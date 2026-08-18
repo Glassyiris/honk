@@ -101,3 +101,22 @@ fn fixed_ttl_lookup_preserves_exact_domain_semantics() {
     assert_eq!(router.fixed_ttl("custom.test"), Some(300));
     assert_eq!(router.fixed_ttl("normal.test"), None);
 }
+
+#[test]
+fn response_sip_condition_is_rejected() {
+    let routing = DnsRouting {
+        response: DnsResponseRouting {
+            rules: vec![DnsResponseRule {
+                conditions: vec![DnsCond::Sip {
+                    not: false,
+                    cidrs: vec!["192.0.2.0/24".into()],
+                }],
+                action: DnsResponseAction::Reject,
+            }],
+            fallback: DnsResponseAction::Accept,
+        },
+        ..Default::default()
+    };
+
+    assert!(DnsRouter::new(&routing).is_err());
+}

@@ -263,6 +263,22 @@ pub fn reserve_rollback_batch(iterations: usize) {
     }
 }
 
+/// Repeatedly take the first-reply metric after its one true result.
+#[doc(hidden)]
+pub fn first_reply_metric_hot_batch(iterations: usize) {
+    assert!(iterations > 0, "benchmark batch must be non-empty");
+    let (_, destination) = bench_addresses();
+    let endpoint = UdpEndpoint::new(
+        Arc::new(BenchPacketTransport { relay: destination }),
+        destination,
+        uuid::Uuid::from_u128(0xbe9c4),
+    );
+    assert!(endpoint.take_first_reply_metric().is_some());
+    for _ in 0..iterations {
+        assert!(endpoint.take_first_reply_metric().is_none());
+    }
+}
+
 /// Prepared fixture for filling the exact 64-datagram bound and dropping newest.
 #[doc(hidden)]
 pub struct QueueSaturationBenchmark(QueuedBatch);

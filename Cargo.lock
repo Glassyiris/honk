@@ -354,19 +354,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aya-ebpf"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eace5970943931fea46a8cbdca208a8f6a9e0413d85a5a6c4e168f0b909570bc"
-dependencies = [
- "aya-build",
- "aya-ebpf-bindings",
- "aya-ebpf-cty",
- "aya-ebpf-macros",
- "rustversion",
-]
-
-[[package]]
 name = "aya-ebpf-bindings"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -383,18 +370,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0884264bc8a51a49fed03df8feada3a21d703cf501dae33c28bdba5d2313ef33"
 dependencies = [
  "aya-build",
-]
-
-[[package]]
-name = "aya-ebpf-macros"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23e3a7f86e914df106dd00f9d757bc93f7d5c93380c51eead23d8d2ccd15a87a"
-dependencies = [
- "proc-macro2",
- "proc-macro2-diagnostics",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -1495,10 +1470,10 @@ dependencies = [
 name = "honk-config"
 version = "0.0.1-alpha"
 dependencies = [
- "anyhow",
  "base64 0.23.0",
  "chrono",
  "glob",
+ "ipnet",
  "libc",
  "regex",
  "serde",
@@ -1524,9 +1499,7 @@ dependencies = [
  "aya-log",
  "aya-obj",
  "base64 0.23.0",
- "boring",
  "bytes",
- "chacha20poly1305",
  "chrono",
  "clap",
  "criterion",
@@ -1546,9 +1519,7 @@ dependencies = [
  "libc",
  "libmimalloc-sys",
  "libsystemd",
- "log",
  "lru",
- "md-5",
  "mimalloc",
  "nix 0.31.3",
  "parking_lot",
@@ -1564,22 +1535,18 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sha1 0.11.0",
  "sha2 0.11.0",
  "socket2",
  "stats_alloc",
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-boring",
  "tokio-rustls",
- "tokio-test",
  "tokio-tungstenite 0.30.0",
  "toml",
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
- "url",
  "uuid",
  "webpki-roots",
  "zip",
@@ -1590,7 +1557,6 @@ name = "honk-ebpf-common"
 version = "0.0.1-alpha"
 dependencies = [
  "aya",
- "aya-ebpf",
  "aya-ebpf-bindings",
  "network-types",
 ]
@@ -1633,6 +1599,7 @@ dependencies = [
  "honk-ebpf-common",
  "http",
  "libc",
+ "lru",
  "md-5",
  "parking_lot",
  "quinn",
@@ -1640,10 +1607,10 @@ dependencies = [
  "rand 0.10.2",
  "rcgen",
  "rustls-pemfile",
- "serde",
  "sha1 0.11.0",
  "sha2 0.11.0",
  "sha3",
+ "shake",
  "socket2",
  "thiserror",
  "tokio",
@@ -1670,7 +1637,6 @@ dependencies = [
  "libc",
  "tempfile",
  "tokio",
- "tracing",
  "tracing-subscriber",
  "url",
  "uuid",
@@ -2598,18 +2564,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "proc-macro2-diagnostics"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af066a9c399a26e020ada66a034357a868728e72cd426f3adcd35f80d88d88c8"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
- "version_check",
-]
-
-[[package]]
 name = "quinn"
 version = "0.11.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3225,12 +3179,24 @@ dependencies = [
 
 [[package]]
 name = "sha3"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be176f1a57ce4e3d31c1a166222d9768de5954f811601fb7ca06fc8203905ce1"
+checksum = "bc9bad02c26382724b2d2692c6f179285e4b54eeecd7968f52a50059c3c11759"
 dependencies = [
  "digest 0.11.3",
  "keccak",
+ "sponge-cursor",
+]
+
+[[package]]
+name = "shake"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09057cb2149ad4cbd2da1e26b351f9a4c354219421229c69c3063e6f61947c4a"
+dependencies = [
+ "digest 0.11.3",
+ "keccak",
+ "sponge-cursor",
 ]
 
 [[package]]
@@ -3313,6 +3279,12 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "sponge-cursor"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 
 [[package]]
 name = "sqlite-wasm-rs"
@@ -3546,28 +3518,6 @@ checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
  "rustls",
  "tokio",
-]
-
-[[package]]
-name = "tokio-stream"
-version = "0.1.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
-dependencies = [
- "futures-core",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
-name = "tokio-test"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6d24790a10a7af737693a3e8f1d03faef7e6ca0cc99aae5066f533766de545"
-dependencies = [
- "futures-core",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]

@@ -59,18 +59,36 @@ impl GroupManager {
         &self,
         candidates: &[Candidate<'a>],
         group: &Group,
-    ) -> &'a Node {
+    ) -> Candidate<'a> {
         if let Some(choice) = self.selector_choice.read().get(&group.name)
             && let Some(c) = candidates.iter().find(|c| c.tag == choice.as_str())
         {
-            return c.node;
+            return c.clone();
         }
-        if let Some(ref default_name) = group.default
+        if let Some(default_name) = &group.default
             && let Some(c) = candidates.iter().find(|c| c.tag == default_name.as_str())
         {
-            return c.node;
+            return c.clone();
         }
-        candidates[0].node
+        candidates[0].clone()
+    }
+    pub(super) fn pick_score<'a>(
+        &self,
+        candidates: &[Candidate<'a>],
+        group: &Group,
+        context: &ScoreSelectionContext,
+    ) -> Candidate<'a> {
+        let mut unique = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if !unique
+                .iter()
+                .any(|existing: &&Candidate<'a>| existing.node.id == candidate.node.id)
+            {
+                unique.push(candidate);
+            }
+        }
+        let nodes: Vec<_> = unique.iter().map(|candidate| candidate.node).collect();
+        unique[self.score_state.rank(&group.name, context, &nodes)].clone()
     }
 
     /// URLTest policy: lowest-latency alive candidate with tolerance-based
@@ -87,7 +105,7 @@ impl GroupManager {
         network: SelectionNetwork,
         ipver: IpVersion,
         effects: SelectionEffects,
-    ) -> &'a Node {
+    ) -> Candidate<'a> {
         let tolerance = Duration::from_millis(group.tolerance.max(1));
 
         // UDP selection with no UDP-specific measurement data mirrors the
@@ -103,14 +121,14 @@ impl GroupManager {
                 cache.get(&group.name).and_then(|sel| sel.tcp.clone())
             };
             if let Some(entry) = tcp_entry
-                && let Some(&c) = candidates.iter().find(|c| c.tag == entry.tag)
+                && let Some(c) = candidates.iter().find(|c| c.tag == entry.tag)
             {
                 if effects.applies()
-                    && self.cache_urltest_selection(group, network, &c, entry.latency)
+                    && self.cache_urltest_selection(group, network, c, entry.latency)
                 {
                     self.maybe_interrupt(&group.name);
                 }
-                return c.node;
+                return c.clone();
             }
             // No usable TCP selection yet — fall through to the normal
             // evaluation (which ranks by the latency fallback chain).
@@ -135,7 +153,8 @@ impl GroupManager {
                 // (sing-box `Select()` / mihomo `fast()` parity): with the
                 // stale baseline a degraded incumbent could never be
                 // displaced. An incumbent with no current measurement gets
-                // no hysteresis.
+                // no hysteresis; neither does one carrying failure strikes
+                // — a just-failed incumbent is replaced immediately.
                 let current_latency = self.node_latency(
                     candidates[pos].node,
                     network,
@@ -144,9 +163,15 @@ impl GroupManager {
                     candidates[pos].tag,
                 );
                 if current_latency != Duration::MAX
+                    && !self.failure_demoted(
+                        candidates[pos].node,
+                        network,
+                        ipver,
+                        group.check_url.as_deref(),
+                    )
                     && best_latency.saturating_add(tolerance) >= current_latency
                 {
-                    return candidates[pos].node;
+                    return candidates[pos].clone();
                 }
             }
         }
@@ -162,7 +187,7 @@ impl GroupManager {
             self.maybe_interrupt(&group.name);
         }
 
-        best.node
+        best
     }
 
     /// LoadBalance policy: round-robin over the alive candidates in member
@@ -180,20 +205,20 @@ impl GroupManager {
         group: &Group,
         network: SelectionNetwork,
         effects: SelectionEffects,
-    ) -> &'a Node {
+    ) -> Candidate<'a> {
         let Some(counter) = self
             .lb_counters
             .get(&group.name)
             .map(|counters| &counters[network.slot()])
         else {
-            return candidates[0].node;
+            return candidates[0].clone();
         };
         let cursor = if effects.applies() {
             counter.fetch_add(1, Ordering::Relaxed)
         } else {
             counter.load(Ordering::Relaxed)
         };
-        candidates[cursor % candidates.len()].node
+        candidates[cursor % candidates.len()].clone()
     }
 
     /// Fallback policy: first alive candidate in member order, pinned.
@@ -211,25 +236,30 @@ impl GroupManager {
         group: &Group,
         network: SelectionNetwork,
         effects: SelectionEffects,
-    ) -> &'a Node {
+    ) -> Candidate<'a> {
         {
             let cache = self.fallback_cache.read();
             if let Some(pinned) = cache
                 .get(&group.name)
                 .and_then(|pins| pins[network.slot()].as_deref())
-                && let Some(&c) = candidates.iter().find(|c| c.tag == pinned)
+                && let Some(c) = candidates.iter().find(|c| c.tag == pinned)
             {
-                return c.node;
+                return c.clone();
             }
         }
-        let first = candidates[0];
+        let first = candidates[0].clone();
         if effects.applies() && self.cache_fallback_selection(group, network, &first) {
             self.maybe_interrupt(&group.name);
         }
-        first.node
+        first
     }
 
     /// Pick the candidate with the lowest probe latency from alive_set.
+    ///
+    /// Two tiers: a failure-demoted candidate (recent probe/dial failure,
+    /// strikes not yet cleared by consecutive real successes) ranks below
+    /// every non-demoted candidate; within a tier the (real-only) moving
+    /// average decides.
     pub(super) fn pick_best_by_latency<'a>(
         &self,
         candidates: &[Candidate<'a>],
@@ -240,20 +270,48 @@ impl GroupManager {
         candidates
             .iter()
             .min_by_key(|c| {
-                self.node_latency(c.node, network, ipver, group.check_url.as_deref(), c.tag)
+                (
+                    self.failure_demoted(c.node, network, ipver, group.check_url.as_deref()),
+                    self.node_latency(c.node, network, ipver, group.check_url.as_deref(), c.tag),
+                )
             })
-            .copied()
-            .unwrap_or(candidates[0])
+            .cloned()
+            .unwrap_or_else(|| candidates[0].clone())
+    }
+
+    /// Whether the node carries pending failure strikes. UDP checks both
+    /// UDP domains; the per-(node, url) TCP path tracks no strikes and
+    /// always reports not demoted.
+    fn failure_demoted(
+        &self,
+        node: &Node,
+        network: SelectionNetwork,
+        ipver: IpVersion,
+        check_url: Option<&str>,
+    ) -> bool {
+        let Some(alive) = self.alive_set.as_ref() else {
+            return false;
+        };
+        match network {
+            SelectionNetwork::Tcp => {
+                check_url.is_none() && alive.is_failure_demoted(node.id, ProbeDomain::Tcp, ipver)
+            }
+            SelectionNetwork::Udp => {
+                alive.is_failure_demoted(node.id, ProbeDomain::DataUdp, ipver)
+                    || alive.is_failure_demoted(node.id, ProbeDomain::DnsUdp, ipver)
+            }
+        }
     }
 
     /// Effective selection latency for a node on the given network.
     ///
     /// Ranking uses the **halving moving average** (`(prev + sample) / 2`,
-    /// dae `min_moving_avg` semantics): recent samples weigh exponentially
-    /// more, so a degraded node is displaced within a few probe cycles
-    /// while single-sample jitter stays smoothed. Synthetic failure samples
-    /// feed the same average, so a failed probe or dial immediately sinks
-    /// the node's rank. TCP ranks by the TCP-probe average — or, when the
+    /// dae `min_moving_avg` semantics) over real measurements: recent
+    /// samples weigh exponentially more, so a degraded node is displaced
+    /// within a few probe cycles while single-sample jitter stays smoothed.
+    /// Synthetic failure samples never feed the average — their demotion is
+    /// handled by the failure-strike tier in `pick_best_by_latency`.
+    /// TCP ranks by the TCP-probe average — or, when the
     /// group has a custom `check_url`, by the per-(node, url) probe average
     /// (sing-box urltest `url` option). UDP ranks by the DataUDP then
     /// DNS-UDP averages only — a node with no UDP measurement ranks

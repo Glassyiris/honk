@@ -402,6 +402,95 @@ async fn test_proxies_structure_and_selector_switch() {
     assert_eq!(resp.status(), 400);
 }
 
+#[tokio::test]
+async fn test_score_proxy_contract_and_put_rejection() {
+    use honk_outbound::group::{
+        ScoreOutcome, ScoreSelectionContext, ScoreTarget, SelectionNetwork,
+    };
+
+    let (a, b) = (make_node("node-a"), make_node("node-b"));
+    let group = Group {
+        name: "auto".into(),
+        policy: honk_config::group::GroupPolicy::Score,
+        nodes: vec![a.id, b.id],
+        ..Default::default()
+    };
+    let app = spawn_app_with_config(
+        Config {
+            nodes: vec![a.clone(), b.clone()],
+            groups: vec![group],
+            ..Default::default()
+        },
+        "",
+        "",
+    )
+    .await;
+    let context = ScoreSelectionContext {
+        network: SelectionNetwork::Tcp,
+        probe_domain: ProbeDomain::Tcp,
+        target_family: Some(IpVersion::V4),
+        health_family: IpVersion::V4,
+        target: Some(ScoreTarget::domain("seed.example", 443)),
+    };
+    let manager = app.state.group_manager.read().clone();
+    let first = manager.selection_plan_for_target("auto", &context);
+    assert_eq!(first.entries[0].node.id, a.id);
+    first.entries[0]
+        .feedback
+        .as_ref()
+        .unwrap()
+        .start()
+        .setup_failed(ScoreOutcome::Timeout);
+    let second = manager.selection_plan_for_target("auto", &context);
+    assert_eq!(second.entries[0].node.id, b.id);
+    let reporter = second.entries[0].feedback.as_ref().unwrap().start();
+    reporter.setup_succeeded();
+    reporter.tx(1);
+    reporter.rx(1);
+    reporter.finish(ScoreOutcome::Success);
+
+    let client = http_client();
+    let body: serde_json::Value = client
+        .get(app.url("/proxies"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["proxies"]["auto"]["type"], "url_test");
+    assert_eq!(
+        body["proxies"]["auto"]["all"],
+        serde_json::json!(["node-a", "node-b"])
+    );
+    assert_eq!(body["proxies"]["auto"]["now"], "node-b");
+
+    let response = client
+        .put(app.url("/proxies/auto"))
+        .json(&serde_json::json!({"name": "node-a"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert_eq!(
+        app.state
+            .cache_db
+            .as_ref()
+            .unwrap()
+            .load_selector_choice("auto"),
+        None
+    );
+    let body: serde_json::Value = client
+        .get(app.url("/proxies/auto"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["now"], "node-b");
+}
+
 /// Dashboards (metacubexd/zashboard) send PUT/PATCH without a JSON
 /// Content-Type; the API must still accept them (mihomo parity).
 #[tokio::test]
@@ -796,7 +885,7 @@ async fn test_group_delay_omits_failed_members() {
     let client = http_client();
     let http_addr = spawn_mock_http_server().await;
 
-    // Pre-seed latency history; a failed measurement must clear it.
+    // A lone transient failure must preserve the existing latency history.
     app.state.alive_set.record_probe_latency(
         make_node("node-a").id,
         ProbeDomain::Tcp,
@@ -820,15 +909,13 @@ async fn test_group_delay_omits_failed_members() {
         "failed members must be omitted, got: {map:?}"
     );
 
-    // Failure replaced the seeded history with the synthetic penalty sample,
-    // so the node can no longer rank by its stale 123ms.
     assert_eq!(
         app.state.alive_set.get_last_latency(
             make_node("node-a").id,
             ProbeDomain::Tcp,
             IpVersion::V4
         ),
-        Some(Duration::from_secs(10))
+        Some(Duration::from_millis(123))
     );
 
     // Unknown group → 404.
@@ -838,6 +925,114 @@ async fn test_group_delay_omits_failed_members() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn test_score_group_delay_returns_current_winner_latency() {
+    use honk_outbound::group::{ScoreOutcome, ScoreSelectionContext, SelectionNetwork};
+
+    let direct = Config::builtin_direct_node();
+    let unreachable = make_node("unreachable");
+    let group = Group {
+        name: "auto-delay".into(),
+        policy: honk_config::group::GroupPolicy::Score,
+        nodes: vec![unreachable.id, direct.id],
+        ..Default::default()
+    };
+    let app = spawn_app_with_config(
+        Config {
+            nodes: vec![unreachable.clone(), direct.clone()],
+            groups: vec![group],
+            ..Default::default()
+        },
+        "",
+        "",
+    )
+    .await;
+    let manager = app.state.group_manager.read().clone();
+    let aggregate =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    manager
+        .feedback_for_group_node("auto-delay", unreachable.id, aggregate.clone())
+        .unwrap()
+        .start()
+        .setup_failed(ScoreOutcome::Timeout);
+    let reporter = manager
+        .feedback_for_group_node("auto-delay", direct.id, aggregate)
+        .unwrap()
+        .start();
+    reporter.setup_succeeded();
+    reporter.tx(1);
+    reporter.rx(1);
+    reporter.finish(ScoreOutcome::Success);
+    assert_eq!(
+        manager.get_score_selection_for_network("auto-delay", SelectionNetwork::Tcp),
+        Some(Config::BUILTIN_DIRECT_NODE.into())
+    );
+
+    let http_addr = spawn_mock_http_server().await;
+    let response = http_client()
+        .get(app.url(&format!(
+            "/proxies/auto-delay/delay?url=http://{http_addr}/&timeout=1000"
+        )))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let delay = response.json::<serde_json::Value>().await.unwrap()["delay"]
+        .as_u64()
+        .unwrap();
+    assert!(delay < 1000);
+}
+
+#[tokio::test]
+async fn test_group_delay_returns_member_results_for_zashboard_core_mode() {
+    let direct = Config::builtin_direct_node();
+    let group = Group {
+        name: "proxy".into(),
+        policy: honk_config::group::GroupPolicy::Selector,
+        nodes: vec![direct.id],
+        ..Default::default()
+    };
+    let app = spawn_app_with_config(
+        Config {
+            nodes: vec![direct],
+            groups: vec![group],
+            ..Default::default()
+        },
+        "",
+        "",
+    )
+    .await;
+    let http_addr = spawn_mock_http_server().await;
+
+    let response = http_client()
+        .get(app.url(&format!(
+            "/group/proxy/delay?url=http://{http_addr}/&timeout=1000"
+        )))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body[Config::BUILTIN_DIRECT_NODE].as_u64().is_some());
+
+    let proxies: serde_json::Value = http_client()
+        .get(app.url("/proxies"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        proxies["proxies"][Config::BUILTIN_DIRECT_NODE]["history"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -865,9 +1060,9 @@ async fn test_node_delay_failure_is_503() {
 }
 
 /// Nested groups on the delay endpoints: `/group/{name}/delay` flattens
-/// sub-group members to their representative leaves (failures clear the
-/// LEAF's latency history), and `/proxies/{subgroup-tag}/delay` works
-/// through the group branch.
+/// sub-group members to their representative leaves, consecutive failures
+/// replace the leaf's display history, and `/proxies/{subgroup-tag}/delay`
+/// works through the group branch.
 #[tokio::test]
 async fn test_nested_group_delay_endpoints() {
     let (a, b) = (make_node("node-a"), make_node("node-b"));
@@ -892,8 +1087,8 @@ async fn test_nested_group_delay_endpoints() {
     let app = spawn_app_with_config(config, "", "").await;
     let client = http_client();
 
-    // Seed latency on the sub-group's leaf: a failed measurement of the
-    // parent must clear it (proof the leaf was actually measured).
+    // Seed the sub-group leaf: the parent failure is transient, while the
+    // follow-up sub-group failure supplies the strike.
     app.state.alive_set.record_probe_latency(
         make_node("node-b").id,
         ProbeDomain::Tcp,
@@ -919,8 +1114,8 @@ async fn test_nested_group_delay_endpoints() {
             ProbeDomain::Tcp,
             IpVersion::V4
         ),
-        Some(Duration::from_secs(10)),
-        "sub-group leaf must have been measured (penalty sample on failure)"
+        Some(Duration::from_millis(55)),
+        "one transient failure must preserve the leaf's latency"
     );
 
     // The sub-group tag itself is a valid delay target (group branch):
@@ -931,6 +1126,15 @@ async fn test_nested_group_delay_endpoints() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 503);
+    assert_eq!(
+        app.state.alive_set.get_last_latency(
+            make_node("node-b").id,
+            ProbeDomain::Tcp,
+            IpVersion::V4
+        ),
+        Some(Duration::from_secs(10)),
+        "the consecutive failure must append the penalty sample"
+    );
 }
 
 #[tokio::test]
@@ -1468,6 +1672,7 @@ async fn stats_exposes_udp_metrics() {
         .record_udp_nfqueue_drop(Duration::from_millis(5));
     app.state.stats.record_udp_nfqueue_token_mismatch();
     app.state.stats.record_udp_nfqueue_token_exhaustion();
+    app.state.stats.record_udp_nfqueue_token_rollover();
     app.state.stats.record_udp_nfqueue_verdict_error();
 
     let body: serde_json::Value = http_client()
@@ -1510,6 +1715,19 @@ async fn stats_exposes_udp_metrics() {
     let nfqueue = &udp["nfqueue"];
     assert_eq!(nfqueue["received"], 1);
     assert_eq!(nfqueue["activeFlows"], 1);
+    assert_eq!(nfqueue["kernelQueueDepth"], 0);
+    assert_eq!(nfqueue["kernelStatsAvailable"], false);
+    assert_eq!(nfqueue["kernelStatsReadErrors"], 0);
+    assert_eq!(nfqueue["kernelDropped"], 0);
+    assert_eq!(nfqueue["kernelUserDropped"], 0);
+    assert_eq!(nfqueue["heldPackets"], 0);
+    assert_eq!(nfqueue["heldPeak"], 0);
+    assert_eq!(nfqueue["socketReceiveBufferBytes"], 0);
+    assert_eq!(nfqueue["actorQueueFull"], 0);
+    assert_eq!(nfqueue["correlatorFull"], 0);
+    assert_eq!(nfqueue["actorQueueDepth"], 0);
+    assert_eq!(nfqueue["actorQueuedBytes"], 0);
+    assert_eq!(nfqueue["actorOldestAgeNanos"], 0);
     assert_eq!(nfqueue["directAccepted"], 1);
     assert_eq!(nfqueue["proxyCopied"], 1);
     assert_eq!(nfqueue["proxyDropped"], 1);
@@ -1518,6 +1736,7 @@ async fn stats_exposes_udp_metrics() {
     assert_eq!(nfqueue["drop"], 1);
     assert_eq!(nfqueue["tokenMismatch"], 1);
     assert_eq!(nfqueue["tokenExhaustion"], 1);
+    assert_eq!(nfqueue["tokenRollovers"], 1);
     assert_eq!(nfqueue["verdictErrors"], 1);
     assert_eq!(nfqueue["receiptToVerdict"]["count"], 5);
 
@@ -1530,6 +1749,7 @@ async fn stats_exposes_udp_metrics() {
     assert_eq!(warm["nodes"]["selector"], 0);
     assert_eq!(warm["nodes"]["traffic"], 0);
     assert_eq!(warm["sessions"]["anytls"], 0);
+    assert_eq!(warm["sessions"]["vless"], 0);
     assert_eq!(warm["sessions"]["tuic"], 0);
     assert_eq!(warm["sessions"]["juicity"], 0);
     assert_eq!(warm["sessions"]["hysteria2"], 0);

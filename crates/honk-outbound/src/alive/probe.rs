@@ -1,4 +1,24 @@
 use super::*;
+use crate::group::{ScoreOutcome, ScoreReporter, ScoreSelectionContext, SelectionNetwork};
+
+impl AliveDialerSet {
+    fn raw_probe_reporter(&self, node_id: Uuid, ipver: IpVersion) -> Option<ScoreReporter> {
+        self.score_feedback
+            .read()
+            .as_ref()
+            .and_then(|factory| {
+                factory(
+                    node_id,
+                    ScoreSelectionContext::aggregate(
+                        SelectionNetwork::Tcp,
+                        ProbeDomain::Tcp,
+                        ipver,
+                    ),
+                )
+            })
+            .map(|feedback| feedback.start())
+    }
+}
 
 impl AliveDialerSet {
     /// Probe a single node's TCP reachability.
@@ -98,10 +118,9 @@ impl AliveDialerSet {
             return false;
         }
 
-        // Try up to 3 addresses per family, stopping at the first success:
-        // the family-death threshold is 1 probe failure, so a single stale
-        // cached address (e.g. a v6 answer from a long-gone DNS cache entry)
-        // would otherwise pin the whole family as dead forever.
+        // Try up to 3 addresses per family, stopping at the first success.
+        // This prevents one stale cached address from consuming a failure on
+        // every probe cycle when another address in the family still works.
         let mut by_family: [Vec<SocketAddr>; 2] = [Vec::new(), Vec::new()];
         for a in &addrs {
             let idx = if a.is_ipv4() { 0 } else { 1 };
@@ -118,16 +137,17 @@ impl AliveDialerSet {
                 IpVersion::V6
             };
             if family_addrs.is_empty() {
-                self.mark_dead_for(node_id, ProbeDomain::Tcp, ipver);
+                // A check URL with no address in this family yields no
+                // evidence either way. Marking the family dead here killed
+                // (Tcp, V6) on every cycle for v4-only check URLs, wedging
+                // the group's v6 connectivity slot shut (#46).
                 continue;
             }
 
             let mut family_ok = false;
             for a in family_addrs {
-                match tokio::time::timeout(timeout, prober.probe_http(node_name, *a, &check_url))
-                    .await
-                {
-                    Ok(Ok(elapsed)) => {
+                match prober.probe_http(node_name, *a, &check_url, timeout).await {
+                    HttpProbeResult::WarmSuccess(elapsed) => {
                         tracing::debug!(
                             "HTTP health check succeeded for node '{}' via {} ({}ms)",
                             node_name,
@@ -139,20 +159,20 @@ impl AliveDialerSet {
                         family_ok = true;
                         break;
                     }
-                    Ok(Err(err_msg)) => {
+                    HttpProbeResult::SetupFailure(error) => {
                         tracing::debug!(
-                            "HTTP health check failed for node '{}' via {}: {}",
+                            "HTTP health check establishment failed for node '{}' via {}: {}",
                             node_name,
                             a,
-                            err_msg
+                            error
                         );
                     }
-                    Err(_) => {
+                    HttpProbeResult::ExchangeFailure(error) => {
                         tracing::debug!(
-                            "HTTP health check timed out for node '{}' via {} after {:?}",
+                            "HTTP health check warm exchange failed for node '{}' via {}: {}",
                             node_name,
                             a,
-                            timeout
+                            error
                         );
                     }
                 }
@@ -166,8 +186,9 @@ impl AliveDialerSet {
             tracing::info!("Node '{}' is alive after HTTP health check", node_name);
         } else {
             tracing::warn!(
-                "Node '{}' failed HTTP health check against all addresses ({})",
+                "Node '{}' failed HTTP health check for '{}' through proxy endpoint {}",
                 node_name,
+                check_url,
                 registered.address
             );
         }
@@ -220,8 +241,8 @@ impl AliveDialerSet {
 
         let mut any_ok = false;
         for a in addrs.into_iter().take(3) {
-            match tokio::time::timeout(timeout, prober.probe_http(leaf, a, url)).await {
-                Ok(Ok(elapsed)) => {
+            match prober.probe_http(leaf, a, url, timeout).await {
+                HttpProbeResult::WarmSuccess(elapsed) => {
                     tracing::debug!(
                         "HTTP health check succeeded for member '{}' (leaf '{}') via {} ({}ms, url={})",
                         tag,
@@ -234,24 +255,24 @@ impl AliveDialerSet {
                     any_ok = true;
                     break;
                 }
-                Ok(Err(err_msg)) => {
+                HttpProbeResult::SetupFailure(error) => {
                     tracing::debug!(
-                        "HTTP health check failed for member '{}' (leaf '{}') via {} (url={}): {}",
+                        "HTTP health check establishment failed for member '{}' (leaf '{}') via {} (url={}): {}",
                         tag,
                         leaf,
                         a,
                         url,
-                        err_msg
+                        error
                     );
                 }
-                Err(_) => {
+                HttpProbeResult::ExchangeFailure(error) => {
                     tracing::debug!(
-                        "HTTP health check timed out for member '{}' (leaf '{}') via {} after {:?} (url={})",
+                        "HTTP health check warm exchange failed for member '{}' (leaf '{}') via {} (url={}): {}",
                         tag,
                         leaf,
                         a,
-                        timeout,
-                        url
+                        url,
+                        error
                     );
                 }
             }
@@ -337,6 +358,8 @@ impl AliveDialerSet {
                 IpVersion::V6
             };
 
+            let reporter = self.raw_probe_reporter(node_id, ipver);
+
             let start = Instant::now();
             let result = tokio::time::timeout(
                 timeout,
@@ -347,6 +370,10 @@ impl AliveDialerSet {
 
             match result {
                 Ok(Ok(_stream)) => {
+                    if let Some(reporter) = &reporter {
+                        reporter.setup_succeeded();
+                        reporter.finish(ScoreOutcome::Success);
+                    }
                     tracing::debug!(
                         "Health check probe succeeded for node '{}' via {} ({}ms)",
                         node_name,
@@ -357,6 +384,13 @@ impl AliveDialerSet {
                     any_ok = true;
                 }
                 Ok(Err(e)) => {
+                    if let Some(reporter) = &reporter {
+                        reporter.finish(if e.kind() == std::io::ErrorKind::TimedOut {
+                            ScoreOutcome::Timeout
+                        } else {
+                            ScoreOutcome::Io(e.kind())
+                        });
+                    }
                     tracing::debug!(
                         "Health check probe failed for node '{}' via {}: {}",
                         node_name,
@@ -366,6 +400,9 @@ impl AliveDialerSet {
                     self.mark_dead_for(node_id, ProbeDomain::Tcp, ipver);
                 }
                 Err(_) => {
+                    if let Some(reporter) = &reporter {
+                        reporter.finish(ScoreOutcome::Timeout);
+                    }
                     tracing::debug!(
                         "Health check probe timed out for node '{}' via {} after {:?}",
                         node_name,
@@ -377,13 +414,9 @@ impl AliveDialerSet {
             }
         }
 
-        if !any_v4 {
-            self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V4);
-        }
-        if !any_v6 {
-            self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V6);
-        }
-
+        // A node address that resolves to a single address family says
+        // nothing about the other family's reachability through the tunnel —
+        // leave it untouched rather than dead-marking it without evidence.
         if any_ok {
             tracing::info!("Node '{}' is alive after TCP health check", node_name);
         } else {
@@ -429,8 +462,8 @@ impl AliveDialerSet {
         let node_name = self.node_name(node_id);
         const UDP_DOMAINS: [ProbeDomain; 2] = [ProbeDomain::DataUdp, ProbeDomain::DnsUdp];
         const IPVERS: [IpVersion; 2] = [IpVersion::V4, IpVersion::V6];
-        match tokio::time::timeout(timeout, prober.probe_udp(&node_name)).await {
-            Ok(Ok(elapsed)) => {
+        match prober.probe_udp(&node_name, timeout).await {
+            Ok(elapsed) => {
                 tracing::debug!(
                     "UDP health check succeeded for node '{}' ({}ms)",
                     node_name,
@@ -443,24 +476,11 @@ impl AliveDialerSet {
                 }
                 true
             }
-            Ok(Err(err_msg)) => {
+            Err(err_msg) => {
                 tracing::debug!(
                     "UDP health check failed for node '{}': {}",
                     node_name,
                     err_msg
-                );
-                for domain in UDP_DOMAINS {
-                    for ipver in IPVERS {
-                        self.mark_dead_for(node_id, domain, ipver);
-                    }
-                }
-                false
-            }
-            Err(_) => {
-                tracing::debug!(
-                    "UDP health check timed out for node '{}' after {:?}",
-                    node_name,
-                    timeout
                 );
                 for domain in UDP_DOMAINS {
                     for ipver in IPVERS {

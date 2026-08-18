@@ -17,45 +17,72 @@ pub(crate) enum OperationKind {
 /// Immutable query identity shared by all cache and singleflight operations for
 /// one prepared DNS query.  The canonical wire form is deliberately retained
 /// as bytes; its textual representation is a persistence boundary only.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KeyIdentity(Arc<KeyIdentityData>);
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq)]
 struct KeyIdentityData {
     wire_identity: Arc<[u8]>,
     ingress: IngressProfile,
     policy_id: Option<PolicyId>,
+    identity_hash: u64,
+}
+
+impl Hash for KeyIdentity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.0.identity_hash);
+    }
+}
+
+fn hash_identity(
+    wire_identity: &[u8],
+    ingress: IngressProfile,
+    policy_id: &Option<PolicyId>,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    wire_identity.hash(&mut hasher);
+    ingress.hash(&mut hasher);
+    policy_id.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl KeyIdentity {
     pub(crate) fn new(query: &QueryContext, policy_id: Option<PolicyId>) -> Self {
+        let wire_identity = query.canonical_wire_arc();
+        let ingress = query.ingress();
+        let identity_hash = hash_identity(wire_identity.as_ref(), ingress, &policy_id);
         Self(Arc::new(KeyIdentityData {
-            wire_identity: query.canonical_wire_arc(),
-            ingress: query.ingress(),
+            wire_identity,
+            ingress,
             policy_id,
+            identity_hash,
         }))
     }
 
     pub(crate) fn key(&self, scope: RequestScope, operation: OperationKind) -> CacheKey {
-        let mut hasher = DefaultHasher::new();
-        self.hash(&mut hasher);
-        scope.hash(&mut hasher);
-        operation.hash(&mut hasher);
+        // ponytail: one query's bounded scope/operation variants share a shard;
+        // mix them only if collision profiling shows contention.
         CacheKey {
             identity: self.clone(),
             scope,
             operation,
-            shard_hash: hasher.finish(),
+            shard_hash: self.0.identity_hash,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CacheKey {
     identity: KeyIdentity,
     scope: RequestScope,
     operation: OperationKind,
     shard_hash: u64,
+}
+
+impl Hash for CacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.shard_hash);
+    }
 }
 
 impl CacheKey {
@@ -105,10 +132,14 @@ impl CacheKey {
         scope: RequestScope,
         operation: OperationKind,
     ) -> Self {
+        let wire_identity = Arc::<[u8]>::from(wire_identity);
+        let policy_id = None;
+        let identity_hash = hash_identity(wire_identity.as_ref(), ingress, &policy_id);
         KeyIdentity(Arc::new(KeyIdentityData {
-            wire_identity: wire_identity.into(),
+            wire_identity,
             ingress,
-            policy_id: None,
+            policy_id,
+            identity_hash,
         }))
         .key(scope, operation)
     }

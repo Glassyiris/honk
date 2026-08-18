@@ -196,3 +196,216 @@ async fn hot_near_expiry_hits_own_one_refresh_task_and_close_cleans_it() {
     assert_eq!(service.refresh_task_count(), 0);
     assert_eq!(service.active_flights(), 0);
 }
+
+#[tokio::test]
+async fn compatibility_default_scope_refresh_keeps_compatibility_planning() {
+    use honk_config::dns::{DnsRequestAction, DnsRequestRouting};
+
+    let upstream = Arc::new(MockUpstream::new(make_a_response([192, 0, 2, 20], 2)));
+    let router = Arc::new(
+        DnsRouter::new(&DnsRouting {
+            request: DnsRequestRouting {
+                rules: Vec::new(),
+                fallback: DnsRequestAction::AsIs,
+            },
+            ..Default::default()
+        })
+        .expect("router"),
+    );
+    let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), router);
+    let query = make_a_query();
+
+    forwarder.resolve(&query).await.expect("compatibility prime");
+    tokio::time::sleep(Duration::from_millis(1900)).await;
+    forwarder.resolve(&query).await.expect("near-expiry hit");
+    for _ in 0..20 {
+        if upstream.call_count.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_selected_near_expiry_hits_share_one_refresh() {
+    use honk_config::dns::{DnsCond, DnsRequestAction, DnsRequestRouting, DnsRequestRule};
+
+    struct SourceRefreshUpstream {
+        calls: std::sync::Mutex<Vec<String>>,
+        refresh_entered: tokio::sync::Notify,
+        refresh_release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl DnsUpstreamPool for SourceRefreshUpstream {
+        async fn query(&self, upstream_name: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let refresh = {
+                let mut calls = self.calls.lock().expect("calls");
+                calls.push(upstream_name.to_string());
+                calls.len() > 1
+            };
+            if refresh {
+                self.refresh_entered.notify_one();
+                self.refresh_release.acquire().await?.forget();
+            }
+            Ok(make_a_response([192, 0, 2, 30], 2))
+        }
+    }
+
+    let upstream = Arc::new(SourceRefreshUpstream {
+        calls: std::sync::Mutex::new(Vec::new()),
+        refresh_entered: tokio::sync::Notify::new(),
+        refresh_release: tokio::sync::Semaphore::new(0),
+    });
+    let router = Arc::new(
+        DnsRouter::new(&DnsRouting {
+            request: DnsRequestRouting {
+                rules: vec![DnsRequestRule {
+                    conditions: vec![DnsCond::Sip {
+                        not: false,
+                        cidrs: vec!["192.0.2.0/24".into(), "203.0.113.0/24".into()],
+                    }],
+                    action: DnsRequestAction::Upstream("red".into()),
+                }],
+                fallback: DnsRequestAction::Upstream("trap".into()),
+            },
+            ..Default::default()
+        })
+        .expect("router"),
+    );
+    let forwarder = Arc::new(DnsForwarder::new(upstream.clone(), test_cache(), router));
+    let service = forwarder.cache_service().await;
+    let query = make_a_query();
+    forwarder
+        .resolve_outcome_with_context(
+            &query,
+            DnsRequestMeta::new(Some("192.0.2.10".parse().expect("source")), None),
+        )
+        .await
+        .expect("prime");
+    tokio::time::sleep(Duration::from_millis(1900)).await;
+
+    let start = Arc::new(tokio::sync::Barrier::new(3));
+    let mut callers = tokio::task::JoinSet::new();
+    for source in ["192.0.2.10", "203.0.113.30"] {
+        let forwarder = Arc::clone(&forwarder);
+        let start = Arc::clone(&start);
+        let query = query.clone();
+        callers.spawn(async move {
+            start.wait().await;
+            forwarder
+                .resolve_outcome_with_context(
+                    &query,
+                    DnsRequestMeta::new(Some(source.parse().expect("source")), None),
+                )
+                .await
+        });
+    }
+    start.wait().await;
+    while let Some(result) = callers.join_next().await {
+        result.expect("task").expect("cache hit");
+    }
+    upstream.refresh_entered.notified().await;
+
+    assert_eq!(service.refresh_task_count(), 1);
+    assert_eq!(service.active_flights(), 1);
+    assert_eq!(upstream.calls.lock().expect("calls").as_slice(), ["red", "red"]);
+    upstream.refresh_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while service.refresh_task_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("refresh completion");
+    assert_eq!(service.active_flights(), 0);
+}
+
+#[tokio::test]
+async fn stale_response_keeps_source_aware_preferred_family_projection() {
+    use honk_config::dns::{
+        DnsCond, DnsRequestAction, DnsRequestRouting, DnsRequestRule,
+    };
+
+    struct StalePreferenceUpstream;
+
+    #[async_trait]
+    impl DnsUpstreamPool for StalePreferenceUpstream {
+        async fn query(&self, upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+            Ok(match upstream_name {
+                "aaaa" => make_aaaa_response(TEST_V6, 1),
+                "has-a" => make_a_response([192, 0, 2, 1], 300),
+                "no-a" => {
+                    let query = crate::dns::query::QueryContext::parse(raw_query).expect("query");
+                    make_empty_response(raw_query, &query)
+                }
+                _ => panic!("unexpected upstream {upstream_name}"),
+            })
+        }
+    }
+
+    async fn projections(forwarder: &DnsForwarder, query: &[u8]) -> [u16; 2] {
+        let mut counts = [0, 0];
+        for (index, source) in ["192.0.2.10", "198.51.100.10"].into_iter().enumerate() {
+            let response = forwarder
+                .resolve_outcome_with_context(
+                    query,
+                    DnsRequestMeta::new(Some(source.parse().expect("source")), None),
+                )
+                .await
+                .expect("response")
+                .into_rendered();
+            assert_eq!(response[3] & 0x0f, 0);
+            counts[index] = answer_count(&response);
+        }
+        counts
+    }
+
+    let router = Arc::new(
+        DnsRouter::new(&DnsRouting {
+            request: DnsRequestRouting {
+                rules: vec![
+                    DnsRequestRule {
+                        conditions: vec![DnsCond::Qtype {
+                            not: false,
+                            types: vec![28],
+                        }],
+                        action: DnsRequestAction::Upstream("aaaa".into()),
+                    },
+                    DnsRequestRule {
+                        conditions: vec![
+                            DnsCond::Sip {
+                                not: false,
+                                cidrs: vec!["192.0.2.0/24".into()],
+                            },
+                            DnsCond::Qtype {
+                                not: false,
+                                types: vec![1],
+                            },
+                        ],
+                        action: DnsRequestAction::Upstream("has-a".into()),
+                    },
+                ],
+                fallback: DnsRequestAction::Upstream("no-a".into()),
+            },
+            ..Default::default()
+        })
+        .expect("router"),
+    );
+    let cache = test_cache();
+    let query = build_dns_query("example.com", 28);
+    let priming = DnsForwarder::new(
+        Arc::new(StalePreferenceUpstream),
+        cache.clone(),
+        Arc::clone(&router),
+    )
+    .with_strategy(DnsStrategy::PreferIpv4);
+    assert_eq!(projections(&priming, &query).await, [0, 1]);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    let failing = DnsForwarder::new(Arc::new(FailUpstream), cache, router)
+        .with_strategy(DnsStrategy::PreferIpv4);
+    assert_eq!(projections(&failing, &query).await, [0, 1]);
+}

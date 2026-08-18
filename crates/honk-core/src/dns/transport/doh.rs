@@ -58,19 +58,30 @@ impl DohClient {
         }))
     }
 
-    pub async fn exchange(self: &Arc<Self>, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub async fn exchange(
+        self: &Arc<Self>,
+        raw_query: &[u8],
+        feedback: Option<&honk_outbound::group::ScoreFeedback>,
+    ) -> anyhow::Result<Vec<u8>> {
         exchange_with_retry(
             "DoH",
-            || self.exchange_once(raw_query),
-            || async {
-                self.close_session().await;
-            },
+            raw_query,
+            |reporter| async move { self.exchange_once(raw_query, reporter.as_ref()).await },
+            || async { self.close_session().await },
+            feedback,
         )
         .await
     }
 
-    async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn exchange_once(
+        &self,
+        raw_query: &[u8],
+        reporter: Option<&honk_outbound::group::ScoreReporter>,
+    ) -> anyhow::Result<Vec<u8>> {
         let mut sender = self.get_sender().await?;
+        if let Some(reporter) = reporter {
+            reporter.setup_succeeded();
+        }
 
         tokio::time::timeout(self.dial.query_timeout, async {
             let mut wire = raw_query.to_vec();
@@ -85,6 +96,9 @@ impl DohClient {
             send_stream
                 .send_data(Bytes::from(wire), true)
                 .map_err(|e| anyhow::anyhow!("DoH send_data: {e}"))?;
+            if let Some(reporter) = reporter {
+                reporter.tx(raw_query.len() as u64);
+            }
 
             let response = response_fut
                 .await
@@ -101,7 +115,14 @@ impl DohClient {
                 let _ = body.flow_control().release_capacity(n);
             }
 
-            finish_doh_response("DoH", status, buf.into_bytes(), orig_id)
+            let response = finish_doh_response("DoH", status, buf.into_bytes(), orig_id)?;
+            if let Some(reporter) = reporter
+                && super::is_valid_response(raw_query, &response)
+            {
+                reporter.first_response();
+                reporter.rx(response.len() as u64);
+            }
+            Ok::<_, anyhow::Error>(response)
         })
         .await
         .map_err(|_| {
@@ -121,8 +142,9 @@ impl DohClient {
     async fn handshake(&self) -> anyhow::Result<H2Session> {
         let server_name = self.dial.endpoint.sni.clone();
         let via_proxy = self.dial.proxy.is_some();
-        tokio::time::timeout(self.dial.dial_timeout, async {
-            let tcp = self.dial.dial_tcp_boxed().await?;
+        let deadline = tokio::time::Instant::now() + self.dial.dial_timeout;
+        let tcp = self.dial.dial_tcp_boxed_until(deadline).await?;
+        tokio::time::timeout_at(deadline, async {
             let tls = self
                 .connector
                 .connect(&server_name, tcp)

@@ -1,6 +1,6 @@
 //! DNS request/response routing.
 //!
-//! Routes DNS queries by domain, qtype, response IPs, and upstream metadata.
+//! Routes DNS queries by domain, qtype, logical client source, response IPs, and upstream metadata.
 
 mod compiler {
     use std::collections::HashSet;
@@ -12,7 +12,7 @@ mod compiler {
     use tracing::warn;
 
     use super::matcher::{CompiledCond, CompiledDomainMatcher};
-    use crate::routing::{BinaryLpmTrie, GeoAssets, GeositeMatcher};
+    use crate::routing::{BinaryLpmTrie, GeoAssets, GeositeMatcher, parse_ip_net_str};
 
     #[derive(Clone)]
     pub(super) struct CompiledRequestRule {
@@ -51,7 +51,7 @@ mod compiler {
             .iter()
             .map(|rule| {
                 Ok(CompiledRequestRule {
-                    conditions: compile_conditions(&rule.conditions, &assets)?,
+                    conditions: compile_conditions(&rule.conditions, &assets, true)?,
                     action: rule.action.clone(),
                 })
             })
@@ -61,7 +61,7 @@ mod compiler {
             .iter()
             .map(|rule| {
                 Ok(CompiledResponseRule {
-                    conditions: compile_conditions(&rule.conditions, &assets)?,
+                    conditions: compile_conditions(&rule.conditions, &assets, false)?,
                     action: rule.action.clone(),
                 })
             })
@@ -94,7 +94,7 @@ mod compiler {
                             .map(|code| code.to_lowercase()),
                     );
                 }
-                DnsCond::Qtype { .. } | DnsCond::Upstream { .. } => {}
+                DnsCond::Sip { .. } | DnsCond::Qtype { .. } | DnsCond::Upstream { .. } => {}
             }
         }
     }
@@ -102,6 +102,7 @@ mod compiler {
     fn compile_conditions(
         conditions: &[DnsCond],
         assets: &GeoAssets,
+        allow_sip: bool,
     ) -> anyhow::Result<Vec<CompiledCond>> {
         conditions
             .iter()
@@ -117,6 +118,23 @@ mod compiler {
                     not: *not,
                     types: types.clone(),
                 }),
+                DnsCond::Sip { not, cidrs } => {
+                    if !allow_sip {
+                        anyhow::bail!("DNS sip() condition is request-only");
+                    }
+                    if cidrs.is_empty() {
+                        anyhow::bail!("DNS sip() condition requires at least one IP or CIDR");
+                    }
+                    let nets = cidrs
+                        .iter()
+                        .map(|value| {
+                            parse_ip_net_str(value).ok_or_else(|| {
+                                anyhow::anyhow!("Invalid DNS source IP or CIDR '{value}'")
+                            })
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    Ok(CompiledCond::Sip { not: *not, nets })
+                }
                 DnsCond::Upstream { not, names } => Ok(CompiledCond::Upstream {
                     not: *not,
                     names: names.clone(),
@@ -241,6 +259,10 @@ mod matcher {
             not: bool,
             types: Vec<u16>,
         },
+        Sip {
+            not: bool,
+            nets: Vec<ipnet::IpNet>,
+        },
         Upstream {
             not: bool,
             names: Vec<String>,
@@ -254,6 +276,7 @@ mod matcher {
     pub(super) struct Evaluation<'a> {
         domain: &'a str,
         qtype: u16,
+        source_ip: Option<IpAddr>,
         answer_ips: &'a [IpAddr],
         from_upstream: &'a str,
     }
@@ -264,10 +287,11 @@ mod matcher {
     }
 
     impl<'a> Evaluation<'a> {
-        pub(super) fn request(domain: &'a str, qtype: u16) -> Self {
+        pub(super) fn request(domain: &'a str, qtype: u16, source_ip: Option<IpAddr>) -> Self {
             Self {
                 domain,
                 qtype,
+                source_ip,
                 answer_ips: &[],
                 from_upstream: "",
             }
@@ -277,6 +301,7 @@ mod matcher {
             Self {
                 domain,
                 qtype,
+                source_ip: None,
                 answer_ips: context.answer_ips,
                 from_upstream: context.from_upstream,
             }
@@ -291,6 +316,12 @@ mod matcher {
                     *not,
                 ),
                 CompiledCond::Qtype { not, types } => (types.contains(&value.qtype), *not),
+                CompiledCond::Sip { not, nets } => {
+                    let Some(source_ip) = value.source_ip else {
+                        return false;
+                    };
+                    (nets.iter().any(|net| net.contains(&source_ip)), *not)
+                }
                 CompiledCond::Upstream { not, names } => {
                     (names.iter().any(|name| name == value.from_upstream), *not)
                 }
@@ -332,7 +363,7 @@ pub enum DnsResponseDecision {
     Requery(String),
 }
 
-/// DNS router that selects upstreams based on domain, qtype, and response metadata.
+/// DNS router that selects upstreams based on domain, qtype, logical client source, and response metadata.
 #[derive(Clone)]
 pub struct DnsRouter {
     request_rules: Vec<CompiledRequestRule>,
@@ -378,8 +409,13 @@ impl DnsRouter {
 
     /// Select a request route for a domain that has already been normalized to
     /// ASCII lowercase by the DNS query parser.
-    pub(crate) fn select_request_normalized(&self, domain: &str, qtype: u16) -> DnsRequestDecision {
-        let evaluation = Evaluation::request(domain, qtype);
+    pub(crate) fn select_request_normalized(
+        &self,
+        domain: &str,
+        qtype: u16,
+        source_ip: Option<IpAddr>,
+    ) -> DnsRequestDecision {
+        let evaluation = Evaluation::request(domain, qtype, source_ip);
         for rule in &self.request_rules {
             if eval_conditions(&rule.conditions, &evaluation) {
                 debug!(qtype, action = ?rule.action, "DNS request route selected");
@@ -391,7 +427,7 @@ impl DnsRouter {
     }
 
     pub fn select_request(&self, domain: &str, qtype: u16) -> DnsRequestDecision {
-        self.select_request_normalized(&domain.to_ascii_lowercase(), qtype)
+        self.select_request_normalized(&domain.to_ascii_lowercase(), qtype, None)
     }
 
     /// Select a response route for a domain that has already been normalized
@@ -463,7 +499,7 @@ impl DnsRouter {
     }
 
     pub(crate) fn select_upstream_normalized(&self, domain: &str) -> &str {
-        let evaluation = Evaluation::request(domain, 1);
+        let evaluation = Evaluation::request(domain, 1, None);
         for rule in &self.request_rules {
             if eval_conditions(&rule.conditions, &evaluation) {
                 return request_action_name(&rule.action, false);

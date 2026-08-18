@@ -1,18 +1,4 @@
 //! Outbound dialer management — alive detection, sticky cache, recovery state.
-//!
-//! `AliveDialerSet` tracks 6 independent alive states per node
-//! (Tcp4/6, DnsUdp4/6, DataUdp4/6) with exponential probe backoff
-//! and pushes changes into the eBPF `outbound_connectivity_map`.
-//!
-//! Each periodic probe cycle runs the TCP probe (HTTP through the proxy,
-//! or raw connect) followed by a UDP probe (`probe_node_udp`, when a
-//! [`UdpProber`] is installed): a DNS exchange through the node's own UDP
-//! data path whose result drives both UDP domains — catching nodes with
-//! healthy TCP but broken UDP (e.g. an AnyTLS server without UoT).
-//! Due dead TCP/UDP states are retried between full cycles on the same
-//! exponential schedule, independent of a long configured check interval.
-//!
-//! Go reference: `component/outbound/dialer/dialer.go`, `connectivity_check.go`
 
 pub mod collection;
 pub mod latencies;
@@ -21,7 +7,9 @@ mod probe;
 #[cfg(test)]
 mod tests;
 
-use self::collection::DialerCollection;
+use self::collection::{DialerCollection, SLOW_DIAL_STREAK_MAX, TrafficVerdict};
+use crate::group::{ScoreFeedback, ScoreSelectionContext};
+use honk_config::config::{BLOCK_NODE_ID, DIRECT_NODE_ID};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -30,6 +18,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+type ScoreFeedbackFactory =
+    Arc<dyn Fn(Uuid, ScoreSelectionContext) -> Option<ScoreFeedback> + Send + Sync>;
 
 /// Per-(node, check_url) probe state for URLTest groups with a custom
 /// `check_url` (sing-box urltest `url` option). Deliberately simpler than
@@ -106,20 +97,33 @@ pub fn alive_index(domain: ProbeDomain, ipver: IpVersion) -> usize {
 
 pub type ProtocolDomain = ProbeDomain;
 
+/// Result of one HTTP health probe. Only a complete warm exchange is healthy
+/// and contributes latency; setup and target-exchange failures stay distinct
+/// for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpProbeResult {
+    WarmSuccess(Duration),
+    SetupFailure(String),
+    ExchangeFailure(String),
+}
+
 /// Trait for HTTP-based health check probing through proxy nodes.
 ///
 /// Implemented by `honk-core` to route HTTP requests through the proxy
 /// registry, matching Go's `Dialer.HttpCheck`. `url` is the check target
 /// (global `tcp_check_url`, or a group's custom `check_url`); `addr` is a
-/// pre-resolved IP for that URL's host. Returns the measured round-trip
-/// latency on success, or an error string on failure.
+/// pre-resolved IP for that URL's host. Only [`HttpProbeResult::WarmSuccess`]
+/// is healthy and carries a ranking RTT.
+/// Implementations own timeout handling; callers do not wrap the future in a
+/// competing deadline.
 pub trait HttpProber: Send + Sync {
     fn probe_http(
         &self,
         node_name: &str,
         addr: SocketAddr,
         url: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Duration, String>> + Send + 'static>>;
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = HttpProbeResult> + Send + 'static>>;
 }
 
 /// Type-erased HTTP prober stored in `AliveDialerSet`.
@@ -135,10 +139,13 @@ pub type HttpProberRef = Arc<dyn HttpProber>;
 /// This catches nodes whose TCP path works but whose UDP path is broken
 /// (e.g. an AnyTLS server without UoT support) — a plain TCP probe can
 /// never see that failure mode.
+/// Implementations own timeout handling; callers do not wrap the future in a
+/// competing deadline.
 pub trait UdpProber: Send + Sync {
     fn probe_udp(
         &self,
         node_name: &str,
+        timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<Duration, String>> + Send + 'static>>;
 }
 
@@ -146,13 +153,15 @@ pub trait UdpProber: Send + Sync {
 pub type UdpProberRef = Arc<dyn UdpProber>;
 
 /// Returns the failure threshold for probe-based health checks.
-/// Matches Go thresholds:
-///   TCP probe = 1 (single failure indicates immediate issue)
+///   TCP probe = 3 (Go dae uses 1; a single transient probe loss used to
+///   eject the URLTest incumbent from the candidate set outright, forcing
+///   an immediate switch that bypassed tolerance hysteresis — ranking
+///   demotion now covers the fast path, liveness exclusion is the backstop)
 ///   UDP DNS probe = 3 (DNS queries more prone to transient loss)
 ///   UDP Data probe = 3 (same as DNS)
 const fn probe_failure_threshold(domain: ProbeDomain) -> u32 {
     match domain {
-        ProbeDomain::Tcp => 1,
+        ProbeDomain::Tcp => 3,
         ProbeDomain::DnsUdp => 3,
         ProbeDomain::DataUdp => 3,
     }
@@ -334,6 +343,7 @@ pub struct AliveDialerSet {
     /// When set, each periodic probe cycle runs a DNS-over-UDP exchange
     /// through the node's UDP data path after the TCP probe.
     udp_prober: RwLock<Option<UdpProberRef>>,
+    score_feedback: RwLock<Option<ScoreFeedbackFactory>>,
     /// Timestamp when each node was first registered (for grace period).
     node_registered_at: RwLock<HashMap<Uuid, Instant>>,
     /// Per-node per-domain/IP-version probe history for API/UI.
@@ -404,6 +414,7 @@ impl AliveDialerSet {
             direct_check_addr: RwLock::new(DEFAULT_DIRECT_CHECK_ADDR.to_string()),
             check_url_ips: RwLock::new(Vec::new()),
             udp_prober: RwLock::new(None),
+            score_feedback: RwLock::new(None),
             node_registered_at: RwLock::new(HashMap::new()),
             probe_history: RwLock::new(HashMap::new()),
             outbound_resolver: RwLock::new(None),
@@ -476,6 +487,13 @@ impl AliveDialerSet {
     /// [`AliveDialerSet::probe_node_udp`] after each node's TCP probe.
     pub fn set_udp_probe(&self, prober: UdpProberRef) {
         *self.udp_prober.write() = Some(prober);
+    }
+
+    pub fn set_score_feedback_factory<F>(&self, factory: F)
+    where
+        F: Fn(Uuid, ScoreSelectionContext) -> Option<ScoreFeedback> + Send + Sync + 'static,
+    {
+        *self.score_feedback.write() = Some(Arc::new(factory));
     }
 
     /// Install the DNS resolver for health-check targets (see [`ResolveHook`]).
@@ -751,12 +769,11 @@ impl AliveDialerSet {
                 }
             }
         }
-        let coll = self.get_or_create_collection(node_id, idx);
         if !is_traffic {
-            // Only append synthetic TIMEOUT_LATENCY for probe failures,
-            // not for traffic-based reporting (which may succeed through
-            // other nodes without indicating a true latency change).
-            coll.mark_unavailable();
+            // Probe counters own liveness and cooldown; ranking strikes are
+            // reserved for real dial failures.
+            self.get_or_create_collection(node_id, idx)
+                .mark_probe_unavailable();
         }
 
         self.record_probe_history(node_id, idx, false, None);
@@ -793,6 +810,11 @@ impl AliveDialerSet {
     /// the data-UDP health domain (Go: `ReportAvailableTraffic`).
     pub fn report_available_traffic(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
         let idx = alive_index(domain, ipver);
+        // A real dial success breaks the consecutive dial-failure streak —
+        // even when the state is clean and nothing else needs updating.
+        if let Some(arr) = self.collections.read().get(&node_id) {
+            arr[idx].reset_dial_fail_streak();
+        }
         if self
             .states
             .read()
@@ -876,15 +898,8 @@ impl AliveDialerSet {
         Arc::clone(&arr[idx])
     }
 
-    /// Record a successful probe latency for a node + domain + ip version.
-    ///
-    /// This is the core method that feeds latency data into the per-node
-    /// `Latencies10` ring buffer and `MovingAverage`, which downstream
-    /// `GroupManager` can read for selection.
-    ///
-    /// Applies recovery hysteresis: a dead node needs
-    /// `RECOVERY_SUCCESSES_NEEDED` consecutive successes before being
-    /// marked alive again. An already-alive node stays alive immediately.
+    /// Record a successful probe latency for a node + domain + IP version.
+    /// Applies recovery hysteresis and feeds the selection moving average.
     pub fn record_probe_latency(
         &self,
         node_id: Uuid,
@@ -948,6 +963,18 @@ impl AliveDialerSet {
         if ma > Duration::ZERO { Some(ma) } else { None }
     }
 
+    /// Whether the node carries pending failure strikes in this domain.
+    /// Selection demotes such nodes below every non-demoted candidate; the
+    /// demotion clears only after max(strikes, 2) consecutive real
+    /// successes, so a fast-but-flaky node cannot reclaim rank with one
+    /// lucky probe.
+    pub fn is_failure_demoted(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) -> bool {
+        let idx = alive_index(domain, ipver);
+        let cols = self.collections.read();
+        cols.get(&node_id)
+            .is_some_and(|arr| arr[idx].is_failure_demoted())
+    }
+
     /// Read the last probe latency for a node-domain pair.
     pub fn get_last_latency(
         &self,
@@ -993,24 +1020,57 @@ impl AliveDialerSet {
         coll.latencies.avg().or_else(|| coll.latencies.last())
     }
 
-    /// Delete all latency history for a node (sing-box URLTest "delete
-    /// history" semantics on measurement failure). After this call
-    /// `get_last_latency` / `get_moving_average` return `None` until the
-    /// next successful measurement.
-    pub fn clear_latency(&self, node_id: Uuid) {
-        self.collections.write().remove(&node_id);
+    /// Dial-failure handling: only DIAL_FAILURE_STRIKE_AT consecutive dial
+    /// failures append the synthetic timeout sample and one failure strike —
+    /// a lone transient failure (the retry race rescues that flow) leaves no
+    /// selection state at all. The node's real history and moving average
+    /// are retained so URLTest tolerance hysteresis keeps its baseline; the
+    /// strike demotes the node in ranking until max(strikes, 2) consecutive
+    /// real successes clear it, which is what stops a fast-but-flaky node
+    /// from reclaiming the top rank with a single lucky probe.
+    pub fn record_dial_failure(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
+        self.get_or_create_collection(node_id, alive_index(domain, ipver))
+            .record_dial_failure();
     }
 
-    /// Dial-failure handling: un-rank the node (sing-box
-    /// `DeleteURLTestHistory` parity) **and** seed one synthetic timeout
-    /// sample. The blank-slate version let a fast-but-flaky node reclaim
-    /// the top rank with a single lucky probe — with the penalty sample its
-    /// moving average stays unattractive until ten real successes age the
-    /// failure out.
-    pub fn record_dial_failure(&self, node_id: Uuid, domain: ProbeDomain, ipver: IpVersion) {
-        self.clear_latency(node_id);
+    /// Feed one REAL proxied dial's wall-clock latency (network round trip
+    /// only — pool-ready hits are excluded by the caller). Sudden
+    /// degradation (3 consecutive dials slower than min(2×ema, ema+500ms),
+    /// floored at 250ms so fast nodes under load don't trip it)
+    /// appends a synthetic failure strike (strike demotion) and returns
+    /// true so the caller fires an emergency probe. Gradual drift stays
+    /// owned by the probe cycle. Returns true once per demotion.
+    ///
+    /// A false positive (target-mix shift, not node decay) self-heals: the
+    /// emergency probe succeeds and consecutive probe successes clear the
+    /// strike while the replacement node serves traffic meanwhile.
+    pub fn report_dial_latency(
+        &self,
+        node_id: Uuid,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+        elapsed: Duration,
+    ) -> bool {
+        // Local-egress latency is not node quality.
+        if node_id == DIRECT_NODE_ID || node_id == BLOCK_NODE_ID {
+            return false;
+        }
         let coll = self.get_or_create_collection(node_id, alive_index(domain, ipver));
-        coll.mark_unavailable();
+        match coll.record_traffic_latency(elapsed) {
+            TrafficVerdict::Slow => {
+                if coll.bump_slow_streak() >= SLOW_DIAL_STREAK_MAX {
+                    coll.reset_slow_streak();
+                    coll.mark_unavailable();
+                    true
+                } else {
+                    false
+                }
+            }
+            TrafficVerdict::Fast | TrafficVerdict::Warmup => {
+                coll.reset_slow_streak();
+                false
+            }
+        }
     }
 
     /// Seed a persisted delay sample into the node's TCP-v4 latency
@@ -1209,11 +1269,8 @@ impl AliveDialerSet {
             .unwrap_or_default()
     }
 
-    /// Whether the member is alive for a custom check URL. The key is
-    /// the member TAG (a direct member's node name, or a sub-group's
-    /// tag — sing-box RealTag semantics): the parent ranks sub-groups as
-    /// units. Members never probed default to alive (same as the global
-    /// path).
+    /// Whether the member is alive for a custom check URL. The key is the
+    /// member tag; members never probed default to alive.
     pub fn is_alive_for_url(&self, node_id: &str, url: &str) -> bool {
         self.url_states
             .read()
@@ -1271,9 +1328,9 @@ impl AliveDialerSet {
         }
     }
 
-    /// Record a failed custom-URL probe: TCP-probe parity — a single
-    /// failure kills the node for this URL; backoff 5s→300s with no
-    /// permanent stop.
+    /// Record a failed custom-URL probe: TCP-probe parity — three
+    /// consecutive failures kill the node for this URL; backoff 5s→300s
+    /// with no permanent stop.
     pub(crate) fn record_url_probe_failure(&self, node_id: &str, url: &str) {
         let key = (node_id.to_string(), url.to_string());
         let mut states = self.url_states.write();

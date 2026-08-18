@@ -163,7 +163,7 @@ pub(super) fn decode(
     }
     let (query, policy, scope, operation) = decode_key(key_bytes, active_policy)?;
     let key = CacheKey::new(&query, policy, scope, operation);
-    ResponseTemplate::validate(&query, &response).map_err(|_| DecodeError::Corrupt)?;
+    ResponseTemplate::check(&query, &response).map_err(|_| DecodeError::Corrupt)?;
     Ok(DecodedEntry {
         key,
         response,

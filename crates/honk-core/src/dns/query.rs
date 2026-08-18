@@ -1,3 +1,4 @@
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -11,30 +12,26 @@ const HEADER_LEN: usize = 12;
 const MIN_QUESTION_WIRE_LEN: usize = 5;
 const OPT_TYPE: u16 = 41;
 const ALLOWED_QUERY_FLAGS: u16 = 0x0130;
-/// Validate a complete DNS request structurally. Ingress adapters and the
-/// policy engine apply the stricter single-question contract before any raw
-/// query can be forwarded.
-pub(crate) fn is_dns_request(data: &[u8]) -> bool {
-    data.len() >= HEADER_LEN
-        && data[2] & 0x80 == 0
-        && QueryContext::parse(data)
-            .ok()
-            .and_then(|query| query.qname()?.to_domain_name())
-            .is_some()
+
+/// Unforgeable evidence that an ingress adapter validated the exact query.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ValidatedDnsQuery(IngressProfile);
+
+impl ValidatedDnsQuery {
+    pub(crate) const fn ingress(self) -> IngressProfile {
+        self.0
+    }
 }
 
-/// Return whether `data` is exactly one DNS query that the forwarding path
-/// can consume. Every record declared by the header must be complete and the
-/// message must end at the final record; compression pointers may only target
-/// previously observed label boundaries.
-pub(crate) fn is_exact_dns_query(data: &[u8]) -> bool {
+/// Validate exactly one complete, forwarder-consumable DNS query.
+pub(crate) fn validate_exact_dns_query(data: &[u8]) -> Option<ValidatedDnsQuery> {
     if data.len() < HEADER_LEN || data[2] & 0x80 != 0 {
-        return false;
+        return None;
     }
 
     let qdcount = usize::from(u16::from_be_bytes([data[4], data[5]]));
     if qdcount != 1 {
-        return false;
+        return None;
     }
     let counts = [
         usize::from(u16::from_be_bytes([data[6], data[7]])),
@@ -50,7 +47,7 @@ pub(crate) fn is_exact_dns_query(data: &[u8]) -> bool {
     if !skip_strict_dns_name(data, &mut pos, &mut label_boundaries)
         || pos.checked_add(4).is_none_or(|end| end > data.len())
     {
-        return false;
+        return None;
     }
     pos += 4; // QTYPE + QCLASS
 
@@ -59,27 +56,36 @@ pub(crate) fn is_exact_dns_query(data: &[u8]) -> bool {
             if !skip_strict_dns_name(data, &mut pos, &mut label_boundaries)
                 || pos.checked_add(10).is_none_or(|end| end > data.len())
             {
-                return false;
+                return None;
             }
             let rdlength = usize::from(u16::from_be_bytes([data[pos + 8], data[pos + 9]]));
             pos += 10; // TYPE + CLASS + TTL + RDLENGTH
-            let Some(rdata_end) = pos.checked_add(rdlength) else {
-                return false;
-            };
+            let rdata_end = pos.checked_add(rdlength)?;
             if rdata_end > data.len() {
-                return false;
+                return None;
             }
             pos = rdata_end;
         }
     }
 
     if pos != data.len() {
-        return false;
+        return None;
     }
 
-    is_dns_request(data)
+    let query = QueryContext::parse(data).ok()?;
+    query.qname()?.to_domain_name()?;
+    let advertised_size = query
+        .edns()
+        .map(|edns| edns.advertised_size())
+        .unwrap_or(512);
+    Some(ValidatedDnsQuery(IngressProfile::Udp { advertised_size }))
 }
 
+pub(crate) fn is_exact_dns_query(data: &[u8]) -> bool {
+    validate_exact_dns_query(data).is_some()
+}
+
+#[cfg(test)]
 /// Derive the response-size policy advertised by a UDP DNS query.
 pub(crate) fn udp_ingress_profile(data: &[u8]) -> IngressProfile {
     let advertised_size = QueryContext::parse(data)
@@ -226,6 +232,40 @@ pub enum IngressProfile {
     Api,
     #[default]
     Internal,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct DnsRequestMeta {
+    source_ip: Option<IpAddr>,
+    original_dst: Option<SocketAddr>,
+}
+
+impl DnsRequestMeta {
+    pub const EMPTY: Self = Self {
+        source_ip: None,
+        original_dst: None,
+    };
+
+    pub fn new(source_ip: Option<IpAddr>, original_dst: Option<SocketAddr>) -> Self {
+        let source_ip = source_ip.map(|source| match source {
+            IpAddr::V6(address) => address
+                .to_ipv4_mapped()
+                .map_or(IpAddr::V6(address), IpAddr::V4),
+            source => source,
+        });
+        Self {
+            source_ip,
+            original_dst,
+        }
+    }
+
+    pub const fn source_ip(self) -> Option<IpAddr> {
+        self.source_ip
+    }
+
+    pub const fn original_dst(self) -> Option<SocketAddr> {
+        self.original_dst
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -114,6 +114,8 @@ const _UDP_DECISION_STATE_VALUES: () = assert!(
 );
 
 /// Persistent allocator value shared by the BPF sequence map and userspace.
+/// `next` is the full raw token so older binaries can resume allocation after
+/// a rollback; `exhausted` retains their ABI and is set only at the final token.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct UdpDecisionSequence {

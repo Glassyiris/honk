@@ -28,17 +28,33 @@ impl DotPool {
         }))
     }
 
-    pub async fn exchange(self: &Arc<Self>, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        exchange_with_retry("DoT", || self.exchange_once(raw_query), || async {}).await
+    pub async fn exchange(
+        self: &Arc<Self>,
+        raw_query: &[u8],
+        feedback: Option<&honk_outbound::group::ScoreFeedback>,
+    ) -> anyhow::Result<Vec<u8>> {
+        exchange_with_retry(
+            "DoT",
+            raw_query,
+            |reporter| async move { self.exchange_once(raw_query, reporter.as_ref()).await },
+            || async {},
+            feedback,
+        )
+        .await
     }
 
-    async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn exchange_once(
+        &self,
+        raw_query: &[u8],
+        reporter: Option<&honk_outbound::group::ScoreReporter>,
+    ) -> anyhow::Result<Vec<u8>> {
         idle_pool_exchange(
             &self.lifecycle,
             &self.idle,
             || self.dial_tls(),
             raw_query,
             self.dial.query_timeout,
+            reporter,
         )
         .await
     }
@@ -46,23 +62,20 @@ impl DotPool {
     async fn dial_tls(&self) -> anyhow::Result<PooledStream> {
         let server_name = self.dial.endpoint.sni.clone();
         let via_proxy = self.dial.proxy.is_some();
-        tokio::time::timeout(self.dial.dial_timeout, async {
-            let tcp = self.dial.dial_tcp_boxed().await?;
-            self.connector
-                .connect(&server_name, tcp)
-                .await
-                .map_err(|error| {
-                    let route = if via_proxy { " (via proxy)" } else { "" };
-                    anyhow::anyhow!("DoT TLS handshake{route}: {error}")
-                })
-        })
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "DoT dial and TLS handshake timed out after {:?}",
-                self.dial.dial_timeout
-            )
-        })?
+        let deadline = tokio::time::Instant::now() + self.dial.dial_timeout;
+        let tcp = self.dial.dial_tcp_boxed_until(deadline).await?;
+        tokio::time::timeout_at(deadline, self.connector.connect(&server_name, tcp))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "DoT dial and TLS handshake timed out after {:?}",
+                    self.dial.dial_timeout
+                )
+            })?
+            .map_err(|error| {
+                let route = if via_proxy { " (via proxy)" } else { "" };
+                anyhow::anyhow!("DoT TLS handshake{route}: {error}")
+            })
     }
 
     pub(crate) async fn close(&self) {

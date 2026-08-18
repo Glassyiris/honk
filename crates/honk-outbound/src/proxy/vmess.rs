@@ -1,46 +1,4 @@
 //! VMess AEAD outbound handler (alterId = 0).
-//!
-//! Implements the VMess AEAD wire format as specified by Xray-core
-//! (`proxy/vmess/aead`, `proxy/vmess/encoding`) and sing-vmess — the format
-//! sing-box/v2ray servers actually speak:
-//!
-//! 1. **Request header** (`aead/encrypt.go` `SealVMessAEADHeader`):
-//!    ```text
-//!    auth_id(16) | enc_len(2+16) | conn_nonce(8) | enc_header(N+16)
-//!    ```
-//!    - `auth_id`: AES-128 single-block encrypt of
-//!      `ts(8 BE) | rand(4) | crc32(ts|rand)(4 BE)` under
-//!      `KDF16(cmd_key, "AES Auth ID Encryption")` (`aead/authid.go`).
-//!    - `enc_len`/`enc_header`: AES-128-GCM with keys/nonces from
-//!      `KDF(cmd_key, salt, auth_id, conn_nonce)`, AAD = auth_id.
-//!    - `cmd_key = MD5(uuid || "c48619fe-8f02-49e0-b9e9-edf763e17e21")`.
-//!    - `KDF` is the chained HMAC-SHA256 of `aead/kdf.go` with salt seed
-//!      `"VMess AEAD KDF"`.
-//!
-//! 2. **Header plaintext** (`encoding/client.go` `EncodeRequestHeader`):
-//!    ```text
-//!    version(1) | req_iv(16) | req_key(16) | resp_header(1) | option(1) |
-//!    padding_len<<4|security(1) | 0(1) | cmd(1) | port(2 BE) | atyp+addr |
-//!    padding | fnv1a32(4 BE)
-//!    ```
-//!    ATYP numbering is V2Ray's (IPv4=1, Domain=2, IPv6=3) and the port
-//!    comes FIRST (`addrParser.WriteAddressPort`).
-//!
-//! 3. **Body chunks** (`common/crypto` `AuthenticationWriter` +
-//!    `encoding/auth.go` `ShakeSizeParser`):
-//!    ```text
-//!    masked_len(2) | encrypted_payload(len+16)
-//!    ```
-//!    - `masked_len = BE16(payload_len+16) XOR SHAKE128(iv)` (2 bytes per
-//!      chunk from one continuous SHAKE stream, option `ChunkMasking`).
-//!    - AES-128-GCM key = body key, nonce = `count(2 BE) | iv[2..12]`,
-//!      count starts at 0 (`GenerateChunkNonce`).
-//!    - An empty-payload chunk (len field = 16) terminates the request body.
-//!
-//! 4. **Response**: body key/iv are `SHA256(req_key/req_iv)[..16]`; the
-//!    response header is AES-128-GCM with `KDF` salts
-//!    `"AEAD Resp Header {Len,}{Key,IV}"` and no AAD
-//!    (`encoding/client.go` `DecodeResponseHeader`).
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use async_trait::async_trait;
@@ -50,8 +8,10 @@ use rand::Rng;
 use rand::RngExt;
 use sha2::Sha256;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
 use super::addr::{self, SocksAddr};
@@ -210,6 +170,51 @@ impl Session {
             resp_iv,
             resp_header: rng.random(),
         }
+    }
+}
+
+struct VmessStream {
+    inner: tokio::io::DuplexStream,
+    relay: tokio::task::AbortHandle,
+}
+
+impl std::fmt::Debug for VmessStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VmessStream").finish_non_exhaustive()
+    }
+}
+
+impl AsyncRead for VmessStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for VmessStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl Drop for VmessStream {
+    fn drop(&mut self) {
+        self.relay.abort();
     }
 }
 
@@ -399,10 +404,13 @@ impl VmessHandler {
         let header_wire = Self::seal_request_header(&cmd_key, &auth_id, &conn_nonce, &plain);
 
         let (client_half, server_half) = tokio::io::duplex(65536);
-        tokio::spawn(vmess_relay(stream, server_half, header_wire, session));
+        let relay = tokio::spawn(vmess_relay(stream, server_half, header_wire, session));
 
         Ok(ProxyStream {
-            stream: Box::new(client_half),
+            stream: Box::new(VmessStream {
+                inner: client_half,
+                relay: relay.abort_handle(),
+            }),
             target_addr: target,
             target_domain: target_domain.map(|s| s.to_string()),
         })
@@ -450,12 +458,12 @@ impl ProbeableOutbound for VmessHandler {}
 
 /// `ShakeSizeParser` (encoding/auth.go): a SHAKE128 stream over the body IV
 /// yielding the 2-byte XOR mask for each chunk's length field, in order.
-struct ShakeSizeParser(sha3::Shake128Reader);
+struct ShakeSizeParser(shake::ShakeReader<168>);
 
 impl ShakeSizeParser {
     fn new(iv: &[u8; 16]) -> Self {
         use sha3::digest::{ExtendableOutput, Update};
-        let mut h = sha3::Shake128::default();
+        let mut h = shake::Shake128::default();
         h.update(iv);
         Self(h.finalize_xof())
     }
@@ -860,6 +868,35 @@ mod tests {
             let n = rx.open_chunk(&mut ct).unwrap();
             assert_eq!(&ct[..n], payload);
         }
+    }
+
+    #[tokio::test]
+    async fn dropping_vmess_stream_closes_physical_transport() {
+        let (physical, mut peer) = tokio::io::duplex(4096);
+        let uuid = uuid::Uuid::parse_str(UUID).unwrap();
+        let target = "93.184.216.34:53".parse().unwrap();
+        let stream =
+            VmessHandler::perform_handshake(uuid.as_bytes(), Box::new(physical), target, None)
+                .unwrap();
+
+        let mut first = [0];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            peer.read_exact(&mut first),
+        )
+        .await
+        .expect("VMess relay must write its request header")
+        .unwrap();
+        drop(stream);
+
+        let mut rest = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            peer.read_to_end(&mut rest),
+        )
+        .await
+        .expect("dropping the VMess stream must close its physical transport")
+        .unwrap();
     }
 
     #[test]

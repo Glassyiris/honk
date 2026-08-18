@@ -253,6 +253,31 @@ fn test_config_json_round_trip() {
 }
 
 #[test]
+fn test_config_json_vless_mode_and_default() {
+    let mut config = Config::default();
+    config.nodes.push(
+        Node::from_share_link("vless://uuid@example.com:443?vless_mode=mux-cool#vless").unwrap(),
+    );
+    let json = config.to_json_string().unwrap();
+    let parsed = Config::from_json_str(&json).unwrap();
+    assert_eq!(
+        parsed.nodes[0].vless_mode,
+        honk_config::node::WireMode::MuxCool
+    );
+
+    let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    value["nodes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("vless_mode");
+    let parsed = Config::from_json_str(&value.to_string()).unwrap();
+    assert_eq!(
+        parsed.nodes[0].vless_mode,
+        honk_config::node::WireMode::Legacy
+    );
+}
+
+#[test]
 fn test_config_toml_round_trip() {
     let config = sample_config();
     let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -489,6 +514,86 @@ fn test_tuic_alpn_and_congestion_params() {
 }
 
 #[test]
+fn test_vless_mode_query() {
+    for (value, expected) in [
+        ("legacy", honk_config::node::WireMode::Legacy),
+        ("uot-v2", honk_config::node::WireMode::UotV2),
+        ("h2mux", honk_config::node::WireMode::H2mux),
+        ("h2mux-padded", honk_config::node::WireMode::H2muxPadded),
+        ("xudp", honk_config::node::WireMode::Xudp),
+        ("mux-cool", honk_config::node::WireMode::MuxCool),
+    ] {
+        let node = Node::from_share_link(&format!(
+            "vless://uuid@example.com:443?vless_mode={value}#node"
+        ))
+        .unwrap();
+        assert_eq!(node.vless_mode, expected);
+    }
+    let xudp =
+        Node::from_share_link("vless://uuid@example.com:443?packetEncoding=xudp#node").unwrap();
+    assert_eq!(xudp.vless_mode, honk_config::node::WireMode::Xudp);
+
+    let error =
+        Node::from_share_link("vless://uuid@example.com:443?vless_mode=smux#node").unwrap_err();
+    assert!(error.to_string().contains("unsupported wire mode"));
+}
+
+#[test]
+fn test_vless_mode_query_rejects_duplicates() {
+    let error = Node::from_share_link(
+        "vless://uuid@example.com:443?vless_mode=xudp&vless_mode=legacy#node",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("duplicate"));
+    let error = Node::from_share_link(
+        "vless://uuid@example.com:443?vless_mode=xudp&packetEncoding=xudp#node",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("duplicate"));
+}
+
+#[test]
+fn test_rejects_vless_mode_on_other_protocols() {
+    for query in ["vless_mode=h2mux", "packetEncoding=xudp"] {
+        let error =
+            Node::from_share_link(&format!("trojan://password@example.com:443?{query}#node"))
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("only for VLESS"),
+            "{query}: {error}"
+        );
+    }
+}
+
+#[test]
+fn test_vless_share_link_rejects_external_mux_fields() {
+    for parameter in [
+        "smux=h2mux",
+        "udp-over-tcp=1",
+        "packet-encoding=xudp",
+        "only-tcp=1",
+        "brutal=1",
+        "packet-addr=1",
+        "xudp=1",
+        "brutal-opts=1",
+        "max-connections=2",
+    ] {
+        let error =
+            Node::from_share_link(&format!("vless://uuid@example.com:443?{parameter}#node"))
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("use vless_mode"),
+            "{parameter}: {error}"
+        );
+    }
+
+    let error =
+        Node::from_share_link("vless://uuid@example.com:443?packetEncoding=packetaddr#node")
+            .unwrap_err();
+    assert!(error.to_string().contains("expected xudp"));
+}
+
+#[test]
 fn test_vless_reality_full() {
     let node = Node::from_share_link(
         "vless://b831381d-6324-4d53-ad4f-8cda48b30811@reality.example.com:443?security=reality&pbk=jHkr1EmJCyQxjU0HXJlNblVdXB4Z7yODHJhgJ5lqmzc&sid=a1b2c3d4e5f60718&spx=%2F&fp=chrome&flow=xtls-rprx-vision#reality-node",
@@ -542,6 +647,35 @@ fn test_vless_no_security_keeps_tls_default() {
     let node = Node::from_share_link("vless://uuid@example.com:443#n").unwrap();
     assert!(node.tls);
     assert!(node.reality_public_key.is_none());
+}
+
+#[test]
+fn test_vless_encryption_param_and_identity() {
+    let plain = Node::from_share_link("vless://uuid@example.com:443#plain").unwrap();
+    let encryption = "mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let encrypted = Node::from_share_link(&format!(
+        "vless://uuid@example.com:443?encryption={encryption}#encrypted"
+    ))
+    .unwrap();
+    assert_eq!(encrypted.encryption.as_deref(), Some(encryption));
+    assert_ne!(plain.id, encrypted.id);
+}
+
+#[test]
+fn test_validate_rejects_vless_encryption_with_flow() {
+    let encryption = "mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let node = Node::from_share_link(&format!(
+        "vless://uuid@example.com:443?security=tls&flow=xtls-rprx-vision&encryption={encryption}#encrypted-flow"
+    ))
+    .unwrap();
+    let mut config = Config::default();
+    config.nodes.push(node);
+    let error = config.validate().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("combines VLESS Encryption with flow")
+    );
 }
 
 #[test]

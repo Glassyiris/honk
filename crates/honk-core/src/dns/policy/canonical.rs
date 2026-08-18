@@ -103,15 +103,24 @@ use self::normalize::{exact, host, lowercase};
 use self::wire::Writer;
 use super::PolicyError;
 use crate::dns::endpoint::DnsEndpoint;
+use crate::routing::parse_ip_net_str;
 
 const FORMAT_VERSION: u8 = 2;
+const ECS_FORMAT_VERSION: u8 = 3;
 // Stale controls are not configurable yet, so identity pins the cache/forwarder defaults.
 const STALE_RETENTION_SECS: u64 = 3600;
 const SERVE_STALE_TTL_SECS: u32 = 30;
 
 pub(super) fn encode(config: &DnsConfig) -> Result<Vec<u8>, PolicyError> {
+    let client_subnet = config
+        .effective_client_subnet()
+        .map_err(|source| PolicyError::InvalidClientSubnet { source })?;
     let mut writer = Writer::new();
-    writer.byte(FORMAT_VERSION);
+    writer.byte(if client_subnet.is_some() {
+        ECS_FORMAT_VERSION
+    } else {
+        FORMAT_VERSION
+    });
     writer.len(config.upstream.len())?;
     for upstream in &config.upstream {
         writer.string(&exact(&upstream.name, "upstream name")?)?;
@@ -170,6 +179,12 @@ pub(super) fn encode(config: &DnsConfig) -> Result<Vec<u8>, PolicyError> {
     writer.u64(u64::try_from(config.cache.max_size).map_err(|_| PolicyError::FieldTooLarge)?);
     writer.u64(STALE_RETENTION_SECS);
     writer.u32(SERVE_STALE_TTL_SECS);
+    if let Some(network) = client_subnet {
+        writer.byte(network.prefix_len());
+        for octet in network.network().octets() {
+            writer.byte(octet);
+        }
+    }
     Ok(writer.finish())
 }
 
@@ -210,6 +225,23 @@ fn conditions(writer: &mut Writer, values: &[DnsCond]) -> Result<(), PolicyError
                 writer.len(types.len())?;
                 for value in types {
                     writer.u16(*value);
+                }
+            }
+            DnsCond::Sip { not, cidrs } => {
+                if cidrs.is_empty() {
+                    return Err(PolicyError::EmptyName {
+                        field: "source IP condition",
+                    });
+                }
+                writer.byte(4);
+                writer.byte(u8::from(*not));
+                writer.len(cidrs.len())?;
+                for value in cidrs {
+                    let network =
+                        parse_ip_net_str(value).ok_or_else(|| PolicyError::InvalidCidr {
+                            value: value.clone(),
+                        })?;
+                    writer.string(&network.trunc().to_string())?;
                 }
             }
             DnsCond::Upstream { not, names } => {

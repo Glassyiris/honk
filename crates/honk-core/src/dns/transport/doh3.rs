@@ -3,7 +3,6 @@
 //! One long-lived QUIC connection with ALPN `h3`, carrying POST requests of
 //! `application/dns-message` to the configured path (default `/dns-query`).
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -22,7 +21,7 @@ use super::lifecycle::LifecycleSlot;
 use super::owned_task::OwnedTask;
 use super::{
     DnsMessageBody, SharedQuicEndpoint, build_doh_request, dns_quic_config, doh_content_length,
-    exchange_with_retry, finish_doh_response, quic_connect,
+    exchange_with_retry, finish_doh_response, quic_connect_endpoint,
 };
 
 type H3Sender = SendRequest<h3_quinn::OpenStreams, Bytes>;
@@ -77,19 +76,30 @@ impl Doh3Client {
         }))
     }
 
-    pub async fn exchange(self: &Arc<Self>, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub async fn exchange(
+        self: &Arc<Self>,
+        raw_query: &[u8],
+        feedback: Option<&honk_outbound::group::ScoreFeedback>,
+    ) -> anyhow::Result<Vec<u8>> {
         exchange_with_retry(
             "DoH3",
-            || self.exchange_once(raw_query),
-            || async {
-                self.close_session().await;
-            },
+            raw_query,
+            |reporter| async move { self.exchange_once(raw_query, reporter.as_ref()).await },
+            || async { self.close_session().await },
+            feedback,
         )
         .await
     }
 
-    async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn exchange_once(
+        &self,
+        raw_query: &[u8],
+        reporter: Option<&honk_outbound::group::ScoreReporter>,
+    ) -> anyhow::Result<Vec<u8>> {
         let mut sender = self.get_sender().await?;
+        if let Some(reporter) = reporter {
+            reporter.setup_succeeded();
+        }
 
         tokio::time::timeout(self.query_timeout, async {
             let mut wire = raw_query.to_vec();
@@ -110,6 +120,9 @@ impl Doh3Client {
                 .finish()
                 .await
                 .map_err(|e| anyhow::anyhow!("DoH3 finish: {e}"))?;
+            if let Some(reporter) = reporter {
+                reporter.tx(raw_query.len() as u64);
+            }
 
             let response = stream
                 .recv_response()
@@ -132,7 +145,14 @@ impl Doh3Client {
                 }
             }
 
-            finish_doh_response("DoH3", status, buf.into_bytes(), orig_id)
+            let response = finish_doh_response("DoH3", status, buf.into_bytes(), orig_id)?;
+            if let Some(reporter) = reporter
+                && super::is_valid_response(raw_query, &response)
+            {
+                reporter.first_response();
+                reporter.rx(response.len() as u64);
+            }
+            Ok::<_, anyhow::Error>(response)
         })
         .await
         .map_err(|_| anyhow::anyhow!("DoH3 exchange timed out after {:?}", self.query_timeout))?
@@ -149,25 +169,20 @@ impl Doh3Client {
     }
 
     async fn handshake(&self) -> anyhow::Result<H3Session> {
-        let (conn, mut driver, sender) = tokio::time::timeout(self.dial_timeout, async {
-            let addr: SocketAddr = self.endpoint.resolve_addr().await?;
-            let conn = quic_connect(
-                &self.quic_ep,
-                &self.quic_config,
-                addr,
-                &self.endpoint.sni,
-                self.dial_timeout,
-                "DoH3 QUIC",
-            )
-            .await?;
-            let quinn_conn = H3QuinnConnection::new(conn.clone());
-            let (driver, sender) = h3::client::new(quinn_conn)
-                .await
-                .map_err(|e| anyhow::anyhow!("DoH3 h3::client::new: {e}"))?;
-            Ok::<_, anyhow::Error>((conn, driver, sender))
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("DoH3 dial timed out after {:?}", self.dial_timeout))??;
+        let deadline = tokio::time::Instant::now() + self.dial_timeout;
+        let conn = quic_connect_endpoint(
+            &self.quic_ep,
+            &self.quic_config,
+            &self.endpoint,
+            deadline,
+            "DoH3 QUIC",
+        )
+        .await?;
+        let quinn_conn = H3QuinnConnection::new(conn.clone());
+        let (mut driver, sender) = tokio::time::timeout_at(deadline, h3::client::new(quinn_conn))
+            .await
+            .map_err(|_| anyhow::anyhow!("DoH3 dial timed out after {:?}", self.dial_timeout))?
+            .map_err(|e| anyhow::anyhow!("DoH3 h3::client::new: {e}"))?;
 
         let driver = OwnedTask::spawn(
             async move {

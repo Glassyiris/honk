@@ -1,5 +1,7 @@
 use super::DnsController;
-use crate::dns::query::{IngressProfile, is_exact_dns_query, udp_ingress_profile};
+use crate::dns::query::{
+    DnsRequestMeta, IngressProfile, ValidatedDnsQuery, is_exact_dns_query, validate_exact_dns_query,
+};
 use crate::dns::response::build_dns_refused;
 use crate::dns::transport::{read_length_prefixed_into, write_length_prefixed};
 use std::net::SocketAddr;
@@ -11,16 +13,19 @@ pub(super) const TCP_DNS_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl DnsController {
     /// Handle a UDP DNS query from TPROXY.
-    pub async fn handle_udp_dns(
+    pub(crate) async fn handle_udp_dns(
         &self,
         data: &[u8],
         client_addr: SocketAddr,
         original_dst: SocketAddr,
+        validated: Option<ValidatedDnsQuery>,
     ) -> anyhow::Result<bool> {
-        if original_dst.port() != 53 || !is_exact_dns_query(data) {
+        if original_dst.port() != 53 {
             return Ok(false);
         }
-
+        let Some(validated) = validated.or_else(|| validate_exact_dns_query(data)) else {
+            return Ok(false);
+        };
         // Keep the permit through the reply write so the limit bounds the
         // complete request lifecycle rather than only upstream resolution.
         let _permit = match self.try_acquire_query() {
@@ -40,7 +45,11 @@ impl DnsController {
 
         debug!(%client_addr, "DNS controller (UDP): forwarding query");
         let response = self
-            .answer_query(data, Some(original_dst), udp_ingress_profile(data))
+            .answer_query(
+                data,
+                DnsRequestMeta::new(Some(client_addr.ip()), Some(original_dst)),
+                validated.ingress(),
+            )
             .await;
         let _ =
             super::super::send_udp_reply_from_orig_dst(&response, client_addr, original_dst).await;
@@ -81,19 +90,20 @@ impl DnsController {
         original_dst: Option<SocketAddr>,
     ) -> anyhow::Result<bool> {
         stream.set_nodelay(true)?;
+        let metadata = DnsRequestMeta::new(Some(client_addr.ip()), original_dst);
         let mut query = Vec::new();
         if !read_tcp_dns_query(stream, &mut query, Some(TCP_DNS_IO_TIMEOUT)).await {
             return Ok(original_dst.is_some());
         }
 
         debug!(%client_addr, "DNS controller (TCP): forwarding query");
-        self.process_tcp_query(stream, &query, original_dst).await?;
+        self.process_tcp_query(stream, &query, metadata).await?;
 
         loop {
             if !read_tcp_dns_query(stream, &mut query, Some(TCP_DNS_IO_TIMEOUT)).await {
                 return Ok(true);
             }
-            self.process_tcp_query(stream, &query, original_dst).await?;
+            self.process_tcp_query(stream, &query, metadata).await?;
         }
     }
 
@@ -101,14 +111,14 @@ impl DnsController {
         &self,
         stream: &mut TcpStream,
         query: &[u8],
-        original_dst: Option<SocketAddr>,
+        metadata: DnsRequestMeta,
     ) -> anyhow::Result<()> {
         // Keep the permit through the framed response write, including every
         // frame on a persistent TCP connection.
         match self.try_acquire_query() {
             Ok(_permit) => {
                 let response = self
-                    .answer_query(query, original_dst, IngressProfile::Tcp)
+                    .answer_query(query, metadata, IngressProfile::Tcp)
                     .await;
                 write_tcp_dns_response(stream, &response, TCP_DNS_IO_TIMEOUT).await
             }

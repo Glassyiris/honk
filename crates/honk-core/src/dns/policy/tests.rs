@@ -53,6 +53,37 @@ fn dns_v2_persistence_cache_identity_matches_external_golden_contract() {
 }
 
 #[test]
+fn effective_client_subnet_partitions_policy_identity() {
+    let disabled = representative_config();
+    let mut unresolved = representative_config();
+    unresolved.client_subnet = "auto(9.9.9.9)".into();
+    assert_eq!(
+        PolicyId::from_config(&disabled).unwrap(),
+        PolicyId::from_config(&unresolved).unwrap()
+    );
+
+    let mut first = unresolved.clone();
+    first.resolved_client_subnet = Some("198.51.100.0/24".parse().unwrap());
+    let mut same = first.clone();
+    same.client_subnet = "auto(1.1.1.1)".into();
+    let mut second = same.clone();
+    second.resolved_client_subnet = Some("203.0.113.0/24".parse().unwrap());
+
+    assert_eq!(
+        PolicyId::from_config(&first).unwrap(),
+        PolicyId::from_config(&same).unwrap()
+    );
+    assert_ne!(
+        PolicyId::from_config(&disabled).unwrap(),
+        PolicyId::from_config(&first).unwrap()
+    );
+    assert_ne!(
+        PolicyId::from_config(&first).unwrap(),
+        PolicyId::from_config(&second).unwrap()
+    );
+}
+
+#[test]
 fn canonical_policy_normalizes_equivalent_endpoint_spellings() {
     // Given
     let first = representative_config();
@@ -66,6 +97,69 @@ fn canonical_policy_normalizes_equivalent_endpoint_spellings() {
 
     // Then
     assert_eq!(first_id, second_id);
+}
+
+#[test]
+fn sip_policy_identity_normalizes_addresses_and_preserves_semantics() {
+    fn config(cidrs: &[&str], not: bool, action: DnsRequestAction) -> DnsConfig {
+        let mut config = DnsConfig::default();
+        config.routing.request.rules = vec![DnsRequestRule {
+            conditions: vec![DnsCond::Sip {
+                not,
+                cidrs: cidrs.iter().map(|cidr| (*cidr).to_owned()).collect(),
+            }],
+            action,
+        }];
+        config
+    }
+
+    let id = |config: &DnsConfig| PolicyId::from_config(config).expect("valid policy");
+    assert_eq!(
+        id(&config(
+            &["192.0.2.10", "2001:db8::10", "2001:db8:0:0::/64"],
+            false,
+            DnsRequestAction::Reject,
+        )),
+        id(&config(
+            &["192.0.2.10/32", "2001:db8::10/128", "2001:db8::/64"],
+            false,
+            DnsRequestAction::Reject,
+        )),
+    );
+    assert!(PolicyId::from_config(&config(&[], false, DnsRequestAction::Reject)).is_err());
+    assert!(
+        PolicyId::from_config(&config(&["not-an-ip"], false, DnsRequestAction::Reject,)).is_err()
+    );
+
+    let base = id(&config(
+        &["192.0.2.10", "198.51.100.0/24"],
+        false,
+        DnsRequestAction::Reject,
+    ));
+    assert_ne!(
+        base,
+        id(&config(
+            &["198.51.100.0/24", "192.0.2.10"],
+            false,
+            DnsRequestAction::Reject,
+        )),
+    );
+    assert_ne!(
+        base,
+        id(&config(
+            &["192.0.2.10", "198.51.100.0/24"],
+            true,
+            DnsRequestAction::Reject,
+        )),
+    );
+    assert_ne!(
+        base,
+        id(&config(
+            &["192.0.2.10", "198.51.100.0/24"],
+            false,
+            DnsRequestAction::AsIs,
+        )),
+    );
 }
 
 #[test]
@@ -128,6 +222,19 @@ fn listener_bind_does_not_change_resolution_policy_identity() {
     assert_eq!(
         PolicyId::from_config(&base).expect("base policy"),
         PolicyId::from_config(&bound).expect("bound policy"),
+    );
+}
+
+#[test]
+fn hosts_lookup_does_not_change_upstream_cache_identity() {
+    let base = representative_config();
+    let mut with_hosts = base.clone();
+    with_hosts.use_host = true;
+
+    // Hosts answers bypass the cache before routing; non-host upstream policy is unchanged.
+    assert_eq!(
+        PolicyId::from_config(&base).expect("base policy"),
+        PolicyId::from_config(&with_hosts).expect("hosts policy"),
     );
 }
 

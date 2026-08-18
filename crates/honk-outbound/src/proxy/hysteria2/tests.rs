@@ -1,5 +1,11 @@
+use super::wire::{
+    AUTH_PADDING_MAX, AUTH_PADDING_MIN, FRAME_TYPE_TCP_REQUEST, HEADER_AUTH, HEADER_CC_RX,
+    HEADER_PADDING, HEADER_UDP, MAX_ADDRESS_LENGTH, MAX_FIELD_SECTION, MAX_PADDING_LENGTH,
+    STATUS_AUTH_OK, URL_HOST, URL_PATH, decode_udp_message, encode_tcp_request, encode_udp_message,
+    fragment_udp_message, random_padding, read_varint_stream, skip_bytes, write_varint,
+};
 use super::*;
-use crate::quic::testutil;
+use crate::quic::{recv_read_exact as read_exact, testutil};
 use honk_config::types::NodeProtocol;
 use quinn::EndpointConfig;
 use std::time::Instant;
@@ -107,12 +113,20 @@ fn qpack_test_encode(fields: &[(&str, &str)]) -> Vec<u8> {
 /// verbatim. Responses are encoded with the same QPACK forms (Huffman
 /// included) that quic-go produces.
 async fn start_server(password: &'static str) -> SocketAddr {
+    start_server_with_response(password, Duration::ZERO, 0).await
+}
+
+async fn start_server_with_response(
+    password: &'static str,
+    response_delay: Duration,
+    response_status: u8,
+) -> SocketAddr {
     let (endpoint, addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             tokio::spawn(async move {
                 let Ok(conn) = incoming.await else { return };
-                handle_connection(conn, password).await;
+                handle_connection(conn, password, response_delay, response_status).await;
             });
         }
     });
@@ -142,14 +156,19 @@ async fn start_obfs_server(password: &'static str, obfs_password: &'static [u8])
         while let Some(incoming) = endpoint.accept().await {
             tokio::spawn(async move {
                 let Ok(conn) = incoming.await else { return };
-                handle_connection(conn, password).await;
+                handle_connection(conn, password, Duration::ZERO, 0).await;
             });
         }
     });
     addr
 }
 
-async fn handle_connection(conn: quinn::Connection, password: &'static str) {
+async fn handle_connection(
+    conn: quinn::Connection,
+    password: &'static str,
+    response_delay: Duration,
+    response_status: u8,
+) {
     let authenticated = Arc::new(AtomicBool::new(false));
     // Uni streams: the client preface (control + QPACK encoder/decoder).
     // Drain them; their content is not needed by this minimal server.
@@ -175,7 +194,8 @@ async fn handle_connection(conn: quinn::Connection, password: &'static str) {
             };
             let auth = Arc::clone(&bi_auth);
             tokio::spawn(async move {
-                handle_server_stream(send, recv, auth, password).await;
+                handle_server_stream(send, recv, auth, password, response_delay, response_status)
+                    .await;
             });
         }
     });
@@ -193,6 +213,8 @@ async fn handle_server_stream(
     mut recv: quinn::RecvStream,
     authenticated: Arc<AtomicBool>,
     password: &str,
+    response_delay: Duration,
+    response_status: u8,
 ) {
     let Ok(frame_type) = read_varint_stream(&mut recv).await else {
         return;
@@ -202,7 +224,7 @@ async fn handle_server_stream(
             handle_auth_request(&mut send, &mut recv, authenticated, password).await
         }
         FRAME_TYPE_TCP_REQUEST if authenticated.load(Ordering::Relaxed) => {
-            handle_tcp_request(&mut send, &mut recv).await
+            handle_tcp_request(&mut send, &mut recv, response_delay, response_status).await
         }
         _ => {}
     }
@@ -260,8 +282,12 @@ async fn handle_auth_request(
     let _ = send.finish();
 }
 
-async fn handle_tcp_request(send: &mut quinn::SendStream, recv: &mut quinn::RecvStream) {
-    // ReadTCPRequest: address vstring + padding (`protocol/proxy.go:39-67`).
+async fn handle_tcp_request(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    response_delay: Duration,
+    response_status: u8,
+) {
     let Ok(addr_len) = read_varint_stream(recv).await else {
         return;
     };
@@ -275,27 +301,36 @@ async fn handle_tcp_request(send: &mut quinn::SendStream, recv: &mut quinn::Recv
     let Ok(padding_len) = read_varint_stream(recv).await else {
         return;
     };
-    if padding_len > MAX_PADDING_LENGTH {
+    if padding_len > MAX_PADDING_LENGTH || skip_bytes(recv, padding_len).await.is_err() {
         return;
     }
-    if skip_bytes(recv, padding_len).await.is_err() {
-        return;
-    }
-    // WriteTCPResponse(ok) with server-side padding (128..1024 in sing).
+    let mut first_payload = [0; 8192];
+    let first_payload_len = if response_status == 0 {
+        match recv.read(&mut first_payload).await {
+            Ok(Some(count)) => count,
+            _ => return,
+        }
+    } else {
+        0
+    };
+    tokio::time::sleep(response_delay).await;
     let padding = random_padding(128, 1024);
-    let mut resp = vec![0u8];
-    write_varint(&mut resp, 0);
-    write_varint(&mut resp, padding.len() as u64);
-    resp.extend_from_slice(padding.as_bytes());
-    if send.write_all(&resp).await.is_err() {
+    let mut response = vec![response_status];
+    write_varint(&mut response, usize::from(response_status != 0) as u64 * 6);
+    if response_status != 0 {
+        response.extend_from_slice(b"denied");
+    }
+    write_varint(&mut response, padding.len() as u64);
+    response.extend_from_slice(padding.as_bytes());
+    response.extend_from_slice(&first_payload[..first_payload_len]);
+    if send.write_all(&response).await.is_err() {
         return;
     }
-    // Echo the stream payload.
-    let mut buf = [0u8; 8192];
+    let mut buffer = [0; 8192];
     loop {
-        match recv.read(&mut buf).await {
-            Ok(Some(n)) => {
-                if send.write_all(&buf[..n]).await.is_err() {
+        match recv.read(&mut buffer).await {
+            Ok(Some(count)) => {
+                if send.write_all(&buffer[..count]).await.is_err() {
                     return;
                 }
             }
@@ -570,9 +605,58 @@ async fn test_dial_tcp_echo() {
         .await
         .expect("dial should succeed");
     stream.stream.write_all(b"hello hy2").await.unwrap();
-    let mut buf = [0u8; 64];
-    let n = stream.stream.read(&mut buf).await.unwrap();
-    assert_eq!(&buf[..n], b"hello hy2");
+    let mut buf = [0u8; 9];
+    tokio::time::timeout(Duration::from_secs(1), stream.stream.read_exact(&mut buf))
+        .await
+        .expect("TCP echo timed out")
+        .unwrap();
+    assert_eq!(&buf, b"hello hy2");
+}
+
+#[tokio::test]
+async fn test_dial_tcp_does_not_wait_for_response() {
+    let server_addr =
+        start_server_with_response(TEST_PASSWORD, Duration::from_millis(200), 0).await;
+    let node = test_node(server_addr.port(), TEST_PASSWORD);
+    let handler = Hysteria2Handler::new();
+    let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+
+    let stream = tokio::time::timeout(
+        Duration::from_millis(100),
+        handler.dial(&node, target, None, Duration::from_secs(5)),
+    )
+    .await
+    .expect("dial waited for the delayed TCP response")
+    .expect("dial should open the QUIC stream");
+    let mut stream = stream;
+
+    stream.stream.write_all(b"fast open").await.unwrap();
+    let mut output = [0u8; 9];
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        stream.stream.read_exact(&mut output),
+    )
+    .await
+    .expect("TCP echo timed out")
+    .unwrap();
+    assert_eq!(&output, b"fast open");
+}
+
+#[tokio::test]
+async fn test_first_read_sends_tcp_request_and_reports_response_error() {
+    let server_addr = start_server_with_response(TEST_PASSWORD, Duration::ZERO, 1).await;
+    let node = test_node(server_addr.port(), TEST_PASSWORD);
+    let handler = Hysteria2Handler::new();
+    let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+    let mut stream = handler
+        .dial(&node, target, None, Duration::from_secs(5))
+        .await
+        .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(1), stream.stream.read_u8())
+        .await
+        .expect("first read did not send the Hysteria2 TCP request")
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
 }
 
 #[tokio::test]

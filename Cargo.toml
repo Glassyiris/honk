@@ -40,7 +40,6 @@ toml = "1"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-log = "0.4"
 
 # Error handling
 thiserror = "2"
@@ -83,7 +82,8 @@ chacha20 = "0"
 chacha20poly1305 = "0.11"
 sha1 = "0.11"
 sha2 = "0.11"
-sha3 = "0.11"
+sha3 = "0.12"
+shake = "0.1"
 hmac = "0.13"
 hkdf = "0.13"
 md-5 = "0.11"
@@ -119,13 +119,20 @@ libc = "0.2"
 parking_lot = "0.12"
 dashmap = "6"
 libsystemd = "0.7"
-nix = { version = "0.31", features = ["time", "fs", "net", "sched", "mount", "resource", "zerocopy"] }
+nix = { version = "0.31", features = [
+    "time",
+    "fs",
+    "net",
+    "sched",
+    "mount",
+    "resource",
+    "zerocopy",
+] }
 pin-project-lite = "0.2"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 # Dev/test utilities
 tempfile = "3"
-tokio-test = "0.4"
 rcgen = "0.14"
 
 [profile.release]
@@ -134,8 +141,8 @@ lto = true
 codegen-units = 1
 strip = true
 
-# Keep the shipping profile size-oriented; opt-in profiles isolate LLVM
-# optimization and LTO effects for controlled benchmarks.
+# Keep the shipping profile size-oriented; opt-in profiles isolate LTO effects
+# for controlled benchmarks.
 [profile.release-size]
 inherits = "release"
 opt-level = "s"
@@ -146,20 +153,6 @@ strip = true
 [profile.release-size-thin]
 inherits = "release"
 opt-level = "s"
-lto = "thin"
-codegen-units = 1
-strip = true
-
-[profile.release-speed]
-inherits = "release"
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-strip = true
-
-[profile.release-speed-thin]
-inherits = "release"
-opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true

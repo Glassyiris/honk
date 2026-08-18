@@ -1,19 +1,21 @@
 use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
+use crate::dns::query::DnsRequestMeta;
 use crate::dns::routing::{DnsRequestDecision, DnsResponseDecision, DnsRouter};
 
 pub const MAX_RESPONSE_UPSTREAMS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct UpstreamTag(String);
+pub struct UpstreamTag(Arc<str>);
 
 impl UpstreamTag {
     pub fn new(value: &str) -> Result<Self, PlanError> {
         if value.is_empty() {
             return Err(PlanError::EmptyUpstream);
         }
-        Ok(Self(value.to_string()))
+        Ok(Self(Arc::from(value)))
     }
 
     pub fn as_str(&self) -> &str {
@@ -47,7 +49,7 @@ pub enum ResponsePlan {
 pub struct RequestContext<'a> {
     pub domain: &'a str,
     pub qtype: u16,
-    pub original_dst: Option<SocketAddr>,
+    pub metadata: DnsRequestMeta,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -119,13 +121,15 @@ impl Planner {
     }
 
     pub fn plan_request(&self, context: RequestContext<'_>) -> Result<RequestPlan, PlanError> {
-        match self
-            .router
-            .select_request_normalized(context.domain, context.qtype)
-        {
+        match self.router.select_request_normalized(
+            context.domain,
+            context.qtype,
+            context.metadata.source_ip(),
+        ) {
             DnsRequestDecision::Reject => Ok(RequestPlan::Reject),
             DnsRequestDecision::AsIs => context
-                .original_dst
+                .metadata
+                .original_dst()
                 .map(|destination| RequestPlan::Exchange(RequestScope::AsIs(destination)))
                 .ok_or(PlanError::MissingOriginalDestination),
             DnsRequestDecision::Upstream(name) => {

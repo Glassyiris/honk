@@ -409,6 +409,10 @@ impl Router {
         })
     }
 
+    pub const fn default_outbound(&self) -> &str {
+        self.default_outbound.as_str()
+    }
+
     pub fn route(&self, conn: &ConnectionInfo) -> &str {
         match self.route_full(conn) {
             Some(r) => r.outbound_name,
@@ -428,7 +432,7 @@ impl Router {
     pub fn route_with_must(&self, conn: &ConnectionInfo) -> (&str, bool) {
         match self.route_full(conn) {
             Some(r) => (r.outbound_name, r.must),
-            None => (self.route(conn), false),
+            None => (self.default_outbound(), false),
         }
     }
 
@@ -793,7 +797,7 @@ fn parse_ip_version(s: &str) -> Option<u8> {
 /// rejects bare addresses, but dae configs write them freely — a bare IP is
 /// a host route (/32 or /128). Silently dropping it would silently drop the
 /// whole matcher.
-fn parse_ip_net_str(s: &str) -> Option<ipnet::IpNet> {
+pub(crate) fn parse_ip_net_str(s: &str) -> Option<ipnet::IpNet> {
     let trimmed = s.trim();
     if trimmed.contains('/') {
         return trimmed.parse().ok();

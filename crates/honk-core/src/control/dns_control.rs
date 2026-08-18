@@ -10,6 +10,7 @@ use crate::dns::forwarder::DnsForwarder;
 use crate::ebpf::EbpfBackend;
 #[cfg(test)]
 use crate::routing::Router;
+#[cfg(test)]
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +22,7 @@ mod transport;
 #[cfg(test)]
 mod tests;
 
+use crate::dns::query::{DnsRequestMeta, IngressProfile};
 use crate::dns::response::{build_dns_refused, build_dns_servfail};
 
 #[cfg(test)]
@@ -180,17 +182,17 @@ impl DnsController {
     pub(crate) async fn answer_query(
         &self,
         data: &[u8],
-        original_dst: Option<SocketAddr>,
-        ingress: crate::dns::query::IngressProfile,
+        metadata: DnsRequestMeta,
+        ingress: IngressProfile,
     ) -> Vec<u8> {
         match self
             .dns_service
-            .resolve_outcome_with_runtime(data, original_dst, ingress)
+            .resolve_outcome_with_runtime(data, metadata, ingress)
             .await
         {
             Ok((outcome, runtime)) => {
                 self.submit_projection(runtime.runtime(), &outcome);
-                outcome.rendered().to_vec()
+                outcome.into_rendered()
             }
             Err(error)
                 if error

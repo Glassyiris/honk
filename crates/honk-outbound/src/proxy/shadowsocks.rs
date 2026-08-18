@@ -136,6 +136,18 @@ impl AeadCipher {
         }
     }
 
+    #[cfg(feature = "rprx")]
+    pub(crate) fn new_vless(use_aes: bool, key: &[u8]) -> anyhow::Result<Self> {
+        Self::new(
+            if use_aes {
+                "aes-256-gcm"
+            } else {
+                "chacha20-poly1305"
+            },
+            key,
+        )
+    }
+
     /// XChaCha20-Poly1305 with a 24-byte nonce, used by the Shadowsocks 2022
     /// chacha UDP construction (keyed directly with the PSK).
     pub(crate) fn new_xchacha20(key: &[u8]) -> anyhow::Result<Self> {
@@ -198,11 +210,21 @@ impl AeadCipher {
         plaintext: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<(), aes_gcm::aead::Error> {
+        self.seal_with_aad_into(nonce, plaintext, b"", out)
+    }
+
+    pub(crate) fn seal_with_aad_into(
+        &self,
+        nonce: &[u8],
+        plaintext: &[u8],
+        aad: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), aes_gcm::aead::Error> {
         match self {
             AeadCipher::Aes128Gcm(c) | AeadCipher::Aes256Gcm(c) => {
-                boring_seal_into(c, nonce, plaintext, out)
+                boring_seal_into(c, nonce, plaintext, aad, out)
             }
-            AeadCipher::ChaCha20Poly1305(c) => boring_seal_into(c, nonce, plaintext, out),
+            AeadCipher::ChaCha20Poly1305(c) => boring_seal_into(c, nonce, plaintext, aad, out),
             AeadCipher::XChaCha20Poly1305(c) => {
                 use aes_gcm::aead::AeadInOut;
                 out.extend_from_slice(plaintext);
@@ -211,7 +233,7 @@ impl AeadCipher {
                     nonce.try_into().map_err(|_| aes_gcm::aead::Error)?;
                 let tag = c.encrypt_inout_detached(
                     nonce,
-                    b"",
+                    aad,
                     aes_gcm::aead::inout::InOutBuf::from(&mut out[start..]),
                 )?;
                 out.extend_from_slice(&tag);
@@ -227,6 +249,15 @@ impl AeadCipher {
         nonce: &[u8],
         buf: &mut [u8],
     ) -> Result<usize, aes_gcm::aead::Error> {
+        self.open_with_aad_in_place(nonce, buf, b"")
+    }
+
+    pub(crate) fn open_with_aad_in_place(
+        &self,
+        nonce: &[u8],
+        buf: &mut [u8],
+        aad: &[u8],
+    ) -> Result<usize, aes_gcm::aead::Error> {
         let tag_len = self.tag_len();
         if buf.len() < tag_len {
             return Err(aes_gcm::aead::Error);
@@ -234,10 +265,10 @@ impl AeadCipher {
         let (ct, tag) = buf.split_at_mut(buf.len() - tag_len);
         match self {
             AeadCipher::Aes128Gcm(c) | AeadCipher::Aes256Gcm(c) => {
-                c.open_in_place(nonce, ct, tag, b"").map_err(aead_err)?;
+                c.open_in_place(nonce, ct, tag, aad).map_err(aead_err)?;
             }
             AeadCipher::ChaCha20Poly1305(c) => {
-                c.open_in_place(nonce, ct, tag, b"").map_err(aead_err)?;
+                c.open_in_place(nonce, ct, tag, aad).map_err(aead_err)?;
             }
             AeadCipher::XChaCha20Poly1305(c) => {
                 use aes_gcm::aead::AeadInOut;
@@ -247,7 +278,7 @@ impl AeadCipher {
                     (&*tag).try_into().map_err(|_| aes_gcm::aead::Error)?;
                 c.decrypt_inout_detached(
                     nonce,
-                    b"",
+                    aad,
                     aes_gcm::aead::inout::InOutBuf::from(&mut *ct),
                     tag,
                 )?;
@@ -267,13 +298,14 @@ fn boring_seal_into(
     ctx: &boring::aead::AeadCtx,
     nonce: &[u8],
     plaintext: &[u8],
+    aad: &[u8],
     out: &mut Vec<u8>,
 ) -> Result<(), aes_gcm::aead::Error> {
     out.extend_from_slice(plaintext);
     out.resize(out.len() + 16, 0);
     let start = out.len() - plaintext.len() - 16;
     let (body, tag) = out[start..].split_at_mut(plaintext.len());
-    ctx.seal_in_place(nonce, body, tag, b"").map_err(aead_err)?;
+    ctx.seal_in_place(nonce, body, tag, aad).map_err(aead_err)?;
     Ok(())
 }
 

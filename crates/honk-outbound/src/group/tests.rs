@@ -48,6 +48,59 @@ fn direct_selector_plan_fast_path_preserves_choice_default_and_health() {
         "plan-b"
     );
 }
+
+#[test]
+fn dead_single_leaf_remains_a_tcp_last_resort_only() {
+    let node = make_node(nid("last-resort"), "last-resort");
+    let single = make_group("single", GroupPolicy::Selector, vec![node.id]);
+    let child = make_group("child", GroupPolicy::Selector, vec![node.id]);
+    let parent = make_subgroup("parent", GroupPolicy::Selector, &["child"]);
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.report_unavailable_forced(node.id, ProbeDomain::Tcp, IpVersion::V4);
+    let manager = GroupManager::with_alive_set(
+        &[single.clone(), child.clone(), parent.clone()],
+        std::slice::from_ref(&node),
+        Some(Arc::clone(&alive)),
+    );
+
+    for group in ["single", "parent"] {
+        assert_eq!(
+            manager
+                .selection_plan_for_domain(group, ProbeDomain::Tcp, IpVersion::V4)
+                .nodes
+                .first()
+                .map(|node| node.name.as_str()),
+            Some("last-resort")
+        );
+        assert_eq!(
+            manager
+                .select_node_for_domain(group, ProbeDomain::Tcp, IpVersion::V4)
+                .map(|node| node.name.as_str()),
+            Some("last-resort")
+        );
+    }
+
+    for domain in [ProbeDomain::DnsUdp, ProbeDomain::DataUdp] {
+        alive.report_unavailable_forced(node.id, domain, IpVersion::V4);
+    }
+    assert!(
+        manager
+            .selection_plan_for_domain("single", ProbeDomain::DataUdp, IpVersion::V4)
+            .nodes
+            .is_empty()
+    );
+
+    let mut with_final = single;
+    with_final.final_outbound = Some("block".into());
+    let manager =
+        GroupManager::with_alive_set(&[with_final], std::slice::from_ref(&node), Some(alive));
+    assert!(
+        manager
+            .selection_plan_for_domain("single", ProbeDomain::Tcp, IpVersion::V4)
+            .nodes
+            .is_empty()
+    );
+}
 use chrono::Utc;
 
 fn nid(name: &str) -> uuid::Uuid {
@@ -453,6 +506,40 @@ fn test_urltest_dial_list_single_when_data_exists_race_when_cold() {
     let warm = m.select_nodes_in_order_for_domain("g", ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(warm.len(), 1);
     assert_eq!(warm[0].name, "a");
+}
+
+#[test]
+fn urltest_retry_candidates_deduplicate_shared_nested_leaves_before_cap() {
+    let (a, b) = (nid("retry-a"), nid("retry-b"));
+    let nodes = vec![make_node(a, "retry-a"), make_node(b, "retry-b")];
+    let groups = vec![
+        make_group("a-1", GroupPolicy::Selector, vec![a]),
+        make_group("a-2", GroupPolicy::Selector, vec![a]),
+        make_group("a-3", GroupPolicy::Selector, vec![a]),
+        make_group("b-1", GroupPolicy::Selector, vec![b]),
+        make_subgroup("retry", GroupPolicy::URLTest, &["a-1", "a-2", "a-3", "b-1"]),
+    ];
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.record_probe_latency(
+        a,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    alive.record_probe_latency(
+        b,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(20),
+    );
+    let manager = GroupManager::with_alive_set(&groups, &nodes, Some(alive));
+
+    let retry_ids: Vec<_> = manager
+        .urltest_retry_candidates("retry", ProbeDomain::Tcp, IpVersion::V4)
+        .into_iter()
+        .map(|node| node.id)
+        .collect();
+    assert_eq!(retry_ids, vec![a, b]);
 }
 
 #[test]
@@ -907,6 +994,14 @@ fn test_urltest_tcp_udp_separate_selections() {
     assert_eq!(
         m.get_urltest_selection_for_network("g", SelectionNetwork::Udp),
         Some("b".into())
+    );
+    assert_eq!(
+        m.selection_chain_for_network("g", SelectionNetwork::Tcp),
+        vec!["g", "a"]
+    );
+    assert_eq!(
+        m.selection_chain_for_network("g", SelectionNetwork::Udp),
+        vec!["g", "b"]
     );
 }
 
@@ -1509,14 +1604,13 @@ fn test_urltest_keeps_incumbent_within_tolerance_of_current_latency() {
     assert_eq!(m.select_node("g").unwrap().name, "a");
 }
 
-/// Lab scenario S3: a flaky node (fast when it works, but failing probes and
-/// dials) must not be re-adopted after a dial failure wipes its history. The
-/// sequence mirrors the control plane: probe failure kills the node (TCP
-/// threshold 1, synthetic timeout sample), recovery needs 2 successes, and a
-/// dial failure clears latency history + triggers a re-probe that can
-/// succeed. The incumbent must survive all of it.
+/// Lab scenario S3: a flaky node (fast when it works, but failing real dials)
+/// must not be re-adopted while the incumbent is healthy. Probe failures own
+/// liveness without creating ranking strikes; a dial failure demotes the node
+/// while retaining its real moving average, and tolerance then guards the
+/// incumbent against the flaky node's lower average.
 #[test]
-fn urltest_flaky_node_stays_demoted_after_history_clear() {
+fn urltest_flaky_node_stays_demoted_after_dial_failure() {
     let (na, nb, nc) = (nid("a"), nid("b"), nid("c"));
     let nodes = vec![make_node(na, "a"), make_node(nb, "b"), make_node(nc, "c")];
     let alive = Arc::new(AliveDialerSet::new());
@@ -1538,19 +1632,27 @@ fn urltest_flaky_node_stays_demoted_after_history_clear() {
     probe_ok(nid("c"), 42);
     assert_eq!(m.select_node("g").unwrap().name, "a");
 
-    // Probe failure on 'a' → dead + synthetic 10s sample → group moves to 'b'.
+    // One probe failure keeps 'a' alive and does not bypass tolerance.
     alive.mark_dead(nid("a"));
+    assert!(alive.is_alive_for(nid("a"), ProbeDomain::Tcp, IpVersion::V4));
+    assert_eq!(m.select_node("g").unwrap().name, "a");
+
+    // One transient dial failure leaves no strike — 'a' keeps the seat.
+    alive.record_dial_failure(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(m.select_node("g").unwrap().name, "a");
+    // The second consecutive failure supplies the ranking strike and moves
+    // to 'b'.
+    alive.record_dial_failure(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(m.select_node("g").unwrap().name, "b");
 
-    // 'a' recovers after two good probes; its window still holds the
-    // synthetic sample, so the average stays unattractive.
+    // 'a' recovers after two good probes; 7ms beats b's 21ms but stays
+    // within the 50ms tolerance → hysteresis keeps 'b'.
     probe_ok(nid("a"), 7);
     probe_ok(nid("a"), 7);
     assert_eq!(m.select_node("g").unwrap().name, "b");
 
-    // Now the flaky loop: a user dial through 'a' fails → history cleared
-    // with a synthetic penalty sample, an emergency re-probe succeeds (the
-    // node works 60% of the time).
+    // Now the flaky loop: a user dial through 'a' fails → strike, an
+    // emergency re-probe succeeds (the node works 60% of the time).
     for round in 0..6 {
         alive.report_unavailable_traffic(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
         alive.record_dial_failure(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
@@ -1562,9 +1664,9 @@ fn urltest_flaky_node_stays_demoted_after_history_clear() {
         );
     }
 
-    // With no incumbent context at all, one dial failure still demotes the
-    // flaky node below the healthy alternative: the penalty sample keeps its
-    // moving average at seconds, not 7ms.
+    // When the incumbent itself fails dials, the strike (second consecutive
+    // failure) skips hysteresis and the group moves; one lucky re-probe
+    // does not let it reclaim the rank against the new incumbent.
     let alive2 = Arc::new(AliveDialerSet::new());
     let m2 = GroupManager::with_alive_set(
         &[make_group("g2", GroupPolicy::URLTest, vec![na, nb])],
@@ -1575,6 +1677,13 @@ fn urltest_flaky_node_stays_demoted_after_history_clear() {
     probe_ok2(&alive2, nid("b"), 21);
     assert_eq!(m2.select_node("g2").unwrap().name, "a");
     alive2.record_dial_failure(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(
+        m2.select_node("g2").unwrap().name,
+        "a",
+        "one transient failure keeps the incumbent"
+    );
+    alive2.record_dial_failure(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(m2.select_node("g2").unwrap().name, "b");
     probe_ok2(&alive2, nid("a"), 7);
     assert_eq!(m2.select_node("g2").unwrap().name, "b");
 }
@@ -1588,37 +1697,41 @@ fn probe_ok2(alive: &AliveDialerSet, n: uuid::Uuid, ms: u64) {
     );
 }
 
-/// After a dial failure clears the node's latency history (sing-box
-/// `DeleteURLTestHistory` parity), the URLTest group's next selection must
-/// move to the next-best measured node instead of waiting for the probe
-/// cycle.
+/// Strike stickiness at ranking level: one lucky probe success after a dial
+/// failure does NOT clear the demotion — even when the challenger's latency
+/// would win by far. Two consecutive successes clear it, and then the
+/// challenger wins only because the gap exceeds tolerance.
 #[test]
-fn test_urltest_reselects_after_latency_cleared() {
-    let (n1, n2) = (nid("a"), nid("b"));
-    let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
+fn urltest_strike_demotion_needs_two_consecutive_successes() {
+    let (na, nb) = (nid("a"), nid("b"));
+    let nodes = vec![make_node(na, "a"), make_node(nb, "b")];
     let alive = Arc::new(AliveDialerSet::new());
     let m = GroupManager::with_alive_set(
-        &[make_group("g", GroupPolicy::URLTest, vec![n1, n2])],
+        &[make_group("g", GroupPolicy::URLTest, vec![na, nb])],
         &nodes,
         Some(alive.clone()),
     );
-    alive.record_probe_latency(
-        nid("a"),
-        ProbeDomain::Tcp,
-        IpVersion::V4,
-        Duration::from_millis(10),
-    );
-    alive.record_probe_latency(
-        nid("b"),
-        ProbeDomain::Tcp,
-        IpVersion::V4,
-        Duration::from_millis(100),
-    );
+    probe_ok2(&alive, nid("a"), 7);
+    probe_ok2(&alive, nid("b"), 21);
     assert_eq!(m.select_node("g").unwrap().name, "a");
 
-    // Dial to 'a' fails → history cleared → next selection is 'b'.
-    alive.clear_latency(nid("a"));
+    // Two consecutive dial failures strike the incumbent; a lone one does
+    // not.
+    alive.record_dial_failure(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(m.select_node("g").unwrap().name, "a");
+    alive.record_dial_failure(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(m.select_node("g").unwrap().name, "b");
+
+    // One lucky success: the strike is still pending — 'a' stays demoted
+    // even though 7ms vs 200ms is far beyond tolerance.
+    probe_ok2(&alive, nid("a"), 7);
+    probe_ok2(&alive, nid("b"), 200);
+    assert_eq!(m.select_node("g").unwrap().name, "b");
+
+    // The second consecutive success clears the strike; with the gap beyond
+    // tolerance 'a' wins immediately.
+    probe_ok2(&alive, nid("a"), 7);
+    assert_eq!(m.select_node("g").unwrap().name, "a");
 }
 
 /// A URLTest group with a custom check_url ranks and filters by the
@@ -1654,7 +1767,9 @@ fn test_urltest_group_custom_check_url_selection() {
     assert_eq!(m.select_node("g").unwrap().name, "b");
 
     // b dies for the group's URL (but stays globally alive) → a wins.
-    alive.record_url_probe_failure("b", url);
+    for _ in 0..3 {
+        alive.record_url_probe_failure("b", url);
+    }
     assert!(alive.is_alive_for(nid("b"), ProbeDomain::Tcp, IpVersion::V4));
     assert_eq!(m.select_node("g").unwrap().name, "a");
 }
@@ -1683,8 +1798,10 @@ fn test_urltest_group_without_check_url_uses_global_state() {
         Duration::from_millis(100),
     );
     assert_eq!(m.select_node("g").unwrap().name, "a");
-    // A stray per-URL failure for 'a' must not leak into this group.
-    alive.record_url_probe_failure("a", "http://unrelated.example");
+    // Stray per-URL failures for 'a' must not leak into this group.
+    for _ in 0..3 {
+        alive.record_url_probe_failure("a", "http://unrelated.example");
+    }
     assert_eq!(m.select_node("g").unwrap().name, "a");
 }
 
@@ -1719,7 +1836,9 @@ fn test_nested_group_check_url_ranks_subgroups_by_tag() {
 
     // hk dies FOR THE PARENT'S URL (its own/global state untouched) →
     // the parent switches to us even though hk-1 is globally healthy.
-    alive.record_url_probe_failure("hk", url);
+    for _ in 0..3 {
+        alive.record_url_probe_failure("hk", url);
+    }
     assert!(alive.is_alive_for(nid("hk-1"), ProbeDomain::Tcp, IpVersion::V4));
     let sel = m.select_node("ai").unwrap();
     assert_eq!(sel.name, "us-1");

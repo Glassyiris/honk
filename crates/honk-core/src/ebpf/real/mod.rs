@@ -14,8 +14,9 @@ use tracing::{debug, info, warn};
 use super::{
     EbpfBackend, LpmKeepSet, UDP_DECISION_EPOCH_MAP, UDP_DECISION_INFLIGHT_MAP,
     UDP_DECISION_RETIRE_FENCE_MAP, UDP_DECISION_SEQUENCE_MAP, USERSPACE_CONN_STATE_DELETES,
-    UdpDecisionCommitResult, UdpDecisionTransition, apply_udp_decision_transition, maps,
-    probe::BatchCapability, udp_state_is_legacy_userspace_owned, udp_state_is_userspace_owned,
+    UdpDecisionCommitResult, UdpDecisionSequenceStatus, UdpDecisionTransition,
+    apply_udp_decision_transition, maps, probe::BatchCapability,
+    udp_state_is_legacy_userspace_owned, udp_state_is_userspace_owned,
     validate_udp_decision_transition,
 };
 
@@ -118,7 +119,7 @@ pub use iface_watch::{AttachedInterface, AttachedMap, IfaceWatcher};
 use syscall::{
     LookupAndDelete, bpf_delete_batch, bpf_delete_shared, bpf_lookup_and_delete,
     bpf_lookup_batch_scan, bpf_lookup_batch_scan_cb, bpf_update_batch,
-    read_udp_decision_sequence_locked, validate_loaded_udp_decision_sequence,
+    reset_udp_decision_sequence_locked, validate_loaded_udp_decision_sequence,
 };
 
 fn conn_key(outbound: u8, domain: u32, ipver: u32) -> u32 {
@@ -460,7 +461,11 @@ impl RealEbpfBackend {
                 return Ok(UdpDecisionCommitResult::Missing);
             };
             if state.decision_token != token {
-                return Ok(UdpDecisionCommitResult::TokenMismatch);
+                return Ok(if pending_only {
+                    UdpDecisionCommitResult::TokenMismatch
+                } else {
+                    UdpDecisionCommitResult::Superseded
+                });
             }
             let state_allowed = if pending_only {
                 state.state == UdpDecisionState::Preparing as u8
@@ -963,7 +968,7 @@ impl EbpfBackend for RealEbpfBackend {
                 return Ok(UdpDecisionCommitResult::Missing);
             };
             if !udp_state_is_legacy_userspace_owned(&state) {
-                return Ok(UdpDecisionCommitResult::StateMismatch);
+                return Ok(UdpDecisionCommitResult::Superseded);
             }
             if !backend.hash_remove_present::<_, ConnState>("CONN_STATE_MAP", key)? {
                 return Ok(UdpDecisionCommitResult::Missing);
@@ -976,19 +981,74 @@ impl EbpfBackend for RealEbpfBackend {
     fn verify_udp_decision_sequence(&self) -> anyhow::Result<()> {
         validate_loaded_udp_decision_sequence(self.bpf()?).map(|_| ())
     }
+    fn udp_decision_sequence_status(&self) -> anyhow::Result<UdpDecisionSequenceStatus> {
+        let sequence = validate_loaded_udp_decision_sequence(self.bpf()?)?;
+        Ok(UdpDecisionSequenceStatus {
+            next: sequence.next & UDP_DECISION_SEQUENCE_MASK,
+            generation: udp_decision_token_generation(sequence.next),
+        })
+    }
 
-    fn udp_decision_sequence_exhausted(&self) -> anyhow::Result<bool> {
-        let sequence = read_udp_decision_sequence_locked(self.bpf()?)?;
+    fn reset_udp_decision_sequence(&mut self, generation: u32) -> anyhow::Result<bool> {
         anyhow::ensure!(
-            sequence.next <= NFQUEUE_TOKEN_MASK,
-            "UDP_DECISION_SEQUENCE next token exceeds reserved token space"
+            generation <= UDP_DECISION_GENERATION_MASK,
+            "invalid UDP decision generation {generation}"
         );
         anyhow::ensure!(
-            sequence.exhausted <= 1,
-            "UDP_DECISION_SEQUENCE has invalid exhausted value {}",
-            sequence.exhausted
+            self.udp_decision_sequence_status()?.exhausted(),
+            "UDP decision sequence is not exhausted"
         );
-        Ok(sequence.exhausted != 0)
+        let conflicts_with_rollback =
+            |token| token != 0 && udp_decision_token_generation(token) >= generation;
+        let mut live = false;
+        self.for_each_map_chunk::<TuplesKey, ConnState>("CONN_STATE_MAP", 256, &mut |chunk| {
+            live = chunk
+                .iter()
+                .any(|(_, state)| conflicts_with_rollback(state.decision_token));
+            !live
+        })?;
+        if !live {
+            self.for_each_map_chunk::<TuplesKey, u32>(
+                UDP_DECISION_RETIRE_FENCE_MAP,
+                256,
+                &mut |chunk| {
+                    live = chunk
+                        .iter()
+                        .any(|(_, token)| conflicts_with_rollback(*token));
+                    !live
+                },
+            )?;
+        }
+
+        if !live {
+            self.for_each_map_chunk::<TuplesKey, RoutingHandoffEntry>(
+                "ROUTING_HANDOFF_MAP",
+                256,
+                &mut |chunk| {
+                    live = chunk
+                        .iter()
+                        .any(|(_, entry)| conflicts_with_rollback(entry.result.decision_token));
+                    !live
+                },
+            )?;
+        }
+        if !live {
+            self.for_each_map_chunk::<RedirectTuple, RedirectEntry>(
+                "REDIRECT_TRACK",
+                256,
+                &mut |chunk| {
+                    live = chunk
+                        .iter()
+                        .any(|(_, entry)| conflicts_with_rollback(entry.decision_token));
+                    !live
+                },
+            )?;
+        }
+        if live {
+            return Ok(false);
+        }
+        reset_udp_decision_sequence_locked(self.bpf()?, generation)?;
+        Ok(true)
     }
 
     fn routing_handoff_lookup(

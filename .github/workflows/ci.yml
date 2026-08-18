@@ -49,13 +49,9 @@ jobs:
             https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
           sudo curl -sL --retry 3 -o /etc/dae/geoip.dat \
             https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
-      # Full suite minus the known-failing pre-existing tests (see AGENTS.md
-      # "Current test status": share_link TOML round-trip x2,
-      # config_dae_routing x1).
+      # Full suite minus the known pre-existing config_dae_routing failure.
       - run: |
           cargo test --workspace --no-fail-fast -- \
-            --skip test_config_toml_round_trip \
-            --skip test_to_file_and_from_file_by_extension \
             --skip test_routing_with_config_dae
 
   ebpf:
@@ -79,6 +75,13 @@ jobs:
         run: |
           sed -i 's|linker=/root/.cargo/bin/bpf-linker-wrapper|linker=bpf-linker|' \
             crates/honk-ebpf/.cargo/config.toml
+      - name: Install geo assets for eBPF-feature unit tests
+        run: |
+          sudo mkdir -p /etc/dae
+          sudo curl -sL --retry 3 -o /etc/dae/geosite.dat \
+            https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+          sudo curl -sL --retry 3 -o /etc/dae/geoip.dat \
+            https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
       - name: Build eBPF object
         run: |
           cd crates/honk-ebpf
@@ -87,6 +90,10 @@ jobs:
       # here instead of at runtime on a gateway.
       - name: Verify eBPF object has BTF
         run: readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
+      - name: Run eBPF-feature unit tests
+        run: |
+          cargo +stable test -p honk-core --features ebpf --lib -- \
+            --skip test_routing_with_config_dae
       # Map pinning needs bpffs; the hosted VM image does not guarantee that it is mounted.
       - name: Prepare the VM kernel
         run: |
@@ -96,7 +103,7 @@ jobs:
           fi
           test "$(stat -f -c %T /sys/fs/bpf)" = bpf_fs
 
-      - name: Load and attach eBPF in the VM kernel
+      - name: Verify eBPF lifecycle and pinned-map compatibility
         run: |
           sudo env \
             HOME="$HOME" \
@@ -106,7 +113,20 @@ jobs:
             CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
             RUST_BACKTRACE=1 \
             "$HOME/.cargo/bin/cargo" +stable test \
-              -p honk-core --features ebpf --lib link_lifecycle -- \
+              -p honk-core --features ebpf --lib ebpf::real::tests -- \
+              --ignored --test-threads=1
+
+      - name: Run real-kernel NFQUEUE contract
+        run: |
+          sudo env \
+            HOME="$HOME" \
+            PATH="$PATH" \
+            CARGO_HOME="$HOME/.cargo" \
+            RUSTUP_HOME="$HOME/.rustup" \
+            CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
+            RUST_BACKTRACE=1 \
+            "$HOME/.cargo/bin/cargo" +stable test \
+              -p honk-nfqueue --lib nfqueue_service_isolated_netns_kernel_contract -- \
               --ignored --test-threads=1
 
       - name: Run real-kernel network namespace tests

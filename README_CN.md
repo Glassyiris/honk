@@ -14,6 +14,8 @@
 
 许可证：**GPL-3.0-only**。
 
+可靠性优先的 Score 组策略始终随程序编译；配置以 `policy: score` 显式选择它，省略 `policy` 时仍默认使用 Selector。Score 仅在实际经过 Score 组时按需创建反馈与评分 cell，从真实流量以及 DNS、真实 QUIC 握手、探测、delay test、预热和直连或经代理的 UI 下载中学习；状态只存在于进程内存，不提供调节项，也不会写入日志、持久化或 API。详见 [Score 策略](doc/zh/reference/groups.md#score-策略)。
+
 ### 实验性首包保留 UDP 决策
 
 默认关闭的 UDP NFQUEUE 路径只保留仍需用户态判定的 **LAN 转发**首包：报文已经过 LAN TC，但尚未进入 conntrack/NAT。通过进程配置启用：
@@ -28,16 +30,22 @@ experimental {
 
 修改 `experimental.udp_nfqueue.enabled` 后必须重启。启用时必须使用带 `ebpf` feature 的构建和真实 eBPF 后端；`--mock-ebpf` 或不带 `ebpf` 的构建会在启动时被拒绝。本机发起的 WAN 出口流量仍走规范 TPROXY 路径。DNS 53、`must`、`block` 和已经可以安全地在路由时直连的决策不会进入 NFQUEUE；只暂存仍可能在用户态改判的决策。
 
-该路径拥有 raw-netlink 队列 `320` 和 nftables 对象 `inet honk_nfqueue` / `udp_decision`；honk 运行期间，同一网络命名空间中的防火墙管理器不得修改它们。Direct 释放被保留的 skb，Proxy 把唯一的 payload 副本交给正常 UDP 初始化器，block/取消则丢弃报文。启用 Clash API 后，运行时计数器与 receipt-to-verdict 延迟位于 `/stats.udp.nfqueue`。完整不变量和指标 schema 见[设计文档](doc/design.zh.md)与[配置参考](doc/configuration.zh.md)。
+该路径拥有 raw-netlink 队列 `320` 和 nftables 对象 `inet honk_nfqueue` / `udp_decision`；honk 运行期间，同一网络命名空间中的防火墙管理器不得修改它们。Direct 释放被保留的 skb，Proxy 把唯一的 payload 副本交给正常 UDP 初始化器，block/取消则丢弃报文。ingest actor 最多保留 256 个报文和 8 MiB payload；每个报文从 listener 收到时起都保留固定的三秒绝对期限。启用 Clash API 后，`/stats.udp.nfqueue` 会暴露 actor 深度、字节数、最老年龄以及明确的内核统计可用状态与读取失败数。完整不变量和指标 schema 见 [NFQUEUE 设计](doc/zh/design/nfqueue.md)与 [API 参考](doc/zh/reference/api.md)。
+
+### VLESS UDP、H2MUX 与 XUDP
+
+VLESS 分享链接通过 `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool` 选择唯一模式。`legacy` 是保持兼容的 TCP-only 默认值；`uot-v2` 保留该 TCP 路径并增加直连 UoT v2 UDP；`h2mux` 在共享 HTTP/2 carrier 上承载逻辑 TCP 与 sing-mux 原生 connected UDP；`h2mux-padded` 再启用 sing-mux v1 padding；`xudp` 保留普通 VLESS TCP，并为每个 UDP transport 建立一条 Single XUDP carrier；`mux-cool` 让逻辑 TCP 与 XUDP 共用节点所有的 Xray Mux.Cool carrier。
+
+这些模式不协商、不降级，也不会重放 UDP 首包。所有非 `legacy` 模式都不能使用 VLESS Encryption；只有 `xudp` 可与 `flow=xtls-rprx-vision` 组合。官方互通套件覆盖 sing-box 与 Xray：六种明文模式、TLS/REALITY 上的 H2MUX、padding，以及 XUDP Vision。wire、生命周期和导入规则见[节点参考](doc/zh/reference/nodes.md)。
 
 ### 文档
 
-| 文档         | English                                              | 中文                                                 |
-| ------------ | ---------------------------------------------------- | ---------------------------------------------------- |
-| 设计         | [doc/design.en.md](./doc/design.en.md)               | [doc/design.zh.md](./doc/design.zh.md)               |
-| 配置         | [doc/configuration.en.md](./doc/configuration.en.md) | [doc/configuration.zh.md](./doc/configuration.zh.md) |
-| 组件详细配置 | [doc/components.en.md](./doc/components.en.md)       | [doc/components.zh.md](./doc/components.zh.md)       |
-| 索引         | [doc/README.md](./doc/README.md)                     | 同上                                                 |
+| 文档     | English                                                    | 中文                                                     |
+| -------- | ---------------------------------------------------------- | -------------------------------------------------------- |
+| 配置指南 | [doc/en/configuration.md](./doc/en/configuration.md)       | [doc/zh/configuration.md](./doc/zh/configuration.md)     |
+| 设计     | [doc/en/design/overview.md](./doc/en/design/overview.md)   | [doc/zh/design/overview.md](./doc/zh/design/overview.md) |
+| 字段参考 | [doc/en/reference/global.md](./doc/en/reference/global.md) | [doc/zh/reference/global.md](./doc/zh/reference/global.md) |
+| 完整索引 | [doc/README.md](./doc/README.md)                           | 同上                                                     |
 
 ### 架构（crate）
 
@@ -60,7 +68,7 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 **eBPF 数据面**
 
 - 工具链：Rust [aya](https://github.com/aya-rs/aya)（内核侧 `aya-ebpf`），而非 Go `cilium/ebpf`。
-- LAN/WAN 投递与 dae 同构，并非重写：TC 程序给代理流量打标并重定向进 `dae0` veth，随后 `daens` 命名空间内的 `sk_lookup` + `bpf_sk_assign` 把报文交给透明监听 socket。与 Go dae 一样，**不安装任何全局 `iptables` `TPROXY` 规则**。
+- LAN/WAN 投递与 dae 同构，并非重写：TC 程序给代理流量打标并重定向进 `dae0`；`dae0`/`dae0peer` 在内核支持时使用 L2 netkit pair，否则回退到 veth。随后 `daens` 命名空间内的 `sk_lookup` + `bpf_sk_assign` 把报文交给透明监听 socket。与 Go dae 一样，**不安装任何全局 `iptables` `TPROXY` 规则**。
 - 内核侧按出站统计：TC 程序维护 per-CPU `OUTBOUND_STATS` 数组（每出站的 tx/rx 包数/字节数）；dae 的内核路径没有按出站的计数器。
 - 路由快路径：推送规则时，用户态按四个 `(l4proto, ipversion)` 组（TCP4/TCP6/UDP4/UDP6）预计算规则掩码；内核为每个流量组通过一次 `ROUTING_GROUP_META_MAP` 查询同时取得规则数和掩码，并在完整写入非活动 bank 后最后切换 generation selector。eBPF 路由循环可直接跳过不可能命中的整条规则链；dae 的 `route()` 顺序评估每个 match set，除此之外核心状态机是 1:1 移植。
 - Map 设计：conntrack / redirect-track / routing-handoff 均为 **LRU** hash map（满了自动淘汰最旧条目），dae 则是普通 hash map + 溢出计数；LPM trie 容量限制为 64K 条（每个约 1.3 MB），dae 为 2M。
@@ -114,8 +122,9 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 
 - [x] Handler：Direct、Block、SOCKS5、SS（含 2022）、Trojan、VMess、VLESS、Hysteria2、TUIC、Juicity、AnyTLS
 - [x] VLESS + REALITY 客户端（含 `xtls-rprx-vision` flow），基于 boring-sys 补丁钩子改写 ClientHello；JA4 与真实 Chrome 对齐（ja4_a/ja4_b 完全一致）
+- [x] VLESS UDP/复用：UoT v2、H2MUX（padding）、Single XUDP 与 Mux.Cool；覆盖 TLS/REALITY
 - [x] 共享传输层（TLS/WS/gRPC）
-- [x] 组：Selector / URLTest / LoadBalance / Fallback + 嵌套组
+- [x] 组：Selector / URLTest / LoadBalance / Fallback / Score + 嵌套组；Score 为始终编译、显式选择且按需采样的自动评分策略
 - [x] URLTest：tolerance、TCP/UDP 独立选择、idle_timeout、interrupt_connections
 - [x] `AliveDialerSet`：并发探测、恢复滞后、TCP+UDP 探测、推送 eBPF
 - [x] 订阅拉取 + 后台合并（节点仅内存）
@@ -135,9 +144,10 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 
 ### TODO
 
-- [ ] VMess / VLESS 的 UDP 中继
+- [ ] VMess 的 UDP 中继
 - [x] REALITY 客户端 + Chrome（uTLS 风格）指纹——BoringSSL 加两个 boring-sys 补丁钩子实现；支持 VLESS `xtls-rprx-vision`
 - [x] 真正的 DoT/DoH/DoQ/DoH3 上游（TLS/H2/QUIC 会话复用）
+- [ ] 为 DoQ/DoH3 增加代理路径：将出站 `PacketTransport` 适配为 quinn `AsyncUdpSocket`
 - [x] Hysteria2 brutal（上下行 Mbps）、端口跳跃（`mport`/`mhop`）、`pinSHA256`、QUIC 接收窗口/PMTUD 参数；已对官方服务器实测验证
 - [ ] Hysteria2 残留：`maxStreamReceiveWindow`/`maxConnReceiveWindow`（quinn 无自动调窗对应）、`fastOpen`、UDP 会话/连接空闲超时可配（当前硬编码 90s/120s）
 - [x] QUIC 客户端选项整合：`QuicClientOptions` 管传输调优，`BoringQuicOptions` 管 TLS 后端
@@ -210,7 +220,7 @@ routing {
 }
 ```
 
-完整说明：[doc/configuration.zh.md](./doc/configuration.zh.md)、[doc/components.zh.md](./doc/components.zh.md)。
+完整说明：[doc/zh/configuration.md](./doc/zh/configuration.md)、[doc/zh/reference/global.md](./doc/zh/reference/global.md)（其余小节见 [doc/README.md](./doc/README.md) 索引）。
 
 ### 致谢
 

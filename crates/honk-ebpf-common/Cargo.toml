@@ -10,7 +10,6 @@ license.workspace = true
 
 [dependencies]
 aya-ebpf-bindings.workspace = true
-aya-ebpf.workspace = true
 network-types.workspace = true
 
 # aya is userspace-only; exclude it from BPF target builds.

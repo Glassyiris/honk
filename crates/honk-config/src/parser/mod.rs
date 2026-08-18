@@ -1,4 +1,3 @@
-mod section_parser;
 #[cfg(test)]
 mod tests;
 
@@ -14,7 +13,11 @@ use crate::node::Node;
 use crate::routing::RoutingConfig;
 use crate::subscription::Subscription;
 use regex::Regex;
-use section_parser::Section;
+#[derive(Debug, Clone)]
+struct Section {
+    name: String,
+    body: String,
+}
 
 /// Load a dae configuration file, resolving its top-level `include` blocks.
 ///
@@ -39,6 +42,7 @@ pub fn parse_dae_config_file(path: impl AsRef<Path>) -> Result<Config, crate::Co
 
     match parse_dae_config(&input) {
         Ok(config) => Ok(config),
+        Err(err @ crate::ConfigError::UnsupportedPolicy(_)) => Err(err),
         Err(err) if loader.saw_include => Err(crate::ConfigError::Include(format!(
             "failed to parse configuration after resolving includes: {err}"
         ))),
@@ -745,6 +749,9 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
     if let Some(v) = kv.get("log_level") {
         cfg.log_level = v.clone();
     }
+    if let Some(v) = kv.get("log_file") {
+        cfg.log_file = v.clone();
+    }
     if let Some(v) = kv.get("disable_waiting_network") {
         cfg.disable_waiting_network = parse_bool(v);
     }
@@ -866,6 +873,14 @@ fn parse_dns_section(section: &Section) -> Result<DnsConfig, crate::ConfigError>
     if let Some(bind) = kv.get("bind") {
         cfg.bind.clone_from(bind);
         cfg.bind_endpoint()
+            .map_err(|error| crate::ConfigError::Parse(error.to_string()))?;
+    }
+    if let Some(v) = kv.get("use_host") {
+        cfg.use_host = parse_bool(v);
+    }
+    if let Some(value) = kv.get("client_subnet") {
+        cfg.client_subnet.clone_from(value);
+        cfg.client_subnet_mode()
             .map_err(|error| crate::ConfigError::Parse(error.to_string()))?;
     }
 
@@ -1185,6 +1200,11 @@ fn parse_dns_conditions(expr: &str, is_response: bool) -> Vec<crate::dns::DnsCon
                 .filter_map(|a| crate::dns::parse_qtype_token(a))
                 .collect();
             conds.push(crate::dns::DnsCond::Qtype { not, types });
+            continue;
+        }
+
+        if let Some(cidrs) = extract_fn_args(inner, "sip") {
+            conds.push(crate::dns::DnsCond::Sip { not, cidrs });
             continue;
         }
 
@@ -1515,6 +1535,10 @@ fn parse_ip_args(args: &[String], cond: &mut crate::routing::ConditionFields<'_>
     }
 }
 
+fn node_parse_diagnostic(error: &crate::ConfigError) -> String {
+    format!("node section: skipping unparseable entry: {error}")
+}
+
 fn parse_node_section(section: &Section) -> Result<Vec<Node>, crate::ConfigError> {
     let mut nodes = Vec::new();
     for line in section.body.lines() {
@@ -1526,7 +1550,7 @@ fn parse_node_section(section: &Section) -> Result<Vec<Node>, crate::ConfigError
             && rest.trim_start().starts_with(['=', ':'])
         {
             return Err(crate::ConfigError::Parse(
-                "node section: 'mux' (h2mux) is no longer supported; remove the mux setting".into(),
+                "node section: standalone 'mux' is unsupported; set vless_mode on each VLESS share link".into(),
             ));
         }
         let unquote = |s: &str| s.trim().trim_matches(|c| c == '\'' || c == '"').to_string();
@@ -1566,9 +1590,7 @@ fn parse_node_section(section: &Section) -> Result<Vec<Node>, crate::ConfigError
             // A recognized-but-removed protocol in the config file is a hard
             // error (subscriptions skip such entries with a warning instead).
             Err(e @ crate::ConfigError::UnknownProtocol(_)) => return Err(e),
-            Err(e) => {
-                eprintln!("node section: skipping unparseable entry '{trimmed}': {e}");
-            }
+            Err(e) => eprintln!("{}", node_parse_diagnostic(&e)),
         }
     }
     Ok(nodes)
@@ -1588,7 +1610,7 @@ fn parse_group_section(section: &Section) -> Result<Vec<Group>, crate::ConfigErr
         };
         let kv = parse_kv_pairs(&grp.body);
         if let Some(policy) = kv.get("policy") {
-            group.policy = parse_group_policy(policy);
+            group.policy = parse_group_policy(policy)?;
         }
         if let Some(final_outbound) = kv.get("final") {
             group.final_outbound = Some(final_outbound.to_string());
@@ -1636,10 +1658,7 @@ fn parse_group_section(section: &Section) -> Result<Vec<Group>, crate::ConfigErr
     Ok(groups)
 }
 
-fn parse_group_policy(policy: &str) -> crate::group::GroupPolicy {
-    // dae accepts parameterized policies like `fixed(0)` / `min_moving_avg`.
-    // Strip the optional `(...)` argument before matching the base name so
-    // `policy: fixed(0)` is recognized as Selector (not the default fallthrough).
+fn parse_group_policy(policy: &str) -> Result<crate::group::GroupPolicy, crate::ConfigError> {
     let base = policy
         .trim()
         .split_once('(')
@@ -1647,15 +1666,19 @@ fn parse_group_policy(policy: &str) -> crate::group::GroupPolicy {
         .unwrap_or_else(|| policy.trim())
         .to_ascii_lowercase();
     match base.as_str() {
-        "select" | "selector" | "fixed" => crate::group::GroupPolicy::Selector,
+        "select" | "selector" | "fixed" => Ok(crate::group::GroupPolicy::Selector),
         "urltest" | "min_moving_avg" | "min_avg10" | "min_last_delay" => {
-            crate::group::GroupPolicy::URLTest
+            Ok(crate::group::GroupPolicy::URLTest)
         }
         "roundrobin" | "round_robin" | "loadbalance" | "balance" => {
-            crate::group::GroupPolicy::LoadBalance
+            Ok(crate::group::GroupPolicy::LoadBalance)
         }
-        "fallback" => crate::group::GroupPolicy::Fallback,
-        _ => crate::group::GroupPolicy::Selector,
+        "fallback" => Ok(crate::group::GroupPolicy::Fallback),
+        "score" => Ok(crate::group::GroupPolicy::Score),
+        "honk" => Err(crate::ConfigError::UnsupportedPolicy(
+            "group policy 'honk' was renamed to 'score'".into(),
+        )),
+        _ => Ok(crate::group::GroupPolicy::Selector),
     }
 }
 

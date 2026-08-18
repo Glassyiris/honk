@@ -70,9 +70,9 @@ the resolver returns no AAAA. Override them with
 - proxied latency via `urltest_node` (default target:
   `https://www.gstatic.com/generate_204`),
 - UDP liveness: a minimal DNS A query **and** a real QUIC handshake (h3,
-  certificates skipped) through a node's packet handler. Protocols without a
-  packet handler, including VLESS and VMess, report `n/a` rather than a
-  failure.
+  certificates skipped) through a node's packet handler. VMess, legacy VLESS,
+  and nodes whose `network` excludes UDP report `n/a`; every non-legacy VLESS
+  mode otherwise runs both probes through its mode-specific packet transport.
 
 Ends with alive-per-family counts and the median latency.
 
@@ -81,7 +81,7 @@ explicit target. Pass dae-style targets to skip DNS:
 `--v4-target 1.1.1.1:443 --v6-target '[2606:4700:4700::1111]:443'`.
 
 VLESS output uses only the node display name and a normalized shape such as
-`vless/reality/tcp/vision`. Invalid and intentionally unsupported feed entries
+`vless/reality/tcp/vision` or `vless/tls/tcp/h2mux-padded`. Invalid and intentionally unsupported feed entries
 remain visible with fixed codes (`invalid-uuid`, `invalid-reality`,
 `unsupported-transport`, `unsupported-flow`, `vision-without-tls`, or
 `vision-non-tcp`) but perform no network work. Network failures are limited to

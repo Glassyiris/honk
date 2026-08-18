@@ -208,6 +208,23 @@ fn include_rejects_cycles_and_paths_outside_the_entry_directory() {
     assert!(err.to_string().contains("circular or duplicate include"));
 }
 
+#[test]
+fn include_preserves_renamed_honk_policy_error() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        &dir.path().join("config.dae"),
+        "include { child.dae }\nglobal {\n}\n",
+    );
+    write(
+        &dir.path().join("child.dae"),
+        "group {\n proxy {\n policy: honk\n }\n}\n",
+    );
+
+    let error = Config::from_file(dir.path().join("config.dae").to_str().unwrap()).unwrap_err();
+    assert!(matches!(error, ConfigError::UnsupportedPolicy(_)));
+    assert!(error.to_string().contains("renamed to 'score'"));
+}
+
 #[cfg(unix)]
 #[test]
 fn include_rejects_symlinks_that_escape_the_entry_directory() {

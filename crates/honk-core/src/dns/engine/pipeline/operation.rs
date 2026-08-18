@@ -49,17 +49,19 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
     };
 
     let mut traversal = ResponseTraversal::start(context.logical_upstream.clone());
+    let mut strict_reusable = true;
     let (status, class, analyzed_answer_ips) = loop {
         match context.engine.analyze(
             context.prepared,
             traversal,
             response,
-            matches!(context.mode, ResolveMode::Strict),
+            matches!(context.mode, ResolveMode::Strict) || context.bypass_cache_read,
         )? {
             ResponseDirective::Accept {
                 response: analyzed,
                 traversal: accepted,
             } => {
+                strict_reusable &= analyzed.strict_reusable;
                 let class = analyzed.class;
                 if context.reuse_eligible
                     && class == ResponseClass::Servfail
@@ -81,6 +83,7 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
                 response: analyzed,
                 traversal: rejected,
             } => {
+                strict_reusable &= analyzed.strict_reusable;
                 response = make_empty_response(context.raw_query, context.prepared.query());
                 traversal = rejected;
                 break (OutcomeStatus::Rejected, analyzed.class, None);
@@ -88,7 +91,9 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
             ResponseDirective::Requery {
                 upstream,
                 traversal: next,
+                strict_reusable: response_strict_reusable,
             } => {
+                strict_reusable &= response_strict_reusable;
                 response = context
                     .forwarder
                     .upstream_pool
@@ -105,7 +110,11 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
     };
 
     let exact_cache_key = context.cache_key.clone();
-    let expiry = cache::store(context, &exact_cache_key, &mut response, class).await;
+    let expiry = if strict_reusable {
+        cache::store(context, &exact_cache_key, &mut response, class).await
+    } else {
+        EffectiveExpiry::do_not_cache()
+    };
     debug!(
         ttl = expiry.ttl().as_secs(),
         bytes = response.len(),
@@ -118,7 +127,8 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
             context.prepared.query(),
             context.prepared.qtype(),
             response.into(),
-            context.original_dst,
+            context.metadata,
+            context.mode,
         )
         .await?;
     context.forwarder.outcome_from_wire(
@@ -143,7 +153,7 @@ async fn stale_outcome(
 ) -> Result<Option<DnsOutcome>, DnsForwardError> {
     let Some(stale) = context
         .forwarder
-        .try_serve_stale(&context.cache_key, context.raw_query)
+        .try_serve_stale(&context.cache_key, context.raw_query, context.mode)
         .await
     else {
         return Ok(None);
@@ -155,7 +165,8 @@ async fn stale_outcome(
             context.prepared.query(),
             context.prepared.qtype(),
             stale.into(),
-            context.original_dst,
+            context.metadata,
+            context.mode,
         )
         .await?;
     context

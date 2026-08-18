@@ -35,6 +35,50 @@ use crate::types::NodeProtocol;
 pub const NODE_ID_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x3d8f2e1a_9b4c_4d57_8f3a_2c6e1d0b9a7f);
 
+/// Normalized multiplexing and packet wire behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum WireMode {
+    #[default]
+    Legacy,
+    UotV2,
+    H2mux,
+    H2muxPadded,
+    Xudp,
+    MuxCool,
+}
+impl WireMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::UotV2 => "uot-v2",
+            Self::H2mux => "h2mux",
+            Self::H2muxPadded => "h2mux-padded",
+            Self::Xudp => "xudp",
+            Self::MuxCool => "mux-cool",
+        }
+    }
+}
+
+impl std::str::FromStr for WireMode {
+    type Err = crate::ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "legacy" => Ok(Self::Legacy),
+            "uot-v2" => Ok(Self::UotV2),
+            "h2mux" => Ok(Self::H2mux),
+            "h2mux-padded" => Ok(Self::H2muxPadded),
+            "xudp" => Ok(Self::Xudp),
+            "mux-cool" => Ok(Self::MuxCool),
+            _ => Err(crate::ConfigError::Parse(
+                "unsupported wire mode (expected legacy/uot-v2/h2mux/h2mux-padded/xudp/mux-cool)"
+                    .into(),
+            )),
+        }
+    }
+}
+
 /// A proxy node definition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
@@ -55,9 +99,12 @@ pub struct Node {
     /// Password / UUID for auth
     #[serde(default)]
     pub password: Option<String>,
-    /// Encryption method (for SS)
+    /// Protocol encryption/cipher setting (SS, VMess, or VLESS Encryption)
     #[serde(default)]
     pub encryption: Option<String>,
+    /// VLESS TCP/UDP multiplexing mode.
+    #[serde(default)]
+    pub vless_mode: WireMode,
     #[serde(default)]
     pub plugin: Option<String>,
     #[serde(default)]
@@ -220,6 +267,7 @@ impl Default for Node {
             username: None,
             password: None,
             encryption: None,
+            vless_mode: WireMode::default(),
             plugin: None,
             plugin_opts: None,
             transport: default_transport(),
@@ -279,16 +327,47 @@ impl Node {
             &self.host
         }
     }
+    pub fn validate_vless_mode(&self) -> Result<(), crate::ConfigError> {
+        if self.vless_mode == WireMode::Legacy {
+            return Ok(());
+        }
+        if self.protocol != NodeProtocol::VLess {
+            return Err(crate::ConfigError::Validation(format!(
+                "Node '{}' sets a VLESS mode on a non-VLESS protocol",
+                self.name
+            )));
+        }
+        if let Some(flow) = self.flow.as_deref().filter(|flow| !flow.is_empty())
+            && !(self.vless_mode == WireMode::Xudp && flow == "xtls-rprx-vision")
+        {
+            return Err(crate::ConfigError::Validation(format!(
+                "Node '{}' combines VLESS mode '{}' with flow; this combination is unsupported",
+                self.name,
+                self.vless_mode.as_str()
+            )));
+        }
+        if self
+            .encryption
+            .as_deref()
+            .is_some_and(|value| !value.is_empty() && value != "none")
+        {
+            return Err(crate::ConfigError::Validation(format!(
+                "Node '{}' combines VLESS mode '{}' with VLESS Encryption; this combination is unsupported",
+                self.name,
+                self.vless_mode.as_str()
+            )));
+        }
+        Ok(())
+    }
 
     /// Content-derived stable identity: UUID v5 over
     /// `protocol|host|port|credential-fingerprint|dial-shape`. The same
     /// node config keeps its ID across reloads and subscription refreshes
     /// (health state, latency history, and session pools survive); renaming
     /// a node does NOT change the ID — identity is the dialable endpoint,
-    /// not the label. Dial shape covers SNI (CDN fronting makes the same
-    /// server a different endpoint per SNI), transport, obfs, and the
-    /// REALITY/flow handshake shape; validation and tuning knobs are
-    /// excluded.
+    /// not the label. Dial shape covers SNI, transport, obfs, the
+    /// REALITY/flow handshake shape, and non-legacy VLESS modes;
+    /// validation and tuning knobs are excluded.
     pub fn derive_id(&self) -> uuid::Uuid {
         let material = format!(
             "{}|{}|{}|{}|{}",
@@ -302,7 +381,7 @@ impl Node {
     }
 
     fn dial_shape_fingerprint(&self) -> String {
-        [
+        let mut fingerprint = [
             self.sni.as_deref().unwrap_or(""),
             self.transport.as_str(),
             self.ws_path.as_deref().unwrap_or(""),
@@ -314,7 +393,12 @@ impl Node {
             self.reality_spider_x.as_deref().unwrap_or(""),
             self.flow.as_deref().unwrap_or(""),
         ]
-        .join("|")
+        .join("|");
+        if self.protocol == NodeProtocol::VLess && self.vless_mode != WireMode::Legacy {
+            fingerprint.push('|');
+            fingerprint.push_str(self.vless_mode.as_str());
+        }
+        fingerprint
     }
 
     /// The protocol's credential identity, resolved the same way the
@@ -328,7 +412,20 @@ impl Node {
             NodeProtocol::SS => {
                 format!("{}|{}", self.encryption.as_deref().unwrap_or(""), pass)
             }
-            NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess => pass.to_string(),
+            NodeProtocol::Trojan | NodeProtocol::VMess => pass.to_string(),
+            NodeProtocol::VLess
+                if self
+                    .encryption
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty() && value != "none") =>
+            {
+                format!(
+                    "{}|{}",
+                    self.encryption.as_deref().unwrap_or_default(),
+                    pass
+                )
+            }
+            NodeProtocol::VLess => pass.to_string(),
             NodeProtocol::Socks5 => format!("{user}|{pass}"),
             NodeProtocol::Hysteria2 => self.hy2_auth.as_deref().unwrap_or(pass).to_string(),
             NodeProtocol::Tuic => format!(
@@ -354,14 +451,13 @@ impl Node {
 
 /// A group of nodes for load balancing / failover.
 ///
-/// Modeled after sing-box's outbound groups: Selector (manual), URLTest
-/// (auto), LoadBalance (round-robin) and Fallback (first alive, sticky).
+/// Modeled after sing-box's outbound groups, plus the built-in Score policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
     #[serde(default = "uuid::Uuid::new_v4")]
     pub id: uuid::Uuid,
     pub name: String,
-    /// Group selection policy (Selector or URLTest).
+    /// Group selection policy.
     #[serde(default)]
     pub policy: GroupPolicy,
     /// Node UUIDs that belong to this group.
@@ -451,6 +547,8 @@ pub enum GroupPolicy {
     /// First alive node in declaration order, pinned until it dies. A
     /// recovered higher-preference node does not immediately win the pin back.
     Fallback,
+    /// Reliability-aware automatic selection trained by real connection outcomes.
+    Score,
 }
 
 #[cfg(test)]
@@ -487,6 +585,74 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&GroupPolicy::URLTest).unwrap(),
             "\"urltest\""
+        );
+        assert_eq!(
+            serde_json::from_str::<GroupPolicy>("\"score\"").unwrap(),
+            GroupPolicy::Score
+        );
+        assert_eq!(
+            serde_json::to_string(&GroupPolicy::Score).unwrap(),
+            "\"score\""
+        );
+    }
+
+    #[test]
+    fn test_group_policy_serde_rejects_legacy_honk() {
+        assert!(serde_json::from_str::<GroupPolicy>("\"honk\"").is_err());
+    }
+
+    #[test]
+    fn test_vless_mode_serde_and_default() {
+        assert_eq!(Node::default().vless_mode, WireMode::Legacy);
+        for (value, mode) in [
+            ("legacy", WireMode::Legacy),
+            ("uot-v2", WireMode::UotV2),
+            ("h2mux", WireMode::H2mux),
+            ("h2mux-padded", WireMode::H2muxPadded),
+            ("xudp", WireMode::Xudp),
+            ("mux-cool", WireMode::MuxCool),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<WireMode>(&format!("\"{value}\"")).unwrap(),
+                mode
+            );
+            assert_eq!(
+                serde_json::to_string(&mode).unwrap(),
+                format!("\"{value}\"")
+            );
+            assert_eq!(value.parse::<WireMode>().unwrap(), mode);
+            assert_eq!(mode.as_str(), value);
+        }
+        let error = "smux".parse::<WireMode>().unwrap_err().to_string();
+        assert!(error.contains("xudp/mux-cool"));
+    }
+
+    #[test]
+    fn test_vless_mode_identity() {
+        let legacy = Node::from_share_link("vless://uuid@example.com:443#legacy").unwrap();
+        let explicit_legacy =
+            Node::from_share_link("vless://uuid@example.com:443?vless_mode=legacy#explicit")
+                .unwrap();
+        assert_eq!(legacy.id, explicit_legacy.id);
+        assert_eq!(
+            legacy.id,
+            uuid::Uuid::parse_str("d47c73f3-910d-56b4-baa5-d230c76d788b").unwrap()
+        );
+
+        let ids = ["uot-v2", "h2mux", "h2mux-padded", "xudp", "mux-cool"].map(|mode| {
+            Node::from_share_link(&format!(
+                "vless://uuid@example.com:443?vless_mode={mode}#{mode}"
+            ))
+            .unwrap()
+            .id
+        });
+        assert!(ids.iter().all(|id| *id != legacy.id));
+        assert_eq!(
+            ids.iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            ids.len()
         );
     }
 

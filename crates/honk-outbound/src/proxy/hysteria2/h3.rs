@@ -1,6 +1,8 @@
-use std::sync::LazyLock;
+use std::{io, sync::LazyLock};
 
-use super::*;
+use crate::quic::recv_read_exact as read_exact;
+
+use super::wire::{MAX_FIELD_SECTION, read_varint_stream, skip_bytes, write_varint};
 
 // QPACK prefixed integers (RFC 7541 §5.1 / RFC 9204 §4.1.1) — only inside
 // QPACK field sections; everything else on the wire uses QUIC varints.

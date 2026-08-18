@@ -32,13 +32,9 @@ jobs:
             https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
           sudo curl -sL --retry 3 -o /etc/dae/geoip.dat \
             https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
-      # Full suite minus the known-failing pre-existing tests (see AGENTS.md
-      # "Current test status": share_link TOML round-trip x2,
-      # config_dae_routing x1).
+      # Full suite minus the known pre-existing config_dae_routing failure.
       - run: |
           cargo test --workspace --no-fail-fast -- \
-            --skip test_config_toml_round_trip \
-            --skip test_to_file_and_from_file_by_extension \
             --skip test_routing_with_config_dae
 
   build:
@@ -122,7 +118,7 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ matrix.suffix }}" == "-stock" ]]; then
-            echo "FEATURES=--no-default-features --features clash-api,ebpf" >> "$GITHUB_ENV"
+            echo "FEATURES=--no-default-features --features clash-api,ebpf,rprx" >> "$GITHUB_ENV"
           else
             echo "FEATURES=--features ebpf" >> "$GITHUB_ENV"
           fi

@@ -288,6 +288,7 @@ mod storage {
         pub expires_at: Instant,
         /// Minimum TTL from the DNS record set, in seconds.
         pub min_ttl: u32,
+        pub(crate) strict_reusable: bool,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,6 +360,7 @@ pub(crate) use key::{CacheKey, KeyIdentity, OperationKind};
 pub(crate) use service::PublicationEpoch;
 pub(crate) use service::{CacheSlot, DnsCacheService};
 pub use storage::{CachedEntry, NegativeCacheHit};
+pub(crate) use store::ExactLookup;
 
 use storage::{CacheValue, NegativeEntry};
 

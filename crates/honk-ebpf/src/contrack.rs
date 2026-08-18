@@ -17,7 +17,7 @@ use aya_ebpf_bindings::{
     helpers::{bpf_ktime_get_ns, bpf_spin_lock, bpf_spin_unlock},
 };
 use honk_ebpf_common::{
-    NFQUEUE_TOKEN_MASK, RoutingMeta,
+    NFQUEUE_TOKEN_MASK, RoutingMeta, UDP_DECISION_SEQUENCE_MASK,
     conn::{
         BpfStatsKey, ConnState, ConntrackArgs, OCCUPANCY_EBPF_DELETES, OCCUPANCY_INSERTS, TcpState,
         UDP_CONN_STATE_TIMEOUT_NS, UdpDecisionState, tcp_conn_state_expired,
@@ -25,9 +25,6 @@ use honk_ebpf_common::{
     redirect_need::TuplesKey,
 };
 use network_types::tcp::TcpHdr;
-
-/// Type alias so callers can refer to [`ConnState`] through the contrack module.
-pub type ConnStateAlias = ConnState;
 
 /// Lazy-timestamp update interval: only bump `last_seen_ns` when > 1 s elapsed.
 pub const UDP_CONN_STATE_UPDATE_INTERVAL_NS: u64 = 1_000_000_000;
@@ -137,7 +134,7 @@ pub fn populate_udp_conn_state(
     conn.mac.copy_from_slice(mac);
 }
 
-/// Allocate each nonzero mark token once for the lifetime of the pinned map.
+/// Allocate each generation-tagged mark token once until userspace rotates it.
 #[inline(always)]
 pub fn allocate_udp_decision_token(key: &TuplesKey) -> Option<u32> {
     let sequence_ptr = UDP_DECISION_SEQUENCE.get_ptr_mut(0)?;
@@ -147,17 +144,15 @@ pub fn allocate_udp_decision_token(key: &TuplesKey) -> Option<u32> {
     }
 
     let mut became_exhausted = false;
-    let token = if sequence.exhausted != 0 {
-        0
-    } else if sequence.next >= NFQUEUE_TOKEN_MASK {
-        sequence.exhausted = 1;
-        became_exhausted = true;
+    let token = if sequence.exhausted != 0
+        || sequence.next & UDP_DECISION_SEQUENCE_MASK >= UDP_DECISION_SEQUENCE_MASK
+    {
         0
     } else {
         sequence.next += 1;
+        became_exhausted = sequence.next & UDP_DECISION_SEQUENCE_MASK == UDP_DECISION_SEQUENCE_MASK;
         if sequence.next == NFQUEUE_TOKEN_MASK {
             sequence.exhausted = 1;
-            became_exhausted = true;
         }
         sequence.next
     };

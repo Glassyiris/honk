@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use parking_lot::Mutex;
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 use super::*;
 

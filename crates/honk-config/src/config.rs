@@ -52,6 +52,10 @@ pub struct GlobalConfig {
     pub so_mark_from_dae: u32,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Optional append-only operational log file. Relative paths resolve below
+    /// [`GlobalConfig::data_dir`]; empty keeps file logging disabled.
+    #[serde(default)]
+    pub log_file: String,
     #[serde(default)]
     pub disable_waiting_network: bool,
     #[serde(default)]
@@ -310,6 +314,7 @@ impl Default for GlobalConfig {
             pprof_port: 0,
             so_mark_from_dae: 0,
             log_level: default_log_level(),
+            log_file: String::new(),
             disable_waiting_network: false,
             lan_interface: vec![],
             wan_interface: vec![],
@@ -485,9 +490,10 @@ impl Config {
                 .or_else(|_| Self::from_json_str(&content)),
             _ => match crate::parser::parse_dae_config_file(path) {
                 Ok(config) => Ok(config),
-                // An include directive was recognized, so returning a
-                // structured-format error would hide the actionable cause.
-                Err(err @ crate::ConfigError::Include(_)) => Err(err),
+                // These errors identify recognized dae syntax; structured
+                // fallbacks would hide their actionable cause.
+                Err(err @ crate::ConfigError::Include(_))
+                | Err(err @ crate::ConfigError::UnsupportedPolicy(_)) => Err(err),
                 Err(_) => parse_toml(&content)
                     .or_else(|_| parse_yaml(&content))
                     .or_else(|_| Self::from_json_str(&content)),
@@ -551,6 +557,9 @@ impl Config {
 
         self.dns
             .bind_endpoint()
+            .map_err(|error| crate::ConfigError::Validation(error.to_string()))?;
+        self.dns
+            .client_subnet_mode()
             .map_err(|error| crate::ConfigError::Validation(error.to_string()))?;
 
         // The eBPF datapath has the mark compiled in; userspace cannot inject
@@ -637,6 +646,19 @@ impl Config {
                     )));
                 }
             }
+            if node.protocol == crate::types::NodeProtocol::VLess
+                && node
+                    .encryption
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty() && value != "none")
+                && node.flow.as_deref().is_some_and(|flow| !flow.is_empty())
+            {
+                return Err(crate::ConfigError::Validation(format!(
+                    "Node '{}' combines VLESS Encryption with flow; this combination is unsupported",
+                    node.name
+                )));
+            }
+            node.validate_vless_mode()?;
             // direct/block are the injected built-ins; a user node may
             // neither take their names nor their protocols.
             if matches!(
@@ -693,6 +715,34 @@ mod builtin_nodes_tests {
             error.to_string().contains("dns.bind"),
             "validation error must identify dns.bind: {error}"
         );
+    }
+
+    #[test]
+    fn test_from_json_accepts_legacy_null_dns_routing_fields() {
+        let config =
+            Config::from_json_str(r#"{"dns":{"routing":{"request":null,"response":null}}}"#)
+                .unwrap();
+
+        assert!(config.dns.routing.request.rules.is_empty());
+        assert!(config.dns.routing.response.rules.is_empty());
+    }
+
+    #[test]
+    fn test_from_file_preserves_renamed_honk_policy_error() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "group {\n proxy {\n policy: honk\n }\n}").unwrap();
+        let error = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(error, crate::ConfigError::UnsupportedPolicy(_)));
+        assert!(error.to_string().contains("renamed to 'score'"));
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_structured_dns_client_subnet() {
+        let config =
+            Config::from_json_str(r#"{"dns":{"client_subnet":"auto(dns.google)"}}"#).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(matches!(error, crate::ConfigError::Validation(_)));
+        assert!(error.to_string().contains("dns.client_subnet"));
     }
 
     #[test]
@@ -753,6 +803,60 @@ mod builtin_nodes_tests {
             config.nodes[0].transport = ok.into();
             assert!(config.validate().is_ok(), "transport '{ok}' must pass");
         }
+    }
+
+    #[test]
+    fn test_validate_rejects_vless_mode_conflicts() {
+        let base = crate::node::Node::from_share_link(
+            "vless://uuid@example.com:443?vless_mode=h2mux#vless",
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.nodes.push(base.clone());
+        assert!(config.validate().is_ok());
+
+        for mode in [
+            crate::node::WireMode::UotV2,
+            crate::node::WireMode::H2mux,
+            crate::node::WireMode::H2muxPadded,
+            crate::node::WireMode::MuxCool,
+        ] {
+            config.nodes[0] = base.clone();
+            config.nodes[0].vless_mode = mode;
+            config.nodes[0].flow = Some("xtls-rprx-vision".into());
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("with flow")
+            );
+        }
+        config.nodes[0] = base.clone();
+        config.nodes[0].vless_mode = crate::node::WireMode::Xudp;
+        config.nodes[0].flow = Some("xtls-rprx-vision".into());
+        assert!(config.validate().is_ok());
+
+        config.nodes[0] = base.clone();
+        config.nodes[0].encryption = Some("mlkem768x25519plus.native.1rtt.key".into());
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("with VLESS Encryption")
+        );
+
+        config.nodes[0] = base;
+        config.nodes[0].protocol = crate::types::NodeProtocol::Trojan;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("non-VLESS protocol")
+        );
     }
 
     #[test]

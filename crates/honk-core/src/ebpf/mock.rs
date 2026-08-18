@@ -7,8 +7,8 @@
 #[cfg(test)]
 use super::ProjectionMapOperation;
 use super::{
-    EbpfBackend, LpmKeepSet, RoutingPushPhase, UdpDecisionCommitResult, UdpDecisionTransition,
-    apply_udp_decision_transition, udp_state_is_legacy_userspace_owned,
+    EbpfBackend, LpmKeepSet, RoutingPushPhase, UdpDecisionCommitResult, UdpDecisionSequenceStatus,
+    UdpDecisionTransition, apply_udp_decision_transition, udp_state_is_legacy_userspace_owned,
     udp_state_is_userspace_owned, validate_udp_decision_transition,
 };
 use async_trait::async_trait;
@@ -169,6 +169,8 @@ pub struct MockEbpfBackend {
     /// Behind a Mutex because `routing_handoff_take` takes `&self` (the
     /// per-connection hot path holds only a read lock on the backend).
     pub routing_handoffs: parking_lot::Mutex<HashMap<[u8; 40], RoutingHandoffEntry>>,
+    /// Exact tuple retirement fences (TuplesKey → decision token).
+    udp_retire_fences: HashMap<[u8; 40], u32>,
     /// Cookie PID map (cookie → PIDName)
     pub cookie_pids: HashMap<u64, PIDName>,
     /// Outbound alive bitmap: (outbound*6 + domain*2 + ipver) → 0|1
@@ -190,7 +192,7 @@ pub struct MockEbpfBackend {
     pub routing_publication_order: Vec<MockRoutingPublicationWrite>,
     /// Persistent allocator state; cleanup intentionally leaves this intact.
     pub udp_decision_sequence_next: u32,
-    pub udp_decision_sequence_exhausted: bool,
+    pub udp_decision_sequence_generation: u32,
     routing_fault: Option<(RoutingPushPhase, usize)>,
     #[cfg(test)]
     projection_fault: Option<(ProjectionMapOperation, usize, bool)>,
@@ -247,7 +249,11 @@ impl MockEbpfBackend {
             return Ok(UdpDecisionCommitResult::Missing);
         };
         if state.decision_token != token {
-            return Ok(UdpDecisionCommitResult::TokenMismatch);
+            return Ok(if pending_only {
+                UdpDecisionCommitResult::TokenMismatch
+            } else {
+                UdpDecisionCommitResult::Superseded
+            });
         }
         let state_allowed = if pending_only {
             state.state == UdpDecisionState::Preparing as u8
@@ -967,7 +973,7 @@ impl EbpfBackend for MockEbpfBackend {
             return Ok(UdpDecisionCommitResult::Missing);
         };
         if !udp_state_is_legacy_userspace_owned(&state) {
-            return Ok(UdpDecisionCommitResult::StateMismatch);
+            return Ok(UdpDecisionCommitResult::Superseded);
         }
         if self.udp_conn_states.remove(&key_bytes).is_some() {
             super::USERSPACE_CONN_STATE_DELETES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -978,16 +984,58 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn verify_udp_decision_sequence(&self) -> anyhow::Result<()> {
+        self.udp_decision_sequence_status().map(|_| ())
+    }
+    fn udp_decision_sequence_status(&self) -> anyhow::Result<UdpDecisionSequenceStatus> {
         anyhow::ensure!(
-            self.udp_decision_sequence_next <= NFQUEUE_TOKEN_MASK,
-            "UDP decision sequence next token exceeds reserved token space"
+            self.udp_decision_sequence_next <= honk_ebpf_common::UDP_DECISION_SEQUENCE_MASK,
+            "invalid mock UDP decision sequence"
         );
-        Ok(())
+        anyhow::ensure!(
+            self.udp_decision_sequence_generation <= honk_ebpf_common::UDP_DECISION_GENERATION_MASK,
+            "invalid mock UDP decision generation"
+        );
+        Ok(UdpDecisionSequenceStatus {
+            next: self.udp_decision_sequence_next,
+            generation: self.udp_decision_sequence_generation,
+        })
     }
 
-    fn udp_decision_sequence_exhausted(&self) -> anyhow::Result<bool> {
-        self.verify_udp_decision_sequence()?;
-        Ok(self.udp_decision_sequence_exhausted)
+    fn reset_udp_decision_sequence(&mut self, generation: u32) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            generation <= honk_ebpf_common::UDP_DECISION_GENERATION_MASK,
+            "invalid UDP decision generation {generation}"
+        );
+        anyhow::ensure!(
+            self.udp_decision_sequence_status()?.exhausted(),
+            "UDP decision sequence is not exhausted"
+        );
+        let conflicts_with_rollback = |token| {
+            token != 0 && honk_ebpf_common::udp_decision_token_generation(token) >= generation
+        };
+        let generation_is_live = self
+            .udp_conn_states
+            .values()
+            .any(|state| conflicts_with_rollback(state.decision_token))
+            || self
+                .udp_retire_fences
+                .values()
+                .any(|token| conflicts_with_rollback(*token))
+            || self
+                .routing_handoffs
+                .lock()
+                .values()
+                .any(|entry| conflicts_with_rollback(entry.result.decision_token))
+            || self
+                .redirect_tracks
+                .values()
+                .any(|entry| conflicts_with_rollback(entry.decision_token));
+        if generation_is_live {
+            return Ok(false);
+        }
+        self.udp_decision_sequence_next = 0;
+        self.udp_decision_sequence_generation = generation;
+        Ok(true)
     }
 
     fn routing_handoff_lookup(
@@ -1781,7 +1829,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 backend.remove_udp_flow(&key, 0).unwrap(),
-                UdpDecisionCommitResult::StateMismatch
+                UdpDecisionCommitResult::Superseded
             );
             assert!(backend.udp_conn_state_lookup(&key).unwrap().is_some());
         }
@@ -1805,6 +1853,51 @@ mod tests {
         backend.udp_decision_sequence_next = 123;
         futures::executor::block_on(backend.cleanup()).unwrap();
         assert_eq!(backend.udp_decision_sequence_next, 123);
+    }
+
+    #[test]
+    fn exhausted_sequence_skips_rollback_reachable_generations() {
+        let mut backend = MockEbpfBackend::new();
+        backend.udp_decision_sequence_next = UDP_DECISION_SEQUENCE_MASK;
+        let key = decision_test_key();
+        let live_token = udp_decision_token(1, 7).unwrap();
+        backend
+            .udp_conn_state_store(
+                &key,
+                &ConnState {
+                    state: UdpDecisionState::Proxy as u8,
+                    decision_token: live_token,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(!backend.reset_udp_decision_sequence(0).unwrap());
+        assert!(!backend.reset_udp_decision_sequence(1).unwrap());
+
+        assert!(backend.reset_udp_decision_sequence(2).unwrap());
+        assert_eq!(
+            backend.udp_decision_sequence_status().unwrap(),
+            UdpDecisionSequenceStatus {
+                next: 0,
+                generation: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn exhausted_sequence_skips_live_retirement_fence() {
+        let mut backend = MockEbpfBackend::new();
+        backend.udp_decision_sequence_next = UDP_DECISION_SEQUENCE_MASK;
+        let key = decision_test_key();
+        backend.udp_retire_fences.insert(
+            MockEbpfBackend::tuples_key_bytes(&key),
+            udp_decision_token(1, 7).unwrap(),
+        );
+
+        assert!(!backend.reset_udp_decision_sequence(1).unwrap());
+        backend.udp_retire_fences.clear();
+        assert!(backend.reset_udp_decision_sequence(1).unwrap());
     }
 
     #[test]

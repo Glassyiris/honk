@@ -8,7 +8,6 @@
 //! 5. TCP relay
 //! 6. DNS resolution
 //! 7. Statistics tracking
-//! 8. Control plane commands
 //!
 //! All tests use the mock eBPF backend, so they run without
 //! kernel eBPF support.
@@ -17,7 +16,7 @@
 mod integration_tests {
     use honk_config::*;
     use honk_core::{
-        control::{ControlCommand, ControlPlane},
+        control::ControlPlane,
         dns::{self, DnsResolver},
         ebpf::mock::MockEbpfBackend,
         proxy::ProxyRegistry,
@@ -61,7 +60,6 @@ mod integration_tests {
     use std::net::SocketAddr;
     use std::str::FromStr;
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::mpsc;
 
     /// Spawn an echo server that returns what it receives.
     async fn spawn_echo_server() -> SocketAddr {
@@ -581,32 +579,6 @@ protocol = "udp"
             test_dns_forwarder(),
         );
         assert!(cp.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_control_plane_stats_command() {
-        let config = Config::default();
-        let ebpf = Box::new(MockEbpfBackend::new());
-        let router = Router::new(&[], "direct").unwrap();
-        let registry = ProxyRegistry::default_resolver().unwrap();
-        let resolver = DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap();
-
-        let cp = ControlPlane::new(
-            config,
-            ebpf,
-            router,
-            std::sync::Arc::new(registry),
-            resolver,
-            test_dns_forwarder(),
-        )
-        .unwrap();
-        let tx = cp.command_sender();
-
-        let (stats_tx, _stats_rx) = mpsc::channel(1);
-        tx.send(ControlCommand::GetStats(stats_tx)).await.unwrap();
-
-        // Note: stats response requires the event loop to be running
-        // This test just verifies the channel works
     }
 
     #[tokio::test]

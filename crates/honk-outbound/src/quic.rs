@@ -11,6 +11,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, anyhow};
+use bytes::Bytes;
 use quinn::congestion;
 use quinn::{
     ClientConfig, Connection, Endpoint, EndpointConfig, RecvStream, SendStream, TransportConfig,
@@ -793,6 +794,23 @@ impl QuicBiStream {
         self
     }
 
+    /// Poll one cancellation-safe scatter write. `chunks` retains exactly the
+    /// unsent suffix when progress is made.
+    pub(crate) fn poll_write_chunks(
+        &mut self,
+        cx: &mut Context<'_>,
+        chunks: &mut [Bytes],
+    ) -> Poll<io::Result<usize>> {
+        use std::future::Future;
+
+        let result = std::pin::pin!(self.send.write_chunks(chunks)).poll(cx);
+        result.map(|result| {
+            result
+                .map(|written| written.bytes)
+                .map_err(io::Error::other)
+        })
+    }
+
     /// Split into the raw quinn halves plus the drop guard (open-stream
     /// accounting) — for users that drive the halves separately, e.g. UDP
     /// session bridges.
@@ -1358,7 +1376,9 @@ impl TransportQuinnSocket {
             async move {
                 while let Some(data) = outbound_rx.recv().await {
                     if transport.send_packet(&data).await.is_err() {
-                        break;
+                        // Quinn logs socket errors at ERROR. Keep this probe-only
+                        // adapter open and let its existing timeout classify failure.
+                        std::future::pending::<()>().await;
                     }
                 }
             }
@@ -1366,8 +1386,9 @@ impl TransportQuinnSocket {
         let receiver = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
             loop {
-                let Ok((n, _)) = transport.recv_packet(&mut buf).await else {
-                    break;
+                let (n, _) = match transport.recv_packet(&mut buf).await {
+                    Ok(packet) => packet,
+                    Err(_) => std::future::pending().await,
                 };
                 // A full queue drops the datagram (UDP semantics); the
                 // transport read must never backpressure.
@@ -1513,4 +1534,49 @@ pub async fn quic_handshake_probe(
     conn.close(quinn::VarInt::from_u32(0), b"probe");
     endpoint.close(quinn::VarInt::from_u32(0), b"probe");
     Ok(elapsed)
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct FailedPacketTransport;
+
+    #[async_trait::async_trait]
+    impl PacketTransport for FailedPacketTransport {
+        fn relay_addr(&self) -> SocketAddr {
+            "127.0.0.1:443".parse().unwrap()
+        }
+
+        async fn send_packet(&self, _data: &[u8]) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        async fn recv_packet(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    #[tokio::test]
+    async fn packet_transport_failure_stays_quiet_until_probe_timeout() {
+        let node = honk_config::node::Node {
+            sni: Some("localhost".into()),
+            skip_cert_verify: true,
+            ..Default::default()
+        };
+        let config = client_config(&node, &[b"h3"], QuicClientOptions::default())
+            .await
+            .unwrap();
+        let error = quic_handshake_probe(
+            Arc::new(FailedPacketTransport),
+            "127.0.0.1:443".parse().unwrap(),
+            "localhost",
+            &config,
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("QUIC handshake timeout"));
+    }
 }

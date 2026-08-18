@@ -6,7 +6,8 @@ use tracing::debug;
 
 use super::{DnsService, DnsServiceBackend, OperationToken};
 use crate::dns::forwarder::{DnsForwarder, build_dns_query};
-use crate::dns::query::IngressProfile;
+use crate::dns::planner::PlanError;
+use crate::dns::query::{DnsRequestMeta, IngressProfile};
 use crate::dns::resolver::ResolvedAddr;
 
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +32,23 @@ struct FamilyResponses {
     ipv6_eligible: bool,
 }
 
+impl FamilyResponses {
+    fn has_missing_original_destination(&self) -> bool {
+        self.ipv4
+            .iter()
+            .chain(self.ipv6.iter())
+            .filter_map(|response| response.as_ref().err())
+            .any(|error| {
+                error.chain().any(|cause| {
+                    matches!(
+                        cause.downcast_ref::<PlanError>(),
+                        Some(PlanError::MissingOriginalDestination)
+                    )
+                })
+            })
+    }
+}
+
 impl DnsService {
     pub(crate) async fn resolve_name(&self, domain: &str) -> anyhow::Result<ResolvedAddr> {
         self.resolve_name_with_fallback(domain, |name| async move {
@@ -39,6 +57,47 @@ impl DnsService {
                 .map_err(anyhow::Error::from)
         })
         .await
+    }
+
+    pub(crate) async fn resolve_name_for_source(
+        &self,
+        domain: &str,
+        source_ip: IpAddr,
+    ) -> anyhow::Result<ResolvedAddr> {
+        let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        if domain.is_empty() {
+            return Err(NameResolutionError::EmptyDomain.into());
+        }
+        if let Ok(ip) = domain.parse::<IpAddr>() {
+            return Ok(literal(ip));
+        }
+
+        debug!(lookup_kind = "source_name", %source_ip, "DNS lookup");
+        let mut operation = self.operation();
+        let metadata = Some(DnsRequestMeta::new(Some(source_ip), None));
+        let responses = match self.backend.as_ref() {
+            DnsServiceBackend::Runtime(provider) => {
+                let lease = provider.acquire();
+                resolve_with_forwarder(
+                    &mut operation,
+                    lease.runtime().forwarder(),
+                    &domain,
+                    metadata,
+                )
+                .await?
+            }
+            DnsServiceBackend::Standalone(forwarder) => {
+                resolve_with_forwarder(&mut operation, forwarder, &domain, metadata).await?
+            }
+        };
+        if responses.has_missing_original_destination() {
+            return Err(PlanError::MissingOriginalDestination.into());
+        }
+        let resolved = resolved_from_responses(responses);
+        if resolved.ipv4.is_empty() && resolved.ipv6.is_empty() {
+            return Err(NameResolutionError::NoAddresses { domain }.into());
+        }
+        Ok(resolved)
     }
 
     pub(crate) async fn resolve_name_with_fallback<F, Fut>(
@@ -63,10 +122,11 @@ impl DnsService {
         let responses = match self.backend.as_ref() {
             DnsServiceBackend::Runtime(provider) => {
                 let lease = provider.acquire();
-                resolve_with_forwarder(&mut operation, lease.runtime().forwarder(), &domain).await?
+                resolve_with_forwarder(&mut operation, lease.runtime().forwarder(), &domain, None)
+                    .await?
             }
             DnsServiceBackend::Standalone(forwarder) => {
-                resolve_with_forwarder(&mut operation, forwarder, &domain).await?
+                resolve_with_forwarder(&mut operation, forwarder, &domain, None).await?
             }
         };
         let ipv4_eligible = responses.ipv4_eligible;
@@ -105,6 +165,7 @@ async fn resolve_with_forwarder(
     operation: &mut OperationToken,
     forwarder: &DnsForwarder,
     domain: &str,
+    metadata: Option<DnsRequestMeta>,
 ) -> anyhow::Result<FamilyResponses> {
     let ipv4_query = build_dns_query(domain, 1);
     let ipv6_query = build_dns_query(domain, 28);
@@ -112,8 +173,8 @@ async fn resolve_with_forwarder(
         match &forwarder.strategy {
             DnsStrategy::Both | DnsStrategy::PreferIpv4 | DnsStrategy::PreferIpv6 => {
                 let (ipv4, ipv6) = tokio::join!(
-                    forwarder.resolve_with_profile(&ipv4_query, IngressProfile::Internal),
-                    forwarder.resolve_with_profile(&ipv6_query, IngressProfile::Internal),
+                    resolve_family(forwarder, &ipv4_query, metadata),
+                    resolve_family(forwarder, &ipv6_query, metadata),
                 );
                 FamilyResponses {
                     ipv4: Some(ipv4),
@@ -123,22 +184,14 @@ async fn resolve_with_forwarder(
                 }
             }
             DnsStrategy::Ipv4Only => FamilyResponses {
-                ipv4: Some(
-                    forwarder
-                        .resolve_with_profile(&ipv4_query, IngressProfile::Internal)
-                        .await,
-                ),
+                ipv4: Some(resolve_family(forwarder, &ipv4_query, metadata).await),
                 ipv6: None,
                 ipv4_eligible: true,
                 ipv6_eligible: false,
             },
             DnsStrategy::Ipv6Only => FamilyResponses {
                 ipv4: None,
-                ipv6: Some(
-                    forwarder
-                        .resolve_with_profile(&ipv6_query, IngressProfile::Internal)
-                        .await,
-                ),
+                ipv6: Some(resolve_family(forwarder, &ipv6_query, metadata).await),
                 ipv4_eligible: false,
                 ipv6_eligible: true,
             },
@@ -148,6 +201,25 @@ async fn resolve_with_forwarder(
         .run(operation_future)
         .await
         .map_err(anyhow::Error::from)
+}
+
+async fn resolve_family(
+    forwarder: &DnsForwarder,
+    query: &[u8],
+    metadata: Option<DnsRequestMeta>,
+) -> anyhow::Result<Vec<u8>> {
+    match metadata {
+        Some(metadata) => {
+            forwarder
+                .resolve_strict_with_context_and_profile(query, metadata, IngressProfile::Internal)
+                .await
+        }
+        None => {
+            forwarder
+                .resolve_with_profile(query, IngressProfile::Internal)
+                .await
+        }
+    }
 }
 
 fn literal(ip: IpAddr) -> ResolvedAddr {

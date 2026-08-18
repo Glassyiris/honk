@@ -30,8 +30,11 @@ use honk_config::group::GroupPolicy;
 use honk_config::node::{Group, Node};
 use honk_config::types::NodeProtocol;
 use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
+use honk_outbound::group::SelectionNetwork;
 use honk_outbound::group::{GroupManager, SharedGroupManager};
-use honk_outbound::urltest::{urltest_group, urltest_node_in_generation};
+use honk_outbound::urltest::{
+    urltest_group_with_feedback, urltest_node_in_generation_with_feedback,
+};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -384,6 +387,7 @@ fn clash_group_type(policy: GroupPolicy) -> &'static str {
         GroupPolicy::URLTest => "url_test",
         GroupPolicy::LoadBalance => "load_balance",
         GroupPolicy::Fallback => "fallback",
+        GroupPolicy::Score => "url_test",
     }
 }
 
@@ -408,6 +412,10 @@ fn build_group_proxy_info(
         GroupPolicy::LoadBalance => node_names.first().cloned().unwrap_or_default(),
         GroupPolicy::Fallback => group_manager
             .get_fallback_selection(&group.name)
+            .or_else(|| node_names.first().cloned())
+            .unwrap_or_default(),
+        GroupPolicy::Score => group_manager
+            .get_score_selection_for_network(&group.name, SelectionNetwork::Tcp)
             .or_else(|| node_names.first().cloned())
             .unwrap_or_default(),
     };
@@ -637,7 +645,8 @@ fn delay_ms(d: Duration) -> u64 {
 
 /// GET /proxies/{name}/delay — live latency measurement (HEAD request
 /// through the node / group members). Successes refresh the alive-set
-/// latency history; failures clear it and return 503.
+/// history; failures return 503, but only the second consecutive failure
+/// adds a synthetic penalty and demotes the node.
 async fn get_proxy_delay(
     State(s): State<Arc<ClashState>>,
     Path(name): Path<String>,
@@ -654,15 +663,21 @@ async fn get_proxy_delay(
             );
         };
         let tcp = entry.tcp.clone();
+        let warmable = entry.warmable.clone();
         let generation = s.runtime_registry.read().clone();
-        let measured = urltest_node_in_generation(
-            &generation,
-            &node,
-            tcp.as_ref(),
-            &query.url,
-            query.timeout(),
-        )
-        .await;
+        let measured = {
+            let group_manager = s.group_manager.read().clone();
+            urltest_node_in_generation_with_feedback(
+                &generation,
+                &node,
+                tcp.as_ref(),
+                warmable.as_deref(),
+                &query.url,
+                query.timeout(),
+                &group_manager,
+            )
+            .await
+        };
         return match measured {
             Ok(latency) => {
                 s.alive_set
@@ -670,9 +685,9 @@ async fn get_proxy_delay(
                 Json(serde_json::json!({"delay": delay_ms(latency)})).into_response()
             }
             Err(e) => {
-                // sing-box deletes the node's latency history on failure;
-                // the synthetic penalty sample keeps a flaky node from
-                // instantly re-ranking first.
+                // A lone failure leaves history unchanged; a second
+                // consecutive failure adds the synthetic penalty and
+                // demotes the node.
                 s.alive_set
                     .record_dial_failure(node.id, ProbeDomain::Tcp, IpVersion::V4);
                 error_response(
@@ -683,26 +698,31 @@ async fn get_proxy_delay(
         };
     }
 
-    if config.groups.iter().any(|g| g.name == name) {
+    let is_group = config.groups.iter().any(|group| group.name == name);
+    drop(config);
+    if is_group {
         let members = {
             let gm = s.group_manager.read();
             gm.delay_test_members(&name)
         };
-        drop(config);
         if members.is_empty() {
             return error_response(StatusCode::SERVICE_UNAVAILABLE, "group has no members");
         }
         let leaves: Vec<Node> = members.iter().map(|(_, leaf)| leaf.clone()).collect();
         let generation = s.runtime_registry.read().clone();
-        let results = urltest_group(
-            &leaves,
-            &generation,
-            &s.proxy_registry,
-            &s.alive_set,
-            &query.url,
-            query.timeout(),
-        )
-        .await;
+        let results = {
+            let group_manager = s.group_manager.read().clone();
+            urltest_group_with_feedback(
+                &leaves,
+                &generation,
+                &s.proxy_registry,
+                &s.alive_set,
+                &query.url,
+                query.timeout(),
+                group_manager,
+            )
+            .await
+        };
         // sing-box performUpdateCheck: an explicit delay test immediately
         // re-evaluates the URLTest selection with the fresh measurements
         // (tolerance hysteresis applies). Without this the group's `now`
@@ -719,6 +739,7 @@ async fn get_proxy_delay(
             let gm = s.group_manager.read();
             gm.get_selector_choice(&name)
                 .or_else(|| gm.get_urltest_selection(&name))
+                .or_else(|| gm.get_score_selection_for_network(&name, SelectionNetwork::Tcp))
         }
         .or_else(|| members.first().map(|(tag, _)| tag.clone()));
         if let Some(current) = current
@@ -746,27 +767,33 @@ async fn get_group_delay(
     Path(name): Path<String>,
     Query(query): Query<DelayQuery>,
 ) -> Response {
-    let config = s.config.read().await;
-    if !config.groups.iter().any(|g| g.name == name) {
+    let exists = {
+        let config = s.config.read().await;
+        config.groups.iter().any(|group| group.name == name)
+    };
+    if !exists {
         return error_response(StatusCode::NOT_FOUND, "group not found");
     }
     let members = {
         let gm = s.group_manager.read();
         gm.delay_test_members(&name)
     };
-    drop(config);
 
     let leaves: Vec<Node> = members.iter().map(|(_, leaf)| leaf.clone()).collect();
     let generation = s.runtime_registry.read().clone();
-    let results = urltest_group(
-        &leaves,
-        &generation,
-        &s.proxy_registry,
-        &s.alive_set,
-        &query.url,
-        query.timeout(),
-    )
-    .await;
+    let results = {
+        let group_manager = s.group_manager.read().clone();
+        urltest_group_with_feedback(
+            &leaves,
+            &generation,
+            &s.proxy_registry,
+            &s.alive_set,
+            &query.url,
+            query.timeout(),
+            group_manager,
+        )
+        .await
+    };
     // sing-box performUpdateCheck: re-evaluate the URLTest selection with
     // the fresh measurements (see get_proxy_delay's group branch).
     {
@@ -854,6 +881,7 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
             },
             "sessions": {
                 "anytls": warm.anytls_sessions,
+                "vless": warm.vless_sessions,
                 "tuic": warm.tuic_clients,
                 "juicity": warm.juicity_clients,
                 "hysteria2": warm.hysteria2_clients,
@@ -902,6 +930,19 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
             "nfqueue": {
                 "received": udp.nfqueue.received,
                 "activeFlows": udp.nfqueue.active_flows,
+                "kernelQueueDepth": udp.nfqueue.kernel_queue_depth,
+                "kernelStatsAvailable": udp.nfqueue.kernel_stats_available,
+                "kernelStatsReadErrors": udp.nfqueue.kernel_stats_read_errors,
+                "kernelDropped": udp.nfqueue.kernel_dropped,
+                "kernelUserDropped": udp.nfqueue.kernel_user_dropped,
+                "heldPackets": udp.nfqueue.held_packets,
+                "heldPeak": udp.nfqueue.held_peak,
+                "socketReceiveBufferBytes": udp.nfqueue.socket_receive_buffer_bytes,
+                "actorQueueFull": udp.nfqueue.actor_queue_full,
+                "correlatorFull": udp.nfqueue.correlator_full,
+                "actorQueueDepth": udp.nfqueue.actor_queue_depth,
+                "actorQueuedBytes": udp.nfqueue.actor_queued_bytes,
+                "actorOldestAgeNanos": udp.nfqueue.actor_oldest_age_nanos,
                 "directAccepted": udp.nfqueue.direct_accepted,
                 "proxyCopied": udp.nfqueue.proxy_copied,
                 "proxyDropped": udp.nfqueue.proxy_dropped,
@@ -910,6 +951,7 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
                 "drop": udp.nfqueue.drop,
                 "tokenMismatch": udp.nfqueue.token_mismatch,
                 "tokenExhaustion": udp.nfqueue.token_exhaustion,
+                "tokenRollovers": udp.nfqueue.token_rollovers,
                 "verdictErrors": udp.nfqueue.verdict_errors,
                 "receiptToVerdict": udp_histogram_json(&udp.nfqueue.receipt_to_verdict_latency),
             },
@@ -1121,13 +1163,13 @@ fn spawn_connection_sampler(
 
 async fn delete_connections(State(s): State<Arc<ClashState>>) -> StatusCode {
     for snap in s.connection_tracker.snapshot() {
-        s.connection_tracker.close_connection(&snap.id);
+        s.connection_tracker.remove(&snap.id);
     }
     StatusCode::NO_CONTENT
 }
 
 async fn delete_connection(State(s): State<Arc<ClashState>>, Path(id): Path<String>) -> StatusCode {
-    s.connection_tracker.close_connection(&id);
+    s.connection_tracker.remove(&id);
     StatusCode::NO_CONTENT
 }
 

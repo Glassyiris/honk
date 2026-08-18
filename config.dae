@@ -7,6 +7,8 @@ global {
     auto_config_kernel_parameter: true
     # 运行时状态与相对资源根目录（须为绝对路径；修改后需重启）
     data_dir: '/var/share/honk'
+    # 运行日志追加写入 data_dir 下的文件（空值关闭文件输出）
+    log_file: 'honk.log'
     tcp_check_url: 'https://www.gstatic.com/generate_204'
     tcp_check_http_method: HEAD
     udp_check_dns: 'dns.google.com:53,8.8.8.8,2001:4860:4860::8888'
@@ -18,7 +20,7 @@ global {
     # Group will switch node only when new_latency <= old_latency - tolerance.
     check_tolerance: 30ms
 
-    # 预热与拨号预算(小中规模节点的推荐值;大订阅见 doc/configuration.zh.md)
+    # 预热与拨号预算(小中规模节点的推荐值;大订阅见 doc/zh/configuration.md)
     # 大订阅基线关闭额外 UDP 预热；Selector 选择仍单独保活。
     udp_warm_node_count: 0
     # 大订阅诊断基线也关闭启动裸 TCP 预连接。
@@ -38,17 +40,23 @@ subscription {
 
 # 对于中国大陆域名使用 alidns，其他使用 googledns 查询。
 dns {
-    # 保持注释可避免与现有 dnsmasq/AdGuardHome 抢占；透明 :53 仍生效
-    # bind: 'tcp+udp://:1053'
-    ipversion_prefer: 4
+    #ipversion_prefer: 4
+    #client_subnet: auto
     upstream {
-        homedns: 'udp+tcp://10.10.10.1:53'
+        local: 'udp://127.0.0.1:53'
+        remote: 'tcp+udp://dns.google:53'
     }
     routing {
-        # 根据 DNS 查询，决定使用哪个 DNS 上游。
-        # 按由上到下的顺序匹配。
         request {
-            fallback: homedns
+            qtype(https) -> reject
+            qname(geosite:gfw) -> remote
+            fallback: local
+        }
+        response {
+            upstream(remote) -> accept
+            qname(geosite:private) -> accept
+            ip(geoip:cn) -> accept
+            fallback: remote
         }
     }
 }

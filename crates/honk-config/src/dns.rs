@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Host;
@@ -161,12 +162,53 @@ fn parse_bind_authority(value: &str, authority: &str) -> Result<(String, u16), D
     Ok((host, port))
 }
 
+pub const DEFAULT_CLIENT_SUBNET_PROBE_TARGET: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+
+/// Configured EDNS Client Subnet behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsClientSubnet {
+    Preset(Ipv4Net),
+    Auto { target: Ipv4Addr },
+}
+
+impl DnsClientSubnet {
+    pub const fn is_auto(self) -> bool {
+        matches!(self, Self::Auto { .. })
+    }
+}
+
+/// Error returned when `dns.client_subnet` is not supported.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "invalid dns.client_subnet {value:?}: expected empty, auto, auto(IPv4), IPv4, or IPv4/prefix"
+)]
+pub struct DnsClientSubnetError {
+    value: String,
+}
+
+impl DnsClientSubnetError {
+    fn new(value: &str) -> Self {
+        Self {
+            value: value.to_string(),
+        }
+    }
+}
+
 /// DNS configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsConfig {
     /// Standalone DNS listener endpoint. Empty disables the listener.
     #[serde(default)]
     pub bind: String,
+    /// Resolve A/AAAA queries from `/etc/hosts` before DNS routing and upstreams.
+    #[serde(default)]
+    pub use_host: bool,
+    /// EDNS Client Subnet preset or automatic first-public-hop inference.
+    #[serde(default)]
+    pub client_subnet: String,
+    /// Generation-pinned result of automatic inference; never serialized.
+    #[serde(skip)]
+    pub resolved_client_subnet: Option<Ipv4Net>,
     #[serde(default)]
     pub upstream: Vec<DnsUpstream>,
     #[serde(default)]
@@ -191,6 +233,43 @@ impl DnsConfig {
         } else {
             DnsBindEndpoint::parse(&self.bind).map(Some)
         }
+    }
+
+    pub fn client_subnet_mode(&self) -> Result<Option<DnsClientSubnet>, DnsClientSubnetError> {
+        let value = self.client_subnet.trim();
+        if value.is_empty() {
+            return Ok(None);
+        }
+        if value.eq_ignore_ascii_case("auto") {
+            return Ok(Some(DnsClientSubnet::Auto {
+                target: DEFAULT_CLIENT_SUBNET_PROBE_TARGET,
+            }));
+        }
+        let lowercase = value.to_ascii_lowercase();
+        if lowercase.starts_with("auto(") && lowercase.ends_with(')') {
+            let target = value[5..value.len() - 1]
+                .trim()
+                .parse::<Ipv4Addr>()
+                .map_err(|_| DnsClientSubnetError::new(value))?;
+            return Ok(Some(DnsClientSubnet::Auto { target }));
+        }
+        if let Ok(network) = value.parse::<Ipv4Net>() {
+            return Ok(Some(DnsClientSubnet::Preset(network.trunc())));
+        }
+        let address = value
+            .parse::<Ipv4Addr>()
+            .map_err(|_| DnsClientSubnetError::new(value))?;
+        Ok(Some(DnsClientSubnet::Preset(
+            Ipv4Net::new(address, 32).expect("IPv4 /32 is valid"),
+        )))
+    }
+
+    pub fn effective_client_subnet(&self) -> Result<Option<Ipv4Net>, DnsClientSubnetError> {
+        Ok(match self.client_subnet_mode()? {
+            Some(DnsClientSubnet::Preset(network)) => Some(network),
+            Some(DnsClientSubnet::Auto { .. }) => self.resolved_client_subnet,
+            None => None,
+        })
     }
 }
 
@@ -220,10 +299,10 @@ pub struct DnsUpstream {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsRouting {
     /// New-style request routing rules.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "DnsRequestRouting::is_default")]
     pub request: DnsRequestRouting,
     /// New-style response routing rules.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "DnsResponseRouting::is_default")]
     pub response: DnsResponseRouting,
     /// LEGACY flat rules for old JSON/tests — converted in `DnsRouter::new`
     /// when `request.rules` is empty.
@@ -340,6 +419,13 @@ pub enum DnsCond {
         /// QTYPE values (OR-ed within).
         types: Vec<u16>,
     },
+    /// Request only: match the client source address.
+    Sip {
+        /// Negate this condition.
+        not: bool,
+        /// IP hosts or CIDRs (OR-ed within).
+        cidrs: Vec<String>,
+    },
     /// Response only: match the upstream that produced the answer.
     Upstream {
         /// Negate this condition.
@@ -416,34 +502,62 @@ impl Default for DnsResponseRouting {
     }
 }
 
-// All the new routing types live outside the serde tree.  `DnsRouting` only
-// serialises/deserialises the legacy fields; the new request/response blocks
-// are populated by the parser, so the manual impls below accept-and-ignore
-// any serialized form and deserialize back to the defaults.
-
-impl Serialize for DnsRequestRouting {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        // Never serialised via JSON — the parser writes directly.
-        s.serialize_unit()
+impl DnsRequestRouting {
+    fn is_default(&self) -> bool {
+        self.rules.is_empty()
+            && matches!(&self.fallback, DnsRequestAction::Upstream(name) if name == "default")
     }
 }
+
+impl DnsResponseRouting {
+    fn is_default(&self) -> bool {
+        self.rules.is_empty() && self.fallback == DnsResponseAction::Accept
+    }
+}
+
+impl Serialize for DnsRequestRouting {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if !self.is_default() {
+            return Err(<S::Error as serde::ser::Error>::custom(
+                "dns.routing.request rules can only be written in dae syntax",
+            ));
+        }
+        serializer.serialize_unit()
+    }
+}
+
 impl<'de> Deserialize<'de> for DnsRequestRouting {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        // Accept anything and return default — populated by parser later.
-        let _ = serde::de::IgnoredAny::deserialize(d)?;
-        Ok(Self::default())
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if Option::<serde::de::IgnoredAny>::deserialize(deserializer)?.is_none() {
+            Ok(Self::default())
+        } else {
+            Err(<D::Error as serde::de::Error>::custom(
+                "dns.routing.request rules are only supported in dae syntax",
+            ))
+        }
     }
 }
 
 impl Serialize for DnsResponseRouting {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_unit()
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if !self.is_default() {
+            return Err(<S::Error as serde::ser::Error>::custom(
+                "dns.routing.response rules can only be written in dae syntax",
+            ));
+        }
+        serializer.serialize_unit()
     }
 }
+
 impl<'de> Deserialize<'de> for DnsResponseRouting {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let _ = serde::de::IgnoredAny::deserialize(d)?;
-        Ok(Self::default())
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if Option::<serde::de::IgnoredAny>::deserialize(deserializer)?.is_none() {
+            Ok(Self::default())
+        } else {
+            Err(<D::Error as serde::de::Error>::custom(
+                "dns.routing.response rules are only supported in dae syntax",
+            ))
+        }
     }
 }
 
@@ -577,6 +691,9 @@ impl Default for DnsConfig {
     fn default() -> Self {
         Self {
             bind: String::new(),
+            use_host: false,
+            client_subnet: String::new(),
+            resolved_client_subnet: None,
             upstream: vec![DnsUpstream {
                 name: "default".to_string(),
                 address: "223.5.5.5:53".to_string(),
@@ -686,6 +803,72 @@ mod tests {
         assert!(endpoint.udp_enabled());
         assert_eq!(endpoint.host(), "localhost");
         assert_eq!(endpoint.port(), 53);
+    }
+
+    #[test]
+    fn dns_client_subnet_parses_fixed_and_auto_modes() {
+        let mut config = DnsConfig::default();
+        assert_eq!(config.client_subnet_mode().unwrap(), None);
+
+        config.client_subnet = "203.0.113.9".into();
+        assert_eq!(
+            config.client_subnet_mode().unwrap(),
+            Some(DnsClientSubnet::Preset("203.0.113.9/32".parse().unwrap()))
+        );
+        config.client_subnet = "198.51.100.9/24".into();
+        assert_eq!(
+            config.client_subnet_mode().unwrap(),
+            Some(DnsClientSubnet::Preset("198.51.100.0/24".parse().unwrap()))
+        );
+        config.client_subnet = "auto".into();
+        assert_eq!(
+            config.client_subnet_mode().unwrap(),
+            Some(DnsClientSubnet::Auto {
+                target: DEFAULT_CLIENT_SUBNET_PROBE_TARGET
+            })
+        );
+        config.client_subnet = "auto(9.9.9.9)".into();
+        assert_eq!(
+            config.client_subnet_mode().unwrap(),
+            Some(DnsClientSubnet::Auto {
+                target: Ipv4Addr::new(9, 9, 9, 9)
+            })
+        );
+    }
+
+    #[test]
+    fn dns_client_subnet_rejects_ambiguous_values() {
+        let mut config = DnsConfig::default();
+        for value in ["auto()", "auto(dns.google)", "2001:db8::1", "192.0.2.1/33"] {
+            config.client_subnet = value.into();
+            assert!(config.client_subnet_mode().is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn resolved_client_subnet_is_runtime_only() {
+        let config = DnsConfig {
+            client_subnet: "auto".into(),
+            resolved_client_subnet: Some("198.51.100.0/24".parse().unwrap()),
+            ..Default::default()
+        };
+
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert!(serialized.get("resolved_client_subnet").is_none());
+        let restored: DnsConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.resolved_client_subnet, None);
+        assert_eq!(restored.client_subnet, "auto");
+    }
+
+    #[test]
+    fn use_host_is_serde_defaulted_and_explicitly_configurable() {
+        assert!(!DnsConfig::default().use_host);
+        assert!(!serde_json::from_str::<DnsConfig>("{}").unwrap().use_host);
+        assert!(
+            serde_json::from_str::<DnsConfig>(r#"{"use_host":true}"#)
+                .unwrap()
+                .use_host
+        );
     }
 
     /// Regression: a `[dns]` section without `cache` must still get the

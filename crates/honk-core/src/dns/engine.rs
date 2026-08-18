@@ -1,4 +1,4 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -9,7 +9,7 @@ use super::planner::{
     ResponseTraversal, UpstreamTag,
 };
 use super::policy::PolicyId;
-use super::query::{IngressProfile, QueryContext, QueryError};
+use super::query::{DnsRequestMeta, IngressProfile, QueryContext, QueryError};
 use super::response::{ResponseError, ResponseTemplate};
 use super::routing::DnsRouter;
 
@@ -60,10 +60,17 @@ pub(crate) struct PreparedQuery {
     plan: RequestPlan,
 }
 
+pub(crate) struct ParsedQuery {
+    query: QueryContext,
+    domain: Arc<str>,
+    qtype: u16,
+}
+
 pub(crate) struct AnalyzedResponse {
     pub wire: Vec<u8>,
     pub class: ResponseClass,
     pub answer_ips: Vec<IpAddr>,
+    pub strict_reusable: bool,
 }
 
 pub(crate) enum ResponseDirective {
@@ -78,6 +85,7 @@ pub(crate) enum ResponseDirective {
     Requery {
         upstream: UpstreamTag,
         traversal: ResponseTraversal,
+        strict_reusable: bool,
     },
 }
 
@@ -97,31 +105,21 @@ impl DnsEngine {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare(
         &self,
         raw_query: &[u8],
-        original_dst: Option<SocketAddr>,
+        metadata: DnsRequestMeta,
         ingress: IngressProfile,
     ) -> Result<PreparedQuery, EngineError> {
-        self.prepare_with_mode(raw_query, original_dst, ingress, false)
+        let parsed = Self::parse_query(raw_query, ingress)?;
+        self.prepare_parsed(parsed, metadata, false)
     }
 
-    pub(crate) fn prepare_compatibility(
-        &self,
+    pub(crate) fn parse_query(
         raw_query: &[u8],
-        original_dst: Option<SocketAddr>,
         ingress: IngressProfile,
-    ) -> Result<PreparedQuery, EngineError> {
-        self.prepare_with_mode(raw_query, original_dst, ingress, true)
-    }
-
-    fn prepare_with_mode(
-        &self,
-        raw_query: &[u8],
-        original_dst: Option<SocketAddr>,
-        ingress: IngressProfile,
-        compatibility: bool,
-    ) -> Result<PreparedQuery, EngineError> {
+    ) -> Result<ParsedQuery, EngineError> {
         let query = QueryContext::parse_with_profile(raw_query, ingress)?;
         if query.questions().len() > 1 {
             return Err(EngineError::MultipleQuestions);
@@ -133,10 +131,28 @@ impl DnsEngine {
             .ok_or(EngineError::MalformedCanonicalName)?
             .into();
         let qtype = query.qtype().ok_or(EngineError::MissingQuestion)?.get();
+        Ok(ParsedQuery {
+            query,
+            domain,
+            qtype,
+        })
+    }
+
+    pub(crate) fn prepare_parsed(
+        &self,
+        parsed: ParsedQuery,
+        metadata: DnsRequestMeta,
+        compatibility: bool,
+    ) -> Result<PreparedQuery, EngineError> {
+        let ParsedQuery {
+            query,
+            domain,
+            qtype,
+        } = parsed;
         let context = RequestContext {
             domain: &domain,
             qtype,
-            original_dst,
+            metadata,
         };
         let plan = match self.planner.plan_request(context) {
             Err(PlanError::MissingOriginalDestination) if compatibility => {
@@ -160,9 +176,12 @@ impl DnsEngine {
         wire: Vec<u8>,
         strict: bool,
     ) -> Result<ResponseDirective, EngineError> {
-        if strict {
-            ResponseTemplate::validate(&prepared.query, &wire)?;
-        }
+        let strict_reusable = if strict {
+            ResponseTemplate::check(&prepared.query, &wire)?;
+            true
+        } else {
+            ResponseTemplate::check(&prepared.query, &wire).is_ok()
+        };
         let class = classify_response(&wire);
         if matches!(class, ResponseClass::Nxdomain | ResponseClass::Servfail) {
             return Ok(ResponseDirective::Accept {
@@ -170,6 +189,7 @@ impl DnsEngine {
                     wire,
                     class,
                     answer_ips: Vec::new(),
+                    strict_reusable,
                 },
                 traversal,
             });
@@ -184,13 +204,15 @@ impl DnsEngine {
             },
             traversal,
         );
-        let response = AnalyzedResponse {
+        let mut response = AnalyzedResponse {
             wire,
             class,
             answer_ips,
+            strict_reusable,
         };
         let plan = match planned {
             Err(PlanError::UpstreamCycle { .. } | PlanError::DepthExceeded { .. }) if !strict => {
+                response.strict_reusable = false;
                 return Ok(ResponseDirective::Accept {
                     response,
                     traversal: current_traversal,
@@ -213,12 +235,31 @@ impl DnsEngine {
             } => ResponseDirective::Requery {
                 upstream,
                 traversal,
+                strict_reusable: response.strict_reusable,
             },
         })
     }
 
     pub(crate) const fn policy_id(&self) -> Option<&PolicyId> {
         self.policy_id.as_ref()
+    }
+}
+
+impl ParsedQuery {
+    pub(crate) const fn query(&self) -> &QueryContext {
+        &self.query
+    }
+
+    pub(crate) fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    pub(crate) fn domain_arc(&self) -> Arc<str> {
+        Arc::clone(&self.domain)
+    }
+
+    pub(crate) const fn qtype(&self) -> u16 {
+        self.qtype
     }
 }
 

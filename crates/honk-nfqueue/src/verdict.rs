@@ -73,6 +73,7 @@ impl Drop for VerdictGuard {
 
 pub(crate) struct GuardTracker {
     count: AtomicUsize,
+    peak: AtomicUsize,
     wait_lock: Mutex<()>,
     drained: Condvar,
 }
@@ -81,13 +82,15 @@ impl GuardTracker {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             count: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
             wait_lock: Mutex::new(()),
             drained: Condvar::new(),
         })
     }
 
     fn acquire(&self) {
-        self.count.fetch_add(1, Ordering::Relaxed);
+        let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak.fetch_max(count, Ordering::Relaxed);
     }
 
     fn release(&self) {
@@ -98,6 +101,14 @@ impl GuardTracker {
                 .unwrap_or_else(|error| error.into_inner());
             self.drained.notify_all();
         }
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn peak(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
     }
 
     pub(crate) fn wait_until_drained(&self) {

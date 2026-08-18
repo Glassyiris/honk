@@ -124,7 +124,8 @@ fn exercise_kernel_contract() {
             })
             .expect("kernel test event receiver");
     });
-    let (service, mut fatal) = NfqueueService::start(callback).expect("start production NFQUEUE");
+    let (mut service, mut fatal) =
+        NfqueueService::start(callback).expect("start production NFQUEUE");
 
     assert!(owned_table_exists(), "service must publish its owned table");
     assert_queue_configuration_in_proc();
@@ -184,6 +185,23 @@ fn exercise_kernel_contract() {
         &mut fatal,
         b"uncommitted-drop",
         CallbackDecision::DefaultDrop,
+    );
+
+    let rebound = service.rebind().expect("hard rebind production NFQUEUE");
+    service = rebound.0;
+    fatal = rebound.1;
+    assert!(
+        owned_table_exists(),
+        "hard rebind must retain the owned nftables table"
+    );
+    assert_queue_configuration_in_proc();
+    exercise_datagram(
+        &ipv4_client,
+        &ipv4_receiver,
+        &events,
+        &mut fatal,
+        b"accept-rebound",
+        CallbackDecision::Accept,
     );
 
     assert!(

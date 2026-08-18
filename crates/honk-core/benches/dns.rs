@@ -18,6 +18,7 @@ criterion_group!(
     legacy::bench_udp_pool_exchange,
     legacy_framing::bench_length_prefix_roundtrip,
     architecture::bench_typed_key_build,
+    architecture::bench_dns_udp_validation_profile,
     architecture::bench_warmed_forwarder_hits,
     architecture::bench_projection_replacement,
     architecture::bench_policy_evaluation,

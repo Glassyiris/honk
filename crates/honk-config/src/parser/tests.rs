@@ -25,12 +25,14 @@ mod parser_tests {
 global {
     tproxy_port: 12345
     log_level: info
+    log_file: '/var/log/honk/honk.log'
     dial_mode: domain
 }
 "#;
         let config = parse_dae_config(input).unwrap();
         assert_eq!(config.global.tproxy_port, 12345);
         assert_eq!(config.global.log_level, "info");
+        assert_eq!(config.global.log_file, "/var/log/honk/honk.log");
         assert_eq!(config.global.dial_mode, "domain");
     }
 
@@ -73,6 +75,16 @@ global {
         let explicitly_empty = parse_dae_config("global {\n    lan_interface:\n}").unwrap();
         assert!(explicitly_empty.global.lan_interface.is_empty());
         assert_eq!(config.global.wan_interface, vec!["ens3"]);
+    }
+
+    #[test]
+    fn test_parse_dns_client_subnet() {
+        let config = parse_dae_config("dns {\n    client_subnet: auto(9.9.9.9)\n}").unwrap();
+        assert_eq!(config.dns.client_subnet, "auto(9.9.9.9)");
+        assert!(config.dns.client_subnet_mode().unwrap().unwrap().is_auto());
+
+        let error = parse_dae_config("dns {\n    client_subnet: auto(example.com)\n}").unwrap_err();
+        assert!(error.to_string().contains("dns.client_subnet"));
     }
 
     #[test]
@@ -248,7 +260,20 @@ node {
     }
 
     #[test]
-    fn test_node_section_rejects_removed_protocols_and_mux() {
+    fn test_parse_vless_mode_link() {
+        let config = parse_dae_config(
+            "node {\n    xudp: 'vless://uuid@example.com:443?vless_mode=xudp#node'\n    cool: 'vless://uuid@example.com:443?vless_mode=mux-cool#node'\n}",
+        )
+        .unwrap();
+        assert_eq!(config.nodes.len(), 2);
+        assert_eq!(config.nodes[0].name, "xudp");
+        assert_eq!(config.nodes[0].vless_mode, crate::node::WireMode::Xudp);
+        assert_eq!(config.nodes[1].name, "cool");
+        assert_eq!(config.nodes[1].vless_mode, crate::node::WireMode::MuxCool);
+    }
+
+    #[test]
+    fn test_node_section_rejects_removed_protocols_and_standalone_mux() {
         for input in [
             "node {\n    'ssr://a'\n}",
             "node {\n    'trojan-go://pw@example.com:443'\n}",
@@ -262,8 +287,8 @@ node {
         }
         let err = parse_dae_config("node {\n    mux = true\n}").unwrap_err();
         assert!(
-            err.to_string().contains("mux"),
-            "mux must be a hard error: {err}"
+            err.to_string().contains("vless_mode"),
+            "standalone mux must direct users to the normalized link mode: {err}"
         );
     }
 
@@ -304,6 +329,29 @@ group {
             .find(|g| g.name == "my_group")
             .expect("my_group");
         assert_eq!(my_group.policy, crate::group::GroupPolicy::URLTest);
+    }
+
+    #[test]
+    fn test_parse_unknown_group_policy_remains_selector() {
+        let config = parse_dae_config("group {\n proxy {\n policy: future_policy\n }\n}").unwrap();
+        assert_eq!(config.groups[0].policy, crate::group::GroupPolicy::Selector);
+    }
+
+    #[test]
+    fn test_parse_score_group_policy_case_insensitively() {
+        for policy in ["score", "ScOrE"] {
+            let config =
+                parse_dae_config(&format!("group {{\n proxy {{\n policy: {policy}\n }}\n}}"))
+                    .unwrap();
+            assert_eq!(config.groups[0].policy, crate::group::GroupPolicy::Score);
+        }
+    }
+
+    #[test]
+    fn test_parse_legacy_honk_group_policy_is_actionable() {
+        let error = parse_dae_config("group {\n proxy {\n policy: honk\n }\n}").unwrap_err();
+        assert!(matches!(error, crate::ConfigError::UnsupportedPolicy(_)));
+        assert!(error.to_string().contains("renamed to 'score'"));
     }
 
     #[test]
@@ -742,6 +790,19 @@ group {
 }
 
 #[test]
+fn node_parse_diagnostic_redacts_share_link_credentials() {
+    for uri in [
+        "trojan://super-secret@",
+        "vless://uuid@example.com:443?vless_mode=super-secret",
+    ] {
+        let error = crate::node::Node::from_share_link(uri).unwrap_err();
+        let diagnostic = super::node_parse_diagnostic(&error);
+        assert!(!diagnostic.contains(uri));
+        assert!(!diagnostic.contains("super-secret"));
+    }
+}
+
+#[test]
 fn test_group_subscription_filter_exact_regex_and_compound() {
     let input = r#"
 subscription {
@@ -918,6 +979,22 @@ dns {
 }
 
 #[test]
+fn test_dae_dns_rules_are_not_silently_dropped_by_structured_writer() {
+    let config = parse_dae_config(
+        "dns {\n routing {\n  request {\n   qname(example.com) -> reject\n  }\n }\n}",
+    )
+    .unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), "original").unwrap();
+
+    let error = config.to_file(file.path().to_str().unwrap()).unwrap_err();
+
+    assert!(matches!(error, crate::ConfigError::Serialization(_)));
+    assert!(error.to_string().contains("dns.routing.request"));
+    assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "original");
+}
+
+#[test]
 fn test_parse_dns_request_routing_qtype() {
     let input = r#"
 dns {
@@ -971,6 +1048,51 @@ dns {
         config.dns.routing.request.rules[1].action,
         crate::dns::DnsRequestAction::Reject
     );
+}
+
+#[test]
+fn test_parse_dns_request_routing_sip() {
+    let input = r#"
+dns {
+    routing {
+        request {
+            sip(192.168.50.1, 100.64.0.0/10, 2001:db8::/32) -> lan_proxy
+            !sip(127.0.0.0/8, ::1/128) && qname(suffix: example-isp.cn) -> asis
+        }
+        response {
+            sip(192.168.50.0/24) -> reject
+            fallback: accept
+        }
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    let rules = &config.dns.routing.request.rules;
+    assert_eq!(rules.len(), 2);
+    match &rules[0].conditions[0] {
+        crate::dns::DnsCond::Sip { not, cidrs } => {
+            assert!(!not);
+            assert_eq!(cidrs, &["192.168.50.1", "100.64.0.0/10", "2001:db8::/32"]);
+        }
+        _ => panic!("expected Sip"),
+    }
+    match &rules[1].conditions[0] {
+        crate::dns::DnsCond::Sip { not, cidrs } => {
+            assert!(*not);
+            assert_eq!(cidrs, &["127.0.0.0/8", "::1/128"]);
+        }
+        _ => panic!("expected Sip"),
+    }
+    assert_eq!(rules[1].conditions.len(), 2);
+    let response_rules = &config.dns.routing.response.rules;
+    assert_eq!(response_rules.len(), 1);
+    match &response_rules[0].conditions[0] {
+        crate::dns::DnsCond::Sip { not, cidrs } => {
+            assert!(!not);
+            assert_eq!(cidrs, &["192.168.50.0/24"]);
+        }
+        _ => panic!("expected response Sip to be rejected by the router"),
+    }
 }
 
 #[test]
@@ -1251,6 +1373,29 @@ dns {
 fn test_parse_dns_zero_max_cache_size_is_preserved_for_runtime_clamp() {
     let config = parse_dae_config("dns {\n    max_cache_size: 0\n}\n").unwrap();
     assert_eq!(config.dns.cache.max_size, 0);
+}
+
+#[test]
+fn use_host_defaults_off_and_parses_dae_boolean_forms() {
+    assert!(!parse_dae_config("dns {}").unwrap().dns.use_host);
+    assert!(
+        parse_dae_config("dns {\n    use_host: true\n}")
+            .unwrap()
+            .dns
+            .use_host
+    );
+    assert!(
+        parse_dae_config("dns {\n    use_host: on\n}")
+            .unwrap()
+            .dns
+            .use_host
+    );
+    assert!(
+        !parse_dae_config("dns {\n    use_host: false\n}")
+            .unwrap()
+            .dns
+            .use_host
+    );
 }
 
 #[test]

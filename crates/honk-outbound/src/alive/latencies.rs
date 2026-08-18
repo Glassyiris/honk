@@ -4,9 +4,10 @@ use parking_lot::Mutex;
 use std::time::{Duration, SystemTime};
 
 /// One latency sample. `synthetic` marks the 10s placeholder pushed on
-/// failure: it counts for selection statistics (dead nodes sort last) but
-/// is not a real measurement and must never be displayed as clash delay
-/// history (dashboards otherwise show a bogus 10000ms).
+/// failure: it is not a real measurement and must never be displayed as
+/// clash delay history (dashboards otherwise show a bogus 10000ms), and it
+/// never feeds the moving average. Selection demotion no longer reads this
+/// flag — it lives in `DialerCollection`'s coherent failure state.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LatencySample {
     pub latency: Duration,

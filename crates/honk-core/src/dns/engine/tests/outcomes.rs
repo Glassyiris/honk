@@ -65,7 +65,7 @@ async fn typed_outcome_metadata_excludes_udp_truncated_answers() {
     let outcome = forwarder
         .resolve_outcome_with_context_and_profile(
             &query,
-            None,
+            DnsRequestMeta::EMPTY,
             IngressProfile::Udp {
                 advertised_size: 45,
             },
@@ -151,6 +151,46 @@ async fn typed_outcome_reports_malformed_response_and_requery_cycle() {
 }
 
 #[tokio::test]
+async fn compatibility_only_cycle_response_is_not_reused_by_strict_lookup() {
+    let query = build_dns_query("example.com", 1);
+    let answer = response(&query, [192, 0, 2, 10], 30);
+    let cycle_rules = vec![DnsResponseRule {
+        conditions: vec![DnsCond::Upstream {
+            not: false,
+            names: vec!["first".to_owned()],
+        }],
+        action: DnsResponseAction::Upstream("first".to_owned()),
+    }];
+    let upstream = exchange(
+        [
+            ("first", Ok(answer.clone())),
+            ("first", Ok(answer)),
+        ],
+        None,
+    );
+    let forwarder = DnsForwarder::new(
+        upstream.clone(),
+        Arc::new(Mutex::new(DnsCache::new(8))),
+        router("first", cycle_rules, None),
+    );
+
+    forwarder
+        .resolve(&query)
+        .await
+        .expect("compatibility accepts the cycle terminal response");
+    let strict_error = forwarder
+        .resolve_outcome(&query)
+        .await
+        .expect_err("strict lookup must not consume a compatibility-only cache entry");
+
+    assert!(matches!(
+        strict_error,
+        DnsForwardError::Engine(super::EngineError::Plan(PlanError::UpstreamCycle { .. }))
+    ));
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn typed_outcome_reports_requery_depth_before_fourth_exchange() {
     // Given
     let query = build_dns_query("example.com", 1);
@@ -205,7 +245,7 @@ async fn stale_outcome_covers_upstream_error_and_servfail_without_sleeping() {
     let routing = router("first", Vec::new(), None);
     let engine = super::DnsEngine::from_router(&routing, None).expect("engine");
     let prepared = engine
-        .prepare(&query, None, IngressProfile::Internal)
+        .prepare(&query, DnsRequestMeta::EMPTY, IngressProfile::Internal)
         .expect("prepared");
     let RequestPlan::Exchange(scope) = prepared.plan() else {
         panic!("exchange plan");
@@ -264,7 +304,7 @@ fn engine_rejects_multiple_questions_before_policy_planning() {
     let router = DnsRouter::new(&DnsRouting::default()).expect("router");
     let engine = DnsEngine::from_router(&router, None).expect("engine");
 
-    let result = engine.prepare(&wire, None, IngressProfile::Internal);
+    let result = engine.prepare(&wire, DnsRequestMeta::EMPTY, IngressProfile::Internal);
 
     assert!(matches!(result, Err(EngineError::MultipleQuestions)));
 }

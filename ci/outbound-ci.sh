@@ -26,8 +26,7 @@ step "cargo clippy --all-targets -D warnings"
 cargo clippy -p honk-outbound --all-targets -- -D warnings
 
 step "cargo test -p honk-config"
-# The two TOML round-trip failures are pre-existing (CI gate skips them too).
-cargo test -p honk-config -- --skip test_config_toml_round_trip --skip test_to_file_and_from_file_by_extension
+cargo test -p honk-config
 
 step "cargo test -p honk-outbound"
 cargo test -p honk-outbound

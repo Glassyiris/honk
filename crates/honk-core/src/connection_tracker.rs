@@ -133,11 +133,6 @@ impl ConnectionTracker {
             .map(|ref_multi| ref_multi.value().snapshot())
             .collect()
     }
-
-    /// Force-remove a connection by ID (for admin-initiated close).
-    pub fn close_connection(&self, id: &str) {
-        self.entries.remove(id);
-    }
 }
 
 impl Default for ConnectionTracker {
@@ -145,6 +140,3 @@ impl Default for ConnectionTracker {
         Self::new()
     }
 }
-
-/// Convenience: shared tracker reference used throughout the control plane.
-pub type SharedTracker = Arc<ConnectionTracker>;

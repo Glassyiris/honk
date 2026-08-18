@@ -6,7 +6,7 @@ use crate::dns::planner::{RequestScope, UpstreamTag};
 use crate::dns::query::{IngressProfile, QueryContext};
 use crate::dns::response::ResponseTemplate;
 
-fn key(index: u16) -> CacheKey {
+fn cache_key(index: u16) -> CacheKey {
     let mut wire = vec![0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 0, 0, 1, 0, 1];
     wire.extend_from_slice(&index.to_be_bytes());
     CacheKey::for_test(
@@ -14,6 +14,16 @@ fn key(index: u16) -> CacheKey {
         IngressProfile::Internal,
         RequestScope::Upstream(UpstreamTag::new("default").expect("tag")),
         OperationKind::Resolve,
+    )
+}
+
+fn key(index: u16) -> FlightKey {
+    FlightKey::resolve(
+        cache_key(index),
+        ResolveMode::Strict,
+        &honk_config::dns::DnsStrategy::Both,
+        1,
+        DnsRequestMeta::EMPTY,
     )
 }
 
@@ -74,6 +84,87 @@ async fn waiter_retries_when_leader_is_cancelled() {
     let delta = crate::stats::dns_snapshot().delta(before);
     assert!(delta.singleflight_cancel >= 1);
     assert!(delta.singleflight_retry >= 1);
+}
+
+#[test]
+fn strict_and_compatibility_resolves_do_not_share_a_flight() {
+    let flights = Singleflight::default();
+    let cache_key = cache_key(4);
+    let FlightRole::Leader(_strict) = flights.acquire(FlightKey::resolve(
+        cache_key.clone(),
+        ResolveMode::Strict,
+        &honk_config::dns::DnsStrategy::Both,
+        1,
+        DnsRequestMeta::EMPTY,
+    )) else {
+        panic!("strict leader");
+    };
+    let FlightRole::Leader(_compatibility) = flights.acquire(FlightKey::resolve(
+        cache_key,
+        ResolveMode::Compatibility,
+        &honk_config::dns::DnsStrategy::Both,
+        1,
+        DnsRequestMeta::EMPTY,
+    )) else {
+        panic!("compatibility leader");
+    };
+    assert_eq!(flights.active_len(), 2);
+}
+
+#[test]
+fn preference_sensitive_sources_do_not_share_a_flight() {
+    let flights = Singleflight::default();
+    let cache_key = cache_key(5);
+    let mut leaders = Vec::new();
+    for source in ["192.0.2.1", "192.0.2.2"] {
+        let FlightRole::Leader(leader) = flights.acquire(FlightKey::resolve(
+            cache_key.clone(),
+            ResolveMode::Strict,
+            &honk_config::dns::DnsStrategy::PreferIpv4,
+            28,
+            DnsRequestMeta::new(Some(source.parse().expect("source")), None),
+        )) else {
+            panic!("source leader");
+        };
+        leaders.push(leader);
+    }
+    assert_eq!(flights.active_len(), 2);
+}
+
+#[test]
+fn preference_irrelevant_sources_share_a_flight() {
+    let flights = Singleflight::default();
+    let cache_key = cache_key(6);
+    let key_for = |source: &str| {
+        FlightKey::resolve(
+            cache_key.clone(),
+            ResolveMode::Strict,
+            &honk_config::dns::DnsStrategy::Both,
+            28,
+            DnsRequestMeta::new(Some(source.parse().expect("source")), None),
+        )
+    };
+    let FlightRole::Leader(_leader) = flights.acquire(key_for("192.0.2.1")) else {
+        panic!("leader");
+    };
+    assert!(matches!(
+        flights.acquire(key_for("192.0.2.2")),
+        FlightRole::Waiter(_)
+    ));
+}
+
+#[test]
+fn refreshes_share_the_source_selected_cache_scope() {
+    let flights = Singleflight::default();
+    let refresh_key = cache_key(7).with_operation(OperationKind::Refresh);
+    let FlightRole::Leader(_leader) = flights.acquire(FlightKey::Refresh(refresh_key.clone()))
+    else {
+        panic!("leader");
+    };
+    assert!(matches!(
+        flights.acquire(FlightKey::Refresh(refresh_key)),
+        FlightRole::Waiter(_)
+    ));
 }
 
 #[test]

@@ -156,3 +156,162 @@ async fn test_routing_respects_rules() {
     let result2 = forwarder.resolve(&query2).await.expect("resolve");
     assert_eq!(result2, response_default);
 }
+
+struct RoutedScopeUpstream {
+    negative: bool,
+    calls: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+impl RoutedScopeUpstream {
+    fn calls(&self, upstream: &str) -> usize {
+        self.calls
+            .lock()
+            .expect("calls")
+            .get(upstream)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+#[async_trait]
+impl DnsUpstreamPool for RoutedScopeUpstream {
+    async fn query(&self, upstream_name: &str, _raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        *self
+            .calls
+            .lock()
+            .expect("calls")
+            .entry(upstream_name.to_string())
+            .or_default() += 1;
+        self.entered.add_permits(1);
+        self.release.acquire().await?.forget();
+        if self.negative {
+            let mut response = nodata_response("example.com", 1);
+            response[3] = if upstream_name == "red" { 0x83 } else { 0x82 };
+            Ok(response)
+        } else {
+            Ok(make_a_response(
+                if upstream_name == "red" {
+                    [192, 0, 2, 1]
+                } else {
+                    [198, 51, 100, 1]
+                },
+                300,
+            ))
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn selected_scopes_partition_overlapping_positive_and_negative_queries() {
+    use honk_config::dns::{
+        DnsCond, DnsRequestAction, DnsRequestRouting, DnsRequestRule,
+    };
+
+    let router = Arc::new(
+        DnsRouter::new(&DnsRouting {
+            request: DnsRequestRouting {
+                rules: vec![
+                    DnsRequestRule {
+                        conditions: vec![DnsCond::Sip {
+                            not: false,
+                            cidrs: vec!["192.0.2.0/24".into(), "203.0.113.0/24".into()],
+                        }],
+                        action: DnsRequestAction::Upstream("red".into()),
+                    },
+                    DnsRequestRule {
+                        conditions: vec![DnsCond::Sip {
+                            not: false,
+                            cidrs: vec!["198.51.100.0/24".into()],
+                        }],
+                        action: DnsRequestAction::Upstream("blue".into()),
+                    },
+                ],
+                fallback: DnsRequestAction::Upstream("trap".into()),
+            },
+            ..Default::default()
+        })
+        .expect("router"),
+    );
+
+    for negative in [false, true] {
+        let upstream = Arc::new(RoutedScopeUpstream {
+            negative,
+            calls: std::sync::Mutex::new(std::collections::HashMap::new()),
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let cache = test_cache();
+        let forwarder = Arc::new(DnsForwarder::new(
+            upstream.clone(),
+            cache.clone(),
+            Arc::clone(&router),
+        ));
+        let flights = cache.lock().await.singleflight();
+        let sources = ["192.0.2.10", "198.51.100.20", "203.0.113.30"];
+        let mut tasks = tokio::task::JoinSet::new();
+        for source in sources {
+            let forwarder = Arc::clone(&forwarder);
+            tasks.spawn(async move {
+                let response = forwarder
+                    .resolve_outcome_with_context(
+                        &make_a_query(),
+                        DnsRequestMeta::new(Some(source.parse().expect("source")), None),
+                    )
+                    .await
+                    .expect("resolve")
+                    .into_rendered();
+                (source, response)
+            });
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), upstream.entered.acquire_many(2))
+            .await
+            .expect("selected scopes shared one exchange")
+            .expect("entry semaphore")
+            .forget();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while flights.counters().waiters == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same-scope sources did not share an exchange");
+        upstream.release.add_permits(2);
+
+        let assert_response = |source: &str, response: &[u8]| {
+            let blue = source == "198.51.100.20";
+            if negative {
+                assert_eq!(response[3] & 0x0f, if blue { 2 } else { 3 });
+            } else {
+                assert_eq!(
+                    &response[response.len() - 4..],
+                    if blue {
+                        &[198, 51, 100, 1]
+                    } else {
+                        &[192, 0, 2, 1]
+                    }
+                );
+            }
+        };
+        while let Some(result) = tasks.join_next().await {
+            let (source, response) = result.expect("task");
+            assert_response(source, &response);
+        }
+        for source in sources {
+            let response = forwarder
+                .resolve_outcome_with_context(
+                    &make_a_query(),
+                    DnsRequestMeta::new(Some(source.parse().expect("source")), None),
+                )
+                .await
+                .expect("cached resolve")
+                .into_rendered();
+            assert_response(source, &response);
+        }
+        assert_eq!(upstream.calls("red"), 1);
+        assert_eq!(upstream.calls("blue"), 1);
+        assert_eq!(upstream.calls("trap"), 0);
+    }
+}

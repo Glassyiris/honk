@@ -24,17 +24,33 @@ impl TcpPool {
         })
     }
 
-    pub async fn exchange(self: &Arc<Self>, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
-        exchange_with_retry("TCP DNS", || self.exchange_once(raw_query), || async {}).await
+    pub async fn exchange(
+        self: &Arc<Self>,
+        raw_query: &[u8],
+        feedback: Option<&honk_outbound::group::ScoreFeedback>,
+    ) -> anyhow::Result<Vec<u8>> {
+        exchange_with_retry(
+            "TCP DNS",
+            raw_query,
+            |reporter| async move { self.exchange_once(raw_query, reporter.as_ref()).await },
+            || async {},
+            feedback,
+        )
+        .await
     }
 
-    async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn exchange_once(
+        &self,
+        raw_query: &[u8],
+        reporter: Option<&honk_outbound::group::ScoreReporter>,
+    ) -> anyhow::Result<Vec<u8>> {
         idle_pool_exchange(
             &self.lifecycle,
             &self.idle,
             || self.dial_new(),
             raw_query,
             self.dial.query_timeout,
+            reporter,
         )
         .await
     }

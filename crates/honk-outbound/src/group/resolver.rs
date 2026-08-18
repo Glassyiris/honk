@@ -16,21 +16,51 @@ impl GroupManager {
         depth: usize,
         effects: SelectionEffects,
     ) -> Option<&'a Node> {
+        self.pick_candidate_in_group(group, domain, ipver, visited, depth, effects)
+            .map(|candidate| candidate.node)
+    }
+
+    pub(super) fn pick_candidate_in_group<'a>(
+        &'a self,
+        group: &'a Group,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+        visited: &mut Vec<&'a str>,
+        depth: usize,
+        effects: SelectionEffects,
+    ) -> Option<Candidate<'a>> {
         let candidates = self.flatten_candidates(group, domain, ipver, visited, depth, effects);
         let candidates =
             self.filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref());
         if candidates.is_empty() {
-            return None;
+            return self
+                .last_resort_tcp_leaf(group, domain)
+                .map(|node| Candidate {
+                    tag: node.name.as_str(),
+                    node,
+                    attribution: Vec::new(),
+                    selection_chain: vec![node.name.as_str()],
+                });
         }
         let network = SelectionNetwork::from_probe_domain(domain);
-        Some(match group.policy {
+        let candidate = match group.policy {
             GroupPolicy::Selector => self.pick_selector(&candidates, group),
             GroupPolicy::URLTest => self.pick_urltest(&candidates, group, network, ipver, effects),
             GroupPolicy::LoadBalance => {
                 self.pick_load_balance(&candidates, group, network, effects)
             }
             GroupPolicy::Fallback => self.pick_fallback(&candidates, group, network, effects),
-        })
+            GroupPolicy::Score => self.pick_score(
+                &candidates,
+                group,
+                &ScoreSelectionContext::aggregate(network, domain, ipver),
+            ),
+        };
+        let mut candidate = candidate;
+        if group.policy == GroupPolicy::Score {
+            candidate.attribution.push(group.name.as_str());
+        }
+        Some(candidate)
     }
 
     /// Flatten a group's members into dial candidates: every direct member
@@ -58,6 +88,8 @@ impl GroupManager {
             .map(|node| Candidate {
                 tag: node.name.as_str(),
                 node,
+                attribution: Vec::new(),
+                selection_chain: vec![node.name.as_str()],
             })
             .collect();
         for sub_tag in &group.groups {
@@ -70,12 +102,11 @@ impl GroupManager {
             if effects.applies() {
                 self.mark_used(sub_tag);
             }
-            if let Some(leaf) = self.pick_in_group(sub, domain, ipver, visited, depth + 1, effects)
+            if let Some(mut candidate) =
+                self.pick_candidate_in_group(sub, domain, ipver, visited, depth + 1, effects)
             {
-                out.push(Candidate {
-                    tag: sub_tag.as_str(),
-                    node: leaf,
-                });
+                candidate.tag = sub_tag.as_str();
+                out.push(candidate);
             }
         }
         visited.pop();
@@ -141,6 +172,24 @@ impl GroupManager {
         out
     }
 
+    /// Keep a sole TCP leaf dialable when probe health cannot choose an alternative.
+    /// A real dial can then prove recovery without leaking traffic to another outbound.
+    /// Explicit `final` fallbacks and UDP health remain authoritative.
+    pub(super) fn last_resort_tcp_leaf<'a>(
+        &'a self,
+        group: &'a Group,
+        domain: ProbeDomain,
+    ) -> Option<&'a Node> {
+        if domain != ProbeDomain::Tcp || group.final_outbound.is_some() {
+            return None;
+        }
+        let leaves = self.leaf_nodes_in_group(&group.name);
+        match leaves.as_slice() {
+            [node] => Some(*node),
+            _ => None,
+        }
+    }
+
     fn collect_leaf_nodes<'a>(
         &'a self,
         group_name: &str,
@@ -198,17 +247,23 @@ impl GroupManager {
         result
     }
 
-    /// The selection chain from a group down to the leaf its current
-    /// selections resolve to: `[group, ..sub-group tags.., leaf node]`.
-    ///
-    /// Each step uses the group's current selection for its policy
-    /// (Selector: runtime choice → `default` → first member tag; URLTest:
-    /// cached TCP selection; Fallback: pinned tag). The chain stops at the
-    /// first group without a formed selection (a URLTest group before any
-    /// measurement, or LoadBalance which has no stable pick to report).
-    /// Intended for debugging/introspection — the clash `now` field keeps
-    /// showing the immediate member tag.
+    /// The current TCP selection chain from a group down to its leaf.
     pub fn selection_chain(&self, group_name: &str) -> Vec<String> {
+        self.selection_chain_for_network(group_name, SelectionNetwork::Tcp)
+    }
+
+    /// The current selection chain for one network: `[group, ..sub-groups, leaf]`.
+    ///
+    /// The chain stops at the first group without a formed selection (a
+    /// URLTest group before any measurement, or LoadBalance, which has no
+    /// stable pick). Callers that dial must snapshot this together with the
+    /// selection plan; reading it again after an await can combine a newer
+    /// group choice with an older physical connection.
+    pub fn selection_chain_for_network(
+        &self,
+        group_name: &str,
+        network: SelectionNetwork,
+    ) -> Vec<String> {
         let mut chain = vec![group_name.to_string()];
         let mut current = group_name.to_string();
         for _ in 0..MAX_GROUP_DEPTH {
@@ -223,14 +278,18 @@ impl GroupManager {
                     .cloned()
                     .or_else(|| group.default.clone())
                     .or_else(|| self.member_tags(group).first().map(|s| s.to_string())),
-                GroupPolicy::URLTest => self.get_urltest_selection(&group.name),
-                GroupPolicy::Fallback => self.get_fallback_selection(&group.name),
-                // Round-robin has no stable selection to report.
+                GroupPolicy::URLTest => {
+                    self.get_urltest_selection_for_network(&group.name, network)
+                }
+                GroupPolicy::Fallback => {
+                    self.get_fallback_selection_for_network(&group.name, network)
+                }
                 GroupPolicy::LoadBalance => None,
+                GroupPolicy::Score => self.get_score_selection_for_network(&group.name, network),
             };
             let Some(tag) = next else { break };
             if tag == current || chain.contains(&tag) {
-                break; // cycle guard
+                break;
             }
             chain.push(tag.clone());
             current = tag;

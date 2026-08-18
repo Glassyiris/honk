@@ -1,7 +1,96 @@
 use super::udp_dial::{UdpPrepare, UdpStaggerCallbacks, prepare_udp_plan};
 use super::*;
 use crate::control::udp_endpoint::UdpEndpoint;
-use crate::dns::query::is_exact_dns_query;
+use crate::dns::query::{IngressProfile, is_exact_dns_query, validate_exact_dns_query};
+
+#[cfg(feature = "ebpf")]
+#[test]
+fn nfqueue_actor_queue_bounds_small_and_max_payloads() {
+    let stats = Arc::new(StatsManager::new());
+    let queue =
+        NfqueueActorQueue::new(Arc::clone(&stats), Arc::new(tokio::sync::Semaphore::new(1)));
+    let oldest = Instant::now() - Duration::from_millis(25);
+    assert!(queue.try_enqueue(oldest, 1_200));
+    assert!(queue.try_enqueue(Instant::now(), 65_507));
+
+    let snapshot = stats.udp_snapshot().nfqueue;
+    assert_eq!(snapshot.actor_queue_depth, 2);
+    assert_eq!(snapshot.actor_queued_bytes, 66_707);
+    assert!(snapshot.actor_oldest_age_nanos >= Duration::from_millis(25).as_nanos() as u64);
+
+    drop(queue.dequeue(1_200));
+    drop(queue.dequeue(65_507));
+    let mut max_payloads = 0;
+    while queue.try_enqueue(Instant::now(), 65_507) {
+        max_payloads += 1;
+    }
+    let saturated = stats.udp_snapshot().nfqueue;
+    assert!(saturated.actor_queue_depth <= NFQUEUE_INGEST_QUEUE_LEN as u64);
+    assert!(saturated.actor_queued_bytes <= NFQUEUE_INGEST_BYTE_BUDGET as u64);
+    assert!(max_payloads < NFQUEUE_INGEST_QUEUE_LEN);
+
+    for _ in 0..max_payloads {
+        drop(queue.dequeue(65_507));
+    }
+    let empty = stats.udp_snapshot().nfqueue;
+    assert_eq!(empty.actor_queue_depth, 0);
+    assert_eq!(empty.actor_queued_bytes, 0);
+    assert_eq!(empty.actor_oldest_age_nanos, 0);
+}
+
+#[cfg(feature = "ebpf")]
+#[test]
+fn nfqueue_actor_acquires_slow_permits_only_at_dequeue() {
+    let limit = Arc::new(tokio::sync::Semaphore::new(1));
+    let queue = NfqueueActorQueue::new(Arc::new(StatsManager::new()), Arc::clone(&limit));
+    assert!(queue.try_enqueue(Instant::now(), 0));
+    assert!(queue.try_enqueue(Instant::now(), 0));
+    assert_eq!(limit.available_permits(), 1);
+
+    let first = queue.dequeue(0).expect("first dequeued request permit");
+    assert_eq!(limit.available_permits(), 0);
+    drop(first);
+    assert!(queue.dequeue(0).is_some());
+}
+
+#[cfg(feature = "ebpf")]
+#[test]
+fn nfqueue_token_retry_backoff_caps_at_thirty_seconds() {
+    let mut backoff = NfqueueTokenRetryBackoff::default();
+    assert_eq!(backoff.failed(), Duration::from_secs(1));
+    assert_eq!(backoff.failed(), Duration::from_secs(2));
+    assert_eq!(backoff.failed(), Duration::from_secs(5));
+    assert_eq!(backoff.failed(), Duration::from_secs(30));
+    assert_eq!(backoff.failed(), Duration::from_secs(30));
+    backoff.reset();
+    assert_eq!(backoff.failed(), Duration::from_secs(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn network_refresh_retry_resends_with_backoff_then_stops() {
+    let (tx, mut rx) = mpsc::channel(4);
+    let retry = spawn_network_refresh_retry(tx);
+
+    for delay in [5, 15, 60] {
+        tokio::time::advance(Duration::from_secs(delay)).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(ControlCommand::NetworkChanged)
+        ));
+    }
+    retry
+        .await
+        .expect("retry task stops after the backoff ladder");
+}
+
+#[tokio::test(start_paused = true)]
+async fn network_refresh_retry_exits_when_control_plane_is_gone() {
+    let (tx, rx) = mpsc::channel::<ControlCommand>(1);
+    drop(rx);
+    let retry = spawn_network_refresh_retry(tx);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    retry.await.expect("retry task exits on a closed channel");
+}
 
 #[test]
 fn test_build_dns_probe_query() {
@@ -89,6 +178,98 @@ async fn test_resolve_udp_check_target() {
     assert_eq!(
         resolve_udp_check_target(&["dns.example".into()], Some(hook)).await,
         "10.9.8.7:53".parse().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn quic_failure_trains_score_without_failing_dns_udp_health() {
+    use honk_config::node::{Group, GroupPolicy};
+    use honk_outbound::group::{GroupManager, ScoreTarget, SelectionNetwork};
+
+    let node = udp_test_node();
+    let mut other = node.clone();
+    other.name = "udp-test-other".into();
+    other.port += 1;
+    other.id = other.derive_id();
+    let group = Group {
+        name: "score".into(),
+        policy: GroupPolicy::Score,
+        nodes: vec![node.id, other.id],
+        ..Group::default()
+    };
+    let config = Config {
+        nodes: vec![node.clone(), other.clone()],
+        groups: vec![group.clone()],
+        ..Config::default()
+    };
+    let manager: SharedGroupManager = Arc::new(parking_lot::RwLock::new(Arc::new(
+        GroupManager::new(&[group], &[node.clone(), other.clone()]),
+    )));
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handler = Arc::new(UdpTestHandler {
+        mode: UdpTestMode::DnsResponse {
+            dials: Arc::clone(&dials),
+        },
+    });
+    let mut registry = ProxyRegistry::new();
+    registry.register(
+        honk_outbound::proxy::ProtocolEntry::new(node.protocol, handler.clone())
+            .with_packet(handler),
+    );
+    let runtime = Arc::new(parking_lot::RwLock::new(Arc::new(
+        honk_outbound::runtime::OutboundRuntimeRegistry::build(&[node.clone(), other.clone()])
+            .unwrap(),
+    )));
+    let resolver: crate::outbound::ResolveHook = Arc::new(|_host, port| {
+        Box::pin(async move { vec![SocketAddr::from(([127, 0, 0, 1], port))] })
+    });
+    let quic_target = resolve_quic_score_target(
+        "https://quic.example.test:9443/generate_204",
+        Some(resolver),
+    )
+    .await
+    .unwrap();
+    let context = probers::quic_probe_context(&quic_target);
+    assert_eq!(context.network, SelectionNetwork::Udp);
+    assert_eq!(context.probe_domain, ProbeDomain::DataUdp);
+    assert_eq!(context.target_family, Some(IpVersion::V4));
+    assert_eq!(
+        context.target,
+        Some(ScoreTarget::domain("quic.example.test", 9443))
+    );
+    assert_eq!(
+        manager
+            .read()
+            .selection_plan_for_target("score", &context)
+            .entries[0]
+            .node
+            .id,
+        node.id
+    );
+    let prober = probers::ProxyUdpProber::new(
+        Arc::new(RwLock::new(config)),
+        Arc::new(registry),
+        runtime,
+        Arc::new(StatsManager::new()),
+        "127.0.0.1:53".parse().unwrap(),
+        "127.0.0.1:53".parse::<SocketAddr>().unwrap().into(),
+        Some(quic_target),
+        manager.clone(),
+    );
+
+    let result =
+        honk_outbound::alive::UdpProber::probe_udp(&prober, &node.name, Duration::from_millis(30))
+            .await;
+    assert!(result.is_ok(), "DNS health result: {result:?}");
+    assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert_eq!(
+        manager
+            .read()
+            .selection_plan_for_target("score", &context)
+            .entries[0]
+            .node
+            .id,
+        other.id
     );
 }
 
@@ -358,7 +539,7 @@ fn udp_original_dst_unspecified_origdst_is_authoritative_and_fails_closed() {
         local_addr: addr("192.0.2.20:5353"),
     };
 
-    assert_eq!(udp_original_dst(&meta, &dns_query_payload()), None);
+    assert!(udp_original_dst(&meta, &dns_query_payload()).is_none());
 }
 
 fn ipv4_origdst(ip: [u8; 4], port: u16) -> libc::sockaddr_in {
@@ -611,16 +792,23 @@ fn strict_dns_query_accepts_complete_query_and_edns_only() {
     edns.extend_from_slice(&[
         0x00, // root NAME
         0x00, 0x29, // TYPE OPT
-        0x10, 0x00, // UDP payload size
+        0x04, 0xd0, // UDP payload size (1232)
         0x00, 0x00, 0x00, 0x00, // extended RCODE/version/flags
         0x00, 0x00, // RDLENGTH
     ]);
     assert!(is_exact_dns_query(&edns));
+    assert_eq!(
+        validate_exact_dns_query(&edns).unwrap().ingress(),
+        IngressProfile::Udp {
+            advertised_size: 1232
+        }
+    );
 
     // A forged QDCOUNT cannot claim a second question that is not encoded.
     let mut forged_question_count = query.clone();
     forged_question_count[4..6].copy_from_slice(&2u16.to_be_bytes());
     assert!(!is_exact_dns_query(&forged_question_count));
+    assert!(validate_exact_dns_query(&forged_question_count).is_none());
 
     // Header record counts require a complete NAME + fixed RR + RDATA.
     let mut truncated_rr = query.clone();
@@ -650,6 +838,7 @@ fn strict_dns_query_accepts_complete_query_and_edns_only() {
     let mut trailing_junk = query;
     trailing_junk.push(0xde);
     assert!(!is_exact_dns_query(&trailing_junk));
+    assert!(validate_exact_dns_query(&trailing_junk).is_none());
 }
 
 fn dns_query_with_qname(qname: &[u8]) -> Vec<u8> {
@@ -738,14 +927,17 @@ async fn udp_dns_controller_declines_root_and_binary_questions() {
 
     let root = dns_query_with_qname(&[0x00]);
     assert!(
-        !controller.handle_udp_dns(&root, client, dst).await.unwrap(),
+        !controller
+            .handle_udp_dns(&root, client, dst, None)
+            .await
+            .unwrap(),
         "root qname must fall back to ordinary UDP"
     );
 
     let binary = dns_query_with_qname(&[0x01, 0xff, 0x00]);
     assert!(
         !controller
-            .handle_udp_dns(&binary, client, dst)
+            .handle_udp_dns(&binary, client, dst, None)
             .await
             .unwrap(),
         "binary qname must fall back to ordinary UDP"
@@ -758,6 +950,7 @@ async fn udp_dns_controller_declines_root_and_binary_questions() {
 fn udp_slow_path_only_forces_strict_dns_to_port_53() {
     let client = addr("10.0.0.1:12345");
     let data = dns_query_payload();
+    let validated = validate_exact_dns_query(&data).unwrap();
 
     let dns_pool = Arc::new(UdpEndpointPool::new());
     let dns_stats = Arc::new(StatsManager::new());
@@ -769,6 +962,7 @@ fn udp_slow_path_only_forces_strict_dns_to_port_53() {
         client,
         addr("203.0.113.53:53"),
         &data,
+        Some(validated),
     );
     assert!(matches!(
         dns_work,
@@ -785,6 +979,7 @@ fn udp_slow_path_only_forces_strict_dns_to_port_53() {
         client,
         addr("203.0.113.53:5353"),
         &data,
+        Some(validated),
     );
     assert!(matches!(ordinary_work, UdpSlowPathWork::Initialize(_)));
 }
@@ -798,10 +993,9 @@ fn udp_original_dst_cmsg_takes_precedence_over_other_metadata() {
         local_addr: addr("192.0.2.10:5353"),
     };
 
-    assert_eq!(
-        udp_original_dst(&meta, b"not a DNS query"),
-        Some(addr("203.0.113.10:4444"))
-    );
+    let destination = udp_original_dst(&meta, b"not a DNS query").unwrap();
+    assert_eq!(destination.address, addr("203.0.113.10:4444"));
+    assert!(destination.validated_dns.is_none());
 }
 
 #[test]
@@ -824,10 +1018,9 @@ fn udp_original_dst_uses_ipv4_pktinfo_for_exact_dns_query() {
         packet_ifindex: None,
         local_addr: addr("0.0.0.0:15000"),
     };
-    assert_eq!(
-        udp_original_dst(&meta, &dns_query_payload()),
-        Some(addr("198.51.100.53:53"))
-    );
+    let destination = udp_original_dst(&meta, &dns_query_payload()).unwrap();
+    assert_eq!(destination.address, addr("198.51.100.53:53"));
+    assert!(destination.validated_dns.is_some());
 }
 
 #[test]
@@ -849,10 +1042,9 @@ fn udp_original_dst_uses_ipv6_pktinfo_for_exact_dns_query() {
         packet_ifindex: None,
         local_addr: addr("[::]:15000"),
     };
-    assert_eq!(
-        udp_original_dst(&meta, &dns_query_payload()),
-        Some(addr("[2001:db8::53]:53"))
-    );
+    let destination = udp_original_dst(&meta, &dns_query_payload()).unwrap();
+    assert_eq!(destination.address, addr("[2001:db8::53]:53"));
+    assert!(destination.validated_dns.is_some());
 }
 
 #[test]
@@ -865,7 +1057,12 @@ fn udp_original_dst_uses_non_wildcard_local_fallback() {
         local_addr,
     };
 
-    assert_eq!(udp_original_dst(&meta, b"opaque UDP"), Some(local_addr));
+    let destination = udp_original_dst(&meta, b"opaque UDP").unwrap();
+    assert_eq!(destination.address, local_addr);
+    assert!(destination.validated_dns.is_none());
+    let dns_destination = udp_original_dst(&meta, &dns_query_payload()).unwrap();
+    assert_eq!(dns_destination.address, local_addr);
+    assert!(dns_destination.validated_dns.is_some());
 }
 
 #[test]
@@ -877,7 +1074,7 @@ fn udp_original_dst_fails_closed_for_wildcard_local_without_metadata() {
             packet_ifindex: None,
             local_addr,
         };
-        assert_eq!(udp_original_dst(&meta, b"opaque UDP"), None);
+        assert!(udp_original_dst(&meta, b"opaque UDP").is_none());
     }
 }
 
@@ -906,11 +1103,10 @@ fn udp_original_dst_does_not_rewrite_non_exact_dns_payloads() {
         b"random non-53 UDP payload".as_slice(),
     ] {
         assert!(!is_exact_dns_query(payload));
-        assert_eq!(udp_original_dst(&packet_meta, payload), None);
-        assert_eq!(
-            udp_original_dst(&fallback_meta, payload),
-            Some(local_fallback)
-        );
+        assert!(udp_original_dst(&packet_meta, payload).is_none());
+        let destination = udp_original_dst(&fallback_meta, payload).unwrap();
+        assert_eq!(destination.address, local_fallback);
+        assert!(destination.validated_dns.is_none());
     }
 }
 
@@ -920,7 +1116,7 @@ async fn udp_fast_path_miss_goes_slow() {
     let stats = StatsManager::new();
     let client = addr("10.0.0.1:12345");
     let dst = addr("203.0.113.1:443");
-    assert!(!udp_fast_path(&pool, &stats, b"hello", client, dst).await);
+    assert!(!udp_fast_path(&pool, &stats, b"hello", client, dst, None).await);
     let udp = stats.udp_snapshot();
     assert_eq!(udp.endpoint_misses, 1);
     assert_eq!(udp.endpoint_hits, 0);
@@ -951,7 +1147,17 @@ async fn udp_fast_path_hit_enqueues_for_the_endpoint_driver() {
     let mut buf = [0u8; 64];
     // First packet was delivered through the driver start barrier.
     echo.recv_from(&mut buf).await.unwrap();
-    assert!(!udp_fast_path(&pool, &stats, b"wrong-client", addr("10.0.0.2:12345"), dst,).await);
+    assert!(
+        !udp_fast_path(
+            &pool,
+            &stats,
+            b"wrong-client",
+            addr("10.0.0.2:12345"),
+            dst,
+            None,
+        )
+        .await
+    );
     assert!(
         !udp_fast_path(
             &pool,
@@ -959,6 +1165,7 @@ async fn udp_fast_path_hit_enqueues_for_the_endpoint_driver() {
             b"wrong-destination",
             client,
             addr("203.0.113.2:443"),
+            None,
         )
         .await
     );
@@ -969,6 +1176,7 @@ async fn udp_fast_path_hit_enqueues_for_the_endpoint_driver() {
             b"wrong-client-port",
             addr("10.0.0.1:12346"),
             dst,
+            None,
         )
         .await
     );
@@ -979,10 +1187,11 @@ async fn udp_fast_path_hit_enqueues_for_the_endpoint_driver() {
             b"wrong-destination-port",
             client,
             addr("203.0.113.1:444"),
+            None,
         )
         .await
     );
-    assert!(udp_fast_path(&pool, &stats, b"hello", client, dst).await);
+    assert!(udp_fast_path(&pool, &stats, b"hello", client, dst, None).await);
     let udp = stats.udp_snapshot();
     assert_eq!(udp.endpoint_hits, 1);
     assert_eq!(udp.endpoint_misses, 4);
@@ -1017,7 +1226,9 @@ async fn udp_fast_path_dns_goes_slow_even_with_endpoint() {
     )
     .await;
 
-    assert!(!udp_fast_path(&pool, &stats, &dns_query_payload(), client, dst).await);
+    let query = dns_query_payload();
+    let validated = validate_exact_dns_query(&query).unwrap();
+    assert!(!udp_fast_path(&pool, &stats, &query, client, dst, Some(validated)).await);
     let udp = stats.udp_snapshot();
     assert_eq!(udp.endpoint_hits, 0);
     assert_eq!(udp.endpoint_misses, 0);
@@ -1047,7 +1258,17 @@ async fn udp_fast_path_dns_shaped_non53_forwards() {
     let mut buf = [0u8; 64];
     echo.recv_from(&mut buf).await.unwrap();
     let query = dns_query_payload();
-    assert!(udp_fast_path(&pool, &stats, &query, client, dst).await);
+    assert!(
+        udp_fast_path(
+            &pool,
+            &stats,
+            &query,
+            client,
+            dst,
+            validate_exact_dns_query(&query),
+        )
+        .await
+    );
     assert_eq!(stats.udp_snapshot().endpoint_hits, 1);
 
     let (n, _) = tokio::time::timeout(Duration::from_secs(2), echo.recv_from(&mut buf))
@@ -1083,7 +1304,7 @@ async fn udp_fast_path_non_dns_port53_forwards() {
     let mut buf = [0u8; 64];
     echo.recv_from(&mut buf).await.unwrap();
     let garbage = [0u8; 20]; // QR=0 but qdcount=0 — not a DNS query
-    assert!(udp_fast_path(&pool, &stats, &garbage, client, dst).await);
+    assert!(udp_fast_path(&pool, &stats, &garbage, client, dst, None).await);
     assert_eq!(stats.udp_snapshot().endpoint_hits, 1);
 
     let (n, _) = tokio::time::timeout(Duration::from_secs(2), echo.recv_from(&mut buf))
@@ -1102,15 +1323,26 @@ async fn udp_fast_path_drops_internal_and_broadcast() {
     // honk-internal subnets (v4 + v6), either direction.  The v6 check
     // must match the real dae0 addresses (fd00:686f:6e6b::1/2, see the
     // DAENS_* constants in the crate root).
-    assert!(udp_fast_path(&pool, &stats, b"hello", client, addr("169.254.0.11:8080")).await);
-    assert!(udp_fast_path(&pool, &stats, b"hello", addr("169.254.0.1:1234"), dst).await);
     assert!(
         udp_fast_path(
             &pool,
             &stats,
             b"hello",
             client,
-            addr("[fd00:686f:6e6b::1]:8080")
+            addr("169.254.0.11:8080"),
+            None,
+        )
+        .await
+    );
+    assert!(udp_fast_path(&pool, &stats, b"hello", addr("169.254.0.1:1234"), dst, None).await);
+    assert!(
+        udp_fast_path(
+            &pool,
+            &stats,
+            b"hello",
+            client,
+            addr("[fd00:686f:6e6b::1]:8080"),
+            None,
         )
         .await
     );
@@ -1120,20 +1352,42 @@ async fn udp_fast_path_drops_internal_and_broadcast() {
             &stats,
             b"hello",
             addr("[fd00:686f:6e6b::2]:1234"),
-            dst
+            dst,
+            None,
         )
         .await
     );
     // Broadcast / multicast destinations.
-    assert!(udp_fast_path(&pool, &stats, b"hello", client, addr("255.255.255.255:67")).await);
-    assert!(udp_fast_path(&pool, &stats, b"hello", client, addr("192.168.1.255:67")).await);
     assert!(
         udp_fast_path(
             &pool,
             &stats,
             b"hello",
             client,
-            addr("239.255.255.250:1900")
+            addr("255.255.255.255:67"),
+            None,
+        )
+        .await
+    );
+    assert!(
+        udp_fast_path(
+            &pool,
+            &stats,
+            b"hello",
+            client,
+            addr("192.168.1.255:67"),
+            None,
+        )
+        .await
+    );
+    assert!(
+        udp_fast_path(
+            &pool,
+            &stats,
+            b"hello",
+            client,
+            addr("239.255.255.250:1900"),
+            None,
         )
         .await
     );
@@ -1283,6 +1537,280 @@ fn domain_reality_same_family_wrong_ip_is_mismatch() {
     );
 }
 
+fn source_routed_dns_resolver(
+    source_cidr: &str,
+    selected_ip: std::net::Ipv4Addr,
+    fallback_ip: std::net::Ipv4Addr,
+) -> anyhow::Result<DnsResolver> {
+    struct SourceRoutedUpstream {
+        selected_ip: std::net::Ipv4Addr,
+        fallback_ip: std::net::Ipv4Addr,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dns::forwarder::DnsUpstreamPool for SourceRoutedUpstream {
+        async fn query(&self, upstream_name: &str, raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let ip = if upstream_name == "selected" {
+                self.selected_ip
+            } else {
+                self.fallback_ip
+            };
+            let mut response = raw.to_vec();
+            anyhow::ensure!(response.len() >= 12, "short DNS query");
+            response[2] = 0x81;
+            response[3] = 0x80;
+            response[6..8].copy_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+            response.extend_from_slice(&ip.octets());
+            Ok(response)
+        }
+    }
+
+    let config = honk_config::dns::DnsConfig {
+        strategy: honk_config::dns::DnsStrategy::Ipv4Only,
+        routing: honk_config::dns::DnsRouting {
+            request: honk_config::dns::DnsRequestRouting {
+                rules: vec![honk_config::dns::DnsRequestRule {
+                    conditions: vec![honk_config::dns::DnsCond::Sip {
+                        not: false,
+                        cidrs: vec![source_cidr.into()],
+                    }],
+                    action: honk_config::dns::DnsRequestAction::Upstream("selected".into()),
+                }],
+                fallback: honk_config::dns::DnsRequestAction::Upstream("fallback".into()),
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let router = Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(
+        &config,
+    )?);
+    let forwarder = Arc::new(
+        crate::dns::forwarder::DnsForwarder::new(
+            Arc::new(SourceRoutedUpstream {
+                selected_ip,
+                fallback_ip,
+            }),
+            Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(1))),
+            router,
+        )
+        .with_cache_enabled(false)
+        .with_policy_from_config(&config)?,
+    );
+    DnsResolver::with_forwarder(&config, forwarder)
+}
+
+fn tls_client_hello(sni: &str) -> Vec<u8> {
+    let hello = crate::control::quic::test_utils::build_client_hello(Some(sni));
+    let mut record = vec![0x16, 0x03, 0x01];
+    record.extend_from_slice(&(hello.len() as u16).to_be_bytes());
+    record.extend_from_slice(&hello);
+    record
+}
+
+async fn store_active_tcp_flow(
+    handle: &ControlPlaneHandle,
+    original_dst: SocketAddr,
+    client_addr: SocketAddr,
+) -> anyhow::Result<()> {
+    let tuples = build_tuples_key(
+        original_dst.ip(),
+        original_dst.port(),
+        client_addr.ip(),
+        client_addr.port(),
+        6,
+    );
+    handle.ebpf.write().await.tcp_conn_state_store(
+        &tuples,
+        &honk_ebpf_common::conn::ConnState {
+            state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
+            last_seen_ns: 1,
+            ..Default::default()
+        },
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn tcp_domain_reality_uses_client_source() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let original_dst = listener.local_addr()?;
+    let mut config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "domain".into();
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut handle = udp_test_handle(
+        config,
+        UdpTestMode::TcpHold {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        },
+        1,
+    );
+    handle.dns_resolver = Arc::new(source_routed_dns_resolver(
+        "127.0.0.42/32",
+        original_dst.ip().to_string().parse()?,
+        "192.0.2.1".parse()?,
+    )?);
+
+    let client_socket = tokio::net::TcpSocket::new_v4()?;
+    client_socket.bind("127.0.0.42:0".parse()?)?;
+    let mut client = client_socket.connect(original_dst).await?;
+    let (accepted, client_addr) = listener.accept().await?;
+    store_active_tcp_flow(&handle, original_dst, client_addr).await?;
+    let task_handle = handle.clone();
+    let mut task =
+        tokio::spawn(async move { task_handle.serve_connection(accepted, client_addr).await });
+    let hello = tls_client_hello("source.test");
+    client.write_all(&hello).await?;
+    tokio::select! {
+        _ = entered.notified() => {}
+        result = &mut task => anyhow::bail!("TCP handler exited before dial: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_secs(5)) => anyhow::bail!("TCP dial timed out"),
+    }
+    release.notify_one();
+    let (mut upstream, _) =
+        tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+
+    let tracked = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(entry) = handle.connection_tracker.snapshot().into_iter().next() {
+                break entry;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(tracked.domain.as_deref(), Some("source.test"));
+
+    let mut received = vec![0; hello.len()];
+    upstream.read_exact(&mut received).await?;
+    assert_eq!(received, hello);
+    client.shutdown().await?;
+    upstream.shutdown().await?;
+    drop(client);
+    drop(upstream);
+    tokio::time::timeout(Duration::from_secs(5), task).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn udp_domain_reality_uses_client_source() -> anyhow::Result<()> {
+    let client = addr("192.0.2.10:53000");
+    let original_dst = addr("198.51.100.20:443");
+    let mut config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "domain".into();
+    let mut handle = udp_test_handle(config, UdpTestMode::Success, 1);
+    handle.dns_resolver = Arc::new(source_routed_dns_resolver(
+        "192.0.2.0/24",
+        original_dst.ip().to_string().parse()?,
+        "203.0.113.20".parse()?,
+    )?);
+
+    let hello = crate::control::quic::test_utils::build_client_hello(Some("source.test"));
+    let packet = crate::control::quic::test_utils::protect_initial_packet(
+        b"dcid1234",
+        b"",
+        1,
+        0,
+        1,
+        &crate::control::quic::test_utils::wrap_crypto_frame(0, &hello),
+    );
+    serve_test_udp_to(&handle, client, original_dst, &packet).await?;
+
+    let tracked = handle
+        .connection_tracker
+        .snapshot()
+        .into_iter()
+        .next()
+        .expect("ready UDP endpoint must be tracked");
+    assert_eq!(tracked.domain.as_deref(), Some("source.test"));
+    handle.udp_pool.remove(client, original_dst);
+    Ok(())
+}
+
+#[tokio::test]
+async fn tcp_local_resolution_uses_client_source() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("0.0.0.0:0").await?;
+    let original_dst = SocketAddr::new("127.0.0.1".parse()?, listener.local_addr()?.port());
+    let mut node = Node {
+        name: "local-resolve".into(),
+        protocol: honk_config::types::NodeProtocol::VMess,
+        address: "127.0.0.1".into(),
+        port: 9,
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    let mut config = udp_test_config("local-resolve", vec![node], vec![]);
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "domain+".into();
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+    let dial_target = Arc::new(std::sync::Mutex::new(None));
+    let handler = Arc::new(UdpTestHandler {
+        mode: UdpTestMode::TcpCaptureTarget(Arc::clone(&dial_target)),
+    });
+    let mut registry = ProxyRegistry::new();
+    registry.register(honk_outbound::proxy::ProtocolEntry::new(
+        honk_config::types::NodeProtocol::VMess,
+        handler,
+    ));
+    let dns_resolver =
+        source_routed_dns_resolver("127.0.0.42/32", "127.0.0.2".parse()?, "127.0.0.3".parse()?)?;
+    let dns_forwarder = dns_resolver.forwarder();
+    let plane = ControlPlane::new(
+        config,
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        router,
+        Arc::new(registry),
+        dns_resolver,
+        dns_forwarder,
+    )?;
+    let handle = plane.spawn_handle();
+
+    let client_socket = tokio::net::TcpSocket::new_v4()?;
+    client_socket.bind("127.0.0.42:0".parse()?)?;
+    let mut client = client_socket.connect(original_dst).await?;
+    let (accepted, client_addr) = listener.accept().await?;
+    store_active_tcp_flow(&handle, original_dst, client_addr).await?;
+    let task_handle = handle.clone();
+    let task =
+        tokio::spawn(async move { task_handle.serve_connection(accepted, client_addr).await });
+    let hello = tls_client_hello("source.test");
+    client.write_all(&hello).await?;
+    let (mut upstream, _) =
+        tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+    let (captured_target, captured_domain) = dial_target
+        .lock()
+        .expect("dial target")
+        .clone()
+        .expect("captured dial");
+    assert_eq!(captured_domain.as_deref(), Some("source.test"));
+    assert_eq!(
+        captured_target,
+        SocketAddr::new("127.0.0.2".parse()?, original_dst.port())
+    );
+
+    let mut received = vec![0; hello.len()];
+    upstream.read_exact(&mut received).await?;
+    assert_eq!(received, hello);
+    client.shutdown().await?;
+    upstream.shutdown().await?;
+    drop(client);
+    drop(upstream);
+    tokio::time::timeout(Duration::from_secs(5), task).await???;
+    Ok(())
+}
+
+type CapturedTcpTarget = Arc<std::sync::Mutex<Option<(SocketAddr, Option<String>)>>>;
+
 #[derive(Debug, Clone)]
 enum UdpTestMode {
     DialError,
@@ -1309,6 +1837,16 @@ enum UdpTestMode {
         sends: Arc<std::sync::atomic::AtomicUsize>,
     },
     Success,
+    DnsResponse {
+        dials: Arc<std::sync::atomic::AtomicUsize>,
+    },
+    #[cfg(feature = "ebpf")]
+    KernelSocket(Arc<UdpSocket>),
+    TcpHold {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    },
+    TcpCaptureTarget(CapturedTcpTarget),
     Hold {
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
@@ -1330,6 +1868,7 @@ enum UdpTestMode {
 struct UdpTestTransport {
     mode: UdpTestMode,
     relay: SocketAddr,
+    replied: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -1355,11 +1894,33 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
                 sends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
+            #[cfg(feature = "ebpf")]
+            UdpTestMode::KernelSocket(socket) => {
+                socket.send_to(_data, self.relay).await?;
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
 
-    async fn recv_packet(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+    async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        #[cfg(feature = "ebpf")]
+        if let UdpTestMode::KernelSocket(socket) = &self.mode {
+            let (size, _) = socket.recv_from(buf).await?;
+            return Ok((size, self.relay));
+        }
+        if matches!(self.mode, UdpTestMode::DnsResponse { .. })
+            && !self
+                .replied
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let response = [0x12, 0x34, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0];
+            buf[..response.len()].copy_from_slice(&response);
+            return Ok((response.len(), self.relay));
+        }
+        if matches!(self.mode, UdpTestMode::DnsResponse { .. }) {
+            return std::future::pending().await;
+        }
         Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
     }
 }
@@ -1372,6 +1933,32 @@ impl crate::control::udp_endpoint::UdpReplySocketFactory for UdpTestReplySocketF
         let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
         socket.set_nonblocking(true)?;
         UdpSocket::from_std(socket)
+    }
+}
+
+#[cfg(feature = "ebpf")]
+#[derive(Debug)]
+struct KernelUdpReplySocketFactory;
+
+#[cfg(feature = "ebpf")]
+impl crate::control::udp_endpoint::UdpReplySocketFactory for KernelUdpReplySocketFactory {
+    fn create(&self, original_dst: SocketAddr) -> std::io::Result<UdpSocket> {
+        let domain = if original_dst.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        };
+        let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
+        socket.set_nonblocking(true)?;
+        socket.set_reuse_address(true)?;
+        if original_dst.is_ipv4() {
+            socket.set_ip_transparent_v4(true)?;
+        } else {
+            socket.set_ip_transparent_v6(true)?;
+        }
+        socket.set_mark(DAE_BYPASS_MARK)?;
+        socket.bind(&original_dst.into())?;
+        UdpSocket::from_std(socket.into())
     }
 }
 
@@ -1394,13 +1981,27 @@ impl honk_outbound::proxy::TcpOutbound for UdpTestHandler {
     async fn dial(
         &self,
         _node: &Node,
-        _target: SocketAddr,
-        _target_domain: Option<&str>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
         _connect_timeout: Duration,
     ) -> anyhow::Result<honk_outbound::proxy::ProxyStream> {
-        Err(anyhow::anyhow!(
-            "TCP dial is not used by the UDP lifecycle tests"
-        ))
+        match &self.mode {
+            UdpTestMode::TcpHold { entered, release } => {
+                entered.notify_one();
+                release.notified().await;
+            }
+            UdpTestMode::TcpCaptureTarget(captured) => {
+                *captured.lock().expect("dial target") =
+                    Some((target, target_domain.map(str::to_owned)));
+            }
+            _ => anyhow::bail!("TCP dial is not used by the UDP lifecycle tests"),
+        }
+        let stream = TcpStream::connect(target).await?;
+        Ok(honk_outbound::proxy::ProxyStream {
+            stream: Box::new(stream),
+            target_addr: target,
+            target_domain: target_domain.map(str::to_owned),
+        })
     }
 }
 
@@ -1443,6 +2044,9 @@ impl honk_outbound::proxy::PacketOutbound for UdpTestHandler {
                 entered.notify_one();
                 release.notified().await;
             }
+            UdpTestMode::DnsResponse { dials } => {
+                dials.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             _ => {}
         }
         match &self.mode {
@@ -1452,6 +2056,7 @@ impl honk_outbound::proxy::PacketOutbound for UdpTestHandler {
             _ => Ok(Arc::new(UdpTestTransport {
                 mode: self.mode.clone(),
                 relay: target,
+                replied: std::sync::atomic::AtomicBool::new(false),
             })),
         }
     }
@@ -1639,6 +2244,217 @@ async fn tcp_idle_relay_survives_conn_state_sweep() -> anyhow::Result<()> {
             .redirect_track_lookup(&redirect_key)?
             .is_none()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn tcp_tracker_keeps_the_dial_selection_snapshot() -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut hk = Node {
+        name: "hk-140".into(),
+        protocol: honk_config::types::NodeProtocol::Socks5,
+        address: "127.0.0.1".into(),
+        port: 140,
+        ..Default::default()
+    };
+    hk.id = hk.derive_id();
+    let mut us = Node {
+        name: "us-163".into(),
+        protocol: honk_config::types::NodeProtocol::Socks5,
+        address: "127.0.0.1".into(),
+        port: 163,
+        ..Default::default()
+    };
+    us.id = us.derive_id();
+    let mut config = udp_test_config(
+        "devops",
+        vec![hk.clone(), us.clone()],
+        vec![Group {
+            name: "devops".into(),
+            policy: honk_config::group::GroupPolicy::Selector,
+            nodes: vec![hk.id, us.id],
+            default: Some(hk.name.clone()),
+            ..Default::default()
+        }],
+    );
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "ip".into();
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handle = udp_test_handle(
+        config,
+        UdpTestMode::TcpHold {
+            entered: entered.clone(),
+            release: release.clone(),
+        },
+        1,
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let original_dst = listener.local_addr()?;
+    let mut client = TcpStream::connect(original_dst).await?;
+    let (accepted, client_addr) = listener.accept().await?;
+    let tuples = build_tuples_key(
+        original_dst.ip(),
+        original_dst.port(),
+        client_addr.ip(),
+        client_addr.port(),
+        6,
+    );
+    handle.ebpf.write().await.tcp_conn_state_store(
+        &tuples,
+        &honk_ebpf_common::conn::ConnState {
+            state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
+            last_seen_ns: 1,
+            ..Default::default()
+        },
+    )?;
+    let task_handle = handle.clone();
+    let mut task =
+        tokio::spawn(async move { task_handle.serve_connection(accepted, client_addr).await });
+
+    tokio::select! {
+        _ = entered.notified() => {}
+        result = &mut task => panic!("TCP handler exited before dial: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_secs(5)) => {
+            panic!("TCP dial did not reach the injected handler")
+        }
+    }
+    assert_eq!(
+        handle.group_manager.read().selection_chain("devops"),
+        vec!["devops", "hk-140"]
+    );
+    handle
+        .group_manager
+        .read()
+        .set_selector_choice("devops", "us-163");
+    assert_eq!(
+        handle.group_manager.read().selection_chain("devops"),
+        vec!["devops", "us-163"]
+    );
+
+    release.notify_one();
+    let (mut upstream, _) =
+        tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+    let tracked = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(entry) = handle.connection_tracker.snapshot().into_iter().next() {
+                break entry;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert_eq!(tracked.proxy, "hk-140");
+    assert_eq!(tracked.chains, vec!["hk-140", "devops"]);
+
+    client.shutdown().await?;
+    upstream.shutdown().await?;
+    drop(client);
+    drop(upstream);
+    tokio::time::timeout(Duration::from_secs(5), task).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn udp_tracker_uses_the_udp_selection_snapshot() -> anyhow::Result<()> {
+    let mut tcp_node = Node {
+        name: "tcp-node".into(),
+        protocol: honk_config::types::NodeProtocol::Socks5,
+        address: "127.0.0.1".into(),
+        port: 140,
+        ..Default::default()
+    };
+    tcp_node.id = tcp_node.derive_id();
+    let mut udp_node = Node {
+        name: "udp-node".into(),
+        protocol: honk_config::types::NodeProtocol::Socks5,
+        address: "127.0.0.1".into(),
+        port: 163,
+        ..Default::default()
+    };
+    udp_node.id = udp_node.derive_id();
+    let config = udp_test_config(
+        "traffic",
+        vec![tcp_node.clone(), udp_node.clone()],
+        vec![Group {
+            name: "traffic".into(),
+            policy: honk_config::group::GroupPolicy::URLTest,
+            nodes: vec![tcp_node.id, udp_node.id],
+            ..Default::default()
+        }],
+    );
+    let handle = udp_test_handle(config, UdpTestMode::Success, 1);
+    handle.alive_set.record_probe_latency(
+        tcp_node.id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    handle.alive_set.record_probe_latency(
+        udp_node.id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(100),
+    );
+    handle.alive_set.record_probe_latency(
+        tcp_node.id,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+        Duration::from_millis(100),
+    );
+    handle.alive_set.record_probe_latency(
+        udp_node.id,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    assert_eq!(
+        handle
+            .group_manager
+            .read()
+            .select_node_for_domain("traffic", ProbeDomain::Tcp, IpVersion::V4)
+            .expect("TCP selection")
+            .name,
+        "tcp-node"
+    );
+    assert_eq!(
+        handle
+            .group_manager
+            .read()
+            .select_node_for_domain("traffic", ProbeDomain::DataUdp, IpVersion::V4)
+            .expect("UDP selection")
+            .name,
+        "udp-node"
+    );
+    assert_eq!(
+        handle
+            .group_manager
+            .read()
+            .selection_chain_for_network("traffic", crate::group::SelectionNetwork::Tcp),
+        vec!["traffic", "tcp-node"]
+    );
+    assert_eq!(
+        handle
+            .group_manager
+            .read()
+            .selection_chain_for_network("traffic", crate::group::SelectionNetwork::Udp),
+        vec!["traffic", "udp-node"]
+    );
+
+    serve_test_udp(&handle).await?;
+    let tracked = handle
+        .connection_tracker
+        .snapshot()
+        .into_iter()
+        .next()
+        .expect("ready UDP endpoint must be tracked");
+    assert_eq!(tracked.proxy, "udp-node");
+    assert_eq!(tracked.chains, vec!["udp-node", "traffic"]);
+    handle
+        .udp_pool
+        .remove(addr("10.0.0.2:53000"), addr("203.0.113.2:443"));
     Ok(())
 }
 
@@ -2425,7 +3241,9 @@ async fn udp_dns_dispatch_registers_connection_guard_before_task_poll() {
         drain: Arc::clone(&drain),
         handle: plane.spawn_handle(),
     };
-    super::dispatch_udp_slow_path(&state, client, dst, &dns_query_payload());
+    let query = dns_query_payload();
+    let validated = validate_exact_dns_query(&query);
+    super::dispatch_udp_slow_path(&state, client, dst, &query, validated);
     assert_eq!(
         drain.active_count(),
         1,
@@ -2479,12 +3297,17 @@ async fn udp_dns_with_ready_endpoint_uses_controller_not_queue() {
     let dns = production_dns_controller(upstream_calls.clone(), dns_response_payload());
     let slow = Arc::new(tokio::sync::Semaphore::new(1));
     let query = dns_query_payload();
+    let validated = validate_exact_dns_query(&query).unwrap();
 
     // Fast path must force DNS-shaped traffic slow even with Ready present.
-    assert!(!udp_fast_path(&pool, &stats, &query, client, dst).await);
+    assert!(!udp_fast_path(&pool, &stats, &query, client, dst, Some(validated)).await);
 
-    match super::begin_udp_slow_path(&pool, &stats, &slow, client, dst, &query) {
-        super::UdpSlowPathWork::DnsThenMaybeInitialize { permit, data } => {
+    match super::begin_udp_slow_path(&pool, &stats, &slow, client, dst, &query, Some(validated)) {
+        super::UdpSlowPathWork::DnsThenMaybeInitialize {
+            permit,
+            data,
+            validated,
+        } => {
             let lease = super::complete_udp_dns_slow_path(
                 super::UdpDnsSlowPathContext {
                     pool: &pool,
@@ -2495,6 +3318,7 @@ async fn udp_dns_with_ready_endpoint_uses_controller_not_queue() {
                 },
                 permit,
                 &data,
+                validated,
             )
             .await;
             assert!(
@@ -2542,10 +3366,15 @@ async fn udp_dns_with_initializing_endpoint_uses_controller_not_queue() {
     let dns = production_dns_controller(upstream_calls.clone(), dns_response_payload());
     let slow = Arc::new(tokio::sync::Semaphore::new(1));
     let query = dns_query_payload();
+    let validated = validate_exact_dns_query(&query).unwrap();
 
-    assert!(!udp_fast_path(&pool, &stats, &query, client, dst).await);
-    match super::begin_udp_slow_path(&pool, &stats, &slow, client, dst, &query) {
-        super::UdpSlowPathWork::DnsThenMaybeInitialize { permit, data } => {
+    assert!(!udp_fast_path(&pool, &stats, &query, client, dst, Some(validated)).await);
+    match super::begin_udp_slow_path(&pool, &stats, &slow, client, dst, &query, Some(validated)) {
+        super::UdpSlowPathWork::DnsThenMaybeInitialize {
+            permit,
+            data,
+            validated,
+        } => {
             let maybe_lease = super::complete_udp_dns_slow_path(
                 super::UdpDnsSlowPathContext {
                     pool: &pool,
@@ -2556,6 +3385,7 @@ async fn udp_dns_with_initializing_endpoint_uses_controller_not_queue() {
                 },
                 permit,
                 &data,
+                validated,
             )
             .await;
             assert!(maybe_lease.is_none());
@@ -2591,12 +3421,12 @@ async fn udp_initializing_follower_requires_slow_permit_via_shared_helper() {
     };
 
     // Fast path must miss for Initializing — no direct enqueue, no copy.
-    assert!(!udp_fast_path(&pool, &stats, b"follower", client, dst).await);
+    assert!(!udp_fast_path(&pool, &stats, b"follower", client, dst, None).await);
     assert_eq!(stats.udp_snapshot().endpoint_misses, 1);
     assert_eq!(stats.udp_snapshot().queue_accepted, 0);
 
     let zero = Arc::new(tokio::sync::Semaphore::new(0));
-    match super::begin_udp_slow_path(&pool, &stats, &zero, client, dst, b"follower") {
+    match super::begin_udp_slow_path(&pool, &stats, &zero, client, dst, b"follower", None) {
         super::UdpSlowPathWork::Done => {}
         _ => panic!("zero slow permit must not reserve or enqueue"),
     }
@@ -2605,7 +3435,7 @@ async fn udp_initializing_follower_requires_slow_permit_via_shared_helper() {
     assert_eq!(udp.queue_accepted, 0);
 
     let open = Arc::new(tokio::sync::Semaphore::new(1));
-    match super::begin_udp_slow_path(&pool, &stats, &open, client, dst, b"follower") {
+    match super::begin_udp_slow_path(&pool, &stats, &open, client, dst, b"follower", None) {
         super::UdpSlowPathWork::Done => {}
         super::UdpSlowPathWork::Initialize(_) => {
             panic!("Initializing follower must enqueue, not create a second lease")
@@ -2623,8 +3453,26 @@ async fn udp_initializing_follower_requires_slow_permit_via_shared_helper() {
     drop(lease);
 }
 
+fn resolve_udp_score_plan(
+    config: &Config,
+    manager: &GroupManager,
+    outbound: &str,
+    ipver: IpVersion,
+) -> ResolvedUdpPlan {
+    resolve_udp_outbound_plan_for_target(
+        config,
+        manager,
+        outbound,
+        &crate::group::ScoreSelectionContext::aggregate(
+            crate::group::SelectionNetwork::Udp,
+            ProbeDomain::DataUdp,
+            ipver,
+        ),
+    )
+}
+
 #[test]
-fn resolve_udp_outbound_plan_preserves_terminal_provenance() {
+fn resolve_udp_score_plan_preserves_terminal_provenance() {
     let first = Node {
         id: uuid::Uuid::new_v4(),
         name: "first".into(),
@@ -2660,7 +3508,7 @@ fn resolve_udp_outbound_plan_preserves_terminal_provenance() {
     );
     let manager = GroupManager::new(&config.groups, &config.nodes);
 
-    let direct = resolve_udp_outbound_plan(&config, &manager, "direct", IpVersion::V4);
+    let direct = resolve_udp_score_plan(&config, &manager, "direct", IpVersion::V4);
     assert_eq!(direct.mode, crate::group::SelectionPlanMode::Authoritative);
     assert_eq!(
         direct
@@ -2671,7 +3519,7 @@ fn resolve_udp_outbound_plan_preserves_terminal_provenance() {
         ["direct"]
     );
 
-    let node = resolve_udp_outbound_plan(&config, &manager, "first", IpVersion::V4);
+    let node = resolve_udp_score_plan(&config, &manager, "first", IpVersion::V4);
     assert_eq!(node.mode, crate::group::SelectionPlanMode::Authoritative);
     assert_eq!(
         node.nodes
@@ -2681,7 +3529,7 @@ fn resolve_udp_outbound_plan_preserves_terminal_provenance() {
         ["first"]
     );
 
-    let nested = resolve_udp_outbound_plan(&config, &manager, "nested-parent", IpVersion::V4);
+    let nested = resolve_udp_score_plan(&config, &manager, "nested-parent", IpVersion::V4);
     assert_eq!(nested.mode, crate::group::SelectionPlanMode::Authoritative);
     assert_eq!(
         nested
@@ -2692,7 +3540,7 @@ fn resolve_udp_outbound_plan_preserves_terminal_provenance() {
         ["first"]
     );
 
-    let final_plan = resolve_udp_outbound_plan(&config, &manager, "empty-final", IpVersion::V4);
+    let final_plan = resolve_udp_score_plan(&config, &manager, "empty-final", IpVersion::V4);
     assert_eq!(
         final_plan.mode,
         crate::group::SelectionPlanMode::ColdUrlTest
@@ -2708,7 +3556,7 @@ fn resolve_udp_outbound_plan_preserves_terminal_provenance() {
 }
 
 #[test]
-fn resolve_udp_outbound_plan_tracks_v4_fallback_and_final_resolution_guards() {
+fn resolve_udp_score_plan_tracks_v4_fallback_and_final_resolution_guards() {
     let v4_only = Node {
         id: uuid::Uuid::new_v4(),
         name: "v4-only".into(),
@@ -2752,7 +3600,7 @@ fn resolve_udp_outbound_plan_tracks_v4_fallback_and_final_resolution_guards() {
     alive.report_unavailable_forced(v4_only_id, ProbeDomain::DnsUdp, IpVersion::V6);
     let manager = GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive));
 
-    let v4_fallback = resolve_udp_outbound_plan(&config, &manager, "v4-group", IpVersion::V6);
+    let v4_fallback = resolve_udp_score_plan(&config, &manager, "v4-group", IpVersion::V6);
     assert_eq!(
         v4_fallback.mode,
         crate::group::SelectionPlanMode::ColdUrlTest
@@ -2767,11 +3615,11 @@ fn resolve_udp_outbound_plan_tracks_v4_fallback_and_final_resolution_guards() {
         ["v4-only"]
     );
 
-    let empty = resolve_udp_outbound_plan(&config, &manager, "empty", IpVersion::V4);
+    let empty = resolve_udp_score_plan(&config, &manager, "empty", IpVersion::V4);
     assert!(empty.nodes.is_empty());
     assert_eq!(empty.mode, crate::group::SelectionPlanMode::Authoritative);
 
-    let missing = resolve_udp_outbound_plan(&config, &manager, "missing-final", IpVersion::V4);
+    let missing = resolve_udp_score_plan(&config, &manager, "missing-final", IpVersion::V4);
     assert_eq!(
         missing
             .nodes
@@ -2781,7 +3629,7 @@ fn resolve_udp_outbound_plan_tracks_v4_fallback_and_final_resolution_guards() {
         ["direct"]
     );
 
-    let cycle = resolve_udp_outbound_plan(&config, &manager, "cycle-a", IpVersion::V4);
+    let cycle = resolve_udp_score_plan(&config, &manager, "cycle-a", IpVersion::V4);
     assert!(
         cycle.nodes.is_empty(),
         "final cycles fail closed instead of bypassing policy"
@@ -2789,7 +3637,7 @@ fn resolve_udp_outbound_plan_tracks_v4_fallback_and_final_resolution_guards() {
 }
 
 #[test]
-fn resolve_udp_outbound_plan_explicit_node_falls_back_to_v4_through_final() {
+fn resolve_udp_score_plan_explicit_node_falls_back_to_v4_through_final() {
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "v4-explicit".into(),
@@ -2810,7 +3658,7 @@ fn resolve_udp_outbound_plan_explicit_node_falls_back_to_v4_through_final() {
     let manager = GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive.clone()));
 
     for outbound in ["v4-explicit", "final-to-explicit"] {
-        let plan = resolve_udp_outbound_plan(&config, &manager, outbound, IpVersion::V6);
+        let plan = resolve_udp_score_plan(&config, &manager, outbound, IpVersion::V6);
         assert_eq!(plan.mode, crate::group::SelectionPlanMode::Authoritative);
         assert_eq!(plan.ipver, IpVersion::V4, "{outbound}");
         assert_eq!(
@@ -2824,7 +3672,7 @@ fn resolve_udp_outbound_plan_explicit_node_falls_back_to_v4_through_final() {
     }
 
     for outbound in ["direct", "block"] {
-        let plan = resolve_udp_outbound_plan(&config, &manager, outbound, IpVersion::V6);
+        let plan = resolve_udp_score_plan(&config, &manager, outbound, IpVersion::V6);
         assert_eq!(plan.ipver, IpVersion::V6, "{outbound}");
         assert_eq!(
             plan.nodes
@@ -2840,7 +3688,7 @@ fn resolve_udp_outbound_plan_explicit_node_falls_back_to_v4_through_final() {
     }
     for outbound in ["v4-explicit", "final-to-explicit"] {
         assert!(
-            resolve_udp_outbound_plan(&config, &manager, outbound, IpVersion::V6)
+            resolve_udp_score_plan(&config, &manager, outbound, IpVersion::V6)
                 .nodes
                 .is_empty(),
             "{outbound} must stay empty when neither family is selectable"
@@ -2849,7 +3697,7 @@ fn resolve_udp_outbound_plan_explicit_node_falls_back_to_v4_through_final() {
 }
 
 #[test]
-fn resolve_udp_outbound_plan_excludes_unselectable_explicit_node() {
+fn resolve_udp_score_plan_excludes_unselectable_explicit_node() {
     let node = udp_test_node();
     let config = udp_test_config("udp-test", vec![node], vec![]);
     let alive = Arc::new(AliveDialerSet::new());
@@ -2858,7 +3706,7 @@ fn resolve_udp_outbound_plan_excludes_unselectable_explicit_node() {
     }
     let manager = GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive));
 
-    let plan = resolve_udp_outbound_plan(&config, &manager, "udp-test", IpVersion::V4);
+    let plan = resolve_udp_score_plan(&config, &manager, "udp-test", IpVersion::V4);
 
     assert!(plan.nodes.is_empty());
 }
@@ -2879,7 +3727,7 @@ async fn udp_stagger_uses_absolute_offsets_bounds_inflight_and_drains_losers() {
         let active = active.clone();
         let max_active = max_active.clone();
         let release_first = release_first.clone();
-        Arc::new(move |node: Node| {
+        Arc::new(move |_: usize, node: Node| {
             let starts = starts.clone();
             let active = active.clone();
             let max_active = max_active.clone();
@@ -3014,7 +3862,7 @@ async fn udp_stagger_drain_reports_completed_error_without_cancelling_ready_lose
     let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let prepare: UdpPrepare<String> = {
         let release = release.clone();
-        Arc::new(move |node: Node| {
+        Arc::new(move |_: usize, node: Node| {
             let release = release.clone();
             Box::pin(async move {
                 release.notified().await;
@@ -3086,7 +3934,8 @@ async fn udp_stagger_authoritative_prepares_only_the_current_node_without_delay(
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let prepare: UdpPrepare<String> = Arc::new(|node: Node| Box::pin(async move { Ok(node.name) }));
+    let prepare: UdpPrepare<String> =
+        Arc::new(|_: usize, node: Node| Box::pin(async move { Ok(node.name) }));
     let callbacks = UdpStaggerCallbacks {
         is_eligible: Arc::new(|_| true),
         on_dial_error: Arc::new(|_| panic!("authoritative success must not report an error")),
@@ -3139,7 +3988,7 @@ async fn udp_stagger_authoritative_failure_preserves_fixed_metric_zeros() {
     let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let prepare: UdpPrepare<()> =
-        Arc::new(|_: Node| Box::pin(async { Err(anyhow::anyhow!("dial failed")) }));
+        Arc::new(|_: usize, _: Node| Box::pin(async { Err(anyhow::anyhow!("dial failed")) }));
     let callbacks = UdpStaggerCallbacks {
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
@@ -3195,7 +4044,7 @@ async fn udp_stagger_all_dial_failures_report_health_without_cancellation() {
     let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let prepare: UdpPrepare<()> =
-        Arc::new(|_: Node| Box::pin(async { Err(anyhow::anyhow!("dial failed")) }));
+        Arc::new(|_: usize, _: Node| Box::pin(async { Err(anyhow::anyhow!("dial failed")) }));
     let callbacks = UdpStaggerCallbacks {
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
@@ -3246,7 +4095,7 @@ async fn udp_stagger_rechecks_eligibility_before_accepting_prepared_transport() 
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let prepare: UdpPrepare<String> = {
         let became_ineligible = became_ineligible.clone();
-        Arc::new(move |node: Node| {
+        Arc::new(move |_: usize, node: Node| {
             let became_ineligible = became_ineligible.clone();
             Box::pin(async move {
                 if node.name == "became-ineligible" {
@@ -3408,47 +4257,6 @@ fn preconnect_candidates_auto_caps_at_eight() {
     );
 }
 
-#[test]
-fn probe_warm_runtime_reuses_only_warm_or_stateless_nodes() {
-    let anytls = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "anytls".into(),
-        protocol: NodeProtocol::AnyTLS,
-        address: "anytls.example.com:443".into(),
-        ..Default::default()
-    };
-    let trojan = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "trojan".into(),
-        protocol: NodeProtocol::Trojan,
-        address: "trojan.example.com:443".into(),
-        ..Default::default()
-    };
-    let absent = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "absent".into(),
-        protocol: NodeProtocol::SS,
-        address: "absent.example.com:443".into(),
-        ..Default::default()
-    };
-    let generation =
-        honk_outbound::runtime::OutboundRuntimeRegistry::build(&[anytls.clone(), trojan.clone()])
-            .unwrap();
-
-    assert!(
-        probers::warm_runtime(&generation, &anytls).is_none(),
-        "a cold AnyTLS node probes through an ephemeral runtime"
-    );
-    assert!(
-        probers::warm_runtime(&generation, &absent).is_none(),
-        "a node outside the generation probes ephemerally"
-    );
-    assert!(
-        probers::warm_runtime(&generation, &trojan).is_some(),
-        "a session-less protocol has nothing to retain; reuse the generation runtime"
-    );
-}
-
 fn link_lifecycle_cp(backend: crate::ebpf::mock::MockEbpfBackend) -> ControlPlane {
     ControlPlane::new(
         Config::default(),
@@ -3459,6 +4267,77 @@ fn link_lifecycle_cp(backend: crate::ebpf::mock::MockEbpfBackend) -> ControlPlan
         udp_test_forwarder(),
     )
     .unwrap()
+}
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+async fn exhausted_udp_tokens_wait_for_a_rollback_safe_generation() {
+    use honk_ebpf_common::conn::{ConnState, UdpDecisionState};
+
+    let mut backend = crate::ebpf::mock::MockEbpfBackend::new();
+    backend.udp_decision_sequence_next = UDP_DECISION_SEQUENCE_MASK;
+    let mut keys = Vec::new();
+    for generation in 0..=UDP_DECISION_GENERATION_MASK {
+        let key = connection::build_tuples_key(
+            "203.0.113.1".parse().unwrap(),
+            44000 + generation as u16,
+            "10.0.0.1".parse().unwrap(),
+            53000,
+            17,
+        );
+        backend
+            .udp_conn_state_store(
+                &key,
+                &ConnState {
+                    state: UdpDecisionState::DirectArmed as u8,
+                    decision_token: udp_decision_token(generation, 1).unwrap(),
+                    ..ConnState::default()
+                },
+            )
+            .unwrap();
+        keys.push(key);
+    }
+
+    let control = link_lifecycle_cp(backend);
+    assert!(!control.rotate_udp_decision_generation().await.unwrap());
+    assert!(
+        control
+            .ebpf
+            .read()
+            .await
+            .udp_decision_sequence_status()
+            .unwrap()
+            .exhausted()
+    );
+
+    control
+        .ebpf
+        .write()
+        .await
+        .udp_conn_state_remove(&keys[2])
+        .unwrap();
+    assert!(!control.rotate_udp_decision_generation().await.unwrap());
+    control
+        .ebpf
+        .write()
+        .await
+        .udp_conn_state_remove(&keys[3])
+        .unwrap();
+
+    assert!(control.rotate_udp_decision_generation().await.unwrap());
+    assert_eq!(
+        control
+            .ebpf
+            .read()
+            .await
+            .udp_decision_sequence_status()
+            .unwrap(),
+        crate::ebpf::UdpDecisionSequenceStatus {
+            next: 0,
+            generation: 2,
+        }
+    );
+    assert_eq!(control.stats.udp_snapshot().nfqueue.token_rollovers, 1);
 }
 
 /// Reload and subscription merge share `apply_runtime_config`, which only
@@ -3582,7 +4461,7 @@ async fn udp_removal_worker_retires_legacy_token_zero_conn_state() {
 }
 
 #[tokio::test]
-async fn udp_removal_worker_escalates_token_mismatch() {
+async fn udp_removal_worker_acknowledges_superseding_token() {
     use honk_ebpf_common::conn::{ConnState, UdpDecisionState};
 
     let client: SocketAddr = "10.0.0.1:53000".parse().unwrap();
@@ -3595,6 +4474,74 @@ async fn udp_removal_worker_escalates_token_mismatch() {
             state: UdpDecisionState::Pending as u8,
             decision_token: 42,
             ..ConnState::default()
+        },
+    )
+    .unwrap();
+    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+    let pool = Arc::new(UdpEndpointPool::new());
+    let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
+    let removal_task = spawn_udp_removal_worker(
+        Arc::clone(&pool),
+        Arc::clone(&backend),
+        Arc::new(ConnectionTracker::new()),
+        fatal_tx,
+    );
+    let lease = match pool.reserve_owned_or_enqueue(
+        client,
+        dst,
+        Bytes::from_static(b"held datagram"),
+        41,
+        None,
+        Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap(),
+        &StatsManager::new(),
+    ) {
+        udp_endpoint::EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("expected an initializing lease"),
+    };
+
+    drop(lease);
+    assert!(pool.wait_for_retirements().await);
+    assert!(pool.is_empty());
+    assert_eq!(
+        backend
+            .read()
+            .await
+            .udp_conn_state_lookup(&key)
+            .unwrap()
+            .unwrap()
+            .decision_token,
+        42
+    );
+    assert!(fatal_rx.try_recv().is_err());
+
+    assert!(pool.shutdown().await);
+    removal_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn udp_removal_worker_escalates_auxiliary_token_mismatch() {
+    use honk_ebpf_common::conn::{ConnState, UdpDecisionState};
+    use honk_ebpf_common::{RedirectEntry, RedirectTuple};
+
+    let client: SocketAddr = "10.0.0.1:53000".parse().unwrap();
+    let dst: SocketAddr = "203.0.113.1:443".parse().unwrap();
+    let key = connection::build_tuples_key(dst.ip(), dst.port(), client.ip(), client.port(), 17);
+    let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
+    mock.seed_staged_udp_flow(
+        &key,
+        ConnState {
+            state: UdpDecisionState::Pending as u8,
+            decision_token: 41,
+            ..ConnState::default()
+        },
+    );
+    mock.redirect_track_store(
+        &RedirectTuple::from_tuples(&key),
+        &RedirectEntry {
+            decision_token: 42,
+            ..RedirectEntry::default()
         },
     )
     .unwrap();
@@ -3625,10 +4572,702 @@ async fn udp_removal_worker_escalates_token_mismatch() {
     drop(lease);
     let fatal = tokio::time::timeout(Duration::from_secs(1), fatal_rx.recv())
         .await
-        .expect("removal mismatch must reach supervision")
+        .expect("auxiliary mismatch must reach supervision")
         .expect("removal fatal channel must remain open");
     assert!(fatal.to_string().contains("identity mismatch"));
 
     removal_task.abort();
     let _ = removal_task.await;
+}
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn fresh_test_netns() -> std::os::fd::OwnedFd {
+    std::thread::spawn(|| {
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).expect("unshare test netns");
+        std::fs::File::open("/proc/thread-self/ns/net")
+            .expect("open test netns")
+            .into()
+    })
+    .join()
+    .expect("create test netns")
+}
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn in_test_netns<T>(netns: &std::os::fd::OwnedFd, f: impl FnOnce() -> T) -> T {
+    let current = std::fs::File::open("/proc/thread-self/ns/net").expect("open current netns");
+    nix::sched::setns(netns, nix::sched::CloneFlags::CLONE_NEWNET).expect("enter test netns");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    nix::sched::setns(&current, nix::sched::CloneFlags::CLONE_NEWNET).expect("restore test netns");
+    match result {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn configure_test_edge(
+    netns: &std::os::fd::OwnedFd,
+    interface: &str,
+    address: [u8; 4],
+    gateway: [u8; 4],
+    ports: &[u16],
+) -> Vec<std::net::UdpSocket> {
+    in_test_netns(netns, || {
+        let mut netlink = crate::netlink::NlSock::new().expect("edge netlink");
+        let (loopback, _) = netlink.get_link("lo").expect("edge loopback");
+        let (ifindex, _) = netlink.get_link(interface).expect("edge interface");
+        netlink
+            .set_link_up(loopback, true)
+            .expect("edge loopback up");
+        netlink
+            .set_link_up(ifindex, true)
+            .expect("edge interface up");
+        netlink
+            .addr_op(true, ifindex, libc::AF_INET as u8, &address, 24)
+            .expect("edge address");
+        netlink
+            .add_route(
+                libc::AF_INET as u8,
+                254,
+                1,
+                0,
+                4,
+                None,
+                Some(&gateway),
+                Some(ifindex),
+            )
+            .expect("edge default route");
+        ports
+            .iter()
+            .map(|port| {
+                let socket = std::net::UdpSocket::bind(SocketAddr::from((address, *port)))
+                    .expect("edge UDP bind");
+                socket.set_nonblocking(true).expect("edge UDP nonblocking");
+                socket
+            })
+            .collect()
+    })
+}
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[test]
+#[ignore = "requires root, bpffs, nftables, and eBPF TC support"]
+fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
+    std::thread::spawn(|| -> anyhow::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET)?;
+        let client_netns = fresh_test_netns();
+        let server_netns = fresh_test_netns();
+        let mut netlink = crate::netlink::NlSock::new()?;
+        netlink.add_veth_pair("honk-lan0", "honk-c0")?;
+        netlink.add_veth_pair("honk-wan0", "honk-s0")?;
+        let (lan, _) = netlink.get_link("honk-lan0")?;
+        let (client_peer, _) = netlink.get_link("honk-c0")?;
+        let (wan, _) = netlink.get_link("honk-wan0")?;
+        let (server_peer, _) = netlink.get_link("honk-s0")?;
+        netlink.set_link_netns_fd(client_peer, &client_netns)?;
+        netlink.set_link_netns_fd(server_peer, &server_netns)?;
+        netlink.set_link_up(lan, true)?;
+        netlink.set_link_up(wan, true)?;
+        netlink.addr_op(true, lan, libc::AF_INET as u8, &[10, 70, 0, 1], 24)?;
+        netlink.addr_op(true, wan, libc::AF_INET as u8, &[198, 51, 100, 1], 24)?;
+        std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
+
+        let client = configure_test_edge(
+            &client_netns,
+            "honk-c0",
+            [10, 70, 0, 2],
+            [10, 70, 0, 1],
+            &[0],
+        )
+        .pop()
+        .expect("client socket");
+        let mut servers = configure_test_edge(
+            &server_netns,
+            "honk-s0",
+            [198, 51, 100, 2],
+            [198, 51, 100, 1],
+            &[41001, 41002],
+        );
+        let server_proxy = servers.pop().expect("proxy server socket");
+        let server_direct = servers.pop().expect("direct server socket");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async move {
+            let pin_root = std::path::Path::new("/sys/fs/bpf")
+                .join(format!("honk-nfq-e2e-{}", std::process::id()));
+            let mut backend = crate::ebpf::real::RealEbpfBackend::load(
+                crate::DEFAULT_BPF_OBJECT,
+                &pin_root,
+                12345,
+                TPROXY_MARK,
+                Some("honk-lan0"),
+                "honk-wan0",
+                false,
+            )
+            .await?;
+            let tcp_listener = TcpListener::bind("0.0.0.0:0").await?;
+            let udp_listener = UdpSocket::bind("0.0.0.0:0").await?;
+            let udp_fds = vec![udp_listener.as_raw_fd(); 4];
+            backend.publish_listener_sockets(
+                tcp_listener.as_raw_fd(),
+                tcp_listener.as_raw_fd(),
+                &udp_fds,
+                &udp_fds,
+            )?;
+
+            let proxy_socket =
+                Arc::new(honk_outbound::util::udp_marked_bind("0.0.0.0:0".parse()?).await?);
+            let mut registry = honk_outbound::proxy::ProxyRegistry::new();
+            let handler = Arc::new(UdpTestHandler {
+                mode: UdpTestMode::KernelSocket(proxy_socket),
+            });
+            registry.register(
+                honk_outbound::proxy::ProtocolEntry::new(
+                    honk_config::types::NodeProtocol::Socks5,
+                    handler.clone(),
+                )
+                .with_packet(handler),
+            );
+
+            let mut config = udp_test_config("direct", vec![udp_test_node()], vec![]);
+            config.ensure_builtin_nodes();
+            config.global.lan_interface = vec!["honk-lan0".into()];
+            config.global.dial_mode = "domain++".into();
+            config.global.wan_interface = vec!["honk-wan0".into()];
+            config.experimental.udp_nfqueue.enabled = true;
+            config
+                .routing
+                .rules
+                .push(honk_config::routing::RoutingRule {
+                    name: "domain-can-reroute".into(),
+                    condition: honk_config::routing::RoutingCondition {
+                        domain_suffix: vec!["never.invalid".into()],
+                        ..Default::default()
+                    },
+                    outbound: honk_config::routing::RoutingOutbound::Simple("udp-test".into()),
+                    priority: 0,
+                    must: false,
+                    mark: 0,
+                });
+            config
+                .routing
+                .rules
+                .push(honk_config::routing::RoutingRule {
+                    name: "port-proxy".into(),
+                    condition: honk_config::routing::RoutingCondition {
+                        port: vec!["41002".into()],
+                        ..Default::default()
+                    },
+                    outbound: honk_config::routing::RoutingOutbound::Simple("udp-test".into()),
+                    priority: 0,
+                    must: false,
+                    mark: 0,
+                });
+            let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+            let mut control = ControlPlane::new(
+                config,
+                Box::new(backend),
+                router,
+                Arc::new(registry),
+                DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
+                udp_test_forwarder(),
+            )?;
+            control.udp_pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
+                1024,
+                Arc::new(KernelUdpReplySocketFactory),
+            ));
+            control.set_mode_state(Arc::new(parking_lot::RwLock::new(
+                crate::mode::ModeState::new("Rule", "Proxy"),
+            )));
+            control.start_datapath_flags_coordinator()?;
+            {
+                let plan = control.active_routing_plan.read().clone();
+                let mut ebpf = control.ebpf.write().await;
+                routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &plan)?;
+            }
+            let mut nfqueue = control
+                .start_nfqueue_runtime(true)
+                .await?
+                .expect("enabled NFQUEUE runtime");
+            nfqueue.check_startup_health().await?;
+            control
+                .initialize_datapath_flags(true, nfqueue.sequence_ready)
+                .await?;
+            nfqueue.pending.open_admission();
+            control.ebpf.write().await.set_datapath_ready(true)?;
+            let (removal_fatal_tx, mut removal_fatal_rx) = mpsc::unbounded_channel();
+            let mut removal_task = spawn_udp_removal_worker(
+                Arc::clone(&control.udp_pool),
+                Arc::clone(&control.ebpf),
+                Arc::clone(&control.connection_tracker),
+                removal_fatal_tx,
+            );
+
+            let client = UdpSocket::from_std(client)?;
+            let server_direct = UdpSocket::from_std(server_direct)?;
+            let server_proxy = UdpSocket::from_std(server_proxy)?;
+            let exercise = async {
+                let direct_dst = SocketAddr::from(([198, 51, 100, 2], 41001));
+                client.send_to(b"direct-first", direct_dst).await?;
+                let mut buffer = [0u8; 128];
+                let (size, source) = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    server_direct.recv_from(&mut buffer),
+                )
+                .await??;
+                anyhow::ensure!(&buffer[..size] == b"direct-first");
+                anyhow::ensure!(source.ip() == "10.70.0.2".parse::<std::net::IpAddr>()?);
+                anyhow::ensure!(
+                    tokio::time::timeout(
+                        Duration::from_millis(250),
+                        server_direct.recv_from(&mut buffer),
+                    )
+                    .await
+                    .is_err(),
+                    "direct original arrived more than once"
+                );
+                let direct_stats = control.stats.udp_snapshot().nfqueue;
+                anyhow::ensure!(direct_stats.direct_accepted == 1);
+                anyhow::ensure!(direct_stats.proxy_copied == 0);
+                let tc_status = std::process::Command::new("tc")
+                    .args([
+                        "filter",
+                        "add",
+                        "dev",
+                        "honk-wan0",
+                        "egress",
+                        "pref",
+                        "1",
+                        "matchall",
+                        "action",
+                        "drop",
+                    ])
+                    .status()?;
+                anyhow::ensure!(tc_status.success(), "failed to install classic TC sentinel");
+                client.send_to(b"later-hook", direct_dst).await?;
+                anyhow::ensure!(
+                    tokio::time::timeout(
+                        Duration::from_millis(25),
+                        server_direct.recv_from(&mut buffer),
+                    )
+                    .await
+                    .is_err(),
+                    "honk terminated the TC chain before a later classifier"
+                );
+                let tc_status = std::process::Command::new("tc")
+                    .args(["filter", "del", "dev", "honk-wan0", "egress", "pref", "1"])
+                    .status()?;
+                anyhow::ensure!(tc_status.success(), "failed to remove classic TC sentinel");
+
+                let proxy_dst = SocketAddr::from(([198, 51, 100, 2], 41002));
+                let proxy_payload = b"\x80proxy-first";
+                client.send_to(proxy_payload, proxy_dst).await?;
+                let (size, proxy_source) = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    server_proxy.recv_from(&mut buffer),
+                )
+                .await??;
+                anyhow::ensure!(&buffer[..size] == proxy_payload);
+                anyhow::ensure!(proxy_source.ip() == "198.51.100.1".parse::<std::net::IpAddr>()?);
+                anyhow::ensure!(
+                    tokio::time::timeout(
+                        Duration::from_millis(250),
+                        server_proxy.recv_from(&mut buffer),
+                    )
+                    .await
+                    .is_err(),
+                    "proxy payload arrived more than once"
+                );
+                server_proxy.send_to(b"proxy-reply", proxy_source).await?;
+                let (size, reply_source) =
+                    tokio::time::timeout(Duration::from_secs(3), client.recv_from(&mut buffer))
+                        .await??;
+                anyhow::ensure!(&buffer[..size] == b"proxy-reply");
+                anyhow::ensure!(reply_source == proxy_dst);
+                anyhow::ensure!(
+                    tokio::time::timeout(
+                        Duration::from_millis(250),
+                        client.recv_from(&mut buffer),
+                    )
+                    .await
+                    .is_err(),
+                    "proxy reply arrived more than once"
+                );
+                let proxy_stats = control.stats.udp_snapshot().nfqueue;
+                anyhow::ensure!(proxy_stats.proxy_copied == 1);
+                anyhow::ensure!(proxy_stats.proxy_dropped == 1);
+                anyhow::ensure!(removal_fatal_rx.try_recv().is_err());
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+
+            if let Some(flags) = control.datapath_flags.as_ref() {
+                let _ = flags.fence_nfqueue().await;
+            }
+            let _ = control.ebpf.write().await.set_datapath_ready(false);
+            nfqueue.begin_pending_drain().await;
+            let service_shutdown = nfqueue.shutdown_service().await;
+            let pending_shutdown = nfqueue.finish_pending_drain().await;
+            control.pending_udp_verdicts = None;
+            let drain = Arc::clone(&control.drain_tracker);
+            let datapath_shutdown = control
+                .shutdown_datapath(&drain, &mut removal_task, None)
+                .await;
+            if let Some(flags) = control.datapath_flags.as_ref() {
+                let _ = flags.disable().await;
+            }
+            let backend_shutdown = control.finalize_shutdown().await;
+            let _ = std::fs::remove_file(pin_root.join(crate::ebpf::UDP_DECISION_SEQUENCE_MAP));
+            let _ = std::fs::remove_dir(&pin_root);
+
+            exercise?;
+            service_shutdown?;
+            pending_shutdown?;
+            anyhow::ensure!(
+                control
+                    .stats
+                    .udp_snapshot()
+                    .nfqueue
+                    .kernel_stats_read_errors
+                    == 0,
+                "stats sampler read the queue after teardown"
+            );
+            datapath_shutdown?;
+            backend_shutdown?;
+            Ok(())
+        })
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("NFQUEUE network test thread panicked"))?
+}
+
+#[cfg(feature = "ebpf")]
+struct NfqueueRuntimeFixture {
+    runtime: NfqueueRuntime,
+    listener_fatal_tx: tokio::sync::oneshot::Sender<honk_nfqueue::FatalError>,
+    pending: Arc<nfqueue::PendingUdpVerdicts>,
+    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+}
+
+#[cfg(feature = "ebpf")]
+fn stop_waiting_task(stop: &tokio::sync::watch::Sender<bool>) -> tokio::task::JoinHandle<()> {
+    let mut rx = stop.subscribe();
+    tokio::spawn(async move {
+        let _ = rx.changed().await;
+    })
+}
+
+#[cfg(feature = "ebpf")]
+fn nfqueue_runtime_fixture(
+    watchdog: tokio::task::JoinHandle<()>,
+    ingest_worker: tokio::task::JoinHandle<()>,
+    stats_sampler: tokio::task::JoinHandle<()>,
+    stop: tokio::sync::watch::Sender<bool>,
+) -> NfqueueRuntimeFixture {
+    let stats = Arc::new(StatsManager::new());
+    let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
+        crate::ebpf::mock::MockEbpfBackend::new(),
+    )));
+    let (pending, pending_fatal) = nfqueue::PendingUdpVerdicts::new(
+        Arc::clone(&ebpf),
+        Arc::new(UdpEndpointPool::new()),
+        Arc::clone(&stats),
+    );
+    let pending = Arc::new(pending);
+    let (listener_fatal_tx, listener_fatal) =
+        tokio::sync::oneshot::channel::<honk_nfqueue::FatalError>();
+    let start = tokio::time::Instant::now() + Duration::from_secs(3600);
+    let token_backstop = tokio::time::interval_at(start, Duration::from_secs(3600));
+    let runtime = NfqueueRuntime {
+        service: None,
+        listener_fatal,
+        pending_fatal,
+        stats,
+        pending: Arc::clone(&pending),
+        stop,
+        watchdog: Some(watchdog),
+        ingest_worker: Some(ingest_worker),
+        stats_sampler: Some(stats_sampler),
+        token_backstop,
+        token_retry: NfqueueTokenRetryBackoff::default(),
+        sequence_ready: true,
+    };
+    NfqueueRuntimeFixture {
+        runtime,
+        listener_fatal_tx,
+        pending,
+        ebpf,
+    }
+}
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+async fn nfqueue_watchdog_exit_completes_shutdown_without_double_join() {
+    let (stop, _) = tokio::sync::watch::channel(false);
+    let mut fixture = nfqueue_runtime_fixture(
+        tokio::spawn(async {}),
+        stop_waiting_task(&stop),
+        stop_waiting_task(&stop),
+        stop,
+    );
+    tokio::task::yield_now().await;
+    let NfqueueRuntimeEvent::Fatal(error) = fixture.runtime.next_event(&fixture.ebpf).await else {
+        panic!("watchdog exit must be fatal");
+    };
+    assert!(matches!(
+        error.downcast_ref::<NfqueueRuntimeFatal>(),
+        Some(NfqueueRuntimeFatal::Watchdog(_))
+    ));
+    assert!(fixture.runtime.watchdog.is_none());
+    fixture
+        .runtime
+        .finish_pending_drain()
+        .await
+        .expect("shutdown after watchdog exit");
+    assert!(fixture.pending.is_empty());
+    assert!(!fixture.listener_fatal_tx.is_closed());
+}
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+async fn nfqueue_ingest_actor_exit_completes_shutdown_without_double_join() {
+    let (stop, _) = tokio::sync::watch::channel(false);
+    let mut fixture = nfqueue_runtime_fixture(
+        stop_waiting_task(&stop),
+        tokio::spawn(async {}),
+        stop_waiting_task(&stop),
+        stop,
+    );
+    tokio::task::yield_now().await;
+    let NfqueueRuntimeEvent::Fatal(error) = fixture.runtime.next_event(&fixture.ebpf).await else {
+        panic!("ingest actor exit must be fatal");
+    };
+    assert!(matches!(
+        error.downcast_ref::<NfqueueRuntimeFatal>(),
+        Some(NfqueueRuntimeFatal::IngestActor(_))
+    ));
+    assert!(fixture.runtime.ingest_worker.is_none());
+    fixture
+        .runtime
+        .finish_pending_drain()
+        .await
+        .expect("shutdown after ingest actor exit");
+    assert!(fixture.pending.is_empty());
+    assert!(!fixture.listener_fatal_tx.is_closed());
+}
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+async fn nfqueue_stats_sampler_exit_completes_shutdown_without_double_join() {
+    let (stop, _) = tokio::sync::watch::channel(false);
+    let mut fixture = nfqueue_runtime_fixture(
+        stop_waiting_task(&stop),
+        stop_waiting_task(&stop),
+        tokio::spawn(async {}),
+        stop,
+    );
+    tokio::task::yield_now().await;
+    let NfqueueRuntimeEvent::Fatal(error) = fixture.runtime.next_event(&fixture.ebpf).await else {
+        panic!("stats sampler exit must be fatal");
+    };
+    assert!(matches!(
+        error.downcast_ref::<NfqueueRuntimeFatal>(),
+        Some(NfqueueRuntimeFatal::StatsSampler(_))
+    ));
+    assert!(fixture.runtime.stats_sampler.is_none());
+    fixture
+        .runtime
+        .finish_pending_drain()
+        .await
+        .expect("shutdown after stats sampler exit");
+    assert!(fixture.pending.is_empty());
+    assert!(!fixture.listener_fatal_tx.is_closed());
+}
+
+/// A failed authoritative URLTest pick is retried once with the re-planned
+/// replacement: node a refuses every dial, so the client flow must succeed
+/// through b (invisible to the client) and a must end failure-demoted.
+#[tokio::test]
+async fn tcp_authoritative_dial_failure_retries_with_replacement() -> anyhow::Result<()> {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Echo listener: the FIRST accepted socket is the client flow handed to
+    // serve_connection (its local_addr is the flow's original destination);
+    // every later socket is the proxy's relayed connection and gets echoed.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let target = listener.local_addr()?;
+    let (flow_tx, flow_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut flow_tx = Some(flow_tx);
+        while let Ok((mut stream, peer)) = listener.accept().await {
+            if let Some(tx) = flow_tx.take() {
+                let _ = tx.send((stream, peer));
+                continue;
+            }
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    // Minimal relaying SOCKS5 server: no auth, CONNECT to the requested
+    // target, then pipe both ways.
+    let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let socks_addr = socks_listener.local_addr()?;
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = socks_listener.accept().await {
+            tokio::spawn(async move {
+                let mut head = [0u8; 2];
+                if stream.read_exact(&mut head).await.is_err() || head[0] != 0x05 {
+                    return;
+                }
+                let mut methods = vec![0u8; head[1] as usize];
+                if stream.read_exact(&mut methods).await.is_err() {
+                    return;
+                }
+                if stream.write_all(&[0x05, 0x00]).await.is_err() {
+                    return;
+                }
+                let mut req = [0u8; 4];
+                if stream.read_exact(&mut req).await.is_err() || req[1] != 0x01 {
+                    return;
+                }
+                let target = match req[3] {
+                    0x01 => {
+                        let mut rest = [0u8; 6];
+                        if stream.read_exact(&mut rest).await.is_err() {
+                            return;
+                        }
+                        SocketAddr::new(
+                            IpAddr::V4(Ipv4Addr::new(rest[0], rest[1], rest[2], rest[3])),
+                            u16::from_be_bytes([rest[4], rest[5]]),
+                        )
+                    }
+                    // The test dials only IPv4 literals.
+                    _ => return,
+                };
+                let Ok(mut upstream) = tokio::net::TcpStream::connect(target).await else {
+                    return;
+                };
+                let _ = stream
+                    .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await;
+                let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+            });
+        }
+    });
+
+    let socks_node = |name: &str, port: u16| {
+        let mut node = Node {
+            name: name.into(),
+            protocol: honk_config::types::NodeProtocol::Socks5,
+            address: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        node
+    };
+    let node_a = socks_node("a", 1); // 127.0.0.1:1 — connection refused
+    let node_b = socks_node("b", socks_addr.port());
+    let group = Group {
+        name: "proxy".into(),
+        policy: honk_config::group::GroupPolicy::URLTest,
+        nodes: vec![node_a.id, node_b.id],
+        ..Default::default()
+    };
+    let config = udp_test_config("proxy", vec![node_a.clone(), node_b.clone()], vec![group]);
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
+    let handle = ControlPlane::new(
+        config,
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        router,
+        Arc::new(honk_outbound::proxy::ProxyRegistry::default_resolver().unwrap()),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
+        udp_test_forwarder(),
+    )
+    .unwrap()
+    .spawn_handle();
+
+    // Warm URLTest measurements: a (1ms) wins over b (50ms).
+    handle.alive_set.record_probe_latency(
+        node_a.id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(1),
+    );
+    handle.alive_set.record_probe_latency(
+        node_b.id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(50),
+    );
+    {
+        let gm = handle.group_manager.read().clone();
+        let plan = gm.selection_plan_for_domain("proxy", ProbeDomain::Tcp, IpVersion::V4);
+        assert_eq!(plan.nodes.first().map(|n| n.name.as_str()), Some("a"));
+    }
+
+    let mut client = tokio::net::TcpStream::connect(target).await?;
+    let (flow_stream, client_addr) = flow_rx.await.expect("listener hands the flow over");
+    // serve_connection adopts only flows with kernel conn-state; seed the
+    // mock backend for this tuple.
+    let tuples = build_tuples_key(
+        target.ip(),
+        target.port(),
+        client_addr.ip(),
+        client_addr.port(),
+        6,
+    );
+    handle.ebpf.write().await.tcp_conn_state_store(
+        &tuples,
+        &honk_ebpf_common::conn::ConnState {
+            state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
+            last_seen_ns: 0,
+            ..Default::default()
+        },
+    )?;
+    let serve = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.serve_connection(flow_stream, client_addr).await })
+    };
+
+    let payload = b"retry-with-replacement";
+    client.write_all(payload).await?;
+    let mut echoed = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut echoed)).await??;
+    assert_eq!(
+        echoed, payload,
+        "the flow must succeed through the replacement"
+    );
+    serve.abort();
+
+    assert!(
+        handle
+            .alive_set
+            .is_failure_demoted(node_a.id, ProbeDomain::Tcp, IpVersion::V4),
+        "the refused node must carry a failure strike"
+    );
+    assert!(
+        !handle
+            .alive_set
+            .is_failure_demoted(node_b.id, ProbeDomain::Tcp, IpVersion::V4),
+        "the replacement node must stay clean"
+    );
+    Ok(())
 }

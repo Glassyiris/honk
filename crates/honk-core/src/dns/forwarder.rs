@@ -6,6 +6,7 @@
 //! and returns the result.  It also supports background prefetch to
 //! warm the cache for frequently-accessed domains.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -76,7 +77,7 @@ enum AsIsExchangeError {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ResolveMode {
     Strict,
     Compatibility,
@@ -93,6 +94,7 @@ pub struct DnsForwarder {
     engine: Arc<OnceCell<DnsEngine>>,
     pub(crate) routing: Arc<DnsRouter>,
     pub(crate) strategy: DnsStrategy,
+    hosts: Option<Arc<hosts::HostsFile>>,
     /// When false, skip positive/negative cache lookups and inserts
     /// (`dns.optimistic_cache` / `cache.enabled`).
     pub(crate) cache_enabled: bool,
@@ -121,6 +123,7 @@ impl DnsForwarder {
             engine: Arc::new(OnceCell::new()),
             routing,
             strategy: DnsStrategy::default(),
+            hosts: None,
             cache_enabled: true,
             // 0 = keep answer min TTL until `with_cache_ttl` is applied from config.
             cache_ttl: 0,
@@ -174,6 +177,28 @@ impl DnsForwarder {
         Ok(self.with_policy_id(policy_id))
     }
 
+    pub(crate) fn with_hosts_from_config(self, config: &DnsConfig) -> anyhow::Result<Self> {
+        self.with_hosts_file(config.use_host, hosts::SYSTEM_HOSTS_PATH)
+    }
+
+    fn with_hosts_file(mut self, enabled: bool, path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        if !enabled {
+            self.hosts = None;
+            return Ok(self);
+        }
+        let path = path.as_ref();
+        let hosts = hosts::HostsFile::load(path)
+            .with_context(|| format!("failed to load DNS hosts file {}", path.display()))?;
+        tracing::info!(
+            path = %path.display(),
+            hostnames = hosts.len(),
+            addresses = hosts.address_count(),
+            "Loaded DNS hosts snapshot"
+        );
+        self.hosts = Some(Arc::new(hosts));
+        Ok(self)
+    }
+
     /// Return a clone of the underlying cache Arc.
     pub fn cache(&self) -> Arc<Mutex<DnsCache>> {
         self.cache.clone()
@@ -203,6 +228,7 @@ impl DnsForwarder {
             engine: Arc::clone(&self.engine),
             routing: Arc::clone(&self.routing),
             strategy: self.strategy.clone(),
+            hosts: self.hosts.clone(),
             cache_enabled: self.cache_enabled,
             cache_ttl: self.cache_ttl,
             policy_id: self.policy_id.clone(),
@@ -218,6 +244,7 @@ impl DnsForwarder {
 }
 
 mod exchange;
+mod hosts;
 mod message {
     use crate::dns::query::{NameParseState, parse_name};
     use std::net::{IpAddr, SocketAddr};
@@ -314,6 +341,8 @@ mod message {
 mod prefetch;
 mod resolution;
 mod response {
+    use std::net::IpAddr;
+
     use super::message::extract_answer_ips;
     use crate::dns::query::QueryContext;
     use crate::dns::response::dns_error_flags;
@@ -355,16 +384,55 @@ mod response {
 
     /// Build a NODATA response while preserving the exact question bytes.
     pub(crate) fn make_empty_response(raw_query: &[u8], query: &QueryContext) -> Vec<u8> {
+        make_address_response(raw_query, query, &[], 0)
+    }
+
+    pub(super) fn make_address_response(
+        raw_query: &[u8],
+        query: &QueryContext,
+        addresses: &[IpAddr],
+        ttl: u32,
+    ) -> Vec<u8> {
         let question_end = query
             .question_offsets()
             .map(|offsets| offsets.end())
             .unwrap_or(12)
             .min(raw_query.len());
-        let mut response = raw_query[..question_end].to_vec();
+        let mut response = Vec::with_capacity(
+            question_end
+                .saturating_add(addresses.len().saturating_mul(28))
+                .saturating_add(11),
+        );
+        response.extend_from_slice(&raw_query[..question_end]);
         response.resize(response.len().max(12), 0);
         response[2..4].copy_from_slice(&dns_error_flags(raw_query, 0).to_be_bytes());
         response[4..6].copy_from_slice(&1u16.to_be_bytes());
         response[6..12].fill(0);
+
+        let qtype = query.qtype().map(|value| value.get()).unwrap_or_default();
+        let question_offset = query
+            .question_offsets()
+            .and_then(|offsets| u16::try_from(offsets.start()).ok())
+            .filter(|offset| *offset <= 0x3fff)
+            .unwrap_or(12);
+        let name_pointer = (0xc000 | question_offset).to_be_bytes();
+        let mut answer_count = 0u16;
+        for address in addresses {
+            if answer_count == u16::MAX {
+                break;
+            }
+            match (qtype, address) {
+                (1, IpAddr::V4(address)) => {
+                    append_address_record(&mut response, name_pointer, 1, ttl, &address.octets());
+                }
+                (28, IpAddr::V6(address)) => {
+                    append_address_record(&mut response, name_pointer, 28, ttl, &address.octets());
+                }
+                _ => continue,
+            }
+            answer_count += 1;
+        }
+        response[6..8].copy_from_slice(&answer_count.to_be_bytes());
 
         if let Some(edns) = query.edns().filter(|edns| edns.version() == 0) {
             response[10..12].copy_from_slice(&1u16.to_be_bytes());
@@ -376,19 +444,34 @@ mod response {
         }
         response
     }
+
+    fn append_address_record(
+        response: &mut Vec<u8>,
+        name_pointer: [u8; 2],
+        record_type: u16,
+        ttl: u32,
+        address: &[u8],
+    ) {
+        response.extend_from_slice(&name_pointer);
+        response.extend_from_slice(&record_type.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&ttl.to_be_bytes());
+        let rdlength = if record_type == 1 { 4u16 } else { 16u16 };
+        response.extend_from_slice(&rdlength.to_be_bytes());
+        response.extend_from_slice(address);
+    }
 }
 mod strategy {
     use anyhow::Context;
     use bytes::Bytes;
-    use std::net::SocketAddr;
 
     use tracing::debug;
 
-    use crate::dns::query::QueryContext;
+    use crate::dns::query::{DnsRequestMeta, QueryContext};
     use honk_config::dns::DnsStrategy;
 
-    use super::DnsForwarder;
     use super::response::{make_empty_response, qtype_name, response_has_family_ips};
+    use super::{DnsForwarder, ResolveMode};
 
     impl DnsForwarder {
         /// Prefer-mode strategy (sing-box / dae `ipversion_prefer` semantics):
@@ -401,7 +484,8 @@ mod strategy {
             query: &QueryContext,
             qtype: u16,
             response: Bytes,
-            original_dst: Option<SocketAddr>,
+            metadata: DnsRequestMeta,
+            mode: ResolveMode,
         ) -> anyhow::Result<Bytes> {
             let preferred = match (&self.strategy, qtype) {
                 (DnsStrategy::PreferIpv4, 28) => 1u16,
@@ -409,7 +493,7 @@ mod strategy {
                 _ => return Ok(response),
             };
             if self
-                .preferred_family_has_answers(raw_query, query, preferred, original_dst)
+                .preferred_family_has_answers(raw_query, query, preferred, metadata, mode)
                 .await?
             {
                 debug!(
@@ -430,7 +514,8 @@ mod strategy {
             raw_query: &[u8],
             query: &QueryContext,
             preferred_qtype: u16,
-            original_dst: Option<SocketAddr>,
+            metadata: DnsRequestMeta,
+            mode: ResolveMode,
         ) -> anyhow::Result<bool> {
             let offsets = query
                 .question_offsets()
@@ -448,14 +533,16 @@ mod strategy {
 
             // Boxed: breaks the async recursion cycle through resolve_with_context
             // (the sibling uses the preferred qtype, so it never re-enters here).
-            let sibling = Box::pin(self.resolve_with_context_and_profile(
+            let sibling = Box::pin(self.resolve_inner(
                 &sibling_query,
-                original_dst,
+                metadata,
                 query.ingress(),
+                false,
+                mode,
             ))
             .await;
             Ok(match sibling {
-                Ok(resp) => response_has_family_ips(&resp, preferred_qtype),
+                Ok(outcome) => response_has_family_ips(outcome.rendered(), preferred_qtype),
                 Err(_) => {
                     debug!(
                         error_kind = "preferred_family_probe_failed",
@@ -485,7 +572,7 @@ mod tests {
     use std::net::{IpAddr, SocketAddr};
     use std::time::Duration;
 
-    use crate::dns::query::IngressProfile;
+    use crate::dns::query::{DnsRequestMeta, IngressProfile};
 
     include!("forwarder/tests/fixtures.rs");
     include!("forwarder/tests/service_flush.rs");

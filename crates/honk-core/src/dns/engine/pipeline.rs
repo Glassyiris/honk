@@ -1,5 +1,3 @@
-use std::net::SocketAddr;
-
 use tracing::debug;
 
 use super::{DnsEngine, PreparedQuery};
@@ -7,8 +5,8 @@ use crate::dns::cache::{CacheKey, OperationKind, PublicationEpoch};
 use crate::dns::forwarder::{DnsForwardError, DnsForwarder, ResolveMode, is_filtered_qtype};
 use crate::dns::outcome::{DnsOutcome, OutcomeStatus};
 use crate::dns::planner::{RequestPlan, RequestScope, UpstreamTag};
-use crate::dns::query::IngressProfile;
-use crate::dns::singleflight::{FlightLeader, FlightRole};
+use crate::dns::query::{DnsRequestMeta, IngressProfile};
+use crate::dns::singleflight::{FlightKey, FlightLeader, FlightRole};
 
 mod cache;
 mod flight {
@@ -109,9 +107,8 @@ pub(super) struct ExecutionContext<'a> {
     pub(super) engine: &'a DnsEngine,
     pub(super) prepared: &'a PreparedQuery,
     pub(super) raw_query: &'a [u8],
-    pub(super) original_dst: Option<SocketAddr>,
+    pub(super) metadata: DnsRequestMeta,
     pub(super) cache_key: CacheKey,
-    pub(super) refresh_key: CacheKey,
     pub(super) logical_upstream: UpstreamTag,
     pub(super) request_scope: RequestScope,
     pub(super) reuse_eligible: bool,
@@ -139,7 +136,7 @@ impl ResolveExecution {
 pub(crate) async fn resolve(
     forwarder: &DnsForwarder,
     raw_query: &[u8],
-    original_dst: Option<SocketAddr>,
+    metadata: DnsRequestMeta,
     ingress: IngressProfile,
     bypass_cache_read: bool,
     mode: ResolveMode,
@@ -148,7 +145,7 @@ pub(crate) async fn resolve(
     resolve_with_owner(
         forwarder,
         raw_query,
-        original_dst,
+        metadata,
         ingress,
         bypass_cache_read,
         mode,
@@ -160,7 +157,7 @@ pub(crate) async fn resolve(
 pub(crate) async fn resolve_with_owner(
     forwarder: &DnsForwarder,
     raw_query: &[u8],
-    original_dst: Option<SocketAddr>,
+    metadata: DnsRequestMeta,
     ingress: IngressProfile,
     bypass_cache_read: bool,
     mode: ResolveMode,
@@ -172,13 +169,15 @@ pub(crate) async fn resolve_with_owner(
     } = execution;
     debug!("DNS forwarder: resolving {} bytes", raw_query.len());
     let engine = forwarder.engine().await?;
-    let prepared = match mode {
-        ResolveMode::Strict => engine.prepare(raw_query, original_dst, ingress)?,
-        ResolveMode::Compatibility => {
-            engine.prepare_compatibility(raw_query, original_dst, ingress)?
-        }
-    };
-    let qtype = prepared.qtype();
+    let parsed = DnsEngine::parse_query(raw_query, ingress)?;
+    let qtype = parsed.qtype();
+    if !is_filtered_qtype(qtype, &forwarder.strategy)
+        && let Some(outcome) = forwarder.resolve_hosts(engine, &parsed, raw_query, mode)?
+    {
+        return Ok(outcome);
+    }
+    let prepared =
+        engine.prepare_parsed(parsed, metadata, matches!(mode, ResolveMode::Compatibility))?;
     let reuse_eligible = prepared.is_cacheable() && prepared.is_coalescable();
 
     if is_filtered_qtype(qtype, &forwarder.strategy) {
@@ -204,15 +203,13 @@ pub(crate) async fn resolve_with_owner(
 
     let (logical_upstream, request_scope) = request_exchange(&prepared)?;
     let resolve_key = prepared.cache_key(request_scope.clone(), OperationKind::Resolve);
-    let refresh_key = resolve_key.with_operation(OperationKind::Refresh);
     let context = ExecutionContext {
         forwarder,
         engine,
         prepared: &prepared,
         raw_query,
-        original_dst,
+        metadata,
         cache_key: resolve_key,
-        refresh_key,
         logical_upstream,
         request_scope: request_scope.clone(),
         reuse_eligible,
@@ -232,12 +229,17 @@ pub(crate) async fn resolve_with_owner(
         return operation::run_as_leader(owner, &context).await;
     }
 
-    let operation = if bypass_cache_read {
-        OperationKind::Refresh
+    let flight_key = if bypass_cache_read {
+        FlightKey::Refresh(context.cache_key.with_operation(OperationKind::Refresh))
     } else {
-        OperationKind::Resolve
+        FlightKey::resolve(
+            context.cache_key.clone(),
+            mode,
+            &forwarder.strategy,
+            qtype,
+            metadata,
+        )
     };
-    let flight_key = context.cache_key.with_operation(operation);
     let flights = forwarder.cache_service().await.singleflight();
     loop {
         match flights.acquire(flight_key.clone()) {

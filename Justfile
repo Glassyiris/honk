@@ -66,17 +66,13 @@ fmt:
 
 # ── Test ─────────────────────────────────────────────────
 
-# Run all tests (includes known-failing pre-existing tests — see AGENTS.md)
+# Run the full workspace suite.
 test:
     cargo test --all
 
-# CI-equivalent gate: full suite minus the known-failing pre-existing tests
-# (share_link TOML round-trip ×2, config_dae_routing ×1 — see AGENTS.md)
+# CI-equivalent gate: full suite minus the known pre-existing routing failure.
 test-ci:
-    cargo test --workspace --no-fail-fast -- \
-        --skip test_config_toml_round_trip \
-        --skip test_to_file_and_from_file_by_extension \
-        --skip test_routing_with_config_dae
+    cargo test --workspace --no-fail-fast -- --skip test_routing_with_config_dae
 
 # Run core + outbound tests
 test-core:
@@ -90,11 +86,11 @@ test-config:
 test-ebpf:
     cargo test -p honk-ebpf-common
 
-# Root-gated netlink/netns integration tests (NFQUEUE + veth/route/rule roundtrip)
+# Root-gated netlink/netns integration tests (NFQUEUE + netkit/veth/route/rule roundtrip)
 test-netns:
     cargo test -p honk-nfqueue --lib nfqueue_service_isolated_netns_kernel_contract -- --ignored --test-threads=1
     cargo test -p honk-core --features ebpf --lib netns -- --ignored --test-threads=1
-    cargo test -p honk-core --features ebpf --lib link_lifecycle -- --ignored --test-threads=1
+    cargo test -p honk-core --features ebpf --lib ebpf::real::tests -- --ignored --test-threads=1
 
 # Full honk-outbound gate after outbound changes (fmt + clippy + config & outbound suites)
 outbound-ci:
@@ -177,7 +173,7 @@ clean-all:
     @echo "=== Stopping honk-core ==="
     @pkill honk-core 2>/dev/null || true
     @sleep 1
-    @echo "=== Removing veth + netns ==="
+    @echo "=== Removing link + netns ==="
     @ip link del dae0 2>/dev/null || true
     @ip netns del daens 2>/dev/null || true
     @echo "=== Cleaning ephemeral BPF maps (preserving UDP_DECISION_SEQUENCE) ==="
