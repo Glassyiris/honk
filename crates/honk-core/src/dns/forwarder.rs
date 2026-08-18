@@ -193,12 +193,7 @@ impl DnsForwarder {
             .with_context(|| format!("failed to load DNS hosts file {}", path.display()))?;
             hosts.merge(loaded);
         }
-        tracing::info!(
-            sources = config.hosts.len(),
-            hostnames = hosts.len(),
-            addresses = hosts.address_count(),
-            "Loaded DNS hosts snapshot"
-        );
+        tracing::info!(sources = config.hosts.len(), "Loaded DNS hosts snapshot");
         self.hosts = Some(Arc::new(hosts));
         Ok(self)
     }

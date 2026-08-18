@@ -704,13 +704,6 @@ fn parse_kv_pairs(body: &str) -> HashMap<String, String> {
         .collect()
 }
 
-fn parse_kv_values<'a>(body: &'a str, wanted: &'a str) -> impl Iterator<Item = &'a str> + 'a {
-    body.lines()
-        .filter_map(parse_kv_pair)
-        .filter(move |(key, _)| *key == wanted)
-        .map(|(_, value)| value)
-}
-
 fn strip_unquoted_comment(line: &str) -> &str {
     let mut quote = None;
     let mut escaped = false;
@@ -883,8 +876,10 @@ fn parse_dns_section(section: &Section) -> Result<DnsConfig, crate::ConfigError>
             "dns.hosts_file was removed; use one or more use_host paths".into(),
         ));
     }
-    for source in parse_kv_values(dns_body, "use_host") {
-        crate::dns::push_host_source(&mut cfg.hosts, source);
+    for (key, source) in dns_body.lines().filter_map(parse_kv_pair) {
+        if key == "use_host" {
+            crate::dns::push_host_source(&mut cfg.hosts, source);
+        }
     }
     if let Some(value) = kv.get("client_subnet") {
         cfg.client_subnet.clone_from(value);

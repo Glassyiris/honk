@@ -59,9 +59,7 @@ impl HostsFile {
     }
 
     pub(super) fn merge(&mut self, other: Self) {
-        for (hostname, addresses) in other.entries {
-            self.entries.insert(hostname, addresses);
-        }
+        self.entries.extend(other.entries);
         for rule in other.rules {
             self.insert_rule(rule.matcher, rule.addresses);
         }
@@ -157,19 +155,6 @@ impl HostsFile {
         } else {
             self.rules.push(HostsRule { matcher, addresses });
         }
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.entries.len() + self.rules.len()
-    }
-
-    pub(super) fn address_count(&self) -> usize {
-        self.entries.values().map(Vec::len).sum::<usize>()
-            + self
-                .rules
-                .iter()
-                .map(|rule| rule.addresses.len())
-                .sum::<usize>()
     }
 
     fn addresses_for(&self, domain: &str) -> Option<&[IpAddr]> {
@@ -336,8 +321,6 @@ mod tests {
              192.0.2.1 alias alias\n",
         );
 
-        assert_eq!(hosts.len(), 2);
-        assert_eq!(hosts.address_count(), 4);
         assert_eq!(
             hosts.entries.get("localhost"),
             Some(&vec![
@@ -420,8 +403,6 @@ mod tests {
             hosts.addresses_for("replace.test"),
             Some([v4(7)].as_slice())
         );
-        assert_eq!(hosts.len(), 6);
-        assert_eq!(hosts.address_count(), 7);
 
         let raw_regexp = HostsFile::parse_rules("regexp:^API\\.TEST$ 192.0.2.8\n").unwrap();
         assert_eq!(raw_regexp.addresses_for("api.test"), None);
