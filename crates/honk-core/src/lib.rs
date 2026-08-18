@@ -1007,6 +1007,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         info!("Skipping eBPF datapath setup (mock mode)");
     }
 
+    dns::ecs::resolve_client_subnet(&mut config.dns).await;
+    let dns_client_subnet = config
+        .dns
+        .effective_client_subnet()
+        .map_err(anyhow::Error::new)?;
+
     let router = routing::Router::new(&config.routing.rules, &config.routing.default_outbound)?;
     info!("Router ready with {} compiled routes", router.route_count());
 
@@ -1033,6 +1039,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             honk_outbound::bootstrap::BootstrapResolver::parse(&config.global.bootstrap_resolver),
             config.dns.strategy.clone(),
         )?
+        .with_client_subnet(dns_client_subnet)
         .with_timeouts(
             std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
             std::time::Duration::from_millis(config.global.connect_timeout_ms),

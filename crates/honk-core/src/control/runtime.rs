@@ -596,20 +596,32 @@ impl ControlPlane {
                             let _ = self.apply_runtime_config(new_config, &drain).await;
                         }
                         Some(ControlCommand::NetworkChanged) => {
-                            let new_config = {
-                                let current = self.config.read().await;
-                                let mut next = current.clone();
-                                next.ensure_local_direct_rules().then_some(next)
-                            };
+                            let current = self.config.read().await.clone();
+                            let mut next = current.clone();
+                            let routing_changed = next.ensure_local_direct_rules();
+                            let client_subnet_auto = matches!(
+                                current.dns.client_subnet_mode(),
+                                Ok(Some(honk_config::dns::DnsClientSubnet::Auto { .. }))
+                            );
+                            if client_subnet_auto {
+                                crate::dns::ecs::resolve_client_subnet(&mut next.dns).await;
+                            }
+                            let client_subnet_changed =
+                                next.dns.resolved_client_subnet != current.dns.resolved_client_subnet;
+                            let new_config = (routing_changed || client_subnet_changed).then_some(next);
                             let applied = match new_config {
                                 Some(new_config) => {
-                                    info!("refreshing local direct rules after network change");
-                                    self.apply_runtime_config(new_config, &drain).await
+                                    info!(
+                                        routing_changed,
+                                        client_subnet_changed,
+                                        "refreshing runtime after network change"
+                                    );
+                                    self.apply_resolved_runtime_config(new_config, &drain).await
                                 }
                                 None => true,
                             };
                             if !applied {
-                                warn!("network-triggered routing refresh rejected");
+                                warn!("network-triggered runtime refresh rejected");
                                 if self
                                     .network_refresh_retry
                                     .as_ref()

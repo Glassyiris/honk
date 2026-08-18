@@ -65,6 +65,11 @@ pub enum PolicyError {
     EmptyName { field: &'static str },
     #[error("DNS policy contains invalid endpoint host '{value}'")]
     InvalidHost { value: String },
+    #[error("DNS policy contains invalid client subnet: {source}")]
+    InvalidClientSubnet {
+        #[source]
+        source: honk_config::dns::DnsClientSubnetError,
+    },
     #[error("DNS policy contains invalid CIDR '{value}'")]
     InvalidCidr { value: String },
     #[error("DNS policy contains invalid regex '{value}': {source}")]

@@ -573,6 +573,53 @@ async fn valid_reload_commits() {
 }
 
 #[tokio::test]
+async fn client_subnet_reload_injects_upstream_query() {
+    let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let cp = test_cp().await;
+    let mut replacement = Config::default();
+    replacement.dns.client_subnet = "198.51.100.9/24".into();
+    replacement.dns.cache.enabled = false;
+    replacement.dns.upstream[0].address = upstream.local_addr().unwrap().to_string();
+
+    assert!(
+        cp.apply_runtime_config(replacement, &DrainTracker::new())
+            .await
+    );
+    let config = cp.config_handle().read().await.clone();
+    assert_eq!(
+        config.dns.effective_client_subnet().unwrap(),
+        Some("198.51.100.0/24".parse().unwrap())
+    );
+    let expected_policy = crate::dns::policy::PolicyId::from_config(&config.dns).unwrap();
+    let runtime = cp.dns_controller.runtime_provider().acquire();
+    assert_eq!(
+        runtime.runtime().forwarder().policy_id.as_ref(),
+        Some(&expected_policy)
+    );
+    let forwarder = Arc::clone(runtime.runtime().forwarder());
+    drop(runtime);
+
+    let query = crate::dns::forwarder::build_dns_query("example.com", 1);
+    let resolve = tokio::spawn(async move { forwarder.resolve(&query).await });
+    let mut wire = [0_u8; 512];
+    let (length, peer) =
+        tokio::time::timeout(Duration::from_secs(1), upstream.recv_from(&mut wire))
+            .await
+            .expect("reloaded upstream did not receive query")
+            .unwrap();
+    assert_eq!(
+        &wire[length - 11..length],
+        &[0, 8, 0, 7, 0, 1, 24, 0, 198, 51, 100]
+    );
+
+    let mut response = wire[..length].to_vec();
+    response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+    upstream.send_to(&response, peer).await.unwrap();
+    let response = resolve.await.unwrap().unwrap();
+    assert_eq!(&response[10..12], &[0, 0]);
+}
+
+#[tokio::test]
 async fn routing_push_failure_replays_old_plan_and_keeps_userspace_generation() {
     let cp = test_cp().await;
     cp.ebpf

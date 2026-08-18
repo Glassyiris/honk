@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -7,7 +8,9 @@ use tracing::debug;
 use super::UpstreamPool;
 use super::admission::AdmissionPermit;
 use super::entries::UpstreamEntry;
+use crate::dns::ecs::EcsQuery;
 use crate::dns::forwarder::DnsUpstreamPool;
+
 fn udp_attempt_addresses(
     addresses: &[SocketAddr],
     current: Option<SocketAddr>,
@@ -75,20 +78,33 @@ impl UpstreamPool {
         Ok(admission)
     }
 
+    fn prepare_generated_ecs(&self, raw_query: &[u8]) -> Option<EcsQuery> {
+        let subnet = self.client_subnet?;
+        match EcsQuery::prepare(raw_query, subnet) {
+            Ok(injected) => injected,
+            Err(error) => {
+                debug!(%error, "DNS query is not eligible for configured ECS injection");
+                None
+            }
+        }
+    }
+
     async fn exchange_direct_udp<'a>(
         &'a self,
         entry: &UpstreamEntry,
         address: SocketAddr,
         raw_query: &[u8],
-    ) -> anyhow::Result<(Vec<u8>, AdmissionPermit<'a>)> {
+    ) -> anyhow::Result<(Vec<u8>, AdmissionPermit<'a>, Option<EcsQuery>)> {
         let admission = self.admit_query().await?;
+        let injected = self.prepare_generated_ecs(raw_query);
+        let effective_query = injected.as_ref().map_or(raw_query, EcsQuery::wire);
         let response = self
             .udp_pool(entry, address)
             .await?
-            .exchange(raw_query)
+            .exchange(effective_query)
             .await?;
         entry.udp.lock().mark_current(address);
-        Ok((response, admission))
+        Ok((response, admission, injected))
     }
 
     pub(super) async fn resolve_udp_addrs(
@@ -134,24 +150,32 @@ impl UpstreamPool {
         raw_query: &[u8],
         response: Vec<u8>,
         _admission: AdmissionPermit<'_>,
+        injected: Option<EcsQuery>,
     ) -> anyhow::Result<Vec<u8>> {
-        if response.len() >= 4 && response[2] & 0x02 != 0 {
+        let effective_query = injected.as_ref().map_or(raw_query, EcsQuery::wire);
+        let response = if response.len() >= 4 && response[2] & 0x02 != 0 {
             debug!(
                 "DNS upstream '{}' UDP answer has TC set — retrying over TCP",
                 upstream_name
             );
-            return self
-                .get_transport(entry, None)
+            self.get_transport(entry, None)
                 .await?
-                .exchange(raw_query)
-                .await;
+                .exchange(effective_query)
+                .await?
+        } else {
+            debug!(
+                "DNS upstream '{}' (udp) returned {} bytes",
+                upstream_name,
+                response.len()
+            );
+            response
+        };
+        match injected {
+            Some(injected) => injected
+                .restore_response(response)
+                .context("invalid ECS response from DNS upstream"),
+            None => Ok(response),
         }
-        debug!(
-            "DNS upstream '{}' (udp) returned {} bytes",
-            upstream_name,
-            response.len()
-        );
-        Ok(response)
     }
 
     async fn query_datagram(
@@ -185,7 +209,9 @@ impl UpstreamPool {
                     .await;
             }
             let admission = self.admit_query().await?;
-            match pool.exchange(raw_query).await {
+            let injected = self.prepare_generated_ecs(raw_query);
+            let effective_query = injected.as_ref().map_or(raw_query, EcsQuery::wire);
+            match pool.exchange(effective_query).await {
                 Ok(response) => {
                     entry.udp.lock().mark_current(address);
                     return self
@@ -195,6 +221,7 @@ impl UpstreamPool {
                             raw_query,
                             response,
                             admission,
+                            injected,
                         )
                         .await;
                 }
@@ -228,7 +255,7 @@ impl UpstreamPool {
                     .await;
             }
             match self.exchange_direct_udp(entry, first, raw_query).await {
-                Ok((response, admission)) => {
+                Ok((response, admission, injected)) => {
                     return self
                         .finish_direct_udp_query(
                             upstream_name,
@@ -236,6 +263,7 @@ impl UpstreamPool {
                             raw_query,
                             response,
                             admission,
+                            injected,
                         )
                         .await;
                 }
@@ -263,9 +291,16 @@ impl UpstreamPool {
                 });
         }
         match self.exchange_direct_udp(entry, retry, raw_query).await {
-            Ok((response, admission)) => {
-                self.finish_direct_udp_query(upstream_name, entry, raw_query, response, admission)
-                    .await
+            Ok((response, admission, injected)) => {
+                self.finish_direct_udp_query(
+                    upstream_name,
+                    entry,
+                    raw_query,
+                    response,
+                    admission,
+                    injected,
+                )
+                .await
             }
             Err(error) => Err(anyhow::anyhow!(
                 "UDP DNS failed via {retry}: {error} (first {first}: {first_error})"
@@ -289,6 +324,7 @@ impl DnsUpstreamPool for UpstreamPool {
         if entry.protocol == DnsProtocol::Udp {
             return self.query_datagram(upstream_name, entry, raw_query).await;
         }
+
         let proxy_node = self
             .resolve_dial_leaf(entry)
             .await
@@ -307,10 +343,16 @@ impl DnsUpstreamPool for UpstreamPool {
                 entry.protocol
             );
         }
+        let injected = if proxy_node.is_none() {
+            self.prepare_generated_ecs(raw_query)
+        } else {
+            None
+        };
+        let effective_query = injected.as_ref().map_or(raw_query, EcsQuery::wire);
         let response = self
             .get_transport(entry, proxy_node.as_ref())
             .await?
-            .exchange(raw_query)
+            .exchange(effective_query)
             .await?;
         debug!(
             "DNS upstream '{}' ({:?} {} via {:?}) returned {} bytes",
@@ -323,7 +365,13 @@ impl DnsUpstreamPool for UpstreamPool {
                 .unwrap_or("direct"),
             response.len()
         );
-        Ok(response)
+
+        match injected {
+            Some(injected) => injected
+                .restore_response(response)
+                .context("invalid ECS response from DNS upstream"),
+            None => Ok(response),
+        }
     }
 }
 

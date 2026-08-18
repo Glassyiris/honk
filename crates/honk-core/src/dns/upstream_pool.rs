@@ -260,6 +260,7 @@ pub struct TransportLifecycleStats {
 pub struct UpstreamPool {
     entries: HashMap<String, UpstreamEntry>,
     proxy_registry: Option<Arc<ProxyRegistry>>,
+    client_subnet: Option<ipnet::Ipv4Net>,
     runtime_generation: std::sync::OnceLock<Arc<honk_outbound::runtime::OutboundRuntimeRegistry>>,
     nodes: Vec<Node>,
     groups: Vec<Group>,
@@ -317,6 +318,7 @@ impl UpstreamPool {
         Ok(Self {
             entries: build_entries(upstreams, bootstrap_resolver, strategy)?,
             proxy_registry,
+            client_subnet: None,
             runtime_generation: std::sync::OnceLock::new(),
             nodes,
             groups,
@@ -340,6 +342,11 @@ impl UpstreamPool {
     ) -> Self {
         self.dns_query_timeout = dns_query_timeout;
         self.dns_dial_timeout = dns_dial_timeout;
+        self
+    }
+
+    pub fn with_client_subnet(mut self, client_subnet: Option<ipnet::Ipv4Net>) -> Self {
+        self.client_subnet = client_subnet;
         self
     }
 

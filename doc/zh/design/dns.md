@@ -114,6 +114,8 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 
 复用仅适用于标准单问题 QUERY：没有 answer 或 authority record，且至多一个无 option 的 EDNS-v0 OPT。ECS、COOKIE、任何其他 EDNS option、EDNS-v1、多个 OPT record 或异常 flags 会同时绕过缓存与 singleflight。请求仍使用正常的严格交换路径。
 
+配置生成的 ECS 属于 generation 固定的命名上游 transport policy，而不属于入口身份。有效 IPv4 prefix 会写入 `PolicyId`，原始查询仍作为 cache/singleflight key。上游池仅在接纳后添加 ECS，保留客户端自带的 ECS，校验生成 option 的回显，并在响应分析及缓存发布前移除生成的 EDNS 状态。`asis` 绕过该转换。自动推断会在启动、reload 与网络事件时以事务方式刷新，因此替换 generation 探测和构建期间，活动查询仍使用旧 generation。
+
 ## 缓存与持久化
 
 | 机制 | 不变量 |
@@ -138,6 +140,8 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 | DoH | 一个长生命周期、可复用并发请求的 HTTP/2-only TLS session。 | 支持经代理 TCP 基础 stream。 |
 | DoQ | 一个长生命周期 QUIC connection；每个查询一条双向 stream。 | 仅直连。 |
 | DoH3 | 一个长生命周期 QUIC 与 HTTP/3 session。 | 仅直连。 |
+
+DoQ 与 DoH3 目前仅支持直连，因为它们的客户端会在带 bypass mark 的原生 UDP socket 上创建 quinn endpoint，而 DNS 代理拨号路径当前只提供 boxed TCP 字节流；QUIC 无法运行在这种 stream 上。代理支持需要把所选出站的 `PacketTransport` 适配到 quinn 的 `AsyncUdpSocket` 接口，并保留 datagram 边界、地址元数据、MTU 行为、generation 所有权、重连与关闭语义。在该适配层完成前，选到代理的 DoQ/DoH3 上游会在拨号前失败，而不会静默绕过所选路由；需要代理加密 DNS 时应使用 DoT 或 DoH。
 
 `-> node-or-group` 强制选择一个由 generation 固定的拨号叶子。没有显式目标时，上游 endpoint 经过固定的流量 Router 与组快照。UDP+代理有意使用 TCP-DNS；此策略独立于普通代理 UDP 流量使用的 SOCKS5 RFC 1928 UDP transport。
 

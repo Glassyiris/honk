@@ -114,6 +114,8 @@ A response chain accepted only by compatibility mode—for example, one ending a
 
 Reuse is limited to a standard single-question QUERY with no answer or authority records and at most one option-free EDNS-v0 OPT. ECS, COOKIE, any other EDNS option, EDNS-v1, multiple OPT records, or unusual flags bypass both cache and singleflight. The request still uses the normal strict exchange path.
 
+Configured ECS is a generation-pinned named-upstream transport policy, not ingress identity. The effective IPv4 prefix is included in `PolicyId`; the original query remains the cache/singleflight key. The upstream pool adds ECS only after admission, preserves any client ECS, validates an echoed generated option, and removes generated EDNS state before response analysis and cache publication. `asis` bypasses this transformation. Automatic inference is refreshed transactionally on startup, reload, and network events, so active queries retain their old generation while a replacement is probed and built.
+
 ## Cache and persistence
 
 | Mechanism | Invariant |
@@ -138,6 +140,8 @@ When `store_dns` enables persistence, a bounded actor mirrors retained positive 
 | DoH | One long-lived, multiplexed HTTP/2-only TLS session. | Supported over a proxied TCP base stream. |
 | DoQ | One long-lived QUIC connection; one bidirectional stream per query. | Direct only. |
 | DoH3 | One long-lived QUIC and HTTP/3 session. | Direct only. |
+
+DoQ and DoH3 are direct-only because their clients create a quinn endpoint on a native bypass-marked UDP socket, while the DNS proxy dial path currently provides only a boxed TCP byte stream. QUIC cannot run over that stream. Proxy support requires adapting the selected outbound's `PacketTransport` to quinn's `AsyncUdpSocket` interface while preserving datagram boundaries, address metadata, MTU behavior, generation ownership, reconnects, and shutdown. Until that adapter exists, a proxy-selected DoQ or DoH3 upstream fails before dialing rather than silently bypassing the selected route; use DoT or DoH for proxied encrypted DNS.
 
 `-> node-or-group` forces one generation-pinned dial leaf. Without an explicit target, the upstream endpoint is passed through the pinned traffic router and group snapshot. UDP+proxy deliberately uses TCP-DNS; this policy is separate from the SOCKS5 RFC 1928 UDP transport used by ordinary proxied UDP flows.
 

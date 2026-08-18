@@ -153,6 +153,7 @@ routing {
 
 dns {
     ipversion_prefer: 4
+    # client_subnet: auto  # 可选：为命名上游推断公网路径上的一个 /24。
     upstream {
         direct_dns: 'udp://1.1.1.1:53' -> direct
         proxy_doh: 'https://dns.google/dns-query' -> proxy
@@ -243,6 +244,8 @@ dns {
 `sip(...)` 仅用于 request，将逻辑 DNS 客户端 IP 与主机地址或 CIDR 匹配。透明 53 端口与 `dns.bind` 查询使用 socket peer；代表已接纳 TCP/UDP 流执行的 DNS 查询使用该流的客户端地址。内部、bootstrap、prefetch 与 Clash API 查询没有客户端来源，因此 `sip(...)` 和 `!sip(...)` 都不匹配并继续执行 fallback。带来源的流查询仍没有被拦截 DNS 服务器的原始目的地址，因此选择 `asis` 会 fail closed。
 
 `bind` 留空时仅使用透明 53 端口拦截。独立监听形式都要求显式端口：裸数字 `IP:port`（仅 UDP）、`udp://host:port`、`tcp://host:port` 或 `tcp+udp://host:port`；空 host 表示绑定通配地址。除非有主机防火墙保护 LAN 暴露，否则只绑定 loopback。省略 `ipversion_prefer` 时策略为 `both`，也可设为 `4`/`6` 以同时控制 DNS 结果和 bootstrap 解析出的上游拨号顺序；偏好地址族拨号失败时会回退到另一地址族。
+
+`client_subnet` 默认关闭。需要确定性的 ECS 时写固定 IPv4/CIDR；写 `auto` 则无需 DNS 或 HTTP，把公网路径上的首个公网 hop 推断为 `/24`。自动推断会在 reload 与网络变化时刷新；有界探测失败时不生成 ECS。客户端自带的 ECS 始终优先。启用前请阅读参考文档中的隐私警告。
 
 详见 [DNS 参考](./reference/dns.md)。
 

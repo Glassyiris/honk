@@ -37,6 +37,37 @@ async fn test_udp_query() {
 }
 
 #[tokio::test]
+async fn configured_ecs_is_added_for_direct_route() {
+    let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_address = server.local_addr().unwrap();
+    let server_handle = tokio::spawn(async move {
+        let mut buffer = [0_u8; 512];
+        let (length, source) = server.recv_from(&mut buffer).await.unwrap();
+        let request = buffer[..length].to_vec();
+        let mut response = request.clone();
+        response[2] |= 0x80;
+        server.send_to(&response, source).await.unwrap();
+        request
+    });
+
+    let upstream = DnsUpstream {
+        outbound: Some("direct".into()),
+        ..make_upstream("ecs-direct", &server_address.to_string(), DnsProtocol::Udp)
+    };
+    let pool = UpstreamPool::new(&[upstream], make_router())
+        .unwrap()
+        .with_client_subnet(Some("203.0.113.0/24".parse().unwrap()));
+    let query = mock_dns_query(0x1234);
+    let response = pool.query("ecs-direct", &query).await.unwrap();
+
+    let seen = server_handle.await.unwrap();
+    assert!(seen.ends_with(&[0, 8, 0, 7, 0, 1, 24, 0, 203, 0, 113]));
+    let mut expected = query;
+    expected[2] |= 0x80;
+    assert_eq!(response, expected);
+}
+
+#[tokio::test]
 async fn udp_prefer_ipv6_falls_back_to_ipv4_and_reuses_winner() {
     let upstream_server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let upstream_address = upstream_server.local_addr().unwrap();
@@ -92,7 +123,8 @@ async fn udp_cold_retry_rechecks_route_for_alternate_address() {
         .unwrap();
     let udp_task = tokio::spawn(async move {
         let mut buffer = [0_u8; 512];
-        udp_server.recv_from(&mut buffer).await.unwrap();
+        let (length, _) = udp_server.recv_from(&mut buffer).await.unwrap();
+        buffer[..length].to_vec()
     });
     let tcp_task = tokio::spawn(async move {
         let (mut stream, _) = tcp_server.accept().await.unwrap();
@@ -106,6 +138,7 @@ async fn udp_cold_retry_rechecks_route_for_alternate_address() {
             .await
             .unwrap();
         stream.write_all(&response).await.unwrap();
+        query
     });
     let (bootstrap_address, bootstrap_task) = spawn_dual_stack_bootstrap(4).await;
     let resolver =
@@ -144,17 +177,21 @@ async fn udp_cold_retry_rechecks_route_for_alternate_address() {
     )
     .unwrap()
     .with_traffic_router(traffic)
-    .with_timeouts(Duration::from_millis(50), Duration::from_secs(1));
+    .with_timeouts(Duration::from_millis(50), Duration::from_secs(1))
+    .with_client_subnet(Some("203.0.113.0/24".parse().unwrap()));
 
+    let query = mock_dns_query(0x1234);
     let response = pool
-        .query("route-diff", &mock_dns_query(0x1234))
+        .query("route-diff", &query)
         .await
         .expect("alternate address follows its proxy route");
     assert_eq!(response, mock_dns_response(0x1234));
 
+    let direct_query = udp_task.await.unwrap();
+    let proxy_query = tcp_task.await.unwrap();
+    assert!(direct_query.ends_with(&[0, 8, 0, 7, 0, 1, 24, 0, 203, 0, 113]));
+    assert_eq!(proxy_query[2..], query[2..]);
     pool.close().await;
-    udp_task.await.unwrap();
-    tcp_task.await.unwrap();
     bootstrap_task.await.unwrap();
 }
 

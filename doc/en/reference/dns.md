@@ -8,6 +8,7 @@ This page defines the current dae-syntax `dns { ... }` section and its runtime s
 | --- | --- | --- |
 | `bind` | absent / `""` | Optional standalone DNS listener; an empty value disables only this listener. |
 | `use_host` | `false` | Answer matching IN-class A/AAAA queries from one `/etc/hosts` snapshot per DNS runtime generation. |
+| `client_subnet` | absent / `""` | Optional EDNS Client Subnet preset: IPv4, IPv4 CIDR, `auto`, or `auto(IPv4)`. |
 | `upstream { ... }` | `default: 'udp://223.5.5.5:53'` | Named upstream servers. The first explicit `upstream` block replaces the built-in entry. |
 | `routing { ... }` | no rules; request fallback `default`; response fallback `accept` | Ordered request and response routing. |
 | `ipversion_prefer` | omitted: `both` | `4` selects `preferipv4`; `6` selects `preferipv6`. |
@@ -41,6 +42,12 @@ With `use_host: true`, honk reads `/etc/hosts` while building each DNS runtime g
 After hard `ipv4only`/`ipv6only` filtering, a known IN-class A or AAAA name takes precedence over request rules—including `reject`—and over cache lookup and upstream exchange. If the name exists but has no address in the requested family, honk returns NOERROR/NODATA without querying an upstream. Other classes and qtypes continue through the normal pipeline. Hosts answers use a 60-second TTL and bypass honk's DNS cache.
 
 SIGHUP builds a new snapshot. If `/etc/hosts` is unreadable, startup fails; on reload the replacement generation fails before publication and the active generation remains in use.
+
+## EDNS Client Subnet (`client_subnet`)
+
+`client_subnet` applies only to named upstreams. An IPv4 address is a `/32`; an IPv4 CIDR is normalized to its network. `auto` sends bypass-marked UDP probes toward `1.1.1.1:33434`, while `auto(IPv4)` changes only that probe target. It uses the route-selected public local address when available; otherwise it checks at most 12 TTLs with three independent UDP flows per TTL and selects the first public ICMP hop as a `/24`. The probe needs neither DNS nor an HTTP service. Startup, SIGHUP, and route/link/address changes resolve a new immutable value for the replacement DNS generation. A bounded failure disables generated ECS for that generation.
+
+honk never overrides client-supplied ECS, including `/0`. Generated ECS follows the resolved dial route after both explicit `-> tag` selection and ordinary traffic routing: direct attempts, including `-> direct`, are eligible; attempts with a proxy leaf omit it. UDP address retries are judged separately, so ECS from a failed direct attempt cannot reach a proxied retry. For an eligible named-upstream query without ECS, honk adds the configured option after cache/singleflight admission, validates any echoed ECS, and removes only its injected state before caching or replying. The effective prefix partitions DNS policy identity, so answers cannot cross a changed automatic prefix. `asis` requests remain byte-for-byte unchanged. ECS reveals an approximate client network to upstream authoritative servers; leave the field empty unless CDN locality requires it.
 
 ## Upstreams
 

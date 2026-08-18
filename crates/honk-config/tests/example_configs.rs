@@ -34,8 +34,8 @@ fn test_config_dae_parses() {
     assert!(!config.routing.rules.is_empty());
     assert_eq!(config.routing.default_outbound, "direct");
 
-    // DNS section with a single upstream.
-    assert_eq!(config.dns.upstream.len(), 1);
+    // DNS section with local and remote upstreams.
+    assert_eq!(config.dns.upstream.len(), 2);
 
     // Experimental sections parsed from dae syntax.
     assert_eq!(

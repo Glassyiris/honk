@@ -78,6 +78,16 @@ global {
     }
 
     #[test]
+    fn test_parse_dns_client_subnet() {
+        let config = parse_dae_config("dns {\n    client_subnet: auto(9.9.9.9)\n}").unwrap();
+        assert_eq!(config.dns.client_subnet, "auto(9.9.9.9)");
+        assert!(config.dns.client_subnet_mode().unwrap().unwrap().is_auto());
+
+        let error = parse_dae_config("dns {\n    client_subnet: auto(example.com)\n}").unwrap_err();
+        assert!(error.to_string().contains("dns.client_subnet"));
+    }
+
+    #[test]
     fn test_parse_dns_upstream() {
         let input = r#"
 dns {

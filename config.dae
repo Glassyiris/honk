@@ -41,6 +41,7 @@ subscription {
 # 对于中国大陆域名使用 alidns，其他使用 googledns 查询。
 dns {
     #ipversion_prefer: 4
+    #client_subnet: auto
     upstream {
         local: 'udp://127.0.0.1:53'
         remote: 'tcp+udp://dns.google:53'

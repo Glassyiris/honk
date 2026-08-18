@@ -56,6 +56,7 @@ These checkboxes indicate maintainer review status, not feature availability:
 
 ### TODO
 
+- [ ] Add proxied DoQ/DoH3 through a quinn `AsyncUdpSocket` adapter over outbound `PacketTransport`
 - [ ] Evaluate AF_XDP and XDP paths for further performance gains
 - [ ] Add a honk REST API
 - [ ] Add a score-based group policy
