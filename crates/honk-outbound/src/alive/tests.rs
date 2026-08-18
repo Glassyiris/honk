@@ -494,6 +494,53 @@ async fn warm_http_probe_is_the_only_result_recorded_as_latency() {
     }
 }
 
+#[tokio::test]
+async fn v4_only_check_url_leaves_v6_family_untouched() {
+    let set = AliveDialerSet::new();
+    set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
+    // Age the node out of the registration grace period so failures count.
+    set.node_registered_at
+        .write()
+        .insert(id(1), Instant::now() - GRACE_PERIOD);
+    set.set_http_probe(
+        Arc::new(MockHttpProber {
+            result: HttpProbeResult::WarmSuccess(Duration::from_millis(10)),
+        }),
+        "http://127.0.0.1/".into(),
+        "HEAD".into(),
+    )
+    .await;
+
+    for _ in 0..4 {
+        assert!(set.probe_node(id(1), Duration::from_millis(200)).await);
+    }
+    assert!(
+        set.is_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V6),
+        "a v4-only check URL carries no v6 evidence; the family must stay alive (#46)"
+    );
+}
+
+#[tokio::test]
+async fn raw_tcp_probe_with_v4_only_node_address_leaves_v6_untouched() {
+    let set = AliveDialerSet::new();
+    set.register_node(id(1), "n1".into(), "127.0.0.1:9".into());
+    set.node_registered_at
+        .write()
+        .insert(id(1), Instant::now() - GRACE_PERIOD);
+
+    for _ in 0..4 {
+        assert!(!set.probe_node(id(1), Duration::from_millis(100)).await);
+    }
+    assert!(
+        !set.is_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V4),
+        "real v4 connect failures must still kill the v4 family"
+    );
+    assert!(
+        set.is_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V6),
+        "a v4-only node address carries no v6 evidence (#46)"
+    );
+}
+
 struct MockUdpProber {
     result: std::sync::Mutex<Result<Duration, String>>,
 }
@@ -875,9 +922,10 @@ async fn test_direct_probe_uses_direct_check_addr() {
     );
 }
 
-/// Failure demotion is sticky: a dial failure adds a strike that only
-/// max(strikes, 2) consecutive real probe successes clear — one lucky
-/// success never re-ranks a flaky node.
+/// Failure demotion is sticky: two consecutive dial failures add a strike
+/// that only max(strikes, 2) consecutive real probe successes clear — one
+/// lucky success never re-ranks a flaky node. A lone transient failure
+/// leaves no strike at all.
 #[test]
 fn test_failure_demotion_needs_consecutive_successes() {
     let set = AliveDialerSet::new();
@@ -896,21 +944,79 @@ fn test_failure_demotion_needs_consecutive_successes() {
     assert!(!demoted());
 
     set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
-    assert!(demoted());
+    assert!(!demoted(), "a lone dial failure must not demote");
+    set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
+    assert!(demoted(), "two consecutive dial failures demote");
     probe_ok(10);
     assert!(demoted(), "one success must not clear the strike");
     probe_ok(10);
     assert!(!demoted(), "two consecutive successes clear it");
 
-    // A fresh failure resets the clear progress: the success between the
-    // two failures no longer counts toward the clear.
+    // Once the failure streak is hot (no dial success intervened), further
+    // failures keep striking; a fresh strike resets the clear progress, so
+    // the success between the two strikes no longer counts toward the
+    // clear.
     set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
     probe_ok(10);
     set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
     probe_ok(10);
-    assert!(demoted(), "progress was reset by the second failure");
+    assert!(demoted(), "progress was reset by the second strike");
     probe_ok(10);
     assert!(!demoted());
+
+    // Repeated failures cap at three strikes, so exactly three consecutive
+    // probe successes clear even after many more failures.
+    for _ in 0..8 {
+        set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
+    }
+    probe_ok(10);
+    probe_ok(10);
+    assert!(demoted(), "the strike cap still requires three successes");
+    probe_ok(10);
+    assert!(!demoted());
+}
+
+/// A real dial success breaks the consecutive dial-failure streak: two
+/// failures separated by a success never strike. Probe successes do NOT
+/// reset the streak — a probe-alive but dial-dead node still accumulates.
+#[test]
+fn test_dial_success_resets_failure_streak() {
+    let set = AliveDialerSet::new();
+    let node = id(1);
+    let demoted = || set.is_failure_demoted(node, ProbeDomain::Tcp, IpVersion::V4);
+
+    set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
+    set.report_available_traffic(node, ProbeDomain::Tcp, IpVersion::V4);
+    set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
+    assert!(
+        !demoted(),
+        "failures separated by a dial success never strike"
+    );
+    set.record_dial_failure(node, ProbeDomain::Tcp, IpVersion::V4);
+    assert!(demoted());
+}
+
+#[test]
+fn test_concurrent_dial_failures_cannot_collapse() {
+    for _ in 0..64 {
+        let collection = Arc::new(collection::DialerCollection::new());
+        let start = Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let collection = Arc::clone(&collection);
+                let start = Arc::clone(&start);
+                scope.spawn(move || {
+                    start.wait();
+                    collection.record_dial_failure();
+                });
+            }
+            start.wait();
+        });
+        assert!(
+            collection.is_failure_demoted(),
+            "two simultaneous failures must produce the threshold strike"
+        );
+    }
 }
 
 /// Real-traffic fast path: three consecutive dials far above the node's own

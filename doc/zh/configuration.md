@@ -42,7 +42,7 @@ include {
 
 ## 运行时数据目录
 
-`global.data_dir` 是运行时状态与相对运行时资源的进程级根目录。默认值为 `/var/share/honk`，必须是非空绝对路径，修改后需重启。相对的 `experimental.cache_file.path`、`experimental.clash_api.external_ui`、`.sub` 订阅存储、`geoip.dat`、`geosite.dat` 与节点 `ech_config_path` 均在其下解析；绝对子路径保持原样。若首选的数据目录副本不存在，honk 会继续使用入口配置旁已有的旧缓存、已有 `./.sub`、或工作目录中已有的 UI/ECH 路径，直至手动迁移。Geo 查找首先使用已存在的 `$DAE_LOCATION_ASSET/<file>`，随后检查 `data_dir`、工作目录与 dae 标准资源目录。
+`global.data_dir` 是运行时状态与相对运行时资源的进程级根目录。默认值为 `/var/share/honk`，必须是非空绝对路径，修改后需重启。启动时 honk 会递归创建目录，再以 create-new 方式创建并删除一个私有随机探测文件，且不跟随探测文件的符号链接。候选目录不可用时，只有通过同一探测的进程工作目录才能作为回退；两者均不可用时启动失败并保留两项原因。相对的 `global.log_file`、`experimental.cache_file.path`、`experimental.clash_api.external_ui`、`.sub` 订阅存储、`geoip.dat`、`geosite.dat` 与节点 `ech_config_path` 均在实际生效的目录下解析；绝对子路径保持原样。若首选的数据目录副本不存在，honk 会继续使用入口配置旁已有的旧缓存、已有 `./.sub`、或工作目录中已有的 UI/ECH 路径，直至手动迁移。Geo 查找首先使用已存在的 `$DAE_LOCATION_ASSET/<file>`，随后检查实际生效的数据目录、工作目录与 dae 标准资源目录。
 
 详见 [Global 参考](./reference/global.md)。
 
@@ -59,6 +59,8 @@ global {
     lan_interface: eth0
     # 输出常规运行日志。
     log_level: info
+    # 同时追加写入 <data_dir>/honk.log。
+    log_file: 'honk.log'
     # 嗅探域名并校验目的 IP。
     dial_mode: domain
     # 应用推荐的网关 sysctl。
@@ -117,6 +119,7 @@ global {
     wan_interface: auto
     lan_interface: br-lan
     log_level: info
+    log_file: 'honk.log'
     dial_mode: domain++
     auto_config_kernel_parameter: true
     data_dir: '/var/share/honk'
@@ -150,6 +153,7 @@ routing {
 
 dns {
     ipversion_prefer: 4
+    # client_subnet: auto  # 可选：为命名上游推断公网路径上的一个 /24。
     upstream {
         direct_dns: 'udp://1.1.1.1:53' -> direct
         proxy_doh: 'https://dns.google/dns-query' -> proxy
@@ -224,22 +228,24 @@ honk 会在启动与重载时注入 `dip(<每个已配置 LAN/WAN 接口地址>)
 ```dae
 dns {
     upstream {
-        secure: 'https://dns.google/dns-query' -> proxy
+        home: 'udp://223.5.5.5:53' -> direct
+        lan_proxy: 'https://dns.google/dns-query' -> proxy
     }
     routing {
         request {
-            qname(suffix: example.org) && !qtype(aaaa) -> secure
-            fallback: secure
-        }
-        response {
-            upstream(secure) -> accept
-            fallback: accept
+            sip(192.168.50.0/24, 100.64.0.0/10) -> lan_proxy
+            sip(127.0.0.0/8, ::1/128) && qname(suffix: example-isp.cn) -> asis
+            fallback: home
         }
     }
 }
 ```
 
-`bind` 留空时仅使用透明 53 端口拦截。独立监听形式都要求显式端口：裸数字 `IP:port`（仅 UDP）、`udp://host:port`、`tcp://host:port` 或 `tcp+udp://host:port`；空 host 表示绑定通配地址。除非有主机防火墙保护 LAN 暴露，否则只绑定 loopback。省略 `ipversion_prefer` 时策略为 `both`，也可设为 `4`/`6` 以优先对应地址族。
+`sip(...)` 仅用于 request，将逻辑 DNS 客户端 IP 与主机地址或 CIDR 匹配。透明 53 端口与 `dns.bind` 查询使用 socket peer；代表已接纳 TCP/UDP 流执行的 DNS 查询使用该流的客户端地址。内部、bootstrap、prefetch 与 Clash API 查询没有客户端来源，因此 `sip(...)` 和 `!sip(...)` 都不匹配并继续执行 fallback。带来源的流查询仍没有被拦截 DNS 服务器的原始目的地址，因此选择 `asis` 会 fail closed。
+
+`bind` 留空时仅使用透明 53 端口拦截。独立监听形式都要求显式端口：裸数字 `IP:port`（仅 UDP）、`udp://host:port`、`tcp://host:port` 或 `tcp+udp://host:port`；空 host 表示绑定通配地址。除非有主机防火墙保护 LAN 暴露，否则只绑定 loopback。省略 `ipversion_prefer` 时策略为 `both`，也可设为 `4`/`6` 以同时控制 DNS 结果和 bootstrap 解析出的上游拨号顺序；偏好地址族拨号失败时会回退到另一地址族。
+
+`client_subnet` 默认关闭。需要确定性的 ECS 时写固定 IPv4/CIDR；写 `auto` 则无需 DNS 或 HTTP，把公网路径上的首个公网 hop 推断为 `/24`。自动推断会在 reload 与网络变化时刷新；有界探测失败时不生成 ECS。客户端自带的 ECS 始终优先。启用前请阅读参考文档中的隐私警告。
 
 详见 [DNS 参考](./reference/dns.md)。
 

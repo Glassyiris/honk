@@ -8,6 +8,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
+use honk_config::dns::DnsStrategy;
 use honk_config::types::DnsProtocol;
 
 /// Default DoH / DoH3 request path (RFC 8484).
@@ -24,6 +25,7 @@ pub struct DnsEndpoint {
     pub sni: String,
     bootstrap_resolver: Option<honk_outbound::bootstrap::BootstrapResolver>,
     resolved_addr: Option<SocketAddr>,
+    strategy: DnsStrategy,
 }
 
 impl DnsEndpoint {
@@ -34,7 +36,13 @@ impl DnsEndpoint {
         protocol: DnsProtocol,
         tls_server_name: Option<&str>,
     ) -> anyhow::Result<Self> {
-        Self::parse_with_resolver(address, protocol, tls_server_name, None)
+        Self::parse_with_resolver(
+            address,
+            protocol,
+            tls_server_name,
+            None,
+            DnsStrategy::default(),
+        )
     }
 
     pub(crate) fn parse_with_resolver(
@@ -42,6 +50,7 @@ impl DnsEndpoint {
         protocol: DnsProtocol,
         tls_server_name: Option<&str>,
         bootstrap_resolver: Option<honk_outbound::bootstrap::BootstrapResolver>,
+        strategy: DnsStrategy,
     ) -> anyhow::Result<Self> {
         let address = address.trim();
         if address.is_empty() {
@@ -75,6 +84,7 @@ impl DnsEndpoint {
             sni,
             bootstrap_resolver,
             resolved_addr: None,
+            strategy,
         })
     }
     pub(crate) fn with_resolved_addr(mut self, address: SocketAddr) -> Self {
@@ -82,10 +92,7 @@ impl DnsEndpoint {
         self
     }
 
-    /// Resolve host → one `SocketAddr` via bootstrap (bypass-marked) DNS.
-    ///
-    /// Prefers IPv4 when both families are returned so broken dual-stack
-    /// networks (common on gateways without working IPv6 egress) still dial.
+    /// Resolve host to the first address allowed by the configured strategy.
     pub async fn resolve_addr(&self) -> anyhow::Result<SocketAddr> {
         self.resolve_addrs()
             .await?
@@ -96,10 +103,10 @@ impl DnsEndpoint {
             })
     }
 
-    /// Resolve host → all candidate addresses (IPv4 preferred, then IPv6).
+    /// Resolve host to every allowed candidate, preferred family first.
     ///
-    /// Callers that dial should iterate this list rather than only the first
-    /// address — `lookup_host` often returns unreachable AAAA first.
+    /// Dialers iterate this list so failure in the preferred family can fall
+    /// back to the other family.
     pub async fn resolve_addrs(&self) -> anyhow::Result<Vec<SocketAddr>> {
         self.resolve_addrs_with(self.bootstrap_resolver).await
     }
@@ -111,28 +118,41 @@ impl DnsEndpoint {
         if let Some(address) = self.resolved_addr {
             return Ok(vec![address]);
         }
-        if let Ok(ip) = self.host.parse::<IpAddr>() {
-            return Ok(vec![SocketAddr::new(ip, self.port)]);
-        }
-        let ips = honk_outbound::bootstrap::resolve_with(bootstrap_resolver, &self.host)
-            .await
-            .map_err(|e| anyhow::anyhow!("bootstrap resolve '{}': {}", self.host, e))?;
-        if ips.is_empty() {
-            anyhow::bail!("bootstrap resolve '{}' returned no addresses", self.host);
-        }
-        let mut v4 = Vec::new();
-        let mut v6 = Vec::new();
-        for ip in ips {
-            let sa = SocketAddr::new(ip, self.port);
-            if sa.is_ipv4() {
-                v4.push(sa);
-            } else {
-                v6.push(sa);
+        let ips = if let Ok(ip) = self.host.parse::<IpAddr>() {
+            vec![ip]
+        } else {
+            let ips = honk_outbound::bootstrap::resolve_with(bootstrap_resolver, &self.host)
+                .await
+                .map_err(|e| anyhow::anyhow!("bootstrap resolve '{}': {}", self.host, e))?;
+            if ips.is_empty() {
+                anyhow::bail!("bootstrap resolve '{}' returned no addresses", self.host);
             }
+            ips
+        };
+        let (mut v4, mut v6): (Vec<_>, Vec<_>) = ips
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, self.port))
+            .partition(SocketAddr::is_ipv4);
+        let addresses = match &self.strategy {
+            DnsStrategy::PreferIpv6 => {
+                v6.extend(v4);
+                v6
+            }
+            DnsStrategy::Ipv4Only => v4,
+            DnsStrategy::Ipv6Only => v6,
+            DnsStrategy::PreferIpv4 | DnsStrategy::Both => {
+                v4.extend(v6);
+                v4
+            }
+        };
+        if addresses.is_empty() {
+            anyhow::bail!(
+                "bootstrap resolve '{}' returned no addresses allowed by {:?}",
+                self.host,
+                self.strategy
+            );
         }
-        // IPv4 first: many hosts advertise AAAA but lack working v6 egress.
-        v4.extend(v6);
-        Ok(v4)
+        Ok(addresses)
     }
 }
 
@@ -255,8 +275,8 @@ mod tests {
     #[tokio::test]
     async fn resolve_addrs_uses_the_captured_bootstrap_resolver() {
         // Given
-        let old = spawn_bootstrap_server([192, 0, 2, 10]).await;
-        let replacement = spawn_bootstrap_server([198, 51, 100, 20]).await;
+        let old = spawn_bootstrap_server([192, 0, 2, 10], None, 2).await;
+        let replacement = spawn_bootstrap_server([198, 51, 100, 20], None, 2).await;
         let endpoint = DnsEndpoint::parse("runtime.test:853", DnsProtocol::Tls, None).unwrap();
         let old_resolver =
             honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{old}")).unwrap();
@@ -282,23 +302,98 @@ mod tests {
         );
     }
 
-    async fn spawn_bootstrap_server(ip: [u8; 4]) -> SocketAddr {
+    #[tokio::test]
+    async fn resolve_addrs_follows_upstream_family_strategy() {
+        let ipv4 = [192, 0, 2, 10];
+        let ipv6 = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+        ];
+        let server = spawn_bootstrap_server(ipv4, Some(ipv6), 8).await;
+        let resolver =
+            honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{server}")).unwrap();
+
+        let prefer_v4 = DnsEndpoint::parse_with_resolver(
+            "dual.test:853",
+            DnsProtocol::Tls,
+            None,
+            Some(resolver),
+            DnsStrategy::PreferIpv4,
+        )
+        .unwrap()
+        .resolve_addrs()
+        .await
+        .unwrap();
+        let prefer_v6 = DnsEndpoint::parse_with_resolver(
+            "dual.test:853",
+            DnsProtocol::Tls,
+            None,
+            Some(resolver),
+            DnsStrategy::PreferIpv6,
+        )
+        .unwrap()
+        .resolve_addrs()
+        .await
+        .unwrap();
+        let v4_only = DnsEndpoint::parse_with_resolver(
+            "dual.test:853",
+            DnsProtocol::Tls,
+            None,
+            Some(resolver),
+            DnsStrategy::Ipv4Only,
+        )
+        .unwrap()
+        .resolve_addrs()
+        .await
+        .unwrap();
+        let v6_only = DnsEndpoint::parse_with_resolver(
+            "dual.test:853",
+            DnsProtocol::Tls,
+            None,
+            Some(resolver),
+            DnsStrategy::Ipv6Only,
+        )
+        .unwrap()
+        .resolve_addrs()
+        .await
+        .unwrap();
+
+        assert!(prefer_v4[0].is_ipv4());
+        assert!(prefer_v4[1].is_ipv6());
+        assert!(prefer_v6[0].is_ipv6());
+        assert!(prefer_v6[1].is_ipv4());
+        assert!(v4_only.iter().all(SocketAddr::is_ipv4));
+        assert!(v6_only.iter().all(SocketAddr::is_ipv6));
+    }
+
+    async fn spawn_bootstrap_server(
+        ipv4: [u8; 4],
+        ipv6: Option<[u8; 16]>,
+        requests: usize,
+    ) -> SocketAddr {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let address = socket.local_addr().unwrap();
         tokio::spawn(async move {
-            for _ in 0..2 {
+            for _ in 0..requests {
                 let mut query = [0u8; 512];
                 let (length, peer) = socket.recv_from(&mut query).await.unwrap();
                 let query = &query[..length];
                 let qtype = u16::from_be_bytes([query[length - 4], query[length - 3]]);
                 let mut response = query.to_vec();
                 response[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
-                response[6..8].copy_from_slice(&u16::from(qtype == 1).to_be_bytes());
+                let has_answer = qtype == 1 || qtype == 28 && ipv6.is_some();
+                response[6..8].copy_from_slice(&u16::from(has_answer).to_be_bytes());
                 if qtype == 1 {
                     response.extend_from_slice(&[
                         0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04,
                     ]);
-                    response.extend_from_slice(&ip);
+                    response.extend_from_slice(&ipv4);
+                } else if qtype == 28
+                    && let Some(ipv6) = ipv6
+                {
+                    response.extend_from_slice(&[
+                        0xc0, 0x0c, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x10,
+                    ]);
+                    response.extend_from_slice(&ipv6);
                 }
                 socket.send_to(&response, peer).await.unwrap();
             }

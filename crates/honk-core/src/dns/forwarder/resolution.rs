@@ -1,7 +1,5 @@
-use std::net::SocketAddr;
-
 use crate::dns::outcome::{DnsOutcome, OutcomeStatus, ResponseClass};
-use crate::dns::query::IngressProfile;
+use crate::dns::query::{DnsRequestMeta, IngressProfile};
 
 use super::{DnsForwardError, DnsForwarder, ResolveMode};
 
@@ -19,36 +17,38 @@ impl DnsForwarder {
         ingress: IngressProfile,
     ) -> anyhow::Result<Vec<u8>> {
         Ok(self
-            .resolve_inner(raw_query, None, ingress, false, ResolveMode::Compatibility)
+            .resolve_inner(
+                raw_query,
+                DnsRequestMeta::EMPTY,
+                ingress,
+                false,
+                ResolveMode::Compatibility,
+            )
             .await?
             .into_rendered())
     }
 
-    /// Resolve a raw DNS query with optional original destination.
-    ///
-    /// `original_dst` is used when request routing selects `asis` (dial the
-    /// intercepted packet's real DNS server). When `None`, `asis` falls back
-    /// to the configured default upstream with a debug log.
+    /// Resolve a raw DNS query with caller metadata.
     pub async fn resolve_with_context(
         &self,
         raw_query: &[u8],
-        original_dst: Option<SocketAddr>,
+        metadata: DnsRequestMeta,
     ) -> anyhow::Result<Vec<u8>> {
-        self.resolve_with_context_and_profile(raw_query, original_dst, IngressProfile::Internal)
+        self.resolve_with_context_and_profile(raw_query, metadata, IngressProfile::Internal)
             .await
     }
 
-    /// Resolve with an original destination and explicit caller ingress profile.
+    /// Resolve with caller metadata and an explicit ingress profile.
     pub async fn resolve_with_context_and_profile(
         &self,
         raw_query: &[u8],
-        original_dst: Option<SocketAddr>,
+        metadata: DnsRequestMeta,
         ingress: IngressProfile,
     ) -> anyhow::Result<Vec<u8>> {
         Ok(self
             .resolve_inner(
                 raw_query,
-                original_dst,
+                metadata,
                 ingress,
                 false,
                 ResolveMode::Compatibility,
@@ -60,49 +60,46 @@ impl DnsForwarder {
     pub(crate) async fn resolve_strict_with_context_and_profile(
         &self,
         raw_query: &[u8],
-        original_dst: Option<SocketAddr>,
+        metadata: DnsRequestMeta,
         ingress: IngressProfile,
     ) -> anyhow::Result<Vec<u8>> {
         Ok(self
-            .resolve_inner(raw_query, original_dst, ingress, false, ResolveMode::Strict)
+            .resolve_inner(raw_query, metadata, ingress, false, ResolveMode::Strict)
             .await?
             .into_rendered())
     }
 
     pub async fn resolve_outcome(&self, raw_query: &[u8]) -> Result<DnsOutcome, DnsForwardError> {
-        self.resolve_outcome_with_context(raw_query, None).await
+        self.resolve_outcome_with_context(raw_query, DnsRequestMeta::EMPTY)
+            .await
     }
 
     pub async fn resolve_outcome_with_context(
         &self,
         raw_query: &[u8],
-        original_dst: Option<SocketAddr>,
+        metadata: DnsRequestMeta,
     ) -> Result<DnsOutcome, DnsForwardError> {
-        self.resolve_outcome_with_context_and_profile(
-            raw_query,
-            original_dst,
-            IngressProfile::Internal,
-        )
-        .await
+        self.resolve_outcome_with_context_and_profile(raw_query, metadata, IngressProfile::Internal)
+            .await
     }
 
     pub async fn resolve_outcome_with_context_and_profile(
         &self,
         raw_query: &[u8],
-        original_dst: Option<SocketAddr>,
+        metadata: DnsRequestMeta,
         ingress: IngressProfile,
     ) -> Result<DnsOutcome, DnsForwardError> {
-        self.resolve_inner(raw_query, original_dst, ingress, false, ResolveMode::Strict)
+        self.resolve_inner(raw_query, metadata, ingress, false, ResolveMode::Strict)
             .await
     }
 
     /// `bypass_cache_read` skips the cache/negative lookup — used by the
     /// stale-while-revalidate refresh so it always reaches the upstream
     /// (its result is still written back through the normal pipeline).
-    async fn resolve_inner(
+    pub(super) async fn resolve_inner(
         &self,
         raw_query: &[u8],
-        original_dst: Option<SocketAddr>,
+        metadata: DnsRequestMeta,
         ingress: IngressProfile,
         bypass_cache_read: bool,
         mode: ResolveMode,
@@ -111,7 +108,7 @@ impl DnsForwarder {
         let result = crate::dns::engine::pipeline::resolve(
             self,
             raw_query,
-            original_dst,
+            metadata,
             ingress,
             bypass_cache_read,
             mode,

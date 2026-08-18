@@ -38,6 +38,19 @@ async fn answer_one_tcp_query(
     query
 }
 
+async fn answer_one_udp_query(socket: tokio::net::UdpSocket, answer_ip: [u8; 4]) -> Vec<u8> {
+    let mut query = vec![0u8; 512];
+    let (received, peer) = socket.recv_from(&mut query).await.expect("receive asis query");
+    query.truncate(received);
+    let mut response = make_a_response(answer_ip, 60);
+    response[..2].copy_from_slice(&query[..2]);
+    socket
+        .send_to(&response, peer)
+        .await
+        .expect("send asis response");
+    query
+}
+
 #[tokio::test]
 async fn tcp_asis_reaches_tcp_only_original_destination() {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -48,7 +61,11 @@ async fn tcp_asis_reaches_tcp_only_original_destination() {
     let query = make_a_query();
 
     let response = asis_test_forwarder()
-        .resolve_with_context_and_profile(&query, Some(original_dst), IngressProfile::Tcp)
+        .resolve_with_context_and_profile(
+            &query,
+            DnsRequestMeta::new(None, Some(original_dst)),
+            IngressProfile::Tcp,
+        )
         .await
         .expect("TCP asis response");
     let received_query = tokio::time::timeout(Duration::from_millis(250), responder)
@@ -86,7 +103,7 @@ async fn udp_asis_truncation_retries_tcp_on_the_same_endpoint() {
     let response = asis_test_forwarder()
         .resolve_with_context_and_profile(
             &query,
-            Some(original_dst),
+            DnsRequestMeta::new(None, Some(original_dst)),
             IngressProfile::Udp {
                 advertised_size: 1232,
             },
@@ -102,6 +119,64 @@ async fn udp_asis_truncation_retries_tcp_on_the_same_endpoint() {
     assert_eq!(udp_query, query);
     assert_eq!(tcp_query, query);
     assert_eq!(&response[response.len() - 4..], &[203, 0, 113, 11]);
+}
+
+#[tokio::test]
+async fn udp_asis_cache_is_partitioned_by_original_destination() {
+    let first = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind first endpoint");
+    let first_addr = first.local_addr().expect("first endpoint");
+    let second = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind second endpoint");
+    let second_addr = second.local_addr().expect("second endpoint");
+    let first_responder = tokio::spawn(answer_one_udp_query(first, [192, 0, 2, 1]));
+    let second_responder = tokio::spawn(answer_one_udp_query(second, [198, 51, 100, 1]));
+    let query = make_a_query();
+    let forwarder = asis_test_forwarder();
+    let ingress = IngressProfile::Udp {
+        advertised_size: 1232,
+    };
+
+    let first_response = forwarder
+        .resolve_with_context_and_profile(
+            &query,
+            DnsRequestMeta::new(None, Some(first_addr)),
+            ingress,
+        )
+        .await
+        .expect("first asis response");
+    let second_response = forwarder
+        .resolve_with_context_and_profile(
+            &query,
+            DnsRequestMeta::new(None, Some(second_addr)),
+            ingress,
+        )
+        .await
+        .expect("second asis response");
+    first_responder.await.expect("first responder");
+    second_responder.await.expect("second responder");
+
+    assert_eq!(&first_response[first_response.len() - 4..], &[192, 0, 2, 1]);
+    assert_eq!(
+        &second_response[second_response.len() - 4..],
+        &[198, 51, 100, 1]
+    );
+    for (destination, expected) in [
+        (first_addr, [192, 0, 2, 1]),
+        (second_addr, [198, 51, 100, 1]),
+    ] {
+        let cached = forwarder
+            .resolve_with_context_and_profile(
+                &query,
+                DnsRequestMeta::new(None, Some(destination)),
+                ingress,
+            )
+            .await
+            .expect("cached asis response");
+        assert_eq!(&cached[cached.len() - 4..], &expected);
+    }
 }
 
 #[tokio::test]
@@ -146,7 +221,11 @@ async fn udp_asis_receives_valid_datagrams_larger_than_4096_bytes() {
     });
 
     let response = asis_test_forwarder()
-        .resolve_with_context_and_profile(&query, Some(original_dst), ingress)
+        .resolve_with_context_and_profile(
+            &query,
+            DnsRequestMeta::new(None, Some(original_dst)),
+            ingress,
+        )
         .await
         .expect("large UDP asis response");
     let sent = tokio::time::timeout(Duration::from_millis(250), responder)
@@ -185,7 +264,7 @@ async fn udp_asis_honors_configured_query_timeout() {
         forwarder
             .resolve_with_context_and_profile(
                 &query,
-                Some(original_dst),
+                DnsRequestMeta::new(None, Some(original_dst)),
                 IngressProfile::Udp {
                     advertised_size: 1232,
                 },

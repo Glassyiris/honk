@@ -43,7 +43,7 @@ use crate::{
     },
 };
 
-use crate::action::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT, Verdict, flatten};
+use crate::action::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT, TC_ACT_UNSPEC, Verdict, flatten};
 
 /// Ingress ifindex for locally-generated packets (not from any interface).
 const NOWHERE_IFINDEX: u32 = 0;
@@ -887,11 +887,10 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         }
     }
 
-    // Only process locally-generated packets. Pure forwarded traffic has a
-    // real ingress interface and must be left alone to avoid double-handling
-    // and loops.
+    // Pure forwarded traffic stays on the native path here; continue so a
+    // downstream external-interface NAT classifier can still translate it.
     if skb_ingress_ifindex(ctx) != NOWHERE_IFINDEX {
-        return Err(TC_ACT_OK);
+        return Err(TC_ACT_UNSPEC);
     }
 
     // Control-plane bypass (Go dae `pid_is_control_plane` mark fallback,

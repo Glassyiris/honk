@@ -17,7 +17,11 @@ async fn snapshot_publication_does_not_wait_for_answer_query_exchange() {
         let query = query.clone();
         tokio::spawn(async move {
             controller
-                .answer_query(&query, None, crate::dns::query::IngressProfile::Internal)
+                .answer_query(
+                    &query,
+                    crate::dns::query::DnsRequestMeta::EMPTY,
+                    crate::dns::query::IngressProfile::Internal,
+                )
                 .await
         })
     };
@@ -43,7 +47,11 @@ async fn snapshot_publication_does_not_wait_for_answer_query_exchange() {
     release.notify_waiters();
     let old_response = running.await.expect("old query task");
     let new_response = controller
-        .answer_query(&query, None, crate::dns::query::IngressProfile::Internal)
+        .answer_query(
+            &query,
+            crate::dns::query::DnsRequestMeta::EMPTY,
+            crate::dns::query::IngressProfile::Internal,
+        )
         .await;
 
     assert_eq!(

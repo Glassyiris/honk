@@ -154,8 +154,9 @@ impl DohClient {
     async fn handshake(&self) -> anyhow::Result<H2Session> {
         let server_name = self.dial.endpoint.sni.clone();
         let via_proxy = self.dial.proxy.is_some();
-        tokio::time::timeout(self.dial.dial_timeout, async {
-            let tcp = self.dial.dial_tcp_boxed().await?;
+        let deadline = tokio::time::Instant::now() + self.dial.dial_timeout;
+        let tcp = self.dial.dial_tcp_boxed_until(deadline).await?;
+        tokio::time::timeout_at(deadline, async {
             let tls = self
                 .connector
                 .connect(&server_name, tcp)

@@ -107,6 +107,42 @@ async fn cancelled_first_tcp_frame_releases_permit() {
 }
 
 #[tokio::test]
+async fn transparent_tcp_routes_by_client_source() {
+    let query = query_with_txid("source.example", 0x5151);
+    let upstream = Arc::new(SlowUpstream {
+        calls: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+        response: response_with_txid("source.example", 0x5151),
+    });
+    let mut config = honk_config::dns::DnsConfig::default();
+    config.routing.request.rules = vec![honk_config::dns::DnsRequestRule {
+        conditions: vec![honk_config::dns::DnsCond::Sip {
+            not: false,
+            cidrs: vec!["127.0.0.42/32".into()],
+        }],
+        action: honk_config::dns::DnsRequestAction::Upstream("default".into()),
+    }];
+    config.routing.request.fallback = honk_config::dns::DnsRequestAction::Reject;
+    let controller = controller_with_dns_config(upstream.clone(), &config);
+    let (mut client, mut server) = tcp_pair().await;
+    let task = tokio::spawn(async move {
+        controller
+            .handle_tcp_dns(
+                &mut server,
+                "127.0.0.42:10053".parse().expect("client"),
+                "127.0.0.1:53".parse().expect("destination"),
+            )
+            .await
+    });
+
+    write_tcp_query(&mut client, &query).await;
+    let _ = read_tcp_response(&mut client).await;
+    drop(client);
+    task.await.expect("TCP task").expect("TCP DNS");
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn malformed_first_tcp_frame_is_closed_as_dns() {
     use tokio::io::AsyncWriteExt;
 

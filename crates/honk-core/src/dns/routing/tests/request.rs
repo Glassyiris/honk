@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use honk_config::dns::{
     DnsCond, DnsDomainMatcher, DnsLegacyRule, DnsRequestAction, DnsRequestRouting, DnsRequestRule,
     DnsRouting,
@@ -273,4 +275,89 @@ fn negated_and_positive_conditions_are_anded() {
         router.select_request("other.org", 1),
         DnsRequestDecision::Upstream("default".into())
     );
+}
+
+#[test]
+fn sip_matches_hosts_and_mixed_family_cidrs() {
+    let router = router_from_request(request(vec![rule(
+        DnsCond::Sip {
+            not: false,
+            cidrs: vec![
+                "192.168.50.1".into(),
+                "100.64.0.0/10".into(),
+                "2001:db8::/32".into(),
+            ],
+        },
+        DnsRequestAction::Upstream("source".into()),
+    )]));
+
+    for source in ["192.168.50.1", "100.127.255.254", "2001:db8::1"] {
+        assert_eq!(
+            router.select_request_normalized("example.test", 1, Some(source.parse().unwrap())),
+            DnsRequestDecision::Upstream("source".into())
+        );
+    }
+    assert_eq!(
+        router.select_request_normalized("example.test", 1, Some("192.168.50.2".parse().unwrap())),
+        DnsRequestDecision::Upstream("default".into())
+    );
+}
+
+#[test]
+fn unknown_source_never_matches_positive_or_negated_sip() {
+    for not in [false, true] {
+        let router = router_from_request(request(vec![rule(
+            DnsCond::Sip {
+                not,
+                cidrs: vec!["192.0.2.0/24".into()],
+            },
+            DnsRequestAction::Upstream("source".into()),
+        )]));
+        assert_eq!(
+            router.select_request_normalized("example.test", 1, None),
+            DnsRequestDecision::Upstream("default".into())
+        );
+    }
+}
+
+#[test]
+fn negated_sip_matches_only_known_addresses_outside_its_networks() {
+    let router = router_from_request(request(vec![rule(
+        DnsCond::Sip {
+            not: true,
+            cidrs: vec!["192.0.2.0/24".into()],
+        },
+        DnsRequestAction::Upstream("outside".into()),
+    )]));
+
+    assert_eq!(
+        router.select_request_normalized(
+            "example.test",
+            1,
+            Some("198.51.100.1".parse::<IpAddr>().unwrap())
+        ),
+        DnsRequestDecision::Upstream("outside".into())
+    );
+    assert_eq!(
+        router.select_request_normalized(
+            "example.test",
+            1,
+            Some("192.0.2.1".parse::<IpAddr>().unwrap())
+        ),
+        DnsRequestDecision::Upstream("default".into())
+    );
+}
+
+#[test]
+fn invalid_sip_conditions_fail_router_construction() {
+    for cidrs in [Vec::new(), vec!["not-an-ip".into()]] {
+        let routing = DnsRouting {
+            request: request(vec![rule(
+                DnsCond::Sip { not: false, cidrs },
+                DnsRequestAction::Reject,
+            )]),
+            ..DnsRouting::default()
+        };
+        assert!(DnsRouter::new(&routing).is_err());
+    }
 }

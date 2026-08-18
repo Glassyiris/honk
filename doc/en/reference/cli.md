@@ -15,6 +15,7 @@ honk-core [OPTIONS] [COMMAND]
 | Option | Default | Effect |
 | --- | --- | --- |
 | `-c`, `--config PATH` | `/etc/honk/config.dae` | Configuration entry file. `mode`, `proxy`, and `delay` also read this path. `reload` ignores it and signals the running instance, which reloads its own startup path. |
+| `--log-file PATH` | Unset | Override `global.log_file` for this engine process without rewriting the configuration. Relative paths resolve below `global.data_dir`; console logging remains enabled. While set, SIGHUP ignores changes to the shadowed config value unless the effective destination changes. |
 | `-b`, `--bpf-object PATH` | Embedded object | Override the object embedded by an `ebpf` build. Used only by the real backend. |
 | `--bpf-pin-root PATH` | `/sys/fs/bpf` | Root for pinned eBPF maps. |
 | `-d`, `--debug` | Off | Select `debug` as the default console filter when `RUST_LOG` does not provide a valid filter. |
@@ -53,7 +54,7 @@ A real-datapath process holds the lock for its lifetime. `reload` verifies that 
 | `RUST_LOG` | Both binaries | Tracing filter. It has the effective `honk-core` precedence described above; `honk-tool` otherwise defaults to `warn`. |
 | `HONK_UI_DOWNLOAD_URL` | `honk-core` with `clash-api` | Overrides the dashboard zip URL used when a configured external-UI directory needs downloading. |
 | `HONK_POOL_DISABLE=1` | `honk-core` | Bypasses both ready-stream and bare-TCP pools and performs fresh dials. The code also accepts case-insensitive `true`; the value is cached on first use. |
-| `HONK_MI_COLLECT_SECS` | `honk-core` with `mimalloc` | Idle-worker forced-collection interval in seconds. Default `60`; `0` disables the collector; an invalid value falls back to `60`. |
+| `HONK_MI_COLLECT_SECS` | `honk-core` with `mimalloc` | Per-owner idle collection interval. A periodic rendezvous wakes persistently parked owners only while every other worker is idle; forced collection remains in each owner's park hook. Default `60`; `0` disables both the hook and rendezvous; an invalid value falls back to `60`. |
 | `DAE_LOCATION_ASSET` | Geo loading in both binaries | Directory checked first for `geoip.dat` and `geosite.dat`. |
 
 UDP NFQUEUE has no environment-variable switch. It is enabled only by `experimental.udp_nfqueue.enabled`; see the [experimental configuration reference](./experimental.md).

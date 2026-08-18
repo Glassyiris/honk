@@ -1037,6 +1037,98 @@ impl super::GroupManager {
         fallback.health_family = IpVersion::V4;
         self.selection_plan_for_target(group_name, &fallback)
     }
+    /// Return the latency-ordered URLTest alternatives for one target without
+    /// changing selection state. Each entry keeps the same Honk attribution
+    /// and selection chain as an ordinary target-aware plan.
+    pub fn urltest_retry_plan_for_target(
+        &self,
+        group_name: &str,
+        context: &HonkSelectionContext,
+    ) -> super::HonkSelectionPlan<'_> {
+        let Some(group) = self.groups.get(group_name) else {
+            return super::HonkSelectionPlan {
+                mode: super::SelectionPlanMode::Authoritative,
+                health_family: context.health_family,
+                entries: Vec::new(),
+            };
+        };
+        if group.policy != honk_config::group::GroupPolicy::URLTest {
+            return super::HonkSelectionPlan {
+                mode: super::SelectionPlanMode::Authoritative,
+                health_family: context.health_family,
+                entries: Vec::new(),
+            };
+        }
+        let mut visited = Vec::new();
+        let candidates = self.flatten_candidates_for_target(
+            group,
+            context,
+            &mut visited,
+            0,
+            super::SelectionEffects::Peek,
+        );
+        let candidates = self.filter_alive_candidates(
+            candidates,
+            context.probe_domain,
+            context.health_family,
+            group.check_url.as_deref(),
+        );
+        let mut seen = std::collections::HashSet::new();
+        let candidates = self
+            .order_by_latency(
+                candidates,
+                context.network,
+                context.health_family,
+                group.check_url.as_deref(),
+            )
+            .into_iter()
+            .filter(|candidate| seen.insert(candidate.node.id))
+            .take(3)
+            .collect();
+        self.honk_selection_plan(candidates, super::SelectionPlanMode::Authoritative, context)
+    }
+
+    fn honk_selection_plan<'a>(
+        &'a self,
+        candidates: Vec<super::Candidate<'a>>,
+        mode: super::SelectionPlanMode,
+        context: &HonkSelectionContext,
+    ) -> super::HonkSelectionPlan<'a> {
+        super::HonkSelectionPlan {
+            mode,
+            health_family: context.health_family,
+            entries: candidates
+                .into_iter()
+                .map(|candidate| {
+                    let attributions: Vec<_> = candidate
+                        .attribution
+                        .into_iter()
+                        .map(|group| HonkAttribution {
+                            group: group.to_string(),
+                            node_id: candidate.node.id,
+                        })
+                        .collect();
+                    let selection_chain = candidate
+                        .selection_chain
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect();
+                    let feedback = (!attributions.is_empty()).then(|| {
+                        HonkFeedback::new(
+                            Arc::clone(&self.honk_state),
+                            context.clone(),
+                            attributions,
+                        )
+                    });
+                    super::HonkSelectionEntry {
+                        node: candidate.node,
+                        feedback,
+                        selection_chain,
+                    }
+                })
+                .collect(),
+        }
+    }
 
     /// Target-aware, candidate-safe plan with attribution captured during
     /// recursive selection rather than recovered from the selected NodeId.
@@ -1127,46 +1219,17 @@ impl super::GroupManager {
             };
             (super::SelectionPlanMode::Authoritative, vec![candidate])
         };
-        let candidates = candidates.into_iter().map(|mut candidate| {
-            if group.policy == honk_config::group::GroupPolicy::Honk {
-                candidate.attribution.insert(0, group.name.as_str());
-            }
-            candidate.selection_chain.insert(0, group.name.as_str());
-            candidate
-        });
-        super::HonkSelectionPlan {
-            mode,
-            health_family: context.health_family,
-            entries: candidates
-                .map(|candidate| {
-                    let attributions: Vec<_> = candidate
-                        .attribution
-                        .into_iter()
-                        .map(|group| HonkAttribution {
-                            group: group.to_string(),
-                            node_id: candidate.node.id,
-                        })
-                        .collect();
-                    let selection_chain = candidate
-                        .selection_chain
-                        .into_iter()
-                        .map(str::to_owned)
-                        .collect();
-                    let feedback = (!attributions.is_empty()).then(|| {
-                        HonkFeedback::new(
-                            Arc::clone(&self.honk_state),
-                            context.clone(),
-                            attributions,
-                        )
-                    });
-                    super::HonkSelectionEntry {
-                        node: candidate.node,
-                        feedback,
-                        selection_chain,
-                    }
-                })
-                .collect(),
-        }
+        let candidates = candidates
+            .into_iter()
+            .map(|mut candidate| {
+                if group.policy == honk_config::group::GroupPolicy::Honk {
+                    candidate.attribution.insert(0, group.name.as_str());
+                }
+                candidate.selection_chain.insert(0, group.name.as_str());
+                candidate
+            })
+            .collect();
+        self.honk_selection_plan(candidates, mode, context)
     }
 
     fn last_resort_candidate_for_target<'a>(

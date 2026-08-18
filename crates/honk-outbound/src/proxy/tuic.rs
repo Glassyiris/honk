@@ -442,13 +442,14 @@ impl TuicHandler {
             .unwrap_or_else(|| vec![b"tuic".to_vec()]);
         // quinn's default stream window (1.25MB) caps a single stream at
         // ~12.5MB/s per 100ms of RTT — unusable on long-fat links. Default
-        // to 8MB stream / 32MB conn; explicit node fields override.
+        // to 8MB stream / 8MB conn (conn window = memory budget, see hy2).
+        // Explicit node fields override.
         let options = crate::quic::QuicClientOptions {
             congestion: Some(crate::quic::congestion_factory(
                 node.tuic_congestion.as_deref(),
             )),
             stream_receive_window: Some(node.tuic_init_stream_recv_window.unwrap_or(8 << 20)),
-            conn_receive_window: Some(node.tuic_init_conn_recv_window.unwrap_or(32 << 20)),
+            conn_receive_window: Some(node.tuic_init_conn_recv_window.unwrap_or(8 << 20)),
             max_udp_payload_size: node.quic_mtu,
             ..Default::default()
         };

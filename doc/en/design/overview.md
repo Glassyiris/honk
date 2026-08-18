@@ -86,6 +86,7 @@ flowchart TB
 
 - **Bypass-mark discipline:** dials, probes, DNS upstreams, QUIC endpoints, and transparent listeners carry `DAE_BYPASS_MARK` (`0x100`) or use loopback. Accepted TCP sockets have the listener mark cleared; ordinary host-netns `dns.bind` ingress sockets are deliberately unmarked.
 - **Anyfrom UDP replies:** proxied UDP and transparent port-53 DNS replies use transparent sockets created inside `daens` and bound to the flow's original destination. Replying from the TPROXY listener exposes the `dae0` source and fails on the return path.
+- **DNS source boundary:** transparent and `dns.bind` adapters derive the logical client source from the socket peer; flow-associated lookups use the admitted flow's source. Cache reuse starts only after routing materializes the selected source-neutral scope, while `DOMAIN_ROUTING_MAP` projection remains global and source-independent.
 - **Network-namespace discipline:** the process remains in the host netns. It enters `daens` only through scoped, fully synchronous `with_daens_netns` calls; no `.await` may occur across `setns`, and failure to restore the original namespace aborts the process.
 - **Datapath admission:** `DATAPATH_STATE_MAP[0]` stays closed until every listener FD is published and every receive loop is running, and closes before listener teardown. TC passes traffic unchanged while the gate is closed.
 - **NFQUEUE readiness and ownership:** enabled-but-not-ready staging drops only new flows that require staging. honk exclusively owns queue `320` and nftables `inet honk_nfqueue` / `udp_decision`; readiness changes are fenced, lifecycle ambiguity is fatal, and same-netns firewall managers must not mutate those objects.
@@ -95,7 +96,7 @@ flowchart TB
 - **Group-OR connectivity:** the eBPF alive slot for a group is the OR of all leaf-member states, plus the sole-TCP-leaf last-resort exception above. A single dead member in a multi-leaf group must not make the whole group fail closed.
 - **Optional Honk isolation:** Honk uses the business target family for scoring but the proxy server family for health filtering. Its authoritative pick cannot revive a dead member. Exact target keys and aggregate priors remain in bounded process memory, survive reload through shared state, reset on process restart, and are not added to logs, Clash API documents, or `cache.db`; existing connection metadata remains unchanged.
 - **Honk feedback coverage:** When the feature is enabled, actual attempts associated with Honk leaves report setup, first response, bidirectional bytes, and one compact terminal outcome. This includes transparent TCP/UDP, supported DNS transports, health and delay probes, preconnect/session/UDP warm-up, and direct or proxied UI downloads; work without a business target updates aggregate setup evidence only.
-- **Internal and special traffic:** honk's `169.254.0.0/16` and `fd00:686f:6e6b::/64` veth ranges are never proxied. L2 broadcast/multicast, IPv4 broadcast/multicast/unspecified destinations, and IPv6 multicast pass through before routing or conntrack.
+- **Internal and special traffic:** honk's link-internal ranges `169.254.0.0/16` and `fd00:686f:6e6b::/64` are never proxied. L2 broadcast/multicast, IPv4 broadcast/multicast/unspecified destinations, and IPv6 multicast pass through before routing or conntrack.
 
 ## Build features and mock mode
 
@@ -105,7 +106,7 @@ flowchart TB
 | --- | --- | --- |
 | `ebpf` | no | Pulls in `aya`, `aya-obj`, `aya-log`, and optional `honk-nfqueue`; `build.rs` embeds the `honk-ebpf` object. Requires Linux kernel 5.8+ at runtime. |
 | `clash-api` | yes | Pulls in optional `axum` and `tower-http` for the Clash-compatible REST/WebSocket service. |
-| `mimalloc` | yes | Pulls in `mimalloc` and `libmimalloc-sys` and installs mimalloc as the `honk-core` binary allocator. |
+| `mimalloc` | yes | Pulls in `mimalloc` and `libmimalloc-sys` and installs mimalloc as the `honk-core` binary allocator. On Linux, startup disables transparent huge pages for the process before starting Tokio. |
 | `rprx` | yes | Enables `honk-outbound/rprx`, which registers the VLESS and VMess handlers, including the supported VLESS Encryption and `xtls-rprx-vision` paths. |
 | `honk-policy` | no | Forwards the optional scorer through `honk-config` and `honk-outbound`; enables `policy: honk` with authoritative reliability-first scoring isolated by TCP/UDP, target IPv4/IPv6 family, and exact target. It adds no runtime knobs or persistence. |
 

@@ -1,7 +1,7 @@
 //! Socket-lookup program for the isolated `daens` namespace.
 //!
 //! When proxy-bound packets are redirected from the host namespace into `daens`
-//! via the `dae0peer` veth, normal socket lookup fails because the destination
+//! via the `dae0peer` link, normal socket lookup fails because the destination
 //! port belongs to the original remote endpoint, not to the local TPROXY
 //! listener.  This program overrides the lookup and assigns the transparent
 //! listener socket, letting the kernel deliver the packet with the original

@@ -836,7 +836,7 @@ pub(super) async fn resolve_quic_score_target(
     })
 }
 
-/// Returns true if `ip` belongs to honk's own dae0 veth subnets.
+/// Returns true if `ip` belongs to honk's own dae0 link subnets.
 ///
 /// The subnet constants (`crate::DAE0_IPV6_PREFIX_HI`, `crate::DAE0_IPV4_NET`)
 /// live in the crate root next to the `DAENS_*` address strings used by the

@@ -25,12 +25,14 @@ mod parser_tests {
 global {
     tproxy_port: 12345
     log_level: info
+    log_file: '/var/log/honk/honk.log'
     dial_mode: domain
 }
 "#;
         let config = parse_dae_config(input).unwrap();
         assert_eq!(config.global.tproxy_port, 12345);
         assert_eq!(config.global.log_level, "info");
+        assert_eq!(config.global.log_file, "/var/log/honk/honk.log");
         assert_eq!(config.global.dial_mode, "domain");
     }
 
@@ -73,6 +75,16 @@ global {
         let explicitly_empty = parse_dae_config("global {\n    lan_interface:\n}").unwrap();
         assert!(explicitly_empty.global.lan_interface.is_empty());
         assert_eq!(config.global.wan_interface, vec!["ens3"]);
+    }
+
+    #[test]
+    fn test_parse_dns_client_subnet() {
+        let config = parse_dae_config("dns {\n    client_subnet: auto(9.9.9.9)\n}").unwrap();
+        assert_eq!(config.dns.client_subnet, "auto(9.9.9.9)");
+        assert!(config.dns.client_subnet_mode().unwrap().unwrap().is_auto());
+
+        let error = parse_dae_config("dns {\n    client_subnet: auto(example.com)\n}").unwrap_err();
+        assert!(error.to_string().contains("dns.client_subnet"));
     }
 
     #[test]
@@ -1034,6 +1046,51 @@ dns {
         config.dns.routing.request.rules[1].action,
         crate::dns::DnsRequestAction::Reject
     );
+}
+
+#[test]
+fn test_parse_dns_request_routing_sip() {
+    let input = r#"
+dns {
+    routing {
+        request {
+            sip(192.168.50.1, 100.64.0.0/10, 2001:db8::/32) -> lan_proxy
+            !sip(127.0.0.0/8, ::1/128) && qname(suffix: example-isp.cn) -> asis
+        }
+        response {
+            sip(192.168.50.0/24) -> reject
+            fallback: accept
+        }
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    let rules = &config.dns.routing.request.rules;
+    assert_eq!(rules.len(), 2);
+    match &rules[0].conditions[0] {
+        crate::dns::DnsCond::Sip { not, cidrs } => {
+            assert!(!not);
+            assert_eq!(cidrs, &["192.168.50.1", "100.64.0.0/10", "2001:db8::/32"]);
+        }
+        _ => panic!("expected Sip"),
+    }
+    match &rules[1].conditions[0] {
+        crate::dns::DnsCond::Sip { not, cidrs } => {
+            assert!(*not);
+            assert_eq!(cidrs, &["127.0.0.0/8", "::1/128"]);
+        }
+        _ => panic!("expected Sip"),
+    }
+    assert_eq!(rules[1].conditions.len(), 2);
+    let response_rules = &config.dns.routing.response.rules;
+    assert_eq!(response_rules.len(), 1);
+    match &response_rules[0].conditions[0] {
+        crate::dns::DnsCond::Sip { not, cidrs } => {
+            assert!(!not);
+            assert_eq!(cidrs, &["192.168.50.0/24"]);
+        }
+        _ => panic!("expected response Sip to be rejected by the router"),
+    }
 }
 
 #[test]

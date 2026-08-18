@@ -509,6 +509,40 @@ fn test_urltest_dial_list_single_when_data_exists_race_when_cold() {
 }
 
 #[test]
+fn urltest_retry_candidates_deduplicate_shared_nested_leaves_before_cap() {
+    let (a, b) = (nid("retry-a"), nid("retry-b"));
+    let nodes = vec![make_node(a, "retry-a"), make_node(b, "retry-b")];
+    let groups = vec![
+        make_group("a-1", GroupPolicy::Selector, vec![a]),
+        make_group("a-2", GroupPolicy::Selector, vec![a]),
+        make_group("a-3", GroupPolicy::Selector, vec![a]),
+        make_group("b-1", GroupPolicy::Selector, vec![b]),
+        make_subgroup("retry", GroupPolicy::URLTest, &["a-1", "a-2", "a-3", "b-1"]),
+    ];
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.record_probe_latency(
+        a,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(10),
+    );
+    alive.record_probe_latency(
+        b,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(20),
+    );
+    let manager = GroupManager::with_alive_set(&groups, &nodes, Some(alive));
+
+    let retry_ids: Vec<_> = manager
+        .urltest_retry_candidates("retry", ProbeDomain::Tcp, IpVersion::V4)
+        .into_iter()
+        .map(|node| node.id)
+        .collect();
+    assert_eq!(retry_ids, vec![a, b]);
+}
+
+#[test]
 fn selection_plan_preserves_authoritative_and_cold_urltest_provenance() {
     let (a, b) = (nid("a"), nid("b"));
     let nodes = vec![make_node(a, "a"), make_node(b, "b")];
@@ -1603,7 +1637,11 @@ fn urltest_flaky_node_stays_demoted_after_dial_failure() {
     assert!(alive.is_alive_for(nid("a"), ProbeDomain::Tcp, IpVersion::V4));
     assert_eq!(m.select_node("g").unwrap().name, "a");
 
-    // A real dial failure supplies the ranking strike and moves to 'b'.
+    // One transient dial failure leaves no strike — 'a' keeps the seat.
+    alive.record_dial_failure(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(m.select_node("g").unwrap().name, "a");
+    // The second consecutive failure supplies the ranking strike and moves
+    // to 'b'.
     alive.record_dial_failure(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(m.select_node("g").unwrap().name, "b");
 
@@ -1626,9 +1664,9 @@ fn urltest_flaky_node_stays_demoted_after_dial_failure() {
         );
     }
 
-    // When the incumbent itself fails a dial, its strike skips hysteresis
-    // and the group moves immediately; one lucky re-probe does not let it
-    // reclaim the rank against the new incumbent.
+    // When the incumbent itself fails dials, the strike (second consecutive
+    // failure) skips hysteresis and the group moves; one lucky re-probe
+    // does not let it reclaim the rank against the new incumbent.
     let alive2 = Arc::new(AliveDialerSet::new());
     let m2 = GroupManager::with_alive_set(
         &[make_group("g2", GroupPolicy::URLTest, vec![na, nb])],
@@ -1638,6 +1676,12 @@ fn urltest_flaky_node_stays_demoted_after_dial_failure() {
     probe_ok2(&alive2, nid("a"), 7);
     probe_ok2(&alive2, nid("b"), 21);
     assert_eq!(m2.select_node("g2").unwrap().name, "a");
+    alive2.record_dial_failure(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(
+        m2.select_node("g2").unwrap().name,
+        "a",
+        "one transient failure keeps the incumbent"
+    );
     alive2.record_dial_failure(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(m2.select_node("g2").unwrap().name, "b");
     probe_ok2(&alive2, nid("a"), 7);
@@ -1671,6 +1715,10 @@ fn urltest_strike_demotion_needs_two_consecutive_successes() {
     probe_ok2(&alive, nid("b"), 21);
     assert_eq!(m.select_node("g").unwrap().name, "a");
 
+    // Two consecutive dial failures strike the incumbent; a lone one does
+    // not.
+    alive.record_dial_failure(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(m.select_node("g").unwrap().name, "a");
     alive.record_dial_failure(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(m.select_node("g").unwrap().name, "b");
 

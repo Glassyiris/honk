@@ -70,15 +70,22 @@ pub(super) fn resolver_with_strategy(
         strategy,
         ..DnsConfig::default()
     };
+    resolver_with_config(pool, &config)
+}
+
+pub(super) fn resolver_with_config(
+    pool: Arc<dyn DnsUpstreamPool>,
+    config: &DnsConfig,
+) -> DnsResolver {
     let forwarder = Arc::new(
         DnsForwarder::new(
             pool,
             Arc::new(Mutex::new(DnsCache::new(32))),
-            Arc::new(DnsRouter::new_from_dns_config(&config).expect("router")),
+            Arc::new(DnsRouter::new_from_dns_config(config).expect("router")),
         )
         .with_strategy(config.strategy.clone()),
     );
-    DnsResolver::with_forwarder(&config, forwarder).expect("resolver")
+    DnsResolver::with_forwarder(config, forwarder).expect("resolver")
 }
 
 #[test]

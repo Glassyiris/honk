@@ -7,7 +7,7 @@
 use super::{ConnectionGuard, try_admit_udp_slow_path};
 use crate::control::dns_control::DnsController;
 use crate::control::drain::DrainTracker;
-use crate::dns::query::validate_exact_dns_query;
+use crate::dns::query::{DnsRequestMeta, validate_exact_dns_query};
 use crate::stats::StatsManager;
 use honk_config::dns::DnsBindEndpoint;
 use std::io;
@@ -421,7 +421,8 @@ async fn run_udp_supervisor(
                     let _slow_permit = slow_permit;
                     let _query_permit = query_permit;
                     let _guard = guard;
-                    let response = child_controller.answer_query(&query, None, ingress).await;
+                    let metadata = DnsRequestMeta::new(Some(client_addr.ip()), None);
+                    let response = child_controller.answer_query(&query, metadata, ingress).await;
                     if let Err(error) = send_bound_udp_response(child_socket.as_ref(), &response, response_source, client_addr).await {
                         debug!(error_kind = ?error.kind(), %client_addr, "standalone UDP DNS response send failed");
                     }
@@ -553,7 +554,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
-    use tokio::net::TcpStream;
+    use tokio::net::{TcpSocket, TcpStream};
 
     struct FixedAddressUpstream {
         address: [u8; 4],
@@ -586,18 +587,17 @@ mod tests {
         ]);
         response
     }
-
-    fn forwarder(address: [u8; 4]) -> (Arc<DnsForwarder>, Arc<AtomicUsize>) {
+    fn forwarder_with_config(
+        address: [u8; 4],
+        config: &honk_config::dns::DnsConfig,
+    ) -> (Arc<DnsForwarder>, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let upstream = Arc::new(FixedAddressUpstream {
             address,
             calls: Arc::clone(&calls),
         });
         let router = Arc::new(
-            crate::dns::routing::DnsRouter::new_from_dns_config(
-                &honk_config::dns::DnsConfig::default(),
-            )
-            .expect("test DNS router"),
+            crate::dns::routing::DnsRouter::new_from_dns_config(config).expect("test DNS router"),
         );
         let forwarder = Arc::new(
             DnsForwarder::new(
@@ -612,8 +612,14 @@ mod tests {
         (forwarder, calls)
     }
 
-    fn controller(address: [u8; 4]) -> (Arc<DnsController>, Arc<AtomicUsize>) {
-        let (forwarder, calls) = forwarder(address);
+    fn forwarder(address: [u8; 4]) -> (Arc<DnsForwarder>, Arc<AtomicUsize>) {
+        forwarder_with_config(address, &honk_config::dns::DnsConfig::default())
+    }
+    fn controller_with_config(
+        address: [u8; 4],
+        config: &honk_config::dns::DnsConfig,
+    ) -> (Arc<DnsController>, Arc<AtomicUsize>) {
+        let (forwarder, calls) = forwarder_with_config(address, config);
         let controller = Arc::new(DnsController::new(
             forwarder,
             Arc::new(tokio::sync::RwLock::new(Box::new(
@@ -624,6 +630,10 @@ mod tests {
             )),
         ));
         (controller, calls)
+    }
+
+    fn controller(address: [u8; 4]) -> (Arc<DnsController>, Arc<AtomicUsize>) {
+        controller_with_config(address, &honk_config::dns::DnsConfig::default())
     }
 
     fn start_listener(
@@ -824,6 +834,81 @@ mod tests {
         assert_eq!(refused[3] & 0x0f, 5);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         stop_listener(&mut saturated, &saturated_drain).await;
+    }
+    #[tokio::test]
+    async fn standalone_listeners_route_by_exact_peer_source() {
+        let mut config = honk_config::dns::DnsConfig::default();
+        config.routing.request.rules = vec![honk_config::dns::DnsRequestRule {
+            conditions: vec![honk_config::dns::DnsCond::Sip {
+                not: false,
+                cidrs: vec!["127.0.0.42/32".into()],
+            }],
+            action: honk_config::dns::DnsRequestAction::Upstream("default".into()),
+        }];
+        config.routing.request.fallback = honk_config::dns::DnsRequestAction::Reject;
+        let (controller, calls) = controller_with_config([192, 0, 2, 30], &config);
+        let (mut listener, address, drain) = start_listener("tcp+udp://127.0.0.1:0", controller, 8);
+
+        let udp_client = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 42), 0))
+            .await
+            .expect("bind source-routed UDP client");
+        udp_client
+            .send_to(&query("udp-source.example", 0x4040), address)
+            .await
+            .expect("send source-routed UDP query");
+        let mut udp_response = [0u8; 512];
+        let udp_length =
+            tokio::time::timeout(Duration::from_secs(2), udp_client.recv(&mut udp_response))
+                .await
+                .expect("source-routed UDP response timeout")
+                .expect("receive source-routed UDP response");
+        assert!(
+            udp_response[..udp_length]
+                .windows(4)
+                .any(|window| window == [192, 0, 2, 30])
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let rejected_udp = udp_exchange(address, &query("udp-fallback.example", 0x4041)).await;
+        assert_eq!(u16::from_be_bytes([rejected_udp[6], rejected_udp[7]]), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let tcp_socket = TcpSocket::new_v4().expect("create source-routed TCP socket");
+        tcp_socket
+            .bind(SocketAddr::new(Ipv4Addr::new(127, 0, 0, 42).into(), 0))
+            .expect("bind source-routed TCP client");
+        let mut tcp_client = tcp_socket
+            .connect(address)
+            .await
+            .expect("connect source-routed TCP client");
+        let tcp_query = query("tcp-source.example", 0x4042);
+        crate::dns::transport::write_length_prefixed(&mut tcp_client, &tcp_query)
+            .await
+            .expect("write source-routed TCP query");
+        let tcp_response = read_tcp_frame(&mut tcp_client).await;
+        assert!(
+            tcp_response
+                .windows(4)
+                .any(|window| window == [192, 0, 2, 30])
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        drop(tcp_client);
+
+        let mut rejected_tcp = TcpStream::connect(address)
+            .await
+            .expect("connect fallback TCP client");
+        let rejected_query = query("tcp-fallback.example", 0x4043);
+        crate::dns::transport::write_length_prefixed(&mut rejected_tcp, &rejected_query)
+            .await
+            .expect("write fallback TCP query");
+        let rejected_response = read_tcp_frame(&mut rejected_tcp).await;
+        assert_eq!(
+            u16::from_be_bytes([rejected_response[6], rejected_response[7]]),
+            0
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        stop_listener(&mut listener, &drain).await;
     }
 
     #[tokio::test]

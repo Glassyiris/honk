@@ -52,6 +52,10 @@ pub struct GlobalConfig {
     pub so_mark_from_dae: u32,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Optional append-only operational log file. Relative paths resolve below
+    /// [`GlobalConfig::data_dir`]; empty keeps file logging disabled.
+    #[serde(default)]
+    pub log_file: String,
     #[serde(default)]
     pub disable_waiting_network: bool,
     #[serde(default)]
@@ -310,6 +314,7 @@ impl Default for GlobalConfig {
             pprof_port: 0,
             so_mark_from_dae: 0,
             log_level: default_log_level(),
+            log_file: String::new(),
             disable_waiting_network: false,
             lan_interface: vec![],
             wan_interface: vec![],
@@ -553,6 +558,9 @@ impl Config {
         self.dns
             .bind_endpoint()
             .map_err(|error| crate::ConfigError::Validation(error.to_string()))?;
+        self.dns
+            .client_subnet_mode()
+            .map_err(|error| crate::ConfigError::Validation(error.to_string()))?;
 
         // The eBPF datapath has the mark compiled in; userspace cannot inject
         // a different value, so a custom mark would silently break the proxy.
@@ -727,6 +735,15 @@ mod builtin_nodes_tests {
         let error = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
         assert!(matches!(error, crate::ConfigError::UnsupportedFeature(_)));
         assert!(error.to_string().contains("honk-policy"));
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_structured_dns_client_subnet() {
+        let config =
+            Config::from_json_str(r#"{"dns":{"client_subnet":"auto(dns.google)"}}"#).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(matches!(error, crate::ConfigError::Validation(_)));
+        assert!(error.to_string().contains("dns.client_subnet"));
     }
 
     #[test]

@@ -86,6 +86,7 @@ flowchart TB
 
 - **旁路标记纪律：** 拨号、探测、DNS 上游、QUIC endpoint 和透明监听器携带 `DAE_BYPASS_MARK`（`0x100`）或使用 loopback。接受后的 TCP 套接字会清除监听器标记；普通 host-netns `dns.bind` 入口套接字则有意保持无标记。
 - **Anyfrom UDP 回包：** 代理 UDP 与透明 53 端口 DNS 回包使用在 `daens` 中创建、并绑定到流量原始目的地址的透明套接字。直接从 TPROXY 监听器回包会暴露 `dae0` 源地址，并在返回路径失败。
+- **DNS 来源边界：** 透明入口与 `dns.bind` adapter 从 socket peer 得到逻辑客户端来源；流关联查询使用已准入流的来源。缓存仅在路由确定所选、与来源无关的 scope 后复用，而 `DOMAIN_ROUTING_MAP` 投影仍为全局且不区分来源。
 - **网络命名空间纪律：** 进程常驻 host netns。它只通过有作用域且完全同步的 `with_daens_netns` 调用进入 `daens`；`setns` 跨度内不得出现 `.await`，恢复原命名空间失败时进程必须中止。
 - **数据路径准入：** `DATAPATH_STATE_MAP[0]` 在全部监听 FD 已发布且全部接收循环已运行前保持关闭，并在拆除监听器前关闭。gate 关闭期间，TC 原样放行流量。
 - **NFQUEUE 就绪与所有权：** 启用但尚未 ready 时，只丢弃需要暂存的新流。honk 独占队列 `320` 和 nftables `inet honk_nfqueue` / `udp_decision`；ready 变更必须经过 fence，生命周期歧义为致命错误，同一 netns 的防火墙管理器不得修改这些对象。
@@ -95,7 +96,7 @@ flowchart TB
 - **组 OR 连通性：** 一个组的 eBPF alive slot 是全部叶子成员状态的 OR，并包含上述单叶 TCP 最后尝试例外。多叶节点组中的单个成员失活不得使整个组 fail-closed。
 - **可选 Honk 隔离：** Honk 用业务目标地址族评分，用代理服务器地址族过滤健康状态；其权威选择不能让死亡成员重新入选。精确目标键与聚合先验只存在于有界进程内存，通过共享状态跨 reload 保留，进程重启即清空，且不会新增到日志、Clash API 文档或 `cache.db`；已有连接元数据保持不变。
 - **Honk 反馈覆盖：** feature 启用后，与 Honk 叶节点关联的实际 attempt 会报告 setup、首响应、双向字节和一个紧凑终态，包括透明 TCP/UDP、受支持的 DNS transport、健康与 delay 探测、preconnect/session/UDP 预热，以及直连或经代理的 UI 下载；没有业务目标的任务只更新聚合 setup 证据。
-- **内部与特殊流量：** honk 自有 veth 网段 `169.254.0.0/16` 和 `fd00:686f:6e6b::/64` 永不代理。L2 广播/组播、IPv4 广播/组播/未指定目的地址以及 IPv6 组播会在路由或 conntrack 前直通。
+- **内部与特殊流量：** honk 的内部链路地址范围 `169.254.0.0/16` 和 `fd00:686f:6e6b::/64` 永不代理。L2 广播/组播、IPv4 广播/组播/未指定目的地址以及 IPv6 组播会在路由或 conntrack 前直通。
 
 ## 构建 feature 与 mock 模式
 
@@ -105,7 +106,7 @@ flowchart TB
 | --- | --- | --- |
 | `ebpf` | 否 | 引入 `aya`、`aya-obj`、`aya-log` 和可选 `honk-nfqueue`；`build.rs` 嵌入 `honk-ebpf` 目标文件。运行时要求 Linux kernel 5.8+。 |
 | `clash-api` | 是 | 引入可选 `axum` 与 `tower-http`，提供 Clash 兼容 REST/WebSocket 服务。 |
-| `mimalloc` | 是 | 引入 `mimalloc` 与 `libmimalloc-sys`，并将 mimalloc 安装为 `honk-core` 二进制的 allocator。 |
+| `mimalloc` | 是 | 引入 `mimalloc` 与 `libmimalloc-sys`，并将 mimalloc 安装为 `honk-core` 二进制的 allocator。在 Linux 上，程序会在启动 Tokio 前为当前进程禁用透明大页。 |
 | `rprx` | 是 | 启用 `honk-outbound/rprx`，注册 VLESS 与 VMess Handler，包括受支持的 VLESS Encryption 和 `xtls-rprx-vision` 路径。 |
 | `honk-policy` | 否 | 将可选评分器转发给 `honk-config` 与 `honk-outbound`；启用 `policy: honk`，按 TCP/UDP、目标 IPv4/IPv6 地址族和精确目标隔离，进行权威的可靠性优先评分。它不增加运行时旋钮或持久化。 |
 

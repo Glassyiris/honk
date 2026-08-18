@@ -72,23 +72,20 @@ impl DotPool {
     async fn dial_tls(&self) -> anyhow::Result<PooledStream> {
         let server_name = self.dial.endpoint.sni.clone();
         let via_proxy = self.dial.proxy.is_some();
-        tokio::time::timeout(self.dial.dial_timeout, async {
-            let tcp = self.dial.dial_tcp_boxed().await?;
-            self.connector
-                .connect(&server_name, tcp)
-                .await
-                .map_err(|error| {
-                    let route = if via_proxy { " (via proxy)" } else { "" };
-                    anyhow::anyhow!("DoT TLS handshake{route}: {error}")
-                })
-        })
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "DoT dial and TLS handshake timed out after {:?}",
-                self.dial.dial_timeout
-            )
-        })?
+        let deadline = tokio::time::Instant::now() + self.dial.dial_timeout;
+        let tcp = self.dial.dial_tcp_boxed_until(deadline).await?;
+        tokio::time::timeout_at(deadline, self.connector.connect(&server_name, tcp))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "DoT dial and TLS handshake timed out after {:?}",
+                    self.dial.dial_timeout
+                )
+            })?
+            .map_err(|error| {
+                let route = if via_proxy { " (via proxy)" } else { "" };
+                anyhow::anyhow!("DoT TLS handshake{route}: {error}")
+            })
     }
 
     pub(crate) async fn close(&self) {

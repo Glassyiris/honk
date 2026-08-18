@@ -135,7 +135,10 @@ impl AliveDialerSet {
                 IpVersion::V6
             };
             if family_addrs.is_empty() {
-                self.mark_dead_for(node_id, ProbeDomain::Tcp, ipver);
+                // A check URL with no address in this family yields no
+                // evidence either way. Marking the family dead here killed
+                // (Tcp, V6) on every cycle for v4-only check URLs, wedging
+                // the group's v6 connectivity slot shut (#46).
                 continue;
             }
 
@@ -413,13 +416,9 @@ impl AliveDialerSet {
             }
         }
 
-        if !any_v4 {
-            self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V4);
-        }
-        if !any_v6 {
-            self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V6);
-        }
-
+        // A node address that resolves to a single address family says
+        // nothing about the other family's reachability through the tunnel —
+        // leave it untouched rather than dead-marking it without evidence.
         if any_ok {
             tracing::info!("Node '{}' is alive after TCP health check", node_name);
         } else {

@@ -176,6 +176,10 @@ pub struct Cli {
     #[arg(short, long, default_value = "/etc/honk/config.dae")]
     pub config: PathBuf,
 
+    /// Append operational logs to this path, overriding `global.log_file`
+    #[arg(long, value_name = "PATH")]
+    pub log_file: Option<PathBuf>,
+
     /// Path to an external eBPF object file (for real eBPF backend).
     /// If omitted, the built-in object file is used.
     #[arg(short = 'b', long)]
@@ -395,6 +399,95 @@ fn validate_udp_nfqueue_runtime(enabled: bool, mock_ebpf: bool) -> anyhow::Resul
     Ok(())
 }
 
+fn probe_runtime_data_dir(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::create_dir_all(path)?;
+    if !std::fs::metadata(path)?.is_dir() {
+        return Err(std::io::Error::other(
+            "runtime data path is not a directory",
+        ));
+    }
+
+    let probe = path.join(format!(
+        ".honk-write-probe-{}",
+        uuid::Uuid::new_v4().as_simple()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&probe)?;
+    drop(file);
+    std::fs::remove_file(probe)
+}
+
+fn prepare_runtime_data_dir_with_fallback(
+    requested: &std::path::Path,
+    fallback: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> anyhow::Result<(PathBuf, Option<std::io::Error>)> {
+    let requested_error = match probe_runtime_data_dir(requested) {
+        Ok(()) => return Ok((requested.to_path_buf(), None)),
+        Err(error) => error,
+    };
+    let fallback = fallback().map_err(|fallback_error| {
+        anyhow::anyhow!(
+            "runtime data directory {} is unusable: {requested_error}; determine fallback working directory: {fallback_error}",
+            requested.display()
+        )
+    })?;
+    probe_runtime_data_dir(&fallback).map_err(|fallback_error| {
+        anyhow::anyhow!(
+            "runtime data directory {} is unusable: {requested_error}; fallback {} is unusable: {fallback_error}",
+            requested.display(),
+            fallback.display()
+        )
+    })?;
+    Ok((fallback, Some(requested_error)))
+}
+
+fn prepare_runtime_data_dir(
+    requested: &std::path::Path,
+) -> anyhow::Result<(PathBuf, Option<std::io::Error>)> {
+    prepare_runtime_data_dir_with_fallback(requested, std::env::current_dir)
+}
+
+fn resolved_log_file_path(
+    config: &Config,
+    cli_override: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    cli_override
+        .map(honk_config::paths::resolve_artifact_path)
+        .or_else(|| match config.global.log_file.trim() {
+            "" => None,
+            path => Some(honk_config::paths::resolve_artifact_path(path)),
+        })
+}
+
+fn open_log_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            anyhow::anyhow!("create log directory {}: {error}", parent.display())
+        })?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("open log file {}: {error}", path.display()))?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "log destination is not a regular file: {}",
+        path.display()
+    );
+    Ok(file)
+}
+
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Load the configuration before initializing logging so `log_level` in
     // the config file is honored (previously only --debug/RUST_LOG had any
@@ -402,15 +495,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let mut config = Config::from_file(cli.config.to_str().unwrap())?;
     config.validate()?;
     validate_udp_nfqueue_runtime(config.experimental.udp_nfqueue.enabled, cli.mock_ebpf)?;
-    honk_config::paths::set_data_dir(PathBuf::from(&config.global.data_dir)).map_err(
-        |requested| {
-            anyhow::anyhow!(
-                "runtime data directory is already {}; cannot switch to {}",
-                honk_config::paths::data_dir().display(),
-                requested.display()
-            )
-        },
-    )?;
+    let requested_data_dir = PathBuf::from(&config.global.data_dir);
+    let (runtime_data_dir, data_dir_creation_error) =
+        prepare_runtime_data_dir(&requested_data_dir)?;
+    honk_config::paths::set_data_dir(runtime_data_dir).map_err(|requested| {
+        anyhow::anyhow!(
+            "runtime data directory is already {}; cannot switch to {}",
+            honk_config::paths::data_dir().display(),
+            requested.display()
+        )
+    })?;
     // Make `direct`/`block` usable as group members without declaring them
     // in the config (Direct/Block protocols → DirectHandler/BlockHandler).
     config.ensure_builtin_nodes();
@@ -428,21 +522,46 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
 
-    // The console and Clash API have independent per-layer filters. With no
-    // `/logs` subscription, the API layer contributes no callsite interest.
+    let log_file_path = resolved_log_file_path(&config, cli.log_file.as_deref());
+    let log_file_layer = if let Some(path) = log_file_path.as_ref() {
+        let file = open_log_file(path)?;
+        Some(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .with_filter(env_filter.clone()),
+        )
+    } else {
+        None
+    };
+
+    // Console, optional file, and Clash API output use independent layers.
+    // With no `/logs` subscription, the API layer contributes no callsite interest.
     #[cfg(feature = "clash-api")]
     let (clash_log_layer, clash_log_handle) = clash_api::logs::layer();
 
     use tracing_subscriber::prelude::*;
     let registry = tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(env_filter));
+        .with(tracing_subscriber::fmt::layer().with_filter(env_filter))
+        .with(log_file_layer);
     #[cfg(feature = "clash-api")]
     let registry = registry.with(clash_log_layer);
     registry.init();
 
     info!("honk-core v{} starting", env!("CARGO_PKG_VERSION"));
     info!("Config: {}", cli.config.display());
+    if let Some(error) = data_dir_creation_error {
+        warn!(
+            requested = %requested_data_dir.display(),
+            fallback = %honk_config::paths::data_dir().display(),
+            %error,
+            "Runtime data directory is unusable; using process working directory"
+        );
+    }
     info!(directory = %honk_config::paths::data_dir().display(), "Runtime data directory configured");
+    if let Some(path) = log_file_path.as_ref() {
+        info!(path = %path.display(), "File logging enabled");
+    }
 
     let effective_nofile = match raise_nofile_rlimit() {
         Ok(limit) => limit,
@@ -638,7 +757,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Some(acquire_instance_lock(&cli.bpf_pin_root)?)
     };
 
-    // Create dae0 veth BEFORE eBPF load so PARAM.dae0_ifindex is correct.
+    // Create the dae0 link pair before eBPF load so PARAM.dae0_ifindex is correct.
     // dae0peer stays in the host namespace during the dae0 attach, then moves
     // to the daens netns in setup_daens_namespace() below.
     #[cfg(feature = "ebpf")]
@@ -664,9 +783,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             if let Some(lan_ifname) = configured_ifaces.lan.first() {
                 let _ = set_sysctl(&format!("net.ipv4.conf.{}.rp_filter", lan_ifname), "0");
             }
-            _dae0_guard = Some(create_dae0_veth()?);
+            _dae0_guard = Some(create_dae0_link()?);
+            for wan_ifname in &configured_ifaces.wan {
+                enable_wan_accept_ra(wan_ifname);
+            }
             info!(
-                "dae0 veth created before eBPF load (ifindex={})",
+                "dae0 link created before eBPF load (ifindex={})",
                 _dae0_guard.as_ref().unwrap().ifindex
             );
         }
@@ -871,7 +993,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     // We follow Go dae-core: no global iptables PREROUTING rules. Proxy-bound
     // traffic is selected by the LAN ingress TC eBPF program and redirected to
-    // the dae0 veth; dae0peer_ingress / tproxy_sk_lookup in daens then assign
+    // the dae0 link; dae0peer_ingress / tproxy_sk_lookup in daens then assign
     // it (bpf_sk_assign) to the TPROXY listener sockets bound inside daens.
     // Accepted connections are handled on host-netns worker threads, and
     // replies to the client egress dae0peer and take the host dae0_ingress
@@ -884,6 +1006,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     } else {
         info!("Skipping eBPF datapath setup (mock mode)");
     }
+
+    dns::ecs::resolve_client_subnet(&mut config.dns).await;
+    let dns_client_subnet = config
+        .dns
+        .effective_client_subnet()
+        .map_err(anyhow::Error::new)?;
 
     let router = routing::Router::new(&config.routing.rules, &config.routing.default_outbound)?;
     info!("Router ready with {} compiled routes", router.route_count());
@@ -909,7 +1037,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             config.nodes.clone(),
             config.groups.clone(),
             honk_outbound::bootstrap::BootstrapResolver::parse(&config.global.bootstrap_resolver),
+            config.dns.strategy.clone(),
         )?
+        .with_client_subnet(dns_client_subnet)
         .with_timeouts(
             std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
             std::time::Duration::from_millis(config.global.connect_timeout_ms),
@@ -948,6 +1078,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         dns_upstream_pool.clone(),
         resource_budget,
     )?;
+    control_plane.set_log_file_override(cli.log_file.clone(), log_file_path);
 
     #[cfg(feature = "ebpf")]
     let iface_watcher = if !cli.mock_ebpf {
@@ -1355,9 +1486,8 @@ pub struct Dae0Setup {
     pub peer_mac: [u8; 6],
 }
 
-/// Guard that removes the `dae0` veth pair and policy routing when it goes
-/// out of scope.  If setup fails mid-way, the drop impl cleans up whatever was
-/// already installed.
+/// Guard that removes the `dae0` link pair and policy routing when it goes out
+/// of scope. If setup fails mid-way, drop cleans up whatever was installed.
 ///
 /// Link-local addressing (169.254.0.1/32 on dae0, 169.254.0.11/32 on dae0peer)
 /// eliminates the need for iptables MASQUERADE and TCP MSS clamping — the kernel
@@ -1385,7 +1515,7 @@ impl Drop for Dae0Guard {
 }
 
 #[cfg(feature = "ebpf")]
-fn create_dae0_veth() -> anyhow::Result<Dae0Guard> {
+fn create_dae0_link() -> anyhow::Result<Dae0Guard> {
     let mut guard = Dae0Guard::new();
 
     // Stale-state cleanup (previous run): drop the compat bind-mount (the
@@ -1404,9 +1534,10 @@ fn create_dae0_veth() -> anyhow::Result<Dae0Guard> {
     create_daens_namespace()?;
 
     let mut nl = netlink::NlSock::new().map_err(|e| anyhow::anyhow!("netlink: {e}"))?;
-    nl.add_veth_pair("dae0", "dae0peer")
-        .map_err(|e| anyhow::anyhow!("failed to add dae0 veth pair: {e}"))?;
-    info!("Created dae0/dae0peer veth pair");
+    let link_kind = nl
+        .add_link_pair("dae0", "dae0peer")
+        .map_err(|e| anyhow::anyhow!("failed to add dae0 link pair: {e}"))?;
+    info!(kind = ?link_kind, "Created dae0/dae0peer link pair");
 
     let dae0_idx = netlink::ifindex_of("dae0")?;
     let peer_idx = netlink::ifindex_of("dae0peer")?;
@@ -1444,7 +1575,7 @@ fn create_dae0_veth() -> anyhow::Result<Dae0Guard> {
         .map_err(|e| anyhow::anyhow!("dae0 IPv4 address {}: {e}", host_v4))?;
 
     // Assign an IPv6 ULA address to the host-side dae0 so the daens
-    // namespace can route IPv6 replies back through this veth.
+    // namespace can route IPv6 replies back through this link.
     let host_v6: std::net::Ipv6Addr = DAENS_HOST_IPV6.parse().unwrap();
     let _ = nl.addr_op(false, dae0_idx, netlink::FAM_V6, &host_v6.octets(), 64);
     let _ = nl.addr_op(true, dae0_idx, netlink::FAM_V6, &host_v6.octets(), 64);
@@ -1554,7 +1685,7 @@ fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<(
             Some(peer),
         );
 
-        // Static neighbours for the host side of the veth (v4 + v6).
+        // Static neighbours for the host side of the link (v4 + v6).
         n.neigh_replace(peer, FAM_V4, &host_v4.octets(), &dae0_mac)?;
         let _ = n.neigh_replace(peer, FAM_V6, &host_v6.octets(), &dae0_mac);
 
@@ -1857,7 +1988,7 @@ fn cleanup_dae0_interface(recorded_ifindex: Option<u32>) {
     let _ = nl.del_rule_fwmark(netlink::FAM_V6, honk_ebpf_common::TPROXY_MARK, 100);
 }
 
-/// Addressing for the dae0/dae0peer veth pair between the host namespace and
+/// Addressing for the dae0/dae0peer link pair between the host namespace and
 /// the isolated `daens` namespace.  These strings are the canonical values:
 /// the netns setup consumes them (ebpf feature only), while the control
 /// plane's internal-traffic filter (`control::is_honk_internal_addr`) uses
@@ -1871,7 +2002,7 @@ fn cleanup_dae0_interface(recorded_ifindex: Option<u32>) {
 pub(crate) const DAENS_HOST_IP: &str = "169.254.0.1";
 #[cfg(any(feature = "ebpf", test))]
 pub(crate) const DAENS_PEER_IP: &str = "169.254.0.11";
-/// IPv6 ULA addresses of the dae0/dae0peer veth pair (fd00:686f:6e6b::/64).
+/// IPv6 ULA addresses of the dae0/dae0peer link pair (fd00:686f:6e6b::/64).
 /// The middle hextets are ASCII "honk" (`68 6f 6e 6b`) so the mnemonic
 /// stays readable while remaining a valid IPv6 ULA prefix.
 #[cfg(any(feature = "ebpf", test))]
@@ -1886,7 +2017,7 @@ pub(crate) const DAE0_IPV6_PREFIX_HI: u64 = 0xfd00_686f_6e6b_0000;
 /// (169.254.0.0/16), as a big-endian u32.
 pub(crate) const DAE0_IPV4_NET: u32 = 0xA9FE_0000;
 
-fn set_sysctl(key: &str, value: &str) -> anyhow::Result<()> {
+pub(crate) fn set_sysctl(key: &str, value: &str) -> anyhow::Result<()> {
     // Prefer /proc/sys because the standalone `sysctl` binary may not be on
     // PATH in minimal environments (e.g. NixOS containers).
     let path = format!("/proc/sys/{}", key.replace('.', "/"));
@@ -1908,6 +2039,17 @@ fn set_sysctl(key: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Keep RA reception alive on a WAN interface across the datapath's
+/// all.forwarding=1 pin: with the stock accept_ra=1 the kernel drops RAs
+/// once forwarding is on, and networkd's userspace RA disables itself the
+/// same way — either path lets the SLAAC default route expire (#46).
+#[cfg(feature = "ebpf")]
+pub(crate) fn enable_wan_accept_ra(ifname: &str) {
+    if let Err(e) = set_sysctl(&format!("net.ipv6.conf.{ifname}.accept_ra"), "2") {
+        warn!("failed to set accept_ra for {ifname}: {e}");
+    }
+}
+
 /// Whether `path` is a mountpoint (appears in /proc/mounts).
 #[cfg(feature = "ebpf")]
 fn is_mountpoint(path: &str) -> bool {
@@ -1918,7 +2060,9 @@ fn is_mountpoint(path: &str) -> bool {
 #[cfg(test)]
 mod startup_lifecycle_tests {
     use super::{
-        ClashCommand, Cli, publish_instance_pid, running_instance_pid, validate_udp_nfqueue_runtime,
+        ClashCommand, Cli, open_log_file, prepare_runtime_data_dir,
+        prepare_runtime_data_dir_with_fallback, publish_instance_pid, running_instance_pid,
+        validate_udp_nfqueue_runtime,
     };
     use clap::Parser;
 
@@ -1939,6 +2083,119 @@ mod startup_lifecycle_tests {
         assert_eq!(
             honk_config::routing::DATAPATH_RESERVED_MARK_MASK,
             honk_ebpf_common::SKB_MARK_RESERVED_MASK,
+        );
+    }
+
+    #[test]
+    fn missing_runtime_data_directory_is_created() {
+        let root = tempfile::tempdir().expect("create temporary directory");
+        let data_dir = root.path().join("nested/data");
+        assert!(!data_dir.exists());
+
+        let (effective, error) =
+            prepare_runtime_data_dir(&data_dir).expect("prepare runtime data directory");
+
+        assert_eq!(effective, data_dir);
+        assert!(error.is_none());
+        assert!(effective.is_dir());
+        assert_eq!(std::fs::read_dir(&effective).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn runtime_data_directory_symlink_remains_usable() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("create temporary directory");
+        let target = root.path().join("data");
+        let link = root.path().join("data-link");
+        std::fs::create_dir(&target).expect("create data directory");
+        symlink(&target, &link).expect("create data directory symlink");
+
+        let (effective, error) = prepare_runtime_data_dir_with_fallback(&link, || {
+            Ok(root.path().join("unused-fallback"))
+        })
+        .expect("prepare symlinked runtime data directory");
+        assert_eq!(effective, link);
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn existing_read_only_data_directory_uses_writable_fallback() {
+        let fallback = tempfile::tempdir().expect("create fallback directory");
+
+        let (effective, error) =
+            prepare_runtime_data_dir_with_fallback(std::path::Path::new("/proc"), || {
+                Ok(fallback.path().to_path_buf())
+            })
+            .expect("prepare fallback data directory");
+
+        assert_eq!(effective, fallback.path());
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn unusable_data_directory_and_fallback_preserve_both_errors() {
+        let root = tempfile::tempdir().expect("create temporary directory");
+        let invalid = root.path().join("not-a-directory");
+        std::fs::write(&invalid, "file").expect("create blocking file");
+
+        let error = prepare_runtime_data_dir_with_fallback(&invalid, || {
+            Ok(std::path::PathBuf::from("/proc"))
+        })
+        .expect_err("reject unusable fallback");
+        let message = error.to_string();
+        assert!(message.contains(&invalid.display().to_string()));
+        assert!(message.contains("/proc"));
+        assert!(message.contains("fallback"));
+    }
+
+    #[test]
+    fn new_log_file_is_private_regular_and_existing_mode_is_preserved() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("create temporary directory");
+        let path = root.path().join("logs/honk.log");
+        drop(open_log_file(&path).expect("create log file"));
+        let metadata = std::fs::metadata(&path).expect("read log metadata");
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+            .expect("set existing log permissions");
+        drop(open_log_file(&path).expect("reopen existing log file"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn log_symlink_is_rejected_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("create temporary directory");
+        let target = root.path().join("target.log");
+        let link = root.path().join("honk.log");
+        std::fs::write(&target, "unchanged").expect("create target");
+        symlink(&target, &link).expect("create log symlink");
+
+        assert!(open_log_file(&link).is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "unchanged");
+    }
+
+    #[test]
+    fn non_regular_log_destination_is_rejected() {
+        assert!(open_log_file(std::path::Path::new("/dev/null")).is_err());
+    }
+
+    #[test]
+    fn log_file_option_parses() {
+        let cli =
+            Cli::try_parse_from(["honk-core", "--log-file", "/var/log/honk/cli.log", "reload"])
+                .expect("parse log file option");
+        assert_eq!(
+            cli.log_file.as_deref(),
+            Some(std::path::Path::new("/var/log/honk/cli.log"))
         );
     }
 

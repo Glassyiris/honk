@@ -5,8 +5,8 @@
 //! server negotiates h2 via ALPN (dispatched per connection — the probe
 //! offers `h2,http/1.1` and speaks whichever the server picks, Go-client
 //! style). Successful measurements feed the node's latency history in
-//! [`AliveDialerSet`]; failed ones clear it (sing-box "delete history"
-//! semantics), so a failed node immediately sorts last in URLTest selection.
+//! [`AliveDialerSet`]. A lone failure leaves history unchanged; a second
+//! consecutive failure adds a synthetic penalty and demotes the node.
 //!
 //! Used by the clash API delay endpoints; the periodic health check loop in
 //! `alive` is unaffected by these ad-hoc measurements.
@@ -594,8 +594,8 @@ where
 
 /// Measure every member of a group concurrently (at most
 /// [`URLTEST_MAX_CONCURRENT`] at a time) and fold the results into the
-/// alive set: successes record the measured TCP latency, failures clear
-/// the node's latency history (sing-box deletes history on failure).
+/// alive set: successes record the measured TCP latency; only a second
+/// consecutive failure adds a synthetic penalty and demotes the node.
 ///
 /// Returns one `(node_name, result)` entry per member, in member order.
 pub async fn urltest_group(
@@ -1357,8 +1357,10 @@ mod tests {
     #[tokio::test]
     async fn test_urltest_group_marks_failure_with_synthetic_sample() {
         // Plaintext HTTP server: every https measurement fails the TLS
-        // handshake, so the group run must append a synthetic penalty sample
-        // for both the dial-failing and the handshake-failing member.
+        // handshake, so two consecutive failing group runs must append a
+        // synthetic penalty sample for both the dial-failing and the
+        // handshake-failing member (a lone transient failure strikes
+        // nothing).
         let addr = spawn_mock_http_server().await;
         let url = format!("https://{}:{}/", addr.ip(), addr.port());
 
@@ -1380,9 +1382,10 @@ mod tests {
             );
         }
 
+        let runtime = Arc::new(crate::runtime::OutboundRuntimeRegistry::build(&members).unwrap());
         let results = urltest_group(
             &members,
-            &Arc::new(crate::runtime::OutboundRuntimeRegistry::build(&members).unwrap()),
+            &runtime,
             &registry,
             &alive_set,
             &url,
@@ -1396,10 +1399,26 @@ mod tests {
         assert!(results[0].1.is_err());
         assert!(results[1].1.is_err());
 
-        // Failure → synthetic penalty sample on top of the retained history:
-        // the latest sample is the 10s placeholder (display-only) and a
-        // failure strike demotes the node, while the real 999ms moving
-        // average survives unpoisoned.
+        // One failed run leaves no selection state.
+        for m in &members {
+            assert!(!alive_set.is_failure_demoted(m.id, ProbeDomain::Tcp, IpVersion::V4));
+        }
+
+        let results = urltest_group(
+            &members,
+            &runtime,
+            &registry,
+            &alive_set,
+            &url,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(results.iter().all(|(_, r)| r.is_err()));
+
+        // The second consecutive failure → synthetic penalty sample on top
+        // of the retained history: the latest sample is the 10s placeholder
+        // (display-only) and a failure strike demotes the node, while the
+        // real 999ms moving average survives unpoisoned.
         for m in &members {
             assert_eq!(
                 alive_set.get_last_latency(m.id, ProbeDomain::Tcp, IpVersion::V4),

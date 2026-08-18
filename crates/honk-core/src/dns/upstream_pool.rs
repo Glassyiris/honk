@@ -145,27 +145,55 @@ mod admission {
 }
 mod entries {
     use std::collections::HashMap;
+    use std::net::SocketAddr;
     use std::sync::Arc;
 
-    use honk_config::dns::DnsUpstream;
+    use honk_config::dns::{DnsStrategy, DnsUpstream};
 
     use super::transports::{PooledTransport, TransportKey};
     use crate::dns::endpoint::DnsEndpoint;
     use crate::dns::transport::{LifecycleSlot, UdpPool};
 
+    #[derive(Default)]
+    pub(super) struct UdpState {
+        pub(super) current: Option<SocketAddr>,
+        pub(super) pools: [Option<(SocketAddr, Arc<UdpPool>)>; 2],
+    }
+
+    impl UdpState {
+        pub(super) fn current_pool(&self) -> Option<(SocketAddr, Arc<UdpPool>)> {
+            let current = self.current?;
+            let family = usize::from(current.is_ipv6());
+            self.pools[family]
+                .as_ref()
+                .filter(|(address, _)| *address == current)
+                .map(|(_, pool)| (current, Arc::clone(pool)))
+        }
+
+        pub(super) fn mark_current(&mut self, address: SocketAddr) {
+            let family = usize::from(address.is_ipv6());
+            if self.pools[family]
+                .as_ref()
+                .is_some_and(|(cached, _)| *cached == address)
+            {
+                self.current = Some(address);
+            }
+        }
+    }
+
     pub(super) struct UpstreamEntry {
         pub(super) protocol: honk_config::types::DnsProtocol,
         pub(super) endpoint: DnsEndpoint,
-        pub(super) address: String,
         pub(super) outbound: Option<String>,
         pub(super) transports:
             parking_lot::Mutex<HashMap<TransportKey, Arc<LifecycleSlot<PooledTransport>>>>,
-        pub(super) udp: parking_lot::Mutex<HashMap<std::net::SocketAddr, Arc<UdpPool>>>,
+        pub(super) udp: parking_lot::Mutex<UdpState>,
     }
 
     pub(super) fn build_entries(
         upstreams: &[DnsUpstream],
         bootstrap_resolver: Option<honk_outbound::bootstrap::BootstrapResolver>,
+        strategy: DnsStrategy,
     ) -> anyhow::Result<HashMap<String, UpstreamEntry>> {
         let mut entries = HashMap::new();
         for upstream in upstreams {
@@ -174,6 +202,7 @@ mod entries {
                 upstream.protocol,
                 upstream.tls_server_name.as_deref(),
                 bootstrap_resolver,
+                strategy.clone(),
             )
             .map_err(|error| {
                 anyhow::anyhow!(
@@ -187,10 +216,9 @@ mod entries {
                 UpstreamEntry {
                     protocol: upstream.protocol,
                     endpoint,
-                    address: upstream.address.clone(),
                     outbound: upstream.outbound.clone(),
                     transports: parking_lot::Mutex::new(HashMap::new()),
-                    udp: parking_lot::Mutex::new(HashMap::new()),
+                    udp: parking_lot::Mutex::new(UdpState::default()),
                 },
             );
         }
@@ -209,7 +237,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
-use honk_config::dns::DnsUpstream;
+use honk_config::dns::{DnsStrategy, DnsUpstream};
 use honk_config::node::{Group, Node};
 use honk_outbound::group::{GroupManager, SharedGroupManager};
 #[cfg(test)]
@@ -232,6 +260,7 @@ pub struct TransportLifecycleStats {
 pub struct UpstreamPool {
     entries: HashMap<String, UpstreamEntry>,
     proxy_registry: Option<Arc<ProxyRegistry>>,
+    client_subnet: Option<ipnet::Ipv4Net>,
     runtime_generation: std::sync::OnceLock<Arc<honk_outbound::runtime::OutboundRuntimeRegistry>>,
     nodes: Vec<Node>,
     groups: Vec<Group>,
@@ -273,6 +302,7 @@ impl UpstreamPool {
             nodes,
             groups,
             honk_outbound::bootstrap::global(),
+            DnsStrategy::default(),
         )
     }
 
@@ -283,10 +313,12 @@ impl UpstreamPool {
         nodes: Vec<Node>,
         groups: Vec<Group>,
         bootstrap_resolver: Option<honk_outbound::bootstrap::BootstrapResolver>,
+        strategy: DnsStrategy,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            entries: build_entries(upstreams, bootstrap_resolver)?,
+            entries: build_entries(upstreams, bootstrap_resolver, strategy)?,
             proxy_registry,
+            client_subnet: None,
             runtime_generation: std::sync::OnceLock::new(),
             nodes,
             groups,
@@ -310,6 +342,11 @@ impl UpstreamPool {
     ) -> Self {
         self.dns_query_timeout = dns_query_timeout;
         self.dns_dial_timeout = dns_dial_timeout;
+        self
+    }
+
+    pub fn with_client_subnet(mut self, client_subnet: Option<ipnet::Ipv4Net>) -> Self {
+        self.client_subnet = client_subnet;
         self
     }
 

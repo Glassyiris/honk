@@ -199,12 +199,20 @@ impl UpstreamPool {
             .clone()
             .map(|feedback| feedback.with_context(tcp_target_context(entry, route.target)))
     }
-
+    #[cfg(test)]
     pub(super) async fn resolve_dial_route(
         &self,
         entry: &UpstreamEntry,
     ) -> anyhow::Result<DnsDialRoute> {
         let target = Self::resolve_udp_addr(entry).await?;
+        self.resolve_dial_route_for_address(entry, target).await
+    }
+
+    pub(super) async fn resolve_dial_route_for_address(
+        &self,
+        entry: &UpstreamEntry,
+        target: SocketAddr,
+    ) -> anyhow::Result<DnsDialRoute> {
         if let Some(tag) = entry.outbound.as_deref() {
             #[cfg(feature = "honk-policy")]
             let (node, feedback) = self.resolve_outbound_for_target(tag, entry, target);

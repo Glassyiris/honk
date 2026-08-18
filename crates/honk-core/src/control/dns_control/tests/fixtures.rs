@@ -2,8 +2,8 @@ use super::*;
 
 pub(super) struct SlowUpstream {
     pub(super) calls: AtomicUsize,
-    delay: Duration,
-    response: Vec<u8>,
+    pub(super) delay: Duration,
+    pub(super) response: Vec<u8>,
 }
 
 #[async_trait::async_trait]
@@ -37,18 +37,27 @@ pub(super) fn controller_with_limit(
     Arc::new(controller)
 }
 
+pub(super) fn controller_with_dns_config(
+    upstream: Arc<dyn DnsUpstreamPool>,
+    config: &honk_config::dns::DnsConfig,
+) -> Arc<DnsController> {
+    Arc::new(controller_for_upstream_and_config(upstream, config))
+}
+
 fn controller_for_upstream(upstream: Arc<dyn DnsUpstreamPool>) -> DnsController {
+    controller_for_upstream_and_config(upstream, &honk_config::dns::DnsConfig::default())
+}
+
+fn controller_for_upstream_and_config(
+    upstream: Arc<dyn DnsUpstreamPool>,
+    config: &honk_config::dns::DnsConfig,
+) -> DnsController {
     let forwarder = Arc::new(DnsForwarder::new(
         upstream,
         Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(
             16,
         ))),
-        Arc::new(
-            crate::dns::routing::DnsRouter::new_from_dns_config(
-                &honk_config::dns::DnsConfig::default(),
-            )
-            .expect("router"),
-        ),
+        Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(config).expect("router")),
     ));
     DnsController::new(
         forwarder,

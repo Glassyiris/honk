@@ -2,7 +2,7 @@
 //!
 //! `lan_ingress` intercepts LAN traffic, makes a routing decision, and
 //! redirects proxy-bound flows into the isolated `daens` namespace via the
-//! `dae0` veth.  The `sk_lookup` BPF program in `daens` then assigns the
+//! `dae0` link. The `sk_lookup` BPF program in `daens` then assigns the
 //! packet to the local transparent listener socket.  `dae0_ingress` rewrites
 //! replies from that listener back onto the original LAN interface so the
 //! three-way handshake can complete without involving host IP forwarding.
@@ -184,12 +184,10 @@ fn redirect_lan_packet_to_control_plane(
         }
     }
 
-    // Redirect the packet to the host-side dae0 veth.  From there it crosses
-    // into the isolated daens namespace via the veth peer (dae0peer), where
-    // the sk_lookup program overrides socket selection and delivers it to the
-    // local TPROXY listener while preserving the original destination.
+    // Redirect to host-side dae0. The netkit or veth peer delivers it inside
+    // daens as dae0peer, where sk_lookup selects the local TPROXY listener.
     let param = PARAM.load();
-    // bpf_redirect_peer() bypasses the CPU backlog for veth peer redirect.
+    // bpf_redirect_peer() bypasses the CPU backlog for paired links.
     // Requires kernel >= 6.8 (CVE-2025-37959 fix). Userspace verifies the
     // kernel version before enabling this flag.
     if param.use_redirect_peer != 0 {

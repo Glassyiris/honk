@@ -749,6 +749,9 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
     if let Some(v) = kv.get("log_level") {
         cfg.log_level = v.clone();
     }
+    if let Some(v) = kv.get("log_file") {
+        cfg.log_file = v.clone();
+    }
     if let Some(v) = kv.get("disable_waiting_network") {
         cfg.disable_waiting_network = parse_bool(v);
     }
@@ -874,6 +877,11 @@ fn parse_dns_section(section: &Section) -> Result<DnsConfig, crate::ConfigError>
     }
     if let Some(v) = kv.get("use_host") {
         cfg.use_host = parse_bool(v);
+    }
+    if let Some(value) = kv.get("client_subnet") {
+        cfg.client_subnet.clone_from(value);
+        cfg.client_subnet_mode()
+            .map_err(|error| crate::ConfigError::Parse(error.to_string()))?;
     }
 
     if let Some(v) = kv.get("ipversion_prefer") {
@@ -1192,6 +1200,11 @@ fn parse_dns_conditions(expr: &str, is_response: bool) -> Vec<crate::dns::DnsCon
                 .filter_map(|a| crate::dns::parse_qtype_token(a))
                 .collect();
             conds.push(crate::dns::DnsCond::Qtype { not, types });
+            continue;
+        }
+
+        if let Some(cidrs) = extract_fn_args(inner, "sip") {
+            conds.push(crate::dns::DnsCond::Sip { not, cidrs });
             continue;
         }
 

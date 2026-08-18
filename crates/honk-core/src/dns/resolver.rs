@@ -56,6 +56,16 @@ impl DnsResolver {
         self.service.resolve_name(domain).await
     }
 
+    pub async fn resolve_for_source(
+        &self,
+        domain: &str,
+        source_ip: IpAddr,
+    ) -> anyhow::Result<ResolvedAddr> {
+        self.service
+            .resolve_name_for_source(domain, source_ip)
+            .await
+    }
+
     pub async fn resolve_first_ipv4(&self, domain: &str) -> anyhow::Result<Option<IpAddr>> {
         let result = self.resolve(domain).await?;
         Ok(result.ipv4.first().copied())
@@ -70,7 +80,10 @@ impl DnsResolver {
 fn build_forwarder_from_config(config: &DnsConfig) -> anyhow::Result<Arc<DnsForwarder>> {
     let dns_cache = Arc::new(Mutex::new(DnsCache::new(config.cache.max_size)));
     let router = Arc::new(DnsRouter::new_from_dns_config(config)?);
-    let pool = Arc::new(UpstreamPool::new(&config.upstream, Arc::clone(&router))?);
+    let pool = Arc::new(
+        UpstreamPool::new(&config.upstream, Arc::clone(&router))?
+            .with_client_subnet(config.effective_client_subnet()?),
+    );
     Ok(Arc::new(
         DnsForwarder::new(pool, dns_cache, router)
             .with_strategy(config.strategy.clone())

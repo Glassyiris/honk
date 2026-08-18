@@ -42,7 +42,7 @@ The entry file's own sections merge first regardless of where its `include` bloc
 
 ## Runtime data directory
 
-`global.data_dir` is the process-wide root for runtime state and relative runtime-supplied files. It defaults to `/var/share/honk`, must be a non-empty absolute path, and is restart-required. Relative `experimental.cache_file.path`, `experimental.clash_api.external_ui`, the `.sub` subscription store, `geoip.dat`, `geosite.dat`, and node `ech_config_path` resolve under it; absolute child paths stay literal. If the preferred data-directory copy is absent, honk retains an existing legacy cache beside the entry config, an existing `./.sub` store, or an existing working-directory UI/ECH path until it is moved. Geo lookup gives an existing `$DAE_LOCATION_ASSET/<file>` first priority, then checks `data_dir`, the working directory, and dae's standard asset directories.
+`global.data_dir` is the process-wide root for runtime state and relative runtime-supplied files. It defaults to `/var/share/honk`, must be a non-empty absolute path, and is restart-required. At startup honk recursively creates the directory, then verifies it by creating and removing a private random probe file without following a probe symlink. An unusable candidate falls back only to a working directory that passes the same probe; startup fails with both causes if neither works. Relative `global.log_file`, `experimental.cache_file.path`, `experimental.clash_api.external_ui`, the `.sub` subscription store, `geoip.dat`, `geosite.dat`, and node `ech_config_path` resolve under the effective directory; absolute child paths stay literal. If the preferred data-directory copy is absent, honk retains an existing legacy cache beside the entry config, an existing `./.sub` store, or an existing working-directory UI/ECH path until it is moved. Geo lookup checks an existing `$DAE_LOCATION_ASSET/<file>` first, followed by the effective data directory, working directory, and standard dae asset directories.
 
 See the [global reference](./reference/global.md).
 
@@ -59,6 +59,8 @@ global {
     lan_interface: eth0
     # Emit normal operational logs.
     log_level: info
+    # Also append logs to <data_dir>/honk.log.
+    log_file: 'honk.log'
     # Sniff domains and verify their destination IP.
     dial_mode: domain
     # Apply the recommended gateway sysctls.
@@ -117,6 +119,7 @@ global {
     wan_interface: auto
     lan_interface: br-lan
     log_level: info
+    log_file: 'honk.log'
     dial_mode: domain++
     auto_config_kernel_parameter: true
     data_dir: '/var/share/honk'
@@ -150,6 +153,7 @@ routing {
 
 dns {
     ipversion_prefer: 4
+    # client_subnet: auto  # Optional: infer one public-path /24 for named upstreams.
     upstream {
         direct_dns: 'udp://1.1.1.1:53' -> direct
         proxy_doh: 'https://dns.google/dns-query' -> proxy
@@ -224,22 +228,24 @@ Upstream forms are bare `host:port` (UDP) or `udp://`, `tcp://`, `tcp+udp://`/`u
 ```dae
 dns {
     upstream {
-        secure: 'https://dns.google/dns-query' -> proxy
+        home: 'udp://223.5.5.5:53' -> direct
+        lan_proxy: 'https://dns.google/dns-query' -> proxy
     }
     routing {
         request {
-            qname(suffix: example.org) && !qtype(aaaa) -> secure
-            fallback: secure
-        }
-        response {
-            upstream(secure) -> accept
-            fallback: accept
+            sip(192.168.50.0/24, 100.64.0.0/10) -> lan_proxy
+            sip(127.0.0.0/8, ::1/128) && qname(suffix: example-isp.cn) -> asis
+            fallback: home
         }
     }
 }
 ```
 
-Leave `bind` empty for transparent port-53 interception only. Standalone forms require an explicit port: bare numeric `IP:port` (UDP), `udp://host:port`, `tcp://host:port`, or `tcp+udp://host:port`; an empty host binds wildcard addresses. Bind loopback unless a host firewall protects LAN exposure. Omit `ipversion_prefer` for `both`, or set `4`/`6` to prefer that family.
+`sip(...)` is request-only and matches the logical DNS client IP against host addresses or CIDRs. Transparent port-53 and `dns.bind` queries use their socket peer; DNS lookups made for an admitted TCP/UDP flow use that flow's client address. Internal, bootstrap, prefetch, and Clash API queries have no client source, so neither `sip(...)` nor `!sip(...)` matches and routing falls through. A source-aware flow lookup still has no intercepted DNS-server destination, so selecting `asis` fails closed.
+
+Leave `bind` empty for transparent port-53 interception only. Standalone forms require an explicit port: bare numeric `IP:port` (UDP), `udp://host:port`, `tcp://host:port`, or `tcp+udp://host:port`; an empty host binds wildcard addresses. Bind loopback unless a host firewall protects LAN exposure. Omit `ipversion_prefer` for `both`, or set `4`/`6` to prefer that family for both DNS results and bootstrap-resolved upstream dials; a failed preferred-family dial falls back to the other family.
+
+`client_subnet` is off by default. Use a fixed IPv4/CIDR for deterministic ECS, or `auto` to infer the first public path hop as a `/24` without DNS or HTTP. Automatic inference is refreshed on reload and network changes; a bounded failure sends no generated ECS. Existing client ECS always wins. See the privacy warning in the reference before enabling it.
 
 See the [DNS reference](./reference/dns.md).
 

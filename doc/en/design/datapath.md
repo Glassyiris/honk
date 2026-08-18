@@ -27,7 +27,7 @@ flowchart LR
 
 A throwaway thread calls `unshare(CLONE_NEWNET)`, opens `/proc/thread-self/ns/net`, and hands the resulting `OwnedFd` to the process. That FD pins `daens` for the process lifetime. `/var/run/netns/daens` is only a best-effort compatibility bind mount; the engine does not use it as the namespace owner.
 
-Rtnetlink creates `dae0`/`dae0peer`, moves `dae0peer` by namespace FD, and configures links, addresses, neighbors, policy rules, and routes. Current addressing is:
+Rtnetlink creates `dae0`/`dae0peer` as an L2 netkit pair when the kernel supports it, otherwise as a veth pair. It moves `dae0peer` by namespace FD and configures links, addresses, neighbors, policy rules, and routes. Current addressing is:
 
 | Side | IPv4 | IPv6 |
 | --- | --- | --- |
@@ -133,7 +133,7 @@ On LAN ingress/egress and WAN egress, `dst_is_special` passes traffic before rou
 - IPv4 `255.255.255.255`, `224.0.0.0/4`, or `0.0.0.0`;
 - IPv6 `ff00::/8`.
 
-This keeps DHCP, mDNS, SSDP, LLMNR, and similar link traffic out of the proxy. The veth address space is also internal: `169.254.0.0/16` and `fd00:686f:6e6b::/64`. Control-plane UDP admission rejects proxy initialization when either endpoint is in those ranges, while `dae0`/`dae0peer` hooks handle the engine's own delivery path.
+This keeps DHCP, mDNS, SSDP, LLMNR, and similar link traffic out of the proxy. The internal link address space is `169.254.0.0/16` and `fd00:686f:6e6b::/64`. Control-plane UDP admission rejects proxy initialization when either endpoint is in those ranges, while `dae0`/`dae0peer` hooks handle the engine's own delivery path.
 
 ### Outbound liveness
 

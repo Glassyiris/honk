@@ -4,7 +4,6 @@
 //! bidirectional stream, writes a length-prefixed message with ID=0,
 //! finishes the send side, and reads the length-prefixed response.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,7 +14,7 @@ use super::framing::{
     force_dns_id_zero, read_length_prefixed, restore_dns_id, write_length_prefixed,
 };
 use super::lifecycle::LifecycleSlot;
-use super::{SharedQuicEndpoint, dns_quic_config, exchange_with_retry, quic_connect};
+use super::{SharedQuicEndpoint, dns_quic_config, exchange_with_retry, quic_connect_endpoint};
 
 /// DoQ client for one upstream.
 pub struct DoqClient {
@@ -123,20 +122,14 @@ impl DoqClient {
     }
 
     async fn dial(&self) -> anyhow::Result<Connection> {
-        tokio::time::timeout(self.dial_timeout, async {
-            let addr: SocketAddr = self.endpoint.resolve_addr().await?;
-            quic_connect(
-                &self.quic_ep,
-                &self.quic_config,
-                addr,
-                &self.endpoint.sni,
-                self.dial_timeout,
-                "DoQ",
-            )
-            .await
-        })
+        quic_connect_endpoint(
+            &self.quic_ep,
+            &self.quic_config,
+            &self.endpoint,
+            tokio::time::Instant::now() + self.dial_timeout,
+            "DoQ",
+        )
         .await
-        .map_err(|_| anyhow::anyhow!("DoQ dial timed out after {:?}", self.dial_timeout))?
     }
 
     async fn close_connection(&self) {

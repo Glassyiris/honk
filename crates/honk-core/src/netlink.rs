@@ -1,6 +1,6 @@
 //! Minimal synchronous rtnetlink client (NETLINK_ROUTE).
 //!
-//! Replaces the engine's `ip`/`nsenter` shell-outs: veth pair creation,
+//! Replaces the engine's `ip`/`nsenter` shell-outs: netkit/veth pair creation,
 //! link up/down/netns-move, v4/v6 addresses, routes (incl. table 100 +
 //! RTN_LOCAL), fwmark rules, and static neighbours. Message headers use
 //! the stable kernel ABI layouts directly (the musl libc crate does not
@@ -53,6 +53,9 @@ const IFLA_NET_NS_FD: u16 = 28;
 const IFLA_INFO_KIND: u16 = 1;
 const IFLA_INFO_DATA: u16 = 2;
 const VETH_INFO_PEER: u16 = 1;
+const IFLA_NETKIT_PEER_INFO: u16 = 1;
+const IFLA_NETKIT_MODE: u16 = 5;
+const NETKIT_L2: u32 = 0;
 
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
@@ -183,6 +186,16 @@ fn ifinfo(ifindex: i32, flags: u32, change: u32) -> IfInfoMsg {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LinkPairKind {
+    Netkit,
+    Veth,
+}
+
+fn netkit_unavailable(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EOPNOTSUPP)
+}
+
 /// One synchronous NETLINK_ROUTE connection.
 pub(crate) struct NlSock {
     fd: OwnedFd,
@@ -311,10 +324,50 @@ impl NlSock {
         }
     }
 
+    /// Create an L2 netkit pair when supported, otherwise a veth pair.
+    pub(crate) fn add_link_pair(&mut self, name: &str, peer: &str) -> io::Result<LinkPairKind> {
+        match self.add_netkit_pair(name, peer) {
+            Ok(()) => Ok(LinkPairKind::Netkit),
+            Err(error) if netkit_unavailable(&error) => {
+                self.add_veth_pair(name, peer)?;
+                Ok(LinkPairKind::Veth)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn add_netkit_pair(&mut self, name: &str, peer: &str) -> io::Result<()> {
+        let header = ifinfo(0, 0, 0);
+        let mut peer_payload = pod_bytes(&ifinfo(0, 0, 0)).to_vec();
+        put_attr(&mut peer_payload, IFLA_IFNAME, &Attr::Str(peer.to_string()));
+
+        let attrs = [
+            (IFLA_IFNAME, Attr::Str(name.to_string())),
+            (
+                IFLA_LINKINFO,
+                Attr::Nested(vec![
+                    (IFLA_INFO_KIND, Attr::Str("netkit".to_string())),
+                    (
+                        IFLA_INFO_DATA,
+                        Attr::Nested(vec![
+                            (IFLA_NETKIT_MODE, Attr::U32(NETKIT_L2)),
+                            (IFLA_NETKIT_PEER_INFO, Attr::Bytes(peer_payload)),
+                        ]),
+                    ),
+                ]),
+            ),
+        ];
+        self.request(
+            RTM_NEWLINK,
+            NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL,
+            pod_bytes(&header),
+            &attrs,
+        )
+    }
+
     /// Create a veth pair (`name` ↔ `peer_name`).
     pub(crate) fn add_veth_pair(&mut self, name: &str, peer: &str) -> io::Result<()> {
         let header = ifinfo(0, 0, 0);
-        // Peer payload: its own ifinfomsg followed by IFLA_IFNAME.
         let mut peer_payload = pod_bytes(&ifinfo(0, 0, 0)).to_vec();
         put_attr(&mut peer_payload, IFLA_IFNAME, &Attr::Str(peer.to_string()));
 
@@ -724,6 +777,19 @@ mod tests {
     }
 
     #[test]
+    fn netkit_fallback_is_only_for_missing_driver() {
+        assert!(netkit_unavailable(&io::Error::from_raw_os_error(
+            libc::EOPNOTSUPP
+        )));
+        assert!(!netkit_unavailable(&io::Error::from_raw_os_error(
+            libc::EINVAL
+        )));
+        assert!(!netkit_unavailable(&io::Error::from_raw_os_error(
+            libc::EPERM
+        )));
+    }
+
+    #[test]
     fn sock_open_close() {
         let _ = NlSock::new().expect("netlink socket");
     }
@@ -869,11 +935,22 @@ mod tests {
         if let Ok((idx, _)) = nl.get_link("honkt0") {
             let _ = nl.del_link(idx);
         }
+        let peer_ns = std::thread::spawn(|| -> io::Result<OwnedFd> {
+            nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).map_err(io::Error::from)?;
+            std::fs::File::open("/proc/thread-self/ns/net").map(OwnedFd::from)
+        })
+        .join()
+        .unwrap()
+        .unwrap();
 
         let result = (|| -> io::Result<()> {
-            nl.add_veth_pair("honkt0", "honkt1")?;
+            let kind = nl.add_link_pair("honkt0", "honkt1")?;
+            eprintln!("created {kind:?} link pair");
             let (idx, _mac) = nl.get_link("honkt0")?;
             nl.set_link_up(idx, true)?;
+            let (peer_idx, _) = nl.get_link("honkt1")?;
+            nl.set_link_up(peer_idx, true)?;
+            nl.set_link_netns_fd(peer_idx, &peer_ns)?;
             nl.addr_op(true, idx, FAM_V4, &[10, 254, 99, 1], 32)?;
             nl.add_route(
                 FAM_V4,

@@ -13,11 +13,12 @@ Compatibility-only keys are accepted by the dae parser and stored in `GlobalConf
 | `pprof_port` | `pprof_port` | `0` | Compatibility pprof HTTP port; `0` means disabled. honk currently starts no pprof server and does not read this field. |
 | `so_mark_from_dae` | `so_mark_from_dae` | `0` | Compatibility socket-mark value. Validation rejects overlap with datapath-reserved mark bits, but the current runtime does not apply it to sockets. |
 | `log_level` | `log_level` | `"info"` | Startup log filter. `--debug` takes precedence, followed by `RUST_LOG`, then this value. A SIGHUP change is restart-required. |
+| `log_file` | `log_file` | `""` | Optional append-only log path. Empty disables file output; a relative path resolves below `data_dir`. Console logging remains enabled. SIGHUP requires restart only when the resolved effective destination changes; `--log-file` shadows this value. |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | Compatibility key; the current startup path does not read it. Unresolved `auto` interfaces already remain pending without blocking startup. |
 | `lan_interface` | `lan_interface` | `[]` | Comma-separated LAN interfaces on which forwarded traffic is intercepted. Empty installs no LAN hooks. See [Interface semantics](#interface-semantics). |
 | `wan_interface` | `wan_interface` | `[]` | Comma-separated WAN interfaces whose hooks intercept host-originated TCP and UDP. The literal `auto` follows the lowest-metric IPv4 default route. |
-| `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | Compatibility switch for automatic sysctl setup. The current runtime does not branch on this field; the real datapath applies its fixed best-effort sysctl setup. |
-| `data_dir` | `data_dir` | `"/var/share/honk"` | Absolute, non-empty root for generated state and relative runtime assets. A change requires restart. |
+| `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | Compatibility switch for automatic sysctl setup. The current runtime does not branch on this field; the real datapath applies its fixed best-effort sysctl setup. That setup pins `net.ipv6.conf.all.forwarding=1` and therefore also writes `net.ipv6.conf.<wan>.accept_ra=2` on every resolved WAN interface (including late-attached ones), so an SLAAC/RA-learned IPv6 default route survives the forwarding pin. Hosts running systemd-networkd should prefer the explicit `IPv6AcceptRA=yes` in the WAN `.network` file. |
+| `data_dir` | `data_dir` | `"/var/share/honk"` | Absolute, non-empty root for generated state and relative runtime assets. Missing directories are created recursively; each candidate must pass a private create-new/remove probe. An unusable candidate falls back to the equally probed working directory. A change requires restart. |
 | `store_subscribe` | `store_subscribe` | `true` | Persist each last valid subscription body under `data_dir/.sub` for startup and reload recovery. A change requires restart. |
 | `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | Comma-separated TCP/HTTP health-check URLs. The current health loop uses the first value; an empty list falls back to a plain TCP check. |
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | HTTP method sent by the URL health check. An empty value is treated as `HEAD`. |
@@ -65,7 +66,7 @@ An empty `lan_interface` is literal: honk installs no LAN TC hooks and never sub
 
 ## Data directory and asset paths
 
-`data_dir` defaults to `/var/share/honk`, must be an absolute non-empty path, and is installed once for the process. Absolute child paths remain unchanged.
+`data_dir` defaults to `/var/share/honk`, must be an absolute non-empty path, and is installed once for the process. At startup honk recursively creates it and verifies it with a private random create-new/remove probe. An unusable candidate falls back only to a process working directory that passes the same probe; startup fails and reports both causes when neither is usable. Absolute child paths remain unchanged.
 
 `geoip.dat` and `geosite.dat` use the first existing file in this exact order:
 
@@ -79,6 +80,7 @@ Other relative runtime paths preserve legacy installations as follows:
 | Path | Resolution and legacy fallback |
 | ---- | ------------------------------ |
 | Node `ech_config_path` | Prefer an existing `<data_dir>/<path>`, then an existing working-directory-relative path. If neither exists, resolve to `<data_dir>/<path>` so the read error names the intended location. |
+| `global.log_file` | Relative paths resolve to `<data_dir>/<path>`; parent directories are created at startup. Absolute paths remain explicit. On Linux, new logs are mode `0600`; symlinks and non-regular destinations are rejected, while permissions on an existing regular file are preserved. honk appends without rotation; use the platform log-rotation facility when needed. |
 | `experimental.cache_file.path` | Prefer an existing `<data_dir>/<path>`, then an existing path relative to the original configuration directory. New databases are created below `data_dir`. |
 | `experimental.clash_api.external_ui` | Prefer an existing `<data_dir>/<path>`, then an existing working-directory-relative directory. If neither exists, use `<data_dir>/<path>` for the dashboard download. |
 | Subscription store | Use `<data_dir>/.sub`; retain an existing legacy `./.sub` until it is moved. |
@@ -97,6 +99,7 @@ Other relative runtime paths preserve legacy installations as follows:
 global {
     tproxy_port: 12345
     log_level: info
+    log_file: 'honk.log'
     data_dir: '/var/share/honk'
     store_subscribe: true
 

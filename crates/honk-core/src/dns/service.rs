@@ -1,5 +1,4 @@
 use std::future::Future;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, watch};
@@ -7,7 +6,7 @@ use tokio::sync::{Mutex, watch};
 use super::cache::DnsCache;
 use super::forwarder::DnsForwarder;
 use super::outcome::DnsOutcome;
-use super::query::IngressProfile;
+use super::query::{DnsRequestMeta, IngressProfile};
 use super::runtime::{DnsServiceProvider, RuntimeLease};
 
 mod name_resolution;
@@ -77,13 +76,14 @@ impl DnsService {
         raw_query: &[u8],
         ingress: IngressProfile,
     ) -> anyhow::Result<Vec<u8>> {
-        self.resolve_with_context(raw_query, None, ingress).await
+        self.resolve_with_context(raw_query, DnsRequestMeta::EMPTY, ingress)
+            .await
     }
 
     pub async fn resolve_with_context(
         &self,
         raw_query: &[u8],
-        original_dst: Option<SocketAddr>,
+        metadata: DnsRequestMeta,
         ingress: IngressProfile,
     ) -> anyhow::Result<Vec<u8>> {
         let mut operation = self.operation();
@@ -95,21 +95,16 @@ impl DnsService {
                         lease
                             .runtime()
                             .forwarder()
-                            .resolve_strict_with_context_and_profile(
-                                raw_query,
-                                original_dst,
-                                ingress,
-                            ),
+                            .resolve_strict_with_context_and_profile(raw_query, metadata, ingress),
                     )
                     .await?
             }
             DnsServiceBackend::Standalone(forwarder) => {
                 operation
-                    .run(forwarder.resolve_strict_with_context_and_profile(
-                        raw_query,
-                        original_dst,
-                        ingress,
-                    ))
+                    .run(
+                        forwarder
+                            .resolve_strict_with_context_and_profile(raw_query, metadata, ingress),
+                    )
                     .await?
             }
         }
@@ -118,7 +113,7 @@ impl DnsService {
     pub(crate) async fn resolve_outcome_with_runtime(
         &self,
         raw_query: &[u8],
-        original_dst: Option<SocketAddr>,
+        metadata: DnsRequestMeta,
         ingress: IngressProfile,
     ) -> anyhow::Result<(DnsOutcome, RuntimeLease)> {
         let mut operation = self.operation();
@@ -131,7 +126,7 @@ impl DnsService {
                 lease
                     .runtime()
                     .forwarder()
-                    .resolve_outcome_with_context_and_profile(raw_query, original_dst, ingress),
+                    .resolve_outcome_with_context_and_profile(raw_query, metadata, ingress),
             )
             .await??;
         Ok((outcome, lease))

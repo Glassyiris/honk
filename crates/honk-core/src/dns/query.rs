@@ -1,3 +1,4 @@
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -231,6 +232,40 @@ pub enum IngressProfile {
     Api,
     #[default]
     Internal,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct DnsRequestMeta {
+    source_ip: Option<IpAddr>,
+    original_dst: Option<SocketAddr>,
+}
+
+impl DnsRequestMeta {
+    pub const EMPTY: Self = Self {
+        source_ip: None,
+        original_dst: None,
+    };
+
+    pub fn new(source_ip: Option<IpAddr>, original_dst: Option<SocketAddr>) -> Self {
+        let source_ip = source_ip.map(|source| match source {
+            IpAddr::V6(address) => address
+                .to_ipv4_mapped()
+                .map_or(IpAddr::V6(address), IpAddr::V4),
+            source => source,
+        });
+        Self {
+            source_ip,
+            original_dst,
+        }
+    }
+
+    pub const fn source_ip(self) -> Option<IpAddr> {
+        self.source_ip
+    }
+
+    pub const fn original_dst(self) -> Option<SocketAddr> {
+        self.original_dst
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
