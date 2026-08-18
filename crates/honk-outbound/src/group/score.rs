@@ -165,11 +165,11 @@ impl Stats {
         self.useful_success + self.useful_failure
     }
 
-    fn reliability(&self) -> f64 {
+    fn reliability(&self, factor: f64) -> f64 {
         // Setup failure is already a useful failure. Counting two additional
         // failures makes it the strongest negative signal without a knob.
-        let successes = self.useful_success;
-        let failures = self.useful_failure + self.setup_failure * 2.0;
+        let successes = self.useful_success * factor;
+        let failures = (self.useful_failure + self.setup_failure * 2.0) * factor;
         let a = successes + 1.0;
         let b = failures + 1.0;
         let sum = a + b;
@@ -247,7 +247,7 @@ impl Stats {
 }
 
 fn evidence_decay(elapsed: Duration) -> f64 {
-    2.0_f64.powf(-elapsed.as_secs_f64() / SCORE_EVIDENCE_HALF_LIFE.as_secs_f64())
+    (-elapsed.as_secs_f64() / SCORE_EVIDENCE_HALF_LIFE.as_secs_f64()).exp2()
 }
 
 fn record_cell_start<K>(cache: &mut LruCache<K, Stats>, key: K, now: Instant, tick: u64) -> u64
@@ -678,6 +678,7 @@ struct ScoreSnapshot {
     attempts: f64,
     completed: f64,
     reliability: f64,
+    useful_completed: f64,
     latency_ms: Option<f64>,
     latency_confidence: f64,
     throughput: Option<f64>,
@@ -691,7 +692,7 @@ fn score_snapshot(
     node_id: Uuid,
     now: Instant,
 ) -> ScoreSnapshot {
-    let family_aggregate = context.target_family.and_then(|family| {
+    let family_score = context.target_family.and_then(|family| {
         inner
             .aggregate
             .peek(&AggregateKey {
@@ -700,9 +701,9 @@ fn score_snapshot(
                 family: Some(family),
                 node_id,
             })
-            .map(|stats| decayed(stats, now))
+            .map(|stats| snapshot(stats, now))
     });
-    let global_aggregate = inner
+    let global_score = inner
         .aggregate
         .peek(&AggregateKey {
             group: group.to_string(),
@@ -710,43 +711,41 @@ fn score_snapshot(
             family: None,
             node_id,
         })
-        .map_or_else(Stats::default, |stats| decayed(stats, now));
-    let global_score = snapshot(&global_aggregate);
-    let aggregate_score = family_aggregate.map_or(global_score, |family| {
-        let family_score = snapshot(&family);
-        let reliability_weight = (family.useful_completed() / 8.0).clamp(0.0, 1.0);
-        let setup_weight = (family.completed() / 8.0).clamp(0.0, 1.0);
+        .map_or_else(
+            || snapshot(&Stats::default(), now),
+            |stats| snapshot(stats, now),
+        );
+    let aggregate_score = family_score.map_or(global_score, |family| {
+        let reliability_weight = (family.useful_completed / 8.0).clamp(0.0, 1.0);
+        let setup_weight = (family.completed / 8.0).clamp(0.0, 1.0);
         ScoreSnapshot {
             attempts: family.attempts,
-            completed: global_aggregate.completed() + family.completed(),
+            completed: global_score.completed + family.completed,
+            useful_completed: global_score.useful_completed + family.useful_completed,
             reliability: blend(
                 global_score.reliability,
-                family_score.reliability,
+                family.reliability,
                 reliability_weight,
             ),
-            latency_ms: blend_option(
-                global_score.latency_ms,
-                family_score.latency_ms,
-                setup_weight,
-            ),
+            latency_ms: blend_option(global_score.latency_ms, family.latency_ms, setup_weight),
             latency_confidence: blend(
                 global_score.latency_confidence,
-                family_score.latency_confidence,
+                family.latency_confidence,
                 setup_weight,
             ),
             throughput: blend_option(
                 global_score.throughput,
-                family_score.throughput,
+                family.throughput,
                 reliability_weight,
             ),
             throughput_confidence: blend(
                 global_score.throughput_confidence,
-                family_score.throughput_confidence,
+                family.throughput_confidence,
                 reliability_weight,
             ),
         }
     });
-    let exact = match (context.target_family, context.target.as_ref()) {
+    let exact_score = match (context.target_family, context.target.as_ref()) {
         (Some(family), Some(target)) => inner
             .exact
             .peek(&ExactKey {
@@ -756,53 +755,46 @@ fn score_snapshot(
                 target: target.clone(),
                 node_id,
             })
-            .map(|stats| decayed(stats, now)),
+            .map(|stats| snapshot(stats, now)),
         _ => None,
     };
-    let Some(exact) = exact else {
+    let Some(exact) = exact_score else {
         return aggregate_score;
     };
-    let reliability_weight = (exact.useful_completed() / 8.0).clamp(0.0, 1.0);
-    let setup_weight = (exact.completed() / 8.0).clamp(0.0, 1.0);
-    let exact_score = snapshot(&exact);
+    let reliability_weight = (exact.useful_completed / 8.0).clamp(0.0, 1.0);
+    let setup_weight = (exact.completed / 8.0).clamp(0.0, 1.0);
     ScoreSnapshot {
         attempts: exact.attempts,
-        completed: aggregate_score.completed + exact.completed(),
+        completed: aggregate_score.completed + exact.completed,
+        useful_completed: aggregate_score.useful_completed + exact.useful_completed,
         reliability: blend(
             aggregate_score.reliability,
-            exact_score.reliability,
+            exact.reliability,
             reliability_weight,
         ),
-        latency_ms: blend_option(
-            aggregate_score.latency_ms,
-            exact_score.latency_ms,
-            setup_weight,
-        ),
+        latency_ms: blend_option(aggregate_score.latency_ms, exact.latency_ms, setup_weight),
         latency_confidence: blend(
             aggregate_score.latency_confidence,
-            exact_score.latency_confidence,
+            exact.latency_confidence,
             setup_weight,
         ),
         throughput: blend_option(
             aggregate_score.throughput,
-            exact_score.throughput,
+            exact.throughput,
             reliability_weight,
         ),
         throughput_confidence: blend(
             aggregate_score.throughput_confidence,
-            exact_score.throughput_confidence,
+            exact.throughput_confidence,
             reliability_weight,
         ),
     }
 }
 
-fn decayed(stats: &Stats, now: Instant) -> Stats {
-    let mut stats = stats.clone();
-    stats.decay_to(now);
-    stats
-}
-
-fn snapshot(stats: &Stats) -> ScoreSnapshot {
+fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
+    let factor = stats.updated_at.map_or(1.0, |updated_at| {
+        evidence_decay(now.saturating_duration_since(updated_at))
+    });
     let (latency_ms, latency_weight) = stats
         .first_response_ms
         .mean()
@@ -814,13 +806,14 @@ fn snapshot(stats: &Stats) -> ScoreSnapshot {
             .clamp(0.0, 30.0)
     });
     ScoreSnapshot {
-        attempts: stats.attempts,
-        completed: stats.completed(),
-        reliability: stats.reliability(),
+        attempts: stats.attempts * factor,
+        completed: stats.completed() * factor,
+        useful_completed: stats.useful_completed() * factor,
+        reliability: stats.reliability(factor),
         latency_ms,
-        latency_confidence: (latency_weight / 8.0).clamp(0.0, 1.0),
+        latency_confidence: (latency_weight * factor / 8.0).clamp(0.0, 1.0),
         throughput,
-        throughput_confidence: (stats.throughput_windows / 8.0).clamp(0.0, 1.0),
+        throughput_confidence: (stats.throughput_windows * factor / 8.0).clamp(0.0, 1.0),
     }
 }
 
@@ -1588,7 +1581,7 @@ mod tests {
         assert_close(stats.throughput_bytes, 196_608.0);
         assert_close(stats.throughput_seconds, 4.0);
         assert_close(stats.throughput_windows, 2.0);
-        let score = snapshot(&stats);
+        let score = snapshot(&stats, now);
         assert_close(score.throughput.unwrap(), (1.0_f64 + 49_152.0).log2());
         assert_close(score.throughput_confidence, 0.25);
     }
