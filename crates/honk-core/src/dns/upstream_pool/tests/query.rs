@@ -1,7 +1,8 @@
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 
 use honk_config::dns::DnsStrategy;
 use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
@@ -9,6 +10,28 @@ use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
 use super::*;
 use crate::dns::forwarder::DnsUpstreamPool;
 use crate::routing::Router;
+
+async fn bind_matching_tcp_udp(
+    tcp_ip: IpAddr,
+    udp_ip: IpAddr,
+) -> (TcpListener, UdpSocket, SocketAddr) {
+    const MAX_ATTEMPTS: usize = 8;
+    let mut last_error = None;
+
+    for _ in 0..MAX_ATTEMPTS {
+        let tcp = TcpListener::bind(SocketAddr::new(tcp_ip, 0)).await.unwrap();
+        let address = SocketAddr::new(udp_ip, tcp.local_addr().unwrap().port());
+        match UdpSocket::bind(address).await {
+            Ok(udp) => return (tcp, udp, address),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    panic!(
+        "could not bind matching TCP/UDP listeners after {MAX_ATTEMPTS} attempts: {}",
+        last_error.unwrap()
+    );
+}
 
 #[tokio::test]
 async fn test_udp_query() {
@@ -116,11 +139,9 @@ async fn udp_prefer_ipv6_falls_back_to_ipv4_and_reuses_winner() {
 
 #[tokio::test]
 async fn udp_cold_retry_rechecks_route_for_alternate_address() {
-    let tcp_server = TcpListener::bind("[::1]:0").await.unwrap();
-    let upstream_port = tcp_server.local_addr().unwrap().port();
-    let udp_server = tokio::net::UdpSocket::bind(("127.0.0.1", upstream_port))
-        .await
-        .unwrap();
+    let (tcp_server, udp_server, upstream_address) =
+        bind_matching_tcp_udp(Ipv6Addr::LOCALHOST.into(), Ipv4Addr::LOCALHOST.into()).await;
+    let upstream_port = upstream_address.port();
     let udp_task = tokio::spawn(async move {
         let mut buffer = [0_u8; 512];
         let (length, _) = udp_server.recv_from(&mut buffer).await.unwrap();
@@ -458,31 +479,8 @@ async fn udp_truncated_fallback_reuses_tcp_connection_and_closes_once() {
     let mut truncated = mock_dns_response(0x1234);
     truncated[2] |= 0x02;
     let full = mock_dns_response(0x1234);
-    const MAX_BIND_ATTEMPTS: usize = 8;
-    let sockets: std::io::Result<_> = async {
-        let mut last_error = None;
-        for _ in 0..MAX_BIND_ATTEMPTS {
-            let tcp_listener = TcpListener::bind("127.0.0.1:0").await?;
-            let address = tcp_listener.local_addr()?;
-            match tokio::net::UdpSocket::bind(address).await {
-                Ok(udp_server) => return Ok((tcp_listener, udp_server, address)),
-                Err(error) => {
-                    drop(tcp_listener);
-                    last_error = Some(error);
-                }
-            }
-        }
-
-        let detail = last_error
-            .map(|error| error.to_string())
-            .unwrap_or_else(|| "no bind attempt was made".to_owned());
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AddrInUse,
-            format!("could not bind matching TCP/UDP loopback listeners after {MAX_BIND_ATTEMPTS} attempts: {detail}"),
-        ))
-    }
-    .await;
-    let (tcp_listener, udp_server, address) = sockets.expect("matching TCP/UDP listener bind");
+    let (tcp_listener, udp_server, address) =
+        bind_matching_tcp_udp(Ipv4Addr::LOCALHOST.into(), Ipv4Addr::LOCALHOST.into()).await;
     let udp_responder = tokio::spawn(async move {
         let mut buffer = [0_u8; 512];
         for _ in 0..2 {
