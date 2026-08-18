@@ -10,7 +10,7 @@ Its configuration syntax and TC datapath have dae lineage and remain dae-compati
 
 - Intercept Linux LAN-forwarded and host-originated traffic with an eBPF transparent-proxy datapath.
 - Keep the native `.dae` configuration syntax as the primary and only documented configuration format.
-- Provide multi-protocol outbounds, Selector/URLTest/LoadBalance/Fallback groups, optional Honk automatic scoring, health checks, and a Clash-compatible control API.
+- Provide multi-protocol outbounds, Selector/URLTest/LoadBalance/Fallback/Score groups, health checks, and a Clash-compatible control API.
 - Ship an engine-only `honk-core` binary rather than a separate GraphQL service or bundled dashboard application.
 
 ### Non-goals
@@ -27,7 +27,7 @@ The root workspace contains six crates. `honk-ebpf` is a separate Cargo project 
 | `honk-config` | member | Shared configuration model, dae-syntax parser, include handling, share-link parsing, and subscription decoding. |
 | `honk-ebpf-common` | member | `no_std`, `#[repr(C)]` constants and ABI types shared by kernel programs and userspace map writers. |
 | `honk-nfqueue` | member | Raw `NETLINK_NETFILTER` queue `320`, verdict ownership, and the owned nftables transaction. |
-| `honk-outbound` | member | Protocol handlers, per-node runtimes, outbound groups, health state, URLTest probing, and the feature-gated Honk scorer. |
+| `honk-outbound` | member | Protocol handlers, per-node runtimes, outbound groups, health state, URLTest probing, and the always-compiled Score scorer. |
 | `honk-core` | member | Engine library and binary: eBPF/NFQUEUE runtime, control plane, DNS, routing, relay, and Clash API. |
 | `honk-tool` | member | CLI toolbox for subscription/node probing, datapath diagnostics, pinned-map inspection, and geo-asset queries. |
 | `honk-ebpf` | excluded | TC, `sk_lookup`, and cgroup eBPF programs; built separately and embedded into `honk-core` when real eBPF is enabled. |
@@ -78,7 +78,7 @@ flowchart TB
 4. When explicitly enabled, [NFQUEUE staging](./nfqueue.md) holds only ambiguous LAN-forwarded UDP after LAN TC and before conntrack/NAT. Each staged flow carries a unique decision token in fixed queue `320`; host-originated WAN traffic stays on the ordinary transparent path.
 5. The [control plane](./control-plane.md) recovers the original destination and consumes the eBPF routing handoff. A missing handoff or `ControlPlaneRouting` outcome enters userspace routing.
 6. The [routing path](./routing.md) may sniff TLS SNI, HTTP Host, or QUIC Initial SNI, then runs the userspace `Router` when the kernel result is not final.
-7. The [group layer](./groups.md) applies the Clash mode override without changing final `must`/`block` results, then resolves the authoritative group policy pick to a leaf node. When enabled and selected, Honk ranks only health-eligible members from per-target TCP/UDP and target-family scores.
+7. The [group layer](./groups.md) applies the Clash mode override without changing final `must`/`block` results, then resolves the authoritative group policy pick to a leaf node. When explicitly selected, Score ranks only health-eligible members from per-target TCP/UDP and target-family scores.
 8. The [outbound layer](./outbound.md) dials that leaf and relays TCP or datagrams. Sniffed TCP bytes are forwarded before the remaining stream.
 9. Control-plane egress leaves with `DAE_BYPASS_MARK` (`0x100`) so WAN TC does not intercept it again. Proxied UDP and transparent port-53 replies use [anyfrom sockets](./control-plane.md) bound to the original destination so the [return datapath](./datapath.md) preserves the source address.
 
@@ -94,8 +94,8 @@ flowchart TB
 - **`must`/`block` finality:** Clash mode overrides never replace a `block` result or a dae `(must)` result.
 - **Fail-closed dead outbounds:** `lan_ingress` drops new flows routed to a dead outbound. A TCP group with one unique leaf and no `final` keeps that same proxy as a userspace last resort; UDP and all-dead multi-leaf groups remain fail-closed. TCP and UDP port `53` are exempt, and `honk-core` injects `dip(<each LAN/WAN interface address>) -> direct(must)` at startup, reload, and interface-topology changes so local administration does not depend on proxy health.
 - **Group-OR connectivity:** the eBPF alive slot for a group is the OR of all leaf-member states, plus the sole-TCP-leaf last-resort exception above. A single dead member in a multi-leaf group must not make the whole group fail closed.
-- **Optional Honk isolation:** Honk uses the business target family for scoring but the proxy server family for health filtering. Its authoritative pick cannot revive a dead member. Exact target keys and aggregate priors remain in bounded process memory, survive reload through shared state, reset on process restart, and are not added to logs, Clash API documents, or `cache.db`; existing connection metadata remains unchanged.
-- **Honk feedback coverage:** When the feature is enabled, actual attempts associated with Honk leaves report setup, first response, bidirectional bytes, and one compact terminal outcome. This includes transparent TCP/UDP, supported DNS transports, health and delay probes, preconnect/session/UDP warm-up, and direct or proxied UI downloads; work without a business target updates aggregate setup evidence only.
+- **Score isolation:** Score uses the business target family for scoring but the proxy server family for health filtering. Its authoritative pick cannot revive a dead member. Exact target keys and aggregate priors remain in two 4,096-entry LRUs in process memory, survive successful in-process reload through shared state, reset on process restart, and are never logged, persisted, or returned by Clash APIs; existing connection metadata remains unchanged.
+- **Demand-driven Score feedback:** Instrumentation is always compiled but creates `ScoreFeedback`/`ScoreReporter` state only for attempts associated with Score groups; non-Score paths allocate no reporter or score cell. Reports cover setup, first response, bidirectional bytes, and one compact terminal outcome across transparent TCP/UDP, supported DNS transports, health and delay probes, preconnect/session/UDP warm-up, and direct or proxied UI downloads; work without a business target updates aggregate setup evidence only.
 - **Internal and special traffic:** honk's link-internal ranges `169.254.0.0/16` and `fd00:686f:6e6b::/64` are never proxied. L2 broadcast/multicast, IPv4 broadcast/multicast/unspecified destinations, and IPv6 multicast pass through before routing or conntrack.
 
 ## Build features and mock mode
@@ -108,7 +108,6 @@ flowchart TB
 | `clash-api` | yes | Pulls in optional `axum` and `tower-http` for the Clash-compatible REST/WebSocket service. |
 | `mimalloc` | yes | Pulls in `mimalloc` and `libmimalloc-sys` and installs mimalloc as the `honk-core` binary allocator. On Linux, startup disables transparent huge pages for the process before starting Tokio. |
 | `rprx` | yes | Enables `honk-outbound/rprx`, which registers the VLESS and VMess handlers, including the supported VLESS Encryption and `xtls-rprx-vision` paths. |
-| `honk-policy` | no | Forwards the optional scorer through `honk-config` and `honk-outbound`; enables `policy: honk` with authoritative reliability-first scoring isolated by TCP/UDP, target IPv4/IPv6 family, and exact target. It adds no runtime knobs or persistence. |
 
 `mock-ebpf` is not a Cargo feature. A build without `ebpf` uses `MockEbpfBackend`, and `--mock-ebpf` selects the unprivileged development path explicitly. It cannot run with `experimental.udp_nfqueue.enabled = true`.
 

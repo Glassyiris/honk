@@ -14,7 +14,7 @@
 
 许可证：**GPL-3.0-only**。
 
-可靠性优先的 Honk 组策略仅在构建时启用默认关闭的 `honk-policy` Cargo feature 后可用；启用该 feature 的配置以 `policy: honk` 选择它，不会改变默认组行为。被选用时，它只在内存中从真实流量以及 DNS、真实 QUIC 握手、探测、delay test、预热和直连或经代理的 UI 下载 attempt 学习，不会导出目标键。详见[组参考](doc/zh/reference/groups.md#honk-策略可选)。
+可靠性优先的 Score 组策略始终随程序编译；配置以 `policy: score` 显式选择它，省略 `policy` 时仍默认使用 Selector。Score 仅在实际经过 Score 组时按需创建反馈与评分 cell，从真实流量以及 DNS、真实 QUIC 握手、探测、delay test、预热和直连或经代理的 UI 下载中学习；状态只存在于进程内存，不提供调节项，也不会写入日志、持久化或 API。详见 [Score 策略](doc/zh/reference/groups.md#score-策略)。
 
 ### 实验性首包保留 UDP 决策
 
@@ -124,7 +124,7 @@ honk 沿用 dae 的内核模型，但并非移植。主要不同点：
 - [x] VLESS + REALITY 客户端（含 `xtls-rprx-vision` flow），基于 boring-sys 补丁钩子改写 ClientHello；JA4 与真实 Chrome 对齐（ja4_a/ja4_b 完全一致）
 - [x] VLESS UDP/复用：UoT v2、H2MUX（padding）、Single XUDP 与 Mux.Cool；覆盖 TLS/REALITY
 - [x] 共享传输层（TLS/WS/gRPC）
-- [x] 组：Selector / URLTest / LoadBalance / Fallback + 嵌套组；另有默认关闭的 `honk-policy` 自动评分策略
+- [x] 组：Selector / URLTest / LoadBalance / Fallback / Score + 嵌套组；Score 为始终编译、显式选择且按需采样的自动评分策略
 - [x] URLTest：tolerance、TCP/UDP 独立选择、idle_timeout、interrupt_connections
 - [x] `AliveDialerSet`：并发探测、恢复滞后、TCP+UDP 探测、推送 eBPF
 - [x] 订阅拉取 + 后台合并（节点仅内存）

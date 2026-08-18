@@ -4,7 +4,7 @@
 
 ## 范围
 
-本文覆盖 `GroupManager`、`AliveDialerSet`、可选 Honk 评分器、冷启动 URLTest 准备流程与预热资源 coordinator。组字段和策略语法见[组参考](../reference/groups.md)；进程级健康检查、预热与拨号配置键见[全局参考](../reference/global.md)。
+本文覆盖 `GroupManager`、`AliveDialerSet`、始终编译的 Score 评分器、冷启动 URLTest 准备流程与预热资源 coordinator。组字段和策略语法见[组参考](../reference/groups.md)；进程级健康检查、预热与拨号配置键见[全局参考](../reference/global.md)。
 
 ## 组管理器与选择流水线
 
@@ -22,7 +22,7 @@ facade 与内部实现按职责拆分：
 | `resolver.rs` | 嵌套组展开、成员/叶节点内省、环切断与 Selector 选择迁移 |
 | `filter.rs` | 按网络和地址族过滤存活性 |
 | `policy.rs` | Selector、URLTest、LoadBalance、Fallback 选择与延迟排名 |
-| `honk.rs` | feature-gated Honk 评分、exact-once 反馈与 target-aware 选择 |
+| `score.rs` | Score 评分、exact-once 反馈与 target-aware 选择 |
 | `state.rs` | URLTest/Fallback 缓存、Selector 选择、空闲时间戳与回调 |
 
 选择遵循一个不变量：完成解析和存活性过滤后，拨号路径只使用策略选出的结果。Selector 返回其有效手动选择，URLTest 返回当前胜者，LoadBalance 返回下一个成员，Fallback 返回固定成员。唯一的多候选例外是尚无测量值的顶层 URLTest 组；已有测量值的 URLTest 和所有非 URLTest 计划都是权威的单叶节点计划。若未配置 `final` 的组只有一个唯一叶节点，且 TCP 存活性过滤将其排除，该节点仍作为权威的最后尝试：健康状态仍是 dead，但真实拨号可以证明恢复，且不会泄漏到 `direct`。UDP 继续执行正常的存活性排除。
@@ -35,23 +35,25 @@ facade 与内部实现按职责拆分：
 | URLTest | 选择最小减半递推移动平均，分别保存 TCP 与 UDP 选择，应用 tolerance 滞后，并在拨号和选择查询时惰性重算。真实选择变化可以调用 `InterruptCallback`。 |
 | LoadBalance | 按声明顺序轮询合格成员。每个组分别为 TCP 和 UDP 持有独立 `AtomicUsize` 游标。轮转从不调用 `InterruptCallback`。 |
 | Fallback | 分别为 TCP 和 UDP 固定声明顺序中的第一个合格成员。该成员死亡前保持固定；更靠前的成员恢复不会触发 failback。 |
-| Honk（可选） | 启用默认关闭的 `honk-policy` Cargo feature 后，通过自动的 target-aware 可靠性优先评分和有界确定性探索，选择一个权威存活成员。 |
+| Score | 以 `policy: score` 显式选择后，通过自动的 target-aware 可靠性优先评分和有界确定性探索，选择一个权威存活成员。评分器始终编译；省略策略仍默认使用 Selector。 |
 
-### Honk 评分与生命周期
+### Score 评分与生命周期
 
-Honk 首先运行与其他策略相同的存活性过滤。过滤所用的 health family 描述到代理服务器的连通性；单独携带的 target family 决定评分分桶。因此经 IPv4 到达的服务器仍可承载 IPv6 业务目标，而评分绝不会让已被判死的节点重新入选。
+Score 首先运行与其他策略相同的存活性过滤。过滤所用的 health family 描述到代理服务器的连通性；单独携带的 target family 决定评分分桶。因此经 IPv4 到达的服务器仍可承载 IPv6 业务目标，而评分绝不会让已被判死的节点重新入选。健康过滤后的计划只包含一个权威叶节点；只有冷 URLTest 仍可按既有规则进行推测准备。
 
-精确键为 `(group, TCP/UDP, target IPv4/IPv6, normalized target, NodeId)`。domain 会转为 ASCII 小写、去掉一个末尾点并保留端口；IP 目标保留 socket address。第二个有界的 `(group, TCP/UDP, optional target family, NodeId)` 聚合层为冷目标提供先验，并接收无目标预热样本。target-family 聚合层和精确层分别在前八个 useful 终态结果中混入可靠性与吞吐，并在前八个 setup 完成样本中独立混入 setup 延迟；family 层以全局聚合作为先验，因此仅有 setup 的预热不会抹掉已知可靠性。递归选择携带同一 target context，并把叶节点结果归因到路径上的每个 Honk 组。
+精确键为 `(group, TCP/UDP, target IPv4/IPv6, normalized target, NodeId)`。domain 会转为 ASCII 小写、去掉一个末尾点并保留端口；IP 目标保留 socket address。第二个有界的 `(group, TCP/UDP, optional target family, NodeId)` 聚合层为冷目标提供先验，并接收无目标预热样本。精确目标、target-family 和全局聚合层按衰减后的有效证据分层混合：精确证据增多时逐渐覆盖聚合证据，老化后又逐渐让出权重。递归选择携带同一 target context，并把叶节点结果归因到路径上的每个 Score 组。
 
-每个 cell 只保留 started、setup 与 useful outcome 紧凑计数，setup/首响应延迟 EWMA、有界的 `log2(1 + bytes/second)` 吞吐，以及最近使用时间。setup 失败是最强的可靠性惩罚。只有终态成功且双向流量均非零才算 useful success，因此原始字节量本身不会直接带来奖励。错误字符串会先缩减为紧凑结果类别，再进入反馈状态。
+每次评分操作只读取一次单调时钟。cell 中的 attempt、setup、useful outcome、setup/首响应加权和与权重，以及吞吐字节、时长和窗口数，全部按固定 30 分钟半衰期应用指数衰减：`factor(dt) = 2^(-dt / 30 min)`。setup 与首响应延迟为衰减后的 `sum / weight`，新样本权重为 1；排名还会按有效权重降低稀疏或陈旧延迟的影响。衰减应用于开始、完成和排名快照，因此失败、成功、探索次数与各项指标会按相同时间尺度老化。该半衰期没有配置项。
 
-只有物理拨号、逻辑 stream、transport preparation 或 exchange 真正启动时才调用 `HonkFeedback::start()`。其可 clone reporter 记录 setup、首响应、发送/接收字节，并且只接受 success、timeout、`io::ErrorKind`、cancellation、shutdown 或 other 中的一个终态；第一个终态调用生效，最后一个未完成 handle 被 drop 时报告 cancellation。cancellation 与 shutdown 会撤销 start 而非降低可靠性。retry 会启动新的 reporter，未实际启动的 speculative work 则没有 reporter。
+可靠性使用带 Beta 先验的下置信估计，setup 失败受到最强惩罚。只有终态成功且双向流量均非零才算 useful success。吞吐量还要求交换持续至少 1 秒，且 `max(tx, rx)` 至少为 64 KiB；不满足条件的成功仍更新可靠性和延迟，但不更新吞吐。合格窗口只累加主导方向字节、实际秒数和一个窗口，按池化的 `bytes / seconds` 得出速率，再以衰减窗口数限制置信度；这既不双计请求与响应，也不让短小快速交换影响选择。门槛和吞吐权重均为固定实现常量。
 
-同一 reporter 路径覆盖透明 TCP relay 与 UDP endpoint 生命周期、受支持的 DNS upstream exchange、周期 HTTP/UDP 健康探测、按需 Clash delay 测量、启动 preconnect、Selector/session 与 UDP 预热，以及外部 UI 下载。DNS 反馈跟随实际尝试的 carrier：UDP 使用 UDP 分桶，TCP/DoT/DoH 使用 TCP；UDP truncated answer 后的 TCP retry 会相应切换分桶；现有的 proxied DoQ/DoH3 限制保持不变。启用 `honk-policy` 后，每个周期 UDP 探测会为 Honk 组中的每个节点另外打开一个 packet transport，对第一个 HTTPS `global.tcp_check_url` 完成 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手。这个精确目标 `DataUdp` 评分与决定 UDP 存活性的 DNS exchange 相互独立；URL 缺失或不是 HTTPS 时不运行。由于 adapter 不提供 wire counter，成功握手只记录双向有效性，不奖励虚构的 byte volume。URL test 与下载对代理叶节点和内建 `direct` 叶节点都使用真实请求目标。周期 direct liveness 仍使用稳定 bootstrap 目标；仅连接 server/session 的预热只更新聚合 setup 证据。
+只有物理拨号、逻辑 stream、transport preparation 或 exchange 真正启动时才调用 `ScoreFeedback::start()` 并创建 `ScoreReporter`。可 clone reporter 记录 setup、首响应、发送/接收字节，并且只接受 success、timeout、`io::ErrorKind`、cancellation、shutdown 或 other 中的一个终态；第一个终态调用生效，最后一个未完成 handle 被 drop 时报告 cancellation。cancellation 与 shutdown 会撤销本次 attempt 而不增加终态证据。retry 会启动新的 reporter，未实际启动的 speculative work 没有 reporter。instrumentation 始终编译但按需运行：非 Score 计划不会创建 reporter 或评分 cell。
 
-排名首先计算带 Beta 先验的 useful reliability 下置信估计。比最佳候选低出固定「可靠性接近」区间的成员，不会参与延迟、吞吐与 UCB 探索。在该区间内，更低的 setup/首响应延迟、有界吞吐和有界探索共同形成 utility。完全冷的候选按确定性顺序依次探索；其余平局按声明顺序和稳定 `NodeId` 解决。最终计划始终只包含一个权威叶节点，不会竞速候选。
+同一 reporter 路径覆盖透明 TCP relay 与 UDP endpoint 生命周期、受支持的 DNS upstream exchange、周期 HTTP/UDP 健康探测、按需 Clash delay 测量、启动 preconnect、Selector/session 与 UDP 预热，以及外部 UI 下载。DNS 反馈跟随实际尝试的 carrier：UDP 使用 UDP 分桶，TCP/DoT/DoH 使用 TCP；UDP truncated answer 后的 TCP retry 会相应切换分桶；现有的 proxied DoQ/DoH3 限制保持不变。每个周期 UDP 探测会为 Score 组中的每个节点另外打开一个 packet transport，对第一个 HTTPS `global.tcp_check_url` 完成 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手。这个精确目标 `DataUdp` 评分与决定 UDP 存活性的 DNS exchange 相互独立；URL 缺失或不是 HTTPS 时不运行。由于 adapter 不提供 wire counter，成功握手只记录双向有效性，不奖励虚构的 byte volume。URL test 与下载对代理叶节点和内建 `direct` 叶节点都使用真实请求目标。周期 direct liveness 仍使用稳定 bootstrap 目标；仅连接 server/session 的预热只更新聚合 setup 证据。
 
-共享状态由 mutex 保护且仅存于内存：精确 cell 使用 4,096-entry LRU，聚合 cell 使用另一个有界的 4,096-entry LRU。已提交 reload 会复用状态、发布新的合法 `(group, member)` 集合并裁剪已删除 cell；已删除成员的迟到反馈会被忽略。进程重启会清空一切。评分 cell 与仅由 scorer 持有的目标数据不会进入日志、Clash API 文档或 `cache.db`；已有的 `/connections` 目标元数据保持不变。
+排名首先计算可靠性下置信估计。比最佳候选低出固定「可靠性接近」区间的成员，不会参与延迟、吞吐与 UCB 探索。在该区间内，更低的 setup/首响应延迟、有界吞吐和有界探索共同形成 utility。有效完成证据不足或随时间衰减到训练阈值以下的候选会重新视为冷候选，并按确定性顺序探索；其余平局按声明顺序和稳定 `NodeId` 解决。最终计划始终只包含一个权威叶节点，不会竞速候选。
+
+共享状态由 mutex 保护且仅存于当前进程内存：精确 cell 使用 4,096-entry LRU，聚合 cell 使用另一个 4,096-entry LRU。已提交的进程内 reload 会复用同一共享状态、发布新的合法 `(group, member)` 集合并裁剪已删除 cell；已删除成员的迟到反馈会被忽略。进程重启会清空一切。Score 不提供调节项；评分 cell 与仅由 scorer 持有的目标数据不会进入日志、持久化存储或任何 API 输出，已有的 `/connections` 目标元数据保持不变。
 
 ### URLTest 排名与滞后
 
@@ -119,7 +121,7 @@ Honk 首先运行与其他策略相同的存活性过滤。过滤所用的 healt
 | --- | --- |
 | TCP | 通过节点向 `tcp_check_url` 发送已配置 HTTP 方法；不适用 HTTP 探测时执行裸 TCP 连接。冷的可复用节点会先在临时 runtime 中建立 session/client；setup 不计时，随后只有完成的 HTTP 交换才把暖路径 RTT 记录到匹配的 TCP 地址族状态。setup 与目标交换失败都会更新活性/冷却，但不贡献延迟或排名 strike。 |
 | UDP 健康 | 通过节点自己的 `dial_udp_transport`，向第一个 `udp_check_dns` 目标发送一个最小 DNS 查询。成功记录实测 RTT，并把 `DnsUdp` 与 `DataUdp` 都标记为存活；失败分别给两个 UDP 域增加一次探测失败。它从不修改 TCP 状态。 |
-| Honk QUIC 评分 | 仅在启用 `honk-policy` 时，通过新的 packet transport 为 Honk 组中的每个节点单独执行一次 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手，目标为第一个 HTTPS `tcp_check_url`。成功或失败会更新精确 `DataUdp` 分数与聚合先验，但绝不修改存活状态，也不奖励未观测的 byte volume。 |
+| Score QUIC 评分 | 通过新的 packet transport 为 Score 组中的每个节点单独执行一次 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手，目标为第一个 HTTPS `tcp_check_url`。成功或失败会更新精确 `DataUdp` 分数与聚合先验，但绝不修改存活状态，也不奖励未观测的 byte volume。 |
 | 按组 URL | 用与全局 TCP 探测相同的临时暖路径计时，探测动态解析出的 `(member tag, current leaf)` 对。状态为 TCP-only，连续三次失败即死亡，并使用相同冷却与连续两次成功恢复。重载时 `sync_group_check_urls` 替换有效的组/URL 注册表。 |
 
 `has_udp_state` 区分从未观察过 UDP 的节点与已明确观察为死亡的节点。已建立 endpoint 的发送、接收和回包空闲错误会上报 `DataUdp` 流量失败。主动 endpoint 退役、节点死亡取消和进程关闭不影响健康状态。

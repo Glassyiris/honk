@@ -52,25 +52,27 @@ group {
 | `urltest` | `urltest`、`min_moving_avg`、`min_avg10`、`min_last_delay` | 使用减半移动平均 `(prev + sample) / 2` 和 tolerance 选择延迟最低的存活成员；TCP 与 UDP 选择相互独立。 |
 | `loadbalance` | `loadbalance`、`roundrobin`、`round_robin`、`balance` | 对存活成员轮询；每个组以及 TCP/UDP 网络各有独立计数器。 |
 | `fallback` | `fallback` | 分别为 TCP 和 UDP 按声明顺序固定第一个存活成员；更靠前的成员恢复后不会立即 failback。 |
-| `honk` | `honk` | 启用默认关闭的 `honk-policy` Cargo feature 后，按目标的可靠性优先评分自动选择一个存活成员；TCP/UDP 与目标 IPv4/IPv6 地址族各自隔离。 |
+| `score` | `score` | 按目标的可靠性优先评分自动选择一个存活成员；TCP/UDP 与目标 IPv4/IPv6 地址族各自隔离。 |
 
-策略名按 ASCII 大小写不敏感匹配。解析器匹配前会去掉可选的括号后缀，因此接受 `fixed(0)`。无法识别的策略会静默变为 `selector`；但 binary 未启用所需 `honk-policy` feature 时，`honk` 会返回可操作的明确错误。
+策略名按 ASCII 大小写不敏感匹配。解析器匹配前会去掉可选的括号后缀，因此接受 `fixed(0)`。无法识别的策略会静默变为 `selector`；旧策略名 `honk` 明确无效，必须改用 `score`。
 
 若组只有一个唯一叶节点、未配置 `final`，且 TCP 健康状态排除了该节点，honk 仍会把同一节点作为最后尝试。节点保持 dead，直到真实流量或探测使其恢复；这绝不表示回退到 `direct`。UDP 继续正常排除死亡成员。
 
 每个已配置 Selector 的代理叶节点都保持热态。解析嵌套选择后，honk 会按叶节点协议保留可复用的多路复用 session、QUIC client 或一条到服务端的裸 TCP 连接；`direct` 与 `block` 不需要热资源。
 
-### Honk 策略（可选）
+### Score 策略
 
-仅当启用默认关闭的 `honk-policy` Cargo feature 时，才接受 `policy: honk`。`honk-core` 和 `honk-tool` 会把该 feature 转发给配置与出站 crate；它不增加运行时配置旋钮，也不改变默认策略。未启用该 feature 的 build 会明确拒绝 `honk`，且不会分配评分状态。
+Score 始终随程序编译，必须以 `policy: score` 显式选择；省略 `policy` 时仍默认使用 Selector。Score 没有运行时调节项，也不会改变其他策略的行为。
 
-Honk 先用普通健康过滤排除死亡候选，再作出权威的单成员选择。健康状态使用代理服务器可达的 IPv4/IPv6 地址族，与评分使用的业务目标地址族相互独立；因此 IPv4 代理服务器仍可承载 IPv6 目标。在剩余成员中，Honk 首先按有效结果的可靠性排名，再考虑 setup/首响应延迟和有界的吞吐贡献。只有可靠性接近时才应用有界探索 bonus。冷启动探索是确定性的，最终平局依次按声明顺序和稳定节点身份解决，因此选择既不会竞速多个成员，也不会使死亡节点重新入选。
+Score 先用普通健康过滤排除死亡候选，再作出权威的单成员选择。健康状态使用代理服务器可达的 IPv4/IPv6 地址族，与评分使用的业务目标地址族相互独立；因此 IPv4 代理服务器仍可承载 IPv6 目标。在剩余成员中，Score 首先按带 Beta 先验的可靠性下置信估计排名，再考虑 setup/首响应延迟和有界吞吐贡献。只有可靠性接近时才应用有界探索 bonus；证据不足或衰减后低于训练阈值的候选会重新进入确定性冷探索。最终平局依次按声明顺序和稳定节点身份解决，因此选择既不会竞速多个成员，也不会使死亡节点重新入选。
 
-评分按组、TCP/UDP、目标 IPv4/IPv6 地址族、规范化精确目标（小写 domain 或 IP 加端口）及节点身份隔离。精确目标样本足够前，会与有界的组/网络/地址族聚合证据混合。有真实目标的任务同时更新两层；无目标预热只更新聚合层。嵌套选择会把一次完成的尝试归因到路径经过的每个 Honk 组。
+所有历史计数、加权和与权重都采用固定 30 分钟半衰期的指数衰减。setup 和首响应延迟取衰减加权均值。吞吐证据仅接纳终态成功、收发双向均非零、持续至少 1 秒，且主导方向传输至少 64 KiB 的交换；合格窗口以主导方向字节数除以总持续时间汇总，避免双计请求与响应，也不让短小突发影响排名。这些半衰期和门槛是固定实现常量，不可配置。
 
-所有经过 Honk 组的真实 attempt 都会反馈：透明 TCP/UDP、DNS upstream exchange、周期 HTTP/UDP 健康探测、按需 Clash delay test、启动/Selector/UDP 预热，以及外部 UI 下载。有目标的任务使用真实 host/IP、端口、transport 和目标地址族；仅连接代理服务器的 preconnect 与 session warm-up 只更新聚合层，不会虚构业务目标。每个周期 UDP 探测还会通过属于 Honk 组的每个节点，对第一个 HTTPS `global.tcp_check_url` 执行一次 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手；这个独立 `DataUdp` 样本只影响 Honk 评分，不改变基于 DNS 的 UDP 健康判定。未配置 check URL 或 URL 不是 HTTPS 时不运行额外探测。该握手只记录双向有效性，不虚构 wire-byte 流量。每个已启动 attempt 都记录 setup、存在时的首响应、双向字节，以及唯一的紧凑终态；取消或进程 shutdown 保持中性，retry 则作为独立 attempt。
+评分按组、TCP/UDP、目标 IPv4/IPv6 地址族、规范化精确目标（小写 domain 或 IP 加端口）及节点身份隔离。精确目标证据会与有界的组/网络/地址族聚合证据分层混合，随后随衰减逐渐取得或让出主导权。有真实目标的任务同时更新两层；无目标预热只更新聚合层。嵌套选择会把一次完成的尝试归因到路径经过的每个 Score 组。
 
-全部评分状态仅存于进程内存。精确 node-target cell 使用硬上限为 4,096 的 LRU，另有 4,096 个有界聚合 cell。reload 保留共享状态并移除已删除组或成员的 cell；进程重启会清空状态。评分 cell 与仅由 scorer 持有的 domain/IP 键不会进入日志、Clash API 文档或 `cache.db`；已有连接元数据不受影响。
+评分器的 instrumentation 虽然始终编译，但按需运行：非 Score 路径不会创建 reporter 或评分 cell。所有经过 Score 组且真实启动的 attempt 都会反馈，包括透明 TCP/UDP、DNS upstream exchange、周期 HTTP/UDP 健康探测、按需 Clash delay test、启动/Selector/UDP 预热，以及外部 UI 下载。有目标的任务使用真实 host/IP、端口、transport 和目标地址族；仅连接代理服务器的 preconnect 与 session warm-up 只更新聚合层，不会虚构业务目标。每个周期 UDP 探测还会通过属于 Score 组的每个节点，对第一个 HTTPS `global.tcp_check_url` 执行一次 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手；这个独立 `DataUdp` 样本只影响 Score 评分，不改变基于 DNS 的 UDP 健康判定。未配置 check URL 或 URL 不是 HTTPS 时不运行额外探测。该握手只记录双向有效性，不虚构 wire-byte 流量。每个已启动 attempt 都记录 setup、存在时的首响应、双向字节，以及唯一的紧凑终态；取消或进程 shutdown 保持中性，retry 则作为独立 attempt。
+
+全部评分状态仅存于当前进程内存。精确 node-target cell 使用硬上限为 4,096 的 LRU，聚合 cell 使用另一个 4,096 项 LRU。成功的进程内 reload 复用同一共享状态并移除已删除组或成员的 cell；进程重启会清空状态。评分 cell 与仅由 scorer 持有的 domain/IP 键不会进入日志、持久化存储或任何 API 输出。Clash 仍将 Score 表示为 `type: "url_test"`，在 `now` 中显示当前聚合 TCP 胜者，并拒绝对该组执行 `PUT /proxies/{name}`。
 
 ## 过滤解析
 

@@ -16,7 +16,7 @@ It is **not** a line-for-line port of either project. The kernel path follows da
 
 License: **GPL-3.0-only**.
 
-The reliability-first Honk group policy is available only in builds with the default-off `honk-policy` Cargo feature; enabled configurations select it with `policy: honk`. It does not change default group behavior. When selected, it learns in memory from actual traffic plus DNS, real QUIC handshakes, probes, delay tests, warm-up, and direct or proxied UI downloads without exporting target keys. See the [group reference](doc/en/reference/groups.md#honk-policy-optional).
+The always-compiled, reliability-first Score group policy is selected explicitly with `policy: score`; omitted policy still defaults to Selector. Score learns only in process memory from actual traffic plus DNS, real QUIC handshakes, probes, delay tests, warm-up, and direct or proxied UI downloads, without logging, persisting, or exporting scorer target keys. See the [group reference](doc/en/reference/groups.md#score-policy).
 
 ## Experimental held-first-packet UDP decisions
 
@@ -58,7 +58,7 @@ These checkboxes indicate maintainer review status, not feature availability:
 
 ### TODO
 
-- [x] Add the default-off `honk-policy` score-based group policy
+- [x] Add the always-compiled Score group policy
 - [ ] Add proxied DoQ/DoH3 through a quinn `AsyncUdpSocket` adapter over outbound `PacketTransport`
 - [ ] Evaluate AF_XDP and XDP paths for further performance gains
 - [ ] Add a honk REST API
