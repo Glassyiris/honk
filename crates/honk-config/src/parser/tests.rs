@@ -1376,26 +1376,34 @@ fn test_parse_dns_zero_max_cache_size_is_preserved_for_runtime_clamp() {
 }
 
 #[test]
-fn use_host_defaults_off_and_parses_dae_boolean_forms() {
-    assert!(!parse_dae_config("dns {}").unwrap().dns.use_host);
-    assert!(
-        parse_dae_config("dns {\n    use_host: true\n}")
-            .unwrap()
-            .dns
-            .use_host
+fn hosts_sources_default_off_and_collect_repeated_values() {
+    assert!(parse_dae_config("dns {}").unwrap().dns.hosts.is_empty());
+
+    let custom = parse_dae_config(
+        "dns {\n    use_host: true\n    use_host: 'rules-one.txt'\n    use_host: false\n    use_host: \"rules-two.txt\"\n    use_host: 'rules-one.txt'\n}",
+    )
+    .unwrap()
+    .dns;
+    assert_eq!(
+        custom.hosts,
+        ["/etc/hosts", "rules-one.txt", "rules-two.txt"]
     );
-    assert!(
+
+    assert_eq!(
         parse_dae_config("dns {\n    use_host: on\n}")
             .unwrap()
             .dns
-            .use_host
+            .hosts,
+        ["/etc/hosts"]
     );
     assert!(
-        !parse_dae_config("dns {\n    use_host: false\n}")
+        parse_dae_config("dns {\n    use_host: false\n}")
             .unwrap()
             .dns
-            .use_host
+            .hosts
+            .is_empty()
     );
+    assert!(parse_dae_config("dns {\n    hosts_file: 'rules.txt'\n}").is_err());
 }
 
 #[test]

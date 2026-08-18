@@ -65,9 +65,9 @@ flowchart LR
 
 ### Hosts 快照
 
-启用 `use_host` 后，构建 generation 时只读取一次 `/etc/hosts`。名称与别名会规范化，以精确、ASCII 大小写不敏感方式匹配；末尾点会移除，重复地址会丢弃。查询处理不执行文件 I/O。
+构建 generation 时会按声明顺序读取并合并每个可重复的 `use_host` 来源。`true` 选择 `/etc/hosts`，其解析器索引精确名称及别名；路径选择 OxiDNS 兼容的精确、domain 后缀、regexp 和 keyword 规则文件。后定义的同名规则覆盖先定义的规则；精确与最长后缀匹配优先于有序的 regexp 和 keyword 匹配。查询处理不执行文件 I/O。
 
-只有 IN class 的 A 与 AAAA 查询使用该快照。已知名称缺少所请求地址族时返回 `NOERROR`/NODATA，绝不泄漏给上游。hosts 应答 TTL 为 60 秒，绕过正缓存与负缓存复用，但仍产生正常的路由投影结果。快照在其 generation 内不可变；修改 `/etc/hosts` 后发送 SIGHUP 以发布替换项。加载失败会令启动失败，或在发布前中止 reload。
+只有 IN class 的 A 与 AAAA 查询使用该快照。已知名称缺少所请求地址族时返回 `NOERROR`/NODATA，绝不泄漏给上游。hosts 应答 TTL 为 60 秒，绕过正缓存与负缓存复用，但仍产生正常的路由投影结果。快照在其 generation 内不可变；修改来源后发送 SIGHUP 以发布替换项。加载或解析失败会令启动失败，或在发布前中止 reload。
 
 ### 地址族策略
 
