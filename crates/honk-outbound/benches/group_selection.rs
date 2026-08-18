@@ -5,7 +5,9 @@ use chrono::Utc;
 use criterion::{Criterion, criterion_group, criterion_main};
 use honk_config::node::{Group, GroupPolicy, NODE_ID_NAMESPACE, Node};
 use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
-use honk_outbound::group::GroupManager;
+use honk_outbound::group::{
+    GroupManager, ScoreOutcome, ScoreSelectionContext, ScoreTarget, SelectionNetwork,
+};
 use uuid::Uuid;
 
 fn node(name: &str) -> Node {
@@ -41,10 +43,18 @@ fn bench_group_selection(c: &mut Criterion) {
         group("selector", GroupPolicy::Selector, &nodes),
         group("load-balance", GroupPolicy::LoadBalance, &nodes),
         group("fallback", GroupPolicy::Fallback, &nodes),
+        group("score", GroupPolicy::Score, &nodes),
     ];
     let alive = Arc::new(AliveDialerSet::new());
     let manager = GroupManager::with_alive_set(&groups, &nodes, Some(Arc::clone(&alive)));
     alive.report_available_traffic(nodes[0].id, ProbeDomain::DataUdp, IpVersion::V4);
+    let score_context = ScoreSelectionContext {
+        network: SelectionNetwork::Tcp,
+        probe_domain: ProbeDomain::Tcp,
+        target_family: Some(IpVersion::V4),
+        health_family: IpVersion::V4,
+        target: Some(ScoreTarget::domain("example.com", 443)),
+    };
 
     let mut group = c.benchmark_group("group_selection");
     group.bench_function("direct_selector_plan", |b| {
@@ -55,6 +65,31 @@ fn bench_group_selection(c: &mut Criterion) {
                 IpVersion::V4,
             );
             black_box(plan.nodes[0].id)
+        });
+    });
+    group.bench_function("score_cold_target_plan", |b| {
+        b.iter(|| {
+            let plan =
+                manager.selection_plan_for_target(black_box("score"), black_box(&score_context));
+            black_box(plan.entries[0].node.id)
+        });
+    });
+    for _ in 0..8 {
+        let plan = manager.selection_plan_for_target("score", &score_context);
+        let reporter = plan.entries[0]
+            .feedback
+            .as_ref()
+            .expect("score feedback")
+            .start();
+        reporter.setup_succeeded();
+        reporter.rx(1);
+        reporter.finish(ScoreOutcome::Success);
+    }
+    group.bench_function("score_trained_target_plan", |b| {
+        b.iter(|| {
+            let plan =
+                manager.selection_plan_for_target(black_box("score"), black_box(&score_context));
+            black_box(plan.entries[0].node.id)
         });
     });
     group.bench_function("load_balance_tcp", |b| {
