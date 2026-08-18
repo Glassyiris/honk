@@ -8,6 +8,7 @@ use honk_core::dns::DnsResolver;
 use honk_core::ebpf::mock::MockEbpfBackend;
 use honk_core::proxy::ProxyRegistry;
 use honk_core::routing::Router;
+use tempfile::NamedTempFile;
 
 #[path = "support/dns_surface.rs"]
 mod dns_surface_support;
@@ -85,6 +86,59 @@ async fn public_reload_surface_publishes_a_coherent_runtime() {
         }),
         "public reload surface did not activate the replacement generation"
     );
+    assert!(control.is_datapath_healthy());
+}
+
+#[tokio::test]
+async fn public_runtime_reload_replaces_hosts_snapshot_and_rejects_invalid_file() {
+    let file = NamedTempFile::new().expect("temporary hosts file");
+    std::fs::write(file.path(), "full:reload-hosts.test 192.0.2.60\n")
+        .expect("write initial hosts file");
+    let config = Config::default();
+    let upstream = StaticUpstream::new([192, 0, 2, 1]);
+    let control = control_plane(
+        config.clone(),
+        test_dns_forwarder(&config, upstream.clone()),
+    );
+    let service = control.dns_service();
+    let query = build_dns_query("reload-hosts.test", 1);
+    let subscription_id = uuid::Uuid::new_v4();
+
+    {
+        let config_handle = control.config_handle();
+        let mut active = config_handle.write().await;
+        active.dns.use_host = true;
+        active.dns.hosts_file = file.path().to_string_lossy().into_owned();
+    }
+    control
+        .merge_subscription_nodes(subscription_id, vec![])
+        .await;
+    let initial = service
+        .resolve(&query, IngressProfile::Internal)
+        .await
+        .expect("initial hosts answer");
+    assert_eq!(initial, a_response_with_ttl(&query, [192, 0, 2, 60], 60));
+
+    std::fs::write(file.path(), "full:reload-hosts.test 192.0.2.61\n").expect("replace hosts file");
+    control
+        .merge_subscription_nodes(subscription_id, vec![])
+        .await;
+    let replaced = service
+        .resolve(&query, IngressProfile::Internal)
+        .await
+        .expect("reloaded hosts answer");
+    assert_eq!(replaced, a_response_with_ttl(&query, [192, 0, 2, 61], 60));
+
+    std::fs::write(file.path(), "full:reload-hosts.test not-an-ip\n").expect("corrupt hosts file");
+    control
+        .merge_subscription_nodes(subscription_id, vec![])
+        .await;
+    let retained = service
+        .resolve(&query, IngressProfile::Internal)
+        .await
+        .expect("retained hosts answer");
+    assert_eq!(retained, replaced);
+    assert_eq!(upstream.calls(), 0);
     assert!(control.is_datapath_healthy());
 }
 

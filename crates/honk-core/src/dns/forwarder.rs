@@ -178,17 +178,32 @@ impl DnsForwarder {
     }
 
     pub(crate) fn with_hosts_from_config(self, config: &DnsConfig) -> anyhow::Result<Self> {
-        self.with_hosts_file(config.use_host, hosts::SYSTEM_HOSTS_PATH)
+        let custom_rules = !config.hosts_file.is_empty();
+        let configured_path = if custom_rules {
+            config.hosts_file.as_str()
+        } else {
+            hosts::SYSTEM_HOSTS_PATH
+        };
+        self.with_hosts_file(config.use_host, configured_path, custom_rules)
     }
 
-    fn with_hosts_file(mut self, enabled: bool, path: impl AsRef<Path>) -> anyhow::Result<Self> {
+    fn with_hosts_file(
+        mut self,
+        enabled: bool,
+        path: impl AsRef<Path>,
+        custom_rules: bool,
+    ) -> anyhow::Result<Self> {
         if !enabled {
             self.hosts = None;
             return Ok(self);
         }
-        let path = path.as_ref();
-        let hosts = hosts::HostsFile::load(path)
-            .with_context(|| format!("failed to load DNS hosts file {}", path.display()))?;
+        let path = honk_config::paths::resolve_dependency_path(path);
+        let hosts = if custom_rules {
+            hosts::HostsFile::load_rules(&path)
+        } else {
+            hosts::HostsFile::load(&path)
+        }
+        .with_context(|| format!("failed to load DNS hosts file {}", path.display()))?;
         tracing::info!(
             path = %path.display(),
             hostnames = hosts.len(),

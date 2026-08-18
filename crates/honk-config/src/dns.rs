@@ -200,9 +200,13 @@ pub struct DnsConfig {
     /// Standalone DNS listener endpoint. Empty disables the listener.
     #[serde(default)]
     pub bind: String,
-    /// Resolve A/AAAA queries from `/etc/hosts` before DNS routing and upstreams.
+    /// Resolve A/AAAA queries from a generation-pinned hosts snapshot before DNS routing.
     #[serde(default)]
     pub use_host: bool,
+    /// OxiDNS-compatible rule file used instead of `/etc/hosts` when set.
+    /// Relative paths resolve through `global.data_dir`.
+    #[serde(default)]
+    pub hosts_file: String,
     /// EDNS Client Subnet preset or automatic first-public-hop inference.
     #[serde(default)]
     pub client_subnet: String,
@@ -664,6 +668,7 @@ impl Default for DnsConfig {
         Self {
             bind: String::new(),
             use_host: false,
+            hosts_file: String::new(),
             client_subnet: String::new(),
             resolved_client_subnet: None,
             upstream: vec![DnsUpstream {
@@ -833,14 +838,17 @@ mod tests {
     }
 
     #[test]
-    fn use_host_is_serde_defaulted_and_explicitly_configurable() {
-        assert!(!DnsConfig::default().use_host);
-        assert!(!serde_json::from_str::<DnsConfig>("{}").unwrap().use_host);
-        assert!(
-            serde_json::from_str::<DnsConfig>(r#"{"use_host":true}"#)
-                .unwrap()
-                .use_host
-        );
+    fn hosts_settings_are_serde_defaulted_and_configurable() {
+        let defaults = DnsConfig::default();
+        assert!(!defaults.use_host);
+        assert!(defaults.hosts_file.is_empty());
+
+        let parsed = serde_json::from_str::<DnsConfig>(
+            r#"{"use_host":true,"hosts_file":"/etc/honk/hosts.txt"}"#,
+        )
+        .unwrap();
+        assert!(parsed.use_host);
+        assert_eq!(parsed.hosts_file, "/etc/honk/hosts.txt");
     }
 
     /// Regression: a `[dns]` section without `cache` must still get the

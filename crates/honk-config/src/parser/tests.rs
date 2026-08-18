@@ -1337,14 +1337,18 @@ fn test_parse_dns_zero_max_cache_size_is_preserved_for_runtime_clamp() {
 }
 
 #[test]
-fn use_host_defaults_off_and_parses_dae_boolean_forms() {
-    assert!(!parse_dae_config("dns {}").unwrap().dns.use_host);
-    assert!(
-        parse_dae_config("dns {\n    use_host: true\n}")
+fn hosts_settings_default_off_and_parse_dae_values() {
+    let defaults = parse_dae_config("dns {}").unwrap().dns;
+    assert!(!defaults.use_host);
+    assert!(defaults.hosts_file.is_empty());
+
+    let custom =
+        parse_dae_config("dns {\n    use_host: true\n    hosts_file: '/etc/honk/hosts.txt'\n}")
             .unwrap()
-            .dns
-            .use_host
-    );
+            .dns;
+    assert!(custom.use_host);
+    assert_eq!(custom.hosts_file, "/etc/honk/hosts.txt");
+
     assert!(
         parse_dae_config("dns {\n    use_host: on\n}")
             .unwrap()
