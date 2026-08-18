@@ -247,7 +247,7 @@ impl Stats {
 }
 
 fn evidence_decay(elapsed: Duration) -> f64 {
-    2.0_f64.powf(-elapsed.as_secs_f64() / SCORE_EVIDENCE_HALF_LIFE.as_secs_f64())
+    (-elapsed.as_secs_f64() / SCORE_EVIDENCE_HALF_LIFE.as_secs_f64()).exp2()
 }
 
 fn record_cell_start<K>(cache: &mut LruCache<K, Stats>, key: K, now: Instant, tick: u64) -> u64
