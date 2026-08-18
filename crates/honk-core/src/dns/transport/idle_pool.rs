@@ -16,7 +16,7 @@ pub(super) async fn idle_pool_exchange<S, Dial, DialFut>(
     dial: Dial,
     raw_query: &[u8],
     query_timeout: Duration,
-    #[cfg(feature = "honk-policy")] reporter: Option<&honk_outbound::group::HonkReporter>,
+    reporter: Option<&honk_outbound::group::ScoreReporter>,
 ) -> anyhow::Result<Vec<u8>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -33,7 +33,6 @@ where
         Some(s) => s,
         None => dial().await?,
     };
-    #[cfg(feature = "honk-policy")]
     if let Some(reporter) = reporter {
         reporter.setup_succeeded();
     }
@@ -41,7 +40,6 @@ where
         &mut stream,
         raw_query,
         query_timeout,
-        #[cfg(feature = "honk-policy")]
         reporter,
     )
     .await?;

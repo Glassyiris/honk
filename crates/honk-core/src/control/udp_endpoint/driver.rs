@@ -103,8 +103,7 @@ struct UdpDriverCleanupGuard {
     generation: u64,
     decision_token: u32,
     endpoint: Arc<UdpEndpoint>,
-    #[cfg(feature = "honk-policy")]
-    outcome: Option<HonkOutcome>,
+    outcome: Option<ScoreOutcome>,
 }
 
 impl UdpDriverCleanupGuard {
@@ -121,13 +120,11 @@ impl UdpDriverCleanupGuard {
             generation,
             decision_token,
             endpoint,
-            #[cfg(feature = "honk-policy")]
             outcome: None,
         }
     }
 
-    #[cfg(feature = "honk-policy")]
-    fn set_outcome(&mut self, outcome: HonkOutcome) {
+    fn set_outcome(&mut self, outcome: ScoreOutcome) {
         self.outcome = Some(outcome);
     }
 }
@@ -147,12 +144,11 @@ pub(super) struct UdpDriverContext {
 
 impl Drop for UdpDriverCleanupGuard {
     fn drop(&mut self) {
-        #[cfg(feature = "honk-policy")]
         self.endpoint
-            .finish_honk(if self.pool.terminal.load(Ordering::Acquire) {
-                HonkOutcome::Shutdown
+            .finish_score(if self.pool.terminal.load(Ordering::Acquire) {
+                ScoreOutcome::Shutdown
             } else {
-                self.outcome.unwrap_or(HonkOutcome::Cancelled)
+                self.outcome.unwrap_or(ScoreOutcome::Cancelled)
             });
         self.endpoint.release();
         self.pool
@@ -202,25 +198,27 @@ impl UdpDriverHandle {
     }
 }
 
-#[cfg(feature = "honk-policy")]
-pub(super) fn honk_driver_outcome(endpoint: &UdpEndpoint, result: &io::Result<()>) -> HonkOutcome {
+pub(super) fn score_driver_outcome(
+    endpoint: &UdpEndpoint,
+    result: &io::Result<()>,
+) -> ScoreOutcome {
     if endpoint.dead.load(Ordering::Acquire) {
         return if endpoint.has_reply() {
-            HonkOutcome::Success
+            ScoreOutcome::Success
         } else {
-            HonkOutcome::Cancelled
+            ScoreOutcome::Cancelled
         };
     }
     match result {
-        Ok(()) => HonkOutcome::Success,
+        Ok(()) => ScoreOutcome::Success,
         Err(error) if error.kind() == io::ErrorKind::TimedOut => {
             if endpoint.has_reply() {
-                HonkOutcome::Success
+                ScoreOutcome::Success
             } else {
-                HonkOutcome::Timeout
+                ScoreOutcome::Timeout
             }
         }
-        Err(error) => HonkOutcome::Io(error.kind()),
+        Err(error) => ScoreOutcome::Io(error.kind()),
     }
 }
 
@@ -295,8 +293,7 @@ impl UdpEndpointPool {
                 first_ack_tx,
             )
             .await;
-            #[cfg(feature = "honk-policy")]
-            _cleanup.set_outcome(honk_driver_outcome(&endpoint, &result));
+            _cleanup.set_outcome(score_driver_outcome(&endpoint, &result));
             if let Err(error) = result {
                 debug!(
                     "UDP endpoint driver {} -> {} stopped: {}",
@@ -361,8 +358,6 @@ pub(super) async fn run_endpoint_driver(
                     health_family,
                 );
             }
-            #[cfg(feature = "honk-policy")]
-            let _ = &error;
             let _ = first_ack.send(Err(io::Error::new(error.kind(), error.to_string())));
             return Err(error);
         }
@@ -397,8 +392,6 @@ pub(super) async fn run_endpoint_driver(
             health_family,
         );
     }
-    #[cfg(feature = "honk-policy")]
-    let _ = &result;
     result
 }
 
@@ -545,8 +538,7 @@ async fn receive_loop(
             stats.record_udp_first_reply_latency(elapsed);
         }
         endpoint.tracker_download(n as u64);
-        #[cfg(feature = "honk-policy")]
-        endpoint.honk_first_response();
+        endpoint.score_first_response();
         outbound_tracker.add_bytes(0, n as u64);
         if endpoint.take_alive_report_slot() {
             alive_set.report_available_traffic(

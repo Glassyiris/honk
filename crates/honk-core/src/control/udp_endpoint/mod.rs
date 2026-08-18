@@ -10,8 +10,7 @@
 use crate::stats::{ActiveConnectionGuard, OutboundTracker, StatsManager};
 use bytes::Bytes;
 use dashmap::DashMap;
-#[cfg(feature = "honk-policy")]
-use honk_outbound::group::{HonkOutcome, HonkReporter};
+use honk_outbound::group::{ScoreOutcome, ScoreReporter};
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::io;
@@ -79,8 +78,7 @@ pub struct UdpEndpoint {
     download: Arc<AtomicU64>,
     /// Clash-API tracker connection id; set once at registration, taken at
     /// removal.  Not touched on the per-packet path.
-    #[cfg(feature = "honk-policy")]
-    honk_reporter: Mutex<Option<HonkReporter>>,
+    score_reporter: Mutex<Option<ScoreReporter>>,
     health_family: honk_outbound::alive::IpVersion,
     tracker_id: Mutex<Option<String>>,
 }
@@ -96,7 +94,6 @@ impl UdpEndpoint {
             relay_addr,
             node_id,
             honk_outbound::alive::IpVersion::V4,
-            #[cfg(feature = "honk-policy")]
             None,
         )
     }
@@ -106,7 +103,7 @@ impl UdpEndpoint {
         relay_addr: SocketAddr,
         node_id: uuid::Uuid,
         health_family: honk_outbound::alive::IpVersion,
-        #[cfg(feature = "honk-policy")] honk_reporter: Option<HonkReporter>,
+        score_reporter: Option<ScoreReporter>,
     ) -> Self {
         let now = monotonic_nanos();
         Self {
@@ -131,8 +128,7 @@ impl UdpEndpoint {
             upload: Arc::new(AtomicU64::new(0)),
             download: Arc::new(AtomicU64::new(0)),
             tracker_id: Mutex::new(None),
-            #[cfg(feature = "honk-policy")]
-            honk_reporter: Mutex::new(honk_reporter),
+            score_reporter: Mutex::new(score_reporter),
             health_family,
         }
     }
@@ -158,16 +154,14 @@ impl UdpEndpoint {
         self.download.fetch_add(n, Ordering::Relaxed);
     }
 
-    #[cfg(feature = "honk-policy")]
-    pub(crate) fn honk_first_response(&self) {
-        if let Some(reporter) = self.honk_reporter.lock().as_ref() {
+    pub(crate) fn score_first_response(&self) {
+        if let Some(reporter) = self.score_reporter.lock().as_ref() {
             reporter.first_response();
         }
     }
 
-    #[cfg(feature = "honk-policy")]
-    pub(crate) fn finish_honk(&self, outcome: HonkOutcome) {
-        if let Some(reporter) = self.honk_reporter.lock().take() {
+    pub(crate) fn finish_score(&self, outcome: ScoreOutcome) {
+        if let Some(reporter) = self.score_reporter.lock().take() {
             let upload = self.upload.load(Ordering::Relaxed);
             let download = self.download.load(Ordering::Relaxed);
             reporter.tx(upload);
@@ -397,8 +391,8 @@ impl Default for UdpEndpointPool {
 
 mod driver;
 
-#[cfg(all(test, feature = "honk-policy"))]
-use driver::honk_driver_outcome;
+#[cfg(test)]
+use driver::score_driver_outcome;
 use driver::{
     DRIVER_ABORT_TIMEOUT, DRIVER_SHUTDOWN_TIMEOUT, TRAFFIC_ALIVE_REPORT_INTERVAL, TaskRegistry,
     join_registered_tasks, monotonic_nanos, nanos_from_dur,

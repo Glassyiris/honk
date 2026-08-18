@@ -6,11 +6,6 @@ use crate::control::udp_endpoint::{UdpEndpoint, UdpInitLease};
 use crate::control::*;
 use crate::group::{SelectionNetwork, SelectionPlanMode};
 
-#[cfg(feature = "honk-policy")]
-type UdpHonkReporter = Option<crate::group::HonkReporter>;
-#[cfg(not(feature = "honk-policy"))]
-type UdpHonkReporter = Option<()>;
-
 impl ControlPlaneHandle {
     pub(in crate::control) async fn serve_udp_connection(
         &self,
@@ -309,34 +304,24 @@ impl ControlPlaneHandle {
         let (plan, selection_chains) = {
             let config = self.config.read().await;
             let gm = self.group_manager.read();
-            #[cfg(feature = "honk-policy")]
             let plan = crate::control::reload::resolve_udp_outbound_plan_for_target(
                 &config,
                 &gm,
                 &outbound_name,
-                &crate::group::HonkSelectionContext {
+                &crate::group::ScoreSelectionContext {
                     network: SelectionNetwork::Udp,
                     probe_domain: ProbeDomain::DataUdp,
                     target_family: Some(requested_ipver),
                     health_family: requested_ipver,
                     target: Some(match quic_domain.as_deref() {
                         Some(domain) => {
-                            crate::group::HonkTarget::domain(domain, original_dst.port())
+                            crate::group::ScoreTarget::domain(domain, original_dst.port())
                         }
                         None => original_dst.into(),
                     }),
                 },
             );
-            #[cfg(not(feature = "honk-policy"))]
-            let plan = resolve_udp_outbound_plan(&config, &gm, &outbound_name, requested_ipver);
-            #[cfg(feature = "honk-policy")]
             let selection_chains = plan.selection_chains.clone();
-            #[cfg(not(feature = "honk-policy"))]
-            let selection_chains =
-                vec![
-                    gm.selection_chain_for_network(&outbound_name, SelectionNetwork::Udp);
-                    plan.nodes.len()
-                ];
             (plan, selection_chains)
         };
 
@@ -363,28 +348,24 @@ impl ControlPlaneHandle {
         // a single eligible transport winner has been drained and accepted.
         let scheduler_ipver = plan.ipver;
         let plan_mode = plan.mode;
-        #[cfg(feature = "honk-policy")]
-        let honk_feedback = plan.feedback;
+        let score_feedback = plan.feedback;
         let runtime_generation = self.runtime_registry.read().clone();
         let prepare_generation = Arc::clone(&runtime_generation);
         let prepare: UdpPrepare<(
             honk_outbound::proxy::PreparedUdpTransport,
-            UdpHonkReporter,
+            Option<crate::group::ScoreReporter>,
             Vec<String>,
         )> = {
             let registry = self.proxy_registry.clone();
             let stats = self.stats.clone();
-            #[cfg(feature = "honk-policy")]
-            let feedback = honk_feedback.clone();
+            let feedback = score_feedback.clone();
             Arc::new(move |index: usize, node: Node| {
                 let registry = registry.clone();
                 let stats = stats.clone();
                 let runtime_generation = Arc::clone(&prepare_generation);
-                #[cfg(feature = "honk-policy")]
                 let feedback = feedback.get(index).cloned().flatten();
                 let selection_chain = selection_chains.get(index).cloned().unwrap_or_default();
                 Box::pin(async move {
-                    #[cfg(feature = "honk-policy")]
                     let reporter = feedback.map(|feedback| feedback.start());
                     let dial_started_at = std::time::Instant::now();
                     let result = if plan_mode == SelectionPlanMode::ColdUrlTest {
@@ -411,24 +392,10 @@ impl ControlPlaneHandle {
                     };
                     stats.record_udp_dial_latency(dial_started_at.elapsed());
                     match result {
-                        Ok(transport) => Ok((
-                            transport,
-                            {
-                                #[cfg(feature = "honk-policy")]
-                                {
-                                    reporter
-                                }
-                                #[cfg(not(feature = "honk-policy"))]
-                                {
-                                    None
-                                }
-                            },
-                            selection_chain,
-                        )),
+                        Ok(transport) => Ok((transport, reporter, selection_chain)),
                         Err(error) => {
-                            #[cfg(feature = "honk-policy")]
                             if let Some(reporter) = &reporter {
-                                reporter.setup_failed(honk_runtime_outcome(
+                                reporter.setup_failed(score_runtime_outcome(
                                     &runtime_generation,
                                     &error,
                                 ));
@@ -476,7 +443,7 @@ impl ControlPlaneHandle {
                 Arc::new(move || stats.record_udp_stagger_cancellation())
             },
         };
-        let Some((node, (prepared_transport, honk_reporter, selection_chain))) =
+        let Some((node, (prepared_transport, score_reporter, selection_chain))) =
             prepare_udp_plan(plan_mode, plan.nodes, prepare, callbacks).await
         else {
             debug!(
@@ -486,16 +453,13 @@ impl ControlPlaneHandle {
             self.stats.record_error(&outbound_name);
             return Ok(());
         };
-        #[cfg(not(feature = "honk-policy"))]
-        let _ = honk_reporter;
 
         // The prepared winner is bound only after every speculative loser has
         // been aborted/drained. Close the death-before-bind race again before
         // creating endpoint state or allowing the driver to send.
         if !lease.bind_selected_node(node.id) {
-            #[cfg(feature = "honk-policy")]
-            if let Some(reporter) = &honk_reporter {
-                reporter.finish(crate::group::HonkOutcome::Cancelled);
+            if let Some(reporter) = &score_reporter {
+                reporter.finish(crate::group::ScoreOutcome::Cancelled);
             }
             return Err(anyhow::anyhow!(
                 "UDP initializer generation was cancelled before winner bind"
@@ -509,9 +473,8 @@ impl ControlPlaneHandle {
             )
         {
             lease.clear_selected_node();
-            #[cfg(feature = "honk-policy")]
-            if let Some(reporter) = &honk_reporter {
-                reporter.finish(crate::group::HonkOutcome::Cancelled);
+            if let Some(reporter) = &score_reporter {
+                reporter.finish(crate::group::ScoreOutcome::Cancelled);
             }
             return Err(anyhow::anyhow!(
                 "UDP winner '{}' became ineligible before endpoint setup",
@@ -524,15 +487,13 @@ impl ControlPlaneHandle {
         let transport = match prepared_transport.commit().await {
             Ok(transport) => transport,
             Err(error) => {
-                #[cfg(feature = "honk-policy")]
-                if let Some(reporter) = &honk_reporter {
-                    reporter.finish(honk_runtime_outcome(&runtime_generation, &error));
+                if let Some(reporter) = &score_reporter {
+                    reporter.finish(score_runtime_outcome(&runtime_generation, &error));
                 }
                 return Err(error);
             }
         };
-        #[cfg(feature = "honk-policy")]
-        if let Some(reporter) = &honk_reporter {
+        if let Some(reporter) = &score_reporter {
             reporter.setup_succeeded();
         }
 
@@ -546,9 +507,8 @@ impl ControlPlaneHandle {
                 self.stats
                     .record_udp_reply_ready_latency(reply_ready_started.elapsed());
                 self.stats.record_error(&outbound_name);
-                #[cfg(feature = "honk-policy")]
-                if let Some(reporter) = &honk_reporter {
-                    reporter.finish(crate::group::HonkOutcome::Cancelled);
+                if let Some(reporter) = &score_reporter {
+                    reporter.finish(crate::group::ScoreOutcome::Cancelled);
                 }
                 return Err(error.into());
             }
@@ -557,15 +517,12 @@ impl ControlPlaneHandle {
             .record_udp_reply_ready_latency(reply_ready_started.elapsed());
 
         let relay_addr = transport.relay_addr();
-        #[cfg(feature = "honk-policy")]
-        let honk_reporter = honk_reporter;
         let endpoint = Arc::new(UdpEndpoint::new_scored(
             transport,
             relay_addr,
             node.id,
             scheduler_ipver,
-            #[cfg(feature = "honk-policy")]
-            honk_reporter,
+            score_reporter,
         ));
         endpoint.record_pending_reply_peer(relay_addr);
 

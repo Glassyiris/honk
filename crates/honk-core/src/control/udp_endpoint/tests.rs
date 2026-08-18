@@ -23,7 +23,6 @@ async fn first_reply_metric_and_alive_reporting_are_throttled() {
     assert!(endpoint.take_alive_report_slot());
 }
 
-#[cfg(feature = "honk-policy")]
 #[tokio::test]
 async fn explicit_retirement_is_neutral_until_a_reply_makes_it_useful() {
     let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -33,13 +32,13 @@ async fn explicit_retirement_is_neutral_until_a_reply_makes_it_useful() {
     endpoint.kill();
 
     assert_eq!(
-        honk_driver_outcome(&endpoint, &result),
-        HonkOutcome::Cancelled
+        score_driver_outcome(&endpoint, &result),
+        ScoreOutcome::Cancelled
     );
     endpoint.has_reply.store(true, Ordering::Relaxed);
     assert_eq!(
-        honk_driver_outcome(&endpoint, &result),
-        HonkOutcome::Success
+        score_driver_outcome(&endpoint, &result),
+        ScoreOutcome::Success
     );
 }
 

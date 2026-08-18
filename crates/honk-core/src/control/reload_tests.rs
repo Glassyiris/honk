@@ -878,7 +878,6 @@ async fn changed_selector_bare_endpoint_is_purged_before_failed_replacement() {
     let resources = SelectorWarmResources {
         generation: Arc::clone(&generation),
         proxy_registry: cp.proxy_registry.clone(),
-        #[cfg(feature = "honk-policy")]
         group_manager: cp.group_manager.clone(),
         connection_pool: cp.connection_pool.clone(),
         stats: cp.stats.clone(),

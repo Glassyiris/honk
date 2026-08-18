@@ -35,10 +35,9 @@ use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 
 use state::UrlTestSelections;
 
-#[cfg(feature = "honk-policy")]
-pub use honk::{
-    HonkAttribution, HonkFeedback, HonkOutcome, HonkPolicyState, HonkReporter,
-    HonkSelectionContext, HonkTarget,
+pub use score::{
+    ScoreAttribution, ScoreFeedback, ScoreOutcome, ScorePolicyState, ScoreReporter,
+    ScoreSelectionContext, ScoreTarget,
 };
 pub use state::{InterruptCallback, PersistCallback, SelectorChangeCallback};
 
@@ -98,20 +97,18 @@ pub struct SelectionPlan<'a> {
     pub mode: SelectionPlanMode,
     pub nodes: Vec<&'a Node>,
 }
-#[cfg(feature = "honk-policy")]
 #[derive(Clone)]
-pub struct HonkSelectionEntry<'a> {
+pub struct ScoreSelectionEntry<'a> {
     pub node: &'a Node,
-    pub feedback: Option<HonkFeedback>,
+    pub feedback: Option<ScoreFeedback>,
     pub selection_chain: Vec<String>,
 }
 
-#[cfg(feature = "honk-policy")]
 #[derive(Clone)]
-pub struct HonkSelectionPlan<'a> {
+pub struct ScoreSelectionPlan<'a> {
     pub mode: SelectionPlanMode,
     pub health_family: IpVersion,
-    pub entries: Vec<HonkSelectionEntry<'a>>,
+    pub entries: Vec<ScoreSelectionEntry<'a>>,
 }
 
 /// Whether resolving a selection may update group state or must only observe
@@ -147,9 +144,7 @@ struct Candidate<'a> {
     tag: &'a str,
     /// Leaf node that would actually be dialed.
     node: &'a Node,
-    #[cfg(feature = "honk-policy")]
     attribution: Vec<&'a str>,
-    #[cfg(feature = "honk-policy")]
     selection_chain: Vec<&'a str>,
 }
 
@@ -176,8 +171,7 @@ pub struct GroupManager {
     selector_change_callback: RwLock<Option<SelectorChangeCallback>>,
     /// Invoked on selection changes for groups with interrupt_connections.
     interrupt_callback: RwLock<Option<InterruptCallback>>,
-    #[cfg(feature = "honk-policy")]
-    honk_state: Arc<HonkPolicyState>,
+    score_state: Arc<ScorePolicyState>,
 }
 
 impl GroupManager {
@@ -190,49 +184,35 @@ impl GroupManager {
         nodes: &[Node],
         alive_set: Option<Arc<AliveDialerSet>>,
     ) -> Self {
-        #[cfg(feature = "honk-policy")]
-        let honk_state = Arc::new(HonkPolicyState::default());
-        #[cfg(feature = "honk-policy")]
-        let manager = Self::with_alive_set_and_honk_state(groups, nodes, alive_set, honk_state);
-        #[cfg(feature = "honk-policy")]
-        manager.publish_honk_membership();
-        #[cfg(feature = "honk-policy")]
-        return manager;
-
-        #[cfg(not(feature = "honk-policy"))]
-        Self::build(groups, nodes, alive_set)
+        let score_state = Arc::new(ScorePolicyState::default());
+        let manager = Self::with_alive_set_and_score_state(groups, nodes, alive_set, score_state);
+        manager.publish_score_membership();
+        manager
     }
 
-    #[cfg(feature = "honk-policy")]
-    pub fn with_alive_set_and_honk_state(
+    pub fn with_alive_set_and_score_state(
         groups: &[Group],
         nodes: &[Node],
         alive_set: Option<Arc<AliveDialerSet>>,
-        honk_state: Arc<HonkPolicyState>,
+        score_state: Arc<ScorePolicyState>,
     ) -> Self {
-        Self::build(groups, nodes, alive_set, honk_state)
+        Self::build(groups, nodes, alive_set, score_state)
     }
 
-    #[cfg(feature = "honk-policy")]
     fn build(
         groups: &[Group],
         nodes: &[Node],
         alive_set: Option<Arc<AliveDialerSet>>,
-        honk_state: Arc<HonkPolicyState>,
+        score_state: Arc<ScorePolicyState>,
     ) -> Self {
-        Self::build_inner(groups, nodes, alive_set, honk_state)
-    }
-
-    #[cfg(not(feature = "honk-policy"))]
-    fn build(groups: &[Group], nodes: &[Node], alive_set: Option<Arc<AliveDialerSet>>) -> Self {
-        Self::build_inner(groups, nodes, alive_set)
+        Self::build_inner(groups, nodes, alive_set, score_state)
     }
 
     fn build_inner(
         groups: &[Group],
         nodes: &[Node],
         alive_set: Option<Arc<AliveDialerSet>>,
-        #[cfg(feature = "honk-policy")] honk_state: Arc<HonkPolicyState>,
+        score_state: Arc<ScorePolicyState>,
     ) -> Self {
         let mut group_map: HashMap<String, Group> =
             groups.iter().map(|g| (g.name.clone(), g.clone())).collect();
@@ -265,8 +245,7 @@ impl GroupManager {
             persist_callback: RwLock::new(None),
             selector_change_callback: RwLock::new(None),
             interrupt_callback: RwLock::new(None),
-            #[cfg(feature = "honk-policy")]
-            honk_state,
+            score_state,
         }
     }
 
@@ -543,14 +522,13 @@ impl GroupManager {
                         .node,
                 ],
             },
-            #[cfg(feature = "honk-policy")]
-            GroupPolicy::Honk => SelectionPlan {
+            GroupPolicy::Score => SelectionPlan {
                 mode: SelectionPlanMode::Authoritative,
                 nodes: vec![
-                    self.pick_honk(
+                    self.pick_score(
                         &candidates,
                         group,
-                        &HonkSelectionContext::aggregate(network, domain, ipver),
+                        &ScoreSelectionContext::aggregate(network, domain, ipver),
                     )
                     .node,
                 ],
@@ -632,10 +610,9 @@ impl GroupManager {
 }
 
 mod filter;
-#[cfg(feature = "honk-policy")]
-mod honk;
 mod policy;
 mod resolver;
+mod score;
 mod state;
 
 #[cfg(test)]

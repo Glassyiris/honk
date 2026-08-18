@@ -38,9 +38,7 @@ impl GroupManager {
                 .map(|node| Candidate {
                     tag: node.name.as_str(),
                     node,
-                    #[cfg(feature = "honk-policy")]
                     attribution: Vec::new(),
-                    #[cfg(feature = "honk-policy")]
                     selection_chain: vec![node.name.as_str()],
                 });
         }
@@ -52,17 +50,14 @@ impl GroupManager {
                 self.pick_load_balance(&candidates, group, network, effects)
             }
             GroupPolicy::Fallback => self.pick_fallback(&candidates, group, network, effects),
-            #[cfg(feature = "honk-policy")]
-            GroupPolicy::Honk => self.pick_honk(
+            GroupPolicy::Score => self.pick_score(
                 &candidates,
                 group,
-                &HonkSelectionContext::aggregate(network, domain, ipver),
+                &ScoreSelectionContext::aggregate(network, domain, ipver),
             ),
         };
-        #[cfg(feature = "honk-policy")]
         let mut candidate = candidate;
-        #[cfg(feature = "honk-policy")]
-        if group.policy == GroupPolicy::Honk {
+        if group.policy == GroupPolicy::Score {
             candidate.attribution.push(group.name.as_str());
         }
         Some(candidate)
@@ -93,9 +88,7 @@ impl GroupManager {
             .map(|node| Candidate {
                 tag: node.name.as_str(),
                 node,
-                #[cfg(feature = "honk-policy")]
                 attribution: Vec::new(),
-                #[cfg(feature = "honk-policy")]
                 selection_chain: vec![node.name.as_str()],
             })
             .collect();
@@ -292,8 +285,7 @@ impl GroupManager {
                     self.get_fallback_selection_for_network(&group.name, network)
                 }
                 GroupPolicy::LoadBalance => None,
-                #[cfg(feature = "honk-policy")]
-                GroupPolicy::Honk => self.get_honk_selection_for_network(&group.name, network),
+                GroupPolicy::Score => self.get_score_selection_for_network(&group.name, network),
             };
             let Some(tag) = next else { break };
             if tag == current || chain.contains(&tag) {

@@ -317,15 +317,12 @@ impl ControlPlane {
             let config = self.config.read().await;
             (config.groups.clone(), config.nodes.clone())
         };
-        #[cfg(feature = "honk-policy")]
-        let new_gm = GroupManager::with_alive_set_and_honk_state(
+        let new_gm = GroupManager::with_alive_set_and_score_state(
             &groups,
             &nodes,
             Some(self.alive_set.clone()),
-            self.group_manager.read().honk_state(),
+            self.group_manager.read().score_state(),
         );
-        #[cfg(not(feature = "honk-policy"))]
-        let new_gm = GroupManager::with_alive_set(&groups, &nodes, Some(self.alive_set.clone()));
         // Migrate runtime choices before wiring callbacks: migration must
         // not fire persistence or connection interruption.
         new_gm.migrate_selector_choices_from(&self.group_manager.read());
@@ -338,8 +335,7 @@ impl ControlPlane {
         }
         {
             let mut group_manager = self.group_manager.write();
-            #[cfg(feature = "honk-policy")]
-            new_gm.publish_honk_membership();
+            new_gm.publish_score_membership();
             *group_manager = Arc::new(new_gm);
         }
 

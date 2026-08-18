@@ -130,12 +130,11 @@ async fn resolve_dial_leaf_implicit_default_fallback() {
     assert!(pool.resolve_dial_leaf(entry).await.unwrap().is_none());
 }
 
-#[cfg(feature = "honk-policy")]
 #[tokio::test]
-async fn forced_honk_route_keeps_target_and_nested_attribution() {
+async fn forced_score_route_keeps_target_and_nested_attribution() {
     let node = test_node("proxy-leaf");
-    let child = test_group("child", GroupPolicy::Honk, vec![node.id]);
-    let mut parent = test_group("parent", GroupPolicy::Honk, vec![]);
+    let child = test_group("child", GroupPolicy::Score, vec![node.id]);
+    let mut parent = test_group("parent", GroupPolicy::Score, vec![]);
     parent.groups.push("child".into());
     let manager = Arc::new(GroupManager::new(
         &[parent, child],
@@ -156,7 +155,7 @@ async fn forced_honk_route_keeps_target_and_nested_attribution() {
         .unwrap();
     assert_eq!(route.target, "192.0.2.53:53".parse().unwrap());
     assert_eq!(route.node.unwrap().id, node.id);
-    let feedback = route.feedback.expect("honk attribution");
+    let feedback = route.feedback.expect("score attribution");
     assert_eq!(
         feedback
             .attributions()
@@ -167,12 +166,11 @@ async fn forced_honk_route_keeps_target_and_nested_attribution() {
     );
 }
 
-#[cfg(feature = "honk-policy")]
 #[tokio::test]
-async fn tcp_fallback_keeps_selected_honk_group_chain() {
+async fn tcp_fallback_keeps_selected_score_group_chain() {
     let node = test_node("shared-leaf");
-    let selected = test_group("selected", GroupPolicy::Honk, vec![node.id]);
-    let unrelated = test_group("unrelated", GroupPolicy::Honk, vec![node.id]);
+    let selected = test_group("selected", GroupPolicy::Score, vec![node.id]);
+    let unrelated = test_group("unrelated", GroupPolicy::Score, vec![node.id]);
     let manager = Arc::new(GroupManager::new(
         &[selected, unrelated],
         std::slice::from_ref(&node),
@@ -216,11 +214,10 @@ async fn tcp_fallback_keeps_selected_honk_group_chain() {
     );
 }
 
-#[cfg(feature = "honk-policy")]
 #[tokio::test]
-async fn implicit_honk_route_keeps_target_and_attribution() {
+async fn implicit_score_route_keeps_target_and_attribution() {
     let node = test_node("proxy-leaf");
-    let group = test_group("proxy", GroupPolicy::Honk, vec![node.id]);
+    let group = test_group("proxy", GroupPolicy::Score, vec![node.id]);
     let manager = GroupManager::new(&[group], std::slice::from_ref(&node)).into_shared();
     let traffic = Arc::new(RwLock::new(
         Router::new(&[route("192.0.2.53/32", "proxy")], "direct").unwrap(),

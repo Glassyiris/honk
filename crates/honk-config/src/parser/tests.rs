@@ -337,19 +337,21 @@ group {
         assert_eq!(config.groups[0].policy, crate::group::GroupPolicy::Selector);
     }
 
-    #[cfg(feature = "honk-policy")]
     #[test]
-    fn test_parse_honk_group_policy() {
-        let config = parse_dae_config("group {\n proxy {\n policy: honk\n }\n}").unwrap();
-        assert_eq!(config.groups[0].policy, crate::group::GroupPolicy::Honk);
+    fn test_parse_score_group_policy_case_insensitively() {
+        for policy in ["score", "ScOrE"] {
+            let config =
+                parse_dae_config(&format!("group {{\n proxy {{\n policy: {policy}\n }}\n}}"))
+                    .unwrap();
+            assert_eq!(config.groups[0].policy, crate::group::GroupPolicy::Score);
+        }
     }
 
-    #[cfg(not(feature = "honk-policy"))]
     #[test]
-    fn test_parse_honk_group_policy_requires_feature() {
+    fn test_parse_legacy_honk_group_policy_is_actionable() {
         let error = parse_dae_config("group {\n proxy {\n policy: honk\n }\n}").unwrap_err();
-        assert!(matches!(error, crate::ConfigError::UnsupportedFeature(_)));
-        assert!(error.to_string().contains("honk-policy"));
+        assert!(matches!(error, crate::ConfigError::UnsupportedPolicy(_)));
+        assert!(error.to_string().contains("renamed to 'score'"));
     }
 
     #[test]

@@ -402,15 +402,16 @@ async fn test_proxies_structure_and_selector_switch() {
     assert_eq!(resp.status(), 400);
 }
 
-#[cfg(feature = "honk-policy")]
 #[tokio::test]
-async fn test_honk_proxy_contract_and_put_rejection() {
-    use honk_outbound::group::{HonkOutcome, HonkSelectionContext, HonkTarget, SelectionNetwork};
+async fn test_score_proxy_contract_and_put_rejection() {
+    use honk_outbound::group::{
+        ScoreOutcome, ScoreSelectionContext, ScoreTarget, SelectionNetwork,
+    };
 
     let (a, b) = (make_node("node-a"), make_node("node-b"));
     let group = Group {
         name: "auto".into(),
-        policy: honk_config::group::GroupPolicy::Honk,
+        policy: honk_config::group::GroupPolicy::Score,
         nodes: vec![a.id, b.id],
         ..Default::default()
     };
@@ -424,12 +425,12 @@ async fn test_honk_proxy_contract_and_put_rejection() {
         "",
     )
     .await;
-    let context = HonkSelectionContext {
+    let context = ScoreSelectionContext {
         network: SelectionNetwork::Tcp,
         probe_domain: ProbeDomain::Tcp,
         target_family: Some(IpVersion::V4),
         health_family: IpVersion::V4,
-        target: Some(HonkTarget::domain("seed.example", 443)),
+        target: Some(ScoreTarget::domain("seed.example", 443)),
     };
     let manager = app.state.group_manager.read().clone();
     let first = manager.selection_plan_for_target("auto", &context);
@@ -439,14 +440,14 @@ async fn test_honk_proxy_contract_and_put_rejection() {
         .as_ref()
         .unwrap()
         .start()
-        .setup_failed(HonkOutcome::Timeout);
+        .setup_failed(ScoreOutcome::Timeout);
     let second = manager.selection_plan_for_target("auto", &context);
     assert_eq!(second.entries[0].node.id, b.id);
     let reporter = second.entries[0].feedback.as_ref().unwrap().start();
     reporter.setup_succeeded();
     reporter.tx(1);
     reporter.rx(1);
-    reporter.finish(HonkOutcome::Success);
+    reporter.finish(ScoreOutcome::Success);
 
     let client = http_client();
     let body: serde_json::Value = client
@@ -926,16 +927,15 @@ async fn test_group_delay_omits_failed_members() {
     assert_eq!(resp.status(), 404);
 }
 
-#[cfg(feature = "honk-policy")]
 #[tokio::test]
-async fn test_honk_group_delay_returns_current_winner_latency() {
-    use honk_outbound::group::{HonkOutcome, HonkSelectionContext, SelectionNetwork};
+async fn test_score_group_delay_returns_current_winner_latency() {
+    use honk_outbound::group::{ScoreOutcome, ScoreSelectionContext, SelectionNetwork};
 
     let direct = Config::builtin_direct_node();
     let unreachable = make_node("unreachable");
     let group = Group {
         name: "auto-delay".into(),
-        policy: honk_config::group::GroupPolicy::Honk,
+        policy: honk_config::group::GroupPolicy::Score,
         nodes: vec![unreachable.id, direct.id],
         ..Default::default()
     };
@@ -951,12 +951,12 @@ async fn test_honk_group_delay_returns_current_winner_latency() {
     .await;
     let manager = app.state.group_manager.read().clone();
     let aggregate =
-        HonkSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
     manager
         .feedback_for_group_node("auto-delay", unreachable.id, aggregate.clone())
         .unwrap()
         .start()
-        .setup_failed(HonkOutcome::Timeout);
+        .setup_failed(ScoreOutcome::Timeout);
     let reporter = manager
         .feedback_for_group_node("auto-delay", direct.id, aggregate)
         .unwrap()
@@ -964,9 +964,9 @@ async fn test_honk_group_delay_returns_current_winner_latency() {
     reporter.setup_succeeded();
     reporter.tx(1);
     reporter.rx(1);
-    reporter.finish(HonkOutcome::Success);
+    reporter.finish(ScoreOutcome::Success);
     assert_eq!(
-        manager.get_honk_selection_for_network("auto-delay", SelectionNetwork::Tcp),
+        manager.get_score_selection_for_network("auto-delay", SelectionNetwork::Tcp),
         Some(Config::BUILTIN_DIRECT_NODE.into())
     );
 

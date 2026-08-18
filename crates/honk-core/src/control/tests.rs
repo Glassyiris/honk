@@ -181,11 +181,10 @@ async fn test_resolve_udp_check_target() {
     );
 }
 
-#[cfg(feature = "honk-policy")]
 #[tokio::test]
-async fn quic_failure_trains_honk_without_failing_dns_udp_health() {
+async fn quic_failure_trains_score_without_failing_dns_udp_health() {
     use honk_config::node::{Group, GroupPolicy};
-    use honk_outbound::group::{GroupManager, HonkTarget, SelectionNetwork};
+    use honk_outbound::group::{GroupManager, ScoreTarget, SelectionNetwork};
 
     let node = udp_test_node();
     let mut other = node.clone();
@@ -193,8 +192,8 @@ async fn quic_failure_trains_honk_without_failing_dns_udp_health() {
     other.port += 1;
     other.id = other.derive_id();
     let group = Group {
-        name: "honk".into(),
-        policy: GroupPolicy::Honk,
+        name: "score".into(),
+        policy: GroupPolicy::Score,
         nodes: vec![node.id, other.id],
         ..Group::default()
     };
@@ -236,12 +235,12 @@ async fn quic_failure_trains_honk_without_failing_dns_udp_health() {
     assert_eq!(context.target_family, Some(IpVersion::V4));
     assert_eq!(
         context.target,
-        Some(HonkTarget::domain("quic.example.test", 9443))
+        Some(ScoreTarget::domain("quic.example.test", 9443))
     );
     assert_eq!(
         manager
             .read()
-            .selection_plan_for_target("honk", &context)
+            .selection_plan_for_target("score", &context)
             .entries[0]
             .node
             .id,
@@ -266,7 +265,7 @@ async fn quic_failure_trains_honk_without_failing_dns_udp_health() {
     assert_eq!(
         manager
             .read()
-            .selection_plan_for_target("honk", &context)
+            .selection_plan_for_target("score", &context)
             .entries[0]
             .node
             .id,
@@ -1838,7 +1837,6 @@ enum UdpTestMode {
         sends: Arc<std::sync::atomic::AtomicUsize>,
     },
     Success,
-    #[cfg_attr(not(feature = "honk-policy"), expect(dead_code))]
     DnsResponse {
         dials: Arc<std::sync::atomic::AtomicUsize>,
     },
@@ -3455,8 +3453,26 @@ async fn udp_initializing_follower_requires_slow_permit_via_shared_helper() {
     drop(lease);
 }
 
+fn resolve_udp_score_plan(
+    config: &Config,
+    manager: &GroupManager,
+    outbound: &str,
+    ipver: IpVersion,
+) -> ResolvedUdpPlan {
+    resolve_udp_outbound_plan_for_target(
+        config,
+        manager,
+        outbound,
+        &crate::group::ScoreSelectionContext::aggregate(
+            crate::group::SelectionNetwork::Udp,
+            ProbeDomain::DataUdp,
+            ipver,
+        ),
+    )
+}
+
 #[test]
-fn resolve_udp_outbound_plan_preserves_terminal_provenance() {
+fn resolve_udp_score_plan_preserves_terminal_provenance() {
     let first = Node {
         id: uuid::Uuid::new_v4(),
         name: "first".into(),
@@ -3492,7 +3508,7 @@ fn resolve_udp_outbound_plan_preserves_terminal_provenance() {
     );
     let manager = GroupManager::new(&config.groups, &config.nodes);
 
-    let direct = resolve_udp_outbound_plan(&config, &manager, "direct", IpVersion::V4);
+    let direct = resolve_udp_score_plan(&config, &manager, "direct", IpVersion::V4);
     assert_eq!(direct.mode, crate::group::SelectionPlanMode::Authoritative);
     assert_eq!(
         direct
@@ -3503,7 +3519,7 @@ fn resolve_udp_outbound_plan_preserves_terminal_provenance() {
         ["direct"]
     );
 
-    let node = resolve_udp_outbound_plan(&config, &manager, "first", IpVersion::V4);
+    let node = resolve_udp_score_plan(&config, &manager, "first", IpVersion::V4);
     assert_eq!(node.mode, crate::group::SelectionPlanMode::Authoritative);
     assert_eq!(
         node.nodes
@@ -3513,7 +3529,7 @@ fn resolve_udp_outbound_plan_preserves_terminal_provenance() {
         ["first"]
     );
 
-    let nested = resolve_udp_outbound_plan(&config, &manager, "nested-parent", IpVersion::V4);
+    let nested = resolve_udp_score_plan(&config, &manager, "nested-parent", IpVersion::V4);
     assert_eq!(nested.mode, crate::group::SelectionPlanMode::Authoritative);
     assert_eq!(
         nested
@@ -3524,7 +3540,7 @@ fn resolve_udp_outbound_plan_preserves_terminal_provenance() {
         ["first"]
     );
 
-    let final_plan = resolve_udp_outbound_plan(&config, &manager, "empty-final", IpVersion::V4);
+    let final_plan = resolve_udp_score_plan(&config, &manager, "empty-final", IpVersion::V4);
     assert_eq!(
         final_plan.mode,
         crate::group::SelectionPlanMode::ColdUrlTest
@@ -3540,7 +3556,7 @@ fn resolve_udp_outbound_plan_preserves_terminal_provenance() {
 }
 
 #[test]
-fn resolve_udp_outbound_plan_tracks_v4_fallback_and_final_resolution_guards() {
+fn resolve_udp_score_plan_tracks_v4_fallback_and_final_resolution_guards() {
     let v4_only = Node {
         id: uuid::Uuid::new_v4(),
         name: "v4-only".into(),
@@ -3584,7 +3600,7 @@ fn resolve_udp_outbound_plan_tracks_v4_fallback_and_final_resolution_guards() {
     alive.report_unavailable_forced(v4_only_id, ProbeDomain::DnsUdp, IpVersion::V6);
     let manager = GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive));
 
-    let v4_fallback = resolve_udp_outbound_plan(&config, &manager, "v4-group", IpVersion::V6);
+    let v4_fallback = resolve_udp_score_plan(&config, &manager, "v4-group", IpVersion::V6);
     assert_eq!(
         v4_fallback.mode,
         crate::group::SelectionPlanMode::ColdUrlTest
@@ -3599,11 +3615,11 @@ fn resolve_udp_outbound_plan_tracks_v4_fallback_and_final_resolution_guards() {
         ["v4-only"]
     );
 
-    let empty = resolve_udp_outbound_plan(&config, &manager, "empty", IpVersion::V4);
+    let empty = resolve_udp_score_plan(&config, &manager, "empty", IpVersion::V4);
     assert!(empty.nodes.is_empty());
     assert_eq!(empty.mode, crate::group::SelectionPlanMode::Authoritative);
 
-    let missing = resolve_udp_outbound_plan(&config, &manager, "missing-final", IpVersion::V4);
+    let missing = resolve_udp_score_plan(&config, &manager, "missing-final", IpVersion::V4);
     assert_eq!(
         missing
             .nodes
@@ -3613,7 +3629,7 @@ fn resolve_udp_outbound_plan_tracks_v4_fallback_and_final_resolution_guards() {
         ["direct"]
     );
 
-    let cycle = resolve_udp_outbound_plan(&config, &manager, "cycle-a", IpVersion::V4);
+    let cycle = resolve_udp_score_plan(&config, &manager, "cycle-a", IpVersion::V4);
     assert!(
         cycle.nodes.is_empty(),
         "final cycles fail closed instead of bypassing policy"
@@ -3621,7 +3637,7 @@ fn resolve_udp_outbound_plan_tracks_v4_fallback_and_final_resolution_guards() {
 }
 
 #[test]
-fn resolve_udp_outbound_plan_explicit_node_falls_back_to_v4_through_final() {
+fn resolve_udp_score_plan_explicit_node_falls_back_to_v4_through_final() {
     let node = Node {
         id: uuid::Uuid::new_v4(),
         name: "v4-explicit".into(),
@@ -3642,7 +3658,7 @@ fn resolve_udp_outbound_plan_explicit_node_falls_back_to_v4_through_final() {
     let manager = GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive.clone()));
 
     for outbound in ["v4-explicit", "final-to-explicit"] {
-        let plan = resolve_udp_outbound_plan(&config, &manager, outbound, IpVersion::V6);
+        let plan = resolve_udp_score_plan(&config, &manager, outbound, IpVersion::V6);
         assert_eq!(plan.mode, crate::group::SelectionPlanMode::Authoritative);
         assert_eq!(plan.ipver, IpVersion::V4, "{outbound}");
         assert_eq!(
@@ -3656,7 +3672,7 @@ fn resolve_udp_outbound_plan_explicit_node_falls_back_to_v4_through_final() {
     }
 
     for outbound in ["direct", "block"] {
-        let plan = resolve_udp_outbound_plan(&config, &manager, outbound, IpVersion::V6);
+        let plan = resolve_udp_score_plan(&config, &manager, outbound, IpVersion::V6);
         assert_eq!(plan.ipver, IpVersion::V6, "{outbound}");
         assert_eq!(
             plan.nodes
@@ -3672,7 +3688,7 @@ fn resolve_udp_outbound_plan_explicit_node_falls_back_to_v4_through_final() {
     }
     for outbound in ["v4-explicit", "final-to-explicit"] {
         assert!(
-            resolve_udp_outbound_plan(&config, &manager, outbound, IpVersion::V6)
+            resolve_udp_score_plan(&config, &manager, outbound, IpVersion::V6)
                 .nodes
                 .is_empty(),
             "{outbound} must stay empty when neither family is selectable"
@@ -3681,7 +3697,7 @@ fn resolve_udp_outbound_plan_explicit_node_falls_back_to_v4_through_final() {
 }
 
 #[test]
-fn resolve_udp_outbound_plan_excludes_unselectable_explicit_node() {
+fn resolve_udp_score_plan_excludes_unselectable_explicit_node() {
     let node = udp_test_node();
     let config = udp_test_config("udp-test", vec![node], vec![]);
     let alive = Arc::new(AliveDialerSet::new());
@@ -3690,7 +3706,7 @@ fn resolve_udp_outbound_plan_excludes_unselectable_explicit_node() {
     }
     let manager = GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive));
 
-    let plan = resolve_udp_outbound_plan(&config, &manager, "udp-test", IpVersion::V4);
+    let plan = resolve_udp_score_plan(&config, &manager, "udp-test", IpVersion::V4);
 
     assert!(plan.nodes.is_empty());
 }

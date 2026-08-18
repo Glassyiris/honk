@@ -46,23 +46,14 @@ impl DoqClient {
     pub async fn exchange(
         self: &Arc<Self>,
         raw_query: &[u8],
-        #[cfg(feature = "honk-policy")] feedback: Option<&honk_outbound::group::HonkFeedback>,
+        feedback: Option<&honk_outbound::group::ScoreFeedback>,
     ) -> anyhow::Result<Vec<u8>> {
-        #[cfg(feature = "honk-policy")]
-        return exchange_with_retry(
+        exchange_with_retry(
             "DoQ",
             raw_query,
             |reporter| async move { self.exchange_once(raw_query, reporter.as_ref()).await },
             || async { self.close_connection().await },
             feedback,
-        )
-        .await;
-        #[cfg(not(feature = "honk-policy"))]
-        exchange_with_retry(
-            "DoQ",
-            raw_query,
-            || self.exchange_once(raw_query),
-            || async { self.close_connection().await },
         )
         .await
     }
@@ -70,10 +61,9 @@ impl DoqClient {
     async fn exchange_once(
         &self,
         raw_query: &[u8],
-        #[cfg(feature = "honk-policy")] reporter: Option<&honk_outbound::group::HonkReporter>,
+        reporter: Option<&honk_outbound::group::ScoreReporter>,
     ) -> anyhow::Result<Vec<u8>> {
         let conn = self.get_conn().await?;
-        #[cfg(feature = "honk-policy")]
         if let Some(reporter) = reporter {
             reporter.setup_succeeded();
         }
@@ -88,13 +78,11 @@ impl DoqClient {
             write_length_prefixed(&mut send, &wire).await?;
             send.finish()
                 .map_err(|e| anyhow::anyhow!("DoQ finish send: {e}"))?;
-            #[cfg(feature = "honk-policy")]
             if let Some(reporter) = reporter {
                 reporter.tx(raw_query.len() as u64);
             }
 
             let mut resp = read_length_prefixed(&mut recv, self.query_timeout).await?;
-            #[cfg(feature = "honk-policy")]
             if let Some(reporter) = reporter
                 && super::is_valid_response(raw_query, &resp)
             {

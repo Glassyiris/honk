@@ -6,7 +6,6 @@ pub(in crate::control) struct SelectorWarmResources {
     pub(in crate::control) generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
     pub(in crate::control) proxy_registry: Arc<ProxyRegistry>,
     pub(in crate::control) connection_pool: Arc<ConnectionPool>,
-    #[cfg(feature = "honk-policy")]
     pub(in crate::control) group_manager: crate::group::SharedGroupManager,
     pub(in crate::control) stats: Arc<StatsManager>,
     pub(in crate::control) selected_ids:
@@ -152,7 +151,6 @@ pub(in crate::control) async fn warm_selector_candidate(
         generation,
         proxy_registry,
         connection_pool,
-        #[cfg(feature = "honk-policy")]
         group_manager,
         stats,
         bare_warm,
@@ -177,12 +175,11 @@ pub(in crate::control) async fn warm_selector_candidate(
     }
 
     if descriptor.has_generation_runtime(&node) {
-        #[cfg(feature = "honk-policy")]
         let reporter = group_manager
             .read()
             .feedback_for_node(
                 node.id,
-                crate::group::HonkSelectionContext::aggregate(
+                crate::group::ScoreSelectionContext::aggregate(
                     crate::group::SelectionNetwork::Tcp,
                     ProbeDomain::Tcp,
                     IpVersion::V4,
@@ -194,10 +191,9 @@ pub(in crate::control) async fn warm_selector_candidate(
             .await
         {
             Ok(honk_outbound::proxy::WarmOutcome::Ready) => {
-                #[cfg(feature = "honk-policy")]
                 if let Some(reporter) = &reporter {
                     reporter.setup_succeeded();
-                    reporter.finish(crate::group::HonkOutcome::Success);
+                    reporter.finish(crate::group::ScoreOutcome::Success);
                 }
                 if let Some(addr) = bare_warm.lock().remove(&node.id) {
                     connection_pool.purge_bare(&addr);
@@ -207,20 +203,18 @@ pub(in crate::control) async fn warm_selector_candidate(
             }
             Ok(honk_outbound::proxy::WarmOutcome::NotApplicable) => {}
             Err(error) if generation.is_shutdown() => {
-                #[cfg(feature = "honk-policy")]
                 if let Some(reporter) = &reporter {
-                    reporter.finish(crate::group::HonkOutcome::Shutdown);
+                    reporter.finish(crate::group::ScoreOutcome::Shutdown);
                 }
                 debug!(node = %node.name, %error, "Selector warm generation ended");
                 return;
             }
             Err(error) => {
-                #[cfg(feature = "honk-policy")]
                 if let Some(reporter) = &reporter {
                     reporter.setup_failed(if error.is::<tokio::time::error::Elapsed>() {
-                        crate::group::HonkOutcome::Timeout
+                        crate::group::ScoreOutcome::Timeout
                     } else {
-                        crate::group::HonkOutcome::from_error(&error)
+                        crate::group::ScoreOutcome::from_error(&error)
                     });
                 }
                 debug!(node = %node.name, %error, "Selector warm session failed");
@@ -233,12 +227,11 @@ pub(in crate::control) async fn warm_selector_candidate(
         return;
     };
     if !connection_pool.has_live_bare_entry(&addr) {
-        #[cfg(feature = "honk-policy")]
         let reporter = group_manager
             .read()
             .feedback_for_node(
                 node.id,
-                crate::group::HonkSelectionContext::aggregate(
+                crate::group::ScoreSelectionContext::aggregate(
                     crate::group::SelectionNetwork::Tcp,
                     ProbeDomain::Tcp,
                     IpVersion::V4,
@@ -247,43 +240,38 @@ pub(in crate::control) async fn warm_selector_candidate(
             .map(|feedback| feedback.start());
         let stream = match honk_outbound::util::connect_outbound(&addr, connect_timeout).await {
             Ok(_) if generation.is_shutdown() => {
-                #[cfg(feature = "honk-policy")]
                 if let Some(reporter) = &reporter {
-                    reporter.finish(crate::group::HonkOutcome::Shutdown);
+                    reporter.finish(crate::group::ScoreOutcome::Shutdown);
                 }
                 return;
             }
             Ok(stream) if is_tcp_stream_alive(&stream) => stream,
             Ok(_) => {
-                #[cfg(feature = "honk-policy")]
                 if let Some(reporter) = &reporter {
-                    reporter.setup_failed(crate::group::HonkOutcome::Io(
+                    reporter.setup_failed(crate::group::ScoreOutcome::Io(
                         io::ErrorKind::ConnectionAborted,
                     ));
                 }
                 return;
             }
             Err(error) => {
-                #[cfg(feature = "honk-policy")]
                 if let Some(reporter) = &reporter {
                     reporter.setup_failed(if error.kind() == io::ErrorKind::TimedOut {
-                        crate::group::HonkOutcome::Timeout
+                        crate::group::ScoreOutcome::Timeout
                     } else {
-                        crate::group::HonkOutcome::Io(error.kind())
+                        crate::group::ScoreOutcome::Io(error.kind())
                     });
                 }
                 debug!(node = %node.name, %error, "Selector warm bare TCP failed");
                 return;
             }
         };
-        #[cfg(feature = "honk-policy")]
         if let Some(reporter) = &reporter {
             reporter.setup_succeeded();
         }
         connection_pool.deposit_tcp(&addr, stream).await;
-        #[cfg(feature = "honk-policy")]
         if let Some(reporter) = &reporter {
-            reporter.finish(crate::group::HonkOutcome::Success);
+            reporter.finish(crate::group::ScoreOutcome::Success);
         }
     }
     if connection_pool.has_live_bare_entry(&addr) {
@@ -528,16 +516,13 @@ impl ControlPlane {
             Duration::from_millis(config.global.connect_timeout_ms)
         };
         let proxy_registry = self.proxy_registry.clone();
-        #[cfg(feature = "honk-policy")]
         let group_manager = self.group_manager.clone();
         let dispatch = Arc::new(
             move |generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
                   node_id: uuid::Uuid| {
                 let proxy_registry = proxy_registry.clone();
-                #[cfg(feature = "honk-policy")]
                 let group_manager = group_manager.clone();
                 async move {
-                    #[cfg(feature = "honk-policy")]
                     let reporter = generation
                         .get(&node_id)
                         .filter(|runtime| {
@@ -548,7 +533,7 @@ impl ControlPlane {
                         .and_then(|_| {
                             group_manager.read().feedback_for_node(
                                 node_id,
-                                crate::group::HonkSelectionContext::aggregate(
+                                crate::group::ScoreSelectionContext::aggregate(
                                     crate::group::SelectionNetwork::Udp,
                                     ProbeDomain::DataUdp,
                                     IpVersion::V4,
@@ -559,27 +544,26 @@ impl ControlPlane {
                     let result = proxy_registry
                         .warm_udp(generation.clone(), node_id, connect_timeout)
                         .await;
-                    #[cfg(feature = "honk-policy")]
                     match &result {
                         Ok(honk_outbound::proxy::WarmOutcome::Ready) => {
                             if let Some(reporter) = &reporter {
                                 reporter.setup_succeeded();
-                                reporter.finish(crate::group::HonkOutcome::Success);
+                                reporter.finish(crate::group::ScoreOutcome::Success);
                             }
                         }
                         Ok(honk_outbound::proxy::WarmOutcome::NotApplicable) => {}
                         Err(_) if generation.is_shutdown() => {
                             if let Some(reporter) = &reporter {
-                                reporter.finish(crate::group::HonkOutcome::Shutdown);
+                                reporter.finish(crate::group::ScoreOutcome::Shutdown);
                             }
                         }
                         Err(error) => {
                             if let Some(reporter) = &reporter {
                                 reporter.setup_failed(
                                     if error.is::<tokio::time::error::Elapsed>() {
-                                        crate::group::HonkOutcome::Timeout
+                                        crate::group::ScoreOutcome::Timeout
                                     } else {
-                                        crate::group::HonkOutcome::from_error(error)
+                                        crate::group::ScoreOutcome::from_error(error)
                                     },
                                 );
                             }
@@ -626,7 +610,6 @@ impl ControlPlane {
                 generation,
                 proxy_registry: self.proxy_registry.clone(),
                 connection_pool: self.connection_pool.clone(),
-                #[cfg(feature = "honk-policy")]
                 group_manager: self.group_manager.clone(),
                 stats: self.stats.clone(),
                 selected_ids: self.selector_warm_ids.clone(),

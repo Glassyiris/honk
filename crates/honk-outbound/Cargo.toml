@@ -1,4 +1,3 @@
-
 [package]
 name = "honk-outbound"
 version.workspace = true
@@ -67,7 +66,6 @@ webpki-roots.workspace = true
 # the descriptor facts stay unconditional, the registry simply has no
 # handler to dispatch for those protocols without the feature.
 rprx = []
-honk-policy = ["honk-config/honk-policy"]
 
 [[bench]]
 name = "ss_aead"

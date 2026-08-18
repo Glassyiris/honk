@@ -22,7 +22,6 @@ pub(in crate::control) use connectivity::{
     urltest_group_registrations,
 };
 
-#[cfg(any(not(feature = "honk-policy"), feature = "clash-api"))]
 pub(crate) fn resolve_outbound_nodes(
     config: &Config,
     group_manager: &GroupManager,
@@ -87,18 +86,16 @@ pub(crate) fn resolve_outbound_nodes(
     vec![Config::builtin_direct_node()]
 }
 
-#[cfg(feature = "honk-policy")]
 #[derive(Debug, Clone)]
-pub(super) struct ResolvedHonkPlan {
+pub(super) struct ResolvedScorePlan {
     pub(super) mode: honk_outbound::group::SelectionPlanMode,
     pub(super) nodes: Vec<Node>,
     pub(super) health_family: IpVersion,
-    pub(super) feedback: Vec<Option<honk_outbound::group::HonkFeedback>>,
+    pub(super) feedback: Vec<Option<honk_outbound::group::ScoreFeedback>>,
     pub(super) selection_chains: Vec<Vec<String>>,
 }
 
-#[cfg(feature = "honk-policy")]
-fn own_honk_plan(plan: honk_outbound::group::HonkSelectionPlan<'_>) -> ResolvedHonkPlan {
+fn own_score_plan(plan: honk_outbound::group::ScoreSelectionPlan<'_>) -> ResolvedScorePlan {
     let mut nodes = Vec::with_capacity(plan.entries.len());
     let mut feedback = Vec::with_capacity(plan.entries.len());
     let mut selection_chains = Vec::with_capacity(plan.entries.len());
@@ -107,7 +104,7 @@ fn own_honk_plan(plan: honk_outbound::group::HonkSelectionPlan<'_>) -> ResolvedH
         feedback.push(entry.feedback);
         selection_chains.push(entry.selection_chain);
     }
-    ResolvedHonkPlan {
+    ResolvedScorePlan {
         mode: plan.mode,
         nodes,
         health_family: plan.health_family,
@@ -116,22 +113,20 @@ fn own_honk_plan(plan: honk_outbound::group::HonkSelectionPlan<'_>) -> ResolvedH
     }
 }
 
-#[cfg(feature = "honk-policy")]
 pub(super) fn resolve_urltest_retry_plan_for_target(
     group_manager: &GroupManager,
     outbound_name: &str,
-    context: &honk_outbound::group::HonkSelectionContext,
-) -> ResolvedHonkPlan {
-    own_honk_plan(group_manager.urltest_retry_plan_for_target(outbound_name, context))
+    context: &honk_outbound::group::ScoreSelectionContext,
+) -> ResolvedScorePlan {
+    own_score_plan(group_manager.urltest_retry_plan_for_target(outbound_name, context))
 }
 
-#[cfg(feature = "honk-policy")]
 pub(super) fn resolve_outbound_plan_for_target(
     config: &Config,
     group_manager: &GroupManager,
     outbound_name: &str,
-    context: &honk_outbound::group::HonkSelectionContext,
-) -> ResolvedHonkPlan {
+    context: &honk_outbound::group::ScoreSelectionContext,
+) -> ResolvedScorePlan {
     resolve_outbound_plan_for_target_inner(
         config,
         group_manager,
@@ -142,17 +137,16 @@ pub(super) fn resolve_outbound_plan_for_target(
     )
 }
 
-#[cfg(feature = "honk-policy")]
 fn resolve_outbound_plan_for_target_inner(
     config: &Config,
     group_manager: &GroupManager,
     outbound_name: &str,
-    context: &honk_outbound::group::HonkSelectionContext,
+    context: &honk_outbound::group::ScoreSelectionContext,
     depth: usize,
     visited: &mut Vec<String>,
-) -> ResolvedHonkPlan {
+) -> ResolvedScorePlan {
     if let Some(node) = config.builtin_node(outbound_name) {
-        return ResolvedHonkPlan {
+        return ResolvedScorePlan {
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
             nodes: vec![node],
             health_family: context.health_family,
@@ -178,7 +172,7 @@ fn resolve_outbound_plan_for_target_inner(
         } else {
             None
         };
-        return ResolvedHonkPlan {
+        return ResolvedScorePlan {
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
             nodes: health_family.map(|_| node.clone()).into_iter().collect(),
             health_family: health_family.unwrap_or(context.health_family),
@@ -194,7 +188,7 @@ fn resolve_outbound_plan_for_target_inner(
         .iter()
         .find(|group| group.name == outbound_name)
     else {
-        return ResolvedHonkPlan {
+        return ResolvedScorePlan {
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
             nodes: vec![Config::builtin_direct_node()],
             health_family: context.health_family,
@@ -205,7 +199,7 @@ fn resolve_outbound_plan_for_target_inner(
     if depth >= honk_outbound::group::MAX_GROUP_DEPTH
         || visited.iter().any(|name| name == outbound_name)
     {
-        return ResolvedHonkPlan {
+        return ResolvedScorePlan {
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
             nodes: Vec::new(),
             health_family: context.health_family,
@@ -215,10 +209,10 @@ fn resolve_outbound_plan_for_target_inner(
     }
     let plan = group_manager.selection_plan_for_target_with_health_fallback(outbound_name, context);
     if !plan.entries.is_empty() {
-        return own_honk_plan(plan);
+        return own_score_plan(plan);
     }
     let Some(final_name) = group.final_outbound.as_deref() else {
-        return ResolvedHonkPlan {
+        return ResolvedScorePlan {
             mode: plan.mode,
             nodes: Vec::new(),
             health_family: plan.health_family,
@@ -252,50 +246,22 @@ fn resolve_outbound_plan_for_target_inner(
     terminal
 }
 
-/// Concrete UDP candidates plus the provenance and IP family selected by
-/// the final outbound resolution. This companion does not change the legacy
-/// TCP/DNS `resolve_outbound_nodes` API.
+/// Concrete UDP candidates plus target-aware Score feedback, attribution,
+/// and the health family selected by final outbound resolution.
 #[derive(Debug, Clone)]
 pub(super) struct ResolvedUdpPlan {
     pub(super) mode: honk_outbound::group::SelectionPlanMode,
     pub(super) nodes: Vec<Node>,
     pub(super) ipver: IpVersion,
-    #[cfg(feature = "honk-policy")]
-    pub(super) feedback: Vec<Option<honk_outbound::group::HonkFeedback>>,
-    #[cfg(feature = "honk-policy")]
+    pub(super) feedback: Vec<Option<honk_outbound::group::ScoreFeedback>>,
     pub(super) selection_chains: Vec<Vec<String>>,
 }
 
-/// Resolve UDP candidates without inferring policy from candidate count.
-///
-/// A group plan supplies the authoritative/cold provenance directly. Empty
-/// groups may follow `final_outbound`, in which case the terminal outbound's
-/// mode and resolved IP version replace the outer plan. Recursive final
-/// chains are bounded and cycle-safe; a missing final target retains the
-/// historical direct fallback, while a cycle/depth breach fails closed.
-#[cfg(any(test, not(feature = "honk-policy")))]
-pub(super) fn resolve_udp_outbound_plan(
-    config: &Config,
-    group_manager: &GroupManager,
-    outbound_name: &str,
-    ipver: IpVersion,
-) -> ResolvedUdpPlan {
-    resolve_udp_outbound_plan_inner(
-        config,
-        group_manager,
-        outbound_name,
-        ipver,
-        0,
-        &mut Vec::new(),
-    )
-}
-
-#[cfg(feature = "honk-policy")]
 pub(super) fn resolve_udp_outbound_plan_for_target(
     config: &Config,
     group_manager: &GroupManager,
     outbound_name: &str,
-    context: &honk_outbound::group::HonkSelectionContext,
+    context: &honk_outbound::group::ScoreSelectionContext,
 ) -> ResolvedUdpPlan {
     let plan = resolve_outbound_plan_for_target(config, group_manager, outbound_name, context);
     ResolvedUdpPlan {
@@ -304,154 +270,5 @@ pub(super) fn resolve_udp_outbound_plan_for_target(
         ipver: plan.health_family,
         feedback: plan.feedback,
         selection_chains: plan.selection_chains,
-    }
-}
-
-#[cfg(any(test, not(feature = "honk-policy")))]
-fn resolve_udp_outbound_plan_inner(
-    config: &Config,
-    group_manager: &GroupManager,
-    outbound_name: &str,
-    ipver: IpVersion,
-    depth: usize,
-    visited: &mut Vec<String>,
-) -> ResolvedUdpPlan {
-    if let Some(node) = config.builtin_node(outbound_name) {
-        return ResolvedUdpPlan {
-            mode: honk_outbound::group::SelectionPlanMode::Authoritative,
-            nodes: vec![node],
-            ipver,
-            #[cfg(feature = "honk-policy")]
-            feedback: Vec::new(),
-            #[cfg(feature = "honk-policy")]
-            selection_chains: Vec::new(),
-        };
-    }
-    if let Some(node) = config.nodes.iter().find(|node| node.name == outbound_name) {
-        let mut selected_ipver = ipver;
-        let nodes = if group_manager.is_node_selectable_for_domain(
-            node.id,
-            ProbeDomain::DataUdp,
-            selected_ipver,
-        ) {
-            vec![node.clone()]
-        } else if ipver == IpVersion::V6
-            && group_manager.is_node_selectable_for_domain(
-                node.id,
-                ProbeDomain::DataUdp,
-                IpVersion::V4,
-            )
-        {
-            selected_ipver = IpVersion::V4;
-            vec![node.clone()]
-        } else {
-            vec![]
-        };
-        return ResolvedUdpPlan {
-            mode: honk_outbound::group::SelectionPlanMode::Authoritative,
-            nodes,
-            ipver: selected_ipver,
-            #[cfg(feature = "honk-policy")]
-            feedback: Vec::new(),
-            #[cfg(feature = "honk-policy")]
-            selection_chains: Vec::new(),
-        };
-    }
-    let Some(group) = config
-        .groups
-        .iter()
-        .find(|group| group.name == outbound_name)
-    else {
-        warn!(
-            "UDP outbound '{}' not found, falling back to direct",
-            outbound_name
-        );
-        return ResolvedUdpPlan {
-            mode: honk_outbound::group::SelectionPlanMode::Authoritative,
-            nodes: vec![Config::builtin_direct_node()],
-            ipver,
-            #[cfg(feature = "honk-policy")]
-            feedback: Vec::new(),
-            #[cfg(feature = "honk-policy")]
-            selection_chains: Vec::new(),
-        };
-    };
-    if depth >= honk_outbound::group::MAX_GROUP_DEPTH
-        || visited.iter().any(|name| name == outbound_name)
-    {
-        warn!(
-            "UDP final outbound resolution for '{}' stopped at recursive cycle/depth",
-            outbound_name
-        );
-        return ResolvedUdpPlan {
-            mode: honk_outbound::group::SelectionPlanMode::Authoritative,
-            nodes: vec![],
-            ipver,
-            #[cfg(feature = "honk-policy")]
-            feedback: Vec::new(),
-            #[cfg(feature = "honk-policy")]
-            selection_chains: Vec::new(),
-        };
-    }
-
-    visited.push(outbound_name.to_owned());
-    let mut selected_ipver = ipver;
-    let mut plan =
-        group_manager.selection_plan_for_domain(&group.name, ProbeDomain::DataUdp, selected_ipver);
-    // Proxy servers frequently have only an A record. Preserve that concrete
-    // fallback family for traffic health feedback rather than reporting the
-    // original IPv6 destination family.
-    if plan.nodes.is_empty() && ipver == IpVersion::V6 {
-        plan = group_manager.selection_plan_for_domain(
-            &group.name,
-            ProbeDomain::DataUdp,
-            IpVersion::V4,
-        );
-        if !plan.nodes.is_empty() {
-            selected_ipver = IpVersion::V4;
-            warn!(
-                "UDP group '{}' has no IPv6 alive node; falling back to IPv4 alive candidates",
-                group.name
-            );
-        }
-    }
-    if !plan.nodes.is_empty() {
-        visited.pop();
-        return ResolvedUdpPlan {
-            mode: plan.mode,
-            nodes: plan.nodes.into_iter().cloned().collect(),
-            ipver: selected_ipver,
-            #[cfg(feature = "honk-policy")]
-            feedback: Vec::new(),
-            #[cfg(feature = "honk-policy")]
-            selection_chains: Vec::new(),
-        };
-    }
-
-    if let Some(final_name) = group_manager.get_final_outbound(&group.name) {
-        info!(
-            "UDP group '{}' has no available node; falling back to final outbound '{}'",
-            group.name, final_name
-        );
-        let terminal = resolve_udp_outbound_plan_inner(
-            config,
-            group_manager,
-            &final_name,
-            ipver,
-            depth + 1,
-            visited,
-        );
-        visited.pop();
-        return terminal;
-    }
-    visited.pop();
-    ResolvedUdpPlan {
-        mode: plan.mode,
-        nodes: vec![],
-        ipver: selected_ipver,
-        #[cfg(feature = "honk-policy")]
-        feedback: Vec::new(),
-        #[cfg(feature = "honk-policy")]
-        selection_chains: Vec::new(),
     }
 }

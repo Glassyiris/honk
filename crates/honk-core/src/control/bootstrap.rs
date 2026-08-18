@@ -112,10 +112,9 @@ impl ControlPlane {
         // they currently select, and the tag keeps the result. The cell
         // keeps working across reloads (the manager inside is swapped).
         let group_manager = group_manager.into_shared();
-        #[cfg(feature = "honk-policy")]
         {
             let group_manager = group_manager.clone();
-            alive_set.set_honk_feedback_factory(move |node_id, context| {
+            alive_set.set_score_feedback_factory(move |node_id, context| {
                 group_manager.read().feedback_for_node(node_id, context)
             });
         }

@@ -232,7 +232,6 @@ impl ControlPlane {
                         self.proxy_registry.clone(),
                         self.runtime_registry.clone(),
                         check_method.clone(),
-                        #[cfg(feature = "honk-policy")]
                         self.group_manager.clone(),
                     ));
                     alive_set
@@ -260,12 +259,11 @@ impl ControlPlane {
                     let c = self.config.read().await;
                     c.global.udp_check_dns.clone()
                 };
-                #[cfg(feature = "honk-policy")]
                 let quic_url = {
                     let c = self.config.read().await;
                     if c.groups
                         .iter()
-                        .any(|group| group.policy == honk_config::node::GroupPolicy::Honk)
+                        .any(|group| group.policy == honk_config::node::GroupPolicy::Score)
                     {
                         c.global.tcp_check_url.first().cloned().unwrap_or_default()
                     } else {
@@ -287,7 +285,6 @@ impl ControlPlane {
                     })
                 };
                 let dns_target = resolve_udp_check_target(&dns_raw, Some(resolver.clone())).await;
-                #[cfg(feature = "honk-policy")]
                 let quic_score_target = if quic_url.is_empty() {
                     None
                 } else {
@@ -299,11 +296,8 @@ impl ControlPlane {
                     self.runtime_registry.clone(),
                     self.stats.clone(),
                     dns_target,
-                    #[cfg(feature = "honk-policy")]
                     udp_probe_identity(&dns_raw, dns_target),
-                    #[cfg(feature = "honk-policy")]
                     quic_score_target,
-                    #[cfg(feature = "honk-policy")]
                     self.group_manager.clone(),
                 )));
                 info!("UDP health check enabled (dns={})", dns_target);

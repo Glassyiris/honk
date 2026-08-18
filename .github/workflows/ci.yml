@@ -28,7 +28,6 @@ jobs:
           sudo apt-get install -y cmake libclang-dev
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all --all-targets -- -D warnings
-      - run: cargo clippy -p honk-config -p honk-outbound -p honk-core -p honk-tool --features honk-policy --all-targets -- -D warnings
 
   test:
     name: cargo test (workspace)
@@ -53,11 +52,6 @@ jobs:
       # Full suite minus the known pre-existing config_dae_routing failure.
       - run: |
           cargo test --workspace --no-fail-fast -- \
-            --skip test_routing_with_config_dae
-      - name: Test optional honk-policy feature
-        run: |
-          cargo test -p honk-config -p honk-outbound -p honk-core \
-            --features honk-policy --tests -- \
             --skip test_routing_with_config_dae
 
   ebpf:

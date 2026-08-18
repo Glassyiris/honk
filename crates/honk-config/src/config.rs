@@ -493,7 +493,7 @@ impl Config {
                 // These errors identify recognized dae syntax; structured
                 // fallbacks would hide their actionable cause.
                 Err(err @ crate::ConfigError::Include(_))
-                | Err(err @ crate::ConfigError::UnsupportedFeature(_)) => Err(err),
+                | Err(err @ crate::ConfigError::UnsupportedPolicy(_)) => Err(err),
                 Err(_) => parse_toml(&content)
                     .or_else(|_| parse_yaml(&content))
                     .or_else(|_| Self::from_json_str(&content)),
@@ -727,14 +727,13 @@ mod builtin_nodes_tests {
         assert!(config.dns.routing.response.rules.is_empty());
     }
 
-    #[cfg(not(feature = "honk-policy"))]
     #[test]
-    fn test_from_file_preserves_disabled_honk_policy_error() {
+    fn test_from_file_preserves_renamed_honk_policy_error() {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), "group {\n proxy {\n policy: honk\n }\n}").unwrap();
         let error = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
-        assert!(matches!(error, crate::ConfigError::UnsupportedFeature(_)));
-        assert!(error.to_string().contains("honk-policy"));
+        assert!(matches!(error, crate::ConfigError::UnsupportedPolicy(_)));
+        assert!(error.to_string().contains("renamed to 'score'"));
     }
 
     #[test]

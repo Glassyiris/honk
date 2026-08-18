@@ -62,18 +62,11 @@ impl ControlPlane {
             }
         };
         let old_group_manager = self.group_manager.read().clone();
-        #[cfg(feature = "honk-policy")]
-        let new_group_manager = Arc::new(GroupManager::with_alive_set_and_honk_state(
+        let new_group_manager = Arc::new(GroupManager::with_alive_set_and_score_state(
             &new_config.groups,
             &new_config.nodes,
             Some(Arc::clone(&self.alive_set)),
-            old_group_manager.honk_state(),
-        ));
-        #[cfg(not(feature = "honk-policy"))]
-        let new_group_manager = Arc::new(GroupManager::with_alive_set(
-            &new_config.groups,
-            &new_config.nodes,
-            Some(Arc::clone(&self.alive_set)),
+            old_group_manager.score_state(),
         ));
         new_group_manager.migrate_selector_choices_from(&old_group_manager);
         // Build the outbound generation before DNS so every new runtime
@@ -320,8 +313,7 @@ impl ControlPlane {
                 *router_guard = new_router;
                 *config_guard = new_config;
                 *group_guard = Arc::clone(&new_group_manager);
-                #[cfg(feature = "honk-policy")]
-                new_group_manager.publish_honk_membership();
+                new_group_manager.publish_score_membership();
                 *outbound_guard = new_outbound_id_map;
                 *plan_guard = Arc::clone(&new_plan);
                 // The projection worker takes eBPF before its generation fence;

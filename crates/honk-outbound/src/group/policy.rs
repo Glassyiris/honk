@@ -72,12 +72,11 @@ impl GroupManager {
         }
         candidates[0].clone()
     }
-    #[cfg(feature = "honk-policy")]
-    pub(super) fn pick_honk<'a>(
+    pub(super) fn pick_score<'a>(
         &self,
         candidates: &[Candidate<'a>],
         group: &Group,
-        context: &HonkSelectionContext,
+        context: &ScoreSelectionContext,
     ) -> Candidate<'a> {
         let mut unique = Vec::with_capacity(candidates.len());
         for candidate in candidates {
@@ -89,7 +88,7 @@ impl GroupManager {
             }
         }
         let nodes: Vec<_> = unique.iter().map(|candidate| candidate.node).collect();
-        unique[self.honk_state.rank(&group.name, context, &nodes)].clone()
+        unique[self.score_state.rank(&group.name, context, &nodes)].clone()
     }
 
     /// URLTest policy: lowest-latency alive candidate with tolerance-based

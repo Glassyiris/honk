@@ -12,9 +12,8 @@
 //! `alive` is unaffected by these ad-hoc measurements.
 
 use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
-#[cfg(feature = "honk-policy")]
 use crate::group::{
-    GroupManager, HonkFeedback, HonkOutcome, HonkReporter, HonkSelectionContext, HonkTarget,
+    GroupManager, ScoreFeedback, ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreTarget,
     SelectionNetwork,
 };
 use crate::proxy::{ProxyRegistry, TcpOutbound};
@@ -24,86 +23,56 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-#[cfg(feature = "honk-policy")]
-type MaybeHonkReporter = Option<HonkReporter>;
-#[cfg(not(feature = "honk-policy"))]
-type MaybeHonkReporter = Option<()>;
 #[cfg(test)]
-fn no_feedback() -> MaybeHonkReporter {
+fn no_feedback() -> Option<ScoreReporter> {
     None
 }
 
-#[cfg(feature = "honk-policy")]
-fn start_feedback(feedback: Option<HonkFeedback>) -> MaybeHonkReporter {
+fn start_feedback(feedback: Option<ScoreFeedback>) -> Option<ScoreReporter> {
     feedback.map(|feedback| feedback.start())
 }
-#[cfg(not(feature = "honk-policy"))]
-fn start_feedback(_: ()) -> MaybeHonkReporter {
-    None
-}
 
-#[cfg(feature = "honk-policy")]
-fn reporter_setup(reporter: &MaybeHonkReporter) {
+fn reporter_setup(reporter: &Option<ScoreReporter>) {
     if let Some(reporter) = reporter {
         reporter.setup_succeeded();
     }
 }
-#[cfg(not(feature = "honk-policy"))]
-fn reporter_setup(_: &MaybeHonkReporter) {}
 
-#[cfg(feature = "honk-policy")]
-fn reporter_first_response(reporter: &MaybeHonkReporter) {
+fn reporter_first_response(reporter: &Option<ScoreReporter>) {
     if let Some(reporter) = reporter {
         reporter.first_response();
     }
 }
-#[cfg(not(feature = "honk-policy"))]
-fn reporter_first_response(_: &MaybeHonkReporter) {}
 
-#[cfg(feature = "honk-policy")]
-fn reporter_tx(reporter: &MaybeHonkReporter, bytes: usize) {
+fn reporter_tx(reporter: &Option<ScoreReporter>, bytes: usize) {
     if let Some(reporter) = reporter {
         reporter.tx(bytes as u64);
     }
 }
-#[cfg(not(feature = "honk-policy"))]
-fn reporter_tx(_: &MaybeHonkReporter, _: usize) {}
 
-#[cfg(feature = "honk-policy")]
-fn reporter_rx(reporter: &MaybeHonkReporter, bytes: usize) {
+fn reporter_rx(reporter: &Option<ScoreReporter>, bytes: usize) {
     if let Some(reporter) = reporter {
         reporter.rx(bytes as u64);
     }
 }
-#[cfg(not(feature = "honk-policy"))]
-fn reporter_rx(_: &MaybeHonkReporter, _: usize) {}
 
-#[cfg(feature = "honk-policy")]
-fn reporter_error(reporter: &MaybeHonkReporter, error: &anyhow::Error) {
+fn reporter_error(reporter: &Option<ScoreReporter>, error: &anyhow::Error) {
     if let Some(reporter) = reporter {
-        reporter.finish(HonkOutcome::from_error(error));
+        reporter.finish(ScoreOutcome::from_error(error));
     }
 }
-#[cfg(not(feature = "honk-policy"))]
-fn reporter_error(_: &MaybeHonkReporter, _: &anyhow::Error) {}
 
-#[cfg(feature = "honk-policy")]
-fn reporter_timeout(reporter: &MaybeHonkReporter) {
+fn reporter_timeout(reporter: &Option<ScoreReporter>) {
     if let Some(reporter) = reporter {
-        reporter.finish(HonkOutcome::Timeout);
+        reporter.finish(ScoreOutcome::Timeout);
     }
 }
-#[cfg(not(feature = "honk-policy"))]
-fn reporter_timeout(_: &MaybeHonkReporter) {}
 
-#[cfg(feature = "honk-policy")]
-fn reporter_success(reporter: &MaybeHonkReporter) {
+fn reporter_success(reporter: &Option<ScoreReporter>) {
     if let Some(reporter) = reporter {
-        reporter.finish(HonkOutcome::Success);
+        reporter.finish(ScoreOutcome::Success);
     }
 }
-#[cfg(not(feature = "honk-policy"))]
-fn reporter_success(_: &MaybeHonkReporter) {}
 
 /// Default liveness URL (sing-box / clash convention).
 pub const DEFAULT_URLTEST_URL: &str = "https://www.gstatic.com/generate_204";
@@ -140,15 +109,7 @@ pub async fn urltest_node(
     url: &str,
     timeout: Duration,
 ) -> anyhow::Result<Duration> {
-    urltest_node_impl(
-        runtime,
-        handler,
-        url,
-        timeout,
-        #[cfg(feature = "honk-policy")]
-        None,
-    )
-    .await
+    urltest_node_impl(runtime, handler, url, timeout, None).await
 }
 
 async fn urltest_node_impl(
@@ -156,7 +117,7 @@ async fn urltest_node_impl(
     handler: &dyn TcpOutbound,
     url: &str,
     timeout: Duration,
-    #[cfg(feature = "honk-policy")] group_manager: Option<&GroupManager>,
+    group_manager: Option<&GroupManager>,
 ) -> anyhow::Result<Duration> {
     let node = runtime.node.as_ref();
     let url = normalize_url(url);
@@ -184,7 +145,6 @@ async fn urltest_node_impl(
                     .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?,
             }
         };
-        #[cfg(feature = "honk-policy")]
         let feedback = group_manager.and_then(|manager| {
             let family = if addr.is_ipv6() {
                 IpVersion::V6
@@ -193,10 +153,10 @@ async fn urltest_node_impl(
             };
             let target = host
                 .parse::<std::net::IpAddr>()
-                .map_or_else(|_| HonkTarget::domain(&host, port), |_| addr.into());
+                .map_or_else(|_| ScoreTarget::domain(&host, port), |_| addr.into());
             manager.feedback_for_node(
                 node.id,
-                HonkSelectionContext {
+                ScoreSelectionContext {
                     network: SelectionNetwork::Tcp,
                     probe_domain: ProbeDomain::Tcp,
                     target_family: Some(family),
@@ -205,8 +165,6 @@ async fn urltest_node_impl(
                 },
             )
         });
-        #[cfg(not(feature = "honk-policy"))]
-        let feedback = ();
         return measure_head_exchange(
             runtime,
             handler,
@@ -235,7 +193,6 @@ async fn urltest_node_impl(
                 .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?,
         }
     };
-    #[cfg(feature = "honk-policy")]
     let feedback = group_manager.and_then(|manager| {
         let family = if addr.is_ipv6() {
             IpVersion::V6
@@ -244,10 +201,10 @@ async fn urltest_node_impl(
         };
         let target = host
             .parse::<std::net::IpAddr>()
-            .map_or_else(|_| HonkTarget::domain(&host, port), |_| addr.into());
+            .map_or_else(|_| ScoreTarget::domain(&host, port), |_| addr.into());
         manager.feedback_for_node(
             node.id,
-            HonkSelectionContext {
+            ScoreSelectionContext {
                 network: SelectionNetwork::Tcp,
                 probe_domain: ProbeDomain::Tcp,
                 target_family: Some(family),
@@ -256,8 +213,6 @@ async fn urltest_node_impl(
             },
         )
     });
-    #[cfg(not(feature = "honk-policy"))]
-    let feedback = ();
     measure_head_exchange(
         runtime,
         handler,
@@ -293,28 +248,6 @@ pub fn probe_runtime(
 
 /// Reuse an already-warm generation runtime. Cold reusable transports warm a
 /// throwaway runtime before measurement so a group scan retains no new state.
-pub async fn urltest_node_in_generation(
-    generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
-    node: &Node,
-    handler: &dyn TcpOutbound,
-    warmable: Option<&dyn crate::proxy::WarmableOutbound>,
-    url: &str,
-    timeout: Duration,
-) -> anyhow::Result<Duration> {
-    urltest_node_in_generation_impl(
-        generation,
-        node,
-        handler,
-        warmable,
-        url,
-        timeout,
-        #[cfg(feature = "honk-policy")]
-        None,
-    )
-    .await
-}
-
-#[cfg(feature = "honk-policy")]
 pub async fn urltest_node_in_generation_with_feedback(
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
     node: &Node,
@@ -343,7 +276,7 @@ async fn urltest_node_in_generation_impl(
     warmable: Option<&dyn crate::proxy::WarmableOutbound>,
     url: &str,
     timeout: Duration,
-    #[cfg(feature = "honk-policy")] group_manager: Option<&GroupManager>,
+    group_manager: Option<&GroupManager>,
 ) -> anyhow::Result<Duration> {
     let timeout = if timeout.is_zero() {
         DEFAULT_URLTEST_TIMEOUT
@@ -353,19 +286,16 @@ async fn urltest_node_in_generation_impl(
     let (runtime, guard) = probe_runtime(generation, node);
     let result = async {
         if !runtime.is_warm_or_stateless() {
-            #[cfg(feature = "honk-policy")]
             let warm_reporter = start_feedback(group_manager.and_then(|manager| {
                 manager.feedback_for_node(
                     node.id,
-                    HonkSelectionContext::aggregate(
+                    ScoreSelectionContext::aggregate(
                         SelectionNetwork::Tcp,
                         ProbeDomain::Tcp,
                         IpVersion::V4,
                     ),
                 )
             }));
-            #[cfg(not(feature = "honk-policy"))]
-            let warm_reporter = start_feedback(());
             let warmed = match warmable {
                 Some(warmable) => {
                     warmable
@@ -389,15 +319,7 @@ async fn urltest_node_in_generation_impl(
                 }
             }
         }
-        urltest_node_impl(
-            &runtime,
-            handler,
-            url,
-            timeout,
-            #[cfg(feature = "honk-policy")]
-            group_manager,
-        )
-        .await
+        urltest_node_impl(&runtime, handler, url, timeout, group_manager).await
     }
     .await;
     if let Some(guard) = guard {
@@ -417,20 +339,7 @@ pub async fn urltest_node_addr(
 ) -> anyhow::Result<Duration> {
     let url = normalize_url(url);
     let (host, _, is_https) = parse_url_host_port(url)?;
-    measure_head_exchange(
-        runtime,
-        handler,
-        &host,
-        None,
-        is_https,
-        addr,
-        timeout,
-        #[cfg(feature = "honk-policy")]
-        None,
-        #[cfg(not(feature = "honk-policy"))]
-        (),
-    )
-    .await
+    measure_head_exchange(runtime, handler, &host, None, is_https, addr, timeout, None).await
 }
 
 /// Dial `addr` through the node and time the full exchange up to the first
@@ -444,8 +353,7 @@ async fn measure_head_exchange(
     is_https: bool,
     addr: SocketAddr,
     timeout: Duration,
-    #[cfg(feature = "honk-policy")] feedback: Option<HonkFeedback>,
-    #[cfg(not(feature = "honk-policy"))] feedback: (),
+    feedback: Option<ScoreFeedback>,
 ) -> anyhow::Result<Duration> {
     let node = runtime.node.as_ref();
     let reporter = start_feedback(feedback);
@@ -524,7 +432,7 @@ fn https_connector() -> anyhow::Result<crate::tls::TlsConnector> {
 async fn exchange_head_h2<S>(
     stream: S,
     host: &str,
-    reporter: &MaybeHonkReporter,
+    reporter: &Option<ScoreReporter>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -562,7 +470,7 @@ where
 async fn exchange_head<S>(
     stream: &mut S,
     host: &str,
-    reporter: &MaybeHonkReporter,
+    reporter: &Option<ScoreReporter>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -598,28 +506,6 @@ where
 /// consecutive failure adds a synthetic penalty and demotes the node.
 ///
 /// Returns one `(node_name, result)` entry per member, in member order.
-pub async fn urltest_group(
-    members: &[Node],
-    generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
-    registry: &Arc<ProxyRegistry>,
-    alive_set: &Arc<AliveDialerSet>,
-    url: &str,
-    timeout: Duration,
-) -> Vec<(String, anyhow::Result<Duration>)> {
-    urltest_group_impl(
-        members,
-        generation,
-        registry,
-        alive_set,
-        url,
-        timeout,
-        #[cfg(feature = "honk-policy")]
-        None,
-    )
-    .await
-}
-
-#[cfg(feature = "honk-policy")]
 pub async fn urltest_group_with_feedback(
     members: &[Node],
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
@@ -648,7 +534,7 @@ async fn urltest_group_impl(
     alive_set: &Arc<AliveDialerSet>,
     url: &str,
     timeout: Duration,
-    #[cfg(feature = "honk-policy")] group_manager: Option<Arc<GroupManager>>,
+    group_manager: Option<Arc<GroupManager>>,
 ) -> Vec<(String, anyhow::Result<Duration>)> {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(URLTEST_MAX_CONCURRENT));
     let url = normalize_url(url).to_string();
@@ -660,7 +546,6 @@ async fn urltest_group_impl(
         let alive_set = alive_set.clone();
         let url = url.clone();
         let permit = semaphore.clone();
-        #[cfg(feature = "honk-policy")]
         let group_manager = group_manager.clone();
         join_set.spawn(async move {
             let _permit = permit.acquire_owned().await;
@@ -673,7 +558,6 @@ async fn urltest_group_impl(
                         entry.warmable.as_deref(),
                         &url,
                         timeout,
-                        #[cfg(feature = "honk-policy")]
                         group_manager.as_deref(),
                     )
                     .await
@@ -965,13 +849,14 @@ mod tests {
             ephemeral: Arc::clone(&ephemeral),
         };
 
-        urltest_node_in_generation(
+        urltest_node_in_generation_impl(
             &generation,
             &node,
             &MockHandler,
             Some(&warmable),
             &format!("http://{addr}/"),
             Duration::from_secs(1),
+            None,
         )
         .await
         .unwrap();
@@ -1024,7 +909,7 @@ mod tests {
                 crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
                     .unwrap(),
             );
-            let elapsed = urltest_node_in_generation(
+            let elapsed = urltest_node_in_generation_impl(
                 &generation,
                 &node,
                 &MockHandler,
@@ -1033,6 +918,7 @@ mod tests {
                 }),
                 &format!("http://{addr}/"),
                 Duration::from_secs(1),
+                None,
             )
             .await
             .unwrap();
@@ -1056,7 +942,7 @@ mod tests {
             ephemeral: Arc::clone(&ephemeral),
         };
 
-        let error = urltest_node_in_generation(
+        let error = urltest_node_in_generation_impl(
             &generation,
             &node,
             &DelayedDialHandler {
@@ -1065,6 +951,7 @@ mod tests {
             Some(&warmable),
             "http://localhost/",
             Duration::from_millis(50),
+            None,
         )
         .await
         .unwrap_err();
@@ -1383,13 +1270,14 @@ mod tests {
         }
 
         let runtime = Arc::new(crate::runtime::OutboundRuntimeRegistry::build(&members).unwrap());
-        let results = urltest_group(
+        let results = urltest_group_impl(
             &members,
             &runtime,
             &registry,
             &alive_set,
             &url,
             Duration::from_secs(5),
+            None,
         )
         .await;
         assert_eq!(results.len(), 2);
@@ -1404,13 +1292,14 @@ mod tests {
             assert!(!alive_set.is_failure_demoted(m.id, ProbeDomain::Tcp, IpVersion::V4));
         }
 
-        let results = urltest_group(
+        let results = urltest_group_impl(
             &members,
             &runtime,
             &registry,
             &alive_set,
             &url,
             Duration::from_secs(5),
+            None,
         )
         .await;
         assert!(results.iter().all(|(_, r)| r.is_err()));

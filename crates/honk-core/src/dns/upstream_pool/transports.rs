@@ -3,8 +3,7 @@ use std::sync::atomic::Ordering;
 
 use honk_config::node::Node;
 use honk_config::types::DnsProtocol;
-#[cfg(feature = "honk-policy")]
-use honk_outbound::group::HonkFeedback;
+use honk_outbound::group::ScoreFeedback;
 
 use super::UpstreamPool;
 use super::entries::UpstreamEntry;
@@ -40,54 +39,14 @@ impl PooledTransport {
     pub(super) async fn exchange(
         &self,
         raw_query: &[u8],
-        #[cfg(feature = "honk-policy")] feedback: Option<&HonkFeedback>,
+        feedback: Option<&ScoreFeedback>,
     ) -> anyhow::Result<Vec<u8>> {
         match self {
-            Self::Tcp(transport) => {
-                transport
-                    .exchange(
-                        raw_query,
-                        #[cfg(feature = "honk-policy")]
-                        feedback,
-                    )
-                    .await
-            }
-            Self::Dot(transport) => {
-                transport
-                    .exchange(
-                        raw_query,
-                        #[cfg(feature = "honk-policy")]
-                        feedback,
-                    )
-                    .await
-            }
-            Self::Doh(transport) => {
-                transport
-                    .exchange(
-                        raw_query,
-                        #[cfg(feature = "honk-policy")]
-                        feedback,
-                    )
-                    .await
-            }
-            Self::Doq(transport) => {
-                transport
-                    .exchange(
-                        raw_query,
-                        #[cfg(feature = "honk-policy")]
-                        feedback,
-                    )
-                    .await
-            }
-            Self::Doh3(transport) => {
-                transport
-                    .exchange(
-                        raw_query,
-                        #[cfg(feature = "honk-policy")]
-                        feedback,
-                    )
-                    .await
-            }
+            Self::Tcp(transport) => transport.exchange(raw_query, feedback).await,
+            Self::Dot(transport) => transport.exchange(raw_query, feedback).await,
+            Self::Doh(transport) => transport.exchange(raw_query, feedback).await,
+            Self::Doq(transport) => transport.exchange(raw_query, feedback).await,
+            Self::Doh3(transport) => transport.exchange(raw_query, feedback).await,
         }
     }
 }

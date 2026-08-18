@@ -14,22 +14,26 @@ use uuid::Uuid;
 const EXACT_CAPACITY: usize = 4096;
 const AGGREGATE_CAPACITY: usize = 4096;
 const RELIABILITY_CLOSE: f64 = 0.05;
+const SCORE_EVIDENCE_HALF_LIFE: Duration = Duration::from_secs(30 * 60);
+const MIN_TRAINED_EVIDENCE: f64 = 0.5;
+const MIN_THROUGHPUT_DURATION: Duration = Duration::from_secs(1);
+const MIN_THROUGHPUT_BYTES: u64 = 64 * 1024;
 
 /// A normalized business target used only as an in-memory score key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum HonkTarget {
+pub enum ScoreTarget {
     Domain { host: String, port: u16 },
     Socket(SocketAddr),
 }
 
-impl HonkTarget {
+impl ScoreTarget {
     pub fn domain(host: &str, port: u16) -> Self {
         let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
         Self::Domain { host, port }
     }
 }
 
-impl From<SocketAddr> for HonkTarget {
+impl From<SocketAddr> for ScoreTarget {
     fn from(value: SocketAddr) -> Self {
         Self::Socket(value)
     }
@@ -38,15 +42,15 @@ impl From<SocketAddr> for HonkTarget {
 /// Business-target scoring dimensions plus the independent proxy-health
 /// dimensions used to form the alive candidate set.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HonkSelectionContext {
+pub struct ScoreSelectionContext {
     pub network: SelectionNetwork,
     pub probe_domain: ProbeDomain,
     pub target_family: Option<IpVersion>,
     pub health_family: IpVersion,
-    pub target: Option<HonkTarget>,
+    pub target: Option<ScoreTarget>,
 }
 
-impl HonkSelectionContext {
+impl ScoreSelectionContext {
     /// Context for traffic without a trustworthy business target (warm-up
     /// and preconnect). Feedback updates aggregate state only.
     pub fn aggregate(
@@ -65,14 +69,14 @@ impl HonkSelectionContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HonkAttribution {
+pub struct ScoreAttribution {
     pub group: String,
     pub node_id: Uuid,
 }
 
 /// Compact terminal result; formatted error strings never enter score state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HonkOutcome {
+pub enum ScoreOutcome {
     Success,
     Timeout,
     Io(io::ErrorKind),
@@ -81,7 +85,7 @@ pub enum HonkOutcome {
     Other,
 }
 
-impl HonkOutcome {
+impl ScoreOutcome {
     pub fn from_error(error: &anyhow::Error) -> Self {
         error
             .chain()
@@ -101,7 +105,7 @@ struct ExactKey {
     group: String,
     network: SelectionNetwork,
     family: IpVersion,
-    target: HonkTarget,
+    target: ScoreTarget,
     node_id: Uuid,
 }
 
@@ -114,34 +118,58 @@ struct AggregateKey {
 }
 
 #[derive(Debug, Clone, Default)]
+struct WeightedMean {
+    sum: f64,
+    weight: f64,
+}
+
+impl WeightedMean {
+    fn decay(&mut self, factor: f64) {
+        self.sum *= factor;
+        self.weight *= factor;
+    }
+
+    fn record(&mut self, sample: f64) {
+        self.sum += sample;
+        self.weight += 1.0;
+    }
+
+    fn mean(&self) -> Option<f64> {
+        (self.weight > 0.0).then(|| self.sum / self.weight)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 struct Stats {
     incarnation: u64,
-    started: u64,
-    setup_success: u64,
-    setup_failure: u64,
-    useful_success: u64,
-    useful_failure: u64,
-    setup_ms: Option<f64>,
-    first_response_ms: Option<f64>,
-    throughput: Option<f64>,
+    attempts: f64,
+    setup_success: f64,
+    setup_failure: f64,
+    useful_success: f64,
+    useful_failure: f64,
+    setup_ms: WeightedMean,
+    first_response_ms: WeightedMean,
+    throughput_bytes: f64,
+    throughput_seconds: f64,
+    throughput_windows: f64,
     last_used: u64,
+    updated_at: Option<Instant>,
 }
 
 impl Stats {
-    fn completed(&self) -> u64 {
-        self.setup_success.saturating_add(self.setup_failure)
+    fn completed(&self) -> f64 {
+        self.setup_success + self.setup_failure
     }
-    fn useful_completed(&self) -> u64 {
-        self.useful_success.saturating_add(self.useful_failure)
+
+    fn useful_completed(&self) -> f64 {
+        self.useful_success + self.useful_failure
     }
 
     fn reliability(&self) -> f64 {
         // Setup failure is already a useful failure. Counting two additional
         // failures makes it the strongest negative signal without a knob.
-        let successes = self.useful_success as f64;
-        let failures = self
-            .useful_failure
-            .saturating_add(self.setup_failure.saturating_mul(2)) as f64;
+        let successes = self.useful_success;
+        let failures = self.useful_failure + self.setup_failure * 2.0;
         let a = successes + 1.0;
         let b = failures + 1.0;
         let sum = a + b;
@@ -150,60 +178,91 @@ impl Stats {
         (mean - 1.64 * deviation).clamp(0.0, 1.0)
     }
 
-    fn record_start(&mut self, tick: u64) {
-        self.started = self.started.saturating_add(1);
+    fn decay_to(&mut self, now: Instant) {
+        let Some(updated_at) = self.updated_at.replace(now) else {
+            return;
+        };
+        let factor = evidence_decay(now.saturating_duration_since(updated_at));
+        self.attempts *= factor;
+        self.setup_success *= factor;
+        self.setup_failure *= factor;
+        self.useful_success *= factor;
+        self.useful_failure *= factor;
+        self.setup_ms.decay(factor);
+        self.first_response_ms.decay(factor);
+        self.throughput_bytes *= factor;
+        self.throughput_seconds *= factor;
+        self.throughput_windows *= factor;
+    }
+
+    fn record_start(&mut self, now: Instant, tick: u64) {
+        self.decay_to(now);
+        self.attempts += 1.0;
         self.last_used = tick;
     }
 
-    fn record_finish(&mut self, sample: &FlowSample, count_usefulness: bool, tick: u64) {
+    fn record_finish(
+        &mut self,
+        now: Instant,
+        sample: &FlowSample,
+        count_usefulness: bool,
+        tick: u64,
+    ) {
+        self.decay_to(now);
         if matches!(
             sample.outcome,
-            HonkOutcome::Cancelled | HonkOutcome::Shutdown
+            ScoreOutcome::Cancelled | ScoreOutcome::Shutdown
         ) {
-            self.started = self.started.saturating_sub(1);
+            self.attempts = (self.attempts - evidence_decay(sample.elapsed)).max(0.0);
             self.last_used = tick;
             return;
         }
         if let Some(setup) = sample.setup {
-            self.setup_success = self.setup_success.saturating_add(1);
-            update_ewma(&mut self.setup_ms, setup.as_secs_f64() * 1000.0);
+            self.setup_success += 1.0;
+            self.setup_ms.record(setup.as_secs_f64() * 1000.0);
         } else {
-            self.setup_failure = self.setup_failure.saturating_add(1);
+            self.setup_failure += 1.0;
         }
         if let Some(first_response) = sample.first_response {
-            update_ewma(
-                &mut self.first_response_ms,
-                first_response.as_secs_f64() * 1000.0,
-            );
+            self.first_response_ms
+                .record(first_response.as_secs_f64() * 1000.0);
         }
         if count_usefulness {
-            let useful = sample.outcome == HonkOutcome::Success && sample.tx > 0 && sample.rx > 0;
+            let useful = sample.outcome == ScoreOutcome::Success && sample.tx > 0 && sample.rx > 0;
             if useful {
-                self.useful_success = self.useful_success.saturating_add(1);
-                let seconds = sample.elapsed.as_secs_f64().max(0.001);
-                let rate = sample.tx.saturating_add(sample.rx) as f64 / seconds;
-                update_ewma(&mut self.throughput, (1.0 + rate).log2().clamp(0.0, 30.0));
+                self.useful_success += 1.0;
+                if sample.elapsed >= MIN_THROUGHPUT_DURATION
+                    && sample.tx.max(sample.rx) >= MIN_THROUGHPUT_BYTES
+                {
+                    self.throughput_bytes += sample.tx.max(sample.rx) as f64;
+                    self.throughput_seconds += sample.elapsed.as_secs_f64();
+                    self.throughput_windows += 1.0;
+                }
             } else {
-                self.useful_failure = self.useful_failure.saturating_add(1);
+                self.useful_failure += 1.0;
             }
         }
         self.last_used = tick;
     }
 }
 
-fn record_cell_start<K>(cache: &mut LruCache<K, Stats>, key: K, tick: u64) -> u64
+fn evidence_decay(elapsed: Duration) -> f64 {
+    2.0_f64.powf(-elapsed.as_secs_f64() / SCORE_EVIDENCE_HALF_LIFE.as_secs_f64())
+}
+
+fn record_cell_start<K>(cache: &mut LruCache<K, Stats>, key: K, now: Instant, tick: u64) -> u64
 where
     K: std::hash::Hash + Eq,
 {
     if let Some(stats) = cache.get_mut(&key) {
-        stats.record_start(tick);
+        stats.record_start(now, tick);
         return stats.incarnation;
     }
     let mut stats = Stats {
         incarnation: tick,
         ..Default::default()
     };
-    stats.record_start(tick);
+    stats.record_start(now, tick);
     cache.put(key, stats);
     tick
 }
@@ -212,6 +271,7 @@ fn record_cell_finish<K>(
     cache: &mut LruCache<K, Stats>,
     key: &K,
     incarnation: Option<u64>,
+    now: Instant,
     sample: &FlowSample,
     count_usefulness: bool,
     tick: u64,
@@ -223,8 +283,8 @@ fn record_cell_finish<K>(
     };
     let remove_empty = match cache.get_mut(key) {
         Some(stats) if stats.incarnation == incarnation => {
-            stats.record_finish(sample, count_usefulness, tick);
-            stats.started == 0 && stats.completed() == 0
+            stats.record_finish(now, sample, count_usefulness, tick);
+            stats.attempts == 0.0 && stats.completed() == 0.0
         }
         _ => false,
     };
@@ -237,10 +297,6 @@ fn record_cell_finish<K>(
 struct StartedCells {
     aggregate: [Option<u64>; 2],
     exact: Option<u64>,
-}
-
-fn update_ewma(value: &mut Option<f64>, sample: f64) {
-    *value = Some(value.map_or(sample, |old| (old + sample) * 0.5));
 }
 
 struct StateInner {
@@ -265,12 +321,12 @@ impl Default for StateInner {
 
 /// Process-memory-only score state shared by old and replacement managers.
 #[derive(Default)]
-pub struct HonkPolicyState {
+pub struct ScorePolicyState {
     inner: Mutex<StateInner>,
 }
 
-impl HonkPolicyState {
-    /// Atomically publish committed Honk group/leaf membership and prune
+impl ScorePolicyState {
+    /// Atomically publish committed Score group/leaf membership and prune
     /// removed cells. Construction with a reused state never calls this.
     pub fn publish_membership<I>(&self, membership: I)
     where
@@ -298,10 +354,20 @@ impl HonkPolicyState {
         }
     }
 
+    #[cfg(test)]
     fn start(
         &self,
-        context: &HonkSelectionContext,
-        attributions: &[HonkAttribution],
+        context: &ScoreSelectionContext,
+        attributions: &[ScoreAttribution],
+    ) -> Vec<StartedCells> {
+        self.start_at(context, attributions, Instant::now())
+    }
+
+    fn start_at(
+        &self,
+        context: &ScoreSelectionContext,
+        attributions: &[ScoreAttribution],
+        now: Instant,
     ) -> Vec<StartedCells> {
         let mut inner = self.inner.lock();
         inner.tick = inner.tick.saturating_add(1);
@@ -313,7 +379,8 @@ impl HonkPolicyState {
                 .valid
                 .contains(&(attribution.group.clone(), attribution.node_id))
             {
-                started.aggregate = record_aggregate_start(&mut inner, attribution, context, tick);
+                started.aggregate =
+                    record_aggregate_start(&mut inner, attribution, context, now, tick);
                 if let (Some(family), Some(target)) =
                     (context.target_family, context.target.as_ref())
                 {
@@ -324,7 +391,7 @@ impl HonkPolicyState {
                         target: target.clone(),
                         node_id: attribution.node_id,
                     };
-                    started.exact = Some(record_cell_start(&mut inner.exact, key, tick));
+                    started.exact = Some(record_cell_start(&mut inner.exact, key, now, tick));
                 }
             }
             cells.push(started);
@@ -334,10 +401,21 @@ impl HonkPolicyState {
 
     fn finish(
         &self,
-        context: &HonkSelectionContext,
-        attributions: &[HonkAttribution],
+        context: &ScoreSelectionContext,
+        attributions: &[ScoreAttribution],
         cells: &[StartedCells],
         sample: &FlowSample,
+    ) {
+        self.finish_at(context, attributions, cells, sample, Instant::now());
+    }
+
+    fn finish_at(
+        &self,
+        context: &ScoreSelectionContext,
+        attributions: &[ScoreAttribution],
+        cells: &[StartedCells],
+        sample: &FlowSample,
+        now: Instant,
     ) {
         let mut inner = self.inner.lock();
         inner.tick = inner.tick.saturating_add(1);
@@ -355,8 +433,8 @@ impl HonkPolicyState {
                 attribution,
                 context,
                 started.aggregate,
+                now,
                 sample,
-                sample.count_usefulness && context.target.is_some(),
                 tick,
             );
             if let (Some(family), Some(target)) = (context.target_family, context.target.as_ref()) {
@@ -371,6 +449,7 @@ impl HonkPolicyState {
                     &mut inner.exact,
                     &key,
                     started.exact,
+                    now,
                     sample,
                     sample.count_usefulness,
                     tick,
@@ -382,8 +461,18 @@ impl HonkPolicyState {
     pub(super) fn rank(
         &self,
         group: &str,
-        context: &HonkSelectionContext,
+        context: &ScoreSelectionContext,
         nodes: &[&Node],
+    ) -> usize {
+        self.rank_at(group, context, nodes, Instant::now())
+    }
+
+    fn rank_at(
+        &self,
+        group: &str,
+        context: &ScoreSelectionContext,
+        nodes: &[&Node],
+        now: Instant,
     ) -> usize {
         if nodes.len() < 2 {
             return 0;
@@ -391,28 +480,33 @@ impl HonkPolicyState {
         let inner = self.inner.lock();
         let snapshots: Vec<_> = nodes
             .iter()
-            .map(|node| score_snapshot(&inner, group, context, node.id))
+            .map(|node| score_snapshot(&inner, group, context, node.id, now))
             .collect();
+        if let Some((index, _)) = snapshots
+            .iter()
+            .enumerate()
+            .filter(|(_, score)| score.completed < MIN_TRAINED_EVIDENCE)
+            .min_by(|(left_index, left), (right_index, right)| {
+                left.attempts
+                    .total_cmp(&right.attempts)
+                    .then_with(|| left_index.cmp(right_index))
+                    .then_with(|| nodes[*left_index].id.cmp(&nodes[*right_index].id))
+            })
+        {
+            return index;
+        }
         let best_reliability = snapshots
             .iter()
             .map(|score| score.reliability)
             .fold(0.0_f64, f64::max);
-        if let Some((index, _)) = snapshots
-            .iter()
-            .enumerate()
-            .filter(|(_, score)| score.completed == 0)
-            .min_by_key(|(index, score)| (score.started, *index, nodes[*index].id))
-        {
-            return index;
-        }
-        let total_started = snapshots.iter().map(|score| score.started).sum::<u64>() as f64;
+        let total_attempts = snapshots.iter().map(|score| score.attempts).sum();
         snapshots
             .iter()
             .enumerate()
             .filter(|(_, score)| best_reliability - score.reliability <= RELIABILITY_CLOSE)
             .max_by(|(left_index, left), (right_index, right)| {
-                utility(left, total_started)
-                    .total_cmp(&utility(right, total_started))
+                utility(left, total_attempts)
+                    .total_cmp(&utility(right, total_attempts))
                     .then_with(|| right_index.cmp(left_index))
                     .then_with(|| nodes[*right_index].id.cmp(&nodes[*left_index].id))
             })
@@ -429,7 +523,7 @@ impl HonkPolicyState {
     pub(super) fn has_exact(
         &self,
         group: &str,
-        context: &HonkSelectionContext,
+        context: &ScoreSelectionContext,
         node_id: Uuid,
     ) -> bool {
         let (Some(family), Some(target)) = (context.target_family, context.target.as_ref()) else {
@@ -447,7 +541,7 @@ impl HonkPolicyState {
     fn exact_stats(
         &self,
         group: &str,
-        context: &HonkSelectionContext,
+        context: &ScoreSelectionContext,
         node_id: Uuid,
     ) -> Option<(u64, u64, u64)> {
         let (Some(family), Some(target)) = (context.target_family, context.target.as_ref()) else {
@@ -463,14 +557,20 @@ impl HonkPolicyState {
                 target: target.clone(),
                 node_id,
             })
-            .map(|stats| (stats.started, stats.setup_success, stats.setup_failure))
+            .map(|stats| {
+                (
+                    stats.attempts.round() as u64,
+                    stats.setup_success.round() as u64,
+                    stats.setup_failure.round() as u64,
+                )
+            })
     }
 
     #[cfg(test)]
     fn exact_useful_failures(
         &self,
         group: &str,
-        context: &HonkSelectionContext,
+        context: &ScoreSelectionContext,
         node_id: Uuid,
     ) -> Option<u64> {
         let (Some(family), Some(target)) = (context.target_family, context.target.as_ref()) else {
@@ -486,7 +586,7 @@ impl HonkPolicyState {
                 target: target.clone(),
                 node_id,
             })
-            .map(|stats| stats.useful_failure)
+            .map(|stats| stats.useful_failure.round() as u64)
     }
 
     #[cfg(test)]
@@ -505,18 +605,25 @@ impl HonkPolicyState {
                 family: None,
                 node_id,
             })
-            .map(|stats| (stats.started, stats.setup_success, stats.setup_failure))
+            .map(|stats| {
+                (
+                    stats.attempts.round() as u64,
+                    stats.setup_success.round() as u64,
+                    stats.setup_failure.round() as u64,
+                )
+            })
     }
 }
 
-fn aggregate_families(context: &HonkSelectionContext) -> [Option<IpVersion>; 2] {
+fn aggregate_families(context: &ScoreSelectionContext) -> [Option<IpVersion>; 2] {
     [None, context.target_family]
 }
 
 fn record_aggregate_start(
     inner: &mut StateInner,
-    attribution: &HonkAttribution,
-    context: &HonkSelectionContext,
+    attribution: &ScoreAttribution,
+    context: &ScoreSelectionContext,
+    now: Instant,
     tick: u64,
 ) -> [Option<u64>; 2] {
     let mut cells = [None; 2];
@@ -530,18 +637,18 @@ fn record_aggregate_start(
             family,
             node_id: attribution.node_id,
         };
-        cells[index] = Some(record_cell_start(&mut inner.aggregate, key, tick));
+        cells[index] = Some(record_cell_start(&mut inner.aggregate, key, now, tick));
     }
     cells
 }
 
 fn record_aggregate_finish(
     inner: &mut StateInner,
-    attribution: &HonkAttribution,
-    context: &HonkSelectionContext,
+    attribution: &ScoreAttribution,
+    context: &ScoreSelectionContext,
     cells: [Option<u64>; 2],
+    now: Instant,
     sample: &FlowSample,
-    count_usefulness: bool,
     tick: u64,
 ) {
     for (index, family) in aggregate_families(context).into_iter().enumerate() {
@@ -558,8 +665,9 @@ fn record_aggregate_finish(
             &mut inner.aggregate,
             &key,
             cells[index],
+            now,
             sample,
-            count_usefulness,
+            sample.count_usefulness && context.target.is_some(),
             tick,
         );
     }
@@ -567,18 +675,21 @@ fn record_aggregate_finish(
 
 #[derive(Clone, Copy)]
 struct ScoreSnapshot {
-    started: u64,
-    completed: u64,
+    attempts: f64,
+    completed: f64,
     reliability: f64,
     latency_ms: Option<f64>,
+    latency_confidence: f64,
     throughput: Option<f64>,
+    throughput_confidence: f64,
 }
 
 fn score_snapshot(
     inner: &StateInner,
     group: &str,
-    context: &HonkSelectionContext,
+    context: &ScoreSelectionContext,
     node_id: Uuid,
+    now: Instant,
 ) -> ScoreSnapshot {
     let family_aggregate = context.target_family.and_then(|family| {
         inner
@@ -589,7 +700,7 @@ fn score_snapshot(
                 family: Some(family),
                 node_id,
             })
-            .cloned()
+            .map(|stats| decayed(stats, now))
     });
     let global_aggregate = inner
         .aggregate
@@ -599,18 +710,15 @@ fn score_snapshot(
             family: None,
             node_id,
         })
-        .cloned()
-        .unwrap_or_default();
+        .map_or_else(Stats::default, |stats| decayed(stats, now));
     let global_score = snapshot(&global_aggregate);
     let aggregate_score = family_aggregate.map_or(global_score, |family| {
         let family_score = snapshot(&family);
-        let reliability_weight = (family.useful_completed() as f64 / 8.0).clamp(0.0, 1.0);
-        let setup_weight = (family.completed() as f64 / 8.0).clamp(0.0, 1.0);
+        let reliability_weight = (family.useful_completed() / 8.0).clamp(0.0, 1.0);
+        let setup_weight = (family.completed() / 8.0).clamp(0.0, 1.0);
         ScoreSnapshot {
-            started: family.started,
-            completed: global_aggregate
-                .completed()
-                .saturating_add(family.completed()),
+            attempts: family.attempts,
+            completed: global_aggregate.completed() + family.completed(),
             reliability: blend(
                 global_score.reliability,
                 family_score.reliability,
@@ -621,9 +729,19 @@ fn score_snapshot(
                 family_score.latency_ms,
                 setup_weight,
             ),
+            latency_confidence: blend(
+                global_score.latency_confidence,
+                family_score.latency_confidence,
+                setup_weight,
+            ),
             throughput: blend_option(
                 global_score.throughput,
                 family_score.throughput,
+                reliability_weight,
+            ),
+            throughput_confidence: blend(
+                global_score.throughput_confidence,
+                family_score.throughput_confidence,
                 reliability_weight,
             ),
         }
@@ -638,18 +756,18 @@ fn score_snapshot(
                 target: target.clone(),
                 node_id,
             })
-            .cloned(),
+            .map(|stats| decayed(stats, now)),
         _ => None,
     };
     let Some(exact) = exact else {
         return aggregate_score;
     };
-    let reliability_weight = (exact.useful_completed() as f64 / 8.0).clamp(0.0, 1.0);
-    let setup_weight = (exact.completed() as f64 / 8.0).clamp(0.0, 1.0);
+    let reliability_weight = (exact.useful_completed() / 8.0).clamp(0.0, 1.0);
+    let setup_weight = (exact.completed() / 8.0).clamp(0.0, 1.0);
     let exact_score = snapshot(&exact);
     ScoreSnapshot {
-        started: exact.started,
-        completed: aggregate_score.completed.saturating_add(exact.completed()),
+        attempts: exact.attempts,
+        completed: aggregate_score.completed + exact.completed(),
         reliability: blend(
             aggregate_score.reliability,
             exact_score.reliability,
@@ -660,21 +778,49 @@ fn score_snapshot(
             exact_score.latency_ms,
             setup_weight,
         ),
+        latency_confidence: blend(
+            aggregate_score.latency_confidence,
+            exact_score.latency_confidence,
+            setup_weight,
+        ),
         throughput: blend_option(
             aggregate_score.throughput,
             exact_score.throughput,
             reliability_weight,
         ),
+        throughput_confidence: blend(
+            aggregate_score.throughput_confidence,
+            exact_score.throughput_confidence,
+            reliability_weight,
+        ),
     }
 }
 
+fn decayed(stats: &Stats, now: Instant) -> Stats {
+    let mut stats = stats.clone();
+    stats.decay_to(now);
+    stats
+}
+
 fn snapshot(stats: &Stats) -> ScoreSnapshot {
+    let (latency_ms, latency_weight) = stats
+        .first_response_ms
+        .mean()
+        .map(|mean| (Some(mean), stats.first_response_ms.weight))
+        .unwrap_or_else(|| (stats.setup_ms.mean(), stats.setup_ms.weight));
+    let throughput = (stats.throughput_seconds > 0.0).then(|| {
+        (1.0 + stats.throughput_bytes / stats.throughput_seconds)
+            .log2()
+            .clamp(0.0, 30.0)
+    });
     ScoreSnapshot {
-        started: stats.started,
+        attempts: stats.attempts,
         completed: stats.completed(),
         reliability: stats.reliability(),
-        latency_ms: stats.first_response_ms.or(stats.setup_ms),
-        throughput: stats.throughput,
+        latency_ms,
+        latency_confidence: (latency_weight / 8.0).clamp(0.0, 1.0),
+        throughput,
+        throughput_confidence: (stats.throughput_windows / 8.0).clamp(0.0, 1.0),
     }
 }
 
@@ -690,41 +836,41 @@ fn blend_option(base: Option<f64>, exact: Option<f64>, exact_weight: f64) -> Opt
     }
 }
 
-fn utility(score: &ScoreSnapshot, total_started: f64) -> f64 {
-    let exploration = ((total_started + 1.0).ln() / (score.started as f64 + 1.0))
+fn utility(score: &ScoreSnapshot, total_attempts: f64) -> f64 {
+    let exploration = ((total_attempts + 1.0).ln() / (score.attempts + 1.0))
         .sqrt()
         .min(1.0)
         * RELIABILITY_CLOSE;
     let latency_penalty = score
         .latency_ms
-        .map(|latency| (latency.max(1.0).log2() / 20.0).min(0.03))
+        .map(|latency| (latency.max(1.0).log2() / 20.0).min(0.03) * score.latency_confidence)
         .unwrap_or(0.0);
     let throughput_bonus = score
         .throughput
-        .map(|throughput| throughput / 30.0 * 0.02)
+        .map(|throughput| throughput / 30.0 * 0.02 * score.throughput_confidence)
         .unwrap_or(0.0);
     score.reliability + exploration + throughput_bonus - latency_penalty
 }
 
 #[derive(Clone)]
-pub struct HonkFeedback {
-    state: Arc<HonkPolicyState>,
-    context: HonkSelectionContext,
-    attributions: Arc<[HonkAttribution]>,
+pub struct ScoreFeedback {
+    state: Arc<ScorePolicyState>,
+    context: ScoreSelectionContext,
+    attributions: Arc<[ScoreAttribution]>,
 }
 
-impl std::fmt::Debug for HonkFeedback {
+impl std::fmt::Debug for ScoreFeedback {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("HonkFeedback")
+            .debug_struct("ScoreFeedback")
             .finish_non_exhaustive()
     }
 }
-impl HonkFeedback {
+impl ScoreFeedback {
     pub(super) fn new(
-        state: Arc<HonkPolicyState>,
-        context: HonkSelectionContext,
-        attributions: Vec<HonkAttribution>,
+        state: Arc<ScorePolicyState>,
+        context: ScoreSelectionContext,
+        attributions: Vec<ScoreAttribution>,
     ) -> Self {
         Self {
             state,
@@ -733,14 +879,14 @@ impl HonkFeedback {
         }
     }
 
-    pub fn attributions(&self) -> &[HonkAttribution] {
+    pub fn attributions(&self) -> &[ScoreAttribution] {
         &self.attributions
     }
-    pub fn context(&self) -> &HonkSelectionContext {
+    pub fn context(&self) -> &ScoreSelectionContext {
         &self.context
     }
 
-    /// Add an outer Honk group when a terminal `final` outbound supplies the
+    /// Add an outer Score group when a terminal `final` outbound supplies the
     /// leaf. Existing nested attribution order remains outer-to-inner.
     pub fn prepend_attribution(mut self, group: String, node_id: Uuid) -> Self {
         if !self
@@ -749,7 +895,7 @@ impl HonkFeedback {
             .any(|attribution| attribution.group == group)
         {
             let mut attributions = Vec::with_capacity(self.attributions.len() + 1);
-            attributions.push(HonkAttribution { group, node_id });
+            attributions.push(ScoreAttribution { group, node_id });
             attributions.extend(self.attributions.iter().cloned());
             self.attributions = attributions.into();
         }
@@ -757,21 +903,24 @@ impl HonkFeedback {
     }
     /// Reuse the selected group chain for a related attempt with different
     /// transport dimensions, such as a UDP DNS reply retried over TCP.
-    pub fn with_context(mut self, context: HonkSelectionContext) -> Self {
+    pub fn with_context(mut self, context: ScoreSelectionContext) -> Self {
         self.context = context;
         self
     }
 
     /// Call only when the physical dial or logical stream actually starts.
-    pub fn start(&self) -> HonkReporter {
-        let cells = self.state.start(&self.context, &self.attributions);
-        HonkReporter {
+    pub fn start(&self) -> ScoreReporter {
+        let started = Instant::now();
+        let cells = self
+            .state
+            .start_at(&self.context, &self.attributions, started);
+        ScoreReporter {
             shared: Arc::new(ReporterShared {
                 state: Arc::clone(&self.state),
                 context: self.context.clone(),
                 attributions: Arc::clone(&self.attributions),
                 cells: cells.into(),
-                started: Instant::now(),
+                started,
                 finished: AtomicBool::new(false),
                 handles: AtomicUsize::new(1),
                 tx: AtomicU64::new(0),
@@ -789,9 +938,9 @@ struct ReporterProgress {
 }
 
 struct ReporterShared {
-    state: Arc<HonkPolicyState>,
-    context: HonkSelectionContext,
-    attributions: Arc<[HonkAttribution]>,
+    state: Arc<ScorePolicyState>,
+    context: ScoreSelectionContext,
+    attributions: Arc<[ScoreAttribution]>,
     cells: Arc<[StartedCells]>,
     started: Instant,
     finished: AtomicBool,
@@ -803,11 +952,11 @@ struct ReporterShared {
 
 /// Cloneable exact-once flow reporter. The first terminal call wins; dropping
 /// the final unfinished handle reports cancellation.
-pub struct HonkReporter {
+pub struct ScoreReporter {
     shared: Arc<ReporterShared>,
 }
 
-impl Clone for HonkReporter {
+impl Clone for ScoreReporter {
     fn clone(&self) -> Self {
         self.shared.handles.fetch_add(1, Ordering::Relaxed);
         Self {
@@ -816,7 +965,7 @@ impl Clone for HonkReporter {
     }
 }
 
-impl HonkReporter {
+impl ScoreReporter {
     pub fn setup_succeeded(&self) {
         let mut progress = self.shared.progress.lock();
         progress
@@ -824,7 +973,7 @@ impl HonkReporter {
             .get_or_insert_with(|| self.shared.started.elapsed());
     }
 
-    pub fn setup_failed(&self, outcome: HonkOutcome) {
+    pub fn setup_failed(&self, outcome: ScoreOutcome) {
         self.finish(outcome);
     }
 
@@ -844,8 +993,8 @@ impl HonkReporter {
     }
 
     /// Recover the immutable attribution plan for a related physical attempt.
-    pub fn feedback(&self) -> HonkFeedback {
-        HonkFeedback {
+    pub fn feedback(&self) -> ScoreFeedback {
+        ScoreFeedback {
             state: Arc::clone(&self.shared.state),
             context: self.shared.context.clone(),
             attributions: Arc::clone(&self.shared.attributions),
@@ -854,14 +1003,14 @@ impl HonkReporter {
 
     /// Complete a successful preparation that carried no application payload.
     pub fn finish_setup_only(&self) {
-        self.finish_inner(HonkOutcome::Success, false);
+        self.finish_inner(ScoreOutcome::Success, false);
     }
 
-    pub fn finish(&self, outcome: HonkOutcome) {
+    pub fn finish(&self, outcome: ScoreOutcome) {
         self.finish_inner(outcome, true);
     }
 
-    fn finish_inner(&self, outcome: HonkOutcome, count_usefulness: bool) {
+    fn finish_inner(&self, outcome: ScoreOutcome, count_usefulness: bool) {
         if self
             .shared
             .finished
@@ -889,10 +1038,10 @@ impl HonkReporter {
     }
 }
 
-impl Drop for HonkReporter {
+impl Drop for ScoreReporter {
     fn drop(&mut self) {
         if self.shared.handles.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.finish_inner(HonkOutcome::Cancelled, false);
+            self.finish_inner(ScoreOutcome::Cancelled, false);
         }
     }
 }
@@ -904,7 +1053,7 @@ fn saturating_add(value: &AtomicU64, amount: u64) {
 }
 
 struct FlowSample {
-    outcome: HonkOutcome,
+    outcome: ScoreOutcome,
     setup: Option<Duration>,
     first_response: Option<Duration>,
     tx: u64,
@@ -915,14 +1064,14 @@ struct FlowSample {
 
 impl super::GroupManager {
     /// Shared scorer handle for fallible reload construction.
-    pub fn honk_state(&self) -> Arc<HonkPolicyState> {
-        Arc::clone(&self.honk_state)
+    pub fn score_state(&self) -> Arc<ScorePolicyState> {
+        Arc::clone(&self.score_state)
     }
 
     /// Publish committed group/leaf membership and prune only removed pairs.
-    /// Extant non-Honk groups remain valid for reporters started before a
-    /// policy change; new selection creates feedback only for Honk groups.
-    pub fn publish_honk_membership(&self) {
+    /// Extant non-Score groups remain valid for reporters started before a
+    /// policy change; new selection creates feedback only for Score groups.
+    pub fn publish_score_membership(&self) {
         let membership = self.groups.values().flat_map(|group| {
             let mut node_ids: HashSet<_> = self
                 .leaf_nodes_in_group(&group.name)
@@ -935,7 +1084,7 @@ impl super::GroupManager {
                 .into_iter()
                 .map(move |node_id| (group.name.clone(), node_id))
         });
-        self.honk_state.publish_membership(membership);
+        self.score_state.publish_membership(membership);
     }
 
     fn collect_final_outbound_node_ids(
@@ -973,29 +1122,29 @@ impl super::GroupManager {
     }
 
     /// Aggregate scorer feedback for concrete work scheduled by leaf ID.
-    /// Every Honk group that recursively contains the leaf is attributed
+    /// Every Score group that recursively contains the leaf is attributed
     /// once, regardless of how many nested paths reach it.
     pub fn feedback_for_node(
         &self,
         node_id: Uuid,
-        context: HonkSelectionContext,
-    ) -> Option<HonkFeedback> {
+        context: ScoreSelectionContext,
+    ) -> Option<ScoreFeedback> {
         let attributions: Vec<_> = self
             .groups
             .values()
-            .filter(|group| group.policy == honk_config::group::GroupPolicy::Honk)
+            .filter(|group| group.policy == honk_config::group::GroupPolicy::Score)
             .filter(|group| {
                 self.leaf_nodes_in_group(&group.name)
                     .iter()
                     .any(|node| node.id == node_id)
             })
-            .map(|group| HonkAttribution {
+            .map(|group| ScoreAttribution {
                 group: group.name.clone(),
                 node_id,
             })
             .collect();
         (!attributions.is_empty())
-            .then(|| HonkFeedback::new(Arc::clone(&self.honk_state), context, attributions))
+            .then(|| ScoreFeedback::new(Arc::clone(&self.score_state), context, attributions))
     }
 
     /// Feedback for a terminal `final` leaf attributed to one outer Honk
@@ -1004,16 +1153,16 @@ impl super::GroupManager {
         &self,
         group_name: &str,
         node_id: Uuid,
-        context: HonkSelectionContext,
-    ) -> Option<HonkFeedback> {
+        context: ScoreSelectionContext,
+    ) -> Option<ScoreFeedback> {
         self.groups
             .get(group_name)
-            .filter(|group| group.policy == honk_config::group::GroupPolicy::Honk)
+            .filter(|group| group.policy == honk_config::group::GroupPolicy::Score)
             .map(|group| {
-                HonkFeedback::new(
-                    Arc::clone(&self.honk_state),
+                ScoreFeedback::new(
+                    Arc::clone(&self.score_state),
                     context,
-                    vec![HonkAttribution {
+                    vec![ScoreAttribution {
                         group: group.name.clone(),
                         node_id,
                     }],
@@ -1027,8 +1176,8 @@ impl super::GroupManager {
     pub fn selection_plan_for_target_with_health_fallback(
         &self,
         group_name: &str,
-        context: &HonkSelectionContext,
-    ) -> super::HonkSelectionPlan<'_> {
+        context: &ScoreSelectionContext,
+    ) -> super::ScoreSelectionPlan<'_> {
         let plan = self.selection_plan_for_target(group_name, context);
         if !plan.entries.is_empty() || context.health_family != IpVersion::V6 {
             return plan;
@@ -1043,17 +1192,17 @@ impl super::GroupManager {
     pub fn urltest_retry_plan_for_target(
         &self,
         group_name: &str,
-        context: &HonkSelectionContext,
-    ) -> super::HonkSelectionPlan<'_> {
+        context: &ScoreSelectionContext,
+    ) -> super::ScoreSelectionPlan<'_> {
         let Some(group) = self.groups.get(group_name) else {
-            return super::HonkSelectionPlan {
+            return super::ScoreSelectionPlan {
                 mode: super::SelectionPlanMode::Authoritative,
                 health_family: context.health_family,
                 entries: Vec::new(),
             };
         };
         if group.policy != honk_config::group::GroupPolicy::URLTest {
-            return super::HonkSelectionPlan {
+            return super::ScoreSelectionPlan {
                 mode: super::SelectionPlanMode::Authoritative,
                 health_family: context.health_family,
                 entries: Vec::new(),
@@ -1085,16 +1234,16 @@ impl super::GroupManager {
             .filter(|candidate| seen.insert(candidate.node.id))
             .take(3)
             .collect();
-        self.honk_selection_plan(candidates, super::SelectionPlanMode::Authoritative, context)
+        self.score_selection_plan(candidates, super::SelectionPlanMode::Authoritative, context)
     }
 
-    fn honk_selection_plan<'a>(
+    fn score_selection_plan<'a>(
         &'a self,
         candidates: Vec<super::Candidate<'a>>,
         mode: super::SelectionPlanMode,
-        context: &HonkSelectionContext,
-    ) -> super::HonkSelectionPlan<'a> {
-        super::HonkSelectionPlan {
+        context: &ScoreSelectionContext,
+    ) -> super::ScoreSelectionPlan<'a> {
+        super::ScoreSelectionPlan {
             mode,
             health_family: context.health_family,
             entries: candidates
@@ -1103,7 +1252,7 @@ impl super::GroupManager {
                     let attributions: Vec<_> = candidate
                         .attribution
                         .into_iter()
-                        .map(|group| HonkAttribution {
+                        .map(|group| ScoreAttribution {
                             group: group.to_string(),
                             node_id: candidate.node.id,
                         })
@@ -1114,13 +1263,13 @@ impl super::GroupManager {
                         .map(str::to_owned)
                         .collect();
                     let feedback = (!attributions.is_empty()).then(|| {
-                        HonkFeedback::new(
-                            Arc::clone(&self.honk_state),
+                        ScoreFeedback::new(
+                            Arc::clone(&self.score_state),
                             context.clone(),
                             attributions,
                         )
                     });
-                    super::HonkSelectionEntry {
+                    super::ScoreSelectionEntry {
                         node: candidate.node,
                         feedback,
                         selection_chain,
@@ -1135,10 +1284,10 @@ impl super::GroupManager {
     pub fn selection_plan_for_target(
         &self,
         group_name: &str,
-        context: &HonkSelectionContext,
-    ) -> super::HonkSelectionPlan<'_> {
+        context: &ScoreSelectionContext,
+    ) -> super::ScoreSelectionPlan<'_> {
         let Some(group) = self.groups.get(group_name) else {
-            return super::HonkSelectionPlan {
+            return super::ScoreSelectionPlan {
                 mode: super::SelectionPlanMode::Authoritative,
                 health_family: context.health_family,
                 entries: Vec::new(),
@@ -1213,8 +1362,8 @@ impl super::GroupManager {
                     context.network,
                     super::SelectionEffects::Apply,
                 ),
-                honk_config::group::GroupPolicy::Honk => {
-                    self.pick_honk(&candidates, group, context)
+                honk_config::group::GroupPolicy::Score => {
+                    self.pick_score(&candidates, group, context)
                 }
             };
             (super::SelectionPlanMode::Authoritative, vec![candidate])
@@ -1222,20 +1371,20 @@ impl super::GroupManager {
         let candidates = candidates
             .into_iter()
             .map(|mut candidate| {
-                if group.policy == honk_config::group::GroupPolicy::Honk {
+                if group.policy == honk_config::group::GroupPolicy::Score {
                     candidate.attribution.insert(0, group.name.as_str());
                 }
                 candidate.selection_chain.insert(0, group.name.as_str());
                 candidate
             })
             .collect();
-        self.honk_selection_plan(candidates, mode, context)
+        self.score_selection_plan(candidates, mode, context)
     }
 
     fn last_resort_candidate_for_target<'a>(
         &'a self,
         group: &'a honk_config::group::Group,
-        context: &HonkSelectionContext,
+        context: &ScoreSelectionContext,
         visited: &mut Vec<&'a str>,
         depth: usize,
         effects: super::SelectionEffects,
@@ -1270,7 +1419,7 @@ impl super::GroupManager {
     fn pick_candidate_for_target<'a>(
         &'a self,
         group: &'a honk_config::group::Group,
-        context: &HonkSelectionContext,
+        context: &ScoreSelectionContext,
         visited: &mut Vec<&'a str>,
         depth: usize,
         effects: super::SelectionEffects,
@@ -1301,12 +1450,12 @@ impl super::GroupManager {
                 honk_config::group::GroupPolicy::Fallback => {
                     self.pick_fallback(&candidates, group, context.network, effects)
                 }
-                honk_config::group::GroupPolicy::Honk => {
-                    self.pick_honk(&candidates, group, context)
+                honk_config::group::GroupPolicy::Score => {
+                    self.pick_score(&candidates, group, context)
                 }
             })
         }?;
-        if group.policy == honk_config::group::GroupPolicy::Honk {
+        if group.policy == honk_config::group::GroupPolicy::Score {
             candidate.attribution.insert(0, group.name.as_str());
         }
         candidate.selection_chain.insert(0, group.name.as_str());
@@ -1316,7 +1465,7 @@ impl super::GroupManager {
     fn flatten_candidates_for_target<'a>(
         &'a self,
         group: &'a honk_config::group::Group,
-        context: &HonkSelectionContext,
+        context: &ScoreSelectionContext,
         visited: &mut Vec<&'a str>,
         depth: usize,
         effects: super::SelectionEffects,
@@ -1355,13 +1504,13 @@ impl super::GroupManager {
     }
 
     /// Aggregate winner used by display/control surfaces.
-    pub fn get_honk_selection_for_network(
+    pub fn get_score_selection_for_network(
         &self,
         group_name: &str,
         network: SelectionNetwork,
     ) -> Option<String> {
         let group = self.groups.get(group_name)?;
-        let context = HonkSelectionContext::aggregate(
+        let context = ScoreSelectionContext::aggregate(
             network,
             match network {
                 SelectionNetwork::Tcp => ProbeDomain::Tcp,
@@ -1383,8 +1532,11 @@ impl super::GroupManager {
             context.health_family,
             group.check_url.as_deref(),
         );
-        (!candidates.is_empty())
-            .then(|| self.pick_honk(&candidates, group, &context).tag.to_string())
+        (!candidates.is_empty()).then(|| {
+            self.pick_score(&candidates, group, &context)
+                .tag
+                .to_string()
+        })
     }
 }
 #[cfg(test)]
@@ -1392,6 +1544,242 @@ mod tests {
     use super::*;
     use honk_config::group::{Group, GroupPolicy};
 
+    fn assert_close(actual: f64, expected: f64) {
+        assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn latency_samples_use_a_decayed_weighted_mean() {
+        let mut latency = WeightedMean::default();
+        latency.record(10.0);
+        latency.record(20.0);
+        latency.record(30.0);
+
+        assert_close(latency.mean().unwrap(), 20.0);
+        assert_close(latency.weight, 3.0);
+    }
+
+    #[test]
+    fn throughput_ignores_bursts_and_pools_dominant_direction() {
+        let now = Instant::now();
+        let mut stats = Stats::default();
+        let sample = |tx, rx, elapsed| FlowSample {
+            outcome: ScoreOutcome::Success,
+            setup: Some(Duration::from_millis(10)),
+            first_response: None,
+            tx,
+            rx,
+            elapsed,
+            count_usefulness: true,
+        };
+
+        stats.record_finish(
+            now,
+            &sample(10_000_000, 1, Duration::from_millis(999)),
+            true,
+            1,
+        );
+        stats.record_finish(now, &sample(65_535, 1, Duration::from_secs(2)), true, 2);
+        assert_close(stats.throughput_windows, 0.0);
+
+        stats.record_finish(now, &sample(65_536, 1, Duration::from_secs(1)), true, 3);
+        stats.record_finish(now, &sample(1, 131_072, Duration::from_secs(3)), true, 4);
+
+        assert_close(stats.throughput_bytes, 196_608.0);
+        assert_close(stats.throughput_seconds, 4.0);
+        assert_close(stats.throughput_windows, 2.0);
+        let score = snapshot(&stats);
+        assert_close(score.throughput.unwrap(), (1.0_f64 + 49_152.0).log2());
+        assert_close(score.throughput_confidence, 0.25);
+    }
+
+    #[test]
+    fn stale_exact_metrics_yield_back_to_aggregate_evidence() {
+        let now = Instant::now();
+        let context = context("example.com", IpVersion::V4);
+        let node = node("leaf");
+        let mut inner = StateInner::default();
+        inner.aggregate.put(
+            AggregateKey {
+                group: "score".into(),
+                network: SelectionNetwork::Tcp,
+                family: None,
+                node_id: node.id,
+            },
+            Stats {
+                setup_success: 8.0,
+                useful_success: 8.0,
+                first_response_ms: WeightedMean {
+                    sum: 800.0,
+                    weight: 8.0,
+                },
+                updated_at: Some(now),
+                ..Default::default()
+            },
+        );
+        inner.exact.put(
+            ExactKey {
+                group: "score".into(),
+                network: SelectionNetwork::Tcp,
+                family: IpVersion::V4,
+                target: context.target.clone().unwrap(),
+                node_id: node.id,
+            },
+            Stats {
+                setup_success: 8.0,
+                useful_success: 8.0,
+                first_response_ms: WeightedMean {
+                    sum: 8_000.0,
+                    weight: 8.0,
+                },
+                updated_at: Some(now),
+                ..Default::default()
+            },
+        );
+
+        let fresh = score_snapshot(&inner, "score", &context, node.id, now);
+        assert_close(fresh.latency_ms.unwrap(), 1_000.0);
+        assert_close(fresh.latency_confidence, 1.0);
+
+        let aged = score_snapshot(
+            &inner,
+            "score",
+            &context,
+            node.id,
+            now + Duration::from_secs(SCORE_EVIDENCE_HALF_LIFE.as_secs() * 3),
+        );
+        assert_close(aged.latency_ms.unwrap(), 212.5);
+        assert_close(aged.latency_confidence, 0.125);
+    }
+
+    #[test]
+    fn evidence_half_life_decays_every_historical_field() {
+        let start = Instant::now();
+        let mut stats = Stats {
+            incarnation: 7,
+            attempts: 8.0,
+            setup_success: 6.0,
+            setup_failure: 2.0,
+            useful_success: 4.0,
+            useful_failure: 2.0,
+            setup_ms: WeightedMean {
+                sum: 800.0,
+                weight: 8.0,
+            },
+            first_response_ms: WeightedMean {
+                sum: 600.0,
+                weight: 6.0,
+            },
+            throughput_bytes: 1_000_000.0,
+            throughput_seconds: 10.0,
+            throughput_windows: 4.0,
+            last_used: 9,
+            updated_at: Some(start),
+        };
+
+        stats.decay_to(start + SCORE_EVIDENCE_HALF_LIFE);
+
+        assert_close(stats.attempts, 4.0);
+        assert_close(stats.setup_success, 3.0);
+        assert_close(stats.setup_failure, 1.0);
+        assert_close(stats.useful_success, 2.0);
+        assert_close(stats.useful_failure, 1.0);
+        assert_close(stats.setup_ms.sum, 400.0);
+        assert_close(stats.setup_ms.weight, 4.0);
+        assert_close(stats.first_response_ms.sum, 300.0);
+        assert_close(stats.first_response_ms.weight, 3.0);
+        assert_close(stats.throughput_bytes, 500_000.0);
+        assert_close(stats.throughput_seconds, 5.0);
+        assert_close(stats.throughput_windows, 2.0);
+        assert_eq!(stats.incarnation, 7);
+        assert_eq!(stats.last_used, 9);
+    }
+
+    #[test]
+    fn aged_evidence_reenters_deterministic_cold_exploration() {
+        let nodes = [node("a"), node("b")];
+        let node_refs = [&nodes[0], &nodes[1]];
+        let context = context("example.com", IpVersion::V4);
+        let state = ScorePolicyState::default();
+        state.publish_membership(nodes.iter().map(|node| ("score".to_string(), node.id)));
+        let now = Instant::now();
+
+        for (index, node) in nodes.iter().enumerate() {
+            let attributions = [ScoreAttribution {
+                group: "score".into(),
+                node_id: node.id,
+            }];
+            let cells = state.start_at(&context, &attributions, now);
+            let success = index == 1;
+            state.finish_at(
+                &context,
+                &attributions,
+                &cells,
+                &FlowSample {
+                    outcome: if success {
+                        ScoreOutcome::Success
+                    } else {
+                        ScoreOutcome::Timeout
+                    },
+                    setup: success.then_some(Duration::from_millis(10)),
+                    first_response: success.then_some(Duration::from_millis(20)),
+                    tx: u64::from(success),
+                    rx: u64::from(success),
+                    elapsed: Duration::from_secs(1),
+                    count_usefulness: true,
+                },
+                now,
+            );
+        }
+
+        assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
+        assert_eq!(
+            state.rank_at(
+                "score",
+                &context,
+                &node_refs,
+                now + Duration::from_secs(SCORE_EVIDENCE_HALF_LIFE.as_secs() * 3),
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn parsed_score_policy_learns_without_a_feature_flag() {
+        let config = honk_config::parser::parse_dae_config(
+            r#"
+node {
+    a: 'socks5://127.0.0.1:10001'
+    b: 'socks5://127.0.0.1:10002'
+}
+group {
+    scored {
+        policy: score
+        filter: name('a', 'b')
+    }
+}
+"#,
+        )
+        .unwrap();
+        let manager = super::super::GroupManager::new(&config.groups, &config.nodes);
+        let context = context("example.com", IpVersion::V4);
+
+        let first = manager.selection_plan_for_target("scored", &context);
+        assert_eq!(first.entries[0].node.name, "a");
+        finish_failure(&first);
+
+        let second = manager.selection_plan_for_target("scored", &context);
+        assert_eq!(second.entries[0].node.name, "b");
+        finish_success(&second);
+        assert_eq!(
+            manager
+                .selection_plan_for_target("scored", &context)
+                .entries[0]
+                .node
+                .id,
+            config.nodes[1].id
+        );
+    }
     fn node(name: &str) -> Node {
         Node {
             id: Uuid::new_v5(&honk_config::node::NODE_ID_NAMESPACE, name.as_bytes()),
@@ -1404,44 +1792,44 @@ mod tests {
         Group {
             id: Uuid::new_v4(),
             name: name.into(),
-            policy: GroupPolicy::Honk,
+            policy: GroupPolicy::Score,
             nodes: nodes.iter().map(|node| node.id).collect(),
             ..Default::default()
         }
     }
 
-    fn context(host: &str, family: IpVersion) -> HonkSelectionContext {
-        HonkSelectionContext {
+    fn context(host: &str, family: IpVersion) -> ScoreSelectionContext {
+        ScoreSelectionContext {
             network: SelectionNetwork::Tcp,
             probe_domain: ProbeDomain::Tcp,
             target_family: Some(family),
             health_family: IpVersion::V4,
-            target: Some(HonkTarget::domain(host, 443)),
+            target: Some(ScoreTarget::domain(host, 443)),
         }
     }
 
-    fn finish_success(plan: &super::super::HonkSelectionPlan<'_>) {
+    fn finish_success(plan: &super::super::ScoreSelectionPlan<'_>) {
         let reporter = plan.entries[0]
             .feedback
             .as_ref()
-            .expect("Honk candidate must carry feedback")
+            .expect("Score candidate must carry feedback")
             .start();
         reporter.setup_succeeded();
         reporter.tx(1);
         reporter.rx(1);
-        reporter.finish(HonkOutcome::Success);
+        reporter.finish(ScoreOutcome::Success);
     }
-    fn finish_failure(plan: &super::super::HonkSelectionPlan<'_>) {
+    fn finish_failure(plan: &super::super::ScoreSelectionPlan<'_>) {
         plan.entries[0]
             .feedback
             .as_ref()
-            .expect("Honk candidate must carry feedback")
+            .expect("Score candidate must carry feedback")
             .start()
-            .setup_failed(HonkOutcome::Timeout);
+            .setup_failed(ScoreOutcome::Timeout);
     }
 
-    fn selected(manager: &super::super::GroupManager, context: &HonkSelectionContext) -> Uuid {
-        manager.selection_plan_for_target("honk", context).entries[0]
+    fn selected(manager: &super::super::GroupManager, context: &ScoreSelectionContext) -> Uuid {
+        manager.selection_plan_for_target("score", context).entries[0]
             .node
             .id
     }
@@ -1449,23 +1837,23 @@ mod tests {
     #[test]
     fn normalizes_domain_key_and_keeps_target_dimensions_independent() {
         let nodes = [node("a"), node("b")];
-        let manager = super::super::GroupManager::new(&[group("honk", &nodes)], &nodes);
+        let manager = super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
 
         let a = context("EXAMPLE.COM.", IpVersion::V4);
-        finish_success(&manager.selection_plan_for_target("honk", &a));
+        finish_success(&manager.selection_plan_for_target("score", &a));
         let normalized = context("example.com", IpVersion::V4);
         assert!(
             manager
-                .honk_state()
-                .has_exact("honk", &normalized, nodes[0].id)
+                .score_state()
+                .has_exact("score", &normalized, nodes[0].id)
         );
-        assert!(!manager.honk_state().has_exact(
-            "honk",
+        assert!(!manager.score_state().has_exact(
+            "score",
             &context("example.com", IpVersion::V6),
             nodes[0].id,
         ));
-        assert!(!manager.honk_state().has_exact(
-            "honk",
+        assert!(!manager.score_state().has_exact(
+            "score",
             &context("other.example", IpVersion::V4),
             nodes[0].id,
         ));
@@ -1474,20 +1862,20 @@ mod tests {
     #[test]
     fn cold_exploration_is_deterministic_and_cancelled_loser_is_neutral() {
         let nodes = [node("a"), node("b")];
-        let manager = super::super::GroupManager::new(&[group("honk", &nodes)], &nodes);
+        let manager = super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
         let context = context("example.com", IpVersion::V4);
-        let first = manager.selection_plan_for_target("honk", &context);
+        let first = manager.selection_plan_for_target("score", &context);
         assert_eq!(first.entries[0].node.id, nodes[0].id);
         drop(first.entries[0].feedback.as_ref().unwrap().start());
         assert_eq!(
-            manager.selection_plan_for_target("honk", &context).entries[0]
+            manager.selection_plan_for_target("score", &context).entries[0]
                 .node
                 .id,
             nodes[0].id
         );
-        finish_success(&manager.selection_plan_for_target("honk", &context));
+        finish_success(&manager.selection_plan_for_target("score", &context));
         assert_eq!(
-            manager.selection_plan_for_target("honk", &context).entries[0]
+            manager.selection_plan_for_target("score", &context).entries[0]
                 .node
                 .id,
             nodes[1].id,
@@ -1498,12 +1886,12 @@ mod tests {
     #[test]
     fn cancelled_exact_attempt_does_not_hide_aggregate_failure() {
         let nodes = [node("a"), node("b")];
-        let manager = super::super::GroupManager::new(&[group("honk", &nodes)], &nodes);
+        let manager = super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
         manager
             .feedback_for_group_node(
-                "honk",
+                "score",
                 nodes[0].id,
-                HonkSelectionContext::aggregate(
+                ScoreSelectionContext::aggregate(
                     SelectionNetwork::Tcp,
                     ProbeDomain::Tcp,
                     IpVersion::V4,
@@ -1511,20 +1899,20 @@ mod tests {
             )
             .unwrap()
             .start()
-            .setup_failed(HonkOutcome::Timeout);
+            .setup_failed(ScoreOutcome::Timeout);
 
         let context = context("cancelled.example", IpVersion::V4);
         drop(
             manager
-                .feedback_for_group_node("honk", nodes[0].id, context.clone())
+                .feedback_for_group_node("score", nodes[0].id, context.clone())
                 .unwrap()
                 .start(),
         );
 
         assert!(
             !manager
-                .honk_state()
-                .has_exact("honk", &context, nodes[0].id)
+                .score_state()
+                .has_exact("score", &context, nodes[0].id)
         );
         assert_eq!(selected(&manager, &context), nodes[1].id);
     }
@@ -1532,22 +1920,22 @@ mod tests {
     #[test]
     fn reload_reuses_state_and_prunes_removed_members() {
         let nodes = [node("a"), node("b")];
-        let old = super::super::GroupManager::new(&[group("honk", &nodes)], &nodes);
+        let old = super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
         let context = context("example.com", IpVersion::V4);
-        finish_success(&old.selection_plan_for_target("honk", &context));
-        let state = old.honk_state();
-        let replacement = super::super::GroupManager::with_alive_set_and_honk_state(
-            &[group("honk", &nodes[1..])],
+        finish_success(&old.selection_plan_for_target("score", &context));
+        let state = old.score_state();
+        let replacement = super::super::GroupManager::with_alive_set_and_score_state(
+            &[group("score", &nodes[1..])],
             &nodes[1..],
             None,
             Arc::clone(&state),
         );
-        replacement.publish_honk_membership();
-        assert!(!state.has_exact("honk", &context, nodes[0].id));
+        replacement.publish_score_membership();
+        assert!(!state.has_exact("score", &context, nodes[0].id));
     }
 
     #[test]
-    fn nested_honk_groups_keep_the_target_and_complete_attribution_path() {
+    fn nested_score_groups_keep_the_target_and_complete_attribution_path() {
         let nodes = [node("a"), node("b")];
         let child = group("child", &nodes);
         let mut parent = group("parent", &[]);
@@ -1569,12 +1957,16 @@ mod tests {
         );
         finish_success(&plan);
         for group in ["parent", "child"] {
-            assert!(manager.honk_state().has_exact(group, &context, nodes[0].id));
+            assert!(
+                manager
+                    .score_state()
+                    .has_exact(group, &context, nodes[0].id)
+            );
         }
     }
 
     #[test]
-    fn feedback_for_node_merges_nested_honk_memberships_once() {
+    fn feedback_for_node_merges_nested_score_memberships_once() {
         let leaf = node("leaf");
         let other = node("other");
         let child = group("child", std::slice::from_ref(&leaf));
@@ -1595,7 +1987,7 @@ mod tests {
         let feedback = manager
             .feedback_for_node(
                 leaf.id,
-                HonkSelectionContext::aggregate(
+                ScoreSelectionContext::aggregate(
                     SelectionNetwork::Tcp,
                     ProbeDomain::Tcp,
                     IpVersion::V4,
@@ -1611,7 +2003,7 @@ mod tests {
         assert_eq!(groups, ["child", "parent"]);
     }
     #[test]
-    fn nested_honk_last_resort_keeps_child_attribution() {
+    fn nested_score_last_resort_keeps_child_attribution() {
         let leaf = node("leaf");
         let alive = Arc::new(super::super::AliveDialerSet::new());
         alive.report_unavailable_forced(leaf.id, ProbeDomain::Tcp, IpVersion::V4);
@@ -1640,7 +2032,7 @@ mod tests {
     }
 
     #[test]
-    fn deep_honk_last_resort_keeps_every_attribution() {
+    fn deep_score_last_resort_keeps_every_attribution() {
         let leaf = node("leaf");
         let alive = Arc::new(super::super::AliveDialerSet::new());
         alive.report_unavailable_forced(leaf.id, ProbeDomain::Tcp, IpVersion::V4);
@@ -1705,15 +2097,15 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_leaf_paths_do_not_change_honk_rank() {
+    fn duplicate_leaf_paths_do_not_change_score_rank() {
         let nodes = [node("a"), node("b")];
         let mut bridge = group("bridge", std::slice::from_ref(&nodes[0]));
         bridge.policy = GroupPolicy::Selector;
-        let mut parent = group("honk", &nodes);
+        let mut parent = group("score", &nodes);
         parent.groups.push(bridge.name.clone());
         let manager = super::super::GroupManager::new(&[parent, bridge], &nodes);
         let context = context("duplicate.example", IpVersion::V4);
-        finish_failure(&manager.selection_plan_for_target("honk", &context));
+        finish_failure(&manager.selection_plan_for_target("score", &context));
         assert_eq!(selected(&manager, &context), nodes[1].id);
     }
 
@@ -1721,13 +2113,13 @@ mod tests {
     fn aggregate_feedback_completion_and_cancellation_are_accounted_once() {
         let leaf = node("leaf");
         let manager = super::super::GroupManager::new(
-            &[group("honk", std::slice::from_ref(&leaf))],
+            &[group("score", std::slice::from_ref(&leaf))],
             std::slice::from_ref(&leaf),
         );
         let feedback = manager
             .feedback_for_node(
                 leaf.id,
-                HonkSelectionContext::aggregate(
+                ScoreSelectionContext::aggregate(
                     SelectionNetwork::Tcp,
                     ProbeDomain::Tcp,
                     IpVersion::V4,
@@ -1738,17 +2130,17 @@ mod tests {
         drop(feedback.start());
         assert_eq!(
             manager
-                .honk_state()
-                .aggregate_stats("honk", SelectionNetwork::Tcp, leaf.id),
+                .score_state()
+                .aggregate_stats("score", SelectionNetwork::Tcp, leaf.id),
             None
         );
         let reporter = feedback.start();
         reporter.setup_succeeded();
-        reporter.finish(HonkOutcome::Success);
+        reporter.finish(ScoreOutcome::Success);
         assert_eq!(
             manager
-                .honk_state()
-                .aggregate_stats("honk", SelectionNetwork::Tcp, leaf.id),
+                .score_state()
+                .aggregate_stats("score", SelectionNetwork::Tcp, leaf.id),
             Some((1, 1, 0))
         );
     }
@@ -1757,11 +2149,11 @@ mod tests {
     fn setup_only_success_does_not_become_usefulness_failure() {
         let leaf = node("leaf");
         let manager = super::super::GroupManager::new(
-            &[group("honk", std::slice::from_ref(&leaf))],
+            &[group("score", std::slice::from_ref(&leaf))],
             std::slice::from_ref(&leaf),
         );
         let context = context("prepared.example", IpVersion::V4);
-        let feedback = manager.selection_plan_for_target("honk", &context).entries[0]
+        let feedback = manager.selection_plan_for_target("score", &context).entries[0]
             .feedback
             .clone()
             .unwrap();
@@ -1770,8 +2162,8 @@ mod tests {
         reporter.finish_setup_only();
         assert_eq!(
             manager
-                .honk_state()
-                .exact_useful_failures("honk", &context, leaf.id),
+                .score_state()
+                .exact_useful_failures("score", &context, leaf.id),
             Some(0)
         );
 
@@ -1781,8 +2173,8 @@ mod tests {
 
         assert_eq!(
             manager
-                .honk_state()
-                .exact_useful_failures("honk", &context, leaf.id),
+                .score_state()
+                .exact_useful_failures("score", &context, leaf.id),
             Some(0)
         );
     }
@@ -1790,11 +2182,11 @@ mod tests {
     #[test]
     fn setup_only_exact_samples_keep_aggregate_reliability() {
         let nodes = [node("a"), node("b")];
-        let manager = super::super::GroupManager::new(&[group("honk", &nodes)], &nodes);
+        let manager = super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
         for index in 0..8 {
             let reporter = manager
                 .feedback_for_group_node(
-                    "honk",
+                    "score",
                     nodes[0].id,
                     context(&format!("a-{index}.example"), IpVersion::V4),
                 )
@@ -1803,21 +2195,21 @@ mod tests {
             reporter.setup_succeeded();
             reporter.tx(1);
             reporter.rx(1);
-            reporter.finish(HonkOutcome::Success);
+            reporter.finish(ScoreOutcome::Success);
         }
         let reporter = manager
-            .feedback_for_group_node("honk", nodes[1].id, context("b.example", IpVersion::V4))
+            .feedback_for_group_node("score", nodes[1].id, context("b.example", IpVersion::V4))
             .unwrap()
             .start();
         reporter.setup_succeeded();
         reporter.tx(1);
         reporter.rx(1);
-        reporter.finish(HonkOutcome::Success);
+        reporter.finish(ScoreOutcome::Success);
 
         let target = context("prepared.example", IpVersion::V4);
         for _ in 0..8 {
             let reporter = manager
-                .feedback_for_group_node("honk", nodes[0].id, target.clone())
+                .feedback_for_group_node("score", nodes[0].id, target.clone())
                 .unwrap()
                 .start();
             reporter.setup_succeeded();
@@ -1830,11 +2222,11 @@ mod tests {
     #[test]
     fn setup_only_family_samples_keep_global_reliability() {
         let nodes = [node("a"), node("b")];
-        let manager = super::super::GroupManager::new(&[group("honk", &nodes)], &nodes);
+        let manager = super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
         for index in 0..8 {
             let reporter = manager
                 .feedback_for_group_node(
-                    "honk",
+                    "score",
                     nodes[0].id,
                     context(&format!("a-{index}.example"), IpVersion::V6),
                 )
@@ -1843,20 +2235,20 @@ mod tests {
             reporter.setup_succeeded();
             reporter.tx(1);
             reporter.rx(1);
-            reporter.finish(HonkOutcome::Success);
+            reporter.finish(ScoreOutcome::Success);
         }
         let reporter = manager
-            .feedback_for_group_node("honk", nodes[1].id, context("b.example", IpVersion::V6))
+            .feedback_for_group_node("score", nodes[1].id, context("b.example", IpVersion::V6))
             .unwrap()
             .start();
         reporter.setup_succeeded();
         reporter.tx(1);
         reporter.rx(1);
-        reporter.finish(HonkOutcome::Success);
+        reporter.finish(ScoreOutcome::Success);
 
         let reporter = manager
             .feedback_for_group_node(
-                "honk",
+                "score",
                 nodes[0].id,
                 context("prepared.example", IpVersion::V4),
             )
@@ -1875,56 +2267,59 @@ mod tests {
     fn compact_outcome_finds_nested_io_errors() {
         let error = anyhow::Error::new(io::Error::new(io::ErrorKind::TimedOut, "secret target"))
             .context("outer context");
-        assert_eq!(HonkOutcome::from_error(&error), HonkOutcome::Timeout);
+        assert_eq!(ScoreOutcome::from_error(&error), ScoreOutcome::Timeout);
     }
 
     #[test]
     fn exact_cache_has_a_hard_lru_bound() {
         let node = node("a");
         let manager = super::super::GroupManager::new(
-            &[group("honk", std::slice::from_ref(&node))],
+            &[group("score", std::slice::from_ref(&node))],
             std::slice::from_ref(&node),
         );
         for index in 0..=EXACT_CAPACITY {
             finish_success(&manager.selection_plan_for_target(
-                "honk",
+                "score",
                 &context(&format!("{index}.example"), IpVersion::V4),
             ));
         }
-        assert_eq!(manager.honk_state().exact_len(), EXACT_CAPACITY);
+        assert_eq!(manager.score_state().exact_len(), EXACT_CAPACITY);
     }
 
     #[test]
     fn setup_failure_switches_to_the_other_candidate() {
         let nodes = [node("a"), node("b")];
-        let manager = super::super::GroupManager::new(&[group("honk", &nodes)], &nodes);
+        let manager = super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
         let context = context("failure.example", IpVersion::V4);
 
         assert_eq!(selected(&manager, &context), nodes[0].id);
-        finish_failure(&manager.selection_plan_for_target("honk", &context));
+        finish_failure(&manager.selection_plan_for_target("score", &context));
         assert_eq!(selected(&manager, &context), nodes[1].id);
     }
 
     #[test]
     fn inflight_exact_attempt_does_not_mask_aggregate_reliability() {
         let nodes = [node("a"), node("b")];
-        let manager = super::super::GroupManager::new(&[group("honk", &nodes)], &nodes);
-        let aggregate =
-            HonkSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+        let manager = super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
+        let aggregate = ScoreSelectionContext::aggregate(
+            SelectionNetwork::Tcp,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+        );
         manager
-            .feedback_for_group_node("honk", nodes[0].id, aggregate.clone())
+            .feedback_for_group_node("score", nodes[0].id, aggregate.clone())
             .unwrap()
             .start()
-            .setup_failed(HonkOutcome::Other);
+            .setup_failed(ScoreOutcome::Other);
         let good = manager
-            .feedback_for_group_node("honk", nodes[1].id, aggregate)
+            .feedback_for_group_node("score", nodes[1].id, aggregate)
             .unwrap()
             .start();
         good.setup_succeeded();
         good.finish_setup_only();
         let target = context("inflight.example", IpVersion::V4);
         let inflight = manager
-            .feedback_for_group_node("honk", nodes[0].id, target.clone())
+            .feedback_for_group_node("score", nodes[0].id, target.clone())
             .unwrap()
             .start();
 
@@ -1936,30 +2331,30 @@ mod tests {
     #[test]
     fn network_target_and_family_buckets_are_isolated() {
         let nodes = [node("a"), node("b")];
-        let manager = super::super::GroupManager::new(&[group("honk", &nodes)], &nodes);
+        let manager = super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
         let tcp_a_v4 = context("a.example", IpVersion::V4);
-        finish_failure(&manager.selection_plan_for_target("honk", &tcp_a_v4));
+        finish_failure(&manager.selection_plan_for_target("score", &tcp_a_v4));
 
         let mut udp_a_v4 = tcp_a_v4.clone();
         udp_a_v4.network = SelectionNetwork::Udp;
         udp_a_v4.probe_domain = ProbeDomain::DataUdp;
         let tcp_b_v4 = context("b.example", IpVersion::V4);
         let tcp_a_v6 = context("a.example", IpVersion::V6);
-        let state = manager.honk_state();
+        let state = manager.score_state();
 
         assert_eq!(
-            state.exact_stats("honk", &tcp_a_v4, nodes[0].id),
+            state.exact_stats("score", &tcp_a_v4, nodes[0].id),
             Some((1, 0, 1))
         );
         for untouched in [&udp_a_v4, &tcp_b_v4, &tcp_a_v6] {
-            assert_eq!(state.exact_stats("honk", untouched, nodes[0].id), None);
+            assert_eq!(state.exact_stats("score", untouched, nodes[0].id), None);
         }
-        finish_success(&manager.selection_plan_for_target("honk", &tcp_b_v4));
+        finish_success(&manager.selection_plan_for_target("score", &tcp_b_v4));
         assert_eq!(
-            state.exact_stats("honk", &tcp_b_v4, nodes[1].id),
+            state.exact_stats("score", &tcp_b_v4, nodes[1].id),
             Some((1, 1, 0))
         );
-        assert_eq!(state.exact_stats("honk", &tcp_a_v4, nodes[1].id), None);
+        assert_eq!(state.exact_stats("score", &tcp_a_v4, nodes[1].id), None);
     }
 
     #[test]
@@ -1968,7 +2363,7 @@ mod tests {
         let alive = Arc::new(super::super::AliveDialerSet::new());
         alive.report_unavailable_forced(nodes[0].id, ProbeDomain::Tcp, IpVersion::V4);
         let manager = super::super::GroupManager::with_alive_set(
-            &[group("honk", &nodes)],
+            &[group("score", &nodes)],
             &nodes,
             Some(alive),
         );
@@ -1981,16 +2376,19 @@ mod tests {
 
     #[test]
     fn aggregate_cache_has_a_hard_lru_bound() {
-        let state = HonkPolicyState::default();
+        let state = ScorePolicyState::default();
         let node_id = node("a").id;
-        let context =
-            HonkSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+        let context = ScoreSelectionContext::aggregate(
+            SelectionNetwork::Tcp,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+        );
         let memberships: Vec<_> = (0..=AGGREGATE_CAPACITY)
             .map(|index| (format!("group-{index}"), node_id))
             .collect();
         state.publish_membership(memberships.iter().cloned());
         for (group, node_id) in memberships {
-            drop(state.start(&context, &[HonkAttribution { group, node_id }]));
+            drop(state.start(&context, &[ScoreAttribution { group, node_id }]));
         }
         assert_eq!(state.inner.lock().aggregate.len(), AGGREGATE_CAPACITY);
     }
@@ -1999,20 +2397,20 @@ mod tests {
     fn stale_exact_completion_does_not_mutate_recreated_cell() {
         let node = node("a");
         let manager = super::super::GroupManager::new(
-            &[group("honk", std::slice::from_ref(&node))],
+            &[group("score", std::slice::from_ref(&node))],
             std::slice::from_ref(&node),
         );
         let evicted = context("evicted.example", IpVersion::V4);
-        let reporter = manager.selection_plan_for_target("honk", &evicted).entries[0]
+        let reporter = manager.selection_plan_for_target("score", &evicted).entries[0]
             .feedback
             .as_ref()
             .unwrap()
             .start();
         for index in 0..EXACT_CAPACITY {
             let context = context(&format!("{index}.example"), IpVersion::V4);
-            finish_success(&manager.selection_plan_for_target("honk", &context));
+            finish_success(&manager.selection_plan_for_target("score", &context));
         }
-        let replacement = manager.selection_plan_for_target("honk", &evicted).entries[0]
+        let replacement = manager.selection_plan_for_target("score", &evicted).entries[0]
             .feedback
             .as_ref()
             .unwrap()
@@ -2020,32 +2418,39 @@ mod tests {
         reporter.setup_succeeded();
         reporter.tx(1);
         reporter.rx(1);
-        reporter.finish(HonkOutcome::Success);
+        reporter.finish(ScoreOutcome::Success);
         assert_eq!(
-            manager.honk_state().exact_stats("honk", &evicted, node.id),
+            manager
+                .score_state()
+                .exact_stats("score", &evicted, node.id),
             Some((1, 0, 0))
         );
         replacement.setup_succeeded();
         replacement.tx(1);
         replacement.rx(1);
-        replacement.finish(HonkOutcome::Success);
+        replacement.finish(ScoreOutcome::Success);
         assert_eq!(
-            manager.honk_state().exact_stats("honk", &evicted, node.id),
+            manager
+                .score_state()
+                .exact_stats("score", &evicted, node.id),
             Some((1, 1, 0))
         );
     }
 
     #[test]
     fn stale_aggregate_completion_does_not_mutate_recreated_cell() {
-        let state = HonkPolicyState::default();
+        let state = ScorePolicyState::default();
         let node_id = node("a").id;
-        let context =
-            HonkSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+        let context = ScoreSelectionContext::aggregate(
+            SelectionNetwork::Tcp,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+        );
         let memberships: Vec<_> = (0..=AGGREGATE_CAPACITY)
             .map(|index| (format!("group-{index}"), node_id))
             .collect();
         state.publish_membership(memberships.iter().cloned());
-        let evicted = HonkAttribution {
+        let evicted = ScoreAttribution {
             group: memberships[0].0.clone(),
             node_id,
         };
@@ -2053,7 +2458,7 @@ mod tests {
         for (group, node_id) in memberships.iter().skip(1) {
             drop(state.start(
                 &context,
-                &[HonkAttribution {
+                &[ScoreAttribution {
                     group: group.clone(),
                     node_id: *node_id,
                 }],
@@ -2061,7 +2466,7 @@ mod tests {
         }
         let current_cells = state.start(&context, std::slice::from_ref(&evicted));
         let sample = FlowSample {
-            outcome: HonkOutcome::Success,
+            outcome: ScoreOutcome::Success,
             setup: Some(Duration::ZERO),
             first_response: None,
             tx: 1,
@@ -2109,8 +2514,8 @@ mod tests {
         reporter.setup_succeeded();
         reporter.tx(1);
         reporter.rx(1);
-        reporter.finish(HonkOutcome::Success);
-        assert!(manager.honk_state().has_exact(
+        reporter.finish(ScoreOutcome::Success);
+        assert!(manager.score_state().has_exact(
             "outer",
             &context,
             honk_config::config::DIRECT_NODE_ID
@@ -2127,7 +2532,7 @@ mod tests {
         let manager = super::super::GroupManager::new(&[parent, child], &nodes);
 
         assert_eq!(
-            manager.get_honk_selection_for_network("parent", SelectionNetwork::Tcp),
+            manager.get_score_selection_for_network("parent", SelectionNetwork::Tcp),
             Some("child".into())
         );
         assert_eq!(manager.select_node("child").unwrap().id, nodes[0].id);
@@ -2136,36 +2541,36 @@ mod tests {
     #[test]
     fn late_completion_keeps_extant_member_and_drops_deleted_member() {
         let nodes = [node("a"), node("b")];
-        let old = super::super::GroupManager::new(&[group("honk", &nodes)], &nodes);
+        let old = super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
         let context = context("reload.example", IpVersion::V4);
-        let reporter_a = old.selection_plan_for_target("honk", &context).entries[0]
+        let reporter_a = old.selection_plan_for_target("score", &context).entries[0]
             .feedback
             .as_ref()
             .unwrap()
             .start();
-        finish_success(&old.selection_plan_for_target("honk", &context));
-        let reporter_b = old.selection_plan_for_target("honk", &context).entries[0]
+        finish_success(&old.selection_plan_for_target("score", &context));
+        let reporter_b = old.selection_plan_for_target("score", &context).entries[0]
             .feedback
             .as_ref()
             .unwrap()
             .start();
-        let state = old.honk_state();
-        let replacement = super::super::GroupManager::with_alive_set_and_honk_state(
-            &[group("honk", &nodes[..1])],
+        let state = old.score_state();
+        let replacement = super::super::GroupManager::with_alive_set_and_score_state(
+            &[group("score", &nodes[..1])],
             &nodes[..1],
             None,
             Arc::clone(&state),
         );
-        replacement.publish_honk_membership();
+        replacement.publish_score_membership();
 
         for reporter in [&reporter_a, &reporter_b] {
             reporter.setup_succeeded();
             reporter.tx(1);
             reporter.rx(1);
-            reporter.finish(HonkOutcome::Success);
+            reporter.finish(ScoreOutcome::Success);
         }
-        assert!(state.has_exact("honk", &context, nodes[0].id));
-        assert!(!state.has_exact("honk", &context, nodes[1].id));
+        assert!(state.has_exact("score", &context, nodes[0].id));
+        assert!(!state.has_exact("score", &context, nodes[1].id));
     }
 
     #[test]
@@ -2185,7 +2590,7 @@ mod tests {
             .feedback_for_group_node("outer", leaves[1].id, context.clone())
             .unwrap()
             .start();
-        let state = old.honk_state();
+        let state = old.score_state();
         assert!(
             state
                 .inner
@@ -2202,18 +2607,18 @@ mod tests {
         );
 
         final_group.nodes.retain(|node_id| *node_id == leaves[0].id);
-        let replacement = super::super::GroupManager::with_alive_set_and_honk_state(
+        let replacement = super::super::GroupManager::with_alive_set_and_score_state(
             &[outer, final_group],
             std::slice::from_ref(&leaves[0]),
             None,
             Arc::clone(&state),
         );
-        replacement.publish_honk_membership();
+        replacement.publish_score_membership();
         for reporter in [&reporter_a, &reporter_b] {
             reporter.setup_succeeded();
             reporter.tx(1);
             reporter.rx(1);
-            reporter.finish(HonkOutcome::Success);
+            reporter.finish(ScoreOutcome::Success);
         }
 
         assert!(state.has_exact("outer", &context, leaves[0].id));

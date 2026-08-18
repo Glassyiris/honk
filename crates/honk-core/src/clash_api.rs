@@ -30,12 +30,8 @@ use honk_config::group::GroupPolicy;
 use honk_config::node::{Group, Node};
 use honk_config::types::NodeProtocol;
 use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
-#[cfg(feature = "honk-policy")]
 use honk_outbound::group::SelectionNetwork;
 use honk_outbound::group::{GroupManager, SharedGroupManager};
-#[cfg(not(feature = "honk-policy"))]
-use honk_outbound::urltest::{urltest_group, urltest_node_in_generation};
-#[cfg(feature = "honk-policy")]
 use honk_outbound::urltest::{
     urltest_group_with_feedback, urltest_node_in_generation_with_feedback,
 };
@@ -391,8 +387,7 @@ fn clash_group_type(policy: GroupPolicy) -> &'static str {
         GroupPolicy::URLTest => "url_test",
         GroupPolicy::LoadBalance => "load_balance",
         GroupPolicy::Fallback => "fallback",
-        #[cfg(feature = "honk-policy")]
-        GroupPolicy::Honk => "url_test",
+        GroupPolicy::Score => "url_test",
     }
 }
 
@@ -419,9 +414,8 @@ fn build_group_proxy_info(
             .get_fallback_selection(&group.name)
             .or_else(|| node_names.first().cloned())
             .unwrap_or_default(),
-        #[cfg(feature = "honk-policy")]
-        GroupPolicy::Honk => group_manager
-            .get_honk_selection_for_network(&group.name, SelectionNetwork::Tcp)
+        GroupPolicy::Score => group_manager
+            .get_score_selection_for_network(&group.name, SelectionNetwork::Tcp)
             .or_else(|| node_names.first().cloned())
             .unwrap_or_default(),
     };
@@ -671,7 +665,6 @@ async fn get_proxy_delay(
         let tcp = entry.tcp.clone();
         let warmable = entry.warmable.clone();
         let generation = s.runtime_registry.read().clone();
-        #[cfg(feature = "honk-policy")]
         let measured = {
             let group_manager = s.group_manager.read().clone();
             urltest_node_in_generation_with_feedback(
@@ -685,16 +678,6 @@ async fn get_proxy_delay(
             )
             .await
         };
-        #[cfg(not(feature = "honk-policy"))]
-        let measured = urltest_node_in_generation(
-            &generation,
-            &node,
-            tcp.as_ref(),
-            warmable.as_deref(),
-            &query.url,
-            query.timeout(),
-        )
-        .await;
         return match measured {
             Ok(latency) => {
                 s.alive_set
@@ -727,7 +710,6 @@ async fn get_proxy_delay(
         }
         let leaves: Vec<Node> = members.iter().map(|(_, leaf)| leaf.clone()).collect();
         let generation = s.runtime_registry.read().clone();
-        #[cfg(feature = "honk-policy")]
         let results = {
             let group_manager = s.group_manager.read().clone();
             urltest_group_with_feedback(
@@ -741,16 +723,6 @@ async fn get_proxy_delay(
             )
             .await
         };
-        #[cfg(not(feature = "honk-policy"))]
-        let results = urltest_group(
-            &leaves,
-            &generation,
-            &s.proxy_registry,
-            &s.alive_set,
-            &query.url,
-            query.timeout(),
-        )
-        .await;
         // sing-box performUpdateCheck: an explicit delay test immediately
         // re-evaluates the URLTest selection with the fresh measurements
         // (tolerance hysteresis applies). Without this the group's `now`
@@ -765,13 +737,9 @@ async fn get_proxy_delay(
         // tag); its delay is the measurement of that member's leaf.
         let current = {
             let gm = s.group_manager.read();
-            let current = gm
-                .get_selector_choice(&name)
-                .or_else(|| gm.get_urltest_selection(&name));
-            #[cfg(feature = "honk-policy")]
-            let current =
-                current.or_else(|| gm.get_honk_selection_for_network(&name, SelectionNetwork::Tcp));
-            current
+            gm.get_selector_choice(&name)
+                .or_else(|| gm.get_urltest_selection(&name))
+                .or_else(|| gm.get_score_selection_for_network(&name, SelectionNetwork::Tcp))
         }
         .or_else(|| members.first().map(|(tag, _)| tag.clone()));
         if let Some(current) = current
@@ -813,7 +781,6 @@ async fn get_group_delay(
 
     let leaves: Vec<Node> = members.iter().map(|(_, leaf)| leaf.clone()).collect();
     let generation = s.runtime_registry.read().clone();
-    #[cfg(feature = "honk-policy")]
     let results = {
         let group_manager = s.group_manager.read().clone();
         urltest_group_with_feedback(
@@ -827,16 +794,6 @@ async fn get_group_delay(
         )
         .await
     };
-    #[cfg(not(feature = "honk-policy"))]
-    let results = urltest_group(
-        &leaves,
-        &generation,
-        &s.proxy_registry,
-        &s.alive_set,
-        &query.url,
-        query.timeout(),
-    )
-    .await;
     // sing-box performUpdateCheck: re-evaluate the URLTest selection with
     // the fresh measurements (see get_proxy_delay's group branch).
     {

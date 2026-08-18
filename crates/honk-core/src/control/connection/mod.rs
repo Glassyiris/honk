@@ -1,12 +1,11 @@
-#[cfg(feature = "honk-policy")]
-pub(in crate::control) fn honk_runtime_outcome(
+pub(in crate::control) fn score_runtime_outcome(
     generation: &honk_outbound::runtime::OutboundRuntimeRegistry,
     error: &anyhow::Error,
-) -> crate::group::HonkOutcome {
+) -> crate::group::ScoreOutcome {
     if generation.is_shutdown() {
-        crate::group::HonkOutcome::Shutdown
+        crate::group::ScoreOutcome::Shutdown
     } else {
-        crate::group::HonkOutcome::from_error(error)
+        crate::group::ScoreOutcome::from_error(error)
     }
 }
 

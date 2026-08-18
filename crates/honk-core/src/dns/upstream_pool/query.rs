@@ -102,11 +102,7 @@ impl UpstreamPool {
         let response = self
             .udp_pool(entry, address)
             .await?
-            .exchange(
-                effective_query,
-                #[cfg(feature = "honk-policy")]
-                None,
-            )
+            .exchange(effective_query, None)
             .await?;
         entry.udp.lock().mark_current(address);
         Ok((response, admission, injected))
@@ -140,14 +136,9 @@ impl UpstreamPool {
         let _admission = self.admit_query().await?;
         let transport = self.get_transport(entry, Some(node), route.target).await?;
         let response = transport
-            .exchange(
-                raw_query,
-                #[cfg(feature = "honk-policy")]
-                route.feedback.as_ref(),
-            )
+            .exchange(raw_query, route.feedback.as_ref())
             .await?;
         let response = if response.len() >= 4 && response[2] & 0x02 != 0 {
-            #[cfg(feature = "honk-policy")]
             let tcp_feedback = self.tcp_feedback_for_route(entry, route);
             debug!(
                 "DNS upstream '{}' proxied UDP answer has TC set — retrying over proxied TCP",
@@ -155,11 +146,7 @@ impl UpstreamPool {
             );
             self.get_transport(entry, Some(node), route.target)
                 .await?
-                .exchange(
-                    raw_query,
-                    #[cfg(feature = "honk-policy")]
-                    tcp_feedback.as_ref(),
-                )
+                .exchange(raw_query, tcp_feedback.as_ref())
                 .await?
         } else {
             response
@@ -190,11 +177,7 @@ impl UpstreamPool {
             );
             self.get_transport(entry, None, address)
                 .await?
-                .exchange(
-                    effective_query,
-                    #[cfg(feature = "honk-policy")]
-                    None,
-                )
+                .exchange(effective_query, None)
                 .await?
         } else {
             debug!(
@@ -244,14 +227,7 @@ impl UpstreamPool {
                 let admission = self.admit_query().await?;
                 let injected = self.prepare_generated_ecs(raw_query);
                 let effective_query = injected.as_ref().map_or(raw_query, EcsQuery::wire);
-                match pool
-                    .exchange(
-                        effective_query,
-                        #[cfg(feature = "honk-policy")]
-                        None,
-                    )
-                    .await
-                {
+                match pool.exchange(effective_query, None).await {
                     Ok(response) => {
                         entry.udp.lock().mark_current(address);
                         return self
@@ -397,11 +373,7 @@ impl DnsUpstreamPool for UpstreamPool {
             {
                 Ok(transport) => {
                     transport
-                        .exchange(
-                            effective_query,
-                            #[cfg(feature = "honk-policy")]
-                            route.feedback.as_ref(),
-                        )
+                        .exchange(effective_query, route.feedback.as_ref())
                         .await
                 }
                 Err(error) => Err(error),

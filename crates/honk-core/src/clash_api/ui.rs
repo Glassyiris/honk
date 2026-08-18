@@ -26,10 +26,9 @@ use honk_config::Config;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
 use honk_outbound::alive::{IpVersion, ProbeDomain};
-use honk_outbound::group::SharedGroupManager;
-#[cfg(feature = "honk-policy")]
 use honk_outbound::group::{
-    HonkFeedback, HonkOutcome, HonkReporter, HonkSelectionContext, HonkTarget, SelectionNetwork,
+    ScoreFeedback, ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreTarget,
+    SelectionNetwork, SharedGroupManager,
 };
 use honk_outbound::proxy::{AsyncReadWrite, ProxyRegistry};
 use honk_outbound::runtime::SharedRuntimeRegistry;
@@ -38,14 +37,6 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::routing::{ConnectionInfo, Router};
-#[cfg(feature = "honk-policy")]
-type UiHonkFeedback = Option<HonkFeedback>;
-#[cfg(not(feature = "honk-policy"))]
-type UiHonkFeedback = Option<()>;
-#[cfg(feature = "honk-policy")]
-type UiHonkReporter = Option<HonkReporter>;
-#[cfg(not(feature = "honk-policy"))]
-type UiHonkReporter = Option<()>;
 
 /// Default dashboard archive (zashboard release `dist.zip`, latest).
 pub const DEFAULT_UI_DOWNLOAD_URL: &str =
@@ -124,12 +115,12 @@ fn download_url() -> String {
 /// Where the routing decision sends the download.
 enum UiRoute {
     Direct {
-        feedback: UiHonkFeedback,
+        feedback: Option<ScoreFeedback>,
     },
     Block,
     Proxy {
         node: Box<Node>,
-        feedback: UiHonkFeedback,
+        feedback: Option<ScoreFeedback>,
     },
 }
 
@@ -137,11 +128,7 @@ enum UiRoute {
 /// traffic: `Router::route_with_must` for the outbound name, then the
 /// authoritative group/leaf resolution for the node to dial.
 async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow::Result<UiRoute> {
-    #[cfg(feature = "honk-policy")]
     let host_ip = parse_host_ip(host);
-    #[cfg(not(feature = "honk-policy"))]
-    let host_ip = host.parse::<std::net::IpAddr>().ok();
-    #[cfg(feature = "honk-policy")]
     let resolved_ip = if let Some(ip) = host_ip {
         Some(ip)
     } else {
@@ -156,16 +143,7 @@ async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow:
             (!host.parse::<std::net::IpAddr>().is_ok()).then(|| host.to_string()),
         ),
         None => (
-            {
-                #[cfg(feature = "honk-policy")]
-                {
-                    resolved_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
-                }
-                #[cfg(not(feature = "honk-policy"))]
-                {
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-                }
-            },
+            resolved_ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
             Some(host.to_string()),
         ),
     };
@@ -193,7 +171,6 @@ async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow:
     } else {
         IpVersion::V4
     };
-    #[cfg(feature = "honk-policy")]
     let score_ipver = resolved_ip.map(|ip| {
         if ip.is_ipv6() {
             IpVersion::V6
@@ -201,18 +178,17 @@ async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow:
             IpVersion::V4
         }
     });
-    #[cfg(feature = "honk-policy")]
     let (nodes, feedback) = {
         let config = ctx.config.read().await;
         let group_manager = ctx.group_manager.read().clone();
         if config.groups.iter().any(|group| group.name == outbound) {
-            let context = HonkSelectionContext {
+            let context = ScoreSelectionContext {
                 network: SelectionNetwork::Tcp,
                 probe_domain: ProbeDomain::Tcp,
                 target_family: score_ipver,
                 health_family: score_ipver.unwrap_or(target_ipver),
                 target: Some(if domain.is_some() {
-                    HonkTarget::domain(host, port)
+                    ScoreTarget::domain(host, port)
                 } else {
                     std::net::SocketAddr::new(dst_ip, port).into()
                 }),
@@ -237,20 +213,6 @@ async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow:
             )
         }
     };
-    #[cfg(not(feature = "honk-policy"))]
-    let nodes = {
-        let config = ctx.config.read().await;
-        let group_manager = ctx.group_manager.read().clone();
-        crate::control::reload::resolve_outbound_nodes(
-            &config,
-            &group_manager,
-            &outbound,
-            ProbeDomain::Tcp,
-            target_ipver,
-        )
-    };
-    #[cfg(not(feature = "honk-policy"))]
-    let feedback = None;
     let Some(node) = nodes.into_iter().next() else {
         anyhow::bail!("external UI download: outbound '{outbound}' has no available node");
     };
@@ -329,20 +291,14 @@ async fn fetch_routed(ctx: &UiDownloadContext, url: &str) -> anyhow::Result<Vec<
 /// Direct fetch: plain reqwest (the control-plane PID bypass keeps the
 /// gateway's own traffic out of the datapath), streaming with the archive
 /// size cap.
-async fn fetch_direct(url: &str, feedback: UiHonkFeedback) -> anyhow::Result<ProxiedFetch> {
-    #[cfg(feature = "honk-policy")]
-    let reporter = feedback.as_ref().map(HonkFeedback::start);
-    #[cfg(not(feature = "honk-policy"))]
-    let reporter = feedback;
-    #[cfg(not(feature = "honk-policy"))]
-    let _ = &reporter;
+async fn fetch_direct(url: &str, feedback: Option<ScoreFeedback>) -> anyhow::Result<ProxiedFetch> {
+    let reporter = feedback.as_ref().map(ScoreFeedback::start);
     let result = async {
         let client = reqwest::Client::builder()
             .timeout(DOWNLOAD_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let mut response = client.get(url).send().await?;
-        #[cfg(feature = "honk-policy")]
         if let Some(reporter) = &reporter {
             reporter.setup_succeeded();
             reporter.first_response();
@@ -355,7 +311,6 @@ async fn fetch_direct(url: &str, feedback: UiHonkFeedback) -> anyhow::Result<Pro
                 .ok_or_else(|| anyhow::anyhow!("redirect {} without Location", response.status()))?
                 .to_str()?
                 .to_string();
-            #[cfg(feature = "honk-policy")]
             if let Some(reporter) = &reporter {
                 reporter.rx(location.len() as u64);
             }
@@ -369,7 +324,6 @@ async fn fetch_direct(url: &str, feedback: UiHonkFeedback) -> anyhow::Result<Pro
             if bytes.len() + chunk.len() > MAX_ARCHIVE_BYTES {
                 anyhow::bail!("external UI archive exceeds {} bytes", MAX_ARCHIVE_BYTES);
             }
-            #[cfg(feature = "honk-policy")]
             if let Some(reporter) = &reporter {
                 reporter.rx(chunk.len() as u64);
             }
@@ -378,11 +332,10 @@ async fn fetch_direct(url: &str, feedback: UiHonkFeedback) -> anyhow::Result<Pro
         Ok(ProxiedFetch::Body(bytes))
     }
     .await;
-    #[cfg(feature = "honk-policy")]
     if let Some(reporter) = &reporter {
         reporter.finish(match &result {
-            Ok(_) => HonkOutcome::Success,
-            Err(error) => HonkOutcome::from_error(error),
+            Ok(_) => ScoreOutcome::Success,
+            Err(error) => ScoreOutcome::from_error(error),
         });
     }
     result
@@ -399,7 +352,7 @@ enum ProxiedFetch {
 async fn fetch_proxied(
     ctx: &UiDownloadContext,
     node: &Node,
-    feedback: UiHonkFeedback,
+    feedback: Option<ScoreFeedback>,
     host: &str,
     port: u16,
     path: &str,
@@ -412,10 +365,7 @@ async fn fetch_proxied(
     let connect_timeout = Duration::from_millis(ctx.config.read().await.global.connect_timeout_ms);
     // Tunnel handlers dial by domain; the address is only a fallback for
     // handlers that need a numeric target.
-    #[cfg(feature = "honk-policy")]
     let host_ip = parse_host_ip(host);
-    #[cfg(not(feature = "honk-policy"))]
-    let host_ip = host.parse::<std::net::IpAddr>().ok();
     let (domain, addr) = match host_ip {
         Some(ip) => (None, std::net::SocketAddr::new(ip, port)),
         None => (Some(host), std::net::SocketAddr::from(([0, 0, 0, 0], port))),
@@ -431,10 +381,7 @@ async fn fetch_proxied(
             (guard.runtime(), Some(guard))
         }
     };
-    #[cfg(feature = "honk-policy")]
-    let reporter = feedback.as_ref().map(HonkFeedback::start);
-    #[cfg(not(feature = "honk-policy"))]
-    let reporter = feedback;
+    let reporter = feedback.as_ref().map(ScoreFeedback::start);
     let result = match entry
         .tcp
         .dial_runtime(runtime, addr, domain, connect_timeout)
@@ -454,11 +401,10 @@ async fn fetch_proxied(
         },
         Err(e) => Err(e.context("external UI download dial failed")),
     };
-    #[cfg(feature = "honk-policy")]
     if let Some(reporter) = &reporter {
         reporter.finish(match &result {
-            Ok(_) => HonkOutcome::Success,
-            Err(error) => HonkOutcome::from_error(error),
+            Ok(_) => ScoreOutcome::Success,
+            Err(error) => ScoreOutcome::from_error(error),
         });
     }
     if let Some(guard) = guard {
@@ -473,21 +419,17 @@ async fn proxied_get(
     host: &str,
     path: &str,
     is_https: bool,
-    reporter: &UiHonkReporter,
+    reporter: &Option<ScoreReporter>,
 ) -> anyhow::Result<ProxiedFetch> {
-    #[cfg(not(feature = "honk-policy"))]
-    let _ = reporter;
     if is_https {
         let connector = honk_outbound::tls::build_dns_connector(false, HTTP11_ALPN_WIRE)?;
         let mut tls = connector.connect(host, stream).await?;
-        #[cfg(feature = "honk-policy")]
         if let Some(reporter) = reporter {
             reporter.setup_succeeded();
         }
         http_get(&mut tls, host, path, reporter).await
     } else {
         let mut stream = stream;
-        #[cfg(feature = "honk-policy")]
         if let Some(reporter) = reporter {
             reporter.setup_succeeded();
         }
@@ -502,18 +444,15 @@ async fn http_get<S>(
     stream: &mut S,
     host: &str,
     path: &str,
-    reporter: &UiHonkReporter,
+    reporter: &Option<ScoreReporter>,
 ) -> anyhow::Result<ProxiedFetch>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    #[cfg(not(feature = "honk-policy"))]
-    let _ = reporter;
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: honk-ui-download/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n"
     );
     stream.write_all(request.as_bytes()).await?;
-    #[cfg(feature = "honk-policy")]
     if let Some(reporter) = reporter {
         reporter.tx(request.len() as u64);
     }
@@ -525,7 +464,6 @@ where
         if n == 0 {
             anyhow::bail!("connection closed before response headers");
         }
-        #[cfg(feature = "honk-policy")]
         if let Some(reporter) = reporter {
             reporter.first_response();
             reporter.rx(n as u64);
@@ -580,7 +518,6 @@ where
             body.reserve(len.saturating_sub(body.len()));
             while body.len() < len {
                 let n = stream.read(&mut chunk).await?;
-                #[cfg(feature = "honk-policy")]
                 if let Some(reporter) = reporter {
                     reporter.rx(n as u64);
                 }
@@ -596,7 +533,6 @@ where
             if n == 0 {
                 break;
             }
-            #[cfg(feature = "honk-policy")]
             if let Some(reporter) = reporter {
                 reporter.rx(n as u64);
             }
@@ -609,7 +545,6 @@ where
     Ok(ProxiedFetch::Body(body))
 }
 
-#[cfg(feature = "honk-policy")]
 fn parse_host_ip(host: &str) -> Option<std::net::IpAddr> {
     host.parse()
         .ok()
@@ -721,7 +656,6 @@ fn remove_all_in_directory(directory: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "honk-policy")]
     use honk_config::group::{Group, GroupPolicy};
     use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
     use honk_outbound::group::GroupManager;
@@ -1012,9 +946,8 @@ mod tests {
             b"<html>p</html>"
         );
     }
-    #[cfg(feature = "honk-policy")]
     #[tokio::test]
-    async fn honk_route_attributes_target_and_rewards_useful_body_exchange() {
+    async fn score_route_attributes_target_and_rewards_useful_body_exchange() {
         let body = b"dashboard bytes".to_vec();
         let addr = spawn_zip_server(body.clone()).await;
         let nodes = ["a", "b"].map(|name| {
@@ -1030,13 +963,13 @@ mod tests {
         });
         let child = Group {
             name: "ui-child".into(),
-            policy: GroupPolicy::Honk,
+            policy: GroupPolicy::Score,
             nodes: nodes.iter().map(|node| node.id).collect(),
             ..Default::default()
         };
         let parent = Group {
             name: "ui-parent".into(),
-            policy: GroupPolicy::Honk,
+            policy: GroupPolicy::Score,
             groups: vec![child.name.clone()],
             ..Default::default()
         };
@@ -1046,7 +979,7 @@ mod tests {
             ..Default::default()
         };
         let rules = vec![RoutingRule {
-            name: "honk-ui".into(),
+            name: "score-ui".into(),
             condition: RoutingCondition {
                 ip: vec!["127.0.0.1/32".into()],
                 ..Default::default()
@@ -1079,10 +1012,10 @@ mod tests {
         let UiRoute::Proxy { node, feedback } =
             decide_route(&ctx, "127.0.0.1", addr.port()).await.unwrap()
         else {
-            panic!("Honk group must resolve to a proxy leaf");
+            panic!("Score group must resolve to a proxy leaf");
         };
         assert_eq!(node.id, nodes[0].id);
-        let feedback = feedback.expect("Honk route must carry feedback");
+        let feedback = feedback.expect("Score route must carry feedback");
         assert_eq!(
             feedback
                 .attributions()
@@ -1107,30 +1040,29 @@ mod tests {
         let UiRoute::Proxy { node, feedback } =
             decide_route(&ctx, "127.0.0.1", addr.port()).await.unwrap()
         else {
-            panic!("Honk group must resolve to a proxy leaf");
+            panic!("Score group must resolve to a proxy leaf");
         };
         assert_eq!(node.id, nodes[1].id);
         let reporter = feedback.unwrap().start();
         reporter.setup_succeeded();
-        reporter.finish(HonkOutcome::Success);
+        reporter.finish(ScoreOutcome::Success);
 
         let UiRoute::Proxy { node, .. } =
             decide_route(&ctx, "127.0.0.1", addr.port()).await.unwrap()
         else {
-            panic!("Honk group must resolve to a proxy leaf");
+            panic!("Score group must resolve to a proxy leaf");
         };
         assert_eq!(node.id, nodes[0].id);
     }
 
-    #[cfg(feature = "honk-policy")]
     #[tokio::test]
-    async fn direct_honk_ui_route_reports_target_exchange() {
+    async fn direct_score_ui_route_reports_target_exchange() {
         let body = b"direct dashboard".to_vec();
         let addr = spawn_zip_server(body.clone()).await;
         let direct = Config::builtin_direct_node();
         let group = Group {
             name: "ui-direct".into(),
-            policy: GroupPolicy::Honk,
+            policy: GroupPolicy::Score,
             nodes: vec![direct.id],
             ..Default::default()
         };
@@ -1140,7 +1072,7 @@ mod tests {
             ..Default::default()
         };
         let rules = vec![RoutingRule {
-            name: "honk-ui-direct".into(),
+            name: "score-ui-direct".into(),
             condition: RoutingCondition {
                 ip: vec!["127.0.0.1/32".into()],
                 ..Default::default()
@@ -1167,7 +1099,7 @@ mod tests {
         let UiRoute::Direct { feedback } =
             decide_route(&ctx, "127.0.0.1", addr.port()).await.unwrap()
         else {
-            panic!("Honk group must resolve to direct");
+            panic!("Score group must resolve to direct");
         };
         assert_eq!(
             feedback
@@ -1186,8 +1118,11 @@ mod tests {
         let UiRoute::Direct { feedback } =
             decide_route(&ctx, "127.0.0.1", addr.port()).await.unwrap()
         else {
-            panic!("Honk group must still resolve to direct");
+            panic!("Score group must still resolve to direct");
         };
-        feedback.unwrap().start().setup_failed(HonkOutcome::Timeout);
+        feedback
+            .unwrap()
+            .start()
+            .setup_failed(ScoreOutcome::Timeout);
     }
 }

@@ -99,7 +99,6 @@ async fn feedback_does_not_start_while_waiting_for_dial_admission() {
     assert!(!started.load(std::sync::atomic::Ordering::Acquire));
 }
 
-#[cfg(feature = "honk-policy")]
 #[test]
 fn retired_runtime_errors_are_neutral() {
     let generation = honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(&[], 1, None)
@@ -108,8 +107,8 @@ fn retired_runtime_errors_are_neutral() {
     generation.begin_retirement();
 
     assert_eq!(
-        honk_runtime_outcome(&generation, &anyhow::anyhow!("retired")),
-        crate::group::HonkOutcome::Shutdown
+        score_runtime_outcome(&generation, &anyhow::anyhow!("retired")),
+        crate::group::ScoreOutcome::Shutdown
     );
 }
 

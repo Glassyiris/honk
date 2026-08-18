@@ -1,23 +1,18 @@
 use super::*;
-#[cfg(feature = "honk-policy")]
 use honk_outbound::group::{
-    HonkOutcome, HonkReporter, HonkSelectionContext, HonkTarget, SelectionNetwork,
+    ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreTarget, SelectionNetwork,
 };
 
-#[cfg(feature = "honk-policy")]
-type ProbeReporter = Option<HonkReporter>;
-#[cfg(not(feature = "honk-policy"))]
-type ProbeReporter = Option<()>;
+type ProbeReporter = Option<ScoreReporter>;
 #[cfg(test)]
 fn empty_probe_reporter() -> ProbeReporter {
     None
 }
 
-#[cfg(feature = "honk-policy")]
 fn start_probe_feedback(
     manager: &SharedGroupManager,
     node_id: uuid::Uuid,
-    context: HonkSelectionContext,
+    context: ScoreSelectionContext,
 ) -> ProbeReporter {
     manager
         .read()
@@ -25,50 +20,36 @@ fn start_probe_feedback(
         .map(|feedback| feedback.start())
 }
 
-#[cfg(feature = "honk-policy")]
 fn probe_setup(reporter: &ProbeReporter) {
     if let Some(reporter) = reporter {
         reporter.setup_succeeded();
     }
 }
-#[cfg(not(feature = "honk-policy"))]
-fn probe_setup(_: &ProbeReporter) {}
 
-#[cfg(feature = "honk-policy")]
 fn probe_first_response(reporter: &ProbeReporter) {
     if let Some(reporter) = reporter {
         reporter.first_response();
     }
 }
-#[cfg(not(feature = "honk-policy"))]
-fn probe_first_response(_: &ProbeReporter) {}
 
-#[cfg(feature = "honk-policy")]
 fn probe_tx(reporter: &ProbeReporter, bytes: usize) {
     if let Some(reporter) = reporter {
         reporter.tx(bytes as u64);
     }
 }
-#[cfg(not(feature = "honk-policy"))]
-fn probe_tx(_: &ProbeReporter, _: usize) {}
 
-#[cfg(feature = "honk-policy")]
 fn probe_rx(reporter: &ProbeReporter, bytes: usize) {
     if let Some(reporter) = reporter {
         reporter.rx(bytes as u64);
     }
 }
-#[cfg(not(feature = "honk-policy"))]
-fn probe_rx(_: &ProbeReporter, _: usize) {}
 
-#[cfg(feature = "honk-policy")]
-fn probe_finish(reporter: &ProbeReporter, outcome: HonkOutcome) {
+fn probe_finish(reporter: &ProbeReporter, outcome: ScoreOutcome) {
     if let Some(reporter) = reporter {
         reporter.finish(outcome);
     }
 }
 
-#[cfg(feature = "honk-policy")]
 fn target_family(addr: SocketAddr) -> IpVersion {
     if addr.is_ipv6() {
         IpVersion::V6
@@ -77,7 +58,6 @@ fn target_family(addr: SocketAddr) -> IpVersion {
     }
 }
 
-#[cfg(feature = "honk-policy")]
 fn url_port(url: &str) -> u16 {
     let (default, rest) = if let Some(rest) = url.trim().strip_prefix("https://") {
         (443, rest)
@@ -107,14 +87,14 @@ fn url_port(url: &str) -> u16 {
         .unwrap_or(default)
 }
 
-#[cfg(feature = "honk-policy")]
-fn http_probe_context(url: &str, addr: SocketAddr) -> HonkSelectionContext {
+fn http_probe_context(url: &str, addr: SocketAddr) -> ScoreSelectionContext {
     let family = target_family(addr);
     let (host, _) = extract_url_host_path(url).unwrap_or(("", "/"));
-    let target = host
-        .parse::<std::net::IpAddr>()
-        .map_or_else(|_| HonkTarget::domain(host, url_port(url)), |_| addr.into());
-    HonkSelectionContext {
+    let target = host.parse::<std::net::IpAddr>().map_or_else(
+        |_| ScoreTarget::domain(host, url_port(url)),
+        |_| addr.into(),
+    );
+    ScoreSelectionContext {
         network: SelectionNetwork::Tcp,
         probe_domain: ProbeDomain::Tcp,
         target_family: Some(family),
@@ -133,7 +113,6 @@ pub(super) struct ProxyHttpProber {
     proxy_registry: Arc<ProxyRegistry>,
     runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
     check_method: String,
-    #[cfg(feature = "honk-policy")]
     group_manager: SharedGroupManager,
 }
 
@@ -143,14 +122,13 @@ impl ProxyHttpProber {
         proxy_registry: Arc<ProxyRegistry>,
         runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
         check_method: String,
-        #[cfg(feature = "honk-policy")] group_manager: SharedGroupManager,
+        group_manager: SharedGroupManager,
     ) -> Self {
         Self {
             config,
             proxy_registry,
             runtime_registry,
             check_method,
-            #[cfg(feature = "honk-policy")]
             group_manager,
         }
     }
@@ -184,7 +162,6 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
         let check_url = url.to_string();
         let check_method = self.check_method.clone();
         let config = self.config.clone();
-        #[cfg(feature = "honk-policy")]
         let group_manager = self.group_manager.clone();
 
         Box::pin(async move {
@@ -214,11 +191,10 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
             };
             let (runtime, ephemeral) = honk_outbound::urltest::probe_runtime(&generation, &node);
             if !runtime.is_warm_or_stateless() {
-                #[cfg(feature = "honk-policy")]
                 let warm_reporter = start_probe_feedback(
                     &group_manager,
                     node.id,
-                    HonkSelectionContext::aggregate(
+                    ScoreSelectionContext::aggregate(
                         SelectionNetwork::Tcp,
                         ProbeDomain::Tcp,
                         target_family(addr),
@@ -243,23 +219,18 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 };
                 match warmed {
                     Ok(Ok(())) => {
-                        #[cfg(feature = "honk-policy")]
-                        {
-                            probe_setup(&warm_reporter);
-                            probe_finish(&warm_reporter, HonkOutcome::Success);
-                        }
+                        probe_setup(&warm_reporter);
+                        probe_finish(&warm_reporter, ScoreOutcome::Success);
                     }
                     Ok(Err(error)) => {
-                        #[cfg(feature = "honk-policy")]
-                        probe_finish(&warm_reporter, HonkOutcome::from_error(&error));
+                        probe_finish(&warm_reporter, ScoreOutcome::from_error(&error));
                         close_ephemeral(ephemeral).await;
                         return honk_outbound::alive::HttpProbeResult::SetupFailure(format!(
                             "warm failed: {error}"
                         ));
                     }
                     Err(_) => {
-                        #[cfg(feature = "honk-policy")]
-                        probe_finish(&warm_reporter, HonkOutcome::Timeout);
+                        probe_finish(&warm_reporter, ScoreOutcome::Timeout);
                         close_ephemeral(ephemeral).await;
                         return honk_outbound::alive::HttpProbeResult::SetupFailure(
                             "warm timeout".into(),
@@ -268,14 +239,11 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 }
             }
 
-            #[cfg(feature = "honk-policy")]
             let reporter = start_probe_feedback(
                 &group_manager,
                 node.id,
                 http_probe_context(&check_url, addr),
             );
-            #[cfg(not(feature = "honk-policy"))]
-            let reporter = None;
             let start = std::time::Instant::now();
             let attempt = async {
                 let proxy = entry
@@ -291,18 +259,15 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
             close_ephemeral(ephemeral).await;
             match result {
                 Ok(Ok(())) => {
-                    #[cfg(feature = "honk-policy")]
-                    probe_finish(&reporter, HonkOutcome::Success);
+                    probe_finish(&reporter, ScoreOutcome::Success);
                     honk_outbound::alive::HttpProbeResult::WarmSuccess(start.elapsed())
                 }
                 Ok(Err(error)) => {
-                    #[cfg(feature = "honk-policy")]
-                    probe_finish(&reporter, HonkOutcome::from_error(&error));
+                    probe_finish(&reporter, ScoreOutcome::from_error(&error));
                     honk_outbound::alive::HttpProbeResult::ExchangeFailure(error.to_string())
                 }
                 Err(_) => {
-                    #[cfg(feature = "honk-policy")]
-                    probe_finish(&reporter, HonkOutcome::Timeout);
+                    probe_finish(&reporter, ScoreOutcome::Timeout);
                     honk_outbound::alive::HttpProbeResult::ExchangeFailure(
                         "HTTP probe timeout".into(),
                     )
@@ -416,12 +381,11 @@ fn health_https_connector() -> Result<honk_outbound::tls::TlsConnector, String> 
 /// or unresolvable (dae semantics: plain `8.8.8.8:53`).
 const DEFAULT_UDP_CHECK_DNS: &str = "8.8.8.8:53";
 
-#[cfg(feature = "honk-policy")]
 #[derive(Clone)]
 pub(super) struct QuicScoreTarget {
     addr: SocketAddr,
     host: String,
-    identity: HonkTarget,
+    identity: ScoreTarget,
     config: quinn::ClientConfig,
 }
 
@@ -442,11 +406,8 @@ pub(super) struct ProxyUdpProber {
     runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
     stats: Arc<StatsManager>,
     dns_target: SocketAddr,
-    #[cfg(feature = "honk-policy")]
     group_manager: SharedGroupManager,
-    #[cfg(feature = "honk-policy")]
-    dns_identity: HonkTarget,
-    #[cfg(feature = "honk-policy")]
+    dns_identity: ScoreTarget,
     quic_score_target: Option<QuicScoreTarget>,
 }
 
@@ -458,9 +419,9 @@ impl ProxyUdpProber {
         runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
         stats: Arc<StatsManager>,
         dns_target: SocketAddr,
-        #[cfg(feature = "honk-policy")] dns_identity: HonkTarget,
-        #[cfg(feature = "honk-policy")] quic_score_target: Option<QuicScoreTarget>,
-        #[cfg(feature = "honk-policy")] group_manager: SharedGroupManager,
+        dns_identity: ScoreTarget,
+        quic_score_target: Option<QuicScoreTarget>,
+        group_manager: SharedGroupManager,
     ) -> Self {
         Self {
             config,
@@ -468,11 +429,8 @@ impl ProxyUdpProber {
             runtime_registry,
             stats,
             dns_target,
-            #[cfg(feature = "honk-policy")]
             group_manager,
-            #[cfg(feature = "honk-policy")]
             dns_identity,
-            #[cfg(feature = "honk-policy")]
             quic_score_target,
         }
     }
@@ -504,11 +462,8 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
         let config = self.config.clone();
         let stats = self.stats.clone();
         let dns_target = self.dns_target;
-        #[cfg(feature = "honk-policy")]
         let group_manager = self.group_manager.clone();
-        #[cfg(feature = "honk-policy")]
         let dns_identity = self.dns_identity.clone();
-        #[cfg(feature = "honk-policy")]
         let quic_score_target = self.quic_score_target.clone();
 
         Box::pin(async move {
@@ -527,11 +482,10 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                 std::time::Duration::from_millis(config.global.connect_timeout_ms)
             };
             let (runtime, ephemeral) = honk_outbound::urltest::probe_runtime(&generation, &node);
-            #[cfg(feature = "honk-policy")]
             let reporter = start_probe_feedback(
                 &group_manager,
                 node.id,
-                HonkSelectionContext {
+                ScoreSelectionContext {
                     network: SelectionNetwork::Udp,
                     probe_domain: ProbeDomain::DnsUdp,
                     target_family: Some(target_family(dns_target)),
@@ -539,8 +493,6 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                     target: Some(dns_identity),
                 },
             );
-            #[cfg(not(feature = "honk-policy"))]
-            let reporter = None;
             let start = std::time::Instant::now();
             let attempt = async {
                 let transport = packet
@@ -561,22 +513,18 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             let result = tokio::time::timeout(timeout, attempt).await;
             let health_result = match result {
                 Ok(Ok(())) => {
-                    #[cfg(feature = "honk-policy")]
-                    probe_finish(&reporter, HonkOutcome::Success);
+                    probe_finish(&reporter, ScoreOutcome::Success);
                     Ok(start.elapsed())
                 }
                 Ok(Err(error)) => {
-                    #[cfg(feature = "honk-policy")]
-                    probe_finish(&reporter, HonkOutcome::from_error(&error));
+                    probe_finish(&reporter, ScoreOutcome::from_error(&error));
                     Err(format!("UDP probe failed: {error}"))
                 }
                 Err(_) => {
-                    #[cfg(feature = "honk-policy")]
-                    probe_finish(&reporter, HonkOutcome::Timeout);
+                    probe_finish(&reporter, ScoreOutcome::Timeout);
                     Err("UDP probe timeout".to_string())
                 }
             };
-            #[cfg(feature = "honk-policy")]
             if let Some(target) = quic_score_target.as_ref() {
                 score_quic_probe(
                     &packet,
@@ -623,10 +571,9 @@ async fn udp_probe_exchange(
     Ok(())
 }
 
-#[cfg(feature = "honk-policy")]
-pub(super) fn quic_probe_context(target: &QuicScoreTarget) -> HonkSelectionContext {
+pub(super) fn quic_probe_context(target: &QuicScoreTarget) -> ScoreSelectionContext {
     let family = target_family(target.addr);
-    HonkSelectionContext {
+    ScoreSelectionContext {
         network: SelectionNetwork::Udp,
         probe_domain: ProbeDomain::DataUdp,
         target_family: Some(family),
@@ -635,7 +582,6 @@ pub(super) fn quic_probe_context(target: &QuicScoreTarget) -> HonkSelectionConte
     }
 }
 
-#[cfg(feature = "honk-policy")]
 #[allow(clippy::too_many_arguments)]
 async fn score_quic_probe(
     packet: &Arc<dyn honk_outbound::proxy::PacketOutbound>,
@@ -652,8 +598,8 @@ async fn score_quic_probe(
     };
     let reporter = Some(reporter);
     let target_domain = match &target.identity {
-        HonkTarget::Domain { .. } => Some(target.host.as_str()),
-        HonkTarget::Socket(_) => None,
+        ScoreTarget::Domain { .. } => Some(target.host.as_str()),
+        ScoreTarget::Socket(_) => None,
     };
     let attempt = async {
         let transport = packet
@@ -676,10 +622,10 @@ async fn score_quic_probe(
             // bidirectional fact so it contributes reliability, not volume.
             probe_tx(&reporter, 1);
             probe_rx(&reporter, 1);
-            probe_finish(&reporter, HonkOutcome::Success);
+            probe_finish(&reporter, ScoreOutcome::Success);
         }
-        Ok(Err(error)) => probe_finish(&reporter, HonkOutcome::from_error(&error)),
-        Err(_) => probe_finish(&reporter, HonkOutcome::Timeout),
+        Ok(Err(error)) => probe_finish(&reporter, ScoreOutcome::from_error(&error)),
+        Err(_) => probe_finish(&reporter, ScoreOutcome::Timeout),
     }
 }
 
@@ -751,8 +697,7 @@ pub(super) async fn resolve_udp_check_target(
     fallback
 }
 
-#[cfg(feature = "honk-policy")]
-pub(super) fn udp_probe_identity(raws: &[String], resolved: SocketAddr) -> HonkTarget {
+pub(super) fn udp_probe_identity(raws: &[String], resolved: SocketAddr) -> ScoreTarget {
     let entries: Vec<&str> = raws
         .iter()
         .map(|raw| raw.trim())
@@ -771,18 +716,17 @@ pub(super) fn udp_probe_identity(raws: &[String], resolved: SocketAddr) -> HonkT
             .rsplit_once(':')
             .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, port)))
             .unwrap_or((raw, 53));
-        return HonkTarget::domain(host, port);
+        return ScoreTarget::domain(host, port);
     }
     resolved.into()
 }
 
-#[cfg(feature = "honk-policy")]
 pub(super) async fn resolve_quic_score_target(
     url: &str,
     resolver: Option<crate::outbound::ResolveHook>,
 ) -> Option<QuicScoreTarget> {
     if !url.trim().starts_with("https://") {
-        warn!("Honk QUIC scoring disabled: tcp_check_url is not HTTPS");
+        warn!("Score QUIC probe disabled: tcp_check_url is not HTTPS");
         return None;
     }
     let (host, _) = extract_url_host_path(url)?;
@@ -802,13 +746,13 @@ pub(super) async fn resolve_quic_score_target(
     let addr = match addrs.into_iter().next() {
         Some(addr) => addr,
         None => {
-            warn!("Honk QUIC scoring disabled: tcp_check_url host did not resolve");
+            warn!("Score QUIC probe disabled: tcp_check_url host did not resolve");
             return None;
         }
     };
     let identity = host
         .parse::<std::net::IpAddr>()
-        .map_or_else(|_| HonkTarget::domain(&host, port), |_| addr.into());
+        .map_or_else(|_| ScoreTarget::domain(&host, port), |_| addr.into());
     let tls_node = Node {
         sni: Some(host.clone()),
         skip_cert_verify: true,
@@ -823,11 +767,11 @@ pub(super) async fn resolve_quic_score_target(
     {
         Ok(config) => config,
         Err(error) => {
-            warn!("Honk QUIC scoring disabled: failed to build QUIC client: {error:#}");
+            warn!("Score QUIC probe disabled: failed to build QUIC client: {error:#}");
             return None;
         }
     };
-    info!(host, %addr, "Honk QUIC scoring probe enabled");
+    info!(host, %addr, "Score QUIC probe enabled");
     Some(QuicScoreTarget {
         addr,
         host,

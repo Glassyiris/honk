@@ -64,8 +64,6 @@ impl ControlPlane {
             (preconnect_candidates(&config, &manager, count), manager)
         };
         drop(config);
-        #[cfg(not(feature = "honk-policy"))]
-        drop(manager);
 
         if !nodes.is_empty() {
             let node_count = nodes.len();
@@ -75,10 +73,9 @@ impl ControlPlane {
             let handle = tokio::spawn(async move {
                 let mut set = tokio::task::JoinSet::new();
                 for node in nodes {
-                    #[cfg(feature = "honk-policy")]
                     let feedback = manager.feedback_for_node(
                         node.id,
-                        crate::group::HonkSelectionContext::aggregate(
+                        crate::group::ScoreSelectionContext::aggregate(
                             crate::group::SelectionNetwork::Tcp,
                             ProbeDomain::Tcp,
                             IpVersion::V4,
@@ -90,39 +87,33 @@ impl ControlPlane {
                     let sem = semaphore.clone();
                     set.spawn(async move {
                         let _permit = sem.acquire_owned().await;
-                        #[cfg(feature = "honk-policy")]
                         let reporter = feedback.map(|feedback| feedback.start());
                         match honk_outbound::util::connect_outbound(&addr, connect_timeout).await {
                             Ok(stream) if is_tcp_stream_alive(&stream) => {
-                                #[cfg(feature = "honk-policy")]
                                 if let Some(reporter) = &reporter {
                                     reporter.setup_succeeded();
                                 }
                                 pool.deposit_tcp(&addr, stream).await;
                                 stats.mark_warm(node.id, crate::stats::WarmReason::Preconnect);
-                                #[cfg(feature = "honk-policy")]
                                 if let Some(reporter) = &reporter {
-                                    reporter.finish(crate::group::HonkOutcome::Success);
+                                    reporter.finish(crate::group::ScoreOutcome::Success);
                                 }
                                 debug!("Preconnect warmup: deposited connection to {}", addr);
                             }
-                            Ok(_) =>
-                            {
-                                #[cfg(feature = "honk-policy")]
+                            Ok(_) => {
                                 if let Some(reporter) = &reporter {
-                                    reporter.setup_failed(crate::group::HonkOutcome::Io(
+                                    reporter.setup_failed(crate::group::ScoreOutcome::Io(
                                         io::ErrorKind::ConnectionAborted,
                                     ));
                                 }
                             }
                             Err(error) => {
-                                #[cfg(feature = "honk-policy")]
                                 if let Some(reporter) = &reporter {
                                     reporter.setup_failed(
                                         if error.kind() == io::ErrorKind::TimedOut {
-                                            crate::group::HonkOutcome::Timeout
+                                            crate::group::ScoreOutcome::Timeout
                                         } else {
-                                            crate::group::HonkOutcome::Io(error.kind())
+                                            crate::group::ScoreOutcome::Io(error.kind())
                                         },
                                     );
                                 }

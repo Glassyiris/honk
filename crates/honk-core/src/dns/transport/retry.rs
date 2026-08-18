@@ -1,37 +1,38 @@
 use std::future::Future;
 
-#[cfg(feature = "honk-policy")]
 pub(super) async fn exchange_with_retry<Once, Fut, Reset, ResetFut>(
     label: &'static str,
     raw_query: &[u8],
     once: Once,
     reset: Reset,
-    feedback: Option<&honk_outbound::group::HonkFeedback>,
+    feedback: Option<&honk_outbound::group::ScoreFeedback>,
 ) -> anyhow::Result<Vec<u8>>
 where
-    Once: Fn(Option<honk_outbound::group::HonkReporter>) -> Fut,
+    Once: Fn(Option<honk_outbound::group::ScoreReporter>) -> Fut,
     Fut: Future<Output = anyhow::Result<Vec<u8>>>,
     Reset: FnOnce() -> ResetFut,
     ResetFut: Future<Output = ()>,
 {
     async fn attempt<Once, Fut>(
         once: &Once,
-        feedback: Option<&honk_outbound::group::HonkFeedback>,
+        feedback: Option<&honk_outbound::group::ScoreFeedback>,
         raw_query: &[u8],
     ) -> anyhow::Result<Vec<u8>>
     where
-        Once: Fn(Option<honk_outbound::group::HonkReporter>) -> Fut,
+        Once: Fn(Option<honk_outbound::group::ScoreReporter>) -> Fut,
         Fut: Future<Output = anyhow::Result<Vec<u8>>>,
     {
-        let reporter = feedback.map(honk_outbound::group::HonkFeedback::start);
+        let reporter = feedback.map(honk_outbound::group::ScoreFeedback::start);
         let result = once(reporter.clone()).await;
         if let Some(reporter) = &reporter {
             match &result {
                 Ok(response) if super::is_valid_response(raw_query, response) => {
-                    reporter.finish(honk_outbound::group::HonkOutcome::Success)
+                    reporter.finish(honk_outbound::group::ScoreOutcome::Success)
                 }
-                Ok(_) => reporter.finish(honk_outbound::group::HonkOutcome::Other),
-                Err(error) => reporter.finish(honk_outbound::group::HonkOutcome::from_error(error)),
+                Ok(_) => reporter.finish(honk_outbound::group::ScoreOutcome::Other),
+                Err(error) => {
+                    reporter.finish(honk_outbound::group::ScoreOutcome::from_error(error))
+                }
             }
         }
         result
@@ -43,31 +44,6 @@ where
             record_reset(label);
             reset().await;
             attempt(&once, feedback, raw_query).await.map_err(|error| {
-                anyhow::anyhow!("{label} failed after retry: {error} (first: {first})")
-            })
-        }
-    }
-}
-
-#[cfg(not(feature = "honk-policy"))]
-pub(super) async fn exchange_with_retry<Once, Fut, Reset, ResetFut>(
-    label: &'static str,
-    _raw_query: &[u8],
-    once: Once,
-    reset: Reset,
-) -> anyhow::Result<Vec<u8>>
-where
-    Once: Fn() -> Fut,
-    Fut: Future<Output = anyhow::Result<Vec<u8>>>,
-    Reset: FnOnce() -> ResetFut,
-    ResetFut: Future<Output = ()>,
-{
-    match once().await {
-        Ok(response) => Ok(response),
-        Err(first) => {
-            record_reset(label);
-            reset().await;
-            once().await.map_err(|error| {
                 anyhow::anyhow!("{label} failed after retry: {error} (first: {first})")
             })
         }
@@ -120,7 +96,6 @@ mod tests {
             .finish();
         let _subscriber = tracing::subscriber::set_default(subscriber);
 
-        #[cfg(feature = "honk-policy")]
         let response = super::exchange_with_retry(
             "test",
             &[0; 12],
@@ -134,22 +109,6 @@ mod tests {
                 resets.fetch_add(1, Ordering::SeqCst);
             },
             None,
-        )
-        .await
-        .expect("retry succeeds");
-        #[cfg(not(feature = "honk-policy"))]
-        let response = super::exchange_with_retry(
-            "test",
-            &[0; 12],
-            || async {
-                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                    anyhow::bail!("secret endpoint value")
-                }
-                Ok(vec![1, 2, 3])
-            },
-            || async {
-                resets.fetch_add(1, Ordering::SeqCst);
-            },
         )
         .await
         .expect("retry succeeds");

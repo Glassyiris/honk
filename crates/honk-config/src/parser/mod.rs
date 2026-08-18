@@ -42,7 +42,7 @@ pub fn parse_dae_config_file(path: impl AsRef<Path>) -> Result<Config, crate::Co
 
     match parse_dae_config(&input) {
         Ok(config) => Ok(config),
-        Err(err @ crate::ConfigError::UnsupportedFeature(_)) => Err(err),
+        Err(err @ crate::ConfigError::UnsupportedPolicy(_)) => Err(err),
         Err(err) if loader.saw_include => Err(crate::ConfigError::Include(format!(
             "failed to parse configuration after resolving includes: {err}"
         ))),
@@ -1674,11 +1674,9 @@ fn parse_group_policy(policy: &str) -> Result<crate::group::GroupPolicy, crate::
             Ok(crate::group::GroupPolicy::LoadBalance)
         }
         "fallback" => Ok(crate::group::GroupPolicy::Fallback),
-        #[cfg(feature = "honk-policy")]
-        "honk" => Ok(crate::group::GroupPolicy::Honk),
-        #[cfg(not(feature = "honk-policy"))]
-        "honk" => Err(crate::ConfigError::UnsupportedFeature(
-            "group policy 'honk' requires the 'honk-policy' Cargo feature".into(),
+        "score" => Ok(crate::group::GroupPolicy::Score),
+        "honk" => Err(crate::ConfigError::UnsupportedPolicy(
+            "group policy 'honk' was renamed to 'score'".into(),
         )),
         _ => Ok(crate::group::GroupPolicy::Selector),
     }

@@ -1,17 +1,19 @@
 use super::*;
-#[cfg(feature = "honk-policy")]
-use crate::group::{HonkOutcome, HonkReporter, HonkSelectionContext, SelectionNetwork};
+use crate::group::{ScoreOutcome, ScoreReporter, ScoreSelectionContext, SelectionNetwork};
 
-#[cfg(feature = "honk-policy")]
 impl AliveDialerSet {
-    fn raw_probe_reporter(&self, node_id: Uuid, ipver: IpVersion) -> Option<HonkReporter> {
-        self.honk_feedback
+    fn raw_probe_reporter(&self, node_id: Uuid, ipver: IpVersion) -> Option<ScoreReporter> {
+        self.score_feedback
             .read()
             .as_ref()
             .and_then(|factory| {
                 factory(
                     node_id,
-                    HonkSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, ipver),
+                    ScoreSelectionContext::aggregate(
+                        SelectionNetwork::Tcp,
+                        ProbeDomain::Tcp,
+                        ipver,
+                    ),
                 )
             })
             .map(|feedback| feedback.start())
@@ -356,7 +358,6 @@ impl AliveDialerSet {
                 IpVersion::V6
             };
 
-            #[cfg(feature = "honk-policy")]
             let reporter = self.raw_probe_reporter(node_id, ipver);
 
             let start = Instant::now();
@@ -369,10 +370,9 @@ impl AliveDialerSet {
 
             match result {
                 Ok(Ok(_stream)) => {
-                    #[cfg(feature = "honk-policy")]
                     if let Some(reporter) = &reporter {
                         reporter.setup_succeeded();
-                        reporter.finish(HonkOutcome::Success);
+                        reporter.finish(ScoreOutcome::Success);
                     }
                     tracing::debug!(
                         "Health check probe succeeded for node '{}' via {} ({}ms)",
@@ -384,12 +384,11 @@ impl AliveDialerSet {
                     any_ok = true;
                 }
                 Ok(Err(e)) => {
-                    #[cfg(feature = "honk-policy")]
                     if let Some(reporter) = &reporter {
                         reporter.finish(if e.kind() == std::io::ErrorKind::TimedOut {
-                            HonkOutcome::Timeout
+                            ScoreOutcome::Timeout
                         } else {
-                            HonkOutcome::Io(e.kind())
+                            ScoreOutcome::Io(e.kind())
                         });
                     }
                     tracing::debug!(
@@ -401,9 +400,8 @@ impl AliveDialerSet {
                     self.mark_dead_for(node_id, ProbeDomain::Tcp, ipver);
                 }
                 Err(_) => {
-                    #[cfg(feature = "honk-policy")]
                     if let Some(reporter) = &reporter {
-                        reporter.finish(HonkOutcome::Timeout);
+                        reporter.finish(ScoreOutcome::Timeout);
                     }
                     tracing::debug!(
                         "Health check probe timed out for node '{}' via {} after {:?}",
