@@ -6,7 +6,6 @@
 //! and returns the result.  It also supports background prefetch to
 //! warm the cache for frequently-accessed domains.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,7 +19,7 @@ use super::engine::{DnsEngine, EngineError};
 use super::policy::PolicyId;
 use super::response::ResponseError;
 use super::routing::DnsRouter;
-use honk_config::dns::{DnsConfig, DnsStrategy};
+use honk_config::dns::{DnsConfig, DnsStrategy, SYSTEM_HOSTS_PATH};
 
 /// Abstraction over a pool of DNS upstream servers.
 ///
@@ -177,35 +176,25 @@ impl DnsForwarder {
         Ok(self.with_policy_id(policy_id))
     }
 
-    pub(crate) fn with_hosts_from_config(self, config: &DnsConfig) -> anyhow::Result<Self> {
-        let custom_rules = !config.hosts_file.is_empty();
-        let configured_path = if custom_rules {
-            config.hosts_file.as_str()
-        } else {
-            hosts::SYSTEM_HOSTS_PATH
-        };
-        self.with_hosts_file(config.use_host, configured_path, custom_rules)
-    }
-
-    fn with_hosts_file(
-        mut self,
-        enabled: bool,
-        path: impl AsRef<Path>,
-        custom_rules: bool,
-    ) -> anyhow::Result<Self> {
-        if !enabled {
+    pub(crate) fn with_hosts_from_config(mut self, config: &DnsConfig) -> anyhow::Result<Self> {
+        if config.hosts.is_empty() {
             self.hosts = None;
             return Ok(self);
         }
-        let path = honk_config::paths::resolve_dependency_path(path);
-        let hosts = if custom_rules {
-            hosts::HostsFile::load_rules(&path)
-        } else {
-            hosts::HostsFile::load(&path)
+
+        let mut hosts = hosts::HostsFile::default();
+        for source in &config.hosts {
+            let path = honk_config::paths::resolve_dependency_path(source);
+            let loaded = if source == SYSTEM_HOSTS_PATH {
+                hosts::HostsFile::load(&path)
+            } else {
+                hosts::HostsFile::load_rules(&path)
+            }
+            .with_context(|| format!("failed to load DNS hosts file {}", path.display()))?;
+            hosts.merge(loaded);
         }
-        .with_context(|| format!("failed to load DNS hosts file {}", path.display()))?;
         tracing::info!(
-            path = %path.display(),
+            sources = config.hosts.len(),
             hostnames = hosts.len(),
             addresses = hosts.address_count(),
             "Loaded DNS hosts snapshot"

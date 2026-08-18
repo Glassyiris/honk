@@ -107,8 +107,7 @@ async fn public_runtime_reload_replaces_hosts_snapshot_and_rejects_invalid_file(
     {
         let config_handle = control.config_handle();
         let mut active = config_handle.write().await;
-        active.dns.use_host = true;
-        active.dns.hosts_file = file.path().to_string_lossy().into_owned();
+        active.dns.hosts = vec![file.path().to_string_lossy().into_owned()];
     }
     control
         .merge_subscription_nodes(subscription_id, vec![])

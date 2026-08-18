@@ -688,24 +688,27 @@ fn merge_top_level_sections(sections: Vec<Section>) -> Vec<Section> {
     merged
 }
 
+fn parse_kv_pair(line: &str) -> Option<(&str, &str)> {
+    let trimmed = strip_unquoted_comment(line.trim()).trim();
+    let (key, value) = trimmed.split_once(':')?;
+    Some((
+        key.trim(),
+        value.trim().trim_matches('\'').trim_matches('"'),
+    ))
+}
+
 fn parse_kv_pairs(body: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for line in body.lines() {
-        let trimmed = strip_unquoted_comment(line.trim()).trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some(pos) = trimmed.find(':') {
-            let key = trimmed[..pos].trim().to_string();
-            let val = trimmed[pos + 1..]
-                .trim()
-                .trim_matches('\'')
-                .trim_matches('"')
-                .to_string();
-            map.insert(key, val);
-        }
-    }
-    map
+    body.lines()
+        .filter_map(parse_kv_pair)
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+}
+
+fn parse_kv_values<'a>(body: &'a str, wanted: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    body.lines()
+        .filter_map(parse_kv_pair)
+        .filter(move |(key, _)| *key == wanted)
+        .map(|(_, value)| value)
 }
 
 fn strip_unquoted_comment(line: &str) -> &str {
@@ -868,17 +871,20 @@ fn parse_dns_section(section: &Section) -> Result<DnsConfig, crate::ConfigError>
         split_nested_sections(&section.body, &["upstream", "routing", "fixed_domain_ttl"])?;
     let mut cfg = DnsConfig::default();
     let mut saw_upstream = false;
-    let kv = parse_kv_pairs(dns_subs.first().map(|s| s.body.as_str()).unwrap_or(""));
+    let dns_body = dns_subs.first().map(|s| s.body.as_str()).unwrap_or("");
+    let kv = parse_kv_pairs(dns_body);
     if let Some(bind) = kv.get("bind") {
         cfg.bind.clone_from(bind);
         cfg.bind_endpoint()
             .map_err(|error| crate::ConfigError::Parse(error.to_string()))?;
     }
-    if let Some(v) = kv.get("use_host") {
-        cfg.use_host = parse_bool(v);
+    if kv.contains_key("hosts_file") {
+        return Err(crate::ConfigError::Parse(
+            "dns.hosts_file was removed; use one or more use_host paths".into(),
+        ));
     }
-    if let Some(value) = kv.get("hosts_file") {
-        cfg.hosts_file.clone_from(value);
+    for source in parse_kv_values(dns_body, "use_host") {
+        crate::dns::push_host_source(&mut cfg.hosts, source);
     }
     if let Some(value) = kv.get("client_subnet") {
         cfg.client_subnet.clone_from(value);

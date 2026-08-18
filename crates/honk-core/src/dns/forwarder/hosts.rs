@@ -17,7 +17,6 @@ use crate::dns::outcome::DnsOutcome;
 use super::response::make_address_response;
 use super::{DnsForwardError, DnsForwarder, ResolveMode};
 
-pub(super) const SYSTEM_HOSTS_PATH: &str = "/etc/hosts";
 const HOSTS_TTL_SECS: u32 = 60;
 
 #[derive(Debug, Default)]
@@ -57,6 +56,15 @@ impl HostsFile {
 
     pub(super) fn load_rules(path: &Path) -> io::Result<Self> {
         fs::read_to_string(path).and_then(|contents| Self::parse_rules(&contents))
+    }
+
+    pub(super) fn merge(&mut self, other: Self) {
+        for (hostname, addresses) in other.entries {
+            self.entries.insert(hostname, addresses);
+        }
+        for rule in other.rules {
+            self.insert_rule(rule.matcher, rule.addresses);
+        }
     }
 
     fn parse(contents: &str) -> Self {
@@ -311,11 +319,12 @@ mod tests {
     ) -> DnsForwarder {
         let router = Arc::new(DnsRouter::new_from_dns_config(config).expect("DNS router"));
         let upstream: Arc<dyn DnsUpstreamPool> = upstream;
-        DnsForwarder::new(upstream, Arc::new(Mutex::new(DnsCache::new(100))), router)
-            .with_policy_from_config(config)
-            .expect("DNS policy")
-            .with_hosts_file(config.use_host, path, false)
-            .expect("hosts snapshot")
+        let mut forwarder =
+            DnsForwarder::new(upstream, Arc::new(Mutex::new(DnsCache::new(100))), router)
+                .with_policy_from_config(config)
+                .expect("DNS policy");
+        forwarder.hosts = Some(Arc::new(HostsFile::load(path).expect("hosts snapshot")));
+        forwarder
     }
 
     #[test]
@@ -432,10 +441,7 @@ mod tests {
     async fn hosts_answers_a_and_aaaa_before_request_reject() {
         let file = hosts_file("192.0.2.10 service.test\n2001:db8::10 service.test\n");
         let upstream = Arc::new(CountingUpstream::default());
-        let mut config = DnsConfig {
-            use_host: true,
-            ..Default::default()
-        };
+        let mut config = DnsConfig::default();
         config.routing.request.rules = vec![DnsRequestRule {
             conditions: vec![DnsCond::Qname {
                 not: false,
@@ -473,10 +479,7 @@ mod tests {
     async fn known_name_family_miss_is_nodata_but_other_queries_use_upstream() {
         let file = hosts_file("192.0.2.20 ipv4-only.test\n");
         let upstream = Arc::new(CountingUpstream::default());
-        let config = DnsConfig {
-            use_host: true,
-            ..Default::default()
-        };
+        let config = DnsConfig::default();
         let forwarder = test_forwarder(file.path(), &config, Arc::clone(&upstream));
 
         let family_miss = forwarder
@@ -502,10 +505,7 @@ mod tests {
     async fn rebuilt_forwarder_loads_a_new_snapshot_without_mutating_the_old_one() {
         let file = hosts_file("192.0.2.30 reload.test\n");
         let upstream = Arc::new(CountingUpstream::default());
-        let config = DnsConfig {
-            use_host: true,
-            ..Default::default()
-        };
+        let config = DnsConfig::default();
         let old = test_forwarder(file.path(), &config, Arc::clone(&upstream));
 
         std::fs::write(file.path(), "192.0.2.31 reload.test\n").expect("replace hosts file");
@@ -525,21 +525,52 @@ mod tests {
         assert_eq!(upstream.calls.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn configured_sources_merge_in_order() {
+        let first = hosts_file("full:first.test 192.0.2.40\nfull:override.test 192.0.2.41\n");
+        let second = hosts_file("full:second.test 192.0.2.42\nfull:override.test 192.0.2.43\n");
+        let config = DnsConfig {
+            hosts: vec![
+                first.path().to_string_lossy().into_owned(),
+                second.path().to_string_lossy().into_owned(),
+            ],
+            ..Default::default()
+        };
+        let router = Arc::new(DnsRouter::new_from_dns_config(&config).expect("DNS router"));
+        let upstream: Arc<dyn DnsUpstreamPool> = Arc::new(CountingUpstream::default());
+        let forwarder =
+            DnsForwarder::new(upstream, Arc::new(Mutex::new(DnsCache::new(100))), router)
+                .with_hosts_from_config(&config)
+                .expect("merged hosts snapshot");
+
+        for (domain, last) in [
+            ("first.test", 40),
+            ("second.test", 42),
+            ("override.test", 43),
+        ] {
+            let outcome = forwarder
+                .resolve_outcome(&build_dns_query(domain, 1))
+                .await
+                .expect("hosts outcome");
+            assert_eq!(
+                outcome.answer_ips(),
+                &[IpAddr::V4(Ipv4Addr::new(192, 0, 2, last))]
+            );
+        }
+    }
+
     #[test]
     fn enabled_hosts_load_failure_is_fatal_but_disabled_hosts_skips_io() {
         let directory = tempdir().expect("temporary directory");
         let missing = directory.path().join("missing-hosts");
-        let mut config = DnsConfig {
-            hosts_file: missing.to_string_lossy().into_owned(),
-            ..Default::default()
-        };
+        let mut config = DnsConfig::default();
         let router = Arc::new(DnsRouter::new_from_dns_config(&config).expect("DNS router"));
         let upstream: Arc<dyn DnsUpstreamPool> = Arc::new(CountingUpstream::default());
         let forwarder =
             DnsForwarder::new(upstream, Arc::new(Mutex::new(DnsCache::new(100))), router);
 
         assert!(forwarder.clone().with_hosts_from_config(&config).is_ok());
-        config.use_host = true;
+        config.hosts.push(missing.to_string_lossy().into_owned());
         assert!(forwarder.with_hosts_from_config(&config).is_err());
     }
 }

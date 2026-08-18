@@ -229,7 +229,7 @@ fn listener_bind_does_not_change_resolution_policy_identity() {
 fn hosts_lookup_does_not_change_upstream_cache_identity() {
     let base = representative_config();
     let mut with_hosts = base.clone();
-    with_hosts.use_host = true;
+    with_hosts.hosts.push("/etc/hosts".into());
 
     // Hosts answers bypass the cache before routing; non-host upstream policy is unchanged.
     assert_eq!(

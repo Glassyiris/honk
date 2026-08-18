@@ -194,19 +194,70 @@ impl DnsClientSubnetError {
     }
 }
 
+/// Default source selected by `dns.use_host: true`.
+pub const SYSTEM_HOSTS_PATH: &str = "/etc/hosts";
+
+pub(crate) fn push_host_source(sources: &mut Vec<String>, value: &str) {
+    let value = value.trim();
+    let path = if ["true", "yes", "1", "on"]
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
+    {
+        SYSTEM_HOSTS_PATH
+    } else if value.is_empty()
+        || ["false", "no", "0", "off"]
+            .iter()
+            .any(|candidate| value.eq_ignore_ascii_case(candidate))
+    {
+        return;
+    } else {
+        value
+    };
+    if !sources.iter().any(|source| source == path) {
+        sources.push(path.to_owned());
+    }
+}
+
+fn deserialize_host_sources<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum HostSources {
+        Enabled(bool),
+        One(String),
+        Many(Vec<String>),
+    }
+
+    let mut sources = Vec::new();
+    match HostSources::deserialize(deserializer)? {
+        HostSources::Enabled(enabled) => {
+            push_host_source(&mut sources, if enabled { "true" } else { "false" });
+        }
+        HostSources::One(source) => push_host_source(&mut sources, &source),
+        HostSources::Many(values) => {
+            for source in values {
+                push_host_source(&mut sources, &source);
+            }
+        }
+    }
+    Ok(sources)
+}
+
 /// DNS configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsConfig {
     /// Standalone DNS listener endpoint. Empty disables the listener.
     #[serde(default)]
     pub bind: String,
-    /// Resolve A/AAAA queries from a generation-pinned hosts snapshot before DNS routing.
-    #[serde(default)]
-    pub use_host: bool,
-    /// OxiDNS-compatible rule file used instead of `/etc/hosts` when set.
-    /// Relative paths resolve through `global.data_dir`.
-    #[serde(default)]
-    pub hosts_file: String,
+    /// Ordered hosts sources loaded into one generation-pinned snapshot.
+    #[serde(
+        default,
+        rename = "use_host",
+        deserialize_with = "deserialize_host_sources"
+    )]
+    pub hosts: Vec<String>,
     /// EDNS Client Subnet preset or automatic first-public-hop inference.
     #[serde(default)]
     pub client_subnet: String,
@@ -667,8 +718,7 @@ impl Default for DnsConfig {
     fn default() -> Self {
         Self {
             bind: String::new(),
-            use_host: false,
-            hosts_file: String::new(),
+            hosts: Vec::new(),
             client_subnet: String::new(),
             resolved_client_subnet: None,
             upstream: vec![DnsUpstream {
@@ -838,17 +888,17 @@ mod tests {
     }
 
     #[test]
-    fn hosts_settings_are_serde_defaulted_and_configurable() {
-        let defaults = DnsConfig::default();
-        assert!(!defaults.use_host);
-        assert!(defaults.hosts_file.is_empty());
+    fn hosts_sources_are_serde_defaulted_and_accept_legacy_true() {
+        assert!(DnsConfig::default().hosts.is_empty());
 
-        let parsed = serde_json::from_str::<DnsConfig>(
-            r#"{"use_host":true,"hosts_file":"/etc/honk/hosts.txt"}"#,
+        let enabled = serde_json::from_str::<DnsConfig>(r#"{"use_host":true}"#).unwrap();
+        assert_eq!(enabled.hosts, [SYSTEM_HOSTS_PATH]);
+
+        let sources = serde_json::from_str::<DnsConfig>(
+            r#"{"use_host":["/etc/hosts","rules.txt","rules.txt"]}"#,
         )
         .unwrap();
-        assert!(parsed.use_host);
-        assert_eq!(parsed.hosts_file, "/etc/honk/hosts.txt");
+        assert_eq!(sources.hosts, ["/etc/hosts", "rules.txt"]);
     }
 
     /// Regression: a `[dns]` section without `cache` must still get the

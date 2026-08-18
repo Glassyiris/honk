@@ -1337,30 +1337,34 @@ fn test_parse_dns_zero_max_cache_size_is_preserved_for_runtime_clamp() {
 }
 
 #[test]
-fn hosts_settings_default_off_and_parse_dae_values() {
-    let defaults = parse_dae_config("dns {}").unwrap().dns;
-    assert!(!defaults.use_host);
-    assert!(defaults.hosts_file.is_empty());
+fn hosts_sources_default_off_and_collect_repeated_values() {
+    assert!(parse_dae_config("dns {}").unwrap().dns.hosts.is_empty());
 
-    let custom =
-        parse_dae_config("dns {\n    use_host: true\n    hosts_file: '/etc/honk/hosts.txt'\n}")
-            .unwrap()
-            .dns;
-    assert!(custom.use_host);
-    assert_eq!(custom.hosts_file, "/etc/honk/hosts.txt");
+    let custom = parse_dae_config(
+        "dns {\n    use_host: true\n    use_host: 'rules-one.txt'\n    use_host: false\n    use_host: \"rules-two.txt\"\n    use_host: 'rules-one.txt'\n}",
+    )
+    .unwrap()
+    .dns;
+    assert_eq!(
+        custom.hosts,
+        ["/etc/hosts", "rules-one.txt", "rules-two.txt"]
+    );
 
-    assert!(
+    assert_eq!(
         parse_dae_config("dns {\n    use_host: on\n}")
             .unwrap()
             .dns
-            .use_host
+            .hosts,
+        ["/etc/hosts"]
     );
     assert!(
-        !parse_dae_config("dns {\n    use_host: false\n}")
+        parse_dae_config("dns {\n    use_host: false\n}")
             .unwrap()
             .dns
-            .use_host
+            .hosts
+            .is_empty()
     );
+    assert!(parse_dae_config("dns {\n    hosts_file: 'rules.txt'\n}").is_err());
 }
 
 #[test]

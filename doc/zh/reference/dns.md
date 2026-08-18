@@ -7,8 +7,7 @@
 | 键 | 默认值 | 含义 |
 | --- | --- | --- |
 | `bind` | 省略 / `""` | 可选的独立 DNS 监听器；空值只关闭此监听器。 |
-| `use_host` | `false` | 使用每个 DNS runtime generation 对应的一份 `/etc/hosts` 快照应答匹配的 IN class A/AAAA 查询。 |
-| `hosts_file` | 省略 / `""` | 与 `use_host` 配合，以 OxiDNS 兼容的 hosts 规则文件替代 `/etc/hosts`。 |
+| `use_host` | `false` | 可重复的 hosts 来源：`true` 选择 `/etc/hosts`；路径选择 OxiDNS 兼容规则文件。 |
 | `client_subnet` | 省略 / `""` | 可选的 EDNS Client Subnet preset：IPv4、IPv4 CIDR、`auto` 或 `auto(IPv4)`。 |
 | `upstream { ... }` | `default: 'udp://223.5.5.5:53'` | 命名上游服务器。第一个显式 `upstream` 块会替换内置条目。 |
 | `routing { ... }` | 无规则；request fallback 为 `default`；response fallback 为 `accept` | 有序的 request 与 response 路由。 |
@@ -36,15 +35,24 @@
 
 监听器归进程所有。SIGHUP 重载接受语义等价的不同写法，但 host、port 或 transport 集合的任何变化都会作为 restart-required 被拒绝。通配或 LAN 侧 bind 会暴露一个无认证的递归 resolver；必须用主机防火墙限制来源，绝不能发布到不可信网络。
 
-## Hosts 快照（`use_host`、`hosts_file`）
+## Hosts 快照（`use_host`）
 
-`use_host: true` 时，honk 会在构建每个 DNS runtime generation 时读取一个 hosts 来源。`hosts_file` 为空时读取标准 `IP 规范名 别名...` 格式的 `/etc/hosts`；非空时读取 OxiDNS 兼容的 `matcher IP...` 规则文件。绝对路径保持原样；相对路径解析到 `global.data_dir` 下，但仍兼容已经存在于旧工作目录中的文件。查询路径只使用生成的不可变快照，不执行文件 I/O。
+`use_host` 可以重复配置。`true` 会按标准 `IP 规范名 别名...` 格式加入 `/etc/hosts`；`false` 不加入来源；每个路径会按 OxiDNS 兼容的 `matcher IP...` 规则文件加载。所有来源按声明顺序各读取一次并合并为一个快照；后面的来源会覆盖前面来源中相同的精确名称或 matcher。重复路径只加载一次。
+
+```dae
+dns {
+    use_host: true
+    use_host: 'hosts.txt'
+}
+```
+
+绝对路径保持原样。相对路径解析到 `global.data_dir` 下，但仍兼容已经存在于旧工作目录中的文件。查询路径只使用生成的不可变快照，不执行文件 I/O。
 
 自定义 matcher 支持 `full:example.com`（或无前缀的精确名称）、`domain:example.com`（该名称及标签边界内的所有子域）、`keyword:text` 和 `regexp:pattern`。匹配优先级依次为精确、最长 domain 后缀、首个匹配的 regexp、首个匹配的 keyword；重复定义同一 matcher 时，后者替换其地址。Full、domain 和 keyword 名称按 ASCII 大小写不敏感方式处理，并归一化末尾点。Regexp 保持大小写敏感，匹配不带末尾点的小写名称；需要忽略大小写时使用 `(?i)`。重复地址会去除。
 
 在 `ipv4only`/`ipv6only` 的硬地址族过滤之后，已知名称的 IN class A 或 AAAA 查询优先于 request 规则（包括 `reject`）、缓存查询和上游交换。名称存在但没有所请求地址族时，honk 返回 NOERROR/NODATA，且不查询上游。其他 class 和 qtype 继续走正常管线。Hosts 应答使用 60 秒 TTL，并绕过 honk 的 DNS 缓存。
 
-SIGHUP 会构建新快照。来源不可读或自定义规则无效时启动失败；重载时，替换 generation 会在发布前失败，当前 generation 继续使用。
+SIGHUP 会构建新快照。任一来源不可读或自定义规则无效时启动失败；重载时，替换 generation 会在发布前失败，当前 generation 继续使用。
 
 ## EDNS Client Subnet（`client_subnet`）
 

@@ -65,7 +65,7 @@ There are two independent 2,048 limits: controller query lifecycles and active s
 
 ### Hosts snapshot
 
-With `use_host` enabled, generation construction reads one source once. The default `/etc/hosts` parser indexes exact names and aliases. `hosts_file` switches to OxiDNS-compatible exact, domain-suffix, regexp, and keyword rules; exact and longest-suffix lookups take precedence over ordered regexp and keyword matches. Query handling performs no file I/O.
+Generation construction reads every repeatable `use_host` source once and merges them in declaration order. `true` selects `/etc/hosts`, whose parser indexes exact names and aliases; a path selects an OxiDNS-compatible exact, domain-suffix, regexp, and keyword rule file. Later definitions replace earlier matching definitions. Exact and longest-suffix lookups take precedence over ordered regexp and keyword matches. Query handling performs no file I/O.
 
 Only IN-class A and AAAA queries use the snapshot. A known name with no address in the requested family returns `NOERROR`/NODATA and never leaks to an upstream. A host answer has a 60-second TTL, bypasses positive and negative cache reuse, and still produces the normal routing-projection outcome. The snapshot is immutable for its generation; edit its source and send SIGHUP to publish a replacement. A load or parse failure aborts startup or the reload before publication.
 
