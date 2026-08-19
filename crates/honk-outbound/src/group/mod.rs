@@ -529,6 +529,7 @@ impl GroupManager {
                         &candidates,
                         group,
                         &ScoreSelectionContext::aggregate(network, domain, ipver),
+                        effects,
                     )
                     .node,
                 ],
