@@ -755,8 +755,12 @@ async fn test_connection_reuse_across_dials() {
         let payload = format!("req{i}");
         stream.stream.write_all(payload.as_bytes()).await.unwrap();
         let mut buf = [0u8; 16];
-        let n = stream.stream.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], payload.as_bytes());
+        stream
+            .stream
+            .read_exact(&mut buf[..payload.len()])
+            .await
+            .unwrap();
+        assert_eq!(&buf[..payload.len()], payload.as_bytes());
     }
 }
 
