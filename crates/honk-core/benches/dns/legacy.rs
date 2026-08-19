@@ -215,7 +215,7 @@ pub(super) fn bench_tcp_pool_exchange(c: &mut Criterion) {
     g.throughput(Throughput::Elements(1));
     g.bench_function("exchange_reused", |b| {
         b.to_async(&rt).iter(|| async {
-            let r = pool.exchange(black_box(&q)).await.unwrap();
+            let r = pool.exchange(black_box(&q), None).await.unwrap();
             black_box(r);
         });
     });
@@ -258,6 +258,10 @@ pub(super) fn bench_udp_pool_exchange(c: &mut Criterion) {
 
     let q = build_dns_query("example.com", 1);
     let mut g = c.benchmark_group("dns_udp_pool");
+    // The production pool quarantines all 65,536 IDs for three seconds; a long
+    // localhost run measures intentional exhaustion rather than exchange latency.
+    g.warm_up_time(Duration::from_millis(100));
+    g.measurement_time(Duration::from_millis(100));
     g.throughput(Throughput::Elements(1));
     g.bench_function("exchange", |b| {
         b.to_async(&rt).iter(|| async {

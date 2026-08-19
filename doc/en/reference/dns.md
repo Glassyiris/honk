@@ -7,7 +7,7 @@ This page defines the current dae-syntax `dns { ... }` section and its runtime s
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `bind` | absent / `""` | Optional standalone DNS listener; an empty value disables only this listener. |
-| `use_host` | `false` | Answer matching IN-class A/AAAA queries from one `/etc/hosts` snapshot per DNS runtime generation. |
+| `use_host` | `false` | Repeatable hosts source: `true` selects `/etc/hosts`; a path selects an OxiDNS-compatible rule file. |
 | `client_subnet` | absent / `""` | Optional EDNS Client Subnet preset: IPv4, IPv4 CIDR, `auto`, or `auto(IPv4)`. |
 | `upstream { ... }` | `default: 'udp://223.5.5.5:53'` | Named upstream servers. The first explicit `upstream` block replaces the built-in entry. |
 | `routing { ... }` | no rules; request fallback `default`; response fallback `accept` | Ordered request and response routing. |
@@ -37,11 +37,22 @@ Listener ownership is process-scoped. A SIGHUP reload accepts semantically equiv
 
 ## Hosts snapshot (`use_host`)
 
-With `use_host: true`, honk reads `/etc/hosts` while building each DNS runtime generation. The query path uses that immutable snapshot and performs no file I/O. Canonical names and aliases from valid address lines are indexed by exact, ASCII case-insensitive name; a trailing dot is normalized and duplicate addresses are removed.
+`use_host` is repeatable. `true` contributes `/etc/hosts` in standard `IP canonical-name aliases...` format; `false` contributes no source; each path contributes an OxiDNS-compatible `matcher IP...` rule file. All sources are read once in declaration order and merged into one snapshot; a later source replaces an earlier definition of the same exact name or matcher. Duplicate source paths are loaded once.
+
+```dae
+dns {
+    use_host: true
+    use_host: 'hosts.txt'
+}
+```
+
+Absolute paths remain explicit. Relative paths resolve below `global.data_dir`, while an existing legacy working-directory path remains usable. The query path uses the resulting immutable snapshot and performs no file I/O.
+
+Custom matchers are `full:example.com` (or an unprefixed exact name), `domain:example.com` (the name and all label-boundary subdomains), `keyword:text`, and `regexp:pattern`. Matching precedence is exact, longest domain suffix, first matching regexp, then first matching keyword; redefining the same matcher replaces its addresses. Full, domain, and keyword names are ASCII case-insensitive and normalize trailing dots. Regexps remain case-sensitive and run against the lowercase name without a trailing dot; use `(?i)` when a regexp needs case-insensitive matching. Duplicate addresses are removed.
 
 After hard `ipv4only`/`ipv6only` filtering, a known IN-class A or AAAA name takes precedence over request rules—including `reject`—and over cache lookup and upstream exchange. If the name exists but has no address in the requested family, honk returns NOERROR/NODATA without querying an upstream. Other classes and qtypes continue through the normal pipeline. Hosts answers use a 60-second TTL and bypass honk's DNS cache.
 
-SIGHUP builds a new snapshot. If `/etc/hosts` is unreadable, startup fails; on reload the replacement generation fails before publication and the active generation remains in use.
+SIGHUP builds a new snapshot. Any unreadable source or invalid custom rule aborts startup; on reload the replacement generation fails before publication and the active generation remains in use.
 
 ## EDNS Client Subnet (`client_subnet`)
 

@@ -16,6 +16,7 @@ const AGGREGATE_CAPACITY: usize = 4096;
 const RELIABILITY_CLOSE: f64 = 0.05;
 const SCORE_EVIDENCE_HALF_LIFE: Duration = Duration::from_secs(30 * 60);
 const MIN_TRAINED_EVIDENCE: f64 = 0.5;
+const SCORE_SWITCH_MARGIN: f64 = 0.01;
 const MIN_THROUGHPUT_DURATION: Duration = Duration::from_secs(1);
 const MIN_THROUGHPUT_BYTES: u64 = 64 * 1024;
 
@@ -154,6 +155,7 @@ struct Stats {
     throughput_windows: f64,
     last_used: u64,
     updated_at: Option<Instant>,
+    selected_at: u64,
 }
 
 impl Stats {
@@ -477,41 +479,30 @@ impl ScorePolicyState {
         if nodes.len() < 2 {
             return 0;
         }
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         let snapshots: Vec<_> = nodes
             .iter()
             .map(|node| score_snapshot(&inner, group, context, node.id, now))
             .collect();
-        if let Some((index, _)) = snapshots
+        let best = best_index(&snapshots, nodes);
+        let incumbent = snapshots
             .iter()
             .enumerate()
-            .filter(|(_, score)| score.completed < MIN_TRAINED_EVIDENCE)
-            .min_by(|(left_index, left), (right_index, right)| {
-                left.attempts
-                    .total_cmp(&right.attempts)
-                    .then_with(|| left_index.cmp(right_index))
-                    .then_with(|| nodes[*left_index].id.cmp(&nodes[*right_index].id))
-            })
-        {
-            return index;
-        }
-        let best_reliability = snapshots
-            .iter()
-            .map(|score| score.reliability)
-            .fold(0.0_f64, f64::max);
-        let total_attempts = snapshots.iter().map(|score| score.attempts).sum();
-        snapshots
-            .iter()
-            .enumerate()
-            .filter(|(_, score)| best_reliability - score.reliability <= RELIABILITY_CLOSE)
+            .filter(|(_, score)| score.selected_at != 0)
             .max_by(|(left_index, left), (right_index, right)| {
-                utility(left, total_attempts)
-                    .total_cmp(&utility(right, total_attempts))
-                    .then_with(|| right_index.cmp(left_index))
-                    .then_with(|| nodes[*right_index].id.cmp(&nodes[*left_index].id))
+                left.selected_at
+                    .cmp(&right.selected_at)
+                    .then_with(|| left_index.cmp(right_index))
             })
-            .map(|(index, _)| index)
-            .unwrap_or(0)
+            .map(|(index, _)| index);
+        let selected = incumbent
+            .filter(|&index| index != best)
+            .filter(|&index| keep_incumbent(&snapshots[index], &snapshots[best]))
+            .unwrap_or(best);
+        inner.tick = inner.tick.saturating_add(1);
+        let tick = inner.tick;
+        mark_selected(&mut inner, group, context, nodes[selected].id, tick);
+        selected
     }
 
     #[cfg(test)]
@@ -615,6 +606,83 @@ impl ScorePolicyState {
     }
 }
 
+fn best_index(snapshots: &[ScoreSnapshot], nodes: &[&Node]) -> usize {
+    if let Some((index, _)) = snapshots
+        .iter()
+        .enumerate()
+        .filter(|(_, score)| score.completed < MIN_TRAINED_EVIDENCE)
+        .min_by(|(left_index, left), (right_index, right)| {
+            left.attempts
+                .total_cmp(&right.attempts)
+                .then_with(|| left_index.cmp(right_index))
+                .then_with(|| nodes[*left_index].id.cmp(&nodes[*right_index].id))
+        })
+    {
+        return index;
+    }
+    let best_reliability = snapshots
+        .iter()
+        .map(|score| score.reliability)
+        .fold(0.0_f64, f64::max);
+    snapshots
+        .iter()
+        .enumerate()
+        .filter(|(_, score)| best_reliability - score.reliability <= RELIABILITY_CLOSE)
+        .max_by(|(left_index, left), (right_index, right)| {
+            utility(left)
+                .total_cmp(&utility(right))
+                .then_with(|| right_index.cmp(left_index))
+                .then_with(|| nodes[*right_index].id.cmp(&nodes[*left_index].id))
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+fn keep_incumbent(incumbent: &ScoreSnapshot, best: &ScoreSnapshot) -> bool {
+    incumbent.completed >= MIN_TRAINED_EVIDENCE
+        && best.completed >= MIN_TRAINED_EVIDENCE
+        && incumbent.failures == 0.0
+        && utility(best) - utility(incumbent) < SCORE_SWITCH_MARGIN
+}
+
+fn mark_selected(
+    inner: &mut StateInner,
+    group: &str,
+    context: &ScoreSelectionContext,
+    node_id: Uuid,
+    tick: u64,
+) {
+    let key = AggregateKey {
+        group: group.to_string(),
+        network: context.network,
+        family: context.target_family,
+        node_id,
+    };
+    if let Some(stats) = inner.aggregate.get_mut(&key) {
+        stats.selected_at = tick;
+    } else {
+        inner.aggregate.put(
+            key,
+            Stats {
+                incarnation: tick,
+                selected_at: tick,
+                ..Default::default()
+            },
+        );
+    }
+    if let (Some(family), Some(target)) = (context.target_family, context.target.as_ref()) {
+        let key = ExactKey {
+            group: group.to_string(),
+            network: context.network,
+            family,
+            target: target.clone(),
+            node_id,
+        };
+        if let Some(stats) = inner.exact.get_mut(&key) {
+            stats.selected_at = tick;
+        }
+    }
+}
 fn aggregate_families(context: &ScoreSelectionContext) -> [Option<IpVersion>; 2] {
     [None, context.target_family]
 }
@@ -683,6 +751,8 @@ struct ScoreSnapshot {
     latency_confidence: f64,
     throughput: Option<f64>,
     throughput_confidence: f64,
+    failures: f64,
+    selected_at: u64,
 }
 
 fn score_snapshot(
@@ -743,6 +813,8 @@ fn score_snapshot(
                 family.throughput_confidence,
                 reliability_weight,
             ),
+            failures: global_score.failures + family.failures,
+            selected_at: global_score.selected_at.max(family.selected_at),
         }
     });
     let exact_score = match (context.target_family, context.target.as_ref()) {
@@ -788,9 +860,10 @@ fn score_snapshot(
             exact.throughput_confidence,
             reliability_weight,
         ),
+        failures: aggregate_score.failures + exact.failures,
+        selected_at: aggregate_score.selected_at.max(exact.selected_at),
     }
 }
-
 fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
     let factor = stats.updated_at.map_or(1.0, |updated_at| {
         evidence_decay(now.saturating_duration_since(updated_at))
@@ -814,9 +887,10 @@ fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
         latency_confidence: (latency_weight * factor / 8.0).clamp(0.0, 1.0),
         throughput,
         throughput_confidence: (stats.throughput_windows * factor / 8.0).clamp(0.0, 1.0),
+        failures: (stats.setup_failure + stats.useful_failure) * factor,
+        selected_at: stats.selected_at,
     }
 }
-
 fn blend(base: f64, exact: f64, exact_weight: f64) -> f64 {
     base * (1.0 - exact_weight) + exact * exact_weight
 }
@@ -829,20 +903,16 @@ fn blend_option(base: Option<f64>, exact: Option<f64>, exact_weight: f64) -> Opt
     }
 }
 
-fn utility(score: &ScoreSnapshot, total_attempts: f64) -> f64 {
-    let exploration = ((total_attempts + 1.0).ln() / (score.attempts + 1.0))
-        .sqrt()
-        .min(1.0)
-        * RELIABILITY_CLOSE;
+fn utility(score: &ScoreSnapshot) -> f64 {
     let latency_penalty = score
         .latency_ms
-        .map(|latency| (latency.max(1.0).log2() / 20.0).min(0.03) * score.latency_confidence)
+        .map(|latency| latency.max(1.0).log2().min(20.0) / 20.0 * 0.03 * score.latency_confidence)
         .unwrap_or(0.0);
     let throughput_bonus = score
         .throughput
         .map(|throughput| throughput / 30.0 * 0.02 * score.throughput_confidence)
         .unwrap_or(0.0);
-    score.reliability + exploration + throughput_bonus - latency_penalty
+    score.reliability + throughput_bonus - latency_penalty
 }
 
 #[derive(Clone)]
@@ -1553,6 +1623,77 @@ mod tests {
     }
 
     #[test]
+    fn trained_utility_does_not_trade_latency_for_attempt_balance() {
+        let candidate = |attempts, latency_ms| ScoreSnapshot {
+            attempts,
+            completed: 8.0,
+            reliability: 0.9,
+            useful_completed: 8.0,
+            latency_ms: Some(latency_ms),
+            latency_confidence: 1.0,
+            throughput: None,
+            throughput_confidence: 0.0,
+            failures: 0.0,
+            selected_at: 0,
+        };
+
+        let faster_incumbent = candidate(100.0, 50.0);
+        let underused_slow_node = candidate(8.0, 500.0);
+        assert!(utility(&faster_incumbent) > utility(&underused_slow_node));
+    }
+
+    #[test]
+    fn trained_score_holds_incumbent_against_small_gain() {
+        let nodes = [node("a"), node("b")];
+        let node_refs = [&nodes[0], &nodes[1]];
+        let context = context("example.com", IpVersion::V4);
+        let state = ScorePolicyState::default();
+        state.publish_membership(nodes.iter().map(|node| ("score".into(), node.id)));
+        let now = Instant::now();
+        let key = |node_id| AggregateKey {
+            group: "score".into(),
+            network: SelectionNetwork::Tcp,
+            family: Some(IpVersion::V4),
+            node_id,
+        };
+        {
+            let mut inner = state.inner.lock();
+            for (node, latency_ms) in [(&nodes[0], 1_000.0), (&nodes[1], 1_200.0)] {
+                inner.aggregate.put(
+                    key(node.id),
+                    Stats {
+                        setup_success: 8.0,
+                        useful_success: 8.0,
+                        first_response_ms: WeightedMean {
+                            sum: latency_ms * 8.0,
+                            weight: 8.0,
+                        },
+                        updated_at: Some(now),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        assert_eq!(state.rank_at("score", &context, &node_refs, now), 0);
+        inner_update_response(&state, key(nodes[1].id), 900.0);
+        assert_eq!(state.rank_at("score", &context, &node_refs, now), 0);
+        inner_update_response(&state, key(nodes[1].id), 1.0);
+        assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
+    }
+
+    fn inner_update_response(state: &ScorePolicyState, key: AggregateKey, latency_ms: f64) {
+        state
+            .inner
+            .lock()
+            .aggregate
+            .get_mut(&key)
+            .unwrap()
+            .first_response_ms
+            .sum = latency_ms * 8.0;
+    }
+
+    #[test]
     fn throughput_ignores_bursts_and_pools_dominant_direction() {
         let now = Instant::now();
         let mut stats = Stats::default();
@@ -1668,6 +1809,7 @@ mod tests {
             throughput_windows: 4.0,
             last_used: 9,
             updated_at: Some(start),
+            selected_at: 0,
         };
 
         stats.decay_to(start + SCORE_EVIDENCE_HALF_LIFE);
