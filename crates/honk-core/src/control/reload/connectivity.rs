@@ -317,7 +317,12 @@ impl ControlPlane {
             let config = self.config.read().await;
             (config.groups.clone(), config.nodes.clone())
         };
-        let new_gm = GroupManager::with_alive_set(&groups, &nodes, Some(self.alive_set.clone()));
+        let new_gm = GroupManager::with_alive_set_and_score_state(
+            &groups,
+            &nodes,
+            Some(self.alive_set.clone()),
+            self.group_manager.read().score_state(),
+        );
         // Migrate runtime choices before wiring callbacks: migration must
         // not fire persistence or connection interruption.
         new_gm.migrate_selector_choices_from(&self.group_manager.read());
@@ -328,7 +333,11 @@ impl ControlPlane {
                 db_cb.save_selector_choice(group, node);
             })));
         }
-        *self.group_manager.write() = Arc::new(new_gm);
+        {
+            let mut group_manager = self.group_manager.write();
+            new_gm.publish_score_membership();
+            *group_manager = Arc::new(new_gm);
+        }
 
         // Refresh health-check registrations and the URLTest idle table to
         // match the new group membership.

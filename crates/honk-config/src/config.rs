@@ -490,9 +490,10 @@ impl Config {
                 .or_else(|_| Self::from_json_str(&content)),
             _ => match crate::parser::parse_dae_config_file(path) {
                 Ok(config) => Ok(config),
-                // An include directive was recognized, so returning a
-                // structured-format error would hide the actionable cause.
-                Err(err @ crate::ConfigError::Include(_)) => Err(err),
+                // These errors identify recognized dae syntax; structured
+                // fallbacks would hide their actionable cause.
+                Err(err @ crate::ConfigError::Include(_))
+                | Err(err @ crate::ConfigError::UnsupportedPolicy(_)) => Err(err),
                 Err(_) => parse_toml(&content)
                     .or_else(|_| parse_yaml(&content))
                     .or_else(|_| Self::from_json_str(&content)),
@@ -714,6 +715,25 @@ mod builtin_nodes_tests {
             error.to_string().contains("dns.bind"),
             "validation error must identify dns.bind: {error}"
         );
+    }
+
+    #[test]
+    fn test_from_json_accepts_legacy_null_dns_routing_fields() {
+        let config =
+            Config::from_json_str(r#"{"dns":{"routing":{"request":null,"response":null}}}"#)
+                .unwrap();
+
+        assert!(config.dns.routing.request.rules.is_empty());
+        assert!(config.dns.routing.response.rules.is_empty());
+    }
+
+    #[test]
+    fn test_from_file_preserves_renamed_honk_policy_error() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "group {\n proxy {\n policy: honk\n }\n}").unwrap();
+        let error = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(error, crate::ConfigError::UnsupportedPolicy(_)));
+        assert!(error.to_string().contains("renamed to 'score'"));
     }
 
     #[test]

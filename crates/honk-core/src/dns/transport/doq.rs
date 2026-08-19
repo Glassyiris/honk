@@ -43,19 +43,30 @@ impl DoqClient {
         }))
     }
 
-    pub async fn exchange(self: &Arc<Self>, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub async fn exchange(
+        self: &Arc<Self>,
+        raw_query: &[u8],
+        feedback: Option<&honk_outbound::group::ScoreFeedback>,
+    ) -> anyhow::Result<Vec<u8>> {
         exchange_with_retry(
             "DoQ",
-            || self.exchange_once(raw_query),
-            || async {
-                self.close_connection().await;
-            },
+            raw_query,
+            |reporter| async move { self.exchange_once(raw_query, reporter.as_ref()).await },
+            || async { self.close_connection().await },
+            feedback,
         )
         .await
     }
 
-    async fn exchange_once(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn exchange_once(
+        &self,
+        raw_query: &[u8],
+        reporter: Option<&honk_outbound::group::ScoreReporter>,
+    ) -> anyhow::Result<Vec<u8>> {
         let conn = self.get_conn().await?;
+        if let Some(reporter) = reporter {
+            reporter.setup_succeeded();
+        }
         tokio::time::timeout(self.query_timeout, async {
             let (mut send, mut recv) = conn
                 .open_bi()
@@ -67,8 +78,17 @@ impl DoqClient {
             write_length_prefixed(&mut send, &wire).await?;
             send.finish()
                 .map_err(|e| anyhow::anyhow!("DoQ finish send: {e}"))?;
+            if let Some(reporter) = reporter {
+                reporter.tx(raw_query.len() as u64);
+            }
 
             let mut resp = read_length_prefixed(&mut recv, self.query_timeout).await?;
+            if let Some(reporter) = reporter
+                && super::is_valid_response(raw_query, &resp)
+            {
+                reporter.first_response();
+                reporter.rx(resp.len() as u64);
+            }
             restore_dns_id(&mut resp, orig_id);
             Ok::<_, anyhow::Error>(resp)
         })

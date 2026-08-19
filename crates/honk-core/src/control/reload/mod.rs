@@ -86,78 +86,101 @@ pub(crate) fn resolve_outbound_nodes(
     vec![Config::builtin_direct_node()]
 }
 
-/// Concrete UDP candidates plus the provenance and IP family selected by
-/// the final outbound resolution. This companion does not change the legacy
-/// TCP/DNS `resolve_outbound_nodes` API.
 #[derive(Debug, Clone)]
-pub(super) struct ResolvedUdpPlan {
+pub(super) struct ResolvedScorePlan {
     pub(super) mode: honk_outbound::group::SelectionPlanMode,
     pub(super) nodes: Vec<Node>,
-    pub(super) ipver: IpVersion,
+    pub(super) health_family: IpVersion,
+    pub(super) feedback: Vec<Option<honk_outbound::group::ScoreFeedback>>,
+    pub(super) selection_chains: Vec<Vec<String>>,
 }
 
-/// Resolve UDP candidates without inferring policy from candidate count.
-///
-/// A group plan supplies the authoritative/cold provenance directly. Empty
-/// groups may follow `final_outbound`, in which case the terminal outbound's
-/// mode and resolved IP version replace the outer plan. Recursive final
-/// chains are bounded and cycle-safe; a missing final target retains the
-/// historical direct fallback, while a cycle/depth breach fails closed.
-pub(super) fn resolve_udp_outbound_plan(
+fn own_score_plan(plan: honk_outbound::group::ScoreSelectionPlan<'_>) -> ResolvedScorePlan {
+    let mut nodes = Vec::with_capacity(plan.entries.len());
+    let mut feedback = Vec::with_capacity(plan.entries.len());
+    let mut selection_chains = Vec::with_capacity(plan.entries.len());
+    for entry in plan.entries {
+        nodes.push(entry.node.clone());
+        feedback.push(entry.feedback);
+        selection_chains.push(entry.selection_chain);
+    }
+    ResolvedScorePlan {
+        mode: plan.mode,
+        nodes,
+        health_family: plan.health_family,
+        feedback,
+        selection_chains,
+    }
+}
+
+pub(super) fn resolve_urltest_retry_plan_for_target(
+    group_manager: &GroupManager,
+    outbound_name: &str,
+    context: &honk_outbound::group::ScoreSelectionContext,
+) -> ResolvedScorePlan {
+    own_score_plan(group_manager.urltest_retry_plan_for_target(outbound_name, context))
+}
+
+pub(super) fn resolve_outbound_plan_for_target(
     config: &Config,
     group_manager: &GroupManager,
     outbound_name: &str,
-    ipver: IpVersion,
-) -> ResolvedUdpPlan {
-    resolve_udp_outbound_plan_inner(
+    context: &honk_outbound::group::ScoreSelectionContext,
+) -> ResolvedScorePlan {
+    resolve_outbound_plan_for_target_inner(
         config,
         group_manager,
         outbound_name,
-        ipver,
+        context,
         0,
         &mut Vec::new(),
     )
 }
 
-fn resolve_udp_outbound_plan_inner(
+fn resolve_outbound_plan_for_target_inner(
     config: &Config,
     group_manager: &GroupManager,
     outbound_name: &str,
-    ipver: IpVersion,
+    context: &honk_outbound::group::ScoreSelectionContext,
     depth: usize,
     visited: &mut Vec<String>,
-) -> ResolvedUdpPlan {
+) -> ResolvedScorePlan {
     if let Some(node) = config.builtin_node(outbound_name) {
-        return ResolvedUdpPlan {
+        return ResolvedScorePlan {
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
             nodes: vec![node],
-            ipver,
+            health_family: context.health_family,
+            feedback: vec![None],
+            selection_chains: vec![vec![outbound_name.to_owned()]],
         };
     }
     if let Some(node) = config.nodes.iter().find(|node| node.name == outbound_name) {
-        let mut selected_ipver = ipver;
-        let nodes = if group_manager.is_node_selectable_for_domain(
+        let health_family = if group_manager.is_node_selectable_for_domain(
             node.id,
-            ProbeDomain::DataUdp,
-            selected_ipver,
+            context.probe_domain,
+            context.health_family,
         ) {
-            vec![node.clone()]
-        } else if ipver == IpVersion::V6
+            Some(context.health_family)
+        } else if context.health_family == IpVersion::V6
             && group_manager.is_node_selectable_for_domain(
                 node.id,
-                ProbeDomain::DataUdp,
+                context.probe_domain,
                 IpVersion::V4,
             )
         {
-            selected_ipver = IpVersion::V4;
-            vec![node.clone()]
+            Some(IpVersion::V4)
         } else {
-            vec![]
+            None
         };
-        return ResolvedUdpPlan {
+        return ResolvedScorePlan {
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
-            nodes,
-            ipver: selected_ipver,
+            nodes: health_family.map(|_| node.clone()).into_iter().collect(),
+            health_family: health_family.unwrap_or(context.health_family),
+            feedback: health_family.map(|_| None).into_iter().collect(),
+            selection_chains: health_family
+                .map(|_| vec![node.name.clone()])
+                .into_iter()
+                .collect(),
         };
     }
     let Some(group) = config
@@ -165,80 +188,87 @@ fn resolve_udp_outbound_plan_inner(
         .iter()
         .find(|group| group.name == outbound_name)
     else {
-        warn!(
-            "UDP outbound '{}' not found, falling back to direct",
-            outbound_name
-        );
-        return ResolvedUdpPlan {
+        return ResolvedScorePlan {
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
             nodes: vec![Config::builtin_direct_node()],
-            ipver,
+            health_family: context.health_family,
+            feedback: vec![None],
+            selection_chains: vec![vec![Config::BUILTIN_DIRECT_NODE.to_owned()]],
         };
     };
     if depth >= honk_outbound::group::MAX_GROUP_DEPTH
         || visited.iter().any(|name| name == outbound_name)
     {
-        warn!(
-            "UDP final outbound resolution for '{}' stopped at recursive cycle/depth",
-            outbound_name
-        );
-        return ResolvedUdpPlan {
+        return ResolvedScorePlan {
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
-            nodes: vec![],
-            ipver,
+            nodes: Vec::new(),
+            health_family: context.health_family,
+            feedback: Vec::new(),
+            selection_chains: Vec::new(),
         };
     }
-
-    visited.push(outbound_name.to_owned());
-    let mut selected_ipver = ipver;
-    let mut plan =
-        group_manager.selection_plan_for_domain(&group.name, ProbeDomain::DataUdp, selected_ipver);
-    // Proxy servers frequently have only an A record. Preserve that concrete
-    // fallback family for traffic health feedback rather than reporting the
-    // original IPv6 destination family.
-    if plan.nodes.is_empty() && ipver == IpVersion::V6 {
-        plan = group_manager.selection_plan_for_domain(
-            &group.name,
-            ProbeDomain::DataUdp,
-            IpVersion::V4,
-        );
-        if !plan.nodes.is_empty() {
-            selected_ipver = IpVersion::V4;
-            warn!(
-                "UDP group '{}' has no IPv6 alive node; falling back to IPv4 alive candidates",
-                group.name
-            );
-        }
+    let plan = group_manager.selection_plan_for_target_with_health_fallback(outbound_name, context);
+    if !plan.entries.is_empty() {
+        return own_score_plan(plan);
     }
-    if !plan.nodes.is_empty() {
-        visited.pop();
-        return ResolvedUdpPlan {
+    let Some(final_name) = group.final_outbound.as_deref() else {
+        return ResolvedScorePlan {
             mode: plan.mode,
-            nodes: plan.nodes.into_iter().cloned().collect(),
-            ipver: selected_ipver,
+            nodes: Vec::new(),
+            health_family: plan.health_family,
+            feedback: Vec::new(),
+            selection_chains: Vec::new(),
+        };
+    };
+    visited.push(outbound_name.to_owned());
+    let mut terminal = resolve_outbound_plan_for_target_inner(
+        config,
+        group_manager,
+        final_name,
+        context,
+        depth + 1,
+        visited,
+    );
+    visited.pop();
+    for chain in &mut terminal.selection_chains {
+        chain.insert(0, outbound_name.to_owned());
+    }
+    for (index, node) in terminal.nodes.iter().enumerate() {
+        let outer = group_manager.feedback_for_group_node(outbound_name, node.id, context.clone());
+        terminal.feedback[index] = match (outer, terminal.feedback[index].take()) {
+            (Some(outer), Some(inner)) => {
+                Some(inner.prepend_attribution(outer.attributions()[0].group.clone(), node.id))
+            }
+            (Some(outer), None) => Some(outer),
+            (None, inner) => inner,
         };
     }
+    terminal
+}
 
-    if let Some(final_name) = group_manager.get_final_outbound(&group.name) {
-        info!(
-            "UDP group '{}' has no available node; falling back to final outbound '{}'",
-            group.name, final_name
-        );
-        let terminal = resolve_udp_outbound_plan_inner(
-            config,
-            group_manager,
-            &final_name,
-            ipver,
-            depth + 1,
-            visited,
-        );
-        visited.pop();
-        return terminal;
-    }
-    visited.pop();
+/// Concrete UDP candidates plus target-aware Score feedback, attribution,
+/// and the health family selected by final outbound resolution.
+#[derive(Debug, Clone)]
+pub(super) struct ResolvedUdpPlan {
+    pub(super) mode: honk_outbound::group::SelectionPlanMode,
+    pub(super) nodes: Vec<Node>,
+    pub(super) ipver: IpVersion,
+    pub(super) feedback: Vec<Option<honk_outbound::group::ScoreFeedback>>,
+    pub(super) selection_chains: Vec<Vec<String>>,
+}
+
+pub(super) fn resolve_udp_outbound_plan_for_target(
+    config: &Config,
+    group_manager: &GroupManager,
+    outbound_name: &str,
+    context: &honk_outbound::group::ScoreSelectionContext,
+) -> ResolvedUdpPlan {
+    let plan = resolve_outbound_plan_for_target(config, group_manager, outbound_name, context);
     ResolvedUdpPlan {
         mode: plan.mode,
-        nodes: vec![],
-        ipver: selected_ipver,
+        nodes: plan.nodes,
+        ipver: plan.health_family,
+        feedback: plan.feedback,
+        selection_chains: plan.selection_chains,
     }
 }

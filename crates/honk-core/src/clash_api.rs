@@ -30,8 +30,11 @@ use honk_config::group::GroupPolicy;
 use honk_config::node::{Group, Node};
 use honk_config::types::NodeProtocol;
 use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
+use honk_outbound::group::SelectionNetwork;
 use honk_outbound::group::{GroupManager, SharedGroupManager};
-use honk_outbound::urltest::{urltest_group, urltest_node_in_generation};
+use honk_outbound::urltest::{
+    urltest_group_with_feedback, urltest_node_in_generation_with_feedback,
+};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -384,6 +387,7 @@ fn clash_group_type(policy: GroupPolicy) -> &'static str {
         GroupPolicy::URLTest => "url_test",
         GroupPolicy::LoadBalance => "load_balance",
         GroupPolicy::Fallback => "fallback",
+        GroupPolicy::Score => "url_test",
     }
 }
 
@@ -408,6 +412,10 @@ fn build_group_proxy_info(
         GroupPolicy::LoadBalance => node_names.first().cloned().unwrap_or_default(),
         GroupPolicy::Fallback => group_manager
             .get_fallback_selection(&group.name)
+            .or_else(|| node_names.first().cloned())
+            .unwrap_or_default(),
+        GroupPolicy::Score => group_manager
+            .get_score_selection_for_network(&group.name, SelectionNetwork::Tcp)
             .or_else(|| node_names.first().cloned())
             .unwrap_or_default(),
     };
@@ -657,15 +665,19 @@ async fn get_proxy_delay(
         let tcp = entry.tcp.clone();
         let warmable = entry.warmable.clone();
         let generation = s.runtime_registry.read().clone();
-        let measured = urltest_node_in_generation(
-            &generation,
-            &node,
-            tcp.as_ref(),
-            warmable.as_deref(),
-            &query.url,
-            query.timeout(),
-        )
-        .await;
+        let measured = {
+            let group_manager = s.group_manager.read().clone();
+            urltest_node_in_generation_with_feedback(
+                &generation,
+                &node,
+                tcp.as_ref(),
+                warmable.as_deref(),
+                &query.url,
+                query.timeout(),
+                &group_manager,
+            )
+            .await
+        };
         return match measured {
             Ok(latency) => {
                 s.alive_set
@@ -686,26 +698,31 @@ async fn get_proxy_delay(
         };
     }
 
-    if config.groups.iter().any(|g| g.name == name) {
+    let is_group = config.groups.iter().any(|group| group.name == name);
+    drop(config);
+    if is_group {
         let members = {
             let gm = s.group_manager.read();
             gm.delay_test_members(&name)
         };
-        drop(config);
         if members.is_empty() {
             return error_response(StatusCode::SERVICE_UNAVAILABLE, "group has no members");
         }
         let leaves: Vec<Node> = members.iter().map(|(_, leaf)| leaf.clone()).collect();
         let generation = s.runtime_registry.read().clone();
-        let results = urltest_group(
-            &leaves,
-            &generation,
-            &s.proxy_registry,
-            &s.alive_set,
-            &query.url,
-            query.timeout(),
-        )
-        .await;
+        let results = {
+            let group_manager = s.group_manager.read().clone();
+            urltest_group_with_feedback(
+                &leaves,
+                &generation,
+                &s.proxy_registry,
+                &s.alive_set,
+                &query.url,
+                query.timeout(),
+                group_manager,
+            )
+            .await
+        };
         // sing-box performUpdateCheck: an explicit delay test immediately
         // re-evaluates the URLTest selection with the fresh measurements
         // (tolerance hysteresis applies). Without this the group's `now`
@@ -722,6 +739,7 @@ async fn get_proxy_delay(
             let gm = s.group_manager.read();
             gm.get_selector_choice(&name)
                 .or_else(|| gm.get_urltest_selection(&name))
+                .or_else(|| gm.get_score_selection_for_network(&name, SelectionNetwork::Tcp))
         }
         .or_else(|| members.first().map(|(tag, _)| tag.clone()));
         if let Some(current) = current
@@ -749,27 +767,33 @@ async fn get_group_delay(
     Path(name): Path<String>,
     Query(query): Query<DelayQuery>,
 ) -> Response {
-    let config = s.config.read().await;
-    if !config.groups.iter().any(|g| g.name == name) {
+    let exists = {
+        let config = s.config.read().await;
+        config.groups.iter().any(|group| group.name == name)
+    };
+    if !exists {
         return error_response(StatusCode::NOT_FOUND, "group not found");
     }
     let members = {
         let gm = s.group_manager.read();
         gm.delay_test_members(&name)
     };
-    drop(config);
 
     let leaves: Vec<Node> = members.iter().map(|(_, leaf)| leaf.clone()).collect();
     let generation = s.runtime_registry.read().clone();
-    let results = urltest_group(
-        &leaves,
-        &generation,
-        &s.proxy_registry,
-        &s.alive_set,
-        &query.url,
-        query.timeout(),
-    )
-    .await;
+    let results = {
+        let group_manager = s.group_manager.read().clone();
+        urltest_group_with_feedback(
+            &leaves,
+            &generation,
+            &s.proxy_registry,
+            &s.alive_set,
+            &query.url,
+            query.timeout(),
+            group_manager,
+        )
+        .await
+    };
     // sing-box performUpdateCheck: re-evaluate the URLTest selection with
     // the fresh measurements (see get_proxy_delay's group branch).
     {

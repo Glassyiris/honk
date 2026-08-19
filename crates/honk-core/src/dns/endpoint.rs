@@ -24,6 +24,7 @@ pub struct DnsEndpoint {
     /// TLS/QUIC server name (SNI). Falls back to `host` when host is not an IP.
     pub sni: String,
     bootstrap_resolver: Option<honk_outbound::bootstrap::BootstrapResolver>,
+    resolved_addr: Option<SocketAddr>,
     strategy: DnsStrategy,
 }
 
@@ -82,8 +83,13 @@ impl DnsEndpoint {
             path,
             sni,
             bootstrap_resolver,
+            resolved_addr: None,
             strategy,
         })
+    }
+    pub(crate) fn with_resolved_addr(mut self, address: SocketAddr) -> Self {
+        self.resolved_addr = Some(address);
+        self
     }
 
     /// Resolve host to the first address allowed by the configured strategy.
@@ -109,6 +115,9 @@ impl DnsEndpoint {
         &self,
         bootstrap_resolver: Option<honk_outbound::bootstrap::BootstrapResolver>,
     ) -> anyhow::Result<Vec<SocketAddr>> {
+        if let Some(address) = self.resolved_addr {
+            return Ok(vec![address]);
+        }
         let ips = if let Ok(ip) = self.host.parse::<IpAddr>() {
             vec![ip]
         } else {

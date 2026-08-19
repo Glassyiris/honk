@@ -3,6 +3,82 @@ use crate::control::*;
 use crate::group::{SelectionNetwork, SelectionPlanMode};
 use honk_config::types::NodeProtocol;
 
+use std::collections::{HashMap, HashSet};
+
+type UnpackedTcpScorePlan = (
+    Vec<Node>,
+    SelectionPlanMode,
+    HashMap<uuid::Uuid, crate::group::ScoreFeedback>,
+    HashMap<uuid::Uuid, Vec<String>>,
+    IpVersion,
+);
+
+fn tcp_score_context(
+    target: SocketAddr,
+    domain: Option<&str>,
+    health_family: IpVersion,
+) -> crate::group::ScoreSelectionContext {
+    let target_family = if target.is_ipv6() {
+        IpVersion::V6
+    } else {
+        IpVersion::V4
+    };
+    crate::group::ScoreSelectionContext {
+        network: SelectionNetwork::Tcp,
+        probe_domain: ProbeDomain::Tcp,
+        target_family: Some(target_family),
+        health_family,
+        target: Some(match domain {
+            Some(domain) => crate::group::ScoreTarget::domain(domain, target.port()),
+            None => target.into(),
+        }),
+    }
+}
+
+fn unpack_tcp_score_plan(plan: crate::control::reload::ResolvedScorePlan) -> UnpackedTcpScorePlan {
+    let mut seen = HashSet::new();
+    let mut nodes = Vec::with_capacity(plan.nodes.len());
+    let mut feedback = HashMap::new();
+    let mut selection_chains = HashMap::new();
+    for ((node, value), selection_chain) in plan
+        .nodes
+        .into_iter()
+        .zip(plan.feedback)
+        .zip(plan.selection_chains)
+    {
+        if !seen.insert(node.id) {
+            continue;
+        }
+        if let Some(value) = value {
+            feedback.insert(node.id, value);
+        }
+        selection_chains.insert(node.id, selection_chain);
+        nodes.push(node);
+    }
+    (
+        nodes,
+        plan.mode,
+        feedback,
+        selection_chains,
+        plan.health_family,
+    )
+}
+
+fn timeout_started_score_reporters(
+    reporters: &parking_lot::Mutex<Vec<crate::group::ScoreReporter>>,
+) {
+    for reporter in reporters.lock().iter() {
+        reporter.setup_failed(crate::group::ScoreOutcome::Timeout);
+    }
+}
+
+#[cfg(test)]
+fn started_score_reporter_count(
+    reporters: &parking_lot::Mutex<Vec<crate::group::ScoreReporter>>,
+) -> usize {
+    reporters.lock().len()
+}
+
 const COLD_URLTEST_STAGGER: Duration = Duration::from_millis(200);
 
 /// Wait until this candidate's absolute cold-URLTest release offset. The
@@ -216,28 +292,29 @@ impl ControlPlaneHandle {
         } else {
             IpVersion::V4
         };
-        let (mut candidates, selection_mode, selection_chain) = {
-            let config = self.config.read().await;
-            let gm = self.group_manager.read();
-            let (candidates, selection_mode) = if let Some(group) = config
-                .groups
-                .iter()
-                .find(|group| group.name == outbound_name)
-            {
-                let plan = gm.selection_plan_for_domain(&group.name, ProbeDomain::Tcp, ipver);
-                (
-                    plan.nodes.into_iter().cloned().collect::<Vec<_>>(),
-                    plan.mode,
-                )
-            } else {
-                (
-                    resolve_outbound_nodes(&config, &gm, &outbound_name, ProbeDomain::Tcp, ipver),
-                    SelectionPlanMode::Authoritative,
-                )
-            };
-            let selection_chain =
-                gm.selection_chain_for_network(&outbound_name, SelectionNetwork::Tcp);
-            (candidates, selection_mode, selection_chain)
+        // Hold the config read guard while cloning the group/runtime handles:
+        // reload publishes all three under their write guards, so this is one
+        // coherent generation rather than three individually-current values.
+        let generation_config_guard = self.config.read().await;
+        let generation_config = generation_config_guard.clone();
+        let generation_group_manager = self.group_manager.read().clone();
+        let runtime_generation = self.runtime_registry.read().clone();
+        drop(generation_config_guard);
+        let (
+            mut candidates,
+            mut selection_mode,
+            mut score_feedback,
+            mut selection_chains,
+            health_ipver,
+        ) = {
+            let context = tcp_score_context(original_dst, domain.as_deref(), ipver);
+            let plan = crate::control::reload::resolve_outbound_plan_for_target(
+                &generation_config,
+                &generation_group_manager,
+                &outbound_name,
+                &context,
+            );
+            unpack_tcp_score_plan(plan)
         };
         // Only an unmeasured URLTest group is allowed to speculate. Its
         // candidate set is bounded before spawning so a large group cannot
@@ -247,10 +324,6 @@ impl ControlPlaneHandle {
         } else {
             candidates.truncate(1);
         }
-        // Pin this flow to the runtime generation admitted with its
-        // candidate selection: every dial, pool backfill, and permit below
-        // uses this snapshot, never a post-reload replacement.
-        let runtime_generation = self.runtime_registry.read().clone();
 
         // If eBPF already decided this flow should go direct (not just punted
         // it to userspace), skip userspace proxy dial, DNS, and relay entirely.
@@ -367,7 +440,7 @@ impl ControlPlaneHandle {
                             }
                         }
                     }
-                    _ => {
+                    Ok(Err(_)) | Err(_) => {
                         debug!("DNS timed out or failed for {}, using original dst", domain);
                         (original_dst, Some(domain.clone()))
                     }
@@ -376,6 +449,33 @@ impl ControlPlaneHandle {
         } else {
             (original_dst, None)
         };
+        if (resolved_target.is_ipv6() && ipver == IpVersion::V4)
+            || (resolved_target.is_ipv4() && ipver == IpVersion::V6)
+        {
+            // Local DNS fell back across address families. The preliminary
+            // plan was needed to decide whether local resolution was required,
+            // but no dial (and therefore no reporter) has started yet. Replace
+            // it with a plan keyed by the address that will actually be dialed
+            // while retaining the proxy-health family already selected.
+            let context =
+                tcp_score_context(resolved_target, target_domain.as_deref(), health_ipver);
+            let plan = crate::control::reload::resolve_outbound_plan_for_target(
+                &generation_config,
+                &generation_group_manager,
+                &outbound_name,
+                &context,
+            );
+            let (nodes, mode, feedback, chains, _) = unpack_tcp_score_plan(plan);
+            candidates = nodes;
+            selection_mode = mode;
+            score_feedback = feedback;
+            selection_chains = chains;
+            if selection_mode == SelectionPlanMode::ColdUrlTest {
+                candidates.truncate(3);
+            } else {
+                candidates.truncate(1);
+            }
+        }
 
         let cold_urltest = selection_mode == SelectionPlanMode::ColdUrlTest;
         let candidate_refs: Vec<&Node> = candidates.iter().collect();
@@ -388,46 +488,76 @@ impl ControlPlaneHandle {
                 connect_timeout,
                 overall_dial_timeout,
                 Arc::clone(&runtime_generation),
-                ipver,
+                health_ipver,
+                &score_feedback,
                 cold_urltest,
             )
             .await;
-        let (mut proxy_stream, node) = match raced {
+        let (mut proxy_stream, node, score_reporter) = match raced {
             Some(pair) => pair,
             None => {
-                // Exactly one retry for an authoritative single-candidate
-                // failure, racing the URLTest latency-ordered top-3: when
-                // the just-recorded strike moved the pick the incumbent is
-                // replaced; otherwise it re-races alongside its alternates
-                // — a lone transient failure leaves no strike and must not
-                // hard-fail the flow. Non-URLTest plans and single-leaf
-                // outcomes yield no retry candidates and fail the flow.
-                let mut retried: Option<(crate::proxy::ProxyStream, Node)> = None;
+                // Retry once only when a failed authoritative pick can produce
+                // a different plan. URLTest may race its alternates; Score
+                // re-scores the exact target and retries only a replacement.
+                let mut retried: Option<(
+                    crate::proxy::ProxyStream,
+                    Node,
+                    Option<crate::group::ScoreReporter>,
+                )> = None;
                 if selection_mode == SelectionPlanMode::Authoritative && candidates.len() == 1 {
-                    let group_manager = self.group_manager.read().clone();
-                    let retry_nodes = group_manager.urltest_retry_candidates(
-                        &outbound_name,
-                        ProbeDomain::Tcp,
-                        ipver,
-                    );
-                    if retry_nodes.len() > 1
-                        || retry_nodes
-                            .first()
-                            .is_some_and(|n| n.id != candidates[0].id)
                     {
-                        retried = self
-                            .race_candidates(
-                                &retry_nodes,
-                                resolved_target,
-                                target_domain.clone(),
+                        let group_manager = Arc::clone(&generation_group_manager);
+                        let context = tcp_score_context(
+                            resolved_target,
+                            target_domain.as_deref(),
+                            health_ipver,
+                        );
+                        let mut plan =
+                            crate::control::reload::resolve_urltest_retry_plan_for_target(
+                                &group_manager,
                                 &outbound_name,
-                                connect_timeout,
-                                overall_dial_timeout,
-                                Arc::clone(&runtime_generation),
-                                ipver,
-                                false,
-                            )
-                            .await;
+                                &context,
+                            );
+                        if plan.nodes.is_empty() {
+                            plan = crate::control::reload::resolve_outbound_plan_for_target(
+                                &generation_config,
+                                &group_manager,
+                                &outbound_name,
+                                &context,
+                            );
+                        }
+                        let (
+                            retry_nodes,
+                            _,
+                            retry_feedback,
+                            retry_selection_chains,
+                            retry_health_ipver,
+                        ) = unpack_tcp_score_plan(plan);
+                        if retry_nodes.len() > 1
+                            || retry_nodes
+                                .first()
+                                .is_some_and(|node| node.id != candidates[0].id)
+                        {
+                            let nodes: Vec<_> = retry_nodes.iter().take(3).collect();
+                            let retry = self
+                                .race_candidates(
+                                    &nodes,
+                                    resolved_target,
+                                    target_domain.clone(),
+                                    &outbound_name,
+                                    connect_timeout,
+                                    overall_dial_timeout,
+                                    Arc::clone(&runtime_generation),
+                                    retry_health_ipver,
+                                    &retry_feedback,
+                                    false,
+                                )
+                                .await;
+                            if retry.is_some() {
+                                selection_chains = retry_selection_chains;
+                            }
+                            retried = retry;
+                        }
                     }
                 }
                 match retried {
@@ -450,7 +580,10 @@ impl ControlPlaneHandle {
         let (rule, rule_payload) = matched_rule
             .clone()
             .unwrap_or_else(|| ("Fallback".to_string(), String::new()));
-        let chains = connection_chains(selection_chain, &node.name);
+        let chains = connection_chains(
+            selection_chains.remove(&node.id).unwrap_or_default(),
+            &node.name,
+        );
         // Live byte counters shared with the relay task: it increments them
         // as data flows so /connections shows real-time totals instead of a
         // single close-time (never-visible) update.
@@ -491,8 +624,14 @@ impl ControlPlaneHandle {
                 warn!("Failed to write sniffed bytes to proxy: {}", e);
                 self.stats.record_error(&outbound_name);
                 self.stats.record_close(&outbound_name);
+                if let Some(reporter) = &score_reporter {
+                    reporter.finish(crate::group::ScoreOutcome::Io(e.kind()));
+                }
                 return Ok(());
             }
+        }
+        if let Some(reporter) = &score_reporter {
+            reporter.tx(sniff_result.buffered.len() as u64);
         }
 
         // Zero-copy fast path: a direct dial yields plain `TcpStream`s on
@@ -500,7 +639,16 @@ impl ControlPlaneHandle {
         // fallback to the copy relay when the kernel rejects it). TLS- or
         // protocol-wrapped proxy streams keep the userspace copy relay.
         // Both paths update the connection's live byte counters as data flows.
-        let conn_progress = Some((conn_upload.clone(), conn_download.clone()));
+        let first_response = score_reporter.as_ref().map(|reporter| {
+            let reporter = reporter.clone();
+            std::sync::Arc::new(move || reporter.first_response())
+                as std::sync::Arc<dyn Fn() + Send + Sync>
+        });
+        let conn_progress = relay::RelayProgress {
+            upload: conn_upload.clone(),
+            download: conn_download.clone(),
+            first_response,
+        };
         let relay_result = match proxy_stream.into_tcp_stream() {
             Ok(upstream) => {
                 relay::splice::relay_splice(
@@ -508,7 +656,7 @@ impl ControlPlaneHandle {
                     upstream,
                     client_addr,
                     resolved_target,
-                    conn_progress,
+                    Some(conn_progress.clone()),
                 )
                 .await
             }
@@ -518,11 +666,20 @@ impl ControlPlaneHandle {
                     proxy_stream.stream,
                     client_addr,
                     resolved_target,
-                    conn_progress,
+                    Some(conn_progress),
                 )
                 .await
             }
         };
+        if let Some(reporter) = &score_reporter {
+            let upload = conn_upload.load(std::sync::atomic::Ordering::Relaxed);
+            let download = conn_download.load(std::sync::atomic::Ordering::Relaxed);
+            reporter.tx(upload);
+            reporter.rx(download);
+            if download > 0 {
+                reporter.first_response();
+            }
+        }
         flow.retire().await;
 
         match relay_result {
@@ -532,6 +689,9 @@ impl ControlPlaneHandle {
                     relay_stats.client_to_proxy,
                     relay_stats.proxy_to_client,
                 );
+                if let Some(reporter) = &score_reporter {
+                    reporter.finish(crate::group::ScoreOutcome::Success);
+                }
                 self.stats.record_close(&outbound_name);
 
                 // Deposit a fresh connection for future reuse. Ready-capable
@@ -545,6 +705,8 @@ impl ControlPlaneHandle {
                     let registry = self.proxy_registry.clone();
                     let target_domain = target_domain.clone();
                     let generation = Arc::clone(&runtime_generation);
+                    let pool_feedback = score_reporter.as_ref().map(|reporter| reporter.feedback());
+                    let pool_health_family = health_ipver;
                     tokio::spawn(async move {
                         let (ready_capable, bare_capable) = registry
                             .find(node.protocol)
@@ -566,9 +728,11 @@ impl ControlPlaneHandle {
                             if !pool.note_target(&key) {
                                 return;
                             }
+                            let pool_reporter =
+                                pool_feedback.as_ref().map(|feedback| feedback.start());
                             match registry
                                 .dial_runtime(
-                                    generation,
+                                    Arc::clone(&generation),
                                     node.id,
                                     resolved_target,
                                     target_domain.as_deref(),
@@ -577,9 +741,23 @@ impl ControlPlaneHandle {
                                 .await
                             {
                                 Ok(stream) => {
+                                    if generation.is_shutdown() {
+                                        if let Some(reporter) = &pool_reporter {
+                                            reporter.finish(crate::group::ScoreOutcome::Shutdown);
+                                        }
+                                        return;
+                                    }
+                                    if let Some(reporter) = &pool_reporter {
+                                        reporter.setup_succeeded();
+                                        reporter.finish_setup_only();
+                                    }
                                     pool.deposit_ready(&key, stream).await;
                                 }
                                 Err(e) => {
+                                    if let Some(reporter) = &pool_reporter {
+                                        reporter
+                                            .setup_failed(score_runtime_outcome(&generation, &e));
+                                    }
                                     debug!(
                                         "Pool deposit: ready dial to {} via {} failed: {}",
                                         resolved_target, node_addr, e
@@ -593,17 +771,49 @@ impl ControlPlaneHandle {
                             // instead; a bare TCP is useless to them.
                             return;
                         }
+                        let pool_reporter = pool_feedback.as_ref().map(|feedback| {
+                            feedback
+                                .clone()
+                                .with_context(crate::group::ScoreSelectionContext::aggregate(
+                                    SelectionNetwork::Tcp,
+                                    ProbeDomain::Tcp,
+                                    pool_health_family,
+                                ))
+                                .start()
+                        });
                         match honk_outbound::util::connect_outbound(&node_addr, connect_timeout)
                             .await
                         {
                             Ok(stream) => {
+                                if generation.is_shutdown() {
+                                    if let Some(reporter) = &pool_reporter {
+                                        reporter.finish(crate::group::ScoreOutcome::Shutdown);
+                                    }
+                                    return;
+                                }
                                 if is_tcp_stream_alive(&stream) {
+                                    if let Some(reporter) = &pool_reporter {
+                                        reporter.setup_succeeded();
+                                        reporter.finish_setup_only();
+                                    }
                                     pool.deposit_tcp(&node_addr, stream).await;
                                 } else {
+                                    if let Some(reporter) = &pool_reporter {
+                                        reporter.setup_failed(crate::group::ScoreOutcome::Io(
+                                            std::io::ErrorKind::ConnectionReset,
+                                        ));
+                                    }
                                     debug!("Pool deposit: stream to {} is dead", node_addr);
                                 }
                             }
                             Err(e) => {
+                                if let Some(reporter) = &pool_reporter {
+                                    reporter.setup_failed(if generation.is_shutdown() {
+                                        crate::group::ScoreOutcome::Shutdown
+                                    } else {
+                                        crate::group::ScoreOutcome::Io(e.kind())
+                                    });
+                                }
                                 debug!("Pool deposit: connect to {} failed: {}", node_addr, e);
                             }
                         }
@@ -640,6 +850,9 @@ impl ControlPlaneHandle {
                 }
                 self.stats.record_error(&outbound_name);
                 self.stats.record_close(&outbound_name);
+                if let Some(reporter) = &score_reporter {
+                    reporter.finish(crate::group::ScoreOutcome::from_error(&e));
+                }
             }
         }
 
@@ -679,19 +892,28 @@ impl ControlPlaneHandle {
         overall_dial_timeout: Duration,
         runtime_generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
         ipver: IpVersion,
+        feedback: &HashMap<uuid::Uuid, crate::group::ScoreFeedback>,
         cold_urltest: bool,
-    ) -> Option<(crate::proxy::ProxyStream, Node)> {
+    ) -> Option<(
+        crate::proxy::ProxyStream,
+        Node,
+        Option<crate::group::ScoreReporter>,
+    )> {
         let dial_deadline = tokio::time::Instant::now() + overall_dial_timeout;
         let ctx = self.clone();
         let target = resolved_target;
         let outbound = outbound_name.to_string();
+        let feedback = feedback.clone();
 
         let mut set = tokio::task::JoinSet::new();
+        let started_reporters = Arc::new(parking_lot::Mutex::new(Vec::new()));
         for (idx, node) in candidates.iter().enumerate() {
             let ctx = ctx.clone();
             let node = (*node).clone();
             let target_domain = target_domain.clone();
             let generation = Arc::clone(&runtime_generation);
+            let feedback = feedback.clone();
+            let started_reporters = Arc::clone(&started_reporters);
             set.spawn(async move {
                 if cold_urltest {
                     // Absolute releases make only candidate zero immediate;
@@ -699,6 +921,14 @@ impl ControlPlaneHandle {
                     // cancels it before it can start.
                     wait_for_cold_urltest_release(idx).await;
                 }
+                let reporter = parking_lot::Mutex::new(None);
+                let on_start = || {
+                    let started = feedback.get(&node.id).map(|feedback| feedback.start());
+                    if let Some(reporter) = &started {
+                        started_reporters.lock().push(reporter.clone());
+                    }
+                    *reporter.lock() = started;
+                };
                 let start = std::time::Instant::now();
                 let per_dial_timeout = connect_timeout * 3;
                 let result = tokio::time::timeout(
@@ -708,27 +938,45 @@ impl ControlPlaneHandle {
                         &ctx.connection_pool,
                         &generation,
                         &node,
-                        target,
-                        target_domain.as_deref(),
+                        (target, target_domain.as_deref()),
                         connect_timeout,
+                        on_start,
                     ),
                 )
                 .await
                 .unwrap_or_else(|_| {
-                    Err(anyhow::anyhow!(
-                        "dial timed out after {:?}",
-                        per_dial_timeout
-                    ))
+                    Err(anyhow::Error::new(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("dial timed out after {per_dial_timeout:?}"),
+                    )))
                 });
                 let elapsed = start.elapsed();
-                (result, idx, elapsed, node)
+                let reporter = reporter.into_inner();
+                match &result {
+                    Ok(_) => {
+                        if let Some(reporter) = &reporter {
+                            reporter.setup_succeeded();
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(reporter) = &reporter {
+                            reporter.setup_failed(score_runtime_outcome(&generation, error));
+                        }
+                    }
+                }
+                (result, idx, elapsed, node, reporter)
             });
         }
 
         let mut last_err: Option<(String, String)> = None;
         let mut first_err: Option<(String, String)> = None;
         let mut timeout_count: usize = 0;
-        let mut winner: Option<(crate::proxy::ProxyStream, usize, Node)> = None;
+        let mut winner: Option<(
+            crate::proxy::ProxyStream,
+            usize,
+            Node,
+            Option<crate::group::ScoreReporter>,
+        )> = None;
         let mut remaining = set.len();
 
         loop {
@@ -738,7 +986,7 @@ impl ControlPlaneHandle {
             remaining -= 1;
             match tokio::time::timeout_at(dial_deadline, set.join_next()).await {
                 Ok(Some(task_result)) => match task_result {
-                    Ok((Ok((stream, fresh)), idx, elapsed, node)) => {
+                    Ok((Ok((stream, fresh)), idx, elapsed, node, reporter)) => {
                         ctx.alive_set
                             .report_available_traffic(node.id, ProbeDomain::Tcp, ipver);
                         // Real-traffic degradation fast path: a fresh
@@ -755,18 +1003,20 @@ impl ControlPlaneHandle {
                         {
                             ctx.alive_set.notify_check_tcp(node.id);
                         }
-                        winner = Some((stream, idx, node));
+                        winner = Some((stream, idx, node, reporter));
                         set.abort_all();
                         break;
                     }
-                    Ok((Err(e), _idx, _elapsed, node)) => {
+                    Ok((Err(e), _idx, _elapsed, node, _reporter)) => {
                         debug!("Parallel dial to {} failed: {}", node.name, e);
                         ctx.stats.record_error(&outbound);
-                        ctx.alive_set
-                            .report_unavailable_traffic(node.id, ProbeDomain::Tcp, ipver);
-                        ctx.alive_set
-                            .record_dial_failure(node.id, ProbeDomain::Tcp, ipver);
-                        ctx.alive_set.notify_check_tcp(node.id);
+                        report_dial_failure_if_current(
+                            &runtime_generation,
+                            &ctx.alive_set,
+                            node.id,
+                            ProbeDomain::Tcp,
+                            ipver,
+                        );
                         let msg = e.to_string();
                         if msg.starts_with("dial timed out after") {
                             timeout_count += 1;
@@ -782,6 +1032,7 @@ impl ControlPlaneHandle {
                 },
                 Ok(None) => break,
                 Err(_elapsed) => {
+                    timeout_started_score_reporters(&started_reporters);
                     set.abort_all();
                     warn!(
                         "Overall dial deadline reached for outbound '{}' ({} candidates, {} remaining)",
@@ -797,14 +1048,13 @@ impl ControlPlaneHandle {
         // Drain any remaining aborted tasks to avoid JoinSet drop panic.
         while (set.join_next().await).is_some() {}
 
-        // Deposit fresh connections for losing candidates into the pool
         // so the pool stays warm after a parallel-dial race. Limit to 2 deposits
         // per race to avoid thundering herd on the proxy servers.
         // Ready-capable handlers get a fully-dialed stream (handshake
         // included, paid off the critical path); others get a bare TCP.
         if outbound_name != "direct"
             && outbound_name != "block"
-            && let Some((_, winning_idx, _)) = &winner
+            && let Some((_, winning_idx, ..)) = &winner
         {
             let mut deposit_count = 0u32;
             for (idx, node) in candidates.iter().enumerate() {
@@ -820,6 +1070,9 @@ impl ControlPlaneHandle {
                 let registry = ctx.proxy_registry.clone();
                 let target_domain = target_domain.clone();
                 let generation = Arc::clone(&runtime_generation);
+                let pool_feedback = feedback.get(&node.id).cloned();
+                let pool_health_family = ipver;
+                deposit_count += 1;
                 tokio::spawn(async move {
                     let (ready_capable, bare_capable) = registry
                         .find(node.protocol)
@@ -839,9 +1092,10 @@ impl ControlPlaneHandle {
                             return;
                         };
                         let _dial_permit = generation.acquire_dial_permit().await;
+                        let pool_reporter = pool_feedback.as_ref().map(|feedback| feedback.start());
                         match registry
                             .dial_runtime(
-                                generation,
+                                Arc::clone(&generation),
                                 node.id,
                                 target,
                                 target_domain.as_deref(),
@@ -850,9 +1104,22 @@ impl ControlPlaneHandle {
                             .await
                         {
                             Ok(stream) => {
+                                if generation.is_shutdown() {
+                                    if let Some(reporter) = &pool_reporter {
+                                        reporter.finish(crate::group::ScoreOutcome::Shutdown);
+                                    }
+                                    return;
+                                }
+                                if let Some(reporter) = &pool_reporter {
+                                    reporter.setup_succeeded();
+                                    reporter.finish_setup_only();
+                                }
                                 pool.deposit_ready(&key, stream).await;
                             }
                             Err(e) => {
+                                if let Some(reporter) = &pool_reporter {
+                                    reporter.setup_failed(score_runtime_outcome(&generation, &e));
+                                }
                                 debug!(
                                     "Post-race pool deposit: ready dial to {} via {} failed: {}",
                                     target, node_addr, e
@@ -867,15 +1134,47 @@ impl ControlPlaneHandle {
                         return;
                     }
                     let _dial_permit = generation.acquire_dial_permit().await;
+                    let pool_reporter = pool_feedback.as_ref().map(|feedback| {
+                        feedback
+                            .clone()
+                            .with_context(crate::group::ScoreSelectionContext::aggregate(
+                                SelectionNetwork::Tcp,
+                                ProbeDomain::Tcp,
+                                pool_health_family,
+                            ))
+                            .start()
+                    });
                     match honk_outbound::util::connect_outbound(&node_addr, connect_timeout).await {
                         Ok(stream) => {
+                            if generation.is_shutdown() {
+                                if let Some(reporter) = &pool_reporter {
+                                    reporter.finish(crate::group::ScoreOutcome::Shutdown);
+                                }
+                                return;
+                            }
                             if is_tcp_stream_alive(&stream) {
+                                if let Some(reporter) = &pool_reporter {
+                                    reporter.setup_succeeded();
+                                    reporter.finish_setup_only();
+                                }
                                 pool.deposit_tcp(&node_addr, stream).await;
                             } else {
+                                if let Some(reporter) = &pool_reporter {
+                                    reporter.setup_failed(crate::group::ScoreOutcome::Io(
+                                        std::io::ErrorKind::ConnectionReset,
+                                    ));
+                                }
                                 debug!("Post-race pool deposit: stream to {} is dead", node_addr);
                             }
                         }
                         Err(e) => {
+                            if let Some(reporter) = &pool_reporter {
+                                reporter.setup_failed(if generation.is_shutdown() {
+                                    crate::group::ScoreOutcome::Shutdown
+                                } else {
+                                    crate::group::ScoreOutcome::Io(e.kind())
+                                });
+                            }
                             debug!(
                                 "Post-race pool deposit: connect to {} failed: {}",
                                 node_addr, e
@@ -883,12 +1182,11 @@ impl ControlPlaneHandle {
                         }
                     }
                 });
-                deposit_count += 1;
             }
         }
 
         match winner {
-            Some((stream, _, node)) => Some((stream, node)),
+            Some((stream, _, node, reporter)) => Some((stream, node, reporter)),
             None => {
                 if let Some((last_msg, last_name)) = last_err {
                     let (first_msg, first_name) =
@@ -938,10 +1236,11 @@ impl ControlPlaneHandle {
         pool: &ConnectionPool,
         generation: &Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
         node: &Node,
-        target: SocketAddr,
-        target_domain: Option<&str>,
+        target: (SocketAddr, Option<&str>),
         connect_timeout: Duration,
+        on_start: impl FnOnce(),
     ) -> anyhow::Result<(crate::proxy::ProxyStream, bool)> {
+        let (target, target_domain) = target;
         static POOL_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let pool_disabled = *POOL_DISABLED.get_or_init(|| {
             std::env::var("HONK_POOL_DISABLE")
@@ -962,6 +1261,7 @@ impl ControlPlaneHandle {
                     addr,
                     target
                 );
+                on_start();
                 return Ok((stream, false));
             }
         }
@@ -988,6 +1288,7 @@ impl ControlPlaneHandle {
             && (entry.descriptor.pool_bare_tcp)(node)
             && let Some(tcp) = pool.acquire_tcp(&addr).await
         {
+            on_start();
             tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);
             return entry
                 .tcp
@@ -1001,6 +1302,7 @@ impl ControlPlaneHandle {
         // (e.g. a hand-built test config without the built-in nodes
         // injected) falls back to the stateless node-based dial.
         tracing::debug!("Fresh TCP connect to {} for {}", addr, target);
+        on_start();
         if generation.get(&node.id).is_some() {
             registry
                 .dial_runtime(
@@ -1019,6 +1321,91 @@ impl ControlPlaneHandle {
                 .await
                 .map(|stream| (stream, true))
         }
+    }
+}
+
+#[cfg(test)]
+mod score_tests {
+    use super::*;
+
+    #[test]
+    fn tcp_score_context_uses_resolved_target_family_not_health_family() {
+        let resolved: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let context = tcp_score_context(resolved, Some("example.com"), IpVersion::V6);
+
+        assert_eq!(context.target_family, Some(IpVersion::V4));
+        assert_eq!(context.health_family, IpVersion::V6);
+        assert_eq!(
+            context.target,
+            Some(crate::group::ScoreTarget::domain("example.com", 443))
+        );
+    }
+
+    #[test]
+    fn unpack_tcp_score_plan_deduplicates_shared_leaf_metadata() {
+        let node = Node {
+            id: uuid::Uuid::new_v4(),
+            name: "shared".into(),
+            ..Default::default()
+        };
+        let plan = crate::control::reload::ResolvedScorePlan {
+            mode: SelectionPlanMode::ColdUrlTest,
+            nodes: vec![node.clone(), node],
+            health_family: IpVersion::V4,
+            feedback: vec![None, None],
+            selection_chains: vec![
+                vec!["outer".into(), "shared".into()],
+                vec!["duplicate".into(), "shared".into()],
+            ],
+        };
+        let (nodes, mode, feedback, selection_chains, family) = unpack_tcp_score_plan(plan);
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(mode, SelectionPlanMode::ColdUrlTest);
+        assert!(feedback.is_empty());
+        assert_eq!(
+            selection_chains[&nodes[0].id],
+            ["outer".to_owned(), "shared".to_owned()]
+        );
+        assert_eq!(family, IpVersion::V4);
+    }
+
+    #[test]
+    fn timeout_helper_finishes_started_reporter_before_abort_drop() {
+        let nodes = [
+            Node {
+                id: uuid::Uuid::new_v4(),
+                name: "a".into(),
+                ..Default::default()
+            },
+            Node {
+                id: uuid::Uuid::new_v4(),
+                name: "b".into(),
+                ..Default::default()
+            },
+        ];
+        let group = honk_config::group::Group {
+            name: "score".into(),
+            policy: honk_config::group::GroupPolicy::Score,
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            ..Default::default()
+        };
+        let manager = crate::group::GroupManager::new(&[group], &nodes);
+        let context = tcp_score_context("192.0.2.1:443".parse().unwrap(), None, IpVersion::V4);
+        let feedback = manager
+            .feedback_for_node(nodes[0].id, context.clone())
+            .unwrap();
+        let reporters = parking_lot::Mutex::new(vec![feedback.start()]);
+        assert_eq!(started_score_reporter_count(&reporters), 1);
+        timeout_started_score_reporters(&reporters);
+        drop(reporters);
+
+        assert_eq!(
+            manager.selection_plan_for_target("score", &context).entries[0]
+                .node
+                .id,
+            nodes[1].id
+        );
     }
 }
 

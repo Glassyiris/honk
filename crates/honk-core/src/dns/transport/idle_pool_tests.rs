@@ -36,6 +36,7 @@ async fn assert_close_excludes_inflight_return() {
             || async { Ok::<_, anyhow::Error>(client) },
             &[0_u8; 12],
             Duration::from_secs(1),
+            None,
         )
         .await
     });
@@ -69,6 +70,7 @@ async fn assert_close_excludes_inflight_return() {
         || async { Ok::<_, anyhow::Error>(tokio::io::duplex(64).0) },
         &[0_u8; 12],
         Duration::from_secs(1),
+        None,
     )
     .await
     .expect_err("closed pool rejects exchange");

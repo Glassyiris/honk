@@ -75,14 +75,10 @@ impl ControlPlane {
         let alive_set = Arc::new(
             crate::outbound::AliveDialerSet::new().with_so_mark(honk_ebpf_common::DAE_BYPASS_MARK),
         );
-        // direct is probed against the bootstrap resolver rather than the
-        // proxy check URL (which is unreachable over direct egress), so the
-        // clash API gets a real direct latency too. The urltest (on-demand
-        // delay) path shares the same target.
+        // Periodic direct health uses a stable bootstrap target; on-demand
+        // URL tests still measure their requested URL.
         let direct_target = direct_check_addr(&config.global.bootstrap_resolver);
-        let direct_target_socket = direct_target.parse()?;
         alive_set.set_direct_check_addr(direct_target.clone());
-        honk_outbound::urltest::set_urltest_direct_target(direct_target_socket);
         // Register health checks per the config's group membership; reload
         // re-runs the same sync via `reload_group_manager`.
         let (added, _) = sync_health_check_nodes(&alive_set, &config);
@@ -116,6 +112,12 @@ impl ControlPlane {
         // they currently select, and the tag keeps the result. The cell
         // keeps working across reloads (the manager inside is swapped).
         let group_manager = group_manager.into_shared();
+        {
+            let group_manager = group_manager.clone();
+            alive_set.set_score_feedback_factory(move |node_id, context| {
+                group_manager.read().feedback_for_node(node_id, context)
+            });
+        }
         // Per-node runtime registry (single owner of session-layer
         // resources, keyed by Node.id). Invalid node sets (nil/duplicate
         // UUIDs) are a fatal config error at startup.

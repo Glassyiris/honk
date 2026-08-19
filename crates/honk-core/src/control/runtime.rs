@@ -232,6 +232,7 @@ impl ControlPlane {
                         self.proxy_registry.clone(),
                         self.runtime_registry.clone(),
                         check_method.clone(),
+                        self.group_manager.clone(),
                     ));
                     alive_set
                         .set_http_probe(prober, check_url, check_method)
@@ -258,30 +259,46 @@ impl ControlPlane {
                     let c = self.config.read().await;
                     c.global.udp_check_dns.clone()
                 };
-                let dns_target = resolve_udp_check_target(
-                    &dns_raw,
-                    Some({
-                        let controller = self.dns_controller.clone();
-                        Arc::new(move |host: String, port: u16| {
-                            let controller = controller.clone();
-                            Box::pin(async move {
-                                controller
-                                    .resolve_domain(&host)
-                                    .await
-                                    .into_iter()
-                                    .map(|ip| std::net::SocketAddr::new(ip, port))
-                                    .collect()
-                            })
+                let quic_url = {
+                    let c = self.config.read().await;
+                    if c.groups
+                        .iter()
+                        .any(|group| group.policy == honk_config::node::GroupPolicy::Score)
+                    {
+                        c.global.tcp_check_url.first().cloned().unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
+                };
+                let resolver: crate::outbound::ResolveHook = {
+                    let controller = self.dns_controller.clone();
+                    Arc::new(move |host: String, port: u16| {
+                        let controller = controller.clone();
+                        Box::pin(async move {
+                            controller
+                                .resolve_domain(&host)
+                                .await
+                                .into_iter()
+                                .map(|ip| std::net::SocketAddr::new(ip, port))
+                                .collect()
                         })
-                    }),
-                )
-                .await;
+                    })
+                };
+                let dns_target = resolve_udp_check_target(&dns_raw, Some(resolver.clone())).await;
+                let quic_score_target = if quic_url.is_empty() {
+                    None
+                } else {
+                    resolve_quic_score_target(&quic_url, Some(resolver)).await
+                };
                 alive_set.set_udp_probe(Arc::new(ProxyUdpProber::new(
                     self.config.clone(),
                     self.proxy_registry.clone(),
                     self.runtime_registry.clone(),
                     self.stats.clone(),
                     dns_target,
+                    udp_probe_identity(&dns_raw, dns_target),
+                    quic_score_target,
+                    self.group_manager.clone(),
                 )));
                 info!("UDP health check enabled (dns={})", dns_target);
             }

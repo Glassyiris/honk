@@ -99,7 +99,11 @@ impl UdpPool {
         }
     }
 
-    pub async fn exchange(&self, query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub async fn exchange(
+        &self,
+        query: &[u8],
+        reporter: Option<&honk_outbound::group::ScoreReporter>,
+    ) -> anyhow::Result<Vec<u8>> {
         if query.len() < 12 {
             anyhow::bail!("malformed DNS query");
         }
@@ -132,6 +136,10 @@ impl UdpPool {
         if let Err(error) = self.socket.send(&wire).await {
             self.unregister(id).await;
             return Err(error.into());
+        }
+        if let Some(reporter) = reporter {
+            reporter.setup_succeeded();
+            reporter.tx(query.len() as u64);
         }
         match tokio::time::timeout(self.timeout, receiver).await {
             Ok(Ok(response)) => Ok(response),
@@ -299,14 +307,14 @@ mod tests {
         });
         let pool = UdpPool::new(address, Duration::from_secs(1)).await.unwrap();
 
-        pool.exchange(&query(0x1234)).await.unwrap();
+        pool.exchange(&query(0x1234), None).await.unwrap();
         let first_id = first_id_rx.await.unwrap();
         {
             let state = pool.state.lock().await;
             assert!(UdpPool::is_retired(&state, first_id));
             assert_ne!(UdpPool::allocate_id_from(&state, first_id), Some(first_id));
         }
-        pool.exchange(&query(0x5678)).await.unwrap();
+        pool.exchange(&query(0x5678), None).await.unwrap();
 
         pool.close().await;
         responder.await.unwrap();
@@ -328,7 +336,8 @@ mod tests {
             .unwrap();
         assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 1);
         let exchange_pool = Arc::clone(&pool);
-        let exchange = tokio::spawn(async move { exchange_pool.exchange(&query(0x1234)).await });
+        let exchange =
+            tokio::spawn(async move { exchange_pool.exchange(&query(0x1234), None).await });
         received_rx.await.unwrap();
 
         pool.close().await;
@@ -341,7 +350,7 @@ mod tests {
         assert!(error.to_string().contains("receive loop stopped"));
         assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(
-            pool.exchange(&query(0x5678))
+            pool.exchange(&query(0x5678), None,)
                 .await
                 .expect_err("closed pool rejects exchanges")
                 .to_string()

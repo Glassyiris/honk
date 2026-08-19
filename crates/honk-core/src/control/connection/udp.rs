@@ -301,13 +301,28 @@ impl ControlPlaneHandle {
         } else {
             IpVersion::V4
         };
-        let (plan, selection_chain) = {
+        let (plan, selection_chains) = {
             let config = self.config.read().await;
             let gm = self.group_manager.read();
-            let plan = resolve_udp_outbound_plan(&config, &gm, &outbound_name, requested_ipver);
-            let selection_chain =
-                gm.selection_chain_for_network(&outbound_name, SelectionNetwork::Udp);
-            (plan, selection_chain)
+            let plan = crate::control::reload::resolve_udp_outbound_plan_for_target(
+                &config,
+                &gm,
+                &outbound_name,
+                &crate::group::ScoreSelectionContext {
+                    network: SelectionNetwork::Udp,
+                    probe_domain: ProbeDomain::DataUdp,
+                    target_family: Some(requested_ipver),
+                    health_family: requested_ipver,
+                    target: Some(match quic_domain.as_deref() {
+                        Some(domain) => {
+                            crate::group::ScoreTarget::domain(domain, original_dst.port())
+                        }
+                        None => original_dst.into(),
+                    }),
+                },
+            );
+            let selection_chains = plan.selection_chains.clone();
+            (plan, selection_chains)
         };
 
         if plan.nodes.is_empty() {
@@ -333,20 +348,30 @@ impl ControlPlaneHandle {
         // a single eligible transport winner has been drained and accepted.
         let scheduler_ipver = plan.ipver;
         let plan_mode = plan.mode;
+        let score_feedback = plan.feedback;
         let runtime_generation = self.runtime_registry.read().clone();
-        let prepare: UdpPrepare<honk_outbound::proxy::PreparedUdpTransport> = {
+        let prepare_generation = Arc::clone(&runtime_generation);
+        let prepare: UdpPrepare<(
+            honk_outbound::proxy::PreparedUdpTransport,
+            Option<crate::group::ScoreReporter>,
+            Vec<String>,
+        )> = {
             let registry = self.proxy_registry.clone();
             let stats = self.stats.clone();
-            Arc::new(move |node: Node| {
+            let feedback = score_feedback.clone();
+            Arc::new(move |index: usize, node: Node| {
                 let registry = registry.clone();
                 let stats = stats.clone();
-                let runtime_generation = Arc::clone(&runtime_generation);
+                let runtime_generation = Arc::clone(&prepare_generation);
+                let feedback = feedback.get(index).cloned().flatten();
+                let selection_chain = selection_chains.get(index).cloned().unwrap_or_default();
                 Box::pin(async move {
+                    let reporter = feedback.map(|feedback| feedback.start());
                     let dial_started_at = std::time::Instant::now();
                     let result = if plan_mode == SelectionPlanMode::ColdUrlTest {
                         registry
                             .dial_udp_transport_speculative(
-                                runtime_generation,
+                                Arc::clone(&runtime_generation),
                                 node.id,
                                 original_dst,
                                 None,
@@ -356,7 +381,7 @@ impl ControlPlaneHandle {
                     } else {
                         registry
                             .dial_udp_transport_runtime(
-                                runtime_generation,
+                                Arc::clone(&runtime_generation),
                                 node.id,
                                 original_dst,
                                 None,
@@ -366,7 +391,18 @@ impl ControlPlaneHandle {
                             .map(honk_outbound::proxy::PreparedUdpTransport::ready)
                     };
                     stats.record_udp_dial_latency(dial_started_at.elapsed());
-                    result
+                    match result {
+                        Ok(transport) => Ok((transport, reporter, selection_chain)),
+                        Err(error) => {
+                            if let Some(reporter) = &reporter {
+                                reporter.setup_failed(score_runtime_outcome(
+                                    &runtime_generation,
+                                    &error,
+                                ));
+                            }
+                            Err(error)
+                        }
+                    }
                 })
             })
         };
@@ -383,14 +419,15 @@ impl ControlPlaneHandle {
             },
             on_dial_error: {
                 let alive_set = self.alive_set.clone();
+                let runtime_generation = Arc::clone(&runtime_generation);
                 Arc::new(move |node| {
-                    alive_set.report_unavailable_traffic(
+                    report_dial_failure_if_current(
+                        &runtime_generation,
+                        &alive_set,
                         node.id,
                         ProbeDomain::DataUdp,
                         scheduler_ipver,
                     );
-                    alive_set.record_dial_failure(node.id, ProbeDomain::DataUdp, scheduler_ipver);
-                    alive_set.notify_check_tcp(node.id);
                 })
             },
             on_attempt: {
@@ -406,7 +443,7 @@ impl ControlPlaneHandle {
                 Arc::new(move || stats.record_udp_stagger_cancellation())
             },
         };
-        let Some((node, prepared_transport)) =
+        let Some((node, (prepared_transport, score_reporter, selection_chain))) =
             prepare_udp_plan(plan_mode, plan.nodes, prepare, callbacks).await
         else {
             debug!(
@@ -421,6 +458,9 @@ impl ControlPlaneHandle {
         // been aborted/drained. Close the death-before-bind race again before
         // creating endpoint state or allowing the driver to send.
         if !lease.bind_selected_node(node.id) {
+            if let Some(reporter) = &score_reporter {
+                reporter.finish(crate::group::ScoreOutcome::Cancelled);
+            }
             return Err(anyhow::anyhow!(
                 "UDP initializer generation was cancelled before winner bind"
             ));
@@ -433,6 +473,9 @@ impl ControlPlaneHandle {
             )
         {
             lease.clear_selected_node();
+            if let Some(reporter) = &score_reporter {
+                reporter.finish(crate::group::ScoreOutcome::Cancelled);
+            }
             return Err(anyhow::anyhow!(
                 "UDP winner '{}' became ineligible before endpoint setup",
                 node.name
@@ -441,7 +484,18 @@ impl ControlPlaneHandle {
         // Promotion is explicit and still pre-publication: detached AnyTLS
         // sessions and QUIC clients become generation-owned only for the
         // finalized winner.
-        let transport = prepared_transport.commit().await?;
+        let transport = match prepared_transport.commit().await {
+            Ok(transport) => transport,
+            Err(error) => {
+                if let Some(reporter) = &score_reporter {
+                    reporter.finish(score_runtime_outcome(&runtime_generation, &error));
+                }
+                return Err(error);
+            }
+        };
+        if let Some(reporter) = &score_reporter {
+            reporter.setup_succeeded();
+        }
 
         // Both capacity (at reservation time) and anyfrom creation happen
         // after the winner is finalized and before the only first send. Any
@@ -453,6 +507,9 @@ impl ControlPlaneHandle {
                 self.stats
                     .record_udp_reply_ready_latency(reply_ready_started.elapsed());
                 self.stats.record_error(&outbound_name);
+                if let Some(reporter) = &score_reporter {
+                    reporter.finish(crate::group::ScoreOutcome::Cancelled);
+                }
                 return Err(error.into());
             }
         };
@@ -460,7 +517,13 @@ impl ControlPlaneHandle {
             .record_udp_reply_ready_latency(reply_ready_started.elapsed());
 
         let relay_addr = transport.relay_addr();
-        let endpoint = Arc::new(UdpEndpoint::new(transport, relay_addr, node.id));
+        let endpoint = Arc::new(UdpEndpoint::new_scored(
+            transport,
+            relay_addr,
+            node.id,
+            scheduler_ipver,
+            score_reporter,
+        ));
         endpoint.record_pending_reply_peer(relay_addr);
 
         let conn_id = uuid::Uuid::new_v4().to_string();

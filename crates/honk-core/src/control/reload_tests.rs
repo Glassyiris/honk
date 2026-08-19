@@ -878,6 +878,7 @@ async fn changed_selector_bare_endpoint_is_purged_before_failed_replacement() {
     let resources = SelectorWarmResources {
         generation: Arc::clone(&generation),
         proxy_registry: cp.proxy_registry.clone(),
+        group_manager: cp.group_manager.clone(),
         connection_pool: cp.connection_pool.clone(),
         stats: cp.stats.clone(),
         selected_ids: cp.selector_warm_ids.clone(),

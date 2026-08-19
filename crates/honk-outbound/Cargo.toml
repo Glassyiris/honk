@@ -1,4 +1,3 @@
-
 [package]
 name = "honk-outbound"
 version.workspace = true

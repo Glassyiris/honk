@@ -42,6 +42,7 @@ pub fn parse_dae_config_file(path: impl AsRef<Path>) -> Result<Config, crate::Co
 
     match parse_dae_config(&input) {
         Ok(config) => Ok(config),
+        Err(err @ crate::ConfigError::UnsupportedPolicy(_)) => Err(err),
         Err(err) if loader.saw_include => Err(crate::ConfigError::Include(format!(
             "failed to parse configuration after resolving includes: {err}"
         ))),
@@ -1613,7 +1614,7 @@ fn parse_group_section(section: &Section) -> Result<Vec<Group>, crate::ConfigErr
         };
         let kv = parse_kv_pairs(&grp.body);
         if let Some(policy) = kv.get("policy") {
-            group.policy = parse_group_policy(policy);
+            group.policy = parse_group_policy(policy)?;
         }
         if let Some(final_outbound) = kv.get("final") {
             group.final_outbound = Some(final_outbound.to_string());
@@ -1661,10 +1662,7 @@ fn parse_group_section(section: &Section) -> Result<Vec<Group>, crate::ConfigErr
     Ok(groups)
 }
 
-fn parse_group_policy(policy: &str) -> crate::group::GroupPolicy {
-    // dae accepts parameterized policies like `fixed(0)` / `min_moving_avg`.
-    // Strip the optional `(...)` argument before matching the base name so
-    // `policy: fixed(0)` is recognized as Selector (not the default fallthrough).
+fn parse_group_policy(policy: &str) -> Result<crate::group::GroupPolicy, crate::ConfigError> {
     let base = policy
         .trim()
         .split_once('(')
@@ -1672,15 +1670,19 @@ fn parse_group_policy(policy: &str) -> crate::group::GroupPolicy {
         .unwrap_or_else(|| policy.trim())
         .to_ascii_lowercase();
     match base.as_str() {
-        "select" | "selector" | "fixed" => crate::group::GroupPolicy::Selector,
+        "select" | "selector" | "fixed" => Ok(crate::group::GroupPolicy::Selector),
         "urltest" | "min_moving_avg" | "min_avg10" | "min_last_delay" => {
-            crate::group::GroupPolicy::URLTest
+            Ok(crate::group::GroupPolicy::URLTest)
         }
         "roundrobin" | "round_robin" | "loadbalance" | "balance" => {
-            crate::group::GroupPolicy::LoadBalance
+            Ok(crate::group::GroupPolicy::LoadBalance)
         }
-        "fallback" => crate::group::GroupPolicy::Fallback,
-        _ => crate::group::GroupPolicy::Selector,
+        "fallback" => Ok(crate::group::GroupPolicy::Fallback),
+        "score" => Ok(crate::group::GroupPolicy::Score),
+        "honk" => Err(crate::ConfigError::UnsupportedPolicy(
+            "group policy 'honk' was renamed to 'score'".into(),
+        )),
+        _ => Ok(crate::group::GroupPolicy::Selector),
     }
 }
 

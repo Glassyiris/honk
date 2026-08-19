@@ -354,10 +354,10 @@ pub struct DnsUpstream {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsRouting {
     /// New-style request routing rules.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "DnsRequestRouting::is_default")]
     pub request: DnsRequestRouting,
     /// New-style response routing rules.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "DnsResponseRouting::is_default")]
     pub response: DnsResponseRouting,
     /// LEGACY flat rules for old JSON/tests — converted in `DnsRouter::new`
     /// when `request.rules` is empty.
@@ -557,34 +557,62 @@ impl Default for DnsResponseRouting {
     }
 }
 
-// All the new routing types live outside the serde tree.  `DnsRouting` only
-// serialises/deserialises the legacy fields; the new request/response blocks
-// are populated by the parser, so the manual impls below accept-and-ignore
-// any serialized form and deserialize back to the defaults.
-
-impl Serialize for DnsRequestRouting {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        // Never serialised via JSON — the parser writes directly.
-        s.serialize_unit()
+impl DnsRequestRouting {
+    fn is_default(&self) -> bool {
+        self.rules.is_empty()
+            && matches!(&self.fallback, DnsRequestAction::Upstream(name) if name == "default")
     }
 }
+
+impl DnsResponseRouting {
+    fn is_default(&self) -> bool {
+        self.rules.is_empty() && self.fallback == DnsResponseAction::Accept
+    }
+}
+
+impl Serialize for DnsRequestRouting {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if !self.is_default() {
+            return Err(<S::Error as serde::ser::Error>::custom(
+                "dns.routing.request rules can only be written in dae syntax",
+            ));
+        }
+        serializer.serialize_unit()
+    }
+}
+
 impl<'de> Deserialize<'de> for DnsRequestRouting {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        // Accept anything and return default — populated by parser later.
-        let _ = serde::de::IgnoredAny::deserialize(d)?;
-        Ok(Self::default())
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if Option::<serde::de::IgnoredAny>::deserialize(deserializer)?.is_none() {
+            Ok(Self::default())
+        } else {
+            Err(<D::Error as serde::de::Error>::custom(
+                "dns.routing.request rules are only supported in dae syntax",
+            ))
+        }
     }
 }
 
 impl Serialize for DnsResponseRouting {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_unit()
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if !self.is_default() {
+            return Err(<S::Error as serde::ser::Error>::custom(
+                "dns.routing.response rules can only be written in dae syntax",
+            ));
+        }
+        serializer.serialize_unit()
     }
 }
+
 impl<'de> Deserialize<'de> for DnsResponseRouting {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let _ = serde::de::IgnoredAny::deserialize(d)?;
-        Ok(Self::default())
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if Option::<serde::de::IgnoredAny>::deserialize(deserializer)?.is_none() {
+            Ok(Self::default())
+        } else {
+            Err(<D::Error as serde::de::Error>::custom(
+                "dns.routing.response rules are only supported in dae syntax",
+            ))
+        }
     }
 }
 

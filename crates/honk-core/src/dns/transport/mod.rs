@@ -41,6 +41,10 @@ use doh_message::{build_doh_request, finish_doh_response};
 use idle_pool::{IdlePoolState, close_idle_pool, idle_pool_exchange};
 use quic::{SharedQuicEndpoint, dns_quic_config, quic_connect_endpoint};
 use retry::exchange_with_retry;
+fn is_valid_response(query: &[u8], response: &[u8]) -> bool {
+    crate::dns::query::QueryContext::parse(query)
+        .is_ok_and(|query| crate::dns::response::ResponseTemplate::check(&query, response).is_ok())
+}
 
 pub use dial::{DialContext, ProxyDial};
 pub use doh::DohClient;

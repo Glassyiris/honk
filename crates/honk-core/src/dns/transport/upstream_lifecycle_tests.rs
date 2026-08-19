@@ -336,7 +336,7 @@ async fn stalled_tls_setups_use_dial_timeout_for_dot_and_doh() {
 
         assert!(
             result.to_string().contains("timed out"),
-            "unexpected {protocol:?} setup error: {result}"
+            "unexpected {protocol:?} setup error: {result:#}"
         );
         pool.close().await;
         assert_eq!(pool.lifecycle_stats().tasks, 0);

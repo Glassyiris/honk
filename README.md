@@ -16,6 +16,8 @@ It is **not** a line-for-line port of either project. The kernel path follows da
 
 License: **GPL-3.0-only**.
 
+The always-compiled, reliability-first Score group policy is selected explicitly with `policy: score`; omitted policy still defaults to Selector. Score learns only in process memory from actual traffic plus DNS, real QUIC handshakes, probes, delay tests, warm-up, and direct or proxied UI downloads, without logging, persisting, or exporting scorer target keys. See the [group reference](doc/en/reference/groups.md#score-policy).
+
 ## Experimental held-first-packet UDP decisions
 
 The default-off UDP NFQUEUE path holds only ambiguous **LAN-forwarded** first packets after LAN TC and before conntrack/NAT. Enable it with a process configuration change:
@@ -56,10 +58,10 @@ These checkboxes indicate maintainer review status, not feature availability:
 
 ### TODO
 
+- [x] Add the always-compiled Score group policy
 - [ ] Add proxied DoQ/DoH3 through a quinn `AsyncUdpSocket` adapter over outbound `PacketTransport`
 - [ ] Evaluate AF_XDP and XDP paths for further performance gains
 - [ ] Add a honk REST API
-- [ ] Add a score-based group policy
 - [ ] Add inbound support
 - [ ] Track additional work through GitHub [Issues](https://github.com/Glassyiris/honk/issues) and [Discussions](https://github.com/Glassyiris/honk/discussions)
 

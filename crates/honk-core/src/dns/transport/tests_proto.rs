@@ -209,7 +209,7 @@ async fn tcp_pool_reuses_connection() {
     });
     let q = build_dns_query("example.com", 1);
     for _ in 0..3 {
-        let r = pool.exchange(&q).await.unwrap();
+        let r = pool.exchange(&q, None).await.unwrap();
         assert!(r.len() >= 12);
     }
     assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 1);

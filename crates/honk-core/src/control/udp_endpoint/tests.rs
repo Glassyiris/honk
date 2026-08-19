@@ -23,6 +23,25 @@ async fn first_reply_metric_and_alive_reporting_are_throttled() {
     assert!(endpoint.take_alive_report_slot());
 }
 
+#[tokio::test]
+async fn explicit_retirement_is_neutral_until_a_reply_makes_it_useful() {
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let relay = "127.0.0.1:53".parse().unwrap();
+    let endpoint = UdpEndpoint::new(transport(socket, relay), relay, uuid::Uuid::new_v4());
+    let result = Err(io::Error::new(io::ErrorKind::BrokenPipe, "retired"));
+    endpoint.kill();
+
+    assert_eq!(
+        score_driver_outcome(&endpoint, &result),
+        ScoreOutcome::Cancelled
+    );
+    endpoint.has_reply.store(true, Ordering::Relaxed);
+    assert_eq!(
+        score_driver_outcome(&endpoint, &result),
+        ScoreOutcome::Success
+    );
+}
+
 async fn recv_and_ack(
     pool: &UdpEndpointPool,
     rx: &mut mpsc::Receiver<EndpointRemoval>,
@@ -95,6 +114,7 @@ async fn run_endpoint_driver(
             alive_set,
             stats,
             outbound_tracker,
+            health_family: honk_outbound::alive::IpVersion::V4,
         },
         UdpDriverStart {
             first,

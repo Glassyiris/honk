@@ -54,26 +54,36 @@ pub struct RelayStats {
     pub duration_ms: u64,
 }
 
-/// Optional live byte counters shared with a connection tracker.
-///
-/// `(client→proxy, proxy→client)`; relays increment them as bytes move so
-/// observers see per-connection traffic in real time instead of a single
-/// close-time update.
-pub type RelayProgress = Option<(
-    std::sync::Arc<std::sync::atomic::AtomicU64>,
-    std::sync::Arc<std::sync::atomic::AtomicU64>,
-)>;
+/// Live relay progress shared with connection accounting and optional
+/// first-response notification.
+#[derive(Clone)]
+pub struct RelayProgress {
+    pub upload: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub download: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub first_response: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+pub type OptionalRelayProgress = Option<RelayProgress>;
 
 /// AsyncRead wrapper that counts bytes read from the inner stream into a
 /// shared counter. Writes pass through untouched.
 pub(crate) struct ReadCounter<S> {
     inner: S,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    on_progress: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl<S> ReadCounter<S> {
-    pub(crate) fn wrap(inner: S, counter: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
-        Self { inner, counter }
+    pub(crate) fn wrap(
+        inner: S,
+        counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        on_progress: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    ) -> Self {
+        Self {
+            inner,
+            counter,
+            on_progress,
+        }
     }
 }
 
@@ -90,6 +100,9 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ReadCounter<S> {
             if n > 0 {
                 self.counter
                     .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                if let Some(callback) = self.on_progress.take() {
+                    callback();
+                }
             }
         }
         poll
@@ -148,7 +161,7 @@ where
 {
     const RELAY_BUF_SIZE: usize = 64 * 1024;
     let mut br =
-        tokio::io::BufReader::with_capacity(RELAY_BUF_SIZE, ReadCounter::wrap(rd, progress));
+        tokio::io::BufReader::with_capacity(RELAY_BUF_SIZE, ReadCounter::wrap(rd, progress, None));
     let n = tokio::io::copy_buf(&mut br, wr).await?;
     wr.shutdown().await?;
     Ok(n)

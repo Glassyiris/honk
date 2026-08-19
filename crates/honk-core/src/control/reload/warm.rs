@@ -1,12 +1,12 @@
 use super::*;
 
 const SELECTOR_WARM_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
-
 #[derive(Clone)]
 pub(in crate::control) struct SelectorWarmResources {
     pub(in crate::control) generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
     pub(in crate::control) proxy_registry: Arc<ProxyRegistry>,
     pub(in crate::control) connection_pool: Arc<ConnectionPool>,
+    pub(in crate::control) group_manager: crate::group::SharedGroupManager,
     pub(in crate::control) stats: Arc<StatsManager>,
     pub(in crate::control) selected_ids:
         Arc<parking_lot::Mutex<std::collections::HashSet<uuid::Uuid>>>,
@@ -151,14 +151,16 @@ pub(in crate::control) async fn warm_selector_candidate(
         generation,
         proxy_registry,
         connection_pool,
+        group_manager,
         stats,
         bare_warm,
         ..
     } = resources;
     // Purge a moved endpoint before redial: failure must not keep the old
     // socket pinned under a stable node ID.
-    let supports_bare = (honk_outbound::descriptor::descriptor(node.protocol).pool_bare_tcp)(&node);
-    let bare_addr = supports_bare.then(|| format!("{}:{}", node.host(), node.port));
+    let descriptor = honk_outbound::descriptor::descriptor(node.protocol);
+    let bare_addr =
+        (descriptor.pool_bare_tcp)(&node).then(|| format!("{}:{}", node.host(), node.port));
     let stale = {
         let mut retained = bare_warm.lock();
         match (retained.get(&node.id), bare_addr.as_ref()) {
@@ -171,48 +173,113 @@ pub(in crate::control) async fn warm_selector_candidate(
         connection_pool.purge_bare(&stale);
         stats.clear_warm(node.id, crate::stats::WarmReason::Selector);
     }
-    match proxy_registry
-        .warm_session(Arc::clone(&generation), node.id, connect_timeout)
-        .await
-    {
-        Ok(honk_outbound::proxy::WarmOutcome::Ready) => {
-            if let Some(addr) = bare_warm.lock().remove(&node.id) {
-                connection_pool.purge_bare(&addr);
-            }
-            stats.mark_warm(node.id, crate::stats::WarmReason::Selector);
-        }
-        Ok(honk_outbound::proxy::WarmOutcome::NotApplicable) => {
-            let Some(addr) = bare_addr else {
-                return;
-            };
-            if !connection_pool.has_live_bare_entry(&addr) {
-                let stream =
-                    match honk_outbound::util::connect_outbound(&addr, connect_timeout).await {
-                        Ok(stream) if !generation.is_shutdown() && is_tcp_stream_alive(&stream) => {
-                            stream
-                        }
-                        Ok(_) => return,
-                        Err(error) => {
-                            debug!(node = %node.name, %error, "Selector warm bare TCP failed");
-                            return;
-                        }
-                    };
-                connection_pool.deposit_tcp(&addr, stream).await;
-            }
-            if connection_pool.has_live_bare_entry(&addr) {
-                let old = bare_warm.lock().insert(node.id, addr.clone());
-                if let Some(old) = old.filter(|old| old != &addr) {
-                    connection_pool.purge_bare(&old);
+
+    if descriptor.has_generation_runtime(&node) {
+        let reporter = group_manager
+            .read()
+            .feedback_for_node(
+                node.id,
+                crate::group::ScoreSelectionContext::aggregate(
+                    crate::group::SelectionNetwork::Tcp,
+                    ProbeDomain::Tcp,
+                    IpVersion::V4,
+                ),
+            )
+            .map(|feedback| feedback.start());
+        match proxy_registry
+            .warm_session(Arc::clone(&generation), node.id, connect_timeout)
+            .await
+        {
+            Ok(honk_outbound::proxy::WarmOutcome::Ready) => {
+                if let Some(reporter) = &reporter {
+                    reporter.setup_succeeded();
+                    reporter.finish(crate::group::ScoreOutcome::Success);
+                }
+                if let Some(addr) = bare_warm.lock().remove(&node.id) {
+                    connection_pool.purge_bare(&addr);
                 }
                 stats.mark_warm(node.id, crate::stats::WarmReason::Selector);
+                return;
+            }
+            Ok(honk_outbound::proxy::WarmOutcome::NotApplicable) => {}
+            Err(error) if generation.is_shutdown() => {
+                if let Some(reporter) = &reporter {
+                    reporter.finish(crate::group::ScoreOutcome::Shutdown);
+                }
+                debug!(node = %node.name, %error, "Selector warm generation ended");
+                return;
+            }
+            Err(error) => {
+                if let Some(reporter) = &reporter {
+                    reporter.setup_failed(if error.is::<tokio::time::error::Elapsed>() {
+                        crate::group::ScoreOutcome::Timeout
+                    } else {
+                        crate::group::ScoreOutcome::from_error(&error)
+                    });
+                }
+                debug!(node = %node.name, %error, "Selector warm session failed");
+                return;
             }
         }
-        Err(error) if generation.is_shutdown() => {
-            debug!(node = %node.name, %error, "Selector warm generation ended");
+    }
+
+    let Some(addr) = bare_addr else {
+        return;
+    };
+    if !connection_pool.has_live_bare_entry(&addr) {
+        let reporter = group_manager
+            .read()
+            .feedback_for_node(
+                node.id,
+                crate::group::ScoreSelectionContext::aggregate(
+                    crate::group::SelectionNetwork::Tcp,
+                    ProbeDomain::Tcp,
+                    IpVersion::V4,
+                ),
+            )
+            .map(|feedback| feedback.start());
+        let stream = match honk_outbound::util::connect_outbound(&addr, connect_timeout).await {
+            Ok(_) if generation.is_shutdown() => {
+                if let Some(reporter) = &reporter {
+                    reporter.finish(crate::group::ScoreOutcome::Shutdown);
+                }
+                return;
+            }
+            Ok(stream) if is_tcp_stream_alive(&stream) => stream,
+            Ok(_) => {
+                if let Some(reporter) = &reporter {
+                    reporter.setup_failed(crate::group::ScoreOutcome::Io(
+                        io::ErrorKind::ConnectionAborted,
+                    ));
+                }
+                return;
+            }
+            Err(error) => {
+                if let Some(reporter) = &reporter {
+                    reporter.setup_failed(if error.kind() == io::ErrorKind::TimedOut {
+                        crate::group::ScoreOutcome::Timeout
+                    } else {
+                        crate::group::ScoreOutcome::Io(error.kind())
+                    });
+                }
+                debug!(node = %node.name, %error, "Selector warm bare TCP failed");
+                return;
+            }
+        };
+        if let Some(reporter) = &reporter {
+            reporter.setup_succeeded();
         }
-        Err(error) => {
-            debug!(node = %node.name, %error, "Selector warm session failed");
+        connection_pool.deposit_tcp(&addr, stream).await;
+        if let Some(reporter) = &reporter {
+            reporter.finish(crate::group::ScoreOutcome::Success);
         }
+    }
+    if connection_pool.has_live_bare_entry(&addr) {
+        let old = bare_warm.lock().insert(node.id, addr.clone());
+        if let Some(old) = old.filter(|old| old != &addr) {
+            connection_pool.purge_bare(&old);
+        }
+        stats.mark_warm(node.id, crate::stats::WarmReason::Selector);
     }
 }
 
@@ -449,14 +516,63 @@ impl ControlPlane {
             Duration::from_millis(config.global.connect_timeout_ms)
         };
         let proxy_registry = self.proxy_registry.clone();
-        let dispatch = Arc::new(move |generation, node_id| {
-            let proxy_registry = proxy_registry.clone();
-            async move {
-                proxy_registry
-                    .warm_udp(generation, node_id, connect_timeout)
-                    .await
-            }
-        });
+        let group_manager = self.group_manager.clone();
+        let dispatch = Arc::new(
+            move |generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+                  node_id: uuid::Uuid| {
+                let proxy_registry = proxy_registry.clone();
+                let group_manager = group_manager.clone();
+                async move {
+                    let reporter = generation
+                        .get(&node_id)
+                        .filter(|runtime| {
+                            runtime.udp_capable
+                                && honk_outbound::descriptor::descriptor(runtime.node.protocol)
+                                    .has_generation_runtime(&runtime.node)
+                        })
+                        .and_then(|_| {
+                            group_manager.read().feedback_for_node(
+                                node_id,
+                                crate::group::ScoreSelectionContext::aggregate(
+                                    crate::group::SelectionNetwork::Udp,
+                                    ProbeDomain::DataUdp,
+                                    IpVersion::V4,
+                                ),
+                            )
+                        })
+                        .map(|feedback| feedback.start());
+                    let result = proxy_registry
+                        .warm_udp(generation.clone(), node_id, connect_timeout)
+                        .await;
+                    match &result {
+                        Ok(honk_outbound::proxy::WarmOutcome::Ready) => {
+                            if let Some(reporter) = &reporter {
+                                reporter.setup_succeeded();
+                                reporter.finish(crate::group::ScoreOutcome::Success);
+                            }
+                        }
+                        Ok(honk_outbound::proxy::WarmOutcome::NotApplicable) => {}
+                        Err(_) if generation.is_shutdown() => {
+                            if let Some(reporter) = &reporter {
+                                reporter.finish(crate::group::ScoreOutcome::Shutdown);
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(reporter) = &reporter {
+                                reporter.setup_failed(
+                                    if error.is::<tokio::time::error::Elapsed>() {
+                                        crate::group::ScoreOutcome::Timeout
+                                    } else {
+                                        crate::group::ScoreOutcome::from_error(error)
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    result
+                }
+            },
+        );
         let handle = tokio::spawn(run_udp_warm_coordinator(
             self.config.clone(),
             self.group_manager.clone(),
@@ -494,6 +610,7 @@ impl ControlPlane {
                 generation,
                 proxy_registry: self.proxy_registry.clone(),
                 connection_pool: self.connection_pool.clone(),
+                group_manager: self.group_manager.clone(),
                 stats: self.stats.clone(),
                 selected_ids: self.selector_warm_ids.clone(),
                 bare_warm: self.selector_bare_warm.clone(),

@@ -171,6 +171,7 @@ async fn pump(
     pipe: &Pipe,
     mut staged: usize,
     progress: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    mut on_progress: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 ) -> io::Result<u64> {
     let mut total = 0u64;
 
@@ -203,6 +204,9 @@ async fn pump(
             if let Some(counter) = &progress {
                 counter.fetch_add(n as u64, Ordering::Relaxed);
             }
+            if let Some(callback) = on_progress.take() {
+                callback();
+            }
         }
     }
 }
@@ -222,7 +226,7 @@ pub(crate) const DRAIN_DEADLINE: std::time::Duration = if cfg!(test) {
 async fn run(
     client: &TcpStream,
     upstream: &TcpStream,
-    progress: super::RelayProgress,
+    progress: super::OptionalRelayProgress,
 ) -> Result<(u64, u64), SpliceError> {
     let pipe_c2p = Pipe::new().map_err(SpliceError::Io)?;
     let pipe_p2c = Pipe::new().map_err(SpliceError::Io)?;
@@ -248,7 +252,7 @@ async fn run(
     // Byte counters double as final stats when the drain deadline cancels
     // the surviving pump before it can return its own total.
     let (cnt_c2p, cnt_p2c) = match &progress {
-        Some((up, down)) => (up.clone(), down.clone()),
+        Some(progress) => (progress.upload.clone(), progress.download.clone()),
         None => (
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -260,6 +264,7 @@ async fn run(
         &pipe_c2p,
         staged_c2p,
         Some(cnt_c2p.clone()),
+        None,
     );
     let p2c = pump(
         upstream,
@@ -267,6 +272,9 @@ async fn run(
         &pipe_p2c,
         staged_p2c,
         Some(cnt_p2c.clone()),
+        progress
+            .as_ref()
+            .and_then(|progress| progress.first_response.clone()),
     );
     tokio::pin!(c2p);
     tokio::pin!(p2c);
@@ -342,7 +350,7 @@ pub async fn relay_splice(
     upstream: TcpStream,
     client_addr: SocketAddr,
     target_addr: SocketAddr,
-    progress: super::RelayProgress,
+    progress: super::OptionalRelayProgress,
 ) -> anyhow::Result<RelayStats> {
     if !splice_available() {
         return relay_tcp_counted(client, upstream, client_addr, target_addr, progress).await;
@@ -402,13 +410,14 @@ async fn relay_tcp_counted(
     upstream: TcpStream,
     client_addr: SocketAddr,
     target_addr: SocketAddr,
-    progress: super::RelayProgress,
+    progress: super::OptionalRelayProgress,
 ) -> anyhow::Result<RelayStats> {
     match progress {
-        Some((up, down)) => {
+        Some(progress) => {
+            let first_response = progress.first_response.clone();
             relay_tcp(
-                super::ReadCounter::wrap(client, up),
-                super::ReadCounter::wrap(upstream, down),
+                super::ReadCounter::wrap(client, progress.upload, None),
+                super::ReadCounter::wrap(upstream, progress.download, first_response),
                 client_addr,
                 target_addr,
             )
@@ -430,17 +439,18 @@ pub async fn relay_auto<S1, S2>(
     proxy: S2,
     client_addr: SocketAddr,
     target_addr: SocketAddr,
-    progress: super::RelayProgress,
+    progress: super::OptionalRelayProgress,
 ) -> anyhow::Result<RelayStats>
 where
     S1: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin,
     S2: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin,
 {
     match progress {
-        Some((up, down)) => {
+        Some(progress) => {
+            let first_response = progress.first_response.clone();
             super::relay_tcp(
-                super::ReadCounter::wrap(client, up),
-                super::ReadCounter::wrap(proxy, down),
+                super::ReadCounter::wrap(client, progress.upload, None),
+                super::ReadCounter::wrap(proxy, progress.download, first_response),
                 client_addr,
                 target_addr,
             )
@@ -781,7 +791,18 @@ mod tests {
         let relay = tokio::spawn(async move {
             let (mut client, client_addr) = listener.accept().await.unwrap();
             let upstream = TcpStream::connect(echo).await.unwrap();
-            relay_splice(&mut client, upstream, client_addr, echo, Some((up2, down2))).await
+            relay_splice(
+                &mut client,
+                upstream,
+                client_addr,
+                echo,
+                Some(crate::relay::RelayProgress {
+                    upload: up2,
+                    download: down2,
+                    first_response: None,
+                }),
+            )
+            .await
         });
 
         let mut client = TcpStream::connect(front).await.unwrap();
@@ -822,7 +843,18 @@ mod tests {
         let relay = tokio::spawn(async move {
             let (client, client_addr) = listener.accept().await.unwrap();
             let upstream = TcpStream::connect(echo).await.unwrap();
-            relay_auto(client, upstream, client_addr, echo, Some((up2, down2))).await
+            relay_auto(
+                client,
+                upstream,
+                client_addr,
+                echo,
+                Some(crate::relay::RelayProgress {
+                    upload: up2,
+                    download: down2,
+                    first_response: None,
+                }),
+            )
+            .await
         });
 
         let mut client = TcpStream::connect(front).await.unwrap();

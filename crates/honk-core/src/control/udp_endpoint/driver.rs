@@ -103,6 +103,7 @@ struct UdpDriverCleanupGuard {
     generation: u64,
     decision_token: u32,
     endpoint: Arc<UdpEndpoint>,
+    outcome: Option<ScoreOutcome>,
 }
 
 impl UdpDriverCleanupGuard {
@@ -119,7 +120,12 @@ impl UdpDriverCleanupGuard {
             generation,
             decision_token,
             endpoint,
+            outcome: None,
         }
+    }
+
+    fn set_outcome(&mut self, outcome: ScoreOutcome) {
+        self.outcome = Some(outcome);
     }
 }
 
@@ -133,10 +139,17 @@ pub(super) struct UdpDriverContext {
     pub(super) alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
     pub(super) stats: Arc<StatsManager>,
     pub(super) outbound_tracker: OutboundTracker,
+    pub(super) health_family: honk_outbound::alive::IpVersion,
 }
 
 impl Drop for UdpDriverCleanupGuard {
     fn drop(&mut self) {
+        self.endpoint
+            .finish_score(if self.pool.terminal.load(Ordering::Acquire) {
+                ScoreOutcome::Shutdown
+            } else {
+                self.outcome.unwrap_or(ScoreOutcome::Cancelled)
+            });
         self.endpoint.release();
         self.pool
             .retire_if_same(self.key, self.decision_token, self.generation);
@@ -185,6 +198,30 @@ impl UdpDriverHandle {
     }
 }
 
+pub(super) fn score_driver_outcome(
+    endpoint: &UdpEndpoint,
+    result: &io::Result<()>,
+) -> ScoreOutcome {
+    if endpoint.dead.load(Ordering::Acquire) {
+        return if endpoint.has_reply() {
+            ScoreOutcome::Success
+        } else {
+            ScoreOutcome::Cancelled
+        };
+    }
+    match result {
+        Ok(()) => ScoreOutcome::Success,
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+            if endpoint.has_reply() {
+                ScoreOutcome::Success
+            } else {
+                ScoreOutcome::Timeout
+            }
+        }
+        Err(error) => ScoreOutcome::Io(error.kind()),
+    }
+}
+
 impl UdpEndpointPool {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::control) fn spawn_driver(
@@ -227,7 +264,7 @@ impl UdpEndpointPool {
         let task = drivers.tasks.spawn(async move {
             // Construct before every await so abort and panic take the same
             // cleanup path as an ordinary driver return.
-            let _cleanup = UdpDriverCleanupGuard::new(
+            let mut _cleanup = UdpDriverCleanupGuard::new(
                 Arc::clone(&pool),
                 key,
                 generation,
@@ -250,11 +287,13 @@ impl UdpEndpointPool {
                     alive_set,
                     stats,
                     outbound_tracker,
+                    health_family: endpoint.health_family,
                 },
                 initial,
                 first_ack_tx,
             )
             .await;
+            _cleanup.set_outcome(score_driver_outcome(&endpoint, &result));
             if let Err(error) = result {
                 debug!(
                     "UDP endpoint driver {} -> {} stopped: {}",
@@ -290,6 +329,7 @@ pub(super) async fn run_endpoint_driver(
         alive_set,
         stats,
         outbound_tracker,
+        health_family,
     } = context;
     // Sniffing may have consumed later QUIC Initial fragments from the queue.
     // Send that retained prefix before the untouched receiver queue so the
@@ -312,15 +352,10 @@ pub(super) async fn run_endpoint_driver(
         }
         Err(error) => {
             if !endpoint.dead.load(Ordering::Acquire) {
-                let ipver = if client_dst.is_ipv4() {
-                    honk_outbound::alive::IpVersion::V4
-                } else {
-                    honk_outbound::alive::IpVersion::V6
-                };
                 alive_set.report_unavailable_traffic(
                     endpoint.node_id,
                     honk_outbound::alive::ProbeDomain::DataUdp,
-                    ipver,
+                    health_family,
                 );
             }
             let _ = first_ack.send(Err(io::Error::new(error.kind(), error.to_string())));
@@ -351,15 +386,10 @@ pub(super) async fn run_endpoint_driver(
         result = &mut receiver => result,
     };
     if result.is_err() && !endpoint.dead.load(Ordering::Acquire) {
-        let ipver = if client_dst.is_ipv4() {
-            honk_outbound::alive::IpVersion::V4
-        } else {
-            honk_outbound::alive::IpVersion::V6
-        };
         alive_set.report_unavailable_traffic(
             endpoint.node_id,
             honk_outbound::alive::ProbeDomain::DataUdp,
-            ipver,
+            health_family,
         );
     }
     result
@@ -440,11 +470,7 @@ async fn receive_loop(
     stats: Arc<StatsManager>,
     outbound_tracker: OutboundTracker,
 ) -> io::Result<()> {
-    let ipver = if client_dst.is_ipv4() {
-        honk_outbound::alive::IpVersion::V4
-    } else {
-        honk_outbound::alive::IpVersion::V6
-    };
+    let ipver = endpoint.health_family;
     // The normal fixed-target path keeps using the pre-created socket without
     // allocating. Full-cone sources populate this small endpoint-local cache.
     let mut alternate_reply_sockets = Vec::new();
@@ -512,6 +538,7 @@ async fn receive_loop(
             stats.record_udp_first_reply_latency(elapsed);
         }
         endpoint.tracker_download(n as u64);
+        endpoint.score_first_response();
         outbound_tracker.add_bytes(0, n as u64);
         if endpoint.take_alive_report_slot() {
             alive_set.report_available_traffic(

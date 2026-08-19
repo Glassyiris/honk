@@ -23,8 +23,7 @@ step "cargo clippy -D warnings"
 cargo clippy -p honk-config -p honk-core -p honk-outbound --all-targets -- -D warnings
 
 step "cargo test -p honk-config"
-# The two TOML round-trip failures are pre-existing (CI gate skips them too).
-cargo test -p honk-config -- --skip test_config_toml_round_trip --skip test_to_file_and_from_file_by_extension
+cargo test -p honk-config
 
 step "cargo test -p honk-core (all DNS unit tests)"
 cargo test -p honk-core --lib dns::

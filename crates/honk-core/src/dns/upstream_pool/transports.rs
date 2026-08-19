@@ -3,6 +3,7 @@ use std::sync::atomic::Ordering;
 
 use honk_config::node::Node;
 use honk_config::types::DnsProtocol;
+use honk_outbound::group::ScoreFeedback;
 
 use super::UpstreamPool;
 use super::entries::UpstreamEntry;
@@ -13,6 +14,7 @@ use crate::dns::transport::{
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct TransportKey {
     resolved_leaf: Option<String>,
+    target: std::net::SocketAddr,
 }
 
 pub(super) enum PooledTransport {
@@ -34,13 +36,17 @@ impl PooledTransport {
         }
     }
 
-    pub(super) async fn exchange(&self, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    pub(super) async fn exchange(
+        &self,
+        raw_query: &[u8],
+        feedback: Option<&ScoreFeedback>,
+    ) -> anyhow::Result<Vec<u8>> {
         match self {
-            Self::Tcp(transport) => transport.exchange(raw_query).await,
-            Self::Dot(transport) => transport.exchange(raw_query).await,
-            Self::Doh(transport) => transport.exchange(raw_query).await,
-            Self::Doq(transport) => transport.exchange(raw_query).await,
-            Self::Doh3(transport) => transport.exchange(raw_query).await,
+            Self::Tcp(transport) => transport.exchange(raw_query, feedback).await,
+            Self::Dot(transport) => transport.exchange(raw_query, feedback).await,
+            Self::Doh(transport) => transport.exchange(raw_query, feedback).await,
+            Self::Doq(transport) => transport.exchange(raw_query, feedback).await,
+            Self::Doh3(transport) => transport.exchange(raw_query, feedback).await,
         }
     }
 }
@@ -50,6 +56,7 @@ impl UpstreamPool {
         &self,
         entry: &UpstreamEntry,
         proxy_node: Option<&Node>,
+        target: std::net::SocketAddr,
     ) -> DialContext {
         let proxy = match (proxy_node, self.proxy_registry.as_ref()) {
             (Some(node), Some(registry)) => Some(ProxyDial {
@@ -60,7 +67,7 @@ impl UpstreamPool {
             _ => None,
         };
         DialContext {
-            endpoint: entry.endpoint.clone(),
+            endpoint: entry.endpoint.clone().with_resolved_addr(target),
             query_timeout: self.dns_query_timeout,
             dial_timeout: self.dns_dial_timeout,
             proxy,
@@ -71,8 +78,9 @@ impl UpstreamPool {
         &self,
         entry: &UpstreamEntry,
         proxy_node: Option<&Node>,
+        target: std::net::SocketAddr,
     ) -> anyhow::Result<PooledTransport> {
-        let dial = self.dial_context(entry, proxy_node);
+        let dial = self.dial_context(entry, proxy_node, target);
         Ok(match entry.protocol {
             DnsProtocol::Udp | DnsProtocol::Tcp => PooledTransport::Tcp(TcpPool::new(dial)),
             DnsProtocol::Tls => PooledTransport::Dot(DotPool::new(dial)?),
@@ -82,7 +90,7 @@ impl UpstreamPool {
             )?),
             DnsProtocol::Quic => PooledTransport::Doq(
                 DoqClient::new(
-                    entry.endpoint.clone(),
+                    entry.endpoint.clone().with_resolved_addr(target),
                     self.dns_query_timeout,
                     self.dns_dial_timeout,
                 )
@@ -90,7 +98,7 @@ impl UpstreamPool {
             ),
             DnsProtocol::H3 => PooledTransport::Doh3(
                 Doh3Client::new_tracked(
-                    entry.endpoint.clone(),
+                    entry.endpoint.clone().with_resolved_addr(target),
                     self.dns_query_timeout,
                     self.dns_dial_timeout,
                     Arc::clone(&self.active_transport_tasks),
@@ -104,9 +112,11 @@ impl UpstreamPool {
         &self,
         entry: &UpstreamEntry,
         proxy_node: Option<&Node>,
+        target: std::net::SocketAddr,
     ) -> anyhow::Result<Arc<PooledTransport>> {
         let key = TransportKey {
             resolved_leaf: proxy_node.map(|node| node.name.clone()),
+            target,
         };
         let slot = {
             let mut transports = entry.transports.lock();
@@ -116,7 +126,7 @@ impl UpstreamPool {
                     .or_insert_with(|| Arc::new(LifecycleSlot::new())),
             )
         };
-        slot.acquire(|| self.build_transport(entry, proxy_node))
+        slot.acquire(|| self.build_transport(entry, proxy_node, target))
             .await
     }
 

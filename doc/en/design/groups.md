@@ -4,7 +4,7 @@ This document explains how honk resolves groups to leaf outbounds, tracks their 
 
 ## Scope
 
-The scope is `GroupManager`, `AliveDialerSet`, cold URLTest preparation, and the warm-resource coordinators. Group fields and policy syntax belong in the [group reference](../reference/groups.md); process-wide health, warm-up, and dial keys belong in the [global reference](../reference/global.md).
+The scope is `GroupManager`, `AliveDialerSet`, the always-compiled Score scorer, cold URLTest preparation, and the warm-resource coordinators. Group fields and policy syntax belong in the [group reference](../reference/groups.md); process-wide health, warm-up, and dial keys belong in the [global reference](../reference/global.md).
 
 ## Group manager and selection pipeline
 
@@ -22,6 +22,7 @@ The facade and its internals are split by responsibility:
 | `resolver.rs` | Nested-group expansion, member/leaf introspection, cycle cutting, and Selector-choice migration |
 | `filter.rs` | Network- and family-specific liveness filtering |
 | `policy.rs` | Selector, URLTest, LoadBalance, and Fallback picks and latency ranking |
+| `score.rs` | Score scoring, exactly-once feedback, and target-aware selection |
 | `state.rs` | URLTest/Fallback caches, Selector choices, idle timestamps, and callbacks |
 
 Selection follows one invariant: after resolution and liveness filtering, the dial path uses exactly the policy pick. Selector returns its effective manual choice, URLTest its current winner, LoadBalance its next member, and Fallback its pin. The only multi-candidate exception is an unmeasured top-level URLTest group; all warm URLTest and non-URLTest plans are authoritative single-leaf plans. If a group with no `final` has exactly one unique leaf and TCP liveness excludes it, that same leaf remains an authoritative last resort: its health stays dead, but a real dial can prove recovery without leaking to `direct`. UDP keeps normal liveness exclusion.
@@ -34,6 +35,27 @@ Selection follows one invariant: after resolution and liveness filtering, the di
 | URLTest | Chooses the lowest halving moving average, keeps independent TCP and UDP selections, applies tolerance hysteresis, and re-evaluates lazily on dial and selection queries. A real selection change may invoke `InterruptCallback`. |
 | LoadBalance | Round-robins eligible members in declaration order. Every group owns independent `AtomicUsize` cursors for TCP and UDP. Rotation never invokes `InterruptCallback`. |
 | Fallback | Pins the first eligible member in declaration order independently for TCP and UDP. The pin stays until that member dies; recovery of an earlier member does not cause failback. |
+| Score | When explicitly selected with `policy: score`, chooses one authoritative alive member using automatic target-aware, reliability-first scoring and bounded deterministic exploration. Selector remains the omitted/default policy. |
+
+### Score scoring and lifecycle
+
+Score first runs the same liveness filter as every other policy. The filter's health family describes connectivity to the proxy server; the separately carried target family selects the scoring bucket. Consequently a server reached over IPv4 remains eligible for an IPv6 business target, while no score can return a node already excluded as dead.
+
+The exact key is `(group, TCP/UDP, target IPv4/IPv6, normalized target, NodeId)`. Domains are ASCII-lowercased with one trailing dot removed and retain their port; IP targets retain the socket address. A second bounded `(group, TCP/UDP, target family or no family, NodeId)` aggregate supplies the prior for cold targets and receives targetless warm-up samples. Global aggregate, family aggregate, and exact-target evidence blend hierarchically until the more specific layer has enough evidence. Recursive selection carries the same target context and attributes the leaf outcome to every Score group traversed.
+
+Every historical counter and weighted sum uses fixed exponential decay with a 30-minute half-life. Decay is applied lazily when evidence is recorded or ranked, so no timer or configuration knob is required. Setup and first-response latency are decayed weighted means rather than fixed-alpha EWMAs; their decayed weights also reduce the influence of stale or sparse latency. Reliability is a Beta-prior lower-confidence estimate over decayed setup and useful-outcome evidence, with setup failure carrying the strongest penalty.
+
+Throughput evidence admits only a successful, useful bidirectional exchange that lasts at least 1 second and moves at least 64 KiB in its dominant direction. Qualifying windows pool dominant-direction bytes and elapsed seconds, avoiding request/response double-counting; the score uses bounded `log2(1 + pooled bytes/second)` throughput and confidence from the decayed window evidence. Short probes and small control exchanges can still update reliability and latency but cannot inflate throughput.
+
+`ScoreFeedback::start()` creates a cloneable `ScoreReporter` only when a physical dial, logical stream, transport preparation, or exchange associated with a Score group actually starts. The reporter records setup, first response, transmitted/received bytes, and exactly one of success, timeout, `io::ErrorKind`, cancellation, shutdown, or other; the first terminal call wins and dropping the last unfinished handle reports cancellation. Cancellation and shutdown remove the attempt rather than degrading reliability. A retry starts a new reporter, while speculative work that never starts and all non-Score paths create neither a reporter nor a score cell.
+
+The same reporter path covers transparent TCP relay and UDP endpoint lifetime, supported DNS upstream exchanges, periodic HTTP/UDP health probes, on-demand Clash delay measurements, startup preconnect, Selector/session and UDP warm-up, and external UI downloads. DNS feedback follows the carrier actually attempted: UDP uses the UDP bucket, TCP/DoT/DoH use TCP, and a TCP retry after a truncated UDP answer switches buckets. Every periodic UDP cycle also completes a real `h3` TLS-in-QUIC handshake through each node in a Score group to the first HTTPS `global.tcp_check_url`; this exact-target `DataUdp` evidence is independent of the DNS health verdict and is disabled when no HTTPS check URL exists.
+
+Ranking begins with the Beta-prior lower-confidence reliability estimate. Candidates more than the fixed close-reliability band below the best are excluded from latency, throughput, and exploration. Within that band, lower decayed setup/first-response latency, bounded qualified throughput, and bounded exploration contribute to utility. Evidence that decays below the trained threshold becomes cold again; cold exploration is deterministic, and remaining ties use declaration order and stable `NodeId`. The resulting plan always contains one authoritative leaf rather than racing candidates.
+
+Score state is demand-driven, memory-only, process-local, and non-configurable. Exact cells use a 4,096-entry LRU and aggregate cells use a separate 4,096-entry LRU. A successful in-process reload shares the same state, publishes the new valid `(group, member)` set, and prunes removed cells; late feedback for deleted membership is ignored. Process restart clears everything. Score cells and scorer-only target data are never logged, persisted, or returned by Clash APIs; the existing `/connections` destination metadata remains unchanged.
+
+Clash represents a Score group as `type: "url_test"`, reports the current aggregate TCP winner in `now`, and rejects `PUT /proxies/{name}`.
 
 ### URLTest ranking and hysteresis
 
@@ -100,7 +122,8 @@ A dead state normally needs two consecutive probe successes to recover. `notify_
 | Probe path | Behavior |
 | --- | --- |
 | TCP | Sends the configured HTTP method to `tcp_check_url` through the node, or performs a raw TCP connect when no HTTP probe applies. A cold reusable node first establishes its session/client in a throwaway runtime; setup is untimed, then only a completed HTTP exchange records warm-path RTT in the matching TCP family state. Setup and target-exchange failures both update liveness/cooldown without contributing latency or ranking strikes. |
-| UDP | Sends one minimal DNS query to the first `udp_check_dns` target through the node's own `dial_udp_transport`. Success records the measured RTT and marks both `DnsUdp` and `DataUdp` alive; failure adds one probe failure to each UDP domain. It never changes TCP state. |
+| UDP health | Sends one minimal DNS query to the first `udp_check_dns` target through the node's own `dial_udp_transport`. Success records the measured RTT and marks both `DnsUdp` and `DataUdp` alive; failure adds one probe failure to each UDP domain. It never changes TCP state. |
+| Score QUIC evidence | Separately performs a real TLS-in-QUIC handshake with ALPN `h3` through a new packet transport for each node in a Score group, targeting the first HTTPS `tcp_check_url`. Success or failure updates the exact `DataUdp` score and aggregate prior; it never changes liveness or awards unobserved byte volume. |
 | Per-group URL | Probes the dynamically resolved `(member tag, current leaf)` pairs with the same throwaway warm-path timing as the global TCP probe. State is TCP-only, dies after three consecutive failures, and uses the same cooldown and two-success recovery. `sync_group_check_urls` replaces the active group/URL registry on reload. |
 
 `has_udp_state` distinguishes a node with no UDP observations from one explicitly observed dead. Established endpoint send, receive, and reply-idle errors report `DataUdp` traffic failures. Intentional endpoint retirement, node-death cancellation, and process shutdown are health-neutral.

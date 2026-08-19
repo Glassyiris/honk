@@ -62,10 +62,11 @@ impl ControlPlane {
             }
         };
         let old_group_manager = self.group_manager.read().clone();
-        let new_group_manager = Arc::new(GroupManager::with_alive_set(
+        let new_group_manager = Arc::new(GroupManager::with_alive_set_and_score_state(
             &new_config.groups,
             &new_config.nodes,
             Some(Arc::clone(&self.alive_set)),
+            old_group_manager.score_state(),
         ));
         new_group_manager.migrate_selector_choices_from(&old_group_manager);
         // Build the outbound generation before DNS so every new runtime
@@ -114,14 +115,6 @@ impl ControlPlane {
             group_connectivity_snapshot(&new_config, &new_group_manager, &self.alive_set);
         let bootstrap = new_config.global.bootstrap_resolver.clone();
         let direct_target = super::direct_check_addr(&bootstrap);
-        let direct_target_socket = match direct_target.parse() {
-            Ok(target) => target,
-            Err(error) => {
-                error!(%error, "Failed to prepare direct health-check target");
-                self.stop_reload_rejection_if_healthy(drain);
-                return false;
-            }
-        };
         let bootstrap_resolver = honk_outbound::bootstrap::BootstrapResolver::parse(&bootstrap);
         let new_plan = match Self::compile_routing_plan(&new_config, &new_router) {
             Ok(plan) => Arc::new(plan),
@@ -320,6 +313,7 @@ impl ControlPlane {
                 *router_guard = new_router;
                 *config_guard = new_config;
                 *group_guard = Arc::clone(&new_group_manager);
+                new_group_manager.publish_score_membership();
                 *outbound_guard = new_outbound_id_map;
                 *plan_guard = Arc::clone(&new_plan);
                 // The projection worker takes eBPF before its generation fence;
@@ -346,7 +340,6 @@ impl ControlPlane {
         routing_matcher::RoutingMatcherBuilder::activate_projection(&new_plan);
         honk_outbound::bootstrap::set_global(bootstrap_resolver);
         self.alive_set.set_direct_check_addr(direct_target);
-        honk_outbound::urltest::set_urltest_direct_target(direct_target_socket);
         install_interrupt_callback(
             &new_group_manager,
             &self.group_manager,

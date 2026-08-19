@@ -1,4 +1,24 @@
 use super::*;
+use crate::group::{ScoreOutcome, ScoreReporter, ScoreSelectionContext, SelectionNetwork};
+
+impl AliveDialerSet {
+    fn raw_probe_reporter(&self, node_id: Uuid, ipver: IpVersion) -> Option<ScoreReporter> {
+        self.score_feedback
+            .read()
+            .as_ref()
+            .and_then(|factory| {
+                factory(
+                    node_id,
+                    ScoreSelectionContext::aggregate(
+                        SelectionNetwork::Tcp,
+                        ProbeDomain::Tcp,
+                        ipver,
+                    ),
+                )
+            })
+            .map(|feedback| feedback.start())
+    }
+}
 
 impl AliveDialerSet {
     /// Probe a single node's TCP reachability.
@@ -126,10 +146,8 @@ impl AliveDialerSet {
 
             let mut family_ok = false;
             for a in family_addrs {
-                match tokio::time::timeout(timeout, prober.probe_http(node_name, *a, &check_url))
-                    .await
-                {
-                    Ok(HttpProbeResult::WarmSuccess(elapsed)) => {
+                match prober.probe_http(node_name, *a, &check_url, timeout).await {
+                    HttpProbeResult::WarmSuccess(elapsed) => {
                         tracing::debug!(
                             "HTTP health check succeeded for node '{}' via {} ({}ms)",
                             node_name,
@@ -141,7 +159,7 @@ impl AliveDialerSet {
                         family_ok = true;
                         break;
                     }
-                    Ok(HttpProbeResult::SetupFailure(error)) => {
+                    HttpProbeResult::SetupFailure(error) => {
                         tracing::debug!(
                             "HTTP health check establishment failed for node '{}' via {}: {}",
                             node_name,
@@ -149,20 +167,12 @@ impl AliveDialerSet {
                             error
                         );
                     }
-                    Ok(HttpProbeResult::ExchangeFailure(error)) => {
+                    HttpProbeResult::ExchangeFailure(error) => {
                         tracing::debug!(
                             "HTTP health check warm exchange failed for node '{}' via {}: {}",
                             node_name,
                             a,
                             error
-                        );
-                    }
-                    Err(_) => {
-                        tracing::debug!(
-                            "HTTP health check timed out for node '{}' via {} after {:?}",
-                            node_name,
-                            a,
-                            timeout
                         );
                     }
                 }
@@ -231,8 +241,8 @@ impl AliveDialerSet {
 
         let mut any_ok = false;
         for a in addrs.into_iter().take(3) {
-            match tokio::time::timeout(timeout, prober.probe_http(leaf, a, url)).await {
-                Ok(HttpProbeResult::WarmSuccess(elapsed)) => {
+            match prober.probe_http(leaf, a, url, timeout).await {
+                HttpProbeResult::WarmSuccess(elapsed) => {
                     tracing::debug!(
                         "HTTP health check succeeded for member '{}' (leaf '{}') via {} ({}ms, url={})",
                         tag,
@@ -245,7 +255,7 @@ impl AliveDialerSet {
                     any_ok = true;
                     break;
                 }
-                Ok(HttpProbeResult::SetupFailure(error)) => {
+                HttpProbeResult::SetupFailure(error) => {
                     tracing::debug!(
                         "HTTP health check establishment failed for member '{}' (leaf '{}') via {} (url={}): {}",
                         tag,
@@ -255,7 +265,7 @@ impl AliveDialerSet {
                         error
                     );
                 }
-                Ok(HttpProbeResult::ExchangeFailure(error)) => {
+                HttpProbeResult::ExchangeFailure(error) => {
                     tracing::debug!(
                         "HTTP health check warm exchange failed for member '{}' (leaf '{}') via {} (url={}): {}",
                         tag,
@@ -263,16 +273,6 @@ impl AliveDialerSet {
                         a,
                         url,
                         error
-                    );
-                }
-                Err(_) => {
-                    tracing::debug!(
-                        "HTTP health check timed out for member '{}' (leaf '{}') via {} after {:?} (url={})",
-                        tag,
-                        leaf,
-                        a,
-                        timeout,
-                        url
                     );
                 }
             }
@@ -358,6 +358,8 @@ impl AliveDialerSet {
                 IpVersion::V6
             };
 
+            let reporter = self.raw_probe_reporter(node_id, ipver);
+
             let start = Instant::now();
             let result = tokio::time::timeout(
                 timeout,
@@ -368,6 +370,10 @@ impl AliveDialerSet {
 
             match result {
                 Ok(Ok(_stream)) => {
+                    if let Some(reporter) = &reporter {
+                        reporter.setup_succeeded();
+                        reporter.finish(ScoreOutcome::Success);
+                    }
                     tracing::debug!(
                         "Health check probe succeeded for node '{}' via {} ({}ms)",
                         node_name,
@@ -378,6 +384,13 @@ impl AliveDialerSet {
                     any_ok = true;
                 }
                 Ok(Err(e)) => {
+                    if let Some(reporter) = &reporter {
+                        reporter.finish(if e.kind() == std::io::ErrorKind::TimedOut {
+                            ScoreOutcome::Timeout
+                        } else {
+                            ScoreOutcome::Io(e.kind())
+                        });
+                    }
                     tracing::debug!(
                         "Health check probe failed for node '{}' via {}: {}",
                         node_name,
@@ -387,6 +400,9 @@ impl AliveDialerSet {
                     self.mark_dead_for(node_id, ProbeDomain::Tcp, ipver);
                 }
                 Err(_) => {
+                    if let Some(reporter) = &reporter {
+                        reporter.finish(ScoreOutcome::Timeout);
+                    }
                     tracing::debug!(
                         "Health check probe timed out for node '{}' via {} after {:?}",
                         node_name,
@@ -446,8 +462,8 @@ impl AliveDialerSet {
         let node_name = self.node_name(node_id);
         const UDP_DOMAINS: [ProbeDomain; 2] = [ProbeDomain::DataUdp, ProbeDomain::DnsUdp];
         const IPVERS: [IpVersion; 2] = [IpVersion::V4, IpVersion::V6];
-        match tokio::time::timeout(timeout, prober.probe_udp(&node_name)).await {
-            Ok(Ok(elapsed)) => {
+        match prober.probe_udp(&node_name, timeout).await {
+            Ok(elapsed) => {
                 tracing::debug!(
                     "UDP health check succeeded for node '{}' ({}ms)",
                     node_name,
@@ -460,24 +476,11 @@ impl AliveDialerSet {
                 }
                 true
             }
-            Ok(Err(err_msg)) => {
+            Err(err_msg) => {
                 tracing::debug!(
                     "UDP health check failed for node '{}': {}",
                     node_name,
                     err_msg
-                );
-                for domain in UDP_DOMAINS {
-                    for ipver in IPVERS {
-                        self.mark_dead_for(node_id, domain, ipver);
-                    }
-                }
-                false
-            }
-            Err(_) => {
-                tracing::debug!(
-                    "UDP health check timed out for node '{}' after {:?}",
-                    node_name,
-                    timeout
                 );
                 for domain in UDP_DOMAINS {
                     for ipver in IPVERS {

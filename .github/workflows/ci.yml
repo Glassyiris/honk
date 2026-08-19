@@ -49,13 +49,9 @@ jobs:
             https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
           sudo curl -sL --retry 3 -o /etc/dae/geoip.dat \
             https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
-      # Full suite minus the known-failing pre-existing tests (see AGENTS.md
-      # "Current test status": share_link TOML round-trip x2,
-      # config_dae_routing x1).
+      # Full suite minus the known pre-existing config_dae_routing failure.
       - run: |
           cargo test --workspace --no-fail-fast -- \
-            --skip test_config_toml_round_trip \
-            --skip test_to_file_and_from_file_by_extension \
             --skip test_routing_with_config_dae
 
   ebpf:
@@ -97,8 +93,6 @@ jobs:
       - name: Run eBPF-feature unit tests
         run: |
           cargo +stable test -p honk-core --features ebpf --lib -- \
-            --skip test_config_toml_round_trip \
-            --skip test_to_file_and_from_file_by_extension \
             --skip test_routing_with_config_dae
       # Map pinning needs bpffs; the hosted VM image does not guarantee that it is mounted.
       - name: Prepare the VM kernel

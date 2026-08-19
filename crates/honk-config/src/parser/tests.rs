@@ -332,6 +332,29 @@ group {
     }
 
     #[test]
+    fn test_parse_unknown_group_policy_remains_selector() {
+        let config = parse_dae_config("group {\n proxy {\n policy: future_policy\n }\n}").unwrap();
+        assert_eq!(config.groups[0].policy, crate::group::GroupPolicy::Selector);
+    }
+
+    #[test]
+    fn test_parse_score_group_policy_case_insensitively() {
+        for policy in ["score", "ScOrE"] {
+            let config =
+                parse_dae_config(&format!("group {{\n proxy {{\n policy: {policy}\n }}\n}}"))
+                    .unwrap();
+            assert_eq!(config.groups[0].policy, crate::group::GroupPolicy::Score);
+        }
+    }
+
+    #[test]
+    fn test_parse_legacy_honk_group_policy_is_actionable() {
+        let error = parse_dae_config("group {\n proxy {\n policy: honk\n }\n}").unwrap_err();
+        assert!(matches!(error, crate::ConfigError::UnsupportedPolicy(_)));
+        assert!(error.to_string().contains("renamed to 'score'"));
+    }
+
+    #[test]
     fn test_parse_group_policies_loadbalance_fallback() {
         let input = r#"
 group {
@@ -953,6 +976,22 @@ dns {
         crate::dns::DnsRequestAction::Upstream("alidns".to_string())
     );
     assert_eq!(config.dns.routing.fallback, "default");
+}
+
+#[test]
+fn test_dae_dns_rules_are_not_silently_dropped_by_structured_writer() {
+    let config = parse_dae_config(
+        "dns {\n routing {\n  request {\n   qname(example.com) -> reject\n  }\n }\n}",
+    )
+    .unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), "original").unwrap();
+
+    let error = config.to_file(file.path().to_str().unwrap()).unwrap_err();
+
+    assert!(matches!(error, crate::ConfigError::Serialization(_)));
+    assert!(error.to_string().contains("dns.routing.request"));
+    assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "original");
 }
 
 #[test]
