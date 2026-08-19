@@ -64,6 +64,17 @@ fn test_trie_ipv4_wrong_family_rejected() {
     // IPv6 address should not match an IPv4-only trie
     assert!(!trie.matches(&"::ffff:10.0.0.1".parse().unwrap()));
 }
+#[test]
+fn test_trie_mixed_families() {
+    let nets: Vec<ipnet::IpNet> = vec![
+        "10.0.0.0/8".parse().unwrap(),
+        "2001:db8::/32".parse().unwrap(),
+    ];
+    let trie = BinaryLpmTrie::from_nets(&nets);
+    assert!(trie.matches(&"10.1.2.3".parse().unwrap()));
+    assert!(trie.matches(&"2001:db8::1".parse().unwrap()));
+    assert!(!trie.matches(&"2001:db9::1".parse().unwrap()));
+}
 
 #[test]
 fn test_empty_router() {
@@ -645,6 +656,31 @@ fn test_ip_version_route() {
     assert_eq!(router.route(&conn), "proxy");
 
     conn.dst_ip = "1.1.1.1".parse().unwrap();
+    assert_eq!(router.route(&conn), "direct");
+}
+#[test]
+fn test_mixed_family_ip_route() {
+    let rules = vec![RoutingRule {
+        name: "mixed-family".into(),
+        condition: RoutingCondition {
+            ip: vec!["10.0.0.0/8".into(), "2001:db8::/32".into()],
+            ..Default::default()
+        },
+        outbound: RoutingOutbound::Simple("proxy".into()),
+        priority: 0,
+        must: false,
+        mark: 0,
+    }];
+
+    let router = Router::new(&rules, "direct").unwrap();
+    let mut conn = make_conn(None, None);
+    conn.dst_ip = "10.1.2.3".parse().unwrap();
+    assert_eq!(router.route(&conn), "proxy");
+
+    conn.dst_ip = "2001:db8::1".parse().unwrap();
+    assert_eq!(router.route(&conn), "proxy");
+
+    conn.dst_ip = "2001:db9::1".parse().unwrap();
     assert_eq!(router.route(&conn), "direct");
 }
 
