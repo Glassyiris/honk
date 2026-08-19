@@ -35,7 +35,7 @@ facade 与内部实现按职责拆分：
 | URLTest | 选择最小减半递推移动平均，分别保存 TCP 与 UDP 选择，应用 tolerance 滞后，并在拨号和选择查询时惰性重算。真实选择变化可以调用 `InterruptCallback`。 |
 | LoadBalance | 按声明顺序轮询合格成员。每个组分别为 TCP 和 UDP 持有独立 `AtomicUsize` 游标。轮转从不调用 `InterruptCallback`。 |
 | Fallback | 分别为 TCP 和 UDP 固定声明顺序中的第一个合格成员。该成员死亡前保持固定；更靠前的成员恢复不会触发 failback。 |
-| Score | 以 `policy: score` 显式选择后，通过自动的 target-aware 可靠性优先评分和有界确定性探索，选择一个权威存活成员。评分器始终编译；省略策略仍默认使用 Selector。 |
+| Score | 以 `policy: score` 显式选择后，通过自动的 target-aware 可靠性优先评分和有界的确定性冷启动探索，选择一个权威存活成员。评分器始终编译；省略策略仍默认使用 Selector。 |
 
 ### Score 评分与生命周期
 
@@ -51,7 +51,7 @@ Score 首先运行与其他策略相同的存活性过滤。过滤所用的 heal
 
 同一 reporter 路径覆盖透明 TCP relay 与 UDP endpoint 生命周期、受支持的 DNS upstream exchange、周期 HTTP/UDP 健康探测、按需 Clash delay 测量、启动 preconnect、Selector/session 与 UDP 预热，以及外部 UI 下载。DNS 反馈跟随实际尝试的 carrier：UDP 使用 UDP 分桶，TCP/DoT/DoH 使用 TCP；UDP truncated answer 后的 TCP retry 会相应切换分桶；现有的 proxied DoQ/DoH3 限制保持不变。每个周期 UDP 探测会为 Score 组中的每个节点另外打开一个 packet transport，对第一个 HTTPS `global.tcp_check_url` 完成 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手。这个精确目标 `DataUdp` 评分与决定 UDP 存活性的 DNS exchange 相互独立；URL 缺失或不是 HTTPS 时不运行。由于 adapter 不提供 wire counter，成功握手只记录双向有效性，不奖励虚构的 byte volume。URL test 与下载对代理叶节点和内建 `direct` 叶节点都使用真实请求目标。周期 direct liveness 仍使用稳定 bootstrap 目标；仅连接 server/session 的预热只更新聚合 setup 证据。
 
-排名首先计算可靠性下置信估计。比最佳候选低出固定「可靠性接近」区间的成员，不会参与延迟、吞吐与 UCB 探索。在该区间内，更低的 setup/首响应延迟、有界吞吐和有界探索共同形成 utility。有效完成证据不足或随时间衰减到训练阈值以下的候选会重新视为冷候选，并按确定性顺序探索；其余平局按声明顺序和稳定 `NodeId` 解决。最终计划始终只包含一个权威叶节点，不会竞速候选。
+排名首先计算可靠性下置信估计。比最佳候选低出固定「可靠性接近」区间的成员，不参与延迟与吞吐排名。在该区间内，已训练候选的 utility 偏向更低的衰减 setup/首响应延迟和有界的合格吞吐；普通健康探测会持续刷新未入选候选，因此 attempt 数不会获得路由 bonus。有效完成证据不足或随时间衰减到训练阈值以下的候选会重新视为冷候选，并按确定性顺序探索；其余平局按声明顺序和稳定 `NodeId` 解决。最终计划始终只包含一个权威叶节点，不会竞速候选。
 
 共享状态由 mutex 保护且仅存于当前进程内存：精确 cell 使用 4,096-entry LRU，聚合 cell 使用另一个 4,096-entry LRU。已提交的进程内 reload 会复用同一共享状态、发布新的合法 `(group, member)` 集合并裁剪已删除 cell；已删除成员的迟到反馈会被忽略。进程重启会清空一切。Score 不提供调节项；评分 cell 与仅由 scorer 持有的目标数据不会进入日志、持久化存储或任何 API 输出，已有的 `/connections` 目标元数据保持不变。
 
