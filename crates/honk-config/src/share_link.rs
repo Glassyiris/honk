@@ -139,7 +139,8 @@ impl Node {
             query.insert(key, value.into_owned());
         }
         if protocol != NodeProtocol::VLess
-            && (query.contains_key("vless_mode") || query.contains_key("packetEncoding"))
+            && (query.contains_key("vless_mode")
+                || query.get("packetEncoding").is_some_and(|v| v != "none"))
         {
             return Err(ConfigError::Parse(
                 "vless_mode/packetEncoding are valid only for VLESS share links".into(),
@@ -383,12 +384,16 @@ impl Node {
                 if let Some(mode) = query.get("vless_mode") {
                     node.vless_mode = mode.parse()?;
                 } else if let Some(encoding) = query.get("packetEncoding") {
-                    if encoding != "xudp" {
-                        return Err(ConfigError::Parse(
-                            "unsupported VLESS packetEncoding (expected xudp)".into(),
-                        ));
+                    // `none` is the explicit spelling of legacy plain VLESS.
+                    match encoding.as_str() {
+                        "xudp" => node.vless_mode = crate::node::WireMode::Xudp,
+                        "none" => {}
+                        _ => {
+                            return Err(ConfigError::Parse(
+                                "unsupported VLESS packetEncoding (expected xudp or none)".into(),
+                            ));
+                        }
                     }
-                    node.vless_mode = crate::node::WireMode::Xudp;
                 }
             }
             // `security=reality` carries the REALITY handshake parameters.

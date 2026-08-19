@@ -533,6 +533,10 @@ fn test_vless_mode_query() {
         Node::from_share_link("vless://uuid@example.com:443?packetEncoding=xudp#node").unwrap();
     assert_eq!(xudp.vless_mode, honk_config::node::WireMode::Xudp);
 
+    let legacy =
+        Node::from_share_link("vless://uuid@example.com:443?packetEncoding=none#node").unwrap();
+    assert_eq!(legacy.vless_mode, honk_config::node::WireMode::Legacy);
+
     let error =
         Node::from_share_link("vless://uuid@example.com:443?vless_mode=smux#node").unwrap_err();
     assert!(error.to_string().contains("unsupported wire mode"));
@@ -566,6 +570,17 @@ fn test_rejects_vless_mode_on_other_protocols() {
 }
 
 #[test]
+fn test_packet_encoding_none_is_a_noop_on_other_protocols() {
+    // Converters append packetEncoding=none to anytls/trojan links; it spells
+    // the default behavior and must not reject the node.
+    let node = Node::from_share_link(
+        "anytls://00000000-0000-0000-0000-000000000000@example.com:443?security=tls&packetEncoding=none&udp=1#node",
+    )
+    .unwrap();
+    assert_eq!(node.protocol, honk_config::types::NodeProtocol::AnyTLS);
+}
+
+#[test]
 fn test_vless_share_link_rejects_external_mux_fields() {
     for parameter in [
         "smux=h2mux",
@@ -590,7 +605,7 @@ fn test_vless_share_link_rejects_external_mux_fields() {
     let error =
         Node::from_share_link("vless://uuid@example.com:443?packetEncoding=packetaddr#node")
             .unwrap_err();
-    assert!(error.to_string().contains("expected xudp"));
+    assert!(error.to_string().contains("expected xudp or none"));
 }
 
 #[test]

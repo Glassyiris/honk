@@ -70,7 +70,11 @@ fn cidr_match_preserves_requery_and_fallback() {
             rules: vec![DnsResponseRule {
                 conditions: vec![DnsCond::Ip {
                     not: false,
-                    cidrs: vec!["10.0.0.0/8".into(), "192.168.0.0/16".into()],
+                    cidrs: vec![
+                        "10.0.0.0/8".into(),
+                        "192.168.0.0/16".into(),
+                        "2001:db8::/32".into(),
+                    ],
                     geoip: vec![],
                 }],
                 action: DnsResponseAction::Upstream("googledns".into()),
@@ -83,6 +87,11 @@ fn cidr_match_preserves_requery_and_fallback() {
     let private_ip: IpAddr = "10.1.2.3".parse().expect("valid private IP");
     assert_eq!(
         router.select_response("test.com", 1, &[private_ip], "any"),
+        DnsResponseDecision::Requery("googledns".into())
+    );
+    let private_v6: IpAddr = "2001:db8::1".parse().expect("valid private IPv6 address");
+    assert_eq!(
+        router.select_response("test.com", 1, &[private_v6], "any"),
         DnsResponseDecision::Requery("googledns".into())
     );
     let public_ip: IpAddr = "8.8.8.8".parse().expect("valid public IP");
