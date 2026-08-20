@@ -167,6 +167,17 @@ struct PressureState {
     last_tcp_overflow: u64,
 }
 
+/// Auxiliary-map pressure: any aux map's last-scan fill ratio at or above the
+/// pressure watermark. Conn-state overflow alone does not see a REDIRECT_TRACK
+/// filling toward capacity — at ~17 entries/s of steady deletion capacity a
+/// ~19 entries/s insert rate saturates it over hours, and every later insert
+/// fails closed.
+fn aux_pressure_active(aux_scan_high_water: &[usize; 3]) -> bool {
+    aux_scan_high_water
+        .iter()
+        .any(|&hw| hw as f64 / AUX_MAP_CAPACITY as f64 >= CONN_STATE_PRESSURE_WATERMARK)
+}
+
 /// The BPF map janitor.
 ///
 /// Runs background cleanup of stale eBPF map entries to prevent map overflow
@@ -270,7 +281,8 @@ impl BpfJanitor {
                 };
                 update_pressure_state(&mut pressure, overflow_delta, utilization);
 
-                let redirect_interval = if pressure.active {
+                let aux_pressure = aux_pressure_active(&aux_scan_high_water);
+                let redirect_interval = if pressure.active || aux_pressure {
                     Duration::from_secs(REDIRECT_PRESSURE_INTERVAL_SECS)
                 } else {
                     Duration::from_secs(REDIRECT_STEADY_INTERVAL_SECS)
@@ -305,7 +317,7 @@ impl BpfJanitor {
                         );
                     }
                 }
-                let auxiliary_pressure_floor = if pressure.active {
+                let auxiliary_pressure_floor = if pressure.active || aux_pressure {
                     CONN_STATE_PRESSURE_WATERMARK
                 } else {
                     0.0
@@ -861,6 +873,16 @@ mod tests {
     use super::*;
     use crate::ebpf::mock::MockEbpfBackend;
     use honk_ebpf_common::{RedirectEntry, RedirectTuple};
+
+    #[test]
+    fn aux_pressure_follows_fill_ratio() {
+        let at_watermark = (AUX_MAP_CAPACITY as f64 * CONN_STATE_PRESSURE_WATERMARK) as usize;
+        assert!(!aux_pressure_active(&[at_watermark, 0, 0]));
+        assert!(aux_pressure_active(&[0, at_watermark + 1, 0]));
+        assert!(aux_pressure_active(&[AUX_MAP_CAPACITY, 0, 0]));
+        assert!(!aux_pressure_active(&[0, 0, 0]));
+    }
+
     #[test]
     fn scan_tuning_grows_with_pressure() {
         let steady = scan_tuning(0.5, Duration::ZERO);
