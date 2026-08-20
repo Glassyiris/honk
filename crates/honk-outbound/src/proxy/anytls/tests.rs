@@ -378,6 +378,25 @@ async fn test_writer_batch_caps() {
 
 const TEST_AUTH: &[u8] = b"test-auth";
 const TEST_SETTINGS: &[u8] = b"test-settings";
+struct CountingReader<R> {
+    inner: R,
+    reads: Arc<AtomicUsize>,
+}
+
+impl<R> AsyncRead for CountingReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.as_mut().get_mut();
+        this.reads.fetch_add(1, Ordering::Relaxed);
+        std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
 
 /// Establish a session over an in-memory duplex; returns the session
 /// and the server end of the transport.
@@ -405,6 +424,40 @@ async fn expect_handshake(server: &mut tokio::io::DuplexStream) {
     assert_eq!(cmd, CMD_SETTINGS);
     assert_eq!(sid, 0);
     assert_eq!(data, TEST_SETTINGS);
+}
+#[tokio::test]
+async fn demux_prefetches_multiple_frames_with_one_inner_read() {
+    let mut wire = Vec::new();
+    for sid in 0..32 {
+        write_frame(&mut wire, CMD_WASTE, sid, &[sid as u8])
+            .await
+            .unwrap();
+    }
+    write_frame(&mut wire, CMD_ALERT, 0, b"stop").await.unwrap();
+    assert!(wire.len() < DEMUX_READ_BUFFER_BYTES);
+
+    let reads = Arc::new(AtomicUsize::new(0));
+    let session = AnyTlsSession::establish(
+        "demux-prefetch",
+        Box::new(CountingReader {
+            inner: std::io::Cursor::new(wire),
+            reads: Arc::clone(&reads),
+        }),
+        Box::new(tokio::io::sink()),
+        TEST_AUTH,
+        TEST_SETTINGS,
+    )
+    .await
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !session.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(reads.load(Ordering::Acquire), 1);
 }
 
 #[tokio::test]

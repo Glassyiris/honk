@@ -42,6 +42,7 @@ const CMD_HEART_RESPONSE: u8 = 9;
 const CMD_SERVER_SETTINGS: u8 = 10;
 
 const FRAME_HEADER_LEN: usize = 7;
+const DEMUX_READ_BUFFER_BYTES: usize = u16::MAX as usize + 1;
 
 /// sing-anytls defaults (session/client.go): values below 5s clamp to 30s.
 const DEFAULT_IDLE_CHECK_INTERVAL_SECS: u64 = 30;
@@ -1424,7 +1425,8 @@ impl AnyTlsSession {
     }
 }
 
-async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedReader) {
+async fn session_demux(session: Arc<AnyTlsSession>, read: BoxedReader) {
+    let mut read = tokio::io::BufReader::with_capacity(DEMUX_READ_BUFFER_BYTES, read);
     let mut fail_reason: Option<anyhow::Error> = None;
     loop {
         let (cmd, sid, data) = match read_frame(&mut read).await {
