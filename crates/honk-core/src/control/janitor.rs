@@ -233,11 +233,13 @@ impl BpfJanitor {
             let mut pressure = PressureState::default();
             let mut gauge = OccupancyGauge::default();
             let mut aux_scan_high_water = [0usize; 3];
-            let mut aux_pressure_maps = [false; 3];
+            let mut aux_scan_results = [AuxScanResult {
+                complete: true,
+                ..AuxScanResult::default()
+            }; 3];
 
             let mut last_aux_failures = [0u64; 3];
             let mut aux_pressure_warned = [false; 3];
-            let mut aux_scan_counts = [0usize; 3];
             let mut last_scan_elapsed = [Duration::ZERO; 4];
 
             let mut last_redirect_cleanup = tokio::time::Instant::now();
@@ -287,7 +289,9 @@ impl BpfJanitor {
                 };
                 update_pressure_state(&mut pressure, overflow_delta, utilization);
 
-                let aux_pressure = aux_pressure_maps.iter().any(|&active| active);
+                let aux_pressure = aux_scan_results
+                    .iter()
+                    .any(|result| aux_scan_is_pressured(result.scanned, result.complete));
                 let redirect_interval = if pressure.active || aux_pressure {
                     Duration::from_secs(REDIRECT_PRESSURE_INTERVAL_SECS)
                 } else {
@@ -331,40 +335,40 @@ impl BpfJanitor {
                 };
 
                 if last_redirect_cleanup + redirect_interval <= now {
-                    let utilization = (aux_scan_counts[0] as f64 / AUX_MAP_CAPACITY as f64)
+                    let utilization = (aux_scan_results[0].scanned as f64
+                        / AUX_MAP_CAPACITY as f64)
                         .max(auxiliary_pressure_floor);
                     let tuning = scan_tuning(utilization, last_scan_elapsed[1]);
                     let started = Instant::now();
                     let result = self.cleanup_redirect_track(tuning).await;
                     last_scan_elapsed[1] = started.elapsed();
                     aux_scan_high_water[0] = aux_scan_high_water[0].max(result.scanned);
-                    aux_scan_counts[0] = result.scanned;
-                    aux_pressure_maps[0] = aux_scan_is_pressured(result.scanned, result.complete);
+                    aux_scan_results[0] = result;
                     last_redirect_cleanup = now;
                 }
                 if last_cookie_pid_cleanup + redirect_interval <= now {
-                    let utilization = (aux_scan_counts[1] as f64 / AUX_MAP_CAPACITY as f64)
+                    let utilization = (aux_scan_results[1].scanned as f64
+                        / AUX_MAP_CAPACITY as f64)
                         .max(auxiliary_pressure_floor);
                     let tuning = scan_tuning(utilization, last_scan_elapsed[2]);
                     let started = Instant::now();
                     let result = self.cleanup_cookie_pid(tuning).await;
                     last_scan_elapsed[2] = started.elapsed();
                     aux_scan_high_water[1] = aux_scan_high_water[1].max(result.scanned);
-                    aux_scan_counts[1] = result.scanned;
-                    aux_pressure_maps[1] = aux_scan_is_pressured(result.scanned, result.complete);
+                    aux_scan_results[1] = result;
                     last_cookie_pid_cleanup = now;
                 }
 
                 if last_routing_handoff + routing_interval <= now {
-                    let utilization = (aux_scan_counts[2] as f64 / AUX_MAP_CAPACITY as f64)
+                    let utilization = (aux_scan_results[2].scanned as f64
+                        / AUX_MAP_CAPACITY as f64)
                         .max(auxiliary_pressure_floor);
                     let tuning = scan_tuning(utilization, last_scan_elapsed[3]);
                     let started = Instant::now();
                     let result = self.cleanup_routing_handoff(tuning).await;
                     last_scan_elapsed[3] = started.elapsed();
                     aux_scan_high_water[2] = aux_scan_high_water[2].max(result.scanned);
-                    aux_scan_counts[2] = result.scanned;
-                    aux_pressure_maps[2] = aux_scan_is_pressured(result.scanned, result.complete);
+                    aux_scan_results[2] = result;
                     last_routing_handoff = now;
                 }
 
@@ -579,12 +583,8 @@ impl BpfJanitor {
                             expired.push((*key, *entry));
                         }
                     }
-                    let keep_scanning =
-                        expired.len() < tuning.candidates && Instant::now() < deadline;
-                    if !keep_scanning {
-                        complete = false;
-                    }
-                    keep_scanning
+                    complete = expired.len() < tuning.candidates && Instant::now() < deadline;
+                    complete
                 })?;
                 expired.truncate(tuning.candidates);
                 anyhow::Ok((expired, total, complete))
@@ -665,12 +665,8 @@ impl BpfJanitor {
                             expired.push((*cookie, *entry));
                         }
                     }
-                    let keep_scanning =
-                        expired.len() < tuning.candidates && Instant::now() < deadline;
-                    if !keep_scanning {
-                        complete = false;
-                    }
-                    keep_scanning
+                    complete = expired.len() < tuning.candidates && Instant::now() < deadline;
+                    complete
                 })?;
                 expired.truncate(tuning.candidates);
                 anyhow::Ok((expired, total, complete))
@@ -733,12 +729,8 @@ impl BpfJanitor {
                             expired.push((*key, *entry));
                         }
                     }
-                    let keep_scanning =
-                        expired.len() < tuning.candidates && Instant::now() < deadline;
-                    if !keep_scanning {
-                        complete = false;
-                    }
-                    keep_scanning
+                    complete = expired.len() < tuning.candidates && Instant::now() < deadline;
+                    complete
                 })?;
                 expired.truncate(tuning.candidates);
                 anyhow::Ok((expired, total, complete))
@@ -925,12 +917,6 @@ mod tests {
         assert!(!aux_scan_is_pressured(at_watermark, true));
         assert!(aux_scan_is_pressured(at_watermark + 1, true));
         assert!(aux_scan_is_pressured(0, false));
-
-        let mut map_pressure = [false; 3];
-        map_pressure[0] = aux_scan_is_pressured(0, false);
-        assert!(map_pressure.iter().any(|&active| active));
-        map_pressure[0] = aux_scan_is_pressured(0, true);
-        assert!(!map_pressure.iter().any(|&active| active));
     }
 
     #[test]
