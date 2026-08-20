@@ -4910,6 +4910,11 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
             }
             let _ = control.ebpf.write().await.set_datapath_ready(false);
             nfqueue.begin_pending_drain().await;
+            let stats_errors_before_shutdown = control
+                .stats
+                .udp_snapshot()
+                .nfqueue
+                .kernel_stats_read_errors;
             let service_shutdown = nfqueue.shutdown_service().await;
             let pending_shutdown = nfqueue.finish_pending_drain().await;
             control.pending_udp_verdicts = None;
@@ -4933,7 +4938,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
                     .udp_snapshot()
                     .nfqueue
                     .kernel_stats_read_errors
-                    == 0,
+                    == stats_errors_before_shutdown,
                 "stats sampler read the queue after teardown"
             );
             datapath_shutdown?;

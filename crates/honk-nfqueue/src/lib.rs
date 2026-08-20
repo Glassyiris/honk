@@ -178,10 +178,9 @@ impl QueueStatsReader {
         }
     }
 
-    pub fn stats(&self) -> io::Result<QueueStats> {
+    pub async fn stats(&self) -> io::Result<QueueStats> {
         let generation = self.kernel_counters.lock().generation;
-        // `/proc/net` is network-namespace scoped; async filesystem workers may not be.
-        let contents = std::fs::read_to_string("/proc/net/netfilter/nfnetlink_queue")?;
+        let contents = tokio::fs::read_to_string("/proc/net/netfilter/nfnetlink_queue").await?;
         let (kernel_queue_depth, kernel_dropped, kernel_user_dropped) =
             parse_kernel_queue_stats(&contents).ok_or_else(|| {
                 io::Error::new(

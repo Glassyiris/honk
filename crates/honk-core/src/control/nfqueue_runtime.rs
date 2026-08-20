@@ -552,7 +552,7 @@ impl ControlPlane {
                     _ = interval.tick() => {
                         sampler_queue.sample();
                         sampler_stats.update_udp_nfqueue_local_stats(stats_reader.local_stats());
-                        match stats_reader.stats() {
+                        match stats_reader.stats().await {
                             Ok(sample) => {
                                 if unavailable {
                                     info!("NFQUEUE kernel statistics are available again");
