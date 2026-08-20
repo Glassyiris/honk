@@ -295,7 +295,21 @@ pub(crate) fn add_chrome_alps(cfg: &mut ConnectConfiguration) -> anyhow::Result<
 }
 
 /// Mozilla root CAs (full DER certs) loaded into a BoringSSL store.
+///
+/// The store is built once per process (~150 parsed certs, ~0.8 MiB) and
+/// every caller gets a refcounted clone (`X509_STORE_up_ref`) — with a
+/// per-node-per-probe-cycle call pattern, building it fresh each time would
+/// pin hundreds of megabytes in connector caches.
 pub(crate) fn root_store() -> Result<boring::x509::store::X509Store, ErrorStack> {
+    static ROOT_STORE: LazyLock<Option<boring::x509::store::X509Store>> =
+        LazyLock::new(|| build_root_store().ok());
+    match &*ROOT_STORE {
+        Some(store) => Ok(store.clone()),
+        None => build_root_store(),
+    }
+}
+
+fn build_root_store() -> Result<boring::x509::store::X509Store, ErrorStack> {
     let mut builder = X509StoreBuilder::new()?;
     for der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
         if let Ok(cert) = X509::from_der(der.as_ref()) {
@@ -564,6 +578,14 @@ pub fn build_http_probe_connector(skip_cert_verify: bool) -> anyhow::Result<TlsC
 mod tests {
     use super::*;
     use boring::pkey::PKey;
+
+    #[test]
+    fn root_store_clones_share_one_store() {
+        use foreign_types::ForeignType;
+        let a = root_store().unwrap();
+        let b = root_store().unwrap();
+        assert_eq!(a.as_ptr(), b.as_ptr());
+    }
     use boring::ssl::{SslAcceptor, SslStream};
     use std::io::Read;
     use std::net::TcpListener;
