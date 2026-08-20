@@ -215,7 +215,7 @@ pub(super) fn bench_tcp_pool_exchange(c: &mut Criterion) {
     g.throughput(Throughput::Elements(1));
     g.bench_function("exchange_reused", |b| {
         b.to_async(&rt).iter(|| async {
-            let r = pool.exchange(black_box(&q)).await.unwrap();
+            let r = pool.exchange(black_box(&q), None).await.unwrap();
             black_box(r);
         });
     });

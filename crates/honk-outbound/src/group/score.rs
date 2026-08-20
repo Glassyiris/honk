@@ -2,7 +2,7 @@ use super::{IpVersion, ProbeDomain, SelectionNetwork};
 use honk_config::node::Node;
 use lru::LruCache;
 use parking_lot::Mutex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -16,8 +16,41 @@ const AGGREGATE_CAPACITY: usize = 4096;
 const RELIABILITY_CLOSE: f64 = 0.05;
 const SCORE_EVIDENCE_HALF_LIFE: Duration = Duration::from_secs(30 * 60);
 const MIN_TRAINED_EVIDENCE: f64 = 0.5;
+const SCORE_SWITCH_MARGIN: f64 = 0.01;
+const SCORE_EXPLORATION_MIN_PERIOD: u64 = 16;
+const SCORE_EXPLORATION_MAX_PERIOD: u64 = 64;
 const MIN_THROUGHPUT_DURATION: Duration = Duration::from_secs(1);
 const MIN_THROUGHPUT_BYTES: u64 = 64 * 1024;
+
+fn exploration_target(candidate_count: usize) -> usize {
+    if candidate_count <= 4 {
+        candidate_count
+    } else {
+        (((candidate_count as f64).sqrt().ceil() as usize) + 1).min(candidate_count)
+    }
+}
+
+fn exploration_period(candidate_count: usize) -> u64 {
+    (candidate_count as u64)
+        .saturating_mul(2)
+        .clamp(SCORE_EXPLORATION_MIN_PERIOD, SCORE_EXPLORATION_MAX_PERIOD)
+}
+
+fn exploration_attempts(score: &ScoreSnapshot) -> f64 {
+    if score.targeted {
+        score.target_attempts
+    } else {
+        score.attempts
+    }
+}
+
+fn exploration_completed(score: &ScoreSnapshot) -> f64 {
+    if score.targeted {
+        score.target_completed
+    } else {
+        score.completed
+    }
+}
 
 /// A normalized business target used only as an in-memory score key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -154,6 +187,7 @@ struct Stats {
     throughput_windows: f64,
     last_used: u64,
     updated_at: Option<Instant>,
+    selected_at: u64,
 }
 
 impl Stats {
@@ -303,6 +337,7 @@ struct StateInner {
     exact: LruCache<ExactKey, Stats>,
     aggregate: LruCache<AggregateKey, Stats>,
     valid: HashSet<(String, Uuid)>,
+    selection_counts: HashMap<String, u64>,
     tick: u64,
 }
 
@@ -314,6 +349,7 @@ impl Default for StateInner {
                 NonZeroUsize::new(AGGREGATE_CAPACITY).expect("non-zero capacity"),
             ),
             valid: HashSet::new(),
+            selection_counts: HashMap::new(),
             tick: 0,
         }
     }
@@ -334,6 +370,10 @@ impl ScorePolicyState {
     {
         let mut inner = self.inner.lock();
         inner.valid = membership.into_iter().collect();
+        let valid_groups: HashSet<_> = inner.valid.iter().map(|(group, _)| group.clone()).collect();
+        inner
+            .selection_counts
+            .retain(|group, _| valid_groups.contains(group));
         let invalid_exact: Vec<_> = inner
             .exact
             .iter()
@@ -467,6 +507,15 @@ impl ScorePolicyState {
         self.rank_at(group, context, nodes, Instant::now())
     }
 
+    pub(super) fn peek_rank(
+        &self,
+        group: &str,
+        context: &ScoreSelectionContext,
+        nodes: &[&Node],
+    ) -> usize {
+        self.rank_inner(group, context, nodes, Instant::now(), false)
+    }
+
     fn rank_at(
         &self,
         group: &str,
@@ -474,44 +523,63 @@ impl ScorePolicyState {
         nodes: &[&Node],
         now: Instant,
     ) -> usize {
+        self.rank_inner(group, context, nodes, now, true)
+    }
+
+    fn rank_inner(
+        &self,
+        group: &str,
+        context: &ScoreSelectionContext,
+        nodes: &[&Node],
+        now: Instant,
+        apply: bool,
+    ) -> usize {
         if nodes.len() < 2 {
             return 0;
         }
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         let snapshots: Vec<_> = nodes
             .iter()
             .map(|node| score_snapshot(&inner, group, context, node.id, now))
             .collect();
-        if let Some((index, _)) = snapshots
+        let selection_count = if apply {
+            let count = inner.selection_counts.entry(group.to_owned()).or_default();
+            *count = count.saturating_add(1);
+            *count
+        } else {
+            inner.selection_counts.get(group).copied().unwrap_or(0)
+        };
+        let (best, forced_exploration) = best_index(&snapshots, nodes, selection_count, apply);
+        let incumbent = snapshots
             .iter()
             .enumerate()
-            .filter(|(_, score)| score.completed < MIN_TRAINED_EVIDENCE)
-            .min_by(|(left_index, left), (right_index, right)| {
-                left.attempts
-                    .total_cmp(&right.attempts)
-                    .then_with(|| left_index.cmp(right_index))
-                    .then_with(|| nodes[*left_index].id.cmp(&nodes[*right_index].id))
-            })
-        {
-            return index;
-        }
-        let best_reliability = snapshots
-            .iter()
-            .map(|score| score.reliability)
-            .fold(0.0_f64, f64::max);
-        let total_attempts = snapshots.iter().map(|score| score.attempts).sum();
-        snapshots
-            .iter()
-            .enumerate()
-            .filter(|(_, score)| best_reliability - score.reliability <= RELIABILITY_CLOSE)
+            .filter(|(_, score)| score.selected_at != 0)
             .max_by(|(left_index, left), (right_index, right)| {
-                utility(left, total_attempts)
-                    .total_cmp(&utility(right, total_attempts))
-                    .then_with(|| right_index.cmp(left_index))
-                    .then_with(|| nodes[*right_index].id.cmp(&nodes[*left_index].id))
+                left.selected_at
+                    .cmp(&right.selected_at)
+                    .then_with(|| left_index.cmp(right_index))
             })
-            .map(|(index, _)| index)
-            .unwrap_or(0)
+            .map(|(index, _)| index);
+        let selected = if forced_exploration {
+            best
+        } else {
+            incumbent
+                .filter(|&index| index != best)
+                .filter(|&index| keep_incumbent(&snapshots[index], &snapshots[best]))
+                .unwrap_or(best)
+        };
+        if apply {
+            inner.tick = inner.tick.saturating_add(1);
+            let selection_tick = inner.tick;
+            mark_selected(
+                &mut inner,
+                group,
+                context,
+                nodes[selected].id,
+                selection_tick,
+            );
+        }
+        selected
     }
 
     #[cfg(test)]
@@ -615,6 +683,126 @@ impl ScorePolicyState {
     }
 }
 
+fn best_index(
+    snapshots: &[ScoreSnapshot],
+    nodes: &[&Node],
+    selection_count: u64,
+    explore: bool,
+) -> (usize, bool) {
+    if explore {
+        let candidate_count = snapshots.len();
+        let target = exploration_target(candidate_count);
+        let explored = snapshots
+            .iter()
+            .filter(|score| exploration_attempts(score) >= MIN_TRAINED_EVIDENCE)
+            .count();
+        let cold = snapshots
+            .iter()
+            .enumerate()
+            .filter(|(_, score)| exploration_completed(score) < MIN_TRAINED_EVIDENCE)
+            .min_by(|(left_index, left), (right_index, right)| {
+                exploration_attempts(left)
+                    .total_cmp(&exploration_attempts(right))
+                    .then_with(|| left_index.cmp(right_index))
+                    .then_with(|| nodes[*left_index].id.cmp(&nodes[*right_index].id))
+            })
+            .map(|(index, _)| index);
+        let periodic = candidate_count > target
+            && selection_count != 0
+            && selection_count.is_multiple_of(exploration_period(candidate_count));
+        if let Some(index) = cold
+            && (explored < target || candidate_count <= target || periodic)
+        {
+            return (index, true);
+        }
+        if periodic {
+            let incumbent = snapshots
+                .iter()
+                .enumerate()
+                .filter(|(_, score)| score.selected_at != 0)
+                .max_by_key(|(_, score)| score.selected_at)
+                .map(|(index, _)| index);
+            if let Some((index, _)) = snapshots
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| Some(*index) != incumbent)
+                .min_by(|(left_index, left), (right_index, right)| {
+                    exploration_attempts(left)
+                        .total_cmp(&exploration_attempts(right))
+                        .then_with(|| left_index.cmp(right_index))
+                        .then_with(|| nodes[*left_index].id.cmp(&nodes[*right_index].id))
+                })
+            {
+                return (index, true);
+            }
+        }
+    }
+    let best_reliability = snapshots
+        .iter()
+        .map(|score| score.reliability)
+        .fold(0.0_f64, f64::max);
+    (
+        snapshots
+            .iter()
+            .enumerate()
+            .filter(|(_, score)| best_reliability - score.reliability <= RELIABILITY_CLOSE)
+            .max_by(|(left_index, left), (right_index, right)| {
+                utility(left)
+                    .total_cmp(&utility(right))
+                    .then_with(|| right_index.cmp(left_index))
+                    .then_with(|| nodes[*right_index].id.cmp(&nodes[*left_index].id))
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(0),
+        false,
+    )
+}
+
+fn keep_incumbent(incumbent: &ScoreSnapshot, best: &ScoreSnapshot) -> bool {
+    incumbent.completed >= MIN_TRAINED_EVIDENCE
+        && best.completed >= MIN_TRAINED_EVIDENCE
+        && incumbent.failures == 0.0
+        && utility(best) - utility(incumbent) < SCORE_SWITCH_MARGIN
+}
+
+fn mark_selected(
+    inner: &mut StateInner,
+    group: &str,
+    context: &ScoreSelectionContext,
+    node_id: Uuid,
+    tick: u64,
+) {
+    let key = AggregateKey {
+        group: group.to_string(),
+        network: context.network,
+        family: context.target_family,
+        node_id,
+    };
+    if let Some(stats) = inner.aggregate.get_mut(&key) {
+        stats.selected_at = tick;
+    } else {
+        inner.aggregate.put(
+            key,
+            Stats {
+                incarnation: tick,
+                selected_at: tick,
+                ..Default::default()
+            },
+        );
+    }
+    if let (Some(family), Some(target)) = (context.target_family, context.target.as_ref()) {
+        let key = ExactKey {
+            group: group.to_string(),
+            network: context.network,
+            family,
+            target: target.clone(),
+            node_id,
+        };
+        if let Some(stats) = inner.exact.get_mut(&key) {
+            stats.selected_at = tick;
+        }
+    }
+}
 fn aggregate_families(context: &ScoreSelectionContext) -> [Option<IpVersion>; 2] {
     [None, context.target_family]
 }
@@ -683,6 +871,11 @@ struct ScoreSnapshot {
     latency_confidence: f64,
     throughput: Option<f64>,
     throughput_confidence: f64,
+    failures: f64,
+    selected_at: u64,
+    targeted: bool,
+    target_attempts: f64,
+    target_completed: f64,
 }
 
 fn score_snapshot(
@@ -743,6 +936,11 @@ fn score_snapshot(
                 family.throughput_confidence,
                 reliability_weight,
             ),
+            failures: global_score.failures + family.failures,
+            selected_at: global_score.selected_at.max(family.selected_at),
+            targeted: false,
+            target_attempts: 0.0,
+            target_completed: 0.0,
         }
     });
     let exact_score = match (context.target_family, context.target.as_ref()) {
@@ -788,9 +986,14 @@ fn score_snapshot(
             exact.throughput_confidence,
             reliability_weight,
         ),
+        failures: aggregate_score.failures + exact.failures,
+        selected_at: aggregate_score.selected_at.max(exact.selected_at),
+        targeted: exact.completed >= MIN_TRAINED_EVIDENCE
+            || aggregate_score.completed < MIN_TRAINED_EVIDENCE,
+        target_attempts: exact.attempts,
+        target_completed: exact.completed,
     }
 }
-
 fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
     let factor = stats.updated_at.map_or(1.0, |updated_at| {
         evidence_decay(now.saturating_duration_since(updated_at))
@@ -814,9 +1017,13 @@ fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
         latency_confidence: (latency_weight * factor / 8.0).clamp(0.0, 1.0),
         throughput,
         throughput_confidence: (stats.throughput_windows * factor / 8.0).clamp(0.0, 1.0),
+        failures: (stats.setup_failure + stats.useful_failure) * factor,
+        selected_at: stats.selected_at,
+        targeted: false,
+        target_attempts: 0.0,
+        target_completed: 0.0,
     }
 }
-
 fn blend(base: f64, exact: f64, exact_weight: f64) -> f64 {
     base * (1.0 - exact_weight) + exact * exact_weight
 }
@@ -829,20 +1036,16 @@ fn blend_option(base: Option<f64>, exact: Option<f64>, exact_weight: f64) -> Opt
     }
 }
 
-fn utility(score: &ScoreSnapshot, total_attempts: f64) -> f64 {
-    let exploration = ((total_attempts + 1.0).ln() / (score.attempts + 1.0))
-        .sqrt()
-        .min(1.0)
-        * RELIABILITY_CLOSE;
+fn utility(score: &ScoreSnapshot) -> f64 {
     let latency_penalty = score
         .latency_ms
-        .map(|latency| (latency.max(1.0).log2() / 20.0).min(0.03) * score.latency_confidence)
+        .map(|latency| latency.max(1.0).log2().min(20.0) / 20.0 * 0.03 * score.latency_confidence)
         .unwrap_or(0.0);
     let throughput_bonus = score
         .throughput
         .map(|throughput| throughput / 30.0 * 0.02 * score.throughput_confidence)
         .unwrap_or(0.0);
-    score.reliability + exploration + throughput_bonus - latency_penalty
+    score.reliability + throughput_bonus - latency_penalty
 }
 
 #[derive(Clone)]
@@ -1356,7 +1559,7 @@ impl super::GroupManager {
                     super::SelectionEffects::Apply,
                 ),
                 honk_config::group::GroupPolicy::Score => {
-                    self.pick_score(&candidates, group, context)
+                    self.pick_score(&candidates, group, context, super::SelectionEffects::Apply)
                 }
             };
             (super::SelectionPlanMode::Authoritative, vec![candidate])
@@ -1444,7 +1647,7 @@ impl super::GroupManager {
                     self.pick_fallback(&candidates, group, context.network, effects)
                 }
                 honk_config::group::GroupPolicy::Score => {
-                    self.pick_score(&candidates, group, context)
+                    self.pick_score(&candidates, group, context, effects)
                 }
             })
         }?;
@@ -1526,7 +1729,7 @@ impl super::GroupManager {
             group.check_url.as_deref(),
         );
         (!candidates.is_empty()).then(|| {
-            self.pick_score(&candidates, group, &context)
+            self.pick_score(&candidates, group, &context, super::SelectionEffects::Peek)
                 .tag
                 .to_string()
         })
@@ -1550,6 +1753,193 @@ mod tests {
 
         assert_close(latency.mean().unwrap(), 20.0);
         assert_close(latency.weight, 3.0);
+    }
+
+    #[test]
+    fn trained_utility_does_not_trade_latency_for_attempt_balance() {
+        let candidate = |attempts, latency_ms| ScoreSnapshot {
+            attempts,
+            completed: 8.0,
+            reliability: 0.9,
+            useful_completed: 8.0,
+            latency_ms: Some(latency_ms),
+            latency_confidence: 1.0,
+            throughput: None,
+            throughput_confidence: 0.0,
+            failures: 0.0,
+            selected_at: 0,
+            targeted: false,
+            target_attempts: 0.0,
+            target_completed: 0.0,
+        };
+
+        let faster_incumbent = candidate(100.0, 50.0);
+        let underused_slow_node = candidate(8.0, 500.0);
+        assert!(utility(&faster_incumbent) > utility(&underused_slow_node));
+    }
+
+    #[test]
+    fn exploration_budget_scales_with_candidate_count() {
+        assert_eq!(exploration_target(3), 3);
+        assert_eq!(exploration_target(4), 4);
+        assert_eq!(exploration_target(14), 5);
+        assert_eq!(exploration_target(28), 7);
+        assert_eq!(exploration_period(3), SCORE_EXPLORATION_MIN_PERIOD);
+        assert_eq!(exploration_period(28), 56);
+        assert_eq!(exploration_period(128), SCORE_EXPLORATION_MAX_PERIOD);
+    }
+
+    #[test]
+    fn large_score_groups_periodically_try_non_incumbent() {
+        let nodes: Vec<_> = (0..8).map(|index| node(&format!("node-{index}"))).collect();
+        let node_refs: Vec<_> = nodes.iter().collect();
+        let context = context("example.com", IpVersion::V4);
+        let state = ScorePolicyState::default();
+        state.publish_membership(nodes.iter().map(|node| ("score".into(), node.id)));
+        let now = Instant::now();
+        {
+            let mut inner = state.inner.lock();
+            for (index, node) in nodes.iter().enumerate() {
+                inner.aggregate.put(
+                    AggregateKey {
+                        group: "score".into(),
+                        network: SelectionNetwork::Tcp,
+                        family: None,
+                        node_id: node.id,
+                    },
+                    Stats {
+                        setup_success: 8.0,
+                        useful_success: 8.0,
+                        first_response_ms: WeightedMean {
+                            sum: 800.0,
+                            weight: 8.0,
+                        },
+                        updated_at: Some(now),
+                        selected_at: u64::from(index == 0),
+                        ..Default::default()
+                    },
+                );
+            }
+            inner
+                .selection_counts
+                .insert("score".into(), exploration_period(nodes.len()) - 1);
+        }
+
+        assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
+    }
+
+    #[test]
+    fn large_score_groups_cap_initial_target_exploration() {
+        let nodes: Vec<_> = (0..8).map(|index| node(&format!("node-{index}"))).collect();
+        let manager = super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
+        let context = context("example.com", IpVersion::V4);
+        let mut seen = std::collections::HashSet::new();
+
+        for _ in 0..exploration_target(nodes.len()) {
+            let plan = manager.selection_plan_for_target("score", &context);
+            seen.insert(plan.entries[0].node.id);
+            finish_success(&plan);
+        }
+
+        assert_eq!(seen.len(), exploration_target(nodes.len()));
+    }
+
+    #[test]
+    fn score_peek_does_not_consume_group_exploration_budget() {
+        let nodes: Vec<_> = (0..8).map(|index| node(&format!("node-{index}"))).collect();
+        let node_refs: Vec<_> = nodes.iter().collect();
+        let context = ScoreSelectionContext::aggregate(
+            SelectionNetwork::Tcp,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+        );
+        let state = ScorePolicyState::default();
+        state.publish_membership(nodes.iter().map(|node| ("score".into(), node.id)));
+        let now = Instant::now();
+        {
+            let mut inner = state.inner.lock();
+            for (index, node) in nodes.iter().enumerate() {
+                inner.aggregate.put(
+                    AggregateKey {
+                        group: "score".into(),
+                        network: SelectionNetwork::Tcp,
+                        family: None,
+                        node_id: node.id,
+                    },
+                    Stats {
+                        setup_success: 8.0,
+                        useful_success: 8.0,
+                        first_response_ms: WeightedMean {
+                            sum: 800.0,
+                            weight: 8.0,
+                        },
+                        updated_at: Some(now),
+                        selected_at: u64::from(index == 0),
+                        ..Default::default()
+                    },
+                );
+            }
+            inner
+                .selection_counts
+                .insert("score".into(), exploration_period(nodes.len()) - 1);
+        }
+
+        let selected = state.rank_at("score", &context, &node_refs, now);
+        assert_eq!(selected, 1);
+        let count = state.inner.lock().selection_counts["score"];
+        assert_eq!(state.peek_rank("score", &context, &node_refs), selected);
+        assert_eq!(state.inner.lock().selection_counts["score"], count);
+    }
+
+    #[test]
+    fn trained_score_holds_incumbent_against_small_gain() {
+        let nodes = [node("a"), node("b")];
+        let node_refs = [&nodes[0], &nodes[1]];
+        let context = context("example.com", IpVersion::V4);
+        let state = ScorePolicyState::default();
+        state.publish_membership(nodes.iter().map(|node| ("score".into(), node.id)));
+        let now = Instant::now();
+        let key = |node_id| AggregateKey {
+            group: "score".into(),
+            network: SelectionNetwork::Tcp,
+            family: Some(IpVersion::V4),
+            node_id,
+        };
+        {
+            let mut inner = state.inner.lock();
+            for (node, latency_ms) in [(&nodes[0], 1_000.0), (&nodes[1], 1_200.0)] {
+                inner.aggregate.put(
+                    key(node.id),
+                    Stats {
+                        setup_success: 8.0,
+                        useful_success: 8.0,
+                        first_response_ms: WeightedMean {
+                            sum: latency_ms * 8.0,
+                            weight: 8.0,
+                        },
+                        updated_at: Some(now),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        assert_eq!(state.rank_at("score", &context, &node_refs, now), 0);
+        inner_update_response(&state, key(nodes[1].id), 900.0);
+        assert_eq!(state.rank_at("score", &context, &node_refs, now), 0);
+        inner_update_response(&state, key(nodes[1].id), 1.0);
+        assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
+    }
+
+    fn inner_update_response(state: &ScorePolicyState, key: AggregateKey, latency_ms: f64) {
+        state
+            .inner
+            .lock()
+            .aggregate
+            .get_mut(&key)
+            .unwrap()
+            .first_response_ms
+            .sum = latency_ms * 8.0;
     }
 
     #[test]
@@ -1668,6 +2058,7 @@ mod tests {
             throughput_windows: 4.0,
             last_used: 9,
             updated_at: Some(start),
+            selected_at: 0,
         };
 
         stats.decay_to(start + SCORE_EVIDENCE_HALF_LIFE);
