@@ -23,7 +23,7 @@ use std::sync::{Arc, LazyLock};
 use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use boring::aead::{AeadCtx, Algorithm as AeadAlgorithm};
 use boring::error::ErrorStack;
-use boring::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode, SslVersion};
+use boring::ssl::{Ssl, SslContext};
 use bytes::BytesMut;
 use foreign_types::ForeignTypeRef;
 use hkdf::Hkdf;
@@ -583,29 +583,8 @@ impl BoringQuicClientConfig {
             pin_sha256,
             ticket_key,
         } = options;
-        let mut builder = SslContext::builder(SslMethod::tls())?;
-        // QUIC mandates TLS 1.3.
-        builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
-        builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
-
-        if let Some(pin) = pin_sha256 {
-            // pinSHA256: fingerprint check replaces PKI + hostname checks.
-            builder.set_custom_verify_callback(
-                SslVerifyMode::PEER,
-                crate::tls::pin_sha256_custom_verify(pin),
-            );
-        } else if skip_cert_verify {
-            builder.set_verify(SslVerifyMode::NONE);
-        } else {
-            builder.set_verify(SslVerifyMode::PEER);
-            builder.set_verify_cert_store(crate::tls::root_store()?)?;
-        }
-        if chrome {
-            builder.set_grease_enabled(true);
-            builder.set_sigalgs_list(crate::tls::CHROME_SIGALGS)?;
-            builder.set_curves_list(crate::tls::CHROME_CURVES)?;
-            builder.add_certificate_compression_algorithm(crate::tls::BrotliCertCompression)?;
-        }
+        let has_pin = pin_sha256.is_some();
+        let builder = crate::tls::build_quic_context(skip_cert_verify, pin_sha256, chrome)?;
         // Client-side TLS 1.3 session ticket cache: a repeat connection to
         // the same server can resume (and offer 0-RTT early data when the
         // server accepts it). BoringSSL has no implicit internal cache —
@@ -623,7 +602,7 @@ impl BoringQuicClientConfig {
             alpn_wire,
             chrome,
             ech_config_list,
-            has_pin: pin_sha256.is_some(),
+            has_pin,
             ticket_key,
         })
     }
