@@ -59,10 +59,12 @@ An empty `lan_interface` is literal: honk installs no LAN TC hooks and never sub
 
 | Mode | Sniffing | Domain verification | Routing and dial behavior |
 | ---- | -------- | ------------------- | ------------------------- |
-| `ip` | No | Not applicable | Resolve locally and dial the proxy by numeric IP. |
-| `domain` | Yes | The sniffed name must resolve to the original destination IP. | Dial by the verified domain; do not re-run routing solely because of sniffing. |
-| `domain+` | Yes | No | Use the sniffed domain without destination-IP verification; do not re-run routing. |
-| `domain++` | Forced | No | Re-evaluate routing from the sniffed SNI/Host, then dial using the resulting domain decision. |
+| `ip` | No | Not applicable | Keep the original destination IP; do not sniff or re-run routing. |
+| `domain` | Yes | The sniffed name must pass the destination-IP reality check. | A verified name may re-run routing; if no domain rule matches, normal IP/port rules still decide. Proxy outbounds may dial by the verified name. |
+| `domain+` | Yes | No | Keep the initial IP-rule decision, but let proxy outbounds use the sniffed domain as their target. |
+| `domain++` | Yes | No | Re-evaluate non-reserved decisions from the sniffed SNI/Host, then use the resulting proxy domain target. |
+
+Direct, block, `must`, and other reserved handoffs remain final and keep the original IP target.
 
 ## Data directory and asset paths
 

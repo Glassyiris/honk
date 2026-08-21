@@ -1736,6 +1736,42 @@ async fn udp_domain_reality_uses_client_source() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn udp_domain_plus_passes_sniffed_proxy_target_without_rerouting() -> anyhow::Result<()> {
+    let client = addr("192.0.2.10:53000");
+    let original_dst = addr("198.51.100.20:443");
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let mut config = udp_test_config("udp-test", vec![udp_test_node()], vec![]);
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "domain+".into();
+    let handle = udp_test_handle(
+        config,
+        UdpTestMode::UdpCaptureTarget(Arc::clone(&captured)),
+        1,
+    );
+
+    let hello = crate::control::quic::test_utils::build_client_hello(Some("source.test"));
+    let packet = crate::control::quic::test_utils::protect_initial_packet(
+        b"dcid1234",
+        b"",
+        1,
+        0,
+        1,
+        &crate::control::quic::test_utils::wrap_crypto_frame(0, &hello),
+    );
+    serve_test_udp_to(&handle, client, original_dst, &packet).await?;
+
+    let (target, domain) = captured
+        .lock()
+        .expect("UDP dial target")
+        .clone()
+        .expect("UDP transport dial was captured");
+    assert_eq!(target, original_dst);
+    assert_eq!(domain.as_deref(), Some("source.test"));
+    handle.udp_pool.remove(client, original_dst);
+    Ok(())
+}
+
+#[tokio::test]
 async fn tcp_local_resolution_uses_client_source() -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1847,6 +1883,7 @@ enum UdpTestMode {
         release: Arc<tokio::sync::Notify>,
     },
     TcpCaptureTarget(CapturedTcpTarget),
+    UdpCaptureTarget(CapturedTcpTarget),
     Hold {
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
@@ -2011,9 +2048,13 @@ impl honk_outbound::proxy::PacketOutbound for UdpTestHandler {
         &self,
         _node: &Node,
         target: SocketAddr,
-        _target_domain: Option<&str>,
+        target_domain: Option<&str>,
         _connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn honk_outbound::proxy::PacketTransport>> {
+        if let UdpTestMode::UdpCaptureTarget(captured) = &self.mode {
+            *captured.lock().expect("UDP dial target") =
+                Some((target, target_domain.map(str::to_owned)));
+        }
         match &self.mode {
             UdpTestMode::Hold { entered, release } => {
                 entered.notify_one();

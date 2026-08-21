@@ -304,16 +304,14 @@ impl ControlPlane {
 }
 
 /// The static half of the datapath offload policy: non-`must` direct
-/// offload needs no SNI re-evaluation when `dial_mode: ip` or the routing
-/// config contains no domain-class rule at all.
+/// offload is safe when sniffing cannot change routing (`ip`/`domain+`) or
+/// the routing config contains no domain-class rule at all.
 fn direct_offload_static_bit(config: &Config, plan: &routing_matcher::RoutingPushPlan) -> u32 {
-    let dial_mode = config
-        .global
-        .dial_mode
-        .parse::<DialMode>()
-        .ok()
-        .unwrap_or(DialMode::DomainPlusPlus);
-    if dial_mode == DialMode::Ip || !plan.has_domain_rules {
+    let dial_mode = match config.global.dial_mode.parse::<DialMode>() {
+        Ok(mode) => mode,
+        Err(_) => return 0,
+    };
+    if matches!(dial_mode, DialMode::Ip | DialMode::DomainPlus) || !plan.has_domain_rules {
         honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_NO_DOMAIN_RULES
     } else {
         0
@@ -334,13 +332,12 @@ impl ControlPlane {
             outbound_name_to_id.insert(group.name.clone(), id);
         }
 
-        let fallback_outbound = config.routing.default_outbound.as_str();
         let dial_mode = config
             .global
             .dial_mode
             .parse::<DialMode>()
-            .ok()
-            .unwrap_or(DialMode::DomainPlusPlus);
+            .map_err(|_| anyhow::anyhow!("invalid global.dial_mode"))?;
+        let fallback_outbound = config.routing.default_outbound.as_str();
         routing_matcher::RoutingMatcherBuilder::compile(
             router.compiled_routes(),
             &outbound_name_to_id,

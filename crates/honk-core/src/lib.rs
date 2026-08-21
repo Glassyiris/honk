@@ -220,7 +220,7 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
             }
             let config = Config::from_file(cli.config.to_str().unwrap())?;
             let mut config = config;
-            config.global.dial_mode = mode.clone();
+            config.experimental.clash_api.default_mode = mode.clone();
             config.validate()?;
             config.to_file(cli.config.to_str().unwrap())?;
             println!("Mode set to {}", mode);
