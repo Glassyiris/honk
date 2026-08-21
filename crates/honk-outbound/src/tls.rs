@@ -24,7 +24,7 @@ use base64::engine::general_purpose;
 use boring::error::ErrorStack;
 use boring::ssl::{
     CertificateCompressionAlgorithm, CertificateCompressor, ConnectConfiguration, SslConnector,
-    SslMethod, SslVerifyMode, SslVersion,
+    SslContextBuilder, SslMethod, SslVerifyMode, SslVersion,
 };
 use boring::x509::X509;
 use boring::x509::store::X509StoreBuilder;
@@ -502,7 +502,7 @@ pub fn pin_sha256_custom_verify(
     }
 }
 
-fn apply_chrome_ctx(builder: &mut boring::ssl::SslConnectorBuilder) -> anyhow::Result<()> {
+pub(crate) fn apply_chrome_ctx(builder: &mut SslContextBuilder) -> anyhow::Result<()> {
     builder.set_grease_enabled(true);
     builder.set_sigalgs_list(CHROME_SIGALGS)?;
     builder.set_curves_list(CHROME_CURVES)?;
