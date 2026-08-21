@@ -163,11 +163,10 @@ impl ControlPlaneHandle {
                             || x == OutboundIndex::MustRules as u8
                     )
             });
-        let quic_domain: Option<String>;
         let mut follower_rx = None;
         let mut sniffed_followers = Vec::new();
-        if skip_sniff {
-            quic_domain = None;
+        let quic_domain: Option<String> = if skip_sniff {
+            None
         } else {
             use crate::control::packet_sniffer::QuicSniffOutcome;
             let sniffer_key =
@@ -197,8 +196,8 @@ impl ControlPlaneHandle {
                 }
                 return Ok(());
             }
-            quic_domain = outcome.into_domain();
-        }
+            outcome.into_domain()
+        };
         let (quic_domain, domain_verified) = self
             .apply_domain_reality_check(dial_mode, quic_domain, original_dst.ip(), client_addr.ip())
             .await;
