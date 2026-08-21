@@ -748,7 +748,8 @@ pub(crate) struct AnyTlsSession {
     /// never a clean EOF.
     terminal_error: std::sync::OnceLock<Arc<anyhow::Error>>,
     /// Streams killed locally (HOL slow-consumer): their readers see a
-    /// reset after the queued data drains, not a clean EOF.
+    /// reset after the queued data drains, not a clean EOF. A tombstone
+    /// survives map/session teardown until the owning stream reads or drops.
     killed_streams: Mutex<HashSet<u32>>,
     /// Per-stream ordered overflow for full TCP queues, with exact session
     /// and stream frame/byte accounting.
@@ -1079,12 +1080,15 @@ impl AnyTlsSession {
 
     /// Unregister a stream, optionally notifying the server with FIN. This is
     /// synchronous so cleanup is ordered before the stream permit is dropped.
-    fn end_stream(&self, sid: u32, notify_fin: bool) {
-        let (was_registered, received_fin) = {
+    /// Returns whether the watchdog had killed this stream.
+    fn end_stream(&self, sid: u32, notify_fin: bool) -> bool {
+        let (was_registered, received_fin, was_killed) = {
             let mut remote_fin = self.remote_fin.lock();
+            let mut killed_streams = self.killed_streams.lock().unwrap();
             let received_fin = remote_fin.remove(&sid);
+            let was_killed = killed_streams.remove(&sid);
             let was_registered = self.streams.lock().unwrap().remove(&sid).is_some();
-            (was_registered, received_fin)
+            (was_registered, received_fin, was_killed)
         };
 
         self.discard_overflow(sid);
@@ -1092,6 +1096,28 @@ impl AnyTlsSession {
             let _ = self.enqueue_control(CMD_FIN, sid, bytes::Bytes::new());
         }
         debug!("AnyTLS session {} sid={} stream ended", self.seq, sid);
+        was_killed
+    }
+
+    fn kill_stream(&self, sid: u32) -> Option<usize> {
+        let queue_capacity = {
+            let mut remote_fin = self.remote_fin.lock();
+            let mut killed_streams = self.killed_streams.lock().unwrap();
+            let mut streams = self.streams.lock().unwrap();
+            let Some(StreamSink::Tcp(tx)) = streams.get(&sid).cloned() else {
+                return None;
+            };
+            if tx.is_closed() {
+                return None;
+            }
+            streams.remove(&sid);
+            remote_fin.remove(&sid);
+            killed_streams.insert(sid);
+            tx.capacity()
+        };
+
+        self.discard_overflow(sid);
+        Some(queue_capacity)
     }
 
     /// Mark a registered stream before queueing its remote FIN event. The
@@ -1212,14 +1238,16 @@ impl AnyTlsSession {
     }
 
     fn overflow_sink_is_live(&self, sid: u32) -> bool {
-        let live = matches!(
-            self.streams.lock().unwrap().get(&sid),
-            Some(StreamSink::Tcp(tx)) if !tx.is_closed()
-        );
-        if !live {
+        let closed = match self.streams.lock().unwrap().get(&sid) {
+            Some(StreamSink::Tcp(tx)) => tx.is_closed(),
+            Some(StreamSink::Uot(_)) | None => return false,
+        };
+        if closed {
             self.end_stream(sid, false);
+            false
+        } else {
+            true
         }
-        live
     }
 
     fn overflow_has(&self, sid: u32) -> bool {
@@ -1235,11 +1263,10 @@ impl AnyTlsSession {
     }
 
     fn kill_overflow_victim(&self, victim: OverflowVictim) {
-        let stall_ms = u64::try_from(victim.stalled_for.as_millis()).unwrap_or(u64::MAX);
-        let queue_capacity = match self.streams.lock().unwrap().get(&victim.sid) {
-            Some(StreamSink::Tcp(tx)) => tx.capacity(),
-            Some(StreamSink::Uot(_)) | None => 0,
+        let Some(queue_capacity) = self.kill_stream(victim.sid) else {
+            return;
         };
+        let stall_ms = u64::try_from(victim.stalled_for.as_millis()).unwrap_or(u64::MAX);
         warn!(
             session = self.seq,
             victim_sid = victim.sid,
@@ -1253,8 +1280,6 @@ impl AnyTlsSession {
             queue_capacity,
             "AnyTLS overflow killed stream"
         );
-        self.killed_streams.lock().unwrap().insert(victim.sid);
-        self.end_stream(victim.sid, false);
         if self
             .enqueue_control(CMD_FIN, victim.sid, bytes::Bytes::new())
             .is_err()
@@ -2008,8 +2033,15 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                     got_any = true;
                 }
                 std::task::Poll::Ready(Some(StreamEvent::Error(e))) => {
-                    let err =
-                        std::io::Error::new(std::io::ErrorKind::ConnectionReset, e.to_string());
+                    let killed = this.session.end_stream(this.sid, true);
+                    let err = if killed {
+                        std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "stream killed: slow consumer (HOL)",
+                        )
+                    } else {
+                        std::io::Error::new(std::io::ErrorKind::ConnectionReset, e.to_string())
+                    };
 
                     if got_any {
                         this.read_err = Some(err);
@@ -2020,13 +2052,7 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                     return std::task::Poll::Ready(Err(err));
                 }
                 std::task::Poll::Ready(Some(StreamEvent::Fin)) => {
-                    let killed = this
-                        .session
-                        .killed_streams
-                        .lock()
-                        .unwrap()
-                        .remove(&this.sid);
-                    this.session.end_stream(this.sid, false);
+                    let killed = this.session.end_stream(this.sid, false);
                     if killed {
                         // A cloned sender can outlive watchdog removal and carry this FIN.
                         let err = std::io::Error::new(
@@ -2046,19 +2072,14 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                     return std::task::Poll::Ready(Ok(()));
                 }
                 std::task::Poll::Ready(None) => {
+                    let killed = this.session.end_stream(this.sid, false);
                     let pending: Option<std::io::Error> =
                         if let Some(e) = this.session.terminal_error.get() {
                             Some(std::io::Error::new(
                                 std::io::ErrorKind::ConnectionAborted,
                                 e.to_string(),
                             ))
-                        } else if this
-                            .session
-                            .killed_streams
-                            .lock()
-                            .unwrap()
-                            .remove(&this.sid)
-                        {
+                        } else if killed {
                             Some(std::io::Error::new(
                                 std::io::ErrorKind::ConnectionReset,
                                 "stream killed: slow consumer (HOL)",

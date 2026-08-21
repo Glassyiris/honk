@@ -1036,6 +1036,7 @@ async fn test_synack_with_data_surfaces_open_error() {
     assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
     assert!(err.to_string().contains("refused"));
     assert!(!session.is_closed(), "target refusal keeps the session");
+    assert!(!session.streams.lock().unwrap().contains_key(&stream.sid));
 }
 
 #[tokio::test]
@@ -1571,7 +1572,101 @@ async fn stale_remote_fin_after_overflow_kill_is_reset() {
         .expect("stale FIN read")
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    assert!(!session.killed_streams.lock().unwrap().contains(&sid));
     session.close();
+}
+
+#[tokio::test]
+async fn killed_stream_tombstone_follows_stream_owner() {
+    let (session, _server) = establish_test_session("127.0.0.1:443").await;
+
+    let sid = 83;
+    let (tx, rx) = mpsc::channel(1);
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(sid, StreamSink::Tcp(tx));
+    let stream = AnyTlsStream::new(
+        Arc::clone(&session),
+        sid,
+        rx,
+        session.try_reserve().unwrap(),
+    );
+    session
+        .overflow
+        .lock()
+        .push_back(sid, StreamEvent::Data(vec![1]));
+    let victim = session
+        .overflow
+        .lock()
+        .take_victim(sid, OverflowLimit::StallGrace);
+    session.kill_overflow_victim(victim);
+    assert!(session.killed_streams.lock().unwrap().contains(&sid));
+    drop(stream);
+    assert!(!session.killed_streams.lock().unwrap().contains(&sid));
+
+    let sid = 84;
+    let (tx, rx) = mpsc::channel(1);
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(sid, StreamSink::Tcp(tx));
+    let stream = AnyTlsStream::new(
+        Arc::clone(&session),
+        sid,
+        rx,
+        session.try_reserve().unwrap(),
+    );
+    session
+        .overflow
+        .lock()
+        .push_back(sid, StreamEvent::Data(vec![1]));
+    let victim = session
+        .overflow
+        .lock()
+        .take_victim(sid, OverflowLimit::StallGrace);
+    drop(stream);
+    session.kill_overflow_victim(victim);
+    assert!(!session.killed_streams.lock().unwrap().contains(&sid));
+    session.close();
+}
+
+#[tokio::test]
+async fn session_close_preserves_killed_reset_until_owner_reads() {
+    let (session, _server) = establish_test_session("127.0.0.1:443").await;
+    let sid = 85;
+    let (tx, rx) = mpsc::channel(1);
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(sid, StreamSink::Tcp(tx));
+    let mut stream = AnyTlsStream::new(
+        Arc::clone(&session),
+        sid,
+        rx,
+        session.try_reserve().unwrap(),
+    );
+    session
+        .overflow
+        .lock()
+        .push_back(sid, StreamEvent::Data(vec![1]));
+    let victim = session
+        .overflow
+        .lock()
+        .take_victim(sid, OverflowLimit::StallGrace);
+    session.kill_overflow_victim(victim);
+    session.close();
+    assert!(session.killed_streams.lock().unwrap().contains(&sid));
+
+    let error = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut [0; 1]))
+        .await
+        .expect("killed stream read")
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    assert!(!session.killed_streams.lock().unwrap().contains(&sid));
 }
 
 /// 3B-2: a stalled stream is first parked in the session overflow
