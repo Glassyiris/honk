@@ -479,15 +479,13 @@ enum StreamSink {
 }
 
 impl StreamSink {
-    /// Deliver a payload frame. A false result makes the caller retire the
-    /// stream; UoT must never continue after losing a byte-stream chunk.
+    #[cfg(test)]
     async fn send_data(&self, data: Vec<u8>) -> bool {
         match self {
             StreamSink::Tcp(tx) => tx.send(StreamEvent::Data(data)).await.is_ok(),
             StreamSink::Uot(tx) => tx.try_send(StreamEvent::Data(data)).is_ok(),
         }
     }
-
     #[cfg(test)]
     async fn send_fin(&self) {
         match self {
@@ -532,13 +530,7 @@ impl Drop for StreamRegistration {
         if self.committed {
             return;
         }
-        self.session.streams.lock().unwrap().remove(&self.sid);
-        self.session.discard_overflow(self.sid);
-        if self.frame_started {
-            let _ = self
-                .session
-                .enqueue_control(CMD_FIN, self.sid, bytes::Bytes::new());
-        }
+        self.session.end_stream(self.sid, self.frame_started);
     }
 }
 
@@ -739,6 +731,8 @@ pub(crate) struct AnyTlsSession {
     writer_task: Mutex<Option<tokio::task::AbortHandle>>,
     /// Open streams: sid → demux delivery channel.
     streams: Mutex<HashMap<u32, StreamSink>>,
+    /// Remote FINs suppress the local Drop notification.
+    remote_fin: parking_lot::Mutex<HashSet<u32>>,
     /// Stream id allocator (sing `streamId`); first stream gets sid 1.
     next_sid: AtomicU32,
     /// Set once the TLS connection dies or an ALERT arrives; idempotent
@@ -795,6 +789,7 @@ impl AnyTlsSession {
             writer_q: Arc::new(WriterQueue::new()),
             writer_task: Mutex::new(None),
             streams: Mutex::new(HashMap::new()),
+            remote_fin: parking_lot::Mutex::new(HashSet::new()),
             next_sid: AtomicU32::new(0),
             closed: AtomicBool::new(false),
             created: Instant::now(),
@@ -1067,29 +1062,47 @@ impl AnyTlsSession {
         Ok(AnyTlsStream::new(Arc::clone(self), sid, rx, permit))
     }
 
-    /// Unregister a UoT stream (FIN to the server), mirroring
-    /// [`Self::end_stream`]. Stream capacity is the permit's business
-    /// (released when the transport drops it), never this map's.
-    fn end_uot_stream(&self, sid: u32) {
-        let was_registered = self.streams.lock().unwrap().remove(&sid).is_some();
-        if was_registered {
+    /// Unregister a UoT stream, optionally notifying the server with FIN.
+    /// Stream capacity is released by the transport permit, not this map.
+    fn end_uot_stream(&self, sid: u32, notify_fin: bool) {
+        let (was_registered, received_fin) = {
+            let mut remote_fin = self.remote_fin.lock();
+            let received_fin = remote_fin.remove(&sid);
+            let was_registered = self.streams.lock().unwrap().remove(&sid).is_some();
+            (was_registered, received_fin)
+        };
+        if notify_fin && was_registered && !received_fin {
             let _ = self.enqueue_control(CMD_FIN, sid, bytes::Bytes::new());
         }
         debug!("AnyTLS session {} sid={} uot stream ended", self.seq, sid);
     }
 
-    /// Unregister a stream, optionally notifying the server with FIN, and
-    /// restart the idle clock when the last stream is gone. Called exactly
-    /// once per stream task.
-    async fn end_stream(&self, sid: u32, notify_fin: bool) {
-        let was_registered = self.streams.lock().unwrap().remove(&sid).is_some();
+    /// Unregister a stream, optionally notifying the server with FIN. This is
+    /// synchronous so cleanup is ordered before the stream permit is dropped.
+    fn end_stream(&self, sid: u32, notify_fin: bool) {
+        let (was_registered, received_fin) = {
+            let mut remote_fin = self.remote_fin.lock();
+            let received_fin = remote_fin.remove(&sid);
+            let was_registered = self.streams.lock().unwrap().remove(&sid).is_some();
+            (was_registered, received_fin)
+        };
 
         self.discard_overflow(sid);
-
-        if notify_fin && was_registered {
+        if notify_fin && was_registered && !received_fin {
             let _ = self.enqueue_control(CMD_FIN, sid, bytes::Bytes::new());
         }
         debug!("AnyTLS session {} sid={} stream ended", self.seq, sid);
+    }
+
+    /// Mark a registered stream before queueing its remote FIN event. The
+    /// lock order matches the end_* methods so Drop cannot race the marker.
+    fn mark_remote_fin(&self, sid: u32) -> Option<StreamSink> {
+        let mut remote_fin = self.remote_fin.lock();
+        let sink = self.streams.lock().unwrap().get(&sid).cloned();
+        if sink.is_some() {
+            remote_fin.insert(sid);
+        }
+        sink
     }
 
     /// Record the first physical-failure reason and close: streams
@@ -1112,6 +1125,7 @@ impl AnyTlsSession {
             crate::session::SessionState::Closed as usize,
             Ordering::Release,
         );
+        self.remote_fin.lock().clear();
         self.streams.lock().unwrap().clear();
         self.clear_overflow();
         if let Some(handle) = self.demux.lock().unwrap().take() {
@@ -1138,29 +1152,26 @@ impl AnyTlsSession {
     /// the demux waits bounded rounds for that progress (see
     /// [`Self::park_overflow`]). A saturated UoT sink retires only its sid.
     async fn dispatch_data(self: &Arc<Self>, sid: u32, data: Vec<u8>) {
-        if self.overflow_has(sid) {
-            self.park_overflow(sid, StreamEvent::Data(data)).await;
-            return;
-        }
         let sink = self.streams.lock().unwrap().get(&sid).cloned();
         match sink {
-            Some(StreamSink::Tcp(tx)) => match tx.try_send(StreamEvent::Data(data)) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(ev)) => {
-                    self.park_overflow(sid, ev).await;
+            Some(StreamSink::Tcp(tx)) => {
+                if self.overflow_has(sid) {
+                    self.park_overflow(sid, StreamEvent::Data(data)).await;
+                    return;
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    self.streams.lock().unwrap().remove(&sid);
-                    self.discard_overflow(sid);
-                }
-            },
-            Some(sink) => {
-                if !sink.send_data(data).await {
-                    let removed = self.streams.lock().unwrap().remove(&sid).is_some();
-                    self.discard_overflow(sid);
-                    if removed {
-                        let _ = self.enqueue_control(CMD_FIN, sid, bytes::Bytes::new());
+                match tx.try_send(StreamEvent::Data(data)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(ev)) => {
+                        self.park_overflow(sid, ev).await;
                     }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        self.end_stream(sid, false);
+                    }
+                }
+            }
+            Some(StreamSink::Uot(tx)) => {
+                if tx.try_send(StreamEvent::Data(data)).is_err() {
+                    self.end_uot_stream(sid, true);
                 }
             }
             None => {
@@ -1174,13 +1185,39 @@ impl AnyTlsSession {
         }
     }
 
+    async fn dispatch_fin(self: &Arc<Self>, sid: u32) {
+        let sink = self.mark_remote_fin(sid);
+        match sink {
+            Some(StreamSink::Tcp(tx)) => {
+                if self.overflow_has(sid) {
+                    self.park_overflow(sid, StreamEvent::Fin).await;
+                    return;
+                }
+                match tx.try_send(StreamEvent::Fin) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(event)) => {
+                        self.park_overflow(sid, event).await;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        self.end_stream(sid, false);
+                    }
+                }
+            }
+            Some(StreamSink::Uot(tx)) => match tx.try_send(StreamEvent::Fin) {
+                Ok(()) => {}
+                Err(_) => self.end_uot_stream(sid, false),
+            },
+            None => {}
+        }
+    }
+
     fn overflow_sink_is_live(&self, sid: u32) -> bool {
         let live = matches!(
             self.streams.lock().unwrap().get(&sid),
             Some(StreamSink::Tcp(tx)) if !tx.is_closed()
         );
         if !live {
-            self.streams.lock().unwrap().remove(&sid);
+            self.end_stream(sid, false);
         }
         live
     }
@@ -1217,7 +1254,7 @@ impl AnyTlsSession {
             "AnyTLS overflow killed stream"
         );
         self.killed_streams.lock().unwrap().insert(victim.sid);
-        self.streams.lock().unwrap().remove(&victim.sid);
+        self.end_stream(victim.sid, false);
         if self
             .enqueue_control(CMD_FIN, victim.sid, bytes::Bytes::new())
             .is_err()
@@ -1357,67 +1394,34 @@ impl AnyTlsSession {
                     overflow.remove_stream(sid);
                     overflow.cancel_flush(sid);
                     drop(overflow);
-                    self.streams.lock().unwrap().remove(&sid);
+                    self.end_stream(sid, false);
                     return moved;
                 }
             }
         }
     }
 
-    async fn dispatch_fin(self: &Arc<Self>, sid: u32) {
-        if self.overflow_has(sid) {
-            self.park_overflow(sid, StreamEvent::Fin).await;
-            return;
-        }
-        let sink = self.streams.lock().unwrap().get(&sid).cloned();
-        match sink {
-            Some(StreamSink::Tcp(tx)) => match tx.try_send(StreamEvent::Fin) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(event)) => {
-                    self.park_overflow(sid, event).await;
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    self.streams.lock().unwrap().remove(&sid);
-                    self.discard_overflow(sid);
-                }
-            },
-            Some(StreamSink::Uot(tx)) => match tx.try_send(StreamEvent::Fin) {
-                Ok(()) => {}
-                Err(_) => {
-                    self.streams.lock().unwrap().remove(&sid);
-                    self.discard_overflow(sid);
-                }
-            },
-            None => {}
-        }
-    }
-
     async fn dispatch_error(self: &Arc<Self>, sid: u32, message: Arc<str>) {
-        if self.overflow_has(sid) {
-            self.park_overflow(sid, StreamEvent::Error(message)).await;
-            return;
-        }
         let sink = self.streams.lock().unwrap().get(&sid).cloned();
         match sink {
             Some(StreamSink::Tcp(tx)) => {
-                let event = StreamEvent::Error(message);
-                match tx.try_send(event) {
+                if self.overflow_has(sid) {
+                    self.park_overflow(sid, StreamEvent::Error(message)).await;
+                    return;
+                }
+                match tx.try_send(StreamEvent::Error(message)) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(event)) => {
                         self.park_overflow(sid, event).await;
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                        self.streams.lock().unwrap().remove(&sid);
-                        self.discard_overflow(sid);
+                        self.end_stream(sid, false);
                     }
                 }
             }
             Some(StreamSink::Uot(tx)) => match tx.try_send(StreamEvent::Error(message)) {
                 Ok(()) => {}
-                Err(_) => {
-                    self.streams.lock().unwrap().remove(&sid);
-                    self.discard_overflow(sid);
-                }
+                Err(_) => self.end_uot_stream(sid, false),
             },
             None => {}
         }
@@ -1949,9 +1953,7 @@ impl std::fmt::Debug for AnyTlsStream {
 
 impl Drop for AnyTlsStream {
     fn drop(&mut self) {
-        let session = Arc::clone(&self.session);
-        let sid = self.sid;
-        tokio::spawn(async move { session.end_stream(sid, true).await });
+        self.session.end_stream(self.sid, true);
     }
 }
 
@@ -2018,6 +2020,7 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                     return std::task::Poll::Ready(Err(err));
                 }
                 std::task::Poll::Ready(Some(StreamEvent::Fin)) => {
+                    this.session.end_stream(this.sid, false);
                     this.read_eof = true;
                     this.release_permit();
                     return std::task::Poll::Ready(Ok(()));

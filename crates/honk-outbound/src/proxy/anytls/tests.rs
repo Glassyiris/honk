@@ -983,7 +983,7 @@ async fn test_registration_commit_moves_permit() {
     };
     let permit = guard.commit();
     assert_eq!(session.active_streams(), 1);
-    session.end_stream(sid, false).await;
+    session.end_stream(sid, false);
     assert_eq!(
         session.active_streams(),
         1,
@@ -1052,7 +1052,7 @@ async fn overflow_accounting_clears_on_lifecycle_exits() {
         .overflow
         .lock()
         .push_back(31, StreamEvent::Data(vec![1; 17]));
-    session.end_stream(31, false).await;
+    session.end_stream(31, false);
     assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
 
     let (drop_tx, _drop_rx) = mpsc::channel(STREAM_QUEUE_CAP);
@@ -1995,6 +1995,65 @@ async fn test_server_fin_closes_only_that_stream() {
 
     assert!(!session.is_closed());
     assert_eq!(session.active_streams(), 1);
+}
+
+#[tokio::test]
+async fn stream_drop_unregisters_before_returning() {
+    let (session, mut server) = establish_test_session("127.0.0.1:1443").await;
+    expect_handshake(&mut server).await;
+    let sid = 44;
+    let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAP);
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(sid, StreamSink::Tcp(tx));
+    let stream = AnyTlsStream::new(
+        Arc::clone(&session),
+        sid,
+        rx,
+        session.try_reserve().unwrap(),
+    );
+
+    drop(stream);
+    assert!(!session.streams.lock().unwrap().contains_key(&sid));
+    let (cmd, got_sid, _) = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut server))
+        .await
+        .expect("drop FIN")
+        .unwrap();
+    assert_eq!((cmd, got_sid), (CMD_FIN, sid));
+    session.close();
+}
+
+#[tokio::test]
+async fn remote_fin_drop_does_not_enqueue_a_second_fin() {
+    let (session, mut server) = establish_test_session("127.0.0.1:1443").await;
+    expect_handshake(&mut server).await;
+
+    let target = vec![0x01, 127, 0, 0, 1, 0x00, 0x50];
+    let stream = session
+        .open_stream_direct(target, session.try_reserve().unwrap())
+        .await
+        .unwrap();
+    let sid = stream.sid;
+    let (cmd, got_sid, _) = read_frame(&mut server).await.unwrap();
+    assert_eq!((cmd, got_sid), (CMD_SYN, sid));
+    let (cmd, got_sid, _) = read_frame(&mut server).await.unwrap();
+    assert_eq!((cmd, got_sid), (CMD_PSH, sid));
+
+    session.dispatch_fin(sid).await;
+    assert!(session.remote_fin.lock().contains(&sid));
+    drop(stream);
+
+    assert!(!session.streams.lock().unwrap().contains_key(&sid));
+    assert!(!session.remote_fin.lock().contains(&sid));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), read_frame(&mut server))
+            .await
+            .is_err(),
+        "dropping a remotely closed stream must not send a duplicate FIN"
+    );
+    session.close();
 }
 
 #[tokio::test]
