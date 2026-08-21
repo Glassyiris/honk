@@ -511,6 +511,12 @@ impl Config {
             .map(str::to_ascii_lowercase);
 
         let content = match ext.as_deref() {
+            Some("dae") => {
+                return Err(crate::ConfigError::Serialization(
+                    "refusing to rewrite .dae configuration: source formatting, comments, and includes cannot be preserved; edit the dae source directly or use .toml/.yaml/.json"
+                        .into(),
+                ));
+            }
             Some("json") => self.to_json_string()?,
             Some("yaml") | Some("yml") => serde_yaml::to_string(self)
                 .map_err(|e| crate::ConfigError::Serialization(e.to_string()))?,

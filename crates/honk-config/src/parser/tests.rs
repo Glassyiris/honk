@@ -995,6 +995,21 @@ fn test_dae_dns_rules_are_not_silently_dropped_by_structured_writer() {
 }
 
 #[test]
+fn test_dae_writer_rejects_dae_extension_without_touching_source() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.dae");
+    let source = "# keep this comment\nglobal {\n    log_level: debug\n}\n";
+    let config = parse_dae_config(source).unwrap();
+    std::fs::write(&path, source).unwrap();
+
+    let error = config.to_file(path.to_str().unwrap()).unwrap_err();
+
+    assert!(matches!(error, crate::ConfigError::Serialization(_)));
+    assert!(error.to_string().contains("refusing to rewrite .dae"));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+}
+
+#[test]
 fn test_parse_dns_request_routing_qtype() {
     let input = r#"
 dns {

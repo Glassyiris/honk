@@ -104,7 +104,7 @@ UDP 嗅探处理 QUIC v1 与 v2 Initial 包。它派生 Initial key、移除 hea
 
 | 模式 | 用户态 override | 路由时内核策略 |
 | --- | --- | --- |
-| `Rule` | 保留路由得到的出站 | 仅当 SNI 无法改变结果时卸载普通 `direct`：`dial_mode: ip`、不存在 domain-class 规则，或该流通过 `DOMAIN_ROUTING_MAP` 设置了 `DomainKnown`；否则交给用户态 |
+| `Rule` | 保留路由得到的出站 | 仅当 SNI 无法改变结果时卸载普通 `direct`：`dial_mode: ip` 或 `domain+`、不存在 domain-class 规则，或该流通过 `DOMAIN_ROUTING_MAP` 设置了 `DomainKnown`；否则交给用户态 |
 | `Global` | 当前 GLOBAL 选择可解析时使用该选择 | 通常交给用户态。GLOBAL 选择恰好是小写 `direct` 时例外：此时发布 `OFFLOAD_ALL`，因为每个非最终结果都会收敛到直连 |
 | `Direct` | 强制 `direct` | 卸载每个非 `must`、非 `block` 结果，并把缓存出站规范化为 `Direct` |
 

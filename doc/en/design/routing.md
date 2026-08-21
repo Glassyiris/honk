@@ -104,7 +104,7 @@ The initial IP-based decision and the optional domain target are separate. A sni
 
 | Mode | Userspace override | Route-time kernel policy |
 | --- | --- | --- |
-| `Rule` | Keep the routed outbound | Offload a plain `direct` result only when SNI cannot change it: `dial_mode: ip`, no domain-class rule exists, or this flow set `DomainKnown` through `DOMAIN_ROUTING_MAP`; otherwise hand off to userspace |
+| `Rule` | Keep the routed outbound | Offload a plain `direct` result only when SNI cannot change it: `dial_mode: ip` or `domain+`, no domain-class rule exists, or this flow set `DomainKnown` through `DOMAIN_ROUTING_MAP`; otherwise hand off to userspace |
 | `Global` | Use the current GLOBAL selection when it resolves | Normally hand off to userspace. The exact lowercase GLOBAL selection `direct` is a special case that publishes `OFFLOAD_ALL` because every non-final result converges to direct |
 | `Direct` | Force `direct` | Offload every non-`must`, non-`block` result and normalize its cached outbound to `Direct` |
 
