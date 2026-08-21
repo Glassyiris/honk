@@ -464,29 +464,6 @@ fn base_builder(skip_cert_verify: bool) -> anyhow::Result<boring::ssl::SslConnec
     Ok(builder)
 }
 
-/// Build the TLS 1.3 context shared by all QUIC backends.
-pub(crate) fn build_quic_context(
-    skip_cert_verify: bool,
-    pin_sha256: Option<[u8; 32]>,
-    chrome: bool,
-) -> anyhow::Result<SslContextBuilder> {
-    let mut builder = SslContextBuilder::new(SslMethod::tls())?;
-    builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
-    builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
-    if let Some(pin) = pin_sha256 {
-        builder.set_custom_verify_callback(SslVerifyMode::PEER, pin_sha256_custom_verify(pin));
-    } else if skip_cert_verify {
-        builder.set_verify(SslVerifyMode::NONE);
-    } else {
-        builder.set_verify(SslVerifyMode::PEER);
-        builder.set_verify_cert_store(root_store()?)?;
-    }
-    if chrome {
-        apply_chrome_ctx(&mut builder)?;
-    }
-    Ok(builder)
-}
-
 /// Parse a `pinSHA256` value (hex, optionally colon-separated) into 32 bytes.
 pub fn parse_pin_sha256(s: &str) -> Option<[u8; 32]> {
     let hex: String = s
@@ -525,7 +502,7 @@ pub fn pin_sha256_custom_verify(
     }
 }
 
-fn apply_chrome_ctx(builder: &mut SslContextBuilder) -> anyhow::Result<()> {
+pub(crate) fn apply_chrome_ctx(builder: &mut SslContextBuilder) -> anyhow::Result<()> {
     builder.set_grease_enabled(true);
     builder.set_sigalgs_list(CHROME_SIGALGS)?;
     builder.set_curves_list(CHROME_CURVES)?;
