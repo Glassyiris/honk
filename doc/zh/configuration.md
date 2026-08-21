@@ -195,9 +195,9 @@ experimental {
 | 模式 | 适用场景 |
 | --- | --- |
 | `ip` | 仅按 IP 元数据路由；关闭域名嗅探。 |
-| `domain` | 默认：嗅探域名，校验其是否解析到目的 IP，再按域名拨号。 |
-| `domain+` | 客户端 DNS 不经过 honk 时，嗅探但不执行目的 IP 真实性校验。 |
-| `domain++` | 强制嗅探，并按 SNI/HTTP Host 重新执行路由。 |
+| `domain` | 默认：嗅探域名并校验目的 IP；仅在校验通过后重新执行路由。未命中时继续使用普通 IP/端口规则。代理出站可按已校验名称拨号。 |
+| `domain+` | 嗅探但不执行目的 IP reality check；保留初始路由，仅把嗅探名称作为代理目标。 |
+| `domain++` | 嗅探但不校验，并强制根据 SNI/HTTP Host 重新执行非保留决策。 |
 
 详见 [Global 参考](./reference/global.md)。
 

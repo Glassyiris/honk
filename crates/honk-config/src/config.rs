@@ -6,6 +6,7 @@ use crate::group::Group;
 use crate::node::Node;
 use crate::routing::RoutingConfig;
 use crate::subscription::Subscription;
+use crate::types::DialMode;
 
 /// Stable identity of the built-in `direct` node across reloads and restarts.
 pub const DIRECT_NODE_ID: uuid::Uuid =
@@ -510,6 +511,12 @@ impl Config {
             .map(str::to_ascii_lowercase);
 
         let content = match ext.as_deref() {
+            Some("dae") => {
+                return Err(crate::ConfigError::Serialization(
+                    "refusing to rewrite .dae configuration: source formatting, comments, and includes cannot be preserved; edit the dae source directly or use .toml/.yaml/.json"
+                        .into(),
+                ));
+            }
             Some("json") => self.to_json_string()?,
             Some("yaml") | Some("yml") => serde_yaml::to_string(self)
                 .map_err(|e| crate::ConfigError::Serialization(e.to_string()))?,
@@ -548,6 +555,13 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        if self.global.dial_mode.parse::<DialMode>().is_err() {
+            return Err(crate::ConfigError::Validation(format!(
+                "global.dial_mode must be one of: ip, domain, domain+, domain++ (got '{}')",
+                self.global.dial_mode
+            )));
+        }
+
         let data_dir = std::path::Path::new(&self.global.data_dir);
         if self.global.data_dir.is_empty() || !data_dir.is_absolute() {
             return Err(crate::ConfigError::Validation(
@@ -704,6 +718,14 @@ mod builtin_nodes_tests {
         let mut config = Config::default();
         config.dns.bind = "tcp+udp://localhost:0".into();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_validate_rejects_unknown_dial_mode() {
+        let mut config = Config::default();
+        config.global.dial_mode = "domain???".into();
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("global.dial_mode"));
     }
 
     #[test]

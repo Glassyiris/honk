@@ -195,9 +195,9 @@ See the [global reference](./reference/global.md).
 | Mode | When to use it |
 | --- | --- |
 | `ip` | Route only on IP metadata; disables domain sniffing. |
-| `domain` | Default: sniff a domain, verify that it resolves to the destination IP, and dial by domain. |
-| `domain+` | Sniff without the destination-IP reality check when client DNS does not pass through honk. |
-| `domain++` | Force sniffing and re-run routing from SNI/HTTP Host. |
+| `domain` | Default: sniff a domain, verify its destination IP, and re-run routing only when that verification succeeds. A miss falls through to ordinary IP/port rules. Proxy outbounds may dial by the verified name. |
+| `domain+` | Sniff without the destination-IP reality check; keep the initial route and use the sniffed name only as a proxy target. |
+| `domain++` | Sniff without verification and force non-reserved routing to run again from SNI/HTTP Host. |
 
 See the [global reference](./reference/global.md).
 

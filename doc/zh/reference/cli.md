@@ -41,7 +41,7 @@ Clap 还提供 `-h`/`--help` 和 `-V`/`--version`。
 | 命令 | 当前行为 | 持久化 / 运行时影响 |
 | --- | --- | --- |
 | `reload` | 从已加锁的 `/run/honk-core.lock` 读取 PID 并发送 `SIGHUP`。 | 只报告信号成功送达；运行中进程随后记录 `applied` 或 `rejected`。mock 实例不持有该锁。 |
-| `mode <rule\|global\|direct>` | 加载 `--config`，将参数字符串赋给 `global.dial_mode`，校验并重写文件。 | 仅修改文件；不联系运行中的引擎，也不更改 Clash mode。接受的字符串不同于正常 dial mode 值 `ip`、`domain`、`domain+`、`domain++`。 |
+| `mode <rule\|global\|direct>` | 加载 `--config`，将参数字符串赋给 `experimental.clash_api.default_mode`，并在重写结构化格式文件前完成校验。`.dae` 文件会被拒绝且保持不变，因为 writer 无法保留 dae 语法、注释或 include；请直接编辑这些源文件，或使用 `.toml`、`.yaml`、`.json`。 | 仅修改文件；不联系运行中的引擎，也不更改 dial mode。接受的字符串不同于正常 dial mode 值 `ip`、`domain`、`domain+`、`domain++`。 |
 | `proxy <group> <node>` | 检查组名和节点名各自存在，然后打印请求的选择；不检查节点是否属于该组。 | 不写入任何内容，也不联系运行中的引擎。 |
 | `delay <node> [-u\|--url HOST:PORT]` | 建立一次原始 TCP 连接，超时五秒，并打印耗时毫秒数。未给 `--url` 时使用节点服务端地址。 | 不经过代理，不是 HTTP URLTest，也不联系运行中的引擎。 |
 

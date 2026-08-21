@@ -42,7 +42,7 @@
 
 ## 嗅探与流初始化
 
-TCP 嗅探最多读取 4096 字节，并提取 TLS SNI 或 HTTP `Host`。返回的缓冲区属于流状态，并在中继开始前写入已选出站，因此嗅探不会消费应用数据。`dial_mode: ip`、最终的非控制平面 `must` handoff 或命中 TCP negative cache 时跳过 TCP 嗅探。连续三次失败会抑制同一目的地址/出站签名十分钟；嗅探成功会移除 negative 条目。
+TCP 嗅探最多读取 4096 字节，并提取 TLS SNI 或 HTTP `Host`。返回的缓冲区属于流状态，并在中继开始前写入已选出站，因此嗅探不会消费应用数据。`dial_mode: ip`、最终的 direct/block 或 `must` handoff，或命中 TCP negative cache 时跳过 TCP 嗅探。连续三次失败会抑制同一目的地址/出站签名十分钟；嗅探成功会移除 negative 条目。
 
 UDP 域名发现解密 QUIC v1/v2 Initial packet，重组 CRYPTO fragment，并解析 TLS ClientHello SNI。每流 session 五秒过期，最多检查八个 Initial packet，并把 CRYPTO stream 限制为 64 KiB。首个 ClientHello 分片时，initializer 最多保留八个 FIFO follower，最多等待 250 ms。failed-DCID cache 限制对非 QUIC 或不可解密流量的重复工作。
 
