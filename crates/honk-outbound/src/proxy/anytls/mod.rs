@@ -1186,23 +1186,23 @@ impl AnyTlsSession {
     }
 
     async fn dispatch_fin(self: &Arc<Self>, sid: u32) {
+        if self.overflow_has(sid) {
+            if self.mark_remote_fin(sid).is_some() {
+                self.park_overflow(sid, StreamEvent::Fin).await;
+            }
+            return;
+        }
         let sink = self.mark_remote_fin(sid);
         match sink {
-            Some(StreamSink::Tcp(tx)) => {
-                if self.overflow_has(sid) {
-                    self.park_overflow(sid, StreamEvent::Fin).await;
-                    return;
+            Some(StreamSink::Tcp(tx)) => match tx.try_send(StreamEvent::Fin) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    self.park_overflow(sid, event).await;
                 }
-                match tx.try_send(StreamEvent::Fin) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(event)) => {
-                        self.park_overflow(sid, event).await;
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        self.end_stream(sid, false);
-                    }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.end_stream(sid, false);
                 }
-            }
+            },
             Some(StreamSink::Uot(tx)) => match tx.try_send(StreamEvent::Fin) {
                 Ok(()) => {}
                 Err(_) => self.end_uot_stream(sid, false),
@@ -2020,7 +2020,27 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                     return std::task::Poll::Ready(Err(err));
                 }
                 std::task::Poll::Ready(Some(StreamEvent::Fin)) => {
+                    let killed = this
+                        .session
+                        .killed_streams
+                        .lock()
+                        .unwrap()
+                        .remove(&this.sid);
                     this.session.end_stream(this.sid, false);
+                    if killed {
+                        // A cloned sender can outlive watchdog removal and carry this FIN.
+                        let err = std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "stream killed: slow consumer (HOL)",
+                        );
+                        if got_any {
+                            this.read_err = Some(err);
+                            return std::task::Poll::Ready(Ok(()));
+                        }
+                        this.read_eof = true;
+                        this.release_permit();
+                        return std::task::Poll::Ready(Err(err));
+                    }
                     this.read_eof = true;
                     this.release_permit();
                     return std::task::Poll::Ready(Ok(()));

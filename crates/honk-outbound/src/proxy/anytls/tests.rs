@@ -1530,6 +1530,50 @@ async fn overflow_preserves_data_before_fin() {
     assert_eq!(session.overflow.lock().usage(), OverflowUsage::default());
 }
 
+/// A FIN delivered through a sender cloned before watchdog retirement must
+/// preserve the stream reset instead of turning the retirement into EOF.
+#[tokio::test]
+async fn stale_remote_fin_after_overflow_kill_is_reset() {
+    let (session, _server) = establish_test_session("127.0.0.1:443").await;
+    let sid = 82;
+    let (tx, rx) = mpsc::channel(1);
+    tx.try_send(StreamEvent::Data(vec![1])).unwrap();
+    session
+        .streams
+        .lock()
+        .unwrap()
+        .insert(sid, StreamSink::Tcp(tx));
+    let permit = session.try_reserve().unwrap();
+    let mut stream = AnyTlsStream::new(Arc::clone(&session), sid, rx, permit);
+
+    let stale_tx = match session.streams.lock().unwrap().get(&sid).cloned() {
+        Some(StreamSink::Tcp(tx)) => tx,
+        _ => panic!("registered TCP stream"),
+    };
+    session.dispatch_data(sid, vec![2]).await;
+    session.dispatch_fin(sid).await;
+    assert!(session.remote_fin.lock().contains(&sid));
+
+    let victim = session
+        .overflow
+        .lock()
+        .take_victim(sid, OverflowLimit::StallGrace);
+    session.kill_overflow_victim(victim);
+    assert!(session.killed_streams.lock().unwrap().contains(&sid));
+
+    let mut byte = [0u8; 1];
+    stream.read_exact(&mut byte).await.unwrap();
+    assert_eq!(byte, [1]);
+    stale_tx.try_send(StreamEvent::Fin).unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+        .await
+        .expect("stale FIN read")
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+    session.close();
+}
+
 /// 3B-2: a stalled stream is first parked in the session overflow
 /// (non-blocking); parking past the session soft cap still does not
 /// kill, but past the stall grace the watchdog reaps just that
