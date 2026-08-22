@@ -261,7 +261,7 @@ dns {
 
 **缓存文件。** 设置 `experimental.cache_file.enabled: true` 可持久化 Selector 选择与 Clash 模式；`store_dns: true` 还会持久化符合条件的 DNS 应答。相对 `path` 使用 `data_dir`，并遵循前述旧路径规则。
 
-**首包保留 UDP。** `global.nfqueue_enable` 默认值为 `true`；设置为 `false` 可关闭有歧义 LAN 转发 UDP 的 NFQUEUE 暂存。该设置修改后需重启。启用时要求 root、带 `ebpf` 的构建和真实后端；mock 启动会被拒绝。honk 独占队列 `320` 以及 nftables `inet honk_nfqueue` / `udp_decision`；honk 运行期间，防火墙管理器不得修改这些对象。
+**首包保留 UDP。** `global.nfqueue_enable` 默认值为 `true`；设置为 `false` 可关闭有歧义 LAN 转发 UDP 的 NFQUEUE 暂存。该设置修改后需重启。若使用 mock eBPF、不带 `ebpf` 的构建，或队列/nftables 前置检查失败，honk 会记录 warning，仅在本进程关闭 NFQUEUE，不会改写配置文件。honk 独占队列 `320` 以及 nftables `inet honk_nfqueue` / `udp_decision`；honk 运行期间，防火墙管理器不得修改这些对象。
 
 详见 [Global 参考](./reference/global.md)、[Experimental 参考](./reference/experimental.md)与 [UDP NFQUEUE 设计](./design/nfqueue.md)。
 
@@ -304,7 +304,7 @@ cargo run --release -p honk-core -- \
 2. 确保每个路由规则/`fallback`、DNS `fallback`、组 `final` 与 `->` 代理目标都按场景指向已有的组、节点、`direct` 或 `block`。
 3. 对首连域名规则使用 `dial_mode: domain`/`domain++`，或确保客户端 DNS 经过 honk 以填充域名路由 map。
 4. 修改组或策略后，SIGHUP 会重建 `GroupManager`；仍有效的 Selector 选择会迁移到 replacement generation。
-5. 修改 `global.nfqueue_enable` 后需重启；确认已启用真实 eBPF 后端，且防火墙管理器不修改 `inet honk_nfqueue` / `udp_decision`。
+5. 修改 `global.nfqueue_enable` 后需重启；若希望启用暂存，确认真实 eBPF 后端和启动前置条件可用，并确保防火墙管理器不修改 `inet honk_nfqueue` / `udp_decision`。
 6. 增加或修改配置 fixture 时，运行 `cargo test -p honk-config` 以保持解析器示例有效。
 
 ## 相关文档

@@ -71,6 +71,14 @@ impl Default for CacheFileConfig {
     }
 }
 
+/// Compatibility-only NFQUEUE settings accepted while old configurations migrate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LegacyUdpNfqueueConfig {
+    #[serde(default)]
+    pub(crate) enabled: bool,
+}
+
 /// Experimental features configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -79,4 +87,7 @@ pub struct ExperimentalConfig {
     pub clash_api: ClashApiConfig,
     #[serde(default)]
     pub cache_file: CacheFileConfig,
+    /// Removed from the active schema; accepted only as a migration input.
+    #[serde(rename = "udp_nfqueue", default, skip_serializing)]
+    pub(crate) legacy_udp_nfqueue: Option<LegacyUdpNfqueueConfig>,
 }

@@ -1,6 +1,6 @@
 # Experimental Configuration Reference
 
-This reference describes the two supported nested sections under `experimental { ... }`.
+This reference describes the two current nested sections under `experimental { ... }`.
 
 ## Section overview
 
@@ -9,7 +9,7 @@ This reference describes the two supported nested sections under `experimental {
 | `clash_api` | Clash-compatible HTTP API and external dashboard |
 | `cache_file` | SQLite persistence for runtime choices, mode, delay samples, and optional DNS state |
 
-At the nested-section level, the dae parser whitelists exactly `clash_api` and `cache_file`; no other section name is accepted under `experimental`. The held-first-packet UDP path is configured by the global `nfqueue_enable` field; see the [global configuration reference](./global.md).
+`udp_nfqueue { enabled: ... }` is a deprecated compatibility section. Dae and structured loaders accept it, print a migration warning, and copy its value to `global.nfqueue_enable`; new configurations should use the global field directly.
 
 ## `clash_api`
 

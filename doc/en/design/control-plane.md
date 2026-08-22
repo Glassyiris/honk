@@ -12,17 +12,17 @@ The main implementation is `crates/honk-core/src/control/`. It consumes `EbpfBac
 
 Startup keeps kernel admission closed until userspace can receive every redirected flow:
 
-1. Load and validate the configuration, select `global.data_dir`, reject `global.nfqueue_enable` on a mock or non-`ebpf` build, raise `RLIMIT_NOFILE`, and take one immutable descriptor-budget snapshot.
+1. Load and validate the configuration and select `global.data_dir`. If NFQUEUE is requested, probe the real eBPF/netlink prerequisites; mock/no-`ebpf` mode or a failed preflight logs a warning and disables NFQUEUE for this process. Then raise `RLIMIT_NOFILE` and take one immutable descriptor-budget snapshot.
 2. Restore persisted subscriptions before network refresh. Only subscriptions without a valid restored body participate in the five-second first-fetch grace period.
 3. Select the backend. Real mode takes `/run/honk-core.lock` and publishes the process PID in the locked file; `honk-core reload` reads that PID and sends `SIGHUP`. Mock mode does not take the process-global lock.
 4. In real mode, create the FD-owned `daens` namespace and the `dae0`/`dae0peer` link through rtnetlink. The engine tries an L2 netkit pair first and falls back to veth only when the kernel reports netkit unsupported. The process stays in the host namespace; only synchronous socket, link, and attachment operations enter `daens` through scoped `setns` calls.
 5. Load the BPF object and attach the real datapath. The default object is embedded with `include_bytes!`; `--bpf-object` supplies a runtime override. With the `ebpf` feature, `build.rs` locates the object, rejects stale or BTF-less output, rebuilds it with nightly after removing inherited `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS`, verifies `.BTF`, and copies it into `OUT_DIR` for embedding.
 6. Reuse or create the pinned `UDP_DECISION_SEQUENCE` allocator and validate its map ABI, BTF, locked value, token range, and exhaustion state. NFQUEUE startup rechecks the locked allocator status and leaves staging fenced if no rollback-safe generation is available.
 7. Build the userspace router, outbound runtime registry, DNS runtime, group manager, cache DB, optional Clash API, and control-plane supervisors.
-8. Bind the transparent TCP/UDP listeners, publish the complete listener FD set, start the standalone DNS and UDP receive loops, then start the optional NFQUEUE service and its ingest actor, correlator, watchdog, and statistics sampler.
+8. Bind the transparent TCP/UDP listeners, publish the complete listener FD set, start the standalone DNS and UDP receive loops, then start the NFQUEUE service and its ingest actor, correlator, watchdog, and statistics sampler when the effective flag remains enabled.
 9. Check NFQUEUE health, publish its ready state, open pending verdict admission, and set `DATAPATH_STATE_MAP[0]` ready last. The TCP accept loop then runs in the control-plane supervisor.
 
-`RealEbpfBackend` owns aya programs, maps, links, persistent allocator handling, and real NFQUEUE integration. `MockEbpfBackend` provides the same control-plane interface without privileged kernel resources. `global.nfqueue_enable` is rejected with `--mock-ebpf` and when `honk-core` is built without the `ebpf` feature.
+`RealEbpfBackend` owns aya programs, maps, links, persistent allocator handling, and real NFQUEUE integration. `MockEbpfBackend` provides the same control-plane interface without privileged kernel resources. A requested NFQUEUE path that cannot pass startup preflight is disabled with a warning; failures after the service is admitted remain fatal.
 
 Shutdown reverses ownership before resources disappear: fence NFQUEUE, close datapath admission, reject new userspace work, cancel and drain held verdicts and UDP initializers, stop UDP drivers and removal processing, stop the interface watcher, detach BPF hooks, drain accepted flows for up to five seconds, retire the outbound runtime, stop NFQUEUE, stop the DNS controller and persistence, and clean up generation-owned BPF state. Ordinary cleanup preserves the pinned allocator. Listener and `daens`/link-pair ownership then falls out of scope.
 

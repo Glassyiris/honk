@@ -971,6 +971,12 @@ fn connections_json(s: &ClashState) -> serde_json::Value {
     connections_json_tracker(&s.connection_tracker)
 }
 
+fn connection_addr_parts(raw: &str) -> (String, String) {
+    raw.parse::<std::net::SocketAddr>()
+        .map(|addr| (addr.ip().to_string(), addr.port().to_string()))
+        .unwrap_or_default()
+}
+
 fn connections_json_tracker(
     tracker: &crate::connection_tracker::ConnectionTracker,
 ) -> serde_json::Value {
@@ -978,16 +984,8 @@ fn connections_json_tracker(
     let connections: Vec<serde_json::Value> = snapshots
         .iter()
         .map(|e| {
-            let source_ip: Vec<&str> = e.source.rsplitn(2, ':').collect();
-            let dest_ip: Vec<&str> = e.destination.rsplitn(2, ':').collect();
-            let src_port = source_ip.first().copied().unwrap_or("");
-            let dst_port = dest_ip.first().copied().unwrap_or("");
-            let src_ip = if source_ip.len() > 1 {
-                source_ip[1]
-            } else {
-                ""
-            };
-            let dst_ip = if dest_ip.len() > 1 { dest_ip[1] } else { "" };
+            let (src_ip, src_port) = connection_addr_parts(&e.source);
+            let (dst_ip, dst_port) = connection_addr_parts(&e.destination);
             let start = std::time::SystemTime::now()
                 .checked_sub(e.start_time.elapsed())
                 .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339())

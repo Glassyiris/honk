@@ -12,7 +12,7 @@ global {
 }
 ```
 
-修改该设置必须重启进程；reload 会拒绝该变更。启用后，启动要求带 `ebpf` feature 的构建和真实 eBPF 后端。不带 `ebpf` 的构建和 `--mock-ebpf` 都会直接启动失败，而不是静默回退。进程级配置项见[全局配置参考](../reference/global.md)。
+修改该设置必须重启进程；reload 会拒绝该变更。启动阶段 NFQUEUE 采用 best-effort：mock 模式、不带 `ebpf` 的构建，或队列/nftables 前置检查失败时记录 warning，仅在本进程关闭暂存且不改写配置文件。服务通过前置检查并准入后，listener、queue、watchdog、verdict、cleanup 和 retirement 的失败仍为 fatal。进程级配置项见[全局配置参考](../reference/global.md)。
 
 该 hook 的范围刻意保持狭窄：
 

@@ -398,11 +398,14 @@ pub fn parse_dae_config(input: &str) -> Result<Config, crate::ConfigError> {
                     config.subscriptions.push(sub);
                 }
             }
-            "experimental" => config.experimental = parse_experimental_section(section)?,
+            "experimental" => {
+                config.experimental = parse_experimental_section(section)?;
+            }
             "include" => {}
             _ => {}
         }
     }
+    config.apply_legacy_nfqueue();
 
     for group in &mut config.groups {
         if group.policy == crate::node::GroupPolicy::URLTest {
@@ -1718,7 +1721,7 @@ fn parse_subscription_section(section: &Section) -> Result<Vec<Subscription>, cr
 
 fn parse_experimental_section(section: &Section) -> Result<ExperimentalConfig, crate::ConfigError> {
     let mut cfg = ExperimentalConfig::default();
-    let subs = split_nested_sections(&section.body, &["clash_api", "cache_file"])?;
+    let subs = split_nested_sections(&section.body, &["clash_api", "cache_file", "udp_nfqueue"])?;
 
     if let Some(unparsed) = subs.first().filter(|sub| !sub.body.trim().is_empty()) {
         let setting = unparsed.body.lines().next().unwrap_or_default().trim();
@@ -1760,6 +1763,20 @@ fn parse_experimental_section(section: &Section) -> Result<ExperimentalConfig, c
                 if let Some(v) = kv.get("store_dns") {
                     cfg.cache_file.store_dns = parse_bool(v);
                 }
+            }
+            "udp_nfqueue" => {
+                if let Some(key) = kv.keys().find(|key| key.as_str() != "enabled") {
+                    return Err(crate::ConfigError::Parse(format!(
+                        "unknown experimental.udp_nfqueue setting: {key}"
+                    )));
+                }
+                let enabled = kv
+                    .get("enabled")
+                    .map(|value| parse_checked_bool(value, "experimental.udp_nfqueue.enabled"))
+                    .transpose()?
+                    .unwrap_or(false);
+                cfg.legacy_udp_nfqueue =
+                    Some(crate::experimental::LegacyUdpNfqueueConfig { enabled });
             }
             _ => {}
         }

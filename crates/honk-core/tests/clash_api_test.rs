@@ -788,8 +788,8 @@ async fn test_connections_snapshot_and_delete() {
     // A LAN-forwarded flow carries no process attribution.
     app.state.connection_tracker.register(ConnectionEntry {
         id: "conn-2".into(),
-        source: "192.168.1.10:4321".into(),
-        destination: "1.1.1.1:443".into(),
+        source: "[2001:db8::10]:4321".into(),
+        destination: "[2001:db8::20]:443".into(),
         proxy: "proxy".into(),
         rule: "Match".into(),
         rule_payload: String::new(),
@@ -837,6 +837,10 @@ async fn test_connections_snapshot_and_delete() {
     let c2 = conns.iter().find(|c| c["id"] == "conn-2").unwrap();
     assert_eq!(c2["metadata"]["process"], "");
     assert_eq!(c2["metadata"]["processPath"], "");
+    assert_eq!(c2["metadata"]["sourceIP"], "2001:db8::10");
+    assert_eq!(c2["metadata"]["destinationIP"], "2001:db8::20");
+    assert_eq!(c2["metadata"]["sourcePort"], "4321");
+    assert_eq!(c2["metadata"]["destinationPort"], "443");
     assert_eq!(body["uploadTotal"], 100);
     assert_eq!(body["downloadTotal"], 200);
 

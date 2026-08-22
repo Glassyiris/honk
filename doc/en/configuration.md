@@ -261,7 +261,7 @@ See the [subscription reference](./reference/subscription.md).
 
 **Cache file.** Set `experimental.cache_file.enabled: true` to persist Selector choices and Clash mode; `store_dns: true` also persists eligible DNS answers. A relative `path` uses `data_dir`, subject to the legacy-path rule above.
 
-**Held-first-packet UDP.** `global.nfqueue_enable` defaults to `true`; set it to `false` to disable NFQUEUE staging for ambiguous LAN-forwarded UDP. The setting is restart-required. Enabled startup requires root, a build with `ebpf`, and the real backend; mock startup is rejected. honk exclusively owns queue `320` and nftables `inet honk_nfqueue` / `udp_decision`; a firewall manager must not mutate them while honk runs.
+**Held-first-packet UDP.** `global.nfqueue_enable` defaults to `true`; set it to `false` to disable NFQUEUE staging for ambiguous LAN-forwarded UDP. The setting is restart-required. If startup uses mock eBPF, lacks the `ebpf` feature, or fails the queue/nftables preflight, honk logs a warning and disables NFQUEUE for that process without rewriting the config file. honk exclusively owns queue `320` and nftables `inet honk_nfqueue` / `udp_decision`; a firewall manager must not mutate them while honk runs.
 
 See the [global reference](./reference/global.md), [experimental reference](./reference/experimental.md), and [UDP NFQUEUE design](./design/nfqueue.md).
 
@@ -304,7 +304,7 @@ See the [CLI reference](./reference/cli.md).
 2. Ensure every routing rule/fallback, DNS fallback, group `final`, and `->` proxy target names an existing group, node, `direct`, or `block` as appropriate.
 3. For first-connection domain rules, use `dial_mode: domain`/`domain++` or ensure client DNS passes through honk so the domain routing map is populated.
 4. After changing groups or policies, SIGHUP rebuilds `GroupManager`; a still-valid Selector choice migrates to the replacement generation.
-5. Changing `global.nfqueue_enable` requires a restart; verify the real eBPF backend is active and the firewall manager leaves `inet honk_nfqueue` / `udp_decision` untouched.
+5. Changing `global.nfqueue_enable` requires a restart; when activation is desired, verify the real eBPF backend and startup prerequisites, and ensure the firewall manager leaves `inet honk_nfqueue` / `udp_decision` untouched.
 6. When adding or changing configuration fixtures, run `cargo test -p honk-config` to keep parser examples valid.
 
 ## Related docs

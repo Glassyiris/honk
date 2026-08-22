@@ -5,6 +5,7 @@ use crate::netlink;
 use crate::{NFQUEUE_SIGNATURE_MARK, QUEUE_NUM};
 
 const NFT_MSG_NEWTABLE: u16 = 0;
+const NFT_MSG_GETTABLE: u16 = 1;
 const NFT_MSG_DELTABLE: u16 = 2;
 const NFT_MSG_NEWCHAIN: u16 = 3;
 const NFT_MSG_NEWRULE: u16 = 6;
@@ -54,6 +55,63 @@ pub const CHAIN_PRIORITY: i32 = -250;
 pub(crate) enum RulesError {
     #[error("nftables netlink: {0}")]
     Io(#[from] io::Error),
+    #[error("nftables table {TABLE_NAME} already exists")]
+    Busy,
+}
+
+pub(crate) fn preflight() -> Result<(), RulesError> {
+    let socket = netlink::open_socket(false)?;
+    netlink::set_receive_timeout(socket.as_raw_fd(), std::time::Duration::from_secs(1))?;
+    let sequence = 1;
+    let request = build_get_table(sequence);
+    netlink::send(socket.as_raw_fd(), &request)?;
+    loop {
+        let datagram = netlink::recv_datagram(socket.as_raw_fd(), 64 * 1024)?;
+        for message in netlink::messages(datagram) {
+            let message = message
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+            if message.sequence != sequence {
+                continue;
+            }
+            let new_table = (netlink::NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWTABLE;
+            let get_table = (netlink::NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_GETTABLE;
+            match message.message_type {
+                message_type if message_type == new_table || message_type == get_table => {
+                    return Err(RulesError::Busy);
+                }
+                netlink::NLMSG_ERROR => {
+                    if message.body.len() < 4 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "truncated nftables NLMSG_ERROR",
+                        )
+                        .into());
+                    }
+                    let code =
+                        i32::from_ne_bytes(message.body[..4].try_into().expect("four bytes"));
+                    if code == 0 || code == -libc::ENOENT {
+                        return Ok(());
+                    }
+                    return Err(io::Error::from_raw_os_error(-code).into());
+                }
+                _ => {}
+            }
+        }
+    }
+}
+fn build_get_table(sequence: u32) -> Vec<u8> {
+    let mut buffer = Vec::with_capacity(64);
+    let message = netlink::put_message_header(
+        &mut buffer,
+        (netlink::NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_GETTABLE,
+        netlink::NLM_F_REQUEST,
+        sequence,
+        netlink::NFPROTO_INET,
+        netlink::NFNL_SUBSYS_NFTABLES,
+    );
+    netlink::put_attribute_string(&mut buffer, NFTA_TABLE_NAME, TABLE_NAME);
+    netlink::seal_message(&mut buffer, message);
+    buffer
 }
 
 pub(crate) struct NftRuleset {
@@ -282,6 +340,25 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
+
+    #[test]
+    fn preflight_targets_owned_table() {
+        let messages = netlink::messages(Bytes::from(build_get_table(23)))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].message_type,
+            (netlink::NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_GETTABLE
+        );
+        assert_eq!(messages[0].flags, netlink::NLM_F_REQUEST);
+        let attributes = netlink::attributes(messages[0].body.slice(netlink::NFGENMSG_LEN..))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(attributes.len(), 1);
+        assert_eq!(attributes[0].kind, NFTA_TABLE_NAME);
+        assert_eq!(attributes[0].payload.as_ref(), b"honk_nfqueue\0");
+    }
 
     #[derive(Debug)]
     struct Expression {

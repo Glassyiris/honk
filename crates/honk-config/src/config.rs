@@ -473,6 +473,19 @@ impl Config {
         changed
     }
 
+    /// Apply the removed experimental NFQUEUE setting without retaining it in
+    /// the active configuration schema.
+    pub(crate) fn apply_legacy_nfqueue(&mut self) {
+        let Some(legacy) = self.experimental.legacy_udp_nfqueue.take() else {
+            return;
+        };
+        eprintln!(
+            "warning: experimental.udp_nfqueue.enabled is deprecated; migrate to global.nfqueue_enable: {}",
+            legacy.enabled
+        );
+        self.global.nfqueue_enable = legacy.enabled;
+    }
+
     pub fn from_file(path: &str) -> Result<Self, crate::ConfigError> {
         let content = std::fs::read_to_string(path)?;
 
@@ -505,6 +518,7 @@ impl Config {
                     .or_else(|_| Self::from_json_str(&content)),
             },
         }?;
+        config.apply_legacy_nfqueue();
         config.derive_node_ids();
         Ok(config)
     }
@@ -542,6 +556,7 @@ impl Config {
     pub fn from_json_str(s: &str) -> Result<Self, crate::ConfigError> {
         let mut config: Self =
             serde_json::from_str(s).map_err(|e| crate::ConfigError::Parse(e.to_string()))?;
+        config.apply_legacy_nfqueue();
         config.derive_node_ids();
         Ok(config)
     }

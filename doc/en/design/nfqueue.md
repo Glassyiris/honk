@@ -12,7 +12,7 @@ global {
 }
 ```
 
-Changing the setting requires a process restart; reload rejects the change. Enabled startup requires an `ebpf`-feature build and the real eBPF backend. A build without `ebpf` and `--mock-ebpf` both fail startup instead of silently falling back. See the [global configuration reference](../reference/global.md) for the process-scoped knob.
+Changing the setting requires a process restart; reload rejects the change. Startup treats NFQUEUE as best-effort: mock mode, a build without `ebpf`, or a failed queue/nftables preflight logs a warning and disables staging for that process without rewriting the config file. Once the service passes preflight and is admitted, listener, queue, watchdog, verdict, cleanup, and retirement failures remain fatal. See the [global configuration reference](../reference/global.md) for the process-scoped knob.
 
 The hook is deliberately narrow:
 
