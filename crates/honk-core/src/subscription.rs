@@ -140,10 +140,7 @@ fn subscription_filename(sub: &Subscription) -> String {
 
     let mut hasher = Sha256::new();
     add_part(&mut hasher, sub.url.as_bytes());
-    add_part(
-        &mut hasher,
-        subscription_cache_user_agent(sub).as_bytes(),
-    );
+    add_part(&mut hasher, subscription_cache_user_agent(sub).as_bytes());
     for header in &sub.headers {
         add_part(&mut hasher, header.key.as_bytes());
         add_part(&mut hasher, header.value.as_bytes());
@@ -1278,10 +1275,12 @@ not-proxies: []
         );
 
         let mut with_header = default_sub.clone();
-        with_header.headers.push(honk_config::subscription::SubscriptionHeader {
-            key: "X-Test".into(),
-            value: "1".into(),
-        });
+        with_header
+            .headers
+            .push(honk_config::subscription::SubscriptionHeader {
+                key: "X-Test".into(),
+                value: "1".into(),
+            });
         assert_ne!(store.path_for(&default_sub), store.path_for(&with_header));
 
         write_store_file(
@@ -1291,11 +1290,7 @@ not-proxies: []
         )
         .unwrap();
         assert!(store.load_nodes(&default_sub).await.unwrap().is_none());
-        assert!(store
-            .load_nodes(&explicit_default)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(store.load_nodes(&explicit_default).await.unwrap().is_some());
     }
 
     #[tokio::test]
