@@ -279,10 +279,14 @@ fn parse_subscription_content(sub: &Subscription, content: &str) -> anyhow::Resu
     }?;
 
     let mut seen = std::collections::HashSet::new();
+    let mut had_duplicate = false;
     let nodes = nodes
         .into_iter()
         .filter(|node| {
-            seen.insert(node.id) || {
+            if seen.insert(node.id) {
+                true
+            } else {
+                had_duplicate = true;
                 tracing::warn!(
                     node = %node.name,
                     "skipping subscription node with a duplicate endpoint identity"
@@ -293,6 +297,9 @@ fn parse_subscription_content(sub: &Subscription, content: &str) -> anyhow::Resu
         .collect::<Vec<_>>();
     if nodes.is_empty() {
         anyhow::bail!("no usable nodes found in subscription");
+    }
+    if had_duplicate && nodes.len() == 1 {
+        anyhow::bail!("subscription contains only duplicate endpoint identities");
     }
     Ok(nodes)
 }
@@ -852,6 +859,54 @@ mod tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode(uris.as_bytes());
         let result = parse_base64_subscription(&encoded, None, "test");
         assert!(result.is_err());
+    }
+    #[test]
+    fn test_parse_subscription_rejects_duplicate_only_simple_payload() {
+        let sub = Subscription {
+            sub_type: SubscriptionType::Simple,
+            ..Default::default()
+        };
+        let uri = "socks5://127.0.0.1:1080#same";
+        let content = format!("{uri}\n{uri}");
+        let error = parse_subscription_content(&sub, &content).unwrap_err();
+        assert!(error.to_string().contains("duplicate endpoint identities"));
+    }
+
+    #[test]
+    fn test_parse_subscription_keeps_unique_nodes_with_duplicates() {
+        let sub = Subscription {
+            sub_type: SubscriptionType::Simple,
+            ..Default::default()
+        };
+        let content = concat!(
+            "socks5://127.0.0.1:1080#same\n",
+            "socks5://127.0.0.1:1080#same-again\n",
+            "socks5://127.0.0.1:1081#unique"
+        );
+        let nodes = parse_subscription_content(&sub, content).unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].name, "same");
+        assert_eq!(nodes[1].name, "unique");
+    }
+
+    #[test]
+    fn test_parse_subscription_rejects_duplicate_only_clash_payload() {
+        let sub = Subscription {
+            sub_type: SubscriptionType::Clash,
+            ..Default::default()
+        };
+        let yaml = r#"proxies:
+  - name: first
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+  - name: second
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+"#;
+        let error = parse_subscription_content(&sub, yaml).unwrap_err();
+        assert!(error.to_string().contains("duplicate endpoint identities"));
     }
 
     #[test]

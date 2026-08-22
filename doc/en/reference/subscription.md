@@ -72,7 +72,7 @@ Changing `global.store_subscribe` through SIGHUP is rejected as restart-required
 
 ## Subscription body formats
 
-All accepted nodes receive the subscription ID. After parsing, duplicate derived node IDs are discarded with the first occurrence retained.
+All accepted nodes receive the subscription ID. After parsing, duplicate derived node IDs are discarded with the first occurrence retained. A body whose supported entries all collapse to one duplicated identity is rejected rather than replacing the active subscription.
 
 ### `simple`
 

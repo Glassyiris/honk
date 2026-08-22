@@ -15,6 +15,13 @@ impl ControlPlane {
         self.apply_resolved_runtime_config(new_config, drain).await
     }
 
+    /// Publish an explicit runtime configuration through the same transaction
+    /// used by SIGHUP and subscription refreshes.
+    pub async fn reload_runtime_config(&self, new_config: Config) -> bool {
+        self.apply_runtime_config(new_config, &DrainTracker::new())
+            .await
+    }
+
     pub(in crate::control) async fn apply_resolved_runtime_config(
         &self,
         new_config: Config,

@@ -44,11 +44,13 @@ impl ControlPlane {
     /// reloads); this public wrapper exists so integration tests can drive a
     /// merge without binding the TPROXY accept loop.
     pub async fn merge_subscription_nodes(&self, subscription_id: uuid::Uuid, nodes: Vec<Node>) {
+        if nodes.is_empty() {
+            return;
+        }
         let new_config = {
             let current = self.config.read().await;
             config_with_subscription_nodes(&current, subscription_id, nodes)
         };
-        let drain = DrainTracker::new();
-        self.apply_runtime_config(new_config, &drain).await;
+        self.reload_runtime_config(new_config).await;
     }
 }
