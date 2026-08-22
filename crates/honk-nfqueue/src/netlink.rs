@@ -1,6 +1,5 @@
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 
@@ -245,27 +244,6 @@ pub(crate) fn open_socket(nonblocking: bool) -> io::Result<OwnedFd> {
         return Err(io::Error::last_os_error());
     }
     Ok(fd)
-}
-
-pub(crate) fn set_receive_timeout(fd: RawFd, timeout: Duration) -> io::Result<()> {
-    let value = libc::timeval {
-        tv_sec: timeout.as_secs() as libc::time_t,
-        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
-    };
-    let result = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            (&value as *const libc::timeval).cast::<libc::c_void>(),
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
 }
 
 pub(crate) fn send(fd: RawFd, bytes: &[u8]) -> io::Result<()> {

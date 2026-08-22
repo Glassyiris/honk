@@ -284,7 +284,6 @@ mod tests {
 
     use super::*;
 
-
     #[derive(Debug)]
     struct Expression {
         name: String,

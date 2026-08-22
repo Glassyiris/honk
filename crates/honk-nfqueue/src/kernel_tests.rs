@@ -124,7 +124,7 @@ fn exercise_kernel_contract() {
             })
             .expect("kernel test event receiver");
     });
-    let (mut service, mut fatal) =
+    let (mut service, _) =
         NfqueueService::start(Arc::clone(&callback)).expect("start production NFQUEUE");
 
     assert!(owned_table_exists(), "service must publish its owned table");
@@ -146,15 +146,21 @@ fn exercise_kernel_contract() {
     // An unwinding service closes the queue but intentionally leaves its
     // fail-closed table; the next owner must reclaim that stale table.
     drop(service);
-    assert!(owned_table_exists(), "unwinding must retain the owned table");
+    assert!(
+        owned_table_exists(),
+        "unwinding must retain the owned table"
+    );
     assert!(
         !queue_is_listed_in_proc(),
         "dropping the service must release the fixed queue"
     );
-    let restarted = NfqueueService::start(Arc::clone(&callback))
+    assert!(
+        crate::preflight().is_ok(),
+        "a stale table must not block queue preflight"
+    );
+    let (new_service, mut fatal) = NfqueueService::start(Arc::clone(&callback))
         .expect("restart must reclaim a stale owned table");
-    service = restarted.0;
-    fatal = restarted.1;
+    service = new_service;
     assert!(owned_table_exists(), "restart must publish the owned table");
 
     let ipv4_receiver = marked_receiver("127.0.0.1:0".parse().unwrap());
