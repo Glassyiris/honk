@@ -714,6 +714,45 @@ experimental {
             .expect("structured global NFQUEUE setting");
         assert!(!config.global.nfqueue_enable);
     }
+
+    #[test]
+    fn test_canonical_nfqueue_setting_wins_over_legacy() {
+        let dae = parse_dae_config(
+            "global {\n    nfqueue_enable: false\n}\nexperimental {\n    udp_nfqueue {\n        enabled: true\n    }\n}",
+        )
+        .unwrap();
+        assert!(!dae.global.nfqueue_enable);
+
+        let dae = parse_dae_config(
+            "global {\n    nfqueue_enable: true\n}\nexperimental {\n    udp_nfqueue {\n        enabled: false\n    }\n}",
+        )
+        .unwrap();
+        assert!(dae.global.nfqueue_enable);
+
+        let json = crate::Config::from_json_str(
+            r#"{"global":{"nfqueue_enable":false},"experimental":{"udp_nfqueue":{"enabled":true}}}"#,
+        )
+        .unwrap();
+        assert!(!json.global.nfqueue_enable);
+
+        for (suffix, body, expected) in [
+            (
+                ".toml",
+                "[global]\nnfqueue_enable = false\n[experimental.udp_nfqueue]\nenabled = true\n",
+                false,
+            ),
+            (
+                ".yaml",
+                "global:\n  nfqueue_enable: true\nexperimental:\n  udp_nfqueue:\n    enabled: false\n",
+                true,
+            ),
+        ] {
+            let file = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
+            std::fs::write(file.path(), body).unwrap();
+            let loaded = crate::Config::from_file(file.path().to_str().unwrap()).unwrap();
+            assert_eq!(loaded.global.nfqueue_enable, expected, "{suffix}");
+        }
+    }
 }
 
 #[test]

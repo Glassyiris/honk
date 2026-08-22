@@ -475,7 +475,7 @@ impl Config {
 
     /// Apply the removed experimental NFQUEUE setting without retaining it in
     /// the active configuration schema.
-    pub(crate) fn apply_legacy_nfqueue(&mut self) {
+    pub(crate) fn apply_legacy_nfqueue(&mut self, canonical_present: bool) {
         let Some(legacy) = self.experimental.legacy_udp_nfqueue.take() else {
             return;
         };
@@ -483,7 +483,9 @@ impl Config {
             "warning: experimental.udp_nfqueue.enabled is deprecated; migrate to global.nfqueue_enable: {}",
             legacy.enabled
         );
-        self.global.nfqueue_enable = legacy.enabled;
+        if !canonical_present {
+            self.global.nfqueue_enable = legacy.enabled;
+        }
     }
 
     pub fn from_file(path: &str) -> Result<Self, crate::ConfigError> {
@@ -518,7 +520,6 @@ impl Config {
                     .or_else(|_| Self::from_json_str(&content)),
             },
         }?;
-        config.apply_legacy_nfqueue();
         config.derive_node_ids();
         Ok(config)
     }
@@ -554,9 +555,10 @@ impl Config {
 
     /// Parse a configuration from a JSON string.
     pub fn from_json_str(s: &str) -> Result<Self, crate::ConfigError> {
+        let canonical_present = json_has_global_nfqueue_enable(s);
         let mut config: Self =
             serde_json::from_str(s).map_err(|e| crate::ConfigError::Parse(e.to_string()))?;
-        config.apply_legacy_nfqueue();
+        config.apply_legacy_nfqueue(canonical_present);
         config.derive_node_ids();
         Ok(config)
     }
@@ -718,15 +720,48 @@ impl Config {
         Ok(())
     }
 }
-
 /// Parse a configuration from a TOML string.
 fn parse_toml(content: &str) -> Result<Config, crate::ConfigError> {
-    toml::from_str(content).map_err(|e| crate::ConfigError::Parse(e.to_string()))
+    let canonical_present = toml_has_global_nfqueue_enable(content);
+    let mut config: Config =
+        toml::from_str(content).map_err(|e| crate::ConfigError::Parse(e.to_string()))?;
+    config.apply_legacy_nfqueue(canonical_present);
+    Ok(config)
 }
 
 /// Parse a configuration from a YAML string.
 fn parse_yaml(content: &str) -> Result<Config, crate::ConfigError> {
-    serde_yaml::from_str(content).map_err(|e| crate::ConfigError::Parse(e.to_string()))
+    let canonical_present = yaml_has_global_nfqueue_enable(content);
+    let mut config: Config =
+        serde_yaml::from_str(content).map_err(|e| crate::ConfigError::Parse(e.to_string()))?;
+    config.apply_legacy_nfqueue(canonical_present);
+    Ok(config)
+}
+
+fn json_has_global_nfqueue_enable(content: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|root| root.get("global").cloned())
+        .and_then(|global| global.as_object().cloned())
+        .is_some_and(|global| global.contains_key("nfqueue_enable"))
+}
+
+fn toml_has_global_nfqueue_enable(content: &str) -> bool {
+    toml::from_str::<toml::Value>(content)
+        .ok()
+        .and_then(|root| root.get("global").cloned())
+        .and_then(|global| global.as_table().cloned())
+        .is_some_and(|global| global.contains_key("nfqueue_enable"))
+}
+
+fn yaml_has_global_nfqueue_enable(content: &str) -> bool {
+    serde_yaml::from_str::<serde_yaml::Value>(content)
+        .ok()
+        .and_then(|root| root.get("global").cloned())
+        .and_then(|global| global.as_mapping().cloned())
+        .is_some_and(|global| {
+            global.contains_key(serde_yaml::Value::String("nfqueue_enable".into()))
+        })
 }
 
 #[cfg(test)]

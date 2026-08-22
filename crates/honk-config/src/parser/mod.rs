@@ -376,6 +376,10 @@ pub fn parse_dae_config(input: &str) -> Result<Config, crate::ConfigError> {
     }
 
     let sections = merge_top_level_sections(split_sections(&input)?);
+    let canonical_nfqueue_present = sections
+        .iter()
+        .filter(|section| section.name == "global")
+        .any(|section| parse_kv_pairs(&section.body).contains_key("nfqueue_enable"));
     let mut config = Config::default();
 
     for section in &sections {
@@ -405,7 +409,7 @@ pub fn parse_dae_config(input: &str) -> Result<Config, crate::ConfigError> {
             _ => {}
         }
     }
-    config.apply_legacy_nfqueue();
+    config.apply_legacy_nfqueue(canonical_nfqueue_present);
 
     for group in &mut config.groups {
         if group.policy == crate::node::GroupPolicy::URLTest {
