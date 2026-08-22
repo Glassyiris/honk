@@ -665,23 +665,93 @@ experimental {
     }
 
     #[test]
-    fn test_nfqueue_global_setting_rejects_old_or_invalid_settings() {
-        for input in [
-            "experimental {\n    udp_nfqueue {\n        enabled: false\n    }\n}",
-            "global {\n    nfqueue_enable: maybe\n}",
+    fn test_legacy_nfqueue_setting_migrates_to_global() {
+        for (enabled, expected) in [("true", true), ("false", false), ("", false)] {
+            let input = if enabled.is_empty() {
+                "experimental {\n    udp_nfqueue {\n    }\n}".to_string()
+            } else {
+                format!(
+                    "experimental {{\n    udp_nfqueue {{\n        enabled: {enabled}\n    }}\n}}"
+                )
+            };
+            let config = parse_dae_config(&input).unwrap();
+            assert_eq!(config.global.nfqueue_enable, expected);
+        }
+
+        let structured =
+            crate::Config::from_json_str(r#"{"experimental":{"udp_nfqueue":{"enabled":true}}}"#)
+                .unwrap();
+        assert!(structured.global.nfqueue_enable);
+        assert!(!structured.to_json_string().unwrap().contains("udp_nfqueue"));
+        for (suffix, body) in [
+            (".toml", "[experimental.udp_nfqueue]\nenabled = false\n"),
+            (
+                ".yaml",
+                "experimental:\n  udp_nfqueue:\n    enabled: true\n",
+            ),
         ] {
-            let error = parse_dae_config(input).expect_err("unsupported NFQUEUE config must fail");
+            let file = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
+            std::fs::write(file.path(), body).unwrap();
+            let loaded = crate::Config::from_file(file.path().to_str().unwrap()).unwrap();
+            assert_eq!(loaded.global.nfqueue_enable, suffix == ".yaml");
+        }
+
+        for input in [
+            "experimental {\n    udp_nfqueue {\n        enabled: maybe\n    }\n}",
+            "experimental {\n    udp_nfqueue {\n        workers: 4\n    }\n}",
+        ] {
+            let error =
+                parse_dae_config(input).expect_err("invalid legacy NFQUEUE config must fail");
             assert!(matches!(error, crate::ConfigError::Parse(_)), "{error}");
         }
 
         let error =
-            crate::Config::from_json_str(r#"{"experimental":{"udp_nfqueue":{"enabled":false}}}"#)
-                .expect_err("structured configs must reject the removed experimental setting");
+            crate::Config::from_json_str(r#"{"experimental":{"udp_nfqueue":{"workers":4}}}"#)
+                .expect_err("unknown structured legacy NFQUEUE setting must fail");
         assert!(matches!(error, crate::ConfigError::Parse(_)));
 
         let config = crate::Config::from_json_str(r#"{"global":{"nfqueue_enable":false}}"#)
             .expect("structured global NFQUEUE setting");
         assert!(!config.global.nfqueue_enable);
+    }
+
+    #[test]
+    fn test_canonical_nfqueue_setting_wins_over_legacy() {
+        let dae = parse_dae_config(
+            "global {\n    nfqueue_enable: false\n}\nexperimental {\n    udp_nfqueue {\n        enabled: true\n    }\n}",
+        )
+        .unwrap();
+        assert!(!dae.global.nfqueue_enable);
+
+        let dae = parse_dae_config(
+            "global {\n    nfqueue_enable: true\n}\nexperimental {\n    udp_nfqueue {\n        enabled: false\n    }\n}",
+        )
+        .unwrap();
+        assert!(dae.global.nfqueue_enable);
+
+        let json = crate::Config::from_json_str(
+            r#"{"global":{"nfqueue_enable":false},"experimental":{"udp_nfqueue":{"enabled":true}}}"#,
+        )
+        .unwrap();
+        assert!(!json.global.nfqueue_enable);
+
+        for (suffix, body, expected) in [
+            (
+                ".toml",
+                "[global]\nnfqueue_enable = false\n[experimental.udp_nfqueue]\nenabled = true\n",
+                false,
+            ),
+            (
+                ".yaml",
+                "global:\n  nfqueue_enable: true\nexperimental:\n  udp_nfqueue:\n    enabled: false\n",
+                true,
+            ),
+        ] {
+            let file = tempfile::Builder::new().suffix(suffix).tempfile().unwrap();
+            std::fs::write(file.path(), body).unwrap();
+            let loaded = crate::Config::from_file(file.path().to_str().unwrap()).unwrap();
+            assert_eq!(loaded.global.nfqueue_enable, expected, "{suffix}");
+        }
     }
 }
 

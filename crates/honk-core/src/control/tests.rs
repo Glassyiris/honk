@@ -39,6 +39,53 @@ fn nfqueue_actor_queue_bounds_small_and_max_payloads() {
 }
 
 #[cfg(feature = "ebpf")]
+#[tokio::test]
+async fn nfqueue_startup_degradation_clears_config_and_effective_flag() {
+    use honk_ebpf_common::{DATAPATH_FLAG_NFQ_ENABLED, DATAPATH_FLAG_NFQ_READY};
+
+    let mut config = Config::default();
+    config.global.nfqueue_enable = true;
+    let backend = crate::ebpf::mock::MockEbpfBackend::new();
+    let writes = backend.datapath_flags_writes.clone();
+    let mut control = ControlPlane::new(
+        config,
+        Box::new(backend),
+        Router::new(&[], "direct").unwrap(),
+        Arc::new(ProxyRegistry::default_resolver().unwrap()),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
+        udp_test_forwarder(),
+    )
+    .unwrap();
+    control.set_mode_state(Arc::new(parking_lot::RwLock::new(
+        crate::mode::ModeState::new("Rule", "Proxy"),
+    )));
+    control.start_datapath_flags_coordinator().unwrap();
+
+    let mut enabled = true;
+    control
+        .degrade_nfqueue_startup(&mut enabled, anyhow::anyhow!("injected startup failure"))
+        .await;
+
+    assert!(!enabled);
+    assert!(!control.config_handle().read().await.global.nfqueue_enable);
+    control
+        .datapath_flags_handle()
+        .expect("datapath flags coordinator")
+        .initialize(0, enabled, false)
+        .await
+        .unwrap();
+    let published = writes
+        .lock()
+        .ok()
+        .and_then(|values| values.last().copied())
+        .expect("initial flags");
+    assert_eq!(
+        published & (DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY),
+        0
+    );
+}
+
+#[cfg(feature = "ebpf")]
 #[test]
 fn nfqueue_actor_acquires_slow_permits_only_at_dequeue() {
     let limit = Arc::new(tokio::sync::Semaphore::new(1));
@@ -1494,6 +1541,27 @@ fn subscription_merge_replaces_only_that_subscription() {
     assert_eq!(remerged.nodes.len(), 3);
     assert_eq!(remerged.groups[0].nodes.len(), 3);
     assert_eq!(remerged.nodes[2].id, new_a1b.id);
+}
+
+#[test]
+fn empty_subscription_merge_preserves_previous_nodes() {
+    let subscription_id = uuid::Uuid::new_v4();
+    let old = Node {
+        id: uuid::Uuid::new_v4(),
+        name: "old".into(),
+        subscription_id: Some(subscription_id),
+        ..Default::default()
+    };
+    let current = Config {
+        nodes: vec![old.clone()],
+        ..Default::default()
+    };
+
+    let merged = config_with_subscription_nodes(&current, subscription_id, Vec::new());
+
+    assert_eq!(merged.nodes.len(), 1);
+    assert_eq!(merged.nodes[0].id, old.id);
+    assert_eq!(merged.nodes[0].name, "old");
 }
 
 #[test]
@@ -4830,8 +4898,9 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
                 let mut ebpf = control.ebpf.write().await;
                 routing_matcher::RoutingMatcherBuilder::push_plan(ebpf.as_mut(), &plan)?;
             }
+            let sequence_ready = control.rotate_udp_decision_generation().await?;
             let mut nfqueue = control
-                .start_nfqueue_runtime(true)
+                .start_nfqueue_runtime(true, sequence_ready)
                 .await?
                 .expect("enabled NFQUEUE runtime");
             nfqueue.check_startup_health().await?;

@@ -19,7 +19,7 @@ honk-core [OPTIONS] [COMMAND]
 | `-b`, `--bpf-object PATH` | Embedded object | Override the object embedded by an `ebpf` build. Used only by the real backend. |
 | `--bpf-pin-root PATH` | `/sys/fs/bpf` | Root for pinned eBPF maps. |
 | `-d`, `--debug` | Off | Select `debug` as the default console filter when `RUST_LOG` does not provide a valid filter. |
-| `--mock-ebpf` | Off | Use `MockEbpfBackend` instead of loading kernel eBPF. A configuration with `global.nfqueue_enable: true` is rejected. |
+| `--mock-ebpf` | Off | Use `MockEbpfBackend` instead of loading kernel eBPF. If `global.nfqueue_enable: true` is requested, honk logs a warning and disables NFQUEUE staging for this process. |
 
 Clap also provides `-h`/`--help` and `-V`/`--version`.
 

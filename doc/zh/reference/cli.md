@@ -19,7 +19,7 @@ honk-core [OPTIONS] [COMMAND]
 | `-b`, `--bpf-object PATH` | 内嵌目标文件 | 覆盖 `ebpf` 构建内嵌的目标文件。仅真实后端使用。 |
 | `--bpf-pin-root PATH` | `/sys/fs/bpf` | eBPF map 的 pin 根目录。 |
 | `-d`, `--debug` | 关 | 当 `RUST_LOG` 未提供有效 filter 时，选择 `debug` 作为默认控制台 filter。 |
-| `--mock-ebpf` | 关 | 使用 `MockEbpfBackend`，不加载内核 eBPF。`global.nfqueue_enable: true` 的配置会被拒绝。 |
+| `--mock-ebpf` | 关 | 使用 `MockEbpfBackend`，不加载内核 eBPF。若配置请求 `global.nfqueue_enable: true`，honk 会记录 warning 并仅在本进程关闭 NFQUEUE 暂存。 |
 
 Clap 还提供 `-h`/`--help` 和 `-V`/`--version`。
 

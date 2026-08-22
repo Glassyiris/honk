@@ -1,6 +1,6 @@
 # Experimental 配置参考
 
-本文档说明 `experimental { ... }` 下支持的两个嵌套 section。
+本文档说明 `experimental { ... }` 下当前支持的两个嵌套 section。
 
 ## Section 概览
 
@@ -9,7 +9,7 @@
 | `clash_api` | Clash 兼容 HTTP API 与外部 dashboard |
 | `cache_file` | 用 SQLite 持久化运行时选择、模式、延迟样本和可选 DNS 状态 |
 
-在嵌套 section 这一层，dae 解析器只将 `clash_api`、`cache_file` 列入白名单；`experimental` 下不接受其他 section 名称。首包保留 UDP 路径由全局字段 `nfqueue_enable` 配置，见[全局配置参考](./global.md)。
+`udp_nfqueue { enabled: ... }` 是已弃用的兼容 section。dae 和结构化配置加载器仍会接受它，打印迁移 warning，并将值复制到 `global.nfqueue_enable`；新配置应直接使用全局字段。
 
 ## `clash_api`
 

@@ -16,11 +16,36 @@ async fn wait_nfqueue_event(
 fn accepts_transparent_connection(drain: &DrainTracker) -> bool {
     !drain.should_reject()
 }
+
+#[cfg(feature = "ebpf")]
+pub(super) fn disable_nfqueue_for_startup(config: &mut Config, enabled: &mut bool) {
+    config.global.nfqueue_enable = false;
+    *enabled = false;
+}
+
 impl ControlPlane {
+    #[cfg(feature = "ebpf")]
+    pub(super) async fn degrade_nfqueue_startup(
+        &mut self,
+        enabled: &mut bool,
+        error: anyhow::Error,
+    ) {
+        warn!(
+            %error,
+            "NFQUEUE startup failed before datapath admission; disabling staging for this process"
+        );
+        self.pending_udp_verdicts = None;
+        let mut config = self.config.write().await;
+        disable_nfqueue_for_startup(&mut config, enabled);
+    }
+
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let config = self.config.read().await;
         let tproxy_port = config.global.tproxy_port;
         let tproxy_mark = config.global.tproxy_mark;
+        #[cfg(feature = "ebpf")]
+        let mut udp_nfqueue_enabled = config.global.nfqueue_enable;
+        #[cfg(not(feature = "ebpf"))]
         let udp_nfqueue_enabled = config.global.nfqueue_enable;
         let dns_bind_endpoint = config
             .dns
@@ -151,16 +176,35 @@ impl ControlPlane {
         }
 
         let tcp6_listener = tcp6_listener;
+        // A persistent token allocator error is ambiguous; only service setup can degrade.
         #[cfg(feature = "ebpf")]
-        let mut nfqueue_runtime = match self.start_nfqueue_runtime(udp_nfqueue_enabled).await {
+        let nfqueue_sequence_ready = if udp_nfqueue_enabled {
+            match self.rotate_udp_decision_generation().await {
+                Ok(ready) => ready,
+                Err(error) => {
+                    if let Some(listener) = dns_listener.as_mut() {
+                        listener.stop_accepting();
+                        listener.abort_and_join().await;
+                    }
+                    self.cleanup_pre_admission_failure().await;
+                    return Err(anyhow::anyhow!(
+                        "prepare UDP decision token allocator: {error:#}"
+                    ));
+                }
+            }
+        } else {
+            false
+        };
+        #[cfg(feature = "ebpf")]
+        let mut nfqueue_runtime = match self
+            .start_nfqueue_runtime(udp_nfqueue_enabled, nfqueue_sequence_ready)
+            .await
+        {
             Ok(runtime) => runtime,
             Err(error) => {
-                if let Some(listener) = dns_listener.as_mut() {
-                    listener.stop_accepting();
-                    listener.abort_and_join().await;
-                }
-                self.cleanup_pre_admission_failure().await;
-                return Err(error);
+                self.degrade_nfqueue_startup(&mut udp_nfqueue_enabled, error)
+                    .await;
+                None
             }
         };
         #[cfg(not(feature = "ebpf"))]
@@ -396,17 +440,18 @@ impl ControlPlane {
         }
 
         #[cfg(feature = "ebpf")]
-        let nfqueue_startup_health = match nfqueue_runtime.as_mut() {
-            Some(runtime) => runtime.check_startup_health().await,
-            None => Ok(()),
-        };
-        #[cfg(feature = "ebpf")]
-        if let Err(error) = nfqueue_startup_health {
-            self.cleanup_nfqueue_startup_failure(&mut nfqueue_runtime)
-                .await;
-            self.cleanup_started_control_tasks(&mut udp_removal_task, dns_listener.as_mut())
-                .await;
-            return Err(anyhow::anyhow!("NFQUEUE failed before readiness: {error}"));
+        {
+            let nfqueue_startup_health_error = match nfqueue_runtime.as_mut() {
+                Some(runtime) => runtime.check_startup_health().await.err(),
+                None => None,
+            };
+            if let Some(error) = nfqueue_startup_health_error {
+                self.cleanup_nfqueue_startup_failure(&mut nfqueue_runtime)
+                    .await;
+                nfqueue_runtime = None;
+                self.degrade_nfqueue_startup(&mut udp_nfqueue_enabled, error.into())
+                    .await;
+            }
         }
         #[cfg(feature = "ebpf")]
         let nfqueue_ready = nfqueue_runtime
@@ -604,6 +649,13 @@ impl ControlPlane {
                                 nodes.len(),
                                 name
                             );
+                            if nodes.is_empty() {
+                                warn!(
+                                    subscription = %name,
+                                    "subscription returned no nodes; keeping active nodes"
+                                );
+                                continue;
+                            }
                             let new_config = {
                                 let current = self.config.read().await;
                                 config_with_subscription_nodes(&current, subscription_id, nodes)

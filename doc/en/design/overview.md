@@ -75,7 +75,7 @@ flowchart TB
 1. The [datapath](./datapath.md) classifies LAN-forwarded traffic at LAN TC and host-originated TCP/UDP at WAN TC. `direct(must)` and route-time-safe direct decisions remain on the native Linux path; decisions that still need userspace are not offloaded.
 2. The [DNS path](./dns.md) sends TCP and UDP destination port `53` through a fast path that skips the general match loop and redirects to the control plane.
 3. The [datapath](./datapath.md) redirects ordinary proxy and userspace decisions through `dae0`; inside `daens`, `sk_lookup` assigns them to the [control plane's](./control-plane.md) transparent TCP or UDP listener.
-4. The [NFQUEUE staging](./nfqueue.md) path, enabled by default through `global.nfqueue_enable`, holds only ambiguous LAN-forwarded UDP after LAN TC and before conntrack/NAT. Each staged flow carries a unique decision token in fixed queue `320`; host-originated WAN traffic stays on the ordinary transparent path.
+4. The [NFQUEUE staging](./nfqueue.md) path is enabled by default through `global.nfqueue_enable` when startup prerequisites pass; it holds only ambiguous LAN-forwarded UDP after LAN TC and before conntrack/NAT. Each staged flow carries a unique decision token in fixed queue `320`; host-originated WAN traffic stays on the ordinary transparent path.
 5. The [control plane](./control-plane.md) recovers the original destination and consumes the eBPF routing handoff. A missing handoff or `ControlPlaneRouting` outcome enters userspace routing.
 6. The [routing path](./routing.md) may sniff TLS SNI, HTTP Host, or QUIC Initial SNI, then runs the userspace `Router` when the kernel result is not final.
 7. The [group layer](./groups.md) applies the Clash mode override without changing final `must`/`block` results, then resolves the authoritative group policy pick to a leaf node. When explicitly selected, Score ranks only health-eligible members from per-target TCP/UDP and target-family scores.
@@ -109,7 +109,7 @@ flowchart TB
 | `mimalloc` | yes | Pulls in `mimalloc` and `libmimalloc-sys` and installs mimalloc as the `honk-core` binary allocator. On Linux, startup disables transparent huge pages for the process before starting Tokio. |
 | `rprx` | yes | Enables `honk-outbound/rprx`, which registers the VLESS and VMess handlers, including the supported VLESS Encryption and `xtls-rprx-vision` paths. |
 
-`mock-ebpf` is not a Cargo feature. A build without `ebpf` uses `MockEbpfBackend`, and `--mock-ebpf` selects the unprivileged development path explicitly. It cannot run with `global.nfqueue_enable = true`.
+`mock-ebpf` is not a Cargo feature. A build without `ebpf` uses `MockEbpfBackend`, and `--mock-ebpf` selects the unprivileged development path explicitly. If `global.nfqueue_enable = true` is requested, startup logs a warning and disables NFQUEUE staging for that process; the config file is unchanged.
 
 ## Authorship disclosure
 

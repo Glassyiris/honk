@@ -269,6 +269,20 @@ async fn test_cp() -> ControlPlane {
 }
 
 #[tokio::test]
+async fn empty_subscription_merge_does_not_publish_runtime() {
+    let cp = test_cp().await;
+    let provider = cp.dns_controller.runtime_provider();
+    let before_generation = provider.current_generation();
+    let before_retired = provider.retired_count();
+
+    cp.merge_subscription_nodes(uuid::Uuid::new_v4(), Vec::new())
+        .await;
+
+    assert_eq!(provider.current_generation(), before_generation);
+    assert_eq!(provider.retired_count(), before_retired);
+}
+
+#[tokio::test]
 async fn reload_clamps_dials_to_startup_descriptor_reservation() {
     let cp = test_cp().await;
     let ceiling = cp.resource_budget.transient_dials;
