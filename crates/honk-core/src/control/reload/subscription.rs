@@ -1,17 +1,20 @@
 use super::*;
 
 /// Build the config produced by merging one subscription's freshly fetched
-/// nodes: every node previously delivered by that subscription is replaced
-/// (matched by `subscription_id`), group memberships derived from replaced
-/// nodes are pruned, and filter-based membership is re-resolved against the
-/// merged node set. Nodes from other subscriptions and static config nodes
-/// are untouched. Re-merging the same subscription is idempotent — nodes
-/// are replaced, never duplicated.
+/// nodes. A non-empty result replaces the previous node set for
+/// `subscription_id`; an empty result leaves the current config untouched.
+/// Group memberships derived from replaced nodes are pruned and filter-based
+/// membership is re-resolved against the merged node set. Nodes from other
+/// subscriptions and static config nodes are untouched. Re-merging the same
+/// subscription is idempotent — nodes are replaced, never duplicated.
 pub(in crate::control) fn config_with_subscription_nodes(
     current: &Config,
     subscription_id: uuid::Uuid,
     nodes: Vec<Node>,
 ) -> Config {
+    if nodes.is_empty() {
+        return current.clone();
+    }
     let mut config = current.clone();
     config
         .nodes

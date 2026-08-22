@@ -1497,6 +1497,27 @@ fn subscription_merge_replaces_only_that_subscription() {
 }
 
 #[test]
+fn empty_subscription_merge_preserves_previous_nodes() {
+    let subscription_id = uuid::Uuid::new_v4();
+    let old = Node {
+        id: uuid::Uuid::new_v4(),
+        name: "old".into(),
+        subscription_id: Some(subscription_id),
+        ..Default::default()
+    };
+    let current = Config {
+        nodes: vec![old.clone()],
+        ..Default::default()
+    };
+
+    let merged = config_with_subscription_nodes(&current, subscription_id, Vec::new());
+
+    assert_eq!(merged.nodes.len(), 1);
+    assert_eq!(merged.nodes[0].id, old.id);
+    assert_eq!(merged.nodes[0].name, "old");
+}
+
+#[test]
 fn domain_reality_exact_match_same_family() {
     let v4: std::net::IpAddr = "104.20.22.25".parse().unwrap();
     let v6: std::net::IpAddr = "2606:4700:10::6814:1619".parse().unwrap();

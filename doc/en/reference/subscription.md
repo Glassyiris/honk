@@ -26,7 +26,7 @@ The dae surface sets only the subscription tag (`name`) and `url`. Every other f
 | `url` | string | `""` | Yes | HTTP(S) fetch URL. |
 | `sub_type` | enum | `simple` | No | Body parser: `simple`, `clash`, `sip008`, or `custom`. |
 | `update_interval` | u64 | `86400` | No | Periodic refresh interval in seconds; `0` disables periodic refresh. |
-| `user_agent` | string or null | null | No | Optional `User-Agent` override. |
+| `user_agent` | string or null | `honk/<version>` | No | Optional `User-Agent` override; otherwise requests identify as `honk/<version>`. |
 | `headers` | `{key,value}[]` | `[]` | No | Ordered extra request headers. |
 | `enabled` | bool | `true` | No | Disabled subscriptions are not restored, fetched, or refreshed. |
 | `last_updated` | datetime or null | null | No | Model metadata; the current core runtime does not update it. |
@@ -46,7 +46,7 @@ Only non-dae model consumers can set these values. `honk-tool sub` uses `custom`
 
 ## Fetch, persistence, and recovery
 
-`global.store_subscribe` defaults to `true`. When enabled, the runtime opens a private subscription store and fetches every enabled subscription immediately. A non-zero `update_interval` schedules later refreshes.
+`global.store_subscribe` defaults to `true`. When enabled, the runtime opens a private subscription store and fetches every enabled subscription immediately. Requests identify as `honk/<version>` unless `user_agent` supplies an override. A non-zero `update_interval` schedules later refreshes.
 
 | Property | Current behavior |
 | --- | --- |
@@ -64,9 +64,9 @@ On SIGHUP, subscriptions with the same URL retain their runtime ID. The reload c
 
 Failure handling preserves a usable runtime rather than clearing it:
 
-- HTTP or parse failure publishes no replacement nodes and performs no write, so the active nodes and last valid stored body remain.
+- HTTP, parse, or no-usable-node failure publishes no replacement nodes and performs no write, so the active nodes and last valid stored body remain.
 - A persistence-write failure is non-fatal after parsing: the newly parsed nodes are still returned for publication, while the atomic path never installs a partially written body. The next restart can therefore restore whichever complete valid body remains on disk.
-- An individual unsupported share link or Clash proxy is skipped. The whole body fails only when no supported nodes remain.
+- An individual unsupported share link or Clash proxy is skipped. The whole body fails only when no supported nodes remain; an empty result never clears the previous generation.
 
 Changing `global.store_subscribe` through SIGHUP is rejected as restart-required.
 

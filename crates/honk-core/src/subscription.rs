@@ -37,6 +37,14 @@ impl reqwest::dns::Resolve for BootstrapDnsResolve {
 }
 
 const SUBSCRIPTION_STORE_DIR: &str = ".sub";
+const DEFAULT_SUBSCRIPTION_USER_AGENT: &str = concat!("honk/", env!("CARGO_PKG_VERSION"));
+
+fn effective_subscription_user_agent(sub: &Subscription) -> &str {
+    sub.user_agent
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_SUBSCRIPTION_USER_AGENT)
+}
 
 fn default_store_root() -> PathBuf {
     honk_config::paths::resolve_artifact_path_with_legacy(
@@ -129,7 +137,7 @@ fn subscription_filename(sub: &Subscription) -> String {
     add_part(&mut hasher, sub.url.as_bytes());
     add_part(
         &mut hasher,
-        sub.user_agent.as_deref().unwrap_or_default().as_bytes(),
+        effective_subscription_user_agent(sub).as_bytes(),
     );
     for header in &sub.headers {
         add_part(&mut hasher, header.key.as_bytes());
@@ -230,11 +238,10 @@ impl SubscriptionManager {
         sub: &Subscription,
         store: Option<&SubscriptionStore>,
     ) -> anyhow::Result<Vec<Node>> {
-        let mut request = self.client.get(&sub.url);
-
-        if let Some(ref ua) = sub.user_agent {
-            request = request.header("User-Agent", ua);
-        }
+        let mut request = self
+            .client
+            .get(&sub.url)
+            .header("User-Agent", effective_subscription_user_agent(sub));
 
         for header in &sub.headers {
             request = request.header(&header.key, &header.value);
@@ -270,7 +277,7 @@ fn parse_subscription_content(sub: &Subscription, content: &str) -> anyhow::Resu
     }?;
 
     let mut seen = std::collections::HashSet::new();
-    Ok(nodes
+    let nodes = nodes
         .into_iter()
         .filter(|node| {
             seen.insert(node.id) || {
@@ -281,7 +288,11 @@ fn parse_subscription_content(sub: &Subscription, content: &str) -> anyhow::Resu
                 false
             }
         })
-        .collect())
+        .collect::<Vec<_>>();
+    if nodes.is_empty() {
+        anyhow::bail!("no usable nodes found in subscription");
+    }
+    Ok(nodes)
 }
 
 fn parse_base64_subscription(
@@ -1173,6 +1184,24 @@ not-proxies: []
         let result = parse_clash_subscription(yaml, None);
         assert!(result.is_err());
     }
+    #[test]
+    fn subscription_user_agent_defaults_and_allows_override() {
+        let mut sub = Subscription::default();
+        assert_eq!(
+            effective_subscription_user_agent(&sub),
+            DEFAULT_SUBSCRIPTION_USER_AGENT
+        );
+
+        sub.user_agent = Some("provider/1.0".into());
+        assert_eq!(effective_subscription_user_agent(&sub), "provider/1.0");
+
+        sub.user_agent = Some(String::new());
+        assert_eq!(
+            effective_subscription_user_agent(&sub),
+            DEFAULT_SUBSCRIPTION_USER_AGENT
+        );
+    }
+
     #[tokio::test]
     async fn fetch_error_chain_redacts_subscription_url() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1183,7 +1212,14 @@ not-proxies: []
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).await.unwrap();
+            let size = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            let expected = format!("user-agent: {DEFAULT_SUBSCRIPTION_USER_AGENT}");
+            assert!(
+                request
+                    .lines()
+                    .any(|line| { line.trim_end_matches('\r').eq_ignore_ascii_case(&expected) })
+            );
             stream
                 .write_all(
                     b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",

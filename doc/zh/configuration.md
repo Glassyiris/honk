@@ -251,7 +251,7 @@ dns {
 
 ## 订阅
 
-每个来源写作 `tag: 'url'`；`subtag(...)` 匹配的就是该 tag。默认 `global.store_subscribe: true` 时，成功获取并解析的原始正文会原子存储到 `.sub`。启动时先恢复有效存储再后台刷新；SIGHUP 会沿用活动订阅节点，仅在没有节点可沿用时从存储恢复；获取、解析或写入失败会保留活动节点与上一次有效正文。订阅节点仅存在于运行时。修改 `store_subscribe` 后需重启。
+每个来源写作 `tag: 'url'`；`subtag(...)` 匹配的就是该 tag。默认 `global.store_subscribe: true` 时，成功获取并解析的原始正文会原子存储到 `.sub`。请求默认使用 `honk/<version>`，可由订阅的可选 `user_agent` 覆盖。启动时先恢复有效且非空的存储再后台刷新；SIGHUP 会沿用活动订阅节点，仅在没有节点可沿用时从存储恢复；获取、解析或没有可用节点的失败会保留活动节点与上一次有效正文，空刷新不会清空上一代。订阅节点仅存在于运行时。修改 `store_subscribe` 后需重启。
 
 详见 [订阅参考](./reference/subscription.md)。
 

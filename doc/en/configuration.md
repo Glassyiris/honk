@@ -251,7 +251,7 @@ See the [DNS reference](./reference/dns.md).
 
 ## Subscriptions
 
-Declare each source as `tag: 'url'`; the tag is what `subtag(...)` matches. With the default `global.store_subscribe: true`, a successfully fetched and parsed raw body is atomically stored under `.sub`. Startup restores valid stored bodies before background refresh, SIGHUP carries active subscription nodes and restores storage only when no nodes survive, and fetch/parse/write failure preserves the active nodes and last valid body. Subscription nodes remain runtime-only. Changing `store_subscribe` requires a restart.
+Declare each source as `tag: 'url'`; the tag is what `subtag(...)` matches. With the default `global.store_subscribe: true`, a successfully fetched and parsed raw body is atomically stored under `.sub`. Requests use `honk/<version>` unless the subscription's optional `user_agent` overrides it. Startup restores valid non-empty stored bodies before background refresh, SIGHUP carries active subscription nodes and restores storage only when no nodes survive, and fetch/parse/no-usable-node failure preserves the active nodes and last valid body. An empty refresh never clears the previous generation. Subscription nodes remain runtime-only. Changing `store_subscribe` requires a restart.
 
 See the [subscription reference](./reference/subscription.md).
 
