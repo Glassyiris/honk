@@ -4779,7 +4779,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
             config.global.lan_interface = vec!["honk-lan0".into()];
             config.global.dial_mode = "domain++".into();
             config.global.wan_interface = vec!["honk-wan0".into()];
-            config.experimental.udp_nfqueue.enabled = true;
+            config.global.nfqueue_enable = true;
             config
                 .routing
                 .rules

@@ -19,7 +19,7 @@ honk-core [OPTIONS] [COMMAND]
 | `-b`, `--bpf-object PATH` | 内嵌目标文件 | 覆盖 `ebpf` 构建内嵌的目标文件。仅真实后端使用。 |
 | `--bpf-pin-root PATH` | `/sys/fs/bpf` | eBPF map 的 pin 根目录。 |
 | `-d`, `--debug` | 关 | 当 `RUST_LOG` 未提供有效 filter 时，选择 `debug` 作为默认控制台 filter。 |
-| `--mock-ebpf` | 关 | 使用 `MockEbpfBackend`，不加载内核 eBPF。启用 UDP NFQUEUE 的配置会被拒绝。 |
+| `--mock-ebpf` | 关 | 使用 `MockEbpfBackend`，不加载内核 eBPF。`global.nfqueue_enable: true` 的配置会被拒绝。 |
 
 Clap 还提供 `-h`/`--help` 和 `-V`/`--version`。
 
@@ -57,7 +57,7 @@ Clap 还提供 `-h`/`--help` 和 `-V`/`--version`。
 | `HONK_MI_COLLECT_SECS` | 启用 `mimalloc` 的 `honk-core` | 每个 owner worker 的空闲回收间隔。周期性 rendezvous 仅在其余 worker 均空闲时唤醒持续 park 的 owner，强制回收仍由各 owner 的 park 钩子执行。默认 `60`；`0` 同时关闭钩子与 rendezvous；无效值回退为 `60`。 |
 | `DAE_LOCATION_ASSET` | 两个二进制的 Geo 加载 | 最先检查其中的 `geoip.dat` 与 `geosite.dat`。 |
 
-UDP NFQUEUE 没有环境变量开关，只能通过 `experimental.udp_nfqueue.enabled` 启用；见 [Experimental 配置参考](./experimental.md)。
+UDP NFQUEUE 没有环境变量开关，默认由 `global.nfqueue_enable` 开启；设置为 `false` 可关闭。见[全局配置参考](./global.md)与 [NFQUEUE 设计](../design/nfqueue.md)。
 
 ## eBPF 与运行时路径
 

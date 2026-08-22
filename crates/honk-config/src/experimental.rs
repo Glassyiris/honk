@@ -71,21 +71,12 @@ impl Default for CacheFileConfig {
     }
 }
 
-/// Held-first-packet UDP decision pipeline.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct UdpNfqueueConfig {
-    #[serde(default)]
-    pub enabled: bool,
-}
-
 /// Experimental features configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ExperimentalConfig {
     #[serde(default)]
     pub clash_api: ClashApiConfig,
     #[serde(default)]
     pub cache_file: CacheFileConfig,
-    #[serde(default)]
-    pub udp_nfqueue: UdpNfqueueConfig,
 }

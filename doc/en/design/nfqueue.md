@@ -1,20 +1,18 @@
 # NFQUEUE held-first-packet UDP
 
-This document explains the optional fail-closed path that holds ambiguous LAN-forwarded UDP originals until userspace reaches a terminal direct, proxy, or block decision.
+This document explains the fail-closed path that holds ambiguous LAN-forwarded UDP originals until userspace reaches a terminal direct, proxy, or block decision.
 
 ## Activation and scope
 
-The complete configuration surface is:
+The path is enabled by default through `global.nfqueue_enable`. Set that key to `false` to disable it:
 
 ```dae
-experimental {
-    udp_nfqueue {
-        enabled: true
-    }
+global {
+    nfqueue_enable: false
 }
 ```
 
-`enabled` defaults to `false`. Changing it requires a process restart; reload rejects the change. Enabled startup requires an `ebpf`-feature build and the real eBPF backend. A build without `ebpf` and `--mock-ebpf` both fail startup instead of silently falling back. See the [experimental configuration reference](../reference/experimental.md) for the knob table.
+Changing the setting requires a process restart; reload rejects the change. Enabled startup requires an `ebpf`-feature build and the real eBPF backend. A build without `ebpf` and `--mock-ebpf` both fail startup instead of silently falling back. See the [global configuration reference](../reference/global.md) for the process-scoped knob.
 
 The hook is deliberately narrow:
 
@@ -136,4 +134,4 @@ With the API enabled, `GET /stats` exposes `udp.nfqueue` (the documented dotted 
 
 - [eBPF datapath](./datapath.md)
 - [Control plane](./control-plane.md)
-- [Experimental configuration reference](../reference/experimental.md)
+- [Global configuration reference](../reference/global.md)

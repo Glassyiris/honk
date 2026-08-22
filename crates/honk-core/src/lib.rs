@@ -391,10 +391,10 @@ fn validate_udp_nfqueue_runtime(enabled: bool, mock_ebpf: bool) -> anyhow::Resul
         return Ok(());
     }
     if mock_ebpf {
-        anyhow::bail!("experimental.udp_nfqueue requires the real eBPF backend");
+        anyhow::bail!("global.nfqueue_enable requires the real eBPF backend");
     }
     #[cfg(not(feature = "ebpf"))]
-    anyhow::bail!("experimental.udp_nfqueue requires a build with the ebpf feature");
+    anyhow::bail!("global.nfqueue_enable requires a build with the ebpf feature");
     #[cfg(feature = "ebpf")]
     Ok(())
 }
@@ -494,7 +494,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // effect and config log_level was silently ignored).
     let mut config = Config::from_file(cli.config.to_str().unwrap())?;
     config.validate()?;
-    validate_udp_nfqueue_runtime(config.experimental.udp_nfqueue.enabled, cli.mock_ebpf)?;
+    validate_udp_nfqueue_runtime(config.global.nfqueue_enable, cli.mock_ebpf)?;
     let requested_data_dir = PathBuf::from(&config.global.data_dir);
     let (runtime_data_dir, data_dir_creation_error) =
         prepare_runtime_data_dir(&requested_data_dir)?;

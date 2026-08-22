@@ -1,20 +1,18 @@
 # NFQUEUE 持有首包的 UDP 路径
 
-本文说明可选的 fail-closed 路径：它持有语义尚不明确的 LAN 转发 UDP 原始包，直到用户空间得到 direct、proxy 或 block 终态决策。
+本文说明 fail-closed 路径：它持有语义尚不明确的 LAN 转发 UDP 原始包，直到用户空间得到 direct、proxy 或 block 终态决策。
 
 ## 启用与范围
 
-完整配置面如下：
+该路径通过 `global.nfqueue_enable` 默认开启。设置为 `false` 可关闭：
 
 ```dae
-experimental {
-    udp_nfqueue {
-        enabled: true
-    }
+global {
+    nfqueue_enable: false
 }
 ```
 
-`enabled` 默认为 `false`。修改它必须重启进程；reload 会拒绝该变更。启用后，启动要求带 `ebpf` feature 的构建和真实 eBPF 后端。不带 `ebpf` 的构建和 `--mock-ebpf` 都会直接启动失败，而不是静默回退。配置键表见[实验性配置参考](../reference/experimental.md)。
+修改该设置必须重启进程；reload 会拒绝该变更。启用后，启动要求带 `ebpf` feature 的构建和真实 eBPF 后端。不带 `ebpf` 的构建和 `--mock-ebpf` 都会直接启动失败，而不是静默回退。进程级配置项见[全局配置参考](../reference/global.md)。
 
 该 hook 的范围刻意保持狭窄：
 
@@ -136,4 +134,4 @@ Retirement 以 `BPF_NOEXIST` 插入 `UDP_DECISION_RETIRE_FENCE[tuple] = token`�
 
 - [eBPF 数据路径](./datapath.md)
 - [控制平面](./control-plane.md)
-- [实验性配置参考](../reference/experimental.md)
+- [全局配置参考](../reference/global.md)

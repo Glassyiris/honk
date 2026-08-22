@@ -75,7 +75,7 @@ flowchart TB
 1. [数据路径](./datapath.md)在 LAN TC 分类 LAN 转发流量，并在 WAN TC 分类本机发起的 TCP/UDP。`direct(must)` 与路由时已安全的 direct 决策留在 Linux 原生路径；仍需用户态处理的决策不会卸载。
 2. [DNS 路径](./dns.md)让 TCP 和 UDP 目的端口 `53` 进入快速路径，跳过通用匹配循环并重定向到控制面。
 3. [数据路径](./datapath.md)将普通 proxy 和用户态决策经 `dae0` 重定向；在 `daens` 内，`sk_lookup` 将其指派给[控制面](./control-plane.md)的透明 TCP 或 UDP 监听器。
-4. 显式启用时，[NFQUEUE 暂存](./nfqueue.md)仅在 LAN TC 之后、conntrack/NAT 之前保留仍有歧义的 LAN 转发 UDP。每个暂存流在固定队列 `320` 中携带唯一决策 token；本机发起的 WAN 流量继续走普通透明路径。
+4. [NFQUEUE 暂存](./nfqueue.md)通过 `global.nfqueue_enable` 默认开启，仅在 LAN TC 之后、conntrack/NAT 之前保留仍有歧义的 LAN 转发 UDP。每个暂存流在固定队列 `320` 中携带唯一决策 token；本机发起的 WAN 流量继续走普通透明路径。
 5. [控制面](./control-plane.md)恢复原始目的地址并消费 eBPF 路由 handoff。handoff 缺失或结果为 `ControlPlaneRouting` 时进入用户态路由。
 6. [路由路径](./routing.md)可嗅探 TLS SNI、HTTP Host 或 QUIC Initial SNI，并在内核结果尚未终结时运行用户态 `Router`。
 7. [组层](./groups.md)应用 Clash 模式覆盖但不改写最终 `must`/`block` 结果，再将权威组策略选择解析为叶节点。显式选择 Score 时，它只在健康合格成员中按目标的 TCP/UDP 与目标地址族评分排名；省略策略仍使用 Selector。
@@ -109,7 +109,7 @@ flowchart TB
 | `mimalloc` | 是 | 引入 `mimalloc` 与 `libmimalloc-sys`，并将 mimalloc 安装为 `honk-core` 二进制的 allocator。在 Linux 上，程序会在启动 Tokio 前为当前进程禁用透明大页。 |
 | `rprx` | 是 | 启用 `honk-outbound/rprx`，注册 VLESS 与 VMess Handler，包括受支持的 VLESS Encryption 和 `xtls-rprx-vision` 路径。 |
 
-`mock-ebpf` 不是 Cargo feature。不带 `ebpf` 的构建使用 `MockEbpfBackend`，`--mock-ebpf` 则显式选择无特权开发路径。该模式不能运行 `experimental.udp_nfqueue.enabled = true`。
+`mock-ebpf` 不是 Cargo feature。不带 `ebpf` 的构建使用 `MockEbpfBackend`，`--mock-ebpf` 则显式选择无特权开发路径。该模式不能运行 `global.nfqueue_enable = true`。
 
 ## 作者与分工说明
 

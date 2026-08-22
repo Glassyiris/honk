@@ -19,7 +19,7 @@ honk-core [OPTIONS] [COMMAND]
 | `-b`, `--bpf-object PATH` | Embedded object | Override the object embedded by an `ebpf` build. Used only by the real backend. |
 | `--bpf-pin-root PATH` | `/sys/fs/bpf` | Root for pinned eBPF maps. |
 | `-d`, `--debug` | Off | Select `debug` as the default console filter when `RUST_LOG` does not provide a valid filter. |
-| `--mock-ebpf` | Off | Use `MockEbpfBackend` instead of loading kernel eBPF. A configuration with UDP NFQUEUE enabled is rejected. |
+| `--mock-ebpf` | Off | Use `MockEbpfBackend` instead of loading kernel eBPF. A configuration with `global.nfqueue_enable: true` is rejected. |
 
 Clap also provides `-h`/`--help` and `-V`/`--version`.
 
@@ -57,7 +57,7 @@ A real-datapath process holds the lock for its lifetime. `reload` verifies that 
 | `HONK_MI_COLLECT_SECS` | `honk-core` with `mimalloc` | Per-owner idle collection interval. A periodic rendezvous wakes persistently parked owners only while every other worker is idle; forced collection remains in each owner's park hook. Default `60`; `0` disables both the hook and rendezvous; an invalid value falls back to `60`. |
 | `DAE_LOCATION_ASSET` | Geo loading in both binaries | Directory checked first for `geoip.dat` and `geosite.dat`. |
 
-UDP NFQUEUE has no environment-variable switch. It is enabled only by `experimental.udp_nfqueue.enabled`; see the [experimental configuration reference](./experimental.md).
+UDP NFQUEUE has no environment-variable switch. It is enabled by default through `global.nfqueue_enable`; set that key to `false` to disable it. See the [global configuration reference](./global.md) and [NFQUEUE design](../design/nfqueue.md).
 
 ## eBPF and runtime paths
 

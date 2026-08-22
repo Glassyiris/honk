@@ -800,6 +800,9 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
     if let Some(v) = kv.get("dial_mode") {
         cfg.dial_mode = v.clone();
     }
+    if let Some(v) = kv.get("nfqueue_enable") {
+        cfg.nfqueue_enable = parse_checked_bool(v, "global.nfqueue_enable")?;
+    }
     if let Some(v) = kv.get("allow_insecure") {
         cfg.allow_insecure = parse_bool(v);
     }
@@ -1715,7 +1718,7 @@ fn parse_subscription_section(section: &Section) -> Result<Vec<Subscription>, cr
 
 fn parse_experimental_section(section: &Section) -> Result<ExperimentalConfig, crate::ConfigError> {
     let mut cfg = ExperimentalConfig::default();
-    let subs = split_nested_sections(&section.body, &["clash_api", "cache_file", "udp_nfqueue"])?;
+    let subs = split_nested_sections(&section.body, &["clash_api", "cache_file"])?;
 
     if let Some(unparsed) = subs.first().filter(|sub| !sub.body.trim().is_empty()) {
         let setting = unparsed.body.lines().next().unwrap_or_default().trim();
@@ -1756,17 +1759,6 @@ fn parse_experimental_section(section: &Section) -> Result<ExperimentalConfig, c
                 }
                 if let Some(v) = kv.get("store_dns") {
                     cfg.cache_file.store_dns = parse_bool(v);
-                }
-            }
-            "udp_nfqueue" => {
-                if let Some(key) = kv.keys().find(|key| key.as_str() != "enabled") {
-                    return Err(crate::ConfigError::Parse(format!(
-                        "unknown experimental.udp_nfqueue setting: {key}"
-                    )));
-                }
-                if let Some(v) = kv.get("enabled") {
-                    cfg.udp_nfqueue.enabled =
-                        parse_checked_bool(v, "experimental.udp_nfqueue.enabled")?;
                 }
             }
             _ => {}

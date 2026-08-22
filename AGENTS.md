@@ -6,7 +6,7 @@ This file is written for AI coding agents that need to understand, build, test, 
 
 `honk` is a Rust transparent-proxy engine for Linux, **inspired by** [dae](https://github.com/daeuniverse/dae) (eBPF datapath and configuration surface) and [sing-box](https://github.com/SagerNet/sing-box) (outbound groups, multi-protocol dialers, Clash-compatible API). It is not a line-for-line port of either: the kernel path follows dae's TC + match_set + `dae0`/`daens` model, the userspace outbound/control stack follows sing-box-oriented designs.
 
-- An eBPF transparent proxy engine (`honk-core`) normally intercepts with TC redirect and relays through userspace proxy handlers. Its default-off LAN UDP path can instead hold ambiguous originals in fixed NFQUEUE 320 for token-checked terminal decisions; this uses a wholly owned nftables table/chain but still installs no global `iptables` TPROXY rules.
+- An eBPF transparent proxy engine (`honk-core`) normally intercepts with TC redirect and relays through userspace proxy handlers. Its LAN UDP path holds ambiguous originals in fixed NFQUEUE 320 by default for token-checked terminal decisions; set `global.nfqueue_enable: false` to disable it. This uses a wholly owned nftables table/chain but still installs no global `iptables` TPROXY rules.
 - Shared configuration types and parsers (`honk-config`) parse the original dae `{ section { ... } }` configuration syntax — the primary and only documented config format.
 - Status: **experimental alpha** (`v0.0.1-alpha`). Expect breaking changes.
 - License: **GPL-3.0-only**. Repository: <https://github.com/daeuniverse/honk>
@@ -74,7 +74,7 @@ Configuration schema and parsers used by the rest of the project. Deps are pure-
 - `src/share_link.rs` — `Node::from_share_link`, the single share-link parser: SIP002 `ss://`, v2rayN `vmess://`, trojan/AnyTLS/Hy2/TUIC/Juicity/SOCKS5/VLESS, transports, REALITY, ECH, pins, and protocol tuning. VLESS uses canonical `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool`; omission preserves legacy IDs/behavior, and legacy `packetEncoding=xudp` maps to `xudp`. Ambiguous third-party mux/UoT/XUDP/packetaddr query parameters are rejected rather than guessed. Explicit `security=` overrides the historical VLESS TLS-on default, `security=reality` maps `pbk`/`sid`/`spx`, and `flow=` maps Vision. Node names never expose credentials; chain links parse only the first hop.
 - VLESS share links map `encryption=` and the normalized mode before deriving identity. Clash YAML subscriptions map enabled `smux`/`multiplex` H2MUX only when `protocol: h2mux` or an explicit `padding` boolean disambiguates it; enabled blocks missing both are rejected. `udp-over-tcp` version 0/2 maps to UoT v2, and `packet-encoding: xudp` or `xudp: true` maps to Single XUDP. Conflicts, packetaddr, unsupported mux protocols/tuning, and `udp: true` without an explicit packet mode are rejected. Mux.Cool requires the canonical share-link mode.
 - `src/routing.rs` — `RoutingRule` (condition + one outbound tag + priority + **`must` flag** — Go dae semantics: match does not finalize, continues searching), `RoutingCondition` (14 matcher lists incl. dscp, ip_version, mac, process_name, geoip/geosite), `RoutingOutbound` (single node/group tag; the unwired structured complex variants were removed), `ClashRuleDisplay` (Simple/Complex/Match; `/rules` keeps native types for simple matchers and uses `complex` only for compound, negated, or `must` dae statements), `RoutingConfig`.
-- `src/experimental.rs` — `ExperimentalConfig` { `clash_api: ClashApiConfig`, `cache_file: CacheFileConfig`, `udp_nfqueue: UdpNfqueueConfig { enabled }` }. The dae parser explicitly whitelists all three nested sections; `udp_nfqueue.enabled` defaults false and is the only NFQUEUE knob.
+- `src/experimental.rs` — `ExperimentalConfig` { `clash_api: ClashApiConfig`, `cache_file: CacheFileConfig` }. The dae parser explicitly whitelists both nested sections; NFQUEUE is configured by `GlobalConfig::nfqueue_enable`.
 - `src/subscription.rs`, `src/types.rs` (`NodeProtocol` 11 variants (Direct/Block reserved for the built-ins), `DialMode` ip/domain/domain+/domain++, `SubscriptionType`, `DnsProtocol`, plus the shared `default_true`/`parse_duration_secs` helpers), `src/error.rs` (`ConfigError`).
 
 ### `crates/honk-ebpf-common`
@@ -180,7 +180,7 @@ Outbound dialing, groups, and health checking. Re-exported by `honk-core` as `ho
 The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 
 - `default = ["clash-api", "mimalloc", "rprx"]`
-- `ebpf` — real eBPF backend via aya plus `honk-nfqueue` (requires Linux kernel 5.8+); without it the engine runs on `MockEbpfBackend`. `experimental.udp_nfqueue.enabled=true` rejects mock/no-`ebpf` startup.
+- `ebpf` — real eBPF backend via aya plus `honk-nfqueue` (requires Linux kernel 5.8+); without it the engine runs on `MockEbpfBackend`. `global.nfqueue_enable=true` rejects mock/no-`ebpf` startup.
 - `clash-api` — Clash-compatible REST/WS API (pulls in optional axum/tower-http).
 - `mimalloc` — shipped binary allocates through mimalloc (see Technology stack); build with `--no-default-features --features "clash-api,ebpf,rprx"` for a stock-malloc binary.
 - `rprx` — forwards to `honk-outbound/rprx`: registers VLESS (VLESS Encryption and xtls-rprx-vision) and VMess handlers; without it VLESS/VMess nodes parse fine but fail at dial with "No handler for protocol".
@@ -191,7 +191,7 @@ The Score group policy is always compiled and has no Cargo feature; Selector rem
 
 Module map:
 
-- `src/lib.rs` — engine entry `run()`, `Cli`/`ClashCommand`, resource-limit setup, backend selection, and startup rejection of enabled UDP NFQUEUE with mock/no-`ebpf`. Real datapath instances hold `/run/honk-core.lock` and publish their PID there for the `reload` subcommand; real mode creates the FD-owned `daens` namespace and an L2 netkit `dae0` pair through rtnetlink when supported, falling back to veth only on `EOPNOTSUPP`, then loads or reuses the persistent allocator pin and starts NFQUEUE before opening datapath admission.
+- `src/lib.rs` — engine entry `run()`, `Cli`/`ClashCommand`, resource-limit setup, backend selection, and startup rejection of enabled `global.nfqueue_enable` with mock/no-`ebpf`. Real datapath instances hold `/run/honk-core.lock` and publish their PID there for the `reload` subcommand; real mode creates the FD-owned `daens` namespace and an L2 netkit `dae0` pair through rtnetlink when supported, falling back to veth only on `EOPNOTSUPP`, then loads or reuses the persistent allocator pin and starts NFQUEUE before opening datapath admission.
 - `src/subscription.rs` + startup/reload orchestration in `src/lib.rs` — validated raw subscription bodies are atomically persisted when `global.store_subscribe` is true (default) under `<cwd>/.sub`, mode `0700` with `0600` hash-named files. Startup restores valid bodies before launching network refresh and skips the five-second first-fetch wait for restored subscriptions; SIGHUP carries active nodes and restores cache only where no nodes survive. Fetch/parse/write failure preserves active nodes and the last valid body; subscription nodes are never written back to the config.
 - `src/control/` — the control plane:
   - `mod.rs` — `ControlPlane`: TPROXY TCP/UDP listeners plus the supervised NFQUEUE runtime, one actor bounded to 256 entries and 8 MiB payload, fixed startup descriptor budgets, listener-FD publication, an independent one-second queue-pressure sampler, periodic locked token-exhaustion detection, 1/2/5/30-second retry backoff, safe generation rotation, and ordered startup/shutdown. Queue/listener/verdict faults are fatal branches of `run`; sequence exhaustion fences/drains and rotates only when the candidate and every higher generation through 3 are absent from complete live token-bound map scans.
@@ -200,7 +200,7 @@ Module map:
   - `sockets.rs` — real TPROXY listeners bind inside daens with transparent options and bypass marks; mock mode binds ordinary host-netns sockets without privileged options. The module also owns anyfrom replies, cached per-family transparent-DNS reply sockets, UDP `recvmsg` provenance, and `udp_fast_path`. UDP destination precedence is authoritative valid ORIGDST, then exact-DNS plus specified PKTINFO as `IP:53`, then a non-wildcard local bind; malformed or unspecified provenance fails closed.
   - `dns_control.rs` — `DnsController`: transport-neutral, generation-pinned query resolution shared by port-53 interception and `dns.bind`, an owned-permit 2048-query controller semaphore with REFUSED degradation, and outcome-driven `DOMAIN_ROUTING_MAP` projection. Ingress adapters own admission through reply completion.
   - `dns_listener.rs` — process-scoped `DnsListener`, created and owned by `ControlPlane::run`: synchronously/all-or-nothing binds configured unmarked UDP/TCP sockets in the host netns, accepts only complete single-question requests, clamps UDP replies to `512..=1232` while preserving wildcard destination address/interface via pktinfo, and serves persistent RFC 7766 TCP through the current `DnsServiceProvider`. Length/body reads and response writes are each capped at 30s; TCP consumes at most one quarter of the global connection budget. Shutdown stops admission and explicitly joins supervisors/children before DNS runtime retirement. Semantic bind changes on SIGHUP are restart-required; standalone `asis` fails because no intercepted destination exists.
-  - `reload.rs` — `apply_runtime_config` fences NFQUEUE readiness before rejecting admission, cancels/drains all token-bound initializers/correlator cells/retirements before generation publication, then reopens NFQUEUE last with the latest static/mode flags (or restores/reopens the old generation after rejection). A change to `experimental.udp_nfqueue.enabled` is restart-required. Existing Selector/UDP warm ownership rules remain generation-bound.
+  - `reload.rs` — `apply_runtime_config` fences NFQUEUE readiness before rejecting admission, cancels/drains all token-bound initializers/correlator cells/retirements before generation publication, then reopens NFQUEUE last with the latest static/mode flags (or restores/reopens the old generation after rejection). A change to `global.nfqueue_enable` is restart-required. Existing Selector/UDP warm ownership rules remain generation-bound.
   - `routing_matcher.rs` — eBPF routing push: **two-phase commit** — compile (no map writes), fill the inactive MatchSet bank, stage LPM values containing both generations, write all four packed `RoutingGroupMeta` entries, then flip the generation selector last. Physical tail slots are count-bounded; retired LPM keys remain for one transition so old-selector readers stay valid. Never call `clear_routes` on the push path. Port-only generic proxy rules punt to `ControlPlaneRouting` in domain dial modes.
   - `quic.rs` — QUIC v1/v2 Initial decryption and CRYPTO reassembly; `packet_sniffer.rs` owns bounded per-flow sniff sessions; `tcp_sniff.rs` owns the TCP negative cache. Their output feeds the same canonical initializer and may resolve a staged decision, but they do not own verdicts or a separate offload path.
   - `udp_endpoint.rs` — `UdpEndpointPool`: `Initializing`→`Ready` plus token/generation-aware `Retiring` tombstones, owned-`Bytes` admission for the one NFQUEUE payload allocation, FIFO/drop-newest budgets, no-replay sends, anyfrom replies, and exact cleanup. Direct/block remove the initializer as a kernel handoff; proxy transfers token/generation into `Ready`; delayed retirement cannot delete a newer tuple incarnation.
@@ -241,7 +241,7 @@ The `honk-tool` CLI toolbox (bin crate, diagnostics that don't belong in the eng
 
 ## Runtime architecture (data path)
 
-1. LAN TC classifies forwarded traffic. Ordinary proxy decisions still tc-redirect through `dae0`/`daens` to the transparent listeners, DNS 53 keeps its fast path, and route-time-safe direct stays native. With default-off `experimental { udp_nfqueue { enabled: true } }`, only an ambiguous LAN-forwarded UDP decision allocates a persistent unique token, publishes token-bound Pending state, and reaches fixed queue `320` after LAN TC but before conntrack/NAT. Host-originated WAN egress remains canonical TPROXY. Direct then runs Arm → FIFO marked `NF_ACCEPT` → Activate without a userspace direct socket/copy/retransmission/endpoint/connection entry; proxy commits state, transfers its one payload allocation to the canonical initializer, drops originals, and dials/sends once; block/cancel drop.
+1. LAN TC classifies forwarded traffic. Ordinary proxy decisions still tc-redirect through `dae0`/`daens` to the transparent listeners, DNS 53 keeps its fast path, and route-time-safe direct stays native. With `global.nfqueue_enable` enabled (the default), only an ambiguous LAN-forwarded UDP decision allocates a persistent unique token, publishes token-bound Pending state, and reaches fixed queue `320` after LAN TC but before conntrack/NAT. Host-originated WAN egress remains canonical TPROXY. Direct then runs Arm → FIFO marked `NF_ACCEPT` → Activate without a userspace direct socket/copy/retransmission/endpoint/connection entry; proxy commits state, transfers its one payload allocation to the canonical initializer, drops originals, and dials/sends once. Block/cancel drop.
 
 2. `honk-core` accepts and reads the original destination (`SO_ORIGINAL_DST` / `IP6T_SO_ORIGINAL_DST` for TCP with transparent-`local_addr` fallback; `IP_RECVORIGDSTADDR` cmsg for UDP).
 3. It takes the eBPF routing handoff entry (`routing_handoff_take`); if absent or `ControlPlaneRouting`, it falls back to the userspace `Router::route_with_must`. eBPF-decided `direct` with a nonzero mark is offloaded without userspace relay.
@@ -285,7 +285,7 @@ sudo ./target/release/honk-core --config /etc/honk/config.dae          # embedde
 sudo ./target/release/honk-core --config c.dae --bpf-object /path.o    # external object
 ```
 
-An enabled `experimental.udp_nfqueue` configuration requires this real-eBPF
+An enabled `global.nfqueue_enable` configuration requires this real-eBPF
 build and root. The same config is rejected with `--mock-ebpf` or a build without
 `ebpf`; changing the flag is restart-required.
 
@@ -442,24 +442,23 @@ with the `ja4probe` tool on .59 (`/usr/local/bin/ja4probe`, source at
 
 The primary (and only documented) format is the original **dae syntax** — `{ include { ... } global { ... } node { ... } group { ... } routing { ... } dns { ... } subscription { ... } experimental { ... } }`, parsed by `honk-config/src/parser/mod.rs`. `include` accepts bare/quoted `.dae` glob patterns, resolves relative paths from the entry config directory, merges entry sections before included sections, and rejects repeated/cyclic or escaping files. Root examples: `config.dae` (full), `config.min.dae` (minimal), `example.dae` (annotated). Field-by-field reference: `doc/en/reference/`; guide: `doc/en/configuration.md`.
 
-Held-first-packet UDP configuration has exactly one key:
+Held-first-packet UDP configuration has exactly one key in `global`:
 
 ```dae
-experimental {
-    udp_nfqueue {
-        enabled: true
-    }
+global {
+    nfqueue_enable: true
 }
 ```
 
-It defaults off and is restart-required. Enabled startup requires the real eBPF
-backend and an `ebpf` build; mock/no-`ebpf` is rejected. Scope is LAN-forwarded
-UDP only because `inet prerouting` follows LAN TC; host-originated WAN egress
-remains canonical TPROXY. DNS 53, internal/special, reverse, `must`, `block`, and
-already-safe direct flows are excluded. There are no queue/worker/timeout/failure
-policy knobs: queue `320` and fail-closed behavior are fixed. The exact owned
-nftables names are `inet honk_nfqueue` / `udp_decision`; same-netns firewall
-managers must not mutate them while honk runs.
+It defaults on and is restart-required. Enabled startup requires the real eBPF
+backend and an `ebpf` build; mock/no-`ebpf` is rejected. Set it to `false` for
+unprivileged mock development. Scope is LAN-forwarded UDP only because `inet
+prerouting` follows LAN TC; host-originated WAN egress remains canonical TPROXY.
+DNS 53, internal/special, reverse, `must`, `block`, and already-safe direct flows
+are excluded. There are no queue/worker/timeout/failure policy knobs: queue `320`
+and fail-closed behavior are fixed. The exact owned nftables names are
+`inet honk_nfqueue` / `udp_decision`; same-netns firewall managers must not mutate
+them while honk runs.
 
 - Group policy: omitting `policy` selects `Selector`; `policy: score` selects the always-compiled `Score` policy. Legacy `honk` is invalid. Score has no configuration knobs.
 - Built-ins: `direct` and `block` are auto-injected by `honk-core` (not the parser) as real `NodeProtocol::Direct`/`Block` nodes with the reserved `DIRECT_NODE_ID`/`BLOCK_NODE_ID` IDs; user nodes taking the `direct`/`block` names or those protocols fail validation. `block` drops traffic.
@@ -470,7 +469,7 @@ managers must not mutate them while honk runs.
 - DNS hosts snapshot: repeatable `dns.use_host` defaults to no sources. `true` adds standard `/etc/hosts`; each path adds an OxiDNS-compatible exact/domain/regexp/keyword rule file. Sources merge in declaration order and later duplicate definitions win. Relative paths resolve below `global.data_dir` with legacy working-directory fallback. Known IN A/AAAA names precede request rules and cache; a missing family returns NODATA without upstream I/O. SIGHUP reloads every source transactionally.
 - DNS upstream URI schemes: `udp://` (bare default), `tcp://`, `tcp+udp://`, `tls://` (DoT), `https://` (DoH), `h3://`/`http3://` (DoH3), `quic://` (DoQ); optional dial-path proxy `name: 'uri' -> <node|group>` (or legacy `outbound:` key).
 - Geo assets: `geoip.dat` / `geosite.dat` loaded at runtime (repo root is the common dev location).
-- Environment variables: `RUST_LOG`, `HONK_UI_DOWNLOAD_URL` (UI zip override), `HONK_POOL_DISABLE=1` (bypass connection pool), `HONK_MI_COLLECT_SECS` (mimalloc builds only: per-owner park/sweep collection interval, default 60s, `0` disables). UDP NFQUEUE is configured only by `experimental.udp_nfqueue.enabled`, never an environment variable.
+- Environment variables: `RUST_LOG`, `HONK_UI_DOWNLOAD_URL` (UI zip override), `HONK_POOL_DISABLE=1` (bypass connection pool), `HONK_MI_COLLECT_SECS` (mimalloc builds only: per-owner park/sweep collection interval, default 60s, `0` disables). UDP NFQUEUE is configured only by `global.nfqueue_enable`, never an environment variable.
 - Default runtime paths: config `/etc/honk/config.dae`, BPF pin root `/sys/fs/bpf`, embedded BPF object unless `--bpf-object`.
 
 ## Deployment

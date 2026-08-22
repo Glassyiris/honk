@@ -91,7 +91,7 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 | `OUTBOUND_STATS` | 直接以出站编号为索引的 256 项 per-CPU 数组。每个 32-byte 值紧凑保存 `tx_packets`、`tx_bytes`、`rx_packets`、`rx_bytes`；当前 ABI 不使用 `outbound * 4 + counter` 索引。 |
 | `LISTEN_SOCKET_MAP` | 16 槽 `SockMap`；key `0..=9` 保存两个 TCP 和八个 UDP 透明监听器。 |
 | `DATAPATH_STATE_MAP` | 单槽准入数组。零值不改动地放行流量；非零值启用分类与重定向。 |
-| `DATAPATH_FLAGS_MAP` | 单槽运行时策略字：Rule/Direct 卸载属性及 NFQUEUE enabled/ready 栅栏。新流分类读取它；已建立流的 direct 卸载使用缓存元数据。 |
+| `DATAPATH_FLAGS_MAP` | 单槽运行时策略字：Rule/Direct 卸载属性、`global.nfqueue_enable` 及 NFQUEUE ready 栅栏。新流分类读取它；已建立流的 direct 卸载使用缓存元数据。 |
 | `COOKIE_PID_MAP` | 不预分配的 65,536 项套接字 cookie 到 PID/`comm` 的 hash，用于 `pname` 路由和识别控制平面。 |
 | `CONN_STATE_OCCUPANCY` | 两槽 per-CPU 累计插入/eBPF 删除计数；结合用户空间删除计数估算占用率。 |
 | `BPF_STATS_MAP` | 五个计数器：UDP/TCP conn-state overflow，以及 redirect、handoff 和 cookie map 插入失败。 |

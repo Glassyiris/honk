@@ -18,17 +18,15 @@
 
 ### 实验性首包保留 UDP 决策
 
-默认关闭的 UDP NFQUEUE 路径只保留仍需用户态判定的 **LAN 转发**首包：报文已经过 LAN TC，但尚未进入 conntrack/NAT。通过进程配置启用：
+UDP NFQUEUE 路径默认开启，只保留仍需用户态判定的 **LAN 转发**首包：报文已经过 LAN TC，但尚未进入 conntrack/NAT。通过进程配置关闭：
 
 ```dae
-experimental {
-    udp_nfqueue {
-        enabled: true
-    }
+global {
+    nfqueue_enable: false
 }
 ```
 
-修改 `experimental.udp_nfqueue.enabled` 后必须重启。启用时必须使用带 `ebpf` feature 的构建和真实 eBPF 后端；`--mock-ebpf` 或不带 `ebpf` 的构建会在启动时被拒绝。本机发起的 WAN 出口流量仍走规范 TPROXY 路径。DNS 53、`must`、`block` 和已经可以安全地在路由时直连的决策不会进入 NFQUEUE；只暂存仍可能在用户态改判的决策。
+修改 `global.nfqueue_enable` 后必须重启。该路径必须使用带 `ebpf` feature 的构建和真实 eBPF 后端；`--mock-ebpf` 或不带 `ebpf` 的构建会在启动时被拒绝。本机发起的 WAN 出口流量仍走规范 TPROXY 路径。DNS 53、`must`、`block` 和已经可以安全地在路由时直连的决策不会进入 NFQUEUE；只暂存仍可能在用户态改判的决策。
 
 该路径拥有 raw-netlink 队列 `320` 和 nftables 对象 `inet honk_nfqueue` / `udp_decision`；honk 运行期间，同一网络命名空间中的防火墙管理器不得修改它们。Direct 释放被保留的 skb，Proxy 把唯一的 payload 副本交给正常 UDP 初始化器，block/取消则丢弃报文。ingest actor 最多保留 256 个报文和 8 MiB payload；每个报文从 listener 收到时起都保留固定的三秒绝对期限。启用 Clash API 后，`/stats.udp.nfqueue` 会暴露 actor 深度、字节数、最老年龄以及明确的内核统计可用状态与读取失败数。完整不变量和指标 schema 见 [NFQUEUE 设计](doc/zh/design/nfqueue.md)与 [API 参考](doc/zh/reference/api.md)。
 
@@ -59,7 +57,7 @@ crates/
 └── honk-ebpf/          # 内核 eBPF 程序（bpfel-unknown-none；不在 workspace 内）
 ```
 
-高层路径：通常为 **TC 分类 → 经 `dae0`/`daens` redirect → sk_lookup 透明监听 → 用户态拨号/中继**；启用实验配置后，仍有歧义的 LAN 转发 UDP 会改为 **TC 暂存 → NFQUEUE 保留原始 skb → token 校验后的 direct/proxy/block 提交**。细节见设计文档。
+高层路径：通常为 **TC 分类 → 经 `dae0`/`daens` redirect → sk_lookup 透明监听 → 用户态拨号/中继**；`global.nfqueue_enable` 开启时（默认开启），仍有歧义的 LAN 转发 UDP 会改为 **TC 暂存 → NFQUEUE 保留原始 skb → token 校验后的 direct/proxy/block 提交**。细节见设计文档。
 
 ### 与 dae 的差异（eBPF / 控制面）
 

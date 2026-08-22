@@ -49,7 +49,8 @@ fn config_for_upstream(address: std::net::SocketAddr, protocol: DnsProtocol) -> 
     config
 }
 
-fn control_plane(config: Config, forwarder: Arc<DnsForwarder>) -> ControlPlane {
+fn control_plane(mut config: Config, forwarder: Arc<DnsForwarder>) -> ControlPlane {
+    config.global.nfqueue_enable = false;
     ControlPlane::new(
         config.clone(),
         Box::new(MockEbpfBackend::new()),

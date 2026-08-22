@@ -12,7 +12,7 @@
 
 启动时保持内核准入关闭，直到用户态能够接收每个重定向流：
 
-1. 加载并校验配置，选择 `global.data_dir`，在 mock 或非 `ebpf` 构建上拒绝启用的 `experimental.udp_nfqueue`，提升 `RLIMIT_NOFILE`，并取得一次不可变的描述符预算快照。
+1. 加载并校验配置，选择 `global.data_dir`，在 mock 或非 `ebpf` 构建上拒绝 `global.nfqueue_enable`，提升 `RLIMIT_NOFILE`，并取得一次不可变的描述符预算快照。
 2. 在网络刷新前恢复持久化订阅。只有没有有效已恢复正文的订阅才参与五秒首次拉取宽限期。
 3. 选择后端。真实模式取得 `/run/honk-core.lock`，并把进程 PID 发布到已锁文件；`honk-core reload` 读取该 PID 并发送 `SIGHUP`。Mock 模式不取得进程全局锁。
 4. 在真实模式下，通过 rtnetlink 创建由 FD 持有的 `daens` 命名空间和 `dae0`/`dae0peer` 链路。引擎优先尝试 L2 netkit pair，仅在内核报告不支持 netkit 时回退到 veth。进程留在宿主命名空间；只有同步的 socket、链路和挂载操作通过有作用域的 `setns` 调用进入 `daens`。
@@ -22,7 +22,7 @@
 8. 绑定透明 TCP/UDP listener，发布完整 listener FD 集，启动独立 DNS 和 UDP 接收循环，再启动可选 NFQUEUE 服务及其 ingest actor、correlator、watchdog 和统计采样器。
 9. 检查 NFQUEUE 健康状态，发布其 ready 状态，开放 pending verdict 准入，最后把 `DATAPATH_STATE_MAP[0]` 设为 ready。随后 TCP accept loop 在控制平面 supervisor 中运行。
 
-`RealEbpfBackend` 负责 aya program、map、link、持久分配器处理和真实 NFQUEUE 集成。`MockEbpfBackend` 在没有特权内核资源时提供相同控制平面接口。使用 `--mock-ebpf` 或 `honk-core` 构建时未启用 `ebpf` feature，都会拒绝启用的 `experimental.udp_nfqueue`。
+`RealEbpfBackend` 负责 aya program、map、link、持久分配器处理和真实 NFQUEUE 集成。`MockEbpfBackend` 在没有特权内核资源时提供相同控制平面接口。使用 `--mock-ebpf` 或 `honk-core` 构建时未启用 `ebpf` feature，都会拒绝 `global.nfqueue_enable`。
 
 关闭时在资源消失前逆序释放所有权：fence NFQUEUE、关闭数据路径准入、拒绝新的用户态工作、取消并排空持有的 verdict 和 UDP initializer、停止 UDP driver 和 removal 处理、停止接口 watcher、卸载 BPF hook、最多用五秒排空已接受流、退役出站运行时、停止 NFQUEUE、停止 DNS controller 和 persistence，并清理 generation 持有的 BPF 状态。普通清理保留固定分配器。随后 listener 和 `daens`/link-pair 所有权离开作用域。
 
@@ -149,7 +149,7 @@ Accepted TCP socket 只有在其规范正向 `CONN_STATE_MAP` 条目仍存在时
 | DNS listener | `dns.bind` endpoint 或 transport 的语义变更 |
 | Clash API | `experimental.clash_api.external_controller`、`external_ui`、`secret`、`default_mode` |
 | 持久化 | 任意 `experimental.cache_file` 变更 |
-| NFQUEUE | `experimental.udp_nfqueue.enabled` |
+| NFQUEUE | `global.nfqueue_enable` |
 
 当旧值和新值都能解析时，`dns.bind` 的语义比较使用解析后的 bind endpoint，因此描述同一 endpoint 的纯拼写变更不会强制重启。
 

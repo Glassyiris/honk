@@ -12,7 +12,7 @@ honk uses dae configuration syntax. The runtime sections and CLI entry point are
 | `routing` | Apply ordered traffic rules and a fallback outbound. | [Routing reference](./reference/routing.md) |
 | `dns` | Configure listeners, upstreams, request/response policy, and cache behavior. | [DNS reference](./reference/dns.md) |
 | `subscription` | Fetch remote node lists. | [Subscription reference](./reference/subscription.md) |
-| `experimental` | Enable the Clash API, persistent cache, or UDP NFQUEUE path. | [Experimental reference](./reference/experimental.md) |
+| `experimental` | Enable the Clash API or persistent cache. | [Experimental reference](./reference/experimental.md) |
 | CLI | Select a config, backend, object file, or local command. | [CLI reference](./reference/cli.md) |
 
 The built-in outbounds `direct` and `block` are injected at startup and may be used in groups and routing rules.
@@ -255,15 +255,15 @@ Declare each source as `tag: 'url'`; the tag is what `subtag(...)` matches. With
 
 See the [subscription reference](./reference/subscription.md).
 
-## Enabling the Clash API, cache file, and UDP NFQUEUE
+## Enabling the Clash API, cache file, and held-first-packet UDP
 
 **Clash API.** A non-empty `experimental.clash_api.external_controller` enables the server. Keep it on loopback unless a firewall and non-empty `secret` protect it; an empty secret disables API authentication. A relative `external_ui` resolves through `data_dir` and may be downloaded in the background when missing.
 
 **Cache file.** Set `experimental.cache_file.enabled: true` to persist Selector choices and Clash mode; `store_dns: true` also persists eligible DNS answers. A relative `path` uses `data_dir`, subject to the legacy-path rule above.
 
-**UDP NFQUEUE.** `experimental.udp_nfqueue.enabled: true` enables the held-first-packet path only for ambiguous LAN-forwarded UDP. It requires root, a build with `ebpf`, and the real backend; mock startup is rejected. The setting is restart-required and fail-closed. honk exclusively owns queue `320` and nftables `inet honk_nfqueue` / `udp_decision`; a firewall manager must not mutate them while honk runs.
+**Held-first-packet UDP.** `global.nfqueue_enable` defaults to `true`; set it to `false` to disable NFQUEUE staging for ambiguous LAN-forwarded UDP. The setting is restart-required. Enabled startup requires root, a build with `ebpf`, and the real backend; mock startup is rejected. honk exclusively owns queue `320` and nftables `inet honk_nfqueue` / `udp_decision`; a firewall manager must not mutate them while honk runs.
 
-See the [experimental reference](./reference/experimental.md) and [UDP NFQUEUE design](./design/nfqueue.md).
+See the [global reference](./reference/global.md), [experimental reference](./reference/experimental.md), and [UDP NFQUEUE design](./design/nfqueue.md).
 
 ## Warm-up and dial budget
 
@@ -304,7 +304,7 @@ See the [CLI reference](./reference/cli.md).
 2. Ensure every routing rule/fallback, DNS fallback, group `final`, and `->` proxy target names an existing group, node, `direct`, or `block` as appropriate.
 3. For first-connection domain rules, use `dial_mode: domain`/`domain++` or ensure client DNS passes through honk so the domain routing map is populated.
 4. After changing groups or policies, SIGHUP rebuilds `GroupManager`; a still-valid Selector choice migrates to the replacement generation.
-5. Changing `experimental.udp_nfqueue.enabled` requires a restart; verify the real eBPF backend is active and the firewall manager leaves `inet honk_nfqueue` / `udp_decision` untouched.
+5. Changing `global.nfqueue_enable` requires a restart; verify the real eBPF backend is active and the firewall manager leaves `inet honk_nfqueue` / `udp_decision` untouched.
 6. When adding or changing configuration fixtures, run `cargo test -p honk-config` to keep parser examples valid.
 
 ## Related docs

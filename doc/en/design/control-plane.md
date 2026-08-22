@@ -12,7 +12,7 @@ The main implementation is `crates/honk-core/src/control/`. It consumes `EbpfBac
 
 Startup keeps kernel admission closed until userspace can receive every redirected flow:
 
-1. Load and validate the configuration, select `global.data_dir`, reject an enabled `experimental.udp_nfqueue` on a mock or non-`ebpf` build, raise `RLIMIT_NOFILE`, and take one immutable descriptor-budget snapshot.
+1. Load and validate the configuration, select `global.data_dir`, reject `global.nfqueue_enable` on a mock or non-`ebpf` build, raise `RLIMIT_NOFILE`, and take one immutable descriptor-budget snapshot.
 2. Restore persisted subscriptions before network refresh. Only subscriptions without a valid restored body participate in the five-second first-fetch grace period.
 3. Select the backend. Real mode takes `/run/honk-core.lock` and publishes the process PID in the locked file; `honk-core reload` reads that PID and sends `SIGHUP`. Mock mode does not take the process-global lock.
 4. In real mode, create the FD-owned `daens` namespace and the `dae0`/`dae0peer` link through rtnetlink. The engine tries an L2 netkit pair first and falls back to veth only when the kernel reports netkit unsupported. The process stays in the host namespace; only synchronous socket, link, and attachment operations enter `daens` through scoped `setns` calls.
@@ -22,7 +22,7 @@ Startup keeps kernel admission closed until userspace can receive every redirect
 8. Bind the transparent TCP/UDP listeners, publish the complete listener FD set, start the standalone DNS and UDP receive loops, then start the optional NFQUEUE service and its ingest actor, correlator, watchdog, and statistics sampler.
 9. Check NFQUEUE health, publish its ready state, open pending verdict admission, and set `DATAPATH_STATE_MAP[0]` ready last. The TCP accept loop then runs in the control-plane supervisor.
 
-`RealEbpfBackend` owns aya programs, maps, links, persistent allocator handling, and real NFQUEUE integration. `MockEbpfBackend` provides the same control-plane interface without privileged kernel resources. An enabled `experimental.udp_nfqueue` is rejected with `--mock-ebpf` and when `honk-core` is built without the `ebpf` feature.
+`RealEbpfBackend` owns aya programs, maps, links, persistent allocator handling, and real NFQUEUE integration. `MockEbpfBackend` provides the same control-plane interface without privileged kernel resources. `global.nfqueue_enable` is rejected with `--mock-ebpf` and when `honk-core` is built without the `ebpf` feature.
 
 Shutdown reverses ownership before resources disappear: fence NFQUEUE, close datapath admission, reject new userspace work, cancel and drain held verdicts and UDP initializers, stop UDP drivers and removal processing, stop the interface watcher, detach BPF hooks, drain accepted flows for up to five seconds, retire the outbound runtime, stop NFQUEUE, stop the DNS controller and persistence, and clean up generation-owned BPF state. Ordinary cleanup preserves the pinned allocator. Listener and `daens`/link-pair ownership then falls out of scope.
 
@@ -149,7 +149,7 @@ The current process-scoped consumers reject a SIGHUP reload when any of these va
 | DNS listener | Semantic `dns.bind` endpoint or transport change |
 | Clash API | `experimental.clash_api.external_controller`, `external_ui`, `secret`, `default_mode` |
 | Persistence | Any `experimental.cache_file` change |
-| NFQUEUE | `experimental.udp_nfqueue.enabled` |
+| NFQUEUE | `global.nfqueue_enable` |
 
 Semantic comparison of `dns.bind` uses the parsed bind endpoint when both old and new values parse, so spelling-only changes that describe the same endpoint do not force a restart.
 

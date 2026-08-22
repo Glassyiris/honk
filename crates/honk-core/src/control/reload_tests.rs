@@ -37,11 +37,11 @@ fn subscription_store_toggle_requires_restart() {
 fn udp_nfqueue_toggle_requires_restart() {
     let current = Config::default();
     let mut replacement = current.clone();
-    replacement.experimental.udp_nfqueue.enabled = !current.experimental.udp_nfqueue.enabled;
+    replacement.global.nfqueue_enable = !current.global.nfqueue_enable;
 
     assert_eq!(
         restart_required_changes(&current, &replacement),
-        vec!["experimental.udp_nfqueue.enabled"]
+        vec!["global.nfqueue_enable"]
     );
 }
 

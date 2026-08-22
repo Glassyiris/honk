@@ -21,7 +21,7 @@ impl ControlPlane {
         let config = self.config.read().await;
         let tproxy_port = config.global.tproxy_port;
         let tproxy_mark = config.global.tproxy_mark;
-        let udp_nfqueue_enabled = config.experimental.udp_nfqueue.enabled;
+        let udp_nfqueue_enabled = config.global.nfqueue_enable;
         let dns_bind_endpoint = config
             .dns
             .bind_endpoint()

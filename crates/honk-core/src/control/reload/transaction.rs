@@ -168,9 +168,7 @@ impl ControlPlane {
         let datapath_flags = if let Some(handle) = self.datapath_flags.clone() {
             handle
         } else {
-            if current_config.experimental.udp_nfqueue.enabled
-                || new_config.experimental.udp_nfqueue.enabled
-            {
+            if current_config.global.nfqueue_enable || new_config.global.nfqueue_enable {
                 error!("datapath flags writer is unavailable during NFQUEUE reload");
                 return false;
             }

@@ -65,6 +65,10 @@ pub struct GlobalConfig {
     pub wan_interface: Vec<String>,
     #[serde(default)]
     pub auto_config_kernel_parameter: bool,
+    /// Enable held-first-packet NFQUEUE staging for ambiguous LAN-forwarded UDP.
+    /// This process-scoped setting requires the real eBPF backend and a restart.
+    #[serde(default = "crate::types::default_true")]
+    pub nfqueue_enable: bool,
     /// Root for generated state and relative runtime-supplied assets.
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
@@ -320,6 +324,7 @@ impl Default for GlobalConfig {
             lan_interface: vec![],
             wan_interface: vec![],
             auto_config_kernel_parameter: false,
+            nfqueue_enable: true,
             data_dir: default_data_dir(),
             store_subscribe: default_store_subscribe(),
             tcp_check_url: default_tcp_check_urls(),
