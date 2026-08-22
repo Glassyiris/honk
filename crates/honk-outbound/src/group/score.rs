@@ -17,6 +17,7 @@ const RELIABILITY_CLOSE: f64 = 0.05;
 const SCORE_EVIDENCE_HALF_LIFE: Duration = Duration::from_secs(30 * 60);
 const MIN_TRAINED_EVIDENCE: f64 = 0.5;
 const SCORE_SWITCH_MARGIN: f64 = 0.01;
+const SCORE_FAILURE_FORGIVENESS_THRESHOLD: f64 = 0.01;
 const SCORE_EXPLORATION_MIN_PERIOD: u64 = 16;
 const SCORE_EXPLORATION_MAX_PERIOD: u64 = 64;
 const MIN_THROUGHPUT_DURATION: Duration = Duration::from_secs(1);
@@ -761,7 +762,7 @@ fn best_index(
 fn keep_incumbent(incumbent: &ScoreSnapshot, best: &ScoreSnapshot) -> bool {
     incumbent.completed >= MIN_TRAINED_EVIDENCE
         && best.completed >= MIN_TRAINED_EVIDENCE
-        && incumbent.failures == 0.0
+        && incumbent.failures < SCORE_FAILURE_FORGIVENESS_THRESHOLD
         && utility(best) - utility(incumbent) < SCORE_SWITCH_MARGIN
 }
 
@@ -1929,6 +1930,70 @@ mod tests {
         assert_eq!(state.rank_at("score", &context, &node_refs, now), 0);
         inner_update_response(&state, key(nodes[1].id), 1.0);
         assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
+    }
+
+    #[test]
+    fn aged_failure_restores_incumbent_margin() {
+        // Given: two trained nodes and negligible failure evidence on the incumbent.
+        let nodes = [node("a"), node("b")];
+        let node_refs = [&nodes[0], &nodes[1]];
+        let context = context("example.com", IpVersion::V4);
+        let state = ScorePolicyState::default();
+        state.publish_membership(nodes.iter().map(|node| ("score".into(), node.id)));
+        let start = Instant::now();
+        let now = start + Duration::from_secs(SCORE_EVIDENCE_HALF_LIFE.as_secs() * 8);
+        {
+            let mut inner = state.inner.lock();
+            for (index, node) in nodes.iter().enumerate() {
+                let incumbent = index == 0;
+                inner.aggregate.put(
+                    AggregateKey {
+                        group: "score".into(),
+                        network: SelectionNetwork::Tcp,
+                        family: Some(IpVersion::V4),
+                        node_id: node.id,
+                    },
+                    Stats {
+                        attempts: 256.0 + f64::from(incumbent),
+                        setup_success: 256.0,
+                        setup_failure: f64::from(incumbent),
+                        useful_success: 256.0,
+                        useful_failure: f64::from(incumbent),
+                        first_response_ms: WeightedMean {
+                            sum: 256_000.0,
+                            weight: 256.0,
+                        },
+                        updated_at: Some(start),
+                        selected_at: u64::from(incumbent),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        let snapshots: Vec<_> = {
+            let inner = state.inner.lock();
+            nodes
+                .iter()
+                .map(|node| score_snapshot(&inner, "score", &context, node.id, now))
+                .collect()
+        };
+        assert!(
+            snapshots[0].failures > 0.0
+                && snapshots[0].failures < SCORE_FAILURE_FORGIVENESS_THRESHOLD
+        );
+        assert!(
+            snapshots
+                .iter()
+                .all(|score| score.completed >= MIN_TRAINED_EVIDENCE)
+        );
+        assert!(utility(&snapshots[1]) > utility(&snapshots[0]));
+        assert!(utility(&snapshots[1]) - utility(&snapshots[0]) < SCORE_SWITCH_MARGIN);
+
+        // When: the scorer ranks the candidates.
+        let selected = state.rank_at("score", &context, &node_refs, now);
+
+        // Then: the normal small-gain protection retains the incumbent.
+        assert_eq!(selected, 0);
     }
 
     fn inner_update_response(state: &ScorePolicyState, key: AggregateKey, latency_ms: f64) {
