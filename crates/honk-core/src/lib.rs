@@ -386,12 +386,12 @@ fn acquire_instance_lock(
     }
 }
 
-fn prepare_nfqueue_startup(config: &mut Config, mock_ebpf: bool) {
+fn prepare_nfqueue_startup(config: &mut Config, mock_mode: bool) {
     if !config.global.nfqueue_enable {
         return;
     }
 
-    let reason = if mock_ebpf {
+    let reason = if mock_mode {
         Some("the mock eBPF backend was selected".to_string())
     } else {
         #[cfg(not(feature = "ebpf"))]
@@ -574,7 +574,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             "Runtime data directory is unusable; using process working directory"
         );
     }
-    prepare_nfqueue_startup(&mut config, cli.mock_ebpf);
     info!(directory = %honk_config::paths::data_dir().display(), "Runtime data directory configured");
     if let Some(path) = log_file_path.as_ref() {
         info!(path = %path.display(), "File logging enabled");
@@ -773,6 +772,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     } else {
         Some(acquire_instance_lock(&cli.bpf_pin_root)?)
     };
+
+    // The old instance owns queue 320 until this lock is released. Check
+    // NFQUEUE only after the handoff so a transient busy result cannot turn
+    // a healthy restart into a permanently degraded process.
+    prepare_nfqueue_startup(&mut config, mock_mode);
 
     // Create the dae0 link pair before eBPF load so PARAM.dae0_ifindex is correct.
     // dae0peer stays in the host namespace during the dae0 attach, then moves

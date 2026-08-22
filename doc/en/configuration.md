@@ -251,7 +251,7 @@ See the [DNS reference](./reference/dns.md).
 
 ## Subscriptions
 
-Declare each source as `tag: 'url'`; the tag is what `subtag(...)` matches. With the default `global.store_subscribe: true`, a successfully fetched and parsed raw body is atomically stored under `.sub`. Requests use `honk/<version>` unless the subscription's optional `user_agent` overrides it. Startup restores valid non-empty stored bodies before background refresh, SIGHUP carries active subscription nodes and restores storage only when no nodes survive, and fetch/parse/no-usable-node failure preserves the active nodes and last valid body. An empty refresh never clears the previous generation. Subscription nodes remain runtime-only. Changing `store_subscribe` requires a restart.
+Declare each source as `tag: 'url'`; the tag is what `subtag(...)` matches. With the default `global.store_subscribe: true`, a successfully fetched and parsed raw body is atomically stored under `.sub`. Requests use `honk/<version>` unless the subscription's optional `user_agent` overrides it; the cache key uses the configured override (unset or empty is stable), so the versioned default request header does not invalidate stored bodies on upgrade. Startup restores valid non-empty stored bodies before background refresh, SIGHUP carries active subscription nodes and restores storage only when no nodes survive, and fetch/parse/no-usable-node failure preserves the active nodes and last valid body. An empty refresh never clears the previous generation. Subscription nodes remain runtime-only. Changing `store_subscribe` requires a restart.
 
 See the [subscription reference](./reference/subscription.md).
 
@@ -261,7 +261,7 @@ See the [subscription reference](./reference/subscription.md).
 
 **Cache file.** Set `experimental.cache_file.enabled: true` to persist Selector choices and Clash mode; `store_dns: true` also persists eligible DNS answers. A relative `path` uses `data_dir`, subject to the legacy-path rule above.
 
-**Held-first-packet UDP.** `global.nfqueue_enable` defaults to `true`; set it to `false` to disable NFQUEUE staging for ambiguous LAN-forwarded UDP. The setting is restart-required. If startup uses mock eBPF, lacks the `ebpf` feature, or fails the queue/nftables preflight, honk logs a warning and disables NFQUEUE for that process without rewriting the config file. honk exclusively owns queue `320` and nftables `inet honk_nfqueue` / `udp_decision`; a firewall manager must not mutate them while honk runs.
+**Held-first-packet UDP.** `global.nfqueue_enable` defaults to `true`; set it to `false` to disable NFQUEUE staging for ambiguous LAN-forwarded UDP. The setting is restart-required. If startup uses mock eBPF, lacks the `ebpf` feature, or fails the fixed-queue preflight, honk logs a warning and disables NFQUEUE for that process without rewriting the config file. After the real-instance lock is acquired, startup binds queue `320` and reclaims the stale owned nftables table before publishing `inet honk_nfqueue` / `udp_decision`; a firewall manager must not mutate those reserved objects while honk runs.
 
 See the [global reference](./reference/global.md), [experimental reference](./reference/experimental.md), and [UDP NFQUEUE design](./design/nfqueue.md).
 

@@ -127,6 +127,11 @@ impl SubscriptionStore {
     }
 }
 
+fn subscription_cache_user_agent(sub: &Subscription) -> &str {
+    // The request UA may change with the binary; the cache identity must not.
+    sub.user_agent.as_deref().unwrap_or_default()
+}
+
 fn subscription_filename(sub: &Subscription) -> String {
     fn add_part(hasher: &mut Sha256, value: &[u8]) {
         hasher.update((value.len() as u64).to_be_bytes());
@@ -137,7 +142,7 @@ fn subscription_filename(sub: &Subscription) -> String {
     add_part(&mut hasher, sub.url.as_bytes());
     add_part(
         &mut hasher,
-        effective_subscription_user_agent(sub).as_bytes(),
+        subscription_cache_user_agent(sub).as_bytes(),
     );
     for header in &sub.headers {
         add_part(&mut hasher, header.key.as_bytes());
@@ -1202,6 +1207,97 @@ not-proxies: []
         );
     }
 
+    #[test]
+    fn subscription_cache_identity_is_stable_with_default_user_agent() {
+        let mut sub = Subscription {
+            url: "https://example.test/subscription".into(),
+            ..Subscription::default()
+        };
+        let unset = subscription_filename(&sub);
+        sub.user_agent = Some(String::new());
+        assert_eq!(subscription_filename(&sub), unset);
+        sub.user_agent = Some("provider/1.0".into());
+        assert_ne!(subscription_filename(&sub), unset);
+    }
+
+    #[tokio::test]
+    async fn subscription_store_loads_pre_default_user_agent_key() {
+        fn pre_default_filename(sub: &Subscription) -> String {
+            fn add_part(hasher: &mut Sha256, value: &[u8]) {
+                hasher.update((value.len() as u64).to_be_bytes());
+                hasher.update(value);
+            }
+
+            let mut hasher = Sha256::new();
+            add_part(&mut hasher, sub.url.as_bytes());
+            add_part(&mut hasher, b"");
+            for header in &sub.headers {
+                add_part(&mut hasher, header.key.as_bytes());
+                add_part(&mut hasher, header.value.as_bytes());
+            }
+            use base64::Engine as _;
+            format!(
+                "{}.sub",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
+            )
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = SubscriptionStore::open(temp.path().join(SUBSCRIPTION_STORE_DIR)).unwrap();
+        let sub = Subscription {
+            name: "provider".into(),
+            url: "https://example.test/subscription".into(),
+            ..Subscription::default()
+        };
+        let content = "socks5://127.0.0.1:1080#stored";
+        let old_path = store.root().join(pre_default_filename(&sub));
+        write_store_file(store.root(), &old_path, content.as_bytes()).unwrap();
+
+        let restored = store.load_nodes(&sub).await.unwrap().unwrap();
+        assert_eq!(restored[0].name, "stored");
+
+        let mut explicit_empty = sub.clone();
+        explicit_empty.user_agent = Some(String::new());
+        assert!(store.load_nodes(&explicit_empty).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn subscription_cache_identity_isolates_explicit_default_user_agent() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SubscriptionStore::open(temp.path().join(SUBSCRIPTION_STORE_DIR)).unwrap();
+        let default_sub = Subscription {
+            name: "provider".into(),
+            url: "https://example.test/subscription".into(),
+            ..Subscription::default()
+        };
+        let mut explicit_default = default_sub.clone();
+        explicit_default.user_agent = Some(DEFAULT_SUBSCRIPTION_USER_AGENT.into());
+        assert_ne!(
+            store.path_for(&default_sub),
+            store.path_for(&explicit_default)
+        );
+
+        let mut with_header = default_sub.clone();
+        with_header.headers.push(honk_config::subscription::SubscriptionHeader {
+            key: "X-Test".into(),
+            value: "1".into(),
+        });
+        assert_ne!(store.path_for(&default_sub), store.path_for(&with_header));
+
+        write_store_file(
+            store.root(),
+            &store.path_for(&explicit_default),
+            b"socks5://127.0.0.1:1080#explicit",
+        )
+        .unwrap();
+        assert!(store.load_nodes(&default_sub).await.unwrap().is_none());
+        assert!(store
+            .load_nodes(&explicit_default)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
     #[tokio::test]
     async fn fetch_error_chain_redacts_subscription_url() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1211,9 +1307,15 @@ not-proxies: []
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = [0_u8; 1024];
-            let size = stream.read(&mut request).await.unwrap();
-            let request = String::from_utf8_lossy(&request[..size]);
+            let mut request = Vec::with_capacity(1024);
+            let mut chunk = [0_u8; 256];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let size = stream.read(&mut chunk).await.unwrap();
+                assert!(size > 0, "HTTP request ended before its headers");
+                request.extend_from_slice(&chunk[..size]);
+                assert!(request.len() <= 16 * 1024, "HTTP request headers too large");
+            }
+            let request = String::from_utf8_lossy(&request);
             let expected = format!("user-agent: {DEFAULT_SUBSCRIPTION_USER_AGENT}");
             assert!(
                 request

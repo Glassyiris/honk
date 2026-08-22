@@ -604,6 +604,13 @@ impl ControlPlane {
                                 nodes.len(),
                                 name
                             );
+                            if nodes.is_empty() {
+                                warn!(
+                                    subscription = %name,
+                                    "subscription returned no nodes; keeping active nodes"
+                                );
+                                continue;
+                            }
                             let new_config = {
                                 let current = self.config.read().await;
                                 config_with_subscription_nodes(&current, subscription_id, nodes)

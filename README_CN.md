@@ -26,7 +26,7 @@ global {
 }
 ```
 
-修改 `global.nfqueue_enable` 后必须重启。若使用 `--mock-ebpf`、不带 `ebpf` 的构建，或启动前队列/nftables 前置检查不可用，honk 会记录 warning，仅在本进程关闭 NFQUEUE 暂存，不会改写配置文件。本机发起的 WAN 出口流量仍走规范 TPROXY 路径。DNS 53、`must`、`block` 和已经可以安全地在路由时直连的决策不会进入 NFQUEUE；只暂存仍可能在用户态改判的决策。
+修改 `global.nfqueue_enable` 后必须重启。若使用 `--mock-ebpf`、不带 `ebpf` 的构建，或固定队列不可用，honk 会记录 warning，仅在本进程关闭 NFQUEUE 暂存，不会改写配置文件。真实启动会先等待单实例交接，再探测队列，并在安装阶段回收保留的 nftables table。本机发起的 WAN 出口流量仍走规范 TPROXY 路径。DNS 53、`must`、`block` 和已经可以安全地在路由时直连的决策不会进入 NFQUEUE；只暂存仍可能在用户态改判的决策。
 
 该路径拥有 raw-netlink 队列 `320` 和 nftables 对象 `inet honk_nfqueue` / `udp_decision`；honk 运行期间，同一网络命名空间中的防火墙管理器不得修改它们。Direct 释放被保留的 skb，Proxy 把唯一的 payload 副本交给正常 UDP 初始化器，block/取消则丢弃报文。ingest actor 最多保留 256 个报文和 8 MiB payload；每个报文从 listener 收到时起都保留固定的三秒绝对期限。启用 Clash API 后，`/stats.udp.nfqueue` 会暴露 actor 深度、字节数、最老年龄以及明确的内核统计可用状态与读取失败数。完整不变量和指标 schema 见 [NFQUEUE 设计](doc/zh/design/nfqueue.md)与 [API 参考](doc/zh/reference/api.md)。
 

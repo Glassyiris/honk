@@ -53,7 +53,7 @@ dae 配置面只设置订阅 tag（`name`）和 `url`。其他所有字段都保
 | 首选位置 | `<data_dir>/.sub`；`data_dir` 默认值为 `/var/share/honk`。 |
 | 旧位置 | 若首选目录不存在而 `./.sub` 存在，则继续使用旧目录，直至手动迁移。两者同时存在时优先使用首选目录。 |
 | 权限 | 目录 mode 为 `0700`，文件 mode 为 `0600`。拒绝符号链接形式的存储目录。 |
-| 文件名 | 对带长度边界的 URL、user agent 及有序 header key/value 对计算 SHA-256，再用 URL-safe Base64 编码并添加 `.sub`。请求身份不会以明文暴露。 |
+| 文件名 | 对带长度边界的 URL、配置中的 user agent 覆盖值（未设置或为空时为空）及有序 header key/value 对计算 SHA-256，再用 URL-safe Base64 编码并添加 `.sub`。版本化的默认请求 UA 不参与 key，因此默认订阅升级后仍保留缓存。请求身份不会以明文暴露。 |
 | 写入边界 | 只有 HTTP 成功且解析成功后才写入原始响应正文。临时文件完成 sync 后原子 rename，随后对目录执行 sync。 |
 
 订阅正文及其产生的节点都只属于 runtime 状态；两者都不会写回 dae 配置。

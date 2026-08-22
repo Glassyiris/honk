@@ -12,7 +12,7 @@ global {
 }
 ```
 
-Changing the setting requires a process restart; reload rejects the change. Startup treats NFQUEUE as best-effort: mock mode, a build without `ebpf`, or a failed queue/nftables preflight logs a warning and disables staging for that process without rewriting the config file. Once the service passes preflight and is admitted, listener, queue, watchdog, verdict, cleanup, and retirement failures remain fatal. See the [global configuration reference](../reference/global.md) for the process-scoped knob.
+Changing the setting requires a process restart; reload rejects the change. Startup treats NFQUEUE as best-effort: mock mode, a build without `ebpf`, or a failed fixed-queue preflight logs a warning and disables staging for that process without rewriting the config file. Real mode acquires the singleton instance lock before that preflight, so a normal handoff waits for the old queue owner instead of degrading spuriously. The reserved nftables table is reclaimed during installation after queue binding. Once the service is admitted, listener, queue, watchdog, verdict, cleanup, and retirement failures remain fatal. See the [global configuration reference](../reference/global.md) for the process-scoped knob.
 
 The hook is deliberately narrow:
 
@@ -50,7 +50,7 @@ flowchart LR
 | nftables ownership | One atomic transaction owns exact `inet honk_nfqueue` / `udp_decision`, an `inet prerouting` filter chain at priority `-250`; only UDP carrying the pending signature reaches the queue |
 | Failure policy | No queue bypass, fanout, or fail-open flag. Malformed or truncated input, `ENOBUFS`, unexpected listener exit, and verdict-socket failure are fatal |
 
-The service binds queue `320` before publishing the nftables transaction. On an orderly final shutdown it drains every dispatched guard, closes the queue, and deletes the owned table last. Same-network-namespace firewall managers must not mutate either owned nftables object while honk runs.
+The service binds queue `320` before publishing the nftables transaction. Installation reclaims the stale reserved table under the singleton process lock; on an orderly final shutdown it drains every dispatched guard, closes the queue, and deletes the owned table last. Same-network-namespace firewall managers must not mutate either reserved nftables object while honk runs.
 
 ## Decision-token protocol
 

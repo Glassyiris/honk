@@ -12,7 +12,7 @@ global {
 }
 ```
 
-修改该设置必须重启进程；reload 会拒绝该变更。启动阶段 NFQUEUE 采用 best-effort：mock 模式、不带 `ebpf` 的构建，或队列/nftables 前置检查失败时记录 warning，仅在本进程关闭暂存且不改写配置文件。服务通过前置检查并准入后，listener、queue、watchdog、verdict、cleanup 和 retirement 的失败仍为 fatal。进程级配置项见[全局配置参考](../reference/global.md)。
+修改该设置必须重启进程；reload 会拒绝该变更。启动阶段 NFQUEUE 采用 best-effort：mock 模式、不带 `ebpf` 的构建，或固定队列前置检查失败时记录 warning，仅在本进程关闭暂存且不改写配置文件。真实模式会先取得单实例锁，再执行该前置检查，因此正常交接会等待旧队列所有者，不会误降级；保留的 nftables table 会在绑定队列后由安装阶段回收。服务通过前置检查并准入后，listener、queue、watchdog、verdict、cleanup 和 retirement 的失败仍为 fatal。进程级配置项见[全局配置参考](../reference/global.md)。
 
 该 hook 的范围刻意保持狭窄：
 
@@ -50,7 +50,7 @@ flowchart LR
 | nftables 所有权 | 单个原子事务独占精确的 `inet honk_nfqueue` / `udp_decision`，即优先级 `-250` 的 `inet prerouting` filter chain；只有携带 Pending 签名的 UDP 才进入队列 |
 | 失败策略 | 不设置 queue bypass、fanout 或 fail-open flag。输入畸形或截断、`ENOBUFS`、listener 意外退出以及 verdict socket 失败均为 fatal |
 
-服务先绑定队列 `320`，再发布 nftables 事务。最终有序关闭时，它会 drain 所有已分发 guard、关闭队列，并最后删除自有 table。honk 运行期间，同一网络命名空间的防火墙管理器不得修改任一自有 nftables 对象。
+服务先绑定队列 `320`，再发布 nftables 事务。安装阶段在单实例锁保护下回收残留的保留 table；最终有序关闭时，它会 drain 所有已分发 guard、关闭队列，并最后删除自有 table。同一网络命名空间的防火墙管理器不得在 honk 运行期间修改任一保留 nftables 对象。
 
 ## 决策 token 协议
 

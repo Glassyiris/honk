@@ -251,7 +251,7 @@ dns {
 
 ## 订阅
 
-每个来源写作 `tag: 'url'`；`subtag(...)` 匹配的就是该 tag。默认 `global.store_subscribe: true` 时，成功获取并解析的原始正文会原子存储到 `.sub`。请求默认使用 `honk/<version>`，可由订阅的可选 `user_agent` 覆盖。启动时先恢复有效且非空的存储再后台刷新；SIGHUP 会沿用活动订阅节点，仅在没有节点可沿用时从存储恢复；获取、解析或没有可用节点的失败会保留活动节点与上一次有效正文，空刷新不会清空上一代。订阅节点仅存在于运行时。修改 `store_subscribe` 后需重启。
+每个来源写作 `tag: 'url'`；`subtag(...)` 匹配的就是该 tag。默认 `global.store_subscribe: true` 时，成功获取并解析的原始正文会原子存储到 `.sub`。请求默认使用 `honk/<version>`，可由订阅的可选 `user_agent` 覆盖；缓存 key 使用配置中的覆盖值（未设置或为空时保持稳定），因此版本化的默认请求 header 不会在升级时使已存正文失效。启动时先恢复有效且非空的存储再后台刷新；SIGHUP 会沿用活动订阅节点，仅在没有节点可沿用时从存储恢复；获取、解析或没有可用节点的失败会保留活动节点与上一次有效正文，空刷新不会清空上一代。订阅节点仅存在于运行时。修改 `store_subscribe` 后需重启。
 
 详见 [订阅参考](./reference/subscription.md)。
 
@@ -261,7 +261,7 @@ dns {
 
 **缓存文件。** 设置 `experimental.cache_file.enabled: true` 可持久化 Selector 选择与 Clash 模式；`store_dns: true` 还会持久化符合条件的 DNS 应答。相对 `path` 使用 `data_dir`，并遵循前述旧路径规则。
 
-**首包保留 UDP。** `global.nfqueue_enable` 默认值为 `true`；设置为 `false` 可关闭有歧义 LAN 转发 UDP 的 NFQUEUE 暂存。该设置修改后需重启。若使用 mock eBPF、不带 `ebpf` 的构建，或队列/nftables 前置检查失败，honk 会记录 warning，仅在本进程关闭 NFQUEUE，不会改写配置文件。honk 独占队列 `320` 以及 nftables `inet honk_nfqueue` / `udp_decision`；honk 运行期间，防火墙管理器不得修改这些对象。
+**首包保留 UDP。** `global.nfqueue_enable` 默认值为 `true`；设置为 `false` 可关闭有歧义 LAN 转发 UDP 的 NFQUEUE 暂存。该设置修改后需重启。若使用 mock eBPF、不带 `ebpf` 的构建，或固定队列前置检查失败，honk 会记录 warning，仅在本进程关闭 NFQUEUE，不会改写配置文件。真实实例取得锁后，启动会绑定队列 `320`，并在发布 `inet honk_nfqueue` / `udp_decision` 前回收残留的自有 nftables table；honk 运行期间，防火墙管理器不得修改这些保留对象。
 
 详见 [Global 参考](./reference/global.md)、[Experimental 参考](./reference/experimental.md)与 [UDP NFQUEUE 设计](./design/nfqueue.md)。
 

@@ -12,17 +12,19 @@
 
 启动时保持内核准入关闭，直到用户态能够接收每个重定向流：
 
-1. 加载并校验配置并选择 `global.data_dir`。若请求 NFQUEUE，先探测真实 eBPF/netlink 前置条件；mock/不带 `ebpf` 的模式或前置检查失败时记录 warning，仅在本进程关闭 NFQUEUE。随后提升 `RLIMIT_NOFILE`，并取得一次不可变的描述符预算快照。
+1. 加载并校验配置、选择 `global.data_dir`，提升 `RLIMIT_NOFILE`，并取得一次不可变的描述符预算快照。
 2. 在网络刷新前恢复持久化订阅。只有没有有效已恢复正文的订阅才参与五秒首次拉取宽限期。
 3. 选择后端。真实模式取得 `/run/honk-core.lock`，并把进程 PID 发布到已锁文件；`honk-core reload` 读取该 PID 并发送 `SIGHUP`。Mock 模式不取得进程全局锁。
-4. 在真实模式下，通过 rtnetlink 创建由 FD 持有的 `daens` 命名空间和 `dae0`/`dae0peer` 链路。引擎优先尝试 L2 netkit pair，仅在内核报告不支持 netkit 时回退到 veth。进程留在宿主命名空间；只有同步的 socket、链路和挂载操作通过有作用域的 `setns` 调用进入 `daens`。
-5. 加载 BPF 对象并挂载真实数据路径。默认对象通过 `include_bytes!` 嵌入；`--bpf-object` 提供运行时覆盖。启用 `ebpf` feature 时，`build.rs` 定位对象，拒绝过期或无 BTF 的产物，在移除继承的 `RUSTFLAGS` 和 `CARGO_ENCODED_RUSTFLAGS` 后用 nightly 重建，校验 `.BTF`，再复制到 `OUT_DIR` 供嵌入。
-6. 复用或创建固定的 `UDP_DECISION_SEQUENCE` 分配器，并校验其 map ABI、BTF、加锁值、token 范围与耗尽状态。NFQUEUE 启动时再次检查加锁的分配器状态；若没有回滚安全的 generation，则保持暂存关闭。
-7. 构建用户态 Router、出站运行时 registry、DNS 运行时、GroupManager、cache DB、可选 Clash API 和控制平面 supervisor。
-8. 绑定透明 TCP/UDP listener，发布完整 listener FD 集，启动独立 DNS 和 UDP 接收循环；仅当生效开关仍开启时，才启动 NFQUEUE 服务及其 ingest actor、correlator、watchdog 和统计采样器。
-9. 检查 NFQUEUE 健康状态，发布其 ready 状态，开放 pending verdict 准入，最后把 `DATAPATH_STATE_MAP[0]` 设为 ready。随后 TCP accept loop 在控制面 supervisor 中运行。
+4. 真实实例完成锁交接后，再探测固定 NFQUEUE 队列前置条件。mock/不带 `ebpf` 的模式或前置检查失败时记录 warning，仅在本进程关闭 NFQUEUE；前置检查不会拒绝保留的 nftables table，因为安装阶段会回收残留的自有状态。
+5. 在真实模式下，通过 rtnetlink 创建由 FD 持有的 `daens` 命名空间和 `dae0`/`dae0peer` 链路。引擎优先尝试 L2 netkit pair，仅在内核报告不支持 netkit 时回退到 veth。进程留在宿主命名空间；只有同步的 socket、链路和挂载操作通过有作用域的 `setns` 调用进入 `daens`。
+6. 加载 BPF 对象并挂载真实数据路径。默认对象通过 `include_bytes!` 嵌入；`--bpf-object` 提供运行时覆盖。启用 `ebpf` feature 时，`build.rs` 定位对象，拒绝过期或无 BTF 的产物，在移除继承的 `RUSTFLAGS` 和 `CARGO_ENCODED_RUSTFLAGS` 后用 nightly 重建，校验 `.BTF`，再复制到 `OUT_DIR` 供嵌入。
+7. 复用或创建固定的 `UDP_DECISION_SEQUENCE` 分配器，并校验其 map ABI、BTF、加锁值、token 范围与耗尽状态。NFQUEUE 启动时再次检查加锁的分配器状态；若没有回滚安全的 generation，则保持暂存关闭。
+8. 构建用户态 Router、出站运行时 registry、DNS 运行时、GroupManager、cache DB、可选 Clash API 和控制平面 supervisor。
+9. 绑定透明 TCP/UDP listener，发布完整 listener FD 集，启动独立 DNS 和 UDP 接收循环；仅当生效开关仍开启时，才启动 NFQUEUE 服务及其 ingest actor、correlator、watchdog 和统计采样器。
+10. 检查 NFQUEUE 健康状态，发布其 ready 状态，开放 pending verdict 准入，最后把 `DATAPATH_STATE_MAP[0]` 设为 ready。随后 TCP accept loop 在控制面 supervisor 中运行。
+`RealEbpfBackend` 负责 aya program、map、link、持久分配器处理和真实 NFQUEUE 集成。`MockEbpfBackend` 在没有特权内核资源时提供相同控制面接口。请求的 NFQUEUE 路径无法通过锁交接后的固定队列前置检查时会记录 warning 并关闭；服务准入后的失败仍为 fatal。
 
-`RealEbpfBackend` 负责 aya program、map、link、持久分配器处理和真实 NFQUEUE 集成。`MockEbpfBackend` 在没有特权内核资源时提供相同控制面接口。请求的 NFQUEUE 路径无法通过启动前置检查时会记录 warning 并关闭；服务准入后的失败仍为 fatal。
+当 `global.store_subscribe` 启用时，经过校验的原始正文存放在 `<global.data_dir>/.sub`。切换 data directory 时会保留已有的旧 `./.sub`，直到运维人员迁移它。目录必须是非符号链接目录、权限 `0700`；文件权限 `0600`，文件名由请求 URL、配置中的 User-Agent 覆盖值（未设置或为空时贡献空组件）与 headers 共同计算 URL-safe SHA-256。未配置订阅覆盖值时，请求标识为 `honk/<version>`。写入使用新的临时文件、`sync_all`、原子 rename 和目录 sync。
 
 关闭时在资源消失前逆序释放所有权：fence NFQUEUE、关闭数据路径准入、拒绝新的用户态工作、取消并排空持有的 verdict 和 UDP initializer、停止 UDP driver 和 removal 处理、停止接口 watcher、卸载 BPF hook、最多用五秒排空已接受流、退役出站运行时、停止 NFQUEUE、停止 DNS controller 和 persistence，并清理 generation 持有的 BPF 状态。普通清理保留固定分配器。随后 listener 和 `daens`/link-pair 所有权离开作用域。
 
@@ -153,11 +155,11 @@ Accepted TCP socket 只有在其规范正向 `CONN_STATE_MAP` 条目仍存在时
 
 当旧值和新值都能解析时，`dns.bind` 的语义比较使用解析后的 bind endpoint，因此描述同一 endpoint 的纯拼写变更不会强制重启。
 
-当 `global.store_subscribe` 启用时，经过校验的原始正文存放在 `<global.data_dir>/.sub`。切换 data directory 时会保留已有的旧 `./.sub`，直到运维人员迁移它。目录必须是非符号链接目录、权限 `0700`；文件权限 `0600`，文件名是由请求 URL、实际 User-Agent 与 headers 共同计算的 URL-safe SHA-256。未配置订阅覆盖值时，请求标识为 `honk/<version>`。写入使用新的临时文件、`sync_all`、原子 rename 和目录 sync。
-
 启动时先解析已存正文，再开始网络刷新。有效且非空的恢复结果立即提供节点，并从五秒首次拉取等待中移除该订阅；缺失、无效或空正文只会在共享 grace 期间等待。之后所有订阅仍在后台刷新。
 
 `SIGHUP` 会按 URL 稳定订阅 ID，并把活动订阅节点带入候选配置。只有启用订阅且当前没有活动节点时才恢复缓存，随后安排立即网络刷新。网络、解析或没有可用节点的失败会保留活动节点，不替换上一次有效正文。持久化失败不是致命错误：校验成功的节点仍可合并，旧正文仍可恢复。定期刷新与立即刷新使用同一串行的 runtime 发布路径，订阅节点不会写回配置文件。
+
+当 `global.store_subscribe` 启用时，经过校验的原始正文存放在 `<global.data_dir>/.sub`。切换 data directory 时会保留已有的旧 `./.sub`，直到运维人员迁移它。目录必须是非符号链接目录、权限 `0700`；文件权限 `0600`，文件名由请求 URL、配置中的 User-Agent 覆盖值（未设置或为空时贡献空组件）与 headers 共同计算 URL-safe SHA-256。未配置订阅覆盖值时，请求标识为 `honk/<version>`。写入使用新的临时文件、`sync_all`、原子 rename 和目录 sync。
 
 ## Clash API 与 cache DB
 
