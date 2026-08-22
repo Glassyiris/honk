@@ -180,7 +180,7 @@ Outbound dialing, groups, and health checking. Re-exported by `honk-core` as `ho
 The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 
 - `default = ["clash-api", "mimalloc", "rprx"]`
-- `ebpf` — real eBPF backend via aya plus `honk-nfqueue` (requires Linux kernel 5.8+); without it the engine runs on `MockEbpfBackend`. A requested `global.nfqueue_enable=true` is logged and disabled for this process on mock/no-`ebpf` startup or failed queue/nftables preflight.
+- `ebpf` — real eBPF backend via aya plus `honk-nfqueue` (requires Linux kernel 5.8+); without it the engine runs on `MockEbpfBackend`. A requested `global.nfqueue_enable=true` is logged and disabled for this process on mock/no-`ebpf` startup or failed fixed-queue preflight.
 - `clash-api` — Clash-compatible REST/WS API (pulls in optional axum/tower-http).
 - `mimalloc` — shipped binary allocates through mimalloc (see Technology stack); build with `--no-default-features --features "clash-api,ebpf,rprx"` for a stock-malloc binary.
 - `rprx` — forwards to `honk-outbound/rprx`: registers VLESS (VLESS Encryption and xtls-rprx-vision) and VMess handlers; without it VLESS/VMess nodes parse fine but fail at dial with "No handler for protocol".
@@ -191,7 +191,7 @@ The Score group policy is always compiled and has no Cargo feature; Selector rem
 
 Module map:
 
-- `src/lib.rs` — engine entry `run()`, `Cli`/`ClashCommand`, resource-limit setup, backend selection, and startup NFQUEUE preflight. Mock/no-`ebpf` mode or unavailable queue/nftables prerequisites disables requested `global.nfqueue_enable` with a warning for this process. Real datapath instances hold `/run/honk-core.lock` and publish their PID there for the `reload` subcommand; real mode creates the FD-owned `daens` namespace and an L2 netkit `dae0` pair through rtnetlink when supported, falling back to veth only on `EOPNOTSUPP`, then loads or reuses the persistent allocator pin and starts NFQUEUE before opening datapath admission.
+- `src/lib.rs` — engine entry `run()`, `Cli`/`ClashCommand`, resource-limit setup, backend selection, and startup fixed-queue preflight. Mock/no-`ebpf` mode or an unavailable fixed queue disables requested `global.nfqueue_enable` with a warning for this process. Real datapath instances hold `/run/honk-core.lock` and publish their PID there for the `reload` subcommand; real mode creates the FD-owned `daens` namespace and an L2 netkit `dae0` pair through rtnetlink when supported, falling back to veth only on `EOPNOTSUPP`, then loads or reuses the persistent allocator pin and starts NFQUEUE before opening datapath admission.
 - `src/subscription.rs` + startup/reload orchestration in `src/lib.rs` — validated raw subscription bodies are atomically persisted when `global.store_subscribe` is true (default) under `<cwd>/.sub`, mode `0700` with `0600` hash-named files. Startup restores valid bodies before launching network refresh and skips the five-second first-fetch wait for restored subscriptions; SIGHUP carries active nodes and restores cache only where no nodes survive. Fetch/parse/write failure preserves active nodes and the last valid body; subscription nodes are never written back to the config.
 - `src/control/` — the control plane:
   - `mod.rs` — `ControlPlane`: TPROXY TCP/UDP listeners plus the supervised NFQUEUE runtime, one actor bounded to 256 entries and 8 MiB payload, fixed startup descriptor budgets, listener-FD publication, an independent one-second queue-pressure sampler, periodic locked token-exhaustion detection, 1/2/5/30-second retry backoff, safe generation rotation, and ordered startup/shutdown. Queue/listener/verdict faults are fatal branches of `run`; sequence exhaustion fences/drains and rotates only when the candidate and every higher generation through 3 are absent from complete live token-bound map scans.
@@ -285,7 +285,7 @@ sudo ./target/release/honk-core --config /etc/honk/config.dae          # embedde
 sudo ./target/release/honk-core --config c.dae --bpf-object /path.o    # external object
 ```
 
-An enabled `global.nfqueue_enable` configuration is activated only when the real-eBPF build/backend and startup prerequisites are available. The same request on `--mock-ebpf`, a build without `ebpf`, or a host where queue/nftables preflight fails logs a warning and runs with staging disabled for this process; changing the flag is restart-required.
+An enabled `global.nfqueue_enable` configuration is activated only when the real-eBPF build/backend and startup prerequisites are available. The same request on `--mock-ebpf`, a build without `ebpf`, or a host where fixed-queue preflight fails logs a warning and runs with staging disabled for this process; changing the flag is restart-required.
 
 Dev without kernel eBPF (unprivileged):
 
@@ -450,7 +450,7 @@ global {
 Legacy configs may still use `experimental { udp_nfqueue { enabled: ... } }`; loaders warn and migrate that value to `global.nfqueue_enable` without serializing the removed section.
 
 It defaults on and is restart-required. Activation needs the real eBPF backend
-and an `ebpf` build; mock/no-`ebpf` startup or a failed queue/nftables preflight
+and an `ebpf` build; mock/no-`ebpf` startup or failed fixed-queue preflight
 logs a warning and disables staging for this process without rewriting the config.
 Set it to `false` for unprivileged mock development. Scope is LAN-forwarded UDP
 only because `inet prerouting` follows LAN TC; host-originated WAN egress remains
