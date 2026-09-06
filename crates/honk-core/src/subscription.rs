@@ -23,6 +23,69 @@ pub(crate) use supervisor::{
     SubscriptionSupervisorHandle, same_subscription_worker_set, validate_subscription_ids,
 };
 
+/// Bounds what a hostile or broken origin can make honk buffer before parsing.
+const MAX_SUBSCRIPTION_BYTES: usize = 8 * 1024 * 1024;
+
+const MAX_SUBSCRIPTION_REDIRECTS: usize = 5;
+
+/// A hostname that resolves to a private address is not detected here; this
+/// only refuses a destination the redirect states outright.
+fn has_private_literal_host(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    // Canonicalized first: an IPv4-mapped literal such as `::ffff:127.0.0.1`
+    // otherwise takes the IPv6 branch, where it is neither loopback nor local.
+    match host.parse::<std::net::IpAddr>().map(|ip| ip.to_canonical()) {
+        Ok(std::net::IpAddr::V4(address)) => {
+            address.is_loopback()
+                || address.is_private()
+                || address.is_link_local()
+                || address.is_unspecified()
+        }
+        Ok(std::net::IpAddr::V6(address)) => {
+            address.is_loopback()
+                || address.is_unique_local()
+                || address.is_unicast_link_local()
+                || address.is_unspecified()
+        }
+        Err(_) => false,
+    }
+}
+
+/// reqwest's default follows ten hops, allows an https-to-http downgrade, and
+/// does not restrict the destination, so a subscription origin could move the
+/// fetch onto plaintext or onto an address the operator never published it to.
+fn subscription_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let origin_https = attempt
+            .previous()
+            .first()
+            .is_some_and(|url| url.scheme() == "https");
+        let origin_private = attempt
+            .previous()
+            .first()
+            .is_some_and(has_private_literal_host);
+        let refusal = if attempt.previous().len() > MAX_SUBSCRIPTION_REDIRECTS {
+            Some("redirected too many times")
+        } else if origin_https && attempt.url().scheme() != "https" {
+            Some("redirected from https to plaintext")
+        } else if has_private_literal_host(attempt.url()) && !origin_private {
+            Some("redirected to a private address")
+        } else {
+            None
+        };
+        match refusal {
+            Some(reason) => attempt.error(anyhow::anyhow!("subscription {reason}")),
+            None => attempt.follow(),
+        }
+    })
+}
+
 /// reqwest DNS resolver backed by honk's bootstrap resolver
 /// (bypass-marked UDP/TCP), so subscription fetches do not depend on the
 /// system resolver — which on a polluted network can hand back poisoned
@@ -237,6 +300,24 @@ fn write_store_file(root: &Path, destination: &Path, content: &[u8]) -> anyhow::
     result
 }
 
+/// `Response::text` buffers the whole body before anything can check its size.
+/// Lossy conversion keeps the previous behaviour: a body with invalid bytes
+/// still parses its valid lines.
+async fn read_capped_body(mut response: reqwest::Response) -> anyhow::Result<String> {
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(reqwest::Error::without_url)?
+    {
+        if body.len() + chunk.len() > MAX_SUBSCRIPTION_BYTES {
+            anyhow::bail!("subscription body exceeds {MAX_SUBSCRIPTION_BYTES} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 /// Manager for fetching and parsing proxy subscriptions.
 pub struct SubscriptionManager {
     client: reqwest::Client,
@@ -247,6 +328,7 @@ impl SubscriptionManager {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .dns_resolver(std::sync::Arc::new(BootstrapDnsResolve))
+            .redirect(subscription_redirect_policy())
             .build()?;
         Ok(Self { client })
     }
@@ -274,7 +356,7 @@ impl SubscriptionManager {
         let response = response
             .error_for_status()
             .map_err(reqwest::Error::without_url)?;
-        let content = response.text().await.map_err(reqwest::Error::without_url)?;
+        let content = read_capped_body(response).await?;
         let nodes = parse_subscription_content(sub, &content)?;
         if let Some(store) = store
             && let Err(error) = store.store_content(sub, content).await
@@ -864,6 +946,49 @@ fn parse_node_uri(uri: &str) -> anyhow::Result<Node> {
 mod tests {
     use super::*;
     use base64::Engine as _;
+
+    #[tokio::test]
+    async fn body_reader_refuses_one_byte_past_the_cap() {
+        let at_cap = http::Response::new(vec![b'a'; MAX_SUBSCRIPTION_BYTES]);
+        assert_eq!(
+            read_capped_body(at_cap.into()).await.unwrap().len(),
+            MAX_SUBSCRIPTION_BYTES
+        );
+        let over_cap = http::Response::new(vec![b'a'; MAX_SUBSCRIPTION_BYTES + 1]);
+        assert!(read_capped_body(over_cap.into()).await.is_err());
+    }
+
+    #[test]
+    fn private_literal_hosts_are_recognized_by_address_not_name() {
+        for url in [
+            "http://127.0.0.1/sub",
+            "http://10.203.0.1:8080/sub",
+            "http://192.168.1.1/sub",
+            "http://169.254.1.1/sub",
+            "http://[::1]/sub",
+            "http://[fd00::1]/sub",
+            "http://[fe80::1]/sub",
+            "http://[::ffff:127.0.0.1]/sub",
+            "http://0.0.0.0/sub",
+            "http://[::]/sub",
+        ] {
+            let url = reqwest::Url::parse(url).unwrap();
+            assert!(has_private_literal_host(&url), "{url} should be private");
+        }
+        for url in [
+            "https://example.com/sub",
+            "http://93.184.216.34/sub",
+            "http://[2001:db8::1]/sub",
+            // Resolution is out of scope: only a stated literal is refused.
+            "http://internal.example/sub",
+        ] {
+            let url = reqwest::Url::parse(url).unwrap();
+            assert!(
+                !has_private_literal_host(&url),
+                "{url} should not be private"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_socks5_uri() {

@@ -60,6 +60,8 @@ The internal body-selector behavior is:
 | Permissions | Directory mode `0700`; file mode `0600`. Symlink store directories are rejected. |
 | Filename | URL-safe Base64 of a SHA-256 hash over the length-delimited URL, configured user-agent override (empty when unset or empty), and ordered header key/value pairs, plus `.sub`. The versioned default request UA is intentionally not part of the key, so default subscriptions retain their cache across upgrades. The request identity is not exposed in plaintext. |
 | Write boundary | The raw response body is written only after HTTP success and successful parsing. A temporary file is synced, renamed atomically, and followed by a directory sync. |
+| Redirects | At most 5 hops. A redirect from `https` to another scheme fails the fetch, as does one to a loopback, private, link-local, or unspecified literal address that the configured URL did not itself use. A hostname resolving to such an address is not detected. |
+| Body size | At most 8 MiB, enforced while reading rather than after the body is buffered. |
 
 Subscription bodies and the nodes created from them remain runtime state; neither is written back into the dae configuration.
 
