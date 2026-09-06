@@ -1,6 +1,5 @@
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn identical_concurrent_queries_share_one_exchange_and_render_each_txid() {
-    // Given
     const CALLERS: usize = 128;
     let upstream = Arc::new(GatedUpstream {
         response: make_a_response([192, 0, 2, 1], 300),
@@ -32,12 +31,11 @@ async fn identical_concurrent_queries_share_one_exchange_and_render_each_txid() 
     }
     start.wait().await;
     upstream.entered.notified().await;
-    let flights = cache.lock().await.singleflight();
+    let flights = forwarder.singleflight();
     while flights.counters().waiters < u64::try_from(CALLERS - 1).expect("count") {
         tokio::task::yield_now().await;
     }
 
-    // When
     upstream.release.notify_one();
     let mut txids = Vec::with_capacity(CALLERS);
     while let Some(joined) = tasks.join_next().await {
@@ -45,7 +43,6 @@ async fn identical_concurrent_queries_share_one_exchange_and_render_each_txid() 
         txids.push(u16::from_be_bytes([response[0], response[1]]));
     }
 
-    // Then
     txids.sort_unstable();
     assert_eq!(
         txids,
@@ -53,6 +50,111 @@ async fn identical_concurrent_queries_share_one_exchange_and_render_each_txid() 
     );
     assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
     assert_eq!(flights.active_len(), 0);
+}
+
+#[tokio::test]
+async fn newly_constructed_forwarder_does_not_join_predecessor_flight() {
+    for (cache_enabled, fixed_ttl) in [(false, None), (true, Some(0))] {
+        let fixed_ttl = fixed_ttl
+            .map(|ttl| std::collections::HashMap::from([("example.com".to_string(), ttl)]))
+            .unwrap_or_default();
+        let router = Arc::new(
+            DnsRouter::new_with_fixed_ttl(
+                &DnsRouting {
+                    fallback: "default".into(),
+                    ..Default::default()
+                },
+                &fixed_ttl,
+            )
+            .unwrap(),
+        );
+        let old_upstream = Arc::new(GatedUpstream {
+            response: make_a_response([192, 0, 2, 1], 300),
+            call_count: AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let cache = test_cache();
+        let old = Arc::new(
+            DnsForwarder::new(old_upstream.clone(), cache.clone(), Arc::clone(&router))
+                .with_cache_enabled(cache_enabled),
+        );
+        let old_query = make_a_query();
+        let predecessor = tokio::spawn(async move { old.resolve(&old_query).await });
+        old_upstream.entered.notified().await;
+
+        let new_upstream = Arc::new(MockUpstream::new(make_a_response([198, 51, 100, 2], 300)));
+        let new = DnsForwarder::new(new_upstream.clone(), cache.clone(), router)
+            .with_cache_enabled(cache_enabled);
+        let response = tokio::time::timeout(Duration::from_secs(1), new.resolve(&make_a_query()))
+            .await
+            .expect("new generation must not await predecessor flight")
+            .expect("new generation resolve");
+
+        assert_eq!(&response[response.len() - 4..], &[198, 51, 100, 2]);
+        assert_eq!(new_upstream.call_count.load(Ordering::SeqCst), 1);
+        assert!(cache.lock().await.is_empty());
+
+        old_upstream.release.notify_one();
+        let response = predecessor.await.expect("predecessor task").expect("predecessor resolve");
+        assert_eq!(&response[response.len() - 4..], &[192, 0, 2, 1]);
+    }
+}
+
+#[tokio::test]
+async fn failed_exchange_is_shared_without_serial_waiter_retries() {
+    struct FailingUpstream {
+        release: tokio::sync::Semaphore,
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl DnsUpstreamPool for FailingUpstream {
+        async fn query(&self, _: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.release.acquire().await?.forget();
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into())
+        }
+    }
+    let upstream = Arc::new(FailingUpstream {
+        release: tokio::sync::Semaphore::new(0),
+        calls: AtomicUsize::new(0),
+    });
+    let forwarder = Arc::new(DnsForwarder::new(
+        upstream.clone(),
+        test_cache(),
+        test_router(),
+    ));
+    let flights = forwarder.singleflight();
+    let mut queries = tokio::task::JoinSet::new();
+    for _ in 0..257 {
+        let forwarder = Arc::clone(&forwarder);
+        queries.spawn(async move { forwarder.resolve(&make_a_query()).await });
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while flights.counters().waiters != 256 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all followers join the failed exchange");
+    upstream.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(query) = queries.join_next().await {
+            let error = query.unwrap().expect_err("upstream timeout");
+            assert!(error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)));
+        }
+    })
+    .await
+    .expect("one failed exchange must settle every waiter");
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(flights.active_len(), 0);
+    assert!(forwarder.cache().lock().await.is_empty());
+
+    upstream.release.add_permits(1);
+    assert!(forwarder.resolve(&make_a_query()).await.is_err());
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 2, "failures are not cached");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -91,7 +193,7 @@ async fn cancelled_leader_wakes_all_waiters_to_one_successor_operation() {
         test_cache(),
         test_router(),
     ));
-    let service = forwarder.cache_service().await;
+    let flights = forwarder.singleflight();
     let mut leader_query = make_a_query();
     leader_query[0..2].copy_from_slice(&1_u16.to_be_bytes());
     let leader = {
@@ -117,14 +219,14 @@ async fn cancelled_leader_wakes_all_waiters_to_one_successor_operation() {
         });
     }
     start.wait().await;
-    while service.flight_counters().waiters < u64::try_from(CALLERS - 1).expect("count") {
+    while flights.counters().waiters < u64::try_from(CALLERS - 1).expect("count") {
         tokio::task::yield_now().await;
     }
 
     leader.abort();
     assert!(leader.await.expect_err("cancelled").is_cancelled());
     upstream.successor_entered.notified().await;
-    while service.flight_counters().waiters
+    while flights.counters().waiters
         < u64::try_from((CALLERS - 1) + (CALLERS - 2)).expect("count")
     {
         tokio::task::yield_now().await;
@@ -136,13 +238,13 @@ async fn cancelled_leader_wakes_all_waiters_to_one_successor_operation() {
         joined.expect("task").expect("resolve");
         completed += 1;
     }
-    let counters = service.flight_counters();
+    let counters = flights.counters();
     assert_eq!(completed, CALLERS - 1);
     assert_eq!(upstream.calls.load(Ordering::SeqCst), 2);
     assert_eq!(counters.leaders, 2);
     assert_eq!(counters.aborts, 1);
     assert_eq!(counters.retries, u64::try_from(CALLERS - 1).expect("count"));
-    assert_eq!(service.active_flights(), 0);
+    assert_eq!(flights.active_len(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -325,7 +427,7 @@ async fn non_reusable_preference_sensitive_sources_do_not_share_a_flight() {
             DnsForwarder::new(upstream.clone(), cache.clone(), router)
                 .with_cache_enabled(cache_enabled),
         );
-        let flights = cache.lock().await.singleflight();
+        let flights = forwarder.singleflight();
         let mut tasks = tokio::task::JoinSet::new();
         for source in ["192.0.2.10", "198.51.100.10"] {
             let forwarder = Arc::clone(&forwarder);

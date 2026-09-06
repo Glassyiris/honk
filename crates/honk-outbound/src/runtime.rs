@@ -221,11 +221,13 @@ struct TlsConnectorSlot {
 struct TlsConnectorSlotState {
     cached: Option<(Arc<crate::tls::TlsConnector>, Instant)>,
     revision: u64,
+    closed: bool,
 }
 
 impl TlsConnectorSlot {
     fn get_or_build(&self, node: &Node) -> anyhow::Result<Arc<crate::tls::TlsConnector>> {
         let mut state = self.state.lock();
+        anyhow::ensure!(!state.closed, "TLS runtime is closed");
         state.revision = state.revision.wrapping_add(1);
         if let Some((connector, used_at)) = state.cached.as_mut() {
             *used_at = Instant::now();
@@ -264,6 +266,13 @@ impl TlsConnectorSlot {
         if state.cached.take().is_some() {
             state.revision = state.revision.wrapping_add(1);
         }
+    }
+
+    // Pool shutdown signals detached factories; it does not join them.
+    fn close(&self) {
+        let mut state = self.state.lock();
+        state.closed = true;
+        state.cached = None;
     }
 
     #[cfg(test)]
@@ -581,7 +590,10 @@ impl NodeRuntime {
     /// (connection + endpoint driver). Terminal for the runtime; idempotent.
     pub async fn close(&self) {
         match &self.runtime {
-            ProtocolRuntime::AnyTls(runtime) => runtime.pool.shutdown(),
+            ProtocolRuntime::AnyTls(runtime) => {
+                runtime.pool.shutdown();
+                runtime.tls.close();
+            }
             ProtocolRuntime::VlessMux(runtime) => runtime.shutdown(),
             ProtocolRuntime::Quic(runtime) => runtime.force_close().await,
             ProtocolRuntime::None => {}
@@ -796,10 +808,12 @@ pub struct OutboundRuntimeRegistry {
     /// leaves this generation's ownership untouched; drain/shutdown skip
     /// exactly these entries (the successor closes them as their full owner).
     moved_out: parking_lot::Mutex<HashSet<uuid::Uuid>>,
-    /// Generation-local configured admission budget. The process-wide
-    /// descriptor gate below is shared by every overlapping generation.
+    /// Generation-local configured admission budget. DNS forks share the
+    /// source generation's semaphore so one config generation cannot exceed
+    /// its configured aggregate dial limit.
     dial_semaphore: Arc<tokio::sync::Semaphore>,
     dial_limit: usize,
+    /// Process-wide descriptor gate shared by every overlapping generation.
     dial_ceiling_semaphore: Arc<tokio::sync::Semaphore>,
     dial_ceiling_limit: usize,
 }
@@ -834,6 +848,27 @@ impl OutboundRuntimeRegistry {
             dial_ceiling_limit,
             previous,
         )
+    }
+
+    /// Build a DNS-owned runtime fork from this generation's immutable node
+    /// configuration. The fork owns fresh protocol sessions and terminal
+    /// lifecycle state, while sharing this generation's configured dial gate
+    /// and process-wide descriptor ceiling.
+    pub fn fork_for_dns(&self) -> Result<Self, RuntimeRegistryError> {
+        let nodes: Vec<Node> = self
+            .nodes
+            .values()
+            .map(|runtime| runtime.node.as_ref().clone())
+            .collect();
+        let (mut fork, _) = Self::build_reusing_with_admission(
+            &nodes,
+            self.dial_limit,
+            Arc::clone(&self.dial_ceiling_semaphore),
+            self.dial_ceiling_limit,
+            None,
+        )?;
+        fork.dial_semaphore = Arc::clone(&self.dial_semaphore);
+        Ok(fork)
     }
 
     /// Build while sharing one immutable process-wide dial descriptor ceiling
@@ -1024,7 +1059,7 @@ impl OutboundRuntimeRegistry {
             match &runtime.runtime {
                 ProtocolRuntime::AnyTls(anytls) => {
                     anytls.pool.retire();
-                    anytls.tls.evict();
+                    anytls.tls.close();
                 }
                 ProtocolRuntime::VlessMux(vless) => vless.retire(),
                 ProtocolRuntime::Quic(quic) => quic.release_warm().await,

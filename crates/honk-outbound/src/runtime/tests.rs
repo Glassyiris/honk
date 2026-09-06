@@ -108,6 +108,7 @@ async fn retirement_releases_cached_non_flow_state() {
 
     assert!(anytls_state.pool.is_retired());
     assert!(!anytls_runtime.tls_connector_loaded());
+    assert!(anytls_runtime.anytls_tls_connector().is_err());
     assert!(client.warm_released.load(Ordering::Acquire));
     assert_eq!(quic.client_count(), Some(0));
     assert!(!client.force_closed.load(Ordering::Acquire));
@@ -296,6 +297,64 @@ async fn overlapping_generations_share_the_startup_dial_ceiling() {
     tokio::time::timeout(Duration::from_millis(100), second.acquire_dial_permit())
         .await
         .expect("released process capacity must admit the successor");
+}
+
+#[tokio::test]
+async fn dns_fork_owns_sessions_but_preserves_dial_limits() {
+    let node = node("dns", NodeProtocol::AnyTLS);
+    let (main, _) = OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+        std::slice::from_ref(&node),
+        1,
+        2,
+        None,
+    )
+    .unwrap();
+    let main = Arc::new(main);
+    let dns = Arc::new(main.fork_for_dns().unwrap());
+
+    main.begin_retirement();
+    assert!(!dns.is_shutdown());
+
+    let held = main.acquire_dial_permit().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), dns.acquire_dial_permit())
+            .await
+            .is_err()
+    );
+    drop(held);
+    let dns_permit = tokio::time::timeout(Duration::from_millis(100), dns.acquire_dial_permit())
+        .await
+        .expect("released generation capacity must admit DNS");
+    let (successor, _) =
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 2, Some(&main)).unwrap();
+    let successor_permit = successor.acquire_dial_permit().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), successor.acquire_dial_permit())
+            .await
+            .is_err()
+    );
+    drop(dns_permit);
+    tokio::time::timeout(Duration::from_millis(100), successor.acquire_dial_permit())
+        .await
+        .expect("released DNS capacity must admit the successor");
+    drop(successor_permit);
+
+    let dns_runtime = dns.get(&node.id).unwrap();
+    let connector = dns_runtime.anytls_tls_connector().unwrap();
+    let connector_lifetime = Arc::downgrade(&connector);
+    drop(connector);
+    main.shutdown().await;
+    assert!(!dns.is_shutdown());
+    assert!(connector_lifetime.upgrade().is_some());
+    let dns_pool = dns_runtime.anytls_pool().unwrap();
+    assert!(!dns_pool.is_retired());
+    dns.shutdown().await;
+    assert!(dns_pool.is_retired());
+    assert!(connector_lifetime.upgrade().is_none());
+    assert!(
+        dns_runtime.anytls_tls_connector().is_err(),
+        "a delayed dial cannot rebuild TLS state after terminal shutdown"
+    );
 }
 
 #[tokio::test]

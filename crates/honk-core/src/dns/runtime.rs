@@ -2,12 +2,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use super::forwarder::DnsForwarder;
 
 pub(crate) const RETIREMENT_DEADLINE: Duration = Duration::from_secs(30);
 pub(crate) const MAX_RETIRED_RUNTIMES: usize = 4;
+const MAX_CONCURRENT_QUERIES: usize = 2048;
 
 mod provider;
 pub(crate) use provider::DnsServiceProvider;
@@ -19,12 +20,19 @@ mod resources {
     #[async_trait]
     pub(crate) trait RuntimeTransport: Send + Sync {
         async fn close(&self);
+        fn reap_tls_connectors(&self, _now: std::time::Instant) -> usize {
+            0
+        }
     }
 
     #[async_trait]
     impl RuntimeTransport for UpstreamPool {
         async fn close(&self) {
             UpstreamPool::close(self).await;
+        }
+
+        fn reap_tls_connectors(&self, now: std::time::Instant) -> usize {
+            UpstreamPool::reap_tls_connectors(self, now)
         }
     }
 }
@@ -73,17 +81,20 @@ pub(crate) use super::projection::RoutingProjectionSnapshot;
 
 pub(crate) struct DnsRuntimeParts {
     pub(crate) generation: RuntimeGeneration,
+    pub(crate) udp_query_limit: usize,
     pub(crate) forwarder: Arc<DnsForwarder>,
     pub(crate) routing_projection: Arc<RoutingProjectionSnapshot>,
-    /// Outbound session generation captured with this DNS snapshot. It stays
-    /// available to existing leases after publication and begins graceful
-    /// pool drain only when the runtime itself retires.
+    /// Defers reusable-state retirement of the traffic registry until this
+    /// generation drains. DNS transports own a separate registry so admitted
+    /// DNS dials can outlive traffic admission.
     pub(crate) outbound_runtime: Option<Arc<honk_outbound::runtime::OutboundRuntimeRegistry>>,
     pub(crate) transport: Arc<dyn RuntimeTransport>,
 }
 
 pub(crate) struct DnsRuntime {
     parts: DnsRuntimeParts,
+    query_limit: Arc<Semaphore>,
+    udp_query_limit: Arc<Semaphore>,
     state: AtomicU8,
     leases: AtomicUsize,
     lease_released: Notify,
@@ -95,6 +106,8 @@ pub(crate) struct DnsRuntime {
 impl DnsRuntime {
     pub(crate) fn new(parts: DnsRuntimeParts) -> Arc<Self> {
         Arc::new(Self {
+            query_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
+            udp_query_limit: Arc::new(Semaphore::new(parts.udp_query_limit)),
             parts,
             state: AtomicU8::new(RuntimeState::Active as u8),
             leases: AtomicUsize::new(0),
@@ -117,12 +130,24 @@ impl DnsRuntime {
         self.leases.load(Ordering::Acquire)
     }
 
+    pub(crate) fn try_acquire_query(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
+        Arc::clone(&self.query_limit).try_acquire_owned()
+    }
+
+    pub(crate) fn try_acquire_udp_query(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
+        Arc::clone(&self.udp_query_limit).try_acquire_owned()
+    }
+
     pub(crate) fn forwarder(&self) -> &Arc<DnsForwarder> {
         &self.parts.forwarder
     }
 
     pub(crate) fn routing_projection(&self) -> &Arc<RoutingProjectionSnapshot> {
         &self.parts.routing_projection
+    }
+
+    pub(crate) fn reap_tls_connectors(&self, now: std::time::Instant) -> usize {
+        self.parts.transport.reap_tls_connectors(now)
     }
 
     pub(crate) fn cache(&self) -> Arc<tokio::sync::Mutex<super::cache::DnsCache>> {
@@ -150,15 +175,20 @@ impl DnsRuntime {
         self.cancellation.notify_waiters();
     }
 
+    async fn cancelled(&self) {
+        let cancelled = self.cancellation.notified();
+        if !self.cancellation_requested.load(Ordering::Acquire) {
+            cancelled.await;
+        }
+    }
+
     async fn retire(self: Arc<Self>, deadline: Duration) {
         self.start_draining();
-        let cancellation = self.cancellation.notified();
-        tokio::pin!(cancellation);
         if self.lease_count() != 0 && !self.cancellation_requested.load(Ordering::Acquire) {
             let timed_out = tokio::select! {
                 () = Self::wait_for_zero_leases(&self) => false,
                 () = tokio::time::sleep(deadline) => true,
-                () = &mut cancellation => false,
+                () = self.cancelled() => false,
             };
             if timed_out {
                 crate::stats::record_dns_event(
@@ -184,7 +214,8 @@ impl DnsRuntime {
             self.wait_closed().await;
             return;
         }
-        self.parts.forwarder.shutdown_prefetch().await;
+        self.request_cancellation();
+        self.parts.forwarder.shutdown_background_tasks().await;
         self.parts.transport.close().await;
         if let Some(runtime) = &self.parts.outbound_runtime {
             runtime.retire_reusable_state().await;
@@ -225,9 +256,44 @@ pub(crate) struct RuntimeLease {
     runtime: Arc<DnsRuntime>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("DNS runtime generation {generation} retired")]
+pub(crate) struct RuntimeCancelled {
+    generation: u64,
+}
+
 impl RuntimeLease {
     pub(crate) fn runtime(&self) -> &DnsRuntime {
         &self.runtime
+    }
+
+    pub(crate) async fn cancelled(&self) -> RuntimeCancelled {
+        self.runtime.cancelled().await;
+        RuntimeCancelled {
+            generation: self.runtime.generation().get(),
+        }
+    }
+
+    pub(crate) async fn run<T>(
+        &self,
+        operation: impl Future<Output = T>,
+    ) -> Result<T, RuntimeCancelled> {
+        tokio::select! {
+            biased;
+            error = self.cancelled() => Err(error),
+            result = operation => Ok(result),
+        }
+    }
+
+    pub(crate) async fn run_reply<T>(
+        &self,
+        operation: impl Future<Output = T>,
+    ) -> Result<T, RuntimeCancelled> {
+        tokio::select! {
+            biased;
+            result = operation => Ok(result),
+            error = self.cancelled() => Err(error),
+        }
     }
 }
 
