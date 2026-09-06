@@ -259,42 +259,51 @@ impl Socks5Handler {
         username: Option<&str>,
         password: Option<&str>,
     ) -> anyhow::Result<SocketAddr> {
-        let methods = if username.is_some() && password.is_some() {
-            vec![METHOD_NO_AUTH, METHOD_USERNAME_PASSWORD]
-        } else {
-            vec![METHOD_NO_AUTH]
-        };
+        // The TCP path bounds the same exchange at `handshake`; without a
+        // deadline here a peer that accepts the connection and then goes
+        // silent leaves this await pending, and the caller only bounds the
+        // connect that precedes it.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let methods = if username.is_some() && password.is_some() {
+                vec![METHOD_NO_AUTH, METHOD_USERNAME_PASSWORD]
+            } else {
+                vec![METHOD_NO_AUTH]
+            };
 
-        let mut greeting = Vec::with_capacity(2 + methods.len());
-        greeting.push(SOCKS5_VERSION);
-        greeting.push(methods.len() as u8);
-        greeting.extend_from_slice(&methods);
-        stream.write_all(&greeting).await?;
+            let mut greeting = Vec::with_capacity(2 + methods.len());
+            greeting.push(SOCKS5_VERSION);
+            greeting.push(methods.len() as u8);
+            greeting.extend_from_slice(&methods);
+            stream.write_all(&greeting).await?;
 
-        let mut response = [0u8; 2];
-        stream.read_exact(&mut response).await?;
+            let mut response = [0u8; 2];
+            stream.read_exact(&mut response).await?;
 
-        if response[0] != SOCKS5_VERSION {
-            anyhow::bail!("SOCKS5: unsupported server version {}", response[0]);
-        }
-
-        match response[1] {
-            METHOD_NO_AUTH => {}
-            METHOD_USERNAME_PASSWORD => {
-                let user = username.unwrap_or("");
-                let pass = password.unwrap_or("");
-                let auth_req = Self::username_password_auth_request(user, pass)?;
-                stream.write_all(&auth_req).await?;
-
-                let mut auth_resp = [0u8; 2];
-                stream.read_exact(&mut auth_resp).await?;
-                if auth_resp[1] != 0x00 {
-                    anyhow::bail!("SOCKS5: authentication failed");
-                }
+            if response[0] != SOCKS5_VERSION {
+                anyhow::bail!("SOCKS5: unsupported server version {}", response[0]);
             }
-            METHOD_NO_ACCEPTABLE => anyhow::bail!("SOCKS5: no acceptable auth method"),
-            m => anyhow::bail!("SOCKS5: unexpected auth method 0x{:02x}", m),
-        }
+
+            match response[1] {
+                METHOD_NO_AUTH => {}
+                METHOD_USERNAME_PASSWORD => {
+                    let user = username.unwrap_or("");
+                    let pass = password.unwrap_or("");
+                    let auth_req = Self::username_password_auth_request(user, pass)?;
+                    stream.write_all(&auth_req).await?;
+
+                    let mut auth_resp = [0u8; 2];
+                    stream.read_exact(&mut auth_resp).await?;
+                    if auth_resp[1] != 0x00 {
+                        anyhow::bail!("SOCKS5: authentication failed");
+                    }
+                }
+                METHOD_NO_ACCEPTABLE => anyhow::bail!("SOCKS5: no acceptable auth method"),
+                m => anyhow::bail!("SOCKS5: unexpected auth method 0x{:02x}", m),
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("SOCKS5 UDP: negotiation timed out"))??;
 
         // VER | CMD=0x03 | RSV | ATYP=0x01 | BND.ADDR=0.0.0.0 | BND.PORT=0
         let request = [
@@ -606,6 +615,35 @@ mod tests {
     use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+
+    /// A peer that accepts and then stays silent must not park the caller: the
+    /// TCP path bounds the same exchange, and only the connect before this one
+    /// is bounded by the caller.
+    #[tokio::test(start_paused = true)]
+    async fn udp_associate_gives_up_on_a_silent_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _accepted = listener.accept().await;
+            std::future::pending::<()>().await;
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            Socks5Handler::udp_associate(&mut stream, None, None),
+        )
+        .await;
+
+        let inner = outcome.expect("udp_associate outlived its own deadline");
+        assert!(
+            inner
+                .unwrap_err()
+                .to_string()
+                .contains("negotiation timed out"),
+            "expected the negotiation deadline to fire"
+        );
+    }
 
     #[test]
     fn socks5_rfc1929_auth_request_rejects_oversized_credentials() {
