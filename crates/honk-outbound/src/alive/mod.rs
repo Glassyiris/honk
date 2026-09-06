@@ -1530,11 +1530,13 @@ impl AliveDialerSet {
     /// URLTest group it belongs to is idle. Nodes outside URLTest groups
     /// are never suspended.
     pub fn is_probe_suspended(&self, node_id: Uuid) -> bool {
-        let groups = self.node_urltest_groups.read();
-        match groups.get(&node_id) {
-            Some(gs) if !gs.is_empty() => gs.iter().all(|g| self.is_urltest_group_idle(g)),
-            _ => false,
-        }
+        // Reload takes `urltest_group_timeout` first and this map last, so the
+        // names are copied out rather than held across the idle checks.
+        let groups = match self.node_urltest_groups.read().get(&node_id) {
+            Some(groups) if !groups.is_empty() => groups.clone(),
+            _ => return false,
+        };
+        groups.iter().all(|group| self.is_urltest_group_idle(group))
     }
 
     /// Number of consecutive TCP failures for this node.

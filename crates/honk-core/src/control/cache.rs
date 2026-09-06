@@ -19,14 +19,15 @@ impl ControlPlane {
         // callback so restoration does not rewrite the same values.
         {
             let config = self.config.read().await;
+            // The setter runs its callbacks synchronously and interrupt handling
+            // reacquires this lock, so the guard is released before the calls.
+            let group_manager = self.group_manager.read().clone();
             for group in &config.groups {
                 if group.policy == GroupPolicy::Selector
                     && let Some(node) = db.load_selector_choice(&group.name)
                 {
                     info!("cache.db: restored selector '{}' = '{}'", group.name, node);
-                    self.group_manager
-                        .read()
-                        .set_selector_choice(&group.name, &node);
+                    group_manager.set_selector_choice(&group.name, &node);
                 }
             }
         }

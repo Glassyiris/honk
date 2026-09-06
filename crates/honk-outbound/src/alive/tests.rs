@@ -285,6 +285,49 @@ async fn test_recovery_cycle_probes_due_dead_udp_nodes() {
     assert!(set.is_alive_for(node_id, ProbeDomain::DnsUdp, IpVersion::V6));
 }
 
+#[test]
+fn test_suspension_check_releases_node_groups_before_reading_timeouts() {
+    // Reload takes urltest_group_timeout first and node_urltest_groups last.
+    // A suspension check reads them in the opposite order, so it must release
+    // the node groups before consulting the timeouts or the two orders form a
+    // cycle. With the timeouts held here the check cannot finish; the node
+    // groups must still be free for reload's next acquisition.
+    let set = std::sync::Arc::new(AliveDialerSet::new());
+    set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
+    set.register_urltest_group("g", &[id(1)], Some(Duration::from_millis(50)));
+
+    let timeouts = set.urltest_group_timeout.write();
+    let (entered, started) = std::sync::mpsc::channel();
+    let prober = {
+        let set = std::sync::Arc::clone(&set);
+        std::thread::spawn(move || {
+            let _ = entered.send(());
+            set.is_probe_suspended(id(1))
+        })
+    };
+    started.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+
+    // The check cannot finish while the timeouts are held, so a map that is
+    // never free within the deadline is one held across the idle lookup.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut node_groups_free = false;
+    while std::time::Instant::now() < deadline {
+        if set.node_urltest_groups.try_write().is_some() {
+            node_groups_free = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(timeouts);
+    prober.join().unwrap();
+
+    assert!(
+        node_groups_free,
+        "the suspension check held node_urltest_groups while waiting for urltest_group_timeout"
+    );
+}
+
 #[tokio::test]
 async fn test_urltest_idle_suspension() {
     let set = AliveDialerSet::new();

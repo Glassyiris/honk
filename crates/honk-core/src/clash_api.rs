@@ -623,9 +623,10 @@ async fn put_proxy(
 
     // cache.db persistence runs through the group manager's persist
     // callback, wired by ControlPlane::init_cache_db.
-    s.group_manager
-        .read()
-        .set_selector_choice(&group_name, &body.name);
+    // The setter runs its callbacks synchronously and interrupt handling
+    // reacquires this lock, so the guard is released before the call.
+    let group_manager = s.group_manager.read().clone();
+    group_manager.set_selector_choice(&group_name, &body.name);
     StatusCode::NO_CONTENT.into_response()
 }
 

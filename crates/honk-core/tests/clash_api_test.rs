@@ -375,6 +375,37 @@ routing {
 }
 
 #[tokio::test]
+async fn test_selector_switch_releases_the_group_manager_lock() {
+    // The callbacks must run without the shared-manager guard: interrupt
+    // handling reacquires it, which wedges behind a waiting reload writer.
+    let app = spawn_app("", "").await;
+    let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let manager = app.state.group_manager.read().clone();
+        let cell = Arc::clone(&app.state.group_manager);
+        let observed = Arc::clone(&observed);
+        manager.set_selector_change_callback(Some(Arc::new(move || {
+            observed.store(
+                cell.try_write().is_some(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        })));
+    }
+
+    let resp = http_client()
+        .put(app.url("/proxies/proxy"))
+        .json(&serde_json::json!({"name": "node-b"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert!(
+        observed.load(std::sync::atomic::Ordering::SeqCst),
+        "the handler held the group manager lock across the selector callbacks"
+    );
+}
+
+#[tokio::test]
 async fn test_proxies_structure_and_selector_switch() {
     let app = spawn_app("", "").await;
     let client = http_client();
