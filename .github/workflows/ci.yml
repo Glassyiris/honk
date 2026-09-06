@@ -209,9 +209,21 @@ jobs:
               lines.push("", "No structural issues detected.");
             }
 
+            const body = lines.join("\n");
+            await core.summary.addRaw(body).write();
+
+            // A pull_request run from a fork gets a read-only token whatever
+            // `permissions:` asks for, so commenting there fails the job and
+            // hides the review that was just written to the step summary.
+            const head = pr.head.repo?.full_name;
+            if (head !== `${context.repo.owner}/${context.repo.repo}`) {
+              core.info("fork pull request: review written to the step summary");
+              return;
+            }
+
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: pr.number,
-              body: lines.join("\n"),
+              body,
             });
