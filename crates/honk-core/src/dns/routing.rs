@@ -8,7 +8,6 @@ mod compiler {
         DnsCond, DnsDomainMatcher, DnsRequestAction, DnsRequestRouting, DnsResponseAction,
         DnsResponseRouting,
     };
-    use tracing::warn;
 
     use super::matcher::{CompiledCond, CompiledDomainMatcher};
     use crate::routing::{
@@ -168,13 +167,8 @@ mod compiler {
                 })?)
             }
             DnsDomainMatcher::Geosite(code) => {
+                // `geosite_domains` already warns when a code expands to nothing.
                 let domains = assets.geosite_domains(std::slice::from_ref(code));
-                if domains.is_empty() {
-                    warn!(
-                        "geosite code '{}' expanded to 0 domains; matcher will never match",
-                        code
-                    );
-                }
                 CompiledDomainMatcher::Geosite(GeositeMatcher::build(&domains))
             }
         })
