@@ -368,8 +368,17 @@ impl GeoAssets {
             }
             match &self.geoip {
                 Some(index) => {
+                    let before = nets.len();
                     if let Some(v) = index.get(&code.to_lowercase()) {
                         nets.extend(v.iter().cloned());
+                    }
+                    if nets.len() == before {
+                        // Same reason as the geosite path: a code that expands
+                        // to nothing silently disables its rule.
+                        tracing::warn!(
+                            code,
+                            "geoip code expanded to zero networks; rule will never match"
+                        );
                     }
                 }
                 None => {
@@ -1074,6 +1083,33 @@ fn split_geoip_entry(data: &[u8]) -> anyhow::Result<(Option<String>, Vec<&[u8]>)
 #[cfg(test)]
 mod scan_tests {
     use super::*;
+
+    #[test]
+    fn geoip_code_expanding_to_nothing_warns_like_geosite() {
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(Arc::new(output.reopen().unwrap()))
+            .finish();
+        let dat = geoip_dat(&[("cn", vec![(&[1, 0, 0, 0], 8)])]);
+        let codes: std::collections::HashSet<String> =
+            ["cn".to_string(), "zz".to_string()].into_iter().collect();
+        let assets = GeoAssets {
+            geosite: None,
+            geoip: Some(parse_geoip_index(&dat, &codes).unwrap()),
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(assets.geoip_nets(&["cn".into()]).len(), 1);
+            assert!(assets.geoip_nets(&["zz".into()]).is_empty());
+        });
+        let output = std::fs::read_to_string(output.path()).unwrap();
+        assert!(output.contains("geoip code expanded to zero networks"));
+        assert!(
+            !output.contains("code=cn"),
+            "a matching code must stay quiet"
+        );
+    }
 
     #[test]
     fn missing_geo_asset_warns_only_when_required() {
