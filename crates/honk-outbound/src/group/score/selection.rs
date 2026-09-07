@@ -182,6 +182,10 @@ impl super::GroupManager {
             .into_iter()
             .filter(|candidate| seen.insert(candidate.node.id))
             .take(3)
+            .map(|mut candidate| {
+                candidate.selection_chain.insert(0, group.name.as_str());
+                candidate
+            })
             .collect();
         self.score_selection_plan(candidates, super::SelectionPlanMode::Authoritative, context)
     }

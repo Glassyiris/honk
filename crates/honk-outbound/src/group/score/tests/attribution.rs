@@ -783,3 +783,23 @@ fn final_outbound_late_completion_keeps_extant_leaf_and_drops_deleted_leaf() {
     assert!(state.has_exact("outer", &context, leaves[0].id));
     assert!(!state.has_exact("outer", &context, leaves[1].id));
 }
+
+#[test]
+fn urltest_retry_plan_keeps_the_group_in_the_selection_chain() {
+    let nodes = [node("a"), node("b")];
+    let mut auto = group("auto", &nodes);
+    auto.policy = honk_config::group::GroupPolicy::URLTest;
+    let manager = super::super::super::GroupManager::new(std::slice::from_ref(&auto), &nodes);
+
+    let context = context("retry.example", IpVersion::V4);
+    let ordinary = manager.selection_plan_for_target("auto", &context);
+    let retry = manager.urltest_retry_plan_for_target("auto", &context);
+
+    assert_eq!(ordinary.entries[0].selection_chain[0], "auto");
+    for entry in &retry.entries {
+        assert_eq!(
+            entry.selection_chain[0], "auto",
+            "the retry plan promises the same chain as an ordinary plan"
+        );
+    }
+}
