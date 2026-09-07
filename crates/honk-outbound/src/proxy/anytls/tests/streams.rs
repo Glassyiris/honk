@@ -121,6 +121,83 @@ async fn concurrent_first_open_keeps_settings_ahead_of_syn() {
 }
 
 #[tokio::test]
+async fn a_server_alert_does_not_become_clean_eof() {
+    use tokio::io::AsyncReadExt;
+
+    let (session, mut server) = establish_test_session("alert").await;
+    expect_handshake(&mut server).await;
+    let mut stream = session
+        .open_stream_direct(b"target".to_vec(), session.try_reserve().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_SYN);
+    assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_PSH);
+
+    write_frame(&mut server, CMD_ALERT, 0, b"authentication failed")
+        .await
+        .unwrap();
+
+    let mut buf = [0u8; 8];
+    let error = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+        .await
+        .expect("read settles")
+        .expect_err("an alerted session must not read as clean EOF");
+    assert!(
+        error.to_string().contains("authentication failed"),
+        "error must carry the alert: {error}"
+    );
+}
+
+#[tokio::test]
+async fn a_deferred_read_error_releases_the_stream_slot() {
+    use crate::session::ManagedSession;
+    use tokio::io::AsyncReadExt;
+
+    let (session, mut server) = establish_test_session("deferred-error").await;
+    expect_handshake(&mut server).await;
+    let mut stream = session
+        .open_stream_direct(b"target".to_vec(), session.try_reserve().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_SYN);
+    assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_PSH);
+    assert_eq!(session.active_streams(), 1);
+
+    write_frame(&mut server, CMD_PSH, stream.sid, b"hello")
+        .await
+        .unwrap();
+    write_frame(&mut server, CMD_ALERT, 0, &vec![0xff; u16::MAX as usize])
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !session.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("alert closes the session");
+
+    let mut buf = [0u8; 32];
+    let n = stream.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"hello");
+    let error = stream.read(&mut buf).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+    assert!(
+        error.to_string().len() <= 4096,
+        "each stream must retain a bounded diagnostic, not the full server alert"
+    );
+
+    assert_eq!(
+        session.active_streams(),
+        0,
+        "the slot must be released once the deferred error is delivered, \
+         even while the caller still holds the stream"
+    );
+    drop(stream);
+}
+
+#[tokio::test]
 async fn empty_control_frames_do_not_close_the_session() {
     let (session, mut server) = establish_test_session("empty-controls").await;
     expect_handshake(&mut server).await;

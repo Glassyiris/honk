@@ -551,6 +551,12 @@ stalled stream 自己 retained 的 payload。session failure 变成
 `ConnectionAborted`；逐 stream 拒绝或 slow-consumer reap 变成
 `ConnectionReset`。
 
+非空的服务端 ALERT 会使 session 失败；空 ALERT 仍被忽略。
+ALERT 与 SYNACK 诊断文本在有损 UTF-8 解码前最多保留 1 KiB 源字节，
+并标记截断，限制每个 deferred error 的大小。
+TCP stream 在交付终止读取结果时释放容量 permit，包括先交付缓冲数据、
+再交付 deferred error 的路径；drop stream 也会释放 permit。
+
 UoT delivery 使用非阻塞 `try_send`。UoT sink 满时会移除该 sink 并退役
 对应 SID，而不是阻塞 session demux，或丢弃任意 chunk 后继续使用已经
 损坏的长度分隔字节流。

@@ -607,6 +607,12 @@ is the fail-safe exception and discards only the stalled stream's retained
 payloads. A session failure becomes `ConnectionAborted`; a per-stream refusal
 or slow-consumer reap becomes `ConnectionReset`.
 
+Non-empty server ALERTs fail the session; empty ALERTs remain ignored.
+ALERT and SYNACK diagnostics retain at most 1 KiB of source bytes before
+lossy UTF-8 decoding and mark truncation, bounding each deferred error.
+TCP streams release their capacity permit on delivery of a terminal read
+result, including a deferred error after buffered data, or on stream drop.
+
 UoT delivery uses nonblocking `try_send`. A full UoT sink is removed and that
 SID is retired rather than blocking the session demux or dropping an arbitrary
 chunk and continuing a corrupted length-delimited byte stream.
