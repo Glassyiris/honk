@@ -148,3 +148,25 @@ pub fn parse_duration_secs(s: &str) -> Option<u64> {
     }
     s.parse().ok()
 }
+
+/// Parse a millisecond duration like `500ms`, `0.5s` or a bare `500`. The
+/// minute and hour suffixes `parse_duration_secs` accepts are deliberately
+/// not part of this grammar. `as u64` saturates, so a non-finite or negative
+/// value is refused rather than becoming `u64::MAX` or zero.
+pub fn parse_duration_ms(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(v) = s.strip_suffix("ms") {
+        return v.parse().ok();
+    }
+    if let Some(v) = s.strip_suffix('s') {
+        return v
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map(|v| (v * 1000.0) as u64);
+    }
+    s.parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| v as u64)
+}

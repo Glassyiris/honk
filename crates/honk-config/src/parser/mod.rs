@@ -803,7 +803,7 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
         cfg.check_interval_secs = parse_duration_secs(v);
     }
     if let Some(v) = kv.get("check_tolerance") {
-        cfg.check_tolerance_ms = parse_duration_ms(v);
+        cfg.check_tolerance_ms = parse_checked_duration_ms(v, "global.check_tolerance")?;
     }
     if let Some(v) = kv.get("dial_mode") {
         cfg.dial_mode = v.clone();
@@ -815,7 +815,7 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
         cfg.allow_insecure = parse_bool(v);
     }
     if let Some(v) = kv.get("sniffing_timeout") {
-        cfg.sniffing_timeout_ms = parse_duration_ms(v);
+        cfg.sniffing_timeout_ms = parse_checked_duration_ms(v, "global.sniffing_timeout")?;
     }
     if let Some(v) = kv.get("tls_implementation") {
         cfg.tls_implementation = v.clone();
@@ -1217,19 +1217,10 @@ fn parse_duration_secs(s: &str) -> u64 {
     crate::types::parse_duration_secs(s).unwrap_or(0)
 }
 
-fn parse_duration_ms(s: &str) -> u64 {
-    let s = s.trim();
-    if s.ends_with("ms") {
-        return s.trim_end_matches("ms").parse().unwrap_or(0);
-    }
-    if s.ends_with('s') {
-        return s
-            .trim_end_matches('s')
-            .parse::<f64>()
-            .map(|v| (v * 1000.0) as u64)
-            .unwrap_or(0);
-    }
-    s.parse::<f64>().map(|v| v as u64).unwrap_or(0)
+fn parse_checked_duration_ms(s: &str, setting: &str) -> Result<u64, crate::ConfigError> {
+    crate::types::parse_duration_ms(s).ok_or_else(|| {
+        crate::ConfigError::Parse(format!("invalid millisecond duration for {setting}: {s}"))
+    })
 }
 
 fn parse_ip_prefer(s: &str) -> crate::dns::DnsStrategy {

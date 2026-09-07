@@ -40,6 +40,32 @@ global {
     }
 
     #[test]
+    fn test_millisecond_durations_reject_values_they_cannot_read() {
+        for (value, expected) in [("50ms", 50), ("0ms", 0), ("0.5s", 500), ("50", 50)] {
+            let input = format!("global {{\n    check_tolerance: {value}\n}}");
+            let config = parse_dae_config(&input).unwrap();
+            assert_eq!(config.global.check_tolerance_ms, expected, "{value}");
+        }
+
+        for value in [
+            "1m", "2h", "1min", "abc", "-5ms", "-0.5s", "1.5ms", "inf", "nan", "",
+        ] {
+            for (setting, key) in [
+                ("global.check_tolerance", "check_tolerance"),
+                ("global.sniffing_timeout", "sniffing_timeout"),
+            ] {
+                let input = format!("global {{\n    {key}: {value}\n}}");
+                let error = parse_dae_config(&input).unwrap_err();
+                assert!(matches!(error, crate::ConfigError::Parse(_)), "{value}");
+                assert!(
+                    error.to_string().contains(setting),
+                    "error must identify {setting} for {value}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_parse_store_subscribe() {
         assert!(
             parse_dae_config("global {}")
