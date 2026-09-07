@@ -314,8 +314,25 @@ fn test_priority_ordering() {
     assert_eq!(router.route(&conn), "proxy2");
 }
 
+/// Both geosite route tests need `geosite.dat`. This override lived inside
+/// `test_geosite_route`, so on a checkout where the asset is reachable only
+/// through it, `test_geosite_cn_route` passed or failed by whichever ran
+/// first in the process.
+#[allow(clippy::let_unit_value)]
+fn use_repo_geo_assets() {
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    let _ = unsafe {
+        std::env::set_var(
+            "DAE_LOCATION_ASSET",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../.."),
+        )
+    };
+}
+
 #[test]
 fn test_geosite_cn_route() {
+    use_repo_geo_assets();
+
     let rules = vec![RoutingRule {
         name: "geosite-cn-direct".into(),
         condition: RoutingCondition {
@@ -790,15 +807,8 @@ fn test_geoip_private_route() {
 }
 
 #[test]
-#[allow(clippy::let_unit_value)]
 fn test_geosite_route() {
-    // FIXME: Audit that the environment access only happens in single-threaded code.
-    let _ = unsafe {
-        std::env::set_var(
-            "DAE_LOCATION_ASSET",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../.."),
-        )
-    };
+    use_repo_geo_assets();
 
     let rules = vec![RoutingRule {
         name: "geosite-cn".into(),
