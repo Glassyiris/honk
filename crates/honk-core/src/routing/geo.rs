@@ -500,7 +500,16 @@ fn parse_geosite_index(
                 }
             }
         }
-        index.insert(code, IndexedGeosite { domains, attrs });
+        if let Some(previous) = index.insert(code.clone(), IndexedGeosite { domains, attrs }) {
+            // Same reason the zero-expansion paths warn: the earlier block's
+            // entries are gone, and which rules that changes is not something
+            // the operator can see from the asset.
+            tracing::warn!(
+                code,
+                dropped = previous.domains.len(),
+                "duplicate geosite code in asset; only the last block is used"
+            );
+        }
     }
 
     Ok(index)
@@ -619,8 +628,14 @@ fn parse_geoip_index(
             continue;
         }
         let entry = decoder.read_len_delimited()?;
-        if let Some((code, entry_nets)) = parse_geoip_entry(entry, codes)? {
-            index.insert(code, entry_nets);
+        if let Some((code, entry_nets)) = parse_geoip_entry(entry, codes)?
+            && let Some(previous) = index.insert(code.clone(), entry_nets)
+        {
+            tracing::warn!(
+                code,
+                dropped = previous.len(),
+                "duplicate geoip code in asset; only the last block is used"
+            );
         }
     }
 
@@ -1292,6 +1307,52 @@ mod scan_tests {
             geosite: Some(parse_geosite_index(dat, &set).unwrap()),
             geoip: None,
         }
+    }
+
+    #[test]
+    fn a_duplicate_category_code_warns_and_keeps_the_last_block() {
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(Arc::new(output.reopen().unwrap()))
+            .finish();
+        let site = geosite_dat(&[
+            ("DUP", vec![domain_msg(2, "first.example", &[])]),
+            ("DUP", vec![domain_msg(2, "second.example", &[])]),
+            ("ONCE", vec![domain_msg(2, "only.example", &[])]),
+        ]);
+        let ip = geoip_dat(&[
+            ("dup", vec![(&[1, 0, 0, 0], 8)]),
+            ("dup", vec![(&[2, 0, 0, 0], 8)]),
+        ]);
+        let site_codes: std::collections::HashSet<String> = ["dup".to_string(), "once".to_string()]
+            .into_iter()
+            .collect();
+        let ip_codes: std::collections::HashSet<String> = ["dup".to_string()].into_iter().collect();
+
+        let assets = tracing::subscriber::with_default(subscriber, || GeoAssets {
+            geosite: Some(parse_geosite_index(&site, &site_codes).unwrap()),
+            geoip: Some(parse_geoip_index(&ip, &ip_codes).unwrap()),
+        });
+
+        let output = std::fs::read_to_string(output.path()).unwrap();
+        assert!(output.contains("duplicate geosite code in asset"));
+        assert!(output.contains("duplicate geoip code in asset"));
+        assert!(
+            !output.contains("once"),
+            "a code that appears once must stay quiet: {output}"
+        );
+
+        let domains = assets.geosite_domains(&["dup".to_string()]);
+        assert_eq!(domains.len(), 1);
+        let matcher = GeositeMatcher::build(&domains);
+        assert!(matcher.matches("www.second.example"));
+        assert!(!matcher.matches("www.first.example"));
+        assert_eq!(
+            assets.geoip_nets(&["dup".into()]),
+            vec!["2.0.0.0/8".parse::<ipnet::IpNet>().unwrap()]
+        );
     }
 
     fn attr_fixture() -> Vec<u8> {
