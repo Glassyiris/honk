@@ -83,7 +83,7 @@ impl Defragmenter {
             bytes: 0,
             updated: Instant::now(),
         });
-        if entry.frags.len() != frag_total {
+        if entry.updated.elapsed() >= DEFRAG_MAX_AGE || entry.frags.len() != frag_total {
             entry.frags = (0..frag_total).map(|_| None).collect();
             entry.count = 0;
             entry.bytes = 0;
@@ -154,6 +154,17 @@ mod tests {
         assert!(defrag.feed(65_500, 0, 2, vec![4]).is_none());
         assert_eq!(defrag.feed(0, 1, 2, vec![5]), Some(vec![3, 5]));
         assert_eq!(defrag.feed(65_500, 1, 2, vec![6]), Some(vec![4, 6]));
+    }
+
+    #[test]
+    fn an_expired_buffer_does_not_absorb_a_new_packet() {
+        let mut defrag = Defragmenter::new(8);
+        assert!(defrag.feed(7, 0, 2, vec![1]).is_none());
+        let key = defrag.packet_key(7);
+        defrag.map.get_mut(&key).expect("buffer pending").updated =
+            Instant::now() - DEFRAG_MAX_AGE - Duration::from_secs(1);
+        assert!(defrag.feed(7, 1, 2, vec![3]).is_none());
+        assert_eq!(defrag.feed(7, 0, 2, vec![2]), Some(vec![2, 3]));
     }
 
     #[test]
