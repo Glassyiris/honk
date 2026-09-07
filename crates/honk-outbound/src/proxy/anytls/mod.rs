@@ -2472,10 +2472,10 @@ pub(crate) struct AnyTlsStream {
     /// first, then the error — never silently merge them).
     read_err: Option<std::io::Error>,
     /// Outbound frame slot: the payload is owned by the stream until it
-    /// is enqueued — cancelling the caller's write future can neither
-    /// lose it nor enqueue it twice. `poll_write` only returns `Ok(n)`
-    /// after exactly these `n` bytes were queued (never a number derived
-    /// from a different call's buffer).
+    /// is enqueued, so a resumed write cannot enqueue it twice, and a
+    /// cancelled one queued nothing to lose. `poll_write` only returns
+    /// `Ok(n)` after exactly these `n` bytes were queued (never a number
+    /// derived from a different call's buffer).
     out_slot: Option<(bytes::Bytes, usize)>,
     /// Waiter for a writer-queue data permit while `out_slot` is occupied.
     permit_fut: Option<
@@ -2556,8 +2556,14 @@ impl tokio::io::AsyncWrite for AnyTlsStream {
         }
         let this = self.as_mut().get_mut();
 
-        if this.out_slot.is_none() {
-            this.out_slot = Some((bytes::Bytes::copy_from_slice(&buf[..chunk]), chunk));
+        // A payload sits here only while it is still unqueued — a successful
+        // enqueue takes it — and a write that returned Pending accepted no
+        // bytes, so a cancelled call's payload belongs to nobody and this
+        // call's buffer replaces it. Equal bytes need no replacement, which
+        // keeps a resumed write from reallocating on every poll.
+        match &this.out_slot {
+            Some((payload, _)) if payload.as_ref() == &buf[..chunk] => {}
+            _ => this.out_slot = Some((bytes::Bytes::copy_from_slice(&buf[..chunk]), chunk)),
         }
 
         if let Some((payload, n)) = this.out_slot.take() {

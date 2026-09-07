@@ -388,6 +388,56 @@ async fn test_poll_write_cancel_safety() {
 }
 
 #[tokio::test]
+async fn a_cancelled_write_does_not_send_or_count_its_bytes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (session, mut server) = establish_test_session("127.0.0.1:444").await;
+    expect_handshake(&mut server).await;
+    let mut addr_rx = spawn_echo_server(server);
+    let target = vec![0x01, 127, 0, 0, 1, 0x01, 0xbb];
+    let permit = session.try_reserve().unwrap();
+    let mut stream = session.open_stream_direct(target, permit).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), addr_rx.recv())
+        .await
+        .unwrap();
+
+    let sem = Arc::clone(&session.writer_q.data_permits);
+    let mut hog = Vec::new();
+    while let Ok(p) = Arc::clone(&sem).try_acquire_owned() {
+        hog.push(p);
+    }
+    assert!(!hog.is_empty());
+
+    let old = b"old-payload".to_vec();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), stream.write(&old))
+            .await
+            .is_err()
+    );
+
+    // The cancelled write queued nothing, so the next call must send its own
+    // buffer and report its own length.
+    drop(hog);
+    let new = b"new".to_vec();
+    let written = tokio::time::timeout(Duration::from_secs(2), stream.write(&new))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        written,
+        new.len(),
+        "count must describe the buffer passed in"
+    );
+
+    let mut echoed = vec![0u8; new.len()];
+    tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut echoed))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(echoed, new, "the cancelled payload must not reach the peer");
+}
+
+#[tokio::test]
 async fn test_pool_offer_reuses_and_invalidates() {
     let pool = crate::session::SessionPool::new(crate::session::SessionPoolConfig::default());
     let addr = "127.0.0.1:1234";
