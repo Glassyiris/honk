@@ -8,6 +8,8 @@ A new flow is first classified by the eBPF routing engine. A complete kernel dec
 
 The routing result is therefore a property of the flow, not of each packet. Established packets use the decision stored in conntrack state and do not repeat rule evaluation or read the current Clash-mode flags.
 
+- [`src/routing.rs`](../../../crates/honk-config/src/routing.rs) — `RoutingRule`: condition, one outbound tag, priority, **`must` flag** (Go dae: match continues searching, not final). `RoutingCondition`: 14 matcher lists including dscp, ip_version, mac, process_name, geoip/geosite. `RoutingOutbound`: one group tag or built-in `direct`/`block`; unwired structured complex variants removed. `ClashRuleDisplay`: Simple/Complex/Match; `/rules` retains native simple matcher types, using `complex` only for compound/negated/`must` statements. Also `RoutingConfig`. `Config::validate` rejects rule/fallback bare node outbounds (no eBPF outbound id; wrap in a group) and group names shared with config-defined nodes.
+
 ## Kernel routing
 
 ### `MatchSet` evaluation
@@ -17,6 +19,8 @@ The routing result is therefore a property of the flow, not of each packet. Esta
 Multiple values inside one condition form an OR chain. Distinct conditions form an AND chain. The intermediate `LogicalOr` and `LogicalAnd` outcomes preserve this structure without allocating a rule object in the kernel. A final fallback entry gives unmatched flows a real outbound.
 
 At route entry, `route()` prepares full-prefix source, destination, and MAC keys and calls `bpf_loop` over the selected bank. `RouteCtx` maintains `GoodSubrule`, `BadRule`, `Must`, DNS-query, and domain-known state across loop iterations. A final result encodes the outbound in bits 0–7, the mark in bits 8–39, and `must` in bit 40.
+
+- [`src/route.rs`](../../../crates/honk-ebpf/src/route.rs): `route()` + `RouteCtx` over `MatchSet`s via `bpf_loop`, 1:1 Go dae `kern/tproxy.c` port with group-bitmap skips. Do not confuse `src/routing.rs`, only helper `bpf_sock_is_dae_socket`. Removed `src/compat.rs` no-op `tproxy_sockops`/`tproxy_sk_msg_redir`: sockops+sk_msg caused kernel panics on some kernels; TC redirect replaces it. honk-core loads strictly by name, so neither stub was referenced.
 
 | Index | Meaning in the route state machine |
 | --- | --- |
@@ -73,6 +77,8 @@ The kernel's reserved `MustRules` outcome has Go dae's non-final behavior: it re
 IP and source-IP conditions use `BinaryLpmTrie`, a compact binary trie with 32 levels for IPv4 and 128 for IPv6. Lookup stops as soon as it encounters a matched prefix or a missing child.
 
 `GeoAssets` parses `geoip.dat` and `geosite.dat` at most once per `Router` build and decodes only categories referenced by the configuration. `category@attr` splits at the first `@`, indexes the base category, and keeps entries carrying that attribute key; key presence is case-insensitive. `GeositeMatcher` uses hash sets for exact names and dot-boundary suffixes, one Aho-Corasick automaton for keywords, and compiled regular expressions for regex entries.
+
+- [`src/routing/`](../../../crates/honk-core/src/routing/) — userspace `Router`: priority-ordered compiled routes, `route_with_must`, `GeositeMatcher` hash sets/Aho-Corasick/regex. `lpm.rs`: `BinaryLpmTrie`. `geo.rs`: `GeoAssets`, parsing `geoip.dat`/`geosite.dat` once per Router build and decoding only referenced codes. `category@attr` decodes base-category per-entry attribute keys, filtering on expansion by dae Cut-on-first-`@` and case-insensitive key presence. Regular-file asset search order: [Configuration](../configuration.md).
 
 ## Domain routing and sniffing
 
