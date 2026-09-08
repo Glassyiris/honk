@@ -63,7 +63,7 @@ async fn stale_remove_is_repaired_by_new_same_generation_owner() {
     let now = tokio::time::Instant::now();
     let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 31));
     let mut state = DesiredState::new(snapshot(1, 1, 2), 10_000);
-    let mut backend = MockEbpfBackend::new();
+    let mut backend = backend_for_test(&snapshot(1, 1, 2));
     let key = maps::ip_addr_to_lpm_key(ip);
     state.observe(positive("a.test", &[ip], Duration::from_secs(30)), now);
     let initial = state.batch(now);
@@ -196,13 +196,14 @@ async fn changed_entry_is_written_before_obsolete_entry_is_deleted_and_delete_re
 
 #[tokio::test(start_paused = true)]
 async fn spawned_worker_converges_mock_map_after_transient_failure() {
-    let ebpf: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
-        Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
+    let current = snapshot(7, 1, 2);
+    let ebpf: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> = Arc::new(tokio::sync::RwLock::new(
+        Box::new(backend_for_test(&current)),
+    ));
     ebpf.write()
         .await
         .inject_projection_fault(ProjectionMapOperation::Set, 1, false)
         .expect("fault injection");
-    let current = snapshot(7, 1, 2);
     let projection = RoutingProjection::spawn(Arc::clone(&ebpf), Arc::clone(&current));
     let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
     projection.submit(current, positive("a.test", &[ip], Duration::from_secs(30)));
@@ -222,6 +223,80 @@ async fn spawned_worker_converges_mock_map_after_transient_failure() {
         projection.counters().write_failures
     );
     projection.shutdown(Duration::from_secs(30)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_observation_drains_multiple_batches_without_another_wake() {
+    let current = snapshot(1, 1, 2);
+    let ebpf: SharedBackend = Arc::new(tokio::sync::RwLock::new(Box::new(backend_for_test(
+        &current,
+    ))));
+    let projection = RoutingProjection::spawn(Arc::clone(&ebpf), Arc::clone(&current));
+    let ips = (0..600u32)
+        .map(|ip| IpAddr::V4(Ipv4Addr::from(0xc0000200 + ip)))
+        .collect::<Vec<_>>();
+    projection.submit(current, positive("a.test", &ips, Duration::from_secs(300)));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if ebpf.read().await.projection_map_snapshot().len() == ips.len() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("all admitted IPs must publish before TTL expiry without more DNS traffic");
+    assert!(
+        ebpf.read()
+            .await
+            .projection_map_snapshot()
+            .iter()
+            .all(|(_, value)| value.bitmap[0] == 1)
+    );
+    projection.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn reload_prefilled_facts_are_removed_after_clear_or_concurrent_expiry() {
+    for expire_during_publication in [false, true] {
+        let old = snapshot(1, 1, 2);
+        let new = snapshot(2, 4, 8);
+        let (projection, _receiver, ebpf) = projection_for_test(Arc::clone(&old));
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 91));
+        projection.submit(old, positive("a.test", &[ip], Duration::from_secs(30)));
+
+        let mut backend = ebpf.write().await;
+        let publication = projection.prepare_snapshot_publication();
+        let published = publication.project(&new);
+        let plan = crate::control::routing_matcher::RoutingPushPlan::compile(
+            &new.matcher,
+            &std::collections::HashMap::from([("direct".to_owned(), 0)]),
+            "direct",
+            honk_config::types::DialMode::Domain,
+        )
+        .unwrap();
+        let entries = published
+            .iter()
+            .map(|(ip, bitmap)| (maps::ip_addr_to_lpm_key(*ip), *bitmap))
+            .collect::<Vec<_>>();
+        backend.publish_routing_plan(&plan, &entries).unwrap();
+        if expire_during_publication {
+            projection
+                .state
+                .lock()
+                .expire(tokio::time::Instant::now() + Duration::from_secs(31));
+        }
+        publication.commit(Arc::clone(&new), Some(published));
+        drop(backend);
+        if !expire_during_publication {
+            projection.submit(new, ProjectionObservation::Clear { domain: "a.test" });
+        }
+        worker::flush_for_test(&projection, &ebpf).await;
+        assert!(
+            ebpf.read().await.projection_map_snapshot().is_empty(),
+            "published facts must remain owned until their removal is acknowledged"
+        );
+    }
 }
 
 #[tokio::test]

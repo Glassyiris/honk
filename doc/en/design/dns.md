@@ -2,7 +2,7 @@
 
 This document describes the userspace DNS architecture shared by transparent port-53 interception and the optional `dns.bind` listener.
 
-Field-level settings, accepted URI forms, and defaults belong in the [DNS configuration reference](../reference/dns.md). The cache is entirely in userspace; `DOMAIN_ROUTING_MAP` stores learned routing projections, not DNS responses.
+Field-level settings, accepted URI forms, and defaults belong in the [DNS configuration reference](../reference/dns.md). The cache is entirely in userspace; generation-owned routing projection and domain-fact maps store learned predicate facts, not DNS responses.
 
 ## Architecture
 
@@ -18,7 +18,7 @@ flowchart LR
     R --> O[Typed outcome]
     O --> X[Ingress reply]
     O --> M[Routing projection]
-    M --> D[DOMAIN_ROUTING_MAP]
+    M --> D[Generation-owned domain-fact maps]
 ```
 
 Both ingress adapters use the same `DnsController`, current `DnsServiceProvider`, forwarder, cache, singleflight set, upstream pools, and routing projection. An adapter owns admission until reply I/O completes; it does not write domain routes directly.
@@ -32,14 +32,14 @@ Both ingress adapters use the same `DnsController`, current `DnsServiceProvider`
     - `forwarder/`, `engine/`, `planner/`, `policy.rs` — [resolution pipeline](#resolution-pipeline) and request/response policy.
     - `cache/` — [answer cache and persistence](#cache-and-persistence).
     - `upstream_pool/`, `transport/` — [upstream sessions and drivers](#upstream-transports).
-    - `projection/` — [`DOMAIN_ROUTING_MAP` reconciliation](#routing-projection).
+    - `projection/` — generation-owned routing projection and domain-fact reconciliation ([routing projection](#routing-projection)).
     - `service.rs`, `resolver.rs` — current-provider access for transparent DNS, `dns.bind`, Clash API, and application lookups.
 
 ## Ingress paths
 
 | Path | Socket and destination model | Reply model |
 | --- | --- | --- |
-| Transparent port 53 | The eBPF TCP and UDP fast path redirects port-53 traffic without the full route loop. The adapter preserves the intercepted original destination and ingress transport. | Transparent UDP uses an anyfrom socket bound to the original destination; TCP replies on the intercepted stream. Request action `asis` dials that original destination and preserves TCP/UDP, including UDP `TC` fallback to TCP. |
+| Transparent port 53 | LAN-forwarded TCP and UDP destination port `53` takes the eBPF early fast path, which skips the compiled traffic policy and redirects to the control plane. Host-originated WAN port-53 traffic uses the generated routing result; a non-`must` result is handed to userspace as `ControlPlaneRouting` with its mark intact, while terminal `must` decisions retain their native result. | Transparent UDP uses an anyfrom socket bound to the original destination; TCP replies on the intercepted stream. Request action `asis` dials that original destination and preserves TCP/UDP, including UDP `TC` fallback to TCP. |
 | Standalone `dns.bind` | Selected TCP/UDP sockets are ordinary unmarked sockets in the host network namespace. They have no intercepted destination. | TCP replies on the accepted socket. UDP uses packet info so a wildcard bind replies from the exact local address and interface that received the query. |
 
 `DnsRequestMeta { source_ip, original_dst }` carries the logical client source and intercepted destination as one immutable value. Both transparent and standalone adapters set `source_ip` from the socket peer; only transparent interception sets `original_dst`. IPv4-mapped IPv6 peers normalize to IPv4. Flow-associated TCP/UDP lookups use the admitted flow's client address and have no intercepted DNS destination. Internal, bootstrap, prefetch, and Clash API queries have neither value.
@@ -208,7 +208,7 @@ Direct UDP assigns each query a fresh CSPRNG-selected 16-bit ID, verifies both I
 
 ## Routing projection
 
-`DnsController` converts resolution outcomes into desired state rather than writing `DOMAIN_ROUTING_MAP` inline:
+`DnsController` converts resolution outcomes into generation-owned desired state rather than writing domain facts inline:
 
 | Outcome | Projection observation |
 | --- | --- |
@@ -216,9 +216,15 @@ Direct UDP assigns each query a fresh CSPRNG-selected 16-bit ID, verifies both I
 | Accepted NODATA or NXDOMAIN | Clear that domain owner. |
 | Accepted SERVFAIL or rejected policy result | Retain current state. |
 
-`DOMAIN_ROUTING_MAP` remains global and source-independent. Source-aware request routing isolates DNS exchange scopes and answers; it does not partition eBPF domain observations or ordinary traffic routing.
+The domain association remains global and source-independent within each policy generation. Source-aware request routing isolates DNS exchange scopes and answers; it does not partition eBPF domain observations or ordinary traffic routing. Projection evaluates every domain predicate independently of non-domain rule conditions, including predicates used by negation; a known domain with no matching predicate is eligible for a present zero bitmap.
 
-The worker reconciles generation-tagged desired state in batches of at most 256 sets/removes. Failed writes remain dirty and retry with bounded backoff. Before a batch mutates the backend, the worker acquires the backend lock and rechecks the generation while holding the publication fence. Reload installs the replacement projection snapshot under the same backend lock. An old batch can therefore neither enter nor continue mutating the map after a replacement generation is published.
+Projection retains at most 10,000 domain owners and admits at most 49,152 unique IP keys into the 65,536-entry domain map. The selected desired/reload set has a separate 32,768-key ceiling for present-zero facts, leaving space for later matching DNS facts; obsolete zero keys awaiting successful deletion can temporarily exceed that sub-limit within the total applied ceiling. The remaining 16,384 map slots are reserved from DNS projection for sniff writes. IPv4 and mapped-IPv6 owners share one key and contribute ORed facts. Incremental reconciliation and reload use the same admission policy: evict zero bitmaps first, then the highest IP within one priority class. Omitted owners remain available for projection on a later policy generation; ordinary refresh can re-admit an omitted IP when space is available. Capacity pressure emits a warning.
+
+An omitted key behaves like an ordinary missing domain fact, not a fabricated zero bitmap. Existing dial-mode and terminal `must`/`block` semantics still apply: eligible unresolved direct results enter control-plane routing, while this budget does not introduce blanket unknown-to-punt behavior or change `ip` mode. Sniff writes share the physical map and can still exhaust their headroom; backend write failures remain observable and retried where applicable.
+
+The worker reconciles generation-tagged desired state in batches of at most 256 sets/removes and schedules remaining ready work without waiting for another DNS observation. Obsolete keys are selected before additions; new DNS keys wait for confirmed removals when the applied projection reaches its IP ceiling, including across removal failures. Failed writes remain dirty and retry with bounded backoff. Before a batch mutates a generation-owned domain-fact map, the worker acquires the backend lock and rechecks the generation while holding the publication fence. Reload installs the replacement projection snapshot under the same backend lock. An old batch can therefore neither enter nor continue mutating the map after a replacement generation is published.
+
+Retry wakeups and batch admission use the same capacity-aware per-IP deadline; an overdue insertion blocked by a full projection cannot spin while a deletion backs off. A successful reload records the exact IP slice installed in the new map as applied state before reconciling current owners, including any that expired during loading. Worker writes and their acknowledgements remain under one generation fence, so an old completion cannot overwrite that published accounting. Reloads that keep the physical map also keep its existing applied state.
 
 ## Generations and reload
 

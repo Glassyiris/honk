@@ -6,7 +6,7 @@ Re-read it when a conversation grows long or context is trimmed: a rule read onc
 
 ## Project overview
 
-`honk`: Rust transparent-proxy engine for Linux, **inspired by** [dae](https://github.com/daeuniverse/dae) (eBPF datapath/configuration) and [sing-box](https://github.com/SagerNet/sing-box) (outbound groups, multi-protocol dialers, Clash-compatible API), not a line-for-line port. Kernel: dae TC + match_set + `dae0`/`daens`; userspace outbound/control: sing-box-oriented designs.
+`honk` is a Rust transparent-proxy engine for Linux, **inspired by** [dae](https://github.com/daeuniverse/dae) (eBPF datapath and configuration surface) and [sing-box](https://github.com/SagerNet/sing-box) (outbound groups, multi-protocol dialers, Clash-compatible API). It is not a line-for-line port of either: the kernel path uses TC hooks with a restricted native-BPF routing policy compiled from userspace, while the userspace outbound/control stack follows sing-box-oriented designs.
 
 - `honk-core` intercepts via TC redirect and userspace proxy relay. Ambiguous LAN UDP uses default-on NFQUEUE 320 when prerequisites pass (`global.nfqueue_enable: false` disables; see Configuration). Its owned nftables table/chain installs no global `iptables` TPROXY rules.
 - `honk-config` provides shared types/parsers for original dae `{ section { ... } }`, the primary and only documented config syntax.
@@ -39,7 +39,7 @@ Re-read it when a conversation grows long or context is trimmed: a rule read onc
     └── honk-ebpf             # Kernel eBPF programs (EXCLUDED from workspace, own Cargo.lock)
 ```
 
-**Absent despite older docs:** `Makefile`, `scripts/`, `Dockerfile`, `docker-compose.yml`, `plan.md`, `run_tests.sh`, `test-honk.sh`, `log/`; vendored reference checkouts `honk/`, `outbound/`, `sing-box/` are `.gitignore`d. Removed `run` / `deploy` / `docker*` recipes depended on missing files; use `run-debug`, `run-dae`, `deploy-vyos`. Root-gated `test-netns` remains the real-kernel integration recipe.
+Notable absences (referenced by older docs but **not in this tree**): `Makefile`, `scripts/`, `Dockerfile`, `docker-compose.yml`, `plan.md`, `run_tests.sh`, `test-honk.sh`, `log/`, and the vendored reference checkouts (`honk/`, `outbound/`, `sing-box/` — these paths are `.gitignore`d). The old `run` / `deploy` / `docker*` recipes were removed with those missing files; use `run-debug`, `run-dae`, and `deploy-vyos`. Root-gated real-kernel checks are split between `test-routing` for compiled routing and `test-netns`, which depends on it for the remaining integration tests.
 
 ## Technology stack
 
@@ -78,7 +78,7 @@ cargo test --all                      # full suite (see current validation guida
 The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 
 - `default = ["clash-api", "mimalloc", "rprx"]`
-- `ebpf` — aya real backend + `honk-nfqueue`, requires Linux kernel 5.8+; otherwise `MockEbpfBackend`. NFQUEUE activation follows Configuration.
+- `ebpf` — aya real backend + `honk-nfqueue`, requires Linux kernel 6.12+; otherwise `MockEbpfBackend`. NFQUEUE activation follows Configuration.
 - `clash-api` — Clash-compatible REST/WS API (pulls in optional axum/tower-http).
 - `mimalloc` — shipped binary allocates through mimalloc (see Technology stack); build with `--no-default-features --features "clash-api,ebpf,rprx"` for a stock-malloc binary.
 - `rprx` — forwards to `honk-outbound/rprx`: registers VLESS (VLESS Encryption and xtls-rprx-vision) and VMess handlers; without it VLESS/VMess nodes parse fine but fail at dial with "No handler for protocol".
@@ -88,7 +88,7 @@ Score is always compiled, without a Cargo feature; omitted policy selects Select
 `build.rs` always emits `HONK_VERSION` from the GitHub release tag, local `git describe`, or Cargo package version without Git metadata. `honk_core::VERSION` supplies both CLIs and Clash `/version`; runtime needs no Git. With `ebpf`, locate `crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf` or `target/honk-core.o` and **verify `.BTF`**. Missing/BTF-less objects trigger `cargo +nightly` rebuild, stripping child `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`: environment flags override `crates/honk-ebpf/.cargo/config.toml`'s `--btf` and silently omit BTF. Copy to `OUT_DIR/honk-ebpf.o`, set `HONK_EBPF_OBJECT`; `lib.rs` embeds with `include_bytes!`. Runtime override: `--bpf-object`.
 
 ```bash
-# Requires Linux kernel 5.8+, clang/llvm/libbpf headers, nightly + bpf-linker.
+# Requires Linux kernel 6.12+, clang/llvm/libbpf headers, nightly + bpf-linker.
 # build.rs auto-builds the eBPF object on first build (~30s).
 cargo build --release -p honk-core --features ebpf
 sudo ./target/release/honk-core --config /etc/honk/config.dae          # embedded object
@@ -112,15 +112,7 @@ cd crates/honk-ebpf
 cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
 ```
 
-- Build (needs nightly + `bpf-linker`):
-
-    ```bash
-    cd crates/honk-ebpf
-    cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
-    # → crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf
-    ```
-
-    `.cargo/config.toml` resolves `bpf-linker` from `PATH`. CI tracks the latest nightly toolchain and pins the prebuilt `bpf-linker` 0.11.0 release.
+`.cargo/config.toml` resolves `bpf-linker` from `PATH`. CI tracks the latest nightly toolchain and pins the prebuilt `bpf-linker` 0.11.0 release.
 
 
 ### Justfile (preferred for day-to-day dev)
@@ -128,8 +120,9 @@ cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
 | Recipe                                                                          | Purpose                                                                                                                                                                                                                                      |
 | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `build` / `check` / `lint` / `fmt`                                              | `cargo build --release` / `check` / `clippy --all -D warnings` / `fmt --all`                                                                                                                                                                 |
+| `test-routing` | Root-gated compiled-policy check: builds the `routing-test` eBPF object and exercises the real object against independent goldens plus failed root-publication preservation (Linux 6.12+) |
 | `test` / `test-ci` / `test-core` / `test-config` / `test-ebpf`                  | Test suites (`test` = full workspace; `test-ci` = CI gate with the known legacy routing failure skipped; `test-ebpf` = honk-ebpf-common only)                                                                                                |
-| `test-netns`                                                                    | Root-gated real-kernel tests: production NFQUEUE/nftables IPv4+IPv6 held-verdict contract, eBPF netlink/netns roundtrips, link ownership/rebind lifecycle, and pinned allocator rollback compatibility (`--features ebpf --ignored`, serial) |
+| `test-netns`                                                                    | Depends on `test-routing`; root-gated real-kernel tests for production NFQUEUE/nftables IPv4+IPv6 held-verdict contract, eBPF netlink/netns roundtrips, link ownership/rebind lifecycle, and pinned allocator rollback compatibility (`--features ebpf --ignored`, serial) |
 | `outbound-ci` / `outbound-ci-e2e`                                               | honk-outbound gate (`ci/outbound-ci.sh`: fmt + clippy + honk-config & honk-outbound suites; `...-e2e` adds live hy2 e2e via `HONK_HY2_SERVER=`) — run after every outbound change                                                            |
 | `dns-ci`                                                                        | DNS subsystem gate (`ci/dns-ci.sh`: fmt + clippy + honk-config + honk-core dns/control + honk-outbound suites) — run after every DNS-path change                                                                                             |
 | `build-core` / `build-core-ebpf`                                                | honk-core with `ebpf` feature                                                                                                                                                                                                                |
@@ -148,7 +141,7 @@ Removed `run` / `deploy` / `docker*` recipes called absent `scripts/debug-local.
 
 ### CI / releases
 
-`.github/workflows/ci.yml`: fmt + clippy, workspace gate, Ubuntu hosted-VM eBPF job. The VM BTF-checks the object, mounts bpffs, installs routing-test geo assets, and runs full `honk-core --features ebpf --lib`. Then serially run real NFQUEUE/nftables netns, TC/cgroup link lifecycle, pinned allocator rollback-compatibility, and root-only network tests, without a job container.
+`.github/workflows/ci.yml` runs fmt + clippy, the workspace gate, and an Ubuntu hosted-VM eBPF job. The VM job boots the pinned Linux 6.12 image, BTF-checks the kernel object, mounts bpffs, installs the geo assets required by eBPF-feature routing tests, runs the full `honk-core --features ebpf --lib` gate, then runs the real NFQUEUE/nftables netns contract, TC/cgroup link lifecycle, pinned allocator rollback-compatibility test, and root-only network tests serially without a job container.
 
 `.github/workflows/release.yml` on `v*`: `cargo test --workspace --no-fail-fast` with the temporary routing exclude below (`cmake` + `libclang-dev` required for boring-sys), then `honk-core --features ebpf` for `x86_64`/`aarch64` × `gnu`/`musl`. Native gnu uses `cargo build`; the other three use **zig cc/c++ `ci/zigcc` / `ci/zigcxx` wrappers**. Cross CMake injects ASM `--target` flags rejected by GCC and, in Rust-triple spelling, zig; wrappers strip/re-anchor on `$ZIGCC_TARGET`. Musl sets `link-self-contained=no` for zig CRT. Each target ships default mimalloc and `-stock` without `mimalloc` (lower RSS high-water on small gateways). Build eBPF once on host with latest nightly/pinned prebuilt `bpf-linker`; **verify `.BTF`** before packaging. Publish GitHub Release tarballs; `alpha`/`beta`/`rc` tags are prereleases.
 
@@ -192,8 +185,7 @@ Removed `run` / `deploy` / `docker*` recipes called absent `scripts/debug-local.
 
 ## Current validation guidance
 
-Use current command output and CI, never dated pass counts, for repository status.
-The release workflow temporarily excludes the legacy routing test; reproduce its gate:
+Do not treat dated pass counts as repository status; use the current command output and CI for that evidence. The workspace gate below retains the known legacy routing exclude. The current compiled-routing gate is `just test-routing`: it builds a real `routing-test` eBPF object and exercises independent policy goldens plus preservation of the active root when publication fails.
 
 ```bash
 CARGO_TARGET_DIR=/root/code/honk/target \
@@ -254,7 +246,7 @@ JA4 was verified on .70 with `/usr/local/bin/ja4probe` (`ja4probe`, source
 
 - **A new test must fail without the change.** Remove the production hunk, run it, read the failure; a test that passes either way is not evidence. Read what already covers the behaviour first — several deliberate oddities here are pinned by one test. A deletion needs no test of its own.
 - **Say which gates you ran and which you did not.** Running a subset is fine; reporting no limits after running a subset is not.
-- `cargo test --all`: unprivileged default workspace unit/integration suites, using mock eBPF/loopback where appropriate. Ignored real NFQUEUE/eBPF netns tests require root via `just test-netns`.
+- `cargo test --all`: unprivileged default workspace unit/integration suites, using mock eBPF/loopback where appropriate. `just test-routing` runs the root-only compiled-policy goldens and failed-publication checks on Linux 6.12+; `just test-netns` depends on it and runs the remaining real NFQUEUE/eBPF integration checks.
 - Test locations:
     - `crates/honk-config/src/node.rs`, `src/config.rs`, `src/parser/tests.rs` — GroupPolicy serde, dae policy/default/errors, file loading, parser units: sections, groups, nested filters, DNS upstreams/routing, subscriptions, experimental.
     - `crates/honk-config/tests/example_configs.rs` — keeps `config.dae`, `config.min.dae`, `example.dae` parseable.
@@ -276,7 +268,6 @@ JA4 was verified on .70 with `/usr/local/bin/ja4probe` (`ja4probe`, source
 Benchmarks kept on `main`: `benches/dns.rs` (criterion, `harness = false`) covers DNS endpoint parse, cache get/put + 90/10 mix, per-query routing match, framing, forwarder cache-hit, and TcpPool/UpstreamPool exchange; run `cargo bench -p honk-core --features dns-bench --bench dns`. `benches/udp.rs` is the candidate-only UDP Criterion suite; run `cargo bench -p honk-core --bench udp -- --save-baseline udp-candidate`. Lab/deployment harnesses, raw evidence, and their documentation live only on branch `bench`; use `git worktree add ../honk-bench bench` when benchmarking so they never enter the `main` worktree.
 
 `benches/reload.rs` measures an unchanged-effective-config runtime reload's wall/CPU time, allocations, and mock eBPF writes; run `cargo bench -p honk-core --bench reload --no-default-features --features reload-alloc-bench`.
-
 
 ## Configuration
 
@@ -308,6 +299,8 @@ Owned nftables names and firewall restrictions: `crates/honk-nfqueue`.
 - Subscription recovery: `global.store_subscribe` defaults `true`, retaining the last valid raw response per request identity. Storage/fallback order and restore-before-refresh: `honk-core`'s `src/subscription.rs`. Process-scoped; reject SIGHUP changes as restart-required.
 - DNS bind: absent/empty disables only standalone listening, not transparent TCP/UDP port-53 interception. Bare numeric `IP:port` is UDP-only; `udp://host:port`, `tcp://host:port`, `tcp+udp://host:port` select transports. Accept schemed hostnames, bracketed IPv6, empty wildcard hosts; require port. Bind host-netns sockets all-or-nothing; semantic SIGHUP changes require restart.
 - DNS hosts: repeatable `dns.use_host`, default no sources. `true` adds standard `/etc/hosts`; paths add OxiDNS-compatible exact/domain/regexp/keyword rules. Merge in declaration order, later duplicates win. Relative files select the first existing copy under configured `global.data_dir`, then `/var/share/honk`, then CWD; missing files stay under `global.data_dir`. Known IN A/AAAA names precede request rules/cache; missing families return NODATA without upstream I/O. SIGHUP transactionally reloads every source; load failure leaves the active generation untouched.
+- DNS projection (`honk-core/src/dns/projection/`): retain at most 10,000 domain owners; admit at most 49,152 canonical IP keys into the 65,536-entry domain map, with at most 32,768 zero bitmaps selected for desired/reload state. Obsolete zero facts awaiting deletion may exceed that sub-limit within the applied total. Shared incremental/reload admission evicts zero facts first, then the highest IP; IPv4/mapped-IPv6 owners OR into one key. Keep 16,384 slots outside DNS projection for sniff writes. At the applied ceiling, new keys wait for confirmed removal, including on retry; the worker drains ready 256-entry batches without another observation. Omitted facts retain existing dial-mode/must/block cache-miss semantics, not blanket unknown-to-punt behavior. See bilingual DNS design docs for headroom limits.
+  Reload acknowledges the exact installed IP slice before owner reconciliation; skipped map publication preserves applied state. Worker writes and acknowledgements share the generation fence. Retry wakeups and batch admission use the same capacity-aware per-IP deadline; no separate retry heap can wake blocked insertions.
 - DNS upstream URI schemes: `udp://` (bare default), `tcp://`, `tcp+udp://`, `tls://` (DoT), `https://` (DoH), `h3://`/`http3://` (DoH3), `quic://` (DoQ); optional dial-path proxy `name: 'uri' -> <node|group>` (or legacy `outbound:` key).
 - Clash UI: `experimental.clash_api.external_ui_download_url` selects HTTP(S) dashboard ZIP; empty uses built-in zashboard. `HONK_UI_DOWNLOAD_URL` overrides both. Nonempty `external_ui_download_detour` forces the initial download and every redirect through its node/group; empty uses per-URL traffic routing. Both config fields require restart.
 - Geo assets: `geoip.dat` / `geosite.dat` are selected only from regular files, in order `$DAE_LOCATION_ASSET`, configured `global.data_dir`, `/var/share/honk`, CWD, `/usr/local/share/honk`, `/usr/share/honk`, `/usr/local/share/dae`, `/usr/share/dae`, then `/etc/dae`.
@@ -325,7 +318,7 @@ CLI (`honk-core` binary):
 The `honk-tool` CLI toolbox (bin crate, diagnostics that don't belong in the engine binary). Deps are honk-config + honk-outbound + honk-core (`default-features = false`, so no axum/aya). Subcommands:
 
 - `sub <url|file|-> [--target HOST:PORT] [--url TEST_URL] [--timeout SECS] [--concurrency N] [--limit N] [--ua UA] [--tls-implementation tls|utls] [--utls-imitate chrome_auto]` — fetch a subscription (or parse a share-link file/stdin URL) and probe TCP families, URLTest, and supported UDP paths. VMess, legacy VLESS, and nodes whose `network` excludes UDP render UDP as `n/a`; all other VLESS modes probe through their packet handler. VLESS output exposes only display name, fixed carrier/transport/wire shape, and fixed result codes; endpoint credentials and raw errors are never rendered.
-- `bpf show <conn-state|redirect-track|domain-routing|routing-handoff> [--ip IP] [--limit N]` and `bpf stats` — quick reads of the running engine's pinned maps under `/sys/fs/bpf` (raw `bpf(2)`; no aya, no program load). `stats` prints overflow counters, the `CONN_STATE_OCCUPANCY` gauge, and non-zero per-outbound tx/rx counters.
+- `bpf show <conn-state|redirect-track|domain-routing|routing-handoff> [--ip IP] [--limit N]` and `bpf stats` — quick reads of the running engine's maps under `/sys/fs/bpf` (raw `bpf(2)`; no aya, no program load). `domain-routing` follows the active `ROUTING_POLICY_ROOT` descriptor's domain-map ID. `stats` prints overflow counters, the `CONN_STATE_OCCUPANCY` gauge, and non-zero per-outbound tx/rx counters.
 - `diagnose [--api URL] [--pin-root PATH]` — one-shot read-only health check: engine process, `daens`/`dae0` presence, daens fwmark rule, pinned maps present, occupancy/overflow, clash API reachability. Exit summary `all checks passed` / `N issue(s) found`.
 - `geosite list [FILTER] | show <category> [--attr ATTR] | find <domain>` and `geoip list [FILTER] | show <code> | lookup <ip>` — offline content search of geosite.dat/geoip.dat (one record per line, `--file PATH` overrides the default search). Without `--file`, honk-tool selects the first regular file from `$DAE_LOCATION_ASSET`, `/var/lib/honk`, legacy `/var/share/honk`, CWD, honk share directories, then dae asset locations; it does not load a config to discover a custom `global.data_dir`. Backed by the read-only scan API in `honk-core::routing` (`GeositeScan`/`GeoipScan`, including `@attr` decoding); `lookup` is longest-prefix. `--attr` uses the same key-presence predicate as routing's `category@attr` filter, so tool output and expansion agree.
 - honk-tool is a **static musl binary** for gateway deployment: build with the `build-musl` zig env (`ZIGCC_TARGET=x86_64-linux-musl` + ci wrappers) and scp — a gnu build fails to exec on VyOS.
@@ -374,7 +367,7 @@ Shared eBPF/`honk-core` constants and `#[repr(C)]` structs in `#![no_std]`; `aya
 - **NFQUEUE readiness and ownership:** `DATAPATH_FLAG_NFQ_ENABLED && !DATAPATH_FLAG_NFQ_READY` drops only new staging-required flows. The serialized flags writer clears readiness → flips `UDP_DECISION_EPOCH` → waits old per-CPU `UDP_DECISION_INFLIGHT` → removes residual Preparing/Pending → completes reload/shutdown fence. Delayed deliveries then fail token lookup. Exclusive queue/table ownership and no-bypass/fanout/fail-open rules: `crates/honk-nfqueue`.
 - **Token-checked terminal state:** require token agreement across skb mark, conn state, handoff, redirect track, verdict cell, lease, endpoint/tombstone, backend transition. Direct marked `NF_ACCEPT` follows `ArmDirect`, which requires `Pending` and retains the token through activation; activate only after every verdict succeeds. `ActivateProxy` publishes the final outbound and mark while retaining the provisional redirect track. Armed followers append only verdict guards, discarding payload without slow/endpoint admission. Proxy publishes before canonical dial/send. Stale cleanup fences the exact tuple, waits pre-fence readers, then revalidates; never overwrite/delete newer incarnations.
 - **NFQUEUE lifecycle is fatal/fenced after admission:** listener/queue/verdict/watchdog/cleanup/retirement ambiguity terminates the control plane. Reload/shutdown: clear ready → quiesce kernel stagers → reject ingress → cancel/drain guards/leases/retirements/scheduled token cleanups → detach producers → close queue → delete owned table last. Preserve raw rollback-compatible `UDP_DECISION_SEQUENCE` during ordinary cleanup. Exhaustion uses the same fence/drain and empty-generation-suffix rule in `honk-core`'s `src/ebpf/`. If no suffix is clear, retry with staging fenced; never collide or require reboot.
-- **must/block are final:** clash mode override never overrides `block` results or dae `(must)` results.
+- **must/block are final:** a matching configured `must` rule is terminal; Clash mode override never overrides `block` or `must` results.
 - **Fail-closed on dead outbounds:** `lan_ingress` normally drops new dead-outbound flows (`TC_ACT_SHOT`). Exception: exactly one unique TCP leaf and no `final` keeps the eBPF slot open and the same proxy as userspace last resort. Real success can revive it without leaking to `direct`; UDP/all-dead multi-leaf groups remain closed. Built-in `direct`/`block` never die, keeping containing groups' OR slots alive. Port 53 TCP+UDP is always exempt (dae parity).
   LAN-facing specifically bound local `:53` listeners, including `dns.bind`, take precedence for their transport via local-socket probe. Wildcards additionally require full destination FIB `NOT_FWDED`, preventing remote resolvers bypassing transparent DNS. Empty `bind` preserves interception. At startup/reload/interface topology changes, refresh `dip(<every lan/wan iface address>) -> direct(must)` via `Config::ensure_local_direct_rules`; gateway admin/SSH/API must not depend on node health. Network events clear stale probe cooldowns and schedule immediate checks; other dead nodes stay closed until fresh success verifies recovery.
 - **eBPF connectivity pushes are group-OR plus the sole-TCP-leaf exception:** publish OR of leaf-member states into the shared group alive slot, with the last-resort exception above. One dead member must never `TC_ACT_SHOT` an entire multi-leaf group.

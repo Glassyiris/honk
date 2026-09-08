@@ -162,12 +162,14 @@ An accepted TCP socket is adopted only if its canonical forward `CONN_STATE_MAP`
 1. Fence NFQUEUE readiness and wait for the kernel reader-epoch grace period.
 2. Reject new transparent admission.
 3. Cancel correlator cells and token-bound originals, advance the UDP initializer epoch, drain `Initializing` leases, wait for the correlator to become empty, and drain exact endpoint retirements.
-4. Stage and activate routing, then publish the new outbound registry, DNS runtime pointer, router, config, groups, and projection snapshot as one serialized generation change.
-5. Publish new static datapath flags, reopen pending admission, and reopen NFQUEUE last. Only then stop rejecting new flows.
+4. Compile the generation's `RoutingPushPlan`, then call `EbpfBackend::publish_routing_plan(&plan, learned_domains)` once. The backend chooses the inactive slot, stages all generation-owned IP/source/MAC/domain fact maps with full 256-bit predicate values, attaches the generated function to every relevant target, and switches `ROUTING_POLICY_ROOT` last. Only after that succeeds does userspace publish the outbound registry, DNS runtime pointer, router, config, groups, and projection snapshot under the same serialization boundary.
+5. Reopen pending admission and NFQUEUE last. Rule-derived feature bits live in the policy descriptor, not a separately published static-flags map.
 
-A pre-commit build failure leaves the current generation untouched. If publication fails after the fence, the control plane replays the exact retained old routing plan before userspace publication, restores old static flags, and reopens the old generation. If restoration cannot prove the datapath healthy, admission remains rejected. A later reload that completes the full publication path — routing re-push included, which is forced while the latch is set — re-arms admission, because every map a failure could have torn has been republished by then (group-connectivity republication stays warn-only and fail-open by policy).
+`RoutingPushPlan::compile` is the only userspace lowering path; there is no caller-selected slot or separate domain-publication handshake. The stable `routing_policy.rs` ABI remains `RoutingInput` 128 bytes, `RoutingDecision` 20 bytes, and `RoutingPolicyDescriptor` 24 bytes. Real eBPF requires Linux 6.12+; generated process-name writes check fixed offsets before pointer construction for the 6.12 verifier.
 
-Content-based reuse retains the immutable userspace `Router` and compiled eBPF plan for unchanged routing, and the compiled DNS router for unchanged DNS routing/fixed-TTL state. Hash hosts/referenced geo bytes first: unchanged content avoids rebuild, changed content forces it. Skip static routing/LPM/domain publication only if compiled plan **and** projection bytes match. Non-fatal startup publication failures stay dirty until a successful 5-second heartbeat repush or later reload.
+Pre-commit failures leave the active code and facts intact. After a fenced publication rejection, the controller restores group connectivity and reopens the old generation. A failed connectivity restoration keeps admission rejected. Once the root has switched, the new generation is committed; a subsequent NFQUEUE-reopen failure keeps that generation published but admission fenced until a later successful reload repairs it.
+
+Candidate construction reuses the immutable userspace `Router` and compiled DNS router only when their routing inputs and content fingerprints are unchanged. Hosts and referenced geo assets are fingerprinted before parsing; changed content forces a replacement. Native routing publication is skipped only when the complete `RoutingPushPlan` and learned-domain projection bytes are unchanged; datapath health still forces recovery publication.
 
 `DnsServiceProvider` is the coherent DNS-generation pointer. A request lease retains its generation's forwarder, projection, transport pools, and outbound runtime until retirement. The outbound registry is also generation-owned: unchanged node runtimes transfer only at the commit point, the old registry marks those runtimes as moved, and then begins graceful retirement. Existing streams and `Ready` UDP endpoints keep their references while old reusable pools stop accepting new work and drain.
 
@@ -222,5 +224,3 @@ The optional Clash-compatible axum server is a userspace view and mutation surfa
 - [NFQUEUE design](./nfqueue.md)
 - [Outbound design](./outbound.md)
 - [Group design](./groups.md)
-
-

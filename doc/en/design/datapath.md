@@ -73,7 +73,7 @@ A changed link/address/route/interface role also republishes generated `direct(m
 
 `LISTEN_SOCKET_MAP` keys are fixed: `0` TCP4, `1` TCP6, `2..=5` UDP4, and `6..=9` UDP6. UDP chooses one of four listeners per family with a flow-stable hash. The IPv4 and IPv6 key readers in `tproxy_sk_lookup` remain separate `#[inline(never)]` subprograms. At optimization level 2, inlining lets LLVM turn the family branch into a computed-offset read from the lookup context; the verifier rejects that as a dereference of a modified context pointer.
 
-- TC entry points are raw `#[unsafe(no_mangle)] #[unsafe(link_section = "classifier")]` functions taking `*mut __sk_buff`, not Aya's `#[tc]`, whose structured argument shape triggers a verifier rejection on kernels ≥7.0. Bodies return `Verdict = Result<c_long, c_long>` (`action::Verdict`): `Ok` normal, `Err` early exit; both carry real `TC_ACT_*` values, reduced to kernel `i32` by `flatten` (`action::flatten`). `src/action.rs` owns `TC_ACT_*`. Keep internal sentinels (`LOAD_REDIRECT_TUPLE_FALLBACK`, bpf_loop `LOOP_CONTINUE`/`LOOP_BREAK`) separate from verdicts.
+- TC entry points are raw `#[unsafe(no_mangle)] #[unsafe(link_section = "classifier")]` functions taking `*mut __sk_buff`, not Aya's `#[tc]`, whose structured argument shape triggers a verifier rejection on kernels ≥7.0. Bodies return `Verdict = Result<c_long, c_long>` (`action::Verdict`): `Ok` normal, `Err` early exit; both carry real `TC_ACT_*` values, reduced to kernel `i32` by `flatten` (`action::flatten`). `src/action.rs` owns `TC_ACT_*`. Keep parser and helper sentinels (for example `transport::ERR_FALLBACK`, `ERR_FRAGMENT`, and `PASS_UNSUPPORTED`) separate from verdicts; the `bpf_loop` callback's continuation values are separate as well.
   `src/sk.rs`: `sk_assign_by_index` is TC's counterpart to aya `SockMap::redirect_sk_lookup` (which accepts only `SkLookupContext`); NAT-loopback probes `probe_tcp_socket`/`probe_udp_socket` lookup/release sockets. All helpers release implicit lookup references. Programs:
     - `lan_ingress_l2/l3` — LAN classify/route/redirect, DNS port-53 fast path, `CLASSIFIED_MARK` dedup, and unique-token staging of only ambiguous UDP decisions into Pending when NFQUEUE is enabled and ready; enabled-but-not-ready staging fails closed (`src/ingress.rs`).
     - `wan_ingress_l2/l3` — reverse-direction conntrack refresh (skipped single-homed).
@@ -91,13 +91,11 @@ A changed link/address/route/interface role also republishes generated `direct(m
 | Map | Shape and role |
 | --- | --- |
 | `CONN_STATE_MAP` | Non-preallocated plain hash, maximum 524,288 entries. Stores per-flow TCP/UDP state and published routing metadata; userspace owns pressure eviction. |
-| `REDIRECT_TRACK` | Non-preallocated 65,536-entry token-bound hash. Maps a directional five-tuple to original MAC/interface, outbound, timestamp, and decision identity for reply restoration. |
-| `ROUTING_HANDOFF_MAP` | Non-preallocated 65,536-entry token-bound hash. Carries tuple-keyed route metadata to userspace. |
-| `ROUTING_MAP` | 256-entry array: two banks of 128 `MatchSet` rules. Userspace fills the inactive bank before switching generations. |
-| `ROUTING_META_MAP` | 35-entry array containing the active generation selector plus each generation's rule count and four flow-group bitmaps. The selector is the commit point. |
-| `ROUTING_GROUP_META_MAP` | Eight packed entries: two generations × TCP4/TCP6/UDP4/UDP6, each with a rule count and 128-bit bitmap. |
-| `DEST_LPM_ROUTING_MAP`, `SOURCE_LPM_ROUTING_MAP`, `MAC_LPM_ROUTING_MAP` | LPM tries, each capped at 65,536 entries, for destination CIDR, source CIDR, and MAC prefixes; values retain both routing generations. |
-| `DOMAIN_ROUTING_MAP` | Non-preallocated 65,536-entry IP-to-domain-rule bitmap hash populated from DNS outcomes, with per-generation bitmaps. |
+| `REDIRECT_TRACK` | Non-preallocated 65,536-entry token-bound hash. Maps a directional five-tuple to original MAC/interface, outbound, timestamp, and decision identity for reply restoration; staged entries carry the decision token. |
+| `ROUTING_HANDOFF_MAP` | Non-preallocated 65,536-entry token-bound hash. Carries tuple-keyed route metadata to userspace; staged entries carry the decision token. |
+| `ROUTING_POLICY_ROOT` | One-entry map-in-map selecting an immutable policy descriptor and one of two synchronous generated-function slots. Successful root replacement supplies the old non-sleepable readers' grace period. |
+| Generation-owned IP/MAC indexes | Separate destination/source IPv4 and IPv6 LPM maps plus a MAC LPM map. Values are full per-generation predicate bitmaps, with ancestor bits inherited into more-specific prefixes. |
+| Generation-owned domain map | Non-preallocated IP-to-domain-predicate bitmap hash. DNS/sniff facts include positive and negated predicates; a present zero bitmap is known-false. The descriptor exposes its map ID for diagnostics. |
 | `OUTBOUND_CONNECTIVITY_MAP` | 1,536-entry array. Six liveness slots per outbound cover TCP/UDP class and IPv4/IPv6; an absent slot is treated as alive. |
 | `OUTBOUND_STATS` | 256-entry (`MAX_OUTBOUNDS`) per-CPU array indexed directly by the `u8` outbound index. Each packed 32-byte `OutboundStatsCounters` value contains `tx_packets`, `tx_bytes`, `rx_packets`, and `rx_bytes`; the current ABI does not use `outbound * 4 + counter` indexing. |
 | `LISTEN_SOCKET_MAP` | 16-slot `SockMap`; keys `0..=9` hold the two TCP and eight UDP transparent listeners. |
@@ -114,11 +112,14 @@ A changed link/address/route/interface role also republishes generated `direct(m
 
 Kernel/userspace map keys and values are `#[repr(C)]` ABI. IPv4 addresses in shared flow structures are IPv4-mapped IPv6 values in network byte order.
 
-- `src/lib.rs` — datapath constants including `TPROXY_MARK`, `DAE_BYPASS_MARK`, `CLASSIFIED_MARK`, `NFQUEUE_PENDING_MARK`, `NFQUEUE_TOKEN_MASK`, reserved-mark validation, NFQUEUE enabled/ready flags, outbound indices, tuples/redirect entries, and per-outbound stats helpers. Marks must never overlap the pending/token namespace.
-- `src/conn.rs` — `ConnState` (including protocol-specific `UdpDecisionState::{None,Preparing,Pending,DirectArmed,Proxy,Block}` and `decision_token`), `ConntrackArgs`, `ParseTransportCtx`, `BpfStatsKey`, `TcpState`.
-- `src/redirect_need.rs` — `TuplesKey`, `Tuples`, token-carrying `RoutingResult`/`RoutingHandoffEntry`, `DomainRouting`, `PIDName`, `MAX_MATCH_SET_LEN` (=128). Routing port ranges use `route::PortRange`; connection states use `conn::TcpState`.
-- `src/route.rs` — `MatchSet` (dae-core `match_set` layout), `MatchSetValue`, `MatchType` (incl. DNS match types `Upstream`/`QType`), and routing-group pre-filter ABI: exploded `ROUTING_META_MAP` introspection slots plus `#[repr(C)] RoutingGroupMeta { rule_count, bitmap[4] }` in the double-buffered eight-entry `ROUTING_GROUP_META_MAP`; layout is compile-time asserted.
-- `src/event.rs` — fixed-layout ring events including conntrack overflow and UDP decision-token exhaustion. `src/dae_ip.rs` — `In6Addr` union + v4-mapped helpers.
+`crates/honk-ebpf-common/src/lib.rs` — shared marks and NFQUEUE token packing, `OutboundIndex`, `RoutingMeta`, `DaeParam`, and `OutboundStatsCounters`/map constants.
+`crates/honk-ebpf-common/src/routing_policy.rs` — fixed `RoutingInput`/`RoutingDecision`/`RoutingPolicyDescriptor` ABI (128/20/24 bytes), feature bits, and process-name normalization limits.
+`crates/honk-ebpf-common/src/redirect_need.rs` — `TuplesKey`, `Tuples`, token-carrying `RoutingResult`/`RoutingHandoffEntry`, 256-bit `DomainRouting`, and `PIDName`.
+`crates/honk-ebpf-common/src/conn.rs` — `ConnState` (including `UdpDecisionState` and `decision_token`), `ConntrackArgs`, `ParseTransportCtx`, `BpfStatsKey`, and `TcpState`.
+`crates/honk-ebpf/src/maps.rs` — static TC map declarations and their kernel-side capacities.
+`crates/honk-ebpf/src/route.rs` — static root/slot facade and fixed-ABI dispatch; generated policy code is loaded by userspace.
+`crates/honk-ebpf-common/src/event.rs` — fixed-layout ring events including conntrack overflow and UDP decision-token exhaustion. `crates/honk-ebpf-common/src/dae_ip.rs` — `In6Addr` union and v4-mapped helpers.
+`crates/honk-core/src/routing/ir.rs` — canonical `CompiledPredicate` and userspace `PortRange`; `crates/honk-core/src/control/routing_matcher.rs` lowers them into the generated function ABI.
 
 ## Marks and mark ownership
 
@@ -186,7 +187,7 @@ Conn-state sweeps normally run every 60 seconds. At 70% occupancy the interval f
 
 Per-outbound traffic counters are per CPU. TX packets and bytes are counted at `lan_ingress` when the route lands, for both redirect and direct-offload outcomes. RX packets and bytes are counted at `dae0_ingress` after `REDIRECT_TRACK` identifies the returning outbound. Unclassified pass-through traffic and drops have no outbound counter.
 
-The backend API uses `TuplesKey`/`ConnState`, bounded map scans, and conditional retirement. Legacy `ConnTuple` CRUD, string IP/domain routes, cached parameter setters, and backend statistics adapters are removed. Load-time `DaeParam` globals, generation-fenced IP/rule-bit projections, `StatsManager`, and pinned `OUTBOUND_STATS` remain the authoritative paths.
+The backend API uses `TuplesKey`/`ConnState`, bounded map scans, and conditional retirement. Legacy `ConnTuple` CRUD, string IP/domain routes, cached parameter setters, and backend statistics adapters are removed. Load-time `DaeParam` globals, generation-owned IP/MAC/domain fact maps, `StatsManager`, and pinned `OUTBOUND_STATS` remain the authoritative paths.
 
 `just test-netns` includes production TC packet regressions: exact reverse-tuple RX accounting, cached-route health/readiness, and locally generated ICMPv6 Redirect suppression. L2 cases use `BPF_PROG_TEST_RUN`; L3 uses actual TUN interfaces in an isolated network namespace, including forwarded and hook-detached controls.
 

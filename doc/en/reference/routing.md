@@ -9,7 +9,7 @@ condition [&& condition ...] -> outbound[(must)]
 fallback: outbound
 ```
 
-- Rules have source-order priority: the parser assigns `priority` values `0, 1, ...`, and lower values run first. The first final match wins.
+- Rules are evaluated by ascending `priority`; lower values run first. Equal priorities retain stable source order. The dae parser assigns `priority` values `0, 1, ...` in source order, while generated local rules use priority `0` and are appended after user rules.
 - `default:` is an alias of `fallback:`. The fallback target applies when no rule finalizes; if omitted, it defaults to `direct`.
 - Comma-separated arguments inside a matcher are alternatives. Different populated condition groups must all match.
 - A parenthesized argument list may span physical lines. The statement continues through its closing `)` and `-> outbound`.
@@ -36,12 +36,15 @@ routing {
 | `dport(...)` | Destination port or inclusive `start-end` range | `port` |
 | `sport(...)` | Source port or inclusive `start-end` range | `source_port` |
 | `l4proto(...)` | `tcp`, `udp` | `protocol` |
-| `pname(...)` | Executable basename from `argv[0]`, limited to 15 bytes; when runtime BTF offsets or verifier-safe kernel argv access are unavailable, the cgroup hook uses the calling thread's `comm` synchronously | `process_name` |
+| `pname(...)` | Substring patterns normalized to 15 bytes, matched against the executable basename from `argv[0]`; when runtime BTF offsets or verifier-safe kernel argv access are unavailable, the cgroup hook uses the calling thread's `comm` synchronously | `process_name` |
 | `mac(...)` | Source MAC address | `mac` |
 | `ipversion(...)` | `4`/`ipv4`, `6`/`ipv6` | `ip_version` |
 | `dscp(...)` | DSCP value | `dscp` |
 
 Every positive field has a corresponding list under `RoutingCondition.not`; the parser sends `!matcher(...)` there. Within one field, listed values are alternatives.
+
+Ordinary domain pattern/suffix/keyword alternatives share one condition. When the
+same rule also populates `geosite`, that field remains a separate AND-ed condition.
 
 A `mac(...)` bypass does not exempt a client from DNS interception: on LAN interfaces the port-`53` fast path runs before the routing engine, so no routing rule can exempt DNS. Only a specifically bound non-honk local `:53` listener takes precedence over the fast path (see the DNS design doc).
 
@@ -53,9 +56,9 @@ A `mac(...)` bypass does not exempt a client from DNS interception: on LAN inter
 | `block` | Built-in blocking outbound |
 | Group name | Resolve through that outbound group and its policy |
 
-Bare node names are not valid outbound targets: `Config::validate` rejects them. Wrap the node in a group (for example `filter: name('node')`) and reference the group instead. A group and a node also may not share a name.
+Bare node names are not valid outbound targets: `Config::validate` rejects them. Wrap the node in a group (for example `filter: name('node')`) and reference the group instead. A group and a node also may not share a name. A configuration may define at most 250 top-level user groups; higher routing ordinals are reserved by the ABI.
 
-Appending `(must)` gives Go dae-compatible must semantics. A matching must rule does not finalize the rule search; evaluation continues and propagates the must state to the resulting outbound. Clash `Global` and `Direct` modes never override a must result. They also never override `block`.
+Appending `(must)` makes a matched result terminal and skips later domain rerouting. Clash `Global` and `Direct` modes never override a must result or `block`. It is not the historical internal `MustRules` opcode that continued scanning.
 
 ## Geo assets
 
@@ -87,7 +90,7 @@ At startup, reload, and interface-topology changes, honk refreshes one generated
 dip(<each LAN/WAN interface address>) -> direct(must)
 ```
 
-Addresses become host CIDRs (`/32` or `/128`). Missing interfaces and an unresolved `auto` interface are skipped. These rules keep gateway-local services such as SSH, the admin UI, and the Clash API reachable without making them depend on proxy health.
+Generated rules have priority `0` and are appended after user rules. Stable equal-priority ordering therefore lets an earlier user priority-0 match win; generated rules outrank only user rules with a higher priority. Addresses become host CIDRs (`/32` or `/128`). Missing interfaces and an unresolved `auto` interface are skipped. These rules keep gateway-local services such as SSH, the admin UI, and the Clash API reachable without making them depend on proxy health.
 
 ## Fail-closed behavior
 

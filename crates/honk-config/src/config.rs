@@ -430,13 +430,12 @@ impl Config {
         cidrs
     }
 
-    /// Inject must-direct routing rules for every address assigned to the
+    /// Inject terminal must-direct routing rules for every address assigned to
     /// configured lan/wan interfaces, so traffic to the gateway itself
-    /// (admin UI, SSH, clash API) bypasses the proxy even when every node
-    /// is dead. `must` rules never finalize, so user rules can still
-    /// override; without any match these save local traffic from a
-    /// proxied fallback (and from the eBPF fail-closed drop when the
-    /// fallback outbound is down).
+    /// (admin UI, SSH, clash API) bypasses the proxy even when every node is
+    /// dead. Generated rules use priority 0 and are appended after user rules:
+    /// they outrank user rules with a higher priority, while stable equal-
+    /// priority ordering lets an existing user priority-0 rule win first.
     ///
     /// Best-effort and idempotent: interfaces that cannot be read
     /// (missing, `auto` without a default route) are skipped. Returns whether
@@ -721,6 +720,15 @@ impl Config {
                 )));
             }
         }
+        // User groups occupy ordinals 2..=251; 252 and above are reserved
+        // protocol values (must/control-plane/logical operators).
+        const MAX_USER_GROUPS: usize = 0xFC - 2;
+        if self.groups.len() > MAX_USER_GROUPS {
+            return Err(crate::ConfigError::Validation(format!(
+                "too many outbound groups: {} (maximum is {MAX_USER_GROUPS})",
+                self.groups.len()
+            )));
+        }
         for group in &self.groups {
             if group.name.is_empty() {
                 return Err(crate::ConfigError::Validation(
@@ -970,6 +978,27 @@ mod builtin_nodes_tests {
         assert!(config.validate().is_err());
         config.global.so_mark_from_dae = 0;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_reserved_group_ordinal_overflow() {
+        let mut config = Config::default();
+        for index in 0..=250 {
+            config.groups.push(crate::group::Group {
+                name: format!("group-{index}"),
+                ..Default::default()
+            });
+        }
+        let error = config
+            .validate()
+            .expect_err("reserved user-group ordinal must fail validation");
+        assert!(error.to_string().contains("too many outbound groups"));
+
+        config.groups.pop();
+        assert!(
+            config.validate().is_ok(),
+            "the last valid group ordinal must pass"
+        );
     }
 
     #[test]
