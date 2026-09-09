@@ -1,6 +1,6 @@
 # honk
 
-[English](./README.md) | [中文](./README_CN.md)
+[English](./README.md) | 中文
 
 ---
 
@@ -60,7 +60,7 @@ VLESS 分享链接通过 `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-c
 - [x] 通过出站 `PacketTransport` 上的 quinn `AsyncUdpSocket` adapter 添加代理 DoQ/DoH3
 - [ ] 评估 AF_XDP 与 XDP 路径以进一步提升性能
 - [ ] 添加 honk REST API
-- [ ] 添加 inbound 支持
+- [ ] 添加入站支持
 - [ ] 通过 GitHub [Issues](https://github.com/Glassyiris/honk/issues) 和 [Discussions](https://github.com/Glassyiris/honk/discussions) 跟踪其他工作
 
 > 在所有当前尚未 review 的代码完成 review，并处理所有未经验证的 AI 生成实现前，不会发布 `test.1` release tag。

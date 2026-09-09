@@ -58,11 +58,15 @@ check:
 
 # Clippy lint all
 lint:
-    cargo clippy --all -- -D warnings
+    cargo clippy --all --all-targets -- -D warnings
 
 # Format all
 fmt:
     cargo fmt --all
+
+# Check formatting
+fmt-check:
+    cargo fmt --all -- --check
 
 # ── Test ─────────────────────────────────────────────────
 
@@ -70,7 +74,7 @@ fmt:
 test:
     cargo test --all
 
-# CI-equivalent gate: full suite minus the known pre-existing routing failure.
+# Workspace test gate: full suite minus the known pre-existing routing failure.
 test-ci:
     cargo test --workspace --no-fail-fast -- --skip test_routing_with_config_dae
 
