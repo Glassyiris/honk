@@ -447,7 +447,8 @@ pub fn resolve_group_filters(groups: &mut [Group], nodes: &[Node], subscriptions
             .filters
             .iter()
             .map(|filter| filter.trim())
-            .filter(|filter| !filter.starts_with("group("))
+            // Unterminated group filters must not trigger the all-nodes fallback.
+            .filter(|filter| !filter.starts_with("group(") || !filter.contains(')'))
             .collect();
 
         if filters.is_empty() {
@@ -1005,7 +1006,10 @@ fn parse_group_section(section: &Section) -> Result<Vec<Group>, crate::ConfigErr
             .filter(|l| l.trim().starts_with("filter:"))
             .collect();
         for line in filter_lines {
-            let val = line.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
+            let val = line
+                .split_once(':')
+                .map(|(_, v)| strip_unquoted_comment(v.trim()).trim())
+                .unwrap_or("");
             // separated by commas or pipes: `group('hk', 'jp')`, `group('hk|jp')`.
             if let Some(tags) = extract_fn_args(val, "group") {
                 for tag in tags

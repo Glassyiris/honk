@@ -499,6 +499,18 @@ group {
 
         let hk1 = config.nodes.iter().find(|n| n.name == "hk1").unwrap();
         assert_eq!(group("hk").nodes, vec![hk1.id]);
+
+        let mut structured: crate::group::Group =
+            serde_json::from_str(r#"{"name":"p","filters":["group('hk')"]}"#).unwrap();
+        crate::parser::resolve_group_filters(
+            std::slice::from_mut(&mut structured),
+            &config.nodes,
+            &config.subscriptions,
+        );
+        assert_eq!(
+            structured.nodes,
+            config.nodes.iter().map(|node| node.id).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -903,6 +915,101 @@ group {
     assert_eq!(g.final_outbound.as_deref(), Some("direct"));
     let plain = config.groups.iter().find(|g| g.name == "plain").unwrap();
     assert_eq!(plain.check_url, None);
+}
+
+#[test]
+fn test_group_filter_trailing_comment() {
+    let input = r#"
+node {
+    edge: 'socks5://127.0.0.1:1080'
+    other: 'socks5://127.0.0.1:1081'
+}
+group {
+    proxy {
+        filter: name('edge') # comment
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    let edge = config
+        .nodes
+        .iter()
+        .find(|node| node.name == "edge")
+        .unwrap();
+    assert_eq!(config.groups[0].nodes, vec![edge.id]);
+
+    let input = r#"
+node {
+    'edge#1': 'socks5://127.0.0.1:1080'
+}
+group {
+    proxy {
+        filter: name('edge#1')
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    assert_eq!(config.groups[0].nodes.len(), 1, "a quoted `#` is data");
+}
+
+#[test]
+fn test_group_filter_unterminated_group() {
+    let input = r#"
+node {
+    edge: 'socks5://127.0.0.1:1080'
+}
+group {
+    proxy {
+        filter: group('hk'
+    }
+}
+"#;
+    let mut config = parse_dae_config(input).unwrap();
+    assert!(
+        config.groups[0].nodes.is_empty(),
+        "unterminated group filter must not select all nodes"
+    );
+    config
+        .nodes
+        .push(crate::node::Node::from_share_link("socks5://127.0.0.1:1081#new").unwrap());
+    crate::parser::resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
+    assert!(
+        config.groups[0].nodes.is_empty(),
+        "unterminated group filter must remain empty after adding a node"
+    );
+}
+
+// Stripping turns `group(hk#suffix)` into `group(hk`; the failed extraction must
+// neither select every node nor leave the comment behind as a subgroup name.
+#[test]
+fn test_group_filter_unquoted_hash() {
+    let input = r#"
+node {
+    edge: 'socks5://127.0.0.1:1080'
+}
+group {
+    proxy {
+        filter: group(hk#suffix)
+    }
+}
+"#;
+    let mut config = parse_dae_config(input).unwrap();
+    assert!(
+        config.groups[0].groups.is_empty(),
+        "the comment must not survive as a nested group name"
+    );
+    assert!(
+        config.groups[0].nodes.is_empty(),
+        "comment-truncated group filter must not select all nodes"
+    );
+    config
+        .nodes
+        .push(crate::node::Node::from_share_link("socks5://127.0.0.1:1081#new").unwrap());
+    crate::parser::resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
+    assert!(
+        config.groups[0].nodes.is_empty(),
+        "comment-truncated group filter must remain empty after adding a node"
+    );
 }
 
 #[test]
