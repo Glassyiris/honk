@@ -1029,6 +1029,8 @@ protocol = "udp"
             format!(
                 "global {{\n data_dir: '{}'\n tproxy_port: {port}\n nfqueue_enable: false\n \
                  check_tolerance: {tolerance}\n preconnect_node_count: 0\n}}\n \
+                 node {{\n loopback: 'socks5://127.0.0.1:1'\n}}\n \
+                 group {{\n proxy {{\n filter: bogus('x')\n policy: select\n }}\n}}\n \
                  routing {{\n fallback: direct\n}}\n",
                 data_dir.display()
             )
@@ -1086,9 +1088,15 @@ protocol = "udp"
                     && line.contains(value)
             })
         };
-        let result = (|| -> Result<(), String> {
+        let filter_diagnostic_count = |log: &str| {
+            log.lines()
+                .filter(|line| line.contains("WARN") && line.contains("group.proxy.filter"))
+                .count()
+        };
+        let result = (|| -> Result<(usize, usize), String> {
             wait_for("startup diagnostic (1m)", &|log| diagnostic(log, "1m"))?;
             wait_for("Router ready", &|log| log.contains("Router ready"))?;
+            let startup_filter_diagnostics = filter_diagnostic_count(&output.lock());
             // Router construction precedes the spawned SIGHUP handler; do not
             // deliver a terminating default-action signal during that window.
             wait_for("SIGHUP handler registration", &|_| {
@@ -1108,15 +1116,27 @@ protocol = "udp"
                 nix::sys::signal::Signal::SIGHUP,
             )
             .map_err(|error| error.to_string())?;
-            wait_for("SIGHUP diagnostic (2h)", &|log| diagnostic(log, "2h"))
+            wait_for("SIGHUP diagnostic (2h)", &|log| diagnostic(log, "2h"))?;
+            wait_for("SIGHUP reload request 1 applied", &|log| {
+                log.contains("SIGHUP reload request 1 applied")
+            })?;
+            let cumulative_filter_diagnostics = filter_diagnostic_count(&output.lock());
+            Ok((startup_filter_diagnostics, cumulative_filter_diagnostics))
         })();
         let _ = child.kill();
         let status = child.wait();
         for reader in readers {
             reader.join().expect("join daemon output reader");
         }
-        assert!(result.is_ok(), "{}\n{}", result.unwrap_err(), output.lock());
         status.expect("reap mock daemon");
+        let (startup_filter_diagnostics, cumulative_filter_diagnostics) = match result {
+            Ok(counts) => counts,
+            Err(error) => panic!("{}\n{}", error, output.lock()),
+        };
+        assert_eq!(
+            (startup_filter_diagnostics, cumulative_filter_diagnostics),
+            (1, 2)
+        );
     }
 
     #[test]

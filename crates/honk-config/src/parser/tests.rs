@@ -1,5 +1,6 @@
 #[allow(unused_imports)]
 use crate::parser::parse_dae_config;
+use crate::parser::parse_dae_config_with_diagnostics;
 
 #[cfg(test)]
 mod parser_tests {
@@ -1744,10 +1745,7 @@ dns {
 }
 "#;
     let config = parse_dae_config(input).unwrap();
-    assert!(matches!(
-        config.dns.strategy,
-        crate::dns::DnsStrategy::PreferIpv4
-    ));
+    assert!(matches!(config.dns.strategy, crate::dns::DnsStrategy::Both));
     assert!(!config.dns.cache.enabled);
     assert_eq!(config.dns.cache.ttl, 60);
     assert_eq!(config.dns.cache.max_size, 10000);
@@ -1976,4 +1974,406 @@ fn test_routing_condition_not_serde_defaults() {
     let cond: crate::routing::RoutingCondition =
         toml::from_str("port = ['443']\n[not]\nport = ['53']").unwrap();
     assert_eq!(cond.not.port, vec!["53"]);
+}
+
+#[test]
+fn test_unparseable_ports_use_the_fallback_and_return_diagnostics() {
+    for (key, value, expected, fallback) in [
+        ("tproxy_port", "abc", 12345u16, "12345"),
+        ("tproxy_port", "0x3039", 12345u16, "12345"),
+        ("pprof_port", "abc", 0u16, "0"),
+    ] {
+        let input = format!("global {{\n    {key}: {value}\n}}");
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_diagnostics(&input, &mut diagnostics).unwrap();
+
+        assert_eq!(diagnostics.len(), 1, "{key}={value}: {diagnostics:?}");
+        assert_eq!(diagnostics[0].setting, format!("global.{key}"));
+        assert_eq!(diagnostics[0].value, value);
+        assert!(diagnostics[0].message.contains(fallback));
+        let observed = if key == "tproxy_port" {
+            config.global.tproxy_port
+        } else {
+            config.global.pprof_port
+        };
+        assert_eq!(observed, expected);
+    }
+
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "global {\n    tproxy_port: 12345\n    pprof_port: 54321\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(config.global.tproxy_port, 12345);
+    assert_eq!(config.global.pprof_port, 54321);
+}
+
+#[test]
+fn test_unparseable_so_mark_uses_the_fallback_and_returns_a_diagnostic() {
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "global {\n    so_mark_from_dae: zz\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].setting, "global.so_mark_from_dae");
+    assert_eq!(diagnostics[0].value, "zz");
+    assert!(diagnostics[0].message.contains("0"));
+    assert_eq!(config.global.so_mark_from_dae, 0);
+
+    for value in ["0x10", "10"] {
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_diagnostics(
+            &format!("global {{\n    so_mark_from_dae: {value}\n}}"),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(diagnostics.is_empty(), "{value}: {diagnostics:?}");
+        assert_eq!(config.global.so_mark_from_dae, 16, "{value}");
+    }
+}
+
+#[test]
+fn test_unparseable_second_durations_use_the_fallback_and_return_diagnostics() {
+    for value in ["soon", "1.5s"] {
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_diagnostics(
+            &format!("global {{\n    check_interval: {value}\n}}"),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "check_interval={value}: {diagnostics:?}"
+        );
+        assert_eq!(diagnostics[0].setting, "global.check_interval");
+        assert_eq!(diagnostics[0].value, value);
+        assert!(diagnostics[0].message.contains("0s"));
+        assert_eq!(config.global.check_interval_secs, 0);
+    }
+
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "subscription {\n    timed: {\n        url: 'https://example.com/timed'\n        interval: never\n    }\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].setting, "subscription.timed.interval");
+    assert_eq!(diagnostics[0].value, "never");
+    assert!(diagnostics[0].message.contains("0s"));
+    assert_eq!(config.subscriptions[0].update_interval, 0);
+
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "global {\n    check_interval: 2s\n}\nsubscription {\n    timed: {\n        url: 'https://example.com/timed'\n        interval: 1h\n    }\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(config.global.check_interval_secs, 2);
+    assert_eq!(config.subscriptions[0].update_interval, 3600);
+}
+
+#[test]
+fn test_unparseable_ipversion_prefer_uses_the_fallback_and_returns_a_diagnostic() {
+    for value in ["ipv4", "0x6"] {
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_diagnostics(
+            &format!("dns {{\n    ipversion_prefer: {value}\n}}"),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "ipversion_prefer={value}: {diagnostics:?}"
+        );
+        assert_eq!(diagnostics[0].setting, "dns.ipversion_prefer");
+        assert_eq!(diagnostics[0].value, value);
+        assert!(diagnostics[0].message.contains("no preference"));
+        assert!(matches!(config.dns.strategy, crate::dns::DnsStrategy::Both));
+    }
+
+    for (value, expected) in [
+        ("0", crate::dns::DnsStrategy::Both),
+        ("+6", crate::dns::DnsStrategy::PreferIpv6),
+        ("06", crate::dns::DnsStrategy::PreferIpv6),
+    ] {
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_diagnostics(
+            &format!("dns {{\n    ipversion_prefer: {value}\n}}"),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(diagnostics.is_empty(), "{value}: {diagnostics:?}");
+        assert_eq!(config.dns.strategy, expected, "{value}");
+    }
+}
+
+#[test]
+fn test_unparseable_dns_cache_numbers_use_the_fallback_and_return_diagnostics() {
+    for (key, value, fallback) in [
+        ("optimistic_cache_ttl", "x", "60"),
+        ("optimistic_cache_ttl", "0x10", "60"),
+    ] {
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_diagnostics(
+            &format!("dns {{\n    {key}: {value}\n}}"),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert_eq!(diagnostics.len(), 1, "{key}={value}: {diagnostics:?}");
+        assert_eq!(diagnostics[0].setting, format!("dns.{key}"));
+        assert_eq!(diagnostics[0].value, value);
+        assert!(diagnostics[0].message.contains(fallback));
+        assert_eq!(config.dns.cache.ttl, 60);
+    }
+
+    let mut diagnostics = Vec::new();
+    let config =
+        parse_dae_config_with_diagnostics("dns {\n    max_cache_size: x\n}", &mut diagnostics)
+            .unwrap();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].setting, "dns.max_cache_size");
+    assert_eq!(diagnostics[0].value, "x");
+    assert!(diagnostics[0].message.contains("10000"));
+    assert_eq!(config.dns.cache.max_size, 10000);
+
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "dns {\n    optimistic_cache_ttl: 4294967296\n    max_cache_size: 123\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(config.dns.cache.ttl, 4294967296);
+    assert_eq!(config.dns.cache.max_size, 123);
+}
+
+#[test]
+fn test_unparseable_fixed_domain_ttl_is_skipped_and_returns_a_diagnostic() {
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "dns {\n    fixed_domain_ttl {\n        example.com: 4294967296\n        good.com: 30\n    }\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].setting, "dns.fixed_domain_ttl.example.com");
+    assert_eq!(diagnostics[0].value, "4294967296");
+    assert!(diagnostics[0].message.contains("ignored"));
+    assert!(!config.dns.fixed_domain_ttl.contains_key("example.com"));
+    assert_eq!(config.dns.fixed_domain_ttl.get("good.com"), Some(&30));
+
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "dns {\n    fixed_domain_ttl {\n        zero.com: 0\n        max.com: 4294967295\n    }\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(config.dns.fixed_domain_ttl.get("zero.com"), Some(&0));
+    assert_eq!(
+        config.dns.fixed_domain_ttl.get("max.com"),
+        Some(&4294967295)
+    );
+}
+
+#[test]
+fn test_unrecognised_booleans_are_false_and_return_diagnostics() {
+    let input = r#"
+global {
+    tproxy_port_protect: flase
+    disable_waiting_network: flase
+    auto_config_kernel_parameter: flase
+    store_subscribe: flase
+    allow_insecure: flase
+    tls_fragment: flase
+    mptcp: flase
+}
+dns {
+    optimistic_cache: flase
+}
+experimental {
+    cache_file {
+        enabled: flase
+        store_fakeip: flase
+        store_dns: flase
+    }
+}
+"#;
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+
+    let expected = [
+        "global.tproxy_port_protect",
+        "global.disable_waiting_network",
+        "global.auto_config_kernel_parameter",
+        "global.store_subscribe",
+        "global.allow_insecure",
+        "global.tls_fragment",
+        "global.mptcp",
+        "dns.optimistic_cache",
+        "experimental.cache_file.enabled",
+        "experimental.cache_file.store_fakeip",
+        "experimental.cache_file.store_dns",
+    ];
+    assert_eq!(diagnostics.len(), expected.len(), "{diagnostics:?}");
+    for diagnostic in &diagnostics {
+        assert_eq!(diagnostic.value, "flase");
+        assert!(diagnostic.message.contains("false"));
+    }
+    for (diagnostic, setting) in diagnostics.iter().zip(expected) {
+        assert_eq!(diagnostic.setting, setting);
+    }
+    assert!(!config.global.tproxy_port_protect);
+    assert!(!config.global.disable_waiting_network);
+    assert!(!config.global.auto_config_kernel_parameter);
+    assert!(!config.global.store_subscribe);
+    assert!(!config.global.allow_insecure);
+    assert!(!config.global.tls_fragment);
+    assert!(!config.global.mptcp);
+    assert!(!config.dns.cache.enabled);
+    assert!(!config.experimental.cache_file.enabled);
+    assert!(!config.experimental.cache_file.store_fakeip);
+    assert!(!config.experimental.cache_file.store_dns);
+
+    let valid_input = r#"
+global {
+    tproxy_port_protect: off
+    disable_waiting_network: no
+    auto_config_kernel_parameter: 0
+    store_subscribe: FALSE
+    allow_insecure: f
+    tls_fragment: n
+    mptcp: t
+}
+dns {
+    optimistic_cache: y
+}
+experimental {
+    cache_file {
+        enabled: true
+        store_fakeip: yes
+        store_dns: on
+    }
+}
+"#;
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(valid_input, &mut diagnostics).unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert!(!config.global.tproxy_port_protect);
+    assert!(!config.global.disable_waiting_network);
+    assert!(!config.global.auto_config_kernel_parameter);
+    assert!(!config.global.store_subscribe);
+    assert!(!config.global.allow_insecure);
+    assert!(!config.global.tls_fragment);
+    assert!(!config.global.mptcp);
+    assert!(!config.dns.cache.enabled);
+    assert!(config.experimental.cache_file.enabled);
+    assert!(config.experimental.cache_file.store_fakeip);
+    assert!(config.experimental.cache_file.store_dns);
+}
+
+#[test]
+fn test_unknown_group_policy_returns_a_diagnostic_without_the_text() {
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "group {\n    odd {\n        policy: mystery('trojan://super-secret@example.com:443')\n    }\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].setting, "group.odd.policy");
+    assert_eq!(diagnostics[0].value, "");
+    assert!(diagnostics[0].message.contains("selector"));
+    assert!(!diagnostics[0].message.contains("super-secret"));
+    assert_eq!(config.groups[0].policy, crate::group::GroupPolicy::Selector);
+    assert!(!format!("{config:?}").contains("super-secret"));
+
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "group {\n    odd {\n        policy: select\n    }\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(config.groups[0].policy, crate::group::GroupPolicy::Selector);
+}
+
+#[test]
+fn test_unparseable_group_filter_returns_a_diagnostic() {
+    let input = "node {\n    probe: 'socks5://127.0.0.1:1080'\n}\ngroup {\n    proxy {\n        filter: bogus('x')\n    }\n}\n";
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].setting, "group.proxy.filter");
+    assert_eq!(diagnostics[0].value, "1");
+    assert!(diagnostics[0].message.contains("ignored"));
+    assert!(config.groups[0].nodes.is_empty());
+}
+
+#[test]
+fn test_unterminated_group_filter_returns_a_diagnostic() {
+    let input = "node {\n    probe: 'socks5://127.0.0.1:1080'\n}\ngroup {\n    proxy {\n        filter: group('hk'\n    }\n}\n";
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].setting, "group.proxy.filter");
+    assert_eq!(diagnostics[0].value, "1");
+    assert!(diagnostics[0].message.contains("unterminated"));
+    assert!(diagnostics[0].message.contains("ignored"));
+    assert!(config.groups[0].nodes.is_empty());
+}
+
+#[test]
+fn test_group_filter_diagnostics_do_not_echo_the_filter() {
+    let input = "node {\n    probe: 'socks5://127.0.0.1:1080'\n}\ngroup {\n    proxy {\n        filter: bogus('trojan://super-secret@example.com:443')\n    }\n}\n";
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].setting, "group.proxy.filter");
+    assert_eq!(diagnostics[0].value, "1");
+    assert!(diagnostics[0].message.contains("ignored"));
+    assert!(config.groups[0].nodes.is_empty());
+    assert!(!diagnostics[0].setting.contains("super-secret"));
+    assert!(!diagnostics[0].value.contains("super-secret"));
+    assert!(!diagnostics[0].message.contains("super-secret"));
+}
+
+#[test]
+fn test_quoted_and_in_filter_is_reported_as_unparseable() {
+    let input = "node {\n    probe: 'socks5://127.0.0.1:1080'\n}\ngroup {\n    proxy {\n        filter: name('a&&b')\n    }\n}\n";
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].setting, "group.proxy.filter");
+    assert_eq!(diagnostics[0].value, "1");
+    assert!(diagnostics[0].message.contains("could not parse"));
+    assert!(diagnostics[0].message.contains("ignored"));
+    assert!(config.groups[0].nodes.is_empty());
+}
+
+#[test]
+fn test_filter_ordinal_skips_subgroup_declarations() {
+    let input = "node {\n    probe: 'socks5://127.0.0.1:1080'\n}\ngroup {\n    proxy {\n        filter: group('hk')\n        filter: bogus('x')\n    }\n}\n";
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].setting, "group.proxy.filter");
+    assert_eq!(diagnostics[0].value, "1");
+    assert!(diagnostics[0].message.contains("ignored"));
+    assert!(config.groups[0].nodes.is_empty());
+    assert_eq!(config.groups[0].groups, ["hk"]);
 }

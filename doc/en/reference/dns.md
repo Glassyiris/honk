@@ -11,7 +11,7 @@ This page defines the current dae-syntax `dns { ... }` section and its runtime s
 | `client_subnet` | absent / `""` | Optional EDNS Client Subnet preset: IPv4, IPv4 CIDR, `auto`, or `auto(IPv4)`. |
 | `upstream { ... }` | `default: 'udp://223.5.5.5:53'` | Named upstream servers. The first explicit `upstream` block replaces the built-in entry. |
 | `routing { ... }` | no rules; request fallback `default`; response fallback `accept` | Ordered request and response routing. |
-| `ipversion_prefer` | omitted: `both` | `4` selects `preferipv4`; `6` selects `preferipv6`. |
+| `ipversion_prefer` | omitted: `both` | `4` selects `preferipv4`; `6` selects `preferipv6`; `0` is dae's no preference, `both`. A value honk cannot parse keeps `both` and is reported as a diagnostic. |
 | `optimistic_cache` | `true` | Enables positive and negative cache reads and writes. |
 | `optimistic_cache_ttl` | `600` seconds | Fixed positive-answer cache and wire TTL; `0` preserves the answer TTL. |
 | `max_cache_size` | `10000` | Maximum cache entries and the input to the retained wire-byte budget. |

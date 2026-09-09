@@ -1,11 +1,15 @@
 use super::{
-    Section, extract_fn_args, extract_nested_all, has_routing_fallback, normalize_geosite_code,
-    parse_bool, parse_ip_prefer, parse_kv_pair, parse_kv_pairs, split_nested_sections,
+    Section, extract_fn_args, extract_nested_all, has_routing_fallback, lenient, lenient_bool,
+    normalize_geosite_code, parse_ip_prefer, parse_kv_pair, parse_kv_pairs, split_nested_sections,
     strip_tag_arg,
 };
+use crate::ConfigDiagnostic;
 use crate::dns::DnsConfig;
 
-pub(super) fn parse_section(section: &Section) -> Result<DnsConfig, crate::ConfigError> {
+pub(super) fn parse_section(
+    section: &Section,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> Result<DnsConfig, crate::ConfigError> {
     let dns_subs =
         split_nested_sections(&section.body, &["upstream", "routing", "fixed_domain_ttl"])?;
     let mut cfg = DnsConfig::default();
@@ -34,16 +38,42 @@ pub(super) fn parse_section(section: &Section) -> Result<DnsConfig, crate::Confi
     }
 
     if let Some(v) = kv.get("ipversion_prefer") {
-        cfg.strategy = parse_ip_prefer(v);
+        cfg.strategy = lenient(
+            parse_ip_prefer(v),
+            crate::dns::DnsStrategy::Both,
+            diagnostics,
+            || {
+                ConfigDiagnostic {
+                setting: "dns.ipversion_prefer".to_string(),
+                value: v.to_string(),
+                message: "honk could not parse the preference as decimal 0, 4 or 6; using fallback: no preference"
+                    .to_string(),
+            }
+            },
+        );
     }
     if let Some(v) = kv.get("optimistic_cache") {
-        cfg.cache.enabled = parse_bool(v);
+        cfg.cache.enabled = lenient_bool(v, "dns.optimistic_cache", diagnostics);
     }
     if let Some(v) = kv.get("optimistic_cache_ttl") {
-        cfg.cache.ttl = v.parse().unwrap_or(60);
+        cfg.cache.ttl = lenient(v.parse().ok(), 60, diagnostics, || {
+            ConfigDiagnostic {
+                setting: "dns.optimistic_cache_ttl".to_string(),
+                value: v.to_string(),
+                message: "honk could not parse this value as an unsigned decimal integer in range; using fallback 60"
+                    .to_string(),
+            }
+        });
     }
     if let Some(v) = kv.get("max_cache_size") {
-        cfg.cache.max_size = v.parse().unwrap_or(10000);
+        cfg.cache.max_size = lenient(v.parse().ok(), 10000, diagnostics, || {
+            ConfigDiagnostic {
+                setting: "dns.max_cache_size".to_string(),
+                value: v.to_string(),
+                message: "honk could not parse this value as an unsigned decimal integer in range; using fallback 10000"
+                    .to_string(),
+            }
+        });
     }
 
     for sub in dns_subs.iter().skip(1) {
@@ -82,7 +112,7 @@ pub(super) fn parse_section(section: &Section) -> Result<DnsConfig, crate::Confi
             }
             "fixed_domain_ttl" => {
                 cfg.fixed_domain_ttl
-                    .extend(parse_fixed_domain_ttl(&sub.body));
+                    .extend(parse_fixed_domain_ttl(&sub.body, diagnostics));
             }
             _ => {}
         }
@@ -221,7 +251,10 @@ fn extract_tls_server_name(address: String) -> (String, Option<String>) {
 }
 
 /// Parse `fixed_domain_ttl { domain: N ... }` into a HashMap.
-fn parse_fixed_domain_ttl(body: &str) -> std::collections::HashMap<String, u32> {
+fn parse_fixed_domain_ttl(
+    body: &str,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> std::collections::HashMap<String, u32> {
     let mut map = std::collections::HashMap::new();
     for line in body.lines() {
         let trimmed = line.trim();
@@ -233,6 +266,13 @@ fn parse_fixed_domain_ttl(body: &str) -> std::collections::HashMap<String, u32> 
             let val = trimmed[pos + 1..].split_whitespace().next().unwrap_or("");
             if let Ok(n) = val.parse::<u32>() {
                 map.insert(key.to_string(), n);
+            } else {
+                diagnostics.push(ConfigDiagnostic {
+                    setting: format!("dns.fixed_domain_ttl.{key}"),
+                    value: val.to_string(),
+                    message: "honk could not parse this TTL as an unsigned 32-bit decimal integer; entry ignored"
+                        .to_string(),
+                });
             }
         }
     }

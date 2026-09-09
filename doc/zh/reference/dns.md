@@ -11,7 +11,7 @@
 | `client_subnet` | 省略 / `""` | 可选的 EDNS Client Subnet preset：IPv4、IPv4 CIDR、`auto` 或 `auto(IPv4)`。 |
 | `upstream { ... }` | `default: 'udp://223.5.5.5:53'` | 命名上游服务器。第一个显式 `upstream` 块会替换内置条目。 |
 | `routing { ... }` | 无规则；request fallback 为 `default`；response fallback 为 `accept` | 有序的 request 与 response 路由。 |
-| `ipversion_prefer` | 省略：`both` | `4` 选择 `preferipv4`；`6` 选择 `preferipv6`。 |
+| `ipversion_prefer` | 省略：`both` | `4` 选择 `preferipv4`；`6` 选择 `preferipv6`；`0` 是 dae 的无偏好，即 `both`。honk 无法解析的值保持 `both`，并输出诊断。 |
 | `optimistic_cache` | `true` | 启用正、负缓存的读取与写入。 |
 | `optimistic_cache_ttl` | `600` 秒 | 固定的正应答缓存和 wire TTL；`0` 保留应答 TTL。 |
 | `max_cache_size` | `10000` | 缓存最大条目数，也是保留 wire 字节预算的输入。 |

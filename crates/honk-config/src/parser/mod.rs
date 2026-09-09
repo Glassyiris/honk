@@ -412,7 +412,7 @@ pub fn parse_dae_config_with_diagnostics(
     for section in &sections {
         match section.name.as_str() {
             "global" => config.global = parse_global_section(section, diagnostics)?,
-            "dns" => config.dns = dns::parse_section(section)?,
+            "dns" => config.dns = dns::parse_section(section, diagnostics)?,
             "routing" => config.routing = routing::parse_section(section)?,
             "node" => {
                 for node in parse_node_section(section)? {
@@ -420,17 +420,17 @@ pub fn parse_dae_config_with_diagnostics(
                 }
             }
             "group" => {
-                for group in parse_group_section(section)? {
+                for group in parse_group_section(section, diagnostics)? {
                     config.groups.push(group);
                 }
             }
             "subscription" => {
-                for sub in parse_subscription_section(section)? {
+                for sub in parse_subscription_section(section, diagnostics)? {
                     config.subscriptions.push(sub);
                 }
             }
             "experimental" => {
-                config.experimental = parse_experimental_section(section)?;
+                config.experimental = parse_experimental_section(section, diagnostics)?;
             }
             "include" => {}
             _ => {}
@@ -444,7 +444,12 @@ pub fn parse_dae_config_with_diagnostics(
         }
     }
 
-    resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
+    resolve_group_filters_inner(
+        &mut config.groups,
+        &config.nodes,
+        &config.subscriptions,
+        Some(diagnostics),
+    );
 
     Ok(config)
 }
@@ -459,6 +464,16 @@ pub fn parse_dae_config_with_diagnostics(
 /// `group('tag')` entries are not node filters — the dae parser routes them
 /// into `Group.groups` at parse time.
 pub fn resolve_group_filters(groups: &mut [Group], nodes: &[Node], subscriptions: &[Subscription]) {
+    // Runtime re-resolution: the filters were reported when the config was parsed.
+    resolve_group_filters_inner(groups, nodes, subscriptions, None);
+}
+
+fn resolve_group_filters_inner(
+    groups: &mut [Group],
+    nodes: &[Node],
+    subscriptions: &[Subscription],
+    mut diagnostics: Option<&mut Vec<ConfigDiagnostic>>,
+) {
     let mut subscription_tags: HashMap<uuid::Uuid, Vec<&str>> = HashMap::new();
     for subscription in subscriptions {
         subscription_tags
@@ -468,12 +483,13 @@ pub fn resolve_group_filters(groups: &mut [Group], nodes: &[Node], subscriptions
     }
 
     for group in groups {
-        let filters: Vec<&str> = group
+        let filters: Vec<(usize, &str)> = group
             .filters
             .iter()
-            .map(|filter| filter.trim())
+            .enumerate()
+            .map(|(index, filter)| (index, filter.trim()))
             // Unterminated group filters must not trigger the all-nodes fallback.
-            .filter(|filter| !filter.starts_with("group(") || !filter.contains(')'))
+            .filter(|(_, filter)| !filter.starts_with("group(") || !filter.contains(')'))
             .collect();
 
         if filters.is_empty() {
@@ -487,13 +503,26 @@ pub fn resolve_group_filters(groups: &mut [Group], nodes: &[Node], subscriptions
             continue;
         }
 
-        let filters: Vec<Vec<GroupFilterTerm>> = filters
-            .into_iter()
-            .filter_map(parse_group_filter_expression)
-            .collect();
+        let mut parsed_filters = Vec::new();
+        for (index, filter) in filters {
+            if let Some(parsed) = parse_group_filter_expression(filter) {
+                parsed_filters.push(parsed);
+            } else if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                diagnostics.push(ConfigDiagnostic {
+                    setting: format!("group.{}.filter", group.name),
+                    value: (index + 1).to_string(),
+                    message: if filter.starts_with("group(") {
+                        "group(...) is unterminated; ignored"
+                    } else {
+                        "honk could not parse this filter; ignored"
+                    }
+                    .to_string(),
+                });
+            }
+        }
         group.nodes.clear();
         for node in nodes {
-            if filters.iter().any(|filter| {
+            if parsed_filters.iter().any(|filter| {
                 filter
                     .iter()
                     .all(|term| term.matches(node, &subscription_tags))
@@ -769,16 +798,30 @@ fn parse_global_section(
     let kv = parse_kv_pairs(&section.body);
 
     if let Some(v) = kv.get("tproxy_port") {
-        cfg.tproxy_port = v.parse().unwrap_or(12345);
+        cfg.tproxy_port = lenient(v.parse().ok(), 12345, diagnostics, || ConfigDiagnostic {
+            setting: "global.tproxy_port".to_string(),
+            value: v.clone(),
+            message: "honk could not parse this port as a decimal in 0-65535; using fallback 12345"
+                .to_string(),
+        });
     }
     if let Some(v) = kv.get("tproxy_port_protect") {
-        cfg.tproxy_port_protect = parse_bool(v);
+        cfg.tproxy_port_protect = lenient_bool(v, "global.tproxy_port_protect", diagnostics);
     }
     if let Some(v) = kv.get("pprof_port") {
-        cfg.pprof_port = v.parse().unwrap_or(0);
+        cfg.pprof_port = lenient(v.parse().ok(), 0, diagnostics, || ConfigDiagnostic {
+            setting: "global.pprof_port".to_string(),
+            value: v.clone(),
+            message: "honk could not parse this port as a decimal in 0-65535; using fallback 0"
+                .to_string(),
+        });
     }
     if let Some(v) = kv.get("so_mark_from_dae") {
-        cfg.so_mark_from_dae = parse_hex_or_dec(v);
+        cfg.so_mark_from_dae = lenient(parse_hex_or_dec(v), 0, diagnostics, || ConfigDiagnostic {
+            setting: "global.so_mark_from_dae".to_string(),
+            value: v.clone(),
+            message: "honk could not parse this mark as a u32; using fallback 0".to_string(),
+        });
     }
     if let Some(v) = kv.get("log_level") {
         cfg.log_level = v.clone();
@@ -787,7 +830,8 @@ fn parse_global_section(
         cfg.log_file = v.clone();
     }
     if let Some(v) = kv.get("disable_waiting_network") {
-        cfg.disable_waiting_network = parse_bool(v);
+        cfg.disable_waiting_network =
+            lenient_bool(v, "global.disable_waiting_network", diagnostics);
     }
     if let Some(v) = kv.get("lan_interface") {
         cfg.lan_interface = v
@@ -806,13 +850,14 @@ fn parse_global_section(
             .collect();
     }
     if let Some(v) = kv.get("auto_config_kernel_parameter") {
-        cfg.auto_config_kernel_parameter = parse_bool(v);
+        cfg.auto_config_kernel_parameter =
+            lenient_bool(v, "global.auto_config_kernel_parameter", diagnostics);
     }
     if let Some(v) = kv.get("data_dir") {
         cfg.data_dir = v.clone();
     }
     if let Some(v) = kv.get("store_subscribe") {
-        cfg.store_subscribe = parse_bool(v);
+        cfg.store_subscribe = lenient_bool(v, "global.store_subscribe", diagnostics);
     }
     if let Some(v) = kv.get("tcp_check_url") {
         cfg.tcp_check_url = v
@@ -830,7 +875,14 @@ fn parse_global_section(
             .collect();
     }
     if let Some(v) = kv.get("check_interval") {
-        cfg.check_interval_secs = parse_duration_secs(v);
+        cfg.check_interval_secs =
+            lenient(crate::types::parse_duration_secs(v), 0, diagnostics, || {
+                ConfigDiagnostic {
+                    setting: "global.check_interval".to_string(),
+                    value: v.clone(),
+                    message: "duration is unsupported by honk; using fallback 0s".to_string(),
+                }
+            });
     }
     if let Some(v) = kv.get("check_tolerance") {
         cfg.check_tolerance_ms = lenient_duration_ms(
@@ -847,7 +899,7 @@ fn parse_global_section(
         cfg.nfqueue_enable = parse_checked_bool(v, "global.nfqueue_enable")?;
     }
     if let Some(v) = kv.get("allow_insecure") {
-        cfg.allow_insecure = parse_bool(v);
+        cfg.allow_insecure = lenient_bool(v, "global.allow_insecure", diagnostics);
     }
     if let Some(v) = kv.get("sniffing_timeout") {
         cfg.sniffing_timeout_ms = lenient_duration_ms(
@@ -864,7 +916,7 @@ fn parse_global_section(
         cfg.utls_imitate = v.clone();
     }
     if let Some(v) = kv.get("tls_fragment") {
-        cfg.tls_fragment = parse_bool(v);
+        cfg.tls_fragment = lenient_bool(v, "global.tls_fragment", diagnostics);
     }
     if let Some(v) = kv.get("tls_fragment_length") {
         cfg.tls_fragment_length = v.clone();
@@ -873,7 +925,7 @@ fn parse_global_section(
         cfg.tls_fragment_interval = v.clone();
     }
     if let Some(v) = kv.get("mptcp") {
-        cfg.mptcp = parse_bool(v);
+        cfg.mptcp = lenient_bool(v, "global.mptcp", diagnostics);
     }
     if let Some(v) = kv.get("bootstrap_resolver") {
         cfg.bootstrap_resolver = v.clone();
@@ -1003,7 +1055,10 @@ fn parse_node_section(section: &Section) -> Result<Vec<Node>, crate::ConfigError
     Ok(nodes)
 }
 
-fn parse_group_section(section: &Section) -> Result<Vec<Group>, crate::ConfigError> {
+fn parse_group_section(
+    section: &Section,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> Result<Vec<Group>, crate::ConfigError> {
     let groups_raw = split_nested_sections_named(&section.body)?;
     let mut groups = Vec::new();
 
@@ -1017,7 +1072,7 @@ fn parse_group_section(section: &Section) -> Result<Vec<Group>, crate::ConfigErr
         };
         let kv = parse_kv_pairs(&grp.body);
         if let Some(policy) = kv.get("policy") {
-            group.policy = parse_group_policy(policy)?;
+            group.policy = parse_group_policy(policy, &group.name, diagnostics)?;
         }
         if let Some(final_outbound) = kv.get("final") {
             group.final_outbound = Some(final_outbound.to_string());
@@ -1068,7 +1123,11 @@ fn parse_group_section(section: &Section) -> Result<Vec<Group>, crate::ConfigErr
     Ok(groups)
 }
 
-fn parse_group_policy(policy: &str) -> Result<crate::group::GroupPolicy, crate::ConfigError> {
+fn parse_group_policy(
+    policy: &str,
+    group_name: &str,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> Result<crate::group::GroupPolicy, crate::ConfigError> {
     let base = policy
         .trim()
         .split_once('(')
@@ -1088,11 +1147,21 @@ fn parse_group_policy(policy: &str) -> Result<crate::group::GroupPolicy, crate::
         "honk" => Err(crate::ConfigError::UnsupportedPolicy(
             "group policy 'honk' was renamed to 'score'".into(),
         )),
-        _ => Ok(crate::group::GroupPolicy::Selector),
+        _ => {
+            diagnostics.push(ConfigDiagnostic {
+                setting: format!("group.{group_name}.policy"),
+                value: String::new(),
+                message: "policy is not recognised; using fallback selector".to_string(),
+            });
+            Ok(crate::group::GroupPolicy::Selector)
+        }
     }
 }
 
-fn parse_subscription_section(section: &Section) -> Result<Vec<Subscription>, crate::ConfigError> {
+fn parse_subscription_section(
+    section: &Section,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> Result<Vec<Subscription>, crate::ConfigError> {
     let mut subs = Vec::new();
     let mut lines = section.body.lines();
 
@@ -1131,7 +1200,16 @@ fn parse_subscription_section(section: &Section) -> Result<Vec<Subscription>, cr
                 sub.user_agent = Some(ua.clone());
             }
             if let Some(interval) = kv.get("interval") {
-                sub.update_interval = parse_duration_secs(interval);
+                sub.update_interval = lenient(
+                    crate::types::parse_duration_secs(interval),
+                    0,
+                    diagnostics,
+                    || ConfigDiagnostic {
+                        setting: format!("subscription.{}.interval", sub.name),
+                        value: interval.clone(),
+                        message: "duration is unsupported by honk; using fallback 0s".to_string(),
+                    },
+                );
             }
             subs.push(sub);
         } else {
@@ -1165,7 +1243,10 @@ fn parse_subscription_value(value: &str) -> (String, Option<String>) {
     (unquote_filter_argument(value).to_string(), None)
 }
 
-fn parse_experimental_section(section: &Section) -> Result<ExperimentalConfig, crate::ConfigError> {
+fn parse_experimental_section(
+    section: &Section,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> Result<ExperimentalConfig, crate::ConfigError> {
     let mut cfg = ExperimentalConfig::default();
     let subs = split_nested_sections(&section.body, &["clash_api", "cache_file", "udp_nfqueue"])?;
 
@@ -1201,7 +1282,8 @@ fn parse_experimental_section(section: &Section) -> Result<ExperimentalConfig, c
             }
             "cache_file" => {
                 if let Some(v) = kv.get("enabled") {
-                    cfg.cache_file.enabled = parse_bool(v);
+                    cfg.cache_file.enabled =
+                        lenient_bool(v, "experimental.cache_file.enabled", diagnostics);
                 }
                 if let Some(v) = kv.get("path") {
                     cfg.cache_file.path = v.clone();
@@ -1210,10 +1292,12 @@ fn parse_experimental_section(section: &Section) -> Result<ExperimentalConfig, c
                     cfg.cache_file.cache_id = v.clone();
                 }
                 if let Some(v) = kv.get("store_fakeip") {
-                    cfg.cache_file.store_fakeip = parse_bool(v);
+                    cfg.cache_file.store_fakeip =
+                        lenient_bool(v, "experimental.cache_file.store_fakeip", diagnostics);
                 }
                 if let Some(v) = kv.get("store_dns") {
-                    cfg.cache_file.store_dns = parse_bool(v);
+                    cfg.cache_file.store_dns =
+                        lenient_bool(v, "experimental.cache_file.store_dns", diagnostics);
                 }
             }
             "udp_nfqueue" => {
@@ -1247,17 +1331,46 @@ fn parse_checked_bool(s: &str, setting: &str) -> Result<bool, crate::ConfigError
     }
 }
 
-fn parse_bool(s: &str) -> bool {
-    matches!(s.to_lowercase().as_str(), "true" | "yes" | "1" | "on")
+/// Keep `fallback` when `parsed` is `None` and record why. For settings whose
+/// unparseable value does not justify rejecting the configuration.
+fn lenient<T>(
+    parsed: Option<T>,
+    fallback: T,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    diagnostic: impl FnOnce() -> ConfigDiagnostic,
+) -> T {
+    match parsed {
+        Some(value) => value,
+        None => {
+            diagnostics.push(diagnostic());
+            fallback
+        }
+    }
 }
 
-fn parse_hex_or_dec(s: &str) -> u32 {
+/// Lenient boolean for dae settings honk does not reject. Recognised spellings are dae's
+/// (`true/t/1/y/yes/on`, `false/f/0/n/no/off`, case-insensitive) and produce no
+/// diagnostic; `t` and `y` still yield false, a divergence recorded in the lab notes.
+fn lenient_bool(value: &str, setting: &str, diagnostics: &mut Vec<ConfigDiagnostic>) -> bool {
+    let lowered = value.to_lowercase();
+    match lowered.as_str() {
+        "true" | "yes" | "1" | "on" => true,
+        "false" | "f" | "0" | "n" | "no" | "off" | "t" | "y" => false,
+        _ => {
+            diagnostics.push(ConfigDiagnostic {
+                setting: setting.to_string(),
+                value: value.to_string(),
+                message: "value is not a boolean spelling honk recognises; using fallback false"
+                    .to_string(),
+            });
+            false
+        }
+    }
+}
+
+fn parse_hex_or_dec(s: &str) -> Option<u32> {
     let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
-    u32::from_str_radix(s, 16).unwrap_or_else(|_| s.parse().unwrap_or(0))
-}
-
-fn parse_duration_secs(s: &str) -> u64 {
-    crate::types::parse_duration_secs(s).unwrap_or(0)
+    u32::from_str_radix(s, 16).ok().or_else(|| s.parse().ok())
 }
 
 // Invalid URLTest tolerance or compatibility sniffing timeout does not justify
@@ -1269,29 +1382,30 @@ fn lenient_duration_ms(
     default: u64,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) -> u64 {
-    match crate::types::parse_duration_ms(value) {
-        Some(milliseconds) => milliseconds,
-        None => {
-            diagnostics.push(ConfigDiagnostic {
-                setting: setting.to_string(),
-                value: value.to_string(),
-                message: format!(
-                    "duration is not milliseconds, `ms` or `s`; keeping the default ({default}ms)"
-                ),
-            });
-            default
-        }
-    }
+    lenient(
+        crate::types::parse_duration_ms(value),
+        default,
+        diagnostics,
+        || ConfigDiagnostic {
+            setting: setting.to_string(),
+            value: value.to_string(),
+            message: format!(
+                "duration is not milliseconds, `ms` or `s`; keeping the default ({default}ms)"
+            ),
+        },
+    )
 }
 
-fn parse_ip_prefer(s: &str) -> crate::dns::DnsStrategy {
+fn parse_ip_prefer(s: &str) -> Option<crate::dns::DnsStrategy> {
     use crate::dns::DnsStrategy;
     // dae `ipversion_prefer` is a *preference*, not an only-mode: 4/6 map to
-    // the prefer variants (other family still answered when it alone exists).
+    // the prefer variants (other family still answered when it alone exists),
+    // and 0 is dae's "no preference", the same as omitting the setting.
     match s.parse::<i32>() {
-        Ok(4) => DnsStrategy::PreferIpv4,
-        Ok(6) => DnsStrategy::PreferIpv6,
-        _ => DnsStrategy::PreferIpv4,
+        Ok(0) => Some(DnsStrategy::Both),
+        Ok(4) => Some(DnsStrategy::PreferIpv4),
+        Ok(6) => Some(DnsStrategy::PreferIpv6),
+        _ => None,
     }
 }
 

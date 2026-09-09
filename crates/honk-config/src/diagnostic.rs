@@ -7,7 +7,9 @@ use tracing::warn;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigDiagnostic {
     pub setting: String,
-    /// Safe-to-display input: currently timer strings only, never share links or secrets.
+    /// Scalar diagnostics retain the parsed scalar text, including anything typed there.
+    /// Filter and policy expressions are never echoed: filters use a node-filter ordinal,
+    /// and policies use an empty value.
     pub value: String,
     pub message: String,
 }
