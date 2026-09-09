@@ -1322,3 +1322,46 @@ fn shadowrocket_vmess_rejects_bad_authorities_and_conflicts() {
     }
     assert!(Node::from_share_link("vmess://!!!").is_err());
 }
+
+#[test]
+fn test_credential_bytes_are_not_replaced() {
+    // RFC 1929 makes the SOCKS5 password a byte string. A lossy decode would
+    // turn 0xFF into U+FFFD and authenticate with three bytes the operator
+    // never wrote, failing at dial time with nothing pointing back here.
+    for link in [
+        "socks5://user:p%FFss@1.2.3.4:1080#n",
+        "socks5://u%FFser:pass@1.2.3.4:1080#n",
+        "trojan://%FF%FE@1.2.3.4:443#t",
+        "ss://aes-256-gcm:p%FFss@1.2.3.4:8388#s",
+    ] {
+        assert!(
+            Node::from_share_link(link).is_err(),
+            "{link} must be refused rather than silently re-encoded"
+        );
+    }
+
+    // A component the protocol discards must not decide whether the link loads:
+    // Trojan, VLESS and AnyTLS all take `password.or(username)`.
+    let node = Node::from_share_link("trojan://%FF:correct-password@1.2.3.4:443#t").unwrap();
+    assert_eq!(
+        node.trojan().unwrap().password.as_deref(),
+        Some("correct-password")
+    );
+    let node = Node::from_share_link("anytls://%FF:correct-password@1.2.3.4:443#a").unwrap();
+    assert_eq!(
+        node.anytls().unwrap().password.as_deref(),
+        Some("correct-password")
+    );
+
+    // Multibyte UTF-8 survives byte for byte.
+    let node = Node::from_share_link("socks5://user:p%C3%A4ss@1.2.3.4:1080#n").unwrap();
+    assert_eq!(node.socks5().unwrap().password.as_deref(), Some("päss"));
+
+    let node = Node::from_share_link("socks5://user:p%40ss@1.2.3.4:1080#n").unwrap();
+    let socks5 = node.socks5().unwrap();
+    assert_eq!(socks5.password.as_deref(), Some("p@ss"));
+
+    // A name is cosmetic, so an undecodable fragment must not lose the node.
+    let node = Node::from_share_link("socks5://user:pass@1.2.3.4:1080#n%FFm").unwrap();
+    assert!(node.name.contains('\u{FFFD}'), "{}", node.name);
+}

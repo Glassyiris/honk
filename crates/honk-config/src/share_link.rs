@@ -100,35 +100,41 @@ fn node_from_url(url: &url::Url) -> Result<Node, ConfigError> {
         ..Default::default()
     };
     if let Some(config) = node.shadowsocks_mut() {
-        apply_ss_userinfo(config, url);
+        apply_ss_userinfo(config, url)?;
     } else {
-        let username = (!url.username().is_empty()).then(|| percent_decode_str(url.username()));
-        let password = url.password().map(percent_decode_str);
+        // Decode only the components a protocol keeps: `password.or(username)`
+        // discards the other one, and a discarded component must not decide
+        // whether the link loads.
+        let raw_username = (!url.username().is_empty()).then(|| url.username());
+        let raw_password = url.password();
+        let username = || percent_decode_credential(raw_username, "username");
+        let password = || percent_decode_credential(raw_password, "password");
+        let single = |field| percent_decode_credential(raw_password.or(raw_username), field);
         match &mut node.outbound {
             OutboundConfig::Socks5(config) => {
-                config.username = username;
-                config.password = password;
+                config.username = username()?;
+                config.password = password()?;
             }
-            OutboundConfig::Trojan(config) => config.password = password.or(username),
-            OutboundConfig::Vless(config) => config.uuid = password.or(username),
+            OutboundConfig::Trojan(config) => config.password = single("password")?,
+            OutboundConfig::Vless(config) => config.uuid = single("uuid")?,
             OutboundConfig::Hysteria2(config) => {
-                config.auth = match (username, password) {
+                config.auth = match (username()?, password()?) {
                     (Some(username), Some(password)) => Some(format!("{username}:{password}")),
                     (username, None) => username,
                     (None, Some(password)) => Some(format!(":{password}")),
                 };
             }
             OutboundConfig::Tuic(config) => {
-                config.uuid = username;
-                config.password = password;
+                config.uuid = username()?;
+                config.password = password()?;
             }
             OutboundConfig::Juicity(config) => {
-                config.uuid = username;
-                config.password = password;
+                config.uuid = username()?;
+                config.password = password()?;
             }
-            OutboundConfig::AnyTls(config) => config.password = password.or(username),
+            OutboundConfig::AnyTls(config) => config.password = single("password")?,
             OutboundConfig::Vmess(config) => {
-                config.uuid = password.or(username);
+                config.uuid = single("uuid")?;
                 config.encryption = Some("auto".into());
             }
             OutboundConfig::Shadowsocks(_) | OutboundConfig::Direct | OutboundConfig::Block => {}
@@ -259,17 +265,20 @@ fn json_port(value: Option<serde_json::Value>) -> Option<u16> {
 /// decoded method lands in `encryption` and the password in `password`.
 /// Note: the `url` crate percent-encodes `=` in userinfo, so the raw parts
 /// are percent-decoded before any base64 decoding happens.
-fn apply_ss_userinfo(config: &mut crate::node::ShadowsocksConfig, url: &url::Url) {
+fn apply_ss_userinfo(
+    config: &mut crate::node::ShadowsocksConfig,
+    url: &url::Url,
+) -> Result<(), ConfigError> {
     let userinfo = match url.password() {
         Some(pw) => format!(
             "{}:{}",
-            percent_decode_str(url.username()),
-            percent_decode_str(pw)
+            percent_decode_credential(Some(url.username()), "username")?.unwrap_or_default(),
+            percent_decode_credential(Some(pw), "password")?.unwrap_or_default()
         ),
-        None => percent_decode_str(url.username()),
+        None => percent_decode_credential(Some(url.username()), "username")?.unwrap_or_default(),
     };
     if userinfo.is_empty() {
-        return;
+        return Ok(());
     }
 
     match decode_ss_userinfo(&userinfo) {
@@ -282,6 +291,7 @@ fn apply_ss_userinfo(config: &mut crate::node::ShadowsocksConfig, url: &url::Url
             config.password = Some(userinfo);
         }
     }
+    Ok(())
 }
 
 /// Decode a SIP002 userinfo string into `(method, password)`.
@@ -466,6 +476,26 @@ fn base64_decode_flexible(input: &str) -> Option<Vec<u8>> {
 
 /// Percent-decode a string into bytes, then lossily into UTF-8.
 fn percent_decode_str(s: &str) -> String {
+    String::from_utf8_lossy(&percent_decode_bytes(s)).into_owned()
+}
+
+/// Percent-decode a credential, refusing bytes that are not UTF-8.
+///
+/// RFC 1929 makes the SOCKS5 username and password byte strings. Substituting
+/// U+FFFD for an undecodable byte sends a credential the operator never wrote,
+/// and the substitution is invisible in the loaded configuration.
+fn percent_decode_credential(s: Option<&str>, field: &str) -> Result<Option<String>, ConfigError> {
+    s.map(|s| {
+        String::from_utf8(percent_decode_bytes(s)).map_err(|_| {
+            ConfigError::Parse(format!(
+                "share link {field} is not UTF-8 after percent-decoding"
+            ))
+        })
+    })
+    .transpose()
+}
+
+fn percent_decode_bytes(s: &str) -> Vec<u8> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -481,7 +511,7 @@ fn percent_decode_str(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 fn hex_to_byte(h: u8, l: u8) -> Result<u8, ()> {
