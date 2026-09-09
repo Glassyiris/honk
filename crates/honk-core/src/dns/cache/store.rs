@@ -8,7 +8,7 @@ use super::{
 
 pub(crate) enum ExactLookup {
     Negative(NegativeCacheHit),
-    Positive(CachedEntry),
+    Positive { entry: CachedEntry, revision: u64 },
     Miss,
 }
 
@@ -67,7 +67,13 @@ impl DnsCacheService {
                 Some(value) => match value.positive.as_ref() {
                     Some(entry) if entry.is_stale_retention_exceeded() => (None, true),
                     Some(entry) if require_strict && !entry.strict_reusable => (None, false),
-                    Some(entry) if !entry.is_expired() => (Some(entry.clone()), false),
+                    Some(entry) if !entry.is_expired() => (
+                        Some(ExactLookup::Positive {
+                            entry: entry.clone(),
+                            revision: value.revision,
+                        }),
+                        false,
+                    ),
                     Some(_) | None => (None, false),
                 },
                 None => (None, false),
@@ -75,7 +81,7 @@ impl DnsCacheService {
             if clear_positive {
                 shard.remove_positive(&key);
             }
-            positive.map_or(ExactLookup::Miss, ExactLookup::Positive)
+            positive.unwrap_or(ExactLookup::Miss)
         };
 
         match &result {
@@ -84,7 +90,7 @@ impl DnsCacheService {
                 crate::stats::record_dns_event(crate::stats::DnsStatEvent::CacheHit);
                 tracing::debug!(result = "negative_hit", "DNS cache lookup");
             }
-            ExactLookup::Positive(_) => {
+            ExactLookup::Positive { .. } => {
                 self.counters.hits.fetch_add(1, Ordering::Relaxed);
                 crate::stats::record_dns_event(crate::stats::DnsStatEvent::CacheHit);
                 tracing::debug!(result = "hit", "DNS cache lookup");
@@ -157,13 +163,27 @@ impl DnsCacheService {
 
     pub fn put(&self, key: String, response: Vec<u8>, min_ttl: u32) {
         let ttl = min_ttl.max(1);
-        self.put_slot(CacheSlot::Legacy(key), response.into(), ttl, true);
+        self.put_slot(CacheSlot::Legacy(key), response.into(), ttl, true, None);
     }
 
-    pub(crate) fn put_exact(&self, key: CacheKey, response: Vec<u8>, min_ttl: u32) {
+    /// Publish a positive answer. `refreshing` is the slot revision a background
+    /// refresh started from; `None` publishes unconditionally.
+    pub(crate) fn put_exact(
+        &self,
+        key: CacheKey,
+        response: Vec<u8>,
+        min_ttl: u32,
+        refreshing: Option<u64>,
+    ) {
         let ttl = min_ttl.max(1);
         let response = bytes::Bytes::from(response);
-        let retained = self.put_slot(CacheSlot::Exact(key.clone()), response.clone(), ttl, true);
+        let retained = self.put_slot(
+            CacheSlot::Exact(key.clone()),
+            response.clone(),
+            ttl,
+            true,
+            refreshing,
+        );
         if retained && let Some(persister) = lock(&self.persister).clone() {
             persister.save(
                 key,
@@ -179,16 +199,17 @@ impl DnsCacheService {
         key: CacheKey,
         response: Vec<u8>,
         min_ttl: u32,
+        refreshing: Option<u64>,
     ) {
         let publication = lock(&self.publication);
         if !publication.accepting || publication.epoch != epoch.0 {
             return;
         }
-        self.put_exact(key, response, min_ttl);
+        self.put_exact(key, response, min_ttl, refreshing);
     }
 
     pub(crate) fn put_restored_exact(&self, key: CacheKey, response: Vec<u8>, min_ttl: u32) {
-        self.put_slot(CacheSlot::Exact(key), response.into(), min_ttl, false);
+        self.put_slot(CacheSlot::Exact(key), response.into(), min_ttl, false, None);
     }
 
     fn put_slot(
@@ -197,6 +218,7 @@ impl DnsCacheService {
         response: bytes::Bytes,
         min_ttl: u32,
         strict_reusable: bool,
+        refreshing: Option<u64>,
     ) -> bool {
         if crate::dns::response::is_truncated(&response) {
             return false;
@@ -209,21 +231,35 @@ impl DnsCacheService {
             strict_reusable,
         };
         let index = self.shard_index(&key);
-        lock(&self.shards[index]).put(key, CacheValue::positive(entry))
+        let mut shard = lock(&self.shards[index]);
+        if refreshing.is_some_and(|revision| {
+            !shard
+                .peek(&key)
+                .is_some_and(|value| value.revision == revision && value.positive.is_some())
+        }) {
+            return false;
+        }
+        let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
+        shard.put(key, CacheValue::positive(entry, revision))
     }
 
     #[cfg(test)]
     pub(crate) fn insert_expired_for_test(&self, key: String, response: Vec<u8>, min_ttl: u32) {
         let key = CacheSlot::Legacy(key);
         let index = self.shard_index(&key);
-        lock(&self.shards[index]).put(
+        let mut shard = lock(&self.shards[index]);
+        let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
+        shard.put(
             key,
-            CacheValue::positive(CachedEntry {
-                response: response.into(),
-                expires_at: Instant::now() - Duration::from_secs(1),
-                min_ttl,
-                strict_reusable: true,
-            }),
+            CacheValue::positive(
+                CachedEntry {
+                    response: response.into(),
+                    expires_at: Instant::now() - Duration::from_secs(1),
+                    min_ttl,
+                    strict_reusable: true,
+                },
+                revision,
+            ),
         );
     }
 
@@ -236,14 +272,19 @@ impl DnsCacheService {
     ) {
         let key = CacheSlot::Exact(key);
         let index = self.shard_index(&key);
-        lock(&self.shards[index]).put(
+        let mut shard = lock(&self.shards[index]);
+        let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
+        shard.put(
             key,
-            CacheValue::positive(CachedEntry {
-                response: response.into(),
-                expires_at: Instant::now() - Duration::from_secs(1),
-                min_ttl,
-                strict_reusable: true,
-            }),
+            CacheValue::positive(
+                CachedEntry {
+                    response: response.into(),
+                    expires_at: Instant::now() - Duration::from_secs(1),
+                    min_ttl,
+                    strict_reusable: true,
+                },
+                revision,
+            ),
         );
     }
     #[cfg(test)]
@@ -269,7 +310,8 @@ impl DnsCacheService {
         if let Some(value) = shard.get_mut(&key) {
             value.negative = Some(negative);
         } else {
-            shard.put(key, CacheValue::negative(negative));
+            let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
+            shard.put(key, CacheValue::negative(negative, revision));
         }
     }
 
@@ -282,37 +324,59 @@ impl DnsCacheService {
     ) {
         let key = CacheSlot::Legacy(key);
         let index = self.shard_index(&key);
-        lock(&self.shards[index]).put(
+        let mut shard = lock(&self.shards[index]);
+        let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
+        shard.put(
             key,
-            CacheValue::positive(CachedEntry {
-                response: response.into(),
-                expires_at: Instant::now()
-                    - super::storage::STALE_RETENTION
-                    - Duration::from_secs(1),
-                min_ttl,
-                strict_reusable: true,
-            }),
+            CacheValue::positive(
+                CachedEntry {
+                    response: response.into(),
+                    expires_at: Instant::now()
+                        - super::storage::STALE_RETENTION
+                        - Duration::from_secs(1),
+                    min_ttl,
+                    strict_reusable: true,
+                },
+                revision,
+            ),
         );
     }
 
     pub fn put_negative(&self, key: String, ttl: u32, rcode: u8) {
         let key = CacheSlot::Legacy(key);
         let index = self.shard_index(&key);
-        lock(&self.shards[index]).put(key, CacheValue::negative(negative_entry(ttl, rcode)));
+        let mut shard = lock(&self.shards[index]);
+        let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
+        shard.put(
+            key,
+            CacheValue::negative(negative_entry(ttl, rcode), revision),
+        );
     }
 
     pub(crate) fn put_negative_exact(&self, key: CacheKey, ttl: u32, rcode: u8) {
-        self.merge_negative_slot(CacheSlot::Exact(key), ttl, rcode);
+        self.merge_negative_slot(CacheSlot::Exact(key), ttl, rcode, None);
     }
 
-    fn merge_negative_slot(&self, key: CacheSlot, ttl: u32, rcode: u8) {
+    fn merge_negative_slot(&self, key: CacheSlot, ttl: u32, rcode: u8, refreshing: Option<u64>) {
         let negative = negative_entry(ttl, rcode);
         let index = self.shard_index(&key);
         let mut shard = lock(&self.shards[index]);
+        if refreshing.is_some_and(|revision| {
+            !shard
+                .peek(&key)
+                .is_some_and(|value| value.revision == revision && value.positive.is_some())
+        }) {
+            return;
+        }
+        if refreshing.is_some() && rcode == 3 {
+            shard.remove_positive(&key);
+        }
+        let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
         if let Some(value) = shard.get_mut(&key) {
             value.negative = Some(negative);
+            value.revision = revision;
         } else {
-            shard.put(key, CacheValue::negative(negative));
+            shard.put(key, CacheValue::negative(negative, revision));
         }
     }
 
@@ -322,12 +386,17 @@ impl DnsCacheService {
         key: CacheKey,
         ttl: u32,
         rcode: u8,
+        refreshing: Option<u64>,
     ) {
         let publication = lock(&self.publication);
         if !publication.accepting || publication.epoch != epoch.0 {
             return;
         }
-        self.put_negative_exact(key, ttl, rcode);
+        if refreshing.is_none() {
+            self.put_negative_exact(key, ttl, rcode);
+        } else {
+            self.merge_negative_slot(CacheSlot::Exact(key), ttl, rcode, refreshing);
+        }
     }
 
     pub fn negative_rcode(&self, key: &str) -> Option<u8> {

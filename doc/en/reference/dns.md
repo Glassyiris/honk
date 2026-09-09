@@ -14,6 +14,7 @@ This page defines the current dae-syntax `dns { ... }` section and its runtime s
 | `ipversion_prefer` | omitted: `both` | `4` selects `preferipv4`; `6` selects `preferipv6`; `0` is dae's no preference, `both`. A value honk cannot parse keeps `both` and is reported as a diagnostic. |
 | `optimistic_cache` | `true` | Enables positive and negative cache reads and writes. |
 | `optimistic_cache_ttl` | `600` seconds | Fixed positive-answer cache and wire TTL; `0` preserves the answer TTL. |
+| `optimistic_stale_reply_ttl` | `30` seconds | TTL for served-stale positive answers; a non-zero value replaces every non-OPT RR TTL, while `0` preserves cached policy-rewritten wire TTLs rather than authoritative TTLs. |
 | `max_cache_size` | `10000` | Maximum cache entries and the input to the retained wire-byte budget. |
 | `fixed_domain_ttl { ... }` | empty | Per-domain positive TTL overrides; `0` means never cache that domain. |
 
@@ -170,6 +171,7 @@ The internal `ipv4only` and `ipv6only` modes are not expressible with dae `ipver
 | --- | --- | --- |
 | `optimistic_cache` | `true` | Enables cache reads and publications. |
 | `optimistic_cache_ttl` | `600` | Overrides the positive answer's minimum TTL for cache lifetime and returned wire RR TTLs. `0` keeps the answer TTL. |
+| `optimistic_stale_reply_ttl` | `30` seconds | Served-stale positive answers use this TTL; a non-zero value replaces every non-OPT RR TTL. `0` preserves cached policy-rewritten wire TTLs rather than authoritative TTLs; in that case, the outcome TTL derives from `extract_min_ttl` of that wire, falling back to 60 seconds when no positive TTL exists. For a non-zero value, the outcome TTL is the configured value even when no positive TTL exists. |
 | `max_cache_size` | `10000` | Entry limit. It also scales the retained query/response wire-byte budget at 4 KiB per configured entry, with at least 65,535 bytes per shard and a 64 MiB global cap. `0` is warned and clamped to one entry. |
 | `fixed_domain_ttl { domain: seconds }` | empty | Per-domain override applied before `optimistic_cache_ttl`; `0` makes that domain uncacheable. |
 

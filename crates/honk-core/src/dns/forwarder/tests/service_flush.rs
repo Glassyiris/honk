@@ -114,6 +114,7 @@ async fn service_flush_fences_background_refresh_memory_and_persistence() {
     let upstream = Arc::new(RefreshFenceUpstream {
         initial: make_a_response([192, 0, 2, 1], 1),
         refreshed: make_a_response([192, 0, 2, 2], 300),
+        later: RefreshFenceLater::Response(make_a_response([192, 0, 2, 2], 300)),
         call_count: AtomicUsize::new(0),
         refresh_entered: tokio::sync::Notify::new(),
         refresh_release: tokio::sync::Semaphore::new(0),

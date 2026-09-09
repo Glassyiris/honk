@@ -719,6 +719,9 @@ pub struct DnsCacheConfig {
     /// Cache TTL in seconds
     #[serde(default = "default_cache_ttl")]
     pub ttl: u64,
+    /// Served-stale reply TTL in seconds; zero preserves cached wire TTLs.
+    #[serde(default = "default_stale_reply_ttl")]
+    pub stale_reply_ttl: u32,
     /// Maximum cache entries
     #[serde(default = "default_cache_size")]
     pub max_size: usize,
@@ -726,6 +729,10 @@ pub struct DnsCacheConfig {
 
 fn default_cache_ttl() -> u64 {
     600
+}
+
+fn default_stale_reply_ttl() -> u32 {
+    30
 }
 
 fn default_cache_size() -> usize {
@@ -737,6 +744,7 @@ impl Default for DnsCacheConfig {
         Self {
             enabled: crate::types::default_true(),
             ttl: default_cache_ttl(),
+            stale_reply_ttl: default_stale_reply_ttl(),
             max_size: default_cache_size(),
         }
     }
@@ -761,6 +769,7 @@ impl Default for DnsConfig {
             cache: DnsCacheConfig {
                 enabled: true,
                 ttl: 600,
+                stale_reply_ttl: 30,
                 max_size: 10000,
             },
             fixed_domain_ttl: HashMap::new(),

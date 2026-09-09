@@ -25,7 +25,7 @@ async fn bounded_queue_drops_only_persistence_work_when_saturated() {
     for _ in 0..(COMMAND_CAPACITY + 1024) {
         persister.save(key.clone(), response.clone().into(), unix_now() + 300);
     }
-    service.put_exact(key.clone(), response, 300);
+    service.put_exact(key.clone(), response, 300, None);
     assert_eq!(persister.counters().dropped_full, 1025);
     assert!(crate::stats::dns_snapshot().delta(before).persistence_drop >= 1);
     assert!(service.get_exact(&key).is_some());

@@ -53,6 +53,18 @@ fn dns_v2_persistence_cache_identity_matches_external_golden_contract() {
 }
 
 #[test]
+fn stale_reply_ttl_changes_policy_identity() {
+    let default = representative_config();
+    let mut changed = default.clone();
+    changed.cache.stale_reply_ttl = 31;
+
+    assert_ne!(
+        PolicyId::from_config(&default).expect("default policy"),
+        PolicyId::from_config(&changed).expect("changed stale TTL policy"),
+    );
+}
+
+#[test]
 fn effective_client_subnet_partitions_policy_identity() {
     let disabled = representative_config();
     let mut unresolved = representative_config();

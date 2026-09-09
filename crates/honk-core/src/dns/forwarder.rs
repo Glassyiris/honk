@@ -115,6 +115,9 @@ pub struct DnsForwarder {
     /// and when rewriting wire TTLs on the way into the cache. `0` falls
     /// back to the answer min TTL (default path uses 600).
     pub(crate) cache_ttl: u32,
+    /// TTL advertised for positive responses served from the stale cache.
+    /// `0` preserves the cached wire TTLs.
+    pub(crate) stale_reply_ttl: u32,
     pub(crate) policy_id: Option<PolicyId>,
     pub(crate) query_timeout: Duration,
     pub(crate) dial_timeout: Duration,
@@ -142,6 +145,7 @@ impl DnsForwarder {
             cache_enabled: true,
             // 0 = keep answer min TTL until `with_cache_ttl` is applied from config.
             cache_ttl: 0,
+            stale_reply_ttl: 30,
             policy_id: None,
             query_timeout: Duration::from_secs(5),
             dial_timeout: Duration::from_secs(10),
@@ -170,6 +174,14 @@ impl DnsForwarder {
     /// stored in the cache. `0` keeps answer min TTL behaviour.
     pub fn with_cache_ttl(mut self, ttl_secs: u32) -> Self {
         self.cache_ttl = ttl_secs;
+        self
+    }
+    /// Set the TTL advertised for positive responses served from the stale cache.
+    ///
+    /// A non-zero value replaces every non-OPT record TTL; `0` preserves the
+    /// cached wire TTLs.
+    pub fn with_stale_reply_ttl(mut self, ttl_secs: u32) -> Self {
+        self.stale_reply_ttl = ttl_secs;
         self
     }
 
@@ -275,6 +287,7 @@ impl DnsForwarder {
             hosts_fingerprint: self.hosts_fingerprint,
             cache_enabled: self.cache_enabled,
             cache_ttl: self.cache_ttl,
+            stale_reply_ttl: self.stale_reply_ttl,
             policy_id: self.policy_id.clone(),
             query_timeout: self.query_timeout,
             dial_timeout: self.dial_timeout,
@@ -612,8 +625,7 @@ pub(crate) use response::{is_filtered_qtype, make_empty_response};
 #[cfg(test)]
 use ttl::effective_cache_ttl;
 pub(crate) use ttl::{
-    SERVE_STALE_TTL_SECS, extract_min_ttl, extract_soa_negative_ttl, rewrite_answer_ttls,
-    traversal_strings,
+    extract_min_ttl, extract_soa_negative_ttl, rewrite_answer_ttls, traversal_strings,
 };
 
 #[cfg(test)]

@@ -1735,6 +1735,34 @@ dns {
 }
 
 #[test]
+fn test_parse_dns_stale_reply_ttl_invalid_uses_default_and_diagnostic() {
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "dns {\n    optimistic_stale_reply_ttl: x\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+
+    assert_eq!(config.dns.cache.stale_reply_ttl, 30);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].setting, "dns.optimistic_stale_reply_ttl");
+    assert_eq!(diagnostics[0].value, "x");
+}
+
+#[test]
+fn test_parse_dns_stale_reply_ttl_numeric_value_has_no_diagnostic() {
+    let mut diagnostics = Vec::new();
+    let config = parse_dae_config_with_diagnostics(
+        "dns {\n    optimistic_stale_reply_ttl: 7\n}",
+        &mut diagnostics,
+    )
+    .unwrap();
+
+    assert_eq!(config.dns.cache.stale_reply_ttl, 7);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+#[test]
 fn test_parse_dns_accepted_invalid_values_keep_fallbacks() {
     let input = r#"
 dns {

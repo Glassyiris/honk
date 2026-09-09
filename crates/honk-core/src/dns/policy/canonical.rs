@@ -107,9 +107,8 @@ use crate::routing::parse_ip_net_str;
 
 const FORMAT_VERSION: u8 = 2;
 const ECS_FORMAT_VERSION: u8 = 3;
-// Stale controls are not configurable yet, so identity pins the cache/forwarder defaults.
+// Retention remains fixed; the reply TTL keeps its existing identity slot.
 const STALE_RETENTION_SECS: u64 = 3600;
-const SERVE_STALE_TTL_SECS: u32 = 30;
 
 pub(super) fn encode(config: &DnsConfig) -> Result<Vec<u8>, PolicyError> {
     let client_subnet = config
@@ -178,7 +177,7 @@ pub(super) fn encode(config: &DnsConfig) -> Result<Vec<u8>, PolicyError> {
     writer.u64(config.cache.ttl);
     writer.u64(u64::try_from(config.cache.max_size).map_err(|_| PolicyError::FieldTooLarge)?);
     writer.u64(STALE_RETENTION_SECS);
-    writer.u32(SERVE_STALE_TTL_SECS);
+    writer.u32(config.cache.stale_reply_ttl);
     if let Some(network) = client_subnet {
         writer.byte(network.prefix_len());
         for octet in network.network().octets() {

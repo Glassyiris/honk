@@ -5,7 +5,7 @@ use tracing::debug;
 use super::{ExecutionContext, cache};
 use crate::dns::engine::ResponseDirective;
 use crate::dns::forwarder::{
-    DnsForwardError, ResolveMode, SERVE_STALE_TTL_SECS, make_empty_response, traversal_strings,
+    DnsForwardError, ResolveMode, extract_min_ttl, make_empty_response, traversal_strings,
 };
 use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeStatus, Provenance, ResponseClass};
 use crate::dns::planner::{ResponseTraversal, UpstreamTag};
@@ -171,6 +171,11 @@ async fn stale_outcome(
             context.mode,
         )
         .await?;
+    let ttl = if context.forwarder.stale_reply_ttl == 0 {
+        extract_min_ttl(&stale)
+    } else {
+        context.forwarder.stale_reply_ttl
+    };
     context
         .forwarder
         .outcome_from_wire(
@@ -180,7 +185,7 @@ async fn stale_outcome(
             None,
             OutcomeStatus::Accepted,
             Provenance::Stale,
-            EffectiveExpiry::cacheable(Duration::from_secs(u64::from(SERVE_STALE_TTL_SECS))),
+            EffectiveExpiry::cacheable(Duration::from_secs(u64::from(ttl))),
             Some(context.logical_upstream.as_str().to_owned()),
             Some(final_upstream.as_str().to_owned()),
             history,

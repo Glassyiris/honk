@@ -114,6 +114,27 @@ fn make_a_query() -> Vec<u8> {
     build_dns_query("example.com", 1)
 }
 
+/// Build an NXDOMAIN response preserving the query question and carrying an
+/// authority SOA whose TTL and MINIMUM determine the negative cache lifetime.
+fn make_nxdomain_response(query: &[u8], soa_ttl: u32, soa_minimum: u32) -> Vec<u8> {
+    let mut response = query.to_vec();
+    response[2] = 0x81;
+    response[3] = 0x83;
+    response[6..8].copy_from_slice(&0_u16.to_be_bytes()); // ANCOUNT
+    response[8..10].copy_from_slice(&1_u16.to_be_bytes()); // NSCOUNT
+    response[10..12].copy_from_slice(&0_u16.to_be_bytes()); // ARCOUNT
+
+    response.extend_from_slice(&[0xc0, 0x0c]); // NAME pointer to qname
+    response.extend_from_slice(&[0x00, 0x06, 0x00, 0x01]); // SOA, IN
+    response.extend_from_slice(&soa_ttl.to_be_bytes());
+    response.extend_from_slice(&22_u16.to_be_bytes());
+    response.extend_from_slice(&[0, 0]); // Root MNAME and RNAME, followed by five u32 fields.
+    for value in [1_u32, 7200, 3600, 1_209_600, soa_minimum] {
+        response.extend_from_slice(&value.to_be_bytes());
+    }
+    response
+}
+
 struct MockUpstream {
     response: Vec<u8>,
     call_count: AtomicUsize,
@@ -153,9 +174,15 @@ impl DnsUpstreamPool for GatedUpstream {
     }
 }
 
+enum RefreshFenceLater {
+    Response(Vec<u8>),
+    Error,
+}
+
 struct RefreshFenceUpstream {
     initial: Vec<u8>,
     refreshed: Vec<u8>,
+    later: RefreshFenceLater,
     call_count: AtomicUsize,
     refresh_entered: tokio::sync::Notify,
     refresh_release: tokio::sync::Semaphore,
@@ -173,10 +200,13 @@ impl DnsUpstreamPool for RefreshFenceUpstream {
                 .expect("refresh release")
                 .forget();
         }
-        Ok(if call == 0 {
-            self.initial.clone()
-        } else {
-            self.refreshed.clone()
-        })
+        match call {
+            0 => Ok(self.initial.clone()),
+            1 => Ok(self.refreshed.clone()),
+            _ => match &self.later {
+                RefreshFenceLater::Response(response) => Ok(response.clone()),
+                RefreshFenceLater::Error => anyhow::bail!("foreground upstream down"),
+            },
+        }
     }
 }

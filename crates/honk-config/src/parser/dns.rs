@@ -65,6 +65,16 @@ pub(super) fn parse_section(
             }
         });
     }
+    if let Some(v) = kv.get("optimistic_stale_reply_ttl") {
+        cfg.cache.stale_reply_ttl = lenient(v.parse().ok(), 30, diagnostics, || {
+            ConfigDiagnostic {
+                setting: "dns.optimistic_stale_reply_ttl".to_string(),
+                value: v.to_string(),
+                message: "honk could not parse this value as an unsigned decimal integer in range; using fallback 30"
+                    .to_string(),
+            }
+        });
+    }
     if let Some(v) = kv.get("max_cache_size") {
         cfg.cache.max_size = lenient(v.parse().ok(), 10000, diagnostics, || {
             ConfigDiagnostic {

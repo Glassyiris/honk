@@ -1,12 +1,18 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 
 use async_trait::async_trait;
+use honk_config::dns::{DnsConfig, DnsUpstream};
+use honk_config::types::DnsProtocol;
 use tokio::sync::{Notify, Semaphore};
 
 use super::*;
-use crate::dns::forwarder::{DnsUpstreamPool, parse_dns_question};
+use crate::dns::forwarder::{
+    DnsUpstreamPool, build_dns_query, extract_min_ttl, parse_dns_question,
+};
+use crate::dns::outcome::Provenance;
 
 mod outcomes;
 
@@ -160,4 +166,65 @@ async fn parallel_strategies_enter_both_families_before_either_is_released() {
         assert_eq!(resolved.ipv6, expected_ipv6);
         assert_eq!(resolved.min_ttl, 120);
     }
+}
+
+#[tokio::test]
+async fn resolver_new_wires_configured_stale_reply_ttl() {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("loopback DNS socket");
+    let address = socket.local_addr().expect("loopback socket address");
+    let server = tokio::spawn(async move {
+        let mut query = [0_u8; 4096];
+        let (length, peer) = socket.recv_from(&mut query).await.expect("priming query");
+        let response = address_response(&query[..length], 1, 2);
+        socket
+            .send_to(&response, peer)
+            .await
+            .expect("priming response");
+
+        // Let both the initial and retry UDP attempts time out without
+        // answering, forcing the forwarder to use its stale fallback.
+        for _ in 0..2 {
+            let _ = socket.recv_from(&mut query).await;
+        }
+        std::future::pending::<()>().await;
+    });
+
+    let mut config = DnsConfig {
+        upstream: vec![DnsUpstream {
+            name: "default".into(),
+            address: address.to_string(),
+            protocol: DnsProtocol::Udp,
+            tls_server_name: None,
+            outbound: None,
+        }],
+        ..Default::default()
+    };
+    config.cache.enabled = true;
+    config.cache.ttl = 0;
+    config.cache.stale_reply_ttl = 7;
+
+    let resolver = DnsResolver::new(&config).expect("resolver");
+    let query = build_dns_query("example.com", 1);
+    resolver
+        .forwarder()
+        .resolve_outcome(&query)
+        .await
+        .expect("prime cache");
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+
+    let stale = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        resolver.forwarder().resolve_outcome(&query),
+    )
+    .await
+    .expect("stale fallback deadline")
+    .expect("stale outcome");
+    assert_eq!(stale.provenance(), Provenance::Stale);
+    assert_eq!(extract_min_ttl(stale.rendered()), 7);
+    assert_eq!(stale.expiry().ttl(), std::time::Duration::from_secs(7));
+
+    server.abort();
+    let _ = server.await;
 }

@@ -15,7 +15,7 @@ use crate::dns::singleflight::FlightKey;
 use honk_ebpf_common::DAE_BYPASS_MARK;
 
 use super::message::{build_dns_query, new_asis_socket_with_mark};
-use super::ttl::{SERVE_STALE_TTL_SECS, patch_txid, rewrite_answer_ttls};
+use super::ttl::{patch_txid, rewrite_answer_ttls};
 use super::{DnsForwardError, DnsForwarder, ResolveMode};
 
 impl DnsForwarder {
@@ -145,10 +145,7 @@ impl DnsForwarder {
         }))
     }
 
-    /// RFC 8767 serve-stale: fall back to a recently-expired cache entry
-    /// when the upstream phase fails. TTLs are rewritten to
-    /// [`SERVE_STALE_TTL_SECS`] so the client re-asks soon, and the txid is
-    /// patched to the caller's query.
+    /// RFC 8767 fallback using the configured reply TTL, or cached TTLs when zero.
     pub(crate) async fn try_serve_stale(
         &self,
         cache_key: &CacheKey,
@@ -161,7 +158,9 @@ impl DnsForwarder {
         let cache = self.cache_service().await;
         let entry = cache.get_stale_exact(cache_key, matches!(mode, ResolveMode::Strict))?;
         let mut response = entry.response.to_vec();
-        rewrite_answer_ttls(&mut response, SERVE_STALE_TTL_SECS);
+        if self.stale_reply_ttl != 0 {
+            rewrite_answer_ttls(&mut response, self.stale_reply_ttl);
+        }
         if response.len() >= 2 && raw_query.len() >= 2 {
             response[0..2].copy_from_slice(&raw_query[0..2]);
         }
@@ -180,6 +179,7 @@ impl DnsForwarder {
         mode: ResolveMode,
         flight_key: CacheKey,
         publication_epoch: PublicationEpoch,
+        refreshing: u64,
     ) {
         let ingress = flight_key.ingress();
         let crate::dns::singleflight::FlightRole::Leader(owner) =
@@ -197,7 +197,11 @@ impl DnsForwarder {
                 ingress,
                 true,
                 mode,
-                crate::dns::engine::pipeline::ResolveExecution::refresh(owner, publication_epoch),
+                crate::dns::engine::pipeline::ResolveExecution::refresh(
+                    owner,
+                    publication_epoch,
+                    refreshing,
+                ),
             )
             .await;
             if result.is_err() {

@@ -91,6 +91,7 @@ fn build_forwarder_from_config(config: &DnsConfig) -> anyhow::Result<Arc<DnsForw
             .with_strategy(config.strategy)
             .with_cache_enabled(config.cache.enabled)
             .with_cache_ttl(config.cache.ttl.min(u64::from(u32::MAX)) as u32)
+            .with_stale_reply_ttl(config.cache.stale_reply_ttl)
             .with_policy_from_config(config)?,
     ))
 }

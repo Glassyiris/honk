@@ -36,7 +36,7 @@ async fn exact_entry_round_trips_across_restart_and_renders_caller_txid() {
     ));
     assert!(matches!(
         restored_service.lookup_exact(&key, false),
-        ExactLookup::Positive(_)
+        ExactLookup::Positive { .. }
     ));
     let entry = restored_service.get_exact(&key).expect("exact hit");
     let mut caller_wire = build_dns_query("example.com", 1);

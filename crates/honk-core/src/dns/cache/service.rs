@@ -1,7 +1,7 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::CacheKey;
 use super::counters::CacheCounterSet;
@@ -21,6 +21,7 @@ pub struct DnsCacheService {
     pub(super) counters: CacheCounterSet,
     pub(super) persister: Mutex<Option<crate::dns::persist::DnsCachePersister>>,
     pub(super) publication: Mutex<PublicationState>,
+    pub(super) next_revision: AtomicU64,
 }
 
 pub(super) struct PublicationState {
@@ -182,6 +183,7 @@ impl DnsCache {
                     epoch: 0,
                     accepting: true,
                 }),
+                next_revision: AtomicU64::new(1),
             }),
         }
     }

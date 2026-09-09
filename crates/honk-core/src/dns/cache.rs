@@ -304,20 +304,23 @@ mod storage {
     pub(super) struct CacheValue {
         pub positive: Option<CachedEntry>,
         pub negative: Option<NegativeEntry>,
+        pub revision: u64,
     }
 
     impl CacheValue {
-        pub(super) fn positive(entry: CachedEntry) -> Self {
+        pub(super) fn positive(entry: CachedEntry, revision: u64) -> Self {
             Self {
                 positive: Some(entry),
                 negative: None,
+                revision,
             }
         }
 
-        pub(super) fn negative(entry: NegativeEntry) -> Self {
+        pub(super) fn negative(entry: NegativeEntry, revision: u64) -> Self {
             Self {
                 positive: None,
                 negative: Some(entry),
+                revision,
             }
         }
 

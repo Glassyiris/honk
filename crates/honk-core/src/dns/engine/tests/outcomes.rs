@@ -286,7 +286,7 @@ async fn stale_outcome_covers_upstream_error_and_servfail_without_sleeping() {
     assert_eq!(on_servfail.provenance(), Provenance::Stale);
     assert_eq!(
         on_error.expiry().ttl(),
-        std::time::Duration::from_secs(crate::dns::forwarder::SERVE_STALE_TTL_SECS.into())
+        std::time::Duration::from_secs(error_forwarder.stale_reply_ttl.into())
     );
     assert_eq!(on_error.expiry(), on_servfail.expiry());
     assert_eq!(

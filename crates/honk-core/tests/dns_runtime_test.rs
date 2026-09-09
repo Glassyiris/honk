@@ -30,6 +30,7 @@ fn test_dns_forwarder(config: &Config, upstream: Arc<dyn DnsUpstreamPool>) -> Ar
         DnsForwarder::new(upstream, cache, router)
             .with_cache_enabled(config.dns.cache.enabled)
             .with_cache_ttl(u32::try_from(config.dns.cache.ttl).expect("test TTL fits u32"))
+            .with_stale_reply_ttl(config.dns.cache.stale_reply_ttl)
             .with_policy_from_config(&config.dns)
             .expect("DNS policy"),
     )

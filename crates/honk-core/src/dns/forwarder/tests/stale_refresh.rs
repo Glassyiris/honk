@@ -1,3 +1,9 @@
+use crate::dns::cache::{CacheKey, OperationKind};
+use crate::dns::outcome::Provenance;
+use crate::dns::outcome::{OutcomeStatus, ResponseClass};
+use crate::dns::planner::{RequestScope, UpstreamTag};
+use crate::dns::query::QueryContext;
+
 #[tokio::test]
 async fn forwarding_hot_path_is_not_serialized_by_compatibility_cache_mutex() {
     let cache = test_cache();
@@ -29,7 +35,7 @@ impl DnsUpstreamPool for FailUpstream {
 
 /// Fill the cache with a 1-second-TTL answer, let it expire, then
 /// resolve through a failing upstream — the stale entry must be served
-/// (RFC 8767) with TTLs rewritten to SERVE_STALE_TTL_SECS.
+/// (RFC 8767) with TTLs rewritten to the configured stale reply TTL.
 #[tokio::test]
 async fn test_serve_stale_on_upstream_failure() {
     let response = make_a_response([93, 184, 216, 34], 1);
@@ -44,9 +50,66 @@ async fn test_serve_stale_on_upstream_failure() {
     tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
 
     let fwd_fail = DnsForwarder::new(Arc::new(FailUpstream), cache, test_router());
+    let expected_ttl = fwd_fail.stale_reply_ttl;
     let stale = fwd_fail.resolve(&query).await.expect("stale served");
     assert!(stale.windows(4).any(|w| w == [93, 184, 216, 34]));
-    assert_eq!(extract_min_ttl(&stale), SERVE_STALE_TTL_SECS);
+    assert_eq!(extract_min_ttl(&stale), expected_ttl);
+}
+
+#[tokio::test]
+async fn serve_stale_with_configured_reply_ttl_updates_wire_and_outcome() {
+    let response = make_a_response([93, 184, 216, 34], 1);
+    let cache = test_cache();
+    let query = make_a_query();
+    let fwd_ok = DnsForwarder::new(
+        Arc::new(MockUpstream::new(response)),
+        cache.clone(),
+        test_router(),
+    );
+    fwd_ok.resolve(&query).await.expect("initial resolve");
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+    let fwd_fail =
+        DnsForwarder::new(Arc::new(FailUpstream), cache, test_router()).with_stale_reply_ttl(7);
+    let stale = fwd_fail
+        .resolve_outcome(&query)
+        .await
+        .expect("stale outcome");
+    assert_eq!(stale.provenance(), Provenance::Stale);
+    assert_eq!(extract_min_ttl(stale.rendered()), 7);
+    assert_eq!(stale.expiry().ttl(), Duration::from_secs(7));
+}
+
+#[tokio::test]
+async fn serve_stale_with_zero_reply_ttl_preserves_wire_and_outcome_expiry() {
+    let response = make_a_response([93, 184, 216, 34], 1);
+    let cache = test_cache();
+    let query = make_a_query();
+    let fwd_ok = DnsForwarder::new(
+        Arc::new(MockUpstream::new(response)),
+        cache.clone(),
+        test_router(),
+    );
+    fwd_ok.resolve(&query).await.expect("initial resolve");
+    let stored_ttl = {
+        let guard = cache.lock().await;
+        extract_min_ttl(&guard.positive_entries_for_test()[0].response)
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+    let fwd_fail =
+        DnsForwarder::new(Arc::new(FailUpstream), cache, test_router()).with_stale_reply_ttl(0);
+    let stale = fwd_fail
+        .resolve_outcome(&query)
+        .await
+        .expect("stale outcome");
+    assert_eq!(stale.provenance(), Provenance::Stale);
+    assert_ne!(stored_ttl, 30);
+    assert_eq!(extract_min_ttl(stale.rendered()), stored_ttl);
+    assert_eq!(
+        stale.expiry().ttl(),
+        Duration::from_secs(u64::from(extract_min_ttl(stale.rendered())))
+    );
 }
 
 /// A SERVFAIL answer must not shadow a recently-expired positive entry.
@@ -107,7 +170,11 @@ async fn background_refresh_rejects_a_mismatched_question_before_cache_write() {
         async fn query(&self, _: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             let mut response = make_a_response(
-                if call == 0 { [192, 0, 2, 1] } else { [192, 0, 2, 2] },
+                if call == 0 {
+                    [192, 0, 2, 1]
+                } else {
+                    [192, 0, 2, 2]
+                },
                 2,
             );
             if call > 0 {
@@ -137,7 +204,10 @@ async fn background_refresh_rejects_a_mismatched_question_before_cache_write() {
     assert_eq!(upstream.calls.load(Ordering::SeqCst), 2);
     let entries = service.positive_entries_for_test();
     assert_eq!(entries.len(), 1);
-    assert_eq!(&entries[0].response[entries[0].response.len() - 4..], &[192, 0, 2, 1]);
+    assert_eq!(
+        &entries[0].response[entries[0].response.len() - 4..],
+        &[192, 0, 2, 1]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -215,7 +285,10 @@ async fn compatibility_default_scope_refresh_keeps_compatibility_planning() {
     let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), router);
     let query = make_a_query();
 
-    forwarder.resolve(&query).await.expect("compatibility prime");
+    forwarder
+        .resolve(&query)
+        .await
+        .expect("compatibility prime");
     tokio::time::sleep(Duration::from_millis(1900)).await;
     forwarder.resolve(&query).await.expect("near-expiry hit");
     for _ in 0..20 {
@@ -311,7 +384,10 @@ async fn source_selected_near_expiry_hits_share_one_refresh() {
 
     assert_eq!(forwarder.refresh_task_count(), 1);
     assert_eq!(flights.active_len(), 1);
-    assert_eq!(upstream.calls.lock().expect("calls").as_slice(), ["red", "red"]);
+    assert_eq!(
+        upstream.calls.lock().expect("calls").as_slice(),
+        ["red", "red"]
+    );
     upstream.refresh_release.add_permits(1);
     tokio::time::timeout(Duration::from_secs(1), async {
         while forwarder.refresh_task_count() != 0 {
@@ -325,9 +401,7 @@ async fn source_selected_near_expiry_hits_share_one_refresh() {
 
 #[tokio::test]
 async fn stale_response_keeps_source_aware_preferred_family_projection() {
-    use honk_config::dns::{
-        DnsCond, DnsRequestAction, DnsRequestRouting, DnsRequestRule,
-    };
+    use honk_config::dns::{DnsCond, DnsRequestAction, DnsRequestRouting, DnsRequestRule};
 
     struct StalePreferenceUpstream;
 
@@ -408,4 +482,247 @@ async fn stale_response_keeps_source_aware_preferred_family_projection() {
     let failing = DnsForwarder::new(Arc::new(FailUpstream), cache, router)
         .with_strategy(DnsStrategy::PreferIpv4);
     assert_eq!(projections(&failing, &query).await, [0, 1]);
+}
+
+fn resolve_cache_key(query: &[u8]) -> CacheKey {
+    let parsed = QueryContext::parse(query).expect("query");
+    CacheKey::new(
+        &parsed,
+        None,
+        RequestScope::Upstream(UpstreamTag::new("default").expect("scope")),
+        OperationKind::Resolve,
+    )
+}
+
+async fn wait_for_refresh_start(upstream: &RefreshFenceUpstream) {
+    tokio::time::timeout(Duration::from_secs(1), upstream.refresh_entered.notified())
+        .await
+        .expect("refresh entered");
+}
+
+async fn wait_for_refresh_completion(forwarder: &DnsForwarder) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while forwarder.refresh_task_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("refresh completion");
+}
+
+#[tokio::test]
+async fn refresh_nxdomain_retires_the_refreshed_positive() {
+    let query = make_a_query();
+    let cache = test_cache();
+    let upstream = Arc::new(RefreshFenceUpstream {
+        initial: make_a_response([192, 0, 2, 1], 1),
+        refreshed: make_nxdomain_response(&query, 1, 1),
+        later: RefreshFenceLater::Error,
+        call_count: AtomicUsize::new(0),
+        refresh_entered: tokio::sync::Notify::new(),
+        refresh_release: tokio::sync::Semaphore::new(0),
+    });
+    let forwarder = DnsForwarder::new(upstream.clone(), cache.clone(), test_router());
+
+    let initial = forwarder.resolve_outcome(&query).await.expect("initial");
+    assert_eq!(initial.status(), OutcomeStatus::Accepted);
+    assert_eq!(initial.response_class(), ResponseClass::Positive);
+    assert_eq!(initial.provenance(), Provenance::Upstream);
+    assert_eq!(
+        initial.answer_ips(),
+        &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))]
+    );
+
+    let cached = forwarder.resolve_outcome(&query).await.expect("cache hit");
+    assert_eq!(cached.provenance(), Provenance::Cache);
+    wait_for_refresh_start(&upstream).await;
+    let service = forwarder.cache_service().await;
+    let key = resolve_cache_key(&query);
+    service.expire_positive_exact_for_test(&key);
+    upstream.refresh_release.add_permits(1);
+    wait_for_refresh_completion(&forwarder).await;
+
+    let negative = forwarder
+        .resolve_outcome(&query)
+        .await
+        .expect("cached nxdomain");
+    assert_eq!(negative.status(), OutcomeStatus::Accepted);
+    assert_eq!(negative.response_class(), ResponseClass::Nxdomain);
+    assert_eq!(negative.provenance(), Provenance::Cache);
+    assert_eq!(negative.rendered()[3] & 0x0f, 3);
+
+    service.insert_expired_negative_exact_for_test(key, 3);
+    let _error = forwarder
+        .resolve_outcome(&query)
+        .await
+        .expect_err("retired positive must not be served stale");
+}
+
+#[tokio::test]
+async fn owning_refresh_publishes_a_changed_positive() {
+    let query = make_a_query();
+    let upstream = Arc::new(RefreshFenceUpstream {
+        initial: make_a_response([192, 0, 2, 1], 1),
+        refreshed: make_a_response([192, 0, 2, 2], 300),
+        later: RefreshFenceLater::Error,
+        call_count: AtomicUsize::new(0),
+        refresh_entered: tokio::sync::Notify::new(),
+        refresh_release: tokio::sync::Semaphore::new(0),
+    });
+    let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router());
+
+    forwarder.resolve_outcome(&query).await.expect("initial");
+    let cached = forwarder.resolve_outcome(&query).await.expect("cache hit");
+    assert_eq!(cached.provenance(), Provenance::Cache);
+    wait_for_refresh_start(&upstream).await;
+    upstream.refresh_release.add_permits(1);
+    wait_for_refresh_completion(&forwarder).await;
+
+    let changed = forwarder
+        .resolve_outcome(&query)
+        .await
+        .expect("changed cache hit");
+    assert_eq!(changed.status(), OutcomeStatus::Accepted);
+    assert_eq!(changed.response_class(), ResponseClass::Positive);
+    assert_eq!(changed.provenance(), Provenance::Cache);
+    assert_eq!(
+        changed.answer_ips(),
+        &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2))]
+    );
+    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn held_refresh_does_not_overwrite_a_newer_foreground_nxdomain() {
+    let query = make_a_query();
+    let foreground = make_nxdomain_response(&query, 1, 1);
+    let upstream = Arc::new(RefreshFenceUpstream {
+        initial: make_a_response([192, 0, 2, 1], 1),
+        refreshed: make_a_response([192, 0, 2, 2], 300),
+        later: RefreshFenceLater::Response(foreground),
+        call_count: AtomicUsize::new(0),
+        refresh_entered: tokio::sync::Notify::new(),
+        refresh_release: tokio::sync::Semaphore::new(0),
+    });
+    let cache = test_cache();
+    let forwarder = DnsForwarder::new(upstream.clone(), cache.clone(), test_router());
+
+    forwarder.resolve_outcome(&query).await.expect("initial");
+    forwarder.resolve_outcome(&query).await.expect("cache hit");
+    wait_for_refresh_start(&upstream).await;
+    let service = forwarder.cache_service().await;
+    service.expire_positive_exact_for_test(&resolve_cache_key(&query));
+
+    let foreground = forwarder
+        .resolve_outcome(&query)
+        .await
+        .expect("foreground nxdomain");
+    assert_eq!(foreground.status(), OutcomeStatus::Accepted);
+    assert_eq!(foreground.response_class(), ResponseClass::Nxdomain);
+    assert_eq!(foreground.provenance(), Provenance::Upstream);
+    assert_eq!(foreground.rendered()[3] & 0x0f, 3);
+
+    upstream.refresh_release.add_permits(1);
+    wait_for_refresh_completion(&forwarder).await;
+
+    let retained = forwarder
+        .resolve_outcome(&query)
+        .await
+        .expect("negative hit");
+    assert_eq!(retained.status(), OutcomeStatus::Accepted);
+    assert_eq!(retained.response_class(), ResponseClass::Nxdomain);
+    assert_eq!(retained.provenance(), Provenance::Cache);
+    assert_eq!(retained.rendered()[3] & 0x0f, 3);
+}
+
+#[tokio::test]
+async fn held_refresh_does_not_overwrite_a_newer_foreground_positive() {
+    let query = make_a_query();
+    let parsed = QueryContext::parse(&query).expect("query");
+    let refresh_responses = [
+        make_nxdomain_response(&query, 1, 1),
+        make_empty_response(&query, &parsed),
+    ];
+
+    for refresh_response in refresh_responses {
+        let upstream = Arc::new(RefreshFenceUpstream {
+            initial: make_a_response([192, 0, 2, 1], 1),
+            refreshed: refresh_response,
+            later: RefreshFenceLater::Response(make_a_response([192, 0, 2, 9], 300)),
+            call_count: AtomicUsize::new(0),
+            refresh_entered: tokio::sync::Notify::new(),
+            refresh_release: tokio::sync::Semaphore::new(0),
+        });
+        let cache = test_cache();
+        let forwarder = DnsForwarder::new(upstream.clone(), cache, test_router());
+
+        forwarder.resolve_outcome(&query).await.expect("initial");
+        forwarder.resolve_outcome(&query).await.expect("cache hit");
+        wait_for_refresh_start(&upstream).await;
+        let service = forwarder.cache_service().await;
+        service.expire_positive_exact_for_test(&resolve_cache_key(&query));
+
+        let foreground = forwarder
+            .resolve_outcome(&query)
+            .await
+            .expect("foreground positive");
+        assert_eq!(foreground.status(), OutcomeStatus::Accepted);
+        assert_eq!(foreground.response_class(), ResponseClass::Positive);
+        assert_eq!(foreground.provenance(), Provenance::Upstream);
+        assert_eq!(
+            foreground.answer_ips(),
+            &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9))]
+        );
+
+        upstream.refresh_release.add_permits(1);
+        wait_for_refresh_completion(&forwarder).await;
+
+        let retained = forwarder
+            .resolve_outcome(&query)
+            .await
+            .expect("positive hit");
+        assert_eq!(retained.status(), OutcomeStatus::Accepted);
+        assert_eq!(retained.response_class(), ResponseClass::Positive);
+        assert_eq!(retained.provenance(), Provenance::Cache);
+        assert_eq!(
+            retained.answer_ips(),
+            &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9))]
+        );
+    }
+}
+
+#[tokio::test]
+async fn refresh_servfail_keeps_the_stale_positive() {
+    let query = make_a_query();
+    let mut servfail = make_a_response([192, 0, 2, 1], 1);
+    servfail[3] = 0x82;
+    let upstream = Arc::new(RefreshFenceUpstream {
+        initial: make_a_response([192, 0, 2, 1], 1),
+        refreshed: servfail,
+        later: RefreshFenceLater::Error,
+        call_count: AtomicUsize::new(0),
+        refresh_entered: tokio::sync::Notify::new(),
+        refresh_release: tokio::sync::Semaphore::new(0),
+    });
+    let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router());
+
+    forwarder.resolve_outcome(&query).await.expect("initial");
+    forwarder.resolve_outcome(&query).await.expect("cache hit");
+    wait_for_refresh_start(&upstream).await;
+    let service = forwarder.cache_service().await;
+    service.expire_positive_exact_for_test(&resolve_cache_key(&query));
+    upstream.refresh_release.add_permits(1);
+    wait_for_refresh_completion(&forwarder).await;
+
+    let stale = forwarder
+        .resolve_outcome(&query)
+        .await
+        .expect("stale positive");
+    assert_eq!(stale.status(), OutcomeStatus::Accepted);
+    assert_eq!(stale.response_class(), ResponseClass::Positive);
+    assert_eq!(stale.provenance(), Provenance::Stale);
+    assert_eq!(
+        stale.answer_ips(),
+        &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))]
+    );
 }

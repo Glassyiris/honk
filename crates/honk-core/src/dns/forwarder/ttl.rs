@@ -10,10 +10,6 @@ pub(super) fn effective_cache_ttl(configured: u32, answer_min_ttl: u32) -> u32 {
     }
 }
 
-/// TTL advertised on answers served from the serve-stale fallback: small
-/// enough that clients retry soon and pick up the recovery.
-pub(crate) const SERVE_STALE_TTL_SECS: u32 = 30;
-
 pub(crate) fn traversal_strings(traversal: &ResponseTraversal) -> Vec<String> {
     traversal
         .path()

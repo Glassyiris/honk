@@ -16,7 +16,7 @@ pub(super) async fn lookup(
         return Ok(None);
     }
     let cache = context.forwarder.cache_service().await;
-    let entry = match cache.lookup_exact(
+    let (entry, revision) = match cache.lookup_exact(
         &context.cache_key,
         matches!(context.mode, ResolveMode::Strict),
     ) {
@@ -51,7 +51,7 @@ pub(super) async fn lookup(
                 )
                 .map(Some);
         }
-        ExactLookup::Positive(entry) => entry,
+        ExactLookup::Positive { entry, revision } => (entry, revision),
         ExactLookup::Miss => return Ok(None),
     };
     let remaining = entry.remaining_ttl_secs();
@@ -65,6 +65,7 @@ pub(super) async fn lookup(
             context.mode,
             refresh_key,
             context.publication_epoch,
+            revision,
         );
     }
     let response = entry.response;
@@ -119,6 +120,7 @@ pub(super) async fn store(
                     cache_key.clone(),
                     negative_ttl,
                     rcode,
+                    context.refreshing,
                 );
         }
         return EffectiveExpiry::cacheable(std::time::Duration::from_secs(u64::from(negative_ttl)));
@@ -145,6 +147,7 @@ pub(super) async fn store(
                 cache_key.clone(),
                 response.to_owned(),
                 cache_ttl,
+                context.refreshing,
             );
     }
     expiry

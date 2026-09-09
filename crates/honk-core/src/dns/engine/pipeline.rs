@@ -99,6 +99,7 @@ use plan::{rejected_outcome, request_exchange};
 pub(crate) struct ResolveExecution {
     refresh_owner: Option<FlightLeader>,
     publication_epoch: PublicationEpoch,
+    refreshing: Option<u64>,
 }
 
 pub(super) struct ExecutionContext<'a> {
@@ -114,6 +115,7 @@ pub(super) struct ExecutionContext<'a> {
     pub(super) bypass_cache_read: bool,
     pub(super) mode: ResolveMode,
     pub(super) publication_epoch: PublicationEpoch,
+    pub(super) refreshing: Option<u64>,
 }
 
 impl ResolveExecution {
@@ -121,13 +123,19 @@ impl ResolveExecution {
         Self {
             refresh_owner: None,
             publication_epoch,
+            refreshing: None,
         }
     }
 
-    pub(crate) const fn refresh(owner: FlightLeader, publication_epoch: PublicationEpoch) -> Self {
+    pub(crate) const fn refresh(
+        owner: FlightLeader,
+        publication_epoch: PublicationEpoch,
+        refreshing: u64,
+    ) -> Self {
         Self {
             refresh_owner: Some(owner),
             publication_epoch,
+            refreshing: Some(refreshing),
         }
     }
 }
@@ -165,6 +173,7 @@ pub(crate) async fn resolve_with_owner(
     let ResolveExecution {
         refresh_owner,
         publication_epoch,
+        refreshing,
     } = execution;
     debug!("DNS forwarder: resolving {} bytes", raw_query.len());
     let engine = forwarder.engine().await?;
@@ -215,6 +224,7 @@ pub(crate) async fn resolve_with_owner(
         bypass_cache_read,
         mode,
         publication_epoch,
+        refreshing,
     };
     if reuse_eligible && let Some(outcome) = cache::lookup(&context, true).await? {
         return Ok(outcome);
