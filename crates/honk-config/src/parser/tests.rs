@@ -3,7 +3,7 @@ use crate::parser::parse_dae_config;
 
 #[cfg(test)]
 mod parser_tests {
-    use crate::parser::parse_dae_config;
+    use crate::parser::{parse_dae_config, parse_dae_config_with_diagnostics};
 
     #[test]
     fn test_parse_example_dae() {
@@ -40,11 +40,16 @@ global {
     }
 
     #[test]
-    fn test_millisecond_durations_keep_the_default_and_warn() {
+    fn test_millisecond_durations_keep_the_default_and_return_diagnostics() {
         for (value, expected) in [("50ms", 50), ("0ms", 0), ("0.5s", 500), ("50", 50)] {
-            let input = format!("global {{\n    check_tolerance: {value}\n}}");
-            let config = parse_dae_config(&input).unwrap();
+            let input = format!(
+                "global {{\n    check_tolerance: {value}\n    sniffing_timeout: {value}\n}}"
+            );
+            let mut diagnostics = Vec::new();
+            let config = parse_dae_config_with_diagnostics(&input, &mut diagnostics).unwrap();
             assert_eq!(config.global.check_tolerance_ms, expected, "{value}");
+            assert_eq!(config.global.sniffing_timeout_ms, expected, "{value}");
+            assert!(diagnostics.is_empty(), "{value}: {diagnostics:?}");
         }
 
         for value in [
@@ -55,41 +60,127 @@ global {
                 ("global.sniffing_timeout", "sniffing_timeout", 30),
             ] {
                 let input = format!("global {{\n    {key}: {value}\n}}");
-                let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-                let writer = std::sync::Arc::clone(&output);
-                let subscriber = tracing_subscriber::fmt()
-                    .without_time()
-                    .with_ansi(false)
-                    .with_writer(move || LogWriter(std::sync::Arc::clone(&writer)))
-                    .finish();
-                let config = tracing::subscriber::with_default(subscriber, || {
-                    parse_dae_config(&input).unwrap()
-                });
+                let mut diagnostics = Vec::new();
+                let config = parse_dae_config_with_diagnostics(&input, &mut diagnostics).unwrap();
                 let observed = match key {
                     "check_tolerance" => config.global.check_tolerance_ms,
                     _ => config.global.sniffing_timeout_ms,
                 };
                 assert_eq!(observed, default, "{setting} for {value}");
-                let logged = String::from_utf8(output.lock().unwrap().clone()).unwrap();
-                assert!(
-                    logged.contains(setting),
-                    "warning must identify {setting} for {value}: {logged}"
-                );
+                assert_eq!(diagnostics.len(), 1, "{setting} for {value}");
+                assert_eq!(diagnostics[0].setting, setting);
+                assert_eq!(diagnostics[0].value, value);
+                assert!(diagnostics[0].message.contains(&format!("{default}ms")));
             }
         }
     }
 
-    struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    #[test]
+    fn test_millisecond_duration_compat_entry_logs_warning() {
+        #[derive(Clone)]
+        struct Writer(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
 
-    impl std::io::Write for LogWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
 
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+        let output = Writer(Default::default());
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            parse_dae_config("global {\n    check_tolerance: abc\n}").unwrap();
+        });
+        let bytes = output.0.lock();
+        let log = String::from_utf8_lossy(&bytes);
+        assert!(log.contains("global.check_tolerance"), "{log}");
+    }
+
+    #[test]
+    fn test_timer_diagnostic_survives_later_parse_error() {
+        let mut diagnostics = Vec::new();
+        let result = parse_dae_config_with_diagnostics(
+            "global {\n check_tolerance: abc\n nfqueue_enable: invalid\n}",
+            &mut diagnostics,
+        );
+        assert!(result.is_err());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].setting, "global.check_tolerance");
+        assert_eq!(diagnostics[0].value, "abc");
+        assert!(diagnostics[0].message.contains("50ms"));
+    }
+
+    #[test]
+    fn test_from_file_preserves_timer_diagnostics() {
+        let file = tempfile::Builder::new().suffix(".dae").tempfile().unwrap();
+        std::fs::write(file.path(), "global {\n    check_tolerance: abc\n}").unwrap();
+
+        let mut diagnostics = Vec::new();
+        let config = crate::Config::from_file_with_diagnostics(
+            file.path().to_str().unwrap(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(config.global.check_tolerance_ms, 50);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].setting, "global.check_tolerance");
+        assert_eq!(diagnostics[0].value, "abc");
+        assert!(diagnostics[0].message.contains("50ms"));
+    }
+
+    #[test]
+    fn test_structured_fallback_discards_only_abandoned_dae_diagnostics() {
+        let file = tempfile::Builder::new().suffix(".dae").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            "ignored: |\n  global {\n    check_tolerance: abc\n    nfqueue_enable: invalid\n  }\n\
+             global:\n  check_tolerance_ms: 75\n",
+        )
+        .unwrap();
+        let mut diagnostics = Vec::new();
+        parse_dae_config_with_diagnostics("global {\n sniffing_timeout: 2h\n}", &mut diagnostics)
+            .unwrap();
+        let previous = diagnostics.clone();
+        let config = crate::Config::from_file_with_diagnostics(
+            file.path().to_str().unwrap(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(config.global.check_tolerance_ms, 75);
+        assert_eq!(diagnostics, previous);
+    }
+
+    #[test]
+    fn test_include_preserves_timer_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("config.dae");
+        std::fs::write(&entry, "include {\n    timers.dae\n}").unwrap();
+        std::fs::write(
+            dir.path().join("timers.dae"),
+            "global {\n    sniffing_timeout: 1m\n}",
+        )
+        .unwrap();
+
+        let mut diagnostics = Vec::new();
+        let config =
+            crate::Config::from_file_with_diagnostics(entry.to_str().unwrap(), &mut diagnostics)
+                .unwrap();
+        assert_eq!(config.global.sniffing_timeout_ms, 30);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].setting, "global.sniffing_timeout");
+        assert_eq!(diagnostics[0].value, "1m");
+        assert!(diagnostics[0].message.contains("30ms"));
     }
 
     #[test]

@@ -1012,6 +1012,114 @@ protocol = "udp"
     }
 
     #[test]
+    fn test_daemon_reports_timer_diagnostics_on_startup_and_sighup() {
+        use std::io::{BufRead, BufReader, Read};
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.dae");
+        let port = std::net::TcpListener::bind("[::]:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let data_dir = directory.path().join("data");
+        let source = |tolerance| {
+            format!(
+                "global {{\n data_dir: '{}'\n tproxy_port: {port}\n nfqueue_enable: false\n \
+                 check_tolerance: {tolerance}\n preconnect_node_count: 0\n}}\n \
+                 routing {{\n fallback: direct\n}}\n",
+                data_dir.display()
+            )
+        };
+        std::fs::write(&path, source("1m")).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_honk-core"))
+            .arg("--config")
+            .arg(&path)
+            .arg("--mock-ebpf")
+            .env("RUST_LOG", "info")
+            .env("NO_COLOR", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mock daemon");
+        let output = Arc::new(parking_lot::Mutex::new(String::new()));
+        let pipes: [Box<dyn Read + Send>; 2] = [
+            Box::new(child.stdout.take().unwrap()),
+            Box::new(child.stderr.take().unwrap()),
+        ];
+        let readers = pipes.map(|pipe| {
+            let output = output.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(pipe).lines() {
+                    let mut output = output.lock();
+                    match line {
+                        Ok(line) => {
+                            output.push_str(&line);
+                            output.push('\n');
+                        }
+                        Err(error) => {
+                            output.push_str(&format!("output read failed: {error}\n"));
+                            break;
+                        }
+                    }
+                }
+            })
+        });
+        let wait_for = |description: &str, predicate: &dyn Fn(&str) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if predicate(&output.lock()) {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!("timed out waiting for {description}"));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let diagnostic = |log: &str, value: &str| {
+            log.lines().any(|line| {
+                line.contains("WARN")
+                    && line.contains("global.check_tolerance")
+                    && line.contains(value)
+            })
+        };
+        let result = (|| -> Result<(), String> {
+            wait_for("startup diagnostic (1m)", &|log| diagnostic(log, "1m"))?;
+            wait_for("Router ready", &|log| log.contains("Router ready"))?;
+            // Router construction precedes the spawned SIGHUP handler; do not
+            // deliver a terminating default-action signal during that window.
+            wait_for("SIGHUP handler registration", &|_| {
+                std::fs::read_to_string(format!("/proc/{}/status", child.id()))
+                    .ok()
+                    .and_then(|status| {
+                        status.lines().find_map(|line| {
+                            line.strip_prefix("SigCgt:")
+                                .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+                        })
+                    })
+                    .is_some_and(|mask| mask & (1 << (libc::SIGHUP - 1)) != 0)
+            })?;
+            std::fs::write(&path, source("2h")).map_err(|error| error.to_string())?;
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(child.id() as libc::pid_t),
+                nix::sys::signal::Signal::SIGHUP,
+            )
+            .map_err(|error| error.to_string())?;
+            wait_for("SIGHUP diagnostic (2h)", &|log| diagnostic(log, "2h"))
+        })();
+        let _ = child.kill();
+        let status = child.wait();
+        for reader in readers {
+            reader.join().expect("join daemon output reader");
+        }
+        assert!(result.is_ok(), "{}\n{}", result.unwrap_err(), output.lock());
+        status.expect("reap mock daemon");
+    }
+
+    #[test]
     fn test_mode_command_rejects_dae_without_rewriting() {
         let directory = tempfile::tempdir().expect("create temporary directory");
         let path = directory.path().join("config.dae");

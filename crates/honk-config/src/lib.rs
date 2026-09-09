@@ -6,6 +6,7 @@
 //! (`global { ... } node { ... } routing { ... }`), parsed by [`parser`].
 
 pub mod config;
+pub mod diagnostic;
 pub mod dns;
 pub mod error;
 pub mod experimental;
@@ -19,4 +20,5 @@ pub mod subscription;
 pub mod types;
 
 pub use config::Config;
+pub use diagnostic::ConfigDiagnostic;
 pub use error::ConfigError;

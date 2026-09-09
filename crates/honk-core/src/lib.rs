@@ -542,7 +542,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Load the configuration before initializing logging so `log_level` in
     // the config file is honored (previously only --debug/RUST_LOG had any
     // effect and config log_level was silently ignored).
-    let mut config = Config::from_file(cli.config.to_str().unwrap())?;
+    let mut diagnostics = Vec::new();
+    let mut config =
+        Config::from_file_with_diagnostics(cli.config.to_str().unwrap(), &mut diagnostics)?;
     config.validate()?;
     subscription::validate_subscription_ids(&config.subscriptions)?;
     let requested_data_dir = PathBuf::from(&config.global.data_dir);
@@ -613,6 +615,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             "Runtime data directory is unusable; using process working directory"
         );
     }
+    honk_config::diagnostic::report_diagnostics(&diagnostics);
     info!(directory = %honk_config::paths::data_dir().display(), "Runtime data directory configured");
     if let Some(path) = log_file_path.as_ref() {
         info!(path = %path.display(), "File logging enabled");
@@ -1188,8 +1191,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             sighup.recv().await;
             request_id = request_id.wrapping_add(1).max(1);
             info!("SIGHUP reload request {request_id} received");
-            match Config::from_file(config_path.to_str().unwrap_or("/etc/honk/config.dae")) {
+            let mut diagnostics = Vec::new();
+            match Config::from_file_with_diagnostics(
+                config_path.to_str().unwrap_or("/etc/honk/config.dae"),
+                &mut diagnostics,
+            ) {
                 Ok(mut new_config) => {
+                    honk_config::diagnostic::report_diagnostics(&diagnostics);
                     if let Err(error) = new_config.validate() {
                         warn!(
                             "SIGHUP reload request {request_id} rejected: invalid config: {error}"
@@ -1220,6 +1228,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     }
                 }
                 Err(e) => {
+                    honk_config::diagnostic::report_diagnostics(&diagnostics);
                     warn!("SIGHUP reload request {request_id} rejected: config load failed: {e}")
                 }
             }

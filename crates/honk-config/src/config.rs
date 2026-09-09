@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::ConfigDiagnostic;
 use crate::dns::DnsConfig;
 use crate::experimental::ExperimentalConfig;
 use crate::group::Group;
@@ -488,6 +489,20 @@ impl Config {
     }
 
     pub fn from_file(path: &str) -> Result<Self, crate::ConfigError> {
+        let mut diagnostics = Vec::new();
+        let result = Self::from_file_with_diagnostics(path, &mut diagnostics);
+        crate::diagnostic::report_diagnostics(&diagnostics);
+        result
+    }
+
+    /// Load a config, appending diagnostics as encountered on success or failure.
+    /// A successful structured fallback discards only the abandoned dae diagnostics.
+    /// The plain entry point logs them instead. Values must be safe to display;
+    /// see [`ConfigDiagnostic`] for stderr warnings not captured by this vector.
+    pub fn from_file_with_diagnostics(
+        path: &str,
+        diagnostics: &mut Vec<ConfigDiagnostic>,
+    ) -> Result<Self, crate::ConfigError> {
         let content = std::fs::read_to_string(path)?;
 
         let ext = std::path::Path::new(path)
@@ -498,6 +513,7 @@ impl Config {
         // A recognized extension picks its format first and falls back to the
         // other structured formats.  Unknown or missing extensions keep the
         // historical dae -> TOML -> YAML -> JSON fallback chain.
+        let diagnostics_start = diagnostics.len();
         let mut config = match ext.as_deref() {
             Some("json") => Self::from_json_str(&content)
                 .or_else(|_| parse_toml(&content))
@@ -508,7 +524,7 @@ impl Config {
             Some("toml") => parse_toml(&content)
                 .or_else(|_| parse_yaml(&content))
                 .or_else(|_| Self::from_json_str(&content)),
-            _ => match crate::parser::parse_dae_config_file(path) {
+            _ => match crate::parser::parse_dae_config_file_with_diagnostics(path, diagnostics) {
                 Ok(config) => Ok(config),
                 // These errors identify recognized dae syntax; structured
                 // fallbacks would hide their actionable cause.
@@ -516,7 +532,8 @@ impl Config {
                 | Err(err @ crate::ConfigError::UnsupportedPolicy(_)) => Err(err),
                 Err(_) => parse_toml(&content)
                     .or_else(|_| parse_yaml(&content))
-                    .or_else(|_| Self::from_json_str(&content)),
+                    .or_else(|_| Self::from_json_str(&content))
+                    .inspect(|_| diagnostics.truncate(diagnostics_start)),
             },
         }?;
         config.derive_node_ids();

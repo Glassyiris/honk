@@ -7,14 +7,13 @@ mod tests;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::Config;
 use crate::config::GlobalConfig;
 use crate::experimental::ExperimentalConfig;
 use crate::group::Group;
 use crate::node::Node;
 use crate::subscription::Subscription;
+use crate::{Config, ConfigDiagnostic};
 use regex::Regex;
-use tracing::warn;
 #[derive(Debug, Clone)]
 struct Section {
     name: String,
@@ -27,6 +26,19 @@ struct Section {
 /// when they occur in a nested included file.  Included files must remain
 /// below that directory after symlink resolution.
 pub fn parse_dae_config_file(path: impl AsRef<Path>) -> Result<Config, crate::ConfigError> {
+    let mut diagnostics = Vec::new();
+    let result = parse_dae_config_file_with_diagnostics(path, &mut diagnostics);
+    crate::diagnostic::report_diagnostics(&diagnostics);
+    result
+}
+
+/// Load dae with includes, appending diagnostics as encountered on success or failure.
+/// The plain entry point logs them instead. Values must be safe to display;
+/// see [`ConfigDiagnostic`] for stderr warnings not captured by this vector.
+pub fn parse_dae_config_file_with_diagnostics(
+    path: impl AsRef<Path>,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> Result<Config, crate::ConfigError> {
     let entry = std::fs::canonicalize(path.as_ref())?;
     let entry_dir = entry.parent().map(Path::to_path_buf).ok_or_else(|| {
         crate::ConfigError::Include(format!(
@@ -42,7 +54,7 @@ pub fn parse_dae_config_file(path: impl AsRef<Path>) -> Result<Config, crate::Co
     };
     let input = loader.expand_file(&entry)?;
 
-    match parse_dae_config(&input) {
+    match parse_dae_config_with_diagnostics(&input, diagnostics) {
         Ok(config) => Ok(config),
         Err(err @ crate::ConfigError::UnsupportedPolicy(_)) => Err(err),
         Err(err) if loader.saw_include => Err(crate::ConfigError::Include(format!(
@@ -372,6 +384,19 @@ fn is_ident_continue(byte: u8) -> bool {
 }
 
 pub fn parse_dae_config(input: &str) -> Result<Config, crate::ConfigError> {
+    let mut diagnostics = Vec::new();
+    let result = parse_dae_config_with_diagnostics(input, &mut diagnostics);
+    crate::diagnostic::report_diagnostics(&diagnostics);
+    result
+}
+
+/// Parse dae, appending diagnostics as encountered on success or failure.
+/// The plain entry point logs them instead. Values must be safe to display;
+/// see [`ConfigDiagnostic`] for stderr warnings not captured by this vector.
+pub fn parse_dae_config_with_diagnostics(
+    input: &str,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> Result<Config, crate::ConfigError> {
     let input = strip_comments(input);
     if !input.contains('{') || !input.contains('}') {
         return Err(crate::ConfigError::Parse("not a dae config file".into()));
@@ -386,7 +411,7 @@ pub fn parse_dae_config(input: &str) -> Result<Config, crate::ConfigError> {
 
     for section in &sections {
         match section.name.as_str() {
-            "global" => config.global = parse_global_section(section)?,
+            "global" => config.global = parse_global_section(section, diagnostics)?,
             "dns" => config.dns = dns::parse_section(section)?,
             "routing" => config.routing = routing::parse_section(section)?,
             "node" => {
@@ -736,7 +761,10 @@ fn strip_unquoted_comment(line: &str) -> &str {
     line
 }
 
-fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::ConfigError> {
+fn parse_global_section(
+    section: &Section,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> Result<GlobalConfig, crate::ConfigError> {
     let mut cfg = GlobalConfig::default();
     let kv = parse_kv_pairs(&section.body);
 
@@ -805,8 +833,12 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
         cfg.check_interval_secs = parse_duration_secs(v);
     }
     if let Some(v) = kv.get("check_tolerance") {
-        cfg.check_tolerance_ms =
-            lenient_duration_ms(v, "global.check_tolerance", cfg.check_tolerance_ms);
+        cfg.check_tolerance_ms = lenient_duration_ms(
+            v,
+            "global.check_tolerance",
+            cfg.check_tolerance_ms,
+            diagnostics,
+        );
     }
     if let Some(v) = kv.get("dial_mode") {
         cfg.dial_mode = v.clone();
@@ -818,8 +850,12 @@ fn parse_global_section(section: &Section) -> Result<GlobalConfig, crate::Config
         cfg.allow_insecure = parse_bool(v);
     }
     if let Some(v) = kv.get("sniffing_timeout") {
-        cfg.sniffing_timeout_ms =
-            lenient_duration_ms(v, "global.sniffing_timeout", cfg.sniffing_timeout_ms);
+        cfg.sniffing_timeout_ms = lenient_duration_ms(
+            v,
+            "global.sniffing_timeout",
+            cfg.sniffing_timeout_ms,
+            diagnostics,
+        );
     }
     if let Some(v) = kv.get("tls_implementation") {
         cfg.tls_implementation = v.clone();
@@ -1224,18 +1260,25 @@ fn parse_duration_secs(s: &str) -> u64 {
     crate::types::parse_duration_secs(s).unwrap_or(0)
 }
 
-/// Keep the documented default for a timer the grammar cannot read. Guessing
-/// wrong here only changes how eagerly URLTest switches member, which does not
-/// justify refusing the whole configuration. Non-finite and negative values
-/// stay unreadable because `as u64` would saturate them to `u64::MAX`.
-fn lenient_duration_ms(value: &str, setting: &str, default: u64) -> u64 {
+// Invalid URLTest tolerance or compatibility sniffing timeout does not justify
+// rejecting the configuration; keep the documented default. Refuse non-finite
+// and negative values rather than letting `as u64` saturate to `u64::MAX` or zero.
+fn lenient_duration_ms(
+    value: &str,
+    setting: &str,
+    default: u64,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> u64 {
     match crate::types::parse_duration_ms(value) {
         Some(milliseconds) => milliseconds,
         None => {
-            warn!(
-                setting,
-                value, default, "duration is not milliseconds, `ms` or `s`; keeping the default"
-            );
+            diagnostics.push(ConfigDiagnostic {
+                setting: setting.to_string(),
+                value: value.to_string(),
+                message: format!(
+                    "duration is not milliseconds, `ms` or `s`; keeping the default ({default}ms)"
+                ),
+            });
             default
         }
     }
