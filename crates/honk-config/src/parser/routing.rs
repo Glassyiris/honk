@@ -1,12 +1,16 @@
-use super::{Section, extract_fn_args, normalize_geosite_code, strip_tag_arg};
+use super::{
+    Block, extract_fn_args, find_unquoted, normalize_geosite_code, split_unquoted, strip_tag_arg,
+};
 use crate::routing::RoutingConfig;
 
-fn split_routing_statements(body: &str) -> Result<Vec<String>, crate::ConfigError> {
+fn split_routing_statements<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<String>, crate::ConfigError> {
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut parenthesis_depth = 0usize;
 
-    for (line_index, line) in body.lines().enumerate() {
+    for (line_index, line) in lines.into_iter().enumerate() {
         let mut chunk = String::new();
         let mut quote = None;
         let mut escaped = false;
@@ -89,7 +93,8 @@ fn parse_routing_rule(
     statement: String,
     index: usize,
 ) -> Option<(crate::routing::RoutingRule, Option<String>)> {
-    let (left, right) = statement.split_once("->")?;
+    let arrow = find_unquoted(&statement, "->")?;
+    let (left, right) = (&statement[..arrow], &statement[arrow + 2..]);
     let left = left.trim();
     let right = right.trim();
     let (outbound, must) = right.strip_suffix("(must)").map_or_else(
@@ -97,7 +102,8 @@ fn parse_routing_rule(
         |name| (name.trim().to_owned(), true),
     );
     let condition = parse_route_condition(left);
-    let is_complex = must || left.split("&&").nth(1).is_some() || condition.needs_complex_display();
+    let is_complex =
+        must || find_unquoted(left, "&&").is_some() || condition.needs_complex_display();
     let rule = crate::routing::RoutingRule {
         name: format!("rule-{index}"),
         condition,
@@ -110,8 +116,8 @@ fn parse_routing_rule(
     Some((rule, is_complex.then_some(statement)))
 }
 
-pub(super) fn parse_section(section: &Section) -> Result<RoutingConfig, crate::ConfigError> {
-    split_routing_statements(&section.body).map(|statements| {
+pub(super) fn parse_section(section: &Block) -> Result<RoutingConfig, crate::ConfigError> {
+    split_routing_statements(section.lines_except(&[])).map(|statements| {
         statements
             .into_iter()
             .fold(RoutingConfig::default(), |mut config, statement| {
@@ -181,7 +187,7 @@ fn parse_route_matcher(condition: &mut crate::routing::RoutingCondition, matcher
 }
 
 fn parse_route_condition(expr: &str) -> crate::routing::RoutingCondition {
-    expr.split("&&")
+    split_unquoted(expr, "&&")
         .map(str::trim)
         .filter(|part| !part.is_empty())
         .fold(

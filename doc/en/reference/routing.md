@@ -13,6 +13,7 @@ fallback: outbound
 - `default:` is an alias of `fallback:`. The fallback target applies when no rule finalizes; if omitted, it defaults to `direct`.
 - Comma-separated arguments inside a matcher are alternatives. Different populated condition groups must all match.
 - A parenthesized argument list may span physical lines. The statement continues through its closing `)` and `-> outbound`.
+- Single or double quotes keep `,`, `)`, `&&`, and `->` literal inside matcher arguments. A prefixed argument may quote only its value, as in `domain(full: 'example.com')`; backslashes are preserved rather than decoded.
 - A leading `!` negates only the single matcher immediately following it. A rule matches when its positive conditions match and none of its negated matchers hits.
 - An unknown or unsniffed domain counts as “not x” for a negated domain or geosite matcher. It does not veto that rule.
 

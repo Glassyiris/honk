@@ -1,21 +1,19 @@
 use super::{
-    Section, extract_fn_args, extract_nested_all, has_routing_fallback, lenient, lenient_bool,
-    normalize_geosite_code, parse_ip_prefer, parse_kv_pair, parse_kv_pairs, split_nested_sections,
-    strip_tag_arg,
+    Block, extract_fn_args, find_unquoted, lenient, lenient_bool, normalize_geosite_code,
+    parse_ip_prefer, parse_kv_pair, parse_kv_pairs, split_unquoted, strip_tag_arg,
 };
 use crate::ConfigDiagnostic;
 use crate::dns::DnsConfig;
 
 pub(super) fn parse_section(
-    section: &Section,
+    section: &Block,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) -> Result<DnsConfig, crate::ConfigError> {
-    let dns_subs =
-        split_nested_sections(&section.body, &["upstream", "routing", "fixed_domain_ttl"])?;
+    let dns_subs = section.blocks_matching(&["upstream", "routing", "fixed_domain_ttl"]);
     let mut cfg = DnsConfig::default();
     let mut saw_upstream = false;
-    let dns_body = dns_subs.first().map(|s| s.body.as_str()).unwrap_or("");
-    let kv = parse_kv_pairs(dns_body);
+    let dns_lines = section.lines_except(&["upstream", "routing", "fixed_domain_ttl"]);
+    let kv = parse_kv_pairs(dns_lines.iter().copied());
     if let Some(bind) = kv.get("bind") {
         cfg.bind.clone_from(bind);
         cfg.bind_endpoint()
@@ -26,7 +24,7 @@ pub(super) fn parse_section(
             "dns.hosts_file was removed; use one or more use_host paths".into(),
         ));
     }
-    for (key, source) in dns_body.lines().filter_map(parse_kv_pair) {
+    for (key, source) in dns_lines.into_iter().filter_map(parse_kv_pair) {
         if key == "use_host" {
             crate::dns::push_host_source(&mut cfg.hosts, source);
         }
@@ -86,19 +84,24 @@ pub(super) fn parse_section(
         });
     }
 
-    for sub in dns_subs.iter().skip(1) {
+    for sub in dns_subs {
         match sub.name.as_str() {
             "upstream" => {
                 if !saw_upstream {
                     cfg.upstream.clear();
                     saw_upstream = true;
                 }
-                cfg.upstream.extend(parse_dns_upstreams(&sub.body));
+                cfg.upstream
+                    .extend(parse_dns_upstreams(sub.lines_except(&[])));
             }
             "routing" => {
-                for req_body in extract_nested_all(&sub.body, "request") {
-                    let has_fallback = has_routing_fallback(&req_body);
-                    let request = parse_dns_request_routing(&req_body);
+                for req in sub.blocks_matching(&["request"]) {
+                    let req_lines = req.lines_except(&[]);
+                    let has_fallback = req_lines.iter().any(|line| {
+                        let line = line.trim();
+                        line.starts_with("fallback:") || line.starts_with("default:")
+                    });
+                    let request = parse_dns_request_routing(req_lines);
                     cfg.routing.request.rules.extend(request.rules);
                     if !has_fallback {
                         continue;
@@ -111,9 +114,13 @@ pub(super) fn parse_section(
                         cfg.routing.fallback = name.clone();
                     }
                 }
-                for resp_body in extract_nested_all(&sub.body, "response") {
-                    let has_fallback = has_routing_fallback(&resp_body);
-                    let response = parse_dns_response_routing(&resp_body);
+                for resp in sub.blocks_matching(&["response"]) {
+                    let resp_lines = resp.lines_except(&[]);
+                    let has_fallback = resp_lines.iter().any(|line| {
+                        let line = line.trim();
+                        line.starts_with("fallback:") || line.starts_with("default:")
+                    });
+                    let response = parse_dns_response_routing(resp_lines);
                     cfg.routing.response.rules.extend(response.rules);
                     if has_fallback {
                         cfg.routing.response.fallback = response.fallback;
@@ -122,7 +129,7 @@ pub(super) fn parse_section(
             }
             "fixed_domain_ttl" => {
                 cfg.fixed_domain_ttl
-                    .extend(parse_fixed_domain_ttl(&sub.body, diagnostics));
+                    .extend(parse_fixed_domain_ttl(sub.lines_except(&[]), diagnostics));
             }
             _ => {}
         }
@@ -131,9 +138,11 @@ pub(super) fn parse_section(
     Ok(cfg)
 }
 
-fn parse_dns_upstreams(body: &str) -> Vec<crate::dns::DnsUpstream> {
+fn parse_dns_upstreams<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+) -> Vec<crate::dns::DnsUpstream> {
     let mut upstreams = Vec::new();
-    for line in body.lines() {
+    for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -261,12 +270,12 @@ fn extract_tls_server_name(address: String) -> (String, Option<String>) {
 }
 
 /// Parse `fixed_domain_ttl { domain: N ... }` into a HashMap.
-fn parse_fixed_domain_ttl(
-    body: &str,
+fn parse_fixed_domain_ttl<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) -> std::collections::HashMap<String, u32> {
     let mut map = std::collections::HashMap::new();
-    for line in body.lines() {
+    for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -289,20 +298,29 @@ fn parse_fixed_domain_ttl(
     map
 }
 
+fn strip_dns_routing_comment(line: &str) -> &str {
+    let line = line.trim();
+    // DNS gives // precedence and tests only the first unquoted # for a preceding space.
+    if let Some(pos) = find_unquoted(line, "//") {
+        &line[..pos]
+    } else if let Some(pos) = find_unquoted(line, "#")
+        && pos > 0
+        && line.as_bytes()[pos - 1] == b' '
+    {
+        &line[..pos]
+    } else {
+        line
+    }
+}
+
 /// Parse `routing.request { ... }` block.
-fn parse_dns_request_routing(body: &str) -> crate::dns::DnsRequestRouting {
+fn parse_dns_request_routing<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+) -> crate::dns::DnsRequestRouting {
     let mut routing = crate::dns::DnsRequestRouting::default();
 
-    for line in body.lines() {
-        let mut trimmed = line.trim();
-        if let Some(pos) = trimmed.find("//") {
-            trimmed = trimmed[..pos].trim();
-        } else if let Some(pos) = trimmed.find('#') {
-            // Only strip # if preceded by space (to avoid stripping domain # itself)
-            if pos > 0 && trimmed.as_bytes()[pos - 1] == b' ' {
-                trimmed = trimmed[..pos].trim();
-            }
-        }
+    for line in lines {
+        let trimmed = strip_dns_routing_comment(line).trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -313,7 +331,7 @@ fn parse_dns_request_routing(body: &str) -> crate::dns::DnsRequestRouting {
             continue;
         }
 
-        if let Some(arrow_pos) = trimmed.find("->") {
+        if let Some(arrow_pos) = find_unquoted(trimmed, "->") {
             let left = trimmed[..arrow_pos].trim();
             let right = trimmed[arrow_pos + 2..].trim();
             let action = crate::dns::DnsRequestAction::parse(right);
@@ -331,19 +349,13 @@ fn parse_dns_request_routing(body: &str) -> crate::dns::DnsRequestRouting {
 }
 
 /// Parse `routing.response { ... }` block.
-fn parse_dns_response_routing(body: &str) -> crate::dns::DnsResponseRouting {
+fn parse_dns_response_routing<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+) -> crate::dns::DnsResponseRouting {
     let mut routing = crate::dns::DnsResponseRouting::default();
 
-    for line in body.lines() {
-        let mut trimmed = line.trim();
-        if let Some(pos) = trimmed.find("//") {
-            trimmed = trimmed[..pos].trim();
-        } else if let Some(pos) = trimmed.find('#')
-            && pos > 0
-            && trimmed.as_bytes()[pos - 1] == b' '
-        {
-            trimmed = trimmed[..pos].trim();
-        }
+    for line in lines {
+        let trimmed = strip_dns_routing_comment(line).trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -354,7 +366,7 @@ fn parse_dns_response_routing(body: &str) -> crate::dns::DnsResponseRouting {
             continue;
         }
 
-        if let Some(arrow_pos) = trimmed.find("->") {
+        if let Some(arrow_pos) = find_unquoted(trimmed, "->") {
             let left = trimmed[..arrow_pos].trim();
             let right = trimmed[arrow_pos + 2..].trim();
             let action = crate::dns::DnsResponseAction::parse(right);
@@ -374,9 +386,8 @@ fn parse_dns_response_routing(body: &str) -> crate::dns::DnsResponseRouting {
 /// Parse a chain of `&&`-separated conditions.
 fn parse_dns_conditions(expr: &str, is_response: bool) -> Vec<crate::dns::DnsCond> {
     let mut conds = Vec::new();
-    let parts: Vec<&str> = expr.split("&&").map(|s| s.trim()).collect();
 
-    for part in parts {
+    for part in split_unquoted(expr, "&&") {
         let part = part.trim();
         if part.is_empty() {
             continue;
@@ -396,7 +407,8 @@ fn parse_dns_conditions(expr: &str, is_response: bool) -> Vec<crate::dns::DnsCon
         if let Some(args) = extract_fn_args(inner, "qtype") {
             let types: Vec<u16> = args
                 .iter()
-                .filter_map(|a| crate::dns::parse_qtype_token(a))
+                .flat_map(|argument| argument.split(','))
+                .filter_map(crate::dns::parse_qtype_token)
                 .collect();
             conds.push(crate::dns::DnsCond::Qtype { not, types });
             continue;

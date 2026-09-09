@@ -19,11 +19,13 @@ The built-in outbounds `direct` and `block` are injected at startup and may be u
 
 ## Configuration format
 
-- Put settings in `section { ... }` blocks as one `key: value` pair per line.
+- Put settings in `section { ... }` blocks as one `key: value` pair per line. One-line blocks such as `global { log_level: debug }` and nested one-line blocks are accepted.
 - Quote URLs, values containing whitespace, and values containing syntax characters such as `:`, `+`, or `#`. Scalar values plus `include` and `node` entries accept single or double quotes; use single quotes for quoted `subscription` URLs.
+- Matching single or double quotes keep commas, closing parentheses, `&&`, and `->` literal in matcher arguments and filter/routing expressions. `group(...)` and `qtype(...)` still interpret quoted comma-separated text as lists.
 - Write lists accepted by a setting or matcher with commas: `lan_interface: eth0, eth1` or `dport(80, 443)`.
 - Second-based durations accept bare seconds or `ms`, `s`, `m`, and `h` suffixes. Millisecond settings such as `check_tolerance` accept bare milliseconds, `ms`, or `s`.
 - `#` starts a whole-line or unquoted trailing comment. Keep notes for `node` and `subscription` entries on separate comment lines.
+- Braces inside matching single or double quotes are data. An unmatched closing `}` is ignored with a diagnostic; an unclosed block is an error naming its opening line.
 
 ### Splitting a configuration with `include {}`
 

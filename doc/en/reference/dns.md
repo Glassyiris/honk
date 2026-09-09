@@ -96,6 +96,8 @@ The parameter is removed from the dial address and overrides a hostname-derived 
 
 A trailing `-> tag` forces the upstream through that node or group. Without it, honk resolves the upstream destination and applies the ordinary traffic `routing { ... }` rules; that route can still select a proxy leaf. The legacy same-line form `name: 'uri' outbound: tag` remains accepted.
 
+The upstream-line searches for `->` and `outbound:` are not quote-aware; do not embed these separators in the URI.
+
 | Protocol | Through a selected node/group |
 | --- | --- |
 | UDP (`udp`, bare, `tcp+udp`) | Carried as TCP-DNS through the outbound. |
@@ -108,6 +110,8 @@ A trailing `-> tag` forces the upstream through that node or group. Without it, 
 ## DNS routing
 
 `routing` contains ordered `request` and `response` rules. The first matching rule wins. Arguments inside one condition are OR-ed; conditions joined with `&&` are AND-ed. Prefix a condition with `!` to negate it.
+
+In request and response rules, single or double quotes protect `,`, `)`, `&&`, `->`, `#`, and `//` inside matcher arguments. Outside quotes, `//` takes comment precedence; otherwise only the first `#` is considered, and it starts a comment only after an ASCII space. A quoted QTYPE list such as `qtype('a,aaaa')` still selects both types.
 
 ### Conditions
 

@@ -96,6 +96,8 @@ cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
 
 末尾的 `-> tag` 强制该上游经过指定节点或组。省略时，honk 会解析上游目的地址并应用普通流量的 `routing { ... }` 规则；该路由仍可选择代理 leaf。旧版同一行写法 `name: 'uri' outbound: tag` 仍然接受。
 
+上游行中对 `->` 和 `outbound:` 的搜索不区分引号内外，不要在 URI 中嵌入这两个分隔符。
+
 | 协议 | 经过选定节点/组 |
 | --- | --- |
 | UDP（`udp`、裸地址、`tcp+udp`） | 通过该出站承载为 TCP-DNS。 |
@@ -108,6 +110,8 @@ cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
 ## DNS 路由
 
 `routing` 包含有序的 `request` 和 `response` 规则，首条匹配规则生效。同一个条件内的参数按 OR 组合；用 `&&` 连接的条件按 AND 组合。在条件前加 `!` 可将其取反。
+
+在 request 和 response 规则中，匹配器参数内的成对单引号或双引号可保护 `,`、`)`、`&&`、`->`、`#` 和 `//`。引号外优先用 `//` 截断注释；没有 `//` 时，只检查第一个 `#`，且仅在它前面是 ASCII 空格时开始注释。`qtype('a,aaaa')` 这样的带引号列表仍选择两种类型。
 
 ### 条件
 

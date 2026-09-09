@@ -2381,16 +2381,19 @@ fn test_group_filter_diagnostics_do_not_echo_the_filter() {
 }
 
 #[test]
-fn test_quoted_and_in_filter_is_reported_as_unparseable() {
-    let input = "node {\n    probe: 'socks5://127.0.0.1:1080'\n}\ngroup {\n    proxy {\n        filter: name('a&&b')\n    }\n}\n";
+fn quoted_conjunction_filter_matches_literal_on_reresolution() {
+    let input = "node {\n    'a&&b': 'socks5://127.0.0.1:1080'\n    other: 'socks5://127.0.0.1:1081'\n}\ngroup {\n    proxy {\n        filter: name('a&&b')\n    }\n}\n";
     let mut diagnostics = Vec::new();
-    let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
-    assert_eq!(diagnostics.len(), 1);
-    assert_eq!(diagnostics[0].setting, "group.proxy.filter");
-    assert_eq!(diagnostics[0].value, "1");
-    assert!(diagnostics[0].message.contains("could not parse"));
-    assert!(diagnostics[0].message.contains("ignored"));
-    assert!(config.groups[0].nodes.is_empty());
+    let mut config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+    assert_eq!(config.groups[0].nodes, [config.nodes[0].id]);
+    assert!(diagnostics.is_empty());
+
+    config.nodes[0].name = "renamed".to_string();
+    let replacement = crate::node::Node::from_share_link("socks5://127.0.0.1:1082#a&&b").unwrap();
+    let replacement_id = replacement.id;
+    config.nodes.push(replacement);
+    crate::parser::resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
+    assert_eq!(config.groups[0].nodes, [replacement_id]);
 }
 
 #[test]

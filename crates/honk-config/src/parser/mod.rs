@@ -1,6 +1,8 @@
 mod dns;
 mod routing;
 
+mod structure;
+
 #[cfg(test)]
 mod tests;
 
@@ -14,11 +16,7 @@ use crate::node::Node;
 use crate::subscription::Subscription;
 use crate::{Config, ConfigDiagnostic};
 use regex::Regex;
-#[derive(Debug, Clone)]
-struct Section {
-    name: String,
-    body: String,
-}
+use structure::{Block, Item, quoted_end, scan};
 
 /// Load a dae configuration file, resolving its top-level `include` blocks.
 ///
@@ -52,9 +50,17 @@ pub fn parse_dae_config_file_with_diagnostics(
         stack: Vec::new(),
         saw_include: false,
     };
-    let input = loader.expand_file(&entry)?;
-
-    match parse_dae_config_with_diagnostics(&input, diagnostics) {
+    let blocks = match loader.expand_file(&entry, diagnostics) {
+        Ok(blocks) => blocks,
+        Err(err @ crate::ConfigError::Include(_)) => return Err(err),
+        Err(err) if loader.saw_include => {
+            return Err(crate::ConfigError::Include(format!(
+                "failed to parse configuration after resolving includes: {err}"
+            )));
+        }
+        Err(err) => return Err(err),
+    };
+    match parse_blocks(blocks, diagnostics) {
         Ok(config) => Ok(config),
         Err(err @ crate::ConfigError::UnsupportedPolicy(_)) => Err(err),
         Err(err) if loader.saw_include => Err(crate::ConfigError::Include(format!(
@@ -74,7 +80,11 @@ struct IncludeLoader {
 }
 
 impl IncludeLoader {
-    fn expand_file(&mut self, path: &Path) -> Result<String, crate::ConfigError> {
+    fn expand_file(
+        &mut self,
+        path: &Path,
+        diagnostics: &mut Vec<ConfigDiagnostic>,
+    ) -> Result<Vec<Block>, crate::ConfigError> {
         if !self.loaded.insert(path.to_path_buf()) {
             let mut chain = self
                 .stack
@@ -96,20 +106,40 @@ impl IncludeLoader {
                     path.display()
                 ))
             })?;
-            let (has_include, patterns) = extract_include_patterns(&input, path)?;
-            self.saw_include |= has_include;
+            let mut structural_diagnostics = Vec::new();
+            let roots = scan(
+                &input,
+                Some(path),
+                &mut structural_diagnostics,
+                &mut self.saw_include,
+            );
+            if self.stack.len() == 1 && !matches!(&roots, Err(crate::ConfigError::Include(_))) {
+                check_dae_input(&input)?;
+            }
+            diagnostics.extend(structural_diagnostics);
+            let roots = roots?;
+            let mut blocks = Vec::new();
+            let mut patterns = Vec::new();
+            for block in roots {
+                if block.name == "include" {
+                    self.saw_include = true;
+                    if let Some(body) = block.include_body.as_deref() {
+                        patterns.extend(parse_include_body(body, path)?);
+                    }
+                } else {
+                    blocks.push(block);
+                }
+            }
 
             // dae merges an entry's own sections before the sections of its
             // included descendants, regardless of where `include` occurs in
             // that entry.  Appending recursively gives that preorder.
-            let mut expanded = input;
             for pattern in patterns {
                 for child in self.expand_pattern(&pattern, path)? {
-                    expanded.push('\n');
-                    expanded.push_str(&self.expand_file(&child)?);
+                    blocks.extend(self.expand_file(&child, diagnostics)?);
                 }
             }
-            Ok(expanded)
+            Ok(blocks)
         })();
         self.stack.pop();
         result
@@ -194,71 +224,24 @@ fn normalize_dae_glob_pattern(pattern: &Path) -> PathBuf {
     PathBuf::from(normalized)
 }
 
-/// Extract bare or quoted paths from top-level `include { ... }` blocks.
-/// This intentionally has a small lexer of its own so the file loader also
-/// accepts dae's inline form: `include { 'path with spaces.dae' other.dae }`.
-fn extract_include_patterns(
-    input: &str,
-    source: &Path,
-) -> Result<(bool, Vec<String>), crate::ConfigError> {
-    let bytes = input.as_bytes();
-    let mut index = 0;
-    let mut depth = 0usize;
-    let mut found = false;
-    let mut patterns = Vec::new();
-
-    while index < bytes.len() {
-        match bytes[index] {
-            b'#' => skip_line(bytes, &mut index),
-            b'\'' | b'"' => {
-                if let Some(end) = quoted_end(bytes, index) {
-                    index = end;
-                } else {
-                    break;
-                }
-            }
-            b'{' => {
-                depth += 1;
-                index += 1;
-            }
-            b'}' => {
-                depth = depth.saturating_sub(1);
-                index += 1;
-            }
-            byte if depth == 0 && is_ident_start(byte) => {
-                let start = index;
-                index += 1;
-                while index < bytes.len() && is_ident_continue(bytes[index]) {
-                    index += 1;
-                }
-                if &input[start..index] != "include" {
-                    continue;
-                }
-
-                let mut after_name = index;
-                skip_layout(bytes, &mut after_name);
-                if after_name >= bytes.len() || bytes[after_name] != b'{' {
-                    continue;
-                }
-                let (body, end) = include_body(input, after_name, source)?;
-                found = true;
-                patterns.extend(parse_include_body(body, source)?);
-                index = end;
-            }
-            _ => index += 1,
-        }
-    }
-
-    Ok((found, patterns))
-}
-
 fn parse_include_body(body: &str, source: &Path) -> Result<Vec<String>, crate::ConfigError> {
     let bytes = body.as_bytes();
     let mut index = 0;
     let mut patterns = Vec::new();
 
     while index < bytes.len() {
-        skip_layout(bytes, &mut index);
+        loop {
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            if index < bytes.len() && bytes[index] == b'#' {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            } else {
+                break;
+            }
+        }
         if index >= bytes.len() {
             break;
         }
@@ -302,87 +285,6 @@ fn parse_include_body(body: &str, source: &Path) -> Result<Vec<String>, crate::C
     Ok(patterns)
 }
 
-fn include_body<'a>(
-    input: &'a str,
-    open_brace: usize,
-    source: &Path,
-) -> Result<(&'a str, usize), crate::ConfigError> {
-    let bytes = input.as_bytes();
-    let mut index = open_brace + 1;
-    let body_start = index;
-    let mut depth = 1usize;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            b'#' => skip_line(bytes, &mut index),
-            b'\'' | b'"' => {
-                if let Some(end) = quoted_end(bytes, index) {
-                    index = end;
-                } else {
-                    break;
-                }
-            }
-            b'{' => {
-                depth += 1;
-                index += 1;
-            }
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Ok((&input[body_start..index], index + 1));
-                }
-                index += 1;
-            }
-            _ => index += 1,
-        }
-    }
-
-    Err(crate::ConfigError::Include(format!(
-        "unclosed include section in '{}'",
-        source.display()
-    )))
-}
-
-fn skip_layout(bytes: &[u8], index: &mut usize) {
-    loop {
-        while *index < bytes.len() && bytes[*index].is_ascii_whitespace() {
-            *index += 1;
-        }
-        if *index < bytes.len() && bytes[*index] == b'#' {
-            skip_line(bytes, index);
-        } else {
-            break;
-        }
-    }
-}
-
-fn skip_line(bytes: &[u8], index: &mut usize) {
-    while *index < bytes.len() && bytes[*index] != b'\n' {
-        *index += 1;
-    }
-}
-
-fn quoted_end(bytes: &[u8], start: usize) -> Option<usize> {
-    let quote = bytes[start];
-    let mut index = start + 1;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\\' => index += 2,
-            byte if byte == quote => return Some(index + 1),
-            _ => index += 1,
-        }
-    }
-    None
-}
-
-fn is_ident_start(byte: u8) -> bool {
-    byte.is_ascii_alphabetic() || byte == b'_'
-}
-
-fn is_ident_continue(byte: u8) -> bool {
-    is_ident_start(byte) || byte.is_ascii_digit() || byte == b'-'
-}
-
 pub fn parse_dae_config(input: &str) -> Result<Config, crate::ConfigError> {
     let mut diagnostics = Vec::new();
     let result = parse_dae_config_with_diagnostics(input, &mut diagnostics);
@@ -397,16 +299,45 @@ pub fn parse_dae_config_with_diagnostics(
     input: &str,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) -> Result<Config, crate::ConfigError> {
-    let input = strip_comments(input);
-    if !input.contains('{') || !input.contains('}') {
+    check_dae_input(input)?;
+    let blocks = scan(input, None, diagnostics, &mut false)?;
+    parse_blocks(blocks, diagnostics)
+}
+
+fn check_dae_input(input: &str) -> Result<(), crate::ConfigError> {
+    let mut has_open = false;
+    let mut has_close = false;
+    for line in input.lines().map(str::trim_start) {
+        if !line.starts_with('#') {
+            has_open |= line.contains('{');
+            has_close |= line.contains('}');
+        }
+    }
+    if !has_open || !has_close {
         return Err(crate::ConfigError::Parse("not a dae config file".into()));
     }
+    Ok(())
+}
 
-    let sections = merge_top_level_sections(split_sections(&input)?);
+fn parse_blocks(
+    blocks: Vec<Block>,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) -> Result<Config, crate::ConfigError> {
+    let mut sections = Vec::<Block>::new();
+    let mut indices = HashMap::<String, usize>::new();
+    for block in blocks {
+        if let Some(&index) = indices.get(&block.name) {
+            sections[index].items.extend(block.items);
+        } else {
+            indices.insert(block.name.clone(), sections.len());
+            sections.push(block);
+        }
+    }
+
     let canonical_nfqueue_present = sections
         .iter()
         .filter(|section| section.name == "global")
-        .any(|section| parse_kv_pairs(&section.body).contains_key("nfqueue_enable"));
+        .any(|section| parse_kv_pairs(section.lines_except(&[])).contains_key("nfqueue_enable"));
     let mut config = Config::default();
 
     for section in &sections {
@@ -432,7 +363,6 @@ pub fn parse_dae_config_with_diagnostics(
             "experimental" => {
                 config.experimental = parse_experimental_section(section, diagnostics)?;
             }
-            "include" => {}
             _ => {}
         }
     }
@@ -489,7 +419,9 @@ fn resolve_group_filters_inner(
             .enumerate()
             .map(|(index, filter)| (index, filter.trim()))
             // Unterminated group filters must not trigger the all-nodes fallback.
-            .filter(|(_, filter)| !filter.starts_with("group(") || !filter.contains(')'))
+            .filter(|(_, filter)| {
+                !filter.starts_with("group(") || find_unquoted(filter, ")").is_none()
+            })
             .collect();
 
         if filters.is_empty() {
@@ -559,7 +491,7 @@ impl GroupFilterTerm {
 
 fn parse_group_filter_expression(filter: &str) -> Option<Vec<GroupFilterTerm>> {
     let mut terms = Vec::new();
-    for raw_term in filter.split("&&") {
+    for raw_term in split_unquoted(filter, "&&") {
         let raw_term = raw_term.trim();
         let (negated, predicate) = match raw_term.strip_prefix('!') {
             Some(predicate) => (true, predicate.trim()),
@@ -660,99 +592,6 @@ fn unquote_filter_argument(value: &str) -> &str {
     value
 }
 
-fn strip_comments(input: &str) -> String {
-    input
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim_start();
-            !trimmed.is_empty() && !trimmed.starts_with('#')
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn split_sections(input: &str) -> Result<Vec<Section>, crate::ConfigError> {
-    let mut sections = Vec::new();
-    let mut depth = 0i32;
-    let mut current_name = String::new();
-    let mut current_body = String::new();
-    let mut in_section = false;
-
-    for line in input.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let open_count = trimmed.matches('{').count() as i32;
-        let close_count = trimmed.matches('}').count() as i32;
-
-        if !in_section {
-            if let Some(name) = trimmed.strip_suffix('{') {
-                current_name = name.trim().to_string();
-                in_section = true;
-                depth = 1;
-                current_body.clear();
-                if trimmed.contains('}') {
-                    depth = 0;
-                    in_section = false;
-                    sections.push(Section {
-                        name: current_name.clone(),
-                        body: current_body.clone(),
-                    });
-                }
-            }
-        } else {
-            depth += open_count;
-            depth -= close_count;
-            if depth <= 0 {
-                in_section = false;
-                let line_content = if close_count > 0 {
-                    trimmed.trim_end_matches('}').trim()
-                } else {
-                    trimmed
-                };
-                if !line_content.is_empty() {
-                    current_body.push_str(line_content);
-                    current_body.push('\n');
-                }
-                sections.push(Section {
-                    name: current_name.clone(),
-                    body: current_body.clone(),
-                });
-            } else {
-                current_body.push_str(trimmed);
-                current_body.push('\n');
-            }
-        }
-    }
-
-    Ok(sections)
-}
-
-/// dae merges repeated top-level sections by appending their items.  Keeping
-/// one body per section lets the existing section parsers retain that order
-/// when a configuration is composed from include files.
-fn merge_top_level_sections(sections: Vec<Section>) -> Vec<Section> {
-    let mut merged = Vec::<Section>::new();
-    let mut indices = HashMap::<String, usize>::new();
-
-    for section in sections {
-        if let Some(&index) = indices.get(&section.name) {
-            let body = &mut merged[index].body;
-            if !body.is_empty() && !section.body.is_empty() {
-                body.push('\n');
-            }
-            body.push_str(&section.body);
-        } else {
-            indices.insert(section.name.clone(), merged.len());
-            merged.push(section);
-        }
-    }
-
-    merged
-}
-
 fn parse_kv_pair(line: &str) -> Option<(&str, &str)> {
     let trimmed = strip_unquoted_comment(line.trim()).trim();
     let (key, value) = trimmed.split_once(':')?;
@@ -762,8 +601,9 @@ fn parse_kv_pair(line: &str) -> Option<(&str, &str)> {
     ))
 }
 
-fn parse_kv_pairs(body: &str) -> HashMap<String, String> {
-    body.lines()
+fn parse_kv_pairs<'a>(lines: impl IntoIterator<Item = &'a str>) -> HashMap<String, String> {
+    lines
+        .into_iter()
         .filter_map(parse_kv_pair)
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
         .collect()
@@ -789,13 +629,12 @@ fn strip_unquoted_comment(line: &str) -> &str {
     }
     line
 }
-
 fn parse_global_section(
-    section: &Section,
+    section: &Block,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) -> Result<GlobalConfig, crate::ConfigError> {
     let mut cfg = GlobalConfig::default();
-    let kv = parse_kv_pairs(&section.body);
+    let kv = parse_kv_pairs(section.lines_except(&[]));
 
     if let Some(v) = kv.get("tproxy_port") {
         cfg.tproxy_port = lenient(v.parse().ok(), 12345, diagnostics, || ConfigDiagnostic {
@@ -963,26 +802,51 @@ fn parse_global_section(
     Ok(cfg)
 }
 
+fn find_unquoted(input: &str, delimiter: &str) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if matches!(bytes[index], b'\'' | b'"') {
+            index = quoted_end(bytes, index)?;
+        } else if bytes[index..].starts_with(delimiter.as_bytes()) {
+            return Some(index);
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
+fn split_unquoted<'a>(input: &'a str, delimiter: &'a str) -> impl Iterator<Item = &'a str> {
+    let mut remaining = Some(input);
+    std::iter::from_fn(move || {
+        let input = remaining.take()?;
+        if let Some(index) = find_unquoted(input, delimiter) {
+            remaining = Some(&input[index + delimiter.len()..]);
+            Some(&input[..index])
+        } else {
+            Some(input)
+        }
+    })
+}
+
 fn extract_fn_args(expr: &str, fn_name: &str) -> Option<Vec<String>> {
-    let args = expr
-        .strip_prefix(fn_name)?
-        .strip_prefix('(')?
-        .split_once(')')?
-        .0;
+    let body = expr.strip_prefix(fn_name)?.strip_prefix('(')?;
+    let args = &body[..find_unquoted(body, ")")?];
     Some(
-        args.split(',')
-            .map(str::trim)
-            .map(|arg| arg.trim_matches(['\'', '"']))
+        split_unquoted(args, ",")
+            .map(unquote_filter_argument)
             .filter(|arg| !arg.is_empty())
             .map(str::to_owned)
             .collect(),
     )
 }
 
-/// Strip a `prefix:` marker from a route argument and trim surrounding
-/// whitespace.  Dae syntax allows spaces after the colon (`geosite: cn`).
+/// Strip a `prefix:` marker from a route argument.  Dae syntax allows spaces
+/// after the colon (`geosite: cn`), and the value may carry its own quotes.
 fn strip_tag_arg(arg: &str, prefix: &str) -> Option<String> {
-    arg.strip_prefix(prefix).map(|s| s.trim().to_string())
+    arg.strip_prefix(prefix)
+        .map(|value| unquote_filter_argument(value).to_string())
 }
 
 /// Normalize a geosite list name.
@@ -998,9 +862,10 @@ fn node_parse_diagnostic(error: &crate::ConfigError) -> String {
     format!("node section: skipping unparseable entry: {error}")
 }
 
-fn parse_node_section(section: &Section) -> Result<Vec<Node>, crate::ConfigError> {
+fn parse_node_section(section: &Block) -> Result<Vec<Node>, crate::ConfigError> {
     let mut nodes = Vec::new();
-    for line in section.body.lines() {
+    let lines = section.lines_except(&[]);
+    for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -1054,23 +919,19 @@ fn parse_node_section(section: &Section) -> Result<Vec<Node>, crate::ConfigError
     }
     Ok(nodes)
 }
-
 fn parse_group_section(
-    section: &Section,
+    section: &Block,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) -> Result<Vec<Group>, crate::ConfigError> {
-    let groups_raw = split_nested_sections_named(&section.body)?;
     let mut groups = Vec::new();
 
-    for grp in &groups_raw {
-        if grp.name.is_empty() {
-            continue; // skip pre-ambient section
-        }
+    for grp in section.blocks_any() {
         let mut group = Group {
             name: grp.name.clone(),
             ..Default::default()
         };
-        let kv = parse_kv_pairs(&grp.body);
+        let lines = grp.lines_except(&[]);
+        let kv = parse_kv_pairs(lines.iter().copied());
         if let Some(policy) = kv.get("policy") {
             group.policy = parse_group_policy(policy, &group.name, diagnostics)?;
         }
@@ -1091,21 +952,19 @@ fn parse_group_section(
             );
         }
 
-        let filter_lines: Vec<&str> = grp
-            .body
-            .lines()
-            .filter(|l| l.trim().starts_with("filter:"))
-            .collect();
+        let filter_lines = lines
+            .iter()
+            .copied()
+            .filter(|line| line.trim().starts_with("filter:"));
         for line in filter_lines {
             let val = line
                 .split_once(':')
                 .map(|(_, v)| strip_unquoted_comment(v.trim()).trim())
                 .unwrap_or("");
-            // separated by commas or pipes: `group('hk', 'jp')`, `group('hk|jp')`.
             if let Some(tags) = extract_fn_args(val, "group") {
                 for tag in tags
                     .iter()
-                    .flat_map(|t| t.split('|').map(str::trim))
+                    .flat_map(|t| t.split(['|', ',']).map(str::trim))
                     .map(str::to_string)
                 {
                     if !tag.is_empty() && !group.groups.contains(&tag) {
@@ -1159,71 +1018,72 @@ fn parse_group_policy(
 }
 
 fn parse_subscription_section(
-    section: &Section,
+    section: &Block,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) -> Result<Vec<Subscription>, crate::ConfigError> {
     let mut subs = Vec::new();
-    let mut lines = section.body.lines();
+    append_subscriptions(&section.items, &mut subs, diagnostics);
+    Ok(subs)
+}
 
-    while let Some(raw_line) = lines.next() {
-        let line = raw_line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some((tag, value)) = line.split_once(':') else {
-            continue;
-        };
-        let tag = unquote_filter_argument(tag).to_string();
-        let value = value.trim();
-
-        if value == "{" {
-            let mut body = String::new();
-            for raw_line in lines.by_ref() {
-                let setting = strip_unquoted_comment(raw_line.trim()).trim();
-                if setting == "}" {
-                    break;
+fn append_subscriptions(
+    items: &[Item],
+    subs: &mut Vec<Subscription>,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    for item in items {
+        match item {
+            Item::Statement(line, _) => subs.extend(parse_subscription_entry(line)),
+            Item::Block(block) => {
+                let Some((tag, _)) = block
+                    .header
+                    .split_once(':')
+                    .filter(|(_, value)| value.trim() == "{")
+                else {
+                    subs.extend(parse_subscription_entry(&block.header));
+                    append_subscriptions(&block.items, subs, diagnostics);
+                    subs.extend(parse_subscription_entry(&block.closing));
+                    continue;
+                };
+                let kv = parse_kv_pairs(block.lines_except(&[]));
+                let mut sub = Subscription {
+                    name: unquote_filter_argument(tag).to_string(),
+                    ..Default::default()
+                };
+                if let Some(url) = kv.get("url") {
+                    sub.url = url.clone();
                 }
-                if !setting.is_empty() {
-                    body.push_str(setting);
-                    body.push('\n');
+                if let Some(ua) = kv.get("ua") {
+                    sub.user_agent = Some(ua.clone());
                 }
+                if let Some(interval) = kv.get("interval") {
+                    sub.update_interval = lenient(
+                        crate::types::parse_duration_secs(interval),
+                        0,
+                        diagnostics,
+                        || ConfigDiagnostic {
+                            setting: format!("subscription.{}.interval", sub.name),
+                            value: interval.clone(),
+                            message: "duration is unsupported by honk; using fallback 0s"
+                                .to_string(),
+                        },
+                    );
+                }
+                subs.push(sub);
             }
-            let kv = parse_kv_pairs(&body);
-            let mut sub = Subscription {
-                name: tag,
-                ..Default::default()
-            };
-            if let Some(url) = kv.get("url") {
-                sub.url = url.clone();
-            }
-            if let Some(ua) = kv.get("ua") {
-                sub.user_agent = Some(ua.clone());
-            }
-            if let Some(interval) = kv.get("interval") {
-                sub.update_interval = lenient(
-                    crate::types::parse_duration_secs(interval),
-                    0,
-                    diagnostics,
-                    || ConfigDiagnostic {
-                        setting: format!("subscription.{}.interval", sub.name),
-                        value: interval.clone(),
-                        message: "duration is unsupported by honk; using fallback 0s".to_string(),
-                    },
-                );
-            }
-            subs.push(sub);
-        } else {
-            let (url, user_agent) = parse_subscription_value(value);
-            subs.push(Subscription {
-                name: tag,
-                url,
-                user_agent,
-                ..Default::default()
-            });
         }
     }
+}
 
-    Ok(subs)
+fn parse_subscription_entry(line: &str) -> Option<Subscription> {
+    let (tag, value) = line.trim().split_once(':')?;
+    let (url, user_agent) = parse_subscription_value(value);
+    Some(Subscription {
+        name: unquote_filter_argument(tag).to_string(),
+        url,
+        user_agent,
+        ..Default::default()
+    })
 }
 
 fn parse_subscription_value(value: &str) -> (String, Option<String>) {
@@ -1242,23 +1102,23 @@ fn parse_subscription_value(value: &str) -> (String, Option<String>) {
     }
     (unquote_filter_argument(value).to_string(), None)
 }
-
 fn parse_experimental_section(
-    section: &Section,
+    section: &Block,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) -> Result<ExperimentalConfig, crate::ConfigError> {
     let mut cfg = ExperimentalConfig::default();
-    let subs = split_nested_sections(&section.body, &["clash_api", "cache_file", "udp_nfqueue"])?;
-
-    if let Some(unparsed) = subs.first().filter(|sub| !sub.body.trim().is_empty()) {
-        let setting = unparsed.body.lines().next().unwrap_or_default().trim();
+    let recognised = ["clash_api", "cache_file", "udp_nfqueue"];
+    let ambient = section.lines_except(&recognised);
+    if let Some(setting) = ambient.into_iter().find(|line| !line.trim().is_empty()) {
         return Err(crate::ConfigError::Parse(format!(
-            "unknown experimental setting: {setting}"
+            "unknown experimental setting: {}",
+            setting.trim()
         )));
     }
+    let subs = section.blocks_matching(&recognised);
 
-    for sub in &subs {
-        let kv = parse_kv_pairs(&sub.body);
+    for sub in subs {
+        let kv = parse_kv_pairs(sub.lines_except(&[]));
         match sub.name.as_str() {
             "clash_api" => {
                 if let Some(v) = kv.get("external_controller") {
@@ -1407,108 +1267,4 @@ fn parse_ip_prefer(s: &str) -> Option<crate::dns::DnsStrategy> {
         Ok(6) => Some(DnsStrategy::PreferIpv6),
         _ => None,
     }
-}
-
-fn split_nested_sections(body: &str, names: &[&str]) -> Result<Vec<Section>, crate::ConfigError> {
-    split_nested_sections_generic(body, names, false)
-}
-
-fn split_nested_sections_named(body: &str) -> Result<Vec<Section>, crate::ConfigError> {
-    split_nested_sections_generic(body, &[], true)
-}
-
-fn split_nested_sections_generic(
-    body: &str,
-    names: &[&str],
-    any_name: bool,
-) -> Result<Vec<Section>, crate::ConfigError> {
-    let mut sections = vec![Section {
-        name: String::new(),
-        body: String::new(),
-    }];
-    let mut depth = 0i32;
-    let mut current_name = String::new();
-    let mut current_body = String::new();
-    let mut in_sub = false;
-
-    for line in body.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let open = trimmed.matches('{').count() as i32;
-        let close = trimmed.matches('}').count() as i32;
-
-        if !in_sub {
-            if open > 0 && close == 0 {
-                if let Some(name) = trimmed.strip_suffix('{') {
-                    let name = name.trim().to_string();
-                    let matched = any_name || names.contains(&name.as_str());
-                    if matched {
-                        if !current_body.is_empty() {
-                            sections.push(Section {
-                                name: current_name.clone(),
-                                body: std::mem::take(&mut current_body),
-                            });
-                        }
-                        current_name = name;
-                        current_body.clear();
-                        in_sub = true;
-                        depth = 1;
-                    } else {
-                        sections.first_mut().unwrap().body.push_str(trimmed);
-                        sections.first_mut().unwrap().body.push('\n');
-                    }
-                } else {
-                    sections.first_mut().unwrap().body.push_str(trimmed);
-                    sections.first_mut().unwrap().body.push('\n');
-                }
-            } else {
-                sections.first_mut().unwrap().body.push_str(trimmed);
-                sections.first_mut().unwrap().body.push('\n');
-            }
-        } else {
-            depth += open;
-            depth -= close;
-            if depth <= 0 {
-                in_sub = false;
-                // Take (not clone) the accumulated name/body: leaving them in
-                // place would push the same section a second time when the
-                // next section opens or at end-of-input.
-                sections.push(Section {
-                    name: std::mem::take(&mut current_name),
-                    body: std::mem::take(&mut current_body),
-                });
-            } else {
-                current_body.push_str(trimmed);
-                current_body.push('\n');
-            }
-        }
-    }
-
-    if !current_body.is_empty() && !current_name.is_empty() {
-        sections.push(Section {
-            name: current_name,
-            body: current_body,
-        });
-    }
-
-    Ok(sections)
-}
-
-fn extract_nested_all(body: &str, name: &str) -> Vec<String> {
-    split_nested_sections(body, &[name])
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|section| section.name == name)
-        .map(|section| section.body)
-        .collect()
-}
-
-fn has_routing_fallback(body: &str) -> bool {
-    body.lines().any(|line| {
-        let line = line.trim();
-        line.starts_with("fallback:") || line.starts_with("default:")
-    })
 }
