@@ -1,0 +1,3650 @@
+[
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 150698.5,
+      "tc_ns_per_exchange": 8889.95,
+      "requests_per_second": 5346.205570692742
+    },
+    "candidate": {
+      "latency_ns": 156723.0,
+      "tc_ns_per_exchange": 7371.5,
+      "requests_per_second": 5116.492296609198
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 76092.5,
+      "tc_ns_per_exchange": 1566.3,
+      "requests_per_second": 12688.769233795014
+    },
+    "candidate": {
+      "latency_ns": 77295.5,
+      "tc_ns_per_exchange": 1590.25,
+      "requests_per_second": 12455.789731322388
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 316731.5,
+      "tc_ns_per_exchange": 15301.15,
+      "requests_per_second": 2906.124759645319
+    },
+    "candidate": {
+      "latency_ns": 345215.0,
+      "tc_ns_per_exchange": 13308.9,
+      "requests_per_second": 2608.8568341548407
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 623738.0,
+      "tc_ns_per_exchange": 10654.65,
+      "requests_per_second": 149.35770102234076
+    },
+    "candidate": {
+      "latency_ns": 587998.5,
+      "tc_ns_per_exchange": 10361.15,
+      "requests_per_second": 221.68921484297525
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 265082.5,
+      "tc_ns_per_exchange": 8972.5,
+      "requests_per_second": 3112.1691102899827
+    },
+    "candidate": {
+      "latency_ns": 546657.0,
+      "tc_ns_per_exchange": 17289.5,
+      "requests_per_second": 1489.194516279465
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 79493.0,
+      "tc_ns_per_exchange": 1633.15,
+      "requests_per_second": 11944.070694565627
+    },
+    "candidate": {
+      "latency_ns": 86544.0,
+      "tc_ns_per_exchange": 1783.75,
+      "requests_per_second": 10881.398738519445
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 26692.0,
+      "tc_ns_per_exchange": 3591.0,
+      "requests_per_second": 29366.980061288887
+    },
+    "candidate": {
+      "latency_ns": 20148.0,
+      "tc_ns_per_exchange": 1910.8,
+      "requests_per_second": 38061.81619568341
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 22741.5,
+      "tc_ns_per_exchange": 913.1,
+      "requests_per_second": 41485.08300127982
+    },
+    "candidate": {
+      "latency_ns": 17091.0,
+      "tc_ns_per_exchange": 698.2,
+      "requests_per_second": 55714.031021572475
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 290573.0,
+      "tc_ns_per_exchange": 8509.2,
+      "requests_per_second": 976.1786539697061
+    },
+    "candidate": {
+      "latency_ns": 231565.0,
+      "tc_ns_per_exchange": 5017.85,
+      "requests_per_second": 1595.6473293889994
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 72672.0,
+      "tc_ns_per_exchange": 1992.75,
+      "requests_per_second": 12383.923932985634
+    },
+    "candidate": {
+      "latency_ns": 44370.0,
+      "tc_ns_per_exchange": 1240.6,
+      "requests_per_second": 20591.045366191152
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 89263.0,
+      "tc_ns_per_exchange": 6277.9,
+      "requests_per_second": 8159.781578966694
+    },
+    "candidate": {
+      "latency_ns": 94371.0,
+      "tc_ns_per_exchange": 6559.35,
+      "requests_per_second": 8074.04871558033
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 80394.0,
+      "tc_ns_per_exchange": 3051.1,
+      "requests_per_second": 11621.542155400937
+    },
+    "candidate": {
+      "latency_ns": 81543.5,
+      "tc_ns_per_exchange": 2980.75,
+      "requests_per_second": 11391.091482994809
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 336842.5,
+      "tc_ns_per_exchange": 20887.9,
+      "requests_per_second": 2282.7654744962024
+    },
+    "candidate": {
+      "latency_ns": 621492.0,
+      "tc_ns_per_exchange": 22807.7,
+      "requests_per_second": 1404.4285987447076
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 98530.5,
+      "tc_ns_per_exchange": 1949.45,
+      "requests_per_second": 9580.214175268102
+    },
+    "candidate": {
+      "latency_ns": 119275.0,
+      "tc_ns_per_exchange": 2232.75,
+      "requests_per_second": 7663.616291928603
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 363803.5,
+      "tc_ns_per_exchange": 17356.95,
+      "requests_per_second": 2420.0160495464406
+    },
+    "candidate": {
+      "latency_ns": 384149.0,
+      "tc_ns_per_exchange": 16342.5,
+      "requests_per_second": 2350.0172021259195
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 194318.0,
+      "tc_ns_per_exchange": 10014.9,
+      "requests_per_second": 148.40494256428204
+    },
+    "candidate": {
+      "latency_ns": 489912.5,
+      "tc_ns_per_exchange": 10818.75,
+      "requests_per_second": 149.79923531984346
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 328603.5,
+      "tc_ns_per_exchange": 10758.0,
+      "requests_per_second": 2838.922248591078
+    },
+    "candidate": {
+      "latency_ns": 246740.5,
+      "tc_ns_per_exchange": 9352.55,
+      "requests_per_second": 3342.2795014655894
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 88155.0,
+      "tc_ns_per_exchange": 1979.15,
+      "requests_per_second": 10723.751339798682
+    },
+    "candidate": {
+      "latency_ns": 79488.0,
+      "tc_ns_per_exchange": 1788.75,
+      "requests_per_second": 11968.730494709522
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 15721.0,
+      "tc_ns_per_exchange": 3068.1,
+      "requests_per_second": 46640.594574299634
+    },
+    "candidate": {
+      "latency_ns": 14250.5,
+      "tc_ns_per_exchange": 1822.65,
+      "requests_per_second": 48705.64741981833
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 11905.0,
+      "tc_ns_per_exchange": 782.3,
+      "requests_per_second": 71234.20381530396
+    },
+    "candidate": {
+      "latency_ns": 11800.5,
+      "tc_ns_per_exchange": 745.9,
+      "requests_per_second": 76565.8677018372
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 223102.5,
+      "tc_ns_per_exchange": 6158.9,
+      "requests_per_second": 4393.705928383472
+    },
+    "candidate": {
+      "latency_ns": 211982.5,
+      "tc_ns_per_exchange": 4439.85,
+      "requests_per_second": 3983.271851532305
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 42423.0,
+      "tc_ns_per_exchange": 1330.35,
+      "requests_per_second": 22657.21558680489
+    },
+    "candidate": {
+      "latency_ns": 42968.5,
+      "tc_ns_per_exchange": 1230.5,
+      "requests_per_second": 22610.72471894869
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 27105.0,
+      "tc_ns_per_exchange": 2300.65,
+      "requests_per_second": 27765.013584032895
+    },
+    "candidate": {
+      "latency_ns": 86938.5,
+      "tc_ns_per_exchange": 6956.0,
+      "requests_per_second": 7881.44727016222
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 27465.0,
+      "tc_ns_per_exchange": 1239.6,
+      "requests_per_second": 34804.21757508575
+    },
+    "candidate": {
+      "latency_ns": 61148.0,
+      "tc_ns_per_exchange": 2608.9,
+      "requests_per_second": 15598.312262613184
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 143680.0,
+      "tc_ns_per_exchange": 5805.35,
+      "requests_per_second": 5579.290788451426
+    },
+    "candidate": {
+      "latency_ns": 143776.0,
+      "tc_ns_per_exchange": 4367.25,
+      "requests_per_second": 5523.653388540408
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 73934.5,
+      "tc_ns_per_exchange": 847.3,
+      "requests_per_second": 13071.374278541836
+    },
+    "candidate": {
+      "latency_ns": 73800.0,
+      "tc_ns_per_exchange": 830.2,
+      "requests_per_second": 13050.179244211919
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 317889.5,
+      "tc_ns_per_exchange": 13776.95,
+      "requests_per_second": 3015.088255402096
+    },
+    "candidate": {
+      "latency_ns": 334834.0,
+      "tc_ns_per_exchange": 11453.35,
+      "requests_per_second": 2832.0665263755313
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 100131.5,
+      "tc_ns_per_exchange": 1556.4,
+      "requests_per_second": 9702.567784564186
+    },
+    "candidate": {
+      "latency_ns": 269314.0,
+      "tc_ns_per_exchange": 4350.25,
+      "requests_per_second": 432.8350673102895
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 909576.0,
+      "tc_ns_per_exchange": 15722.5,
+      "requests_per_second": 1090.7883902155845
+    },
+    "candidate": {
+      "latency_ns": 778601.5,
+      "tc_ns_per_exchange": 13512.9,
+      "requests_per_second": 1135.361486324429
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 125996.5,
+      "tc_ns_per_exchange": 1397.8,
+      "requests_per_second": 7788.604803855671
+    },
+    "candidate": {
+      "latency_ns": 141090.5,
+      "tc_ns_per_exchange": 1708.55,
+      "requests_per_second": 6541.23841996386
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 27508.0,
+      "tc_ns_per_exchange": 3710.1,
+      "requests_per_second": 28364.931867433654
+    },
+    "candidate": {
+      "latency_ns": 28555.5,
+      "tc_ns_per_exchange": 2012.75,
+      "requests_per_second": 27437.74033745677
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 20888.0,
+      "tc_ns_per_exchange": 593.6,
+      "requests_per_second": 43803.837654216884
+    },
+    "candidate": {
+      "latency_ns": 21828.0,
+      "tc_ns_per_exchange": 637.35,
+      "requests_per_second": 37889.33661454989
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 339203.5,
+      "tc_ns_per_exchange": 6809.7,
+      "requests_per_second": 1692.5825026067887
+    },
+    "candidate": {
+      "latency_ns": 387224.5,
+      "tc_ns_per_exchange": 5649.5,
+      "requests_per_second": 1449.494362010492
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 50525.0,
+      "tc_ns_per_exchange": 1602.9,
+      "requests_per_second": 18356.960270948734
+    },
+    "candidate": {
+      "latency_ns": 86755.5,
+      "tc_ns_per_exchange": 2302.95,
+      "requests_per_second": 11000.017050026427
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 79332.0,
+      "tc_ns_per_exchange": 4487.9,
+      "requests_per_second": 9328.575759695888
+    },
+    "candidate": {
+      "latency_ns": 28294.0,
+      "tc_ns_per_exchange": 1552.7,
+      "requests_per_second": 23163.26861516082
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 69362.5,
+      "tc_ns_per_exchange": 1566.75,
+      "requests_per_second": 13769.62860557725
+    },
+    "candidate": {
+      "latency_ns": 28835.5,
+      "tc_ns_per_exchange": 691.75,
+      "requests_per_second": 32272.118503219142
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 639316.5,
+      "tc_ns_per_exchange": 21464.2,
+      "requests_per_second": 1443.336347019626
+    },
+    "candidate": {
+      "latency_ns": 592026.0,
+      "tc_ns_per_exchange": 13554.4,
+      "requests_per_second": 1527.1936686215763
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 135272.0,
+      "tc_ns_per_exchange": 1649.1,
+      "requests_per_second": 6882.011694602473
+    },
+    "candidate": {
+      "latency_ns": 118677.0,
+      "tc_ns_per_exchange": 1401.05,
+      "requests_per_second": 8000.409620972594
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 351902.5,
+      "tc_ns_per_exchange": 16435.4,
+      "requests_per_second": 2509.476095420821
+    },
+    "candidate": {
+      "latency_ns": 343753.0,
+      "tc_ns_per_exchange": 13300.8,
+      "requests_per_second": 2706.8394117442454
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 430899.5,
+      "tc_ns_per_exchange": 8668.75,
+      "requests_per_second": 388.18286728130636
+    },
+    "candidate": {
+      "latency_ns": 805891.0,
+      "tc_ns_per_exchange": 12649.45,
+      "requests_per_second": 152.2073756695764
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 427300.0,
+      "tc_ns_per_exchange": 10853.2,
+      "requests_per_second": 1543.7201618189222
+    },
+    "candidate": {
+      "latency_ns": 233609.0,
+      "tc_ns_per_exchange": 5321.5,
+      "requests_per_second": 3730.634741386804
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 114117.5,
+      "tc_ns_per_exchange": 1409.25,
+      "requests_per_second": 8526.439422845315
+    },
+    "candidate": {
+      "latency_ns": 88599.0,
+      "tc_ns_per_exchange": 1078.3,
+      "requests_per_second": 9989.306447448007
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 14124.0,
+      "tc_ns_per_exchange": 2854.7,
+      "requests_per_second": 47097.387978862695
+    },
+    "candidate": {
+      "latency_ns": 13028.5,
+      "tc_ns_per_exchange": 1300.3,
+      "requests_per_second": 50769.023787826096
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 10805.5,
+      "tc_ns_per_exchange": 445.5,
+      "requests_per_second": 78397.55399631531
+    },
+    "candidate": {
+      "latency_ns": 10666.0,
+      "tc_ns_per_exchange": 420.05,
+      "requests_per_second": 84884.95965842293
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 279921.0,
+      "tc_ns_per_exchange": 6727.65,
+      "requests_per_second": 3184.138912517853
+    },
+    "candidate": {
+      "latency_ns": 332694.5,
+      "tc_ns_per_exchange": 5688.2,
+      "requests_per_second": 2829.136027123493
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 42778.0,
+      "tc_ns_per_exchange": 1283.9,
+      "requests_per_second": 22238.456295317803
+    },
+    "candidate": {
+      "latency_ns": 53282.5,
+      "tc_ns_per_exchange": 1517.3,
+      "requests_per_second": 17639.624240724424
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 63581.5,
+      "tc_ns_per_exchange": 3643.55,
+      "requests_per_second": 8917.333200167825
+    },
+    "candidate": {
+      "latency_ns": 83826.5,
+      "tc_ns_per_exchange": 3916.0,
+      "requests_per_second": 8485.031555832356
+    }
+  },
+  {
+    "dataset": "x86-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 45579.0,
+      "tc_ns_per_exchange": 1280.25,
+      "requests_per_second": 20560.39410163414
+    },
+    "candidate": {
+      "latency_ns": 64365.5,
+      "tc_ns_per_exchange": 1734.95,
+      "requests_per_second": 13579.142979549131
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 165355.5,
+      "tc_ns_per_exchange": 8485.8,
+      "requests_per_second": 4829.182168341427
+    },
+    "candidate": {
+      "latency_ns": 189354.5,
+      "tc_ns_per_exchange": 7062.3,
+      "requests_per_second": 4399.040481290221
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 81941.0,
+      "tc_ns_per_exchange": 1719.2,
+      "requests_per_second": 11521.620031949453
+    },
+    "candidate": {
+      "latency_ns": 82998.5,
+      "tc_ns_per_exchange": 1631.65,
+      "requests_per_second": 11125.271108950335
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 321188.5,
+      "tc_ns_per_exchange": 14984.65,
+      "requests_per_second": 2872.9811920286265
+    },
+    "candidate": {
+      "latency_ns": 347943.0,
+      "tc_ns_per_exchange": 13541.55,
+      "requests_per_second": 2611.442321791585
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 359290.0,
+      "tc_ns_per_exchange": 6024.3,
+      "requests_per_second": 80.44867804540009
+    },
+    "candidate": {
+      "latency_ns": 404751.5,
+      "tc_ns_per_exchange": 6695.55,
+      "requests_per_second": 54.13671613750165
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 216127.5,
+      "tc_ns_per_exchange": 7118.65,
+      "requests_per_second": 3994.3464021024643
+    },
+    "candidate": {
+      "latency_ns": 231998.0,
+      "tc_ns_per_exchange": 6560.95,
+      "requests_per_second": 3959.8934075892544
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 82654.5,
+      "tc_ns_per_exchange": 1581.6,
+      "requests_per_second": 11424.086658551758
+    },
+    "candidate": {
+      "latency_ns": 85388.5,
+      "tc_ns_per_exchange": 1656.65,
+      "requests_per_second": 11219.900513142149
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 18354.0,
+      "tc_ns_per_exchange": 2677.6,
+      "requests_per_second": 41446.39633945427
+    },
+    "candidate": {
+      "latency_ns": 17104.0,
+      "tc_ns_per_exchange": 1744.35,
+      "requests_per_second": 43723.30145904657
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 15377.5,
+      "tc_ns_per_exchange": 732.3,
+      "requests_per_second": 60487.46850871171
+    },
+    "candidate": {
+      "latency_ns": 15132.5,
+      "tc_ns_per_exchange": 696.25,
+      "requests_per_second": 61094.25927792695
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 236828.5,
+      "tc_ns_per_exchange": 8477.5,
+      "requests_per_second": 1561.6699967977956
+    },
+    "candidate": {
+      "latency_ns": 200300.0,
+      "tc_ns_per_exchange": 4770.3,
+      "requests_per_second": 1991.765245767897
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 55830.5,
+      "tc_ns_per_exchange": 1572.9,
+      "requests_per_second": 16785.60667798576
+    },
+    "candidate": {
+      "latency_ns": 43912.0,
+      "tc_ns_per_exchange": 1176.3,
+      "requests_per_second": 21725.64636513642
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 23595.5,
+      "tc_ns_per_exchange": 1809.65,
+      "requests_per_second": 31437.099864663283
+    },
+    "candidate": {
+      "latency_ns": 23772.0,
+      "tc_ns_per_exchange": 1788.5,
+      "requests_per_second": 29537.559961246723
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 20721.5,
+      "tc_ns_per_exchange": 734.65,
+      "requests_per_second": 46840.05292925981
+    },
+    "candidate": {
+      "latency_ns": 20778.5,
+      "tc_ns_per_exchange": 740.5,
+      "requests_per_second": 39421.37308584595
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 247975.5,
+      "tc_ns_per_exchange": 10692.4,
+      "requests_per_second": 3784.201375519358
+    },
+    "candidate": {
+      "latency_ns": 226043.0,
+      "tc_ns_per_exchange": 7916.9,
+      "requests_per_second": 4130.817197500773
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 83670.0,
+      "tc_ns_per_exchange": 1725.6,
+      "requests_per_second": 11155.43537433179
+    },
+    "candidate": {
+      "latency_ns": 85007.5,
+      "tc_ns_per_exchange": 1759.45,
+      "requests_per_second": 11061.445222064043
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 325287.5,
+      "tc_ns_per_exchange": 16986.2,
+      "requests_per_second": 2693.93902780859
+    },
+    "candidate": {
+      "latency_ns": 367077.0,
+      "tc_ns_per_exchange": 15888.25,
+      "requests_per_second": 2559.786698094021
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 122595.0,
+      "tc_ns_per_exchange": 3549.35,
+      "requests_per_second": 161.1651856123326
+    },
+    "candidate": {
+      "latency_ns": 143804.5,
+      "tc_ns_per_exchange": 4826.0,
+      "requests_per_second": 120.13046288399664
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 221228.0,
+      "tc_ns_per_exchange": 7554.45,
+      "requests_per_second": 4171.168922121982
+    },
+    "candidate": {
+      "latency_ns": 223177.0,
+      "tc_ns_per_exchange": 6698.9,
+      "requests_per_second": 4416.066799192831
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 89145.0,
+      "tc_ns_per_exchange": 1790.25,
+      "requests_per_second": 10576.794934984442
+    },
+    "candidate": {
+      "latency_ns": 88208.0,
+      "tc_ns_per_exchange": 1765.4,
+      "requests_per_second": 10766.267561128176
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 19185.5,
+      "tc_ns_per_exchange": 3005.85,
+      "requests_per_second": 39513.900002173265
+    },
+    "candidate": {
+      "latency_ns": 18356.0,
+      "tc_ns_per_exchange": 1708.95,
+      "requests_per_second": 40986.79815231514
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 15573.0,
+      "tc_ns_per_exchange": 812.75,
+      "requests_per_second": 60867.60686830076
+    },
+    "candidate": {
+      "latency_ns": 15802.0,
+      "tc_ns_per_exchange": 799.9,
+      "requests_per_second": 60221.01111077655
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 218707.0,
+      "tc_ns_per_exchange": 6352.2,
+      "requests_per_second": 4018.6239106515236
+    },
+    "candidate": {
+      "latency_ns": 182867.0,
+      "tc_ns_per_exchange": 4214.9,
+      "requests_per_second": 5101.541073527491
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 45880.0,
+      "tc_ns_per_exchange": 1294.25,
+      "requests_per_second": 20916.73882941563
+    },
+    "candidate": {
+      "latency_ns": 44351.0,
+      "tc_ns_per_exchange": 1225.4,
+      "requests_per_second": 21137.291995835953
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 24287.0,
+      "tc_ns_per_exchange": 2064.8,
+      "requests_per_second": 29364.17746534293
+    },
+    "candidate": {
+      "latency_ns": 24281.0,
+      "tc_ns_per_exchange": 1854.0,
+      "requests_per_second": 30231.345370447347
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 21588.5,
+      "tc_ns_per_exchange": 813.35,
+      "requests_per_second": 44421.739999555786
+    },
+    "candidate": {
+      "latency_ns": 21938.5,
+      "tc_ns_per_exchange": 815.45,
+      "requests_per_second": 40996.79610038475
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 155624.0,
+      "tc_ns_per_exchange": 6267.55,
+      "requests_per_second": 4903.832173209237
+    },
+    "candidate": {
+      "latency_ns": 155273.0,
+      "tc_ns_per_exchange": 4428.25,
+      "requests_per_second": 5190.87361364743
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 76571.5,
+      "tc_ns_per_exchange": 875.05,
+      "requests_per_second": 12603.673088448166
+    },
+    "candidate": {
+      "latency_ns": 76102.5,
+      "tc_ns_per_exchange": 860.35,
+      "requests_per_second": 12235.66377864216
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 341562.5,
+      "tc_ns_per_exchange": 14917.75,
+      "requests_per_second": 2647.3452818615283
+    },
+    "candidate": {
+      "latency_ns": 347147.0,
+      "tc_ns_per_exchange": 12293.25,
+      "requests_per_second": 2828.603860535121
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 104141.0,
+      "tc_ns_per_exchange": 1731.45,
+      "requests_per_second": 9402.7203950647
+    },
+    "candidate": {
+      "latency_ns": 106977.0,
+      "tc_ns_per_exchange": 1798.9,
+      "requests_per_second": 9086.1553796173
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 223573.0,
+      "tc_ns_per_exchange": 5555.4,
+      "requests_per_second": 3737.573735321847
+    },
+    "candidate": {
+      "latency_ns": 222746.0,
+      "tc_ns_per_exchange": 4035.5,
+      "requests_per_second": 3903.9107035081324
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 127646.0,
+      "tc_ns_per_exchange": 1473.7,
+      "requests_per_second": 7568.558844220516
+    },
+    "candidate": {
+      "latency_ns": 76322.0,
+      "tc_ns_per_exchange": 848.85,
+      "requests_per_second": 12109.814217285186
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 15757.0,
+      "tc_ns_per_exchange": 2945.55,
+      "requests_per_second": 33381.012546253565
+    },
+    "candidate": {
+      "latency_ns": 14612.0,
+      "tc_ns_per_exchange": 1327.15,
+      "requests_per_second": 49017.084904943615
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 12627.0,
+      "tc_ns_per_exchange": 386.75,
+      "requests_per_second": 71535.87524143358
+    },
+    "candidate": {
+      "latency_ns": 12421.5,
+      "tc_ns_per_exchange": 368.65,
+      "requests_per_second": 77291.10147548713
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 293618.5,
+      "tc_ns_per_exchange": 5558.8,
+      "requests_per_second": 1888.8809136139203
+    },
+    "candidate": {
+      "latency_ns": 237899.5,
+      "tc_ns_per_exchange": 4226.15,
+      "requests_per_second": 1724.6786772714859
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 42955.0,
+      "tc_ns_per_exchange": 1193.15,
+      "requests_per_second": 21260.04005391546
+    },
+    "candidate": {
+      "latency_ns": 44386.5,
+      "tc_ns_per_exchange": 1199.45,
+      "requests_per_second": 21415.408600642248
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 19972.0,
+      "tc_ns_per_exchange": 1126.45,
+      "requests_per_second": 20898.05198808393
+    },
+    "candidate": {
+      "latency_ns": 23630.5,
+      "tc_ns_per_exchange": 1408.8,
+      "requests_per_second": 28520.133074940928
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 17564.0,
+      "tc_ns_per_exchange": 420.3,
+      "requests_per_second": 53557.84783144274
+    },
+    "candidate": {
+      "latency_ns": 21244.5,
+      "tc_ns_per_exchange": 524.25,
+      "requests_per_second": 43763.3888617799
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 218376.0,
+      "tc_ns_per_exchange": 7520.35,
+      "requests_per_second": 4336.768270642096
+    },
+    "candidate": {
+      "latency_ns": 219553.5,
+      "tc_ns_per_exchange": 5872.85,
+      "requests_per_second": 3993.5639723022377
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 78077.5,
+      "tc_ns_per_exchange": 910.0,
+      "requests_per_second": 12188.425749024469
+    },
+    "candidate": {
+      "latency_ns": 78241.5,
+      "tc_ns_per_exchange": 939.8,
+      "requests_per_second": 11785.198262390368
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 332790.5,
+      "tc_ns_per_exchange": 16347.7,
+      "requests_per_second": 2810.540482392737
+    },
+    "candidate": {
+      "latency_ns": 339867.0,
+      "tc_ns_per_exchange": 13041.25,
+      "requests_per_second": 2785.9351506731236
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 106428.0,
+      "tc_ns_per_exchange": 2354.4,
+      "requests_per_second": 8841.166238238486
+    },
+    "candidate": {
+      "latency_ns": 184809.0,
+      "tc_ns_per_exchange": 5110.5,
+      "requests_per_second": 96.73458104949437
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 248880.0,
+      "tc_ns_per_exchange": 5323.55,
+      "requests_per_second": 3245.7242046474553
+    },
+    "candidate": {
+      "latency_ns": 218965.0,
+      "tc_ns_per_exchange": 4907.7,
+      "requests_per_second": 3881.4074759789396
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 77702.5,
+      "tc_ns_per_exchange": 982.2,
+      "requests_per_second": 11828.860052756716
+    },
+    "candidate": {
+      "latency_ns": 82649.5,
+      "tc_ns_per_exchange": 977.15,
+      "requests_per_second": 11054.188183183374
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 16542.0,
+      "tc_ns_per_exchange": 2225.7,
+      "requests_per_second": 40651.232748633105
+    },
+    "candidate": {
+      "latency_ns": 15323.5,
+      "tc_ns_per_exchange": 1124.75,
+      "requests_per_second": 46825.467435228675
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 12698.5,
+      "tc_ns_per_exchange": 418.8,
+      "requests_per_second": 74868.23191183517
+    },
+    "candidate": {
+      "latency_ns": 12535.0,
+      "tc_ns_per_exchange": 395.0,
+      "requests_per_second": 75645.25401676299
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 226326.0,
+      "tc_ns_per_exchange": 5673.65,
+      "requests_per_second": 4010.4150478793426
+    },
+    "candidate": {
+      "latency_ns": 252389.0,
+      "tc_ns_per_exchange": 4678.95,
+      "requests_per_second": 3757.7738947447533
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 44364.5,
+      "tc_ns_per_exchange": 1281.6,
+      "requests_per_second": 21721.422753190334
+    },
+    "candidate": {
+      "latency_ns": 45861.5,
+      "tc_ns_per_exchange": 1374.1,
+      "requests_per_second": 20602.308488666156
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 20601.5,
+      "tc_ns_per_exchange": 1075.95,
+      "requests_per_second": 34404.22208613441
+    },
+    "candidate": {
+      "latency_ns": 20622.0,
+      "tc_ns_per_exchange": 1042.35,
+      "requests_per_second": 32305.115353490648
+    }
+  },
+  {
+    "dataset": "x86-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 17835.5,
+      "tc_ns_per_exchange": 458.4,
+      "requests_per_second": 51990.184253212996
+    },
+    "candidate": {
+      "latency_ns": 18013.5,
+      "tc_ns_per_exchange": 438.0,
+      "requests_per_second": 52659.84897155315
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 6779119.5,
+      "tc_ns_per_exchange": 396841.95,
+      "requests_per_second": 136.45972851323367
+    },
+    "candidate": {
+      "latency_ns": 6668866.5,
+      "tc_ns_per_exchange": 331800.0,
+      "requests_per_second": 136.62966892356337
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 4321025.5,
+      "tc_ns_per_exchange": 98963.05,
+      "requests_per_second": 219.96752575423784
+    },
+    "candidate": {
+      "latency_ns": 4335025.5,
+      "tc_ns_per_exchange": 98087.45,
+      "requests_per_second": 228.7865061901678
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 11066311.0,
+      "tc_ns_per_exchange": 641711.25,
+      "requests_per_second": 85.5499221929874
+    },
+    "candidate": {
+      "latency_ns": 10947598.5,
+      "tc_ns_per_exchange": 558307.2,
+      "requests_per_second": 85.88069243798819
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 6946541.5,
+      "tc_ns_per_exchange": 135916.45,
+      "requests_per_second": 77.83775042394039
+    },
+    "candidate": {
+      "latency_ns": 7294656.0,
+      "tc_ns_per_exchange": 151258.55,
+      "requests_per_second": 47.20412749680951
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 6985626.0,
+      "tc_ns_per_exchange": 281983.9,
+      "requests_per_second": 129.41280685960348
+    },
+    "candidate": {
+      "latency_ns": 6940854.0,
+      "tc_ns_per_exchange": 275290.7,
+      "requests_per_second": 129.99278735019388
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 4516010.0,
+      "tc_ns_per_exchange": 103935.4,
+      "requests_per_second": 215.57883931576828
+    },
+    "candidate": {
+      "latency_ns": 4569824.0,
+      "tc_ns_per_exchange": 102768.55,
+      "requests_per_second": 211.92298193267573
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 1776011.5,
+      "tc_ns_per_exchange": 194658.2,
+      "requests_per_second": 487.77442188975516
+    },
+    "candidate": {
+      "latency_ns": 1663279.0,
+      "tc_ns_per_exchange": 131804.15,
+      "requests_per_second": 530.6652334460042
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 1155909.5,
+      "tc_ns_per_exchange": 46856.1,
+      "requests_per_second": 779.6315640543539
+    },
+    "candidate": {
+      "latency_ns": 1148034.0,
+      "tc_ns_per_exchange": 45105.9,
+      "requests_per_second": 790.1700319481547
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 9964798.5,
+      "tc_ns_per_exchange": 273218.55,
+      "requests_per_second": 73.73162182184083
+    },
+    "candidate": {
+      "latency_ns": 9723874.0,
+      "tc_ns_per_exchange": 206106.65,
+      "requests_per_second": 72.63712978507444
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 3123989.5,
+      "tc_ns_per_exchange": 96614.55,
+      "requests_per_second": 314.8605092377555
+    },
+    "candidate": {
+      "latency_ns": 2945629.5,
+      "tc_ns_per_exchange": 96235.6,
+      "requests_per_second": 332.25138438769017
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 1772219.5,
+      "tc_ns_per_exchange": 91350.0,
+      "requests_per_second": 474.67637158330916
+    },
+    "candidate": {
+      "latency_ns": 1645778.5,
+      "tc_ns_per_exchange": 97868.55,
+      "requests_per_second": 483.9565031509924
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 1172535.0,
+      "tc_ns_per_exchange": 52280.85,
+      "requests_per_second": 792.0685738120189
+    },
+    "candidate": {
+      "latency_ns": 1170493.0,
+      "tc_ns_per_exchange": 52164.5,
+      "requests_per_second": 787.5924884626561
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 7314927.5,
+      "tc_ns_per_exchange": 459681.0,
+      "requests_per_second": 124.03473071687857
+    },
+    "candidate": {
+      "latency_ns": 7177548.5,
+      "tc_ns_per_exchange": 359960.75,
+      "requests_per_second": 127.52087164392402
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 4756205.0,
+      "tc_ns_per_exchange": 114245.7,
+      "requests_per_second": 206.11706177366472
+    },
+    "candidate": {
+      "latency_ns": 4737392.0,
+      "tc_ns_per_exchange": 109564.45,
+      "requests_per_second": 207.58846914558092
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 11428279.5,
+      "tc_ns_per_exchange": 709362.8,
+      "requests_per_second": 82.05710297176404
+    },
+    "candidate": {
+      "latency_ns": 11240294.5,
+      "tc_ns_per_exchange": 597246.3,
+      "requests_per_second": 82.98272819485776
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 7372241.5,
+      "tc_ns_per_exchange": 174402.55,
+      "requests_per_second": 54.35060535242261
+    },
+    "candidate": {
+      "latency_ns": 7455806.5,
+      "tc_ns_per_exchange": 173308.6,
+      "requests_per_second": 39.70382416216519
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 7140943.0,
+      "tc_ns_per_exchange": 314300.3,
+      "requests_per_second": 126.84197618809533
+    },
+    "candidate": {
+      "latency_ns": 7287947.5,
+      "tc_ns_per_exchange": 315524.8,
+      "requests_per_second": 125.04171782461998
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 4717412.0,
+      "tc_ns_per_exchange": 110745.7,
+      "requests_per_second": 209.76413009462271
+    },
+    "candidate": {
+      "latency_ns": 4736370.5,
+      "tc_ns_per_exchange": 107654.0,
+      "requests_per_second": 207.10130278420675
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 1670133.5,
+      "tc_ns_per_exchange": 211414.6,
+      "requests_per_second": 519.4689157592843
+    },
+    "candidate": {
+      "latency_ns": 1428626.0,
+      "tc_ns_per_exchange": 130696.15,
+      "requests_per_second": 566.5485969948053
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 1006718.0,
+      "tc_ns_per_exchange": 45893.8,
+      "requests_per_second": 923.2942807551402
+    },
+    "candidate": {
+      "latency_ns": 1010218.0,
+      "tc_ns_per_exchange": 44741.45,
+      "requests_per_second": 927.6662019522828
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 9671081.0,
+      "tc_ns_per_exchange": 295006.45,
+      "requests_per_second": 98.03201658019418
+    },
+    "candidate": {
+      "latency_ns": 9656206.0,
+      "tc_ns_per_exchange": 199047.9,
+      "requests_per_second": 99.74597791550237
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 3224763.5,
+      "tc_ns_per_exchange": 102928.85,
+      "requests_per_second": 307.6280844137616
+    },
+    "candidate": {
+      "latency_ns": 3225492.5,
+      "tc_ns_per_exchange": 100318.45,
+      "requests_per_second": 309.85366091867985
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 1823992.5,
+      "tc_ns_per_exchange": 100829.25,
+      "requests_per_second": 471.99706323427256
+    },
+    "candidate": {
+      "latency_ns": 1723072.5,
+      "tc_ns_per_exchange": 104897.7,
+      "requests_per_second": 480.13735385309144
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 1317643.5,
+      "tc_ns_per_exchange": 60200.0,
+      "requests_per_second": 688.5650789193701
+    },
+    "candidate": {
+      "latency_ns": 1337915.0,
+      "tc_ns_per_exchange": 59456.2,
+      "requests_per_second": 686.0299065133325
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 6586030.5,
+      "tc_ns_per_exchange": 280919.05,
+      "requests_per_second": 140.27215449115002
+    },
+    "candidate": {
+      "latency_ns": 6434214.0,
+      "tc_ns_per_exchange": 222978.85,
+      "requests_per_second": 142.71965998924907
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 3922305.0,
+      "tc_ns_per_exchange": 62445.85,
+      "requests_per_second": 250.65937201104364
+    },
+    "candidate": {
+      "latency_ns": 3947243.0,
+      "tc_ns_per_exchange": 61687.6,
+      "requests_per_second": 242.95222029964683
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 11056685.0,
+      "tc_ns_per_exchange": 654500.2,
+      "requests_per_second": 87.1800502508425
+    },
+    "candidate": {
+      "latency_ns": 11104666.5,
+      "tc_ns_per_exchange": 570849.4,
+      "requests_per_second": 85.86832183009093
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 7050085.5,
+      "tc_ns_per_exchange": 156231.45,
+      "requests_per_second": 49.69627339796528
+    },
+    "candidate": {
+      "latency_ns": 7222466.0,
+      "tc_ns_per_exchange": 151885.65,
+      "requests_per_second": 61.17792028902407
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 6958062.5,
+      "tc_ns_per_exchange": 182058.85,
+      "requests_per_second": 133.26008381886035
+    },
+    "candidate": {
+      "latency_ns": 6831475.0,
+      "tc_ns_per_exchange": 171806.5,
+      "requests_per_second": 132.9665300905385
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 4241981.0,
+      "tc_ns_per_exchange": 67651.8,
+      "requests_per_second": 225.55196823921537
+    },
+    "candidate": {
+      "latency_ns": 4407215.0,
+      "tc_ns_per_exchange": 66368.9,
+      "requests_per_second": 222.43862782014781
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 1583651.5,
+      "tc_ns_per_exchange": 150500.0,
+      "requests_per_second": 542.6123223785693
+    },
+    "candidate": {
+      "latency_ns": 1570234.5,
+      "tc_ns_per_exchange": 94981.2,
+      "requests_per_second": 548.5506400694575
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 1011822.0,
+      "tc_ns_per_exchange": 28554.2,
+      "requests_per_second": 891.5418797786087
+    },
+    "candidate": {
+      "latency_ns": 1014593.5,
+      "tc_ns_per_exchange": 28393.6,
+      "requests_per_second": 885.2687691475336
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 10232410.5,
+      "tc_ns_per_exchange": 251110.35,
+      "requests_per_second": 63.656495089740076
+    },
+    "candidate": {
+      "latency_ns": 10220306.0,
+      "tc_ns_per_exchange": 182627.2,
+      "requests_per_second": 74.37436940528801
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 3316640.5,
+      "tc_ns_per_exchange": 99939.55,
+      "requests_per_second": 301.8230884189379
+    },
+    "candidate": {
+      "latency_ns": 3166865.5,
+      "tc_ns_per_exchange": 96920.7,
+      "requests_per_second": 314.5499762585542
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 1639070.0,
+      "tc_ns_per_exchange": 52733.55,
+      "requests_per_second": 513.6475248468644
+    },
+    "candidate": {
+      "latency_ns": 1507961.5,
+      "tc_ns_per_exchange": 54104.25,
+      "requests_per_second": 524.756269079482
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 996800.5,
+      "tc_ns_per_exchange": 31120.55,
+      "requests_per_second": 940.8789757252754
+    },
+    "candidate": {
+      "latency_ns": 1004967.5,
+      "tc_ns_per_exchange": 31368.75,
+      "requests_per_second": 924.3647338030617
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 6973375.0,
+      "tc_ns_per_exchange": 320133.4,
+      "requests_per_second": 130.81888876405134
+    },
+    "candidate": {
+      "latency_ns": 7005897.0,
+      "tc_ns_per_exchange": 235608.15,
+      "requests_per_second": 132.7045631883991
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 4328900.0,
+      "tc_ns_per_exchange": 70904.35,
+      "requests_per_second": 227.26613655476717
+    },
+    "candidate": {
+      "latency_ns": 4329192.0,
+      "tc_ns_per_exchange": 67112.7,
+      "requests_per_second": 224.42470382307147
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 11446801.0,
+      "tc_ns_per_exchange": 699140.1,
+      "requests_per_second": 83.07743993362976
+    },
+    "candidate": {
+      "latency_ns": 11552970.5,
+      "tc_ns_per_exchange": 592914.0,
+      "requests_per_second": 81.78404266807632
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 7572476.0,
+      "tc_ns_per_exchange": 183327.45,
+      "requests_per_second": 43.633629410343815
+    },
+    "candidate": {
+      "latency_ns": 7417597.0,
+      "tc_ns_per_exchange": 169531.6,
+      "requests_per_second": 48.585417354200935
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 6925978.0,
+      "tc_ns_per_exchange": 181183.45,
+      "requests_per_second": 132.23724962653722
+    },
+    "candidate": {
+      "latency_ns": 6945957.5,
+      "tc_ns_per_exchange": 182437.5,
+      "requests_per_second": 129.9767741252896
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 4388694.0,
+      "tc_ns_per_exchange": 69752.05,
+      "requests_per_second": 223.26138489617531
+    },
+    "candidate": {
+      "latency_ns": 4349464.0,
+      "tc_ns_per_exchange": 68644.2,
+      "requests_per_second": 221.9425622636277
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 1533046.5,
+      "tc_ns_per_exchange": 178937.45,
+      "requests_per_second": 530.2917636117345
+    },
+    "candidate": {
+      "latency_ns": 1306122.5,
+      "tc_ns_per_exchange": 94674.95,
+      "requests_per_second": 603.9492361340654
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 915131.5,
+      "tc_ns_per_exchange": 29647.75,
+      "requests_per_second": 930.1452542733431
+    },
+    "candidate": {
+      "latency_ns": 848629.5,
+      "tc_ns_per_exchange": 27125.0,
+      "requests_per_second": 1071.279338390736
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 10138345.0,
+      "tc_ns_per_exchange": 281968.65,
+      "requests_per_second": 95.68923901496387
+    },
+    "candidate": {
+      "latency_ns": 9980403.0,
+      "tc_ns_per_exchange": 184318.85,
+      "requests_per_second": 96.49884390283803
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 3250868.5,
+      "tc_ns_per_exchange": 105248.05,
+      "requests_per_second": 303.15080547547956
+    },
+    "candidate": {
+      "latency_ns": 3254514.0,
+      "tc_ns_per_exchange": 101369.0,
+      "requests_per_second": 298.7355896673095
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 1526920.5,
+      "tc_ns_per_exchange": 55445.85,
+      "requests_per_second": 500.4735105001219
+    },
+    "candidate": {
+      "latency_ns": 1430084.5,
+      "tc_ns_per_exchange": 56131.1,
+      "requests_per_second": 527.0148608177468
+    }
+  },
+  {
+    "dataset": "arm-l2",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 1108658.5,
+      "tc_ns_per_exchange": 34197.95,
+      "requests_per_second": 853.9788411370489
+    },
+    "candidate": {
+      "latency_ns": 1120033.5,
+      "tc_ns_per_exchange": 34110.3,
+      "requests_per_second": 812.2986235559209
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 10853968.0,
+      "tc_ns_per_exchange": 494535.95,
+      "requests_per_second": 87.37348128780036
+    },
+    "candidate": {
+      "latency_ns": 10824946.0,
+      "tc_ns_per_exchange": 423776.95,
+      "requests_per_second": 87.46788370646294
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 5940988.5,
+      "tc_ns_per_exchange": 107800.05,
+      "requests_per_second": 169.22065764562623
+    },
+    "candidate": {
+      "latency_ns": 5651793.0,
+      "tc_ns_per_exchange": 108616.95,
+      "requests_per_second": 174.4728373010085
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 15560149.5,
+      "tc_ns_per_exchange": 751770.5,
+      "requests_per_second": 58.745250501570624
+    },
+    "candidate": {
+      "latency_ns": 15734716.5,
+      "tc_ns_per_exchange": 691893.0,
+      "requests_per_second": 59.95028334991848
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 59693976.5,
+      "tc_ns_per_exchange": 390978.75,
+      "requests_per_second": 17.441026895572122
+    },
+    "candidate": {
+      "latency_ns": 59899026.0,
+      "tc_ns_per_exchange": 394858.5,
+      "requests_per_second": 16.646782819821297
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 10893489.5,
+      "tc_ns_per_exchange": 367281.2,
+      "requests_per_second": 87.08927798394592
+    },
+    "candidate": {
+      "latency_ns": 10993534.0,
+      "tc_ns_per_exchange": 379604.15,
+      "requests_per_second": 87.16910482502831
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 5639980.0,
+      "tc_ns_per_exchange": 121406.15,
+      "requests_per_second": 174.10603320322187
+    },
+    "candidate": {
+      "latency_ns": 5862674.0,
+      "tc_ns_per_exchange": 117104.2,
+      "requests_per_second": 169.3862002231443
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 4366233.5,
+      "tc_ns_per_exchange": 219333.2,
+      "requests_per_second": 209.38563135913324
+    },
+    "candidate": {
+      "latency_ns": 4097163.0,
+      "tc_ns_per_exchange": 163027.0,
+      "requests_per_second": 226.4197039030285
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 4042620.0,
+      "tc_ns_per_exchange": 67389.65,
+      "requests_per_second": 255.52130434427102
+    },
+    "candidate": {
+      "latency_ns": 3834655.5,
+      "tc_ns_per_exchange": 63524.85,
+      "requests_per_second": 250.69061189855609
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 12057711.5,
+      "tc_ns_per_exchange": 284564.7,
+      "requests_per_second": 63.255843480727684
+    },
+    "candidate": {
+      "latency_ns": 12092420.5,
+      "tc_ns_per_exchange": 233041.5,
+      "requests_per_second": 62.24617933807108
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 5447474.0,
+      "tc_ns_per_exchange": 102360.4,
+      "requests_per_second": 183.33426283804593
+    },
+    "candidate": {
+      "latency_ns": 5621458.5,
+      "tc_ns_per_exchange": 105350.25,
+      "requests_per_second": 175.394420175557
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 4742786.0,
+      "tc_ns_per_exchange": 103891.75,
+      "requests_per_second": 198.67010233496973
+    },
+    "candidate": {
+      "latency_ns": 4501133.0,
+      "tc_ns_per_exchange": 103439.45,
+      "requests_per_second": 204.8823064347007
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 4008347.5,
+      "tc_ns_per_exchange": 62212.6,
+      "requests_per_second": 241.49000394993124
+    },
+    "candidate": {
+      "latency_ns": 4073974.5,
+      "tc_ns_per_exchange": 63627.0,
+      "requests_per_second": 240.50239218109408
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 11341211.5,
+      "tc_ns_per_exchange": 547020.15,
+      "requests_per_second": 83.49688738424528
+    },
+    "candidate": {
+      "latency_ns": 11182686.0,
+      "tc_ns_per_exchange": 463794.35,
+      "requests_per_second": 83.73834851011348
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 5686210.5,
+      "tc_ns_per_exchange": 115499.55,
+      "requests_per_second": 174.43955362453295
+    },
+    "candidate": {
+      "latency_ns": 6495463.0,
+      "tc_ns_per_exchange": 129296.1,
+      "requests_per_second": 146.63831444184598
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 16641243.0,
+      "tc_ns_per_exchange": 834998.25,
+      "requests_per_second": 57.04694216310316
+    },
+    "candidate": {
+      "latency_ns": 16535073.5,
+      "tc_ns_per_exchange": 747862.35,
+      "requests_per_second": 57.73895360496953
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 59841128.0,
+      "tc_ns_per_exchange": 408653.5,
+      "requests_per_second": 17.457682753763915
+    },
+    "candidate": {
+      "latency_ns": 60059592.0,
+      "tc_ns_per_exchange": 423018.65,
+      "requests_per_second": 17.467520226940817
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 11052744.5,
+      "tc_ns_per_exchange": 393224.7,
+      "requests_per_second": 85.97871090596915
+    },
+    "candidate": {
+      "latency_ns": 11223666.0,
+      "tc_ns_per_exchange": 403652.0,
+      "requests_per_second": 84.38168114374339
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 5820818.5,
+      "tc_ns_per_exchange": 129820.65,
+      "requests_per_second": 168.06183196472182
+    },
+    "candidate": {
+      "latency_ns": 5750816.0,
+      "tc_ns_per_exchange": 125489.5,
+      "requests_per_second": 169.60867902536137
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 4523155.0,
+      "tc_ns_per_exchange": 242783.3,
+      "requests_per_second": 205.61709932359685
+    },
+    "candidate": {
+      "latency_ns": 4138727.0,
+      "tc_ns_per_exchange": 167504.3,
+      "requests_per_second": 218.20847849697824
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 4100371.5,
+      "tc_ns_per_exchange": 79567.0,
+      "requests_per_second": 241.22918718295776
+    },
+    "candidate": {
+      "latency_ns": 4084329.0,
+      "tc_ns_per_exchange": 71108.45,
+      "requests_per_second": 239.56383570688192
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 12167965.0,
+      "tc_ns_per_exchange": 319608.25,
+      "requests_per_second": 78.83207070896188
+    },
+    "candidate": {
+      "latency_ns": 12320802.0,
+      "tc_ns_per_exchange": 233450.0,
+      "requests_per_second": 79.37733528864582
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 5987948.5,
+      "tc_ns_per_exchange": 111066.65,
+      "requests_per_second": 164.79106556893956
+    },
+    "candidate": {
+      "latency_ns": 5656313.0,
+      "tc_ns_per_exchange": 109272.85,
+      "requests_per_second": 174.30297438874888
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 4521842.0,
+      "tc_ns_per_exchange": 105277.1,
+      "requests_per_second": 203.733603685109
+    },
+    "candidate": {
+      "latency_ns": 4538759.5,
+      "tc_ns_per_exchange": 110410.7,
+      "requests_per_second": 203.04705610449045
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "LAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 4121226.5,
+      "tc_ns_per_exchange": 66077.2,
+      "requests_per_second": 232.89415705823006
+    },
+    "candidate": {
+      "latency_ns": 3787403.5,
+      "tc_ns_per_exchange": 67389.5,
+      "requests_per_second": 245.57129060421528
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 9630973.5,
+      "tc_ns_per_exchange": 342591.65,
+      "requests_per_second": 100.51938112931062
+    },
+    "candidate": {
+      "latency_ns": 9433654.5,
+      "tc_ns_per_exchange": 281093.6,
+      "requests_per_second": 101.58158257645066
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 5709689.5,
+      "tc_ns_per_exchange": 70452.35,
+      "requests_per_second": 174.4262373202046
+    },
+    "candidate": {
+      "latency_ns": 5810755.5,
+      "tc_ns_per_exchange": 72041.95,
+      "requests_per_second": 172.69583070385943
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 12310594.5,
+      "tc_ns_per_exchange": 679787.55,
+      "requests_per_second": 74.1877869157018
+    },
+    "candidate": {
+      "latency_ns": 12687292.5,
+      "tc_ns_per_exchange": 625595.8,
+      "requests_per_second": 72.08816266953424
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 49985127.5,
+      "tc_ns_per_exchange": 231130.75,
+      "requests_per_second": 19.763930346656206
+    },
+    "candidate": {
+      "latency_ns": 49976085.5,
+      "tc_ns_per_exchange": 229847.6,
+      "requests_per_second": 21.034383144496722
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 9655035.5,
+      "tc_ns_per_exchange": 213252.6,
+      "requests_per_second": 95.62387930606401
+    },
+    "candidate": {
+      "latency_ns": 9640015.0,
+      "tc_ns_per_exchange": 218341.95,
+      "requests_per_second": 97.49429711983713
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 6475629.5,
+      "tc_ns_per_exchange": 77233.5,
+      "requests_per_second": 155.7471532807881
+    },
+    "candidate": {
+      "latency_ns": 6397023.0,
+      "tc_ns_per_exchange": 76912.4,
+      "requests_per_second": 155.22569113094187
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 2901878.0,
+      "tc_ns_per_exchange": 164966.55,
+      "requests_per_second": 295.6941141376915
+    },
+    "candidate": {
+      "latency_ns": 2664016.5,
+      "tc_ns_per_exchange": 97752.05,
+      "requests_per_second": 311.60400216701885
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 2504762.0,
+      "tc_ns_per_exchange": 39170.65,
+      "requests_per_second": 386.49152597038506
+    },
+    "candidate": {
+      "latency_ns": 2182752.5,
+      "tc_ns_per_exchange": 36356.1,
+      "requests_per_second": 451.8904032916239
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 11132954.5,
+      "tc_ns_per_exchange": 257789.35,
+      "requests_per_second": 67.57016742107012
+    },
+    "candidate": {
+      "latency_ns": 10872343.5,
+      "tc_ns_per_exchange": 193622.5,
+      "requests_per_second": 66.59899786689736
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 4545614.0,
+      "tc_ns_per_exchange": 113546.1,
+      "requests_per_second": 213.71901465660426
+    },
+    "candidate": {
+      "latency_ns": 4651637.5,
+      "tc_ns_per_exchange": 119656.0,
+      "requests_per_second": 209.69555057915395
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 2859001.5,
+      "tc_ns_per_exchange": 60958.35,
+      "requests_per_second": 310.0372962465893
+    },
+    "candidate": {
+      "latency_ns": 2686621.0,
+      "tc_ns_per_exchange": 55664.55,
+      "requests_per_second": 319.3715789315679
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 4,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 2296942.5,
+      "tc_ns_per_exchange": 39243.65,
+      "requests_per_second": 404.92383332079754
+    },
+    "candidate": {
+      "latency_ns": 2277692.5,
+      "tc_ns_per_exchange": 39068.55,
+      "requests_per_second": 422.0486308067139
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 9714100.5,
+      "tc_ns_per_exchange": 377533.6,
+      "requests_per_second": 96.86694380331578
+    },
+    "candidate": {
+      "latency_ns": 9721976.0,
+      "tc_ns_per_exchange": 289596.05,
+      "requests_per_second": 96.10030811776889
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 6416711.5,
+      "tc_ns_per_exchange": 80368.65,
+      "requests_per_second": 155.1421047767874
+    },
+    "candidate": {
+      "latency_ns": 6515735.0,
+      "tc_ns_per_exchange": 79974.8,
+      "requests_per_second": 155.18880079398315
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 12952426.0,
+      "tc_ns_per_exchange": 743633.6,
+      "requests_per_second": 72.06770853463496
+    },
+    "candidate": {
+      "latency_ns": 13072304.5,
+      "tc_ns_per_exchange": 659502.75,
+      "requests_per_second": 71.59911310035405
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 49963250.5,
+      "tc_ns_per_exchange": 225429.7,
+      "requests_per_second": 23.136385331352162
+    },
+    "candidate": {
+      "latency_ns": 50042441.0,
+      "tc_ns_per_exchange": 243235.35,
+      "requests_per_second": 19.556350633331878
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 9705349.5,
+      "tc_ns_per_exchange": 224641.35,
+      "requests_per_second": 97.06576972718598
+    },
+    "candidate": {
+      "latency_ns": 9533262.0,
+      "tc_ns_per_exchange": 223300.1,
+      "requests_per_second": 97.99435732811408
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "tcp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 6408689.5,
+      "tc_ns_per_exchange": 80062.4,
+      "requests_per_second": 153.63590901374195
+    },
+    "candidate": {
+      "latency_ns": 6531193.5,
+      "tc_ns_per_exchange": 85443.65,
+      "requests_per_second": 151.58717035010733
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 2773540.5,
+      "tc_ns_per_exchange": 175116.6,
+      "requests_per_second": 321.03280104489755
+    },
+    "candidate": {
+      "latency_ns": 3081987.0,
+      "tc_ns_per_exchange": 108616.65,
+      "requests_per_second": 283.8372174824482
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "direct",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 2135208.5,
+      "tc_ns_per_exchange": 36735.35,
+      "requests_per_second": 448.85833779498523
+    },
+    "candidate": {
+      "latency_ns": 2423384.0,
+      "tc_ns_per_exchange": 41052.15,
+      "requests_per_second": 389.19860232554726
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 10861697.0,
+      "tc_ns_per_exchange": 273058.7,
+      "requests_per_second": 79.69145445184317
+    },
+    "candidate": {
+      "latency_ns": 10856738.0,
+      "tc_ns_per_exchange": 197210.6,
+      "requests_per_second": 87.73850528191066
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "proxy",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 4513821.0,
+      "tc_ns_per_exchange": 106720.75,
+      "requests_per_second": 217.6246665894897
+    },
+    "candidate": {
+      "latency_ns": 4558885.0,
+      "tc_ns_per_exchange": 109506.15,
+      "requests_per_second": 215.02321164818582
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "new",
+    "new_flow_fraction": 1,
+    "baseline": {
+      "latency_ns": 2600869.0,
+      "tc_ns_per_exchange": 58391.75,
+      "requests_per_second": 315.33263801435544
+    },
+    "candidate": {
+      "latency_ns": 3021902.0,
+      "tc_ns_per_exchange": 60375.0,
+      "requests_per_second": 285.2423034245891
+    }
+  },
+  {
+    "dataset": "arm-l3",
+    "role": "WAN",
+    "family": 6,
+    "protocol": "udp",
+    "action": "early",
+    "flow": "cached",
+    "new_flow_fraction": 0,
+    "baseline": {
+      "latency_ns": 2369716.5,
+      "tc_ns_per_exchange": 39827.15,
+      "requests_per_second": 403.94580727680903
+    },
+    "candidate": {
+      "latency_ns": 2567617.5,
+      "tc_ns_per_exchange": 40993.85,
+      "requests_per_second": 376.5811134629857
+    }
+  }
+]

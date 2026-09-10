@@ -1,0 +1,22 @@
+warning: honk-core@0.0.1-alpha: eBPF object embedded (1473056 bytes)
+   Compiling honk-core v0.0.1-alpha (/root/.herdr/worktrees/honk/perf-ir/crates/honk-core)
+    Finished `test` profile [unoptimized] target(s) in 36.80s
+     Running unittests src/lib.rs (target/debug/deps/honk_core-26ecd7f903c4fc54)
+
+running 1 test
+
+thread 'ebpf::real::routing::tests::lazy_fact_cache_short_circuit_reuse_and_alternating_inputs' (2384556) panicked at crates/honk-core/src/ebpf/real/routing/tests.rs:88:5:
+assertion `left == right` failed: A1: complete decision
+  left: RoutingDecision { outbound: 0, mark: 0, must: 0, domain_final: 1, rule_id: 4294967295 }
+ right: RoutingDecision { outbound: 2, mark: 2053, must: 1, domain_final: 1, rule_id: 4 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test ebpf::real::routing::tests::lazy_fact_cache_short_circuit_reuse_and_alternating_inputs ... FAILED
+
+failures:
+
+failures:
+    ebpf::real::routing::tests::lazy_fact_cache_short_circuit_reuse_and_alternating_inputs
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1018 filtered out; finished in 0.31s
+
+error: test failed, to rerun pass `-p honk-core --lib`

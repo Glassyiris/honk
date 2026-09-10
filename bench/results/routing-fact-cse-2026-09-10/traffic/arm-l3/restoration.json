@@ -1,0 +1,12 @@
+{
+  "original_active": true,
+  "original_binary_unchanged": true,
+  "protected_files_restored": [
+    "/etc/honk/config.dae",
+    "/etc/config/honk",
+    "/etc/honk/api.secret",
+    "/etc/honk/config.d/99-openwrt.dae",
+    "/etc/crontabs/root"
+  ],
+  "errors": []
+}

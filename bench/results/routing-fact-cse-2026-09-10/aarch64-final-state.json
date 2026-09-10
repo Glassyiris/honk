@@ -1,0 +1,10 @@
+{
+  "arch": "aarch64",
+  "owned_links_remaining": [],
+  "original_service_running": true,
+  "original_binary_sha256": "12e2bba768ea7fcf38fc4f35f57a94a7c5671a76a7f0453cab98a659a34b4a9c",
+  "allocator_pin_present": true,
+  "checkpoint_removed": true,
+  "test_processes": [],
+  "original_config_unchanged": true
+}

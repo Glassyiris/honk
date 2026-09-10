@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://daeuniverse.github.io/honk/evidence/routing-fact-cse-generator-v1.schema.json",
+  "title": "honk routing fact CSE generator manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "scope", "baseline", "candidate", "map_fd_sentinels", "variants"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "scope": {"type": "string"},
+    "baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "source", "source_sha256", "metadata", "metadata_sha256"],
+      "properties": {
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "source": {"type": "string"},
+        "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "metadata": {"type": "string"},
+        "metadata_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "source_sha256"],
+      "properties": {
+        "source": {"type": "string"},
+        "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "map_fd_sentinels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["destination_v4", "destination_v6", "source_v4", "source_v6", "mac", "domain"],
+      "properties": {
+        "destination_v4": {"type": "integer"},
+        "destination_v6": {"type": "integer"},
+        "source_v4": {"type": "integer"},
+        "source_v6": {"type": "integer"},
+        "mac": {"type": "integer"},
+        "domain": {"type": "integer"}
+      }
+    },
+    "variants": {
+      "type": "array",
+      "minItems": 10,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "plan", "emitters"],
+        "properties": {
+          "name": {"type": "string"},
+          "plan": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["fallback", "features", "has_domain_rules", "domain_predicate_count", "rules"],
+            "properties": {
+              "fallback": {"type": "integer", "minimum": 0, "maximum": 255},
+              "features": {"type": "integer", "minimum": 0},
+              "has_domain_rules": {"type": "boolean"},
+              "domain_predicate_count": {"type": "integer", "minimum": 0, "maximum": 256},
+              "rules": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["id", "outbound", "mark", "must", "conditions"],
+                  "properties": {
+                    "id": {"type": "integer", "minimum": 0},
+                    "outbound": {"type": "integer", "minimum": 0, "maximum": 255},
+                    "mark": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                    "must": {"type": "boolean"},
+                    "conditions": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": ["kind", "not"],
+                        "properties": {
+                          "kind": {"enum": ["domain", "destination_ip", "source_ip", "mac", "destination_port", "source_port", "protocol", "ip_version", "dscp", "process_name"]},
+                          "not": {"type": "boolean"},
+                          "id": {"type": "integer", "minimum": 0, "maximum": 255},
+                          "ranges": {"type": "array", "items": {"type": "array", "prefixItems": [{"type": "integer"}, {"type": "integer"}], "items": false}},
+                          "mask": {"type": "integer"},
+                          "values": {"type": "array"},
+                          "names": {"type": "array"}
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "emitters": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["old", "new"],
+            "properties": {
+              "old": {"$ref": "#/$defs/emitter"},
+              "new": {"$ref": "#/$defs/emitter"}
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "emitter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "instruction_slots", "map_lookup_call_sites"],
+      "properties": {
+        "file": {"type": "string", "pattern": "\\.bpf$"},
+        "instruction_slots": {"type": "integer", "minimum": 1},
+        "map_lookup_call_sites": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

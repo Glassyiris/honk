@@ -1,0 +1,19 @@
+   Compiling honk-core v0.0.1-alpha (/root/.herdr/worktrees/honk/perf-ir/crates/honk-core)
+warning: honk-core@0.0.1-alpha: eBPF object embedded (1473056 bytes)
+    Finished `test` profile [unoptimized] target(s) in 26.64s
+     Running unittests src/lib.rs (target/debug/deps/honk_core-26ecd7f903c4fc54)
+
+running 7 tests
+test ebpf::real::routing::tests::four_mode_golden_policies ... ok
+test ebpf::real::routing::tests::large_prefix_fact_policy ... ok
+test ebpf::real::routing::tests::lazy_fact_cache_ipv6_host_overlap_and_default_prefix ... ok
+test ebpf::real::routing::tests::lazy_fact_cache_null_zero_mac_presence_and_invalid_family ... ok
+test ebpf::real::routing::tests::lazy_fact_cache_short_circuit_reuse_and_alternating_inputs ... ok
+test ebpf::real::routing::tests::predicate_bits_and_capacity_limits ... ok
+test ebpf::real::routing::tests::publication_failure_recovery_and_frozen_root ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 1012 filtered out; finished in 3.84s
+
+   Compiling honk-core v0.0.1-alpha (/root/.herdr/worktrees/honk/perf-ir/crates/honk-core)
+warning: honk-core@0.0.1-alpha: eBPF object embedded (1473056 bytes)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.67s

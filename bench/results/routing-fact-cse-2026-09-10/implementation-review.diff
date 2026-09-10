@@ -1,0 +1,968 @@
+diff --git a/crates/honk-core/src/control/routing_matcher/codegen.rs b/crates/honk-core/src/control/routing_matcher/codegen.rs
+index 5fe85cf..574deee 100644
+--- a/crates/honk-core/src/control/routing_matcher/codegen.rs
++++ b/crates/honk-core/src/control/routing_matcher/codegen.rs
+@@ -48,6 +48,50 @@ const MUST: i16 = std::mem::offset_of!(RoutingDecision, must) as i16;
+ const DOMAIN_FINAL: i16 = std::mem::offset_of!(RoutingDecision, domain_final) as i16;
+ const RULE_ID: i16 = std::mem::offset_of!(RoutingDecision, rule_id) as i16;
+ 
++#[derive(Clone, Copy)]
++enum FactKind {
++    Destination,
++    Source,
++    Mac,
++}
++
++impl FactKind {
++    fn of(predicate: &KernelPredicate) -> Option<Self> {
++        match predicate {
++            KernelPredicate::DestinationIp(_) => Some(Self::Destination),
++            KernelPredicate::SourceIp(_) => Some(Self::Source),
++            KernelPredicate::Mac(_) => Some(Self::Mac),
++            _ => None,
++        }
++    }
++}
++
++#[derive(Clone, Copy)]
++struct FactCache {
++    pointer: i16,
++    ready: i16,
++}
++
++fn fact_caches(plan: &RoutingPushPlan) -> [Option<FactCache>; 3] {
++    let mut uses = [0u8; 3];
++    for condition in plan.rules.iter().flat_map(|rule| &rule.conditions) {
++        if let Some(kind) = FactKind::of(&condition.predicate) {
++            let count = &mut uses[kind as usize];
++            *count = (*count + 1).min(2);
++        }
++    }
++    // Separate DW slots preserve ready constants on 6.12; packed W flags
++    // lose precision and exhaust the verifier budget on mixed 256-bit policies.
++    // Pairs occupy [-32, -1] and [-80, -65], outside both key buffers.
++    std::array::from_fn(|index| {
++        let pointer = [-16, -32, -80][index];
++        (uses[index] == 2).then_some(FactCache {
++            pointer,
++            ready: pointer + 8,
++        })
++    })
++}
++
+ #[derive(Debug, Clone, Copy)]
+ pub struct RoutingMapFds {
+     pub destination_v4: i32,
+@@ -198,6 +242,10 @@ impl Assembler {
+         self.emit(BPF_ST | BPF_W | BPF_MEM, dst, 0, off, imm)?;
+         Ok(())
+     }
++    fn st_dw_imm(&mut self, dst: u8, off: i16, imm: i32) -> anyhow::Result<()> {
++        self.emit(BPF_ST | BPF_DW | BPF_MEM, dst, 0, off, imm)?;
++        Ok(())
++    }
+     fn call(&mut self, helper: i32) -> anyhow::Result<()> {
+         self.emit(BPF_JMP | BPF_CALL, 0, 0, 0, helper)?;
+         Ok(())
+@@ -246,6 +294,12 @@ pub fn emit_routing_program(
+     )?;
+     asm.st_imm(R7, RULE_ID, u32::MAX as i32)?;
+ 
++    let caches = fact_caches(plan);
++    for cache in caches.iter().flatten() {
++        asm.st_dw_imm(R10, cache.pointer, 0)?;
++        asm.st_dw_imm(R10, cache.ready, 0)?;
++    }
++
+     if plan.has_domain_rules {
+         write_domain_key_from_input(&mut asm)?;
+         load_map_fd(&mut asm, fds.domain)?;
+@@ -264,7 +318,7 @@ pub fn emit_routing_program(
+         let fail = asm.label();
+         for condition in &rule.conditions {
+             let pass = asm.label();
+-            emit_condition(&mut asm, condition, pass, fail, &fds)?;
++            emit_condition(&mut asm, condition, pass, fail, &fds, &caches)?;
+             asm.bind(pass);
+         }
+         asm.st_imm(R7, OUTBOUND, rule.outbound as i32)?;
+@@ -385,11 +439,12 @@ fn emit_condition(
+     pass: Label,
+     fail: Label,
+     fds: &RoutingMapFds,
++    caches: &[Option<FactCache>; 3],
+ ) -> anyhow::Result<()> {
+     if condition.not {
+-        emit_predicate(asm, &condition.predicate, fail, pass, fds)
++        emit_predicate(asm, &condition.predicate, fail, pass, fds, caches)
+     } else {
+-        emit_predicate(asm, &condition.predicate, pass, fail, fds)
++        emit_predicate(asm, &condition.predicate, pass, fail, fds, caches)
+     }
+ }
+ 
+@@ -399,37 +454,44 @@ fn emit_predicate(
+     on_true: Label,
+     on_false: Label,
+     fds: &RoutingMapFds,
++    caches: &[Option<FactCache>; 3],
+ ) -> anyhow::Result<()> {
+     match predicate {
+         KernelPredicate::Domain(id) => {
+-            emit_domain_bit(asm, *id, on_true, on_false)?;
++            emit_bitmap_bit(asm, R8, *id, on_true, on_false)?;
+         }
+         KernelPredicate::DestinationIp(id) => {
+-            emit_family_map_bit(
++            emit_fact_bit(
+                 asm,
++                FactKind::Destination,
+                 *id,
+-                fds.destination_v4,
+-                fds.destination_v6,
++                caches[FactKind::Destination as usize],
+                 on_true,
+                 on_false,
+-                INPUT_DST_IP,
++                fds,
+             )?;
+         }
+         KernelPredicate::SourceIp(id) => {
+-            emit_family_map_bit(
++            emit_fact_bit(
+                 asm,
++                FactKind::Source,
+                 *id,
+-                fds.source_v4,
+-                fds.source_v6,
++                caches[FactKind::Source as usize],
+                 on_true,
+                 on_false,
+-                INPUT_SRC_IP,
++                fds,
+             )?;
+         }
+         KernelPredicate::Mac(id) => {
+-            asm.ldx_w(R0, R6, INPUT_MAC_PRESENT)?;
+-            asm.jump(BPF_JEQ, R0, 0, on_false)?;
+-            emit_lpm_bit(asm, fds.mac, *id, 128, INPUT_MAC, on_true, on_false)?;
++            emit_fact_bit(
++                asm,
++                FactKind::Mac,
++                *id,
++                caches[FactKind::Mac as usize],
++                on_true,
++                on_false,
++                fds,
++            )?;
+         }
+         KernelPredicate::DestinationPort(ranges) => {
+             emit_port_ranges(asm, ranges, INPUT_DST_PORT, on_true, on_false)?;
+@@ -548,62 +610,98 @@ fn emit_process_names(
+     Ok(())
+ }
+ 
+-fn emit_domain_bit(
++fn emit_bitmap_bit(
+     asm: &mut Assembler,
++    pointer: u8,
+     id: u32,
+     on_true: Label,
+     on_false: Label,
+ ) -> anyhow::Result<()> {
+-    asm.jump(BPF_JEQ, R8, 0, on_false)?;
+-    asm.ldx_w(R2, R8, (id / 32 * 4) as i16)?;
++    asm.jump(BPF_JEQ, pointer, 0, on_false)?;
++    asm.ldx_w(R2, pointer, (id / 32 * 4) as i16)?;
+     asm.and_imm(R2, (1u32 << (id % 32)) as i32)?;
+     asm.jump(BPF_JNE, R2, 0, on_true)?;
+     asm.ja(on_false)?;
+     Ok(())
+ }
+ 
+-fn emit_family_map_bit(
++fn emit_fact_bit(
+     asm: &mut Assembler,
++    kind: FactKind,
+     id: u32,
+-    v4_fd: i32,
+-    v6_fd: i32,
++    cache: Option<FactCache>,
+     on_true: Label,
+     on_false: Label,
+-    input_offset: i16,
++    fds: &RoutingMapFds,
+ ) -> anyhow::Result<()> {
+-    asm.ldx_w(R0, R6, INPUT_VERSION)?;
+-    let v4 = asm.label();
+-    let v6 = asm.label();
+-    asm.jump(BPF_JEQ, R0, 1, v4)?;
+-    asm.jump(BPF_JEQ, R0, 2, v6)?;
+-    asm.ja(on_false)?;
+-    asm.bind(v4);
+-    emit_lpm_bit(asm, v4_fd, id, 32, input_offset + 12, on_true, on_false)?;
+-    asm.bind(v6);
+-    emit_lpm_bit(asm, v6_fd, id, 128, input_offset, on_true, on_false)?;
++    if let Some(cache) = cache {
++        let reuse = asm.label();
++        let ready = asm.label();
++        asm.ldx_dw(R0, R10, cache.ready)?;
++        asm.jump(BPF_JNE, R0, 0, reuse)?;
++        emit_fact_lookup(asm, kind, fds)?;
++        asm.stx_dw(R10, R0, cache.pointer)?;
++        asm.st_dw_imm(R10, cache.ready, 1)?;
++        asm.ja(ready)?;
++        asm.bind(reuse);
++        asm.ldx_dw(R0, R10, cache.pointer)?;
++        asm.bind(ready);
++    } else {
++        emit_fact_lookup(asm, kind, fds)?;
++    }
++    emit_bitmap_bit(asm, R0, id, on_true, on_false)
++}
++
++fn emit_fact_lookup(
++    asm: &mut Assembler,
++    kind: FactKind,
++    fds: &RoutingMapFds,
++) -> anyhow::Result<()> {
++    let absent = asm.label();
++    let done = asm.label();
++    match kind {
++        FactKind::Mac => {
++            asm.ldx_w(R0, R6, INPUT_MAC_PRESENT)?;
++            asm.jump(BPF_JEQ, R0, 0, absent)?;
++            emit_lpm_lookup(asm, fds.mac, 128, INPUT_MAC)?;
++            asm.ja(done)?;
++        }
++        FactKind::Destination | FactKind::Source => {
++            let (v4_fd, v6_fd, input_offset) = match kind {
++                FactKind::Destination => (fds.destination_v4, fds.destination_v6, INPUT_DST_IP),
++                _ => (fds.source_v4, fds.source_v6, INPUT_SRC_IP),
++            };
++            let v4 = asm.label();
++            let v6 = asm.label();
++            asm.ldx_w(R0, R6, INPUT_VERSION)?;
++            asm.jump(BPF_JEQ, R0, 1, v4)?;
++            asm.jump(BPF_JEQ, R0, 2, v6)?;
++            asm.ja(absent)?;
++            asm.bind(v4);
++            emit_lpm_lookup(asm, v4_fd, 32, input_offset + 12)?;
++            asm.ja(done)?;
++            asm.bind(v6);
++            emit_lpm_lookup(asm, v6_fd, 128, input_offset)?;
++            asm.ja(done)?;
++        }
++    }
++    asm.bind(absent);
++    asm.mov_imm(R0, 0)?;
++    asm.bind(done);
+     Ok(())
+ }
+ 
+-fn emit_lpm_bit(
++fn emit_lpm_lookup(
+     asm: &mut Assembler,
+     fd: i32,
+-    id: u32,
+     prefix_len: u32,
+     input_offset: i16,
+-    on_true: Label,
+-    on_false: Label,
+ ) -> anyhow::Result<()> {
+     write_key_from_input(asm, input_offset, prefix_len)?;
+     load_map_fd(asm, fd)?;
+     asm.mov_reg(R2, R10)?;
+     asm.add_imm(R2, STACK_KEY as i32)?;
+-    asm.call(MAP_LOOKUP_ELEM)?;
+-    asm.jump(BPF_JEQ, R0, 0, on_false)?;
+-    asm.ldx_w(R2, R0, (id / 32 * 4) as i16)?;
+-    asm.and_imm(R2, (1u32 << (id % 32)) as i32)?;
+-    asm.jump(BPF_JNE, R2, 0, on_true)?;
+-    asm.ja(on_false)?;
+-    Ok(())
++    asm.call(MAP_LOOKUP_ELEM)
+ }
+ 
+ fn write_key_from_input(
+diff --git a/crates/honk-core/src/ebpf/real/routing/tests.rs b/crates/honk-core/src/ebpf/real/routing/tests.rs
+index d06b68d..0932fc3 100644
+--- a/crates/honk-core/src/ebpf/real/routing/tests.rs
++++ b/crates/honk-core/src/ebpf/real/routing/tests.rs
+@@ -42,6 +42,488 @@ fn object() -> Vec<u8> {
+     std::fs::read(path).expect("read routing-test object")
+ }
+ 
++fn outbound_ids() -> HashMap<String, u8> {
++    HashMap::from([
++        ("direct".into(), 0),
++        ("block".into(), 1),
++        ("proxy".into(), 2),
++    ])
++}
++
++fn rule(
++    name: &str,
++    condition: honk_config::routing::RoutingCondition,
++    outbound: &str,
++    mark: u32,
++    must: bool,
++) -> honk_config::routing::RoutingRule {
++    honk_config::routing::RoutingRule {
++        name: name.into(),
++        condition,
++        outbound: honk_config::routing::RoutingOutbound::Simple(outbound.into()),
++        priority: 0,
++        must,
++        mark,
++    }
++}
++
++fn decision(
++    outbound: u32,
++    mark: u32,
++    must: bool,
++    domain_final: u32,
++    rule_id: u32,
++) -> RoutingDecision {
++    RoutingDecision {
++        outbound,
++        mark,
++        must: must as u32,
++        domain_final,
++        rule_id,
++    }
++}
++
++fn assert_route(
++    backend: &mut RealEbpfBackend,
++    label: &str,
++    input: &RoutingInput,
++    expected: RoutingDecision,
++) {
++    let actual = backend.run_routing_test(input).unwrap();
++    assert_eq!(actual.status, 0, "{label}: program status");
++    assert_eq!(actual.decision, expected, "{label}: complete decision");
++}
++
++fn domain_entry(
++    router: &Router,
++    connection: &ConnectionInfo,
++    domain: &str,
++) -> (LpmKey, DomainRouting) {
++    (
++        crate::ebpf::maps::ip_addr_to_lpm_key(connection.dst_ip),
++        router.domain_bitmap(domain).unwrap(),
++    )
++}
++
++#[test]
++#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
++fn lazy_fact_cache_short_circuit_reuse_and_alternating_inputs() {
++    use honk_config::routing::{RoutingCondition, RoutingNotCondition};
++
++    let rules = vec![
++        rule(
++            "domain-short-circuits-first-facts",
++            RoutingCondition {
++                domain: vec!["never.test".into()],
++                ip: vec!["192.0.2.10".into()],
++                source_ip: vec!["198.51.100.10".into()],
++                mac: vec!["02:00:00:00:00:0a".into()],
++                ..Default::default()
++            },
++            "block",
++            0x801,
++            false,
++        ),
++        rule(
++            "destination-used-before-port-failure",
++            RoutingCondition {
++                ip: vec!["192.0.2.10".into()],
++                port: vec!["1".into()],
++                ..Default::default()
++            },
++            "block",
++            0x802,
++            false,
++        ),
++        rule(
++            "source-used-before-port-failure",
++            RoutingCondition {
++                source_ip: vec!["198.51.100.10".into()],
++                port: vec!["1".into()],
++                ..Default::default()
++            },
++            "block",
++            0x803,
++            false,
++        ),
++        rule(
++            "mac-used-before-version-failure",
++            RoutingCondition {
++                mac: vec!["02:00:00:00:00:0a".into()],
++                ip_version: vec!["6".into()],
++                ..Default::default()
++            },
++            "block",
++            0x804,
++            false,
++        ),
++        rule(
++            "mixed-positive-and-negative-reuse",
++            RoutingCondition {
++                domain: vec!["a.test".into()],
++                ip: vec!["192.0.2.10".into()],
++                source_ip: vec!["198.51.100.10".into()],
++                port: vec!["8443".into()],
++                source_port: vec!["40000".into()],
++                protocol: vec!["tcp".into()],
++                mac: vec!["02:00:00:00:00:0a".into()],
++                ip_version: vec!["4".into()],
++                dscp: vec!["0".into()],
++                not: RoutingNotCondition {
++                    domain: vec!["b.test".into()],
++                    ip: vec!["192.0.2.20".into()],
++                    source_ip: vec!["198.51.100.20".into()],
++                    port: vec!["1".into()],
++                    source_port: vec!["1".into()],
++                    protocol: vec!["udp".into()],
++                    process_name: vec!["forbidden".into()],
++                    mac: vec!["02:00:00:00:00:14".into()],
++                    ip_version: vec!["6".into()],
++                    dscp: vec!["46".into()],
++                    ..Default::default()
++                },
++                ..Default::default()
++            },
++            "proxy",
++            0x805,
++            true,
++        ),
++        rule(
++            "alternating-b",
++            RoutingCondition {
++                domain: vec!["b.test".into()],
++                ip: vec!["192.0.2.20".into()],
++                source_ip: vec!["198.51.100.20".into()],
++                mac: vec!["02:00:00:00:00:14".into()],
++                ..Default::default()
++            },
++            "block",
++            0x806,
++            false,
++        ),
++    ];
++    let router = Router::new(&rules, "direct").unwrap();
++    let plan =
++        RoutingPushPlan::compile(&router, &outbound_ids(), "direct", DialMode::Domain).unwrap();
++    let mut a = golden::connection();
++    a.domain = Some("a.test".into());
++    a.dst_ip = "192.0.2.10".parse().unwrap();
++    a.src_ip = "198.51.100.10".parse().unwrap();
++    a.mac = Some("02:00:00:00:00:0a".into());
++    let mut b = a.clone();
++    b.domain = Some("b.test".into());
++    b.dst_ip = "192.0.2.20".parse().unwrap();
++    b.src_ip = "198.51.100.20".parse().unwrap();
++    b.mac = Some("02:00:00:00:00:14".into());
++    let learned = [
++        domain_entry(&router, &a, "a.test"),
++        domain_entry(&router, &b, "b.test"),
++    ];
++    let mut backend = RealEbpfBackend::load_routing_test_fixture(&object()).unwrap();
++    backend.publish_routing_plan(&plan, &learned).unwrap();
++
++    for (round, connection, expected) in [
++        ("A1", &a, decision(2, 0x805, true, 1, 4)),
++        ("B1", &b, decision(1, 0x806, false, 1, 5)),
++        ("A2", &a, decision(2, 0x805, true, 1, 4)),
++        ("B2", &b, decision(1, 0x806, false, 1, 5)),
++    ] {
++        assert_route(&mut backend, round, &input(connection), expected);
++    }
++
++    let changed_rules = vec![
++        rule(
++            "changed-generation-positive",
++            RoutingCondition {
++                ip: vec!["192.0.2.99".into()],
++                source_ip: vec!["198.51.100.99".into()],
++                mac: vec!["02:00:00:00:00:63".into()],
++                ..Default::default()
++            },
++            "proxy",
++            0x807,
++            false,
++        ),
++        rule(
++            "changed-generation-negative",
++            RoutingCondition {
++                not: RoutingNotCondition {
++                    ip: vec!["192.0.2.99".into()],
++                    source_ip: vec!["198.51.100.99".into()],
++                    mac: vec!["02:00:00:00:00:63".into()],
++                    ..Default::default()
++                },
++                ..Default::default()
++            },
++            "block",
++            0x808,
++            false,
++        ),
++    ];
++    let changed_router = Router::new(&changed_rules, "direct").unwrap();
++    let changed =
++        RoutingPushPlan::compile(&changed_router, &outbound_ids(), "direct", DialMode::Domain)
++            .unwrap();
++    backend.publish_routing_plan(&changed, &[]).unwrap();
++    assert_route(
++        &mut backend,
++        "generation changed all facts and removed domain",
++        &input(&a),
++        decision(1, 0x808, false, 1, 1),
++    );
++    backend.publish_routing_plan(&plan, &[]).unwrap();
++    assert_route(
++        &mut backend,
++        "domain generation absent after no-domain generation",
++        &input(&a),
++        decision(0, 0, false, 0, u32::MAX),
++    );
++    backend.publish_routing_plan(&plan, &learned).unwrap();
++    assert_route(
++        &mut backend,
++        "domain and original facts restored in later generation",
++        &input(&a),
++        decision(2, 0x805, true, 1, 4),
++    );
++}
++
++#[test]
++#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
++fn lazy_fact_cache_ipv6_host_overlap_and_default_prefix() {
++    use honk_config::routing::RoutingCondition;
++
++    let rules = vec![
++        rule(
++            "host-prefix-then-port-failure",
++            RoutingCondition {
++                ip: vec!["2001:db8:1::42/128".into()],
++                source_ip: vec!["2001:db8:2::7/128".into()],
++                port: vec!["1".into()],
++                ..Default::default()
++            },
++            "direct",
++            0x811,
++            false,
++        ),
++        rule(
++            "parent-prefix-reuses-host-result",
++            RoutingCondition {
++                ip: vec!["2001:db8:1::/48".into()],
++                source_ip: vec!["2001:db8:2::/48".into()],
++                mac: vec!["02:00:00:00:00:66".into()],
++                ip_version: vec!["6".into()],
++                ..Default::default()
++            },
++            "proxy",
++            0x812,
++            true,
++        ),
++        rule(
++            "ipv6-default-prefix",
++            RoutingCondition {
++                ip: vec!["::/0".into()],
++                source_ip: vec!["::/0".into()],
++                mac: vec!["02:00:00:00:00:66".into()],
++                ..Default::default()
++            },
++            "block",
++            0x813,
++            false,
++        ),
++    ];
++    let router = Router::new(&rules, "direct").unwrap();
++    let plan = RoutingPushPlan::compile(&router, &outbound_ids(), "direct", DialMode::Ip).unwrap();
++    let mut backend = RealEbpfBackend::load_routing_test_fixture(&object()).unwrap();
++    backend.publish_routing_plan(&plan, &[]).unwrap();
++
++    let mut host = golden::connection();
++    host.dst_ip = "2001:db8:1::42".parse().unwrap();
++    host.src_ip = "2001:db8:2::7".parse().unwrap();
++    host.mac = Some("02:00:00:00:00:66".into());
++    assert_route(
++        &mut backend,
++        "IPv6 /128 lookup reused by overlapping /48",
++        &input(&host),
++        decision(2, 0x812, true, 1, 1),
++    );
++
++    let mut outside = host;
++    outside.dst_ip = "2001:db9::42".parse().unwrap();
++    outside.src_ip = "2001:dba::7".parse().unwrap();
++    assert_route(
++        &mut backend,
++        "IPv6 /0 after specific destination short circuits source",
++        &input(&outside),
++        decision(1, 0x813, false, 1, 2),
++    );
++}
++
++#[test]
++#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
++fn lazy_fact_cache_null_zero_mac_presence_and_invalid_family() {
++    use honk_config::routing::{RoutingCondition, RoutingNotCondition};
++
++    let facts = vec![
++        rule(
++            "positive-facts",
++            RoutingCondition {
++                ip: vec!["192.0.2.30".into()],
++                source_ip: vec!["198.51.100.30".into()],
++                mac: vec!["02:00:00:00:00:1e".into()],
++                ..Default::default()
++            },
++            "proxy",
++            0x821,
++            false,
++        ),
++        rule(
++            "negated-facts",
++            RoutingCondition {
++                not: RoutingNotCondition {
++                    ip: vec!["192.0.2.30".into()],
++                    source_ip: vec!["198.51.100.30".into()],
++                    mac: vec!["02:00:00:00:00:1e".into()],
++                    ..Default::default()
++                },
++                ..Default::default()
++            },
++            "block",
++            0x822,
++            true,
++        ),
++    ];
++    let router = Router::new(&facts, "direct").unwrap();
++    let mut zero_plan =
++        RoutingPushPlan::compile(&router, &outbound_ids(), "direct", DialMode::Ip).unwrap();
++    for entries in [
++        &mut zero_plan.facts.destination_v4,
++        &mut zero_plan.facts.destination_v6,
++        &mut zero_plan.facts.source_v4,
++        &mut zero_plan.facts.source_v6,
++        &mut zero_plan.facts.mac,
++    ] {
++        for (_, bitmap) in entries {
++            *bitmap = DomainRouting::default();
++        }
++    }
++    let mut null_plan = zero_plan.clone();
++    null_plan.facts = Default::default();
++    let mut connection = golden::connection();
++    connection.dst_ip = "192.0.2.30".parse().unwrap();
++    connection.src_ip = "198.51.100.30".parse().unwrap();
++    connection.mac = Some("02:00:00:00:00:1e".into());
++    let mut backend = RealEbpfBackend::load_routing_test_fixture(&object()).unwrap();
++    for (label, plan) in [
++        ("present zero bitmap", &zero_plan),
++        ("NULL map miss", &null_plan),
++    ] {
++        backend.publish_routing_plan(plan, &[]).unwrap();
++        assert_route(
++            &mut backend,
++            label,
++            &input(&connection),
++            decision(1, 0x822, true, 1, 1),
++        );
++    }
++
++    let mac_rules = vec![
++        rule(
++            "present-all-zero-mac",
++            RoutingCondition {
++                mac: vec!["00:00:00:00:00:00".into()],
++                ..Default::default()
++            },
++            "proxy",
++            0x823,
++            false,
++        ),
++        rule(
++            "absent-or-different-mac",
++            RoutingCondition {
++                not: RoutingNotCondition {
++                    mac: vec!["00:00:00:00:00:00".into()],
++                    ..Default::default()
++                },
++                ..Default::default()
++            },
++            "block",
++            0x824,
++            false,
++        ),
++    ];
++    let mac_router = Router::new(&mac_rules, "direct").unwrap();
++    let mac_plan =
++        RoutingPushPlan::compile(&mac_router, &outbound_ids(), "direct", DialMode::Ip).unwrap();
++    backend.publish_routing_plan(&mac_plan, &[]).unwrap();
++    let mut zero_mac = golden::connection();
++    zero_mac.mac = Some("00:00:00:00:00:00".into());
++    let absent_mac = golden::connection();
++    for (label, connection, expected) in [
++        (
++            "present all-zero MAC",
++            &zero_mac,
++            decision(2, 0x823, false, 1, 0),
++        ),
++        ("absent MAC", &absent_mac, decision(1, 0x824, false, 1, 1)),
++        (
++            "present all-zero MAC again",
++            &zero_mac,
++            decision(2, 0x823, false, 1, 0),
++        ),
++    ] {
++        assert_route(&mut backend, label, &input(connection), expected);
++    }
++
++    let family_rules = vec![
++        rule(
++            "valid-family",
++            RoutingCondition {
++                ip: vec!["192.0.2.30".into()],
++                source_ip: vec!["198.51.100.30".into()],
++                ..Default::default()
++            },
++            "proxy",
++            0x825,
++            false,
++        ),
++        rule(
++            "invalid-family-negation",
++            RoutingCondition {
++                not: RoutingNotCondition {
++                    ip: vec!["192.0.2.30".into()],
++                    source_ip: vec!["198.51.100.30".into()],
++                    ..Default::default()
++                },
++                ..Default::default()
++            },
++            "block",
++            0x826,
++            false,
++        ),
++    ];
++    let family_router = Router::new(&family_rules, "direct").unwrap();
++    let family_plan =
++        RoutingPushPlan::compile(&family_router, &outbound_ids(), "direct", DialMode::Ip).unwrap();
++    backend.publish_routing_plan(&family_plan, &[]).unwrap();
++    let valid = input(&connection);
++    assert_route(
++        &mut backend,
++        "valid IPv4 family",
++        &valid,
++        decision(2, 0x825, false, 1, 0),
++    );
++    for family in [0, 3] {
++        let mut invalid = valid;
++        invalid.ip_version = family;
++        assert_route(
++            &mut backend,
++            &format!("invalid family {family}"),
++            &invalid,
++            decision(1, 0x826, false, 1, 1),
++        );
++    }
++}
++
+ #[test]
+ #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+ fn four_mode_golden_policies() {
+@@ -192,34 +674,39 @@ fn predicate_bits_and_capacity_limits() {
+             .collect::<Vec<_>>();
+         let router = Router::new(&rules, "direct").unwrap();
+         let plan = RoutingPushPlan::compile(&router, &ids, "direct", DialMode::Ip).unwrap();
+-        backend.publish_routing_plan(&plan, &[]).unwrap();
+-        let mut connection = golden::connection();
+-        if domains {
+-            let bitmap = router.domain_bitmap("fact-255.test").unwrap();
+-            assert_eq!(bitmap.bitmap[7], 1 << 31);
+-            backend
+-                .set_domain_ip_bitmap(
+-                    &crate::ebpf::maps::ip_addr_to_lpm_key(connection.dst_ip),
+-                    &bitmap,
+-                )
+-                .unwrap();
+-        } else {
+-            connection.dst_ip = "192.0.2.255".parse().unwrap();
+-            connection.src_ip = "198.51.100.255".parse().unwrap();
+-            connection.mac = Some("02:00:00:00:00:ff".into());
++        if !domains {
++            backend.publish_routing_plan(&plan, &[]).unwrap();
+         }
+-        let observed = backend.run_routing_test(&input(&connection)).unwrap();
+-        assert_eq!(observed.status, 0);
+-        assert_eq!(
+-            observed.decision,
+-            RoutingDecision {
+-                outbound: 2,
+-                mark: 0x6ff,
+-                must: 0,
+-                domain_final: 1,
+-                rule_id: 255,
++        let mut preserved_input = RoutingInput::default();
++        for index in [0, 31, 32, 63, 64, 255] {
++            let mut connection = golden::connection();
++            if domains {
++                let learned = [domain_entry(
++                    &router,
++                    &connection,
++                    &format!("fact-{index}.test"),
++                )];
++                backend.publish_routing_plan(&plan, &learned).unwrap();
++            } else {
++                connection.dst_ip = format!("192.0.2.{index}").parse().unwrap();
++                connection.src_ip = format!("198.51.100.{index}").parse().unwrap();
++                connection.mac = Some(format!("02:00:00:00:00:{index:02x}"));
+             }
+-        );
++            preserved_input = input(&connection);
++            assert_route(
++                &mut backend,
++                &format!(
++                    "{}/predicate bit {index}",
++                    if domains {
++                        "domain"
++                    } else {
++                        "destination/source/MAC"
++                    }
++                ),
++                &preserved_input,
++                decision(2, 0x600 + index, false, 1, index),
++            );
++        }
+         let mut overflow = rules.clone();
+         overflow.push(honk_config::routing::RoutingRule {
+             name: "overflow".into(),
+@@ -242,9 +729,11 @@ fn predicate_bits_and_capacity_limits() {
+         let rejected = Router::new(&overflow, "direct")
+             .and_then(|router| RoutingPushPlan::compile(&router, &ids, "direct", DialMode::Ip));
+         assert!(rejected.is_err());
+-        assert_eq!(
+-            backend.run_routing_test(&input(&connection)).unwrap(),
+-            observed
++        assert_route(
++            &mut backend,
++            "capacity rejection preserves prior generation",
++            &preserved_input,
++            decision(2, 0x6ff, false, 1, 255),
+         );
+     }
+ }
+@@ -326,6 +815,36 @@ fn publication_failure_recovery_and_frozen_root() {
+     let recovery_router = Router::new(std::slice::from_ref(&recovery_rule), "direct").unwrap();
+     let recovery =
+         RoutingPushPlan::compile(&recovery_router, &ids, "direct", DialMode::Ip).unwrap();
++    let mut map_fill_candidate = recovery.clone();
++    map_fill_candidate
++        .facts
++        .destination_v4
++        .first_mut()
++        .expect("recovery plan destination fact")
++        .0
++        .prefix_len = 129;
++    let map_fill_error = backend
++        .publish_routing_plan(&map_fill_candidate, &[])
++        .unwrap_err();
++    assert!(
++        map_fill_error
++            .downcast_ref::<aya::maps::MapError>()
++            .is_some(),
++        "candidate fact-map fill did not fail in the map stage: {map_fill_error:#}"
++    );
++    assert_route(
++        &mut backend,
++        "map-fill failure preserves active hit",
++        &active_hit,
++        active_hit_decision,
++    );
++    assert_route(
++        &mut backend,
++        "map-fill failure preserves active miss",
++        &active_miss,
++        active_miss_decision,
++    );
++    assert_eq!(backend.active_routing_generation().unwrap(), old_slot);
+     let inactive_slot = old_slot ^ 1;
+     let inactive_name = ROUTING_SLOT_NAMES[inactive_slot as usize];
+     let targets = backend.routing_targets(inactive_name).unwrap();
+@@ -333,8 +852,30 @@ fn publication_failure_recovery_and_frozen_root() {
+     let bytecode =
+         crate::control::routing_matcher::codegen::emit_routing_program(&recovery, maps.fds())
+             .unwrap();
+-    let (_btf, program) = load_extension(&targets[0], inactive_name, &bytecode).unwrap();
+-    let occupied = attach_extension(&program, targets.last().unwrap()).unwrap();
++    let mut verifier_candidate = bytecode.clone();
++    verifier_candidate
++        .insns
++        .first_mut()
++        .expect("emitted candidate instruction")
++        .code = 0xff;
++    assert!(load_extension(&targets[0], inactive_name, &verifier_candidate).is_err());
++    assert_route(
++        &mut backend,
++        "verifier failure preserves active hit",
++        &active_hit,
++        active_hit_decision,
++    );
++    assert_route(
++        &mut backend,
++        "verifier failure preserves active miss",
++        &active_miss,
++        active_miss_decision,
++    );
++    assert_eq!(backend.active_routing_generation().unwrap(), old_slot);
++    let (_btf, program) = load_extension(&targets[0], inactive_name, &bytecode)
++        .expect("valid candidate loads after map-fill and verifier failures");
++    let occupied = attach_extension(&program, targets.last().unwrap())
++        .expect("inactive candidate link remains available after pre-link failures");
+     assert!(backend.publish_routing_plan(&recovery, &[]).is_err());
+     assert_eq!(
+         backend.run_routing_test(&active_hit).unwrap().decision,
+diff --git a/doc/en/design/routing.md b/doc/en/design/routing.md
+index 2403751..91d327e 100644
+--- a/doc/en/design/routing.md
++++ b/doc/en/design/routing.md
+@@ -150,6 +150,15 @@ matching ancestor predicate bits, so longest-prefix lookup preserves ordered
+ rule semantics. Facts use the complete `DomainRouting` bitmap within their own
+ generation; a staged prefix cannot shadow facts from another generation.
+ 
++Within one invocation, a destination IP, source IP, or MAC category used by two
++or more conditions is looked up lazily at its first reached condition. Aligned
++stack slots retain the pointer (including NULL) and a separate readiness flag;
++each condition still tests its own positive bit before applying negation.
++Unused and single-use categories have no cache state. Early returns do not
++look up unreached categories, but repeated categories pay stack initialization.
++No fact pointer survives the invocation or crosses a generation. The entry
++domain lookup remains unchanged because it also determines `domain_final`.
++
+ Fact preparation keeps hash-first duplicate coalescing, sorts only unique keys,
+ and applies ancestor inheritance in the original vector before compacting its
+ retained capacity. Assembler-owned ordinal labels identify internal branches;
+diff --git a/doc/zh/design/routing.md b/doc/zh/design/routing.md
+index 4ae14ee..39d850f 100644
+--- a/doc/zh/design/routing.md
++++ b/doc/zh/design/routing.md
+@@ -92,6 +92,12 @@ IP 分 family，避免 IPv6 前缀误匹配 mapped IPv4。更具体的 LPM 条
+ 谓词的位，使最长前缀查找不破坏规则顺序。每一代使用完整 `DomainRouting` bitmap，
+ 不再共享可能被新前缀提前遮挡的双 bank LPM value。
+ 
++同一次调用中，出现至少两次的目的 IP、源 IP 或 MAC 类别，在实际执行到第一个相关
++条件时才 lookup。对齐栈槽保存 pointer（包括 NULL）及独立的 ready 标志；每个条件仍
++先检查自己的正向 bit，再应用否定。未使用或只使用一次的类别没有缓存状态。提前返回
++不预查未到达的类别，但重复类别仍有入口栈初始化成本。fact pointer 不跨调用或
++generation 保留。domain 入口 lookup 不变，因为它还负责确定 `domain_final`。
++
+ 事实准备先用 hash 合并重复键，只排序唯一键，再在原向量中继承祖先位并压缩保留容量。
+ 内部跳转由 assembler 自己分配的 ordinal label 标识，只有规则 source record 保留
+ 诊断文本。输入/输出偏移从共享 ABI 声明推导，不再独立维护一份偏移表。

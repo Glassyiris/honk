@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://daeuniverse.github.io/honk/evidence/routing-fact-cse-v1.schema.json",
+  "title": "honk routing fact CSE local evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_at_utc", "invocation", "baseline", "candidate", "generator", "host", "configuration", "scope", "syscall_side_effects", "program_loads", "correctness", "measurements", "limitations", "cleanup"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "generated_at_utc": {"type": "string", "format": "date-time"},
+    "invocation": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "baseline": {"$ref": "#/$defs/source"},
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "source_sha256"],
+      "properties": {
+        "source": {"type": "string"},
+        "source_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "generator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest", "manifest_sha256", "inputs", "opcode_coverage"],
+      "properties": {
+        "manifest": {"type": "string"},
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "inputs": {"type": "object"},
+        "opcode_coverage": {"type": "object"}
+      }
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kernel", "machine", "python", "cpu"],
+      "properties": {
+        "kernel": {"type": "string"},
+        "machine": {"const": "x86_64"},
+        "python": {"type": "string"},
+        "cpu": {"type": "integer", "minimum": 0}
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repeat", "rounds", "warmups", "large_entries", "working_set", "random_seed"],
+      "properties": {
+        "repeat": {"type": "integer", "minimum": 1},
+        "rounds": {"type": "integer", "minimum": 1},
+        "warmups": {"type": "integer", "minimum": 0},
+        "large_entries": {"type": "integer", "minimum": 1},
+        "working_set": {"type": "integer", "minimum": 1},
+        "random_seed": {"type": "integer"}
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["program_type", "program_form", "production_root", "freplace", "publication", "network_or_cgroup_attachment"],
+      "properties": {
+        "program_type": {"const": "SCHED_CLS"},
+        "program_form": {"type": "string"},
+        "production_root": {"const": false},
+        "freplace": {"const": false},
+        "publication": {"const": false},
+        "network_or_cgroup_attachment": {"const": false}
+      }
+    },
+    "syscall_side_effects": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maps", "programs", "pins", "attachments", "network_changes", "cleanup"],
+      "properties": {
+        "maps": {"type": "string"},
+        "programs": {"type": "string"},
+        "pins": {"type": "array", "maxItems": 0},
+        "attachments": {"type": "array", "maxItems": 0},
+        "network_changes": {"type": "array", "maxItems": 0},
+        "cleanup": {"type": "string"}
+      }
+    },
+    "program_loads": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["label", "body_instruction_slots", "wrapper_instruction_slots", "load_duration_ns", "jit_bytes", "xlated_bytes", "verifier_log", "verifier", "body_sha256", "map_shape", "input_mode"],
+        "properties": {
+          "label": {"type": "string"},
+          "body_instruction_slots": {"type": "integer", "minimum": 1},
+          "wrapper_instruction_slots": {"type": "integer", "minimum": 1},
+          "load_duration_ns": {"type": "integer", "minimum": 0},
+          "jit_bytes": {"type": "integer", "minimum": 1},
+          "xlated_bytes": {"type": "integer", "minimum": 1},
+          "verifier_log": {"type": "string"},
+          "body_sha256": {"$ref": "#/$defs/sha256"},
+          "map_shape": {"enum": ["small", "large"]},
+          "input_mode": {"enum": ["fixed", "randomized-working-set"]},
+          "verifier": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["processed_instructions", "max_states_per_instruction", "total_states", "peak_states", "stack_depth_bytes", "stack_depth_note"],
+            "properties": {
+              "processed_instructions": {"type": ["integer", "null"], "minimum": 0},
+              "max_states_per_instruction": {"type": ["integer", "null"], "minimum": 0},
+              "total_states": {"type": ["integer", "null"], "minimum": 0},
+              "peak_states": {"type": ["integer", "null"], "minimum": 0},
+              "stack_depth_bytes": {"type": ["integer", "null"], "minimum": 0, "maximum": 512},
+              "stack_depth_note": {"type": ["string", "null"]}
+            }
+          }
+        }
+      }
+    },
+    "correctness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["complete_decision_fields", "cases", "alternating_invocations", "comparison_count", "lookup_budget_assertion_count", "lookup_budget"],
+      "properties": {
+        "complete_decision_fields": {"const": ["outbound", "mark", "must", "domain_final", "rule_id"]},
+        "cases": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/case"}},
+        "alternating_invocations": {"type": "array", "minItems": 2},
+        "comparison_count": {"type": "integer", "minimum": 1},
+        "lookup_budget_assertion_count": {"type": "integer", "minimum": 1},
+        "lookup_budget": {"type": "string"}
+      }
+    },
+    "measurements": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["variant", "family", "scenario", "map_shape", "input_mode", "repeat", "raw_samples", "dispersion"],
+        "properties": {
+          "variant": {"type": "string"},
+          "family": {"enum": [1, 2]},
+          "scenario": {"type": "string"},
+          "map_shape": {"enum": ["small", "large"]},
+          "input_mode": {"enum": ["fixed", "randomized-working-set"]},
+          "repeat": {"type": "integer", "minimum": 1},
+          "raw_samples": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["round", "order", "old", "new"],
+              "properties": {
+                "round": {"type": "integer", "minimum": 0},
+                "order": {"oneOf": [{"const": ["old", "new"]}, {"const": ["new", "old"]}]},
+                "old": {"$ref": "#/$defs/sample"},
+                "new": {"$ref": "#/$defs/sample"}
+              }
+            }
+          },
+          "dispersion": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["old", "new"],
+            "properties": {
+              "old": {"$ref": "#/$defs/dispersion"},
+              "new": {"$ref": "#/$defs/dispersion"}
+            }
+          }
+        }
+      }
+    },
+    "limitations": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["closed_fd_count", "affinity_restored", "errors"],
+      "properties": {
+        "closed_fd_count": {"type": "integer", "minimum": 1},
+        "affinity_restored": {"const": true},
+        "errors": {"type": "array", "maxItems": 0}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "source_sha256", "metadata_sha256"],
+      "properties": {
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "source_sha256": {"$ref": "#/$defs/sha256"},
+        "metadata_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outbound", "mark", "must", "domain_final", "rule_id"],
+      "properties": {
+        "outbound": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "mark": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "must": {"type": "integer", "minimum": 0, "maximum": 1},
+        "domain_final": {"type": "integer", "minimum": 0, "maximum": 1},
+        "rule_id": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+      }
+    },
+    "lookups": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["destination", "source", "mac", "domain"],
+      "properties": {
+        "destination": {"type": "integer", "minimum": 0},
+        "source": {"type": "integer", "minimum": 0},
+        "mac": {"type": "integer", "minimum": 0},
+        "domain": {"type": "integer", "minimum": 0}
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision", "lookup_counts", "executed_instructions", "stack_depth_bytes", "kernel_decision"],
+      "properties": {
+        "decision": {"$ref": "#/$defs/decision"},
+        "lookup_counts": {"$ref": "#/$defs/lookups"},
+        "executed_instructions": {"type": "integer", "minimum": 1},
+        "stack_depth_bytes": {"type": "integer", "minimum": 0, "maximum": 512},
+        "kernel_decision": {"$ref": "#/$defs/decision"}
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["variant", "family", "scenario", "expected_decision", "used_categories", "old", "new"],
+      "properties": {
+        "variant": {"type": "string"},
+        "family": {"enum": [0, 1, 2]},
+        "scenario": {"type": "string"},
+        "expected_decision": {"$ref": "#/$defs/decision"},
+        "used_categories": {"type": "array", "uniqueItems": true, "items": {"enum": ["destination", "source", "mac", "domain"]}},
+        "old": {"$ref": "#/$defs/observation"},
+        "new": {"$ref": "#/$defs/observation"}
+      }
+    },
+    "sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bpf_test_run_duration_ns", "ns_per_evaluation"],
+      "properties": {
+        "bpf_test_run_duration_ns": {"type": "integer", "minimum": 0},
+        "ns_per_evaluation": {"type": "number", "minimum": 0}
+      }
+    },
+    "dispersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["median_ns_per_evaluation", "mad_ns_per_evaluation", "min_ns_per_evaluation", "max_ns_per_evaluation", "p25_ns_per_evaluation", "p75_ns_per_evaluation"],
+      "properties": {
+        "median_ns_per_evaluation": {"type": "number", "minimum": 0},
+        "mad_ns_per_evaluation": {"type": "number", "minimum": 0},
+        "min_ns_per_evaluation": {"type": "number", "minimum": 0},
+        "max_ns_per_evaluation": {"type": "number", "minimum": 0},
+        "p25_ns_per_evaluation": {"type": "number", "minimum": 0},
+        "p75_ns_per_evaluation": {"type": "number", "minimum": 0}
+      }
+    }
+  }
+}

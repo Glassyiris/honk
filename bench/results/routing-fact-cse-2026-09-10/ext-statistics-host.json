@@ -1,0 +1,112 @@
+[
+  {
+    "candidate": false,
+    "count_per_category": 1,
+    "emitted_slots": 157,
+    "jit_bytes": 810,
+    "load_us": 393,
+    "targets_attached": 5,
+    "translated_bytes": 1272,
+    "verified_insns": 192,
+    "verifier": "verification time 364 usec\nstack depth 96 max 96\ninsns processed 192\nprocessed 192 insns (limit 1000000) max_states_per_insn 0 total_states 11 peak_states 11 mark_read 0\n"
+  },
+  {
+    "candidate": true,
+    "count_per_category": 1,
+    "emitted_slots": 155,
+    "jit_bytes": 770,
+    "load_us": 364,
+    "targets_attached": 5,
+    "translated_bytes": 1256,
+    "verified_insns": 195,
+    "verifier": "verification time 339 usec\nstack depth 96 max 96\ninsns processed 195\nprocessed 195 insns (limit 1000000) max_states_per_insn 1 total_states 13 peak_states 13 mark_read 0\n"
+  },
+  {
+    "candidate": false,
+    "count_per_category": 4,
+    "emitted_slots": 544,
+    "jit_bytes": 2685,
+    "load_us": 1143,
+    "targets_attached": 5,
+    "translated_bytes": 4368,
+    "verified_insns": 680,
+    "verifier": "verification time 1095 usec\nstack depth 96 max 96\ninsns processed 680\nprocessed 680 insns (limit 1000000) max_states_per_insn 1 total_states 45 peak_states 45 mark_read 0\n"
+  },
+  {
+    "candidate": true,
+    "count_per_category": 4,
+    "emitted_slots": 614,
+    "jit_bytes": 2888,
+    "load_us": 2995,
+    "targets_attached": 5,
+    "translated_bytes": 4856,
+    "verified_insns": 3409,
+    "verifier": "verification time 2933 usec\nstack depth 96 max 96\ninsns processed 3409\nprocessed 3409 insns (limit 1000000) max_states_per_insn 11 total_states 338 peak_states 223 mark_read 0\n"
+  },
+  {
+    "candidate": false,
+    "count_per_category": 16,
+    "emitted_slots": 2092,
+    "jit_bytes": 10347,
+    "load_us": 4420,
+    "targets_attached": 5,
+    "translated_bytes": 16752,
+    "verified_insns": 2864,
+    "verifier": "verification time 4303 usec\nstack depth 96 max 96\ninsns processed 2864\nprocessed 2864 insns (limit 1000000) max_states_per_insn 1 total_states 190 peak_states 190 mark_read 0\n"
+  },
+  {
+    "candidate": true,
+    "count_per_category": 16,
+    "emitted_slots": 2354,
+    "jit_bytes": 11084,
+    "load_us": 17944,
+    "targets_attached": 5,
+    "translated_bytes": 18776,
+    "verified_insns": 18723,
+    "verifier": "verification time 17808 usec\nstack depth 96 max 96\ninsns processed 18723\nprocessed 18723 insns (limit 1000000) max_states_per_insn 14 total_states 1882 peak_states 1176 mark_read 0\n"
+  },
+  {
+    "candidate": false,
+    "count_per_category": 64,
+    "emitted_slots": 8284,
+    "jit_bytes": 41085,
+    "load_us": 17794,
+    "targets_attached": 5,
+    "translated_bytes": 66288,
+    "verified_insns": 11600,
+    "verifier": "verification time 17354 usec\nstack depth 96 max 96\ninsns processed 11600\nprocessed 11600 insns (limit 1000000) max_states_per_insn 1 total_states 772 peak_states 772 mark_read 0\n"
+  },
+  {
+    "candidate": true,
+    "count_per_category": 64,
+    "emitted_slots": 9314,
+    "jit_bytes": 43928,
+    "load_us": 63838,
+    "targets_attached": 5,
+    "translated_bytes": 74456,
+    "verified_insns": 80027,
+    "verifier": "verification time 63375 usec\nstack depth 96 max 96\ninsns processed 80027\nprocessed 80027 insns (limit 1000000) max_states_per_insn 14 total_states 8056 peak_states 4948 mark_read 0\n"
+  },
+  {
+    "candidate": false,
+    "count_per_category": 256,
+    "emitted_slots": 33052,
+    "jit_bytes": 163785,
+    "load_us": 71904,
+    "targets_attached": 5,
+    "translated_bytes": 264432,
+    "verified_insns": 46544,
+    "verifier": "verification time 70417 usec\nstack depth 96 max 96\ninsns processed 46544\nprocessed 46544 insns (limit 1000000) max_states_per_insn 1 total_states 3100 peak_states 3100 mark_read 0\n"
+  },
+  {
+    "candidate": true,
+    "count_per_category": 256,
+    "emitted_slots": 37154,
+    "jit_bytes": 175136,
+    "load_us": 264634,
+    "targets_attached": 5,
+    "translated_bytes": 297176,
+    "verified_insns": 324912,
+    "verifier": "verification time 262899 usec\nstack depth 96 max 96\ninsns processed 324912\nprocessed 324912 insns (limit 1000000) max_states_per_insn 14 total_states 32746 peak_states 20177 mark_read 0\n"
+  }
+]

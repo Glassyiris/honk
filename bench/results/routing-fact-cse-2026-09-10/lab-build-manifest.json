@@ -1,0 +1,24 @@
+{
+  "baseline_head": "d2cf18438debba60d87ce46ba6da68bca6f072b3",
+  "candidate_diff_sha256": "8e5beba17e58c94b7db47611c9192227ea580a6480b46011be5cce6420c2fc4c",
+  "build": "stable release, default features plus ebpf, target-specific repository zig wrappers",
+  "note": "candidate source formatted after build; no semantic changes; no remote engine replacement yet",
+  "binaries": {
+    "honk-baseline-x86_64": {
+      "sha256": "a34e6b7698b0292a3f3b4ef8b18cad47094e2995c091cf31e28991251d3e1b8c",
+      "bytes": 20818776
+    },
+    "honk-candidate-x86_64": {
+      "sha256": "54cb9f7763cf1dd3130ab64723baae9930c8b56e3d4f1dd4670082504f358bac",
+      "bytes": 20819992
+    },
+    "honk-baseline-aarch64": {
+      "sha256": "e89da475ef68cf80864a2696185d0fb8346d5ae8936c0a5fd243d960f0722b3e",
+      "bytes": 18904752
+    },
+    "honk-candidate-aarch64": {
+      "sha256": "8eb65180a26976de43eba3d45b01129cd11c3a4db89780b790327d99093caf08",
+      "bytes": 18906288
+    }
+  }
+}

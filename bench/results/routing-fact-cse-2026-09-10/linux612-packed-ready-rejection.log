@@ -1,0 +1,1234 @@
+
+running 7 tests
+test ebpf::real::routing::tests::four_mode_golden_policies ... native routing: 468 complete-decision golden comparisons
+ok
+test ebpf::real::routing::tests::large_prefix_fact_policy ... ok
+test ebpf::real::routing::tests::lazy_fact_cache_ipv6_host_overlap_and_default_prefix ... ok
+test ebpf::real::routing::tests::lazy_fact_cache_null_zero_mac_presence_and_invalid_family ... ok
+test ebpf::real::routing::tests::lazy_fact_cache_short_circuit_reuse_and_alternating_inputs ... ok
+test ebpf::real::routing::tests::predicate_bits_and_capacity_limits ... 
+thread 'ebpf::real::routing::tests::predicate_bits_and_capacity_limits' (1030) panicked at crates/honk-core/src/ebpf/real/routing/tests.rs:653:54:
+called `Result::unwrap()` on an `Err` value: BPF_PROG_LOAD EXT for honk_route_slot1: Argument list too long (os error 7); diagnostic retry: Argument list too long (os error 7); log bytes=232944
+Validating honk_route_slot1() func#0...
+0: R1=mem_or_null(id=1,sz=128) R2=mem_or_null(id=2,sz=20) R10=fp0
+; routing function prologue @ honk-routing.generated:0
+0: (55) if r1 != 0x0 goto pc+2 3: R1=mem(sz=128) R2=mem_or_null(id=2,sz=20) R10=fp0
+3: (55) if r2 != 0x0 goto pc+2 6: R1=mem(sz=128) R2=mem(sz=20) R10=fp0
+6: (bf) r6 = r1                       ; R1=mem(sz=128) R6_w=mem(sz=128)
+7: (bf) r7 = r2                       ; R2=mem(sz=20) R7_w=mem(sz=20)
+8: (62) *(u32 *)(r7 +0) = 0           ; R7_w=mem(sz=20)
+9: (62) *(u32 *)(r7 +4) = 0           ; R7_w=mem(sz=20)
+10: (62) *(u32 *)(r7 +8) = 0          ; R7_w=mem(sz=20)
+11: (62) *(u32 *)(r7 +12) = 1         ; R7_w=mem(sz=20)
+12: (62) *(u32 *)(r7 +16) = -1        ; R7_w=mem(sz=20)
+13: (7a) *(u64 *)(r10 -8) = 0         ; R10=fp0 fp-8_w=0
+14: (62) *(u32 *)(r10 -28) = 0        ; R10=fp0 fp-32=0000????
+15: (7a) *(u64 *)(r10 -16) = 0        ; R10=fp0 fp-16_w=0
+16: (62) *(u32 *)(r10 -32) = 0        ; R10=fp0 fp-32=00000
+17: (7a) *(u64 *)(r10 -24) = 0        ; R10=fp0 fp-24_w=0
+18: (62) *(u32 *)(r10 -36) = 0        ; R10=fp0 fp-40=0000????
+; capacity-0 dip 192.0.2.0 @ honk-routing.generated:1
+19: (61) r0 = *(u32 *)(r10 -28)       ; R0=0 R10=fp0 fp-32=00000
+20: (55) if r0 != 0x0 goto pc+42      ; R0=0
+21: (61) r0 = *(u32 *)(r6 +108)       ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+22: (15) if r0 == 0x1 goto pc+2       ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+23: (15) if r0 == 0x2 goto pc+15      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+24: (05) goto pc+34
+59: (b7) r0 = 0                       ; R0_w=0
+60: (7b) *(u64 *)(r10 -8) = r0        ; R0_w=0 R10=fp0 fp-8_w=0
+61: (62) *(u32 *)(r10 -28) = 1        ; R10=fp0 fp-32=mmmmmmmm
+62: (05) goto pc+1
+64: (15) if r0 == 0x0 goto pc+94      ; R0=0
+; capacity-1 dip 192.0.2.1 @ honk-routing.generated:2
+159: (61) r0 = *(u32 *)(r10 -28)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+160: (55) if r0 != 0x0 goto pc+42     ; R0_w=0
+161: (61) r0 = *(u32 *)(r6 +108)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+162: (15) if r0 == 0x1 goto pc+2      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+163: (15) if r0 == 0x2 goto pc+15     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+164: (05) goto pc+34
+199: (b7) r0 = 0                      ; R0=0
+200: (7b) *(u64 *)(r10 -8) = r0       ; R0=0 R10=fp0 fp-8_w=0
+201: (62) *(u32 *)(r10 -28) = 1       ; R10=fp0 fp-32=mmmmmmmm
+202: (05) goto pc+1
+204: (15) if r0 == 0x0 goto pc+94     ; R0=0
+; capacity-2 dip 192.0.2.2 @ honk-routing.generated:3
+299: (61) r0 = *(u32 *)(r10 -28)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+300: (55) if r0 != 0x0 goto pc+42     ; R0_w=0
+301: (61) r0 = *(u32 *)(r6 +108)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+302: (15) if r0 == 0x1 goto pc+2      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+303: (15) if r0 == 0x2 goto pc+15     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+304: (05) goto pc+34
+339: (b7) r0 = 0                      ; R0_w=0
+340: (7b) *(u64 *)(r10 -8) = r0       ; R0_w=0 R10=fp0 fp-8_w=0
+341: (62) *(u32 *)(r10 -28) = 1       ; R10=fp0 fp-32=mmmmmmmm
+342: (05) goto pc+1
+344: (15) if r0 == 0x0 goto pc+94     ; R0_w=0
+; capacity-3 dip 192.0.2.3 @ honk-routing.generated:4
+439: (61) r0 = *(u32 *)(r10 -28)      ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+440: (55) if r0 != 0x0 goto pc+42     ; R0=0
+441: (61) r0 = *(u32 *)(r6 +108)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+442: (15) if r0 == 0x1 goto pc+2      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+443: (15) if r0 == 0x2 goto pc+15     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+444: (05) goto pc+34
+479: (b7) r0 = 0                      ; R0_w=0
+480: (7b) *(u64 *)(r10 -8) = r0       ; R0_w=0 R10=fp0 fp-8_w=0
+481: (62) *(u32 *)(r10 -28) = 1       ; R10=fp0 fp-32=mmmmmmmm
+482: (05) goto pc+1
+484: (15) if r0 == 0x0 goto pc+94     ; R0=0
+; capacity-4 dip 192.0.2.4 @ honk-routing.generated:5
+579: (61) r0 = *(u32 *)(r10 -28)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+580: (55) if r0 != 0x0 goto pc+42     ; R0_w=0
+581: (61) r0 = *(u32 *)(r6 +108)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+582: (15) if r0 == 0x1 goto pc+2      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+583: (15) if r0 == 0x2 goto pc+15     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+584: (05) goto pc+34
+619: (b7) r0 = 0                      ; R0=0
+620: (7b) *(u64 *)(r10 -8) = r0       ; R0=0 R10=fp0 fp-8_w=0
+621: (62) *(u32 *)(r10 -28) = 1       ; R10=fp0 fp-32=mmmmmmmm
+622: (05) goto pc+1
+624: (15) if r0 == 0x0 goto pc+94     ; R0=0
+; capacity-5 dip 192.0.2.5 @ honk-routing.generated:6
+719: (61) r0 = *(u32 *)(r10 -28)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+720: (55) if r0 != 0x0 goto pc+42     ; R0_w=0
+721: (61) r0 = *(u32 *)(r6 +108)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+722: (15) if r0 == 0x1 goto pc+2      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+723: (15) if r0 == 0x2 goto pc+15     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+724: (05) goto pc+34
+759: (b7) r0 = 0                      ; R0_w=0
+760: (7b) *(u64 *)(r10 -8) = r0       ; R0_w=0 R10=fp0 fp-8_w=0
+761: (62) *(u32 *)(r10 -28) = 1       ; R10=fp0 fp-32=mmmmmmmm
+762: (05) goto pc+1
+764: (15) if r0 == 0x0 goto pc+94     ; R0_w=0
+; capacity-6 dip 192.0.2.6 @ honk-routing.generated:7
+859: (61) r0 = *(u32 *)(r10 -28)      ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+860: (55) if r0 != 0x0 goto pc+42     ; R0=0
+861: (61) r0 = *(u32 *)(r6 +108)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+862: (15) if r0 == 0x1 goto pc+2      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+863: (15) if r0 == 0x2 goto pc+15     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+864: (05) goto pc+34
+899: (b7) r0 = 0                      ; R0_w=0
+900: (7b) *(u64 *)(r10 -8) = r0       ; R0_w=0 R10=fp0 fp-8_w=0
+901: (62) *(u32 *)(r10 -28) = 1       ; R10=fp0 fp-32=mmmmmmmm
+902: (05) goto pc+1
+904: (15) if r0 == 0x0 goto pc+94     ; R0=0
+; capacity-7 dip 192.0.2.7 @ honk-routing.generated:8
+999: (61) r0 = *(u32 *)(r10 -28)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+1000: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+1001: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+1002: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1003: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1004: (05) goto pc+34
+1039: (b7) r0 = 0                     ; R0=0
+1040: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+1041: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+1042: (05) goto pc+1
+1044: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-8 dip 192.0.2.8 @ honk-routing.generated:9
+1139: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+1140: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+1141: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+1142: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1143: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1144: (05) goto pc+34
+1179: (b7) r0 = 0                     ; R0_w=0
+1180: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+1181: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+1182: (05) goto pc+1
+1184: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; capacity-9 dip 192.0.2.9 @ honk-routing.generated:10
+1279: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+1280: (55) if r0 != 0x0 goto pc+42    ; R0=0
+1281: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+1282: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1283: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1284: (05) goto pc+34
+1319: (b7) r0 = 0                     ; R0_w=0
+1320: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+1321: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+1322: (05) goto pc+1
+1324: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-10 dip 192.0.2.10 @ honk-routing.generated:11
+1419: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+1420: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+1421: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+1422: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1423: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1424: (05) goto pc+34
+1459: (b7) r0 = 0                     ; R0=0
+1460: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+1461: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+1462: (05) goto pc+1
+1464: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-11 dip 192.0.2.11 @ honk-routing.generated:12
+1559: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+1560: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+1561: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+1562: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1563: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1564: (05) goto pc+34
+1599: (b7) r0 = 0                     ; R0_w=0
+1600: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+1601: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+1602: (05) goto pc+1
+1604: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; capacity-12 dip 192.0.2.12 @ honk-routing.generated:13
+1699: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+1700: (55) if r0 != 0x0 goto pc+42    ; R0=0
+1701: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+1702: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1703: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1704: (05) goto pc+34
+1739: (b7) r0 = 0                     ; R0_w=0
+1740: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+1741: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+1742: (05) goto pc+1
+1744: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-13 dip 192.0.2.13 @ honk-routing.generated:14
+1839: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+1840: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+1841: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+1842: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1843: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1844: (05) goto pc+34
+1879: (b7) r0 = 0                     ; R0=0
+1880: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+1881: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+1882: (05) goto pc+1
+1884: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-14 dip 192.0.2.14 @ honk-routing.generated:15
+1979: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+1980: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+1981: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+1982: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1983: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1984: (05) goto pc+34
+2019: (b7) r0 = 0                     ; R0_w=0
+2020: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+2021: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+2022: (05) goto pc+1
+2024: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; capacity-15 dip 192.0.2.15 @ honk-routing.generated:16
+2119: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+2120: (55) if r0 != 0x0 goto pc+42    ; R0=0
+2121: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+2122: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2123: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2124: (05) goto pc+34
+2159: (b7) r0 = 0                     ; R0_w=0
+2160: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+2161: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+2162: (05) goto pc+1
+2164: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-16 dip 192.0.2.16 @ honk-routing.generated:17
+2259: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+2260: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+2261: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+2262: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2263: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2264: (05) goto pc+34
+2299: (b7) r0 = 0                     ; R0=0
+2300: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+2301: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+2302: (05) goto pc+1
+2304: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-17 dip 192.0.2.17 @ honk-routing.generated:18
+2399: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+2400: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+2401: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+2402: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2403: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2404: (05) goto pc+34
+2439: (b7) r0 = 0                     ; R0_w=0
+2440: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+2441: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+2442: (05) goto pc+1
+2444: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; capacity-18 dip 192.0.2.18 @ honk-routing.generated:19
+2539: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+2540: (55) if r0 != 0x0 goto pc+42    ; R0=0
+2541: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+2542: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2543: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2544: (05) goto pc+34
+2579: (b7) r0 = 0                     ; R0_w=0
+2580: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+2581: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+2582: (05) goto pc+1
+2584: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-19 dip 192.0.2.19 @ honk-routing.generated:20
+2679: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+2680: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+2681: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+2682: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2683: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2684: (05) goto pc+34
+2719: (b7) r0 = 0                     ; R0=0
+2720: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+2721: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+2722: (05) goto pc+1
+2724: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-20 dip 192.0.2.20 @ honk-routing.generated:21
+2819: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+2820: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+2821: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+2822: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2823: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2824: (05) goto pc+34
+2859: (b7) r0 = 0                     ; R0_w=0
+2860: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+2861: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+2862: (05) goto pc+1
+2864: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; capacity-21 dip 192.0.2.21 @ honk-routing.generated:22
+2959: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+2960: (55) if r0 != 0x0 goto pc+42    ; R0=0
+2961: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+2962: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2963: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2964: (05) goto pc+34
+2999: (b7) r0 = 0                     ; R0_w=0
+3000: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+3001: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+3002: (05) goto pc+1
+3004: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-22 dip 192.0.2.22 @ honk-routing.generated:23
+3099: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+3100: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+3101: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+3102: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3103: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3104: (05) goto pc+34
+3139: (b7) r0 = 0                     ; R0=0
+3140: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+3141: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+3142: (05) goto pc+1
+3144: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-23 dip 192.0.2.23 @ honk-routing.generated:24
+3239: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+3240: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+3241: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+3242: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3243: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3244: (05) goto pc+34
+3279: (b7) r0 = 0                     ; R0_w=0
+3280: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+3281: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+3282: (05) goto pc+1
+3284: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; capacity-24 dip 192.0.2.24 @ honk-routing.generated:25
+3379: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+3380: (55) if r0 != 0x0 goto pc+42    ; R0=0
+3381: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+3382: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3383: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3384: (05) goto pc+34
+3419: (b7) r0 = 0                     ; R0_w=0
+3420: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+3421: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+3422: (05) goto pc+1
+3424: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-25 dip 192.0.2.25 @ honk-routing.generated:26
+3519: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+3520: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+3521: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+3522: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3523: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3524: (05) goto pc+34
+3559: (b7) r0 = 0                     ; R0=0
+3560: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+3561: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+3562: (05) goto pc+1
+3564: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-26 dip 192.0.2.26 @ honk-routing.generated:27
+3659: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+3660: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+3661: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+3662: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3663: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3664: (05) goto pc+34
+3699: (b7) r0 = 0                     ; R0_w=0
+3700: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+3701: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+3702: (05) goto pc+1
+3704: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; capacity-27 dip 192.0.2.27 @ honk-routing.generated:28
+3799: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+3800: (55) if r0 != 0x0 goto pc+42    ; R0=0
+3801: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+3802: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3803: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3804: (05) goto pc+34
+3839: (b7) r0 = 0                     ; R0_w=0
+3840: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+3841: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+3842: (05) goto pc+1
+3844: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-28 dip 192.0.2.28 @ honk-routing.generated:29
+3939: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+3940: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+3941: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+3942: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3943: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3944: (05) goto pc+34
+3979: (b7) r0 = 0                     ; R0=0
+3980: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+3981: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+3982: (05) goto pc+1
+3984: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-29 dip 192.0.2.29 @ honk-routing.generated:30
+4079: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+4080: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+4081: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+4082: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4083: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4084: (05) goto pc+34
+4119: (b7) r0 = 0                     ; R0_w=0
+4120: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+4121: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+4122: (05) goto pc+1
+4124: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; capacity-30 dip 192.0.2.30 @ honk-routing.generated:31
+4219: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+4220: (55) if r0 != 0x0 goto pc+42    ; R0=0
+4221: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+4222: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4223: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4224: (05) goto pc+34
+4259: (b7) r0 = 0                     ; R0_w=0
+4260: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+4261: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+4262: (05) goto pc+1
+4264: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-31 dip 192.0.2.31 @ honk-routing.generated:32
+4359: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+4360: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+4361: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+4362: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4363: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4364: (05) goto pc+34
+4399: (b7) r0 = 0                     ; R0=0
+4400: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+4401: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+4402: (05) goto pc+1
+4404: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-32 dip 192.0.2.32 @ honk-routing.generated:33
+4499: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+4500: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+4501: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+4502: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4503: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4504: (05) goto pc+34
+4539: (b7) r0 = 0                     ; R0_w=0
+4540: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+4541: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+4542: (05) goto pc+1
+4544: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; capacity-33 dip 192.0.2.33 @ honk-routing.generated:34
+4639: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+4640: (55) if r0 != 0x0 goto pc+42    ; R0=0
+4641: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+4642: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4643: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4644: (05) goto pc+34
+4679: (b7) r0 = 0                     ; R0_w=0
+4680: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+4681: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+4682: (05) goto pc+1
+4684: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-34 dip 192.0.2.34 @ honk-routing.generated:35
+4779: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+4780: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+4781: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+4782: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4783: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4784: (05) goto pc+34
+4819: (b7) r0 = 0                     ; R0=0
+4820: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+4821: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+4822: (05) goto pc+1
+4824: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-35 dip 192.0.2.35 @ honk-routing.generated:36
+4919: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+4920: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+4921: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+4922: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4923: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4924: (05) goto pc+34
+4959: (b7) r0 = 0                     ; R0_w=0
+4960: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+4961: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+4962: (05) goto pc+1
+4964: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; capacity-36 dip 192.0.2.36 @ honk-routing.generated:37
+5059: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+5060: (55) if r0 != 0x0 goto pc+42    ; R0=0
+5061: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+5062: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5063: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5064: (05) goto pc+34
+5099: (b7) r0 = 0                     ; R0_w=0
+5100: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+5101: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+5102: (05) goto pc+1
+5104: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-37 dip 192.0.2.37 @ honk-routing.generated:38
+5199: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+5200: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+5201: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+5202: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5203: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5204: (05) goto pc+34
+5239: (b7) r0 = 0                     ; R0=0
+5240: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+5241: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+5242: (05) goto pc+1
+5244: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-38 dip 192.0.2.38 @ honk-routing.generated:39
+5339: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+5340: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+5341: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+5342: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5343: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5344: (05) goto pc+34
+5379: (b7) r0 = 0                     ; R0_w=0
+5380: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+5381: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+5382: (05) goto pc+1
+5384: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; capacity-39 dip 192.0.2.39 @ honk-routing.generated:40
+5479: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+5480: (55) if r0 != 0x0 goto pc+42    ; R0=0
+5481: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+5482: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5483: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5484: (05) goto pc+34
+5519: (b7) r0 = 0                     ; R0_w=0
+5520: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+5521: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+5522: (05) goto pc+1
+5524: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-40 dip 192.0.2.40 @ honk-routing.generated:41
+5619: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+5620: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+5621: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+5622: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5623: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5624: (05) goto pc+34
+5659: (b7) r0 = 0                     ; R0=0
+5660: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+5661: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+5662: (05) goto pc+1
+5664: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; capacity-41 dip 192.0.2.41 @ honk-routing.generated:42
+5759: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+5760: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+5761: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+5762: (15) if r0 == 0x1 goto pc+2 5765: R0=1 R1=mem(sz=128) R2=mem(sz=20) R6=mem(sz=128) R7=mem(sz=20) R10=fp0 fp-8=0 fp-16=0 fp-24=0 fp-32=mmmmmmmm fp-40=0000????
+; capacity-41 dip 192.0.2.41 @ honk-routing.generated:42
+5765: (62) *(u32 *)(r10 -64) = 32     ; R10=fp0 fp-64=????32
+5766: (62) *(u32 *)(r10 -60) = 0      ; R10=fp0 fp-64=0000mmmm
+5767: (62) *(u32 *)(r10 -56) = 0      ; R10=fp0 fp-56=????0
+5768: (62) *(u32 *)(r10 -52) = 0      ; R10=fp0 fp-56=0000mmmm
+5769: (62) *(u32 *)(r10 -48) = 0      ; R10=fp0 fp-48=????0
+5770: (bf) r2 = r6                    ; R2_w=mem(sz=128) R6=mem(sz=128)
+5771: (61) r3 = *(u32 *)(r2 +28)      ; R2_w=mem(sz=128) R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5772: (63) *(u32 *)(r10 -60) = r3     ; R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-64=mmmmmmmm
+5773: (18) r1 = 0xff1a54b04243c600    ; R1_w=map_ptr(map=standalone_lpm_,ks=20,vs=32)
+5775: (bf) r2 = r10                   ; R2_w=fp0 R10=fp0
+5776: (07) r2 += -64                  ; R2_w=fp-64
+5777: (85) call bpf_map_lookup_elem#1         ; R0_w=map_value_or_null(id=50140,map=standalone_lpm_,ks=20,vs=32)
+5778: (05) goto pc+21
+5800: (7b) *(u64 *)(r10 -8) = r0      ; R0=map_value_or_null(id=50140,map=standalone_lpm_,ks=20,vs=32) R10=fp0 fp-8_w=map_value_or_null(id=50140,map=standalone_lpm_,ks=20,vs=32)
+5801: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+5802: (05) goto pc+1
+5804: (15) if r0 == 0x0 goto pc+94    ; R0=map_value(map=standalone_lpm_,ks=20,vs=32)
+5805: (61) r2 = *(u32 *)(r0 +4)       ; R0=map_value(map=standalone_lpm_,ks=20,vs=32) R2_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5806: (57) r2 &= 512                  ; R2_w=scalar(smin=smin32=0,smax=umax=smax32=umax32=512,var_off=(0x0; 0x200))
+5807: (55) if r2 != 0x0 goto pc+1 5809: R0=map_value(map=standalone_lpm_,ks=20,vs=32) R2_w=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=512,var_off=(0x0; 0x200)) R6=mem(sz=128) R7=mem(sz=20) R10=fp0 fp-8_w=map_value(map=standalone_lpm_,ks=20,vs=32) fp-16=0 fp-24=0 fp-32=mmmmmmmm fp-40=0000???? fp-48=????mmmm fp-56=mmmmmmmm fp-64=mmmmmmmm
+; capacity-41 dip 192.0.2.41 @ honk-routing.generated:42
+5809: (61) r0 = *(u32 *)(r10 -32)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+5810: (55) if r0 != 0x0 goto pc+42    ; R0=0
+5811: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+5812: (15) if r0 == 0x1 goto pc+2 5815: R0=1 R2=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=512,var_off=(0x0; 0x200)) R6=mem(sz=128) R7=mem(sz=20) R10=fp0 fp-8=map_value(map=standalone_lpm_,ks=20,vs=32) fp-16=0 fp-24=0 fp-32=mmmmmmmm fp-40=0000???? fp-48=????mmmm fp-56=mmmmmmmm fp-64=mmmmmmmm
+; capacity-41 dip 192.0.2.41 @ honk-routing.generated:42
+5815: (62) *(u32 *)(r10 -64) = 32     ; R10=fp0 fp-64=mmmm32
+5816: (62) *(u32 *)(r10 -60) = 0      ; R10=fp0 fp-64=0000mmmm
+5817: (62) *(u32 *)(r10 -56) = 0      ; R10=fp0 fp-56=mmmm0
+5818: (62) *(u32 *)(r10 -52) = 0      ; R10=fp0 fp-56=0000mmmm
+5819: (62) *(u32 *)(r10 -48) = 0      ; R10=fp0 fp-48=????0
+5820: (bf) r2 = r6                    ; R2_w=mem(sz=128) R6=mem(sz=128)
+5821: (61) r3 = *(u32 *)(r2 +12)      ; R2_w=mem(sz=128) R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5822: (63) *(u32 *)(r10 -60) = r3     ; R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-64=mmmmmmmm
+5823: (18) r1 = 0xff1a54b04243cc00    ; R1_w=map_ptr(map=standalone_lpm_,ks=20,vs=32)
+5825: (bf) r2 = r10                   ; R2_w=fp0 R10=fp0
+5826: (07) r2 += -64                  ; R2_w=fp-64
+5827: (85) call bpf_map_lookup_elem#1         ; R0_w=map_value_or_null(id=50154,map=standalone_lpm_,ks=20,vs=32)
+5828: (05) goto pc+21
+5850: (7b) *(u64 *)(r10 -16) = r0     ; R0=map_value_or_null(id=50154,map=standalone_lpm_,ks=20,vs=32) R10=fp0 fp-16_w=map_value_or_null(id=50154,map=standalone_lpm_,ks=20,vs=32)
+5851: (62) *(u32 *)(r10 -32) = 1      ; R10=fp0 fp-32=mmmm1
+5852: (05) goto pc+1
+5854: (15) if r0 == 0x0 goto pc+44    ; R0=map_value(map=standalone_lpm_,ks=20,vs=32)
+5855: (61) r2 = *(u32 *)(r0 +4)       ; R0=map_value(map=standalone_lpm_,ks=20,vs=32) R2_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5856: (57) r2 &= 512                  ; R2_w=scalar(smin=smin32=0,smax=umax=smax32=umax32=512,var_off=(0x0; 0x200))
+5857: (55) if r2 != 0x0 goto pc+1 5859: R0=map_value(map=standalone_lpm_,ks=20,vs=32) R2=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=512,var_off=(0x0; 0x200)) R6=mem(sz=128) R7=mem(sz=20) R10=fp0 fp-8=map_value(map=standalone_lpm_,ks=20,vs=32) fp-16=map_value(map=standalone_lpm_,ks=20,vs=32) fp-24=0 fp-32=mmmm1 fp-40=0000???? fp-48=????mmmm fp-56=mmmmmmmm fp-64=mmmmmmmm
+; capacity-41 dip 192.0.2.41 @ honk-routing.generated:42
+5859: (61) r0 = *(u32 *)(r10 -36)     ; R0_w=0 R10=fp0 fp-40=0000????
+5860: (55) if r0 != 0x0 goto pc+26    ; R0_w=0
+5861: (61) r0 = *(u32 *)(r6 +124)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+5862: (15) if r0 == 0x0 goto pc+20    ; R0_w=scalar(smin=umin=umin32=1,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5863: (62) *(u32 *)(r10 -64) = 128    ; R10=fp0 fp-64=mmmm128
+5864: (62) *(u32 *)(r10 -60) = 0      ; R10=fp0 fp-64=0000mmmm
+5865: (62) *(u32 *)(r10 -56) = 0      ; R10=fp0 fp-56=mmmm0
+5866: (62) *(u32 *)(r10 -52) = 0      ; R10=fp0 fp-56=0000mmmm
+5867: (62) *(u32 *)(r10 -48) = 0      ; R10=fp0 fp-48=????0
+5868: (bf) r2 = r6                    ; R2_w=mem(sz=128) R6=mem(sz=128)
+5869: (61) r3 = *(u32 *)(r2 +32)      ; R2_w=mem(sz=128) R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5870: (63) *(u32 *)(r10 -60) = r3     ; R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-64=mmmmmmmm
+5871: (61) r3 = *(u32 *)(r2 +36)      ; R2_w=mem(sz=128) R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5872: (63) *(u32 *)(r10 -56) = r3     ; R3_w=scalar(id=50159,smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-56=0000scalar(id=50159,smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5873: (61) r3 = *(u32 *)(r2 +40)      ; R2_w=mem(sz=128) R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5874: (63) *(u32 *)(r10 -52) = r3     ; R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-56=mmmmmmmm
+5875: (61) r3 = *(u32 *)(r2 +44)      ; R2_w=mem(sz=128) R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5876: (63) *(u32 *)(r10 -48) = r3     ; R3_w=scalar(id=50160,smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-48=????scalar(id=50160,smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5877: (18) r1 = 0xff1a54b04243c400    ; R1_w=map_ptr(map=standalone_lpm_,ks=20,vs=32)
+5879: (bf) r2 = r10                   ; R2_w=fp0 R10=fp0
+5880: (07) r2 += -64                  ; R2_w=fp-64
+5881: (85) call bpf_map_lookup_elem#1         ; R0=map_value_or_null(id=50161,map=standalone_lpm_,ks=20,vs=32)
+5882: (05) goto pc+1
+5884: (7b) *(u64 *)(r10 -24) = r0     ; R0=map_value_or_null(id=50161,map=standalone_lpm_,ks=20,vs=32) R10=fp0 fp-24_w=map_value_or_null(id=50161,map=standalone_lpm_,ks=20,vs=32)
+5885: (62) *(u32 *)(r10 -36) = 1      ; R10=fp0 fp-40=mmmm????
+5886: (05) goto pc+1
+5888: (15) if r0 == 0x0 goto pc+10 5899: R0=0 R6=mem(sz=128) R7=mem(sz=20) R10=fp0 fp-8=map_value(map=standalone_lpm_,ks=20,vs=32) fp-16=map_value(map=standalone_lpm_,ks=20,vs=32) fp-24_w=0 fp-32=mmmm1 fp-40=mmmm???? fp-48=????mmmm fp-56=mmmmmmmm fp-64=mmmmmmmm
+5899: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmm1
+5900: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+5901: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+5902: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5903: (15) if r0 == 0x2 goto pc+15 5919: R0=2 R6=mem(sz=128) R7=mem(sz=20) R10=fp0 fp-8=map_value(map=standalone_lpm_,ks=20,vs=32) fp-16=map_value(map=standalone_lpm_,ks=20,vs=32) fp-24=0 fp-32=mmmm1 fp-40=mmmm???? fp-48=????mmmm fp-56=mmmmmmmm fp-64=mmmmmmmm
+5919: (62) *(u32 *)(r10 -64) = 128    ; R10=fp0 fp-64=mmmm128
+5920: (62) *(u32 *)(r10 -60) = 0      ; R10=fp0 fp-64=0000mmmm
+5921: (62) *(u32 *)(r10 -56) = 0      ; R10=fp0 fp-56=mmmm0
+5922: (62) *(u32 *)(r10 -52) = 0      ; R10=fp0 fp-56=0000mmmm
+5923: (62) *(u32 *)(r10 -48) = 0      ; R10=fp0 fp-48=????0
+5924: (bf) r2 = r6
+BPF program is too large. Processed 1000001 insn
+processed 1000001 insns (limit 1000000) max_states_per_insn 14 total_states 81216 peak_states 34249 mark_read 349
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test ebpf::real::routing::tests::publication_failure_recovery_and_frozen_root ... 
+thread 'ebpf::real::routing::tests::publication_failure_recovery_and_frozen_root' (1032) panicked at crates/honk-core/src/ebpf/real/routing/tests.rs:732:54:
+called `Result::unwrap()` on an `Err` value: BPF_PROG_LOAD EXT for honk_route_slot1: Argument list too long (os error 7); diagnostic retry: Argument list too long (os error 7); log bytes=232683
+Validating honk_route_slot1() func#0...
+0: R1=mem_or_null(id=1,sz=128) R2=mem_or_null(id=2,sz=20) R10=fp0
+; routing function prologue @ honk-routing.generated:0
+0: (55) if r1 != 0x0 goto pc+2 3: R1=mem(sz=128) R2=mem_or_null(id=2,sz=20) R10=fp0
+3: (55) if r2 != 0x0 goto pc+2 6: R1=mem(sz=128) R2=mem(sz=20) R10=fp0
+6: (bf) r6 = r1                       ; R1=mem(sz=128) R6_w=mem(sz=128)
+7: (bf) r7 = r2                       ; R2=mem(sz=20) R7_w=mem(sz=20)
+8: (62) *(u32 *)(r7 +0) = 0           ; R7_w=mem(sz=20)
+9: (62) *(u32 *)(r7 +4) = 0           ; R7_w=mem(sz=20)
+10: (62) *(u32 *)(r7 +8) = 0          ; R7_w=mem(sz=20)
+11: (62) *(u32 *)(r7 +12) = 1         ; R7_w=mem(sz=20)
+12: (62) *(u32 *)(r7 +16) = -1        ; R7_w=mem(sz=20)
+13: (7a) *(u64 *)(r10 -8) = 0         ; R10=fp0 fp-8_w=0
+14: (62) *(u32 *)(r10 -28) = 0        ; R10=fp0 fp-32=0000????
+15: (7a) *(u64 *)(r10 -16) = 0        ; R10=fp0 fp-16_w=0
+16: (62) *(u32 *)(r10 -32) = 0        ; R10=fp0 fp-32=00000
+17: (7a) *(u64 *)(r10 -24) = 0        ; R10=fp0 fp-24_w=0
+18: (62) *(u32 *)(r10 -36) = 0        ; R10=fp0 fp-40=0000????
+; initial-0 dip 192.0.2.0 @ honk-routing.generated:1
+19: (61) r0 = *(u32 *)(r10 -28)       ; R0=0 R10=fp0 fp-32=00000
+20: (55) if r0 != 0x0 goto pc+42      ; R0=0
+21: (61) r0 = *(u32 *)(r6 +108)       ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+22: (15) if r0 == 0x1 goto pc+2       ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+23: (15) if r0 == 0x2 goto pc+15      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+24: (05) goto pc+34
+59: (b7) r0 = 0                       ; R0_w=0
+60: (7b) *(u64 *)(r10 -8) = r0        ; R0_w=0 R10=fp0 fp-8_w=0
+61: (62) *(u32 *)(r10 -28) = 1        ; R10=fp0 fp-32=mmmmmmmm
+62: (05) goto pc+1
+64: (15) if r0 == 0x0 goto pc+94      ; R0=0
+; initial-1 dip 192.0.2.1 @ honk-routing.generated:2
+159: (61) r0 = *(u32 *)(r10 -28)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+160: (55) if r0 != 0x0 goto pc+42     ; R0_w=0
+161: (61) r0 = *(u32 *)(r6 +108)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+162: (15) if r0 == 0x1 goto pc+2      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+163: (15) if r0 == 0x2 goto pc+15     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+164: (05) goto pc+34
+199: (b7) r0 = 0                      ; R0=0
+200: (7b) *(u64 *)(r10 -8) = r0       ; R0=0 R10=fp0 fp-8_w=0
+201: (62) *(u32 *)(r10 -28) = 1       ; R10=fp0 fp-32=mmmmmmmm
+202: (05) goto pc+1
+204: (15) if r0 == 0x0 goto pc+94     ; R0=0
+; initial-2 dip 192.0.2.2 @ honk-routing.generated:3
+299: (61) r0 = *(u32 *)(r10 -28)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+300: (55) if r0 != 0x0 goto pc+42     ; R0_w=0
+301: (61) r0 = *(u32 *)(r6 +108)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+302: (15) if r0 == 0x1 goto pc+2      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+303: (15) if r0 == 0x2 goto pc+15     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+304: (05) goto pc+34
+339: (b7) r0 = 0                      ; R0_w=0
+340: (7b) *(u64 *)(r10 -8) = r0       ; R0_w=0 R10=fp0 fp-8_w=0
+341: (62) *(u32 *)(r10 -28) = 1       ; R10=fp0 fp-32=mmmmmmmm
+342: (05) goto pc+1
+344: (15) if r0 == 0x0 goto pc+94     ; R0_w=0
+; initial-3 dip 192.0.2.3 @ honk-routing.generated:4
+439: (61) r0 = *(u32 *)(r10 -28)      ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+440: (55) if r0 != 0x0 goto pc+42     ; R0=0
+441: (61) r0 = *(u32 *)(r6 +108)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+442: (15) if r0 == 0x1 goto pc+2      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+443: (15) if r0 == 0x2 goto pc+15     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+444: (05) goto pc+34
+479: (b7) r0 = 0                      ; R0_w=0
+480: (7b) *(u64 *)(r10 -8) = r0       ; R0_w=0 R10=fp0 fp-8_w=0
+481: (62) *(u32 *)(r10 -28) = 1       ; R10=fp0 fp-32=mmmmmmmm
+482: (05) goto pc+1
+484: (15) if r0 == 0x0 goto pc+94     ; R0=0
+; initial-4 dip 192.0.2.4 @ honk-routing.generated:5
+579: (61) r0 = *(u32 *)(r10 -28)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+580: (55) if r0 != 0x0 goto pc+42     ; R0_w=0
+581: (61) r0 = *(u32 *)(r6 +108)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+582: (15) if r0 == 0x1 goto pc+2      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+583: (15) if r0 == 0x2 goto pc+15     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+584: (05) goto pc+34
+619: (b7) r0 = 0                      ; R0=0
+620: (7b) *(u64 *)(r10 -8) = r0       ; R0=0 R10=fp0 fp-8_w=0
+621: (62) *(u32 *)(r10 -28) = 1       ; R10=fp0 fp-32=mmmmmmmm
+622: (05) goto pc+1
+624: (15) if r0 == 0x0 goto pc+94     ; R0=0
+; initial-5 dip 192.0.2.5 @ honk-routing.generated:6
+719: (61) r0 = *(u32 *)(r10 -28)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+720: (55) if r0 != 0x0 goto pc+42     ; R0_w=0
+721: (61) r0 = *(u32 *)(r6 +108)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+722: (15) if r0 == 0x1 goto pc+2      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+723: (15) if r0 == 0x2 goto pc+15     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+724: (05) goto pc+34
+759: (b7) r0 = 0                      ; R0_w=0
+760: (7b) *(u64 *)(r10 -8) = r0       ; R0_w=0 R10=fp0 fp-8_w=0
+761: (62) *(u32 *)(r10 -28) = 1       ; R10=fp0 fp-32=mmmmmmmm
+762: (05) goto pc+1
+764: (15) if r0 == 0x0 goto pc+94     ; R0_w=0
+; initial-6 dip 192.0.2.6 @ honk-routing.generated:7
+859: (61) r0 = *(u32 *)(r10 -28)      ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+860: (55) if r0 != 0x0 goto pc+42     ; R0=0
+861: (61) r0 = *(u32 *)(r6 +108)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+862: (15) if r0 == 0x1 goto pc+2      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+863: (15) if r0 == 0x2 goto pc+15     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+864: (05) goto pc+34
+899: (b7) r0 = 0                      ; R0_w=0
+900: (7b) *(u64 *)(r10 -8) = r0       ; R0_w=0 R10=fp0 fp-8_w=0
+901: (62) *(u32 *)(r10 -28) = 1       ; R10=fp0 fp-32=mmmmmmmm
+902: (05) goto pc+1
+904: (15) if r0 == 0x0 goto pc+94     ; R0=0
+; initial-7 dip 192.0.2.7 @ honk-routing.generated:8
+999: (61) r0 = *(u32 *)(r10 -28)      ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+1000: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+1001: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+1002: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1003: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1004: (05) goto pc+34
+1039: (b7) r0 = 0                     ; R0=0
+1040: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+1041: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+1042: (05) goto pc+1
+1044: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-8 dip 192.0.2.8 @ honk-routing.generated:9
+1139: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+1140: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+1141: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+1142: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1143: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1144: (05) goto pc+34
+1179: (b7) r0 = 0                     ; R0_w=0
+1180: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+1181: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+1182: (05) goto pc+1
+1184: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; initial-9 dip 192.0.2.9 @ honk-routing.generated:10
+1279: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+1280: (55) if r0 != 0x0 goto pc+42    ; R0=0
+1281: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+1282: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1283: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1284: (05) goto pc+34
+1319: (b7) r0 = 0                     ; R0_w=0
+1320: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+1321: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+1322: (05) goto pc+1
+1324: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-10 dip 192.0.2.10 @ honk-routing.generated:11
+1419: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+1420: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+1421: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+1422: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1423: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1424: (05) goto pc+34
+1459: (b7) r0 = 0                     ; R0=0
+1460: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+1461: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+1462: (05) goto pc+1
+1464: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-11 dip 192.0.2.11 @ honk-routing.generated:12
+1559: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+1560: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+1561: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+1562: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1563: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1564: (05) goto pc+34
+1599: (b7) r0 = 0                     ; R0_w=0
+1600: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+1601: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+1602: (05) goto pc+1
+1604: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; initial-12 dip 192.0.2.12 @ honk-routing.generated:13
+1699: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+1700: (55) if r0 != 0x0 goto pc+42    ; R0=0
+1701: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+1702: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1703: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1704: (05) goto pc+34
+1739: (b7) r0 = 0                     ; R0_w=0
+1740: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+1741: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+1742: (05) goto pc+1
+1744: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-13 dip 192.0.2.13 @ honk-routing.generated:14
+1839: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+1840: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+1841: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+1842: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1843: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1844: (05) goto pc+34
+1879: (b7) r0 = 0                     ; R0=0
+1880: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+1881: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+1882: (05) goto pc+1
+1884: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-14 dip 192.0.2.14 @ honk-routing.generated:15
+1979: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+1980: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+1981: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+1982: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1983: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+1984: (05) goto pc+34
+2019: (b7) r0 = 0                     ; R0_w=0
+2020: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+2021: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+2022: (05) goto pc+1
+2024: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; initial-15 dip 192.0.2.15 @ honk-routing.generated:16
+2119: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+2120: (55) if r0 != 0x0 goto pc+42    ; R0=0
+2121: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+2122: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2123: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2124: (05) goto pc+34
+2159: (b7) r0 = 0                     ; R0_w=0
+2160: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+2161: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+2162: (05) goto pc+1
+2164: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-16 dip 192.0.2.16 @ honk-routing.generated:17
+2259: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+2260: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+2261: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+2262: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2263: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2264: (05) goto pc+34
+2299: (b7) r0 = 0                     ; R0=0
+2300: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+2301: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+2302: (05) goto pc+1
+2304: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-17 dip 192.0.2.17 @ honk-routing.generated:18
+2399: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+2400: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+2401: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+2402: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2403: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2404: (05) goto pc+34
+2439: (b7) r0 = 0                     ; R0_w=0
+2440: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+2441: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+2442: (05) goto pc+1
+2444: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; initial-18 dip 192.0.2.18 @ honk-routing.generated:19
+2539: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+2540: (55) if r0 != 0x0 goto pc+42    ; R0=0
+2541: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+2542: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2543: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2544: (05) goto pc+34
+2579: (b7) r0 = 0                     ; R0_w=0
+2580: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+2581: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+2582: (05) goto pc+1
+2584: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-19 dip 192.0.2.19 @ honk-routing.generated:20
+2679: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+2680: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+2681: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+2682: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2683: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2684: (05) goto pc+34
+2719: (b7) r0 = 0                     ; R0=0
+2720: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+2721: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+2722: (05) goto pc+1
+2724: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-20 dip 192.0.2.20 @ honk-routing.generated:21
+2819: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+2820: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+2821: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+2822: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2823: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2824: (05) goto pc+34
+2859: (b7) r0 = 0                     ; R0_w=0
+2860: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+2861: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+2862: (05) goto pc+1
+2864: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; initial-21 dip 192.0.2.21 @ honk-routing.generated:22
+2959: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+2960: (55) if r0 != 0x0 goto pc+42    ; R0=0
+2961: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+2962: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2963: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+2964: (05) goto pc+34
+2999: (b7) r0 = 0                     ; R0_w=0
+3000: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+3001: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+3002: (05) goto pc+1
+3004: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-22 dip 192.0.2.22 @ honk-routing.generated:23
+3099: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+3100: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+3101: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+3102: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3103: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3104: (05) goto pc+34
+3139: (b7) r0 = 0                     ; R0=0
+3140: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+3141: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+3142: (05) goto pc+1
+3144: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-23 dip 192.0.2.23 @ honk-routing.generated:24
+3239: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+3240: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+3241: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+3242: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3243: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3244: (05) goto pc+34
+3279: (b7) r0 = 0                     ; R0_w=0
+3280: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+3281: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+3282: (05) goto pc+1
+3284: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; initial-24 dip 192.0.2.24 @ honk-routing.generated:25
+3379: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+3380: (55) if r0 != 0x0 goto pc+42    ; R0=0
+3381: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+3382: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3383: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3384: (05) goto pc+34
+3419: (b7) r0 = 0                     ; R0_w=0
+3420: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+3421: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+3422: (05) goto pc+1
+3424: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-25 dip 192.0.2.25 @ honk-routing.generated:26
+3519: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+3520: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+3521: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+3522: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3523: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3524: (05) goto pc+34
+3559: (b7) r0 = 0                     ; R0=0
+3560: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+3561: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+3562: (05) goto pc+1
+3564: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-26 dip 192.0.2.26 @ honk-routing.generated:27
+3659: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+3660: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+3661: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+3662: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3663: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3664: (05) goto pc+34
+3699: (b7) r0 = 0                     ; R0_w=0
+3700: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+3701: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+3702: (05) goto pc+1
+3704: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; initial-27 dip 192.0.2.27 @ honk-routing.generated:28
+3799: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+3800: (55) if r0 != 0x0 goto pc+42    ; R0=0
+3801: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+3802: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3803: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3804: (05) goto pc+34
+3839: (b7) r0 = 0                     ; R0_w=0
+3840: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+3841: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+3842: (05) goto pc+1
+3844: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-28 dip 192.0.2.28 @ honk-routing.generated:29
+3939: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+3940: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+3941: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+3942: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3943: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+3944: (05) goto pc+34
+3979: (b7) r0 = 0                     ; R0=0
+3980: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+3981: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+3982: (05) goto pc+1
+3984: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-29 dip 192.0.2.29 @ honk-routing.generated:30
+4079: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+4080: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+4081: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+4082: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4083: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4084: (05) goto pc+34
+4119: (b7) r0 = 0                     ; R0_w=0
+4120: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+4121: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+4122: (05) goto pc+1
+4124: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; initial-30 dip 192.0.2.30 @ honk-routing.generated:31
+4219: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+4220: (55) if r0 != 0x0 goto pc+42    ; R0=0
+4221: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+4222: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4223: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4224: (05) goto pc+34
+4259: (b7) r0 = 0                     ; R0_w=0
+4260: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+4261: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+4262: (05) goto pc+1
+4264: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-31 dip 192.0.2.31 @ honk-routing.generated:32
+4359: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+4360: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+4361: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+4362: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4363: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4364: (05) goto pc+34
+4399: (b7) r0 = 0                     ; R0=0
+4400: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+4401: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+4402: (05) goto pc+1
+4404: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-32 dip 192.0.2.32 @ honk-routing.generated:33
+4499: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+4500: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+4501: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+4502: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4503: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4504: (05) goto pc+34
+4539: (b7) r0 = 0                     ; R0_w=0
+4540: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+4541: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+4542: (05) goto pc+1
+4544: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; initial-33 dip 192.0.2.33 @ honk-routing.generated:34
+4639: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+4640: (55) if r0 != 0x0 goto pc+42    ; R0=0
+4641: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+4642: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4643: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4644: (05) goto pc+34
+4679: (b7) r0 = 0                     ; R0_w=0
+4680: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+4681: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+4682: (05) goto pc+1
+4684: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-34 dip 192.0.2.34 @ honk-routing.generated:35
+4779: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+4780: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+4781: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+4782: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4783: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4784: (05) goto pc+34
+4819: (b7) r0 = 0                     ; R0=0
+4820: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+4821: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+4822: (05) goto pc+1
+4824: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-35 dip 192.0.2.35 @ honk-routing.generated:36
+4919: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+4920: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+4921: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+4922: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4923: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+4924: (05) goto pc+34
+4959: (b7) r0 = 0                     ; R0_w=0
+4960: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+4961: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+4962: (05) goto pc+1
+4964: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; initial-36 dip 192.0.2.36 @ honk-routing.generated:37
+5059: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+5060: (55) if r0 != 0x0 goto pc+42    ; R0=0
+5061: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+5062: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5063: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5064: (05) goto pc+34
+5099: (b7) r0 = 0                     ; R0_w=0
+5100: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+5101: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+5102: (05) goto pc+1
+5104: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-37 dip 192.0.2.37 @ honk-routing.generated:38
+5199: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+5200: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+5201: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+5202: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5203: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5204: (05) goto pc+34
+5239: (b7) r0 = 0                     ; R0=0
+5240: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+5241: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+5242: (05) goto pc+1
+5244: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-38 dip 192.0.2.38 @ honk-routing.generated:39
+5339: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+5340: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+5341: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+5342: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5343: (15) if r0 == 0x2 goto pc+15    ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5344: (05) goto pc+34
+5379: (b7) r0 = 0                     ; R0_w=0
+5380: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+5381: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+5382: (05) goto pc+1
+5384: (15) if r0 == 0x0 goto pc+94    ; R0_w=0
+; initial-39 dip 192.0.2.39 @ honk-routing.generated:40
+5479: (61) r0 = *(u32 *)(r10 -28)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+5480: (55) if r0 != 0x0 goto pc+42    ; R0=0
+5481: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+5482: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5483: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5484: (05) goto pc+34
+5519: (b7) r0 = 0                     ; R0_w=0
+5520: (7b) *(u64 *)(r10 -8) = r0      ; R0_w=0 R10=fp0 fp-8_w=0
+5521: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+5522: (05) goto pc+1
+5524: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-40 dip 192.0.2.40 @ honk-routing.generated:41
+5619: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+5620: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+5621: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+5622: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5623: (15) if r0 == 0x2 goto pc+15    ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5624: (05) goto pc+34
+5659: (b7) r0 = 0                     ; R0=0
+5660: (7b) *(u64 *)(r10 -8) = r0      ; R0=0 R10=fp0 fp-8_w=0
+5661: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+5662: (05) goto pc+1
+5664: (15) if r0 == 0x0 goto pc+94    ; R0=0
+; initial-41 dip 192.0.2.41 @ honk-routing.generated:42
+5759: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+5760: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+5761: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+5762: (15) if r0 == 0x1 goto pc+2 5765: R0=1 R1=mem(sz=128) R2=mem(sz=20) R6=mem(sz=128) R7=mem(sz=20) R10=fp0 fp-8=0 fp-16=0 fp-24=0 fp-32=mmmmmmmm fp-40=0000????
+; initial-41 dip 192.0.2.41 @ honk-routing.generated:42
+5765: (62) *(u32 *)(r10 -64) = 32     ; R10=fp0 fp-64=????32
+5766: (62) *(u32 *)(r10 -60) = 0      ; R10=fp0 fp-64=0000mmmm
+5767: (62) *(u32 *)(r10 -56) = 0      ; R10=fp0 fp-56=????0
+5768: (62) *(u32 *)(r10 -52) = 0      ; R10=fp0 fp-56=0000mmmm
+5769: (62) *(u32 *)(r10 -48) = 0      ; R10=fp0 fp-48=????0
+5770: (bf) r2 = r6                    ; R2_w=mem(sz=128) R6=mem(sz=128)
+5771: (61) r3 = *(u32 *)(r2 +28)      ; R2_w=mem(sz=128) R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5772: (63) *(u32 *)(r10 -60) = r3     ; R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-64=mmmmmmmm
+5773: (18) r1 = 0xff1a54b047981a00    ; R1_w=map_ptr(map=standalone_lpm_,ks=20,vs=32)
+5775: (bf) r2 = r10                   ; R2_w=fp0 R10=fp0
+5776: (07) r2 += -64                  ; R2_w=fp-64
+5777: (85) call bpf_map_lookup_elem#1         ; R0_w=map_value_or_null(id=50140,map=standalone_lpm_,ks=20,vs=32)
+5778: (05) goto pc+21
+5800: (7b) *(u64 *)(r10 -8) = r0      ; R0=map_value_or_null(id=50140,map=standalone_lpm_,ks=20,vs=32) R10=fp0 fp-8_w=map_value_or_null(id=50140,map=standalone_lpm_,ks=20,vs=32)
+5801: (62) *(u32 *)(r10 -28) = 1      ; R10=fp0 fp-32=mmmmmmmm
+5802: (05) goto pc+1
+5804: (15) if r0 == 0x0 goto pc+94    ; R0=map_value(map=standalone_lpm_,ks=20,vs=32)
+5805: (61) r2 = *(u32 *)(r0 +4)       ; R0=map_value(map=standalone_lpm_,ks=20,vs=32) R2_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5806: (57) r2 &= 512                  ; R2_w=scalar(smin=smin32=0,smax=umax=smax32=umax32=512,var_off=(0x0; 0x200))
+5807: (55) if r2 != 0x0 goto pc+1 5809: R0=map_value(map=standalone_lpm_,ks=20,vs=32) R2_w=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=512,var_off=(0x0; 0x200)) R6=mem(sz=128) R7=mem(sz=20) R10=fp0 fp-8_w=map_value(map=standalone_lpm_,ks=20,vs=32) fp-16=0 fp-24=0 fp-32=mmmmmmmm fp-40=0000???? fp-48=????mmmm fp-56=mmmmmmmm fp-64=mmmmmmmm
+; initial-41 dip 192.0.2.41 @ honk-routing.generated:42
+5809: (61) r0 = *(u32 *)(r10 -32)     ; R0=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmmmmmm
+5810: (55) if r0 != 0x0 goto pc+42    ; R0=0
+5811: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+5812: (15) if r0 == 0x1 goto pc+2 5815: R0=1 R2=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=512,var_off=(0x0; 0x200)) R6=mem(sz=128) R7=mem(sz=20) R10=fp0 fp-8=map_value(map=standalone_lpm_,ks=20,vs=32) fp-16=0 fp-24=0 fp-32=mmmmmmmm fp-40=0000???? fp-48=????mmmm fp-56=mmmmmmmm fp-64=mmmmmmmm
+; initial-41 dip 192.0.2.41 @ honk-routing.generated:42
+5815: (62) *(u32 *)(r10 -64) = 32     ; R10=fp0 fp-64=mmmm32
+5816: (62) *(u32 *)(r10 -60) = 0      ; R10=fp0 fp-64=0000mmmm
+5817: (62) *(u32 *)(r10 -56) = 0      ; R10=fp0 fp-56=mmmm0
+5818: (62) *(u32 *)(r10 -52) = 0      ; R10=fp0 fp-56=0000mmmm
+5819: (62) *(u32 *)(r10 -48) = 0      ; R10=fp0 fp-48=????0
+5820: (bf) r2 = r6                    ; R2_w=mem(sz=128) R6=mem(sz=128)
+5821: (61) r3 = *(u32 *)(r2 +12)      ; R2_w=mem(sz=128) R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5822: (63) *(u32 *)(r10 -60) = r3     ; R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-64=mmmmmmmm
+5823: (18) r1 = 0xff1a54b047981800    ; R1_w=map_ptr(map=standalone_lpm_,ks=20,vs=32)
+5825: (bf) r2 = r10                   ; R2_w=fp0 R10=fp0
+5826: (07) r2 += -64                  ; R2_w=fp-64
+5827: (85) call bpf_map_lookup_elem#1         ; R0_w=map_value_or_null(id=50154,map=standalone_lpm_,ks=20,vs=32)
+5828: (05) goto pc+21
+5850: (7b) *(u64 *)(r10 -16) = r0     ; R0=map_value_or_null(id=50154,map=standalone_lpm_,ks=20,vs=32) R10=fp0 fp-16_w=map_value_or_null(id=50154,map=standalone_lpm_,ks=20,vs=32)
+5851: (62) *(u32 *)(r10 -32) = 1      ; R10=fp0 fp-32=mmmm1
+5852: (05) goto pc+1
+5854: (15) if r0 == 0x0 goto pc+44    ; R0=map_value(map=standalone_lpm_,ks=20,vs=32)
+5855: (61) r2 = *(u32 *)(r0 +4)       ; R0=map_value(map=standalone_lpm_,ks=20,vs=32) R2_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5856: (57) r2 &= 512                  ; R2_w=scalar(smin=smin32=0,smax=umax=smax32=umax32=512,var_off=(0x0; 0x200))
+5857: (55) if r2 != 0x0 goto pc+1 5859: R0=map_value(map=standalone_lpm_,ks=20,vs=32) R2=scalar(smin=umin=smin32=umin32=1,smax=umax=smax32=umax32=512,var_off=(0x0; 0x200)) R6=mem(sz=128) R7=mem(sz=20) R10=fp0 fp-8=map_value(map=standalone_lpm_,ks=20,vs=32) fp-16=map_value(map=standalone_lpm_,ks=20,vs=32) fp-24=0 fp-32=mmmm1 fp-40=0000???? fp-48=????mmmm fp-56=mmmmmmmm fp-64=mmmmmmmm
+; initial-41 dip 192.0.2.41 @ honk-routing.generated:42
+5859: (61) r0 = *(u32 *)(r10 -36)     ; R0_w=0 R10=fp0 fp-40=0000????
+5860: (55) if r0 != 0x0 goto pc+26    ; R0_w=0
+5861: (61) r0 = *(u32 *)(r6 +124)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+5862: (15) if r0 == 0x0 goto pc+20    ; R0_w=scalar(smin=umin=umin32=1,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5863: (62) *(u32 *)(r10 -64) = 128    ; R10=fp0 fp-64=mmmm128
+5864: (62) *(u32 *)(r10 -60) = 0      ; R10=fp0 fp-64=0000mmmm
+5865: (62) *(u32 *)(r10 -56) = 0      ; R10=fp0 fp-56=mmmm0
+5866: (62) *(u32 *)(r10 -52) = 0      ; R10=fp0 fp-56=0000mmmm
+5867: (62) *(u32 *)(r10 -48) = 0      ; R10=fp0 fp-48=????0
+5868: (bf) r2 = r6                    ; R2_w=mem(sz=128) R6=mem(sz=128)
+5869: (61) r3 = *(u32 *)(r2 +32)      ; R2_w=mem(sz=128) R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5870: (63) *(u32 *)(r10 -60) = r3     ; R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-64=mmmmmmmm
+5871: (61) r3 = *(u32 *)(r2 +36)      ; R2_w=mem(sz=128) R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5872: (63) *(u32 *)(r10 -56) = r3     ; R3_w=scalar(id=50159,smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-56=0000scalar(id=50159,smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5873: (61) r3 = *(u32 *)(r2 +40)      ; R2_w=mem(sz=128) R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5874: (63) *(u32 *)(r10 -52) = r3     ; R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-56=mmmmmmmm
+5875: (61) r3 = *(u32 *)(r2 +44)      ; R2_w=mem(sz=128) R3_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5876: (63) *(u32 *)(r10 -48) = r3     ; R3_w=scalar(id=50160,smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-48=????scalar(id=50160,smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5877: (18) r1 = 0xff1a54b047981e00    ; R1_w=map_ptr(map=standalone_lpm_,ks=20,vs=32)
+5879: (bf) r2 = r10                   ; R2_w=fp0 R10=fp0
+5880: (07) r2 += -64                  ; R2_w=fp-64
+5881: (85) call bpf_map_lookup_elem#1         ; R0=map_value_or_null(id=50161,map=standalone_lpm_,ks=20,vs=32)
+5882: (05) goto pc+1
+5884: (7b) *(u64 *)(r10 -24) = r0     ; R0=map_value_or_null(id=50161,map=standalone_lpm_,ks=20,vs=32) R10=fp0 fp-24_w=map_value_or_null(id=50161,map=standalone_lpm_,ks=20,vs=32)
+5885: (62) *(u32 *)(r10 -36) = 1      ; R10=fp0 fp-40=mmmm????
+5886: (05) goto pc+1
+5888: (15) if r0 == 0x0 goto pc+10 5899: R0=0 R6=mem(sz=128) R7=mem(sz=20) R10=fp0 fp-8=map_value(map=standalone_lpm_,ks=20,vs=32) fp-16=map_value(map=standalone_lpm_,ks=20,vs=32) fp-24_w=0 fp-32=mmmm1 fp-40=mmmm???? fp-48=????mmmm fp-56=mmmmmmmm fp-64=mmmmmmmm
+5899: (61) r0 = *(u32 *)(r10 -28)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R10=fp0 fp-32=mmmm1
+5900: (55) if r0 != 0x0 goto pc+42    ; R0_w=0
+5901: (61) r0 = *(u32 *)(r6 +108)     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff)) R6=mem(sz=128)
+5902: (15) if r0 == 0x1 goto pc+2     ; R0_w=scalar(smin=0,smax=umax=0xffffffff,var_off=(0x0; 0xffffffff))
+5903: (15) if r0 == 0x2 goto pc+15 5919: R0=2 R6=mem(sz=128) R7=mem(sz=20) R10=fp0 fp-8=map_value(map=standalone_lpm_,ks=20,vs=32) fp-16=map_value(map=standalone_lpm_,ks=20,vs=32) fp-24=0 fp-32=mmmm1 fp-40=mmmm???? fp-48=????mmmm fp-56=mmmmmmmm fp-64=mmmmmmmm
+5919: (62) *(u32 *)(r10 -64) = 128    ; R10=fp0 fp-64=mmmm128
+5920: (62) *(u32 *)(r10 -60) = 0      ; R10=fp0 fp-64=0000mmmm
+5921: (62) *(u32 *)(r10 -56) = 0      ; R10=fp0 fp-56=mmmm0
+5922: (62) *(u32 *)(r10 -52) = 0      ; R10=fp0 fp-56=0000mmmm
+5923: (62) *(u32 *)(r10 -48) = 0      ; R10=fp0 fp-48=????0
+5924: (bf) r2 = r6
+BPF program is too large. Processed 1000001 insn
+processed 1000001 insns (limit 1000000) max_states_per_insn 14 total_states 81216 peak_states 34249 mark_read 349
+
+FAILED
+
+failures:
+
+failures:
+    ebpf::real::routing::tests::predicate_bits_and_capacity_limits
+    ebpf::real::routing::tests::publication_failure_recovery_and_frozen_root
+
+test result: FAILED. 5 passed; 2 failed; 0 ignored; 0 measured; 1012 filtered out; finished in 163.03s
+

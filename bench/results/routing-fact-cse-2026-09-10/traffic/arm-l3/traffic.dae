@@ -1,0 +1,236 @@
+global {
+ lan_interface: cseg0
+ wan_interface: cseg1
+ dial_mode: ip
+ nfqueue_enable: false
+ auto_config_kernel_parameter: false
+ disable_waiting_network: true
+ data_dir: '/tmp/honk-cse.EEghAk/data'
+ tcp_check_url: 'http://198.19.243.2:18080/'
+ udp_check_dns: '198.19.243.2:53000'
+ check_interval: 3600s
+}
+node {
+ local: 'socks5://127.0.0.1:39080'
+}
+group {
+ proxy {
+  filter: name(local)
+  policy: fixed(0)
+ }
+}
+dns {
+ upstream {
+  local: 'udp://198.19.243.2:53000'
+ }
+ routing {
+  request {
+   fallback: local
+  }
+ }
+}
+routing {
+ dport(18083) -> direct(must)
+ dip(198.18.0.1, 2001:db8:ffff::0) -> block
+ sip(198.18.0.2, 2001:db8:fffe::0) -> block
+ mac(02:ff:00:00:00:00) -> block
+ dip(198.18.1.1, 2001:db8:ffff::1) -> block
+ sip(198.18.1.2, 2001:db8:fffe::1) -> block
+ mac(02:ff:00:00:00:01) -> block
+ dip(198.18.2.1, 2001:db8:ffff::2) -> block
+ sip(198.18.2.2, 2001:db8:fffe::2) -> block
+ mac(02:ff:00:00:00:02) -> block
+ dip(198.18.3.1, 2001:db8:ffff::3) -> block
+ sip(198.18.3.2, 2001:db8:fffe::3) -> block
+ mac(02:ff:00:00:00:03) -> block
+ dip(198.18.4.1, 2001:db8:ffff::4) -> block
+ sip(198.18.4.2, 2001:db8:fffe::4) -> block
+ mac(02:ff:00:00:00:04) -> block
+ dip(198.18.5.1, 2001:db8:ffff::5) -> block
+ sip(198.18.5.2, 2001:db8:fffe::5) -> block
+ mac(02:ff:00:00:00:05) -> block
+ dip(198.18.6.1, 2001:db8:ffff::6) -> block
+ sip(198.18.6.2, 2001:db8:fffe::6) -> block
+ mac(02:ff:00:00:00:06) -> block
+ dip(198.18.7.1, 2001:db8:ffff::7) -> block
+ sip(198.18.7.2, 2001:db8:fffe::7) -> block
+ mac(02:ff:00:00:00:07) -> block
+ dip(198.18.8.1, 2001:db8:ffff::8) -> block
+ sip(198.18.8.2, 2001:db8:fffe::8) -> block
+ mac(02:ff:00:00:00:08) -> block
+ dip(198.18.9.1, 2001:db8:ffff::9) -> block
+ sip(198.18.9.2, 2001:db8:fffe::9) -> block
+ mac(02:ff:00:00:00:09) -> block
+ dip(198.18.10.1, 2001:db8:ffff::a) -> block
+ sip(198.18.10.2, 2001:db8:fffe::a) -> block
+ mac(02:ff:00:00:00:0a) -> block
+ dip(198.18.11.1, 2001:db8:ffff::b) -> block
+ sip(198.18.11.2, 2001:db8:fffe::b) -> block
+ mac(02:ff:00:00:00:0b) -> block
+ dip(198.18.12.1, 2001:db8:ffff::c) -> block
+ sip(198.18.12.2, 2001:db8:fffe::c) -> block
+ mac(02:ff:00:00:00:0c) -> block
+ dip(198.18.13.1, 2001:db8:ffff::d) -> block
+ sip(198.18.13.2, 2001:db8:fffe::d) -> block
+ mac(02:ff:00:00:00:0d) -> block
+ dip(198.18.14.1, 2001:db8:ffff::e) -> block
+ sip(198.18.14.2, 2001:db8:fffe::e) -> block
+ mac(02:ff:00:00:00:0e) -> block
+ dip(198.18.15.1, 2001:db8:ffff::f) -> block
+ sip(198.18.15.2, 2001:db8:fffe::f) -> block
+ mac(02:ff:00:00:00:0f) -> block
+ dip(198.18.16.1, 2001:db8:ffff::10) -> block
+ sip(198.18.16.2, 2001:db8:fffe::10) -> block
+ mac(02:ff:00:00:00:10) -> block
+ dip(198.18.17.1, 2001:db8:ffff::11) -> block
+ sip(198.18.17.2, 2001:db8:fffe::11) -> block
+ mac(02:ff:00:00:00:11) -> block
+ dip(198.18.18.1, 2001:db8:ffff::12) -> block
+ sip(198.18.18.2, 2001:db8:fffe::12) -> block
+ mac(02:ff:00:00:00:12) -> block
+ dip(198.18.19.1, 2001:db8:ffff::13) -> block
+ sip(198.18.19.2, 2001:db8:fffe::13) -> block
+ mac(02:ff:00:00:00:13) -> block
+ dip(198.18.20.1, 2001:db8:ffff::14) -> block
+ sip(198.18.20.2, 2001:db8:fffe::14) -> block
+ mac(02:ff:00:00:00:14) -> block
+ dip(198.18.21.1, 2001:db8:ffff::15) -> block
+ sip(198.18.21.2, 2001:db8:fffe::15) -> block
+ mac(02:ff:00:00:00:15) -> block
+ dip(198.18.22.1, 2001:db8:ffff::16) -> block
+ sip(198.18.22.2, 2001:db8:fffe::16) -> block
+ mac(02:ff:00:00:00:16) -> block
+ dip(198.18.23.1, 2001:db8:ffff::17) -> block
+ sip(198.18.23.2, 2001:db8:fffe::17) -> block
+ mac(02:ff:00:00:00:17) -> block
+ dip(198.18.24.1, 2001:db8:ffff::18) -> block
+ sip(198.18.24.2, 2001:db8:fffe::18) -> block
+ mac(02:ff:00:00:00:18) -> block
+ dip(198.18.25.1, 2001:db8:ffff::19) -> block
+ sip(198.18.25.2, 2001:db8:fffe::19) -> block
+ mac(02:ff:00:00:00:19) -> block
+ dip(198.18.26.1, 2001:db8:ffff::1a) -> block
+ sip(198.18.26.2, 2001:db8:fffe::1a) -> block
+ mac(02:ff:00:00:00:1a) -> block
+ dip(198.18.27.1, 2001:db8:ffff::1b) -> block
+ sip(198.18.27.2, 2001:db8:fffe::1b) -> block
+ mac(02:ff:00:00:00:1b) -> block
+ dip(198.18.28.1, 2001:db8:ffff::1c) -> block
+ sip(198.18.28.2, 2001:db8:fffe::1c) -> block
+ mac(02:ff:00:00:00:1c) -> block
+ dip(198.18.29.1, 2001:db8:ffff::1d) -> block
+ sip(198.18.29.2, 2001:db8:fffe::1d) -> block
+ mac(02:ff:00:00:00:1d) -> block
+ dip(198.18.30.1, 2001:db8:ffff::1e) -> block
+ sip(198.18.30.2, 2001:db8:fffe::1e) -> block
+ mac(02:ff:00:00:00:1e) -> block
+ dip(198.18.31.1, 2001:db8:ffff::1f) -> block
+ sip(198.18.31.2, 2001:db8:fffe::1f) -> block
+ mac(02:ff:00:00:00:1f) -> block
+ dip(198.18.32.1, 2001:db8:ffff::20) -> block
+ sip(198.18.32.2, 2001:db8:fffe::20) -> block
+ mac(02:ff:00:00:00:20) -> block
+ dip(198.18.33.1, 2001:db8:ffff::21) -> block
+ sip(198.18.33.2, 2001:db8:fffe::21) -> block
+ mac(02:ff:00:00:00:21) -> block
+ dip(198.18.34.1, 2001:db8:ffff::22) -> block
+ sip(198.18.34.2, 2001:db8:fffe::22) -> block
+ mac(02:ff:00:00:00:22) -> block
+ dip(198.18.35.1, 2001:db8:ffff::23) -> block
+ sip(198.18.35.2, 2001:db8:fffe::23) -> block
+ mac(02:ff:00:00:00:23) -> block
+ dip(198.18.36.1, 2001:db8:ffff::24) -> block
+ sip(198.18.36.2, 2001:db8:fffe::24) -> block
+ mac(02:ff:00:00:00:24) -> block
+ dip(198.18.37.1, 2001:db8:ffff::25) -> block
+ sip(198.18.37.2, 2001:db8:fffe::25) -> block
+ mac(02:ff:00:00:00:25) -> block
+ dip(198.18.38.1, 2001:db8:ffff::26) -> block
+ sip(198.18.38.2, 2001:db8:fffe::26) -> block
+ mac(02:ff:00:00:00:26) -> block
+ dip(198.18.39.1, 2001:db8:ffff::27) -> block
+ sip(198.18.39.2, 2001:db8:fffe::27) -> block
+ mac(02:ff:00:00:00:27) -> block
+ dip(198.18.40.1, 2001:db8:ffff::28) -> block
+ sip(198.18.40.2, 2001:db8:fffe::28) -> block
+ mac(02:ff:00:00:00:28) -> block
+ dip(198.18.41.1, 2001:db8:ffff::29) -> block
+ sip(198.18.41.2, 2001:db8:fffe::29) -> block
+ mac(02:ff:00:00:00:29) -> block
+ dip(198.18.42.1, 2001:db8:ffff::2a) -> block
+ sip(198.18.42.2, 2001:db8:fffe::2a) -> block
+ mac(02:ff:00:00:00:2a) -> block
+ dip(198.18.43.1, 2001:db8:ffff::2b) -> block
+ sip(198.18.43.2, 2001:db8:fffe::2b) -> block
+ mac(02:ff:00:00:00:2b) -> block
+ dip(198.18.44.1, 2001:db8:ffff::2c) -> block
+ sip(198.18.44.2, 2001:db8:fffe::2c) -> block
+ mac(02:ff:00:00:00:2c) -> block
+ dip(198.18.45.1, 2001:db8:ffff::2d) -> block
+ sip(198.18.45.2, 2001:db8:fffe::2d) -> block
+ mac(02:ff:00:00:00:2d) -> block
+ dip(198.18.46.1, 2001:db8:ffff::2e) -> block
+ sip(198.18.46.2, 2001:db8:fffe::2e) -> block
+ mac(02:ff:00:00:00:2e) -> block
+ dip(198.18.47.1, 2001:db8:ffff::2f) -> block
+ sip(198.18.47.2, 2001:db8:fffe::2f) -> block
+ mac(02:ff:00:00:00:2f) -> block
+ dip(198.18.48.1, 2001:db8:ffff::30) -> block
+ sip(198.18.48.2, 2001:db8:fffe::30) -> block
+ mac(02:ff:00:00:00:30) -> block
+ dip(198.18.49.1, 2001:db8:ffff::31) -> block
+ sip(198.18.49.2, 2001:db8:fffe::31) -> block
+ mac(02:ff:00:00:00:31) -> block
+ dip(198.18.50.1, 2001:db8:ffff::32) -> block
+ sip(198.18.50.2, 2001:db8:fffe::32) -> block
+ mac(02:ff:00:00:00:32) -> block
+ dip(198.18.51.1, 2001:db8:ffff::33) -> block
+ sip(198.18.51.2, 2001:db8:fffe::33) -> block
+ mac(02:ff:00:00:00:33) -> block
+ dip(198.18.52.1, 2001:db8:ffff::34) -> block
+ sip(198.18.52.2, 2001:db8:fffe::34) -> block
+ mac(02:ff:00:00:00:34) -> block
+ dip(198.18.53.1, 2001:db8:ffff::35) -> block
+ sip(198.18.53.2, 2001:db8:fffe::35) -> block
+ mac(02:ff:00:00:00:35) -> block
+ dip(198.18.54.1, 2001:db8:ffff::36) -> block
+ sip(198.18.54.2, 2001:db8:fffe::36) -> block
+ mac(02:ff:00:00:00:36) -> block
+ dip(198.18.55.1, 2001:db8:ffff::37) -> block
+ sip(198.18.55.2, 2001:db8:fffe::37) -> block
+ mac(02:ff:00:00:00:37) -> block
+ dip(198.18.56.1, 2001:db8:ffff::38) -> block
+ sip(198.18.56.2, 2001:db8:fffe::38) -> block
+ mac(02:ff:00:00:00:38) -> block
+ dip(198.18.57.1, 2001:db8:ffff::39) -> block
+ sip(198.18.57.2, 2001:db8:fffe::39) -> block
+ mac(02:ff:00:00:00:39) -> block
+ dip(198.18.58.1, 2001:db8:ffff::3a) -> block
+ sip(198.18.58.2, 2001:db8:fffe::3a) -> block
+ mac(02:ff:00:00:00:3a) -> block
+ dip(198.18.59.1, 2001:db8:ffff::3b) -> block
+ sip(198.18.59.2, 2001:db8:fffe::3b) -> block
+ mac(02:ff:00:00:00:3b) -> block
+ dip(198.18.60.1, 2001:db8:ffff::3c) -> block
+ sip(198.18.60.2, 2001:db8:fffe::3c) -> block
+ mac(02:ff:00:00:00:3c) -> block
+ dip(198.18.61.1, 2001:db8:ffff::3d) -> block
+ sip(198.18.61.2, 2001:db8:fffe::3d) -> block
+ mac(02:ff:00:00:00:3d) -> block
+ dip(198.18.62.1, 2001:db8:ffff::3e) -> block
+ sip(198.18.62.2, 2001:db8:fffe::3e) -> block
+ mac(02:ff:00:00:00:3e) -> block
+ dip(198.18.63.1, 2001:db8:ffff::3f) -> block
+ sip(198.18.63.2, 2001:db8:fffe::3f) -> block
+ mac(02:ff:00:00:00:3f) -> block
+ dport(18080) -> direct(must)
+ dport(18081) -> proxy(must)
+ dport(18082) -> block
+ fallback: direct
+}
+experimental {
+ clash_api {
+  external_controller: '127.0.0.1:39990'
+  secret: 'cse-local-test'
+ }
+}

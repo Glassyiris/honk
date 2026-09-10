@@ -1,0 +1,26 @@
+{
+  "programs": [
+    "dst-0.new.bpf",
+    "dst-0.old.bpf",
+    "dst-1.new.bpf",
+    "dst-1.old.bpf",
+    "dst-4.new.bpf",
+    "dst-4.old.bpf",
+    "dst-16.new.bpf",
+    "dst-16.old.bpf",
+    "dst-64.new.bpf",
+    "dst-64.old.bpf",
+    "dst-256.new.bpf",
+    "dst-256.old.bpf",
+    "early-dst-16.new.bpf",
+    "early-dst-16.old.bpf",
+    "short-circuit-dst.new.bpf",
+    "short-circuit-dst.old.bpf",
+    "post-lookup-fail.new.bpf",
+    "post-lookup-fail.old.bpf",
+    "mixed.new.bpf",
+    "mixed.old.bpf"
+  ],
+  "result": "all bytes identical before/after category-index ownership cleanup",
+  "scope": "10 plan shapes, old/new emitters; no claim of arbitrary policy coverage"
+}
