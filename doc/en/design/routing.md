@@ -150,6 +150,15 @@ matching ancestor predicate bits, so longest-prefix lookup preserves ordered
 rule semantics. Facts use the complete `DomainRouting` bitmap within their own
 generation; a staged prefix cannot shadow facts from another generation.
 
+Within one invocation, a destination IP, source IP, or MAC category used by two
+or more conditions is looked up lazily at its first reached condition. Aligned
+stack slots retain the pointer (including NULL) and a separate readiness flag;
+each condition still tests its own positive bit before applying negation.
+Unused and single-use categories have no cache state. Early returns do not
+look up unreached categories, but repeated categories pay stack initialization.
+No fact pointer survives the invocation or crosses a generation. The entry
+domain lookup remains unchanged because it also determines `domain_final`.
+
 Fact preparation keeps hash-first duplicate coalescing, sorts only unique keys,
 and applies ancestor inheritance in the original vector before compacting its
 retained capacity. Assembler-owned ordinal labels identify internal branches;

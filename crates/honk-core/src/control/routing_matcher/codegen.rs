@@ -48,6 +48,50 @@ const MUST: i16 = std::mem::offset_of!(RoutingDecision, must) as i16;
 const DOMAIN_FINAL: i16 = std::mem::offset_of!(RoutingDecision, domain_final) as i16;
 const RULE_ID: i16 = std::mem::offset_of!(RoutingDecision, rule_id) as i16;
 
+#[derive(Clone, Copy)]
+enum FactKind {
+    Destination,
+    Source,
+    Mac,
+}
+
+impl FactKind {
+    fn of(predicate: &KernelPredicate) -> Option<Self> {
+        match predicate {
+            KernelPredicate::DestinationIp(_) => Some(Self::Destination),
+            KernelPredicate::SourceIp(_) => Some(Self::Source),
+            KernelPredicate::Mac(_) => Some(Self::Mac),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FactCache {
+    pointer: i16,
+    ready: i16,
+}
+
+fn fact_caches(plan: &RoutingPushPlan) -> [Option<FactCache>; 3] {
+    let mut uses = [0u8; 3];
+    for condition in plan.rules.iter().flat_map(|rule| &rule.conditions) {
+        if let Some(kind) = FactKind::of(&condition.predicate) {
+            let count = &mut uses[kind as usize];
+            *count = (*count + 1).min(2);
+        }
+    }
+    // Separate DW slots preserve ready constants on 6.12; packed W flags
+    // lose precision and exhaust the verifier budget on mixed 256-bit policies.
+    // Pairs occupy [-32, -1] and [-80, -65], outside both key buffers.
+    std::array::from_fn(|index| {
+        let pointer = [-16, -32, -80][index];
+        (uses[index] == 2).then_some(FactCache {
+            pointer,
+            ready: pointer + 8,
+        })
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RoutingMapFds {
     pub destination_v4: i32,
@@ -198,6 +242,10 @@ impl Assembler {
         self.emit(BPF_ST | BPF_W | BPF_MEM, dst, 0, off, imm)?;
         Ok(())
     }
+    fn st_dw_imm(&mut self, dst: u8, off: i16, imm: i32) -> anyhow::Result<()> {
+        self.emit(BPF_ST | BPF_DW | BPF_MEM, dst, 0, off, imm)?;
+        Ok(())
+    }
     fn call(&mut self, helper: i32) -> anyhow::Result<()> {
         self.emit(BPF_JMP | BPF_CALL, 0, 0, 0, helper)?;
         Ok(())
@@ -246,6 +294,12 @@ pub fn emit_routing_program(
     )?;
     asm.st_imm(R7, RULE_ID, u32::MAX as i32)?;
 
+    let caches = fact_caches(plan);
+    for cache in caches.iter().flatten() {
+        asm.st_dw_imm(R10, cache.pointer, 0)?;
+        asm.st_dw_imm(R10, cache.ready, 0)?;
+    }
+
     if plan.has_domain_rules {
         write_domain_key_from_input(&mut asm)?;
         load_map_fd(&mut asm, fds.domain)?;
@@ -264,7 +318,7 @@ pub fn emit_routing_program(
         let fail = asm.label();
         for condition in &rule.conditions {
             let pass = asm.label();
-            emit_condition(&mut asm, condition, pass, fail, &fds)?;
+            emit_condition(&mut asm, condition, pass, fail, &fds, &caches)?;
             asm.bind(pass);
         }
         asm.st_imm(R7, OUTBOUND, rule.outbound as i32)?;
@@ -385,11 +439,12 @@ fn emit_condition(
     pass: Label,
     fail: Label,
     fds: &RoutingMapFds,
+    caches: &[Option<FactCache>; 3],
 ) -> anyhow::Result<()> {
     if condition.not {
-        emit_predicate(asm, &condition.predicate, fail, pass, fds)
+        emit_predicate(asm, &condition.predicate, fail, pass, fds, caches)
     } else {
-        emit_predicate(asm, &condition.predicate, pass, fail, fds)
+        emit_predicate(asm, &condition.predicate, pass, fail, fds, caches)
     }
 }
 
@@ -399,37 +454,28 @@ fn emit_predicate(
     on_true: Label,
     on_false: Label,
     fds: &RoutingMapFds,
+    caches: &[Option<FactCache>; 3],
 ) -> anyhow::Result<()> {
     match predicate {
         KernelPredicate::Domain(id) => {
-            emit_domain_bit(asm, *id, on_true, on_false)?;
+            emit_bitmap_bit(asm, R8, *id, on_true, on_false)?;
         }
         KernelPredicate::DestinationIp(id) => {
-            emit_family_map_bit(
+            emit_fact_bit(
                 asm,
+                FactKind::Destination,
                 *id,
-                fds.destination_v4,
-                fds.destination_v6,
+                caches,
                 on_true,
                 on_false,
-                INPUT_DST_IP,
+                fds,
             )?;
         }
         KernelPredicate::SourceIp(id) => {
-            emit_family_map_bit(
-                asm,
-                *id,
-                fds.source_v4,
-                fds.source_v6,
-                on_true,
-                on_false,
-                INPUT_SRC_IP,
-            )?;
+            emit_fact_bit(asm, FactKind::Source, *id, caches, on_true, on_false, fds)?;
         }
         KernelPredicate::Mac(id) => {
-            asm.ldx_w(R0, R6, INPUT_MAC_PRESENT)?;
-            asm.jump(BPF_JEQ, R0, 0, on_false)?;
-            emit_lpm_bit(asm, fds.mac, *id, 128, INPUT_MAC, on_true, on_false)?;
+            emit_fact_bit(asm, FactKind::Mac, *id, caches, on_true, on_false, fds)?;
         }
         KernelPredicate::DestinationPort(ranges) => {
             emit_port_ranges(asm, ranges, INPUT_DST_PORT, on_true, on_false)?;
@@ -548,62 +594,98 @@ fn emit_process_names(
     Ok(())
 }
 
-fn emit_domain_bit(
+fn emit_bitmap_bit(
     asm: &mut Assembler,
+    pointer: u8,
     id: u32,
     on_true: Label,
     on_false: Label,
 ) -> anyhow::Result<()> {
-    asm.jump(BPF_JEQ, R8, 0, on_false)?;
-    asm.ldx_w(R2, R8, (id / 32 * 4) as i16)?;
+    asm.jump(BPF_JEQ, pointer, 0, on_false)?;
+    asm.ldx_w(R2, pointer, (id / 32 * 4) as i16)?;
     asm.and_imm(R2, (1u32 << (id % 32)) as i32)?;
     asm.jump(BPF_JNE, R2, 0, on_true)?;
     asm.ja(on_false)?;
     Ok(())
 }
 
-fn emit_family_map_bit(
+fn emit_fact_bit(
     asm: &mut Assembler,
+    kind: FactKind,
     id: u32,
-    v4_fd: i32,
-    v6_fd: i32,
+    caches: &[Option<FactCache>; 3],
     on_true: Label,
     on_false: Label,
-    input_offset: i16,
+    fds: &RoutingMapFds,
 ) -> anyhow::Result<()> {
-    asm.ldx_w(R0, R6, INPUT_VERSION)?;
-    let v4 = asm.label();
-    let v6 = asm.label();
-    asm.jump(BPF_JEQ, R0, 1, v4)?;
-    asm.jump(BPF_JEQ, R0, 2, v6)?;
-    asm.ja(on_false)?;
-    asm.bind(v4);
-    emit_lpm_bit(asm, v4_fd, id, 32, input_offset + 12, on_true, on_false)?;
-    asm.bind(v6);
-    emit_lpm_bit(asm, v6_fd, id, 128, input_offset, on_true, on_false)?;
+    if let Some(cache) = caches[kind as usize] {
+        let reuse = asm.label();
+        let ready = asm.label();
+        asm.ldx_dw(R0, R10, cache.ready)?;
+        asm.jump(BPF_JNE, R0, 0, reuse)?;
+        emit_fact_lookup(asm, kind, fds)?;
+        asm.stx_dw(R10, R0, cache.pointer)?;
+        asm.st_dw_imm(R10, cache.ready, 1)?;
+        asm.ja(ready)?;
+        asm.bind(reuse);
+        asm.ldx_dw(R0, R10, cache.pointer)?;
+        asm.bind(ready);
+    } else {
+        emit_fact_lookup(asm, kind, fds)?;
+    }
+    emit_bitmap_bit(asm, R0, id, on_true, on_false)
+}
+
+fn emit_fact_lookup(
+    asm: &mut Assembler,
+    kind: FactKind,
+    fds: &RoutingMapFds,
+) -> anyhow::Result<()> {
+    let absent = asm.label();
+    let done = asm.label();
+    match kind {
+        FactKind::Mac => {
+            asm.ldx_w(R0, R6, INPUT_MAC_PRESENT)?;
+            asm.jump(BPF_JEQ, R0, 0, absent)?;
+            emit_lpm_lookup(asm, fds.mac, 128, INPUT_MAC)?;
+            asm.ja(done)?;
+        }
+        FactKind::Destination | FactKind::Source => {
+            let (v4_fd, v6_fd, input_offset) = match kind {
+                FactKind::Destination => (fds.destination_v4, fds.destination_v6, INPUT_DST_IP),
+                _ => (fds.source_v4, fds.source_v6, INPUT_SRC_IP),
+            };
+            let v4 = asm.label();
+            let v6 = asm.label();
+            asm.ldx_w(R0, R6, INPUT_VERSION)?;
+            asm.jump(BPF_JEQ, R0, 1, v4)?;
+            asm.jump(BPF_JEQ, R0, 2, v6)?;
+            asm.ja(absent)?;
+            asm.bind(v4);
+            emit_lpm_lookup(asm, v4_fd, 32, input_offset + 12)?;
+            asm.ja(done)?;
+            asm.bind(v6);
+            emit_lpm_lookup(asm, v6_fd, 128, input_offset)?;
+            asm.ja(done)?;
+        }
+    }
+    asm.bind(absent);
+    asm.mov_imm(R0, 0)?;
+    asm.bind(done);
     Ok(())
 }
 
-fn emit_lpm_bit(
+fn emit_lpm_lookup(
     asm: &mut Assembler,
     fd: i32,
-    id: u32,
     prefix_len: u32,
     input_offset: i16,
-    on_true: Label,
-    on_false: Label,
 ) -> anyhow::Result<()> {
     write_key_from_input(asm, input_offset, prefix_len)?;
     load_map_fd(asm, fd)?;
     asm.mov_reg(R2, R10)?;
     asm.add_imm(R2, STACK_KEY as i32)?;
-    asm.call(MAP_LOOKUP_ELEM)?;
-    asm.jump(BPF_JEQ, R0, 0, on_false)?;
-    asm.ldx_w(R2, R0, (id / 32 * 4) as i16)?;
-    asm.and_imm(R2, (1u32 << (id % 32)) as i32)?;
-    asm.jump(BPF_JNE, R2, 0, on_true)?;
-    asm.ja(on_false)?;
-    Ok(())
+    asm.call(MAP_LOOKUP_ELEM)
 }
 
 fn write_key_from_input(
