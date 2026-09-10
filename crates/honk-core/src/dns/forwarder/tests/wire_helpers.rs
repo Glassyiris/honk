@@ -114,13 +114,6 @@ fn test_build_and_parse_roundtrip() {
 }
 
 #[test]
-fn test_effective_cache_ttl_override() {
-    assert_eq!(effective_cache_ttl(600, 30), 600);
-    assert_eq!(effective_cache_ttl(0, 30), 30);
-    assert_eq!(effective_cache_ttl(0, 0), 1);
-}
-
-#[test]
 fn test_rewrite_answer_ttls_overrides_wire() {
     let mut resp = make_a_response([1, 2, 3, 4], 30);
     assert_eq!(extract_min_ttl(&resp), 30);

@@ -4,7 +4,8 @@ use super::super::effective_expiry;
 use super::ExecutionContext;
 use crate::dns::cache::{CacheKey, ExactLookup, OperationKind};
 use crate::dns::forwarder::{
-    DnsForwardError, ResolveMode, extract_min_ttl, extract_soa_negative_ttl, rewrite_answer_ttls,
+    DnsForwardError, ResolveMode, extract_min_ttl, extract_min_ttl_including_zero,
+    extract_soa_negative_ttl, rewrite_answer_ttls,
 };
 use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeStatus, Provenance, ResponseClass};
 
@@ -167,11 +168,12 @@ pub(super) async fn store(
             EffectiveExpiry::cacheable(std::time::Duration::from_secs(u64::from(ttl)))
         }
     } else {
-        effective_expiry(
-            fixed_ttl,
-            context.forwarder.cache_ttl,
-            extract_min_ttl(lifetime_wire),
-        )
+        let answer_ttl = if class == ResponseClass::Positive && rcode == 0 {
+            extract_min_ttl_including_zero(lifetime_wire)
+        } else {
+            extract_min_ttl(lifetime_wire)
+        };
+        effective_expiry(fixed_ttl, context.forwarder.cache_ttl, answer_ttl)
     };
     if !expiry.is_cacheable() {
         if context.forwarder.cache_enabled {

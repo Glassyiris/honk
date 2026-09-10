@@ -622,10 +622,9 @@ mod ttl;
 use message::new_asis_socket_with_mark;
 pub use message::{build_dns_query, extract_answer_ips, parse_dns_question};
 pub(crate) use response::{is_filtered_qtype, make_empty_response};
-#[cfg(test)]
-use ttl::effective_cache_ttl;
 pub(crate) use ttl::{
-    extract_min_ttl, extract_soa_negative_ttl, rewrite_answer_ttls, traversal_strings,
+    extract_min_ttl, extract_min_ttl_including_zero, extract_soa_negative_ttl, rewrite_answer_ttls,
+    traversal_strings,
 };
 
 #[cfg(test)]

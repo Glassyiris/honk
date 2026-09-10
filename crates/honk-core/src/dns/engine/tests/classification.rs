@@ -47,3 +47,10 @@ fn fixed_zero_disables_cache_instead_of_clamping_to_one() {
     // Then
     assert!(!expiry.is_cacheable());
 }
+
+#[test]
+fn configured_ttl_overrides_zero_upstream_ttl() {
+    let expiry = effective_expiry(None, 600, 0);
+    assert!(expiry.is_cacheable());
+    assert_eq!(expiry.ttl(), std::time::Duration::from_secs(600));
+}

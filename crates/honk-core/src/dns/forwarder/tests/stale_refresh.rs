@@ -569,6 +569,42 @@ async fn foreground_nxdomain_retires_expired_positive() {
 }
 
 #[tokio::test]
+async fn foreground_zero_ttl_positive_retires_expired_positive() {
+    let query = make_a_query();
+    let upstream = Arc::new(RefreshFenceUpstream {
+        initial: make_a_response([192, 0, 2, 1], 1),
+        refreshed: make_a_response([192, 0, 2, 2], 0),
+        later: RefreshFenceLater::Error,
+        call_count: AtomicUsize::new(0),
+        refresh_entered: tokio::sync::Notify::new(),
+        refresh_release: tokio::sync::Semaphore::new(0),
+    });
+    let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router())
+        .with_cache_ttl(0);
+    forwarder.resolve_outcome(&query).await.expect("initial");
+    forwarder
+        .cache_service()
+        .await
+        .expire_positive_exact_for_test(&resolve_cache_key(&query));
+    upstream.refresh_release.add_permits(1);
+
+    let replacement = forwarder
+        .resolve_outcome(&query)
+        .await
+        .expect("zero-TTL positive");
+    assert_eq!(
+        replacement.answer_ips(),
+        &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2))]
+    );
+    assert!(!replacement.expiry().is_cacheable());
+    let error = forwarder
+        .resolve_outcome(&query)
+        .await
+        .expect_err("superseded positive must not be served");
+    assert!(matches!(error.unshared(), DnsForwardError::Exchange { .. }));
+}
+
+#[tokio::test]
 async fn owning_refresh_publishes_a_changed_positive() {
     let query = make_a_query();
     let upstream = Arc::new(RefreshFenceUpstream {

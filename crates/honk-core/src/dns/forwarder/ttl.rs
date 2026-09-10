@@ -1,15 +1,6 @@
 use crate::dns::planner::ResponseTraversal;
 use crate::dns::wire::skip_dns_name;
 
-#[cfg(test)]
-pub(super) fn effective_cache_ttl(configured: u32, answer_min_ttl: u32) -> u32 {
-    if configured > 0 {
-        configured
-    } else {
-        answer_min_ttl.max(1)
-    }
-}
-
 pub(crate) fn traversal_strings(traversal: &ResponseTraversal) -> Vec<String> {
     traversal
         .path()
@@ -115,6 +106,15 @@ pub(crate) fn rewrite_answer_ttls(data: &mut [u8], ttl: u32) {
 /// Extract the minimum positive TTL from DNS records, excluding EDNS OPT
 /// pseudo-records. Returns 60 if no TTL is found.
 pub(crate) fn extract_min_ttl(data: &[u8]) -> u32 {
+    extract_min_ttl_inner::<false>(data)
+}
+
+/// Extract the minimum non-OPT record TTL, including zero. Returns 60 if absent.
+pub(crate) fn extract_min_ttl_including_zero(data: &[u8]) -> u32 {
+    extract_min_ttl_inner::<true>(data)
+}
+
+fn extract_min_ttl_inner<const INCLUDE_ZERO: bool>(data: &[u8]) -> u32 {
     if data.len() < 12 {
         return 60;
     }
@@ -153,6 +153,9 @@ pub(crate) fn extract_min_ttl(data: &[u8]) -> u32 {
         // Record layout after NAME: TYPE(2) CLASS(2) TTL(4) RDLENGTH(2) RDATA(n)
         let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
         let ttl = u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
+        if INCLUDE_ZERO && rtype != 41 && ttl == 0 {
+            return 0;
+        }
         if rtype != 41 && ttl > 0 && ttl < min_ttl {
             min_ttl = ttl;
         }

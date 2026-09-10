@@ -181,6 +181,8 @@ cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
 
 Request 路由先于缓存查询执行。缓存与后台 refresh 的标识使用选中的上游或精确 `asis` 目的地址，而不是原始客户端来源：选择相同交换 scope 的客户端共享条目，选择不同上游或 `asis` 目的地址的客户端仍相互隔离。偏好地址族的渲染继续保留来源元数据，因此依赖来源的 sibling 策略不会经 foreground singleflight 泄漏。
 
+设置 `optimistic_cache_ttl: 0` 且没有 `fixed_domain_ttl` 覆盖时，NOERROR 正应答使用 answer、authority 和 additional 段中所有非 OPT 记录的最小 TTL。任一记录 TTL 为零时，honk 不缓存该应答，并移除精确缓存槽，避免旧地址或更早的负应答再次返回。非零的配置 TTL 或固定 TTL 仍可覆盖零值。其他失败响应码的 TTL 行为不变。
+
 ### 负应答
 
 NXDOMAIN 的缓存时间为 `min(SOA TTL, SOA MINIMUM, 300)` 秒。缺少 SOA 或 SOA 生命周期为零时不缓存，并移除精确缓存键下已有的正、负缓存，避免旧地址再次作为过期应答返回。前台结果替换当时已有的发布结果；后台刷新只移除开始时读取的版本。`fixed_domain_ttl: 0` 禁止缓存，但不移除已有条目。除此之外，SERVFAIL 仍使用 SOA 得出的生命周期，缺省为 60 秒，并限制在 `1..=300` 秒。
