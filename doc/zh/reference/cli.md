@@ -72,7 +72,7 @@ UDP NFQUEUE 没有环境变量开关，默认由 `global.nfqueue_enable` 开启�
 | Pin 根目录 | `--bpf-pin-root PATH` | 默认 `/sys/fs/bpf`，传给真实后端用于 pin map。 |
 | Bypass mark | 编译期常量 | `DAE_BYPASS_MARK = 0x100`；控制面拨号、探测与 DNS 上游 socket 使用该值以避免再次拦截。 |
 | TPROXY mark | 编译期常量与配置校验 | `TPROXY_MARK = 0x08000000`；`global.tproxy_mark` 必须等于该值。 |
-| Geo 资源 | 运行时路径搜索 | 依次检查 `DAE_LOCATION_ASSET`、`global.data_dir`、旧根目录 `/var/share/honk`、工作目录、`/usr/local/share/honk`、`/usr/share/honk`、`/usr/local/share/dae`、`/usr/share/dae`、`/etc/dae`；每个候选都必须是普通文件。见[全局配置参考](./global.md)。 |
+| Geo 资源 | 运行时路径搜索 | 依次检查 `DAE_LOCATION_ASSET`、[`global.data_dir`](./global.md)、旧根目录 `/var/share/honk`、工作目录、`/usr/local/share/honk`、`/usr/share/honk`、`/usr/local/share/dae`、`/usr/share/dae`、`/etc/dae`；每个候选都必须是普通文件。 |
 
 ## `honk-tool`
 
@@ -117,6 +117,7 @@ scp target/x86_64-unknown-linux-musl/release/honk-tool root@GATEWAY:/tmp/
 
 ```text
 honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
+              [--udp-check HOST[:PORT]]
               [--timeout SECS] [--concurrency N] [--limit N] [--ua UA]
               [--tls-implementation tls|utls] [--utls-imitate PROFILE]
               [--v4-target IP:PORT] [--v6-target [IP]:PORT]
@@ -125,7 +126,8 @@ honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
 | `<url\|file\|->` | 必填 | HTTP(S) 订阅 URL、已有本地订阅文件，或 `-`。`-` 从 stdin 读取且只接受一个 HTTP(S) 订阅 URL；不会从 stdin 读取订阅正文。 |
-| `--target HOST:PORT` | `cp.cloudflare.com:443` | 地址族连通性探测与 QUIC 探测使用的主机。 |
+| `--target HOST:PORT` | `cp.cloudflare.com:443` | 主机用于地址族探测的 HTTPS 请求 URL（TLS SNI 和 Host 标头）；主机和端口用于 QUIC 探测。未指定 `--v4-target`/`--v6-target` 地址覆盖时，地址族探测解析此主机并使用此端口。UDP DNS 探测目标由 `--udp-check` 单独指定。 |
+| `--udp-check HOST[:PORT]` | `dns.google:53`、`8.8.8.8`、`2001:4860:4860::8888` | UDP DNS 检查目标，默认取自 `honk-config` 中的引擎列表。可重复指定或用逗号分隔。优先采用首个可解析为 IP 地址或套接字地址的目标，否则仅在节点支持 UDP DNS 探测时解析列表首项。省略端口时使用 `53`。 |
 | `--url TEST_URL` | `https://www.gstatic.com/generate_204` | 经代理的 URLTest 目标。 |
 | `--timeout SECS` | `5` | 每项探测的超时。 |
 | `--concurrency N` | `10` | 同时进行的节点探测任务上限。 |
@@ -139,6 +141,10 @@ honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
 远程订阅与本地文件共享引擎的自动格式识别：编码/原始分享链接、Clash YAML/JSON、SIP008、sing-box JSON，以及受支持的 Surge/Surfboard/Loon/Quantumult X 记录。不支持的节点会被跳过，不打印原始输入。使用 `-` 可避免把含凭据的 provider URL 放入 argv 和进程列表。
 
 对每个节点，命令报告服务端地址族、完整的代理 IPv4/IPv6 交换、代理 URLTest 延迟、经 packet handler 的 DNS 查询，以及经该 handler 的真实 QUIC 握手。VMess、legacy VLESS 及 `network` 排除 UDP 的节点，其 UDP 显示 `n/a`；非 legacy VLESS 模式使用其配置的 packet transport。
+
+UDP DNS 目标解析、packet transport 建立、发送与接收共用一个 `--timeout` 预算。解析失败或超时只体现在 DNS 列，TCP、URLTest 和 QUIC 探测继续进行。不支持 UDP 的节点跳过该解析；主机名解析失败时不会替换为另一个目标。
+
+UDP DNS 主机名目标使用共享异步解析器，读取 `/etc/resolv.conf` 中首个数字形式的 nameserver（UDP 端口 `53`），并在 `/etc/hosts` 存在时加载它，不执行阻塞的 NSS 查询。此路径不应用 NSS 插件或解析器搜索后缀。解析器不可用时，DNS 列报告 `resolve`，不会回退到公共解析器；字面量目标不需要解析器。
 
 VLESS 输出被严格限制为显示名称与规范化的承载、传输和 wire shape。资格状态码为 `supported`、`invalid-uuid`、`invalid-reality`、`invalid-config`、`unsupported-transport`、`unsupported-flow`、`vision-without-tls`、`vision-non-tcp`；探测失败码仅有 `resolve`、`timeout`、`exchange`、`handler`。凭据、端点详情、SNI、REALITY key、URL query 数据和原始错误绝不会输出。
 

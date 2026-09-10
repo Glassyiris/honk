@@ -1272,7 +1272,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     sighup_handle.abort();
     let _ = sig_handle.await;
     let _ = sighup_handle.await;
-    debug_assert_eq!(subscription_supervisor.shutdown().await, 0);
+    let remaining_subscription_tasks = subscription_supervisor.shutdown().await;
+    debug_assert_eq!(remaining_subscription_tasks, 0);
     info!("honk-core stopped");
 
     control_result

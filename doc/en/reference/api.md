@@ -30,8 +30,8 @@ The table follows the router in `crates/honk-core/src/clash_api.rs`.
 | GET | `/proxies` | Return every node and group plus the synthetic `GLOBAL` selector. |
 | GET | `/proxies/{name}` | Return one node, group, or `GLOBAL` selector. |
 | PUT | `/proxies/{name}` | Select a direct member of a Selector group with `{"name":"member"}`; also mutates the synthetic `GLOBAL` selector. Automatic groups, including Score, reject writes. |
-| GET | `/proxies/{name}/delay` | Run an on-demand URL delay test for a node or group. Already-warm transports are reused; every cold reusable session or QUIC client is warmed in a throwaway runtime before timing. |
-| GET | `/group/{name}/delay` | Test all group members concurrently (maximum 10) and return successful member delays with the same timing semantics. |
+| GET | `/proxies/{name}/delay` | Run an on-demand proxied delay test against the caller's `?url=` for a node or group. Already-warm transports are reused; every cold reusable session or QUIC client is warmed in a throwaway runtime before timing. |
+| GET | `/group/{name}/delay` | Test all group members against the caller's `?url=` with up to `URLTEST_MAX_CONCURRENT` (10) proxied dials, returning successful member delays with the same timing semantics. |
 | GET | `/rules` | Return one row per route. Simple matchers use native Clash rule types; compound, negated, and `must` rules use `complex` with the full dae statement. |
 | GET | `/connections` | Return a connection snapshot, or stream snapshots after a WebSocket upgrade. |
 | DELETE | `/connections` | Close all tracked connections. |
@@ -39,7 +39,7 @@ The table follows the router in `crates/honk-core/src/clash_api.rs`.
 | GET | `/traffic` | Stream per-second traffic JSON over WebSocket or chunked JSON lines. |
 | GET | `/memory` | Stream process RSS JSON over WebSocket or chunked JSON lines. |
 | GET | `/stats` | Return the userspace outbound, ready-pool, warm-resource, Score selection-reason, and UDP snapshot documented below. |
-| GET | `/logs` | Stream tracing events over WebSocket or chunked JSON lines; `?level=` defaults to `info`. |
+| GET | `/logs` | Stream tracing events over WebSocket or chunked JSON lines from one shared 256-slot broadcast queue; `?level=` defaults to `info`. |
 | GET | `/dns/query` | Resolve `?name=` through honk DNS and return DoH-style JSON; `?type=` defaults to `A`. |
 | POST | `/cache/fakeip/flush` | Flush persisted FakeIP-prefixed cache entries when the cache database exists. |
 | POST | `/cache/dns/flush` | Flush the live DNS cache and its persisted DNS state. |
@@ -47,9 +47,11 @@ The table follows the router in `crates/honk-core/src/clash_api.rs`.
 | GET | `/providers/rules` | Return the current stub document `{"providers":[]}`. |
 | GET | `/ui`, `/ui/*` | Redirect `/ui` to `/ui/` and serve the configured external UI directory. |
 
-`/traffic`, `/memory`, and `/logs` send one JSON document per line for a plain HTTP GET. `/logs` installs dynamic tracing interest only while subscribers exist; with no subscribers, the Clash tracing layer does not format events.
+`/traffic`, `/memory`, and `/logs` send one JSON document per line for a plain HTTP GET. `/logs` installs dynamic tracing interest only while subscribers exist; with no subscribers, the Clash tracing layer does not format events. Each subscriber's level filter runs after the shared queue. Lagged clients skip overwritten events without a gap marker.
 
 ### Delay measurement
+
+The caller selects the test URL with `?url=`. A group request fans out to at most `URLTEST_MAX_CONCURRENT` (10) proxied measurements at once.
 
 Delay tests report one warm-path round trip through the node: the proxy dial, target TLS handshake, and a first throwaway request are untimed setup, and only the second request on the established connection (`HEAD /`, or an HTTP/2 request when h2 is negotiated) is measured, through receipt of its response headers. A second request that fails or times out falls back to the first exchange's time. Each phase — transport warm-up, dial, target TLS, warm-up request, measured request — is bounded by its own copy of the requested timeout, so slow phases fail (or fall back) individually instead of one shared clock killing slow-but-working measurements. Cold reusable transports—AnyTLS, VLESS H2MUX/Mux.Cool, Hysteria2, TUIC, and Juicity—first establish their session or QUIC client in a temporary runtime before the measured exchange. The temporary runtime closes afterward, so scanning a large group does not leave reusable state per tested node resident.
 
@@ -78,6 +80,8 @@ The mode update goes through `DatapathFlagsHandle`, the sole serialized writer f
 ## External UI hosting
 
 Set `experimental.clash_api.external_ui` to serve a static dashboard directory. If the directory is missing or empty, honk starts a background ZIP download; startup does not wait, and the static route returns `404` until files are available. `external_ui_download_url` replaces the built-in zashboard URL, while `HONK_UI_DOWNLOAD_URL` remains the highest-precedence override.
+
+Every download hop accepts only HTTP(S), with at most five redirects and a 128 MiB limit on the downloaded ZIP body. HTTPS-to-HTTP redirects and IP-literal hosts are allowed; each hop still follows routing or the explicit `external_ui_download_detour`.
 
 A non-empty `external_ui_download_detour` forces the initial request and redirects through that node or group. When empty, each URL follows honk's current traffic routing decision: `direct` uses the direct HTTP client, `block` aborts, and a proxy result uses the selected outbound leaf. Each direct or proxied HTTP exchange reports the real host/IP, port, setup, first response, bytes, and terminal outcome to its traversed Score groups; paths that traverse no Score group create no score reporter or cell. Download or extraction failures are logged and do not stop the engine.
 

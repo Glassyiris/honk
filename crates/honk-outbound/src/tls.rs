@@ -1044,6 +1044,9 @@ mod pin_tests {
             err.to_string().contains("invalid tls_pin_sha256"),
             "bad pin must be a hard error: {err}"
         );
+
+        let node = Node::from_share_link("trojan://pw@example.com:443?pinSHA256=").unwrap();
+        assert!(build_connector(&node).is_err());
     }
 
     #[test]

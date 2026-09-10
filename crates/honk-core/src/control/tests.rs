@@ -221,6 +221,47 @@ async fn network_refresh_retry_exits_when_control_plane_is_gone() {
     retry.await.expect("retry task exits on a closed channel");
 }
 
+#[tokio::test(start_paused = true)]
+async fn startup_failure_drops_saturated_control_receiver() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut config = Config::default();
+    config.dns.bind = format!("tcp://{}", listener.local_addr().unwrap());
+    let mut control_plane = ControlPlane::new(
+        config,
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        Router::new(&[], "direct").unwrap(),
+        Arc::new(ProxyRegistry::default_resolver().unwrap()),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default()).unwrap(),
+        udp_test_forwarder(),
+    )
+    .unwrap();
+
+    let command_tx = control_plane.command_sender();
+    for _ in 0..command_tx.max_capacity() {
+        command_tx.send(ControlCommand::Shutdown).await.unwrap();
+    }
+    let mut blocked_delivery = std::pin::pin!(command_tx.send(ControlCommand::Shutdown));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut blocked_delivery)
+            .await
+            .is_err(),
+        "the producer must be backpressured before startup fails"
+    );
+
+    control_plane
+        .run()
+        .await
+        .expect_err("occupied dns.bind must fail startup");
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), blocked_delivery)
+            .await
+            .expect("receiver drop must wake the blocked producer")
+            .is_err(),
+        "the abandoned producer must observe the closed control channel"
+    );
+}
+
 #[test]
 fn test_build_dns_probe_query() {
     let q = build_dns_probe_query();

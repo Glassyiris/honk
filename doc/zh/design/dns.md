@@ -91,9 +91,9 @@ LAN 客户端 -> dnsmasq :53 -> 127.0.0.1:54 -> Honk DNS 策略/上游
 | 阶段 | 不变量 |
 | --- | --- |
 | 1. 准入与 generation | `DnsController` 固定一个 runtime，取得该代的 owned query permit；UDP 入口同时取得该代的 UDP permit。每代 2,048 查询的 permit 一直保留到应答完成；饱和时降级为 `REFUSED`。 |
-| 2. 解析与校验 | adapter 要求一条完整请求。`DnsEngine` 解析 wire，拒绝没有可用问题或有多个问题的请求，将 qname 规范化为小写，并记录入口 profile。 |
+| 2. 解析与校验 | adapter 要求一条完整请求。`DnsEngine` 解析 wire，拒绝没有可用问题或有多个问题的请求，生成小写的路由域名而不改变 qname 的大小写，并记录入口 profile。 |
 | 3. 地址族 gate 与 hosts | `ipv4only`/`ipv6only` 在 hosts 或上游工作前，以 NODATA 拒绝另一地址族。除此之外，不可变 hosts 快照先于请求路由、缓存与上游交换执行。 |
-| 4. 请求规划 | 按源码顺序的请求规则依据规范 qname、QTYPE 与逻辑客户端来源选择 reject、`asis` 或命名上游。首条命中。 |
+| 4. 请求规划 | 按源码顺序的请求规则依据路由域名、QTYPE 与逻辑客户端来源选择 reject、`asis` 或命名上游。首条命中。 |
 | 5. 复用 | 符合资格的请求先查询精确身份的正/负缓存；未命中时共用一次 singleflight 交换。不符合资格的请求绕过两者。 |
 | 6. 交换 | 请求 scope 选择拦截所得目的地址或某个 `UpstreamPool` transport。 |
 | 7. 响应规划 | 策略使用每个上游响应前，都会严格核对其与查询是否匹配。响应规则执行 accept、reject 或经命名上游重新查询；遍历无环且最多包含三个上游。 |
@@ -185,9 +185,9 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 | UDP | 每个直连上游一个由 generation 持有的 connected socket 与 receive task；`TC` fallback 由 TCP 池处理。 | 配置代理时，查询会刻意由池化 TCP-DNS 承载。 |
 | TCP | RFC 7766 空闲 stream 池。 | 支持经所选节点或组叶子。 |
 | DoT | 空闲 TLS stream 池。 | 支持经代理 TCP 基础 stream。 |
-| DoH | 一个长生命周期、可复用并发请求的 HTTP/2-only TLS session。 | 支持经代理 TCP 基础 stream。 |
+| DoH | 一个长生命周期、可复用并发请求的 HTTP/2-only TLS session。 | HTTP/2 会话可经由代理 TCP 连接建立。 |
 | DoQ | 一个长生命周期 QUIC connection；每个查询一条双向 stream。 | 支持经所选叶节点的 `PacketTransport`。 |
-| DoH3 | 一个长生命周期 QUIC 与 HTTP/3 session。 | 支持经所选叶节点的 `PacketTransport`。 |
+| DoH3 | 一个长生命周期 QUIC 与 HTTP/3 session。 | QUIC 会话可使用所选叶节点的 `PacketTransport`。 |
 
 代理 DoQ 与 DoH3 会把 generation 固定的叶节点 `PacketTransport` 适配为 quinn `AsyncUdpSocket`。每个池化 QUIC connection 或 HTTP/3 session 持有一个有界 adapter 与 client endpoint，直到 retry 或 shutdown 将其关闭；datagram 边界和 peer 元数据保持不变，内层 QUIC payload 上限为 1252 bytes。缺少代理 registry 或 packet capability 时会 fail closed，不会绕过为直连。直连 QUIC 仍复用带 bypass mark 的原生 endpoint。
 
@@ -217,7 +217,7 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 
 worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired state，并自行调度剩余已就绪工作，不必等待下一次 DNS observation。过时 key 优先于新增项进入批次；已写入的投影达到 IP 上限后，新增 DNS key 必须等待删除确认，删除失败期间也不释放额度。失败写入保持 dirty，并以有界退避重试。批次修改 backend 前，worker 获取 backend lock，并在持有 publication fence 时重新检查 generation。reload 在同一个 backend lock 下安装替换投影快照。因此，旧批次在替换 generation 发布后既不能进入，也不能继续修改 map。
 
-重试唤醒与批次准入共用同一个带容量判断的逐 IP deadline；投影已满时，过期但无法准入的新增项不会在删除退避期间空转。成功 reload 会先把新 map 实际安装的完整 IP 集合记为 applied，再协调当前 owner，包括加载期间已到期的 owner。worker 的 map 写入与确认保持在同一个 generation fence 内，旧完成事件不能覆盖新发布的记账。保留物理 map 的 reload 也保留原有 applied 状态。
+重试唤醒与批次准入共用同一个带容量判断的逐 IP deadline；投影已满时，过期但无法准入的新增项不会在删除退避期间空转。成功 reload 会先把实际写入新 map 的完整 IP 集合记为 applied，再协调当前 owner，包括加载期间已到期的 owner。worker 的 map 写入与确认保持在同一个 generation fence 内，旧完成事件不能覆盖新发布的记账。保留物理 map 的 reload 也保留原有 applied 状态。
 
 增量确认将成功写入与当前期望位图或缺失状态比较，不保留历史 IP revision 账本。owner 的 TTL sequence 与策略 generation 仍分别保护各自的边界。
 

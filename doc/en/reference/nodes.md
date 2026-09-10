@@ -59,7 +59,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `plugin` / `plugin_opts` | string? | null | Parsed SIP002 plugin metadata; subscription import rejects non-empty values because proxy plugins are unsupported |
 | `transport` | string | `"tcp"` | Stream transport; validated as empty/`tcp`, `ws`, or `grpc` |
 | `tls` | bool | `false` | Stream TLS flag; Trojan/AnyTLS links enable it, canonical VLESS links historically default on |
-| `sni` | string? | null | TLS server name from `sni`, then `peer`, then an unconsumed `host` query |
+| `sni` | string? | null | TLS server name from the first nonempty `sni`, then `peer`, then an unconsumed `host` query |
 | `tls_alpn` | string[] | `[]` | Structured/imported ordinary raw-TCP TLS ALPN; empty preserves the TLS profile default. Nonempty values are supported for AnyTLS and TCP Trojan/VMess/VLESS, not disabled TLS, REALITY, WS/gRPC, or QUIC. TUIC retains `tuic_alpn`; this is not a share-link query. |
 | `skip_cert_verify` | bool | `false` | `allowInsecure`, `allow_insecure`, or `insecure` equal to `1`/`true` |
 | `ech_enabled` | bool | `false` | Static ECH config present, or `ech=1`/`true` |
@@ -68,7 +68,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `reality_public_key` | string? | null | REALITY X25519 public key from `pbk` |
 | `reality_short_id` | string? | null | REALITY short ID from `sid` |
 | `reality_spider_x` | string? | null | Stored `spx`; a REALITY link defaults it to `/` |
-| `flow` | string? | null | VLESS flow from `flow` or Shadowrocket `xtls=2`; only `xtls-rprx-vision` is supported |
+| `flow` | string? | null | VLESS flow from nonempty `flow` or Shadowrocket `xtls=2`; only `xtls-rprx-vision` is supported |
 | `network` | string? | null | Protocol network/capability hint; VMess JSON `net` and subscription import populate it |
 | `ws_path` / `ws_host` | string? | null | WebSocket `path` and Host header |
 | `grpc_service` | string? | null | gRPC `serviceName` or `service_name` |

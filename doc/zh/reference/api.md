@@ -30,8 +30,8 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 | GET | `/proxies` | 返回所有节点和组，以及合成的 `GLOBAL` Selector。 |
 | GET | `/proxies/{name}` | 返回一个节点、组或 `GLOBAL` Selector。 |
 | PUT | `/proxies/{name}` | 用 `{"name":"member"}` 选择 Selector 组的直接成员；也可修改合成的 `GLOBAL` Selector。包括 Score 在内的自动组会拒绝写入。 |
-| GET | `/proxies/{name}/delay` | 对节点或组执行按需 URL 延迟测试。已热 transport 会复用；每个冷可复用 session 或 QUIC client 都会先在临时 runtime 中预热，再开始计时。 |
-| GET | `/group/{name}/delay` | 最多并发 10 个任务测试全部组成员，并以相同计时语义返回成功成员的延迟。 |
+| GET | `/proxies/{name}/delay` | 使用调用方的 `?url=`，对节点或组执行按需代理延迟测试。已预热的传输会复用；每个尚未预热的可复用会话或 QUIC 客户端都会先在临时运行时中预热，再开始计时。 |
+| GET | `/group/{name}/delay` | 使用调用方的 `?url=` 测试全部组成员，最多并发 `URLTEST_MAX_CONCURRENT`（10）次代理拨号，并以相同计时语义返回成功成员的延迟。 |
 | GET | `/rules` | 每条路由返回一行。简单 matcher 使用原生 Clash rule type；组合、取反和 `must` 规则使用 `complex`，并保留完整 dae 语句。 |
 | GET | `/connections` | 返回连接快照；WebSocket upgrade 后改为推送快照。 |
 | DELETE | `/connections` | 关闭所有已跟踪连接。 |
@@ -39,7 +39,7 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 | GET | `/traffic` | 通过 WebSocket 或分块 JSON 行推送每秒流量。 |
 | GET | `/memory` | 通过 WebSocket 或分块 JSON 行推送进程 RSS。 |
 | GET | `/stats` | 返回下文所述的用户态出站、ready pool、热资源、Score 选路原因和 UDP 快照。 |
-| GET | `/logs` | 通过 WebSocket 或分块 JSON 行推送 tracing event；`?level=` 默认为 `info`。 |
+| GET | `/logs` | 通过 WebSocket 或分块 JSON 行推送 tracing 事件；所有订阅者共用一个 256 槽位的广播队列，`?level=` 默认为 `info`。 |
 | GET | `/dns/query` | 经 honk DNS 解析 `?name=` 并返回 DoH 风格 JSON；`?type=` 默认为 `A`。 |
 | POST | `/cache/fakeip/flush` | cache database 存在时，清除持久化的 FakeIP 前缀条目。 |
 | POST | `/cache/dns/flush` | 清除存活 DNS cache 及其持久化 DNS 状态。 |
@@ -47,9 +47,11 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 | GET | `/providers/rules` | 返回当前空桩文档 `{"providers":[]}`。 |
 | GET | `/ui`, `/ui/*` | 将 `/ui` 重定向到 `/ui/`，并提供已配置的外部 UI 目录。 |
 
-对普通 HTTP GET，`/traffic`、`/memory` 和 `/logs` 每行发送一个 JSON 文档。`/logs` 仅在存在 subscriber 时安装动态 tracing interest；没有 subscriber 时，Clash tracing layer 不会格式化 event。
+对普通 HTTP GET，`/traffic`、`/memory` 和 `/logs` 每行发送一个 JSON 文档。`/logs` 只在存在订阅者时启用动态 `tracing` 事件过滤；无订阅者时，Clash 日志层不格式化事件。每个订阅者的级别过滤发生在共享队列之后。订阅者落后时会跳过被覆盖的事件，且不会收到事件丢失标记。
 
 ### 延迟测量
+
+调用方通过 `?url=` 指定测试 URL。组请求最多同时执行 `URLTEST_MAX_CONCURRENT`（10）项经代理的测量。
 
 延迟测试报告的是节点热路径上的一个 round trip：代理拨号、目标站 TLS 握手与第一个探路请求都不计时，只测量已建立连接上的第二个请求（`HEAD /`；ALPN 协商出 h2 时为 HTTP/2 请求），到收到响应 header 为止。第二个请求失败或超时时，回退为第一个交换的耗时。预热、拨号、目标 TLS、探路请求、正式测量各自使用一份指定的 timeout 预算，慢节点按阶段失败（或回退），而不是共用一个时钟拖垮整个测量。冷可复用 transport——AnyTLS、VLESS H2MUX/Mux.Cool、Hysteria2、TUIC 与 Juicity——先在临时 runtime 中建立 session 或 QUIC client，再执行测量。临时 runtime 随后关闭，因此扫描大组不会为每个已测试节点留下常驻可复用状态。
 
@@ -78,6 +80,8 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 ## 外部 UI hosting
 
 设置 `experimental.clash_api.external_ui` 以提供静态 dashboard 目录。目录缺失或为空时，honk 会在后台下载 ZIP；启动不会等待，文件可用前静态路由返回 `404`。`external_ui_download_url` 会替换内建 zashboard URL，`HONK_UI_DOWNLOAD_URL` 则保持最高覆盖优先级。
+
+每次下载请求（含重定向）只接受 HTTP(S)，最多跟随五次重定向，下载的 ZIP 正文上限为 128 MiB。允许 HTTPS 降级到 HTTP，也允许 URL 直接使用 IP 地址；每一跳仍遵循路由或指定的 `external_ui_download_detour`。
 
 非空 `external_ui_download_detour` 会强制初始请求和 redirect 都经过该节点或组。该字段为空时，每个 URL 遵循 honk 当前的流量路由决策：`direct` 使用直连 HTTP client，`block` 中止下载，proxy 结果使用选中的出站叶节点。每次直连或经代理且实际经过 Score 组的 HTTP exchange，都会向路径经过的 Score 组报告真实 host/IP、端口、setup、首响应、字节与终态；其他路径不创建评分 reporter 或 cell。下载或解压失败只写日志，不会停止引擎。
 

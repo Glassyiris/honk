@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! honk-tool — CLI toolbox for honk diagnostics.
 //!
 //! Currently implemented: `sub` (subscription availability check),

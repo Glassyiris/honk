@@ -6,7 +6,7 @@
 //! measurement (`urltest_node`).
 
 use std::io::Read as _;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,7 @@ use honk_config::Config;
 use honk_config::node::{Node, WireMode};
 use honk_config::subscription::Subscription;
 use honk_config::types::{NodeProtocol, SubscriptionType};
+use honk_core::dns::DnsResolver;
 use honk_core::proxy::ProxyRegistry;
 use honk_core::subscription::SubscriptionManager;
 use honk_outbound::reality::parse_reality_config;
@@ -84,6 +85,14 @@ pub struct SubArgs {
     /// Test target for proxied connectivity/latency (host:port).
     #[arg(long, default_value = "cp.cloudflare.com:443")]
     pub target: String,
+    /// UDP DNS check targets; repeat the flag or separate targets with commas.
+    #[arg(
+        long,
+        value_name = "HOST[:PORT]",
+        value_delimiter = ',',
+        default_values_t = honk_config::config::GlobalConfig::default().udp_check_dns
+    )]
+    pub udp_check: Vec<String>,
     /// Latency-test URL (defaults to https://www.gstatic.com/generate_204).
     #[arg(long)]
     pub url: Option<String>,
@@ -139,7 +148,23 @@ pub async fn run(args: SubArgs) -> anyhow::Result<()> {
 
     let registry = Arc::new(ProxyRegistry::default_resolver()?);
     let (url_host, url_port) = split_host_port(&args.target)?;
+    let udp_dns = parse_udp_check_target(&args.udp_check)?;
+    let dns_resolver = if matches!(&udp_dns, UdpCheckTarget::Host { .. }) {
+        system_dns_resolver().map(Arc::new)
+    } else {
+        None
+    };
     let timeout = Duration::from_secs(args.timeout);
+    let targets = Arc::new(ProbeTargets {
+        host: url_host.to_string(),
+        port: url_port,
+        url: args.url,
+        timeout,
+        v4: args.v4_target,
+        v6: args.v6_target,
+        udp_dns,
+        dns_resolver,
+    });
 
     let mut set = tokio::task::JoinSet::new();
     let mut pending = nodes.into_iter();
@@ -151,14 +176,7 @@ pub async fn run(args: SubArgs) -> anyhow::Result<()> {
             && let Some(node) = pending.next()
         {
             let registry = Arc::clone(&registry);
-            let targets = Arc::new(ProbeTargets {
-                host: url_host.to_string(),
-                port: url_port,
-                url: args.url.clone(),
-                timeout,
-                v4: args.v4_target,
-                v6: args.v6_target,
-            });
+            let targets = Arc::clone(&targets);
             set.spawn(async move { probe_node(&registry, node, &targets).await });
             running += 1;
         }
@@ -378,6 +396,8 @@ struct ProbeTargets {
     timeout: Duration,
     v4: Option<SocketAddr>,
     v6: Option<SocketAddr>,
+    udp_dns: UdpCheckTarget,
+    dns_resolver: Option<Arc<DnsResolver>>,
 }
 
 async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets) -> ProbeOutcome {
@@ -422,8 +442,14 @@ async fn probe_supported_node(
             targets.timeout,
             targets.v6,
         ),
-        probe_udp_dns(registry, node, targets.timeout),
-        probe_udp_quic(registry, node, &targets.host, 443, targets.timeout),
+        probe_udp_dns(
+            registry,
+            node,
+            &targets.udp_dns,
+            targets.dns_resolver.as_deref(),
+            targets.timeout,
+        ),
+        probe_udp_quic(registry, node, &targets.host, targets.port, targets.timeout),
         probe_urltest(
             registry,
             node,
@@ -615,6 +641,96 @@ fn split_host_port(s: &str) -> anyhow::Result<(&str, u16)> {
     Ok((host, port.parse()?))
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum UdpCheckTarget {
+    Literal(SocketAddr),
+    Host { host: String, port: u16 },
+}
+
+fn parse_udp_check_target(targets: &[String]) -> anyhow::Result<UdpCheckTarget> {
+    for target in targets {
+        let target = target.trim();
+        if let Ok(address) = target.parse::<SocketAddr>() {
+            return Ok(UdpCheckTarget::Literal(address));
+        }
+        if let Ok(ip) = target.parse::<IpAddr>() {
+            return Ok(UdpCheckTarget::Literal(SocketAddr::new(ip, 53)));
+        }
+    }
+    let target = targets
+        .first()
+        .map(String::as_str)
+        .context("--udp-check requires at least one target")?
+        .trim();
+    let endpoint = honk_core::dns::endpoint::DnsEndpoint::parse(
+        target,
+        honk_config::types::DnsProtocol::Udp,
+        None,
+    )?;
+    Ok(UdpCheckTarget::Host {
+        host: endpoint.host,
+        port: endpoint.port,
+    })
+}
+
+// Avoid uncancellable getaddrinfo work and public-resolver fallback.
+fn system_dns_resolver() -> Option<DnsResolver> {
+    let contents = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    let server = contents.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next()? != "nameserver" {
+            return None;
+        }
+        fields
+            .next()?
+            .parse::<IpAddr>()
+            .ok()
+            .map(|ip| SocketAddr::new(ip, 53))
+    })?;
+    let mut config = honk_config::dns::DnsConfig {
+        upstream: vec![honk_config::dns::DnsUpstream {
+            name: "system".into(),
+            address: server.to_string(),
+            protocol: honk_config::types::DnsProtocol::Udp,
+            tls_server_name: None,
+            outbound: None,
+        }],
+        ..Default::default()
+    };
+    config.routing.fallback = "system".into();
+    if std::path::Path::new(honk_config::dns::SYSTEM_HOSTS_PATH).is_file() {
+        config
+            .hosts
+            .push(honk_config::dns::SYSTEM_HOSTS_PATH.into());
+    }
+    DnsResolver::new(&config).ok()
+}
+
+async fn resolve_udp_check_target(
+    target: &UdpCheckTarget,
+    resolver: Option<&DnsResolver>,
+) -> Result<SocketAddr, ProbeFailureKind> {
+    match target {
+        UdpCheckTarget::Literal(address) => Ok(*address),
+        UdpCheckTarget::Host { host, port } => {
+            let Some(resolver) = resolver else {
+                return Err(ProbeFailureKind::Resolve);
+            };
+            let resolved = resolver
+                .resolve(host)
+                .await
+                .map_err(|_| ProbeFailureKind::Resolve)?;
+            resolved
+                .ipv4
+                .into_iter()
+                .chain(resolved.ipv6)
+                .next()
+                .map(|ip| SocketAddr::new(ip, *port))
+                .ok_or(ProbeFailureKind::Resolve)
+        }
+    }
+}
+
 /// Tiny xorshift PRNG seeded from the clock (avoids a rand dependency for the
 /// two probe packet builders).
 fn next_rand(state: &mut u64) -> u64 {
@@ -633,32 +749,7 @@ fn rand_seed() -> u64 {
         .unwrap_or(0x9e3779b97f4a7c15)
 }
 
-/// UDP probe: one minimal DNS A query through the node's UDP transport.
-/// Proves the node's UDP relay path end to end (mirrors the engine's
-/// `probe_node_udp` health check).
-async fn probe_udp_dns(
-    registry: &ProxyRegistry,
-    node: &Node,
-    timeout: Duration,
-) -> Option<Result<Duration, ProbeFailureKind>> {
-    let Some(entry) = registry.find(node.protocol()) else {
-        return Some(Err(ProbeFailureKind::Handler));
-    };
-    if !(entry.descriptor.supports_udp)(node) {
-        return None;
-    }
-    let packet = entry.packet.as_ref()?;
-    let dns_server = SocketAddr::from(([8, 8, 8, 8], 53));
-    let transport = match packet
-        .dial_udp_transport(node, dns_server, None, timeout)
-        .await
-    {
-        Ok(transport) => transport,
-        Err(_) => return Some(Err(ProbeFailureKind::Exchange)),
-    };
-
-    let mut rng = rand_seed();
-    let id = next_rand(&mut rng) as u16;
+fn build_dns_probe_query(id: u16) -> Vec<u8> {
     let mut query = vec![
         (id >> 8) as u8,
         id as u8,
@@ -670,25 +761,61 @@ async fn probe_udp_dns(
         0x00,
         0x00,
         0x00,
+        0x00,
+        0x00,
     ];
     for label in ["google", "com"] {
         query.push(label.len() as u8);
         query.extend_from_slice(label.as_bytes());
     }
     query.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
+    query
+}
 
-    let start = Instant::now();
-    if transport.send_packet(&query).await.is_err() {
-        return Some(Err(ProbeFailureKind::Exchange));
+/// UDP probe: one minimal DNS A query through the node's UDP transport.
+/// Proves the node's UDP relay path end to end (mirrors the engine's
+/// `probe_node_udp` health check).
+async fn probe_udp_dns(
+    registry: &ProxyRegistry,
+    node: &Node,
+    target: &UdpCheckTarget,
+    resolver: Option<&DnsResolver>,
+    timeout: Duration,
+) -> Option<Result<Duration, ProbeFailureKind>> {
+    let Some(entry) = registry.find(node.protocol()) else {
+        return Some(Err(ProbeFailureKind::Handler));
+    };
+    if !(entry.descriptor.supports_udp)(node) {
+        return None;
     }
-    let mut buf = [0u8; 512];
-    match tokio::time::timeout(timeout, transport.recv_packet(&mut buf)).await {
-        Ok(Ok((n, _))) if n >= 2 && buf[0] == query[0] && buf[1] == query[1] => {
-            Some(Ok(start.elapsed()))
+    let packet = entry.packet.as_ref()?;
+    let result = tokio::time::timeout(timeout, async {
+        let dns_server = resolve_udp_check_target(target, resolver).await?;
+        let transport = packet
+            .dial_udp_transport(node, dns_server, None, timeout)
+            .await
+            .map_err(|_| ProbeFailureKind::Exchange)?;
+
+        let mut rng = rand_seed();
+        let id = next_rand(&mut rng) as u16;
+        let query = build_dns_probe_query(id);
+
+        let start = Instant::now();
+        transport
+            .send_packet(&query)
+            .await
+            .map_err(|_| ProbeFailureKind::Exchange)?;
+        let mut buf = [0u8; 512];
+        match transport.recv_packet(&mut buf).await {
+            Ok((n, _)) if n >= 2 && buf[0] == query[0] && buf[1] == query[1] => Ok(start.elapsed()),
+            Ok(_) | Err(_) => Err(ProbeFailureKind::Exchange),
         }
-        Ok(Ok(_)) | Ok(Err(_)) => Some(Err(ProbeFailureKind::Exchange)),
-        Err(_) => Some(Err(ProbeFailureKind::Timeout)),
-    }
+    })
+    .await;
+    Some(match result {
+        Ok(result) => result,
+        Err(_) => Err(ProbeFailureKind::Timeout),
+    })
 }
 
 /// UDP probe for QUIC: run a real QUIC handshake through the node's UDP
@@ -755,6 +882,132 @@ async fn probe_udp_quic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn udp_check_target_prefers_literals_and_defaults_to_dns_port() {
+        for (targets, expected) in [
+            (vec!["1.2.3.4"], "1.2.3.4:53"),
+            (vec!["2001:db8::1"], "[2001:db8::1]:53"),
+            (vec!["[2001:db8::1]:5353"], "[2001:db8::1]:5353"),
+            (vec!["my.dns.invalid", "9.9.9.9"], "9.9.9.9:53"),
+        ] {
+            let targets = targets.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(
+                parse_udp_check_target(&targets).unwrap(),
+                UdpCheckTarget::Literal(expected.parse().unwrap())
+            );
+        }
+        assert_eq!(
+            parse_udp_check_target(&["my.dns.invalid:5353".to_string()]).unwrap(),
+            UdpCheckTarget::Host {
+                host: "my.dns.invalid".into(),
+                port: 5353,
+            }
+        );
+        assert!(parse_udp_check_target(&[]).is_err());
+        assert!(parse_udp_check_target(&[String::new()]).is_err());
+    }
+
+    fn silent_dns_resolver(address: SocketAddr) -> DnsResolver {
+        let mut config = honk_config::dns::DnsConfig {
+            upstream: vec![honk_config::dns::DnsUpstream {
+                name: "test".into(),
+                address: address.to_string(),
+                protocol: honk_config::types::DnsProtocol::Udp,
+                tls_server_name: None,
+                outbound: None,
+            }],
+            ..Default::default()
+        };
+        config.routing.fallback = "test".into();
+        DnsResolver::new(&config).unwrap()
+    }
+
+    fn direct_node() -> Node {
+        let mut node = Node {
+            name: "direct-test".into(),
+            host: "127.0.0.1".into(),
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Direct),
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        node
+    }
+
+    #[tokio::test]
+    async fn udp_dns_resolution_timeout_does_not_abort_unrelated_probe() {
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let closed_port = tokio::net::TcpSocket::new_v4().unwrap();
+        closed_port.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = closed_port.local_addr().unwrap();
+        let targets = ProbeTargets {
+            host: address.ip().to_string(),
+            port: address.port(),
+            url: Some(format!("http://{address}/")),
+            timeout: Duration::from_millis(40),
+            v4: Some(address),
+            v6: Some(address),
+            udp_dns: UdpCheckTarget::Host {
+                host: "dns.test".into(),
+                port: 53,
+            },
+            dns_resolver: Some(Arc::new(silent_dns_resolver(sink.local_addr().unwrap()))),
+        };
+        let registry = ProxyRegistry::default_resolver().unwrap();
+        let outcome = probe_node(&registry, direct_node(), &targets).await;
+        assert_eq!(outcome.udp_dns, Some(Err(ProbeFailureKind::Timeout)));
+        assert_eq!(outcome.urltest, Some(Err(ProbeFailureKind::Exchange)));
+        assert_eq!(outcome.v4, Some(Err(ProbeFailureKind::Exchange)));
+    }
+
+    #[tokio::test]
+    async fn udp_dns_without_system_resolver_reports_resolve() {
+        let registry = ProxyRegistry::default_resolver().unwrap();
+        let node = direct_node();
+        let target = UdpCheckTarget::Host {
+            host: "dns.test".into(),
+            port: 53,
+        };
+        assert_eq!(
+            probe_udp_dns(&registry, &node, &target, None, Duration::from_millis(40),).await,
+            Some(Err(ProbeFailureKind::Resolve))
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_ineligible_node_skips_dns_target_resolution() {
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resolver = silent_dns_resolver(sink.local_addr().unwrap());
+        let target = UdpCheckTarget::Host {
+            host: "dns.test".into(),
+            port: 53,
+        };
+        let registry = ProxyRegistry::default_resolver().unwrap();
+        assert_eq!(
+            probe_udp_dns(
+                &registry,
+                &vless_node(),
+                &target,
+                Some(&resolver),
+                Duration::from_millis(40),
+            )
+            .await,
+            None
+        );
+        let mut packet = [0u8; 512];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), sink.recv(&mut packet))
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn dns_probe_query_has_full_header_and_google_a_question() {
+        let query = build_dns_probe_query(0x1234);
+        assert_eq!(&query[..12], &[0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&query[12..], b"\x06google\x03com\x00\x00\x01\x00\x01");
+    }
 
     fn vless_node() -> Node {
         Node {

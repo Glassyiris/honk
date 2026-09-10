@@ -266,6 +266,56 @@ fn combined_exact_lookup_preserves_precedence_and_counts_once() {
 }
 
 #[test]
+fn exact_negative_hit_promotes_before_same_shard_eviction() {
+    let cache = DnsCache::new(32);
+    let shard_count = cache.shard_capacities().len() as u64;
+    let scope = RequestScope::Upstream(UpstreamTag::new("default").expect("scope"));
+    let keys: Vec<_> = (0u16..=u16::MAX)
+        .map(|index| {
+            CacheKey::for_test(
+                index.to_be_bytes().to_vec(),
+                IngressProfile::Internal,
+                scope.clone(),
+                OperationKind::Resolve,
+            )
+        })
+        .filter(|key| key.shard_hash() % shard_count == 0)
+        .take(3)
+        .collect();
+    assert_eq!(keys.len(), 3, "need three exact keys in one shard");
+
+    let negative = keys[0].clone();
+    let positive = keys[1].clone();
+    let eviction = keys[2].clone();
+    let service = cache.service();
+    service.put_negative_exact(negative.clone(), 60, 3);
+    service.put_exact(
+        positive.clone(),
+        make_test_response([192, 0, 2, 1], 300),
+        300,
+        None,
+    );
+
+    for _ in 0..3 {
+        assert!(matches!(
+            service.lookup_exact(&negative, true),
+            ExactLookup::Negative(hit) if hit.rcode == 3
+        ));
+    }
+
+    service.put_exact(eviction, make_test_response([192, 0, 2, 2], 300), 300, None);
+
+    assert!(matches!(
+        service.lookup_exact(&negative, true),
+        ExactLookup::Negative(hit) if hit.rcode == 3
+    ));
+    assert!(matches!(
+        service.lookup_exact(&positive, true),
+        ExactLookup::Miss
+    ));
+}
+
+#[test]
 fn conditional_publication_rejects_stale_revision_after_each_publication() {
     let key = CacheKey::new(
         &QueryContext::parse(&crate::dns::forwarder::build_dns_query(

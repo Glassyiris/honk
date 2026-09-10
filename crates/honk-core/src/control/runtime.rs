@@ -334,6 +334,7 @@ impl ControlPlane {
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
+        let mut rx = self.command_rx.take().expect("command_rx already taken");
         let config = self.config.read().await;
         let mut subscription_authorizations =
             crate::subscription::SubscriptionAuthorizations::new(&config.subscriptions)?;
@@ -785,7 +786,6 @@ impl ControlPlane {
             warn!(%error, "sd_notify readiness failed");
         }
 
-        let mut rx = self.command_rx.take().expect("command_rx already taken");
         let tcp_concurrency_limit = Arc::clone(&self.concurrency_limit);
         let tcp_stats = Arc::clone(&self.stats);
         let drain = self.drain_tracker.clone();

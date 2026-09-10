@@ -504,22 +504,22 @@ impl ConnectionPool {
         drop(removed);
     }
 
-    /// Drop every pooled connection tied to a proxy node identity in one
-    /// generation: the bare `"host:port"` key plus that identity's ready
-    /// entries. Called when the node flips alive→dead.
-    pub(crate) fn purge_node(&self, node_addr: &str, generation: u64, node_id: Uuid) {
+    /// Drop ready entries tied to a proxy node identity in one generation,
+    /// plus its bare preconnect when the current config supplies the address.
+    /// Called when the node flips alive→dead.
+    pub(crate) fn purge_node(&self, node_addr: Option<&str>, generation: u64, node_id: Uuid) {
         let ready_prefix = format!("ready|{generation}|{node_id}|");
         let mut removed = Vec::new();
         let mut state = self.state.lock();
         state.remove_matching(
-            |key| key == node_addr || key.starts_with(&ready_prefix),
+            |key| node_addr.is_some_and(|addr| key == addr) || key.starts_with(&ready_prefix),
             &mut removed,
         );
         drop(state);
         debug!(
             "Purged {} pooled connections for dead node {}",
             removed.len(),
-            node_addr
+            node_id
         );
         drop(removed);
     }
@@ -827,7 +827,7 @@ mod tests {
 
         let purge_pool = Arc::clone(&pool);
         let purge_key = key.clone();
-        let purge = thread::spawn(move || purge_pool.purge_node(&purge_key, 1, Uuid::nil()));
+        let purge = thread::spawn(move || purge_pool.purge_node(Some(&purge_key), 1, Uuid::nil()));
         purge.join().expect("purge thread panicked");
         hook.resume.wait();
         deposit.join().expect("deposit thread panicked");
@@ -889,7 +889,7 @@ mod tests {
         let purge_key = key.clone();
         let purge = thread::spawn(move || {
             let before = purge_pool.ready_metrics().entries;
-            purge_pool.purge_node(&purge_key, 1, Uuid::nil());
+            purge_pool.purge_node(Some(&purge_key), 1, Uuid::nil());
             before > purge_pool.ready_metrics().entries
         });
         let purged = purge.join().expect("purge thread panicked");
@@ -950,7 +950,7 @@ mod tests {
             "janitor must publish the competitor's deposited stream"
         );
         pool.check_invariants();
-        pool.purge_node(&key, 1, Uuid::nil());
+        pool.purge_node(Some(&key), 1, Uuid::nil());
         assert_eq!(
             pool.ready_metrics().entries,
             0,
@@ -1269,7 +1269,7 @@ mod tests {
             pool.deposit_ready(generation, &key, make_ready_stream(tcp, target))
                 .await;
         }
-        pool.purge_node(dead_addr, generation, dead_id);
+        pool.purge_node(Some(dead_addr), generation, dead_id);
         assert!(pool.acquire_tcp(dead_addr).await.is_none());
         let dead_key = ConnectionPool::ready_key(generation, dead_id, target, None);
         assert!(pool.acquire_ready(&dead_key).await.is_none());
@@ -1333,7 +1333,7 @@ mod tests {
             pool.ready_metrics().entries,
             MAX_READY_TARGETS_PER_NODE as u64
         );
-        pool.purge_node("node:443", generation, node_id);
+        pool.purge_node(Some("node:443"), generation, node_id);
         pool.check_invariants();
         assert_eq!(pool.ready_metrics().entries, 0);
         let key_target: SocketAddr = "198.51.100.1:443".parse().unwrap();
@@ -1697,7 +1697,7 @@ mod tests {
         pool.check_invariants();
 
         let node_addr = format!("{}:{}", node_a.host(), node_a.port);
-        pool.purge_node(&node_addr, generation, node_a.id);
+        pool.purge_node(Some(&node_addr), generation, node_a.id);
         pool.check_invariants();
 
         assert!(pool.acquire_ready(&key_a).await.is_none());

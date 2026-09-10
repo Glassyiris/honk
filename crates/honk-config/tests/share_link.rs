@@ -1091,6 +1091,7 @@ fn test_packet_encoding_none_is_a_noop_on_other_protocols() {
 fn test_vless_share_link_rejects_external_mux_fields() {
     for parameter in [
         "smux=h2mux",
+        "mux=",
         "udp-over-tcp=1",
         "packet-encoding=xudp",
         "only-tcp=1",
@@ -1564,4 +1565,65 @@ fn test_credential_bytes_are_not_replaced() {
     // A name is cosmetic, so an undecodable fragment must not lose the node.
     let node = Node::from_share_link("socks5://user:pass@1.2.3.4:1080#n%FFm").unwrap();
     assert!(node.name.contains('\u{FFFD}'), "{}", node.name);
+}
+
+#[test]
+fn empty_share_link_sni_uses_the_host_fallback() {
+    for alias in ["sni", "peer"] {
+        let node = Node::from_share_link(&format!("trojan://pw@example.com:443?{alias}=")).unwrap();
+        assert_eq!(node.tls().unwrap().sni, None);
+        let node = Node::from_share_link(&format!(
+            "trojan://pw@example.com:443?{alias}=&host=cdn.example"
+        ))
+        .unwrap();
+        assert_eq!(node.tls().unwrap().sni.as_deref(), Some("cdn.example"));
+    }
+}
+
+#[test]
+fn empty_share_link_host_alias_leaves_sni_absent() {
+    for query in ["host=", "sni=&host="] {
+        let node = Node::from_share_link(&format!("trojan://pw@example.com:443?{query}")).unwrap();
+        assert_eq!(node.tls().unwrap().sni, None, "{query}");
+        assert_eq!(node.host(), "example.com");
+    }
+}
+
+#[test]
+fn empty_share_link_sni_does_not_mask_peer() {
+    let node = Node::from_share_link("trojan://pw@example.com:443?sni=&peer=cdn.example").unwrap();
+    assert_eq!(node.tls().unwrap().sni.as_deref(), Some("cdn.example"));
+}
+
+#[test]
+fn empty_share_link_flow_is_absent_and_valid() {
+    let node =
+        Node::from_share_link("vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?flow=")
+            .unwrap();
+    assert_eq!(node.vless().unwrap().flow, None);
+    let mut config = Config::default();
+    config.nodes.push(node);
+    config.validate().unwrap();
+}
+
+#[test]
+fn empty_share_link_flow_allows_xtls_vision() {
+    let node = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?flow=&xtls=2",
+    )
+    .unwrap();
+    assert_eq!(
+        node.vless().unwrap().flow.as_deref(),
+        Some("xtls-rprx-vision")
+    );
+}
+
+#[test]
+fn empty_share_link_reality_key_still_conflicts_with_plaintext() {
+    assert!(
+        Node::from_share_link(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=none&pbk=",
+        )
+        .is_err()
+    );
 }

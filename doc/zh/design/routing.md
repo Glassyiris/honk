@@ -22,7 +22,18 @@ native-direct 与已有流缓存路径保持原生执行。
 不能因 geo 资源没有匹配项而放宽复合规则。
 
 
-切换保留当前用户态匹配合同：
+配置模型及解析器位于
+[`crates/honk-config/src/routing.rs`](../../../crates/honk-config/src/routing.rs)
+及对应的路由解析模块。`RoutingRule` 保存出站标签、优先级、mark 和显式的终结
+`must` 标志；`RoutingCondition` 保存正向与否定匹配列表。`RoutingOutbound` 是
+单个字符串目标，指向组或内置的 `direct`/`block`。`ClashRuleDisplay` 保留简单
+匹配类型，对复合、否定或解析器记录的 `must` 语句使用 `complex`。
+`Config::validate` 拒绝直接指向已配置节点的规则或 fallback；应使用组，
+也可以是只筛选一个节点的组。
+
+## 内核路由
+
+切换保留当前用户态匹配语义：
 
 - 普通 domain pattern/suffix/keyword 是同一条件内的 OR；与 geosite 字段同时存在
   时，geosite 仍是独立条件。suffix、regex、keyword、大小写和 geosite 属性行为不变。
@@ -32,8 +43,8 @@ native-direct 与已有流缓存路径保持原生执行。
   lossy UTF-8 与 trim 规则转换，热路径不分配堆内存。
 - 缺失 pname/MAC/DSCP 不是普通零值。缺失 domain 不满足正向条件，也不会触发负向
   条件的 veto。
-- 配置 `(must)` 是终结结果，不是历史内部 `MustRules` opcode。Clash mode 不能
-  覆盖 must 或 block。
+- 配置 `(must)` 是终结结果：设置显式的 `must` 决策字段并跳过嗅探。
+  Clash 模式不能覆盖 `must` 或 `block`。
 
 旧 lowering 丢弃 full/regex、把协议 OR 降成 TCP、截断规则链、DNS 只投影首条整规则、
 重叠 LPM 丢失祖先位图，都不是要保留的兼容行为。共享 IR 和独立 golden 案例需要
@@ -46,9 +57,26 @@ native-direct 与已有流缓存路径保持原生执行。
 不可变的已编译 matcher registry。规则名只用于展示，不能当作 bitmap 身份；相同
 域名谓词可以在同一 policy 内共享 PredicateId。
 
-用户态 reference 与内核编译器消费这一表示。DNS 和 sniffing 产生的是**全部域名
-谓词**的真值位，而不是用伪造五元组选择一条完整 traffic rule。用于否定规则的谓词
-同样投影其正向真值，not 由 evaluator 应用。一个已知域名即使没有匹配任何谓词，也
+### 源码组织
+
+- [`crates/honk-core/src/routing/`](../../../crates/honk-core/src/routing/) —
+  用户态 `Router`、按优先级排序的编译规则、`route_with_must`、`GeositeMatcher`
+  以及 `BinaryLpmTrie`/Geo 资源辅助代码。`geo.rs` 在每次构建 `Router` 时只解析
+  一次 `geoip.dat`/`geosite.dat`，且只解码被引用的类别。`category@attr` 在首个
+  `@` 处分隔，并以不区分大小写的方式筛选属性键。
+- [`crates/honk-core/src/control/routing_matcher.rs`](../../../crates/honk-core/src/control/routing_matcher.rs)
+  把 IR 编译为 `RoutingPushPlan`，不修改 map。
+  [`crates/honk-core/src/ebpf/real/routing.rs`](../../../crates/honk-core/src/ebpf/real/routing.rs)
+  负责 generation map、扩展加载、目标挂接与发布。
+- [`crates/honk-ebpf/src/route.rs`](../../../crates/honk-ebpf/src/route.rs) —
+  静态根/槽位接口与固定 ABI 分派，不包含解释器或备用规则引擎。
+  静态 TC 调用方在这次同步调用前后负责报文解析与决策执行。
+- 旧的 sockops/sk_msg 重定向实验不属于当前数据路径；部分内核出现 panic 报告后，
+  这些实验代码已被移除。当前支持 TC 重定向，加载器只查找现有程序名称。
+
+用户态参考实现与内核编译器使用这一表示。DNS 和嗅探产生的是**全部域名
+谓词**的真值位，而不是首条命中的完整流量规则。用于否定规则的谓词
+同样投影其正向真值，由求值器应用否定。一个已知域名即使没有匹配任何谓词，也
 产生存在的零 bitmap；该 IP 的最后一个有效 owner 消失时才删除条目。
 
 DNS 关联仍按 IP、与源客户端无关，并延续多个有效 owner 的 OR 聚合。这不证明共享

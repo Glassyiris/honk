@@ -28,26 +28,45 @@ impl DnsCacheService {
         let now = Instant::now();
         let mut shard = lock(&self.shards[index]);
 
-        let (negative, clear_negative) = match shard.peek(&key) {
-            Some(value) => match value.negative.as_ref() {
-                Some(negative) => match negative.expires_at.checked_duration_since(now) {
-                    Some(remaining) => {
-                        let rounded_secs = remaining
-                            .as_secs()
-                            .saturating_add(u64::from(remaining.subsec_nanos() > 0));
-                        (
-                            Some(NegativeCacheHit {
-                                rcode: negative.rcode,
-                                remaining_ttl: Duration::from_secs(rounded_secs),
+        let (negative, clear_negative, positive) = match shard.get(&key) {
+            Some(value) => {
+                let (negative, clear_negative) = match value.negative.as_ref() {
+                    Some(negative) => match negative.expires_at.checked_duration_since(now) {
+                        Some(remaining) => {
+                            let rounded_secs = remaining
+                                .as_secs()
+                                .saturating_add(u64::from(remaining.subsec_nanos() > 0));
+                            (
+                                Some(NegativeCacheHit {
+                                    rcode: negative.rcode,
+                                    remaining_ttl: Duration::from_secs(rounded_secs),
+                                }),
+                                false,
+                            )
+                        }
+                        None => (None, true),
+                    },
+                    None => (None, false),
+                };
+                let positive = if negative.is_none() {
+                    match value.positive.as_ref() {
+                        Some(entry) if entry.is_stale_retention_exceeded() => (None, true),
+                        Some(entry) if require_strict && !entry.strict_reusable => (None, false),
+                        Some(entry) if !entry.is_expired() => (
+                            Some(ExactLookup::Positive {
+                                entry: entry.clone(),
+                                revision: value.revision,
                             }),
                             false,
-                        )
+                        ),
+                        Some(_) | None => (None, false),
                     }
-                    None => (None, true),
-                },
-                None => (None, false),
-            },
-            None => (None, false),
+                } else {
+                    (None, false)
+                };
+                (negative, clear_negative, positive)
+            }
+            None => (None, false, (None, false)),
         };
 
         if clear_negative {
@@ -63,21 +82,7 @@ impl DnsCacheService {
         let result = if let Some(hit) = negative {
             ExactLookup::Negative(hit)
         } else {
-            let (positive, clear_positive) = match shard.get(&key) {
-                Some(value) => match value.positive.as_ref() {
-                    Some(entry) if entry.is_stale_retention_exceeded() => (None, true),
-                    Some(entry) if require_strict && !entry.strict_reusable => (None, false),
-                    Some(entry) if !entry.is_expired() => (
-                        Some(ExactLookup::Positive {
-                            entry: entry.clone(),
-                            revision: value.revision,
-                        }),
-                        false,
-                    ),
-                    Some(_) | None => (None, false),
-                },
-                None => (None, false),
-            };
+            let (positive, clear_positive) = positive;
             if clear_positive {
                 shard.remove_positive(&key);
             }

@@ -182,7 +182,7 @@ On reload, unchanged node configurations transfer their existing `NodeRuntime`, 
 
 `max_concurrent_dials` defaults to 64 and creates a generation-local semaphore for physical proxied connects and protocol handshakes. The configured value is clamped to the immutable process-wide descriptor gate computed at startup. Reload may change the replacement generation's local limit, but overlapping old and new generations still share that same process gate.
 
-Ready-pool hits and logical streams opened on an already warm generation transport are exempt. `block` never dials; a userspace `direct` dial is not exempt — `DirectHandler::dial` goes through `admit_physical_dial` like any other physical connect, and only a datapath-offloaded direct flow avoids the gate by never reaching userspace. A bare-TCP pool hit still runs its protocol handshake and therefore remains admitted by the dial budget.
+Ready-pool hits and logical streams opened on an already warm generation transport are exempt. `block` never dials; `DirectHandler::dial` goes through `admit_physical_dial` like other physical connects. Datapath-offloaded direct flows and direct UI downloads through reqwest do not use this handler's gate. A bare-TCP pool hit still runs its protocol handshake and therefore remains admitted by the dial budget.
 
 ## Related docs
 

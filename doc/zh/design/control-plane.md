@@ -24,8 +24,6 @@
 10. 检查 NFQUEUE 健康状态，发布其 ready 状态，开放 pending verdict 准入，最后把 `DATAPATH_STATE_MAP[0]` 设为 ready。随后 TCP accept loop 在控制面 supervisor 中运行。
 `RealEbpfBackend` 负责 aya program、map、link、持久分配器处理和真实 NFQUEUE 集成。`MockEbpfBackend` 在没有特权内核资源时提供相同控制面接口。请求的 NFQUEUE 路径无法通过锁交接后的固定队列前置检查时会记录 warning 并关闭；服务准入后的失败仍为 fatal。
 
-当 `global.store_subscribe` 启用时，经过校验的原始正文存放在 `<global.data_dir>/.sub`。切换数据目录期间，若配置存储不存在，则依次保留并使用已有的 `/var/share/honk/.sub` 与 `./.sub`；honk 不会自动移动或删除它们。目录必须是非符号链接目录、权限 `0700`；文件权限 `0600`，文件名由请求 URL、配置中的 User-Agent 覆盖值（未设置或为空时贡献空组件）与 headers 共同计算 URL-safe SHA-256。未配置订阅覆盖值时，请求标识为 `honk/<version>`。写入使用新的临时文件、`sync_all`、原子 rename 和目录 sync。
-
 关闭时在资源消失前逆序释放所有权：fence NFQUEUE、关闭数据路径准入、拒绝新的用户态工作、取消并排空持有的 verdict 和 UDP initializer、停止 UDP driver 和 removal 处理、停止接口 watcher、卸载 BPF hook、最多用五秒排空已接受流、退役出站运行时、停止 NFQUEUE、停止 DNS controller 和 persistence，并清理 generation 持有的 BPF 状态。普通清理保留固定分配器。随后 listener 和 `daens`/link-pair 所有权离开作用域。
 
 ## 透明代理入口
@@ -158,11 +156,20 @@ Accepted TCP socket 只有在其规范正向 `CONN_STATE_MAP` 条目仍存在时
 
 当旧值和新值都能解析时，`dns.bind` 的语义比较使用解析后的 bind endpoint，因此描述同一 endpoint 的纯拼写变更不会强制重启。
 
+## 订阅编排
+
 启动时先解析已存正文，再开始网络刷新。有效且非空的恢复结果立即提供节点，并从五秒首次拉取等待中移除该订阅；缺失、无效或空正文只会在共享 grace 期间等待。之后所有订阅仍在后台刷新。
+
+`ControlPlane::run` 首次被 poll 时便取得控制命令接收端的所有权，早于所有启动阶段的 await。这个已开始运行的 future 返回或被丢弃时，即使监听器启动失败也会关闭通道，使阻塞在满队列上的订阅投递解除等待，随后调用方才能等待 supervisor 关闭。
 
 `SIGHUP` 会按 fetch 身份（URL + 配置的 User-Agent + headers）稳定订阅 ID，并把活动订阅节点带入候选配置。只有启用订阅且当前没有活动节点时才恢复缓存，随后安排立即网络刷新。网络、解析或没有可用节点的失败会保留活动节点，不替换上一次有效正文。持久化失败不是致命错误：校验成功的节点仍可合并，旧正文仍可恢复。定期刷新与立即刷新使用同一串行的 runtime 发布路径，订阅节点不会写回配置文件。
 
 当 `global.store_subscribe` 启用时，经过校验的原始正文存放在 `<global.data_dir>/.sub`。切换数据目录期间，若配置存储不存在，则依次保留并使用已有的 `/var/share/honk/.sub` 与 `./.sub`；honk 不会自动移动或删除它们。目录必须是非符号链接目录、权限 `0700`；文件权限 `0600`，文件名由请求 URL、配置中的 User-Agent 覆盖值（未设置或为空时贡献空组件）与 headers 共同计算 URL-safe SHA-256。未配置订阅覆盖值时，请求标识为 `honk/<version>`。写入使用新的临时文件、`sync_all`、原子 rename 和目录 sync。
+
+- `src/subscription.rs` 负责拉取、解析与原始正文持久化。`src/subscription/supervisor.rs` 管理启动、立即与周期刷新任务，并按修订版本校验任务授权；重新协调或关闭时会等待被替换的任务结束。`src/lib.rs` 只在 `SIGHUP` 提交后协调这些任务。
+- 守护进程的拉取/恢复路径与 `honk-tool sub` 的本地文件共用正文格式检测。`Simple`/`Custom` 接受 BOM、可换行的标准/URL-safe Base64、原始分享链接、Clash YAML/JSON、SIP008、sing-box JSON，以及 Surge/Surfboard/Loon/Quantumult X 记录。`src/subscription/json.rs` 与 `records.rs` 规范化外部记录，`clash.rs` 构造并校验类型化节点。
+  只导入节点，不导入完整配置中的路由、DNS 或组。原生 JSON 保留以 Unicode 代理项对编码的名称。跳过不支持的节点，身份重复时保留首个可用节点，空结果不替换活动订阅。导入的 Trojan/AnyTLS/QUIC 节点必须使用 TLS，不会静默降级为明文。
+  Clash 与 sing-box 的 TCP ALPN 归入共享 TLS 模型，而不是 TUIC 的 QUIC 字段。共享构造器的跳过告警只包含从 1 开始的代理序号和静态拒绝原因，不包含原始节点记录或凭据。
 
 ## Clash API 与 cache DB
 

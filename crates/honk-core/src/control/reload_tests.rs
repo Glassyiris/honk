@@ -2285,6 +2285,25 @@ async fn ready_pool_reload_fixture() -> (
 }
 
 #[tokio::test]
+async fn node_death_purges_ready_stream_when_config_lock_is_busy() {
+    let (cp, config, _generation, key, _peer) = ready_pool_reload_fixture().await;
+    let node_id = config.nodes[0].id;
+    // Bypass registration grace without replacing the ControlPlane death callback.
+    cp.alive_set().remove_node(node_id);
+    let config_handle = cp.config_handle();
+    let _config_guard = config_handle.write().await;
+
+    for _ in 0..3 {
+        cp.alive_set().mark_dead(node_id);
+    }
+
+    assert!(
+        cp.connection_pool.acquire_ready(&key).await.is_none(),
+        "node death must purge ready streams while config is write-locked"
+    );
+}
+
+#[tokio::test]
 async fn ready_pool_reload_recredentials_retire_old_stream() {
     let (cp, mut config, generation, key, _peer) = ready_pool_reload_fixture().await;
     let node = &mut config.nodes[0];

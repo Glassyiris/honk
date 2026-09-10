@@ -141,10 +141,10 @@ pub fn parse_duration_secs(s: &str) -> Option<u64> {
         return v.parse().ok();
     }
     if let Some(v) = s.strip_suffix('m') {
-        return v.parse::<u64>().ok().map(|v| v * 60);
+        return v.parse::<u64>().ok().and_then(|v| v.checked_mul(60));
     }
     if let Some(v) = s.strip_suffix('h') {
-        return v.parse::<u64>().ok().map(|v| v * 3600);
+        return v.parse::<u64>().ok().and_then(|v| v.checked_mul(3600));
     }
     s.parse().ok()
 }
@@ -169,4 +169,24 @@ pub fn parse_duration_ms(s: &str) -> Option<u64> {
         .ok()
         .filter(|v| v.is_finite() && *v >= 0.0)
         .map(|v| v as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_duration_secs;
+
+    #[test]
+    fn second_durations_reject_overflow_at_the_unit_boundary() {
+        for (suffix, multiplier) in [('m', 60), ('h', 3600)] {
+            let maximum = u64::MAX / multiplier;
+            assert_eq!(
+                parse_duration_secs(&format!("{maximum}{suffix}")),
+                Some(maximum * multiplier)
+            );
+            assert_eq!(
+                parse_duration_secs(&format!("{}{suffix}", maximum + 1)),
+                None
+            );
+        }
+    }
 }

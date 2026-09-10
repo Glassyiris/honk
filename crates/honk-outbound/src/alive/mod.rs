@@ -490,7 +490,7 @@ impl AliveDialerSet {
         // targets even when DNS resolution fails.
         let addrs = self.resolve_host(&hostname, port).await;
         if addrs.is_empty() {
-            tracing::warn!("Failed to resolve health check URL '{}'[39m", hostname);
+            tracing::warn!("Failed to resolve health check URL '{}'", hostname);
         }
         let ips = Self::merge_check_addrs(addrs, &check_url, port);
         tracing::debug!(

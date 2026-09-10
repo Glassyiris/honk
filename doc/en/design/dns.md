@@ -107,9 +107,9 @@ Production `DnsService` callers require strict query/response wire validation be
 | Stage | Invariant |
 | --- | --- |
 | 1. Admission and generation | `DnsController` pins one runtime and acquires its owned query permit plus a UDP permit for UDP ingress. The generation's 2,048-query permit remains held through reply completion; saturation degrades to `REFUSED`. |
-| 2. Parse and validate | The adapter requires one complete request. `DnsEngine` parses the wire, rejects zero or multiple usable questions, canonicalizes the qname to lowercase, and records the ingress profile. |
+| 2. Parse and validate | The adapter requires one complete request. `DnsEngine` parses the wire, rejects zero or multiple usable questions, derives a lowercase routing domain without changing the qname's case, and records the ingress profile. |
 | 3. Family gate and hosts | `ipv4only`/`ipv6only` reject the other address family with NODATA before hosts or upstream work. Otherwise the immutable hosts snapshot runs before request routing, cache, and upstream exchange. |
-| 4. Request planning | Source-ordered request rules choose reject, `asis`, or a named upstream from the canonical qname, QTYPE, and logical client source. First match wins. |
+| 4. Request planning | Source-ordered request rules choose reject, `asis`, or a named upstream from the routing domain, QTYPE, and logical client source. First match wins. |
 | 5. Reuse | Eligible requests look up the exact-identity positive/negative cache, then share one singleflight exchange on a miss. Ineligible requests bypass both. |
 | 6. Exchange | The request scope selects the intercepted destination or an `UpstreamPool` transport. |
 | 7. Response planning | Every upstream response is strictly matched to the query before policy uses it. Response rules accept, reject, or re-query through a named upstream; traversal is acyclic and contains at most three upstreams. |

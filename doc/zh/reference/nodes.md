@@ -59,7 +59,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `plugin` / `plugin_opts` | string? | null | 解析后的 SIP002 插件元数据；代理插件不受支持，订阅导入会拒绝非空值 |
 | `transport` | string | `"tcp"` | 流 transport；校验只接受空值/`tcp`、`ws` 或 `grpc` |
 | `tls` | bool | `false` | 流 TLS 标志；Trojan/AnyTLS 链接开启，规范 VLESS 链接历史默认开启 |
-| `sni` | string? | null | TLS 服务端名称，依次取 `sni`、`peer`、未被 transport 消耗的 `host` query |
+| `sni` | string? | null | TLS 服务端名称；依次采用非空的 `sni`、`peer`、未被传输层使用的 `host` 查询参数 |
 | `tls_alpn` | string[] | `[]` | 结构化配置/订阅导入的普通裸 TCP TLS ALPN；空列表保留 TLS profile 默认值。非空值支持 AnyTLS 与 TCP Trojan/VMess/VLESS，不支持关闭 TLS、REALITY、WS/gRPC 或 QUIC。TUIC 继续使用 `tuic_alpn`；这不是分享链接 query。 |
 | `skip_cert_verify` | bool | `false` | `allowInsecure`、`allow_insecure` 或 `insecure` 等于 `1`/`true` |
 | `ech_enabled` | bool | `false` | 存在静态 ECH 配置，或 `ech=1`/`true` |
@@ -68,7 +68,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `reality_public_key` | string? | null | 来自 `pbk` 的 REALITY X25519 公钥 |
 | `reality_short_id` | string? | null | 来自 `sid` 的 REALITY short ID |
 | `reality_spider_x` | string? | null | 存储的 `spx`；REALITY 链接默认设为 `/` |
-| `flow` | string? | null | 来自 `flow` 或 Shadowrocket `xtls=2` 的 VLESS flow；只支持 `xtls-rprx-vision` |
+| `flow` | string? | null | 来自非空 `flow` 或 Shadowrocket `xtls=2` 的 VLESS flow；只支持 `xtls-rprx-vision` |
 | `network` | string? | null | 协议网络/能力提示；VMess JSON `net` 与订阅导入会填充它 |
 | `ws_path` / `ws_host` | string? | null | WebSocket `path` 与 Host header |
 | `grpc_service` | string? | null | gRPC `serviceName` 或 `service_name` |

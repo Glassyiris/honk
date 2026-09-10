@@ -318,6 +318,23 @@ const H2_WINDOW_REFRESH: u32 = 8 * 1024 * 1024;
 /// sliver frames off the wire.
 const H2_MIN_WRITE_WINDOW: i64 = 1024;
 
+/// Encode an uncompressed HPACK string length (RFC 7541 §5.1).
+fn push_hpack_string_length(hpack: &mut Vec<u8>, length: usize) {
+    const PREFIX_MAX: usize = (1 << 7) - 1;
+    if length < PREFIX_MAX {
+        hpack.push(length as u8);
+        return;
+    }
+
+    hpack.push(PREFIX_MAX as u8);
+    let mut remainder = length - PREFIX_MAX;
+    while remainder >= (1 << 7) {
+        hpack.push(((remainder as u8) & 0x7f) | 0x80);
+        remainder >>= 7;
+    }
+    hpack.push(remainder as u8);
+}
+
 impl GrpcStream {
     async fn new(
         inner: Box<dyn AsyncReadWrite>,
@@ -390,17 +407,17 @@ impl GrpcStream {
 
         // :scheme — same pattern, static idx 6 = ":scheme"
         hpack.push(0x46);
-        hpack.push(scheme.len() as u8);
+        push_hpack_string_length(&mut hpack, scheme.len());
         hpack.extend_from_slice(scheme.as_bytes());
 
         // :path: <path> — static idx 4 = ":path"
         hpack.push(0x44);
-        hpack.push(path.len() as u8);
+        push_hpack_string_length(&mut hpack, path.len());
         hpack.extend_from_slice(path.as_bytes());
 
         // :authority: <authority> — static idx 1 = ":authority"
         hpack.push(0x41);
-        hpack.push(authority.len() as u8);
+        push_hpack_string_length(&mut hpack, authority.len());
         hpack.extend_from_slice(authority.as_bytes());
 
         // content-type: application/grpc — static idx 31 = "content-type"
@@ -976,6 +993,50 @@ mod tests {
         assert_eq!(host.as_deref(), Some("cdn.example.com"));
 
         server.await.unwrap();
+    }
+
+    async fn decoded_grpc_headers(service_len: usize, authority: &str) -> (String, String) {
+        let mut node = transport_node(443);
+        node.host = authority.to_owned();
+        node.transport_mut().unwrap().grpc_service = Some("s".repeat(service_len));
+        let (client, server) = tokio::io::duplex(4096);
+        let receive = async {
+            let mut connection = h2::server::handshake(server).await.unwrap();
+            let request = connection.accept().await.expect("gRPC request");
+            assert!(request.is_ok(), "invalid gRPC headers: {request:?}");
+            let (request, _) = request.unwrap();
+            assert_eq!(request.headers()["content-type"], "application/grpc");
+            assert_eq!(request.headers()["te"], "trailers");
+            assert_eq!(request.headers()["user-agent"], "honk");
+            (
+                request.uri().path().to_owned(),
+                request.uri().authority().unwrap().as_str().to_owned(),
+            )
+        };
+        let (stream, headers) = tokio::join!(wrap_grpc(&node, Box::new(client)), receive);
+        stream.unwrap();
+        headers
+    }
+
+    #[tokio::test]
+    async fn test_grpc_hpack_path_length_200() {
+        let (path, _) = decoded_grpc_headers(195, "example.com").await;
+        assert_eq!(path.len(), 200);
+        assert_eq!(path, format!("/{}/Tun", "s".repeat(195)));
+    }
+
+    #[tokio::test]
+    async fn test_grpc_hpack_path_length_127_boundary() {
+        let (path, _) = decoded_grpc_headers(122, "example.com").await;
+        assert_eq!(path.len(), 127);
+        assert_eq!(path, format!("/{}/Tun", "s".repeat(122)));
+    }
+
+    #[tokio::test]
+    async fn test_grpc_hpack_authority_length_300() {
+        let authority = "a".repeat(300);
+        let (_, decoded) = decoded_grpc_headers(1, &authority).await;
+        assert_eq!(decoded, authority);
     }
 
     /// gRPC transport: the mock server verifies the HTTP/2 preface, the

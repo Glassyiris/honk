@@ -157,7 +157,11 @@ pub(super) fn apply_tls(
             NodeProtocol::VMess => security.is_some_and(|value| value != "none"),
             _ => tls.enabled,
         };
-        tls.sni = query.get("sni").or_else(|| query.get("peer")).cloned();
+        tls.sni = query
+            .get("sni")
+            .filter(|value| !value.is_empty())
+            .or_else(|| query.get("peer").filter(|value| !value.is_empty()))
+            .cloned();
         if let Some(value) = query
             .get("allowInsecure")
             .or_else(|| query.get("allow_insecure"))
@@ -269,7 +273,7 @@ pub(super) fn apply_transport(
     }
     if !host_consumed
         && node.tls().is_some_and(|tls| tls.sni.is_none())
-        && let Some(value) = query.get("host")
+        && let Some(value) = query.get("host").filter(|value| !value.is_empty())
         && let Some(tls) = node.tls_mut()
     {
         tls.sni = Some(value.clone());
@@ -466,7 +470,7 @@ fn apply_vless(config: &mut VlessConfig, query: &Query) -> Result<(), ConfigErro
             }
         }
     }
-    config.flow = query.get("flow").cloned();
+    config.flow = query.get("flow").filter(|value| !value.is_empty()).cloned();
     // Shadowrocket's exporter maps 1 to retired XTLS Direct and 2 to Vision.
     if let Some(xtls) = query.get("xtls") {
         let flow = match xtls.as_str() {
@@ -474,7 +478,7 @@ fn apply_vless(config: &mut VlessConfig, query: &Query) -> Result<(), ConfigErro
             "2" => Some("xtls-rprx-vision"),
             _ => return Err(ConfigError::Parse("unsupported VLESS xtls value".into())),
         };
-        if config.flow.is_some() && config.flow.as_deref().filter(|value| !value.is_empty()) != flow
+        if config.flow.is_some() && config.flow.as_deref() != flow
             || flow.is_some() && !config.tls.enabled
         {
             return Err(ConfigError::Parse(

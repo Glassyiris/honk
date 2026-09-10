@@ -117,6 +117,7 @@ The binary provides `-h`/`--help` and `-v`/`--version`, with help on every comma
 
 ```text
 honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
+              [--udp-check HOST[:PORT]]
               [--timeout SECS] [--concurrency N] [--limit N] [--ua UA]
               [--tls-implementation tls|utls] [--utls-imitate PROFILE]
               [--v4-target IP:PORT] [--v6-target [IP]:PORT]
@@ -125,7 +126,8 @@ honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
 | Argument / option | Default | Meaning |
 | --- | --- | --- |
 | `<url\|file\|->` | Required | HTTP(S) subscription URL, an existing local subscription file, or `-`. `-` reads exactly one HTTP(S) subscription URL from stdin; it does not read a subscription body from stdin. |
-| `--target HOST:PORT` | `cp.cloudflare.com:443` | Host used by the family connectivity probes and QUIC probe. |
+| `--target HOST:PORT` | `cp.cloudflare.com:443` | Host for the family probes' HTTPS request URL (TLS SNI and Host header), and host and port for QUIC. Without `--v4-target`/`--v6-target` address overrides, family probes resolve this host and use this port. `--udp-check` selects the UDP DNS probe target separately. |
+| `--udp-check HOST[:PORT]` | `dns.google:53`, `8.8.8.8`, `2001:4860:4860::8888` | UDP DNS check targets, defaulting to the engine list in `honk-config`. Repeat the flag or use commas. The first IP/socket-address literal is used; otherwise the first entry is resolved only for eligible UDP DNS probes. An omitted port means `53`. |
 | `--url TEST_URL` | `https://www.gstatic.com/generate_204` | Proxied URLTest target. |
 | `--timeout SECS` | `5` | Per-probe timeout. |
 | `--concurrency N` | `10` | Maximum node probe tasks in flight. |
@@ -139,6 +141,10 @@ honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
 Remote subscriptions and local files share the engine's automatic format detection: encoded/raw share links, Clash YAML/JSON, SIP008, sing-box JSON, and supported Surge/Surfboard/Loon/Quantumult X records. Unsupported nodes are skipped without printing their raw input. Source `-` keeps a credential-bearing provider URL out of argv and process listings.
 
 For each node, the command reports server address families, full proxied IPv4 and IPv6 exchanges, proxied URLTest latency, a DNS query through the packet handler, and a real QUIC handshake through that handler. VMess, legacy VLESS, and nodes whose `network` excludes UDP show `n/a` for UDP; non-legacy VLESS modes use their configured packet transport.
+
+UDP DNS target resolution, packet-transport setup, send, and receive share one `--timeout` budget. A resolution failure or timeout is reported only in the DNS column; TCP, URLTest, and QUIC probes continue. Unsupported UDP nodes skip this resolution, and a failed hostname is never replaced with another target.
+
+UDP DNS hostname targets use a shared asynchronous resolver with the first numeric nameserver in `/etc/resolv.conf` (UDP port `53`) and `/etc/hosts` when present, rather than blocking NSS lookup. This path does not apply NSS plugins or resolver search suffixes. An unavailable resolver is a DNS-column `resolve` failure, not a fallback to a public resolver; literal targets need no resolver.
 
 VLESS output is deliberately bounded to the display name and normalized carrier/transport/wire shape. Eligibility codes are `supported`, `invalid-uuid`, `invalid-reality`, `invalid-config`, `unsupported-transport`, `unsupported-flow`, `vision-without-tls`, and `vision-non-tcp`; probe failure codes are only `resolve`, `timeout`, `exchange`, and `handler`. Credentials, endpoint details, SNI, REALITY keys, URL query data, and raw errors are never rendered.
 
