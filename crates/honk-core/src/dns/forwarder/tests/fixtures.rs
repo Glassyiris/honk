@@ -142,6 +142,17 @@ fn make_nxdomain_without_soa_response(query: &[u8]) -> Vec<u8> {
     response
 }
 
+fn nodata_response(domain: &str, qtype: u16, soa: Option<(u32, u32)>) -> Vec<u8> {
+    let query = build_dns_query(domain, qtype);
+    if let Some((ttl, minimum)) = soa {
+        let mut response = make_nxdomain_response(&query, ttl, minimum);
+        response[3] = 0x80;
+        return response;
+    }
+    let context = crate::dns::query::QueryContext::parse(&query).expect("query context");
+    make_empty_response(&query, &context)
+}
+
 struct MockUpstream {
     response: Vec<u8>,
     call_count: AtomicUsize,

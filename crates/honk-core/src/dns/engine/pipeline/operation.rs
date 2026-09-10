@@ -52,6 +52,7 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
 
     let mut traversal = ResponseTraversal::start(context.logical_upstream.clone());
     let mut strict_reusable = true;
+    let mut rejected_wire = None;
     let (status, class, analyzed_answer_ips) = loop {
         match context.engine.analyze(
             context.prepared,
@@ -86,6 +87,7 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
                 traversal: rejected,
             } => {
                 strict_reusable &= analyzed.strict_reusable;
+                rejected_wire = Some(analyzed.wire);
                 response = make_empty_response(context.raw_query, context.prepared.query());
                 traversal = rejected;
                 break (OutcomeStatus::Rejected, analyzed.class, None);
@@ -113,7 +115,14 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
 
     let exact_cache_key = context.cache_key.clone();
     let expiry = if strict_reusable {
-        cache::store(context, &exact_cache_key, &mut response, class).await
+        cache::store(
+            context,
+            &exact_cache_key,
+            &mut response,
+            rejected_wire.as_deref(),
+            class,
+        )
+        .await
     } else {
         EffectiveExpiry::do_not_cache()
     };

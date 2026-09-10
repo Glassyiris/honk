@@ -189,7 +189,7 @@ impl DnsUpstreamPool for RoutedScopeUpstream {
             let mut response = if upstream_name == "red" {
                 make_nxdomain_response(raw_query, 1, 1)
             } else {
-                nodata_response("example.com", 1)
+                nodata_response("example.com", 1, None)
             };
             response[3] = if upstream_name == "red" { 0x83 } else { 0x82 };
             Ok(response)

@@ -147,12 +147,6 @@ fn make_aaaa_response(ip: [u8; 16], ttl: u32) -> Vec<u8> {
     v
 }
 
-fn nodata_response(domain: &str, qtype: u16) -> Vec<u8> {
-    let query = build_dns_query(domain, qtype);
-    let context = crate::dns::query::QueryContext::parse(&query).expect("query context");
-    make_empty_response(&query, &context)
-}
-
 fn answer_count(resp: &[u8]) -> u16 {
     u16::from_be_bytes([resp[6], resp[7]])
 }

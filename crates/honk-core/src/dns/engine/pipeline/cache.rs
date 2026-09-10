@@ -102,8 +102,10 @@ pub(super) async fn store(
     context: &ExecutionContext<'_>,
     cache_key: &CacheKey,
     response: &mut [u8],
+    rejected_wire: Option<&[u8]>,
     class: ResponseClass,
 ) -> EffectiveExpiry {
+    let lifetime_wire = rejected_wire.unwrap_or(response);
     if !context.reuse_eligible {
         return EffectiveExpiry::do_not_cache();
     }
@@ -115,7 +117,7 @@ pub(super) async fn store(
         return EffectiveExpiry::do_not_cache();
     }
     if matches!(class, ResponseClass::Nxdomain | ResponseClass::Servfail) {
-        let soa_ttl = extract_soa_negative_ttl(response);
+        let soa_ttl = extract_soa_negative_ttl(lifetime_wire);
         let negative_ttl = if class == ResponseClass::Nxdomain {
             let Some(ttl) = soa_ttl.filter(|ttl| *ttl > 0) else {
                 if context.forwarder.cache_enabled {
@@ -152,9 +154,40 @@ pub(super) async fn store(
         return EffectiveExpiry::cacheable(std::time::Duration::from_secs(u64::from(negative_ttl)));
     }
 
-    let answer_ttl = extract_min_ttl(response);
-    let expiry = effective_expiry(fixed_ttl, context.forwarder.cache_ttl, answer_ttl);
-    if context.forwarder.cache_enabled && expiry.is_cacheable() {
+    let rcode = response.get(3).copied().unwrap_or_default() & 0x0f;
+    let expiry = if class == ResponseClass::Nodata && rcode == 0 {
+        let ttl = fixed_ttl.unwrap_or_else(|| {
+            extract_soa_negative_ttl(lifetime_wire)
+                .unwrap_or(0)
+                .min(300)
+        });
+        if ttl == 0 {
+            EffectiveExpiry::do_not_cache()
+        } else {
+            EffectiveExpiry::cacheable(std::time::Duration::from_secs(u64::from(ttl)))
+        }
+    } else {
+        effective_expiry(
+            fixed_ttl,
+            context.forwarder.cache_ttl,
+            extract_min_ttl(lifetime_wire),
+        )
+    };
+    if !expiry.is_cacheable() {
+        if context.forwarder.cache_enabled {
+            context
+                .forwarder
+                .cache_service()
+                .await
+                .supersede_exact_if_current(
+                    context.publication_epoch,
+                    cache_key.clone(),
+                    context.refreshing,
+                );
+        }
+        return expiry;
+    }
+    if context.forwarder.cache_enabled {
         let cache_ttl = expiry.ttl().as_secs().min(u64::from(u32::MAX)) as u32;
         rewrite_answer_ttls(response, cache_ttl);
         context

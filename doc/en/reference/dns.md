@@ -13,10 +13,10 @@ This page defines the current dae-syntax `dns { ... }` section and its runtime s
 | `routing { ... }` | no rules; request fallback `default`; response fallback `accept` | Ordered request and response routing. |
 | `ipversion_prefer` | omitted: `both` | `4` selects `preferipv4`; `6` selects `preferipv6`; `0` is dae's no preference, `both`. A value honk cannot parse keeps `both` and is reported as a diagnostic. |
 | `optimistic_cache` | `true` | Enables positive and negative cache reads and writes. |
-| `optimistic_cache_ttl` | `600` seconds | Fixed positive-answer cache and wire TTL; `0` preserves the answer TTL. |
+| `optimistic_cache_ttl` | `600` seconds | Fixed positive-answer cache and wire TTL, excluding NODATA; `0` preserves the answer TTL. |
 | `optimistic_stale_reply_ttl` | `30` seconds | TTL for served-stale positive answers; a non-zero value replaces every non-OPT RR TTL, while `0` preserves cached policy-rewritten wire TTLs rather than authoritative TTLs. |
 | `max_cache_size` | `10000` | Maximum cache entries and the input to the retained wire-byte budget. |
-| `fixed_domain_ttl { ... }` | empty | Per-domain positive TTL overrides; `0` disables caching for every response code, including negatives. |
+| `fixed_domain_ttl { ... }` | empty | Per-domain positive and NODATA TTL overrides; `0` disables caching for every response code, including negatives. |
 
 ## Standalone listener (`bind`)
 
@@ -174,7 +174,7 @@ The internal `ipv4only` and `ipv6only` modes are not expressible with dae `ipver
 | Key | Default | Behavior |
 | --- | --- | --- |
 | `optimistic_cache` | `true` | Enables cache reads and publications. |
-| `optimistic_cache_ttl` | `600` | Overrides the positive answer's minimum TTL for cache lifetime and returned wire RR TTLs. `0` keeps the answer TTL. |
+| `optimistic_cache_ttl` | `600` | Overrides the positive answer's minimum TTL for cache lifetime and returned wire RR TTLs, but never applies to NODATA. `0` keeps the answer TTL. |
 | `optimistic_stale_reply_ttl` | `30` seconds | Served-stale positive answers use this TTL; a non-zero value replaces every non-OPT RR TTL. `0` preserves cached policy-rewritten wire TTLs rather than authoritative TTLs; in that case, the outcome TTL derives from `extract_min_ttl` of that wire, falling back to 60 seconds when no positive TTL exists. For a non-zero value, the outcome TTL is the configured value even when no positive TTL exists. |
 | `max_cache_size` | `10000` | Entry limit. It also scales the retained query/response wire-byte budget at 4 KiB per configured entry, with at least 65,535 bytes per shard and a 64 MiB global cap. `0` is warned and clamped to one entry. |
 | `fixed_domain_ttl { domain: seconds }` | empty | Per-domain override applied before `optimistic_cache_ttl`; `0` disables caching for every response code, including NXDOMAIN and SERVFAIL. |
@@ -184,6 +184,10 @@ Request routing runs before cache lookup. Cache and background-refresh identity 
 ### Negative answers
 
 NXDOMAIN is cached for `min(SOA TTL, SOA MINIMUM, 300)` seconds. Missing SOA or a zero SOA lifetime prevents caching and removes the existing positive and negative values for the exact cache key, so an old address cannot return as stale. A foreground result replaces whichever publication is present; a refresh removes only the revision it started from. `fixed_domain_ttl: 0` prevents caching without removing an existing entry. SERVFAIL otherwise retains its SOA-derived lifetime, defaulting to 60 seconds and clamped to `1..=300`.
+
+NODATA here means NOERROR with no answer records (`ANCOUNT=0`); a nonempty answer, including a CNAME/DNAME-only answer, remains positive. NODATA retains its full wire response in the positive slot for `min(SOA TTL, SOA MINIMUM, 300)` seconds. A nonzero `fixed_domain_ttl` takes precedence over both SOA and the cap, including when SOA is absent. Without that override, missing SOA or zero lifetime supersedes the exact slot without caching, just as for NXDOMAIN.
+
+Cached NODATA remains eligible for serve-stale; the stale rewrite changes the SOA record TTL, not SOA MINIMUM. A response-policy `reject` applied to upstream NODATA produces an empty NOERROR wire; its cache lifetime follows the same TTL rules using the rejected answer's SOA, not the synthetic wire. Subsequent requests reuse the synthetic response for that lifetime.
 
 Cache hits do not count down wire record TTLs. Supersession affects memory only; it does not delete a saved persistence row.
 

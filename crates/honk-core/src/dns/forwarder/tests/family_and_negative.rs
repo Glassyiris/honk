@@ -60,7 +60,7 @@ async fn test_prefer_ipv4_suppresses_aaaa_when_a_exists() {
 #[tokio::test]
 async fn test_prefer_ipv4_returns_aaaa_when_no_a() {
     let mock = qtype_mock(
-        nodata_response("example.com", 1),
+        nodata_response("example.com", 1, Some((30, 20))),
         make_aaaa_response(TEST_V6, 300),
     );
     let forwarder = DnsForwarder::new(
@@ -263,16 +263,13 @@ async fn cached_negative_keeps_source_aware_preferred_family_projection() {
                     let mut response = if self.rcode == 3 {
                         make_nxdomain_response(raw_query, 30, 20)
                     } else {
-                        nodata_response("example.com", 28)
+                        nodata_response("example.com", 28, None)
                     };
                     response[3] = 0x80 | self.rcode;
                     response
                 }
                 "has-a" => make_a_response([192, 0, 2, 1], 300),
-                "no-a" => {
-                    let query = crate::dns::query::QueryContext::parse(raw_query).expect("query");
-                    make_empty_response(raw_query, &query)
-                }
+                "no-a" => nodata_response("example.com", 1, Some((30, 20))),
                 _ => panic!("unexpected upstream {upstream_name}"),
             })
         }
@@ -464,4 +461,115 @@ async fn preferred_family_sibling_keeps_client_source_routing() {
     assert_eq!(answer_count(&inside), 0);
     assert_eq!(answer_count(&outside), 1);
     assert_eq!(upstream.calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn nodata_soa_lifetime_uses_minimum_and_cap_not_optimistic_ttl() {
+    let query = make_a_query();
+    for (ttl, minimum, expected) in [(30, 20, 20), (600, 600, 300)] {
+        let response = nodata_response("example.com", 1, Some((ttl, minimum)));
+        let upstream = Arc::new(MockUpstream::new(response));
+        let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router())
+            .with_cache_ttl(600);
+        let first = forwarder.resolve_outcome(&query).await.unwrap();
+        assert_eq!(first.expiry().ttl(), Duration::from_secs(expected));
+        let cached = forwarder.resolve_outcome(&query).await.unwrap();
+        assert_eq!(cached.provenance(), Provenance::Cache);
+        assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn nodata_without_soa_or_zero_soa_ttl_is_not_cached() {
+    let query = make_a_query();
+    for soa in [None, Some((0, 20))] {
+        let upstream = Arc::new(MockUpstream::new(nodata_response("example.com", 1, soa)));
+        let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router())
+            .with_cache_ttl(600);
+        for _ in 0..2 {
+            let outcome = forwarder.resolve_outcome(&query).await.unwrap();
+            assert!(!outcome.expiry().is_cacheable());
+        }
+        assert_eq!(upstream.call_count.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
+async fn nodata_fixed_ttl_overrides_missing_soa_and_negative_cap() {
+    let query = make_a_query();
+    let upstream = Arc::new(MockUpstream::new(nodata_response("example.com", 1, None)));
+    let fixed_ttl = std::collections::HashMap::from([("example.com".to_owned(), 3600)]);
+    let router = Arc::new(
+        DnsRouter::new_with_fixed_ttl(&DnsRouting::default(), &fixed_ttl).expect("router"),
+    );
+    let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), router).with_cache_ttl(600);
+    let first = forwarder.resolve_outcome(&query).await.unwrap();
+    assert_eq!(first.expiry().ttl(), Duration::from_secs(3600));
+    let cached = forwarder.resolve_outcome(&query).await.unwrap();
+    assert_eq!(cached.provenance(), Provenance::Cache);
+    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn nodata_response_policy_reject_caches_synthetic_for_rejected_soa_lifetime() {
+    use honk_config::dns::{DnsResponseAction, DnsResponseRouting};
+
+    let query = make_a_query();
+    let routing = DnsRouting {
+        response: DnsResponseRouting {
+            rules: Vec::new(),
+            fallback: DnsResponseAction::Reject,
+        },
+        ..Default::default()
+    };
+    let upstream = Arc::new(MockUpstream::new(nodata_response(
+        "example.com",
+        1,
+        Some((30, 20)),
+    )));
+    let forwarder = DnsForwarder::new(
+        upstream.clone(),
+        test_cache(),
+        Arc::new(DnsRouter::new(&routing).expect("router")),
+    )
+    .with_cache_ttl(600);
+    let first = forwarder.resolve_outcome(&query).await.unwrap();
+    assert_eq!(first.status(), OutcomeStatus::Rejected);
+    assert_eq!(first.expiry().ttl(), Duration::from_secs(20));
+    assert_eq!(first.reusable().len(), query.len());
+    assert_eq!(first.reusable()[3] & 0x0f, 0);
+    let cached = forwarder.resolve_outcome(&query).await.unwrap();
+    assert_eq!(cached.provenance(), Provenance::Cache);
+    assert_eq!(cached.reusable(), first.reusable());
+    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
+
+    let positive = Arc::new(MockUpstream::new(make_a_response([192, 0, 2, 1], 30)));
+    let positive_router = Arc::new(DnsRouter::new(&routing).unwrap());
+    let positive_forwarder =
+        DnsForwarder::new(positive.clone(), test_cache(), positive_router).with_cache_ttl(600);
+    let rejected = positive_forwarder.resolve_outcome(&query).await.unwrap();
+    assert_eq!(rejected.status(), OutcomeStatus::Rejected);
+    assert_eq!(rejected.expiry().ttl(), Duration::from_secs(600));
+    let cached = positive_forwarder.resolve_outcome(&query).await.unwrap();
+    assert_eq!(cached.provenance(), Provenance::Cache);
+    assert_eq!(cached.reusable(), rejected.reusable());
+    assert_eq!(positive.call_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn empty_refused_response_keeps_optimistic_cache_lifetime() {
+    let query = make_a_query();
+    let mut response = query.clone();
+    response[2] = 0x81;
+    response[3] = 0x85;
+    let upstream = Arc::new(MockUpstream::new(response));
+    let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router())
+        .with_cache_ttl(600);
+    let first = forwarder.resolve_outcome(&query).await.unwrap();
+    assert_eq!(first.expiry().ttl(), Duration::from_secs(600));
+    assert_eq!(first.rendered()[3] & 0x0f, 5);
+    let cached = forwarder.resolve_outcome(&query).await.unwrap();
+    assert_eq!(cached.provenance(), Provenance::Cache);
+    assert_eq!(cached.rendered()[3] & 0x0f, 5);
+    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
 }

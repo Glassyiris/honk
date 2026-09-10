@@ -13,10 +13,10 @@
 | `routing { ... }` | 无规则；request fallback 为 `default`；response fallback 为 `accept` | 有序的 request 与 response 路由。 |
 | `ipversion_prefer` | 省略：`both` | `4` 选择 `preferipv4`；`6` 选择 `preferipv6`；`0` 是 dae 的无偏好，即 `both`。honk 无法解析的值保持 `both`，并输出诊断。 |
 | `optimistic_cache` | `true` | 启用正、负缓存的读取与写入。 |
-| `optimistic_cache_ttl` | `600` 秒 | 固定的正应答缓存和 wire TTL；`0` 保留应答 TTL。 |
+| `optimistic_cache_ttl` | `600` 秒 | 固定正应答的缓存和报文 TTL，不适用于 NODATA；`0` 保留应答 TTL。 |
 | `optimistic_stale_reply_ttl` | `30` 秒 | serve-stale 正应答使用的 TTL；非零值替换每个非 OPT RR 的 TTL，`0` 保留缓存中已按策略改写的 wire TTL，而不是权威 TTL。 |
 | `max_cache_size` | `10000` | 缓存最大条目数，也是保留 wire 字节预算的输入。 |
-| `fixed_domain_ttl { ... }` | 空 | 按域名覆盖正应答 TTL；`0` 禁止缓存所有响应码的应答，包括负应答。 |
+| `fixed_domain_ttl { ... }` | 空 | 按域名覆盖正应答和 NODATA 的 TTL；`0` 禁止缓存所有响应码的应答，包括负应答。 |
 
 ## 独立监听器（`bind`）
 
@@ -174,7 +174,7 @@ cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
 | 键 | 默认值 | 行为 |
 | --- | --- | --- |
 | `optimistic_cache` | `true` | 启用缓存读取与发布。 |
-| `optimistic_cache_ttl` | `600` | 覆盖正应答的最小 TTL，用于缓存生命周期和返回的 wire RR TTL。`0` 保留应答 TTL。 |
+| `optimistic_cache_ttl` | `600` | 覆盖正应答的最小 TTL，用于缓存生命周期和返回的记录 TTL，不适用于 NODATA。`0` 保留应答 TTL。 |
 | `optimistic_stale_reply_ttl` | `30` 秒 | serve-stale 正应答使用此 TTL；非零值替换每个非 OPT RR 的 TTL。`0` 保留缓存中已按策略改写的 wire TTL，而不是权威 TTL；此时 outcome TTL 从该 wire 的 `extract_min_ttl` 得出，不存在正 TTL 时回退为 60 秒。非零值时，即使不存在正 TTL，outcome TTL 仍为配置值。 |
 | `max_cache_size` | `10000` | 条目上限。它还按每个配置条目 4 KiB 缩放保留 query/response wire 字节预算；每个分片至少 65,535 字节，全局上限 64 MiB。`0` 会告警并钳制为一个条目。 |
 | `fixed_domain_ttl { domain: seconds }` | 空 | 先于 `optimistic_cache_ttl` 应用的按域名覆盖；`0` 禁止缓存所有响应码的应答，包括 NXDOMAIN 和 SERVFAIL。 |
@@ -184,6 +184,10 @@ Request 路由先于缓存查询执行。缓存与后台 refresh 的标识使用
 ### 负应答
 
 NXDOMAIN 的缓存时间为 `min(SOA TTL, SOA MINIMUM, 300)` 秒。缺少 SOA 或 SOA 生命周期为零时不缓存，并移除精确缓存键下已有的正、负缓存，避免旧地址再次作为过期应答返回。前台结果替换当时已有的发布结果；后台刷新只移除开始时读取的版本。`fixed_domain_ttl: 0` 禁止缓存，但不移除已有条目。除此之外，SERVFAIL 仍使用 SOA 得出的生命周期，缺省为 60 秒，并限制在 `1..=300` 秒。
+
+此处 NODATA 指没有 answer 记录的 NOERROR 应答（`ANCOUNT=0`）；answer 非空时仍归为正应答，包括仅含 CNAME/DNAME 的应答。NODATA 的完整报文保留在正缓存槽中，生命周期为 `min(SOA TTL, SOA MINIMUM, 300)` 秒。非零 `fixed_domain_ttl` 优先于 SOA 和上限，即使缺少 SOA 也生效。没有该覆盖值时，缺少 SOA 或生命周期为零的 NODATA 与 NXDOMAIN 一样：移除精确缓存槽，不保留新应答。
+
+缓存的 NODATA 仍可作为过期应答返回；过期应答改写的是 SOA 记录 TTL，而不是 SOA MINIMUM。对上游 NODATA 应用响应策略 `reject` 会生成空的 NOERROR 报文；其缓存生命周期按相同的 TTL 规则计算，使用被拒绝应答的 SOA，而非合成报文。后续请求会在该生命周期内复用合成应答。
 
 缓存命中时不会递减报文中的记录 TTL。替换只影响内存，不删除已保存的持久化行。
 
