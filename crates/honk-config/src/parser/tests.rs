@@ -606,6 +606,107 @@ group {
     }
 
     #[test]
+    fn test_standalone_group_filter_comments_and_bare_tags() {
+        let input = r#"
+node {
+    edge: 'socks5://127.0.0.1:1080'
+}
+group {
+    proxy {
+        filter: group('hk')   # note
+    }
+    multi {
+        filter: group(hk, sg)
+    }
+}
+"#;
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+
+        assert_eq!(config.groups[0].groups, vec!["hk"]);
+        assert!(config.groups[0].nodes.is_empty());
+        assert_eq!(config.groups[1].groups, vec!["hk", "sg"]);
+        assert!(config.groups[1].nodes.is_empty());
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_mixed_group_filter_is_reported_and_stays_empty() {
+        let input = r#"
+node {
+    edge: 'socks5://127.0.0.1:1080'
+    other: 'socks5://127.0.0.1:1081'
+}
+group {
+    hk {
+        filter: name('edge')
+    }
+    proxy {
+        filter: group('hk') && name('edge')
+    }
+    later {
+        filter: name('other')
+    }
+}
+"#;
+        let mut diagnostics = Vec::new();
+        let mut config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+
+        assert!(config.groups[1].groups.is_empty());
+        assert!(config.groups[1].nodes.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].setting, "group.proxy.filter");
+        assert_eq!(diagnostics[0].value, "1");
+        assert_eq!(
+            diagnostics[0].message,
+            "group(...) must be the whole filter line; ignored"
+        );
+        assert_eq!(config.groups[0].nodes, vec![config.nodes[0].id]);
+        assert_eq!(config.groups[2].nodes, vec![config.nodes[1].id]);
+
+        config
+            .nodes
+            .push(crate::node::Node::from_share_link("socks5://127.0.0.1:1082#new").unwrap());
+        crate::parser::resolve_group_filters(
+            &mut config.groups,
+            &config.nodes,
+            &config.subscriptions,
+        );
+
+        assert!(config.groups[1].groups.is_empty());
+        assert!(config.groups[1].nodes.is_empty());
+    }
+
+    #[test]
+    fn test_nested_call_in_group_filter_is_reported() {
+        let input = r#"
+node {
+    edge: 'socks5://127.0.0.1:1080'
+}
+group {
+    proxy {
+        filter: group('hk' && name('edge')
+    }
+}
+"#;
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+        let group = |name: &str| {
+            config
+                .groups
+                .iter()
+                .find(|g| g.name == name)
+                .unwrap_or_else(|| panic!("group '{}' missing", name))
+        };
+
+        assert!(group("proxy").groups.is_empty());
+        assert!(group("proxy").nodes.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].setting, "group.proxy.filter");
+        assert_eq!(diagnostics[0].value, "1");
+    }
+
+    #[test]
     fn test_entry_node_escaped_quote_tag() {
         let config = parse_dae_config(
             r#"node {

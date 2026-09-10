@@ -82,13 +82,13 @@ For Clash compatibility, Score remains automatic but is represented as `type: "u
 
 ## Filter resolution
 
-1. `group('tag')` adds nested tags to `groups`; it is not evaluated as a node predicate. A nested tag may contribute the leaf selected by that group's current policy.
+1. A standalone `group('tag')` line adds nested tags to `groups`; it is not evaluated as a node predicate. A nested tag may contribute the leaf selected by that group's current policy. A `group(...)` line containing another predicate or trailing text is reported as a diagnostic and ignored; a group whose only filter is such a line remains empty.
 2. `name(...)` matches `Node.name`. `subtag(...)` maps `Node.subscription_id` to the current subscription tag and matches that tag. Plain arguments are exact matches, `keyword:` is a substring match, and `regex:` is a raw regular expression. Matching is case-sensitive; multiple arguments in one predicate are alternatives.
-3. Predicates joined by `&&` on one line are AND-ed. Prefixing a predicate with `!` negates it. Separate `name(...)` and `subtag(...)` `filter:` lines are OR-ed; `group(...)` lines add nested candidates.
+3. Predicates joined by `&&` on one line are AND-ed. Prefixing a predicate with `!` negates it. Separate `name(...)` and `subtag(...)` `filter:` lines are OR-ed; standalone `group(...)` lines add nested candidates.
 4. Filter-derived membership is rebuilt after every subscription refresh. Stable node UUIDs therefore do not retain stale membership after their subscription provenance changes.
 5. A group with neither node filters nor nested groups receives all current nodes. A group with nested groups but no node filters receives only its nested candidates, not all nodes.
 
-A filter honk cannot parse is ignored and reported by its ordinal among the group's node filters, excluding `group(...)` entries.
+A filter honk cannot parse is ignored and reported by its ordinal among the group's node filters, excluding only standalone `group(...)` lines; mixed lines are counted.
 
 ## Nested groups
 

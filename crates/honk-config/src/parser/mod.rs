@@ -418,10 +418,8 @@ fn resolve_group_filters_inner(
             .iter()
             .enumerate()
             .map(|(index, filter)| (index, filter.trim()))
-            // Unterminated group filters must not trigger the all-nodes fallback.
-            .filter(|(_, filter)| {
-                !filter.starts_with("group(") || find_unquoted(filter, ")").is_none()
-            })
+            // Non-standalone group references must not trigger the all-nodes fallback.
+            .filter(|(_, filter)| standalone_group_reference(filter).is_none())
             .collect();
 
         if filters.is_empty() {
@@ -443,12 +441,15 @@ fn resolve_group_filters_inner(
                 diagnostics.push(ConfigDiagnostic {
                     setting: format!("group.{}.filter", group.name),
                     value: (index + 1).to_string(),
-                    message: if filter.starts_with("group(") {
-                        "group(...) is unterminated; ignored"
-                    } else {
-                        "honk could not parse this filter; ignored"
-                    }
-                    .to_string(),
+                    message:
+                        if filter.starts_with("group(") && find_unquoted(filter, ")").is_none() {
+                            "group(...) is unterminated; ignored"
+                        } else if filter.starts_with("group(") {
+                            "group(...) must be the whole filter line; ignored"
+                        } else {
+                            "honk could not parse this filter; ignored"
+                        }
+                        .to_string(),
                 });
             }
         }
@@ -864,6 +865,14 @@ fn split_unquoted<'a>(input: &'a str, delimiter: &'a str) -> impl Iterator<Item 
     })
 }
 
+/// Returns the raw argument text of a standalone `group(...)` filter line.
+fn standalone_group_reference(val: &str) -> Option<&str> {
+    let body = strip_unquoted_comment(val.trim().strip_prefix("group(")?);
+    let end = find_unquoted(body, ")")?;
+    let args = &body[..end];
+    (body[end + 1..].trim().is_empty() && find_unquoted(args, "(").is_none()).then_some(args)
+}
+
 fn extract_fn_args(expr: &str, fn_name: &str) -> Option<Vec<String>> {
     let body = expr.strip_prefix(fn_name)?.strip_prefix('(')?;
     let args = &body[..find_unquoted(body, ")")?];
@@ -985,10 +994,10 @@ fn parse_group_section(
                 .split_once(':')
                 .map(|(_, v)| strip_unquoted_comment(v.trim()).trim())
                 .unwrap_or("");
-            if let Some(tags) = extract_fn_args(val, "group") {
-                for tag in tags
-                    .iter()
-                    .flat_map(|t| t.split(['|', ',']).map(str::trim))
+            if let Some(args) = standalone_group_reference(val) {
+                for tag in split_unquoted(args, ",")
+                    .map(unquote_filter_argument)
+                    .flat_map(|tag| tag.split(['|', ',']).map(str::trim))
                     .map(str::to_string)
                 {
                     if !tag.is_empty() && !group.groups.contains(&tag) {
