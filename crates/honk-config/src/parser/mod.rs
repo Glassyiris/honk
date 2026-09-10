@@ -592,6 +592,40 @@ fn unquote_filter_argument(value: &str) -> &str {
     value
 }
 
+fn split_entry_tag(mut line: &str) -> (Option<&str>, &str) {
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' | b'"' => {
+                if let Some(end) = quoted_end(bytes, index) {
+                    index = end;
+                    continue;
+                }
+            }
+            b'#' if index == 0 || matches!(bytes[index - 1], b' ' | b'\t') => {
+                line = line[..index].trim_end();
+                break;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+
+    if line.starts_with(['\'', '"']) {
+        if let Some(end) = quoted_end(line.as_bytes(), 0)
+            && let Some(value) = line[end..].trim_start().strip_prefix(':')
+        {
+            return (Some(&line[..end]), value.trim());
+        }
+    } else if let Some(pos) = line.find(':')
+        && !line[pos..].starts_with("://")
+    {
+        return (Some(&line[..pos]), line[pos + 1..].trim());
+    }
+    (None, line)
+}
+
 fn parse_kv_pair(line: &str) -> Option<(&str, &str)> {
     let trimmed = strip_unquoted_comment(line.trim()).trim();
     let (key, value) = trimmed.split_once(':')?;
@@ -878,31 +912,21 @@ fn parse_node_section(section: &Block) -> Result<Vec<Node>, crate::ConfigError> 
             ));
         }
         let unquote = |s: &str| s.trim().trim_matches(|c| c == '\'' || c == '"').to_string();
-        // Shapes: `tag: 'uri'` | `'tag': 'uri'` | `'uri'` | bare `scheme://uri`.
-        // The first colon only splits tag/uri when it sits outside any quotes
-        // and is not the URI scheme separator (`://`).
-        let (tag, uri) = if trimmed.starts_with(['\'', '"']) {
-            let q = trimmed.as_bytes()[0] as char;
-            match trimmed[1..].find(q) {
-                Some(rel) => {
-                    let close = 1 + rel;
-                    let after = trimmed[close + 1..].trim_start();
-                    if let Some(rest) = after.strip_prefix(':') {
-                        (trimmed[1..close].to_string(), unquote(rest))
-                    } else {
-                        (String::new(), trimmed[1..close].to_string())
-                    }
-                }
-                None => (String::new(), unquote(trimmed)),
+        let (tag, value) = split_entry_tag(trimmed);
+        let (tag, uri) = match tag {
+            Some(tag) if tag.starts_with(['\'', '"']) => {
+                (tag[1..tag.len() - 1].to_string(), unquote(value))
             }
-        } else if let Some(pos) = trimmed.find(':') {
-            if trimmed[pos..].starts_with("://") || trimmed[..pos].contains(char::is_whitespace) {
-                (String::new(), trimmed.to_string())
-            } else {
-                (unquote(&trimmed[..pos]), unquote(&trimmed[pos + 1..]))
-            }
-        } else {
-            (String::new(), unquote(trimmed))
+            Some(tag) if tag.contains(char::is_whitespace) => (String::new(), trimmed.to_string()),
+            Some(tag) => (unquote(tag), unquote(value)),
+            None if value.starts_with(['\'', '"']) => (
+                String::new(),
+                quoted_end(value.as_bytes(), 0)
+                    .map(|end| value[1..end - 1].to_string())
+                    .unwrap_or_else(|| unquote(value)),
+            ),
+            None if value.contains(':') => (String::new(), value.to_string()),
+            None => (String::new(), unquote(value)),
         };
         match Node::from_share_link(&uri) {
             Ok(mut node) => {
@@ -1076,10 +1100,29 @@ fn append_subscriptions(
 }
 
 fn parse_subscription_entry(line: &str) -> Option<Subscription> {
-    let (tag, value) = line.trim().split_once(':')?;
-    let (url, user_agent) = parse_subscription_value(value);
+    let (tag, value) = split_entry_tag(line.trim());
+    let (mut url, user_agent) = parse_subscription_value(value);
+    let name = if let Some(tag) = tag {
+        unquote_filter_argument(tag).to_string()
+    } else {
+        let tag_colon = url.find(':').filter(|&pos| !url[pos..].starts_with("://"));
+        let value = tag_colon.map_or(url.as_str(), |pos| &url[pos + 1..]);
+        if !value.contains("://") {
+            return None;
+        }
+        if let Some(pos) = tag_colon {
+            let name = url[..pos].to_string();
+            url.drain(..=pos);
+            name
+        } else {
+            url::Url::parse(&url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .unwrap_or_default()
+        }
+    };
     Some(Subscription {
-        name: unquote_filter_argument(tag).to_string(),
+        name,
         url,
         user_agent,
         ..Default::default()
@@ -1090,15 +1133,45 @@ fn parse_subscription_value(value: &str) -> (String, Option<String>) {
     let value = value.trim();
     if matches!(value.as_bytes().first().copied(), Some(b'\'' | b'"'))
         && let Some(end) = quoted_end(value.as_bytes(), 0)
-        && let Some(ua) = value[end..]
-            .trim()
+    {
+        let mut remainder = value[end..].trim();
+        if remainder.is_empty() || remainder.starts_with('#') {
+            return (value[1..end - 1].to_string(), None);
+        }
+        if remainder.starts_with('(') {
+            let bytes = remainder.as_bytes();
+            let mut depth = 0;
+            let mut index = 0;
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'\'' | b'"' => {
+                        if let Some(end) = quoted_end(bytes, index) {
+                            index = end;
+                            continue;
+                        }
+                    }
+                    b'(' => depth += 1,
+                    b')' if depth > 0 => {
+                        depth -= 1;
+                        if depth == 0 && bytes.get(index + 1) == Some(&b'#') {
+                            remainder = &remainder[..index + 1];
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                index += 1;
+            }
+        }
+        if let Some(ua) = remainder
             .strip_prefix('(')
             .and_then(|ua| ua.strip_suffix(')'))
-    {
-        return (
-            value[1..end - 1].to_string(),
-            Some(unquote_filter_argument(ua).to_string()),
-        );
+        {
+            return (
+                value[1..end - 1].to_string(),
+                Some(unquote_filter_argument(ua).to_string()),
+            );
+        }
     }
     (unquote_filter_argument(value).to_string(), None)
 }

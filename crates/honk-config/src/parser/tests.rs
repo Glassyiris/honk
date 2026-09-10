@@ -606,6 +606,397 @@ group {
     }
 
     #[test]
+    fn test_entry_node_escaped_quote_tag() {
+        let config = parse_dae_config(
+            r#"node {
+    'a\'b': 'socks5://127.0.0.1:1080'
+}"#,
+        )
+        .unwrap();
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].name, r"a\'b");
+    }
+
+    #[test]
+    fn test_entry_node_escaped_quote_uri() {
+        let config = parse_dae_config(
+            r#"node {
+    'socks5://127.0.0.1:1080#left\':socks5://127.0.0.2:1081#right'
+}"#,
+        )
+        .unwrap();
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].host, "127.0.0.1");
+        assert_eq!(config.nodes[0].port, 1080);
+        assert_eq!(
+            config.nodes[0].name,
+            r"left\':socks5://127.0.0.2:1081#right"
+        );
+    }
+
+    #[test]
+    fn test_entry_node_spaced_tag() {
+        let config = parse_dae_config("node {\n edge : 'socks5://127.0.0.1:1080'\n}").unwrap();
+        assert!(config.nodes.is_empty());
+        let config =
+            parse_dae_config("node {\n 'edge west': 'socks5://127.0.0.1:1080'\n}").unwrap();
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].name, "edge west");
+        assert_eq!(config.nodes[0].host, "127.0.0.1");
+        assert_eq!(config.nodes[0].port, 1080);
+    }
+
+    #[test]
+    fn test_entry_comment_tagless_file_subscription() {
+        let config = parse_dae_config(
+            "subscription {\n 'file://relative/path/to/mysub.sub' # Put subscription content in /etc/dae/relative/path/to/mysub.sub\n}",
+        )
+        .unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(
+            config.subscriptions[0].url,
+            "file://relative/path/to/mysub.sub"
+        );
+        assert_eq!(config.subscriptions[0].name, "relative");
+        assert_eq!(config.subscriptions[0].user_agent, None);
+    }
+
+    #[test]
+    fn test_entry_comment_tagged_subscription() {
+        let config = parse_dae_config("subscription {\n tag: 'https://h/p' # c\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "tag");
+        assert_eq!(config.subscriptions[0].url, "https://h/p");
+        assert_eq!(config.subscriptions[0].user_agent, None);
+    }
+
+    #[test]
+    fn test_entry_comment_quoted_subscription_glued_user_agent() {
+        let config = parse_dae_config(
+            "subscription {\n sub: 'http://sub'(honk/1.0 like)#xxxx\n other: 'http://other'(agent)# note\n}",
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .subscriptions
+                .iter()
+                .map(|sub| (
+                    sub.name.as_str(),
+                    sub.url.as_str(),
+                    sub.user_agent.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("sub", "http://sub", Some("honk/1.0 like")),
+                ("other", "http://other", Some("agent")),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_entry_comment_quoted_subscription_glued_url() {
+        let config = parse_dae_config("subscription {\n tag: 'http://q'#c\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "tag");
+        assert_eq!(config.subscriptions[0].url, "http://q");
+        assert_eq!(config.subscriptions[0].user_agent, None);
+    }
+
+    #[test]
+    fn test_entry_comment_quoted_subscription_parentheses_in_comment() {
+        let config = parse_dae_config("subscription {\n tag: 'http://q'(ua)#c(x)\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "tag");
+        assert_eq!(config.subscriptions[0].url, "http://q");
+        assert_eq!(config.subscriptions[0].user_agent.as_deref(), Some("ua"));
+    }
+
+    #[test]
+    fn test_entry_comment_quoted_subscription_hash_in_user_agent() {
+        let config =
+            parse_dae_config("subscription {\n tag: 'http://q'(agent#build)#c\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "tag");
+        assert_eq!(config.subscriptions[0].url, "http://q");
+        assert_eq!(
+            config.subscriptions[0].user_agent.as_deref(),
+            Some("agent#build")
+        );
+    }
+
+    #[test]
+    fn test_entry_comment_quoted_subscription_empty_user_agent() {
+        let config = parse_dae_config("subscription {\n tag: 'http://q'()#c\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "tag");
+        assert_eq!(config.subscriptions[0].url, "http://q");
+        assert_eq!(config.subscriptions[0].user_agent.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_entry_comment_quoted_subscription_remainder_controls() {
+        for (value, url, user_agent) in [
+            ("'http://q'(agent) junk", "'http://q'(agent) junk", None),
+            ("'http://q'(agent", "'http://q'(agent", None),
+            ("'http://q'(ua)(x)", "http://q", Some("ua)(x")),
+            (
+                "'http://q'('agent)#build')",
+                "http://q",
+                Some("agent)#build"),
+            ),
+        ] {
+            let config = parse_dae_config(&format!("subscription {{\n tag: {value}\n}}")).unwrap();
+            assert_eq!(config.subscriptions.len(), 1, "{value}");
+            assert_eq!(config.subscriptions[0].name, "tag", "{value}");
+            assert_eq!(config.subscriptions[0].url, url, "{value}");
+            assert_eq!(
+                config.subscriptions[0].user_agent.as_deref(),
+                user_agent,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_entry_comment_quoted_subscription_nested_parentheses() {
+        let config = parse_dae_config(
+            "subscription {\n tag: 'http://q'(Mozilla/5.0 (X11; (Linux)#build))\n}",
+        )
+        .unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "tag");
+        assert_eq!(config.subscriptions[0].url, "http://q");
+        assert_eq!(
+            config.subscriptions[0].user_agent.as_deref(),
+            Some("Mozilla/5.0 (X11; (Linux)#build)")
+        );
+    }
+
+    #[test]
+    fn test_entry_comment_node_glued_hash_controls() {
+        let config = parse_dae_config(
+            "node {\n 'ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:8388#hk1'#note\n ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:8388#hk2#note\n}",
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .nodes
+                .iter()
+                .map(|node| (node.name.as_str(), node.host.as_str(), node.port))
+                .collect::<Vec<_>>(),
+            vec![("hk1", "1.2.3.4", 8388), ("hk2#note", "1.2.3.4", 8388)]
+        );
+    }
+
+    #[test]
+    fn test_entry_comment_bare_node_fragment() {
+        let config =
+            parse_dae_config("node {\n ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:8388#hk1 # note\n}")
+                .unwrap();
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].name, "hk1");
+        assert_eq!(config.nodes[0].host, "1.2.3.4");
+        assert_eq!(config.nodes[0].port, 8388);
+    }
+
+    #[test]
+    fn test_entry_comment_tagged_node() {
+        let config =
+            parse_dae_config("node {\n edge: 'socks5://127.0.0.1:1080' # note\n}").unwrap();
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].name, "edge");
+        assert_eq!(config.nodes[0].host, "127.0.0.1");
+        assert_eq!(config.nodes[0].port, 1080);
+    }
+
+    #[test]
+    fn test_entry_comment_quoted_node_trailing_text() {
+        let config =
+            parse_dae_config("node {\n 'ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:8388#hk1' # note\n}")
+                .unwrap();
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].name, "hk1");
+        assert_eq!(config.nodes[0].host, "1.2.3.4");
+        assert_eq!(config.nodes[0].port, 8388);
+    }
+
+    #[test]
+    fn test_entry_subscription_tagless_quoted() {
+        let config =
+            parse_dae_config("subscription {\n 'https://example.com/no_tag_link'\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "example.com");
+        assert_eq!(
+            config.subscriptions[0].url,
+            "https://example.com/no_tag_link"
+        );
+        assert_eq!(config.subscriptions[0].user_agent, None);
+    }
+
+    #[test]
+    fn test_entry_subscription_tagless_bare() {
+        let config =
+            parse_dae_config("subscription {\n https://example.net/sub?x=(1)#frag\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "example.net");
+        assert_eq!(
+            config.subscriptions[0].url,
+            "https://example.net/sub?x=(1)#frag"
+        );
+        assert_eq!(config.subscriptions[0].user_agent, None);
+    }
+
+    #[test]
+    fn test_entry_subscription_tagless_user_agent() {
+        let config =
+            parse_dae_config("subscription {\n 'https://example.org/sub'(provider/2.0)\n}")
+                .unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "example.org");
+        assert_eq!(config.subscriptions[0].url, "https://example.org/sub");
+        assert_eq!(
+            config.subscriptions[0].user_agent.as_deref(),
+            Some("provider/2.0")
+        );
+    }
+
+    #[test]
+    fn test_entry_subscription_tag_inside_literal() {
+        let config =
+            parse_dae_config("subscription {\n 'paid:https://example.com/sub'\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "paid");
+        assert_eq!(config.subscriptions[0].url, "https://example.com/sub");
+        assert_eq!(config.subscriptions[0].user_agent, None);
+    }
+
+    #[test]
+    fn test_entry_subscription_apostrophe_tag() {
+        let config =
+            parse_dae_config("subscription {\n edge': https://example.com/sub\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "edge'");
+        assert_eq!(config.subscriptions[0].url, "https://example.com/sub");
+        assert_eq!(config.subscriptions[0].user_agent, None);
+    }
+
+    #[test]
+    fn test_entry_subscription_escaped_quote_tag() {
+        let config = parse_dae_config(
+            r#"subscription {
+    "paid\"east": "https://example.com/sub"(provider/2.0)
+}"#,
+        )
+        .unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, r#"paid\"east"#);
+        assert_eq!(config.subscriptions[0].url, "https://example.com/sub");
+        assert_eq!(
+            config.subscriptions[0].user_agent.as_deref(),
+            Some("provider/2.0")
+        );
+    }
+
+    #[test]
+    fn test_entry_subscription_colliding_names_select_both_nodes() {
+        let mut config = parse_dae_config(
+            r#"subscription {
+    example.com: 'https://other.example/paid'
+    'https://example.com/free'
+}
+node {
+    paid: 'socks5://127.0.0.1:1080'
+    free: 'socks5://127.0.0.2:1080'
+}
+group {
+    proxy {
+        filter: subtag(example.com)
+    }
+}"#,
+        )
+        .unwrap();
+        assert_eq!(config.subscriptions.len(), 2);
+        assert_eq!(config.nodes.len(), 2);
+        config.nodes[0].subscription_id = Some(config.subscriptions[0].id);
+        config.nodes[1].subscription_id = Some(config.subscriptions[1].id);
+        crate::parser::resolve_group_filters(
+            &mut config.groups,
+            &config.nodes,
+            &config.subscriptions,
+        );
+        assert_eq!(
+            config.groups[0].nodes,
+            vec![config.nodes[0].id, config.nodes[1].id]
+        );
+        assert_eq!(
+            config
+                .subscriptions
+                .iter()
+                .map(|sub| (
+                    sub.name.as_str(),
+                    sub.url.as_str(),
+                    sub.user_agent.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("example.com", "https://other.example/paid", None),
+                ("example.com", "https://example.com/free", None),
+            ]
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_entry_subscription_hostless_validation() {
+        let config = parse_dae_config("subscription {\n 'https://:80/x'\n}").unwrap();
+        let crate::ConfigError::Validation(message) = config.validate().unwrap_err() else {
+            panic!("expected subscription validation error");
+        };
+        assert_eq!(message, "subscription name must not be empty");
+    }
+
+    #[test]
+    fn test_entry_subscription_hostless_name() {
+        let config = parse_dae_config("subscription {\n 'https://:80/x'\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "");
+        assert_eq!(config.subscriptions[0].url, "https://:80/x");
+        assert_eq!(config.subscriptions[0].user_agent, None);
+    }
+
+    #[test]
+    fn test_entry_subscription_spaced_tag() {
+        let config =
+            parse_dae_config("subscription {\n paid : https://example.com/sub\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "paid");
+        assert_eq!(config.subscriptions[0].url, "https://example.com/sub");
+        assert_eq!(config.subscriptions[0].user_agent, None);
+    }
+
+    #[test]
+    fn test_entry_subscription_tagged_invalid_url() {
+        let config = parse_dae_config("subscription {\n broken: not-a-url\n}").unwrap();
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "broken");
+        assert_eq!(config.subscriptions[0].url, "not-a-url");
+        assert_eq!(config.subscriptions[0].user_agent, None);
+        let crate::ConfigError::Validation(message) = config.validate().unwrap_err() else {
+            panic!("expected subscription validation error");
+        };
+        assert_eq!(
+            message,
+            "subscription 'broken' url must use http:// or https://"
+        );
+    }
+
+    #[test]
+    fn test_entry_subscription_tagless_garbage() {
+        let config = parse_dae_config("subscription {\n foo bar\n}").unwrap();
+        assert!(config.subscriptions.is_empty());
+    }
+
+    #[test]
     fn test_parse_subscriptions() {
         let input = r#"
 subscription {

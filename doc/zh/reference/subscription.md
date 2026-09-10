@@ -4,12 +4,13 @@
 
 ## `subscription {}` 语法
 
-每个条目支持以下两种形式：
+每个条目支持以下形式：
 
 ```dae
 subscription {
     primary: 'https://example.com/sub'
     compatible: 'https://example.net/sub'(honk/1.0 like)
+    'https://example.com/no_tag_link'
     detailed: {
         url: 'https://example.org/sub'
         ua: 'honk/1.0'
@@ -20,14 +21,24 @@ subscription {
 
 简写 `tag: URL` 使用默认 `honk/<version>` User-Agent；在带引号的 URL 后追加 `(UA)` 即可覆盖。块形式接受 `url`、可选的 `ua` 和可选的 `interval`；`interval` 是 duration，默认 `86400s`，设为 `0` 可禁用定期刷新。
 
-其他情况下 URL 可以使用单引号，也可以不加引号；普通 HTTP(S) URL 必须带 tag，因为解析器按第一个 `:` 分派。`(UA)` 后缀要求 URL 带引号，以免与裸 URL 自身的括号产生歧义。两种形式的 `sub_type` 都保持为 `simple`，会自动识别下文列出的正文格式。
+tag 可以省略。条目不带引号时，第一个 `:` 之前的文本是 tag；如果该冒号属于 `://`，则没有 tag，也不会按 URL 中后续的冒号拆分。tag 和 URL 都可以使用配对的单引号或双引号。带引号的 tag 后接 `:` 表示显式 tag；否则，解析器先去掉 URL 的外层引号，再应用相同的首个冒号规则。因此，`'paid:https://example.com/sub'` 的 tag 是 `paid`，而 `'https://example.com/sub'` 没有 tag。`(UA)` 后缀要求 URL 带引号，以免与裸 URL 自身的括号产生歧义。两种形式的 `sub_type` 都保持为 `simple`，会自动识别下文列出的正文格式。
+
+不带 tag 的条目使用 URL 的主机名作为名称：`'https://example.com/sub'` 的名称是 `example.com`。如果无法解析出主机名，名称保持为空，配置验证会拒绝该条目。验证不要求名称唯一：显式 tag `example.com` 与该主机上不带 tag 的 URL 都匹配 `subtag(example.com)`，该筛选条件会选中两个订阅的节点。按主机名生成名称仅适用于 dae；JSON、YAML 和 TOML 仍要求提供 `name`。
+
+不带 tag 且不含 `://` 的文本会被忽略。带显式 tag 的条目仍交给配置验证，要求名称非空且 URL 使用 HTTP(S)。`file://`、`http-file://` 和 `https-file://` 仍不受支持。
+
+条目行中，配对引号之外的 `#` 位于语句开头或紧跟 ASCII 空格、制表符时，会开始注释。裸 URL 中紧贴前文的 `#` 仍是数据，即使前一个字符是括号也不例外，例如 `https://example.com/sub?filter=(hk)#token`。未配对的引号按普通文本处理。User-Agent 中若包含前有空格的 `#`，应给 UA 加引号：`'https://example.com/sub'('agent # build')`；否则，注释会截断该后缀。
+
+URL 带引号时，紧跟结束引号的 `#` 也会开始注释；紧跟使 `(UA)` 后缀嵌套深度回到零的 `)` 时同样如此。例如，`'http://q'#c` 和 `'http://q'(ua)#c` 都保留 URL `http://q`，只有后者设置 UA `ua`。配对引号内的括号不计入嵌套深度。后缀内部紧贴前文的 `#` 仍是 UA 数据，包括 `(Mozilla/5.0 (X11; (Linux)#build))` 中的 `#`。UA 仍取第一个 `(` 与最后一个 `)` 之间的文本，因此 `(ua)(x)` 得到 `ua)(x`。出现其他尾随文本（例如 `(agent) junk`）时，仍将整个值作为 URL。
+
+此规则在块扫描之后执行。行尾注释中未加引号的大括号仍参与块结构解析：`tag: 'https://h/p' # {` 仍会触发块未闭合错误。此类注释应独占一行。块形式中的 `url`、`ua` 和 `interval` 解析不变。
 
 ## 内部模型
 
 | 字段 | 类型 | 默认值 | 可在 dae 中设置 | 含义 |
 | --- | --- | --- | --- | --- |
 | `id` | UUID | 随机 UUID | 否 | runtime 订阅身份；SIGHUP 时，若 fetch 身份（URL + 配置的 `ua` + headers）与已有订阅匹配则保留该值。 |
-| `name` | string | `""` | 是，作为 tag | 显示 tag，也是组 `subtag(...)` filter 使用的值。 |
+| `name` | string | `""` | 是，作为 tag；省略时取 URL 主机名 | 显示 tag，也是组 `subtag(...)` filter 使用的值。 |
 | `url` | string | `""` | 是 | HTTP(S) 拉取 URL。 |
 | `sub_type` | enum | `simple` | 否 | 正文解析器：`simple`、`clash`、`sip008` 或 `custom`。 |
 | `update_interval` | u64 | `86400` | 是，对应块内 `interval` | 定期刷新间隔，单位为秒；`0` 禁用定期刷新。 |

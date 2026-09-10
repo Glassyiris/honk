@@ -6,6 +6,8 @@
 
 Each non-comment line is one share link. Tags and links may be quoted or bare:
 
+Outside matching quotes, `#` starts a comment at the start of the statement or immediately after an ASCII space or tab. In a bare share link, a glued `#` remains data: `ss://…#hk1 # note` keeps the name `hk1`, while `ss://…#hk2#note` keeps `hk2#note`. An untagged quoted link takes only the quoted interior, so `'ss://…#hk1'#note` also keeps `hk1`. An unmatched quote is ordinary text. Block scanning still treats unquoted braces in trailing comments as structure; keep comments containing braces on separate lines.
+
 ```dae
 node {
     iris: 'socks5://10.10.10.1:2077'
@@ -16,6 +18,8 @@ node {
 ```
 
 The current parser accepts both tagged and untagged entries. A non-empty dae tag replaces the link's `#fragment` name. An untagged link keeps its decoded fragment; without one, it receives the credential-free fallback `{scheme}-{host}`.
+
+In quoted tags and links, a backslash escapes the next character when locating the closing quote; the source escape is retained in the parsed text.
 
 A malformed recognized link is dropped with `node section: skipping unparseable entry: ...` on stderr. An unknown scheme is a hard configuration error. A standalone `mux:` or `mux=` line is also rejected; VLESS wire behavior belongs in each link's `vless_mode=` query.
 

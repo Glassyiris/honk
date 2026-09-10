@@ -6,6 +6,8 @@
 
 每个非注释行是一个分享链接。tag 与链接都可加引号或裸写：
 
+配对引号之外的 `#` 位于语句开头或紧跟 ASCII 空格、制表符时，会开始注释。裸分享链接中紧贴前文的 `#` 仍是数据：`ss://…#hk1 # note` 保留名称 `hk1`，而 `ss://…#hk2#note` 保留 `hk2#note`。不带 tag 的带引号链接只取引号内的文本，因此 `'ss://…#hk1'#note` 也保留 `hk1`。未配对的引号按普通文本处理。块扫描仍将行尾注释中未加引号的大括号视为结构；含大括号的注释应独占一行。
+
 ```dae
 node {
     iris: 'socks5://10.10.10.1:2077'
@@ -16,6 +18,8 @@ node {
 ```
 
 当前解析器同时接受带 tag 和不带 tag 的条目。非空 dae tag 会替换链接的 `#fragment` 名称。不带 tag 的链接保留解码后的 fragment；没有 fragment 时使用不含凭据的 `{scheme}-{host}` 回退名称。
+
+识别 tag 与链接的结束引号时，反斜杠会转义下一个字符；解析后的文本保留原始转义序列。
 
 格式错误但 scheme 已识别的链接会被丢弃，并向 stderr 输出 `node section: skipping unparseable entry: ...`。未知 scheme 是配置硬错误。独立的 `mux:` 或 `mux=` 行也会被拒绝；VLESS wire 行为必须写在各链接的 `vless_mode=` query 中。
 
