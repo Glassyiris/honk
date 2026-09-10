@@ -571,6 +571,8 @@ impl ControlPlane {
         // DNS runtime still owns it until old leases and transports retire;
         // only then do the pools enter graceful session drain.
         old_registry.begin_retirement();
+        self.connection_pool
+            .retire_generation(old_registry.generation());
         self.stop_udp_warm_coordinator().await;
         self.stop_selector_warm_coordinator().await;
         self.start_udp_warm_coordinator(Arc::clone(&new_runtime_registry))

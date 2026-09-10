@@ -2245,3 +2245,107 @@ async fn reload_retires_only_the_old_warm_generation_and_starts_the_new_one() {
     cp.stop_udp_warm_coordinator().await;
     new_generation.shutdown().await;
 }
+
+async fn ready_pool_reload_fixture() -> (
+    ControlPlane,
+    Config,
+    Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+    String,
+    tokio::net::TcpStream,
+) {
+    let cp = test_cp().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let node = Node::from_share_link(&format!("socks5://a:a@{address}#ready-reload")).unwrap();
+    let mut config = Config::default();
+    config.nodes.push(node.clone());
+    assert!(
+        cp.apply_runtime_config(config.clone(), &DrainTracker::new())
+            .await
+    );
+    let generation = cp.runtime_registry.read().clone();
+    let target = "192.0.2.1:443".parse().unwrap();
+    let key = ConnectionPool::ready_key(generation.generation(), node.id, target, None);
+    let client = tokio::net::TcpStream::connect(address).await.unwrap();
+    let (peer, _) = listener.accept().await.unwrap();
+    cp.connection_pool
+        .deposit_ready(
+            generation.generation(),
+            &key,
+            crate::proxy::ProxyStream {
+                stream: Box::new(client),
+                target_addr: target,
+                target_domain: None,
+            },
+        )
+        .await;
+    cp.connection_pool.check_invariants();
+    assert_eq!(cp.connection_pool.ready_metrics().entries, 1);
+    (cp, config, generation, key, peer)
+}
+
+#[tokio::test]
+async fn ready_pool_reload_recredentials_retire_old_stream() {
+    let (cp, mut config, generation, key, _peer) = ready_pool_reload_fixture().await;
+    let node = &mut config.nodes[0];
+    let socks = node.socks5_mut().unwrap();
+    socks.username = Some("b".into());
+    socks.password = Some("b".into());
+    node.id = node.derive_id();
+    assert!(cp.apply_runtime_config(config, &DrainTracker::new()).await);
+    assert_ne!(
+        generation.generation(),
+        cp.runtime_registry.read().generation()
+    );
+    cp.connection_pool.check_invariants();
+    assert!(cp.connection_pool.acquire_ready(&key).await.is_none());
+    cp.connection_pool.check_invariants();
+}
+
+#[tokio::test]
+async fn ready_pool_reload_protocol_replacement_retires_old_stream() {
+    let (cp, mut config, generation, key, _peer) = ready_pool_reload_fixture().await;
+    let node = &config.nodes[0];
+    config.nodes[0] = Node::from_share_link(&format!(
+        "trojan://secret@{}:{}?sni=reload.example#ready-reload",
+        node.host(),
+        node.port,
+    ))
+    .unwrap();
+    assert!(cp.apply_runtime_config(config, &DrainTracker::new()).await);
+    assert_ne!(
+        generation.generation(),
+        cp.runtime_registry.read().generation()
+    );
+    cp.connection_pool.check_invariants();
+    assert!(cp.connection_pool.acquire_ready(&key).await.is_none());
+    cp.connection_pool.check_invariants();
+}
+
+#[tokio::test]
+async fn ready_pool_reload_routing_change_retires_unchanged_node_stream() {
+    let (cp, mut config, generation, key, _peer) = ready_pool_reload_fixture().await;
+    config.routing = changed_routing_config().routing;
+    assert!(cp.apply_runtime_config(config, &DrainTracker::new()).await);
+    assert_ne!(
+        generation.generation(),
+        cp.runtime_registry.read().generation()
+    );
+    cp.connection_pool.check_invariants();
+    assert!(cp.connection_pool.acquire_ready(&key).await.is_none());
+    cp.connection_pool.check_invariants();
+}
+
+#[tokio::test]
+async fn ready_pool_reload_rejection_preserves_stream() {
+    let (cp, mut config, generation, key, _peer) = ready_pool_reload_fixture().await;
+    config.nodes[0].name = "direct".into();
+    assert!(!cp.reload_runtime_config(config).await);
+    assert_eq!(
+        generation.generation(),
+        cp.runtime_registry.read().generation()
+    );
+    cp.connection_pool.check_invariants();
+    assert!(cp.connection_pool.acquire_ready(&key).await.is_some());
+    cp.connection_pool.check_invariants();
+}

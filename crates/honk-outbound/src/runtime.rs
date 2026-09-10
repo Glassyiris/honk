@@ -22,13 +22,15 @@ pub(crate) use admission::{
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 const TLS_ACTIVE_RATIO_NUMERATOR: usize = 1;
 const TLS_ACTIVE_RATIO_DENOMINATOR: usize = 10;
 const TLS_ACTIVE_MIN: usize = 8;
 pub const TLS_IDLE_RETENTION: Duration = Duration::from_secs(10 * 60);
 pub const TLS_REAP_INTERVAL: Duration = Duration::from_secs(60);
+
+static NEXT_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 use honk_config::node::Node;
 
@@ -801,6 +803,7 @@ pub enum RuntimeRegistryError {
 /// through to a newer generation.
 #[derive(Debug)]
 pub struct OutboundRuntimeRegistry {
+    generation: u64,
     nodes: HashMap<uuid::Uuid, Arc<NodeRuntime>>,
     terminal: AtomicBool,
     /// Runtimes a successor generation took over at the reload commit point.
@@ -956,6 +959,7 @@ impl OutboundRuntimeRegistry {
         }
         Ok((
             Self {
+                generation: NEXT_RUNTIME_GENERATION.fetch_add(1, Ordering::Relaxed),
                 nodes: map,
                 terminal: AtomicBool::new(false),
                 moved_out: parking_lot::Mutex::new(HashSet::new()),
@@ -973,6 +977,10 @@ impl OutboundRuntimeRegistry {
     /// Wrap into the shared cell used by the control plane.
     pub fn into_shared(self) -> SharedRuntimeRegistry {
         Arc::new(parking_lot::RwLock::new(Arc::new(self)))
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn get(&self, id: &uuid::Uuid) -> Option<Arc<NodeRuntime>> {

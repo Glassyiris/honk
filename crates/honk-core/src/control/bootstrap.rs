@@ -315,17 +315,20 @@ impl ControlPlane {
         let pool = self.connection_pool.clone();
         let udp_pool = self.udp_pool.clone();
         let config_for_purge = self.config.clone();
+        let runtime_registry = self.runtime_registry.clone();
         self.alive_set.set_death_callback(Some(Box::new(
             move |node_id: uuid::Uuid, _name: &str| {
                 udp_pool.remove_by_node(node_id);
                 let node_addr = config_for_purge.try_read().ok().and_then(|c| {
-                    c.nodes
-                        .iter()
-                        .find(|n| n.id == node_id)
-                        .map(|n| format!("{}:{}", n.host(), n.port))
+                    c.nodes.iter().find(|n| n.id == node_id).map(|n| {
+                        (
+                            format!("{}:{}", n.host(), n.port),
+                            runtime_registry.read().generation(),
+                        )
+                    })
                 });
-                if let Some(addr) = node_addr {
-                    pool.purge_node(&addr);
+                if let Some((addr, generation)) = node_addr {
+                    pool.purge_node(&addr, generation, node_id);
                 }
             },
         )));

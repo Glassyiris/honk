@@ -98,6 +98,15 @@ pooling stores only a connected proxy-server socket and lets `dial_with_tcp`
 perform the per-target protocol handshake. Multiplexed and QUIC protocols
 exclude both because their generation runtime is the sole reusable-state owner.
 
+Ready streams are keyed by runtime generation, node identity, and target; only
+flows using the generation that dialed them may acquire them. After a reload
+publishes its successor, retiring the old generation removes its ready streams,
+target counts, warm claims, and hotness under the pool lock and refuses late
+ready deposits, hotness updates, and warm claims for it. The successor starts
+with an empty ready namespace. A rejected reload keeps the active pool state.
+Bare-TCP keys remain proxy-server addresses; health purges remove that address's
+bare entries and only the current generation's matching identity's ready entries.
+
 Registry assembly checks that descriptor capabilities, populated slots, and runtime kinds agree.
 Node-dependent entries may carry a packet slot even when the default node lacks
 UDP. `block` is the explicit exception: its descriptor says no UDP capability,

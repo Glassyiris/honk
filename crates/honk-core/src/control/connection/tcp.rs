@@ -559,13 +559,14 @@ impl ControlPlaneHandle {
                             .unwrap_or((false, false));
                         if ready_capable {
                             let key = ConnectionPool::ready_key(
-                                &node_addr,
+                                generation.generation(),
+                                node.id,
                                 original_dst,
                                 target_domain.as_deref(),
                             );
                             // Only hot targets earn a speculative ready
                             // dial; a one-off flow gets none.
-                            if !pool.note_target(&key) {
+                            if !pool.note_target(generation.generation(), &key) {
                                 return;
                             }
                             let pool_reporter =
@@ -591,7 +592,8 @@ impl ControlPlaneHandle {
                                         reporter.setup_succeeded();
                                         reporter.finish_setup_only();
                                     }
-                                    pool.deposit_ready(&key, stream).await;
+                                    pool.deposit_ready(generation.generation(), &key, stream)
+                                        .await;
                                 }
                                 Err(e) => {
                                     if let Some(reporter) = &pool_reporter {
@@ -913,11 +915,16 @@ impl ControlPlaneHandle {
                         })
                         .unwrap_or((false, false));
                     if ready_capable {
-                        let key =
-                            ConnectionPool::ready_key(&node_addr, target, target_domain.as_deref());
+                        let key = ConnectionPool::ready_key(
+                            generation.generation(),
+                            node.id,
+                            target,
+                            target_domain.as_deref(),
+                        );
                         // Only hot targets earn a speculative ready
                         // dial; a one-off flow gets none.
-                        let Some(_warm_guard) = pool.try_begin_warm(&key) else {
+                        let Some(_warm_guard) = pool.try_begin_warm(generation.generation(), &key)
+                        else {
                             return;
                         };
                         let pool_reporter = pool_feedback.as_ref().map(|feedback| feedback.start());
@@ -942,7 +949,8 @@ impl ControlPlaneHandle {
                                     reporter.setup_succeeded();
                                     reporter.finish_setup_only();
                                 }
-                                pool.deposit_ready(&key, stream).await;
+                                pool.deposit_ready(generation.generation(), &key, stream)
+                                    .await;
                             }
                             Err(e) => {
                                 if let Some(reporter) = &pool_reporter {
@@ -1089,7 +1097,8 @@ impl ControlPlaneHandle {
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
 
         if !pool_disabled && (entry.descriptor.pool_ready_streams)(node) {
-            let key = ConnectionPool::ready_key(&addr, target, target_domain);
+            let key =
+                ConnectionPool::ready_key(generation.generation(), node.id, target, target_domain);
             if let Some(stream) = pool.acquire_ready(&key).await {
                 tracing::debug!(
                     "Pooled ready stream via {} acquired for {} (handshake skipped)",

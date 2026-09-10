@@ -25,8 +25,9 @@ async fn ready_pool_hit_does_not_wait_for_physical_dial_permit() {
     );
     let _held = generation.acquire_dial_permit().await;
     let pool = ConnectionPool::new();
-    let key = ConnectionPool::ready_key(&format!("{}:{}", node.host(), node.port), target, None);
+    let key = ConnectionPool::ready_key(generation.generation(), node.id, target, None);
     pool.deposit_ready(
+        generation.generation(),
         &key,
         crate::proxy::ProxyStream {
             stream: Box::new(tcp),

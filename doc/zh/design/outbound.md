@@ -83,6 +83,14 @@ Ready-stream pooling 保存已经完成且绑定目标的握手。Bare-TCP pooli
 多路复用与 QUIC 协议排除两者，因为其 generation runtime 是可复用状态的
 唯一所有者。
 
+Ready stream 按 runtime generation、节点身份和目标分别保存，只能由使用
+拨号时所属 generation 的流取出。reload 发布新 generation 后，连接池在
+同一把锁内移除旧 generation 的 ready stream、目标计数、预热任务记录和
+目标访问计数，并拒绝旧 generation 后续的 ready 写入、访问计数更新和预热请求。
+新 generation 的 ready 命名空间从空开始。reload 被拒绝时，保留当前连接池状态。
+Bare-TCP 仍以代理服务器地址为键；节点失效时，清除该地址的 bare 连接，
+但只清除当前 generation 中对应节点身份的 ready 连接。
+
 Registry 组装会检查 descriptor capability 与填充的槽是否一致。
 依赖节点的 entry 即使默认节点没有 UDP，也可以携带 packet 槽。`block`
 是显式例外：其 descriptor 声明没有 UDP capability，但分派允许其 packet
