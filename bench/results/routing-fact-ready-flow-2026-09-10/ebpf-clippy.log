@@ -1,0 +1,3 @@
+warning: honk-core@0.0.1-alpha: eBPF object embedded (1473056 bytes)
+    Checking honk-core v0.0.1-alpha (/root/.herdr/worktrees/honk/perf-ir/crates/honk-core)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.28s

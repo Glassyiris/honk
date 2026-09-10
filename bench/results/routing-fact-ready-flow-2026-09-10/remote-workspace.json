@@ -1,0 +1,6 @@
+{
+  "host": "root@10.10.10.118",
+  "directory": "/tmp/honk-ready-flow.fmpAij",
+  "scope": "isolated BPF program tests only; no network hooks, pins, service restart or gateway deployment",
+  "removed_after_successful_collection": true
+}

@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "/root/code/honk-cse-bench/bench/results/routing-fact-ready-flow-2026-09-10/measure.py", line 1381, in <module>
+    main()
+  File "/root/code/honk-cse-bench/bench/results/routing-fact-ready-flow-2026-09-10/measure.py", line 1351, in main
+    result = run(args)
+             ^^^^^^^^^
+  File "/root/code/honk-cse-bench/bench/results/routing-fact-ready-flow-2026-09-10/measure.py", line 1067, in run
+    raise AssertionError(f"{name}/{emitter}: emitted bytecode differs from compiled manifest")
+AssertionError: dst-0/new: emitted bytecode differs from compiled manifest

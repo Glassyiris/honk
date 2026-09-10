@@ -1,0 +1,388 @@
+{
+  "baseline_commit": "ac7cf6a5ab6d7c4229a0c6230a6415965d953403",
+  "candidate_commit": "6b700f93ce8f3af0096ab41608fc5a0b12b6b9eb",
+  "candidate_branch": "perf/fact-ready-flow",
+  "candidate_source_sha256": "9043452de0c2d8c8ffb1c5f60807678a7fd58c6d8a70cd8744da9f1469c02809",
+  "verdict": "Confirmed reductions in emitted/JIT size and verifier processing, with long-chain real-root latency gains. Not a universal packet-path speedup: repeated domain-gated and mixed synthetic paths regress.",
+  "implementation": [
+    "Propagate three-bit definite/possible readiness through condition failure joins.",
+    "Emit only the required first-use lookup, cached reload or runtime ready guard.",
+    "Join IPv4/IPv6 key and map selection at one helper call; clear only untouched IPv4 padding.",
+    "Retain per-invocation NULL/ready initialization and lazy short-circuit semantics."
+  ],
+  "max_mixed_real_extension": {
+    "conditions_per_category": 256,
+    "categories": [
+      "domain",
+      "destination",
+      "source",
+      "mac"
+    ],
+    "metrics": {
+      "x86_64_linux_7_2": {
+        "static_bytes": {
+          "baseline": 297232,
+          "candidate": 245936,
+          "change_percent": -17.257899553210965
+        },
+        "jit_bytes": {
+          "baseline": 175136,
+          "candidate": 138516,
+          "change_percent": -20.909464644619035
+        },
+        "verified_insns": {
+          "baseline": 324912,
+          "candidate": 300106,
+          "change_percent": -7.634682621756039
+        }
+      },
+      "x86_64_linux_6_12": {
+        "static_bytes": {
+          "baseline": 297232,
+          "candidate": 245936,
+          "change_percent": -17.257899553210965
+        },
+        "jit_bytes": {
+          "baseline": 175128,
+          "candidate": 138508,
+          "change_percent": -20.91041980722671
+        },
+        "verified_insns": {
+          "baseline": 324912,
+          "candidate": 300106,
+          "change_percent": -7.634682621756039
+        }
+      },
+      "aarch64_linux_6_12_94": {
+        "static_bytes": {
+          "baseline": 297232,
+          "candidate": 245936,
+          "change_percent": -17.257899553210965
+        },
+        "jit_bytes": {
+          "baseline": 208120,
+          "candidate": 166128,
+          "change_percent": -20.176821064770323
+        },
+        "verified_insns": {
+          "baseline": 324912,
+          "candidate": 300106,
+          "change_percent": -7.634682621756039
+        }
+      }
+    },
+    "stack": "96 bytes in retained real-EXT verifier logs; initialization is unchanged.",
+    "attachment_scope": "Freplace links to four production TC targets and one test target; no live network hooks."
+  },
+  "real_root_late_hit_latency": [
+    {
+      "architecture": "x86_64",
+      "rules": 0,
+      "family": 4,
+      "baseline_ns": 17,
+      "candidate_ns": 17,
+      "change_percent": 0.0
+    },
+    {
+      "architecture": "x86_64",
+      "rules": 0,
+      "family": 6,
+      "baseline_ns": 17,
+      "candidate_ns": 17,
+      "change_percent": 0.0
+    },
+    {
+      "architecture": "x86_64",
+      "rules": 1,
+      "family": 4,
+      "baseline_ns": 26,
+      "candidate_ns": 26,
+      "change_percent": 0.0
+    },
+    {
+      "architecture": "x86_64",
+      "rules": 1,
+      "family": 6,
+      "baseline_ns": 27,
+      "candidate_ns": 27,
+      "change_percent": 0.0
+    },
+    {
+      "architecture": "x86_64",
+      "rules": 4,
+      "family": 4,
+      "baseline_ns": 30,
+      "candidate_ns": 30,
+      "change_percent": 0.0
+    },
+    {
+      "architecture": "x86_64",
+      "rules": 4,
+      "family": 6,
+      "baseline_ns": 33,
+      "candidate_ns": 32,
+      "change_percent": -3.0303030303030276
+    },
+    {
+      "architecture": "x86_64",
+      "rules": 16,
+      "family": 4,
+      "baseline_ns": 42,
+      "candidate_ns": 39,
+      "change_percent": -7.14285714285714
+    },
+    {
+      "architecture": "x86_64",
+      "rules": 16,
+      "family": 6,
+      "baseline_ns": 45,
+      "candidate_ns": 44,
+      "change_percent": -2.2222222222222254
+    },
+    {
+      "architecture": "x86_64",
+      "rules": 64,
+      "family": 4,
+      "baseline_ns": 74,
+      "candidate_ns": 68,
+      "change_percent": -8.108108108108103
+    },
+    {
+      "architecture": "x86_64",
+      "rules": 64,
+      "family": 6,
+      "baseline_ns": 75,
+      "candidate_ns": 70,
+      "change_percent": -6.666666666666665
+    },
+    {
+      "architecture": "x86_64",
+      "rules": 256,
+      "family": 4,
+      "baseline_ns": 197,
+      "candidate_ns": 188,
+      "change_percent": -4.5685279187817285
+    },
+    {
+      "architecture": "x86_64",
+      "rules": 256,
+      "family": 6,
+      "baseline_ns": 202,
+      "candidate_ns": 202,
+      "change_percent": 0.0
+    },
+    {
+      "architecture": "aarch64",
+      "rules": 0,
+      "family": 4,
+      "baseline_ns": 218,
+      "candidate_ns": 218,
+      "change_percent": 0.0
+    },
+    {
+      "architecture": "aarch64",
+      "rules": 0,
+      "family": 6,
+      "baseline_ns": 218,
+      "candidate_ns": 218,
+      "change_percent": 0.0
+    },
+    {
+      "architecture": "aarch64",
+      "rules": 1,
+      "family": 4,
+      "baseline_ns": 279,
+      "candidate_ns": 280,
+      "change_percent": 0.35842293906809264
+    },
+    {
+      "architecture": "aarch64",
+      "rules": 1,
+      "family": 6,
+      "baseline_ns": 288,
+      "candidate_ns": 291,
+      "change_percent": 1.041666666666674
+    },
+    {
+      "architecture": "aarch64",
+      "rules": 4,
+      "family": 4,
+      "baseline_ns": 349,
+      "candidate_ns": 351,
+      "change_percent": 0.5730659025787954
+    },
+    {
+      "architecture": "aarch64",
+      "rules": 4,
+      "family": 6,
+      "baseline_ns": 383,
+      "candidate_ns": 384,
+      "change_percent": 0.26109660574411553
+    },
+    {
+      "architecture": "aarch64",
+      "rules": 16,
+      "family": 4,
+      "baseline_ns": 446,
+      "candidate_ns": 458,
+      "change_percent": 2.6905829596412634
+    },
+    {
+      "architecture": "aarch64",
+      "rules": 16,
+      "family": 6,
+      "baseline_ns": 502,
+      "candidate_ns": 513,
+      "change_percent": 2.1912350597609542
+    },
+    {
+      "architecture": "aarch64",
+      "rules": 64,
+      "family": 4,
+      "baseline_ns": 724,
+      "candidate_ns": 704,
+      "change_percent": -2.7624309392265234
+    },
+    {
+      "architecture": "aarch64",
+      "rules": 64,
+      "family": 6,
+      "baseline_ns": 808,
+      "candidate_ns": 782,
+      "change_percent": -3.2178217821782207
+    },
+    {
+      "architecture": "aarch64",
+      "rules": 256,
+      "family": 4,
+      "baseline_ns": 1826,
+      "candidate_ns": 1670,
+      "change_percent": -8.54326396495071
+    },
+    {
+      "architecture": "aarch64",
+      "rules": 256,
+      "family": 6,
+      "baseline_ns": 1937,
+      "candidate_ns": 1777,
+      "change_percent": -8.260196179659262
+    }
+  ],
+  "repeatability": {
+    "independent_process_runs": 3,
+    "warmup_rounds": 3,
+    "paired_rounds_per_run": 15,
+    "bpf_repetitions_per_sample": 20000,
+    "summary": "paired-repeat-summary.json",
+    "regressions": [
+      {
+        "variant": "domain-gated-repeated",
+        "family": 1,
+        "scenario": "reuse-hit",
+        "map_shape": "small",
+        "input_mode": "fixed",
+        "runs": [
+          {
+            "baseline_ns": 121,
+            "candidate_ns": 130,
+            "change_percent": 7.438016528925617
+          },
+          {
+            "baseline_ns": 118,
+            "candidate_ns": 129,
+            "change_percent": 9.322033898305083
+          },
+          {
+            "baseline_ns": 121,
+            "candidate_ns": 127,
+            "change_percent": 4.958677685950419
+          }
+        ],
+        "median_change_percent": 7.438016528925617
+      },
+      {
+        "variant": "mixed3categories",
+        "family": 1,
+        "scenario": "all",
+        "map_shape": "small",
+        "input_mode": "fixed",
+        "runs": [
+          {
+            "baseline_ns": 204,
+            "candidate_ns": 214,
+            "change_percent": 4.90196078431373
+          },
+          {
+            "baseline_ns": 207,
+            "candidate_ns": 214,
+            "change_percent": 3.3816425120772875
+          },
+          {
+            "baseline_ns": 208,
+            "candidate_ns": 213,
+            "change_percent": 2.4038461538461453
+          }
+        ],
+        "median_change_percent": 3.3816425120772875
+      },
+      {
+        "variant": "mixed3categories",
+        "family": 2,
+        "scenario": "all",
+        "map_shape": "small",
+        "input_mode": "fixed",
+        "runs": [
+          {
+            "baseline_ns": 209,
+            "candidate_ns": 215,
+            "change_percent": 2.8708133971291794
+          },
+          {
+            "baseline_ns": 212,
+            "candidate_ns": 213,
+            "change_percent": 0.4716981132075526
+          },
+          {
+            "baseline_ns": 207,
+            "candidate_ns": 215,
+            "change_percent": 3.864734299516903
+          }
+        ],
+        "median_change_percent": 2.8708133971291794
+      }
+    ]
+  },
+  "correctness": {
+    "complete_decision_observations_per_standalone_run": 528,
+    "dynamic_lookup_budget_assertions_per_run": 504,
+    "real_kernel_routing_tests_per_architecture": 9,
+    "independent_policy_goldens_per_architecture": 468,
+    "independent_bitmap_state_combinations_per_architecture": 500,
+    "architectures": [
+      "x86_64 Linux 7.2",
+      "x86_64 Linux 6.12.0",
+      "aarch64 Linux 6.12.94"
+    ],
+    "observed_mismatches": 0,
+    "negative_controls": [
+      "must-ready OR mutation produces the wrong full decision.",
+      "may-ready AND mutation repeats destination lookup 64 times and fails its budget.",
+      "Tampered bytecode is rejected before interpreter/kernel loading."
+    ],
+    "full_ebpf_lib": {
+      "passed": 1004,
+      "ignored": 17
+    },
+    "workspace_exclusion": "test_routing_with_config_dae",
+    "final_gates": "final-gates.json"
+  },
+  "limits": [
+    "Finite tests and static review do not prove every possible policy/input.",
+    "Rooted BPF_TEST_RUN includes the test classifier input/output and root/slot dispatch, not live packet parsing or throughput.",
+    "SCHED_CLS wrapper regressions are reported rather than generalized to production throughput.",
+    "Large randomized working sets are cache-pressure evidence, not verified cache-cold execution.",
+    "Wall-clock loader timings are descriptive single samples; JIT size and verifier processed counts are separate budgets.",
+    "Real-kernel probes used validated-codegen.rs; final changes only remove compiler-reported identity conversions. final-bytecode-equivalence.json binds all 15 retained policies to the final source."
+  ],
+  "publication": "Local implementation commit only; no push, PR update, merge, or gateway service restart."
+}

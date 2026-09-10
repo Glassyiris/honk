@@ -1,0 +1,15 @@
+    Checking aws-lc-sys v0.44.0
+   Compiling honk-core v0.0.1-alpha (/root/.herdr/worktrees/honk/perf-ir/crates/honk-core)
+    Checking aws-lc-rs v1.18.0
+    Checking rustls-webpki v0.103.15
+    Checking rustls v0.23.43
+    Checking rustls-platform-verifier v0.7.0
+    Checking tokio-rustls v0.26.4
+    Checking quinn-proto v0.11.17 (https://github.com/Glassyiris/quinn?rev=7f13718a#7f13718a)
+    Checking hyper-rustls v0.27.9
+    Checking reqwest v0.13.4
+    Checking quinn v0.11.11 (https://github.com/Glassyiris/quinn?rev=7f13718a#7f13718a)
+    Checking honk-outbound v0.0.1-alpha (/root/.herdr/worktrees/honk/perf-ir/crates/honk-outbound)
+    Checking h3-quinn v0.0.10
+    Checking honk-tool v0.0.1-alpha (/root/.herdr/worktrees/honk/perf-ir/crates/honk-tool)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.15s

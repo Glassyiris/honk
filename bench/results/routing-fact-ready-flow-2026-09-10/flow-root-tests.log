@@ -1,0 +1,20 @@
+
+running 9 tests
+test ebpf::real::routing::tests::four_mode_golden_policies ... ok
+test ebpf::real::routing::tests::large_prefix_fact_policy ... ok
+test ebpf::real::routing::tests::lazy_fact_cache_ipv6_host_overlap_and_default_prefix ... ok
+test ebpf::real::routing::tests::lazy_fact_cache_null_zero_mac_presence_and_invalid_family ... ok
+test ebpf::real::routing::tests::lazy_fact_cache_short_circuit_reuse_and_alternating_inputs ... ok
+test ebpf::real::routing::tests::predicate_bits_and_capacity_limits ... ok
+test ebpf::real::routing::tests::publication_failure_recovery_and_frozen_root ... ok
+test ebpf::real::routing::tests::readiness::fact_readiness_failure_joins_preserve_full_decisions ... ok
+test ebpf::real::routing::tests::readiness::fact_readiness_independent_bitmap_states ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 1017 filtered out; finished in 4.20s
+
+warning: honk-core@0.0.1-alpha: eBPF object embedded (1473056 bytes)
+   Compiling honk-core v0.0.1-alpha (/root/.herdr/worktrees/honk/perf-ir/crates/honk-core)
+    Finished `test` profile [unoptimized] target(s) in 23.16s
+     Running unittests src/lib.rs (target/debug/deps/honk_core-26ecd7f903c4fc54)
+native routing: 468 complete-decision golden comparisons
+readiness: 500 independent bitmap-state decisions

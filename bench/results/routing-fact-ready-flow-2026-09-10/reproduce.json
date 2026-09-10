@@ -1,0 +1,20 @@
+{
+  "abi_checkout": "Use a separate honk worktree at 6b700f93ce8f3af0096ab41608fc5a0b12b6b9eb (ac7 baseline has the same shared ABI). The bench branch itself predates this routing ABI.",
+  "setup": "Create candidate-source as a symlink to that worktree. It is intentionally untracked; the emitter defaults to the frozen candidate-codegen.rs.",
+  "standalone_commands": [
+    "cargo +stable run --release --manifest-path Cargo.toml -- generated",
+    "python3 measure.py --generated generated --output rerun.json --cpu 0 --repeat 20000 --rounds 15 --warmups 3 --large-entries 16384 --working-set 16384"
+  ],
+  "ablations": "Set HONK_FACT_EMITTER to the absolute state-only-codegen.rs or key-only-codegen.rs path when invoking Cargo; use a separate generated/output path for each.",
+  "root_probe": "In an isolated code worktree, temporarily include root_probe.rs as a test module at the end of crates/honk-core/src/ebpf/real/routing/tests.rs, build with --features ebpf, execute paired_root_slot / mixed_extension_statistics with the output envs below, then remove only that temporary module. The probe fingerprints compiler-embedded source bytes.",
+  "root_probe_env": [
+    "HONK_ROUTING_TEST_OBJECT",
+    "HONK_FACT_READY_ROOT_RESULTS",
+    "HONK_FACT_READY_EXT_RESULTS"
+  ],
+  "historical_arm_script": "#!/bin/sh\nset -eu\nE=/tmp/honk-ready-flow.fmpAij\nexport HONK_ROUTING_TEST_OBJECT=\"$E/honk-ebpf\"\nexport HONK_FACT_READY_EXT_RESULTS=\"$E/ext-statistics-arm.json\"\nexport HONK_FACT_READY_ROOT_RESULTS=\"$E/root-paired-arm.json\"\nuname -a\n\"$E/flow-tests-aarch64\" ebpf::real::routing::tests --ignored --skip paired_root_slot --skip mixed_extension_statistics --test-threads=1 --nocapture\n\"$E/flow-tests-aarch64\" mixed_extension_statistics --ignored --nocapture\ntaskset -c 0 \"$E/flow-tests-aarch64\" paired_root_slot --ignored --nocapture\nprintf '%s\\n' FLOW_ARM_GATES_PASS\n",
+  "historical_linux612_script": "#!/bin/sh\nset -eu\nPATH=/nix/store/8mid8wh1kxb0gl4g6s9l3bwawd9xzfkj-busybox-static-x86_64-unknown-linux-musl-1.37.0/bin:/nix/store/xxx9p6yah6yv90053vhqcnn4k86674ji-kmod-31/bin:/root/.nix-profile/bin\nexport PATH\nE=/root/code/honk-cse-bench/bench/results/routing-fact-ready-flow-2026-09-10\nexport HONK_ROUTING_TEST_OBJECT=/root/.herdr/worktrees/honk/perf-ir/crates/honk-ebpf/target/routing-test/bpfel-unknown-none/release/honk-ebpf\nexport HONK_FACT_READY_EXT_RESULTS=\"$E/ext-statistics-linux612.json\"\nuname -a\nprintf '%s\\n' FLOW_VM_READY\n\"$E/flow-tests-x86\" ebpf::real::routing::tests --ignored --skip paired_root_slot --skip mixed_extension_statistics --test-threads=1 --nocapture > \"$E/linux612-routing.log\" 2>&1\n\"$E/flow-tests-x86\" mixed_extension_statistics --ignored --nocapture > \"$E/linux612-ext.log\" 2>&1\nprintf '%s\\n' FLOW_VM_GATES_PASS\n",
+  "linux612_vm": "virtme-ng with Ubuntu 6.12.0-061200-generic, TCG (not used for latency claims), 2 vCPUs/4 GiB, private writable evidence directory. Host PATH must include kmod, zstd and file for initramfs modules. Guest printed FLOW_VM_GATES_PASS before power-off; virtme returned 255 on shutdown.",
+  "cross_build": "Use ci/zigcc and ci/zigcxx with aarch64-linux-musl, -C link-self-contained=no, and ci/zig-bindgen-env. Preserve the parent HOME in the build environment; this router requires scp -O.",
+  "proof_binding": "Baseline, compiled source, emitted bodies, and kernel statistics are bound by SHA-256. final-bytecode-equivalence.json records the final identity-conversion cleanup."
+}

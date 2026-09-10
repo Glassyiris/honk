@@ -1,0 +1,13 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+warning: honk-core@0.0.1-alpha: eBPF object embedded (1473056 bytes)
+   Compiling honk-core v0.0.1-alpha (/root/.herdr/worktrees/honk/perf-ir/crates/honk-core)
+warning: linker stderr: unable to open library directory '/root/.herdr/worktrees/honk/perf-ir/target/cse-aarch64/aarch64-unknown-linux-musl/release/build/boring-sys-e35711fa0084ec46/out/build/lib': FileNotFound
+         warning: unable to open library directory '/root/.herdr/worktrees/honk/perf-ir/target/cse-aarch64/aarch64-unknown-linux-musl/release/build/boring-sys-e35711fa0084ec46/out/build/crypto': FileNotFound
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `honk-core` (lib test) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 3m 48s
+  Executable unittests src/lib.rs (target/cse-aarch64/aarch64-unknown-linux-musl/release/deps/honk_core-fda4874f1eef26ef)

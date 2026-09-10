@@ -1,0 +1,5 @@
+{
+  "head": "ac7cf6a5ab6d7c4229a0c6230a6415965d953403",
+  "source_sha256": "477f81f42c422783d5a2790b6d98e34372e23a4c51a1777357dfbf1497543d3a",
+  "scope": "baseline already includes lazy fact CSE; this experiment only evaluates readiness propagation and key/lookup emission simplification"
+}

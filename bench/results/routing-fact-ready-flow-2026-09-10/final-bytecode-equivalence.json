@@ -1,0 +1,24 @@
+{
+  "measured_source_sha256": "f1e1069aac73565cf1463ad454da32e73c6c970bed301384936b137c6dfa3601",
+  "final_source_sha256": "9043452de0c2d8c8ffb1c5f60807678a7fd58c6d8a70cd8744da9f1469c02809",
+  "change": "Remove an i16-to-i16 cast; test fixture removes &str-to-&str conversion.",
+  "identical_emitted_variants": [
+    "dst-0",
+    "dst-1",
+    "dst-4",
+    "dst-16",
+    "dst-64",
+    "dst-256",
+    "early-dst-16",
+    "short-circuit-dst",
+    "post-lookup-fail",
+    "mixed",
+    "dominated-dst-chain",
+    "domain-gated-repeated",
+    "mixed3categories",
+    "conditional-first-use-merge",
+    "seeded-adversarial-0x484f4e4b"
+  ],
+  "baseline_and_candidate_bodies_equal_to_pre_lint": true,
+  "scope": "Generated sentinel-FD bytecode is identical for every retained policy; real-kernel and ARM probe evidence remains bound to the preserved measured source snapshot."
+}

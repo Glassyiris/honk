@@ -1,0 +1,17 @@
+[package]
+name = "honk-routing-fact-ready-flow-evidence"
+version = "0.0.0"
+edition = "2024"
+publish = false
+build = "build.rs"
+
+[dependencies]
+anyhow = "=1.0.104"
+aya-obj = "=0.3.0"
+libc = "=0.2.189"
+serde_json = "=1.0.151"
+sha2 = "=0.11.0"
+honk-ebpf-common = { path = "candidate-source/crates/honk-ebpf-common" }
+
+[workspace]
+exclude = ["candidate-source"]

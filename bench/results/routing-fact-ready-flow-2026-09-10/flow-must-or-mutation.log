@@ -1,0 +1,22 @@
+
+running 1 test
+test ebpf::real::routing::tests::readiness::fact_readiness_failure_joins_preserve_full_decisions ... FAILED
+
+failures:
+
+failures:
+    ebpf::real::routing::tests::readiness::fact_readiness_failure_joins_preserve_full_decisions
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1019 filtered out; finished in 0.28s
+
+warning: honk-core@0.0.1-alpha: eBPF object embedded (1473056 bytes)
+   Compiling honk-core v0.0.1-alpha (/root/.herdr/worktrees/honk/perf-ir/crates/honk-core)
+    Finished `test` profile [unoptimized] target(s) in 5.01s
+     Running unittests src/lib.rs (target/debug/deps/honk_core-26ecd7f903c4fc54)
+
+thread 'ebpf::real::routing::tests::readiness::fact_readiness_failure_joins_preserve_full_decisions' (2681787) panicked at crates/honk-core/src/ebpf/real/routing/tests.rs:95:5:
+assertion `left == right` failed: scalar failure before first lookup: complete decision
+  left: RoutingDecision { outbound: 1, mark: 2562, must: 0, domain_final: 1, rule_id: 2 }
+ right: RoutingDecision { outbound: 2, mark: 2561, must: 1, domain_final: 1, rule_id: 1 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: test failed, to rerun pass `-p honk-core --lib`

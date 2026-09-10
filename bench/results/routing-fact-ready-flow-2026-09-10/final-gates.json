@@ -1,0 +1,67 @@
+[
+  {
+    "gate": "workspace-clippy",
+    "command": [
+      "cargo",
+      "+stable",
+      "clippy",
+      "--workspace",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0
+  },
+  {
+    "gate": "ebpf-clippy",
+    "command": [
+      "cargo",
+      "+stable",
+      "clippy",
+      "-p",
+      "honk-core",
+      "--features",
+      "ebpf",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0
+  },
+  {
+    "gate": "netns-gates",
+    "command": [
+      "just",
+      "test-netns"
+    ],
+    "exit_code": 0
+  },
+  {
+    "gate": "fmt-check",
+    "command": [
+      "cargo",
+      "+stable",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0
+  },
+  {
+    "gate": "full-ebpf-lib-tests",
+    "command": [
+      "cargo",
+      "+stable",
+      "test",
+      "-p",
+      "honk-core",
+      "--features",
+      "ebpf",
+      "--lib"
+    ],
+    "exit_code": 0
+  }
+]

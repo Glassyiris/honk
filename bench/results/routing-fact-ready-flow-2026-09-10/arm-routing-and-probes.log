@@ -1,0 +1,30 @@
+Linux OpenWrt 6.12.94 #0 SMP Mon Jun 29 12:59:20 2026 aarch64 GNU/Linux
+
+running 9 tests
+test ebpf::real::routing::tests::four_mode_golden_policies ... native routing: 468 complete-decision golden comparisons
+ok
+test ebpf::real::routing::tests::large_prefix_fact_policy ... ok
+test ebpf::real::routing::tests::lazy_fact_cache_ipv6_host_overlap_and_default_prefix ... ok
+test ebpf::real::routing::tests::lazy_fact_cache_null_zero_mac_presence_and_invalid_family ... ok
+test ebpf::real::routing::tests::lazy_fact_cache_short_circuit_reuse_and_alternating_inputs ... ok
+test ebpf::real::routing::tests::predicate_bits_and_capacity_limits ... ok
+test ebpf::real::routing::tests::publication_failure_recovery_and_frozen_root ... ok
+test ebpf::real::routing::tests::readiness::fact_readiness_failure_joins_preserve_full_decisions ... ok
+test ebpf::real::routing::tests::readiness::fact_readiness_independent_bitmap_states ... readiness: 500 independent bitmap-state decisions
+ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 1017 filtered out; finished in 32.28s
+
+
+running 1 test
+test ebpf::real::routing::tests::flow_probe::mixed_extension_statistics ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1025 filtered out; finished in 10.08s
+
+
+running 1 test
+test ebpf::real::routing::tests::flow_probe::paired_root_slot ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1025 filtered out; finished in 29.71s
+
+FLOW_ARM_GATES_PASS

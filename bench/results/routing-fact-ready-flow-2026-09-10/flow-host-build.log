@@ -1,0 +1,8 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+warning: honk-core@0.0.1-alpha: eBPF object embedded (1473056 bytes)
+   Compiling honk-core v0.0.1-alpha (/root/.herdr/worktrees/honk/perf-ir/crates/honk-core)
+    Finished `test` profile [unoptimized] target(s) in 8.92s
+  Executable unittests src/lib.rs (target/debug/deps/honk_core-26ecd7f903c4fc54)
