@@ -1,0 +1,2 @@
+PASS: 532 complete-decision observations; 508 lookup-budget assertions; 141 paired measurements
+PASS: 18 timed fixtures matched their real map/input/decision contracts

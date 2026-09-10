@@ -828,7 +828,10 @@ FACT_SCENARIOS = (
 
 
 def correctness_cases():
-    cases = [{"variant": "dst-0", "family": 1, "scenario": "fallback"}]
+    cases = [
+        {"variant": "dst-0", "family": family, "scenario": "fallback"}
+        for family in (1, 2)
+    ]
     for count in (1, 4, 16, 64, 256):
         for family in (1, 2):
             for scenario in ("first", "middle", "late", "zero", "miss"):
@@ -947,52 +950,6 @@ def paired_measure(programs, repeat, rounds, warmups, *, counter_fd=None, workin
     }
 
 
-def benchmark_input(kernel_maps, family, scenario, count=0, variant=None):
-    kernel_maps.clear()
-    variant = variant or f"dst-{count}"
-    input_value = routing_input(
-        family,
-        miss=scenario == "miss",
-        mac_present=scenario != "mac-absent",
-        destination_port=9 if scenario in ("hit", "dominated-hit", "match") else 443,
-        protocol=2 if variant == "domain-gated-repeated" and scenario == "match" else 1,
-    )
-
-    def put(category, value):
-        kernel_maps.put(category, family, fact_key(category, family, input_value), value)
-
-    if variant.startswith("dst-"):
-        if count and scenario != "miss":
-            selected = 0 if scenario == "first" else count // 2 if scenario == "middle" else count - 1
-            put("destination", bytes(32) if scenario == "zero" else bitmap(selected))
-    elif variant == "dominated-dst-chain":
-        if scenario != "miss":
-            put("destination", bytes(32) if scenario == "zero" else bitmap(0))
-    elif variant == "domain-gated-repeated":
-        if scenario != "null":
-            put("domain", bytes(32) if scenario == "zero" else bitmap(0))
-            put("destination", bytes(32) if scenario == "zero" else bitmap(0))
-    elif variant == "mixed3categories":
-        for category in ("destination", "source", "mac"):
-            if scenario != "null" and not (category == "mac" and scenario == "mac-absent"):
-                put(category, bytes(32) if scenario in ("zero", "mac-absent") else bitmap(0))
-    elif variant == "conditional-first-use-merge":
-        if scenario != "null":
-            put("destination", bitmap(0, 1, 2, 3) if scenario in ("all", "match", "first-fail") else bitmap(3))
-    elif variant == "seeded-adversarial-0x484f4e4b":
-        for category in ("destination", "source", "mac"):
-            if scenario != "null" and not (category == "mac" and scenario == "mac-absent"):
-                put(category, bytes(32) if scenario in ("zero", "mac-absent") else bitmap(*range(32)))
-    elif variant == "mixed":
-        if scenario == "all":
-            for category in ("destination", "source", "mac", "domain"):
-                put(category, bitmap(0, 1))
-        elif scenario in ("zero", "mac-absent"):
-            for category in ("destination", "source", "domain"):
-                put(category, bytes(32))
-            if scenario != "mac-absent":
-                put("mac", bytes(32))
-    return input_value
 
 
 def benchmark_row(cache, maps, fixture_fd, variant, family, scenario, config, *, mode="fixed", counter_fd=None, working_set=None):
@@ -1077,6 +1034,7 @@ def run(args):
     metadata = []
     cache = ProgramCache(bodies, sentinels, metadata)
     comparisons = []
+    measurements = []
     lookup_assertions = 0
     for case in correctness_cases():
         input_value, models = configure_case(case, small, sentinels)
@@ -1126,6 +1084,14 @@ def run(args):
                 },
             }
         )
+        # Keep the checked fixture installed: rebuilding it let timing labels drift.
+        measurements.append({
+            **benchmark_row(
+                cache, small, fixed_fixture,
+                case["variant"], case["family"], case["scenario"], args,
+            ),
+            "checked_case_index": len(comparisons) - 1,
+        })
 
     alternating = []
     for index, scenario in enumerate(("all", "null", "all", "zero", "null", "all")):
@@ -1142,36 +1108,6 @@ def run(args):
             row[emitter] = {"lookup_counts": interpreted["lookups"], "kernel_decision": observed}
         alternating.append(row)
 
-    measurements = []
-    for family in (1, 2):
-        input_value = benchmark_input(small, family, "fallback", 0)
-        set_fixture(fixed_fixture, input_value)
-        measurements.append(benchmark_row(cache, small, fixed_fixture, "dst-0", family, "fallback", args))
-        for count in (1, 4, 16, 64, 256):
-            for scenario in ("first", "middle", "late", "zero", "miss"):
-                input_value = benchmark_input(small, family, scenario, count)
-                set_fixture(fixed_fixture, input_value)
-                measurements.append(
-                    benchmark_row(cache, small, fixed_fixture, f"dst-{count}", family, scenario, args)
-                )
-        small.clear()
-        input_value = routing_input(family, destination_port=8443)
-        set_fixture(fixed_fixture, input_value)
-        measurements.append(
-            benchmark_row(cache, small, fixed_fixture, "early-dst-16", family, "early-port", args)
-        )
-        for scenario in ("all", "null", "zero"):
-            case = {"variant": "mixed", "family": family, "scenario": scenario}
-            input_value, _ = configure_case(case, small, sentinels)
-            set_fixture(fixed_fixture, input_value)
-            measurements.append(benchmark_row(cache, small, fixed_fixture, "mixed", family, scenario, args))
-        for variant, scenarios in FACT_SCENARIOS:
-            for scenario in scenarios:
-                input_value = benchmark_input(small, family, scenario, variant=variant)
-                set_fixture(fixed_fixture, input_value)
-                measurements.append(
-                    benchmark_row(cache, small, fixed_fixture, variant, family, scenario, args)
-                )
 
     for family in (1, 2):
         for address_index in range(args.large_entries):

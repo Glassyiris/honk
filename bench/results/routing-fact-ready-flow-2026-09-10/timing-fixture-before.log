@@ -1,0 +1,14 @@
+Traceback (most recent call last):
+  File "/tmp/honk-fixture-fix-3cd7kpbg/before/test_measure.py", line 84, in <module>
+    main()
+  File "/tmp/honk-fixture-fix-3cd7kpbg/before/test_measure.py", line 78, in main
+    measure.main()
+  File "/tmp/honk-fixture-fix-3cd7kpbg/before/measure.py", line 1351, in main
+    result = run(args)
+             ^^^^^^^^^
+  File "/tmp/honk-fixture-fix-3cd7kpbg/before/measure.py", line 1173, in run
+    benchmark_row(cache, small, fixed_fixture, variant, family, scenario, args)
+  File "/tmp/honk-fixture-fix-3cd7kpbg/before/test_measure.py", line 58, in observe
+    assert observed == value, (context, category, value, observed)
+           ^^^^^^^^^^^^^^^^^
+AssertionError: (('domain-gated-repeated', 1, 'destination-null'), 'destination', None, b'\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')

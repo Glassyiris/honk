@@ -1,0 +1,147 @@
+{
+  "baseline_runner_commit": "dee4638118e67ba93535964b1a5f87e99969a184",
+  "implementation_commit_unchanged": "6b700f93ce8f3af0096ab41608fc5a0b12b6b9eb",
+  "measure_source_sha256": "6338bf78b669eea77ca08a63d86acc65d1d0b5be9f0c687a087382f84b4ac6cf",
+  "test_source_sha256": "b3831d263896dd667034ee76d44dc870a87928a0b883b02aed8b905df98c5c09",
+  "test_before_exit": 1,
+  "test_after_exit": 0,
+  "before_log": "timing-fixture-before.log",
+  "after_log": "timing-fixture-after.log",
+  "runs": {
+    "combined": {
+      "decisions": 532,
+      "lookup_assertions": 508,
+      "paired_rows": 141,
+      "cleanup": {
+        "closed_fd_count": 54,
+        "affinity_restored": true,
+        "errors": []
+      }
+    },
+    "combined-run2": {
+      "decisions": 532,
+      "lookup_assertions": 508,
+      "paired_rows": 141,
+      "cleanup": {
+        "closed_fd_count": 54,
+        "affinity_restored": true,
+        "errors": []
+      }
+    },
+    "combined-run3": {
+      "decisions": 532,
+      "lookup_assertions": 508,
+      "paired_rows": 141,
+      "cleanup": {
+        "closed_fd_count": 54,
+        "affinity_restored": true,
+        "errors": []
+      }
+    },
+    "state-only": {
+      "decisions": 532,
+      "lookup_assertions": 508,
+      "paired_rows": 141,
+      "cleanup": {
+        "closed_fd_count": 54,
+        "affinity_restored": true,
+        "errors": []
+      }
+    },
+    "key-only": {
+      "decisions": 532,
+      "lookup_assertions": 508,
+      "paired_rows": 141,
+      "cleanup": {
+        "closed_fd_count": 54,
+        "affinity_restored": true,
+        "errors": []
+      }
+    }
+  },
+  "additional_boundary_timings": [
+    {
+      "variant": "dst-256",
+      "family": 1,
+      "scenario": "multi",
+      "map_shape": "small",
+      "input_mode": "fixed"
+    },
+    {
+      "variant": "dst-256",
+      "family": 2,
+      "scenario": "multi",
+      "map_shape": "small",
+      "input_mode": "fixed"
+    },
+    {
+      "variant": "dst-4",
+      "family": 0,
+      "scenario": "invalid",
+      "map_shape": "small",
+      "input_mode": "fixed"
+    },
+    {
+      "variant": "mixed",
+      "family": 1,
+      "scenario": "mac-absent",
+      "map_shape": "small",
+      "input_mode": "fixed"
+    },
+    {
+      "variant": "mixed",
+      "family": 2,
+      "scenario": "mac-absent",
+      "map_shape": "small",
+      "input_mode": "fixed"
+    },
+    {
+      "variant": "mixed3categories",
+      "family": 0,
+      "scenario": "invalid",
+      "map_shape": "small",
+      "input_mode": "fixed"
+    },
+    {
+      "variant": "post-lookup-fail",
+      "family": 1,
+      "scenario": "post-lookup-fail",
+      "map_shape": "small",
+      "input_mode": "fixed"
+    },
+    {
+      "variant": "post-lookup-fail",
+      "family": 2,
+      "scenario": "post-lookup-fail",
+      "map_shape": "small",
+      "input_mode": "fixed"
+    },
+    {
+      "variant": "seeded-adversarial-0x484f4e4b",
+      "family": 0,
+      "scenario": "invalid",
+      "map_shape": "small",
+      "input_mode": "fixed"
+    },
+    {
+      "variant": "short-circuit-dst",
+      "family": 1,
+      "scenario": "short-circuit",
+      "map_shape": "small",
+      "input_mode": "fixed"
+    },
+    {
+      "variant": "short-circuit-dst",
+      "family": 2,
+      "scenario": "short-circuit",
+      "map_shape": "small",
+      "input_mode": "fixed"
+    }
+  ],
+  "source_lines_before": 1381,
+  "source_lines_after": 1317,
+  "not_run": [
+    "Production workspace/kernel matrix gates: Rust code unchanged.",
+    "Remote ARM or live traffic: outside this local fixture repair."
+  ]
+}
