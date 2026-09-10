@@ -1,0 +1,160 @@
+
+running 142 tests
+test config::builtin_nodes_tests::test_builtin_node_resolves_registered_or_fresh ... ok
+test config::builtin_nodes_tests::test_ensure_builtin_nodes_injects_direct_and_block_once ... ok
+test config::builtin_nodes_tests::test_ensure_local_direct_rules_injects_refreshes_and_is_idempotent ... ok
+test config::builtin_nodes_tests::test_from_file_preserves_renamed_honk_policy_error ... ok
+test config::builtin_nodes_tests::test_from_json_accepts_legacy_null_dns_routing_fields ... ok
+test config::builtin_nodes_tests::test_validate_accepts_group_and_builtin_outbounds ... ok
+test config::builtin_nodes_tests::test_validate_accepts_supported_dns_bind ... ok
+test config::builtin_nodes_tests::test_validate_rejects_bare_node_outbounds ... ok
+test config::builtin_nodes_tests::test_validate_rejects_datapath_reserved_routing_marks ... ok
+test config::builtin_nodes_tests::test_validate_rejects_derived_id_conflicts ... ok
+test config::builtin_nodes_tests::test_validate_rejects_invalid_structured_dns_bind_clearly ... ok
+test config::builtin_nodes_tests::test_validate_rejects_invalid_structured_dns_client_subnet ... ok
+test config::builtin_nodes_tests::test_validate_rejects_invalid_subscriptions ... ok
+test config::builtin_nodes_tests::test_validate_rejects_node_group_name_collision ... ok
+test config::builtin_nodes_tests::test_validate_rejects_reserved_builtin_names_and_protocols ... ok
+test config::builtin_nodes_tests::test_validate_rejects_reserved_group_ordinal_overflow ... ok
+test config::builtin_nodes_tests::test_validate_rejects_unknown_dial_mode ... ok
+test config::builtin_nodes_tests::test_validate_rejects_unknown_outbounds ... ok
+test config::builtin_nodes_tests::test_validate_rejects_unknown_transport ... ok
+test config::builtin_nodes_tests::test_validate_rejects_vless_mode_conflicts ... ok
+test config::builtin_nodes_tests::test_validate_rejects_zero_check_interval ... ok
+test config::builtin_nodes_tests::test_validate_requires_absolute_data_dir ... ok
+test dns::tests::dns_bind_bare_numeric_is_udp_and_semantically_canonical ... ok
+test dns::tests::dns_bind_is_serde_defaulted_and_empty_disables_it ... ok
+test dns::tests::dns_bind_rejects_undocumented_or_malformed_forms ... ok
+test dns::tests::dns_bind_supported_forms_select_exact_transports ... ok
+test dns::tests::dns_client_subnet_parses_fixed_and_auto_modes ... ok
+test dns::tests::dns_client_subnet_rejects_ambiguous_values ... ok
+test dns::tests::hosts_sources_are_serde_defaulted_and_accept_legacy_true ... ok
+test dns::tests::legacy_conversion_preserves_rule_order_and_matcher_kind ... ok
+test dns::tests::missing_cache_section_uses_nonzero_defaults ... ok
+test dns::tests::missing_strategy_uses_both_for_serde_configs ... ok
+test dns::tests::resolved_client_subnet_is_runtime_only ... ok
+test dns::tests::test_default_dns_config_works ... ok
+test dns::tests::test_dns_request_action_parse ... ok
+test dns::tests::test_dns_response_action_parse ... ok
+test dns::tests::test_fixed_domain_ttl_serde ... ok
+test dns::tests::test_legacy_conversion ... ok
+test dns::tests::test_legacy_rules_serde_backcompat ... ok
+test dns::tests::test_parse_qtype_token ... ok
+test dns::tests::zero_cache_size_remains_accepted_for_runtime_clamping ... ok
+test node::tests::test_derive_id_is_content_derived ... ok
+test node::tests::test_group_policy_serde_lowercase ... ok
+test node::tests::test_group_policy_serde_rejects_legacy_honk ... ok
+test node::tests::test_protocol_identity_goldens ... ok
+test node::tests::test_tls_alpn_identity_is_ordered_and_framed ... ok
+test node::tests::test_tls_alpn_validation_boundaries_and_context ... ok
+test node::tests::test_vless_mode_identity ... ok
+test node::tests::test_vless_mode_serde_and_default ... ok
+test parser::tests::hosts_sources_default_off_and_collect_repeated_values ... ok
+test parser::tests::max_concurrent_dials_defaults_and_parses ... ok
+test parser::tests::node_parse_diagnostic_redacts_share_link_credentials ... ok
+test parser::tests::parser_tests::test_canonical_nfqueue_setting_wins_over_legacy ... warning: experimental.udp_nfqueue.enabled is deprecated; migrate to global.nfqueue_enable: true
+warning: experimental.udp_nfqueue.enabled is deprecated; migrate to global.nfqueue_enable: false
+warning: experimental.udp_nfqueue.enabled is deprecated; migrate to global.nfqueue_enable: true
+warning: experimental.udp_nfqueue.enabled is deprecated; migrate to global.nfqueue_enable: true
+warning: experimental.udp_nfqueue.enabled is deprecated; migrate to global.nfqueue_enable: false
+ok
+test parser::tests::parser_tests::test_from_file_preserves_timer_diagnostics ... ok
+test parser::tests::parser_tests::test_global_check_tolerance_applies_to_dae_urltest_groups ... ok
+test parser::tests::parser_tests::test_include_preserves_timer_diagnostics ... ok
+test parser::tests::parser_tests::test_legacy_nfqueue_setting_migrates_to_global ... warning: experimental.udp_nfqueue.enabled is deprecated; migrate to global.nfqueue_enable: true
+warning: experimental.udp_nfqueue.enabled is deprecated; migrate to global.nfqueue_enable: false
+warning: experimental.udp_nfqueue.enabled is deprecated; migrate to global.nfqueue_enable: false
+warning: experimental.udp_nfqueue.enabled is deprecated; migrate to global.nfqueue_enable: true
+warning: experimental.udp_nfqueue.enabled is deprecated; migrate to global.nfqueue_enable: false
+warning: experimental.udp_nfqueue.enabled is deprecated; migrate to global.nfqueue_enable: true
+ok
+test parser::tests::parser_tests::test_millisecond_duration_compat_entry_logs_warning ... ok
+test parser::tests::parser_tests::test_millisecond_durations_keep_the_default_and_return_diagnostics ... ok
+test parser::tests::parser_tests::test_node_section_rejects_removed_protocols_and_standalone_mux ... ok
+test parser::tests::parser_tests::test_parse_anytls_node ... ok
+test parser::tests::parser_tests::test_parse_data_dir ... ok
+test parser::tests::parser_tests::test_parse_dns_bind_rejects_invalid_values_clearly ... ok
+test parser::tests::parser_tests::test_parse_dns_bind_scalar_and_current_dae_bare_udp ... ok
+test parser::tests::parser_tests::test_parse_dns_client_subnet ... ok
+test parser::tests::parser_tests::test_parse_dns_upstream ... ok
+test parser::tests::parser_tests::test_parse_dns_upstream_tls_server_name ... ok
+test parser::tests::parser_tests::test_parse_domain_condition_prefixes ... ok
+test parser::tests::parser_tests::test_parse_example_dae ... ok
+test parser::tests::parser_tests::test_parse_experimental_section ... ok
+test parser::tests::parser_tests::test_parse_full_global ... ok
+test parser::tests::parser_tests::test_parse_global_section ... ok
+test parser::tests::parser_tests::test_parse_group_nested_group_filter ... ok
+test parser::tests::parser_tests::test_parse_group_policies_loadbalance_fallback ... ok
+test parser::tests::parser_tests::test_parse_groups ... ok
+test parser::tests::parser_tests::test_parse_ip_routing_rules ... ok
+test parser::tests::parser_tests::test_parse_legacy_honk_group_policy_is_actionable ... ok
+test parser::tests::parser_tests::test_parse_multiline_routing_matcher ... ok
+test parser::tests::parser_tests::test_parse_nodes ... node section: skipping unparseable entry: Parse error: invalid share link syntax
+ok
+test parser::tests::parser_tests::test_parse_routing_rules ... ok
+test parser::tests::parser_tests::test_parse_score_group_policy_case_insensitively ... ok
+test parser::tests::parser_tests::test_parse_store_subscribe ... ok
+test parser::tests::parser_tests::test_parse_subscription_user_agent_forms ... ok
+test parser::tests::parser_tests::test_parse_subscriptions ... ok
+test parser::tests::parser_tests::test_parse_unknown_group_policy_remains_selector ... ok
+test parser::tests::parser_tests::test_parse_vless_mode_link ... ok
+test parser::tests::parser_tests::test_parse_wan_only_global ... ok
+test parser::tests::parser_tests::test_structured_fallback_discards_only_abandoned_dae_diagnostics ... ok
+test parser::tests::parser_tests::test_timer_diagnostic_survives_later_parse_error ... ok
+test parser::tests::preconnect_node_count_defaults_to_auto_and_zero_disables ... ok
+test parser::tests::test_dae_dns_rules_are_not_silently_dropped_by_structured_writer ... ok
+test parser::tests::test_dae_writer_rejects_dae_extension_without_touching_source ... ok
+test parser::tests::test_filter_ordinal_skips_subgroup_declarations ... ok
+test parser::tests::test_group_filter_diagnostics_do_not_echo_the_filter ... ok
+test parser::tests::test_group_filter_multi_tags_comma_and_pipe ... ok
+test parser::tests::test_group_filter_trailing_comment ... ok
+test parser::tests::test_group_filter_unquoted_hash ... ok
+test parser::tests::test_group_filter_unterminated_group ... ok
+test parser::tests::test_group_name_filter_exact_multi_and_regex ... ok
+test parser::tests::test_group_subscription_filter_exact_regex_and_compound ... ok
+test parser::tests::test_group_tags_serde_string_and_array ... ok
+test parser::tests::test_parse_dns_accepted_invalid_values_keep_fallbacks ... ok
+test parser::tests::test_parse_dns_duplicate_sections_preserve_source_order ... ok
+test parser::tests::test_parse_dns_request_ignores_sub ... dns routing: ignoring unsupported function sub(whatever) (out of scope for client DNS)
+ok
+test parser::tests::test_parse_dns_request_response_order_is_first_match_relevant ... ok
+test parser::tests::test_parse_dns_request_routing_negation ... ok
+test parser::tests::test_parse_dns_request_routing_qname ... ok
+test parser::tests::test_parse_dns_request_routing_qname_and_qtype ... ok
+test parser::tests::test_parse_dns_request_routing_qtype ... ok
+test parser::tests::test_parse_dns_request_routing_reject_asis ... ok
+test parser::tests::test_parse_dns_request_routing_sip ... ok
+test parser::tests::test_parse_dns_response_routing ... ok
+test parser::tests::test_parse_dns_stale_reply_ttl_invalid_uses_default_and_diagnostic ... ok
+test parser::tests::test_parse_dns_stale_reply_ttl_numeric_value_has_no_diagnostic ... ok
+test parser::tests::test_parse_dns_upstream_aliases_are_equivalent ... ok
+test parser::tests::test_parse_dns_zero_max_cache_size_is_preserved_for_runtime_clamp ... ok
+test parser::tests::test_parse_fixed_domain_ttl ... ok
+test parser::tests::test_parse_group_check_url ... ok
+test parser::tests::test_parse_group_default_key ... ok
+test parser::tests::test_parse_ipversion_prefer_maps_to_prefer_variants ... ok
+test parser::tests::test_parse_route_negation_bare_prefix_forms ... ok
+test parser::tests::test_parse_route_negation_matrix ... ok
+test parser::tests::test_parse_route_negation_production_rule ... ok
+test parser::tests::test_quoted_and_in_filter_is_reported_as_unparseable ... ok
+test parser::tests::test_routing_condition_not_serde_defaults ... ok
+test parser::tests::test_unknown_group_policy_returns_a_diagnostic_without_the_text ... ok
+test parser::tests::test_unparseable_dns_cache_numbers_use_the_fallback_and_return_diagnostics ... ok
+test parser::tests::test_unparseable_fixed_domain_ttl_is_skipped_and_returns_a_diagnostic ... ok
+test parser::tests::test_unparseable_group_filter_returns_a_diagnostic ... ok
+test parser::tests::test_unparseable_ipversion_prefer_uses_the_fallback_and_returns_a_diagnostic ... ok
+test parser::tests::test_unparseable_ports_use_the_fallback_and_return_diagnostics ... ok
+test parser::tests::test_unparseable_second_durations_use_the_fallback_and_return_diagnostics ... ok
+test parser::tests::test_unparseable_so_mark_uses_the_fallback_and_returns_a_diagnostic ... ok
+test parser::tests::test_unrecognised_booleans_are_false_and_return_diagnostics ... ok
+test parser::tests::test_unterminated_group_filter_returns_a_diagnostic ... ok
+test parser::tests::udp_warm_node_count_defaults_to_strictly_disabled ... ok
+test parser::tests::udp_warm_node_count_parses_zero_and_rejects_invalid_values ... ok
+test paths::tests::absolute_paths_stay_explicit ... ok
+test paths::tests::artifacts_honor_a_custom_data_directory ... ok
+test paths::tests::legacy_resolution_prefers_configured_then_old_root_then_caller ... ok
+test routing::tests::clash_rule_parts_picks_first_condition_kind ... ok
+test routing::tests::structured_complex_outbound_is_rejected ... ok
+
+test result: ok. 142 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

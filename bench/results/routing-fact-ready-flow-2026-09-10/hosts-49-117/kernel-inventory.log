@@ -1,0 +1,11 @@
+ebpf::real::routing::tests::four_mode_golden_policies: test
+ebpf::real::routing::tests::large_prefix_fact_policy: test
+ebpf::real::routing::tests::lazy_fact_cache_ipv6_host_overlap_and_default_prefix: test
+ebpf::real::routing::tests::lazy_fact_cache_null_zero_mac_presence_and_invalid_family: test
+ebpf::real::routing::tests::lazy_fact_cache_short_circuit_reuse_and_alternating_inputs: test
+ebpf::real::routing::tests::predicate_bits_and_capacity_limits: test
+ebpf::real::routing::tests::publication_failure_recovery_and_frozen_root: test
+ebpf::real::routing::tests::readiness::fact_readiness_failure_joins_preserve_full_decisions: test
+ebpf::real::routing::tests::readiness::fact_readiness_independent_bitmap_states: test
+
+9 tests, 0 benchmarks

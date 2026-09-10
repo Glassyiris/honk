@@ -1,0 +1,91 @@
+{
+  "implementation_head": "6b700f93ce8f3af0096ab41608fc5a0b12b6b9eb",
+  "hosts": {
+    "10.10.10.49": {
+      "kernel": "Linux archlinux 7.2.3-arch1-3 #1 SMP PREEMPT_DYNAMIC Sun, 06 Sep 2026 13:01:04 +0000 x86_64 GNU/Linux",
+      "gates": {
+        "config-tests.log": {
+          "result": "test result: ok. 142 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+          "internal_test_skips": [],
+          "expected_parser_diagnostics": [
+            "test parser::tests::parser_tests::test_parse_nodes ... node section: skipping unparseable entry: Parse error: invalid share link syntax"
+          ]
+        },
+        "routing-tests.log": {
+          "result": "test result: ok. 102 passed; 0 failed; 9 ignored; 0 measured; 910 filtered out; finished in 0.13s",
+          "internal_test_skips": [],
+          "expected_parser_diagnostics": []
+        },
+        "compiler-tests.log": {
+          "result": "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 1017 filtered out; finished in 0.00s",
+          "internal_test_skips": [],
+          "expected_parser_diagnostics": []
+        },
+        "kernel-routing-tests.log": {
+          "result": "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 1012 filtered out; finished in 2.48s",
+          "internal_test_skips": [],
+          "expected_parser_diagnostics": []
+        }
+      },
+      "kernel_goldens": 468,
+      "independent_bitmap_cases": 500,
+      "existing_honk_processes_unchanged": true,
+      "before_processes": [],
+      "after_processes": [],
+      "identity": [
+        "SSH_CONNECTION=10.10.10.70 43164 10.10.10.49 22",
+        "Linux archlinux 7.2.3-arch1-3 #1 SMP PREEMPT_DYNAMIC Sun, 06 Sep 2026 13:01:04 +0000 x86_64 GNU/Linux",
+        "machine_id_sha256=f29a761d071b808f8c53821027a4bbaae101234765747d90af13870f4058b9cd"
+      ]
+    },
+    "10.10.10.117": {
+      "kernel": "Linux tester 6.12.94+deb13-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.12.94-1 (2026-06-20) x86_64 GNU/Linux",
+      "gates": {
+        "config-tests.log": {
+          "result": "test result: ok. 142 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+          "internal_test_skips": [],
+          "expected_parser_diagnostics": [
+            "test parser::tests::parser_tests::test_parse_nodes ... node section: skipping unparseable entry: Parse error: invalid share link syntax"
+          ]
+        },
+        "routing-tests.log": {
+          "result": "test result: ok. 102 passed; 0 failed; 9 ignored; 0 measured; 910 filtered out; finished in 0.14s",
+          "internal_test_skips": [],
+          "expected_parser_diagnostics": []
+        },
+        "compiler-tests.log": {
+          "result": "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 1017 filtered out; finished in 0.00s",
+          "internal_test_skips": [],
+          "expected_parser_diagnostics": []
+        },
+        "kernel-routing-tests.log": {
+          "result": "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 1012 filtered out; finished in 1.86s",
+          "internal_test_skips": [],
+          "expected_parser_diagnostics": []
+        }
+      },
+      "kernel_goldens": 468,
+      "independent_bitmap_cases": 500,
+      "existing_honk_processes_unchanged": true,
+      "before_processes": [
+        "840 /usr/local/bin/honk-core --config /etc/honk/config.dae --bpf-object /usr/local/lib/honk/honk-ebpf.o",
+        "31339 /root/honk-core.vless-shapes-20260808 --config /root/honk-vless-shapes-20260808.dae --mock-ebpf"
+      ],
+      "after_processes": [
+        "840 /usr/local/bin/honk-core --config /etc/honk/config.dae --bpf-object /usr/local/lib/honk/honk-ebpf.o",
+        "31339 /root/honk-core.vless-shapes-20260808 --config /root/honk-vless-shapes-20260808.dae --mock-ebpf"
+      ],
+      "identity": [
+        "SSH_CONNECTION=10.10.10.70 46626 10.10.10.117 22",
+        "Linux tester 6.12.94+deb13-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.12.94-1 (2026-06-20) x86_64 GNU/Linux",
+        "machine_id_sha256=8c9bb970a1ff36db2acdbc879187fb652926499297e53a0b76b2edc6753fccb3"
+      ]
+    }
+  },
+  "scope": "All15 supported traffic matcher fields, both polarities, four dial modes, full routing/config/compiler test gates and isolated real-BPF routing. No live packet parsing, throughput A/B or changes to production configuration/services.",
+  "geo_assets": "geo-assets.json",
+  "artifact_hashes": "artifacts.json",
+  "coverage": "coverage.json",
+  "ignored_tests": "The nine ignored tests in the ordinary routing selection were all run explicitly by the real-kernel gate.",
+  "test_artifact_cleanup": "Owned remote directories removed after collecting successful logs and confirming process identities; source geo files were never modified."
+}

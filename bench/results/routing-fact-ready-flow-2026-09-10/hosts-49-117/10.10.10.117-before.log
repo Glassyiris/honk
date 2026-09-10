@@ -1,0 +1,9 @@
+Linux tester 6.12.94+deb13-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.12.94-1 (2026-06-20) x86_64 GNU/Linux
+uid=0(root) gid=0(root) groups=0(root)
+BPF_SETTINGS
+/proc/sys/net/core/bpf_jit_enable=1
+/proc/sys/kernel/unprivileged_bpf_disabled=2
+EXISTING_HONK_PROCESSES
+840 /usr/local/bin/honk-core --config /etc/honk/config.dae --bpf-object /usr/local/lib/honk/honk-ebpf.o
+31339 /root/honk-core.vless-shapes-20260808 --config /root/honk-vless-shapes-20260808.dae --mock-ebpf
+END_PROCESSES

@@ -1,0 +1,41 @@
+{
+  "source_commit": "6b700f93ce8f3af0096ab41608fc5a0b12b6b9eb",
+  "target": "x86_64-unknown-linux-musl",
+  "files": {
+    "honk-core-tests": {
+      "sha256": "7c12d254d19d397e296ed16405117ba6a710d39686ea83e5d50edf9da02a85ca",
+      "bytes": 24148040
+    },
+    "honk-config-tests": {
+      "sha256": "8f15ffce1683e07b76d44b4e52a8a2a7cffe4ae32c941a4ec4d47e075ea92f33",
+      "bytes": 4388744
+    },
+    "routing-test.o": {
+      "sha256": "5cb8893f1d21d60bceeac05ee3d3f4cffe040dba73cbfadcdf2c1e9644f70d36",
+      "bytes": 1523472
+    },
+    "geosite.dat": {
+      "sha256": "2c185fdfac8f0aac556cfceee6b66b9353779d3ef6deff3b4acc0132d7515546",
+      "bytes": 4229320
+    },
+    "geoip.dat": {
+      "sha256": "9be74ddcc596ba6b382ad074c1f3f18a834a118a1557f8186d6b083d65dd2714",
+      "bytes": 142966
+    }
+  },
+  "geo_sources": {
+    "geosite.dat": {
+      "source": "vyos@10.10.10.1:/etc/daed/geosite.dat",
+      "sha256": "2c185fdfac8f0aac556cfceee6b66b9353779d3ef6deff3b4acc0132d7515546",
+      "bytes": 4229320,
+      "access": "sudo -n cat, read-only"
+    },
+    "geoip.dat": {
+      "source": "vyos@10.10.10.1:/etc/daed/geoip.dat",
+      "sha256": "9be74ddcc596ba6b382ad074c1f3f18a834a118a1557f8186d6b083d65dd2714",
+      "bytes": 142966,
+      "access": "sudo -n cat, read-only"
+    }
+  },
+  "binaries": "manual test builds, not release artifacts"
+}

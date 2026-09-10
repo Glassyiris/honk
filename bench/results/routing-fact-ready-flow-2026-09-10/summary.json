@@ -510,7 +510,7 @@
     "Wall-clock loader timings are descriptive single samples; JIT size and verifier processed counts are separate budgets.",
     "Real-kernel probes used validated-codegen.rs; final changes only remove compiler-reported identity conversions. final-bytecode-equivalence.json binds all 15 retained policies to the final source."
   ],
-  "publication": "Local commits only; no push, PR update, merge, gateway service restart or production-code change in this fixture repair.",
+  "publication": "Implementation and evidence are published separately for review; no merge or gateway deployment. The host checks used isolated manual test binaries and did not restart existing services.",
   "fixture_repair": {
     "supersedes_evidence_commit": "dee4638118e67ba93535964b1a5f87e99969a184",
     "change": "Removed the separate benchmark_input builder and fixed-map timing loop. Each checked small-map fixture is timed immediately, with a checked_case_index link to the exact semantic observations.",
@@ -523,5 +523,21 @@
     "validation": "The final regression fails on the old runner with a positive destination map in destination-null, then passes all18 real timing-boundary checks on the repaired runner. Three paired and two ablation processes passed532 decisions and508 lookup-budget checks each.",
     "scope": "Only the Python evidence runner and its evidence changed. Existing production, real-EXT, ARM and kernel-matrix records were not rerun and remain historical evidence for the unchanged Rust implementation.",
     "caution": "Corrected ready-null cases regress by2\u20133ns in this SCHED_CLS wrapper, roughly22\u201325%; integer-nanosecond granularity is significant at an8\u20139ns baseline. No live-throughput conclusion follows."
+  },
+  "requested_host_validation": {
+    "hosts": [
+      "10.10.10.49",
+      "10.10.10.117"
+    ],
+    "results": "hosts-49-117/results.json",
+    "rule_fields": 15,
+    "modes": 4,
+    "per_host_passed_tests": 257,
+    "per_host_config_tests": 142,
+    "per_host_routing_tests": 102,
+    "per_host_compiler_tests": 4,
+    "per_host_kernel_tests": 9,
+    "source_commit": "6b700f93ce8f3af0096ab41608fc5a0b12b6b9eb",
+    "scope": "Isolated canonical-input real BPF plus complete routing/configuration unit gates; existing services left untouched."
   }
 }

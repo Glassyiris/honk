@@ -1,0 +1,14 @@
+{
+  "geosite.dat": {
+    "source": "vyos@10.10.10.1:/etc/daed/geosite.dat",
+    "sha256": "2c185fdfac8f0aac556cfceee6b66b9353779d3ef6deff3b4acc0132d7515546",
+    "bytes": 4229320,
+    "access": "sudo -n cat, read-only"
+  },
+  "geoip.dat": {
+    "source": "vyos@10.10.10.1:/etc/daed/geoip.dat",
+    "sha256": "9be74ddcc596ba6b382ad074c1f3f18a834a118a1557f8186d6b083d65dd2714",
+    "bytes": 142966,
+    "access": "sudo -n cat, read-only"
+  }
+}

@@ -1,0 +1,3 @@
+/root/.herdr/worktrees/honk/perf-ir/target/cse-x86_64/x86_64-unknown-linux-musl/release/deps/honk_core-0454ec7cd4a88145:   ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped
+/root/.herdr/worktrees/honk/perf-ir/target/cse-x86_64/x86_64-unknown-linux-musl/release/deps/honk_config-1e3886473639cf76: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped
+/root/.herdr/worktrees/honk/perf-ir/crates/honk-ebpf/target/routing-test/bpfel-unknown-none/release/honk-ebpf:             ELF 64-bit LSB relocatable, eBPF, version 1 (SYSV), with debug_info, not stripped

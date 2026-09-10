@@ -1,0 +1,10 @@
+{
+  "10.10.10.49": {
+    "directory": "/tmp/honk-rule-check.1S1KHu",
+    "removed_after_collection": true
+  },
+  "10.10.10.117": {
+    "directory": "/tmp/honk-rule-check.CZr1MH",
+    "removed_after_collection": true
+  }
+}

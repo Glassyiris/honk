@@ -1,0 +1,10 @@
+   Compiling honk-core v0.0.1-alpha (/root/.herdr/worktrees/honk/perf-ir/crates/honk-core)
+warning: honk-core@0.0.1-alpha: eBPF object embedded (1473056 bytes)
+warning: linker stderr: unable to open library directory '/root/.herdr/worktrees/honk/perf-ir/target/cse-x86_64/x86_64-unknown-linux-musl/release/build/boring-sys-f2addc58d6de8f22/out/build/lib': FileNotFound
+         warning: unable to open library directory '/root/.herdr/worktrees/honk/perf-ir/target/cse-x86_64/x86_64-unknown-linux-musl/release/build/boring-sys-f2addc58d6de8f22/out/build/crypto': FileNotFound
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `honk-core` (lib test) generated 1 warning
+    Finished `release` profile [optimized] target(s) in 3m 19s
+  Executable unittests src/lib.rs (target/cse-x86_64/x86_64-unknown-linux-musl/release/deps/honk_core-0454ec7cd4a88145)

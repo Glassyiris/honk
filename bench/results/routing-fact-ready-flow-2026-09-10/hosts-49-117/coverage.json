@@ -1,0 +1,54 @@
+{
+  "source_commit": "6b700f93ce8f3af0096ab41608fc5a0b12b6b9eb",
+  "rule_fields": [
+    "domain",
+    "domain_suffix",
+    "domain_keyword",
+    "domain_regex",
+    "ip",
+    "source_ip",
+    "port",
+    "source_port",
+    "protocol",
+    "process_name",
+    "mac",
+    "geo_ip",
+    "geosite",
+    "ip_version",
+    "dscp"
+  ],
+  "polarity": [
+    "positive",
+    "negated"
+  ],
+  "dial_modes": [
+    "ip",
+    "domain",
+    "domain+",
+    "domain++"
+  ],
+  "kernel_goldens": 468,
+  "independent_bitmap_cases": 500,
+  "additional": [
+    "same-field alternatives",
+    "cross-field conjunction",
+    "must and mark",
+    "stable priority and tie order",
+    "fallback",
+    "domain_final and DNS handoff",
+    "IPv4/IPv6 family separation",
+    "NULL versus zero bitmap",
+    "MAC absent versus all-zero",
+    "bit31/32/63/64/255",
+    "256-predicate rejection",
+    "65537-prefix map",
+    "failed publication preserves active root"
+  ],
+  "source_locations": [
+    "crates/honk-config/src/routing.rs:31-102",
+    "crates/honk-core/src/routing/golden.rs:45-492",
+    "crates/honk-core/src/ebpf/real/routing/tests.rs:530-725",
+    "crates/honk-core/src/ebpf/real/routing/tests/readiness.rs:133-311"
+  ],
+  "scope": "All supported traffic-rule fields and complete existing routing test selection; canonical-input BPF_TEST_RUN, not live packet parsing or every rule in the hosts production configurations."
+}
