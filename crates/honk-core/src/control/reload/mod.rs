@@ -67,11 +67,9 @@ pub(crate) fn resolve_outbound_nodes(
                     "resolve_outbound_nodes: group '{}' has no available node (ipver={:?})",
                     group.name, ipver
                 );
-                // When all nodes in a group are dead and `final` is configured,
-                // recursively resolve the fallback outbound.
                 if let Some(final_name) = group_manager.get_final_outbound(&group.name) {
                     info!(
-                        "Group '{}' has no alive nodes, falling back to final outbound '{}'",
+                        "Group '{}' has no available selection, using final outbound '{}'",
                         group.name, final_name
                     );
                     return resolve_outbound_nodes(

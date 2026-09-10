@@ -890,7 +890,7 @@ fn selector_commit_follows_non_first_default() {
 }
 
 #[test]
-fn selector_commit_follows_alive_fallback() {
+fn selector_refusal_does_not_commit_a_sibling_score_group() {
     let dead = node("fallback-dead");
     let nodes = [dead.clone(), node("fallback-alpha"), node("fallback-beta")];
     let sub = group("fallback-sub", &nodes[1..]);
@@ -908,15 +908,18 @@ fn selector_commit_follows_alive_fallback() {
         super::super::super::GroupManager::with_alive_set(&[sub, parent], &nodes, Some(alive));
     let state = manager.score_state();
 
-    // The chosen direct member is dead; the fallback serving sub-group
-    // must be the one committing its rank.
     manager.set_selector_choice("fallback-parent", "fallback-dead");
-    let _ = manager.selection_plan_for_domain("fallback-parent", ProbeDomain::Tcp, IpVersion::V4);
+    assert!(
+        manager
+            .selection_plan_for_domain("fallback-parent", ProbeDomain::Tcp, IpVersion::V4)
+            .nodes
+            .is_empty()
+    );
     assert_eq!(
         state
             .selection_reason_counts("fallback-sub", SelectionNetwork::Tcp)
             .cold_explore,
-        1
+        0
     );
 }
 

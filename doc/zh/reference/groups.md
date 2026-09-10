@@ -36,7 +36,7 @@ group {
 | `filter: subtag(...)` | `filters` + `nodes` | `[]` | 按产生节点的订阅的当前 tag 选择节点。 |
 | `filter: group(...)` | `groups` | `[]` | 加入嵌套组 tag。接受逗号分隔的参数和竖线分隔的 tag。 |
 | `default` | `default` | `null` | `selector` 的初始或回退成员 tag。 |
-| `final` | `final_outbound` | `null` | 没有存活成员时使用的节点、组、`direct` 或 `block`。 |
+| `final` | `final_outbound` | `null` | 组策略没有合格选择时使用的节点、组、`direct` 或 `block`。 |
 | `check_url` | `check_url` | `null` | 非 Selector 策略的按组 TCP 健康检查目标。Selector 会忽略该字段并告警。 |
 | —（dae 中不可配置） | `check_interval` | `null` | 按组间隔字段，单位为秒。当前运行时不读取该字段，而使用全局间隔。 |
 | —（dae 中不可配置） | `tolerance` | `50` | URLTest 切换阈值，单位为毫秒。dae URLTest 组接收 `global.check_tolerance`；运行时的有效下限为 1 ms。 |
@@ -48,7 +48,7 @@ group {
 
 | 规范名 | 接受的 dae 拼写 | 行为 |
 | ------ | --------------- | ---- |
-| `selector` | `selector`、`select`、`fixed`、`fixed(0)` | 依次使用运行时选择、`default` 和第一个存活成员；选择可以是直接节点或嵌套组 tag。 |
+| `selector` | `selector`、`select`、`fixed`、`fixed(0)` | 在健康过滤前依次使用运行时选择、`default` 和第一个现存成员，TCP 与 UDP 语义一致。健康状态不会把有效选择替换成兄弟成员。选择可以是直接节点或嵌套组 tag。 |
 | `urltest` | `urltest`、`min_moving_avg`、`min_avg10`、`min_last_delay` | 使用减半移动平均 `(prev + sample) / 2` 和 tolerance 选择延迟最低的存活成员；TCP 与 UDP 选择相互独立。 |
 | `loadbalance` | `loadbalance`、`roundrobin`、`round_robin`、`balance` | 对存活成员轮询；每个组以及 TCP/UDP 网络各有独立计数器。 |
 | `fallback` | `fallback` | 分别为 TCP 和 UDP 按声明顺序固定第一个存活成员；更靠前的成员恢复后不会立即 failback。 |
@@ -56,7 +56,11 @@ group {
 
 策略名按 ASCII 大小写不敏感匹配。解析器匹配前会去掉可选的括号后缀，因此接受 `fixed(0)`。无法识别的策略会变为 `selector`，并在诊断信息中注明组名；旧策略名 `honk` 明确无效，必须改用 `score`。
 
-若组只有一个唯一叶节点、未配置 `final`，且 TCP 健康状态排除了该节点，honk 仍会把同一节点作为最后尝试。节点保持 dead，直到真实流量或探测使其恢复；这绝不表示回退到 `direct`。UDP 继续正常排除死亡成员。最后尝试服务与 Selector 已配置选择/`default` 因健康过滤回退到其他成员，都会记录限流警告（每组每网络 60 秒）。
+只有在选择缺失或已不属于该组时，才继续使用 `default` 或声明顺序中的第一个成员。现存的已选成员没有合格叶节点时，TCP 和 UDP 都不会回退到兄弟成员：仅可继续执行显式配置的 `final` 或下述同一叶节点的 TCP 最后尝试。选中的嵌套组仍执行自己的策略，因此 URLTest 可以在该子组内部选择其他叶节点。
+
+不同节点使用同一显示 tag 时，Selector 在健康过滤前按组内声明顺序绑定第一个匹配成员的 `NodeId`，不会因另一个同名节点健康而改选它。
+
+若组只有一个唯一叶节点、未配置 `final`，且 TCP 健康状态排除了该节点，honk 仍可把同一节点作为最后尝试，但当前 Selector 选择路径必须能到达它。这不能绕过选中的空子组，也不表示回退到 `direct`。节点保持 dead，直到真实流量或探测使其恢复；UDP 继续正常排除死亡成员。最后尝试服务会记录限流警告（每组 60 秒）。
 
 每个已配置 Selector 的代理叶节点都保持热态。解析嵌套选择后，honk 会按叶节点协议保留可复用的多路复用 session、QUIC client 或一条到服务端的裸 TCP 连接；`direct` 与 `block` 不需要热资源。
 

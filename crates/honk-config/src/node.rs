@@ -359,11 +359,11 @@ pub struct Group {
     /// delimited string (`groups = "hk|jp"` or `"hk, jp"`).
     #[serde(default, deserialize_with = "deserialize_group_tags")]
     pub groups: Vec<String>,
-    /// Default node name for Selector policy.
-    /// The first alive node is used if empty or the default is dead.
+    /// Initial Selector member tag (node or subgroup) when no valid runtime choice exists.
+    /// Missing/non-member defaults use the first existing member; health does not replace a choice.
     #[serde(default)]
     pub default: Option<String>,
-    /// Fallback outbound name when all nodes in this group are dead.
+    /// Explicit fallback for the caller when the group's policy has no available selection.
     /// Can be "direct", "block", another group name, or a node name.
     #[serde(default)]
     pub final_outbound: Option<String>,
@@ -417,8 +417,10 @@ fn default_tolerance() -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum GroupPolicy {
-    /// Manual selection — uses `Group.default` (or first alive node as fallback).
-    /// The selected node stays until changed via API or the node dies.
+    /// Manual selection — valid runtime choice, then valid `Group.default`, then first existing member.
+    /// Health never switches TCP or UDP to another member; missing/non-member tags are resolved again.
+    /// Same-name nodes resolve to the first matching member in declaration order.
+    /// The caller may apply an explicit final, or retry the same sole TCP leaf within this path.
     #[default]
     Selector,
     /// Auto-select lowest-latency node with tolerance (like sing-box urltest).

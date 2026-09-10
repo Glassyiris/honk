@@ -69,7 +69,7 @@ impl GroupManager {
             // tag's state instead of leaking the old leaf's.
             return candidates
                 .into_iter()
-                .filter(|c| alive.is_alive_for_url(c.tag, url))
+                .filter(|c| alive.is_alive_for_url(c.tag(), url))
                 .collect();
         }
         candidates

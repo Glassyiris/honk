@@ -36,7 +36,7 @@ group {
 | `filter: subtag(...)` | `filters` + `nodes` | `[]` | Select nodes by the current tag of the subscription that produced them. |
 | `filter: group(...)` | `groups` | `[]` | Add nested group tags. Comma-separated arguments and pipe-separated tags are accepted. |
 | `default` | `default` | `null` | Initial or fallback member tag for `selector`. |
-| `final` | `final_outbound` | `null` | Node, group, `direct`, or `block` used when no member is alive. |
+| `final` | `final_outbound` | `null` | Node, group, `direct`, or `block` used when the group's policy has no eligible selection. |
 | `check_url` | `check_url` | `null` | Per-group TCP health-check target for non-Selector policies. A Selector ignores it with a warning. |
 | — (not in dae) | `check_interval` | `null` | Per-group interval field in seconds. The current runtime does not consult it and uses the global interval. |
 | — (not in dae) | `tolerance` | `50` | URLTest switch threshold in milliseconds. dae URLTest groups receive `global.check_tolerance`; the runtime applies an effective minimum of 1 ms. |
@@ -48,7 +48,7 @@ group {
 
 | Canonical name | Accepted dae spellings | Behavior |
 | -------------- | ---------------------- | -------- |
-| `selector` | `selector`, `select`, `fixed`, `fixed(0)` | Uses the runtime choice, then `default`, then the first alive member; the choice may be a direct node or nested group tag. |
+| `selector` | `selector`, `select`, `fixed`, `fixed(0)` | Uses the runtime choice, then `default`, then the first existing member before health filtering, identically for TCP and UDP. Health never replaces a valid choice with a sibling. The choice may be a direct node or nested group tag. |
 | `urltest` | `urltest`, `min_moving_avg`, `min_avg10`, `min_last_delay` | Selects the lowest-latency alive member using the halving moving average `(prev + sample) / 2` and tolerance; TCP and UDP selections are independent. |
 | `loadbalance` | `loadbalance`, `roundrobin`, `round_robin`, `balance` | Round-robins over alive members with independent counters per group and TCP/UDP network. |
 | `fallback` | `fallback` | Pins the first alive member in declaration order independently for TCP and UDP; recovery of an earlier member does not immediately fail back. |
@@ -56,7 +56,11 @@ group {
 
 Policy matching is ASCII case-insensitive. The parser removes a parenthesized suffix when present before matching, which accepts `fixed(0)`. An unrecognized policy becomes `selector` and a diagnostic names the group. Legacy `honk` is invalid; use `score`.
 
-If a group has exactly one unique leaf, no `final`, and that leaf is excluded by TCP health, honk still dials the same leaf as a last resort. The node remains marked dead until real traffic or probes recover it; this never implies a `direct` fallback. UDP keeps normal dead-member exclusion. The last-resort serve and a health-filtered Selector choice/default falling back to another member each log a rate-limited warning (60s per group/network).
+Only missing or no-longer-member choices fall through to `default` or the first declared member. An existing chosen member without an eligible leaf does not fall back to a sibling, on either TCP or UDP: the only continuations are an explicit `final` or the same-leaf TCP last-resort rule below. A chosen nested group still applies its own policy, so URLTest may select another leaf inside that group.
+
+When distinct nodes share a display tag, Selector binds the first matching member in the group's declaration order by `NodeId`, before health filtering. A healthy same-name node cannot replace that member.
+
+If a group has exactly one unique leaf, no `final`, and that leaf is excluded by TCP health, honk can still dial the same leaf as a last resort, but only if the current Selector choices lead to it. This cannot bypass a chosen empty sub-group or imply a `direct` fallback. The node remains marked dead until real traffic or probes recover it; UDP keeps normal dead-member exclusion. Last-resort serving logs a rate-limited warning (60s per group).
 
 Every configured Selector proxy leaf stays warm. After resolving a nested choice, honk retains a reusable multiplexed session, a QUIC client, or one bare server TCP connection according to the leaf protocol; `direct` and `block` need no warm resource.
 

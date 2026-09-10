@@ -7,6 +7,22 @@ use super::*;
 use std::sync::atomic::Ordering;
 
 impl GroupManager {
+    /// Resolve the configured member before health filtering, so an
+    /// unavailable choice cannot redirect traffic to a sibling member.
+    pub(super) fn selector_member<'a>(&'a self, group: &'a Group) -> Option<GroupMember<'a>> {
+        if group.policy != GroupPolicy::Selector {
+            return None;
+        }
+        let choices = self.selector_choice.read();
+        choices
+            .get(&group.name)
+            .map(String::as_str)
+            .into_iter()
+            .chain(group.default.as_deref())
+            .find_map(|tag| self.members(group).find(|member| member.tag() == tag))
+            .or_else(|| self.members(group).next())
+    }
+
     /// Allocation-free selector fast path for a group with direct members
     /// only. It preserves selector precedence and liveness/custom-URL
     /// eligibility while the recursive path retains nested cycle guards.
@@ -15,133 +31,39 @@ impl GroupManager {
         group: &'a Group,
         domain: ProbeDomain,
         ipver: IpVersion,
-        effects: SelectionEffects,
     ) -> Option<&'a Node> {
-        let selectable = |node: &&Node| {
-            if domain == ProbeDomain::Tcp
-                && let Some(url) = group.check_url.as_deref()
-                && let Some(alive) = &self.alive_set
-            {
-                alive.is_alive_for_url(&node.name, url)
-            } else {
-                self.is_node_selectable_for_domain(node.id, domain, ipver)
-            }
+        let GroupMember::Node(node) = self.selector_member(group)? else {
+            return None;
         };
-        let find = |tag: &str| {
-            group
-                .nodes
-                .iter()
-                .filter_map(|id| self.nodes.get(id))
-                .find(|node| node.name == tag && selectable(node))
-        };
-        let choice = self.selector_choice.read().get(&group.name).cloned();
-        let mut filtered: Option<&str> = None;
-        if let Some(choice) = choice.as_deref() {
-            if let Some(node) = find(choice) {
-                return Some(node);
-            }
-            filtered = Some(choice);
-        }
-        if let Some(default) = group.default.as_deref() {
-            if let Some(node) = find(default) {
-                if let Some(preference) = filtered {
-                    self.warn_selector_choice_filtered(
-                        group,
-                        preference,
-                        &node.name,
-                        SelectionNetwork::from_probe_domain(domain),
-                        effects,
-                    );
-                }
-                return Some(node);
-            }
-            if filtered.is_none() {
-                filtered = Some(default);
-            }
-        }
-        let picked = group
-            .nodes
-            .iter()
-            .filter_map(|id| self.nodes.get(id))
-            .find(selectable);
-        if let (Some(preference), Some(node)) = (filtered, picked) {
-            self.warn_selector_choice_filtered(
-                group,
-                preference,
-                &node.name,
-                SelectionNetwork::from_probe_domain(domain),
-                effects,
-            );
-        }
-        picked
-    }
-
-    /// Selector policy: runtime choice, then `group.default`, then first
-    /// alive candidate. Choices match member TAGS — a choice may name a
-    /// direct member node or a nested sub-group (sing-box nested-selector
-    /// behavior: picking a sub-group defers to that group's own pick,
-    /// which flattening already resolved to its leaf).
-    ///
-    /// When the configured choice or default is health-filtered for this
-    /// network (e.g. UDP-dead), the fallback is deliberate — but it is
-    /// logged (rate-limited) because the dashboard `now` field still
-    /// displays the configured choice while traffic silently rides another
-    /// member.
-    pub(super) fn pick_selector<'a>(
-        &self,
-        candidates: &[Candidate<'a>],
-        group: &Group,
-        network: SelectionNetwork,
-        effects: SelectionEffects,
-    ) -> Candidate<'a> {
-        let choice = self.selector_choice.read().get(&group.name).cloned();
-        let mut filtered: Option<&str> = None;
-        if let Some(choice) = choice.as_deref() {
-            if let Some(c) = candidates.iter().find(|c| c.tag == choice) {
-                return c.clone();
-            }
-            filtered = Some(choice);
-        }
-        let default_picked = group
-            .default
-            .as_deref()
-            .and_then(|default| candidates.iter().find(|c| c.tag == default));
-        if filtered.is_none()
-            && let Some(default) = group.default.as_deref()
-            && default_picked.is_none()
+        let selectable = if domain == ProbeDomain::Tcp
+            && let Some(url) = group.check_url.as_deref()
+            && let Some(alive) = &self.alive_set
         {
-            filtered = Some(default);
-        }
-        let picked = default_picked.unwrap_or(&candidates[0]);
-        if let Some(preference) = filtered {
-            self.warn_selector_choice_filtered(group, preference, picked.tag, network, effects);
-        }
-        picked.clone()
+            alive.is_alive_for_url(&node.name, url)
+        } else {
+            self.is_node_selectable_for_domain(node.id, domain, ipver)
+        };
+        selectable.then_some(node)
     }
 
-    /// Rate-limited warning for a health-filtered Selector choice or
-    /// default: the dashboard keeps displaying the configured choice while
-    /// traffic rides another member, so the fallback must be visible
-    /// without logging once per dial. Peek paths (warm-up discovery) move
-    /// no traffic and stay silent.
-    fn warn_selector_choice_filtered(
-        &self,
-        group: &Group,
-        preferred: &str,
-        picked: &str,
-        network: SelectionNetwork,
-        effects: SelectionEffects,
-    ) {
-        if !effects.applies() || !self.selector_fallback_log_allowed(group, network) {
-            return;
-        }
-        tracing::warn!(
-            group = %group.name,
-            network = ?network,
-            preferred = %preferred,
-            picked = %picked,
-            "selector choice is not alive for this network; traffic falls back to another member"
-        );
+    /// Require the configured member's candidate; a nested choice delegates
+    /// to that group's own policy without escaping its membership.
+    pub(super) fn pick_selector<'a>(
+        candidates: &[Candidate<'a>],
+        member: GroupMember<'a>,
+    ) -> Option<Candidate<'a>> {
+        candidates
+            .iter()
+            .find(|candidate| match (member, candidate.member()) {
+                (GroupMember::Node(selected), GroupMember::Node(actual)) => {
+                    selected.id == actual.id
+                }
+                (GroupMember::Group(selected), GroupMember::Group(actual)) => {
+                    selected.name == actual.name
+                }
+                _ => false,
+            })
+            .cloned()
     }
 
     /// Rate-limited warning when every candidate was health-filtered and
@@ -153,9 +75,20 @@ impl GroupManager {
         picked: &str,
         effects: SelectionEffects,
     ) {
-        if !effects.applies() || !self.selector_fallback_log_allowed(group, SelectionNetwork::Tcp) {
+        if !effects.applies() {
             return;
         }
+        const LOG_COOLDOWN: Duration = Duration::from_secs(60);
+        let now = Instant::now();
+        let mut last = self.last_resort_log.write();
+        if last
+            .get(&group.name)
+            .is_some_and(|previous| now.duration_since(*previous) < LOG_COOLDOWN)
+        {
+            return;
+        }
+        last.insert(group.name.clone(), now);
+        drop(last);
         tracing::warn!(
             group = %group.name,
             picked = %picked,
@@ -163,19 +96,6 @@ impl GroupManager {
         );
     }
 
-    fn selector_fallback_log_allowed(&self, group: &Group, network: SelectionNetwork) -> bool {
-        const LOG_COOLDOWN: Duration = Duration::from_secs(60);
-        let key = (group.name.clone(), network);
-        let now = Instant::now();
-        let mut last = self.selector_fallback_log.write();
-        if let Some(previous) = last.get(&key)
-            && now.duration_since(*previous) < LOG_COOLDOWN
-        {
-            return false;
-        }
-        last.insert(key, now);
-        true
-    }
     pub(super) fn pick_score<'a>(
         &self,
         candidates: &[Candidate<'a>],
@@ -232,7 +152,7 @@ impl GroupManager {
                 cache.get(&group.name).and_then(|sel| sel.tcp.clone())
             };
             if let Some(entry) = tcp_entry
-                && let Some(c) = candidates.iter().find(|c| c.tag == entry.tag)
+                && let Some(c) = candidates.iter().find(|c| c.tag() == entry.tag)
             {
                 if effects.applies()
                     && self.cache_urltest_selection(group, network, c, entry.latency)
@@ -250,14 +170,14 @@ impl GroupManager {
         {
             let cache = self.urltest_cache.read();
             if let Some(current) = cache.get(&group.name).and_then(|sel| sel.get(network))
-                && let Some(pos) = candidates.iter().position(|c| c.tag == current.tag)
+                && let Some(pos) = candidates.iter().position(|c| c.tag() == current.tag)
             {
                 let best_latency = self.node_latency(
                     best.node,
                     network,
                     ipver,
                     group.check_url.as_deref(),
-                    best.tag,
+                    best.tag(),
                 );
                 // Hysteresis baseline is the incumbent's *current* measured
                 // latency, not the latency recorded when it was selected
@@ -271,7 +191,7 @@ impl GroupManager {
                     network,
                     ipver,
                     group.check_url.as_deref(),
-                    candidates[pos].tag,
+                    candidates[pos].tag(),
                 );
                 if current_latency != Duration::MAX
                     && !self.failure_demoted(
@@ -292,7 +212,7 @@ impl GroupManager {
             network,
             ipver,
             group.check_url.as_deref(),
-            best.tag,
+            best.tag(),
         );
         if effects.applies() && self.cache_urltest_selection(group, network, &best, latency) {
             self.maybe_interrupt(&group.name);
@@ -353,7 +273,7 @@ impl GroupManager {
             if let Some(pinned) = cache
                 .get(&group.name)
                 .and_then(|pins| pins[network.slot()].as_deref())
-                && let Some(c) = candidates.iter().find(|c| c.tag == pinned)
+                && let Some(c) = candidates.iter().find(|c| c.tag() == pinned)
             {
                 return c.clone();
             }
@@ -383,7 +303,7 @@ impl GroupManager {
             .min_by_key(|c| {
                 (
                     self.failure_demoted(c.node, network, ipver, group.check_url.as_deref()),
-                    self.node_latency(c.node, network, ipver, group.check_url.as_deref(), c.tag),
+                    self.node_latency(c.node, network, ipver, group.check_url.as_deref(), c.tag()),
                 )
             })
             .cloned()
@@ -479,7 +399,7 @@ impl GroupManager {
         ipver: IpVersion,
         check_url: Option<&str>,
     ) -> Vec<Candidate<'a>> {
-        candidates.sort_by_key(|c| self.node_latency(c.node, network, ipver, check_url, c.tag));
+        candidates.sort_by_key(|c| self.node_latency(c.node, network, ipver, check_url, c.tag()));
         candidates
     }
 }

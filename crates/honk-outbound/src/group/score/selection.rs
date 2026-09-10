@@ -1,3 +1,5 @@
+use crate::group::GroupMember;
+
 use super::*;
 
 impl super::GroupManager {
@@ -250,6 +252,7 @@ impl super::GroupManager {
             };
         };
         self.mark_used(group_name);
+        let selected_member = self.selector_member(group);
         let mut visited = Vec::new();
         let mut candidates = self.flatten_candidates_for_target(
             group,
@@ -294,7 +297,7 @@ impl super::GroupManager {
                     context.network,
                     context.health_family,
                     group.check_url.as_deref(),
-                    candidate.tag,
+                    candidate.tag(),
                 ) != Duration::MAX
             })
         {
@@ -310,45 +313,49 @@ impl super::GroupManager {
         } else {
             let candidate = match group.policy {
                 honk_config::group::GroupPolicy::Selector => {
-                    let picked = self.pick_selector(
-                        &candidates,
-                        group,
-                        context.network,
-                        super::SelectionEffects::Apply,
-                    );
-                    self.commit_selector_pick_for_target(
-                        group,
-                        picked,
-                        context,
-                        &mut visited,
-                        0,
-                        super::SelectionEffects::Apply,
-                    )
+                    let picked =
+                        selected_member.and_then(|member| Self::pick_selector(&candidates, member));
+                    picked.and_then(|picked| {
+                        self.commit_selector_pick_for_target(
+                            group,
+                            picked,
+                            context,
+                            &mut visited,
+                            0,
+                            super::SelectionEffects::Apply,
+                        )
+                    })
                 }
-                honk_config::group::GroupPolicy::URLTest => self.pick_urltest(
+                honk_config::group::GroupPolicy::URLTest => Some(self.pick_urltest(
                     &candidates,
                     group,
                     context.network,
                     context.health_family,
                     super::SelectionEffects::Apply,
-                ),
-                honk_config::group::GroupPolicy::LoadBalance => self.pick_load_balance(
+                )),
+                honk_config::group::GroupPolicy::LoadBalance => Some(self.pick_load_balance(
                     &candidates,
                     group,
                     context.network,
                     super::SelectionEffects::Apply,
-                ),
-                honk_config::group::GroupPolicy::Fallback => self.pick_fallback(
+                )),
+                honk_config::group::GroupPolicy::Fallback => Some(self.pick_fallback(
                     &candidates,
                     group,
                     context.network,
                     super::SelectionEffects::Apply,
-                ),
-                honk_config::group::GroupPolicy::Score => {
-                    self.pick_score(&candidates, group, context, super::SelectionEffects::Apply)
-                }
+                )),
+                honk_config::group::GroupPolicy::Score => Some(self.pick_score(
+                    &candidates,
+                    group,
+                    context,
+                    super::SelectionEffects::Apply,
+                )),
             };
-            (super::SelectionPlanMode::Authoritative, vec![candidate])
+            (
+                super::SelectionPlanMode::Authoritative,
+                candidate.into_iter().collect(),
+            )
         };
         let candidates = candidates
             .into_iter()
@@ -374,10 +381,19 @@ impl super::GroupManager {
         if depth >= super::MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
             return None;
         }
+        let selected_member = if group.policy == honk_config::group::GroupPolicy::Selector {
+            Some(self.selector_member(group)?)
+        } else {
+            None
+        };
         let node = self.last_resort_tcp_leaf(group, context.probe_domain, effects)?;
-        if group.nodes.contains(&node.id) {
+        if group.nodes.contains(&node.id)
+            && selected_member.is_none_or(
+                |member| matches!(member, GroupMember::Node(selected) if selected.id == node.id),
+            )
+        {
             return Some(super::Candidate {
-                tag: node.name.as_str(),
+                via: None,
                 node,
                 attribution: Vec::new(),
                 selection_chain: vec![node.name.as_str()],
@@ -386,11 +402,16 @@ impl super::GroupManager {
 
         visited.push(group.name.as_str());
         let candidate = group.groups.iter().find_map(|tag| {
+            if selected_member.is_some_and(
+                |member| !matches!(member, GroupMember::Group(selected) if selected.name == *tag),
+            ) {
+                return None;
+            }
             let subgroup = self.groups.get(tag)?;
             self.pick_candidate_for_target(subgroup, context, visited, depth + 1, effects)
                 .filter(|candidate| candidate.node.id == node.id)
                 .map(|mut candidate| {
-                    candidate.tag = tag.as_str();
+                    candidate.via = Some(subgroup);
                     candidate
                 })
         });
@@ -406,6 +427,7 @@ impl super::GroupManager {
         depth: usize,
         effects: super::SelectionEffects,
     ) -> Option<super::Candidate<'a>> {
+        let selected_member = self.selector_member(group);
         let mut candidates =
             self.flatten_candidates_for_target(group, context, visited, depth, effects);
         let before_filter = (effects.applies()
@@ -431,10 +453,10 @@ impl super::GroupManager {
         } else {
             Some(match group.policy {
                 honk_config::group::GroupPolicy::Selector => {
-                    let picked = self.pick_selector(&candidates, group, context.network, effects);
+                    let picked = Self::pick_selector(&candidates, selected_member?)?;
                     self.commit_selector_pick_for_target(
                         group, picked, context, visited, depth, effects,
-                    )
+                    )?
                 }
                 honk_config::group::GroupPolicy::URLTest => self.pick_urltest(
                     &candidates,
@@ -470,24 +492,20 @@ impl super::GroupManager {
         visited: &mut Vec<&'a str>,
         depth: usize,
         effects: super::SelectionEffects,
-    ) -> super::Candidate<'a> {
+    ) -> Option<super::Candidate<'a>> {
         if !effects.applies() {
-            return picked;
+            return Some(picked);
         }
-        let Some(sub) = self.groups.get(picked.tag) else {
-            return picked;
+        let Some(sub) = picked.via else {
+            return Some(picked);
         };
-        self.mark_used(picked.tag);
+        self.mark_used(&sub.name);
         visited.push(group.name.as_str());
         let committed = self.pick_candidate_for_target(sub, context, visited, depth + 1, effects);
         visited.pop();
-        match committed {
-            Some(mut committed) => {
-                committed.tag = picked.tag;
-                committed
-            }
-            None => picked,
-        }
+        let mut committed = committed?;
+        committed.via = picked.via;
+        Some(committed)
     }
 
     fn flatten_candidates_for_target<'a>(
@@ -514,7 +532,7 @@ impl super::GroupManager {
             .iter()
             .filter_map(|id| self.nodes.get(id))
             .map(|node| super::Candidate {
-                tag: node.name.as_str(),
+                via: None,
                 node,
                 attribution: Vec::new(),
                 selection_chain: vec![node.name.as_str()],
@@ -530,7 +548,7 @@ impl super::GroupManager {
             if let Some(mut candidate) =
                 self.pick_candidate_for_target(subgroup, context, visited, depth + 1, sub_effects)
             {
-                candidate.tag = tag.as_str();
+                candidate.via = Some(subgroup);
                 candidates.push(candidate);
             }
         }
@@ -569,8 +587,109 @@ impl super::GroupManager {
         );
         (!candidates.is_empty()).then(|| {
             self.pick_score(&candidates, group, &context, super::SelectionEffects::Peek)
-                .tag
+                .tag()
                 .to_string()
         })
     }
+}
+
+#[test]
+fn selector_commit_does_not_restore_a_stale_sibling() {
+    use crate::alive::AliveDialerSet;
+    use honk_config::group::{Group, GroupPolicy};
+
+    let nodes: Vec<_> = ["a", "b", "outside"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| Node {
+            id: Uuid::from_u128(index as u128 + 1),
+            name: name.into(),
+            ..Default::default()
+        })
+        .collect();
+    let groups = [
+        Group {
+            name: "child".into(),
+            policy: GroupPolicy::Selector,
+            nodes: vec![nodes[0].id, nodes[1].id],
+            ..Default::default()
+        },
+        Group {
+            name: "parent".into(),
+            policy: GroupPolicy::Selector,
+            nodes: vec![nodes[2].id],
+            groups: vec!["child".into()],
+            ..Default::default()
+        },
+    ];
+    let mut results = Vec::new();
+    for target_aware in [false, true] {
+        for domain in [ProbeDomain::Tcp, ProbeDomain::DataUdp] {
+            let alive = Arc::new(AliveDialerSet::new());
+            for domain in [ProbeDomain::Tcp, ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+                alive.report_unavailable_forced(nodes[1].id, domain, IpVersion::V4);
+            }
+            let manager = GroupManager::with_alive_set(&groups, &nodes, Some(alive));
+            manager.set_selector_choice("parent", "child");
+            manager.set_selector_choice("child", "a");
+            let parent = &manager.groups["parent"];
+            let selected_member = manager.selector_member(parent).unwrap();
+            let context = ScoreSelectionContext {
+                target: Some(ScoreTarget::domain("commit.example", 443)),
+                ..ScoreSelectionContext::aggregate(
+                    SelectionNetwork::from_probe_domain(domain),
+                    domain,
+                    IpVersion::V4,
+                )
+            };
+            let mut visited = Vec::new();
+            let candidates = if target_aware {
+                manager.flatten_candidates_for_target(
+                    parent,
+                    &context,
+                    &mut visited,
+                    0,
+                    SelectionEffects::Apply,
+                )
+            } else {
+                manager.flatten_candidates(
+                    parent,
+                    context.probe_domain,
+                    context.health_family,
+                    &mut visited,
+                    0,
+                    SelectionEffects::Apply,
+                )
+            };
+
+            // A failed serving commit must not resurrect the child's old leaf.
+            manager.set_selector_choice("child", "b");
+            let picked = GroupManager::pick_selector(&candidates, selected_member).unwrap();
+            let committed: Option<Candidate<'_>> = if target_aware {
+                manager.commit_selector_pick_for_target(
+                    parent,
+                    picked,
+                    &context,
+                    &mut visited,
+                    0,
+                    SelectionEffects::Apply,
+                )
+            } else {
+                manager.commit_selector_pick(
+                    parent,
+                    picked,
+                    context.probe_domain,
+                    context.health_family,
+                    &mut visited,
+                    0,
+                    SelectionEffects::Apply,
+                )
+            };
+            results.push(committed.map(|candidate| candidate.node.id));
+        }
+    }
+    assert_eq!(
+        results, [None; 4],
+        "ordinary and target-aware commits must refuse"
+    );
 }
