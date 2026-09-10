@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 mod protocol;
@@ -310,18 +312,22 @@ impl Node {
         Ok(())
     }
 
+    pub(crate) fn identity_material(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}",
+            self.protocol().as_str(),
+            identity_field(self.host()),
+            self.port,
+            self.outbound.credential_fingerprint(),
+            self.outbound.dial_shape_fingerprint()
+        )
+    }
+
     /// Content-derived stable identity: UUID v5 over
     /// `protocol|host|port|credential-fingerprint|dial-shape`.
     /// Explicit ALPN derives a child UUID from the legacy ID and an ordered JSON list.
     pub fn derive_id(&self) -> uuid::Uuid {
-        let material = format!(
-            "{}|{}|{}|{}|{}",
-            self.protocol().as_str(),
-            self.host(),
-            self.port,
-            self.outbound.credential_fingerprint(),
-            self.outbound.dial_shape_fingerprint()
-        );
+        let material = self.identity_material();
         let legacy_id = uuid::Uuid::new_v5(&NODE_ID_NAMESPACE, material.as_bytes());
         if let Some(tls) = self.tls().filter(|tls| !tls.alpn.is_empty()) {
             let alpn = serde_json::to_vec(&("tls-alpn", &tls.alpn))
@@ -331,6 +337,26 @@ impl Node {
             legacy_id
         }
     }
+}
+
+/// Escape raw identity fields without changing ordinary nodes' legacy material.
+/// Both `|` and `\` must be escaped so different field splits stay distinct (#193).
+fn identity_field(value: &str) -> Cow<'_, str> {
+    let escapes = value
+        .bytes()
+        .filter(|byte| matches!(byte, b'|' | b'\\'))
+        .count();
+    if escapes == 0 {
+        return Cow::Borrowed(value);
+    }
+    let mut escaped = String::with_capacity(value.len() + escapes);
+    for character in value.chars() {
+        if matches!(character, '|' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    Cow::Owned(escaped)
 }
 
 /// A group of nodes for load balancing / failover.
@@ -565,6 +591,16 @@ mod tests {
                 "4133852f-b86f-5a8f-b8fb-b335023645fe",
             ),
             (
+                "vless-encrypted",
+                "vless://b@example.com:443?encryption=a#encrypted",
+                "9add2074-63e8-5b29-ba6b-26ed937d2464",
+            ),
+            (
+                "vless-populated-dial",
+                "vless://uuid@example.com:443?security=reality&type=ws&sni=cdn.example.com&path=%2Fp&host=ws.example.com&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=abcd&spx=%2Fprobe#populated",
+                "529c3f31-3295-54f2-86e5-15cfc43f1a39",
+            ),
+            (
                 "hysteria2",
                 "hysteria2://secret@example.com:443#hysteria2",
                 "f622cf2a-ef2e-5777-abdb-d8c826d11f57",
@@ -590,6 +626,66 @@ mod tests {
             let node = Node::from_share_link(link).unwrap();
             assert_eq!(node.id.to_string(), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn test_identity_credential_split() {
+        for [left, right] in ["socks5", "ss", "tuic", "juicity"].map(|p| {
+            ["a%7Cb:c", "a:b%7Cc"].map(|c| Node::from_share_link(&format!("{p}://{c}@h")).unwrap())
+        }) {
+            assert_ne!(left.id, right.id);
+        }
+    }
+
+    #[test]
+    fn test_identity_vless_credential_arity() {
+        let left = Node::from_share_link("vless://b@example.com:443?encryption=a").unwrap();
+        let right = Node::from_share_link("vless://a%7Cb@example.com:443").unwrap();
+        assert_ne!(left.id, right.id);
+    }
+
+    #[test]
+    fn test_identity_dial_shape_split() {
+        let left =
+            Node::from_share_link("vless://uuid@example.com:443?type=ws&sni=a%7Cws&path=%2Fp")
+                .unwrap();
+        let right =
+            Node::from_share_link("vless://uuid@example.com:443?type=ws&sni=a&path=ws%7C%2Fp")
+                .unwrap();
+        assert_ne!(left.id, right.id);
+    }
+
+    #[test]
+    fn test_identity_effective_host_split() {
+        let mut node = Node::from_share_link("socks5://a:b@h:443").unwrap();
+        let plain_id = node.derive_id();
+        node.host = "h|1080".into();
+        assert!(node.identity_material().contains(r"|h\|1080|"));
+        assert_ne!(node.derive_id(), plain_id);
+    }
+
+    #[test]
+    fn test_identity_vless_layout_control() {
+        let encrypted =
+            Node::from_share_link("vless://b@example.com:443?encryption=a&sni=tcp").unwrap();
+        let xudp =
+            Node::from_share_link("vless://a@example.com:443?vless_mode=xudp&sni=b").unwrap();
+        for node in [&encrypted, &xudp] {
+            crate::Config {
+                nodes: vec![node.clone()],
+                ..Default::default()
+            }
+            .validate()
+            .unwrap();
+        }
+        assert_ne!(encrypted.id, xudp.id);
+    }
+
+    #[test]
+    fn test_identity_escape_mutation_check() {
+        let left = [r"|\", ""].map(identity_field).join("|");
+        let right = [r"\", "|"].map(identity_field).join("|");
+        assert_ne!(left, right);
     }
 
     #[test]

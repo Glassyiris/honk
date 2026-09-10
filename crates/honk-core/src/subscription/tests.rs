@@ -223,6 +223,30 @@ fn test_parse_subscription_keeps_unique_nodes_with_duplicates() {
 }
 
 #[test]
+fn test_parse_subscription_rejects_encrypted_vless_flow_before_deduplication() {
+    let invalid = "vless://u@h:443?encryption=e&type=ws&sni=ws&flow=xudp#a";
+    let valid = "vless://e@h:443?type=ws&sni=u&path=ws&vless_mode=xudp#b";
+    let sub = Subscription {
+        sub_type: SubscriptionType::Simple,
+        ..Default::default()
+    };
+    let nodes = parse_subscription_content(&sub, &format!("{invalid}\n{valid}")).unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["b"]
+    );
+    let error = Node::from_share_link(invalid).unwrap_err();
+    assert!(matches!(
+        error,
+        honk_config::ConfigError::Validation(message)
+            if message == "Node 'a' combines VLESS Encryption with flow; this combination is unsupported"
+    ));
+}
+
+#[test]
 fn test_parse_subscription_skips_proxy_plugins() {
     let clash = Subscription {
         sub_type: SubscriptionType::Clash,

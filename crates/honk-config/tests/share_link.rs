@@ -1096,10 +1096,11 @@ fn test_vless_encryption_param_and_identity() {
 #[test]
 fn test_validate_rejects_vless_encryption_with_flow() {
     let encryption = "mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    let node = Node::from_share_link(&format!(
-        "vless://uuid@example.com:443?security=tls&flow=xtls-rprx-vision&encryption={encryption}#encrypted-flow"
+    let mut node = Node::from_share_link(&format!(
+        "vless://uuid@example.com:443?security=tls&encryption={encryption}#encrypted-flow"
     ))
     .unwrap();
+    node.vless_mut().unwrap().flow = Some("xtls-rprx-vision".into());
     let mut config = Config::default();
     config.nodes.push(node);
     let error = config.validate().unwrap_err();

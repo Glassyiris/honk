@@ -1,6 +1,6 @@
 use crate::types::NodeProtocol;
 
-use super::WireMode;
+use super::{WireMode, identity_field};
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TlsOptions {
@@ -107,6 +107,16 @@ pub struct VlessConfig {
 
 impl VlessConfig {
     pub fn validate(&self, name: &str) -> Result<(), crate::ConfigError> {
+        if self
+            .encryption
+            .as_deref()
+            .is_some_and(|value| !value.is_empty() && value != "none")
+            && self.flow.as_deref().is_some_and(|flow| !flow.is_empty())
+        {
+            return Err(crate::ConfigError::Validation(format!(
+                "Node '{name}' combines VLESS Encryption with flow; this combination is unsupported"
+            )));
+        }
         if self.mode != WireMode::Legacy {
             if let Some(flow) = self.flow.as_deref().filter(|flow| !flow.is_empty())
                 && !(self.mode == WireMode::Xudp && flow == "xtls-rprx-vision")
@@ -314,43 +324,38 @@ impl OutboundConfig {
 
     pub(crate) fn credential_fingerprint(&self) -> String {
         match self {
-            Self::Shadowsocks(config) => format!(
-                "{}|{}",
+            Self::Shadowsocks(config) => identity_join(&[
                 config.encryption.as_deref().unwrap_or(""),
-                config.password.as_deref().unwrap_or("")
-            ),
-            Self::Trojan(config) => config.password.as_deref().unwrap_or("").to_string(),
-            Self::Vmess(config) => config.uuid.as_deref().unwrap_or("").to_string(),
+                config.password.as_deref().unwrap_or(""),
+            ]),
+            Self::Trojan(config) => identity_join(&[config.password.as_deref().unwrap_or("")]),
+            Self::Vmess(config) => identity_join(&[config.uuid.as_deref().unwrap_or("")]),
             Self::Vless(config)
                 if config
                     .encryption
                     .as_deref()
                     .is_some_and(|value| !value.is_empty() && value != "none") =>
             {
-                format!(
-                    "{}|{}",
+                identity_join(&[
                     config.encryption.as_deref().unwrap_or_default(),
-                    config.uuid.as_deref().unwrap_or("")
-                )
+                    config.uuid.as_deref().unwrap_or(""),
+                ])
             }
-            Self::Vless(config) => config.uuid.as_deref().unwrap_or("").to_string(),
-            Self::Socks5(config) => format!(
-                "{}|{}",
+            Self::Vless(config) => identity_join(&[config.uuid.as_deref().unwrap_or("")]),
+            Self::Socks5(config) => identity_join(&[
                 config.username.as_deref().unwrap_or(""),
-                config.password.as_deref().unwrap_or("")
-            ),
-            Self::Hysteria2(config) => config.auth.as_deref().unwrap_or("").to_string(),
-            Self::Tuic(config) => format!(
-                "{}|{}",
+                config.password.as_deref().unwrap_or(""),
+            ]),
+            Self::Hysteria2(config) => identity_join(&[config.auth.as_deref().unwrap_or("")]),
+            Self::Tuic(config) => identity_join(&[
                 config.uuid.as_deref().unwrap_or(""),
-                config.password.as_deref().unwrap_or("")
-            ),
-            Self::Juicity(config) => format!(
-                "{}|{}",
+                config.password.as_deref().unwrap_or(""),
+            ]),
+            Self::Juicity(config) => identity_join(&[
                 config.uuid.as_deref().unwrap_or(""),
-                config.password.as_deref().unwrap_or("")
-            ),
-            Self::AnyTls(config) => config.password.as_deref().unwrap_or("").to_string(),
+                config.password.as_deref().unwrap_or(""),
+            ]),
+            Self::AnyTls(config) => identity_join(&[config.password.as_deref().unwrap_or("")]),
             Self::Direct | Self::Block => String::new(),
         }
     }
@@ -385,13 +390,27 @@ impl OutboundConfig {
                 _ => "",
             },
         ]
+        .map(identity_field)
         .join("|");
         if let Self::Vless(config) = self
             && config.mode != WireMode::Legacy
         {
             fingerprint.push('|');
-            fingerprint.push_str(config.mode.as_str());
+            fingerprint.push_str(&identity_field(config.mode.as_str()));
         }
         fingerprint
     }
+}
+
+fn identity_join(fields: &[&str]) -> String {
+    let capacity =
+        fields.iter().map(|field| field.len()).sum::<usize>() + fields.len().saturating_sub(1);
+    let mut identity = String::with_capacity(capacity);
+    for (index, field) in fields.iter().enumerate() {
+        if index != 0 {
+            identity.push('|');
+        }
+        identity.push_str(&identity_field(field));
+    }
+    identity
 }

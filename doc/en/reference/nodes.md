@@ -33,6 +33,10 @@ protocol|host|port|credential-fingerprint|dial-shape
 
 The credential fingerprint follows each handler's field precedence. The legacy dial shape includes `sni`, transport, WebSocket/gRPC shape, Hysteria2 obfuscation, REALITY parameters, `flow`, and every non-`legacy` VLESS mode. Nonempty structured `tls_alpn` derives a child UUID v5 using the legacy ID as its namespace and the JSON tuple `["tls-alpn", <ordered list>]` as its name; this separates ALPN from arbitrary credential text. Empty `tls_alpn` retains legacy IDs. Tuning and display metadata do not participate.
 
+Before joining, each raw credential and dial-shape field and the effective host escapes `\` as `\\` and `|` as `\|`. Joined fingerprints are not escaped again. For nodes accepted by `Config::validate`, different identity fields produce different hash material. This guarantee does not cover nodes rejected by full configuration validation, even if `Node::from_share_link` can derive their IDs.
+
+At this upgrade, a node with `|` or `\` in one of these pipe-joined identity fields receives a new ID once; its ID-keyed health and warm state starts fresh. Nodes without either character in those fields retain their IDs. ALPN uses the separate JSON child-UUID step, so `|` or `\` in ALPN alone does not change an existing ID at this upgrade. Selector choices migrate by member name, pooled ready streams already retire per generation, and `name`/`subtag` filters are unaffected.
+
 Identity is therefore stable across rename, reload, and subscription refresh when the dialable endpoint is unchanged. Configuration/runtime assembly rejects duplicate derived IDs. `Node::default()` has a nil ID; construction paths derive it, and the outbound runtime registry rejects any nil ID that reaches it.
 
 ## Node fields

@@ -694,30 +694,19 @@ impl Config {
                     node.name, transport.transport
                 )));
             }
-            if let Some(vless) = node.vless() {
-                if let Some(flow) = vless.flow.as_deref() {
-                    if vless.tls.reality_public_key.is_none() && !vless.tls.enabled {
-                        return Err(crate::ConfigError::Validation(format!(
-                            "Node '{}' sets flow '{}' without TLS or REALITY",
-                            node.name, flow
-                        )));
-                    }
-                    if flow != "xtls-rprx-vision" {
-                        return Err(crate::ConfigError::Validation(format!(
-                            "Node '{}' has unsupported flow '{}' (expected xtls-rprx-vision)",
-                            node.name, flow
-                        )));
-                    }
-                }
-                if vless
-                    .encryption
-                    .as_deref()
-                    .is_some_and(|value| !value.is_empty() && value != "none")
-                    && vless.flow.as_deref().is_some_and(|flow| !flow.is_empty())
-                {
+            if let Some(vless) = node.vless()
+                && let Some(flow) = vless.flow.as_deref()
+            {
+                if vless.tls.reality_public_key.is_none() && !vless.tls.enabled {
                     return Err(crate::ConfigError::Validation(format!(
-                        "Node '{}' combines VLESS Encryption with flow; this combination is unsupported",
-                        node.name
+                        "Node '{}' sets flow '{}' without TLS or REALITY",
+                        node.name, flow
+                    )));
+                }
+                if flow != "xtls-rprx-vision" {
+                    return Err(crate::ConfigError::Validation(format!(
+                        "Node '{}' has unsupported flow '{}' (expected xtls-rprx-vision)",
+                        node.name, flow
                     )));
                 }
             }

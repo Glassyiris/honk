@@ -33,6 +33,10 @@ protocol|host|port|credential-fingerprint|dial-shape
 
 凭据指纹遵循各 handler 的字段优先级。旧版 dial shape 包含 `sni`、transport、WebSocket/gRPC 形态、Hysteria2 混淆、REALITY 参数、`flow` 以及每种非 `legacy` VLESS mode。非空的结构化 `tls_alpn` 以旧 ID 为 namespace、JSON 元组 `["tls-alpn", <有序列表>]` 为 name 派生子 UUID v5，从而将 ALPN 与任意凭据文本分离。空 `tls_alpn` 保留旧 ID。调优参数与显示元数据不参与。
 
+拼接前，每个原始凭据字段、拨号形态字段和有效的 `host` 值都会将 `\` 转义为 `\\`，将 `|` 转义为 `\|`。拼接后的指纹不再转义。对于通过 `Config::validate` 的节点，不同的身份字段会产生不同的哈希输入。完整配置校验拒绝的节点不在此保证范围内，即使 `Node::from_share_link` 能为其派生 ID。
+
+本次升级时，上述以 `|` 拼接的身份字段中含有 `|` 或 `\` 的节点，其 ID 会变更一次，以 ID 为键的健康状态和预热状态会重新建立。这些字段不含两种字符的节点保留原 ID。ALPN 使用独立的 JSON 子 UUID 派生步骤，因此仅 ALPN 含有 `|` 或 `\` 不会在本次升级时改变已有 ID。Selector 选择按成员名称迁移。连接池中的就绪流原本就会在所属配置版本退出时移除。`name`/`subtag` 筛选器不受影响。
+
 因此，只要可拨号端点不变，身份在改名、reload 和订阅刷新后仍保持稳定。配置/运行时组装会拒绝重复的派生 ID。`Node::default()` 的 ID 为 nil；构造路径会派生 ID，出站运行时注册表会拒绝任何抵达该处的 nil ID。
 
 ## 节点字段
