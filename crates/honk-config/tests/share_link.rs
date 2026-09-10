@@ -594,6 +594,205 @@ fn test_ss_full_base64_authority_with_fragment() {
 }
 
 #[test]
+fn test_ss_legacy_literal_percent_password() {
+    let link = format!("ss://{}", b64("aes-256-gcm:a%20b@1.2.3.4:8388"));
+    let node = Node::from_share_link(&link).unwrap();
+    assert_eq!(
+        node.shadowsocks().unwrap().password.as_deref(),
+        Some("a%20b")
+    );
+}
+
+#[test]
+fn test_ss_legacy_standard_base64_slash() {
+    let payload = base64::engine::general_purpose::STANDARD.encode("aes-256-gcm:ab?@1.2.3.4:8388");
+    let node = Node::from_share_link(&format!("ss://{payload}")).unwrap();
+    assert_eq!(node.host, "1.2.3.4");
+    assert_eq!(node.port, 8388);
+    assert_eq!(
+        node.shadowsocks().unwrap().encryption.as_deref(),
+        Some("aes-256-gcm")
+    );
+    assert_eq!(node.shadowsocks().unwrap().password.as_deref(), Some("ab?"));
+}
+
+#[test]
+fn test_ss_legacy_literal_slash_password() {
+    let link = format!("ss://{}", b64("aes-256-gcm:a/b@1.2.3.4:8388"));
+    let node = Node::from_share_link(&link).unwrap();
+    assert_eq!(node.shadowsocks().unwrap().password.as_deref(), Some("a/b"));
+}
+
+#[test]
+fn test_ss_legacy_literal_hash_password() {
+    let link = format!("ss://{}", b64("aes-256-gcm:p#x@1.2.3.4:8388"));
+    let node = Node::from_share_link(&link).unwrap();
+    assert_eq!(node.shadowsocks().unwrap().password.as_deref(), Some("p#x"));
+}
+
+#[test]
+fn test_ss_legacy_rejects_missing_credentials() {
+    let link = format!("ss://{}", b64("1.2.3.4:8388"));
+    let error = Node::from_share_link(&link).unwrap_err();
+    assert!(
+        matches!(error, honk_config::ConfigError::Parse(message) if message.contains("no credentials"))
+    );
+}
+
+#[test]
+fn test_ss_legacy_rejects_missing_method_separator() {
+    let link = format!("ss://{}", b64("password@1.2.3.4:8388"));
+    let error = Node::from_share_link(&link).unwrap_err();
+    assert!(
+        matches!(error, honk_config::ConfigError::Parse(message) if message.contains("no method separator"))
+    );
+}
+
+#[test]
+fn test_ss_legacy_plain_matches_userinfo_form() {
+    let link = format!("ss://{}", b64("aes-256-gcm:plain@1.2.3.4:8388"));
+    let node = Node::from_share_link(&link).unwrap();
+    let canonical = Node::from_share_link("ss://aes-256-gcm:plain@1.2.3.4:8388").unwrap();
+    assert_eq!(node.id, canonical.id);
+    assert_eq!(
+        node.shadowsocks().unwrap().password.as_deref(),
+        Some("plain")
+    );
+}
+
+#[test]
+fn test_ss_legacy_colon_password() {
+    let link = format!("ss://{}", b64("aes-256-gcm:a:b@1.2.3.4:8388"));
+    let node = Node::from_share_link(&link).unwrap();
+    assert_eq!(node.shadowsocks().unwrap().password.as_deref(), Some("a:b"));
+}
+
+#[test]
+fn test_ss_legacy_last_at_separates_endpoint() {
+    let link = format!("ss://{}", b64("aes-256-gcm:a@b@1.2.3.4:8388"));
+    let node = Node::from_share_link(&link).unwrap();
+    assert_eq!(node.host, "1.2.3.4");
+    assert_eq!(node.shadowsocks().unwrap().password.as_deref(), Some("a@b"));
+}
+
+#[test]
+fn test_ss_legacy_encoded_method() {
+    let link = format!(
+        "ss://{}",
+        b64("Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNQ:pw@1.2.3.4:8388")
+    );
+    let node = Node::from_share_link(&link).unwrap();
+    assert_eq!(
+        node.shadowsocks().unwrap().encryption.as_deref(),
+        Some("chacha20-ietf-poly1305")
+    );
+}
+
+#[test]
+fn test_ss_legacy_ipv6_matches_userinfo_form() {
+    let link = format!("ss://{}", b64("aes-256-gcm:plain@[2001:db8::1]:8388"));
+    let node = Node::from_share_link(&link).unwrap();
+    let canonical = Node::from_share_link("ss://aes-256-gcm:plain@[2001:db8::1]:8388").unwrap();
+    assert_eq!(node.host, "[2001:db8::1]");
+    assert_eq!(node.id, canonical.id);
+}
+
+#[test]
+fn test_ss_legacy_padded_plugin_suffix() {
+    let payload =
+        base64::engine::general_purpose::STANDARD.encode("aes-256-gcm:plain@1.2.3.4:8388");
+    let node = Node::from_share_link(&format!(
+        "ss://{payload}/?plugin=v2ray-plugin%3Btls&remark=query#name"
+    ))
+    .unwrap();
+    assert_eq!(
+        node.shadowsocks().unwrap().plugin.as_deref(),
+        Some("v2ray-plugin")
+    );
+    assert_eq!(
+        node.shadowsocks().unwrap().plugin_opts.as_deref(),
+        Some("tls")
+    );
+    assert_eq!(node.name, "name");
+}
+
+#[test]
+fn test_ss_legacy_unpadded_plugin_delimiter() {
+    let payload = b64("aes-256-gcm:abcdefghijklmnop@1.2.3.4:8388");
+    let node =
+        Node::from_share_link(&format!("ss://{payload}/?plugin=v2ray-plugin%3Btls#name")).unwrap();
+    assert_eq!(node.port, 8388);
+    assert_eq!(
+        node.shadowsocks().unwrap().plugin.as_deref(),
+        Some("v2ray-plugin")
+    );
+    assert_eq!(
+        node.shadowsocks().unwrap().plugin_opts.as_deref(),
+        Some("tls")
+    );
+    assert_eq!(node.name, "name");
+}
+
+#[test]
+fn test_ss_legacy_remark_suffix() {
+    let link = format!(
+        "ss://{}/?remark=name",
+        b64("aes-256-gcm:plain@1.2.3.4:8388")
+    );
+    let node = Node::from_share_link(&link).unwrap();
+    assert_eq!(node.name, "name");
+}
+
+#[test]
+fn test_ss_url_userinfo_still_percent_decodes() {
+    let link = "ss://aes-256-gcm:a%20b@1.2.3.4:8388";
+    let node = Node::from_share_link(link).unwrap();
+    assert_eq!(node.shadowsocks().unwrap().password.as_deref(), Some("a b"));
+}
+
+#[test]
+fn test_ss_compat_nested_base64_userinfo() {
+    let link = format!(
+        "ss://{}",
+        b64(&format!("{}@1.2.3.4:8388", b64("aes-256-gcm:pw")))
+    );
+    let node = Node::from_share_link(&link).unwrap();
+    let ss = node.shadowsocks().unwrap();
+    assert_eq!(ss.encryption.as_deref(), Some("aes-256-gcm"));
+    assert_eq!(ss.password.as_deref(), Some("pw"));
+}
+
+#[test]
+fn test_ss_compat_empty_base64_run() {
+    let link = "ss://[2001:db8::1]:8388#nm";
+    let node = Node::from_share_link(link).unwrap();
+    assert_eq!(node.host, "[2001:db8::1]");
+    assert_eq!(node.port, 8388);
+    assert_eq!(node.name, "nm");
+}
+
+#[test]
+fn test_ss_compat_legacy_path_suffix() {
+    let link = format!("ss://{}/path#name", b64("aes-256-gcm:plain@1.2.3.4:8388"));
+    let node = Node::from_share_link(&link).unwrap();
+    assert_eq!(node.host, "1.2.3.4");
+    assert_eq!(node.port, 8388);
+    assert_eq!(
+        node.shadowsocks().unwrap().password.as_deref(),
+        Some("plain")
+    );
+    assert_eq!(node.name, "name");
+}
+
+#[test]
+fn test_ss_compat_bare_hostname() {
+    let link = "ss://host:8388";
+    let node = Node::from_share_link(link).unwrap();
+    assert_eq!(node.host, "host");
+    assert_eq!(node.port, 8388);
+}
+
+#[test]
 fn test_name_fallback_never_contains_credentials() {
     // Links without #name get a `scheme-host` fallback; the raw URI (with
     // the password) must never end up in the display name.

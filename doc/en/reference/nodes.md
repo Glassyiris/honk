@@ -23,6 +23,8 @@ In quoted tags and links, a backslash escapes the next character when locating t
 
 A malformed recognized link is dropped with `node section: skipping unparseable entry: ...` on stderr. An unknown scheme is a hard configuration error. A standalone `mux:` or `mux=` line is also rejected; VLESS wire behavior belongs in each link's `vless_mode=` query.
 
+In the legacy `ss://base64(method:password@host:port)` form, decoded credentials are literal text, not URL-decoded: `%20` stays `%20`, and `?`, `/`, `#`, `:` and `@` remain password characters. The last `@` separates the endpoint; the userinfo may itself be `base64(method:password)`. A decoded payload without `@`, or credentials that cannot supply a method and password, is rejected. URL userinfo forms still percent-decode their credentials. The endpoint, path, query (including `/?plugin=...`) and fragment keep the usual URL handling.
+
 ## Node identity
 
 `Node::derive_id()` is the only identity derivation path. It computes UUID v5 over:

@@ -22,7 +22,7 @@ use std::borrow::Cow;
 use base64::Engine as _;
 
 use crate::error::ConfigError;
-use crate::node::{Node, OutboundConfig};
+use crate::node::{Node, OutboundConfig, ShadowsocksConfig};
 
 mod options;
 
@@ -31,6 +31,7 @@ impl Node {
     /// A chain describes several hops; only the first is parsed.
     pub fn from_share_link(link: &str) -> Result<Node, ConfigError> {
         let first = link.split("->").next().unwrap_or("").trim();
+        let mut ss_config = None;
         let (decoded, shadowrocket) = match first.split_once("://") {
             Some((scheme, payload)) if scheme.eq_ignore_ascii_case("vmess") => {
                 let Some(decoded) = decode_full_base64_vmess_link(payload)? else {
@@ -44,7 +45,12 @@ impl Node {
                 (decoded, shadowrocket)
             }
             Some((scheme, payload)) if scheme.eq_ignore_ascii_case("ss") => {
-                (decode_full_base64_ss_link(payload), false)
+                if let Some((link, config)) = decode_full_base64_ss_link(payload)? {
+                    ss_config = Some(config);
+                    (Some(link), false)
+                } else {
+                    (None, false)
+                }
             }
             _ => (None, false),
         };
@@ -53,6 +59,9 @@ impl Node {
         let url = url::Url::parse(first.as_ref())
             .map_err(|_| ConfigError::Parse("invalid share link syntax".into()))?;
         let mut node = node_from_url(&url)?;
+        if let Some(config) = ss_config {
+            node.outbound = OutboundConfig::Shadowsocks(config);
+        }
         let query = options::parse_query(&url, node.protocol(), shadowrocket)?;
         node.name = url
             .fragment()
@@ -332,20 +341,67 @@ fn looks_like_cipher(s: &str) -> bool {
         && (s.contains('-') || matches!(s, "salsa20" | "chacha20" | "rc4"))
 }
 
-/// Decode the SIP002 full-base64 form `ss://base64(method:password@host:port)`,
-/// keeping any `?query` / `#fragment` suffix, and return the rebuilt link.
-/// Returns `None` for the (more common) forms that already carry an `@`.
-fn decode_full_base64_ss_link(rest: &str) -> Option<String> {
-    let end = rest.find(['?', '#', '/']).unwrap_or(rest.len());
-    let authority = &rest[..end];
-    if authority.is_empty() || authority.contains('@') {
-        return None;
+/// Decode legacy credentials literally, leaving the endpoint and suffix on the URL path.
+/// Returns `None` for URL forms without a UTF-8 payload; rejects decoded text
+/// without credentials or credentials that cannot supply a method and password.
+fn decode_full_base64_ss_link(
+    rest: &str,
+) -> Result<Option<(String, ShadowsocksConfig)>, ConfigError> {
+    let authority_end = rest.find(['?', '#']).unwrap_or(rest.len());
+    if rest[..authority_end].contains('@') {
+        return Ok(None);
     }
-    let text = String::from_utf8(base64_decode_flexible(authority)?).ok()?;
-    if !text.contains('@') {
-        return None;
+    let end = rest
+        .bytes()
+        .position(|b| !b.is_ascii_alphanumeric() && !matches!(b, b'+' | b'/' | b'=' | b'_' | b'-'))
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return Ok(None);
     }
-    Some(format!("ss://{}{}", text, &rest[end..]))
+    // An optional delimiter can also decode as payload; prefer preserving the suffix.
+    let without_delimiter = rest[..end]
+        .strip_suffix('/')
+        .filter(|_| matches!(rest.as_bytes().get(end), None | Some(b'?' | b'#')))
+        .map(str::len);
+    // Preserve the old path boundary only after trying both base64 alphabets.
+    let path_start = rest[..end]
+        .find('/')
+        .filter(|&start| Some(start) != without_delimiter);
+    let mut decoded_text = false;
+    for end in [without_delimiter, Some(end), path_start]
+        .into_iter()
+        .flatten()
+    {
+        let Some(text) =
+            base64_decode_flexible(&rest[..end]).and_then(|bytes| String::from_utf8(bytes).ok())
+        else {
+            continue;
+        };
+        decoded_text = true;
+        let Some((userinfo, endpoint)) = text.rsplit_once('@') else {
+            continue;
+        };
+        let Some((method, password)) = decode_ss_userinfo(userinfo) else {
+            return Err(ConfigError::Parse(
+                "invalid legacy ss:// link: no method separator".into(),
+            ));
+        };
+        return Ok(Some((
+            format!("ss://{endpoint}{}", &rest[end..]),
+            ShadowsocksConfig {
+                encryption: Some(method),
+                password: Some(password),
+                ..Default::default()
+            },
+        )));
+    }
+    if decoded_text {
+        Err(ConfigError::Parse(
+            "invalid legacy ss:// link: no credentials".into(),
+        ))
+    } else {
+        Ok(None)
+    }
 }
 
 fn decode_full_base64_vless_link(rest: &str) -> Result<Option<String>, ConfigError> {
