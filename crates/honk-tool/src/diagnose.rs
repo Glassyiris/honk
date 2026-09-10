@@ -3,9 +3,10 @@
 //! Read-only: inspects the process, namespace/veth plumbing, pinned maps,
 //! policy routing, and the clash API.  Requires root for the map reads.
 
-use std::path::PathBuf;
+use std::{ffi::OsString, io, path::PathBuf};
 
 use clap::Args;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Args)]
 pub struct DiagnoseArgs {
@@ -15,6 +16,9 @@ pub struct DiagnoseArgs {
     /// Clash API base URL to probe (empty = skip API checks).
     #[arg(long, default_value = "http://127.0.0.1:9090")]
     pub api: String,
+    /// Clash API Bearer token (overrides HONK_API_SECRET).
+    #[arg(long, env = "HONK_API_SECRET", hide_env_values = true)]
+    pub secret: Option<String>,
     /// Expected TPROXY mark (hex, no 0x).
     #[arg(long, default_value_t = 0x0800_0000)]
     pub tproxy_mark: u32,
@@ -75,7 +79,7 @@ pub async fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
 
     if !args.api.is_empty() {
         let url = format!("{}/version", args.api.trim_end_matches('/'));
-        match reqwest_get(&url).await {
+        match reqwest_get(&url, args.secret.as_deref()).await {
             Ok(body) => println!("[ok] clash API {}: {}", args.api, body.trim()),
             Err(e) => {
                 println!("[FAIL] clash API {}: {}", args.api, e);
@@ -92,17 +96,32 @@ pub async fn run(args: DiagnoseArgs) -> anyhow::Result<()> {
             format!("diagnose: {issues} issue(s) found")
         }
     );
+    anyhow::ensure!(issues == 0, "diagnose: {issues} issue(s) found");
     Ok(())
 }
 
 fn find_engine() -> Option<(u32, String)> {
-    for entry in std::fs::read_dir("/proc").ok()? {
-        let entry = entry.ok()?;
-        let pid: u32 = match entry.file_name().to_str()?.parse() {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    find_engine_in(entries.map(|entry| entry.map(|entry| (entry.file_name(), entry.path()))))
+}
+
+fn find_engine_in(
+    entries: impl Iterator<Item = io::Result<(OsString, PathBuf)>>,
+) -> Option<(u32, String)> {
+    for entry in entries {
+        let Ok((name, path)) = entry else {
+            continue;
+        };
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let pid: u32 = match name.parse() {
             Ok(p) => p,
             Err(_) => continue,
         };
-        let comm = std::fs::read_to_string(entry.path().join("comm")).ok()?;
+        let Ok(comm) = std::fs::read_to_string(path.join("comm")) else {
+            continue;
+        };
         let comm = comm.trim().to_string();
         if comm == "honk-core" || comm == "honk" || comm == "dae" {
             return Some((pid, comm));
@@ -126,7 +145,7 @@ fn run_cmd(cmd: &str, args: &[&str]) -> anyhow::Result<String> {
 }
 
 /// Minimal GET helper (avoids pulling reqwest into the tool for one call).
-async fn reqwest_get(url: &str) -> anyhow::Result<String> {
+async fn reqwest_get(url: &str, secret: Option<&str>) -> anyhow::Result<String> {
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| anyhow::anyhow!("only http:// API URLs are supported"))?;
@@ -135,13 +154,69 @@ async fn reqwest_get(url: &str) -> anyhow::Result<String> {
         None => (rest, "/"),
     };
     let stream = tokio::net::TcpStream::connect(host).await?;
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    tokio::io::AsyncWriteExt::write_all(
-        &mut writer,
-        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
-    )
-    .await?;
-    let mut buf = String::new();
-    tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut buf).await?;
-    Ok(buf)
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+    if let Some(secret) = secret {
+        request.push_str("Authorization: Bearer ");
+        request.push_str(secret);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    writer.write_all(request.as_bytes()).await?;
+
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    let mut status = line.split_whitespace();
+    anyhow::ensure!(
+        matches!(status.next(), Some("HTTP/1.0" | "HTTP/1.1")),
+        "invalid HTTP status line"
+    );
+    let code = status
+        .next()
+        .filter(|code| code.len() == 3)
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| anyhow::anyhow!("invalid HTTP status code"))?;
+    anyhow::ensure!((200..300).contains(&code), "{}", line.trim_end());
+    loop {
+        line.clear();
+        anyhow::ensure!(
+            reader.read_line(&mut line).await? != 0,
+            "incomplete HTTP response headers"
+        );
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+    }
+    let mut body = String::new();
+    reader.read_to_string(&mut body).await?;
+    Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    use super::find_engine_in;
+
+    #[test]
+    fn find_engine_skips_unreadable_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_comm = dir.path().join("100");
+        let engine = dir.path().join("200");
+        std::fs::create_dir(&missing_comm).unwrap();
+        std::fs::create_dir(&engine).unwrap();
+        std::fs::write(engine.join("comm"), "honk-core\n").unwrap();
+        let entries = [
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            Ok((OsString::from_vec(vec![0xff]), dir.path().to_path_buf())),
+            Ok(("100".into(), missing_comm)),
+            Ok(("200".into(), engine)),
+        ];
+
+        let found = find_engine_in(entries.into_iter());
+
+        assert_eq!(found, Some((200, "honk-core".to_owned())));
+    }
 }
