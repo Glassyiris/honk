@@ -92,6 +92,12 @@ IP 分 family，避免 IPv6 前缀误匹配 mapped IPv4。更具体的 LPM 条�
 谓词的位，使最长前缀查找不破坏规则顺序。每一代使用完整 `DomainRouting` bitmap，
 不再共享可能被新前缀提前遮挡的双 bank LPM value。
 
+同一次调用中，出现至少两次的目的 IP、源 IP 或 MAC 类别，在实际执行到第一个相关
+条件时才 lookup。对齐栈槽保存 pointer（包括 NULL）及独立的 ready 标志；每个条件仍
+先检查自己的正向 bit，再应用否定。未使用或只使用一次的类别没有缓存状态。提前返回
+不预查未到达的类别，但重复类别仍有入口栈初始化成本。fact pointer 不跨调用或
+generation 保留。domain 入口 lookup 不变，因为它还负责确定 `domain_final`。
+
 事实准备先用 hash 合并重复键，只排序唯一键，再在原向量中继承祖先位并压缩保留容量。
 内部跳转由 assembler 自己分配的 ordinal label 标识，只有规则 source record 保留
 诊断文本。输入/输出偏移从共享 ABI 声明推导，不再独立维护一份偏移表。
