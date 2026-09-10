@@ -44,6 +44,18 @@ impl DnsUpstreamPool for ConcurrentPool {
     }
 }
 
+struct EmptyPool;
+
+#[async_trait]
+impl DnsUpstreamPool for EmptyPool {
+    async fn query(&self, _upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let mut response = raw_query.to_vec();
+        response[2] = 0x81;
+        response[3] = 0x83;
+        Ok(response)
+    }
+}
+
 pub(super) fn address_response(query: &[u8], qtype: u16, ttl: u32) -> Vec<u8> {
     let mut response = query.to_vec();
     response[2] = 0x81;
@@ -127,6 +139,20 @@ async fn resolver_groups_literal_ipv6_without_upstream() {
         vec!["2001:db8::1".parse::<IpAddr>().expect("IP")]
     );
     assert_eq!(resolved.min_ttl, 3600);
+}
+#[tokio::test]
+async fn resolver_without_fallback_returns_configured_dns_failure() {
+    let resolver =
+        resolver_with_strategy(Arc::new(EmptyPool), honk_config::dns::DnsStrategy::Ipv4Only);
+    let error = resolver
+        .resolve_without_fallback("example.com")
+        .await
+        .expect_err("empty DNS answer must not bootstrap through the system resolver");
+    assert!(
+        error
+            .to_string()
+            .contains("no A/AAAA records for example.com")
+    );
 }
 
 #[tokio::test]

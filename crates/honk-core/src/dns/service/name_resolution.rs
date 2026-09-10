@@ -14,6 +14,8 @@ use crate::dns::resolver::ResolvedAddr;
 enum NameResolutionError {
     #[error("empty domain")]
     EmptyDomain,
+    #[error("invalid domain {domain}")]
+    InvalidDomain { domain: String },
     #[error("no A/AAAA records for {domain}")]
     NoAddresses { domain: String },
     #[error("resolve {domain}: {source}")]
@@ -59,38 +61,41 @@ impl DnsService {
         .await
     }
 
+    pub(crate) async fn resolve_name_without_fallback(
+        &self,
+        domain: &str,
+    ) -> anyhow::Result<ResolvedAddr> {
+        let domain = normalize_domain(domain)?;
+        if let Ok(ip) = domain.parse::<IpAddr>() {
+            return Ok(literal(ip));
+        }
+        debug!(lookup_kind = "name", "DNS lookup");
+        let resolved = resolved_from_responses(self.resolve_name_families(&domain, None).await?);
+        if resolved.ipv4.is_empty() && resolved.ipv6.is_empty() {
+            return Err(NameResolutionError::NoAddresses { domain }.into());
+        }
+        debug!(
+            ipv4_present = !resolved.ipv4.is_empty(),
+            ipv6_present = !resolved.ipv6.is_empty(),
+            ttl = resolved.min_ttl,
+            "DNS resolved"
+        );
+        Ok(resolved)
+    }
+
     pub(crate) async fn resolve_name_for_source(
         &self,
         domain: &str,
         source_ip: IpAddr,
     ) -> anyhow::Result<ResolvedAddr> {
-        let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-        if domain.is_empty() {
-            return Err(NameResolutionError::EmptyDomain.into());
-        }
+        let domain = normalize_domain(domain)?;
         if let Ok(ip) = domain.parse::<IpAddr>() {
             return Ok(literal(ip));
         }
 
         debug!(lookup_kind = "source_name", %source_ip, "DNS lookup");
-        let mut operation = self.operation();
         let metadata = Some(DnsRequestMeta::new(Some(source_ip), None));
-        let responses = match self.backend.as_ref() {
-            DnsServiceBackend::Runtime(provider) => {
-                let lease = provider.acquire();
-                lease
-                    .run(resolve_with_forwarder(
-                        &mut operation,
-                        lease.runtime().forwarder(),
-                        &domain,
-                        metadata,
-                    ))
-                    .await??
-            }
-            DnsServiceBackend::Standalone(forwarder) => {
-                resolve_with_forwarder(&mut operation, forwarder, &domain, metadata).await?
-            }
-        };
+        let responses = self.resolve_name_families(&domain, metadata).await?;
         if responses.has_missing_original_destination() {
             return Err(PlanError::MissingOriginalDestination.into());
         }
@@ -110,32 +115,13 @@ impl DnsService {
         F: FnOnce(String) -> Fut,
         Fut: Future<Output = anyhow::Result<Vec<IpAddr>>>,
     {
-        let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-        if domain.is_empty() {
-            return Err(NameResolutionError::EmptyDomain.into());
-        }
+        let domain = normalize_domain(domain)?;
         if let Ok(ip) = domain.parse::<IpAddr>() {
             return Ok(literal(ip));
         }
 
         debug!(lookup_kind = "name", "DNS lookup");
-        let mut operation = self.operation();
-        let responses = match self.backend.as_ref() {
-            DnsServiceBackend::Runtime(provider) => {
-                let lease = provider.acquire();
-                lease
-                    .run(resolve_with_forwarder(
-                        &mut operation,
-                        lease.runtime().forwarder(),
-                        &domain,
-                        None,
-                    ))
-                    .await??
-            }
-            DnsServiceBackend::Standalone(forwarder) => {
-                resolve_with_forwarder(&mut operation, forwarder, &domain, None).await?
-            }
-        };
+        let responses = self.resolve_name_families(&domain, None).await?;
         let ipv4_eligible = responses.ipv4_eligible;
         let ipv6_eligible = responses.ipv6_eligible;
         let mut resolved = resolved_from_responses(responses);
@@ -166,6 +152,46 @@ impl DnsService {
         );
         Ok(resolved)
     }
+
+    async fn resolve_name_families(
+        &self,
+        domain: &str,
+        metadata: Option<DnsRequestMeta>,
+    ) -> anyhow::Result<FamilyResponses> {
+        let mut operation = self.operation();
+        let responses = match self.backend.as_ref() {
+            DnsServiceBackend::Runtime(provider) => {
+                let lease = provider.acquire();
+                lease
+                    .run(resolve_with_forwarder(
+                        &mut operation,
+                        lease.runtime().forwarder(),
+                        domain,
+                        metadata,
+                    ))
+                    .await??
+            }
+            DnsServiceBackend::Standalone(forwarder) => {
+                resolve_with_forwarder(&mut operation, forwarder, domain, metadata).await?
+            }
+        };
+        Ok(responses)
+    }
+}
+
+fn normalize_domain(domain: &str) -> anyhow::Result<String> {
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty() {
+        return Err(NameResolutionError::EmptyDomain.into());
+    }
+    if domain.len() > 253
+        || domain
+            .split('.')
+            .any(|label| label.is_empty() || label.len() > 63)
+    {
+        return Err(NameResolutionError::InvalidDomain { domain }.into());
+    }
+    Ok(domain)
 }
 
 async fn resolve_with_forwarder(
