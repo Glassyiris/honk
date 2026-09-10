@@ -136,17 +136,44 @@ impl SelectionEffects {
 /// keeps the hot path cheap.
 pub type SharedGroupManager = Arc<parking_lot::RwLock<Arc<GroupManager>>>;
 
-/// A dialable candidate of a group: a leaf node plus the member tag that
-/// selected it. Direct members use their node name; nested candidates use
-/// the sub-group tag while retaining the leaf chosen by that sub-group.
+/// Display tags may be shared by distinct nodes; retain the concrete member.
+#[derive(Clone, Copy)]
+enum GroupMember<'a> {
+    Node(&'a Node),
+    Group(&'a Group),
+}
+
+impl<'a> GroupMember<'a> {
+    fn tag(self) -> &'a str {
+        match self {
+            Self::Node(node) => &node.name,
+            Self::Group(group) => &group.name,
+        }
+    }
+}
+
+/// A leaf and its immediate member path, independent of display-name collisions.
 #[derive(Debug, Clone)]
 struct Candidate<'a> {
-    /// Display tag: node name for direct members, sub-group tag for nested.
-    tag: &'a str,
+    /// `None` is a direct member; a subgroup may resolve to the same physical leaf.
+    via: Option<&'a Group>,
     /// Leaf node that would actually be dialed.
     node: &'a Node,
     attribution: Vec<&'a str>,
     selection_chain: Vec<&'a str>,
+}
+
+impl<'a> Candidate<'a> {
+    fn member(&self) -> GroupMember<'a> {
+        match self.via {
+            Some(group) => GroupMember::Group(group),
+            None => GroupMember::Node(self.node),
+        }
+    }
+
+    fn tag(&self) -> &'a str {
+        self.member().tag()
+    }
 }
 
 enum UniqueCandidateIds {
@@ -200,10 +227,8 @@ pub struct GroupManager {
     /// Per-group selector choice (set via API, persisted by caller).
     /// group_name → selected node name.
     selector_choice: RwLock<HashMap<String, String>>,
-    /// Rate limiter for the "selector choice health-filtered" warning,
-    /// keyed per (group, network) so a degraded choice logs at most once
-    /// per cooldown instead of once per dial.
-    selector_fallback_log: RwLock<HashMap<(String, SelectionNetwork), Instant>>,
+    /// Per-group rate limiter for the sole TCP leaf's last-resort warning.
+    last_resort_log: RwLock<HashMap<String, Instant>>,
     /// Invoked on selector choice changes (cache.db persistence hook).
     persist_callback: RwLock<Option<PersistCallback>>,
     /// Wakes the generation-owned selector warm coordinator.
@@ -297,7 +322,7 @@ impl GroupManager {
             fallback_cache: RwLock::new(HashMap::new()),
             last_used: RwLock::new(HashMap::new()),
             selector_choice: RwLock::new(HashMap::new()),
-            selector_fallback_log: RwLock::new(HashMap::new()),
+            last_resort_log: RwLock::new(HashMap::new()),
             persist_callback: RwLock::new(None),
             selector_change_callback: RwLock::new(None),
             interrupt_callback: RwLock::new(None),
@@ -325,7 +350,7 @@ impl GroupManager {
         // groups still take the guarded recursive path below.
         if group.policy == GroupPolicy::Selector && group.groups.is_empty() {
             return self
-                .pick_direct_selector(group, domain, ipver, SelectionEffects::Apply)
+                .pick_direct_selector(group, domain, ipver)
                 .or_else(|| self.last_resort_tcp_leaf(group, domain, SelectionEffects::Apply));
         }
         let mut visited = Vec::with_capacity(MAX_GROUP_DEPTH);
@@ -500,12 +525,13 @@ impl GroupManager {
             return SelectionPlan {
                 mode: SelectionPlanMode::Authoritative,
                 nodes: self
-                    .pick_direct_selector(group, domain, ipver, effects)
+                    .pick_direct_selector(group, domain, ipver)
                     .or_else(|| self.last_resort_tcp_leaf(group, domain, effects))
                     .into_iter()
                     .collect(),
             };
         }
+        let selected_member = self.selector_member(group);
         let mut visited = Vec::new();
         let candidates = self.flatten_candidates(group, domain, ipver, &mut visited, 0, effects);
         let before_filter = (effects.applies()
@@ -528,7 +554,7 @@ impl GroupManager {
         // group stays cold with one (or zero) survivor.
         let urltest_has_data = group.policy == GroupPolicy::URLTest
             && candidates.iter().any(|c| {
-                self.node_latency(c.node, network, ipver, group.check_url.as_deref(), c.tag)
+                self.node_latency(c.node, network, ipver, group.check_url.as_deref(), c.tag())
                     != Duration::MAX
             });
         if candidates.is_empty() {
@@ -549,19 +575,25 @@ impl GroupManager {
         }
         match group.policy {
             GroupPolicy::Selector => {
-                let picked = self.pick_selector(&candidates, group, network, effects);
-                let committed = self.commit_selector_pick(
-                    group,
-                    picked,
-                    domain,
-                    ipver,
-                    &mut visited,
-                    0,
-                    effects,
-                );
+                let committed = selected_member
+                    .and_then(|member| Self::pick_selector(&candidates, member))
+                    .and_then(|picked| {
+                        self.commit_selector_pick(
+                            group,
+                            picked,
+                            domain,
+                            ipver,
+                            &mut visited,
+                            0,
+                            effects,
+                        )
+                    });
                 SelectionPlan {
                     mode: SelectionPlanMode::Authoritative,
-                    nodes: vec![committed.node],
+                    nodes: committed
+                        .into_iter()
+                        .map(|candidate| candidate.node)
+                        .collect(),
                 }
             }
             GroupPolicy::URLTest => {

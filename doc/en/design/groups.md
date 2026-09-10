@@ -25,13 +25,13 @@ The `src/group/` facade and its internals are split by responsibility:
 | `score.rs`, `score/selection.rs` | Always-compiled target-aware Score state, evidence, reporters, counters, and candidate ranking/selection; `score/tests/` contains the scenario suites |
 | `state.rs` | URLTest/Fallback caches, Selector choices, idle timestamps, and callbacks |
 
-Selection follows one invariant (sing-box semantics): after resolution and liveness filtering, the dial path uses exactly the policy pick. Selector returns its effective manual choice, URLTest its current winner, LoadBalance its next member, Fallback its pin, and Score its ranked eligible leaf, including deterministic cold exploration. The only multi-candidate exception at selection time is an unmeasured top-level URLTest group; all warm URLTest and non-URLTest plans are authoritative single-leaf plans. Post-failure retry racing belongs to `connection.rs`, not here, and parallel racing is added nowhere else. If a group with no `final` has exactly one unique leaf and TCP liveness excludes it, that same leaf remains an authoritative last resort: its health stays dead, but a real dial can prove recovery without leaking to `direct`. UDP keeps normal liveness exclusion. Both a health-filtered Selector choice/default falling back to another member and the all-filtered last-resort serve log a rate-limited warning (60s per group/network) on real selection paths; warm-up peeks stay silent. Dashboard `now` still displays the configured choice, so the divergence must be visible.
+Selection follows one invariant (sing-box semantics): after resolution and liveness filtering, the dial path uses exactly the policy pick. Selector returns its effective manual choice, URLTest its current winner, LoadBalance its next member, Fallback its pin, and Score its ranked eligible leaf, including deterministic cold exploration. The only multi-candidate exception at selection time is an unmeasured top-level URLTest group; all warm URLTest and non-URLTest plans are authoritative single-leaf plans. Post-failure retry racing belongs to `connection.rs`, not here, and parallel racing is added nowhere else. If a group with no `final` has exactly one unique leaf and TCP liveness excludes it, that same leaf remains an authoritative last resort only when reachable through the current Selector choices: its health stays dead, but a real dial can prove recovery without leaking to another member or `direct`. UDP keeps normal liveness exclusion. Last-resort serving logs a rate-limited warning (60s per group); warm-up peeks stay silent.
 
 ## Policy semantics
 
 | Policy | Runtime behavior |
 | --- | --- |
-| Selector | The runtime choice has precedence, then `group.default` (`default`), then the first eligible member. The Clash API changes the runtime choice. `PersistCallback` stores effective writes in `cache.db` via honk-core's `cachedb`; `InterruptCallback` closes tracked group connections when `interrupt_connections` is enabled. |
+| Selector | TCP and UDP resolve the runtime choice, then `group.default`, then the first declared member independently of health; only missing/non-member tags fall through. No eligible candidate for that member means an empty plan, except for the same-leaf TCP last resort above; an explicit `final` remains available to the caller. The Clash API changes the runtime choice. `PersistCallback` stores effective writes in `cache.db` via honk-core's `cachedb`; `InterruptCallback` closes tracked group connections when `interrupt_connections` is enabled. |
 | URLTest | Chooses the lowest halving moving average, keeps independent TCP and UDP selections, applies tolerance hysteresis, and re-evaluates lazily on dial and selection queries. A real selection change may invoke `InterruptCallback`. |
 | LoadBalance | Round-robins eligible members in declaration order. Every group owns independent `AtomicUsize` cursors for TCP and UDP. Rotation never invokes `InterruptCallback`. |
 | Fallback | Pins the first eligible member in declaration order independently for TCP and UDP. The pin stays until that member dies; recovery of an earlier member does not cause failback. |
@@ -95,11 +95,11 @@ A group `check_url` creates independent TCP-only liveness and latency state keye
 
 Resolution is bounded by `MAX_GROUP_DEPTH = 8` and a per-walk visited set. Construction also runs DFS over group edges and cuts every cycle-closing edge with a warning. These checks prevent a malformed graph from hanging selection or introspection.
 
-Selector parents peek all sub-groups, then commit only the serving pick (`commit_selector_pick`). Cross-traffic cannot churn unchosen Score state; stale/dead-choice fallbacks still commit on service.
+Selector captures a concrete node or sub-group member before candidate expansion and health filtering; repeated node tags bind the first matching declared `NodeId`. Parents retain the existing subgroup Peek, parent-health gate, and serving-commit order, so unchosen Score state is not advanced. For both TCP and UDP, a failed serving commit yields an empty parent plan rather than restoring the earlier peek. Candidates retain their originating subgroup reference instead of rediscovering it from a display tag. A chosen automatic sub-group may still select a different leaf within its own membership. The sole TCP leaf's last-resort walk also respects every nested Selector choice, while explicit delay tests may inspect all members for recovery.
 
-Identity remains the member tag even when the physical dial reaches a deeper leaf:
+Display and API output retain member tags even when the physical dial reaches a deeper leaf; serving selection retains concrete node or subgroup identity separately:
 
-| API | Identity returned |
+| API | Output |
 | --- | --- |
 | `node_names_in_group` | Direct node tags plus sub-group tags |
 | `leaf_node_names_in_group` | Deduplicated real leaf nodes reachable below the group |
@@ -160,7 +160,7 @@ This keeps a TCP-healthy but UDP-broken node from attracting packet flows withou
 
 ## eBPF connectivity publication
 
-The eBPF alive slot belongs to a group, not to one node. For every domain and address family, the published value is the OR of all reachable leaf-member states. A callback caused by one node transition recomputes that OR; it never writes the transitioning node's value directly.
+The eBPF alive slot belongs to a group, not to one node. For every domain and address family, publication uses the OR of all reachable leaf-member states, plus the existing TCP admission exception for exactly one unique leaf and no `final`. A callback caused by one node transition recomputes that group value; it never writes the transitioning node's value directly. Admission does not override userspace selection: a chosen empty Selector path still refuses traffic even when this slot remains alive.
 
 Reload first sets every slot needed by the old or new group layout to alive, making the transition fail-open. After the new routing generation is published, honk writes the exact new group snapshot. Reordered groups therefore cannot inherit stale ordinal state; if exact publication fails partway, unfilled transition slots remain fail-open rather than falsely killing a group.
 

@@ -40,12 +40,11 @@ fn direct_selector_plan_fast_path_preserves_choice_default_and_health() {
         "plan-a"
     );
     alive.report_unavailable_forced(nid("plan-a"), ProbeDomain::Tcp, IpVersion::V4);
-    assert_eq!(
+    assert!(
         manager
             .selection_plan_for_domain("plan-selector", ProbeDomain::Tcp, IpVersion::V4)
-            .nodes[0]
-            .name,
-        "plan-b"
+            .nodes
+            .is_empty()
     );
 }
 
@@ -101,6 +100,61 @@ fn dead_single_leaf_remains_a_tcp_last_resort_only() {
             .is_empty()
     );
 }
+
+#[test]
+fn selector_tcp_last_resort_cannot_escape_an_empty_selected_subgroup() {
+    let leaf = make_node(nid("leaf"), "leaf");
+    let empty = make_group("empty", GroupPolicy::Selector, vec![]);
+    let mut child = make_subgroup("child", GroupPolicy::Selector, &["empty"]);
+    child.nodes.push(leaf.id);
+    child.default = Some("empty".into());
+    let parent = make_subgroup("parent", GroupPolicy::Selector, &["child"]);
+    let automatic = make_subgroup("automatic", GroupPolicy::URLTest, &["parent"]);
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.report_unavailable_forced(leaf.id, ProbeDomain::Tcp, IpVersion::V4);
+    let manager = GroupManager::with_alive_set(
+        &[empty, child, parent, automatic],
+        std::slice::from_ref(&leaf),
+        Some(alive),
+    );
+    let context =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    for name in ["child", "parent", "automatic"] {
+        assert!(manager.select_node(name).is_none(), "{name}");
+        assert!(
+            manager
+                .selection_plan_for_domain(name, ProbeDomain::Tcp, IpVersion::V4)
+                .nodes
+                .is_empty(),
+            "{name}"
+        );
+        assert!(
+            manager
+                .selection_plan_for_target(name, &context)
+                .entries
+                .is_empty(),
+            "{name}"
+        );
+    }
+    manager.set_selector_choice("child", "leaf");
+    for name in ["child", "parent", "automatic"] {
+        assert_eq!(
+            manager.select_node(name).map(|node| node.id),
+            Some(leaf.id),
+            "{name}"
+        );
+        assert_eq!(
+            manager
+                .selection_plan_for_target(name, &context)
+                .entries
+                .iter()
+                .map(|entry| entry.node.id)
+                .collect::<Vec<_>>(),
+            [leaf.id],
+            "{name}"
+        );
+    }
+}
 use chrono::Utc;
 
 fn nid(name: &str) -> uuid::Uuid {
@@ -141,7 +195,7 @@ fn make_subgroup(name: &str, policy: GroupPolicy, sub_tags: &[&str]) -> Group {
 }
 
 #[test]
-fn test_selector_default_first_alive() {
+fn test_selector_default_first_member() {
     let (n1, n2) = (nid("a"), nid("b"));
     let nodes = vec![make_node(n1, "a"), make_node(n2, "b")];
     let m = GroupManager::new(
@@ -177,7 +231,7 @@ fn test_selector_runtime_choice_overrides_default() {
 }
 
 #[test]
-fn selector_choice_filtered_by_health_falls_back_without_rewriting_choice() {
+fn selector_choice_filtered_by_health_refuses_without_rewriting_choice() {
     let (a, b) = (nid("sel-a"), nid("sel-b"));
     let nodes = vec![make_node(a, "sel-a"), make_node(b, "sel-b")];
     let group = make_group("g", GroupPolicy::Selector, vec![a, b]);
@@ -186,12 +240,9 @@ fn selector_choice_filtered_by_health_falls_back_without_rewriting_choice() {
     m.set_selector_choice("g", "sel-a");
     alive.report_unavailable_forced(a, ProbeDomain::Tcp, IpVersion::V4);
 
-    let selected = m
-        .select_node_for_domain("g", ProbeDomain::Tcp, IpVersion::V4)
-        .unwrap();
-    assert_eq!(
-        selected.name, "sel-b",
-        "a health-filtered choice falls back to the first alive member"
+    assert!(
+        m.select_node_for_domain("g", ProbeDomain::Tcp, IpVersion::V4)
+            .is_none()
     );
     assert_eq!(
         m.get_selector_choice("g").as_deref(),
@@ -199,19 +250,12 @@ fn selector_choice_filtered_by_health_falls_back_without_rewriting_choice() {
         "the stored choice is preserved so recovery restores it"
     );
 
-    // The fallback is rate-limit logged once per (group, network); a second
-    // pick inside the cooldown leaves the timestamp untouched.
-    let key = ("g".to_string(), SelectionNetwork::Tcp);
-    let first_at = m.selector_fallback_log.read().get(&key).copied();
-    assert!(first_at.is_some(), "a filtered-choice fallback is logged");
-    m.select_node_for_domain("g", ProbeDomain::Tcp, IpVersion::V4)
-        .unwrap();
-    let second_at = m.selector_fallback_log.read().get(&key).copied();
-    assert_eq!(first_at, second_at, "the warn is rate-limited");
+    alive.report_available_traffic(a, ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(m.select_node("g").map(|node| node.id), Some(a));
 }
 
 #[test]
-fn selector_default_filtered_by_health_falls_back_with_log() {
+fn selector_default_filtered_by_health_refuses() {
     let (a, b) = (nid("def-a"), nid("def-b"));
     let nodes = vec![make_node(a, "def-a"), make_node(b, "def-b")];
     let mut group = make_group("gd", GroupPolicy::Selector, vec![a, b]);
@@ -220,36 +264,9 @@ fn selector_default_filtered_by_health_falls_back_with_log() {
     let m = GroupManager::with_alive_set(&[group], &nodes, Some(alive.clone()));
     alive.report_unavailable_forced(a, ProbeDomain::Tcp, IpVersion::V4);
 
-    let selected = m
-        .select_node_for_domain("gd", ProbeDomain::Tcp, IpVersion::V4)
-        .unwrap();
-    assert_eq!(selected.name, "def-b");
     assert!(
-        m.selector_fallback_log
-            .read()
-            .contains_key(&("gd".to_string(), SelectionNetwork::Tcp)),
-        "a health-filtered default is as invisible as a filtered choice"
-    );
-}
-
-#[test]
-fn selector_all_filtered_serves_last_resort_leaf_with_log() {
-    let a = nid("lr-a");
-    let nodes = vec![make_node(a, "lr-a")];
-    let group = make_group("lr", GroupPolicy::Selector, vec![a]);
-    let alive = Arc::new(AliveDialerSet::new());
-    let m = GroupManager::with_alive_set(&[group], &nodes, Some(alive.clone()));
-    alive.report_unavailable_forced(a, ProbeDomain::Tcp, IpVersion::V4);
-
-    let selected = m
-        .select_node_for_domain("lr", ProbeDomain::Tcp, IpVersion::V4)
-        .unwrap();
-    assert_eq!(selected.name, "lr-a", "the sole leaf stays dialable");
-    assert!(
-        m.selector_fallback_log
-            .read()
-            .contains_key(&("lr".to_string(), SelectionNetwork::Tcp)),
-        "the last-resort serve is logged"
+        m.select_node_for_domain("gd", ProbeDomain::Tcp, IpVersion::V4)
+            .is_none()
     );
 }
 
@@ -270,7 +287,7 @@ fn selector_warm_node_keeps_configured_dead_leaf_and_resolves_nested_choice() {
             .selector_warm_node("warm-parent")
             .map(|node| node.id),
         Some(a),
-        "warm ownership follows the configured choice instead of liveness fallback"
+        "warm ownership retains the configured leaf despite failed health"
     );
 }
 
@@ -1172,11 +1189,11 @@ fn test_udp_both_dead_excluded_despite_tcp_alive() {
         Some(alive.clone()),
     );
 
-    // "a" UDP-dead on both domains, TCP still alive → "b" wins UDP.
+    // The implicit first member stays pinned even while UDP-dead.
     alive.report_unavailable_forced(nid("a"), ProbeDomain::DataUdp, IpVersion::V4);
     alive.report_unavailable_forced(nid("a"), ProbeDomain::DnsUdp, IpVersion::V4);
     let udp = m.select_node_for_domain("g", ProbeDomain::DataUdp, IpVersion::V4);
-    assert_eq!(udp.unwrap().name, "b");
+    assert!(udp.is_none());
 
     // With "b" UDP-dead too, NOTHING is selectable for UDP — no TCP
     // fallback for explicitly UDP-dead nodes.
@@ -1240,11 +1257,9 @@ fn test_udp_unprobed_node_inherits_tcp_liveness() {
     // and there is no healthy TCP to inherit.
     alive.report_unavailable_forced(nid("a"), ProbeDomain::Tcp, IpVersion::V4);
     assert!(!alive.has_udp_state(nid("a")));
-    assert_eq!(
+    assert!(
         m.select_node_for_domain("g", ProbeDomain::DataUdp, IpVersion::V4)
-            .unwrap()
-            .name,
-        "b"
+            .is_none()
     );
 
     // With every unprobed node TCP-dead, UDP selection is empty.

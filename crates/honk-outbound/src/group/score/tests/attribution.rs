@@ -231,6 +231,35 @@ fn deep_score_last_resort_keeps_every_attribution() {
 }
 
 #[test]
+fn selector_tcp_last_resort_keeps_the_chosen_member_chain() {
+    let leaf = node("leaf");
+    let alive = Arc::new(super::super::super::AliveDialerSet::new());
+    alive.report_unavailable_forced(leaf.id, ProbeDomain::Tcp, IpVersion::V4);
+    let child = group("child", std::slice::from_ref(&leaf));
+    let mut parent = selector_with_children("parent", std::slice::from_ref(&leaf), &["child"]);
+    parent.default = Some("child".into());
+    let manager = super::super::super::GroupManager::with_alive_set(
+        &[child, parent],
+        std::slice::from_ref(&leaf),
+        Some(alive),
+    );
+    let plan =
+        manager.selection_plan_for_target("parent", &context("last-resort.example", IpVersion::V4));
+    assert_eq!(plan.entries[0].selection_chain, ["parent", "child", "leaf"]);
+    assert_eq!(
+        plan.entries[0]
+            .feedback
+            .as_ref()
+            .unwrap()
+            .attributions()
+            .iter()
+            .map(|attribution| attribution.group.as_str())
+            .collect::<Vec<_>>(),
+        ["child"],
+    );
+}
+
+#[test]
 fn duplicate_direct_leaf_stays_direct_on_last_resort() {
     let leaf = node("leaf");
     let alive = Arc::new(super::super::super::AliveDialerSet::new());

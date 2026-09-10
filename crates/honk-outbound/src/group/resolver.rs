@@ -23,8 +23,8 @@ impl GroupManager {
     /// After a Selector pick, commit the serving sub-group's own selection:
     /// sub-groups are peeked during flattening, so only the real service
     /// path records selection state (ranks, incumbent marks, URLTest
-    /// caches), whatever member the pick landed on — stored choice, default,
-    /// or alive fallback.
+    /// caches) only for the member actually serving traffic.
+    /// Refusal at commit is final; a stale peek is not a fallback.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn commit_selector_pick<'a>(
         &'a self,
@@ -35,25 +35,21 @@ impl GroupManager {
         visited: &mut Vec<&'a str>,
         depth: usize,
         effects: SelectionEffects,
-    ) -> Candidate<'a> {
+    ) -> Option<Candidate<'a>> {
         if !effects.applies() {
-            return picked;
+            return Some(picked);
         }
-        let Some(sub) = self.groups.get(picked.tag) else {
-            return picked;
+        let Some(sub) = picked.via else {
+            return Some(picked);
         };
-        self.mark_used(picked.tag);
+        self.mark_used(&sub.name);
         visited.push(group.name.as_str());
         let committed =
             self.pick_candidate_in_group(sub, domain, ipver, visited, depth + 1, effects);
         visited.pop();
-        match committed {
-            Some(mut committed) => {
-                committed.tag = picked.tag;
-                committed
-            }
-            None => picked,
-        }
+        let mut committed = committed?;
+        committed.via = picked.via;
+        Some(committed)
     }
 
     pub(super) fn pick_candidate_in_group<'a>(
@@ -65,6 +61,7 @@ impl GroupManager {
         depth: usize,
         effects: SelectionEffects,
     ) -> Option<Candidate<'a>> {
+        let selected_member = self.selector_member(group);
         let candidates = self.flatten_candidates(group, domain, ipver, visited, depth, effects);
         let before_filter = (effects.applies()
             && group.policy == GroupPolicy::Score
@@ -85,7 +82,7 @@ impl GroupManager {
             return self
                 .last_resort_tcp_leaf(group, domain, effects)
                 .map(|node| Candidate {
-                    tag: node.name.as_str(),
+                    via: None,
                     node,
                     attribution: Vec::new(),
                     selection_chain: vec![node.name.as_str()],
@@ -93,8 +90,8 @@ impl GroupManager {
         }
         let candidate = match group.policy {
             GroupPolicy::Selector => {
-                let picked = self.pick_selector(&candidates, group, network, effects);
-                self.commit_selector_pick(group, picked, domain, ipver, visited, depth, effects)
+                let picked = Self::pick_selector(&candidates, selected_member?)?;
+                self.commit_selector_pick(group, picked, domain, ipver, visited, depth, effects)?
             }
             GroupPolicy::URLTest => self.pick_urltest(&candidates, group, network, ipver, effects),
             GroupPolicy::LoadBalance => {
@@ -145,7 +142,7 @@ impl GroupManager {
             .iter()
             .filter_map(|id| self.nodes.get(id))
             .map(|node| Candidate {
-                tag: node.name.as_str(),
+                via: None,
                 node,
                 attribution: Vec::new(),
                 selection_chain: vec![node.name.as_str()],
@@ -164,7 +161,7 @@ impl GroupManager {
             if let Some(mut candidate) =
                 self.pick_candidate_in_group(sub, domain, ipver, visited, depth + 1, sub_effects)
             {
-                candidate.tag = sub_tag.as_str();
+                candidate.via = Some(sub);
                 out.push(candidate);
             }
         }
@@ -172,20 +169,29 @@ impl GroupManager {
         out
     }
 
+    pub(super) fn members<'a>(&'a self, group: &'a Group) -> impl Iterator<Item = GroupMember<'a>> {
+        group
+            .nodes
+            .iter()
+            .filter_map(move |id| self.nodes.get(id))
+            .map(GroupMember::Node)
+            .chain(
+                group
+                    .groups
+                    .iter()
+                    .filter_map(move |tag| self.groups.get(tag))
+                    .map(GroupMember::Group),
+            )
+    }
+
     /// Borrowed member tags of a group (direct node names, then sub-group
     /// tags; deduplicated). Missing sub-group tags are skipped.
     pub(super) fn member_tags<'a>(&'a self, group: &'a Group) -> Vec<&'a str> {
         let mut out: Vec<&'a str> = Vec::new();
-        for id in &group.nodes {
-            if let Some(n) = self.nodes.get(id)
-                && !out.contains(&n.name.as_str())
-            {
-                out.push(n.name.as_str());
-            }
-        }
-        for tag in &group.groups {
-            if self.groups.contains_key(tag.as_str()) && !out.contains(&tag.as_str()) {
-                out.push(tag.as_str());
+        for member in self.members(group) {
+            let tag = member.tag();
+            if !out.contains(&tag) {
+                out.push(tag);
             }
         }
         out
@@ -245,7 +251,11 @@ impl GroupManager {
         }
         let leaves = self.leaf_nodes_in_group(&group.name);
         match leaves.as_slice() {
-            [node] => {
+            [node]
+                if self
+                    .first_leaf(group, &mut Vec::new(), 0, true)
+                    .is_some_and(|selected| selected.id == node.id) =>
+            {
                 self.warn_selector_last_resort(group, &node.name, effects);
                 Some(*node)
             }
@@ -284,28 +294,44 @@ impl GroupManager {
     }
 
     /// First leaf node reachable from a group in declaration order,
-    /// ignoring alive state. Cycle/depth-guarded like the selection paths.
+    /// ignoring health. Serving fallbacks must also respect Selector choices;
+    /// explicit delay tests may inspect every member to discover recovery.
     fn first_leaf<'a>(
         &'a self,
         group: &'a Group,
         visited: &mut Vec<&'a str>,
         depth: usize,
+        respect_selectors: bool,
     ) -> Option<&'a Node> {
         if depth >= MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
             return None;
         }
+        let selected = if respect_selectors && group.policy == GroupPolicy::Selector {
+            Some(self.selector_member(group)?)
+        } else {
+            None
+        };
         visited.push(group.name.as_str());
-        let mut result = group.nodes.iter().find_map(|id| self.nodes.get(id));
-        if result.is_none() {
-            for tag in &group.groups {
-                if let Some(sub) = self.groups.get(tag.as_str()) {
-                    result = self.first_leaf(sub, visited, depth + 1);
-                    if result.is_some() {
-                        break;
+        let result = match selected {
+            Some(GroupMember::Node(node)) => Some(node),
+            Some(GroupMember::Group(sub)) => {
+                self.first_leaf(sub, visited, depth + 1, respect_selectors)
+            }
+            None => {
+                let mut result = group.nodes.iter().find_map(|id| self.nodes.get(id));
+                if result.is_none() {
+                    for tag in &group.groups {
+                        if let Some(sub) = self.groups.get(tag) {
+                            result = self.first_leaf(sub, visited, depth + 1, respect_selectors);
+                            if result.is_some() {
+                                break;
+                            }
+                        }
                     }
                 }
+                result
             }
-        }
+        };
         visited.pop();
         result
     }
@@ -422,7 +448,7 @@ impl GroupManager {
                 )
                 .or_else(|| {
                     let mut visited = Vec::new();
-                    self.first_leaf(sub, &mut visited, 0)
+                    self.first_leaf(sub, &mut visited, 0, false)
                 });
             if let Some(leaf) = leaf
                 && !seen.contains(&leaf.id)

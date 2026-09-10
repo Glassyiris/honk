@@ -4135,6 +4135,73 @@ fn resolve_udp_score_plan(
 }
 
 #[test]
+fn resolve_selector_refusal_uses_only_explicit_final() {
+    let selected = Node {
+        id: uuid::Uuid::from_u128(101),
+        name: "selected".into(),
+        ..udp_test_node()
+    };
+    let sibling = Node {
+        id: uuid::Uuid::from_u128(102),
+        name: "sibling".into(),
+        ..udp_test_node()
+    };
+    let selector = Group {
+        name: "selector".into(),
+        policy: GroupPolicy::Selector,
+        nodes: vec![selected.id, sibling.id],
+        default: Some(selected.name.clone()),
+        ..Default::default()
+    };
+    let with_final = Group {
+        name: "selector-final".into(),
+        final_outbound: Some("block".into()),
+        ..selector.clone()
+    };
+    let alive = Arc::new(AliveDialerSet::new());
+    for ipver in [IpVersion::V4, IpVersion::V6] {
+        for domain in [ProbeDomain::Tcp, ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+            alive.report_unavailable_forced(selected.id, domain, ipver);
+        }
+    }
+    let config = udp_test_config(
+        "direct",
+        vec![selected, sibling],
+        vec![selector, with_final],
+    );
+    let manager = GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive));
+    for (network, domain) in [
+        (crate::group::SelectionNetwork::Tcp, ProbeDomain::Tcp),
+        (crate::group::SelectionNetwork::Udp, ProbeDomain::DataUdp),
+    ] {
+        let context =
+            crate::group::ScoreSelectionContext::aggregate(network, domain, IpVersion::V6);
+        assert!(
+            super::reload::resolve_outbound_plan_for_target(
+                &config, &manager, "selector", &context
+            )
+            .nodes
+            .is_empty()
+        );
+        let plan = super::reload::resolve_outbound_plan_for_target(
+            &config,
+            &manager,
+            "selector-final",
+            &context,
+        );
+        assert_eq!(plan.mode, crate::group::SelectionPlanMode::Authoritative);
+        assert_eq!(
+            plan.nodes
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["block"]
+        );
+        assert_eq!(plan.selection_chains, [vec!["selector-final", "block"]]);
+    }
+}
+
+#[test]
 fn resolve_udp_score_plan_preserves_terminal_provenance() {
     let first = Node {
         id: uuid::Uuid::new_v4(),

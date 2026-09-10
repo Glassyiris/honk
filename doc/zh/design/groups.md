@@ -25,13 +25,13 @@ facade 与内部实现按职责拆分：
 | `score.rs` | Score 评分、exact-once 反馈与 target-aware 选择 |
 | `state.rs` | URLTest/Fallback 缓存、Selector 选择、空闲时间戳与回调 |
 
-选择遵循一个不变量：完成解析和存活性过滤后，拨号路径只使用策略选出的结果。Selector 返回其有效手动选择，URLTest 返回当前胜者，LoadBalance 返回下一个成员，Fallback 返回固定成员。唯一的多候选例外是尚无测量值的顶层 URLTest 组；已有测量值的 URLTest 和所有非 URLTest 计划都是权威的单叶节点计划。若未配置 `final` 的组只有一个唯一叶节点，且 TCP 存活性过滤将其排除，该节点仍作为权威的最后尝试：健康状态仍是 dead，但真实拨号可以证明恢复，且不会泄漏到 `direct`。UDP 继续执行正常的存活性排除。Selector 的已配置选择或 `default` 因健康过滤回退到其他成员、以及全候选被过滤后的最后尝试服务，都会在真实选择路径上记录限流警告（每组每网络 60 秒）——面板仍显示已配置选择，因此这种偏离必须可见。
+选择遵循一个不变量：完成解析和存活性过滤后，拨号路径只使用策略选出的结果。Selector 返回其有效手动选择，URLTest 返回当前胜者，LoadBalance 返回下一个成员，Fallback 返回固定成员。唯一的多候选例外是尚无测量值的顶层 URLTest 组；已有测量值的 URLTest 和所有非 URLTest 计划都是权威的单叶节点计划。若未配置 `final` 的组只有一个唯一叶节点，且 TCP 存活性过滤将其排除，只有当前 Selector 选择路径能到达该节点时，才会将它作为权威的最后尝试：健康状态仍是 dead，但真实拨号可以证明恢复，且不会泄漏到其他成员或 `direct`。UDP 继续执行正常的存活性排除。最后尝试服务会记录限流警告（每组 60 秒）；预热 peek 保持静默。
 
 ## 策略语义
 
 | 策略 | 运行时行为 |
 | --- | --- |
-| Selector | 运行时选择优先，其次是 `default`，最后是第一个合格成员。Clash API 修改运行时选择。`PersistCallback` 把有效写入持久化到 `cache.db`；启用 `interrupt_connections` 时，`InterruptCallback` 关闭该组已跟踪的连接。已配置但不健康的选择仍保有预热所有权，即使流量暂时选择另一个合格成员；该回退（或 `default` 被健康过滤）按每组每网络每分钟一次记录警告。 |
+| Selector | TCP 与 UDP 都不依赖健康状态，依次解析运行时选择、`default` 和声明顺序中的第一个成员；只有缺失或不再属于该组的 tag 才继续向后查找。该成员没有合格候选时，除上述同一叶节点的 TCP 最后尝试外，计划为空；调用方仍可执行显式配置的 `final`。Clash API 修改运行时选择。`PersistCallback` 把有效写入持久化到 `cache.db`；启用 `interrupt_connections` 时，`InterruptCallback` 关闭该组已跟踪的连接。 |
 | URLTest | 选择最小减半递推移动平均，分别保存 TCP 与 UDP 选择，应用 tolerance 滞后，并在拨号和选择查询时惰性重算。真实选择变化可以调用 `InterruptCallback`。 |
 | LoadBalance | 按声明顺序轮询合格成员。每个组分别为 TCP 和 UDP 持有独立 `AtomicUsize` 游标。轮转从不调用 `InterruptCallback`。 |
 | Fallback | 分别为 TCP 和 UDP 固定声明顺序中的第一个合格成员。该成员死亡前保持固定；更靠前的成员恢复不会触发 failback。 |
@@ -93,9 +93,11 @@ Score 首先运行与其他策略相同的存活性过滤。过滤所用的 heal
 
 解析受 `MAX_GROUP_DEPTH = 8` 和每次遍历的 visited set 限制。构造阶段还会对组边执行 DFS，并切断每条闭环边，同时打印告警。这些检查可防止异常组图卡住选择或内省。
 
-即使物理拨号落到更深的叶节点，身份仍然是成员 tag：
+Selector 在候选展开和健康过滤前绑定具体节点或子组成员；节点 tag 重复时，按声明顺序绑定第一个匹配的 `NodeId`。父组保留现有的子组 Peek、父组健康检查和服务提交顺序，不推进未选中 Score 子组的状态。TCP 与 UDP 的服务提交失败时，父组计划都为空，不会恢复之前 peek 的叶节点。候选保留来源子组的引用，不再根据显示 tag 反查身份。选中的自动策略子组仍可在自己的成员范围内选择其他叶节点。唯一 TCP 叶节点的最后尝试遍历也遵守每一级 Selector 选择，而显式延迟测试仍可检查全部成员以发现恢复。
 
-| API | 返回的身份 |
+展示和 API 输出仍使用成员 tag；即使物理拨号落到更深的叶节点，实际选择也会单独保留具体节点或子组身份：
+
+| API | 返回内容 |
 | --- | --- |
 | `node_names_in_group` | 直接节点 tag 加子组 tag |
 | `leaf_node_names_in_group` | 该组下可达且去重的真实叶节点 |
@@ -150,7 +152,7 @@ UDP 选择按节点和地址族决定：
 
 ## eBPF 连通性发布
 
-eBPF alive slot 属于组，而不是某个节点。对于每个域和地址族，发布值是所有可达叶成员状态的 OR。由单个节点转换触发的回调会重新计算该 OR；绝不会直接写入正在转换节点自身的值。
+eBPF alive slot 属于组，而不是某个节点。对于每个域和地址族，发布值使用所有可达叶成员状态的 OR，并保留“恰有一个唯一叶节点且未配置 `final`”的 TCP 准入例外。由单个节点转换触发的回调会重新计算该组值；绝不会直接写入正在转换节点自身的值。准入不覆盖用户态选择：即使该 slot 仍存活，选中的空 Selector 路径仍会拒绝流量。
 
 重载先把旧组或新组布局所需的所有 slot 设置为存活，使转换期 fail-open。发布新路由 generation 后，honk 再写入精确的新组快照。因此组重排不会继承陈旧的 ordinal 状态；若精确发布中途失败，尚未填写的转换 slot 保持 fail-open，而不会错误地杀死某个组。
 

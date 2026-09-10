@@ -211,12 +211,12 @@ impl GroupManager {
         let selections = cache.entry(group.name.clone()).or_default();
         let changed = selections
             .get(network)
-            .map(|entry| entry.tag != candidate.tag)
+            .map(|entry| entry.tag != candidate.tag())
             .unwrap_or(false);
         selections.set(
             network,
             UrlTestEntry {
-                tag: candidate.tag.to_string(),
+                tag: candidate.tag().to_string(),
                 latency,
             },
         );
@@ -238,9 +238,9 @@ impl GroupManager {
         let pin = &mut pins[network.slot()];
         let changed = pin
             .as_deref()
-            .map(|old| old != candidate.tag)
+            .map(|old| old != candidate.tag())
             .unwrap_or(false);
-        *pin = Some(candidate.tag.to_owned());
+        *pin = Some(candidate.tag().to_owned());
         changed
     }
 }
