@@ -307,7 +307,7 @@ impl DnsUpstreamPool for PreferenceSourceUpstream {
         Ok(if upstream_name == "preferred" {
             make_aaaa_response([0x20, 1, 0xdb, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 300)
         } else {
-            nodata_response("example.com", 28)
+            nodata_response("example.com", 28, None)
         })
     }
 }

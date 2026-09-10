@@ -94,36 +94,9 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
             .expect("DNS router"),
         ),
     ));
-    let route = honk_config::routing::RoutingRule {
-        name: "dns".into(),
-        condition: honk_config::routing::RoutingCondition {
-            domain: vec!["example.com".into()],
-            ..Default::default()
-        },
-        outbound: honk_config::routing::RoutingOutbound::Simple("direct".into()),
-        priority: 1,
-        must: false,
-        mark: 0,
-    };
-    let snapshot = Arc::new(crate::dns::projection::RoutingProjectionSnapshot::new(
-        1,
-        Arc::new(Router::new(&[route], "direct").expect("routing matcher")),
-    ));
-    let runtime = crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
-        generation: crate::dns::runtime::RuntimeGeneration::new(1),
-        forwarder,
-        routing_projection: Arc::clone(&snapshot),
-        outbound_runtime: None,
-        transport: Arc::new(NoopRuntimeTransport),
-        udp_query_limit: 256,
-    });
-    let ebpf: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::EbpfBackend>>> = Arc::new(
-        tokio::sync::RwLock::new(Box::new(crate::ebpf::mock::MockEbpfBackend::new())),
-    );
-    let controller = DnsController::new_with_runtime(
-        Arc::new(crate::dns::runtime::DnsServiceProvider::new(runtime)),
-        ebpf,
-    );
+    let (controller, _ebpf) = projection_controller(forwarder);
+    let runtime = controller.runtime_provider().acquire();
+    let snapshot = Arc::clone(runtime.runtime().routing_projection());
     let learned_ip = "192.0.2.10".parse().expect("learned IP");
     controller.routing_projection.submit(
         Arc::clone(&snapshot),
@@ -136,7 +109,6 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
     let projected = controller.project_routes(&snapshot);
     assert_eq!(projected.len(), 1);
 
-    let runtime = controller.runtime_provider().acquire();
     let outcome = controller
         .dns_service()
         .resolve_outcome_with_runtime(
@@ -163,4 +135,93 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
     persister.shutdown().await.expect("persistence shutdown");
     assert!(database.load_dns_v2().expect("persisted rows").is_empty());
     controller.shutdown(Duration::from_secs(1)).await;
+}
+
+async fn assert_uncacheable_positive_projection(
+    response: Vec<u8>,
+    config: &honk_config::dns::DnsConfig,
+    projection_ttl: u64,
+) {
+    let query = query_with_txid("example.com", 0x5151);
+    let ip = [192, 0, 2, 77];
+    let upstream = Arc::new(SlowUpstream {
+        calls: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+        response: response.clone(),
+    });
+    let forwarder = Arc::new(
+        DnsForwarder::new(
+            upstream.clone(),
+            Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(
+                16,
+            ))),
+            Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(config).unwrap()),
+        )
+        .with_cache_ttl(0),
+    );
+    let (controller, ebpf) = projection_controller(forwarder);
+    for _ in 0..2 {
+        let wire = controller
+            .answer_query_for_test(&query, DnsRequestMeta::EMPTY, IngressProfile::Internal)
+            .await;
+        assert_eq!(
+            wire, response,
+            "projection must not rewrite the returned TTLs"
+        );
+    }
+    assert_eq!(
+        upstream.calls.load(Ordering::SeqCst),
+        2,
+        "must not cache the answer"
+    );
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let entries = ebpf.read().await.projection_map_snapshot();
+    assert_eq!(
+        entries.len(),
+        1,
+        "accepted answer lost its DNS domain projection"
+    );
+    assert_eq!(
+        entries[0].0,
+        crate::ebpf::maps::lpm_key_bytes(&crate::ebpf::maps::ip_addr_to_lpm_key(ip.into()))
+    );
+    assert_eq!(entries[0].1.bitmap, [1, 0, 0, 0, 0, 0, 0, 0]);
+
+    tokio::time::sleep(Duration::from_secs(projection_ttl - 1)).await;
+    let retained = ebpf.read().await.projection_map_snapshot();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].0, entries[0].0);
+    assert_eq!(retained[0].1.bitmap, entries[0].1.bitmap);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(ebpf.read().await.projection_map_snapshot().is_empty());
+    controller.shutdown(Duration::from_secs(1)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn uncacheable_zero_ttl_answer_keeps_routing_projection() {
+    let query = query_with_txid("example.com", 0x5151);
+    let mut response = a_response(&query, [192, 0, 2, 77]);
+    crate::dns::forwarder::rewrite_answer_ttls(&mut response, 0);
+    assert_uncacheable_positive_projection(response, &Default::default(), 60).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn uncacheable_zero_ttl_additional_keeps_routing_projection() {
+    let query = query_with_txid("example.com", 0x5151);
+    let mut response = a_response(&query, [192, 0, 2, 77]);
+    crate::dns::forwarder::rewrite_answer_ttls(&mut response, 300);
+    response[10..12].copy_from_slice(&1u16.to_be_bytes());
+    response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4, 192, 0, 2, 88]);
+    assert_uncacheable_positive_projection(response, &Default::default(), 300).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn uncacheable_fixed_zero_keeps_routing_projection() {
+    let query = query_with_txid("example.com", 0x5151);
+    let mut response = a_response(&query, [192, 0, 2, 77]);
+    crate::dns::forwarder::rewrite_answer_ttls(&mut response, 300);
+    let mut config = honk_config::dns::DnsConfig::default();
+    config.fixed_domain_ttl.insert("example.com".into(), 0);
+    assert_uncacheable_positive_projection(response, &config, 300).await;
 }

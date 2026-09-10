@@ -314,7 +314,14 @@ impl DnsController {
                     ProjectionObservation::Positive {
                         domain,
                         ips: outcome.answer_ips(),
-                        advertised_ttl: outcome.expiry().ttl(),
+                        // Uncacheable does not mean the accepted address has no routing lifetime.
+                        advertised_ttl: if outcome.expiry().is_cacheable() {
+                            outcome.expiry().ttl()
+                        } else {
+                            Duration::from_secs(u64::from(crate::dns::forwarder::extract_min_ttl(
+                                outcome.reusable(),
+                            )))
+                        },
                     }
                 }
                 (OutcomeStatus::Accepted, ResponseClass::Nodata | ResponseClass::Nxdomain) => {

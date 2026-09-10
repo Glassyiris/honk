@@ -1,15 +1,6 @@
 use crate::dns::planner::ResponseTraversal;
 use crate::dns::wire::skip_dns_name;
 
-#[cfg(test)]
-pub(super) fn effective_cache_ttl(configured: u32, answer_min_ttl: u32) -> u32 {
-    if configured > 0 {
-        configured
-    } else {
-        answer_min_ttl.max(1)
-    }
-}
-
 pub(crate) fn traversal_strings(traversal: &ResponseTraversal) -> Vec<String> {
     traversal
         .path()
@@ -26,11 +17,10 @@ pub(super) fn patch_txid(mut response: Vec<u8>, txid: u16) -> Vec<u8> {
 }
 
 /// RFC 2308 §5 negative-cache TTL: `min(SOA TTL, SOA MINIMUM)` from the
-/// authority section, falling back to `default_ttl` when no SOA record is
-/// present (or the message is malformed).
-pub(crate) fn extract_soa_negative_ttl(data: &[u8], default_ttl: u32) -> u32 {
+/// authority section. Missing SOA or malformed data yields `None`.
+pub(crate) fn extract_soa_negative_ttl(data: &[u8]) -> Option<u32> {
     if data.len() < 12 {
-        return default_ttl;
+        return None;
     }
     let qdcount = u16::from_be_bytes([data[4], data[5]]) as usize;
     let ancount = u16::from_be_bytes([data[6], data[7]]) as usize;
@@ -39,19 +29,19 @@ pub(crate) fn extract_soa_negative_ttl(data: &[u8], default_ttl: u32) -> u32 {
     let mut pos = 12;
     for _ in 0..qdcount {
         if !skip_dns_name(data, &mut pos) {
-            return default_ttl;
+            return None;
         }
         pos += 4;
         if pos > data.len() {
-            return default_ttl;
+            return None;
         }
     }
     for i in 0..(ancount + nscount) {
         if !skip_dns_name(data, &mut pos) {
-            return default_ttl;
+            return None;
         }
         if pos + 10 > data.len() {
-            return default_ttl;
+            return None;
         }
         let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
         let ttl = u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
@@ -65,11 +55,11 @@ pub(crate) fn extract_soa_negative_ttl(data: &[u8], default_ttl: u32) -> u32 {
                 data[pos + 10 + rdlength - 2],
                 data[pos + 10 + rdlength - 1],
             ]);
-            return ttl.min(minimum).max(1);
+            return Some(ttl.min(minimum));
         }
         pos += 10 + rdlength;
     }
-    default_ttl
+    None
 }
 
 /// Overwrite TTL fields on answer/authority/additional records with `ttl`,
@@ -116,6 +106,15 @@ pub(crate) fn rewrite_answer_ttls(data: &mut [u8], ttl: u32) {
 /// Extract the minimum positive TTL from DNS records, excluding EDNS OPT
 /// pseudo-records. Returns 60 if no TTL is found.
 pub(crate) fn extract_min_ttl(data: &[u8]) -> u32 {
+    extract_min_ttl_inner::<false>(data)
+}
+
+/// Extract the minimum non-OPT record TTL, including zero. Returns 60 if absent.
+pub(crate) fn extract_min_ttl_including_zero(data: &[u8]) -> u32 {
+    extract_min_ttl_inner::<true>(data)
+}
+
+fn extract_min_ttl_inner<const INCLUDE_ZERO: bool>(data: &[u8]) -> u32 {
     if data.len() < 12 {
         return 60;
     }
@@ -141,9 +140,6 @@ pub(crate) fn extract_min_ttl(data: &[u8]) -> u32 {
     let mut min_ttl = u32::MAX;
 
     for _ in 0..total_records {
-        if pos + 12 > data.len() {
-            break;
-        }
         if !skip_dns_name(data, &mut pos) {
             break;
         }
@@ -154,6 +150,9 @@ pub(crate) fn extract_min_ttl(data: &[u8]) -> u32 {
         // Record layout after NAME: TYPE(2) CLASS(2) TTL(4) RDLENGTH(2) RDATA(n)
         let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
         let ttl = u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
+        if INCLUDE_ZERO && rtype != 41 && ttl == 0 {
+            return 0;
+        }
         if rtype != 41 && ttl > 0 && ttl < min_ttl {
             min_ttl = ttl;
         }

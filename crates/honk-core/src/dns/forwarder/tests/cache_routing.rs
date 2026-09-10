@@ -28,10 +28,9 @@ fn test_extract_soa_negative_ttl() {
     resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
     resp.extend_from_slice(&rdata);
 
-    assert_eq!(extract_soa_negative_ttl(&resp, 60), 60);
-    // No authority section → default.
+    assert_eq!(extract_soa_negative_ttl(&resp), Some(60));
     let plain = make_a_response([1, 1, 1, 1], 300);
-    assert_eq!(extract_soa_negative_ttl(&plain, 42), 42);
+    assert_eq!(extract_soa_negative_ttl(&plain), None);
 }
 
 #[tokio::test]
@@ -177,7 +176,7 @@ impl RoutedScopeUpstream {
 
 #[async_trait]
 impl DnsUpstreamPool for RoutedScopeUpstream {
-    async fn query(&self, upstream_name: &str, _raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    async fn query(&self, upstream_name: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
         *self
             .calls
             .lock()
@@ -187,7 +186,11 @@ impl DnsUpstreamPool for RoutedScopeUpstream {
         self.entered.add_permits(1);
         self.release.acquire().await?.forget();
         if self.negative {
-            let mut response = nodata_response("example.com", 1);
+            let mut response = if upstream_name == "red" {
+                make_nxdomain_response(raw_query, 1, 1)
+            } else {
+                nodata_response("example.com", 1, None)
+            };
             response[3] = if upstream_name == "red" { 0x83 } else { 0x82 };
             Ok(response)
         } else {

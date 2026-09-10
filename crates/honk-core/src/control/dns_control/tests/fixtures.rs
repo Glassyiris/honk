@@ -80,6 +80,56 @@ fn controller_for_upstream_and_config(
     )
 }
 
+pub(super) fn projection_controller(
+    forwarder: Arc<DnsForwarder>,
+) -> (DnsController, Arc<RwLock<Box<dyn EbpfBackend>>>) {
+    use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
+
+    let router = Arc::new(
+        Router::new(
+            &[RoutingRule {
+                name: "dns".into(),
+                condition: RoutingCondition {
+                    domain: vec!["example.com".into()],
+                    ..Default::default()
+                },
+                outbound: RoutingOutbound::Simple("direct".into()),
+                priority: 0,
+                must: false,
+                mark: 0,
+            }],
+            "direct",
+        )
+        .unwrap(),
+    );
+    let plan = crate::control::routing_matcher::RoutingPushPlan::compile(
+        &router,
+        &std::collections::HashMap::from([("direct".to_owned(), 0)]),
+        "direct",
+        honk_config::types::DialMode::Domain,
+    )
+    .unwrap();
+    let mut backend = crate::ebpf::mock::MockEbpfBackend::new();
+    backend.publish_routing_plan(&plan, &[]).unwrap();
+    let ebpf: Arc<RwLock<Box<dyn crate::ebpf::EbpfBackend>>> =
+        Arc::new(RwLock::new(Box::new(backend)));
+    let runtime = crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
+        generation: crate::dns::runtime::RuntimeGeneration::new(1),
+        forwarder,
+        routing_projection: Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
+            1, router,
+        )),
+        outbound_runtime: None,
+        transport: Arc::new(NoopRuntimeTransport),
+        udp_query_limit: 16,
+    });
+    let controller = DnsController::new_with_runtime(
+        Arc::new(crate::dns::runtime::DnsServiceProvider::new(runtime)),
+        Arc::clone(&ebpf),
+    );
+    (controller, ebpf)
+}
+
 pub(super) fn query_with_txid(domain: &str, txid: u16) -> Vec<u8> {
     let mut query = crate::dns::forwarder::build_dns_query(domain, 1);
     query[0..2].copy_from_slice(&txid.to_be_bytes());

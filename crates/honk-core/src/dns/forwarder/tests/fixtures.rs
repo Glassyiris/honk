@@ -116,7 +116,7 @@ fn make_a_query() -> Vec<u8> {
 
 /// Build an NXDOMAIN response preserving the query question and carrying an
 /// authority SOA whose TTL and MINIMUM determine the negative cache lifetime.
-fn make_nxdomain_response(query: &[u8], soa_ttl: u32, soa_minimum: u32) -> Vec<u8> {
+pub(crate) fn make_nxdomain_response(query: &[u8], soa_ttl: u32, soa_minimum: u32) -> Vec<u8> {
     let mut response = query.to_vec();
     response[2] = 0x81;
     response[3] = 0x83;
@@ -133,6 +133,24 @@ fn make_nxdomain_response(query: &[u8], soa_ttl: u32, soa_minimum: u32) -> Vec<u
         response.extend_from_slice(&value.to_be_bytes());
     }
     response
+}
+
+fn make_nxdomain_without_soa_response(query: &[u8]) -> Vec<u8> {
+    let mut response = make_nxdomain_response(query, 30, 20);
+    response.truncate(query.len());
+    response[8..10].copy_from_slice(&0_u16.to_be_bytes());
+    response
+}
+
+fn nodata_response(domain: &str, qtype: u16, soa: Option<(u32, u32)>) -> Vec<u8> {
+    let query = build_dns_query(domain, qtype);
+    if let Some((ttl, minimum)) = soa {
+        let mut response = make_nxdomain_response(&query, ttl, minimum);
+        response[3] = 0x80;
+        return response;
+    }
+    let context = crate::dns::query::QueryContext::parse(&query).expect("query context");
+    make_empty_response(&query, &context)
 }
 
 struct MockUpstream {

@@ -2,6 +2,7 @@ use crate::dns::planner::{RequestScope, UpstreamTag};
 use crate::dns::policy::PolicyId;
 use crate::dns::query::{IngressProfile, QueryContext};
 
+use super::CacheSlot;
 use super::{CacheKey, DnsCache, ExactLookup, OperationKind, make_test_response};
 
 #[test]
@@ -430,4 +431,91 @@ fn matching_revision_nxdomain_removes_positive_and_keeps_negative() {
         service.lookup_exact(&key, true),
         ExactLookup::Miss
     ));
+}
+
+fn supersede_key(id: u8) -> CacheKey {
+    CacheKey::for_test(
+        vec![0, 0, id],
+        IngressProfile::Internal,
+        RequestScope::Upstream(UpstreamTag::new("default").expect("scope")),
+        OperationKind::Resolve,
+    )
+}
+
+#[test]
+fn supersede_matching_revision_removes_combined_slot_and_releases_capacity() {
+    let key = supersede_key(1);
+    let service = DnsCache::new(4).service();
+    let epoch = service.publication_epoch();
+    service.put_exact(
+        key.clone(),
+        make_test_response([192, 0, 2, 1], 300),
+        300,
+        None,
+    );
+    service.put_negative_exact(key.clone(), 60, 3);
+    let slot = CacheSlot::Exact(key.clone());
+    let revision = super::super::lock(&service.shards[service.shard_index(&slot)])
+        .get(&slot)
+        .expect("combined cache slot")
+        .revision;
+
+    service.supersede_exact_if_current(epoch, key.clone(), Some(revision));
+    assert!(matches!(
+        service.lookup_exact(&key, true),
+        ExactLookup::Miss
+    ));
+    assert!(service.get_stale_exact(&key, true).is_none());
+    assert!(service.negative_hit_exact(&key).is_none());
+
+    let mut replacement = make_test_response([192, 0, 2, 2], 300);
+    replacement.resize(65_524, 0);
+    service.put_exact(key.clone(), replacement.clone(), 300, None);
+    assert_eq!(
+        service
+            .get_exact(&key)
+            .expect("replacement retained")
+            .response
+            .as_ref(),
+        replacement.as_slice()
+    );
+}
+
+#[test]
+fn supersede_rejects_stale_epoch_nonaccepting_and_newer_revision() {
+    for case in ["stale epoch", "nonaccepting", "old revision"] {
+        let service = DnsCache::new(4).service();
+        let key = supersede_key(2);
+        let mut epoch = service.publication_epoch();
+        let fence = match case {
+            "stale epoch" => {
+                drop(service.begin_flush());
+                None
+            }
+            "nonaccepting" => {
+                let fence = service.begin_flush();
+                epoch = service.publication_epoch();
+                Some(fence)
+            }
+            _ => None,
+        };
+        let response = make_test_response([192, 0, 2, 1], 300);
+        service.put_exact(key.clone(), response.clone(), 300, None);
+        let revision = match service.lookup_exact(&key, true) {
+            ExactLookup::Positive { revision, .. } => revision,
+            _ => panic!("positive fixture"),
+        };
+        if case == "old revision" {
+            service.put_exact(key.clone(), response.clone(), 300, None);
+        }
+        service.supersede_exact_if_current(epoch, key.clone(), Some(revision));
+        assert!(
+            matches!(
+                service.lookup_exact(&key, true),
+                ExactLookup::Positive { entry, .. } if entry.response.as_ref() == response.as_slice()
+            ),
+            "{case}"
+        );
+        drop(fence);
+    }
 }
