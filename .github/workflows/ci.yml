@@ -24,6 +24,9 @@ jobs:
           components: rustfmt, clippy
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
         run: |
+          # The runner image ships Chrome and Microsoft apt sources; a Hash Sum mismatch
+          # at either fails apt-get update, and the jobs install nothing from them.
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
           sudo apt-get update
           sudo apt-get install -y cmake libclang-dev
       - run: cargo fmt --all -- --check
@@ -37,6 +40,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
         run: |
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
           sudo apt-get update
           sudo apt-get install -y cmake libclang-dev
 
@@ -71,6 +75,7 @@ jobs:
       - name: Install build and VM dependencies
         run: |
           echo 'debconf debconf/frontend select Noninteractive' | sudo debconf-set-selections
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             busybox-static clang cmake coreutils file iproute2 iptables jq kbd kmod \
