@@ -205,7 +205,7 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 
 | 结果 | 投影 observation |
 | --- | --- |
-| 已接受的 positive | 用应答的有效 TTL 替换该域名的 IP 集合与 expiry。同一 IP 的多个域名 owner 会贡献按 OR 合并的路由 bitmap。 |
+| 已接受的 positive | 可缓存时，用 outcome 的有效 TTL 替换该域名的 IP 集合与 expiry；不可缓存的正应答改用已有 wire TTL 规则：非 OPT 记录中的最小正 TTL，不存在正 TTL 时回退为 60 秒。拒绝缓存不应抹去已接受地址的路由寿命。同一 IP 的多个域名 owner 会贡献按 OR 合并的路由 bitmap。 |
 | 已接受的 NODATA 或 NXDOMAIN | 清除该域名 owner。 |
 | 已接受的 SERVFAIL 或被策略拒绝 | 保留当前状态。 |
 

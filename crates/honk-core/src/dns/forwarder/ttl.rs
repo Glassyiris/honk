@@ -140,9 +140,6 @@ fn extract_min_ttl_inner<const INCLUDE_ZERO: bool>(data: &[u8]) -> u32 {
     let mut min_ttl = u32::MAX;
 
     for _ in 0..total_records {
-        if pos + 12 > data.len() {
-            break;
-        }
         if !skip_dns_name(data, &mut pos) {
             break;
         }

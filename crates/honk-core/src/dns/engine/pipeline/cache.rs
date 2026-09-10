@@ -117,56 +117,24 @@ pub(super) async fn store(
     if fixed_ttl == Some(0) {
         return EffectiveExpiry::do_not_cache();
     }
-    if matches!(class, ResponseClass::Nxdomain | ResponseClass::Servfail) {
+    // Rejection rewrites the reply to NOERROR, not the upstream TTL policy.
+    let rcode = lifetime_wire.get(3).copied().unwrap_or_default() & 0x0f;
+    let negative = matches!(class, ResponseClass::Nxdomain | ResponseClass::Servfail);
+    let expiry = if negative {
         let soa_ttl = extract_soa_negative_ttl(lifetime_wire);
-        let negative_ttl = if class == ResponseClass::Nxdomain {
-            let Some(ttl) = soa_ttl.filter(|ttl| *ttl > 0) else {
-                if context.forwarder.cache_enabled {
-                    context
-                        .forwarder
-                        .cache_service()
-                        .await
-                        .supersede_exact_if_current(
-                            context.publication_epoch,
-                            cache_key.clone(),
-                            context.refreshing,
-                        );
-                }
-                return EffectiveExpiry::do_not_cache();
-            };
-            ttl.min(300)
+        let ttl = if class == ResponseClass::Nxdomain {
+            soa_ttl.unwrap_or(0).min(300)
         } else {
             soa_ttl.unwrap_or(60).clamp(1, 300)
         };
-        if context.forwarder.cache_enabled {
-            let rcode = response.get(3).copied().unwrap_or_default() & 0x0f;
-            context
-                .forwarder
-                .cache_service()
-                .await
-                .put_negative_if_current(
-                    context.publication_epoch,
-                    cache_key.clone(),
-                    negative_ttl,
-                    rcode,
-                    context.refreshing,
-                );
-        }
-        return EffectiveExpiry::cacheable(std::time::Duration::from_secs(u64::from(negative_ttl)));
-    }
-
-    let rcode = response.get(3).copied().unwrap_or_default() & 0x0f;
-    let expiry = if class == ResponseClass::Nodata && rcode == 0 {
+        effective_expiry(None, 0, ttl)
+    } else if class == ResponseClass::Nodata && rcode == 0 {
         let ttl = fixed_ttl.unwrap_or_else(|| {
             extract_soa_negative_ttl(lifetime_wire)
                 .unwrap_or(0)
                 .min(300)
         });
-        if ttl == 0 {
-            EffectiveExpiry::do_not_cache()
-        } else {
-            EffectiveExpiry::cacheable(std::time::Duration::from_secs(u64::from(ttl)))
-        }
+        effective_expiry(None, 0, ttl)
     } else {
         let answer_ttl = if class == ResponseClass::Positive && rcode == 0 {
             extract_min_ttl_including_zero(lifetime_wire)
@@ -175,34 +143,35 @@ pub(super) async fn store(
         };
         effective_expiry(fixed_ttl, context.forwarder.cache_ttl, answer_ttl)
     };
-    if !expiry.is_cacheable() {
-        if context.forwarder.cache_enabled {
-            context
-                .forwarder
-                .cache_service()
-                .await
-                .supersede_exact_if_current(
-                    context.publication_epoch,
-                    cache_key.clone(),
-                    context.refreshing,
-                );
-        }
-        return expiry;
-    }
     if context.forwarder.cache_enabled {
-        let cache_ttl = expiry.ttl().as_secs().min(u64::from(u32::MAX)) as u32;
-        rewrite_answer_ttls(response, cache_ttl);
-        context
-            .forwarder
-            .cache_service()
-            .await
-            .put_exact_if_current(
+        let cache = context.forwarder.cache_service().await;
+        if !expiry.is_cacheable() {
+            cache.supersede_exact_if_current(
                 context.publication_epoch,
                 cache_key.clone(),
-                response.to_owned(),
-                cache_ttl,
                 context.refreshing,
             );
+        } else {
+            let cache_ttl = expiry.ttl().as_secs().min(u64::from(u32::MAX)) as u32;
+            if negative {
+                cache.put_negative_if_current(
+                    context.publication_epoch,
+                    cache_key.clone(),
+                    cache_ttl,
+                    rcode,
+                    context.refreshing,
+                );
+            } else {
+                rewrite_answer_ttls(response, cache_ttl);
+                cache.put_exact_if_current(
+                    context.publication_epoch,
+                    cache_key.clone(),
+                    response.to_owned(),
+                    cache_ttl,
+                    context.refreshing,
+                );
+            }
+        }
     }
     expiry
 }

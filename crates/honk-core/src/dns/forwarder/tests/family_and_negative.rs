@@ -624,3 +624,61 @@ async fn refused_zero_ttl_answer_keeps_legacy_cache_lifetime() {
     assert_eq!(second.provenance(), Provenance::Cache);
     assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn zero_ttl_root_null_additional_record_prevents_whole_wire_reuse() {
+    let query = make_a_query();
+    let mut response = make_a_response([192, 0, 2, 1], 300);
+    response[10..12].copy_from_slice(&1_u16.to_be_bytes());
+    // A root owner and empty NULL RDATA make this a valid 11-byte RR.
+    response.extend_from_slice(&[0, 0, 10, 0, 1, 0, 0, 0, 0, 0, 0]);
+    let upstream = Arc::new(MockUpstream::new(response.clone()));
+    let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router())
+        .with_cache_ttl(0);
+
+    let first = forwarder.resolve_outcome(&query).await.expect("first answer");
+    let second = forwarder.resolve_outcome(&query).await.expect("second answer");
+    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 2);
+    assert_eq!(first.rendered(), response);
+    assert_eq!(second.rendered(), response);
+    assert!(!first.expiry().is_cacheable());
+    assert!(!second.expiry().is_cacheable());
+}
+
+#[tokio::test]
+async fn rejected_failure_responses_keep_failure_cache_lifetimes() {
+    use honk_config::dns::{DnsResponseAction, DnsResponseRouting};
+
+    let query = make_a_query();
+    let routing = DnsRouting {
+        response: DnsResponseRouting {
+            rules: Vec::new(),
+            fallback: DnsResponseAction::Reject,
+        },
+        ..Default::default()
+    };
+    for (mut response, configured_ttl, expected_ttl) in [
+        (nodata_response("example.com", 1, None), 600, 600),
+        (make_a_response([192, 0, 2, 1], 0), 0, 60),
+    ] {
+        response[3] = 0x85;
+        let upstream = Arc::new(MockUpstream::new(response));
+        let forwarder = DnsForwarder::new(
+            upstream.clone(),
+            test_cache(),
+            Arc::new(DnsRouter::new(&routing).expect("router")),
+        )
+        .with_cache_ttl(configured_ttl);
+
+        let first = forwarder.resolve_outcome(&query).await.expect("rejected failure");
+        assert_eq!(first.status(), OutcomeStatus::Rejected);
+        assert_eq!(first.expiry().ttl(), Duration::from_secs(expected_ttl));
+        assert_eq!(first.rendered()[3] & 0x0f, 0);
+        assert_eq!(answer_count(first.rendered()), 0);
+
+        let cached = forwarder.resolve_outcome(&query).await.expect("cached rejection");
+        assert_eq!(cached.provenance(), Provenance::Cache);
+        assert_eq!(cached.reusable(), first.reusable());
+        assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
+    }
+}

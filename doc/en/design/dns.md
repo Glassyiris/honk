@@ -219,7 +219,7 @@ Direct UDP assigns each query a fresh CSPRNG-selected 16-bit ID, verifies both I
 
 | Outcome | Projection observation |
 | --- | --- |
-| Accepted positive | Replace the domain's IP set and expiry using the answer's effective TTL. Multiple domain owners of one IP contribute ORed routing bitmaps. |
+| Accepted positive | Replace the domain's IP set and expiry using the outcome's effective TTL when cacheable. Uncacheable positives instead use the existing wire-TTL rule: minimum positive non-OPT record TTL, or 60 seconds if none exists. Cache rejection must not erase an accepted address's routing lifetime. Multiple domain owners of one IP contribute ORed routing bitmaps. |
 | Accepted NODATA or NXDOMAIN | Clear that domain owner. |
 | Accepted SERVFAIL or rejected policy result | Retain current state. |
 
