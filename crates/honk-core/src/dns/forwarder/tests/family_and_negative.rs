@@ -148,12 +148,11 @@ async fn test_prefer_ipv6_suppresses_a_when_aaaa_exists() {
 /// upgraded to SERVFAIL — the two have opposite client semantics.
 #[tokio::test]
 async fn test_negative_cache_returns_nxdomain_not_servfail() {
-    let mut nx = make_a_response([93, 184, 216, 34], 60);
-    nx[3] = 0x83; // QR + RA + NXDOMAIN
+    let query = make_a_query();
+    let nx = make_nxdomain_response(&query, 30, 20);
     let mock = Arc::new(MockUpstream::new(nx));
     let cache = test_cache();
     let forwarder = DnsForwarder::new(mock.clone(), cache, test_router());
-    let query = make_a_query();
 
     let resp = forwarder.resolve(&query).await.expect("first nxdomain");
     assert_eq!(resp[3] & 0x0f, 3);
@@ -167,6 +166,61 @@ async fn test_negative_cache_returns_nxdomain_not_servfail() {
         1,
         "negative hit must not re-query upstream"
     );
+}
+
+#[tokio::test]
+async fn nxdomain_with_fixed_zero_ttl_is_not_cached() {
+    let query = make_a_query();
+    let response = make_nxdomain_response(&query, 30, 20);
+    let mock = Arc::new(MockUpstream::new(response));
+    let fixed_ttl = std::collections::HashMap::from([("example.com".to_owned(), 0)]);
+    let router = Arc::new(
+        DnsRouter::new_with_fixed_ttl(&DnsRouting::default(), &fixed_ttl).expect("router"),
+    );
+    let forwarder = DnsForwarder::new(mock.clone(), test_cache(), router).with_cache_ttl(600);
+
+    for _ in 0..2 {
+        let outcome = forwarder.resolve_outcome(&query).await.unwrap();
+        assert!(!outcome.expiry().is_cacheable());
+    }
+    assert_eq!(mock.call_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn nxdomain_without_soa_or_zero_soa_ttl_is_not_cached() {
+    let query = make_a_query();
+    for response in [
+        make_nxdomain_without_soa_response(&query),
+        make_nxdomain_response(&query, 0, 20),
+    ] {
+        let mock = Arc::new(MockUpstream::new(response));
+        let forwarder =
+            DnsForwarder::new(mock.clone(), test_cache(), test_router()).with_cache_ttl(600);
+
+        for _ in 0..2 {
+            let outcome = forwarder.resolve_outcome(&query).await.unwrap();
+            assert!(!outcome.expiry().is_cacheable());
+        }
+        assert_eq!(mock.call_count.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
+async fn cache_disabled_nxdomain_preserves_shared_positive() {
+    let query = make_a_query();
+    let cache = test_cache();
+    let positive = Arc::new(MockUpstream::new(make_a_response([192, 0, 2, 1], 600)));
+    let negative = Arc::new(MockUpstream::new(make_nxdomain_without_soa_response(&query)));
+    let cached = DnsForwarder::new(positive.clone(), cache.clone(), test_router());
+    let uncached = DnsForwarder::new(negative, cache, test_router()).with_cache_enabled(false);
+
+    let initial = cached.resolve_outcome(&query).await.unwrap();
+    let outcome = uncached.resolve_outcome(&query).await.unwrap();
+    assert_eq!(outcome.response_class(), ResponseClass::Nxdomain);
+    let retained = cached.resolve_outcome(&query).await.unwrap();
+    assert_eq!(retained.provenance(), Provenance::Cache);
+    assert_eq!(retained.answer_ips(), initial.answer_ips());
+    assert_eq!(positive.call_count.load(Ordering::SeqCst), 1);
 }
 
 /// A cached SERVFAIL stays SERVFAIL (rcode 2) on later hits.
@@ -206,7 +260,11 @@ async fn cached_negative_keeps_source_aware_preferred_family_projection() {
                 .push(upstream_name.to_string());
             Ok(match upstream_name {
                 "negative" => {
-                    let mut response = nodata_response("example.com", 28);
+                    let mut response = if self.rcode == 3 {
+                        make_nxdomain_response(raw_query, 30, 20)
+                    } else {
+                        nodata_response("example.com", 28)
+                    };
                     response[3] = 0x80 | self.rcode;
                     response
                 }

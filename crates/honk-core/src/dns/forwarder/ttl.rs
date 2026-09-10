@@ -26,11 +26,10 @@ pub(super) fn patch_txid(mut response: Vec<u8>, txid: u16) -> Vec<u8> {
 }
 
 /// RFC 2308 §5 negative-cache TTL: `min(SOA TTL, SOA MINIMUM)` from the
-/// authority section, falling back to `default_ttl` when no SOA record is
-/// present (or the message is malformed).
-pub(crate) fn extract_soa_negative_ttl(data: &[u8], default_ttl: u32) -> u32 {
+/// authority section. Missing SOA or malformed data yields `None`.
+pub(crate) fn extract_soa_negative_ttl(data: &[u8]) -> Option<u32> {
     if data.len() < 12 {
-        return default_ttl;
+        return None;
     }
     let qdcount = u16::from_be_bytes([data[4], data[5]]) as usize;
     let ancount = u16::from_be_bytes([data[6], data[7]]) as usize;
@@ -39,19 +38,19 @@ pub(crate) fn extract_soa_negative_ttl(data: &[u8], default_ttl: u32) -> u32 {
     let mut pos = 12;
     for _ in 0..qdcount {
         if !skip_dns_name(data, &mut pos) {
-            return default_ttl;
+            return None;
         }
         pos += 4;
         if pos > data.len() {
-            return default_ttl;
+            return None;
         }
     }
     for i in 0..(ancount + nscount) {
         if !skip_dns_name(data, &mut pos) {
-            return default_ttl;
+            return None;
         }
         if pos + 10 > data.len() {
-            return default_ttl;
+            return None;
         }
         let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
         let ttl = u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
@@ -65,11 +64,11 @@ pub(crate) fn extract_soa_negative_ttl(data: &[u8], default_ttl: u32) -> u32 {
                 data[pos + 10 + rdlength - 2],
                 data[pos + 10 + rdlength - 1],
             ]);
-            return ttl.min(minimum).max(1);
+            return Some(ttl.min(minimum));
         }
         pos += 10 + rdlength;
     }
-    default_ttl
+    None
 }
 
 /// Overwrite TTL fields on answer/authority/additional records with `ttl`,

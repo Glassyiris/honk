@@ -399,6 +399,32 @@ impl DnsCacheService {
         }
     }
 
+    /// Publish an empty replacement, retaining the refresh owner's revision fence.
+    pub(crate) fn supersede_exact_if_current(
+        &self,
+        epoch: PublicationEpoch,
+        key: CacheKey,
+        refreshing: Option<u64>,
+    ) {
+        let publication = lock(&self.publication);
+        if !publication.accepting || publication.epoch != epoch.0 {
+            return;
+        }
+        let key = CacheSlot::Exact(key);
+        let index = self.shard_index(&key);
+        let mut shard = lock(&self.shards[index]);
+        if refreshing.is_some_and(|revision| {
+            !shard
+                .peek(&key)
+                .is_some_and(|value| value.revision == revision && value.positive.is_some())
+        }) {
+            return;
+        }
+        if shard.pop(&key).is_some() {
+            self.next_revision.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn negative_rcode(&self, key: &str) -> Option<u8> {
         self.negative_hit(key).map(|hit| hit.rcode)
     }

@@ -629,6 +629,9 @@ pub(crate) use ttl::{
 };
 
 #[cfg(test)]
+pub(crate) use tests::make_nxdomain_response;
+
+#[cfg(test)]
 mod tests {
     use std::net::{IpAddr, SocketAddr};
     use std::time::Duration;

@@ -140,15 +140,12 @@ async fn identical_ineligible_queries_reach_upstream_independently_when_overlapp
 #[tokio::test]
 async fn negative_outcome_expiry_matches_insert_and_cache_hit_lifetime() {
     let query = build_dns_query("example.com", 1);
-    let mut nxdomain = query.clone();
-    nxdomain[0..2].copy_from_slice(&[0, 0]);
-    nxdomain[2] = 0x81;
-    nxdomain[3] = 0x83;
+    let nxdomain = crate::dns::forwarder::make_nxdomain_response(&query, 30, 20);
     let pool = exchange([("first", Ok(nxdomain))], None);
     let forwarder = DnsForwarder::new(
         pool.clone(),
         Arc::new(Mutex::new(DnsCache::new(8))),
-        router("first", Vec::new(), Some(0)),
+        router("first", Vec::new(), None),
     )
     .with_cache_ttl(600);
 
@@ -162,10 +159,10 @@ async fn negative_outcome_expiry_matches_insert_and_cache_hit_lifetime() {
         .expect("negative hit");
 
     assert_eq!(inserted.response_class(), ResponseClass::Nxdomain);
-    assert_eq!(inserted.expiry().ttl(), std::time::Duration::from_secs(60));
+    assert_eq!(inserted.expiry().ttl(), std::time::Duration::from_secs(20));
     assert_eq!(hit.provenance(), Provenance::Cache);
     assert!(hit.expiry().is_cacheable());
-    assert_eq!(hit.expiry().ttl(), std::time::Duration::from_secs(60));
+    assert_eq!(hit.expiry().ttl(), std::time::Duration::from_secs(20));
     assert_eq!(pool.calls.load(Ordering::SeqCst), 1);
 }
 

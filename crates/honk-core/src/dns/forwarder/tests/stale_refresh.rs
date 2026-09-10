@@ -511,51 +511,61 @@ async fn wait_for_refresh_completion(forwarder: &DnsForwarder) {
 }
 
 #[tokio::test]
-async fn refresh_nxdomain_retires_the_refreshed_positive() {
+async fn refresh_nxdomain_without_soa_retires_the_refreshed_positive() {
     let query = make_a_query();
-    let cache = test_cache();
     let upstream = Arc::new(RefreshFenceUpstream {
         initial: make_a_response([192, 0, 2, 1], 1),
-        refreshed: make_nxdomain_response(&query, 1, 1),
+        refreshed: make_nxdomain_without_soa_response(&query),
         later: RefreshFenceLater::Error,
         call_count: AtomicUsize::new(0),
         refresh_entered: tokio::sync::Notify::new(),
         refresh_release: tokio::sync::Semaphore::new(0),
     });
-    let forwarder = DnsForwarder::new(upstream.clone(), cache.clone(), test_router());
-
-    let initial = forwarder.resolve_outcome(&query).await.expect("initial");
-    assert_eq!(initial.status(), OutcomeStatus::Accepted);
-    assert_eq!(initial.response_class(), ResponseClass::Positive);
-    assert_eq!(initial.provenance(), Provenance::Upstream);
-    assert_eq!(
-        initial.answer_ips(),
-        &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))]
-    );
-
+    let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router());
+    forwarder.resolve_outcome(&query).await.expect("initial");
     let cached = forwarder.resolve_outcome(&query).await.expect("cache hit");
     assert_eq!(cached.provenance(), Provenance::Cache);
     wait_for_refresh_start(&upstream).await;
-    let service = forwarder.cache_service().await;
-    let key = resolve_cache_key(&query);
-    service.expire_positive_exact_for_test(&key);
+    forwarder
+        .cache_service()
+        .await
+        .expire_positive_exact_for_test(&resolve_cache_key(&query));
     upstream.refresh_release.add_permits(1);
     wait_for_refresh_completion(&forwarder).await;
 
-    let negative = forwarder
-        .resolve_outcome(&query)
-        .await
-        .expect("cached nxdomain");
-    assert_eq!(negative.status(), OutcomeStatus::Accepted);
-    assert_eq!(negative.response_class(), ResponseClass::Nxdomain);
-    assert_eq!(negative.provenance(), Provenance::Cache);
-    assert_eq!(negative.rendered()[3] & 0x0f, 3);
-
-    service.insert_expired_negative_exact_for_test(key, 3);
-    let _error = forwarder
+    let error = forwarder
         .resolve_outcome(&query)
         .await
         .expect_err("retired positive must not be served stale");
+    assert!(matches!(error.unshared(), DnsForwardError::Exchange { .. }));
+}
+
+#[tokio::test]
+async fn foreground_nxdomain_retires_expired_positive() {
+    let query = make_a_query();
+    let upstream = Arc::new(RefreshFenceUpstream {
+        initial: make_a_response([192, 0, 2, 1], 1),
+        refreshed: make_nxdomain_without_soa_response(&query),
+        later: RefreshFenceLater::Error,
+        call_count: AtomicUsize::new(0),
+        refresh_entered: tokio::sync::Notify::new(),
+        refresh_release: tokio::sync::Semaphore::new(0),
+    });
+    let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router());
+    forwarder.resolve_outcome(&query).await.expect("initial");
+    forwarder
+        .cache_service()
+        .await
+        .expire_positive_exact_for_test(&resolve_cache_key(&query));
+    upstream.refresh_release.add_permits(1);
+    let negative = forwarder.resolve_outcome(&query).await.expect("nxdomain");
+    assert_eq!(negative.response_class(), ResponseClass::Nxdomain);
+
+    let error = forwarder
+        .resolve_outcome(&query)
+        .await
+        .expect_err("retired positive must not be served stale");
+    assert!(matches!(error.unshared(), DnsForwardError::Exchange { .. }));
 }
 
 #[tokio::test]

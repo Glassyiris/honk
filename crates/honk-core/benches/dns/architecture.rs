@@ -37,8 +37,10 @@ pub(super) fn bench_typed_key_build(c: &mut Criterion) {
 
 pub(super) fn bench_warmed_forwarder_hits(c: &mut Criterion) {
     let runtime = Runtime::new().expect("benchmark runtime");
-    let positive = fixtures::forwarder(Arc::new(fixtures::LoopbackPool::immediate()), true);
-    let negative = fixtures::forwarder(Arc::new(fixtures::LoopbackPool::nxdomain()), true);
+    let positive_pool = Arc::new(fixtures::LoopbackPool::immediate());
+    let negative_pool = Arc::new(fixtures::LoopbackPool::nxdomain());
+    let positive = fixtures::forwarder(Arc::clone(&positive_pool), true);
+    let negative = fixtures::forwarder(Arc::clone(&negative_pool), true);
     let positive_query = build_dns_query("positive.example", 1);
     let negative_query = build_dns_query("negative.example", 1);
     runtime.block_on(async {
@@ -97,6 +99,16 @@ pub(super) fn bench_warmed_forwarder_hits(c: &mut Criterion) {
         });
     });
     group.finish();
+    assert_eq!(
+        positive_pool.calls(),
+        1,
+        "positive workload must stay cached"
+    );
+    assert_eq!(
+        negative_pool.calls(),
+        1,
+        "NXDOMAIN workload must stay cached"
+    );
 }
 
 pub(super) fn bench_dns_udp_validation_profile(c: &mut Criterion) {

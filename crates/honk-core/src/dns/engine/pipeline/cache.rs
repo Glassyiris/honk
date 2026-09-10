@@ -107,8 +107,34 @@ pub(super) async fn store(
     if !context.reuse_eligible {
         return EffectiveExpiry::do_not_cache();
     }
+    let fixed_ttl = context
+        .forwarder
+        .routing
+        .fixed_ttl(context.prepared.domain());
+    if fixed_ttl == Some(0) {
+        return EffectiveExpiry::do_not_cache();
+    }
     if matches!(class, ResponseClass::Nxdomain | ResponseClass::Servfail) {
-        let negative_ttl = extract_soa_negative_ttl(response, 60).clamp(1, 300);
+        let soa_ttl = extract_soa_negative_ttl(response);
+        let negative_ttl = if class == ResponseClass::Nxdomain {
+            let Some(ttl) = soa_ttl.filter(|ttl| *ttl > 0) else {
+                if context.forwarder.cache_enabled {
+                    context
+                        .forwarder
+                        .cache_service()
+                        .await
+                        .supersede_exact_if_current(
+                            context.publication_epoch,
+                            cache_key.clone(),
+                            context.refreshing,
+                        );
+                }
+                return EffectiveExpiry::do_not_cache();
+            };
+            ttl.min(300)
+        } else {
+            soa_ttl.unwrap_or(60).clamp(1, 300)
+        };
         if context.forwarder.cache_enabled {
             let rcode = response.get(3).copied().unwrap_or_default() & 0x0f;
             context
@@ -127,14 +153,7 @@ pub(super) async fn store(
     }
 
     let answer_ttl = extract_min_ttl(response);
-    let expiry = effective_expiry(
-        context
-            .forwarder
-            .routing
-            .fixed_ttl(context.prepared.domain()),
-        context.forwarder.cache_ttl,
-        answer_ttl,
-    );
+    let expiry = effective_expiry(fixed_ttl, context.forwarder.cache_ttl, answer_ttl);
     if context.forwarder.cache_enabled && expiry.is_cacheable() {
         let cache_ttl = expiry.ttl().as_secs().min(u64::from(u32::MAX)) as u32;
         rewrite_answer_ttls(response, cache_ttl);
