@@ -688,7 +688,14 @@ fn append_conditions(
             predicate: CompiledPredicate::Dscp(
                 dscps
                     .iter()
-                    .filter_map(|value| value.trim().parse().ok())
+                    .filter_map(|value| {
+                        let value = value.trim();
+                        value
+                            .strip_prefix("0x")
+                            .or_else(|| value.strip_prefix("0X"))
+                            .map_or_else(|| value.parse(), |hex| u8::from_str_radix(hex, 16))
+                            .ok()
+                    })
                     .collect(),
             ),
         });

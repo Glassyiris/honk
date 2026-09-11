@@ -40,7 +40,7 @@ routing {
 | `pname(...)` | 按 15 字节规范化的子串模式，匹配 `argv[0]` 的可执行文件 basename；运行时 BTF 偏移或 cgroup verifier 拒绝内核 argv 读取时，cgroup hook 同步使用调用线程的 `comm` | `process_name` |
 | `mac(...)` | 源 MAC 地址 | `mac` |
 | `ipversion(...)` | `4`/`ipv4`, `6`/`ipv6` | `ip_version` |
-| `dscp(...)` | DSCP 值 | `dscp` |
+| `dscp(...)` | 十进制或带 `0x`/`0X` 前缀的十六进制 DSCP 值 | `dscp` |
 
 每个正向字段在 `RoutingCondition.not` 下都有对应列表；解析器把 `!matcher(...)` 放入该列表。同一字段中的多个值互为备选。
 

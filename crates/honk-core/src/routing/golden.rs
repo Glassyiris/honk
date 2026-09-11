@@ -208,9 +208,10 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
         ),
         (
             "dscp",
-            json!(["8", "46"]),
+            json!(["8", "0x2e", "0X04"]),
             vec![
                 (sample(|c| c.dscp = Some(8)), true),
+                (sample(|c| c.dscp = Some(4)), true),
                 (sample(|c| c.dscp = Some(46)), true),
                 (sample(|c| c.dscp = Some(63)), false),
                 (sample(|c| c.dscp = None), false),

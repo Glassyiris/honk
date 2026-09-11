@@ -115,6 +115,11 @@ UDP Preparing claim，不能把故障伪装成用户态补判请求。
 和终结结果写入。它不拥有 TLS/QUIC 解析、拨号、mode、健康检查或通用 VM。大的 IP、
 MAC、domain 集合保留为索引，不展开成成千上万条立即数比较。
 
+emitter 在生成指令前折叠空的内联谓词：正向空谓词使整条规则不可能命中，取反空谓词
+不增加条件。规则因此变成无条件时，在其 action 处结束生成；后续规则和 fallback
+不能留下不可达指令，否则内核会在语义验证前拒绝加载。保留的 action 仍使用原始
+RuleId 和元数据。
+
 每一代拥有独立的目的 IPv4/IPv6、源 IPv4/IPv6 LPM maps、MAC 索引和 domain hash map。
 IP 分 family，避免 IPv6 前缀误匹配 mapped IPv4。更具体的 LPM 条目继承所有匹配祖先
 谓词的位，使最长前缀查找不破坏规则顺序。每一代使用完整 `DomainRouting` bitmap，
