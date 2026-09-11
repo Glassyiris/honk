@@ -173,6 +173,8 @@ honk-tool bpf stats [--pin-root PATH]
 
 实现通过原始 `bpf(2)` 操作打开 pin；不使用 aya、不加载程序，也不挂载 hook。`stats` 打印 conn-state 与辅助 map 的溢出/插入失败计数、`CONN_STATE_OCCUPANCY` 插入/删除水位计，以及非零的每出站包/字节计数。读取 map 通常需要 root 或合适的 BPF capability。
 
+`stats` 要求 `/sys/devices/system/cpu/possible` 可读且为内核的真实导出文件。每 CPU 缓冲区按该掩码中的 CPU 数量分配，不采用 present 或 online CPU 数量。`CONN_STATE_OCCUPANCY` 和 `OUTBOUND_STATS` 必须为每 CPU 数组，键均为 4 字节，值分别为 8 字节和 32 字节。CPU 列表不可读、格式无效或 map 元数据不兼容时，命令在每 CPU 查找前报错，不回退到猜测的 CPU 数量。
+
 ### `diagnose`
 
 ```text
@@ -187,6 +189,8 @@ honk-tool diagnose [--api URL] [--secret TOKEN] [--pin-root PATH] [--tproxy-mark
 | `--tproxy-mark VALUE` | `134217728`（`0x08000000`） | `daens` 策略规则中预期的 fwmark。 |
 
 该检查只读。它查找引擎进程（`honk-core`、`honk` 或 `dae`）、`/var/run/netns/daens`、`/sys/class/net/dae0`、`daens` 内的 fwmark 规则、必需的 pin map、可读取的占用/溢出统计，并检查 `<api>/version` 是否返回成功的 HTTP 响应。API 返回 2xx 状态码时打印 `[ok]` 和响应正文；返回非 2xx 状态码时打印 `[FAIL]` 和状态文本。标准输出末尾为 `diagnose: all checks passed` 或 `diagnose: N issue(s) found`。存在失败检查时，退出状态为 `1`，错误信息包含问题数量；全部通过时，退出状态为 `0`。
+
+统计检查与 `bpf stats` 对 possible CPU 文件和 pin map 布局的要求相同。准备失败时打印 `[FAIL] map stats read`，计入问题数量，并以非零状态退出。
 
 ### `geosite` 与 `geoip`
 
