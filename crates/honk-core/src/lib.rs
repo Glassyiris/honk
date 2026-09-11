@@ -503,6 +503,22 @@ fn prepare_runtime_data_dir(
     prepare_runtime_data_dir_with_fallback(requested, std::env::current_dir)
 }
 
+/// Log timestamps in the machine's local time zone with its UTC offset,
+/// e.g. `2026-09-12T02:30:15.123456+10:00`. The default timer prints UTC,
+/// which does not line up with a router's syslog or an operator's clock.
+/// chrono reads the zone itself, so this stays sound after threads exist.
+struct LocalTime;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        write!(
+            w,
+            "{}",
+            chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f%:z")
+        )
+    }
+}
+
 fn resolved_log_file_path(
     config: &Config,
     cli_override: Option<&std::path::Path>,
@@ -584,6 +600,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         let file = open_log_file(path)?;
         Some(
             tracing_subscriber::fmt::layer()
+                .with_timer(LocalTime)
                 .with_ansi(false)
                 .with_writer(std::sync::Mutex::new(file))
                 .with_filter(env_filter.clone()),
@@ -599,7 +616,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     use tracing_subscriber::prelude::*;
     let registry = tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(env_filter))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_timer(LocalTime)
+                .with_filter(env_filter),
+        )
         .with(log_file_layer);
     #[cfg(feature = "clash-api")]
     let registry = registry.with(clash_log_layer);
@@ -1858,6 +1879,27 @@ fn is_mountpoint(path: &str) -> bool {
         .map(|m| m.lines().any(|l| l.split_whitespace().nth(1) == Some(path)))
         .unwrap_or(false)
 }
+#[cfg(test)]
+mod local_time_tests {
+    use tracing_subscriber::fmt::time::FormatTime;
+
+    #[test]
+    fn test_log_timestamp_carries_the_local_utc_offset() {
+        let mut out = String::new();
+        super::LocalTime
+            .format_time(&mut tracing_subscriber::fmt::format::Writer::new(&mut out))
+            .unwrap();
+        // 2026-09-12T02:30:15.123456+10:00 — date, time with microseconds, signed offset.
+        let (stamp, offset) = out.split_at(out.len() - 6);
+        assert_eq!(stamp.len(), 26, "{out}");
+        assert_eq!(&stamp[10..11], "T", "{out}");
+        assert!(offset.starts_with('+') || offset.starts_with('-'), "{out}");
+        assert_eq!(&offset[3..4], ":", "{out}");
+        let expected = chrono::Local::now().format("%:z").to_string();
+        assert_eq!(offset, expected, "{out}");
+    }
+}
+
 #[cfg(test)]
 mod startup_lifecycle_tests {
     use super::{
