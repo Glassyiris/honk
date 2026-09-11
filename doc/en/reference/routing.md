@@ -40,7 +40,7 @@ routing {
 | `pname(...)` | Substring patterns normalized to 15 bytes, matched against the executable basename from `argv[0]`; when runtime BTF offsets or verifier-safe kernel argv access are unavailable, the cgroup hook uses the calling thread's `comm` synchronously | `process_name` |
 | `mac(...)` | Source MAC address | `mac` |
 | `ipversion(...)` | `4`/`ipv4`, `6`/`ipv6` | `ip_version` |
-| `dscp(...)` | DSCP value | `dscp` |
+| `dscp(...)` | Decimal or `0x`/`0X`-prefixed hexadecimal DSCP value | `dscp` |
 
 Every positive field has a corresponding list under `RoutingCondition.not`; the parser sends `!matcher(...)` there. Within one field, listed values are alternatives.
 

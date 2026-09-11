@@ -580,6 +580,53 @@ fn four_mode_golden_policies() {
 
 #[test]
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+fn empty_scalar_predicates_preserve_rule_reachability() {
+    let config = honk_config::parser::parse_dae_config(
+        r#"
+        routing {
+            l4proto(icmp) -> block
+            !ipversion(9) && dport(8443) -> proxy(must)
+            dport(443) -> block
+            !dscp(invalid) -> direct(must)
+            dport(80) -> block
+            fallback: block
+        }
+        "#,
+    )
+    .unwrap();
+    let router = Router::new(&config.routing.rules, "block").unwrap();
+    let ids = HashMap::from([
+        ("direct".into(), 0),
+        ("block".into(), 1),
+        ("proxy".into(), 2),
+    ]);
+    let plan = RoutingPushPlan::compile(&router, &ids, "block", DialMode::Ip).unwrap();
+    let mut backend = RealEbpfBackend::load_routing_test_fixture(&object()).unwrap();
+    backend.publish_routing_plan(&plan, &[]).unwrap();
+    for (port, outbound, must, rule_id) in [(8443, 2, 1, 1), (443, 1, 0, 2), (80, 0, 1, 3)] {
+        let mut connection = golden::connection();
+        connection.dst_port = port;
+        assert_eq!(
+            router.route_with_must(&connection),
+            (["direct", "block", "proxy"][outbound as usize], must != 0),
+        );
+        let actual = backend.run_routing_test(&input(&connection)).unwrap();
+        assert_eq!(actual.status, 0);
+        assert_eq!(
+            actual.decision,
+            RoutingDecision {
+                outbound,
+                mark: 0,
+                must,
+                domain_final: 1,
+                rule_id,
+            },
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
 fn large_prefix_fact_policy() {
     let ids = outbound_ids();
     let mut backend = RealEbpfBackend::load_routing_test_fixture(&object()).unwrap();

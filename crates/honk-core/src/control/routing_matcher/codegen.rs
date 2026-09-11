@@ -324,10 +324,22 @@ pub fn emit_routing_program(
     }
 
     for rule in &plan.rules {
+        // BPF rejects structurally unreachable instructions before evaluating predicates.
+        if rule
+            .conditions
+            .iter()
+            .any(|condition| !condition.not && predicate_is_empty(&condition.predicate))
+        {
+            continue;
+        }
         asm.source(rule.id + 1, rule.source.as_str());
         let fail = asm.label();
         let mut failure_ready: Option<(u8, u8)> = None;
-        for condition in &rule.conditions {
+        for condition in rule
+            .conditions
+            .iter()
+            .filter(|condition| !predicate_is_empty(&condition.predicate))
+        {
             let pass = asm.label();
             emit_condition(&mut asm, condition, pass, fail, &fds, &caches)?;
             if let Some(kind) = FactKind::of(&condition.predicate) {
@@ -349,6 +361,9 @@ pub fn emit_routing_program(
         asm.st_imm(R7, RULE_ID, rule.id as i32)?;
         asm.mov_imm(R0, 0)?;
         asm.exit()?;
+        if failure_ready.is_none() {
+            return asm.finish();
+        }
         asm.bind(fail);
         (caches.must_ready, caches.may_ready) = failure_ready.unwrap_or_default();
     }
@@ -456,6 +471,21 @@ fn validate_plan(plan: &RoutingPushPlan) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn predicate_is_empty(predicate: &KernelPredicate) -> bool {
+    match predicate {
+        KernelPredicate::DestinationPort(ranges) | KernelPredicate::SourcePort(ranges) => {
+            ranges.is_empty()
+        }
+        KernelPredicate::Protocol(mask) | KernelPredicate::IpVersion(mask) => *mask == 0,
+        KernelPredicate::Dscp(values) => values.is_empty(),
+        KernelPredicate::ProcessName(names) => names.is_empty(),
+        KernelPredicate::Domain(_)
+        | KernelPredicate::DestinationIp(_)
+        | KernelPredicate::SourceIp(_)
+        | KernelPredicate::Mac(_) => false,
+    }
+}
+
 fn emit_condition(
     asm: &mut Assembler,
     condition: &KernelCondition,
@@ -514,14 +544,10 @@ fn emit_predicate(
         }
         KernelPredicate::Dscp(values) => {
             asm.ldx_w(R0, R6, INPUT_DSCP)?;
-            if values.is_empty() {
-                asm.ja(on_false)?;
-            } else {
-                for value in values {
-                    asm.jump(BPF_JEQ, R0, *value as i32, on_true)?;
-                }
-                asm.ja(on_false)?;
+            for value in values {
+                asm.jump(BPF_JEQ, R0, *value as i32, on_true)?;
             }
+            asm.ja(on_false)?;
         }
         KernelPredicate::ProcessName(names) => {
             emit_process_names(asm, names, on_true, on_false)?;
@@ -538,13 +564,9 @@ fn emit_mask_scalar(
     on_false: Label,
 ) -> anyhow::Result<()> {
     asm.ldx_w(R0, R6, offset)?;
-    if mask == 0 {
-        asm.ja(on_false)?;
-    } else {
-        asm.and_imm(R0, mask)?;
-        asm.jump(BPF_JNE, R0, 0, on_true)?;
-        asm.ja(on_false)?;
-    }
+    asm.and_imm(R0, mask)?;
+    asm.jump(BPF_JNE, R0, 0, on_true)?;
+    asm.ja(on_false)?;
     Ok(())
 }
 
@@ -556,10 +578,6 @@ fn emit_port_ranges(
     on_false: Label,
 ) -> anyhow::Result<()> {
     asm.ldx_w(R0, R6, offset)?;
-    if ranges.is_empty() {
-        asm.ja(on_false)?;
-        return Ok(());
-    }
     for range in ranges {
         let next = asm.label();
         let inside = asm.label();
@@ -580,10 +598,6 @@ fn emit_process_names(
     on_true: Label,
     on_false: Label,
 ) -> anyhow::Result<()> {
-    if names.is_empty() {
-        asm.ja(on_false)?;
-        return Ok(());
-    }
     for bytes in names {
         let next_name = asm.label();
         asm.ldx_w(R4, R6, INPUT_PNAME_LEN)?;

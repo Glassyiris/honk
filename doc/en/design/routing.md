@@ -143,6 +143,12 @@ constant comparisons, masks, map lookups and terminal result writes. It owns no
 TLS/QUIC parser, proxy dialer, mode controller, health checker, or generic VM.
 Large IP/MAC/domain sets are data indexes, not thousands of inline literals.
 
+The emitter folds empty inline predicates before writing instructions: a positive
+empty predicate makes its whole rule impossible; a negated one adds no condition.
+If a rule becomes unconditional, emission ends at its action. Later rules and the
+fallback must not leave unreachable instructions that the kernel rejects before
+semantic verification. Retained actions keep their original rule IDs and metadata.
+
 Each generation owns separate destination IPv4/IPv6 and source IPv4/IPv6 LPM
 maps, a MAC index and a domain hash map. Family-separated IP maps prevent an IPv6
 prefix from matching a mapped IPv4 flow. A more-specific LPM entry inherits all
