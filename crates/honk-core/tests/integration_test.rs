@@ -269,7 +269,7 @@ domain_suffix = ["google.com"]
 
 [dns]
 [[dns.upstream]]
-name = "alidns"
+name = "default"
 address = "223.5.5.5:53"
 protocol = "udp"
 "#;

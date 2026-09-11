@@ -38,10 +38,13 @@ fn test_config_dae_parses() {
     assert_eq!(config.dns.upstream.len(), 2);
 
     // Experimental sections parsed from dae syntax.
-    assert_eq!(
-        config.experimental.clash_api.external_controller,
-        "0.0.0.0:9090"
-    );
+    let controller = config
+        .experimental
+        .clash_api
+        .external_controller
+        .parse::<std::net::SocketAddr>()
+        .expect("config.dae controller must be a numeric socket address");
+    assert!(controller.ip().is_loopback());
     assert!(config.experimental.cache_file.enabled);
 }
 

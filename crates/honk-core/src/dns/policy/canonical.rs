@@ -94,9 +94,7 @@ mod wire {
 
 use std::collections::BTreeMap;
 
-use honk_config::dns::{
-    DnsCond, DnsConfig, DnsDomainMatcher, DnsRequestAction, DnsRequestRouting, DnsResponseAction,
-};
+use honk_config::dns::{DnsCond, DnsConfig, DnsDomainMatcher, DnsRequestAction, DnsResponseAction};
 use honk_config::types::DnsProtocol;
 
 use self::normalize::{exact, host, lowercase};
@@ -147,7 +145,7 @@ pub(super) fn encode(config: &DnsConfig) -> Result<Vec<u8>, PolicyError> {
         )?;
     }
 
-    let request = effective_request(config);
+    let request = config.routing.effective_request();
     writer.len(request.rules.len())?;
     for rule in &request.rules {
         conditions(&mut writer, &rule.conditions)?;
@@ -185,25 +183,6 @@ pub(super) fn encode(config: &DnsConfig) -> Result<Vec<u8>, PolicyError> {
         }
     }
     Ok(writer.finish())
-}
-
-fn effective_request(config: &DnsConfig) -> DnsRequestRouting {
-    if !config.routing.request.rules.is_empty() {
-        return config.routing.request.clone();
-    }
-    if !config.routing.rules.is_empty() {
-        return config.routing.convert_legacy_rules();
-    }
-    let mut request = config.routing.request.clone();
-    if matches!(&request.fallback, DnsRequestAction::Upstream(name) if name == "default")
-        && !matches!(
-            config.routing.fallback.as_str(),
-            "" | "upstream" | "default"
-        )
-    {
-        request.fallback = DnsRequestAction::Upstream(config.routing.fallback.clone());
-    }
-    request
 }
 
 fn conditions(writer: &mut Writer, values: &[DnsCond]) -> Result<(), PolicyError> {

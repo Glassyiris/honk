@@ -4,7 +4,7 @@ This reference describes honk's implemented Clash-compatible HTTP surface and it
 
 ## Enablement and authentication
 
-The API server starts only when `experimental.clash_api.external_controller` is non-empty and the binary includes the default-on `clash-api` feature. The controller accepts `host:port`; a leading `:port` binds `0.0.0.0:port`. An invalid address is logged and does not stop the engine.
+The API server starts only when `experimental.clash_api.external_controller` is non-empty and the binary includes the default-on `clash-api` feature. The controller requires a numeric socket address such as `127.0.0.1:9090` or `[::1]:9090`, not a DNS hostname; a leading `:port` binds `0.0.0.0:port`. An invalid address is logged and does not stop the engine.
 
 When `experimental.clash_api.secret` is non-empty, API requests require:
 
@@ -15,6 +15,8 @@ Authorization: Bearer <secret>
 A WebSocket upgrade may instead pass `?token=<percent-encoded-secret>`. honk percent-decodes the token before exact comparison. Query-token authentication is limited to WebSocket upgrades; ordinary HTTP requests use the Bearer header. An empty `secret` disables authentication. The `/ui` static tree is outside the API authentication layer.
 
 **The API has no TLS.** Bind it to localhost or place a TLS reverse proxy in front of it, and set a strong `secret` when untrusted clients can reach the listener.
+
+The shipped `config.dae` binds to `127.0.0.1:9090`. A non-loopback controller with an empty `secret` emits a startup warning but is still allowed; this applies to wildcard and assigned addresses, regardless of firewall configuration.
 
 ## Endpoint map
 

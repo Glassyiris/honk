@@ -72,6 +72,10 @@ upstream {
 }
 ```
 
+上游声明保留名称的原有拼写。dae 请求和应答动作解析器先去除首尾空白，再调用 Rust `to_lowercase()`，然后识别关键字或生成上游目标。查找时，转换后的目标必须与声明名称完全一致。建议声明名称使用小写：声明 `alidns` 配合动作 `AliDNS` 可以匹配；声明和动作都写成 `AliDNS` 则不能匹配。旧版结构化目标不做大小写转换。
+
+启动和重载时，完整配置校验会检查生效的请求及应答规则和 `fallback` 引用的每个上游名称。只解析配置的 API 不执行这项校验。第一个显式 `upstream` 块会替换内置条目，因此必须保留名为 `default` 的声明、选择已声明的回退上游，或将请求 `fallback` 设为 `reject`、`asis`。即使请求规则覆盖所有查询，也不能省略回退上游的声明。
+
 ### URI scheme 与默认值
 
 | URI 形式 | 运行时协议 | 默认端口 / path |
@@ -145,15 +149,28 @@ cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
 | 动作 | 结果 |
 | --- | --- |
 | `accept` | 返回当前应答。 |
-| `reject` | 返回空的成功应答。 |
+| `reject` | 将当前应答替换为空的成功应答。 |
 | 上游名 | 通过该命名上游重新查询，然后再次执行 response 路由。 |
-| `fallback: accept\|reject` | 无 response 规则匹配时使用的判定；默认为 `accept`。 |
+| `fallback: accept\|reject\|<upstream>` | 无 response 规则匹配时使用的判定或命名上游；默认为 `accept`。 |
+
+NXDOMAIN 和 SERVFAIL 应答会直接返回，不经过应答路由，也不应用应答规则或回退动作。
 
 一次 response 遍历的最大重新查询深度为三个上游，其中包括初始上游；第四次交换会被拒绝。重新查询形成环路时也会被拒绝。
 
 ### 旧版转换
 
-兼容性 schema 保留扁平的 `routing.rules` 条目，其中包含 `domain` 和 `upstream`，以及一个命名 `fallback`。不存在新式 request 规则时，honk 会在加载时将其转换成 request 规则。`suffix:`、`keyword:`、`full:` 和 `regex:` 前缀选择 matcher；不带前缀的旧版域名是精确 `full` 匹配。旧版 fallback 会成为 request fallback。这些是结构化兼容字段，不是额外的当前 dae statement。
+兼容性配置保留扁平的 `routing.rules` 条目（包含 `domain` 和 `upstream`）以及命名 `fallback`。这些是结构化兼容字段，不是当前 dae 语法的附加语句。`suffix:`、`keyword:`、`full:` 和 `regex:` 前缀选择匹配方式；不带前缀的旧版域名采用 `full` 精确匹配。
+
+生效的请求路由按以下优先级选择：
+
+1. 新式 `request.rules` 非空时，使用新式规则及其回退动作，忽略所有旧版字段。
+2. 否则，旧版 `rules` 非空时，将其转换为请求规则，并保留旧版回退名称的原有拼写。即使另有新式回退动作，也以旧版为准。
+3. 两组规则都为空时，使用已配置的请求路由。仅当其回退动作为 `Upstream("default")`，且旧版回退值不是 `""`、`"upstream"` 或 `"default"` 时，才用旧版值替换。
+
+`"upstream"` 仅在第三个分支中作为哨兵值被忽略；存在旧版规则时，它是普通的上游名称，必须有对应声明。旧版目标按原样精确匹配，不采用 dae 动作的大小写转换规则。
+
+校验诊断保留原始字段路径：新式规则和回退使用 `dns.routing.request.rules[i].action` 与 `dns.routing.request.fallback`；转换后的旧版规则使用 `dns.routing.rules[i].upstream`；转换或提升的回退使用 `dns.routing.fallback`。
+旧版规则生效时，诊断会区分默认回退 `upstream` 未声明和回退为空，并按名称排序列出已声明的上游。省略旧版回退等同于显式设置 `upstream`；只要声明了该上游，两者都有效。没有旧版规则时，空值和 `upstream` 哨兵仍会被忽略。
 
 ## 地址族策略
 

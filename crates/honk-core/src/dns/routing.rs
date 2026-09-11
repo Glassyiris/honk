@@ -175,7 +175,7 @@ mod compiler {
     }
 }
 mod config {
-    use honk_config::dns::{DnsRequestAction, DnsRequestRouting, DnsResponseAction, DnsRouting};
+    use honk_config::dns::{DnsRequestAction, DnsResponseAction};
 
     pub(super) fn request_upstream(action: &DnsRequestAction) -> Option<&str> {
         match action {
@@ -189,24 +189,6 @@ mod config {
             DnsResponseAction::Accept | DnsResponseAction::Reject => None,
             DnsResponseAction::Upstream(name) => Some(name),
         }
-    }
-
-    pub(super) fn resolve_request_routing(config: &DnsRouting) -> DnsRequestRouting {
-        if !config.request.rules.is_empty() {
-            return config.request.clone();
-        }
-        if !config.rules.is_empty() {
-            return config.convert_legacy_rules();
-        }
-        let mut request = config.request.clone();
-        let uses_default = matches!(
-            &request.fallback,
-            DnsRequestAction::Upstream(name) if name == "default"
-        );
-        if uses_default && !matches!(config.fallback.as_str(), "" | "upstream" | "default") {
-            request.fallback = DnsRequestAction::Upstream(config.fallback.clone());
-        }
-        request
     }
 }
 mod matcher {
@@ -340,7 +322,7 @@ use honk_config::dns::{
 use tracing::debug;
 
 use self::compiler::{CompiledRequestRule, CompiledResponseRule, compile, requirements};
-use self::config::{request_upstream, resolve_request_routing, response_upstream};
+use self::config::{request_upstream, response_upstream};
 use self::matcher::{Evaluation, ResponseContext, eval_conditions};
 use crate::routing::{GeoAssets, GeoRequirements, GeoSourceSet};
 
@@ -382,7 +364,7 @@ impl DnsRouter {
         config: &DnsRouting,
         fixed_domain_ttl: &HashMap<String, u32>,
     ) -> anyhow::Result<Self> {
-        let request = resolve_request_routing(config);
+        let request = config.effective_request();
         let requirements = requirements(&request, &config.response);
         let sources = GeoSourceSet::load(&requirements);
         Self::build(
@@ -395,7 +377,7 @@ impl DnsRouter {
     }
 
     pub fn new_from_dns_config(dns_config: &DnsConfig) -> anyhow::Result<Self> {
-        let request = resolve_request_routing(&dns_config.routing);
+        let request = dns_config.routing.effective_request();
         let requirements = requirements(&request, &dns_config.routing.response);
         let sources = GeoSourceSet::load(&requirements);
         Self::build(
@@ -408,7 +390,7 @@ impl DnsRouter {
     }
 
     pub(crate) fn geo_requirements(dns_config: &DnsConfig) -> GeoRequirements {
-        let request = resolve_request_routing(&dns_config.routing);
+        let request = dns_config.routing.effective_request();
         requirements(&request, &dns_config.routing.response)
     }
 
@@ -416,7 +398,7 @@ impl DnsRouter {
         dns_config: &DnsConfig,
         geo_sources: &GeoSourceSet,
     ) -> anyhow::Result<Self> {
-        let request = resolve_request_routing(&dns_config.routing);
+        let request = dns_config.routing.effective_request();
         let requirements = requirements(&request, &dns_config.routing.response);
         Self::build(
             &request,

@@ -23,6 +23,8 @@ flowchart LR
 
 两个入口 adapter 使用同一个 `DnsController`、当前 `DnsServiceProvider`、forwarder、缓存、singleflight 集合、上游池与路由投影。adapter 从准入开始一直持有所有权，直至应答 I/O 完成；它不会直接写 domain route。
 
+[`honk-config/src/dns/validation.rs`](../../../crates/honk-config/src/dns/validation.rs) 负责命名上游引用校验，由启动、SIGHUP 和公开运行时重载入口的 `Config::validate` 调用。`DnsRouting` 的私有请求来源选择逻辑同时供校验和 `effective_request` 使用，既保留旧版字段的诊断路径，也避免在校验时分配转换后的规则。仅解析配置的接口不执行完整配置校验。
+
 ## 入口路径
 
 | 路径 | Socket 与目的地址模型 | 应答模型 |

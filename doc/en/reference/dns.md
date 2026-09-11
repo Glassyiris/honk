@@ -72,6 +72,10 @@ upstream {
 }
 ```
 
+Upstream declaration names preserve their spelling. Both request and response dae action parsers trim the token and apply Rust `to_lowercase()` before recognizing keywords or producing an upstream target; lookup then compares that lowercased target exactly with the preserved declaration name. Use lowercase declaration names (for example, `alidns`) so mixed-case dae actions resolve predictably. Legacy structured targets are not normalized and are matched verbatim.
+
+Whole-config validation checks every effective named request and response rule or fallback against the declarations. This check runs at startup and reload, while parse-only loading APIs accept unresolved names for callers that do not validate the whole configuration. The first explicit `upstream` block replaces the built-in `default`: retain a declaration named `default`, select a declared fallback, or use a terminal request fallback such as `reject` or `asis`. A catch-all request rule does not waive fallback validation.
+
 ### URI schemes and defaults
 
 | URI form | Runtime protocol | Default port / path |
@@ -145,15 +149,28 @@ A source-aware lookup made for an admitted flow carries no intercepted DNS-serve
 | Action | Result |
 | --- | --- |
 | `accept` | Return the current response. |
-| `reject` | Return an empty successful response. |
+| `reject` | Replace the current response with an empty successful response. |
 | Upstream name | Re-query through the named upstream, then evaluate response routing again. |
-| `fallback: accept\|reject` | Verdict used when no response rule matches; default is `accept`. |
+| `fallback: accept\|reject\|<upstream>` | Verdict or named upstream used when no response rule matches; default is `accept`. |
+
+NXDOMAIN and SERVFAIL bypass response routing and are returned directly, without applying response rules or fallback.
 
 A response traversal has a maximum re-query depth of three upstreams, including the initial upstream; a fourth exchange is rejected. Re-query cycles are also rejected.
 
 ### Legacy conversion
 
-The compatibility schema retains flat `routing.rules` entries with `domain` and `upstream`, plus a named `fallback`. When no new-style request rules exist, honk converts them to request rules at load time. `suffix:`, `keyword:`, `full:`, and `regex:` prefixes select the matcher; a bare legacy domain is an exact `full` match. The legacy fallback becomes the request fallback. These are structured compatibility fields, not additional current dae statements.
+The compatibility schema retains flat `routing.rules` entries with `domain` and `upstream`, plus a named `fallback`. These are structured compatibility fields, not additional current dae statements. `suffix:`, `keyword:`, `full:`, and `regex:` prefixes select the matcher; a bare legacy domain is an exact `full` match.
+
+Effective request selection follows this precedence:
+
+1. Nonempty new-style `request.rules` selects those rules and their fallback, ignoring all legacy fields.
+2. Otherwise, nonempty legacy `rules` are converted. Their verbatim legacy fallback wins even over a separately populated new-style fallback.
+3. Without either rule set, use the configured request routing. Only when its fallback is `Upstream("default")` does a legacy fallback other than `""`, `"upstream"`, or `"default"` replace it.
+
+The `"upstream"` sentinel is ignored only in the third branch; with legacy rules it is an ordinary named target requiring a declaration. Legacy targets are matched exactly, without dae action normalization.
+
+Validation diagnostics preserve original field paths: new-style rules and fallbacks use `dns.routing.request.rules[i].action` and `dns.routing.request.fallback`; converted legacy rules use `dns.routing.rules[i].upstream`; converted or promoted fallbacks use `dns.routing.fallback`.
+With active legacy rules, diagnostics distinguish an undeclared default `upstream` fallback from an empty fallback and list declared names in sorted order. Omitting the legacy fallback is equivalent to explicitly setting `upstream`; either remains valid when that upstream is declared. Empty and `upstream` sentinels remain ignored when no legacy rules are active.
 
 ## Address-family strategy
 

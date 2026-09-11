@@ -4,7 +4,7 @@
 
 ## 启用与鉴权
 
-仅当 `experimental.clash_api.external_controller` 非空，且 binary 包含默认启用的 `clash-api` feature 时，API server 才会启动。controller 接受 `host:port`；以 `:port` 开头时绑定 `0.0.0.0:port`。无效地址只会写日志，不会停止引擎。
+仅当 `experimental.clash_api.external_controller` 非空，且二进制文件包含默认启用的 `clash-api` 特性时，API 服务才会启动。控制器地址必须是 `127.0.0.1:9090` 或 `[::1]:9090` 这样的数字套接字地址，不能使用 DNS 主机名；`:port` 会绑定 `0.0.0.0:port`。无效地址只会写入日志，不会停止引擎。
 
 当 `experimental.clash_api.secret` 非空时，API 请求必须携带：
 
@@ -15,6 +15,8 @@ Authorization: Bearer <secret>
 WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会先对 token 做 percent-decode，再进行精确比较。query token 鉴权仅适用于 WebSocket upgrade；普通 HTTP 请求使用 Bearer header。`secret` 为空时关闭鉴权。`/ui` 静态目录位于 API 鉴权 layer 之外。
 
 **API 自身不提供 TLS。** 应将其绑定到 localhost，或在前方部署 TLS reverse proxy；当不可信客户端能够访问 listener 时，必须设置强 `secret`。
+
+随附的 `config.dae` 绑定 `127.0.0.1:9090`。非回环控制器地址配合空 `secret` 时，启动会发出警告，但仍允许监听；无论是否配置防火墙，通配地址和已分配的接口地址都适用。
 
 ## 端点表
 

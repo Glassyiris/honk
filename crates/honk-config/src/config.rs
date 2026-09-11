@@ -614,6 +614,8 @@ impl Config {
             .client_subnet_mode()
             .map_err(|error| crate::ConfigError::Validation(error.to_string()))?;
 
+        self.dns.validate_upstream_references()?;
+
         // A duration that fails to parse becomes zero, and a zero period makes
         // tokio::time::interval panic, taking the health-check loop down at startup.
         if self.global.check_interval_secs == 0 {
