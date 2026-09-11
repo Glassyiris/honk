@@ -251,7 +251,7 @@ impl ControlPlaneHandle {
                 })
                 .unwrap_or(false);
         if ebpf_offload {
-            info!(
+            debug!(
                 network = "tcp",
                 outbound = %outbound_name,
                 ip = %original_dst,
@@ -445,7 +445,7 @@ impl ControlPlaneHandle {
             self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
         }
 
-        info!(
+        debug!(
             network = "tcp",
             outbound = %outbound_name,
             dialer = %node.name,

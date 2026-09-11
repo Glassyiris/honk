@@ -222,7 +222,7 @@ impl ControlPlaneHandle {
                         self.push_sniffed_domain_bitmap(domain, original_dst.ip())
                             .await;
                     }
-                    info!(
+                    debug!(
                         network = "udp",
                         outbound = %outbound_name,
                         ip = %original_dst,
@@ -563,7 +563,7 @@ impl ControlPlaneHandle {
             self.stats.record_error(&outbound_name);
             return Err(error.into());
         }
-        info!(
+        debug!(
             network = "udp",
             outbound = %outbound_name,
             dialer = %node.name,
