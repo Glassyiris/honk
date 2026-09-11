@@ -55,6 +55,10 @@ impl DnsResolver {
     pub async fn resolve(&self, domain: &str) -> anyhow::Result<ResolvedAddr> {
         self.service.resolve_name(domain).await
     }
+    /// Resolve through configured DNS without a post-query bootstrap fallback.
+    pub async fn resolve_without_fallback(&self, domain: &str) -> anyhow::Result<ResolvedAddr> {
+        self.service.resolve_name_without_fallback(domain).await
+    }
 
     pub async fn resolve_for_source(
         &self,

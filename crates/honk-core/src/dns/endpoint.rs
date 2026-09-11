@@ -212,6 +212,10 @@ fn split_host_port(hostport: &str) -> anyhow::Result<(String, Option<u16>)> {
         return Ok((inside.to_string(), port));
     }
 
+    if hostport.parse::<IpAddr>().is_ok() {
+        return Ok((hostport.to_string(), None));
+    }
+
     // host:port — only split when suffix is numeric (so "dns.google" stays intact).
     if let Some((host, port_s)) = hostport.rsplit_once(':')
         && !host.is_empty()
