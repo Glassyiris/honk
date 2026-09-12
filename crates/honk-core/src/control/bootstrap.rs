@@ -63,6 +63,7 @@ impl ControlPlane {
         dns_upstream_pool: Arc<crate::dns::upstream_pool::UpstreamPool>,
         resource_budget: ResourceBudget,
     ) -> anyhow::Result<Self> {
+        config.validate_assembled()?;
         let (tx, rx) = mpsc::channel(256);
         let effective_log_file = crate::resolved_log_file_path(&config, None);
 

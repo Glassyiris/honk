@@ -70,7 +70,7 @@ The internal body-selector behavior is:
 | Legacy locations | Prefer an existing `/var/share/honk/.sub` (`LEGACY_DATA_DIR`), then an existing `./.sub` when the configured store is absent. Unusable legacy locations are skipped; a new preferred store is created only when no legacy candidate can be opened. A custom `data_dir` follows the same order. No store is moved or deleted automatically; migrate it explicitly when ready. |
 | Permissions | Directory mode `0700`; file mode `0600`. Symlink store directories are rejected. |
 | Filename | URL-safe Base64 of a SHA-256 hash over the length-delimited URL, configured user-agent override (empty when unset or empty), and ordered header key/value pairs, plus `.sub`. The versioned default request UA is intentionally not part of the key, so default subscriptions retain their cache across upgrades. The request identity is not exposed in plaintext. |
-| Write boundary | The raw response body is written only after HTTP success and successful parsing. A temporary file is synced, renamed atomically, and followed by a directory sync. |
+| Write boundary | After HTTP success and body acceptance, persist the complete raw response, including rejected entries. A temporary file is synced, renamed atomically, and followed by a directory sync. |
 | Redirects | At most 5 hops. A redirect from `https` to another scheme fails the fetch, as does one to a loopback, private, link-local, or unspecified literal address that the configured URL did not itself use. A hostname resolving to such an address is not detected. |
 | Body size | At most 8 MiB, enforced while reading rather than after the body is buffered. |
 
@@ -82,15 +82,21 @@ On SIGHUP, subscriptions with the same fetch identity (URL + configured `ua` + h
 
 Failure handling preserves a usable runtime rather than clearing it:
 
-- HTTP, parse, or no-usable-node failure publishes no replacement nodes and performs no write, so the active nodes and last valid stored body remain.
+- HTTP, invalid UTF-8 encoding, parse, or no-usable-node failure publishes no replacement nodes and performs no write, so the active nodes and last valid stored body remain. Accepted bodies are persisted byte-for-byte, without repairing encoding.
 - A persistence-write failure is non-fatal after parsing: the newly parsed nodes are still returned for publication, while the atomic path never installs a partially written body. The next restart can therefore restore whichever complete valid body remains on disk.
 - An unsupported or malformed node is skipped individually. The shared node builder's warning includes a one-based proxy index and a static rejection reason, never the raw record or its credentials. The whole body fails only when no usable nodes remain; an empty result never clears the previous generation.
+
+The last valid body is the last body accepted by the current import policy, not the last successfully published runtime generation. A partial body with one distinct usable node may replace the stored body; an all-invalid body cannot. Restore reparses with the current policy and may reject a body saved by an older version. Runtime collection or publication failure after a successful write retains the active generation but can leave the new body on disk. Disk and active state are not one transaction.
 
 Changing `global.store_subscribe` through SIGHUP is rejected as restart-required.
 
 ## Subscription body formats
 
-All accepted nodes receive the subscription ID. Duplicate derived node IDs retain the first occurrence, including a body that repeats one usable endpoint. Importing a full client profile extracts its nodes, not its DNS, routing, groups, or remote-provider configuration.
+All accepted nodes receive the subscription ID. Duplicate derived node IDs retain the first usable occurrence; rejected entries do not reserve an identity. Later duplicates report both original indices. Array indices are one-based before normalization; URI and record indices are physical lines, including blanks and comments. Decoded Base64 has a child source referring to its original body, not fabricated encoded-byte offsets. Importing a full client profile extracts its nodes, not its DNS, routing, groups, or remote-provider configuration.
+
+Normalized entries are admitted incrementally, without retaining a body-sized list of outcomes. Each body retains at most 128 nonterminal diagnostics, followed by one `subscription-diagnostics-truncated` summary with the omitted count; a terminal body failure is retained separately. The caller's existing diagnostic prefix is untouched and does not consume this budget. The limit applies to structured, URI, and record imports, including decoded Base64 and restored bodies, and never stops valid-node admission or changes first-usable duplicate selection.
+
+Clash, SIP008, and sing-box credential scalars preserve string bytes and convert native finite numbers to the source format's canonical decimal text. Missing or null values are absent; booleans, lists, maps, and nonfinite numbers reject the entry. A valid alias cannot hide an invalid supplied credential. Numeric UUIDs still fail UUID validation; empty passwords remain subject to each protocol's requirements.
 
 ### Share-link lists
 
@@ -120,10 +126,10 @@ Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vle
 | `password` | `password` | Optional string; VLESS applies the precedence below. |
 | `cipher` | `encryption` | Optional string; VLESS applies the precedence below. |
 | `plugin`, `plugin-opts` | — | Unsupported. An entry with either non-empty value is skipped before node publication; mapping-valued options are rejected too. |
-| `network` | `transport` | Optional transport string. |
+| `network` | `transport` or packet capability | Trojan/VMess/VLESS use a stream transport (`tcp`, `ws`, or `grpc`); AnyTLS uses packet capability. |
 | `tls` | `tls` | Optional boolean. Trojan, AnyTLS, Hysteria2, TUIC, and Juicity default to TLS and reject explicit disabling. |
-| `servername`, `sni` | `sni` | `servername` wins; `sni` is the fallback. |
-| `skip-cert-verify` | `skip_cert_verify` | Optional boolean. |
+| `servername`, `server-name`, `sni` | `sni` | Empty or whitespace-only names are absent; nonempty aliases must agree byte for byte. |
+| `skip-cert-verify`, `skip_cert_verify`, `insecure` | `skip_cert_verify` | Native booleans; supplied aliases must agree. |
 | `alpn` | `tls_alpn` | Ordered string list (or comma-separated string) for AnyTLS and ordinary raw-TCP Trojan/VMess/VLESS TLS; explicit values reach the TLS handshake in both `tls` and `utls` modes. QUIC retains the protocol-specific rules below. |
 
 #### Protocol-specific options
@@ -131,6 +137,8 @@ Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vle
 Hysteria2 imports `password`/`auth`, `obfs: salamander` with `obfs-password`, upload/download bandwidth, `ports`/`mport` hopping ranges, `hop-interval`/`mhop`, receive windows, MTU, and MTU-discovery settings. TUIC imports UUID/password, congestion control, ALPN, receive windows, and MTU. AnyTLS imports `idle-session-check-interval`, `idle-session-timeout`, and `min-idle-session`. Supported spelling aliases are normalized before node identity is derived.
 
 Explicit disabled feature blocks are treated as disabled, not as unsupported active features. `udp: true` is accepted for intrinsically UDP-capable protocols; an explicit UDP restriction is rejected where the node model cannot preserve it. TUIC permits an absent or empty password. Hysteria2 and Juicity accept an explicit `h3` ALPN matching their fixed runtime selection; Juicity receive windows remain fixed at 8 MiB, so non-default overrides are rejected.
+
+AnyTLS packet claims are resolved once in this order: `anytls-network`, applicable `network`, then `udp`. Empty or null network text supplies no claim. Network strings use comma-separated `tcp`/`udp` tokens; aliases are compared by UDP allowance, so `udp` and `tcp,udp` agree, while `tcp` with `udp: true` conflicts. Unknown tokens such as `quic` reject the entry even beside a valid alias. Equivalent claims retain the first explicit network spelling; only a boolean-only input synthesizes `tcp` or `tcp,udp`.
 
 TCP TLS ALPN list members are preserved verbatim, including order; each name must occupy 1–255 UTF-8 bytes and the length-prefixed list may not exceed 65,533 bytes. This is a syntactic ceiling; the complete ClientHello also has TLS-library size limits. Absent, null, or empty imported `alpn` lists preserve existing TLS-profile defaults and node IDs; the flat `tls_alpn` field accepts omission or a string array, not null. Nonempty overrides participate in identity and are rejected with disabled TLS, REALITY, WebSocket, or gRPC rather than silently discarded. Chrome ALPS is offered only when the actual ALPN list contains `h2`. Share-link ALPN compatibility is unchanged; this applies to structured subscription imports and the flat `tls_alpn` model field.
 
@@ -142,7 +150,7 @@ VLESS fields are applied before node identity is derived:
 | --- | --- |
 | `uuid`, then `password` | Credential; `uuid` wins and legacy `password` is the fallback. |
 | `encryption`, then `cipher` | VLESS Encryption; `encryption` wins. |
-| `flow` | Non-empty VLESS flow. |
+| `flow` | Empty or whitespace-only is absent; otherwise exactly `xtls-rprx-vision`. |
 | `network` | Transport. |
 | `reality-opts.public-key` | Enables the REALITY TLS carrier. It must be a non-empty string. |
 | `reality-opts.short-id` | Optional REALITY short ID. |
@@ -187,15 +195,29 @@ SIP008 version 1/2 wrappers (`{"servers":[...]}`) and bare server arrays import 
 
 sing-box profiles import supported entries from `outbounds`: Shadowsocks, SOCKS5, VMess, VLESS, Trojan, Hysteria2, TUIC, Juicity, and AnyTLS. Structural `selector`, `urltest`, `direct`, `block`, and `dns` entries are not proxy nodes. TLS/SNI, REALITY, WebSocket/gRPC, VLESS packet modes, and supported protocol tuning are normalized through the common node builder. VLESS defaults to XUDP only when no enabled multiplex/UoT wrapper, TCP-only restriction, or explicit packet encoding selects another behavior. Empty or omitted gRPC service names retain sing-box's empty service rather than honk's `GunService` default. Hysteria2 accepts `server_ports` without `server_port`, using the first hopping port as its nominal endpoint. Unsupported chaining, wire features, and authentication requirements are not silently dropped. Per-node uTLS fingerprint hints do not override honk's process-wide TLS settings.
 
+In sing-box input, `network` is packet capability, not a stream type; `transport.type` selects the stream. Unsupported stream names such as `h2` reject the entry rather than becoming raw TCP.
+
+Where the sing-box mapping supports packet restrictions, `network: udp` and `network: tcp,udp` permit UDP, while `network: tcp` disables it. These values do not introduce UDP-only TCP rejection. Existing VLESS packet-mode requirements and restrictions for protocols without a representable packet-network field still apply.
+
 Explicit sing-box native VLESS UDP (`packet_encoding: ""` without TCP-only or an enabled wrapper) is unsupported and skipped; enabled H2MUX owns the packet path even when the source also spells out `packet_encoding: "xudp"`.
 
 ### Surge, Surfboard, Loon, and Quantumult X
 
 The importer accepts named comma-separated records from Surge/Surfboard/Loon and `protocol=endpoint,...,tag=name` records from Quantumult X. Full profiles use `[Proxy]` or `[server_local]`; other sections are ignored. Quoted names/passwords may contain commas, equals signs, escaped quotes, and intentional edge spaces.
 
+Explicit credential and cipher aliases must agree before conversion. In named records, positional credentials are used only when the corresponding named claim is absent; a different positional value does not conflict with a valid explicit claim. Quantumult X has no positional fallback. Empty explicit credentials participate in alias comparison rather than selecting a fallback.
+
+Permitted optional record credentials retain empty strings and quoted whitespace byte for byte: SOCKS username/password, Hysteria2 authentication, and TUIC password. An explicit empty value still overrides a positional fallback; protocols requiring nonempty credentials continue to reject it.
+
+Record `transport`/`network` stream claims are compared before assignment, including repeated keys. Empty text and `tcp` have the same raw-TCP meaning; conflicting or unsupported stream claims reject the entry.
+
+AnyTLS record `network` occurrences are packet claims, not stream claims. Every repeated `network`, `udp`, and `udp-relay` value is validated before selection. Equivalent packet claims retain the first explicit network spelling; an invalid or conflicting occurrence rejects the record.
+
 Supported records map credentials, TLS/SNI, WebSocket/gRPC, REALITY, and implemented protocol options to the same node model. Quantumult X `obfs=wss` uses `obfs-host` for both WebSocket Host and the default TLS SNI; an explicit TLS hostname wins. SSR, unsupported plugins/obfuscation, and unsupported transports are skipped rather than imported as another protocol.
 
 Surge `server-cert-fingerprint-sha256` maps to honk's leaf-certificate pin: both replace standard X.509 verification. Independent `server-cert-verify-name`, client certificates, `sni=off`, and Shadow TLS are not representable and are rejected rather than discarded ([Surge TLS reference](https://manual.nssurge.com/policies/tls.html)).
+
+Record aliases `skip-cert-verify`, `allow-insecure`, and `insecure` are compared with the inverse of `tls-verification` before assignment. `tls-verification=false,insecure=true` agrees; `tls-verification=true,insecure=true` rejects the entry. Record text accepts `true/yes/1/on` and `false/no/0/off`, case-insensitively; empty text and `t/y/f/n` remain invalid. Certificate-pin restrictions still apply.
 
 Effective Quantumult X `tls-cert-sha256` and `tls-pubkey-sha256` pins are rejected: honk's leaf-certificate pin replaces PKI, and it is not substituted for an unverified foreign verification contract. With explicit `tls-verification=false`, QX ignores both pins and the import preserves that disabled verification. Effective QX REALITY ignores customized `tls-alpn` and session-ticket settings, as its [official configuration](https://github.com/crossutility/Quantumult-X/blob/master/sample.conf) specifies; ordinary TLS does not. Legacy VMess `aead=false`, active Shadowsocks UoT/SSR, unsupported TLS ALPN, and disabled TLS-session reuse are rejected rather than discarded.
 

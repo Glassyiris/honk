@@ -3,9 +3,13 @@ use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 
 mod protocol;
+mod validation;
 mod wire;
 
 pub use protocol::*;
+pub use validation::validate_node_collection;
+pub use wire::NodeSeed;
+pub(crate) use wire::RawNodeSeed;
 
 /// Deserialize a group-tag list from either an array (`["hk", "jp"]`) or a
 /// single delimited string (`"hk|jp"` / `"hk, jp"`). Entries themselves may
@@ -285,33 +289,6 @@ impl Node {
         self.outbound.network()
     }
 
-    pub fn validate_protocol(&self) -> Result<(), crate::ConfigError> {
-        if let Some(config) = self.vless() {
-            config.validate(&self.name)?;
-        }
-        let Some(tls) = self.tls() else {
-            return Ok(());
-        };
-        tls.validate_alpn()?;
-        if tls.alpn.is_empty() {
-            return Ok(());
-        }
-        let reality = tls.reality_public_key.is_some()
-            || tls.reality_short_id.is_some()
-            || tls.reality_spider_x.is_some();
-        let raw_tcp = self.anytls().is_some()
-            || self
-                .transport()
-                .is_some_and(|transport| matches!(transport.transport.as_str(), "" | "tcp"));
-        if !tls.enabled || reality || !raw_tcp {
-            return Err(crate::ConfigError::Validation(format!(
-                "Node '{}' sets TLS ALPN outside enabled non-REALITY raw TCP TLS",
-                self.name
-            )));
-        }
-        Ok(())
-    }
-
     pub(crate) fn identity_material(&self) -> String {
         format!(
             "{}|{}|{}|{}|{}",
@@ -407,7 +384,7 @@ pub struct Group {
     /// `None` means never stop. Zero means never stop.
     #[serde(default)]
     pub idle_timeout: Option<u64>,
-    /// Interrupt existing connections when the selected node changes.
+    /// Request tracking removal on selection changes; live relays are not cancelled.
     #[serde(default)]
     pub interrupt_connections: bool,
     #[serde(default = "chrono::Utc::now")]
@@ -564,42 +541,42 @@ mod tests {
             ),
             (
                 "vless-legacy",
-                "vless://uuid@example.com:443#legacy",
+                "vless://00000000-0000-0000-0000-000000000001@example.com:443#legacy",
                 "d47c73f3-910d-56b4-baa5-d230c76d788b",
             ),
             (
                 "vless-uot-v2",
-                "vless://uuid@example.com:443?vless_mode=uot-v2#uot-v2",
+                "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=uot-v2#uot-v2",
                 "372e7dc7-86a7-5d0d-accc-ba38fd103214",
             ),
             (
                 "vless-h2mux",
-                "vless://uuid@example.com:443?vless_mode=h2mux#h2mux",
+                "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=h2mux#h2mux",
                 "258ef463-002a-5fdf-8901-a1c8508ff988",
             ),
             (
                 "vless-h2mux-padded",
-                "vless://uuid@example.com:443?vless_mode=h2mux-padded#h2mux-padded",
+                "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=h2mux-padded#h2mux-padded",
                 "7f5ed150-4f89-54e1-b157-4d123d7fbc52",
             ),
             (
                 "vless-xudp",
-                "vless://uuid@example.com:443?vless_mode=xudp#xudp",
+                "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=xudp#xudp",
                 "85e3e4ce-e4e7-546b-93d5-e1d8a0742f4b",
             ),
             (
                 "vless-mux-cool",
-                "vless://uuid@example.com:443?vless_mode=mux-cool#mux-cool",
+                "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=mux-cool#mux-cool",
                 "4133852f-b86f-5a8f-b8fb-b335023645fe",
             ),
             (
                 "vless-encrypted",
-                "vless://b@example.com:443?encryption=a#encrypted",
+                "vless://00000000-0000-0000-0000-000000000001@example.com:443#encrypted",
                 "9add2074-63e8-5b29-ba6b-26ed937d2464",
             ),
             (
                 "vless-populated-dial",
-                "vless://uuid@example.com:443?security=reality&type=ws&sni=cdn.example.com&path=%2Fp&host=ws.example.com&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=abcd&spx=%2Fprobe#populated",
+                "vless://00000000-0000-0000-0000-000000000001@example.com:443?security=reality&type=ws&sni=cdn.example.com&path=%2Fp&host=ws.example.com&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=abcd&spx=%2Fprobe#populated",
                 "529c3f31-3295-54f2-86e5-15cfc43f1a39",
             ),
             (
@@ -609,12 +586,12 @@ mod tests {
             ),
             (
                 "tuic",
-                "tuic://uuid:pass@example.com:443#tuic",
+                "tuic://00000000-0000-0000-0000-000000000001:pass@example.com:443#tuic",
                 "e8751061-7db8-5d0d-b2e9-04af9ce55d02",
             ),
             (
                 "juicity",
-                "juicity://uuid:pass@example.com:443#juicity",
+                "juicity://00000000-0000-0000-0000-000000000001:pass@example.com:443#juicity",
                 "26d8181d-9c09-580d-86bc-1bdc22f1d113",
             ),
             (
@@ -625,36 +602,70 @@ mod tests {
         ];
 
         for (name, link, expected) in cases {
-            let node = Node::from_share_link(link).unwrap();
-            assert_eq!(node.id.to_string(), expected, "{name}");
+            let mut node = Node::from_share_link(link).unwrap();
+            // Admission changed; the historical identity material and hashes did not.
+            match &mut node.outbound {
+                OutboundConfig::Vless(config) if name == "vless-encrypted" => {
+                    config.uuid = Some("b".into());
+                    config.encryption = Some("a".into());
+                }
+                OutboundConfig::Vless(config) => config.uuid = Some("uuid".into()),
+                OutboundConfig::Tuic(config) => config.uuid = Some("uuid".into()),
+                OutboundConfig::Juicity(config) => config.uuid = Some("uuid".into()),
+                _ => {}
+            }
+            assert_eq!(node.derive_id().to_string(), expected, "{name}");
         }
     }
 
     #[test]
     fn test_identity_credential_split() {
-        for [left, right] in ["socks5", "ss", "tuic", "juicity"].map(|p| {
-            ["a%7Cb:c", "a:b%7Cc"].map(|c| Node::from_share_link(&format!("{p}://{c}@h")).unwrap())
-        }) {
-            assert_ne!(left.id, right.id);
+        for p in ["socks5", "ss", "tuic", "juicity"] {
+            let base =
+                Node::from_share_link(&format!("{p}://00000000-0000-0000-0000-000000000001:c@h"))
+                    .unwrap();
+            let [left, right] = [("a|b", "c"), ("a", "b|c")].map(|(first, second)| {
+                let mut node = base.clone();
+                let (credential, password) = match &mut node.outbound {
+                    OutboundConfig::Socks5(config) => (&mut config.username, &mut config.password),
+                    OutboundConfig::Shadowsocks(config) => {
+                        (&mut config.encryption, &mut config.password)
+                    }
+                    OutboundConfig::Tuic(config) => (&mut config.uuid, &mut config.password),
+                    OutboundConfig::Juicity(config) => (&mut config.uuid, &mut config.password),
+                    _ => unreachable!(),
+                };
+                *credential = Some(first.into());
+                *password = Some(second.into());
+                node.derive_id()
+            });
+            assert_ne!(left, right);
         }
     }
 
     #[test]
     fn test_identity_vless_credential_arity() {
-        let left = Node::from_share_link("vless://b@example.com:443?encryption=a").unwrap();
-        let right = Node::from_share_link("vless://a%7Cb@example.com:443").unwrap();
-        assert_ne!(left.id, right.id);
+        let mut left =
+            Node::from_share_link("vless://00000000-0000-0000-0000-000000000001@example.com:443")
+                .unwrap();
+        let mut right = left.clone();
+        left.vless_mut().unwrap().uuid = Some("b".into());
+        left.vless_mut().unwrap().encryption = Some("a".into());
+        right.vless_mut().unwrap().uuid = Some("a|b".into());
+        assert_ne!(left.derive_id(), right.derive_id());
     }
 
     #[test]
     fn test_identity_dial_shape_split() {
-        let left =
-            Node::from_share_link("vless://uuid@example.com:443?type=ws&sni=a%7Cws&path=%2Fp")
+        let mut left =
+            Node::from_share_link("vless://00000000-0000-0000-0000-000000000001@example.com:443?type=ws&sni=a%7Cws&path=%2Fp")
                 .unwrap();
-        let right =
-            Node::from_share_link("vless://uuid@example.com:443?type=ws&sni=a&path=ws%7C%2Fp")
+        let mut right =
+            Node::from_share_link("vless://00000000-0000-0000-0000-000000000001@example.com:443?type=ws&sni=a&path=ws%7C%2Fp")
                 .unwrap();
-        assert_ne!(left.id, right.id);
+        left.vless_mut().unwrap().uuid = Some("uuid".into());
+        right.vless_mut().unwrap().uuid = Some("uuid".into());
+        assert_ne!(left.derive_id(), right.derive_id());
     }
 
     #[test]
@@ -668,19 +679,18 @@ mod tests {
 
     #[test]
     fn test_identity_vless_layout_control() {
-        let encrypted =
-            Node::from_share_link("vless://b@example.com:443?encryption=a&sni=tcp").unwrap();
-        let xudp =
-            Node::from_share_link("vless://a@example.com:443?vless_mode=xudp&sni=b").unwrap();
-        for node in [&encrypted, &xudp] {
-            crate::Config {
-                nodes: vec![node.clone()],
-                ..Default::default()
-            }
-            .validate()
-            .unwrap();
-        }
-        assert_ne!(encrypted.id, xudp.id);
+        let mut encrypted = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?sni=tcp",
+        )
+        .unwrap();
+        let mut xudp = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=xudp&sni=b",
+        )
+        .unwrap();
+        encrypted.vless_mut().unwrap().uuid = Some("b".into());
+        encrypted.vless_mut().unwrap().encryption = Some("a".into());
+        xudp.vless_mut().unwrap().uuid = Some("a".into());
+        assert_ne!(encrypted.derive_id(), xudp.derive_id());
     }
 
     #[test]
@@ -692,18 +702,26 @@ mod tests {
 
     #[test]
     fn test_vless_mode_identity() {
-        let legacy = Node::from_share_link("vless://uuid@example.com:443#legacy").unwrap();
-        let explicit_legacy =
-            Node::from_share_link("vless://uuid@example.com:443?vless_mode=legacy#explicit")
+        let mut legacy = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443#legacy",
+        )
+        .unwrap();
+        let mut explicit_legacy =
+            Node::from_share_link("vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=legacy#explicit")
                 .unwrap();
+        legacy.vless_mut().unwrap().uuid = Some("uuid".into());
+        legacy.id = legacy.derive_id();
+        explicit_legacy.vless_mut().unwrap().uuid = Some("uuid".into());
+        explicit_legacy.id = explicit_legacy.derive_id();
         assert_eq!(legacy.id, explicit_legacy.id);
 
         let ids = ["uot-v2", "h2mux", "h2mux-padded", "xudp", "mux-cool"].map(|mode| {
-            Node::from_share_link(&format!(
-                "vless://uuid@example.com:443?vless_mode={mode}#{mode}"
+            let mut node = Node::from_share_link(&format!(
+                "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode={mode}#{mode}"
             ))
-            .unwrap()
-            .id
+            .unwrap();
+            node.vless_mut().unwrap().uuid = Some("uuid".into());
+            node.derive_id()
         });
         assert!(ids.iter().all(|id| *id != legacy.id));
         assert_eq!(
@@ -817,7 +835,7 @@ mod tests {
         wrapped.tls_mut().unwrap().alpn = vec!["h2".into()];
 
         let mut reality =
-            Node::from_share_link("vless://uuid@example.com:443?security=reality&pbk=public-key")
+            Node::from_share_link("vless://00000000-0000-0000-0000-000000000001@example.com:443?security=reality&pbk=public-key")
                 .unwrap();
         reality.tls_mut().unwrap().alpn = vec!["h2".into()];
 
@@ -827,5 +845,41 @@ mod tests {
         for node in [disabled, wrapped, reality, quic] {
             assert!(node.validate_protocol().is_err(), "{}", node.name);
         }
+    }
+
+    #[test]
+    fn test_validate_redacts_anytls_alpn_context_name() {
+        let mut node = Node::from_share_link("anytls://secret@example.com:443#anytls").unwrap();
+        assert!(node.validate().is_ok());
+
+        const CANARY: &str = "node-name-canary-anytls";
+        node.name = CANARY.into();
+        let tls = node.tls_mut().unwrap();
+        tls.enabled = false;
+        tls.alpn = vec!["h2".into()];
+
+        let error = node.validate().unwrap_err();
+        let rendered = format!("{error} {error:?}");
+        assert!(!rendered.contains(CANARY), "{rendered}");
+    }
+
+    #[test]
+    fn test_validate_redacts_vless_mode_context_name() {
+        let mut node = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443#vless",
+        )
+        .unwrap();
+        assert!(node.validate().is_ok());
+
+        const CANARY: &str = "node-name-canary-vless";
+        node.name = CANARY.into();
+        let vless = node.vless_mut().unwrap();
+        vless.mode = WireMode::UotV2;
+        vless.flow = Some("xtls-rprx-vision".into());
+        vless.tls.enabled = true;
+
+        let error = node.validate().unwrap_err();
+        let rendered = format!("{error} {error:?}");
+        assert!(!rendered.contains(CANARY), "{rendered}");
     }
 }

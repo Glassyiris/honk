@@ -264,35 +264,6 @@ impl HopState {
     }
 }
 
-/// Parse an `mport` list (`20000-30000` / `8080,8888-8890`) into ports.
-pub(super) fn parse_port_hopping(spec: &str) -> Option<Vec<u16>> {
-    let mut ports = Vec::new();
-    for part in spec.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        match part.split_once('-') {
-            Some((lo, hi)) => {
-                let lo: u16 = lo.trim().parse().ok()?;
-                let hi: u16 = hi.trim().parse().ok()?;
-                if lo == 0 || hi < lo {
-                    return None;
-                }
-                ports.extend(lo..=hi);
-            }
-            None => {
-                let port: u16 = part.parse().ok()?;
-                if port == 0 {
-                    return None;
-                }
-                ports.push(port);
-            }
-        }
-    }
-    (!ports.is_empty()).then_some(ports)
-}
-
 #[derive(Debug)]
 pub(super) struct Hy2UdpPoller {
     socket: Arc<tokio::net::UdpSocket>,

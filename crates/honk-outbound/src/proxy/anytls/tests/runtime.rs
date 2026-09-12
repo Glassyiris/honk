@@ -3,13 +3,7 @@ use super::*;
 
 #[tokio::test]
 async fn runtime_udp_pool_hit_does_not_build_connector() {
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "runtime-udp-hit".into(),
-        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
-        address: "127.0.0.1:9".into(),
-        ..Default::default()
-    };
+    let node = anytls_node("runtime-udp-hit");
     let generation = Arc::new(
         crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
     );
@@ -48,13 +42,7 @@ async fn runtime_udp_pool_hit_does_not_build_connector() {
 /// session and its connection.
 #[tokio::test]
 async fn ephemeral_guard_releases_session_when_probe_is_aborted() {
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "guard-abort".into(),
-        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
-        address: "127.0.0.1:9".into(),
-        ..Default::default()
-    };
+    let node = anytls_node("guard-abort");
     let (session, mut server) = establish_test_session("guard-abort").await;
     expect_handshake(&mut server).await;
     let probe_session = Arc::clone(&session);
@@ -84,13 +72,7 @@ async fn ephemeral_guard_releases_session_when_probe_is_aborted() {
 
 #[tokio::test]
 async fn ephemeral_runtime_close_releases_session_and_connection() {
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "ephemeral-probe".into(),
-        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
-        address: "127.0.0.1:9".into(),
-        ..Default::default()
-    };
+    let node = anytls_node("ephemeral-probe");
     let runtime = crate::runtime::NodeRuntime::ephemeral(&node);
     assert!(runtime.is_ephemeral());
     let pool = match &runtime.runtime {
@@ -131,13 +113,7 @@ async fn ephemeral_runtime_close_releases_session_and_connection() {
 
 #[tokio::test]
 async fn warm_resources_flip_with_pool_session() {
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "warm-resources".into(),
-        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
-        address: "127.0.0.1:9".into(),
-        ..Default::default()
-    };
+    let node = anytls_node("warm-resources");
     let generation =
         crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
     let runtime = generation.get(&node.id).unwrap();
@@ -162,13 +138,7 @@ async fn warm_resources_flip_with_pool_session() {
 
 #[tokio::test]
 async fn runtime_dial_stays_on_captured_pool_after_registry_swap() {
-    let old_node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "generation-node".into(),
-        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
-        address: "127.0.0.1:9".into(),
-        ..Default::default()
-    };
+    let old_node = anytls_node("generation-node");
     let old_generation = Arc::new(
         crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&old_node)).unwrap(),
     );
@@ -184,8 +154,12 @@ async fn runtime_dial_stays_on_captured_pool_after_registry_swap() {
 
     let mut replacement_node = old_node.clone();
     replacement_node.address = "127.0.0.1:10".into();
-    let replacement = crate::runtime::OutboundRuntimeRegistry::build(&[replacement_node]).unwrap();
-    let replacement_pool = match &replacement.get(&old_node.id).unwrap().runtime {
+    replacement_node.host = "127.0.0.1".into();
+    replacement_node.port = 10;
+    replacement_node.id = replacement_node.derive_id();
+    let replacement =
+        crate::runtime::OutboundRuntimeRegistry::build(&[replacement_node.clone()]).unwrap();
+    let replacement_pool = match &replacement.get(&replacement_node.id).unwrap().runtime {
         crate::runtime::ProtocolRuntime::AnyTls(runtime) => Arc::clone(&runtime.pool),
         _ => panic!("expected AnyTLS runtime"),
     };
@@ -212,12 +186,7 @@ async fn runtime_dial_stays_on_captured_pool_after_registry_swap() {
 
 #[tokio::test(start_paused = true)]
 async fn runtime_retirement_drains_live_session_without_cutting_it() {
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "retiring-anytls".into(),
-        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
-        ..Default::default()
-    };
+    let node = anytls_node("retiring-anytls");
     let generation =
         crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
     let pool = match &generation.get(&node.id).unwrap().runtime {
@@ -455,6 +424,7 @@ async fn late_predecessor_commit_obeys_successor_dial_limit() {
     node.host = address.ip().to_string();
     node.port = address.port();
     node.anytls_mut().unwrap().min_idle_session = Some(2);
+    node.id = node.derive_id();
     let first = Arc::new(
         crate::runtime::OutboundRuntimeRegistry::build_reusing(
             std::slice::from_ref(&node),

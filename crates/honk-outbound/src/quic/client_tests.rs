@@ -483,11 +483,24 @@ impl crate::runtime::QuicRuntimeClient for ProbeClient {
     }
 }
 
-fn tuic_ephemeral() -> Arc<crate::runtime::NodeRuntime> {
-    crate::runtime::NodeRuntime::ephemeral(&honk_config::node::Node {
-        outbound: honk_config::node::OutboundConfig::Tuic(Default::default()),
+fn tuic_test_node() -> honk_config::node::Node {
+    let mut node = honk_config::node::Node {
+        name: "tuic-ephemeral".into(),
+        address: "127.0.0.1:443".into(),
+        host: "127.0.0.1".into(),
+        port: 443,
+        outbound: honk_config::node::OutboundConfig::Tuic(honk_config::node::TuicConfig {
+            uuid: Some("00000000-0000-4000-8000-000000000001".into()),
+            ..Default::default()
+        }),
         ..Default::default()
-    })
+    };
+    node.id = node.derive_id();
+    node
+}
+
+fn tuic_ephemeral() -> Arc<crate::runtime::NodeRuntime> {
+    crate::runtime::NodeRuntime::ephemeral(&tuic_test_node())
 }
 
 async fn probe_client(
@@ -542,10 +555,7 @@ async fn ephemeral_guard_releases_quic_client_when_probe_is_aborted() {
     spawn_accept_loop(endpoint);
     let (conn_tx, conn_rx) = tokio::sync::oneshot::channel();
     let probe = tokio::spawn(async move {
-        let guard = NodeRuntime::ephemeral_guarded(&honk_config::node::Node {
-            outbound: honk_config::node::OutboundConfig::Tuic(Default::default()),
-            ..Default::default()
-        });
+        let guard = NodeRuntime::ephemeral_guarded(&tuic_test_node());
         let runtime = guard.runtime();
         let (_client, conn) = probe_client(&runtime, addr.port()).await;
         let _ = conn_tx.send(conn);

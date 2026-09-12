@@ -31,7 +31,7 @@ facade 与内部实现按职责拆分：
 
 | 策略 | 运行时行为 |
 | --- | --- |
-| Selector | TCP 与 UDP 都不依赖健康状态，依次解析运行时选择、`default` 和声明顺序中的第一个成员；只有缺失或不再属于该组的 tag 才继续向后查找。该成员没有合格候选时，除上述同一叶节点的 TCP 最后尝试外，计划为空；调用方仍可执行显式配置的 `final`。Clash API 修改运行时选择。`PersistCallback` 把有效写入持久化到 `cache.db`；启用 `interrupt_connections` 时，`InterruptCallback` 关闭该组已跟踪的连接。 |
+| Selector | TCP 与 UDP 都不依赖健康状态，依次解析运行时选择、`default` 和声明顺序中的第一个成员；只有缺失或不再属于该组的 tag 才继续向后查找。该成员没有合格候选时，除上述同一叶节点的 TCP 最后尝试外，计划为空；调用方仍可执行显式配置的 `final`。Clash API 修改运行时选择。`PersistCallback` 把有效写入持久化到 `cache.db`；启用 `interrupt_connections` 时，`InterruptCallback` 只移除跟踪记录，不会取消正在运行的转发任务。配置诊断会对此限制发出警告。 |
 | URLTest | 选择最小减半递推移动平均，分别保存 TCP 与 UDP 选择，应用 tolerance 滞后，并在拨号和选择查询时惰性重算。真实选择变化可以调用 `InterruptCallback`。 |
 | LoadBalance | 按声明顺序轮询合格成员。每个组分别为 TCP 和 UDP 持有独立 `AtomicUsize` 游标。轮转从不调用 `InterruptCallback`。 |
 | Fallback | 分别为 TCP 和 UDP 固定声明顺序中的第一个合格成员。该成员死亡前保持固定；更靠前的成员恢复不会触发 failback。 |

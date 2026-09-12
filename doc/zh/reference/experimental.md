@@ -28,6 +28,8 @@
 
 `secret` 非空时，API 请求使用 `Authorization: Bearer <secret>`；WebSocket upgrade 也可以改用 `?token=<secret>`。静态 `/ui` 内容不经过这层鉴权 middleware。内置 listener 只提供明文 HTTP，不提供 TLS。应绑定到 `127.0.0.1` 等 loopback 地址，或在前面部署带鉴权的 TLS reverse proxy；不得直接暴露到不受信任的网络。endpoint 清单见 [Clash API 参考](./api.md)。
 
+显式启用非回环地址监听且 secret 为空时，会在 `experimental.clash_api.external_controller` 产生 `unsafe-api-bind`，结构化输入也不例外。诊断不包含端点或 secret。使用回环地址的示例配置不产生该警告；此警告不会改变监听、鉴权或 CORS 规则。
+
 ### 外部 UI
 
 绝对 `external_ui` 路径按原值使用。相对路径首先选择 `global.data_dir` 下的已有目录，其次选择 `/var/share/honk` 下的已有目录，再选择相对当前工作目录的已有目录；都不存在时，honk 在 `global.data_dir` 下创建目标目录。目标缺失或为空时，会在后台下载 dashboard ZIP。非空 `external_ui_download_url` 会替换内建 zashboard URL；`HONK_UI_DOWNLOAD_URL` 的优先级高于两者。
@@ -43,7 +45,7 @@
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
 | `enabled` | `false` | 打开 SQLite 缓存并启用运行时状态持久化。 |
-| `path` | `"cache.db"` | 数据库路径。绝对路径按原值使用。对相对路径，依次优先使用 `global.data_dir` 下、`/var/share/honk` 下和相对原配置目录的已有文件；新文件创建在 `global.data_dir` 下。 |
+| `path` | `"cache.db"` | 数据库路径。对相对路径，依次优先使用 `global.data_dir` 下、`/var/share/honk` 下和相对原配置目录的已有文件；新文件创建在 `global.data_dir` 下。 |
 | `cache_id` | `""` | 所有数据库 key 的 namespace。非空值给 key 加上 `<cache_id>:` 前缀。 |
 | `store_fakeip` | `false` | 仅表示 FakeIP 持久化意图。已有 `fakeip:` 前缀和 flush API，但引擎尚不写入或恢复映射。 |
 | `store_dns` | `false` | 使用 exact-key v2 格式持久化并恢复 DNS 缓存应答。 |

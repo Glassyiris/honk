@@ -11,6 +11,27 @@ use crate::types::DnsProtocol;
 
 mod validation;
 
+/// A canonical network plus the information needed for an admission warning.
+pub struct DecodedNetwork {
+    pub network: ipnet::IpNet,
+    pub truncated: bool,
+}
+
+/// Decode a CIDR or bare IPv4/IPv6 host without allocating or resolving names.
+pub fn decode_ip_or_cidr(value: &str) -> Option<DecodedNetwork> {
+    let value = value.trim();
+    let network: ipnet::IpNet = if value.contains('/') {
+        value.parse().ok()?
+    } else {
+        value.parse::<IpAddr>().ok()?.into()
+    };
+    let canonical = network.trunc();
+    Some(DecodedNetwork {
+        network: canonical,
+        truncated: canonical != network,
+    })
+}
+
 /// Transports served by a standalone DNS bind endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnsBindTransport {

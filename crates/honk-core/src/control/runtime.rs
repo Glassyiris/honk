@@ -251,9 +251,16 @@ impl ControlPlane {
                 result,
             } => {
                 info!("SIGHUP reload request {request_id} started");
-                let applied = self
+                let applied = match self
                     .apply_sighup_config(*config, drain, subscription_authorizations)
-                    .await;
+                    .await
+                {
+                    Ok(applied) => applied,
+                    Err(error) => {
+                        crate::report_runtime_admission_error(&error);
+                        false
+                    }
+                };
                 let committed = if applied {
                     info!("SIGHUP reload request {request_id} applied");
                     let config = self.config.read().await;
@@ -270,15 +277,10 @@ impl ControlPlane {
             ControlCommand::MergeSubscription {
                 subscription_id,
                 revision,
-                name,
                 nodes,
             } => {
-                info!(
-                    "Merging {} node(s) from subscription '{}'",
-                    nodes.len(),
-                    name
-                );
-                let _ = self
+                info!(nodes = nodes.len(), "Publishing accepted subscription body");
+                match self
                     .merge_authorized_subscription_nodes_with_drain(
                         subscription_id,
                         revision,
@@ -286,7 +288,12 @@ impl ControlPlane {
                         nodes,
                         drain,
                     )
-                    .await;
+                    .await
+                {
+                    Ok(true) => info!("Subscription runtime publication applied"),
+                    Ok(false) => warn!("Subscription runtime publication rejected"),
+                    Err(error) => crate::report_runtime_admission_error(&error),
+                }
             }
             ControlCommand::NetworkChanged => {
                 let _reload = self.reload_lock.lock().await;
@@ -309,8 +316,16 @@ impl ControlPlane {
                             routing_changed,
                             client_subnet_changed, "refreshing runtime after network change"
                         );
-                        self.apply_resolved_runtime_config_locked(new_config, drain)
+                        match self
+                            .apply_resolved_runtime_config_locked(new_config, drain)
                             .await
+                        {
+                            Ok(applied) => applied,
+                            Err(error) => {
+                                crate::report_runtime_admission_error(&error);
+                                false
+                            }
+                        }
                     }
                     None => true,
                 };

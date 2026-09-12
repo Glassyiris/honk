@@ -1,14 +1,16 @@
 use super::{
-    Block, extract_fn_args, find_unquoted, normalize_geosite_code, split_unquoted, strip_tag_arg,
+    Block, ParserDiagnostics, extract_fn_args, find_unquoted, normalize_geosite_code,
+    split_unquoted, strip_tag_arg,
 };
 use crate::routing::RoutingConfig;
 
 fn split_routing_statements<'a>(
     lines: impl IntoIterator<Item = &'a str>,
-) -> Result<Vec<String>, crate::ConfigError> {
+) -> Result<Vec<(String, &'a str)>, crate::ConfigError> {
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut parenthesis_depth = 0usize;
+    let mut first_line = None;
 
     for (line_index, line) in lines.into_iter().enumerate() {
         let mut chunk = String::new();
@@ -61,6 +63,7 @@ fn split_routing_statements<'a>(
 
         let chunk = chunk.trim();
         if !chunk.is_empty() {
+            first_line.get_or_insert(line);
             if !current.is_empty() && !chunk.starts_with([')', ',']) {
                 current.push(' ');
             }
@@ -68,7 +71,7 @@ fn split_routing_statements<'a>(
         }
 
         if parenthesis_depth == 0 && !current.is_empty() {
-            statements.push(std::mem::take(&mut current));
+            statements.push((std::mem::take(&mut current), first_line.take().unwrap()));
         }
     }
 
@@ -92,8 +95,10 @@ fn parse_default_outbound(statement: &str) -> Option<String> {
 fn parse_routing_rule(
     statement: String,
     index: usize,
-) -> Option<(crate::routing::RoutingRule, Option<String>)> {
-    let arrow = find_unquoted(&statement, "->")?;
+) -> Result<Option<(crate::routing::RoutingRule, Option<String>)>, crate::ConfigError> {
+    let Some(arrow) = find_unquoted(&statement, "->") else {
+        return Ok(None);
+    };
     let (left, right) = (&statement[..arrow], &statement[arrow + 2..]);
     let left = left.trim();
     let right = right.trim();
@@ -101,7 +106,7 @@ fn parse_routing_rule(
         || (right.to_owned(), false),
         |name| (name.trim().to_owned(), true),
     );
-    let condition = parse_route_condition(left);
+    let condition = parse_route_condition(left)?;
     let is_complex =
         must || find_unquoted(left, "&&").is_some() || condition.needs_complex_display();
     let rule = crate::routing::RoutingRule {
@@ -113,35 +118,42 @@ fn parse_routing_rule(
         mark: 0,
     };
 
-    Some((rule, is_complex.then_some(statement)))
+    Ok(Some((rule, is_complex.then_some(statement))))
 }
 
-pub(super) fn parse_section(section: &Block) -> Result<RoutingConfig, crate::ConfigError> {
-    split_routing_statements(section.lines_except(&[])).map(|statements| {
-        statements
-            .into_iter()
-            .fold(RoutingConfig::default(), |mut config, statement| {
-                if let Some(outbound) = parse_default_outbound(&statement) {
-                    config.default_outbound = outbound;
-                } else if let Some((rule, complex_source)) =
-                    parse_routing_rule(statement, config.rules.len())
-                {
-                    if let Some(source) = complex_source {
-                        config.record_complex_rule_source(rule.name.clone(), source);
-                    }
-                    config.rules.push(rule);
-                }
-                config
-            })
-    })
+pub(super) fn parse_section(
+    section: &Block,
+    diagnostics: &mut ParserDiagnostics<'_>,
+) -> Result<RoutingConfig, crate::ConfigError> {
+    let mut config = RoutingConfig::default();
+    for (index, (statement, line)) in split_routing_statements(section.lines_except(&[]))?
+        .into_iter()
+        .enumerate()
+    {
+        diagnostics.entry(line, index + 1);
+        if let Some(outbound) = parse_default_outbound(&statement) {
+            config.default_outbound = outbound;
+        } else if let Some((rule, complex_source)) =
+            parse_routing_rule(statement, config.rules.len())?
+        {
+            if let Some(source) = complex_source {
+                config.record_complex_rule_source(rule.name.clone(), source);
+            }
+            config.rules.push(rule);
+        }
+    }
+    Ok(config)
 }
 
-fn parse_route_matcher(condition: &mut crate::routing::RoutingCondition, matcher: &str) {
+fn parse_route_matcher(
+    condition: &mut crate::routing::RoutingCondition,
+    matcher: &str,
+) -> Result<(), crate::ConfigError> {
     let (negated, matcher) = matcher
         .strip_prefix('!')
         .map_or((false, matcher), |rest| (true, rest.trim()));
     if matcher.is_empty() {
-        return;
+        return Ok(());
     }
 
     let mut target = if negated {
@@ -183,20 +195,25 @@ fn parse_route_matcher(condition: &mut crate::routing::RoutingCondition, matcher
         target.domain.push(value);
     } else if let Some(value) = strip_tag_arg(matcher, "regex:") {
         target.domain_regex.push(value);
+    } else {
+        return Err(crate::ConfigError::Parse(
+            "unknown traffic predicate".into(),
+        ));
     }
+    Ok(())
 }
 
-fn parse_route_condition(expr: &str) -> crate::routing::RoutingCondition {
-    split_unquoted(expr, "&&")
+fn parse_route_condition(
+    expr: &str,
+) -> Result<crate::routing::RoutingCondition, crate::ConfigError> {
+    let mut condition = crate::routing::RoutingCondition::default();
+    for matcher in split_unquoted(expr, "&&")
         .map(str::trim)
         .filter(|part| !part.is_empty())
-        .fold(
-            crate::routing::RoutingCondition::default(),
-            |mut condition, matcher| {
-                parse_route_matcher(&mut condition, matcher);
-                condition
-            },
-        )
+    {
+        parse_route_matcher(&mut condition, matcher)?;
+    }
+    Ok(condition)
 }
 
 /// Dispatch `domain(...)` arguments to the correct condition fields.

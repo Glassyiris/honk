@@ -43,14 +43,7 @@ fn silent_dns_resolver(address: SocketAddr) -> DnsResolver {
 }
 
 fn direct_node() -> Node {
-    let mut node = Node {
-        name: "direct-test".into(),
-        host: "127.0.0.1".into(),
-        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Direct),
-        ..Default::default()
-    };
-    node.id = node.derive_id();
-    node
+    honk_config::Config::builtin_direct_node()
 }
 
 #[tokio::test]
@@ -129,7 +122,7 @@ fn dns_probe_query_has_full_header_and_google_a_question() {
 }
 
 fn vless_node() -> Node {
-    Node {
+    let mut node = Node {
         name: "vless-test".into(),
         address: "192.0.2.1:443".into(),
         host: "192.0.2.1".into(),
@@ -143,7 +136,9 @@ fn vless_node() -> Node {
             ..Default::default()
         }),
         ..Default::default()
-    }
+    };
+    node.id = node.derive_id();
+    node
 }
 
 #[test]
@@ -333,6 +328,7 @@ fn rendered_failures_exclude_connection_identifiers() {
         (ProbeFailureKind::Timeout, "FAIL(timeout)"),
         (ProbeFailureKind::Exchange, "FAIL(exchange)"),
         (ProbeFailureKind::Handler, "FAIL(handler)"),
+        (ProbeFailureKind::Admission, "FAIL(admission)"),
     ] {
         assert_eq!(render_probe_result(&Some(Err(kind)), "n/a"), expected);
     }

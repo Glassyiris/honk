@@ -3,19 +3,138 @@ use honk_config::types::NodeProtocol;
 use std::sync::atomic::AtomicUsize;
 
 fn node(name: &str, protocol: NodeProtocol) -> Node {
-    Node {
-        id: uuid::Uuid::new_v4(),
-        name: name.to_string(),
-        address: "1.2.3.4:443".to_string(),
-        outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
-        ..Default::default()
+    let host = format!("{name}.example");
+    let mut outbound = honk_config::node::OutboundConfig::from_protocol(protocol);
+    let credential = "00000000-0000-4000-8000-000000000001".to_string();
+    match &mut outbound {
+        honk_config::node::OutboundConfig::Vmess(config) => config.uuid = Some(credential.clone()),
+        honk_config::node::OutboundConfig::Vless(config) => config.uuid = Some(credential.clone()),
+        honk_config::node::OutboundConfig::Tuic(config) => config.uuid = Some(credential.clone()),
+        honk_config::node::OutboundConfig::Juicity(config) => config.uuid = Some(credential),
+        _ => {}
     }
+    let mut node = Node {
+        name: name.to_string(),
+        address: format!("{host}:443"),
+        host,
+        port: 443,
+        outbound,
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    node
 }
 
 fn vless_node(name: &str, mode: honk_config::node::WireMode) -> Node {
     let mut node = node(name, NodeProtocol::VLess);
     node.vless_mut().unwrap().mode = mode;
+    node.id = node.derive_id();
     node
+}
+fn canonical_node(name: &str) -> Node {
+    let mut node = Node {
+        name: name.to_string(),
+        address: "1.2.3.4:443".to_string(),
+        host: "1.2.3.4".to_string(),
+        port: 443,
+        outbound: honk_config::node::OutboundConfig::AnyTls(Default::default()),
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    node
+}
+fn assert_admission(error: RuntimeRegistryError, code: &'static str, index: usize) {
+    let index = index + 1;
+    let RuntimeRegistryError::Admission(error) = error else {
+        panic!("expected canonical registry admission error");
+    };
+    assert_eq!(error.diagnostic.code, code);
+    assert_eq!(
+        error.diagnostic.setting.to_string(),
+        format!("nodes[{index}]")
+    );
+    assert_eq!(
+        error.diagnostic.value,
+        honk_config::diagnostic::SafeValue::Ordinal(index)
+    );
+}
+
+#[test]
+fn registry_admission_rejects_invalid_collections() {
+    let mut stale = canonical_node("stale-endpoint");
+    stale.address = "5.6.7.8:8443".to_string();
+    stale.host = "5.6.7.8".to_string();
+    stale.port = 8443;
+    assert_admission(
+        OutboundRuntimeRegistry::build(&[stale]).unwrap_err(),
+        "noncanonical-node-id",
+        0,
+    );
+
+    let first = canonical_node("endpoint-a");
+    let mut second = first.clone();
+    second.name = "endpoint-b".to_string();
+    second.id = uuid::Uuid::new_v4();
+    assert_admission(
+        OutboundRuntimeRegistry::build_reusing(&[first, second], 1, None).unwrap_err(),
+        "noncanonical-node-id",
+        1,
+    );
+
+    let mut intrinsic = canonical_node("invalid-endpoint");
+    intrinsic.port = 0;
+    assert_admission(
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[intrinsic], 1, 1, None)
+            .unwrap_err(),
+        "invalid-config-value",
+        0,
+    );
+
+    let mut nil = canonical_node("nil-id");
+    nil.id = uuid::Uuid::nil();
+    assert_admission(
+        OutboundRuntimeRegistry::build_reusing(&[nil], 1, None).unwrap_err(),
+        "nil-node-id",
+        0,
+    );
+
+    let duplicate = canonical_node("same-name");
+    assert_admission(
+        OutboundRuntimeRegistry::build(&[duplicate.clone(), duplicate]).unwrap_err(),
+        "duplicate-node-id",
+        1,
+    );
+
+    let direct = honk_config::config::Config::builtin_direct_node();
+    let block = honk_config::config::Config::builtin_block_node();
+    assert!(OutboundRuntimeRegistry::build(&[direct.clone(), block]).is_ok());
+    let mut incorrect = direct;
+    incorrect.address = "127.0.0.1:1".to_string();
+    incorrect.host = "127.0.0.1".to_string();
+    incorrect.port = 1;
+    assert_admission(
+        OutboundRuntimeRegistry::build(&[incorrect]).unwrap_err(),
+        "invalid-config-value",
+        0,
+    );
+}
+
+#[test]
+fn registry_admission_rechecks_dns_fork_source_state() {
+    let node = canonical_node("dns-fork");
+    let mut registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+    let runtime = registry.nodes.get_mut(&node.id).unwrap();
+    let runtime = Arc::get_mut(runtime).unwrap();
+    let embedded = Arc::get_mut(&mut runtime.node).unwrap();
+    embedded.address = "5.6.7.8:8443".to_string();
+    embedded.host = "5.6.7.8".to_string();
+    embedded.port = 8443;
+
+    assert_admission(
+        registry.fork_for_dns().unwrap_err(),
+        "noncanonical-node-id",
+        0,
+    );
 }
 
 #[test]
@@ -253,8 +372,7 @@ async fn build_and_get_roundtrip() {
 fn rejects_nil_uuid() {
     let mut n = node("nil", NodeProtocol::Trojan);
     n.id = uuid::Uuid::nil();
-    let err = OutboundRuntimeRegistry::build(&[n]).unwrap_err();
-    assert!(matches!(err, RuntimeRegistryError::NilId(_)));
+    assert!(OutboundRuntimeRegistry::build(&[n]).is_err());
 }
 
 #[test]
@@ -262,8 +380,14 @@ fn rejects_duplicate_uuid() {
     let a = node("a", NodeProtocol::Trojan);
     let mut b = node("b", NodeProtocol::SS);
     b.id = a.id;
-    let err = OutboundRuntimeRegistry::build(&[a, b]).unwrap_err();
-    assert!(matches!(err, RuntimeRegistryError::DuplicateId(..)));
+    assert!(OutboundRuntimeRegistry::build(&[a.clone(), b]).is_err());
+
+    // A duplicate with the same name and canonical identity remains rejected.
+    assert_admission(
+        OutboundRuntimeRegistry::build(&[a.clone(), a]).unwrap_err(),
+        "duplicate-node-id",
+        1,
+    );
 }
 
 #[test]
@@ -520,6 +644,7 @@ fn build_reusing_reuses_unchanged_nodes_and_reports_them() {
     let first_changed = first.get(&changed.id).unwrap();
 
     changed.tls_mut().unwrap().sni = Some("new.example.com".to_string());
+    changed.id = changed.derive_id();
     let (second, reused) = OutboundRuntimeRegistry::build_reusing(
         &[unchanged.clone(), changed.clone()],
         64,
@@ -618,16 +743,17 @@ fn vless_mux_runtime_reuse_is_mode_exact() {
 
     let mut changed = node.clone();
     changed.vless_mut().unwrap().mode = WireMode::H2mux;
+    changed.id = changed.derive_id();
     let (changed_registry, reused) =
         OutboundRuntimeRegistry::build_reusing(std::slice::from_ref(&changed), 64, Some(&first))
             .unwrap();
     assert!(reused.is_empty());
     assert!(!Arc::ptr_eq(
         &first.get(&node.id).unwrap(),
-        &changed_registry.get(&node.id).unwrap()
+        &changed_registry.get(&changed.id).unwrap()
     ));
     assert!(matches!(
-        changed_registry.get(&node.id).unwrap().runtime,
+        changed_registry.get(&changed.id).unwrap().runtime,
         ProtocolRuntime::VlessMux(VlessMuxRuntime::H2(_))
     ));
 }
@@ -636,6 +762,7 @@ fn vless_mux_runtime_reuse_is_mode_exact() {
 fn build_reusing_ignores_parse_timestamps() {
     let mut parsed = node("trojan", NodeProtocol::Trojan);
     parsed.tls_mut().unwrap().sni = Some("example.com".to_string());
+    parsed.id = parsed.derive_id();
     let first = OutboundRuntimeRegistry::build(std::slice::from_ref(&parsed)).unwrap();
     let mut reparsed = parsed.clone();
     reparsed.created_at = chrono::Utc::now();
@@ -773,4 +900,44 @@ async fn retirement_is_terminal_and_shutdown_remains_idempotent() {
         registry.is_shutdown(),
         "retirement and force shutdown remain terminal and idempotent"
     );
+}
+
+#[cfg(test)]
+mod fallible_factory_tests {
+    use super::*;
+
+    #[test]
+    fn try_ephemeral_rejects_nil_id_before_building() {
+        let mut node = canonical_node("nil-ephemeral");
+        node.id = uuid::Uuid::nil();
+        assert_admission(
+            NodeRuntime::try_ephemeral(&node).unwrap_err(),
+            "nil-node-id",
+            0,
+        );
+    }
+
+    #[test]
+    fn try_ephemeral_rejects_stale_id_before_cloning() {
+        let mut node = canonical_node("stale-ephemeral");
+        node.address = "5.6.7.8:8443".into();
+        node.host = "5.6.7.8".into();
+        node.port = 8443;
+        assert_admission(
+            NodeRuntime::try_ephemeral(&node).unwrap_err(),
+            "noncanonical-node-id",
+            0,
+        );
+    }
+
+    #[test]
+    fn try_ephemeral_rejects_intrinsic_invalidity_before_identity() {
+        let mut node = canonical_node("invalid-ephemeral");
+        node.port = 0;
+        assert_admission(
+            NodeRuntime::try_ephemeral(&node).unwrap_err(),
+            "invalid-config-value",
+            0,
+        );
+    }
 }

@@ -1,81 +1,107 @@
 use super::{DnsConfig, DnsRequestAction, DnsResponseAction, RequestSource};
-use crate::ConfigError;
+use crate::diagnostic::{SettingPath, SourceRef};
+use crate::error::{DetailedConfigError, ErrorCategory};
 
 impl DnsConfig {
-    pub(crate) fn validate_upstream_references(&self) -> Result<(), ConfigError> {
-        let declared_upstreams = || {
-            let mut declared: Vec<_> = self
-                .upstream
-                .iter()
-                .map(|upstream| upstream.name.as_str())
-                .collect();
-            declared.sort_unstable();
-            declared
-        };
-        let check_upstream = |location: std::fmt::Arguments<'_>, target: &str| {
-            if self.upstream.iter().any(|upstream| upstream.name == target) {
-                return Ok(());
-            }
-            let declared = declared_upstreams();
-            Err(ConfigError::Validation(format!(
-                "{location} references undeclared DNS upstream '{target}' \
-                 (declared upstreams: {declared:?}); dae action names are lowercased \
-                 before exact lookup against unchanged declarations; legacy targets are matched verbatim"
-            )))
-        };
+    fn check_upstream_reference(
+        &self,
+        target: &str,
+        source: &SourceRef,
+        index: Option<usize>,
+        setting: impl FnOnce() -> SettingPath,
+    ) -> Result<(), DetailedConfigError> {
+        if self.upstream.iter().any(|upstream| upstream.name == target) {
+            return Ok(());
+        }
+        let mut error = DetailedConfigError::new(
+            ErrorCategory::Validation,
+            "unknown-dns-upstream",
+            source.clone(),
+            setting(),
+            "DNS routing references an undeclared upstream",
+        );
+        error.diagnostic.entry_index = index.map(|index| index + 1);
+        Err(error)
+    }
+
+    pub(crate) fn validate_upstream_references_detailed(
+        &self,
+        source: &SourceRef,
+    ) -> Result<(), DetailedConfigError> {
         let routing = &self.routing;
         match routing.request_source() {
             RequestSource::Current => {
                 for (index, rule) in routing.request.rules.iter().enumerate() {
                     if let DnsRequestAction::Upstream(target) = &rule.action {
-                        check_upstream(
-                            format_args!("dns.routing.request.rules[{index}].action"),
-                            target,
-                        )?;
+                        self.check_upstream_reference(target, source, Some(index), || {
+                            SettingPath::new("dns")
+                                .field("routing")
+                                .field("request")
+                                .field("rules")
+                                .index(index + 1)
+                                .field("action")
+                        })?;
                     }
                 }
                 if let DnsRequestAction::Upstream(target) = &routing.request.fallback {
-                    check_upstream(format_args!("dns.routing.request.fallback"), target)?;
+                    self.check_upstream_reference(target, source, None, || {
+                        SettingPath::new("dns")
+                            .field("routing")
+                            .field("request")
+                            .field("fallback")
+                    })?;
                 }
             }
             RequestSource::Legacy => {
                 for (index, rule) in routing.rules.iter().enumerate() {
-                    check_upstream(
-                        format_args!("dns.routing.rules[{index}].upstream"),
-                        &rule.upstream,
-                    )?;
+                    self.check_upstream_reference(&rule.upstream, source, Some(index), || {
+                        SettingPath::new("dns")
+                            .field("routing")
+                            .field("rules")
+                            .index(index + 1)
+                            .field("upstream")
+                    })?;
                 }
-                let target = routing.fallback.as_str();
-                if matches!(target, "" | "upstream")
-                    && !self.upstream.iter().any(|upstream| upstream.name == target)
-                {
-                    let declared = declared_upstreams();
-                    let message = if target.is_empty() {
-                        format!(
-                            "dns.routing.fallback has an empty fallback for active legacy rules \
-                             (fallback value ''; declared upstreams: {declared:?})"
-                        )
-                    } else {
-                        format!(
-                            "dns.routing.fallback has no fallback declared for the legacy default 'upstream' \
-                             (declared upstreams: {declared:?})"
-                        )
+                self.check_upstream_reference(&routing.fallback, source, None, || {
+                    SettingPath::new("dns").field("routing").field("fallback")
+                })
+                .map_err(|mut error| {
+                    let (code, message) = match routing.fallback.as_str() {
+                        "" => (
+                            "empty-dns-fallback",
+                            "empty legacy DNS fallback has no matching upstream declaration",
+                        ),
+                        "upstream" => (
+                            "missing-dns-fallback",
+                            "legacy default fallback 'upstream' requires an upstream declaration",
+                        ),
+                        _ => return error,
                     };
-                    return Err(ConfigError::Validation(message));
-                }
-                check_upstream(format_args!("dns.routing.fallback"), target)?;
+                    error.diagnostic.code = code;
+                    error.diagnostic.message = message;
+                    error
+                })?;
             }
         }
         for (index, rule) in routing.response.rules.iter().enumerate() {
             if let DnsResponseAction::Upstream(target) = &rule.action {
-                check_upstream(
-                    format_args!("dns.routing.response.rules[{index}].action"),
-                    target,
-                )?;
+                self.check_upstream_reference(target, source, Some(index), || {
+                    SettingPath::new("dns")
+                        .field("routing")
+                        .field("response")
+                        .field("rules")
+                        .index(index + 1)
+                        .field("action")
+                })?;
             }
         }
         if let DnsResponseAction::Upstream(target) = &routing.response.fallback {
-            check_upstream(format_args!("dns.routing.response.fallback"), target)?;
+            self.check_upstream_reference(target, source, None, || {
+                SettingPath::new("dns")
+                    .field("routing")
+                    .field("response")
+                    .field("fallback")
+            })?;
         }
         Ok(())
     }

@@ -644,12 +644,14 @@ async fn test_short_salamander_password_rejected_before_dial() {
 #[tokio::test]
 async fn test_invalid_port_hopping_rejected_before_dial() {
     let mut node = test_node(443, TEST_PASSWORD);
-    node.hysteria2_mut().unwrap().port_hopping = Some("0-10".to_string());
-    let error = match Hysteria2Handler::new().build_client(&node, None).await {
-        Ok(_) => panic!("invalid port hopping list must be rejected"),
-        Err(error) => error,
-    };
-    assert!(error.to_string().contains("invalid port hopping list"));
+    for spec in ["0-10", "443,443", "443-445,445-446"] {
+        node.hysteria2_mut().unwrap().port_hopping = Some(spec.to_string());
+        let error = match Hysteria2Handler::new().build_client(&node, None).await {
+            Ok(_) => panic!("invalid port hopping list must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("invalid port hopping list"));
+    }
 }
 
 #[tokio::test]
@@ -1320,8 +1322,6 @@ fn test_parse_port_hopping() {
     assert_eq!(parse_port_hopping("0-10"), None);
 }
 
-/// The share-link parser validates embedded hop ports with its own copy of
-/// these rules; an accepted embedded spec must never fail at dial time.
 #[test]
 fn test_embedded_hop_spec_parity_with_share_link_parser() {
     for spec in [

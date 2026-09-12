@@ -774,19 +774,9 @@ fn parse_ip_version(s: &str) -> Option<u8> {
     }
 }
 
-/// Parse a dae `dip`/`sip` argument into an `IpNet`. `ipnet`'s `FromStr`
-/// rejects bare addresses, but dae configs write them freely — a bare IP is
-/// a host route (/32 or /128). Silently dropping it would silently drop the
-/// whole matcher.
+/// Decode a dae IP host or CIDR using the shared configuration conversion.
 pub(crate) fn parse_ip_net_str(s: &str) -> Option<ipnet::IpNet> {
-    let trimmed = s.trim();
-    if trimmed.contains('/') {
-        return trimmed.parse().ok();
-    }
-    if trimmed.contains(':') {
-        return format!("{trimmed}/128").parse().ok();
-    }
-    format!("{trimmed}/32").parse().ok()
+    honk_config::dns::decode_ip_or_cidr(s).map(|decoded| decoded.network)
 }
 
 fn parse_port_ranges(ports: &[String]) -> anyhow::Result<Vec<PortRange>> {

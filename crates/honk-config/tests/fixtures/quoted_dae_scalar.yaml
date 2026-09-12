@@ -1,0 +1,7 @@
+ignored: "
+  global {
+    nfqueue_enable: invalid
+  }
+"
+global:
+  check_tolerance_ms: 75

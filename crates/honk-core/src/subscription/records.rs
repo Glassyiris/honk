@@ -5,31 +5,35 @@
 //! Clash key vocabulary so the common parser owns Node
 //! construction and validation.
 
-use std::collections::HashMap;
-
+use honk_config::options::vocab::stream_transport;
 use serde_yaml::{Mapping, Value};
 
+use super::IndexedOutcome;
+#[cfg(test)]
 use super::Node;
 
 mod fields;
 use fields::{Field, split_fields};
+mod options;
+use options::{
+    RecordOptions, take_any_active, take_any_matching, take_bool, take_bool_alias,
+    take_credential_alias, take_duration_alias, take_option, take_optional_flow_alias,
+    take_optional_text_alias, take_packet_network, take_raw, take_stream_transport_alias,
+    take_vmess_cipher_alias,
+};
 
-/// Parse Surge/Surfboard/Loon and Quantumult X record bodies.
-///
-/// The body may be a complete profile or a plain record list. Unsupported
-/// records are discarded individually so supported siblings survive.
-pub(super) fn parse_records_subscription(
+/// Parse physical records while emitting one normalized outcome at a time.
+pub(super) fn parse_record_subscription(
     content: &str,
     subscription_id: Option<uuid::Uuid>,
-) -> anyhow::Result<Vec<Node>> {
-    let body = content;
-    let mut records = Vec::<Value>::new();
+    mut emit: impl FnMut(IndexedOutcome),
+) -> anyhow::Result<()> {
     let mut section = None::<String>;
-    let has_sections = body
+    let has_sections = content
         .lines()
         .map(str::trim)
         .any(|line| section_name(line).is_some());
-    for line in body.lines() {
+    for (index, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
@@ -38,31 +42,44 @@ pub(super) fn parse_records_subscription(
             section = Some(name);
             continue;
         }
-        if has_sections && !section.as_deref().is_some_and(is_record_section) {
-            continue;
-        }
-
-        let Some(fields) = split_fields(line) else {
-            tracing::warn!(
-                category = "malformed-record",
-                "skipping subscription record"
-            );
-            continue;
+        let ordinal = index + 1;
+        let mut outcome = if (has_sections && !section.as_deref().is_some_and(is_record_section))
+            || line.starts_with("REMARKS=")
+            || line.starts_with("STATUS=")
+        {
+            IndexedOutcome::profile(ordinal, "entries", "subscription profile metadata")
+        } else {
+            let result = split_fields(line)
+                .ok_or("malformed subscription record")
+                .and_then(|fields| parse_record(&fields))
+                .and_then(|mapping| super::clash::parse_clash_proxy(&mapping, subscription_id));
+            match result {
+                Ok(node) => IndexedOutcome::node(ordinal, "entries", node),
+                Err(reason) if reason.contains("unsupported") => {
+                    IndexedOutcome::unsupported(ordinal, "entries", reason)
+                }
+                Err(reason) => IndexedOutcome::malformed(ordinal, "entries", reason),
+            }
         };
-        match parse_record(&fields) {
-            Ok(record) => records.push(Value::Mapping(record)),
-            Err(reason) => tracing::debug!(
-                category = "unsupported-record",
-                reason,
-                "skipping subscription record"
-            ),
-        }
+        outcome.line = Some(ordinal);
+        emit(outcome);
     }
+    Ok(())
+}
 
-    if records.is_empty() {
-        anyhow::bail!("no supported records found in subscription");
-    }
-    super::parse_clash_proxies(&records, subscription_id)
+#[cfg(test)]
+fn parse_records_subscription(
+    content: &str,
+    subscription_id: Option<uuid::Uuid>,
+) -> anyhow::Result<Vec<Node>> {
+    let mut nodes = Vec::new();
+    parse_record_subscription(content, subscription_id, |outcome| {
+        if let super::IndexedOutcomeKind::Node(node) = outcome.kind {
+            nodes.push(node);
+        }
+    })?;
+    anyhow::ensure!(!nodes.is_empty(), "no supported subscription records");
+    Ok(nodes)
 }
 
 fn section_name(line: &str) -> Option<String> {
@@ -76,7 +93,6 @@ fn is_record_section(name: &str) -> bool {
 }
 
 type RecordResult<T> = Result<T, &'static str>;
-
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Dialect {
     Named,
@@ -152,7 +168,7 @@ fn normalize_protocol(
     server: String,
     port: u16,
     positions: &[String],
-    mut options: HashMap<String, String>,
+    mut options: RecordOptions,
 ) -> RecordResult<Mapping> {
     consume_record_controls(protocol, &mut options)?;
     let mut map = base_mapping(protocol, name, server, port);
@@ -171,10 +187,7 @@ fn record_header(field: &Field) -> Option<(&str, &str)> {
     Some((left.trim(), right.get(1..)?.trim()))
 }
 
-fn consume_record_controls(
-    protocol: &str,
-    options: &mut HashMap<String, String>,
-) -> RecordResult<()> {
+fn consume_record_controls(protocol: &str, options: &mut RecordOptions) -> RecordResult<()> {
     if take_any_active(
         options,
         &[
@@ -213,15 +226,8 @@ fn consume_record_controls(
     Ok(())
 }
 
-fn apply_udp_options(map: &mut Mapping, options: &mut HashMap<String, String>) -> RecordResult<()> {
-    let udp = take_bool(options, &["udp"])?;
-    let relay = take_bool(options, &["udp-relay"])?;
-    if let (Some(udp), Some(relay)) = (udp, relay)
-        && udp != relay
-    {
-        return Err("record UDP aliases conflict");
-    }
-    if let Some(enabled) = relay.or(udp) {
+fn apply_udp_options(map: &mut Mapping, options: &mut RecordOptions) -> RecordResult<()> {
+    if let Some(enabled) = take_bool_alias(options, &["udp", "udp-relay"])? {
         put_bool(map, "udp", enabled);
     }
     Ok(())
@@ -249,9 +255,9 @@ fn positional_options(
     fields: &[Field],
     start: usize,
     dialect: Dialect,
-) -> RecordResult<(Vec<String>, HashMap<String, String>)> {
+) -> RecordResult<(Vec<String>, RecordOptions)> {
     let mut positions = Vec::new();
-    let mut options = HashMap::new();
+    let mut options = RecordOptions::default();
     for field in fields.iter().skip(start) {
         if field.value.trim().is_empty() {
             continue;
@@ -321,18 +327,20 @@ fn apply_protocol(
     dialect: Dialect,
     protocol: &str,
     positions: &[String],
-    options: &mut HashMap<String, String>,
+    options: &mut RecordOptions,
 ) -> RecordResult<()> {
     match protocol {
         "ss" => {
             let cipher = match dialect {
-                Dialect::Named => take_option(options, &["encrypt-method", "method", "cipher"])
-                    .or_else(|| positions.first().cloned()),
+                Dialect::Named => {
+                    take_credential_alias(options, &["encrypt-method", "method", "cipher"])?
+                        .or_else(|| positions.first().cloned())
+                }
                 Dialect::QuantumultX => {
-                    take_option(options, &["method", "cipher", "encrypt-method"])
+                    take_credential_alias(options, &["method", "cipher", "encrypt-method"])?
                 }
             };
-            let password = take_option(options, &["password"]).or_else(|| {
+            let password = take_credential_alias(options, &["password"])?.or_else(|| {
                 (dialect == Dialect::Named)
                     .then(|| positions.get(1).cloned())
                     .flatten()
@@ -354,18 +362,18 @@ fn apply_protocol(
             }
         }
         "socks5" => {
-            let username = take_option(options, &["username"]).or_else(|| {
+            let username = take_credential_alias(options, &["username"])?.or_else(|| {
                 (dialect == Dialect::Named)
                     .then(|| positions.first().cloned())
                     .flatten()
             });
-            let password = take_option(options, &["password"]).or_else(|| {
+            let password = take_credential_alias(options, &["password"])?.or_else(|| {
                 (dialect == Dialect::Named)
                     .then(|| positions.get(1).cloned())
                     .flatten()
             });
-            set_optional(map, "username", username);
-            set_optional(map, "password", password);
+            set_credential(map, "username", username);
+            set_credential(map, "password", password);
             if dialect == Dialect::QuantumultX
                 && take_raw(options, &["obfs"]).is_some_and(|value| !value.trim().is_empty())
             {
@@ -374,21 +382,27 @@ fn apply_protocol(
         }
         "vmess" => {
             let uuid = match dialect {
-                Dialect::Named => take_option(options, &["username", "uuid", "password"])
-                    .or_else(|| {
-                        positions
-                            .iter()
-                            .find(|value| looks_like_uuid(value))
-                            .cloned()
-                    })
-                    .or_else(|| positions.get(1).cloned()),
-                Dialect::QuantumultX => take_option(options, &["password", "uuid", "username"]),
+                Dialect::Named => {
+                    take_credential_alias(options, &["username", "uuid", "password"])?
+                        .or_else(|| {
+                            positions
+                                .iter()
+                                .find(|value| looks_like_uuid(value))
+                                .cloned()
+                        })
+                        .or_else(|| positions.get(1).cloned())
+                }
+                Dialect::QuantumultX => {
+                    take_credential_alias(options, &["password", "uuid", "username"])?
+                }
             };
             set_required(map, "uuid", uuid)?;
             let cipher = match dialect {
-                Dialect::Named => take_option(options, &["method", "encryption", "cipher"])
-                    .or_else(|| positions.first().filter(|v| !looks_like_uuid(v)).cloned()),
-                Dialect::QuantumultX => take_option(options, &["method", "cipher"]),
+                Dialect::Named => {
+                    take_vmess_cipher_alias(options, &["method", "encryption", "cipher"])?
+                        .or_else(|| positions.first().filter(|v| !looks_like_uuid(v)).cloned())
+                }
+                Dialect::QuantumultX => take_vmess_cipher_alias(options, &["method", "cipher"])?,
             };
             set_optional(map, "cipher", cipher);
             if dialect == Dialect::Named {
@@ -396,7 +410,7 @@ fn apply_protocol(
             }
         }
         "trojan" => {
-            let password = take_option(options, &["password"]).or_else(|| {
+            let password = take_credential_alias(options, &["password"])?.or_else(|| {
                 (dialect == Dialect::Named)
                     .then(|| positions.first().cloned())
                     .flatten()
@@ -408,63 +422,57 @@ fn apply_protocol(
         }
         "vless" => {
             let uuid = match dialect {
-                Dialect::Named => take_option(options, &["uuid", "password"])
+                Dialect::Named => take_credential_alias(options, &["uuid", "password"])?
                     .or_else(|| positions.first().cloned()),
-                Dialect::QuantumultX => take_option(options, &["password", "uuid"]),
+                Dialect::QuantumultX => take_credential_alias(options, &["password", "uuid"])?,
             };
             set_required(map, "uuid", uuid)?;
             if dialect == Dialect::QuantumultX {
                 set_optional(
                     map,
                     "encryption",
-                    take_option(options, &["method", "encryption"]),
+                    take_credential_alias(options, &["method", "encryption"])?,
                 );
             }
-            set_optional(
-                map,
-                "flow",
-                match dialect {
-                    Dialect::Named => take_option(options, &["flow", "vless-flow"]),
-                    Dialect::QuantumultX => take_option(options, &["vless-flow", "flow"]),
-                },
-            );
+            let flow = take_optional_flow_alias(options, dialect)?;
+            set_optional(map, "flow", flow);
             if dialect == Dialect::Named {
                 apply_transport(map, options, positions)?;
             }
             apply_vless_mode(map, options)?;
         }
         "hysteria2" => {
-            let auth = take_option(options, &["password", "auth"]).or_else(|| {
+            let auth = take_credential_alias(options, &["password", "auth"])?.or_else(|| {
                 (dialect == Dialect::Named)
                     .then(|| positions.first().cloned())
                     .flatten()
             });
-            set_optional(map, "auth", auth);
+            set_credential(map, "auth", auth);
             apply_hysteria(map, options)?;
             apply_quic_common(map, options);
         }
         "tuic" => {
-            let uuid = take_option(options, &["uuid", "username"]).or_else(|| {
+            let uuid = take_credential_alias(options, &["uuid", "username"])?.or_else(|| {
                 (dialect == Dialect::Named)
                     .then(|| positions.first().cloned())
                     .flatten()
             });
-            let password = take_option(options, &["password"]).or_else(|| {
+            let password = take_credential_alias(options, &["password"])?.or_else(|| {
                 (dialect == Dialect::Named)
                     .then(|| positions.get(1).cloned())
                     .flatten()
             });
             set_required(map, "uuid", uuid)?;
-            set_optional(map, "password", password);
+            set_credential(map, "password", password);
             apply_quic_common(map, options);
         }
         "juicity" => {
-            let uuid = take_option(options, &["uuid", "username"]).or_else(|| {
+            let uuid = take_credential_alias(options, &["uuid", "username"])?.or_else(|| {
                 (dialect == Dialect::Named)
                     .then(|| positions.first().cloned())
                     .flatten()
             });
-            let password = take_option(options, &["password"]).or_else(|| {
+            let password = take_credential_alias(options, &["password"])?.or_else(|| {
                 (dialect == Dialect::Named)
                     .then(|| positions.get(1).cloned())
                     .flatten()
@@ -474,13 +482,13 @@ fn apply_protocol(
             apply_quic_common(map, options);
         }
         "anytls" => {
-            let password = take_option(options, &["password"]).or_else(|| {
+            let password = take_credential_alias(options, &["password"])?.or_else(|| {
                 (dialect == Dialect::Named)
                     .then(|| positions.first().cloned())
                     .flatten()
             });
             set_required(map, "password", password)?;
-            set_optional(map, "network", take_option(options, &["network"]));
+            set_optional(map, "network", take_packet_network(options)?);
         }
         _ => return Err("record protocol is unsupported"),
     }
@@ -489,28 +497,27 @@ fn apply_protocol(
 
 fn apply_transport(
     map: &mut Mapping,
-    options: &mut HashMap<String, String>,
+    options: &mut RecordOptions,
     positions: &[String],
 ) -> RecordResult<()> {
-    let mut transport = take_option(options, &["transport", "network"]);
+    let mut transport: Option<&str> =
+        take_stream_transport_alias(options, &["transport", "network"])?
+            .filter(|value| !value.is_empty());
     let ws = take_bool(options, &["ws"])?;
     if transport.is_none() && ws == Some(true) {
-        transport = Some("ws".to_string());
+        transport = Some("ws");
     }
     let transport = transport.or_else(|| {
         positions
             .iter()
             .find(|value| matches!(value.as_str(), "tcp" | "ws" | "grpc" | "h2" | "httpupgrade"))
-            .cloned()
+            .map(String::as_str)
     });
     let Some(transport) = transport else {
         return Ok(());
     };
-    let transport = transport.to_ascii_lowercase();
-    if !matches!(transport.as_str(), "tcp" | "ws" | "grpc") {
-        return Err("record transport is unsupported");
-    }
-    put_str(map, "network", transport.clone());
+    let transport = stream_transport(transport)?;
+    put_str(map, "network", transport.to_string());
     if transport == "ws" {
         set_optional(
             map,
@@ -547,7 +554,7 @@ fn apply_security(
     map: &mut Mapping,
     dialect: Dialect,
     protocol: &str,
-    options: &mut HashMap<String, String>,
+    options: &mut RecordOptions,
 ) -> RecordResult<()> {
     let mut obfs_tls = None;
     let mut obfs_sni = None;
@@ -643,15 +650,20 @@ fn apply_security(
         put_bool(map, "tls", enabled);
     }
 
-    let explicit_skip = take_option(options, &["skip-cert-verify", "allow-insecure", "insecure"])
-        .map(|value| parse_bool(&value).ok_or("record boolean option is invalid"))
-        .transpose()?;
-    let verification = take_bool(options, &["tls-verification"])?;
+    let explicit_skip =
+        take_bool_alias(options, &["skip-cert-verify", "allow-insecure", "insecure"])?;
+    let verification = take_bool_alias(options, &["tls-verification"])?;
     if verification == Some(true) && !tls_capable(protocol) {
         return Err("TLS verification is unsupported for this protocol");
     }
     let skip = if tls_capable(protocol) {
-        verification.map(|verify| !verify).or(explicit_skip)
+        match (verification.map(|verify| !verify), explicit_skip) {
+            (Some(verification), Some(explicit)) if verification != explicit => {
+                return Err("record TLS verification aliases conflict");
+            }
+            (Some(verification), _) => Some(verification),
+            (None, explicit) => explicit,
+        }
     } else {
         explicit_skip
     };
@@ -685,10 +697,10 @@ fn apply_security(
         return Err("record requires unsupported TLS behavior");
     }
 
-    let servername = take_option(
+    let servername = take_optional_text_alias(
         options,
         &["servername", "server-name", "sni", "tls-name", "tls-host"],
-    )
+    )?
     .or(obfs_sni);
     if servername
         .as_deref()
@@ -724,7 +736,7 @@ fn tls_capable(protocol: &str) -> bool {
     )
 }
 
-fn apply_vless_mode(map: &mut Mapping, options: &mut HashMap<String, String>) -> RecordResult<()> {
+fn apply_vless_mode(map: &mut Mapping, options: &mut RecordOptions) -> RecordResult<()> {
     for key in ["packet-addr", "packet_addr", "packetaddr"] {
         if let Some(value) = options.remove(key)
             && parse_bool(&value).ok_or("record boolean option is invalid")?
@@ -746,7 +758,7 @@ fn apply_vless_mode(map: &mut Mapping, options: &mut HashMap<String, String>) ->
     Ok(())
 }
 
-fn apply_hysteria(map: &mut Mapping, options: &mut HashMap<String, String>) -> RecordResult<()> {
+fn apply_hysteria(map: &mut Mapping, options: &mut RecordOptions) -> RecordResult<()> {
     set_optional(
         map,
         "upload-bandwidth",
@@ -762,11 +774,9 @@ fn apply_hysteria(map: &mut Mapping, options: &mut HashMap<String, String>) -> R
         "mport",
         take_option(options, &["mport", "port-hopping", "port_hopping"]),
     );
-    set_optional(
-        map,
-        "mhop",
-        take_option(options, &["mhop", "hop-interval", "hop_interval"]),
-    );
+    if let Some(seconds) = take_duration_alias(options)? {
+        put_u64(map, "mhop", seconds);
+    }
     if let Some(obfs) = take_option(options, &["obfs"]) {
         if !matches!(obfs.to_ascii_lowercase().as_str(), "none" | "salamander") {
             return Err("Hysteria obfuscation is unsupported");
@@ -783,7 +793,7 @@ fn apply_hysteria(map: &mut Mapping, options: &mut HashMap<String, String>) -> R
     Ok(())
 }
 
-fn apply_quic_common(map: &mut Mapping, options: &mut HashMap<String, String>) {
+fn apply_quic_common(map: &mut Mapping, options: &mut RecordOptions) {
     set_optional(
         map,
         "congestion-control",
@@ -791,43 +801,6 @@ fn apply_quic_common(map: &mut Mapping, options: &mut HashMap<String, String>) {
     );
     set_optional(map, "alpn", take_option(options, &["alpn"]));
     set_optional(map, "mtu", take_option(options, &["mtu"]));
-}
-
-fn take_raw(options: &mut HashMap<String, String>, keys: &[&str]) -> Option<String> {
-    let selected = keys.iter().find(|key| options.contains_key(**key)).copied();
-    let value = selected.and_then(|key| options.remove(key));
-    for key in keys {
-        options.remove(*key);
-    }
-    value
-}
-
-fn take_option(options: &mut HashMap<String, String>, keys: &[&str]) -> Option<String> {
-    take_raw(options, keys).filter(|value| !value.is_empty())
-}
-
-fn take_bool(options: &mut HashMap<String, String>, keys: &[&str]) -> RecordResult<Option<bool>> {
-    take_raw(options, keys)
-        .map(|value| parse_bool(&value).ok_or("record boolean option is invalid"))
-        .transpose()
-}
-
-fn take_any_matching(
-    options: &mut HashMap<String, String>,
-    keys: &[&str],
-    predicate: impl Fn(&str) -> bool,
-) -> bool {
-    let mut matched = false;
-    for key in keys {
-        if let Some(value) = options.remove(*key) {
-            matched |= predicate(&value);
-        }
-    }
-    matched
-}
-
-fn take_any_active(options: &mut HashMap<String, String>, keys: &[&str]) -> bool {
-    take_any_matching(options, keys, |value| !value.trim().is_empty())
 }
 
 fn canonical_type(value: &str) -> Option<&'static str> {
@@ -882,6 +855,12 @@ fn set_required(map: &mut Mapping, key: &str, value: Option<String>) -> RecordRe
 
 fn set_optional(map: &mut Mapping, key: &str, value: Option<String>) {
     if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        put_str(map, key, value);
+    }
+}
+
+fn set_credential(map: &mut Mapping, key: &str, value: Option<String>) {
+    if let Some(value) = value {
         put_str(map, key, value);
     }
 }

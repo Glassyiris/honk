@@ -127,9 +127,8 @@ mod compiler {
                     let nets = cidrs
                         .iter()
                         .map(|value| {
-                            parse_ip_net_str(value).ok_or_else(|| {
-                                anyhow::anyhow!("Invalid DNS source IP or CIDR '{value}'")
-                            })
+                            parse_ip_net_str(value)
+                                .ok_or_else(|| anyhow::anyhow!("invalid DNS source IP or CIDR"))
                         })
                         .collect::<anyhow::Result<Vec<_>>>()?;
                     Ok(CompiledCond::Sip { not: *not, nets })
@@ -139,8 +138,13 @@ mod compiler {
                     names: names.clone(),
                 }),
                 DnsCond::Ip { not, cidrs, geoip } => {
-                    let mut nets: Vec<ipnet::IpNet> =
-                        cidrs.iter().filter_map(|cidr| cidr.parse().ok()).collect();
+                    let mut nets = cidrs
+                        .iter()
+                        .map(|value| {
+                            parse_ip_net_str(value)
+                                .ok_or_else(|| anyhow::anyhow!("invalid DNS response IP or CIDR"))
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
                     nets.extend(assets.geoip_nets(geoip));
                     Ok(CompiledCond::Ip {
                         not: *not,

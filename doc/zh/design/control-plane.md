@@ -10,6 +10,8 @@
 
 ## 启动与关闭
 
+配置诊断在初始化 tracing 前收集。加载或配置校验提前失败时，先向标准错误输出已有的非终止诊断，每条仅输出一次，再由二进制程序返回一次脱敏后的终止错误。加载成功时，诊断延迟到配置指定的 tracing 订阅器就绪后输出。后续运行时致命错误仍保留原有的日志文件记录。
+
 启动时保持内核准入关闭，直到用户态能够接收每个重定向流：
 
 1. 加载并校验配置、选择 `global.data_dir`，提升 `RLIMIT_NOFILE`，并取得一次不可变的描述符预算快照。
@@ -127,6 +129,8 @@ Accepted TCP socket 只有在其规范正向 `CONN_STATE_MAP` 条目仍存在时
 
 ## Reload 与运行时 generation
 
+SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与否，警告都只报告一次；被拒绝的尝试另报告一次脱敏后的原因，不进入运行时发布流程。报告本次诊断不会替换当前运行时状态，也不会新增最近失败尝试的缓存。
+
 `apply_runtime_config` 首先构建替代 Router、GroupManager、出站 registry、DNS 运行时与路由计划，不修改 live state。提交顺序为：
 
 1. Fence NFQUEUE readiness，并等待内核 reader-epoch 宽限期。
@@ -153,6 +157,7 @@ Accepted TCP socket 只有在其规范正向 `CONN_STATE_MAP` 条目仍存在时
 | Clash API | `experimental.clash_api.external_controller`、`external_ui`、`external_ui_download_url`、`external_ui_download_detour`、`secret`、`default_mode` |
 | 持久化 | 任意 `experimental.cache_file` 变更 |
 | NFQUEUE | `global.nfqueue_enable` |
+| 健康检查与 TLS | `global.check_interval`、生效的第一个 `global.tcp_check_url`、启用 HTTP 检查时的 `global.tcp_check_http_method`、选中的 `global.udp_check_dns` 目标，或原生 TLS/uTLS 模式切换（参见[健康检查重载语义](../reference/global.md#重载健康检查与-tls-模式)） |
 
 当旧值和新值都能解析时，`dns.bind` 的语义比较使用解析后的 bind endpoint，因此描述同一 endpoint 的纯拼写变更不会强制重启。
 
@@ -163,6 +168,8 @@ Accepted TCP socket 只有在其规范正向 `CONN_STATE_MAP` 条目仍存在时
 `ControlPlane::run` 首次被 poll 时便取得控制命令接收端的所有权，早于所有启动阶段的 await。这个已开始运行的 future 返回或被丢弃时，即使监听器启动失败也会关闭通道，使阻塞在满队列上的订阅投递解除等待，随后调用方才能等待 supervisor 关闭。
 
 `SIGHUP` 会按 fetch 身份（URL + 配置的 User-Agent + headers）稳定订阅 ID，并把活动订阅节点带入候选配置。只有启用订阅且当前没有活动节点时才恢复缓存，随后安排立即网络刷新。网络、解析或没有可用节点的失败会保留活动节点，不替换上一次有效正文。持久化失败不是致命错误：校验成功的节点仍可合并，旧正文仍可恢复。定期刷新与立即刷新使用同一串行的 runtime 发布路径，订阅节点不会写回配置文件。
+
+正文通过校验与运行时发布分别报告。节点集合准入失败时，只输出一次脱敏诊断，并保留活动配置；已经保存的正文不会回滚。
 
 当 `global.store_subscribe` 启用时，经过校验的原始正文存放在 `<global.data_dir>/.sub`。切换数据目录期间，若配置存储不存在，则依次保留并使用已有的 `/var/share/honk/.sub` 与 `./.sub`；honk 不会自动移动或删除它们。目录必须是非符号链接目录、权限 `0700`；文件权限 `0600`，文件名由请求 URL、配置中的 User-Agent 覆盖值（未设置或为空时贡献空组件）与 headers 共同计算 URL-safe SHA-256。未配置订阅覆盖值时，请求标识为 `honk/<version>`。写入使用新的临时文件、`sync_all`、原子 rename 和目录 sync。
 

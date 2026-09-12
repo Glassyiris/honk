@@ -1,10 +1,12 @@
 //! Normalize sing-box outbounds into the shared Clash-shaped vocabulary.
 
+use honk_config::options::vocab::{optional_text, packet_network, stream_transport};
 use honk_config::types::NodeProtocol;
 use serde_yaml::{Mapping, Value};
 
-use super::{NodeResult, move_strings, put, take_optional_string};
-
+use super::{
+    NodeResult, NormalizedEntry, move_credential_strings, move_strings, put, take_optional_string,
+};
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PacketNetwork {
     Both,
@@ -28,8 +30,16 @@ pub(super) fn normalize(value: Value) -> NodeResult {
         "tuic" => NodeProtocol::Tuic,
         "juicity" => NodeProtocol::Juicity,
         "anytls" => NodeProtocol::AnyTLS,
-        "selector" | "urltest" | "direct" | "block" | "dns" => return Ok(None),
-        _ => return Ok(None),
+        "selector" | "urltest" | "direct" | "block" | "dns" => {
+            return Ok(NormalizedEntry::Profile(
+                "sing-box non-proxy profile outbound",
+            ));
+        }
+        _ => {
+            return Ok(NormalizedEntry::Unsupported(
+                "sing-box outbound type is unsupported",
+            ));
+        }
     };
     if source.remove("detour").is_some_and(|value| active(&value)) {
         return Err("sing-box detour chaining is unsupported");
@@ -70,7 +80,7 @@ pub(super) fn normalize(value: Value) -> NodeResult {
         NodeProtocol::AnyTLS => normalize_anytls(source, proxy),
         NodeProtocol::Direct | NodeProtocol::Block => unreachable!(),
     }
-    .map(Some)
+    .map(NormalizedEntry::Node)
 }
 
 fn normalize_shadowsocks(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &'static str> {
@@ -79,11 +89,11 @@ fn normalize_shadowsocks(mut source: Mapping, mut proxy: Mapping) -> Result<Mapp
         &mut proxy,
         &[
             ("method", "cipher"),
-            ("password", "password"),
             ("plugin", "plugin"),
             ("plugin_opts", "plugin-opts"),
         ],
     )?;
+    move_credential_strings(&mut source, &mut proxy, &[("password", "password")])?;
     reject_packet_network(&mut source)?;
     reject_enabled(
         &mut source,
@@ -106,7 +116,7 @@ fn normalize_socks5(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, 
             return Err("only SOCKS5 sing-box outbounds are supported");
         }
     }
-    move_strings(
+    move_credential_strings(
         &mut source,
         &mut proxy,
         &[("username", "username"), ("password", "password")],
@@ -121,15 +131,11 @@ fn normalize_socks5(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, 
 }
 
 fn normalize_vmess(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &'static str> {
-    move_strings(&mut source, &mut proxy, &[("uuid", "uuid")])?;
-    if let Some(security) = source.remove("security") {
-        let Value::String(value) = &security else {
-            return Err("sing-box VMess security must be a string");
-        };
-        if !matches!(value.as_str(), "auto" | "aes-128-gcm") {
-            return Err("unsupported sing-box VMess security");
-        }
-        put(&mut proxy, "cipher", security);
+    move_credential_strings(&mut source, &mut proxy, &[("uuid", "uuid")])?;
+    if let Some(value) = take_optional_string(&mut source, "security")?
+        && let Some(cipher) = honk_config::options::vocab::vmess_cipher([value.as_str()])?
+    {
+        put(&mut proxy, "cipher", Value::String(cipher.into()));
     }
     if source
         .remove("alter_id")
@@ -173,11 +179,8 @@ fn normalize_vmess(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &
 }
 
 fn normalize_vless(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &'static str> {
-    move_strings(
-        &mut source,
-        &mut proxy,
-        &[("uuid", "uuid"), ("flow", "flow")],
-    )?;
+    move_credential_strings(&mut source, &mut proxy, &[("uuid", "uuid")])?;
+    move_strings(&mut source, &mut proxy, &[("flow", "flow")])?;
     let network = normalize_packet_network(&mut source, &mut proxy)?;
     let packet_encoding = source.remove("packet_encoding");
     let multiplex = normalize_vless_multiplex(&mut source, &mut proxy)?;
@@ -209,7 +212,7 @@ fn normalize_vless(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &
 }
 
 fn normalize_trojan(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &'static str> {
-    move_strings(&mut source, &mut proxy, &[("password", "password")])?;
+    move_credential_strings(&mut source, &mut proxy, &[("password", "password")])?;
     normalize_packet_network(&mut source, &mut proxy)?;
     reject_enabled(
         &mut source,
@@ -227,7 +230,7 @@ fn normalize_trojan(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, 
 }
 
 fn normalize_hysteria2(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &'static str> {
-    move_strings(&mut source, &mut proxy, &[("password", "password")])?;
+    move_credential_strings(&mut source, &mut proxy, &[("password", "password")])?;
     reject_packet_network(&mut source)?;
     if source.remove("realm").is_some_and(|value| active(&value)) {
         return Err("sing-box Hysteria2 realm routing is unsupported");
@@ -238,14 +241,13 @@ fn normalize_hysteria2(mut source: Mapping, mut proxy: Mapping) -> Result<Mappin
     {
         return Err("sing-box randomized Hysteria2 hop intervals are unsupported");
     }
-    for (source_key, target_key) in [
-        ("up_mbps", "up"),
-        ("down_mbps", "down"),
-        ("hop_interval", "hop-interval"),
-    ] {
+    for (source_key, target_key) in [("up_mbps", "up"), ("down_mbps", "down")] {
         if let Some(value) = source.remove(source_key).filter(active) {
             put(&mut proxy, target_key, value);
         }
+    }
+    if let Some(value) = source.remove("hop_interval") {
+        put(&mut proxy, "hop-interval", value);
     }
     normalize_hysteria2_obfs(&mut source, &mut proxy)?;
     normalize_quic_fields(&mut source, &mut proxy)?;
@@ -257,7 +259,7 @@ fn normalize_tuic(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &'
     if source.remove("token").is_some_and(|value| active(&value)) {
         return Err("legacy TUIC tokens are unsupported");
     }
-    move_strings(
+    move_credential_strings(
         &mut source,
         &mut proxy,
         &[("uuid", "uuid"), ("password", "password")],
@@ -288,7 +290,7 @@ fn normalize_tuic(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &'
 }
 
 fn normalize_juicity(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &'static str> {
-    move_strings(
+    move_credential_strings(
         &mut source,
         &mut proxy,
         &[("uuid", "uuid"), ("password", "password")],
@@ -300,14 +302,26 @@ fn normalize_juicity(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping,
 }
 
 fn normalize_anytls(mut source: Mapping, mut proxy: Mapping) -> Result<Mapping, &'static str> {
-    move_strings(&mut source, &mut proxy, &[("password", "password")])?;
-    normalize_packet_network(&mut source, &mut proxy)?;
+    move_credential_strings(&mut source, &mut proxy, &[("password", "password")])?;
+    if let Some(network) = source.remove("network") {
+        match network {
+            Value::Null => {}
+            Value::String(network) => {
+                if packet_network(&network)?.is_some() {
+                    put(&mut proxy, "anytls-network", Value::String(network));
+                }
+            }
+            _ => return Err("sing-box packet network must be a string"),
+        }
+    }
+    if let Some(value) = source.remove("min_idle_session").filter(active) {
+        put(&mut proxy, "min-idle-session", value);
+    }
     for (source_key, target_key) in [
-        ("min_idle_session", "min-idle-session"),
         ("idle_session_check_interval", "idle-session-check-interval"),
         ("idle_session_timeout", "idle-session-timeout"),
     ] {
-        if let Some(value) = source.remove(source_key).filter(active) {
+        if let Some(value) = source.remove(source_key) {
             put(&mut proxy, target_key, value);
         }
     }
@@ -330,20 +344,23 @@ fn normalize_packet_network(
     source: &mut Mapping,
     proxy: &mut Mapping,
 ) -> Result<PacketNetwork, &'static str> {
-    let Some(network) = source.remove("network") else {
-        return Ok(PacketNetwork::Both);
+    let network = match source.remove("network") {
+        None | Some(Value::Null) => return Ok(PacketNetwork::Both),
+        Some(network) => network,
     };
     let Value::String(network) = network else {
         return Err("sing-box packet network must be a string");
     };
-    match network.as_str() {
-        "" => Ok(PacketNetwork::Both),
-        "tcp" => {
+    match packet_network(&network)? {
+        None => Ok(PacketNetwork::Both),
+        Some(false) => {
             put(proxy, "udp", Value::Bool(false));
             Ok(PacketNetwork::TcpOnly)
         }
-        "udp" => Err("UDP-only sing-box packet capability is unsupported"),
-        _ => Err("unsupported sing-box packet network"),
+        Some(true) => {
+            put(proxy, "udp", Value::Bool(true));
+            Ok(PacketNetwork::Both)
+        }
     }
 }
 
@@ -427,7 +444,6 @@ fn normalize_vless_uot(source: &mut Mapping, proxy: &mut Mapping) -> Result<bool
     put(proxy, "udp-over-tcp", Value::Mapping(options));
     Ok(true)
 }
-
 fn normalize_transport(source: &mut Mapping, proxy: &mut Mapping) -> Result<(), &'static str> {
     let Some(value) = source.remove("transport") else {
         return Ok(());
@@ -444,12 +460,26 @@ fn normalize_transport(source: &mut Mapping, proxy: &mut Mapping) -> Result<(), 
         None if transport.values().all(|value| !active(value)) => return Ok(()),
         None => return Err("sing-box transport type is missing"),
     };
-    match kind.as_str() {
-        "" if transport.values().all(|value| !active(value)) => Ok(()),
-        "" => Err("sing-box transport type is missing"),
+    let normalized = stream_transport(&kind)?;
+    if kind.is_empty() {
+        return if transport.values().any(active) {
+            Err("sing-box raw TCP transport has unsupported settings")
+        } else {
+            Ok(())
+        };
+    }
+    match normalized {
+        "tcp" => {
+            reject_active_remainder(
+                &transport,
+                "sing-box raw TCP transport has unsupported settings",
+            )?;
+            put(proxy, "network", Value::String(kind));
+            Ok(())
+        }
         "ws" => normalize_ws_transport(transport, proxy),
         "grpc" => normalize_grpc_transport(transport, proxy),
-        _ => Err("unsupported sing-box stream transport"),
+        _ => unreachable!("stream_transport returned an unknown transport"),
     }
 }
 
@@ -513,7 +543,10 @@ fn normalize_tls(source: &mut Mapping, proxy: &mut Mapping) -> Result<(), &'stat
         return Err("sing-box TLS settings must be an object");
     };
     let enabled = take_bool(&mut tls, "enabled")?.unwrap_or(false);
-    let server_name = take_optional_string(&mut tls, "server_name")?;
+    let mut server_name = take_optional_string(&mut tls, "server_name")?;
+    if optional_text([server_name.as_deref()])?.is_none() {
+        server_name = None;
+    }
     let insecure = take_bool(&mut tls, "insecure")?.unwrap_or(false);
     let reality = tls.remove("reality");
     let alpn = tls.remove("alpn");
@@ -526,9 +559,7 @@ fn normalize_tls(source: &mut Mapping, proxy: &mut Mapping) -> Result<(), &'stat
     // the negotiated proxy protocol. honk selects fingerprints process-wide.
     tls.remove("utls");
     if !enabled
-        && (server_name
-            .as_ref()
-            .is_some_and(|value| !value.trim().is_empty())
+        && (server_name.is_some()
             || insecure
             || reality.as_ref().is_some_and(active)
             || alpn.as_ref().is_some_and(active))
@@ -538,7 +569,7 @@ fn normalize_tls(source: &mut Mapping, proxy: &mut Mapping) -> Result<(), &'stat
     reject_active_remainder(&tls, "unsupported sing-box TLS settings")?;
 
     put(proxy, "tls", Value::Bool(enabled));
-    if let Some(server_name) = server_name.filter(|value| !value.trim().is_empty()) {
+    if let Some(server_name) = server_name {
         put(proxy, "servername", Value::String(server_name));
     }
     if insecure {

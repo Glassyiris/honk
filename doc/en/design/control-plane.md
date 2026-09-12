@@ -29,6 +29,8 @@ Module map:
 
 - `src/lib.rs` — `run()`, `Cli`/`ClashCommand`, resource limits, backend selection, fixed-queue startup preflight ([Configuration](../configuration.md)). Real instances hold `/run/honk-core.lock` and publish the `reload` PID. Via rtnetlink, create FD-owned `daens` and L2 netkit `dae0`; fall back to veth only on `EOPNOTSUPP`. Load/reuse the persistent allocator pin, then start NFQUEUE before datapath admission.
 
+Configuration diagnostics are collected before tracing setup. An early load or operator-validation failure writes prior nonterminal diagnostics to stderr once, then lets the binary return the redacted terminal cause once. Successful loading defers diagnostics to the configured tracing subscriber. Later runtime fatal errors retain their existing log-file mirror.
+
 Startup keeps kernel admission closed until userspace can receive every redirected flow:
 
 1. Load and validate the configuration, select `global.data_dir`, raise `RLIMIT_NOFILE`, and take one immutable descriptor-budget snapshot.
@@ -157,6 +159,8 @@ An accepted TCP socket is adopted only if its canonical forward `CONN_STATE_MAP`
 
 ## Reload and runtime generations
 
+SIGHUP uses an attempt-local diagnostic list. Load and operator-validation warnings are reported once on either outcome; a rejected attempt reports one redacted cause and never reaches runtime publication. Attempt reporting does not replace active runtime state or introduce a last-failed-attempt cache.
+
 `apply_runtime_config` first builds the replacement router, group manager, outbound registry, DNS runtime, and routing plan without mutating live state. Commit ordering is:
 
 1. Fence NFQUEUE readiness and wait for the kernel reader-epoch grace period.
@@ -191,6 +195,7 @@ The current process-scoped consumers reject a SIGHUP reload when any of these va
 | Clash API | `experimental.clash_api.external_controller`, `external_ui`, `external_ui_download_url`, `external_ui_download_detour`, `secret`, `default_mode` |
 | Persistence | Any `experimental.cache_file` change |
 | NFQUEUE | `global.nfqueue_enable` |
+| Health probes and TLS | `global.check_interval`, the effective first `global.tcp_check_url`, `global.tcp_check_http_method` when HTTP probing is enabled, the selected `global.udp_check_dns` target, or a native TLS/uTLS mode change ([health-check reload semantics](../reference/global.md#reloading-health-checks-and-tls-mode)) |
 
 Semantic comparison of `dns.bind` uses the parsed bind endpoint when both old and new values parse, so spelling-only changes that describe the same endpoint do not force a restart.
 
@@ -205,6 +210,8 @@ Startup parses stored bodies before starting network refresh. A valid non-empty 
 `ControlPlane::run` takes ownership of the control-command receiver on its first poll, before awaiting startup work. Returning or dropping that started future closes the channel even if listener startup fails, so subscription deliveries blocked on a full queue are released before the caller waits for supervisor shutdown.
 
 On `SIGHUP`, subscription IDs are stabilized by fetch identity (URL + configured User-Agent + headers) and active subscription nodes are carried into the candidate config. Cache restore runs only for an enabled subscription whose active node set is empty, then an immediate network refresh is scheduled. Network, parse, or no-usable-node failures keep active nodes and do not replace the last valid body. A persistence failure is non-fatal: validated nodes may still be merged, while the previous stored body remains available. Periodic and immediate refreshes use the same serialized runtime-publication path, and subscription nodes are never written back to the config file.
+
+Body acceptance and runtime publication are reported separately. A collection-admission rejection emits one redacted diagnostic and retains the active generation; it does not roll back an already stored body.
 
 - `src/subscription.rs` — fetch/parse and atomic raw-body persistence: `<global.data_dir>/.sub` mode `0700`, hash-named files `0600`; existing `/var/share/honk/.sub`, then `./.sub` are legacy fallbacks. Never move/delete automatically or write subscription nodes into config. `src/subscription/supervisor.rs` owns revision-authorized startup/immediate/periodic workers; reconcile/shutdown joins replaced workers. Startup/reload in `src/lib.rs` restores valid bodies before network refresh, skips restored subscriptions' five-second first-fetch wait, and reconciles workers only after SIGHUP commit. Fetch/parse/write failure preserves active nodes and the last valid body.
 - Daemon fetch/restore and `honk-tool sub` local files share body detection. Simple/Custom accept BOM, wrapped standard/URL-safe Base64, raw share links, Clash YAML/JSON, SIP008, sing-box JSON, Surge/Surfboard/Loon/Quantumult X records. `src/subscription/json.rs` and `records.rs` normalize foreign records; `clash.rs` constructs/validates typed nodes. Never import full-profile routing/DNS/groups. Native JSON preserves Unicode surrogate-pair names. Skip unsupported nodes, retain first usable duplicate identity, preserve active subscriptions on empty results. Imported Trojan/AnyTLS/QUIC require TLS, never silent plaintext.

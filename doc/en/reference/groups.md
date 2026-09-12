@@ -41,7 +41,7 @@ group {
 | — (not in dae) | `check_interval` | `null` | Per-group interval field in seconds. The current runtime does not consult it and uses the global interval. |
 | — (not in dae) | `tolerance` | `50` | URLTest switch threshold in milliseconds. dae URLTest groups receive `global.check_tolerance`; the runtime applies an effective minimum of 1 ms. |
 | — (not in dae) | `idle_timeout` | `null` | URLTest probe-suspension threshold after inactivity, in seconds. With `null`, the health layer uses 1800 seconds. |
-| — (not in dae) | `interrupt_connections` | `false` | Close tracked connections on an actual Selector, URLTest, or Fallback selection change. LoadBalance rotation does not trigger it. |
+| — (not in dae) | `interrupt_connections` | `false` | Requests tracking removal on selection changes, not cancellation of live relays. A true value emits `ineffective-option` at `groups[index].interrupt_connections`, including structured and constructed configurations. |
 | — (not in dae) | `id` | random UUID | Internal group identity generated when the field is absent. |
 
 ## Policies
@@ -90,9 +90,9 @@ For Clash compatibility, Score remains automatic but is represented as `type: "u
 2. `name(...)` matches `Node.name`. `subtag(...)` maps `Node.subscription_id` to the current subscription tag and matches that tag. Plain arguments are exact matches, `keyword:` is a substring match, and `regex:` is a raw regular expression. Matching is case-sensitive; multiple arguments in one predicate are alternatives.
 3. Predicates joined by `&&` on one line are AND-ed. Prefixing a predicate with `!` negates it. Separate `name(...)` and `subtag(...)` `filter:` lines are OR-ed; standalone `group(...)` lines add nested candidates.
 4. Filter-derived membership is rebuilt after every subscription refresh. Stable node UUIDs therefore do not retain stale membership after their subscription provenance changes.
-5. A group with neither node filters nor nested groups receives all current nodes. A group with nested groups but no node filters receives only its nested candidates, not all nodes.
+5. A group with neither node filters nor nested groups receives all current nodes. Explicit `group()`, an empty filter, an empty nested group, or a filter emptied by subscription refresh selects nothing. Empty contributions remain explicit through JSON/YAML/TOML round-trips and refresh; valid sibling filters still contribute by OR, and `final` remains independent.
 
-A filter honk cannot parse is ignored and reported by its ordinal among the group's node filters, excluding only standalone `group(...)` lines; mixed lines are counted.
+A filter honk cannot parse is ignored and reported by its ordinal among the group's node filters, excluding only nonempty standalone `group(...)` lines; mixed lines are counted. `group()` emits `empty-subgroup`. Remove the filter for all nodes; explicit `group()` now selects none.
 
 ## Nested groups
 

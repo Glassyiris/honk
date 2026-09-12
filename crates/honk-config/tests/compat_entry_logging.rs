@@ -1,6 +1,6 @@
 //! Keep this test alone in its binary: scoped-subscriber callsite interest is resolved through
 //! the registering thread's default (`Rebuilder::JustOne`). Another test reaching
-//! `report_diagnostics` first under `NoSubscriber` caches the callsite as never-interested.
+//! `report_detailed_diagnostics` first under `NoSubscriber` caches the callsite as never-interested.
 use honk_config::parser::parse_dae_config;
 
 #[test]

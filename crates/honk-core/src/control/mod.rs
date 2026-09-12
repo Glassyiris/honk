@@ -18,6 +18,8 @@ use nfqueue_runtime::{
 };
 #[cfg(feature = "ebpf")]
 use nfqueue_runtime::{NfqueueRuntime, NfqueueRuntimeEvent, wait_nfqueue_event};
+#[cfg(test)]
+mod c20_tests;
 pub mod packet_sniffer;
 mod preconnect;
 mod probers;

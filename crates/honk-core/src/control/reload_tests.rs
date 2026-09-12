@@ -10,6 +10,38 @@ use crate::dns;
 use crate::ebpf::mock::MockEbpfBackend;
 use crate::ebpf::{DatapathFlagsWriteOrigin, RoutingPushPhase};
 use crate::stats::StatsManager;
+
+#[derive(Clone)]
+struct RuntimeAdmissionCapture(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+impl std::io::Write for RuntimeAdmissionCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+async fn capture_runtime_admission(future: impl Future) -> String {
+    let captured = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer({
+            let captured = Arc::clone(&captured);
+            move || RuntimeAdmissionCapture(Arc::clone(&captured))
+        })
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    future.await;
+    String::from_utf8(captured.lock().clone()).unwrap()
+}
+#[path = "c28_health_tests.rs"]
+mod c28_health_tests;
+
 fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'static str> {
     let current_log_file = crate::resolved_log_file_path(current, None);
     let candidate_log_file = crate::resolved_log_file_path(candidate, None);
@@ -158,7 +190,7 @@ fn equivalent_resolved_log_file_path_does_not_require_restart() {
     assert!(restart_required_changes(&current, &replacement).is_empty());
 }
 
-fn test_dns_forwarder() -> std::sync::Arc<dns::forwarder::DnsForwarder> {
+pub(super) fn test_dns_forwarder() -> std::sync::Arc<dns::forwarder::DnsForwarder> {
     let cache = Arc::new(tokio::sync::Mutex::new(dns::cache::DnsCache::new(100)));
     let router = Arc::new(
         dns::routing::DnsRouter::new(&honk_config::dns::DnsRouting {
@@ -312,16 +344,34 @@ fn changed_routing_config() -> Config {
     config
 }
 
-fn score_reload_config(interval: u64) -> Config {
-    let nodes = ["score-a", "score-b"].map(|name| Node {
-        id: uuid::Uuid::new_v5(&honk_config::node::NODE_ID_NAMESPACE, name.as_bytes()),
-        name: name.into(),
-        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
-        address: "127.0.0.1:9".into(),
-        ..Default::default()
+fn score_reload_config(revision: u64) -> Config {
+    let nodes = [("score-a", 9), ("score-b", 10)].map(|(name, port)| {
+        let mut node = Node {
+            name: name.into(),
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
+            address: format!("127.0.0.1:{port}"),
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        node
     });
     let mut config = Config::default();
-    config.global.check_interval_secs = interval;
+    config
+        .routing
+        .rules
+        .push(honk_config::routing::RoutingRule {
+            name: format!("score-reload-{revision}"),
+            condition: honk_config::routing::RoutingCondition {
+                domain: vec![format!("score-{revision}.example")],
+                ..Default::default()
+            },
+            outbound: honk_config::routing::RoutingOutbound::Simple("direct".into()),
+            priority: 0,
+            must: false,
+            mark: 0,
+        });
     config.nodes = nodes.to_vec();
     config.groups = vec![Group {
         name: "score".into(),
@@ -348,9 +398,9 @@ fn score_reload_context() -> honk_outbound::group::ScoreSelectionContext {
 #[tokio::test]
 async fn reload_publishes_score_authority_before_dns_snapshot_is_reachable() {
     let cp = Arc::new(test_cp().await);
-    let first_interval = Config::default().global.check_interval_secs + 1;
+    let first_revision = 1;
     assert!(
-        cp.apply_runtime_config(score_reload_config(first_interval), &DrainTracker::new(),)
+        cp.apply_runtime_config(score_reload_config(first_revision), &DrainTracker::new(),)
             .await
     );
     let provider = cp.dns_controller.runtime_provider();
@@ -390,7 +440,7 @@ async fn reload_publishes_score_authority_before_dns_snapshot_is_reachable() {
 
     let result = cp
         .apply_runtime_config(
-            score_reload_config(first_interval + 1),
+            score_reload_config(first_revision + 1),
             &DrainTracker::new(),
         )
         .await;
@@ -411,22 +461,25 @@ async fn reload_publishes_score_authority_before_dns_snapshot_is_reachable() {
 #[tokio::test]
 async fn failed_reload_keeps_old_score_authority() {
     let cp = test_cp().await;
-    let interval = Config::default().global.check_interval_secs + 1;
+    let first_revision = 1;
     assert!(
-        cp.apply_runtime_config(score_reload_config(interval), &DrainTracker::new())
+        cp.apply_runtime_config(score_reload_config(first_revision), &DrainTracker::new())
             .await
     );
     let provider = cp.dns_controller.runtime_provider();
     let before_dns = provider.current_generation();
     let before_manager = cp.group_manager.read().clone();
-    let mut invalid = score_reload_config(interval + 1);
+    let mut invalid = score_reload_config(first_revision + 1);
     invalid.dns.upstream[0].address = "://invalid".into();
 
     assert!(!cp.apply_runtime_config(invalid, &DrainTracker::new()).await);
 
     assert_eq!(provider.current_generation(), before_dns);
     assert!(Arc::ptr_eq(&cp.group_manager.read(), &before_manager));
-    assert_eq!(cp.config.read().await.global.check_interval_secs, interval);
+    assert_eq!(
+        cp.config.read().await.routing.rules[0].name,
+        format!("score-reload-{first_revision}")
+    );
     let feedback = before_manager
         .selection_plan_for_target("score", &score_reload_context())
         .entries[0]
@@ -443,9 +496,9 @@ async fn failed_reload_keeps_old_score_authority() {
 #[tokio::test]
 async fn post_publication_datapath_failure_is_committed_degraded() {
     let cp = test_cp_with_nfq(true).await;
-    let first_interval = Config::default().global.check_interval_secs + 1;
+    let first_revision = 1;
     assert!(
-        cp.apply_runtime_config(score_reload_config(first_interval), &DrainTracker::new())
+        cp.apply_runtime_config(score_reload_config(first_revision), &DrainTracker::new())
             .await
     );
     let provider = cp.dns_controller.runtime_provider();
@@ -456,14 +509,17 @@ async fn post_publication_datapath_failure_is_committed_degraded() {
         ebpf.clear_datapath_flags_write_log();
         ebpf.arm_datapath_flags_write_fault(2).unwrap();
     }
-    let interval = first_interval + 1;
+    let revision = first_revision + 1;
     let drain = DrainTracker::new();
     assert!(
-        cp.apply_runtime_config(score_reload_config(interval), &drain)
+        cp.apply_runtime_config(score_reload_config(revision), &drain)
             .await
     );
     assert_ne!(provider.current_generation(), before_dns);
-    assert_eq!(cp.config.read().await.global.check_interval_secs, interval);
+    assert_eq!(
+        cp.config.read().await.routing.rules[0].name,
+        format!("score-reload-{revision}")
+    );
     assert!(!Arc::ptr_eq(&cp.group_manager.read(), &before_manager));
     assert!(!cp.is_datapath_healthy());
     assert!(drain.should_reject());
@@ -498,12 +554,12 @@ async fn post_publication_datapath_failure_is_committed_degraded() {
 async fn fence_failure_rejects_reload_without_stranding_datapath() {
     let cp = test_cp().await;
     assert!(cp.datapath_flags.is_some());
-    let first_interval = Config::default().global.check_interval_secs + 1;
+    let first_revision = 1;
     assert!(
-        cp.apply_runtime_config(score_reload_config(first_interval), &DrainTracker::new())
+        cp.apply_runtime_config(score_reload_config(first_revision), &DrainTracker::new())
             .await
     );
-    let before_interval = cp.config.read().await.global.check_interval_secs;
+    let before_route = cp.config.read().await.routing.rules[0].name.clone();
     {
         let mut ebpf = cp.ebpf.write().await;
         ebpf.clear_datapath_flags_write_log();
@@ -511,13 +567,13 @@ async fn fence_failure_rejects_reload_without_stranding_datapath() {
     }
     let drain = DrainTracker::new();
     assert!(
-        !cp.apply_runtime_config(score_reload_config(first_interval + 1), &drain)
+        !cp.apply_runtime_config(score_reload_config(first_revision + 1), &drain)
             .await,
         "fence failure must reject the reload"
     );
     assert_eq!(
-        cp.config.read().await.global.check_interval_secs,
-        before_interval,
+        cp.config.read().await.routing.rules[0].name,
+        before_route,
         "rejected reload keeps the old config"
     );
     assert!(cp.is_datapath_healthy());
@@ -553,9 +609,9 @@ async fn quiesce_failure_rejects_reload_and_restores_ready_flags() {
         ebpf.arm_quiesce_fault();
     }
     let drain = DrainTracker::new();
-    let interval = Config::default().global.check_interval_secs + 1;
+    let revision = 1;
     assert!(
-        !cp.apply_runtime_config(score_reload_config(interval), &drain)
+        !cp.apply_runtime_config(score_reload_config(revision), &drain)
             .await,
         "quiesce failure must reject the reload"
     );
@@ -668,7 +724,6 @@ async fn reload_dispatch_assigns_worker_revision_and_accepts_only_that_revision(
             ControlCommand::MergeSubscription {
                 subscription_id,
                 revision: revision.wrapping_sub(1),
-                name: "stale".into(),
                 nodes: vec![Node {
                     name: "stale".into(),
                     subscription_id: Some(subscription_id),
@@ -778,12 +833,12 @@ async fn reload_clamps_dials_to_startup_descriptor_reservation() {
 #[tokio::test]
 async fn build_failure_leaves_live_config_untouched() {
     let cp = test_cp().await;
-    let before = cp.config_handle().read().await.global.check_interval_secs;
+    let before = cp.config_handle().read().await.global.check_tolerance_ms;
 
     // An upstream with an empty address fails DnsEndpoint::parse during
     // build_dns_forwarder — the reload must abort before commit.
     let mut bad = Config::default();
-    bad.global.check_interval_secs += 1;
+    bad.global.check_tolerance_ms += 1;
     bad.dns.upstream = vec![honk_config::dns::DnsUpstream {
         name: "broken".into(),
         address: String::new(),
@@ -795,7 +850,7 @@ async fn build_failure_leaves_live_config_untouched() {
     let drain = DrainTracker::new();
     cp.apply_runtime_config(bad, &drain).await;
 
-    let after = cp.config_handle().read().await.global.check_interval_secs;
+    let after = cp.config_handle().read().await.global.check_tolerance_ms;
     assert_eq!(before, after, "failed build must not swap the live config");
 }
 
@@ -927,7 +982,7 @@ async fn reload_cancels_initializing_generation_before_swap_and_keeps_ready_endp
     });
 
     let mut new_config = Config::default();
-    new_config.global.check_interval_secs += 1;
+    new_config.global.check_tolerance_ms += 1;
     let drain = DrainTracker::new();
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -976,8 +1031,8 @@ async fn reload_cancels_initializing_generation_before_swap_and_keeps_ready_endp
         EndpointReservation::Initializing(_)
     ));
     assert_eq!(
-        cp.config_handle().read().await.global.check_interval_secs,
-        Config::default().global.check_interval_secs + 1
+        cp.config_handle().read().await.global.check_tolerance_ms,
+        Config::default().global.check_tolerance_ms + 1
     );
     pool.remove(ready_client, dst);
     pool.remove(initializing_client, dst);
@@ -998,9 +1053,9 @@ async fn reload_timeout_keeps_runtime_and_restores_admission() {
         _ => panic!("timeout fixture must hold a real initializer lease"),
     };
     let mut cancellation = lease.cancellation();
-    let before = cp.config_handle().read().await.global.check_interval_secs;
+    let before = cp.config_handle().read().await.global.check_tolerance_ms;
     let mut next = Config::default();
-    next.global.check_interval_secs += 1;
+    next.global.check_tolerance_ms += 1;
     let drain = Arc::new(DrainTracker::new());
     let reloading_cp = Arc::clone(&cp);
     let reloading_drain = Arc::clone(&drain);
@@ -1022,7 +1077,7 @@ async fn reload_timeout_keeps_runtime_and_restores_admission() {
     reloader.await.unwrap();
 
     assert_eq!(
-        cp.config_handle().read().await.global.check_interval_secs,
+        cp.config_handle().read().await.global.check_tolerance_ms,
         before,
         "a timed-out initializer must prevent the runtime/config swap"
     );
@@ -1043,7 +1098,7 @@ async fn reload_timeout_keeps_runtime_and_restores_admission() {
 /// the static routing bank or retaining its generation-owned upstream pool.
 #[tokio::test]
 async fn valid_reload_commits() {
-    let expected_interval = Config::default().global.check_interval_secs + 1;
+    let expected_tolerance = Config::default().global.check_tolerance_ms + 1;
     let cp = test_cp().await;
     let before_routing_generation = cp.ebpf.read().await.active_routing_generation().unwrap();
     let before_runtime = cp.dns_controller.runtime_provider().acquire();
@@ -1058,12 +1113,12 @@ async fn valid_reload_commits() {
     drop(before_runtime);
 
     let mut good = Config::default();
-    good.global.check_interval_secs = expected_interval;
+    good.global.check_tolerance_ms = expected_tolerance;
     assert!(cp.apply_runtime_config(good, &DrainTracker::new()).await);
 
     assert_eq!(
-        cp.config_handle().read().await.global.check_interval_secs,
-        expected_interval,
+        cp.config_handle().read().await.global.check_tolerance_ms,
+        expected_tolerance,
         "valid reload should swap the live config"
     );
     assert_eq!(
@@ -1230,6 +1285,8 @@ async fn identical_subscription_merge_skips_runtime_generation() {
         name: "subscription-node".into(),
         outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
         address: "127.0.0.1:1080".into(),
+        host: "127.0.0.1".into(),
+        port: 1080,
         subscription_id: Some(subscription_id),
         ..Default::default()
     };
@@ -1353,14 +1410,14 @@ async fn routing_push_failure_keeps_active_policy_and_userspace_generation() {
         .inject_routing_fault(RoutingPushPhase::Root, 1)
         .unwrap();
     let mut replacement = changed_routing_config();
-    replacement.global.check_interval_secs += 1;
+    replacement.global.check_tolerance_ms += 1;
 
     cp.apply_runtime_config(replacement, &DrainTracker::new())
         .await;
 
     assert_eq!(
-        cp.config_handle().read().await.global.check_interval_secs,
-        Config::default().global.check_interval_secs,
+        cp.config_handle().read().await.global.check_tolerance_ms,
+        Config::default().global.check_tolerance_ms,
     );
     assert!(cp.is_datapath_healthy());
     assert!(!cp.drain_tracker.should_reject());
@@ -1376,7 +1433,7 @@ async fn domain_route_staging_failure_keeps_the_active_generation() {
         .inject_routing_fault(RoutingPushPhase::DomainRouting, 1)
         .unwrap();
     let mut replacement = changed_routing_config();
-    replacement.global.check_interval_secs += 1;
+    replacement.global.check_tolerance_ms += 1;
 
     cp.apply_runtime_config(replacement, &DrainTracker::new())
         .await;
@@ -1385,8 +1442,8 @@ async fn domain_route_staging_failure_keeps_the_active_generation() {
         before
     );
     assert_eq!(
-        cp.config_handle().read().await.global.check_interval_secs,
-        Config::default().global.check_interval_secs,
+        cp.config_handle().read().await.global.check_tolerance_ms,
+        Config::default().global.check_tolerance_ms,
     );
     assert!(cp.is_datapath_healthy());
     assert!(!cp.drain_tracker.should_reject());
@@ -1402,7 +1459,7 @@ async fn repeated_publication_failures_preserve_serving_generation() {
         .inject_routing_fault(RoutingPushPhase::Root, 2)
         .unwrap();
     let mut replacement = changed_routing_config();
-    replacement.global.check_interval_secs += 1;
+    replacement.global.check_tolerance_ms += 1;
     for _ in 0..2 {
         let drain = DrainTracker::new();
         assert!(!cp.apply_runtime_config(replacement.clone(), &drain).await);
@@ -1414,8 +1471,8 @@ async fn repeated_publication_failures_preserve_serving_generation() {
             active
         );
         assert_eq!(
-            cp.config.read().await.global.check_interval_secs,
-            Config::default().global.check_interval_secs
+            cp.config.read().await.global.check_tolerance_ms,
+            Config::default().global.check_tolerance_ms
         );
     }
     assert!(
@@ -1427,8 +1484,8 @@ async fn repeated_publication_failures_preserve_serving_generation() {
         active
     );
     assert_eq!(
-        cp.config.read().await.global.check_interval_secs,
-        replacement.global.check_interval_secs
+        cp.config.read().await.global.check_tolerance_ms,
+        replacement.global.check_tolerance_ms
     );
 }
 
@@ -1472,16 +1529,21 @@ async fn default_udp_warm_is_disabled_without_a_task_or_metrics() {
 
 #[test]
 fn selector_warm_candidates_follow_configured_leaves_and_deduplicate() {
-    let node = |name: &str, protocol| Node {
-        id: uuid::Uuid::new_v4(),
-        name: name.into(),
-        address: "127.0.0.1:9".into(),
-        outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
-        ..Default::default()
+    let node = |name: &str, protocol, port| {
+        let mut node = Node {
+            name: name.into(),
+            address: format!("127.0.0.1:{port}"),
+            host: "127.0.0.1".into(),
+            port,
+            outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        node
     };
-    let anytls = node("selector-anytls", NodeProtocol::AnyTLS);
-    let socks = node("selector-socks", NodeProtocol::Socks5);
-    let direct = node("selector-direct", NodeProtocol::Direct);
+    let anytls = node("selector-anytls", NodeProtocol::AnyTLS, 9);
+    let socks = node("selector-socks", NodeProtocol::Socks5, 10);
+    let direct = Config::builtin_direct_node();
     let groups = vec![
         Group {
             name: "first".into(),
@@ -1533,8 +1595,7 @@ async fn selector_choice_switch_replaces_bare_tcp_pin_immediately() {
     let second_socket = second_listener.local_addr().unwrap();
     let first_addr = first_socket.to_string();
     let second_addr = second_socket.to_string();
-    let first = Node {
-        id: uuid::Uuid::new_v4(),
+    let mut first = Node {
         name: "selector-first".into(),
         outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
         address: first_addr.clone(),
@@ -1542,8 +1603,8 @@ async fn selector_choice_switch_replaces_bare_tcp_pin_immediately() {
         port: first_socket.port(),
         ..Default::default()
     };
-    let second = Node {
-        id: uuid::Uuid::new_v4(),
+    first.id = first.derive_id();
+    let mut second = Node {
         name: "selector-second".into(),
         outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
         address: second_addr.clone(),
@@ -1551,6 +1612,7 @@ async fn selector_choice_switch_replaces_bare_tcp_pin_immediately() {
         port: second_socket.port(),
         ..Default::default()
     };
+    second.id = second.derive_id();
     let config = Config {
         nodes: vec![first.clone(), second.clone()],
         groups: vec![Group {
@@ -1616,8 +1678,7 @@ async fn changed_selector_bare_endpoint_is_purged_before_failed_replacement() {
     let old_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let old_socket = old_listener.local_addr().unwrap();
     let old_addr = old_socket.to_string();
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
+    let mut node = Node {
         name: "selector-moved".into(),
         outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
         address: old_addr.clone(),
@@ -1625,6 +1686,7 @@ async fn changed_selector_bare_endpoint_is_purged_before_failed_replacement() {
         port: old_socket.port(),
         ..Default::default()
     };
+    node.id = node.derive_id();
     let generation = Arc::new(
         honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
             .unwrap(),
@@ -1672,17 +1734,25 @@ async fn changed_selector_bare_endpoint_is_purged_before_failed_replacement() {
 
 #[test]
 fn udp_warm_candidates_only_use_authoritative_group_leaves() {
-    let node = |name: &str, protocol| Node {
-        id: uuid::Uuid::new_v4(),
-        name: name.into(),
-        address: "127.0.0.1:9".into(),
-        outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
-        ..Default::default()
+    let node = |name: &str, protocol, port| {
+        let mut node = Node {
+            name: name.into(),
+            address: format!("127.0.0.1:{port}"),
+            host: "127.0.0.1".into(),
+            port,
+            outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
+            ..Default::default()
+        };
+        if let Some(vmess) = node.vmess_mut() {
+            vmess.uuid = Some("11111111-1111-4111-8111-111111111111".into());
+        }
+        node.id = node.derive_id();
+        node
     };
-    let anytls = node("anytls", honk_config::types::NodeProtocol::AnyTLS);
-    let nested_warmable = node("socks", honk_config::types::NodeProtocol::AnyTLS);
-    let cold = node("cold", honk_config::types::NodeProtocol::VMess);
-    let standalone = node("standalone", honk_config::types::NodeProtocol::VMess);
+    let anytls = node("anytls", honk_config::types::NodeProtocol::AnyTLS, 9);
+    let nested_warmable = node("socks", honk_config::types::NodeProtocol::AnyTLS, 10);
+    let cold = node("cold", honk_config::types::NodeProtocol::VMess, 11);
+    let standalone = node("standalone", honk_config::types::NodeProtocol::VMess, 12);
     let groups = vec![
         Group {
             name: "first".into(),
@@ -1744,18 +1814,23 @@ fn udp_warm_candidates_only_use_authoritative_group_leaves() {
 
 #[test]
 fn udp_warm_candidates_bound_capacity_and_exclude_explicitly_dead_udp_leaves() {
-    let node = |name: &str| Node {
-        id: uuid::Uuid::new_v4(),
-        name: name.into(),
-        outbound: honk_config::node::OutboundConfig::from_protocol(
-            honk_config::types::NodeProtocol::AnyTLS,
-        ),
-        address: "127.0.0.1:9".into(),
-        ..Default::default()
+    let node = |name: &str, port| {
+        let mut node = Node {
+            name: name.into(),
+            outbound: honk_config::node::OutboundConfig::from_protocol(
+                honk_config::types::NodeProtocol::AnyTLS,
+            ),
+            address: format!("127.0.0.1:{port}"),
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        node
     };
-    let dead = node("dead-udp");
-    let selected = node("selected");
-    let second = node("second");
+    let dead = node("dead-udp", 9);
+    let selected = node("selected", 10);
+    let second = node("second", 11);
     let config = Config {
         nodes: vec![dead.clone(), selected.clone(), second.clone()],
         groups: vec![
@@ -1805,15 +1880,18 @@ fn udp_warm_candidates_enforce_a_process_wide_latency_ordered_cap() {
     for g in 0..6 {
         let mut ids = Vec::new();
         for i in 0..2 {
-            let node = Node {
-                id: uuid::Uuid::new_v4(),
+            let port = 9 + g * 2 + i;
+            let mut node = Node {
                 name: format!("n{g}-{i}"),
                 outbound: honk_config::node::OutboundConfig::from_protocol(
                     honk_config::types::NodeProtocol::AnyTLS,
                 ),
-                address: "127.0.0.1:9".into(),
+                address: format!("127.0.0.1:{port}"),
+                host: "127.0.0.1".into(),
+                port,
                 ..Default::default()
             };
+            node.id = node.derive_id();
             ids.push(node.id);
             nodes.push(node);
         }
@@ -1850,17 +1928,26 @@ fn udp_warm_candidates_enforce_a_process_wide_latency_ordered_cap() {
 
 #[test]
 fn udp_warm_candidates_do_not_mutate_group_selection_state() {
-    let node = |name: &str| Node {
-        id: uuid::Uuid::new_v4(),
-        name: name.into(),
-        outbound: honk_config::node::OutboundConfig::from_protocol(
-            honk_config::types::NodeProtocol::AnyTLS,
-        ),
-        address: "127.0.0.1:9".into(),
-        ..Default::default()
+    let node = |name: &str, port| {
+        let mut node = Node {
+            name: name.into(),
+            outbound: honk_config::node::OutboundConfig::from_protocol(
+                honk_config::types::NodeProtocol::AnyTLS,
+            ),
+            address: format!("127.0.0.1:{port}"),
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        node
     };
-    let (lb_a, lb_b, lb_c) = (node("lb-a"), node("lb-b"), node("lb-c"));
-    let (fallback_a, fallback_b, cold) = (node("fallback-a"), node("fallback-b"), node("cold"));
+    let (lb_a, lb_b, lb_c) = (node("lb-a", 9), node("lb-b", 10), node("lb-c", 11));
+    let (fallback_a, fallback_b, cold) = (
+        node("fallback-a", 12),
+        node("fallback-b", 13),
+        node("cold", 14),
+    );
     let fallback = Group {
         name: "fallback".into(),
         policy: GroupPolicy::Fallback,
@@ -1955,14 +2042,20 @@ fn udp_warm_candidates_do_not_mutate_group_selection_state() {
 #[tokio::test]
 async fn udp_warm_coordinator_limits_concurrency_and_keeps_shutdown_errors_neutral() {
     let nodes: Vec<Node> = (0..5)
-        .map(|n| Node {
-            id: uuid::Uuid::new_v4(),
-            name: format!("node-{n}"),
-            outbound: honk_config::node::OutboundConfig::from_protocol(
-                honk_config::types::NodeProtocol::Socks5,
-            ),
-            address: "127.0.0.1:9".into(),
-            ..Default::default()
+        .map(|n| {
+            let port = 9 + n;
+            let mut node = Node {
+                name: format!("node-{n}"),
+                outbound: honk_config::node::OutboundConfig::from_protocol(
+                    honk_config::types::NodeProtocol::Socks5,
+                ),
+                address: format!("127.0.0.1:{port}"),
+                host: "127.0.0.1".into(),
+                port,
+                ..Default::default()
+            };
+            node.id = node.derive_id();
+            node
         })
         .collect();
     let ids = nodes.iter().map(|node| node.id).collect::<Vec<_>>();
@@ -2040,15 +2133,17 @@ async fn udp_warm_dispatch_metrics_distinguish_live_and_terminal_errors_and_pani
         ("live-panic", Outcome::LivePanic, 0, 1),
         ("terminal-panic", Outcome::TerminalPanic, 0, 0),
     ];
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
+    let mut node = Node {
         name: "warm-node".into(),
         outbound: honk_config::node::OutboundConfig::from_protocol(
             honk_config::types::NodeProtocol::Socks5,
         ),
         address: "127.0.0.1:9".into(),
+        host: "127.0.0.1".into(),
+        port: 9,
         ..Default::default()
     };
+    node.id = node.derive_id();
 
     for (name, outcome, expected_successes, expected_failures) in cases {
         let generation = Arc::new(
@@ -2139,15 +2234,17 @@ async fn reload_retires_only_the_old_warm_generation_and_starts_the_new_one() {
         }
     }
 
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
+    let mut node = Node {
         name: "warm-node".into(),
         outbound: honk_config::node::OutboundConfig::from_protocol(
             honk_config::types::NodeProtocol::AnyTLS,
         ),
         address: "127.0.0.1:9".into(),
+        host: "127.0.0.1".into(),
+        port: 9,
         ..Default::default()
     };
+    node.id = node.derive_id();
     let mut config = Config::default();
     config.global.udp_warm_node_count = 1;
     config.routing.default_outbound = "warm-group".into();
@@ -2367,4 +2464,66 @@ async fn ready_pool_reload_rejection_preserves_stream() {
     cp.connection_pool.check_invariants();
     assert!(cp.connection_pool.acquire_ready(&key).await.is_some());
     cp.connection_pool.check_invariants();
+}
+
+#[tokio::test]
+async fn subscription_refresh_duplicate_static_node_reports_one_safe_rejection() {
+    let subscription = honk_config::subscription::Subscription {
+        name: "private-provider".into(),
+        url: "http://127.0.0.1:9".into(),
+        ..Default::default()
+    };
+    let body = include_str!("../../tests/fixtures/c20-direct-provider.txt");
+    let nodes = crate::subscription::parse_subscription_content(&subscription, body).unwrap();
+    let mut current = Config::default();
+    current.global.nfqueue_enable = false;
+    current.ensure_builtin_nodes();
+    let mut static_node = nodes[0].clone();
+    static_node.name = "static".into();
+    static_node.subscription_id = None;
+    current.nodes.push(static_node);
+    current.subscriptions.push(subscription.clone());
+    let mut cp = super::c20_tests::control_plane(current.clone()).await;
+    let mut authorizations =
+        crate::subscription::SubscriptionAuthorizations::new(&current.subscriptions).unwrap();
+    let command = ControlCommand::MergeSubscription {
+        subscription_id: subscription.id,
+        revision: authorizations.revision(subscription.id).unwrap(),
+        nodes,
+    };
+    let log = capture_runtime_admission(cp.dispatch_control_command(
+        command,
+        &DrainTracker::new(),
+        &mut authorizations,
+    ))
+    .await;
+    assert_eq!(cp.config_handle().read().await.as_ref(), &current);
+    assert_eq!(log.matches("duplicate-node-id").count(), 1, "{log}");
+    assert!(
+        !log.contains("127.0.0.1") && !log.contains("private-provider"),
+        "{log}"
+    );
+}
+
+#[tokio::test]
+async fn subscription_refresh_stale_id_reports_one_safe_rejection() {
+    let subscription = honk_config::subscription::Subscription {
+        name: "provider".into(),
+        url: "http://127.0.0.1:9".into(),
+        ..Default::default()
+    };
+    let node =
+        super::c20_tests::canonical_socks5("provider", "192.0.2.10", 1080, Some(subscription.id));
+    let mut current = Config::default();
+    current.global.nfqueue_enable = false;
+    current.nodes.push(node.clone());
+    current.subscriptions.push(subscription.clone());
+    let cp = super::c20_tests::control_plane(current.clone()).await;
+    let mut stale = node;
+    stale.address = "192.0.2.11".into();
+    let log =
+        capture_runtime_admission(cp.merge_subscription_nodes(subscription.id, vec![stale])).await;
+    assert_eq!(cp.config_handle().read().await.as_ref(), &current);
+    assert_eq!(log.matches("noncanonical-node-id").count(), 1, "{log}");
+    assert!(!log.contains("192.0.2.11"), "{log}");
 }

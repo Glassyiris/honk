@@ -1,0 +1,7 @@
+
+[General]
+loglevel = notify
+[Proxy]
+# record comment
+bad = ssr, secret.example, 443
+usable = socks5, 127.0.0.1, 1080

@@ -84,7 +84,13 @@ impl ControlPlane {
         drain: &DrainTracker,
     ) -> bool {
         let _reload = self.reload_lock.lock().await;
-        self.apply_runtime_config_locked(new_config, drain).await
+        match self.apply_runtime_config_locked(new_config, drain).await {
+            Ok(applied) => applied,
+            Err(error) => {
+                crate::report_runtime_admission_error(&error);
+                false
+            }
+        }
     }
 
     /// Apply a SIGHUP candidate after rebasing its in-memory subscription
@@ -95,7 +101,7 @@ impl ControlPlane {
         mut new_config: Config,
         drain: &DrainTracker,
         authorizations: &mut crate::subscription::SubscriptionAuthorizations,
-    ) -> bool {
+    ) -> Result<bool, honk_config::error::DetailedConfigError> {
         let _reload = self.reload_lock.lock().await;
         let current = self.config.read().await.clone();
         rebase_subscription_nodes(&current, &mut new_config);
@@ -113,7 +119,7 @@ impl ControlPlane {
         &self,
         mut new_config: Config,
         drain: &DrainTracker,
-    ) -> bool {
+    ) -> Result<bool, honk_config::error::DetailedConfigError> {
         crate::dns::ecs::resolve_client_subnet(&mut new_config.dns).await;
         self.apply_resolved_runtime_config_locked(new_config, drain)
             .await
@@ -122,13 +128,16 @@ impl ControlPlane {
     /// Validate and publish an explicit runtime configuration through the serialized
     /// transaction used by SIGHUP and subscription refreshes.
     ///
-    /// Validation stays on this public entry because subscription merges legitimately
-    /// publish nodes a whole-config check would reject. Unlike SIGHUP, direct callers
-    /// cannot reconcile the process-owned subscription workers, so additions, removals,
-    /// or worker-spec changes are rejected; use SIGHUP for those changes.
+    /// Operator-document restrictions apply here, not to provider nodes admitted by
+    /// subscription merges. Direct callers cannot reconcile process-owned workers;
+    /// use SIGHUP to add, remove, or change subscription worker specifications.
     pub async fn reload_runtime_config(&self, new_config: Config) -> bool {
-        if let Err(error) = new_config.validate() {
-            error!(%error, "runtime reload rejected: invalid configuration");
+        // A candidate equal to the admitted active configuration has already
+        // passed exactly these checks; re-deriving 512 node identities on an
+        // identical SIGHUP is the cost the reload benchmark guards against.
+        let unchanged = *self.config.read().await.as_ref() == new_config;
+        if !unchanged && let Err(error) = new_config.validate_detailed() {
+            crate::report_runtime_admission_error(&error);
             return false;
         }
         let drain = Arc::clone(&self.drain_tracker);
@@ -139,7 +148,7 @@ impl ControlPlane {
         &self,
         new_config: Config,
         drain: &DrainTracker,
-    ) -> bool {
+    ) -> Result<bool, honk_config::error::DetailedConfigError> {
         self.apply_resolved_runtime_config_locked_with_authorizations(new_config, drain, None)
             .await
     }
@@ -149,12 +158,12 @@ impl ControlPlane {
         mut new_config: Config,
         drain: &DrainTracker,
         authorizations: Option<&mut crate::subscription::SubscriptionAuthorizations>,
-    ) -> bool {
+    ) -> Result<bool, honk_config::error::DetailedConfigError> {
         if let Err(error) =
             crate::subscription::validate_subscription_ids(&new_config.subscriptions)
         {
             error!(%error, "reload rejected: invalid subscription ids");
-            return false;
+            return Ok(false);
         }
         let current_router = self.router.read().await.clone();
         let current_config = self.config.read().await.clone();
@@ -165,8 +174,14 @@ impl ControlPlane {
             )
         {
             error!("reload rejected: subscription worker changes require the control command path");
-            return false;
+            return Ok(false);
         }
+        // Same proof as at the public entry: equality with the admitted active
+        // configuration is admission. Anything else is verified before any shortcut.
+        if new_config != *current_config.as_ref() {
+            new_config.validate_assembled()?;
+        }
+
         let config_unchanged = effective_config_unchanged(current_config.as_ref(), &mut new_config);
         let current_dns_forwarder = self.dns_controller.forwarder();
         let current_dns_router = current_dns_forwarder.routing_snapshot();
@@ -182,7 +197,7 @@ impl ControlPlane {
                     Err(error) => {
                         error!(%error, "Failed to fingerprint DNS hosts snapshot");
                         self.stop_reload_rejection_if_healthy(drain);
-                        return false;
+                        return Ok(false);
                     }
                 };
             if current_router.geo_fingerprint() == traffic_geo_fingerprint
@@ -192,7 +207,7 @@ impl ControlPlane {
                 })
             {
                 info!("Configuration unchanged — retaining active runtime generation");
-                return true;
+                return Ok(true);
             }
         }
         let candidate_log_file =
@@ -208,7 +223,7 @@ impl ControlPlane {
                 fields = ?restart_required,
                 "reload rejected: changed fields require process restart"
             );
-            return false;
+            return Ok(false);
         }
 
         #[cfg(feature = "reload-bench-counters")]
@@ -226,7 +241,7 @@ impl ControlPlane {
             Err(error) => {
                 error!(%error, "Failed to load DNS hosts snapshot");
                 self.stop_reload_rejection_if_healthy(drain);
-                return false;
+                return Ok(false);
             }
         };
         let candidate_dns_policy = match crate::dns::policy::PolicyId::from_config_with_artifacts(
@@ -238,7 +253,7 @@ impl ControlPlane {
             Err(error) => {
                 error!(%error, "Failed to derive DNS policy identity");
                 self.stop_reload_rejection_if_healthy(drain);
-                return false;
+                return Ok(false);
             }
         };
         let old_plan = self.active_routing_plan.read().clone();
@@ -257,7 +272,7 @@ impl ControlPlane {
                 Err(error) => {
                     error!(%error, "Failed to build new router");
                     self.stop_reload_rejection_if_healthy(drain);
-                    return false;
+                    return Ok(false);
                 }
             }
         };
@@ -290,7 +305,7 @@ impl ControlPlane {
                 Err(e) => {
                     error!("Failed to build runtime registry (reload aborted): {}", e);
                     self.stop_reload_rejection_if_healthy(drain);
-                    return false;
+                    return Ok(false);
                 }
             };
         let reuse_dns_router = dns_routing_state_reusable(&current_config, &new_config)
@@ -306,7 +321,7 @@ impl ControlPlane {
                 Err(error) => {
                     error!(%error, "Failed to build DNS router");
                     self.stop_reload_rejection_if_healthy(drain);
-                    return false;
+                    return Ok(false);
                 }
             }
         };
@@ -320,7 +335,7 @@ impl ControlPlane {
                 Err(error) => {
                     error!(%error, "Failed to parse DNS hosts snapshot");
                     self.stop_reload_rejection_if_healthy(drain);
-                    return false;
+                    return Ok(false);
                 }
             }
         };
@@ -340,7 +355,7 @@ impl ControlPlane {
             Err(e) => {
                 error!("Failed to build DNS forwarder: {}", e);
                 self.stop_reload_rejection_if_healthy(drain);
-                return false;
+                return Ok(false);
             }
         };
         let new_outbound_id_map = build_outbound_id_map(&new_config);
@@ -355,7 +370,7 @@ impl ControlPlane {
                 Err(error) => {
                     error!(%error, "Failed to compile routing publication");
                     self.stop_reload_rejection_if_healthy(drain);
-                    return false;
+                    return Ok(false);
                 }
             }
         };
@@ -390,7 +405,7 @@ impl ControlPlane {
         } else {
             if current_config.global.nfqueue_enable || new_config.global.nfqueue_enable {
                 error!("datapath flags writer is unavailable during NFQUEUE reload");
-                return false;
+                return Ok(false);
             }
             let mode_state = self.mode_state.clone().unwrap_or_else(|| {
                 Arc::new(parking_lot::RwLock::new(crate::mode::ModeState::new(
@@ -401,7 +416,7 @@ impl ControlPlane {
                 crate::mode::DatapathFlagsHandle::new(Arc::clone(&self.ebpf), mode_state, None);
             if let Err(error) = handle.initialize(false, false).await {
                 error!(%error, "failed to initialize reload-scoped datapath flags writer");
-                return false;
+                return Ok(false);
             }
             handle
         };
@@ -417,7 +432,7 @@ impl ControlPlane {
             // serving instead of rejecting new connections forever.
             self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
                 .await;
-            return false;
+            return Ok(false);
         }
         drain.start_rejecting();
         #[cfg(feature = "ebpf")]
@@ -428,7 +443,7 @@ impl ControlPlane {
             warn!("UDP initializers did not drain before reload commit");
             self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
                 .await;
-            return false;
+            return Ok(false);
         }
         #[cfg(feature = "ebpf")]
         if let Some(pending) = self.pending_udp_verdicts.as_ref() {
@@ -438,7 +453,7 @@ impl ControlPlane {
             warn!("UDP endpoint retirements did not drain before reload commit");
             self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
                 .await;
-            return false;
+            return Ok(false);
         }
         let old_registry_result = {
             let mut router_guard = self.router.write().await;
@@ -555,7 +570,7 @@ impl ControlPlane {
             Err(()) => {
                 self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
                     .await;
-                return false;
+                return Ok(false);
             }
         };
 
@@ -606,7 +621,7 @@ impl ControlPlane {
                 .store(false, std::sync::atomic::Ordering::Release);
             drain.start_rejecting();
             self.drain_tracker.start_rejecting();
-            return true;
+            return Ok(true);
         }
         info!("Configuration applied — {} routes active", route_count);
 
@@ -615,7 +630,7 @@ impl ControlPlane {
         self.datapath_healthy
             .store(true, std::sync::atomic::Ordering::Release);
         self.stop_reload_rejection_if_healthy(drain);
-        true
+        Ok(true)
     }
 
     async fn restore_datapath_flags_after_rejected_reload(

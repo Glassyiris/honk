@@ -29,14 +29,18 @@ use std::time::{Duration, Instant};
 use tracing_subscriber::prelude::*;
 
 fn make_node(name: &str) -> Node {
-    Node {
-        id: uuid::Uuid::new_v5(&honk_config::node::NODE_ID_NAMESPACE, name.as_bytes()),
+    let mut node = Node {
         name: name.into(),
         address: "127.0.0.1".into(),
         port: 1,
-        outbound: honk_config::node::OutboundConfig::Socks5(Default::default()),
+        outbound: honk_config::node::OutboundConfig::Socks5(honk_config::node::Socks5Config {
+            username: Some(name.into()),
+            ..Default::default()
+        }),
         ..Default::default()
-    }
+    };
+    node.id = node.derive_id();
+    node
 }
 
 /// Minimal config: one Selector group "proxy" with nodes node-a / node-b.

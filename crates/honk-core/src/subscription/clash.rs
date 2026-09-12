@@ -4,13 +4,15 @@ mod fields;
 pub(super) mod options;
 
 use honk_config::node::{Node, OutboundConfig};
+use honk_config::options::vocab::{optional_flow, packet_network, stream_transport};
 use honk_config::types::NodeProtocol;
 use serde_yaml::Mapping;
 
+pub(super) use self::fields::duration_secs as parse_feed_duration_secs;
 use self::fields::{
     active as yaml_active, active_for_key as yaml_active_for_key, bool_alias as yaml_bool_alias,
-    duration_alias as yaml_duration_alias, list_alias as yaml_list_alias, ports as yaml_ports,
-    rate_alias as yaml_rate_alias, raw_alias as yaml_alias, text as yaml_text,
+    duration_alias as yaml_duration_alias, list_alias as yaml_list_alias, optional_text_alias,
+    ports as yaml_ports, rate_alias as yaml_rate_alias, raw_alias as yaml_alias, text as yaml_text,
     text_alias as yaml_text_alias, u64_alias as yaml_u64_alias,
 };
 use super::yaml_value;
@@ -320,13 +322,15 @@ fn apply_protocol(mapping: &Mapping, node: &mut Node) -> Result<(), &'static str
         OutboundConfig::Trojan(config) => config.password = password,
         OutboundConfig::Vmess(config) => {
             config.uuid = yaml_text_alias(mapping, &["uuid"])?.or(password);
-            config.encryption = yaml_text_alias(mapping, &["encryption"])?.or(cipher);
+            config.encryption = fields::vmess_cipher_alias(mapping, &["encryption", "cipher"])?;
         }
         OutboundConfig::Vless(config) => {
             config.uuid = yaml_text_alias(mapping, &["uuid"])?.or(password);
             config.encryption = yaml_text_alias(mapping, &["encryption"])?.or(cipher);
-            config.flow =
-                yaml_text_alias(mapping, &["flow"])?.filter(|flow| !flow.trim().is_empty());
+            let flow = optional_text_alias(mapping, &["flow"])?;
+            config.flow = optional_flow(flow.as_deref())
+                .map_err(|_| "VLESS flow is unsupported")?
+                .map(str::to_owned);
             config.mode = options::parse_vless_external_mode(mapping)?;
         }
         OutboundConfig::Hysteria2(config) => {
@@ -356,7 +360,6 @@ fn apply_protocol(mapping: &Mapping, node: &mut Node) -> Result<(), &'static str
         }
         OutboundConfig::AnyTls(config) => {
             config.password = password;
-            config.network = yaml_text_alias(mapping, &["anytls-network"])?;
             config.min_idle_session =
                 yaml_u64_alias(mapping, &["min-idle-session", "min_idle_session"])?
                     .map(|value| {
@@ -374,31 +377,60 @@ fn apply_protocol(mapping: &Mapping, node: &mut Node) -> Result<(), &'static str
     }
     Ok(())
 }
-
-fn apply_stream(mapping: &Mapping, node: &mut Node, udp: Option<bool>) -> Result<(), &'static str> {
-    if let Some(network) =
-        yaml_text_alias(mapping, &["network"])?.filter(|network| !network.trim().is_empty())
-    {
-        if let Some(transport) = node.transport_mut() {
-            if !matches!(network.as_str(), "tcp" | "ws" | "grpc") {
-                return Err("unsupported stream transport");
-            }
-            transport.transport = network;
-        } else if let Some(config) = node.anytls_mut() {
-            if !matches!(network.as_str(), "tcp" | "udp") {
-                return Err("unsupported AnyTLS network");
-            }
-            config.network = Some(network);
+fn resolve_anytls_network(
+    mapping: &Mapping,
+    udp: Option<bool>,
+) -> Result<Option<String>, &'static str> {
+    let mut selected = None::<(&str, bool)>;
+    for key in ["anytls-network", "network"] {
+        let Some(value) = yaml_value(mapping, key) else {
+            continue;
+        };
+        if matches!(value, serde_yaml::Value::Null) {
+            continue;
+        }
+        let serde_yaml::Value::String(value) = value else {
+            return Err("AnyTLS network must be a string");
+        };
+        let Some(network_udp) = packet_network(value)? else {
+            continue;
+        };
+        match selected {
+            None => selected = Some((value, network_udp)),
+            Some((_, previous)) if previous == network_udp => {}
+            Some(_) => return Err("AnyTLS network aliases conflict"),
         }
     }
-    if let Some(udp) = udp {
-        let network = if udp { "tcp,udp" } else { "tcp" }.to_string();
-        match &mut node.outbound {
-            OutboundConfig::Trojan(config) => config.network = Some(network),
-            OutboundConfig::Vmess(config) => config.network = Some(network),
-            OutboundConfig::Vless(config) => config.network = Some(network),
-            OutboundConfig::AnyTls(config) => config.network = Some(network),
-            _ => {}
+    if let (Some((_, network_udp)), Some(udp)) = (selected, udp)
+        && network_udp != udp
+    {
+        return Err("AnyTLS network conflicts with udp");
+    }
+    if let Some((value, _)) = selected {
+        return Ok(Some(value.to_owned()));
+    }
+    Ok(udp.map(|udp| if udp { "tcp,udp" } else { "tcp" }.to_owned()))
+}
+
+fn apply_stream(mapping: &Mapping, node: &mut Node, udp: Option<bool>) -> Result<(), &'static str> {
+    if let Some(config) = node.anytls_mut() {
+        config.network = resolve_anytls_network(mapping, udp)?;
+    } else {
+        if let Some(network) =
+            yaml_text_alias(mapping, &["network"])?.filter(|network| !network.trim().is_empty())
+            && let Some(transport) = node.transport_mut()
+        {
+            stream_transport(&network)?;
+            transport.transport = network;
+        }
+        if let Some(udp) = udp {
+            let network = if udp { "tcp,udp" } else { "tcp" }.to_string();
+            match &mut node.outbound {
+                OutboundConfig::Trojan(config) => config.network = Some(network),
+                OutboundConfig::Vmess(config) => config.network = Some(network),
+                OutboundConfig::Vless(config) => config.network = Some(network),
+                _ => {}
+            }
         }
     }
 
@@ -509,8 +541,7 @@ fn apply_tls(
     }
     if let Some(tls) = node.tls_mut() {
         tls.enabled = tls_enabled;
-        tls.sni = yaml_text_alias(mapping, &["servername", "server-name"])?
-            .or(yaml_text_alias(mapping, &["sni"])?);
+        tls.sni = optional_text_alias(mapping, &["servername", "server-name", "sni"])?;
         tls.skip_cert_verify = yaml_bool_alias(
             mapping,
             &["skip-cert-verify", "skip_cert_verify", "insecure"],
@@ -536,9 +567,7 @@ fn apply_quic(mapping: &Mapping, node: &mut Node) -> Result<(), &'static str> {
             return Err("unsupported fixed QUIC ALPN");
         }
     }
-    if let Some(mode) = yaml_text_alias(mapping, &["udp-relay-mode", "udp_relay_mode"])?
-        && (protocol != NodeProtocol::Tuic || !matches!(mode.trim(), "" | "native"))
-    {
+    if fields::tuic_relay_alias(mapping)?.is_some() && protocol != NodeProtocol::Tuic {
         return Err("unsupported TUIC UDP relay mode");
     }
     if protocol == NodeProtocol::Juicity {
@@ -630,47 +659,13 @@ fn validate_imported_node(node: &Node) -> Result<(), &'static str> {
         OutboundConfig::Trojan(config) => {
             nonempty(config.password.as_ref())?;
         }
-        OutboundConfig::Vmess(config) => {
-            let uuid = nonempty(config.uuid.as_ref())?;
-            uuid::Uuid::parse_str(uuid).map_err(|_| "VMess UUID is invalid")?;
-            let cipher = config.encryption.as_deref().unwrap_or("auto").trim();
-            if !cipher.eq_ignore_ascii_case("auto") && !cipher.eq_ignore_ascii_case("aes-128-gcm") {
-                return Err("VMess cipher is unsupported");
-            }
-        }
-        OutboundConfig::Vless(config) => {
-            let uuid = nonempty(config.uuid.as_ref())?;
-            uuid::Uuid::parse_str(uuid).map_err(|_| "VLESS UUID is invalid")?;
-            if config
-                .flow
-                .as_deref()
-                .is_some_and(|flow| !flow.trim().is_empty() && flow != "xtls-rprx-vision")
-            {
-                return Err("VLESS flow is unsupported");
-            }
-            if config.encryption.as_deref().is_some_and(|encryption| {
-                let encryption = encryption.trim();
-                !encryption.is_empty()
-                    && encryption != "none"
-                    && !encryption.starts_with("mlkem768x25519plus.")
-            }) {
-                return Err("VLESS encryption is unsupported");
-            }
-        }
-        OutboundConfig::Socks5(_) | OutboundConfig::Hysteria2(_) => {}
-        OutboundConfig::Tuic(config) => {
-            let uuid = nonempty(config.uuid.as_ref())?;
-            uuid::Uuid::parse_str(uuid).map_err(|_| "TUIC UUID is invalid")?;
-        }
         OutboundConfig::Juicity(config) => {
-            let uuid = nonempty(config.uuid.as_ref())?;
-            uuid::Uuid::parse_str(uuid).map_err(|_| "Juicity UUID is invalid")?;
             nonempty(config.password.as_ref())?;
         }
         OutboundConfig::AnyTls(config) => {
             nonempty(config.password.as_ref())?;
         }
-        OutboundConfig::Direct | OutboundConfig::Block => unreachable!(),
+        _ => {}
     }
     Ok(())
 }
@@ -703,7 +698,7 @@ pub(super) fn parse_clash_proxy(
     apply_tls(mapping, &mut node, protocol, tls_explicit, tls_enabled)?;
     apply_quic(mapping, &mut node)?;
     validate_imported_node(&node)?;
-    node.validate_protocol()
+    node.validate()
         .map_err(|_| "invalid imported node protocol settings")?;
     node.id = node.derive_id();
     Ok(node)

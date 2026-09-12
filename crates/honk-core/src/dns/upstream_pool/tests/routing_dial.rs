@@ -34,6 +34,7 @@ async fn dns_proxy_query_survives_traffic_registry_retirement() {
     node.port = address.port();
     node.outbound =
         honk_config::node::OutboundConfig::from_protocol(honk_config::types::NodeProtocol::Socks5);
+    node.id = node.derive_id();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         stream.read_exact(&mut [0; 3]).await.unwrap();
@@ -94,6 +95,7 @@ async fn dns_private_tls_connectors_follow_runtime_maintenance() {
     node.port = address.port();
     node.outbound =
         honk_config::node::OutboundConfig::from_protocol(honk_config::types::NodeProtocol::AnyTLS);
+    node.id = node.derive_id();
     let server = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             drop(stream);

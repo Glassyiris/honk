@@ -130,16 +130,20 @@ async fn urltest_node_impl(
         timeout
     };
     if node.protocol() == honk_config::types::NodeProtocol::Direct {
-        let (host, port, is_https) = parse_url_host_port(url)?;
+        let target = parse_url_target(url)?;
+        let host = target.host();
+        let port = target.port();
+        let is_https = target.is_https();
+        let authority = target.authority();
         let addr = {
             let hook = URLTEST_RESOLVER.read().clone();
             match hook {
-                Some(hook) => hook(host.clone(), port)
+                Some(hook) => hook(host.to_owned(), port)
                     .await
                     .into_iter()
                     .next()
                     .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?,
-                None => crate::bootstrap::resolve(&host)
+                None => crate::bootstrap::resolve(host)
                     .await
                     .with_context(|| format!("failed to resolve '{host}:{port}'"))?
                     .into_iter()
@@ -156,7 +160,7 @@ async fn urltest_node_impl(
             };
             let target = host
                 .parse::<std::net::IpAddr>()
-                .map_or_else(|_| ScoreTarget::domain(&host, port), |_| addr.into());
+                .map_or_else(|_| ScoreTarget::domain(host, port), |_| addr.into());
             manager
                 .feedback_for_node(
                     node.id,
@@ -173,8 +177,9 @@ async fn urltest_node_impl(
         return measure_head_exchange(
             runtime,
             handler,
-            &host,
-            Some(&host),
+            host,
+            Some(host),
+            authority,
             is_https,
             addr,
             timeout,
@@ -182,16 +187,20 @@ async fn urltest_node_impl(
         )
         .await;
     }
-    let (host, port, is_https) = parse_url_host_port(url)?;
+    let target = parse_url_target(url)?;
+    let host = target.host();
+    let port = target.port();
+    let is_https = target.is_https();
+    let authority = target.authority();
     let addr = {
         let hook = URLTEST_RESOLVER.read().clone();
         match hook {
-            Some(hook) => hook(host.clone(), port)
+            Some(hook) => hook(host.to_owned(), port)
                 .await
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))?,
-            None => tokio::net::lookup_host(format!("{host}:{port}"))
+            None => tokio::net::lookup_host((host, port))
                 .await
                 .with_context(|| format!("failed to resolve '{host}:{port}'"))?
                 .next()
@@ -206,7 +215,7 @@ async fn urltest_node_impl(
         };
         let target = host
             .parse::<std::net::IpAddr>()
-            .map_or_else(|_| ScoreTarget::domain(&host, port), |_| addr.into());
+            .map_or_else(|_| ScoreTarget::domain(host, port), |_| addr.into());
         manager
             .feedback_for_node(
                 node.id,
@@ -223,8 +232,9 @@ async fn urltest_node_impl(
     measure_head_exchange(
         runtime,
         handler,
-        &host,
-        Some(&host),
+        host,
+        Some(host),
+        authority,
         is_https,
         addr,
         timeout,
@@ -234,6 +244,32 @@ async fn urltest_node_impl(
 }
 /// Reuse an already-warm generation runtime; otherwise create a throwaway
 /// runtime whose guard closes any session or client established for probing.
+pub fn try_probe_runtime(
+    generation: &crate::runtime::OutboundRuntimeRegistry,
+    node: &Node,
+) -> Result<
+    (
+        Arc<crate::runtime::NodeRuntime>,
+        Option<crate::runtime::EphemeralRuntimeGuard>,
+    ),
+    crate::runtime::RuntimeRegistryError,
+> {
+    // Validate before looking up a warm runtime: a stale ID must not buy a
+    // warm-path shortcut or cause feedback/resources to be initialized.
+    crate::runtime::NodeRuntime::validate_for_ephemeral(node)?;
+    match generation
+        .get(&node.id)
+        .filter(|runtime| runtime.is_warm_or_stateless())
+    {
+        Some(runtime) => Ok((runtime, None)),
+        None => {
+            let guard = crate::runtime::NodeRuntime::ephemeral_guarded_after_admission(node);
+            Ok((guard.runtime(), Some(guard)))
+        }
+    }
+}
+
+/// Compatibility wrapper for [`try_probe_runtime`]; panics on invalid input.
 pub fn probe_runtime(
     generation: &crate::runtime::OutboundRuntimeRegistry,
     node: &Node,
@@ -241,16 +277,8 @@ pub fn probe_runtime(
     Arc<crate::runtime::NodeRuntime>,
     Option<crate::runtime::EphemeralRuntimeGuard>,
 ) {
-    match generation
-        .get(&node.id)
-        .filter(|runtime| runtime.is_warm_or_stateless())
-    {
-        Some(runtime) => (runtime, None),
-        None => {
-            let guard = crate::runtime::NodeRuntime::ephemeral_guarded(node);
-            (guard.runtime(), Some(guard))
-        }
-    }
+    try_probe_runtime(generation, node)
+        .unwrap_or_else(|_| panic!("invalid node passed to URLTest runtime probe"))
 }
 
 /// Reuse an already-warm generation runtime. Cold reusable transports warm a
@@ -290,7 +318,7 @@ async fn urltest_node_in_generation_impl(
     } else {
         timeout
     };
-    let (runtime, guard) = probe_runtime(generation, node);
+    let (runtime, guard) = try_probe_runtime(generation, node)?;
     let result = generation
         .scope_dials(async {
             if !runtime.is_warm_or_stateless() {
@@ -350,8 +378,21 @@ pub async fn urltest_node_addr(
     timeout: Duration,
 ) -> anyhow::Result<Duration> {
     let url = normalize_url(url);
-    let (host, _, is_https) = parse_url_host_port(url)?;
-    measure_head_exchange(runtime, handler, &host, None, is_https, addr, timeout, None).await
+    let target = parse_url_target(url)?;
+    let host = target.host();
+    let authority = target.authority();
+    measure_head_exchange(
+        runtime,
+        handler,
+        host,
+        None,
+        authority,
+        target.is_https(),
+        addr,
+        timeout,
+        None,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -360,6 +401,7 @@ async fn measure_head_exchange(
     handler: &dyn TcpOutbound,
     host: &str,
     target_domain: Option<&str>,
+    authority: &str,
     is_https: bool,
     addr: SocketAddr,
     timeout: Duration,
@@ -410,15 +452,15 @@ async fn measure_head_exchange(
                 "urltest: TLS established"
             );
             match tls.ssl().selected_alpn_protocol() {
-                Some(b"h2") => exchange_head_h2(tls, host, &reporter, timeout).await,
+                Some(b"h2") => exchange_head_h2(tls, authority, &reporter, timeout).await,
                 _ => {
                     let mut tls = tls;
-                    exchange_head(&mut tls, host, &reporter, timeout).await
+                    exchange_head(&mut tls, authority, &reporter, timeout).await
                 }
             }
         } else {
             let mut stream = stream;
-            exchange_head(&mut stream, host, &reporter, timeout).await
+            exchange_head(&mut stream, authority, &reporter, timeout).await
         }
     }
     .await;
@@ -460,7 +502,7 @@ fn https_connector() -> anyhow::Result<crate::tls::TlsConnector> {
 /// reported warm-path sample, resolved when its response HEADERS arrive.
 async fn exchange_head_h2<S>(
     stream: S,
-    host: &str,
+    authority: &str,
     reporter: &Option<ScoreReporter>,
     timeout: Duration,
 ) -> anyhow::Result<Duration>
@@ -475,12 +517,12 @@ where
     });
     let round = |first_response: bool| {
         let mut sender = sender.clone();
-        let host = host.to_string();
+        let authority = authority.to_string();
         let reporter = reporter.clone();
         async move {
             let req = http::Request::builder()
                 .method("HEAD")
-                .uri(format!("https://{host}/"))
+                .uri(format!("https://{authority}/"))
                 .header("user-agent", "honk-urltest/1.0")
                 .body(())
                 .map_err(|e| anyhow!("h2 request build: {e}"))?;
@@ -488,7 +530,7 @@ where
             let (response_fut, _send_stream) = sender
                 .send_request(req, true)
                 .map_err(|e| anyhow!("h2 send_request: {e}"))?;
-            reporter_tx(&reporter, host.len().saturating_add(1));
+            reporter_tx(&reporter, authority.len().saturating_add(1));
             let response = response_fut
                 .await
                 .map_err(|e| anyhow!("h2 response: {e}"))?;
@@ -535,7 +577,7 @@ where
 /// a bad status on either request fails the measurement.
 async fn exchange_head<S>(
     stream: &mut S,
-    host: &str,
+    authority: &str,
     reporter: &Option<ScoreReporter>,
     timeout: Duration,
 ) -> anyhow::Result<Duration>
@@ -548,14 +590,13 @@ where
     // connection.
     async fn round<S: AsyncRead + AsyncWrite + Unpin>(
         stream: &mut S,
-        host: &str,
+        authority: &str,
         close: bool,
         reporter: &Option<ScoreReporter>,
         first_response: bool,
     ) -> anyhow::Result<(Duration, Vec<u8>)> {
         let request = format!(
-            "HEAD / HTTP/1.1\r\nHost: {}\r\nUser-Agent: honk-urltest/1.0\r\n{}\r\n",
-            host,
+            "HEAD / HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: honk-urltest/1.0\r\n{}\r\n",
             if close { "Connection: close\r\n" } else { "" }
         );
         let start = Instant::now();
@@ -588,19 +629,23 @@ where
     // Each round has its own budget: a slow warm-up fails the measurement
     // (the old single-request shape); a lost or slow measured request falls
     // back to the warm sample. A bad status on either request fails.
-    let (warm, warm_buf) =
-        match tokio::time::timeout(timeout, round(stream, host, false, reporter, true)).await {
-            Ok(result) => result?,
-            Err(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "urltest warm-up request timed out",
-                )
-                .into());
-            }
-        };
+    let (warm, warm_buf) = match tokio::time::timeout(
+        timeout,
+        round(stream, authority, false, reporter, true),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "urltest warm-up request timed out",
+            )
+            .into());
+        }
+    };
     validate_status(&warm_buf)?;
-    match tokio::time::timeout(timeout, round(stream, host, true, reporter, false)).await {
+    match tokio::time::timeout(timeout, round(stream, authority, true, reporter, false)).await {
         Ok(Ok((measured, buf))) => {
             validate_status(&buf)?;
             Ok(measured)
@@ -711,44 +756,8 @@ fn normalize_url(url: &str) -> &str {
     }
 }
 
-fn parse_url_host_port(url: &str) -> anyhow::Result<(String, u16, bool)> {
-    let (default_port, rest, is_https) = if let Some(r) = url.strip_prefix("https://") {
-        (443u16, r, true)
-    } else if let Some(r) = url.strip_prefix("http://") {
-        (80u16, r, false)
-    } else {
-        (443u16, url, true)
-    };
-    let authority = rest.split('/').next().unwrap_or(rest).trim();
-    if let Some(rest) = authority.strip_prefix('[') {
-        let (host, tail) = rest
-            .split_once(']')
-            .ok_or_else(|| anyhow!("invalid bracketed host in URL '{}'", url))?;
-        if host.is_empty() {
-            return Err(anyhow!("empty host in URL '{}'", url));
-        }
-        let port = match tail {
-            "" => default_port,
-            tail => tail
-                .strip_prefix(':')
-                .ok_or_else(|| anyhow!("invalid bracketed host in URL '{}'", url))?
-                .parse::<u16>()
-                .with_context(|| format!("invalid port in URL '{}'", url))?,
-        };
-        return Ok((host.to_string(), port, is_https));
-    }
-    if let Some((host, port)) = authority.rsplit_once(':')
-        && let Ok(port) = port.parse::<u16>()
-    {
-        if host.is_empty() {
-            return Err(anyhow!("empty host in URL '{}'", url));
-        }
-        return Ok((host.to_string(), port, is_https));
-    }
-    if authority.is_empty() {
-        return Err(anyhow!("empty host in URL '{}'", url));
-    }
-    Ok((authority.to_string(), default_port, is_https))
+fn parse_url_target(url: &str) -> anyhow::Result<honk_config::check::HttpCheckTarget> {
+    Ok(honk_config::check::decode_http_check_target(url, true)?)
 }
 
 fn validate_status(buf: &[u8]) -> anyhow::Result<()> {
@@ -796,7 +805,7 @@ mod resolver_hook_tests {
                 }
             })
         }));
-        let node = Node::default();
+        let node = honk_config::Config::builtin_direct_node();
         // The dial itself fails (nothing on 127.0.0.1:443) but the hook
         // must have been consulted first.
         let handler = crate::proxy::direct::DirectHandler::new();
@@ -868,12 +877,17 @@ mod tests {
     }
 
     fn make_node(name: &str) -> Node {
-        Node {
-            id: uuid::Uuid::new_v4(),
+        let host = format!("{name}.example");
+        let mut node = Node {
             name: name.into(),
+            address: format!("{host}:443"),
+            host,
+            port: 443,
             outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
             ..Default::default()
-        }
+        };
+        node.id = node.derive_id();
+        node
     }
 
     struct RecordingWarmable {
@@ -923,9 +937,22 @@ mod tests {
     fn reusable_node(name: &str, protocol: NodeProtocol) -> Node {
         let mut node = make_node(name);
         node.outbound = honk_config::node::OutboundConfig::from_protocol(protocol);
-        if let Some(vless) = node.vless_mut() {
-            vless.mode = honk_config::node::WireMode::H2mux;
+        let credential = "00000000-0000-4000-8000-000000000001".to_string();
+        match &mut node.outbound {
+            honk_config::node::OutboundConfig::Vmess(config) => {
+                config.uuid = Some(credential.clone())
+            }
+            honk_config::node::OutboundConfig::Vless(config) => {
+                config.uuid = Some(credential.clone());
+                config.mode = honk_config::node::WireMode::H2mux;
+            }
+            honk_config::node::OutboundConfig::Tuic(config) => {
+                config.uuid = Some(credential.clone())
+            }
+            honk_config::node::OutboundConfig::Juicity(config) => config.uuid = Some(credential),
+            _ => {}
         }
+        node.id = node.derive_id();
         node
     }
 
@@ -1267,12 +1294,7 @@ mod tests {
     #[tokio::test]
     async fn hysteria2_excludes_pre_write_dial_time() {
         let addr = spawn_mock_http_server().await;
-        let node = Node {
-            id: uuid::Uuid::new_v4(),
-            name: "hysteria2".into(),
-            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Hysteria2),
-            ..Default::default()
-        };
+        let node = Node::from_share_link("hysteria2://test@127.0.0.1:443").unwrap();
         let elapsed = urltest_node_addr(
             &crate::runtime::NodeRuntime::ephemeral(&node),
             &DelayedDialHandler {
@@ -1300,30 +1322,57 @@ mod tests {
             "https://example.com/x"
         );
 
+        let target = parse_url_target(DEFAULT_URLTEST_URL).unwrap();
         assert_eq!(
-            parse_url_host_port(DEFAULT_URLTEST_URL).unwrap(),
-            ("www.gstatic.com".to_string(), 443, true)
+            (target.host(), target.port(), target.is_https()),
+            ("www.gstatic.com", 443, true)
         );
+        let target = parse_url_target("https://127.0.0.1:8080/").unwrap();
         assert_eq!(
-            parse_url_host_port("https://127.0.0.1:8080/").unwrap(),
-            ("127.0.0.1".to_string(), 8080, true)
+            (target.host(), target.port(), target.is_https()),
+            ("127.0.0.1", 8080, true)
         );
+        let target = parse_url_target("https://[::1]/").unwrap();
         assert_eq!(
-            parse_url_host_port("https://[::1]/").unwrap(),
-            ("::1".to_string(), 443, true)
+            (target.host(), target.port(), target.is_https()),
+            ("::1", 443, true)
         );
+        let target = parse_url_target("http://[::1]:8080/").unwrap();
         assert_eq!(
-            parse_url_host_port("http://[::1]:8080/").unwrap(),
-            ("::1".to_string(), 8080, false)
+            (target.host(), target.port(), target.is_https()),
+            ("::1", 8080, false)
         );
         // Schemeless URLs are treated as https on port 443.
+        let target = parse_url_target("example.com/204").unwrap();
         assert_eq!(
-            parse_url_host_port("example.com/204").unwrap(),
-            ("example.com".to_string(), 443, true)
+            (target.host(), target.port(), target.is_https()),
+            ("example.com", 443, true)
         );
-        assert!(parse_url_host_port("https://").is_err());
+        assert!(parse_url_target("https://").is_err());
     }
 
+    #[test]
+    fn c25_urltest_authority_boundaries() {
+        for (input, expected) in [
+            (
+                "http://u:PRIVATE@host:8080/path?q",
+                ("host", "host:8080", 8080, false),
+            ),
+            ("https://host?q=1", ("host", "host", 443, true)),
+            ("http://[::1]:8080?q=1", ("::1", "[::1]:8080", 8080, false)),
+        ] {
+            let target = parse_url_target(input).unwrap();
+            assert_eq!(
+                (
+                    target.host(),
+                    target.authority(),
+                    target.port(),
+                    target.is_https()
+                ),
+                expected
+            );
+        }
+    }
     /// The HEAD exchange itself is protocol-agnostic; exercise it over a
     /// plain stream against a local HTTP server.
     #[tokio::test]
@@ -1646,13 +1695,7 @@ mod direct_urltest_tests {
                 .await
                 .unwrap();
         });
-        let node = Node {
-            name: honk_config::Config::BUILTIN_DIRECT_NODE.to_string(),
-            outbound: honk_config::node::OutboundConfig::from_protocol(
-                honk_config::types::NodeProtocol::Direct,
-            ),
-            ..Default::default()
-        };
+        let node = honk_config::Config::builtin_direct_node();
         let handler = crate::proxy::direct::DirectHandler::new();
         let latency = urltest_node(
             &crate::runtime::NodeRuntime::ephemeral(&node),
@@ -1663,5 +1706,23 @@ mod direct_urltest_tests {
         .await
         .expect("direct urltest must exchange with the requested URL");
         assert!(latency < Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod fallible_probe_tests {
+    use super::*;
+
+    #[test]
+    fn try_probe_runtime_rejects_stale_id_before_warm_lookup() {
+        let mut node = Node::from_share_link("socks5://127.0.0.1:1080").unwrap();
+        let generation =
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+        node.port += 1;
+        let error = try_probe_runtime(&generation, &node).unwrap_err();
+        let crate::runtime::RuntimeRegistryError::Admission(error) = error else {
+            panic!("expected node admission error");
+        };
+        assert_eq!(error.diagnostic.code, "noncanonical-node-id");
     }
 }

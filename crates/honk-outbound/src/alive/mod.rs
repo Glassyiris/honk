@@ -473,22 +473,19 @@ impl AliveDialerSet {
         *self.http_prober.write() = Some(prober);
         *self.check_method.write() = check_method.clone();
 
-        let port = Self::parse_url_port(&check_url);
-        let Some(hostname) = Self::parse_url_host(&check_url) else {
-            tracing::warn!(
-                "Invalid health check URL '{}'; falling back to TCP probe",
-                check_url
-            );
+        let Ok(target) = honk_config::check::decode_health_http_target(&check_url) else {
+            tracing::warn!("Invalid health check URL; falling back to TCP probe");
             *self.check_url.write() = String::new();
             self.check_url_ips.write().clear();
             return;
         };
+        let (hostname, port) = (target.host(), target.port());
         *self.check_url.write() = check_url.clone();
 
         // Resolve the check URL hostname once at startup; dae-format literal
         // fallback IPs (comma-separated) are merged in so probes still have
         // targets even when DNS resolution fails.
-        let addrs = self.resolve_host(&hostname, port).await;
+        let addrs = self.resolve_host(hostname, port).await;
         if addrs.is_empty() {
             tracing::warn!("Failed to resolve health check URL '{}'", hostname);
         }
@@ -537,7 +534,7 @@ impl AliveDialerSet {
             }
             tracing::debug!("health-check resolver found nothing for {host}; system fallback");
         }
-        tokio::net::lookup_host(format!("{host}:{port}"))
+        tokio::net::lookup_host((host, port))
             .await
             .map(|it| it.collect())
             .unwrap_or_default()
@@ -548,9 +545,9 @@ impl AliveDialerSet {
     /// Matches Go's `TcpCheckOptionRaw.Reset()`.
     pub async fn refresh_check_ips(&self) {
         let check_url = self.check_url.read().clone();
-        if let Some(hostname) = Self::parse_url_host(&check_url) {
-            let port = Self::parse_url_port(&check_url);
-            let addrs = self.resolve_host(&hostname, port).await;
+        if let Ok(target) = honk_config::check::decode_health_http_target(&check_url) {
+            let port = target.port();
+            let addrs = self.resolve_host(target.host(), port).await;
             if !addrs.is_empty() {
                 let ips = Self::merge_check_addrs(addrs, &check_url, port);
                 *self.check_url_ips.write() = ips;
@@ -1420,13 +1417,13 @@ impl AliveDialerSet {
         if let Some(ips) = self.url_check_ips.read().get(url) {
             return ips.clone();
         }
-        let ips = match Self::parse_url_host(url) {
-            Some(hostname) => {
-                let port = Self::parse_url_port(url);
-                let addrs = self.resolve_host(&hostname, port).await;
+        let ips = match honk_config::check::decode_health_http_target(url) {
+            Ok(target) => {
+                let port = target.port();
+                let addrs = self.resolve_host(target.host(), port).await;
                 Self::merge_check_addrs(addrs, url, port)
             }
-            None => Self::merge_check_addrs(Vec::new(), url, Self::parse_url_port(url)),
+            Err(_) => Self::merge_check_addrs(Vec::new(), url, 80),
         };
         self.url_check_ips
             .write()
@@ -1554,71 +1551,6 @@ impl AliveDialerSet {
             .get(&node_id)
             .map(|s| s[idx].consecutive_failures)
             .unwrap_or(0)
-    }
-
-    /// Extract hostname from a URL string like "http://cp.cloudflare.com".
-    ///
-    /// The dae config format allows comma-separated fallback IPs after the
-    /// URL (`http://host,ip4,ip6`, Go: `TcpCheckOptionRaw.Raw`); only the
-    /// first segment is the URL.
-    fn parse_url_host(url: &str) -> Option<String> {
-        let s = url.trim();
-        // The scheme is optional: dae check URLs are usually written with
-        // one, but bare `host/path` forms also appear.
-        let s = s
-            .strip_prefix("http://")
-            .or_else(|| s.strip_prefix("https://"))
-            .unwrap_or(s);
-        // dae comma-separated fallback list: first segment is the URL.
-        let s = s.split(',').next().unwrap_or(s).trim();
-        // Drop any path/query/fragment — only the authority is resolved.
-        // (Previously only a single trailing '/' was stripped, so a URL like
-        // `http://www.google-analytics.com/generate_204` was looked up as the
-        // hostname "www.google-analytics.com/generate_204" and DNS failed.)
-        let s = s.split(['/', '?', '#']).next().unwrap_or(s);
-        // Strip the port, keeping bracketed IPv6 literals intact.
-        let host = if let Some(rest) = s.strip_prefix('[') {
-            rest.split(']').next().unwrap_or(s)
-        } else {
-            s.split(':').next().unwrap_or(s)
-        };
-        if host.is_empty() {
-            None
-        } else {
-            Some(host.to_string())
-        }
-    }
-
-    /// Port of a check URL: the explicit `:port` of the first (URL) segment
-    /// wins; otherwise the scheme default (https 443, http/bare 80).
-    fn parse_url_port(url: &str) -> u16 {
-        let s = url.trim();
-        let (default_port, rest) = if let Some(rest) = s.strip_prefix("https://") {
-            (443, rest)
-        } else if let Some(rest) = s.strip_prefix("http://") {
-            (80, rest)
-        } else {
-            (80, s)
-        };
-        let authority = rest
-            .split(',')
-            .next()
-            .unwrap_or(rest)
-            .trim()
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or("");
-        let port_str = if let Some(rest) = authority.strip_prefix('[') {
-            // [v6]:port — only a port after the closing bracket counts.
-            rest.split(']')
-                .nth(1)
-                .and_then(|tail| tail.strip_prefix(':'))
-        } else {
-            authority.rsplit_once(':').map(|(_, port)| port)
-        };
-        port_str
-            .and_then(|p| p.parse::<u16>().ok())
-            .unwrap_or(default_port)
     }
 
     /// Extract the comma-separated literal fallback IPs from a dae-format

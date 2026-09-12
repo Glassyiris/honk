@@ -217,9 +217,9 @@ fn conditions(writer: &mut Writer, values: &[DnsCond]) -> Result<(), PolicyError
                 for value in cidrs {
                     let network =
                         parse_ip_net_str(value).ok_or_else(|| PolicyError::InvalidCidr {
-                            value: value.clone(),
+                            value: "<redacted>".into(),
                         })?;
-                    writer.string(&network.trunc().to_string())?;
+                    writer.string(&network.to_string())?;
                 }
             }
             DnsCond::Upstream { not, names } => {
@@ -236,11 +236,9 @@ fn conditions(writer: &mut Writer, values: &[DnsCond]) -> Result<(), PolicyError
                 writer.len(cidrs.len())?;
                 for value in cidrs {
                     let network =
-                        value
-                            .parse::<ipnet::IpNet>()
-                            .map_err(|_| PolicyError::InvalidCidr {
-                                value: value.clone(),
-                            })?;
+                        parse_ip_net_str(value).ok_or_else(|| PolicyError::InvalidCidr {
+                            value: "<redacted>".into(),
+                        })?;
                     writer.string(&network.to_string())?;
                 }
                 writer.len(geoip.len())?;

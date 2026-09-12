@@ -35,6 +35,10 @@ pub const VERSION: &str = env!("HONK_VERSION");
 
 use clap::Parser;
 use honk_config::Config;
+use honk_config::diagnostic::{
+    DetailedDiagnostic, DiagnosticSources, SettingPath, finish_attempt, report_detailed_diagnostics,
+};
+use honk_config::error::{DetailedConfigError, ErrorCategory};
 use std::path::PathBuf;
 use tracing::{info, warn};
 
@@ -554,14 +558,59 @@ fn open_log_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
     Ok(file)
 }
 
-#[cfg(feature = "clash-api")]
-fn warn_api_exposure(listen: std::net::SocketAddr, secret: &str) {
-    if !listen.ip().is_loopback() && secret.is_empty() {
-        warn!(
-            listen = %listen,
-            "Clash API authentication is disabled on a non-loopback address; the API has no TLS"
+fn load_operator_config(
+    path: &str,
+    diagnostics: &mut Vec<DetailedDiagnostic>,
+) -> Result<Config, DetailedConfigError> {
+    let start = diagnostics.len();
+    // The file loader already owns parse failures; only validation finishes here.
+    let config = Config::from_file_with_detailed_diagnostics(path, diagnostics)?;
+    let source = diagnostics.get(start).map_or_else(
+        || DiagnosticSources::new(Some(path.into())).root(),
+        |diagnostic| diagnostic.source.sources().root(),
+    );
+    config.append_diagnostics(source.clone(), diagnostics);
+    let result = config.validate_detailed().and_then(|()| {
+        subscription::validate_subscription_ids(&config.subscriptions).map_err(|_| {
+            DetailedConfigError::new(
+                ErrorCategory::Validation,
+                "invalid-subscription-id",
+                source.clone(),
+                SettingPath::new("subscriptions").field("id"),
+                "subscription IDs must be non-nil and unique",
+            )
+        })
+    });
+    let result = result.map_err(|mut error| {
+        error.diagnostic.source = source;
+        error
+    });
+    finish_attempt(result.map(|()| config), diagnostics)
+}
+
+fn report_startup_failure(diagnostics: &[DetailedDiagnostic]) {
+    for diagnostic in diagnostics.iter().filter(|diagnostic| !diagnostic.terminal) {
+        eprintln!(
+            "{:?} code={} setting={} value={}: {}",
+            diagnostic.severity,
+            diagnostic.code,
+            diagnostic.setting,
+            diagnostic.value,
+            diagnostic.message,
         );
     }
+}
+
+/// Render one runtime admission rejection at the process reporting boundary.
+pub(crate) fn report_runtime_admission_error(error: &DetailedConfigError) {
+    let diagnostic = error.diagnostic.as_ref();
+    tracing::error!(
+        code = diagnostic.code,
+        setting = %diagnostic.setting,
+        value = %diagnostic.value,
+        "runtime configuration rejected: {}",
+        diagnostic.message
+    );
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -569,54 +618,76 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // the config file is honored (previously only --debug/RUST_LOG had any
     // effect and config log_level was silently ignored).
     let mut diagnostics = Vec::new();
-    let mut config =
-        Config::from_file_with_diagnostics(cli.config.to_str().unwrap(), &mut diagnostics)?;
-    config.validate()?;
-    subscription::validate_subscription_ids(&config.subscriptions)?;
-    let requested_data_dir = PathBuf::from(&config.global.data_dir);
-    let (runtime_data_dir, data_dir_creation_error) =
-        prepare_runtime_data_dir(&requested_data_dir)?;
-    honk_config::paths::set_data_dir(runtime_data_dir).map_err(|requested| {
-        anyhow::anyhow!(
-            "runtime data directory is already {}; cannot switch to {}",
-            honk_config::paths::data_dir().display(),
-            requested.display()
-        )
-    })?;
-    // Make `direct`/`block` usable as group members without declaring them
-    // in the config (Direct/Block protocols → DirectHandler/BlockHandler).
-    config.ensure_builtin_nodes();
-    // Traffic to the gateway's own addresses always goes direct (must),
-    // keeping admin/API access alive even when every node is down.
-    config.ensure_local_direct_rules();
+    let startup = (|| -> anyhow::Result<_> {
+        let mut config = load_operator_config(cli.config.to_str().unwrap(), &mut diagnostics)?;
+        let requested_data_dir = PathBuf::from(&config.global.data_dir);
+        let (runtime_data_dir, data_dir_creation_error) =
+            prepare_runtime_data_dir(&requested_data_dir)?;
+        honk_config::paths::set_data_dir(runtime_data_dir).map_err(|requested| {
+            anyhow::anyhow!(
+                "runtime data directory is already {}; cannot switch to {}",
+                honk_config::paths::data_dir().display(),
+                requested.display()
+            )
+        })?;
+        // Make `direct`/`block` usable as group members without declaring them
+        // in the config (Direct/Block protocols → DirectHandler/BlockHandler).
+        config.ensure_builtin_nodes();
+        // Traffic to the gateway's own addresses always goes direct (must),
+        // keeping admin/API access alive even when every node is down.
+        config.ensure_local_direct_rules();
 
-    // Effective log level: --debug flag > RUST_LOG env > config log_level >
-    // "info".
-    let config_level = match config.global.log_level.trim() {
-        "" => "info",
-        other => other,
-    };
-    let default_level = if cli.debug { "debug" } else { config_level };
-    // quinn logs every endpoint-driver death at ERROR; probe/warm endpoints
-    // over retiring AnyTLS sessions die as a matter of course (the SYNACK
-    // watchdog kills them on purpose), so that target is silenced unless
-    // RUST_LOG says otherwise.
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new(format!("{default_level},quinn::endpoint=off"))
-    });
+        // Effective log level: --debug flag > RUST_LOG env > config log_level >
+        // "info".
+        let config_level = match config.global.log_level.trim() {
+            "" => "info",
+            other => other,
+        };
+        let default_level = if cli.debug { "debug" } else { config_level };
+        // quinn logs every endpoint-driver death at ERROR; probe/warm endpoints
+        // over retiring AnyTLS sessions die as a matter of course (the SYNACK
+        // watchdog kills them on purpose), so that target is silenced unless
+        // RUST_LOG says otherwise.
+        let env_filter =
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(format!("{default_level},quinn::endpoint=off"))
+            });
 
-    let log_file_path = resolved_log_file_path(&config, cli.log_file.as_deref());
-    let log_file_layer = if let Some(path) = log_file_path.as_ref() {
-        let file = open_log_file(path)?;
-        Some(
-            tracing_subscriber::fmt::layer()
-                .with_timer(LocalTime)
-                .with_ansi(false)
-                .with_writer(std::sync::Mutex::new(file))
-                .with_filter(env_filter.clone()),
-        )
-    } else {
-        None
+        let log_file_path = resolved_log_file_path(&config, cli.log_file.as_deref());
+        let log_file_layer = if let Some(path) = log_file_path.as_ref() {
+            let file = open_log_file(path)?;
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .with_timer(LocalTime)
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(file))
+                    .with_filter(env_filter.clone()),
+            )
+        } else {
+            None
+        };
+        Ok((
+            config,
+            requested_data_dir,
+            data_dir_creation_error,
+            log_file_path,
+            log_file_layer,
+            env_filter,
+        ))
+    })();
+    let (
+        mut config,
+        requested_data_dir,
+        data_dir_creation_error,
+        log_file_path,
+        log_file_layer,
+        env_filter,
+    ) = match startup {
+        Ok(startup) => startup,
+        Err(error) => {
+            report_startup_failure(&diagnostics);
+            return Err(error);
+        }
     };
 
     // Console, optional file, and Clash API output use independent layers.
@@ -646,7 +717,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             "Runtime data directory is unusable; using process working directory"
         );
     }
-    honk_config::diagnostic::report_diagnostics(&diagnostics);
+    report_detailed_diagnostics(&diagnostics);
     info!(directory = %honk_config::paths::data_dir().display(), "Runtime data directory configured");
     if let Some(path) = log_file_path.as_ref() {
         info!(path = %path.display(), "File logging enabled");
@@ -712,6 +783,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         &config.nodes,
         &config.subscriptions,
     );
+    config
+        .validate_assembled()
+        .map_err(|error| anyhow::anyhow!("invalid assembled configuration: {error}"))?;
     for group in &config.groups {
         info!(
             "Group '{}' resolved {} node(s)",
@@ -1164,7 +1238,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         };
         match listen_str.parse::<std::net::SocketAddr>() {
             Ok(listen) => {
-                warn_api_exposure(listen, &clash_cfg.secret);
                 let stream_samplers = std::sync::Arc::new(clash_api::StreamSamplers::new());
                 let connection_tracker = control_plane.connection_tracker();
                 let state = std::sync::Arc::new(clash_api::ClashState {
@@ -1225,26 +1298,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             request_id = request_id.wrapping_add(1).max(1);
             info!("SIGHUP reload request {request_id} received");
             let mut diagnostics = Vec::new();
-            match Config::from_file_with_diagnostics(
+            let result = load_operator_config(
                 config_path.to_str().unwrap_or("/etc/honk/config.dae"),
                 &mut diagnostics,
-            ) {
+            );
+            report_detailed_diagnostics(&diagnostics);
+            match result {
                 Ok(mut new_config) => {
-                    honk_config::diagnostic::report_diagnostics(&diagnostics);
-                    if let Err(error) = new_config.validate() {
-                        warn!(
-                            "SIGHUP reload request {request_id} rejected: invalid config: {error}"
-                        );
-                        continue;
-                    }
-                    if let Err(error) =
-                        subscription::validate_subscription_ids(&new_config.subscriptions)
-                    {
-                        warn!(
-                            "SIGHUP reload request {request_id} rejected: invalid config: {error}"
-                        );
-                        continue;
-                    }
                     new_config.ensure_builtin_nodes();
                     new_config.ensure_local_direct_rules();
                     if let Err(error) = request_runtime_reload(
@@ -1260,9 +1320,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                         break;
                     }
                 }
-                Err(e) => {
-                    honk_config::diagnostic::report_diagnostics(&diagnostics);
-                    warn!("SIGHUP reload request {request_id} rejected: config load failed: {e}")
+                Err(error) => {
+                    warn!("SIGHUP reload request {request_id} rejected: {error}")
                 }
             }
         }
@@ -1915,8 +1974,9 @@ mod local_time_tests {
 #[cfg(test)]
 mod startup_lifecycle_tests {
     use super::{
-        ClashCommand, Cli, open_log_file, prepare_nfqueue_startup, prepare_runtime_data_dir,
-        prepare_runtime_data_dir_with_fallback, publish_instance_pid, running_instance_pid,
+        ClashCommand, Cli, load_operator_config, open_log_file, prepare_nfqueue_startup,
+        prepare_runtime_data_dir, prepare_runtime_data_dir_with_fallback, publish_instance_pid,
+        running_instance_pid,
     };
     use clap::Parser;
 
@@ -2083,93 +2143,23 @@ mod startup_lifecycle_tests {
         drop(lock);
         assert!(running_instance_pid(&path).is_err());
     }
-
-    #[cfg(feature = "clash-api")]
-    const API_WARNING_CASES: &[(&str, &str, &str, bool)] = &[
-        ("wildcard_ipv4_empty", "0.0.0.0:9090", "", true),
-        ("wildcard_ipv6_empty", "[::]:9091", "", true),
-        (
-            "wildcard_ipv6_secret",
-            "[::]:9092",
-            "wildcard-v6-secret",
-            false,
-        ),
-        ("assigned_ipv4_empty", "192.0.2.221:9092", "", true),
-        ("assigned_ipv6_empty", "[2001:db8::221]:9093", "", true),
-        (
-            "assigned_ipv6_secret",
-            "[2001:db8::221]:9095",
-            "assigned-v6-secret",
-            false,
-        ),
-        ("loopback_ipv4_empty", "127.0.0.1:9094", "", false),
-        (
-            "loopback_ipv4_secret",
-            "127.0.0.1:9095",
-            "loopback-v4-secret",
-            false,
-        ),
-        ("loopback_ipv6_empty", "[::1]:9096", "", false),
-        (
-            "loopback_ipv6_secret",
-            "[::1]:9097",
-            "loopback-v6-secret",
-            false,
-        ),
-        (
-            "assigned_ipv4_secret",
-            "192.0.2.222:9098",
-            "assigned-v4-secret",
-            false,
-        ),
-        ("wildcard_ipv4_whitespace", "0.0.0.0:9099", " ", false),
-    ];
-
-    #[cfg(feature = "clash-api")]
     #[test]
-    fn api_exposure_warning_captures_only_unsafe_cases() {
-        let output = tempfile::NamedTempFile::new().expect("create warning capture");
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(std::sync::Arc::new(
-                output.reopen().expect("reopen warning capture"),
-            ))
-            .finish();
+    fn startup_load_reports_duplicate_node_identity() {
+        let file = tempfile::Builder::new().suffix(".dae").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            "node {\n a: 'socks5://127.0.0.1:1080'\n b: 'socks5://127.0.0.1:1080'\n}\n",
+        )
+        .unwrap();
 
-        let cases = tracing::subscriber::with_default(subscriber, || {
-            API_WARNING_CASES
-                .iter()
-                .map(|&(name, address, secret, exposed)| {
-                    let listen: std::net::SocketAddr =
-                        address.parse().expect("parse warning case address");
-                    let listen_text = listen.to_string();
-                    super::warn_api_exposure(listen, secret);
-                    (name, listen_text, secret, exposed)
-                })
-                .collect::<Vec<_>>()
-        });
-
-        let captured =
-            std::fs::read_to_string(output.path()).expect("read captured warning output");
-        let unsafe_cases = cases.iter().filter(|case| case.3).count();
-        assert_eq!(captured.lines().count(), unsafe_cases);
-        for (name, listen, secret, exposed) in cases {
-            let matching = captured
-                .lines()
-                .filter(|line| line.contains(&listen))
-                .collect::<Vec<_>>();
-            if exposed {
-                assert_eq!(matching.len(), 1, "{name}");
-                assert!(matching[0].contains("WARN"), "{name}");
-                assert!(matching[0].contains("authentication is disabled"), "{name}");
-                assert!(matching[0].contains("no TLS"), "{name}");
-            } else {
-                assert!(matching.is_empty(), "{name}");
-            }
-            if secret.chars().any(|character| !character.is_whitespace()) {
-                assert!(!captured.contains(secret), "{name}");
-            }
-        }
+        let mut diagnostics = Vec::new();
+        let error = load_operator_config(file.path().to_str().unwrap(), &mut diagnostics)
+            .expect_err("duplicate node IDs must reject startup");
+        assert_eq!(error.diagnostic.code, "duplicate-node-id");
+        assert_eq!(error.diagnostic.setting.to_string(), "nodes[2]");
+        assert_eq!(error.diagnostic.related_indices, [1]);
+        let rendered = error.to_string();
+        assert!(rendered.contains("node ID duplicates another node"));
+        assert!(!rendered.contains("configuration validation failed"));
     }
 }

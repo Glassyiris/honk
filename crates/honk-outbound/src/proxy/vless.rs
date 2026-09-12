@@ -1112,14 +1112,14 @@ impl TcpOutbound for VLessHandler {
     ) -> anyhow::Result<ProxyStream> {
         match node.vless().unwrap().mode {
             WireMode::H2mux | WireMode::H2muxPadded => {
-                let owner = crate::runtime::NodeRuntime::ephemeral_guarded(node);
+                let owner = crate::runtime::NodeRuntime::try_ephemeral_guarded(node)?;
                 let stream =
                     Self::open_h2_tcp(owner.runtime(), target, target_domain, connect_timeout)
                         .await?;
                 Ok(stream.with_owner(owner))
             }
             WireMode::MuxCool => {
-                let owner = crate::runtime::NodeRuntime::ephemeral_guarded(node);
+                let owner = crate::runtime::NodeRuntime::try_ephemeral_guarded(node)?;
                 let stream =
                     Self::open_cool_tcp(owner.runtime(), target, target_domain, connect_timeout)
                         .await?;
@@ -1205,14 +1205,14 @@ impl PacketOutbound for VLessHandler {
                 Ok(super::vless_cool::connect_single_xudp(stream, target, target_domain).await?)
             }
             WireMode::H2mux | WireMode::H2muxPadded => {
-                let owner = crate::runtime::NodeRuntime::ephemeral_guarded(node);
+                let owner = crate::runtime::NodeRuntime::try_ephemeral_guarded(node)?;
                 let transport =
                     Self::open_h2_udp(owner.runtime(), target, target_domain, connect_timeout)
                         .await?;
                 Ok(super::packet_transport_with_owner(transport, owner))
             }
             WireMode::MuxCool => {
-                let owner = crate::runtime::NodeRuntime::ephemeral_guarded(node);
+                let owner = crate::runtime::NodeRuntime::try_ephemeral_guarded(node)?;
                 let transport =
                     Self::open_cool_udp(owner.runtime(), target, target_domain, connect_timeout)
                         .await?;
@@ -2023,6 +2023,8 @@ mod tests {
             port,
             ..vless_node("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3", WireMode::H2mux)
         };
+        let mut node = node;
+        node.id = node.derive_id();
         let generation = Arc::new(
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
         );

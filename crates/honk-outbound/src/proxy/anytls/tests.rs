@@ -87,17 +87,23 @@ async fn padding_writer_honors_check_and_frame_size_boundaries() {
 }
 
 fn anytls_node(name: &str) -> Node {
-    Node {
-        id: uuid::Uuid::new_v4(),
+    let host = format!("{name}.example");
+    let mut node = Node {
         name: name.into(),
+        address: format!("{host}:443"),
+        host,
+        port: 443,
         outbound: honk_config::node::OutboundConfig::AnyTls(Default::default()),
         ..Default::default()
-    }
+    };
+    node.id = node.derive_id();
+    node
 }
 
 fn zero_idle_anytls_node(name: &str) -> Node {
     let mut node = anytls_node(name);
     node.anytls_mut().unwrap().min_idle_session = Some(0);
+    node.id = node.derive_id();
     node
 }
 

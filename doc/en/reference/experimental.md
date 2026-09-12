@@ -28,6 +28,8 @@ All `clash_api` fields are startup-owned. SIGHUP rejects a candidate configurati
 
 With a non-empty `secret`, API requests use `Authorization: Bearer <secret>`; WebSocket upgrades may instead pass `?token=<secret>`. Static `/ui` content is outside this authentication middleware. The built-in listener serves plain HTTP and provides no TLS. Bind it to a loopback address such as `127.0.0.1`, or put an authenticated TLS reverse proxy in front of it; do not expose it directly on an untrusted network. See the [Clash API reference](./api.md) for the endpoint inventory.
 
+An explicitly enabled non-loopback bind with an empty secret emits `unsafe-api-bind` at `experimental.clash_api.external_controller`, including structured input. The diagnostic contains neither the endpoint nor the secret. Loopback sample configurations do not warn; this warning does not change bind, authentication, or CORS policy.
+
 ### External UI
 
 An absolute `external_ui` path is used literally. A relative path selects an existing directory below `global.data_dir` first, then an existing directory below `/var/share/honk`, then an existing working-directory-relative directory; if none exists, honk creates the target below `global.data_dir`. A missing or empty target triggers a background dashboard ZIP download. A non-empty `external_ui_download_url` replaces the built-in zashboard URL; `HONK_UI_DOWNLOAD_URL` has highest precedence over both.

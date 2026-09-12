@@ -16,6 +16,7 @@ fallback: outbound
 - Single or double quotes keep `,`, `)`, `&&`, and `->` literal inside matcher arguments. A prefixed argument may quote only its value, as in `domain(full: 'example.com')`; backslashes are preserved rather than decoded.
 - A leading `!` negates only the single matcher immediately following it. A rule matches when its positive conditions match and none of its negated matchers hits.
 - An unknown or unsniffed domain counts as “not x” for a negated domain or geosite matcher. It does not veto that rule.
+- Unknown nonempty predicates, whitespace before matcher parentheses, and trailing matcher text reject the configuration with a located diagnostic. Unsupported nonempty terms are never removed from a conjunction. Existing empty traffic-term and empty-argument behavior is unchanged.
 
 ```dae
 routing {

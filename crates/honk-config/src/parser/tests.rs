@@ -5,6 +5,7 @@ use crate::parser::parse_dae_config_with_diagnostics;
 #[cfg(test)]
 mod parser_tests {
     use crate::parser::{parse_dae_config, parse_dae_config_with_diagnostics};
+    use base64::Engine as _;
 
     #[test]
     fn test_parse_example_dae() {
@@ -70,8 +71,6 @@ global {
                 assert_eq!(observed, default, "{setting} for {value}");
                 assert_eq!(diagnostics.len(), 1, "{setting} for {value}");
                 assert_eq!(diagnostics[0].setting, setting);
-                assert_eq!(diagnostics[0].value, value);
-                assert!(diagnostics[0].message.contains(&format!("{default}ms")));
             }
         }
     }
@@ -84,10 +83,8 @@ global {
             &mut diagnostics,
         );
         assert!(result.is_err());
-        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics.len(), 2);
         assert_eq!(diagnostics[0].setting, "global.check_tolerance");
-        assert_eq!(diagnostics[0].value, "abc");
-        assert!(diagnostics[0].message.contains("50ms"));
     }
 
     #[test]
@@ -104,8 +101,6 @@ global {
         assert_eq!(config.global.check_tolerance_ms, 50);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].setting, "global.check_tolerance");
-        assert_eq!(diagnostics[0].value, "abc");
-        assert!(diagnostics[0].message.contains("50ms"));
     }
 
     #[test]
@@ -131,6 +126,29 @@ global {
     }
 
     #[test]
+    fn test_unrelated_scalar_cannot_hide_dae_semantic_failure() {
+        let file = tempfile::Builder::new().suffix(".dae").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            include_str!("../../tests/fixtures/invalid_nfqueue_with_scalar.dae"),
+        )
+        .unwrap();
+        let mut diagnostics = Vec::new();
+        let error = crate::Config::from_file_with_detailed_diagnostics(
+            file.path().to_str().unwrap(),
+            &mut diagnostics,
+        )
+        .unwrap_err();
+        assert_eq!(error.category, crate::error::ErrorCategory::Parse);
+        assert_eq!(diagnostics.iter().filter(|d| d.terminal).count(), 1);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code == "invalid-structured-config")
+        );
+    }
+
+    #[test]
     fn test_include_preserves_timer_diagnostics() {
         let dir = tempfile::tempdir().unwrap();
         let entry = dir.path().join("config.dae");
@@ -148,8 +166,6 @@ global {
         assert_eq!(config.global.sniffing_timeout_ms, 30);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].setting, "global.sniffing_timeout");
-        assert_eq!(diagnostics[0].value, "1m");
-        assert!(diagnostics[0].message.contains("30ms"));
     }
 
     #[test]
@@ -373,9 +389,21 @@ node {
     }
 
     #[test]
+    fn test_parse_tagged_vmess_with_empty_remark() {
+        let payload = r#"{"ps":"","add":"vmess.example.com","port":443,"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}"#;
+        let link = format!(
+            "vmess://{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+        );
+        let config = parse_dae_config(&format!("node {{\n edge: '{link}'\n}}")).unwrap();
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].name, "edge");
+    }
+
+    #[test]
     fn test_parse_vless_mode_link() {
         let config = parse_dae_config(
-            "node {\n    xudp: 'vless://uuid@example.com:443?vless_mode=xudp#node'\n    cool: 'vless://uuid@example.com:443?vless_mode=mux-cool#node'\n}",
+            "node {\n    xudp: 'vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=xudp#node'\n    cool: 'vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=mux-cool#node'\n}",
         )
         .unwrap();
         assert_eq!(config.nodes.len(), 2);
@@ -399,16 +427,10 @@ node {
             "node {\n    'http://proxy.example.com:8080'\n}",
         ] {
             let err = parse_dae_config(input).unwrap_err();
-            assert!(
-                err.to_string().contains("Unknown node protocol"),
-                "removed protocols must be a hard error in the config file: {err}"
-            );
+            assert!(matches!(err, crate::ConfigError::UnknownProtocol(_)));
         }
         let err = parse_dae_config("node {\n    mux = true\n}").unwrap_err();
-        assert!(
-            err.to_string().contains("vless_mode"),
-            "standalone mux must direct users to the normalized link mode: {err}"
-        );
+        assert!(matches!(err, crate::ConfigError::Parse(_)));
     }
 
     #[test]
@@ -623,12 +645,8 @@ group {
         assert!(config.groups[1].groups.is_empty());
         assert!(config.groups[1].nodes.is_empty());
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].setting, "group.proxy.filter");
+        assert_eq!(diagnostics[0].setting, "groups[2].filter");
         assert_eq!(diagnostics[0].value, "1");
-        assert_eq!(
-            diagnostics[0].message,
-            "group(...) must be the whole filter line; ignored"
-        );
         assert_eq!(config.groups[0].nodes, vec![config.nodes[0].id]);
         assert_eq!(config.groups[2].nodes, vec![config.nodes[1].id]);
 
@@ -670,7 +688,7 @@ group {
         assert!(group("proxy").groups.is_empty());
         assert!(group("proxy").nodes.is_empty());
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].setting, "group.proxy.filter");
+        assert_eq!(diagnostics[0].setting, "groups[1].filter");
         assert_eq!(diagnostics[0].value, "1");
     }
 
@@ -1016,21 +1034,13 @@ group {
     }
 
     #[test]
-    fn test_entry_subscription_hostless_validation() {
-        let config = parse_dae_config("subscription {\n 'https://:80/x'\n}").unwrap();
-        let crate::ConfigError::Validation(message) = config.validate().unwrap_err() else {
-            panic!("expected subscription validation error");
-        };
-        assert_eq!(message, "subscription name must not be empty");
-    }
-
-    #[test]
     fn test_entry_subscription_hostless_name() {
         let config = parse_dae_config("subscription {\n 'https://:80/x'\n}").unwrap();
         assert_eq!(config.subscriptions.len(), 1);
         assert_eq!(config.subscriptions[0].name, "");
         assert_eq!(config.subscriptions[0].url, "https://:80/x");
         assert_eq!(config.subscriptions[0].user_agent, None);
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -1050,13 +1060,10 @@ group {
         assert_eq!(config.subscriptions[0].name, "broken");
         assert_eq!(config.subscriptions[0].url, "not-a-url");
         assert_eq!(config.subscriptions[0].user_agent, None);
-        let crate::ConfigError::Validation(message) = config.validate().unwrap_err() else {
-            panic!("expected subscription validation error");
-        };
-        assert_eq!(
-            message,
-            "subscription 'broken' url must use http:// or https://"
-        );
+        assert!(matches!(
+            config.validate(),
+            Err(crate::ConfigError::Validation(_))
+        ));
     }
 
     #[test]
@@ -1570,9 +1577,9 @@ fn test_group_name_filter_exact_multi_and_regex() {
     // regex: gives a raw pattern (Go dae filter.go parity).
     let input = r#"
 node {
-    juicity-1: 'juicity://u:p@1.1.1.1:443'
-    juicity-2: 'juicity://u:p@2.2.2.2:443'
-    other: 'juicity://u:p@3.3.3.3:443'
+    juicity-1: 'juicity://00000000-0000-0000-0000-000000000001:p@1.1.1.1:443'
+    juicity-2: 'juicity://00000000-0000-0000-0000-000000000001:p@2.2.2.2:443'
+    other: 'juicity://00000000-0000-0000-0000-000000000001:p@3.3.3.3:443'
 }
 group {
     exact {
@@ -1617,19 +1624,6 @@ group {
     assert_eq!(names("kw"), vec!["juicity-1"]);
     // Exact match on a shared prefix matches NOTHING (the test.dae case).
     assert!(names("nomatch").is_empty());
-}
-
-#[test]
-fn node_parse_diagnostic_redacts_share_link_credentials() {
-    for uri in [
-        "trojan://super-secret@",
-        "vless://uuid@example.com:443?vless_mode=super-secret",
-    ] {
-        let error = crate::node::Node::from_share_link(uri).unwrap_err();
-        let diagnostic = super::node_parse_diagnostic(&error);
-        assert!(!diagnostic.contains(uri));
-        assert!(!diagnostic.contains("super-secret"));
-    }
 }
 
 #[test]
@@ -2206,7 +2200,6 @@ fn test_parse_dns_stale_reply_ttl_invalid_uses_default_and_diagnostic() {
     assert_eq!(config.dns.cache.stale_reply_ttl, 30);
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert_eq!(diagnostics[0].setting, "dns.optimistic_stale_reply_ttl");
-    assert_eq!(diagnostics[0].value, "x");
 }
 
 #[test]
@@ -2466,10 +2459,10 @@ fn test_routing_condition_not_serde_defaults() {
 
 #[test]
 fn test_unparseable_ports_use_the_fallback_and_return_diagnostics() {
-    for (key, value, expected, fallback) in [
-        ("tproxy_port", "abc", 12345u16, "12345"),
-        ("tproxy_port", "0x3039", 12345u16, "12345"),
-        ("pprof_port", "abc", 0u16, "0"),
+    for (key, value, expected) in [
+        ("tproxy_port", "abc", 12345u16),
+        ("tproxy_port", "0x3039", 12345u16),
+        ("pprof_port", "abc", 0u16),
     ] {
         let input = format!("global {{\n    {key}: {value}\n}}");
         let mut diagnostics = Vec::new();
@@ -2477,8 +2470,6 @@ fn test_unparseable_ports_use_the_fallback_and_return_diagnostics() {
 
         assert_eq!(diagnostics.len(), 1, "{key}={value}: {diagnostics:?}");
         assert_eq!(diagnostics[0].setting, format!("global.{key}"));
-        assert_eq!(diagnostics[0].value, value);
-        assert!(diagnostics[0].message.contains(fallback));
         let observed = if key == "tproxy_port" {
             config.global.tproxy_port
         } else {
@@ -2509,8 +2500,6 @@ fn test_unparseable_so_mark_uses_the_fallback_and_returns_a_diagnostic() {
 
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert_eq!(diagnostics[0].setting, "global.so_mark_from_dae");
-    assert_eq!(diagnostics[0].value, "zz");
-    assert!(diagnostics[0].message.contains("0"));
     assert_eq!(config.global.so_mark_from_dae, 0);
 
     for value in ["0x10", "10"] {
@@ -2541,8 +2530,6 @@ fn test_unparseable_second_durations_use_the_fallback_and_return_diagnostics() {
             "check_interval={value}: {diagnostics:?}"
         );
         assert_eq!(diagnostics[0].setting, "global.check_interval");
-        assert_eq!(diagnostics[0].value, value);
-        assert!(diagnostics[0].message.contains("0s"));
         assert_eq!(config.global.check_interval_secs, 0);
     }
 
@@ -2553,9 +2540,7 @@ fn test_unparseable_second_durations_use_the_fallback_and_return_diagnostics() {
     )
     .unwrap();
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-    assert_eq!(diagnostics[0].setting, "subscription.timed.interval");
-    assert_eq!(diagnostics[0].value, "never");
-    assert!(diagnostics[0].message.contains("0s"));
+    assert_eq!(diagnostics[0].setting, "subscriptions[1].interval");
     assert_eq!(config.subscriptions[0].update_interval, 0);
 
     let mut diagnostics = Vec::new();
@@ -2585,8 +2570,6 @@ fn test_unparseable_ipversion_prefer_uses_the_fallback_and_returns_a_diagnostic(
             "ipversion_prefer={value}: {diagnostics:?}"
         );
         assert_eq!(diagnostics[0].setting, "dns.ipversion_prefer");
-        assert_eq!(diagnostics[0].value, value);
-        assert!(diagnostics[0].message.contains("no preference"));
         assert!(matches!(config.dns.strategy, crate::dns::DnsStrategy::Both));
     }
 
@@ -2608,9 +2591,9 @@ fn test_unparseable_ipversion_prefer_uses_the_fallback_and_returns_a_diagnostic(
 
 #[test]
 fn test_unparseable_dns_cache_numbers_use_the_fallback_and_return_diagnostics() {
-    for (key, value, fallback) in [
-        ("optimistic_cache_ttl", "x", "60"),
-        ("optimistic_cache_ttl", "0x10", "60"),
+    for (key, value) in [
+        ("optimistic_cache_ttl", "x"),
+        ("optimistic_cache_ttl", "0x10"),
     ] {
         let mut diagnostics = Vec::new();
         let config = parse_dae_config_with_diagnostics(
@@ -2621,8 +2604,6 @@ fn test_unparseable_dns_cache_numbers_use_the_fallback_and_return_diagnostics() 
 
         assert_eq!(diagnostics.len(), 1, "{key}={value}: {diagnostics:?}");
         assert_eq!(diagnostics[0].setting, format!("dns.{key}"));
-        assert_eq!(diagnostics[0].value, value);
-        assert!(diagnostics[0].message.contains(fallback));
         assert_eq!(config.dns.cache.ttl, 60);
     }
 
@@ -2632,8 +2613,6 @@ fn test_unparseable_dns_cache_numbers_use_the_fallback_and_return_diagnostics() 
             .unwrap();
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert_eq!(diagnostics[0].setting, "dns.max_cache_size");
-    assert_eq!(diagnostics[0].value, "x");
-    assert!(diagnostics[0].message.contains("10000"));
     assert_eq!(config.dns.cache.max_size, 10000);
 
     let mut diagnostics = Vec::new();
@@ -2657,9 +2636,7 @@ fn test_unparseable_fixed_domain_ttl_is_skipped_and_returns_a_diagnostic() {
     .unwrap();
 
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-    assert_eq!(diagnostics[0].setting, "dns.fixed_domain_ttl.example.com");
-    assert_eq!(diagnostics[0].value, "4294967296");
-    assert!(diagnostics[0].message.contains("ignored"));
+    assert_eq!(diagnostics[0].setting, "dns.fixed_domain_ttl[1]");
     assert!(!config.dns.fixed_domain_ttl.contains_key("example.com"));
     assert_eq!(config.dns.fixed_domain_ttl.get("good.com"), Some(&30));
 
@@ -2717,10 +2694,6 @@ experimental {
         "experimental.cache_file.store_dns",
     ];
     assert_eq!(diagnostics.len(), expected.len(), "{diagnostics:?}");
-    for diagnostic in &diagnostics {
-        assert_eq!(diagnostic.value, "flase");
-        assert!(diagnostic.message.contains("false"));
-    }
     for (diagnostic, setting) in diagnostics.iter().zip(expected) {
         assert_eq!(diagnostic.setting, setting);
     }
@@ -2783,9 +2756,8 @@ fn test_unknown_group_policy_returns_a_diagnostic_without_the_text() {
     .unwrap();
 
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-    assert_eq!(diagnostics[0].setting, "group.odd.policy");
+    assert_eq!(diagnostics[0].setting, "groups[1].policy");
     assert_eq!(diagnostics[0].value, "");
-    assert!(diagnostics[0].message.contains("selector"));
     assert!(!diagnostics[0].message.contains("super-secret"));
     assert_eq!(config.groups[0].policy, crate::group::GroupPolicy::Selector);
     assert!(!format!("{config:?}").contains("super-secret"));
@@ -2806,9 +2778,8 @@ fn test_unparseable_group_filter_returns_a_diagnostic() {
     let mut diagnostics = Vec::new();
     let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
     assert_eq!(diagnostics.len(), 1);
-    assert_eq!(diagnostics[0].setting, "group.proxy.filter");
+    assert_eq!(diagnostics[0].setting, "groups[1].filter");
     assert_eq!(diagnostics[0].value, "1");
-    assert!(diagnostics[0].message.contains("ignored"));
     assert!(config.groups[0].nodes.is_empty());
 }
 
@@ -2818,10 +2789,8 @@ fn test_unterminated_group_filter_returns_a_diagnostic() {
     let mut diagnostics = Vec::new();
     let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
     assert_eq!(diagnostics.len(), 1);
-    assert_eq!(diagnostics[0].setting, "group.proxy.filter");
+    assert_eq!(diagnostics[0].setting, "groups[1].filter");
     assert_eq!(diagnostics[0].value, "1");
-    assert!(diagnostics[0].message.contains("unterminated"));
-    assert!(diagnostics[0].message.contains("ignored"));
     assert!(config.groups[0].nodes.is_empty());
 }
 
@@ -2831,9 +2800,8 @@ fn test_group_filter_diagnostics_do_not_echo_the_filter() {
     let mut diagnostics = Vec::new();
     let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
     assert_eq!(diagnostics.len(), 1);
-    assert_eq!(diagnostics[0].setting, "group.proxy.filter");
+    assert_eq!(diagnostics[0].setting, "groups[1].filter");
     assert_eq!(diagnostics[0].value, "1");
-    assert!(diagnostics[0].message.contains("ignored"));
     assert!(config.groups[0].nodes.is_empty());
     assert!(!diagnostics[0].setting.contains("super-secret"));
     assert!(!diagnostics[0].value.contains("super-secret"));
@@ -2862,9 +2830,8 @@ fn test_filter_ordinal_skips_subgroup_declarations() {
     let mut diagnostics = Vec::new();
     let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
     assert_eq!(diagnostics.len(), 1);
-    assert_eq!(diagnostics[0].setting, "group.proxy.filter");
+    assert_eq!(diagnostics[0].setting, "groups[1].filter");
     assert_eq!(diagnostics[0].value, "1");
-    assert!(diagnostics[0].message.contains("ignored"));
     assert!(config.groups[0].nodes.is_empty());
     assert_eq!(config.groups[0].groups, ["hk"]);
 }

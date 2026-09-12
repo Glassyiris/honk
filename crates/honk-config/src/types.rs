@@ -135,7 +135,11 @@ pub fn default_true() -> bool {
 pub fn parse_duration_secs(s: &str) -> Option<u64> {
     let s = s.trim();
     if let Some(v) = s.strip_suffix("ms") {
-        return v.parse::<f64>().ok().map(|v| (v / 1000.0).ceil() as u64);
+        let value = v.parse::<f64>().ok()?;
+        if !value.is_finite() || value < 0.0 {
+            return None;
+        }
+        return checked_duration_float((value / 1000.0).ceil());
     }
     if let Some(v) = s.strip_suffix('s') {
         return v.parse().ok();
@@ -162,13 +166,14 @@ pub fn parse_duration_ms(s: &str) -> Option<u64> {
         return v
             .parse::<f64>()
             .ok()
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .map(|v| (v * 1000.0) as u64);
+            .and_then(|v| checked_duration_float(v * 1000.0));
     }
-    s.parse::<f64>()
-        .ok()
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .map(|v| v as u64)
+    s.parse::<f64>().ok().and_then(checked_duration_float)
+}
+
+fn checked_duration_float(value: f64) -> Option<u64> {
+    // u64::MAX rounds to 2^64 as f64; equality is already out of range.
+    (value.is_finite() && value >= 0.0 && value < u64::MAX as f64).then_some(value as u64)
 }
 
 #[cfg(test)]
@@ -188,5 +193,18 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn c14_float_durations_reject_nonfinite_negative_and_out_of_range() {
+        for text in ["NaNms", "infms", "-1ms", "18446744073709551616000ms"] {
+            assert_eq!(parse_duration_secs(text), None, "{text}");
+        }
+        for text in ["NaN", "-1", "18446744073709551616", "18446744073709552s"] {
+            assert_eq!(super::parse_duration_ms(text), None, "{text}");
+        }
+        assert_eq!(parse_duration_secs("0.5ms"), Some(1));
+        assert_eq!(super::parse_duration_ms("0.0005s"), Some(0));
+        assert_eq!(super::parse_duration_ms("1m"), None);
     }
 }

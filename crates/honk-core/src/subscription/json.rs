@@ -1,26 +1,65 @@
 //! SIP008 and sing-box node imports normalized through the common Clash builder.
 
+#[cfg(test)]
 use honk_config::node::Node;
 use serde_yaml::{Mapping, Value};
 
+use super::IndexedOutcome;
+#[cfg(test)]
+use super::IndexedOutcomeKind;
+
 mod sing_box;
 
-type NodeResult = Result<Option<Mapping>, &'static str>;
+enum NormalizedEntry {
+    Node(Mapping),
+    Profile(&'static str),
+    Unsupported(&'static str),
+}
 
+type NodeResult = Result<NormalizedEntry, &'static str>;
+
+#[cfg(test)]
 pub(super) fn parse_json_subscription(
     value: Value,
     subscription_id: Option<uuid::Uuid>,
 ) -> anyhow::Result<Vec<Node>> {
+    let mut nodes = Vec::new();
+    emit_json_subscription(value, subscription_id, |outcome| {
+        if let IndexedOutcomeKind::Node(node) = outcome.kind {
+            nodes.push(node);
+        }
+    })?;
+    if nodes.is_empty() {
+        anyhow::bail!("no supported nodes found in JSON subscription");
+    }
+    Ok(nodes)
+}
+
+pub(super) fn emit_json_subscription(
+    value: Value,
+    subscription_id: Option<uuid::Uuid>,
+    mut emit: impl FnMut(IndexedOutcome),
+) -> anyhow::Result<()> {
     match value {
-        Value::Sequence(servers) => parse_entries(servers, subscription_id, normalize_sip008),
+        Value::Sequence(servers) => parse_entries(
+            servers,
+            subscription_id,
+            normalize_sip008,
+            "servers",
+            &mut emit,
+        ),
         Value::Mapping(mut root) => {
             let outbounds = root.remove("outbounds");
             let servers = root.remove("servers");
             match (outbounds, servers) {
                 (Some(_), Some(_)) => anyhow::bail!("ambiguous JSON subscription wrapper"),
-                (Some(Value::Sequence(outbounds)), None) => {
-                    parse_entries(outbounds, subscription_id, sing_box::normalize)
-                }
+                (Some(Value::Sequence(outbounds)), None) => parse_entries(
+                    outbounds,
+                    subscription_id,
+                    sing_box::normalize,
+                    "outbounds",
+                    &mut emit,
+                ),
                 (Some(_), None) => anyhow::bail!("sing-box 'outbounds' must be an array"),
                 (None, Some(Value::Sequence(servers))) => {
                     if let Some(version) = root.remove("version")
@@ -28,7 +67,13 @@ pub(super) fn parse_json_subscription(
                     {
                         anyhow::bail!("unsupported SIP008 version");
                     }
-                    parse_entries(servers, subscription_id, normalize_sip008)
+                    parse_entries(
+                        servers,
+                        subscription_id,
+                        normalize_sip008,
+                        "servers",
+                        &mut emit,
+                    )
                 }
                 (None, Some(_)) => anyhow::bail!("SIP008 'servers' must be an array"),
                 (None, None) => anyhow::bail!("unsupported JSON subscription wrapper"),
@@ -42,24 +87,30 @@ fn parse_entries(
     entries: Vec<Value>,
     subscription_id: Option<uuid::Uuid>,
     normalize: fn(Value) -> NodeResult,
-) -> anyhow::Result<Vec<Node>> {
-    let mut proxies = Vec::with_capacity(entries.len());
-    let mut first_error = None;
-    for entry in entries {
-        match normalize(entry) {
-            Ok(Some(proxy)) => proxies.push(Value::Mapping(proxy)),
-            Ok(None) => {}
-            Err(error) => {
-                first_error.get_or_insert(error);
+    path: &'static str,
+    emit: &mut impl FnMut(IndexedOutcome),
+) -> anyhow::Result<()> {
+    for (index, entry) in entries.into_iter().enumerate() {
+        let ordinal = index + 1;
+        let outcome = match normalize(entry) {
+            Ok(NormalizedEntry::Node(proxy)) => {
+                match super::clash::parse_clash_proxy(&proxy, subscription_id) {
+                    Ok(node) => IndexedOutcome::node(ordinal, path, node),
+                    Err(reason) if reason.contains("unsupported") => {
+                        IndexedOutcome::unsupported(ordinal, path, reason)
+                    }
+                    Err(reason) => IndexedOutcome::malformed(ordinal, path, reason),
+                }
             }
+            Ok(NormalizedEntry::Profile(reason)) => IndexedOutcome::profile(ordinal, path, reason),
+            Ok(NormalizedEntry::Unsupported(reason)) => {
+                IndexedOutcome::unsupported(ordinal, path, reason)
+            }
+            Err(reason) => IndexedOutcome::malformed(ordinal, path, reason),
         };
+        emit(outcome);
     }
-    if proxies.is_empty()
-        && let Some(error) = first_error
-    {
-        anyhow::bail!(error);
-    }
-    super::parse_clash_proxies(&proxies, subscription_id)
+    Ok(())
 }
 
 fn normalize_sip008(value: Value) -> NodeResult {
@@ -74,12 +125,12 @@ fn normalize_sip008(value: Value) -> NodeResult {
         &[
             ("server", "server"),
             ("method", "cipher"),
-            ("password", "password"),
             ("remarks", "name"),
             ("plugin", "plugin"),
             ("plugin_opts", "plugin-opts"),
         ],
     )?;
+    move_credential_strings(&mut source, &mut proxy, &[("password", "password")])?;
     match source.remove("server_port") {
         None | Some(Value::Null) => {}
         Some(port) if matches!(port.as_u64(), Some(1..=65535)) => {
@@ -87,7 +138,7 @@ fn normalize_sip008(value: Value) -> NodeResult {
         }
         Some(_) => return Err("SIP008 server port must be an integer"),
     }
-    Ok(Some(proxy))
+    Ok(NormalizedEntry::Node(proxy))
 }
 
 fn put(mapping: &mut Mapping, key: &str, value: Value) {
@@ -102,6 +153,20 @@ fn take_optional_string(mapping: &mut Mapping, key: &str) -> Result<Option<Strin
     }
 }
 
+fn take_optional_credential(
+    mapping: &mut Mapping,
+    key: &str,
+) -> Result<Option<String>, &'static str> {
+    match mapping.remove(key) {
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(Value::Number(value)) if value.as_f64().is_some_and(|value| value.is_finite()) => {
+            Ok(Some(value.to_string()))
+        }
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err("JSON credential setting has an invalid type"),
+    }
+}
+
 fn move_strings(
     source: &mut Mapping,
     target: &mut Mapping,
@@ -111,6 +176,19 @@ fn move_strings(
         if let Some(value) =
             take_optional_string(source, source_key)?.filter(|value| !value.trim().is_empty())
         {
+            put(target, target_key, Value::String(value));
+        }
+    }
+    Ok(())
+}
+
+fn move_credential_strings(
+    source: &mut Mapping,
+    target: &mut Mapping,
+    fields: &[(&str, &str)],
+) -> Result<(), &'static str> {
+    for &(source_key, target_key) in fields {
+        if let Some(value) = take_optional_credential(source, source_key)? {
             put(target, target_key, Value::String(value));
         }
     }
@@ -268,6 +346,74 @@ mod tests {
         assert_eq!(nodes[4].vless().unwrap().mode, WireMode::H2mux);
     }
 
+    const C10_SING_BOX_TRANSPORTS: &str = r#"{"outbounds":[
+      {"type":"vless","tag":"packet-tcp-stream-tcp","server":"raw.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000025","network":"tcp","transport":{"type":"tcp"}},
+      {"type":"vless","tag":"packet-tcp-stream-ws","server":"ws.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000027","network":"tcp","transport":{"type":"ws"}},
+      {"type":"vless","tag":"packet-tcp-stream-grpc","server":"grpc.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000028","network":"tcp","transport":{"type":"grpc"}},
+      {"type":"vless","tag":"raw-tcp-active-settings","server":"active.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000029","network":"tcp","transport":{"type":"tcp","path":"/must-not-ignore"}},
+      {"type":"vless","tag":"unsupported-h2-stream","server":"h2.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000026","network":"tcp","transport":{"type":"h2"}}
+    ]}"#;
+
+    #[test]
+    fn c10_sing_box_packet_network_and_stream_transport_are_separate() {
+        let nodes = parse_json_subscription(json(C10_SING_BOX_TRANSPORTS), None).unwrap();
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "packet-tcp-stream-tcp",
+                "packet-tcp-stream-ws",
+                "packet-tcp-stream-grpc"
+            ]
+        );
+        assert_eq!(nodes[0].network(), Some("tcp"));
+        assert_eq!(nodes[0].transport().unwrap().transport, "tcp");
+        assert_eq!(nodes[1].network(), Some("tcp"));
+        assert_eq!(nodes[1].transport().unwrap().transport, "ws");
+        assert_eq!(nodes[2].network(), Some("tcp"));
+        assert_eq!(nodes[2].transport().unwrap().transport, "grpc");
+    }
+
+    const C11_SING_BOX_PACKET_NETWORKS: &str = r#"{"outbounds":[
+      {"type":"vless","tag":"packet-udp-stream-ws","server":"udp.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000029","network":"udp","transport":{"type":"ws"}},
+      {"type":"vless","tag":"packet-list-stream-grpc","server":"list.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000030","network":"tcp,udp","transport":{"type":"grpc"}},
+      {"type":"vless","tag":"packet-empty","server":"empty.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000031","network":"","transport":{"type":"tcp"}},
+      {"type":"vless","tag":"packet-null","server":"null.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000032","network":null,"transport":{"type":"ws"}},
+      {"type":"anytls","tag":"native-anytls-udp","server":"native-anytls.example","server_port":443,"password":"password","network":"udp","tls":{"enabled":true}},
+      {"type":"vless","tag":"packet-unknown","server":"unknown.example","server_port":443,"uuid":"00000000-0000-4000-8000-000000000033","network":"quic","transport":{"type":"tcp"}}
+    ]}"#;
+
+    #[test]
+    fn c11_sing_box_packet_networks_do_not_rewrite_stream_transport() {
+        let nodes = parse_json_subscription(json(C11_SING_BOX_PACKET_NETWORKS), None).unwrap();
+        assert_eq!(nodes.len(), 5);
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "packet-udp-stream-ws",
+                "packet-list-stream-grpc",
+                "packet-empty",
+                "packet-null",
+                "native-anytls-udp"
+            ]
+        );
+        assert_eq!(nodes[0].network(), Some("tcp,udp"));
+        assert_eq!(nodes[0].transport().unwrap().transport, "ws");
+        assert_eq!(nodes[1].network(), Some("tcp,udp"));
+        assert_eq!(nodes[1].transport().unwrap().transport, "grpc");
+        assert_eq!(nodes[2].network(), None);
+        assert_eq!(nodes[2].transport().unwrap().transport, "tcp");
+        assert_eq!(nodes[3].network(), None);
+        assert_eq!(nodes[3].transport().unwrap().transport, "ws");
+        assert_eq!(nodes[4].anytls().unwrap().network.as_deref(), Some("udp"));
+    }
+
     #[test]
     fn sing_box_empty_grpc_and_tuic_defaults_are_preserved() {
         let nodes = parse_json_subscription(
@@ -293,7 +439,7 @@ mod tests {
             Some("")
         );
         assert!(nodes[2].tuic().unwrap().password.is_none());
-        assert!(nodes[3].tuic().unwrap().password.is_none());
+        assert_eq!(nodes[3].tuic().unwrap().password.as_deref(), Some(""));
     }
 
     #[test]
@@ -362,5 +508,111 @@ mod tests {
             )
             .is_err()
         );
+    }
+    const C09_SIP008_CREDENTIALS: &str = r#"{"servers":[
+      {"remarks":"numeric","server":"sip.example","server_port":8388,"method":"aes-256-gcm","password":12345},
+      {"remarks":"fractional","server":"fractional.example","server_port":8388,"method":"aes-256-gcm","password":1.25},
+      {"remarks":"string-bytes","server":"string.example","server_port":8388,"method":"aes-256-gcm","password":" password-bytes "},
+      {"remarks":"bool","server":"bool.example","server_port":8388,"method":"aes-256-gcm","password":true},
+      {"remarks":"list","server":"list.example","server_port":8388,"method":"aes-256-gcm","password":[]},
+      {"remarks":"map","server":"map.example","server_port":8388,"method":"aes-256-gcm","password":{}}
+    ]}"#;
+    const C09_SING_BOX_CREDENTIALS: &str = r#"{"outbounds":[
+      {"type":"shadowsocks","tag":"numeric-password","server":"ss.example","server_port":8388,"method":"aes-256-gcm","password":54321},
+      {"type":"hysteria2","tag":"numeric-auth","server":"hy.example","server_port":443,"password":67890,"tls":{"enabled":true}},
+      {"type":"socks","tag":"null-password","server":"socks.example","server_port":1080,"password":null},
+      {"type":"shadowsocks","tag":"bool-password","server":"bool.example","server_port":8388,"method":"aes-256-gcm","password":true},
+      {"type":"shadowsocks","tag":"list-password","server":"list.example","server_port":8388,"method":"aes-256-gcm","password":[]},
+      {"type":"shadowsocks","tag":"map-password","server":"map.example","server_port":8388,"method":"aes-256-gcm","password":{}},
+      {"type":"vless","tag":"numeric-uuid","server":"uuid.example","server_port":443,"uuid":12345,"tls":{"enabled":true}}
+    ]}"#;
+
+    #[test]
+    fn c09_structured_credentials_coerce_native_numbers_and_reject_invalid_types() {
+        let sip = parse_json_subscription(json(C09_SIP008_CREDENTIALS), None).unwrap();
+        assert_eq!(sip.len(), 3);
+        assert_eq!(
+            sip[0].shadowsocks().unwrap().password.as_deref(),
+            Some("12345")
+        );
+        assert_eq!(
+            sip[1].shadowsocks().unwrap().password.as_deref(),
+            Some("1.25")
+        );
+        assert_eq!(
+            sip[2].shadowsocks().unwrap().password.as_deref(),
+            Some(" password-bytes ")
+        );
+
+        let nodes = parse_json_subscription(json(C09_SING_BOX_CREDENTIALS), None).unwrap();
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["numeric-password", "numeric-auth", "null-password"]
+        );
+        assert_eq!(
+            nodes[0].shadowsocks().unwrap().password.as_deref(),
+            Some("54321")
+        );
+        assert_eq!(nodes[1].hysteria2().unwrap().auth.as_deref(), Some("67890"));
+        assert_eq!(nodes[2].socks5().unwrap().password, None);
+    }
+    const C14_SING_BOX_DURATIONS: &str = r#"{"outbounds":[
+      {"type":"hysteria2","tag":"hy2-native-zero","server":"hy2-native.example","server_port":443,"password":"password","hop_interval":0,"tls":{"enabled":true}},
+      {"type":"hysteria2","tag":"hy2-text-zero","server":"hy2-text.example","server_port":443,"password":"password","hop_interval":"0","tls":{"enabled":true}},
+      {"type":"hysteria2","tag":"hy2-subsecond","server":"hy2-subsecond.example","server_port":443,"password":"password","hop_interval":"500ms","tls":{"enabled":true}},
+      {"type":"anytls","tag":"anytls-native-zero","server":"anytls-native.example","server_port":443,"password":"password","idle_session_check_interval":0,"idle_session_timeout":0,"tls":{"enabled":true}},
+      {"type":"anytls","tag":"anytls-text-zero-subsecond","server":"anytls-text.example","server_port":443,"password":"password","idle_session_check_interval":"0","idle_session_timeout":"500ms","tls":{"enabled":true}},
+      {"type":"anytls","tag":"anytls-missing","server":"anytls-missing.example","server_port":443,"password":"password","tls":{"enabled":true}},
+      {"type":"anytls","tag":"anytls-null","server":"anytls-null.example","server_port":443,"password":"password","idle_session_check_interval":null,"idle_session_timeout":null,"tls":{"enabled":true}},
+      {"type":"hysteria2","tag":"invalid-hop-type","server":"invalid-hop.example","server_port":443,"password":"password","hop_interval":[],"tls":{"enabled":true}},
+      {"type":"anytls","tag":"invalid-anytls-timeout","server":"invalid-anytls.example","server_port":443,"password":"password","idle_session_timeout":{},"tls":{"enabled":true}}
+    ]}"#;
+
+    #[test]
+    fn c14_sing_box_durations_preserve_zero_round_subsecond_and_absence() {
+        let nodes = parse_json_subscription(json(C14_SING_BOX_DURATIONS), None).unwrap();
+        assert_eq!(nodes[0].hysteria2().unwrap().hop_interval, Some(0));
+        assert_eq!(nodes[1].hysteria2().unwrap().hop_interval, Some(0));
+        assert_eq!(nodes[2].hysteria2().unwrap().hop_interval, Some(1));
+        assert_eq!(
+            nodes[3].anytls().unwrap().idle_session_check_interval,
+            Some(0)
+        );
+        assert_eq!(nodes[3].anytls().unwrap().idle_session_timeout, Some(0));
+        assert_eq!(
+            nodes[4].anytls().unwrap().idle_session_check_interval,
+            Some(0)
+        );
+        assert_eq!(nodes[4].anytls().unwrap().idle_session_timeout, Some(1));
+        assert!(
+            nodes[5]
+                .anytls()
+                .unwrap()
+                .idle_session_check_interval
+                .is_none()
+        );
+        assert!(nodes[5].anytls().unwrap().idle_session_timeout.is_none());
+        assert!(
+            nodes[6]
+                .anytls()
+                .unwrap()
+                .idle_session_check_interval
+                .is_none()
+        );
+        assert!(nodes[6].anytls().unwrap().idle_session_timeout.is_none());
+    }
+
+    #[test]
+    fn c14_sing_box_invalid_duration_types_are_rejected_by_entry_policy() {
+        let mut fixture = json(C14_SING_BOX_DURATIONS);
+        let entries = fixture["outbounds"].as_sequence_mut().unwrap();
+        for invalid in entries.drain(7..) {
+            let mut body = Mapping::new();
+            body.insert("outbounds".into(), Value::Sequence(vec![invalid]));
+            assert!(parse_json_subscription(Value::Mapping(body), None).is_err());
+        }
     }
 }

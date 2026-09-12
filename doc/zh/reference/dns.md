@@ -117,6 +117,8 @@ cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
 
 在 request 和 response 规则中，匹配器参数内的成对单引号或双引号可保护 `,`、`)`、`&&`、`->`、`#` 和 `//`。引号外优先用 `//` 截断注释；没有 `//` 时，只检查第一个 `#`，且仅在它前面是 ASCII 空格时开始注释。`qtype('a,aaaa')` 这样的带引号列表仍选择两种类型。
 
+未知、格式错误或不支持的条件会产生带位置的警告，并省略整条规则，不会只丢弃合取中的一个条件。未知 QTYPE 名称产生 `invalid-qtype`，混合列表和取反条件也不例外；请修正名称或使用数字类型码。显式 `qtype()` 仍不匹配任何类型。
+
 ### 条件
 
 | 语法 | 范围 | 含义 |
@@ -132,6 +134,8 @@ cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
 | `ip(192.0.2.0/24, geoip: private, ...)` | 仅 response | 任一应答 IP 属于所列 CIDR 或 GeoIP 集时匹配。 |
 
 透明 53 端口与 `dns.bind` 入口的逻辑来源是 socket peer；代表已接纳 TCP/UDP 流执行的 DNS 解析使用该流的客户端地址。内部、bootstrap、prefetch 与 Clash API 查询没有逻辑来源。来源未知时，正向和取反的 `sip` 条件都为 false，请求路由会继续执行下一条规则或 fallback。response 路由不接受 `sip`。
+
+DNS `sip()` 与 `ip()` 共用 IP/CIDR 解码器。裸 IPv4 和 IPv6 地址分别表示 `/32` 和 `/128`；CIDR 中的主机位会被清零，并产生 `dns-network-host-bits` 警告。无效网络产生带位置的 `invalid-dns-network` 诊断，并省略整条 dae 规则；通过代码构造的无效路由会在路由器或策略构建时失败。等价网络写法使用相同策略标识，不改变参数顺序或删除重复参数。
 
 ### Request 动作
 
@@ -170,7 +174,7 @@ NXDOMAIN 和 SERVFAIL 应答会直接返回，不经过应答路由，也不应�
 `"upstream"` 仅在第三个分支中作为哨兵值被忽略；存在旧版规则时，它是普通的上游名称，必须有对应声明。旧版目标按原样精确匹配，不采用 dae 动作的大小写转换规则。
 
 校验诊断保留原始字段路径：新式规则和回退使用 `dns.routing.request.rules[i].action` 与 `dns.routing.request.fallback`；转换后的旧版规则使用 `dns.routing.rules[i].upstream`；转换或提升的回退使用 `dns.routing.fallback`。
-旧版规则生效时，诊断会区分默认回退 `upstream` 未声明和回退为空，并按名称排序列出已声明的上游。省略旧版回退等同于显式设置 `upstream`；只要声明了该上游，两者都有效。没有旧版规则时，空值和 `upstream` 哨兵仍会被忽略。
+旧版规则生效时，默认回退 `upstream` 未声明会报告 `missing-dns-fallback`，空回退没有匹配声明会报告 `empty-dns-fallback`，其他未声明目标报告 `unknown-dns-upstream`。诊断保留字段路径，但不回显目标名称或列出已声明名称。省略旧版回退等同于显式设置 `upstream`；只要声明了该上游，两者都有效。没有旧版规则时，空值和 `upstream` 哨兵仍会被忽略。
 
 ## 地址族策略
 

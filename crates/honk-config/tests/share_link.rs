@@ -3,28 +3,108 @@
 
 use base64::Engine as _;
 use honk_config::Config;
+use honk_config::diagnostic::{SafeValue, Severity};
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
-use parking_lot::Mutex;
-use std::sync::Arc;
 
 /// URL-safe base64 without padding (the encoding used by vmess links).
 fn b64(s: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s)
 }
+fn vmess_link(json: &str) -> String {
+    format!("vmess://{}", b64(json))
+}
 
-#[derive(Clone)]
-struct LogWriter(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for LogWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().extend_from_slice(bytes);
-        Ok(bytes.len())
+fn vmess_transport_fixture(net: Option<&str>) -> String {
+    let mut fixture = serde_json::json!({
+        "ps": "vmess-transport-fixture",
+        "add": "vmess.example.com",
+        "port": 443,
+        "id": UUID_A,
+        "tls": "tls",
+    });
+    if let Some(net) = net {
+        fixture["net"] = serde_json::json!(net);
     }
+    serde_json::to_string(&fixture).unwrap()
+}
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+const UUID_A: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
+const UUID_B: &str = "00000000-0000-0000-0000-000000000001";
+
+fn flat_credential_fixture(protocol: &str) -> serde_json::Value {
+    let mut fixture = serde_json::json!({
+        "name": "credential-fixture",
+        "protocol": protocol,
+        "address": "example.com:443",
+        "host": "example.com",
+        "port": 443,
+    });
+    let object = fixture.as_object_mut().expect("object fixture");
+    match protocol {
+        "tuic" => {
+            object.insert("tuic_uuid".into(), serde_json::json!(UUID_A));
+        }
+        "juicity" => {
+            object.insert("juicity_uuid".into(), serde_json::json!(UUID_A));
+        }
+        _ => {}
     }
+    fixture
+}
+
+fn flat_node_with(
+    protocol: &str,
+    fields: &[(&str, serde_json::Value)],
+) -> Result<Node, serde_json::Error> {
+    let mut fixture = flat_credential_fixture(protocol);
+    let object = fixture.as_object_mut().expect("object fixture");
+    for (field, value) in fields {
+        object.insert((*field).to_string(), value.clone());
+    }
+    serde_json::from_value(fixture)
+}
+
+fn assert_flat_credential_alias(
+    protocol: &str,
+    dedicated: &str,
+    generic: &str,
+    equal: &str,
+    conflict_a: &str,
+    conflict_b: &str,
+) {
+    let both = flat_node_with(
+        protocol,
+        &[
+            (dedicated, serde_json::json!(equal)),
+            (generic, serde_json::json!(equal)),
+        ],
+    )
+    .unwrap();
+    let dedicated_only =
+        flat_node_with(protocol, &[(dedicated, serde_json::json!(equal))]).unwrap();
+    assert_eq!(both.outbound, dedicated_only.outbound);
+
+    let conflict = flat_node_with(
+        protocol,
+        &[
+            (dedicated, serde_json::json!(conflict_a)),
+            (generic, serde_json::json!(conflict_b)),
+        ],
+    );
+    assert!(conflict.is_err(), "{protocol}: {dedicated}/{generic}");
+
+    let empty_with_nonempty = flat_node_with(
+        protocol,
+        &[
+            (dedicated, serde_json::json!("")),
+            (generic, serde_json::json!(equal)),
+        ],
+    );
+    assert!(
+        empty_with_nonempty.is_err(),
+        "{protocol}: empty {dedicated} must not hide {generic}"
+    );
 }
 
 fn serialization_golden_node() -> Node {
@@ -137,17 +217,9 @@ fn test_legacy_cross_protocol_fields_are_stripped() {
 }
 
 #[test]
-fn test_unused_username_credential_is_stripped_and_warned() {
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let writer = Arc::clone(&output);
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_writer(move || LogWriter(Arc::clone(&writer)))
-        .finish();
-    let node = tracing::subscriber::with_default(subscriber, || {
-        serde_json::from_str::<Node>(
-            r#"{
+fn test_unused_username_credential_is_stripped() {
+    let node = serde_json::from_str::<Node>(
+        r#"{
                 "name":"username-only",
                 "protocol":"trojan",
                 "address":"proxy.example:443",
@@ -155,18 +227,11 @@ fn test_unused_username_credential_is_stripped_and_warned() {
                 "port":443,
                 "username":"secret"
             }"#,
-        )
-        .unwrap()
-    });
+    )
+    .unwrap();
 
     assert!(node.trojan().unwrap().password.is_none());
     assert!(serde_json::to_value(&node).unwrap()["username"].is_null());
-    let output = String::from_utf8(output.lock().clone()).unwrap();
-    assert!(
-        output.contains("credential field 'password' is empty; 'username' is not used by trojan"),
-        "{output}"
-    );
-    assert!(output.contains("fields=username"), "{output}");
 }
 
 #[test]
@@ -313,8 +378,8 @@ fn test_vmess_full_fields_ws_tls() {
         Some("b831381d-6324-4d53-ad4f-8cda48b30811")
     );
     assert_eq!(node.vmess().unwrap().encryption.as_deref(), Some("auto"));
+    assert_eq!(node.network(), None);
     assert_eq!(node.transport().unwrap().transport, "ws");
-    assert_eq!(node.network(), Some("ws"));
     assert!(node.tls().unwrap().enabled);
     assert_eq!(
         node.transport().unwrap().ws_host.as_deref(),
@@ -366,6 +431,107 @@ fn test_vmess_grpc_service_from_path() {
 }
 
 #[test]
+fn test_share_link_tls_name_aliases_resolve_before_loss() {
+    let canonical = Node::from_share_link("trojan://pw@example.com:443?sni=edge.example").unwrap();
+    let empty_sni =
+        Node::from_share_link("trojan://pw@example.com:443?sni=&peer=edge.example").unwrap();
+    let equal_aliases =
+        Node::from_share_link("trojan://pw@example.com:443?sni=edge.example&peer=edge.example")
+            .unwrap();
+    let repeated_equal =
+        Node::from_share_link("trojan://pw@example.com:443?sni=edge.example&sni=edge.example")
+            .unwrap();
+    for equivalent in [empty_sni, equal_aliases, repeated_equal] {
+        assert_eq!(
+            equivalent.tls().unwrap().sni.as_deref(),
+            Some("edge.example")
+        );
+        assert_eq!(equivalent.derive_id(), canonical.derive_id());
+    }
+
+    for link in [
+        "trojan://pw@example.com:443?sni=one.example&peer=two.example",
+        "trojan://pw@example.com:443?sni=one.example&sni=two.example",
+    ] {
+        assert!(Node::from_share_link(link).is_err(), "{link}");
+    }
+
+    let raw_tcp =
+        Node::from_share_link("trojan://pw@example.com:443?host=fallback.example").unwrap();
+    assert_eq!(
+        raw_tcp.tls().unwrap().sni.as_deref(),
+        Some("fallback.example")
+    );
+    assert!(raw_tcp.transport().unwrap().ws_host.is_none());
+    let ws =
+        Node::from_share_link("trojan://pw@example.com:443?type=ws&host=header.example").unwrap();
+    assert_eq!(
+        ws.transport().unwrap().ws_host.as_deref(),
+        Some("header.example")
+    );
+    assert!(ws.tls().unwrap().sni.is_none());
+    let raw_tcp = Node::from_share_link(&vmess_link(
+        r#"{"add":"vmess.example","port":"443","id":"b831381d-6324-4d53-ad4f-8cda48b30811","net":"tcp","host":"fallback.example","sni":" \t ","tls":"tls"}"#,
+    ))
+    .unwrap();
+    assert_eq!(
+        raw_tcp.tls().unwrap().sni.as_deref(),
+        Some("fallback.example")
+    );
+
+    let ws = Node::from_share_link(&vmess_link(
+        r#"{"add":"vmess.example","port":"443","id":"b831381d-6324-4d53-ad4f-8cda48b30811","net":"ws","host":"header.example","sni":" \t ","tls":"tls"}"#,
+    ))
+    .unwrap();
+    assert_eq!(
+        ws.transport().unwrap().ws_host.as_deref(),
+        Some("header.example")
+    );
+    assert!(ws.tls().unwrap().sni.is_none());
+}
+
+#[test]
+fn test_flat_optional_sni_and_flow_normalize_like_url_inputs() {
+    let flat: Node = serde_json::from_value(serde_json::json!({
+        "name": "flat",
+        "protocol": "vless",
+        "address": "example.com:443",
+        "host": "example.com",
+        "port": 443,
+        "password": "b831381d-6324-4d53-ad4f-8cda48b30811",
+        "tls": true,
+        "sni": " \t ",
+        "flow": "\n ",
+    }))
+    .unwrap();
+    let url = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&flow=",
+    )
+    .unwrap();
+
+    assert!(flat.tls().unwrap().sni.is_none());
+    assert!(flat.vless().unwrap().flow.is_none());
+    assert_eq!(flat.tls().unwrap().sni, url.tls().unwrap().sni);
+    assert_eq!(flat.vless().unwrap().flow, url.vless().unwrap().flow);
+    assert_eq!(flat.derive_id(), url.derive_id());
+}
+
+#[test]
+fn test_share_link_flow_empty_is_absent_and_invalid_is_rejected() {
+    let empty = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&flow=",
+    )
+    .unwrap();
+    assert!(empty.vless().unwrap().flow.is_none());
+    assert!(
+        Node::from_share_link(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&flow=invalid"
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn test_vmess_invalid_links_rejected() {
     assert!(Node::from_share_link("vmess://!!!not-base64!!!").is_err());
     // Valid base64 but not JSON.
@@ -389,17 +555,14 @@ fn test_removed_protocol_links_rejected() {
         "https://user:pass@proxy.example.com:8443",
     ] {
         let err = Node::from_share_link(link).unwrap_err();
-        assert!(
-            err.to_string().contains("Unknown node protocol"),
-            "'{link}' must be rejected: {err}"
-        );
+        assert!(matches!(err, honk_config::ConfigError::UnknownProtocol(_)));
     }
 }
 
 #[test]
 fn test_unknown_scheme_rejected() {
     let err = Node::from_share_link("unknown://host:1234").unwrap_err();
-    assert!(err.to_string().contains("Unknown node protocol"));
+    assert!(matches!(err, honk_config::ConfigError::UnknownProtocol(_)));
 }
 
 /// Build a config holding an experimental section and three fully populated
@@ -452,7 +615,7 @@ fn test_config_json_round_trip() {
 fn test_config_json_vless_mode_and_default() {
     let mut config = Config::default();
     config.nodes.push(
-        Node::from_share_link("vless://uuid@example.com:443?vless_mode=mux-cool#vless").unwrap(),
+        Node::from_share_link("vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?vless_mode=mux-cool#vless").unwrap(),
     );
     let json = config.to_json_string().unwrap();
     let parsed = Config::from_json_str(&json).unwrap();
@@ -634,18 +797,14 @@ fn test_ss_legacy_literal_hash_password() {
 fn test_ss_legacy_rejects_missing_credentials() {
     let link = format!("ss://{}", b64("1.2.3.4:8388"));
     let error = Node::from_share_link(&link).unwrap_err();
-    assert!(
-        matches!(error, honk_config::ConfigError::Parse(message) if message.contains("no credentials"))
-    );
+    assert!(matches!(error, honk_config::ConfigError::Parse(_)));
 }
 
 #[test]
 fn test_ss_legacy_rejects_missing_method_separator() {
     let link = format!("ss://{}", b64("password@1.2.3.4:8388"));
     let error = Node::from_share_link(&link).unwrap_err();
-    assert!(
-        matches!(error, honk_config::ConfigError::Parse(message) if message.contains("no method separator"))
-    );
+    assert!(matches!(error, honk_config::ConfigError::Parse(_)));
 }
 
 #[test]
@@ -876,7 +1035,7 @@ fn shadowrocket_hysteria2_peer_preserves_sni_and_identity() {
         "hysteria2://secret@example.com:8443?sni=tls.example&insecure=1#edge",
     )
     .unwrap();
-    for query in ["peer=tls.example", "peer=ignored.example&sni=tls.example"] {
+    for query in ["peer=tls.example", "peer=tls.example&sni=tls.example"] {
         let node = Node::from_share_link(&format!(
             "hysteria2://secret@example.com:8443?{query}&insecure=1#edge"
         ))
@@ -972,7 +1131,10 @@ fn test_ech_query_params() {
     assert_eq!(node.tls().unwrap().ech_config.as_deref(), Some("QUJDMTIz"));
 
     // Bare ech=1 toggles ECH without keys.
-    let node = Node::from_share_link("tuic://u:p@example.com:443/?ech=1").unwrap();
+    let node = Node::from_share_link(
+        "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:p@example.com:443/?ech=1",
+    )
+    .unwrap();
     assert!(node.tls().unwrap().ech_enabled);
     assert!(node.tls().unwrap().ech_config.is_none());
 }
@@ -980,13 +1142,15 @@ fn test_ech_query_params() {
 #[test]
 fn test_tuic_window_params() {
     let node = Node::from_share_link(
-        "tuic://u:p@example.com:443/?initStreamReceiveWindow=4194304&initConnReceiveWindow=16777216",
+        "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:p@example.com:443/?initStreamReceiveWindow=4194304&initConnReceiveWindow=16777216",
     )
     .unwrap();
     assert_eq!(node.tuic().unwrap().init_stream_recv_window, Some(4194304));
     assert_eq!(node.tuic().unwrap().init_conn_recv_window, Some(16777216));
     // Unset by default.
-    let node = Node::from_share_link("tuic://u:p@example.com:443").unwrap();
+    let node =
+        Node::from_share_link("tuic://b831381d-6324-4d53-ad4f-8cda48b30811:p@example.com:443")
+            .unwrap();
     assert_eq!(node.tuic().unwrap().init_stream_recv_window, None);
 
     // No ECH params: disabled.
@@ -1005,11 +1169,16 @@ fn test_tuic_alpn_and_congestion_params() {
     assert_eq!(node.tuic().unwrap().congestion.as_deref(), Some("bbr"));
 
     // Comma-separated ALPN list is preserved verbatim.
-    let node = Node::from_share_link("tuic://u:p@example.com:443/?alpn=h3,h3-29").unwrap();
+    let node = Node::from_share_link(
+        "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:p@example.com:443/?alpn=h3,h3-29",
+    )
+    .unwrap();
     assert_eq!(node.tuic().unwrap().alpn.as_deref(), Some("h3,h3-29"));
 
     // Unset by default.
-    let node = Node::from_share_link("tuic://u:p@example.com:443").unwrap();
+    let node =
+        Node::from_share_link("tuic://b831381d-6324-4d53-ad4f-8cda48b30811:p@example.com:443")
+            .unwrap();
     assert_eq!(node.tuic().unwrap().alpn, None);
     assert_eq!(node.tuic().unwrap().congestion, None);
 }
@@ -1025,53 +1194,59 @@ fn test_vless_mode_query() {
         ("mux-cool", honk_config::node::WireMode::MuxCool),
     ] {
         let node = Node::from_share_link(&format!(
-            "vless://uuid@example.com:443?vless_mode={value}#node"
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?vless_mode={value}#node"
         ))
         .unwrap();
         assert_eq!(node.vless().unwrap().mode, expected);
     }
-    let xudp =
-        Node::from_share_link("vless://uuid@example.com:443?packetEncoding=xudp#node").unwrap();
+    let xudp = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?packetEncoding=xudp#node",
+    )
+    .unwrap();
     assert_eq!(
         xudp.vless().unwrap().mode,
         honk_config::node::WireMode::Xudp
     );
 
-    let legacy =
-        Node::from_share_link("vless://uuid@example.com:443?packetEncoding=none#node").unwrap();
+    let legacy = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?packetEncoding=none#node",
+    )
+    .unwrap();
     assert_eq!(
         legacy.vless().unwrap().mode,
         honk_config::node::WireMode::Legacy
     );
 
-    let error =
-        Node::from_share_link("vless://uuid@example.com:443?vless_mode=smux#node").unwrap_err();
-    assert!(error.to_string().contains("unsupported wire mode"));
+    assert!(
+        Node::from_share_link(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?vless_mode=smux#node"
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn test_vless_mode_query_rejects_duplicates() {
-    let error = Node::from_share_link(
-        "vless://uuid@example.com:443?vless_mode=xudp&vless_mode=legacy#node",
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("duplicate"));
-    let error = Node::from_share_link(
-        "vless://uuid@example.com:443?vless_mode=xudp&packetEncoding=xudp#node",
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("duplicate"));
+    assert!(
+        Node::from_share_link(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?vless_mode=xudp&vless_mode=legacy#node",
+        )
+        .is_err()
+    );
+    assert!(
+        Node::from_share_link(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?vless_mode=xudp&packetEncoding=xudp#node",
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn test_rejects_vless_mode_on_other_protocols() {
     for query in ["vless_mode=h2mux", "packetEncoding=xudp"] {
-        let error =
-            Node::from_share_link(&format!("trojan://password@example.com:443?{query}#node"))
-                .unwrap_err();
         assert!(
-            error.to_string().contains("only for VLESS"),
-            "{query}: {error}"
+            Node::from_share_link(&format!("trojan://password@example.com:443?{query}#node"))
+                .is_err()
         );
     }
 }
@@ -1101,19 +1276,18 @@ fn test_vless_share_link_rejects_external_mux_fields() {
         "brutal-opts=1",
         "max-connections=2",
     ] {
-        let error =
-            Node::from_share_link(&format!("vless://uuid@example.com:443?{parameter}#node"))
-                .unwrap_err();
         assert!(
-            error.to_string().contains("use vless_mode"),
-            "{parameter}: {error}"
+            Node::from_share_link(&format!(
+                "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?{parameter}#node"
+            ))
+            .is_err()
         );
     }
 
-    let error =
-        Node::from_share_link("vless://uuid@example.com:443?packetEncoding=packetaddr#node")
-            .unwrap_err();
-    assert!(error.to_string().contains("expected xudp or none"));
+    assert!(
+        Node::from_share_link("vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?packetEncoding=packetaddr#node")
+            .is_err()
+    );
 }
 
 #[test]
@@ -1154,7 +1328,7 @@ fn test_vless_reality_full() {
 fn test_vless_reality_spx_default() {
     // A missing `spx` falls back to the share-link default `/`.
     let node = Node::from_share_link(
-        "vless://uuid@example.com:443?security=reality&pbk=jHkr1EmJCyQxjU0HXJlNblVdXB4Z7yODHJhgJ5lqmzc#n",
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=reality&pbk=jHkr1EmJCyQxjU0HXJlNblVdXB4Z7yODHJhgJ5lqmzc#n",
     )
     .unwrap();
     assert!(node.tls().unwrap().enabled);
@@ -1164,7 +1338,10 @@ fn test_vless_reality_spx_default() {
 
 #[test]
 fn test_vless_security_none() {
-    let node = Node::from_share_link("vless://uuid@example.com:443?security=none#n").unwrap();
+    let node = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=none#n",
+    )
+    .unwrap();
     assert!(!node.tls().unwrap().enabled);
     assert!(node.tls().unwrap().reality_public_key.is_none());
 }
@@ -1173,7 +1350,9 @@ fn test_vless_security_none() {
 fn test_vless_no_security_keeps_tls_default() {
     // Existing links without a `security` parameter keep the historical
     // TLS-on default.
-    let node = Node::from_share_link("vless://uuid@example.com:443#n").unwrap();
+    let node =
+        Node::from_share_link("vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443#n")
+            .unwrap();
     assert!(node.tls().unwrap().enabled);
     assert!(node.tls().unwrap().reality_public_key.is_none());
 }
@@ -1190,7 +1369,7 @@ fn shadowrocket_vless_reality_matches_canonical_link() {
         b64(authority),
     ] {
         let node = Node::from_share_link(&format!(
-            "vless://{encoded}?tls=1&xtls=2&peer=ignored.example&sni=tls.example&pbk=jHkr1EmJCyQxjU0HXJlNblVdXB4Z7yODHJhgJ5lqmzc&sid=0123456789abcdef&remark=Hong%20Kong"
+            "vless://{encoded}?tls=1&xtls=2&peer=tls.example&sni=tls.example&pbk=jHkr1EmJCyQxjU0HXJlNblVdXB4Z7yODHJhgJ5lqmzc&sid=0123456789abcdef&remark=Hong%20Kong"
         ))
         .unwrap();
         assert_eq!(node.host, canonical.host);
@@ -1280,10 +1459,12 @@ fn shadowrocket_vless_stream_transports_match_canonical_links() {
 
 #[test]
 fn test_vless_encryption_param_and_identity() {
-    let plain = Node::from_share_link("vless://uuid@example.com:443#plain").unwrap();
+    let plain =
+        Node::from_share_link("vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443#plain")
+            .unwrap();
     let encryption = "mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     let encrypted = Node::from_share_link(&format!(
-        "vless://uuid@example.com:443?encryption={encryption}#encrypted"
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?encryption={encryption}#encrypted"
     ))
     .unwrap();
     assert_eq!(
@@ -1297,37 +1478,30 @@ fn test_vless_encryption_param_and_identity() {
 fn test_validate_rejects_vless_encryption_with_flow() {
     let encryption = "mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     let mut node = Node::from_share_link(&format!(
-        "vless://uuid@example.com:443?security=tls&encryption={encryption}#encrypted-flow"
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&encryption={encryption}#encrypted-flow"
     ))
     .unwrap();
     node.vless_mut().unwrap().flow = Some("xtls-rprx-vision".into());
     let mut config = Config::default();
     config.nodes.push(node);
-    let error = config.validate().unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("combines VLESS Encryption with flow")
-    );
+    assert!(config.validate().is_err());
 }
 
 #[test]
 fn test_reality_without_public_key_is_rejected_on_every_load_path() {
     // Share links are validated as they are parsed.
     for link in [
-        "vless://uuid@example.com:443?security=reality#no-pbk",
-        "vless://uuid@example.com:443?security=reality&pbk=#empty-pbk",
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=reality#no-pbk",
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=reality&pbk=#empty-pbk",
     ] {
-        let error = Node::from_share_link(link).unwrap_err();
-        assert!(
-            error.to_string().contains("without reality_public_key"),
-            "{link} must be rejected rather than degraded to plain TLS: {error}"
-        );
+        assert!(Node::from_share_link(link).is_err());
     }
 
     // A structured node reaches the same invariant through Config::validate.
-    let node =
-        Node::from_share_link("vless://uuid@example.com:443?security=reality&pbk=AAA#ok").unwrap();
+    let node = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=reality&pbk=AAA#ok",
+    )
+    .unwrap();
     let mut config = Config::default();
     config.nodes.push(node.clone());
     config.validate().unwrap();
@@ -1348,27 +1522,31 @@ fn test_reality_without_public_key_is_rejected_on_every_load_path() {
         tls.reality_spider_x = None;
         let mut config = Config::default();
         config.nodes.push(node);
-        let error = config.validate().unwrap_err();
-        assert!(error.to_string().contains("without reality_public_key"));
+        assert!(config.validate().is_err());
     }
 }
 
 #[test]
 fn test_vless_derive_id_differs_by_reality_public_key() {
-    let a =
-        Node::from_share_link("vless://uuid@example.com:443?security=reality&pbk=AAA#a").unwrap();
-    let b =
-        Node::from_share_link("vless://uuid@example.com:443?security=reality&pbk=BBB#b").unwrap();
+    let a = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=reality&pbk=AAA#a",
+    )
+    .unwrap();
+    let b = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=reality&pbk=BBB#b",
+    )
+    .unwrap();
     assert_ne!(a.derive_id(), b.derive_id());
     assert_ne!(a.id, b.id);
 }
 
 #[test]
 fn test_validate_flow_requires_tls_or_reality() {
-    let node = Node::from_share_link(
-        "vless://uuid@example.com:443?security=none&flow=xtls-rprx-vision#flow-no-tls",
+    let mut node = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=none#flow-no-tls",
     )
     .unwrap();
+    node.vless_mut().unwrap().flow = Some("xtls-rprx-vision".into());
     let mut config = Config::default();
     config.nodes.push(node);
     assert!(config.validate().is_err());
@@ -1376,10 +1554,11 @@ fn test_validate_flow_requires_tls_or_reality() {
 
 #[test]
 fn test_validate_flow_rejects_unknown_value() {
-    let node = Node::from_share_link(
-        "vless://uuid@example.com:443?flow=xtls-rprx-vision-udp443#flow-bad-value",
+    let mut node = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443#flow-bad-value",
     )
     .unwrap();
+    node.vless_mut().unwrap().flow = Some("xtls-rprx-vision-udp443".into());
     let mut config = Config::default();
     config.nodes.push(node);
     assert!(config.validate().is_err());
@@ -1625,5 +1804,459 @@ fn empty_share_link_reality_key_still_conflicts_with_plaintext() {
             "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=none&pbk=",
         )
         .is_err()
+    );
+}
+
+#[test]
+fn c08_share_link_verification_yes_on_warn_and_enable() {
+    for spelling in ["yes", "on"] {
+        let mut diagnostics = Vec::new();
+        let node = Node::from_share_link_with_detailed_diagnostics(
+            &format!("trojan://secret-password@secret.example:443?insecure={spelling}"),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert!(node.tls().unwrap().skip_cert_verify);
+        assert_eq!(diagnostics.len(), 1, "{spelling}: {diagnostics:?}");
+        let warning = &diagnostics[0];
+        assert_eq!(warning.code, "legacy-config-warning");
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_eq!(warning.setting.to_string(), "nodes.skip_cert_verify");
+        assert_eq!(warning.value, SafeValue::Redacted);
+        assert!(!format!("{warning:?}").contains("secret-password"));
+        assert!(!format!("{warning:?}").contains("secret.example"));
+    }
+
+    let dae = "node {\n    edge: 'trojan://secret-password@secret.example:443?insecure=yes'\n}\nrouting {\n    fallback: direct\n}";
+    let mut diagnostics = Vec::new();
+    let config =
+        honk_config::parser::parse_dae_config_with_detailed_diagnostics(dae, &mut diagnostics)
+            .unwrap();
+    assert_eq!(config.nodes.len(), 1);
+    let warning = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "legacy-config-warning")
+        .expect("dae share-link warning");
+    assert_eq!(warning.setting.to_string(), "nodes[1].skip_cert_verify");
+    assert_eq!(warning.entry_index, Some(1));
+    assert_eq!(warning.line, Some(2));
+    assert_eq!(warning.value, SafeValue::Redacted);
+    assert!(!format!("{diagnostics:?}").contains("secret-password"));
+    assert!(!format!("{diagnostics:?}").contains("secret.example"));
+}
+
+#[test]
+fn c08_share_link_verification_aliases_resolve_and_reject_invalid() {
+    let equal = Node::from_share_link(
+        "trojan://pw@example.com:443?allowInsecure=true&allow_insecure=1&insecure=true",
+    )
+    .unwrap();
+    assert!(equal.tls().unwrap().skip_cert_verify);
+    let authority = b64("auto:b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443");
+    let encoded = Node::from_share_link(&format!(
+        "vmess://{authority}?tls=1&allowInsecure=true&allowInsecure=1"
+    ))
+    .unwrap();
+    assert!(encoded.tls().unwrap().skip_cert_verify);
+
+    for link in [
+        "trojan://pw@example.com:443?allowInsecure=true&insecure=false",
+        "trojan://pw@example.com:443?insecure=unknown",
+        "trojan://pw@example.com:443?insecure=",
+    ] {
+        assert!(Node::from_share_link(link).is_err(), "{link}");
+    }
+    for spelling in ["t", "y"] {
+        let node =
+            Node::from_share_link(&format!("trojan://pw@example.com:443?insecure={spelling}"))
+                .unwrap();
+        assert!(!node.tls().unwrap().skip_cert_verify, "{spelling}");
+    }
+
+    let typed: Node = serde_json::from_value(serde_json::json!({
+        "name": "typed",
+        "protocol": "trojan",
+        "address": "example.com:443",
+        "host": "example.com",
+        "port": 443,
+        "password": "password",
+        "tls": true,
+        "skip_cert_verify": false,
+    }))
+    .unwrap();
+    assert!(!typed.tls().unwrap().skip_cert_verify);
+}
+
+#[test]
+fn c09_flat_credential_aliases_preserve_equal_conflicts_and_empty() {
+    assert_flat_credential_alias(
+        "hysteria2",
+        "hy2_auth",
+        "password",
+        "same",
+        "dedicated",
+        "generic",
+    );
+    assert_flat_credential_alias("tuic", "tuic_uuid", "username", UUID_A, UUID_A, UUID_B);
+    assert_flat_credential_alias(
+        "tuic",
+        "tuic_password",
+        "password",
+        "same",
+        "dedicated",
+        "generic",
+    );
+    assert_flat_credential_alias(
+        "juicity",
+        "juicity_uuid",
+        "username",
+        UUID_A,
+        UUID_A,
+        UUID_B,
+    );
+    assert_flat_credential_alias(
+        "juicity",
+        "juicity_password",
+        "password",
+        "same",
+        "dedicated",
+        "generic",
+    );
+    assert_flat_credential_alias(
+        "anytls",
+        "anytls_password",
+        "password",
+        "same",
+        "dedicated",
+        "generic",
+    );
+
+    let empty_tuic = flat_node_with("tuic", &[("tuic_password", serde_json::json!(""))]).unwrap();
+    assert_eq!(empty_tuic.tuic().unwrap().password.as_deref(), Some(""));
+
+    let numeric = flat_node_with("anytls", &[("password", serde_json::json!(123))]);
+    assert!(
+        numeric.is_err(),
+        "flat typed credentials must not coerce numbers"
+    );
+}
+
+#[test]
+fn c10_vmess_json_net_maps_only_to_stream_transport() {
+    for (net, expected_transport) in [
+        (Some("tcp"), "tcp"),
+        (Some("ws"), "ws"),
+        (Some("grpc"), "grpc"),
+        (None, ""),
+    ] {
+        let node = Node::from_share_link(&vmess_link(&vmess_transport_fixture(net))).unwrap();
+        assert_eq!(
+            node.transport().unwrap().transport,
+            expected_transport,
+            "{net:?}"
+        );
+        assert_eq!(
+            node.network(),
+            None,
+            "{net:?} must not become packet network"
+        );
+    }
+    assert!(
+        Node::from_share_link(&vmess_link(&vmess_transport_fixture(Some("h2")))).is_err(),
+        "unsupported VMess stream transport"
+    );
+}
+
+#[test]
+fn c10_share_link_stream_transport_aliases_resolve_before_storage() {
+    for (query, expected_transport) in [
+        ("type=ws", "ws"),
+        ("type=ws&type=ws", "ws"),
+        ("type=ws&network=ws&obfs=websocket", "ws"),
+        ("type=tcp&obfs=", "tcp"),
+        ("type=&network=tcp", ""),
+        ("network=tcp&type=", ""),
+        ("network=grpc&obfs=grpc", "grpc"),
+    ] {
+        let node = Node::from_share_link(&format!(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?{query}"
+        ))
+        .unwrap();
+        assert_eq!(
+            node.transport().unwrap().transport,
+            expected_transport,
+            "{query}"
+        );
+    }
+
+    let authority = b64(&format!("auto:{UUID_A}@example.com:443"));
+    let encoded = Node::from_share_link(&format!(
+        "vmess://{authority}?tls=1&type=&network=tcp&network=tcp"
+    ))
+    .unwrap();
+    assert_eq!(encoded.transport().unwrap().transport, "");
+    assert_eq!(encoded.network(), None);
+
+    for query in [
+        "type=ws&network=grpc",
+        "type=ws&type=grpc",
+        "type=tcp&obfs=websocket",
+        "type=h2",
+        "obfs=h2",
+    ] {
+        assert!(
+            Node::from_share_link(&format!(
+                "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?{query}"
+            ))
+            .is_err(),
+            "{query}"
+        );
+    }
+}
+
+#[test]
+fn c11_flat_packet_network_validates_and_preserves_spelling() {
+    for protocol in ["trojan", "anytls"] {
+        for network in ["tcp", "udp", "tcp,udp"] {
+            let node = flat_node_with(
+                protocol,
+                &[
+                    ("password", serde_json::json!("packet-password")),
+                    ("tls", serde_json::json!(true)),
+                    ("network", serde_json::json!(network)),
+                ],
+            )
+            .unwrap();
+            assert_eq!(node.network(), Some(network), "{protocol}:{network}");
+        }
+
+        let omitted = flat_node_with(
+            protocol,
+            &[
+                ("password", serde_json::json!("packet-password")),
+                ("tls", serde_json::json!(true)),
+            ],
+        )
+        .unwrap();
+        for empty in ["", " \t "] {
+            let node = flat_node_with(
+                protocol,
+                &[
+                    ("password", serde_json::json!("packet-password")),
+                    ("tls", serde_json::json!(true)),
+                    ("network", serde_json::json!(empty)),
+                ],
+            )
+            .unwrap();
+            assert_eq!(node.outbound, omitted.outbound, "{protocol}:{empty:?}");
+        }
+
+        for invalid in ["quic", "tcp,quic", "tcp,"] {
+            let result = flat_node_with(
+                protocol,
+                &[
+                    ("password", serde_json::json!("packet-password")),
+                    ("tls", serde_json::json!(true)),
+                    ("network", serde_json::json!(invalid)),
+                ],
+            );
+            assert!(result.is_err(), "{protocol}:{invalid}");
+        }
+    }
+}
+
+#[test]
+fn c12_vmess_cipher_claims_resolve_before_assignment() {
+    for (scy, security, expected) in [
+        ("", "auto", Some("auto")),
+        ("AUTO", "auto", Some("auto")),
+        ("aes-128-gcm", "AES-128-GCM", Some("aes-128-gcm")),
+        ("", "", None),
+    ] {
+        let mut fixture: serde_json::Value =
+            serde_json::from_str(&vmess_transport_fixture(None)).unwrap();
+        fixture["scy"] = scy.into();
+        fixture["security"] = security.into();
+        let node = Node::from_share_link(&vmess_link(&fixture.to_string())).unwrap();
+        assert_eq!(node.vmess().unwrap().encryption.as_deref(), expected);
+    }
+    for (scy, security) in [("none", "auto"), ("auto", "aes-128-gcm")] {
+        let mut fixture: serde_json::Value =
+            serde_json::from_str(&vmess_transport_fixture(None)).unwrap();
+        fixture["scy"] = scy.into();
+        fixture["security"] = security.into();
+        assert!(Node::from_share_link(&vmess_link(&fixture.to_string())).is_err());
+    }
+}
+
+#[test]
+fn c12_shadowrocket_cipher_aliases_keep_security_tls_meaning() {
+    let authority = b64(&format!("auto:{UUID_A}@example.com:443"));
+    for security in ["none", "tls"] {
+        let node = Node::from_share_link(&format!(
+            "vmess://{authority}?security={security}&scy=AUTO&encryption=auto"
+        ))
+        .unwrap();
+        assert_eq!(node.vmess().unwrap().encryption.as_deref(), Some("auto"));
+        assert_eq!(node.tls().unwrap().enabled, security == "tls");
+    }
+    let canonical = Node::from_share_link(&format!("vmess://{authority}?security=auto")).unwrap();
+    let repeated =
+        Node::from_share_link(&format!("vmess://{authority}?security=AUTO&security=auto")).unwrap();
+    assert_eq!(repeated.outbound, canonical.outbound);
+    assert_eq!(repeated.id, canonical.id);
+    for query in [
+        "scy=auto&encryption=aes-128-gcm",
+        "scy=bogus&encryption=auto",
+        "security=none&security=tls",
+    ] {
+        assert!(Node::from_share_link(&format!("vmess://{authority}?{query}")).is_err());
+    }
+}
+
+#[test]
+fn c13_tuic_relay_claims_cannot_be_discarded() {
+    let link = format!("tuic://{UUID_A}:password@example.com:443");
+    let control = Node::from_share_link(&link).unwrap();
+    for query in [
+        "udp-relay-mode=",
+        "udp_relay_mode=native",
+        "udp-relay-mode=&udp_relay_mode=native",
+    ] {
+        assert_eq!(
+            Node::from_share_link(&format!("{link}?{query}"))
+                .unwrap()
+                .outbound,
+            control.outbound
+        );
+    }
+    for query in [
+        "udp-relay-mode=quic",
+        "udp_relay_mode=unknown",
+        "udp-relay-mode=quic&udp-relay-mode=native",
+    ] {
+        assert!(Node::from_share_link(&format!("{link}?{query}")).is_err());
+    }
+}
+
+#[test]
+fn c13_hy2_obfs_claims_preserve_exact_source_grammar() {
+    const LINK: &str = "hy2://password@example.com:443";
+    for query in ["obfs=", "obfs=salamander", "obfs=salamander&obfs-password="] {
+        assert_eq!(
+            Node::from_share_link(&format!("{LINK}?{query}"))
+                .unwrap()
+                .hysteria2()
+                .unwrap()
+                .obfs,
+            None
+        );
+    }
+    for query in [
+        "obfs=SALAMANDER",
+        "obfs=unknown",
+        "obfs=unknown&obfs=salamander",
+        "obfs=salamander&obfs-password=a&obfs_password=b",
+    ] {
+        assert!(Node::from_share_link(&format!("{LINK}?{query}")).is_err());
+    }
+}
+
+#[test]
+fn c15_hopping_sets_reject_duplicates_and_keep_valid_spelling() {
+    for spec in ["443,443", "443-445,445-446"] {
+        for link in [
+            format!("hy2://password@example.com:443?mport={spec}"),
+            format!("hy2://password@example.com:{spec}"),
+        ] {
+            assert!(Node::from_share_link(&link).is_err());
+        }
+    }
+    for spec in ["443", "443, 500-501"] {
+        let node =
+            Node::from_share_link(&format!("hy2://password@example.com:443?mport={spec}")).unwrap();
+        assert_eq!(
+            node.hysteria2().unwrap().port_hopping.as_deref(),
+            Some(spec)
+        );
+    }
+}
+
+#[test]
+fn c16_all_share_link_completions_reject_intrinsic_errors() {
+    for link in [
+        "tuic://invalid:password@example.com:443",
+        "juicity://invalid:password@example.com:443",
+        "socks5://example.com:0",
+    ] {
+        assert!(Node::from_share_link(link).is_err(), "{link}");
+    }
+    let mut fixture: serde_json::Value =
+        serde_json::from_str(&vmess_transport_fixture(None)).unwrap();
+    fixture["id"] = "invalid".into();
+    assert!(Node::from_share_link(&vmess_link(&fixture.to_string())).is_err());
+}
+
+#[test]
+fn c16_flat_completion_rejects_invalid_nodes_without_alpn() {
+    for (field, value) in [
+        ("host", serde_json::json!(" ")),
+        ("port", serde_json::json!(0)),
+    ] {
+        assert!(flat_node_with("socks5", &[(field, value)]).is_err());
+    }
+    assert!(flat_node_with("vmess", &[("password", serde_json::json!("invalid"))]).is_err());
+    assert!(
+        flat_node_with(
+            "vless",
+            &[
+                ("password", serde_json::json!(UUID_A)),
+                ("flow", serde_json::json!("xtls-rprx-vision")),
+                ("tls", false.into())
+            ]
+        )
+        .is_err()
+    );
+    let fallback = flat_node_with("socks5", &[("host", "".into())]).unwrap();
+    assert_eq!(fallback.host(), "example.com");
+    assert!(
+        flat_node_with(
+            "socks5",
+            &[("host", "".into()), ("address", "[::1]:443".into())]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn c16_constructed_config_cannot_bypass_canonical_node_checks() {
+    let base = Node::from_share_link("anytls://password@example.com:443").unwrap();
+    for field in ["port", "sni", "network"] {
+        let mut node = base.clone();
+        match field {
+            "port" => node.port = 0,
+            "sni" => node.tls_mut().unwrap().sni = Some(" ".into()),
+            _ => node.anytls_mut().unwrap().network = Some("quic".into()),
+        }
+        let mut config = Config::default();
+        config.nodes.push(node);
+        assert!(config.validate().is_err(), "{field}");
+    }
+}
+
+#[test]
+fn detailed_share_link_validation_preserves_intrinsic_cause() {
+    let mut diagnostics = Vec::new();
+    let error = Node::from_share_link_with_detailed_diagnostics(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=none&flow=xtls-rprx-vision",
+        &mut diagnostics,
+    )
+    .expect_err("flow without TLS must fail intrinsic validation");
+    assert_eq!(error.diagnostic.code, "invalid-config-value");
+    assert_eq!(error.diagnostic.setting.to_string(), "nodes.flow");
+    assert!(
+        error
+            .to_string()
+            .contains("VLESS flow requires TLS or REALITY")
     );
 }

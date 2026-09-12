@@ -21,16 +21,16 @@
 | `nfqueue_enable` | `nfqueue_enable` | `true` | 将有歧义的 LAN 转发 UDP 原始包保留在 NFQUEUE，直到用户态得到终态决策。需要真实 eBPF 后端；单实例交接后若固定队列不可用，或数据路径准入前的队列/规则/健康检查失败，honk 记录 warning，仅在本进程关闭该功能且不改写配置。持久化 token generation 恢复失败仍为 fatal，因为分配器状态无法确定。安装阶段会回收保留的 nftables table。修改后需重启。新配置应使用此字段；已弃用的 `experimental.udp_nfqueue.enabled` 写法仍接受并给出迁移 warning；两者同时存在时以此 canonical 字段为准。 |
 | `data_dir` | `data_dir` | `"/var/lib/honk"` | 生成状态和相对运行时资源的非空绝对根目录。缺失目录会递归创建；每个候选目录都必须通过私有的 create-new/remove 探测。候选目录不可用时，仅回退到通过同一探测的工作目录。旧根目录 `/var/share/honk`（`LEGACY_DATA_DIR`）中的已有资源按下方各路径规则继续使用；honk 不会自动迁移它们；可写状态仍在原位置更新。修改后需重启。 |
 | `store_subscribe` | `store_subscribe` | `true` | 将每个订阅最近一次有效正文持久化到 `data_dir/.sub`，供启动和重载恢复；修改后需重启。 |
-| `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | TCP/HTTP 健康检查 URL，逗号分隔。当前健康检查循环使用第一个值；空列表退回普通 TCP 检查。 |
+| `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | TCP/HTTP 健康检查 URL，逗号分隔。健康检查循环使用第一个值；空列表退回普通 TCP 检查。URI 解析分别处理用户信息、带方括号的 IPv6、端口、路径、查询和片段。用户信息不会生成授权头；请求保留路径和查询，不发送片段，无斜杠的查询以 `/?query` 发送。HTTP/HTTPS 默认端口为 80/443；无协议的健康检查目标使用 HTTP/80。URLTest 的无协议目标使用 HTTPS/443，并保持原有的 `HEAD /` 请求规则。 |
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | URL 健康检查发送的 HTTP 方法；空值按 `HEAD` 处理。 |
-| `udp_check_dns` | `udp_check_dns` | `["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"]` | UDP 健康检查的 DNS 目标，逗号分隔；省略端口时默认为 `53`。 |
+| `udp_check_dns` | `udp_check_dns` | `["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"]` | UDP 健康检查的 DNS 目标，逗号分隔。裸 IPv4/IPv6、`[IPv6]` 和域名默认使用端口 `53`；显式端口必须为 `1..65535` 内的整数。无效括号或端口会使校验失败，并产生带位置的诊断。优先选择第一个 IP 字面量，否则解析第一个域名。解析与 Score 共用解码后的主机和端口，解析完成后仍保留域名身份。 |
 | `check_interval` | `check_interval_secs` | `30s` | 全局健康检查间隔。必须为正；解析失败的值会变成零并在校验时被拒绝。UDP 预热 coordinator 也使用该值，但实际下限为 10 秒。 |
 | `check_tolerance` | `check_tolerance_ms` | `50ms` | URLTest 切换所选成员前要求的延迟改善量。接受裸毫秒数、`ms` 或 `s`，其余写法沿用此默认值并记录一条警告。 |
 | `dial_mode` | `dial_mode` | `"domain"` | 目的域名发现和路由模式：`ip`、`domain`、`domain+` 或 `domain++`。参见[拨号模式](#拨号模式)。 |
 | `allow_insecure` | `allow_insecure` | `false` | 全局 TLS 校验回退兼容字段。当前 TLS connector 不读取该字段；跳过证书校验需在节点分享链接中按节点配置。 |
-| `sniffing_timeout` | `sniffing_timeout_ms` | `30ms` | 嗅探超时兼容字段。dae 解析器会保存该时长，但当前控制面不读取它。接受裸毫秒数、`ms` 或 `s`，其余写法沿用此默认值并记录一条警告。 |
+| `sniffing_timeout` | `sniffing_timeout_ms` | `30ms` | 嗅探超时兼容字段；当前控制面不读取它。解析规则同 `check_tolerance`，无效值产生警告并保留默认的 `30ms`。 |
 | `tls_implementation` | `tls_implementation` | `"tls"` | `tls` 使用常规 BoringSSL 客户端 profile；`utls` 启用 honk 的真实 Chrome ClientHello profile。 |
-| `utls_imitate` | `utls_imitate` | `"chrome_auto"` | 使用 `utls` 时请求的指纹 profile。当前只实现 `chrome*`；其他值会告警并仍使用 Chrome。 |
+| `utls_imitate` | `utls_imitate` | `"chrome_auto"` | 兼容指纹配置。uTLS 使用固定的 Chrome 指纹；此值不会切换指纹实现。 |
 | `tls_fragment` | `tls_fragment` | `false` | TLS ClientHello 分片兼容开关；当前 TLS connector 不读取该字段。 |
 | `tls_fragment_length` | `tls_fragment_length` | `""` | 分片长度范围兼容字段；当前 TLS connector 不读取该字段。 |
 | `tls_fragment_interval` | `tls_fragment_interval` | `""` | 分片间隔范围兼容字段；当前 TLS connector 不读取该字段。 |
@@ -47,6 +47,22 @@
 | —（dae 语法中不可配置） | `connect_timeout_ms` | `3000ms` | 代理连接、协议准备、预连接、健康检查和控制面拨号使用的超时。 |
 | —（dae 语法中不可配置） | `dns_resolve_timeout_ms` | `2000ms` | 控制面 DNS 解析超时，包括拨号前必须转换为 IP 的目标。 |
 | —（dae 语法中不可配置） | `relay_idle_timeout_secs` | `300s` | 旧 relay 空闲超时字段；当前 relay 路径不读取它。 |
+
+HTTP 健康检查和 URLTest 的 `Host` 使用不含凭据的主机与端口：IPv6 保留方括号，非默认端口不会省略。建立连接和处理 TLS 服务端名称时仍使用不带方括号的主机。
+
+请求路径和查询字符串保留配置中的原始点路径段和百分号编码。在构造请求前拒绝 authority 含多余斜杠、包含反斜杠或内嵌 ASCII 空白／控制字符的 URL；健康检查警告不回显被拒绝的 URL。
+
+## 重载健康检查与 TLS 模式
+
+以下参数在启动时确定。重载若改变生效值，会被拒绝；当前配置与已安装的探测器保持不变：
+
+- `check_interval`。
+- 第一个 `tcp_check_url`，包括回退地址、路径和查询字符串。缺失或空的首项均关闭 HTTP 探测；后续项不参与比较。
+- HTTP 探测启用时的 `tcp_check_http_method`。空值与 `HEAD` 等价。
+- `udp_check_dns` 选中的目标：去除首尾空白并忽略空项，优先选择列表中的第一个 IP 字面量，否则选择第一个域名，再无可用项则使用 `8.8.8.8:53`。重载检查只比较配置中的地址或域名及端口，不解析 DNS。未选中项的变化仍可重载。
+- `tls_implementation` 在原生 TLS 与 uTLS 之间的切换。比较 `utls` 时不区分大小写。
+
+dae 配置中的 `check_tolerance` 仍可通过重载更新 URLTest 组的容差。组级检查 URL 与直接连接探测仍沿现有路径动态更新。重载 `utls_imitate` 只保存兼容配置值，不改变指纹。
 
 ## 网卡语义
 

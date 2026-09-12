@@ -117,6 +117,8 @@ The upstream-line searches for `->` and `outbound:` are not quote-aware; do not 
 
 In request and response rules, single or double quotes protect `,`, `)`, `&&`, `->`, `#`, and `//` inside matcher arguments. Outside quotes, `//` takes comment precedence; otherwise only the first `#` is considered, and it starts a comment only after an ASCII space. A quoted QTYPE list such as `qtype('a,aaaa')` still selects both types.
 
+Unknown or malformed conditions and unsupported predicates omit the whole rule with a located warning, never just one conjunct. Unknown QTYPE names produce `invalid-qtype`, including mixed and negated lists; correct the name or use its numeric code. Explicit `qtype()` remains match-nothing.
+
 ### Conditions
 
 | Syntax | Scope | Meaning |
@@ -132,6 +134,8 @@ In request and response rules, single or double quotes protect `,`, `)`, `&&`, `
 | `ip(192.0.2.0/24, geoip: private, ...)` | Response only | Match when any answer IP belongs to a listed CIDR or GeoIP set. |
 
 For transparent port-53 and `dns.bind` ingress, the logical source is the socket peer. DNS resolution performed for an admitted TCP/UDP flow uses that flow's client address. Internal, bootstrap, prefetch, and Clash API queries have no logical source. An unknown source makes both positive and negated `sip` conditions false, so request routing continues to the next rule or fallback. `sip` is not valid in response routing.
+
+DNS `sip()` and `ip()` share one IP-or-CIDR decoder. Bare IPv4 and IPv6 addresses mean `/32` and `/128`; CIDR host bits are truncated with `dns-network-host-bits`. Malformed networks produce located `invalid-dns-network` diagnostics and omit the whole dae rule; constructed invalid routing fails router/policy construction. Equivalent network spellings use the same policy identity without reordering or deduplicating arguments.
 
 ### Request actions
 
@@ -170,7 +174,7 @@ Effective request selection follows this precedence:
 The `"upstream"` sentinel is ignored only in the third branch; with legacy rules it is an ordinary named target requiring a declaration. Legacy targets are matched exactly, without dae action normalization.
 
 Validation diagnostics preserve original field paths: new-style rules and fallbacks use `dns.routing.request.rules[i].action` and `dns.routing.request.fallback`; converted legacy rules use `dns.routing.rules[i].upstream`; converted or promoted fallbacks use `dns.routing.fallback`.
-With active legacy rules, diagnostics distinguish an undeclared default `upstream` fallback from an empty fallback and list declared names in sorted order. Omitting the legacy fallback is equivalent to explicitly setting `upstream`; either remains valid when that upstream is declared. Empty and `upstream` sentinels remain ignored when no legacy rules are active.
+With active legacy rules, an undeclared default `upstream` fallback reports `missing-dns-fallback`, an undeclared empty fallback reports `empty-dns-fallback`, and other undeclared targets report `unknown-dns-upstream`. These diagnostics retain field paths but do not echo target names or list declared names. Omitting the legacy fallback is equivalent to explicitly setting `upstream`; either remains valid when that upstream is declared. Empty and `upstream` sentinels remain ignored when no legacy rules are active.
 
 ## Address-family strategy
 

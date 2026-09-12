@@ -19,9 +19,11 @@ node {
 
 The current parser accepts both tagged and untagged entries. A non-empty dae tag replaces the link's `#fragment` name. An untagged link keeps its decoded fragment; without one, it receives the credential-free fallback `{scheme}-{host}`.
 
+An absent or empty VMess JSON `ps` remark uses `vmess-{host}` before validation. A non-empty dae tag then replaces it.
+
 In quoted tags and links, a backslash escapes the next character when locating the closing quote; the source escape is retained in the parsed text.
 
-A malformed recognized link is dropped with `node section: skipping unparseable entry: ...` on stderr. An unknown scheme is a hard configuration error. A standalone `mux:` or `mux=` line is also rejected; VLESS wire behavior belongs in each link's `vless_mode=` query.
+A malformed recognized link is dropped with an `invalid-node-entry` diagnostic using the original node-entry ordinal, never the link or node name. Data entrypoints return it without logging; plain entrypoints report it once. An unknown scheme is a hard configuration error. A standalone `mux:` or `mux=` line is also rejected; VLESS wire behavior belongs in each link's `vless_mode=` query.
 
 In the legacy `ss://base64(method:password@host:port)` form, decoded credentials are literal text, not URL-decoded: `%20` stays `%20`, and `?`, `/`, `#`, `:` and `@` remain password characters. The last `@` separates the endpoint; the userinfo may itself be `base64(method:password)`. A decoded payload without `@`, or credentials that cannot supply a method and password, is rejected. URL userinfo forms still percent-decode their credentials. The endpoint, path, query (including `/?plugin=...`) and fragment keep the usual URL handling.
 
@@ -59,9 +61,9 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `plugin` / `plugin_opts` | string? | null | Parsed SIP002 plugin metadata; subscription import rejects non-empty values because proxy plugins are unsupported |
 | `transport` | string | `"tcp"` | Stream transport; validated as empty/`tcp`, `ws`, or `grpc` |
 | `tls` | bool | `false` | Stream TLS flag; Trojan/AnyTLS links enable it, canonical VLESS links historically default on |
-| `sni` | string? | null | TLS server name from the first nonempty `sni`, then `peer`, then an unconsumed `host` query |
+| `sni` | string? | null | TLS server name; nonempty `sni` and `peer` claims must agree, then an unconsumed `host` supplies the fallback |
 | `tls_alpn` | string[] | `[]` | Structured/imported ordinary raw-TCP TLS ALPN; empty preserves the TLS profile default. Nonempty values are supported for AnyTLS and TCP Trojan/VMess/VLESS, not disabled TLS, REALITY, WS/gRPC, or QUIC. TUIC retains `tuic_alpn`; this is not a share-link query. |
-| `skip_cert_verify` | bool | `false` | `allowInsecure`, `allow_insecure`, or `insecure` equal to `1`/`true` |
+| `skip_cert_verify` | bool | `false` | Certificate-verification bypass from agreeing `allowInsecure`, `allow_insecure`, and `insecure` claims; see the security note below |
 | `ech_enabled` | bool | `false` | Static ECH config present, or `ech=1`/`true` |
 | `ech_config` | string? | null | Base64 ECHConfigList from `ech_config` or `echconfig` |
 | `ech_config_path` | string? | null | Structured-loader path to a base64 ECHConfigList; not a share-link query |
@@ -69,7 +71,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `reality_short_id` | string? | null | REALITY short ID from `sid` |
 | `reality_spider_x` | string? | null | Stored `spx`; a REALITY link defaults it to `/` |
 | `flow` | string? | null | VLESS flow from nonempty `flow` or Shadowrocket `xtls=2`; only `xtls-rprx-vision` is supported |
-| `network` | string? | null | Protocol network/capability hint; VMess JSON `net` and subscription import populate it |
+| `network` | string? | null | Packet capability for supported protocols; independent of VMess JSON `net` and other stream-transport fields |
 | `ws_path` / `ws_host` | string? | null | WebSocket `path` and Host header |
 | `grpc_service` | string? | null | gRPC `serviceName` or `service_name` |
 | `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 authentication and salamander password |
@@ -79,10 +81,10 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `hy2_disable_mtu_discovery` | bool? | null | Hysteria2 `disablePathMTUDiscovery` |
 | `quic_mtu` | u16? | null | QUIC UDP payload size from `mtu`; default 1252, accepted range 1200–65527; explicit values above 1252 enable GSO unless `HONK_QUIC_GSO=0` |
 | `tls_pin_sha256` | string? | null | Leaf-certificate SHA-256 pin from `pinSHA256` or `pin_sha256` |
-| `tuic_uuid` / `tuic_password` | string? | null | Dedicated TUIC credentials; handlers fall back to generic userinfo fields |
+| `tuic_uuid` / `tuic_password` | string? | null | TUIC credentials; flat aliases must agree with `username` / `password` |
 | `tuic_congestion` / `tuic_alpn` | string? | null | TUIC `congestion_control` and comma-separated `alpn` |
 | `tuic_init_stream_recv_window` / `tuic_init_conn_recv_window` | u64? | null | TUIC QUIC receive windows; effective defaults are 8 MiB / 8 MiB |
-| `juicity_uuid` / `juicity_password` | string? | null | Dedicated Juicity credentials; handlers fall back to generic userinfo fields |
+| `juicity_uuid` / `juicity_password` | string? | null | Juicity credentials; flat aliases must agree with `username` / `password` |
 | `anytls_password` | string? | null | AnyTLS secret copied from link userinfo |
 | `anytls_min_idle_session` | usize? | null | Requested idle-session floor from `min_idle_session`; effective default 0, bounded by the two-session pool cap |
 | `anytls_idle_session_check_interval` | u64? | null | Parsed `idle_session_check_interval` seconds; current runtime janitor cadence remains fixed at 30 s |
@@ -92,13 +94,35 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `subscription_id` / `group_id` | UUID? | null | Import/runtime ownership metadata |
 | `created_at` / `updated_at` | datetime | now | Runtime metadata |
 
-Validation requires every non-built-in node to have a non-empty name and either `address` or `host`.
+Intrinsic validation requires a nonempty node name, effective host, and explicit nonzero `port`. `address` does not supply a missing port; address-only IPv6 requires an explicit `host`. Only exact injected `direct`/`block` identities are endpoint-exempt.
 
 ### Structured-loader compatibility
 
 TOML, YAML, and JSON retain the legacy flat node keys. Loading reads the fields owned by the selected `protocol`; non-default fields left over from other protocols are stripped without rejecting the node, and one warning lists the stripped field names. For example, `tls: true` on an `ss` node is ignored with a warning rather than enabling TLS. `username` is not a credential alias for Trojan, VLESS, Hysteria2, or AnyTLS; when supplied without that protocol's effective credential field, it is stripped with a targeted warning, preserving legacy behavior and IDs. Values used by the selected protocol still undergo normal parsing and validation. Honk's own output remains round-trip safe. With `store_subscribe`, a raw subscription body is persisted only after it parses successfully, and a rejected refresh leaves the last valid body untouched.
 
+Flat credential aliases are compared before incompatible fields are stripped: Hysteria2 `hy2_auth`/`password`, TUIC and Juicity dedicated UUID/`username` and dedicated password/`password`, and AnyTLS `password`/`anytls_password`. Missing or null claims are absent; supplied strings must agree byte for byte, including empty strings and surrounding spaces. An empty credential remains subject to its protocol's requirements. Flat credential fields remain strings; numeric coercion applies only to subscription feeds.
+
 The new `tls_alpn` field is deliberately excluded from legacy stripping: a nonempty value on an unsupported protocol or TLS context rejects the node instead of silently changing its handshake.
+
+Share-link verification booleans ignore surrounding whitespace and ASCII case. `true`, `yes`, `1`, and `on` disable certificate verification; `false`, `f`, `no`, `n`, `0`, `off`, `t`, and `y` leave verification enabled. Empty or unknown text and conflicting aliases reject the link. **Security change:** `yes` and `on` previously left verification enabled; they now disable it and emit a warning. Use explicit `true` or `false` and review these links before upgrading. Native structured booleans remain typed; strings and numbers are not coerced.
+
+VMess cipher claims accept `auto` and `aes-128-gcm`, case-insensitively, and store lowercase names; empty optional claims use the default. JSON `scy`/`security`, encoded share-link `encryption`/`scy`/cipher-valued `security`, and supported feed cipher aliases must agree before assignment. Unsupported or conflicting values reject the node. In encoded share links, `security=none` and `security=tls` still select TLS behavior, not a cipher. Record positional ciphers remain lower-priority fallbacks.
+
+TUIC share links and feeds accept only absent, empty, or `native` relay mode; unsupported `udp-relay-mode`/`udp_relay_mode` claims reject even beside a valid alias. Hy2 share links require exact lowercase `obfs=salamander`; absent/empty disables obfuscation, and unknown names (including `SALAMANDER`) reject. Salamander without a nonempty password still disables obfuscation. Repeated password claims and `obfs-password`/`obfs_password` must agree. Clash keeps case-insensitive Salamander with a nonblank password; sing-box keeps exact lowercase type and rejects active incomplete obfuscation objects.
+
+Duration conversion rejects negative, nonfinite, and out-of-range values instead of saturating. Structured feed seconds fields round integer milliseconds up (`500ms` and `1000ms` both become `1`; zero stays zero), then compare aliases. Share-link Hy2 `mhop` remains bare unsigned integer seconds: `500ms` and `1s` are ignored with a redacted warning. AnyTLS share-link durations retain the seconds parser; dae millisecond settings retain bare/ms/s syntax and truncate fractional milliseconds.
+
+Sing-box `hop_interval`, `idle_session_timeout`, and `idle_session_check_interval` preserve native numeric zero as an explicit value; missing or null remains absent. Hysteria2 records compare every `mhop`, `hop-interval`, and `hop_interval` occurrence after conversion to seconds, rejecting conflicts and invalid values even beside a valid alias.
+
+Hysteria2 hopping sets reject repeated ports and overlapping ranges before dialing, including `443,443`. A singleton remains valid. Valid specifications retain their spelling; embedded authority lists retain their stricter empty-segment rule. The outbound constructor uses the same checked decoder for directly constructed nodes.
+
+Every canonical adapter completion applies intrinsic validation: ordinary share links, VMess JSON, standalone flat Node serde, and subscription imports. UUID-based protocols require valid UUIDs; unsupported cipher, transport, packet capability, flow, ALPN context, or hopping sets reject before identity derivation. Vision requires TLS or REALITY. Constructed nodes also reject empty SNI/flow/network values that adapters normalize away. Feed-only nonempty-password requirements remain format-specific; optional SOCKS authentication and handler-supported empty credentials remain valid. Invalid dae node lines and feed entries retain their existing skip policy; valid siblings survive. Parse-only Config fragments remain parse-only, except that invalid contained nodes now reject at construction. Standalone serde preserves a supplied ID; runtime identity admission is separate.
+
+Direct `Node::validate()` calls return the same static, redacted errors as adapter completion. Validation errors never include the supplied node name or credential values.
+
+Detailed Config loaders and configuration/registry admission retain the intrinsic field and cause, adding the original one-based node ordinal instead of replacing the reason with a generic invalid-node error. Credential conflicts identify the canonical alias field without exposing either value. Standalone `NodeSeed` and Node serde still return redacted generic serde errors.
+
+For VMess JSON with `net: "ws"`, an omitted or empty `host` uses the endpoint host in the WebSocket handshake. A supplied nonempty `host` remains the explicit override.
 
 ## Protocols
 
@@ -118,6 +142,8 @@ The new `tls_alpn` field is deliberately excluded from legacy stripping: a nonem
 
 `network` may further disable packet dialing for Trojan, AnyTLS, and non-legacy VLESS. AnyTLS rejects UDP payloads above 16 KiB, matching anytls-go 0.0.13's relay buffer. Legacy VLESS has no UDP, and VMess UDP is not implemented.
 
+For protocols that own `network`, flat structured input accepts comma-separated `tcp`/`udp` tokens, ignoring token whitespace and ASCII case. `tcp` disables UDP; `udp` and `tcp,udp` both permit UDP. Empty or whitespace-only text becomes absent and retains the protocol's default capability. Unknown tokens such as `quic`, or empty tokens inside a nonempty list, reject the node. This controls UDP admission only: `udp` does not add a TCP rejection policy.
+
 VMess and VLESS nodes still parse without the `rprx` Cargo feature, but no handler is registered and dialing fails with `No handler for protocol`. `honk-core` enables `rprx` by default.
 
 `honk-core` injects `direct` and `block` at startup and reload with fixed reserved IDs. User nodes may use neither those names nor those protocols.
@@ -136,7 +162,7 @@ An incorrect or non-base64 key fails handler construction.
 
 ### Stream transports
 
-Trojan and VLESS URL links select transport with `type=` or its `network=` alias. For `ws`, `path` maps to `ws_path` and `host` maps to `ws_host`; for `grpc`, `serviceName` or `service_name` maps to `grpc_service`. `sni` is independent. `alpn` is accepted for compatibility but not stored. Configuration validation admits only TCP, WebSocket, and gRPC.
+Stream-capable share links select transport with `type=` or its `network=` alias. Empty text and `tcp` mean raw TCP; `ws` and `grpc` select WebSocket and gRPC. All supplied aliases, including compatible `obfs` declarations and repeated query keys, must agree before assignment. Unsupported names such as `h2` and `kcp` reject the link during parsing. For `ws`, `path` maps to `ws_path` and `host` maps to `ws_host`; for `grpc`, `serviceName` or `service_name` maps to `grpc_service`. `sni` is independent. `alpn` is accepted for compatibility but not stored.
 
 ```dae
 node {
@@ -146,6 +172,8 @@ node {
 ```
 
 VMess accepts v2rayN Base64 JSON (`net`, `host`, `path`, `sni`) and Shadowrocket's `vmess://base64(auto:UUID@host:port)?...` authority form. The latter maps `tls`, `peer`/`sni`, `obfs=websocket|grpc`, `obfsParam`, `path`, and `remark`; standard/URL-safe Base64 and optional padding are accepted. Encoded-authority VMess requires AEAD authentication and `auto`/`aes-128-gcm`; unsupported ciphers and REALITY parameters are rejected, not silently replaced.
+
+VMess JSON `net` and Shadowrocket transport parameters select only the stream transport. They no longer populate packet-network capability; an omitted packet restriction retains the existing default UDP allowance. Valid empty transport spelling is preserved where already used.
 
 Live interoperability has been verified for VLESS TCP+REALITY+Vision, TCP+REALITY, TCP+WS, TCP+WS+TLS, and TCP+gRPC. Vision's supported direct-copy combination is raw TCP with TLS or REALITY, not WS/gRPC.
 
@@ -161,11 +189,13 @@ The query mapping follows the [Shadowrocket exporter](https://github.com/cedar20
 | `pbk`, `sid`, `spx` without `security` | Select REALITY; a non-empty `pbk` is mandatory. Explicit `security=reality` remains supported. |
 | `xtls=0` / `xtls=2` | No flow / `xtls-rprx-vision`. Retired XTLS Direct (`xtls=1`) and unknown values are rejected. |
 | `remark` | Display name when a non-empty fragment is absent; decoded once as a query value. |
-| `peer` | SNI fallback when `sni` is absent, also supported by Hysteria2 and the other URL-shaped TLS links. |
+| `peer` | Explicit SNI alias; nonempty `sni` and `peer` must agree. Empty or whitespace-only names are absent. |
 | `obfs=websocket`, `obfsParam`, `path` | WebSocket transport, Host header fallback, and path. |
 | `obfs=grpc`, `path` | gRPC transport and service-name fallback. |
 
-Conflicting TLS/REALITY, flow, or transport declarations are rejected rather than silently downgraded. `obfs` accepts only empty/`none`, `websocket`, or `grpc` for VLESS; unsupported transports are not reinterpreted as TCP. Canonical `host`, `serviceName`/`service_name`, and `sni` fields take precedence over their aliases. Normalization precedes node-ID derivation, so equivalent canonical and Shadowrocket links share identity.
+Conflicting TLS/REALITY, flow, or transport declarations are rejected rather than silently downgraded. `obfs` accepts only empty/`none`, `websocket`, or `grpc` for VLESS; unsupported transports are not reinterpreted as TCP. Canonical `host` and `serviceName`/`service_name` fields retain their existing fallback precedence. Explicit SNI aliases are compared before assignment; equal bytes coalesce, unequal names reject without case rewriting. Empty or whitespace-only SNI and flow normalize to absent before node-ID derivation. Nonempty flow must be exactly `xtls-rprx-vision`.
+
+Clash imports compare `servername`, `server-name`, and `sni`; record imports additionally compare `tls-name` and `tls-host`, retaining `obfs_sni` as a lower-priority fallback, including Quantumult X WSS Host. Record `off` remains invalid. In share links and VMess JSON, WebSocket `host` is only the Host header; outside WebSocket it is a lower-priority SNI fallback. The endpoint hostname remains the final TLS consumer fallback.
 
 ### Hysteria2
 
@@ -181,7 +211,7 @@ Both `hysteria2://` and `hy2://` are accepted. The entire percent-decoded userin
 | `initStreamReceiveWindow` / `initConnReceiveWindow` | QUIC receive-window overrides |
 | `disablePathMTUDiscovery` | Disables QUIC PMTU discovery when `1`/`true` |
 | `mtu` | Shared QUIC UDP-payload cap, accepted only in 1200–65527 |
-| `sni` / `peer`, insecure aliases, ECH parameters | Shared TLS behavior; explicit `sni` takes precedence over `peer` |
+| `sni` / `peer`, insecure aliases, ECH parameters | Shared TLS behavior; nonempty explicit SNI aliases must agree |
 
 ```dae
 node {

@@ -1,0 +1,3 @@
+unknown://secret.example:99
+socks5://127.0.0.1:1080#first
+socks5://127.0.0.1:1080#duplicate

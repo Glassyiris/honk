@@ -1149,14 +1149,14 @@ mod tests {
         let stats = StatsManager::new();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let node = honk_config::node::Node {
-            id: uuid::Uuid::new_v4(),
+        let mut node = honk_config::node::Node {
             name: "ss".into(),
             address: addr.to_string(),
             port: addr.port(),
             outbound: honk_config::node::OutboundConfig::Shadowsocks(Default::default()),
             ..Default::default()
         };
+        node.id = node.derive_id();
         let generation =
             honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
                 .unwrap();
@@ -1207,14 +1207,17 @@ mod tests {
         }
 
         let stats = StatsManager::new();
-        let node = honk_config::node::Node {
-            id: uuid::Uuid::new_v4(),
+        let mut node = honk_config::node::Node {
             name: "tuic".into(),
             address: "127.0.0.1:443".into(),
             port: 443,
-            outbound: honk_config::node::OutboundConfig::Tuic(Default::default()),
+            outbound: honk_config::node::OutboundConfig::Tuic(honk_config::node::TuicConfig {
+                uuid: Some("00000000-0000-4000-8000-000000000001".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
+        node.id = node.derive_id();
         let generation =
             honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
                 .unwrap();

@@ -88,6 +88,8 @@ async fn public_reload_surface_publishes_a_coherent_runtime() {
     let subscription_id = uuid::Uuid::new_v4();
     let mut replacement = Node {
         name: "published-runtime-node".into(),
+        address: "127.0.0.1:1".into(),
+        port: 1,
         subscription_id: Some(subscription_id),
         ..Node::default()
     };

@@ -71,6 +71,7 @@ enum ProbeFailureKind {
     Timeout,
     Exchange,
     Handler,
+    Admission,
 }
 
 impl ProbeFailureKind {
@@ -80,6 +81,7 @@ impl ProbeFailureKind {
             Self::Timeout => "timeout",
             Self::Exchange => "exchange",
             Self::Handler => "handler",
+            Self::Admission => "admission",
         }
     }
 }
@@ -487,7 +489,10 @@ async fn probe_urltest(
     let Some(entry) = registry.find(node.protocol()) else {
         return Some(Err(ProbeFailureKind::Handler));
     };
-    let guard = honk_outbound::runtime::NodeRuntime::ephemeral_guarded(node);
+    let guard = match honk_outbound::runtime::NodeRuntime::try_ephemeral_guarded(node) {
+        Ok(guard) => guard,
+        Err(_) => return Some(Err(ProbeFailureKind::Admission)),
+    };
     let measured = urltest_node(&guard.runtime(), entry.tcp.as_ref(), url, timeout).await;
     guard.close().await;
     Some(measured.map_err(|_| ProbeFailureKind::Exchange))
@@ -583,7 +588,10 @@ async fn probe_family(
         return Some(Err(ProbeFailureKind::Handler));
     };
     let url = format!("https://{url_host}/");
-    let guard = honk_outbound::runtime::NodeRuntime::ephemeral_guarded(node);
+    let guard = match honk_outbound::runtime::NodeRuntime::try_ephemeral_guarded(node) {
+        Ok(guard) => guard,
+        Err(_) => return Some(Err(ProbeFailureKind::Admission)),
+    };
     let measured = honk_outbound::urltest::urltest_node_addr(
         &guard.runtime(),
         entry.tcp.as_ref(),

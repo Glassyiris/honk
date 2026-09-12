@@ -3,8 +3,6 @@
 use crate::tls::TlsConnector;
 use async_trait::async_trait;
 use honk_config::node::Node;
-#[cfg(test)]
-use honk_config::types::NodeProtocol;
 use md5::Md5;
 use rand::RngExt as _;
 use sha2::{Digest, Sha256};
@@ -2666,7 +2664,7 @@ impl TcpOutbound for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let owner = crate::runtime::NodeRuntime::ephemeral_guarded(node);
+        let owner = crate::runtime::NodeRuntime::try_ephemeral_guarded(node)?;
         let stream = self
             .dial_runtime(owner.runtime(), target, target_domain, connect_timeout)
             .await?;
@@ -2735,7 +2733,7 @@ impl PacketOutbound for AnyTlsHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        let owner = crate::runtime::NodeRuntime::ephemeral_guarded(node);
+        let owner = crate::runtime::NodeRuntime::try_ephemeral_guarded(node)?;
         let transport = self
             .dial_udp_transport_runtime(owner.runtime(), target, target_domain, connect_timeout)
             .await?;

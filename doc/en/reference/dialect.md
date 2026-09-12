@@ -48,8 +48,8 @@ honk reads dae's configuration syntax, but it is a dialect: where honk and dae r
 | Bare prefix matchers, `!geosite:cn -> proxy`, `domain:example.com -> proxy` | not function calls; rejected | Accepted as matchers (`geosite`, `geoip`, `domain`, `suffix`, `keyword`, `regex`, `full` prefixes). |
 | Two arrows, `domain(x) -> proxy->backup` | rejected | The outbound is the literal text `proxy->backup`. |
 | `-> proxy( must )` | call with parameter `must` | Only the exact suffix `(must)` is the must marker; `proxy( must )` is an outbound named `proxy( must )`. |
-| Whitespace before the parentheses, `dport (443) -> proxy` | accepted | The matcher is not recognised and the condition is dropped: the rule loads with no port condition. Write `dport(443)`. |
-| An unknown matcher in a conjunction, `dport(443) && domian(x) -> direct` | accepted by the grammar; validation is outside it | The unknown matcher is dropped and the rule loads as `dport(443) -> direct`. Check spelling; see issue #161. |
+| Whitespace before the parentheses, `dport (443) -> proxy` | accepted | Located `unknown-traffic-predicate` error. Remove whitespace before matcher parentheses. |
+| An unknown matcher in a conjunction, `dport(443) && domian(x) -> direct` | accepted by the grammar; validation is outside it | Located `unknown-traffic-predicate` error, also for negated terms. Correct the matcher; no term is silently discarded. |
 | Arguments with several colons, `dip(2001:db8::/32)`, `mac(00:11:22:33:44:55)` | not literals; quote them | Kept whole: only a recognised `prefix:` (`geosite:`, `geoip:`, `domain:`, `suffix:`, `keyword:`, `regex:`, `full:`) is split at its colon. |
 
 ## DNS
@@ -61,17 +61,17 @@ honk reads dae's configuration syntax, but it is a dialect: where honk and dae r
 | `->` in a request or response rule | one arrow | The rule splits at the first unquoted `->`; further arrows stay in the action (`-> up->stream` is an upstream named `up->stream`). The whole action text is lowercased: `Reject` is `reject`, and `-> MixedCase` names an upstream `mixedcase`, which does not match an upstream declared as `MixedCase`. |
 | A matcher call split across lines, `qname(` newline `a.example) -> reject` | whitespace, newlines included, is skipped | Request and response rules are read line by line; neither line is a complete rule, so the rule is dropped without a diagnostic. |
 | An upstream with an outbound, `u: 'udp://1.1.1.1:53' -> proxy` or `u: 'udp://1.1.1.1:53' outbound: proxy` | the arrow form is rejected (a declaration cannot carry `->`); the `outbound: proxy` form is two adjacent declarations | honk extension: both forms make upstream `u` dial through outbound `proxy`. |
-| Text after a matcher call, `dport(443)junk -> proxy`, `qname(a.example)junk -> reject` | rejected: the arrow must follow the call | The text after the first unquoted `)` is ignored and the matcher stands (routing and DNS rules; node filters `name(...)`/`subtag(...)` instead require the call to end the expression). |
+| Text after a matcher call, `dport(443)junk -> proxy`, `qname(a.example)junk -> reject` | rejected: the arrow must follow the call | Traffic rejects the configuration; DNS warns and omits the whole rule. Remove trailing matcher text. |
 | A trailing comment on an upstream line, `v: 'udp://8.8.8.8:53' # note` | comment | Not stripped: the address becomes `8.8.8.8:53' # note`. Keep upstream comments on their own line. |
 | `->` or `outbound:` inside a quoted upstream URL | data | The upstream reader searches the whole line, quotes included: `'https://dns.example/q?x=outbound:proxy#frag'` becomes address `dns.example/q?x=` with outbound `proxy#frag`. Do not put these separators in an upstream URL. |
-| `qtype(...)` | function arguments | Names `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `PTR`, `SOA`, `SRV`, `HTTPS`, `SVCB`, `ANY`, `*` (case-insensitive) or a decimal `u16`; an unknown name is silently omitted, and a `qtype` whose list ends up empty is kept as a condition that matches nothing. `qtype('a,aaaa')` splits the quoted text on commas. |
+| `qtype(...)` | function arguments | Names `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `PTR`, `SOA`, `SRV`, `HTTPS`, `SVCB`, `ANY`, `*` (case-insensitive) or decimal `u16`; unknown names emit `invalid-qtype` and omit the whole rule, including mixed or negated lists. Correct unknown names or use their numeric code. Explicit `qtype()` remains match-nothing; `qtype('a,aaaa')` selects both types. |
 
 ## Groups
 
 | Input | dae grammar | honk |
 |---|---|---|
 | `group('hk,jp')` | one literal | Two subgroup tags, split on `,` and `\|`. |
-| `filter: group()` | call without parameters | The empty subgroup filter is dropped; with no other `filter:` line the group falls back to every node. See issue #161. |
+| `filter: group()` | call without parameters | Retained as an explicit empty contribution through serde and refresh, with `empty-subgroup`. Remove the filter for all nodes; explicit `group()` now selects none. |
 
 ## Sections and includes
 

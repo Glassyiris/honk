@@ -23,6 +23,7 @@ use base64::Engine as _;
 
 use crate::error::ConfigError;
 use crate::node::{Node, OutboundConfig, ShadowsocksConfig};
+use crate::options::vocab::{optional_text, stream_transport, vmess_cipher};
 
 mod options;
 
@@ -30,6 +31,70 @@ impl Node {
     /// Parse a proxy share link (e.g. `ss://...`, `trojan://...`) into a [`Node`].
     /// A chain describes several hops; only the first is parsed.
     pub fn from_share_link(link: &str) -> Result<Node, ConfigError> {
+        let mut diagnostics = Vec::new();
+        let result = Self::from_share_link_with_detailed_diagnostics(link, &mut diagnostics);
+        crate::diagnostic::report_detailed_diagnostics(&diagnostics);
+        result.map_err(crate::error::DetailedConfigError::into_legacy)
+    }
+
+    /// Parse while emitting nonterminal diagnostics through a caller-owned sink.
+    /// The terminal failure stays in the returned error so callers can bound
+    /// retained per-entry diagnostics without losing its typed cause.
+    pub fn from_share_link_with_detailed_diagnostics_emit(
+        link: &str,
+        emit: &mut impl FnMut(crate::diagnostic::DetailedDiagnostic),
+    ) -> Result<Node, crate::error::DetailedConfigError> {
+        let source = crate::diagnostic::DiagnosticSources::new(None).root();
+        Self::parse_share_link(link, &source, emit)
+    }
+
+    /// Parse without logging, retaining a safe terminal diagnostic on failure.
+    pub fn from_share_link_with_detailed_diagnostics(
+        link: &str,
+        diagnostics: &mut Vec<crate::diagnostic::DetailedDiagnostic>,
+    ) -> Result<Node, crate::error::DetailedConfigError> {
+        let result =
+            Self::from_share_link_with_detailed_diagnostics_emit(link, &mut |diagnostic| {
+                diagnostics.push(diagnostic);
+            });
+        crate::diagnostic::finish_attempt(result, diagnostics)
+    }
+
+    pub fn from_share_link_with_diagnostics(
+        link: &str,
+        diagnostics: &mut Vec<crate::ConfigDiagnostic>,
+    ) -> Result<Node, ConfigError> {
+        let mut detailed = Vec::new();
+        let result = Self::from_share_link_with_detailed_diagnostics(link, &mut detailed);
+        diagnostics.extend(
+            detailed
+                .iter()
+                .map(crate::diagnostic::DetailedDiagnostic::to_legacy),
+        );
+        result.map_err(crate::error::DetailedConfigError::into_legacy)
+    }
+
+    pub(crate) fn parse_share_link(
+        link: &str,
+        source: &crate::diagnostic::SourceRef,
+        emit: &mut impl FnMut(crate::diagnostic::DetailedDiagnostic),
+    ) -> Result<Node, crate::error::DetailedConfigError> {
+        let mut node = Self::decode_share_link(link, source, emit).map_err(|error| {
+            crate::error::DetailedConfigError::from_legacy(error, source.clone())
+        })?;
+        node.validate_detailed().map_err(|mut error| {
+            error.diagnostic.source = source.clone();
+            error
+        })?;
+        node.id = node.derive_id();
+        Ok(node)
+    }
+
+    fn decode_share_link(
+        link: &str,
+        source: &crate::diagnostic::SourceRef,
+        emit: &mut impl FnMut(crate::diagnostic::DetailedDiagnostic),
+    ) -> Result<Node, ConfigError> {
         let first = link.split("->").next().unwrap_or("").trim();
         let mut ss_config = None;
         let (decoded, shadowrocket) = match first.split_once("://") {
@@ -70,11 +135,16 @@ impl Node {
             .or_else(|| query.get("remark").filter(|name| !name.is_empty()).cloned())
             .unwrap_or_else(|| format!("{}-{}", url.scheme(), node.host));
 
-        options::apply_tls(&mut node, &query, shadowrocket)?;
-        options::apply_transport(&mut node, &query, shadowrocket)?;
-        options::apply_protocol(&mut node, &query, embedded_hop_ports, shadowrocket)?;
-        node.validate_protocol()?;
-        node.id = node.derive_id();
+        options::apply_tls(&mut node, &query, shadowrocket, source, emit)?;
+        options::apply_transport(&mut node, &query)?;
+        options::apply_protocol(
+            &mut node,
+            &query,
+            embedded_hop_ports,
+            shadowrocket,
+            source,
+            emit,
+        )?;
         Ok(node)
     }
 }
@@ -214,47 +284,63 @@ impl VmessLinkJson {
             .ok_or_else(|| ConfigError::Parse("invalid vmess link: missing user id".into()))?;
 
         let transport = self.net.unwrap_or_default();
+        let transport_kind = stream_transport(&transport)
+            .map_err(|_| ConfigError::Parse("unsupported stream transport".into()))?;
 
         let mut stream = crate::node::StreamTransportOptions {
-            transport: transport.clone(),
+            transport,
             ..Default::default()
         };
         let mut tls = crate::node::TlsOptions {
             enabled: self.tls.as_deref() == Some("tls"),
             ..Default::default()
         };
-        if let Some(value) = self.host.filter(|value| !value.is_empty()) {
-            if transport == "ws" {
-                stream.ws_host = Some(value);
-            } else {
-                tls.sni = Some(value);
+        let host_claim = self.host.filter(|host| !host.is_empty());
+        let host_sni_claim = optional_text([host_claim.as_deref()])
+            .map_err(|_| ConfigError::Parse("invalid VMess TLS server name".into()))?;
+        let sni_claim = optional_text([self.sni.as_deref()])
+            .map_err(|_| ConfigError::Parse("invalid VMess TLS server name".into()))?;
+        if let Some(value) = host_claim.as_deref() {
+            if transport_kind == "ws" {
+                stream.ws_host = Some(value.to_string());
+            } else if let Some(value) = host_sni_claim {
+                tls.sni = Some(value.to_string());
             }
         }
-        if let Some(value) = self.sni.filter(|value| !value.is_empty()) {
-            tls.sni = Some(value);
+        if let Some(value) = sni_claim {
+            tls.sni = Some(value.to_string());
         }
         if let Some(value) = self.path.filter(|value| !value.is_empty()) {
-            match transport.as_str() {
+            match transport_kind {
                 "ws" => stream.ws_path = Some(value),
                 "grpc" => stream.grpc_service = Some(value),
                 _ => {}
             }
         }
-        let mut node = Node {
+        let node = Node {
             host: host.clone(),
             address: format!("{}:{}", host, port),
             port,
-            name: self.ps.unwrap_or_else(|| format!("vmess-{}", host)),
+            name: self
+                .ps
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| format!("vmess-{}", host)),
             outbound: crate::node::OutboundConfig::Vmess(crate::node::VmessConfig {
                 uuid: Some(id),
-                encryption: self.scy.or(self.security),
-                network: (!transport.is_empty()).then_some(transport),
+                encryption: vmess_cipher(
+                    self.scy
+                        .iter()
+                        .chain(self.security.iter())
+                        .map(String::as_str),
+                )
+                .map_err(|reason| ConfigError::Parse(reason.into()))?
+                .map(str::to_owned),
+                network: None,
                 transport: stream,
                 tls,
             }),
             ..Default::default()
         };
-        node.id = node.derive_id();
         Ok(node)
     }
 }
@@ -503,19 +589,8 @@ fn extract_hy2_hop_ports(link: &str) -> Result<(Cow<'_, str>, Option<String>), C
 
 /// Comma-separated ports and inclusive port ranges, all nonzero.
 fn valid_hop_port_spec(spec: &str) -> bool {
-    !spec.is_empty()
-        && spec.split(',').all(|segment| {
-            let segment = segment.trim();
-            match segment.split_once('-') {
-                None => segment.parse::<u16>().is_ok_and(|port| port > 0),
-                Some((low, high)) => {
-                    match (low.trim().parse::<u16>(), high.trim().parse::<u16>()) {
-                        (Ok(low), Ok(high)) => low > 0 && low <= high,
-                        _ => false,
-                    }
-                }
-            }
-        })
+    spec.split(',').all(|segment| !segment.trim().is_empty())
+        && crate::options::vocab::parse_port_hopping(spec).is_some()
 }
 
 /// Base64-decode tolerantly: URL-safe without padding first, then the other

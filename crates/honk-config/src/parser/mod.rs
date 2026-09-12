@@ -1,3 +1,4 @@
+mod diagnostics;
 mod dns;
 mod routing;
 
@@ -9,7 +10,13 @@ mod tests;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use self::diagnostics::ParserDiagnostics;
 use crate::config::GlobalConfig;
+use crate::diagnostic::{
+    DetailedDiagnostic, DiagnosticSources, SafeValue, SettingPath, finish_attempt,
+    report_detailed_diagnostics,
+};
+use crate::error::DetailedConfigError;
 use crate::experimental::ExperimentalConfig;
 use crate::group::Group;
 use crate::node::Node;
@@ -17,6 +24,22 @@ use crate::subscription::Subscription;
 use crate::{Config, ConfigDiagnostic};
 use regex::Regex;
 use structure::{Block, Item, quoted_end, scan};
+enum ParseFailure {
+    Legacy(crate::ConfigError),
+    Detailed(crate::error::DetailedConfigError),
+}
+
+impl From<crate::ConfigError> for ParseFailure {
+    fn from(error: crate::ConfigError) -> Self {
+        Self::Legacy(error)
+    }
+}
+
+impl From<crate::error::DetailedConfigError> for ParseFailure {
+    fn from(error: crate::error::DetailedConfigError) -> Self {
+        Self::Detailed(error)
+    }
+}
 
 /// Load a dae configuration file, resolving its top-level `include` blocks.
 ///
@@ -25,49 +48,123 @@ use structure::{Block, Item, quoted_end, scan};
 /// below that directory after symlink resolution.
 pub fn parse_dae_config_file(path: impl AsRef<Path>) -> Result<Config, crate::ConfigError> {
     let mut diagnostics = Vec::new();
-    let result = parse_dae_config_file_with_diagnostics(path, &mut diagnostics);
-    crate::diagnostic::report_diagnostics(&diagnostics);
-    result
+    let result = parse_dae_config_file_with_detailed_diagnostics(path, &mut diagnostics);
+    report_detailed_diagnostics(&diagnostics);
+    result.map_err(DetailedConfigError::into_legacy)
 }
 
-/// Load dae with includes, appending diagnostics as encountered on success or failure.
-/// The plain entry point logs them instead. Values must be safe to display;
-/// see [`ConfigDiagnostic`] for stderr warnings not captured by this vector.
+/// One-release data projection; the caller's existing prefix is preserved.
 pub fn parse_dae_config_file_with_diagnostics(
     path: impl AsRef<Path>,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) -> Result<Config, crate::ConfigError> {
-    let entry = std::fs::canonicalize(path.as_ref())?;
+    let mut detailed = Vec::new();
+    let result = parse_dae_config_file_with_detailed_diagnostics(path, &mut detailed);
+    diagnostics.extend(detailed.iter().map(DetailedDiagnostic::to_legacy));
+    result.map_err(DetailedConfigError::into_legacy)
+}
+
+pub fn parse_dae_config_file_with_detailed_diagnostics(
+    path: impl AsRef<Path>,
+    diagnostics: &mut Vec<DetailedDiagnostic>,
+) -> Result<Config, DetailedConfigError> {
+    let result = parse_dae_config_file_attempt(path, diagnostics, &mut false);
+    finish_attempt(result, diagnostics)
+}
+
+pub(crate) fn parse_dae_config_file_attempt(
+    path: impl AsRef<Path>,
+    diagnostics: &mut Vec<DetailedDiagnostic>,
+    semantic: &mut bool,
+) -> Result<Config, DetailedConfigError> {
+    let source = DiagnosticSources::new(Some(path.as_ref().to_path_buf())).root();
+    let mut sink = ParserDiagnostics::new(diagnostics, source);
+    match parse_dae_file_inner(path, &mut sink, semantic) {
+        Ok(config) => Ok(config),
+        Err(ParseFailure::Detailed(error)) => Err(error),
+        Err(ParseFailure::Legacy(error)) => Err(sink.error(error)),
+    }
+}
+
+fn parse_dae_file_inner(
+    path: impl AsRef<Path>,
+    diagnostics: &mut ParserDiagnostics<'_>,
+    semantic: &mut bool,
+) -> Result<Config, ParseFailure> {
+    let entry =
+        std::fs::canonicalize(path.as_ref()).map_err(|error| ParseFailure::Legacy(error.into()))?;
     let entry_dir = entry.parent().map(Path::to_path_buf).ok_or_else(|| {
-        crate::ConfigError::Include(format!(
+        ParseFailure::Legacy(crate::ConfigError::Include(format!(
             "entry configuration '{}' has no parent directory",
             entry.display()
-        ))
+        )))
     })?;
     let mut loader = IncludeLoader {
         entry_dir,
         loaded: HashSet::new(),
         stack: Vec::new(),
         saw_include: false,
+        entry_input: String::new(),
     };
     let blocks = match loader.expand_file(&entry, diagnostics) {
         Ok(blocks) => blocks,
-        Err(err @ crate::ConfigError::Include(_)) => return Err(err),
+        Err(err @ crate::ConfigError::Include(_)) => return Err(ParseFailure::Legacy(err)),
         Err(err) if loader.saw_include => {
-            return Err(crate::ConfigError::Include(format!(
+            return Err(ParseFailure::Legacy(crate::ConfigError::Include(format!(
                 "failed to parse configuration after resolving includes: {err}"
-            )));
+            ))));
         }
-        Err(err) => return Err(err),
+        Err(err) => return Err(ParseFailure::Legacy(err)),
     };
     match parse_blocks(blocks, diagnostics) {
         Ok(config) => Ok(config),
-        Err(err @ crate::ConfigError::UnsupportedPolicy(_)) => Err(err),
-        Err(err) if loader.saw_include => Err(crate::ConfigError::Include(format!(
-            "failed to parse configuration after resolving includes: {err}"
-        ))),
-        Err(err) => Err(err),
+        Err(err) => {
+            *semantic = loader.saw_include || !is_structured_document(&loader.entry_input);
+            match err {
+                ParseFailure::Detailed(mut error) if loader.saw_include => {
+                    if error.category != crate::error::ErrorCategory::UnsupportedPolicy {
+                        error.category = crate::error::ErrorCategory::Include;
+                    }
+                    Err(ParseFailure::Detailed(error))
+                }
+                err @ ParseFailure::Detailed(_) => Err(err),
+                ParseFailure::Legacy(error) if loader.saw_include => {
+                    let mut error = diagnostics.error(error);
+                    if error.category != crate::error::ErrorCategory::UnsupportedPolicy {
+                        error.category = crate::error::ErrorCategory::Include;
+                    }
+                    Err(ParseFailure::Detailed(error))
+                }
+                err => Err(err),
+            }
+        }
     }
+}
+
+fn is_structured_document(input: &str) -> bool {
+    // A dae semantic failure is final unless the complete document decodes as
+    // a YAML, TOML or JSON mapping containing at least one known Config root.
+    use crate::config::CONFIG_FIELDS;
+
+    serde_yaml::from_str::<serde_yaml::Value>(input).is_ok_and(|value| {
+        value.as_mapping().is_some_and(|mapping| {
+            mapping
+                .keys()
+                .any(|key| key.as_str().is_some_and(|key| CONFIG_FIELDS.contains(&key)))
+        })
+    }) || toml::from_str::<toml::Value>(input).is_ok_and(|value| {
+        value.as_table().is_some_and(|mapping| {
+            mapping
+                .keys()
+                .any(|key| CONFIG_FIELDS.contains(&key.as_str()))
+        })
+    }) || serde_json::from_str::<serde_json::Value>(input).is_ok_and(|value| {
+        value.as_object().is_some_and(|mapping| {
+            mapping
+                .keys()
+                .any(|key| CONFIG_FIELDS.contains(&key.as_str()))
+        })
+    })
 }
 
 struct IncludeLoader {
@@ -77,13 +174,14 @@ struct IncludeLoader {
     loaded: HashSet<PathBuf>,
     stack: Vec<PathBuf>,
     saw_include: bool,
+    entry_input: String,
 }
 
 impl IncludeLoader {
     fn expand_file(
         &mut self,
         path: &Path,
-        diagnostics: &mut Vec<ConfigDiagnostic>,
+        diagnostics: &mut ParserDiagnostics<'_>,
     ) -> Result<Vec<Block>, crate::ConfigError> {
         if !self.loaded.insert(path.to_path_buf()) {
             let mut chain = self
@@ -98,6 +196,15 @@ impl IncludeLoader {
             )));
         }
 
+        let parent = diagnostics.source();
+        let source = if self.stack.is_empty() {
+            parent
+        } else {
+            parent
+                .sources()
+                .add(Some(path.to_path_buf()), Some(parent.index()))
+        };
+        diagnostics.set_source(source.clone());
         self.stack.push(path.to_path_buf());
         let result = (|| {
             let input = std::fs::read_to_string(path).map_err(|err| {
@@ -118,6 +225,10 @@ impl IncludeLoader {
             }
             diagnostics.extend(structural_diagnostics);
             let roots = roots?;
+            diagnostics.register_blocks(&roots, &source);
+            if self.stack.len() == 1 {
+                self.entry_input = input;
+            }
             let mut blocks = Vec::new();
             let mut patterns = Vec::new();
             for block in roots {
@@ -135,7 +246,9 @@ impl IncludeLoader {
             // included descendants, regardless of where `include` occurs in
             // that entry.  Appending recursively gives that preorder.
             for pattern in patterns {
+                diagnostics.set_source(source.clone());
                 for child in self.expand_pattern(&pattern, path)? {
+                    diagnostics.set_source(source.clone());
                     blocks.extend(self.expand_file(&child, diagnostics)?);
                 }
             }
@@ -287,21 +400,42 @@ fn parse_include_body(body: &str, source: &Path) -> Result<Vec<String>, crate::C
 
 pub fn parse_dae_config(input: &str) -> Result<Config, crate::ConfigError> {
     let mut diagnostics = Vec::new();
-    let result = parse_dae_config_with_diagnostics(input, &mut diagnostics);
-    crate::diagnostic::report_diagnostics(&diagnostics);
-    result
+    let result = parse_dae_config_with_detailed_diagnostics(input, &mut diagnostics);
+    report_detailed_diagnostics(&diagnostics);
+    result.map_err(DetailedConfigError::into_legacy)
 }
 
-/// Parse dae, appending diagnostics as encountered on success or failure.
-/// The plain entry point logs them instead. Values must be safe to display;
-/// see [`ConfigDiagnostic`] for stderr warnings not captured by this vector.
+/// One-release data projection; never logs or exposes arbitrary input values.
 pub fn parse_dae_config_with_diagnostics(
     input: &str,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) -> Result<Config, crate::ConfigError> {
-    check_dae_input(input)?;
-    let blocks = scan(input, None, diagnostics, &mut false)?;
-    parse_blocks(blocks, diagnostics)
+    let mut detailed = Vec::new();
+    let result = parse_dae_config_with_detailed_diagnostics(input, &mut detailed);
+    diagnostics.extend(detailed.iter().map(DetailedDiagnostic::to_legacy));
+    result.map_err(DetailedConfigError::into_legacy)
+}
+
+pub fn parse_dae_config_with_detailed_diagnostics(
+    input: &str,
+    diagnostics: &mut Vec<DetailedDiagnostic>,
+) -> Result<Config, DetailedConfigError> {
+    let source = DiagnosticSources::new(None).root();
+    let mut sink = ParserDiagnostics::new(diagnostics, source.clone());
+    let result: Result<Config, ParseFailure> = (|| {
+        check_dae_input(input)?;
+        let mut structural = Vec::new();
+        let blocks = scan(input, None, &mut structural, &mut false);
+        sink.extend(structural);
+        let blocks = blocks?;
+        sink.register_blocks(&blocks, &source);
+        parse_blocks(blocks, &mut sink)
+    })();
+    let result = result.map_err(|error| match error {
+        ParseFailure::Detailed(error) => error,
+        ParseFailure::Legacy(error) => sink.error(error),
+    });
+    finish_attempt(result, sink.output)
 }
 
 fn check_dae_input(input: &str) -> Result<(), crate::ConfigError> {
@@ -321,8 +455,8 @@ fn check_dae_input(input: &str) -> Result<(), crate::ConfigError> {
 
 fn parse_blocks(
     blocks: Vec<Block>,
-    diagnostics: &mut Vec<ConfigDiagnostic>,
-) -> Result<Config, crate::ConfigError> {
+    diagnostics: &mut ParserDiagnostics<'_>,
+) -> Result<Config, ParseFailure> {
     let mut sections = Vec::<Block>::new();
     let mut indices = HashMap::<String, usize>::new();
     for block in blocks {
@@ -341,12 +475,13 @@ fn parse_blocks(
     let mut config = Config::default();
 
     for section in &sections {
+        diagnostics.at_section(section, &[]);
         match section.name.as_str() {
             "global" => config.global = parse_global_section(section, diagnostics)?,
             "dns" => config.dns = dns::parse_section(section, diagnostics)?,
-            "routing" => config.routing = routing::parse_section(section)?,
+            "routing" => config.routing = routing::parse_section(section, diagnostics)?,
             "node" => {
-                for node in parse_node_section(section)? {
+                for node in parse_node_section(section, diagnostics)? {
                     config.nodes.push(node);
                 }
             }
@@ -402,7 +537,7 @@ fn resolve_group_filters_inner(
     groups: &mut [Group],
     nodes: &[Node],
     subscriptions: &[Subscription],
-    mut diagnostics: Option<&mut Vec<ConfigDiagnostic>>,
+    mut diagnostics: Option<&mut ParserDiagnostics<'_>>,
 ) {
     let mut subscription_tags: HashMap<uuid::Uuid, Vec<&str>> = HashMap::new();
     for subscription in subscriptions {
@@ -412,14 +547,23 @@ fn resolve_group_filters_inner(
             .push(subscription.name.as_str());
     }
 
-    for group in groups {
+    for (group_index, group) in groups.iter_mut().enumerate() {
+        if let Some(diagnostics) = diagnostics.as_deref_mut() {
+            diagnostics.select_group(group_index + 1);
+        }
         let filters: Vec<(usize, &str)> = group
             .filters
             .iter()
             .enumerate()
             .map(|(index, filter)| (index, filter.trim()))
-            // Non-standalone group references must not trigger the all-nodes fallback.
-            .filter(|(_, filter)| standalone_group_reference(filter).is_none())
+            .filter(|(_, filter)| {
+                standalone_group_reference(filter).is_none_or(|args| {
+                    split_unquoted(args, ",")
+                        .map(unquote_filter_argument)
+                        .flat_map(|tag| tag.split(['|', ',']))
+                        .all(|tag| tag.trim().is_empty())
+                })
+            })
             .collect();
 
         if filters.is_empty() {
@@ -435,6 +579,9 @@ fn resolve_group_filters_inner(
 
         let mut parsed_filters = Vec::new();
         for (index, filter) in filters {
+            if standalone_group_reference(filter).is_some() {
+                continue;
+            }
             if let Some(parsed) = parse_group_filter_expression(filter) {
                 parsed_filters.push(parsed);
             } else if let Some(diagnostics) = diagnostics.as_deref_mut() {
@@ -666,8 +813,8 @@ fn strip_unquoted_comment(line: &str) -> &str {
 }
 fn parse_global_section(
     section: &Block,
-    diagnostics: &mut Vec<ConfigDiagnostic>,
-) -> Result<GlobalConfig, crate::ConfigError> {
+    diagnostics: &mut ParserDiagnostics<'_>,
+) -> Result<GlobalConfig, ParseFailure> {
     let mut cfg = GlobalConfig::default();
     let kv = parse_kv_pairs(section.lines_except(&[]));
 
@@ -770,7 +917,18 @@ fn parse_global_section(
         cfg.dial_mode = v.clone();
     }
     if let Some(v) = kv.get("nfqueue_enable") {
-        cfg.nfqueue_enable = parse_checked_bool(v, "global.nfqueue_enable")?;
+        cfg.nfqueue_enable = parse_checked_bool(v, "global.nfqueue_enable").map_err(|_| {
+            let (source, line) = diagnostics.field_location("nfqueue_enable");
+            let mut error = DetailedConfigError::new(
+                crate::error::ErrorCategory::Parse,
+                "invalid-config-value",
+                source,
+                SettingPath::new("global").field("nfqueue_enable"),
+                "expected true/false, yes/no, 1/0 or on/off",
+            );
+            error.diagnostic.line = line;
+            ParseFailure::Detailed(error)
+        })?;
     }
     if let Some(v) = kv.get("allow_insecure") {
         cfg.allow_insecure = lenient_bool(v, "global.allow_insecure", diagnostics);
@@ -834,6 +992,14 @@ fn parse_global_section(
             .map_err(|_| crate::ConfigError::Parse(format!("invalid max_concurrent_dials: {v}")))?;
     }
 
+    crate::check::validate_dns_check_targets(&cfg.udp_check_dns).map_err(|mut error| {
+        let (source, line) = diagnostics.field_location("udp_check_dns");
+        error.diagnostic.source = source;
+        if error.diagnostic.line.is_none() {
+            error.diagnostic.line = line;
+        }
+        ParseFailure::Detailed(error)
+    })?;
     Ok(cfg)
 }
 
@@ -875,7 +1041,11 @@ fn standalone_group_reference(val: &str) -> Option<&str> {
 
 fn extract_fn_args(expr: &str, fn_name: &str) -> Option<Vec<String>> {
     let body = expr.strip_prefix(fn_name)?.strip_prefix('(')?;
-    let args = &body[..find_unquoted(body, ")")?];
+    let end = find_unquoted(body, ")")?;
+    if !body[end + 1..].trim().is_empty() {
+        return None;
+    }
+    let args = &body[..end];
     Some(
         split_unquoted(args, ",")
             .map(unquote_filter_argument)
@@ -901,24 +1071,31 @@ fn normalize_geosite_code(code: &str) -> String {
     code.trim().to_string()
 }
 
-fn node_parse_diagnostic(error: &crate::ConfigError) -> String {
-    format!("node section: skipping unparseable entry: {error}")
-}
-
-fn parse_node_section(section: &Block) -> Result<Vec<Node>, crate::ConfigError> {
+fn parse_node_section(
+    section: &Block,
+    diagnostics: &mut ParserDiagnostics<'_>,
+) -> Result<Vec<Node>, ParseFailure> {
     let mut nodes = Vec::new();
     let lines = section.lines_except(&[]);
-    for line in lines {
+    for (index, line) in lines.into_iter().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
+        diagnostics.entry(line, index + 1);
         if let Some(rest) = trimmed.strip_prefix("mux")
             && rest.trim_start().starts_with(['=', ':'])
         {
-            return Err(crate::ConfigError::Parse(
-                "node section: standalone 'mux' is unsupported; set vless_mode on each VLESS share link".into(),
-            ));
+            let (source, line) = diagnostics.field_location("mux");
+            let mut error = DetailedConfigError::new(
+                crate::error::ErrorCategory::Parse,
+                "unsupported-node-mux",
+                source,
+                SettingPath::new("nodes").field("mux"),
+                "standalone mux is unsupported; set vless_mode on each VLESS share link",
+            );
+            error.diagnostic.line = line;
+            return Err(error.into());
         }
         let unquote = |s: &str| s.trim().trim_matches(|c| c == '\'' || c == '"').to_string();
         let (tag, value) = split_entry_tag(trimmed);
@@ -937,28 +1114,36 @@ fn parse_node_section(section: &Block) -> Result<Vec<Node>, crate::ConfigError> 
             None if value.contains(':') => (String::new(), value.to_string()),
             None => (String::new(), unquote(value)),
         };
-        match Node::from_share_link(&uri) {
+        match diagnostics.parse_share_link(&uri) {
             Ok(mut node) => {
                 if !tag.is_empty() {
                     node.name = tag;
                 }
                 nodes.push(node);
             }
-            // A recognized-but-removed protocol in the config file is a hard
-            // error (subscriptions skip such entries with a warning instead).
-            Err(e @ crate::ConfigError::UnknownProtocol(_)) => return Err(e),
-            Err(e) => eprintln!("{}", node_parse_diagnostic(&e)),
+            // Config documents reject removed protocols; subscriptions skip them.
+            Err(error) if error.category == crate::error::ErrorCategory::UnknownProtocol => {
+                return Err(ParseFailure::Detailed(error));
+            }
+            Err(_) => diagnostics.emit(DetailedDiagnostic::warning(
+                "invalid-node-entry",
+                diagnostics.source(),
+                SettingPath::new("nodes").index(index + 1),
+                SafeValue::Redacted,
+                "node entry could not be parsed; ignored",
+            )),
         }
     }
     Ok(nodes)
 }
 fn parse_group_section(
     section: &Block,
-    diagnostics: &mut Vec<ConfigDiagnostic>,
+    diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Result<Vec<Group>, crate::ConfigError> {
     let mut groups = Vec::new();
 
     for grp in section.blocks_any() {
+        diagnostics.begin_group(grp, groups.len() + 1);
         let mut group = Group {
             name: grp.name.clone(),
             ..Default::default()
@@ -995,16 +1180,31 @@ fn parse_group_section(
                 .map(|(_, v)| strip_unquoted_comment(v.trim()).trim())
                 .unwrap_or("");
             if let Some(args) = standalone_group_reference(val) {
+                let mut has_tag = false;
                 for tag in split_unquoted(args, ",")
                     .map(unquote_filter_argument)
                     .flat_map(|tag| tag.split(['|', ',']).map(str::trim))
                     .map(str::to_string)
                 {
+                    has_tag |= !tag.is_empty();
                     if !tag.is_empty() && !group.groups.contains(&tag) {
                         group.groups.push(tag);
                     }
                 }
+                if !has_tag {
+                    diagnostics.remember_filter(line);
+                    diagnostics.at_line(line);
+                    group.filters.push(val.to_string());
+                    diagnostics.emit(DetailedDiagnostic::warning(
+                        "empty-subgroup",
+                        diagnostics.source(),
+                        SettingPath::new("groups").index(groups.len() + 1).field("filter").index(group.filters.len()),
+                        SafeValue::Ordinal(group.filters.len()),
+                        "empty subgroup contribution selects no nodes; remove the filter to select all nodes",
+                    ));
+                }
             } else {
+                diagnostics.remember_filter(line);
                 group.filters.push(val.to_string());
             }
         }
@@ -1018,7 +1218,7 @@ fn parse_group_section(
 fn parse_group_policy(
     policy: &str,
     group_name: &str,
-    diagnostics: &mut Vec<ConfigDiagnostic>,
+    diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Result<crate::group::GroupPolicy, crate::ConfigError> {
     let base = policy
         .trim()
@@ -1052,7 +1252,7 @@ fn parse_group_policy(
 
 fn parse_subscription_section(
     section: &Block,
-    diagnostics: &mut Vec<ConfigDiagnostic>,
+    diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Result<Vec<Subscription>, crate::ConfigError> {
     let mut subs = Vec::new();
     append_subscriptions(&section.items, &mut subs, diagnostics);
@@ -1062,7 +1262,7 @@ fn parse_subscription_section(
 fn append_subscriptions(
     items: &[Item],
     subs: &mut Vec<Subscription>,
-    diagnostics: &mut Vec<ConfigDiagnostic>,
+    diagnostics: &mut ParserDiagnostics<'_>,
 ) {
     for item in items {
         match item {
@@ -1079,6 +1279,7 @@ fn append_subscriptions(
                     continue;
                 };
                 let kv = parse_kv_pairs(block.lines_except(&[]));
+                diagnostics.subscription(block, subs.len() + 1);
                 let mut sub = Subscription {
                     name: unquote_filter_argument(tag).to_string(),
                     ..Default::default()
@@ -1186,9 +1387,10 @@ fn parse_subscription_value(value: &str) -> (String, Option<String>) {
 }
 fn parse_experimental_section(
     section: &Block,
-    diagnostics: &mut Vec<ConfigDiagnostic>,
+    diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Result<ExperimentalConfig, crate::ConfigError> {
     let mut cfg = ExperimentalConfig::default();
+    let mut api_location = None;
     let recognised = ["clash_api", "cache_file", "udp_nfqueue"];
     let ambient = section.lines_except(&recognised);
     if let Some(setting) = ambient.into_iter().find(|line| !line.trim().is_empty()) {
@@ -1200,11 +1402,13 @@ fn parse_experimental_section(
     let subs = section.blocks_matching(&recognised);
 
     for sub in subs {
+        diagnostics.at_section(sub, &[]);
         let kv = parse_kv_pairs(sub.lines_except(&[]));
         match sub.name.as_str() {
             "clash_api" => {
                 if let Some(v) = kv.get("external_controller") {
                     cfg.clash_api.external_controller = v.clone();
+                    api_location = Some(diagnostics.field_location("external_controller"));
                 }
                 if let Some(v) = kv.get("external_ui") {
                     cfg.clash_api.external_ui = v.clone();
@@ -1255,9 +1459,18 @@ fn parse_experimental_section(
                     .unwrap_or(false);
                 cfg.legacy_udp_nfqueue =
                     Some(crate::experimental::LegacyUdpNfqueueConfig { enabled });
+                diagnostics.emit(crate::diagnostic::legacy_nfqueue_warning(
+                    diagnostics.source(),
+                ));
             }
             _ => {}
         }
+    }
+    if let Some((source, line)) = api_location
+        && let Some(mut diagnostic) = cfg.clash_api.exposure_diagnostic(source)
+    {
+        diagnostic.line = line;
+        diagnostics.output.push(diagnostic);
     }
 
     Ok(cfg)
@@ -1278,7 +1491,7 @@ fn parse_checked_bool(s: &str, setting: &str) -> Result<bool, crate::ConfigError
 fn lenient<T>(
     parsed: Option<T>,
     fallback: T,
-    diagnostics: &mut Vec<ConfigDiagnostic>,
+    diagnostics: &mut ParserDiagnostics<'_>,
     diagnostic: impl FnOnce() -> ConfigDiagnostic,
 ) -> T {
     match parsed {
@@ -1293,7 +1506,7 @@ fn lenient<T>(
 /// Lenient boolean for dae settings honk does not reject. Recognised spellings are dae's
 /// (`true/t/1/y/yes/on`, `false/f/0/n/no/off`, case-insensitive) and produce no
 /// diagnostic; `t` and `y` still yield false, a divergence recorded in the lab notes.
-fn lenient_bool(value: &str, setting: &str, diagnostics: &mut Vec<ConfigDiagnostic>) -> bool {
+fn lenient_bool(value: &str, setting: &str, diagnostics: &mut ParserDiagnostics<'_>) -> bool {
     let lowered = value.to_lowercase();
     match lowered.as_str() {
         "true" | "yes" | "1" | "on" => true,
@@ -1322,7 +1535,7 @@ fn lenient_duration_ms(
     value: &str,
     setting: &str,
     default: u64,
-    diagnostics: &mut Vec<ConfigDiagnostic>,
+    diagnostics: &mut ParserDiagnostics<'_>,
 ) -> u64 {
     lenient(
         crate::types::parse_duration_ms(value),

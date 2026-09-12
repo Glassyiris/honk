@@ -1136,6 +1136,40 @@ impl Default for ProxyRegistry {
 
 #[cfg(test)]
 mod tests {
+    fn registry_test_node(name: &str, protocol: NodeProtocol) -> Node {
+        if protocol == NodeProtocol::Direct {
+            return honk_config::config::Config::builtin_direct_node();
+        }
+        if protocol == NodeProtocol::Block {
+            return honk_config::config::Config::builtin_block_node();
+        }
+        let host = format!("{name}.example");
+        let mut outbound = honk_config::node::OutboundConfig::from_protocol(protocol);
+        let credential = "00000000-0000-4000-8000-000000000001".to_string();
+        match &mut outbound {
+            honk_config::node::OutboundConfig::Vmess(config) => {
+                config.uuid = Some(credential.clone())
+            }
+            honk_config::node::OutboundConfig::Vless(config) => {
+                config.uuid = Some(credential.clone())
+            }
+            honk_config::node::OutboundConfig::Tuic(config) => {
+                config.uuid = Some(credential.clone())
+            }
+            honk_config::node::OutboundConfig::Juicity(config) => config.uuid = Some(credential),
+            _ => {}
+        }
+        let mut node = Node {
+            name: name.into(),
+            address: format!("{host}:443"),
+            host,
+            port: 443,
+            outbound,
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        node
+    }
     use super::*;
 
     #[test]
@@ -1243,13 +1277,7 @@ mod tests {
         assert!(entry.packet.is_some());
         assert!(entry.warmable.is_some());
 
-        let node = Node {
-            id: uuid::Uuid::new_v4(),
-            name: "legacy-vless".into(),
-            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::VLess),
-            address: "127.0.0.1:9".into(),
-            ..Default::default()
-        };
+        let node = registry_test_node("legacy-vless", NodeProtocol::VLess);
         let generation = Arc::new(
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
         );
@@ -1347,29 +1375,18 @@ mod tests {
 
     #[tokio::test]
     async fn warm_udp_is_not_applicable_without_reusable_udp_state() {
-        let mut nodes = Vec::new();
+        let mut nodes = vec![registry_test_node("direct", NodeProtocol::Direct)];
         for (name, protocol) in [
-            ("direct", NodeProtocol::Direct),
             ("socks", NodeProtocol::Socks5),
             ("ss", NodeProtocol::SS),
             ("trojan", NodeProtocol::Trojan),
         ] {
-            nodes.push(Node {
-                id: uuid::Uuid::new_v4(),
-                name: name.into(),
-                outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
-                ..Default::default()
-            });
+            nodes.push(registry_test_node(name, protocol));
         }
-        nodes.push(Node {
-            id: uuid::Uuid::new_v4(),
-            name: "tcp-only-anytls".into(),
-            outbound: honk_config::node::OutboundConfig::AnyTls(honk_config::node::AnyTlsConfig {
-                network: Some("tcp".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
+        let mut tcp_only = registry_test_node("tcp-only-anytls", NodeProtocol::AnyTLS);
+        tcp_only.anytls_mut().unwrap().network = Some("tcp".into());
+        tcp_only.id = tcp_only.derive_id();
+        nodes.push(tcp_only);
         let generation = Arc::new(crate::runtime::OutboundRuntimeRegistry::build(&nodes).unwrap());
         let registry = ProxyRegistry::default_resolver().unwrap();
 
@@ -1418,12 +1435,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_warm_releases_only_its_inserted_retention() {
-        let node = Node {
-            id: uuid::Uuid::new_v4(),
-            name: "cancelled-anytls".into(),
-            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
-            ..Default::default()
-        };
+        let node = registry_test_node("cancelled-anytls", NodeProtocol::AnyTLS);
         let generation = Arc::new(
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
         );
@@ -1479,12 +1491,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_warm_releases_its_policy_retention() {
-        let node = Node {
-            id: uuid::Uuid::new_v4(),
-            name: "failing-anytls".into(),
-            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
-            ..Default::default()
-        };
+        let node = registry_test_node("failing-anytls", NodeProtocol::AnyTLS);
         let generation = Arc::new(
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
         );
@@ -1524,12 +1531,7 @@ mod tests {
 
     #[tokio::test]
     async fn warm_udp_rejects_a_shutdown_generation_before_dispatch() {
-        let node = Node {
-            id: uuid::Uuid::new_v4(),
-            name: "old-anytls".into(),
-            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::AnyTLS),
-            ..Default::default()
-        };
+        let node = registry_test_node("old-anytls", NodeProtocol::AnyTLS);
         let generation = Arc::new(
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
         );
@@ -1546,12 +1548,7 @@ mod tests {
 
     #[tokio::test]
     async fn speculative_udp_rejects_a_shutdown_generation_before_dispatch() {
-        let node = Node {
-            id: uuid::Uuid::new_v4(),
-            name: "direct".into(),
-            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Direct),
-            ..Default::default()
-        };
+        let node = registry_test_node("direct", NodeProtocol::Direct);
         let generation = Arc::new(
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
         );

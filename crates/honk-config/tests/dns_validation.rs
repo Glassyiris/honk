@@ -14,16 +14,16 @@ fn dns_validation_fixture(name: &str) -> Config {
     }
 }
 
-fn assert_missing_dns_upstream(config: &Config, location: &str, target: &str, declared: &[&str]) {
+fn assert_missing_dns_upstream(config: &Config, location: &str, target: &str) {
     let error = config
-        .validate()
+        .validate_detailed()
         .expect_err("undeclared DNS target must fail");
-    assert!(matches!(error, honk_config::ConfigError::Validation(_)));
-    let message = error.to_string();
-    assert!(message.contains(location), "{message}");
-    assert!(message.contains(&format!("'{target}'")), "{message}");
-    let expected = format!("declared upstreams: {:?}", declared);
-    assert!(message.contains(&expected), "{message}");
+    assert_eq!(
+        error.category,
+        honk_config::error::ErrorCategory::Validation
+    );
+    assert_eq!(error.diagnostic.code, "unknown-dns-upstream");
+    assert_eq!(error.diagnostic.setting.to_string(), location);
     let mut corrected = config.clone();
     let mut declaration = corrected.dns.upstream[0].clone();
     declaration.name = target.into();
@@ -31,16 +31,16 @@ fn assert_missing_dns_upstream(config: &Config, location: &str, target: &str, de
     corrected.validate().unwrap();
 }
 
-fn assert_missing_legacy_fallback(config: &Config, detail: &str, declared: &[&str]) {
+fn assert_missing_legacy_fallback(config: &Config, expected_code: &str) {
     let error = config
-        .validate()
+        .validate_detailed()
         .expect_err("legacy fallback without a declaration must fail");
-    assert!(matches!(error, honk_config::ConfigError::Validation(_)));
-    let message = error.to_string();
-    assert!(message.contains("dns.routing.fallback"), "{message}");
-    assert!(message.contains(detail), "{message}");
-    let expected = format!("declared upstreams: {:?}", declared);
-    assert!(message.contains(&expected), "{message}");
+    assert_eq!(
+        error.category,
+        honk_config::error::ErrorCategory::Validation
+    );
+    assert_eq!(error.diagnostic.code, expected_code);
+    assert_eq!(error.diagnostic.setting.to_string(), "dns.routing.fallback");
     let mut corrected = config.clone();
     corrected.dns.routing.fallback = "default".into();
     corrected.validate().unwrap();
@@ -49,86 +49,46 @@ fn assert_missing_legacy_fallback(config: &Config, detail: &str, declared: &[&st
 #[test]
 fn test_validate_rejects_dns_request_rule_target() {
     let config = dns_validation_fixture("request-rule-missing.dae");
-    assert_missing_dns_upstream(
-        &config,
-        "dns.routing.request.rules[0].action",
-        "missing",
-        &["alpha", "default", "zeta"],
-    );
+    assert_missing_dns_upstream(&config, "dns.routing.request.rules[1].action", "missing");
 }
 
 #[test]
 fn test_validate_rejects_dns_request_fallback_target() {
     let config = dns_validation_fixture("request-fallback-missing.dae");
-    assert_missing_dns_upstream(
-        &config,
-        "dns.routing.request.fallback",
-        "missing",
-        &["alpha", "default", "zeta"],
-    );
+    assert_missing_dns_upstream(&config, "dns.routing.request.fallback", "missing");
 }
 
 #[test]
 fn test_validate_rejects_dns_implicit_fallback_after_catch_all() {
     let config = dns_validation_fixture("explicit-only-alidns-catchall.dae");
-    assert_missing_dns_upstream(
-        &config,
-        "dns.routing.request.fallback",
-        "default",
-        &["alidns"],
-    );
+    assert_missing_dns_upstream(&config, "dns.routing.request.fallback", "default");
 }
 
 #[test]
 fn test_validate_rejects_dns_implicit_fallback_without_request_routing() {
     let config = dns_validation_fixture("explicit-only-alidns.dae");
-    assert_missing_dns_upstream(
-        &config,
-        "dns.routing.request.fallback",
-        "default",
-        &["alidns"],
-    );
+    assert_missing_dns_upstream(&config, "dns.routing.request.fallback", "default");
 }
 
 #[test]
 fn test_validate_rejects_dns_response_rule_target() {
     let config = dns_validation_fixture("response-rule-missing.dae");
-    assert_missing_dns_upstream(
-        &config,
-        "dns.routing.response.rules[0].action",
-        "missing",
-        &["default"],
-    );
+    assert_missing_dns_upstream(&config, "dns.routing.response.rules[1].action", "missing");
 }
 
 #[test]
 fn test_validate_rejects_dns_response_fallback_target() {
     let config = dns_validation_fixture("response-fallback-missing.dae");
-    assert_missing_dns_upstream(
-        &config,
-        "dns.routing.response.fallback",
-        "missing",
-        &["default"],
-    );
+    assert_missing_dns_upstream(&config, "dns.routing.response.fallback", "missing");
 }
 
 #[test]
 fn test_validate_rejects_dae_uppercase_declaration_mismatch() {
     let config = dns_validation_fixture("dae-uppercase-request-mismatch.dae");
-    assert_missing_dns_upstream(
-        &config,
-        "dns.routing.request.rules[0].action",
-        "alidns",
-        &["AliDNS", "default"],
-    );
+    assert_missing_dns_upstream(&config, "dns.routing.request.rules[1].action", "alidns");
 
     let config = dns_validation_fixture("dae-uppercase-response-mismatch.dae");
-    assert_missing_dns_upstream(
-        &config,
-        "dns.routing.response.rules[0].action",
-        "alidns",
-        &["AliDNS", "default"],
-    );
+    assert_missing_dns_upstream(&config, "dns.routing.response.rules[1].action", "alidns");
     dns_validation_fixture("dae-lowercase-declaration.dae")
         .validate()
         .unwrap();
@@ -152,36 +112,36 @@ fn test_validate_accepts_named_dns_response_fallback() {
 #[test]
 fn test_validate_rejects_effective_legacy_dns_rule_target() {
     let config = dns_validation_fixture("legacy-rule-missing.json");
-    assert_missing_dns_upstream(
-        &config,
-        "dns.routing.rules[0].upstream",
-        "missing",
-        &["alpha", "default"],
-    );
+    assert_missing_dns_upstream(&config, "dns.routing.rules[1].upstream", "missing");
 }
 
 #[test]
 fn test_validate_rejects_omitted_legacy_dns_fallback() {
     let config = dns_validation_fixture("legacy-fallback-omitted.json");
-    assert_missing_legacy_fallback(&config, "no fallback declared", &["alpha", "default"]);
+    assert_missing_legacy_fallback(&config, "missing-dns-fallback");
 }
 
 #[test]
 fn test_validate_rejects_empty_legacy_dns_fallback() {
     let config = dns_validation_fixture("legacy-fallback-empty.toml");
-    assert_missing_legacy_fallback(&config, "empty fallback", &["alpha", "default"]);
+    assert_missing_legacy_fallback(&config, "empty-dns-fallback");
+    let mut declared_empty = config.clone();
+    let mut upstream = declared_empty.dns.upstream[0].clone();
+    upstream.name.clear();
+    declared_empty.dns.upstream.push(upstream);
+    declared_empty.validate().unwrap();
 }
 
 #[test]
 fn test_validate_rejects_effective_legacy_dns_fallback_target() {
     let config = dns_validation_fixture("legacy-fallback-missing.json");
-    assert_missing_legacy_fallback(&config, "'missing'", &["alpha", "default"]);
+    assert_missing_legacy_fallback(&config, "unknown-dns-upstream");
 }
 
 #[test]
 fn test_validate_rejects_promoted_legacy_dns_fallback_target() {
     let config = dns_validation_fixture("legacy-promotion-missing.json");
-    assert_missing_legacy_fallback(&config, "'missing'", &["alpha", "default"]);
+    assert_missing_legacy_fallback(&config, "unknown-dns-upstream");
 }
 
 #[test]
@@ -197,12 +157,7 @@ fn test_validate_rejects_last_legacy_dns_rule_target() {
     last_rule.domain = "last.example".into();
     last_rule.upstream = "missing".into();
     config.dns.routing.rules.push(last_rule);
-    assert_missing_dns_upstream(
-        &config,
-        "dns.routing.rules[1].upstream",
-        "missing",
-        &["AliDNS", "default"],
-    );
+    assert_missing_dns_upstream(&config, "dns.routing.rules[2].upstream", "missing");
 }
 
 #[test]
@@ -214,7 +169,12 @@ fn test_validate_accepts_legacy_dns_upstream_sentinel_without_rules() {
     config.validate().unwrap();
 
     let config = dns_validation_fixture("legacy-sentinel-rules.json");
-    assert_missing_dns_upstream(&config, "dns.routing.fallback", "upstream", &["default"]);
+    assert_missing_legacy_fallback(&config, "missing-dns-fallback");
+    let mut declared_sentinel = config.clone();
+    let mut upstream = declared_sentinel.dns.upstream[0].clone();
+    upstream.name = "upstream".into();
+    declared_sentinel.dns.upstream.push(upstream);
+    declared_sentinel.validate().unwrap();
 }
 
 #[test]

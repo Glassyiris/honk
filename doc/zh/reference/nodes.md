@@ -19,9 +19,11 @@ node {
 
 当前解析器同时接受带 tag 和不带 tag 的条目。非空 dae tag 会替换链接的 `#fragment` 名称。不带 tag 的链接保留解码后的 fragment；没有 fragment 时使用不含凭据的 `{scheme}-{host}` 回退名称。
 
+VMess JSON 的 `ps` 备注缺失或为空时，先使用 `vmess-{host}` 通过校验，再由非空 dae tag 替换名称。
+
 识别 tag 与链接的结束引号时，反斜杠会转义下一个字符；解析后的文本保留原始转义序列。
 
-格式错误但 scheme 已识别的链接会被丢弃，并向 stderr 输出 `node section: skipping unparseable entry: ...`。未知 scheme 是配置硬错误。独立的 `mux:` 或 `mux=` 行也会被拒绝；VLESS wire 行为必须写在各链接的 `vless_mode=` query 中。
+协议已识别但格式错误的链接会被丢弃，并产生 `invalid-node-entry` 诊断。诊断使用原始节点条目序号，不包含链接或节点名称。数据接口返回诊断而不记录日志；普通接口只报告一次。未知协议属于配置硬错误。独立的 `mux:` 或 `mux=` 行也会被拒绝；VLESS 传输行为必须写在各链接的 `vless_mode=` 查询参数中。
 
 旧版 `ss://base64(method:password@host:port)` 格式按字面值读取解码后的凭据，不做 URL 解码：`%20` 保持为 `%20`，`?`、`/`、`#`、`:` 和 `@` 仍是密码字符。最后一个 `@` 分隔凭据与端点；userinfo 本身也可以是 `base64(method:password)`。解码后的载荷缺少 `@`，或凭据无法解析为方法与密码时，拒绝解析。URL userinfo 格式仍按百分号解码凭据。端点、路径、query（包括 `/?plugin=...`）和 fragment 继续按 URL 处理。
 
@@ -59,9 +61,9 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `plugin` / `plugin_opts` | string? | null | 解析后的 SIP002 插件元数据；代理插件不受支持，订阅导入会拒绝非空值 |
 | `transport` | string | `"tcp"` | 流 transport；校验只接受空值/`tcp`、`ws` 或 `grpc` |
 | `tls` | bool | `false` | 流 TLS 标志；Trojan/AnyTLS 链接开启，规范 VLESS 链接历史默认开启 |
-| `sni` | string? | null | TLS 服务端名称；依次采用非空的 `sni`、`peer`、未被传输层使用的 `host` 查询参数 |
+| `sni` | string? | null | TLS 服务端名称；非空的 `sni` 与 `peer` 必须一致，未被传输层使用的 `host` 作为回退值 |
 | `tls_alpn` | string[] | `[]` | 结构化配置/订阅导入的普通裸 TCP TLS ALPN；空列表保留 TLS profile 默认值。非空值支持 AnyTLS 与 TCP Trojan/VMess/VLESS，不支持关闭 TLS、REALITY、WS/gRPC 或 QUIC。TUIC 继续使用 `tuic_alpn`；这不是分享链接 query。 |
-| `skip_cert_verify` | bool | `false` | `allowInsecure`、`allow_insecure` 或 `insecure` 等于 `1`/`true` |
+| `skip_cert_verify` | bool | `false` | 跳过证书校验；`allowInsecure`、`allow_insecure` 与 `insecure` 的有效声明必须一致，安全影响见下文 |
 | `ech_enabled` | bool | `false` | 存在静态 ECH 配置，或 `ech=1`/`true` |
 | `ech_config` | string? | null | 来自 `ech_config` 或 `echconfig` 的 Base64 ECHConfigList |
 | `ech_config_path` | string? | null | 结构化 loader 中指向 base64 ECHConfigList 的路径；不是分享链接 query |
@@ -69,7 +71,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `reality_short_id` | string? | null | 来自 `sid` 的 REALITY short ID |
 | `reality_spider_x` | string? | null | 存储的 `spx`；REALITY 链接默认设为 `/` |
 | `flow` | string? | null | 来自非空 `flow` 或 Shadowrocket `xtls=2` 的 VLESS flow；只支持 `xtls-rprx-vision` |
-| `network` | string? | null | 协议网络/能力提示；VMess JSON `net` 与订阅导入会填充它 |
+| `network` | string? | null | 受支持协议的数据包网络能力；与 VMess JSON `net` 等流传输字段独立 |
 | `ws_path` / `ws_host` | string? | null | WebSocket `path` 与 Host header |
 | `grpc_service` | string? | null | gRPC `serviceName` 或 `service_name` |
 | `hy2_auth` / `hy2_obfs` | string? | null | Hysteria2 认证与 salamander 密码 |
@@ -79,10 +81,10 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `hy2_disable_mtu_discovery` | bool? | null | Hysteria2 `disablePathMTUDiscovery` |
 | `quic_mtu` | u16? | null | 来自 `mtu` 的 QUIC UDP payload 大小；默认 1252，接受范围 1200–65527；显式设置大于 1252 时启用 GSO，`HONK_QUIC_GSO=0` 可强制关闭 |
 | `tls_pin_sha256` | string? | null | 来自 `pinSHA256` 或 `pin_sha256` 的叶证书 SHA-256 pin |
-| `tuic_uuid` / `tuic_password` | string? | null | TUIC 专用凭据；handler 会回退到通用 userinfo 字段 |
+| `tuic_uuid` / `tuic_password` | string? | null | TUIC 凭据；扁平字段须与别名 `username` / `password` 一致 |
 | `tuic_congestion` / `tuic_alpn` | string? | null | TUIC `congestion_control` 与逗号分隔的 `alpn` |
 | `tuic_init_stream_recv_window` / `tuic_init_conn_recv_window` | u64? | null | TUIC QUIC 接收窗口；有效默认值为 8 MiB / 8 MiB |
-| `juicity_uuid` / `juicity_password` | string? | null | Juicity 专用凭据；handler 会回退到通用 userinfo 字段 |
+| `juicity_uuid` / `juicity_password` | string? | null | Juicity 凭据；扁平字段须与别名 `username` / `password` 一致 |
 | `anytls_password` | string? | null | 从链接 userinfo 复制的 AnyTLS 密钥 |
 | `anytls_min_idle_session` | usize? | null | 来自 `min_idle_session` 的空闲 session 目标下限；有效默认值 0，受两条 session 的池上限约束 |
 | `anytls_idle_session_check_interval` | u64? | null | 解析后的 `idle_session_check_interval` 秒数；当前运行时 janitor 周期仍固定为 30 秒 |
@@ -92,13 +94,35 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `subscription_id` / `group_id` | UUID? | null | 导入/运行时归属元数据 |
 | `created_at` / `updated_at` | datetime | now | 运行时元数据 |
 
-校验要求每个非内置节点名称非空，并且 `address` 或 `host` 至少一个非空。
+节点自身校验要求非空名称、有效主机和显式非零 `port`。`address` 不会补充缺失的端口；仅提供 IPv6 地址时须显式设置 `host`。只有身份与注入规则完全一致的 `direct`/`block` 内置节点可省略端点。
 
 ### 结构化 loader 兼容性
 
 TOML、YAML 与 JSON 继续使用旧的扁平节点键。加载时只读取所选 `protocol` 自己的字段；其他协议遗留的非默认字段会被剥离而不会拒绝节点，并由一条警告列出被剥离的字段名。例如，`ss` 节点上的 `tls: true` 会被忽略并告警，而不会开启 TLS。对 Trojan、VLESS、Hysteria2 与 AnyTLS，`username` 不是凭证别名；缺少该协议实际凭证字段时，单独提供的 `username` 会被剥离并触发针对性警告，从而保持旧版行为与 ID。所选协议实际使用的值仍会正常解析与校验。Honk 自身输出仍可安全 round-trip。启用 `store_subscribe` 时，原始订阅正文仅在解析成功后持久化；被拒绝的刷新不会覆盖上一份有效正文。
 
+扁平凭据别名在剥离不兼容字段前比较：Hysteria2 的 `hy2_auth`/`password`，TUIC 和 Juicity 的专用 UUID/`username`、专用密码/`password`，以及 AnyTLS 的 `password`/`anytls_password`。缺失或 null 表示未提供；已提供的字符串须逐字节一致，空字符串和首尾空格也参与比较。空凭据仍须满足对应协议的要求。扁平凭据字段仍须使用字符串；数字转换仅适用于订阅导入。
+
 新增 `tls_alpn` 字段不沿用旧字段剥离规则：不支持的协议或 TLS 上下文带有非空值时，会拒绝节点，而不是静默改变握手。
+
+分享链接的证书校验布尔值忽略首尾空白和 ASCII 大小写。`true`、`yes`、`1`、`on` 会关闭证书校验；`false`、`f`、`no`、`n`、`0`、`off`、`t`、`y` 保持校验开启。空文本、未知文本或别名冲突会使链接被拒绝。**安全行为变更：**`yes` 和 `on` 以前不会关闭校验，现在会关闭校验并产生警告。升级前请检查这些链接，改用明确的 `true` 或 `false`。结构化布尔值仍须使用原生布尔类型，不转换字符串或数字。
+
+VMess 加密方式接受 `auto` 和 `aes-128-gcm`，忽略大小写并存储为小写；空的可选声明使用默认值。JSON 的 `scy`/`security`、编码分享链接的 `encryption`/`scy`/表示加密方式的 `security`，以及订阅支持的加密方式别名，须在赋值前比较。不支持的值或冲突会使节点被拒绝。编码分享链接中的 `security=none` 和 `security=tls` 仍控制 TLS，不表示加密方式。记录格式的位置参数仍是低优先级备用值。
+
+TUIC 分享链接和订阅的转发模式只接受未指定、空值或 `native`；即使存在有效别名，不支持的 `udp-relay-mode`/`udp_relay_mode` 仍会使条目被拒绝。Hy2 分享链接只接受小写的 `obfs=salamander`；未指定或空值关闭混淆，未知名称（包括 `SALAMANDER`）会被拒绝。Salamander 未提供非空密码时仍关闭混淆。重复密码声明与 `obfs-password`/`obfs_password` 须一致。Clash 仍接受不区分大小写的 Salamander，并要求非空白密码；sing-box 仍要求小写类型，并拒绝已配置有效字段但缺少类型或密码的混淆对象。
+
+时长转换拒绝负数、非有限值和超出范围的值，不再截为零或上限。结构化订阅的秒数字段将整数毫秒向上取整（`500ms` 和 `1000ms` 均为 `1`，零仍为零），再比较别名。Hy2 分享链接的 `mhop` 仍只接受无后缀的无符号整数秒数；`500ms` 和 `1s` 会被忽略，并产生不含原值的警告。AnyTLS 分享链接保留秒数解析规则；dae 毫秒字段仍只接受裸数值、ms 或 s，并截去不足一毫秒的部分。
+
+sing-box 的 `hop_interval`、`idle_session_timeout` 和 `idle_session_check_interval` 保留原生数字零，缺失或 null 仍表示未提供。Hysteria2 记录会将每个 `mhop`、`hop-interval` 和 `hop_interval` 值转换为秒后比较；即使存在有效别名，冲突或无效值仍会使记录被拒绝。
+
+Hysteria2 端口跳跃集合在拨号前拒绝重复端口和重叠范围，包括 `443,443`。单端口集合仍然有效。有效配置保留原写法；地址中的端口列表仍拒绝空项。出站构造函数对直接构造的节点使用同一个检查函数。
+
+普通分享链接、VMess JSON、独立扁平 Node 反序列化和订阅导入都在构造完成时校验节点。使用 UUID 的协议要求有效 UUID；不支持的加密方式、传输类型、数据包能力、flow、ALPN 上下文或端口跳跃集合，会在派生身份前被拒绝。Vision 要求 TLS 或 REALITY。直接构造的节点也不能使用本应由适配器归一化掉的空 SNI、flow 或 network。订阅格式特有的非空密码要求仍留在对应适配器；SOCKS 可选认证及处理器支持的空凭据仍然有效。无效 dae 节点行和订阅条目仍按原策略跳过，有效条目保留。仅解析 Config 片段的 API 仍不执行整份配置准入，但片段内的无效节点现在会在构造时被拒绝。独立反序列化保留传入的 ID；运行时身份准入是另一项检查。
+
+直接调用 `Node::validate()` 与适配器完成构造时使用相同的固定脱敏错误。校验错误不包含传入的节点名称或凭据值。
+
+详细 Config 加载接口和配置／注册表准入保留节点校验的字段与原因，并补上从 1 开始的原始节点序号，不再替换为笼统的无效节点错误。凭据冲突指向规范别名字段，不输出任一值。独立 `NodeSeed` 和 Node 反序列化仍返回脱敏的通用 serde 错误。
+
+VMess JSON 使用 `net: "ws"` 时，缺失或为空的 `host` 会让 WebSocket 握手使用节点服务器主机；提供非空 `host` 时仍以它为显式覆盖值。
 
 ## 协议
 
@@ -118,6 +142,8 @@ TOML、YAML 与 JSON 继续使用旧的扁平节点键。加载时只读取所�
 
 `network` 还可关闭 Trojan、AnyTLS 与非 legacy VLESS 的 packet 拨号。AnyTLS 会拒绝超过 16 KiB 的 UDP payload，与 anytls-go 0.0.13 的 relay buffer 一致。Legacy VLESS 没有 UDP，VMess UDP 尚未实现。
 
+对于支持 `network` 的协议，扁平结构化输入接受逗号分隔的 `tcp`/`udp`，忽略各项首尾空白和 ASCII 大小写。`tcp` 关闭 UDP；`udp` 与 `tcp,udp` 都允许 UDP。空文本或纯空白规范化为未指定，保留协议的默认能力。`quic` 等未知值，或非空列表中的空项，会使节点被拒绝。该字段只控制 UDP 准入；`udp` 不会额外禁止 TCP。
+
 没有 `rprx` Cargo feature 时，VMess 与 VLESS 节点仍能解析，但不会注册 handler，拨号以 `No handler for protocol` 失败。`honk-core` 默认启用 `rprx`。
 
 `honk-core` 在启动和 reload 时注入具有固定保留 ID 的 `direct` 与 `block`。用户节点不得使用这些名称或协议。
@@ -136,7 +162,7 @@ TOML、YAML 与 JSON 继续使用旧的扁平节点键。加载时只读取所�
 
 ### 流传输
 
-Trojan 与 VLESS URL 链接用 `type=` 或其 `network=` 别名选择 transport。对于 `ws`，`path` 映射到 `ws_path`，`host` 映射到 `ws_host`；对于 `grpc`，`serviceName` 或 `service_name` 映射到 `grpc_service`。`sni` 独立生效。`alpn` 为兼容而接受，但不会存储。配置校验只允许 TCP、WebSocket 与 gRPC。
+支持流传输的分享链接用 `type=` 或其 `network=` 别名选择传输方式。空文本和 `tcp` 表示裸 TCP；`ws`、`grpc` 分别选择 WebSocket、gRPC。赋值前会比较所有已提供的别名，包括兼容的 `obfs` 声明和重复查询键；不一致则拒绝链接。`h2`、`kcp` 等不支持的名称会在解析时被拒绝。对于 `ws`，`path` 映射到 `ws_path`，`host` 映射到 `ws_host`；对于 `grpc`，`serviceName` 或 `service_name` 映射到 `grpc_service`。`sni` 独立生效。`alpn` 为兼容而接受，但不会存储。
 
 ```dae
 node {
@@ -146,6 +172,8 @@ node {
 ```
 
 VMess 接受 v2rayN Base64 JSON（`net`、`host`、`path`、`sni`），也接受 Shadowrocket 的 `vmess://base64(auto:UUID@host:port)?...` authority 形式。后者映射 `tls`、`peer`/`sni`、`obfs=websocket|grpc`、`obfsParam`、`path` 和 `remark`；接受 standard / URL-safe Base64，有无 padding 均可。编码 authority 的 VMess 要求 AEAD 认证及 `auto`/`aes-128-gcm`；不支持的 cipher 和 REALITY 参数会被拒绝，不会静默替换。
+
+VMess JSON 的 `net` 和 Shadowrocket 传输参数只选择流传输方式，不再写入数据包网络能力字段。未指定数据包限制时，保留原有默认 UDP 能力；已有的有效空传输字段也保留原始写法。
 
 VLESS 已完成以下 live 互通验证：TCP+REALITY+Vision、TCP+REALITY、TCP+WS、TCP+WS+TLS 与 TCP+gRPC。Vision 支持的 direct-copy 组合是带 TLS 或 REALITY 的裸 TCP，而不是 WS/gRPC。
 
@@ -161,11 +189,13 @@ query 映射遵循 [Shadowrocket 导出器](https://github.com/cedar2025/Xboard/
 | 未指定 `security` 时的 `pbk`、`sid`、`spx` | 选择 REALITY，必须提供非空 `pbk`。仍支持显式 `security=reality`。 |
 | `xtls=0` / `xtls=2` | 无 flow / `xtls-rprx-vision`。拒绝已淘汰的 XTLS Direct（`xtls=1`）及未知值。 |
 | `remark` | 没有非空 fragment 时用作显示名称，作为 query 值只解码一次。 |
-| `peer` | 缺少 `sni` 时的 SNI 回退值；Hysteria2 和其他 URL 形 TLS 链接也支持。 |
+| `peer` | 显式 SNI 别名；非空的 `sni` 与 `peer` 必须一致。空值或纯空白名称视为未指定。 |
 | `obfs=websocket`、`obfsParam`、`path` | WebSocket transport、Host header 回退值和路径。 |
 | `obfs=grpc`、`path` | gRPC transport 和 service name 回退值。 |
 
-TLS/REALITY、flow 或 transport 声明相互冲突时会拒绝链接，不会静默降级。VLESS 的 `obfs` 仅接受空值/`none`、`websocket` 或 `grpc`，不会把未支持的传输方式当作 TCP。规范 `host`、`serviceName`/`service_name`、`sni` 字段优先于对应别名。规范化发生在派生节点 ID 之前，因此等价的规范链接与 Shadowrocket 链接拥有相同身份。
+TLS/REALITY、flow 或传输声明相互冲突时会拒绝链接，不会静默降级。VLESS 的 `obfs` 仅接受空值/`none`、`websocket` 或 `grpc`，不会把不支持的传输方式当作 TCP。`host` 和 `serviceName`/`service_name` 保留原有回退顺序。显式 SNI 别名在赋值前按原始字节比较：相同值合并，不同值报错，不转换大小写。空值或纯空白的 SNI 和 flow 在派生节点 ID 前规范化为未指定；非空 flow 必须为 `xtls-rprx-vision`。
+
+Clash 导入会比较 `servername`、`server-name` 和 `sni`；记录格式还会比较 `tls-name` 和 `tls-host`，并保留较低优先级的 `obfs_sni` 回退值，包括 Quantumult X 的 WSS Host。记录中的 `off` 仍为无效值。分享链接和 VMess JSON 的 WebSocket `host` 仅用作 Host 请求头；非 WebSocket 传输则将其作为较低优先级的 SNI 回退值。TLS 使用方最终仍可回退到节点主机名。
 
 ### Hysteria2
 
@@ -181,7 +211,7 @@ TLS/REALITY、flow 或 transport 声明相互冲突时会拒绝链接，不会�
 | `initStreamReceiveWindow` / `initConnReceiveWindow` | QUIC 接收窗口覆盖值 |
 | `disablePathMTUDiscovery` | 值为 `1`/`true` 时关闭 QUIC PMTU 发现 |
 | `mtu` | 共用 QUIC UDP-payload 上限；只接受 1200–65527 |
-| `sni` / `peer`、insecure 别名、ECH 参数 | 共用 TLS 行为；显式 `sni` 优先于 `peer` |
+| `sni` / `peer`、insecure 别名、ECH 参数 | 共用 TLS 行为；非空的显式 SNI 别名必须一致 |
 
 ```dae
 node {

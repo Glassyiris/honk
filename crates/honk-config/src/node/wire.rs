@@ -1,7 +1,13 @@
-use serde::de::Error as _;
+use serde::de::{DeserializeSeed, Error as _};
 use serde::ser::SerializeStruct as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use super::validation::ValidationFailure;
+use crate::diagnostic::{
+    DetailedDiagnostic, DiagnosticSources, SafeValue, SettingPath, SourceRef,
+    report_detailed_diagnostics,
+};
+use crate::options::vocab::{coalesce_equal, optional_flow, packet_network};
 use crate::types::NodeProtocol;
 
 use super::{
@@ -9,6 +15,19 @@ use super::{
     ShadowsocksConfig, Socks5Config, StreamTransportOptions, TlsOptions, TrojanConfig, TuicConfig,
     VlessConfig, VmessConfig, WireMode,
 };
+fn semantic_error(
+    source: &SourceRef,
+    setting: SettingPath,
+    message: &'static str,
+) -> crate::error::DetailedConfigError {
+    crate::error::DetailedConfigError::new(
+        crate::error::ErrorCategory::Validation,
+        "invalid-config-value",
+        source.clone(),
+        setting,
+        message,
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct FlatNode {
@@ -125,7 +144,61 @@ struct FlatNode {
 }
 
 impl FlatNode {
-    fn strip_protocol_incompatible_fields(&mut self) {
+    fn resolve_credential_aliases(&mut self) -> Result<(), ValidationFailure> {
+        fn resolve(
+            field: &'static str,
+            dedicated: Option<String>,
+            generic: Option<String>,
+        ) -> Result<Option<String>, ValidationFailure> {
+            coalesce_equal(
+                [Ok(dedicated), Ok(generic)],
+                "credential aliases must agree",
+            )
+            .map_err(|message| ValidationFailure::new(Some(field), message))
+        }
+
+        match self.protocol {
+            NodeProtocol::Hysteria2 => {
+                self.hy2_auth = resolve("hy2_auth", self.hy2_auth.take(), self.password.take())?;
+            }
+            NodeProtocol::Tuic => {
+                self.tuic_uuid = resolve("tuic_uuid", self.tuic_uuid.take(), self.username.take())?;
+                self.tuic_password = resolve(
+                    "tuic_password",
+                    self.tuic_password.take(),
+                    self.password.take(),
+                )?;
+            }
+            NodeProtocol::Juicity => {
+                self.juicity_uuid = resolve(
+                    "juicity_uuid",
+                    self.juicity_uuid.take(),
+                    self.username.take(),
+                )?;
+                self.juicity_password = resolve(
+                    "juicity_password",
+                    self.juicity_password.take(),
+                    self.password.take(),
+                )?;
+            }
+            NodeProtocol::AnyTLS => {
+                self.anytls_password = resolve(
+                    "anytls_password",
+                    self.anytls_password.take(),
+                    self.password.take(),
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn strip_protocol_incompatible_fields(
+        &mut self,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+        source: &SourceRef,
+        setting: &SettingPath,
+    ) {
         let stream = matches!(
             self.protocol,
             NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess
@@ -326,23 +399,17 @@ impl FlatNode {
         );
 
         if !dropped.is_empty() {
-            if let Some(credential) = unused_username_credential {
-                tracing::warn!(
-                    node = %self.name,
-                    protocol = %self.protocol.as_str(),
-                    fields = %dropped.join(", "),
-                    "credential field '{}' is empty; 'username' is not used by {}",
-                    credential,
-                    self.protocol.as_str()
-                );
-            } else {
-                tracing::warn!(
-                    node = %self.name,
-                    protocol = %self.protocol.as_str(),
-                    fields = %dropped.join(", "),
+            diagnostics.push(DetailedDiagnostic::warning(
+                "incompatible-node-fields",
+                source.clone(),
+                setting.clone(),
+                SafeValue::Fields(dropped),
+                if unused_username_credential.is_some() {
+                    "credential field is empty; username is not used by this protocol"
+                } else {
                     "ignoring protocol-incompatible fields"
-                );
-            }
+                },
+            ));
         }
     }
 
@@ -372,11 +439,55 @@ impl FlatNode {
     }
 }
 
-impl TryFrom<FlatNode> for Node {
-    type Error = crate::ConfigError;
-
-    fn try_from(mut flat: FlatNode) -> Result<Self, Self::Error> {
-        flat.strip_protocol_incompatible_fields();
+impl FlatNode {
+    fn into_node(
+        mut self,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+        source: &SourceRef,
+        setting: &SettingPath,
+    ) -> Result<Node, crate::error::DetailedConfigError> {
+        self.resolve_credential_aliases()
+            .map_err(|error| error.into_detailed(source.clone(), setting.clone()))?;
+        self.strip_protocol_incompatible_fields(diagnostics, source, setting);
+        if self.protocol == NodeProtocol::VMess {
+            self.encryption = crate::options::vocab::vmess_cipher(self.encryption.as_deref())
+                .map_err(|_| {
+                    semantic_error(
+                        source,
+                        setting.clone().field("encryption"),
+                        "VMess cipher must be auto or aes-128-gcm; aliases must agree",
+                    )
+                })?
+                .map(str::to_owned);
+        }
+        if let Some(value) = self.network.as_deref()
+            && packet_network(value)
+                .map_err(|_| {
+                    semantic_error(
+                        source,
+                        setting.clone().field("network"),
+                        "packet network must contain only tcp or udp tokens",
+                    )
+                })?
+                .is_none()
+        {
+            self.network = None;
+        }
+        if self.protocol == NodeProtocol::VLess
+            && optional_flow(self.flow.as_deref())
+                .map_err(|_| {
+                    semantic_error(
+                        source,
+                        setting.clone().field("flow"),
+                        "VLESS flow must be absent or exactly xtls-rprx-vision; aliases must agree",
+                    )
+                })?
+                .is_none()
+        {
+            self.flow = None;
+        }
+        self.sni = self.sni.take().filter(|value| !value.trim().is_empty());
+        let mut flat = self;
         let outbound = match flat.protocol {
             NodeProtocol::SS => OutboundConfig::Shadowsocks(ShadowsocksConfig {
                 password: flat.password.take(),
@@ -425,7 +536,7 @@ impl TryFrom<FlatNode> for Node {
             NodeProtocol::Hysteria2 => {
                 let tls = flat.take_tls();
                 OutboundConfig::Hysteria2(Hysteria2Config {
-                    auth: flat.hy2_auth.take().or_else(|| flat.password.take()),
+                    auth: flat.hy2_auth.take(),
                     obfs: flat.hy2_obfs.take(),
                     up_mbps: flat.hy2_up_mbps,
                     down_mbps: flat.hy2_down_mbps,
@@ -443,8 +554,8 @@ impl TryFrom<FlatNode> for Node {
             NodeProtocol::Tuic => {
                 let tls = flat.take_tls();
                 OutboundConfig::Tuic(TuicConfig {
-                    uuid: flat.tuic_uuid.take().or_else(|| flat.username.take()),
-                    password: flat.tuic_password.take().or_else(|| flat.password.take()),
+                    uuid: flat.tuic_uuid.take(),
+                    password: flat.tuic_password.take(),
                     congestion: flat.tuic_congestion.take(),
                     alpn: flat.tuic_alpn.take(),
                     init_stream_recv_window: flat.tuic_init_stream_recv_window,
@@ -458,11 +569,8 @@ impl TryFrom<FlatNode> for Node {
             NodeProtocol::Juicity => {
                 let tls = flat.take_tls();
                 OutboundConfig::Juicity(JuicityConfig {
-                    uuid: flat.juicity_uuid.take().or_else(|| flat.username.take()),
-                    password: flat
-                        .juicity_password
-                        .take()
-                        .or_else(|| flat.password.take()),
+                    uuid: flat.juicity_uuid.take(),
+                    password: flat.juicity_password.take(),
                     quic: QuicOptions {
                         tls,
                         mtu: flat.quic_mtu,
@@ -472,7 +580,7 @@ impl TryFrom<FlatNode> for Node {
             NodeProtocol::AnyTLS => {
                 let tls = flat.take_tls();
                 OutboundConfig::AnyTls(AnyTlsConfig {
-                    password: flat.password.take().or_else(|| flat.anytls_password.take()),
+                    password: flat.anytls_password.take(),
                     network: flat.network.take(),
                     min_idle_session: flat.anytls_min_idle_session,
                     idle_session_check_interval: flat.anytls_idle_session_check_interval,
@@ -484,10 +592,11 @@ impl TryFrom<FlatNode> for Node {
             NodeProtocol::Block => OutboundConfig::Block,
         };
         if !flat.tls_alpn.is_empty() {
-            return Err(crate::ConfigError::Validation(format!(
-                "Node '{}' sets tls_alpn on a protocol without TLS",
-                flat.name
-            )));
+            return Err(semantic_error(
+                source,
+                setting.clone().field("tls_alpn"),
+                "TLS ALPN requires a TLS-capable protocol",
+            ));
         }
         let node = Node {
             id: flat.id,
@@ -503,9 +612,7 @@ impl TryFrom<FlatNode> for Node {
             created_at: flat.created_at,
             updated_at: flat.updated_at,
         };
-        if node.tls().is_some_and(|tls| !tls.alpn.is_empty()) {
-            node.validate_protocol()?;
-        }
+        node.validate_detailed_at(source, setting)?;
         Ok(node)
     }
 }
@@ -763,8 +870,72 @@ impl<'de> Deserialize<'de> for Node {
     where
         D: Deserializer<'de>,
     {
-        FlatNode::deserialize(deserializer)?
-            .try_into()
-            .map_err(D::Error::custom)
+        let mut diagnostics = Vec::new();
+        let result = NodeSeed {
+            diagnostics: &mut diagnostics,
+            source: DiagnosticSources::new(None).root(),
+            setting: SettingPath::new("nodes"),
+        }
+        .deserialize(deserializer);
+        report_detailed_diagnostics(&diagnostics);
+        result
+    }
+}
+
+/// Data-only serde adapter; the enclosing Config/Node attempt owns terminal reporting.
+pub struct NodeSeed<'a> {
+    pub diagnostics: &'a mut Vec<DetailedDiagnostic>,
+    pub source: SourceRef,
+    pub setting: SettingPath,
+}
+
+/// Crate-private variant used by the detailed structured loaders. It leaves the
+/// decoder error intact until the format-specific owner has captured location
+/// metadata and replaced the public error with a redacted terminal.
+pub(crate) struct RawNodeSeed<'a> {
+    pub diagnostics: &'a mut Vec<DetailedDiagnostic>,
+    pub source: SourceRef,
+    pub setting: SettingPath,
+    pub record_semantic: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for NodeSeed<'_> {
+    type Value = Node;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Node, D::Error> {
+        RawNodeSeed {
+            diagnostics: self.diagnostics,
+            source: self.source,
+            setting: self.setting,
+            record_semantic: false,
+        }
+        .deserialize(deserializer)
+        .map_err(|_| D::Error::custom("invalid node fields"))
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for RawNodeSeed<'_> {
+    type Value = Node;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Node, D::Error> {
+        let RawNodeSeed {
+            diagnostics,
+            source,
+            setting,
+            record_semantic,
+        } = self;
+        let flat = FlatNode::deserialize(deserializer)?;
+        flat.into_node(diagnostics, &source, &setting)
+            .map_err(|mut error| {
+                if record_semantic {
+                    error.diagnostic.entry_index =
+                        setting.0.iter().find_map(|segment| match segment {
+                            crate::diagnostic::SettingSegment::Index(index) => Some(*index),
+                            _ => None,
+                        });
+                    diagnostics.push(*error.diagnostic);
+                }
+                D::Error::custom("invalid node fields")
+            })
     }
 }

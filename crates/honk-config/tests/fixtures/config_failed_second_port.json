@@ -1,0 +1,19 @@
+{
+  "nodes": [
+    {
+      "name": "first",
+      "protocol": "socks5",
+      "address": "example.test:1080",
+      "host": "example.test",
+      "port": 1080,
+      "sni": "ignored.example"
+    },
+    {
+      "name": "second",
+      "protocol": "socks5",
+      "address": "example.test:1080",
+      "host": "example.test",
+      "port": "private-port"
+    }
+  ]
+}

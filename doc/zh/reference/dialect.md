@@ -48,8 +48,8 @@ honk 读取 dae 的配置语法，但它是一种方言：honk 与 dae 对同一
 | 裸前缀匹配器，`!geosite:cn -> proxy`、`domain:example.com -> proxy` | 不是函数调用，拒绝 | 接受为匹配器（`geosite`、`geoip`、`domain`、`suffix`、`keyword`、`regex`、`full` 前缀）。 |
 | 两个箭头，`domain(x) -> proxy->backup` | 拒绝 | 出站是字面文本 `proxy->backup`。 |
 | `-> proxy( must )` | 带参数 `must` 的调用 | 只有精确后缀 `(must)` 是 must 标记；`proxy( must )` 是名为 `proxy( must )` 的出站。 |
-| 括号前有空格，`dport (443) -> proxy` | 接受 | 匹配器不被识别，条件被丢弃：规则加载后没有端口条件。请写 `dport(443)`。 |
-| 合取里的未知匹配器，`dport(443) && domian(x) -> direct` | 文法接受，校验在文法之外 | 未知匹配器被丢弃，规则按 `dport(443) -> direct` 加载。请检查拼写；见 issue #161。 |
+| 括号前有空格，`dport (443) -> proxy` | 接受 | 返回带位置的 `unknown-traffic-predicate` 错误。请删除匹配器名称与左括号之间的空格。 |
+| 合取里的未知匹配器，`dport(443) && domian(x) -> direct` | 文法接受，校验在文法之外 | 返回带位置的 `unknown-traffic-predicate` 错误，取反条件也不例外。请修正匹配器；不再静默丢弃单个条件。 |
 | 含多个冒号的参数，`dip(2001:db8::/32)`、`mac(00:11:22:33:44:55)` | 不是字面量，需要加引号 | 整体保留：只有识别的 `prefix:`（`geosite:`、`geoip:`、`domain:`、`suffix:`、`keyword:`、`regex:`、`full:`）才在其冒号处拆分。 |
 
 ## DNS
@@ -61,17 +61,17 @@ honk 读取 dae 的配置语法，但它是一种方言：honk 与 dae 对同一
 | request 或 response 规则里的 `->` | 一个箭头 | 规则在第一个引号外的 `->` 处拆分，后续箭头留在动作里（`-> up->stream` 是名为 `up->stream` 的上游）。整个动作文本会转为小写：`Reject` 即 `reject`，`-> MixedCase` 指向名为 `mixedcase` 的上游，与声明为 `MixedCase` 的上游不匹配。 |
 | 跨行的匹配器调用，`qname(` 换行 `a.example) -> reject` | 空白（含换行）被跳过 | request 与 response 规则逐行读取，两行都不是完整规则，该规则被丢弃且没有诊断。 |
 | 带出站的上游，`u: 'udp://1.1.1.1:53' -> proxy` 或 `u: 'udp://1.1.1.1:53' outbound: proxy` | 箭头形式被拒绝（声明不能带 `->`）；`outbound: proxy` 形式是相邻的两个声明 | honk 扩展：两种形式都让上游 `u` 经出站 `proxy` 拨号。 |
-| 匹配器调用后的文本，`dport(443)junk -> proxy`、`qname(a.example)junk -> reject` | 拒绝：箭头必须紧接调用 | 第一个引号外 `)` 之后的文本被忽略，匹配器仍然生效（路由与 DNS 规则；节点过滤条件 `name(...)`/`subtag(...)` 则要求调用结束整个表达式）。 |
+| 匹配器调用后的文本，`dport(443)junk -> proxy`、`qname(a.example)junk -> reject` | 拒绝：箭头必须紧接调用 | 流量路由拒绝配置；DNS 发出警告并省略整条规则。请删除匹配器后的多余文本。 |
 | 上游行的行尾注释，`v: 'udp://8.8.8.8:53' # note` | 注释 | 不剥除：地址变成 `8.8.8.8:53' # note`。上游的注释请独占一行。 |
 | 带引号的上游 URL 内的 `->` 或 `outbound:` | 数据 | 上游读取器搜索整行，包括引号内：`'https://dns.example/q?x=outbound:proxy#frag'` 变成地址 `dns.example/q?x=`、出站 `proxy#frag`。不要在上游 URL 里放这两个分隔符。 |
-| `qtype(...)` | 函数参数 | 名称 `A`、`AAAA`、`CNAME`、`MX`、`TXT`、`NS`、`PTR`、`SOA`、`SRV`、`HTTPS`、`SVCB`、`ANY`、`*`（不区分大小写）或十进制 `u16`；未知名称静默省略，列表为空的 `qtype` 仍保留为一个不匹配任何类型的条件。`qtype('a,aaaa')` 把带引号的文本按逗号拆分。 |
+| `qtype(...)` | 函数参数 | 名称 `A`、`AAAA`、`CNAME`、`MX`、`TXT`、`NS`、`PTR`、`SOA`、`SRV`、`HTTPS`、`SVCB`、`ANY`、`*`（不区分大小写）或十进制 `u16`；未知名称产生 `invalid-qtype` 警告并省略整条规则，混合列表和取反条件也不例外。请修正名称或使用数字类型码。显式 `qtype()` 仍不匹配任何类型；`qtype('a,aaaa')` 选择两种类型。 |
 
 ## 组
 
 | 输入 | dae 文法 | honk |
 |---|---|---|
 | `group('hk,jp')` | 一个字面量 | 两个子组标签，按 `,` 与 `\|` 拆分。 |
-| `filter: group()` | 无参数的调用 | 空的子组过滤条件被丢弃；没有其他 `filter:` 行时组回退为全部节点。见 issue #161。 |
+| `filter: group()` | 无参数的调用 | 保留为显式空贡献，序列化往返和刷新后仍不选择节点，并产生 `empty-subgroup` 警告。需要全部节点时请删除过滤器；显式 `group()` 现在不选择任何节点。 |
 
 ## 配置段与 include
 

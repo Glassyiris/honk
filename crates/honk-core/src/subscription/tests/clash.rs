@@ -178,7 +178,7 @@ proxies:
     uuid: b831381d-6324-4d53-ad4f-8cda48b30811
     password: legacy-password
     servername: mask.example
-    sni: ignored.example
+    sni: mask.example
     flow: xtls-rprx-vision
     network: tcp
     client-fingerprint: chrome
@@ -753,4 +753,189 @@ fn clash_rejects_legacy_vless_udp_and_nondefault_juicity_windows() {
     );
     assert_eq!(nodes[1].name, "default-window");
     assert_eq!(nodes[1].juicity().unwrap().quic.mtu, Some(1400));
+}
+
+const C07_CLASH_SERVERNAME_ALIASES: &str = r#"proxies:
+  - name: empty
+    type: trojan
+    server: empty.example
+    port: 443
+    password: fixture-password
+    servername: ""
+    server-name: " \t"
+    sni: null
+  - name: equal
+    type: trojan
+    server: equal.example
+    port: 443
+    password: fixture-password
+    servername: tls.example
+    server-name: tls.example
+    sni: tls.example
+  - name: baseline
+    type: trojan
+    server: equal.example
+    port: 443
+    password: fixture-password
+    sni: tls.example
+  - name: conflict
+    type: trojan
+    server: conflict.example
+    port: 443
+    password: fixture-password
+    servername: first.example
+    server-name: second.example
+"#;
+
+#[test]
+fn c07_clash_tls_name_aliases_normalize_empty_equal_and_conflict() {
+    let nodes = parse_clash_subscription(C07_CLASH_SERVERNAME_ALIASES, None).unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["empty", "equal", "baseline"]
+    );
+    assert_eq!(nodes[0].tls().unwrap().sni, None);
+    assert_eq!(nodes[1].tls().unwrap().sni.as_deref(), Some("tls.example"));
+    assert_eq!(nodes[1].id, nodes[2].id);
+}
+
+const C09_CLASH_NONFINITE_CREDENTIAL: &str = r#"proxies:
+  - name: nonfinite-password
+    type: hysteria2
+    server: nonfinite.example
+    port: 443
+    auth: usable-auth
+    password: .nan
+  - name: finite-password
+    type: hysteria2
+    server: finite.example
+    port: 443
+    auth: usable-auth
+    password: 12345
+"#;
+
+#[test]
+fn c09_clash_rejects_nonfinite_credential_even_with_valid_alias() {
+    let nodes = parse_clash_subscription(C09_CLASH_NONFINITE_CREDENTIAL, None).unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["finite-password"]
+    );
+    assert_eq!(
+        nodes[0].hysteria2().unwrap().auth.as_deref(),
+        Some("usable-auth")
+    );
+}
+
+const C11_CLASH_ANYTLS_NETWORK: &str = r#"proxies:
+  - name: anytls-udp-first
+    type: anytls
+    server: udp-first.example
+    port: 443
+    password: password
+    anytls-network: udp
+    network: tcp,udp
+    udp: true
+  - name: anytls-list-first
+    type: anytls
+    server: list-first.example
+    port: 443
+    password: password
+    anytls-network: tcp,udp
+    network: udp
+    udp: true
+  - name: anytls-boolean-only
+    type: anytls
+    server: boolean-only.example
+    port: 443
+    password: password
+    udp: true
+  - name: anytls-tcp
+    type: anytls
+    server: tcp.example
+    port: 443
+    password: password
+    anytls-network: tcp
+    udp: false
+  - name: anytls-empty
+    type: anytls
+    server: empty.example
+    port: 443
+    password: password
+    anytls-network: ""
+    network: null
+  - name: anytls-conflict
+    type: anytls
+    server: conflict.example
+    port: 443
+    password: password
+    anytls-network: tcp
+    udp: true
+  - name: anytls-unsupported
+    type: anytls
+    server: unsupported.example
+    port: 443
+    password: password
+    network: quic
+"#;
+
+#[test]
+fn c11_clash_anytls_network_aliases_resolve_before_udp() {
+    let nodes = parse_clash_subscription(C11_CLASH_ANYTLS_NETWORK, None).unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "anytls-udp-first",
+            "anytls-list-first",
+            "anytls-boolean-only",
+            "anytls-tcp",
+            "anytls-empty"
+        ]
+    );
+    assert_eq!(nodes[0].anytls().unwrap().network.as_deref(), Some("udp"));
+    assert_eq!(
+        nodes[1].anytls().unwrap().network.as_deref(),
+        Some("tcp,udp")
+    );
+    assert_eq!(
+        nodes[2].anytls().unwrap().network.as_deref(),
+        Some("tcp,udp")
+    );
+    assert_eq!(nodes[3].anytls().unwrap().network.as_deref(), Some("tcp"));
+    assert_eq!(nodes[4].anytls().unwrap().network, None);
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| (honk_outbound::descriptor::descriptor(node.protocol()).supports_udp)(node))
+            .collect::<Vec<_>>(),
+        [true, true, true, false, true]
+    );
+}
+
+#[test]
+fn c14_feed_duration_aliases_compare_after_ceiling() {
+    const FEED: &str = r#"proxies:
+      - {name: hy2, type: hysteria2, server: example.com, port: 443, password: password, hop-interval: 500ms, mhop: 1s}
+      - {name: anytls, type: anytls, server: example.com, port: 443, password: password, idle-session-timeout: 1000ms, idle-session-check-interval: 0ms}
+    "#;
+    let nodes = parse_clash_subscription(FEED, None).unwrap();
+    assert_eq!(
+        nodes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+        ["hy2", "anytls"]
+    );
+    assert_eq!(nodes[0].hysteria2().unwrap().hop_interval, Some(1));
+    assert_eq!(nodes[1].anytls().unwrap().idle_session_timeout, Some(1));
+    assert_eq!(
+        nodes[1].anytls().unwrap().idle_session_check_interval,
+        Some(0)
+    );
 }

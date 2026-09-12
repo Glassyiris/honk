@@ -136,15 +136,13 @@ async fn deliver_fetch(completion: FetchCompletion, command_tx: &mpsc::Sender<Co
     match completion.result {
         Ok(nodes) => {
             info!(
-                subscription = %subscription.name,
                 nodes = nodes.len(),
-                "Subscription refreshed"
+                "Subscription body accepted; runtime publication pending"
             );
             let _ = command_tx
                 .send(ControlCommand::MergeSubscription {
                     subscription_id: subscription.id,
                     revision: completion.authorized.revision,
-                    name: subscription.name,
                     nodes,
                 })
                 .await;
@@ -399,9 +397,8 @@ impl SubscriptionSupervisor {
                         match completion.result {
                             Ok(nodes) => {
                                 info!(
-                                    subscription = %subscription.name,
                                     nodes = nodes.len(),
-                                    "Subscription fetched"
+                                    "Subscription body accepted; startup publication pending"
                                 );
                                 config.nodes.retain(|node| {
                                     node.subscription_id != Some(subscription.id)

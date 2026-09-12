@@ -17,7 +17,6 @@ pub(crate) enum ControlCommand {
     MergeSubscription {
         subscription_id: uuid::Uuid,
         revision: u64,
-        name: String,
         nodes: Vec<Node>,
     },
     /// Refresh generated gateway-address rules and bypass stale health

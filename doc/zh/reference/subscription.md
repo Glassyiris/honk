@@ -70,7 +70,7 @@ URL 带引号时，紧跟结束引号的 `#` 也会开始注释；紧跟使 `(UA
 | 旧位置 | 如果首选存储不存在，依次使用已有的 `/var/share/honk/.sub`（`LEGACY_DATA_DIR`），再使用已有的 `./.sub`。无法打开的旧位置会被跳过；只有所有旧候选均不可用时才创建首选存储。自定义 `data_dir` 也遵循相同顺序。不会自动移动或删除存储；准备迁移时请显式操作。 |
 | 权限 | 目录 mode 为 `0700`，文件 mode 为 `0600`。拒绝符号链接形式的存储目录。 |
 | 文件名 | 对带长度边界的 URL、配置中的 user agent 覆盖值（未设置或为空时为空）及有序 header key/value 对计算 SHA-256，再用 URL-safe Base64 编码并添加 `.sub`。版本化的默认请求 UA 不参与 key，因此默认订阅升级后仍保留缓存。请求身份不会以明文暴露。 |
-| 写入边界 | 只有 HTTP 成功且解析成功后才写入原始响应正文。临时文件完成 sync 后原子 rename，随后对目录执行 sync。 |
+| 写入边界 | HTTP 成功且正文通过导入校验后，保存完整原始响应，包括被拒绝的条目。临时文件完成 sync 后原子 rename，随后对目录执行 sync。 |
 | 重定向 | 最多 5 跳。从 `https` 重定向到其他 scheme 会让本次拉取失败；重定向到配置 URL 自身未使用的回环、私有、链路本地或未指定字面地址同样失败。解析到这类地址的主机名不在检测范围内。 |
 | 正文大小 | 最多 8 MiB，在读取过程中判定，而不是缓冲完整正文之后。 |
 
@@ -82,15 +82,21 @@ SIGHUP 时，fetch 身份（URL + 配置的 `ua` + headers）相同的订阅保�
 
 失败处理会保留可用 runtime，而不会清空它：
 
-- HTTP、解析或没有可用节点的失败不会发布替换节点，也不会写入，因此活动节点与上一次有效正文都会保留。
+- HTTP、UTF-8 编码、解析或无可用节点错误不会发布替换节点，也不会写入，因此活动节点与上一次有效正文都会保留。通过校验的正文按原始字节保存，不修复编码。
 - 持久化写入在解析成功后失败属于非致命错误：新解析出的节点仍会返回用于发布，而原子写入路径绝不会安装只写了一部分的正文。下次重启因此可以恢复磁盘上保留的任一完整有效正文。
 - 不支持或格式错误的节点会逐个跳过。共用节点构建器的警告包含从 1 开始的 proxy 索引和固定拒绝原因，不包含原始记录或凭据。只有没有剩余可用节点时，整个正文才失败；空结果绝不会清空上一代节点。
+
+上一次有效正文指通过当前导入规则校验的正文，不是最后一次成功发布的运行时配置。部分条目无效但仍有一个可用节点的正文可以替换存储；全部无效的正文不能。恢复时会按当前规则重新解析，因此旧版本保存的正文可能被拒绝。写入成功后，若节点集合校验或发布失败，活动配置保持不变，但磁盘上可能已保存新正文。磁盘与活动配置不属于同一事务。
 
 通过 SIGHUP 修改 `global.store_subscribe` 会因需要重启而被拒绝。
 
 ## 订阅正文格式
 
-所有接受的节点都会获得订阅 ID。重复的派生节点 ID 保留第一次出现的节点，即使正文只是重复同一个可用端点也可导入。完整客户端配置只提取节点，不导入其中的 DNS、路由、组或远程 provider 配置。
+所有接受的节点都会获得订阅 ID。重复的派生节点 ID 保留第一个可用条目；被拒绝的条目不会占用身份。后续重复条目的诊断同时记录两个原始索引。数组索引从 1 开始，在规范化前确定；URI 和记录索引使用包含空行与注释的物理行号。Base64 解码后的来源引用原始正文，不虚构编码字节偏移。完整客户端配置只提取节点，不导入其中的 DNS、路由、组或远程订阅配置。
+
+规范化条目逐个进入准入流程，不保留与正文条目数等大的中间结果列表。每份正文最多保留 128 条非终止诊断，超出时追加一条 `subscription-diagnostics-truncated` 摘要记录省略数量；正文失败的终止错误单独保留。调用方已有的诊断不变，也不占用此限额。结构化、URI 和记录导入均使用该限额，包括 Base64 解码与持久化正文恢复；达到限额不会停止有效节点准入，也不改变重复节点保留第一个可用条目的规则。
+
+Clash、SIP008 和 sing-box 的凭据标量保留字符串原始字节，并把原生有限数转换为来源格式的规范十进制文本。缺失或 null 表示未提供；布尔值、列表、映射和非有限数会使条目被拒绝。有效别名不能掩盖已提供的无效凭据。数字 UUID 仍无法通过 UUID 校验；空密码仍须满足对应协议的要求。
 
 ### 分享链接列表
 
@@ -118,12 +124,12 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 | `server`, `port` | `host`, `port`, `address` | 必需的地址和非零 `u16` 端口；接受数字形式的端口字符串。 |
 | `username` | `username` | 可选 string。 |
 | `password` | `password` | 可选 string；VLESS 使用下文优先级。 |
-| `cipher` | `encryption` | 可选 string；VLESS 使用下文优先级。 |
+| `cipher` | `encryption` | 可选加密算法；VLESS 的字段优先级见下文。 |
 | `plugin`, `plugin-opts` | — | 不支持；任一字段具有非空值时，条目会在发布节点前被跳过，mapping 类型的 options 也会被拒绝。 |
-| `network` | `transport` | 可选 transport string。 |
+| `network` | `transport` 或数据包网络能力 | Trojan/VMess/VLESS 使用流传输方式（`tcp`、`ws`、`grpc`）；AnyTLS 使用数据包网络能力。 |
 | `tls` | `tls` | 可选 bool。Trojan、AnyTLS、Hysteria2、TUIC 和 Juicity 默认启用 TLS，并拒绝显式关闭。 |
-| `servername`, `sni` | `sni` | `servername` 优先，`sni` 作为回退。 |
-| `skip-cert-verify` | `skip_cert_verify` | 可选 bool。 |
+| `servername`、`server-name`、`sni` | `sni` | 空值或纯空白名称视为未指定；非空别名必须逐字节一致。 |
+| `skip-cert-verify`、`skip_cert_verify`、`insecure` | `skip_cert_verify` | 须使用原生布尔值；已提供的别名必须一致。 |
 | `alpn` | `tls_alpn` | AnyTLS 与普通裸 TCP Trojan/VMess/VLESS TLS 的有序字符串列表（或逗号分隔字符串）；显式值在 `tls` 与 `utls` 模式下都会用于实际 TLS 握手。QUIC 继续使用下文的协议专属规则。 |
 
 #### 协议专属选项
@@ -131,6 +137,8 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 Hysteria2 导入 `password`/`auth`、`obfs: salamander` 与 `obfs-password`、上传/下载带宽、`ports`/`mport` 跳跃端口范围、`hop-interval`/`mhop`、接收窗口、MTU 与 MTU 发现设置。TUIC 导入 UUID/password、拥塞控制、ALPN、接收窗口和 MTU。AnyTLS 导入 `idle-session-check-interval`、`idle-session-timeout` 和 `min-idle-session`。支持的拼写别名会在派生节点身份前规范化。
 
 显式关闭的功能 block 按禁用处理，不会误判为启用未支持功能。原生支持 UDP 的协议接受 `udp: true`；节点模型无法保留显式 UDP 限制时会拒绝导入。TUIC 允许省略 password 或使用空密码。Hysteria2 和 Juicity 接受与运行时固定选择一致的 `h3` ALPN；Juicity 接收窗口固定为 8 MiB，因此拒绝非默认覆盖值。
+
+AnyTLS 按 `anytls-network`、适用的 `network`、`udp` 的顺序一次性解析数据包能力声明。空文本或 null 不提供网络声明。网络字符串使用逗号分隔的 `tcp`/`udp`；别名按是否允许 UDP 比较，因此 `udp` 与 `tcp,udp` 一致，而 `tcp` 与 `udp: true` 冲突。即使存在有效别名，`quic` 等未知值仍会使条目被拒绝。等价声明保留第一个显式网络字段的写法；仅提供布尔值时，才生成 `tcp` 或 `tcp,udp`。
 
 TCP TLS ALPN 列表成员及顺序原样保留；每个名称必须占 1–255 个 UTF-8 字节，带长度前缀的完整列表不得超过 65,533 字节。这是语法上限；完整 ClientHello 还受 TLS 库的大小限制。导入的 `alpn` 省略、为 null 或空列表时保留原有 TLS profile 默认值及节点 ID；扁平字段 `tls_alpn` 只接受省略或字符串数组，不接受 null。非空覆盖值参与节点身份派生；与关闭 TLS、REALITY、WebSocket 或 gRPC 组合时会拒绝，不会静默丢弃。只有实际 ALPN 列表包含 `h2` 时才发送 Chrome ALPS。分享链接原有的 ALPN 兼容行为不变；这里适用于结构化订阅导入及扁平模型字段 `tls_alpn`。
 
@@ -142,7 +150,7 @@ VLESS 字段会在派生节点身份前应用：
 | --- | --- |
 | `uuid`, then `password` | 凭据；`uuid` 优先，旧 `password` 作为回退。 |
 | `encryption`, then `cipher` | VLESS Encryption；`encryption` 优先。 |
-| `flow` | 非空 VLESS flow。 |
+| `flow` | 空值或纯空白视为未指定；否则必须为 `xtls-rprx-vision`。 |
 | `network` | Transport。 |
 | `reality-opts.public-key` | 启用 REALITY TLS 承载；必须是非空 string。 |
 | `reality-opts.short-id` | 可选 REALITY short ID。 |
@@ -163,7 +171,7 @@ VLESS 字段会在派生节点身份前应用：
 | `udp-over-tcp: true` | `uot-v2` | Boolean 简写。 |
 | `udp-over-tcp: { enabled: true, version: 0|2 }` | `uot-v2` | 缺失 `version` 按 `0` 处理；也接受 `_` 别名。 |
 | `packet-encoding: xudp` | `xudp` | `packet_encoding` 是扁平别名。 |
-| `xudp: true` | `xudp` | Boolean 简写。 |
+| `xudp: true` | `xudp` | 以布尔值显式选择 XUDP。 |
 | 未声明其他 packet 设置时的 `udp: true` | `xudp` | 对齐常见 Clash VLESS UDP 默认行为；显式 mode 优先。 |
 | 规范分享链接 `vless_mode=mux-cool` | `mux-cool` | Clash packet/mux 别名不接受 `mux-cool`。 |
 
@@ -187,15 +195,29 @@ SIP008 version 1/2 wrapper（`{"servers":[...]}`）及裸服务器数组会导�
 
 sing-box 配置从 `outbounds` 导入受支持的 Shadowsocks、SOCKS5、VMess、VLESS、Trojan、Hysteria2、TUIC、Juicity 和 AnyTLS 条目。结构性 `selector`、`urltest`、`direct`、`block` 与 `dns` 条目不是代理节点。TLS/SNI、REALITY、WebSocket/gRPC、VLESS packet mode 和受支持的协议调优会通过共同的节点构建逻辑规范化。只有未启用 multiplex/UoT、未限制为仅 TCP 且没有显式 packet encoding 时，VLESS 才默认使用 XUDP。gRPC service name 为空或省略时保留 sing-box 的空 service，不套用 honk 的 `GunService` 默认值。Hysteria2 可以只提供 `server_ports`，以第一个跳跃端口作为名义端点。不支持的链式代理、线协议功能和认证要求不会被静默丢弃。每节点 uTLS 指纹提示不会覆盖 honk 的进程级 TLS 设置。
 
+在 sing-box 输入中，`network` 表示数据包网络能力，不是流传输类型；`transport.type` 选择流传输方式。`h2` 等不支持的名称会使条目被拒绝，不会被当作裸 TCP。
+
+在支持数据包限制的 sing-box 映射中，`network: udp` 与 `network: tcp,udp` 允许 UDP，`network: tcp` 则关闭 UDP。这些值不会额外禁止 TCP。现有 VLESS 数据包模式要求，以及无法表示网络限制的协议约束，仍然适用。
+
 显式 sing-box 原生 VLESS UDP（`packet_encoding: ""` 且未限制为仅 TCP、未启用 wrapper）尚不支持，会跳过；启用 H2MUX 时由它承载 packet 路径，即使来源同时显式写出 `packet_encoding: "xudp"`。
 
 ### Surge、Surfboard、Loon 与 Quantumult X
 
 导入器接受 Surge/Surfboard/Loon 的具名逗号分隔记录，以及 Quantumult X 的 `protocol=endpoint,...,tag=name` 记录。完整配置使用 `[Proxy]` 或 `[server_local]`；其他 section 会被忽略。带引号的名称/密码可以包含逗号、等号、转义引号和有意保留的首尾空格。
 
+显式凭据和加密方法别名在转换前须一致。具名记录仅在对应具名值缺失时使用位置参数；有效的显式值不会因位置参数不同而冲突。Quantumult X 不使用位置参数回退。显式空凭据参与别名比较，不会触发回退。
+
+允许为空的可选记录凭据会逐字节保留空字符串和带引号的空白：SOCKS 用户名与密码、Hysteria2 认证值及 TUIC 密码。显式空值仍优先于位置参数；要求非空凭据的协议仍会拒绝空值。
+
+记录中的 `transport`/`network` 流传输声明在赋值前比较，包括重复键。空文本与 `tcp` 都表示裸 TCP；声明冲突或包含不支持的传输方式时，拒绝该条目。
+
+AnyTLS 记录中的 `network` 表示数据包能力，不是流传输方式。所有重复的 `network`、`udp` 和 `udp-relay` 值都会在选择前校验。等价声明保留第一个显式网络值的写法；任一值无效或冲突时，拒绝该记录。
+
 受支持的记录把凭据、TLS/SNI、WebSocket/gRPC、REALITY 和已实现的协议选项映射到同一节点模型。Quantumult X 的 `obfs=wss` 同时使用 `obfs-host` 作为 WebSocket Host 和默认 TLS SNI；显式 TLS 主机名优先。SSR、不支持的插件/混淆及传输方式会被跳过，不会冒充另一种协议导入。
 
 Surge `server-cert-fingerprint-sha256` 映射到 honk 的叶证书 pin：两者都替代标准 X.509 验证。独立的 `server-cert-verify-name`、客户端证书、`sni=off` 和 Shadow TLS 无法表达，会被拒绝，不会静默丢弃（[Surge TLS 参考](https://manual.nssurge.com/policies/tls.html)）。
+
+记录格式会在赋值前比较 `skip-cert-verify`、`allow-insecure`、`insecure`，以及取反后的 `tls-verification`。`tls-verification=false,insecure=true` 一致；`tls-verification=true,insecure=true` 则拒绝该条目。记录文本仅接受不区分大小写的 `true/yes/1/on` 和 `false/no/0/off`；空文本及 `t/y/f/n` 仍为无效值。证书固定规则的限制不变。
 
 有效的 Quantumult X `tls-cert-sha256` / `tls-pubkey-sha256` 固定证书设置会被拒绝：honk 的叶证书 pin 会替代 PKI，不能拿它替换尚未确认等价的外部验证约定。显式设置 `tls-verification=false` 时，QX 会忽略两类 pin，导入会保留该禁用验证行为。有效的 QX REALITY 会按[官方配置](https://github.com/crossutility/Quantumult-X/blob/master/sample.conf)忽略自定义 `tls-alpn` 和 session-ticket 设置；普通 TLS 不适用该例外。旧 VMess `aead=false`、启用的 Shadowsocks UoT/SSR、不支持的 TLS ALPN 和禁用 TLS session 复用会被拒绝，不会静默丢弃。
 

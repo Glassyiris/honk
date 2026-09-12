@@ -274,7 +274,10 @@ address = "223.5.5.5:53"
 protocol = "udp"
 "#;
 
-        let config: Config = toml::from_str(toml_str).unwrap();
+        let mut config: Config = toml::from_str(toml_str).unwrap();
+        for node in &mut config.nodes {
+            node.id = node.derive_id();
+        }
         assert!(config.validate().is_ok());
 
         assert_eq!(config.global.tproxy_port, 12345);
@@ -296,14 +299,7 @@ protocol = "udp"
             ..Default::default()
         });
 
-        let result = config.validate();
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Node name cannot be empty")
-        );
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -316,14 +312,7 @@ protocol = "udp"
             ..Default::default()
         });
 
-        let result = config.validate();
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("no address or host")
-        );
+        assert!(config.validate().is_err());
     }
 
     #[tokio::test]
@@ -351,13 +340,12 @@ protocol = "udp"
 
     #[tokio::test]
     async fn test_direct_handler_to_echo_server() {
-        use honk_config::node::Node;
         use honk_core::proxy::TcpOutbound;
         use honk_core::proxy::direct::DirectHandler;
 
         let echo_addr = spawn_echo_server().await;
         let handler = DirectHandler::new();
-        let node = Node::default();
+        let node = Config::builtin_direct_node();
 
         let target: SocketAddr = echo_addr;
 
@@ -373,12 +361,11 @@ protocol = "udp"
 
     #[tokio::test]
     async fn test_block_handler_rejects_all() {
-        use honk_config::node::Node;
         use honk_core::proxy::TcpOutbound;
         use honk_core::proxy::block::BlockHandler;
 
         let handler = BlockHandler::new();
-        let node = Node::default();
+        let node = Config::builtin_block_node();
         let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
 
         let result = handler
@@ -527,13 +514,18 @@ protocol = "udp"
         use honk_config::node::Node;
 
         fn node(name: &str) -> Node {
-            Node {
-                id: uuid::Uuid::new_v4(),
+            let mut node = Node {
                 name: name.into(),
                 address: "127.0.0.1".into(),
                 port: 1,
+                outbound: node::OutboundConfig::Shadowsocks(node::ShadowsocksConfig {
+                    password: Some(name.into()),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }
+            };
+            node.id = node.derive_id();
+            node
         }
         fn selector(name: &str, members: &[&Node]) -> Group {
             Group {
@@ -628,16 +620,20 @@ protocol = "udp"
         let other_sub_id = uuid::Uuid::new_v4();
 
         fn node(name: &str, sub: Option<uuid::Uuid>) -> Node {
-            Node {
-                id: uuid::Uuid::new_v4(),
+            let mut node = Node {
                 name: name.into(),
                 address: "127.0.0.1:1080".into(),
                 host: "127.0.0.1".into(),
                 port: 1080,
-                outbound: honk_config::node::OutboundConfig::Socks5(Default::default()),
+                outbound: node::OutboundConfig::Socks5(node::Socks5Config {
+                    username: Some(name.into()),
+                    ..Default::default()
+                }),
                 subscription_id: sub,
                 ..Default::default()
-            }
+            };
+            node.id = node.derive_id();
+            node
         }
 
         // Startup state: a static node, the subscription's previous
@@ -702,7 +698,7 @@ protocol = "udp"
             .unwrap();
 
         // Simulate a late subscription fetch completing: two new nodes with
-        // fresh UUIDs replace the previous generation.
+        // distinct canonical IDs replace the previous generation.
         let new1 = node("sub-new-1", Some(sub_id));
         let new2 = node("sub-new-2", Some(sub_id));
         cp.merge_subscription_nodes(sub_id, vec![new1.clone(), new2.clone()])
@@ -754,7 +750,7 @@ protocol = "udp"
         assert!(!registered.contains_key(&old2.id));
 
         // Idempotency: re-merging the same subscription (periodic refresh
-        // with fresh UUIDs) replaces instead of duplicating.
+        // with the same canonical IDs) replaces instead of duplicating.
         let refresh1 = node("sub-new-1", Some(sub_id));
         let refresh2 = node("sub-new-2", Some(sub_id));
         cp.merge_subscription_nodes(sub_id, vec![refresh1, refresh2])
@@ -1081,22 +1077,27 @@ protocol = "udp"
                 std::thread::sleep(Duration::from_millis(10));
             }
         };
-        let diagnostic = |log: &str, value: &str| {
-            log.lines().any(|line| {
-                line.contains("WARN")
-                    && line.contains("global.check_tolerance")
-                    && line.contains(value)
-            })
-        };
-        let filter_diagnostic_count = |log: &str| {
+        let diagnostic_count = |log: &str, setting: &str| {
             log.lines()
-                .filter(|line| line.contains("WARN") && line.contains("group.proxy.filter"))
+                .filter(|line| {
+                    line.contains("WARN")
+                        && line.contains("legacy-config-warning")
+                        && line.contains(setting)
+                })
                 .count()
         };
-        let result = (|| -> Result<(usize, usize), String> {
-            wait_for("startup diagnostic (1m)", &|log| diagnostic(log, "1m"))?;
+        let result = (|| -> Result<([usize; 2], [usize; 2]), String> {
+            wait_for("startup diagnostic", &|log| {
+                diagnostic_count(log, "global.check_tolerance") >= 1
+            })?;
             wait_for("Router ready", &|log| log.contains("Router ready"))?;
-            let startup_filter_diagnostics = filter_diagnostic_count(&output.lock());
+            let startup_diagnostics = {
+                let output = output.lock();
+                [
+                    diagnostic_count(&output, "global.check_tolerance"),
+                    diagnostic_count(&output, "groups[1].filter"),
+                ]
+            };
             // Router construction precedes the spawned SIGHUP handler; do not
             // deliver a terminating default-action signal during that window.
             wait_for("SIGHUP handler registration", &|_| {
@@ -1116,12 +1117,20 @@ protocol = "udp"
                 nix::sys::signal::Signal::SIGHUP,
             )
             .map_err(|error| error.to_string())?;
-            wait_for("SIGHUP diagnostic (2h)", &|log| diagnostic(log, "2h"))?;
+            wait_for("SIGHUP diagnostic", &|log| {
+                diagnostic_count(log, "global.check_tolerance") >= 2
+            })?;
             wait_for("SIGHUP reload request 1 applied", &|log| {
                 log.contains("SIGHUP reload request 1 applied")
             })?;
-            let cumulative_filter_diagnostics = filter_diagnostic_count(&output.lock());
-            Ok((startup_filter_diagnostics, cumulative_filter_diagnostics))
+            let cumulative_diagnostics = {
+                let output = output.lock();
+                [
+                    diagnostic_count(&output, "global.check_tolerance"),
+                    diagnostic_count(&output, "groups[1].filter"),
+                ]
+            };
+            Ok((startup_diagnostics, cumulative_diagnostics))
         })();
         let _ = child.kill();
         let status = child.wait();
@@ -1129,13 +1138,13 @@ protocol = "udp"
             reader.join().expect("join daemon output reader");
         }
         status.expect("reap mock daemon");
-        let (startup_filter_diagnostics, cumulative_filter_diagnostics) = match result {
+        let (startup_diagnostics, cumulative_diagnostics) = match result {
             Ok(counts) => counts,
             Err(error) => panic!("{}\n{}", error, output.lock()),
         };
         assert_eq!(
-            (startup_filter_diagnostics, cumulative_filter_diagnostics),
-            (1, 2)
+            (startup_diagnostics, cumulative_diagnostics),
+            ([1, 1], [2, 2])
         );
     }
 

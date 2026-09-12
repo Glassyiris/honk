@@ -1,3 +1,4 @@
+use super::validation::ValidationFailure;
 use crate::types::NodeProtocol;
 
 use super::{WireMode, identity_field};
@@ -18,20 +19,22 @@ pub struct TlsOptions {
 }
 
 impl TlsOptions {
-    pub(super) fn validate_alpn(&self) -> Result<(), crate::ConfigError> {
+    pub(super) fn validate_alpn(&self) -> Result<(), ValidationFailure> {
         let mut encoded_len = 0usize;
         for protocol in &self.alpn {
             let len = protocol.len();
             if !(1..=255).contains(&len) {
-                return Err(crate::ConfigError::Validation(
-                    "TLS ALPN protocol names must be 1..=255 bytes".into(),
+                return Err(ValidationFailure::new(
+                    Some("tls_alpn"),
+                    "TLS ALPN protocol names must be 1..=255 bytes",
                 ));
             }
             encoded_len += len + 1;
         }
         if encoded_len > 65_533 {
-            return Err(crate::ConfigError::Validation(
-                "TLS ALPN protocol list exceeds 65533 encoded bytes".into(),
+            return Err(ValidationFailure::new(
+                Some("tls_alpn"),
+                "TLS ALPN protocol list exceeds 65533 encoded bytes",
             ));
         }
         Ok(())
@@ -106,35 +109,41 @@ pub struct VlessConfig {
 }
 
 impl VlessConfig {
-    pub fn validate(&self, name: &str) -> Result<(), crate::ConfigError> {
+    pub fn validate(&self, _name: &str) -> Result<(), crate::ConfigError> {
+        self.validate_fields()
+            .map_err(ValidationFailure::into_legacy)
+    }
+
+    pub(super) fn validate_fields(&self) -> Result<(), ValidationFailure> {
         if self
             .encryption
             .as_deref()
             .is_some_and(|value| !value.is_empty() && value != "none")
             && self.flow.as_deref().is_some_and(|flow| !flow.is_empty())
         {
-            return Err(crate::ConfigError::Validation(format!(
-                "Node '{name}' combines VLESS Encryption with flow; this combination is unsupported"
-            )));
+            return Err(ValidationFailure::new(
+                Some("flow"),
+                "VLESS Encryption cannot be combined with flow",
+            ));
         }
         if self.mode != WireMode::Legacy {
             if let Some(flow) = self.flow.as_deref().filter(|flow| !flow.is_empty())
                 && !(self.mode == WireMode::Xudp && flow == "xtls-rprx-vision")
             {
-                return Err(crate::ConfigError::Validation(format!(
-                    "Node '{name}' combines VLESS mode '{}' with flow; this combination is unsupported",
-                    self.mode.as_str()
-                )));
+                return Err(ValidationFailure::new(
+                    Some("flow"),
+                    "VLESS mode cannot be combined with this flow",
+                ));
             }
             if self
                 .encryption
                 .as_deref()
                 .is_some_and(|value| !value.is_empty() && value != "none")
             {
-                return Err(crate::ConfigError::Validation(format!(
-                    "Node '{name}' combines VLESS mode '{}' with VLESS Encryption; this combination is unsupported",
-                    self.mode.as_str()
-                )));
+                return Err(ValidationFailure::new(
+                    Some("encryption"),
+                    "VLESS mode cannot be combined with VLESS Encryption",
+                ));
             }
         }
         // A REALITY node without a usable public key falls back to ordinary TLS with the
@@ -150,9 +159,10 @@ impl VlessConfig {
             || self.tls.reality_short_id.is_some()
             || self.tls.reality_spider_x.is_some();
         if wants_reality && !has_key {
-            return Err(crate::ConfigError::Validation(format!(
-                "Node '{name}' selects REALITY without reality_public_key"
-            )));
+            return Err(ValidationFailure::new(
+                Some("reality_public_key"),
+                "REALITY requires reality_public_key",
+            ));
         }
         Ok(())
     }

@@ -482,12 +482,7 @@ impl Drop for WarmAttempt {
 }
 
 impl NodeRuntime {
-    /// A generation-free runtime for one-shot callers (standalone probing,
-    /// tests): session protocols get a throwaway pool per runtime. The
-    /// caller MUST [`Self::close`] it when done — an unclosed ephemeral
-    /// pool keeps its demux-held sessions (and their connections) open
-    /// forever. Prefer [`Self::ephemeral_guarded`], which closes on drop.
-    pub fn ephemeral(node: &Node) -> Arc<Self> {
+    fn build_ephemeral(node: &Node) -> Arc<Self> {
         Arc::new(Self {
             node: Arc::new(node.clone()),
             udp_capable: (crate::descriptor::descriptor(node.protocol()).supports_udp)(node),
@@ -499,13 +494,47 @@ impl NodeRuntime {
         })
     }
 
-    /// [`Self::ephemeral`] wrapped in an ownership guard whose Drop starts
-    /// the close, so timeout/abort paths that simply drop the probe future
-    /// cannot leak the session-layer resources.
-    pub fn ephemeral_guarded(node: &Node) -> EphemeralRuntimeGuard {
+    /// Validate a node before any one-shot runtime state is cloned or built.
+    pub(crate) fn validate_for_ephemeral(node: &Node) -> Result<(), RuntimeRegistryError> {
+        honk_config::node::validate_node_collection(std::slice::from_ref(node))
+            .map_err(RuntimeRegistryError::Admission)
+    }
+
+    /// Admit a canonical node and build a generation-free one-shot runtime.
+    ///
+    /// Rejects nil IDs, intrinsic errors and stale IDs before allocating sessions.
+    /// The caller must [`Self::close`] session-owning runtimes when done; prefer
+    /// [`Self::try_ephemeral_guarded`] for cleanup on cancellation or drop.
+    pub fn try_ephemeral(node: &Node) -> Result<Arc<Self>, RuntimeRegistryError> {
+        Self::validate_for_ephemeral(node)?;
+        Ok(Self::build_ephemeral(node))
+    }
+
+    /// [`Self::try_ephemeral`] with an ownership guard that closes on drop.
+    pub fn try_ephemeral_guarded(
+        node: &Node,
+    ) -> Result<EphemeralRuntimeGuard, RuntimeRegistryError> {
+        Self::validate_for_ephemeral(node)?;
+        Ok(Self::ephemeral_guarded_after_admission(node))
+    }
+
+    pub(crate) fn ephemeral_guarded_after_admission(node: &Node) -> EphemeralRuntimeGuard {
         EphemeralRuntimeGuard {
-            runtime: Some(Self::ephemeral(node)),
+            runtime: Some(Self::build_ephemeral(node)),
         }
+    }
+
+    /// Compatibility wrapper for [`Self::try_ephemeral`]; panics on invalid input.
+    /// The caller retains the same explicit-close obligation.
+    pub fn ephemeral(node: &Node) -> Arc<Self> {
+        Self::try_ephemeral(node)
+            .unwrap_or_else(|_| panic!("invalid node passed to one-shot runtime factory"))
+    }
+
+    /// Compatibility wrapper for [`Self::try_ephemeral_guarded`]; panics on invalid input.
+    pub fn ephemeral_guarded(node: &Node) -> EphemeralRuntimeGuard {
+        Self::try_ephemeral_guarded(node)
+            .unwrap_or_else(|_| panic!("invalid node passed to one-shot runtime factory"))
     }
 
     pub(crate) fn is_ephemeral(&self) -> bool {
@@ -785,16 +814,10 @@ fn same_node_config(a: &Node, b: &Node) -> bool {
 /// (the current generation stays live).
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeRegistryError {
-    #[error("node '{0}' has a nil UUID")]
-    NilId(String),
-    #[error("duplicate node UUID {0} (nodes '{1}' and '{2}')")]
-    DuplicateId(uuid::Uuid, String, String),
-    #[error("node '{node}' has invalid TLS configuration: {source}")]
-    Tls {
-        node: String,
-        #[source]
-        source: anyhow::Error,
-    },
+    #[error("registry node admission failed")]
+    Admission(#[source] honk_config::error::DetailedConfigError),
+    #[error("node TLS configuration rejected")]
+    Tls(#[source] Option<std::io::Error>),
 }
 
 /// The single owner of per-node session runtimes for one config
@@ -909,23 +932,24 @@ impl OutboundRuntimeRegistry {
         dial_ceiling_limit: usize,
         previous: Option<&Self>,
     ) -> Result<(Self, HashSet<uuid::Uuid>), RuntimeRegistryError> {
+        honk_config::node::validate_node_collection(nodes)
+            .map_err(RuntimeRegistryError::Admission)?;
         let mut map = HashMap::with_capacity(nodes.len());
         let mut reused = HashSet::new();
         for node in nodes {
-            if node.id.is_nil() {
-                return Err(RuntimeRegistryError::NilId(node.name.clone()));
-            }
             // Validate cheap, fail-closed TLS inputs before publishing the
             // generation. The heavyweight SSL_CTX/root store stays lazy.
             if node
                 .tls()
                 .is_some_and(|tls| tls.enabled || !tls.alpn.is_empty())
             {
-                crate::tls::validate_connector_config(node).map_err(|source| {
-                    RuntimeRegistryError::Tls {
-                        node: node.name.clone(),
-                        source,
-                    }
+                crate::tls::validate_connector_config(node).map_err(|error| {
+                    // Preserve typed I/O failures without retaining paths or raw TLS values.
+                    RuntimeRegistryError::Tls(error.chain().find_map(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .map(|error| std::io::Error::from(error.kind()))
+                    }))
                 })?;
             }
             let reused_runtime = previous.and_then(|previous| {
@@ -949,13 +973,7 @@ impl OutboundRuntimeRegistry {
                     warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
                 }),
             };
-            if let Some(prev) = map.insert(node.id, runtime) {
-                return Err(RuntimeRegistryError::DuplicateId(
-                    node.id,
-                    prev.node.name.clone(),
-                    node.name.clone(),
-                ));
-            }
+            map.insert(node.id, runtime);
         }
         Ok((
             Self {

@@ -268,18 +268,27 @@ fn contract_counter_suffix(_: Observation, _: Observation) -> String {
 
 fn large_config(hosts_path: String) -> Config {
     // CI copies this harness into main, so use the wire shape shared by both revisions.
-    let node_template: Node =
-        serde_json::from_str(r#"{"name":"","protocol":"socks5","address":"","port":0}"#)
-            .expect("reload benchmark node template must deserialize");
+    // The template must be a valid node: deserialization now validates it before
+    // the per-node fields below overwrite the name and address.
+    let node_template: Node = serde_json::from_str(
+        r#"{"name":"template","protocol":"socks5","address":"192.0.2.1:10000","port":10000}"#,
+    )
+    .expect("reload benchmark node template must deserialize");
     let nodes = (0..512)
-        .map(|index| Node {
-            id: uuid::Uuid::new_v5(
-                &honk_config::node::NODE_ID_NAMESPACE,
-                format!("reload-bench-{index}").as_bytes(),
-            ),
-            name: format!("node-{index:03}"),
-            address: format!("192.0.2.{}:{}", index % 250 + 1, 10_000 + index),
-            ..node_template.clone()
+        .map(|index| {
+            let host = format!("192.0.2.{}", index % 250 + 1);
+            let port = 10_000 + index as u16;
+            let mut node = Node {
+                name: format!("node-{index:03}"),
+                address: format!("{host}:{port}"),
+                host,
+                port,
+                ..node_template.clone()
+            };
+            // Admission verifies each ID against the node's canonical identity,
+            // so the synthetic ID is derived the same way the loaders derive it.
+            node.id = node.derive_id();
+            node
         })
         .collect::<Vec<_>>();
     let groups = nodes

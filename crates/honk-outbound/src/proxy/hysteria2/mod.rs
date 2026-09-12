@@ -55,6 +55,7 @@ use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use bytes::Bytes;
 use honk_config::node::Node;
+use honk_config::options::vocab::parse_port_hopping;
 use quinn::{AsyncUdpSocket, Endpoint, UdpPoller};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;

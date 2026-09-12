@@ -995,6 +995,42 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn vmess_json_empty_ws_host_uses_endpoint_in_handshake() {
+        use base64::Engine as _;
+
+        let payload = r#"{
+            "add": "example.invalid",
+            "port": 443,
+            "id": "00000000-0000-0000-0000-000000000001",
+            "net": "ws",
+            "host": "",
+            "path": "/ws"
+        }"#;
+        let link = format!(
+            "vmess://{}",
+            base64::engine::general_purpose::STANDARD.encode(payload),
+        );
+        let node = Node::from_share_link(&link).unwrap();
+        let (client, server) = tokio::io::duplex(4096);
+        let receive = async {
+            let mut host = None;
+            let callback = |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                            response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                host = request.headers().get("host").cloned();
+                Ok(response)
+            };
+            let _connection = tokio_tungstenite::accept_hdr_async(server, callback)
+                .await
+                .unwrap();
+            host.unwrap()
+        };
+        let (stream, host) = tokio::join!(wrap_ws(&node, Box::new(client)), receive);
+        let _stream = stream.unwrap();
+        assert_eq!(host, "example.invalid");
+    }
+
     async fn decoded_grpc_headers(service_len: usize, authority: &str) -> (String, String) {
         let mut node = transport_node(443);
         node.host = authority.to_owned();

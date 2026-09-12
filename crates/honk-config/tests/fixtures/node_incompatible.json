@@ -1,0 +1,10 @@
+{
+  "name": "secret-node-name",
+  "protocol": "socks5",
+  "address": "secret-endpoint:1080",
+  "host": "secret-endpoint",
+  "port": 1080,
+  "password": "secret-password",
+  "sni": "secret-tls-name",
+  "tls_alpn": ["h2"]
+}

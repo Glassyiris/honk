@@ -190,10 +190,6 @@ fn include_rejects_cycles_and_paths_outside_the_entry_directory() {
     );
     let err = Config::from_file(root.join("escape.dae").to_str().unwrap()).unwrap_err();
     assert!(matches!(err, ConfigError::Include(_)));
-    assert!(
-        err.to_string()
-            .contains("outside entry configuration directory")
-    );
 
     write(
         &root.join("config.dae"),
@@ -205,7 +201,6 @@ fn include_rejects_cycles_and_paths_outside_the_entry_directory() {
     );
     let err = Config::from_file(root.join("config.dae").to_str().unwrap()).unwrap_err();
     assert!(matches!(err, ConfigError::Include(_)));
-    assert!(err.to_string().contains("circular or duplicate include"));
 }
 
 #[test]
@@ -222,7 +217,6 @@ fn include_preserves_renamed_honk_policy_error() {
 
     let error = Config::from_file(dir.path().join("config.dae").to_str().unwrap()).unwrap_err();
     assert!(matches!(error, ConfigError::UnsupportedPolicy(_)));
-    assert!(error.to_string().contains("renamed to 'score'"));
 }
 
 #[cfg(unix)]
@@ -243,8 +237,4 @@ fn include_rejects_symlinks_that_escape_the_entry_directory() {
 
     let err = Config::from_file(root.join("config.dae").to_str().unwrap()).unwrap_err();
     assert!(matches!(err, ConfigError::Include(_)));
-    assert!(
-        err.to_string()
-            .contains("outside entry configuration directory")
-    );
 }

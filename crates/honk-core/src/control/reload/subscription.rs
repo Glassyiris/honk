@@ -33,6 +33,20 @@ pub(in crate::control) fn config_with_subscription_nodes(
     );
     config
 }
+fn subscription_provenance_error(index: usize) -> honk_config::error::DetailedConfigError {
+    let ordinal = index + 1;
+    let source = honk_config::diagnostic::DiagnosticSources::new(None).root();
+    let mut error = honk_config::error::DetailedConfigError::new(
+        honk_config::error::ErrorCategory::Validation,
+        "invalid-subscription-provenance",
+        source,
+        honk_config::diagnostic::SettingPath::new("nodes").index(ordinal),
+        "subscription node provenance does not match the authorized provider",
+    );
+    error.diagnostic.value = honk_config::diagnostic::SafeValue::Ordinal(ordinal);
+    error.diagnostic.entry_index = Some(ordinal);
+    error
+}
 
 impl ControlPlane {
     async fn merge_subscription_nodes_locked(
@@ -40,19 +54,38 @@ impl ControlPlane {
         subscription_id: uuid::Uuid,
         mut nodes: Vec<Node>,
         drain: &DrainTracker,
-    ) -> bool {
+    ) -> Result<bool, honk_config::error::DetailedConfigError> {
         if nodes.is_empty() {
-            return true;
+            return Ok(true);
+        }
+        honk_config::node::validate_node_collection(&nodes)?;
+        if let Some(index) = nodes.iter().position(|node| {
+            node.subscription_id
+                .is_some_and(|provider| provider != subscription_id)
+        }) {
+            return Err(subscription_provenance_error(index));
+        }
+        for node in &mut nodes {
+            if node.subscription_id.is_none() {
+                node.subscription_id = Some(subscription_id);
+            }
         }
         let current = self.config.read().await.clone();
-        if subscription_nodes_unchanged(&current, subscription_id, &mut nodes) {
+        let incoming_len = nodes.len();
+        let mut new_config = config_with_subscription_nodes(&current, subscription_id, nodes);
+        new_config.validate_assembled()?;
+        let candidate_start = new_config.nodes.len() - incoming_len;
+        if subscription_nodes_unchanged(
+            &current,
+            subscription_id,
+            &mut new_config.nodes[candidate_start..],
+        ) {
             info!(
                 subscription_id = %subscription_id,
                 "subscription unchanged; skipping runtime rebuild"
             );
-            return true;
+            return Ok(true);
         }
-        let new_config = config_with_subscription_nodes(&current, subscription_id, nodes);
         self.apply_runtime_config_locked(new_config, drain).await
     }
 
@@ -63,7 +96,7 @@ impl ControlPlane {
         authorizations: &crate::subscription::SubscriptionAuthorizations,
         nodes: Vec<Node>,
         drain: &DrainTracker,
-    ) -> bool {
+    ) -> Result<bool, honk_config::error::DetailedConfigError> {
         let _reload = self.reload_lock.lock().await;
         if !authorizations.authorizes(subscription_id, revision) {
             warn!(
@@ -71,7 +104,7 @@ impl ControlPlane {
                 revision,
                 "discarding stale subscription refresh"
             );
-            return false;
+            return Ok(false);
         }
         self.merge_subscription_nodes_locked(subscription_id, nodes, drain)
             .await
@@ -81,9 +114,12 @@ impl ControlPlane {
     pub async fn merge_subscription_nodes(&self, subscription_id: uuid::Uuid, nodes: Vec<Node>) {
         let drain = Arc::clone(&self.drain_tracker);
         let _reload = self.reload_lock.lock().await;
-        let _ = self
+        if let Err(error) = self
             .merge_subscription_nodes_locked(subscription_id, nodes, &drain)
-            .await;
+            .await
+        {
+            crate::report_runtime_admission_error(&error);
+        }
     }
 }
 

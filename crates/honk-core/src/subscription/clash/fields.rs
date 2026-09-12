@@ -1,3 +1,4 @@
+use honk_config::options::vocab::{coalesce_equal, optional_text};
 use serde_yaml::{Mapping, Value};
 
 use super::super::yaml_value;
@@ -6,21 +7,12 @@ pub(super) fn raw_alias<'a>(
     mapping: &'a Mapping,
     keys: &[&str],
 ) -> Result<Option<&'a Value>, &'static str> {
-    let mut found = None;
-    for key in keys {
-        let Some(value) = yaml_value(mapping, key) else {
-            continue;
-        };
-        if matches!(value, Value::Null) {
-            continue;
-        }
-        match found {
-            None => found = Some(value),
-            Some(previous) if previous == value => {}
-            Some(_) => return Err("conflicting aliases"),
-        }
-    }
-    Ok(found)
+    coalesce_equal(
+        keys.iter()
+            .filter_map(|key| yaml_value(mapping, key))
+            .map(|value| Ok((!matches!(value, Value::Null)).then_some(value))),
+        "conflicting aliases",
+    )
 }
 
 fn parsed_alias<T: PartialEq>(
@@ -28,34 +20,65 @@ fn parsed_alias<T: PartialEq>(
     keys: &[&str],
     parse: impl Fn(&Value) -> Result<Option<T>, &'static str>,
 ) -> Result<Option<T>, &'static str> {
-    let mut found = None;
-    for key in keys {
-        let Some(value) = yaml_value(mapping, key) else {
-            continue;
-        };
-        let Some(value) = parse(value)? else {
-            continue;
-        };
-        match &found {
-            None => found = Some(value),
-            Some(previous) if previous == &value => {}
-            Some(_) => return Err("conflicting aliases"),
-        }
-    }
-    Ok(found)
+    coalesce_equal(
+        keys.iter()
+            .filter_map(|key| yaml_value(mapping, key))
+            .map(parse),
+        "conflicting aliases",
+    )
 }
 
 pub(super) fn text(value: &Value) -> Result<Option<String>, &'static str> {
     match value {
         Value::Null => Ok(None),
         Value::String(value) => Ok(Some(value.clone())),
-        Value::Number(value) => Ok(Some(value.to_string())),
+        Value::Number(value) if value.as_f64().is_some_and(|value| value.is_finite()) => {
+            Ok(Some(value.to_string()))
+        }
+        Value::Number(_) => Err("field must be a finite scalar"),
         _ => Err("field must be a scalar"),
     }
 }
 
 pub(super) fn text_alias(mapping: &Mapping, keys: &[&str]) -> Result<Option<String>, &'static str> {
     parsed_alias(mapping, keys, text)
+}
+
+pub(super) fn optional_text_alias(
+    mapping: &Mapping,
+    keys: &[&str],
+) -> Result<Option<String>, &'static str> {
+    parsed_alias(mapping, keys, |value| {
+        let value = text(value)?;
+        if optional_text([value.as_deref()])?.is_some() {
+            Ok(value)
+        } else {
+            Ok(None)
+        }
+    })
+}
+
+pub(super) fn vmess_cipher_alias(
+    mapping: &Mapping,
+    keys: &[&str],
+) -> Result<Option<String>, &'static str> {
+    parsed_alias(mapping, keys, |value| {
+        let value = text(value)?;
+        honk_config::options::vocab::vmess_cipher(value.as_deref())
+            .map(|value| value.map(str::to_owned))
+    })
+}
+
+pub(super) fn tuic_relay_alias(mapping: &Mapping) -> Result<Option<()>, &'static str> {
+    parsed_alias(
+        mapping,
+        &["udp-relay-mode", "udp_relay_mode"],
+        |value| match text(value)?.as_deref().map(str::trim) {
+            None => Ok(None),
+            Some("" | "native") => Ok(Some(())),
+            Some(_) => Err("unsupported TUIC UDP relay mode"),
+        },
+    )
 }
 
 pub(super) fn bool_alias(mapping: &Mapping, keys: &[&str]) -> Result<Option<bool>, &'static str> {
@@ -84,7 +107,7 @@ pub(super) fn u64_alias(mapping: &Mapping, keys: &[&str]) -> Result<Option<u64>,
     })
 }
 
-fn duration_secs(value: &Value) -> Result<u64, &'static str> {
+pub(in crate::subscription) fn duration_secs(value: &Value) -> Result<u64, &'static str> {
     match value {
         Value::Number(_) => u64_value(value),
         Value::String(raw) => {
@@ -105,7 +128,7 @@ fn duration_secs(value: &Value) -> Result<u64, &'static str> {
                 .parse()
                 .map_err(|_| "field must be a duration")?;
             if multiplier == 0 {
-                Ok(number / 1000)
+                Ok(number / 1000 + u64::from(!number.is_multiple_of(1000)))
             } else {
                 number
                     .checked_mul(multiplier)

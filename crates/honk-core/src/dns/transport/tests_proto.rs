@@ -235,8 +235,7 @@ pub(super) fn proxied_quic_fixture(endpoint: DnsEndpoint) -> ProxiedQuicFixture 
         ProtocolEntry::new(NodeProtocol::Socks5, Arc::clone(&handler))
             .with_packet(Arc::clone(&handler)),
     );
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
+    let mut node = Node {
         name: "packet-proxy".into(),
         outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
         address: "127.0.0.1:1".into(),
@@ -244,6 +243,7 @@ pub(super) fn proxied_quic_fixture(endpoint: DnsEndpoint) -> ProxiedQuicFixture 
         port: 1,
         ..Default::default()
     };
+    node.id = node.derive_id();
     let generation = Arc::new(
         honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
             .unwrap(),

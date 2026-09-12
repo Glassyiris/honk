@@ -78,23 +78,24 @@ impl AliveDialerSet {
                 .await;
         }
 
-        let Some(hostname) = Self::parse_url_host(&check_url) else {
+        let Ok(target) = honk_config::check::decode_health_http_target(&check_url) else {
             return self
                 .probe_node_tcp(node_id, node_name, &registered.address, timeout)
                 .await;
         };
+        let hostname = target.host();
 
         // Use cached IPs from startup (Go: TcpCheckOption.Ip46).
         // Avoids repeated DNS resolution which can fail transiently and
         // cascade into all nodes being marked dead simultaneously.
         // dae-format literal fallback IPs are merged in so a DNS failure
         // alone never leaves the probe without targets.
-        let port = Self::parse_url_port(&check_url);
+        let port = target.port();
         let cached = self.check_url_ips.read().clone();
         let addrs: Vec<SocketAddr> = if cached.is_empty() {
             // Cache miss — one-time resolution via the installed resolver
             // (system lookup is the fallback inside resolve_host).
-            let resolved = self.resolve_host(&hostname, port).await;
+            let resolved = self.resolve_host(hostname, port).await;
             let ips = Self::merge_check_addrs(resolved, &check_url, port);
             *self.check_url_ips.write() = ips.clone();
             ips

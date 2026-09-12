@@ -1,14 +1,17 @@
 use super::{
-    Block, extract_fn_args, find_unquoted, lenient, lenient_bool, normalize_geosite_code,
-    parse_ip_prefer, parse_kv_pair, parse_kv_pairs, split_unquoted, strip_tag_arg,
+    Block, ParserDiagnostics, extract_fn_args, find_unquoted, lenient, lenient_bool,
+    normalize_geosite_code, parse_ip_prefer, parse_kv_pair, parse_kv_pairs, split_unquoted,
+    strip_tag_arg,
 };
 use crate::ConfigDiagnostic;
+use crate::diagnostic::{DetailedDiagnostic, SafeValue, SettingPath};
 use crate::dns::DnsConfig;
 
 pub(super) fn parse_section(
     section: &Block,
-    diagnostics: &mut Vec<ConfigDiagnostic>,
+    diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Result<DnsConfig, crate::ConfigError> {
+    diagnostics.at_section(section, &["upstream", "routing", "fixed_domain_ttl"]);
     let dns_subs = section.blocks_matching(&["upstream", "routing", "fixed_domain_ttl"]);
     let mut cfg = DnsConfig::default();
     let mut saw_upstream = false;
@@ -101,7 +104,7 @@ pub(super) fn parse_section(
                         let line = line.trim();
                         line.starts_with("fallback:") || line.starts_with("default:")
                     });
-                    let request = parse_dns_request_routing(req_lines);
+                    let request = parse_dns_request_routing(req_lines, diagnostics);
                     cfg.routing.request.rules.extend(request.rules);
                     if !has_fallback {
                         continue;
@@ -120,7 +123,7 @@ pub(super) fn parse_section(
                         let line = line.trim();
                         line.starts_with("fallback:") || line.starts_with("default:")
                     });
-                    let response = parse_dns_response_routing(resp_lines);
+                    let response = parse_dns_response_routing(resp_lines, diagnostics);
                     cfg.routing.response.rules.extend(response.rules);
                     if has_fallback {
                         cfg.routing.response.fallback = response.fallback;
@@ -272,10 +275,10 @@ fn extract_tls_server_name(address: String) -> (String, Option<String>) {
 /// Parse `fixed_domain_ttl { domain: N ... }` into a HashMap.
 fn parse_fixed_domain_ttl<'a>(
     lines: impl IntoIterator<Item = &'a str>,
-    diagnostics: &mut Vec<ConfigDiagnostic>,
+    diagnostics: &mut ParserDiagnostics<'_>,
 ) -> std::collections::HashMap<String, u32> {
     let mut map = std::collections::HashMap::new();
-    for line in lines {
+    for (index, line) in lines.into_iter().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -286,6 +289,7 @@ fn parse_fixed_domain_ttl<'a>(
             if let Ok(n) = val.parse::<u32>() {
                 map.insert(key.to_string(), n);
             } else {
+                diagnostics.entry(line, index + 1);
                 diagnostics.push(ConfigDiagnostic {
                     setting: format!("dns.fixed_domain_ttl.{key}"),
                     value: val.to_string(),
@@ -316,10 +320,13 @@ fn strip_dns_routing_comment(line: &str) -> &str {
 /// Parse `routing.request { ... }` block.
 fn parse_dns_request_routing<'a>(
     lines: impl IntoIterator<Item = &'a str>,
+    diagnostics: &mut ParserDiagnostics<'_>,
 ) -> crate::dns::DnsRequestRouting {
     let mut routing = crate::dns::DnsRequestRouting::default();
 
-    for line in lines {
+    for (index, line) in lines.into_iter().enumerate() {
+        let ordinal = index + 1;
+        diagnostics.entry(line, ordinal);
         let trimmed = strip_dns_routing_comment(line).trim();
         if trimmed.is_empty() {
             continue;
@@ -335,8 +342,7 @@ fn parse_dns_request_routing<'a>(
             let left = trimmed[..arrow_pos].trim();
             let right = trimmed[arrow_pos + 2..].trim();
             let action = crate::dns::DnsRequestAction::parse(right);
-            let conditions = parse_dns_conditions(left, false);
-            // Skip rules whose conditions were all ignored (e.g. sub()/node()).
+            let conditions = parse_dns_conditions(left, false, diagnostics, "request", ordinal);
             if !conditions.is_empty() {
                 routing
                     .rules
@@ -351,10 +357,13 @@ fn parse_dns_request_routing<'a>(
 /// Parse `routing.response { ... }` block.
 fn parse_dns_response_routing<'a>(
     lines: impl IntoIterator<Item = &'a str>,
+    diagnostics: &mut ParserDiagnostics<'_>,
 ) -> crate::dns::DnsResponseRouting {
     let mut routing = crate::dns::DnsResponseRouting::default();
 
-    for line in lines {
+    for (index, line) in lines.into_iter().enumerate() {
+        let ordinal = index + 1;
+        diagnostics.entry(line, ordinal);
         let trimmed = strip_dns_routing_comment(line).trim();
         if trimmed.is_empty() {
             continue;
@@ -370,8 +379,7 @@ fn parse_dns_response_routing<'a>(
             let left = trimmed[..arrow_pos].trim();
             let right = trimmed[arrow_pos + 2..].trim();
             let action = crate::dns::DnsResponseAction::parse(right);
-            let conditions = parse_dns_conditions(left, true);
-            // Skip rules whose conditions were all ignored (e.g. sub()/node()).
+            let conditions = parse_dns_conditions(left, true, diagnostics, "response", ordinal);
             if !conditions.is_empty() {
                 routing
                     .rules
@@ -384,13 +392,20 @@ fn parse_dns_response_routing<'a>(
 }
 
 /// Parse a chain of `&&`-separated conditions.
-fn parse_dns_conditions(expr: &str, is_response: bool) -> Vec<crate::dns::DnsCond> {
+fn parse_dns_conditions(
+    expr: &str,
+    is_response: bool,
+    diagnostics: &mut ParserDiagnostics<'_>,
+    route_kind: &'static str,
+    ordinal: usize,
+) -> Vec<crate::dns::DnsCond> {
     let mut conds = Vec::new();
 
     for part in split_unquoted(expr, "&&") {
         let part = part.trim();
         if part.is_empty() {
-            continue;
+            invalid_dns_rule(diagnostics, route_kind, ordinal, "invalid-dns-rule");
+            return Vec::new();
         }
         let (not, inner) = if let Some(rest) = part.strip_prefix('!') {
             (true, rest.trim())
@@ -405,16 +420,23 @@ fn parse_dns_conditions(expr: &str, is_response: bool) -> Vec<crate::dns::DnsCon
         }
 
         if let Some(args) = extract_fn_args(inner, "qtype") {
-            let types: Vec<u16> = args
+            let types: Option<Vec<u16>> = args
                 .iter()
                 .flat_map(|argument| argument.split(','))
-                .filter_map(crate::dns::parse_qtype_token)
+                .map(crate::dns::parse_qtype_token)
                 .collect();
+            let Some(types) = types else {
+                invalid_dns_rule(diagnostics, route_kind, ordinal, "invalid-qtype");
+                return Vec::new();
+            };
             conds.push(crate::dns::DnsCond::Qtype { not, types });
             continue;
         }
 
         if let Some(cidrs) = extract_fn_args(inner, "sip") {
+            if !validate_dns_networks(&cidrs, diagnostics, route_kind, ordinal) {
+                return Vec::new();
+            }
             conds.push(crate::dns::DnsCond::Sip { not, cidrs });
             continue;
         }
@@ -426,25 +448,76 @@ fn parse_dns_conditions(expr: &str, is_response: bool) -> Vec<crate::dns::DnsCon
             }
             if let Some(args) = extract_fn_args(inner, "ip") {
                 let (cidrs, geoip) = parse_dns_ip_args(&args);
+                if !validate_dns_networks(&cidrs, diagnostics, route_kind, ordinal) {
+                    return Vec::new();
+                }
                 conds.push(crate::dns::DnsCond::Ip { not, cidrs, geoip });
                 continue;
             }
         }
 
-        // sub() / node() / subnode() — not supported for client DNS, warn
-        if inner.starts_with("sub(") || inner.starts_with("node(") || inner.starts_with("subnode(")
+        let code = if inner.starts_with("sub(")
+            || inner.starts_with("node(")
+            || inner.starts_with("subnode(")
         {
-            eprintln!(
-                "dns routing: ignoring unsupported function {} (out of scope for client DNS)",
-                inner
-            );
-            continue;
-        }
-
-        // unknown condition function — silently ignored
+            "unsupported-dns-condition"
+        } else {
+            "invalid-dns-rule"
+        };
+        invalid_dns_rule(diagnostics, route_kind, ordinal, code);
+        return Vec::new();
     }
 
     conds
+}
+
+fn invalid_dns_rule(
+    diagnostics: &mut ParserDiagnostics<'_>,
+    route_kind: &'static str,
+    ordinal: usize,
+    code: &'static str,
+) {
+    diagnostics.emit(DetailedDiagnostic::warning(
+        code,
+        diagnostics.source(),
+        SettingPath::new("dns")
+            .field("routing")
+            .field(route_kind)
+            .field("rules")
+            .index(ordinal),
+        SafeValue::Ordinal(ordinal),
+        "invalid or unsupported DNS condition; whole rule omitted",
+    ));
+}
+
+fn validate_dns_networks(
+    values: &[String],
+    diagnostics: &mut ParserDiagnostics<'_>,
+    route_kind: &'static str,
+    ordinal: usize,
+) -> bool {
+    let mut truncated = false;
+    for value in values {
+        let Some(decoded) = crate::dns::decode_ip_or_cidr(value) else {
+            invalid_dns_rule(diagnostics, route_kind, ordinal, "invalid-dns-network");
+            return false;
+        };
+        truncated |= decoded.truncated;
+    }
+    if truncated {
+        diagnostics.emit(DetailedDiagnostic::warning(
+            "dns-network-host-bits",
+            diagnostics.source(),
+            SettingPath::new("dns")
+                .field("routing")
+                .field(route_kind)
+                .field("rules")
+                .index(ordinal),
+            SafeValue::Ordinal(ordinal),
+            "DNS network host bits are truncated to the network prefix",
+        ));
+    }
+    true
 }
 
 /// Parse qname(args) into a list of domain matchers.
