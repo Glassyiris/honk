@@ -6,7 +6,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('ci-{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('ci-{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,9 +19,19 @@ jobs:
   test:
     name: cargo test (workspace)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read Rust toolchain
+        id: toolchain
+        run: echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
         run: |
           sudo apt-get update
@@ -25,21 +39,38 @@ jobs:
 
       # routing::tests::test_geosite_* need geo assets (locally found at
       # /etc/dae/geosite.dat; the runner has none).
+      - name: Read geo cache key
+        id: geo-pins
+        run: |
+          source .github/ci/pins.env
+          echo "key=$GEOSITE_SHA256-$GEOIP_SHA256" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/geo-assets
+          key: geo-${{ steps.geo-pins.outputs.key }}
       - name: Install geo assets for the geosite tests
         run: |
-          sudo mkdir -p /etc/dae
-          sudo curl -sL --retry 3 -o /etc/dae/geosite.dat \
-            https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
-          sudo curl -sL --retry 3 -o /etc/dae/geoip.dat \
-            https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
-      # Full suite minus the known pre-existing config_dae_routing failure.
-      - run: |
-          cargo test --workspace --no-fail-fast -- \
-            --skip test_routing_with_config_dae
+          source .github/ci/pins.env
+          geo_dir="$RUNNER_TEMP/geo-assets"
+          mkdir -p "$geo_dir"
+          if ! test -f "$geo_dir/geosite.dat"; then
+            curl -fsSL --retry 3 -o "$geo_dir/geosite.dat" \
+              "https://github.com/v2fly/domain-list-community/releases/download/$GEOSITE_TAG/dlc.dat"
+          fi
+          if ! test -f "$geo_dir/geoip.dat"; then
+            curl -fsSL --retry 3 -o "$geo_dir/geoip.dat" \
+              "https://github.com/v2fly/geoip/releases/download/$GEOIP_TAG/geoip.dat"
+          fi
+          echo "$GEOSITE_SHA256  $geo_dir/geosite.dat" | sha256sum -c -
+          echo "$GEOIP_SHA256  $geo_dir/geoip.dat" | sha256sum -c -
+          sudo install -D -m 0644 "$geo_dir/geosite.dat" /etc/dae/geosite.dat
+          sudo install -D -m 0644 "$geo_dir/geoip.dat" /etc/dae/geoip.dat
+      - run: cargo test --workspace --no-fail-fast
 
   build:
     name: build ${{ matrix.target }}${{ matrix.suffix }}
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -63,32 +94,48 @@ jobs:
           - target: aarch64-unknown-linux-musl
             suffix: "-stock"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
+      - name: Read Rust toolchains
+        id: toolchain
+        run: |
+          echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "ebpf=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust stable (with target)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
           target: ${{ matrix.target }}
 
       - name: Install Rust nightly (for the eBPF object)
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
-          toolchain: nightly
+          toolchain: ${{ steps.toolchain.outputs.ebpf }}
           components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}${{ matrix.suffix }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          workspaces: |
+            . -> target
+            crates/honk-ebpf -> target
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm libbpf-dev pkg-config cmake libclang-dev zstd
 
-      - name: Install bpf-linker 0.11.0
+      - name: Install pinned bpf-linker
         run: |
-          curl -fsSL --retry 3 -o /tmp/bpf-linker.tar.zst \
-            https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst
-          echo "10f62ba9ab7e544d538370552660efcb4f1a19153d5752bbf0f6b51f3bada450  /tmp/bpf-linker.tar.zst" | sha256sum -c -
-          zstd -dc /tmp/bpf-linker.tar.zst | tar -xf - -C "$HOME/.cargo/bin"
+          source .github/ci/pins.env
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
+            "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          echo "$BPF_LINKER_SHA256  $RUNNER_TEMP/bpf-linker.tar.zst" | sha256sum -c -
+          zstd -dc "$RUNNER_TEMP/bpf-linker.tar.zst" | tar -xf - -C "$CARGO_HOME/bin"
           bpf-linker --version
 
       # The eBPF object is target-independent; build it once on the host so
@@ -96,7 +143,7 @@ jobs:
       - name: Build eBPF object
         run: |
           cd crates/honk-ebpf
-          cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
+          cargo build --release -Zbuild-std=core --target bpfel-unknown-none
 
       # aya refuses objects without BTF ("no BTF parsed for object") — fail
       # the build here instead of at runtime on a gateway.
@@ -110,7 +157,7 @@ jobs:
       # on the zig-style target in $ZIGCC_TARGET.
       - name: Install zig (non-native targets)
         if: matrix.target != 'x86_64-unknown-linux-gnu'
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.14.1
 
@@ -125,13 +172,11 @@ jobs:
             echo "FEATURES=--features ebpf" >> "$GITHUB_ENV"
           fi
 
-      # NB: the nightly step above makes nightly the DEFAULT toolchain, and
-      # rust-toolchain's `target` input installs the std only for stable —
-      # build with +stable explicitly or cross targets fail with
-      # "can't find crate for `core`".
+      # The root rust-toolchain.toml selects the host compiler whose cross
+      # targets were installed above; the eBPF crate has its own nightly pin.
       - name: Build honk-core (native gnu)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo +stable build --release -p honk-core $FEATURES --target ${{ matrix.target }}
+        run: cargo build --release -p honk-core $FEATURES --target ${{ matrix.target }}
 
       - name: Build honk-core (cross via zig wrappers)
         if: matrix.target != 'x86_64-unknown-linux-gnu'
@@ -155,7 +200,7 @@ jobs:
           # boring-sys generates its bindings with bindgen at build time —
           # point it at zig's target headers, not the host's.
           export BINDGEN_EXTRA_CLANG_ARGS="$(ci/zig-bindgen-env "$ZIGCC_TARGET")"
-          cargo +stable build --release -p honk-core $FEATURES --target "$T"
+          cargo build --release -p honk-core $FEATURES --target "$T"
 
       - name: Package artifact
         run: |
@@ -166,7 +211,7 @@ jobs:
           tar -czf "$name.tar.gz" -C dist "$name"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: honk-core-${{ matrix.target }}${{ matrix.suffix }}
           path: honk-core-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}.tar.gz
@@ -176,16 +221,19 @@ jobs:
     name: GitHub Release
     needs: [test, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true
 
       - name: Create release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: dist/*.tar.gz
           prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}

@@ -275,7 +275,9 @@ preservation. `just test-netns` includes that routing gate.
 Performance measurements and historical prototype/lab records are intentionally
 not kept on this design page. The reload benchmark definition lives in
 [`crates/honk-core/benches/reload.rs`](../../../crates/honk-core/benches/reload.rs);
-the [CI workflow](../../../.github/workflows/ci.yml) remains the source for the VM command and pinned image.
+the [CI workflow](../../../.github/workflows/ci.yml) selects the VM gate,
+[`run-vm-gate.sh`](../../../.github/ci/run-vm-gate.sh) owns the host preparation and VM command,
+and [`pins.env`](../../../.github/ci/pins.env) owns the pinned image.
 
 ## Related docs
 

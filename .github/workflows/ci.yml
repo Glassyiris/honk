@@ -8,7 +8,10 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('ci-{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('ci-{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,11 +20,20 @@ jobs:
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read Rust toolchain
+        id: toolchain
+        run: echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
         run: |
           # The runner image ships Chrome and Microsoft apt sources; a Hash Sum mismatch
@@ -33,11 +45,24 @@ jobs:
       - run: cargo clippy --all --all-targets -- -D warnings
 
   test:
-    name: cargo test (workspace)
+    name: cargo nextest (workspace)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read Rust toolchain
+        id: toolchain
+        run: echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        with:
+          tool: nextest
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
         run: |
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
@@ -46,32 +71,67 @@ jobs:
 
       # routing::tests::test_geosite_* need geo assets (locally found at
       # /etc/dae/geosite.dat; the runner has none).
+      - name: Read geo cache key
+        id: geo-pins
+        run: |
+          source .github/ci/pins.env
+          echo "key=$GEOSITE_SHA256-$GEOIP_SHA256" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/geo-assets
+          key: geo-${{ steps.geo-pins.outputs.key }}
       - name: Install geo assets for the geosite tests
         run: |
-          sudo mkdir -p /etc/dae
-          sudo curl -sL --retry 3 -o /etc/dae/geosite.dat \
-            https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
-          sudo curl -sL --retry 3 -o /etc/dae/geoip.dat \
-            https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
-      # Full suite minus the known pre-existing config_dae_routing failure.
-      - run: |
-          cargo test --workspace --no-fail-fast -- \
-            --skip test_routing_with_config_dae
+          source .github/ci/pins.env
+          geo_dir="$RUNNER_TEMP/geo-assets"
+          mkdir -p "$geo_dir"
+          if ! test -f "$geo_dir/geosite.dat"; then
+            curl -fsSL --retry 3 -o "$geo_dir/geosite.dat" \
+              "https://github.com/v2fly/domain-list-community/releases/download/$GEOSITE_TAG/dlc.dat"
+          fi
+          if ! test -f "$geo_dir/geoip.dat"; then
+            curl -fsSL --retry 3 -o "$geo_dir/geoip.dat" \
+              "https://github.com/v2fly/geoip/releases/download/$GEOIP_TAG/geoip.dat"
+          fi
+          echo "$GEOSITE_SHA256  $geo_dir/geosite.dat" | sha256sum -c -
+          echo "$GEOIP_SHA256  $geo_dir/geoip.dat" | sha256sum -c -
+          sudo install -D -m 0644 "$geo_dir/geosite.dat" /etc/dae/geosite.dat
+          sudo install -D -m 0644 "$geo_dir/geoip.dat" /etc/dae/geoip.dat
+      - run: cargo nextest run --workspace --profile ci
+      - name: Upload workspace JUnit
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workspace-junit
+          path: target/nextest/ci/junit.xml
 
   ebpf:
     name: eBPF object + real VM kernel tests
     # These tests attach TC/cgroup programs and therefore cannot run in a job container.
     runs-on: ubuntu-24.04
-    env:
-      CARGO_BUILD_JOBS: 1
-      CARGO_PROFILE_TEST_DEBUG: 0
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read Rust toolchains
+        id: toolchain
+        run: |
+          echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "ebpf=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
-          toolchain: nightly
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.ebpf }}
           components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          workspaces: |
+            . -> target
+            crates/honk-ebpf -> target
+          cache-directories: target/honk-ebpf-routing-test
       - name: Install build and VM dependencies
         run: |
           echo 'debconf debconf/frontend select Noninteractive' | sudo debconf-set-selections
@@ -88,6 +148,7 @@ jobs:
               sudo tee /etc/udev/rules.d/99-kvm4all.rules
             sudo udevadm control --reload-rules
             sudo udevadm trigger --name-match=kvm || true
+            sudo chmod 666 /dev/kvm || true
             if test -r /dev/kvm -a -w /dev/kvm; then
               echo "HONK_CI_VNG_DISABLE_KVM=0" >> "$GITHUB_ENV"
               exit 0
@@ -95,38 +156,60 @@ jobs:
           fi
           echo "KVM unavailable on this runner; using virtme-ng software emulation"
           echo "HONK_CI_VNG_DISABLE_KVM=1" >> "$GITHUB_ENV"
-      - name: Install virtme-ng 1.41
+      - name: Install pinned virtme-ng
         run: |
-          curl -fsSL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/virtme_ng-1.41-py3-none-any.whl" \
-            https://files.pythonhosted.org/packages/41/f2/ca99d9bae0a227be4e09082b9dd9fe3bf931900e36aca6e05f85a4599aea/virtme_ng-1.41-py3-none-any.whl
-          echo "2031f0f2c67947829e030d66b28950adcef351a17a8455483b57d27b6246f2d2  $RUNNER_TEMP/virtme_ng-1.41-py3-none-any.whl" | sha256sum -c -
+          source .github/ci/pins.env
+          wheel="$RUNNER_TEMP/${VIRTME_NG_WHEEL_URL##*/}"
+          curl -fsSL --retry 3 --retry-all-errors -o "$wheel" "$VIRTME_NG_WHEEL_URL"
+          echo "$VIRTME_NG_SHA256  $wheel" | sha256sum -c -
           /usr/bin/python3 -m venv --system-site-packages "$RUNNER_TEMP/virtme-ng"
           "$RUNNER_TEMP/virtme-ng/bin/pip" --disable-pip-version-check install --no-deps \
-            "$RUNNER_TEMP/virtme_ng-1.41-py3-none-any.whl"
+            "$wheel"
           echo "$RUNNER_TEMP/virtme-ng/bin" >> "$GITHUB_PATH"
-      - name: Install bpf-linker 0.11.0
+      - name: Install pinned bpf-linker
         run: |
-          curl -fsSL --retry 3 -o /tmp/bpf-linker.tar.zst \
-            https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst
-          echo "10f62ba9ab7e544d538370552660efcb4f1a19153d5752bbf0f6b51f3bada450  /tmp/bpf-linker.tar.zst" | sha256sum -c -
-          zstd -dc /tmp/bpf-linker.tar.zst | tar -xf - -C "$HOME/.cargo/bin"
+          source .github/ci/pins.env
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
+            "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          echo "$BPF_LINKER_SHA256  $RUNNER_TEMP/bpf-linker.tar.zst" | sha256sum -c -
+          zstd -dc "$RUNNER_TEMP/bpf-linker.tar.zst" | tar -xf - -C "$CARGO_HOME/bin"
           bpf-linker --version
+      - name: Read download cache keys
+        id: pins
+        run: |
+          source .github/ci/pins.env
+          echo "geo=$GEOSITE_SHA256-$GEOIP_SHA256" >> "$GITHUB_OUTPUT"
+          echo "kernel=$KERNEL_FLOOR_IMAGE_SHA256-$KERNEL_FLOOR_MODULES_SHA256" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/geo-assets
+          key: geo-${{ steps.pins.outputs.geo }}
       - name: Install geo assets for eBPF-feature unit tests
         run: |
-          sudo mkdir -p /etc/dae
-          sudo curl -sL --retry 3 -o /etc/dae/geosite.dat \
-            https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
-          sudo curl -sL --retry 3 -o /etc/dae/geoip.dat \
-            https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
+          source .github/ci/pins.env
+          geo_dir="$RUNNER_TEMP/geo-assets"
+          mkdir -p "$geo_dir"
+          if ! test -f "$geo_dir/geosite.dat"; then
+            curl -fsSL --retry 3 -o "$geo_dir/geosite.dat" \
+              "https://github.com/v2fly/domain-list-community/releases/download/$GEOSITE_TAG/dlc.dat"
+          fi
+          if ! test -f "$geo_dir/geoip.dat"; then
+            curl -fsSL --retry 3 -o "$geo_dir/geoip.dat" \
+              "https://github.com/v2fly/geoip/releases/download/$GEOIP_TAG/geoip.dat"
+          fi
+          echo "$GEOSITE_SHA256  $geo_dir/geosite.dat" | sha256sum -c -
+          echo "$GEOIP_SHA256  $geo_dir/geoip.dat" | sha256sum -c -
+          sudo install -D -m 0644 "$geo_dir/geosite.dat" /etc/dae/geosite.dat
+          sudo install -D -m 0644 "$geo_dir/geoip.dat" /etc/dae/geoip.dat
       - name: Build eBPF object
         run: |
           cd crates/honk-ebpf
-          cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
+          cargo build --release -Zbuild-std=core --target bpfel-unknown-none
       - name: Build routing-test eBPF object separately
         run: |
           cd crates/honk-ebpf
           CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/honk-ebpf-routing-test" \
-            cargo +nightly build --release --features routing-test \
+            cargo build --release --features routing-test \
               -Zbuild-std=core --target bpfel-unknown-none
       # aya refuses objects without BTF ("no BTF parsed for object") — fail
       # here instead of at runtime on a gateway.
@@ -134,62 +217,44 @@ jobs:
         run: |
           readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
           readelf -S target/honk-ebpf-routing-test/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        with:
+          tool: nextest
       - name: Run eBPF-feature unit tests
-        run: |
-          cargo +stable test -p honk-core --features ebpf --lib -- \
-            --skip test_routing_with_config_dae
-      - name: Compile real-kernel test binaries on the host
-        run: |
-          {
-            cargo +stable test -p honk-core --features ebpf --lib --test ebpf_datapath_test --no-run --message-format=json
-            cargo +stable test -p honk-nfqueue --lib --no-run --message-format=json
-          } | jq -sr '
-            def executable($name):
-              [.[] | select(.reason == "compiler-artifact" and .target.name == $name and .executable != null) | .executable]
-              | unique | if length == 1 then .[0] else error("missing or ambiguous test executable: " + $name) end;
-            "HONK_CORE_TEST_BIN=" + (executable("honk_core") | @sh),
-            "HONK_DATAPATH_TEST_BIN=" + (executable("ebpf_datapath_test") | @sh),
-            "HONK_NFQUEUE_TEST_BIN=" + (executable("honk_nfqueue") | @sh)
-          ' > target/kernel-test-bins.env
-      - name: Fetch verified Linux 6.12 image and modules
-        run: |
-          kernel_dir="$RUNNER_TEMP/linux-v6.12"
-          base=https://kernel.ubuntu.com/mainline/v6.12/amd64
-          image=linux-image-unsigned-6.12.0-061200-generic_6.12.0-061200.202411220723_amd64.deb
-          modules=linux-modules-6.12.0-061200-generic_6.12.0-061200.202411220723_amd64.deb
-          mkdir -p "$kernel_dir"
-          curl -fsSL --retry 3 --retry-all-errors -o "$kernel_dir/$image" "$base/$image"
-          curl -fsSL --retry 3 --retry-all-errors -o "$kernel_dir/$modules" "$base/$modules"
-          echo "3f156eab453866391b1939652829c67f4e4e9a9c18917d76751f41a26da4a330  $kernel_dir/$image" | sha256sum -c -
-          echo "5c1bb612091143332f4ca1892086e29b676cc27c83f74cd2d48115203a0c72d8  $kernel_dir/$modules" | sha256sum -c -
-          dpkg-deb --extract "$kernel_dir/$image" "$kernel_dir/root"
-          dpkg-deb --extract "$kernel_dir/$modules" "$kernel_dir/root"
-          echo "HONK_CI_KERNEL_IMAGE=$kernel_dir/root/boot/vmlinuz-6.12.0-061200-generic" >> "$GITHUB_ENV"
+        env:
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: cargo nextest run -p honk-core --features ebpf --lib --profile ci
+      - name: Upload eBPF unit-test JUnit
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ebpf-unit-junit
+          path: target/nextest/ci/junit.xml
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/kernel-floor/*.deb
+          key: kernel-floor-${{ steps.pins.outputs.kernel }}
       - name: Run all real-kernel gates on Linux 6.12
-        run: |
-          kvm_args=()
-          if test "${HONK_CI_VNG_DISABLE_KVM:-0}" = 1; then
-            kvm_args+=(--disable-kvm)
-          fi
-          vng -r "$HONK_CI_KERNEL_IMAGE" \
-            "${kvm_args[@]}" \
-            --user root \
-            --rwdir "$GITHUB_WORKSPACE" \
-            --cpus 2 \
-            --memory 4G \
-            -- \
-            env \
-              CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
-              RUST_BACKTRACE=1 \
-              HONK_ROUTING_TEST_OBJECT="$GITHUB_WORKSPACE/target/honk-ebpf-routing-test/bpfel-unknown-none/release/honk-ebpf" \
-              bash "$GITHUB_WORKSPACE/.github/ci/ebpf-vm-tests.sh"
+        env:
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: .github/ci/run-vm-gate.sh floor
+      - name: Upload guest output
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vm-tests-floor
+          path: target/vm-tests/floor
 
   review-bot:
     name: mechanical PR review
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
-      - uses: actions/github-script@v9
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const pr = context.payload.pull_request;

@@ -14,17 +14,17 @@ If this path could not run, put this exact sentence in the PR's Verified section
 Use `just test-routing`. Without `just`, run its `Justfile` commands below from the checkout root. The subshell keeps that working directory; `$PWD` replaces `{{justfile_directory()}}`.
 
 ```bash
-(cd crates/honk-ebpf && CARGO_TARGET_DIR=target/routing-test env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none --features routing-test)
-HONK_ROUTING_TEST_OBJECT="$PWD/crates/honk-ebpf/target/routing-test/bpfel-unknown-none/release/honk-ebpf" CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-core --features ebpf --lib ebpf::real::routing::tests -- --ignored --test-threads=1
+(cd crates/honk-ebpf && CARGO_TARGET_DIR=target/routing-test env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo build --release -Zbuild-std=core --target bpfel-unknown-none --features routing-test)
+HONK_ROUTING_TEST_OBJECT="$PWD/crates/honk-ebpf/target/routing-test/bpfel-unknown-none/release/honk-ebpf" CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib ebpf::real::routing::tests -- --ignored --test-threads=1
 ```
 
 Use `just test-netns`, which includes `test-routing`. Without `just`, run the block above, then these remaining `Justfile` commands:
 
 ```bash
-CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-nfqueue --lib nfqueue_service_isolated_netns_kernel_contract -- --ignored --test-threads=1
-CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-core --features ebpf --lib netns -- --ignored --test-threads=1
-CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-core --features ebpf --lib ebpf::real::tests -- --ignored --test-threads=1
-CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-core --features ebpf --test ebpf_datapath_test -- --ignored --test-threads=1
+CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-nfqueue --lib nfqueue_service_isolated_netns_kernel_contract -- --ignored --test-threads=1
+CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib netns -- --ignored --test-threads=1
+CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib ebpf::real::tests -- --ignored --test-threads=1
+CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --test ebpf_datapath_test -- --ignored --test-threads=1
 ```
 
 The routing object path above is a build output, not a checked-in file.
@@ -34,38 +34,10 @@ The routing object path above is a build output, not a checked-in file.
 This path follows the `ebpf` job in `.github/workflows/ci.yml` on an Ubuntu Linux host. Dependency installation and KVM setup need host root; the guest runs as root. KVM is optional: the workflow falls back to TCG software emulation.
 If this path could not run, put this exact sentence in Verified: "eBPF VM tests: not run (needs Linux root or a VM; CI runs them)".
 
-1. Follow the workflow's toolchain and dependency steps, including "Install virtme-ng 1.41", "Install bpf-linker 0.11.0" and the geo asset installation. Use its pinned downloads and checksums. Outside Actions, set `GITHUB_WORKSPACE` to the checkout root and `RUNNER_TEMP` to a temporary directory. Export the values the workflow writes to `GITHUB_ENV` and add the directory it writes to `GITHUB_PATH` to `PATH`. Set `CARGO_BUILD_JOBS=1` and `CARGO_PROFILE_TEST_DEBUG=0` as the job does.
+1. Follow the workflow's toolchain and dependency steps, including "Install pinned virtme-ng", "Install pinned bpf-linker" and the geo asset installation. `.github/ci/pins.env` owns the download versions and checksums. Outside Actions, set `GITHUB_WORKSPACE` to the checkout root, `RUNNER_TEMP` to a temporary directory and `GITHUB_STEP_SUMMARY` to a writable file. Export the values the workflow writes to `GITHUB_ENV` and add the directory it writes to `GITHUB_PATH` to `PATH`. Set `CARGO_PROFILE_TEST_DEBUG=0` for the host test builds.
 2. Follow "Configure KVM". Set `HONK_CI_VNG_DISABLE_KVM=0` only when KVM is accessible; otherwise set it to `1` for TCG.
 3. Follow "Build eBPF object", "Build routing-test eBPF object separately", "Verify eBPF objects have BTF" and "Run eBPF-feature unit tests" on the host. These produce the two objects used below.
-4. Build the three test executables on the host with the workflow's commands, from the checkout root:
-
-   ```bash
-   cargo +stable test -p honk-core --features ebpf --lib --test ebpf_datapath_test --no-run --message-format=json
-   cargo +stable test -p honk-nfqueue --lib --no-run --message-format=json
-   ```
-
-   Pipe their combined JSON output through the `jq -sr` block in "Compile real-kernel test binaries on the host". It writes the generated `target/kernel-test-bins.env` file with shell-quoted `HONK_CORE_TEST_BIN`, `HONK_DATAPATH_TEST_BIN` and `HONK_NFQUEUE_TEST_BIN`. Use that block's unique-executable checks rather than choosing a binary by filename glob.
-5. Follow "Fetch verified Linux 6.12 image and modules". Keep its image, modules and checksum checks together. Export the resulting `HONK_CI_KERNEL_IMAGE` value.
-6. Boot with the workflow's command below. `HONK_ROUTING_TEST_OBJECT` points to the routing-test build output. `.github/ci/ebpf-vm-tests.sh` is the guest gate; never run it directly on the host. It checks the pinned guest kernel and modules, prepares bpffs and runs the real-kernel binaries serially.
-
-   ```bash
-   kvm_args=()
-   if test "${HONK_CI_VNG_DISABLE_KVM:-0}" = 1; then
-     kvm_args+=(--disable-kvm)
-   fi
-   vng -r "$HONK_CI_KERNEL_IMAGE" \
-     "${kvm_args[@]}" \
-     --user root \
-     --rwdir "$GITHUB_WORKSPACE" \
-     --cpus 2 \
-     --memory 4G \
-     -- \
-     env \
-       CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" \
-       RUST_BACKTRACE=1 \
-       HONK_ROUTING_TEST_OBJECT="$GITHUB_WORKSPACE/target/honk-ebpf-routing-test/bpfel-unknown-none/release/honk-ebpf" \
-       bash "$GITHUB_WORKSPACE/.github/ci/ebpf-vm-tests.sh"
-   ```
+4. Run `.github/ci/run-vm-gate.sh floor` from the checkout root. It compiles the three test executables, writes `target/kernel-test-bins.env` with unique-executable checks, verifies the kernel packages from `pins.env`, and boots the guest. `.github/ci/ebpf-vm-tests.sh` is the guest gate; never run it directly on the host. It checks the expected kernel and modules, prepares bpffs and runs the five real-kernel invocations serially. Logs go to `target/vm-tests/floor/`; the KVM selection and guest kernel go to `GITHUB_STEP_SUMMARY`.
 
 ## No suitable environment
 

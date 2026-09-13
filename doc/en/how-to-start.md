@@ -96,9 +96,9 @@ Release binaries embed the eBPF object, so `honk-ebpf` does not need to be insta
 
 A source build requires:
 
-- Rust stable;
-- `nightly-2026-07-20`, `rust-src`, and `llvm-tools-preview`;
-- `bpf-linker 0.10.3`;
+- the stable Rust version in the root `rust-toolchain.toml` (`rustfmt`, `clippy`);
+- the nightly in `crates/honk-ebpf/rust-toolchain.toml` (`rust-src`, `llvm-tools`);
+- the `bpf-linker` version in `.github/ci/pins.env`;
 - a C/C++ toolchain, CMake, Clang, LLVM, libclang, libbpf headers, binutils, pkg-config, and Git;
 - network access to crates.io and GitHub.
 
@@ -118,36 +118,32 @@ sudo pacman -S --needed \
   base-devel clang llvm libbpf cmake pkgconf git curl ca-certificates
 ```
 
-Install the Rust toolchains:
+Clone the repository, then install its pinned Rust toolchains:
 
 ```shell
-rustup toolchain install stable --profile minimal
-rustup toolchain install nightly-2026-07-20 --profile minimal \
-  --component rust-src --component llvm-tools-preview
-cargo install bpf-linker --version 0.10.3
+git clone https://github.com/daeuniverse/honk.git
+cd honk
+rustup toolchain install $(grep -oP '^channel\s*=\s*"\K[^"]+' rust-toolchain.toml) \
+  --profile minimal --component rustfmt --component clippy
+rustup toolchain install $(grep -oP '^channel\s*=\s*"\K[^"]+' crates/honk-ebpf/rust-toolchain.toml) \
+  --profile minimal --component rust-src --component llvm-tools
+source .github/ci/pins.env
+cargo install bpf-linker --version "$BPF_LINKER_VERSION"
 ```
 
 Build the current `main` branch:
 
 ```shell
-git clone https://github.com/daeuniverse/honk.git
-cd honk
-
-# The current eBPF Cargo config contains a maintainer-local linker path.
-# Use the bpf-linker installed in PATH on a clean machine.
-sed -i 's|linker=/root/.cargo/bin/bpf-linker-wrapper|linker=bpf-linker|' \
-  crates/honk-ebpf/.cargo/config.toml
-
 unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
 (
   cd crates/honk-ebpf
-  cargo +nightly-2026-07-20 build --release \
+  cargo build --release \
     -Zbuild-std=core --target bpfel-unknown-none
 )
 
 readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf \
   | grep -q '\.BTF'
-cargo +stable build --release -p honk-core --features ebpf
+cargo build --release -p honk-core --features ebpf
 sudo install -m 0755 target/release/honk-core /usr/local/bin/honk-core
 ```
 
@@ -279,7 +275,7 @@ sudo journalctl -u honk-core --since '5 minutes ago'
 If `honk-tool` was built from source, run its read-only diagnosis:
 
 ```shell
-cargo +stable build --release -p honk-tool
+cargo build --release -p honk-tool
 sudo ./target/release/honk-tool diagnose \
   --api http://127.0.0.1:9090 --pin-root /sys/fs/bpf
 ```
@@ -324,7 +320,7 @@ routing {
 ```
 
 ```shell
-cargo +stable run --release -p honk-core -- \
+cargo run --release -p honk-core -- \
   --config /tmp/honk.dae --mock-ebpf
 ```
 
@@ -343,7 +339,7 @@ cargo +stable run --release -p honk-core -- \
 
 | Symptom | Action |
 | --- | --- |
-| `bpf-linker-wrapper` is missing | Replace the maintainer-local path with the `bpf-linker` in PATH as shown in the source-build section. |
+| `bpf-linker` is missing | Install it as shown in the source-build section and add Cargo's bin directory to PATH. |
 | `no BTF parsed for object` | Clear `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS`, rebuild the eBPF object, and confirm `.BTF` with `readelf`. |
 | The kernel or verifier rejects compiled routing | Use Linux `6.12+` with BPF/BTF and freplace support. Keep the full verifier log and the generated rule attribution; do not bypass the startup failure. |
 | Pinning a map returns `Invalid argument` | `/sys/fs/bpf` is not bpffs; mount it as shown above. |

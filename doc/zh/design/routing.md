@@ -218,7 +218,9 @@ map，不能假设重 pin 一个同名 map 就能改变已加载程序持有的�
 
 性能测量及历史原型/实验室记录有意不保留在本设计页。reload 基准定义见
 [`crates/honk-core/benches/reload.rs`](../../../crates/honk-core/benches/reload.rs)；
-[`CI workflow`](../../../.github/workflows/ci.yml) 是 VM 命令和固定镜像的来源。
+[`CI workflow`](../../../.github/workflows/ci.yml) 选择 VM 检查，
+[`run-vm-gate.sh`](../../../.github/ci/run-vm-gate.sh) 负责宿主机准备和 VM 命令，
+[`pins.env`](../../../.github/ci/pins.env) 定义固定镜像。
 
 ## 相关文档
 

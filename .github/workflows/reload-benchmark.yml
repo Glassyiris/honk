@@ -7,9 +7,12 @@ on:
       - "crates/honk-config/**"
       - "crates/honk-core/**"
       - "crates/honk-outbound/**"
+      - "crates/honk-ebpf-common/**"
+      - "crates/honk-nfqueue/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/reload-benchmark.yml"
+      - ".github/ci/**"
       - "ci/compare-reload-benchmark.py"
   schedule:
     - cron: "23 4 * * 1"
@@ -26,27 +29,55 @@ jobs:
       CARGO_TERM_COLOR: never
     steps:
       - name: Check out candidate
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: candidate
       - name: Check out main baseline
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: baseline
           ref: ${{ github.event.pull_request.base.sha || 'main' }}
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install build dependencies and geo assets
+      - name: Read candidate Rust toolchain
+        id: toolchain
+        run: echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' candidate/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake libclang-dev
-          sudo mkdir -p /etc/dae
-          sudo curl -fsSL --retry 3 -o /etc/dae/geosite.dat \
-            https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
-          sudo curl -fsSL --retry 3 -o /etc/dae/geoip.dat \
-            https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
+      - name: Read geo cache key
+        id: geo-pins
+        run: |
+          source candidate/.github/ci/pins.env
+          echo "key=$GEOSITE_SHA256-$GEOIP_SHA256" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/geo-assets
+          key: geo-${{ steps.geo-pins.outputs.key }}
+      - name: Install pinned geo assets
+        run: |
+          source candidate/.github/ci/pins.env
+          geo_dir="$RUNNER_TEMP/geo-assets"
+          mkdir -p "$geo_dir"
+          if ! test -f "$geo_dir/geosite.dat"; then
+            curl -fsSL --retry 3 -o "$geo_dir/geosite.dat" \
+              "https://github.com/v2fly/domain-list-community/releases/download/$GEOSITE_TAG/dlc.dat"
+          fi
+          if ! test -f "$geo_dir/geoip.dat"; then
+            curl -fsSL --retry 3 -o "$geo_dir/geoip.dat" \
+              "https://github.com/v2fly/geoip/releases/download/$GEOIP_TAG/geoip.dat"
+          fi
+          echo "$GEOSITE_SHA256  $geo_dir/geosite.dat" | sha256sum -c -
+          echo "$GEOIP_SHA256  $geo_dir/geoip.dat" | sha256sum -c -
+          sudo install -D -m 0644 "$geo_dir/geosite.dat" /etc/dae/geosite.dat
+          sudo install -D -m 0644 "$geo_dir/geoip.dat" /etc/dae/geoip.dat
       - name: Install the candidate harness into main
         run: |
           cp candidate/crates/honk-core/benches/reload.rs baseline/crates/honk-core/benches/reload.rs
+          # Compare both revisions with the candidate's compiler.
+          cp candidate/rust-toolchain.toml baseline/rust-toolchain.toml
           python3 - <<'PY'
           from pathlib import Path
           import re
@@ -74,6 +105,13 @@ jobs:
               assert text.count(call) == 1, "reload benchmark adapter changed"
               harness.write_text(text.replace(call, "reload_runtime_config(config)"))
           PY
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          workspaces: |
+            baseline -> ${{ runner.temp }}/reload-main-target
+            candidate -> ${{ runner.temp }}/reload-candidate-target
       - name: Benchmark main
         run: |
           set -euo pipefail
@@ -99,7 +137,7 @@ jobs:
             main-reload.log candidate-reload.log
       - name: Upload raw benchmark output
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: reload-benchmark-${{ github.run_id }}
           path: |

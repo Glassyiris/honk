@@ -61,6 +61,17 @@ fn embed_ebpf_object() {
     let ebpf_crate = manifest_dir.join("../honk-ebpf");
     let ebpf_common_crate = manifest_dir.join("../honk-ebpf-common");
     let ebpf_target = ebpf_crate.join("target/bpfel-unknown-none/release/honk-ebpf");
+    let toolchain_file = ebpf_crate.join("rust-toolchain.toml");
+    println!("cargo:rerun-if-changed={}", toolchain_file.display());
+    let toolchain =
+        std::fs::read_to_string(&toolchain_file).expect("failed to read eBPF rust-toolchain.toml");
+    let channel = toolchain
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .find(|(key, _)| key.trim() == "channel")
+        .and_then(|(_, value)| value.trim().strip_prefix('"')?.strip_suffix('"'))
+        .filter(|channel| !channel.is_empty())
+        .expect("eBPF rust-toolchain.toml must contain a quoted channel");
 
     /// aya refuses objects without a `.BTF` section ("no BTF parsed for
     /// object"). Cheap guard: section names live verbatim in the section
@@ -80,6 +91,9 @@ fn embed_ebpf_object() {
     /// embedded while the sources have moved on (observed twice: missing maps
     /// at runtime while the build looks green).
     fn newest_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+        if dir.is_file() {
+            return dir.metadata().ok()?.modified().ok();
+        }
         let mut newest = None;
         let mut stack = vec![dir.to_path_buf()];
         while let Some(d) = stack.pop() {
@@ -114,11 +128,18 @@ fn embed_ebpf_object() {
     ];
 
     let obj = candidates.iter().find(|p| p.exists()).cloned();
-    let src_dirs = [ebpf_crate.join("src"), ebpf_common_crate.join("src")];
+    let src_dirs = [
+        ebpf_crate.join("src"),
+        ebpf_common_crate.join("src"),
+        toolchain_file,
+    ];
 
     let obj = match obj {
         Some(p)
             if object_has_btf(&p)
+                // A restored object may have a newer mtime than the changed pin.
+                && std::fs::read_to_string(p.with_extension("toolchain"))
+                    .is_ok_and(|built_channel| built_channel == channel)
                 && !object_stale(
                     &p,
                     &src_dirs.iter().map(|d| d.as_path()).collect::<Vec<_>>(),
@@ -133,22 +154,25 @@ fn embed_ebpf_object() {
                 && object_has_btf(p)
             {
                 println!(
-                    "cargo:warning=eBPF object at {} is older than the eBPF sources — rebuilding",
+                    "cargo:warning=eBPF object at {} has stale sources or toolchain — rebuilding with {channel}",
                     p.display()
                 );
             }
             // Missing, or stale without .BTF (e.g. built while an environment
             // RUSTFLAGS overrode crates/honk-ebpf/.cargo/config.toml): (re)build.
-            println!("cargo:warning=Building eBPF object (one-time, ~30s)...");
+            println!("cargo:warning=Building eBPF object with {channel}...");
             let status = Command::new("cargo")
+                .arg(format!("+{channel}"))
                 .args([
-                    "+nightly",
                     "build",
                     "--release",
                     "-Zbuild-std=core",
                     "--target",
                     "bpfel-unknown-none",
                 ])
+                // Cargo exports its absolute host rustc path to build scripts.
+                // Let the selected nightly resolve its own compiler and sysroot.
+                .env_remove("RUSTC")
                 // An inherited RUSTFLAGS would override the crate's
                 // .cargo/config.toml rustflags (--btf, debuginfo) and silently
                 // produce a BTF-less object again.
@@ -165,7 +189,7 @@ fn embed_ebpf_object() {
             if !status.success() {
                 panic!(
                     "eBPF build failed. Build manually:\n  \
-                     cd crates/honk-ebpf && cargo +nightly build --release \
+                     cd crates/honk-ebpf && cargo +{channel} build --release \
                      -Zbuild-std=core --target bpfel-unknown-none"
                 );
             }
@@ -173,11 +197,13 @@ fn embed_ebpf_object() {
                 panic!(
                     "eBPF object at {} has no .BTF section — aya cannot load it. \
                      Rebuild manually:\n  \
-                     cd crates/honk-ebpf && cargo +nightly build --release \
+                     cd crates/honk-ebpf && cargo +{channel} build --release \
                      -Zbuild-std=core --target bpfel-unknown-none",
                     ebpf_target.display()
                 );
             }
+            std::fs::write(ebpf_target.with_extension("toolchain"), channel)
+                .expect("failed to record eBPF object toolchain");
             println!("cargo:rerun-if-changed={}", ebpf_target.display());
             ebpf_target
         }

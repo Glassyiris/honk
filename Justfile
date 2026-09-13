@@ -1,6 +1,8 @@
 # honk — eBPF transparent proxy engine
 # https://github.com/Glassyiris/honk
 
+ebpf_toolchain := `grep -oP '^channel\s*=\s*"\K[^"]+' crates/honk-ebpf/rust-toolchain.toml`
+
 # ── Default ──────────────────────────────────────────────
 default: build
 
@@ -43,7 +45,7 @@ build-musl:
 # section and aya refuses to load it ("no BTF parsed for object").
 build-ebpf:
     @test -z "${RUSTFLAGS:-}" || echo "warning: RUSTFLAGS is set and overrides crates/honk-ebpf/.cargo/config.toml (--btf) — the object may lack .BTF"
-    cd crates/honk-ebpf && cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
+    cd crates/honk-ebpf && cargo +{{ebpf_toolchain}} build --release -Zbuild-std=core --target bpfel-unknown-none
     @readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF' \
         || (echo "error: eBPF object has no .BTF section (see RUSTFLAGS note above)" && exit 1)
 
@@ -74,9 +76,10 @@ fmt-check:
 test:
     cargo test --all
 
-# Workspace test gate: full suite minus the known pre-existing routing failure.
+# Workspace CI gate (requires cargo-nextest).
 test-ci:
-    cargo test --workspace --no-fail-fast -- --skip test_routing_with_config_dae
+    # Without nextest: cargo test --workspace --no-fail-fast
+    cargo nextest run --workspace --profile ci
 
 # Run core + outbound tests
 test-core:
@@ -93,14 +96,14 @@ test-ebpf:
 
 # Real generated-policy goldens and atomic publication failures (Linux 6.12+, root).
 test-routing:
-    cd crates/honk-ebpf && CARGO_TARGET_DIR=target/routing-test env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none --features routing-test
-    HONK_ROUTING_TEST_OBJECT="{{justfile_directory()}}/crates/honk-ebpf/target/routing-test/bpfel-unknown-none/release/honk-ebpf" CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-core --features ebpf --lib ebpf::real::routing::tests -- --ignored --test-threads=1
+    cd crates/honk-ebpf && CARGO_TARGET_DIR=target/routing-test env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo +{{ebpf_toolchain}} build --release -Zbuild-std=core --target bpfel-unknown-none --features routing-test
+    HONK_ROUTING_TEST_OBJECT="{{justfile_directory()}}/crates/honk-ebpf/target/routing-test/bpfel-unknown-none/release/honk-ebpf" CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib ebpf::real::routing::tests -- --ignored --test-threads=1
 # Root-gated netlink/netns integration tests (NFQUEUE + netkit/veth/route/rule roundtrip)
 test-netns: test-routing
-    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-nfqueue --lib nfqueue_service_isolated_netns_kernel_contract -- --ignored --test-threads=1
-    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-core --features ebpf --lib netns -- --ignored --test-threads=1
-    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-core --features ebpf --lib ebpf::real::tests -- --ignored --test-threads=1
-    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo +stable test -p honk-core --features ebpf --test ebpf_datapath_test -- --ignored --test-threads=1
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-nfqueue --lib nfqueue_service_isolated_netns_kernel_contract -- --ignored --test-threads=1
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib netns -- --ignored --test-threads=1
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib ebpf::real::tests -- --ignored --test-threads=1
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --test ebpf_datapath_test -- --ignored --test-threads=1
 
 # Full honk-outbound gate after outbound changes (fmt + clippy + config & outbound suites)
 outbound-ci:

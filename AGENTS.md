@@ -90,7 +90,7 @@ cargo build --release -p honk-core    # engine (default features: clash-api, moc
 cargo test --all                      # full suite (see current validation guidance below)
 ```
 
-Real-eBPF and standalone eBPF builds: `.agents/rules/real-ebpf.md`. CI and releases: `.agents/rules/release.md`.
+The root `rust-toolchain.toml` pins the host compiler; `crates/honk-ebpf/rust-toolchain.toml` pins the eBPF compiler and components. Real-eBPF and standalone eBPF builds: `.agents/rules/real-ebpf.md`. CI and releases consume the same files: `.agents/rules/release.md`.
 
 ### Justfile (preferred for day-to-day dev)
 
@@ -98,7 +98,7 @@ Real-eBPF and standalone eBPF builds: `.agents/rules/real-ebpf.md`. CI and relea
 | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `build` / `check` / `lint` / `fmt` / `fmt-check`                                              | `cargo build --release` / `check` / `clippy --all --all-targets -- -D warnings` / `fmt --all` / `fmt --all -- --check`                                                                                                                                                                 |
 | `test-routing` | Root-gated compiled-policy check: builds the `routing-test` eBPF object and exercises the real object against independent goldens plus failed root-publication preservation (Linux 6.12+) |
-| `test` / `test-ci` / `test-core` / `test-config` / `test-ebpf`                  | Test suites (`test` = full workspace; `test-ci` = CI gate with the known legacy routing failure skipped; `test-ebpf` = honk-ebpf-common only)                                                                                                |
+| `test` / `test-ci` / `test-core` / `test-config` / `test-ebpf` | Test suites (`test` = cargo test, full workspace; `test-ci` = nextest CI profile with per-test timeouts and JUnit; `test-ebpf` = honk-ebpf-common only) |
 | `test-netns`                                                                    | Depends on `test-routing`; root-gated real-kernel tests for production NFQUEUE/nftables IPv4+IPv6 held-verdict contract, eBPF netlink/netns roundtrips, link ownership/rebind lifecycle, and pinned allocator rollback compatibility (`--features ebpf --ignored`, serial) |
 | `outbound-ci` / `outbound-ci-e2e`                                               | honk-outbound gate (`ci/outbound-ci.sh`: fmt + clippy + honk-config & honk-outbound suites; `...-e2e` adds live hy2 e2e via `HONK_HY2_SERVER=`) — run after every outbound change                                                            |
 | `dns-ci`                                                                        | DNS subsystem gate (`ci/dns-ci.sh`: fmt + clippy + honk-config + honk-core dns/control + honk-outbound suites) — run after every DNS-path change                                                                                             |
@@ -118,12 +118,13 @@ Removed `run` / `deploy` / `docker*` recipes called absent `scripts/debug-local.
 
 ## Current validation guidance
 
-Do not treat dated pass counts as repository status; use the current command output and CI for that evidence. The workspace gate below retains the known legacy routing exclude. The current compiled-routing gate is `just test-routing`: it builds a real `routing-test` eBPF object and exercises independent policy goldens plus preservation of the active root when publication fails.
+Do not treat dated pass counts as repository status; use the current command output and CI for that evidence. The legacy `config.dae` routing test is ignored in source because it expects a direct-routing suffix rule no longer present in the config. The current compiled-routing gate is `just test-routing`: it builds a real `routing-test` eBPF object and exercises independent policy goldens plus preservation of the active root when publication fails.
+
+`just test-ci` requires `cargo-nextest` and selects `.config/nextest.toml`'s `ci` profile: no retries, a three-minute per-test timeout and no fail-fast. JUnit is written to `target/nextest/ci/junit.xml`; CI uploads it on failure. Plain `cargo test` remains supported.
 
 ```bash
 env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
-  cargo test --workspace --no-fail-fast -- \
-    --skip test_routing_with_config_dae
+  cargo test --workspace --no-fail-fast
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

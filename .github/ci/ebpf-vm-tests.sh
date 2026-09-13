@@ -9,8 +9,10 @@ test -x "$HONK_NFQUEUE_TEST_BIN"
 
 cd "$repo"
 test "$(id -u)" -eq 0
-test "$(uname -r)" = 6.12.0-061200-generic
-test -d "/lib/modules/$(uname -r)"
+kernel=$(uname -r)
+printf 'Guest uname -r: %s\n' "$kernel" >> "${GITHUB_STEP_SUMMARY:?}"
+test "$kernel" = "${HONK_CI_EXPECTED_KERNEL:?}"
+test -d "/lib/modules/$kernel"
 modprobe -a tun sch_ingress cls_bpf nf_tables nfnetlink_queue nft_queue
 test -e /sys/fs/cgroup/cgroup.controllers
 test -r "${HONK_ROUTING_TEST_OBJECT:?}"
@@ -19,11 +21,17 @@ if ! mountpoint -q /sys/fs/bpf; then
 fi
 test "$(stat -f -c %T /sys/fs/bpf)" = bpf_fs
 
-"$HONK_CORE_TEST_BIN" ebpf::real::tests --ignored --test-threads=1
+log_dir="${GITHUB_WORKSPACE:?}/target/vm-tests/${HONK_CI_VM_LANE:?}"
+mkdir -p "$log_dir"
+
+"$HONK_CORE_TEST_BIN" ebpf::real::tests --ignored --test-threads=1 \
+  2>&1 | tee "$log_dir/honk-core-real.log"
 "$HONK_CORE_TEST_BIN" \
   ebpf::real::routing::tests \
-  --ignored --test-threads=1
-"$HONK_DATAPATH_TEST_BIN" --ignored --test-threads=1
+  --ignored --test-threads=1 2>&1 | tee "$log_dir/honk-core-routing.log"
+"$HONK_DATAPATH_TEST_BIN" --ignored --test-threads=1 \
+  2>&1 | tee "$log_dir/ebpf-datapath.log"
 "$HONK_NFQUEUE_TEST_BIN" nfqueue_service_isolated_netns_kernel_contract \
-  --ignored --test-threads=1
-"$HONK_CORE_TEST_BIN" netns --ignored --test-threads=1
+  --ignored --test-threads=1 2>&1 | tee "$log_dir/honk-nfqueue.log"
+"$HONK_CORE_TEST_BIN" netns --ignored --test-threads=1 \
+  2>&1 | tee "$log_dir/honk-core-netns.log"

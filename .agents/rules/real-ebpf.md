@@ -12,7 +12,7 @@ The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 
 Score is always compiled, without a Cargo feature; omitted policy selects Selector.
 
-`build.rs` always emits `HONK_VERSION` from the GitHub release tag, local `git describe`, or Cargo package version without Git metadata. `honk_core::VERSION` supplies both CLIs and Clash `/version`; runtime needs no Git. With `ebpf`, locate `crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf` or `target/honk-core.o` and **verify `.BTF`**. Missing/BTF-less objects trigger `cargo +nightly` rebuild, stripping child `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`: environment flags override `crates/honk-ebpf/.cargo/config.toml`'s `--btf` and silently omit BTF. Copy to `OUT_DIR/honk-ebpf.o`, set `HONK_EBPF_OBJECT`; `lib.rs` embeds with `include_bytes!`. Runtime override: `--bpf-object`.
+`build.rs` always emits `HONK_VERSION` from the GitHub release tag, local `git describe`, or Cargo package version without Git metadata. `honk_core::VERSION` supplies both CLIs and Clash `/version`; runtime needs no Git. With `ebpf`, locate `crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf` or `target/honk-core.o` and **verify `.BTF`**. Missing, BTF-less or stale objects trigger a rebuild with the channel read from `crates/honk-ebpf/rust-toolchain.toml`, stripping child `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`: environment flags override `crates/honk-ebpf/.cargo/config.toml`'s `--btf` and silently omit BTF. The object records its compiler channel in a `.toolchain` sidecar; source or pin changes invalidate it. Copy to `OUT_DIR/honk-ebpf.o`, set `HONK_EBPF_OBJECT`; `lib.rs` embeds with `include_bytes!`. Runtime override: `--bpf-object`.
 
 ```bash
 # Requires Linux kernel 6.12+, clang/llvm/libbpf headers, nightly + bpf-linker.
@@ -36,9 +36,9 @@ Kernel eBPF, **excluded from the workspace**, own `Cargo.lock`. Edition 2024, `a
 
 ```bash
 cd crates/honk-ebpf
-cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
+cargo build --release -Zbuild-std=core --target bpfel-unknown-none
 ```
 
-`.cargo/config.toml` resolves `bpf-linker` from `PATH`. CI tracks the latest nightly toolchain and pins the prebuilt `bpf-linker` 0.11.0 release.
+`.cargo/config.toml` resolves `bpf-linker` from `PATH`. The root `rust-toolchain.toml` pins the host compiler; `crates/honk-ebpf/rust-toolchain.toml` pins the eBPF compiler and components for local builds and CI. CI pins the prebuilt `bpf-linker` 0.11.0 release.
 
 
