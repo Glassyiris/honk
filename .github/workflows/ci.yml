@@ -5,6 +5,17 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      ebpf:
+        description: Run the floor-kernel eBPF gate
+        type: boolean
+        default: true
+      full:
+        description: Run all lanes
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -17,7 +28,114 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      docs: ${{ steps.filter.outputs.docs }}
+      ebpf: ${{ steps.filter.outputs.ebpf }}
+      full: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+      ebpf_label: ${{ contains(github.event.pull_request.labels.*.name, 'ci:ebpf') }}
+    steps:
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        if: github.event_name == 'pull_request'
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'config.dae'
+              - 'config.min.dae'
+              - 'example.dae'
+              - 'ci/**'
+              - '.github/ci/**'
+              - '.github/workflows/**'
+              - 'Justfile'
+              - '.config/**'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+            docs:
+              - '*.md'
+              - '.agents/**'
+              - 'doc/**'
+            ebpf:
+              - 'crates/honk-ebpf*/**'
+              - 'crates/honk-core/src/ebpf/**'
+              - 'crates/honk-core/src/control/routing_matcher/**'
+              - 'crates/honk-core/src/control/routing_matcher.rs'
+              - 'crates/honk-core/build.rs'
+              - 'crates/honk-core/tests/**'
+              - 'crates/honk-nfqueue/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/ci/**'
+              - '.github/workflows/ci.yml'
+      - name: Record lane selection
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          FILTER_OUTPUTS: ${{ toJSON(steps.filter.outputs) }}
+          FILTER_OUTCOME: ${{ steps.filter.outcome }}
+          DISPATCH_INPUTS: ${{ toJSON(inputs) }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const filters = JSON.parse(process.env.FILTER_OUTPUTS);
+            const inputs = JSON.parse(process.env.DISPATCH_INPUTS);
+            const labels = (context.payload.pull_request?.labels ?? []).map(label => label.name);
+            const pr = context.eventName === "pull_request";
+            const push = context.eventName === "push";
+            const dispatch = context.eventName === "workflow_dispatch";
+            const failed = pr && process.env.FILTER_OUTCOME !== "success";
+            const full = labels.includes("ci:full");
+            const code = !pr || failed || filters.code === "true" || full;
+            const floor = push || (dispatch && (inputs.ebpf || inputs.full)) ||
+              (pr && (failed || filters.ebpf === "true" || labels.includes("ci:ebpf") || full));
+            const docs = !pr || failed || filters.code === "true" || filters.docs === "true" || full;
+            const lanes = ["changes"];
+            if (code) lanes.push("lint", "test", "ebpf-check");
+            if (floor) lanes.push("ebpf");
+            const heavy = push || (dispatch && inputs.full) || (pr && (failed || full));
+            if (heavy) lanes.push("ebpf-recent", "aarch64", "features", "cross-musl");
+            if (docs) lanes.push("docs");
+            if (pr) lanes.push("review-bot");
+            fs.mkdirSync("target/ci-report", { recursive: true });
+            fs.writeFileSync("target/ci-report/selection.json", JSON.stringify({
+              event: context.eventName, inputs, labels,
+              filters: { code: filters.code ?? null, docs: filters.docs ?? null, ebpf: filters.ebpf ?? null },
+              filter_outcome: process.env.FILTER_OUTCOME,
+              intended_lanes: lanes, run_id: context.runId, run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT),
+            }, null, 2) + "\n");
+      - name: Upload lane selection
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-selection
+          path: target/ci-report/selection.json
+          retention-days: 30
+          if-no-files-found: error
+
+  docs:
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.code == 'true' || needs.changes.outputs.docs == 'true' || needs.changes.outputs.full == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: --offline --include-fragments --hidden '*.md' '.agents/**/*.md' 'doc/**/*.md'
+          fail: true
+
   lint:
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.code == 'true' || needs.changes.outputs.full == 'true') }}
     name: fmt + clippy
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -31,11 +149,13 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.stable }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
         run: |
+          set -euo pipefail
           # The runner image ships Chrome and Microsoft apt sources; a Hash Sum mismatch
           # at either fails apt-get update, and the jobs install nothing from them.
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
@@ -43,8 +163,49 @@ jobs:
           sudo apt-get install -y cmake libclang-dev
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all --all-targets -- -D warnings
+      - name: Write lint CI report
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.stable }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const cp = require("node:child_process");
+            fs.mkdirSync("target/ci-report", {recursive: true});
+            let rustc = null;
+            try { rustc = cp.execFileSync("rustc", ["-V"], {encoding: "utf8"}).trim(); } catch {}
+            const cache = process.env.CACHE_HIT === "true" ? true :
+              process.env.CACHE_HIT === "false" ? false : null;
+            const values = {};
+            const units = {};
+            if (rustc) {
+              units.toolchain = "rustc-cache";
+              values.toolchain = {value: {rustc, cache_hit: cache}, unit: "rustc-cache", available: true};
+            }
+            const status = process.env.JOB_STATUS;
+            fs.writeFileSync("target/ci-report/lint.json", JSON.stringify({
+              schema_version: 1, run_id: context.runId,
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "lint",
+              matrix: {target: "x86_64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN},
+              measured_sha: process.env.MEASURED_SHA, baseline_sha: null, units, values, signals: [],
+              failure: status === "success" ? null : {summary: `lint lane ${status}`, detail_lines: []},
+            }, null, 2) + "\n");
+      - name: Upload lint CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-lint
+          path: target/ci-report/lint.json
+          retention-days: 30
+          if-no-files-found: error
 
   test:
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.code == 'true' || needs.changes.outputs.full == 'true') }}
     name: cargo nextest (workspace)
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -57,6 +218,7 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.stable }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
@@ -65,6 +227,7 @@ jobs:
           tool: nextest
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
         run: |
+          set -euo pipefail
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
           sudo apt-get update
           sudo apt-get install -y cmake libclang-dev
@@ -74,6 +237,7 @@ jobs:
       - name: Read geo cache key
         id: geo-pins
         run: |
+          set -euo pipefail
           source .github/ci/pins.env
           echo "key=$GEOSITE_SHA256-$GEOIP_SHA256" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -82,6 +246,7 @@ jobs:
           key: geo-${{ steps.geo-pins.outputs.key }}
       - name: Install geo assets for the geosite tests
         run: |
+          set -euo pipefail
           source .github/ci/pins.env
           geo_dir="$RUNNER_TEMP/geo-assets"
           mkdir -p "$geo_dir"
@@ -97,15 +262,149 @@ jobs:
           echo "$GEOIP_SHA256  $geo_dir/geoip.dat" | sha256sum -c -
           sudo install -D -m 0644 "$geo_dir/geosite.dat" /etc/dae/geosite.dat
           sudo install -D -m 0644 "$geo_dir/geoip.dat" /etc/dae/geoip.dat
+      - name: List workspace tests
+        run: |
+          set -euo pipefail
+          mkdir -p target/ci-report
+          cargo nextest list --workspace --profile ci --message-format json \
+            > target/ci-report/nextest-list.json
       - run: cargo nextest run --workspace --profile ci
+      - name: Run DNS smoke
+        env:
+          HONK_SMOKE_REPORT: target/ci-report/dns-smoke.json
+        run: |
+          set -euo pipefail
+          python3 ci/dns-smoke.py
       - name: Upload workspace JUnit
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: workspace-junit
           path: target/nextest/ci/junit.xml
+      - name: Write test CI report
+        if: always()
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.stable }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          values = {}
+          units = {}
+
+          def unavailable(name, unit, reason):
+              units[name] = unit
+              values[name] = {"value": None, "unit": unit, "available": False, "reason": reason}
+
+          try:
+              listing = json.loads(Path("target/ci-report/nextest-list.json").read_text())
+              names = []
+              ignored = 0
+              for suite in listing.get("rust-suites", {}).values():
+                  for name, case in suite.get("testcases", {}).items():
+                      names.append(name)
+                      ignored += int(case.get("ignored") is True)
+              units["test_inventory"] = "test-names"
+              values["test_inventory"] = {
+                  "value": {"total": len(names), "names": names},
+                  "unit": "test-names", "available": True,
+              }
+              units["ignored_tests"] = "tests"
+              values["ignored_tests"] = {"value": ignored, "unit": "tests", "available": True}
+          except (OSError, TypeError, ValueError):
+              unavailable("test_inventory", "test-names", "nextest list is unavailable")
+              unavailable("ignored_tests", "tests", "nextest list is unavailable")
+
+          try:
+              cases = list(ET.parse("target/nextest/ci/junit.xml").iter("testcase"))
+              slowest = max(cases, key=lambda case: float(case.get("time", "0")))
+              name = slowest.get("name", "unknown")
+              class_name = slowest.get("classname")
+              if class_name and not name.startswith(class_name):
+                  name = f"{class_name}::{name}"
+              units["slowest_test"] = "seconds"
+              values["slowest_test"] = {
+                  "value": {"name": name, "seconds": float(slowest.get("time", "0"))},
+                  "unit": "seconds", "available": True,
+              }
+          except (OSError, TypeError, ValueError, ET.ParseError):
+              unavailable("slowest_test", "seconds", "nextest JUnit is unavailable")
+
+          try:
+              smoke = json.loads(Path("target/ci-report/dns-smoke.json").read_text())
+              units["dns_smoke"] = "queries-and-names"
+              values["dns_smoke"] = {
+                  "value": {"queries": smoke["queries"], "upstream_names": smoke["upstream_names"]},
+                  "unit": "queries-and-names", "available": True,
+              }
+              units["smoke_memory"] = "MiB"
+              values["smoke_memory"] = {
+                  "value": smoke["vmhwm_kib"] / 1024, "unit": "MiB", "available": True,
+              }
+              units["smoke_cpu"] = "seconds"
+              values["smoke_cpu"] = {
+                  "value": smoke["cpu_seconds"], "unit": "seconds", "available": True,
+              }
+          except (KeyError, OSError, TypeError, ValueError):
+              unavailable("dns_smoke", "queries-and-names", "DNS smoke report is unavailable")
+              unavailable("smoke_memory", "MiB", "DNS smoke report is unavailable")
+              unavailable("smoke_cpu", "seconds", "DNS smoke report is unavailable")
+
+          try:
+              rustc = subprocess.run(
+                  ["rustc", "-V"], check=True, capture_output=True, text=True,
+              ).stdout.strip()
+              raw_cache = os.environ.get("CACHE_HIT")
+              cache_hit = True if raw_cache == "true" else False if raw_cache == "false" else None
+              units["toolchain"] = "rustc-cache"
+              values["toolchain"] = {
+                  "value": {"rustc": rustc, "cache_hit": cache_hit},
+                  "unit": "rustc-cache", "available": True,
+              }
+          except (OSError, subprocess.CalledProcessError):
+              unavailable("toolchain", "rustc-cache", "rustc is unavailable")
+
+          status = os.environ["JOB_STATUS"]
+          report = {
+              "schema_version": 1,
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "lane": "test",
+              "matrix": {
+                  "target": "x86_64-unknown-linux-gnu",
+                  "toolchain": os.environ["TOOLCHAIN"],
+              },
+              "measured_sha": os.environ["MEASURED_SHA"],
+              "baseline_sha": None,
+              "units": units,
+              "values": values,
+              "signals": [],
+              "failure": None if status == "success" else {
+                  "summary": f"test lane {status}", "detail_lines": [],
+              },
+          }
+          Path("target/ci-report/test.json").write_text(json.dumps(report, indent=2) + "\n")
+          PY
+      - name: Upload test CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-test
+          path: target/ci-report/test.json
+          retention-days: 30
+          if-no-files-found: error
 
   ebpf:
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.ebpf || inputs.full)) || (github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.ebpf == 'true' || needs.changes.outputs.ebpf_label == 'true' || needs.changes.outputs.full == 'true'))) }}
     name: eBPF object + real VM kernel tests
     # These tests attach TC/cgroup programs and therefore cannot run in a job container.
     runs-on: ubuntu-24.04
@@ -115,6 +414,7 @@ jobs:
       - name: Read Rust toolchains
         id: toolchain
         run: |
+          set -euo pipefail
           echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
           echo "ebpf=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
@@ -125,6 +425,7 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.ebpf }}
           components: rust-src, llvm-tools
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
@@ -134,6 +435,7 @@ jobs:
           cache-directories: target/honk-ebpf-routing-test
       - name: Install build and VM dependencies
         run: |
+          set -euo pipefail
           echo 'debconf debconf/frontend select Noninteractive' | sudo debconf-set-selections
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
           sudo apt-get update
@@ -143,6 +445,7 @@ jobs:
             python3-requests python3-venv qemu-kvm rsync udev util-linux virtiofsd zstd
       - name: Configure KVM
         run: |
+          set -euo pipefail
           if test -e /dev/kvm; then
             echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | \
               sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -158,6 +461,7 @@ jobs:
           echo "HONK_CI_VNG_DISABLE_KVM=1" >> "$GITHUB_ENV"
       - name: Install pinned virtme-ng
         run: |
+          set -euo pipefail
           source .github/ci/pins.env
           wheel="$RUNNER_TEMP/${VIRTME_NG_WHEEL_URL##*/}"
           curl -fsSL --retry 3 --retry-all-errors -o "$wheel" "$VIRTME_NG_WHEEL_URL"
@@ -168,6 +472,7 @@ jobs:
           echo "$RUNNER_TEMP/virtme-ng/bin" >> "$GITHUB_PATH"
       - name: Install pinned bpf-linker
         run: |
+          set -euo pipefail
           source .github/ci/pins.env
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
             "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
@@ -177,6 +482,7 @@ jobs:
       - name: Read download cache keys
         id: pins
         run: |
+          set -euo pipefail
           source .github/ci/pins.env
           echo "geo=$GEOSITE_SHA256-$GEOIP_SHA256" >> "$GITHUB_OUTPUT"
           echo "kernel=$KERNEL_FLOOR_IMAGE_SHA256-$KERNEL_FLOOR_MODULES_SHA256" >> "$GITHUB_OUTPUT"
@@ -186,6 +492,7 @@ jobs:
           key: geo-${{ steps.pins.outputs.geo }}
       - name: Install geo assets for eBPF-feature unit tests
         run: |
+          set -euo pipefail
           source .github/ci/pins.env
           geo_dir="$RUNNER_TEMP/geo-assets"
           mkdir -p "$geo_dir"
@@ -203,10 +510,12 @@ jobs:
           sudo install -D -m 0644 "$geo_dir/geoip.dat" /etc/dae/geoip.dat
       - name: Build eBPF object
         run: |
+          set -euo pipefail
           cd crates/honk-ebpf
           cargo build --release -Zbuild-std=core --target bpfel-unknown-none
       - name: Build routing-test eBPF object separately
         run: |
+          set -euo pipefail
           cd crates/honk-ebpf
           CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/honk-ebpf-routing-test" \
             cargo build --release --features routing-test \
@@ -215,6 +524,7 @@ jobs:
       # here instead of at runtime on a gateway.
       - name: Verify eBPF objects have BTF
         run: |
+          set -euo pipefail
           readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
           readelf -S target/honk-ebpf-routing-test/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
       - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
@@ -244,6 +554,716 @@ jobs:
         with:
           name: vm-tests-floor
           path: target/vm-tests/floor
+      - name: Write floor-VM CI report
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.stable }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const cp = require("node:child_process");
+            fs.mkdirSync("target/ci-report", {recursive: true});
+            const values = {};
+            const units = {};
+            try {
+              const rustc = cp.execFileSync("rustc", ["-V"], {encoding: "utf8"}).trim();
+              const raw = process.env.CACHE_HIT;
+              const cache = raw === "true" ? true : raw === "false" ? false : null;
+              units.toolchain = "rustc-cache";
+              values.toolchain = {value: {rustc, cache_hit: cache}, unit: "rustc-cache", available: true};
+            } catch {}
+            try {
+              const summary = fs.readFileSync("target/vm-tests/floor/summary.md", "utf8");
+              const kernel = summary.match(/^Guest uname -r: (.+)$/m)?.[1];
+              if (kernel) {
+                units.vm_environment = "kernel-accelerator";
+                values.vm_environment = {
+                  value: {kernel, accelerator: process.env.HONK_CI_VNG_DISABLE_KVM === "1" ? "TCG" : "KVM"},
+                  unit: "kernel-accelerator", available: true,
+                };
+              }
+            } catch {}
+            const status = process.env.JOB_STATUS;
+            fs.writeFileSync("target/ci-report/ebpf.json", JSON.stringify({
+              schema_version: 1, run_id: context.runId,
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "ebpf",
+              matrix: {target: "x86_64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN, kernel: "floor"},
+              measured_sha: process.env.MEASURED_SHA, baseline_sha: null, units, values, signals: [],
+              failure: status === "success" ? null : {summary: `ebpf lane ${status}`, detail_lines: []},
+            }, null, 2) + "\n");
+      - name: Upload floor-VM CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-ebpf
+          path: target/ci-report/ebpf.json
+          retention-days: 30
+          if-no-files-found: error
+
+  ebpf-check:
+    name: eBPF feature compile guard
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.code == 'true' || needs.changes.outputs.full == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read Rust toolchains
+        id: toolchain
+        run: |
+          set -euo pipefail
+          echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "ebpf=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.ebpf }}
+          components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: rust-cache
+        with:
+          key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
+          workspaces: |
+            . -> target
+            crates/honk-ebpf -> target
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev clang llvm zstd
+      - name: Read bpf-linker cache key
+        id: linker-pin
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          echo "sha256=$BPF_LINKER_SHA256" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/bpf-linker
+          key: bpf-linker-${{ github.job }}-${{ steps.linker-pin.outputs.sha256 }}
+      - name: Install pinned bpf-linker
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          archive="$RUNNER_TEMP/bpf-linker/bpf-linker.tar.zst"
+          mkdir -p "$(dirname "$archive")"
+          if ! test -f "$archive"; then
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          fi
+          echo "$BPF_LINKER_SHA256  $archive" | sha256sum -c -
+          zstd -dc "$archive" | tar -xf - -C "$CARGO_HOME/bin"
+          bpf-linker --version
+      - run: cargo check -p honk-core --features ebpf --tests
+      - name: Write eBPF compile-guard CI report
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.stable }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const cp = require("node:child_process");
+            fs.mkdirSync("target/ci-report", {recursive: true});
+            const values = {};
+            const units = {};
+            try {
+              const rustc = cp.execFileSync("rustc", ["-V"], {encoding: "utf8"}).trim();
+              const raw = process.env.CACHE_HIT;
+              const cache = raw === "true" ? true : raw === "false" ? false : null;
+              units.toolchain = "rustc-cache";
+              values.toolchain = {value: {rustc, cache_hit: cache}, unit: "rustc-cache", available: true};
+            } catch {}
+            const status = process.env.JOB_STATUS;
+            fs.writeFileSync("target/ci-report/ebpf-check.json", JSON.stringify({
+              schema_version: 1, run_id: context.runId,
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "ebpf-check",
+              matrix: {target: "x86_64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN, features: "ebpf-tests"},
+              measured_sha: process.env.MEASURED_SHA, baseline_sha: null, units, values, signals: [],
+              failure: status === "success" ? null : {summary: `ebpf-check lane ${status}`, detail_lines: []},
+            }, null, 2) + "\n");
+      - name: Upload eBPF compile-guard CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-ebpf-check
+          path: target/ci-report/ebpf-check.json
+          retention-days: 30
+          if-no-files-found: error
+
+  ebpf-recent:
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.full) || (github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.full == 'true'))) }}
+    name: eBPF real VM tests (recent kernel)
+    # These tests attach TC/cgroup programs and therefore cannot run in a job container.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read Rust toolchains
+        id: toolchain
+        run: |
+          set -euo pipefail
+          echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "ebpf=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.ebpf }}
+          components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: rust-cache
+        with:
+          key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          workspaces: |
+            . -> target
+            crates/honk-ebpf -> target
+          cache-directories: target/honk-ebpf-routing-test
+      - name: Install build and VM dependencies
+        run: |
+          set -euo pipefail
+          echo 'debconf debconf/frontend select Noninteractive' | sudo debconf-set-selections
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            busybox-static clang cmake coreutils file iproute2 iptables jq kbd kmod \
+            libbpf-dev libclang-dev libvirt-clients llvm pkg-config python3-argcomplete \
+            python3-requests python3-venv qemu-kvm rsync udev util-linux virtiofsd zstd
+      - name: Configure KVM
+        run: |
+          set -euo pipefail
+          if test -e /dev/kvm; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | \
+              sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm || true
+            sudo chmod 666 /dev/kvm || true
+            if test -r /dev/kvm -a -w /dev/kvm; then
+              echo "HONK_CI_VNG_DISABLE_KVM=0" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          fi
+          echo "KVM unavailable on this runner; using virtme-ng software emulation"
+          echo "HONK_CI_VNG_DISABLE_KVM=1" >> "$GITHUB_ENV"
+      - name: Install pinned virtme-ng
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          wheel="$RUNNER_TEMP/${VIRTME_NG_WHEEL_URL##*/}"
+          curl -fsSL --retry 3 --retry-all-errors -o "$wheel" "$VIRTME_NG_WHEEL_URL"
+          echo "$VIRTME_NG_SHA256  $wheel" | sha256sum -c -
+          /usr/bin/python3 -m venv --system-site-packages "$RUNNER_TEMP/virtme-ng"
+          "$RUNNER_TEMP/virtme-ng/bin/pip" --disable-pip-version-check install --no-deps \
+            "$wheel"
+          echo "$RUNNER_TEMP/virtme-ng/bin" >> "$GITHUB_PATH"
+      - name: Read bpf-linker cache key
+        id: linker-pin
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          echo "sha256=$BPF_LINKER_SHA256" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/bpf-linker
+          key: bpf-linker-${{ github.job }}-${{ steps.linker-pin.outputs.sha256 }}
+      - name: Install pinned bpf-linker
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          archive="$RUNNER_TEMP/bpf-linker/bpf-linker.tar.zst"
+          mkdir -p "$(dirname "$archive")"
+          if ! test -f "$archive"; then
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          fi
+          echo "$BPF_LINKER_SHA256  $archive" | sha256sum -c -
+          zstd -dc "$archive" | tar -xf - -C "$CARGO_HOME/bin"
+          bpf-linker --version
+      - name: Read download cache keys
+        id: pins
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          echo "geo=$GEOSITE_SHA256-$GEOIP_SHA256" >> "$GITHUB_OUTPUT"
+          echo "kernel=$KERNEL_RECENT_IMAGE_SHA256-$KERNEL_RECENT_MODULES_SHA256" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/geo-assets
+          key: geo-${{ steps.pins.outputs.geo }}
+      - name: Install geo assets for eBPF-feature unit tests
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          geo_dir="$RUNNER_TEMP/geo-assets"
+          mkdir -p "$geo_dir"
+          if ! test -f "$geo_dir/geosite.dat"; then
+            curl -fsSL --retry 3 -o "$geo_dir/geosite.dat" \
+              "https://github.com/v2fly/domain-list-community/releases/download/$GEOSITE_TAG/dlc.dat"
+          fi
+          if ! test -f "$geo_dir/geoip.dat"; then
+            curl -fsSL --retry 3 -o "$geo_dir/geoip.dat" \
+              "https://github.com/v2fly/geoip/releases/download/$GEOIP_TAG/geoip.dat"
+          fi
+          echo "$GEOSITE_SHA256  $geo_dir/geosite.dat" | sha256sum -c -
+          echo "$GEOIP_SHA256  $geo_dir/geoip.dat" | sha256sum -c -
+          sudo install -D -m 0644 "$geo_dir/geosite.dat" /etc/dae/geosite.dat
+          sudo install -D -m 0644 "$geo_dir/geoip.dat" /etc/dae/geoip.dat
+      - name: Build eBPF object
+        run: |
+          set -euo pipefail
+          cd crates/honk-ebpf
+          cargo build --release -Zbuild-std=core --target bpfel-unknown-none
+      - name: Build routing-test eBPF object separately
+        run: |
+          set -euo pipefail
+          cd crates/honk-ebpf
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/honk-ebpf-routing-test" \
+            cargo build --release --features routing-test \
+              -Zbuild-std=core --target bpfel-unknown-none
+      # aya refuses objects without BTF ("no BTF parsed for object") — fail
+      # here instead of at runtime on a gateway.
+      - name: Verify eBPF objects have BTF
+        run: |
+          set -euo pipefail
+          readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
+          readelf -S target/honk-ebpf-routing-test/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        with:
+          tool: nextest
+      - name: Run eBPF-feature unit tests
+        env:
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: cargo nextest run -p honk-core --features ebpf --lib --profile ci
+      - name: Upload eBPF unit-test JUnit
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ebpf-recent-unit-junit
+          path: target/nextest/ci/junit.xml
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/kernel-recent/*.deb
+          key: kernel-recent-${{ steps.pins.outputs.kernel }}
+      - name: Run all real-kernel gates on the recent kernel
+        env:
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: .github/ci/run-vm-gate.sh recent
+      - name: Upload guest output
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vm-tests-recent
+          path: target/vm-tests/recent
+      - name: Write recent-VM CI report
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.stable }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const cp = require("node:child_process");
+            fs.mkdirSync("target/ci-report", {recursive: true});
+            const values = {};
+            const units = {};
+            try {
+              const rustc = cp.execFileSync("rustc", ["-V"], {encoding: "utf8"}).trim();
+              const raw = process.env.CACHE_HIT;
+              const cache = raw === "true" ? true : raw === "false" ? false : null;
+              units.toolchain = "rustc-cache";
+              values.toolchain = {value: {rustc, cache_hit: cache}, unit: "rustc-cache", available: true};
+            } catch {}
+            try {
+              const summary = fs.readFileSync("target/vm-tests/recent/summary.md", "utf8");
+              const kernel = summary.match(/^Guest uname -r: (.+)$/m)?.[1];
+              if (kernel) {
+                units.vm_environment = "kernel-accelerator";
+                values.vm_environment = {
+                  value: {kernel, accelerator: process.env.HONK_CI_VNG_DISABLE_KVM === "1" ? "TCG" : "KVM"},
+                  unit: "kernel-accelerator", available: true,
+                };
+              }
+            } catch {}
+            const status = process.env.JOB_STATUS;
+            fs.writeFileSync("target/ci-report/ebpf-recent.json", JSON.stringify({
+              schema_version: 1, run_id: context.runId,
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "ebpf-recent",
+              matrix: {target: "x86_64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN, kernel: "recent"},
+              measured_sha: process.env.MEASURED_SHA, baseline_sha: null, units, values, signals: [],
+              failure: status === "success" ? null : {summary: `ebpf-recent lane ${status}`, detail_lines: []},
+            }, null, 2) + "\n");
+      - name: Upload recent-VM CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-ebpf-recent
+          path: target/ci-report/ebpf-recent.json
+          retention-days: 30
+          if-no-files-found: error
+
+  aarch64:
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.full) || (github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.full == 'true'))) }}
+    name: cargo nextest (aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read Rust toolchain
+        id: toolchain
+        run: echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: rust-cache
+        with:
+          key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        with:
+          tool: nextest
+      - name: Install boring-sys build deps (cmake + libclang for bindgen)
+        run: |
+          set -euo pipefail
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev
+
+      # routing::tests::test_geosite_* need geo assets (locally found at
+      # /etc/dae/geosite.dat; the runner has none).
+      - name: Read geo cache key
+        id: geo-pins
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          echo "key=$GEOSITE_SHA256-$GEOIP_SHA256" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/geo-assets
+          key: geo-${{ steps.geo-pins.outputs.key }}
+      - name: Install geo assets for the geosite tests
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          geo_dir="$RUNNER_TEMP/geo-assets"
+          mkdir -p "$geo_dir"
+          if ! test -f "$geo_dir/geosite.dat"; then
+            curl -fsSL --retry 3 -o "$geo_dir/geosite.dat" \
+              "https://github.com/v2fly/domain-list-community/releases/download/$GEOSITE_TAG/dlc.dat"
+          fi
+          if ! test -f "$geo_dir/geoip.dat"; then
+            curl -fsSL --retry 3 -o "$geo_dir/geoip.dat" \
+              "https://github.com/v2fly/geoip/releases/download/$GEOIP_TAG/geoip.dat"
+          fi
+          echo "$GEOSITE_SHA256  $geo_dir/geosite.dat" | sha256sum -c -
+          echo "$GEOIP_SHA256  $geo_dir/geoip.dat" | sha256sum -c -
+          sudo install -D -m 0644 "$geo_dir/geosite.dat" /etc/dae/geosite.dat
+          sudo install -D -m 0644 "$geo_dir/geoip.dat" /etc/dae/geoip.dat
+      - run: cargo nextest run --workspace --profile ci
+      - name: Upload workspace JUnit
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aarch64-junit
+          path: target/nextest/ci/junit.xml
+      - name: Write aarch64 CI report
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.stable }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const cp = require("node:child_process");
+            fs.mkdirSync("target/ci-report", {recursive: true});
+            const values = {};
+            const units = {};
+            try {
+              const rustc = cp.execFileSync("rustc", ["-V"], {encoding: "utf8"}).trim();
+              const raw = process.env.CACHE_HIT;
+              const cache = raw === "true" ? true : raw === "false" ? false : null;
+              units.toolchain = "rustc-cache";
+              values.toolchain = {value: {rustc, cache_hit: cache}, unit: "rustc-cache", available: true};
+            } catch {}
+            const status = process.env.JOB_STATUS;
+            fs.writeFileSync("target/ci-report/aarch64.json", JSON.stringify({
+              schema_version: 1, run_id: context.runId,
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "aarch64",
+              matrix: {target: "aarch64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN},
+              measured_sha: process.env.MEASURED_SHA, baseline_sha: null, units, values, signals: [],
+              failure: status === "success" ? null : {summary: `aarch64 lane ${status}`, detail_lines: []},
+            }, null, 2) + "\n");
+      - name: Upload aarch64 CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-aarch64
+          path: target/ci-report/aarch64.json
+          retention-days: 30
+          if-no-files-found: error
+
+  features:
+    name: Independent feature sets
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.full) || (github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.full == 'true'))) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read Rust toolchains
+        id: toolchain
+        run: |
+          set -euo pipefail
+          echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "ebpf=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.ebpf }}
+          components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: rust-cache
+        with:
+          key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
+          workspaces: |
+            . -> target
+            crates/honk-ebpf -> target
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev clang llvm zstd
+      - name: Read bpf-linker cache key
+        id: linker-pin
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          echo "sha256=$BPF_LINKER_SHA256" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/bpf-linker
+          key: bpf-linker-${{ github.job }}-${{ steps.linker-pin.outputs.sha256 }}
+      - name: Install pinned bpf-linker
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          archive="$RUNNER_TEMP/bpf-linker/bpf-linker.tar.zst"
+          mkdir -p "$(dirname "$archive")"
+          if ! test -f "$archive"; then
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          fi
+          echo "$BPF_LINKER_SHA256  $archive" | sha256sum -c -
+          zstd -dc "$archive" | tar -xf - -C "$CARGO_HOME/bin"
+          bpf-linker --version
+      - name: Prepare eBPF object
+        working-directory: crates/honk-ebpf
+        env:
+          EBPF_TOOLCHAIN: ${{ steps.toolchain.outputs.ebpf }}
+        run: |
+          set -euo pipefail
+          cargo build --release -Zbuild-std=core --target bpfel-unknown-none
+          readelf -S target/bpfel-unknown-none/release/honk-ebpf | grep '\.BTF'
+          # build.rs requires the compiler identity as well as source freshness.
+          printf '%s' "$EBPF_TOOLCHAIN" > target/bpfel-unknown-none/release/honk-ebpf.toolchain
+      - run: cargo check -p honk-core --no-default-features
+      - run: cargo check -p honk-core --no-default-features --features clash-api
+      - run: cargo check -p honk-core --no-default-features --features ebpf
+      - run: cargo check -p honk-tool
+      - name: Write feature-set CI report
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.stable }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const cp = require("node:child_process");
+            fs.mkdirSync("target/ci-report", {recursive: true});
+            const values = {};
+            const units = {};
+            try {
+              const rustc = cp.execFileSync("rustc", ["-V"], {encoding: "utf8"}).trim();
+              const raw = process.env.CACHE_HIT;
+              const cache = raw === "true" ? true : raw === "false" ? false : null;
+              units.toolchain = "rustc-cache";
+              values.toolchain = {value: {rustc, cache_hit: cache}, unit: "rustc-cache", available: true};
+            } catch {}
+            const status = process.env.JOB_STATUS;
+            fs.writeFileSync("target/ci-report/features.json", JSON.stringify({
+              schema_version: 1, run_id: context.runId,
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "features",
+              matrix: {target: "x86_64-unknown-linux-gnu", toolchain: process.env.TOOLCHAIN, features: "independent"},
+              measured_sha: process.env.MEASURED_SHA, baseline_sha: null, units, values, signals: [],
+              failure: status === "success" ? null : {summary: `features lane ${status}`, detail_lines: []},
+            }, null, 2) + "\n");
+      - name: Upload feature-set CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-features
+          path: target/ci-report/features.json
+          retention-days: 30
+          if-no-files-found: error
+
+  cross-musl:
+    name: x86_64 musl release path
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.full) || (github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.full == 'true'))) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read Rust toolchains
+        id: toolchain
+        run: |
+          set -euo pipefail
+          echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "ebpf=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+          target: x86_64-unknown-linux-musl
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.ebpf }}
+          components: rust-src, llvm-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: rust-cache
+        with:
+          key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}-${{ steps.toolchain.outputs.ebpf }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
+          workspaces: |
+            . -> target
+            crates/honk-ebpf -> target
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev clang llvm zstd
+      - name: Read bpf-linker cache key
+        id: linker-pin
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          echo "sha256=$BPF_LINKER_SHA256" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/bpf-linker
+          key: bpf-linker-${{ github.job }}-${{ steps.linker-pin.outputs.sha256 }}
+      - name: Install pinned bpf-linker
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          archive="$RUNNER_TEMP/bpf-linker/bpf-linker.tar.zst"
+          mkdir -p "$(dirname "$archive")"
+          if ! test -f "$archive"; then
+            curl -fsSL --retry 3 -o "$archive" \
+              "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          fi
+          echo "$BPF_LINKER_SHA256  $archive" | sha256sum -c -
+          zstd -dc "$archive" | tar -xf - -C "$CARGO_HOME/bin"
+          bpf-linker --version
+      - name: Prepare eBPF object
+        working-directory: crates/honk-ebpf
+        env:
+          EBPF_TOOLCHAIN: ${{ steps.toolchain.outputs.ebpf }}
+        run: |
+          set -euo pipefail
+          cargo build --release -Zbuild-std=core --target bpfel-unknown-none
+          readelf -S target/bpfel-unknown-none/release/honk-ebpf | grep '\.BTF'
+          # build.rs requires the compiler identity as well as source freshness.
+          printf '%s' "$EBPF_TOOLCHAIN" > target/bpfel-unknown-none/release/honk-ebpf.toolchain
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.14.1
+      - name: Build core and toolbox through the release wrappers
+        run: |
+          set -euo pipefail
+          export ZIGCC_TARGET=x86_64-linux-musl
+          export CC_x86_64_unknown_linux_musl="$PWD/ci/zigcc"
+          export CXX_x86_64_unknown_linux_musl="$PWD/ci/zigcxx"
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$PWD/ci/zigcc"
+          # Zig supplies the CRT; Rust's self-contained CRT would duplicate _start.
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS='-C link-self-contained=no'
+          export BINDGEN_EXTRA_CLANG_ARGS="$(ci/zig-bindgen-env "$ZIGCC_TARGET")"
+          cargo build --release -p honk-core --no-default-features --features clash-api,ebpf,rprx,mimalloc --target x86_64-unknown-linux-musl
+          cargo build --release -p honk-tool --target x86_64-unknown-linux-musl
+      - name: Start the musl toolbox
+        working-directory: target/x86_64-unknown-linux-musl/release
+        run: ./honk-tool --version
+      - name: Write musl CI report
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.stable }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            const cp = require("node:child_process");
+            fs.mkdirSync("target/ci-report", {recursive: true});
+            const values = {};
+            const units = {};
+            try {
+              const rustc = cp.execFileSync("rustc", ["-V"], {encoding: "utf8"}).trim();
+              const raw = process.env.CACHE_HIT;
+              const cache = raw === "true" ? true : raw === "false" ? false : null;
+              units.toolchain = "rustc-cache";
+              values.toolchain = {value: {rustc, cache_hit: cache}, unit: "rustc-cache", available: true};
+            } catch {}
+            const status = process.env.JOB_STATUS;
+            fs.writeFileSync("target/ci-report/cross-musl.json", JSON.stringify({
+              schema_version: 1, run_id: context.runId,
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "cross-musl",
+              matrix: {target: "x86_64-unknown-linux-musl", toolchain: process.env.TOOLCHAIN},
+              measured_sha: process.env.MEASURED_SHA, baseline_sha: null, units, values, signals: [],
+              failure: status === "success" ? null : {summary: `cross-musl lane ${status}`, detail_lines: []},
+            }, null, 2) + "\n");
+      - name: Upload musl CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-cross-musl
+          path: target/ci-report/cross-musl.json
+          retention-days: 30
+          if-no-files-found: error
 
   review-bot:
     name: mechanical PR review
@@ -251,10 +1271,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      contents: read
-      pull-requests: write
+      pull-requests: read
     steps:
       - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        id: review
         with:
           script: |
             const pr = context.payload.pull_request;
@@ -274,6 +1294,7 @@ jobs:
 
             const warnings = [];
             const notes = [];
+            const signals = [];
 
             // AGENTS.md invariant: honk-ebpf-common layout changes must move
             // together with the eBPF program and the userspace map writers.
@@ -283,17 +1304,34 @@ jobs:
               !has("crates/honk-ebpf/") &&
               !has("crates/honk-core/src/ebpf/")
             ) {
-              warnings.push(
-                "`crates/honk-ebpf-common` changed without matching changes in `crates/honk-ebpf` or `crates/honk-core/src/ebpf` — shared kernel/userspace layouts must move together.",
-              );
+              const detail = "`crates/honk-ebpf-common` changed without matching changes in `crates/honk-ebpf` or `crates/honk-core/src/ebpf` — shared kernel/userspace layouts must move together.";
+              warnings.push(detail);
+              signals.push({kind: "shared_layout_changed", detail});
             }
             if (has(".github/workflows/")) {
-              notes.push("CI workflow files changed.");
+              const detail = "CI workflow files changed.";
+              notes.push(detail);
+              signals.push({kind: "workflow_changed", detail});
             }
             if (crates.size > 0 && !has("AGENTS.md") && !has(".agents/rules/")) {
-              notes.push(
-                "Code changed but neither `AGENTS.md` nor `.agents/rules/` was updated — check whether any documented behavior/convention changed.",
-              );
+              const detail = "Code changed but neither `AGENTS.md` nor `.agents/rules/` was updated — check whether any documented behavior/convention changed.";
+              notes.push(detail);
+              signals.push({kind: "rules_not_updated", detail});
+            }
+            const changedPaths = new Set(files.flatMap(f => [f.filename, f.previous_filename].filter(Boolean)));
+            const unpaired = [];
+            for (const path of changedPaths) {
+              const peer = path === "README.md" ? "README.zh.md" :
+                path === "README.zh.md" ? "README.md" :
+                path.startsWith("doc/en/") ? path.replace("doc/en/", "doc/zh/") :
+                path.startsWith("doc/zh/") ? path.replace("doc/zh/", "doc/en/") : null;
+              if (peer && !changedPaths.has(peer)) unpaired.push(path);
+            }
+            if (unpaired.length) {
+              const detail = "English/Chinese documentation changed without its paired page — check translation parity: " +
+                unpaired.map(path => `\`${path}\``).join(", ") + ".";
+              notes.push(detail);
+              signals.push({kind: "docs_language_mismatch", detail});
             }
 
             const additions = files.reduce((s, f) => s + f.additions, 0);
@@ -314,19 +1352,33 @@ jobs:
 
             const body = lines.join("\n");
             await core.summary.addRaw(body).write();
-
-            // A pull_request run from a fork gets a read-only token whatever
-            // `permissions:` asks for, so commenting there fails the job and
-            // hides the review that was just written to the step summary.
-            const head = pr.head.repo?.full_name;
-            if (head !== `${context.repo.owner}/${context.repo.repo}`) {
-              core.info("fork pull request: review written to the step summary");
-              return;
-            }
-
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: pr.number,
-              body,
-            });
+            core.setOutput("signals", JSON.stringify(signals));
+      - name: Write review CI report
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          REVIEW_SIGNALS: ${{ steps.review.outputs.signals }}
+        with:
+          script: |
+            const fs = require("node:fs");
+            fs.mkdirSync("target/ci-report", {recursive: true});
+            let signals = [];
+            try { signals = JSON.parse(process.env.REVIEW_SIGNALS || "[]"); } catch {}
+            const status = process.env.JOB_STATUS;
+            fs.writeFileSync("target/ci-report/review.json", JSON.stringify({
+              schema_version: 1, run_id: context.runId,
+              run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), lane: "review",
+              matrix: {}, measured_sha: process.env.MEASURED_SHA, baseline_sha: null,
+              units: {}, values: {}, signals,
+              failure: status === "success" ? null : {summary: `review lane ${status}`, detail_lines: []},
+            }, null, 2) + "\n");
+      - name: Upload review CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-review
+          path: target/ci-report/review.json
+          retention-days: 30
+          if-no-files-found: error
