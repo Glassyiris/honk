@@ -1,3 +1,4 @@
+use super::overall_dial_timeout;
 #[cfg(feature = "ebpf")]
 use super::routing::final_udp_rule_mark;
 use super::routing::{build_connection_info, connection_chains};
@@ -293,9 +294,13 @@ impl ControlPlaneHandle {
             return Ok(());
         }
 
-        let connect_timeout = {
+        let (connect_timeout, transport_deadline) = {
             let config = self.config.read().await;
-            std::time::Duration::from_millis(config.global.connect_timeout_ms)
+            let connect_timeout = Duration::from_millis(config.global.connect_timeout_ms);
+            (
+                connect_timeout,
+                tokio::time::Instant::now() + overall_dial_timeout(connect_timeout),
+            )
         };
 
         // Cold URLTest preparation owns no endpoint state: no lease binding,
@@ -399,8 +404,14 @@ impl ControlPlaneHandle {
                 Arc::new(move || stats.record_udp_stagger_cancellation())
             },
         };
-        let Some((node, (prepared_transport, score_reporter, selection_chain))) =
-            prepare_udp_plan(plan_mode, plan.nodes, prepare, callbacks).await
+        let Some((node, (prepared_transport, score_reporter, selection_chain))) = prepare_udp_plan(
+            plan_mode,
+            plan.nodes,
+            transport_deadline,
+            prepare,
+            callbacks,
+        )
+        .await
         else {
             debug!(
                 "All UDP transport preparations failed for '{}'",
@@ -439,14 +450,26 @@ impl ControlPlaneHandle {
         }
         // Promotion is explicit and still pre-publication: detached AnyTLS
         // sessions and QUIC clients become generation-owned only for the
-        // finalized winner.
-        let transport = match prepared_transport.commit().await {
-            Ok(transport) => transport,
-            Err(error) => {
+        // finalized winner. It shares the preparation deadline because QUIC
+        // promotion may wait for the generation runtime lock.
+        let transport = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(transport_deadline) => {
                 if let Some(reporter) = &score_reporter {
-                    reporter.finish(score_runtime_outcome(&runtime_generation, &error));
+                    reporter.finish(crate::group::ScoreOutcome::Timeout);
                 }
-                return Err(error);
+                return Err(anyhow::anyhow!(
+                    "UDP transport preparation exceeded its overall deadline"
+                ));
+            }
+            result = prepared_transport.commit() => match result {
+                Ok(transport) => transport,
+                Err(error) => {
+                    if let Some(reporter) = &score_reporter {
+                        reporter.finish(score_runtime_outcome(&runtime_generation, &error));
+                    }
+                    return Err(error);
+                }
             }
         };
         if let Some(reporter) = &score_reporter {

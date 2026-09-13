@@ -4,13 +4,6 @@
 //! detection. Foreign JSON and client records normalize through the Clash node
 //! builder; URI lists use [`Node::from_share_link`] from honk-config.
 
-use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::{ErrorKind, Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use anyhow::Context as _;
 use honk_config::diagnostic::{
     DetailedDiagnostic, DiagnosticSources, SafeValue, SettingPath, Severity, finish_attempt,
     report_detailed_diagnostics,
@@ -19,12 +12,15 @@ use honk_config::error::{DetailedConfigError, ErrorCategory};
 use honk_config::node::Node;
 use honk_config::subscription::Subscription;
 use honk_config::types::SubscriptionType;
-use sha2::{Digest as _, Sha256};
 
 mod clash;
 mod json;
 mod records;
+mod store;
 mod supervisor;
+
+pub use store::SubscriptionStore;
+pub(crate) use store::same_subscription_fetch_identity;
 
 pub(crate) use supervisor::{
     AuthorizedSubscription, SubscriptionAuthorizations, SubscriptionSupervisor,
@@ -344,203 +340,6 @@ fn effective_subscription_user_agent(sub: &Subscription) -> &str {
         .as_deref()
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_SUBSCRIPTION_USER_AGENT)
-}
-
-/// Durable raw subscription bodies keyed by their fetch identity.
-#[derive(Clone, Debug)]
-pub struct SubscriptionStore {
-    root: Arc<PathBuf>,
-}
-
-impl SubscriptionStore {
-    /// Open the subscription store below `global.data_dir`, retaining an
-    /// existing old data-directory or `./.sub` store during upgrades.
-    pub fn in_data_dir() -> anyhow::Result<Self> {
-        Self::open_with_legacy(
-            honk_config::paths::resolve_artifact_path(SUBSCRIPTION_STORE_DIR),
-            [
-                Path::new(honk_config::paths::LEGACY_DATA_DIR).join(SUBSCRIPTION_STORE_DIR),
-                PathBuf::from(SUBSCRIPTION_STORE_DIR),
-            ],
-        )
-    }
-
-    fn open_with_legacy(preferred: PathBuf, legacy_roots: [PathBuf; 2]) -> anyhow::Result<Self> {
-        if preferred.exists() {
-            return Self::open(preferred);
-        }
-        for root in legacy_roots {
-            if !root.exists() {
-                continue;
-            }
-            match Self::open(root.clone()) {
-                Ok(store) => {
-                    tracing::warn!(
-                        legacy = %root.display(),
-                        preferred = %preferred.display(),
-                        "using legacy subscription store; move it to the runtime data directory"
-                    );
-                    return Ok(store);
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        legacy = %root.display(),
-                        %error,
-                        "legacy subscription store is unusable; trying the next location"
-                    );
-                }
-            }
-        }
-        Self::open(preferred)
-    }
-
-    fn open(root: PathBuf) -> anyhow::Result<Self> {
-        ensure_store_directory(&root)?;
-        Ok(Self {
-            root: Arc::new(root),
-        })
-    }
-
-    pub fn root(&self) -> &Path {
-        self.root.as_path()
-    }
-
-    pub async fn load_nodes(&self, sub: &Subscription) -> anyhow::Result<Option<Vec<Node>>> {
-        let mut diagnostics = Vec::new();
-        let result = self
-            .load_nodes_with_diagnostics(sub, &mut diagnostics)
-            .await;
-        report_detailed_diagnostics(&diagnostics);
-        result
-    }
-
-    pub async fn load_nodes_with_diagnostics(
-        &self,
-        sub: &Subscription,
-        diagnostics: &mut Vec<DetailedDiagnostic>,
-    ) -> anyhow::Result<Option<Vec<Node>>> {
-        let path = self.path_for(sub);
-        let content = match tokio::task::spawn_blocking(move || read_store_file(&path)).await? {
-            Ok(content) => content,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        parse_subscription_content_with_diagnostics(sub, &content, diagnostics)
-            .map(Some)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))
-    }
-
-    async fn store_content(&self, sub: &Subscription, content: String) -> anyhow::Result<()> {
-        let root = Arc::clone(&self.root);
-        let destination = self.path_for(sub);
-        tokio::task::spawn_blocking(move || {
-            write_store_file(&root, &destination, content.as_bytes())
-        })
-        .await??;
-        Ok(())
-    }
-
-    fn path_for(&self, sub: &Subscription) -> PathBuf {
-        self.root.join(subscription_filename(sub))
-    }
-}
-
-fn subscription_cache_user_agent(sub: &Subscription) -> &str {
-    // The request UA may change with the binary; the cache identity must not.
-    sub.user_agent.as_deref().unwrap_or_default()
-}
-
-/// Full fetch identity, matching the cache filename key: URL plus configured
-/// UA plus headers. URL-only reload matching can swap identities between
-/// same-URL subscriptions with different fetch options.
-pub(crate) fn same_subscription_fetch_identity(a: &Subscription, b: &Subscription) -> bool {
-    a.url == b.url
-        && subscription_cache_user_agent(a) == subscription_cache_user_agent(b)
-        && a.headers == b.headers
-}
-
-fn subscription_filename(sub: &Subscription) -> String {
-    fn add_part(hasher: &mut Sha256, value: &[u8]) {
-        hasher.update((value.len() as u64).to_be_bytes());
-        hasher.update(value);
-    }
-
-    let mut hasher = Sha256::new();
-    add_part(&mut hasher, sub.url.as_bytes());
-    add_part(&mut hasher, subscription_cache_user_agent(sub).as_bytes());
-    for header in &sub.headers {
-        add_part(&mut hasher, header.key.as_bytes());
-        add_part(&mut hasher, header.value.as_bytes());
-    }
-    use base64::Engine as _;
-    format!(
-        "{}.sub",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
-    )
-}
-
-fn ensure_store_directory(root: &Path) -> anyhow::Result<()> {
-    match fs::symlink_metadata(root) {
-        Ok(metadata) => {
-            anyhow::ensure!(
-                metadata.is_dir() && !metadata.file_type().is_symlink(),
-                "subscription store is not a directory: {}",
-                root.display()
-            );
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            let mut builder = DirBuilder::new();
-            builder.recursive(true).mode(0o700).create(root)?;
-        }
-        Err(error) => return Err(error.into()),
-    }
-    fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-fn read_store_file(path: &Path) -> std::io::Result<String> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::other(
-            "subscription cache is not a regular file",
-        ));
-    }
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
-    Ok(content)
-}
-
-fn write_store_file(root: &Path, destination: &Path, content: &[u8]) -> anyhow::Result<()> {
-    ensure_store_directory(root)?;
-    let destination_name = destination
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("invalid subscription cache filename")?;
-    let temporary = root.join(format!(
-        ".{destination_name}.{}.{}.tmp",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-
-    let result = (|| -> anyhow::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        file.write_all(content)?;
-        file.sync_all()?;
-        fs::rename(&temporary, destination)?;
-        File::open(root)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
 }
 
 /// `Response::text` buffers the whole body before anything can check its size.
@@ -995,3 +794,6 @@ fn parse_clash_subscription(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod store_tests;

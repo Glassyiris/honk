@@ -8,6 +8,11 @@ pub(in crate::control) fn score_runtime_outcome(
         crate::group::ScoreOutcome::from_error(error)
     }
 }
+fn overall_dial_timeout(connect_timeout: std::time::Duration) -> std::time::Duration {
+    connect_timeout
+        .saturating_mul(4)
+        .max(std::time::Duration::from_secs(10))
+}
 
 pub(in crate::control) fn report_dial_failure_if_current(
     generation: &honk_outbound::runtime::OutboundRuntimeRegistry,

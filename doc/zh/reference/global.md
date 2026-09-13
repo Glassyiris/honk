@@ -44,7 +44,7 @@
 | `max_concurrent_dials` | `max_concurrent_dials` | `64` | 物理代理连接和协议握手的 generation 局部请求上限；运行时资源预算可能进一步收紧。 |
 | —（dae 语法中不可配置） | `tproxy_mark` | `0x08000000` | 用户态策略路由与编译后的 eBPF 数据路径共享的固定 fwmark。 |
 | —（dae 语法中不可配置） | `udphop_interval_secs` | `30s` | 旧全局 UDP hop 间隔字段。当前拨号器不读取它；协议特定的端口跳跃使用节点字段。 |
-| —（dae 语法中不可配置） | `connect_timeout_ms` | `3000ms` | 代理连接、协议准备、预连接、健康检查和控制面拨号使用的超时。 |
+| —（dae 语法中不可配置） | `connect_timeout_ms` | `3000ms` | 代理连接、协议准备、预连接、健康检查和控制面拨号使用的阶段超时。透明 TCP 候选竞速与 UDP transport preparation 还使用绝对总预算 `max(10s, 4 × connect_timeout)`；不新增配置键。 |
 | —（dae 语法中不可配置） | `dns_resolve_timeout_ms` | `2000ms` | 控制面 DNS 解析超时，包括拨号前必须转换为 IP 的目标。 |
 | —（dae 语法中不可配置） | `relay_idle_timeout_secs` | `300s` | 旧 relay 空闲超时字段；当前 relay 路径不读取它。 |
 

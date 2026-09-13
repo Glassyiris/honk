@@ -12,7 +12,7 @@ The scope is `GroupManager`, `AliveDialerSet`, the always-compiled Score scorer,
 
 `SharedGroupManager = Arc<parking_lot::RwLock<Arc<GroupManager>>>`
 
-A reload builds a complete replacement `GroupManager`, migrates Selector choices whose group and member tag still exist via `migrate_selector_choices_from`, installs callbacks, and swaps the inner `Arc`. Readers therefore see either the old or the new manager, never a partially rebuilt graph.
+A reload builds a complete replacement `GroupManager`, migrates Selector choices whose group and member tag still exist via `migrate_selector_choices_from`, installs interrupt, warm-up, and persistence callbacks before publication, and swaps the inner `Arc`. Readers therefore see either the old or the new manager, never a partially rebuilt graph.
 
 The `src/group/` facade and its internals are split by responsibility:
 
@@ -73,7 +73,7 @@ Latency uses a halving moving average:
 
 The first sample initializes the average. This is dae `min_moving_avg` behavior: recent changes matter quickly without making one jitter sample authoritative.
 
-`SelectionNetwork::Tcp` and `SelectionNetwork::Udp` retain separate winners. TCP uses the TCP probe average, or the `(member tag, check_url)` average when the group has a custom target. UDP first uses `DataUdp`, then `DnsUdp`; if no eligible candidate has UDP measurements, it mirrors the TCP selection instead of inventing a UDP ranking from missing data. This gives the effective fallback order `DataUdp → DnsUdp → TCP`.
+`SelectionNetwork::Tcp` and `SelectionNetwork::Udp` retain separate winners. TCP uses the TCP probe average, or the `(member tag, check_url)` average when the group has a custom target. UDP first uses `DataUdp`, then `DnsUdp`; if no eligible candidate has real UDP ranking evidence in either domain's retained moving average for the selected address family, it mirrors the TCP selection. Synthetic dial-failure samples alone do not disable this mirror; evicting real samples from the history ring does not erase retained ranking evidence. This gives the effective fallback order `DataUdp → DnsUdp → TCP`.
 
 The effective tolerance is `max(configured tolerance, 1 ms)` (`group.tolerance.max(1)`). The incumbent stays selected while:
 
@@ -112,9 +112,9 @@ Custom-URL probes resolve `delay_test_members` again on every cycle. A sub-group
 
 Only a top-level URLTest plan with no usable measurement may prepare several UDP transports. Candidate starts use absolute offsets `0 ms`, `30 ms`, `80 ms`, then one every `80 ms`; at most three preparations are in flight. Absolute scheduling prevents an earlier slow attempt from shifting all later starts.
 
-The first successful candidate that is still eligible wins. honk aborts and drains every started loser before binding the winner to an endpoint, rechecks eligibility, then commits protocol state before endpoint publication or the first application send.
+The first successful candidate that is still eligible wins. On a winner or deadline, honk aborts and drains every started loser before the scheduler returns; it then rechecks winner eligibility and commits protocol state before endpoint publication or the first application send. Only an observed preparation `Err` affects traffic health. Never-started work, cancellation, an ineligible successful result, and successfully drained losers are neutral; a completed error discovered while draining is still an observed error and counts. AnyTLS uses caller-owned provisional pool slots so losers never publish sessions. QUIC protocols build detached clients and publish only the finalized winner; losing clients are closed with their speculative work.
 
-Only an observed preparation `Err` affects traffic health. Never-started work, cancellation, an ineligible successful result, and successfully drained losers are neutral; a completed error discovered while draining is still an observed error and counts. AnyTLS uses caller-owned provisional pool slots so losers never publish sessions. QUIC protocols build detached clients and publish only the finalized winner; losing clients are closed with their speculative work.
+Authoritative single-node and cold URLTest plans share one absolute transport-preparation deadline of `max(10s, 4 × connect_timeout)`. It begins immediately before preparation and covers proxy-host resolution, physical-dial admission, protocol/control negotiation, stagger and full-capacity waits, plus the finalized winner's commit. Expiry starts no new candidate. Earlier sniffing/routing and later reply-socket creation, endpoint-driver readiness, and packet sends remain outside this deadline and retain their own lifecycle or I/O bounds.
 
 ## Health state and probes
 

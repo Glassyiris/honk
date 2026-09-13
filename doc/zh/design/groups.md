@@ -12,7 +12,7 @@
 
 `Arc<parking_lot::RwLock<Arc<GroupManager>>>`
 
-重载会构建完整的替代 `GroupManager`，迁移组和成员 tag 仍然存在的 Selector 选择，安装回调，再切换内部 `Arc`。因此读者只会看到旧管理器或新管理器，不会看到构建到一半的组图。
+重载会构建完整的替代 `GroupManager`，迁移组和成员 tag 仍然存在的 Selector 选择，在发布前安装连接中断、预热和持久化回调，再切换内部 `Arc`。因此读者只会看到旧管理器或新管理器，不会看到构建到一半的组图。
 
 facade 与内部实现按职责拆分：
 
@@ -71,7 +71,7 @@ Score 首先运行与其他策略相同的存活性过滤。过滤所用的 heal
 
 第一个样本初始化平均值。这就是 dae `min_moving_avg` 语义：近期变化能较快生效，同时不让单次抖动成为权威值。
 
-`SelectionNetwork::Tcp` 与 `SelectionNetwork::Udp` 分别保留胜者。TCP 使用 TCP 探测平均值；若组配置了自定义目标，则使用 `(member tag, check_url)` 平均值。UDP 先使用 `DataUdp`，再使用 `DnsUdp`；如果所有合格候选都没有 UDP 测量数据，则镜像 TCP 选择，而不是用缺失数据虚构 UDP 排名。因此有效回退顺序是 `DataUdp → DnsUdp → TCP`。
+`SelectionNetwork::Tcp` 与 `SelectionNetwork::Udp` 分别保留胜者。TCP 使用 TCP 探测平均值；若组配置了自定义目标，则使用 `(member tag, check_url)` 平均值。UDP 先使用 `DataUdp`，再使用 `DnsUdp`；如果在当前地址族下，所有合格候选在这两个域保留的移动平均值中都没有真实 UDP 排名依据，则沿用 TCP 选择。仅有拨号失败产生的合成样本不会停用这一回退；真实样本被历史环形缓冲区淘汰后，保留的排名依据仍然有效。因此有效回退顺序是 `DataUdp → DnsUdp → TCP`。
 
 有效 tolerance 为 `max(配置值, 1 ms)`。满足下式时继续保留当前选择：
 
@@ -110,9 +110,9 @@ Selector 在候选展开和健康过滤前绑定具体节点或子组成员；�
 
 只有没有可用测量值的顶层 URLTest 计划可以准备多个 UDP transport。候选按绝对偏移 `0 ms`、`30 ms`、`80 ms` 启动，之后每隔 `80 ms` 启动一个；同时最多有三个准备任务。绝对调度可避免较早的慢任务推迟所有后续启动时间。
 
-第一个成功且仍然合格的候选获胜。honk 在把胜者绑定到 endpoint 前中止并排空所有已启动 loser，重新检查胜者是否合格，然后在 endpoint 发布或发送第一个应用报文前提交协议状态。
+第一个成功且仍然合格的候选获胜。出现胜者或到达 deadline 时，honk 会在 scheduler 返回前中止并排空所有已启动 loser；随后再次检查胜者资格，并在 endpoint 发布或发送第一个应用报文前提交协议状态。只有已观察到的准备 `Err` 会影响流量健康。未启动任务、取消、已变为不合格的成功结果以及成功排空的 loser 都是中性的；排空时发现的已完成错误仍属于已观察错误并会计数。AnyTLS 使用调用者所有的 provisional pool slot，因此 loser 不会发布 session。QUIC 协议构建 detached client，只发布最终胜者；loser client 与其推测任务一起关闭。
 
-只有已观察到的准备 `Err` 会影响流量健康。未启动任务、取消、已变为不合格的成功结果以及成功排空的 loser 都是中性的；排空时发现的已完成错误仍属于已观察错误并会计数。AnyTLS 使用调用者所有的 provisional pool slot，因此 loser 不会发布 session。QUIC 协议构建 detached client，只发布最终胜者；loser client 与其推测任务一起关闭。
+权威单节点计划与冷启动 URLTest 共用一个绝对 transport preparation deadline：`max(10s, 4 × connect_timeout)`。该 deadline 在准备开始前建立，覆盖代理主机名解析、物理拨号准入、协议／控制协商、stagger 等待、满三任务时的容量等待，以及最终胜者的 commit；到期后不再启动新候选。此前的嗅探／路由，以及之后的 reply socket 创建、endpoint driver ready 和报文发送不在此 deadline 内，继续使用各自的生命周期或 I/O 上限。
 
 ## 健康状态与探测
 

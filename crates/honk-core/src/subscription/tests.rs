@@ -1,6 +1,10 @@
+use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
+
 use super::*;
 use base64::Engine as _;
 use honk_config::types::NodeProtocol;
+use sha2::{Digest as _, Sha256};
 
 mod clash;
 
@@ -394,8 +398,11 @@ async fn subscription_store_loads_pre_default_user_agent_key() {
         ..Subscription::default()
     };
     let content = "socks5://127.0.0.1:1080#stored";
-    let old_path = store.root().join(pre_default_filename(&sub));
-    write_store_file(store.root(), &old_path, content.as_bytes()).unwrap();
+    assert_eq!(
+        store.path_for(&sub).file_name().unwrap().to_str().unwrap(),
+        pre_default_filename(&sub)
+    );
+    store.store_content(&sub, content.into()).await.unwrap();
 
     let restored = store.load_nodes(&sub).await.unwrap().unwrap();
     assert_eq!(restored[0].name, "stored");
@@ -581,17 +588,6 @@ async fn subscription_store_skips_rejected_legacy_candidates() {
     }
 }
 
-#[test]
-fn subscription_store_rejects_symlink_directory() {
-    use std::os::unix::fs::symlink;
-
-    let temp = tempfile::tempdir().unwrap();
-    let target = temp.path().join("target");
-    fs::create_dir(&target).unwrap();
-    let link = temp.path().join(SUBSCRIPTION_STORE_DIR);
-    symlink(target, &link).unwrap();
-    assert!(SubscriptionStore::open(link).is_err());
-}
 fn assert_c17_original_indices(
     sub_type: SubscriptionType,
     fixture: &str,

@@ -1,4 +1,4 @@
-//! Cold URLTest UDP transport preparation with absolute stagger offsets.
+//! UDP transport preparation with absolute stagger offsets and an overall deadline.
 //!
 //! This module deliberately prepares only `PacketTransport`-equivalent values.
 //! Lease binding, reply-socket creation, endpoint publication, and the first
@@ -41,12 +41,13 @@ fn stagger_offset(index: usize) -> Duration {
 /// once, and return the first successful still-eligible result.
 ///
 /// Authoritative plans defensively use only their first node, even if a buggy
-/// caller supplied more. A winner aborts and drains every started loser before
-/// this function returns, so speculative transports cannot leak into the
-/// endpoint/lease lifecycle.
+/// caller supplied more. A winner or deadline aborts and drains every started
+/// loser before this function returns, so speculative transports and dial
+/// permits cannot leak into the endpoint/lease lifecycle.
 pub(super) async fn prepare_udp_plan<T>(
     mode: SelectionPlanMode,
     candidates: Vec<Node>,
+    deadline: tokio::time::Instant,
     prepare: UdpPrepare<T>,
     callbacks: UdpStaggerCallbacks,
 ) -> Option<(Node, T)>
@@ -62,7 +63,11 @@ where
     let mut next = 0;
     let mut tasks = JoinSet::new();
 
-    loop {
+    let winner = 'schedule: loop {
+        if tokio::time::Instant::now() >= deadline {
+            break None;
+        }
+
         // Fill available slots whose absolute deadline has passed. If a
         // completed attempt opened a slot after a deadline, this starts the
         // delayed candidate immediately instead of drifting the schedule.
@@ -72,8 +77,12 @@ where
                 next += 1;
                 continue;
             }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break 'schedule None;
+            }
             let due = started_at + stagger_offset(next);
-            if tokio::time::Instant::now() < due {
+            if now < due {
                 break;
             }
             next += 1;
@@ -87,25 +96,15 @@ where
             });
         }
 
-        if tasks.is_empty() {
-            if next == candidates.len() {
-                return None;
-            }
-            tokio::time::sleep_until(started_at + stagger_offset(next)).await;
-            continue;
+        if tasks.is_empty() && next == candidates.len() {
+            break None;
         }
-
-        // While a slot remains, observe both the next absolute start and an
-        // in-flight completion. At capacity (or after every candidate has
-        // started), only a completion can move the state forward.
-        let joined = if next < candidates.len() && tasks.len() < 3 {
-            let due = started_at + stagger_offset(next);
-            tokio::select! {
-                joined = tasks.join_next() => joined,
-                _ = tokio::time::sleep_until(due) => continue,
-            }
-        } else {
-            tasks.join_next().await
+        let joined = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => break 'schedule None,
+            joined = tasks.join_next(), if !tasks.is_empty() => joined,
+            _ = tokio::time::sleep_until(started_at + stagger_offset(next)),
+                if next < candidates.len() && tasks.len() < 3 => continue,
         };
 
         let Some(joined) = joined else {
@@ -118,21 +117,7 @@ where
         };
         match result {
             Ok(value) if (callbacks.is_eligible)(&node) => {
-                if records_stagger_metrics {
-                    (callbacks.on_winner)();
-                }
-                tasks.abort_all();
-                while let Some(joined) = tasks.join_next().await {
-                    match joined {
-                        Ok((node, Err(_))) => (callbacks.on_dial_error)(&node),
-                        Ok((_, Ok(_))) => {}
-                        Err(error) if error.is_cancelled() && records_stagger_metrics => {
-                            (callbacks.on_cancellation)()
-                        }
-                        Err(_) => {}
-                    }
-                }
-                return Some((node, value));
+                break Some((node, value));
             }
             Ok(_) => {
                 // The node died between launch and completion. Dropping the
@@ -143,5 +128,28 @@ where
                 (callbacks.on_dial_error)(&node);
             }
         }
+    };
+
+    tasks.abort_all();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((node, Err(_))) => (callbacks.on_dial_error)(&node),
+            Ok((_, Ok(_))) => {}
+            Err(error) if error.is_cancelled() && records_stagger_metrics => {
+                (callbacks.on_cancellation)()
+            }
+            Err(_) => {}
+        }
+    }
+    if winner.is_some() && tokio::time::Instant::now() < deadline {
+        if records_stagger_metrics {
+            (callbacks.on_winner)();
+        }
+        winner
+    } else {
+        None
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -44,7 +44,7 @@ Compatibility-only keys are accepted by the dae parser and stored in `GlobalConf
 | `max_concurrent_dials` | `max_concurrent_dials` | `64` | Requested generation-local cap on physical proxied connects and protocol handshakes; runtime resource budgeting may clamp it. |
 | — (not settable in dae syntax) | `tproxy_mark` | `0x08000000` | Fixed fwmark shared by userspace policy routing and the compiled eBPF datapath. |
 | — (not settable in dae syntax) | `udphop_interval_secs` | `30s` | Legacy global UDP-hop interval. Current dialers do not read it; protocol-specific hopping uses node fields. |
-| — (not settable in dae syntax) | `connect_timeout_ms` | `3000ms` | Timeout used by proxy connects, protocol preparation, preconnect, health probes, and control-plane dials. |
+| — (not settable in dae syntax) | `connect_timeout_ms` | `3000ms` | Stage timeout used by proxy connects, protocol preparation, preconnect, health probes, and control-plane dials. Transparent TCP candidate races and UDP transport preparation additionally share an absolute overall budget of `max(10s, 4 × connect_timeout)`; this adds no configuration key. |
 | — (not settable in dae syntax) | `dns_resolve_timeout_ms` | `2000ms` | Timeout for control-plane DNS resolution, including targets that must be converted to an IP before dialing. |
 | — (not settable in dae syntax) | `relay_idle_timeout_secs` | `300s` | Legacy relay-idle timeout field. The current relay path does not read it. |
 

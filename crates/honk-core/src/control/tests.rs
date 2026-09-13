@@ -2302,6 +2302,13 @@ enum UdpTestMode {
         commits: Arc<std::sync::atomic::AtomicUsize>,
         sends: Arc<std::sync::atomic::AtomicUsize>,
     },
+    PreparedCommitHold {
+        dials: Arc<std::sync::atomic::AtomicUsize>,
+        commits: Arc<std::sync::atomic::AtomicUsize>,
+        sends: Arc<std::sync::atomic::AtomicUsize>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    },
     Success,
     DnsResponse {
         dials: Arc<std::sync::atomic::AtomicUsize>,
@@ -2358,7 +2365,8 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
             }
             UdpTestMode::CountDialAndSend { sends, .. }
             | UdpTestMode::HoldAndCountDialAndSend { sends, .. }
-            | UdpTestMode::PreparedCommitError { sends, .. } => {
+            | UdpTestMode::PreparedCommitError { sends, .. }
+            | UdpTestMode::PreparedCommitHold { sends, .. } => {
                 sends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
@@ -2511,7 +2519,8 @@ impl honk_outbound::proxy::PacketOutbound for UdpTestHandler {
             UdpTestMode::CountFirstSendError { dials, .. }
             | UdpTestMode::CountDialAndSend { dials, .. }
             | UdpTestMode::CountDialError { dials }
-            | UdpTestMode::PreparedCommitError { dials, .. } => {
+            | UdpTestMode::PreparedCommitError { dials, .. }
+            | UdpTestMode::PreparedCommitHold { dials, .. } => {
                 dials.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             UdpTestMode::HoldAndCountDialAndSend {
@@ -2565,6 +2574,26 @@ impl honk_outbound::proxy::PacketOutbound for UdpTestHandler {
                     Err(anyhow::anyhow!(
                         "scripted prepared transport commit failure"
                     ))
+                },
+            ));
+        }
+        if let UdpTestMode::PreparedCommitHold {
+            commits,
+            entered,
+            release,
+            ..
+        } = &self.mode
+        {
+            let commits = Arc::clone(commits);
+            let entered = Arc::clone(entered);
+            let release = Arc::clone(release);
+            return Ok(honk_outbound::proxy::PreparedUdpTransport::new(
+                transport,
+                move || async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(())
                 },
             ));
         }
@@ -3474,6 +3503,99 @@ async fn udp_cold_urltest_commit_failure_sends_nothing_and_fails_closed() {
     assert!(serve_test_udp(&handle).await.is_err());
     assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 1);
     assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(sends.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(handle.udp_pool.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn udp_cold_urltest_commit_obeys_the_preparation_deadline() {
+    let node = udp_test_node();
+    let mut config = udp_test_config(
+        "udp-group",
+        vec![node.clone()],
+        vec![Group {
+            name: "udp-group".into(),
+            policy: honk_config::group::GroupPolicy::URLTest,
+            nodes: vec![node.id],
+            ..Default::default()
+        }],
+    );
+    config.global.connect_timeout_ms = 1;
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let handle = udp_test_handle(
+        config,
+        UdpTestMode::PreparedCommitHold {
+            dials: Arc::clone(&dials),
+            commits: Arc::clone(&commits),
+            sends: Arc::clone(&sends),
+            entered: Arc::clone(&entered),
+            release: Arc::new(tokio::sync::Notify::new()),
+        },
+        1,
+    );
+    let task_handle = handle.clone();
+    let task = tokio::spawn(async move { serve_test_udp(&task_handle).await });
+
+    entered.notified().await;
+    assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(sends.load(std::sync::atomic::Ordering::Relaxed), 0);
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("winner commit must retain the preparation deadline")
+            .expect("UDP initializer task must not panic")
+            .is_err()
+    );
+    assert_eq!(sends.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(handle.udp_pool.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn udp_cold_urltest_rejects_commit_ready_after_deadline() {
+    let node = udp_test_node();
+    let mut config = udp_test_config(
+        "udp-group",
+        vec![node.clone()],
+        vec![Group {
+            name: "udp-group".into(),
+            policy: honk_config::group::GroupPolicy::URLTest,
+            nodes: vec![node.id],
+            ..Default::default()
+        }],
+    );
+    config.global.connect_timeout_ms = 1;
+    let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handle = udp_test_handle(
+        config,
+        UdpTestMode::PreparedCommitHold {
+            dials: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            commits: Arc::clone(&commits),
+            sends: Arc::clone(&sends),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        },
+        1,
+    );
+    let operation = serve_test_udp(&handle);
+    tokio::pin!(operation);
+    tokio::select! {
+        result = &mut operation => panic!("commit did not wait: {result:?}"),
+        _ = entered.notified() => {}
+    }
+    // Keep the initializer unpolled until both the deadline and commit are ready.
+    tokio::time::advance(Duration::from_secs(11)).await;
+    release.notify_one();
+
+    assert!(operation.await.is_err());
+    assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert_eq!(sends.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert!(handle.udp_pool.is_empty());
 }
@@ -4602,6 +4724,7 @@ async fn udp_stagger_uses_absolute_offsets_bounds_inflight_and_drains_losers() {
     let task = tokio::spawn(prepare_udp_plan(
         crate::group::SelectionPlanMode::ColdUrlTest,
         candidates,
+        tokio::time::Instant::now() + Duration::from_secs(10),
         prepare,
         callbacks,
     ));
@@ -4712,6 +4835,7 @@ async fn udp_stagger_drain_reports_completed_error_without_cancelling_ready_lose
     let task = tokio::spawn(prepare_udp_plan(
         crate::group::SelectionPlanMode::ColdUrlTest,
         candidates,
+        tokio::time::Instant::now() + Duration::from_secs(10),
         prepare,
         callbacks,
     ));
@@ -4774,6 +4898,7 @@ async fn udp_stagger_authoritative_prepares_only_the_current_node_without_delay(
     let (winner, _) = prepare_udp_plan(
         crate::group::SelectionPlanMode::Authoritative,
         candidates,
+        tokio::time::Instant::now() + Duration::from_secs(10),
         prepare,
         callbacks,
     )
@@ -4830,6 +4955,7 @@ async fn udp_stagger_authoritative_failure_preserves_fixed_metric_zeros() {
         prepare_udp_plan(
             crate::group::SelectionPlanMode::Authoritative,
             candidates,
+            tokio::time::Instant::now() + Duration::from_secs(10),
             prepare,
             callbacks,
         )
@@ -4882,6 +5008,7 @@ async fn udp_stagger_all_dial_failures_report_health_without_cancellation() {
     let task = tokio::spawn(prepare_udp_plan(
         crate::group::SelectionPlanMode::ColdUrlTest,
         candidates,
+        tokio::time::Instant::now() + Duration::from_secs(10),
         prepare,
         callbacks,
     ));
@@ -4938,6 +5065,7 @@ async fn udp_stagger_rechecks_eligibility_before_accepting_prepared_transport() 
     let task = tokio::spawn(prepare_udp_plan(
         crate::group::SelectionPlanMode::ColdUrlTest,
         candidates,
+        tokio::time::Instant::now() + Duration::from_secs(10),
         prepare,
         callbacks,
     ));

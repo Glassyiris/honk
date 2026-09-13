@@ -1,3 +1,4 @@
+use super::overall_dial_timeout;
 use super::routing::{build_connection_info, connection_chains};
 use crate::control::*;
 use crate::group::{SelectionNetwork, SelectionPlanMode};
@@ -147,15 +148,15 @@ impl ControlPlaneHandle {
 
         let (dial_mode, connect_timeout, overall_dial_timeout) = {
             let config = self.config.read().await;
-            let connect_timeout_ms = config.global.connect_timeout_ms;
+            let connect_timeout = Duration::from_millis(config.global.connect_timeout_ms);
             (
                 config
                     .global
                     .dial_mode
                     .parse::<DialMode>()
                     .map_err(|_| anyhow::anyhow!("invalid global.dial_mode"))?,
-                Duration::from_millis(connect_timeout_ms),
-                Duration::from_millis((connect_timeout_ms.max(1000) * 4).max(10000)),
+                connect_timeout,
+                overall_dial_timeout(connect_timeout),
             )
         };
 
