@@ -1,5 +1,7 @@
 use super::*;
 
+mod udp_selection;
+
 #[test]
 fn direct_selector_fast_path_preserves_first_member_selection() {
     let a = make_node(nid("a"), "a");

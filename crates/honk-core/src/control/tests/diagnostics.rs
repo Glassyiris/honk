@@ -1,6 +1,6 @@
+use super::support::{canonical_socks5, changed_routing_config, control_plane};
 use super::*;
 use crate::config_diagnostics::{DiagnosticBuckets, DiagnosticSnapshot};
-use crate::control::c20_tests::{canonical_socks5, control_plane};
 use crate::subscription::{SubscriptionAuthorizations, SubscriptionSupervisor};
 use honk_config::diagnostic::{DetailedDiagnostic, DiagnosticSources, SafeValue, SettingPath};
 use honk_config::subscription::Subscription;
@@ -23,7 +23,7 @@ async fn snapshot(cp: &ControlPlane) -> DiagnosticSnapshot {
 }
 
 async fn fixture(config: Config, buckets: DiagnosticBuckets) -> ControlPlane {
-    let mut cp = control_plane(config).await;
+    let mut cp = control_plane(config);
     cp.set_mode_state(Arc::new(parking_lot::RwLock::new(
         crate::mode::ModeState::new("Rule", ""),
     )));

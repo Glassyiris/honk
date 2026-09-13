@@ -279,5 +279,4 @@ impl<T> LifecycleSlot<T> {
 }
 
 #[cfg(test)]
-#[path = "lifecycle_tests.rs"]
 mod tests;

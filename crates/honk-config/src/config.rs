@@ -1342,9 +1342,6 @@ fn yaml_has_global_nfqueue_enable(content: &str) -> bool {
 }
 
 #[cfg(test)]
-mod c20_tests;
-
-#[cfg(test)]
 mod builtin_nodes_tests {
     use super::*;
 

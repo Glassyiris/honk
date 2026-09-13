@@ -35,3 +35,7 @@ mkdir -p "$log_dir"
   --ignored --test-threads=1 2>&1 | tee "$log_dir/honk-nfqueue.log"
 "$HONK_CORE_TEST_BIN" netns --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/honk-core-netns.log"
+watcher_test=ebpf::real::iface_watch::tests::route_only_change_wakes_network_subscription
+test "$("$HONK_CORE_TEST_BIN" "$watcher_test" --exact --ignored --list --format terse)" = "$watcher_test: test"
+"$HONK_CORE_TEST_BIN" "$watcher_test" --exact --ignored --test-threads=1 \
+  2>&1 | tee "$log_dir/honk-core-iface-watch.log"
