@@ -730,14 +730,17 @@ async fn test_dial_tcp_echo() {
 
 #[tokio::test]
 async fn test_dial_tcp_does_not_wait_for_response() {
-    let server_addr =
-        start_server_with_response(TEST_PASSWORD, Duration::from_millis(200), 0).await;
+    // The server answers the TCP request only after a long delay; the dial
+    // must return well before that, otherwise it waited for the response. The
+    // margins are wide because the QUIC handshake alone can take tens of
+    // milliseconds on a loaded CI runner.
+    let server_addr = start_server_with_response(TEST_PASSWORD, Duration::from_secs(2), 0).await;
     let node = test_node(server_addr.port(), TEST_PASSWORD);
     let handler = Hysteria2Handler::new();
     let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
 
     let stream = tokio::time::timeout(
-        Duration::from_millis(100),
+        Duration::from_secs(1),
         handler.dial(&node, target, None, Duration::from_secs(5)),
     )
     .await
@@ -748,7 +751,7 @@ async fn test_dial_tcp_does_not_wait_for_response() {
     stream.stream.write_all(b"fast open").await.unwrap();
     let mut output = [0u8; 9];
     tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(5),
         stream.stream.read_exact(&mut output),
     )
     .await
