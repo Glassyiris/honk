@@ -119,7 +119,7 @@ outbound-ci-e2e:
 dns-ci:
     ci/dns-ci.sh
 
-# Unprivileged actual-process DNS listener smoke (UDP + persistent TCP + SIGHUP)
+# Unprivileged actual-process DNS listener smoke on the release honk-core (UDP + persistent TCP + SIGHUP)
 dns-smoke:
     python3 ci/dns-smoke.py
 

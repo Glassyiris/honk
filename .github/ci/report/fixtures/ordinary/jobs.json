@@ -5,5 +5,8 @@
     {"workflow": "Reload benchmark", "run_id": 102, "run_attempt": 1, "sha": "776f2f0f"}
   ],
   "baseline": {"run_id": 90, "run_attempt": 1, "sha": "346e667d"},
-  "jobs": [{"name": "cargo nextest (workspace)", "conclusion": "success"}]
+  "jobs": [
+    {"name": "cargo nextest (workspace)", "conclusion": "success"},
+    {"name": "DNS smoke (release honk-core)", "conclusion": "success"}
+  ]
 }

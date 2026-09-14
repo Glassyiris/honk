@@ -99,7 +99,7 @@ jobs:
               (pr && (failed || filters.ebpf === "true" || labels.includes("ci:ebpf") || full));
             const docs = !pr || failed || filters.code === "true" || filters.docs === "true" || full;
             const lanes = ["changes"];
-            if (code) lanes.push("lint", "test", "ebpf-check");
+            if (code) lanes.push("lint", "test", "smoke", "ebpf-check");
             if (floor) lanes.push("ebpf");
             const heavy = push || (dispatch && inputs.full) || (pr && (failed || full));
             if (heavy) lanes.push("ebpf-recent", "aarch64", "features", "cross-musl");
@@ -269,12 +269,6 @@ jobs:
           cargo nextest list --workspace --profile ci --message-format json \
             > target/ci-report/nextest-list.json
       - run: cargo nextest run --workspace --profile ci
-      - name: Run DNS smoke
-        env:
-          HONK_SMOKE_REPORT: target/ci-report/dns-smoke.json
-        run: |
-          set -euo pipefail
-          python3 ci/dns-smoke.py
       - name: Upload workspace JUnit
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -339,26 +333,6 @@ jobs:
               unavailable("slowest_test", "seconds", "nextest JUnit is unavailable")
 
           try:
-              smoke = json.loads(Path("target/ci-report/dns-smoke.json").read_text())
-              units["dns_smoke"] = "queries-and-names"
-              values["dns_smoke"] = {
-                  "value": {"queries": smoke["queries"], "upstream_names": smoke["upstream_names"]},
-                  "unit": "queries-and-names", "available": True,
-              }
-              units["smoke_memory"] = "MiB"
-              values["smoke_memory"] = {
-                  "value": smoke["vmhwm_kib"] / 1024, "unit": "MiB", "available": True,
-              }
-              units["smoke_cpu"] = "seconds"
-              values["smoke_cpu"] = {
-                  "value": smoke["cpu_seconds"], "unit": "seconds", "available": True,
-              }
-          except (KeyError, OSError, TypeError, ValueError):
-              unavailable("dns_smoke", "queries-and-names", "DNS smoke report is unavailable")
-              unavailable("smoke_memory", "MiB", "DNS smoke report is unavailable")
-              unavailable("smoke_cpu", "seconds", "DNS smoke report is unavailable")
-
-          try:
               rustc = subprocess.run(
                   ["rustc", "-V"], check=True, capture_output=True, text=True,
               ).stdout.strip()
@@ -399,6 +373,139 @@ jobs:
         with:
           name: ci-report-test
           path: target/ci-report/test.json
+          retention-days: 30
+          if-no-files-found: error
+
+  smoke:
+    name: DNS smoke (release honk-core)
+    needs: [changes]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.result != 'success' || needs.changes.outputs.code == 'true' || needs.changes.outputs.full == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read Rust toolchain
+        id: toolchain
+        run: echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        id: rust-cache
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - name: Install boring-sys build deps (cmake + libclang for bindgen)
+        run: |
+          set -euo pipefail
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev
+      # The shipping profile (opt-level s, fat LTO): the smoke measures the
+      # binary users run, and every code PR now proves that profile builds.
+      - run: cargo build --release -p honk-core --bin honk-core
+      - name: Run DNS smoke
+        env:
+          HONK_CORE_BIN: target/release/honk-core
+          HONK_SMOKE_REPORT: target/ci-report/dns-smoke.json
+        run: |
+          set -euo pipefail
+          mkdir -p target/ci-report
+          python3 ci/dns-smoke.py
+      - name: Write smoke CI report
+        if: always()
+        env:
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+          HONK_CORE_BIN: target/release/honk-core
+          JOB_STATUS: ${{ job.status }}
+          MEASURED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TOOLCHAIN: ${{ steps.toolchain.outputs.stable }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/ci-report
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          values = {}
+          units = {}
+
+          def unavailable(name, unit, reason):
+              units[name] = unit
+              values[name] = {"value": None, "unit": unit, "available": False, "reason": reason}
+
+          try:
+              smoke = json.loads(Path("target/ci-report/dns-smoke.json").read_text())
+              units["dns_smoke"] = "queries-and-names"
+              values["dns_smoke"] = {
+                  "value": {"queries": smoke["queries"], "upstream_names": smoke["upstream_names"]},
+                  "unit": "queries-and-names", "available": True,
+              }
+              units["smoke_memory"] = "MiB"
+              values["smoke_memory"] = {
+                  "value": smoke["vmhwm_kib"] / 1024, "unit": "MiB", "available": True,
+              }
+              units["smoke_cpu"] = "seconds"
+              values["smoke_cpu"] = {
+                  "value": smoke["cpu_seconds"], "unit": "seconds", "available": True,
+              }
+          except (KeyError, OSError, TypeError, ValueError):
+              unavailable("dns_smoke", "queries-and-names", "DNS smoke report is unavailable")
+              unavailable("smoke_memory", "MiB", "DNS smoke report is unavailable")
+              unavailable("smoke_cpu", "seconds", "DNS smoke report is unavailable")
+
+          try:
+              units["binary_size"] = "bytes"
+              values["binary_size"] = {
+                  "value": os.stat(os.environ["HONK_CORE_BIN"]).st_size, "unit": "bytes", "available": True,
+              }
+          except OSError:
+              unavailable("binary_size", "bytes", "release honk-core is unavailable")
+
+          try:
+              rustc = subprocess.run(
+                  ["rustc", "-V"], check=True, capture_output=True, text=True,
+              ).stdout.strip()
+              raw_cache = os.environ.get("CACHE_HIT")
+              cache_hit = True if raw_cache == "true" else False if raw_cache == "false" else None
+              units["toolchain"] = "rustc-cache"
+              values["toolchain"] = {
+                  "value": {"rustc": rustc, "cache_hit": cache_hit},
+                  "unit": "rustc-cache", "available": True,
+              }
+          except (OSError, subprocess.CalledProcessError):
+              unavailable("toolchain", "rustc-cache", "rustc is unavailable")
+
+          status = os.environ["JOB_STATUS"]
+          report = {
+              "schema_version": 1,
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "lane": "smoke",
+              "matrix": {
+                  "target": "x86_64-unknown-linux-gnu",
+                  "toolchain": os.environ["TOOLCHAIN"],
+                  "profile": "release",
+              },
+              "measured_sha": os.environ["MEASURED_SHA"],
+              "baseline_sha": None,
+              "units": units,
+              "values": values,
+              "signals": [],
+              "failure": None if status == "success" else {
+                  "summary": f"smoke lane {status}", "detail_lines": [],
+              },
+          }
+          Path("target/ci-report/smoke.json").write_text(json.dumps(report, indent=2) + "\n")
+          PY
+      - name: Upload smoke CI report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-report-smoke
+          path: target/ci-report/smoke.json
           retention-days: 30
           if-no-files-found: error
 

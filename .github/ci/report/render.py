@@ -28,6 +28,7 @@ METRIC_UNITS = {
     "dns_smoke": "queries-and-names",
     "smoke_memory": "MiB",
     "smoke_cpu": "seconds",
+    "binary_size": "bytes",
     "reload_benchmark": "ratios",
     "toolchain": "rustc-cache",
     "vm_environment": "kernel-accelerator",
@@ -46,6 +47,7 @@ SIGNAL_KINDS = {
 SELECTION_JOBS = {
     "lint": "fmt + clippy",
     "test": "cargo nextest (workspace)",
+    "smoke": "DNS smoke (release honk-core)",
     "ebpf-check": "eBPF feature compile guard",
     "ebpf": "eBPF object + real VM kernel tests",
     "ebpf-recent": "eBPF real VM tests (recent kernel)",
@@ -62,7 +64,7 @@ REPORT_JOBS = {
 }
 
 POLICY_GROUPS = (
-    ({"lint", "test", "ebpf-check"}, "code lanes not run: `ci:full`"),
+    ({"lint", "test", "smoke", "ebpf-check"}, "code lanes not run: `ci:full`"),
     ({"ebpf"}, "eBPF VM not run: `ci:ebpf`"),
     (
         {"ebpf-recent", "aarch64", "features", "cross-musl"},
@@ -163,7 +165,7 @@ def validate_report(raw: Any, source: Path) -> dict[str, Any]:
     require(isinstance(units, dict) and isinstance(values, dict), "units and values must be objects")
     require(set(units) == set(values), "units must name every metric exactly once")
     for name, item in values.items():
-        require(name in METRIC_UNITS, f"unknown metric {name!r}")
+        require(name in METRIC_UNITS, f"unknown metric {name}")
         require(units[name] == METRIC_UNITS[name], f"units.{name} is not canonical")
         require(
             isinstance(item, dict)
@@ -392,13 +394,16 @@ def measurement_rows(reports: dict[str, Any], baseline: dict[str, Any]) -> tuple
     exceeded: list[str] = []
     test = reports.get("test")
     old_test = matching_baseline(test, baseline) if test is not None else None
+    smoke = reports.get("smoke")
+    old_smoke = matching_baseline(smoke, baseline) if smoke is not None else None
 
-    memory = metric(test, "smoke_memory")
-    old_memory = metric(old_test, "smoke_memory")
+    # The smoke runs the release binary; the cap is sized for that profile.
+    memory = metric(smoke, "smoke_memory")
+    old_memory = metric(old_smoke, "smoke_memory")
     if memory is not None:
         current = require_number(memory, "smoke memory")
         old = require_number(old_memory, "baseline smoke memory") if old_memory is not None else None
-        limit = limit_for(old, 100.0)
+        limit = limit_for(old, 32.0)
         over = limit is not None and current > limit
         shown = f"{decimal(current, 1)} MB"
         baseline_cell = f"{decimal(old, 1)} MB" if old is not None else "no baseline"
@@ -409,6 +414,22 @@ def measurement_rows(reports: dict[str, Any], baseline: dict[str, Any]) -> tuple
             old_note = f" (`main` {decimal(old, 1)} MB)" if old is not None else ""
             exceeded.append(f"- **`honk-core` peak memory in the smoke {shown}**, limit {limit_cell}{old_note}")
 
+    # The shipping profile is size-oriented (opt-level s); 110 % of main, no cap.
+    size = metric(smoke, "binary_size")
+    old_size = metric(old_smoke, "binary_size")
+    if size is not None:
+        current = require_integer(size, "binary size") / 1048576
+        old = require_integer(old_size, "baseline binary size") / 1048576 if old_size is not None else None
+        limit = old * 1.1 if old is not None else None
+        over = limit is not None and current > limit
+        shown = f"{decimal(current, 1)} MB"
+        baseline_cell = f"{decimal(old, 1)} MB" if old is not None else "no baseline"
+        change = signed(current - old, "MB", 1) if old is not None else "—"
+        limit_cell = f"{decimal(limit, 1)} MB" if limit is not None else "—"
+        rows.append(["`honk-core` release binary", f"**{shown}**" if over else shown, baseline_cell, change, limit_cell])
+        if over:
+            exceeded.append(f"- **`honk-core` release binary {shown}**, limit {limit_cell} (`main` {decimal(old, 1)} MB)")
+
     slowest = metric(test, "slowest_test")
     old_slowest = metric(old_test, "slowest_test")
     if isinstance(slowest, dict):
@@ -417,7 +438,9 @@ def measurement_rows(reports: dict[str, Any], baseline: dict[str, Any]) -> tuple
         old_seconds = None
         if isinstance(old_slowest, dict):
             old_seconds = require_number(old_slowest.get("seconds"), "baseline slowest test seconds")
-        limit = limit_for(old_seconds, 60.0)
+        # Runner noise moves a ten-second test by several seconds between runs,
+        # so the 120 % rule only applies above 30 s; the cap is nextest's slow mark.
+        limit = min(60.0, max(30.0, old_seconds * 1.2)) if old_seconds is not None else 60.0
         over = limit is not None and seconds > limit
         shown = f"{decimal(seconds, 1)} s"
         baseline_cell = f"{decimal(old_seconds, 1)} s" if old_seconds is not None else "no baseline"
@@ -428,18 +451,24 @@ def measurement_rows(reports: dict[str, Any], baseline: dict[str, Any]) -> tuple
             old_note = f", `main` {decimal(old_seconds, 1)} s" if old_seconds is not None else ""
             exceeded.append(f"- **slowest test {shown}**, limit {limit_cell} (`{escape(name)}`{old_note})")
 
-    cpu = metric(test, "smoke_cpu")
-    old_cpu = metric(old_test, "smoke_cpu")
+    cpu = metric(smoke, "smoke_cpu")
+    old_cpu = metric(old_smoke, "smoke_cpu")
     if cpu is not None:
         current = require_number(cpu, "smoke CPU")
         old = require_number(old_cpu, "baseline smoke CPU") if old_cpu is not None else None
-        limit = limit_for(old, None)
+        # Startup plus four queries costs about 0.01 s; the cap catches a spin,
+        # a 120 % rule at that resolution would only catch noise.
+        limit = 0.5
+        over = current > limit
         rows.append([
-            "`honk-core` CPU in the smoke", f"{current:.2f} s",
+            "`honk-core` CPU in the smoke", f"**{current:.2f} s**" if over else f"{current:.2f} s",
             f"{old:.2f} s" if old is not None else "no baseline",
             signed(current - old, "s") if old is not None else "—",
-            f"{limit:.2f} s" if limit is not None else "—",
+            f"{limit:.2f} s",
         ])
+        if over:
+            old_note = f" (`main` {old:.2f} s)" if old is not None else ""
+            exceeded.append(f"- **`honk-core` CPU in the smoke {current:.2f} s**, limit {limit:.2f} s{old_note}")
 
     reload = reports.get("reload")
     reload_value = metric(reload, "reload_benchmark")
@@ -496,7 +525,7 @@ def measurement_rows(reports: dict[str, Any], baseline: dict[str, Any]) -> tuple
             f"{limit:,}",
         ])
 
-    dns = metric(test, "dns_smoke")
+    dns = metric(smoke, "dns_smoke")
     if isinstance(dns, dict):
         queries = require_integer(dns.get("queries"), "DNS query count")
         names = dns.get("upstream_names")

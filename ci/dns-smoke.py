@@ -51,7 +51,7 @@ def _cargo_target_dir(project_root: Path) -> Path:
     return path if path.is_absolute() else project_root / path
 
 
-def _build_debug_binary(project_root: Path) -> Path:
+def _build_release_binary(project_root: Path) -> Path:
     configured_binary = os.environ.get("HONK_CORE_BIN")
     if configured_binary:
         binary = Path(configured_binary).expanduser().resolve()
@@ -59,11 +59,11 @@ def _build_debug_binary(project_root: Path) -> Path:
             raise SmokeFailure(f"HONK_CORE_BIN is not an executable file: {binary}")
         return binary
 
-    binary = _cargo_target_dir(project_root) / "debug" / "honk-core"
+    binary = _cargo_target_dir(project_root) / "release" / "honk-core"
     with tempfile.TemporaryFile(mode="w+b") as output:
         try:
             result = subprocess.run(
-                ["cargo", "build", "-p", "honk-core", "--bin", "honk-core"],
+                ["cargo", "build", "--release", "-p", "honk-core", "--bin", "honk-core"],
                 cwd=project_root,
                 stdin=subprocess.DEVNULL,
                 stdout=output,
@@ -75,12 +75,12 @@ def _build_debug_binary(project_root: Path) -> Path:
             raise SmokeFailure("cargo was not found in PATH") from error
         except subprocess.TimeoutExpired as error:
             raise SmokeFailure(
-                f"debug honk-core build exceeded {BUILD_TIMEOUT:.0f}s",
+                f"release honk-core build exceeded {BUILD_TIMEOUT:.0f}s",
                 _tail_bytes(output),
             ) from error
         if result.returncode != 0:
             raise SmokeFailure(
-                f"debug honk-core build exited with status {result.returncode}",
+                f"release honk-core build exited with status {result.returncode}",
                 _tail_bytes(output),
             )
     if not binary.is_file() or not os.access(binary, os.X_OK):
@@ -479,7 +479,7 @@ def _write_smoke_report(path: Path, process: subprocess.Popen[bytes], names: lis
 
 
 def _run_smoke(project_root: Path) -> None:
-    binary = _build_debug_binary(project_root)
+    binary = _build_release_binary(project_root)
     capture: ProcessOutput | None = None
     process: subprocess.Popen[bytes] | None = None
     upstream: DeterministicUdpDns | None = None

@@ -6,12 +6,10 @@
   "matrix": {"target": "x86_64-unknown-linux-gnu", "toolchain": "pinned-stable"},
   "measured_sha": "346e667d",
   "baseline_sha": null,
-  "units": {"test_inventory": "test-names", "slowest_test": "seconds", "smoke_memory": "MiB", "smoke_cpu": "seconds", "toolchain": "rustc-cache"},
+  "units": {"test_inventory": "test-names", "slowest_test": "seconds", "toolchain": "rustc-cache"},
   "values": {
     "test_inventory": {"value": {"total": 0, "names": []}, "unit": "test-names", "available": true},
     "slowest_test": {"value": {"name": "c28_health_tests::warm_then_measure", "seconds": 58}, "unit": "seconds", "available": true},
-    "smoke_memory": {"value": 40, "unit": "MiB", "available": true},
-    "smoke_cpu": {"value": 0.30, "unit": "seconds", "available": true},
     "toolchain": {"value": {"rustc": "1.98.1", "cache_hit": false}, "unit": "rustc-cache", "available": true}
   },
   "signals": [],

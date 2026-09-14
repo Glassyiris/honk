@@ -6,13 +6,14 @@
 </details>
 
 **Measurements**
-<details><summary>3 metrics, 0 over limit</summary>
+<details><summary>4 metrics, 0 over limit</summary>
 
 | | This PR | `main` | Change | Limit |
 |---|---|---|---|---|
-| `honk-core` peak memory in the smoke | 80 MB | no baseline | — | 100 MB |
+| `honk-core` peak memory in the smoke | 18 MB | no baseline | — | 32 MB |
+| `honk-core` release binary | 19 MB | no baseline | — | — |
 | Slowest test | 50 s | no baseline | — | 60 s |
-| `honk-core` CPU in the smoke | 0.20 s | no baseline | — | — |
+| `honk-core` CPU in the smoke | 0.04 s | no baseline | — | 0.50 s |
 
 </details>
 <!-- ci-report -->

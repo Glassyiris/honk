@@ -13,7 +13,8 @@
   "filter_outcome": "success",
   "intended_lanes": [
     "changes",
-    "test"
+    "test",
+    "smoke"
   ],
   "run_id": 501,
   "run_attempt": 1

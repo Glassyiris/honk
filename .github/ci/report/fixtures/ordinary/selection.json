@@ -11,6 +11,7 @@
   "intended_lanes": [
     "changes",
     "test",
+    "smoke",
     "docs"
   ],
   "run_id": 101,
