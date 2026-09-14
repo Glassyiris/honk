@@ -612,7 +612,7 @@ fn test_config_json_round_trip() {
 }
 
 #[test]
-fn test_config_json_vless_mode_and_default() {
+fn test_config_json_vless_mode_defaults_are_protocol_local() {
     let mut config = Config::default();
     config.nodes.push(
         Node::from_share_link("vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?vless_mode=mux-cool#vless").unwrap(),
@@ -632,7 +632,20 @@ fn test_config_json_vless_mode_and_default() {
     let parsed = Config::from_json_str(&value.to_string()).unwrap();
     assert_eq!(
         parsed.nodes[0].vless().unwrap().mode,
+        honk_config::node::WireMode::Auto
+    );
+
+    value["nodes"][0]["vless_mode"] = serde_json::json!("legacy");
+    let parsed = Config::from_json_str(&value.to_string()).unwrap();
+    assert_eq!(
+        parsed.nodes[0].vless().unwrap().mode,
         honk_config::node::WireMode::Legacy
+    );
+
+    let anytls = Node::from_share_link("anytls://password@example.com:443").unwrap();
+    assert_eq!(
+        serde_json::to_value(anytls).unwrap()["vless_mode"],
+        serde_json::json!("legacy")
     );
 }
 
@@ -1186,7 +1199,9 @@ fn test_tuic_alpn_and_congestion_params() {
 #[test]
 fn test_vless_mode_query() {
     for (value, expected) in [
+        ("auto", honk_config::node::WireMode::Auto),
         ("legacy", honk_config::node::WireMode::Legacy),
+        ("native", honk_config::node::WireMode::Native),
         ("uot-v2", honk_config::node::WireMode::UotV2),
         ("h2mux", honk_config::node::WireMode::H2mux),
         ("h2mux-padded", honk_config::node::WireMode::H2muxPadded),
@@ -1199,6 +1214,13 @@ fn test_vless_mode_query() {
         .unwrap();
         assert_eq!(node.vless().unwrap().mode, expected);
     }
+    let automatic =
+        Node::from_share_link("vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443#node")
+            .unwrap();
+    assert_eq!(
+        automatic.vless().unwrap().mode,
+        honk_config::node::WireMode::Auto
+    );
     let xudp = Node::from_share_link(
         "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?packetEncoding=xudp#node",
     )
@@ -1208,13 +1230,13 @@ fn test_vless_mode_query() {
         honk_config::node::WireMode::Xudp
     );
 
-    let legacy = Node::from_share_link(
+    let native = Node::from_share_link(
         "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?packetEncoding=none#node",
     )
     .unwrap();
     assert_eq!(
-        legacy.vless().unwrap().mode,
-        honk_config::node::WireMode::Legacy
+        native.vless().unwrap().mode,
+        honk_config::node::WireMode::Native
     );
 
     assert!(
@@ -1239,6 +1261,35 @@ fn test_vless_mode_query_rejects_duplicates() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn test_vless_udp_query_coalesces_equal_claims_and_rejects_bad_values() {
+    for query in ["", "udp=1", "udp=TRUE", "udp=true&udp=1"] {
+        let node = Node::from_share_link(&format!(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?{query}"
+        ))
+        .unwrap();
+        assert!(node.vless().unwrap().udp_enabled(), "{query}");
+        assert_eq!(node.vless().unwrap().network, None, "{query}");
+    }
+    for query in ["udp=0", "udp=FALSE", "udp=false&udp=0"] {
+        let node = Node::from_share_link(&format!(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?{query}"
+        ))
+        .unwrap();
+        assert!(!node.vless().unwrap().udp_enabled(), "{query}");
+        assert_eq!(node.vless().unwrap().network.as_deref(), Some("tcp"));
+    }
+    for query in ["udp=", "udp=yes", "udp=true&udp=0"] {
+        assert!(
+            Node::from_share_link(&format!(
+                "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?{query}"
+            ))
+            .is_err(),
+            "{query}"
+        );
+    }
 }
 
 #[test]
@@ -1472,6 +1523,22 @@ fn test_vless_encryption_param_and_identity() {
         Some(encryption)
     );
     assert_ne!(plain.id, encrypted.id);
+
+    for mode in ["legacy", "auto", "native", "xudp"] {
+        Node::from_share_link(&format!(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?vless_mode={mode}&encryption={encryption}"
+        ))
+        .unwrap();
+    }
+    for mode in ["uot-v2", "h2mux", "h2mux-padded", "mux-cool"] {
+        assert!(
+            Node::from_share_link(&format!(
+                "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?vless_mode={mode}&encryption={encryption}"
+            ))
+            .is_err(),
+            "{mode}"
+        );
+    }
 }
 
 #[test]
@@ -1558,10 +1625,40 @@ fn test_validate_flow_rejects_unknown_value() {
         "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443#flow-bad-value",
     )
     .unwrap();
-    node.vless_mut().unwrap().flow = Some("xtls-rprx-vision-udp443".into());
+    node.vless_mut().unwrap().flow = Some("xtls-rprx-vision-udp444".into());
     let mut config = Config::default();
     config.nodes.push(node);
     assert!(config.validate().is_err());
+}
+
+#[test]
+fn test_vless_vision_suffix_and_tcp_only_native_admission() {
+    let opted_in = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&flow=xtls-rprx-vision-udp443",
+    )
+    .unwrap();
+    let vless = opted_in.vless().unwrap();
+    assert_eq!(vless.flow.as_deref(), Some("xtls-rprx-vision-udp443"));
+    assert_eq!(vless.wire_flow(), Some("xtls-rprx-vision"));
+    assert!(vless.is_vision());
+    assert!(!vless.rejects_udp_port(443));
+
+    let tcp_only = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&vless_mode=native&udp=false&flow=xtls-rprx-vision",
+    )
+    .unwrap();
+    assert_eq!(
+        tcp_only.vless().unwrap().mode,
+        honk_config::node::WireMode::Native
+    );
+    assert!(!tcp_only.vless().unwrap().udp_enabled());
+
+    assert!(
+        Node::from_share_link(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&vless_mode=native&flow=xtls-rprx-vision"
+        )
+        .is_err()
+    );
 }
 
 #[test]

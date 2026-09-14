@@ -16,36 +16,36 @@ pub(in crate::subscription) fn parse_vless_external_mode(
         return Err("duplicate VLESS XUDP representations");
     }
 
-    // Clash treats an empty packet-encoding as omitted. That lets udp=true take
-    // its source-format XUDP default, unlike explicit none/legacy or xudp=false.
+    // Clash treats an empty packet-encoding as omitted, while none/legacy and
+    // xudp=false explicitly select the native VLESS packet command.
     let packet_encoding =
-        raw_alias(mapping, &["packet-encoding", "packet_encoding"])?.filter(|value| active(value));
+        raw_alias(mapping, &["packet-encoding", "packet_encoding"])?.filter(|value| {
+            value
+                .as_str()
+                .is_none_or(|encoding| !encoding.trim().is_empty())
+        });
     let xudp = yaml_value(mapping, "xudp").filter(|value| match value {
         Value::Null => false,
         Value::String(value) => !value.trim().is_empty(),
         _ => true,
     });
-    let packet_encoding_disabled = packet_encoding.is_some_and(|value| {
-        value
-            .as_str()
-            .is_some_and(|encoding| matches!(encoding.trim(), "none" | "legacy"))
-    });
-    let xudp_enabled = match (packet_encoding, xudp) {
+    let (xudp_enabled, native_selected) = match (packet_encoding, xudp) {
         (Some(value), None) => match value
             .as_str()
             .ok_or("VLESS packet encoding must be a string")?
             .trim()
         {
-            "" | "none" | "legacy" => false,
-            "xudp" => true,
+            "none" | "legacy" => (false, true),
+            "xudp" => (true, false),
             _ => return Err("unsupported VLESS packet encoding"),
         },
-        (None, Some(value)) => value.as_bool().ok_or("VLESS xudp must be boolean")?,
-        (None, None) => false,
+        (None, Some(value)) => match value.as_bool().ok_or("VLESS xudp must be boolean")? {
+            true => (true, false),
+            false => (false, true),
+        },
+        (None, None) => (false, false),
         (Some(_), Some(_)) => return Err("duplicate VLESS XUDP representations"),
     };
-    let xudp_disabled =
-        packet_encoding_disabled || xudp.is_some_and(|value| value.as_bool() == Some(false));
 
     if let Some(value) =
         raw_alias(mapping, &["packet-addr", "packet_addr"])?.filter(|value| active(value))
@@ -186,17 +186,13 @@ pub(in crate::subscription) fn parse_vless_external_mode(
         mode
     } else if uot_enabled {
         WireMode::UotV2
+    } else if native_selected {
+        WireMode::Native
     } else {
         WireMode::Legacy
     };
     if udp == Some(true) && mode == WireMode::Legacy {
-        if xudp_disabled {
-            return Err("VLESS udp=true requires an enabled packet mode");
-        }
         mode = WireMode::Xudp;
-    }
-    if udp == Some(false) && mode != WireMode::Legacy {
-        return Err("VLESS packet mode enables UDP but udp is false");
     }
     Ok(mode)
 }

@@ -1,4 +1,5 @@
 use super::validation::ValidationFailure;
+use crate::options::vocab::packet_network;
 use crate::types::NodeProtocol;
 
 use super::{WireMode, identity_field};
@@ -97,7 +98,7 @@ pub struct VmessConfig {
     pub tls: TlsOptions,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VlessConfig {
     pub uuid: Option<String>,
     pub encryption: Option<String>,
@@ -108,43 +109,93 @@ pub struct VlessConfig {
     pub tls: TlsOptions,
 }
 
+impl Default for VlessConfig {
+    fn default() -> Self {
+        Self {
+            uuid: None,
+            encryption: None,
+            mode: WireMode::Auto,
+            flow: None,
+            network: None,
+            transport: StreamTransportOptions::default(),
+            tls: TlsOptions::default(),
+        }
+    }
+}
+
 impl VlessConfig {
+    pub fn udp_enabled(&self) -> bool {
+        self.mode != WireMode::Legacy
+            && self
+                .network
+                .as_deref()
+                .is_none_or(|network| matches!(packet_network(network), Ok(Some(true))))
+    }
+
+    pub fn udp_mode(&self, port: u16) -> WireMode {
+        match self.mode {
+            WireMode::Auto if self.is_vision() || !matches!(port, 53 | 443) => WireMode::Xudp,
+            WireMode::Auto => WireMode::Native,
+            mode => mode,
+        }
+    }
+
+    pub fn is_vision(&self) -> bool {
+        matches!(
+            self.flow.as_deref(),
+            Some("xtls-rprx-vision" | "xtls-rprx-vision-udp443")
+        )
+    }
+
+    pub fn wire_flow(&self) -> Option<&str> {
+        match self.flow.as_deref() {
+            Some("xtls-rprx-vision-udp443") => Some("xtls-rprx-vision"),
+            flow => flow,
+        }
+    }
+
+    pub fn rejects_udp_port(&self, port: u16) -> bool {
+        port == 443 && self.flow.as_deref() == Some("xtls-rprx-vision") && self.udp_enabled()
+    }
+
     pub fn validate(&self, _name: &str) -> Result<(), crate::ConfigError> {
         self.validate_fields()
             .map_err(ValidationFailure::into_legacy)
     }
 
     pub(super) fn validate_fields(&self) -> Result<(), ValidationFailure> {
-        if self
+        let encrypted = self
             .encryption
             .as_deref()
-            .is_some_and(|value| !value.is_empty() && value != "none")
-            && self.flow.as_deref().is_some_and(|flow| !flow.is_empty())
-        {
+            .is_some_and(|value| !value.is_empty() && value != "none");
+        let has_flow = self.flow.as_deref().is_some_and(|flow| !flow.is_empty());
+        if encrypted && has_flow {
             return Err(ValidationFailure::new(
                 Some("flow"),
                 "VLESS Encryption cannot be combined with flow",
             ));
         }
-        if self.mode != WireMode::Legacy {
-            if let Some(flow) = self.flow.as_deref().filter(|flow| !flow.is_empty())
-                && !(self.mode == WireMode::Xudp && flow == "xtls-rprx-vision")
-            {
-                return Err(ValidationFailure::new(
-                    Some("flow"),
-                    "VLESS mode cannot be combined with this flow",
-                ));
-            }
-            if self
-                .encryption
-                .as_deref()
-                .is_some_and(|value| !value.is_empty() && value != "none")
-            {
-                return Err(ValidationFailure::new(
-                    Some("encryption"),
-                    "VLESS mode cannot be combined with VLESS Encryption",
-                ));
-            }
+        if has_flow
+            && !(matches!(
+                self.mode,
+                WireMode::Legacy | WireMode::Auto | WireMode::Xudp
+            ) || self.mode == WireMode::Native && !self.udp_enabled())
+        {
+            return Err(ValidationFailure::new(
+                Some("flow"),
+                "VLESS mode cannot be combined with this flow",
+            ));
+        }
+        if encrypted
+            && !matches!(
+                self.mode,
+                WireMode::Legacy | WireMode::Auto | WireMode::Native | WireMode::Xudp
+            )
+        {
+            return Err(ValidationFailure::new(
+                Some("encryption"),
+                "VLESS mode cannot be combined with VLESS Encryption",
+            ));
         }
         // A REALITY node without a usable public key falls back to ordinary TLS with the
         // configured SNI, which is the opposite of what selecting REALITY asked for.
@@ -407,6 +458,9 @@ impl OutboundConfig {
         {
             fingerprint.push('|');
             fingerprint.push_str(&identity_field(config.mode.as_str()));
+            if !config.udp_enabled() {
+                fingerprint.push_str("|udp-disabled");
+            }
         }
         fingerprint
     }

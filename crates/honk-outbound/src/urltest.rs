@@ -8,8 +8,8 @@
 //! whose transport fails or times out falls back to the first exchange's time;
 //! rejected response heads and bad decoded status codes never do. Successful measurements
 //! feed the node's latency history in [`AliveDialerSet`].
-//! A lone failure leaves history unchanged; a second consecutive failure adds
-//! a synthetic penalty and demotes the node.
+//! A lone ordinary failure leaves history unchanged; a second consecutive one
+//! adds a synthetic penalty and demotes the node. Local packet refusal is neutral.
 //!
 //! Shared by clash delay measurements and periodic HTTP health checks; their
 //! wrappers remain responsible for alive-state updates.
@@ -23,7 +23,9 @@ use crate::proxy::{ProxyRegistry, TcpOutbound};
 use anyhow::{Context, anyhow};
 use honk_config::check::{HttpCheckTarget, decode_health_http_target, decode_http_check_target};
 use honk_config::node::Node;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -151,15 +153,12 @@ fn validate_runtime(runtime: &Arc<crate::runtime::NodeRuntime>) -> anyhow::Resul
         .map_err(anyhow::Error::new)
 }
 
-/// Optional resolver for check-URL hosts: `(host, port) → addr`.
+/// Optional resolver for check-URL hosts: `(host, port) → Result<addrs>`.
 /// honk-core installs the DNS-forwarder-backed resolver so delay
 /// measurements share the internal DNS stack; unset means the raw system
 /// resolver (tests, tools).
-pub type UrltestResolver = std::sync::Arc<
-    dyn Fn(
-            String,
-            u16,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<SocketAddr>> + Send>>
+pub type UrltestResolver = Arc<
+    dyn Fn(String, u16) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<SocketAddr>>> + Send>>
         + Send
         + Sync,
 >;
@@ -253,7 +252,7 @@ async fn resolve_urltest_address(
     let hook = URLTEST_RESOLVER.read().clone();
     if let Some(hook) = hook {
         return hook(host.to_string(), port)
-            .await
+            .await?
             .into_iter()
             .next()
             .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"));
@@ -856,7 +855,7 @@ where
 /// Measure every member of a group concurrently (at most
 /// [`URLTEST_MAX_CONCURRENT`] at a time) and fold the results into the
 /// alive set: successes record the measured TCP latency; only a second
-/// consecutive failure adds a synthetic penalty and demotes the node.
+/// consecutive ordinary failure adds a synthetic penalty and demotes the node.
 ///
 /// Returns one `(node_name, result)` entry per member, in member order.
 pub async fn urltest_group_with_feedback(
@@ -925,7 +924,10 @@ async fn urltest_group_impl(
                     IpVersion::V4,
                     *latency,
                 ),
-                Err(_) => alive_set.record_dial_failure(node.id, ProbeDomain::Tcp, IpVersion::V4),
+                Err(error) if !crate::proxy::is_packet_rejection(error) => {
+                    alive_set.record_dial_failure(node.id, ProbeDomain::Tcp, IpVersion::V4)
+                }
+                Err(_) => {}
             }
             (node.name.clone(), result)
         });
@@ -1020,28 +1022,49 @@ fn is_header_name_byte(byte: u8) -> bool {
 mod resolver_hook_tests {
     use super::*;
 
-    /// The installed hook is consulted before the system resolver.
+    pub(super) static RESOLVER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    pub(super) struct ResolverReset(Option<UrltestResolver>);
+
+    impl ResolverReset {
+        pub(super) fn install(hook: UrltestResolver) -> Self {
+            Self(URLTEST_RESOLVER.write().replace(hook))
+        }
+    }
+
+    impl Drop for ResolverReset {
+        fn drop(&mut self) {
+            *URLTEST_RESOLVER.write() = self.0.take();
+        }
+    }
+
     #[tokio::test]
-    async fn hook_supplies_urltest_addresses() {
-        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    async fn hook_supplies_addresses_and_preserves_rejection() {
+        let _lock = RESOLVER_LOCK.lock().await;
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let called2 = called.clone();
-        set_urltest_resolver(std::sync::Arc::new(move |host, port| {
+        let hook: UrltestResolver = Arc::new(move |host, port| {
             let called2 = called2.clone();
             Box::pin(async move {
                 // Other urltest tests run concurrently against this global
-                // hook — answer only our host, pass foreigners through to
-                // the system resolver instead of breaking their dials.
+                // hook — answer only our hosts and pass foreigners through.
+                if host == "rejected.invalid" {
+                    return Err(anyhow::Error::new(crate::proxy::PacketRejection::Policy));
+                }
+                if host == "empty.invalid" {
+                    return Ok(Vec::new());
+                }
                 if host == "example.invalid" && port == 443 {
                     called2.store(true, std::sync::atomic::Ordering::Relaxed);
-                    vec!["127.0.0.1:443".parse().unwrap()]
-                } else {
-                    tokio::net::lookup_host(format!("{host}:{port}"))
-                        .await
-                        .map(|addrs| addrs.collect())
-                        .unwrap_or_default()
+                    return Ok(vec!["127.0.0.1:443".parse().unwrap()]);
                 }
+                tokio::net::lookup_host(format!("{host}:{port}"))
+                    .await
+                    .map(|addrs| addrs.collect())
+                    .map_err(anyhow::Error::from)
             })
-        }));
+        });
+        let _reset = ResolverReset::install(hook);
         let node = honk_config::Config::builtin_direct_node();
         // The dial itself fails (nothing on 127.0.0.1:443) but the hook
         // must have been consulted first.
@@ -1054,7 +1077,16 @@ mod resolver_hook_tests {
         )
         .await;
         assert!(called.load(std::sync::atomic::Ordering::Relaxed));
-        *URLTEST_RESOLVER.write() = None;
+
+        let error = resolve_urltest_address("rejected.invalid", 443, false)
+            .await
+            .expect_err("typed hook rejection");
+        assert!(crate::proxy::is_packet_rejection(&error));
+
+        let error = resolve_urltest_address("empty.invalid", 443, false)
+            .await
+            .expect_err("empty hook result");
+        assert!(error.to_string().contains("no address resolved"));
     }
 }
 
@@ -1927,6 +1959,57 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_urltest_group_does_not_penalize_resolver_rejection() {
+        let _lock = super::resolver_hook_tests::RESOLVER_LOCK.lock().await;
+        let hook: UrltestResolver = Arc::new(|host, port| {
+            Box::pin(async move {
+                if host == "rejected.invalid" {
+                    return Err(anyhow::Error::new(crate::proxy::PacketRejection::Policy));
+                }
+                tokio::net::lookup_host(format!("{host}:{port}"))
+                    .await
+                    .map(|addrs| addrs.collect())
+                    .map_err(anyhow::Error::from)
+            })
+        });
+        let _reset = super::resolver_hook_tests::ResolverReset::install(hook);
+
+        let member = make_node("rejected");
+        let mut registry = ProxyRegistry::new();
+        registry.register(crate::proxy::ProtocolEntry::new(
+            NodeProtocol::Socks5,
+            Arc::new(MockHandler),
+        ));
+        let registry = Arc::new(registry);
+        let alive_set = Arc::new(AliveDialerSet::new());
+        let runtime = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&member)).unwrap(),
+        );
+
+        for _ in 0..2 {
+            let results = urltest_group_impl(
+                std::slice::from_ref(&member),
+                &runtime,
+                &registry,
+                &alive_set,
+                "https://rejected.invalid/",
+                Duration::from_millis(50),
+                None,
+            )
+            .await;
+            assert!(crate::proxy::is_packet_rejection(
+                results[0].1.as_ref().expect_err("typed resolver rejection")
+            ));
+        }
+
+        assert!(!alive_set.is_failure_demoted(member.id, ProbeDomain::Tcp, IpVersion::V4));
+        assert_eq!(
+            alive_set.get_last_latency(member.id, ProbeDomain::Tcp, IpVersion::V4),
+            None
+        );
     }
 
     #[tokio::test]

@@ -406,20 +406,23 @@ node {
     #[test]
     fn test_parse_vless_mode_link() {
         let config = parse_dae_config(
-            "node {\n    xudp: 'vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=xudp#node'\n    cool: 'vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=mux-cool#node'\n}",
+            "node {\n    auto: 'vless://00000000-0000-0000-0000-000000000001@example.com:443#node'\n    native: 'vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=native&udp=0#node'\n    xudp: 'vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=xudp#node'\n    cool: 'vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=mux-cool#node'\n}",
         )
         .unwrap();
-        assert_eq!(config.nodes.len(), 2);
-        assert_eq!(config.nodes[0].name, "xudp");
-        assert_eq!(
-            config.nodes[0].vless().unwrap().mode,
-            crate::node::WireMode::Xudp
-        );
-        assert_eq!(config.nodes[1].name, "cool");
-        assert_eq!(
-            config.nodes[1].vless().unwrap().mode,
-            crate::node::WireMode::MuxCool
-        );
+        assert_eq!(config.nodes.len(), 4);
+        for (index, (name, mode)) in [
+            ("auto", crate::node::WireMode::Auto),
+            ("native", crate::node::WireMode::Native),
+            ("xudp", crate::node::WireMode::Xudp),
+            ("cool", crate::node::WireMode::MuxCool),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(config.nodes[index].name, name);
+            assert_eq!(config.nodes[index].vless().unwrap().mode, mode);
+        }
+        assert!(!config.nodes[1].vless().unwrap().udp_enabled());
     }
 
     #[test]

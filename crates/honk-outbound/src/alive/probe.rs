@@ -88,14 +88,13 @@ impl AliveDialerSet {
         // Use cached IPs from startup (Go: TcpCheckOption.Ip46).
         // Avoids repeated DNS resolution which can fail transiently and
         // cascade into all nodes being marked dead simultaneously.
-        // dae-format literal fallback IPs are merged in so a DNS failure
-        // alone never leaves the probe without targets.
+        // Configured dae-format literal fallbacks remain usable when DNS
+        // resolution fails or is locally refused.
         let port = target.port();
         let cached = self.check_url_ips.read().clone();
         let addrs: Vec<SocketAddr> = if cached.is_empty() {
-            // Cache miss — one-time resolution via the installed resolver
-            // (system lookup is the fallback inside resolve_host).
-            let resolved = self.resolve_host(hostname, port).await;
+            // Cache miss — one-time resolution via the installed resolver.
+            let resolved = self.resolve_host(hostname, port).await.unwrap_or_default();
             let ips = Self::merge_check_addrs(resolved, &check_url, port);
             *self.check_url_ips.write() = ips.clone();
             ips
@@ -217,7 +216,13 @@ impl AliveDialerSet {
         let Some(ref prober) = prober_opt else {
             return false;
         };
-        let addrs = self.check_ips_for_url(url).await;
+        let addrs = match self.check_ips_for_url(url).await {
+            Ok(addrs) => addrs,
+            Err(_) => {
+                tracing::debug!("Health check target resolution was locally refused for '{url}'");
+                return false;
+            }
+        };
         if addrs.is_empty() {
             tracing::debug!(
                 "Health check found no addresses for '{}' (member '{}')",
@@ -294,11 +299,9 @@ impl AliveDialerSet {
             },
             None => (addr.clone(), 80),
         };
-        let addrs: Vec<_> = {
-            let out = self.resolve_host(&host, port).await;
-            if !out.is_empty() {
-                out
-            } else {
+        let addrs = match self.resolve_host(&host, port).await {
+            Ok(addrs) if !addrs.is_empty() => addrs,
+            Ok(_) => {
                 tracing::debug!(
                     "Health check DNS resolution failed for node '{}' ({}): system lookup failed",
                     node_name,
@@ -308,18 +311,15 @@ impl AliveDialerSet {
                 self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V6);
                 return false;
             }
+            Err(_) => {
+                tracing::debug!(
+                    "Health check target resolution was locally refused for node '{}' ({})",
+                    node_name,
+                    addr
+                );
+                return false;
+            }
         };
-
-        if addrs.is_empty() {
-            tracing::debug!(
-                "Health check found no addresses for node '{}' ({})",
-                node_name,
-                addr
-            );
-            self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V4);
-            self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V6);
-            return false;
-        }
 
         let mut probe_addrs: Vec<SocketAddr> = Vec::new();
         let mut any_v4 = false;
@@ -458,7 +458,7 @@ impl AliveDialerSet {
         const IPVERS: [IpVersion; 2] = [IpVersion::V4, IpVersion::V6];
         let outcome = prober.probe_udp(&node_name, timeout).await;
         match (outcome.dns, outcome.data_path) {
-            (Ok(elapsed), _) => {
+            (Some(Ok(elapsed)), _) => {
                 tracing::debug!(
                     "UDP health check succeeded for node '{}' ({}ms)",
                     node_name,
@@ -471,7 +471,7 @@ impl AliveDialerSet {
                 }
                 true
             }
-            (Err(dns_err), Some(Ok(data_elapsed))) => {
+            (Some(Err(dns_err)), Some(Ok(data_elapsed))) => {
                 tracing::debug!(
                     "UDP DNS check failed for node '{}' but the data-path handshake succeeded ({}ms): {}",
                     node_name,
@@ -484,7 +484,7 @@ impl AliveDialerSet {
                 }
                 true
             }
-            (Err(err_msg), data_path) => {
+            (Some(Err(err_msg)), data_path) => {
                 match &data_path {
                     Some(Err(data_err)) => tracing::debug!(
                         "UDP health check failed for node '{}': {}; data-path handshake: {}",
@@ -505,6 +505,19 @@ impl AliveDialerSet {
                 }
                 false
             }
+            (None, Some(Ok(data_elapsed))) => {
+                for ipver in IPVERS {
+                    self.mark_alive_for_latency(node_id, ProbeDomain::DataUdp, ipver, data_elapsed);
+                }
+                true
+            }
+            (None, Some(Err(_))) => {
+                for ipver in IPVERS {
+                    self.mark_dead_for(node_id, ProbeDomain::DataUdp, ipver);
+                }
+                false
+            }
+            (None, None) => false,
         }
     }
 

@@ -46,7 +46,7 @@ struct FlatNode {
     #[serde(default)]
     encryption: Option<String>,
     #[serde(default)]
-    vless_mode: WireMode,
+    vless_mode: Option<WireMode>,
     #[serde(default)]
     plugin: Option<String>,
     #[serde(default)]
@@ -286,7 +286,8 @@ impl FlatNode {
             encryption
         );
         strip!(
-            self.vless_mode != WireMode::Legacy && self.protocol != NodeProtocol::VLess,
+            self.vless_mode.is_some_and(|mode| mode != WireMode::Legacy)
+                && self.protocol != NodeProtocol::VLess,
             vless_mode
         );
         strip!(
@@ -479,7 +480,7 @@ impl FlatNode {
                     semantic_error(
                         source,
                         setting.clone().field("flow"),
-                        "VLESS flow must be absent or exactly xtls-rprx-vision; aliases must agree",
+                        "VLESS flow must be absent, xtls-rprx-vision, or xtls-rprx-vision-udp443; aliases must agree",
                     )
                 })?
                 .is_none()
@@ -522,7 +523,7 @@ impl FlatNode {
                 OutboundConfig::Vless(VlessConfig {
                     uuid: flat.password.take(),
                     encryption: flat.encryption.take(),
-                    mode: flat.vless_mode,
+                    mode: flat.vless_mode.unwrap_or(WireMode::Auto),
                     flow: flat.flow.take(),
                     network: flat.network.take(),
                     transport,

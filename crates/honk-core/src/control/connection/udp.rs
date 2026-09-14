@@ -368,6 +368,9 @@ impl ControlPlaneHandle {
             })
         };
         let callbacks = UdpStaggerCallbacks {
+            allows_target: Arc::new(move |node| {
+                honk_outbound::descriptor::udp_target_allowed(node, original_dst.port())
+            }),
             is_eligible: {
                 let group_manager = self.group_manager.clone();
                 Arc::new(move |node| {
@@ -411,7 +414,7 @@ impl ControlPlaneHandle {
             prepare,
             callbacks,
         )
-        .await
+        .await?
         else {
             debug!(
                 "All UDP transport preparations failed for '{}'",

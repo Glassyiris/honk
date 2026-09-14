@@ -264,15 +264,16 @@ async fn c28_udp_reload_preserves_the_configured_probe_target() {
         let calls = Arc::clone(&resolver_calls);
         let resolver: crate::outbound::ResolveHook = Arc::new(move |_host, port| {
             calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move { vec![SocketAddr::from(([127, 0, 0, 1], port))] })
+            Box::pin(async move { Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))]) })
         });
         let node = canonical_socks5("c28-udp", "127.0.0.1", 9, None);
         let mut config = Config::default();
         config.global.nfqueue_enable = false;
         config.global.udp_check_dns = vec![old_raw.into()];
         config.nodes = vec![node.clone()];
-        let target =
-            resolve_udp_check_target(&config.global.udp_check_dns, Some(resolver.clone())).await;
+        let target = resolve_udp_check_target(&config.global.udp_check_dns, Some(resolver.clone()))
+            .await
+            .unwrap();
         let identity = udp_probe_identity(&config.global.udp_check_dns, target);
         let cp = control_plane(config.clone());
         cp.alive_set().set_resolver(resolver);
@@ -291,8 +292,7 @@ async fn c28_udp_reload_preserves_the_configured_probe_target() {
             Arc::new(registry),
             cp.runtime_registry(),
             cp.stats_handle(),
-            target,
-            identity,
+            Some((target, identity)),
             None,
             cp.group_manager(),
         );
@@ -303,7 +303,7 @@ async fn c28_udp_reload_preserves_the_configured_probe_target() {
             .apply_runtime_config(candidate.clone(), Default::default(), &DrainTracker::new())
             .await;
         let outcome = UdpProber::probe_udp(&prober, &node.name, Duration::from_secs(1)).await;
-        assert!(outcome.dns.is_ok(), "{outcome:?}");
+        assert!(matches!(outcome.dns, Some(Ok(_))), "{outcome:?}");
         assert_eq!(
             *capture.lock(),
             Some(expected_target.parse::<SocketAddr>().unwrap()),

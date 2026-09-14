@@ -755,10 +755,7 @@ fn udp_frame(
         MAX_MUX_XUDP_PACKET_SIZE
     };
     if payload.is_empty() || payload.len() > max_packet_size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("XUDP datagram length must be 1..={max_packet_size}"),
-        ));
+        return Err(super::PacketRejection::InvalidSize.into());
     }
     let mut metadata = base_metadata(
         id,
@@ -1437,17 +1434,26 @@ mod tests {
 
     #[test]
     fn xudp_packet_caps_match_carrier_modes() {
-        assert!(
-            udp_frame(
-                0,
-                true,
-                udp_target(),
-                None,
-                [0; 8],
-                &vec![0; MAX_SINGLE_XUDP_PACKET_SIZE + 1],
-            )
-            .is_err()
-        );
+        let rejected = |result: io::Result<Bytes>| {
+            let error = anyhow::Error::new(result.unwrap_err());
+            super::super::is_packet_rejection(&error)
+        };
+        assert!(rejected(udp_frame(
+            0,
+            true,
+            udp_target(),
+            None,
+            [0; 8],
+            &[],
+        )));
+        assert!(rejected(udp_frame(
+            0,
+            true,
+            udp_target(),
+            None,
+            [0; 8],
+            &vec![0; MAX_SINGLE_XUDP_PACKET_SIZE + 1],
+        )));
         assert!(
             udp_frame(
                 1,
@@ -1459,17 +1465,14 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(
-            udp_frame(
-                1,
-                true,
-                udp_target(),
-                None,
-                [0; 8],
-                &vec![0; MAX_MUX_XUDP_PACKET_SIZE + 1],
-            )
-            .is_err()
-        );
+        assert!(rejected(udp_frame(
+            1,
+            true,
+            udp_target(),
+            None,
+            [0; 8],
+            &vec![0; MAX_MUX_XUDP_PACKET_SIZE + 1],
+        )));
     }
 
     #[tokio::test]

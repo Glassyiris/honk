@@ -19,7 +19,7 @@
 //!    - `uuid`: 16 raw bytes parsed from `node.password` (UUID string)
 //!    - `addon_len` / `addon`: Xray `encoding.Addons` protobuf carrying
 //!      the flow (`node.flow`, e.g. `xtls-rprx-vision`); empty otherwise
-//!    - `cmd`: 0x01 TCP
+//!    - `cmd`: 0x01 TCP or 0x02 UDP
 //!    - `port`: big-endian u16
 //!    - `atyp`: 0x01 IPv4, 0x02 Domain, 0x03 IPv6
 //!    - `addr`: 4 bytes (IPv4) / 1+len bytes (Domain) / 16 bytes (IPv6)
@@ -50,6 +50,9 @@ use crate::session::{OpenError, SpeculativeCheckout};
 
 const VLESS_VERSION: u8 = 0x00;
 const CMD_TCP: u8 = 0x01;
+const CMD_UDP: u8 = 0x02;
+// Xray bounds command-UDP frames to 8192 bytes including the u16 length.
+const MAX_NATIVE_PACKET_SIZE: usize = 8190;
 
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x02;
@@ -90,7 +93,7 @@ impl VLessHandler {
             return Ok(None);
         };
         anyhow::ensure!(
-            vless.flow.as_deref().is_none_or(str::is_empty),
+            vless.wire_flow().is_none_or(str::is_empty),
             "VLESS Encryption cannot be combined with XTLS flow"
         );
         let cache_key = if node.id.is_nil() {
@@ -130,7 +133,9 @@ impl VLessHandler {
         anyhow::ensure!(
             matches!(
                 (command, target),
-                (CMD_TCP, Some(_)) | (super::vless_cool::VLESS_MUX_COMMAND, None)
+                (CMD_TCP, Some(_))
+                    | (CMD_UDP, Some(_))
+                    | (super::vless_cool::VLESS_MUX_COMMAND, None)
             ),
             "VLESS: invalid command target"
         );
@@ -203,9 +208,7 @@ impl VLessHandler {
             let encrypted = config.connect(stream).await?;
             return Ok(Self::wrap_response_stream(node, uuid, Box::new(encrypted)));
         }
-        if vless.flow.as_deref() == Some("xtls-rprx-vision")
-            && matches!(vless.transport.transport.as_str(), "" | "tcp")
-        {
+        if vless.is_vision() && matches!(vless.transport.transport.as_str(), "" | "tcp") {
             let stream: Box<dyn AsyncReadWrite> =
                 match super::transport::maybe_tls_wrap_concrete(node, tcp).await? {
                     super::transport::MaybeTls::Tls(tls) => {
@@ -227,7 +230,7 @@ impl VLessHandler {
         stream: Box<dyn AsyncReadWrite>,
     ) -> Box<dyn AsyncReadWrite> {
         let stripped = ResponseHeaderStrip::new(stream);
-        if node.vless().unwrap().flow.as_deref() == Some("xtls-rprx-vision") {
+        if node.vless().unwrap().is_vision() {
             Box::new(VisionStream::new(stripped, uuid))
         } else {
             Box::new(stripped)
@@ -269,7 +272,7 @@ impl VLessHandler {
             CMD_TCP,
             Some(target),
             target_domain,
-            vless.flow.as_deref(),
+            vless.wire_flow(),
         )?;
         let stream = self
             .dial_carrier(node, uuid_bytes, header, tcp, connect_timeout)
@@ -293,10 +296,73 @@ impl VLessHandler {
             super::vless_cool::VLESS_MUX_COMMAND,
             None,
             None,
-            vless.flow.as_deref(),
+            vless.wire_flow(),
         )?;
         self.dial_carrier(node, uuid, header, None, connect_timeout)
             .await
+    }
+
+    fn ensure_udp_allowed(node: &Node, udp_capable: bool, port: u16) -> anyhow::Result<()> {
+        if udp_capable && crate::descriptor::udp_target_allowed(node, port) {
+            Ok(())
+        } else {
+            Err(super::PacketRejection::Policy.into())
+        }
+    }
+
+    async fn open_unpooled_udp(
+        &self,
+        node: &Node,
+        mode: WireMode,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: std::time::Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        match mode {
+            WireMode::Native => {
+                let vless = node.vless().unwrap();
+                let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
+                let header = Self::build_request_header(
+                    &uuid,
+                    CMD_UDP,
+                    Some(target),
+                    target_domain,
+                    vless.wire_flow(),
+                )?;
+                let stream = self
+                    .dial_carrier(node, uuid, header, None, connect_timeout)
+                    .await?;
+                Ok(Arc::new(VlessConnectedTransport::new(stream, target, None)))
+            }
+            WireMode::UotV2 => {
+                let setup = super::uot::connect_request(target, target_domain)?;
+                let magic_target = SocketAddr::from(([0, 0, 0, 0], 0));
+                let stream = self
+                    .dial_base(
+                        node,
+                        magic_target,
+                        Some(super::uot::MAGIC_ADDRESS),
+                        None,
+                        connect_timeout,
+                    )
+                    .await?
+                    .stream;
+                Ok(Arc::new(VlessConnectedTransport::new(
+                    stream,
+                    target,
+                    Some(setup),
+                )))
+            }
+            WireMode::Xudp => {
+                let stream = self.dial_mux_carrier(node, connect_timeout).await?;
+                Ok(super::vless_cool::connect_single_xudp(stream, target, target_domain).await?)
+            }
+            WireMode::Legacy
+            | WireMode::Auto
+            | WireMode::H2mux
+            | WireMode::H2muxPadded
+            | WireMode::MuxCool => unreachable!("resolved VLESS mode is not unpooled UDP"),
+        }
     }
 
     fn uses_mux_runtime(node: &Node) -> bool {
@@ -1000,47 +1066,57 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VisionStream<S> {
     }
 }
 
-struct VlessUotReader {
+struct VlessPacketReader {
     stream: tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>,
     decoder: super::uot::Decoder,
 }
 
-struct VlessUotWriter {
+struct VlessPacketWriter {
     stream: tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>,
     setup: Option<bytes::Bytes>,
     pending: bool,
 }
 
-struct VlessUotTransport {
-    reader: tokio::sync::Mutex<VlessUotReader>,
-    writer: tokio::sync::Mutex<VlessUotWriter>,
+struct VlessConnectedTransport {
+    reader: tokio::sync::Mutex<VlessPacketReader>,
+    writer: tokio::sync::Mutex<VlessPacketWriter>,
     target: SocketAddr,
+    native: bool,
 }
 
-impl VlessUotTransport {
-    fn new(stream: Box<dyn AsyncReadWrite>, target: SocketAddr, setup: bytes::Bytes) -> Self {
+impl VlessConnectedTransport {
+    fn new(
+        stream: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        setup: Option<bytes::Bytes>,
+    ) -> Self {
         let (reader, writer) = tokio::io::split(stream);
+        let native = setup.is_none();
         Self {
-            reader: tokio::sync::Mutex::new(VlessUotReader {
+            reader: tokio::sync::Mutex::new(VlessPacketReader {
                 stream: reader,
                 decoder: super::uot::Decoder::default(),
             }),
-            writer: tokio::sync::Mutex::new(VlessUotWriter {
+            writer: tokio::sync::Mutex::new(VlessPacketWriter {
                 stream: writer,
-                setup: Some(setup),
+                setup,
                 pending: false,
             }),
             target,
+            native,
         }
     }
 
     async fn send(&self, data: &[u8]) -> std::io::Result<()> {
+        if self.native && (data.is_empty() || data.len() > MAX_NATIVE_PACKET_SIZE) {
+            return Err(super::PacketRejection::InvalidSize.into());
+        }
         let packet = super::uot::encode_packet(data, super::uot::MAX_PACKET_SIZE)?;
         let mut writer = self.writer.lock().await;
         if writer.pending {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
-                "VLESS UoT write was interrupted",
+                "VLESS packet write was interrupted",
             ));
         }
         let frame = if let Some(setup) = writer.setup.as_ref() {
@@ -1060,16 +1136,16 @@ impl VlessUotTransport {
     }
 }
 
-impl std::fmt::Debug for VlessUotTransport {
+impl std::fmt::Debug for VlessConnectedTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VlessUotTransport")
+        f.debug_struct("VlessConnectedTransport")
             .field("target", &self.target)
             .finish_non_exhaustive()
     }
 }
 
 #[async_trait]
-impl PacketTransport for VlessUotTransport {
+impl PacketTransport for VlessConnectedTransport {
     fn relay_addr(&self) -> SocketAddr {
         self.target
     }
@@ -1093,7 +1169,7 @@ impl PacketTransport for VlessUotTransport {
             if size == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
-                    "VLESS UoT stream closed",
+                    "VLESS packet stream closed",
                 ));
             }
             reader.decoder.push(&chunk[..size])?;
@@ -1125,7 +1201,11 @@ impl TcpOutbound for VLessHandler {
                         .await?;
                 Ok(stream.with_owner(owner))
             }
-            WireMode::Legacy | WireMode::UotV2 | WireMode::Xudp => {
+            WireMode::Legacy
+            | WireMode::Auto
+            | WireMode::Native
+            | WireMode::UotV2
+            | WireMode::Xudp => {
                 self.dial_base(node, target, target_domain, None, connect_timeout)
                     .await
             }
@@ -1161,7 +1241,11 @@ impl TcpOutbound for VLessHandler {
             WireMode::MuxCool => {
                 Self::open_cool_tcp(runtime, target, target_domain, connect_timeout).await
             }
-            WireMode::Legacy | WireMode::UotV2 | WireMode::Xudp => {
+            WireMode::Legacy
+            | WireMode::Auto
+            | WireMode::Native
+            | WireMode::UotV2
+            | WireMode::Xudp => {
                 self.dial_base(&runtime.node, target, target_domain, None, connect_timeout)
                     .await
             }
@@ -1178,31 +1262,12 @@ impl PacketOutbound for VLessHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        if !crate::descriptor::network_allows_udp(node) {
-            anyhow::bail!("VLESS node '{}' disables UDP", node.name);
-        }
-        match node.vless().unwrap().mode {
-            WireMode::Legacy => anyhow::bail!(
-                "VLESS UDP requires uot-v2, xudp, h2mux, h2mux-padded, or mux-cool mode"
-            ),
-            WireMode::UotV2 => {
-                let setup = super::uot::connect_request(target, target_domain)?;
-                let magic_target = SocketAddr::from(([0, 0, 0, 0], 0));
-                let stream = self
-                    .dial_base(
-                        node,
-                        magic_target,
-                        Some(super::uot::MAGIC_ADDRESS),
-                        None,
-                        connect_timeout,
-                    )
-                    .await?
-                    .stream;
-                Ok(Arc::new(VlessUotTransport::new(stream, target, setup)))
-            }
-            WireMode::Xudp => {
-                let stream = self.dial_mux_carrier(node, connect_timeout).await?;
-                Ok(super::vless_cool::connect_single_xudp(stream, target, target_domain).await?)
+        let udp_capable = (crate::descriptor::descriptor(node.protocol()).supports_udp)(node);
+        Self::ensure_udp_allowed(node, udp_capable, target.port())?;
+        match node.vless().unwrap().udp_mode(target.port()) {
+            mode @ (WireMode::Native | WireMode::UotV2 | WireMode::Xudp) => {
+                self.open_unpooled_udp(node, mode, target, target_domain, connect_timeout)
+                    .await
             }
             WireMode::H2mux | WireMode::H2muxPadded => {
                 let owner = crate::runtime::NodeRuntime::try_ephemeral_guarded(node)?;
@@ -1218,6 +1283,7 @@ impl PacketOutbound for VLessHandler {
                         .await?;
                 Ok(super::packet_transport_with_owner(transport, owner))
             }
+            WireMode::Legacy | WireMode::Auto => Err(super::PacketRejection::Policy.into()),
         }
     }
 
@@ -1228,17 +1294,19 @@ impl PacketOutbound for VLessHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        match runtime.node.vless().unwrap().mode {
+        Self::ensure_udp_allowed(&runtime.node, runtime.udp_capable, target.port())?;
+        match runtime.node.vless().unwrap().udp_mode(target.port()) {
             WireMode::H2mux | WireMode::H2muxPadded => {
                 Self::open_h2_udp(runtime, target, target_domain, connect_timeout).await
             }
             WireMode::MuxCool => {
                 Self::open_cool_udp(runtime, target, target_domain, connect_timeout).await
             }
-            WireMode::Legacy | WireMode::UotV2 | WireMode::Xudp => {
-                self.dial_udp_transport(&runtime.node, target, target_domain, connect_timeout)
+            mode @ (WireMode::Native | WireMode::UotV2 | WireMode::Xudp) => {
+                self.open_unpooled_udp(&runtime.node, mode, target, target_domain, connect_timeout)
                     .await
             }
+            WireMode::Legacy | WireMode::Auto => Err(super::PacketRejection::Policy.into()),
         }
     }
 
@@ -1249,7 +1317,8 @@ impl PacketOutbound for VLessHandler {
         target_domain: Option<&str>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<PreparedUdpTransport> {
-        match runtime.node.vless().unwrap().mode {
+        Self::ensure_udp_allowed(&runtime.node, runtime.udp_capable, target.port())?;
+        match runtime.node.vless().unwrap().udp_mode(target.port()) {
             WireMode::H2mux | WireMode::H2muxPadded => {
                 let pool = runtime.vless_h2_pool()?;
                 let node = Arc::clone(&runtime.node);
@@ -1274,10 +1343,11 @@ impl PacketOutbound for VLessHandler {
                 )
                 .await
             }
-            WireMode::Legacy | WireMode::UotV2 | WireMode::Xudp => self
-                .dial_udp_transport_runtime(runtime, target, target_domain, connect_timeout)
+            mode @ (WireMode::Native | WireMode::UotV2 | WireMode::Xudp) => self
+                .open_unpooled_udp(&runtime.node, mode, target, target_domain, connect_timeout)
                 .await
                 .map(PreparedUdpTransport::ready),
+            WireMode::Legacy | WireMode::Auto => Err(super::PacketRejection::Policy.into()),
         }
     }
 }
@@ -1311,9 +1381,11 @@ impl WarmableOutbound for VLessHandler {
                 )
                 .await?;
             }
-            WireMode::Legacy | WireMode::UotV2 | WireMode::Xudp => {
-                anyhow::bail!("VLESS mode has no warmable runtime")
-            }
+            WireMode::Legacy
+            | WireMode::Auto
+            | WireMode::Native
+            | WireMode::UotV2
+            | WireMode::Xudp => anyhow::bail!("VLESS mode has no warmable runtime"),
         }
         Ok(())
     }
@@ -1891,6 +1963,185 @@ mod tests {
         );
         assert_eq!(&output[..6], b"second");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_native_udp_is_lazy_bounded_and_preserves_frames() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (lazy_tx, lazy_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = [0; 19];
+            stream.read_exact(&mut head).await.unwrap();
+            assert_eq!(head[18], 0x02);
+            let mut target = [0; 7];
+            stream.read_exact(&mut target).await.unwrap();
+            assert_eq!(target, [0, 53, ATYP_IPV4, 8, 8, 8, 8]);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), stream.read_u8())
+                    .await
+                    .is_err(),
+                "native UDP must wait for the first datagram"
+            );
+            lazy_tx.send(()).unwrap();
+
+            let mut packet = vec![0; 2 + MAX_NATIVE_PACKET_SIZE];
+            stream.read_exact(&mut packet).await.unwrap();
+            assert_eq!(&packet[..2], &(MAX_NATIVE_PACKET_SIZE as u16).to_be_bytes());
+            assert!(packet[2..].iter().all(|byte| *byte == 0x5a));
+
+            let mut response = vec![0, 0];
+            response.extend_from_slice(
+                &super::super::uot::encode_packet(&[], super::super::uot::MAX_PACKET_SIZE).unwrap(),
+            );
+            response.extend_from_slice(
+                &super::super::uot::encode_packet(b"answer", super::super::uot::MAX_PACKET_SIZE)
+                    .unwrap(),
+            );
+            stream.write_all(&response).await.unwrap();
+        });
+
+        let node = Node::from_share_link(&format!(
+            "vless://b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3@127.0.0.1:{port}?security=none&udp=1#vless-auto"
+        ))
+        .unwrap();
+        let vless = node.vless().unwrap();
+        assert_eq!(vless.mode, WireMode::Auto);
+        assert_eq!(vless.udp_mode(53), WireMode::Native);
+        assert_eq!(vless.udp_mode(443), WireMode::Native);
+        assert_eq!(vless.udp_mode(54), WireMode::Xudp);
+
+        let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let transport = VLessHandler::new()
+            .dial_udp_transport(&node, target, None, std::time::Duration::from_secs(3))
+            .await
+            .unwrap();
+        lazy_rx.await.unwrap();
+        let oversized = vec![0; MAX_NATIVE_PACKET_SIZE + 1];
+        for packet in [&[][..], oversized.as_slice()] {
+            let error = transport.send_packet_confirmed(packet).await.unwrap_err();
+            assert!(super::super::is_packet_rejection(&anyhow::Error::new(
+                error
+            )));
+        }
+        let maximum = vec![0x5a; MAX_NATIVE_PACKET_SIZE];
+        transport.send_packet_confirmed(&maximum).await.unwrap();
+
+        assert_eq!(transport.recv_packet(&mut []).await.unwrap(), (0, target));
+        let error = transport.recv_packet(&mut [0; 1]).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let mut output = [0; 8];
+        assert_eq!(
+            transport.recv_packet(&mut output).await.unwrap(),
+            (6, target)
+        );
+        assert_eq!(&output[..6], b"answer");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn packet_policy_precedes_every_vless_dial_path() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handler = VLessHandler::new();
+        let target: SocketAddr = "8.8.8.8:443".parse().unwrap();
+        let node = Node::from_share_link(&format!(
+            "vless://b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3@127.0.0.1:{port}?flow=xtls-rprx-vision&udp=1#policy"
+        ))
+        .unwrap();
+        let deadline = std::time::Duration::from_secs(1);
+        let direct = tokio::time::timeout(
+            deadline,
+            handler.dial_udp_transport(&node, target, None, deadline),
+        )
+        .await
+        .expect("VLESS target policy blocked during preflight")
+        .unwrap_err();
+        assert!(super::super::is_packet_rejection(&direct));
+
+        let owner = crate::runtime::NodeRuntime::try_ephemeral_guarded(&node).unwrap();
+        let runtime = owner.runtime();
+        let runtime_error = tokio::time::timeout(
+            deadline,
+            handler.dial_udp_transport_runtime(Arc::clone(&runtime), target, None, deadline),
+        )
+        .await
+        .expect("runtime VLESS target policy blocked during preflight")
+        .unwrap_err();
+        assert!(super::super::is_packet_rejection(&runtime_error));
+        let speculative_error = tokio::time::timeout(
+            deadline,
+            handler.dial_udp_transport_speculative_runtime(runtime, target, None, deadline),
+        )
+        .await
+        .expect("speculative VLESS target policy blocked during preflight")
+        .unwrap_err();
+        assert!(super::super::is_packet_rejection(&speculative_error));
+        owner.close().await;
+
+        let disabled = Node::from_share_link(&format!(
+            "vless://b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3@127.0.0.1:{port}?security=none&udp=0#disabled"
+        ))
+        .unwrap();
+        let network_error = tokio::time::timeout(
+            deadline,
+            handler.dial_udp_transport(&disabled, "8.8.8.8:53".parse().unwrap(), None, deadline),
+        )
+        .await
+        .expect("VLESS network policy blocked during preflight")
+        .unwrap_err();
+        assert!(super::super::is_packet_rejection(&network_error));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                .await
+                .is_err(),
+            "packet policy must run before opening a carrier"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_connected_send_poison_closes_with_last_owner() {
+        let (client, mut wire) = tokio::io::duplex(4);
+        let target = "8.8.8.8:53".parse().unwrap();
+        let transport = Arc::new(VlessConnectedTransport::new(Box::new(client), target, None));
+        let sending = {
+            let transport = Arc::clone(&transport);
+            tokio::spawn(async move {
+                transport
+                    .send_packet_confirmed(&vec![0x5a; MAX_NATIVE_PACKET_SIZE])
+                    .await
+            })
+        };
+        let mut length = [0; 2];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wire.read_exact(&mut length),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(length, (MAX_NATIVE_PACKET_SIZE as u16).to_be_bytes());
+        sending.abort();
+        assert!(sending.await.unwrap_err().is_cancelled());
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            transport.send_packet_confirmed(b"next"),
+        )
+        .await
+        .expect("interrupted send poisoned the connected transport")
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        drop(transport);
+        let mut remainder = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wire.read_to_end(&mut remainder),
+        )
+        .await
+        .unwrap()
+        .unwrap();
     }
 
     #[tokio::test]
@@ -2487,17 +2738,22 @@ mod tests {
     }
 
     #[test]
-    fn test_vless_header_vision_flow() {
+    fn vless_header_uses_base_flow_for_udp443_suffix() {
         let uuid_str = "b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3";
         let uuid_bytes = VLessHandler::parse_uuid(uuid_str).unwrap();
         let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let vless = honk_config::node::VlessConfig {
+            flow: Some("xtls-rprx-vision-udp443".into()),
+            ..Default::default()
+        };
+        assert!(vless.is_vision());
 
         let header = VLessHandler::build_request_header(
             &uuid_bytes,
             CMD_TCP,
             Some(target),
             None,
-            Some("xtls-rprx-vision"),
+            vless.wire_flow(),
         )
         .unwrap();
 

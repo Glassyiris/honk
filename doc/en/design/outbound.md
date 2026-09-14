@@ -84,7 +84,7 @@ Trojan, AnyTLS, and VLESS.
 | Shadowsocks, including 2022 | yes | no | yes | `None` | `ss` |
 | Trojan | when `network` is absent or contains `udp` | only `tcp`/empty transport | yes | `None` | `trojan` |
 | VMess | no | no | yes | `None` | `vmess` |
-| VLESS | non-`legacy` mode and UDP allowed by `network` | no | `legacy`, `uot-v2`, `xudp` only | H2MUX, Mux.Cool, or `None`, by mode | `vless` |
+| VLESS | non-`legacy` mode and UDP allowed by `network` | no | `legacy`, `auto`, `native`, `uot-v2`, `xudp` | H2MUX, Mux.Cool, or `None`, by mode | `vless` |
 | SOCKS5 | yes | yes | yes | `None` | `socks5`, `socks4`, `socks4a` |
 | Hysteria2 | yes | no | no | `Quic` | `hysteria2`, `hysteria` |
 | TUIC | yes | no | no | `Quic` | `tuic` |
@@ -359,11 +359,13 @@ flight cannot complete this handshake.
 
 ## VLESS wire contracts
 
-`WireMode` selects one of six explicit contracts. It is configuration, not
-negotiation.
+`WireMode` selects a configured contract; `auto` resolves its packet framing
+from the target port and flow, never from negotiation or retry.
 
 | Mode | TCP path | UDP path | Reusable shape |
 | --- | --- | --- | --- |
+| `auto` | Ordinary VLESS stream | Native on 53/443 without Vision, Single XUDP otherwise | No generation runtime; bare proxy TCP may be pooled |
+| `native` | Ordinary VLESS stream | Connected command-UDP with u16 lengths | No generation runtime; bare proxy TCP may be pooled |
 | `legacy` | Ordinary VLESS stream | none | No generation runtime; bare proxy TCP may be pooled |
 | `uot-v2` | Ordinary VLESS stream | One connected direct UoT v2 stream per packet transport | No generation runtime; bare proxy TCP may be pooled |
 | `h2mux` | H2MUX logical TCP stream | Native connected H2MUX UDP using UoT length framing | Node-owned H2MUX pool, at most 2 reusable/dialing carriers × 128 streams |
@@ -374,6 +376,16 @@ negotiation.
 The client never probes the server for a mode, falls back to another mode, or
 replays a first UDP packet. A mismatch is a protocol failure. This keeps packet
 admission and side effects single-commit.
+
+Native VLESS reuses the connected UoT length codec without its magic destination
+or setup preamble. Sends accept 1–8190 bytes; received zero-length frames are
+datagrams, not EOF. The writer remains flush-confirmed and cancellation-poisoned.
+Typed policy/size refusals are distinct from congestion and transport failure:
+they do not demote health or Score. Target policy is checked before actual
+candidate admission, including reused logical channels; a denied candidate
+terminates preparation and drains started work without selecting a fallback.
+DNS address/exchange retries preserve that refusal, and denied health/CLI probes
+are skipped independently before target resolution or feedback.
 
 ### H2MUX
 
@@ -419,8 +431,9 @@ letting an unread child pin the carrier indefinitely.
 
 XUDP reply metadata can change the logical peer and therefore enables full-cone
 reply sources. Pooled Mux.Cool packets are capped at 8 KiB. Single XUDP reuses
-the codec on a dedicated unpooled carrier with global ID `0` and a 7,526-byte
-packet cap.
+the codec on a dedicated unpooled carrier with reserved session ID `0` and a
+7,526-byte packet cap. It omits global-ID metadata; this is not a claim of
+Xray's cross-carrier source-session persistence.
 
 ### Vision
 
@@ -435,8 +448,10 @@ write side remains on the outer stream unless the client itself sends a direct
 command, which honk does not.
 
 The supported carrier is TCP with TLS or REALITY, and the supported wire modes
-are `legacy` and Single `xudp`. H2MUX, padded H2MUX, Mux.Cool, and UoT own
-incompatible inner framing.
+are `legacy`, `auto`, and Single `xudp`; TCP-only `native` is also admitted.
+Base Vision denies UDP/443, while `xtls-rprx-vision-udp443` permits it and sends
+only the base flow addon. H2MUX, padded H2MUX, Mux.Cool, and UoT own incompatible
+inner framing and remain excluded.
 
 ### VLESS Encryption
 
@@ -454,9 +469,8 @@ A `0rtt` configuration caches the server ticket and PFS key in the handler's
 record-authentication failure while using a ticket invalidates it, so the next
 connection cannot repeat a rejected cached path.
 
-VLESS Encryption is legacy-only. Configuration rejects it with Vision and with
-every non-`legacy` wire mode because each combination would give two layers
-ownership of the same inner framing.
+VLESS Encryption supports `legacy`, `auto`, `native`, and `xudp`. Vision and
+the UoT/H2MUX/Mux.Cool wrappers remain unsupported combinations.
 
 Raw-TCP interop is verified against Xray 26.7.28 across all modes, both auth-key types, chained X25519 keys, and 1-RTT→0-RTT.
 

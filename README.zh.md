@@ -34,9 +34,9 @@ global {
 
 ## VLESS UDP、H2MUX 与 XUDP
 
-VLESS 分享链接通过 `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool` 选择一个明确模式。`legacy` 是向后兼容的 TCP-only 默认值。`uot-v2` 保留该 TCP 路径，并为 UDP 增加直连 UoT v2。`h2mux` 在共享 HTTP/2 carrier 上承载逻辑 TCP 与原生 connected sing-mux UDP；`h2mux-padded` 再增加 sing-mux v1 padding。`xudp` 保留普通 VLESS TCP，并为每个 UDP transport 打开一条 Single XUDP carrier。`mux-cool` 让逻辑 TCP 与 XUDP 共用节点所有的 Xray Mux.Cool carrier。
+VLESS 分享链接默认使用 `vless_mode=auto`：普通 UDP 在 53/443 端口使用原生 VLESS，其他端口使用 Single XUDP；Vision 使用 Single XUDP。`udp=0` 关闭数据包，不改变 TCP。仍可显式选择 `native`、TCP-only `legacy`、`uot-v2`、`h2mux`、`h2mux-padded`、`xudp` 与 `mux-cool`；只有显式 mux 模式会池化逻辑 TCP stream。
 
-这些模式不协商，绝不降级或重放 UDP 首包。非 legacy 模式不能使用 VLESS Encryption；只有 `xudp` 可与 `flow=xtls-rprx-vision` 组合。官方互通套件覆盖 sing-box 与 Xray：全部六种明文模式、TLS 和 REALITY 上的 H2MUX、padding，以及 XUDP Vision。wire、生命周期和导入规则见[节点参考](doc/zh/reference/nodes.md#mode)。
+基础 Vision 拒绝 UDP/443；`flow=xtls-rprx-vision-udp443` 放行该端口。VLESS Encryption 支持不带 flow、无复用池的 `legacy`、`auto`、`native` 与 `xudp`。不会协商 mode、回退或重放首包；本地策略和大小拒绝不影响健康。官方服务端本地夹具覆盖原生/自动 UDP、XUDP、Vision UDP443 与加密数据包交换。wire、生命周期和导入规则见[节点参考](doc/zh/reference/nodes.md#mode)。
 
 ## 使用本仓库前
 

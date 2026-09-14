@@ -183,6 +183,53 @@ impl ProxyStream {
     }
 }
 
+/// A local packet refusal that must not be treated as transport health.
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
+pub enum PacketRejection {
+    #[error("UDP target rejected by policy")]
+    Policy,
+    #[error("UDP packet size is invalid")]
+    InvalidSize,
+}
+
+impl From<PacketRejection> for std::io::Error {
+    fn from(rejection: PacketRejection) -> Self {
+        let kind = match rejection {
+            PacketRejection::Policy => std::io::ErrorKind::PermissionDenied,
+            PacketRejection::InvalidSize => std::io::ErrorKind::InvalidInput,
+        };
+        Self::new(kind, rejection)
+    }
+}
+
+/// Whether an anyhow error chain contains a typed local packet refusal.
+pub fn is_packet_rejection(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        source.is::<PacketRejection>()
+            || source
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| io_packet_rejection(error).is_some())
+    })
+}
+
+/// Recover a typed packet rejection retained inside an I/O error chain.
+pub(crate) fn io_packet_rejection(error: &std::io::Error) -> Option<PacketRejection> {
+    let mut source = error
+        .get_ref()
+        .map(|source| source as &(dyn std::error::Error + 'static));
+    while let Some(current) = source {
+        if let Some(rejection) = current.downcast_ref::<PacketRejection>() {
+            return Some(*rejection);
+        }
+        source = current
+            .downcast_ref::<std::io::Error>()
+            .and_then(|error| error.get_ref())
+            .map(|source| source as &(dyn std::error::Error + 'static))
+            .or_else(|| current.source());
+    }
+    None
+}
+
 /// Coarse classification for packet-send failures shared with the control plane.
 ///
 /// Congestion is deliberately separate from a dead tunnel: dropping one UDP
@@ -190,12 +237,16 @@ impl ProxyStream {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketErrorClass {
     Congestion,
+    Rejected,
     ConnectionDead,
     Other,
 }
 
 /// Classify an error returned by a [`PacketTransport`] operation.
 pub fn packet_error_class(error: &std::io::Error) -> PacketErrorClass {
+    if io_packet_rejection(error).is_some() {
+        return PacketErrorClass::Rejected;
+    }
     if matches!(
         error.kind(),
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
@@ -1038,6 +1089,11 @@ impl ProxyRegistry {
         if protocol != NodeProtocol::Block && !(entry.descriptor.supports_udp)(node) {
             anyhow::bail!("UDP not supported for protocol {}", protocol.as_str());
         }
+        if protocol != NodeProtocol::Block
+            && !crate::descriptor::udp_target_allowed(node, target.port())
+        {
+            return Err(PacketRejection::Policy.into());
+        }
         let packet = entry.packet.as_ref().ok_or_else(|| {
             anyhow::anyhow!("UDP not supported for protocol {}", protocol.as_str())
         })?;
@@ -1059,6 +1115,11 @@ impl ProxyRegistry {
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let (runtime, packet) = self.packet_runtime(&generation, node_id)?;
+        if runtime.node.protocol() != NodeProtocol::Block
+            && !crate::descriptor::udp_target_allowed(&runtime.node, target.port())
+        {
+            return Err(PacketRejection::Policy.into());
+        }
         let transport = generation
             .scope_dials(packet.dial_udp_transport_runtime(
                 runtime,
@@ -1085,6 +1146,11 @@ impl ProxyRegistry {
         connect_timeout: Duration,
     ) -> anyhow::Result<PreparedUdpTransport> {
         let (runtime, packet) = self.packet_runtime(&generation, node_id)?;
+        if runtime.node.protocol() != NodeProtocol::Block
+            && !crate::descriptor::udp_target_allowed(&runtime.node, target.port())
+        {
+            return Err(PacketRejection::Policy.into());
+        }
         let prepared = generation
             .scope_dials(packet.dial_udp_transport_speculative_runtime(
                 runtime,
@@ -1228,6 +1294,48 @@ mod tests {
         assert_eq!(packet_error_class(&too_large), PacketErrorClass::Congestion);
     }
 
+    #[test]
+    fn typed_packet_rejections_survive_io_and_anyhow_context() {
+        for (rejection, kind) in [
+            (
+                PacketRejection::Policy,
+                std::io::ErrorKind::PermissionDenied,
+            ),
+            (
+                PacketRejection::InvalidSize,
+                std::io::ErrorKind::InvalidInput,
+            ),
+        ] {
+            let io_error = std::io::Error::from(rejection);
+            assert_eq!(io_error.kind(), kind);
+            assert_eq!(packet_error_class(&io_error), PacketErrorClass::Rejected);
+            assert!(is_packet_rejection(
+                &anyhow::Error::new(io_error).context("outer context")
+            ));
+            assert!(is_packet_rejection(
+                &anyhow::Error::new(rejection).context("outer context")
+            ));
+            let nested = std::io::Error::other(std::io::Error::from(rejection));
+            assert_eq!(packet_error_class(&nested), PacketErrorClass::Rejected);
+            assert!(is_packet_rejection(&anyhow::Error::new(nested)));
+        }
+        assert_eq!(
+            packet_error_class(&std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                PacketRejection::Policy,
+            )),
+            PacketErrorClass::Rejected
+        );
+        for kind in [
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let io_error = std::io::Error::new(kind, "untyped refusal");
+            assert_eq!(packet_error_class(&io_error), PacketErrorClass::Other);
+            assert!(!is_packet_rejection(&anyhow::Error::new(io_error)));
+        }
+    }
+
     /// Without the `rprx` feature a parsed VLESS/VMess node must hit the
     /// ordinary no-handler refusal, never a panic.
     #[cfg(not(feature = "rprx"))]
@@ -1277,7 +1385,9 @@ mod tests {
         assert!(entry.packet.is_some());
         assert!(entry.warmable.is_some());
 
-        let node = registry_test_node("legacy-vless", NodeProtocol::VLess);
+        let mut node = registry_test_node("legacy-vless", NodeProtocol::VLess);
+        node.vless_mut().unwrap().mode = honk_config::node::WireMode::Legacy;
+        node.id = node.derive_id();
         let generation = Arc::new(
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
         );
@@ -1299,6 +1409,51 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("UDP not supported"));
+    }
+
+    #[cfg(feature = "rprx")]
+    #[tokio::test]
+    async fn vless_target_policy_is_checked_by_every_packet_registry_path() {
+        let registry = ProxyRegistry::default_resolver().unwrap();
+        let mut node = registry_test_node("vision", NodeProtocol::VLess);
+        let vless = node.vless_mut().unwrap();
+        vless.mode = honk_config::node::WireMode::Auto;
+        vless.flow = Some("xtls-rprx-vision".into());
+        vless.tls.enabled = true;
+        node.id = node.derive_id();
+        let target = "8.8.8.8:443".parse().unwrap();
+
+        let error = registry
+            .dial_udp_transport(&node, target, None, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert!(is_packet_rejection(&error));
+
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+        );
+        let error = registry
+            .dial_udp_transport_runtime(
+                Arc::clone(&generation),
+                node.id,
+                target,
+                None,
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap_err();
+        assert!(is_packet_rejection(&error));
+        let error = registry
+            .dial_udp_transport_speculative(
+                generation,
+                node.id,
+                target,
+                None,
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap_err();
+        assert!(is_packet_rejection(&error));
     }
 
     /// The built-in block node carries NodeProtocol::Block; the registry must

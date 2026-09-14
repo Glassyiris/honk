@@ -50,8 +50,10 @@ pub const NODE_ID_NAMESPACE: uuid::Uuid =
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum WireMode {
+    Auto,
     #[default]
     Legacy,
+    Native,
     UotV2,
     H2mux,
     H2muxPadded,
@@ -61,7 +63,9 @@ pub enum WireMode {
 impl WireMode {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Legacy => "legacy",
+            Self::Native => "native",
             Self::UotV2 => "uot-v2",
             Self::H2mux => "h2mux",
             Self::H2muxPadded => "h2mux-padded",
@@ -76,14 +80,16 @@ impl std::str::FromStr for WireMode {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
+            "auto" => Ok(Self::Auto),
             "legacy" => Ok(Self::Legacy),
+            "native" => Ok(Self::Native),
             "uot-v2" => Ok(Self::UotV2),
             "h2mux" => Ok(Self::H2mux),
             "h2mux-padded" => Ok(Self::H2muxPadded),
             "xudp" => Ok(Self::Xudp),
             "mux-cool" => Ok(Self::MuxCool),
             _ => Err(crate::ConfigError::Parse(
-                "unsupported wire mode (expected legacy/uot-v2/h2mux/h2mux-padded/xudp/mux-cool)"
+                "unsupported wire mode (expected auto/legacy/native/uot-v2/h2mux/h2mux-padded/xudp/mux-cool)"
                     .into(),
             )),
         }
@@ -492,9 +498,12 @@ mod tests {
 
     #[test]
     fn test_vless_mode_serde_and_default() {
-        assert_eq!(Node::default().vless(), None);
+        assert_eq!(WireMode::default(), WireMode::Legacy);
+        assert_eq!(VlessConfig::default().mode, WireMode::Auto);
         for (value, mode) in [
+            ("auto", WireMode::Auto),
             ("legacy", WireMode::Legacy),
+            ("native", WireMode::Native),
             ("uot-v2", WireMode::UotV2),
             ("h2mux", WireMode::H2mux),
             ("h2mux-padded", WireMode::H2muxPadded),
@@ -513,7 +522,56 @@ mod tests {
             assert_eq!(mode.as_str(), value);
         }
         let error = "smux".parse::<WireMode>().unwrap_err().to_string();
-        assert!(error.contains("xudp/mux-cool"));
+        assert!(error.contains("auto/legacy/native"));
+    }
+
+    #[test]
+    fn test_vless_effective_udp_contract() {
+        let mut config = VlessConfig::default();
+        assert!(config.udp_enabled());
+        assert_eq!(config.udp_mode(53), WireMode::Native);
+        assert_eq!(config.udp_mode(443), WireMode::Native);
+        assert_eq!(config.udp_mode(54), WireMode::Xudp);
+
+        config.flow = Some("xtls-rprx-vision".into());
+        assert!(config.is_vision());
+        assert_eq!(config.wire_flow(), Some("xtls-rprx-vision"));
+        assert_eq!(config.udp_mode(443), WireMode::Xudp);
+        assert!(config.rejects_udp_port(443));
+
+        config.flow = Some("xtls-rprx-vision-udp443".into());
+        assert!(config.is_vision());
+        assert_eq!(config.wire_flow(), Some("xtls-rprx-vision"));
+        assert!(!config.rejects_udp_port(443));
+    }
+
+    #[test]
+    fn test_vless_encryption_admission_follows_carrier() {
+        let mut config = VlessConfig {
+            encryption: Some("mlkem768x25519plus.native.1rtt.key".into()),
+            ..Default::default()
+        };
+        for mode in [
+            WireMode::Legacy,
+            WireMode::Auto,
+            WireMode::Native,
+            WireMode::Xudp,
+        ] {
+            config.mode = mode;
+            config.validate("unused").unwrap();
+        }
+        for mode in [
+            WireMode::UotV2,
+            WireMode::H2mux,
+            WireMode::H2muxPadded,
+            WireMode::MuxCool,
+        ] {
+            config.mode = mode;
+            assert!(config.validate("unused").is_err());
+        }
+        config.mode = WireMode::Auto;
+        config.flow = Some("xtls-rprx-vision".into());
+        assert!(config.validate("unused").is_err());
     }
 
     #[test]
@@ -541,7 +599,7 @@ mod tests {
             ),
             (
                 "vless-legacy",
-                "vless://00000000-0000-0000-0000-000000000001@example.com:443#legacy",
+                "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=legacy#legacy",
                 "d47c73f3-910d-56b4-baa5-d230c76d788b",
             ),
             (
@@ -571,12 +629,12 @@ mod tests {
             ),
             (
                 "vless-encrypted",
-                "vless://00000000-0000-0000-0000-000000000001@example.com:443#encrypted",
+                "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=legacy#encrypted",
                 "9add2074-63e8-5b29-ba6b-26ed937d2464",
             ),
             (
                 "vless-populated-dial",
-                "vless://00000000-0000-0000-0000-000000000001@example.com:443?security=reality&type=ws&sni=cdn.example.com&path=%2Fp&host=ws.example.com&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=abcd&spx=%2Fprobe#populated",
+                "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=legacy&security=reality&type=ws&sni=cdn.example.com&path=%2Fp&host=ws.example.com&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=abcd&spx=%2Fprobe#populated",
                 "529c3f31-3295-54f2-86e5-15cfc43f1a39",
             ),
             (
@@ -702,20 +760,30 @@ mod tests {
 
     #[test]
     fn test_vless_mode_identity() {
-        let mut legacy = Node::from_share_link(
-            "vless://00000000-0000-0000-0000-000000000001@example.com:443#legacy",
+        let mut automatic = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443#auto",
         )
         .unwrap();
-        let mut explicit_legacy =
-            Node::from_share_link("vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=legacy#explicit")
-                .unwrap();
+        let mut legacy = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=legacy#legacy",
+        )
+        .unwrap();
+        automatic.vless_mut().unwrap().uuid = Some("uuid".into());
+        automatic.id = automatic.derive_id();
         legacy.vless_mut().unwrap().uuid = Some("uuid".into());
         legacy.id = legacy.derive_id();
-        explicit_legacy.vless_mut().unwrap().uuid = Some("uuid".into());
-        explicit_legacy.id = explicit_legacy.derive_id();
-        assert_eq!(legacy.id, explicit_legacy.id);
+        assert_ne!(automatic.id, legacy.id);
 
-        let ids = ["uot-v2", "h2mux", "h2mux-padded", "xudp", "mux-cool"].map(|mode| {
+        let ids = [
+            "auto",
+            "native",
+            "uot-v2",
+            "h2mux",
+            "h2mux-padded",
+            "xudp",
+            "mux-cool",
+        ]
+        .map(|mode| {
             let mut node = Node::from_share_link(&format!(
                 "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode={mode}#{mode}"
             ))
@@ -731,6 +799,37 @@ mod tests {
                 .len(),
             ids.len()
         );
+    }
+
+    #[test]
+    fn test_vless_packet_disable_identity_is_effective() {
+        let enabled = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=native",
+        )
+        .unwrap();
+        let disabled = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=native&udp=0",
+        )
+        .unwrap();
+        let mut equivalent = disabled.clone();
+        equivalent.vless_mut().unwrap().network = Some(" TCP ".into());
+        assert_ne!(enabled.id, disabled.id);
+        assert_eq!(disabled.id, equivalent.derive_id());
+        for network in ["udp", " TCP, UDP "] {
+            let mut equivalent = enabled.clone();
+            equivalent.vless_mut().unwrap().network = Some(network.into());
+            assert_eq!(enabled.id, equivalent.derive_id());
+        }
+
+        let legacy = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=legacy",
+        )
+        .unwrap();
+        let legacy_disabled = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?vless_mode=legacy&udp=0",
+        )
+        .unwrap();
+        assert_eq!(legacy.id, legacy_disabled.id);
     }
 
     #[test]

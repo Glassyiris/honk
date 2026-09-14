@@ -87,18 +87,27 @@ async fn udp_dns_without_system_resolver_reports_resolve() {
 }
 
 #[tokio::test]
-async fn udp_ineligible_node_skips_dns_target_resolution() {
+async fn udp_policy_denied_target_skips_dns_resolution() {
     let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let resolver = silent_dns_resolver(sink.local_addr().unwrap());
     let target = UdpCheckTarget::Host {
         host: "dns.test".into(),
-        port: 53,
+        port: 443,
     };
     let registry = ProxyRegistry::default_resolver().unwrap();
+    let mut node = vless_node();
+    let vless = node.vless_mut().unwrap();
+    vless.mode = WireMode::Auto;
+    vless.flow = Some("xtls-rprx-vision".into());
+    assert!((registry
+        .find(NodeProtocol::VLess)
+        .unwrap()
+        .descriptor
+        .supports_udp)(&node));
     assert_eq!(
         probe_udp_dns(
             &registry,
-            &vless_node(),
+            &node,
             &target,
             Some(&resolver),
             Duration::from_millis(40),
@@ -111,6 +120,27 @@ async fn udp_ineligible_node_skips_dns_target_resolution() {
         tokio::time::timeout(Duration::from_millis(20), sink.recv(&mut packet))
             .await
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn udp_policy_denied_target_skips_quic_resolution() {
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let mut node = vless_node();
+    let vless = node.vless_mut().unwrap();
+    vless.mode = WireMode::Auto;
+    vless.flow = Some("xtls-rprx-vision".into());
+
+    assert_eq!(
+        probe_udp_quic(
+            &registry,
+            &node,
+            "must-not-resolve.invalid",
+            443,
+            Duration::from_millis(40),
+        )
+        .await,
+        None
     );
 }
 
@@ -129,6 +159,7 @@ fn vless_node() -> Node {
         port: 443,
         outbound: honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
             uuid: Some("b831381d-6324-4d53-ad4f-8cda48b30811".into()),
+            mode: WireMode::Legacy,
             tls: honk_config::node::TlsOptions {
                 enabled: true,
                 ..Default::default()
@@ -239,6 +270,20 @@ fn vless_probe_eligibility_precedence_and_reasons() {
     );
 
     let mut node = vless_node();
+    let vless = node.vless_mut().unwrap();
+    vless.mode = WireMode::Auto;
+    vless.flow = Some("xtls-rprx-vision-udp443".into());
+    node.id = node.derive_id();
+    assert_eq!(classify_vless_node(&node), ProbeEligibility::Supported);
+    assert_eq!(vless_shape(&node), "vless/tls/tcp/vision-udp443/auto");
+
+    node.vless_mut().unwrap().flow = Some("xtls-rprx-vision-udp443-extra".into());
+    assert_eq!(
+        classify_vless_node(&node),
+        ProbeEligibility::ExpectedUnsupported("unsupported-flow")
+    );
+
+    let mut node = vless_node();
     node.name.clear();
     assert_eq!(
         classify_vless_node(&node),
@@ -253,6 +298,11 @@ fn vless_shapes_are_fixed_and_non_identifying() {
     vless.tls.enabled = false;
     vless.transport.transport.clear();
     assert_eq!(vless_shape(&node), "vless/plain/tcp");
+
+    node.vless_mut().unwrap().mode = WireMode::Auto;
+    assert_eq!(vless_shape(&node), "vless/plain/tcp/auto");
+    node.vless_mut().unwrap().mode = WireMode::Native;
+    assert_eq!(vless_shape(&node), "vless/plain/tcp/native");
 
     node.vless_mut().unwrap().mode = WireMode::Xudp;
     assert_eq!(vless_shape(&node), "vless/plain/tcp/xudp");
@@ -277,10 +327,23 @@ fn vless_shapes_are_fixed_and_non_identifying() {
     assert_eq!(vless_shape(&node), "vless/reality/unsupported");
 }
 
+fn timeout_targets(dns_port: u16, port: u16) -> ProbeTargets {
+    ProbeTargets {
+        host: "target.invalid".into(),
+        port,
+        url: None,
+        timeout: Duration::from_millis(1),
+        v4: None,
+        v6: None,
+        udp_dns: UdpCheckTarget::Literal(SocketAddr::from(([127, 0, 0, 1], dns_port))),
+        dns_resolver: None,
+    }
+}
+
 #[test]
 fn vless_udp_is_rendered_as_not_applicable() {
     let registry = ProxyRegistry::default_resolver().unwrap();
-    let outcome = ProbeOutcome::timed_out(&registry, &vless_node());
+    let outcome = ProbeOutcome::timed_out(&registry, &vless_node(), &timeout_targets(53, 443));
     assert_eq!(outcome.udp_dns, None);
     assert_eq!(outcome.udp_quic, None);
     let rendered = render_outcome(&outcome);
@@ -293,13 +356,33 @@ fn vless_udp_mode_is_rendered_as_probeable() {
     let registry = ProxyRegistry::default_resolver().unwrap();
     let mut node = vless_node();
     node.vless_mut().unwrap().mode = WireMode::H2mux;
-    let outcome = ProbeOutcome::timed_out(&registry, &node);
+    let outcome = ProbeOutcome::timed_out(&registry, &node, &timeout_targets(53, 443));
     assert!(matches!(
         outcome.udp_dns,
         Some(Err(ProbeFailureKind::Timeout))
     ));
     assert!(render_outcome(&outcome).contains("dns: FAIL(timeout)"));
     assert_eq!(outcome.shape, "vless/tls/tcp/h2mux");
+}
+
+#[test]
+fn timed_out_vision_targets_are_rendered_per_port_policy() {
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let mut node = vless_node();
+    let vless = node.vless_mut().unwrap();
+    vless.mode = WireMode::Auto;
+    vless.flow = Some("xtls-rprx-vision".into());
+    let outcome = ProbeOutcome::timed_out(&registry, &node, &timeout_targets(443, 443));
+    assert_eq!(outcome.udp_dns, None);
+    assert_eq!(outcome.udp_quic, None);
+    let rendered = render_outcome(&outcome);
+    assert!(rendered.contains("dns: n/a"));
+    assert!(rendered.contains("quic: n/a"));
+
+    node.vless_mut().unwrap().flow = Some("xtls-rprx-vision-udp443".into());
+    let outcome = ProbeOutcome::timed_out(&registry, &node, &timeout_targets(443, 443));
+    assert_eq!(outcome.udp_dns, Some(Err(ProbeFailureKind::Timeout)));
+    assert_eq!(outcome.udp_quic, Some(Err(ProbeFailureKind::Timeout)));
 }
 
 #[test]

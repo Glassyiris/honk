@@ -325,21 +325,74 @@ async fn c27_udp_rejects_invalid_nodes_without_data_path() {
             Arc::new(registry),
             generation,
             Arc::new(StatsManager::new()),
-            target,
-            target.into(),
+            Some((target, target.into())),
             None,
             manager,
         );
         let result = prober
             .probe_udp(&node.name, Duration::from_millis(50))
             .await;
-        assert!(result.dns.is_err());
+        assert!(matches!(result.dns, Some(Err(_))));
         assert!(result.data_path.is_none());
         assert!(
             captured.lock().unwrap().is_none(),
             "invalid node reached UDP dial"
         );
     }
+}
+
+#[tokio::test]
+async fn udp_policy_denial_skips_dns_before_dial_and_health_feedback() {
+    let mut node = udp_test_node();
+    node.name = "vision-vless".into();
+    node.outbound = honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
+        mode: honk_config::node::WireMode::Auto,
+        flow: Some("xtls-rprx-vision".into()),
+        tls: honk_config::node::TlsOptions {
+            enabled: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    node.id = node.derive_id();
+    let generation = Arc::new(parking_lot::RwLock::new(Arc::new(
+        honk_outbound::runtime::OutboundRuntimeRegistry::build(&[udp_test_node()]).unwrap(),
+    )));
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let handler = Arc::new(UdpTestHandler {
+        mode: UdpTestMode::UdpCaptureTarget(captured.clone()),
+    });
+    let mut registry = ProxyRegistry::new();
+    registry.register(
+        honk_outbound::proxy::ProtocolEntry::new(node.protocol(), handler.clone())
+            .with_packet(handler),
+    );
+    let config = Config {
+        nodes: vec![node.clone()],
+        ..Config::default()
+    };
+    let manager = Arc::new(parking_lot::RwLock::new(Arc::new(GroupManager::new(
+        &[],
+        std::slice::from_ref(&node),
+    ))));
+    let target: SocketAddr = "127.0.0.1:443".parse().unwrap();
+    let prober = ProxyUdpProber::new(
+        Arc::new(RwLock::new(Arc::new(config))),
+        Arc::new(registry),
+        generation,
+        Arc::new(StatsManager::new()),
+        Some((target, target.into())),
+        None,
+        manager,
+    );
+
+    let outcome = prober
+        .probe_udp(&node.name, Duration::from_millis(50))
+        .await;
+
+    assert!(outcome.dns.is_none());
+    assert!(outcome.data_path.is_none());
+    assert!(captured.lock().unwrap().is_none());
 }
 
 #[tokio::test]

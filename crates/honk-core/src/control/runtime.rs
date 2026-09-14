@@ -653,32 +653,43 @@ impl ControlPlane {
                     Arc::new(move |host: String, port: u16| {
                         let controller = controller.clone();
                         Box::pin(async move {
-                            controller
-                                .resolve_domain(&host)
-                                .await
-                                .into_iter()
-                                .map(|ip| std::net::SocketAddr::new(ip, port))
-                                .collect()
+                            controller.resolve_domain(&host).await.map(|addresses| {
+                                addresses
+                                    .into_iter()
+                                    .map(|ip| std::net::SocketAddr::new(ip, port))
+                                    .collect()
+                            })
                         })
                     })
                 };
-                let dns_target = resolve_udp_check_target(&dns_raw, Some(resolver.clone())).await;
+                let dns_probe = match resolve_udp_check_target(&dns_raw, Some(resolver.clone()))
+                    .await
+                {
+                    Ok(target) => Some((target, udp_probe_identity(&dns_raw, target))),
+                    Err(_) => {
+                        info!(
+                            "UDP DNS health check disabled: target resolution was locally refused"
+                        );
+                        None
+                    }
+                };
                 let quic_score_target = if quic_url.is_empty() {
                     None
                 } else {
                     resolve_quic_score_target(&quic_url, Some(resolver)).await
                 };
+                if let Some((target, _)) = &dns_probe {
+                    info!("UDP health check enabled (dns={})", target);
+                }
                 alive_set.set_udp_probe(Arc::new(ProxyUdpProber::new(
                     self.config.clone(),
                     self.proxy_registry.clone(),
                     self.runtime_registry.clone(),
                     self.stats.clone(),
-                    dns_target,
-                    udp_probe_identity(&dns_raw, dns_target),
+                    dns_probe,
                     quic_score_target,
                     self.group_manager.clone(),
                 )));
-                info!("UDP health check enabled (dns={})", dns_target);
             }
 
             info!(

@@ -13,6 +13,7 @@ pub(super) const DRIVER_ABORT_TIMEOUT: Duration = Duration::from_secs(1);
 #[derive(Debug)]
 enum PacketSendFailure {
     Congestion(io::Error),
+    Rejected(io::Error),
     Transport(io::Error),
 }
 
@@ -41,6 +42,7 @@ impl PacketSendFailure {
     fn into_io_error(self) -> io::Error {
         match self {
             Self::Congestion(error) => io::Error::new(io::ErrorKind::WouldBlock, error),
+            Self::Rejected(error) => error,
             Self::Transport(error) => error,
         }
     }
@@ -50,15 +52,27 @@ fn classify_send_error(
     transport: &dyn honk_outbound::proxy::PacketTransport,
     error: io::Error,
 ) -> PacketSendFailure {
-    if matches!(
-        honk_outbound::proxy::packet_error_class(&error),
-        honk_outbound::proxy::PacketErrorClass::Congestion
-    ) || (error.kind() == io::ErrorKind::TimedOut && transport.send_timeout_is_congestion())
-    {
-        PacketSendFailure::Congestion(error)
-    } else {
-        PacketSendFailure::Transport(error)
+    match honk_outbound::proxy::packet_error_class(&error) {
+        honk_outbound::proxy::PacketErrorClass::Rejected => PacketSendFailure::Rejected(error),
+        honk_outbound::proxy::PacketErrorClass::Congestion => PacketSendFailure::Congestion(error),
+        _ if error.kind() == io::ErrorKind::TimedOut && transport.send_timeout_is_congestion() => {
+            PacketSendFailure::Congestion(error)
+        }
+        _ => PacketSendFailure::Transport(error),
     }
+}
+
+fn duplicate_send_error(error: &io::Error) -> io::Error {
+    let mut source = error
+        .get_ref()
+        .map(|source| source as &(dyn std::error::Error + 'static));
+    while let Some(current) = source {
+        if let Some(rejection) = current.downcast_ref::<honk_outbound::proxy::PacketRejection>() {
+            return (*rejection).into();
+        }
+        source = current.source();
+    }
+    io::Error::new(error.kind(), error.to_string())
 }
 
 pub(super) struct TaskRegistry {
@@ -265,6 +279,14 @@ pub(super) fn score_driver_outcome(
             ScoreOutcome::Cancelled
         };
     }
+    if let Err(error) = result
+        && matches!(
+            honk_outbound::proxy::packet_error_class(error),
+            honk_outbound::proxy::PacketErrorClass::Rejected
+        )
+    {
+        return ScoreOutcome::Rejected;
+    }
     if endpoint.proxy_socket.quic_path_stalled() {
         return ScoreOutcome::Timeout;
     }
@@ -414,23 +436,21 @@ pub(super) async fn run_endpoint_driver(
     )
     .await
     {
-        let congested = matches!(&failure, PacketSendFailure::Congestion(_));
+        let neutral = matches!(
+            &failure,
+            PacketSendFailure::Congestion(_) | PacketSendFailure::Rejected(_)
+        );
         let result = Err(failure.into_io_error());
         // Health reporting can synchronously retire and mark this endpoint dead.
         let outcome = score_driver_outcome(&endpoint, &result);
-        if !congested && !endpoint.dead.load(Ordering::Acquire) {
+        if !neutral && !endpoint.dead.load(Ordering::Acquire) {
             alive_set.report_unavailable_traffic(
                 endpoint.node_id,
                 honk_outbound::alive::ProbeDomain::DataUdp,
                 health_family,
             );
         }
-        let _ = first_ack.send(
-            result
-                .as_ref()
-                .map(|_| ())
-                .map_err(|error| io::Error::new(error.kind(), error.to_string())),
-        );
+        let _ = first_ack.send(result.as_ref().map(|_| ()).map_err(duplicate_send_error));
         return UdpDriverResult { result, outcome };
     }
 
@@ -452,6 +472,12 @@ pub(super) async fn run_endpoint_driver(
                     error
                 );
             }
+            Err(PacketSendFailure::Rejected(error)) => {
+                let result = Err(error);
+                let outcome = score_driver_outcome(&endpoint, &result);
+                let _ = first_ack.send(result.as_ref().map(|_| ()).map_err(duplicate_send_error));
+                return UdpDriverResult { result, outcome };
+            }
             Err(PacketSendFailure::Transport(error)) => {
                 let result = Err(error);
                 let outcome = score_driver_outcome(&endpoint, &result);
@@ -462,12 +488,7 @@ pub(super) async fn run_endpoint_driver(
                         health_family,
                     );
                 }
-                let _ = first_ack.send(
-                    result
-                        .as_ref()
-                        .map(|_| ())
-                        .map_err(|error| io::Error::new(error.kind(), error.to_string())),
-                );
+                let _ = first_ack.send(result.as_ref().map(|_| ()).map_err(duplicate_send_error));
                 return UdpDriverResult { result, outcome };
             }
         }
@@ -504,6 +525,7 @@ pub(super) async fn run_endpoint_driver(
         && !matches!(
             honk_outbound::proxy::packet_error_class(error),
             honk_outbound::proxy::PacketErrorClass::Congestion
+                | honk_outbound::proxy::PacketErrorClass::Rejected
         )
         && !(is_reply_idle_timeout(error) && endpoint.has_reply())
     {
@@ -541,6 +563,7 @@ async fn send_followers(
                     error
                 );
             }
+            Err(PacketSendFailure::Rejected(error)) => return Err(error),
             Err(PacketSendFailure::Transport(error)) => return Err(error),
         }
     }

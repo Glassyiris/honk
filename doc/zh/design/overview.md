@@ -66,6 +66,8 @@ flowchart LR
 
 遍历语法区分单行条目和多行表达式；括号保护状态仅随实际返回的表达式语句跨越同源分段，在来源边界重置。已建立索引的起始花括号保留其块头和子树归属。订阅原始字段独立于结构块头视图保留完整起始词法单元的字节。
 
+规范 VLESS 链接与 honk 扁平配置默认使用 `auto`：无 Vision 时，UDP/53、443 使用原生 VLESS，其他端口使用 Single XUDP；Vision 使用 Single XUDP。`udp=0` 独立关闭数据包，显式 `legacy` 保留旧 TCP-only 身份。基础 Vision 拒绝 UDP/443，精确的 `-udp443` 后缀放行该端口。订阅格式保留各自的编码默认值；详见[节点参考](../reference/nodes.md#mode)。
+
 ## 高层数据路径
 
 ```mermaid

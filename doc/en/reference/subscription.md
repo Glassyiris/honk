@@ -155,7 +155,7 @@ VLESS fields are applied before node identity is derived:
 | --- | --- |
 | `uuid`, then `password` | Credential; `uuid` wins and legacy `password` is the fallback. |
 | `encryption`, then `cipher` | VLESS Encryption; `encryption` wins. |
-| `flow` | Empty or whitespace-only is absent; otherwise exactly `xtls-rprx-vision`. |
+| `flow` | Empty or whitespace-only is absent; otherwise exactly `xtls-rprx-vision` or `xtls-rprx-vision-udp443`. |
 | `network` | Transport. |
 | `reality-opts.public-key` | Enables the REALITY TLS carrier. It must be a non-empty string. |
 | `reality-opts.short-id` | Optional REALITY short ID. |
@@ -171,14 +171,17 @@ Nested WS/gRPC values take precedence over their flat aliases. Active `reality-o
 
 | Clash representation | Normalized mode | Conditions |
 | --- | --- | --- |
-| No enabled packet/multiplex option and no `udp: true` | `legacy` | Disabled blocks and `xudp: false` do not select a mode. |
+| No packet declaration, no enabled wrapper, and no `udp: true` | `legacy` | Empty packet encoding and disabled wrapper blocks do not select a mode. |
 | `smux` or `multiplex` with `enabled: true` | `h2mux` or `h2mux-padded` | Requires `protocol: h2mux` or an explicit boolean `padding`. `padding: true` selects `h2mux-padded`; otherwise `h2mux`. |
 | `udp-over-tcp: true` | `uot-v2` | Boolean shorthand. |
 | `udp-over-tcp: { enabled: true, version: 0|2 }` | `uot-v2` | Missing `version` is treated as `0`; `_` aliases are also accepted. |
 | `packet-encoding: xudp` | `xudp` | `packet_encoding` is the flat alias. |
+| `packet-encoding: none`/`legacy`, or `xudp: false` | `native` | Without an enabled H2MUX/UoT wrapper; disables XUDP encoding, not UDP capability. |
 | `xudp: true` | `xudp` | Boolean shorthand. |
 | `udp: true` without another packet declaration | `xudp` | Matches the common Clash VLESS UDP default; an explicit mode takes precedence. |
 | Canonical share-link `vless_mode=mux-cool` | `mux-cool` | `mux-cool` is not accepted through Clash packet/mux aliases. |
+
+`udp: false` disables packet dialing independently of the selected mode; it does not erase the TCP carrier or contradict an explicit packet encoding.
 
 A VLESS Clash entry is rejected for any of these conditions:
 
@@ -188,23 +191,22 @@ A VLESS Clash entry is rejected for any of these conditions:
 - an enabled `smux`/`multiplex` block with neither `protocol: h2mux` nor an explicit `padding` boolean;
 - a multiplex protocol other than `h2mux`, `only-tcp: true`, enabled Brutal settings, or non-zero `max-connections`, `min-streams`, or `max-streams` tuning;
 - `udp-over-tcp` version other than `0` or `2`;
-- `udp: true` contradicting an explicitly disabled packet mode, or `udp: false` with a non-legacy mode;
 - an unsupported packet encoding (empty, `none`, `legacy`, and `xudp` are recognized); packetaddr and `mux-cool` aliases remain unsupported;
-- a non-legacy mode combined with VLESS Encryption, or with `flow` other than the supported `xudp` + `xtls-rprx-vision` combination.
+- unsupported flow or Encryption combinations described in the [VLESS node reference](./nodes.md#modes).
 
-Canonical VLESS share links use `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool`. Ambiguous third-party share-link keys such as `smux`, `udp-over-tcp`, and `packet-encoding` are rejected rather than guessed.
+Canonical VLESS share links default to `auto`, with explicit `native`, `legacy`, `uot-v2`, `h2mux`, `h2mux-padded`, `xudp`, and `mux-cool` choices. Ambiguous third-party share-link keys such as `smux`, `udp-over-tcp`, and `packet-encoding` are rejected rather than guessed.
 
 ### SIP008 and sing-box JSON
 
 SIP008 version 1/2 wrappers (`{"servers":[...]}`) and bare server arrays import Shadowsocks `server`, `server_port`, `method`, `password`, and `remarks`. Empty plugin fields are harmless; active plugins remain unsupported.
 
-sing-box profiles import supported entries from `outbounds`: Shadowsocks, SOCKS5, VMess, VLESS, Trojan, Hysteria2, TUIC, Juicity, and AnyTLS. Structural `selector`, `urltest`, `direct`, `block`, and `dns` entries are not proxy nodes. TLS/SNI, REALITY, WebSocket/gRPC, VLESS packet modes, and supported protocol tuning are normalized through the common node builder. VLESS defaults to XUDP only when no enabled multiplex/UoT wrapper, TCP-only restriction, or explicit packet encoding selects another behavior. Empty or omitted gRPC service names retain sing-box's empty service rather than honk's `GunService` default. Hysteria2 accepts `server_ports` without `server_port`, using the first hopping port as its nominal endpoint. Unsupported chaining, wire features, and authentication requirements are not silently dropped. Per-node uTLS fingerprint hints do not override honk's process-wide TLS settings.
+sing-box profiles import supported entries from `outbounds`: Shadowsocks, SOCKS5, VMess, VLESS, Trojan, Hysteria2, TUIC, Juicity, and AnyTLS. Structural `selector`, `urltest`, `direct`, `block`, and `dns` entries are not proxy nodes. TLS/SNI, REALITY, WebSocket/gRPC, VLESS packet modes, and supported protocol tuning are normalized through the common node builder. VLESS defaults to XUDP when no enabled multiplex/UoT wrapper or explicit packet encoding selects another behavior; a TCP-only restriction independently disables UDP. Empty or omitted gRPC service names retain sing-box's empty service rather than honk's `GunService` default. Hysteria2 accepts `server_ports` without `server_port`, using the first hopping port as its nominal endpoint. Unsupported chaining, wire features, and authentication requirements are not silently dropped. Per-node uTLS fingerprint hints do not override honk's process-wide TLS settings.
 
 In sing-box input, `network` is packet capability, not a stream type; `transport.type` selects the stream. Unsupported stream names such as `h2` reject the entry rather than becoming raw TCP.
 
 Where the sing-box mapping supports packet restrictions, `network: udp` and `network: tcp,udp` permit UDP, while `network: tcp` disables it. These values do not introduce UDP-only TCP rejection. Existing VLESS packet-mode requirements and restrictions for protocols without a representable packet-network field still apply.
 
-Explicit sing-box native VLESS UDP (`packet_encoding: ""` without TCP-only or an enabled wrapper) is unsupported and skipped; enabled H2MUX owns the packet path even when the source also spells out `packet_encoding: "xudp"`.
+Explicit sing-box native VLESS UDP (`packet_encoding: ""`) maps to `native`. Enabled H2MUX/UoT owns the packet path even when the source also specifies a packet encoding, including `packet_encoding: "xudp"`; disabling a wrapper does not suppress the source-format XUDP default.
 
 ### Surge, Surfboard, Loon, and Quantumult X
 
@@ -217,6 +219,8 @@ Permitted optional record credentials retain empty strings and quoted whitespace
 Record `transport`/`network` stream claims are compared before assignment, including repeated keys. Empty text and `tcp` have the same raw-TCP meaning; conflicting or unsupported stream claims reject the entry.
 
 AnyTLS record `network` occurrences are packet claims, not stream claims. Every repeated `network`, `udp`, and `udp-relay` value is validated before selection. Equivalent packet claims retain the first explicit network spelling; an invalid or conflicting occurrence rejects the record.
+
+VLESS record `packet-encoding`/`packet_encoding`/`packetencoding` values `none` or empty select native UDP; `xudp` selects Single XUDP. Repeated aliases must agree, including explicit empty assignments. `udp`/`udp-relay` controls packet permission separately.
 
 Supported records map credentials, TLS/SNI, WebSocket/gRPC, REALITY, and implemented protocol options to the same node model. Quantumult X `obfs=wss` uses `obfs-host` for both WebSocket Host and the default TLS SNI; an explicit TLS hostname wins. SSR, unsupported plugins/obfuscation, and unsupported transports are skipped rather than imported as another protocol.
 

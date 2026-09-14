@@ -60,13 +60,13 @@ fn quic_runtime(_: &Node) -> GenerationRuntime {
 }
 
 fn vless_supports_udp(node: &Node) -> bool {
-    node.vless().unwrap().mode != WireMode::Legacy && network_allows_udp(node)
+    node.vless().unwrap().udp_enabled()
 }
 
 fn vless_pool_bare_tcp(node: &Node) -> bool {
     matches!(
         node.vless().unwrap().mode,
-        WireMode::Legacy | WireMode::UotV2 | WireMode::Xudp
+        WireMode::Legacy | WireMode::Auto | WireMode::Native | WireMode::UotV2 | WireMode::Xudp
     )
 }
 
@@ -74,7 +74,9 @@ fn vless_runtime(node: &Node) -> GenerationRuntime {
     match node.vless().unwrap().mode {
         WireMode::H2mux | WireMode::H2muxPadded => GenerationRuntime::VlessH2Mux,
         WireMode::MuxCool => GenerationRuntime::VlessCoolMux,
-        WireMode::Legacy | WireMode::UotV2 | WireMode::Xudp => GenerationRuntime::None,
+        WireMode::Legacy | WireMode::Auto | WireMode::Native | WireMode::UotV2 | WireMode::Xudp => {
+            GenerationRuntime::None
+        }
     }
 }
 
@@ -189,6 +191,15 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     },
 ];
 
+/// Whether a selected node permits packets to the target port.
+///
+/// VLESS Vision's base flow reserves UDP/443 for TCP unless the explicit
+/// `-udp443` flow suffix opts in. Other protocols have no target-port policy.
+pub fn udp_target_allowed(node: &Node, port: u16) -> bool {
+    node.vless()
+        .is_none_or(|vless| !vless.rejects_udp_port(port))
+}
+
 pub fn descriptor(protocol: NodeProtocol) -> &'static ProtocolDescriptor {
     DESCRIPTORS
         .iter()
@@ -249,6 +260,8 @@ mod tests {
         let descriptor = descriptor(NodeProtocol::VLess);
         for (mode, udp, bare, runtime) in [
             (WireMode::Legacy, false, true, GenerationRuntime::None),
+            (WireMode::Auto, true, true, GenerationRuntime::None),
+            (WireMode::Native, true, true, GenerationRuntime::None),
             (WireMode::UotV2, true, true, GenerationRuntime::None),
             (WireMode::Xudp, true, true, GenerationRuntime::None),
             (WireMode::H2mux, true, false, GenerationRuntime::VlessH2Mux),
@@ -317,5 +330,22 @@ mod tests {
         let ss = descriptor(NodeProtocol::SS).supports_udp;
         let node = Node::default();
         assert!(ss(&node), "SS UDP is not network-gated");
+    }
+
+    #[test]
+    fn vless_udp_target_policy_is_flow_scoped() {
+        let mut node = Node {
+            outbound: honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
+                flow: Some("xtls-rprx-vision".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(udp_target_allowed(&node, 53));
+        assert!(!udp_target_allowed(&node, 443));
+
+        node.vless_mut().unwrap().flow = Some("xtls-rprx-vision-udp443".into());
+        assert!(udp_target_allowed(&node, 443));
+        assert!(udp_target_allowed(&Node::default(), 443));
     }
 }

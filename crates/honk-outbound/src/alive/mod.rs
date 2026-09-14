@@ -139,10 +139,11 @@ pub type HttpProberRef = Arc<dyn HttpProber>;
 /// from UDP selection permanently (no traffic left to revive them).
 #[derive(Debug)]
 pub struct UdpProbeOutcome {
-    /// Round-trip of the minimal DNS query through the node's UDP transport.
-    pub dns: Result<Duration, String>,
+    /// Round-trip of the minimal DNS query through the node's UDP transport;
+    /// `None` when target policy skips the configured DNS endpoint.
+    pub dns: Option<Result<Duration, String>>,
     /// Independent data-path handshake result; `None` when not run (no HTTPS
-    /// check URL, or the node belongs to no Score group).
+    /// check URL, no Score group, or target policy skips it).
     pub data_path: Option<Result<Duration, String>>,
 }
 
@@ -306,16 +307,13 @@ pub struct ProbeRecord {
 /// Maximum probe history entries per node per domain/IP version.
 const MAX_PROBE_HISTORY: usize = 100;
 
-/// Domain resolver for health-check targets: `(host, port) → addrs`.
+/// Domain resolver for health-check targets: `(host, port) → Result<addrs>`.
 /// honk-core installs the DNS-forwarder-backed resolver so all health-check
 /// name resolution shares honk's own DNS stack (routing, cache, serve-stale)
 /// instead of the raw system resolver; bootstrap DNS stays for node
 /// hostnames and startup.
 pub type ResolveHook = Arc<
-    dyn Fn(
-            String,
-            u16,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<SocketAddr>> + Send>>
+    dyn Fn(String, u16) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<SocketAddr>>> + Send>>
         + Send
         + Sync,
 >;
@@ -485,7 +483,7 @@ impl AliveDialerSet {
         // Resolve the check URL hostname once at startup; dae-format literal
         // fallback IPs (comma-separated) are merged in so probes still have
         // targets even when DNS resolution fails.
-        let addrs = self.resolve_host(hostname, port).await;
+        let addrs = self.resolve_host(hostname, port).await.unwrap_or_default();
         if addrs.is_empty() {
             tracing::warn!("Failed to resolve health check URL '{}'", hostname);
         }
@@ -523,21 +521,28 @@ impl AliveDialerSet {
         *self.resolver.write() = Some(hook);
     }
 
-    /// Resolve `host` via the installed hook, falling back to the system
-    /// resolver when no hook is set or the hook finds nothing.
-    pub async fn resolve_host(&self, host: &str, port: u16) -> Vec<SocketAddr> {
+    /// Resolve `host` via the installed hook. Typed local refusal is returned;
+    /// ordinary empty or failed hook results retain the system fallback.
+    pub async fn resolve_host(&self, host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
         let hook = self.resolver.read().clone();
         if let Some(hook) = hook {
-            let out = hook(host.to_string(), port).await;
-            if !out.is_empty() {
-                return out;
+            match hook(host.to_string(), port).await {
+                Ok(out) if !out.is_empty() => return Ok(out),
+                Err(error) if crate::proxy::is_packet_rejection(&error) => return Err(error),
+                Ok(_) => {
+                    tracing::debug!(
+                        "health-check resolver found nothing for {host}; system fallback"
+                    )
+                }
+                Err(_) => {
+                    tracing::debug!("health-check resolver failed for {host}; system fallback")
+                }
             }
-            tracing::debug!("health-check resolver found nothing for {host}; system fallback");
         }
-        tokio::net::lookup_host((host, port))
+        Ok(tokio::net::lookup_host((host, port))
             .await
             .map(|it| it.collect())
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     /// Refresh the cached check URL IPs.  Called at the start of each full
@@ -547,9 +552,15 @@ impl AliveDialerSet {
         let check_url = self.check_url.read().clone();
         if let Ok(target) = honk_config::check::decode_health_http_target(&check_url) {
             let port = target.port();
-            let addrs = self.resolve_host(target.host(), port).await;
-            if !addrs.is_empty() {
-                let ips = Self::merge_check_addrs(addrs, &check_url, port);
+            let ips = match self.resolve_host(target.host(), port).await {
+                Ok(addrs) => Self::merge_check_addrs(addrs, &check_url, port),
+                Err(_) => {
+                    *self.check_url_ips.write() =
+                        Self::merge_check_addrs(Vec::new(), &check_url, port);
+                    return;
+                }
+            };
+            if !ips.is_empty() {
                 *self.check_url_ips.write() = ips;
             }
         }
@@ -1413,22 +1424,30 @@ impl AliveDialerSet {
 
     /// Cached resolved IPs for a custom check URL, resolving on first use
     /// (same caching + literal-fallback semantics as the global check URL).
-    async fn check_ips_for_url(&self, url: &str) -> Vec<SocketAddr> {
+    async fn check_ips_for_url(&self, url: &str) -> anyhow::Result<Vec<SocketAddr>> {
         if let Some(ips) = self.url_check_ips.read().get(url) {
-            return ips.clone();
+            return Ok(ips.clone());
         }
         let ips = match honk_config::check::decode_health_http_target(url) {
             Ok(target) => {
                 let port = target.port();
-                let addrs = self.resolve_host(target.host(), port).await;
-                Self::merge_check_addrs(addrs, url, port)
+                match self.resolve_host(target.host(), port).await {
+                    Ok(addrs) => Self::merge_check_addrs(addrs, url, port),
+                    Err(error) => {
+                        let literals = Self::merge_check_addrs(Vec::new(), url, port);
+                        if literals.is_empty() {
+                            return Err(error);
+                        }
+                        literals
+                    }
+                }
             }
             Err(_) => Self::merge_check_addrs(Vec::new(), url, 80),
         };
         self.url_check_ips
             .write()
             .insert(url.to_string(), ips.clone());
-        ips
+        Ok(ips)
     }
 
     /// Replace the whole URLTest group table (config reload).

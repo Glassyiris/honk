@@ -166,7 +166,7 @@ impl DetailedConfigError {
                 "conflicting VLESS flow parameters" | "unsupported VLESS flow" => Some((
                     "invalid-config-value",
                     SettingPath::new("nodes").field("flow"),
-                    "VLESS flow must be absent or exactly xtls-rprx-vision; aliases must agree",
+                    "VLESS flow must be absent, xtls-rprx-vision, or xtls-rprx-vision-udp443; aliases must agree",
                 )),
                 "dns.hosts_file was removed; use one or more use_host paths" => Some((
                     "removed-dns-hosts-file",

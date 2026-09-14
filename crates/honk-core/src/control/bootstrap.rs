@@ -196,26 +196,20 @@ impl ControlPlane {
         // urltest (clash delay) measurements.
         {
             let controller = dns_controller.clone();
-            type HookFn = dyn Fn(
-                    String,
-                    u16,
-                ) -> std::pin::Pin<
-                    Box<dyn std::future::Future<Output = Vec<std::net::SocketAddr>> + Send>,
-                > + Send
-                + Sync;
             let make_hook =
                 move |controller: std::sync::Arc<crate::control::dns_control::DnsController>| {
-                    let hook: Arc<HookFn> = Arc::new(move |host: String, port: u16| {
-                        let controller = controller.clone();
-                        Box::pin(async move {
-                            controller
-                                .resolve_domain(&host)
-                                .await
-                                .into_iter()
-                                .map(|ip| std::net::SocketAddr::new(ip, port))
-                                .collect()
-                        })
-                    });
+                    let hook: crate::outbound::ResolveHook =
+                        Arc::new(move |host: String, port: u16| {
+                            let controller = controller.clone();
+                            Box::pin(async move {
+                                controller.resolve_domain(&host).await.map(|addresses| {
+                                    addresses
+                                        .into_iter()
+                                        .map(|ip| std::net::SocketAddr::new(ip, port))
+                                        .collect()
+                                })
+                            })
+                        });
                     hook
                 };
             alive_set.set_resolver(make_hook(controller.clone()));

@@ -69,7 +69,7 @@ transport 上实现 framing。
 | Shadowsocks（含 2022） | 是 | 否 | 是 | `None` | `ss` |
 | Trojan | `network` 缺省或包含 `udp` 时 | 仅 `tcp`/空 transport | 是 | `None` | `trojan` |
 | VMess | 否 | 否 | 是 | `None` | `vmess` |
-| VLESS | 非 `legacy` mode 且 `network` 允许 UDP | 否 | 仅 `legacy`、`uot-v2`、`xudp` | 按 mode 为 H2MUX、Mux.Cool 或 `None` | `vless` |
+| VLESS | 非 `legacy` mode 且 `network` 允许 UDP | 否 | `legacy`、`auto`、`native`、`uot-v2`、`xudp` | 按 mode 为 H2MUX、Mux.Cool 或 `None` | `vless` |
 | SOCKS5 | 是 | 是 | 是 | `None` | `socks5`、`socks4`、`socks4a` |
 | Hysteria2 | 是 | 否 | 否 | `Quic` | `hysteria2`、`hysteria` |
 | TUIC | 是 | 否 | 否 | `Quic` | `tuic` |
@@ -308,10 +308,12 @@ sing-box 服务端缓冲 8192 字节。更大的证书 flight 无法完成该握
 
 ## VLESS wire 契约
 
-`WireMode` 选择六种显式契约之一。它是配置，不是协商。
+`WireMode` 选择配置契约；`auto` 按目标端口与 flow 确定数据包 framing，不依赖协商或重试。
 
 | Mode | TCP 路径 | UDP 路径 | 可复用形态 |
 | --- | --- | --- | --- |
+| `auto` | 普通 VLESS stream | 无 Vision 时 53/443 使用原生 UDP，否则使用 Single XUDP | 无 generation runtime；可池化裸代理 TCP |
+| `native` | 普通 VLESS stream | connected command-UDP 与 u16 长度分帧 | 无 generation runtime；可池化裸代理 TCP |
 | `legacy` | 普通 VLESS stream | 无 | 无 generation runtime；可池化裸代理 TCP |
 | `uot-v2` | 普通 VLESS stream | 每个 packet transport 一条 connected direct UoT v2 stream | 无 generation runtime；可池化裸代理 TCP |
 | `h2mux` | H2MUX 逻辑 TCP stream | 使用 UoT 长度 framing 的 native connected H2MUX UDP | 节点所有 H2MUX pool，最多 2 条可复用/拨号中 carrier × 128 streams |
@@ -321,6 +323,12 @@ sing-box 服务端缓冲 8192 字节。更大的证书 flight 无法完成该握
 
 客户端绝不探测服务端 mode、回退到其他 mode，或重放首个 UDP packet。
 不匹配就是协议失败。这使 packet 准入与副作用保持 single-commit。
+
+原生 VLESS 复用 connected UoT 长度 codec，但不发送其 magic destination 或 setup preamble。
+发送范围为 1–8190 字节；收到的零长度帧是数据报，不是 EOF。writer 继续确认 flush，取消写入后禁止重放。
+类型化策略/大小拒绝与拥塞、传输故障分开，不降低健康或 Score。目标策略在实际候选准入前检查，
+复用逻辑通道也必须经过检查；被拒绝的候选终止准备并排干已启动工作，不选择回退路径。
+DNS 地址/交换重试保留该拒绝；健康检查与 CLI 在目标解析或反馈前分别跳过被拒绝的探测。
 
 ### H2MUX
 
@@ -359,7 +367,7 @@ pool。
 
 XUDP reply metadata 可以改变逻辑 peer，因此支持 full-cone 回包源地址。
 池化 Mux.Cool packet 上限为 8 KiB。Single XUDP 在专用、不入池的 carrier
-上复用同一 codec，global ID 为 `0`，packet 上限为 7,526 字节。
+上复用同一 codec，保留 session ID `0`，packet 上限为 7,526 字节。不发送 global-ID 元数据；不声称支持 Xray 跨 carrier 的源会话保持。
 
 ### Vision
 
@@ -372,8 +380,9 @@ Vision 移除 response padding。Command `2` 表示 direct-copy：服务端放�
 除非客户端自己发送 direct command，而 honk 不这样做。
 
 受支持的 carrier 是带 TLS 或 REALITY 的 TCP，受支持的 wire mode 是
-`legacy` 与 Single `xudp`。H2MUX、padded H2MUX、Mux.Cool 与 UoT 拥有
-不兼容的内层 framing。
+`legacy`、`auto` 与 Single `xudp`，也允许仅 TCP 的 `native`。
+基础 Vision 拒绝 UDP/443；`xtls-rprx-vision-udp443` 放行该端口，但线上只发送基础 flow addon。
+H2MUX、padded H2MUX、Mux.Cool 与 UoT 拥有不兼容的内层 framing，仍不能与 Vision 组合。
 
 ### VLESS Encryption
 
@@ -389,9 +398,7 @@ prologue 接受 X25519 或 ML-KEM-768 服务端认证密钥，包括链式 relay
 与 PFS key。冷缓存或过期缓存采用 1-RTT 路径。使用 ticket 时发生任何
 record 认证失败都会使其失效，因此下一条连接不会重复被拒绝的缓存路径。
 
-VLESS Encryption 仅支持 legacy。配置会拒绝它与 Vision 组合，也拒绝它
-与所有非 `legacy` wire mode 组合，因为每种组合都会让两层同时拥有同一
-内层 framing。
+VLESS Encryption 支持 `legacy`、`auto`、`native` 与 `xudp`，仍不支持 Vision 或 UoT/H2MUX/Mux.Cool wrapper 组合。
 
 ## QUIC 栈
 

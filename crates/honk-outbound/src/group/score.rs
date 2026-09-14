@@ -140,6 +140,7 @@ pub enum ScoreOutcome {
     Success,
     Timeout,
     Io(io::ErrorKind),
+    Rejected,
     Cancelled,
     Shutdown,
     Other,
@@ -147,6 +148,9 @@ pub enum ScoreOutcome {
 
 impl ScoreOutcome {
     pub fn from_error(error: &anyhow::Error) -> Self {
+        if crate::proxy::is_packet_rejection(error) {
+            return Self::Rejected;
+        }
         error
             .chain()
             .find_map(|source| source.downcast_ref::<io::Error>())
@@ -277,7 +281,7 @@ impl Stats {
         self.decay_to(now);
         if matches!(
             sample.outcome,
-            ScoreOutcome::Cancelled | ScoreOutcome::Shutdown
+            ScoreOutcome::Rejected | ScoreOutcome::Cancelled | ScoreOutcome::Shutdown
         ) {
             self.attempts = (self.attempts - evidence_decay(sample.elapsed)).max(0.0);
             self.last_used = tick;

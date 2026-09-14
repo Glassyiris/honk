@@ -391,6 +391,9 @@ impl DnsUpstreamPool for UpstreamPool {
                         None => Ok(response),
                     };
                 }
+                Err(error) if honk_outbound::proxy::is_packet_rejection(&error) => {
+                    return Err(error);
+                }
                 Err(error) => {
                     debug!(
                         target: "honk_core::dns::upstream_pool::failure",

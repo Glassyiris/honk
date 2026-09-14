@@ -9,7 +9,7 @@ mod guards {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
-    use super::{BuildFailure, LifecycleSlot, SlotState};
+    use super::{BuildFailure, LifecycleSlot, SharedBuildError, SlotState};
 
     pub(super) struct CloseGuard<'a, T> {
         slot: &'a LifecycleSlot<T>,
@@ -73,12 +73,12 @@ mod guards {
             value
         }
 
-        pub(super) fn fail(mut self, message: Arc<str>) {
-            self.record_failure(message);
+        pub(super) fn fail(mut self, error: SharedBuildError) {
+            self.record_failure(error);
             self.armed = false;
         }
 
-        fn record_failure(&self, message: Arc<str>) {
+        fn record_failure(&self, error: SharedBuildError) {
             {
                 let mut inner = self.slot.inner.lock();
                 if matches!(
@@ -88,7 +88,7 @@ mod guards {
                     inner.state = SlotState::Closed;
                     inner.last_failure = Some(BuildFailure {
                         generation: self.generation,
-                        message,
+                        error,
                     });
                 }
             }
@@ -99,7 +99,9 @@ mod guards {
     impl<T> Drop for BuildGuard<'_, T> {
         fn drop(&mut self) {
             if self.armed {
-                self.record_failure(Arc::from("transport initialization cancelled"));
+                self.record_failure(SharedBuildError(Arc::new(anyhow::anyhow!(
+                    "transport initialization cancelled"
+                ))));
             }
         }
     }
@@ -116,9 +118,31 @@ pub(crate) enum LifecycleState {
     Closed,
 }
 
+// An Arc<anyhow::Error> alone becomes an opaque display message when re-wrapped.
+#[derive(Clone)]
+struct SharedBuildError(Arc<anyhow::Error>);
+
+impl std::fmt::Debug for SharedBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.0.as_ref(), formatter)
+    }
+}
+
+impl std::fmt::Display for SharedBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.0.as_ref(), formatter)
+    }
+}
+
+impl std::error::Error for SharedBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref().as_ref())
+    }
+}
+
 struct BuildFailure {
     generation: u64,
-    message: Arc<str>,
+    error: SharedBuildError,
 }
 
 enum SlotState<T> {
@@ -194,7 +218,7 @@ impl<T> LifecycleSlot<T> {
                     && let Some(failure) = &inner.last_failure
                     && failure.generation == generation
                 {
-                    return Err(anyhow::anyhow!("{}", failure.message));
+                    return Err(anyhow::Error::new(failure.error.clone()));
                 }
                 match &inner.state {
                     SlotState::Ready(value) => return Ok(Arc::clone(value)),
@@ -226,9 +250,9 @@ impl<T> LifecycleSlot<T> {
             match initializer().await {
                 Ok(value) => return Ok(guard.publish(value)),
                 Err(error) => {
-                    let message: Arc<str> = Arc::from(error.to_string());
-                    guard.fail(Arc::clone(&message));
-                    return Err(anyhow::anyhow!("{}", message));
+                    let error = SharedBuildError(Arc::new(error));
+                    guard.fail(error.clone());
+                    return Err(anyhow::Error::new(error));
                 }
             }
         }

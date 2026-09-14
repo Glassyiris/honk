@@ -154,6 +154,24 @@ pub(super) fn take_packet_network(options: &mut RecordOptions) -> RecordResult<O
     Ok(options.take_first_nonempty(&["network"]))
 }
 
+pub(super) fn take_vless_packet_encoding_alias(
+    options: &mut RecordOptions,
+) -> RecordResult<Option<&'static str>> {
+    let keys = &["packet-encoding", "packet_encoding", "packetencoding"];
+    let encoding =
+        options.coalesce(
+            keys,
+            "record packet encoding aliases conflict",
+            |value| match value {
+                "" | "none" => Ok(Some("none")),
+                "xudp" => Ok(Some("xudp")),
+                _ => Err("VLESS packet encoding is unsupported"),
+            },
+        )?;
+    options.clear_aliases(keys);
+    Ok(encoding)
+}
+
 pub(super) fn take_option(options: &mut RecordOptions, keys: &[&str]) -> Option<String> {
     take_raw(options, keys).filter(|value| !value.is_empty())
 }

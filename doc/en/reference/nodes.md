@@ -57,7 +57,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `port` | u16 | `0` | Server port; URL-shaped links use `443` when omitted |
 | `username` / `password` | string? | null | Authentication, UUID, or secret from userinfo |
 | `encryption` | string? | null | SS/VMess cipher or VLESS Encryption client string |
-| `vless_mode` | `WireMode` | `legacy` | `legacy`, `uot-v2`, `h2mux`, `h2mux-padded`, `xudp`, or `mux-cool` |
+| `vless_mode` | `WireMode` | `auto` for VLESS | `auto`, `native`, `legacy`, `uot-v2`, `h2mux`, `h2mux-padded`, `xudp`, or `mux-cool` |
 | `plugin` / `plugin_opts` | string? | null | Parsed SIP002 plugin metadata; subscription import rejects non-empty values because proxy plugins are unsupported |
 | `transport` | string | `"tcp"` | Stream transport; validated as empty/`tcp`, `ws`, or `grpc` |
 | `tls` | bool | `false` | Stream TLS flag; Trojan/AnyTLS links enable it, canonical VLESS links historically default on |
@@ -70,7 +70,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
 | `reality_public_key` | string? | null | REALITY X25519 public key from `pbk` |
 | `reality_short_id` | string? | null | REALITY short ID from `sid` |
 | `reality_spider_x` | string? | null | Stored `spx`; a REALITY link defaults it to `/` |
-| `flow` | string? | null | VLESS flow from nonempty `flow` or Shadowrocket `xtls=2`; only `xtls-rprx-vision` is supported |
+| `flow` | string? | null | VLESS `xtls-rprx-vision` or `xtls-rprx-vision-udp443`; Shadowrocket `xtls=2` selects the base flow |
 | `network` | string? | null | Packet capability for supported protocols; independent of VMess JSON `net` and other stream-transport fields |
 | `ws_path` / `ws_host` | string? | null | WebSocket `path` and Host header |
 | `grpc_service` | string? | null | gRPC `serviceName` or `service_name` |
@@ -131,7 +131,7 @@ For VMess JSON with `net: "ws"`, an omitted or empty `host` uses the endpoint ho
 | `ss` | `shadowsocks` | Yes | Yes | AEAD and Shadowsocks 2022 |
 | `trojan` | — | Yes | Yes* | TLS; TCP/WS/gRPC transport |
 | `vmess` | — | Yes | No | AEAD; TCP/WS/gRPC and REALITY; handler requires `rprx` |
-| `vless` | — | Yes | Mode-dependent* | Legacy, UoT v2, H2MUX, XUDP, Mux.Cool, Encryption, REALITY, and Vision; handler requires `rprx` |
+| `vless` | — | Yes | Mode-dependent* | Automatic/native UDP, Legacy, UoT v2, H2MUX, XUDP, Mux.Cool, Encryption, REALITY, and Vision; handler requires `rprx` |
 | `socks5` | — | Yes | Yes | CONNECT and UDP ASSOCIATE |
 | `hysteria2` | — | Yes | Yes | QUIC/H3, salamander, brutal/BBR, and port hopping |
 | `tuic` | — | Yes | Yes | TUIC v5 over QUIC |
@@ -250,16 +250,24 @@ Durations accept bare seconds plus `ms`, `s`, `m`, and `h` suffixes.
 
 | Mode | TCP | UDP | Behavior |
 | --- | --- | --- | --- |
-| `legacy` | Ordinary VLESS stream | No | Backward-compatible default; omission preserves legacy identity |
+| `auto` | Ordinary VLESS stream | Native UDP or Single XUDP | Default for VLESS links and flat honk configuration; selected per target below |
+| `native` | Ordinary VLESS stream | VLESS command-UDP | Connected u16-length datagrams; not UoT v2 |
+| `legacy` | Ordinary VLESS stream | No | Explicit TCP-only compatibility mode; preserves legacy identity |
 | `uot-v2` | Ordinary VLESS stream | Direct UoT v2 | One connected UoT stream per UDP transport |
 | `h2mux` | H2MUX logical stream | Native connected sing-mux UDP | TCP and UDP share a node-owned HTTP/2 carrier pool |
 | `h2mux-padded` | H2MUX logical stream | Native connected sing-mux UDP | `h2mux` with sing-mux v1 padding |
 | `xudp` | Ordinary VLESS stream | Single XUDP | One unpooled mux-command carrier per UDP transport, session ID 0 |
 | `mux-cool` | Mux.Cool logical stream | Pooled XUDP | TCP and UDP share a node-owned Xray Mux.Cool carrier pool |
 
-The canonical query is `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool`. The legacy alias `packetEncoding=xudp` maps to `xudp`. Duplicate mode representations are rejected.
+The canonical query is `vless_mode=auto|native|legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool`. `packetEncoding=xudp` selects `xudp`; `packetEncoding=none` selects `native`, not UDP disable. Duplicate mode representations are rejected. Subscription formats retain their own documented defaults.
 
-Every non-`legacy` mode rejects non-empty, non-`none` VLESS Encryption. Vision is supported only with `legacy` or `xudp`, TLS or REALITY, and raw TCP transport. No mode negotiation, fallback, or first-packet replay occurs.
+With no Vision flow, `auto` uses native VLESS UDP for destination ports 53 and 443 and Single XUDP for other ports. With Vision, `auto` uses Single XUDP. The base `xtls-rprx-vision` flow rejects UDP/443 locally; `xtls-rprx-vision-udp443` permits it while sending the base flow on the wire. These target refusals are health/Score-neutral and never cause another-node or direct fallback.
+
+VLESS links permit UDP when `udp` is absent or `1`/`true`; `0`/`false` disables it independently of the selected carrier. Text booleans are ASCII-case-insensitive; equal repeated claims are accepted and conflicting or unknown values are rejected. URI `network=` still selects stream transport, not packet permission. Native sends accept 1–8190 bytes and Single XUDP sends 1–7526 bytes; empty/oversize sends are packet-local refusals, while a received zero-length frame remains a datagram, not EOF.
+
+Upgrading an omitted mode from `legacy` to `auto` changes the canonical node ID. Mode, Vision UDP443 spelling and effective non-legacy UDP disable participate in VLESS identity; equivalent packet-network spellings do not create separate identities. Reload/refresh can therefore rebuild health/runtime state or collapse newly equivalent subscription entries.
+
+VLESS Encryption supports `legacy`, `auto`, `native`, and `xudp`, without `flow`. Vision is supported with `legacy`, `auto` or `xudp`, TLS or REALITY, and raw TCP transport; `native` plus Vision is admitted only when UDP is disabled, preserving its TCP behavior. No mode negotiation, fallback, or first-packet replay occurs. Existing explicit H2MUX/Mux.Cool behavior is unchanged; honk does not import Xray's independent mux concurrency controls.
 
 Ambiguous third-party query forms are rejected instead of guessed: `mux`, `smux`, `multiplex`, `udp-over-tcp`, `udp_over_tcp`, `packet-encoding`, `packet_encoding`, `packet-addr`, `packet_addr`, `xudp`, `only-tcp`, `only_tcp`, `brutal`, `brutal-opts`, `brutal_opts`, `max-connections`, `max_connections`, `min-streams`, `min_streams`, `max-streams`, and `max_streams`.
 
@@ -273,7 +281,7 @@ The base client-string form accepted in `encryption=` is:
 mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<base64url-key>
 ```
 
-A key decodes to either a 32-byte X25519 key or a 1184-byte ML-KEM-768 key; chained authentication keys are accepted. `0rtt` uses a cached ticket and takes the 1-RTT path while cold. VLESS Encryption runs inside the selected TCP/TLS/REALITY/WS/gRPC transport, but requires `legacy` mode and cannot combine with `flow`.
+A key decodes to either a 32-byte X25519 key or a 1184-byte ML-KEM-768 key; chained authentication keys are accepted. `0rtt` uses a cached ticket and takes the 1-RTT path while cold. VLESS Encryption runs inside the selected TCP/TLS/REALITY/WS/gRPC transport with `legacy`, `auto`, `native`, or `xudp`, and cannot combine with `flow`.
 
 ### REALITY and Vision
 
@@ -285,7 +293,8 @@ For VLESS URL links, `security=reality` enables TLS and maps the REALITY query f
 | `pbk` | Base64url 32-byte X25519 server public key; invalid input fails closed |
 | `sid` | Even-length hexadecimal short ID, at most 8 bytes; empty is valid |
 | `spx` | Stored spider path; defaults to `/` when REALITY is selected |
-| `flow=xtls-rprx-vision` | Enable the supported Vision flow |
+| `flow=xtls-rprx-vision` | Enable Vision and reject UDP/443 locally |
+| `flow=xtls-rprx-vision-udp443` | Enable Vision while permitting UDP/443; the wire addon remains the base flow |
 | `fp` | Accepted but ignored; global TLS mode owns the ClientHello fingerprint |
 
 An explicit `security=` overrides the historical VLESS default: `none` disables TLS; any other value enables it. Without `security`, VLESS defaults TLS on. Standard VMess links use their v2rayN JSON `tls` field instead.

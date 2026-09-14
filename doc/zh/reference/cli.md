@@ -142,6 +142,8 @@ honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
 
 对每个节点，命令报告服务端地址族、完整的代理 IPv4/IPv6 交换、代理 URLTest 延迟、经 packet handler 的 DNS 查询，以及经该 handler 的真实 QUIC 握手。VMess、legacy VLESS 及 `network` 排除 UDP 的节点，其 UDP 显示 `n/a`；非 legacy VLESS 模式使用其配置的 packet transport。
 
+VLESS `auto` 根据各探测目标的端口与 flow 选择 wire mode。被策略拒绝的目标（如基础 Vision 的 UDP/443）仅在对应 DNS/QUIC 列显示 `n/a`，整体超时时也保留该结果；它不解析该目标，也不影响节点健康或 Score。`-udp443` flow 后缀可允许该探测。
+
 UDP DNS 目标解析、packet transport 建立、发送与接收共用一个 `--timeout` 预算。解析失败或超时只体现在 DNS 列，TCP、URLTest 和 QUIC 探测继续进行。不支持 UDP 的节点跳过该解析；主机名解析失败时不会替换为另一个目标。
 
 UDP DNS 主机名目标使用共享异步解析器，读取 `/etc/resolv.conf` 中首个数字形式的 nameserver（UDP 端口 `53`），并在 `/etc/hosts` 存在时加载它，不执行阻塞的 NSS 查询。此路径不应用 NSS 插件或解析器搜索后缀。解析器不可用时，DNS 列报告 `resolve`，不会回退到公共解析器；字面量目标不需要解析器。

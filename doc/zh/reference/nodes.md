@@ -57,7 +57,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `port` | u16 | `0` | 服务端端口；URL 形链接省略时使用 `443` |
 | `username` / `password` | string? | null | 来自 userinfo 的认证、UUID 或密钥 |
 | `encryption` | string? | null | SS/VMess cipher 或 VLESS Encryption 客户端字符串 |
-| `vless_mode` | `WireMode` | `legacy` | `legacy`、`uot-v2`、`h2mux`、`h2mux-padded`、`xudp` 或 `mux-cool` |
+| `vless_mode` | `WireMode` | VLESS 使用 `auto` | `auto`、`native`、`legacy`、`uot-v2`、`h2mux`、`h2mux-padded`、`xudp` 或 `mux-cool` |
 | `plugin` / `plugin_opts` | string? | null | 解析后的 SIP002 插件元数据；代理插件不受支持，订阅导入会拒绝非空值 |
 | `transport` | string | `"tcp"` | 流 transport；校验只接受空值/`tcp`、`ws` 或 `grpc` |
 | `tls` | bool | `false` | 流 TLS 标志；Trojan/AnyTLS 链接开启，规范 VLESS 链接历史默认开启 |
@@ -70,7 +70,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `reality_public_key` | string? | null | 来自 `pbk` 的 REALITY X25519 公钥 |
 | `reality_short_id` | string? | null | 来自 `sid` 的 REALITY short ID |
 | `reality_spider_x` | string? | null | 存储的 `spx`；REALITY 链接默认设为 `/` |
-| `flow` | string? | null | 来自非空 `flow` 或 Shadowrocket `xtls=2` 的 VLESS flow；只支持 `xtls-rprx-vision` |
+| `flow` | string? | null | VLESS `xtls-rprx-vision` 或 `xtls-rprx-vision-udp443`；Shadowrocket `xtls=2` 选择基础 flow |
 | `network` | string? | null | 受支持协议的数据包网络能力；与 VMess JSON `net` 等流传输字段独立 |
 | `ws_path` / `ws_host` | string? | null | WebSocket `path` 与 Host header |
 | `grpc_service` | string? | null | gRPC `serviceName` 或 `service_name` |
@@ -131,7 +131,7 @@ VMess JSON 使用 `net: "ws"` 时，缺失或为空的 `host` 会让 WebSocket �
 | `ss` | `shadowsocks` | 是 | 是 | AEAD 与 Shadowsocks 2022 |
 | `trojan` | — | 是 | 是* | TLS；TCP/WS/gRPC transport |
 | `vmess` | — | 是 | 否 | AEAD；TCP/WS/gRPC 与 REALITY；handler 需要 `rprx` |
-| `vless` | — | 是 | 取决于 mode* | Legacy、UoT v2、H2MUX、XUDP、Mux.Cool、Encryption、REALITY 与 Vision；handler 需要 `rprx` |
+| `vless` | — | 是 | 取决于 mode* | 自动/原生 UDP、Legacy、UoT v2、H2MUX、XUDP、Mux.Cool、Encryption、REALITY 与 Vision；handler 需要 `rprx` |
 | `socks5` | — | 是 | 是 | CONNECT 与 UDP ASSOCIATE |
 | `hysteria2` | — | 是 | 是 | QUIC/H3、salamander、brutal/BBR 与端口跳跃 |
 | `tuic` | — | 是 | 是 | QUIC 上的 TUIC v5 |
@@ -250,16 +250,24 @@ Duration 接受裸秒数以及 `ms`、`s`、`m`、`h` 后缀。
 
 | Mode | TCP | UDP | 行为 |
 | --- | --- | --- | --- |
-| `legacy` | 普通 VLESS stream | 否 | 向后兼容默认值；省略时保留 legacy 身份 |
+| `auto` | 普通 VLESS stream | 原生 UDP 或 Single XUDP | VLESS 链接及 honk 扁平配置的默认值；按下文的目标规则选择 |
+| `native` | 普通 VLESS stream | VLESS command-UDP | connected u16 长度分帧；不是 UoT v2 |
+| `legacy` | 普通 VLESS stream | 否 | 显式 TCP-only 兼容模式；保留 legacy 身份 |
 | `uot-v2` | 普通 VLESS stream | 直连 UoT v2 | 每个 UDP transport 一条 connected UoT stream |
 | `h2mux` | H2MUX 逻辑 stream | 原生 connected sing-mux UDP | TCP 与 UDP 共用节点所有的 HTTP/2 carrier pool |
 | `h2mux-padded` | H2MUX 逻辑 stream | 原生 connected sing-mux UDP | 带 sing-mux v1 padding 的 `h2mux` |
 | `xudp` | 普通 VLESS stream | Single XUDP | 每个 UDP transport 一条不入池的 mux-command carrier，session ID 0 |
 | `mux-cool` | Mux.Cool 逻辑 stream | 池化 XUDP | TCP 与 UDP 共用节点所有的 Xray Mux.Cool carrier pool |
 
-规范 query 为 `vless_mode=legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool`。旧别名 `packetEncoding=xudp` 映射为 `xudp`。重复的 mode 表示会被拒绝。
+规范 query 为 `vless_mode=auto|native|legacy|uot-v2|h2mux|h2mux-padded|xudp|mux-cool`。`packetEncoding=xudp` 选择 `xudp`；`packetEncoding=none` 选择 `native`，不是关闭 UDP。重复的 mode 表示会被拒绝。订阅格式保留各自文档规定的默认行为。
 
-每个非 `legacy` mode 都拒绝非空且非 `none` 的 VLESS Encryption。Vision 只支持与 `legacy` 或 `xudp`、TLS 或 REALITY，以及裸 TCP transport 组合。不会发生 mode 协商、回退或首包重放。
+没有 Vision flow 时，`auto` 对目标端口 53、443 使用原生 VLESS UDP，其他端口使用 Single XUDP。启用 Vision 时，`auto` 使用 Single XUDP。基础 `xtls-rprx-vision` 在本地拒绝 UDP/443；`xtls-rprx-vision-udp443` 放行该端口，但线上仍发送基础 flow。这类目标拒绝不影响健康或 Score，也不会回退到其他节点或 direct。
+
+VLESS 链接省略 `udp` 或使用 `1`/`true` 时允许 UDP；`0`/`false` 独立关闭 UDP，不改变选定的 carrier。文本布尔值忽略 ASCII 大小写；重复等价声明可接受，冲突或未知值会被拒绝。URI 的 `network=` 仍表示流 transport，不表示数据包权限。原生 UDP 发送范围为 1–8190 字节，Single XUDP 为 1–7526 字节；空包或超长包是数据包局部拒绝，接收到的零长度帧仍是数据报，不是 EOF。
+
+升级后，省略 mode 的节点从 `legacy` 变为 `auto`，规范节点 ID 随之改变。mode、Vision UDP443 拼写以及非 legacy 模式的有效 UDP 关闭状态都参与 VLESS 身份；等价的数据包网络拼写不会产生不同身份。因此 reload/refresh 可能重建健康和运行时状态，或合并新近等价的订阅条目。
+
+VLESS Encryption 支持不带 `flow` 的 `legacy`、`auto`、`native` 与 `xudp`。Vision 支持 `legacy`、`auto` 或 `xudp`、TLS 或 REALITY，以及裸 TCP transport；`native` 与 Vision 仅在关闭 UDP 时允许组合，以保留其 TCP 行为。不会发生 mode 协商、回退或首包重放。现有显式 H2MUX/Mux.Cool 行为不变；honk 不导入 Xray 独立的 mux 并发控制参数。
 
 解析器拒绝而不是猜测以下含义模糊的第三方 query 形式：`mux`、`smux`、`multiplex`、`udp-over-tcp`、`udp_over_tcp`、`packet-encoding`、`packet_encoding`、`packet-addr`、`packet_addr`、`xudp`、`only-tcp`、`only_tcp`、`brutal`、`brutal-opts`、`brutal_opts`、`max-connections`、`max_connections`、`min-streams`、`min_streams`、`max-streams` 与 `max_streams`。
 
@@ -273,7 +281,7 @@ Duration 接受裸秒数以及 `ms`、`s`、`m`、`h` 后缀。
 mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<base64url-key>
 ```
 
-密钥解码后可以是 32 字节 X25519 密钥或 1184 字节 ML-KEM-768 密钥；也接受链式认证密钥。`0rtt` 使用缓存 ticket，冷启动时走 1-RTT 路径。VLESS Encryption 位于所选 TCP/TLS/REALITY/WS/gRPC transport 内层，但要求 `legacy` mode，且不能与 `flow` 组合。
+密钥解码后可以是 32 字节 X25519 密钥或 1184 字节 ML-KEM-768 密钥；也接受链式认证密钥。`0rtt` 使用缓存 ticket，冷启动时走 1-RTT 路径。VLESS Encryption 位于所选 TCP/TLS/REALITY/WS/gRPC transport 内层，支持 `legacy`、`auto`、`native` 或 `xudp`，且不能与 `flow` 组合。
 
 ### REALITY 与 Vision
 
@@ -285,7 +293,8 @@ mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<base64url-key>
 | `pbk` | Base64url 编码的 32 字节 X25519 服务端公钥；无效输入 fail-closed |
 | `sid` | 偶数长度十六进制 short ID，最多 8 字节；允许为空 |
 | `spx` | 存储 spider path；选择 REALITY 时默认为 `/` |
-| `flow=xtls-rprx-vision` | 开启受支持的 Vision flow |
+| `flow=xtls-rprx-vision` | 开启 Vision，并在本地拒绝 UDP/443 |
+| `flow=xtls-rprx-vision-udp443` | 开启 Vision 并放行 UDP/443；线上 addon 仍使用基础 flow |
 | `fp` | 接受但忽略；ClientHello 指纹由全局 TLS mode 控制 |
 
 显式 `security=` 会覆盖 VLESS 历史默认值：`none` 关闭 TLS，其他值开启。没有 `security` 时 VLESS 默认开启 TLS。标准 VMess 链接改用其 v2rayN JSON `tls` 字段。

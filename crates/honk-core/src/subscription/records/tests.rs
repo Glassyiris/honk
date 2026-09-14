@@ -586,6 +586,52 @@ fn b4_record_equivalent_packet_claims_keep_first_spelling() {
     assert_eq!(nodes[0].network(), Some("udp"));
 }
 
+const B4_RECORD_VLESS_PACKET_ENCODINGS: &str = r#"none=vless,none.example,443,00000000-0000-4000-8000-000000000051,packet-encoding=none
+empty=vless,empty.example,443,00000000-0000-4000-8000-000000000052,packet_encoding=
+aliases=vless,aliases.example,443,00000000-0000-4000-8000-000000000053,packet-encoding=none,packet_encoding=
+xudp-disabled=vless,xudp.example,443,00000000-0000-4000-8000-000000000054,packetencoding=xudp,udp=false
+vision-native-tcp=vless,vision.example,443,00000000-0000-4000-8000-000000000055,packet-encoding=none,udp=false,flow=xtls-rprx-vision,tls=true
+conflict=vless,conflict.example,443,00000000-0000-4000-8000-000000000056,packet-encoding=none,packet_encoding=xudp
+hidden-invalid=vless,invalid.example,443,00000000-0000-4000-8000-000000000057,packet-encoding=invalid,packet-encoding=none
+conflict-empty=vless,empty-conflict.example,443,00000000-0000-4000-8000-000000000058,packetencoding=xudp,packet_encoding="#;
+
+#[test]
+fn b4_record_vless_packet_aliases_preserve_native_and_reject_conflicts() {
+    let nodes = parse_records_subscription(B4_RECORD_VLESS_PACKET_ENCODINGS, None).unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "none",
+            "empty",
+            "aliases",
+            "xudp-disabled",
+            "vision-native-tcp",
+        ]
+    );
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.vless().unwrap().mode)
+            .collect::<Vec<_>>(),
+        [
+            honk_config::node::WireMode::Native,
+            honk_config::node::WireMode::Native,
+            honk_config::node::WireMode::Native,
+            honk_config::node::WireMode::Xudp,
+            honk_config::node::WireMode::Native,
+        ]
+    );
+    assert!(nodes[0].vless().unwrap().udp_enabled());
+    assert!(nodes[1].vless().unwrap().udp_enabled());
+    assert!(nodes[2].vless().unwrap().udp_enabled());
+    assert!(!nodes[3].vless().unwrap().udp_enabled());
+    assert!(!nodes[4].vless().unwrap().udp_enabled());
+    assert!(nodes.iter().all(|node| node.id == node.derive_id()));
+}
+
 const B4_RECORD_DURATION_CONFLICT: &str =
     "hysteria2=example.com:443,password=fixture,mhop=1s,hop_interval=2s,tag=conflict";
 const B4_RECORD_DURATION_EQUIVALENT: &str = "hysteria2=example.com:443,password=fixture,mhop=500ms,hop-interval=1s,hop_interval=1000ms,tag=equal";

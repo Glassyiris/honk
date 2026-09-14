@@ -339,10 +339,10 @@ fn classify_vless_node(node: &Node) -> ProbeEligibility {
     }
 
     let flow = vless.flow.as_deref().filter(|flow| !flow.is_empty());
-    if flow.is_some_and(|flow| flow != "xtls-rprx-vision") {
+    let vision = vless.is_vision();
+    if flow.is_some() && !vision {
         return ProbeEligibility::ExpectedUnsupported("unsupported-flow");
     }
-    let vision = flow == Some("xtls-rprx-vision");
     if vision && !vless.tls.enabled && !reality {
         return ProbeEligibility::InvalidConfig("vision-without-tls");
     }
@@ -380,13 +380,17 @@ fn vless_shape(node: &Node) -> String {
         "grpc" => "grpc",
         _ => "unsupported",
     };
-    let vision = if vless.flow.as_deref() == Some("xtls-rprx-vision") {
+    let vision = if !vless.is_vision() {
+        ""
+    } else if vless.flow.as_deref() == vless.wire_flow() {
         "/vision"
     } else {
-        ""
+        "/vision-udp443"
     };
     let wire = match vless.mode {
         WireMode::Legacy => "",
+        WireMode::Auto => "/auto",
+        WireMode::Native => "/native",
         WireMode::UotV2 => "/uot-v2",
         WireMode::H2mux => "/h2mux",
         WireMode::H2muxPadded => "/h2mux-padded",
@@ -421,7 +425,7 @@ async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets
     let deadline = targets.timeout.saturating_add(Duration::from_secs(1));
     match tokio::time::timeout(deadline, probe_supported_node(registry, &node, targets)).await {
         Ok(outcome) => outcome,
-        Err(_) => ProbeOutcome::timed_out(registry, &node),
+        Err(_) => ProbeOutcome::timed_out(registry, &node, targets),
     }
 }
 
@@ -514,12 +518,16 @@ impl ProbeOutcome {
         }
     }
 
-    fn timed_out(registry: &ProxyRegistry, node: &Node) -> Self {
-        let packet_result = registry
+    fn timed_out(registry: &ProxyRegistry, node: &Node, targets: &ProbeTargets) -> Self {
+        let packet_available = registry
             .find(node.protocol())
             .filter(|entry| (entry.descriptor.supports_udp)(node))
             .and_then(|entry| entry.packet.as_ref())
-            .map(|_| Err(ProbeFailureKind::Timeout));
+            .is_some();
+        let packet_result = |port| {
+            (packet_available && honk_outbound::descriptor::udp_target_allowed(node, port))
+                .then_some(Err(ProbeFailureKind::Timeout))
+        };
         Self {
             node_name: node.name.clone(),
             shape: probe_shape(node),
@@ -529,8 +537,8 @@ impl ProbeOutcome {
             v4: Some(Err(ProbeFailureKind::Timeout)),
             v6: Some(Err(ProbeFailureKind::Timeout)),
             urltest: Some(Err(ProbeFailureKind::Timeout)),
-            udp_dns: packet_result,
-            udp_quic: packet_result,
+            udp_dns: packet_result(targets.udp_dns.port()),
+            udp_quic: packet_result(targets.port),
         }
     }
 }

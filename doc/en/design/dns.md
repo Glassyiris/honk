@@ -139,6 +139,15 @@ A prefer-family sibling query changes only the first question's QTYPE. Transacti
 
 The strategy also orders bootstrap-resolved upstream dial targets. `both` uses IPv4-first compatibility order; preference modes put their family first while retaining the other family. Stream and QUIC transports walk the ordered candidates. Direct UDP keeps the existing two-attempt bound: after the first candidate fails, its retry selects the other family before another address of the same family and caches the winner.
 
+Typed local packet refusals are not availability failures. DoH3/DoQ initialization
+retains their source for both the builder and its waiters; the outer route loop
+and name-family aggregation do not turn them into another-route, bootstrap, or
+system-DNS attempts. Health and URLTest resolver hooks preserve the error to the
+final consumer, so denied lookups neither demote nodes nor substitute the default
+UDP check target. Independently permitted probes and configured literal fallback
+IPs remain usable. Ordinary failures, empty responses, and existing stale-cache
+handling retain the fallback behavior described above.
+
 ### DNS routing
 
 Conditions within one rule are ANDed; arguments inside one condition are ORed; each condition can be negated. The compiled condition model covers qname, qtype, request-only source IP, upstream name, and response IP. Rules are evaluated in source order and stop on the first match. An unknown source makes both `sip(...)` and `!sip(...)` false, and response rules reject `sip` during configuration.

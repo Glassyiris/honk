@@ -3,7 +3,7 @@
 use crate::error::ConfigError;
 use crate::node::{Hysteria2Config, Node, OutboundConfig, QuicOptions, VlessConfig};
 use crate::options::vocab::{
-    optional_flow, optional_text, stream_transport, verification_text, vmess_cipher,
+    coalesce_equal, optional_flow, optional_text, stream_transport, verification_text, vmess_cipher,
 };
 use crate::types::{NodeProtocol, parse_duration_secs};
 
@@ -569,13 +569,29 @@ fn apply_vless(config: &mut VlessConfig, query: &Query) -> Result<(), ConfigErro
     } else if let Some(encoding) = query.get("packetEncoding") {
         match encoding.as_str() {
             "xudp" => config.mode = crate::node::WireMode::Xudp,
-            "none" => {}
+            "none" => config.mode = crate::node::WireMode::Native,
             _ => {
                 return Err(ConfigError::Parse(
                     "unsupported VLESS packetEncoding (expected xudp or none)".into(),
                 ));
             }
         }
+    }
+    if let Some(enabled) = coalesce_equal(
+        query.values("udp").map(|value| {
+            if value == "1" || value.eq_ignore_ascii_case("true") {
+                Ok(Some(true))
+            } else if value == "0" || value.eq_ignore_ascii_case("false") {
+                Ok(Some(false))
+            } else {
+                Err("unsupported VLESS udp value (expected 1/true or 0/false)")
+            }
+        }),
+        "conflicting VLESS udp parameters",
+    )
+    .map_err(|reason| ConfigError::Parse(reason.into()))?
+    {
+        config.network = (!enabled).then(|| "tcp".to_string());
     }
     let flow = optional_text(query.values("flow").map(Some))
         .map_err(|_| ConfigError::Parse("conflicting VLESS flow parameters".into()))?;
