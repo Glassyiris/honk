@@ -3,13 +3,13 @@ use super::reload::{
     SelectorWarmResources, run_udp_warm_dispatches, selector_warm_candidates, udp_warm_candidates,
     warm_selector_candidate,
 };
+use super::tests::support::{
+    canonical_socks5, changed_routing_config, control_plane, score_reload_config,
+    test_dns_forwarder,
+};
+use super::udp_endpoint::UdpEndpoint;
 use super::*;
 
-#[path = "c14_diagnostics_tests.rs"]
-mod c14_diagnostics;
-
-use crate::control::udp_endpoint::{EndpointReservation, UdpEndpoint};
-use crate::dns;
 use crate::ebpf::mock::MockEbpfBackend;
 use crate::ebpf::{DatapathFlagsWriteOrigin, RoutingPushPhase};
 use crate::stats::StatsManager;
@@ -42,8 +42,6 @@ async fn capture_runtime_admission(future: impl Future) -> String {
     future.await;
     String::from_utf8(captured.lock().clone()).unwrap()
 }
-#[path = "c28_health_tests.rs"]
-mod c28_health_tests;
 
 fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'static str> {
     let current_log_file = crate::resolved_log_file_path(current, None);
@@ -193,33 +191,6 @@ fn equivalent_resolved_log_file_path_does_not_require_restart() {
     assert!(restart_required_changes(&current, &replacement).is_empty());
 }
 
-pub(super) fn test_dns_forwarder() -> std::sync::Arc<dns::forwarder::DnsForwarder> {
-    let cache = Arc::new(tokio::sync::Mutex::new(dns::cache::DnsCache::new(100)));
-    let router = Arc::new(
-        dns::routing::DnsRouter::new(&honk_config::dns::DnsRouting {
-            rules: vec![],
-            fallback: "default".into(),
-            ..Default::default()
-        })
-        .unwrap(),
-    );
-    let upstream_pool = Arc::new(
-        dns::upstream_pool::UpstreamPool::new(
-            &[honk_config::dns::DnsUpstream {
-                name: "default".into(),
-                address: "8.8.8.8:53".into(),
-                protocol: honk_config::types::DnsProtocol::Udp,
-                tls_server_name: None,
-                outbound: None,
-            }],
-            router.clone(),
-        )
-        .unwrap(),
-    );
-    dns::forwarder::DnsForwarder::new(upstream_pool, cache, router)
-        .with_cache_enabled(false)
-        .into()
-}
 #[test]
 fn single_leaf_tcp_connectivity_stays_open_for_recovery() {
     let node = Node {
@@ -328,63 +299,6 @@ async fn test_cp_with_nfq(nfqueue: bool) -> ControlPlane {
     control_plane
 }
 
-fn changed_routing_config() -> Config {
-    let mut config = Config::default();
-    config
-        .routing
-        .rules
-        .push(honk_config::routing::RoutingRule {
-            name: "reload-change".into(),
-            condition: honk_config::routing::RoutingCondition {
-                domain: vec!["reload.example".into()],
-                ..Default::default()
-            },
-            outbound: honk_config::routing::RoutingOutbound::Simple("direct".into()),
-            priority: 0,
-            must: false,
-            mark: 0,
-        });
-    config
-}
-
-fn score_reload_config(revision: u64) -> Config {
-    let nodes = [("score-a", 9), ("score-b", 10)].map(|(name, port)| {
-        let mut node = Node {
-            name: name.into(),
-            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
-            address: format!("127.0.0.1:{port}"),
-            host: "127.0.0.1".into(),
-            port,
-            ..Default::default()
-        };
-        node.id = node.derive_id();
-        node
-    });
-    let mut config = Config::default();
-    config
-        .routing
-        .rules
-        .push(honk_config::routing::RoutingRule {
-            name: format!("score-reload-{revision}"),
-            condition: honk_config::routing::RoutingCondition {
-                domain: vec![format!("score-{revision}.example")],
-                ..Default::default()
-            },
-            outbound: honk_config::routing::RoutingOutbound::Simple("direct".into()),
-            priority: 0,
-            must: false,
-            mark: 0,
-        });
-    config.nodes = nodes.to_vec();
-    config.groups = vec![Group {
-        name: "score".into(),
-        policy: GroupPolicy::Score,
-        nodes: nodes.iter().map(|node| node.id).collect(),
-        ..Default::default()
-    }];
-    config
-}
-
 fn score_reload_context() -> honk_outbound::group::ScoreSelectionContext {
     honk_outbound::group::ScoreSelectionContext {
         network: honk_outbound::group::SelectionNetwork::Tcp,
@@ -413,7 +327,7 @@ async fn reload_persists_selector_choice_before_manager_publication() {
     cp.cache_db = Some(Arc::clone(&db));
     let mut config = changed_routing_config();
     config.nodes = [("a", 9), ("b", 10)]
-        .map(|(name, port)| super::c20_tests::canonical_socks5(name, "127.0.0.1", port, None))
+        .map(|(name, port)| canonical_socks5(name, "127.0.0.1", port, None))
         .to_vec();
     config.groups = vec![Group {
         name: "selector".into(),
@@ -2606,7 +2520,7 @@ async fn subscription_refresh_duplicate_static_node_reports_one_safe_rejection()
     static_node.subscription_id = None;
     current.nodes.push(static_node);
     current.subscriptions.push(subscription.clone());
-    let mut cp = super::c20_tests::control_plane(current.clone()).await;
+    let mut cp = control_plane(current.clone());
     let mut authorizations =
         crate::subscription::SubscriptionAuthorizations::new(&current.subscriptions).unwrap();
     let command = ControlCommand::MergeSubscription {
@@ -2636,13 +2550,12 @@ async fn subscription_refresh_stale_id_reports_one_safe_rejection() {
         url: "http://127.0.0.1:9".into(),
         ..Default::default()
     };
-    let node =
-        super::c20_tests::canonical_socks5("provider", "192.0.2.10", 1080, Some(subscription.id));
+    let node = canonical_socks5("provider", "192.0.2.10", 1080, Some(subscription.id));
     let mut current = Config::default();
     current.global.nfqueue_enable = false;
     current.nodes.push(node.clone());
     current.subscriptions.push(subscription.clone());
-    let cp = super::c20_tests::control_plane(current.clone()).await;
+    let cp = control_plane(current.clone());
     let mut stale = node;
     stale.address = "192.0.2.11".into();
     let log = capture_runtime_admission(cp.merge_subscription_nodes(

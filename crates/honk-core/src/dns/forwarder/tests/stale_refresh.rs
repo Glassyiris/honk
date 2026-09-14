@@ -1,3 +1,5 @@
+use super::*;
+
 use crate::dns::cache::{CacheKey, OperationKind};
 use crate::dns::outcome::Provenance;
 use crate::dns::outcome::{OutcomeStatus, ResponseClass};
@@ -21,16 +23,6 @@ async fn forwarding_hot_path_is_not_serialized_by_compatibility_cache_mutex() {
         .expect("resolve");
 
     assert_eq!(&result[result.len() - 4..], &[192, 0, 2, 3]);
-}
-
-/// Mock upstream that always fails (serve-stale tests).
-struct FailUpstream;
-
-#[async_trait]
-impl DnsUpstreamPool for FailUpstream {
-    async fn query(&self, _: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
-        anyhow::bail!("upstream down")
-    }
 }
 
 /// Fill the cache with a 1-second-TTL answer, let it expire, then
@@ -579,8 +571,8 @@ async fn foreground_zero_ttl_positive_retires_expired_positive() {
         refresh_entered: tokio::sync::Notify::new(),
         refresh_release: tokio::sync::Semaphore::new(0),
     });
-    let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router())
-        .with_cache_ttl(0);
+    let forwarder =
+        DnsForwarder::new(upstream.clone(), test_cache(), test_router()).with_cache_ttl(0);
     forwarder.resolve_outcome(&query).await.expect("initial");
     forwarder
         .cache_service()

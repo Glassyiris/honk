@@ -1,3 +1,5 @@
+use super::*;
+
 #[tokio::test]
 async fn clones_share_lazy_engine_and_policy_change_resets_it() {
     let forwarder = DnsForwarder::new(
@@ -95,19 +97,17 @@ async fn service_flush_fences_background_refresh_memory_and_persistence() {
 
     let directory = tempfile::tempdir().expect("tempdir");
     let database = Arc::new(
-        crate::cachedb::CacheDb::open(
-            &CacheFileConfig {
-                enabled: true,
-                path: directory
-                    .path()
-                    .join("cache.db")
-                    .to_string_lossy()
-                    .into_owned(),
-                cache_id: String::new(),
-                store_fakeip: false,
-                store_dns: true,
-            },
-        )
+        crate::cachedb::CacheDb::open(&CacheFileConfig {
+            enabled: true,
+            path: directory
+                .path()
+                .join("cache.db")
+                .to_string_lossy()
+                .into_owned(),
+            cache_id: String::new(),
+            store_fakeip: false,
+            store_dns: true,
+        })
         .expect("cache.db"),
     );
     let persister = crate::dns::persist::DnsCachePersister::spawn(Arc::clone(&database));
@@ -176,19 +176,17 @@ async fn cancelled_persistent_flush_reopens_cache_publication() {
 
     let directory = tempfile::tempdir().expect("tempdir");
     let database = Arc::new(
-        crate::cachedb::CacheDb::open(
-            &CacheFileConfig {
-                enabled: true,
-                path: directory
-                    .path()
-                    .join("cache.db")
-                    .to_string_lossy()
-                    .into_owned(),
-                cache_id: String::new(),
-                store_fakeip: false,
-                store_dns: true,
-            },
-        )
+        crate::cachedb::CacheDb::open(&CacheFileConfig {
+            enabled: true,
+            path: directory
+                .path()
+                .join("cache.db")
+                .to_string_lossy()
+                .into_owned(),
+            cache_id: String::new(),
+            store_fakeip: false,
+            store_dns: true,
+        })
         .expect("cache.db"),
     );
     let persister = crate::dns::persist::DnsCachePersister::spawn(Arc::clone(&database));

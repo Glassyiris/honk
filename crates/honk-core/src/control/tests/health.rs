@@ -1,9 +1,23 @@
-use crate::control::{ControlPlane, c20_tests::control_plane, reload_tests};
-use honk_config::{Config, node::Node, types::NodeProtocol};
-use honk_outbound::alive::{HttpProbeResult, HttpProber};
+use super::support::{
+    UdpTestHandler, UdpTestMode, canonical_socks5, control_plane, score_reload_config,
+};
+use crate::control::{
+    ControlPlane,
+    drain::DrainTracker,
+    probers::{resolve_udp_check_target, udp_probe_identity},
+};
+use honk_config::{Config, node::Node, parser::parse_dae_config, types::NodeProtocol};
+use honk_outbound::alive::{HttpProbeResult, HttpProber, IpVersion, ProbeDomain, UdpProber};
 use honk_outbound::proxy::{ProtocolEntry, ProxyRegistry, ProxyStream, TcpOutbound};
 use parking_lot::Mutex;
-use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -42,7 +56,7 @@ impl HttpProber for PeriodProbe {
 }
 
 fn health_config(url: String) -> Config {
-    let mut config = reload_tests::score_reload_config(50);
+    let mut config = score_reload_config(50);
     config.global.nfqueue_enable = false;
     config.global.check_interval_secs = 30;
     config.global.tcp_check_url = vec![url];
@@ -53,7 +67,7 @@ fn health_config(url: String) -> Config {
 #[tokio::test(start_paused = true)]
 async fn c28_health_reload_retains_old_period_after_rejection() {
     let old = health_config("http://127.0.0.1:18080/".into());
-    let cp = control_plane(old.clone()).await;
+    let cp = control_plane(old.clone());
     let alive = cp.alive_set();
     let (calls, mut observations) = tokio::sync::mpsc::unbounded_channel();
     alive
@@ -120,7 +134,7 @@ async fn http_fixture() -> (
             });
         }
     });
-    let cp = control_plane(old.clone()).await;
+    let cp = control_plane(old.clone());
     let mut registry = ProxyRegistry::new();
     registry.register(ProtocolEntry::new(
         NodeProtocol::Socks5,
@@ -196,7 +210,7 @@ async fn c28_effectively_equal_health_inputs_remain_admissible() {
         |config: &mut Config| config.global.utls_imitate = "firefox".into(),
     ] {
         let old = health_config("http://127.0.0.1:18080/".into());
-        let cp = control_plane(old.clone()).await;
+        let cp = control_plane(old.clone());
         let mut candidate = old;
         change(&mut candidate);
         assert!(
@@ -206,8 +220,176 @@ async fn c28_effectively_equal_health_inputs_remain_admissible() {
         assert_eq!(cp.config_handle().read().await.as_ref(), &candidate);
     }
     let mut old = health_config(String::new());
-    let cp = control_plane(old.clone()).await;
+    let cp = control_plane(old.clone());
     old.global.tcp_check_url.clear();
     old.global.tcp_check_http_method = "POST".into();
     assert!(cp.reload_runtime_config(old, Default::default()).await);
+}
+
+#[tokio::test]
+async fn c28_udp_reload_preserves_the_configured_probe_target() {
+    for (old_raw, new_raw, expected_target, should_accept) in [
+        (
+            "127.0.0.1:5301",
+            vec!["127.0.0.1:5302"],
+            "127.0.0.1:5301",
+            false,
+        ),
+        (
+            "",
+            vec!["8.8.8.8:53", "unused.example:5302"],
+            "8.8.8.8:53",
+            true,
+        ),
+        (
+            "old.example:5301",
+            vec!["new.example:5301"],
+            "127.0.0.1:5301",
+            false,
+        ),
+        (
+            "OLD.example.:5301",
+            vec!["old.example:5301"],
+            "127.0.0.1:5301",
+            true,
+        ),
+        (
+            "127.0.0.1:5301",
+            vec!["unused.example", " 127.0.0.1:5301 ", "127.0.0.1:5302"],
+            "127.0.0.1:5301",
+            true,
+        ),
+    ] {
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&resolver_calls);
+        let resolver: crate::outbound::ResolveHook = Arc::new(move |_host, port| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { vec![SocketAddr::from(([127, 0, 0, 1], port))] })
+        });
+        let node = canonical_socks5("c28-udp", "127.0.0.1", 9, None);
+        let mut config = Config::default();
+        config.global.nfqueue_enable = false;
+        config.global.udp_check_dns = vec![old_raw.into()];
+        config.nodes = vec![node.clone()];
+        let target =
+            resolve_udp_check_target(&config.global.udp_check_dns, Some(resolver.clone())).await;
+        let identity = udp_probe_identity(&config.global.udp_check_dns, target);
+        let cp = control_plane(config.clone());
+        cp.alive_set().set_resolver(resolver);
+        let calls_before = resolver_calls.load(Ordering::SeqCst);
+        let capture = Arc::new(Mutex::new(None));
+        let handler = Arc::new(UdpTestHandler {
+            mode: UdpTestMode::DnsResponseCaptureTarget(Arc::clone(&capture)),
+        });
+        let mut registry = ProxyRegistry::new();
+        registry.register(
+            honk_outbound::proxy::ProtocolEntry::new(node.protocol(), handler.clone())
+                .with_packet(handler),
+        );
+        let prober = crate::control::probers::ProxyUdpProber::new(
+            cp.config_handle(),
+            Arc::new(registry),
+            cp.runtime_registry(),
+            cp.stats_handle(),
+            target,
+            identity,
+            None,
+            cp.group_manager(),
+        );
+        let generation = cp.runtime_registry().read().generation();
+        let mut candidate = config.clone();
+        candidate.global.udp_check_dns = new_raw.into_iter().map(str::to_owned).collect();
+        let accepted = cp
+            .apply_runtime_config(candidate.clone(), Default::default(), &DrainTracker::new())
+            .await;
+        let outcome = UdpProber::probe_udp(&prober, &node.name, Duration::from_secs(1)).await;
+        assert!(outcome.dns.is_ok(), "{outcome:?}");
+        assert_eq!(
+            *capture.lock(),
+            Some(expected_target.parse::<SocketAddr>().unwrap()),
+        );
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), calls_before);
+        assert_eq!(accepted, should_accept, "configured UDP target: {old_raw}");
+        assert_eq!(
+            cp.config_handle().read().await.as_ref(),
+            if should_accept { &candidate } else { &config },
+        );
+        if !should_accept {
+            assert_eq!(cp.runtime_registry().read().generation(), generation);
+        }
+    }
+}
+
+fn dae_urltest_config(tolerance_ms: u64) -> Config {
+    parse_dae_config(&format!(
+        "global {{\n    nfqueue_enable: false\n    check_tolerance: {tolerance_ms}ms\n}}\n\
+         node {{\n    a: 'socks5://127.0.0.1:1080'\n    b: 'socks5://127.0.0.1:1081'\n}}\n\
+         group {{\n    url {{\n        filter: name('a')\n        filter: name('b')\n        policy: urltest\n    }}\n}}\n"
+    ))
+    .expect("valid dae URLTest fixture")
+}
+
+#[tokio::test]
+async fn c28_dae_tolerance_reload_changes_real_urltest_selection() {
+    let config = dae_urltest_config(100);
+    let a_id = config
+        .nodes
+        .iter()
+        .find(|node| node.name == "a")
+        .unwrap()
+        .id;
+    let b_id = config
+        .nodes
+        .iter()
+        .find(|node| node.name == "b")
+        .unwrap()
+        .id;
+    let cp = control_plane(config);
+    let alive = cp.alive_set();
+    // Establish the incumbent through the real URLTest policy before the
+    // challenger has a measurement.
+    alive.record_probe_latency(
+        a_id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(100),
+    );
+    assert_eq!(
+        cp.group_manager()
+            .read()
+            .select_node_for_domain("url", ProbeDomain::Tcp, IpVersion::V4)
+            .unwrap()
+            .name,
+        "a"
+    );
+    // The challenger is now faster, but the old 100ms tolerance retains a.
+    alive.record_probe_latency(
+        b_id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(60),
+    );
+    assert_eq!(
+        cp.group_manager()
+            .read()
+            .select_node_for_domain("url", ProbeDomain::Tcp, IpVersion::V4)
+            .unwrap()
+            .name,
+        "a"
+    );
+
+    let candidate = dae_urltest_config(10);
+    let accepted = cp
+        .apply_runtime_config(candidate, Default::default(), &DrainTracker::new())
+        .await;
+    assert!(accepted, "dae tolerance-only reload must remain admissible");
+    assert_eq!(
+        cp.group_manager()
+            .read()
+            .select_node_for_domain("url", ProbeDomain::Tcp, IpVersion::V4)
+            .unwrap()
+            .name,
+        "b",
+        "the live URLTest policy must apply the adapted global tolerance"
+    );
 }

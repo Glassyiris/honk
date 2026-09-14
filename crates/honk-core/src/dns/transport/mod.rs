@@ -28,11 +28,7 @@ mod tcp_pool;
 mod udp_pool;
 
 #[cfg(test)]
-mod idle_pool_tests;
-#[cfg(test)]
 mod tests_proto;
-#[cfg(test)]
-mod upstream_lifecycle_tests;
 
 use body::{DnsMessageBody, doh_content_length};
 #[cfg(test)]

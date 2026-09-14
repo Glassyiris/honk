@@ -721,5 +721,4 @@ pub(super) fn is_broadcast_or_multicast(ip: &std::net::IpAddr) -> bool {
 }
 
 #[cfg(test)]
-#[path = "probers_tests.rs"]
-mod http_probe_tests;
+mod tests;

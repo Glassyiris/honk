@@ -631,21 +631,4 @@ pub(crate) use ttl::{
 pub(crate) use tests::make_nxdomain_response;
 
 #[cfg(test)]
-mod tests {
-    use std::net::{IpAddr, SocketAddr};
-    use std::time::Duration;
-
-    use crate::dns::query::{DnsRequestMeta, IngressProfile};
-
-    include!("forwarder/tests/fixtures.rs");
-    include!("forwarder/tests/service_flush.rs");
-    include!("forwarder/tests/singleflight.rs");
-    include!("forwarder/tests/stale_refresh.rs");
-    include!("forwarder/tests/cache_routing.rs");
-    include!("forwarder/tests/wire_helpers.rs");
-    include!("forwarder/tests/rule_pipeline.rs");
-    include!("forwarder/tests/requery_singleflight.rs");
-    include!("forwarder/tests/context_and_family.rs");
-    include!("forwarder/tests/family_and_negative.rs");
-    include!("forwarder/tests/asis_transport.rs");
-}
+mod tests;

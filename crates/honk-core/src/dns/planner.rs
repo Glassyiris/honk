@@ -196,6 +196,4 @@ pub enum PlanError {
 }
 
 #[cfg(test)]
-mod normalization_tests;
-#[cfg(test)]
 mod tests;

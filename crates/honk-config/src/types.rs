@@ -207,4 +207,38 @@ mod tests {
         assert_eq!(super::parse_duration_ms("0.0005s"), Some(0));
         assert_eq!(super::parse_duration_ms("1m"), None);
     }
+
+    #[test]
+    fn test_node_protocol_parsing() {
+        use super::NodeProtocol;
+        use std::str::FromStr;
+        assert_eq!(NodeProtocol::from_str("ss").unwrap(), NodeProtocol::SS);
+        assert_eq!(NodeProtocol::from_str("SS").unwrap(), NodeProtocol::SS);
+        assert_eq!(
+            NodeProtocol::from_str("shadowsocks").unwrap(),
+            NodeProtocol::SS
+        );
+        assert_eq!(
+            NodeProtocol::from_str("trojan").unwrap(),
+            NodeProtocol::Trojan
+        );
+        assert_eq!(
+            NodeProtocol::from_str("vmess").unwrap(),
+            NodeProtocol::VMess
+        );
+        assert_eq!(
+            NodeProtocol::from_str("hysteria2").unwrap(),
+            NodeProtocol::Hysteria2
+        );
+        assert_eq!(NodeProtocol::from_str("tuic").unwrap(), NodeProtocol::Tuic);
+        assert_eq!(
+            NodeProtocol::from_str("juicity").unwrap(),
+            NodeProtocol::Juicity
+        );
+        assert_eq!(
+            NodeProtocol::from_str("anytls").unwrap(),
+            NodeProtocol::AnyTLS
+        );
+        assert!(NodeProtocol::from_str("unknown").is_err());
+    }
 }

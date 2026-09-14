@@ -18,8 +18,6 @@ use nfqueue_runtime::{
 };
 #[cfg(feature = "ebpf")]
 use nfqueue_runtime::{NfqueueRuntime, NfqueueRuntimeEvent, wait_nfqueue_event};
-#[cfg(test)]
-mod c20_tests;
 pub mod packet_sniffer;
 mod preconnect;
 mod probers;
@@ -31,6 +29,8 @@ mod resource_budget;
 mod runtime;
 mod shutdown;
 #[cfg(test)]
+mod tests;
+#[cfg(test)]
 use runtime::{
     UdpLoopState, UdpSlowPathWork, begin_udp_slow_path, dispatch_udp_slow_path,
     reserve_udp_slow_path, try_admit_udp_slow_path,
@@ -38,8 +38,6 @@ use runtime::{
 pub mod routing_matcher;
 mod sockets;
 pub mod tcp_sniff;
-#[cfg(test)]
-mod tests;
 mod udp_dial;
 pub mod udp_endpoint;
 mod udp_removal;

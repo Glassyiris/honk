@@ -73,8 +73,6 @@ mod state {
 }
 pub(crate) use state::{RuntimeGeneration, RuntimeState};
 #[cfg(test)]
-mod prefetch_tests;
-#[cfg(test)]
 mod tests;
 
 pub(crate) use super::projection::RoutingProjectionSnapshot;

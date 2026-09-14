@@ -1,17 +1,6 @@
 use super::*;
 use std::time::Duration;
 
-fn nid(name: &str) -> uuid::Uuid {
-    uuid::Uuid::new_v5(&honk_config::node::NODE_ID_NAMESPACE, name.as_bytes())
-}
-
-fn make_node(id: uuid::Uuid, name: &str) -> Node {
-    Node {
-        id,
-        name: name.into(),
-        ..Default::default()
-    }
-}
 fn make_group(name: &str, policy: GroupPolicy, ids: Vec<uuid::Uuid>) -> Group {
     Group {
         name: name.into(),

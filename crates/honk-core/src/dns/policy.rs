@@ -123,8 +123,6 @@ pub enum PolicyError {
 }
 
 #[cfg(test)]
-mod normalization_tests;
-#[cfg(test)]
 mod tests;
 
 #[cfg(test)]

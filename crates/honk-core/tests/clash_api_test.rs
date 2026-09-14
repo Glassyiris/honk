@@ -1,4 +1,4 @@
-//! Integration tests for the Clash-compatible REST API (Phase 5).
+//! Integration tests for the Clash-compatible REST API.
 //!
 //! Boots the real axum router on 127.0.0.1:0 with a lightweight ClashState
 //! (no eBPF involved) and exercises auth, proxies, mode persistence,

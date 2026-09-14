@@ -1,30 +1,29 @@
+use super::support::{canonical_socks5, control_plane, test_dns_forwarder};
 use super::*;
 use crate::control::drain::DrainTracker;
 use crate::ebpf::mock::MockEbpfBackend;
 use crate::subscription::{SubscriptionSupervisor, parse_subscription_content};
-use honk_config::node::{Group, Node, OutboundConfig};
-use honk_config::types::NodeProtocol;
+use honk_config::node::{Group, Node};
 use honk_config::{Config, subscription::Subscription};
 use std::sync::Arc;
 
-const C20_DIRECT_PROVIDER_BODY: &str = include_str!("../../tests/fixtures/c20-direct-provider.txt");
+const DIRECT_PROVIDER_BODY: &str = include_str!("../../../tests/fixtures/c20-direct-provider.txt");
 
-pub(super) fn canonical_socks5(
-    name: &str,
-    address: &str,
-    port: u16,
-    subscription_id: Option<uuid::Uuid>,
-) -> Node {
-    let mut node = Node {
-        name: name.to_owned(),
-        address: address.to_owned(),
-        port,
-        outbound: OutboundConfig::from_protocol(NodeProtocol::Socks5),
-        subscription_id,
-        ..Default::default()
-    };
-    node.id = node.derive_id();
-    node
+async fn assert_public_merge_rejected(
+    config: Config,
+    subscription_id: uuid::Uuid,
+    nodes: Vec<Node>,
+    case: &str,
+) {
+    let before = config.clone();
+    let cp = control_plane(config);
+    cp.merge_subscription_nodes(subscription_id, nodes, Vec::new())
+        .await;
+    assert_eq!(
+        cp.config_handle().read().await.as_ref(),
+        &before,
+        "{case} must preserve the active assembled configuration"
+    );
 }
 
 fn config_with_provider_node(
@@ -38,35 +37,6 @@ fn config_with_provider_node(
     config.subscriptions = subscription.into_iter().collect();
     config.groups = groups;
     config
-}
-
-pub(super) async fn control_plane(config: Config) -> ControlPlane {
-    ControlPlane::new(
-        config,
-        Box::new(MockEbpfBackend::new()),
-        Router::new(&[], "direct").expect("test router"),
-        Arc::new(ProxyRegistry::default_resolver().expect("test proxy registry")),
-        DnsResolver::new(&honk_config::dns::DnsConfig::default()).expect("test DNS resolver"),
-        super::reload_tests::test_dns_forwarder(),
-    )
-    .expect("test control plane")
-}
-
-async fn assert_public_merge_rejected(
-    config: Config,
-    subscription_id: uuid::Uuid,
-    nodes: Vec<Node>,
-    case: &str,
-) {
-    let before = config.clone();
-    let cp = control_plane(config).await;
-    cp.merge_subscription_nodes(subscription_id, nodes, Vec::new())
-        .await;
-    assert_eq!(
-        cp.config_handle().read().await.as_ref(),
-        &before,
-        "{case} must preserve the active assembled configuration"
-    );
 }
 
 fn provider_config(subscription_id: uuid::Uuid) -> (Config, Node) {
@@ -99,7 +69,7 @@ async fn c20_public_merge_rejects_stale_id_before_noop_and_preserves_membership(
     let subscription_id = uuid::Uuid::new_v4();
     let (config, canonical) = provider_config(subscription_id);
     let before = config.clone();
-    let cp = control_plane(config).await;
+    let cp = control_plane(config);
 
     cp.merge_subscription_nodes(subscription_id, vec![canonical.clone()], Vec::new())
         .await;
@@ -126,7 +96,7 @@ async fn c20_public_merge_rejects_two_ids_for_one_endpoint() {
     let subscription_id = uuid::Uuid::new_v4();
     let (config, canonical) = provider_config(subscription_id);
     let before = config.clone();
-    let cp = control_plane(config).await;
+    let cp = control_plane(config);
 
     let mut conflicting = canonical.clone();
     conflicting.name = "second-id".into();
@@ -193,7 +163,7 @@ async fn c20_public_merge_rebuilds_filters_and_prunes_removed_direct_ids() {
         &config.nodes,
         &config.subscriptions,
     );
-    let cp = control_plane(config).await;
+    let cp = control_plane(config);
 
     let replacement = canonical_socks5("provider-new", "192.0.2.11", 1080, Some(subscription_id));
     cp.merge_subscription_nodes(subscription_id, vec![replacement.clone()], Vec::new())
@@ -214,7 +184,7 @@ async fn c20_public_merge_sets_missing_provider_provenance() {
     let (config, mut candidate) = provider_config(subscription_id);
     candidate.subscription_id = None;
     let before = config.clone();
-    let cp = control_plane(config).await;
+    let cp = control_plane(config);
 
     cp.merge_subscription_nodes(subscription_id, vec![candidate], Vec::new())
         .await;
@@ -231,7 +201,7 @@ async fn c20_authorized_refresh_rejects_conflicting_provider_before_noop() {
     let subscription_id = uuid::Uuid::new_v4();
     let (config, canonical) = provider_config(subscription_id);
     let before = config.clone();
-    let cp = control_plane(config).await;
+    let cp = control_plane(config);
     let authorizations =
         crate::subscription::SubscriptionAuthorizations::new(&before.subscriptions)
             .expect("valid provider authorization");
@@ -273,7 +243,7 @@ async fn c20_authorized_refresh_admits_reserved_provider_name() {
     config.global.nfqueue_enable = false;
     config.ensure_builtin_nodes();
     config.subscriptions.push(subscription.clone());
-    let cp = control_plane(config).await;
+    let cp = control_plane(config);
     let authorizations =
         crate::subscription::SubscriptionAuthorizations::new(std::slice::from_ref(&subscription))
             .expect("valid provider authorization");
@@ -281,7 +251,7 @@ async fn c20_authorized_refresh_admits_reserved_provider_name() {
         .revision(subscription_id)
         .expect("provider revision");
     let nodes =
-        parse_subscription_content(&subscription, C20_DIRECT_PROVIDER_BODY).expect("provider body");
+        parse_subscription_content(&subscription, DIRECT_PROVIDER_BODY).expect("provider body");
 
     assert!(
         cp.merge_authorized_subscription_nodes_with_drain(
@@ -310,7 +280,7 @@ async fn c20_authorized_refresh_admits_reserved_provider_name() {
 async fn c20_public_reload_rejects_stale_config_before_side_effects() {
     let canonical = canonical_socks5("static", "192.0.2.20", 1080, None);
     let config = config_with_provider_node(canonical.clone(), None, Vec::new());
-    let cp = control_plane(config.clone()).await;
+    let cp = control_plane(config.clone());
 
     let mut stale = config.clone();
     stale.nodes[0].address = "192.0.2.21".into();
@@ -343,7 +313,7 @@ async fn c20_startup_post_prepare_rejects_stale_node_identity() {
         Router::new(&[], "direct").expect("test router"),
         Arc::new(ProxyRegistry::default_resolver().expect("test proxy registry")),
         DnsResolver::new(&honk_config::dns::DnsConfig::default()).expect("test DNS resolver"),
-        super::reload_tests::test_dns_forwarder(),
+        test_dns_forwarder(),
     );
     assert!(
         result.is_err(),
@@ -374,8 +344,8 @@ async fn c20_startup_post_prepare_admits_reserved_provider_name() {
             .write_all(
                 format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    C20_DIRECT_PROVIDER_BODY.len(),
-                    C20_DIRECT_PROVIDER_BODY,
+                    DIRECT_PROVIDER_BODY.len(),
+                    DIRECT_PROVIDER_BODY,
                 )
                 .as_bytes(),
             )
@@ -391,7 +361,7 @@ async fn c20_startup_post_prepare_admits_reserved_provider_name() {
         .await
         .expect("startup subscription preparation");
     server.await.unwrap();
-    let cp = control_plane(config).await;
+    let cp = control_plane(config);
     let handle = cp.config_handle();
     let after = handle.read().await;
     let provider = after

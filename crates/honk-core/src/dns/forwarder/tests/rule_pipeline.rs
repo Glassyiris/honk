@@ -1,3 +1,69 @@
+use super::*;
+#[tokio::test]
+async fn test_response_requery_stops_at_depth_limit() {
+    use honk_config::dns::{
+        DnsCond, DnsRequestAction, DnsRequestRouting, DnsResponseAction, DnsResponseRouting,
+        DnsResponseRule,
+    };
+
+    struct RecordingUpstream {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl DnsUpstreamPool for RecordingUpstream {
+        async fn query(&self, upstream_name: &str, _raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+            self.calls.lock().unwrap().push(upstream_name.to_string());
+            let last_octet = match upstream_name {
+                "default" => 1,
+                "one" => 2,
+                "two" => 3,
+                "three" => 4,
+                _ => 255,
+            };
+            Ok(make_a_response([192, 0, 2, last_octet], 60))
+        }
+    }
+
+    let response_rules = [("default", "one"), ("one", "two"), ("two", "three")]
+        .into_iter()
+        .map(|(from, to)| DnsResponseRule {
+            conditions: vec![DnsCond::Upstream {
+                not: false,
+                names: vec![from.to_string()],
+            }],
+            action: DnsResponseAction::Upstream(to.to_string()),
+        })
+        .collect();
+    let router = Arc::new(
+        DnsRouter::new(&DnsRouting {
+            request: DnsRequestRouting {
+                rules: vec![],
+                fallback: DnsRequestAction::Upstream("default".into()),
+            },
+            response: DnsResponseRouting {
+                rules: response_rules,
+                fallback: DnsResponseAction::Accept,
+            },
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let upstream = Arc::new(RecordingUpstream {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), router);
+
+    let response = forwarder.resolve(&make_a_query()).await.unwrap();
+
+    assert_eq!(
+        upstream.calls.lock().unwrap().as_slice(),
+        ["default", "one", "two"],
+        "depth three is accepted without issuing a fourth exchange"
+    );
+    assert_eq!(&response[response.len() - 4..], &[192, 0, 2, 3]);
+}
+
 #[tokio::test]
 async fn test_optimistic_cache_ttl_overrides_answer_ttl() {
     // Upstream answers with TTL=30; forwarder configured for 600.

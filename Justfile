@@ -1,7 +1,7 @@
 # honk — eBPF transparent proxy engine
 # https://github.com/Glassyiris/honk
 
-ebpf_toolchain := `grep -oP '^channel\s*=\s*"\K[^"]+' crates/honk-ebpf/rust-toolchain.toml`
+ebpf_toolchain := `sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' crates/honk-ebpf/rust-toolchain.toml`
 
 # ── Default ──────────────────────────────────────────────
 default: build
@@ -83,11 +83,11 @@ test-ci:
 
 # Run core + outbound tests
 test-core:
-    cargo test -p honk-core -p honk-outbound --lib
+    cargo test -p honk-core -p honk-outbound
 
-# Run config parser tests
+# Run config unit and integration tests
 test-config:
-    cargo test -p honk-config --lib
+    cargo test -p honk-config
 
 # Run eBPF common tests
 test-ebpf:
@@ -102,6 +102,8 @@ test-routing:
 test-netns: test-routing
     CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-nfqueue --lib nfqueue_service_isolated_netns_kernel_contract -- --ignored --test-threads=1
     CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib netns -- --ignored --test-threads=1
+    @test "$(CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib ebpf::real::iface_watch::tests::route_only_change_wakes_network_subscription -- --ignored --exact --list --format terse)" = "ebpf::real::iface_watch::tests::route_only_change_wakes_network_subscription: test"
+    CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib ebpf::real::iface_watch::tests::route_only_change_wakes_network_subscription -- --ignored --exact --test-threads=1
     CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --lib ebpf::real::tests -- --ignored --test-threads=1
     CARGO_BUILD_JOBS=1 CARGO_PROFILE_TEST_DEBUG=0 cargo test -p honk-core --features ebpf --test ebpf_datapath_test -- --ignored --test-threads=1
 

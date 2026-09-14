@@ -1,3 +1,5 @@
+use super::*;
+
 fn asis_test_forwarder() -> DnsForwarder {
     use honk_config::dns::{DnsRequestAction, DnsRequestRouting};
 
@@ -11,16 +13,11 @@ fn asis_test_forwarder() -> DnsForwarder {
         })
         .expect("asis router"),
     );
-    DnsForwarder::new(Arc::new(FailUpstream), test_cache(), router).with_timeouts(
-        Duration::from_millis(250),
-        Duration::from_millis(250),
-    )
+    DnsForwarder::new(Arc::new(FailUpstream), test_cache(), router)
+        .with_timeouts(Duration::from_millis(250), Duration::from_millis(250))
 }
 
-async fn answer_one_tcp_query(
-    listener: tokio::net::TcpListener,
-    answer_ip: [u8; 4],
-) -> Vec<u8> {
+async fn answer_one_tcp_query(listener: tokio::net::TcpListener, answer_ip: [u8; 4]) -> Vec<u8> {
     let (mut stream, _) = listener.accept().await.expect("accept asis TCP query");
     let mut query = Vec::new();
     crate::dns::transport::read_length_prefixed_into(
@@ -40,7 +37,10 @@ async fn answer_one_tcp_query(
 
 async fn answer_one_udp_query(socket: tokio::net::UdpSocket, answer_ip: [u8; 4]) -> Vec<u8> {
     let mut query = vec![0u8; 512];
-    let (received, peer) = socket.recv_from(&mut query).await.expect("receive asis query");
+    let (received, peer) = socket
+        .recv_from(&mut query)
+        .await
+        .expect("receive asis query");
     query.truncate(received);
     let mut response = make_a_response(answer_ip, 60);
     response[..2].copy_from_slice(&query[..2]);
@@ -89,7 +89,10 @@ async fn udp_asis_truncation_retries_tcp_on_the_same_endpoint() {
     let tcp_responder = tokio::spawn(answer_one_tcp_query(tcp, [203, 0, 113, 11]));
     let udp_responder = tokio::spawn(async move {
         let mut query = vec![0u8; 512];
-        let (received, peer) = udp.recv_from(&mut query).await.expect("receive asis UDP query");
+        let (received, peer) = udp
+            .recv_from(&mut query)
+            .await
+            .expect("receive asis UDP query");
         query.truncate(received);
         let mut truncated = query.clone();
         truncated[2..4].copy_from_slice(&0x8380u16.to_be_bytes());
@@ -207,9 +210,7 @@ async fn udp_asis_receives_valid_datagrams_larger_than_4096_bytes() {
         let mut response = query[..question_end].to_vec();
         response[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
         response[6..8].copy_from_slice(&1u16.to_be_bytes());
-        response.extend_from_slice(&[
-            0xc0, 0x0c, 0xff, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c,
-        ]);
+        response.extend_from_slice(&[0xc0, 0x0c, 0xff, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c]);
         response.extend_from_slice(&5000u16.to_be_bytes());
         response.resize(response.len() + 5000, 0x5a);
         response.extend_from_slice(&opt);
@@ -255,10 +256,8 @@ async fn udp_asis_honors_configured_query_timeout() {
         let _ = release_rx.await;
     });
     let query = make_a_query();
-    let forwarder = asis_test_forwarder().with_timeouts(
-        Duration::from_millis(37),
-        Duration::from_secs(10),
-    );
+    let forwarder =
+        asis_test_forwarder().with_timeouts(Duration::from_millis(37), Duration::from_secs(10));
     let started = tokio::time::Instant::now();
     let mut running = tokio::spawn(async move {
         forwarder
@@ -313,14 +312,12 @@ async fn prefer_sibling_changes_only_original_question_qtype() {
     query[qclass_start..].copy_from_slice(&3u16.to_be_bytes());
     query[10..12].copy_from_slice(&1u16.to_be_bytes());
     query.extend_from_slice(&[
-        0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x80, 0x00, 0x00, 0x07, 0xfd, 0xe9, 0x00,
-        0x03, 0xaa, 0xbb, 0xcc,
+        0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x80, 0x00, 0x00, 0x07, 0xfd, 0xe9, 0x00, 0x03,
+        0xaa, 0xbb, 0xcc,
     ]);
-    let parsed = crate::dns::query::QueryContext::parse_with_profile(
-        &query,
-        IngressProfile::Internal,
-    )
-    .expect("profile-rich query");
+    let parsed =
+        crate::dns::query::QueryContext::parse_with_profile(&query, IngressProfile::Internal)
+            .expect("profile-rich query");
     let qtype_start = parsed.question_offsets().expect("question offsets").end() - 4;
     let upstream = Arc::new(RecordingNodataUpstream {
         queries: std::sync::Mutex::new(Vec::new()),
@@ -342,6 +339,9 @@ async fn prefer_sibling_changes_only_original_question_qtype() {
     let mut expected_sibling = query.clone();
     expected_sibling[qtype_start..qtype_start + 2].copy_from_slice(&1u16.to_be_bytes());
     assert_eq!(recorded[1], expected_sibling);
-    assert_eq!(&recorded[1][qclass_start..qclass_start + 2], &3u16.to_be_bytes());
+    assert_eq!(
+        &recorded[1][qclass_start..qclass_start + 2],
+        &3u16.to_be_bytes()
+    );
     assert_eq!(&recorded[1][qclass_start + 2..], &query[qclass_start + 2..]);
 }
