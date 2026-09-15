@@ -232,6 +232,11 @@ pub struct Cli {
     #[arg(short, long)]
     pub debug: bool,
 
+    /// Omit timestamps from console log lines, for journald or another
+    /// logger that stamps them itself. The log file keeps its timestamps.
+    #[arg(long)]
+    pub disable_timestamp: bool,
+
     /// Use mock eBPF backend (for testing without kernel support)
     #[arg(long)]
     pub mock_ebpf: bool,
@@ -525,6 +530,35 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
     }
 }
 
+/// The console layer, with or without the local timestamp. The file layer
+/// always stamps: a file has no journal in front of it.
+fn console_log_layer<S, W>(
+    disable_timestamp: bool,
+    writer: W,
+    filter: tracing_subscriber::EnvFilter,
+) -> Box<dyn tracing_subscriber::Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::Layer as _;
+    if disable_timestamp {
+        Box::new(
+            tracing_subscriber::fmt::layer()
+                .without_time()
+                .with_writer(writer)
+                .with_filter(filter),
+        )
+    } else {
+        Box::new(
+            tracing_subscriber::fmt::layer()
+                .with_timer(LocalTime)
+                .with_writer(writer)
+                .with_filter(filter),
+        )
+    }
+}
+
 fn resolved_log_file_path(
     config: &Config,
     cli_override: Option<&std::path::Path>,
@@ -696,11 +730,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     use tracing_subscriber::prelude::*;
     let registry = tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_timer(LocalTime)
-                .with_filter(env_filter),
-        )
+        .with(console_log_layer(
+            cli.disable_timestamp,
+            std::io::stdout,
+            env_filter,
+        ))
         .with(log_file_layer);
     #[cfg(feature = "clash-api")]
     let registry = registry.with(clash_log_layer);
@@ -1993,6 +2027,58 @@ mod local_time_tests {
         assert_eq!(&offset[3..4], ":", "{out}");
         let expected = chrono::Local::now().format("%:z").to_string();
         assert_eq!(offset, expected, "{out}");
+    }
+
+    /// `--disable-timestamp` drops the stamp from the console line only.
+    #[test]
+    fn test_disable_timestamp_omits_the_console_stamp() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let render = |disable_timestamp: bool| {
+            let sink = Sink::default();
+            let writer = sink.clone();
+            let layer = super::console_log_layer(
+                disable_timestamp,
+                move || writer.clone(),
+                tracing_subscriber::EnvFilter::new("info"),
+            );
+            let subscriber = tracing_subscriber::registry().with(layer);
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!("stamp probe");
+            });
+            let bytes = sink.0.lock().unwrap().clone();
+            let text = String::from_utf8(bytes).unwrap();
+            // The console layer keeps its colours; strip the SGR sequences.
+            let mut plain = String::new();
+            let mut rest = text.as_str();
+            while let Some(start) = rest.find("\u{1b}[") {
+                plain.push_str(&rest[..start]);
+                let after = &rest[start + 2..];
+                rest = after.find('m').map_or("", |end| &after[end + 1..]);
+            }
+            plain.push_str(rest);
+            plain
+        };
+
+        let stamped = render(false);
+        assert!(stamped.starts_with("20"), "{stamped:?}");
+        assert!(stamped.contains(" INFO "), "{stamped:?}");
+        let bare = render(true);
+        assert!(bare.trim_start().starts_with("INFO "), "{bare:?}");
+        assert!(bare.contains("stamp probe"), "{bare:?}");
     }
 }
 
