@@ -116,6 +116,8 @@ The root `rust-toolchain.toml` pins the host compiler; `crates/honk-ebpf/rust-to
 
 Removed `run` / `deploy` / `docker*` recipes called absent `scripts/debug-local.sh` / `scripts/deploy-gateway.sh` / `Dockerfile` / `docker-compose.yml` (Repository layout).
 
+`outbound-ci` runs all-target Clippy and crate test suites in separate `rprx`-off and `rprx`-on invocations; the config suite runs once. The weekly/manual `public-vless-loopback` lane separately runs the two public ignored official-peer cases with pinned executables, not the legacy external-mask test.
+
 ## Current validation guidance
 
 Do not treat dated pass counts as repository status; use the current command output and CI for that evidence. The compiled-routing gate is `just test-routing`: it builds a real `routing-test` eBPF object and exercises independent policy goldens plus preservation of the active root when publication fails.
@@ -141,8 +143,10 @@ not the unprivileged suite. Deployment A/B needs real eBPF/netns/upstreams and t
 Unset `HTTP_PROXY`/`HTTPS_PROXY` so reqwest does not proxy Clash UI loopback fetches.
 The maintainer's REALITY interop lab: `.agents/rules/maintainer-lab.md` (not required for contributions).
 
-REALITY `dest` TLS Certificate messages must stay **under 8 KiB**: sing-box buffers
-8192 bytes; `dl.google.com` works, `www.microsoft.com` at 8273 B fails.
+The documented sing-box 1.12 / MetaCubeX-uTLS 1.8.0 REALITY lab peer buffers
+8192 bytes of target TLS records including framing; this is server-version-specific,
+not a universal honk certificate limit. Earlier `dl.google.com` / `www.microsoft.com`
+size observations are historical, not a maintained target allowlist.
 
 ## Code style guidelines
 
@@ -194,6 +198,8 @@ Shared eBPF/`honk-core` constants and `#[repr(C)]` structs in `#![no_std]`; `aya
   `Node::derive_id()` is the sole identity source: UUID v5 over normalized protocol credentials and dial shape. VLESS identity includes `network`, UDP encoding, multiplex policy/concurrency, UDP/443 policy, transport, REALITY/flow, and encryption; changing these may change the ID. Assign after normalization at every construction entry. `Node::default()` returns **nil**, rejected by the runtime registry; `Config::validate` rejects ID collisions and unsupported protocol combinations.
   VLESS UDP permission comes only from `network`; encoding (`Auto|Native|Xudp|UotV2`) and multiplexing (`Off|H2|Xray`) are independent. Xray TCP and UDP concurrency normalize to `1..=128`; zero TCP means 8, negative disables TCP mux, zero XUDP follows TCP, negative uses the protocol UDP path, and positive XUDP uses a separate pool. Its UDP/443 policy is `Reject|Skip|Allow`: reject applies even when no mux pool exists, skip returns to protocol framing and the Vision gate, and allow bypasses Vision's port-443 denial only for an actual UDP mux path. H2 padding is an H2 property.
   Vision always rejects TCP multiplexing, including with Encryption; UDP-only Xray multiplexing is legal. Without Encryption, Vision requires raw TCP with TLS 1.3 or REALITY. With Encryption, a direct-copy response removes only the AEAD read layer and preserves the outer transport and random-XOR layer. Encryption may use direct or Xray-mux paths but not H2 or UoT framing. Never infer a retry or replay from a failed combination.
+  Vision currently implements downstream unpadding and Direct only: uplink padding and uplink Direct are not implemented. Uploads retain their selected outer transport; do not claim full Vision shaping or bidirectional optimization.
+  Shared REALITY intent/key presence is resolved by `TlsOptions::effective_reality_public_key`; node admission and outbound parsing must not turn missing or blank keys with REALITY intent into ordinary TLS/plaintext.
 - VLESS runtime/pool ownership lives in `honk-outbound/src/runtime/vless.rs` and `proxy/vless{,_mux,_cool}.rs`; the control plane owns source sharing in `honk-core/src/control/udp_endpoint/source.rs`. One process VLESS-carrier semaphore, carved from the startup FD partition before UDP endpoints and shared across reload and DNS forks, is authoritative. Its permits cover actual carrier I/O through active, provisional, draining, and idle task teardown. H2 keeps its own two-carrier/128-concurrent-stream bound and has no 128-open lifetime; Mux.Cool has no per-node two-carrier cap, admits at most the configured positive concurrency capped at 128 per carrier, and rolls a carrier after 128 issued IDs. The existing maintenance pass reaps unretained idle VLESS carriers; do not add a protocol timer.
   Resolve warm retention and runtime reuse by `WarmRequirement::Session` or `WarmRequirement::Udp`; a runtime selected only by UDP Xray mux remains eligible for bare TCP use.
   Pool waiters register capacity notifications before checking availability. Detached attachment returns its first pool-owned stream permit; all releases and carrier publications notify waiters, including non-reserving warm offers.

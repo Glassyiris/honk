@@ -1,9 +1,7 @@
-//! BoringSSL TLS client — real Chrome fingerprint (uTLS-grade) + ECH.
+//! BoringSSL TLS client with native and Chrome-oriented profiles plus ECH.
 //!
-//! Why: a rustls ClientHello is trivially fingerprinted by DPI. BoringSSL is
-//! what Chrome itself ships, so a properly configured BoringSSL ClientHello
-//! matches Chrome's: GREASE, permuted extensions, the X25519MLKEM768 hybrid
-//! key share, ALPS, brotli certificate compression, and ECH GREASE.
+//! The emulation configures GREASE, permuted extensions, hybrid key shares,
+//! ALPS and certificate compression; it does not promise exact browser identity.
 //!
 //! ECH: when a node carries an ECHConfigList (`ech_config` / `ech_config_path`)
 //! the connector offers real ECH via `SSL_set1_ech_config_list`; `ech_enabled`
@@ -268,10 +266,8 @@ pub(crate) fn set_chrome_key_shares_ssl_ref(ssl: &boring::ssl::SslRef) -> anyhow
     Ok(())
 }
 
-/// Chrome sends ALPS for h2 with an empty settings payload whenever ALPN
-/// offers h2. boring exposes this only via FFI. Chrome uses the old ALPS
-/// codepoint (0x4469) on TCP+h2; BoringSSL defaults to the new one (0x44cd),
-/// which is JA4-distinguishable from real Chrome.
+/// Add h2 ALPS using the historical 0x4469 codepoint. The current uTLS
+/// Chrome_133 profile uses 0x44cd; this compatibility choice is not parity.
 pub(crate) fn add_chrome_alps(cfg: &mut ConnectConfiguration) -> anyhow::Result<()> {
     let ssl: &boring::ssl::SslRef = cfg;
     let ok = unsafe {
@@ -451,8 +447,7 @@ pub async fn discover_ech_config(domain: &str) -> Option<Vec<u8>> {
     config
 }
 
-/// Build the TLS connector for a node: BoringSSL with webpki roots,
-/// optional real Chrome fingerprint, optional ECH.
+/// Build the shared BoringSSL trust and protocol defaults.
 fn base_builder(skip_cert_verify: bool) -> anyhow::Result<boring::ssl::SslConnectorBuilder> {
     let mut builder = SslConnector::builder(SslMethod::tls())?;
     builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
@@ -1149,13 +1144,9 @@ mod batch_read_tests {
     }
 }
 
-/// REALITY connector: accept-all certificate verification (the real server
-/// authentication runs post-handshake against the session-id auth key in
-/// `reality::verify_server_certificate`). Chrome mode adds the pieces of
-/// the real Chrome ClientHello the ctx controls: cipher list, ALPN,
-/// OCSP stapling and SCT extensions. Session resumption stays impossible
-/// because nothing ever calls `SSL_set_session` — the empty session_ticket
-/// extension real Chrome sends is just an offer, never a resumption.
+/// REALITY's TLS-1.3-only connector; authentication runs post-handshake in
+/// `reality::verify_server_certificate`. Chrome mode configures the ctx-level
+/// emulation fields. REALITY callers never restore a cached SSL session.
 pub fn build_reality_connector(chrome: bool) -> anyhow::Result<SslConnector> {
     let mut builder = base_builder(true)?;
     builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;

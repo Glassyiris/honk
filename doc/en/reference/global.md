@@ -29,8 +29,8 @@ Compatibility-only keys are accepted by the dae parser and stored in `GlobalConf
 | `dial_mode` | `dial_mode` | `"domain"` | Destination-domain discovery and routing mode: `ip`, `domain`, `domain+`, or `domain++`. See [Dial modes](#dial-modes). |
 | `allow_insecure` | `allow_insecure` | `false` | Compatibility global TLS-verification fallback. Current TLS connectors do not read it; certificate skipping is configured per node in its share link. |
 | `sniffing_timeout` | `sniffing_timeout_ms` | `30ms` | Compatibility sniffing timeout, currently unused by the control plane. Duration syntax and invalid-value handling match `check_tolerance`. |
-| `tls_implementation` | `tls_implementation` | `"tls"` | `tls` uses the regular BoringSSL client profile; `utls` enables honk's real Chrome ClientHello profile. |
-| `utls_imitate` | `utls_imitate` | `"chrome_auto"` | Compatibility fingerprint request. uTLS uses a fixed Chrome profile; this value does not switch profiles. |
+| `tls_implementation` | `tls_implementation` | `"tls"` | `tls` uses the regular BoringSSL client profile; `utls` enables honk's Chrome-oriented ClientHello emulation, not exact browser identity. |
+| `utls_imitate` | `utls_imitate` | `"chrome_auto"` | Compatibility fingerprint request. The `utls` mode uses one Chrome-oriented profile; this value does not switch profiles. |
 | `tls_fragment` | `tls_fragment` | `false` | Compatibility TLS ClientHello-fragmentation switch. The current TLS connector does not read it. |
 | `tls_fragment_length` | `tls_fragment_length` | `""` | Compatibility fragmentation-length range. The current TLS connector does not read it. |
 | `tls_fragment_interval` | `tls_fragment_interval` | `""` | Compatibility fragmentation-interval range. The current TLS connector does not read it. |

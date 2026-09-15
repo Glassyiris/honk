@@ -282,8 +282,9 @@ raw 路径查询 DNS HTTPS 记录（`qtype 65`），并提取 SVCB `ech` 参数�
 - 先 `X25519MLKEM768`、后 `X25519` 的 key share；
 - Chrome-derived signature algorithm、curve、cipher 集与 ALPN；
 - brotli 证书压缩；
-- h2 ALPS，固定使用 Chrome 的旧 `0x4469` codepoint，而不是 BoringSSL
-  较新的 `0x44cd`；以及
+- h2 ALPS 使用历史 `0x4469` codepoint；本次核对的
+  [uTLS Chrome_133 profile](https://github.com/refraction-networking/utls/blob/aa6edf4b11af/u_parrots.go)
+  使用 `0x44cd`；以及
 - 没有真实 ECHConfigList 时的 ECH GREASE。
 
 其他 `utls_imitate` 名称会告警并使用该 profile。
@@ -346,12 +347,16 @@ HMAC-SHA512(authKey, raw_ed25519_public_key)
 不匹配、普通 mask-target 证书或其他认证失败都 fail-closed；客户端不会据此
 归因唯一远端原因。不会回退 PKI，也不使用 session resumption。
 
-REALITY profile 必须在 Chrome-derived signature algorithm 列表中加入
-ed25519，否则 BoringSSL 会在自定义检查前拒绝临时 leaf。这是明确的指纹
-差异，因此不声称拥有完整 Chrome identity。
+REALITY profile 在 Chrome-derived signature algorithm 列表前加入 ed25519，
+使 BoringSSL 能以该叶证书公钥验证服务端 TLS CertificateVerify。这与本次核对的
+uTLS Chrome_133 profile 不同；不承诺完整 Chrome identity 或特定 JA4 值。
 
-REALITY `dest` 必须返回小于 8 KiB 的 TLS Certificate message，因为兼容
-sing-box 服务端缓冲 8192 字节。更大的证书 flight 无法完成该握手。
+target 缓冲限制取决于服务端版本，不是 honk 客户端统一的证书大小上限。
+文档中的 sing-box 1.12 / MetaCubeX-uTLS 1.8.0 peer 使用
+[8192 字节的 target TLS record 缓冲区](https://github.com/MetaCubeX/utls/blob/v1.8.0/reality.go)，
+包含 record framing，并非只限制 DER 证书长度。本次核对的
+[XTLS/REALITY 实现](https://github.com/XTLS/REALITY/blob/8cdf7bf9c7f0/tls.go)
+使用 17 KiB 缓冲区；应按实际部署的服务端版本选择兼容 target。
 
 ## VLESS wire 契约
 
@@ -432,6 +437,12 @@ per-source 行为，不等同于 Xray 的 source-only global identity，也不�
 无碰撞。迟到 callback 在动作前重新检查 source owner 与 endpoint token/generation；
 歧义 send 不会自动重放。
 
+作为对照，本次核对的 [Xray 实现](https://github.com/XTLS/Xray-core/blob/c412e77a9b712082ac9ebf27fa793951cb5a7d85/common/xudp/xudp.go)
+默认在进程内生成随机 base key。跨客户端重启保留 `XRAY_XUDP_BASEKEY` 是显式
+选项，不是 Xray 默认保证。Honk 没有持久化 base-key 选项，并额外区分 runtime、
+path 与 reply projection。ID 字节稳定或 carrier 复用，都不保证远端 NAT 状态
+能跨过期或服务端重启保留。
+
 source owner 报告共享 DataUdp transport health。每个绑定 endpoint 保留自己的
 Score reporter；匹配 reply 与共享 terminal outcome 分别结算这些 flow。foreign
 reply 没有逐 flow Score。source 容量耗尽返回 `PacketRejection::Capacity`：对该
@@ -486,6 +497,13 @@ UDP/443；`xtls-rprx-vision-udp443` 即使在 `mux=off` 时也允许经 Single X
 访问该端口。启用 Xray mux 后，`reject` 对两种 flow 都是终态；`skip` 使用协议
 回退并遵循对应 flow 的门槛，`allow` 仅在实际 UDP mux 路径绕过基础 flow 的限制。
 wire addon 始终是基础 Vision flow。
+
+**当前限制：Vision 只实现下行。** Honk 移除 response padding 并处理下行 Direct
+命令，但不为客户端上行添加 Vision padding，也不执行上行 Direct 切换。
+即使收到下行 Direct，上行仍经过原有 outer stack；在 TLS/REALITY carrier 中
+承载内层 TLS 时，上行仍有 TLS-in-TLS 开销。明文流量或没有 outer TLS 的
+Encryption 组合不应称为双层 TLS。互通 echo 成功不代表具有 Xray 的上行整形、
+隐蔽性或上传性能保证。
 
 `src/proxy/vless_encryption.rs` 在 VLESS 请求前包装所选 transport。实现的协议
 是 `mlkem768x25519plus`，wire mode 为 `native`、`xorpub` 与 `random`。它接受

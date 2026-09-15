@@ -328,8 +328,9 @@ emulation profile process-wide. It configures:
 - `X25519MLKEM768` followed by `X25519` key shares;
 - Chrome-derived signature algorithms, curves, cipher set, and ALPN;
 - brotli certificate compression;
-- ALPS for h2, pinned to Chrome's old `0x4469` codepoint rather than
-  BoringSSL's newer `0x44cd`; and
+- ALPS for h2 using the historical `0x4469` codepoint; the reviewed
+  [uTLS Chrome_133 profile](https://github.com/refraction-networking/utls/blob/aa6edf4b11af/u_parrots.go)
+  uses `0x44cd`; and
 - ECH GREASE when no real ECHConfigList is available.
 
 Other `utls_imitate` names warn and use this profile. `tls_implementation = "tls"`
@@ -393,13 +394,17 @@ mask-target certificate, or any other authentication failure is fail-closed;
 the client does not infer a unique remote cause. There is no PKI fallback or
 session resumption.
 
-The profile must add ed25519 to the Chrome-derived signature list because
-BoringSSL otherwise rejects the ephemeral leaf before the custom check. This
-is an explicit fingerprint divergence, so no full Chrome-identity claim is made.
+The profile prepends ed25519 to the Chrome-derived signature list so BoringSSL
+can verify the server's TLS CertificateVerify with that leaf key. This differs
+from the reviewed uTLS Chrome_133 profile; no full Chrome-identity or specific
+JA4 value is promised.
 
-The REALITY `dest` must return a TLS Certificate message smaller than 8 KiB,
-because compatible sing-box servers buffer 8192 bytes. A larger certificate
-flight cannot complete this handshake.
+Target buffering is a server-version constraint, not a universal honk client
+certificate limit. The documented sing-box 1.12 / MetaCubeX-uTLS 1.8.0 peer uses
+an [8192-byte buffer for target TLS records](https://github.com/MetaCubeX/utls/blob/v1.8.0/reality.go),
+including record framing; this is not simply a DER certificate-length limit.
+The reviewed [XTLS/REALITY implementation](https://github.com/XTLS/REALITY/blob/8cdf7bf9c7f0/tls.go)
+uses a 17-KiB buffer. Choose a target compatible with the deployed server version.
 
 ## VLESS wire contracts
 
@@ -491,6 +496,13 @@ honk's per-source behavior, not Xray's source-only global identity and not a
 collision-free NAT guarantee. Late callbacks recheck source owner and endpoint
 token/generation before acting; ambiguous sends are never automatically replayed.
 
+For comparison, the [reviewed Xray implementation](https://github.com/XTLS/Xray-core/blob/c412e77a9b712082ac9ebf27fa793951cb5a7d85/common/xudp/xudp.go)
+uses a process-wide random base key by default. Keeping `XRAY_XUDP_BASEKEY`
+across client restarts is an explicit opt-in, not Xray's default. Honk has no
+persistent-base-key option and also separates runtime, path and reply projection.
+Neither stable ID bytes nor a reused carrier guarantee that remote NAT state
+survives expiry or server restart.
+
 The source owner reports shared DataUdp transport health. Each bound endpoint
 retains its own Score reporter; matched replies and a shared terminal outcome
 settle those flows separately. Foreign replies have no per-flow Score. Source
@@ -551,6 +563,15 @@ UDP paths. Base `xtls-rprx-vision` rejects UDP/443 on the protocol fallback;
 For enabled Xray mux, `reject` remains terminal for either flow; `skip` uses the
 protocol fallback and its flow gate, while `allow` bypasses the base-flow gate
 only on an actual UDP mux path. The wire addon remains the base Vision flow.
+
+**Current limitation: Vision is downstream-only.** Honk removes response
+padding and honors downstream Direct commands, but does not add client-uplink
+Vision padding or perform uplink Direct cutover. Uploads keep the selected
+outer stack even after a downstream Direct command. Inner TLS traffic therefore
+retains TLS-in-TLS upload overhead on a TLS/REALITY carrier; plaintext and
+non-TLS Encryption compositions are not two TLS sessions. Do not infer Xray's
+uplink shaping, camouflage or upload-performance guarantees from a successful
+interop echo.
 
 `src/proxy/vless_encryption.rs` wraps the selected transport before the VLESS
 request. The implemented protocol is `mlkem768x25519plus`, with `native`,

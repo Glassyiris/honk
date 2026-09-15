@@ -186,6 +186,9 @@ VMess JSON 的 `net` 和 Shadowrocket 传输参数只选择流传输方式，不
 
 VLESS 支持 TCP+REALITY+Vision、TCP+REALITY、TCP+WS、TCP+WS+TLS 与 TCP+gRPC。未加密 Vision 的 direct-copy 路径是使用 TLS 1.3 或 REALITY 的裸 TCP，而不是 WS/gRPC；加密 Vision 遵循下文的组合规则。
 
+当前 Vision 只实现下行 unpadding 与 Direct 处理；上行不添加 Vision padding，
+也不会切换到 raw TCP。参见[Vision 支持边界](../design/outbound.md)。
+
 ### Shadowrocket VLESS
 
 统一解析器接受 `vless://base64(auto:UUID@host:port)?...`，以及省略 `auto:` 的编码 authority。支持 standard / URL-safe Base64，有无 padding 均可；IPv6 端点必须使用方括号。编码内容必须包含有效 UUID 和显式非零端口。格式错误的编码 authority 会被拒绝，不再误当作主机名或显示名称。
@@ -349,7 +352,7 @@ REALITY 仅使用 TLS 1.3，并依次通告 hybrid `X25519MLKEM768` 与预设 cl
 
 裸 TCP pool 仅在握手前 socket 保持静默时接纳它。任何排队的服务端字节（包括 fatal TLS alert）都会在接纳或取出时拒绝该裸 entry；没有 SNI/alert 特例，也不会重试握手。已经完成协议准备的 ready stream 即使含有有效的 buffered application data，也不会因此被拒绝。
 
-REALITY 不需要 CA 校验或 `skip_cert_verify`。服务端 REALITY `dest`/客户端 SNI 应选择 TLS Certificate 消息小于 8 KiB 的目标，因为 sing-box REALITY 缓冲区为 8192 字节；已知 `dl.google.com` 可容纳，`www.microsoft.com` 不可容纳。
+REALITY 不使用 CA 校验或 `skip_cert_verify`。target TLS record 的缓冲限制取决于服务端版本：文档中的 sing-box 1.12 / MetaCubeX-uTLS 1.8.0 peer 有包含 framing 的 8192 字节缓冲区，这不是 honk 统一的证书上限。参见[服务端版本约束](../design/outbound.md)。REALITY profile 还会加入 ed25519；被忽略的 `fp` 和全局 Chrome-oriented 模式都不承诺精确浏览器身份。
 
 ## TLS 指纹与 ECH
 

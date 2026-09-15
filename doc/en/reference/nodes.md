@@ -187,6 +187,10 @@ VMess JSON `net` and Shadowrocket transport parameters select only the stream tr
 
 VLESS supports TCP+REALITY+Vision, TCP+REALITY, TCP+WS, TCP+WS+TLS, and TCP+gRPC. Unencrypted Vision's direct-copy path is raw TCP with TLS 1.3 or REALITY, not WS/gRPC; encrypted Vision follows the composition rules below.
 
+Vision currently implements downstream unpadding and Direct handling only;
+uploads are not Vision-padded and do not switch to raw TCP. See the
+[Vision support boundary](../design/outbound.md#vision-and-vless-encryption).
+
 ### Shadowrocket VLESS
 
 The unified parser accepts `vless://base64(auto:UUID@host:port)?...` and the same encoded authority without `auto:`. Standard and URL-safe Base64, with or without padding, are accepted; IPv6 endpoints must be bracketed. The encoded authority must contain a valid UUID and an explicit nonzero port. Malformed encoded authorities are rejected, never treated as hostnames or display names.
@@ -350,7 +354,7 @@ REALITY is TLS-1.3-only and advertises the hybrid `X25519MLKEM768` key share fir
 
 The bare-TCP pool admits a pre-handshake socket only while it is silent. Any queued server byte, including a fatal TLS alert, rejects that bare entry at admission or checkout; there is no SNI/alert exception and no handshake retry. This does not reject a fully prepared ready stream merely because it has valid buffered application data.
 
-REALITY does not need CA verification or `skip_cert_verify`. Choose a server-side REALITY `dest`/client SNI whose TLS Certificate message remains under 8 KiB, because sing-box REALITY buffers 8192 bytes; `dl.google.com` is known to fit while `www.microsoft.com` does not.
+REALITY does not use CA verification or `skip_cert_verify`. Target TLS-record buffering depends on the server version: the documented sing-box 1.12 / MetaCubeX-uTLS 1.8.0 peer has an 8192-byte buffer including framing, not a universal honk certificate limit. See the [server-version constraints](../design/outbound.md#server-authentication-and-fingerprint-constraints). The REALITY profile also adds ed25519; neither ignored `fp` nor the global Chrome-oriented mode promises exact browser identity.
 
 ## TLS fingerprint and ECH
 
