@@ -8,6 +8,8 @@ use std::{net::IpAddr, sync::Arc};
 mod fingerprint;
 mod geo;
 mod ir;
+#[cfg(any(feature = "ebpf", test))]
+mod lan_protection;
 mod lpm;
 
 pub(crate) use geo::{GeoAssets, GeoRequirements, GeoSourceSet};

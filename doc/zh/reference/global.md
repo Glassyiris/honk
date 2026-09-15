@@ -72,6 +72,8 @@ dae 配置中的 `check_tolerance` 仍可通过重载更新 URLTest 组的容差
 
 `IfaceWatcher` 订阅 link、address 和 IPv4 route 事件，并每 60 秒执行一次 reconciliation。它会随网卡和默认路由变化挂载、卸载或重新绑定所需的 LAN/WAN hook，也覆盖 LAN bridge/bond 成员与 WAN bond slave。拓扑变化仍用于 ECS 刷新，并立即唤醒受健康状态控制的出站探测，但不再生成网关地址 `direct(must)` 规则，也没有隐藏的内核地址白名单。网卡列表配置本身发生变化仍需重启；网关管理访问应使用[显式用户路由](./routing.md#显式本地路由)。
 
+真实 LAN 绑定还会执行提示性的[自保覆盖检查](./routing.md#显式本地路由)。无法确认时仅告警，不拒绝启动或重载，也不插入路由规则。
+
 ## 拨号模式
 
 | 模式 | 嗅探 | 域名校验 | 路由与拨号行为 |
