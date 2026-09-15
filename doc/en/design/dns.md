@@ -8,7 +8,11 @@ Field-level settings, accepted URI forms, and defaults belong in the [DNS config
 
 ```mermaid
 flowchart LR
-    T[Transparent TCP/UDP :53] --> C[DnsController]
+    T[TCP/UDP :53 after local/special exclusions] --> TR[Ordered traffic policy]
+    TR -->|direct must| N[Native Linux path]
+    TR -->|block must| DROP[Drop]
+    TR -->|group must| RAW[Raw TCP/UDP group transport]
+    TR -->|non-must, including ordinary block| C[DnsController]
     B[dns.bind TCP/UDP] --> C
     C --> G[Generation-pinned DnsService]
     G --> P[Parse, hosts, strategy, request policy]
@@ -21,7 +25,7 @@ flowchart LR
     M --> D[Generation-owned domain-fact maps]
 ```
 
-Both ingress adapters use the same `DnsController`, current `DnsServiceProvider`, forwarder, cache, singleflight set, upstream pools, and routing projection. An adapter owns admission until reply I/O completes; it does not write domain routes directly.
+Non-`must` transparent DNS and the standalone ingress adapter use the same `DnsController`, current `DnsServiceProvider`, forwarder, cache, singleflight set, upstream pools, and routing projection. An adapter owns admission until reply I/O completes; it does not write domain routes directly. Raw `group(must)` transport bypasses this entire DNS pipeline.
 
 - [`src/dns.rs`](../../../crates/honk-config/src/dns.rs) — `DnsConfig` (`bind`, `upstream`, `routing`, `strategy`, `cache`, `fixed_domain_ttl`). `DnsBindEndpoint` / `DnsBindTransport` / `DnsBindError` parse current-dae listeners with semantic equality; `DnsConfig::bind_endpoint` maps empty to disabled. Bind syntax: [Configuration](../configuration.md). `DnsUpstream`: name, address, `protocol: DnsProtocol`, `tls_server_name`, **`outbound: Option<String>`** dial-path proxy tag.
   Dae routing: first-match `DnsRequestRule`/`DnsResponseRule`, AND-ed negatable `DnsCond`s. Request: Qname/Qtype/Sip; response: Qname/Qtype/Upstream/Ip. `Sip` accepts mixed host/CIDR arguments, never response rules. Actions: Reject/AsIs/Accept/Upstream(name); legacy `rules`/`fallback` convert. `types.rs::DnsProtocol`: 6 variants—Udp, Tcp, Tls (DoT), Https (DoH), H3 (DoH3), Quic (DoQ). Only the dae parser populates request/response routing types; they deliberately sit outside serde.
@@ -40,8 +44,12 @@ Both ingress adapters use the same `DnsController`, current `DnsServiceProvider`
 
 | Path | Socket and destination model | Reply model |
 | --- | --- | --- |
-| Transparent port 53 | LAN-forwarded TCP and UDP destination port `53` takes the eBPF early fast path, which skips the compiled traffic policy and redirects to the control plane. Host-originated WAN port-53 traffic uses the generated routing result; a non-`must` result is handed to userspace as `ControlPlaneRouting` with its mark intact, while terminal `must` decisions retain their native result. | Transparent UDP uses an anyfrom socket bound to the original destination; TCP replies on the intercepted stream. Request action `asis` dials that original destination and preserves TCP/UDP, including UDP `TC` fallback to TCP. |
+| Transparent port 53, without a terminal user `must` result | Valid queries admitted under [traffic-rule ownership](../reference/routing.md#outbound-targets-and-must) enter `DnsController`. | Transparent UDP uses an anyfrom socket bound to the original destination; TCP replies on the intercepted stream. Request action `asis` creates a new query to that destination on honk-originated sockets, preserving TCP/UDP including UDP `TC` fallback to TCP, not the client's network source. |
 | Standalone `dns.bind` | Selected TCP/UDP sockets are ordinary unmarked sockets in the host network namespace. They have no intercepted destination. | TCP replies on the accepted socket. UDP uses packet info so a wildcard bind replies from the exact local address and interface that received the query. |
+
+Native `direct(must)` leaves the original source IP/port untouched by honk, subject to external firewall/NAT. DNS bypassed by native direct or raw group transport contributes no answers to honk's routing projection. Anyfrom is the client-facing reply leg, not upstream source spoofing. Private-DNS bypass migration belongs in the [routing reference](../reference/routing.md#explicit-local-rules).
+
+The control plane owns [TCP handoff and UDP per-packet admission](./control-plane.md#transparent-ingress), including their different routing-generation requirements.
 
 `DnsRequestMeta { source_ip, original_dst }` carries the logical client source and intercepted destination as one immutable value. Both transparent and standalone adapters set `source_ip` from the socket peer; only transparent interception sets `original_dst`. IPv4-mapped IPv6 peers normalize to IPv4. Flow-associated TCP/UDP lookups use the admitted flow's client address and have no intercepted DNS destination. Internal, bootstrap, prefetch, and Clash API queries have neither value.
 
@@ -58,11 +66,11 @@ The standalone listener has these lifecycle and admission invariants:
 - A semantic `dns.bind` change on SIGHUP is restart-required. An unchanged listener continues through the newly published DNS generation.
 - Standalone requests pass `original_dst=None`; selecting `asis` therefore produces a DNS failure (`SERVFAIL`) rather than dialing the listener recursively.
 
-A bound local `:53` listener takes precedence over transparent interception independently for TCP and UDP. A specific-address bind wins for that transport. A wildcard bind wins only when the full FIB lookup reports `NOT_FWDED`, preventing remote resolver traffic from bypassing transparent DNS. Leaving `dns.bind` empty preserves transparent TCP and UDP interception.
+Leaving `dns.bind` empty does not disable transparent TCP/UDP interception. Local-listener precedence is transport-specific, as described below.
 
 ## DNS ownership state machine
 
-This matrix is for a LAN client and separates the **first receiver**, the **actual answer source**, and the **final reply sender**. `Honk bind` is an ordinary host-network listener; binding `:54` does not claim `:53`. `Transparent Honk` requires the real eBPF datapath and an attached interface hook; it is unavailable in mock mode.
+This matrix is for a LAN client and separates the **first receiver**, the **actual answer source**, and the **final reply sender**. `Honk bind` is an ordinary host-network listener; binding `:54` does not claim `:53`. `Transparent Honk` requires the real eBPF datapath, an attached interface hook, and no terminal user `must` result after local/special exclusions; it is unavailable in mock mode.
 
 | dnsmasq state | Honk `dns.bind` | Query target | First receiver | Actual answer source | Final reply sender |
 | --- | --- | --- | --- | --- | --- |
@@ -70,25 +78,21 @@ This matrix is for a LAN client and separates the **first receiver**, the **actu
 | Running on `:53`; miss forwarded to `127.0.0.1#54` | `:54` running | Gateway `:53` | dnsmasq | Honk cache/hosts/policy or Honk upstream | dnsmasq |
 | Running on `:53`; miss has no reachable dnsmasq upstream | Any | Gateway `:53` | dnsmasq | None | dnsmasq returns `SERVFAIL` or times out |
 | Running on `:53`; forwarding target `127.0.0.1#54` is stopped | `:54` stopped | Gateway `:53` | dnsmasq | None | dnsmasq returns `SERVFAIL` or times out |
-| Running on `:53` | `:54` running | External `:53` (for example `8.8.8.8:53`) | Transparent Honk, when enabled | Honk cache/hosts/policy or Honk upstream | Honk transparent anyfrom/stream path |
+| Running on `:53` | `:54` running | External `:53` (for example `8.8.8.8:53`), no terminal `must` | Transparent Honk, when enabled | Honk cache/hosts/policy or Honk upstream | Honk transparent anyfrom/stream path |
 | Stopped | `:54` running | Gateway `:54` | Honk bind | Honk cache/hosts/policy or Honk upstream | Honk bind |
-| Stopped | `:54` running | Gateway `:53` | Transparent Honk, when enabled | Honk cache/hosts/policy or Honk upstream | Honk transparent anyfrom/stream path |
-| Stopped | Bind disabled | Gateway or external `:53` | Transparent Honk, when enabled | Honk cache/hosts/policy or Honk upstream | Honk transparent anyfrom/stream path |
+| Stopped | `:54` running | Gateway `:53`, no terminal `must` | Transparent Honk, when enabled | Honk cache/hosts/policy or Honk upstream | Honk transparent anyfrom/stream path |
+| Stopped | Bind disabled | Gateway or external `:53`, no terminal `must` | Transparent Honk, when enabled | Honk cache/hosts/policy or Honk upstream | Honk transparent anyfrom/stream path |
 | Stopped or does not own `:53` | `:53` running | Gateway `:53` | Honk bind | Honk cache/hosts/policy or Honk upstream | Honk bind |
 | Owns `:53` | Attempts `:53` | Gateway `:53` | Bind conflict during startup | None until one owner remains | No deterministic owner; one service must fail |
 | Any | Bind disabled or stopped | Gateway `:54` | No Honk listener | None | Connection refusal or timeout |
+| Does not own target for this transport | Does not own target | Unclaimed `:53`, `direct(must)` | Original destination through native Linux | Target resolver, if reachable | Target resolver, subject to external firewall/NAT |
+| Does not own target for this transport | Does not own target | Unclaimed `:53`, `block(must)` | Kernel drop | None | None |
+| Does not own target for this transport | Does not own target | Unclaimed `:53`, `group(must)` | Honk raw TCP/UDP transport | Target resolver through the selected group | Honk raw relay, not `DnsController` |
 | Any | Any | Non-DNS port | Normal routing path | Selected outbound | Normal flow |
 
-The precedence transition for each transport is:
+Unclaimed port-53 queries follow [traffic-rule ownership](../reference/routing.md#outbound-targets-and-must); the matrix does not turn malformed UDP payloads into controller queries.
 
-```text
-gateway:53 packet
-  -> matching host-network listener (dnsmasq or Honk bind)
-  -> otherwise Honk transparent port-53 path
-  -> otherwise ordinary kernel routing / no DNS service
-```
-
-The local-listener check is per TCP/UDP transport. A specifically addressed local `:53` socket wins. A wildcard socket wins only when the complete FIB lookup says `NOT_FWDED`; a forwarded or ambiguous destination remains on the transparent path. Therefore, stopping dnsmasq does not make Honk `:54` automatically own `:53`: the observed takeover is transparent interception. To make Honk the ordinary gateway `:53` service, stop or move dnsmasq and configure `bind` for `tcp+udp://:53`.
+The local-listener check is per TCP/UDP transport. A specifically addressed local `:53` socket wins. A wildcard socket wins only when the complete FIB lookup says `NOT_FWDED`; otherwise traffic proceeds to ordered policy. Stopping dnsmasq does not make Honk `:54` automatically own `:53`: any takeover is transparent interception, conditional on an enabled datapath and no terminal user `must` result. To make Honk the ordinary gateway `:53` service, stop or move dnsmasq and configure `bind` for `tcp+udp://:53`.
 
 The common OpenWrt forwarding state is:
 
@@ -249,6 +253,8 @@ The 30-second deadline bounds waiting for query leases, not completion of transp
 `DnsServiceProvider` owns every retirement and forced-close supervisor; they are reaped and joined at shutdown. Listener sockets and process-wide physical resource limits remain shared, so isolation does not promise service after descriptor exhaustion.
 
 SIGHUP builds policy, `/etc/hosts`, groups, routing, upstream transports, projection data, and the outbound runtime before the commit point. Publication occurs with the control-plane routing/config locks; failed preparation leaves the current generation intact. A semantic `dns.bind` change is the exception: listener ownership is process-scoped and the reload is rejected as restart-required.
+
+Routing publication can reject old queued DNS metadata before admission; already admitted queries keep their generation leases. The nonwrapping 20-bit routing carrier permits at most 1,048,575 successful compiled-policy publications per process, not that many total SIGHUPs or DNS runtime generations. Exhaustion preserves the current policy and requires restart before another publication; see [routing publication](./routing.md#synchronous-slots-and-atomic-publication).
 
 ## Observability
 

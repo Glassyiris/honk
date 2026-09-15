@@ -7,7 +7,7 @@ userspace `Router` evaluates a canonical policy IR; a restricted compiler lowers
 that same IR to native eBPF comparisons. The kernel does not interpret a second
 policy representation. Linux 6.12 is the real-backend baseline.
 
-The static TC programs retain packet parsing, special/local/DNS exclusions,
+The static TC programs retain packet parsing, special/local exclusions, DNS ownership,
 conntrack, mode and health enforcement, NFQUEUE ownership, redirection, and reply
 accounting. Generated code implements only `RoutingInput -> RoutingDecision`.
 No flow is sent to userspace merely because its policy is compiled. Existing
@@ -17,10 +17,9 @@ native-direct and cached-flow paths remain native.
 
 The canonical IR retains ordered rule IDs, display metadata, conditions, and an
 outbound/mark/must action. Lower numeric priority wins; equal priorities retain
-stable source order. The dae parser assigns source-order priorities `0, 1, ...`;
-generated local rules use priority `0` and are appended after user rules, so they
-outrank only user rules with a higher priority. An earlier user priority-0 match
-still wins. Conditions are ANDed, alternatives in a condition are ORed, and
+stable source order. The dae parser assigns source-order priorities `0, 1, ...`.
+Startup, SIGHUP/reload, and network events synthesize no local-interface rules
+or hidden kernel replacement allowlist. Conditions are ANDed, alternatives in a condition are ORed, and
 negation applies once to the entire condition. Fallback is a separate terminal
 action. Empty expanded sets remain conditions: positive empty sets are false,
 negative empty sets are true; they must not disappear and widen a compound rule.
@@ -54,6 +53,11 @@ The cutover preserves the current userspace matching contract:
 - A configured `(must)` result is terminal: it sets the explicit `must` decision
   field and skips sniffing. Neither it nor `block` can be overridden by Clash
   mode.
+
+LAN/WAN TCP/UDP destination port `53` evaluates this same ordered policy once
+after local/special exclusions, not a separate must-only scan. The
+[routing reference](../reference/routing.md#outbound-targets-and-must) defines
+DNS ownership and [explicit local-rule migration](../reference/routing.md#explicit-local-rules).
 
 The old compiler's dropped full/regex conditions, narrowed protocol unions,
 truncated rule chains, first-rule DNS projection, and overlapping-prefix bitmap
@@ -123,10 +127,11 @@ phase's route under its dial mode: the policy has no domain predicates, domain
 rerouting is disabled, or a complete learned-domain bitmap was available. It is
 policy-generation data, not a separately published global routing flag.
 
-A non-`must` direct result with unresolved domain finality is encoded as
-`ControlPlaneRouting` when handed to userspace. Passing it as final `direct`
-would make TCP and UDP initialization skip sniffing. Known direct, `must`,
-block, and mode-owned direct offload retain their terminal behavior.
+For non-DNS traffic, a non-`must` direct result with unresolved domain finality is
+encoded as `ControlPlaneRouting` when handed to userspace. Passing it as final
+`direct` would make TCP and UDP initialization skip sniffing. Known direct,
+`must`, block, and mode-owned direct offload retain their terminal behavior
+within that non-DNS path; port-53 ownership follows the rules above.
 
 Miss-only inputs reuse the existing per-CPU packet scratch; cached packets do
 not clear that storage. Volatile slot accesses keep the complete input/output
@@ -243,6 +248,14 @@ the active code and facts intact. Failure is not handled by closing datapath
 admission, which would pass traffic through, or by punting all flows. Rule-derived
 flags and domain writers must use the same policy generation. Mode/NFQUEUE
 coordination and existing-flow ownership remain with their current controllers.
+
+The committed routing generation is nonwrapping. At most 1,048,575 successful
+**compiled-routing publications** are allowed per process; exhaustion rejects
+replacement, preserves current policy, and requires restart before further
+publications. This is not a limit on every SIGHUP or DNS runtime generation:
+unchanged compiled policy can skip publication. See [datapath ABI](./datapath.md#map-inventory)
+for physical carriers and [control-plane admission](./control-plane.md#transparent-ingress)
+for queued metadata and generation lifetimes.
 
 Only the generation root is a stable policy pin. Tools resolve the active domain
 map through its descriptor instead of assuming that a same-named pinned map

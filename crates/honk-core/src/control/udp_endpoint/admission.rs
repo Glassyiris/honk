@@ -147,6 +147,8 @@ enum PacketAdmissionError {
 pub(super) struct InitializingEndpoint {
     pub(super) decision_token: u32,
     pub(super) generation: u64,
+    pub(super) epoch: u64,
+    pub(super) raw_dns_group: Option<Arc<str>>,
     pub(super) queue_tx: mpsc::Sender<QueuedDatagram>,
     pub(super) queue_rx: Mutex<Option<mpsc::Receiver<QueuedDatagram>>>,
     pub(super) flow_slots: Arc<Semaphore>,
@@ -216,6 +218,7 @@ impl InitializingEndpoint {
 pub(super) struct ReadyEndpoint {
     pub(super) decision_token: u32,
     pub(super) generation: u64,
+    pub(super) raw_dns_group: Option<Arc<str>>,
     pub(super) endpoint: Arc<UdpEndpoint>,
     pub(super) queue_tx: mpsc::Sender<QueuedDatagram>,
     pub(super) flow_slots: Arc<Semaphore>,
@@ -295,10 +298,6 @@ pub(in crate::control) struct UdpInitLease {
     pub(super) key: EndpointKey,
     generation: u64,
     decision_token: u32,
-    /// Cancellation epoch captured while publishing this Initializing entry.
-    /// `commit_ready` compares it under the pool's shared epoch gate, so a
-    /// cancellation that linearizes first can never publish Ready afterwards.
-    epoch: u64,
     first: Option<QueuedDatagram>,
     _slow_permit: OwnedSemaphorePermit,
     cancellation: watch::Receiver<u64>,
@@ -323,6 +322,10 @@ impl UdpInitLease {
 
     pub(in crate::control) fn decision_token(&self) -> u32 {
         self.decision_token
+    }
+
+    pub(in crate::control) fn raw_dns_group(&self) -> Option<Arc<str>> {
+        self.initializer.raw_dns_group.clone()
     }
 
     #[cfg(test)]
@@ -453,7 +456,7 @@ impl UdpInitLease {
             dashmap::mapref::entry::Entry::Vacant(_) => return false,
         };
         let _epoch_gate = self.pool.initialization_epoch.lock();
-        if self.pool.terminal.load(Ordering::Acquire) || self.epoch != *_epoch_gate {
+        if self.pool.terminal.load(Ordering::Acquire) || self.initializer.epoch != *_epoch_gate {
             return false;
         }
         let initializing = match occupied.get() {
@@ -477,6 +480,7 @@ impl UdpInitLease {
             _endpoint_permit: endpoint_permit,
             _connection_guard: self.connection_guard.take(),
             alive: AtomicBool::new(true),
+            raw_dns_group: initializing.raw_dns_group.clone(),
         })));
         self.committed = true;
         true
@@ -492,7 +496,7 @@ impl UdpInitLease {
             dashmap::mapref::entry::Entry::Vacant(_) => return false,
         };
         let _epoch_gate = self.pool.initialization_epoch.lock();
-        if self.pool.terminal.load(Ordering::Acquire) || self.epoch != *_epoch_gate {
+        if self.pool.terminal.load(Ordering::Acquire) || self.initializer.epoch != *_epoch_gate {
             return false;
         }
         if !matches!(
@@ -682,16 +686,19 @@ impl UdpEndpointPool {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn reserve_new_at(
         self: &Arc<Self>,
         vacant: dashmap::mapref::entry::VacantEntry<'_, EndpointKey, EndpointEntry>,
         data: DatagramPayload<'_>,
         decision_token: u32,
+        raw_dns_group: Option<&str>,
+        expected_epoch: u64,
         slow_permit: OwnedSemaphorePermit,
         enqueued_at: u32,
         stats: &StatsManager,
     ) -> EndpointReservation {
-        let reservation_epoch = *self.initialization_epoch.lock();
+        let reservation_epoch = expected_epoch;
         #[cfg(test)]
         self.pause_before_reservation_gate();
         let epoch_gate = self.initialization_epoch.lock();
@@ -721,6 +728,7 @@ impl UdpEndpointPool {
                 return EndpointReservation::QueueFull;
             }
         };
+        let raw_dns_group = raw_dns_group.map(Arc::<str>::from);
         let (queue_tx, queue_rx) = mpsc::channel(FLOW_QUEUE_CAPACITY);
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let epoch_gate = self.initialization_epoch.lock();
@@ -732,6 +740,8 @@ impl UdpEndpointPool {
         let initializer = Arc::new(InitializingEndpoint {
             decision_token,
             generation,
+            epoch,
+            raw_dns_group,
             queue_tx,
             queue_rx: Mutex::new(Some(queue_rx)),
             flow_slots,
@@ -751,7 +761,6 @@ impl UdpEndpointPool {
             key,
             generation,
             decision_token,
-            epoch,
             first: Some(first),
             _slow_permit: slow_permit,
             cancellation,
@@ -773,7 +782,17 @@ impl UdpEndpointPool {
         slow_permit: OwnedSemaphorePermit,
         stats: &StatsManager,
     ) -> EndpointReservation {
-        self.reserve_or_enqueue_at(client, dst, data, slow_permit, queue_now(), stats)
+        let expected_epoch = self.initialization_epoch();
+        self.reserve_or_enqueue_at(
+            client,
+            dst,
+            data,
+            None,
+            expected_epoch,
+            slow_permit,
+            queue_now(),
+            stats,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -782,6 +801,8 @@ impl UdpEndpointPool {
         client: SocketAddr,
         dst: SocketAddr,
         data: &[u8],
+        raw_dns_group: Option<&str>,
+        expected_epoch: u64,
         slow_permit: OwnedSemaphorePermit,
         enqueued_at: u32,
         stats: &StatsManager,
@@ -796,6 +817,16 @@ impl UdpEndpointPool {
                 dashmap::mapref::entry::Entry::Occupied(occupied) => {
                     let (stale_token, stale_generation) = match occupied.get() {
                         EndpointEntry::Initializing(initializing) => {
+                            if initializing.raw_dns_group.as_deref() != raw_dns_group {
+                                return EndpointReservation::IdentityMismatch;
+                            }
+                            let epoch_gate = self.initialization_epoch.lock();
+                            if initializing.epoch != expected_epoch || *epoch_gate != expected_epoch
+                            {
+                                stats.record_udp_queue_closed();
+                                return EndpointReservation::QueueClosed;
+                            }
+                            drop(epoch_gate);
                             match self.enqueue_at(
                                 &initializing.queue_tx,
                                 &initializing.flow_slots,
@@ -813,6 +844,9 @@ impl UdpEndpointPool {
                             if ready.alive.load(Ordering::Acquire)
                                 && !ready.endpoint.dead.load(Ordering::Acquire) =>
                         {
+                            if ready.raw_dns_group.as_deref() != raw_dns_group {
+                                return EndpointReservation::IdentityMismatch;
+                            }
                             match self.enqueue_at(
                                 &ready.queue_tx,
                                 &ready.flow_slots,
@@ -840,6 +874,8 @@ impl UdpEndpointPool {
                         vacant,
                         DatagramPayload::Borrowed(data),
                         0,
+                        raw_dns_group,
+                        expected_epoch,
                         slow_permit,
                         enqueued_at,
                         stats,
@@ -944,6 +980,8 @@ impl UdpEndpointPool {
                     vacant,
                     DatagramPayload::Owned(data),
                     decision_token,
+                    None,
+                    self.initialization_epoch(),
                     slow_permit,
                     enqueued_at,
                     stats,
@@ -1059,7 +1097,7 @@ impl UdpEndpointPool {
         data: &[u8],
         stats: &StatsManager,
     ) -> Option<EndpointReservation> {
-        self.fast_path_enqueue_at(client, dst, data, queue_now(), stats)
+        self.fast_path_enqueue_at(client, dst, data, None, queue_now(), stats)
     }
 
     pub(in crate::control) fn fast_path_enqueue_at(
@@ -1067,6 +1105,7 @@ impl UdpEndpointPool {
         client: SocketAddr,
         dst: SocketAddr,
         data: &[u8],
+        raw_dns_group: Option<&str>,
         enqueued_at: u32,
         stats: &StatsManager,
     ) -> Option<EndpointReservation> {
@@ -1082,6 +1121,9 @@ impl UdpEndpointPool {
                 if ready.alive.load(Ordering::Acquire)
                     && !ready.endpoint.dead.load(Ordering::Acquire) =>
             {
+                if ready.raw_dns_group.as_deref() != raw_dns_group {
+                    return Some(EndpointReservation::IdentityMismatch);
+                }
                 (
                     self.enqueue_at(
                         &ready.queue_tx,
@@ -1125,6 +1167,14 @@ impl UdpEndpointPool {
             }
             _ => None,
         }
+    }
+
+    pub(in crate::control) fn initialization_epoch(&self) -> u64 {
+        *self.initialization_epoch.lock()
+    }
+
+    pub(in crate::control) fn initialization_epoch_is(&self, expected: u64) -> bool {
+        !self.terminal.load(Ordering::Acquire) && *self.initialization_epoch.lock() == expected
     }
 
     pub(super) fn advance_initialization_epoch(&self, terminal: bool) {

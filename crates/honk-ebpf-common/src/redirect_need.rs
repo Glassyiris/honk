@@ -50,14 +50,17 @@ pub struct Tuples {
 pub struct RoutingHandoffEntry {
     pub last_seen_ns: u64,
     pub result: RoutingResult,
+    pub routing_generation: u64,
 }
 
-const _ROUTING_HANDOFF_ENTRY_SIZE: () = assert!(core::mem::size_of::<RoutingHandoffEntry>() == 48);
+const _ROUTING_HANDOFF_ENTRY_SIZE: () = assert!(core::mem::size_of::<RoutingHandoffEntry>() == 56);
 const _ROUTING_HANDOFF_ENTRY_ALIGN: () = assert!(core::mem::align_of::<RoutingHandoffEntry>() == 8);
 const _ROUTING_HANDOFF_LAST_SEEN_OFFSET: () =
     assert!(core::mem::offset_of!(RoutingHandoffEntry, last_seen_ns) == 0);
 const _ROUTING_HANDOFF_RESULT_OFFSET: () =
     assert!(core::mem::offset_of!(RoutingHandoffEntry, result) == 8);
+const _ROUTING_HANDOFF_GENERATION_OFFSET: () =
+    assert!(core::mem::offset_of!(RoutingHandoffEntry, routing_generation) == 48);
 const _ROUTING_HANDOFF_TOKEN_OFFSET: () = assert!(
     core::mem::offset_of!(RoutingHandoffEntry, result)
         + core::mem::offset_of!(RoutingResult, decision_token)

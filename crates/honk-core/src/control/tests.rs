@@ -7,13 +7,15 @@ pub(super) mod support;
 use support::KernelUdpReplySocketFactory;
 use support::{
     FailingUdpTestReplySocketFactory, UdpTestHandler, UdpTestMode, addr, assert_udp_outbound,
-    control_plane, serve_test_udp, serve_test_udp_to, udp_test_config, udp_test_forwarder,
-    udp_test_handle, udp_test_handle_with_default_pool, udp_test_handle_with_reply_factory,
-    udp_test_node,
+    bytes_of, control_plane, dns_query_payload, serve_test_udp, serve_test_udp_to, udp_test_config,
+    udp_test_forwarder, udp_test_handle, udp_test_handle_with_default_pool,
+    udp_test_handle_with_reply_factory, udp_test_node,
 };
 
 mod admission;
 mod diagnostics;
+mod dns_tcp_ownership;
+mod dns_udp_ownership;
 mod health;
 
 #[test]
@@ -284,140 +286,6 @@ fn test_build_dns_probe_query() {
     assert_eq!(&q[q.len() - 4..], &[0, 1, 0, 1]); // QTYPE A / QCLASS IN
 }
 
-#[cfg(target_os = "linux")]
-#[test]
-fn udp_listener_enables_reuse_port_before_bind() {
-    use std::os::fd::AsRawFd;
-
-    let first = sockets::new_udp_listener_socket(socket2::Domain::IPV4, true).unwrap();
-    let mut enabled = 0i32;
-    let mut enabled_len = std::mem::size_of_val(&enabled) as libc::socklen_t;
-    let status = unsafe {
-        libc::getsockopt(
-            first.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_REUSEPORT,
-            (&mut enabled as *mut i32).cast(),
-            &mut enabled_len,
-        )
-    };
-    assert_eq!(status, 0);
-    assert_eq!(enabled, 1);
-
-    first
-        .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
-        .unwrap();
-    let addr = first.local_addr().unwrap();
-    let second = sockets::new_udp_listener_socket(socket2::Domain::IPV4, true).unwrap();
-    second.bind(&addr).unwrap();
-}
-
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn udp_receive_batch_preserves_order_metadata_and_cancellation() {
-    let socket = sockets::bind_tproxy_udp_listeners(SocketAddr::from(([127, 0, 0, 1], 0)), 1)
-        .unwrap()
-        .pop()
-        .unwrap();
-    nix::sys::socket::setsockopt(&socket, nix::sys::socket::sockopt::Ipv4OrigDstAddr, &true)
-        .unwrap();
-    let local_addr = socket.local_addr().unwrap();
-    let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let sender_addr = sender.local_addr().unwrap();
-    for sequence in 0..9u8 {
-        sender.send_to(&[sequence], local_addr).await.unwrap();
-    }
-    sender.send_to(&[], local_addr).await.unwrap();
-
-    let mut batch = sockets::UdpRecvBatch::new().unwrap();
-    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
-        .await
-        .unwrap();
-    assert_eq!(batch.len(), 8);
-    for index in 0..batch.len() {
-        let (data, source, meta) = batch.packet(index).unwrap();
-        assert_eq!(data, &[index as u8]);
-        assert_eq!(source, sender_addr);
-        assert_eq!(meta.original_dst_cmsg, Some(local_addr));
-        assert_eq!(meta.packet_dst_ip, Some(local_addr.ip()));
-        assert!(meta.packet_ifindex.is_some());
-        assert_eq!(meta.local_addr, local_addr);
-    }
-
-    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
-        .await
-        .unwrap();
-    assert_eq!(batch.len(), 2);
-    assert_eq!(batch.packet(0).unwrap().0, &[8]);
-    assert!(batch.packet(1).unwrap().0.is_empty());
-
-    for sequence in 10..13u8 {
-        sender.send_to(&[sequence], local_addr).await.unwrap();
-    }
-    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
-        .await
-        .unwrap();
-    assert_eq!(batch.len(), 3);
-
-    for sequence in 13..16u8 {
-        sender.send_to(&[sequence], local_addr).await.unwrap();
-    }
-    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
-        .await
-        .unwrap();
-    assert_eq!(batch.len(), 3);
-
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(10),
-            sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch),
-        )
-        .await
-        .is_err()
-    );
-    for sequence in 16..25u8 {
-        sender.send_to(&[sequence], local_addr).await.unwrap();
-    }
-    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
-        .await
-        .unwrap();
-    assert_eq!(batch.len(), 1);
-    assert_eq!(batch.packet(0).unwrap().0, &[16]);
-    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
-        .await
-        .unwrap();
-    assert_eq!(batch.len(), 8);
-    for index in 0..batch.len() {
-        assert_eq!(batch.packet(index).unwrap().0, &[index as u8 + 17]);
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn udp_receive_batch_rejects_truncated_slot_without_losing_next_packet() {
-    let socket = sockets::bind_tproxy_udp_listeners(SocketAddr::from(([127, 0, 0, 1], 0)), 1)
-        .unwrap()
-        .pop()
-        .unwrap();
-    nix::sys::socket::setsockopt(&socket, nix::sys::socket::sockopt::Ipv4OrigDstAddr, &true)
-        .unwrap();
-    let local_addr = socket.local_addr().unwrap();
-    let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    sender.send_to(&[1, 2], local_addr).await.unwrap();
-    sender.send_to(&[3], local_addr).await.unwrap();
-
-    let mut batch = sockets::UdpRecvBatch::new_for_test(1).unwrap();
-    sockets::recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch)
-        .await
-        .unwrap();
-
-    assert_eq!(batch.len(), 2);
-    assert_eq!(
-        batch.packet(0).unwrap_err().kind(),
-        std::io::ErrorKind::InvalidData
-    );
-    assert_eq!(batch.packet(1).unwrap().0, &[3]);
-}
 #[tokio::test]
 async fn test_resolve_udp_check_target() {
     let fallback: SocketAddr = "8.8.8.8:53".parse().unwrap();
@@ -669,430 +537,6 @@ async fn quic_probe_still_runs_when_dns_probe_fails() {
         "the Score QUIC probe must be attempted even when DNS fails: {result:?}"
     );
     assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 2);
-}
-
-/// A minimal DNS query payload for "a.com" (A record).
-fn dns_query_payload() -> Vec<u8> {
-    let mut q = vec![
-        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ];
-    q.extend_from_slice(&[
-        0x01, b'a', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01,
-    ]);
-    q
-}
-
-fn bytes_of<T>(value: &T) -> &[u8] {
-    // SAFETY: the returned slice borrows `value` and has its exact layout size.
-    unsafe {
-        std::slice::from_raw_parts((value as *const T).cast::<u8>(), std::mem::size_of::<T>())
-    }
-}
-
-/// Test storage has the same `cmsghdr` alignment required by `recvmsg`.
-#[repr(C)]
-struct AlignedTestCmsgStorage {
-    _alignment: [libc::cmsghdr; 0],
-    bytes: [u8; 256],
-}
-
-impl AlignedTestCmsgStorage {
-    fn new() -> Self {
-        // SAFETY: all-zero bytes are a valid initial representation for this
-        // test-only raw control-message storage.
-        unsafe { std::mem::zeroed() }
-    }
-}
-
-fn cmsg_len(data_len: usize) -> usize {
-    // SAFETY: libc exposes CMSG_LEN as the platform ABI macro wrapper.
-    unsafe { libc::CMSG_LEN(data_len as _) as usize }
-}
-
-fn cmsg_space(data_len: usize) -> usize {
-    // SAFETY: libc exposes CMSG_SPACE as the platform ABI macro wrapper.
-    unsafe { libc::CMSG_SPACE(data_len as _) as usize }
-}
-
-fn append_cmsg(
-    storage: &mut AlignedTestCmsgStorage,
-    used: &mut usize,
-    cmsg_level: libc::c_int,
-    cmsg_type: libc::c_int,
-    data: &[u8],
-) {
-    let space = cmsg_space(data.len());
-    assert!(*used + space <= storage.bytes.len());
-    // SAFETY: all-zero is a valid initial representation for a raw test cmsg header.
-    let mut header: libc::cmsghdr = unsafe { std::mem::zeroed::<libc::cmsghdr>() };
-    header.cmsg_len = cmsg_len(data.len()) as _;
-    header.cmsg_level = cmsg_level;
-    header.cmsg_type = cmsg_type;
-    // SAFETY: `AlignedTestCmsgStorage` is explicitly cmsghdr-aligned, the
-    // checked range fits storage, and the header is initialized before use.
-    unsafe {
-        let ptr = storage
-            .bytes
-            .as_mut_ptr()
-            .add(*used)
-            .cast::<libc::cmsghdr>();
-        assert_eq!(
-            ptr as usize % std::mem::align_of::<libc::cmsghdr>(),
-            0,
-            "test cmsg header must be naturally aligned"
-        );
-        std::ptr::write(ptr, header);
-    }
-    let data_start = *used + cmsg_len(0);
-    storage.bytes[data_start..data_start + data.len()].copy_from_slice(data);
-    *used += space;
-}
-
-#[test]
-fn udp_original_dst_cmsg_parser_walks_aligned_ipv4_multi_cmsg() {
-    let mut original: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    original.sin_family = libc::AF_INET as _;
-    original.sin_port = 4444u16.to_be();
-    original.sin_addr = libc::in_addr {
-        s_addr: u32::from(std::net::Ipv4Addr::new(203, 0, 113, 10)).to_be(),
-    };
-    let pktinfo = libc::in_pktinfo {
-        ipi_ifindex: 0,
-        ipi_spec_dst: libc::in_addr { s_addr: 0 },
-        ipi_addr: libc::in_addr {
-            s_addr: u32::from(std::net::Ipv4Addr::new(198, 51, 100, 53)).to_be(),
-        },
-    };
-    let mut storage = AlignedTestCmsgStorage::new();
-    let mut used = 0;
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IP,
-        libc::IP_ORIGDSTADDR,
-        bytes_of(&original),
-    );
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IP,
-        libc::IP_PKTINFO,
-        bytes_of(&pktinfo),
-    );
-
-    let (original_dst, packet_dst_ip, packet_ifindex) =
-        parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
-    assert_eq!(original_dst, Some(addr("203.0.113.10:4444")));
-    assert_eq!(
-        packet_dst_ip,
-        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-            198, 51, 100, 53
-        )))
-    );
-    assert_eq!(packet_ifindex, Some(0));
-}
-
-#[test]
-fn udp_original_dst_cmsg_parser_walks_aligned_ipv6_multi_cmsg() {
-    let expected_original: std::net::Ipv6Addr = "2001:db8::4444".parse().unwrap();
-    let expected_packet: std::net::Ipv6Addr = "2001:db8::53".parse().unwrap();
-    let mut original: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
-    original.sin6_family = libc::AF_INET6 as _;
-    original.sin6_port = 4444u16.to_be();
-    original.sin6_addr = libc::in6_addr {
-        s6_addr: expected_original.octets(),
-    };
-    let pktinfo = libc::in6_pktinfo {
-        ipi6_addr: libc::in6_addr {
-            s6_addr: expected_packet.octets(),
-        },
-        ipi6_ifindex: 7,
-    };
-    let mut storage = AlignedTestCmsgStorage::new();
-    let mut used = 0;
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IPV6,
-        libc::IPV6_ORIGDSTADDR,
-        bytes_of(&original),
-    );
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IPV6,
-        libc::IPV6_PKTINFO,
-        bytes_of(&pktinfo),
-    );
-
-    let (original_dst, packet_dst_ip, packet_ifindex) =
-        parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
-    assert_eq!(original_dst, Some(addr("[2001:db8::4444]:4444")));
-    assert_eq!(packet_dst_ip, Some(std::net::IpAddr::V6(expected_packet)));
-    assert_eq!(packet_ifindex, Some(7));
-}
-
-#[test]
-fn udp_original_dst_cmsg_parser_uses_only_returned_control_length() {
-    let pktinfo = libc::in_pktinfo {
-        ipi_ifindex: 0,
-        ipi_spec_dst: libc::in_addr { s_addr: 0 },
-        ipi_addr: libc::in_addr {
-            s_addr: u32::from(std::net::Ipv4Addr::new(198, 51, 100, 53)).to_be(),
-        },
-    };
-    let mut storage = AlignedTestCmsgStorage::new();
-    let mut used = 0;
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IP,
-        libc::IP_PKTINFO,
-        bytes_of(&pktinfo),
-    );
-    let returned_control_len = used;
-    // Bytes beyond msg_controllen are not kernel-returned control data; make
-    // them malformed to prove they cannot influence the parser.
-    unsafe {
-        // SAFETY: all-zero is a valid initial representation for a raw test cmsg header.
-        let mut malformed_header: libc::cmsghdr = std::mem::zeroed::<libc::cmsghdr>();
-        malformed_header.cmsg_len = 0;
-        malformed_header.cmsg_level = libc::IPPROTO_IP;
-        malformed_header.cmsg_type = libc::IP_PKTINFO;
-        std::ptr::write(
-            storage.bytes.as_mut_ptr().add(used).cast::<libc::cmsghdr>(),
-            malformed_header,
-        );
-    }
-    let malformed_len = used + cmsg_len(0);
-
-    assert!(parse_cmsg_control(&storage.bytes[..returned_control_len], 0).is_ok());
-    let error = parse_cmsg_control(&storage.bytes[..malformed_len], 0).unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-}
-
-#[test]
-fn udp_original_dst_cmsg_parser_fails_closed_on_truncation_or_ctrunc() {
-    let mut storage = AlignedTestCmsgStorage::new();
-    let mut used = 0;
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IP,
-        libc::IP_ORIGDSTADDR,
-        &[0; 1],
-    );
-    let error = parse_cmsg_control(&storage.bytes[..used], 0).unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-
-    let error = parse_cmsg_control(&storage.bytes[..used], libc::MSG_CTRUNC).unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-}
-
-#[test]
-fn udp_original_dst_cmsg_storage_has_space_for_ipv6_origdst_and_pktinfo() {
-    assert!(cmsg_control_capacity_is_sufficient());
-}
-
-#[test]
-fn udp_original_dst_unspecified_origdst_is_authoritative_and_fails_closed() {
-    let meta = UdpRecvMeta {
-        original_dst_cmsg: Some(addr("0.0.0.0:53")),
-        packet_dst_ip: Some("198.51.100.53".parse().unwrap()),
-        packet_ifindex: None,
-        local_addr: addr("192.0.2.20:5353"),
-    };
-
-    assert!(udp_original_dst(&meta, &dns_query_payload()).is_none());
-}
-
-fn ipv4_origdst(ip: [u8; 4], port: u16) -> libc::sockaddr_in {
-    let mut original: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    original.sin_family = libc::AF_INET as _;
-    original.sin_port = port.to_be();
-    original.sin_addr = libc::in_addr {
-        s_addr: u32::from(std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])).to_be(),
-    };
-    original
-}
-
-fn ipv4_pktinfo(ip: [u8; 4]) -> libc::in_pktinfo {
-    libc::in_pktinfo {
-        ipi_ifindex: 0,
-        ipi_spec_dst: libc::in_addr { s_addr: 0 },
-        ipi_addr: libc::in_addr {
-            s_addr: u32::from(std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])).to_be(),
-        },
-    }
-}
-
-#[test]
-fn udp_original_dst_cmsg_parser_requires_exact_recognized_payload_length() {
-    let original = ipv4_origdst([203, 0, 113, 10], 4444);
-    let mut oversized = bytes_of(&original).to_vec();
-    oversized.push(0xab);
-
-    let mut storage = AlignedTestCmsgStorage::new();
-    let mut used = 0;
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IP,
-        libc::IP_ORIGDSTADDR,
-        &oversized,
-    );
-    let error = parse_cmsg_control(&storage.bytes[..used], 0).unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-
-    let pktinfo = ipv4_pktinfo([198, 51, 100, 53]);
-    let mut oversized_pkt = bytes_of(&pktinfo).to_vec();
-    oversized_pkt.extend_from_slice(&[0xde, 0xad]);
-    let mut storage = AlignedTestCmsgStorage::new();
-    let mut used = 0;
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IP,
-        libc::IP_PKTINFO,
-        &oversized_pkt,
-    );
-    let error = parse_cmsg_control(&storage.bytes[..used], 0).unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-}
-
-#[test]
-fn udp_original_dst_cmsg_parser_rejects_duplicate_recognized_records() {
-    // Equal ORIGDST values are still ambiguous provenance.
-    let original = ipv4_origdst([203, 0, 113, 10], 4444);
-    let mut storage = AlignedTestCmsgStorage::new();
-    let mut used = 0;
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IP,
-        libc::IP_ORIGDSTADDR,
-        bytes_of(&original),
-    );
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IP,
-        libc::IP_ORIGDSTADDR,
-        bytes_of(&original),
-    );
-    let error = parse_cmsg_control(&storage.bytes[..used], 0).unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-
-    // Conflicting ORIGDST values fail closed.
-    let other = ipv4_origdst([198, 51, 100, 10], 53);
-    let mut storage = AlignedTestCmsgStorage::new();
-    let mut used = 0;
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IP,
-        libc::IP_ORIGDSTADDR,
-        bytes_of(&original),
-    );
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IP,
-        libc::IP_ORIGDSTADDR,
-        bytes_of(&other),
-    );
-    let error = parse_cmsg_control(&storage.bytes[..used], 0).unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-
-    // Unspecified followed by a valid ORIGDST is still a duplicate.
-    let unspecified = ipv4_origdst([0, 0, 0, 0], 53);
-    let mut storage = AlignedTestCmsgStorage::new();
-    let mut used = 0;
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IP,
-        libc::IP_ORIGDSTADDR,
-        bytes_of(&unspecified),
-    );
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IP,
-        libc::IP_ORIGDSTADDR,
-        bytes_of(&original),
-    );
-    let error = parse_cmsg_control(&storage.bytes[..used], 0).unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-
-    // Duplicate PKTINFO (equal values) is also rejected.
-    let pktinfo = ipv4_pktinfo([198, 51, 100, 53]);
-    let mut storage = AlignedTestCmsgStorage::new();
-    let mut used = 0;
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IP,
-        libc::IP_PKTINFO,
-        bytes_of(&pktinfo),
-    );
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IP,
-        libc::IP_PKTINFO,
-        bytes_of(&pktinfo),
-    );
-    let error = parse_cmsg_control(&storage.bytes[..used], 0).unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-}
-
-#[test]
-fn udp_original_dst_cmsg_parser_skips_unknown_cmsg_with_padding() {
-    let original = ipv4_origdst([203, 0, 113, 10], 4444);
-    let pktinfo = ipv4_pktinfo([198, 51, 100, 53]);
-    let mut storage = AlignedTestCmsgStorage::new();
-    let mut used = 0;
-    // Unknown record with a non-aligned-looking payload still consumes CMSG_SPACE.
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IP,
-        0x7fff, // not a recognized ORIGDST/PKTINFO type
-        &[0x11, 0x22, 0x33],
-    );
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IP,
-        libc::IP_ORIGDSTADDR,
-        bytes_of(&original),
-    );
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IP,
-        0x7ffe,
-        &[0xaa, 0xbb],
-    );
-    append_cmsg(
-        &mut storage,
-        &mut used,
-        libc::IPPROTO_IP,
-        libc::IP_PKTINFO,
-        bytes_of(&pktinfo),
-    );
-
-    let (original_dst, packet_dst_ip, packet_ifindex) =
-        parse_cmsg_control(&storage.bytes[..used], 0).unwrap();
-    assert_eq!(original_dst, Some(addr("203.0.113.10:4444")));
-    assert_eq!(
-        packet_dst_ip,
-        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-            198, 51, 100, 53
-        )))
-    );
-    assert_eq!(packet_ifindex, Some(0));
 }
 
 async fn ready_udp_endpoint(
@@ -1362,139 +806,13 @@ async fn udp_slow_path_only_forces_strict_dns_to_port_53() {
     assert!(matches!(ordinary_work, UdpSlowPathWork::Initialize(_)));
 }
 
-#[test]
-fn udp_original_dst_cmsg_takes_precedence_over_other_metadata() {
-    let meta = UdpRecvMeta {
-        original_dst_cmsg: Some(addr("203.0.113.10:4444")),
-        packet_dst_ip: Some("198.51.100.10".parse().unwrap()),
-        packet_ifindex: None,
-        local_addr: addr("192.0.2.10:5353"),
-    };
-
-    let destination = udp_original_dst(&meta, b"not a DNS query").unwrap();
-    assert_eq!(destination.address, addr("203.0.113.10:4444"));
-    assert!(destination.validated_dns.is_none());
-}
-
-#[test]
-fn udp_original_dst_uses_ipv4_pktinfo_for_exact_dns_query() {
-    let expected_ip = std::net::Ipv4Addr::new(198, 51, 100, 53);
-    let pktinfo = libc::in_pktinfo {
-        ipi_ifindex: 0,
-        ipi_spec_dst: libc::in_addr { s_addr: 0 },
-        ipi_addr: libc::in_addr {
-            s_addr: u32::from(expected_ip).to_be(),
-        },
-    };
-    let packet_dst_ip =
-        packet_dst_ip_from_cmsg(libc::IPPROTO_IP, libc::IP_PKTINFO, bytes_of(&pktinfo));
-    assert_eq!(packet_dst_ip, Some(std::net::IpAddr::V4(expected_ip)));
-
-    let meta = UdpRecvMeta {
-        original_dst_cmsg: None,
-        packet_dst_ip,
-        packet_ifindex: None,
-        local_addr: addr("0.0.0.0:15000"),
-    };
-    let destination = udp_original_dst(&meta, &dns_query_payload()).unwrap();
-    assert_eq!(destination.address, addr("198.51.100.53:53"));
-    assert!(destination.validated_dns.is_some());
-}
-
-#[test]
-fn udp_original_dst_uses_ipv6_pktinfo_for_exact_dns_query() {
-    let expected_ip: std::net::Ipv6Addr = "2001:db8::53".parse().unwrap();
-    let pktinfo = libc::in6_pktinfo {
-        ipi6_addr: libc::in6_addr {
-            s6_addr: expected_ip.octets(),
-        },
-        ipi6_ifindex: 0,
-    };
-    let packet_dst_ip =
-        packet_dst_ip_from_cmsg(libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, bytes_of(&pktinfo));
-    assert_eq!(packet_dst_ip, Some(std::net::IpAddr::V6(expected_ip)));
-
-    let meta = UdpRecvMeta {
-        original_dst_cmsg: None,
-        packet_dst_ip,
-        packet_ifindex: None,
-        local_addr: addr("[::]:15000"),
-    };
-    let destination = udp_original_dst(&meta, &dns_query_payload()).unwrap();
-    assert_eq!(destination.address, addr("[2001:db8::53]:53"));
-    assert!(destination.validated_dns.is_some());
-}
-
-#[test]
-fn udp_original_dst_uses_non_wildcard_local_fallback() {
-    let local_addr = addr("192.0.2.20:5353");
-    let meta = UdpRecvMeta {
-        original_dst_cmsg: None,
-        packet_dst_ip: None,
-        packet_ifindex: None,
-        local_addr,
-    };
-
-    let destination = udp_original_dst(&meta, b"opaque UDP").unwrap();
-    assert_eq!(destination.address, local_addr);
-    assert!(destination.validated_dns.is_none());
-    let dns_destination = udp_original_dst(&meta, &dns_query_payload()).unwrap();
-    assert_eq!(dns_destination.address, local_addr);
-    assert!(dns_destination.validated_dns.is_some());
-}
-
-#[test]
-fn udp_original_dst_fails_closed_for_wildcard_local_without_metadata() {
-    for local_addr in [addr("0.0.0.0:15000"), addr("[::]:15000")] {
-        let meta = UdpRecvMeta {
-            original_dst_cmsg: None,
-            packet_dst_ip: None,
-            packet_ifindex: None,
-            local_addr,
-        };
-        assert!(udp_original_dst(&meta, b"opaque UDP").is_none());
-    }
-}
-
-#[test]
-fn udp_original_dst_does_not_rewrite_non_exact_dns_payloads() {
-    let packet_meta = UdpRecvMeta {
-        original_dst_cmsg: None,
-        packet_dst_ip: Some("198.51.100.53".parse().unwrap()),
-        packet_ifindex: None,
-        local_addr: addr("0.0.0.0:15000"),
-    };
-    let local_fallback = addr("192.0.2.20:5353");
-    let fallback_meta = UdpRecvMeta {
-        original_dst_cmsg: None,
-        packet_dst_ip: None,
-        packet_ifindex: None,
-        local_addr: local_fallback,
-    };
-    let mut dns_response = dns_query_payload();
-    dns_response[2] |= 0x80;
-
-    for payload in [
-        dns_response.as_slice(),
-        b"short".as_slice(),
-        &[0u8; 20][..],
-        b"random non-53 UDP payload".as_slice(),
-    ] {
-        assert!(!is_exact_dns_query(payload));
-        assert!(udp_original_dst(&packet_meta, payload).is_none());
-        let destination = udp_original_dst(&fallback_meta, payload).unwrap();
-        assert_eq!(destination.address, local_fallback);
-        assert!(destination.validated_dns.is_none());
-    }
-}
-
 #[tokio::test]
 async fn udp_fast_path_miss_goes_slow() {
     let pool = UdpEndpointPool::new();
     let stats = StatsManager::new();
     let client = addr("10.0.0.1:12345");
     let dst = addr("203.0.113.1:443");
-    assert!(!udp_fast_path(&pool, &stats, b"hello", client, dst, None).await);
+    assert!(!udp_fast_path(&pool, &stats, b"hello", client, dst, None));
     let udp = stats.udp_snapshot();
     assert_eq!(udp.endpoint_misses, 1);
     assert_eq!(udp.endpoint_hits, 0);
@@ -1525,51 +843,39 @@ async fn udp_fast_path_hit_enqueues_for_the_endpoint_driver() {
     let mut buf = [0u8; 64];
     // First packet was delivered through the driver start barrier.
     echo.recv_from(&mut buf).await.unwrap();
-    assert!(
-        !udp_fast_path(
-            &pool,
-            &stats,
-            b"wrong-client",
-            addr("10.0.0.2:12345"),
-            dst,
-            None,
-        )
-        .await
-    );
-    assert!(
-        !udp_fast_path(
-            &pool,
-            &stats,
-            b"wrong-destination",
-            client,
-            addr("203.0.113.2:443"),
-            None,
-        )
-        .await
-    );
-    assert!(
-        !udp_fast_path(
-            &pool,
-            &stats,
-            b"wrong-client-port",
-            addr("10.0.0.1:12346"),
-            dst,
-            None,
-        )
-        .await
-    );
-    assert!(
-        !udp_fast_path(
-            &pool,
-            &stats,
-            b"wrong-destination-port",
-            client,
-            addr("203.0.113.1:444"),
-            None,
-        )
-        .await
-    );
-    assert!(udp_fast_path(&pool, &stats, b"hello", client, dst, None).await);
+    assert!(!udp_fast_path(
+        &pool,
+        &stats,
+        b"wrong-client",
+        addr("10.0.0.2:12345"),
+        dst,
+        None,
+    ));
+    assert!(!udp_fast_path(
+        &pool,
+        &stats,
+        b"wrong-destination",
+        client,
+        addr("203.0.113.2:443"),
+        None,
+    ));
+    assert!(!udp_fast_path(
+        &pool,
+        &stats,
+        b"wrong-client-port",
+        addr("10.0.0.1:12346"),
+        dst,
+        None,
+    ));
+    assert!(!udp_fast_path(
+        &pool,
+        &stats,
+        b"wrong-destination-port",
+        client,
+        addr("203.0.113.1:444"),
+        None,
+    ));
+    assert!(udp_fast_path(&pool, &stats, b"hello", client, dst, None));
     let udp = stats.udp_snapshot();
     assert_eq!(udp.endpoint_hits, 1);
     assert_eq!(udp.endpoint_misses, 4);
@@ -1606,7 +912,14 @@ async fn udp_fast_path_dns_goes_slow_even_with_endpoint() {
 
     let query = dns_query_payload();
     let validated = validate_exact_dns_query(&query).unwrap();
-    assert!(!udp_fast_path(&pool, &stats, &query, client, dst, Some(validated)).await);
+    assert!(!udp_fast_path(
+        &pool,
+        &stats,
+        &query,
+        client,
+        dst,
+        Some(validated)
+    ));
     let udp = stats.udp_snapshot();
     assert_eq!(udp.endpoint_hits, 0);
     assert_eq!(udp.endpoint_misses, 0);
@@ -1636,17 +949,14 @@ async fn udp_fast_path_dns_shaped_non53_forwards() {
     let mut buf = [0u8; 64];
     echo.recv_from(&mut buf).await.unwrap();
     let query = dns_query_payload();
-    assert!(
-        udp_fast_path(
-            &pool,
-            &stats,
-            &query,
-            client,
-            dst,
-            validate_exact_dns_query(&query),
-        )
-        .await
-    );
+    assert!(udp_fast_path(
+        &pool,
+        &stats,
+        &query,
+        client,
+        dst,
+        validate_exact_dns_query(&query),
+    ));
     assert_eq!(stats.udp_snapshot().endpoint_hits, 1);
 
     let (n, _) = tokio::time::timeout(Duration::from_secs(2), echo.recv_from(&mut buf))
@@ -1681,7 +991,7 @@ async fn udp_fast_path_non_dns_port53_forwards() {
     let mut buf = [0u8; 64];
     echo.recv_from(&mut buf).await.unwrap();
     let garbage = [0u8; 20]; // QR=0 but qdcount=0 — not a DNS query
-    assert!(udp_fast_path(&pool, &stats, &garbage, client, dst, None).await);
+    assert!(udp_fast_path(&pool, &stats, &garbage, client, dst, None));
     assert_eq!(stats.udp_snapshot().endpoint_hits, 1);
 
     let (n, _) = tokio::time::timeout(Duration::from_secs(2), echo.recv_from(&mut buf))
@@ -1700,74 +1010,63 @@ async fn udp_fast_path_drops_internal_and_broadcast() {
     // honk-internal subnets (v4 + v6), either direction.  The v6 check
     // must match the real dae0 addresses (fd00:686f:6e6b::1/2, see the
     // DAENS_* constants in the crate root).
-    assert!(
-        udp_fast_path(
-            &pool,
-            &stats,
-            b"hello",
-            client,
-            addr("169.254.0.11:8080"),
-            None,
-        )
-        .await
-    );
-    assert!(udp_fast_path(&pool, &stats, b"hello", addr("169.254.0.1:1234"), dst, None).await);
-    assert!(
-        udp_fast_path(
-            &pool,
-            &stats,
-            b"hello",
-            client,
-            addr("[fd00:686f:6e6b::1]:8080"),
-            None,
-        )
-        .await
-    );
-    assert!(
-        udp_fast_path(
-            &pool,
-            &stats,
-            b"hello",
-            addr("[fd00:686f:6e6b::2]:1234"),
-            dst,
-            None,
-        )
-        .await
-    );
+    assert!(udp_fast_path(
+        &pool,
+        &stats,
+        b"hello",
+        client,
+        addr("169.254.0.11:8080"),
+        None,
+    ));
+    assert!(udp_fast_path(
+        &pool,
+        &stats,
+        b"hello",
+        addr("169.254.0.1:1234"),
+        dst,
+        None
+    ));
+    assert!(udp_fast_path(
+        &pool,
+        &stats,
+        b"hello",
+        client,
+        addr("[fd00:686f:6e6b::1]:8080"),
+        None,
+    ));
+    assert!(udp_fast_path(
+        &pool,
+        &stats,
+        b"hello",
+        addr("[fd00:686f:6e6b::2]:1234"),
+        dst,
+        None,
+    ));
     // Broadcast / multicast destinations.
-    assert!(
-        udp_fast_path(
-            &pool,
-            &stats,
-            b"hello",
-            client,
-            addr("255.255.255.255:67"),
-            None,
-        )
-        .await
-    );
-    assert!(
-        udp_fast_path(
-            &pool,
-            &stats,
-            b"hello",
-            client,
-            addr("192.168.1.255:67"),
-            None,
-        )
-        .await
-    );
-    assert!(
-        udp_fast_path(
-            &pool,
-            &stats,
-            b"hello",
-            client,
-            addr("239.255.255.250:1900"),
-            None,
-        )
-        .await
-    );
+    assert!(udp_fast_path(
+        &pool,
+        &stats,
+        b"hello",
+        client,
+        addr("255.255.255.255:67"),
+        None,
+    ));
+    assert!(udp_fast_path(
+        &pool,
+        &stats,
+        b"hello",
+        client,
+        addr("192.168.1.255:67"),
+        None,
+    ));
+    assert!(udp_fast_path(
+        &pool,
+        &stats,
+        b"hello",
+        client,
+        addr("239.255.255.250:1900"),
+        None,
+    ));
     // Drops do not count as endpoint misses and nothing is pooled.
     assert!(pool.is_empty());
     let udp = stats.udp_snapshot();
@@ -2314,6 +1613,7 @@ async fn tcp_idle_relay_survives_conn_state_sweep() -> anyhow::Result<()> {
             mark: 0,
             ..Default::default()
         },
+        routing_generation: 0,
     };
 
     let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
@@ -2466,6 +1766,7 @@ async fn tcp_dns_write_error_is_returned_without_tcp_fallthrough() -> anyhow::Re
                 mark: DAE_BYPASS_MARK,
                 ..Default::default()
             },
+            routing_generation: 0,
             ..Default::default()
         },
     );
@@ -2548,6 +1849,7 @@ async fn tcp_ebpf_direct_offload_skips_dial_and_balances_stats() -> anyhow::Resu
                 mark: DAE_BYPASS_MARK,
                 ..Default::default()
             },
+            routing_generation: 0,
             ..Default::default()
         },
     );
@@ -3583,6 +2885,7 @@ async fn udp_dns_dispatch_registers_connection_guard_before_task_poll() {
         udp_concurrency_limit: Arc::clone(&plane.udp_concurrency_limit),
         dns_controller: Arc::clone(&plane.dns_controller),
         drain: Arc::clone(&drain),
+        requires_dns_route_mark: false,
         handle: plane.spawn_handle(),
     };
     let query = dns_query_payload();
@@ -3683,10 +2986,17 @@ async fn udp_dns_with_ready_endpoint_uses_controller_not_queue() {
     let validated = validate_exact_dns_query(&query).unwrap();
 
     // Fast path must force DNS-shaped traffic slow even with Ready present.
-    assert!(!udp_fast_path(&pool, &stats, &query, client, dst, Some(validated)).await);
+    assert!(!udp_fast_path(
+        &pool,
+        &stats,
+        &query,
+        client,
+        dst,
+        Some(validated)
+    ));
 
     let received_at = crate::control::udp_endpoint::queue_now().wrapping_sub(1_234);
-    match super::runtime::begin_udp_slow_path_at(
+    match super::udp_ingress::begin_udp_slow_path_at(
         &pool,
         &stats,
         &slow,
@@ -3694,6 +3004,8 @@ async fn udp_dns_with_ready_endpoint_uses_controller_not_queue() {
         client,
         dst,
         &query,
+        None,
+        pool.initialization_epoch(),
         received_at,
     ) {
         super::UdpSlowPathWork::Dns {
@@ -3743,7 +3055,14 @@ async fn udp_dns_with_initializing_endpoint_uses_controller_not_queue() {
     let slow = Arc::new(tokio::sync::Semaphore::new(1));
     let query = dns_query_payload();
     let validated = validate_exact_dns_query(&query).unwrap();
-    assert!(!udp_fast_path(&pool, &stats, &query, client, dst, Some(validated)).await);
+    assert!(!udp_fast_path(
+        &pool,
+        &stats,
+        &query,
+        client,
+        dst,
+        Some(validated)
+    ));
     match super::begin_udp_slow_path(
         &pool,
         &stats,
@@ -3791,7 +3110,14 @@ async fn udp_initializing_follower_requires_slow_permit_via_shared_helper() {
         _ => panic!("follower fixture must initialize"),
     };
 
-    assert!(!udp_fast_path(&pool, &stats, b"follower", client, dst, None).await);
+    assert!(!udp_fast_path(
+        &pool,
+        &stats,
+        b"follower",
+        client,
+        dst,
+        None
+    ));
     assert_eq!(stats.udp_snapshot().endpoint_misses, 1);
     assert_eq!(stats.udp_snapshot().queue_accepted, 0);
 

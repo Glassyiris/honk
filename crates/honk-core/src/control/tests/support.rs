@@ -15,11 +15,30 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 
+/// A minimal DNS query payload for "a.com" (A record).
+pub(in crate::control) fn dns_query_payload() -> Vec<u8> {
+    let mut q = vec![
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    q.extend_from_slice(&[
+        0x01, b'a', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01,
+    ]);
+    q
+}
+
+pub(in crate::control) fn bytes_of<T>(value: &T) -> &[u8] {
+    // SAFETY: the returned slice borrows `value` and has its exact layout size.
+    unsafe {
+        std::slice::from_raw_parts((value as *const T).cast::<u8>(), std::mem::size_of::<T>())
+    }
+}
 pub(in crate::control) type CapturedTcpTarget =
     Arc<std::sync::Mutex<Option<(SocketAddr, Option<String>)>>>;
 
 #[derive(Debug, Clone)]
 pub(in crate::control) enum UdpTestMode {
+    #[cfg(feature = "ebpf")]
+    TcpConnect,
     DialError,
     SendError,
     /// Records real application-send attempts made by the production
@@ -148,7 +167,7 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
 }
 
 #[derive(Debug)]
-struct UdpTestReplySocketFactory;
+pub(in crate::control) struct UdpTestReplySocketFactory;
 
 impl crate::control::udp_endpoint::UdpReplySocketFactory for UdpTestReplySocketFactory {
     fn create(&self, _original_dst: SocketAddr) -> std::io::Result<UdpSocket> {
@@ -208,6 +227,8 @@ impl honk_outbound::proxy::TcpOutbound for UdpTestHandler {
         _connect_timeout: Duration,
     ) -> anyhow::Result<honk_outbound::proxy::ProxyStream> {
         match &self.mode {
+            #[cfg(feature = "ebpf")]
+            UdpTestMode::TcpConnect => {}
             UdpTestMode::TcpHold { entered, release } => {
                 entered.notify_one();
                 release.notified().await;
@@ -472,7 +493,7 @@ pub(super) fn udp_test_handle_with_reply_factory(
     control_plane.spawn_handle()
 }
 
-pub(super) fn addr(s: &str) -> SocketAddr {
+pub(in crate::control) fn addr(s: &str) -> SocketAddr {
     s.parse().unwrap()
 }
 

@@ -490,6 +490,131 @@ fn udp_init_lease_reserves_one_initializing_incarnation_per_key() {
 }
 
 #[test]
+fn initializing_raw_dns_owner_and_epoch_must_match_before_enqueue() {
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = StatsManager::new();
+    let client = make_addr("10.0.0.20", 53000);
+    let dst = make_addr("203.0.113.53", 53);
+    let expected_epoch = pool.initialization_epoch();
+    let permit = || Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+    let lease = match pool.reserve_or_enqueue_at(
+        client,
+        dst,
+        b"first",
+        Some("alpha"),
+        expected_epoch,
+        permit(),
+        queue_now(),
+        &stats,
+    ) {
+        EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("raw DNS packet must reserve a cold initializer"),
+    };
+
+    assert!(matches!(
+        pool.reserve_or_enqueue_at(
+            client,
+            dst,
+            b"wrong group",
+            Some("beta"),
+            expected_epoch,
+            permit(),
+            queue_now(),
+            &stats,
+        ),
+        EndpointReservation::IdentityMismatch
+    ));
+    assert!(matches!(
+        pool.reserve_or_enqueue_at(
+            client,
+            dst,
+            b"ordinary",
+            None,
+            expected_epoch,
+            permit(),
+            queue_now(),
+            &stats,
+        ),
+        EndpointReservation::IdentityMismatch
+    ));
+    assert!(matches!(
+        pool.reserve_or_enqueue_at(
+            client,
+            dst,
+            b"same group",
+            Some("alpha"),
+            expected_epoch,
+            permit(),
+            queue_now(),
+            &stats,
+        ),
+        EndpointReservation::Enqueued
+    ));
+
+    pool.advance_initialization_epoch(false);
+    assert!(matches!(
+        pool.reserve_or_enqueue_at(
+            client,
+            dst,
+            b"crossed reload",
+            Some("alpha"),
+            expected_epoch,
+            permit(),
+            queue_now(),
+            &stats,
+        ),
+        EndpointReservation::QueueClosed
+    ));
+    drop(lease);
+}
+
+#[test]
+fn ready_raw_dns_owner_survives_epoch_but_rejects_other_owners() {
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = StatsManager::new();
+    let client = make_addr("10.0.0.21", 53000);
+    let dst = make_addr("203.0.113.53", 53);
+    let expected_epoch = pool.initialization_epoch();
+    let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+    let mut lease = match pool.reserve_or_enqueue_at(
+        client,
+        dst,
+        b"first",
+        Some("alpha"),
+        expected_epoch,
+        permit,
+        queue_now(),
+        &stats,
+    ) {
+        EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("raw DNS packet must reserve a cold initializer"),
+    };
+    let relay = make_addr("127.0.0.1", 9);
+    let endpoint = driver_test_endpoint(Arc::new(ScriptedPacketTransport::new(relay, [])), relay);
+    assert!(lease.commit_ready(endpoint));
+    pool.advance_initialization_epoch(false);
+
+    assert!(matches!(
+        pool.fast_path_enqueue_at(
+            client,
+            dst,
+            b"same group",
+            Some("alpha"),
+            queue_now(),
+            &stats,
+        ),
+        Some(EndpointReservation::Enqueued)
+    ));
+    for owner in [None, Some("beta")] {
+        assert!(matches!(
+            pool.fast_path_enqueue_at(client, dst, b"wrong owner", owner, queue_now(), &stats,),
+            Some(EndpointReservation::IdentityMismatch)
+        ));
+    }
+    drop(lease);
+}
+
+#[test]
 fn udp_init_lease_old_generation_cannot_remove_replacement() {
     let pool = Arc::new(UdpEndpointPool::new());
     let stats = StatsManager::new();

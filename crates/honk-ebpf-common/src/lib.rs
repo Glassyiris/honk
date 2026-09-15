@@ -38,6 +38,71 @@ pub const UDP_DECISION_GENERATION_SHIFT: u32 = 28;
 /// Generation tag carried in the remaining token bits.
 pub const UDP_DECISION_GENERATION_MASK: u32 = 0x3;
 
+/// Maximum non-wrapping compiled-policy generation carried by UDP DNS packets.
+// ponytail: restart at the 20-bit ceiling; add fenced rollover only if it is reached.
+pub const DNS_ROUTE_GENERATION_MAX: u64 = (1 << 20) - 1;
+/// Outbound/generation bits ignored by the daens TPROXY fwmark rule.
+pub const DNS_ROUTE_MARK_MASK: u32 = 0x37ff_feff;
+
+/// Per-packet UDP DNS routing authority carried across the dae0 link.
+/// Generation bits occupy 0..7, 9..15, 24..26 and 28..29.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpDnsRoute {
+    outbound: u8,
+    generation: u32,
+}
+
+impl UdpDnsRoute {
+    #[inline(always)]
+    pub const fn new(outbound: u8, generation: u64) -> Option<Self> {
+        if generation == 0
+            || generation > DNS_ROUTE_GENERATION_MAX
+            || !((outbound >= OutboundIndex::UserBase as u8
+                && outbound < OutboundIndex::MustRules as u8)
+                || outbound == OutboundIndex::ControlPlaneRouting as u8)
+        {
+            None
+        } else {
+            Some(Self {
+                outbound,
+                generation: generation as u32,
+            })
+        }
+    }
+
+    #[inline(always)]
+    pub const fn outbound(&self) -> u8 {
+        self.outbound
+    }
+
+    #[inline(always)]
+    pub const fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    #[inline(always)]
+    pub const fn to_mark(self) -> u32 {
+        let generation = self.generation;
+        TPROXY_MARK
+            | (self.outbound as u32) << 16
+            | generation & 0xff
+            | (generation & 0x7f00) << 1
+            | (generation & 0x3_8000) << 9
+            | (generation & 0xc_0000) << 10
+    }
+
+    #[inline(always)]
+    pub const fn from_mark(mark: u32) -> Option<Self> {
+        if mark & !DNS_ROUTE_MARK_MASK != TPROXY_MARK {
+            return None;
+        }
+        let outbound = (mark >> 16) as u8;
+        let generation =
+            mark & 0xff | (mark >> 1) & 0x7f00 | (mark >> 9) & 0x3_8000 | (mark >> 10) & 0xc_0000;
+        Self::new(outbound, generation as u64)
+    }
+}
+
 #[inline(always)]
 pub const fn udp_decision_token(generation: u32, sequence: u32) -> Option<u32> {
     if generation > UDP_DECISION_GENERATION_MASK
@@ -88,7 +153,7 @@ pub const MAX_OUTBOUNDS: u32 = 256;
 
 // Rust struct with a memory layout identical to the C struct.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct DaeParam {
     pub tproxy_port: u32,
     pub control_plane_pid: u32,
@@ -106,6 +171,30 @@ pub struct DaeParam {
     pub padding2: u16,
     pub dae_socket_mark: u32,
     pub local_ip: u32,
+}
+
+impl DaeParam {
+    pub const DEFAULT: Self = Self {
+        tproxy_port: 0,
+        control_plane_pid: 0,
+        dae0_ifindex: 0,
+        // A negative netns ID selects the packet's namespace, not relative ID zero.
+        dae_netns_id: u32::MAX,
+        wan_ifindex: 0,
+        dae0peer_mac: [0; 6],
+        padding_after_mac: [0; 2],
+        use_redirect_peer: 0,
+        has_bpf_get_current_task: 0,
+        padding2: 0,
+        dae_socket_mark: 0,
+        local_ip: 0,
+    };
+}
+
+impl Default for DaeParam {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 // Pod impls are only needed on the userspace side (honk-core).
@@ -507,6 +596,75 @@ mod nfqueue_abi_tests {
         assert!(!skb_mark_has_reserved_bits(0x3fff_ffff));
         assert!(skb_mark_has_reserved_bits(CLASSIFIED_MARK));
         assert!(skb_mark_has_reserved_bits(NFQUEUE_PENDING_MARK));
+    }
+}
+
+#[cfg(test)]
+mod udp_dns_route_tests {
+    use super::*;
+
+    #[test]
+    fn carrier_round_trips_every_bit_range() {
+        assert_eq!(DNS_ROUTE_MARK_MASK, 0x37ff_feff);
+        for (generation, carrier_bit) in [
+            (1, 1),
+            (1 << 7, 1 << 7),
+            (1 << 8, 1 << 9),
+            (1 << 14, 1 << 15),
+            (1 << 15, 1 << 24),
+            (1 << 17, 1 << 26),
+            (1 << 18, 1 << 28),
+            (1 << 19, 1 << 29),
+        ] {
+            assert_eq!(
+                UdpDnsRoute::new(2, generation).unwrap().to_mark(),
+                TPROXY_MARK | (2 << 16) | carrier_bit
+            );
+        }
+        for outbound in [
+            OutboundIndex::UserBase as u8,
+            OutboundIndex::MustRules as u8 - 1,
+            OutboundIndex::ControlPlaneRouting as u8,
+        ] {
+            for generation in [
+                1,
+                0xff,
+                0x100,
+                0x7fff,
+                0x8000,
+                0x3_ffff,
+                0x4_0000,
+                DNS_ROUTE_GENERATION_MAX,
+            ] {
+                let route = UdpDnsRoute::new(outbound, generation).unwrap();
+                assert_eq!(route.outbound(), outbound);
+                assert_eq!(route.generation(), generation as u32);
+                let mark = route.to_mark();
+                assert_eq!(mark & !DNS_ROUTE_MARK_MASK, TPROXY_MARK);
+                assert_eq!(UdpDnsRoute::from_mark(mark), Some(route));
+            }
+        }
+    }
+
+    #[test]
+    fn carrier_rejects_invalid_generation_owner_and_signature() {
+        assert_eq!(UdpDnsRoute::new(2, 0), None);
+        assert_eq!(UdpDnsRoute::new(2, DNS_ROUTE_GENERATION_MAX + 1), None);
+        for outbound in [0, 1, 0xfc, 0xfe, 0xff] {
+            assert_eq!(UdpDnsRoute::new(outbound, 1), None);
+        }
+
+        let mark = UdpDnsRoute::new(2, 1).unwrap().to_mark();
+        for invalid in [
+            mark & !TPROXY_MARK,
+            mark | DAE_BYPASS_MARK,
+            mark | CLASSIFIED_MARK,
+            mark | NFQUEUE_PENDING_MARK,
+        ] {
+            assert_eq!(UdpDnsRoute::from_mark(invalid), None);
+        }
+        assert_eq!(UdpDnsRoute::from_mark(TPROXY_MARK | (2 << 16)), None);
+        assert_eq!(UdpDnsRoute::from_mark(TPROXY_MARK | (0xfc << 16) | 1), None);
     }
 }
 

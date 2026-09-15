@@ -20,7 +20,7 @@ global {
 | --- | --- |
 | 经过 LAN TC 后语义尚不明确的新 LAN 转发 UDP | 启用且 ready 时，暂存唯一 token 并在 NFQUEUE 中持有原始 skb |
 | 主机发起的 WAN UDP | 保持规范 TPROXY 路径；主机 egress 不经过这个 `inet prerouting` hook |
-| UDP 端口 `53` | 保持专用 DNS fast path；绝不暂存 |
+| UDP 端口 `53` | 遵循[流量规则所有权](../reference/routing.md#出站目标与-must)；不进入普通 UDP conn-state，绝不暂存或分配 decision token |
 | 内部/特殊或反向流量 | 绝不暂存 |
 | `must` 或 `block` 路由结果 | 视为终态；绝不暂存 |
 | 路由时已经确定安全的 direct 结果 | 走内核 direct 路径；绝不暂存 |

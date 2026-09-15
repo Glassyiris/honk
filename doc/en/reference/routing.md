@@ -9,7 +9,7 @@ condition [&& condition ...] -> outbound[(must)]
 fallback: outbound
 ```
 
-- Rules are evaluated by ascending `priority`; lower values run first. Equal priorities retain stable source order. The dae parser assigns `priority` values `0, 1, ...` in source order, while generated local rules use priority `0` and are appended after user rules.
+- Rules are evaluated by ascending `priority`; lower values run first. Equal priorities retain stable source order. The dae parser assigns `priority` values `0, 1, ...` in source order. honk does not insert local-interface routing rules.
 - `default:` is an alias of `fallback:`. The fallback target applies when no rule finalizes; if omitted, it defaults to `direct`.
 - Comma-separated arguments inside a matcher are alternatives. Different populated condition groups must all match.
 - A parenthesized argument list may span physical lines within one source file. The statement continues through its closing `)` and `-> outbound`; an included file cannot finish another file's unfinished call.
@@ -49,7 +49,7 @@ Every positive field has a corresponding list under `RoutingCondition.not`; the 
 Ordinary domain pattern/suffix/keyword alternatives share one condition. When the
 same rule also populates `geosite`, that field remains a separate AND-ed condition.
 
-A `mac(...)` bypass does not exempt a client from DNS interception: on LAN interfaces the port-`53` fast path runs before the routing engine, so no routing rule can exempt DNS. Only a specifically bound non-honk local `:53` listener takes precedence over the fast path (see the DNS design doc).
+A matching `mac(...) -> direct(must)` can exempt a client from transparent DNS; ordinary `direct` does not. LAN/WAN TCP/UDP destination port `53` evaluates the normal ordered traffic policy once after local/special exclusions, not a separate must-only scan.
 
 ## Outbound targets and `must`
 
@@ -62,6 +62,19 @@ A `mac(...)` bypass does not exempt a client from DNS interception: on LAN inter
 Bare node names are not valid outbound targets: `Config::validate` rejects them. Wrap the node in a group (for example `filter: name('node')`) and reference the group instead. A group and a node also may not share a name. A configuration may define at most 250 top-level user groups; higher routing ordinals are reserved by the ABI.
 
 Appending `(must)` makes a matched result terminal and skips later domain rerouting. Clash `Global` and `Direct` modes never override a must result or `block`. It is not the historical internal `MustRules` opcode that continued scanning.
+
+For TCP/UDP destination port `53`, traffic-rule ownership is:
+
+| Ordered policy result | DNS ownership |
+| --- | --- |
+| `direct(must)` | Native Linux path, including the configured skb mark; no honk DNS processing. |
+| `block(must)` | Drop. |
+| `group(must)` | Carry the original TCP/UDP through the group's normal raw transport, bypassing `DnsController`, cache, hosts, request/response policy, and routing projection. |
+| Any non-`must` result, including ordinary `block` | Valid DNS queries enter `DnsController`; Clash Direct-mode offload cannot take this ownership. |
+
+Malformed non-`must` UDP53 payloads retain the generic UDP fallback rather than entering `DnsController`; the controller row is not a claim that every port-53 payload is DNS. Route-metadata admission follows the [TCP/UDP distinction](../design/control-plane.md#transparent-ingress).
+
+Actual bound local sockets take precedence before traffic routing, independently per transport; wildcard ownership also requires full FIB `NOT_FWDED`. See [DNS ownership](../design/dns.md#dns-ownership-state-machine).
 
 ## Geo assets
 
@@ -85,23 +98,25 @@ When a referenced geo asset cannot be found, the engine logs a warning naming th
 
 A geosite code may select an attribute with `category@attr`. Attribute keys compare case-insensitively. Everything after the first `@` is the selector, including any later `@`. An unknown category or a selector matching no entries logs a warning, expands to zero matchers, and never matches.
 
-## Automatic local rules
+## Explicit local rules
 
-At startup, reload, and interface-topology changes, honk refreshes one generated rule for every address currently assigned to configured LAN and WAN interfaces:
+honk no longer injects interface-address `direct(must)` rules at startup, SIGHUP/reload, or network events. There is no hidden kernel replacement allowlist: native `.dae` rule order stays user-authored. Local interface addresses remain observed for topology, ECS, and health events, not synthesized routing rules. If gateway management should stay native independently of proxy health, add an explicit rule at the intended position, for example:
 
 ```dae
-dip(<each LAN/WAN interface address>) -> direct(must)
+dip(192.168.50.1, fd00:50::1) && !dport(53) -> direct(must)
 ```
 
-Generated rules have priority `0` and are appended after user rules. Stable equal-priority ordering therefore lets an earlier user priority-0 match win; generated rules outrank only user rules with a higher priority. Addresses become host CIDRs (`/32` or `/128`). Missing interfaces and an unresolved `auto` interface are skipped. These rules keep gateway-local services such as SSH, the admin UI, and the Clash API reachable without making them depend on proxy health.
+This is optional user configuration, not an inserted rule. It leaves port `53` available for transparent DNS unless another terminal `must` result takes ownership. Existing local socket ownership remains a pre-routing exclusion, including the non-DNS TCP pure-SYN probe skip; there is no unconditional gateway-management reachability guarantee without explicit routing.
+
+A broad `dip(geoip: private) -> direct(must)` also bypasses LAN private DNS. If you want that DNS intercepted, explicitly add `&& !dport(53)` to the rule; honk does not rewrite it for you. Native `direct(must)` leaves the original source IP/port untouched by honk, subject to external firewall/NAT. For bypassed-answer projection and the difference from `asis`, see [DNS source boundaries](../design/dns.md#ingress-paths).
 
 ## Fail-closed behavior
 
-When health checking marks an outbound dead, the eBPF datapath normally drops new flows routed to it with `TC_ACT_SHOT`; it never silently leaks them through `direct`. A TCP group with exactly one unique leaf and no `final` instead keeps that same proxy dialable as a last resort, so real traffic can prove recovery. UDP and all-dead multi-leaf groups remain fail-closed, while a group containing a `direct`/`block` builtin never goes dead: the builtins are never marked dead, so the group-OR slot stays alive. Destination port `53` is exempt for both TCP and UDP so DNS can still reach the control plane.
+When health checking marks an outbound dead, the eBPF datapath normally drops new flows routed to it with `TC_ACT_SHOT`; it never silently leaks them through `direct`. A TCP group with exactly one unique leaf and no `final` instead keeps that same proxy dialable as a last resort, so real traffic can prove recovery. UDP and all-dead multi-leaf groups remain fail-closed, while a group containing a `direct`/`block` builtin never goes dead: the builtins are never marked dead, so the group-OR slot stays alive. Destination port `53` is exempt from LAN health drops for both TCP and UDP; this does not override a terminal user `must` result.
 
 For an outage-tolerant gateway:
 
-- Add `dip(geoip: private) -> direct(must)` so private-network traffic does not depend on proxy health.
+- Add an explicit private-network `direct(must)` rule where appropriate; decide whether it should also bypass private DNS, as described above.
 - Point `fallback:` at a [`fallback`-policy group](./groups.md) containing at least two nodes, not at one node.
 - Keep at least one DNS upstream on a direct path.
 
@@ -111,6 +126,7 @@ For an outage-tolerant gateway:
 routing {
     domain(suffix: doubleclick.net) -> block
     pname(NetworkManager, systemd-resolved) && l4proto(udp) && dport(53) -> direct(must)
+    # This also bypasses private DNS; add && !dport(53) if interception is wanted.
     dip(geoip: private) -> direct(must)
     sip(
         10.10.10.24/32,

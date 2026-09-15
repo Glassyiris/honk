@@ -380,8 +380,10 @@ pub trait EbpfBackend: Send + Sync {
         plan: &crate::control::routing_matcher::RoutingPushPlan,
         learned_domains: &[(LpmKey, DomainRouting)],
     ) -> anyhow::Result<()>;
+    /// Return the committed compiled-policy generation, not the active slot.
+    fn routing_policy_generation(&self) -> u64;
     /// Return the slot currently selected by the stable policy root.
-    fn active_routing_generation(&self) -> anyhow::Result<u32> {
+    fn active_routing_slot(&self) -> anyhow::Result<u32> {
         Ok(0)
     }
     /// OR a learned domain bitmap into the active generation-owned map.
@@ -485,8 +487,8 @@ pub trait EbpfBackend: Send + Sync {
     /// syscall (kernel 4.20+) and falls back to lookup+delete on kernels
     /// without it.  The fallback is not atomic: the eBPF datapath may
     /// re-insert the key between the two syscalls, in which case the fresh
-    /// entry is dropped and the flow is re-routed in userspace — harmless
-    /// for a best-effort handoff hint.
+    /// entry can be dropped. Ordinary flows may re-route in userspace;
+    /// transparent TCP DNS rejects a missing handoff instead.
     ///
     /// Takes `&self` so the per-connection hot path only needs a read lock
     /// on the backend: individual bpf() map operations are serialized by

@@ -40,7 +40,11 @@
 | TCP/IPv6 | `IP6T_SO_ORIGINAL_DST` | 透明 socket 的 `local_addr()` |
 | UDP | `IP_RECVORIGDSTADDR` / IPv6 original-destination cmsg | 下文所述的受约束 provenance 规则 |
 
-形成规范 tuple 后，用户态通过 `routing_handoff_take` 消费 `ROUTING_HANDOFF_MAP`。没有 handoff，或出站为 `ControlPlaneRouting` 时，回退到 `Router::route_with_must`。最终的 `must` 和 `block` 结果不能被 Clash mode 覆盖。
+形成规范 tuple 后，普通非 DNS 流通过 `routing_handoff_take` 消费 `ROUTING_HANDOFF_MAP`。没有 handoff，或出站为 `ControlPlaneRouting` 时，回退到 `Router::route_with_must`。最终的 `must` 和 `block` 结果不能被 Clash mode 覆盖。
+
+端口 53 的控制器与原始转发归属遵循[有序流量规则契约](../reference/routing.md#出站目标与-must)，包括畸形非 `must` UDP 的通用回退。
+
+真实透明 UDP/53 无论归控制器还是原始转发，都要求有效的逐报文 `SO_RCVMARK` / `SOL_SOCKET` `SO_MARK` 凭据及当前已提交路由代际，tuple handoff 不能替代。透明 TCP/53 必须有 SYN handoff；只有原始 `must` TCP 还要求当前路由代际，并在原始 I/O 前固定配置、语义分组与出站 runtime。非 `must` TCP 保留控制器查询准入，不执行该路由代际检查。缺失必需元数据或必需的代际检查失败时，在 I/O 前拒绝准入。物理兼容性见[handoff ABI 与 UDP 携带位](./datapath.md#map-清单)。
 
 ## 嗅探与流初始化
 
@@ -50,7 +54,7 @@ UDP 域名发现解密 QUIC v1/v2 Initial packet，重组 CRYPTO fragment，并�
 
 `dial_mode: domain` 对嗅探到的 TCP 或 QUIC 名称执行 DNS reality check。目的地址同族答案精确匹配时接受；只有另一地址族答案时，为兼容双栈仍保留该名称。同族不匹配、查询失败或超时时丢弃嗅探名称并按 IP 继续。
 
-`connection.rs` 是每流 route/sniff/mode/selection 的规范边界。Socket UDP 入口与 NFQUEUE 持有的 payload 都在同一个 `UdpEndpointPool` 中预留相同的 `UdpInitLease`；NFQUEUE 没有第二套 Router、dialer 或 packet replay 路径。暂存流在 token 校验的终态转换前计算唯一最终出站与 mark。
+`connection/` 是每流 route/sniff/mode/selection 的规范边界。Socket UDP 入口与 NFQUEUE 持有的 payload 都在同一个 `UdpEndpointPool` 中预留相同的 `UdpInitLease`；NFQUEUE 没有第二套 Router、dialer 或 packet replay 路径。暂存流在 token 校验的终态转换前计算唯一最终出站与 mark。
 
 `build_tuples_key` 必须用 `mem::zeroed()` 初始化 `TuplesKey`。这个 `#[repr(C)]` key 在 40 字节布局中只有 37 字节字段，内核会散列包括三个 padding 字节在内的全部 40 字节。因此逐字段初始化可能产生用户态无法可靠查询或删除的 key。
 
@@ -58,12 +62,16 @@ UDP 域名发现解密 QUIC v1/v2 Initial packet，重组 CRYPTO fragment，并�
 
 ### 目的地址 provenance
 
-UDP 准入采用 fail-closed，并在 endpoint 预留前运行：
+`udp_ingress.rs` 负责目的地址校验和有界准入，`sockets.rs` 负责 syscall/cmsg 解码。真实透明监听必须具有权威 ORIGDST；普通/mock 监听保留以下回退规则。所有路径都在 endpoint 预留前拒绝无效元数据：
 
 1. 存在、有效且已指定的 ORIGDST cmsg 具有权威性。未指定的 ORIGDST 无效，不能回退到其他来源。
 2. 没有 ORIGDST 时，只有精确 DNS query 加上已指定的 `PKTINFO` 目的地址才能形成 `IP:53`。
 3. 其他情况只有非 wildcard listener bind 可以提供目的地址。
 4. 缺失、畸形、重复、截断或未指定的元数据，会在 slow-path 预留或 payload 保留前被丢弃。
+
+UDP 入口在任何可能等待的校验前捕获 initializer epoch。原始 UDP/53 随后按 Config → backend 读锁顺序，在一致快照下验证策略代际并固定语义分组名，再通过既有 epoch gate 预留和入队。同一 tuple 的不兼容普通/原始/其他分组报文被拒绝，而不是借用错误的 transport。非 `must` 有效 DNS 保留独立查询预算；UDP/53 不进入普通 UDP conn-state 或 NFQUEUE staging，也不分配 decision token。
+
+归控制器所有的畸形 UDP/53 可保留兼容的 controller handoff 事实用于通用路由，但会丢弃不兼容的终局原始 handoff 及其过期报文事实。
 
 ### Transport 与事务
 
@@ -80,13 +88,13 @@ Endpoint 创建是事务性的：
 
 透明 UDP 的 transport preparation 在路由与选择完成后开始，直到最终 transport 的协议状态 commit 完成才结束。权威路径与冷启动 URLTest 共用一个绝对 `max(10s, 4 × connect_timeout)` deadline，覆盖代理主机名解析、物理拨号准入、控制协商、stagger／满容量等待和 commit。scheduler 到期后不再启动后续候选，并在 initializer 恢复前中止和排空所有已启动任务。嗅探／路由位于该边界之前；reply socket 创建、driver ready 与报文发送位于其后，分别受已有事务或 I/O 上限约束。
 
-每个透明 socket 在一次 readiness 轮次中通过 `recvmmsg` 最多接收八个 datagram。每个 slot 独立保留 ORIGDST 与 PKTINFO 元数据，packet 保持内核顺序，元数据异常也只丢弃对应 slot。队列排空后，下一次唤醒先使用一个 slot；若读取满载则立即恢复八 slot batch，从而避免稀疏流量的准备开销。该上限把调度公平性和 payload 存储限制在每 socket 512 KiB；当前每地址族四个 socket、双栈全部启用时共 4 MiB。Listener 循环只做校验、预留和入队；它从不等待 `PacketTransport` I/O。Endpoint driver 持有全部 transport 调用。首次与稳态发送各有五秒超时。超时或错误具有歧义，因为 transport 可能已接受 packet 的一部分，因此 driver 不会重放该 datagram，也不会继续后续 follower。
+每个透明 socket 在一次 readiness 轮次中通过 `recvmmsg` 最多接收八个 datagram。每个 slot 独立保留 ORIGDST、PKTINFO 与逐报文 `SO_MARK` 元数据，packet 保持内核顺序，元数据异常也只丢弃对应 slot。队列排空后，下一次唤醒先使用一个 slot；若读取满载则立即恢复八 slot batch，从而避免稀疏流量的准备开销。该上限把调度公平性和 payload 存储限制在每 socket 512 KiB；当前每地址族四个 socket、双栈全部启用时共 4 MiB。Listener 循环只做校验、预留和入队；它从不等待 `PacketTransport` I/O。Endpoint driver 持有全部 transport 调用。首次与稳态发送各有五秒超时。超时或错误具有歧义，因为 transport 可能已接受 packet 的一部分，因此 driver 不会重放该 datagram，也不会继续后续 follower。
 
 SOCKS5 UDP 在 endpoint 整个生命周期内保持 TCP `UDP ASSOCIATE` 控制流，并把控制流 EOF 或意外控制数据视为 endpoint 失败。其 connected UDP socket 向服务器物理 `BND.ADDR` relay 发送；若回复为域名则解析，若地址未指定则替换为控制连接对端 IP。`PacketTransport::relay_addr()` 和接收来源元数据暴露的是逻辑目标，因此 endpoint 首回复校验不会把 SOCKS relay 与远端 peer 混淆。
 
 回复使用在 `daens` 内创建、透明绑定到 packet 原始目的地址的 anyfrom socket。通过 transport peer 校验后，按域名拨号的 endpoint 始终使用原始 IP、端口和地址族回复，即使远端 DNS 选择了其他地址。按 IP 拨号的 endpoint 保留其 original-destination socket，并按 endpoint 缓存已接受的其他 full-cone 来源。端口 53 回复另外共享每地址族一个透明 socket，并用 `IP_PKTINFO` 或 `IPV6_PKTINFO` 选择精确源 IP。从 TPROXY listener 回复会使用内部 `dae0` 源地址，因此不可用。
 
-Reload 在等待前推进 cancellation epoch。Initializer 捕获该 epoch 和 incarnation generation；若 cancellation 先于 `commit_ready` 线性化，则阻止发布。Reload 排空 `Initializing` lease 及其保留资源，但保留 `Ready` endpoint。每次 retirement 和 acknowledgement 都指定 token 与 generation，因此延迟工作不能删除替代 mapping。
+Reload 在等待前推进 cancellation epoch。Initializer 在 await 前捕获该 epoch 和 incarnation generation；若 cancellation 先于 `commit_ready` 线性化，则阻止发布。Reload 取消并排空 `Initializing` lease 及其保留资源，`Ready` endpoint 仍遵循既有生命周期。已有原始 UDP `Ready` 会话在语义分组名相同且符合该生命周期时可以保留，但 `Initializing` 不能跨 reload 存活。每次 retirement 和 acknowledgement 都指定 token 与 generation，因此延迟工作不能删除替代 mapping。
 
 ## Queue 与描述符预算
 
@@ -144,6 +152,8 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 提交前失败保留活动代码与事实，不再重放旧路由计划。Fence 后发布被拒绝时，控制器恢复组连通性并重开旧 generation；连通性恢复失败则继续拒绝准入。Root 切换成功后新 generation 已提交，之后若 NFQUEUE 重开失败，保留已发布的新 generation 并继续 fence 准入，直到后续成功 reload 修复。
 
 `DnsServiceProvider` 是一致的 DNS generation pointer。请求 lease 保留其 generation 的 forwarder、projection、transport pool 和出站运行时，直到退役。出站 registry 同样按 generation 持有：未变化的 node runtime 只在提交点转移，旧 registry 把这些 runtime 标记为已移出，然后开始优雅退役。现有 stream 与 `Ready` UDP endpoint 保持引用，同时旧 reusable pool 停止接受新工作并排空。
+
+编译路由发布有独立于 DNS runtime generation 的[进程生命周期上限](./routing.md#同步槽与原子发布)。发布后，排队中的 UDP53 与原始 `must` TCP53 元数据可能按上述准入规则被拒绝；已准入 DNS 查询仍按固定代际排空。
 
 `DrainTracker` 是进程全局的 accepted-flow gate。Reload 和关闭在 drain 前设置 reject-new；关闭最多等待五秒，然后带着剩余计数继续拆除。
 

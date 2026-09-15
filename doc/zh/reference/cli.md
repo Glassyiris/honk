@@ -23,6 +23,8 @@ honk-core [OPTIONS] [COMMAND]
 
 两个二进制都提供 `-h`/`--help` 和 `-v`/`--version`。
 
+请使用匹配版本的 core、`honk-tool` 和 BPF 对象；不兼容对象及 pinned handoff 布局按[数据路径 ABI 契约](../design/datapath.md#map-清单)拒绝。
+
 CLI 与 Clash API 共用构建时版本号：发布构建使用 GitHub tag 名；本地 Git 构建使用 `git describe --tags --always --match 'v*'`（tag，或最近 tag 加提交距离与哈希）。没有可用 Git 元数据时使用 Cargo 包版本。运行时不依赖 Git。
 
 ### 日志级别优先级
@@ -46,6 +48,8 @@ CLI 与 Clash API 共用构建时版本号：发布构建使用 GitHub tag 名�
 | `mode <rule\|global\|direct>` | 加载 `--config`，将参数字符串赋给 `experimental.clash_api.default_mode`，并在重写结构化格式文件前完成校验。`.dae` 文件会被拒绝且保持不变，因为 writer 无法保留 dae 语法、注释或 include；请直接编辑这些源文件，或使用 `.toml`、`.yaml`、`.json`。 | 仅修改文件；不联系运行中的引擎，也不更改 dial mode。接受的字符串不同于正常 dial mode 值 `ip`、`domain`、`domain+`、`domain++`。 |
 | `proxy <group> <node>` | 检查组名和节点名各自存在，然后打印请求的选择；不检查节点是否属于该组。 | 不写入任何内容，也不联系运行中的引擎。 |
 | `delay <node> [-u\|--url HOST:PORT]` | 建立一次原始 TCP 连接，超时五秒，并打印耗时毫秒数。未给 `--url` 时使用节点服务端地址。 | 不经过代理，不是 HTTP URLTest，也不联系运行中的引擎。 |
+
+[编译路由发布计数器](../design/routing.md#同步槽与原子发布)耗尽后需重启；它与普通 SIGHUP 及 DNS runtime 重载分开计数。
 
 真实数据面进程在其生命周期内持有该锁。`reload` 会先确认文件仍被锁定，再信任其中的 PID；`kill(2)` 成功送达并不表示候选配置通过校验或需重启字段检查。
 
@@ -172,6 +176,8 @@ honk-tool bpf stats [--pin-root PATH]
 | `routing-handoff` | Tuple 与待处理的 eBPF 到控制面路由结果。 |
 
 实现通过原始 `bpf(2)` 操作打开 pin；不使用 aya、不加载程序，也不挂载 hook。`stats` 打印 conn-state 与辅助 map 的溢出/插入失败计数、`CONN_STATE_OCCUPANCY` 插入/删除水位计，以及非零的每出站包/字节计数。读取 map 通常需要 root 或合适的 BPF capability。
+
+`routing-handoff` 在读取前检查[handoff ABI](../design/datapath.md#map-清单)；请将工具与引擎/对象一起升级。
 
 `stats` 要求 `/sys/devices/system/cpu/possible` 可读且为内核的真实导出文件。每 CPU 缓冲区按该掩码中的 CPU 数量分配，不采用 present 或 online CPU 数量。`CONN_STATE_OCCUPANCY` 和 `OUTBOUND_STATS` 必须为每 CPU 数组，键均为 4 字节，值分别为 8 字节和 32 字节。CPU 列表不可读、格式无效或 map 元数据不兼容时，命令在每 CPU 查找前报错，不回退到猜测的 CPU 数量。
 

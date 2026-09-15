@@ -20,7 +20,6 @@ use std::ptr;
 
 const TC_ACT_OK: u32 = 0;
 const TC_ACT_SHOT: u32 = 2;
-const TC_ACT_PIPE: u32 = 3;
 const TC_ACT_REDIRECT: u32 = 7;
 const IPPROTO_ICMPV6: u8 = 58;
 const IPPROTO_TCP: u8 = 6;
@@ -686,33 +685,6 @@ fn cached_route_health_and_pending_marks() {
             assert_eq!(run.mark, expected_mark, "cached route row {index}");
         }
     }
-
-    let dns_tcp = tcp_packet([10, 0, 0, 7], [198, 51, 100, 53], 41050, 53, 0x02, 0);
-    assert_eq!(
-        fixture
-            .run("lan_ingress_l2", &dns_tcp, SkbInput::default())
-            .return_value,
-        TC_ACT_REDIRECT
-    );
-    let before_dns = hash_count::<TuplesKey, ConnState>(&fixture.bpf, "CONN_STATE_MAP");
-    let dns_udp = udp_packet([10, 0, 0, 8], [198, 51, 100, 53], 41051, 53, 3);
-    assert_eq!(
-        fixture
-            .run("lan_ingress_l2", &dns_udp, SkbInput::default())
-            .return_value,
-        TC_ACT_REDIRECT
-    );
-    let wan_dns = udp_packet([198, 51, 100, 53], [10, 0, 0, 9], 53, 41052, 3);
-    assert_eq!(
-        fixture
-            .run("wan_ingress_l2", &wan_dns, SkbInput::default())
-            .return_value,
-        TC_ACT_PIPE
-    );
-    assert_eq!(
-        hash_count::<TuplesKey, ConnState>(&fixture.bpf, "CONN_STATE_MAP"),
-        before_dns
-    );
 }
 
 #[test]

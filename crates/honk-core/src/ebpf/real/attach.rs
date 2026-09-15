@@ -124,6 +124,7 @@ impl RealEbpfBackend {
                 .override_global("MM_ARG_START_OFFSET", &offsets.mm_arg_start, true);
         }
         let mut bpf = loader.load(obj)?;
+        validate_routing_handoff_layout(&bpf)?;
         syscall::validate_loaded_udp_decision_sequence(&bpf)?;
         let mut pinned_maps = Vec::new();
         for (name, map) in bpf.maps() {

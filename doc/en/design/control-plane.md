@@ -60,7 +60,11 @@ Original destinations are recovered as follows:
 | TCP/IPv6 | `IP6T_SO_ORIGINAL_DST` | Transparent socket `local_addr()` |
 | UDP | `IP_RECVORIGDSTADDR` / IPv6 original-destination cmsg | Guarded provenance rules described below |
 
-After forming the canonical tuple, userspace consumes `ROUTING_HANDOFF_MAP` with `routing_handoff_take`. A missing handoff, or an outbound of `ControlPlaneRouting`, falls back to `Router::route_with_must`. Final `must` and `block` results cannot be overridden by Clash mode.
+For ordinary flows, userspace forms the canonical tuple and consumes `ROUTING_HANDOFF_MAP` with `routing_handoff_take`. A missing handoff, or an outbound of `ControlPlaneRouting`, falls back to `Router::route_with_must`. Final `must` and `block` results cannot be overridden by Clash mode. This fallback is not the transparent DNS ownership boundary.
+
+Port-53 controller versus raw-transport ownership follows the [ordered traffic-rule contract](../reference/routing.md#outbound-targets-and-must), including the malformed non-`must` UDP fallback.
+
+Real transparent UDP53 requires valid per-packet `SO_RCVMARK` / `SOL_SOCKET` `SO_MARK` provenance and the current committed routing generation for both controller and raw ownership; a tuple handoff cannot substitute. Transparent TCP53 requires a SYN handoff. Only raw-`must` TCP additionally requires the current routing generation and pins the config, semantic group, and outbound runtime before raw I/O; non-`must` TCP retains controller query admission without that generation check. Missing required metadata or a failed required generation check rejects admission before I/O. Physical compatibility belongs to the [handoff ABI and UDP carrier](./datapath.md#map-inventory).
 
 ## Sniffing and flow initialization
 
@@ -72,7 +76,7 @@ UDP domain discovery decrypts QUIC v1/v2 Initial packets, reassembles CRYPTO fra
 
 The sniffers feed the canonical initializer and may resolve a staged decision, but they do not own verdicts or a separate offload path.
 
-`connection.rs` is the canonical per-flow route/sniff/mode/selection boundary. Socket UDP ingress and NFQUEUE-owned payloads both reserve the same `UdpInitLease` in the same `UdpEndpointPool`; NFQUEUE has no second router, dialer, cloned packet, replay, or deliberate retransmission path. A staged flow computes one final outbound and mark before its token-checked terminal transition.
+`connection/` is the canonical per-flow route/sniff/mode/selection boundary. Socket UDP ingress and NFQUEUE-owned payloads both reserve the same `UdpInitLease` in the same `UdpEndpointPool`; NFQUEUE has no second router, dialer, cloned packet, replay, or deliberate retransmission path. A staged flow computes one final outbound and mark before its token-checked terminal transition.
 
 `build_tuples_key` must initialize `TuplesKey` with `mem::zeroed()`. The `#[repr(C)]` key has 37 field bytes in a 40-byte layout, and the kernel hashes all 40 bytes, including its three padding bytes. Field-wise initialization can therefore create keys that userspace cannot look up or delete reliably.
 
@@ -84,12 +88,16 @@ An authoritative single-candidate TCP failure is retried exactly once, only if r
 
 ### Destination provenance
 
-UDP admission is fail-closed and runs before endpoint reservation:
+`udp_ingress.rs` owns destination validation and bounded admission; `sockets.rs` owns syscall/cmsg decoding. Real transparent listeners require authoritative ORIGDST. Plain/mock listeners retain the following fallback rules; every path rejects invalid metadata before endpoint reservation:
 
 1. A present, valid, specified ORIGDST cmsg is authoritative. An unspecified ORIGDST is invalid and cannot fall through to another source.
 2. Without ORIGDST, an exact DNS query plus a specified `PKTINFO` destination forms `IP:53`.
 3. Otherwise, only a non-wildcard listener bind can supply the destination.
 4. Missing, malformed, duplicate, truncated, or unspecified metadata is dropped before slow-path reservation or payload retention.
+
+UDP ingress captures the initializer epoch before any awaited validation. Raw UDP53 admission then holds the `Config` read lock followed by the backend read lock to validate the committed routing generation and pin the semantic group. Reservation and enqueue remain under the existing epoch gates. An incompatible ordinary/raw/group owner on the same tuple is rejected, not silently borrowed. Valid non-`must` DNS instead enters its separate query budgets. UDP53 never allocates ordinary conn-state or NFQUEUE decision tokens.
+
+Malformed controller-owned UDP53 retains compatible controller handoff facts for generic routing, but discards an incompatible terminal raw handoff together with its stale packet facts.
 
 ### Transport and transaction
 
@@ -113,6 +121,8 @@ SOCKS5 UDP keeps its TCP `UDP ASSOCIATE` control stream alive for the endpoint l
 Replies use anyfrom sockets created inside `daens` and bound transparently to the packet's original destination. After transport peer validation, domain-target endpoints always reply from that original IP, port, and address family, even when remote DNS selects a different address. IP-target endpoints retain their original-destination socket and cache accepted alternate full-cone sources per endpoint. Port-53 replies additionally share a per-family transparent socket and choose the exact source IP with `IP_PKTINFO` or `IPV6_PKTINFO`. Replying from the TPROXY listener would use the internal `dae0` source and is not valid.
 
 Reload advances a cancellation epoch before waiting. Initializers capture that epoch and an incarnation generation; a cancellation that linearizes before `commit_ready` prevents publication. Reload drains `Initializing` leases and their retained resources but preserves `Ready` endpoints. Every retirement, including its `Retiring` tombstone and acknowledgement, names the token and generation, so delayed work cannot remove a replacement mapping.
+
+A compatible same-name raw-group `Ready` session may persist across reload. This does not extend initializer lifetime: `Initializing` never survives reload, and stale queued route metadata still fails admission after a compiled-policy publication.
 
 For NFQUEUE ingress, client/destination-keyed `PendingUdpVerdicts` carries only token, endpoint generation, phase, FIFO verdict guards, and final direct mark. Endpoint admission takes owned `Bytes` for the one retained NFQUEUE payload allocation. Direct/block completion removes the initializer as a kernel handoff; proxy completion transfers its token/generation into `Ready`. The [NFQUEUE protocol](./nfqueue.md#terminal-transitions) defines ordered terminal transitions, the absolute deadline, and fatal failure handling.
 
@@ -176,6 +186,8 @@ SIGHUP uses an attempt-local diagnostic list. Load and operator-validation warni
 Pre-commit failures leave the active code and facts intact. After a fenced publication rejection, the controller restores group connectivity and reopens the old generation. A failed connectivity restoration keeps admission rejected. Once the root has switched, the new generation is committed; a subsequent NFQUEUE-reopen failure keeps that generation published but admission fenced until a later successful reload repairs it.
 
 Candidate construction reuses the immutable userspace `Router` and compiled DNS router only when their routing inputs and content fingerprints are unchanged. Hosts and referenced geo assets are fingerprinted before parsing; changed content forces a replacement. Native routing publication is skipped only when the complete `RoutingPushPlan` and learned-domain projection bytes are unchanged; datapath health still forces recovery publication.
+
+Compiled-routing publication has a [process-lifetime ceiling](./routing.md#synchronous-slots-and-atomic-publication), separate from DNS runtime generations. Publication can reject queued UDP53 and raw-`must` TCP53 metadata under the admission rules above; already admitted DNS queries retain their generation leases.
 
 `DnsServiceProvider` is the coherent DNS-generation pointer. A request lease retains its generation's forwarder, projection, transport pools, and outbound runtime until retirement. The outbound registry is also generation-owned: unchanged node runtimes transfer only at the commit point, the old registry marks those runtimes as moved, and then begins graceful retirement. Existing streams and `Ready` UDP endpoints keep their references while old reusable pools stop accepting new work and drain.
 

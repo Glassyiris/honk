@@ -20,6 +20,7 @@ use core::ffi::c_long;
 use core::mem;
 use honk_ebpf_common::{
     IpVersionType, L4ProtoType, RedirectEntry, RedirectTuple, TASK_COMM_LEN, TPROXY_MARK,
+    UdpDnsRoute,
     conn::BpfStatsKey,
     redirect_need::{PIDName, RoutingHandoffEntry, Tuples, TuplesKey},
 };
@@ -362,6 +363,7 @@ fn do_tproxy_wan_egress_tcp(
     let outbound: u8;
     let must: bool;
     let mark: u32;
+    let routing_generation: u64;
 
     let mut handoff_pname: Option<&[u8; TASK_COMM_LEN]> = None;
     let mut handoff_pid: u32 = 0;
@@ -405,10 +407,11 @@ fn do_tproxy_wan_egress_tcp(
             ip_version,
             true,
         );
-        let decision = match crate::route::route(&mut pkt.routing_input, pname) {
-            Ok(decision) => decision,
+        let (decision, generation) = match crate::route::route(&mut pkt.routing_input, pname) {
+            Ok(result) => result,
             Err(_) => return Err(TC_ACT_SHOT),
         };
+        routing_generation = generation;
 
         outbound =
             if crate::maps::datapath_flags() & honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_ALL != 0 {
@@ -450,6 +453,7 @@ fn do_tproxy_wan_egress_tcp(
             return Err(TC_ACT_SHOT);
         }
     } else {
+        routing_generation = 0;
         let tcp_conn = mark_tcp_seen(
             &tuples.five,
             tcph,
@@ -483,7 +487,8 @@ fn do_tproxy_wan_egress_tcp(
         }
     }
 
-    if outbound == OUTBOUND_DIRECT && mark == 0 {
+    let dns = tuples.five.dst_port == 53;
+    if outbound == OUTBOUND_DIRECT && ((!dns && mark == 0) || (dns && must)) {
         ctx.set_mark(mark);
         return Err(TC_ACT_OK);
     } else if outbound == OUTBOUND_BLOCK {
@@ -505,10 +510,10 @@ fn do_tproxy_wan_egress_tcp(
         0,
     );
     if prepare_result != 0 {
-        if prepare_result == TOKEN_IDENTITY_MISMATCH {
+        if dns || prepare_result == TOKEN_IDENTITY_MISMATCH {
             return Err(TC_ACT_SHOT);
         }
-        // Preserve the existing direct-pass fallback for map write failures.
+        // Preserve the existing non-DNS direct-pass fallback for map write failures.
         return Err(TC_ACT_OK);
     }
 
@@ -516,6 +521,7 @@ fn do_tproxy_wan_egress_tcp(
     unsafe {
         (*ctx.skb.skb).cb[0] = TPROXY_MARK;
         (*ctx.skb.skb).cb[1] = tcp_listener_l4proto(tcph) as u32;
+        (*ctx.skb.skb).cb[2] = 0;
     }
 
     // Write routing handoff entry for the control plane.  Only the SYN that
@@ -525,6 +531,7 @@ fn do_tproxy_wan_egress_tcp(
     if tcp_state_syn {
         let mut handoff: RoutingHandoffEntry = unsafe { mem::zeroed() };
         handoff.last_seen_ns = unsafe { bpf_ktime_get_ns() };
+        handoff.routing_generation = routing_generation;
         handoff.result.mark = mark;
         handoff.result.must = must as u8;
         handoff.result.outbound = outbound;
@@ -540,6 +547,9 @@ fn do_tproxy_wan_egress_tcp(
             .is_err()
         {
             increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
+            if dns {
+                return Err(TC_ACT_SHOT);
+            }
         }
     }
 
@@ -561,12 +571,24 @@ fn fast_path_decision(
     handoff_pname: Option<&[u8; TASK_COMM_LEN]>,
     handoff_pid: u32,
     decision_token: u32,
+    routing_generation: u64,
 ) -> Verdict {
-    if outbound == OUTBOUND_DIRECT && mark == 0 {
+    let dns = tuples.five.dst_port == 53;
+    if outbound == OUTBOUND_DIRECT && ((!dns && mark == 0) || (dns && must)) {
+        ctx.set_mark(mark);
         return Err(TC_ACT_OK);
     } else if outbound == OUTBOUND_BLOCK {
         return Err(TC_ACT_SHOT);
     }
+
+    let dns_route_mark = if dns {
+        let Some(route) = UdpDnsRoute::new(outbound, routing_generation) else {
+            return Err(TC_ACT_SHOT);
+        };
+        route.to_mark()
+    } else {
+        0
+    };
 
     if !wan_outbound_is_alive(ctx, outbound, IPPROTO_UDP, tuples.five.dst_port) {
         return Err(TC_ACT_SHOT);
@@ -583,7 +605,7 @@ fn fast_path_decision(
         decision_token,
     );
     if prepare_result != 0 {
-        if prepare_result == TOKEN_IDENTITY_MISMATCH || decision_token != 0 {
+        if dns || prepare_result == TOKEN_IDENTITY_MISMATCH || decision_token != 0 {
             return Err(TC_ACT_SHOT);
         }
         return Err(TC_ACT_OK);
@@ -592,42 +614,46 @@ fn fast_path_decision(
     unsafe {
         (*ctx.skb.skb).cb[0] = TPROXY_MARK;
         (*ctx.skb.skb).cb[1] = IPPROTO_UDP as u32;
+        (*ctx.skb.skb).cb[2] = dns_route_mark;
     }
 
-    // Write routing handoff entry, throttled to absent-or-stale.  The first
-    // packet of a flow always finds the entry absent (new map entry, or
-    // already consumed by userspace) and rewrites it, so userspace still
-    // sees a handoff on endpoint-pool miss; later packets of the same flow
-    // refresh it at most once per AUXILIARY_MAP_REFRESH_INTERVAL_NS.
-    let now = unsafe { bpf_ktime_get_ns() };
-    let write_handoff = match ROUTING_HANDOFF_MAP.get_ptr_mut(tuples.five) {
-        Some(old) => unsafe {
-            if (*old).result.decision_token != decision_token {
-                return Err(TC_ACT_SHOT);
+    // Raw must UDP53 is admitted from the per-packet carrier, so only flows
+    // that userspace may look up publish a tuple handoff.
+    if !(dns_route_mark != 0 && must) {
+        let now = unsafe { bpf_ktime_get_ns() };
+        let write_handoff = match ROUTING_HANDOFF_MAP.get_ptr_mut(tuples.five) {
+            Some(old) => unsafe {
+                if (*old).result.decision_token != decision_token {
+                    return Err(TC_ACT_SHOT);
+                }
+                now.wrapping_sub((*old).last_seen_ns)
+                    >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
+            },
+            None => true,
+        };
+        if write_handoff {
+            let mut handoff: RoutingHandoffEntry = unsafe { mem::zeroed() };
+            handoff.last_seen_ns = now;
+            handoff.routing_generation = 0;
+            handoff.result.mark = mark;
+            handoff.result.must = must as u8;
+            handoff.result.outbound = outbound;
+            handoff.result.pid = handoff_pid;
+            handoff.result.dscp = tuples.dscp;
+            handoff.result.decision_token = decision_token;
+            handoff.result.mac.copy_from_slice(&mac);
+            if let Some(pname) = handoff_pname {
+                handoff.result.pname.copy_from_slice(pname);
             }
-            now.wrapping_sub((*old).last_seen_ns)
-                >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
-        },
-        None => true,
-    };
-    if write_handoff {
-        let mut handoff: RoutingHandoffEntry = unsafe { mem::zeroed() };
-        handoff.last_seen_ns = now;
-        handoff.result.mark = mark;
-        handoff.result.must = must as u8;
-        handoff.result.outbound = outbound;
-        handoff.result.pid = handoff_pid;
-        handoff.result.dscp = tuples.dscp;
-        handoff.result.decision_token = decision_token;
-        handoff.result.mac.copy_from_slice(&mac);
-        if let Some(pname) = handoff_pname {
-            handoff.result.pname.copy_from_slice(pname);
-        }
-        if ROUTING_HANDOFF_MAP
-            .insert(tuples.five, handoff, 0u64)
-            .is_err()
-        {
-            increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
+            if ROUTING_HANDOFF_MAP
+                .insert(tuples.five, handoff, 0u64)
+                .is_err()
+            {
+                increment_bpf_stat(BpfStatsKey::RoutingHandoffInsertFailure);
+                if dns {
+                    return Err(TC_ACT_SHOT);
+                }
+            }
         }
     }
 
@@ -699,6 +725,7 @@ fn do_tproxy_wan_egress_udp(
                 handoff_pname,
                 handoff_pid,
                 decision_token,
+                0,
             );
         }
     }
@@ -723,13 +750,14 @@ fn do_tproxy_wan_egress_udp(
         ip_version,
         true,
     );
-    let decision = match crate::route::route(&mut pkt.routing_input, pname) {
-        Ok(decision) => decision,
+    let (decision, generation) = match crate::route::route(&mut pkt.routing_input, pname) {
+        Ok(result) => result,
         Err(_) => return Err(TC_ACT_SHOT),
     };
+    let routing_generation = generation;
 
-    let force_direct =
-        crate::maps::datapath_flags() & honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_ALL != 0;
+    let force_direct = tuples.five.dst_port != 53
+        && crate::maps::datapath_flags() & honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_ALL != 0;
     outbound = if force_direct {
         decision.outbound as u8
     } else {
@@ -780,6 +808,7 @@ fn do_tproxy_wan_egress_udp(
         handoff_pname,
         handoff_pid,
         decision_token,
+        routing_generation,
     )
 }
 

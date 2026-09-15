@@ -226,7 +226,9 @@ experimental {
 
 规则按 `priority` 升序执行；dae 解析器按源码顺序分配 `0, 1, ...`，同优先级保持稳定的源码顺序。目标可以是 `direct`、`block` 或组；裸节点名会在加载时被拒绝——需要先包一层组（例如 `filter: name('节点名')`）。`(must)` 决策是终局的：跳过嗅探，且 Clash Global/Direct 模式绝不会覆盖 `must` 或 `block`。GeoIP 使用 `dip(geoip: private)`/`dip(geoip: cn)`，geosite 使用 `domain(geosite: category)`。
 
-honk 会在启动与重载时注入 `dip(<每个已配置 LAN/WAN 接口地址>) -> direct(must)`，使网关服务不依赖代理健康状态。生成规则使用 priority 0，并追加在用户规则之后：它们只优先于更高 priority 的用户规则；若更早的用户 priority-0 规则命中，仍由该用户规则先生效。失活出站通常执行 fail-closed：新流会被丢弃而不会泄漏到 `direct`。未配置 `final` 且只有一个唯一叶节点的 TCP 组，仅可在当前 Selector 成员路径内对同一代理做最后尝试；UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed。应保留 `dip(geoip: private) -> direct(must)`，让公网 `fallback` 指向多成员且 `policy: fallback`、带显式 fail-closed `final` 的组，并至少保留一个强制经 `direct` 的 DNS 上游。
+网关管理访问与私网 DNS 绕过请按[显式本地路由迁移](./reference/routing.md#显式本地路由)配置；honk 不会自动生成接口规则。
+
+失活出站通常执行 fail-closed：新流会被丢弃而不会泄漏到 `direct`。未配置 `final` 且只有一个唯一叶节点的 TCP 组，仅可在当前 Selector 成员路径内对同一代理做最后尝试；UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed。让公网 `fallback` 指向多成员且 `policy: fallback`、带显式 fail-closed `final` 的组，并至少保留一个强制经 `direct` 的 DNS 上游。
 
 详见 [路由参考](./reference/routing.md)。
 
@@ -252,7 +254,9 @@ dns {
 
 `sip(...)` 仅用于 request，将逻辑 DNS 客户端 IP 与主机地址或 CIDR 匹配。透明 53 端口与 `dns.bind` 查询使用 socket peer；代表已接纳 TCP/UDP 流执行的 DNS 查询使用该流的客户端地址。内部、bootstrap、prefetch 与 Clash API 查询没有客户端来源，因此 `sip(...)` 和 `!sip(...)` 都不匹配并继续执行 fallback。带来源的流查询仍没有被拦截 DNS 服务器的原始目的地址，因此选择 `asis` 会 fail closed。
 
-`bind` 留空时仅使用透明 53 端口拦截。独立监听形式都要求显式端口：裸数字 `IP:port`（仅 UDP）、`udp://host:port`、`tcp://host:port` 或 `tcp+udp://host:port`；空 host 表示绑定通配地址。除非有主机防火墙保护 LAN 暴露，否则只绑定 loopback。省略 `ipversion_prefer` 时策略为 `both`，也可设为 `4`/`6` 以同时控制 DNS 结果和 bootstrap 解析出的上游拨号顺序；偏好地址族拨号失败时会回退到另一地址族。
+`bind` 留空只关闭独立监听，不关闭透明 53 端口拦截；[流量规则所有权](./reference/routing.md#出站目标与-must)仍然适用。
+
+独立监听形式都要求显式端口：裸数字 `IP:port`（仅 UDP）、`udp://host:port`、`tcp://host:port` 或 `tcp+udp://host:port`；空 host 表示绑定通配地址。除非有主机防火墙保护 LAN 暴露，否则只绑定 loopback。省略 `ipversion_prefer` 时策略为 `both`，也可设为 `4`/`6` 以同时控制 DNS 结果和 bootstrap 解析出的上游拨号顺序；偏好地址族拨号失败时会回退到另一地址族。
 
 `client_subnet` 默认关闭。需要确定性的 ECS 时写固定 IPv4/CIDR；写 `auto` 则无需 DNS 或 HTTP，把公网路径上的首个公网 hop 推断为 `/24`。自动推断会在 reload 与网络变化时刷新；有界探测失败时不生成 ECS。客户端自带的 ECS 始终优先。启用前请阅读参考文档中的隐私警告。
 

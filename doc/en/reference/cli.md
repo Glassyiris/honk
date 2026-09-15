@@ -25,6 +25,8 @@ Both binaries provide `-h`/`--help` and `-v`/`--version`.
 
 The CLI and Clash API share a build-time version: release builds use the GitHub tag name; local Git builds use `git describe --tags --always --match 'v*'` (the tag, or the nearest tag plus commit distance and hash). Without usable Git metadata, the Cargo package version is used. Git is not required at runtime.
 
+Use matching `honk-core`, `honk-tool`, and BPF object versions; incompatible objects and pinned handoff layouts are rejected under the [datapath ABI contract](../design/datapath.md#map-inventory).
+
 ### Log-level precedence
 
 The source comment records the intended order as `--debug` → `RUST_LOG` → `global.log_level` → `info`. The current executable first chooses the debug/config default and then calls `EnvFilter::try_from_default_env()`, so a valid `RUST_LOG` currently wins:
@@ -48,6 +50,8 @@ See the [global configuration reference](./global.md) for `log_level`.
 | `delay <node> [-u\|--url HOST:PORT]` | Opens one raw TCP connection with a five-second timeout and prints elapsed milliseconds. Without `--url`, it uses the node server address. | Not proxied, not an HTTP URLTest, and no running engine is contacted. |
 
 A real-datapath process holds the lock for its lifetime. `reload` verifies that the file is still locked before trusting its PID; successful `kill(2)` delivery does not mean the candidate configuration passed validation or restart-required checks.
+
+An exhausted [compiled-routing publication counter](../design/routing.md#synchronous-slots-and-atomic-publication) requires restart; this is separate from ordinary SIGHUP and DNS runtime reloads.
 
 ## Environment variables
 
@@ -172,6 +176,8 @@ honk-tool bpf stats [--pin-root PATH]
 | `routing-handoff` | Tuple and pending eBPF-to-control-plane routing result. |
 
 The implementation opens pins with raw `bpf(2)` operations; it does not use aya, load programs, or attach hooks. `stats` prints conn-state and auxiliary-map overflow/failure counters, the `CONN_STATE_OCCUPANCY` insert/delete gauge, and non-zero per-outbound packet/byte counters. Map reads normally require root or suitable BPF capabilities.
+
+`routing-handoff` validates the [handoff ABI](../design/datapath.md#map-inventory) before reading entries; upgrade the tool with the engine/object.
 
 `stats` requires a readable, genuine `/sys/devices/system/cpu/possible` export. It sizes per-CPU buffers from that mask's population, never the present/online CPU count. `CONN_STATE_OCCUPANCY` and `OUTBOUND_STATS` must be per-CPU arrays with 4-byte keys and 8-byte and 32-byte values, respectively. An unreadable or invalid CPU list, or incompatible map metadata, fails before per-CPU lookup; there is no guessed CPU-count fallback.
 

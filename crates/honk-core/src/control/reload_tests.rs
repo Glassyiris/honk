@@ -1101,7 +1101,7 @@ async fn reload_timeout_keeps_runtime_and_restores_admission() {
 async fn valid_reload_commits() {
     let expected_tolerance = Config::default().global.check_tolerance_ms + 1;
     let cp = test_cp().await;
-    let before_routing_generation = cp.ebpf.read().await.active_routing_generation().unwrap();
+    let before_routing_generation = cp.ebpf.read().await.active_routing_slot().unwrap();
     let before_runtime = cp.dns_controller.runtime_provider().acquire();
     let cache = before_runtime.runtime().cache();
     let before_forwarder = Arc::clone(before_runtime.runtime().forwarder());
@@ -1126,7 +1126,7 @@ async fn valid_reload_commits() {
         "valid reload should swap the live config"
     );
     assert_eq!(
-        cp.ebpf.read().await.active_routing_generation().unwrap(),
+        cp.ebpf.read().await.active_routing_slot().unwrap(),
         before_routing_generation,
     );
     let after_runtime = cp.dns_controller.runtime_provider().acquire();
@@ -1157,7 +1157,7 @@ async fn identical_effective_reload_retains_runtime_identity_and_writes_nothing(
         .runtime_provider()
         .current_generation()
         .get();
-    let routing_generation = cp.ebpf.read().await.active_routing_generation().unwrap();
+    let routing_generation = cp.ebpf.read().await.active_routing_slot().unwrap();
     let forwarder = cp.dns_controller.forwarder();
     let cache = forwarder.cache();
     let group_manager = cp.group_manager.read().clone();
@@ -1179,7 +1179,7 @@ async fn identical_effective_reload_retains_runtime_identity_and_writes_nothing(
         dns_generation
     );
     assert_eq!(
-        cp.ebpf.read().await.active_routing_generation().unwrap(),
+        cp.ebpf.read().await.active_routing_slot().unwrap(),
         routing_generation
     );
     assert!(cp.ebpf.read().await.datapath_flags_write_log().is_empty());
@@ -1261,7 +1261,7 @@ async fn normalized_routing_reload_preserves_sniff_only_facts() {
         backend.add_domain_ip_bitmap(&positive, &bitmap).unwrap();
         backend.add_domain_ip_bitmap(&negative, &zero).unwrap();
         assert_eq!(facts(backend.as_ref()), expected);
-        backend.active_routing_generation().unwrap()
+        backend.active_routing_slot().unwrap()
     };
 
     config.routing.rules[0].condition.process_name = vec!["abcdefghijklmnoX".into()];
@@ -1277,7 +1277,7 @@ async fn normalized_routing_reload_preserves_sniff_only_facts() {
     );
     {
         let backend = cp.ebpf.read().await;
-        assert_eq!(backend.active_routing_generation().unwrap(), active_slot);
+        assert_eq!(backend.active_routing_slot().unwrap(), active_slot);
         assert_eq!(facts(backend.as_ref()), expected);
     }
 
@@ -1287,7 +1287,7 @@ async fn normalized_routing_reload_preserves_sniff_only_facts() {
             .await
     );
     let backend = cp.ebpf.read().await;
-    assert_ne!(backend.active_routing_generation().unwrap(), active_slot);
+    assert_ne!(backend.active_routing_slot().unwrap(), active_slot);
     assert!(backend.projection_map_snapshot().is_empty());
 }
 
@@ -1445,7 +1445,7 @@ async fn routing_push_failure_keeps_active_policy_and_userspace_generation() {
 #[tokio::test]
 async fn domain_route_staging_failure_keeps_the_active_generation() {
     let cp = test_cp().await;
-    let before = cp.ebpf.read().await.active_routing_generation().unwrap();
+    let before = cp.ebpf.read().await.active_routing_slot().unwrap();
     cp.ebpf
         .write()
         .await
@@ -1456,10 +1456,7 @@ async fn domain_route_staging_failure_keeps_the_active_generation() {
 
     cp.apply_runtime_config(replacement, Default::default(), &DrainTracker::new())
         .await;
-    assert_eq!(
-        cp.ebpf.read().await.active_routing_generation().unwrap(),
-        before
-    );
+    assert_eq!(cp.ebpf.read().await.active_routing_slot().unwrap(), before);
     assert_eq!(
         cp.config_handle().read().await.global.check_tolerance_ms,
         Config::default().global.check_tolerance_ms,
@@ -1471,7 +1468,7 @@ async fn domain_route_staging_failure_keeps_the_active_generation() {
 #[tokio::test]
 async fn repeated_publication_failures_preserve_serving_generation() {
     let cp = test_cp().await;
-    let active = cp.ebpf.read().await.active_routing_generation().unwrap();
+    let active = cp.ebpf.read().await.active_routing_slot().unwrap();
     cp.ebpf
         .write()
         .await
@@ -1488,10 +1485,7 @@ async fn repeated_publication_failures_preserve_serving_generation() {
         assert!(cp.is_datapath_healthy());
         assert!(!drain.should_reject());
         assert!(!cp.drain_tracker.should_reject());
-        assert_eq!(
-            cp.ebpf.read().await.active_routing_generation().unwrap(),
-            active
-        );
+        assert_eq!(cp.ebpf.read().await.active_routing_slot().unwrap(), active);
         assert_eq!(
             cp.config.read().await.global.check_tolerance_ms,
             Config::default().global.check_tolerance_ms
@@ -1505,10 +1499,7 @@ async fn repeated_publication_failures_preserve_serving_generation() {
         )
         .await
     );
-    assert_ne!(
-        cp.ebpf.read().await.active_routing_generation().unwrap(),
-        active
-    );
+    assert_ne!(cp.ebpf.read().await.active_routing_slot().unwrap(), active);
     assert_eq!(
         cp.config.read().await.global.check_tolerance_ms,
         replacement.global.check_tolerance_ms

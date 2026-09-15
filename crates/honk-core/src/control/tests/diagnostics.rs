@@ -298,9 +298,10 @@ async fn c14_sighup_retains_rebased_provider_provenance() {
 #[tokio::test]
 async fn c14_network_refresh_preserves_active_provenance() {
     let mut config = changed_routing_config();
-    config.global.lan_interface = vec!["c14-missing-lan".into()];
-    config.global.wan_interface = vec!["c14-missing-wan".into()];
-    config.routing.rules[0].name = "__local_direct_stale".into();
+    config.global.lan_interface = vec!["lo".into()];
+    let expected_routing = config.routing.clone();
+    config.dns.client_subnet = "auto(127.0.0.1)".into();
+    config.dns.resolved_client_subnet = Some("198.51.100.0/24".parse().unwrap());
     let mut cp = fixture(
         config,
         DiagnosticBuckets {
@@ -309,6 +310,7 @@ async fn c14_network_refresh_preserves_active_provenance() {
         },
     )
     .await;
+    assert!(cp.config.read().await.dns.resolved_client_subnet.is_some());
     let before = snapshot(&cp).await;
     let mut authorizations = SubscriptionAuthorizations::new(&[]).unwrap();
 
@@ -325,6 +327,8 @@ async fn c14_network_refresh_preserves_active_provenance() {
     assert_eq!(after.diagnostics, before.diagnostics);
     assert_eq!(after.sources, before.sources);
     assert!(after.generation > before.generation);
+    assert!(cp.config.read().await.dns.resolved_client_subnet.is_none());
+    assert_eq!(cp.config.read().await.routing, expected_routing);
 }
 
 #[tokio::test]

@@ -26,22 +26,8 @@ pub struct UdpDecisionScratch {
     pub state: ConnState,
 }
 
-// Global variable: corresponds to the C `const volatile struct dae_param PARAM = {};`.
 #[unsafe(no_mangle)]
-pub static PARAM: Global<DaeParam> = Global::new(DaeParam {
-    tproxy_port: 0,
-    control_plane_pid: 0,
-    dae0_ifindex: 0,
-    dae_netns_id: 0,
-    wan_ifindex: 0,
-    dae0peer_mac: [0; 6],
-    padding_after_mac: [0; 2],
-    use_redirect_peer: 0,
-    has_bpf_get_current_task: 0,
-    padding2: 0,
-    dae_socket_mark: 0,
-    local_ip: 0,
-});
+pub static PARAM: Global<DaeParam> = Global::new(DaeParam::DEFAULT);
 
 /// WAN interface ifindex used by the egress program to identify locally-
 /// generated packets that the bonding driver forwards onto the bond master.

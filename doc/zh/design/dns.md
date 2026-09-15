@@ -8,20 +8,26 @@
 
 ```mermaid
 flowchart LR
-    T[透明 TCP/UDP :53] --> C[DnsController]
+    T[LAN/WAN TCP/UDP :53] --> E[现有入口排除与本地监听优先]
+    E -->|本地 socket 接收| L[本地服务]
+    E -->|其余流量| R[正常有序流量策略]
+    R -->|direct must| N[Linux 原生路径]
+    R -->|block must| DROP[丢弃]
+    R -->|group must| RAW[原始 TCP relay / UDP PacketTransport]
+    R -->|非 must| C[DnsController]
     B[dns.bind TCP/UDP] --> C
     C --> G[固定 generation 的 DnsService]
     G --> P[解析、hosts、策略、请求策略]
     P --> F[缓存与 singleflight]
     F --> U[UpstreamPool]
-    U --> R[响应策略与严格校验]
-    R --> O[类型化结果]
+    U --> RESPONSE[响应策略与严格校验]
+    RESPONSE --> O[类型化结果]
     O --> X[入口应答]
     O --> M[路由投影]
     M --> D[Active policy 的域名事实 map]
 ```
 
-两个入口 adapter 使用同一个 `DnsController`、当前 `DnsServiceProvider`、forwarder、缓存、singleflight 集合、上游池与路由投影。adapter 从准入开始一直持有所有权，直至应答 I/O 完成；它不会直接写 domain route。
+非 `must` 透明入口与独立 `dns.bind` 两个 adapter 使用同一个 `DnsController`、当前 `DnsServiceProvider`、forwarder、缓存、singleflight 集合、上游池与路由投影。adapter 从准入开始一直持有所有权，直至应答 I/O 完成；它不会直接写 domain route。终局 `group(must)` 使用原始 TCP relay / UDP `PacketTransport`，不进入这条 DNS 管线，跳过 hosts、缓存、请求/响应策略和投影。
 
 [`honk-config/src/dns/validation.rs`](../../../crates/honk-config/src/dns/validation.rs) 负责命名上游引用校验，由启动、SIGHUP 和公开运行时重载入口的 `Config::validate` 调用。`DnsRouting` 的私有请求来源选择逻辑同时供校验和 `effective_request` 使用，既保留旧版字段的诊断路径，也避免在校验时分配转换后的规则。仅解析配置的接口不执行完整配置校验。
 
@@ -29,10 +35,14 @@ flowchart LR
 
 | 路径 | Socket 与目的地址模型 | 应答模型 |
 | --- | --- | --- |
-| 透明 53 端口 | LAN 转发的 TCP/UDP 目的端口 `53` 走 eBPF 提前快速路径，跳过编译后的流量策略并重定向至控制面。主机发起的 WAN 53 端口流量使用生成的路由结果；非 `must` 结果以 `ControlPlaneRouting` 交给用户态并保留 mark，终态 `must` 决策保留原生结果。 | 透明 UDP 使用绑定到原始目的地址的 anyfrom socket；TCP 在被拦截的 stream 上应答。请求动作 `asis` 拨该原始目的地址并保留 TCP/UDP，包括 UDP `TC` 后回退 TCP。 |
+| 透明 53 端口，无终局用户 `must` 结果 | 按[流量规则所有权](../reference/routing.md#出站目标与-must)准入的有效查询进入 `DnsController`。 | 控制器接管的透明 UDP 使用绑定到原始目的地址的 anyfrom socket；TCP 在被拦截的 stream 上应答。请求动作 `asis` 拨该原始目的地址并保留 TCP/UDP，包括 UDP `TC` 后回退 TCP。 |
 | 独立 `dns.bind` | 所选 TCP/UDP socket 是 host network namespace 中普通且未打 mark 的 socket。它们没有拦截所得的目的地址。 | TCP 在 accept 得到的 socket 上应答。UDP 使用 packet info，使通配 bind 从查询实际命中的本地地址与网卡应答。 |
 
 `DnsRequestMeta` 以一个不可变值承载逻辑客户端来源与拦截所得目的地址。透明 adapter 和独立 adapter 都从 socket peer 设置 `source_ip`；只有透明拦截设置 `original_dst`。IPv4-mapped IPv6 peer 会规范化为 IPv4。代表已接纳 TCP/UDP 流执行的查询使用该流的客户端地址，且没有拦截所得的 DNS 目的地址。内部、bootstrap、prefetch 与 Clash API 查询两者都为空。
+
+`asis` 仍然通过 honk 新建的 socket 查询原始目的解析器，不保留客户端的网络源地址。只有原生 `direct(must)` 绕过用户态重发；是否仍发生 SNAT/MASQUERADE 取决于其他防火墙和网络配置。原生直连或原始分组转发绕过的 DNS 回答不会补充 honk 的域名路由事实；anyfrom 负责客户端侧回复源地址，不是上游源地址伪装。私网 DNS 绕过迁移见[路由参考](../reference/routing.md#显式本地路由)。
+
+[TCP handoff 与 UDP 逐报文准入](./control-plane.md#透明代理入口)由控制面负责，包括两者不同的路由代际要求。
 
 独立监听器具有以下生命周期与准入不变量：
 
@@ -45,11 +55,11 @@ flowchart LR
 - SIGHUP 中 `dns.bind` 的语义变化要求重启。未变化的监听器继续使用新发布的 DNS generation。
 - 独立请求传入 `original_dst=None`；选择 `asis` 因而产生 DNS 失败（`SERVFAIL`），不会递归拨回监听器。
 
-已绑定的本地 `:53` 监听器按 TCP、UDP transport 分别优先于透明拦截。具体地址的 bind 对相应 transport 优先。通配 bind 仅在完整 FIB 查询报告 `NOT_FWDED` 时优先，避免远程 resolver 流量绕过透明 DNS。将 `dns.bind` 留空会保留透明 TCP 与 UDP 拦截。
+将 `dns.bind` 留空不关闭透明 TCP 与 UDP 拦截。本地监听优先接收按 transport 分别判断，详见下文。
 
 ## DNS 所有权状态机
 
-下表针对 LAN 客户端，并明确区分**第一接收者**、**真正的应答来源**与**最终回包者**。`Honk bind` 是 host network namespace 中的普通监听器；绑定 `:54` 不会占用 `:53`。`透明 Honk` 依赖真实 eBPF datapath 与已挂载的接口 hook；mock 模式没有这条路径。
+下表针对 LAN 客户端，并明确区分**第一接收者**、**真正的应答来源**与**最终回包者**。`Honk bind` 是 host network namespace 中的普通监听器；绑定 `:54` 不会占用 `:53`。`透明 Honk` 依赖真实 eBPF datapath 与已挂载的接口 hook，且在现有入口排除后没有终局用户 `must` 结果；mock 模式没有这条路径。
 
 | dnsmasq 状态 | Honk `dns.bind` | 查询目标 | 第一接收者 | 真正的应答来源 | 最终回包者 |
 | --- | --- | --- | --- | --- | --- |
@@ -57,25 +67,18 @@ flowchart LR
 | 运行于 `:53`；未命中并转发到 `127.0.0.1#54` | `:54` 运行 | 网关 `:53` | dnsmasq | Honk 缓存/hosts/策略或 Honk 上游 | dnsmasq |
 | 运行于 `:53`；未命中且 dnsmasq 没有可用上游 | 任意 | 网关 `:53` | dnsmasq | 无 | dnsmasq 返回 `SERVFAIL` 或超时 |
 | 运行于 `:53`；转发目标 `127.0.0.1#54` 已停止 | `:54` 停止 | 网关 `:53` | dnsmasq | 无 | dnsmasq 返回 `SERVFAIL` 或超时 |
-| 运行于 `:53` | `:54` 运行 | 外部 `:53`（例如 `8.8.8.8:53`） | 启用时为透明 Honk | Honk 缓存/hosts/策略或 Honk 上游 | Honk 透明 anyfrom/stream 路径 |
+| 运行于 `:53` | `:54` 运行 | 外部 `:53`（例如 `8.8.8.8:53`） | 无终局 `must` 且启用时为透明 Honk | Honk 缓存/hosts/策略或 Honk 上游 | Honk 透明 anyfrom/stream 路径 |
 | 已停止 | `:54` 运行 | 网关 `:54` | Honk bind | Honk 缓存/hosts/策略或 Honk 上游 | Honk bind |
-| 已停止 | `:54` 运行 | 网关 `:53` | 启用时为透明 Honk | Honk 缓存/hosts/策略或 Honk 上游 | Honk 透明 anyfrom/stream 路径 |
-| 已停止 | bind 关闭 | 网关或外部 `:53` | 启用时为透明 Honk | Honk 缓存/hosts/策略或 Honk 上游 | Honk 透明 anyfrom/stream 路径 |
+| 已停止 | `:54` 运行 | 网关 `:53` | 无终局 `must` 且启用时为透明 Honk | Honk 缓存/hosts/策略或 Honk 上游 | Honk 透明 anyfrom/stream 路径 |
+| 已停止 | bind 关闭 | 网关或外部 `:53` | 无终局 `must` 且启用时为透明 Honk | Honk 缓存/hosts/策略或 Honk 上游 | Honk 透明 anyfrom/stream 路径 |
 | 已停止或没有占用 `:53` | `:53` 运行 | 网关 `:53` | Honk bind | Honk 缓存/hosts/策略或 Honk 上游 | Honk bind |
 | 已占用 `:53` | 尝试绑定 `:53` | 网关 `:53` | 启动时 bind 冲突 | 在只剩一个所有者前无 | 没有确定的所有者；一个服务必须失败 |
 | 任意 | bind 关闭或已停止 | 网关 `:54` | 没有 Honk listener | 无 | 连接拒绝或超时 |
 | 任意 | 任意 | 非 DNS 端口 | 普通路由路径 | 选中的出站 | 普通流 |
 
-每种 transport 的优先级转移如下：
+没有本地监听接收的端口 53 查询遵循[流量规则所有权](../reference/routing.md#出站目标与-must)；该表不表示畸形 UDP payload 会进入控制器。
 
-```text
-gateway:53 数据包
-  -> 匹配的 host-network listener（dnsmasq 或 Honk bind）
-  -> 否则 Honk 透明 53 路径
-  -> 否则普通内核路由 / 没有 DNS 服务
-```
-
-本地 listener 检查按 TCP、UDP transport 分开执行。具体地址的本地 `:53` socket 优先；通配 socket 只有在完整 FIB 查询报告 `NOT_FWDED` 时优先，转发或结果不明确的目的地址仍走透明路径。因此，停止 dnsmasq 不会让 Honk `:54` 自动占用 `:53`；实际观察到的接管来自透明拦截。若要让 Honk 成为普通网关 `:53` 服务，应停止或迁移 dnsmasq，并将 `bind` 配置为 `tcp+udp://:53`。
+本地 listener 检查按 TCP、UDP transport 分开执行。具体地址的本地 `:53` socket 优先；通配 socket 只有在完整 FIB 查询报告 `NOT_FWDED` 时优先，转发或结果不明确的目的地址仍接受流量策略与 DNS 接管判断。因此，停止 dnsmasq 不会让 Honk `:54` 自动占用 `:53`；没有终局用户 `must` 结果时，接管可来自透明拦截。若要让 Honk 成为普通网关 `:53` 服务，应停止或迁移 dnsmasq，并将 `bind` 配置为 `tcp+udp://:53`。
 
 OpenWrt 最常见的转发状态是：
 

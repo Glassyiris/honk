@@ -95,6 +95,7 @@ group {
 # Route private destinations directly and web traffic through the group.
 routing {
     # Keep private destinations off the proxy.
+    # This also bypasses private DNS; add && !dport(53) if interception is wanted.
     dip(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) -> direct(must)
     # Proxy common web ports.
     dport(80, 443) -> proxy
@@ -152,6 +153,7 @@ group {
 }
 
 routing {
+    # This also bypasses private DNS; add && !dport(53) if interception is wanted.
     dip(geoip: private) -> direct(must)
     domain(geosite: geolocation-cn) -> direct
     domain(geosite: geolocation-!cn) -> proxy
@@ -226,7 +228,7 @@ See the [group reference](./reference/groups.md).
 
 Rules are evaluated by ascending `priority`; the dae parser assigns `0, 1, ...` in source order, and stable equal-priority ordering preserves source order. Targets are `direct`, `block`, or a group; a bare node name is rejected at load — wrap it in a group (e.g. `filter: name('node')`). A `(must)` decision is final: sniffing is skipped, and Clash Global/Direct mode never overrides `must` or `block`. Use `dip(geoip: private)`/`dip(geoip: cn)` for GeoIP and `domain(geosite: category)` for geosite data.
 
-honk injects `dip(<every configured LAN/WAN interface address>) -> direct(must)` at startup and reload so gateway services do not depend on proxy health. Generated rules use priority 0 and are appended after user rules: they outrank user rules with a higher priority, but an earlier user priority-0 match still wins. Dead outbounds normally fail closed: new flows are dropped rather than leaked through `direct`. A TCP group with exactly one unique leaf and no `final` may retry that same proxy only within current Selector member paths; UDP and all-dead multi-leaf groups remain fail-closed. Keep `dip(geoip: private) -> direct(must)`, point internet `fallback` at a multi-member group with `policy: fallback` and an explicit fail-closed `final`, and keep at least one DNS upstream forced through `direct`.
+For gateway management and private-DNS bypass, use the [explicit local-rule migration](./reference/routing.md#explicit-local-rules); honk does not synthesize interface rules. Dead outbounds normally fail closed: new flows are dropped rather than leaked through `direct`. A TCP group with exactly one unique leaf and no `final` may retry that same proxy only within current Selector member paths; UDP and all-dead multi-leaf groups remain fail-closed. Point internet `fallback` at a multi-member group with `policy: fallback` and an explicit fail-closed `final`, and keep at least one DNS upstream forced through `direct`.
 
 See the [routing reference](./reference/routing.md).
 
@@ -252,7 +254,7 @@ dns {
 
 `sip(...)` is request-only and matches the logical DNS client IP against host addresses or CIDRs. Transparent port-53 and `dns.bind` queries use their socket peer; DNS lookups made for an admitted TCP/UDP flow use that flow's client address. Internal, bootstrap, prefetch, and Clash API queries have no client source, so neither `sip(...)` nor `!sip(...)` matches and routing falls through. A source-aware flow lookup still has no intercepted DNS-server destination, so selecting `asis` fails closed.
 
-Leave `bind` empty for transparent port-53 interception only. Standalone forms require an explicit port: bare numeric `IP:port` (UDP), `udp://host:port`, `tcp://host:port`, or `tcp+udp://host:port`; an empty host binds wildcard addresses. Bind loopback unless a host firewall protects LAN exposure. Omit `ipversion_prefer` for `both`, or set `4`/`6` to prefer that family for both DNS results and bootstrap-resolved upstream dials; a failed preferred-family dial falls back to the other family.
+Leave `bind` empty to disable only standalone listening, not transparent port-53 interception; [traffic-rule ownership](./reference/routing.md#outbound-targets-and-must) still applies. Standalone forms require an explicit port: bare numeric `IP:port` (UDP), `udp://host:port`, `tcp://host:port`, or `tcp+udp://host:port`; an empty host binds wildcard addresses. Bind loopback unless a host firewall protects LAN exposure. Omit `ipversion_prefer` for `both`, or set `4`/`6` to prefer that family for both DNS results and bootstrap-resolved upstream dials; a failed preferred-family dial falls back to the other family.
 
 `client_subnet` is off by default. Use a fixed IPv4/CIDR for deterministic ECS, or `auto` to infer the first public path hop as a `/24` without DNS or HTTP. Automatic inference is refreshed on reload and network changes; a bounded failure sends no generated ECS. Existing client ECS always wins. See the privacy warning in the reference before enabling it.
 

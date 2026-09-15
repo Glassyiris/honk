@@ -153,6 +153,7 @@ impl MockEbpfBackend {
                     decision_token: token,
                     ..Default::default()
                 },
+                routing_generation: 0,
                 ..Default::default()
             },
         );
@@ -547,6 +548,14 @@ impl EbpfBackend for MockEbpfBackend {
         plan: &crate::control::routing_matcher::RoutingPushPlan,
         learned_domains: &[(LpmKey, DomainRouting)],
     ) -> anyhow::Result<()> {
+        let generation = self
+            .next_generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("routing generation counter exhausted"))?;
+        anyhow::ensure!(
+            generation <= DNS_ROUTE_GENERATION_MAX,
+            "routing generation counter exhausted at {DNS_ROUTE_GENERATION_MAX}"
+        );
         anyhow::ensure!(
             self.active_slot < 2,
             "invalid active routing slot {}",
@@ -571,10 +580,6 @@ impl EbpfBackend for MockEbpfBackend {
         self.routing_publication_order
             .push(MockRoutingPublicationWrite::Attach(slot));
 
-        let generation = self
-            .next_generation
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("routing generation counter exhausted"))?;
         let domain_map_id = self
             .next_domain_map_id
             .checked_add(1)
@@ -612,7 +617,11 @@ impl EbpfBackend for MockEbpfBackend {
         Ok(())
     }
 
-    fn active_routing_generation(&self) -> anyhow::Result<u32> {
+    fn routing_policy_generation(&self) -> u64 {
+        self.next_generation
+    }
+
+    fn active_routing_slot(&self) -> anyhow::Result<u32> {
         Ok(self.active_slot)
     }
 
@@ -1603,6 +1612,23 @@ mod tests {
     }
 
     #[test]
+    fn routing_generation_ceiling_rejects_before_staging() {
+        let mut backend = MockEbpfBackend::new();
+        backend.next_generation = DNS_ROUTE_GENERATION_MAX - 1;
+        backend.publish_routing_plan(&routing_plan(1), &[]).unwrap();
+        let accepted = backend.routing_snapshot();
+        let writes = backend.routing_publication_order.clone();
+
+        assert!(backend.publish_routing_plan(&routing_plan(2), &[]).is_err());
+        assert_eq!(
+            backend.routing_policy_generation(),
+            DNS_ROUTE_GENERATION_MAX
+        );
+        assert_eq!(backend.routing_snapshot(), accepted);
+        assert_eq!(backend.routing_publication_order, writes);
+    }
+
+    #[test]
     fn active_domain_zero_is_present_until_removed() {
         let mut backend = MockEbpfBackend::new();
         backend.publish_routing_plan(&routing_plan(1), &[]).unwrap();
@@ -1754,6 +1780,7 @@ mod tests {
                 outbound: 5,
                 ..Default::default()
             },
+            routing_generation: 0,
         };
         backend
             .routing_handoffs
