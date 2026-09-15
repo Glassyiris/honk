@@ -279,6 +279,75 @@ fn test_parse_subscription_keeps_valid_sibling_after_intrinsic_rejection() {
 }
 
 #[test]
+fn uri_rejections_keep_safe_reason_fields_during_admission() {
+    let uri = "vless://b831381d-6324-4d53-ad4f-8cda48b30811@private.example:443?pbk=PRIVATE_KEY";
+    let invalid = format!(
+        "{uri}&packet-encoding=PRIVATE_VALUE#PRIVATE_NAME\n{uri}&mux=xray&concurrency=PRIVATE_VALUE\n{uri}&flow=xtls-rprx-vision&mux=h2mux\n{uri}&vless_mode=PRIVATE_VALUE\n"
+    );
+    for with_neighbor in [true, false] {
+        let body = if with_neighbor {
+            format!("{invalid}socks5://127.0.0.1:1080#neighbor\n")
+        } else {
+            invalid.clone()
+        };
+        let mut diagnostics = Vec::new();
+        let result = parse_subscription_content_with_diagnostics(
+            &Subscription::default(),
+            &body,
+            &mut diagnostics,
+        );
+        if with_neighbor {
+            let nodes = result.unwrap();
+            assert_eq!(
+                nodes
+                    .iter()
+                    .map(|node| node.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["neighbor"]
+            );
+            assert_eq!(diagnostics.len(), 4);
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(error.diagnostic.code, "empty-subscription-body");
+            assert_eq!(diagnostics.len(), 5);
+            assert_eq!(diagnostics.iter().filter(|d| d.terminal).count(), 1);
+        }
+        for (index, (field, reason)) in [
+            ("packet_encoding", "packetEncoding"),
+            ("multiplex.tcp", "integer"),
+            ("flow", "path"),
+            ("vless_mode", "removed"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let diagnostic = &diagnostics[index];
+            let ordinal = index + 1;
+            assert_eq!(diagnostic.code, "malformed-subscription-entry");
+            assert_eq!(
+                diagnostic.setting.to_string(),
+                format!("entries[{ordinal}].{field}")
+            );
+            assert!(diagnostic.message.contains(reason), "{diagnostic:?}");
+            assert_eq!(diagnostic.line, Some(ordinal));
+            assert_eq!(diagnostic.entry_index, Some(ordinal));
+            assert_eq!(diagnostic.severity, Severity::Warning);
+            assert!(!diagnostic.terminal);
+            assert_eq!(diagnostic.value, SafeValue::Redacted);
+            assert!(diagnostic.source.same_source(&diagnostics[0].source));
+            let rendered = format!("{diagnostic:?} {:?}", diagnostic.to_legacy());
+            for secret in [
+                "PRIVATE_",
+                "private.example",
+                "b831381d-6324-4d53-ad4f-8cda48b30811",
+            ] {
+                assert!(!rendered.contains(secret));
+            }
+        }
+    }
+}
+
+#[test]
 fn test_parse_subscription_skips_proxy_plugins() {
     let clash = Subscription {
         sub_type: SubscriptionType::Clash,

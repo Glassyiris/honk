@@ -133,6 +133,98 @@ mod parser_warnings {
         assert_eq!(error.diagnostic.entry_index, Some(1));
         assert!(!format!("{error:?} {diagnostics:?}").contains("PRIVATE"));
     }
+
+    #[test]
+    fn recoverable_vless_rejections_keep_reasons_and_entry_sources() {
+        use honk_config::diagnostic::{SafeValue, Severity};
+
+        let uri =
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@private.example:443?pbk=PRIVATE_KEY";
+        let input = format!(
+            "node {{\n keep: 'socks5://127.0.0.1:1080'\n PRIVATE_ALIAS: '{uri}&allowInsecure=yes&packet-encoding=PRIVATE_VALUE#PRIVATE_NAME'\n PRIVATE_TUNING: '{uri}&mux=xray&concurrency=PRIVATE_VALUE'\n PRIVATE_VISION: '{uri}&flow=xtls-rprx-vision&mux=h2mux'\n PRIVATE_DUPLICATE: '{uri}&mux=off&mux=off'\n malformed: 'PRIVATE_SYNTAX'\n}}\n"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root.dae");
+        let child = dir.path().join("child.dae");
+        std::fs::write(&root, "include { child.dae }\n").unwrap();
+        std::fs::write(&child, &input).unwrap();
+
+        for included in [false, true] {
+            let mut diagnostics = Vec::new();
+            let config = if included {
+                honk_config::Config::from_file_with_detailed_diagnostics(
+                    root.to_str().unwrap(),
+                    &mut diagnostics,
+                )
+            } else {
+                honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+                    &input,
+                    &mut diagnostics,
+                )
+            }
+            .unwrap();
+            assert_eq!(
+                config
+                    .nodes
+                    .iter()
+                    .map(|node| node.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["keep"]
+            );
+            assert_eq!(diagnostics.len(), 6, "{diagnostics:?}");
+            for (diagnostic, (code, field, ordinal, reason)) in diagnostics.iter().zip([
+                (
+                    "legacy-config-warning",
+                    "nodes[2].skip_cert_verify",
+                    2,
+                    "verification",
+                ),
+                (
+                    "unsupported-vless-parameter",
+                    "nodes[2].packet_encoding",
+                    2,
+                    "packetEncoding",
+                ),
+                (
+                    "invalid-config-value",
+                    "nodes[3].multiplex.tcp",
+                    3,
+                    "integer",
+                ),
+                ("invalid-config-value", "nodes[4].flow", 4, "path"),
+                ("duplicate-vless-parameter", "nodes[5].multiplex", 5, "once"),
+                ("invalid-node-entry", "nodes[6]", 6, "ignored"),
+            ]) {
+                assert_eq!(diagnostic.code, code);
+                assert_eq!(diagnostic.setting.to_string(), field);
+                assert!(diagnostic.message.contains(reason), "{diagnostic:?}");
+                assert_eq!(diagnostic.entry_index, Some(ordinal));
+                assert_eq!(diagnostic.line, Some(ordinal + 1));
+                assert_eq!(diagnostic.byte_column, Some(2));
+                assert_eq!(diagnostic.severity, Severity::Warning);
+                assert!(!diagnostic.terminal);
+                assert_eq!(diagnostic.value, SafeValue::Redacted);
+                assert_eq!(
+                    &input[diagnostic.span.clone().unwrap()],
+                    input.lines().nth(ordinal).unwrap().trim(),
+                );
+                let source = &diagnostic.source;
+                assert_eq!(
+                    source.sources().metadata()[source.index()].path.as_ref(),
+                    included.then_some(&child),
+                );
+                assert!(source.same_source(&diagnostics[0].source));
+                let rendered = format!("{diagnostic:?} {:?}", diagnostic.to_legacy());
+                for secret in [
+                    "PRIVATE_",
+                    "private.example",
+                    "b831381d-6324-4d53-ad4f-8cda48b30811",
+                ] {
+                    assert!(!rendered.contains(secret));
+                }
+            }
+        }
+    }
 }
 
 mod config_loaders {
@@ -472,6 +564,17 @@ mod detailed_diagnostics {
         let errors = [
             honk_config::ConfigError::Io(std::io::Error::other("secret")),
             honk_config::ConfigError::Parse("secret".into()),
+            honk_config::ConfigError::Parse(
+                "unsupported VLESS share-link parameter 'secret'".into(),
+            ),
+            honk_config::ConfigError::Parse("duplicate VLESS share-link parameter 'secret'".into()),
+            honk_config::ConfigError::Parse(
+                "VLESS parameter 'secret' is inactive with mux=off".into(),
+            ),
+            honk_config::ConfigError::Parse("VLESS parameter 'secret' requires mux=xray".into()),
+            honk_config::ConfigError::Parse(
+                "duplicate VLESS share-link parameter 'mux' secret".into(),
+            ),
             honk_config::ConfigError::Include("secret".into()),
             honk_config::ConfigError::Validation("secret".into()),
             honk_config::ConfigError::Serialization("secret".into()),
@@ -481,6 +584,10 @@ mod detailed_diagnostics {
         for original in errors {
             let category = ErrorCategory::of(&original);
             let detailed = DetailedConfigError::from_legacy(original, sources.root());
+            if category == ErrorCategory::Parse {
+                assert_eq!(detailed.diagnostic.code, "config-parse");
+                assert_eq!(detailed.diagnostic.setting.to_string(), "config");
+            }
             assert!(!format!("{detailed:?} {detailed}").contains("secret"));
             let legacy = detailed.into_legacy();
             assert_eq!(ErrorCategory::of(&legacy), category);

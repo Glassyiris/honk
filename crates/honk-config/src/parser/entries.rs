@@ -112,6 +112,13 @@ fn parse_node_entry(
         Err(error) if error.diagnostic.code == "removed-vless-mode" => {
             return Err(super::ParseFailure::Detailed(error));
         }
+        Err(mut error)
+            if !matches!(error.diagnostic.code, "config-parse" | "config-validation") =>
+        {
+            error.diagnostic.severity = Severity::Warning;
+            error.diagnostic.terminal = false;
+            diagnostics.output.push(*error.diagnostic);
+        }
         Err(_) => {
             text.notice(
                 diagnostics,

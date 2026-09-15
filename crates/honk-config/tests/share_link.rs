@@ -1261,25 +1261,92 @@ fn test_vless_mux_query() {
 }
 
 #[test]
-fn test_vless_canonical_query_rejects_removed_duplicate_and_inactive_fields() {
-    for query in [
-        "vless_mode=",
-        "vless_mode=legacy",
-        "vless_mode=xudp",
-        "packetEncoding=xudp&packetEncoding=xudp",
-        "mux=off&padding=false",
-        "mux=h2mux&concurrency=8",
-        "mux=xray&padding=false",
-        "mux=xray&concurrency=32768",
-        "mux=xray&xudpProxyUDP443=proxy",
+fn test_vless_canonical_query_rejections_keep_safe_fields() {
+    for (query, field, code) in [
+        ("vless_mode=", "vless_mode", "removed-vless-mode"),
+        (
+            "packet-encoding=PRIVATE_VALUE",
+            "packet_encoding",
+            "unsupported-vless-parameter",
+        ),
+        (
+            "packetEncoding=xudp&packetEncoding=xudp",
+            "packet_encoding",
+            "duplicate-vless-parameter",
+        ),
+        (
+            "mux=off&padding=false",
+            "multiplex.padding",
+            "invalid-config-value",
+        ),
+        (
+            "mux=h2mux&concurrency=8",
+            "multiplex.tcp",
+            "invalid-config-value",
+        ),
+        (
+            "mux=xray&padding=false",
+            "multiplex.padding",
+            "invalid-config-value",
+        ),
+        (
+            "mux=xray&concurrency=32769",
+            "multiplex.tcp",
+            "invalid-config-value",
+        ),
+        (
+            "mux=xray&xudpConcurrency=PRIVATE_VALUE",
+            "multiplex.udp",
+            "invalid-config-value",
+        ),
+        (
+            "mux=xray&xudpProxyUDP443=PRIVATE_VALUE",
+            "multiplex.udp443",
+            "invalid-config-value",
+        ),
+        (
+            "packetEncoding=PRIVATE_VALUE",
+            "packet_encoding",
+            "invalid-config-value",
+        ),
+        ("mux=PRIVATE_VALUE", "multiplex", "invalid-config-value"),
+        (
+            "mux=h2mux&padding=PRIVATE_VALUE",
+            "multiplex.padding",
+            "invalid-config-value",
+        ),
+        ("udp=PRIVATE_VALUE", "network", "invalid-config-value"),
+        ("xtls=PRIVATE_VALUE", "flow", "invalid-config-value"),
     ] {
-        assert!(
-            Node::from_share_link(&format!(
-                "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?{query}#node"
-            ))
-            .is_err(),
+        let link = format!(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@private.example:443?pbk=PRIVATE_KEY&{query}#PRIVATE_NAME"
+        );
+        let mut diagnostics = Vec::new();
+        let error =
+            Node::from_share_link_with_detailed_diagnostics(&link, &mut diagnostics).unwrap_err();
+        assert_eq!(error.category, honk_config::error::ErrorCategory::Parse);
+        assert_eq!(error.diagnostic.code, code, "{query}");
+        assert_eq!(
+            error.diagnostic.setting.to_string(),
+            format!("nodes.{field}"),
             "{query}"
         );
+        assert_eq!(error.diagnostic.severity, Severity::Error);
+        assert!(error.diagnostic.terminal);
+        assert_eq!(error.diagnostic.value, SafeValue::Redacted);
+        assert_eq!(diagnostics, [*error.diagnostic.clone()]);
+        let rendered = format!(
+            "{error:?} {error} {diagnostics:?} {:?}",
+            error.diagnostic.to_legacy()
+        );
+        for secret in [
+            "PRIVATE_",
+            "private.example",
+            "b831381d-6324-4d53-ad4f-8cda48b30811",
+            "32769",
+        ] {
+            assert!(!rendered.contains(secret), "{query}: {rendered}");
+        }
     }
 }
 
