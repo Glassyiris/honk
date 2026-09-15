@@ -239,6 +239,36 @@ impl ControlPlane {
         disable_nfqueue_for_startup(Arc::make_mut(&mut config), enabled);
     }
 
+    #[cfg(feature = "ebpf")]
+    pub(in crate::control) async fn warn_lan_self_protection(&self) {
+        if !daens_netns_exists() {
+            return;
+        }
+        // The caller holds reload_lock; never retain Config's guard while awaiting Router.
+        let config = self.config.read().await.clone();
+        let mut interfaces = crate::configured_interfaces(&config).lan;
+        interfaces.retain(|name| crate::netlink::ifindex_of(name).is_ok());
+        if interfaces.is_empty() {
+            return;
+        }
+        let addresses = config.local_direct_cidrs();
+        let router = self.router.read().await;
+        let unconfirmed: Vec<_> = addresses
+            .into_iter()
+            .filter(|cidr| {
+                crate::routing::parse_ip_net_str(cidr)
+                    .is_some_and(|network| !router.confirms_lan_self_protection(network.addr()))
+            })
+            .collect();
+        if !unconfirmed.is_empty() {
+            warn!(
+                lan_interfaces = ?interfaces,
+                local_addresses = ?unconfirmed,
+                "LAN self-protection coverage could not be confirmed; review explicit direct(must) rules for management access, excluding port 53 if transparent DNS is intended; configured routing is unchanged"
+            );
+        }
+    }
+
     pub(in crate::control) async fn dispatch_control_command(
         &mut self,
         command: ControlCommand,
@@ -335,6 +365,10 @@ impl ControlPlane {
                     }
                     None => true,
                 };
+                #[cfg(feature = "ebpf")]
+                if applied {
+                    self.warn_lan_self_protection().await;
+                }
                 drop(_reload);
                 if !applied {
                     warn!("network-triggered runtime refresh rejected");
@@ -370,6 +404,11 @@ impl ControlPlane {
             .bind_endpoint()
             .map_err(|error| anyhow::anyhow!("invalid dns.bind: {error}"))?;
         drop(config);
+        #[cfg(feature = "ebpf")]
+        {
+            let _reload = self.reload_lock.lock().await;
+            self.warn_lan_self_protection().await;
+        }
         let bound_dns_listener = dns_bind_endpoint
             .as_ref()
             .map(dns_listener::BoundDnsListener::bind)

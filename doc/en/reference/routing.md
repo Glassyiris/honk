@@ -108,6 +108,17 @@ dip(192.168.50.1, fd00:50::1) && !dport(53) -> direct(must)
 
 This is optional user configuration, not an inserted rule. It leaves port `53` available for transparent DNS unless another terminal `must` result takes ownership. Existing local socket ownership remains a pre-routing exclusion, including the non-DNS TCP pure-SYN probe skip; there is no unconditional gateway-management reachability guarantee without explicit routing.
 
+With real LAN bindings, honk warns when the compiled rule order cannot confirm
+unconditional `direct(must)` coverage for the observed addresses of configured
+LAN/WAN interfaces, for TCP and UDP destination ports `1–65535` except `53`.
+Checks run at startup, after a successful traffic-policy change, and on observed
+network changes; no-op and node-only reloads do not repeat the policy check.
+Missing interfaces and unavailable addresses are reconsidered when discovered.
+This is advisory: startup, reload, explicit blocking and routing order are unchanged.
+Source/domain/process-dependent rules and split port coverage can be intentional
+and still produce an “unconfirmed” warning. The check does not prove listener,
+firewall or end-to-end management reachability.
+
 A broad `dip(geoip: private) -> direct(must)` also bypasses LAN private DNS. If you want that DNS intercepted, explicitly add `&& !dport(53)` to the rule; honk does not rewrite it for you. Native `direct(must)` leaves the original source IP/port untouched by honk, subject to external firewall/NAT. For bypassed-answer projection and the difference from `asis`, see [DNS source boundaries](../design/dns.md#ingress-paths).
 
 ## Fail-closed behavior

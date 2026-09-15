@@ -652,6 +652,10 @@ impl ControlPlane {
             return Ok(true);
         }
         info!("Configuration applied — {} routes active", route_count);
+        #[cfg(feature = "ebpf")]
+        if !reuse_routing_state {
+            self.warn_lan_self_protection().await;
+        }
 
         // A completed slow path has republished everything a latch could
         // have torn; re-arm.
