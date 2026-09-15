@@ -10,9 +10,9 @@ The ordinary proxy path redirects packets through an isolated network namespace 
 flowchart LR
   LAN[LAN traffic] --> LI[lan_ingress]
   LOCAL[Host-originated traffic] --> WE[wan_egress]
-  LI -->|direct offload| HOST[Host routing]
-  LI -->|proxy| DAE0[dae0]
-  WE -->|proxy| DAE0
+  LI -->|local/special or native direct| HOST[Host routing]
+  LI -->|proxy, non-must DNS, or raw DNS group must| DAE0[dae0]
+  WE -->|proxy, non-must DNS, or raw DNS group must| DAE0
   DAE0 --> PEER[dae0peer in daens]
   PEER --> ASSIGN[dae0peer_ingress / sk_lookup]
   ASSIGN --> SOCK[LISTEN_SOCKET_MAP]
@@ -54,18 +54,18 @@ Ethernet interfaces use the `_l2` programs; interfaces without an Ethernet heade
 
 `auto` resolves to the current default-route interface. If no default route exists, the entry stays unattached rather than falling back to loopback. `IfaceWatcher` subscribes to rtnetlink link, IPv4/IPv6 address, and IPv4/IPv6 route groups; a 60-second reconciliation tick backs up event delivery. Reconciliation re-resolves `auto`, detects interface recreation by ifindex, recalculates single- versus dual-homed roles, and attaches or forgets process-owned hooks.
 
-A changed link/address/route/interface role also republishes generated `direct(must)` rules for every address on configured LAN/WAN interfaces. It clears health-check cooldowns and triggers fresh probes. Dead UDP and multi-leaf outbounds remain fail-closed until a fresh probe succeeds; a sole TCP leaf with no `final` remains a userspace last resort.
+A changed link/address/route/interface role updates topology observations, clears health-check cooldowns, and triggers fresh probes. Interface addresses also remain available for ECS; no startup, reload, or network event synthesizes `direct(must)` routing rules or a hidden kernel replacement allowlist. Dead UDP and multi-leaf outbounds remain fail-closed until a fresh probe succeeds; a sole TCP leaf with no `final` remains a userspace last resort.
 
 ## Program inventory
 
 | Program | Hook | Kernel responsibility |
 | --- | --- | --- |
-| `lan_ingress_l2`, `lan_ingress_l3` | TC ingress on LAN | Admission check, special/local traffic bypass, port-53 fast path, routing, connection state, direct offload, proxy redirect, TX accounting, and optional ambiguous-UDP staging. |
+| `lan_ingress_l2`, `lan_ingress_l3` | TC ingress on LAN | Admission check, special/local traffic bypass, ordered routing including port-53 ownership, connection state, direct offload, proxy redirect, TX accounting, and optional ambiguous-UDP staging. |
 | `wan_ingress_l2`, `wan_ingress_l3` | TC ingress on WAN | Refresh reverse-direction connection state; not attached in a single-homed topology. |
 | `lan_egress_l2`, `lan_egress_l3` | TC egress on LAN | Refresh reverse connection state and suppress locally generated ICMPv6 Redirect packets; skipped on the shared interface in a single-homed topology. |
 | `wan_egress_l2`, `wan_egress_l3` | TC egress on WAN | Route host-originated TCP/UDP, apply process-name and control-plane bypass data, check outbound connectivity, cache decisions, and redirect proxy traffic. |
 | `dae0_ingress` | TC ingress on host `dae0` | Reverse `REDIRECT_TRACK`, restore original MAC/interface delivery, and count RX traffic. |
-| `dae0peer_ingress` | TC ingress on `daens` `dae0peer` | Validate redirected packets, apply `TPROXY_MARK`, and use `bpf_sk_assign` for UDP and new TCP listener delivery. |
+| `dae0peer_ingress` | TC ingress on `daens` `dae0peer` | Validate redirected packets, restore per-packet UDP53 route/generation marks across link scrub, apply `TPROXY_MARK` to ordinary redirects, and use `bpf_sk_assign` for UDP and new TCP listener delivery. |
 | `tproxy_sk_lookup` | `sk_lookup` in `daens` | Override ordinary socket lookup with a transparent listener from `LISTEN_SOCKET_MAP`. |
 | `tproxy_wan_cg_sock_create`, `tproxy_wan_cg_sock_release` | cgroup `sock_create`, `sock_release` | Create/refresh or remove socket-cookie to PID/`comm` entries. |
 | `tproxy_wan_cg_connect4`, `tproxy_wan_cg_connect6` | cgroup `connect4`, `connect6` | Refresh cookie-to-process metadata for connected sockets. |
@@ -75,12 +75,12 @@ A changed link/address/route/interface role also republishes generated `direct(m
 
 - TC entry points are raw `#[unsafe(no_mangle)] #[unsafe(link_section = "classifier")]` functions taking `*mut __sk_buff`, not Aya's `#[tc]`, whose structured argument shape triggers a verifier rejection on kernels ≥7.0. Bodies return `Verdict = Result<c_long, c_long>` (`action::Verdict`): `Ok` normal, `Err` early exit; both carry real `TC_ACT_*` values, reduced to kernel `i32` by `flatten` (`action::flatten`). `src/action.rs` owns `TC_ACT_*`. Keep parser and helper sentinels (for example `transport::ERR_FALLBACK`, `ERR_FRAGMENT`, and `PASS_UNSUPPORTED`) separate from verdicts; the `bpf_loop` callback's continuation values are separate as well.
   `src/sk.rs`: `sk_assign_by_index` is TC's counterpart to aya `SockMap::redirect_sk_lookup` (which accepts only `SkLookupContext`); NAT-loopback probes `probe_tcp_socket`/`probe_udp_socket` lookup/release sockets. All helpers release implicit lookup references. Programs:
-    - `lan_ingress_l2/l3` — LAN classify/route/redirect, DNS port-53 fast path, `CLASSIFIED_MARK` dedup, and unique-token staging of only ambiguous UDP decisions into Pending when NFQUEUE is enabled and ready; enabled-but-not-ready staging fails closed (`src/ingress.rs`).
+    - `lan_ingress_l2/l3` — LAN classify/route/redirect, ordered-policy DNS ownership, `CLASSIFIED_MARK` dedup, and unique-token staging of only ambiguous non-DNS UDP decisions into Pending when NFQUEUE is enabled and ready; enabled-but-not-ready staging fails closed (`src/ingress.rs`).
     - `wan_ingress_l2/l3` — reverse-direction conntrack refresh (skipped single-homed).
     - `lan_egress_l2/l3`, `wan_egress_l2/l3` (`src/egress.rs`) — reverse conn state; locally-originated traffic routing (pname via `COOKIE_PID_MAP`, control-plane bypass, `OUTBOUND_CONNECTIVITY_MAP` aliveness, redirect to control plane). Live non-DNS WAN UDP entries take a lookup-only cached-route path; misses route once and then publish complete conntrack metadata.
     - `dae0_ingress` — reply path: rx stats from `RedirectEntry.outbound`, MAC rewrite, redirect to original LAN iface.
     - LAN egress suppresses only locally originated ICMPv6 Redirects, using the parser's ICMPv6 header after extension traversal; forwarded Redirects and other ICMPv6 remain pass-through. `honk-core/tests/ebpf_datapath_test.rs` checks L2 through `BPF_PROG_TEST_RUN` and L3 on isolated TUN interfaces, alongside exact-tuple RX accounting and cached-route policy.
-    - `dae0peer_ingress` — `bpf_sk_assign` of the TPROXY listener via `LISTEN_SOCKET_MAP` inside `daens`.
+    - `dae0peer_ingress` — mandatory restoration of UDP53 route/generation provenance and `bpf_sk_assign` of the TPROXY listener via `LISTEN_SOCKET_MAP` inside `daens`.
     - `tproxy_sk_lookup` (`src/sk_lookup.rs`) — transparent listeners: keys 0/1 TCP4/TCP6, 2..5 UDP4, 6..9 UDP6. Keep v4/v6 UDP listener-key reads in `#[inline(never)]` subprograms. At opt-level=2, LLVM if-converts family branches to a load through computed ctx offset, rejected as "dereference of modified ctx ptr". New branch-selected ctx reads must preserve this shape.
     - cgroup sock_create/sock_release/connect4/6/sendmsg4/6 (`src/cgroup.rs`) — cookie → `PIDName{pid, pname}` for process-name rules + control-plane bypass; `pname` is the 15-byte `argv[0]` executable basename read through runtime kernel-BTF offsets, with thread `comm` as the unavailable/read-failure fallback.
 
@@ -92,7 +92,7 @@ A changed link/address/route/interface role also republishes generated `direct(m
 | --- | --- |
 | `CONN_STATE_MAP` | Non-preallocated plain hash, maximum 524,288 entries. Stores per-flow TCP/UDP state and published routing metadata; userspace owns pressure eviction. |
 | `REDIRECT_TRACK` | Non-preallocated 65,536-entry token-bound hash. Maps a directional five-tuple to original MAC/interface, outbound, timestamp, and decision identity for reply restoration; staged entries carry the decision token. |
-| `ROUTING_HANDOFF_MAP` | Non-preallocated 65,536-entry token-bound hash. Carries tuple-keyed route metadata to userspace; staged entries carry the decision token. |
+| `ROUTING_HANDOFF_MAP` | Non-preallocated 65,536-entry token-bound hash. TCP SYN handoffs include the committed routing generation; staged UDP carries the decision token. Raw-must UDP53 publishes no tuple handoff: ownership uses per-packet marks. Non-must UDP53 retains facts for malformed-payload fallback. |
 | `ROUTING_POLICY_ROOT` | One-entry map-in-map selecting an immutable policy descriptor and one of two synchronous generated-function slots. Successful root replacement supplies the old non-sleepable readers' grace period. |
 | Generation-owned IP/MAC indexes | Separate destination/source IPv4 and IPv6 LPM maps plus a MAC LPM map. Values are full per-generation predicate bitmaps, with ancestor bits inherited into more-specific prefixes. |
 | Generation-owned domain map | Non-preallocated IP-to-domain-predicate bitmap hash. DNS/sniff facts include positive and negated predicates; a present zero bitmap is known-false. The descriptor exposes its map ID for diagnostics. |
@@ -111,6 +111,8 @@ A changed link/address/route/interface role also republishes generated `direct(m
 | `UDP_DECISION_RETIRE_FENCE` | 65,536-entry tuple fence map used during NFQUEUE retirement; see [NFQUEUE](./nfqueue.md). |
 
 Kernel/userspace map keys and values are `#[repr(C)]` ABI. IPv4 addresses in shared flow structures are IPv4-mapped IPv6 values in network byte order.
+
+`RoutingHandoffEntry` appends `routing_generation: u64` and is 56 bytes; `result` remains at offset 8 and the UDP decision token at offset 44. The generated-slot `RoutingInput`/`RoutingDecision`, `ConnState`, and `UDP_DECISION_SEQUENCE` ABIs are unchanged. Old explicit BPF objects and incompatible pinned handoff layouts are rejected before raw reads; `honk-tool` validates the layout too. Use matching core/tool/object versions, not a compatibility shim.
 
 `crates/honk-ebpf-common/src/lib.rs` — shared marks and NFQUEUE token packing, `OutboundIndex`, `RoutingMeta`, `DaeParam`, and `OutboundStatsCounters`/map constants.
 `crates/honk-ebpf-common/src/routing_policy.rs` — fixed `RoutingInput`/`RoutingDecision`/`RoutingPolicyDescriptor` ABI (128/20/24 bytes), feature bits, and process-name normalization limits.
@@ -133,15 +135,21 @@ Kernel/userspace map keys and values are `#[repr(C)]` ABI. IPv4 addresses in sha
 
 `SKB_MARK_RESERVED_MASK` is `0xc0000000`, the union of `CLASSIFIED_MARK` and `NFQUEUE_PENDING_MARK`. Configuration validation rejects `global.so_mark_from_dae` and routing-rule marks that overlap those bits. NFQUEUE direct completion repeats the same check before accepting a rule mark.
 
+Real transparent UDP53 uses `SO_RCVMARK` and per-packet `SOL_SOCKET`/`SO_MARK` ancillary data for DNS/raw ownership, not a tuple handoff. The same skb carries the route code and nonwrapping 20-bit committed routing generation through `cb[2]` across link scrub; mandatory `dae0peer` TC restores it. The internal carrier signature mask is `0xc8000100` and variable carrier bits are `0x37fffeff`. Owned `daens` fwmark routing ignores only those variable bits. User routing-mark reservations are unchanged.
+
 Local-socket probing must distinguish honk's own transparent listeners from ordinary local services. `bpf_sock_is_dae_socket` compares the full socket mark with `PARAM.dae_socket_mark`, which userspace sets to `DAE_BYPASS_MARK`. Equality means “honk listener,” so the probe continues the transparent path; an ordinary unmarked listener may claim the destination. Host-namespace `dns.bind` sockets are deliberately unmarked ordinary listeners.
 
 ## Packet behavior and invariants
 
 ### DNS and local-listener precedence
 
-LAN TCP and UDP with destination port `53` bypass the routing loop and go directly to the control plane. Port `53` is also exempt from LAN outbound-health drops so userspace DNS can apply its own fallback.
+After local/special exclusions, LAN/WAN TCP/UDP destination port `53` evaluates the normal ordered policy once, not a separate must-only scan. [Traffic-rule ownership](../reference/routing.md#outbound-targets-and-must) determines native, drop, raw, or controller handling. Port `53` remains exempt from LAN outbound-health drops, not from terminal user `must` results.
 
-The local-socket probe runs before this fast path and is transport-specific. A specifically bound UDP socket, or a TCP socket in `LISTEN` state, wins for its transport. A wildcard match wins only when a full FIB lookup returns `NOT_FWDED`; socket lookup alone also matches forwarded destinations. The listener-mark check excludes honk's own transparent listener from this precedence rule. Thus a local `dns.bind` listener can own host-local `:53` while remote resolver traffic still follows transparent DNS.
+The local-socket probe runs before traffic routing and is transport-specific. It uses the packet's current network namespace (negative netns ID), not relative namespace ID `0`. A specifically bound UDP socket, or a TCP socket in `LISTEN` state, wins for its transport. A wildcard match wins only when a full FIB lookup returns `NOT_FWDED`; socket lookup alone also matches forwarded destinations. The listener-mark check excludes honk's own transparent listener from this precedence rule. Thus local `dns.bind` can own host-local `:53`, while unclaimed destinations continue through ordered policy. The existing non-DNS TCP pure-SYN probe skip remains; there is no unconditional gateway-management reachability guarantee.
+
+Native direct is subject to external firewall/NAT; see [DNS source boundaries](./dns.md#ingress-paths) for its distinction from `asis` and client-facing anyfrom replies.
+
+UDP53 stays outside ordinary UDP conn-state, NFQUEUE staging, and decision-token allocation. No DNS registry, map, dependency, or configuration key is added for this ownership path.
 
 ### Special and internal traffic
 
@@ -155,11 +163,11 @@ This keeps DHCP, mDNS, SSDP, LLMNR, and similar link traffic out of the proxy. T
 
 ### Outbound liveness
 
-Userspace publishes group-OR health into `OUTBOUND_CONNECTIVITY_MAP`. A new LAN flow routed to a slot explicitly marked dead is dropped with `TC_ACT_SHOT`; this is deliberately fail-closed. One narrow exception keeps the slot open for a TCP group with exactly one unique leaf and no `final`, allowing a real dial through that same proxy to prove recovery without an implicit `direct` fallback. UDP and all-dead multi-leaf groups remain fail-closed, while a group containing a `direct`/`block` builtin never goes dead: the builtins are never marked dead, so the group-OR slot stays alive. TCP and UDP destination port `53` are exempt on LAN ingress. Generated must-direct rules for every current gateway interface address run through the same routing publication path and keep local administration reachable even when proxy outbounds are dead.
+Userspace publishes group-OR health into `OUTBOUND_CONNECTIVITY_MAP`. A new LAN flow routed to a slot explicitly marked dead is dropped with `TC_ACT_SHOT`; this is deliberately fail-closed. One narrow exception keeps the slot open for a TCP group with exactly one unique leaf and no `final`, allowing a real dial through that same proxy to prove recovery without an implicit `direct` fallback. UDP and all-dead multi-leaf groups remain fail-closed, while a group containing a `direct`/`block` builtin never goes dead: the builtins are never marked dead, so the group-OR slot stays alive. TCP and UDP destination port `53` are exempt from LAN health drops, subject to the DNS ownership rules above. Gateway-native routing requires user-authored rules rather than generated interface-address rules.
 
 ### Route-time direct offload
 
-The decision to keep a non-`must` flow in kernel direct routing is made once and cached in `RoutingMeta` bit 57. Established packets test the cached bit instead of rereading `DATAPATH_FLAGS_MAP`.
+For non-DNS traffic, the decision to keep a non-`must` flow in kernel direct routing is made once and cached in `RoutingMeta` bit 57. Established packets test the cached bit instead of rereading `DATAPATH_FLAGS_MAP`. Direct-mode offload cannot take ownership from non-`must` DNS.
 
 | Effective mode | Route-time policy |
 | --- | --- |
@@ -167,7 +175,7 @@ The decision to keep a non-`must` flow in kernel direct routing is made once and
 | `Direct` | Every non-final, non-`block` flow is normalized to `direct` and offloaded because userspace would choose direct anyway. |
 | `Global` | An exact global selection of `direct` uses the same all-direct policy. Other global selections keep non-final flows in userspace for the selected outbound. |
 
-`direct(must)` always stays direct and needs no bit-57 flag. `block` remains final. Full rule evaluation and mode semantics are documented in [Routing](./routing.md).
+`direct(must)` always stays direct and needs no bit-57 flag. Ordinary non-DNS `block` and `block(must)` remain final; non-`must` DNS instead retains controller ownership. Full rule evaluation and mode semantics are documented in [Routing](./routing.md).
 
 ### Host-originated WAN UDP
 

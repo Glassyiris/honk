@@ -1,7 +1,7 @@
 use super::overall_dial_timeout;
 #[cfg(feature = "ebpf")]
 use super::routing::final_udp_rule_mark;
-use super::routing::{build_connection_info, connection_chains};
+use super::routing::{RoutingDecision, build_connection_info, connection_chains};
 use crate::control::udp_dial::{UdpPrepare, UdpStaggerCallbacks, prepare_udp_plan};
 use crate::control::udp_endpoint::{UdpEndpoint, UdpInitLease};
 use crate::control::*;
@@ -83,6 +83,7 @@ impl ControlPlaneHandle {
         let client_addr = lease.client_addr();
         let original_dst = lease.original_dst();
         let data = lease.first_payload();
+        let raw_dns_group = lease.raw_dns_group();
         #[cfg(feature = "ebpf")]
         let pending = if lease.decision_token() == 0 {
             None
@@ -108,7 +109,13 @@ impl ControlPlaneHandle {
             lease.decision_token()
         );
 
-        let dial_mode = {
+        let dial_mode = if raw_dns_group.is_some() {
+            anyhow::ensure!(
+                original_dst.port() == 53 && lease.decision_token() == 0,
+                "raw DNS ownership requires an unstaged UDP/53 lease"
+            );
+            DialMode::Ip
+        } else {
             let config = self.config.read().await;
             config
                 .global
@@ -141,16 +148,19 @@ impl ControlPlaneHandle {
             return Ok(());
         }
 
-        let tuples = build_tuples_key(
-            original_dst.ip(),
-            original_dst.port(),
-            client_addr.ip(),
-            client_addr.port(),
-            17, // UDP
-        );
-        let handoff = self
-            .lookup_udp_handoff(&tuples, lease.decision_token())
-            .await?;
+        let handoff = if raw_dns_group.is_some() {
+            None
+        } else {
+            let tuples = build_tuples_key(
+                original_dst.ip(),
+                original_dst.port(),
+                client_addr.ip(),
+                client_addr.port(),
+                17, // UDP
+            );
+            self.lookup_udp_handoff(&tuples, lease.decision_token())
+                .await?
+        };
         let skip_sniff = matches!(dial_mode, DialMode::Ip)
             || handoff.as_ref().is_some_and(|ho| {
                 ho.must != 0
@@ -197,25 +207,32 @@ impl ControlPlaneHandle {
             .await;
 
         let route_started_at = std::time::Instant::now();
-        let conn_info = build_connection_info(
-            quic_domain.clone(),
-            original_dst,
-            client_addr,
-            "udp",
-            handoff.as_ref(),
-        );
-        let route = self
-            .prepare_routing(dial_mode, &conn_info, domain_verified, handoff.as_ref())
-            .await;
+        let route = if let Some(raw_dns_group) = raw_dns_group.as_deref() {
+            RoutingDecision {
+                outbound: raw_dns_group.to_owned(),
+                must: true,
+                mark: 0,
+                matched_rule: None,
+                reroute_by_sniffed_domain: false,
+            }
+        } else {
+            let conn_info = build_connection_info(
+                quic_domain.clone(),
+                original_dst,
+                client_addr,
+                "udp",
+                handoff.as_ref(),
+            );
+            self.prepare_routing(dial_mode, &conn_info, domain_verified, handoff.as_ref())
+                .await
+        };
         #[cfg(feature = "ebpf")]
         let reroute_by_sniffed_domain = route.reroute_by_sniffed_domain;
-        let matched_rule = route.matched_rule;
-        let routed_outbound = route.outbound;
-        let must = route.must;
-        let routed_mark = route.mark;
         #[cfg(feature = "ebpf")]
-        let routed_direct = routed_outbound == "direct";
-        let outbound_name = self.apply_mode_override(routed_outbound, must).await;
+        let routed_direct = route.outbound == "direct";
+        let routed_mark = route.mark;
+        let matched_rule = route.matched_rule;
+        let outbound_name = self.apply_mode_override(route.outbound, route.must).await;
         let target_domain = if matches!(
             outbound_name.as_str(),
             "direct" | "block" | "must_rules" | "control_plane_routing"

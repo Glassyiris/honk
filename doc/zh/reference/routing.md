@@ -9,7 +9,7 @@ condition [&& condition ...] -> outbound[(must)]
 fallback: outbound
 ```
 
-- 规则按 `priority` 升序执行，数值越小越先运行；同优先级保持稳定的源码顺序。dae 解析器按源码顺序分配 `0, 1, ...`，而生成的本地规则使用 priority `0` 并追加在用户规则之后。
+- 规则按 `priority` 升序执行，数值越小越先运行；同优先级保持稳定的源码顺序。dae 解析器按源码顺序分配 `0, 1, ...`，流量规则及其顺序完全由用户配置决定。
 - `default:` 是 `fallback:` 的别名。没有规则最终确定结果时使用 fallback 目标；省略时默认为 `direct`。
 - 同一个 matcher 内以逗号分隔的参数互为备选。不同的非空条件组必须全部匹配。
 - 匹配器的括号参数列表可以在同一源文件内跨物理行，语句一直延续到右括号和 `-> outbound`。被包含的文件不能补全另一文件中未完成的调用。
@@ -49,7 +49,7 @@ routing {
 普通 domain pattern/suffix/keyword 互为同一条件内的备选；同一规则另有 `geosite`
 字段时，它仍是一个独立的 AND 条件。
 
-`mac(...)` 放行不能让客户端免于 DNS 拦截：LAN 接口上 53 端口快速路径先于路由引擎执行，任何路由规则都无法豁免 DNS。只有明确绑定的本机非 honk `:53` 监听能在快速路径之前取得流量（见 DNS 设计文档）。
+`mac(...)` 与其他流量条件一样，可以通过终局 `direct(must)` 规则绕过透明 DNS；普通 `direct` 不会取消 DNS 接管。LAN/WAN TCP/UDP 目的端口 `53` 在现有入口排除与本地监听优先判断后，执行一次正常有序流量策略，不单独扫描 must 规则。
 
 ## 出站目标与 `must`
 
@@ -62,6 +62,17 @@ routing {
 裸节点名不是合法的出站目标，`Config::validate` 会拒绝：把节点包进一个组（例如 `filter: name('node')`）后引用组名。组与节点也不允许同名。每份配置最多可定义 250 个顶层用户组；更高的路由序号由 ABI 保留。
 
 追加 `(must)` 后，命中的结果立即终结规则搜索并跳过后续域名重路由。Clash `Global` 和 `Direct` 模式都不能覆盖 must 结果或 `block`。它不是历史内部“设置 must 后继续扫描”的 `MustRules` opcode。
+
+TCP/UDP 目的端口 `53` 的接管权限如下；实际本地监听 socket 的优先接收发生在流量策略之前：
+
+| 流量策略结果 | DNS 行为 |
+| --- | --- |
+| `direct(must)` | 保持 Linux 原生路径，保留配置的 skb mark；不进入 honk DNS。 |
+| `block(must)` | 丢弃报文。 |
+| `group(must)` | 通过该组的原始 TCP relay / UDP `PacketTransport` 转发，跳过 honk DNS 的 hosts、缓存、请求/响应策略和投影。 |
+| 非 `must` 的 `direct`、组或 `block` | 有效 DNS 查询仍归 DNS 控制器处理；Clash 模式直连 offload 不会抢走接管权限。 |
+
+畸形的非 `must` UDP53 payload 保留通用 UDP 回退，不进入 `DnsController`；控制器一行不表示所有端口 53 payload 都是 DNS。路由元数据准入遵循[控制面的 TCP/UDP 区分](../design/control-plane.md#透明代理入口)；本地监听优先接收条件见[DNS 所有权状态机](../design/dns.md#dns-所有权状态机)。
 
 ## Geo 资源
 
@@ -85,23 +96,34 @@ routing {
 
 geosite 代码可以用 `category@attr` 选择属性。属性名按大小写不敏感方式比较。第一个 `@` 后的全部内容都是选择器，包括后续的 `@`。未知类目或没有条目命中的选择器会记录告警、展开为零个 matcher，并且永不匹配。
 
-## 自动注入的本地规则
+## 显式本地路由
 
-honk 在启动、reload 和接口拓扑变化时，为配置的 LAN 与 WAN 接口当前分配的每个地址刷新一条生成规则：
+honk 不再在启动、重载或接口变化时注入网关地址的 `direct(must)` 规则，也不会用隐藏的内核地址白名单替代。接口地址仍用于拓扑检测、ECS 刷新和健康探测。需要保障网关管理访问时，请按所需顺序显式配置直连规则，例如：
 
 ```dae
-dip(<each LAN/WAN interface address>) -> direct(must)
+dip(192.168.50.1, fd00:50::1) && !dport(53) -> direct(must)
 ```
 
-生成规则使用 priority `0`，并追加在用户规则之后。因此稳定的同优先级顺序会让较早命中的用户 priority-0 规则先生效；生成规则只优先于更高 priority 的用户规则。地址会转换为主机 CIDR（`/32` 或 `/128`）。不存在的接口和无法解析的 `auto` 接口会被跳过。这些规则让 SSH、管理界面和 Clash API 等网关本地服务保持可达，而不依赖代理健康状态。
+这是一条可选的用户规则，不是运行时自动规则。实际本地 socket 的优先接收属于入口归属判断，不等于所有网关地址强制直连；探测在报文所在的当前网络命名空间进行。非 DNS TCP 纯 SYN 的现有探测策略不变，因此不能承诺无需配置即可始终访问网关管理面。
+
+使用真实 LAN 绑定时，如果无法按已编译规则的实际顺序确认：已观测到的配置
+LAN/WAN 网卡地址，其 TCP/UDP 目的端口 `1–65535`（排除 `53`）均有无条件
+`direct(must)` 覆盖，honk 会告警。检查发生在启动、成功应用流量路由变化和
+观测到网络变化时；无变化或仅节点变化的重载不会重复路由检查。尚不存在的网卡
+或尚未取得的地址会在被发现后重新检查。
+这只是提示，不阻止启动或重载，也不改变显式阻断和规则顺序。依赖来源、域名、
+进程等条件的规则，以及拆分的端口覆盖，可能是用户有意设置的合法策略，
+仍可能得到“无法确认”的告警；它不证明监听器、防火墙或端到端管理访问可达。
+
+现有宽泛私网 `direct(must)` 规则现在也会绕过 LAN 私网 DNS。希望保留这部分 DNS 接管时，由用户显式加入 `!dport(53)`。原生 `direct(must)` 不会由 honk 改写客户端源 IP/端口，但是否仍发生 SNAT/MASQUERADE 取决于其他防火墙和网络配置。绕过应答的投影影响及其与 `asis` 的区别见[DNS 来源边界](../design/dns.md#入口路径)。
 
 ## Fail-closed 行为
 
-健康检查把出站标记为死亡后，eBPF 数据面通常会用 `TC_ACT_SHOT` 丢弃路由到该出站的新流，绝不会静默泄漏到 `direct`。未配置 `final` 且只有一个唯一叶节点的 TCP 组会让同一代理继续作为最后尝试，使真实流量可以证明恢复。UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed；但含有 `direct`/`block` 内建成员的组永不失活：内建节点永远不会被判定死亡，因此 group-OR 槽保持开放。TCP 和 UDP 的目的端口 `53` 均受豁免，因此 DNS 仍可到达控制面。
+健康检查把出站标记为死亡后，eBPF 数据面通常会用 `TC_ACT_SHOT` 丢弃路由到该出站的新流，绝不会静默泄漏到 `direct`。未配置 `final` 且只有一个唯一叶节点的 TCP 组会让同一代理继续作为最后尝试，使真实流量可以证明恢复。UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed；但含有 `direct`/`block` 内建成员的组永不失活：内建节点永远不会被判定死亡，因此 group-OR 槽保持开放。TCP 和 UDP 的目的端口 `53` 均豁免该健康检查丢包；没有终局用户 `must` 结果时，DNS 仍可到达控制面。
 
 要让网关能承受节点故障：
 
-- 添加 `dip(geoip: private) -> direct(must)`，使私有网络流量不依赖代理健康状态。
+- 添加 `dip(geoip: private) -> direct(must)`，使私有网络流量不依赖代理健康状态；它也会绕过 LAN 私网 DNS，希望保留接管时需显式加上 `&& !dport(53)`。
 - 让 `fallback:` 指向至少包含两个节点的 [`fallback` 策略组](./groups.md)，而不是单个节点。
 - 至少保留一个走直连路径的 DNS 上游。
 
@@ -111,6 +133,7 @@ dip(<each LAN/WAN interface address>) -> direct(must)
 routing {
     domain(suffix: doubleclick.net) -> block
     pname(NetworkManager, systemd-resolved) && l4proto(udp) && dport(53) -> direct(must)
+    # 宽泛私网 must 也绕过 LAN 私网 DNS；需保留接管时显式加上 && !dport(53)。
     dip(geoip: private) -> direct(must)
     sip(
         10.10.10.24/32,

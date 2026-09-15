@@ -24,7 +24,7 @@
 
 ## 独立监听器（`bind`）
 
-独立监听器使用 host 网络命名空间中的普通、未打 mark 的 socket。关闭独立监听器时，透明 TCP/UDP 53 端口拦截仍然生效。
+独立监听器使用 host 网络命名空间中的普通、未打 bypass mark 的 socket。关闭它不会关闭透明 TCP/UDP 53 端口拦截；透明路径遵循[流量规则所有权](./routing.md#出站目标与-must)。
 
 | 值 | 结果 |
 | --- | --- |
@@ -39,6 +39,8 @@
 裸主机名无效。解析器也会拒绝 userinfo、path、query、fragment、反斜杠、IPv6 zone identifier、错误的方括号、不支持的 scheme 和超出范围的端口。使用主机名时，honk 按系统解析顺序尝试地址，并使用第一个能让全部请求 transport 成功 bind 的地址。bind 同步且 all-or-nothing：任一失败都会关闭其他已选 socket 并令启动失败。
 
 监听器归进程所有。SIGHUP 重载接受语义等价的不同写法，但 host、port 或 transport 集合的任何变化都会作为 restart-required 被拒绝。通配或 LAN 侧 bind 会暴露一个无认证的递归 resolver；必须用主机防火墙限制来源，绝不能发布到不可信网络。
+
+本地 `:53` 优先接收按 TCP/UDP 分别判断，通配监听还需完整 FIB 检查；见[监听器矩阵](../design/dns.md#dns-所有权状态机)。
 
 ## Hosts 快照（`use_host`）
 
@@ -153,6 +155,8 @@ DNS `sip()` 与 `ip()` 共用 IP/CIDR 解码器。裸 IPv4 和 IPv6 地址分别
 | `fallback: reject\|asis\|<upstream>` | 无 request 规则匹配时使用的动作；默认使用上游 `default`。 |
 
 代表已接纳流执行的带来源查询没有被拦截 DNS 服务器的原始目的地址。若其 request 策略选择 `asis`，解析会 fail closed，绝不会回退到兼容/default 上游。
+
+原生 `direct(must)` 绕过不同于 `asis` 重新查询；见[DNS 来源/NAT 与投影限制](../design/dns.md#入口路径)。
 
 ### Response 动作
 

@@ -316,6 +316,14 @@ impl RealEbpfBackend {
         plan: &crate::control::routing_matcher::RoutingPushPlan,
         learned_domains: &[(LpmKey, DomainRouting)],
     ) -> anyhow::Result<()> {
+        let generation = self
+            .routing_generation_counter
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("routing generation counter exhausted"))?;
+        anyhow::ensure!(
+            generation <= DNS_ROUTE_GENERATION_MAX,
+            "routing generation counter exhausted at {DNS_ROUTE_GENERATION_MAX}"
+        );
         let active = self.routing_slot;
         anyhow::ensure!(
             active < ROUTING_SLOT_NAMES.len() as u32,
@@ -334,10 +342,6 @@ impl RealEbpfBackend {
         }
 
         let domain_map_id = maps.domain.map().info()?.id();
-        let generation = self
-            .routing_generation_counter
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("routing generation counter exhausted"))?;
         let descriptor_value = RoutingPolicyDescriptor {
             slot,
             features: plan.features,
@@ -393,14 +397,17 @@ impl RealEbpfBackend {
     /// Load the production object without attaching any network or cgroup hook.
     /// The resulting backend can publish a real generated policy and exercise
     /// the optional `routing_test` classifier with `BPF_PROG_TEST_RUN`.
-    pub(crate) fn load_routing_test_fixture(obj: &[u8]) -> anyhow::Result<Self> {
+    pub(crate) fn load_routing_test_fixture(obj: &[u8], param: DaeParam) -> anyhow::Result<Self> {
         let version =
             kernel_version().ok_or_else(|| anyhow::anyhow!("cannot determine kernel version"))?;
         anyhow::ensure!(
             version >= (6, 12, 0),
             "routing tests require Linux 6.12 or newer"
         );
-        let bpf = EbpfLoader::new().load(obj)?;
+        let mut loader = EbpfLoader::new();
+        loader.override_global("PARAM", &param, true);
+        let bpf = loader.load(obj)?;
+        validate_routing_handoff_layout(&bpf)?;
         Ok(Self {
             bpf: Some(bpf),
             pin_root: PathBuf::new(),

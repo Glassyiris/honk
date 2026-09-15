@@ -46,6 +46,7 @@ pub(super) struct HandoffResult {
     pub(super) mark: u32,
     pub(super) must: u8,
     pub(super) decision_token: u32,
+    pub(super) routing_generation: u64,
     pub(super) dscp: u8,
     pub(super) mac: [u8; 6],
     pub(super) pname: [u8; 16],
@@ -59,6 +60,7 @@ impl From<RoutingHandoffEntry> for HandoffResult {
             mark: entry.result.mark,
             must: entry.result.must,
             decision_token: entry.result.decision_token,
+            routing_generation: entry.routing_generation,
             dscp: entry.result.dscp,
             mac: entry.result.mac,
             pname: entry.result.pname,
@@ -339,15 +341,23 @@ impl ControlPlaneHandle {
     }
 
     /// Staged UDP transitions consume their handoff atomically at commit, so
-    /// initialization may only inspect it. Legacy socket ingress keeps the
-    /// existing take-once behavior.
+    /// initialization may only inspect it. Legacy socket ingress consumes the
+    /// tuple once; UDP/53 retains only the non-must controller handoff.
     pub(super) async fn lookup_udp_handoff(
         &self,
         tuples: &TuplesKey,
         decision_token: u32,
     ) -> anyhow::Result<Option<HandoffResult>> {
         if decision_token == 0 {
-            return Ok(self.lookup_handoff(tuples).await);
+            let handoff = self.lookup_handoff(tuples).await;
+            return Ok(if tuples.dst_port == 53 {
+                handoff.filter(|handoff| {
+                    handoff.outbound == OutboundIndex::ControlPlaneRouting as u8
+                        && handoff.must == 0
+                })
+            } else {
+                handoff
+            });
         }
         let entry = self
             .ebpf

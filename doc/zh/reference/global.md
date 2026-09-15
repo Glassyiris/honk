@@ -70,7 +70,9 @@ dae 配置中的 `check_tolerance` 仍可通过重载更新 URLTest 组的容差
 
 `auto` 解析为拥有 metric 最低 IPv4 默认路由的网卡。如果不存在该路由，此项会从期望 hook 集合中省略并保持待定。由于没有挂载 hook，未解析网卡上的流量保持 fail-open；同一列表中显式命名的网卡继续工作。
 
-`IfaceWatcher` 订阅 link、address 和 IPv4 route 事件，并每 60 秒执行一次 reconciliation。它会随网卡和默认路由变化挂载、卸载或重新绑定所需的 LAN/WAN hook，也覆盖 LAN bridge/bond 成员与 WAN bond slave。拓扑变化会刷新生成的网关地址 `direct(must)` 规则，并立即唤醒受健康状态控制的出站探测。网卡列表配置本身发生变化仍需重启。
+`IfaceWatcher` 订阅 link、address 和 IPv4 route 事件，并每 60 秒执行一次 reconciliation。它会随网卡和默认路由变化挂载、卸载或重新绑定所需的 LAN/WAN hook，也覆盖 LAN bridge/bond 成员与 WAN bond slave。拓扑变化仍用于 ECS 刷新，并立即唤醒受健康状态控制的出站探测，但不再生成网关地址 `direct(must)` 规则，也没有隐藏的内核地址白名单。网卡列表配置本身发生变化仍需重启；网关管理访问应使用[显式用户路由](./routing.md#显式本地路由)。
+
+真实 LAN 绑定还会执行提示性的[自保覆盖检查](./routing.md#显式本地路由)。无法确认时仅告警，不拒绝启动或重载，也不插入路由规则。
 
 ## 拨号模式
 

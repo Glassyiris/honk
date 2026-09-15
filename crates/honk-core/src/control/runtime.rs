@@ -1,3 +1,4 @@
+use super::udp_ingress::{UdpLoopState, udp_listener_loop};
 use super::*;
 #[cfg(not(feature = "ebpf"))]
 #[allow(dead_code)]
@@ -238,6 +239,36 @@ impl ControlPlane {
         disable_nfqueue_for_startup(Arc::make_mut(&mut config), enabled);
     }
 
+    #[cfg(feature = "ebpf")]
+    pub(in crate::control) async fn warn_lan_self_protection(&self) {
+        if !daens_netns_exists() {
+            return;
+        }
+        // The caller holds reload_lock; never retain Config's guard while awaiting Router.
+        let config = self.config.read().await.clone();
+        let mut interfaces = crate::configured_interfaces(&config).lan;
+        interfaces.retain(|name| crate::netlink::ifindex_of(name).is_ok());
+        if interfaces.is_empty() {
+            return;
+        }
+        let addresses = config.local_direct_cidrs();
+        let router = self.router.read().await;
+        let unconfirmed: Vec<_> = addresses
+            .into_iter()
+            .filter(|cidr| {
+                crate::routing::parse_ip_net_str(cidr)
+                    .is_some_and(|network| !router.confirms_lan_self_protection(network.addr()))
+            })
+            .collect();
+        if !unconfirmed.is_empty() {
+            warn!(
+                lan_interfaces = ?interfaces,
+                local_addresses = ?unconfirmed,
+                "LAN self-protection coverage could not be confirmed; review explicit direct(must) rules for management access, excluding port 53 if transparent DNS is intended; configured routing is unchanged"
+            );
+        }
+    }
+
     pub(in crate::control) async fn dispatch_control_command(
         &mut self,
         command: ControlCommand,
@@ -301,24 +332,21 @@ impl ControlPlane {
             ControlCommand::NetworkChanged => {
                 let _reload = self.reload_lock.lock().await;
                 let current = self.config.read().await.clone();
-                let mut next = current.as_ref().clone();
-                let routing_changed = next.ensure_local_direct_rules();
                 let client_subnet_auto = matches!(
                     current.dns.client_subnet_mode(),
                     Ok(Some(honk_config::dns::DnsClientSubnet::Auto { .. }))
                 );
-                if client_subnet_auto {
+                let new_config = if client_subnet_auto {
+                    let mut next = current.as_ref().clone();
                     crate::dns::ecs::resolve_client_subnet(&mut next.dns).await;
-                }
-                let client_subnet_changed =
-                    next.dns.resolved_client_subnet != current.dns.resolved_client_subnet;
-                let new_config = (routing_changed || client_subnet_changed).then_some(next);
+                    (next.dns.resolved_client_subnet != current.dns.resolved_client_subnet)
+                        .then_some(next)
+                } else {
+                    None
+                };
                 let applied = match new_config {
                     Some(new_config) => {
-                        info!(
-                            routing_changed,
-                            client_subnet_changed, "refreshing runtime after network change"
-                        );
+                        info!("refreshing DNS ECS after network change");
                         match self
                             .apply_resolved_runtime_config_locked(
                                 new_config,
@@ -337,6 +365,10 @@ impl ControlPlane {
                     }
                     None => true,
                 };
+                #[cfg(feature = "ebpf")]
+                if applied {
+                    self.warn_lan_self_protection().await;
+                }
                 drop(_reload);
                 if !applied {
                     warn!("network-triggered runtime refresh rejected");
@@ -372,6 +404,11 @@ impl ControlPlane {
             .bind_endpoint()
             .map_err(|error| anyhow::anyhow!("invalid dns.bind: {error}"))?;
         drop(config);
+        #[cfg(feature = "ebpf")]
+        {
+            let _reload = self.reload_lock.lock().await;
+            self.warn_lan_self_protection().await;
+        }
         let bound_dns_listener = dns_bind_endpoint
             .as_ref()
             .map(dns_listener::BoundDnsListener::bind)
@@ -501,6 +538,7 @@ impl ControlPlane {
                 udp_concurrency_limit: Arc::clone(&self.udp_concurrency_limit),
                 dns_controller: Arc::clone(&self.dns_controller),
                 drain: self.drain_tracker.clone(),
+                requires_dns_route_mark: daens_netns_exists(),
                 handle: self.spawn_handle(),
             };
             let mut tasks = self.background_tasks.lock().await;
@@ -1014,321 +1052,6 @@ impl ControlPlane {
             connection_tracker: self.connection_tracker.clone(),
             tcp_flow_pins: self.tcp_flow_pins.clone(),
             mode_state: self.mode_state.clone(),
-        }
-    }
-}
-/// Work produced by the shared IPv4/IPv6 UDP slow-path dispatcher after a
-/// fast-path miss. The accept loop never awaits PacketTransport I/O; DNS
-/// resolution (when required) runs inside an admitted task.
-pub(super) enum UdpSlowPathWork {
-    /// Fresh reservation: caller spawns `serve_udp_connection`.
-    Initialize(UdpInitLease),
-    /// Strict port-53 DNS owns generation-local admission through its reply.
-    Dns {
-        admission: crate::control::dns_control::AdmittedDnsQuery,
-        data: Bytes,
-        validated: ValidatedDnsQuery,
-    },
-    DnsRefused {
-        runtime: crate::dns::runtime::RuntimeLease,
-        udp_permit: tokio::sync::OwnedSemaphorePermit,
-        response: Vec<u8>,
-    },
-    /// Fully handled in the receive loop (enqueued / rejected / dropped).
-    Done,
-}
-
-/// Shared production admission helper used by both listener families and by
-/// focused tests. Strict port-53 DNS acquires generation-local query and UDP
-/// admission before its heap copy. Other datagrams retain generic UDP admission.
-#[cfg(test)]
-pub(super) fn begin_udp_slow_path(
-    pool: &Arc<UdpEndpointPool>,
-    stats: &StatsManager,
-    concurrency_limit: &Arc<tokio::sync::Semaphore>,
-    dns: Option<(
-        &crate::control::dns_control::DnsController,
-        ValidatedDnsQuery,
-    )>,
-    src_addr: SocketAddr,
-    original_dst: SocketAddr,
-    data: &[u8],
-) -> UdpSlowPathWork {
-    begin_udp_slow_path_at(
-        pool,
-        stats,
-        concurrency_limit,
-        dns,
-        src_addr,
-        original_dst,
-        data,
-        udp_endpoint::queue_now(),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn begin_udp_slow_path_at(
-    pool: &Arc<UdpEndpointPool>,
-    stats: &StatsManager,
-    concurrency_limit: &Arc<tokio::sync::Semaphore>,
-    dns: Option<(
-        &crate::control::dns_control::DnsController,
-        ValidatedDnsQuery,
-    )>,
-    src_addr: SocketAddr,
-    original_dst: SocketAddr,
-    data: &[u8],
-    enqueued_at: u32,
-) -> UdpSlowPathWork {
-    if original_dst.port() == 53
-        && let Some((dns_controller, validated)) = dns
-    {
-        let admission = match dns_controller.try_admit_query(true) {
-            Ok(admission) => {
-                stats.record_udp_slow_permit_accepted();
-                admission
-            }
-            Err(error) => {
-                if let Some((runtime, udp_permit)) = error.udp_reply {
-                    stats.record_udp_slow_permit_accepted();
-                    return UdpSlowPathWork::DnsRefused {
-                        runtime,
-                        udp_permit,
-                        response: crate::dns::response::build_dns_refused(data),
-                    };
-                }
-                stats.record_udp_slow_permit_rejected();
-                return UdpSlowPathWork::Done;
-            }
-        };
-        return UdpSlowPathWork::Dns {
-            admission,
-            data: Bytes::copy_from_slice(data),
-            validated,
-        };
-    }
-    let Some(permit) = try_admit_udp_slow_path(stats, concurrency_limit) else {
-        return UdpSlowPathWork::Done;
-    };
-    match pool.reserve_or_enqueue_at(src_addr, original_dst, data, permit, enqueued_at, stats) {
-        EndpointReservation::Initializing(lease) => UdpSlowPathWork::Initialize(lease),
-        EndpointReservation::Enqueued
-        | EndpointReservation::CapacityRejected
-        | EndpointReservation::QueueFull
-        | EndpointReservation::IdentityMismatch
-        | EndpointReservation::QueueClosed => UdpSlowPathWork::Done,
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct UdpLoopState {
-    pub(super) udp_pool: Arc<UdpEndpointPool>,
-    pub(super) stats: Arc<StatsManager>,
-    pub(super) udp_concurrency_limit: Arc<tokio::sync::Semaphore>,
-    pub(super) dns_controller: Arc<crate::control::dns_control::DnsController>,
-    pub(super) drain: Arc<DrainTracker>,
-    pub(super) handle: ControlPlaneHandle,
-}
-
-/// Receive loop for one UDP listener socket. The eBPF datapath hashes each
-/// flow to a specific socket of the group, so loops are flow-disjoint and
-/// run in parallel across runtime workers.
-async fn udp_listener_loop(state: UdpLoopState, socket: Arc<UdpSocket>, family: &'static str) {
-    let mut batch = match UdpRecvBatch::new() {
-        Ok(batch) => batch,
-        Err(error) => {
-            error!("{} UDP recv setup error: {}", family, error);
-            return;
-        }
-    };
-    let local_addr = match socket.local_addr() {
-        Ok(local_addr) => local_addr,
-        Err(error) => {
-            error!("{} UDP recv error: {}", family, error);
-            return;
-        }
-    };
-    loop {
-        if let Err(error) = recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch).await {
-            error!("{} UDP recv error: {}", family, error);
-            continue;
-        }
-        let batch_received_at = udp_endpoint::queue_now();
-        for index in 0..batch.len() {
-            let (data, src_addr, recv_meta) = match batch.packet(index) {
-                Ok(packet) => packet,
-                Err(error) => {
-                    error!("{} UDP recv packet error: {}", family, error);
-                    continue;
-                }
-            };
-            let Some(destination) = udp_original_dst(&recv_meta, data) else {
-                debug!(
-                    "Dropping {} UDP from {} without original-destination provenance",
-                    family, src_addr
-                );
-                continue;
-            };
-            let original_dst = destination.address;
-            let mut validated_dns = destination.validated_dns;
-            if original_dst.port() == 53 && validated_dns.is_none() {
-                validated_dns = validate_exact_dns_query(data);
-            }
-            if !accepts_transparent_connection(&state.drain) {
-                state.stats.record_udp_slow_permit_closed();
-                continue;
-            }
-            if udp_fast_path_at(
-                &state.udp_pool,
-                &state.stats,
-                data,
-                src_addr,
-                original_dst,
-                validated_dns,
-                batch_received_at,
-            )
-            .await
-            {
-                continue;
-            }
-            dispatch_udp_slow_path_at(
-                &state,
-                src_addr,
-                original_dst,
-                data,
-                validated_dns,
-                batch_received_at,
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-pub(super) fn dispatch_udp_slow_path(
-    state: &UdpLoopState,
-    src_addr: SocketAddr,
-    original_dst: SocketAddr,
-    data: &[u8],
-    validated_dns: Option<ValidatedDnsQuery>,
-) {
-    dispatch_udp_slow_path_at(
-        state,
-        src_addr,
-        original_dst,
-        data,
-        validated_dns,
-        udp_endpoint::queue_now(),
-    );
-}
-
-fn dispatch_udp_slow_path_at(
-    state: &UdpLoopState,
-    src_addr: SocketAddr,
-    original_dst: SocketAddr,
-    data: &[u8],
-    validated_dns: Option<ValidatedDnsQuery>,
-    enqueued_at: u32,
-) {
-    match begin_udp_slow_path_at(
-        &state.udp_pool,
-        &state.stats,
-        &state.udp_concurrency_limit,
-        validated_dns.map(|validated| (state.dns_controller.as_ref(), validated)),
-        src_addr,
-        original_dst,
-        data,
-        enqueued_at,
-    ) {
-        UdpSlowPathWork::Done => {}
-        UdpSlowPathWork::Initialize(lease) => {
-            let handle = state.handle.clone();
-            let drain = Arc::clone(&state.drain);
-            state.udp_pool.spawn_slow_path(async move {
-                let _guard = ConnectionGuard::new(drain);
-                if let Err(e) = handle.serve_udp_connection(lease).await {
-                    warn!(
-                        "Error handling UDP from {} (orig {}): {}",
-                        src_addr, original_dst, e
-                    );
-                }
-            });
-        }
-        UdpSlowPathWork::Dns {
-            admission,
-            data,
-            validated,
-        } => {
-            let guard = ConnectionGuard::new(Arc::clone(&state.drain));
-            let dns_controller = Arc::clone(&state.dns_controller);
-            state.udp_pool.spawn_slow_path(async move {
-                let _guard = guard;
-                dns_controller
-                    .handle_udp_dns_admitted(&admission, &data, src_addr, original_dst, validated)
-                    .await;
-            });
-        }
-        UdpSlowPathWork::DnsRefused {
-            runtime,
-            udp_permit,
-            response,
-        } => {
-            let guard = ConnectionGuard::new(Arc::clone(&state.drain));
-            state.udp_pool.spawn_slow_path(async move {
-                let _guard = guard;
-                let _permit = udp_permit;
-                let _ = runtime
-                    .run_reply(super::send_udp_reply_from_orig_dst(
-                        &response,
-                        src_addr,
-                        original_dst,
-                    ))
-                    .await;
-            });
-        }
-    }
-}
-
-/// Test helper for family-symmetric admission: acquire
-/// the slow permit then synchronously reserve/enqueue (non-DNS path).
-#[cfg(test)]
-pub(super) fn reserve_udp_slow_path(
-    pool: &Arc<UdpEndpointPool>,
-    stats: &StatsManager,
-    concurrency_limit: &Arc<tokio::sync::Semaphore>,
-    src_addr: SocketAddr,
-    original_dst: SocketAddr,
-    data: &[u8],
-) -> Option<UdpInitLease> {
-    match begin_udp_slow_path(
-        pool,
-        stats,
-        concurrency_limit,
-        None,
-        src_addr,
-        original_dst,
-        data,
-    ) {
-        UdpSlowPathWork::Initialize(lease) => Some(lease),
-        UdpSlowPathWork::Dns { .. }
-        | UdpSlowPathWork::DnsRefused { .. }
-        | UdpSlowPathWork::Done => None,
-    }
-}
-
-/// Admit a non-DNS datagram after a fast-path miss. DNS records the same
-/// slow-permit counters at its generation-owned admission boundary.
-pub(super) fn try_admit_udp_slow_path(
-    stats: &StatsManager,
-    concurrency_limit: &Arc<tokio::sync::Semaphore>,
-) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    match concurrency_limit.clone().try_acquire_owned() {
-        Ok(permit) => {
-            stats.record_udp_slow_permit_accepted();
-            Some(permit)
-        }
-        Err(_) => {
-            stats.record_udp_slow_permit_rejected();
-            None
         }
     }
 }

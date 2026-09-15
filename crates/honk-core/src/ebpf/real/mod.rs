@@ -38,6 +38,30 @@ fn kernel_version() -> Option<(u32, u32, u32)> {
         None
     }
 }
+pub(super) fn validate_routing_handoff_sizes(key_size: u32, value_size: u32) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        key_size == core::mem::size_of::<TuplesKey>() as u32
+            && value_size == core::mem::size_of::<RoutingHandoffEntry>() as u32,
+        "map 'ROUTING_HANDOFF_MAP' has incompatible layout: expected key={} value={}, actual key={key_size} value={value_size}",
+        core::mem::size_of::<TuplesKey>(),
+        core::mem::size_of::<RoutingHandoffEntry>()
+    );
+    Ok(())
+}
+
+pub(super) fn validate_routing_handoff_layout(bpf: &Ebpf) -> anyhow::Result<()> {
+    const NAME: &str = "ROUTING_HANDOFF_MAP";
+    let map = bpf
+        .map(NAME)
+        .ok_or_else(|| anyhow::anyhow!("map '{NAME}' not found"))?;
+    let aya::maps::Map::HashMap(map) = map else {
+        anyhow::bail!("map '{NAME}' has incompatible map type");
+    };
+    let info = map
+        .info()
+        .map_err(|error| anyhow::anyhow!("query map '{NAME}': {error}"))?;
+    validate_routing_handoff_sizes(info.key_size(), info.value_size())
+}
 
 /// Real eBPF backend backed by Aya and kernel BPF maps.
 ///
@@ -520,7 +544,11 @@ impl EbpfBackend for RealEbpfBackend {
         self.publish_compiled_routing(plan, learned_domains)
     }
 
-    fn active_routing_generation(&self) -> anyhow::Result<u32> {
+    fn routing_policy_generation(&self) -> u64 {
+        self.routing_generation_counter
+    }
+
+    fn active_routing_slot(&self) -> anyhow::Result<u32> {
         Ok(self.routing_slot)
     }
 
@@ -783,8 +811,8 @@ impl EbpfBackend for RealEbpfBackend {
             LookupAndDelete::Missing => return Ok(None),
             LookupAndDelete::Unsupported => {}
         }
-        // The pre-4.20 fallback is intentionally non-atomic. A concurrent
-        // replacement can be dropped, but this handoff is only a routing hint.
+        // This legacy non-atomic fallback may lose a replacement. Ordinary
+        // flows can re-route; transparent TCP DNS rejects missing authority.
         let entry = self.hash_lookup("ROUTING_HANDOFF_MAP", key)?;
         if entry.is_some() {
             bpf_delete_shared(bpf, "ROUTING_HANDOFF_MAP", key)?;
@@ -1033,29 +1061,25 @@ impl EbpfBackend for RealEbpfBackend {
         // they are created in, so both must run inside daens.  The link
         // handle persists after switching back to the host netns.
         crate::with_daens_netns("attach dae0peer_ingress", move || {
-            if let Err(e) = aya::programs::tc::qdisc_add_clsact("dae0peer")
-                && !e.to_string().contains("File exists")
+            if let Err(error) = aya::programs::tc::qdisc_add_clsact("dae0peer")
+                && !error.to_string().contains("File exists")
             {
-                warn!("failed to add clsact qdisc to dae0peer: {}", e);
+                warn!("failed to add clsact qdisc to dae0peer: {}", error);
             }
 
-            match Self::attach_tc(self.bpf_mut()?, "dae0peer_ingress", "dae0peer") {
-                Ok(id) => {
-                    let p: &mut aya::programs::SchedClassifier = self
-                        .bpf_mut()?
-                        .program_mut("dae0peer_ingress")
-                        .ok_or_else(|| anyhow::anyhow!("dae0peer_ingress program disappeared"))?
-                        .try_into()?;
-                    self.dae0peer_ingress_link = Some(p.take_link(id).map_err(|e| {
-                        anyhow::anyhow!("failed to take dae0peer_ingress link: {}", e)
-                    })?);
-                    info!("dae0peer_ingress attached and link held");
-                }
-                Err(e) => {
-                    warn!("dae0peer_ingress attach failed (non-fatal): {}", e);
-                }
-            }
-
+            let id = Self::attach_tc(self.bpf_mut()?, "dae0peer_ingress", "dae0peer")
+                .map_err(|error| anyhow::anyhow!("attach dae0peer_ingress: {error}"))?;
+            let program: &mut aya::programs::SchedClassifier = self
+                .bpf_mut()?
+                .program_mut("dae0peer_ingress")
+                .ok_or_else(|| anyhow::anyhow!("dae0peer_ingress program disappeared"))?
+                .try_into()?;
+            self.dae0peer_ingress_link = Some(
+                program
+                    .take_link(id)
+                    .map_err(|error| anyhow::anyhow!("take dae0peer_ingress link: {error}"))?,
+            );
+            info!("dae0peer_ingress attached and link held");
             Ok(())
         })
     }

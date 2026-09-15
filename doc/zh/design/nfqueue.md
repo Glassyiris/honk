@@ -20,7 +20,7 @@ global {
 | --- | --- |
 | 经过 LAN TC 后语义尚不明确的新 LAN 转发 UDP | 启用且 ready 时，暂存唯一 token 并在 NFQUEUE 中持有原始 skb |
 | 主机发起的 WAN UDP | 保持规范 TPROXY 路径；主机 egress 不经过这个 `inet prerouting` hook |
-| UDP 端口 `53` | 保持专用 DNS fast path；绝不暂存 |
+| UDP 端口 `53` | 遵循[流量规则所有权](../reference/routing.md#出站目标与-must)；不进入普通 UDP conn-state，绝不暂存或分配 decision token |
 | 内部/特殊或反向流量 | 绝不暂存 |
 | `must` 或 `block` 路由结果 | 视为终态；绝不暂存 |
 | 路由时已经确定安全的 direct 结果 | 走内核 direct 路径；绝不暂存 |
@@ -51,6 +51,8 @@ flowchart LR
 | 失败策略 | 不设置 queue bypass、fanout 或 fail-open flag。输入畸形或截断、`ENOBUFS`、listener 意外退出以及 verdict socket 失败均为 fatal |
 
 服务先绑定队列 `320`，再发布 nftables 事务。安装阶段在单实例锁保护下回收残留的保留 table；最终有序关闭时，它会 drain 所有已分发 guard、关闭队列，并最后删除自有 table。同一网络命名空间的防火墙管理器不得在 honk 运行期间修改任一保留 nftables 对象。
+
+每次内核统计采样先在调用线程所在的队列网络命名空间中打开 procfs 文件，再通过已绑定该命名空间的文件描述符异步读取；采样对象不由进程主线程或阻塞工作线程的命名空间决定。
 
 ## 决策 token 协议
 

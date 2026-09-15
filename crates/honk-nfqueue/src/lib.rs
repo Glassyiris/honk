@@ -10,6 +10,7 @@ mod kernel_tests;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tokio::io::AsyncReadExt;
 
 pub use packet::{PacketError, QueuedPacket, UdpTuple};
 pub use rules::{CHAIN_NAME, CHAIN_PRIORITY, TABLE_NAME};
@@ -195,9 +196,14 @@ impl QueueStatsReader {
         }
     }
 
+    /// The future must first be polled in the queue's network namespace.
     pub async fn stats(&self) -> io::Result<QueueStats> {
         let generation = self.kernel_counters.lock().generation;
-        let contents = tokio::fs::read_to_string("/proc/net/netfilter/nfnetlink_queue").await?;
+        // Tokio's blocking workers may belong to a different network namespace.
+        let file = std::fs::File::open("/proc/thread-self/net/netfilter/nfnetlink_queue")?;
+        let mut file = tokio::fs::File::from_std(file);
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).await?;
         let (kernel_queue_depth, kernel_dropped, kernel_user_dropped) =
             parse_kernel_queue_stats(&contents).ok_or_else(|| {
                 io::Error::new(

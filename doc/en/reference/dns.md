@@ -24,7 +24,7 @@ For scalar settings, only an unquoted token-head `#` starts a comment. `use_host
 
 ## Standalone listener (`bind`)
 
-The standalone listener uses ordinary, unmarked sockets in the host network namespace. Transparent TCP and UDP port-53 interception remains active when the standalone listener is disabled.
+The standalone listener uses ordinary, unmarked sockets in the host network namespace. Disabling it does not disable transparent TCP/UDP port-53 interception, which follows [traffic-rule ownership](./routing.md#outbound-targets-and-must).
 
 | Value | Result |
 | --- | --- |
@@ -39,6 +39,8 @@ A hostname requires a scheme, for example `udp://localhost:1053`. IPv6 literals 
 A bare hostname is invalid. The parser also rejects userinfo, paths, queries, fragments, backslashes, IPv6 zone identifiers, malformed brackets, unsupported schemes, and out-of-range ports. For a hostname, honk tries addresses in system resolution order and uses the first address on which every requested transport binds. Binding is synchronous and all-or-nothing: any failure closes the other selected sockets and fails startup.
 
 Listener ownership is process-scoped. A SIGHUP reload accepts semantically equivalent spelling, but rejects any change to the host, port, or transport set as restart-required. A wildcard or LAN-facing bind exposes an unauthenticated recursive resolver; restrict source access with the host firewall and never publish it to an untrusted network.
+
+Local `:53` precedence is transport-specific, with a full FIB check for wildcard binds; see the [listener matrix](../design/dns.md#dns-ownership-state-machine).
 
 ## Hosts snapshot (`use_host`)
 
@@ -148,11 +150,13 @@ DNS `sip()` and `ip()` share one IP-or-CIDR decoder. Bare IPv4 and IPv6 addresse
 | Action | Result |
 | --- | --- |
 | `reject` | Return an empty successful response. |
-| `asis` | Dial the intercepted original DNS destination. A transparent query preserves its ingress transport; UDP retries the same destination over TCP when the response has `TC` set. A standalone query has no original destination and fails instead of recursing into the listener. |
+| `asis` | Create a new query to the intercepted original DNS destination using honk-originated sockets, not the client's network source IP/port. A transparent query preserves its ingress transport; UDP retries the same destination over TCP when the response has `TC` set. A standalone query has no original destination and fails instead of recursing into the listener. |
 | Upstream name | Query that named upstream. |
 | `fallback: reject\|asis\|<upstream>` | Action used when no request rule matches; default is upstream `default`. |
 
 A source-aware lookup made for an admitted flow carries no intercepted DNS-server destination. If its request policy selects `asis`, resolution fails closed; it never falls through to the compatibility/default upstream.
+
+Native `direct(must)` bypass differs from `asis` re-querying; see [DNS source/NAT and projection caveats](../design/dns.md#ingress-paths).
 
 ### Response actions
 

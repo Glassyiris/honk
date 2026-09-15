@@ -70,7 +70,9 @@ An empty `lan_interface` is literal: honk installs no LAN TC hooks and never sub
 
 `auto` resolves to the interface owning the lowest-metric IPv4 default route. If no such route exists, that entry is omitted from the desired hook set and remains pending. Traffic on the unresolved interface stays fail-open because no hook is attached; explicitly named interfaces in the same list continue to work.
 
-`IfaceWatcher` subscribes to link, address, and IPv4 route events and also performs a 60-second reconciliation. It attaches, detaches, or rebinds the required LAN/WAN hooks as interfaces and default routes change, including LAN bridge/bond members and WAN bond slaves. A changed topology refreshes generated gateway-address `direct(must)` rules and immediately wakes health-backed outbound probing. Interface-list configuration changes themselves require restart.
+`IfaceWatcher` subscribes to link, address, and IPv4 route events and also performs a 60-second reconciliation. It attaches, detaches, or rebinds the required LAN/WAN hooks as interfaces and default routes change, including LAN bridge/bond members and WAN bond slaves. A changed topology immediately wakes health-backed outbound probing. Interface addresses remain observed for topology/ECS/health events, but startup, reload, and network events never synthesize gateway-address routing rules. Configure [explicit local rules](./routing.md#explicit-local-rules) when needed. Interface-list configuration changes themselves require restart.
+
+Real LAN bindings also receive an advisory [self-protection coverage check](./routing.md#explicit-local-rules). An unconfirmed result warns without rejecting startup/reload or inserting routing rules.
 
 ## Dial modes
 

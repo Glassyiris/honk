@@ -21,7 +21,7 @@ pub(crate) enum ControlCommand {
         nodes: Vec<Node>,
         diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
     },
-    /// Refresh generated gateway-address rules and bypass stale health
+    /// Refresh interface-dependent runtime state and bypass stale health
     /// backoff after a link, address, route, or interface-role change.
     NetworkChanged,
     Shutdown,

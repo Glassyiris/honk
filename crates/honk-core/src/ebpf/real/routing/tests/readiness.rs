@@ -151,7 +151,11 @@ fn fact_readiness_failure_joins_preserve_full_decisions() {
         ],
     };
     let plan = readiness_plan(facts);
-    let mut backend = RealEbpfBackend::load_routing_test_fixture(&object()).unwrap();
+    let mut backend = RealEbpfBackend::load_routing_test_fixture(
+        &object(),
+        honk_ebpf_common::DaeParam::default(),
+    )
+    .unwrap();
     backend.publish_routing_plan(&plan, &[]).unwrap();
 
     let mut full = golden::connection();
@@ -254,7 +258,11 @@ fn fact_readiness_independent_bitmap_states() {
             .mac
             .push((mac_key([2, 0, 0, 0, 0, index as u8]), value));
     }
-    let mut backend = RealEbpfBackend::load_routing_test_fixture(&object()).unwrap();
+    let mut backend = RealEbpfBackend::load_routing_test_fixture(
+        &object(),
+        honk_ebpf_common::DaeParam::default(),
+    )
+    .unwrap();
     backend
         .publish_routing_plan(&readiness_plan(facts), &[])
         .unwrap();

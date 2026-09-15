@@ -635,9 +635,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         // Make `direct`/`block` usable as group members without declaring them
         // in the config (Direct/Block protocols → DirectHandler/BlockHandler).
         config.ensure_builtin_nodes();
-        // Traffic to the gateway's own addresses always goes direct (must),
-        // keeping admin/API access alive even when every node is down.
-        config.ensure_local_direct_rules();
 
         // Effective log level: --debug flag > RUST_LOG env > config log_level >
         // "info".
@@ -1314,7 +1311,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             match result {
                 Ok(mut new_config) => {
                     new_config.ensure_builtin_nodes();
-                    new_config.ensure_local_direct_rules();
                     if let Err(error) = request_runtime_reload(
                         &reload_tx,
                         &reload_subscription_supervisor,
@@ -1524,7 +1520,12 @@ fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<(
 
         // fwmark → table 100 with a local default route (v4 + v6 mirror):
         // marked packets are delivered to daens-local sockets.
-        n.add_rule_fwmark(FAM_V4, tproxy_mark, 100)?;
+        n.add_rule_fwmark(
+            FAM_V4,
+            tproxy_mark,
+            !honk_ebpf_common::DNS_ROUTE_MARK_MASK,
+            100,
+        )?;
         n.add_route(
             FAM_V4,
             100,
@@ -1535,7 +1536,12 @@ fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<(
             None,
             Some(lo),
         )?;
-        n.add_rule_fwmark(FAM_V6, tproxy_mark, 100)?;
+        n.add_rule_fwmark(
+            FAM_V6,
+            tproxy_mark,
+            !honk_ebpf_common::DNS_ROUTE_MARK_MASK,
+            100,
+        )?;
         n.add_route(
             FAM_V6,
             100,
@@ -1885,8 +1891,18 @@ fn cleanup_dae0_interface(recorded_ifindex: Option<u32>) {
     // Policy-routing rules for daens live inside the daens namespace and
     // disappear with it; these are only a safety net for stale
     // host-namespace rules.
-    let _ = nl.del_rule_fwmark(netlink::FAM_V4, honk_ebpf_common::TPROXY_MARK, 100);
-    let _ = nl.del_rule_fwmark(netlink::FAM_V6, honk_ebpf_common::TPROXY_MARK, 100);
+    let _ = nl.del_rule_fwmark(
+        netlink::FAM_V4,
+        honk_ebpf_common::TPROXY_MARK,
+        u32::MAX,
+        100,
+    );
+    let _ = nl.del_rule_fwmark(
+        netlink::FAM_V6,
+        honk_ebpf_common::TPROXY_MARK,
+        u32::MAX,
+        100,
+    );
 }
 
 /// Addressing for the dae0/dae0peer link pair between the host namespace and

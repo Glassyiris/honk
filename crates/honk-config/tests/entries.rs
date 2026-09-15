@@ -675,21 +675,27 @@ mod group_syntax {
     }
 
     #[test]
-    fn bare_filter_quote_receives_its_own_warning() {
-        let input = "node {\n edge: 'socks5://127.0.0.1:1080'\n}\ngroup {\n proxy {\n filter:'unterminated\n }\n}";
-        let mut diagnostics = Vec::new();
-        let config = parse_dae_config_with_detailed_diagnostics(input, &mut diagnostics).unwrap();
-        assert!(config.groups[0].nodes.is_empty());
-        assert_eq!(
-            diagnostics
-                .iter()
-                .map(|diagnostic| diagnostic.code)
-                .collect::<Vec<_>>(),
-            ["legacy-config-warning"],
-        );
-        let diagnostic = &diagnostics[0];
-        assert_eq!(diagnostic.setting.to_string(), "groups[1].filter");
-        assert_eq!(diagnostic.entry_index, Some(1));
-        assert_eq!(&input[diagnostic.span.clone().unwrap()], "'unterminated");
+    fn filter_quote_without_a_space_is_the_same_unterminated_quote() {
+        // `filter:'x` and `filter: 'x` are one entry in dae's grammar; an
+        // unterminated quote is the located lexer error in both spellings.
+        for input in [
+            "node {\n edge: 'socks5://127.0.0.1:1080'\n}\ngroup {\n proxy {\n filter:'unterminated\n }\n}",
+            "node {\n edge: 'socks5://127.0.0.1:1080'\n}\ngroup {\n proxy {\n filter: 'unterminated\n }\n}",
+        ] {
+            let mut diagnostics = Vec::new();
+            let config =
+                parse_dae_config_with_detailed_diagnostics(input, &mut diagnostics).unwrap();
+            assert!(config.groups[0].nodes.is_empty());
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                ["unterminated-quote"],
+            );
+            let diagnostic = &diagnostics[0];
+            assert!(!diagnostic.terminal);
+            assert_eq!(&input[diagnostic.span.clone().unwrap()], "'unterminated");
+        }
     }
 }

@@ -6,7 +6,7 @@
 policy IR，受限编译器把同一 IR 降低为原生 eBPF 比较代码。内核不再解释第二套
 policy 表示。真实后端的内核基线为 Linux 6.12。
 
-静态 TC 程序继续负责报文解析、特殊/本地/DNS 排除、conntrack、mode 与健康检查、
+静态 TC 程序继续负责报文解析、特殊/本地排除、DNS 接管判断、conntrack、mode 与健康检查、
 NFQUEUE 所有权、重定向和回包统计。生成函数只负责
 `RoutingInput -> RoutingDecision`。不会因为采用编译策略而把所有首包送到用户态；
 native-direct 与已有流缓存路径保持原生执行。
@@ -15,8 +15,8 @@ native-direct 与已有流缓存路径保持原生执行。
 
 规范化 IR 保存有序 RuleId、展示信息、条件与 outbound/mark/must 动作。priority
 数值越小越先匹配，同优先级保持稳定的源码顺序。dae 解析器按源码顺序分配
-`0, 1, ...`；生成的本地规则使用 priority `0` 并追加在用户规则之后，因此只
-优先于更高 priority 的用户规则。较早命中的用户 priority-0 规则仍先生效。
+`0, 1, ...`；流量规则及其顺序完全由用户配置决定。启动、重载和接口变化不再
+注入网关地址 `direct(must)` 规则，也没有隐藏的内核地址白名单。
 条件之间 AND，同一条件的候选值 OR，否定只作用一次且覆盖整个条件。fallback
 是独立的终结动作。空展开不能被丢弃：正向空集合为 false，负向空集合为 true，
 不能因 geo 资源没有匹配项而放宽复合规则。
@@ -45,6 +45,10 @@ native-direct 与已有流缓存路径保持原生执行。
   条件的 veto。
 - 配置 `(must)` 是终结结果：设置显式的 `must` 决策字段并跳过嗅探。
   Clash 模式不能覆盖 `must` 或 `block`。
+
+LAN/WAN TCP/UDP 目的端口 `53` 在现有入口排除与本地监听优先判断后，
+执行一次正常有序策略，不单独扫描 must 规则。[路由参考](../reference/routing.md#出站目标与-must)
+定义 DNS 所有权及[显式本地路由迁移](../reference/routing.md#显式本地路由)。
 
 旧 lowering 丢弃 full/regex、把协议 OR 降成 TCP、截断规则链、DNS 只投影首条整规则、
 重叠 LPM 丢失祖先位图，都不是要保留的兼容行为。共享 IR 和独立 golden 案例需要
@@ -99,9 +103,10 @@ String 和 allocator 对象都不跨边界。
 policy 没有域名谓词、禁用了域名重路由，或已经取得完整的 learned-domain bitmap。
 它是 policy-generation 内的数据，不是另行发布、可能错代的全局路由 flag。
 
-非 `must` 的 direct 结果若域名 finality 尚未确定，交接给用户态时必须编码为
-`ControlPlaneRouting`；若仍写成最终 direct，TCP/UDP 初始化会跳过嗅探。
-已知 direct、must、block 以及 mode 控制的 direct offload 保留终态语义。
+非 DNS 流量中，非 `must` 的 direct 结果若域名 finality 尚未确定，交接给用户态时
+必须编码为 `ControlPlaneRouting`；若仍写成最终 direct，TCP/UDP 初始化会跳过嗅探。
+该非 DNS 路径保留已知 direct、must、block 与 mode direct offload 的终态语义；
+端口 53 所有权遵循上述参考。
 
 只在路由 miss 时初始化输入，复用现有 per-CPU packet scratch，缓存包不清空它。
 slot 的 volatile 访问防止 LLVM 删除输入或折叠输出；pname 规范化由独立验证、
@@ -166,6 +171,12 @@ lookup；仅清零 IPv4 key 的 padding，不清零马上会被覆盖的字节�
 `RoutingPolicyDescriptor`。descriptor 标识 slot、policy generation、feature bits
 及供诊断使用的 active domain-map ID。一次路由只取一个 descriptor，再同步调用一个
 槽；缓存命中报文不新增这个 lookup。
+
+已提交路由代际不回绕。单进程最多成功发布 1,048,575 次**编译路由策略**，
+耗尽后保留当前策略并拒绝替换，重启后才能继续。这不是所有 SIGHUP 或 DNS
+runtime 重载的次数限制：未变化的编译策略可以跳过发布。物理携带格式见
+[数据路径 ABI](./datapath.md#map-清单)，排队元数据与代际生命周期见
+[控制面准入](./control-plane.md#透明代理入口)。
 
 控制器用一次 backend 发布调用传入不可变 plan 和完整 learned-domain slice。
 后端自行选择 inactive slot 并局部持有候选，不再需要调用方选槽或 pending-domain

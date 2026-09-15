@@ -57,7 +57,10 @@ fn embed_ebpf_object() {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // A shared target can reuse a build-script binary compiled in another checkout.
+    let manifest_dir = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo must provide CARGO_MANIFEST_DIR"),
+    );
     let ebpf_crate = manifest_dir.join("../honk-ebpf");
     let ebpf_common_crate = manifest_dir.join("../honk-ebpf-common");
     let ebpf_target = ebpf_crate.join("target/bpfel-unknown-none/release/honk-ebpf");

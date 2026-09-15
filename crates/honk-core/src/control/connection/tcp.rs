@@ -13,6 +13,13 @@ type UnpackedTcpScorePlan = (
     IpVersion,
 );
 
+struct TcpDnsRoute {
+    decision: super::routing::RoutingDecision,
+    config: Arc<Config>,
+    group_manager: Arc<honk_outbound::group::GroupManager>,
+    runtime: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+}
+
 fn tcp_score_context(
     target: SocketAddr,
     domain: Option<&str>,
@@ -91,6 +98,39 @@ async fn wait_for_cold_urltest_release(index: usize) {
 }
 
 impl ControlPlaneHandle {
+    async fn pin_tcp_dns_route(
+        &self,
+        handoff: &super::handoff::HandoffResult,
+    ) -> anyhow::Result<TcpDnsRoute> {
+        let config = self.config.read().await;
+        let backend = self.ebpf.read().await;
+        anyhow::ensure!(
+            handoff.routing_generation != 0
+                && handoff.routing_generation == backend.routing_policy_generation(),
+            "TCP DNS routing generation is stale"
+        );
+        let group = handoff
+            .outbound
+            .checked_sub(OutboundIndex::UserBase as u8)
+            .filter(|_| handoff.outbound < OutboundIndex::MustRules as u8)
+            .and_then(|index| config.groups.get(index as usize))
+            .ok_or_else(|| anyhow::anyhow!("invalid terminal TCP DNS outbound"))?;
+        let decision = super::routing::RoutingDecision {
+            outbound: group.name.clone(),
+            must: true,
+            mark: handoff.mark,
+            matched_rule: None,
+            reroute_by_sniffed_domain: false,
+        };
+        drop(backend);
+        Ok(TcpDnsRoute {
+            decision,
+            config: Arc::clone(&config),
+            group_manager: self.group_manager.read().clone(),
+            runtime: self.runtime_registry.read().clone(),
+        })
+    }
+
     pub(in crate::control) async fn serve_connection(
         &self,
         stream: TcpStream,
@@ -138,16 +178,32 @@ impl ControlPlaneHandle {
         );
         let (mut flow, handoff) = self.adopt_tcp_flow(stream, tuples).await?;
 
-        if self
-            .dns_controller
-            .handle_tcp_dns(flow.stream_mut(), client_addr, original_dst)
-            .await?
-        {
-            return Ok(());
-        }
+        let pinned_dns_route = if original_dst.port() == 53 {
+            let handoff = handoff
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("transparent TCP DNS has no routing handoff"))?;
+            if handoff.outbound == OutboundIndex::Block as u8 {
+                None
+            } else if handoff.must != 0 {
+                Some(self.pin_tcp_dns_route(handoff).await?)
+            } else {
+                self.dns_controller
+                    .handle_tcp_dns(flow.stream_mut(), client_addr, original_dst)
+                    .await?;
+                return Ok(());
+            }
+        } else {
+            None
+        };
 
         let (dial_mode, connect_timeout, overall_dial_timeout) = {
-            let config = self.config.read().await;
+            let current_config;
+            let config = if let Some(snapshot) = &pinned_dns_route {
+                &snapshot.config
+            } else {
+                current_config = self.config.read().await;
+                &*current_config
+            };
             let connect_timeout = Duration::from_millis(config.global.connect_timeout_ms);
             (
                 config
@@ -221,9 +277,18 @@ impl ControlPlaneHandle {
             "tcp",
             handoff.as_ref(),
         );
-        let route = self
-            .prepare_routing(dial_mode, &conn_info, domain_verified, handoff.as_ref())
-            .await;
+        let (route, pinned_generation) = if let Some(snapshot) = pinned_dns_route {
+            (
+                snapshot.decision,
+                Some((snapshot.config, snapshot.group_manager, snapshot.runtime)),
+            )
+        } else {
+            (
+                self.prepare_routing(dial_mode, &conn_info, domain_verified, handoff.as_ref())
+                    .await,
+                None,
+            )
+        };
         let reroute_by_sniffed_domain = route.reroute_by_sniffed_domain;
         let matched_rule = route.matched_rule;
         let outbound_name = self.apply_mode_override(route.outbound, route.must).await;
@@ -271,14 +336,18 @@ impl ControlPlaneHandle {
         } else {
             IpVersion::V4
         };
-        // Hold the config read guard while cloning the group/runtime handles:
-        // reload publishes all three under their write guards, so this is one
-        // coherent generation rather than three individually-current values.
-        let generation_config_guard = self.config.read().await;
-        let generation_config = Arc::clone(&generation_config_guard);
-        let generation_group_manager = self.group_manager.read().clone();
-        let runtime_generation = self.runtime_registry.read().clone();
-        drop(generation_config_guard);
+        let (generation_config, generation_group_manager, runtime_generation) =
+            if let Some(snapshot) = pinned_generation {
+                snapshot
+            } else {
+                // Config's publication guard pins the group and runtime handles.
+                let config = self.config.read().await;
+                (
+                    Arc::clone(&config),
+                    self.group_manager.read().clone(),
+                    self.runtime_registry.read().clone(),
+                )
+            };
         let (mut candidates, selection_mode, score_feedback, mut selection_chains, health_ipver) = {
             let context = tcp_score_context(original_dst, domain.as_deref(), ipver);
             let plan = crate::control::reload::resolve_outbound_plan_for_target(

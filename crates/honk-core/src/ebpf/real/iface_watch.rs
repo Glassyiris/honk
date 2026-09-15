@@ -125,8 +125,8 @@ async fn run(
     let mut buf = [0u8; 8192];
     let mut network_state = read_network_state(&config).await;
 
-    // Startup rule generation may have run before this interface became
-    // ready; the control-plane refresh is content-deduplicated.
+    // Interface-dependent state may have changed before the watcher was ready;
+    // the control-plane refresh is content-deduplicated.
     reconcile_and_notify(&ebpf, &config, &commands, &mut attached, true).await;
     loop {
         tokio::select! {

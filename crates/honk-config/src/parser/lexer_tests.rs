@@ -37,6 +37,17 @@ fn argument_position_quotes_are_opaque() {
 }
 
 #[test]
+fn quotes_open_after_a_colon() {
+    // dae accepts `key:'value'` without a space; the quote is the value.
+    word("log_file:'honk.log'", &[(9, 19)]);
+    word("a:\"socks5://127.0.0.1:1080\"", &[(2, 27)]);
+    word("suffix:'a b'", &[(7, 12)]);
+    // an apostrophe not right after the colon stays literal
+    word("bind:127.0.0.1:53", &[]);
+    word("path:/tmp/don't", &[]);
+}
+
+#[test]
 fn glued_tokens_continue_after_quotes() {
     word("'piece'(part)tail", &[(0, 7)]);
     word("filter='hk'#token", &[]);

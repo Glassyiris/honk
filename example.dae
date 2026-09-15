@@ -106,6 +106,7 @@ routing {
     pname(sing-box, mihomo) -> direct(must)
 
     # 私有与国内 IP 直连
+    # 宽泛私网 must 也会绕过 LAN 私网 DNS；需保留接管时显式加上 && !dport(53)。
     dip(geoip: private) -> direct(must)
     dip(geoip: cn) -> direct
 

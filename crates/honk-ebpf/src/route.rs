@@ -119,11 +119,12 @@ fn evaluate_policy(
     pname: Option<&[u8; 16]>,
     input_is_canonical: bool,
     decision: &mut RoutingDecision,
-) -> i32 {
+) -> (i32, u64) {
     let zero = 0u32;
     let Some(descriptor) = ROUTING_POLICY_ROOT.get_value(0, &zero) else {
-        return -EFAULT;
+        return (-EFAULT, 0);
     };
+    let generation = descriptor.generation;
 
     if !input_is_canonical {
         // Process facts are meaningful only for WAN packets and only in
@@ -160,24 +161,23 @@ fn evaluate_policy(
         && (input.l4proto == L4ProtoType::Tcp as u32 || input.l4proto == L4ProtoType::Udp as u32)
         && decision.must == 0
     {
-        // DNS ownership is a static datapath concern: every successful
-        // non-must TCP/UDP policy result is handed to userspace with its mark
-        // intact. LAN takes its earlier DNS fast path; WAN relies on this.
+        // Non-must DNS belongs to the controller even when ordinary traffic
+        // policy selects block; an explicit must result retains its authority.
         decision.outbound = OUTBOUND_CONTROL_PLANE_ROUTING as u32;
     }
-    status
+    (status, generation)
 }
 
-/// Invoke the committed policy for a production routing miss.
+/// Invoke the committed policy and return its decision and descriptor generation.
 #[inline(always)]
 pub fn route(
     input: &mut RoutingInput,
     pname: Option<&[u8; 16]>,
-) -> Result<RoutingDecision, c_long> {
+) -> Result<(RoutingDecision, u64), c_long> {
     let mut decision = RoutingDecision::default();
-    let status = evaluate_policy(input, pname, false, &mut decision);
+    let (status, generation) = evaluate_policy(input, pname, false, &mut decision);
     if status == 0 {
-        Ok(decision)
+        Ok((decision, generation))
     } else if status < 0 {
         Err(status as c_long)
     } else {
@@ -194,7 +194,7 @@ pub fn routing_test(_ctx: *mut __sk_buff) -> c_long {
     let status = match crate::maps::ROUTING_TEST_INPUT.get(0) {
         Some(input) => {
             let mut input = *input;
-            evaluate_policy(&mut input, None, true, &mut decision)
+            evaluate_policy(&mut input, None, true, &mut decision).0
         }
         None => -EFAULT,
     };

@@ -6,6 +6,7 @@ fn handoff(outbound: u8, must: u8) -> HandoffResult {
         must,
         mark: 0,
         decision_token: 0,
+        routing_generation: 0,
         dscp: 0,
         mac: [0; 6],
         pname: [0; 16],
