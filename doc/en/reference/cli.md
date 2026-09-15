@@ -38,6 +38,8 @@ The source comment records the intended order as `--debug` → `RUST_LOG` → `g
 
 See the [global configuration reference](./global.md) for `log_level`.
 
+Configuration notices in startup-failure output and normal logs include a fixed schema `setting` and a numeric `source`: the zero-based ordinal within that parsing attempt's source table, with `0` for the entry source. Available physical `line` and `byte_column` values are one-based; missing locations are omitted. Arbitrary configuration values and source paths remain hidden. Legacy list notices identify the specific global field, such as `global.udp_check_dns`; quote list items individually rather than quoting the entire comma-separated list.
+
 ### Subcommands
 
 | Command | Current behavior | Persistence / runtime effect |

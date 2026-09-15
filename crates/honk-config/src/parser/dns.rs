@@ -294,10 +294,9 @@ fn parse_dns_upstreams(
     diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Vec<crate::dns::DnsUpstream> {
     let mut upstreams = Vec::new();
-    for (index, line) in
-        read::child_statements(section, diagnostics, super::cursor::BodySyntax::Statements)
-            .into_iter()
-            .enumerate()
+    for (index, line) in read::child_statements(section, diagnostics)
+        .into_iter()
+        .enumerate()
     {
         if line.has_error() {
             continue;
@@ -444,10 +443,9 @@ fn parse_fixed_domain_ttl(
     diagnostics: &mut ParserDiagnostics<'_>,
 ) -> HashMap<String, u32> {
     let mut map = HashMap::new();
-    for (index, line) in
-        read::child_statements(section, diagnostics, super::cursor::BodySyntax::Statements)
-            .into_iter()
-            .enumerate()
+    for (index, line) in read::child_statements(section, diagnostics)
+        .into_iter()
+        .enumerate()
     {
         if line.has_error() {
             continue;
@@ -520,10 +518,9 @@ fn parse_dns_routing(
 ) {
     let is_response = read::block_header(section).unwrap().raw() == "response";
     let kind = if is_response { "response" } else { "request" };
-    for (index, line) in
-        read::child_statements(section, diagnostics, super::cursor::BodySyntax::Statements)
-            .into_iter()
-            .enumerate()
+    for (index, line) in read::child_statements(section, diagnostics)
+        .into_iter()
+        .enumerate()
     {
         if line.has_error() {
             continue;

@@ -49,6 +49,26 @@ pub struct Token {
     pub line: usize,
 }
 
+impl Token {
+    pub(super) fn unquoted_parts(&self) -> impl Iterator<Item = Span> + '_ {
+        let mut start = self.span.start;
+        self.quoted
+            .iter()
+            .map(Some)
+            .chain(std::iter::once(None))
+            .map(move |quote| {
+                let end = quote.map_or(self.span.end, |quote| quote.start);
+                let span = Span {
+                    start,
+                    end,
+                    ..self.span
+                };
+                start = quote.map_or(self.span.end, |quote| quote.end);
+                span
+            })
+    }
+}
+
 /// Borrows input once; diagnostics retain only `reference` metadata.
 #[derive(Debug, Clone)]
 pub struct Source<'a> {
@@ -150,7 +170,7 @@ impl<'a> Source<'a> {
     pub fn tokenize(&self, diagnostics: &mut Vec<DetailedDiagnostic>) -> Vec<Token> {
         let mut lexer = Lexer::default();
         let mut tokens = Vec::new();
-        while let Some(token) = lexer.next_token(self, false) {
+        while let Some(token) = lexer.next_token(self, QuoteMode::Ordinary) {
             if let TokenKind::Error { opener } = token.kind {
                 diagnostics.push(self.quote_error(opener, token.span.end));
             }
@@ -179,19 +199,39 @@ impl<'a> Source<'a> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum QuoteMode {
+    Ordinary,
+    IncludePaths,
+    Declarations,
+    Entries,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Declaration {
+    #[default]
+    Head,
+    BareHead,
+    QuotedHead,
+    ValueStart,
+    Value,
+}
+
 #[derive(Default)]
 pub(super) struct Lexer {
     offset: usize,
     line: usize,
+    declaration: Declaration,
 }
 
 impl Lexer {
-    pub(super) fn next_token(
-        &mut self,
-        source: &Source<'_>,
-        adjacent_quotes: bool,
-    ) -> Option<Token> {
+    pub(super) fn begin_statement(&mut self) {
+        self.declaration = Declaration::Head;
+    }
+
+    pub(super) fn next_token(&mut self, source: &Source<'_>, quotes: QuoteMode) -> Option<Token> {
         let bytes = source.text().as_bytes();
+        let declaration_quotes = matches!(quotes, QuoteMode::Declarations | QuoteMode::Entries);
         let start = self.offset;
         if start >= bytes.len() {
             return None;
@@ -212,6 +252,7 @@ impl Lexer {
         if start >= end {
             self.offset = next_line;
             self.line += 1;
+            self.declaration = Declaration::Head;
             return Some(Token {
                 span: source.span(start, next_line),
                 quoted: Vec::new(),
@@ -236,13 +277,32 @@ impl Lexer {
             kind = TokenKind::Comment;
         } else {
             let mut error = None;
-            let mut path_quotes = adjacent_quotes;
+            let mut path_quotes = quotes == QuoteMode::IncludePaths;
             while index < end && source.whitespace_width(index) == 0 {
-                let boundary =
-                    index == start || matches!(bytes[index - 1], b'(' | b',') || path_quotes;
+                if declaration_quotes
+                    && self.declaration == Declaration::QuotedHead
+                    && bytes[index] != b':'
+                {
+                    self.declaration = if quotes == QuoteMode::Entries {
+                        Declaration::Value
+                    } else {
+                        Declaration::BareHead
+                    };
+                }
+                let boundary = index == start
+                    || matches!(bytes[index - 1], b'(' | b',')
+                    || path_quotes
+                    || (declaration_quotes && self.declaration == Declaration::ValueStart);
                 if boundary && matches!(bytes[index], b'\'' | b'"') {
                     if let Some(close) = quoted_end(&bytes[..end], index) {
                         quoted.push(source.span(index, close));
+                        if declaration_quotes {
+                            self.declaration = match self.declaration {
+                                Declaration::Head => Declaration::QuotedHead,
+                                Declaration::BareHead => Declaration::BareHead,
+                                _ => Declaration::Value,
+                            };
+                        }
                         index = close;
                         continue;
                     }
@@ -251,6 +311,17 @@ impl Lexer {
                     break;
                 }
                 path_quotes = false;
+                if declaration_quotes {
+                    self.declaration = match (self.declaration, bytes[index]) {
+                        (
+                            Declaration::Head | Declaration::BareHead | Declaration::QuotedHead,
+                            b':',
+                        ) => Declaration::ValueStart,
+                        (Declaration::Head, _) => Declaration::BareHead,
+                        (Declaration::ValueStart, _) => Declaration::Value,
+                        (state, _) => state,
+                    };
+                }
                 index += source.text()[index..].chars().next().unwrap().len_utf8();
             }
             kind = if let Some(opener) = error {

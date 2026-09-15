@@ -723,6 +723,47 @@ fn test_daemon_reports_timer_diagnostics_on_startup_and_sighup() {
 }
 
 #[test]
+fn test_startup_failure_reports_safe_diagnostic_location() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("PRIVATE_CONFIG_PATH.dae");
+    std::fs::write(
+        &path,
+        "global {\n tcp_check_url: 'https://PRIVATE_URL.example/a,https://example.invalid/b'\n}\nnode {\n PRIVATE_TAG: 'ssr://PRIVATE_ERROR@example.invalid:443'\n}\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_honk-core"))
+        .arg("--config")
+        .arg(&path)
+        .arg("--mock-ebpf")
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run mock daemon with invalid config");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let warning = stderr
+        .lines()
+        .find(|line| line.contains("legacy-quoted-list"))
+        .unwrap_or_else(|| panic!("missing startup warning: {stderr}"));
+    assert!(warning.contains("source=0"), "{warning}");
+    assert!(warning.contains("line=2"), "{warning}");
+    assert!(warning.contains("byte_column=17"), "{warning}");
+    assert!(
+        warning.contains("setting=global.tcp_check_url"),
+        "{warning}"
+    );
+    assert!(warning.contains("value=<redacted>"), "{warning}");
+    for private in [
+        "PRIVATE_CONFIG_PATH",
+        "PRIVATE_URL",
+        "PRIVATE_TAG",
+        "PRIVATE_ERROR",
+    ] {
+        assert!(!stderr.contains(private), "{stderr}");
+    }
+}
+
+#[test]
 fn test_mode_command_rejects_dae_without_rewriting() {
     let directory = tempfile::tempdir().expect("create temporary directory");
     let path = directory.path().join("config.dae");

@@ -1,4 +1,4 @@
-//! Structural indexing and bounded segment traversal; no setting decoding.
+//! Structural indexing and bounded traversal over canonical source-backed segments.
 
 use std::ops::Range;
 
@@ -6,8 +6,11 @@ use super::lexer::{Lexer, Source, Span, Token, TokenKind};
 use crate::diagnostic::{DetailedDiagnostic, SettingPath, Severity};
 use crate::error::{DetailedConfigError, ErrorCategory};
 
+mod syntax;
+use syntax::{Scope, Statement};
+
 /// The root sections a document can carry. One list, matched exhaustively by
-/// the reader dispatch, so a root cannot be indexed here and forgotten there.
+/// the reader dispatch, so this cannot silently diverge from section admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Root {
     Include,
@@ -36,9 +39,7 @@ impl Root {
         Root::ALL.into_iter().find(|root| root.name() == name)
     }
 
-    /// Sections whose readers turn a statement with an unterminated quote into a
-    /// skipped contribution once every open block still closes (K05). Elsewhere
-    /// the document fails at the quote.
+    /// These readers can omit a malformed quoted contribution when every block closes.
     pub fn recovers_from_quote_errors(self) -> bool {
         matches!(self, Root::Group | Root::Node | Root::Dns)
     }
@@ -57,13 +58,13 @@ impl Root {
     }
 }
 
-/// Related opener coordinates stay local until the diagnostic model supports related spans.
+/// Related opener coordinates stay local until diagnostics support related spans.
 #[derive(Debug, thiserror::Error)]
 #[error("{error}")]
 pub struct StructureError {
     pub error: DetailedConfigError,
     pub unclosed: Option<Span>,
-    /// Whether a root-level `include` opener was successfully indexed before failure.
+    /// Whether a root-level include opener was indexed before failure.
     pub saw_include: bool,
 }
 
@@ -76,30 +77,41 @@ enum SegmentKind {
 }
 
 #[derive(Debug)]
+struct IndexedSegment {
+    range: Range<usize>,
+    kind: SegmentKind,
+    next: usize,
+    scope: Scope,
+}
+
+#[derive(Debug)]
 pub struct Document<'a> {
     source: Source<'a>,
     tokens: Vec<Token>,
     comments: Vec<Token>,
-    closes: Vec<usize>,
-    sections: Vec<(Range<usize>, SegmentKind)>,
+    segments: Vec<IndexedSegment>,
+    sections: Vec<usize>,
 }
 
 struct Frame {
-    start: usize,
-    open: usize,
-    header: Span,
+    owner: Option<usize>,
+    scope: Scope,
+    parentheses: usize,
     quote: Option<usize>,
 }
 
-#[derive(Clone, Copy)]
-struct PendingHeader {
-    start: usize,
-    has_unquoted_colon: bool,
+struct Indexer<'a> {
+    doc: Document<'a>,
+    frames: Vec<Frame>,
+    pending: Option<Statement>,
+    routing_parentheses: usize,
+    comment_braces: Vec<Span>,
+    saw_open: bool,
+    saw_include: bool,
 }
 
 impl<'a> Document<'a> {
-    /// Standalone structural attempt: appends diagnostics, including one terminal cause.
-    /// Recoverable error tokens remain visible to the owning section reader.
+    /// Standalone structural attempt, including one terminal diagnostic on failure.
     pub fn parse(
         source: Source<'a>,
         diagnostics: &mut Vec<DetailedDiagnostic>,
@@ -116,292 +128,33 @@ impl<'a> Document<'a> {
         diagnostics: &mut Vec<DetailedDiagnostic>,
         require_block: bool,
     ) -> Result<Self, StructureError> {
-        let mut doc = Self {
-            closes: Vec::new(),
-            source,
-            tokens: Vec::new(),
-            comments: Vec::new(),
-            sections: Vec::new(),
-        };
-        let mut lexer = Lexer::default();
-        let mut frames: Vec<Frame> = Vec::new();
-        let mut comment_braces = Vec::new();
-        let mut fatal = None;
-        let mut pending: Option<PendingHeader> = None;
-        let mut saw_open = false;
-        let mut saw_include = false;
-        let attempt_start = diagnostics.len();
-        loop {
-            let include_paths = frames
-                .first()
-                .is_some_and(|frame| doc.source.raw(frame.header) == "include");
-            let Some(token) = lexer.next_token(&doc.source, include_paths) else {
-                break;
-            };
-            match token.kind {
-                TokenKind::Comment => {
-                    if doc.source.raw(token.span).contains(['{', '}'])
-                        && frames.first().is_some_and(|frame| {
-                            let root = doc.source.raw(frame.header);
-                            root != "include"
-                                && (root != "dns"
-                                    || doc
-                                        .tokens
-                                        .last()
-                                        .is_some_and(|previous| previous.line == token.line))
-                        })
-                    {
-                        comment_braces.push(token.span);
-                    }
-                    doc.comments.push(token);
-                    continue;
-                }
-                kind if kind.is_trivia() => continue,
-                _ => {}
-            }
-            let index = doc.tokens.len();
-            doc.tokens.push(token);
-            doc.closes.push(usize::MAX);
-            let token = &doc.tokens[index];
-            let split_include = pending.is_some_and(|header| {
-                let start = header.start;
-                frames.is_empty()
-                    && index == start + 1
-                    && token.kind == TokenKind::OpenBrace
-                    && doc.source.raw(doc.tokens[start].span) == "include"
-            });
-            let compact_empty = pending.is_some_and(|header| {
-                let start = header.start;
-                frames.is_empty()
-                    && token.kind == TokenKind::Word
-                    && doc.source.raw(token.span) == "{}"
-                    && !header.has_unquoted_colon
-                    && (token.line == doc.tokens[start].line
-                        || (index == start + 1
-                            && doc.source.raw(doc.tokens[start].span) == "include"))
-            });
-            if compact_empty {
-                let start = pending.take().unwrap().start;
-                let header = doc.range_span(start..index);
-                let name = doc.source.raw(header);
-                if token.line != doc.tokens[start].line {
-                    diagnostics.push(doc.source.diagnostic(
-                        token.span,
-                        Severity::Warning,
-                        "legacy-include-opener",
-                        "put the include opener on its header line",
-                    ));
-                }
-                if Root::parse(name).is_none() {
-                    diagnostics.push(doc.source.diagnostic(
-                        token.span,
-                        Severity::Warning,
-                        "unknown-block",
-                        "unknown top-level block ignored",
-                    ));
-                } else if name == "include" {
-                    saw_include = true;
-                }
-                if Root::parse(name).is_some() {
-                    doc.sections.push((start..index + 1, SegmentKind::Compact));
-                }
-                saw_open = true;
-                continue;
-            }
-            if let Some(header) = pending
-                && index > 0
-                && token.line != doc.tokens[index - 1].line
-                && !split_include
-            {
-                if frames.is_empty() {
-                    doc.warn_statement(header.start..index, diagnostics);
-                }
-                pending = None;
-            }
-            match token.kind {
-                TokenKind::OpenBrace => {
-                    let Some(pending_header) = pending.take() else {
-                        fatal = Some(doc.source.diagnostic(
-                            token.span,
-                            Severity::Error,
-                            "unexpected-open-brace",
-                            "block opener requires a header on the same line",
-                        ));
-                        break;
-                    };
-                    let start = pending_header.start;
-                    let header = doc.range_span(start..index);
-                    let root = frames.is_empty();
-                    let name = doc.source.raw(header);
-                    if token.line != doc.tokens[start].line {
-                        diagnostics.push(doc.source.diagnostic(
-                            token.span,
-                            Severity::Warning,
-                            "legacy-include-opener",
-                            "put the include opener on its header line",
-                        ));
-                    }
-                    if root && name == "include" {
-                        saw_include = true;
-                    }
-                    if root && Root::parse(name).is_none() {
-                        diagnostics.push(doc.source.diagnostic(
-                            token.span,
-                            Severity::Warning,
-                            "unknown-block",
-                            "unknown top-level block ignored",
-                        ));
-                    }
-                    frames.push(Frame {
-                        start,
-                        open: index,
-                        header,
-                        quote: None,
-                    });
-                    saw_open = true;
-                }
-                TokenKind::CloseBrace => {
-                    if frames.is_empty() {
-                        if let Some(header) = pending {
-                            doc.warn_statement(header.start..index, diagnostics);
-                        }
-                        diagnostics.push(doc.source.diagnostic(
-                            token.span,
-                            Severity::Warning,
-                            "unmatched-close",
-                            "unmatched closing brace ignored",
-                        ));
-                    } else {
-                        let frame = frames.pop().unwrap();
-                        doc.closes[frame.open] = index;
-                        if frames.is_empty() && Root::parse(doc.source.raw(frame.header)).is_some()
-                        {
-                            doc.sections
-                                .push((frame.start..index + 1, SegmentKind::Braced(frame.open)));
-                        }
-                    }
-                    pending = None;
-                }
-                TokenKind::Error { opener } => {
-                    let diagnostic = doc.source.quote_error(opener, token.span.end);
-                    let position = diagnostics.len();
-                    let recoverable = frames.first().is_some_and(|frame| {
-                        Root::parse(doc.source.raw(frame.header))
-                            .is_some_and(Root::recovers_from_quote_errors)
-                    });
-                    if !recoverable {
-                        fatal = Some(diagnostic);
-                        break;
-                    }
-                    diagnostics.push(diagnostic);
-                    for frame in frames.iter_mut().rev() {
-                        if frame.quote.is_some() {
-                            break;
-                        }
-                        frame.quote = Some(position);
-                    }
-                    pending.get_or_insert(PendingHeader {
-                        start: index,
-                        has_unquoted_colon: false,
-                    });
-                }
-                TokenKind::Word => {
-                    let header = pending.get_or_insert(PendingHeader {
-                        start: index,
-                        has_unquoted_colon: false,
-                    });
-                    if frames.is_empty() && !header.has_unquoted_colon {
-                        header.has_unquoted_colon = doc.unquoted_contains(token, ":");
-                    }
-                    let raw = doc.source.raw(token.span);
-                    let glued_empty_root =
-                        frames.is_empty() && raw.len() > 2 && raw.ends_with("{}");
-                    if (raw.ends_with('{') || glued_empty_root)
-                        && !token.quoted.iter().any(|span| span.end == token.span.end)
-                    {
-                        let start = token.span.end - if glued_empty_root { 2 } else { 1 };
-                        let brace = doc.source.span(start, start + 1);
-                        fatal = Some(doc.source.diagnostic(
-                            brace,
-                            Severity::Error,
-                            "block-delimiter-spacing",
-                            "separate block braces from the header with whitespace",
-                        ));
-                        break;
-                    }
-                }
-                _ => unreachable!("trivia was removed"),
-            }
+        Indexer {
+            doc: Self {
+                source,
+                tokens: Vec::new(),
+                comments: Vec::new(),
+                segments: Vec::new(),
+                sections: Vec::new(),
+            },
+            frames: vec![Frame {
+                owner: None,
+                scope: Scope::Root,
+                parentheses: 0,
+                quote: None,
+            }],
+            pending: None,
+            routing_parentheses: 0,
+            comment_braces: Vec::new(),
+            saw_open: false,
+            saw_include: false,
         }
-        for span in comment_braces {
-            diagnostics.push(doc.source.diagnostic(
-                span,
-                Severity::Warning,
-                "legacy-comment-brace",
-                "comments do not close blocks; put the closer outside the comment",
-            ));
-        }
-        if let Some(diagnostic) = fatal {
-            return Err(reject(diagnostic, None, None, saw_include, diagnostics));
-        }
-        if let Some(frame) = frames
-            .iter()
-            .rev()
-            .find(|frame| frame.quote.is_some())
-            .or_else(|| frames.last())
-        {
-            let (mut diagnostic, existing) = if let Some(position) = frame.quote {
-                (diagnostics[position].clone(), Some(position))
-            } else {
-                (
-                    doc.source.diagnostic(
-                        frame.header,
-                        Severity::Error,
-                        "unclosed-block",
-                        "block has no surviving closing brace",
-                    ),
-                    None,
-                )
-            };
-            let root = doc.source.raw(frames[0].header);
-            if let Some(name) = Root::parse(root).map(Root::name) {
-                diagnostic.setting = SettingPath::new(name);
-            }
-            return Err(reject(
-                diagnostic,
-                Some(frame.header),
-                existing,
-                saw_include,
-                diagnostics,
-            ));
-        }
-        if require_block && !saw_open {
-            diagnostics.truncate(attempt_start);
-            let eof = doc
-                .source
-                .span(doc.source.text().len(), doc.source.text().len());
-            return Err(reject(
-                doc.source.diagnostic(
-                    eof,
-                    Severity::Error,
-                    "not-dae-config",
-                    "document contains no block",
-                ),
-                None,
-                None,
-                saw_include,
-                diagnostics,
-            ));
-        }
-        if let Some(header) = pending {
-            doc.warn_statement(header.start..doc.tokens.len(), diagnostics);
-        }
-        Ok(doc)
+        .parse(diagnostics, require_block)
     }
 
     pub fn source(&self) -> &Source<'a> {
         &self.source
     }
+
     pub fn tokens(&self) -> &[Token] {
         &self.tokens
     }
@@ -409,84 +162,7 @@ impl<'a> Document<'a> {
     pub fn sections(&self) -> impl DoubleEndedIterator<Item = Segment<'_, 'a>> {
         self.sections
             .iter()
-            .map(|(range, kind)| self.segment(range.clone(), *kind))
-    }
-
-    fn segment(&self, range: Range<usize>, kind: SegmentKind) -> Segment<'_, 'a> {
-        let end = match kind {
-            SegmentKind::Statement | SegmentKind::Ignored => range.end,
-            SegmentKind::Compact => range.end - 1,
-            SegmentKind::Braced(open) => open,
-        };
-        Segment {
-            doc: self,
-            header: self.range_span(range.start..end),
-            range,
-            kind,
-        }
-    }
-
-    /// Whether punctuation occurs outside the token's quoted spans; punctuation
-    /// inside quotes is data and never a structural signal.
-    fn unquoted_contains(&self, token: &Token, punctuation: &str) -> bool {
-        self.unquoted_parts(token)
-            .any(|part| self.source.raw(part).contains(punctuation))
-    }
-
-    fn unquoted_parts<'d>(&'d self, token: &'d Token) -> impl Iterator<Item = Span> + 'd {
-        let mut start = token.span.start;
-        token
-            .quoted
-            .iter()
-            .map(Some)
-            .chain(std::iter::once(None))
-            .map(move |quote| {
-                let end = quote.map_or(token.span.end, |quote| quote.start);
-                let part = self.source.span(start, end);
-                start = quote.map_or(token.span.end, |quote| quote.end);
-                part
-            })
-    }
-
-    fn entry_has_value(&self, header: Range<usize>) -> bool {
-        let end = self.tokens[header.end - 1].span.end;
-        let first = &self.tokens[header.start];
-        if let Some(quote) = first
-            .quoted
-            .first()
-            .filter(|quote| quote.start == first.span.start)
-        {
-            let tail = self.source.text()[quote.end..end].trim();
-            return tail
-                .strip_prefix(':')
-                .is_none_or(|value| !value.trim().is_empty());
-        }
-        self.tokens[header]
-            .iter()
-            .flat_map(|token| self.unquoted_parts(token))
-            .find_map(|part| {
-                self.source.raw(part).find(':').map(|colon| {
-                    !self.source.text()[part.start + colon + 1..end]
-                        .trim()
-                        .is_empty()
-                })
-            })
-            .unwrap_or(false)
-    }
-
-    fn parentheses_after(&self, token: &Token, mut depth: usize) -> usize {
-        for byte in self
-            .unquoted_parts(token)
-            .flat_map(|part| self.source.raw(part).bytes())
-        {
-            match byte {
-                b'(' => depth += 1,
-                // Readers report malformed delimiters; this only shields argument data.
-                b')' => depth = depth.saturating_sub(1),
-                _ => {}
-            }
-        }
-        depth
+            .map(|&index| Segment { doc: self, index })
     }
 
     fn range_span(&self, range: Range<usize>) -> Span {
@@ -496,19 +172,386 @@ impl<'a> Document<'a> {
         )
     }
 
-    fn warn_statement(&self, range: Range<usize>, diagnostics: &mut Vec<DetailedDiagnostic>) {
-        let span = self.range_span(range);
-        let code = if self.source.raw(span).starts_with("/*") {
-            "unsupported-comment"
-        } else {
-            "unknown-statement"
+    fn header_span(&self, index: usize) -> Span {
+        let segment = &self.segments[index];
+        let end = match segment.kind {
+            SegmentKind::Statement | SegmentKind::Ignored => segment.range.end,
+            SegmentKind::Compact => segment.range.end - 1,
+            SegmentKind::Braced(open) => open,
         };
-        diagnostics.push(self.source.diagnostic(
-            span,
-            Severity::Warning,
-            code,
-            "unknown top-level statement ignored",
-        ));
+        self.range_span(segment.range.start..end)
+    }
+}
+
+impl<'a> Indexer<'a> {
+    fn root(&self) -> Option<Root> {
+        let owner = self.frames.get(1)?.owner?;
+        Root::parse(self.doc.source.raw(self.doc.header_span(owner)))
+    }
+
+    fn push_statement_token(&mut self, index: usize) {
+        let frame = self.frames.last().unwrap();
+        let token = &self.doc.tokens[index];
+        if let Some(statement) = &mut self.pending {
+            statement.push(&self.doc.source, token, index);
+            self.doc.segments[statement.segment].range.end = index + 1;
+        } else {
+            let segment = self.doc.segments.len();
+            let statement = Statement::new(
+                &self.doc.source,
+                token,
+                index,
+                segment,
+                frame.scope,
+                frame.parentheses,
+            );
+            self.doc.segments.push(IndexedSegment {
+                range: index..index + 1,
+                kind: if statement.ignored {
+                    SegmentKind::Ignored
+                } else {
+                    SegmentKind::Statement
+                },
+                next: segment + 1,
+                scope: frame.scope,
+            });
+            self.pending = Some(statement);
+        }
+    }
+
+    fn finish_statement(&mut self, diagnostics: &mut Vec<DetailedDiagnostic>) {
+        let frame = self.frames.last_mut().unwrap();
+        let Some(statement) = self.pending.take() else {
+            return;
+        };
+        let compact = statement.ends_compact();
+        let header = if compact {
+            let token = statement.compact.unwrap().token;
+            statement
+                .header
+                .ending_at(self.doc.tokens[token - 1].span.end)
+        } else {
+            statement.header
+        };
+        let next = self.doc.segments.len();
+        let segment = &mut self.doc.segments[statement.segment];
+        if compact {
+            segment.kind = SegmentKind::Compact;
+            segment.scope = frame.scope.child(&self.doc.source, header);
+        } else if frame.scope.continues_expressions() && !statement.ignored {
+            frame.parentheses = statement.parentheses;
+        }
+        segment.next = next;
+        if frame.scope != Scope::Root {
+            return;
+        }
+        if compact {
+            self.saw_open = true;
+            let last = &self.doc.tokens[statement.end - 1];
+            if last.line != self.doc.tokens[statement.start].line {
+                diagnostics.push(self.doc.source.diagnostic(
+                    last.span,
+                    Severity::Warning,
+                    "legacy-include-opener",
+                    "put the include opener on its header line",
+                ));
+            }
+            match Root::parse(self.doc.source.raw(header.span)) {
+                Some(root) => {
+                    self.saw_include |= root == Root::Include;
+                    self.doc.sections.push(statement.segment);
+                }
+                None => diagnostics.push(self.doc.source.diagnostic(
+                    last.span,
+                    Severity::Warning,
+                    "unknown-block",
+                    "unknown top-level block ignored",
+                )),
+            }
+        } else {
+            let code = if self.doc.source.raw(header.span).starts_with("/*") {
+                "unsupported-comment"
+            } else {
+                "unknown-statement"
+            };
+            diagnostics.push(self.doc.source.diagnostic(
+                header.span,
+                Severity::Warning,
+                code,
+                "unknown top-level statement ignored",
+            ));
+        }
+    }
+
+    fn open_block(
+        &mut self,
+        statement: Statement,
+        index: usize,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+    ) {
+        let frame = self.frames.last().unwrap();
+        let scope = frame.scope.child(&self.doc.source, statement.header);
+        let root = frame.scope == Scope::Root;
+        let name = self.doc.source.raw(statement.header.span);
+        if self.doc.tokens[index].line != self.doc.tokens[statement.start].line {
+            diagnostics.push(self.doc.source.diagnostic(
+                self.doc.tokens[index].span,
+                Severity::Warning,
+                "legacy-include-opener",
+                "put the include opener on its header line",
+            ));
+        }
+        if root {
+            self.saw_include |= name == "include";
+            if Root::parse(name).is_none() {
+                diagnostics.push(self.doc.source.diagnostic(
+                    self.doc.tokens[index].span,
+                    Severity::Warning,
+                    "unknown-block",
+                    "unknown top-level block ignored",
+                ));
+            }
+        }
+        let segment = &mut self.doc.segments[statement.segment];
+        segment.kind = SegmentKind::Braced(index);
+        segment.range.end = index + 1;
+        segment.scope = scope;
+        self.frames.push(Frame {
+            owner: Some(statement.segment),
+            scope,
+            parentheses: if root && scope.continues_expressions() {
+                self.routing_parentheses
+            } else {
+                0
+            },
+            quote: None,
+        });
+        self.saw_open = true;
+    }
+
+    fn close_block(&mut self, index: usize, diagnostics: &mut Vec<DetailedDiagnostic>) {
+        self.finish_statement(diagnostics);
+        if self.frames.len() == 1 {
+            diagnostics.push(self.doc.source.diagnostic(
+                self.doc.tokens[index].span,
+                Severity::Warning,
+                "unmatched-close",
+                "unmatched closing brace ignored",
+            ));
+            return;
+        }
+        let frame = self.frames.pop().unwrap();
+        let owner = frame.owner.unwrap();
+        let next = self.doc.segments.len();
+        let segment = &mut self.doc.segments[owner];
+        segment.range.end = index + 1;
+        segment.next = next;
+        if self.frames.len() == 1 {
+            if frame.scope.continues_expressions() {
+                self.routing_parentheses = frame.parentheses;
+            }
+            if Root::parse(self.doc.source.raw(self.doc.header_span(owner))).is_some() {
+                self.doc.sections.push(owner);
+            }
+        }
+    }
+
+    fn parse(
+        mut self,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+        require_block: bool,
+    ) -> Result<Document<'a>, StructureError> {
+        let attempt_start = diagnostics.len();
+        let mut lexer = Lexer::default();
+        let mut fatal = None;
+        loop {
+            let frame = self.frames.last().unwrap();
+            if self
+                .pending
+                .as_ref()
+                .is_some_and(Statement::starts_new_head)
+            {
+                lexer.begin_statement();
+            }
+            let Some(token) = lexer.next_token(&self.doc.source, frame.scope.quotes()) else {
+                break;
+            };
+            match token.kind {
+                TokenKind::Whitespace => continue,
+                TokenKind::Newline => {
+                    if self.frames.len() != 1 {
+                        self.finish_statement(diagnostics);
+                    }
+                    continue;
+                }
+                TokenKind::Comment => {
+                    let root = self.root();
+                    if self.doc.source.raw(token.span).contains(['{', '}'])
+                        && self.frames.len() > 1
+                        && root != Some(Root::Include)
+                        && (root != Some(Root::Dns)
+                            || self
+                                .doc
+                                .tokens
+                                .last()
+                                .is_some_and(|last| last.line == token.line))
+                    {
+                        self.comment_braces.push(token.span);
+                    }
+                    self.doc.comments.push(token);
+                    continue;
+                }
+                _ => {}
+            }
+            let kind = token.kind;
+            let index = self.doc.tokens.len();
+            let line = token.line;
+            let span = token.span;
+            self.doc.tokens.push(token);
+            let split = self.pending.as_ref().is_some_and(|statement| {
+                statement.split_before(kind)
+                    || (self.frames.len() == 1
+                        && self.doc.tokens[statement.start].line != line
+                        && !(statement.split_include(&self.doc.source)
+                            && (kind == TokenKind::OpenBrace || self.doc.source.raw(span) == "{}")))
+            });
+            if split {
+                self.finish_statement(diagnostics);
+            }
+            match kind {
+                TokenKind::OpenBrace => {
+                    let Some(statement) = self.pending.take() else {
+                        fatal = Some(self.doc.source.diagnostic(
+                            span,
+                            Severity::Error,
+                            "unexpected-open-brace",
+                            "block opener requires a header on the same line",
+                        ));
+                        break;
+                    };
+                    self.open_block(statement, index, diagnostics);
+                    lexer.begin_statement();
+                }
+                TokenKind::CloseBrace => {
+                    self.close_block(index, diagnostics);
+                    lexer.begin_statement();
+                }
+                TokenKind::Error { opener } => {
+                    let diagnostic = self.doc.source.quote_error(opener, span.end);
+                    if !self.root().is_some_and(Root::recovers_from_quote_errors) {
+                        fatal = Some(diagnostic);
+                        break;
+                    }
+                    self.push_statement_token(index);
+                    let position = diagnostics.len();
+                    diagnostics.push(diagnostic);
+                    for frame in self.frames.iter_mut().skip(1).rev() {
+                        if frame.quote.is_some() {
+                            break;
+                        }
+                        frame.quote = Some(position);
+                    }
+                }
+                TokenKind::Word => {
+                    let raw = self.doc.source.raw(span);
+                    let glued_empty_root =
+                        self.frames.len() == 1 && raw.len() > 2 && raw.ends_with("{}");
+                    if (raw.ends_with('{') || glued_empty_root)
+                        && !self.doc.tokens[index]
+                            .quoted
+                            .iter()
+                            .any(|quote| quote.end == span.end)
+                    {
+                        let start = span.end - if glued_empty_root { 2 } else { 1 };
+                        fatal = Some(self.doc.source.diagnostic(
+                            self.doc.source.span(start, start + 1),
+                            Severity::Error,
+                            "block-delimiter-spacing",
+                            "separate block braces from the header with whitespace",
+                        ));
+                        break;
+                    }
+                    self.push_statement_token(index);
+                    if self.frames.len() == 1
+                        && self
+                            .pending
+                            .as_ref()
+                            .is_some_and(Statement::starts_new_head)
+                    {
+                        self.finish_statement(diagnostics);
+                    }
+                }
+                _ => unreachable!("trivia was consumed before indexing"),
+            }
+        }
+        for span in &self.comment_braces {
+            diagnostics.push(self.doc.source.diagnostic(
+                *span,
+                Severity::Warning,
+                "legacy-comment-brace",
+                "comments do not close blocks; put the closer outside the comment",
+            ));
+        }
+        if let Some(diagnostic) = fatal {
+            return Err(reject(
+                diagnostic,
+                None,
+                None,
+                self.saw_include,
+                diagnostics,
+            ));
+        }
+        if let Some(frame) = self
+            .frames
+            .iter()
+            .skip(1)
+            .rev()
+            .find(|frame| frame.quote.is_some())
+            .or_else(|| self.frames.get(1..).unwrap().last())
+        {
+            let header = self.doc.header_span(frame.owner.unwrap());
+            let (mut diagnostic, existing) = if let Some(position) = frame.quote {
+                (diagnostics[position].clone(), Some(position))
+            } else {
+                (
+                    self.doc.source.diagnostic(
+                        header,
+                        Severity::Error,
+                        "unclosed-block",
+                        "block has no surviving closing brace",
+                    ),
+                    None,
+                )
+            };
+            if let Some(root) = self.root() {
+                diagnostic.setting = SettingPath::new(root.name());
+            }
+            return Err(reject(
+                diagnostic,
+                Some(header),
+                existing,
+                self.saw_include,
+                diagnostics,
+            ));
+        }
+        if require_block && !self.saw_open {
+            diagnostics.truncate(attempt_start);
+            let end = self.doc.source.text().len();
+            return Err(reject(
+                self.doc.source.diagnostic(
+                    self.doc.source.span(end, end),
+                    Severity::Error,
+                    "not-dae-config",
+                    "document contains no block",
+                ),
+                None,
+                None,
+                self.saw_include,
+                diagnostics,
+            ));
+        }
+        self.finish_statement(diagnostics);
+        Ok(self.doc)
     }
 }
 
@@ -536,65 +579,76 @@ fn reject(
 #[derive(Debug)]
 pub struct Segment<'d, 'a> {
     doc: &'d Document<'a>,
-    range: Range<usize>,
-    kind: SegmentKind,
-    header: Span,
+    index: usize,
 }
 
 impl<'d, 'a> Segment<'d, 'a> {
-    pub fn span(&self) -> Span {
-        self.doc.range_span(self.range.clone())
+    fn indexed(&self) -> &'d IndexedSegment {
+        &self.doc.segments[self.index]
     }
+
+    pub fn span(&self) -> Span {
+        self.doc.range_span(self.indexed().range.clone())
+    }
+
     pub fn header_span(&self) -> Span {
-        self.header
+        self.doc.header_span(self.index)
     }
 
     pub fn header(&self) -> &'d str {
         self.doc.source.raw(self.header_span())
     }
+
     pub fn body(&self) -> Option<Dispenser<'d, 'a>> {
-        self.body_with(BodySyntax::Statements)
+        matches!(self.indexed().kind, SegmentKind::Braced(_)).then(|| Dispenser {
+            doc: self.doc,
+            range: self.index + 1..self.indexed().next,
+        })
     }
 
-    pub(super) fn body_with(&self, syntax: BodySyntax) -> Option<Dispenser<'d, 'a>> {
-        match self.kind {
-            SegmentKind::Braced(open) => Some(Dispenser::new(
-                self.doc,
-                open + 1..self.doc.closes[open],
-                syntax,
-            )),
-            SegmentKind::Statement | SegmentKind::Ignored | SegmentKind::Compact => None,
+    pub(super) fn subscription_tag(&self) -> Option<Span> {
+        if self.is_block()
+            && let Scope::SubscriptionFields(end) = self.indexed().scope
+        {
+            Some(Span {
+                end,
+                ..self.header_span()
+            })
+        } else {
+            None
         }
     }
 
-    /// The opening token is `{` for a braced block and `{}` for a compact block.
+    /// The opening token remains available independently of the header span.
     pub(super) fn opening_span(&self) -> Option<Span> {
-        match self.kind {
+        let segment = self.indexed();
+        match segment.kind {
             SegmentKind::Statement | SegmentKind::Ignored => None,
-            SegmentKind::Compact => Some(self.doc.tokens[self.range.end - 1].span),
+            SegmentKind::Compact => Some(self.doc.tokens[segment.range.end - 1].span),
             SegmentKind::Braced(open) => Some(self.doc.tokens[open].span),
         }
     }
 
     pub(super) fn is_block(&self) -> bool {
-        matches!(self.kind, SegmentKind::Compact | SegmentKind::Braced(_))
+        matches!(
+            self.indexed().kind,
+            SegmentKind::Compact | SegmentKind::Braced(_)
+        )
     }
 
     pub(super) fn is_ignored(&self) -> bool {
-        matches!(self.kind, SegmentKind::Ignored)
+        matches!(self.indexed().kind, SegmentKind::Ignored)
     }
+
     pub(super) fn source(&self) -> &'d Source<'a> {
         &self.doc.source
     }
 
-    /// Return the comment token that follows this segment's header or statement
-    /// on its physical line.
     pub(super) fn comment(&self) -> Option<&'d Token> {
-        let end = match self.kind {
+        let segment = self.indexed();
+        let end = match segment.kind {
             SegmentKind::Braced(open) => open,
-            SegmentKind::Statement | SegmentKind::Ignored | SegmentKind::Compact => {
-                self.range.end - 1
-            }
+            _ => segment.range.end - 1,
         };
         let last = self.doc.tokens.get(end)?;
         let position = self
@@ -610,36 +664,16 @@ impl<'d, 'a> Segment<'d, 'a> {
                     .is_none_or(|next| next.span.start > comment.span.start)
         })
     }
-    pub(super) fn tokens(&self) -> &'d [Token] {
-        &self.doc.tokens[self.range.clone()]
-    }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BodySyntax {
-    Statements,
-    Declarations,
-    Entries,
-    Expressions,
+    pub(super) fn tokens(&self) -> &'d [Token] {
+        &self.doc.tokens[self.indexed().range.clone()]
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Dispenser<'d, 'a> {
     doc: &'d Document<'a>,
     range: Range<usize>,
-    syntax: BodySyntax,
-    pub(super) parentheses: usize,
-}
-
-impl<'d, 'a> Dispenser<'d, 'a> {
-    fn new(doc: &'d Document<'a>, range: Range<usize>, syntax: BodySyntax) -> Self {
-        Self {
-            doc,
-            range,
-            syntax,
-            parentheses: 0,
-        }
-    }
 }
 
 impl<'d, 'a> Iterator for Dispenser<'d, 'a> {
@@ -649,83 +683,12 @@ impl<'d, 'a> Iterator for Dispenser<'d, 'a> {
         if self.range.is_empty() {
             return None;
         }
-        let start = self.range.start;
-        let mut end = start + 1;
-        let ignored = matches!(
-            self.syntax,
-            BodySyntax::Statements | BodySyntax::Expressions
-        ) && self
-            .doc
-            .source
-            .raw(self.doc.tokens[start].span)
-            .starts_with("/*");
-        let mut kind = if ignored {
-            SegmentKind::Ignored
-        } else {
-            SegmentKind::Statement
-        };
-        let dynamic_header = matches!(self.syntax, BodySyntax::Declarations | BodySyntax::Entries);
-        let track_parentheses = !ignored && self.syntax != BodySyntax::Declarations;
-        let value_marker = |token| {
-            self.doc.unquoted_contains(token, ":") || self.doc.unquoted_contains(token, "->")
-        };
-        let mut declaration =
-            !ignored && (dynamic_header || !value_marker(&self.doc.tokens[start]));
-        let mut parentheses = self.parentheses;
-        if track_parentheses {
-            parentheses = self
-                .doc
-                .parentheses_after(&self.doc.tokens[start], parentheses);
-        }
-        while end < self.range.end
-            && (same_physical_line(&self.doc.tokens[start], &self.doc.tokens[end])
-                || self.doc.tokens[end].kind == TokenKind::OpenBrace)
-        {
-            let token = &self.doc.tokens[end];
-            if !ignored && token.kind == TokenKind::Word && self.doc.source.raw(token.span) == "{}"
-            {
-                if self.syntax == BodySyntax::Entries && declaration && parentheses == 0 {
-                    declaration = !self.doc.entry_has_value(start..end);
-                }
-                let following = self
-                    .doc
-                    .tokens
-                    .get(end + 1)
-                    .filter(|_| end + 1 < self.range.end);
-                let indexed_body = following.is_some_and(|next| next.kind == TokenKind::OpenBrace);
-                let declaration_end = declaration && (!track_parentheses || parentheses == 0);
-                let legacy_end = following.is_none_or(|next| !same_physical_line(token, next))
-                    && (self.syntax != BodySyntax::Expressions || parentheses == 0);
-                // The indexed opener still owns this header and all of its descendants.
-                if !indexed_body && (declaration_end || legacy_end) {
-                    kind = SegmentKind::Compact;
-                    end += 1;
-                    break;
-                }
-            }
-            match token.kind {
-                TokenKind::OpenBrace => {
-                    kind = SegmentKind::Braced(end);
-                    end = self.doc.closes[end] + 1;
-                    break;
-                }
-                TokenKind::CloseBrace => break,
-                _ => {
-                    if declaration && !dynamic_header {
-                        declaration = !value_marker(token);
-                    }
-                    if track_parentheses {
-                        parentheses = self.doc.parentheses_after(token, parentheses);
-                    }
-                    end += 1;
-                }
-            }
-        }
-        if self.syntax == BodySyntax::Expressions && matches!(kind, SegmentKind::Statement) {
-            self.parentheses = parentheses;
-        }
-        self.range.start = end;
-        Some(self.doc.segment(start..end, kind))
+        let index = self.range.start;
+        self.range.start = self.doc.segments[index].next;
+        Some(Segment {
+            doc: self.doc,
+            index,
+        })
     }
 }
 

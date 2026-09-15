@@ -383,6 +383,27 @@ fn adjacent_include_quotes_protect_filename_punctuation_without_leaking() {
 }
 
 #[test]
+fn included_compact_quotes_preserve_values_and_validate() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("config.dae");
+    let fragment_name = "compact don't # { }.dae";
+    write(
+        &dir.path().join(fragment_name),
+        "global {\n log_file:\"/tmp/config # { }.log\"\n}",
+    );
+    write(&entry, &format!("include {{ \"{fragment_name}\" }}"));
+
+    let mut diagnostics = Vec::new();
+    let config =
+        Config::from_file_with_detailed_diagnostics(entry.to_str().unwrap(), &mut diagnostics)
+            .unwrap();
+
+    assert_eq!(config.global.log_file, "/tmp/config # { }.log");
+    config.validate().unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+#[test]
 fn adjacent_include_quote_errors_are_structural_in_string_mode() {
     let input = "include {\n 'first.dae''unterminated\n}\n";
     let mut diagnostics = Vec::new();

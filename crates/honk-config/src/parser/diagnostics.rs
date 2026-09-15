@@ -253,7 +253,7 @@ impl<'a> ParserDiagnostics<'a> {
         self.output.push(diagnostic);
     }
 
-    pub fn notice(&mut self, mut diagnostic: DetailedDiagnostic) {
+    pub fn contextual_notice(&mut self, mut diagnostic: DetailedDiagnostic) {
         diagnostic.setting = SettingPath::new(self.root);
         if let Some(group) = self.group {
             diagnostic.setting = SettingPath::new("groups").index(group).field("filter");
@@ -268,6 +268,10 @@ impl<'a> ParserDiagnostics<'a> {
         } else if let Some(subscription) = self.subscription {
             diagnostic.setting = diagnostic.setting.index(subscription);
         }
+        self.notice(diagnostic);
+    }
+
+    pub fn notice(&mut self, diagnostic: DetailedDiagnostic) {
         self.notices.push((self.output.len(), diagnostic));
     }
 

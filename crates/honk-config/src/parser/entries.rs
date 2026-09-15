@@ -13,7 +13,7 @@ pub(super) fn parse_node_section(
     let mut nodes = Vec::new();
     let mut entry_index = 0;
     for root in section {
-        let Some(body) = root.body_with(super::cursor::BodySyntax::Entries) else {
+        let Some(body) = root.body() else {
             continue;
         };
         for child in body {
@@ -37,7 +37,7 @@ fn visit_node_segment<'d, 'a>(
             "legacy-wrapper",
             "nested node wrapper is retained for compatibility",
         );
-        if let Some(body) = segment.body_with(super::cursor::BodySyntax::Entries) {
+        if let Some(body) = segment.body() {
             for child in body {
                 visit_node_segment(&child, diagnostics, nodes, entry_index)?;
             }
@@ -168,7 +168,7 @@ pub(super) fn parse_subscription_section(
     let mut subscriptions = Vec::new();
     let mut entry_index = 0;
     for root in section {
-        let Some(body) = root.body_with(super::cursor::BodySyntax::Entries) else {
+        let Some(body) = root.body() else {
             continue;
         };
         for child in body {
@@ -185,7 +185,10 @@ fn visit_subscription_segment<'d, 'a>(
     entry_index: &mut usize,
 ) {
     diagnostics.at_section("subscription", Text::segment(segment));
-    if let Some(tag) = block_tag(segment) {
+    if let Some(tag_span) = segment.subscription_tag() {
+        let mut tag = Text::segment(segment);
+        tag.span = tag_span;
+        let tag = tag.trim();
         *entry_index += 1;
         diagnostics.subscription_text(Text::segment(segment).trim(), *entry_index);
         subscriptions.push(parse_subscription_block(segment, tag, diagnostics));
@@ -208,7 +211,7 @@ fn visit_subscription_segment<'d, 'a>(
         if let Some(subscription) = parse_subscription_entry(entry, diagnostics) {
             subscriptions.push(subscription);
         }
-        if let Some(body) = segment.body_with(super::cursor::BodySyntax::Entries) {
+        if let Some(body) = segment.body() {
             for child in body {
                 visit_subscription_segment(&child, diagnostics, subscriptions, entry_index);
             }
@@ -225,12 +228,6 @@ fn visit_subscription_segment<'d, 'a>(
     if let Some(subscription) = parse_subscription_entry(text, diagnostics) {
         subscriptions.push(subscription);
     }
-}
-
-fn block_tag<'d, 'a>(segment: &Segment<'d, 'a>) -> Option<Text<'d, 'a>> {
-    let header = super::read::block_header(segment)?;
-    let (tag, value) = header.kv()?;
-    value.raw().is_empty().then_some(tag)
 }
 
 #[derive(Default)]

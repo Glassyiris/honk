@@ -19,8 +19,8 @@ honk 使用 dae 配置语法的一种方言；与 dae 的已知差异见[方言�
 
 ## 配置格式
 
-- 配置项放在 `section { ... }` 块中，每行一个 `key: value`。也接受 `global { log_level: debug }` 这样的单行块，以及嵌套的单行块。
-- URL、含空白的值以及含 `:`、`+`、`#` 等语法字符的值需要加引号。标量值及 `include`、`node` 条目接受单引号或双引号；带引号的 `subscription` URL 使用单引号。
+- 配置项放在 `section { ... }` 块中，每行一个 `key: value`。也接受 `global { log_level: debug }` 这样的单行块，以及嵌套的单行块。标量键或条目标签冒号后的空格可省略：接受 `bind:'tcp+udp://[::]:53530'` 和 `tag:'https://example.com/sub'(agent)`。
+- URL、含空白的值以及含 `:`、`+`、`#` 等语法字符的值需要加引号。标量值及 `include`、`node`、`subscription` 条目接受配对的单引号或双引号。
 - 在匹配器参数和过滤、路由表达式中，成对单引号或双引号内的逗号、右圆括号、`&&` 和 `->` 按字面值保留。但 `group(...)` 和 `qtype(...)` 仍将带引号的逗号分隔文本按列表解释。
 - 配置项或 matcher 接受列表时，用逗号分隔：`lan_interface: eth0, eth1` 或 `dport(80, 443)`。
 - 以秒为单位的时长接受裸秒数或 `ms`、`s`、`m`、`h` 后缀。`check_tolerance` 等毫秒配置项接受裸毫秒数、`ms` 或 `s`。

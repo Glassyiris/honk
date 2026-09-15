@@ -250,7 +250,7 @@ impl<'d, 'a> Text<'d, 'a> {
         code: &'static str,
         message: &'static str,
     ) {
-        sink.notice(self.source.diagnostic(self.span, severity, code, message));
+        sink.contextual_notice(self.source.diagnostic(self.span, severity, code, message));
     }
 }
 
@@ -261,10 +261,9 @@ pub(super) fn block_header<'d, 'a>(segment: &Segment<'d, 'a>) -> Option<Text<'d,
 pub(super) fn child_statements<'d, 'a>(
     segment: &Segment<'d, 'a>,
     diagnostics: &mut ParserDiagnostics<'_>,
-    syntax: super::cursor::BodySyntax,
 ) -> Vec<Text<'d, 'a>> {
     let mut output = Vec::new();
-    if let Some(mut body) = segment.body_with(syntax) {
+    if let Some(mut body) = segment.body() {
         append_statements(&mut body, diagnostics, &mut output);
     }
     output
@@ -302,21 +301,11 @@ fn append_statements<'d, 'a>(
 pub(super) fn statements<'d, 'a>(
     section: &[Segment<'d, 'a>],
     diagnostics: &mut ParserDiagnostics<'_>,
-    syntax: super::cursor::BodySyntax,
 ) -> Vec<Text<'d, 'a>> {
     let mut output = Vec::new();
-    let mut source = None;
-    let mut parentheses = 0;
     for segment in section {
-        let current_source = segment.header_span().source;
-        if source != Some(current_source) {
-            source = Some(current_source);
-            parentheses = 0;
-        }
-        if let Some(mut body) = segment.body_with(syntax) {
-            body.parentheses = parentheses;
+        if let Some(mut body) = segment.body() {
             append_statements(&mut body, diagnostics, &mut output);
-            parentheses = body.parentheses;
         }
     }
     output

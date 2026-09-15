@@ -16,6 +16,86 @@ mod parser_warnings {
         assert!(!format!("{diagnostics:?}").contains("secret"));
     }
     #[test]
+    fn list_warnings_keep_global_fields_and_include_source_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root.dae");
+        let child = dir.path().join("child.dae");
+        std::fs::write(
+            &root,
+            "global {\n lan_interface: 'lan0', 'lan1'\n wan_interface: 'wan0', 'wan1'\n}\ninclude {\n child.dae\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &child,
+            "global {\n tcp_check_url: 'https://PRIVATE-FIRST.example/a,https://second.example/b'\n udp_check_dns: '1.1.1.1:53,8.8.8.8:53'\n}\n",
+        )
+        .unwrap();
+
+        let mut diagnostics = Vec::new();
+        let config = honk_config::Config::from_file_with_detailed_diagnostics(
+            root.to_str().unwrap(),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert_eq!(config.global.lan_interface, ["lan0", "lan1"]);
+        assert_eq!(config.global.wan_interface, ["wan0", "wan1"]);
+        assert_eq!(
+            config.global.tcp_check_url,
+            [
+                "https://PRIVATE-FIRST.example/a",
+                "https://second.example/b"
+            ]
+        );
+        assert_eq!(config.global.udp_check_dns, ["1.1.1.1:53", "8.8.8.8:53"]);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic.code,
+                        diagnostic.setting.to_string(),
+                        diagnostic.source.index(),
+                        diagnostic.line,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "legacy-list-quoting",
+                    "global.lan_interface".to_string(),
+                    0,
+                    Some(2),
+                ),
+                (
+                    "legacy-list-quoting",
+                    "global.wan_interface".to_string(),
+                    0,
+                    Some(3),
+                ),
+                (
+                    "legacy-quoted-list",
+                    "global.tcp_check_url".to_string(),
+                    1,
+                    Some(2),
+                ),
+                (
+                    "legacy-quoted-list",
+                    "global.udp_check_dns".to_string(),
+                    1,
+                    Some(3),
+                ),
+            ]
+        );
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.span.is_some() && diagnostic.byte_column == Some(17)
+            })
+        );
+        assert!(!format!("{diagnostics:?}").contains("PRIVATE-FIRST"));
+    }
+
+    #[test]
     fn dns_unsupported_conditions_are_safe_data_on_success() {
         let input = include_str!("fixtures/dns_unsupported_condition.dae");
 

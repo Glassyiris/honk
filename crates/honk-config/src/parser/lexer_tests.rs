@@ -43,6 +43,8 @@ fn glued_tokens_continue_after_quotes() {
     word("/tmp/don't", &[]);
     word("/tmp/a#b", &[]);
     word("(hk)#token", &[]);
+    word("https://example.invalid/sub?kind:'a'", &[]);
+    word("tcp+udp://[::]:53530", &[]);
 }
 
 #[test]

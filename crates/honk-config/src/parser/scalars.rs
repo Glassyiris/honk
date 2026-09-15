@@ -109,7 +109,7 @@ fn raw_fields<'d, 'a>(
     diagnostics: &mut ParserDiagnostics<'_>,
 ) -> HashMap<&'d str, Text<'d, 'a>> {
     let mut raw = HashMap::new();
-    for line in read::statements(section, diagnostics, super::cursor::BodySyntax::Statements) {
+    for line in read::statements(section, diagnostics) {
         let Some((key, value)) = line.kv() else {
             line.notice(
                 diagnostics,
@@ -176,6 +176,7 @@ pub(super) fn bool_value(
 
 fn list_value(
     value: Text<'_, '_>,
+    setting: &'static str,
     aggregate_compat: bool,
     legacy_unquote_items: bool,
     filter_empty: bool,
@@ -210,8 +211,8 @@ fn list_value(
         })
         .filter(|item| !filter_empty || !item.is_empty());
     if aggregate || !parsed.iter().map(String::as_str).eq(legacy) {
-        trimmed.notice(
-            diagnostics,
+        let mut diagnostic = trimmed.source.diagnostic(
+            trimmed.span,
             Severity::Warning,
             if aggregate {
                 "legacy-quoted-list"
@@ -220,6 +221,8 @@ fn list_value(
             },
             LEGACY_LIST_MESSAGE,
         );
+        diagnostic.setting = scalar_path(setting);
+        diagnostics.notice(diagnostic);
     }
     parsed
 }
@@ -299,10 +302,24 @@ pub(super) fn parse_global_section(
         );
     }
     if let Some(value) = settings.get("lan_interface") {
-        cfg.lan_interface = list_value(*value, false, false, true, diagnostics);
+        cfg.lan_interface = list_value(
+            *value,
+            "global.lan_interface",
+            false,
+            false,
+            true,
+            diagnostics,
+        );
     }
     if let Some(value) = settings.get("wan_interface") {
-        cfg.wan_interface = list_value(*value, false, false, true, diagnostics);
+        cfg.wan_interface = list_value(
+            *value,
+            "global.wan_interface",
+            false,
+            false,
+            true,
+            diagnostics,
+        );
     }
     if settings.contains_key("auto_config_kernel_parameter") {
         cfg.auto_config_kernel_parameter = bool_value(
@@ -324,7 +341,14 @@ pub(super) fn parse_global_section(
         );
     }
     if let Some(value) = settings.get("tcp_check_url") {
-        cfg.tcp_check_url = list_value(*value, true, true, false, diagnostics);
+        cfg.tcp_check_url = list_value(
+            *value,
+            "global.tcp_check_url",
+            true,
+            true,
+            false,
+            diagnostics,
+        );
     }
     if let Some(value) = settings
         .get("tcp_check_http_method")
@@ -333,7 +357,14 @@ pub(super) fn parse_global_section(
         cfg.tcp_check_http_method = value.to_owned();
     }
     if let Some(value) = settings.get("udp_check_dns") {
-        cfg.udp_check_dns = list_value(*value, true, true, false, diagnostics);
+        cfg.udp_check_dns = list_value(
+            *value,
+            "global.udp_check_dns",
+            true,
+            true,
+            false,
+            diagnostics,
+        );
     }
     if let Some(text) = settings.get("check_interval") {
         let value = text.unquote().raw();
@@ -595,7 +626,7 @@ pub(super) fn parse_experimental_section(
                 }
                 lines
             } else {
-                read::child_statements(&segment, diagnostics, super::cursor::BodySyntax::Statements)
+                read::child_statements(&segment, diagnostics)
             };
             for line in lines {
                 diagnostics.at_text(line);

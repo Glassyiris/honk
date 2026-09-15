@@ -78,6 +78,25 @@ mod scalar_syntax {
     }
 
     #[test]
+    fn compact_dns_bind_quotes_parse_exact_endpoint_and_validate() {
+        for quote in ['\'', '"'] {
+            let source = format!("dns {{\n bind:{quote}tcp+udp://[::]:53530{quote}\n}}");
+            let mut diagnostics = Vec::new();
+            let config =
+                parse_dae_config_with_detailed_diagnostics(&source, &mut diagnostics).unwrap();
+            let endpoint = config.dns.bind_endpoint().unwrap().unwrap();
+
+            assert_eq!(config.dns.bind, "tcp+udp://[::]:53530");
+            assert_eq!(endpoint.host(), "::");
+            assert_eq!(endpoint.port(), 53530);
+            assert!(endpoint.tcp_enabled());
+            assert!(endpoint.udp_enabled());
+            config.validate().unwrap();
+            assert!(diagnostics.is_empty(), "{quote}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
     fn bare_apostrophes_cannot_pair_across_a_comment_or_hide_the_closer() {
         let source = input("k05-bare-apostrophe-before-comment");
         let config = parse_dae_config_with_detailed_diagnostics(&source, &mut Vec::new()).unwrap();
@@ -176,6 +195,28 @@ mod ttl_syntax {
             assert!(diagnostic.byte_column.is_some());
         }
     }
+
+    #[test]
+    fn compact_dns_entries_keep_raw_upstream_name_and_quoted_ttl_warning() {
+        let source = "dns {\n upstream { 'r'x('dns'):'udp://127.0.0.1:53' }\n fixed_domain_ttl { 'example.invalid':'60' }\n routing { request { fallback: reject } }\n}";
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_detailed_diagnostics(source, &mut diagnostics).unwrap();
+
+        assert_eq!(config.dns.upstream[0].name, "'r'x('dns')");
+        assert_eq!(config.dns.upstream[0].address, "127.0.0.1:53");
+        assert_eq!(
+            config.dns.fixed_domain_ttl.get("example.invalid"),
+            Some(&60)
+        );
+        config.validate().unwrap();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            ["legacy-ttl-quoting"]
+        );
+    }
 }
 
 mod routing_syntax {
@@ -195,6 +236,31 @@ mod routing_syntax {
             panic!("expected qname condition, got {condition:?}");
         };
         assert_eq!(matchers, &[DnsDomainMatcher::Suffix(expected.to_string())]);
+    }
+
+    #[test]
+    fn compact_upstream_before_regex_rule_preserves_literal_and_validates() {
+        let source = "dns { upstream {} routing { request {\n qname(regex:'|example[.]invalid) -> reject\n fallback: asis\n} } }";
+        let (config, diagnostics) = parse(source);
+        let rules = &config.dns.routing.request.rules;
+
+        assert_eq!(rules.len(), 1);
+        let DnsCond::Qname { matchers, .. } = &rules[0].conditions[0] else {
+            panic!("expected qname condition");
+        };
+        assert_eq!(
+            matchers,
+            &[DnsDomainMatcher::Regex("'|example[.]invalid".to_owned())]
+        );
+        assert_eq!(rules[0].action, DnsRequestAction::Reject);
+        assert_eq!(config.dns.routing.request.fallback, DnsRequestAction::AsIs);
+        config.validate().unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != "unterminated-quote"),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]

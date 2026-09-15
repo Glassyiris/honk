@@ -592,13 +592,21 @@ fn load_operator_config(
 
 fn report_startup_failure(diagnostics: &[DetailedDiagnostic]) {
     for diagnostic in diagnostics.iter().filter(|diagnostic| !diagnostic.terminal) {
-        eprintln!(
-            "{:?} code={} setting={} value={}: {}",
+        eprint!(
+            "{:?} code={} source={}",
             diagnostic.severity,
             diagnostic.code,
-            diagnostic.setting,
-            diagnostic.value,
-            diagnostic.message,
+            diagnostic.source.index(),
+        );
+        if let Some(line) = diagnostic.line {
+            eprint!(" line={line}");
+        }
+        if let Some(byte_column) = diagnostic.byte_column {
+            eprint!(" byte_column={byte_column}");
+        }
+        eprintln!(
+            " setting={} value={}: {}",
+            diagnostic.setting, diagnostic.value, diagnostic.message,
         );
     }
 }

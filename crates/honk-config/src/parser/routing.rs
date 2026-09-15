@@ -172,7 +172,7 @@ pub(super) fn parse_section(
     diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Result<RoutingConfig, super::ParseFailure> {
     let mut config = RoutingConfig::default();
-    let lines = read::statements(section, diagnostics, super::cursor::BodySyntax::Expressions);
+    let lines = read::statements(section, diagnostics);
     let mut start = 0;
     let mut depth = 0usize;
     let mut ordinal = 0;

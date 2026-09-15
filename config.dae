@@ -11,7 +11,7 @@ global {
     log_file: 'honk.log'
     tcp_check_url: 'https://www.gstatic.com/generate_204'
     tcp_check_http_method: HEAD
-    udp_check_dns: 'dns.google.com:53,8.8.8.8,2001:4860:4860::8888'
+    udp_check_dns: 'dns.google.com:53', '8.8.8.8', '2001:4860:4860::8888'
     check_interval: 300s
     bootstrap_resolver: '1.1.1.1:53'
     # 保存成功获取的订阅正文到运行目录 .sub,启动/重载时可离线恢复

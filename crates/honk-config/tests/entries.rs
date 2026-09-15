@@ -448,6 +448,101 @@ mod subscription_syntax {
             ["https://example.com/sub"],
         );
     }
+
+    #[test]
+    fn compact_quoted_entries_preserve_raw_names_and_user_agents() {
+        let input = r#"subscription {
+ SNTP:'https://example.invalid/sub'(Loon/975 CFNetwork/1492.0.1 Darwin/23.3.0)
+ 'west:paid':"https://example.invalid/west"(Agent {} field:'x')
+ plan('vpn'),east:'https://example.invalid/plan'
+ detailed: {
+  url:'https://example.invalid/block'
+  ua:"agent # { }"
+ }
+ 'paid'x: {
+  url: https://example.invalid/raw
+  ua: {} field:'x
+ }
+}
+node {
+ edge('hk'):'socks5://127.0.0.1:1080'
+}
+group {
+ region:'vpn { policy:'score' }
+}"#;
+        let (config, diagnostics) = parse(input);
+
+        assert_eq!(
+            config
+                .subscriptions
+                .iter()
+                .map(|subscription| (
+                    subscription.name.as_str(),
+                    subscription.url.as_str(),
+                    subscription.user_agent.as_deref(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "SNTP",
+                    "https://example.invalid/sub",
+                    Some("Loon/975 CFNetwork/1492.0.1 Darwin/23.3.0"),
+                ),
+                (
+                    "west:paid",
+                    "https://example.invalid/west",
+                    Some("Agent {} field:'x'"),
+                ),
+                ("plan('vpn'),east", "https://example.invalid/plan", None),
+                (
+                    "detailed",
+                    "https://example.invalid/block",
+                    Some("agent # { }"),
+                ),
+                (
+                    "'paid'x",
+                    "https://example.invalid/raw",
+                    Some("{} field:'x"),
+                ),
+            ]
+        );
+        assert_eq!(config.nodes[0].name, "edge('hk')");
+        assert_eq!(config.groups[0].name, "region:'vpn");
+        assert_eq!(
+            config.groups[0].policy,
+            honk_config::node::GroupPolicy::Score
+        );
+        config.validate().unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn malformed_compact_subscription_suffix_does_not_poison_following_entry() {
+        let input = "subscription {\n 'https://example.invalid/old' {} field:'x\n ok: 'https://example.invalid/sub'\n}";
+        let (config, diagnostics) = parse(input);
+
+        assert_eq!(
+            config
+                .subscriptions
+                .iter()
+                .map(|subscription| (subscription.name.as_str(), subscription.url.as_str()))
+                .collect::<Vec<_>>(),
+            [("ok", "https://example.invalid/sub")]
+        );
+        config.validate().unwrap();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            ["trailing-entry-text"]
+        );
+        let diagnostic = &diagnostics[0];
+        assert!(!diagnostic.terminal);
+        assert_eq!(diagnostic.setting.to_string(), "subscriptions[1]");
+        assert_eq!(diagnostic.entry_index, Some(1));
+        assert_eq!(&input[diagnostic.span.clone().unwrap()], "{} field:'x");
+    }
 }
 
 mod group_syntax {
@@ -675,7 +770,7 @@ mod group_syntax {
     }
 
     #[test]
-    fn bare_filter_quote_receives_its_own_warning() {
+    fn unterminated_compact_filter_quote_is_a_located_lexical_error() {
         let input = "node {\n edge: 'socks5://127.0.0.1:1080'\n}\ngroup {\n proxy {\n filter:'unterminated\n }\n}";
         let mut diagnostics = Vec::new();
         let config = parse_dae_config_with_detailed_diagnostics(input, &mut diagnostics).unwrap();
@@ -685,11 +780,13 @@ mod group_syntax {
                 .iter()
                 .map(|diagnostic| diagnostic.code)
                 .collect::<Vec<_>>(),
-            ["legacy-config-warning"],
+            ["unterminated-quote"],
         );
         let diagnostic = &diagnostics[0];
-        assert_eq!(diagnostic.setting.to_string(), "groups[1].filter");
-        assert_eq!(diagnostic.entry_index, Some(1));
+        assert_eq!(
+            (diagnostic.line, diagnostic.byte_column),
+            (Some(6), Some(9))
+        );
         assert_eq!(&input[diagnostic.span.clone().unwrap()], "'unterminated");
     }
 }

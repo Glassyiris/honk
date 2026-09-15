@@ -19,7 +19,7 @@ pub(super) fn parse_group_section(
     let mut groups = Vec::new();
 
     for root in section {
-        let Some(body) = root.body_with(super::cursor::BodySyntax::Declarations) else {
+        let Some(body) = root.body() else {
             continue;
         };
         for segment in body {
@@ -40,9 +40,7 @@ pub(super) fn parse_group_section(
                 ..Default::default()
             };
             let mut fields: HashMap<&str, Text<'_, '_>> = HashMap::new();
-            for statement in
-                read::child_statements(&segment, diagnostics, super::cursor::BodySyntax::Statements)
-            {
+            for statement in read::child_statements(&segment, diagnostics) {
                 let Some((key, value)) = statement.kv() else {
                     statement.notice(
                         diagnostics,

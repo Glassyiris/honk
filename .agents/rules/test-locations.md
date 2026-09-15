@@ -14,6 +14,7 @@ Read with: `AGENTS.md` (Testing instructions); `real-ebpf.md` for the root-gated
 
 - Configuration:
     - `crates/honk-config/src/node.rs`, `src/config.rs`, `src/types.rs`, `src/parser/tests.rs` — GroupPolicy serde, protocol aliases/durations, dae policy/default/errors, file loading and private parser units.
+    - `crates/honk-config/src/parser/lexer_tests.rs`, `cursor_tests.rs` — ordinary token/quote boundaries and canonical indexed scope/segment transitions; Document-driven checks belong to the cursor suite.
     - `crates/honk-config/tests/parser_syntax.rs`, `entries.rs`, `dns_parser.rs` — scalar/routing/section grammar, named node/subscription/group entries, and DNS grammar respectively.
     - `crates/honk-config/tests/diagnostics.rs`, `validation.rs` — safe diagnostics across loaders/serde and shared admission boundaries.
     - `crates/honk-config/tests/example_configs.rs` — keeps `config.dae`, `config.min.dae`, `example.dae` parseable.

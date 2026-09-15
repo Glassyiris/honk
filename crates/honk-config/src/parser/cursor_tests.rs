@@ -39,6 +39,118 @@ fn structural_segments_never_reclassify_quoted_or_commented_braces() {
 }
 
 #[test]
+fn root_diagnostics_preserve_eof_order_and_terminal_ownership() {
+    let mut diagnostics = Vec::new();
+    parse("global {\n # comment }\n}\ntrailing\n", &mut diagnostics).unwrap();
+    assert_eq!(
+        diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),
+        ["legacy-comment-brace", "unknown-statement"],
+    );
+
+    diagnostics.clear();
+    parse("orphan 'unterminated", &mut diagnostics).unwrap_err();
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|d| (d.code, d.terminal))
+            .collect::<Vec<_>>(),
+        [("unterminated-quote", true)],
+    );
+
+    diagnostics.clear();
+    parse("future {\n # comment }\n}\n", &mut diagnostics).unwrap();
+    assert_eq!(
+        diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),
+        ["unknown-block", "legacy-comment-brace"],
+    );
+    assert_eq!(diagnostics[0].span, Some(7..8));
+
+    diagnostics.clear();
+    parse("future {}", &mut diagnostics).unwrap();
+    assert_eq!(diagnostics[0].code, "unknown-block");
+    assert_eq!(diagnostics[0].span, Some(7..9));
+}
+
+#[test]
+fn quote_modes_follow_compact_siblings_and_restore_after_nested_scopes() {
+    let text = r#"global {
+ key:'value # { }'
+ other:"value"
+}
+subscription {
+ 'west:paid':"https://example.invalid/sub"
+}
+group {
+ region:'vpn {
+  policy:'score'
+  filter:f(kind:'a', other:'b')
+ }
+}
+dns {
+ upstream {} routing {
+  request {
+   qname(regex:'|example[.]invalid) -> reject
+  }
+ }
+ bind:'tcp+udp://[::]:53530'
+}
+routing {
+ f(kind:'a', other:'b') -> direct
+}"#;
+    let mut diagnostics = Vec::new();
+    let document = parse(text, &mut diagnostics).unwrap();
+    let source = document.source();
+    let quoted = document
+        .tokens()
+        .iter()
+        .filter(|token| !token.quoted.is_empty())
+        .map(|token| {
+            (
+                source.raw(token.span),
+                token
+                    .quoted
+                    .iter()
+                    .map(|span| source.raw(span.interior()))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        quoted,
+        [
+            ("key:'value # { }'", vec!["value # { }"]),
+            ("other:\"value\"", vec!["value"]),
+            (
+                "'west:paid':\"https://example.invalid/sub\"",
+                vec!["west:paid", "https://example.invalid/sub"],
+            ),
+            ("policy:'score'", vec!["score"]),
+            ("bind:'tcp+udp://[::]:53530'", vec!["tcp+udp://[::]:53530"]),
+        ]
+    );
+    assert_eq!(
+        document
+            .sections()
+            .map(|section| section.header())
+            .collect::<Vec<_>>(),
+        ["global", "subscription", "group", "dns", "routing"]
+    );
+    let dns = document
+        .sections()
+        .find(|section| section.header() == "dns")
+        .unwrap();
+    assert_eq!(
+        dns.body()
+            .unwrap()
+            .map(|segment| segment.header())
+            .collect::<Vec<_>>(),
+        ["upstream", "routing", "bind:'tcp+udp://[::]:53530'"]
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+#[test]
 fn glued_header_braces_report_the_actual_byte() {
     for text in [
         "global{\n x: y\n}",

@@ -1,6 +1,9 @@
 //! Keep emitting tests in this binary: scoped-subscriber callsite interest is resolved through
 //! the registering thread's default (`Rebuilder::JustOne`). No-subscriber diagnostic suites stay in
 //! separate binaries so they cannot cache these callsites as never-interested.
+use honk_config::diagnostic::{
+    DetailedDiagnostic, DiagnosticSources, SafeValue, SettingPath, report_detailed_diagnostics,
+};
 use honk_config::parser::parse_dae_config;
 use parking_lot::Mutex;
 use serde::de::DeserializeSeed;
@@ -36,6 +39,58 @@ fn test_millisecond_duration_compat_entry_logs_warning() {
     let bytes = output.0.lock();
     let log = String::from_utf8_lossy(&bytes);
     assert!(log.contains("global.check_tolerance"), "{log}");
+}
+
+#[test]
+fn detailed_reporting_adds_safe_optional_locations() {
+    let output = Writer::default();
+    let writer = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let sources = DiagnosticSources::new(Some("PRIVATE_PATH".into()));
+        let child = sources.add(Some("PRIVATE_CHILD_PATH".into()), Some(0));
+        let mut located = DetailedDiagnostic::warning(
+            "with-location",
+            child,
+            SettingPath::new("global").field("tcp_check_url"),
+            SafeValue::Redacted,
+            "safe warning",
+        );
+        located.line = Some(7);
+        located.byte_column = Some(11);
+        let missing = DetailedDiagnostic::warning(
+            "without-location",
+            sources.root(),
+            SettingPath::new("global").field("udp_check_dns"),
+            SafeValue::Redacted,
+            "safe warning",
+        );
+
+        report_detailed_diagnostics(&[located, missing]);
+    });
+
+    let bytes = output.0.lock();
+    let log = String::from_utf8_lossy(&bytes);
+    let located = log
+        .lines()
+        .find(|line| line.contains("with-location"))
+        .unwrap();
+    assert!(located.contains("source=1"), "{located}");
+    assert!(located.contains("line=7"), "{located}");
+    assert!(located.contains("byte_column=11"), "{located}");
+    let unlocated = log
+        .lines()
+        .find(|line| line.contains("without-location"))
+        .unwrap();
+    assert!(unlocated.contains("source=0"), "{unlocated}");
+    assert!(!unlocated.contains("line="), "{unlocated}");
+    assert!(!unlocated.contains("byte_column="), "{unlocated}");
+    assert!(!log.contains("PRIVATE"), "{log}");
 }
 
 #[test]

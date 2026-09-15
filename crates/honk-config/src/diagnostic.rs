@@ -337,15 +337,36 @@ pub fn finish_attempt<T>(
 pub fn report_detailed_diagnostics(diagnostics: &[DetailedDiagnostic]) {
     for d in diagnostics.iter().filter(|d| !d.terminal) {
         match d.severity {
-            Severity::Info => {
-                tracing::info!(code = d.code, setting = %d.setting, value = %d.value, "{}", d.message)
-            }
-            Severity::Warning => {
-                tracing::warn!(code = d.code, setting = %d.setting, value = %d.value, "{}", d.message)
-            }
-            Severity::Error => {
-                tracing::error!(code = d.code, setting = %d.setting, value = %d.value, "{}", d.message)
-            }
+            Severity::Info => tracing::info!(
+                code = d.code,
+                source = d.source.index(),
+                line = d.line,
+                byte_column = d.byte_column,
+                setting = %d.setting,
+                value = %d.value,
+                "{}",
+                d.message
+            ),
+            Severity::Warning => tracing::warn!(
+                code = d.code,
+                source = d.source.index(),
+                line = d.line,
+                byte_column = d.byte_column,
+                setting = %d.setting,
+                value = %d.value,
+                "{}",
+                d.message
+            ),
+            Severity::Error => tracing::error!(
+                code = d.code,
+                source = d.source.index(),
+                line = d.line,
+                byte_column = d.byte_column,
+                setting = %d.setting,
+                value = %d.value,
+                "{}",
+                d.message
+            ),
         }
     }
 }
