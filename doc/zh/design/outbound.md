@@ -433,6 +433,10 @@ Score reporter；匹配 reply 与共享 terminal outcome 分别结算这些 flow
 reply 没有逐 flow Score。source 容量耗尽返回 `PacketRejection::Capacity`：对该
 候选终结，但不影响 health 或 Score。
 
+source 关闭准入时同时发布中立或失败的结算结果；即使 driver cleanup 抢先取得
+reporter，统一的 endpoint Score 结算入口也使用该结果。未绑定的 view，以及
+在 source 关闭前已经退役的 view，保留自己的局部结果；shutdown 仍保持中立。
+
 endpoint 在 packet 入队后有意退役时，会终结结果不明确的 source，但不重放 packet，
 也不产生负向 transport health。后续 sender 与 receiver 保留相同的取消原因，
 避免兄弟 flow 的发送将其重新解释为 carrier 故障。

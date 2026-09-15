@@ -55,8 +55,14 @@ fn normalize_socket_addr(addr: SocketAddr) -> SocketAddr {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum SourceRetirement {
+    Neutral(ScoreOutcome),
+    Failure(ScoreOutcome),
+}
+
 struct SourceState {
-    admitting: bool,
+    retirement: Option<SourceRetirement>,
     attachments: usize,
     bindings: usize,
     active_sender: u64,
@@ -118,7 +124,7 @@ impl SourceOwner {
             transport,
             _runtime: runtime,
             state: Mutex::new(SourceState {
-                admitting: true,
+                retirement: None,
                 attachments: 1,
                 bindings: 0,
                 active_sender: 0,
@@ -147,7 +153,7 @@ impl SourceOwner {
 
     fn attach(self: &Arc<Self>) -> Option<SourceAttachment> {
         let mut state = self.state.lock();
-        if !state.admitting {
+        if state.retirement.is_some() {
             return None;
         }
         state.attachments = state
@@ -162,7 +168,7 @@ impl SourceOwner {
 
     fn commit_attachment(&self) -> bool {
         let mut state = self.state.lock();
-        if !state.admitting {
+        if state.retirement.is_some() {
             return false;
         }
         debug_assert_ne!(state.attachments, 0);
@@ -179,8 +185,8 @@ impl SourceOwner {
             let mut state = self.state.lock();
             debug_assert_ne!(state.attachments, 0);
             state.attachments -= 1;
-            if state.admitting && state.bindings == 0 && state.attachments == 0 {
-                state.admitting = false;
+            if state.retirement.is_none() && state.bindings == 0 && state.attachments == 0 {
+                state.retirement = Some(SourceRetirement::Neutral(ScoreOutcome::Cancelled));
                 true
             } else {
                 false
@@ -196,8 +202,8 @@ impl SourceOwner {
             let mut state = self.state.lock();
             debug_assert_ne!(state.bindings, 0);
             state.bindings -= 1;
-            if state.admitting && state.bindings == 0 {
-                state.admitting = false;
+            if state.retirement.is_none() && state.bindings == 0 {
+                state.retirement = Some(SourceRetirement::Neutral(ScoreOutcome::Cancelled));
                 true
             } else {
                 false
@@ -213,13 +219,13 @@ impl SourceOwner {
         self.retire_notify.notify_waiters();
     }
 
-    fn start_retiring(&self) -> bool {
+    fn start_retiring(&self, retirement: SourceRetirement) -> bool {
         let changed = {
             let mut state = self.state.lock();
-            if !state.admitting {
+            if state.retirement.is_some() {
                 false
             } else {
-                state.admitting = false;
+                state.retirement = Some(retirement);
                 true
             }
         };
@@ -232,13 +238,13 @@ impl SourceOwner {
     fn start_retiring_without_reply(&self) -> bool {
         let changed = {
             let mut state = self.state.lock();
-            if !state.admitting
+            if state.retirement.is_some()
                 || !self.sent.load(Ordering::Acquire)
                 || self.has_reply.load(Ordering::Acquire)
             {
                 false
             } else {
-                state.admitting = false;
+                state.retirement = Some(SourceRetirement::Failure(ScoreOutcome::Timeout));
                 true
             }
         };
@@ -294,14 +300,14 @@ impl SourceOwner {
     }
     fn note_reply(&self) {
         let state = self.state.lock();
-        if state.admitting {
+        if state.retirement.is_none() {
             self.has_reply.store(true, Ordering::Release);
         }
     }
 
     fn report_available(&self) {
         let state = self.state.lock();
-        if !state.admitting {
+        if state.retirement.is_some() {
             return;
         }
         let now = monotonic_nanos();
@@ -506,6 +512,7 @@ pub(super) struct SourceEndpoint {
 struct SourceEndpointBinding {
     attachment: Option<SourceAttachment>,
     bound: bool,
+    retirement: Option<SourceRetirement>,
     _endpoint_permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -529,6 +536,7 @@ impl SourceEndpoint {
             binding: Mutex::new(SourceEndpointBinding {
                 attachment: Some(attachment),
                 bound: false,
+                retirement: None,
                 _endpoint_permit: None,
             }),
         }
@@ -536,6 +544,16 @@ impl SourceEndpoint {
 
     pub(super) fn owner_id(&self) -> u64 {
         self.owner.id
+    }
+
+    pub(super) fn score_retirement(&self) -> Option<SourceRetirement> {
+        let binding = self.binding.lock();
+        binding._endpoint_permit.as_ref()?;
+        if binding.bound {
+            self.owner.state.lock().retirement
+        } else {
+            binding.retirement
+        }
     }
 
     #[cfg(test)]
@@ -564,6 +582,7 @@ impl SourceEndpoint {
             let mut state = self.owner.state.lock();
             if binding.bound {
                 state.mark_intentional_sender(self.view);
+                binding.retirement = state.retirement;
             }
             // Publish intent before a sender can observe retirement and drop its send.
             self.retired.store(true, Ordering::Release);
@@ -594,7 +613,7 @@ impl SourceEndpoint {
                     "VLESS UDP flow retired before source send",
                 ));
             }
-            if !state.admitting {
+            if state.retirement.is_some() {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
                     "VLESS UDP source retired before send",
@@ -685,7 +704,8 @@ struct SourceReplyLease {
 
 impl Drop for SourceReplyLease {
     fn drop(&mut self) {
-        self.owner.start_retiring();
+        self.owner
+            .start_retiring(SourceRetirement::Neutral(ScoreOutcome::Cancelled));
         match self.pool.sources.entry(self.owner.scope.clone()) {
             dashmap::mapref::entry::Entry::Occupied(entry) if entry.get().id == self.owner.id => {
                 entry.remove();
@@ -844,16 +864,19 @@ impl UdpEndpointPool {
         self.retire_source_neutral(owner, ScoreOutcome::Cancelled);
     }
 
-    fn retire_source_neutral(&self, owner: &SourceOwner, no_reply: ScoreOutcome) {
-        if !owner.start_retiring() {
-            return;
-        }
-        let stale: Vec<(EndpointKey, u32, u64, Arc<UdpEndpoint>)> = self
-            .endpoints
+    fn source_settlement_endpoints(
+        &self,
+        owner: &SourceOwner,
+    ) -> Vec<(EndpointKey, u32, u64, Arc<UdpEndpoint>)> {
+        self.endpoints
             .iter()
             .filter_map(|entry| match entry.value() {
                 EndpointEntry::Ready(ready)
-                    if ready.endpoint.source_owner_id() == Some(owner.id) =>
+                    if matches!(
+                        &ready.endpoint.transport,
+                        EndpointTransport::Source(source)
+                            if source.owner.id == owner.id && source.score_retirement().is_some()
+                    ) =>
                 {
                     Some((
                         *entry.key(),
@@ -864,19 +887,22 @@ impl UdpEndpointPool {
                 }
                 _ => None,
             })
-            .collect();
+            .collect()
+    }
+
+    fn retire_source_neutral(&self, owner: &SourceOwner, no_reply: ScoreOutcome) {
+        if !owner.start_retiring(SourceRetirement::Neutral(no_reply)) {
+            return;
+        }
+        let stale = self.source_settlement_endpoints(owner);
         for (key, token, generation, endpoint) in stale {
-            endpoint.finish_score(if endpoint.has_reply() {
-                ScoreOutcome::Success
-            } else {
-                no_reply
-            });
+            endpoint.finish_score(no_reply);
             self.retire_if_same(key, token, generation);
         }
     }
 
     fn fail_source(&self, owner: &SourceOwner, outcome: ScoreOutcome) {
-        if owner.start_retiring() {
+        if owner.start_retiring(SourceRetirement::Failure(outcome)) {
             self.finish_source_failure(owner, outcome);
         }
     }
@@ -888,23 +914,7 @@ impl UdpEndpointPool {
         } else {
             outcome
         };
-        let stale: Vec<(EndpointKey, u32, u64, Arc<UdpEndpoint>)> = self
-            .endpoints
-            .iter()
-            .filter_map(|entry| match entry.value() {
-                EndpointEntry::Ready(ready)
-                    if ready.endpoint.source_owner_id() == Some(owner.id) =>
-                {
-                    Some((
-                        *entry.key(),
-                        ready.decision_token,
-                        ready.generation,
-                        Arc::clone(&ready.endpoint),
-                    ))
-                }
-                _ => None,
-            })
-            .collect();
+        let stale = self.source_settlement_endpoints(owner);
         for (_, _, _, endpoint) in &stale {
             endpoint.finish_score(outcome);
         }

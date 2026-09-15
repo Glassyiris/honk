@@ -34,7 +34,7 @@ pub(crate) use retirement::{EndpointRemoval, RemovalReason};
 #[cfg(feature = "rprx")]
 pub(in crate::control) use source::{SourceAttachment, VlessSourcePreparation};
 #[cfg(feature = "rprx")]
-use source::{SourceEndpoint, SourceOwner, SourceScope};
+use source::{SourceEndpoint, SourceOwner, SourceRetirement, SourceScope};
 #[doc(hidden)]
 pub mod bench_support;
 #[cfg(feature = "ebpf")]
@@ -227,7 +227,24 @@ impl UdpEndpoint {
     }
 
     pub(crate) fn finish_score(&self, outcome: ScoreOutcome) {
-        if let Some(reporter) = self.score_reporter.lock().take() {
+        let mut score_reporter = self.score_reporter.lock();
+        if score_reporter.is_none() {
+            return;
+        }
+        #[cfg(feature = "rprx")]
+        let outcome = match &self.transport {
+            EndpointTransport::Source(source) if outcome != ScoreOutcome::Shutdown => {
+                match source.score_retirement() {
+                    Some(SourceRetirement::Neutral(_)) if self.has_reply() => ScoreOutcome::Success,
+                    Some(
+                        SourceRetirement::Neutral(outcome) | SourceRetirement::Failure(outcome),
+                    ) => outcome,
+                    None => outcome,
+                }
+            }
+            _ => outcome,
+        };
+        if let Some(reporter) = score_reporter.take() {
             let upload = self.upload.load(Ordering::Relaxed);
             let download = self.download.load(Ordering::Relaxed);
             reporter.tx(upload);

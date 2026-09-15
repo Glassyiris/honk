@@ -493,6 +493,11 @@ settle those flows separately. Foreign replies have no per-flow Score. Source
 capacity exhaustion is `PacketRejection::Capacity`, terminal for that candidate
 but health- and Score-neutral.
 
+Source admission closure also publishes its neutral or failure settlement. The
+common endpoint Score finalizer uses it even if driver cleanup wins the reporter
+race. Never-bound views and views retired before that closure retain their local
+result; shutdown remains neutral.
+
 Intentional endpoint retirement after queue admission ends the ambiguous source
 without replay or negative transport health. Later senders and the receiver
 retain the same cancellation cause, so a sibling send cannot reinterpret it as

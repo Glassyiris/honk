@@ -830,3 +830,145 @@ async fn post_admission_view_cancel_is_health_neutral() {
         let _ = wire_task.await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_source_failure_wins_late_cleanup_but_preserves_local_cancellation() {
+    let (server, mut events, wire_task) = start_wire_peer().await;
+    let (node, generation, runtime) = source_runtime(server, 2);
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = client.local_addr().unwrap();
+    let sockets: [_; 4] =
+        std::array::from_fn(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+    let targets = sockets
+        .each_ref()
+        .map(|socket| socket.local_addr().unwrap());
+    let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
+        3,
+        Arc::new(SourceReplySocketFactory::new(sockets)),
+    ));
+    let stats = Arc::new(StatsManager::new());
+    let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
+    let other = Node {
+        name: "other-score-node".into(),
+        id: OTHER_SCORE_NODE_ID,
+        ..Default::default()
+    };
+    let group = honk_config::group::Group {
+        name: "score".into(),
+        policy: honk_config::group::GroupPolicy::Score,
+        nodes: vec![node.id, other.id],
+        ..Default::default()
+    };
+    let contexts = targets.map(score_context);
+    let managers = contexts.each_ref().map(|context| {
+        let manager = honk_outbound::group::GroupManager::new(
+            std::slice::from_ref(&group),
+            &[node.clone(), other.clone()],
+        );
+        train_score_context(&manager, node.id, other.id, context);
+        manager
+    });
+    let mut endpoints = Vec::new();
+    for (index, target) in targets.into_iter().enumerate() {
+        let attachment = attach_source(
+            &pool,
+            &generation,
+            &runtime,
+            client_addr,
+            target,
+            &alive,
+            &stats,
+        )
+        .await;
+        let reporter = managers[index]
+            .feedback_for_node(node.id, contexts[index].clone())
+            .unwrap()
+            .start();
+        reporter.setup_succeeded();
+        let endpoint = source_endpoint(&pool, attachment, target, &stats, node.id, Some(reporter));
+        if index < 3 {
+            let mut lease = reserve_source(&pool, &stats, client_addr, target, node.id);
+            assert!(lease.commit_ready(Arc::clone(&endpoint)));
+        }
+        endpoints.push(endpoint);
+    }
+    for endpoint in &endpoints[..2] {
+        endpoint.send_packet(b"bound", true).await.unwrap();
+    }
+    endpoints[2].kill();
+    let mut replies = HashMap::new();
+    let first = next_data_frame(&mut events, &mut replies).await;
+    let second = next_data_frame(&mut events, &mut replies).await;
+    assert_eq!(first.connection, second.connection);
+    let scope = SourceScope::new(&runtime, client_addr, VlessUdpPath::Xudp, None);
+    let owner = Arc::clone(pool.sources.get(&scope).unwrap().value());
+    let sweep: Vec<_> = pool
+        .endpoints
+        .iter()
+        .filter_map(|entry| match entry.value() {
+            EndpointEntry::Ready(ready) if !ready.endpoint.dead.load(Ordering::Acquire) => {
+                Some(Arc::clone(&ready.endpoint))
+            }
+            _ => None,
+        })
+        .collect();
+    let later = endpoints
+        .iter()
+        .position(|endpoint| Arc::ptr_eq(endpoint, &sweep[1]))
+        .unwrap();
+    let winner = |index: usize| {
+        managers[index]
+            .selection_plan_for_target("score", &contexts[index])
+            .entries[0]
+            .node
+            .id
+    };
+    let settlement = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        std::thread::scope(|threads| {
+            // Keep the stable DashMap sweep blocked at its first reporter, not this flow.
+            let first_reporter = sweep[0].score_reporter.lock();
+            let later_reporter = sweep[1].score_reporter.lock();
+            let retirer = threads.spawn(|| {
+                owner.fail(honk_outbound::group::ScoreOutcome::Io(
+                    io::ErrorKind::ConnectionReset,
+                ));
+            });
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(wait_source_removed(&pool, &scope));
+            });
+            drop(later_reporter);
+            sweep[1].finish_score(honk_outbound::group::ScoreOutcome::Cancelled);
+            let bound_winner = winner(later);
+            drop(first_reporter);
+            retirer.join().unwrap();
+            for endpoint in &endpoints[2..] {
+                endpoint.finish_score(honk_outbound::group::ScoreOutcome::Cancelled);
+            }
+            [bound_winner, winner(2), winner(3)]
+        })
+    }));
+    drop(sweep);
+    drop(endpoints);
+    drop(owner);
+    let shutdown = pool.shutdown().await;
+    generation.shutdown().await;
+    wire_task.abort();
+    let _ = wire_task.await;
+    let [bound_winner, retired_winner, unbound_winner] = match settlement {
+        Ok(winners) => winners,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    assert!(shutdown);
+    assert_eq!(
+        bound_winner, other.id,
+        "late local cancellation must not consume the shared source's I/O failure",
+    );
+    assert_eq!(
+        retired_winner, node.id,
+        "a flow retired before source failure keeps its local cancellation",
+    );
+    assert_eq!(
+        unbound_winner, node.id,
+        "an endpoint never admitted to the source keeps its local cancellation",
+    );
+}
