@@ -18,9 +18,11 @@ pub mod tuic;
 pub(crate) mod uot;
 #[cfg(feature = "rprx")]
 pub mod vless;
+#[cfg(any(feature = "rprx", test))]
 pub(crate) mod vless_cool;
 #[cfg(feature = "rprx")]
 mod vless_encryption;
+#[cfg(any(feature = "rprx", test))]
 pub(crate) mod vless_mux;
 #[cfg(feature = "rprx")]
 pub mod vmess;
@@ -435,13 +437,7 @@ pub trait PacketTransport: Send + Sync + Debug {
 pub(crate) trait MuxSession: crate::session::ManagedSession + Sized + 'static {
     type Stream: AsyncReadWrite + 'static;
     type Packet: PacketTransport + 'static;
-    #[cfg_attr(
-        not(any(feature = "rprx", test)),
-        allow(
-            dead_code,
-            reason = "only VLESS H2MUX performs a carrier readiness probe"
-        )
-    )]
+    #[cfg(any(feature = "rprx", test))]
     fn check_ready(
         self: Arc<Self>,
     ) -> impl Future<Output = Result<(), crate::session::OpenError>> + Send {

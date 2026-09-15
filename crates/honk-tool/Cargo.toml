@@ -8,10 +8,14 @@ description = "honk CLI toolbox: subscription checks, datapath diagnostics"
 name = "honk-tool"
 path = "src/main.rs"
 
+[features]
+default = ["rprx"]
+rprx = ["honk-outbound/rprx"]
+
 [dependencies]
 honk-config.workspace = true
 honk-ebpf-common.workspace = true
-honk-outbound = { workspace = true, features = ["rprx"] }
+honk-outbound.workspace = true
 honk-core = { path = "../honk-core", default-features = false }
 
 anyhow.workspace = true

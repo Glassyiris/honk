@@ -130,9 +130,12 @@ Registry 组装会检查 descriptor capability 与填充的槽是否一致。
 | `tuic` | TUIC v5 QUIC stream | QUIC datagram 或 uni-stream fallback |
 | `juicity` | Juicity QUIC stream | 一条长度分帧 QUIC bi stream |
 
-VMess 与 VLESS entry 只在 `rprx` feature 下编译。`honk-core` 默认
-feature 集启用它。不带 `rprx` 时，这些节点形式仍能解析，但 registry
-中没有对应 entry，拨号以普通的 `No handler for protocol` 拒绝。
+VMess 与 VLESS entry 只在 `rprx` feature 下编译。`honk-core` 与 `honk-tool`
+默认 feature 集启用它。不带 `rprx` 时，这些节点形式仍能解析，但 registry
+中没有对应 entry，拨号以普通的 `No handler for protocol` 拒绝。正常的
+feature-off 构建不分配 VLESS runtime pool 或 carrier semaphore。单元测试
+通过 `cfg(test)` 保留 backend 覆盖；feature 边界集成测试链接正常 library，
+验证这两种构建的区别。
 
 ## Runtime 所有权与 reload
 

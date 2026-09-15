@@ -7,6 +7,7 @@ use super::addr;
 
 pub(crate) const MAGIC_ADDRESS: &str = "sp.v2.udp-over-tcp.arpa";
 pub(crate) const MAX_PACKET_SIZE: usize = u16::MAX as usize;
+#[cfg(any(feature = "rprx", test))]
 const MAX_BUFFERED_BYTES: usize = 2 * (2 + MAX_PACKET_SIZE);
 pub(crate) const V1_ATYP_V4: u8 = 0x00;
 pub(crate) const V1_ATYP_V6: u8 = 0x01;
@@ -131,11 +132,13 @@ pub(crate) fn copy_frame(
     Ok(payload_len)
 }
 
+#[cfg(any(feature = "rprx", test))]
 #[derive(Default)]
 pub(crate) struct Decoder {
     buffered: BytesMut,
 }
 
+#[cfg(any(feature = "rprx", test))]
 impl Decoder {
     pub(crate) fn push(&mut self, data: &[u8]) -> io::Result<()> {
         if self.buffered.len().saturating_add(data.len()) > MAX_BUFFERED_BYTES {

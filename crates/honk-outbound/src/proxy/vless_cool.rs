@@ -1,4 +1,4 @@
-#![cfg_attr(not(feature = "rprx"), allow(dead_code))]
+#![cfg_attr(all(test, not(feature = "rprx")), allow(dead_code))]
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;

@@ -141,9 +141,12 @@ can reject the flow terminally.
 | `juicity` | Juicity QUIC stream | One length-framed QUIC bi stream |
 
 VMess and VLESS entries are compiled only with the `rprx` feature. The default
-`honk-core` feature set enables it. Without `rprx`, these node forms still parse,
-but the registry contains no entry and dials fail with the ordinary
-`No handler for protocol` refusal.
+`honk-core` and `honk-tool` feature sets enable it. Without `rprx`, these node
+forms still parse, but the registry contains no entry and dials fail with the
+ordinary `No handler for protocol` refusal. Normal feature-off builds allocate
+no VLESS runtime pools or carrier semaphores. Unit builds retain backend-only
+coverage through `cfg(test)`; the feature-boundary integration test links the
+normal library to verify that distinction.
 
 Unknown transports, invalid pins/REALITY keys, and reserved built-in names/protocols fail closed.
 
