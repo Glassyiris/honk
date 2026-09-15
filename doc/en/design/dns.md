@@ -144,7 +144,7 @@ Only IN-class A and AAAA queries use the snapshot. A known name with no address 
 | `ipv4only` | Only A is eligible. AAAA is answered NODATA without upstream I/O. |
 | `ipv6only` | Only AAAA is eligible. A is answered NODATA without upstream I/O. |
 
-A prefer-family sibling query changes only the first question's QTYPE. Transaction ID, flags, QCLASS, EDNS data, ingress profile, logical client source, original destination, and the rest of the wire profile remain unchanged. Sibling failure or NODATA does not suppress a usable non-preferred response. For internal/application hostname resolution, the bootstrap fallback runs once only when every eligible family is unusable, then filters fallback addresses through the same family eligibility.
+A prefer-family sibling query changes only the first question's QTYPE. Transaction ID, flags, QCLASS, EDNS data, ingress profile, logical client source, original destination, and the rest of the wire profile remain unchanged. Ordinary sibling failure or NODATA does not suppress a usable non-preferred response; a typed local packet refusal instead terminates the caller's resolution with that cause. For internal/application hostname resolution, the bootstrap fallback runs once only when every eligible family is unusable, then filters fallback addresses through the same family eligibility.
 
 The strategy also orders bootstrap-resolved upstream dial targets. `both` uses IPv4-first compatibility order; preference modes put their family first while retaining the other family. Stream and QUIC transports walk the ordered candidates. Direct UDP keeps the existing two-attempt bound: after the first candidate fails, its retry selects the other family before another address of the same family and caches the winner.
 
@@ -155,8 +155,9 @@ name-family aggregation do not turn that cause into another route, bootstrap,
 or system-DNS attempt. Health and URLTest resolver hooks preserve it to the
 final consumer, so denied lookups neither demote nodes nor substitute the
 default UDP check target. Independently permitted probes and configured literal
-fallback IPs remain usable. Ordinary failures, empty responses, and existing
-stale-cache handling retain the fallback behavior described above.
+fallback IPs remain usable. A typed refusal cannot become a stale-cache answer
+or a successful non-preferred-family answer. Ordinary failures, empty responses,
+and accepted SERVFAIL retain the documented fallback behavior.
 
 ### DNS routing
 
@@ -199,7 +200,7 @@ Configured ECS is a generation-pinned named-upstream transport policy, not ingre
 | Positive TTL | `fixed_domain_ttl` has first priority; zero disables caching for that domain. Otherwise nonzero `optimistic_cache_ttl` overrides the answer minimum TTL. With neither override, a positive NOERROR response uses the minimum of all walked non-OPT record TTLs, including zero; zero supersedes the exact slot without caching. The selected nonzero TTL is also written into cached records. Failure rcodes keep their existing TTL extraction. |
 | Negative TTL | NXDOMAIN uses `min(SOA TTL, SOA MINIMUM, 300)` seconds; missing SOA or zero lifetime supersedes the exact slot without retaining the response. SERVFAIL still defaults to 60 seconds and clamps the SOA-derived lifetime to `1..=300`. `fixed_domain_ttl: 0` prevents caching for every response code without superseding an existing entry. |
 | NODATA TTL | NOERROR with `ANCOUNT=0` retains its full wire in the positive slot. A nonzero `fixed_domain_ttl` overrides SOA and the cap; otherwise lifetime is `min(SOA TTL, SOA MINIMUM, 300)`, with missing SOA or zero superseding the exact slot without caching. `optimistic_cache_ttl` does not apply. NODATA remains stale-eligible; stale rewriting changes SOA TTL, not MINIMUM. |
-| Stale handling | Expired positive answers remain eligible for serve-stale for one hour. An upstream exchange error or accepted SERVFAIL may return one. `optimistic_stale_reply_ttl` defaults to 30 seconds; a non-zero value replaces every non-OPT RR TTL and sets the outcome TTL. `0` preserves cached policy-rewritten TTLs, not authoritative TTLs; the outcome TTL then comes from `extract_min_ttl` of that wire, falling back to 60 seconds when no positive TTL exists. Near-expiry hits start a deduplicated stale-while-revalidate refresh. |
+| Stale handling | Expired positive answers remain eligible for serve-stale for one hour. An ordinary upstream exchange error or accepted SERVFAIL may return one; typed local packet refusals never do. `optimistic_stale_reply_ttl` defaults to 30 seconds; a non-zero value replaces every non-OPT RR TTL and sets the outcome TTL. `0` preserves cached policy-rewritten TTLs, not authoritative TTLs; the outcome TTL then comes from `extract_min_ttl` of that wire, falling back to 60 seconds when no positive TTL exists. Near-expiry hits start a deduplicated stale-while-revalidate refresh. |
 | Flush fence | A publication epoch prevents foreground or background work begun before a flush from repopulating memory or persistence after the flush barrier. |
 
 A background refresh captures the Resolve slot's publication revision with its positive lookup. Every accepted exact publication, including a negative merge or restore, advances that revision. Publication requires the same revision and a retained positive under the shard lock. A matching cacheable NXDOMAIN removes the refreshed positive before storing the negative; a cacheable positive or NODATA replaces the slot. NXDOMAIN, NODATA, or a zero-TTL positive without a usable lifetime removes the whole slot instead, including any negative value. SERVFAIL without eligible stale fallback retains the positive and merges the negative. A newer publication, a negative-only slot, or eviction discards the refresh result; eviction does not allow re-admission without an owner.
