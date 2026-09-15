@@ -163,6 +163,10 @@ VMess JSON 使用 `net: "ws"` 时，缺失或为空的 `host` 会让 WebSocket �
 
 长度错误或不是 base64 的密钥会导致 handler 构造失败。
 
+UDP 重放保护分别保留当前和前一个服务端 session 的窗口。前一个 session
+连续 60 秒没有活动后才接受第三个 session。只有认证及响应 header 校验
+成功后才修改接收 session 状态，无效包不能重置重放历史。
+
 ### 流传输
 
 支持流传输的分享链接用 `type=` 或其 `network=` 别名选择传输方式。空文本和 `tcp` 表示裸 TCP；`ws`、`grpc` 分别选择 WebSocket、gRPC。赋值前会比较所有已提供的别名，包括兼容的 `obfs` 声明和重复查询键；不一致则拒绝链接。`h2`、`kcp` 等不支持的名称会在解析时被拒绝。对于 `ws`，`path` 映射到 `ws_path`，`host` 映射到 `ws_host`；对于 `grpc`，`serviceName` 或 `service_name` 映射到 `grpc_service`。`sni` 独立生效。`alpn` 为兼容而接受，但不会存储。

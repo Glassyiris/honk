@@ -163,6 +163,11 @@ VMess and VLESS nodes still parse without the `rprx` Cargo feature, but no handl
 
 An incorrect or non-base64 key fails handler construction.
 
+UDP replay protection retains separate current and previous server-session
+windows. A third session is admitted only after the previous session has been
+inactive for 60 seconds. Authentication and response-header validation precede
+all receive-session state changes, so an invalid packet cannot reset replay history.
+
 ### Stream transports
 
 Stream-capable share links select transport with `type=` or its `network=` alias. Empty text and `tcp` mean raw TCP; `ws` and `grpc` select WebSocket and gRPC. All supplied aliases, including compatible `obfs` declarations and repeated query keys, must agree before assignment. Unsupported names such as `h2` and `kcp` reject the link during parsing. For `ws`, `path` maps to `ws_path` and `host` maps to `ws_host`; for `grpc`, `serviceName` or `service_name` maps to `grpc_service`. `sni` is independent. `alpn` is accepted for compatibility but not stored.
