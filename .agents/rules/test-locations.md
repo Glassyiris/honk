@@ -33,6 +33,7 @@ Read with: `AGENTS.md` (Testing instructions); `real-ebpf.md` for the root-gated
     - `control/sockets/tests.rs` owns socket options, receive batching and ancillary decoding; `control/udp_ingress/tests.rs` owns destination provenance. Shared control fixtures stay in `control/tests/support.rs`.
     - `crates/honk-core/src/dns/<owner>/tests.rs` and topic children — resolver/cache/engine/forwarder/policy/runtime tests, using native Rust modules.
     - Inline unit tests in the other owning modules cover mode, stats, routing, relay and transports. Real-backend tests require `ebpf`; ignored netns tests require root. `honk-core/tests/ebpf_datapath_test.rs` remains a separate root-gated target for `just test-netns` and CI.
+    - `crates/honk-core/src/routing/lan_protection.rs` — conservative advisory coverage: ordered terminal ownership, unknown predicates, address families and non-DNS port/protocol boundaries.
     - `crates/honk-tool/tests/{geo_cli,diagnose_cli}.rs` — toolbox process-level contracts; command internals stay in their owning unit modules.
 
 ### Benchmarks
