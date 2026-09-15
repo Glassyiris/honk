@@ -98,6 +98,86 @@ jobs:
           cargo +nightly build --release -Zbuild-std=core --target bpfel-unknown-none
           readelf -S target/bpfel-unknown-none/release/honk-ebpf | grep '\.BTF'
 
+  public-vless-loopback:
+    name: Public VLESS loopback interop (2 cases)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read Rust toolchain
+        id: toolchain
+        run: echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: public-vless-loopback-${{ steps.toolchain.outputs.stable }}
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        with:
+          tool: nextest
+      - name: Install build and archive dependencies
+        run: |
+          set -euo pipefail
+          sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev unzip
+      - name: Install pinned official Xray prerelease and sing-box
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          tools="$RUNNER_TEMP/public-vless-interop"
+          mkdir -p "$tools"
+          curl -fsSL --retry 3 -o "$tools/Xray-linux-64.zip" \
+            "https://github.com/XTLS/Xray-core/releases/download/v$XRAY_VERSION/Xray-linux-64.zip"
+          curl -fsSL --retry 3 -o "$tools/sing-box.tar.gz" \
+            "https://github.com/SagerNet/sing-box/releases/download/v$SING_BOX_VERSION/sing-box-$SING_BOX_VERSION-linux-amd64-musl.tar.gz"
+          echo "$XRAY_SHA256  $tools/Xray-linux-64.zip" | sha256sum -c -
+          echo "$SING_BOX_SHA256  $tools/sing-box.tar.gz" | sha256sum -c -
+          unzip -j "$tools/Xray-linux-64.zip" xray -d "$tools"
+          tar -xzf "$tools/sing-box.tar.gz" -C "$tools" --strip-components=1 \
+            "sing-box-$SING_BOX_VERSION-linux-amd64-musl/sing-box"
+          HONK_XRAY_BIN=$(realpath "$tools/xray")
+          HONK_SING_BOX_BIN=$(realpath "$tools/sing-box")
+          test -x "$HONK_XRAY_BIN"
+          test -x "$HONK_SING_BOX_BIN"
+          echo "HONK_XRAY_BIN=$HONK_XRAY_BIN" >> "$GITHUB_ENV"
+          echo "HONK_SING_BOX_BIN=$HONK_SING_BOX_BIN" >> "$GITHUB_ENV"
+          printf 'Official Xray prerelease v%s; sing-box v%s\n' "$XRAY_VERSION" "$SING_BOX_VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
+          "$HONK_XRAY_BIN" version | tee -a "$GITHUB_STEP_SUMMARY"
+          "$HONK_SING_BOX_BIN" version | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Enable loopback IPv6 and low ports on the ephemeral runner
+        run: |
+          set -euo pipefail
+          test "${{ runner.environment }}" = github-hosted
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0 net.ipv4.ip_unprivileged_port_start=0
+          ip -6 address show dev lo scope host | grep -F '::1/128'
+      - name: Run exactly two public ignored loopback cases
+        run: |
+          set -euo pipefail
+          test -x "$HONK_XRAY_BIN"
+          test -x "$HONK_SING_BOX_BIN"
+          udp_test=official_xray_and_sing_box_vless_udp_loopback_interop
+          reality_test=reality::official_xray_reality_authenticates_first_connection_and_rejects_wrong_key
+          filter="test(=$udp_test) or test(=$reality_test)"
+          cargo nextest list -p honk-outbound --features rprx --test vless_udp --profile ci \
+            --run-ignored only -E "$filter" --message-format json > "$RUNNER_TEMP/public-vless-tests.json"
+          jq -e --arg udp "$udp_test" --arg reality "$reality_test" '
+            [."rust-suites"[].testcases | to_entries[]
+              | select(.value["filter-match"].status == "matches" and .value.ignored) | .key]
+            | sort == ([$udp, $reality] | sort)
+          ' "$RUNNER_TEMP/public-vless-tests.json"
+          cargo nextest run -p honk-outbound --features rprx --test vless_udp --profile ci \
+            --run-ignored only -E "$filter" --no-tests fail
+      - name: Upload public loopback JUnit
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: public-vless-loopback-junit
+          path: target/nextest/ci/junit.xml
+
   pins:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -118,6 +198,8 @@ jobs:
           fetch "https://github.com/v2fly/geoip/releases/download/$GEOIP_TAG/geoip.dat" "$GEOIP_SHA256" geoip.dat
           fetch "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst" "$BPF_LINKER_SHA256" bpf-linker.tar.zst
           fetch "$VIRTME_NG_WHEEL_URL" "$VIRTME_NG_SHA256" virtme-ng.whl
+          fetch "https://github.com/XTLS/Xray-core/releases/download/v$XRAY_VERSION/Xray-linux-64.zip" "$XRAY_SHA256" Xray-linux-64.zip
+          fetch "https://github.com/SagerNet/sing-box/releases/download/v$SING_BOX_VERSION/sing-box-$SING_BOX_VERSION-linux-amd64-musl.tar.gz" "$SING_BOX_SHA256" sing-box.tar.gz
           fetch "$KERNEL_FLOOR_BASE/$KERNEL_FLOOR_IMAGE" "$KERNEL_FLOOR_IMAGE_SHA256" "$KERNEL_FLOOR_IMAGE"
           fetch "$KERNEL_FLOOR_BASE/$KERNEL_FLOOR_MODULES" "$KERNEL_FLOOR_MODULES_SHA256" "$KERNEL_FLOOR_MODULES"
           fetch "$KERNEL_RECENT_BASE/$KERNEL_RECENT_IMAGE" "$KERNEL_RECENT_IMAGE_SHA256" "$KERNEL_RECENT_IMAGE"
