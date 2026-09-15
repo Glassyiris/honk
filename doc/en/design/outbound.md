@@ -489,6 +489,8 @@ warming while direct TCP remains bare-poolable. The existing outbound
 maintenance pass reaps unretained idle VLESS sessions; there is no VLESS-only
 timer. Active, provisional, draining, and idle carriers all hold the process
 carrier permit until their actual I/O task tears down.
+Synchronizing unchanged retention does not drain either pool. Only an actual
+unpin drains that pool's excess carriers; existing children continue to finish.
 
 The descriptor partition is fixed at process startup and shared across reloads
 and DNS forks, even when the initial configuration has no VLESS nodes. It reserves

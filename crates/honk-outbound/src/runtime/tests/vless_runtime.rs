@@ -36,40 +36,85 @@ fn vless_registry_builds_only_selected_path_pools() {
         assert_eq!(runtime.separate_cool_pool().is_ok(), expected.2);
     }
 }
+async fn reserve_existing_cool_child(
+    pool: &Arc<crate::proxy::vless_cool::VlessCoolPool>,
+    expected: &Arc<crate::proxy::vless_cool::VlessCoolSession>,
+) -> crate::session::SessionPermit<crate::proxy::vless_cool::VlessCoolSession> {
+    let crate::session::SpeculativeCheckout::Shared { session, permit } =
+        pool.checkout_speculative().await.unwrap()
+    else {
+        panic!("spare child capacity must not require a replacement carrier");
+    };
+    assert!(Arc::ptr_eq(&session, expected));
+    permit
+}
+
 #[tokio::test]
-async fn separate_cool_pools_follow_their_own_warm_requirement() {
-    use honk_config::node::{Udp443Policy, VlessMultiplex, VlessUdpMux, VlessUdpPath};
+async fn separate_cool_warm_transitions_preserve_opposite_child_admission() {
+    use crate::session::ManagedSession as _;
+    use honk_config::node::{Udp443Policy, VlessMultiplex, VlessUdpMux};
     use std::num::NonZeroU16;
 
-    let limit = NonZeroU16::new(8).unwrap();
-    let node = vless_node(
-        "vless-independent-warm",
-        VlessMultiplex::Xray {
-            tcp: Some(limit),
-            udp: VlessUdpMux::Separate(limit),
-            udp443: Udp443Policy::Reject,
-        },
-    );
-    let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
-    let runtime = registry.get(&node.id).unwrap();
-    let ProtocolRuntime::Vless(vless) = &runtime.runtime else {
-        panic!("VLESS runtime expected");
-    };
-    let shared = vless.shared_cool_pool().unwrap();
-    let separate = vless.separate_cool_pool().unwrap();
-    assert!(!Arc::ptr_eq(&shared, &separate));
+    enum Finish {
+        Release,
+        Rollback,
+        Cancel,
+    }
 
-    runtime.retain_warm(WarmRetention::Selector).await.commit();
-    assert!(vless.pool_is_warm_retained(VlessUdpPath::CoolShared));
-    assert!(!vless.pool_is_warm_retained(VlessUdpPath::CoolSeparate));
-    runtime.retain_warm(WarmRetention::Udp).await.commit();
-    assert!(vless.pool_is_warm_retained(VlessUdpPath::CoolShared));
-    assert!(vless.pool_is_warm_retained(VlessUdpPath::CoolSeparate));
-    runtime.release_warm(WarmRetention::Selector).await;
-    assert!(!vless.pool_is_warm_retained(VlessUdpPath::CoolShared));
-    assert!(vless.pool_is_warm_retained(VlessUdpPath::CoolSeparate));
-    runtime.release_warm(WarmRetention::Udp).await;
-    assert!(!vless.pool_is_warm_retained(VlessUdpPath::CoolSeparate));
+    let limit = NonZeroU16::new(8).unwrap();
+    for reason in [WarmRetention::Selector, WarmRetention::Udp] {
+        let node = vless_node(
+            "vless-independent-warm",
+            VlessMultiplex::Xray {
+                tcp: Some(limit),
+                udp: VlessUdpMux::Separate(limit),
+                udp443: Udp443Policy::Reject,
+            },
+        );
+        let registry = OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+        let runtime = registry.get(&node.id).unwrap();
+        let ProtocolRuntime::Vless(vless) = &runtime.runtime else {
+            panic!("VLESS runtime expected");
+        };
+        let shared = vless.shared_cool_pool().unwrap();
+        let separate = vless.separate_cool_pool().unwrap();
+        let (owned_pool, opposite_pool) = match reason {
+            WarmRetention::Selector => (shared, separate),
+            WarmRetention::Udp => (separate, shared),
+        };
+        let (opposite_io, _opposite_peer) = tokio::io::duplex(1024);
+        let opposite = crate::proxy::vless_cool::connect(Box::new(opposite_io), 8);
+        opposite_pool.insert(&opposite);
+        let opposite_child = opposite.try_reserve().unwrap();
+
+        for finish in [Finish::Release, Finish::Rollback, Finish::Cancel] {
+            let (owned_io, _owned_peer) = tokio::io::duplex(1024);
+            let owned = crate::proxy::vless_cool::connect(Box::new(owned_io), 8);
+            owned_pool.insert(&owned);
+            let owned_child = owned.try_reserve().unwrap();
+
+            let attempt = runtime.retain_warm(reason).await;
+            drop(reserve_existing_cool_child(&opposite_pool, &opposite).await);
+            drop(reserve_existing_cool_child(&owned_pool, &owned).await);
+            match finish {
+                Finish::Release => {
+                    attempt.commit();
+                    runtime.release_warm(reason).await;
+                }
+                Finish::Rollback => attempt.rollback().await,
+                Finish::Cancel => drop(attempt),
+            }
+
+            assert!(owned.try_reserve().is_none(), "unpin must stop admission");
+            assert!(!owned.is_closed(), "unpin must not cut an existing child");
+            drop(reserve_existing_cool_child(&opposite_pool, &opposite).await);
+            drop(owned_child);
+            assert!(owned.is_closed(), "last child completes the unpinned drain");
+        }
+
+        drop(opposite_child);
+        registry.shutdown().await;
+    }
 }
 #[test]
 fn vless_probe_readiness_uses_the_requested_path() {

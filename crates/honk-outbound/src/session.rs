@@ -498,6 +498,9 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             if self.state() != PoolState::Running {
                 return;
             }
+            if pool.warm_retained == retained {
+                return;
+            }
             pool.warm_retained = retained;
             if retained {
                 Vec::new()

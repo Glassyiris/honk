@@ -430,6 +430,8 @@ Selector 与 UDP warm retention 独立解析：TCP 所选 pool 响应
 outbound maintenance pass 回收未被 retention 持有的 idle VLESS session；没有
 VLESS 专用 timer。active、provisional、draining 与 idle carrier 都会持有进程
 carrier permit，直至实际 I/O task teardown。
+同步未变化的 retention 不会 drain 任一 pool；只有实际解除保留才会 drain
+该 pool 的多余 carrier，已有子流仍可继续完成。
 
 文件描述符分区在进程启动时固定，并在 reload 与 DNS fork 间共享；即使初始
 配置没有 VLESS 节点也会预留。UDP endpoint 定额划分前先保留
