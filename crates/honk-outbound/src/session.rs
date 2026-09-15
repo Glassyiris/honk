@@ -1009,11 +1009,12 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 _ = interval.tick() => {}
             }
             let now = Instant::now();
-            let idle_to_close = {
+            let (idle_to_close, capacity_changed) = {
                 let mut pool = self.pool.lock();
                 if self.state() != PoolState::Running {
                     return;
                 }
+                let previous_live = pool.sessions.len();
                 pool.sessions.retain(|s| !s.is_closed());
                 let live = &pool.sessions;
                 let mut to_close = Vec::new();
@@ -1026,6 +1027,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     .iter()
                     .filter(|session| session.state() == SessionState::Active)
                     .count();
+                let initial_active = remaining_active;
                 for s in live {
                     let ptr = Arc::as_ptr(s) as usize;
                     let was_active = s.state() == SessionState::Active;
@@ -1057,10 +1059,16 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         remaining_active -= 1;
                     }
                 }
-                to_close
+                (
+                    to_close,
+                    previous_live != live.len() || remaining_active != initial_active,
+                )
             };
             for s in &idle_to_close {
                 self.invalidate(s);
+            }
+            if capacity_changed && idle_to_close.is_empty() {
+                self.capacity_notify.notify_waiters();
             }
             // Prewarm to the explicit or runtime-pinned floor while the pool
             // remains live.

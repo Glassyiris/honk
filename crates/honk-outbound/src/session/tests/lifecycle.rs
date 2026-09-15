@@ -598,3 +598,41 @@ async fn shutdown_after_retirement_force_closes_live_sessions() {
     assert!(session.is_closed());
     assert_eq!(pool.metrics().sessions, 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn max_age_drain_wakes_waiters_with_live_children() {
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+        max_sessions: 1,
+        max_streams_per_session: 1,
+        max_session_age: Some(Duration::from_secs(60)),
+        janitor_interval: Duration::from_secs(5),
+        ..Default::default()
+    }));
+    let old = ReservedTestSession::new(1);
+    pool.insert(&old);
+    let held = pool
+        .open_with(
+            || async { unreachable!("seeded carrier must be reused") },
+            |_session, permit| async { Ok::<_, OpenError>(permit) },
+        )
+        .await
+        .unwrap();
+    pool.ensure_janitor(0, Duration::from_secs(3600), || async {
+        unreachable!("zero standby floor must not prewarm")
+    });
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let mut waiting = std::pin::pin!(pool.offer(|| async { Ok(ReservedTestSession::new(1)) }));
+    assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+    tokio::time::sleep(Duration::from_secs(80)).await;
+    let replacement = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("age drain stranded a waiter behind a live old child")
+        .unwrap();
+    assert!(!Arc::ptr_eq(&replacement, &old));
+    assert_eq!(old.state(), SessionState::Draining);
+    assert_eq!(old.active_streams(), 1);
+    assert!(!old.is_closed());
+    assert_eq!(replacement.state(), SessionState::Active);
+    drop(held);
+    pool.shutdown();
+}

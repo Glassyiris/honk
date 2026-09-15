@@ -228,6 +228,8 @@ normal dial reserves a reusable slot; an overlapping detached commit goes
 drain-only when that reservation fills the cap, preserving its existing child.
 Releasing warm retention also wakes capacity waiters as excess live carriers
 enter Draining, without waiting for their existing children to finish.
+Maintenance likewise publishes capacity released by max-age drains or closed
+session pruning, even when no idle carrier is closed and no prewarm runs.
 
 VLESS physical carriers additionally hold one permit from the immutable
 process-wide VLESS-carrier gate. The startup resource budget computes

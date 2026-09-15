@@ -200,6 +200,8 @@ Pool-owned task 在 poll 拨号前重新检查终态。进行中的普通拨号�
 slot；并发的 detached commit 在该预留占满上限时进入 drain-only，保留已有 child。
 解除 warm retention 时，多余的 live carrier 进入 Draining 后也会唤醒容量
 waiter，无需等待这些 carrier 上已有的 child 结束。
+maintenance 因 max-age 退役或清理已关闭 session 释放容量时，也会发布通知，
+即使没有关闭 idle carrier 或执行 prewarm。
 
 VLESS 物理 carrier 还持有不可变进程级 VLESS-carrier gate 的一个 permit。
 启动资源预算在计算 UDP endpoint 前先分出 `min(after_dials / 8, 8192)`；零值
