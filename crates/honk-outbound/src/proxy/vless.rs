@@ -61,7 +61,7 @@ use super::{
     AsyncReadWrite, MuxSession, PacketOutbound, PacketTransport, PreparedUdpTransport,
     ProbeableOutbound, ProxyStream, TcpOutbound, WarmRequirement, WarmableOutbound,
 };
-use crate::session::{ManagedSession, OpenError, SpeculativeCheckout};
+use crate::session::{OpenError, SpeculativeCheckout};
 
 const VLESS_VERSION: u8 = 0x00;
 const CMD_TCP: u8 = 0x01;
@@ -414,95 +414,26 @@ impl VLessHandler {
         Ok(transport)
     }
 
-    async fn prepare_mux_udp<S, Dial, DialFuture>(
+    async fn prepare_mux_udp<S, T, Dial, DialFuture, Open, OpenFuture>(
         pool: Arc<crate::session::SessionPool<S>>,
         dial: Dial,
-        target: SocketAddr,
-        target_domain: Option<&str>,
+        open: Open,
         retired_error: &'static str,
-    ) -> anyhow::Result<PreparedUdpTransport>
+    ) -> anyhow::Result<PreparedUdpTransport<T>>
     where
         S: super::MuxSession,
+        T: PacketTransport + ?Sized + 'static,
         Dial: FnOnce() -> DialFuture + Send,
         DialFuture: Future<Output = anyhow::Result<Arc<S>>> + Send,
+        Open: Fn(Arc<S>, crate::session::SessionPermit<S>) -> OpenFuture + Send,
+        OpenFuture: Future<Output = Result<Arc<T>, OpenError>> + Send,
     {
         let mut dial = Some(dial);
         let mut last_error = None;
         for _ in 0..2 {
             match pool.checkout_speculative().await? {
                 SpeculativeCheckout::Shared { session, permit } => {
-                    match session
-                        .clone()
-                        .open_packet(permit, target, target_domain)
-                        .await
-                    {
-                        Ok(transport) => {
-                            let transport: Arc<dyn PacketTransport> = transport;
-                            return Ok(PreparedUdpTransport::ready(transport));
-                        }
-                        Err(OpenError::Refused(error)) => return Err(error),
-                        Err(OpenError::Draining(error)) => {
-                            crate::session::ManagedSession::begin_drain(session.as_ref());
-                            last_error = Some(error);
-                        }
-                        Err(OpenError::Session(error)) => {
-                            pool.invalidate(&session);
-                            last_error = Some(error);
-                        }
-                    }
-                }
-                SpeculativeCheckout::Detached(mut reservation) => {
-                    let dial = dial.take().expect("speculative dial runs at most once");
-                    let session = tokio::select! {
-                        result = dial() => result?,
-                        _ = reservation.cancelled() => anyhow::bail!(retired_error),
-                    };
-                    reservation.attach(&session)?;
-                    let permit = session
-                        .try_reserve()
-                        .ok_or_else(|| anyhow::anyhow!("new VLESS mux session has no capacity"))?;
-                    let transport = session
-                        .open_packet(permit, target, target_domain)
-                        .await
-                        .map_err(Self::open_error)?;
-                    let transport: Arc<dyn PacketTransport> = transport;
-                    return Ok(PreparedUdpTransport::new(async move {
-                        reservation.commit()?;
-                        Ok(transport)
-                    }));
-                }
-            }
-        }
-        Err(last_error.expect("shared mux open attempts record an error"))
-    }
-
-    async fn prepare_cool_xudp<Dial, DialFuture>(
-        pool: Arc<crate::proxy::vless_cool::VlessCoolPool>,
-        dial: Dial,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        global_id: [u8; 8],
-        retired_error: &'static str,
-    ) -> anyhow::Result<PreparedUdpTransport<VlessXudpTransport>>
-    where
-        Dial: FnOnce() -> DialFuture + Send,
-        DialFuture:
-            Future<Output = anyhow::Result<Arc<super::vless_cool::VlessCoolSession>>> + Send,
-    {
-        let mut dial = Some(dial);
-        let mut last_error = None;
-        for _ in 0..2 {
-            match pool.checkout_speculative().await? {
-                SpeculativeCheckout::Shared { session, permit } => {
-                    match super::vless_cool::open_xudp(
-                        Arc::clone(&session),
-                        permit,
-                        target,
-                        target_domain,
-                        global_id,
-                    )
-                    .await
-                    {
+                    match open(Arc::clone(&session), permit).await {
                         Ok(transport) => return Ok(PreparedUdpTransport::ready(transport)),
                         Err(OpenError::Refused(error)) => return Err(error),
                         Err(OpenError::Draining(error)) => {
@@ -524,16 +455,8 @@ impl VLessHandler {
                     reservation.attach(&session)?;
                     let permit = session
                         .try_reserve()
-                        .ok_or_else(|| anyhow::anyhow!("new VLESS Cool session has no capacity"))?;
-                    let transport = super::vless_cool::open_xudp(
-                        session,
-                        permit,
-                        target,
-                        target_domain,
-                        global_id,
-                    )
-                    .await
-                    .map_err(Self::open_error)?;
+                        .ok_or_else(|| anyhow::anyhow!("new VLESS mux session has no capacity"))?;
+                    let transport = open(session, permit).await.map_err(Self::open_error)?;
                     return Ok(PreparedUdpTransport::new(async move {
                         reservation.commit()?;
                         Ok(transport)
@@ -541,7 +464,7 @@ impl VLessHandler {
                 }
             }
         }
-        Err(last_error.expect("shared Cool open attempts record an error"))
+        Err(last_error.expect("shared mux open attempts record an error"))
     }
 
     /// Prepare a concrete source-scoped XUDP child without sending NEW; commit
@@ -572,12 +495,12 @@ impl VLessHandler {
                 };
                 let active_limit = Self::cool_limit(&runtime.node, separate)?;
                 let dial_runtime = Arc::clone(&runtime);
-                Self::prepare_cool_xudp(
+                Self::prepare_mux_udp(
                     pool,
                     move || Self::dial_cool_session(dial_runtime, active_limit, timeout),
-                    target,
-                    domain,
-                    global_id,
+                    move |session, permit| {
+                        super::vless_cool::open_xudp(session, permit, target, domain, global_id)
+                    },
                     if separate {
                         "VLESS separate Cool pool retired during source preparation"
                     } else {
@@ -766,8 +689,11 @@ impl PacketOutbound for VLessHandler {
                 Self::prepare_mux_udp(
                     pool,
                     move || Self::dial_h2_session(dial_runtime, connect_timeout),
-                    target,
-                    target_domain,
+                    move |session, permit| async move {
+                        let transport: Arc<dyn PacketTransport> =
+                            session.open_packet(permit, target, target_domain).await?;
+                        Ok(transport)
+                    },
                     "VLESS H2 pool retired during speculative dial",
                 )
                 .await
@@ -784,8 +710,11 @@ impl PacketOutbound for VLessHandler {
                 Self::prepare_mux_udp(
                     pool,
                     move || Self::dial_cool_session(dial_runtime, active_limit, connect_timeout),
-                    target,
-                    target_domain,
+                    move |session, permit| async move {
+                        let transport: Arc<dyn PacketTransport> =
+                            session.open_packet(permit, target, target_domain).await?;
+                        Ok(transport)
+                    },
                     if separate {
                         "VLESS separate Cool pool retired during speculative dial"
                     } else {
