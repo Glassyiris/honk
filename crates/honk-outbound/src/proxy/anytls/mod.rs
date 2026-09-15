@@ -2379,21 +2379,21 @@ impl AnyTlsHandler {
             let commit_node = node.clone();
             let commit_pool = Arc::clone(&pool);
             let commit_runtime = runtime.clone();
-            return Ok(PreparedUdpTransport::new(transport, move || async move {
+            return Ok(PreparedUdpTransport::new(move || async move {
                 reservation.commit()?;
                 if commit_runtime.is_some() {
                     Self::ensure_janitor(&commit_node, &commit_pool, commit_runtime);
                 }
-                Ok(())
+                Ok(transport)
             }));
         }
 
         let commit_node = node.clone();
-        Ok(PreparedUdpTransport::new(transport, move || async move {
+        Ok(PreparedUdpTransport::new(move || async move {
             if runtime.is_some() {
                 Self::ensure_janitor(&commit_node, &pool, runtime);
             }
-            Ok(())
+            Ok(transport)
         }))
     }
 

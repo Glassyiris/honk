@@ -117,7 +117,7 @@ async fn warm_resources_flip_with_pool_session() {
     let generation =
         crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
     let runtime = generation.get(&node.id).unwrap();
-    assert!(!runtime.is_warm_or_stateless());
+    assert!(!runtime.is_warm_or_stateless_for(crate::proxy::WarmRequirement::Session));
 
     let crate::runtime::ProtocolRuntime::AnyTls(anytls) = &runtime.runtime else {
         panic!("expected AnyTLS runtime")
@@ -125,12 +125,12 @@ async fn warm_resources_flip_with_pool_session() {
     let (session, mut server) = establish_test_session("warm-resources").await;
     expect_handshake(&mut server).await;
     anytls.pool.insert(&session);
-    assert!(runtime.is_warm_or_stateless());
+    assert!(runtime.is_warm_or_stateless_for(crate::proxy::WarmRequirement::Session));
     assert_eq!(runtime.warm_counts().sessions, 1);
 
     session.close();
     assert!(
-        !runtime.is_warm_or_stateless(),
+        !runtime.is_warm_or_stateless_for(crate::proxy::WarmRequirement::Session),
         "a closed session no longer counts as warm"
     );
     assert_eq!(runtime.warm_counts().sessions, 0);

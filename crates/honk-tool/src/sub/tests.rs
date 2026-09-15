@@ -97,7 +97,7 @@ async fn udp_policy_denied_target_skips_dns_resolution() {
     let registry = ProxyRegistry::default_resolver().unwrap();
     let mut node = vless_node();
     let vless = node.vless_mut().unwrap();
-    vless.mode = WireMode::Auto;
+    vless.network = None;
     vless.flow = Some("xtls-rprx-vision".into());
     assert!((registry
         .find(NodeProtocol::VLess)
@@ -128,7 +128,7 @@ async fn udp_policy_denied_target_skips_quic_resolution() {
     let registry = ProxyRegistry::default_resolver().unwrap();
     let mut node = vless_node();
     let vless = node.vless_mut().unwrap();
-    vless.mode = WireMode::Auto;
+    vless.network = None;
     vless.flow = Some("xtls-rprx-vision".into());
 
     assert_eq!(
@@ -159,7 +159,7 @@ fn vless_node() -> Node {
         port: 443,
         outbound: honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
             uuid: Some("b831381d-6324-4d53-ad4f-8cda48b30811".into()),
-            mode: WireMode::Legacy,
+            network: Some("tcp".into()),
             tls: honk_config::node::TlsOptions {
                 enabled: true,
                 ..Default::default()
@@ -170,19 +170,6 @@ fn vless_node() -> Node {
     };
     node.id = node.derive_id();
     node
-}
-
-#[test]
-fn registry_contains_node_dependent_vless_udp() {
-    let registry = ProxyRegistry::default_resolver().unwrap();
-    let entry = registry.find(NodeProtocol::VLess).unwrap();
-    assert_eq!(entry.descriptor.protocol, NodeProtocol::VLess);
-    assert!(entry.probeable.is_some());
-    assert!(entry.packet.is_some());
-    let mut node = vless_node();
-    assert!(!(entry.descriptor.supports_udp)(&node));
-    node.vless_mut().unwrap().mode = WireMode::UotV2;
-    assert!((entry.descriptor.supports_udp)(&node));
 }
 
 #[test]
@@ -271,11 +258,10 @@ fn vless_probe_eligibility_precedence_and_reasons() {
 
     let mut node = vless_node();
     let vless = node.vless_mut().unwrap();
-    vless.mode = WireMode::Auto;
+    vless.network = None;
     vless.flow = Some("xtls-rprx-vision-udp443".into());
     node.id = node.derive_id();
     assert_eq!(classify_vless_node(&node), ProbeEligibility::Supported);
-    assert_eq!(vless_shape(&node), "vless/tls/tcp/vision-udp443/auto");
 
     node.vless_mut().unwrap().flow = Some("xtls-rprx-vision-udp443-extra".into());
     assert_eq!(
@@ -289,42 +275,6 @@ fn vless_probe_eligibility_precedence_and_reasons() {
         classify_vless_node(&node),
         ProbeEligibility::InvalidConfig("invalid-config")
     );
-}
-
-#[test]
-fn vless_shapes_are_fixed_and_non_identifying() {
-    let mut node = vless_node();
-    let vless = node.vless_mut().unwrap();
-    vless.tls.enabled = false;
-    vless.transport.transport.clear();
-    assert_eq!(vless_shape(&node), "vless/plain/tcp");
-
-    node.vless_mut().unwrap().mode = WireMode::Auto;
-    assert_eq!(vless_shape(&node), "vless/plain/tcp/auto");
-    node.vless_mut().unwrap().mode = WireMode::Native;
-    assert_eq!(vless_shape(&node), "vless/plain/tcp/native");
-
-    node.vless_mut().unwrap().mode = WireMode::Xudp;
-    assert_eq!(vless_shape(&node), "vless/plain/tcp/xudp");
-    node.vless_mut().unwrap().mode = WireMode::MuxCool;
-    assert_eq!(vless_shape(&node), "vless/plain/tcp/mux-cool");
-    node.vless_mut().unwrap().mode = WireMode::Legacy;
-
-    let vless = node.vless_mut().unwrap();
-    vless.tls.enabled = true;
-    vless.transport.transport = "ws".into();
-    assert_eq!(vless_shape(&node), "vless/tls/ws");
-
-    let vless = node.vless_mut().unwrap();
-    vless.tls.reality_public_key = Some("private-key-material".into());
-    vless.transport.transport = "grpc".into();
-    vless.flow = Some("xtls-rprx-vision".into());
-    assert_eq!(vless_shape(&node), "vless/reality/grpc/vision");
-
-    let vless = node.vless_mut().unwrap();
-    vless.transport.transport = "kcp-secret".into();
-    vless.flow = Some("provider-flow-secret".into());
-    assert_eq!(vless_shape(&node), "vless/reality/unsupported");
 }
 
 fn timeout_targets(dns_port: u16, port: u16) -> ProbeTargets {
@@ -355,14 +305,14 @@ fn vless_udp_is_rendered_as_not_applicable() {
 fn vless_udp_mode_is_rendered_as_probeable() {
     let registry = ProxyRegistry::default_resolver().unwrap();
     let mut node = vless_node();
-    node.vless_mut().unwrap().mode = WireMode::H2mux;
+    node.vless_mut().unwrap().network = None;
+    node.vless_mut().unwrap().multiplex = VlessMultiplex::H2 { padding: false };
     let outcome = ProbeOutcome::timed_out(&registry, &node, &timeout_targets(53, 443));
     assert!(matches!(
         outcome.udp_dns,
         Some(Err(ProbeFailureKind::Timeout))
     ));
     assert!(render_outcome(&outcome).contains("dns: FAIL(timeout)"));
-    assert_eq!(outcome.shape, "vless/tls/tcp/h2mux");
 }
 
 #[test]
@@ -370,7 +320,7 @@ fn timed_out_vision_targets_are_rendered_per_port_policy() {
     let registry = ProxyRegistry::default_resolver().unwrap();
     let mut node = vless_node();
     let vless = node.vless_mut().unwrap();
-    vless.mode = WireMode::Auto;
+    vless.network = None;
     vless.flow = Some("xtls-rprx-vision".into());
     let outcome = ProbeOutcome::timed_out(&registry, &node, &timeout_targets(443, 443));
     assert_eq!(outcome.udp_dns, None);

@@ -3,10 +3,15 @@ use super::*;
 async fn successful_offer_releases_reusable_admission_permit() {
     let pool_a = Arc::new(pool(SessionPoolConfig::default()));
     let pool_b = Arc::new(pool(SessionPoolConfig::default()));
-    let generation =
-        crate::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, None)
-            .unwrap()
-            .0;
+    let generation = crate::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+        &[],
+        1,
+        1,
+        1,
+        None,
+    )
+    .unwrap()
+    .0;
     let admission = generation
         .scope_dials(async { crate::runtime::capture_dial_admission() })
         .await;

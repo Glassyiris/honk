@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use clap::{Args, ValueEnum};
 use honk_config::Config;
-use honk_config::node::{Node, WireMode};
+use honk_config::node::{Node, VlessMultiplex, VlessTcpPath, VlessUdpMux};
 use honk_config::subscription::Subscription;
 use honk_config::types::{NodeProtocol, SubscriptionType};
 use honk_core::dns::DnsResolver;
@@ -343,10 +343,13 @@ fn classify_vless_node(node: &Node) -> ProbeEligibility {
     if flow.is_some() && !vision {
         return ProbeEligibility::ExpectedUnsupported("unsupported-flow");
     }
-    if vision && !vless.tls.enabled && !reality {
+    if vision && !vless.is_encrypted() && !vless.tls.enabled && !reality {
         return ProbeEligibility::InvalidConfig("vision-without-tls");
     }
-    if vision && matches!(vless.transport.transport.as_str(), "ws" | "grpc") {
+    if vision
+        && !vless.is_encrypted()
+        && matches!(vless.transport.transport.as_str(), "ws" | "grpc")
+    {
         return ProbeEligibility::ExpectedUnsupported("vision-non-tcp");
     }
 
@@ -387,17 +390,35 @@ fn vless_shape(node: &Node) -> String {
     } else {
         "/vision-udp443"
     };
-    let wire = match vless.mode {
-        WireMode::Legacy => "",
-        WireMode::Auto => "/auto",
-        WireMode::Native => "/native",
-        WireMode::UotV2 => "/uot-v2",
-        WireMode::H2mux => "/h2mux",
-        WireMode::H2muxPadded => "/h2mux-padded",
-        WireMode::Xudp => "/xudp",
-        WireMode::MuxCool => "/mux-cool",
+    let tcp = match vless.tcp_path() {
+        VlessTcpPath::Direct => "plain",
+        VlessTcpPath::H2 => "h2mux",
+        VlessTcpPath::Cool => "mux-cool",
     };
-    format!("vless/{carrier}/{transport}{vision}{wire}")
+    let (udp_label, udp) = if vless.udp_enabled() {
+        ("udp-fallback", vless.udp_encoding.as_str())
+    } else {
+        ("udp", "disabled")
+    };
+    let mux = match &vless.multiplex {
+        VlessMultiplex::Off => String::new(),
+        VlessMultiplex::H2 { padding } => format!("/padding={padding}"),
+        VlessMultiplex::Xray { tcp, udp, udp443 } => {
+            let tcp = tcp.map_or(0, |limit| limit.get());
+            let udp = match udp {
+                VlessUdpMux::Protocol => "protocol".to_string(),
+                VlessUdpMux::SharedTcp => "shared".to_string(),
+                VlessUdpMux::Separate(limit) => limit.to_string(),
+            };
+            let policy = match udp443 {
+                honk_config::node::Udp443Policy::Reject => "reject",
+                honk_config::node::Udp443Policy::Skip => "skip",
+                honk_config::node::Udp443Policy::Allow => "allow",
+            };
+            format!("/mux={tcp}:{udp}:{policy}")
+        }
+    };
+    format!("vless/{carrier}/{transport}{vision}/tcp={tcp}/{udp_label}={udp}{mux}")
 }
 
 /// Everything a probe run needs to reach the test target.

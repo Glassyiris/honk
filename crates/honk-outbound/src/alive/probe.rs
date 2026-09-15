@@ -152,6 +152,10 @@ impl AliveDialerSet {
                         family_ok = true;
                         break;
                     }
+                    HttpProbeResult::LocalRefusal(error) => {
+                        tracing::debug!(%error, "HTTP health probe locally refused");
+                        return any_ok;
+                    }
                     HttpProbeResult::SetupFailure(error) => {
                         tracing::debug!(
                             "HTTP health check establishment failed for node '{}' via {}: {}",
@@ -248,6 +252,10 @@ impl AliveDialerSet {
                     self.record_url_probe_success(tag, url, elapsed);
                     any_ok = true;
                     break;
+                }
+                HttpProbeResult::LocalRefusal(error) => {
+                    tracing::debug!(%error, "Custom HTTP health probe locally refused");
+                    return false;
                 }
                 HttpProbeResult::SetupFailure(error) => {
                     tracing::debug!(
@@ -457,7 +465,14 @@ impl AliveDialerSet {
         let node_name = self.node_name(node_id);
         const IPVERS: [IpVersion; 2] = [IpVersion::V4, IpVersion::V6];
         let outcome = prober.probe_udp(&node_name, timeout).await;
-        match (outcome.dns, outcome.data_path) {
+        let measured = |result: Option<anyhow::Result<Duration>>| {
+            result.filter(|result| {
+                !result
+                    .as_ref()
+                    .is_err_and(crate::proxy::is_packet_rejection)
+            })
+        };
+        match (measured(outcome.dns), measured(outcome.data_path)) {
             (Some(Ok(elapsed)), _) => {
                 tracing::debug!(
                     "UDP health check succeeded for node '{}' ({}ms)",

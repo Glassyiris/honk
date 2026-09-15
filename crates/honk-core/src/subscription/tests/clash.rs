@@ -543,16 +543,16 @@ fn clash_accepts_explicit_native_vless_udp_and_rejects_nondefault_juicity_window
     assert_eq!(nodes.len(), 4);
     assert_eq!(nodes[0].name, "native-from-xudp-false");
     assert_eq!(
-        nodes[0].vless().unwrap().mode,
-        honk_config::node::WireMode::Native
+        nodes[0].vless().unwrap().udp_encoding,
+        honk_config::node::VlessUdpEncoding::Native
     );
     assert_eq!(
-        nodes[1].vless().unwrap().mode,
-        honk_config::node::WireMode::Native
+        nodes[1].vless().unwrap().udp_encoding,
+        honk_config::node::VlessUdpEncoding::Native
     );
     assert_eq!(
-        nodes[2].vless().unwrap().mode,
-        honk_config::node::WireMode::Xudp
+        nodes[2].vless().unwrap().udp_encoding,
+        honk_config::node::VlessUdpEncoding::Xudp
     );
     assert_eq!(nodes[3].name, "default-window");
     assert_eq!(nodes[3].juicity().unwrap().quic.mtu, Some(1400));

@@ -278,6 +278,7 @@ async fn resolve_urltest_address(
 pub fn try_probe_runtime(
     generation: &crate::runtime::OutboundRuntimeRegistry,
     node: &Node,
+    requirement: crate::proxy::WarmRequirement,
 ) -> Result<
     (
         Arc<crate::runtime::NodeRuntime>,
@@ -290,25 +291,26 @@ pub fn try_probe_runtime(
     crate::runtime::NodeRuntime::validate_for_ephemeral(node)?;
     match generation
         .get(&node.id)
-        .filter(|runtime| runtime.is_warm_or_stateless())
+        .filter(|runtime| runtime.is_warm_or_stateless_for(requirement))
     {
         Some(runtime) => Ok((runtime, None)),
         None => {
-            let guard = crate::runtime::NodeRuntime::ephemeral_guarded_after_admission(node);
+            let guard = generation.ephemeral_guarded_after_admission(node);
             Ok((guard.runtime(), Some(guard)))
         }
     }
 }
 
-/// Compatibility wrapper for [`try_probe_runtime`]; panics on invalid input.
+/// Panicking wrapper for [`try_probe_runtime`].
 pub fn probe_runtime(
     generation: &crate::runtime::OutboundRuntimeRegistry,
     node: &Node,
+    requirement: crate::proxy::WarmRequirement,
 ) -> (
     Arc<crate::runtime::NodeRuntime>,
     Option<crate::runtime::EphemeralRuntimeGuard>,
 ) {
-    try_probe_runtime(generation, node)
+    try_probe_runtime(generation, node, requirement)
         .unwrap_or_else(|_| panic!("invalid node passed to URLTest runtime probe"))
 }
 
@@ -323,7 +325,10 @@ pub async fn warm_http_probe(
     feedback: Option<ScoreFeedback>,
 ) -> anyhow::Result<()> {
     validate_runtime(runtime)?;
-    if runtime.is_warm_or_stateless() {
+    if runtime.is_warm_or_stateless_for(crate::proxy::WarmRequirement::Session)
+        || !crate::descriptor::descriptor(runtime.node.protocol())
+            .supports_warm(&runtime.node, crate::proxy::WarmRequirement::Session)
+    {
         return Ok(());
     }
     let reporter = start_feedback(feedback);
@@ -390,8 +395,10 @@ async fn urltest_node_in_generation_impl(
 ) -> anyhow::Result<Duration> {
     let timeout = urltest_timeout(timeout);
     let request = http_probe_request(url, "")?;
-    let (runtime, guard) = try_probe_runtime(generation, node)?;
-    let warm_feedback = if runtime.is_warm_or_stateless() {
+    let (runtime, guard) =
+        try_probe_runtime(generation, node, crate::proxy::WarmRequirement::Session)?;
+    let warm_feedback = if runtime.is_warm_or_stateless_for(crate::proxy::WarmRequirement::Session)
+    {
         None
     } else {
         group_manager.and_then(|manager| {
@@ -1216,7 +1223,7 @@ mod tests {
             }
             honk_config::node::OutboundConfig::Vless(config) => {
                 config.uuid = Some(credential.clone());
-                config.mode = honk_config::node::WireMode::H2mux;
+                config.multiplex = honk_config::node::VlessMultiplex::H2 { padding: false };
             }
             honk_config::node::OutboundConfig::Tuic(config) => {
                 config.uuid = Some(credential.clone())
@@ -1237,11 +1244,47 @@ mod tests {
             crate::runtime::OutboundRuntimeRegistry::build(&[anytls.clone(), trojan.clone()])
                 .unwrap();
 
-        assert!(probe_runtime(&generation, &anytls).1.is_some());
-        assert!(probe_runtime(&generation, &absent).1.is_some());
-        let (runtime, guard) = probe_runtime(&generation, &trojan);
+        assert!(
+            probe_runtime(&generation, &anytls, crate::proxy::WarmRequirement::Session)
+                .1
+                .is_some()
+        );
+        assert!(
+            probe_runtime(&generation, &absent, crate::proxy::WarmRequirement::Session)
+                .1
+                .is_some()
+        );
+        let (runtime, guard) =
+            probe_runtime(&generation, &trojan, crate::proxy::WarmRequirement::Session);
         assert!(Arc::ptr_eq(&runtime, &generation.get(&trojan.id).unwrap()));
         assert!(guard.is_none());
+    }
+
+    #[test]
+    fn vless_probe_runtime_keeps_cold_udp_pool_ephemeral_without_penalizing_tcp() {
+        use std::num::NonZeroU16;
+
+        let mut node = reusable_node("vless-udp-probe", NodeProtocol::VLess);
+        let honk_config::node::OutboundConfig::Vless(config) = &mut node.outbound else {
+            unreachable!()
+        };
+        config.multiplex = honk_config::node::VlessMultiplex::Xray {
+            tcp: None,
+            udp: honk_config::node::VlessUdpMux::Separate(NonZeroU16::new(8).unwrap()),
+            udp443: honk_config::node::Udp443Policy::Reject,
+        };
+        node.id = node.derive_id();
+        let generation =
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+
+        let (tcp, tcp_guard) =
+            probe_runtime(&generation, &node, crate::proxy::WarmRequirement::Session);
+        assert!(Arc::ptr_eq(&tcp, &generation.get(&node.id).unwrap()));
+        assert!(tcp_guard.is_none());
+        let (udp, udp_guard) =
+            probe_runtime(&generation, &node, crate::proxy::WarmRequirement::Udp);
+        assert!(!Arc::ptr_eq(&udp, &generation.get(&node.id).unwrap()));
+        assert!(udp_guard.is_some());
     }
 
     async fn assert_cold_reusable_transport_warms_before_measurement(node: Node) {
@@ -2220,7 +2263,8 @@ mod fallible_probe_tests {
         let generation =
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
         node.port += 1;
-        let error = try_probe_runtime(&generation, &node).unwrap_err();
+        let error = try_probe_runtime(&generation, &node, crate::proxy::WarmRequirement::Session)
+            .unwrap_err();
         let crate::runtime::RuntimeRegistryError::Admission(error) = error else {
             panic!("expected node admission error");
         };

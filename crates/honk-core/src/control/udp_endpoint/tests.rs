@@ -151,8 +151,9 @@ async fn run_endpoint_driver(
         UdpDriverContext {
             endpoint,
             queue_rx,
-            reply_socket,
+            reply_socket: Arc::new(ReplySocket::untracked(reply_socket)),
             reply_socket_factory: Arc::new(SystemUdpReplySocketFactory),
+            reply_socket_slots: Arc::new(Semaphore::new(MAX_REPLY_SOCKETS_PER_ENDPOINT)),
             client_addr,
             client_dst,
             alive_set,
@@ -422,6 +423,32 @@ impl UdpReplySocketFactory for InjectedReplySocketFactory {
         self.created.lock().push(source);
         UdpSocket::from_std(socket)
     }
+}
+
+#[tokio::test]
+async fn reply_socket_credits_cover_retained_teardown_sockets() {
+    let sockets: Vec<_> = (0..=MAX_REPLY_SOCKETS_PER_ENDPOINT)
+        .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let sources: Vec<_> = sockets
+        .iter()
+        .map(|socket| socket.local_addr().unwrap())
+        .collect();
+    let pool = UdpEndpointPool::with_reply_socket_factory(
+        1,
+        Arc::new(InjectedReplySocketFactory::new(sockets)),
+    );
+    let mut retained: Vec<_> = sources[..MAX_REPLY_SOCKETS_PER_ENDPOINT]
+        .iter()
+        .map(|source| pool.create_reply_socket(*source).unwrap())
+        .collect();
+    let Err(error) = pool.create_reply_socket(sources[MAX_REPLY_SOCKETS_PER_ENDPOINT]) else {
+        panic!("reply socket budget admitted a ninth retained descriptor");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    retained.pop();
+    pool.create_reply_socket(sources[MAX_REPLY_SOCKETS_PER_ENDPOINT])
+        .unwrap();
 }
 
 fn commit_ready(

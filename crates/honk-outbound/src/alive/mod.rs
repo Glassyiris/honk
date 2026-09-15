@@ -105,6 +105,7 @@ pub enum HttpProbeResult {
     WarmSuccess(Duration),
     SetupFailure(String),
     ExchangeFailure(String),
+    LocalRefusal(crate::proxy::PacketRejection),
 }
 
 /// Trait for HTTP-based health check probing through proxy nodes.
@@ -141,10 +142,10 @@ pub type HttpProberRef = Arc<dyn HttpProber>;
 pub struct UdpProbeOutcome {
     /// Round-trip of the minimal DNS query through the node's UDP transport;
     /// `None` when target policy skips the configured DNS endpoint.
-    pub dns: Option<Result<Duration, String>>,
+    pub dns: Option<anyhow::Result<Duration>>,
     /// Independent data-path handshake result; `None` when not run (no HTTPS
     /// check URL, no Score group, or target policy skips it).
-    pub data_path: Option<Result<Duration, String>>,
+    pub data_path: Option<anyhow::Result<Duration>>,
 }
 
 /// Trait for UDP-based health check probing through proxy nodes.

@@ -13,7 +13,7 @@ use crate::types::NodeProtocol;
 use super::{
     AnyTlsConfig, Hysteria2Config, JuicityConfig, Node, OutboundConfig, QuicOptions,
     ShadowsocksConfig, Socks5Config, StreamTransportOptions, TlsOptions, TrojanConfig, TuicConfig,
-    VlessConfig, VmessConfig, WireMode,
+    VlessConfig, VlessMultiplex, VlessUdpEncoding, VmessConfig,
 };
 fn semantic_error(
     source: &SourceRef,
@@ -29,7 +29,61 @@ fn semantic_error(
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RawVlessMode {
+    #[default]
+    Missing,
+    Null,
+    Legacy,
+    Incompatible,
+}
+
+impl<'de> Deserialize<'de> for RawVlessMode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'value> serde::de::Visitor<'value> for Visitor {
+            type Value = RawVlessMode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a legacy VLESS mode string or null")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "legacy" => Ok(RawVlessMode::Legacy),
+                    "auto" | "native" | "uot-v2" | "h2mux" | "h2mux-padded" | "xudp"
+                    | "mux-cool" => Ok(RawVlessMode::Incompatible),
+                    _ => Err(E::unknown_variant(
+                        value,
+                        &[
+                            "legacy",
+                            "auto",
+                            "native",
+                            "uot-v2",
+                            "h2mux",
+                            "h2mux-padded",
+                            "xudp",
+                            "mux-cool",
+                        ],
+                    )),
+                }
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(RawVlessMode::Null)
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(RawVlessMode::Null)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 struct FlatNode {
     #[serde(default)]
     id: uuid::Uuid,
@@ -46,7 +100,11 @@ struct FlatNode {
     #[serde(default)]
     encryption: Option<String>,
     #[serde(default)]
-    vless_mode: Option<WireMode>,
+    vless_mode: RawVlessMode,
+    #[serde(default)]
+    packet_encoding: Option<VlessUdpEncoding>,
+    #[serde(default)]
+    multiplex: Option<VlessMultiplex>,
     #[serde(default)]
     plugin: Option<String>,
     #[serde(default)]
@@ -286,8 +344,7 @@ impl FlatNode {
             encryption
         );
         strip!(
-            self.vless_mode.is_some_and(|mode| mode != WireMode::Legacy)
-                && self.protocol != NodeProtocol::VLess,
+            self.vless_mode == RawVlessMode::Incompatible && self.protocol != NodeProtocol::VLess,
             vless_mode
         );
         strip!(
@@ -449,6 +506,19 @@ impl FlatNode {
     ) -> Result<Node, crate::error::DetailedConfigError> {
         self.resolve_credential_aliases()
             .map_err(|error| error.into_detailed(source.clone(), setting.clone()))?;
+        if self.protocol == NodeProtocol::VLess && self.vless_mode != RawVlessMode::Missing {
+            return Err(crate::error::DetailedConfigError::new(
+                crate::error::ErrorCategory::Validation,
+                "removed-vless-mode",
+                source.clone(),
+                setting.clone().field("vless_mode"),
+                "VLESS vless_mode was removed; use packet_encoding and multiplex",
+            ));
+        }
+        if self.protocol != NodeProtocol::VLess {
+            self.packet_encoding = None;
+            self.multiplex = None;
+        }
         self.strip_protocol_incompatible_fields(diagnostics, source, setting);
         if self.protocol == NodeProtocol::VMess {
             self.encryption = crate::options::vocab::vmess_cipher(self.encryption.as_deref())
@@ -520,15 +590,18 @@ impl FlatNode {
             NodeProtocol::VLess => {
                 let transport = flat.take_transport();
                 let tls = flat.take_tls();
-                OutboundConfig::Vless(VlessConfig {
+                let mut config = VlessConfig {
                     uuid: flat.password.take(),
                     encryption: flat.encryption.take(),
-                    mode: flat.vless_mode.unwrap_or(WireMode::Auto),
+                    udp_encoding: flat.packet_encoding.take().unwrap_or_default(),
+                    multiplex: flat.multiplex.take().unwrap_or_default(),
                     flow: flat.flow.take(),
                     network: flat.network.take(),
                     transport,
                     tls,
-                })
+                };
+                config.normalize();
+                OutboundConfig::Vless(config)
             }
             NodeProtocol::Socks5 => OutboundConfig::Socks5(Socks5Config {
                 username: flat.username.take(),
@@ -623,7 +696,8 @@ struct WireOptions<'a> {
     username: Option<&'a str>,
     password: Option<&'a str>,
     encryption: Option<&'a str>,
-    vless_mode: WireMode,
+    packet_encoding: Option<VlessUdpEncoding>,
+    multiplex: Option<&'a VlessMultiplex>,
     plugin: Option<&'a str>,
     plugin_opts: Option<&'a str>,
     transport: &'a str,
@@ -719,7 +793,8 @@ impl<'a> WireOptions<'a> {
                 wire.username = config.uuid.as_deref();
                 wire.password = config.uuid.as_deref();
                 wire.encryption = config.encryption.as_deref();
-                wire.vless_mode = config.mode;
+                wire.packet_encoding = Some(config.udp_encoding);
+                wire.multiplex = Some(&config.multiplex);
                 wire.flow = config.flow.as_deref();
                 wire.network = config.network.as_deref();
                 wire.set_transport(&config.transport);
@@ -786,8 +861,11 @@ impl Serialize for Node {
         S: Serializer,
     {
         let wire = WireOptions::from_node(self);
-        let mut state =
-            serializer.serialize_struct("Node", 56 + usize::from(wire.tls_alpn.is_some()))?;
+        let vless = self.protocol() == NodeProtocol::VLess;
+        let mut state = serializer.serialize_struct(
+            "Node",
+            56 + usize::from(vless) + usize::from(wire.tls_alpn.is_some()),
+        )?;
         state.serialize_field("id", &self.id)?;
         state.serialize_field("name", &self.name)?;
         state.serialize_field("protocol", &self.protocol())?;
@@ -797,7 +875,12 @@ impl Serialize for Node {
         state.serialize_field("username", &wire.username)?;
         state.serialize_field("password", &wire.password)?;
         state.serialize_field("encryption", &wire.encryption)?;
-        state.serialize_field("vless_mode", &wire.vless_mode)?;
+        if vless {
+            state.serialize_field("packet_encoding", &wire.packet_encoding)?;
+            state.serialize_field("multiplex", &wire.multiplex)?;
+        } else {
+            state.serialize_field("vless_mode", "legacy")?;
+        }
         state.serialize_field("plugin", &wire.plugin)?;
         state.serialize_field("plugin_opts", &wire.plugin_opts)?;
         state.serialize_field("transport", wire.transport)?;

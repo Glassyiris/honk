@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
 use honk_config::dns::DnsStrategy;
-use honk_config::node::{OutboundConfig, TlsOptions, VlessConfig, WireMode};
+use honk_config::node::{OutboundConfig, TlsOptions, VlessConfig};
 use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
 use honk_config::types::NodeProtocol;
 use honk_outbound::proxy::{
@@ -273,7 +273,6 @@ async fn doh3_base_vision_refusal_stops_resolved_route_fallback() {
         port: 443,
         outbound: OutboundConfig::Vless(VlessConfig {
             uuid: Some("00000000-0000-4000-8000-000000000001".into()),
-            mode: WireMode::Auto,
             flow: Some("xtls-rprx-vision".into()),
             tls: TlsOptions {
                 enabled: true,

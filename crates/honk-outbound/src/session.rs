@@ -210,7 +210,7 @@ enum DialSignal {
     /// recorded).
     Done,
     /// Dial failed — waiters surface the error themselves.
-    Failed(Arc<anyhow::Error>),
+    Failed(crate::SharedError),
 }
 
 /// How a protocol open failed, for the pool's retry decision.
@@ -442,6 +442,50 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         pool.sessions.len()
     }
 
+    /// Drain idle sessions above the configured or runtime-retained floor.
+    /// Active sessions are never disturbed; terminal sessions are pruned.
+    pub fn reap_unretained_idle(&self) -> usize {
+        if self.state() != PoolState::Running {
+            return 0;
+        }
+        let to_close = {
+            let mut pool = self.pool.lock();
+            if self.state() != PoolState::Running {
+                return 0;
+            }
+            pool.sessions.retain(|session| !session.is_closed());
+            let min_live = pool
+                .base_min_idle
+                .max(if pool.warm_retained { 1 } else { 0 });
+            let mut remaining = pool.sessions.len();
+            let mut to_close = Vec::new();
+            for session in &pool.sessions {
+                if remaining <= min_live {
+                    break;
+                }
+                if session.active_streams() != 0 {
+                    continue;
+                }
+                session.begin_drain();
+                if session.active_streams() == 0 {
+                    to_close.push(Arc::clone(session));
+                    remaining -= 1;
+                }
+            }
+            pool.sessions
+                .retain(|session| !to_close.iter().any(|closed| Arc::ptr_eq(closed, session)));
+            to_close
+        };
+        let reaped = to_close.len();
+        for session in to_close {
+            session.close();
+        }
+        if reaped != 0 {
+            self.capacity_notify.notify_waiters();
+        }
+        reaped
+    }
+
     /// Pin or unpin a reusable warm session. Unpinning immediately closes
     /// idle sessions above the explicit standby floor and drains active excess
     /// sessions without cutting their streams.
@@ -609,7 +653,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                             if self.config.spread_sessions && self.has_usable_session() {
                                 continue;
                             }
-                            return Err(anyhow::anyhow!(e).context("session dial failed"));
+                            return Err(anyhow::Error::new(e).context("session dial failed"));
                         }
                         DialSignal::Pending | DialSignal::Done => {}
                     }
@@ -681,8 +725,11 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                                         DialSignal::Done
                                     }
                                     Ok(Err(e)) => {
-                                        let backoff =
-                                            Self::record_dial_failure(&mut pool, &config);
+                                        let backoff = if crate::proxy::is_packet_rejection(&e) {
+                                            None
+                                        } else {
+                                            Some(Self::record_dial_failure(&mut pool, &config))
+                                        };
                                         // The waiter only sees the outer context; keep
                                         // the full chain available for diagnostics.
                                         tracing::debug!(
@@ -691,17 +738,22 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                                             "session dial failed: {:#}",
                                             e
                                         );
-                                        DialSignal::Failed(Arc::new(e.context(anyhow!(
-                                            "session dial failed ({} consecutive, backoff {:?})",
-                                            pool.dial_failures,
-                                            backoff
-                                        ))))
+                                        let context = backoff.map_or_else(
+                                            || "session dial rejected".to_owned(),
+                                            |backoff| {
+                                                format!(
+                                                    "session dial failed ({} consecutive, backoff {:?})",
+                                                    pool.dial_failures, backoff
+                                                )
+                                            },
+                                        );
+                                        DialSignal::Failed(crate::SharedError::new(e.context(context)))
                                     }
                                     Err(_panic) => {
                                         pool.dial_failures += 1;
                                         pool.next_dial_at =
                                             Some(Instant::now() + config.dial_backoff);
-                                        DialSignal::Failed(Arc::new(anyhow!(
+                                        DialSignal::Failed(crate::SharedError::new(anyhow!(
                                             "session dial panicked (backoff {:?})",
                                             config.dial_backoff
                                         )))
@@ -810,7 +862,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     match signal {
                         DialSignal::Closed => return Err(Self::pool_closed_err()),
                         DialSignal::Failed(error) => {
-                            return Err(anyhow::anyhow!(error).context("session dial failed"));
+                            return Err(anyhow::Error::new(error).context("session dial failed"));
                         }
                         DialSignal::Pending | DialSignal::Done => {}
                     }

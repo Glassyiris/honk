@@ -346,7 +346,6 @@ async fn udp_policy_denial_skips_dns_before_dial_and_health_feedback() {
     let mut node = udp_test_node();
     node.name = "vision-vless".into();
     node.outbound = honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
-        mode: honk_config::node::WireMode::Auto,
         flow: Some("xtls-rprx-vision".into()),
         tls: honk_config::node::TlsOptions {
             enabled: true,
@@ -412,7 +411,11 @@ async fn c27_legacy_factories_fail_fast_on_invalid_nodes() {
             honk_outbound::runtime::OutboundRuntimeRegistry::build(&[udp_test_node()]).unwrap();
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                honk_outbound::urltest::probe_runtime(&generation, &node)
+                honk_outbound::urltest::probe_runtime(
+                    &generation,
+                    &node,
+                    honk_outbound::proxy::WarmRequirement::Session,
+                )
             }))
             .is_err()
         );

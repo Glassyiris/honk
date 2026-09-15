@@ -97,7 +97,7 @@ mod parser_warnings {
                 include_str!("fixtures/removed_node_mux.dae"),
                 "nodes.mux",
                 "unsupported-node-mux",
-                "vless_mode",
+                "mux",
             ),
             (
                 include_str!("fixtures/removed_dns_hosts_file.dae"),
@@ -118,6 +118,20 @@ mod parser_warnings {
             assert_eq!(diagnostics.iter().filter(|d| d.terminal).count(), 1);
             assert!(error.into_legacy().to_string().contains(replacement));
         }
+    }
+    #[test]
+    fn removed_vless_mode_is_terminal_at_the_dae_entry() {
+        let input = "node {\n edge: 'vless://b831381d-6324-4d53-ad4f-8cda48b30811@private.example:443?vless_mode=#PRIVATE'\n}";
+        let mut diagnostics = Vec::new();
+        let error = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+            input,
+            &mut diagnostics,
+        )
+        .unwrap_err();
+        assert_eq!(error.diagnostic.code, "removed-vless-mode");
+        assert_eq!(error.diagnostic.setting.to_string(), "nodes[1].vless_mode");
+        assert_eq!(error.diagnostic.entry_index, Some(1));
+        assert!(!format!("{error:?} {diagnostics:?}").contains("PRIVATE"));
     }
 }
 
@@ -277,6 +291,32 @@ mod config_loaders {
             assert!(error.diagnostic.line.is_some());
             assert_eq!(diagnostics.iter().filter(|d| d.terminal).count(), 1);
             assert!(!format!("{error:?} {diagnostics:?}").contains("PRIVATE_GROUP_VALUE"));
+        }
+    }
+    #[test]
+    fn removed_vless_mode_preserves_indexed_safe_diagnostics() {
+        for removed in [serde_json::json!("legacy"), serde_json::Value::Null] {
+            let input = serde_json::json!({
+                "nodes": [{
+                    "name": "vless",
+                    "protocol": "vless",
+                    "address": "private.example:443",
+                    "host": "private.example",
+                    "port": 443,
+                    "password": "b831381d-6324-4d53-ad4f-8cda48b30811",
+                    "vless_mode": removed,
+                }]
+            });
+            let mut diagnostics = Vec::new();
+            let error = Config::from_json_str_with_detailed_diagnostics(
+                &input.to_string(),
+                &mut diagnostics,
+            )
+            .unwrap_err();
+            assert_eq!(error.diagnostic.setting.to_string(), "nodes[1].vless_mode");
+            assert_eq!(error.diagnostic.entry_index, Some(1));
+            assert_eq!(error.diagnostic.value, SafeValue::Redacted);
+            assert!(!format!("{error:?} {diagnostics:?}").contains("private.example"));
         }
     }
 }

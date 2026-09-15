@@ -36,6 +36,9 @@ pub(super) fn normalize(value: Value) -> NodeResult {
             ));
         }
     };
+    if protocol == NodeProtocol::VLess && source.contains_key("vless_mode") {
+        return Err("VLESS vless_mode was removed");
+    }
     if source.remove("detour").is_some_and(|value| active(&value)) {
         return Err("sing-box detour chaining is unsupported");
     }

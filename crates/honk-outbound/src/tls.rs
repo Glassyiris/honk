@@ -265,7 +265,7 @@ pub(crate) fn set_chrome_key_shares_ssl(ssl: &boring::ssl::Ssl) -> anyhow::Resul
     set_chrome_key_shares_ssl_ref(ssl)
 }
 
-fn set_chrome_key_shares_ssl_ref(ssl: &boring::ssl::SslRef) -> anyhow::Result<()> {
+pub(crate) fn set_chrome_key_shares_ssl_ref(ssl: &boring::ssl::SslRef) -> anyhow::Result<()> {
     let shares = [SSL_GROUP_X25519_MLKEM768, SSL_GROUP_X25519];
     let ok = unsafe {
         boring_sys::SSL_set1_client_key_shares(ssl.as_ptr(), shares.as_ptr(), shares.len())
@@ -1146,6 +1146,7 @@ mod batch_read_tests {
 /// extension real Chrome sends is just an offer, never a resumption.
 pub fn build_reality_connector(chrome: bool) -> anyhow::Result<SslConnector> {
     let mut builder = base_builder(true)?;
+    builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
     if chrome {
         apply_chrome_ctx(&mut builder)?;
         builder.set_cipher_list(CHROME_CIPHER_LIST)?;

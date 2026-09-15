@@ -69,7 +69,7 @@ fn parse_node_entry(
             "unsupported-node-mux",
             text.source.reference(),
             crate::diagnostic::SettingPath::new("nodes").field("mux"),
-            "standalone mux is unsupported; set vless_mode on each VLESS share link",
+            "standalone mux is unsupported; set mux on each VLESS share link",
         );
         error.diagnostic.line = Some(line);
         error.diagnostic.span = Some(text.span.start..text.span.end);
@@ -107,6 +107,9 @@ fn parse_node_entry(
             nodes.push(node);
         }
         Err(error) if error.category == crate::error::ErrorCategory::UnknownProtocol => {
+            return Err(super::ParseFailure::Detailed(error));
+        }
+        Err(error) if error.diagnostic.code == "removed-vless-mode" => {
             return Err(super::ParseFailure::Detailed(error));
         }
         Err(_) => {

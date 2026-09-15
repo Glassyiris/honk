@@ -579,20 +579,20 @@ async fn raw_tcp_probe_with_v4_only_node_address_leaves_v6_untouched() {
 }
 
 struct MockUdpProber {
-    result: std::sync::Mutex<Option<Result<Duration, String>>>,
+    result: Option<Result<Duration, String>>,
     data_path: Option<Result<Duration, String>>,
 }
 
 impl MockUdpProber {
     fn ok(latency: Duration) -> Self {
         Self {
-            result: std::sync::Mutex::new(Some(Ok(latency))),
+            result: Some(Ok(latency)),
             data_path: None,
         }
     }
     fn err(msg: &str) -> Self {
         Self {
-            result: std::sync::Mutex::new(Some(Err(msg.to_string()))),
+            result: Some(Err(msg.to_string())),
             data_path: None,
         }
     }
@@ -600,19 +600,19 @@ impl MockUdpProber {
     /// succeeded (the relay blocks UDP/53 yet carries UDP fine).
     fn dns_blocked_data_ok(latency: Duration) -> Self {
         Self {
-            result: std::sync::Mutex::new(Some(Err("dns probe refused".to_string()))),
+            result: Some(Err("dns probe refused".to_string())),
             data_path: Some(Ok(latency)),
         }
     }
     fn dns_skipped_data_ok(latency: Duration) -> Self {
         Self {
-            result: std::sync::Mutex::new(None),
+            result: None,
             data_path: Some(Ok(latency)),
         }
     }
     fn skipped() -> Self {
         Self {
-            result: std::sync::Mutex::new(None),
+            result: None,
             data_path: None,
         }
     }
@@ -624,8 +624,14 @@ impl UdpProber for MockUdpProber {
         _node_name: &str,
         _timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>> {
-        let r = self.result.lock().unwrap().clone();
-        let data_path = self.data_path.clone();
+        let r = self
+            .result
+            .clone()
+            .map(|result| result.map_err(anyhow::Error::msg));
+        let data_path = self
+            .data_path
+            .clone()
+            .map(|result| result.map_err(anyhow::Error::msg));
         Box::pin(async move { UdpProbeOutcome { dns: r, data_path } })
     }
 }
@@ -641,10 +647,63 @@ impl UdpProber for PendingUdpProber {
         Box::pin(async move {
             tokio::time::sleep(timeout).await;
             UdpProbeOutcome {
-                dns: Some(Err("UDP probe timeout".into())),
+                dns: Some(Err(anyhow::anyhow!("UDP probe timeout"))),
                 data_path: None,
             }
         })
+    }
+}
+
+struct CapacityUdpProber;
+
+impl UdpProber for CapacityUdpProber {
+    fn probe_udp(
+        &self,
+        _node_name: &str,
+        _timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>> {
+        Box::pin(async {
+            UdpProbeOutcome {
+                dns: Some(Err(crate::proxy::PacketRejection::Capacity.into())),
+                data_path: Some(Err(crate::proxy::PacketRejection::Capacity.into())),
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn local_carrier_capacity_does_not_demote_or_revive_probe_health() {
+    let set = AliveDialerSet::new();
+    set.register_node(id(1), "capacity".into(), "127.0.0.1:1".into());
+    set.node_registered_at
+        .write()
+        .insert(id(1), Instant::now() - GRACE_PERIOD);
+    set.set_http_probe(
+        Arc::new(MockHttpProber {
+            result: HttpProbeResult::LocalRefusal(crate::proxy::PacketRejection::Capacity),
+        }),
+        "http://127.0.0.1/".into(),
+        "HEAD".into(),
+    )
+    .await;
+    set.set_udp_probe(Arc::new(CapacityUdpProber));
+    for domain in [ProbeDomain::Tcp, ProbeDomain::DnsUdp, ProbeDomain::DataUdp] {
+        set.mark_alive_for_latency(id(1), domain, IpVersion::V4, Duration::from_millis(7));
+        for _ in 0..3 {
+            set.mark_dead_for(id(1), domain, IpVersion::V6);
+        }
+    }
+    for _ in 0..4 {
+        assert!(!set.probe_node(id(1), Duration::from_millis(20)).await);
+        assert!(!set.probe_node_udp(id(1), Duration::from_millis(20)).await);
+    }
+    for domain in [ProbeDomain::Tcp, ProbeDomain::DnsUdp, ProbeDomain::DataUdp] {
+        assert!(set.is_alive_for(id(1), domain, IpVersion::V4));
+        assert!(!set.is_alive_for(id(1), domain, IpVersion::V6));
+        assert_eq!(
+            set.get_last_latency(id(1), domain, IpVersion::V4),
+            Some(Duration::from_millis(7))
+        );
     }
 }
 

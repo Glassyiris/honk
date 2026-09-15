@@ -44,6 +44,13 @@ pub(crate) async fn wrap_transport(
     tcp: TcpStream,
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
     let stream = maybe_tls_wrap(node, tcp).await?;
+    wrap_after_tls(node, stream).await
+}
+
+pub(crate) async fn wrap_after_tls(
+    node: &Node,
+    stream: Box<dyn AsyncReadWrite>,
+) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
     match node.transport().unwrap().transport.as_str() {
         "" | "tcp" => Ok(stream), // raw TCP/TLS
         "ws" => wrap_ws(node, stream).await,

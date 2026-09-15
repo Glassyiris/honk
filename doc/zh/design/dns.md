@@ -104,6 +104,11 @@ LAN 客户端 -> dnsmasq :53 -> 127.0.0.1:54 -> Honk DNS 策略/上游
 
 每代有两个相互独立的 2,048 上限：controller 查询生命周期与活跃 singleflight key。UDP 入口另用该代按启动预算确定的 slow-path 配额（最多 256），与普通 UDP 初始化隔离。每个 flight 最多接受 256 个 follower。flight 饱和时拒绝，不会开启无限上游交换；controller 将该过载渲染为 `REFUSED`。发布结果时，删除 flight 与向已加入 follower 广播结果原子完成；后续缓存未命中的请求可以开启新 flight。已完成的失败保留原始原因但不进入缓存，因此已加入的 follower 不会各自重复失败的交换。丢弃未发布结果的 leader 会删除 flight 并唤醒 follower 重新竞争所有权；这包括取消，以及缺少已验证 response template、仅被 compatibility mode 接受的成功结果。
 
+初始化与 flight fan-out 使用 `SharedError`。该 Arc-backed error 为 builder 与
+waiter clone 原始 causal chain，而不是从 display 文本重建。完成的 failure 不
+进入 cache；所有已加入 waiter 观察相同 typed source，包括
+`PacketRejection::Capacity`。
+
 ### Hosts 快照
 
 构建 generation 时会按声明顺序读取并合并每个可重复的 `use_host` 来源。`true` 选择 `/etc/hosts`，其解析器索引精确名称及别名；路径选择 OxiDNS 兼容的精确、domain 后缀、regexp 和 keyword 规则文件。后定义的同名规则覆盖先定义的规则；精确与最长后缀匹配优先于有序的 regexp 和 keyword 匹配。查询处理不执行文件 I/O。
@@ -124,11 +129,13 @@ LAN 客户端 -> dnsmasq :53 -> 127.0.0.1:54 -> Honk DNS 策略/上游
 
 该策略也决定 bootstrap 解析出的上游拨号目标顺序。`both` 使用 IPv4 优先的兼容顺序；偏好模式把对应地址族放在前面，同时保留另一地址族。stream 与 QUIC transport 会依次尝试候选地址。直连 UDP 保持现有两次尝试上限：首个候选失败后，唯一一次重试先选择另一地址族，再考虑同族其他地址，并缓存成功的 socket。
 
-类型化的数据包本地拒绝不是可用性故障。DoH3/DoQ 初始化为构建者及其等待者保留原始错误来源；
-外层路由循环和地址族聚合不会把它变成另一条路由、bootstrap 或系统 DNS 查询。
-健康检查与 URLTest resolver hook 把错误保留到最终消费者，被拒绝的查询不会降低节点健康，
-也不会被替换成默认 UDP 检查目标。独立允许的探测和配置中明确给出的备用 IP 仍可使用；
-普通故障、空应答以及已有的过期缓存处理继续保留上述回退行为。
+包括 capacity 在内的类型化 local packet refusal 不是 availability failure。
+DoH3/DoQ 与代理 reusable-session 初始化为 builder 和每个 waiter 保留同一个
+`SharedError` cause。外层 route loop 与地址族 aggregation 不会把它变成另一条
+route、bootstrap 或 system-DNS attempt。health 与 URLTest resolver hook 把该
+错误保留到最终消费者，因此 denied lookup 不降低节点 health，也不替换默认
+UDP check target。独立允许的 probe 与配置 literal fallback IP 仍可使用；普通
+failure、空 response 和已有 stale-cache handling 保持原有 fallback 行为。
 
 ### DNS 路由
 
@@ -231,7 +238,7 @@ worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired
 
 ## Generation 与 reload
 
-一个 `DnsRuntime` 包含 forwarder 与 policy、不可变 hosts 表、路由与组快照、transport manager、路由投影、捕获的 bootstrap resolver，以及代内 query/UDP 准入。新构建的 forwarder 独占 singleflight 和 refresh/prefetch worker；clone 仍属于同一代。DNS 代理 transport 使用全新的 outbound runtime registry，不复用普通流量或旧 DNS 代的 session。该 DNS registry 与来源配置代共享 dial semaphore，并保留进程级 physical-dial 上限，但不共享退役标志或协议连接池。
+一个 `DnsRuntime` 包含 forwarder 与 policy、不可变 hosts 表、routing/group snapshot、transport manager、路由投影、捕获的 bootstrap resolver 及代内 query/UDP admission。每个新 forwarder 独占 singleflight 和 refresh/prefetch worker；clone 仍属于该代。每个 DNS pool 持有新的 outbound runtime fork，不复用 traffic session 或旧 DNS 代 session。fork 与来源配置代共享 dial semaphore、进程 physical-dial ceiling 和进程 VLESS-carrier gate，但不共享 retirement state 或 protocol pool。
 
 现有 TLS 维护任务也会回收当前 DNS registry 的空闲 connector。Registry 终止关闭时会释放其缓存 connector，即使已退役 runtime 仍被保留。
 

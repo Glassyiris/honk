@@ -82,6 +82,9 @@ impl Node {
         let mut node = Self::decode_share_link(link, source, emit).map_err(|error| {
             crate::error::DetailedConfigError::from_legacy(error, source.clone())
         })?;
+        if let Some(config) = node.vless_mut() {
+            config.normalize();
+        }
         node.validate_detailed().map_err(|mut error| {
             error.diagnostic.source = source.clone();
             error

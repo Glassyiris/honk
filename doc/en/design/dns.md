@@ -119,6 +119,11 @@ Production `DnsService` callers require strict query/response wire validation be
 
 Each generation has two independent 2,048 limits: controller query lifecycles and active singleflight keys. UDP ingress additionally uses that generation's startup-budgeted slow-path quota (at most 256), separate from generic UDP initialization. One flight accepts at most 256 followers. Saturated flights reject rather than opening unbounded upstream exchanges; the controller renders that overload as `REFUSED`. Publication atomically removes the flight and broadcasts its result to attached followers; a later cache miss can start a fresh flight. Completed failures retain their cause without being cached, so attached followers do not each repeat the failed exchange. Dropping a leader without a published result removes the flight and wakes followers to retry ownership; this includes cancellation and compatibility-only successes without a validated response template.
 
+Initialization and flight fan-out use `SharedError`, an `Arc`-backed error that
+clones the original causal chain for builders and waiters instead of rebuilding
+it from display text. A completed failure is not cached; all attached waiters
+observe the same typed source, including `PacketRejection::Capacity`.
+
 ### Hosts snapshot
 
 Generation construction reads every repeatable `use_host` source once and merges them in declaration order. `true` selects `/etc/hosts`, whose parser indexes exact names and aliases; a path selects an OxiDNS-compatible exact, domain-suffix, regexp, and keyword rule file. Later definitions replace earlier matching definitions. Exact and longest-suffix lookups take precedence over ordered regexp and keyword matches. Query handling performs no file I/O.
@@ -139,14 +144,15 @@ A prefer-family sibling query changes only the first question's QTYPE. Transacti
 
 The strategy also orders bootstrap-resolved upstream dial targets. `both` uses IPv4-first compatibility order; preference modes put their family first while retaining the other family. Stream and QUIC transports walk the ordered candidates. Direct UDP keeps the existing two-attempt bound: after the first candidate fails, its retry selects the other family before another address of the same family and caches the winner.
 
-Typed local packet refusals are not availability failures. DoH3/DoQ initialization
-retains their source for both the builder and its waiters; the outer route loop
-and name-family aggregation do not turn them into another-route, bootstrap, or
-system-DNS attempts. Health and URLTest resolver hooks preserve the error to the
-final consumer, so denied lookups neither demote nodes nor substitute the default
-UDP check target. Independently permitted probes and configured literal fallback
-IPs remain usable. Ordinary failures, empty responses, and existing stale-cache
-handling retain the fallback behavior described above.
+Typed local packet refusals, including capacity, are not availability failures.
+DoH3/DoQ and proxied reusable-session initialization preserve the same
+`SharedError` cause for the builder and every waiter. The outer route loop and
+name-family aggregation do not turn that cause into another route, bootstrap,
+or system-DNS attempt. Health and URLTest resolver hooks preserve it to the
+final consumer, so denied lookups neither demote nodes nor substitute the
+default UDP check target. Independently permitted probes and configured literal
+fallback IPs remain usable. Ordinary failures, empty responses, and existing
+stale-cache handling retain the fallback behavior described above.
 
 ### DNS routing
 
@@ -247,7 +253,7 @@ Incremental acknowledgement compares the successful write with the current desir
 
 ## Generations and reload
 
-One `DnsRuntime` contains the forwarder and policy, immutable hosts table, routing and group snapshots, transport manager, routing projection, bootstrap resolver capture, and generation-local query/UDP admission. Each newly constructed forwarder owns its singleflight and background refresh/prefetch workers; clones remain within that generation. Each DNS pool owns a fresh outbound runtime fork, independent of both traffic session reuse and predecessor DNS sessions. The DNS registry shares its source configuration generation's dial semaphore and the process-wide physical-dial ceiling, not its retirement flag or protocol pools.
+One `DnsRuntime` contains the forwarder and policy, immutable hosts table, routing and group snapshots, transport manager, routing projection, bootstrap resolver capture, and generation-local query/UDP admission. Each newly constructed forwarder owns its singleflight and background refresh/prefetch workers; clones remain within that generation. Each DNS pool owns a fresh outbound runtime fork, independent of traffic session reuse and predecessor DNS sessions. The fork shares its source configuration generation's dial semaphore, the process physical-dial ceiling, and the process VLESS-carrier gate, but not retirement state or protocol pools.
 
 The existing TLS maintenance pass also reaps the active DNS registry's idle connectors. Terminal registry shutdown releases its cached connectors even while a retired runtime remains retained.
 

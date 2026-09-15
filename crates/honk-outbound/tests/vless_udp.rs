@@ -1,6 +1,9 @@
 #![cfg(feature = "rprx")]
 
-use honk_config::node::{Node, WireMode};
+#[path = "vless_udp/reality.rs"]
+mod reality;
+
+use honk_config::node::{Node, VlessTcpPath, VlessUdpEncoding, VlessUdpPath};
 use honk_outbound::ProxyRegistry;
 use honk_outbound::proxy::{
     PacketErrorClass, PacketRejection, is_packet_rejection, packet_error_class,
@@ -101,9 +104,12 @@ impl Drop for EchoTasks {
 
 struct Echoes {
     tcp: SocketAddr,
+    tls_tcp: SocketAddr,
+    tls_root: tokio_rustls::rustls::pki_types::CertificateDer<'static>,
     native_v4_53: SocketAddr,
     native_v6_443: SocketAddr,
     domain: SocketAddr,
+    tls_tasks: tokio::sync::mpsc::UnboundedReceiver<tokio::task::JoinHandle<()>>,
     _tasks: EchoTasks,
 }
 
@@ -113,6 +119,29 @@ impl Echoes {
             .await
             .expect("bind TCP echo");
         let tcp_addr = tcp.local_addr().expect("TCP echo address");
+
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+                .expect("generate inner TLS certificate");
+        let tls_root = cert.der().clone();
+        let tls_config = tokio_rustls::rustls::ServerConfig::builder_with_provider(
+            tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .expect("select inner TLS protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![tls_root.clone()],
+            tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
+                signing_key.serialize_der().into(),
+            ),
+        )
+        .expect("build inner TLS server");
+        let tls_acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(tls_config));
+        let tls_tcp = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind inner TLS echo");
+        let tls_tcp_addr = tls_tcp.local_addr().expect("inner TLS echo address");
 
         let native_v4 = tokio::net::UdpSocket::bind((Ipv4Addr::new(127, 77, 0, 1), 53))
             .await
@@ -150,6 +179,33 @@ impl Echoes {
                 });
             }
         })];
+        let (tls_results, tls_tasks) = tokio::sync::mpsc::unbounded_channel();
+        let tls_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = tls_tcp.accept().await.expect("accept inner TLS echo");
+                let acceptor = tls_acceptor.clone();
+                let handler = tokio::spawn(async move {
+                    let mut stream = acceptor.accept(stream).await.expect("accept inner TLS");
+                    assert_eq!(
+                        stream.get_ref().1.protocol_version(),
+                        Some(tokio_rustls::rustls::ProtocolVersion::TLSv1_3)
+                    );
+                    let mut buffer = [0; 16 * 1024];
+                    loop {
+                        let size = stream.read(&mut buffer).await.expect("read inner TLS echo");
+                        if size == 0 {
+                            break;
+                        }
+                        stream
+                            .write_all(&buffer[..size])
+                            .await
+                            .expect("write inner TLS echo");
+                    }
+                });
+                tls_results.send(handler).expect("track inner TLS handler");
+            }
+        });
+        tasks.push(tls_task);
         for socket in [native_v4, native_v6, domain_v4, domain_v6] {
             tasks.push(tokio::spawn(async move {
                 let mut buffer = [0; u16::MAX as usize];
@@ -168,10 +224,25 @@ impl Echoes {
 
         Self {
             tcp: tcp_addr,
+            tls_tcp: tls_tcp_addr,
+            tls_root,
             native_v4_53,
             native_v6_443,
             domain,
+            tls_tasks,
             _tasks: EchoTasks(tasks),
+        }
+    }
+
+    async fn finish(mut self) {
+        for task in std::mem::take(&mut self._tasks.0) {
+            task.abort();
+            if let Err(error) = task.await {
+                assert!(error.is_cancelled(), "echo listener failed: {error}");
+            }
+        }
+        while let Some(task) = self.tls_tasks.recv().await {
+            task.await.expect("inner TLS echo handler failed");
         }
     }
 }
@@ -275,8 +346,17 @@ fn canonical_node(server_port: u16, name: &str, options: &str) -> Node {
     .unwrap_or_else(|error| panic!("parse {name}: {error}"))
 }
 
-fn encrypted_node(server_port: u16, name: &str, mode: WireMode, encryption: &str) -> Node {
-    let option = format!("&security=none&vless_mode={}", mode.as_str());
+fn encrypted_node(
+    server_port: u16,
+    name: &str,
+    udp_encoding: VlessUdpEncoding,
+    encryption: &str,
+) -> Node {
+    let packet_encoding = match udp_encoding {
+        VlessUdpEncoding::Native => "none",
+        encoding => encoding.as_str(),
+    };
+    let option = format!("&security=none&packetEncoding={packet_encoding}");
     let mut node = canonical_node(server_port, name, &option);
     node.vless_mut().expect("VLESS config").encryption = Some(encryption.to_owned());
     node.id = node.derive_id();
@@ -304,6 +384,7 @@ async fn tcp_echo(registry: &ProxyRegistry, name: &str, node: &Node, target: Soc
             .await
             .expect("send TCP echo");
         stream.stream.flush().await.expect("flush TCP echo");
+
         let mut echoed = vec![0; message.len()];
         stream
             .stream
@@ -311,6 +392,57 @@ async fn tcp_echo(registry: &ProxyRegistry, name: &str, node: &Node, target: Soc
             .await
             .expect("receive TCP echo");
         assert_eq!(echoed, message.as_bytes(), "{name}");
+    })
+    .await;
+}
+async fn tls_tcp_echo(
+    registry: &ProxyRegistry,
+    name: &str,
+    node: &Node,
+    target: SocketAddr,
+    root: tokio_rustls::rustls::pki_types::CertificateDer<'static>,
+) {
+    bounded(name, async {
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots
+            .add(root)
+            .expect("trust inner TLS fixture certificate");
+        let config = tokio_rustls::rustls::ClientConfig::builder_with_provider(
+            tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .expect("select inner TLS protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+        let proxy = registry
+            .dial(node, target, None, Duration::from_secs(3))
+            .await
+            .unwrap_or_else(|error| panic!("dial {name}: {error:#}"));
+        let mut stream = connector
+            .connect(
+                tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                proxy.stream,
+            )
+            .await
+            .expect("complete inner TLS handshake through VLESS");
+        assert_eq!(
+            stream.get_ref().1.protocol_version(),
+            Some(tokio_rustls::rustls::ProtocolVersion::TLSv1_3)
+        );
+        let message = format!("tls-{name}");
+        stream
+            .write_all(message.as_bytes())
+            .await
+            .expect("send inner TLS echo");
+        stream.flush().await.expect("flush inner TLS echo");
+        let mut echoed = vec![0; message.len()];
+        stream
+            .read_exact(&mut echoed)
+            .await
+            .expect("receive inner TLS echo");
+        assert_eq!(echoed, message.as_bytes());
+        stream.shutdown().await.expect("close inner TLS echo");
     })
     .await;
 }
@@ -426,13 +558,14 @@ async fn official_xray_and_sing_box_vless_udp_loopback_interop() {
         "xray vlessenc returned no 0rtt client field"
     );
 
-    let (ports, reservations) = reserve_ports(4);
+    let (ports, reservations) = reserve_ports(5);
     let [
         xray_plain_port,
         xray_vision_port,
         xray_encrypted_port,
+        xray_encrypted_vision_port,
         sing_box_port,
-    ]: [u16; 4] = ports.try_into().expect("four reserved ports");
+    ]: [u16; 5] = ports.try_into().expect("five reserved ports");
 
     let key = rcgen::KeyPair::generate().expect("generate TLS key");
     let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
@@ -474,10 +607,19 @@ async fn official_xray_and_sing_box_vless_udp_loopback_interop() {
       "protocol": "vless",
       "settings": {{ "clients": [{{ "id": "{UUID}" }}], "decryption": "{decryption}" }},
       "streamSettings": {{ "network": "tcp", "security": "none" }}
+    }},
+    {{
+      "tag": "vless-encrypted-vision",
+      "listen": "127.0.0.1",
+      "port": {xray_encrypted_vision_port},
+      "protocol": "vless",
+      "settings": {{ "clients": [{{ "id": "{UUID}", "flow": "xtls-rprx-vision" }}], "decryption": "{decryption}" }},
+      "streamSettings": {{ "network": "tcp", "security": "tls", "tlsSettings": {{ "certificates": [{{ "certificateFile": "{}", "keyFile": "{}" }}] }} }}
     }}
   ],
   "outbounds": [{{ "tag": "direct", "protocol": "freedom", "settings": {{ "finalRules": [
     {{ "action": "allow", "network": "tcp", "ip": ["127.0.0.1"], "port": {tcp_echo_port} }},
+    {{ "action": "allow", "network": "tcp", "ip": ["127.0.0.1"], "port": {tls_echo_port} }},
     {{ "action": "allow", "network": "udp", "ip": ["127.77.0.1"], "port": 53 }},
     {{ "action": "allow", "network": "udp", "ip": ["::1"], "port": 443 }},
     {{ "action": "allow", "network": "udp", "ip": ["127.0.0.1", "::1"], "port": {domain_echo_port} }},
@@ -486,7 +628,10 @@ async fn official_xray_and_sing_box_vless_udp_loopback_interop() {
 }}"#,
             cert_path.display(),
             key_path.display(),
+            cert_path.display(),
+            key_path.display(),
             tcp_echo_port = echoes.tcp.port(),
+            tls_echo_port = echoes.tls_tcp.port(),
             domain_echo_port = echoes.domain.port(),
         ),
     )
@@ -530,7 +675,12 @@ async fn official_xray_and_sing_box_vless_udp_loopback_interop() {
 
     wait_ready(
         &mut xray,
-        &[xray_plain_port, xray_vision_port, xray_encrypted_port],
+        &[
+            xray_plain_port,
+            xray_vision_port,
+            xray_encrypted_port,
+            xray_encrypted_vision_port,
+        ],
     )
     .await;
     wait_ready(&mut sing_box, &[sing_box_port]).await;
@@ -571,7 +721,7 @@ async fn official_xray_and_sing_box_vless_udp_loopback_interop() {
         let native = canonical_node(
             port,
             &format!("{server}-explicit-native"),
-            "&security=none&vless_mode=native",
+            "&security=none&packetEncoding=none",
         );
         udp_size_contract(
             &registry,
@@ -583,6 +733,39 @@ async fn official_xray_and_sing_box_vless_udp_loopback_interop() {
         )
         .await;
     }
+
+    for (name, options) in [
+        ("uot-v2", "packetEncoding=uot-v2"),
+        ("h2mux", "mux=h2mux"),
+        ("h2mux-padded", "mux=h2mux&padding=true"),
+    ] {
+        let node = canonical_node(sing_box_port, name, &format!("&security=none&{options}"));
+        tcp_echo(&registry, name, &node, echoes.tcp).await;
+        udp_echo(
+            &registry,
+            name,
+            &node,
+            echoes.domain,
+            Some("localhost"),
+            512,
+        )
+        .await;
+    }
+    let cool = canonical_node(
+        xray_plain_port,
+        "shared-cool",
+        "&security=none&mux=xray&concurrency=8&xudpConcurrency=0&xudpProxyUDP443=allow",
+    );
+    tcp_echo(&registry, "shared-cool-tcp", &cool, echoes.tcp).await;
+    udp_echo(
+        &registry,
+        "shared-cool-udp",
+        &cool,
+        echoes.domain,
+        Some("localhost"),
+        512,
+    )
+    .await;
 
     let mut vision_base = canonical_node(
         xray_vision_port,
@@ -632,15 +815,15 @@ async fn official_xray_and_sing_box_vless_udp_loopback_interop() {
     )
     .await;
 
-    for (mode, target, domain) in [
-        (WireMode::Native, echoes.domain, Some("localhost")),
-        (WireMode::Xudp, echoes.domain, Some("localhost")),
+    for (udp_encoding, target, domain) in [
+        (VlessUdpEncoding::Native, echoes.domain, Some("localhost")),
+        (VlessUdpEncoding::Xudp, echoes.domain, Some("localhost")),
     ] {
-        let mode_name = mode.as_str();
+        let mode_name = udp_encoding.as_str();
         let one_rtt = encrypted_node(
             xray_encrypted_port,
             &format!("xray-encrypted-{mode_name}-1rtt"),
-            mode,
+            udp_encoding,
             &encryption_1rtt,
         );
         udp_echo(
@@ -656,7 +839,7 @@ async fn official_xray_and_sing_box_vless_udp_loopback_interop() {
         let zero_rtt = encrypted_node(
             xray_encrypted_port,
             &format!("xray-encrypted-{mode_name}-0rtt"),
-            mode,
+            udp_encoding,
             &encryption_0rtt,
         );
         // The repeated connection reuses honk's public registry/handler and the same
@@ -675,6 +858,43 @@ async fn official_xray_and_sing_box_vless_udp_loopback_interop() {
         }
     }
 
+    let mut encrypted_vision = canonical_node(
+        xray_encrypted_vision_port,
+        "xray-encrypted-vision",
+        "&security=tls&sni=localhost&flow=xtls-rprx-vision-udp443&packetEncoding=auto&mux=xray&concurrency=-1&xudpConcurrency=4&xudpProxyUDP443=allow",
+    );
+    {
+        let vless = encrypted_vision.vless_mut().expect("VLESS config");
+        vless.encryption = Some(encryption_1rtt.clone());
+        assert_eq!(vless.tcp_path(), VlessTcpPath::Direct);
+        assert_eq!(vless.udp_path(443), Some(VlessUdpPath::CoolSeparate));
+    }
+    encrypted_vision
+        .tls_mut()
+        .expect("VLESS TLS config")
+        .skip_cert_verify = true;
+    encrypted_vision.id = encrypted_vision.derive_id();
+    encrypted_vision
+        .validate()
+        .expect("encrypted Vision mux node validates");
+    tls_tcp_echo(
+        &registry,
+        "xray-encrypted-vision-direct-tls13",
+        &encrypted_vision,
+        echoes.tls_tcp,
+        echoes.tls_root.clone(),
+    )
+    .await;
+    udp_echo(
+        &registry,
+        "xray-encrypted-vision-xudp-443",
+        &encrypted_vision,
+        echoes.native_v6_443,
+        None,
+        512,
+    )
+    .await;
     xray.assert_alive();
     sing_box.assert_alive();
+    bounded("echo fixture shutdown", echoes.finish()).await;
 }

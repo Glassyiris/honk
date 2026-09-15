@@ -531,7 +531,7 @@ async fn ephemeral_runtime_close_shuts_quic_client() {
     let runtime = tuic_ephemeral();
     let (_client, conn) = probe_client(&runtime, addr.port()).await;
     assert!(conn.close_reason().is_none());
-    assert!(runtime.is_warm_or_stateless());
+    assert!(runtime.is_warm_or_stateless_for(crate::proxy::WarmRequirement::Session));
 
     runtime.close().await;
     assert!(
@@ -539,7 +539,7 @@ async fn ephemeral_runtime_close_shuts_quic_client() {
         "closing the ephemeral runtime must close the probe connection"
     );
     assert!(
-        !runtime.is_warm_or_stateless(),
+        !runtime.is_warm_or_stateless_for(crate::proxy::WarmRequirement::Session),
         "a closed runtime no longer reports warm clients"
     );
 }

@@ -1,9 +1,10 @@
 //! Per-protocol facts: UDP support, pooling behavior, generation runtime
 //! ownership, and share-link schemes.
 
-use honk_config::node::{Node, WireMode};
+use honk_config::node::{Node, VlessTcpPath, VlessUdpPath};
 use honk_config::types::NodeProtocol;
 
+use crate::proxy::WarmRequirement;
 use crate::runtime::GenerationRuntime;
 
 /// Per-protocol facts. Function-typed fields cover per-node conditions:
@@ -25,6 +26,25 @@ impl ProtocolDescriptor {
 
     pub fn has_generation_runtime(&self, node: &Node) -> bool {
         self.generation_runtime(node) != GenerationRuntime::None
+    }
+
+    pub fn supports_warm(&self, node: &Node, requirement: WarmRequirement) -> bool {
+        if self.protocol == NodeProtocol::VLess {
+            let vless = node
+                .vless()
+                .expect("VLESS descriptor requires VLESS config");
+            return match requirement {
+                WarmRequirement::Session => {
+                    matches!(vless.tcp_path(), VlessTcpPath::H2 | VlessTcpPath::Cool)
+                }
+                WarmRequirement::Udp => matches!(
+                    vless.udp_path(0),
+                    Some(VlessUdpPath::H2 | VlessUdpPath::CoolShared | VlessUdpPath::CoolSeparate)
+                ),
+            };
+        }
+        self.has_generation_runtime(node)
+            && (requirement == WarmRequirement::Session || (self.supports_udp)(node))
     }
 }
 
@@ -64,20 +84,11 @@ fn vless_supports_udp(node: &Node) -> bool {
 }
 
 fn vless_pool_bare_tcp(node: &Node) -> bool {
-    matches!(
-        node.vless().unwrap().mode,
-        WireMode::Legacy | WireMode::Auto | WireMode::Native | WireMode::UotV2 | WireMode::Xudp
-    )
+    node.vless().unwrap().tcp_path() == VlessTcpPath::Direct
 }
 
-fn vless_runtime(node: &Node) -> GenerationRuntime {
-    match node.vless().unwrap().mode {
-        WireMode::H2mux | WireMode::H2muxPadded => GenerationRuntime::VlessH2Mux,
-        WireMode::MuxCool => GenerationRuntime::VlessCoolMux,
-        WireMode::Legacy | WireMode::Auto | WireMode::Native | WireMode::UotV2 | WireMode::Xudp => {
-            GenerationRuntime::None
-        }
-    }
+fn vless_runtime(_: &Node) -> GenerationRuntime {
+    GenerationRuntime::Vless
 }
 
 /// Poolable only on the plain TCP transport: `dial()` completes the TLS
@@ -192,12 +203,9 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
 ];
 
 /// Whether a selected node permits packets to the target port.
-///
-/// VLESS Vision's base flow reserves UDP/443 for TCP unless the explicit
-/// `-udp443` flow suffix opts in. Other protocols have no target-port policy.
 pub fn udp_target_allowed(node: &Node, port: u16) -> bool {
     node.vless()
-        .is_none_or(|vless| !vless.rejects_udp_port(port))
+        .is_none_or(|vless| vless.udp_path(port).is_some())
 }
 
 pub fn descriptor(protocol: NodeProtocol) -> &'static ProtocolDescriptor {
@@ -251,45 +259,67 @@ mod tests {
             NodeProtocol::Direct,
         ] {
             let node = node(protocol);
-            assert!(!descriptor(protocol).has_generation_runtime(&node));
+            assert_eq!(
+                descriptor(protocol).has_generation_runtime(&node),
+                protocol == NodeProtocol::VLess
+            );
         }
     }
 
     #[test]
-    fn vless_capabilities_follow_wire_mode() {
+    fn vless_capabilities_follow_selected_paths() {
+        use honk_config::node::{Udp443Policy, VlessMultiplex, VlessUdpMux};
+        use std::num::NonZeroU16;
+
         let descriptor = descriptor(NodeProtocol::VLess);
-        for (mode, udp, bare, runtime) in [
-            (WireMode::Legacy, false, true, GenerationRuntime::None),
-            (WireMode::Auto, true, true, GenerationRuntime::None),
-            (WireMode::Native, true, true, GenerationRuntime::None),
-            (WireMode::UotV2, true, true, GenerationRuntime::None),
-            (WireMode::Xudp, true, true, GenerationRuntime::None),
-            (WireMode::H2mux, true, false, GenerationRuntime::VlessH2Mux),
+        let limit = NonZeroU16::new(8).unwrap();
+        for (multiplex, bare, warm_tcp, warm_udp) in [
+            (VlessMultiplex::Off, true, false, false),
+            (VlessMultiplex::H2 { padding: false }, false, true, true),
             (
-                WireMode::H2muxPadded,
-                true,
+                VlessMultiplex::Xray {
+                    tcp: Some(limit),
+                    udp: VlessUdpMux::SharedTcp,
+                    udp443: Udp443Policy::Reject,
+                },
                 false,
-                GenerationRuntime::VlessH2Mux,
+                true,
+                true,
             ),
             (
-                WireMode::MuxCool,
+                VlessMultiplex::Xray {
+                    tcp: None,
+                    udp: VlessUdpMux::Separate(limit),
+                    udp443: Udp443Policy::Reject,
+                },
                 true,
                 false,
-                GenerationRuntime::VlessCoolMux,
+                true,
             ),
         ] {
             let node = Node {
                 outbound: honk_config::node::OutboundConfig::Vless(
                     honk_config::node::VlessConfig {
-                        mode,
+                        multiplex,
                         ..Default::default()
                     },
                 ),
                 ..Default::default()
             };
-            assert_eq!((descriptor.supports_udp)(&node), udp);
+            assert!((descriptor.supports_udp)(&node));
             assert_eq!((descriptor.pool_bare_tcp)(&node), bare);
-            assert_eq!(descriptor.generation_runtime(&node), runtime);
+            assert_eq!(
+                descriptor.generation_runtime(&node),
+                GenerationRuntime::Vless
+            );
+            assert_eq!(
+                descriptor.supports_warm(&node, WarmRequirement::Session),
+                warm_tcp
+            );
+            assert_eq!(
+                descriptor.supports_warm(&node, WarmRequirement::Udp),
+                warm_udp
+            );
         }
     }
 
@@ -319,7 +349,7 @@ mod tests {
         let vless = descriptor(NodeProtocol::VLess).supports_udp;
         let tcp_only = Node {
             outbound: honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
-                mode: WireMode::H2mux,
+                multiplex: honk_config::node::VlessMultiplex::H2 { padding: false },
                 network: Some("tcp".to_string()),
                 ..Default::default()
             }),
@@ -333,10 +363,17 @@ mod tests {
     }
 
     #[test]
-    fn vless_udp_target_policy_is_flow_scoped() {
+    fn vless_udp_443_policy_is_path_scoped() {
+        use honk_config::node::{Udp443Policy, VlessMultiplex, VlessUdpMux};
+        use std::num::NonZeroU16;
+
         let mut node = Node {
             outbound: honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
-                flow: Some("xtls-rprx-vision".into()),
+                multiplex: VlessMultiplex::Xray {
+                    tcp: Some(NonZeroU16::new(8).unwrap()),
+                    udp: VlessUdpMux::SharedTcp,
+                    udp443: Udp443Policy::Reject,
+                },
                 ..Default::default()
             }),
             ..Default::default()
@@ -344,7 +381,10 @@ mod tests {
         assert!(udp_target_allowed(&node, 53));
         assert!(!udp_target_allowed(&node, 443));
 
-        node.vless_mut().unwrap().flow = Some("xtls-rprx-vision-udp443".into());
+        let VlessMultiplex::Xray { udp443, .. } = &mut node.vless_mut().unwrap().multiplex else {
+            unreachable!()
+        };
+        *udp443 = Udp443Policy::Allow;
         assert!(udp_target_allowed(&node, 443));
         assert!(udp_target_allowed(&Node::default(), 443));
     }

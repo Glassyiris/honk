@@ -192,16 +192,21 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 } else {
                     Some(host.to_string())
                 };
-            let (runtime, ephemeral) =
-                match honk_outbound::urltest::try_probe_runtime(&generation, &node) {
-                    Ok(runtime) => runtime,
-                    Err(_) => {
-                        return honk_outbound::alive::HttpProbeResult::SetupFailure(
-                            "invalid node for health probe".into(),
-                        );
-                    }
-                };
-            let warm_feedback = if runtime.is_warm_or_stateless() {
+            let (runtime, ephemeral) = match honk_outbound::urltest::try_probe_runtime(
+                &generation,
+                &node,
+                honk_outbound::proxy::WarmRequirement::Session,
+            ) {
+                Ok(runtime) => runtime,
+                Err(_) => {
+                    return honk_outbound::alive::HttpProbeResult::SetupFailure(
+                        "invalid node for health probe".into(),
+                    );
+                }
+            };
+            let warm_feedback = if runtime
+                .is_warm_or_stateless_for(honk_outbound::proxy::WarmRequirement::Session)
+            {
                 None
             } else {
                 probe_feedback(
@@ -225,6 +230,9 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 .await
             {
                 close_ephemeral(ephemeral).await;
+                if let Some(rejection) = honk_outbound::proxy::packet_rejection(&error) {
+                    return honk_outbound::alive::HttpProbeResult::LocalRefusal(rejection);
+                }
                 return honk_outbound::alive::HttpProbeResult::SetupFailure(format!(
                     "warm failed: {error:#}"
                 ));
@@ -248,6 +256,9 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
             match result {
                 Ok(elapsed) => honk_outbound::alive::HttpProbeResult::WarmSuccess(elapsed),
                 Err(error) => {
+                    if let Some(rejection) = honk_outbound::proxy::packet_rejection(&error) {
+                        return honk_outbound::alive::HttpProbeResult::LocalRefusal(rejection);
+                    }
                     honk_outbound::alive::HttpProbeResult::ExchangeFailure(format!("{error:#}"))
                 }
             }
@@ -356,9 +367,11 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             let Some(node) = node else {
                 let error = format!("node '{}' not found", node_name_owned);
                 return honk_outbound::alive::UdpProbeOutcome {
-                    dns: dns_probe.is_some().then(|| Err(error.clone())),
+                    dns: dns_probe
+                        .as_ref()
+                        .map(|_| Err(anyhow::Error::msg(error.clone()))),
                     data_path: (dns_probe.is_none() && quic_score_target.is_some())
-                        .then_some(Err(error)),
+                        .then_some(Err(anyhow::Error::msg(error))),
                 };
             };
             let dns_allowed = dns_probe.as_ref().is_some_and(|(target, _)| {
@@ -368,8 +381,8 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                 honk_outbound::descriptor::udp_target_allowed(&node, target.addr.port())
             });
             let failed = |error: String| honk_outbound::alive::UdpProbeOutcome {
-                dns: dns_allowed.then(|| Err(error.clone())),
-                data_path: (!dns_allowed && data_allowed).then_some(Err(error)),
+                dns: dns_allowed.then(|| Err(anyhow::Error::msg(error.clone()))),
+                data_path: (!dns_allowed && data_allowed).then_some(Err(anyhow::Error::msg(error))),
             };
             if !dns_allowed && !data_allowed {
                 return honk_outbound::alive::UdpProbeOutcome {
@@ -395,11 +408,14 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                     Err(error) => return failed(error),
                 }
             };
-            let (runtime, ephemeral) =
-                match honk_outbound::urltest::try_probe_runtime(&generation, &node) {
-                    Ok(runtime) => runtime,
-                    Err(_) => return failed("invalid node for health probe".into()),
-                };
+            let (runtime, ephemeral) = match honk_outbound::urltest::try_probe_runtime(
+                &generation,
+                &node,
+                honk_outbound::proxy::WarmRequirement::Udp,
+            ) {
+                Ok(runtime) => runtime,
+                Err(_) => return failed("invalid node for health probe".into()),
+            };
             let dns = if dns_allowed {
                 let (dns_target, dns_identity) =
                     dns_probe.expect("allowed DNS probe requires a target");
@@ -436,11 +452,11 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                     }
                     Ok(Err(error)) => {
                         probe_finish(&reporter, ScoreOutcome::from_error(&error));
-                        Err(format!("UDP probe failed: {error}"))
+                        Err(error.context("UDP probe failed"))
                     }
                     Err(_) => {
                         probe_finish(&reporter, ScoreOutcome::Timeout);
-                        Err("UDP probe timeout".to_string())
+                        Err(anyhow::anyhow!("UDP probe timeout"))
                     }
                 })
             } else {
@@ -518,7 +534,7 @@ async fn score_quic_probe(
     group_manager: &SharedGroupManager,
     connect_timeout: Duration,
     timeout: Duration,
-) -> Option<Result<Duration, String>> {
+) -> Option<anyhow::Result<Duration>> {
     if !honk_outbound::descriptor::udp_target_allowed(node, target.addr.port()) {
         return None;
     }
@@ -560,13 +576,12 @@ async fn score_quic_probe(
             Ok(start.elapsed())
         }
         Ok(Err(error)) => {
-            let message = format!("{error}");
             probe_finish(&reporter, ScoreOutcome::from_error(&error));
-            Err(message)
+            Err(error)
         }
         Err(_) => {
             probe_finish(&reporter, ScoreOutcome::Timeout);
-            Err("Score QUIC probe timeout".to_string())
+            Err(anyhow::anyhow!("Score QUIC probe timeout"))
         }
     })
 }

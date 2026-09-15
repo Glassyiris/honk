@@ -261,7 +261,7 @@ fn test_parse_subscription_keeps_unique_nodes_with_duplicates() {
 #[test]
 fn test_parse_subscription_keeps_valid_sibling_after_intrinsic_rejection() {
     let invalid = "vless://00000000-0000-4000-8000-000000000001@h:443?encryption=e&type=ws&sni=ws&flow=xudp#a";
-    let valid = "vless://00000000-0000-4000-8000-000000000001@h:443?type=ws&sni=u&path=ws&vless_mode=xudp#b";
+    let valid = "vless://00000000-0000-4000-8000-000000000001@h:443?type=ws&sni=u&path=ws&packetEncoding=xudp#b";
     let sub = Subscription {
         sub_type: SubscriptionType::Simple,
         ..Default::default()

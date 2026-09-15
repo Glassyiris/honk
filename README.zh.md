@@ -32,11 +32,11 @@ global {
 
 该路径拥有 raw-netlink 队列 `320` 和 nftables 对象 `inet honk_nfqueue` / `udp_decision`；honk 运行期间，同一网络命名空间中的防火墙管理器必须保持这些对象不变。Direct 释放被保留的 skb，proxy 把一份保留的 payload 提交给正常 UDP 初始化器，block/取消则丢弃报文。ingest actor 最多保留 256 个报文和 8 MiB payload；每个报文从 listener 收到时起都保留固定的三秒绝对期限。启用 Clash API 后，`/stats.udp.nfqueue` 会暴露 actor 深度、字节数、最老年龄，以及明确的内核统计可用状态和读取失败数。完整不变量与指标 schema 见 [NFQUEUE 设计](doc/zh/design/nfqueue.md)和 [API 参考](doc/zh/reference/api.md)。
 
-## VLESS UDP、H2MUX 与 XUDP
+## VLESS UDP 与多路复用
 
-VLESS 分享链接默认使用 `vless_mode=auto`：普通 UDP 在 53/443 端口使用原生 VLESS，其他端口使用 Single XUDP；Vision 使用 Single XUDP。`udp=0` 关闭数据包，不改变 TCP。仍可显式选择 `native`、TCP-only `legacy`、`uot-v2`、`h2mux`、`h2mux-padded`、`xudp` 与 `mux-cool`；只有显式 mux 模式会池化逻辑 TCP stream。
+VLESS 现由三个独立选项组合：`udp=0|1` 控制 packet 权限，`packetEncoding=auto|none|xudp|uot-v2` 选择非复用 UDP 回退路径，`mux=off|h2mux|xray` 选择 carrier 多路复用。规范链接默认允许 UDP、使用 `packetEncoding=auto` 和 `mux=off`；例如 `vless://00000000-0000-4000-8000-000000000001@edge.example:443?security=tls&packetEncoding=auto&mux=off&udp=1#edge`。未启用 Vision 时，Auto 对 53/443 使用原生 VLESS UDP；其他获准目标使用 Single XUDP。
 
-基础 Vision 拒绝 UDP/443；`flow=xtls-rprx-vision-udp443` 放行该端口。VLESS Encryption 支持不带 flow、无复用池的 `legacy`、`auto`、`native` 与 `xudp`。不会协商 mode、回退或重放首包；本地策略和大小拒绝不影响健康。官方服务端本地夹具覆盖原生/自动 UDP、XUDP、Vision UDP443 与加密数据包交换。wire、生命周期和导入规则见[节点参考](doc/zh/reference/nodes.md#mode)。
+Vision 始终禁止 TCP 多路复用，但允许仅 UDP 的 Xray mux。基础 Vision 会在协议回退路径拒绝 UDP/443；实际 Xray UDP mux 只有 `allow` 策略能绕过该门槛。VLESS Encryption 可在 direct-TCP 与合法 XUDP/关闭 UDP 的路径规则下和 Vision 组合。Carrier 容量来自进程级文件描述符预算；容量耗尽属于本地且不影响健康的拒绝，不会触发回退或 packet 重放。XUDP Global ID 使用有作用域的所有权边界，不具备进程级无碰撞 NAT 语义。规范链接、迁移、组合及 REALITY 握手/pool 行为见[节点参考](doc/zh/reference/nodes.md#vless-udp-and-multiplexing)，生命周期及所有权见规范的 [VLESS 出站设计](doc/zh/design/outbound.md#sourcesession-ownership-and-capacity)。
 
 ## 使用本仓库前
 

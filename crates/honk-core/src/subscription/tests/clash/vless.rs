@@ -1,8 +1,10 @@
+use honk_config::node::{Udp443Policy, VlessMultiplex, VlessUdpEncoding};
+
 use super::*;
-use crate::subscription::clash::options::parse_vless_external_mode;
+use crate::subscription::clash::options::parse_vless_external_options;
 
 #[test]
-fn test_parse_clash_vless_modes() {
+fn clash_preserves_vless_packet_and_multiplex_wrappers() {
     let yaml = r#"
 proxies:
   - name: h2-default
@@ -36,9 +38,9 @@ proxies:
     udp_over_tcp:
       enabled: true
       version: 2
-  - name: legacy
+  - name: udp-disabled
     type: vless
-    server: legacy.example
+    server: disabled.example
     port: 443
     uuid: eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee
     smux:
@@ -56,28 +58,29 @@ proxies:
     let nodes = parse_clash_subscription(yaml, None).unwrap();
     assert_eq!(nodes.len(), 6);
     assert_eq!(
-        nodes[0].vless().unwrap().mode,
-        honk_config::node::WireMode::H2mux
-    );
-    assert_eq!(
-        nodes[1].vless().unwrap().mode,
-        honk_config::node::WireMode::H2muxPadded
-    );
-    assert_eq!(
-        nodes[2].vless().unwrap().mode,
-        honk_config::node::WireMode::UotV2
-    );
-    assert_eq!(
-        nodes[3].vless().unwrap().mode,
-        honk_config::node::WireMode::UotV2
-    );
-    assert_eq!(
-        nodes[4].vless().unwrap().mode,
-        honk_config::node::WireMode::Legacy
-    );
-    assert_eq!(
-        nodes[5].vless().unwrap().mode,
-        honk_config::node::WireMode::Xudp
+        nodes
+            .iter()
+            .map(|node| {
+                let config = node.vless().unwrap();
+                (config.udp_encoding, config.multiplex, config.udp_enabled())
+            })
+            .collect::<Vec<_>>(),
+        [
+            (
+                VlessUdpEncoding::Auto,
+                VlessMultiplex::H2 { padding: false },
+                true,
+            ),
+            (
+                VlessUdpEncoding::Auto,
+                VlessMultiplex::H2 { padding: true },
+                true,
+            ),
+            (VlessUdpEncoding::UotV2, VlessMultiplex::Off, true,),
+            (VlessUdpEncoding::UotV2, VlessMultiplex::Off, true,),
+            (VlessUdpEncoding::Auto, VlessMultiplex::Off, false,),
+            (VlessUdpEncoding::Auto, VlessMultiplex::Off, true,),
+        ]
     );
     assert_eq!(
         nodes[5].vless().unwrap().flow.as_deref(),
@@ -86,46 +89,142 @@ proxies:
 }
 
 #[test]
-fn test_external_vless_mode_representations() {
-    use honk_config::node::WireMode;
-
-    for (options, expected) in [
-        ("{}", WireMode::Legacy),
-        ("packet-encoding: ''", WireMode::Legacy),
-        ("packet-encoding: none", WireMode::Native),
-        ("packet-encoding: legacy", WireMode::Native),
-        ("packet_encoding: xudp", WireMode::Xudp),
-        ("xudp: true", WireMode::Xudp),
-        ("xudp: false", WireMode::Native),
-        ("udp: true\nxudp: true", WireMode::Xudp),
-        ("udp: true", WireMode::Xudp),
-        ("udp: true\npacket-encoding: ''", WireMode::Xudp),
-        ("udp: true\npacket-encoding: none", WireMode::Native),
-        ("udp: false\npacket-encoding: xudp", WireMode::Xudp),
+fn external_vless_options_preserve_clash_defaults() {
+    for (options, encoding, multiplex, udp_enabled) in [
+        ("{}", VlessUdpEncoding::Auto, VlessMultiplex::Off, false),
+        (
+            "packet-encoding: ''",
+            VlessUdpEncoding::Auto,
+            VlessMultiplex::Off,
+            false,
+        ),
+        (
+            "packet-encoding: none",
+            VlessUdpEncoding::Native,
+            VlessMultiplex::Off,
+            true,
+        ),
+        (
+            "packet-encoding: legacy",
+            VlessUdpEncoding::Native,
+            VlessMultiplex::Off,
+            true,
+        ),
+        (
+            "packet_encoding: xudp",
+            VlessUdpEncoding::Xudp,
+            VlessMultiplex::Off,
+            true,
+        ),
+        (
+            "xudp: true",
+            VlessUdpEncoding::Xudp,
+            VlessMultiplex::Off,
+            true,
+        ),
+        (
+            "xudp: false",
+            VlessUdpEncoding::Native,
+            VlessMultiplex::Off,
+            true,
+        ),
+        (
+            "udp: true",
+            VlessUdpEncoding::Xudp,
+            VlessMultiplex::Off,
+            true,
+        ),
+        (
+            "udp: true\npacket-encoding: ''",
+            VlessUdpEncoding::Xudp,
+            VlessMultiplex::Off,
+            true,
+        ),
+        (
+            "udp: true\npacket-encoding: none",
+            VlessUdpEncoding::Native,
+            VlessMultiplex::Off,
+            true,
+        ),
+        (
+            "udp: false\npacket-encoding: xudp",
+            VlessUdpEncoding::Xudp,
+            VlessMultiplex::Off,
+            false,
+        ),
         (
             "udp: false\nmultiplex: { enabled: true, protocol: h2mux }",
-            WireMode::H2mux,
+            VlessUdpEncoding::Auto,
+            VlessMultiplex::H2 { padding: false },
+            false,
         ),
         (
             "multiplex: { enabled: true, protocol: '', padding: false }",
-            WireMode::H2mux,
+            VlessUdpEncoding::Auto,
+            VlessMultiplex::H2 { padding: false },
+            true,
         ),
         (
             "multiplex: { enabled: true, padding: true }",
-            WireMode::H2muxPadded,
+            VlessUdpEncoding::Auto,
+            VlessMultiplex::H2 { padding: true },
+            true,
+        ),
+        (
+            "mux: { enabled: true }",
+            VlessUdpEncoding::Auto,
+            VlessMultiplex::xray(0, 0, Udp443Policy::Reject),
+            true,
+        ),
+        (
+            "mux: { enabled: true, concurrency: -1, xudpConcurrency: 0, xudpProxyUDP443: skip }",
+            VlessUdpEncoding::Auto,
+            VlessMultiplex::xray(-1, 0, Udp443Policy::Skip),
+            true,
+        ),
+        (
+            "packet-encoding: none\nmux: { enabled: true, concurrency: 0, xudpConcurrency: 0, xudpProxyUDP443: skip }",
+            VlessUdpEncoding::Native,
+            VlessMultiplex::xray(0, 0, Udp443Policy::Skip),
+            true,
         ),
     ] {
         let value: serde_yaml::Value = serde_yaml::from_str(options).unwrap();
         assert_eq!(
-            parse_vless_external_mode(value.as_mapping().unwrap()).unwrap(),
-            expected,
+            parse_vless_external_options(value.as_mapping().unwrap()).unwrap(),
+            (encoding, multiplex, udp_enabled),
             "{options}"
         );
     }
 }
 
 #[test]
-fn clash_vless_udp_defaults_to_xudp() {
+fn clash_projects_xray_mux_controls_into_canonical_config() {
+    let yaml = r#"proxies:
+  - name: xray-mux
+    type: vless
+    server: mux.example
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    mux:
+      enabled: true
+      concurrency: -1
+      xudpConcurrency: 4
+      xudpProxyUDP443: allow
+"#;
+    let nodes = parse_clash_subscription(yaml, None).unwrap();
+    let config = nodes[0].vless().unwrap();
+    assert_eq!(
+        config.multiplex,
+        VlessMultiplex::xray(-1, 4, Udp443Policy::Allow)
+    );
+    assert_eq!(config.udp_encoding, VlessUdpEncoding::Auto);
+    assert!(config.udp_enabled());
+    assert_eq!(nodes[0].id, nodes[0].derive_id());
+}
+
+#[test]
+fn clash_vless_udp_true_defaults_to_xudp() {
     let yaml = r#"proxies:
   - name: ordinary
     type: vless
@@ -135,18 +234,15 @@ fn clash_vless_udp_defaults_to_xudp() {
     udp: true
 "#;
     let nodes = parse_clash_subscription(yaml, None).unwrap();
-    assert_eq!(
-        nodes[0].vless().unwrap().mode,
-        honk_config::node::WireMode::Xudp
-    );
+    let config = nodes[0].vless().unwrap();
+    assert_eq!(config.udp_encoding, VlessUdpEncoding::Xudp);
+    assert_eq!(config.multiplex, VlessMultiplex::Off);
 }
 
 #[test]
 fn clash_vless_udp_gate_is_independent_from_selected_carrier() {
-    use honk_config::node::WireMode;
-
     let yaml = r#"proxies:
-  - {name: implicit-legacy, type: vless, server: legacy.example, port: 443, uuid: 00000000-0000-4000-8000-000000000041}
+  - {name: implicit-disabled, type: vless, server: disabled.example, port: 443, uuid: 00000000-0000-4000-8000-000000000041}
   - {name: source-xudp, type: vless, server: default.example, port: 443, uuid: 00000000-0000-4000-8000-000000000042, udp: true}
   - {name: native-enabled, type: vless, server: native.example, port: 443, uuid: 00000000-0000-4000-8000-000000000043, udp: true, packet-encoding: none}
   - {name: disabled-xudp, type: vless, server: xudp.example, port: 443, uuid: 00000000-0000-4000-8000-000000000044, udp: false, packet-encoding: xudp}
@@ -164,7 +260,7 @@ fn clash_vless_udp_gate_is_independent_from_selected_carrier() {
             .map(|node| node.name.as_str())
             .collect::<Vec<_>>(),
         [
-            "implicit-legacy",
+            "implicit-disabled",
             "source-xudp",
             "native-enabled",
             "disabled-xudp",
@@ -173,34 +269,33 @@ fn clash_vless_udp_gate_is_independent_from_selected_carrier() {
             "wrapper-precedence",
         ]
     );
-    let modes = nodes
-        .iter()
-        .map(|node| node.vless().unwrap().mode)
-        .collect::<Vec<_>>();
     assert_eq!(
-        modes,
+        nodes
+            .iter()
+            .map(|node| {
+                let config = node.vless().unwrap();
+                (config.udp_encoding, config.multiplex, config.udp_enabled())
+            })
+            .collect::<Vec<_>>(),
         [
-            WireMode::Legacy,
-            WireMode::Xudp,
-            WireMode::Native,
-            WireMode::Xudp,
-            WireMode::H2mux,
-            WireMode::Native,
-            WireMode::UotV2,
+            (VlessUdpEncoding::Auto, VlessMultiplex::Off, false),
+            (VlessUdpEncoding::Xudp, VlessMultiplex::Off, true),
+            (VlessUdpEncoding::Native, VlessMultiplex::Off, true),
+            (VlessUdpEncoding::Auto, VlessMultiplex::Off, false),
+            (
+                VlessUdpEncoding::Auto,
+                VlessMultiplex::H2 { padding: false },
+                false,
+            ),
+            (VlessUdpEncoding::Auto, VlessMultiplex::Off, false),
+            (VlessUdpEncoding::UotV2, VlessMultiplex::Off, true,),
         ]
     );
-    assert!(!nodes[0].vless().unwrap().udp_enabled());
-    assert!(nodes[1].vless().unwrap().udp_enabled());
-    assert!(nodes[2].vless().unwrap().udp_enabled());
-    assert!(!nodes[3].vless().unwrap().udp_enabled());
-    assert!(!nodes[4].vless().unwrap().udp_enabled());
-    assert!(!nodes[5].vless().unwrap().udp_enabled());
-    assert!(nodes[6].vless().unwrap().udp_enabled());
     assert!(nodes.iter().all(|node| node.id == node.derive_id()));
 }
 
 #[test]
-fn test_rejects_ambiguous_external_vless_modes() {
+fn rejects_ambiguous_external_vless_options() {
     for options in [
         "smux: { enabled: true }",
         "multiplex: { enabled: true, protocol: '' }",
@@ -212,7 +307,11 @@ fn test_rejects_ambiguous_external_vless_modes() {
         "packet-encoding: unsupported",
         "packet-addr: true",
         "mux: true",
-        "mux: { enabled: true }",
+        "mux: { enabled: true, concurrency: 32768 }",
+        "mux: { enabled: true, xudpProxyUDP443: false }",
+        "mux: { enabled: true, unknown: true }",
+        "mux: { enabled: true }\nsmux: { enabled: true, protocol: h2mux }",
+        "mux: { enabled: true }\nudp-over-tcp: true",
         "packet-encoding: xudp\nxudp: true",
         "packet-encoding: xudp\npacket_encoding: xudp",
         "packet-encoding: xudp\nsmux: { enabled: true }",
@@ -228,14 +327,14 @@ fn test_rejects_ambiguous_external_vless_modes() {
         let value: serde_yaml::Value = serde_yaml::from_str(options).unwrap();
         let mapping = value.as_mapping().unwrap();
         assert!(
-            parse_vless_external_mode(mapping).is_err(),
+            parse_vless_external_options(mapping).is_err(),
             "unsupported options must fail: {options}"
         );
     }
 }
 
 #[test]
-fn test_clash_import_skips_unsupported_vless_mode() {
+fn clash_import_skips_unsupported_vless_options() {
     let yaml = r#"
 proxies:
   - name: unsupported
@@ -273,10 +372,24 @@ proxies:
 }
 
 #[test]
+fn clash_rejects_removed_vless_mode_before_value_loss() {
+    let yaml = r#"proxies:
+  - {name: null, type: vless, server: null.example, port: 443, uuid: 00000000-0000-4000-8000-000000000061, vless_mode: null}
+  - {name: empty, type: vless, server: empty.example, port: 443, uuid: 00000000-0000-4000-8000-000000000062, vless_mode: ''}
+  - {name: false, type: vless, server: false.example, port: 443, uuid: 00000000-0000-4000-8000-000000000063, vless_mode: false}
+  - {name: old-value, type: vless, server: old.example, port: 443, uuid: 00000000-0000-4000-8000-000000000064, vless_mode: legacy}
+  - {name: vmess-unchanged, type: vmess, server: vmess.example, port: 443, uuid: 00000000-0000-4000-8000-000000000065, vless_mode: xudp}
+"#;
+    let nodes = parse_clash_subscription(yaml, None).unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].name, "vmess-unchanged");
+}
+
+#[test]
 fn empty_packet_encoding_does_not_shadow_xudp_declaration() {
     for (empty, enabled, expected) in [
-        ("", true, honk_config::node::WireMode::Xudp),
-        ("  ", false, honk_config::node::WireMode::Native),
+        ("", true, VlessUdpEncoding::Xudp),
+        ("  ", false, VlessUdpEncoding::Native),
     ] {
         let yaml = format!(
             r#"proxies:
@@ -290,6 +403,6 @@ fn empty_packet_encoding_does_not_shadow_xudp_declaration() {
 "#
         );
         let nodes = parse_clash_subscription(&yaml, None).unwrap();
-        assert_eq!(nodes[0].vless().unwrap().mode, expected);
+        assert_eq!(nodes[0].vless().unwrap().udp_encoding, expected);
     }
 }

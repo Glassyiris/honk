@@ -1,7 +1,10 @@
 //! Apply share-link query fields before validating and deriving node identity.
 
 use crate::error::ConfigError;
-use crate::node::{Hysteria2Config, Node, OutboundConfig, QuicOptions, VlessConfig};
+use crate::node::{
+    Hysteria2Config, Node, OutboundConfig, QuicOptions, Udp443Policy, VlessConfig, VlessMultiplex,
+    VlessUdpEncoding,
+};
 use crate::options::vocab::{
     coalesce_equal, optional_flow, optional_text, stream_transport, verification_text, vmess_cipher,
 };
@@ -55,7 +58,6 @@ pub(super) fn parse_query(
 ) -> Result<Query, ConfigError> {
     let shadowrocket_vmess = shadowrocket && protocol == NodeProtocol::VMess;
     let mut query = Query::default();
-    let mut mode_seen = false;
     for (key, value) in url.query_pairs() {
         let key = key.into_owned();
         if shadowrocket_vmess
@@ -82,15 +84,10 @@ pub(super) fn parse_query(
                 "duplicate VMess share-link parameter".into(),
             ));
         }
-        if protocol == NodeProtocol::VLess
-            && matches!(key.as_str(), "vless_mode" | "packetEncoding")
-        {
-            if mode_seen {
-                return Err(ConfigError::Parse(
-                    "duplicate VLESS share-link mode representation".into(),
-                ));
-            }
-            mode_seen = true;
+        if protocol == NodeProtocol::VLess && key == "vless_mode" {
+            return Err(ConfigError::Parse(
+                "VLESS vless_mode was removed; use packetEncoding and mux".into(),
+            ));
         }
         query.push(key, value.into_owned());
     }
@@ -535,7 +532,6 @@ fn apply_mtu(quic: &mut QuicOptions, query: &Query) {
 
 fn apply_vless(config: &mut VlessConfig, query: &Query) -> Result<(), ConfigError> {
     if let Some(parameter) = [
-        "mux",
         "smux",
         "multiplex",
         "udp-over-tcp",
@@ -561,22 +557,111 @@ fn apply_vless(config: &mut VlessConfig, query: &Query) -> Result<(), ConfigErro
     .find(|parameter| query.contains_key(parameter))
     {
         return Err(ConfigError::Parse(format!(
-            "unsupported VLESS share-link parameter '{parameter}'; use vless_mode"
+            "unsupported VLESS share-link parameter '{parameter}'"
         )));
     }
-    if let Some(mode) = query.get("vless_mode") {
-        config.mode = mode.parse()?;
-    } else if let Some(encoding) = query.get("packetEncoding") {
-        match encoding.as_str() {
-            "xudp" => config.mode = crate::node::WireMode::Xudp,
-            "none" => config.mode = crate::node::WireMode::Native,
-            _ => {
-                return Err(ConfigError::Parse(
-                    "unsupported VLESS packetEncoding (expected xudp or none)".into(),
-                ));
-            }
+    for parameter in [
+        "packetEncoding",
+        "mux",
+        "padding",
+        "concurrency",
+        "xudpConcurrency",
+        "xudpProxyUDP443",
+    ] {
+        if query.values(parameter).nth(1).is_some() {
+            return Err(ConfigError::Parse(format!(
+                "duplicate VLESS share-link parameter '{parameter}'"
+            )));
         }
     }
+
+    if let Some(encoding) = query.get("packetEncoding") {
+        config.udp_encoding = match encoding.as_str() {
+            "auto" => VlessUdpEncoding::Auto,
+            "none" => VlessUdpEncoding::Native,
+            "xudp" => VlessUdpEncoding::Xudp,
+            "uot-v2" => VlessUdpEncoding::UotV2,
+            _ => {
+                return Err(ConfigError::Parse(
+                    "unsupported VLESS packetEncoding (expected auto, none, xudp, or uot-v2)"
+                        .into(),
+                ));
+            }
+        };
+    }
+
+    let mux = query.get("mux").map(String::as_str).unwrap_or("off");
+    let xray_control = ["concurrency", "xudpConcurrency", "xudpProxyUDP443"]
+        .into_iter()
+        .find(|parameter| query.contains_key(parameter));
+    config.multiplex = match mux {
+        "off" => {
+            if let Some(parameter) = query
+                .contains_key("padding")
+                .then_some("padding")
+                .or(xray_control)
+            {
+                return Err(ConfigError::Parse(format!(
+                    "VLESS parameter '{parameter}' is inactive with mux=off"
+                )));
+            }
+            VlessMultiplex::Off
+        }
+        "h2mux" => {
+            if let Some(parameter) = xray_control {
+                return Err(ConfigError::Parse(format!(
+                    "VLESS parameter '{parameter}' requires mux=xray"
+                )));
+            }
+            let padding = match query.get("padding").map(String::as_str) {
+                None | Some("false") => false,
+                Some("true") => true,
+                Some(_) => {
+                    return Err(ConfigError::Parse(
+                        "unsupported VLESS padding (expected true or false)".into(),
+                    ));
+                }
+            };
+            VlessMultiplex::H2 { padding }
+        }
+        "xray" => {
+            if query.contains_key("padding") {
+                return Err(ConfigError::Parse(
+                    "VLESS padding requires mux=h2mux".into(),
+                ));
+            }
+            let concurrency = query
+                .get("concurrency")
+                .map(|value| value.parse::<i16>())
+                .transpose()
+                .map_err(|_| ConfigError::Parse("invalid VLESS concurrency".into()))?
+                .unwrap_or(0);
+            let xudp_concurrency = query
+                .get("xudpConcurrency")
+                .map(|value| value.parse::<i16>())
+                .transpose()
+                .map_err(|_| ConfigError::Parse("invalid VLESS xudpConcurrency".into()))?
+                .unwrap_or(0);
+            let udp443 = match query.get("xudpProxyUDP443").map(String::as_str) {
+                None | Some("reject") => Udp443Policy::Reject,
+                Some("skip") => Udp443Policy::Skip,
+                Some("allow") => Udp443Policy::Allow,
+                Some(_) => {
+                    return Err(ConfigError::Parse(
+                        "unsupported VLESS xudpProxyUDP443 (expected reject, skip, or allow)"
+                            .into(),
+                    ));
+                }
+            };
+            VlessMultiplex::xray(concurrency, xudp_concurrency, udp443)
+        }
+        _ => {
+            return Err(ConfigError::Parse(
+                "unsupported VLESS mux (expected off, h2mux, or xray)".into(),
+            ));
+        }
+    };
+
     if let Some(enabled) = coalesce_equal(
         query.values("udp").map(|value| {
             if value == "1" || value.eq_ignore_ascii_case("true") {

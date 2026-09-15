@@ -168,6 +168,11 @@ impl DetailedConfigError {
                     SettingPath::new("nodes").field("flow"),
                     "VLESS flow must be absent, xtls-rprx-vision, or xtls-rprx-vision-udp443; aliases must agree",
                 )),
+                "VLESS vless_mode was removed; use packetEncoding and mux" => Some((
+                    "removed-vless-mode",
+                    SettingPath::new("nodes").field("vless_mode"),
+                    "VLESS vless_mode was removed; use packetEncoding and mux",
+                )),
                 "dns.hosts_file was removed; use one or more use_host paths" => Some((
                     "removed-dns-hosts-file",
                     SettingPath::new("dns").field("hosts_file"),

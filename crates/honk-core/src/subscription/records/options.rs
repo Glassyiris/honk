@@ -15,6 +15,9 @@ impl RecordOptions {
         self.occurrences.push((key, value));
     }
 
+    pub(super) fn contains(&self, key: &str) -> bool {
+        self.occurrences.iter().any(|(name, _)| name == key)
+    }
     pub(super) fn remove(&mut self, key: &str) -> Option<String> {
         let index = self.occurrences.iter().rposition(|(name, _)| name == key)?;
         let value = self.occurrences.remove(index).1;

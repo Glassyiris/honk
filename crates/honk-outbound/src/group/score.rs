@@ -148,8 +148,12 @@ pub enum ScoreOutcome {
 
 impl ScoreOutcome {
     pub fn from_error(error: &anyhow::Error) -> Self {
-        if crate::proxy::is_packet_rejection(error) {
-            return Self::Rejected;
+        if let Some(rejection) = crate::proxy::packet_rejection(error) {
+            return if rejection == crate::proxy::PacketRejection::Cancelled {
+                Self::Cancelled
+            } else {
+                Self::Rejected
+            };
         }
         error
             .chain()

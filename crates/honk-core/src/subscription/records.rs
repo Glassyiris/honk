@@ -170,6 +170,9 @@ fn normalize_protocol(
     positions: &[String],
     mut options: RecordOptions,
 ) -> RecordResult<Mapping> {
+    if protocol == "vless" && options.contains("vless_mode") {
+        return Err("VLESS vless_mode was removed");
+    }
     consume_record_controls(protocol, &mut options)?;
     let mut map = base_mapping(protocol, name, server, port);
     apply_security(&mut map, dialect, protocol, &mut options)?;
@@ -444,7 +447,7 @@ fn apply_protocol(
             if dialect == Dialect::Named {
                 apply_transport(map, options, positions)?;
             }
-            apply_vless_mode(map, options)?;
+            apply_vless_packet_encoding(map, options)?;
         }
         "hysteria2" => {
             let auth = take_credential_alias(options, &["password", "auth"])?.or_else(|| {
@@ -741,7 +744,7 @@ fn tls_capable(protocol: &str) -> bool {
     )
 }
 
-fn apply_vless_mode(map: &mut Mapping, options: &mut RecordOptions) -> RecordResult<()> {
+fn apply_vless_packet_encoding(map: &mut Mapping, options: &mut RecordOptions) -> RecordResult<()> {
     for key in ["packet-addr", "packet_addr", "packetaddr"] {
         if let Some(value) = options.remove(key)
             && parse_bool(&value).ok_or("record boolean option is invalid")?

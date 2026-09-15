@@ -4,7 +4,9 @@
 use base64::Engine as _;
 use honk_config::Config;
 use honk_config::diagnostic::{SafeValue, Severity};
-use honk_config::node::Node;
+use honk_config::node::{
+    Node, Udp443Policy, VlessMultiplex, VlessUdpEncoding, VlessUdpMux, VlessUdpPath,
+};
 use honk_config::types::NodeProtocol;
 
 /// URL-safe base64 without padding (the encoding used by vmess links).
@@ -117,7 +119,8 @@ fn serialization_golden_node() -> Node {
         outbound: honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
             uuid: Some("00000000-0000-0000-0000-000000000001".into()),
             encryption: Some("none".into()),
-            mode: honk_config::node::WireMode::Xudp,
+            udp_encoding: VlessUdpEncoding::Xudp,
+            multiplex: VlessMultiplex::Off,
             flow: Some("xtls-rprx-vision".into()),
             network: Some("tcp,udp".into()),
             transport: honk_config::node::StreamTransportOptions {
@@ -612,41 +615,60 @@ fn test_config_json_round_trip() {
 }
 
 #[test]
-fn test_config_json_vless_mode_defaults_are_protocol_local() {
-    let mut config = Config::default();
-    config.nodes.push(
-        Node::from_share_link("vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?vless_mode=mux-cool#vless").unwrap(),
-    );
-    let json = config.to_json_string().unwrap();
-    let parsed = Config::from_json_str(&json).unwrap();
-    assert_eq!(
-        parsed.nodes[0].vless().unwrap().mode,
-        honk_config::node::WireMode::MuxCool
-    );
+fn test_config_vless_flat_fields_and_removed_key_rejection() {
+    let node = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?packetEncoding=xudp&mux=xray&xudpConcurrency=4&xudpProxyUDP443=allow#vless",
+    )
+    .unwrap();
+    let value = serde_json::to_value(&node).unwrap();
+    assert!(value.get("vless_mode").is_none());
+    assert_eq!(value["packet_encoding"], serde_json::json!("auto"));
+    assert_eq!(value["multiplex"]["protocol"], serde_json::json!("xray"));
+    let parsed: Node = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(parsed.outbound, node.outbound);
 
-    let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
-    value["nodes"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("vless_mode");
-    let parsed = Config::from_json_str(&value.to_string()).unwrap();
+    for removed in [serde_json::json!("legacy"), serde_json::Value::Null] {
+        let mut rejected = value.clone();
+        rejected["vless_mode"] = removed;
+        assert!(serde_json::from_value::<Node>(rejected).is_err());
+    }
+    for multiplex in [
+        serde_json::json!({ "protocol": "off", "padding": true }),
+        serde_json::json!({ "protocol": "h2", "tcp": 8 }),
+        serde_json::json!({ "protocol": "xray", "padding": true }),
+    ] {
+        let mut rejected = value.clone();
+        rejected["multiplex"] = multiplex;
+        assert!(serde_json::from_value::<Node>(rejected).is_err());
+    }
+    let yaml = serde_yaml::to_string(&node).unwrap();
     assert_eq!(
-        parsed.nodes[0].vless().unwrap().mode,
-        honk_config::node::WireMode::Auto
+        serde_yaml::from_str::<Node>(&yaml).unwrap().outbound,
+        node.outbound
     );
-
-    value["nodes"][0]["vless_mode"] = serde_json::json!("legacy");
-    let parsed = Config::from_json_str(&value.to_string()).unwrap();
+    assert!(serde_yaml::from_str::<Node>(&format!("{yaml}vless_mode: null\n")).is_err());
+    let encoded_toml = toml::to_string(&node).unwrap();
     assert_eq!(
-        parsed.nodes[0].vless().unwrap().mode,
-        honk_config::node::WireMode::Legacy
+        toml::from_str::<Node>(&encoded_toml).unwrap().outbound,
+        node.outbound
     );
+    let toml = r#"name = "vless"
+protocol = "vless"
+address = "example.com:443"
+host = "example.com"
+port = 443
+password = "b831381d-6324-4d53-ad4f-8cda48b30811"
+vless_mode = "legacy"
+"#;
+    assert!(toml::from_str::<Node>(toml).is_err());
 
     let anytls = Node::from_share_link("anytls://password@example.com:443").unwrap();
-    assert_eq!(
-        serde_json::to_value(anytls).unwrap()["vless_mode"],
-        serde_json::json!("legacy")
-    );
+    let mut neutral = serde_json::to_value(&anytls).unwrap();
+    assert_eq!(neutral["vless_mode"], serde_json::json!("legacy"));
+    assert!(neutral.get("packet_encoding").is_none());
+    assert!(neutral.get("multiplex").is_none());
+    neutral["vless_mode"] = serde_json::Value::Null;
+    serde_json::from_value::<Node>(neutral).unwrap();
 }
 
 #[test]
@@ -1197,70 +1219,68 @@ fn test_tuic_alpn_and_congestion_params() {
 }
 
 #[test]
-fn test_vless_mode_query() {
-    for (value, expected) in [
-        ("auto", honk_config::node::WireMode::Auto),
-        ("legacy", honk_config::node::WireMode::Legacy),
-        ("native", honk_config::node::WireMode::Native),
-        ("uot-v2", honk_config::node::WireMode::UotV2),
-        ("h2mux", honk_config::node::WireMode::H2mux),
-        ("h2mux-padded", honk_config::node::WireMode::H2muxPadded),
-        ("xudp", honk_config::node::WireMode::Xudp),
-        ("mux-cool", honk_config::node::WireMode::MuxCool),
+fn test_vless_packet_encoding_query() {
+    for (query, expected) in [
+        ("", VlessUdpEncoding::Auto),
+        ("packetEncoding=auto", VlessUdpEncoding::Auto),
+        ("packetEncoding=none", VlessUdpEncoding::Native),
+        ("packetEncoding=xudp", VlessUdpEncoding::Xudp),
+        ("packetEncoding=uot-v2", VlessUdpEncoding::UotV2),
     ] {
         let node = Node::from_share_link(&format!(
-            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?vless_mode={value}#node"
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?{query}#node"
         ))
         .unwrap();
-        assert_eq!(node.vless().unwrap().mode, expected);
+        assert_eq!(node.vless().unwrap().udp_encoding, expected);
     }
-    let automatic =
-        Node::from_share_link("vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443#node")
-            .unwrap();
-    assert_eq!(
-        automatic.vless().unwrap().mode,
-        honk_config::node::WireMode::Auto
-    );
-    let xudp = Node::from_share_link(
-        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?packetEncoding=xudp#node",
+}
+
+#[test]
+fn test_vless_mux_query() {
+    let h2 = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?mux=h2mux&padding=true#node",
     )
     .unwrap();
     assert_eq!(
-        xudp.vless().unwrap().mode,
-        honk_config::node::WireMode::Xudp
+        h2.vless().unwrap().multiplex,
+        VlessMultiplex::H2 { padding: true }
     );
 
-    let native = Node::from_share_link(
-        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?packetEncoding=none#node",
+    let xray = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?mux=xray&concurrency=-1&xudpConcurrency=7&xudpProxyUDP443=allow#node",
     )
     .unwrap();
     assert_eq!(
-        native.vless().unwrap().mode,
-        honk_config::node::WireMode::Native
-    );
-
-    assert!(
-        Node::from_share_link(
-            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?vless_mode=smux#node"
-        )
-        .is_err()
+        xray.vless().unwrap().multiplex,
+        VlessMultiplex::Xray {
+            tcp: None,
+            udp: VlessUdpMux::Separate(std::num::NonZeroU16::new(7).unwrap()),
+            udp443: Udp443Policy::Allow,
+        }
     );
 }
 
 #[test]
-fn test_vless_mode_query_rejects_duplicates() {
-    assert!(
-        Node::from_share_link(
-            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?vless_mode=xudp&vless_mode=legacy#node",
-        )
-        .is_err()
-    );
-    assert!(
-        Node::from_share_link(
-            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?vless_mode=xudp&packetEncoding=xudp#node",
-        )
-        .is_err()
-    );
+fn test_vless_canonical_query_rejects_removed_duplicate_and_inactive_fields() {
+    for query in [
+        "vless_mode=",
+        "vless_mode=legacy",
+        "vless_mode=xudp",
+        "packetEncoding=xudp&packetEncoding=xudp",
+        "mux=off&padding=false",
+        "mux=h2mux&concurrency=8",
+        "mux=xray&padding=false",
+        "mux=xray&concurrency=32768",
+        "mux=xray&xudpProxyUDP443=proxy",
+    ] {
+        assert!(
+            Node::from_share_link(&format!(
+                "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?{query}#node"
+            ))
+            .is_err(),
+            "{query}"
+        );
+    }
 }
 
 #[test]
@@ -1317,7 +1337,6 @@ fn test_packet_encoding_none_is_a_noop_on_other_protocols() {
 fn test_vless_share_link_rejects_external_mux_fields() {
     for parameter in [
         "smux=h2mux",
-        "mux=",
         "udp-over-tcp=1",
         "packet-encoding=xudp",
         "only-tcp=1",
@@ -1524,34 +1543,44 @@ fn test_vless_encryption_param_and_identity() {
     );
     assert_ne!(plain.id, encrypted.id);
 
-    for mode in ["legacy", "auto", "native", "xudp"] {
+    for query in ["packetEncoding=none", "packetEncoding=xudp", "mux=xray"] {
         Node::from_share_link(&format!(
-            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?vless_mode={mode}&encryption={encryption}"
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?{query}&encryption={encryption}"
         ))
         .unwrap();
     }
-    for mode in ["uot-v2", "h2mux", "h2mux-padded", "mux-cool"] {
+    for query in ["packetEncoding=uot-v2", "mux=h2mux"] {
         assert!(
             Node::from_share_link(&format!(
-                "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?vless_mode={mode}&encryption={encryption}"
+                "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?{query}&encryption={encryption}"
             ))
             .is_err(),
-            "{mode}"
+            "{query}"
         );
     }
 }
 
 #[test]
-fn test_validate_rejects_vless_encryption_with_flow() {
+fn test_vless_encryption_with_vision_uses_supported_paths() {
     let encryption = "mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    let mut node = Node::from_share_link(&format!(
-        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&encryption={encryption}#encrypted-flow"
+    for options in [
+        "",
+        "&type=ws&path=%2Fvision&host=cdn.example",
+        "&type=grpc&serviceName=vision",
+        "&mux=xray&concurrency=-1&xudpConcurrency=4",
+    ] {
+        Node::from_share_link(&format!(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&flow=xtls-rprx-vision&encryption={encryption}{options}#encrypted-flow"
+        ))
+        .unwrap();
+    }
+    Node::from_share_link(&format!(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?flow=xtls-rprx-vision&encryption={encryption}#encrypted-flow"
     ))
     .unwrap();
-    node.vless_mut().unwrap().flow = Some("xtls-rprx-vision".into());
-    let mut config = Config::default();
-    config.nodes.push(node);
-    assert!(config.validate().is_err());
+    assert!(Node::from_share_link(&format!(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&flow=xtls-rprx-vision&encryption={encryption}&mux=xray"
+    )).is_err());
 }
 
 #[test]
@@ -1632,7 +1661,7 @@ fn test_validate_flow_rejects_unknown_value() {
 }
 
 #[test]
-fn test_vless_vision_suffix_and_tcp_only_native_admission() {
+fn test_vless_vision_udp443_and_unreachable_native_fallback() {
     let opted_in = Node::from_share_link(
         "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&flow=xtls-rprx-vision-udp443",
     )
@@ -1641,21 +1670,23 @@ fn test_vless_vision_suffix_and_tcp_only_native_admission() {
     assert_eq!(vless.flow.as_deref(), Some("xtls-rprx-vision-udp443"));
     assert_eq!(vless.wire_flow(), Some("xtls-rprx-vision"));
     assert!(vless.is_vision());
-    assert!(!vless.rejects_udp_port(443));
+    assert_eq!(vless.udp_path(443), Some(VlessUdpPath::Xudp));
 
-    let tcp_only = Node::from_share_link(
-        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&vless_mode=native&udp=false&flow=xtls-rprx-vision",
+    let base = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&flow=xtls-rprx-vision",
     )
     .unwrap();
-    assert_eq!(
-        tcp_only.vless().unwrap().mode,
-        honk_config::node::WireMode::Native
-    );
+    assert_eq!(base.vless().unwrap().udp_path(443), None);
+
+    let tcp_only = Node::from_share_link(
+        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&packetEncoding=none&udp=false&flow=xtls-rprx-vision",
+    )
+    .unwrap();
     assert!(!tcp_only.vless().unwrap().udp_enabled());
 
     assert!(
         Node::from_share_link(
-            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&vless_mode=native&flow=xtls-rprx-vision"
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&packetEncoding=none&flow=xtls-rprx-vision"
         )
         .is_err()
     );

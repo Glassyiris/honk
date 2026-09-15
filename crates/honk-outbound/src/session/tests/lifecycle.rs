@@ -44,6 +44,45 @@ async fn caller_cancel_does_not_stop_shared_dial() {
     assert_eq!(pool.pool.lock().dial_failures, 0);
 }
 
+#[tokio::test(start_paused = true)]
+async fn shared_dial_waiters_preserve_typed_capacity_rejection() {
+    let pool = Arc::new(pool(SessionPoolConfig::default()));
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    let leader_pool = Arc::clone(&pool);
+    let leader = tokio::spawn(async move {
+        leader_pool
+            .offer(move || async move {
+                blocked.await.unwrap();
+                Err(anyhow::Error::new(crate::proxy::PacketRejection::Capacity))
+            })
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let waiter_pool = Arc::clone(&pool);
+    let waiter = tokio::spawn(async move {
+        waiter_pool
+            .offer(|| async { unreachable!("waiter must share the in-flight dial") })
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    release.send(()).unwrap();
+
+    for result in [leader.await.unwrap(), waiter.await.unwrap()] {
+        let error = result.unwrap_err();
+        assert!(error.chain().any(|cause| matches!(
+            cause.downcast_ref::<crate::proxy::PacketRejection>(),
+            Some(crate::proxy::PacketRejection::Capacity)
+        )));
+    }
+    assert_eq!(pool.pool.lock().dial_failures, 0);
+    assert!(pool.pool.lock().next_dial_at.is_none());
+    let session = pool
+        .offer(|| async { Ok(TestSession::new()) })
+        .await
+        .expect("released capacity must admit without a synthetic backoff");
+    assert!(!session.is_closed());
+}
+
 /// v2: a panicking dial surfaces as an internal failure to every
 /// waiter; the inflight entry clears and the next offer re-dials.
 #[tokio::test(start_paused = true)]

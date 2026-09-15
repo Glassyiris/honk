@@ -744,10 +744,10 @@ impl ControlPlane {
                     interval.tick().await;
                     let generation = runtime_registry.read().clone();
                     let now = std::time::Instant::now();
-                    let evicted = generation.reap_tls_connectors(now)
-                        + dns_runtime.acquire().runtime().reap_tls_connectors(now);
+                    let evicted = generation.reap_idle_resources(now)
+                        + dns_runtime.acquire().runtime().reap_idle_resources(now);
                     if evicted > 0 {
-                        debug!(evicted, "released idle outbound TLS connectors");
+                        debug!(evicted, "released idle outbound resources");
                     }
                 }
             });
