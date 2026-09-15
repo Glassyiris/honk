@@ -347,6 +347,20 @@ impl FlatNode {
             vless_mode
         );
         strip!(
+            self.protocol != NodeProtocol::VLess
+                && self
+                    .packet_encoding
+                    .is_some_and(|encoding| encoding != VlessUdpEncoding::Auto),
+            packet_encoding
+        );
+        strip!(
+            self.protocol != NodeProtocol::VLess
+                && self
+                    .multiplex
+                    .is_some_and(|multiplex| multiplex != VlessMultiplex::Off),
+            multiplex
+        );
+        strip!(
             self.plugin.is_some() && self.protocol != NodeProtocol::SS,
             plugin
         );
@@ -513,10 +527,6 @@ impl FlatNode {
                 setting.clone().field("vless_mode"),
                 "VLESS vless_mode was removed; use packet_encoding and multiplex",
             ));
-        }
-        if self.protocol != NodeProtocol::VLess {
-            self.packet_encoding = None;
-            self.multiplex = None;
         }
         self.strip_protocol_incompatible_fields(diagnostics, source, setting);
         if self.protocol == NodeProtocol::VMess {
