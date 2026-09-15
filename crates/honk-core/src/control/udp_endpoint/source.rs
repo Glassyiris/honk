@@ -18,7 +18,7 @@ enum ReplyProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct SourceScope {
+pub(in crate::control) struct SourceScope {
     runtime: usize,
     client: SocketAddr,
     path: VlessUdpPath,
@@ -363,114 +363,125 @@ impl Drop for SourceAttachment {
     }
 }
 
-pub(in crate::control) struct VlessSourcePreparation {
-    scope: SourceScope,
-    prepared: Option<PreparedUdpTransport<VlessXudpTransport>>,
-    attachment: Option<SourceAttachment>,
-    source_permit: Option<OwnedSemaphorePermit>,
-    runtime: Arc<NodeRuntime>,
-    alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
-    stats: Arc<StatsManager>,
-    node_id: uuid::Uuid,
-    node_name: String,
-    health_family: honk_outbound::alive::IpVersion,
+pub(in crate::control) enum VlessSourcePreparation {
+    Reused(SourceAttachment),
+    Fresh {
+        scope: SourceScope,
+        prepared: PreparedUdpTransport<VlessXudpTransport>,
+        source_permit: OwnedSemaphorePermit,
+        runtime: Arc<NodeRuntime>,
+        alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
+        stats: Arc<StatsManager>,
+        node_id: uuid::Uuid,
+        node_name: String,
+        health_family: honk_outbound::alive::IpVersion,
+    },
 }
 
 impl VlessSourcePreparation {
     #[cfg(test)]
     pub(super) fn attached_owner(&self) -> Option<Arc<SourceOwner>> {
-        self.attachment.as_ref().map(SourceAttachment::owner)
+        match self {
+            Self::Reused(attachment) => Some(attachment.owner()),
+            Self::Fresh { .. } => None,
+        }
     }
 
     pub(in crate::control) async fn commit(
-        mut self,
+        self,
         pool: &Arc<UdpEndpointPool>,
     ) -> anyhow::Result<SourceAttachment> {
-        if let Some(attachment) = self.attachment.take() {
-            if attachment.owner.is_ready() {
-                return Ok(attachment);
-            }
-            return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
-        }
-
-        let mut transport = None;
-        loop {
-            if pool.terminal.load(Ordering::Acquire) {
-                return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
-            }
-            let changed = pool.source_changed.notified();
-            if let Some(owner) = pool
-                .sources
-                .get(&self.scope)
-                .map(|entry| Arc::clone(entry.value()))
-            {
-                if let Some(attachment) = owner.attach() {
-                    return Ok(attachment);
+        match self {
+            Self::Reused(attachment) => {
+                if attachment.owner.is_ready() {
+                    Ok(attachment)
+                } else {
+                    Err(honk_outbound::proxy::PacketRejection::Cancelled.into())
                 }
-                changed.await;
-                continue;
             }
-
-            if transport.is_none() {
-                transport = Some(
-                    self.prepared
-                        .take()
-                        .expect("uncommitted VLESS source preparation must own a transport")
-                        .commit()
-                        .await?,
-                );
-            }
-
-            {
-                let mut tasks = pool.source_tasks.lock();
-                while let Some(result) = tasks.tasks.try_join_next() {
-                    if let Err(error) = result {
-                        debug!("VLESS UDP source receiver join failed: {}", error);
+            Self::Fresh {
+                scope,
+                prepared,
+                source_permit,
+                runtime,
+                alive_set,
+                stats,
+                node_id,
+                node_name,
+                health_family,
+            } => {
+                let mut prepared = Some(prepared);
+                let mut transport = None;
+                loop {
+                    if pool.terminal.load(Ordering::Acquire) {
+                        return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
                     }
-                }
-                if tasks.closed || pool.terminal.load(Ordering::Acquire) {
-                    return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
-                }
-                match pool.sources.entry(self.scope.clone()) {
-                    dashmap::mapref::entry::Entry::Occupied(entry) => {
-                        let owner = Arc::clone(entry.get());
-                        drop(entry);
-                        drop(tasks);
+                    let changed = pool.source_changed.notified();
+                    if let Some(owner) = pool
+                        .sources
+                        .get(&scope)
+                        .map(|entry| Arc::clone(entry.value()))
+                    {
                         if let Some(attachment) = owner.attach() {
                             return Ok(attachment);
                         }
+                        changed.await;
+                        continue;
                     }
-                    dashmap::mapref::entry::Entry::Vacant(entry) => {
-                        let owner = SourceOwner::new(
-                            pool.next_source_owner.fetch_add(1, Ordering::Relaxed),
-                            self.scope.clone(),
-                            transport.take().expect("prepared VLESS source transport"),
-                            Arc::clone(&self.runtime),
-                            pool,
-                            Arc::clone(&self.alive_set),
-                            self.node_id,
-                            self.health_family,
-                            self.stats.outbound_tracker(&self.node_name),
-                            Arc::clone(&self.stats),
-                            self.source_permit
-                                .take()
-                                .expect("prepared VLESS source permit"),
-                        );
-                        entry.insert(Arc::clone(&owner));
-                        drop(
-                            tasks
-                                .tasks
-                                .spawn(run_source_receiver(Arc::clone(pool), Arc::clone(&owner))),
-                        );
-                        drop(tasks);
-                        return Ok(SourceAttachment {
-                            owner,
-                            committed: false,
-                        });
+
+                    if let Some(prepared) = prepared.take() {
+                        transport = Some(prepared.commit().await?);
                     }
+
+                    {
+                        let mut tasks = pool.source_tasks.lock();
+                        while let Some(result) = tasks.tasks.try_join_next() {
+                            if let Err(error) = result {
+                                debug!("VLESS UDP source receiver join failed: {}", error);
+                            }
+                        }
+                        if tasks.closed || pool.terminal.load(Ordering::Acquire) {
+                            return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
+                        }
+                        match pool.sources.entry(scope.clone()) {
+                            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                                let owner = Arc::clone(entry.get());
+                                drop(entry);
+                                drop(tasks);
+                                if let Some(attachment) = owner.attach() {
+                                    return Ok(attachment);
+                                }
+                            }
+                            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                                let owner = SourceOwner::new(
+                                    pool.next_source_owner.fetch_add(1, Ordering::Relaxed),
+                                    scope.clone(),
+                                    transport.expect("prepared VLESS source transport"),
+                                    runtime,
+                                    pool,
+                                    alive_set,
+                                    node_id,
+                                    health_family,
+                                    stats.outbound_tracker(&node_name),
+                                    stats,
+                                    source_permit,
+                                );
+                                entry.insert(Arc::clone(&owner));
+                                drop(tasks.tasks.spawn(run_source_receiver(
+                                    Arc::clone(pool),
+                                    Arc::clone(&owner),
+                                )));
+                                drop(tasks);
+                                return Ok(SourceAttachment {
+                                    owner,
+                                    committed: false,
+                                });
+                            }
+                        }
+                    }
+                    changed.await;
                 }
             }
-            changed.await;
         }
     }
 }
@@ -784,18 +795,7 @@ impl UdpEndpointPool {
                 .map(|entry| Arc::clone(entry.value()))
             {
                 if let Some(attachment) = owner.attach() {
-                    return Ok(VlessSourcePreparation {
-                        scope,
-                        prepared: None,
-                        attachment: Some(attachment),
-                        source_permit: None,
-                        runtime: Arc::clone(&runtime),
-                        alive_set,
-                        stats,
-                        node_id: runtime.node.id,
-                        node_name: runtime.node.name.clone(),
-                        health_family,
-                    });
+                    return Ok(VlessSourcePreparation::Reused(attachment));
                 }
                 changed.await;
                 continue;
@@ -818,11 +818,10 @@ impl UdpEndpointPool {
             if generation.is_shutdown() {
                 return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
             }
-            return Ok(VlessSourcePreparation {
+            return Ok(VlessSourcePreparation::Fresh {
                 scope,
-                prepared: Some(prepared),
-                attachment: None,
-                source_permit: Some(source_permit),
+                prepared,
+                source_permit,
                 runtime: Arc::clone(&runtime),
                 alive_set,
                 stats,
