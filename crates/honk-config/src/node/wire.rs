@@ -1,5 +1,4 @@
 use serde::de::{DeserializeSeed, Error as _};
-use serde::ser::SerializeStruct as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::validation::ValidationFailure;
@@ -691,18 +690,30 @@ impl FlatNode {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize)]
+#[serde(rename = "Node")]
 struct WireOptions<'a> {
+    id: uuid::Uuid,
+    name: &'a str,
+    protocol: NodeProtocol,
+    address: &'a str,
+    host: &'a str,
+    port: u16,
     username: Option<&'a str>,
     password: Option<&'a str>,
     encryption: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vless_mode: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     packet_encoding: Option<VlessUdpEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     multiplex: Option<&'a VlessMultiplex>,
     plugin: Option<&'a str>,
     plugin_opts: Option<&'a str>,
     transport: &'a str,
     tls: bool,
     sni: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tls_alpn: Option<&'a [String]>,
     skip_cert_verify: bool,
     ech_enabled: bool,
@@ -739,6 +750,12 @@ struct WireOptions<'a> {
     anytls_min_idle_session: Option<usize>,
     anytls_idle_session_check_interval: Option<u64>,
     anytls_idle_session_timeout: Option<u64>,
+    mark: Option<u32>,
+    tags: &'a [String],
+    subscription_id: Option<uuid::Uuid>,
+    group_id: Option<uuid::Uuid>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl<'a> WireOptions<'a> {
@@ -765,7 +782,20 @@ impl<'a> WireOptions<'a> {
 
     fn from_node(node: &'a Node) -> Self {
         let mut wire = Self {
+            id: node.id,
+            name: &node.name,
+            protocol: node.protocol(),
+            address: &node.address,
+            host: &node.host,
+            port: node.port,
+            vless_mode: (node.protocol() != NodeProtocol::VLess).then_some("legacy"),
             transport: "tcp",
+            mark: node.mark,
+            tags: &node.tags,
+            subscription_id: node.subscription_id,
+            group_id: node.group_id,
+            created_at: node.created_at,
+            updated_at: node.updated_at,
             ..Self::default()
         };
         match &node.outbound {
@@ -860,92 +890,7 @@ impl Serialize for Node {
     where
         S: Serializer,
     {
-        let wire = WireOptions::from_node(self);
-        let vless = self.protocol() == NodeProtocol::VLess;
-        let mut state = serializer.serialize_struct(
-            "Node",
-            56 + usize::from(vless) + usize::from(wire.tls_alpn.is_some()),
-        )?;
-        state.serialize_field("id", &self.id)?;
-        state.serialize_field("name", &self.name)?;
-        state.serialize_field("protocol", &self.protocol())?;
-        state.serialize_field("address", &self.address)?;
-        state.serialize_field("host", &self.host)?;
-        state.serialize_field("port", &self.port)?;
-        state.serialize_field("username", &wire.username)?;
-        state.serialize_field("password", &wire.password)?;
-        state.serialize_field("encryption", &wire.encryption)?;
-        if vless {
-            state.serialize_field("packet_encoding", &wire.packet_encoding)?;
-            state.serialize_field("multiplex", &wire.multiplex)?;
-        } else {
-            state.serialize_field("vless_mode", "legacy")?;
-        }
-        state.serialize_field("plugin", &wire.plugin)?;
-        state.serialize_field("plugin_opts", &wire.plugin_opts)?;
-        state.serialize_field("transport", wire.transport)?;
-        state.serialize_field("tls", &wire.tls)?;
-        state.serialize_field("sni", &wire.sni)?;
-        if let Some(tls_alpn) = wire.tls_alpn {
-            state.serialize_field("tls_alpn", tls_alpn)?;
-        }
-        state.serialize_field("skip_cert_verify", &wire.skip_cert_verify)?;
-        state.serialize_field("ech_enabled", &wire.ech_enabled)?;
-        state.serialize_field("ech_config", &wire.ech_config)?;
-        state.serialize_field("ech_config_path", &wire.ech_config_path)?;
-        state.serialize_field("reality_public_key", &wire.reality_public_key)?;
-        state.serialize_field("reality_short_id", &wire.reality_short_id)?;
-        state.serialize_field("reality_spider_x", &wire.reality_spider_x)?;
-        state.serialize_field("flow", &wire.flow)?;
-        state.serialize_field("network", &wire.network)?;
-        state.serialize_field("ws_path", &wire.ws_path)?;
-        state.serialize_field("ws_host", &wire.ws_host)?;
-        state.serialize_field("grpc_service", &wire.grpc_service)?;
-        state.serialize_field("hy2_auth", &wire.hy2_auth)?;
-        state.serialize_field("hy2_obfs", &wire.hy2_obfs)?;
-        state.serialize_field("hy2_up_mbps", &wire.hy2_up_mbps)?;
-        state.serialize_field("hy2_down_mbps", &wire.hy2_down_mbps)?;
-        state.serialize_field("hy2_port_hopping", &wire.hy2_port_hopping)?;
-        state.serialize_field("hy2_hop_interval", &wire.hy2_hop_interval)?;
-        state.serialize_field("tls_pin_sha256", &wire.tls_pin_sha256)?;
-        state.serialize_field(
-            "hy2_init_stream_recv_window",
-            &wire.hy2_init_stream_recv_window,
-        )?;
-        state.serialize_field("hy2_init_conn_recv_window", &wire.hy2_init_conn_recv_window)?;
-        state.serialize_field("hy2_disable_mtu_discovery", &wire.hy2_disable_mtu_discovery)?;
-        state.serialize_field("quic_mtu", &wire.quic_mtu)?;
-        state.serialize_field("tuic_uuid", &wire.tuic_uuid)?;
-        state.serialize_field("tuic_password", &wire.tuic_password)?;
-        state.serialize_field("tuic_congestion", &wire.tuic_congestion)?;
-        state.serialize_field("tuic_alpn", &wire.tuic_alpn)?;
-        state.serialize_field(
-            "tuic_init_stream_recv_window",
-            &wire.tuic_init_stream_recv_window,
-        )?;
-        state.serialize_field(
-            "tuic_init_conn_recv_window",
-            &wire.tuic_init_conn_recv_window,
-        )?;
-        state.serialize_field("juicity_uuid", &wire.juicity_uuid)?;
-        state.serialize_field("juicity_password", &wire.juicity_password)?;
-        state.serialize_field("anytls_password", &wire.anytls_password)?;
-        state.serialize_field("anytls_min_idle_session", &wire.anytls_min_idle_session)?;
-        state.serialize_field(
-            "anytls_idle_session_check_interval",
-            &wire.anytls_idle_session_check_interval,
-        )?;
-        state.serialize_field(
-            "anytls_idle_session_timeout",
-            &wire.anytls_idle_session_timeout,
-        )?;
-        state.serialize_field("mark", &self.mark)?;
-        state.serialize_field("tags", &self.tags)?;
-        state.serialize_field("subscription_id", &self.subscription_id)?;
-        state.serialize_field("group_id", &self.group_id)?;
-        state.serialize_field("created_at", &self.created_at)?;
-        state.serialize_field("updated_at", &self.updated_at)?;
-        state.end()
+        WireOptions::from_node(self).serialize(serializer)
     }
 }
 
