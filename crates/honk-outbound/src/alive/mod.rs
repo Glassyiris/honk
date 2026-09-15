@@ -139,7 +139,7 @@ pub type HttpProberRef = Arc<dyn HttpProber>;
 #[derive(Debug)]
 pub struct UdpProbeOutcome {
     /// Round-trip of the minimal DNS query through the node's UDP transport;
-    /// `None` when target policy skips the configured DNS endpoint.
+    /// `None` when target policy skips it or local target initialization is still pending.
     pub dns: Option<anyhow::Result<Duration>>,
     /// Independent data-path handshake result; `None` when not run (no HTTPS
     /// check URL, no Score group, or target policy skips it).

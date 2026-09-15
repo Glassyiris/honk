@@ -700,25 +700,18 @@ impl ControlPlane {
                         })
                     })
                 };
-                let dns_probe = match resolve_udp_check_target(&dns_raw, Some(resolver.clone()))
-                    .await
-                {
-                    Ok(target) => Some((target, udp_probe_identity(&dns_raw, target))),
-                    Err(_) => {
-                        info!(
-                            "UDP DNS health check disabled: target resolution was locally refused"
-                        );
-                        None
-                    }
-                };
+                let dns_probe = UdpDnsProbeTarget::new(dns_raw, Some(resolver.clone()));
+                match tokio::time::timeout(check_timeout, dns_probe.resolve()).await {
+                    Ok(Ok((target, _))) => info!("UDP health check enabled (dns={})", target),
+                    _ => info!(
+                        "UDP DNS health target initialization deferred to later health checks"
+                    ),
+                }
                 let quic_score_target = if quic_url.is_empty() {
                     None
                 } else {
                     resolve_quic_score_target(&quic_url, Some(resolver)).await
                 };
-                if let Some((target, _)) = &dns_probe {
-                    info!("UDP health check enabled (dns={})", target);
-                }
                 alive_set.set_udp_probe(Arc::new(ProxyUdpProber::new(
                     self.config.clone(),
                     self.proxy_registry.clone(),

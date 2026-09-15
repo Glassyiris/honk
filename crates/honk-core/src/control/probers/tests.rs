@@ -325,7 +325,7 @@ async fn c27_udp_rejects_invalid_nodes_without_data_path() {
             Arc::new(registry),
             generation,
             Arc::new(StatsManager::new()),
-            Some((target, target.into())),
+            UdpDnsProbeTarget::new(vec![target.to_string()], None),
             None,
             manager,
         );
@@ -374,13 +374,15 @@ async fn udp_policy_denial_skips_dns_before_dial_and_health_feedback() {
         &[],
         std::slice::from_ref(&node),
     ))));
-    let target: SocketAddr = "127.0.0.1:443".parse().unwrap();
+    let resolver: crate::outbound::ResolveHook = Arc::new(|_, _| {
+        panic!("policy-denied DNS target must not be resolved");
+    });
     let prober = ProxyUdpProber::new(
         Arc::new(RwLock::new(Arc::new(config))),
         Arc::new(registry),
         generation,
         Arc::new(StatsManager::new()),
-        Some((target, target.into())),
+        UdpDnsProbeTarget::new(vec!["denied.example:443".into()], Some(resolver)),
         None,
         manager,
     );

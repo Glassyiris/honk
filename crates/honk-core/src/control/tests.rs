@@ -475,10 +475,7 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
         Arc::new(registry),
         runtime,
         cp.stats_handle(),
-        Some((
-            "127.0.0.1:53".parse().unwrap(),
-            "127.0.0.1:53".parse::<SocketAddr>().unwrap().into(),
-        )),
+        probers::UdpDnsProbeTarget::new(vec!["127.0.0.1:53".into()], None),
         Some(quic_target),
         manager.clone(),
     );
@@ -514,12 +511,11 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
 }
 
 #[tokio::test]
-async fn quic_probe_still_runs_without_dns_probe_target() {
+async fn quic_probe_still_runs_when_dns_target_resolution_is_refused() {
     use honk_config::node::{Group, GroupPolicy};
     use honk_outbound::group::GroupManager;
 
-    // A locally denied DNS target is absent from this prober, but the
-    // independent Score handshake probe must still run.
+    // Local DNS setup refusal must not suppress the independent Score handshake.
     let node = udp_test_node();
     let group = Group {
         name: "score".into(),
@@ -564,7 +560,16 @@ async fn quic_probe_still_runs_without_dns_probe_target() {
         Arc::new(registry),
         runtime,
         Arc::new(StatsManager::new()),
-        None,
+        probers::UdpDnsProbeTarget::new(
+            vec!["denied.example:53".into()],
+            Some(Arc::new(|_, _| {
+                Box::pin(async {
+                    Err(anyhow::Error::new(
+                        honk_outbound::proxy::PacketRejection::Capacity,
+                    ))
+                })
+            })),
+        ),
         Some(quic_target),
         manager.clone(),
     );
@@ -575,7 +580,7 @@ async fn quic_probe_still_runs_without_dns_probe_target() {
     assert!(result.dns.is_none(), "DNS health result: {result:?}");
     assert!(
         matches!(result.data_path, Some(Err(_))),
-        "the Score QUIC probe must be attempted without a DNS target: {result:?}"
+        "the Score QUIC probe must be attempted despite DNS initialization refusal: {result:?}"
     );
     assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
