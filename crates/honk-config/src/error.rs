@@ -117,34 +117,6 @@ impl DetailedConfigError {
                 error.diagnostic.entry_index = Some(index);
                 return error;
             }
-            for (prefix, suffix, code, message) in [
-                (
-                    "duplicate VLESS share-link parameter '",
-                    "'",
-                    "duplicate-vless-parameter",
-                    "VLESS share-link controls must occur only once",
-                ),
-                (
-                    "VLESS parameter '",
-                    "' is inactive with mux=off",
-                    "invalid-config-value",
-                    "VLESS multiplex tuning requires an enabled mux; padding uses h2mux and concurrency/UDP policy use xray",
-                ),
-                (
-                    "VLESS parameter '",
-                    "' requires mux=xray",
-                    "invalid-config-value",
-                    "VLESS concurrency and UDP policy controls require mux=xray",
-                ),
-            ] {
-                if let Some(setting) = text
-                    .strip_prefix(prefix)
-                    .and_then(|text| text.strip_suffix(suffix))
-                    .and_then(vless_parameter_setting)
-                {
-                    return Self::new(category, code, source, setting, message);
-                }
-            }
             let reason = match text {
                 "unknown traffic predicate" => Some((
                     "unknown-traffic-predicate",
@@ -174,7 +146,6 @@ impl DetailedConfigError {
                 )),
                 "unsupported stream transport"
                 | "conflicting stream transport aliases"
-                | "unsupported VLESS obfs transport"
                 | "unsupported VMess obfs transport" => Some((
                     "invalid-config-value",
                     SettingPath::new("nodes").field("transport"),
@@ -190,100 +161,6 @@ impl DetailedConfigError {
                     "invalid-config-value",
                     SettingPath::new("nodes").field("sni"),
                     "conflicting TLS server name aliases",
-                )),
-                "conflicting VLESS flow parameters" | "unsupported VLESS flow" => Some((
-                    "invalid-config-value",
-                    SettingPath::new("nodes").field("flow"),
-                    "VLESS flow must be absent, xtls-rprx-vision, or xtls-rprx-vision-udp443; aliases must agree",
-                )),
-                "unsupported VLESS share-link parameter 'packet-encoding'"
-                | "unsupported VLESS share-link parameter 'packet_encoding'"
-                | "unsupported VLESS share-link parameter 'packet-addr'"
-                | "unsupported VLESS share-link parameter 'packet_addr'"
-                | "unsupported VLESS share-link parameter 'xudp'"
-                | "unsupported VLESS share-link parameter 'udp-over-tcp'"
-                | "unsupported VLESS share-link parameter 'udp_over_tcp'" => Some((
-                    "unsupported-vless-parameter",
-                    SettingPath::new("nodes").field("packet_encoding"),
-                    "unsupported VLESS UDP encoding alias; use packetEncoding=auto, none, xudp, or uot-v2",
-                )),
-                "unsupported VLESS share-link parameter 'only-tcp'"
-                | "unsupported VLESS share-link parameter 'only_tcp'" => Some((
-                    "unsupported-vless-parameter",
-                    SettingPath::new("nodes").field("network"),
-                    "unsupported VLESS network alias; use udp=0 to disable UDP",
-                )),
-                "unsupported VLESS share-link parameter 'smux'"
-                | "unsupported VLESS share-link parameter 'multiplex'"
-                | "unsupported VLESS share-link parameter 'brutal'"
-                | "unsupported VLESS share-link parameter 'brutal-opts'"
-                | "unsupported VLESS share-link parameter 'brutal_opts'"
-                | "unsupported VLESS share-link parameter 'max-connections'"
-                | "unsupported VLESS share-link parameter 'max_connections'"
-                | "unsupported VLESS share-link parameter 'min-streams'"
-                | "unsupported VLESS share-link parameter 'min_streams'"
-                | "unsupported VLESS share-link parameter 'max-streams'"
-                | "unsupported VLESS share-link parameter 'max_streams'" => Some((
-                    "unsupported-vless-parameter",
-                    SettingPath::new("nodes").field("multiplex"),
-                    "unsupported VLESS multiplex parameter; use mux=off, h2mux, or xray and its supported controls",
-                )),
-                "unsupported VLESS packetEncoding (expected auto, none, xudp, or uot-v2)" => {
-                    Some((
-                        "invalid-config-value",
-                        SettingPath::new("nodes").field("packet_encoding"),
-                        "VLESS packetEncoding must be auto, none, xudp, or uot-v2",
-                    ))
-                }
-                "unsupported VLESS mux (expected off, h2mux, or xray)" => Some((
-                    "invalid-config-value",
-                    SettingPath::new("nodes").field("multiplex"),
-                    "VLESS mux must be off, h2mux, or xray",
-                )),
-                "unsupported VLESS padding (expected true or false)" => Some((
-                    "invalid-config-value",
-                    SettingPath::new("nodes")
-                        .field("multiplex")
-                        .field("padding"),
-                    "VLESS padding must be true or false",
-                )),
-                "VLESS padding requires mux=h2mux" => Some((
-                    "invalid-config-value",
-                    SettingPath::new("nodes")
-                        .field("multiplex")
-                        .field("padding"),
-                    "VLESS padding requires mux=h2mux",
-                )),
-                "invalid VLESS concurrency" => Some((
-                    "invalid-config-value",
-                    SettingPath::new("nodes").field("multiplex").field("tcp"),
-                    "VLESS concurrency must be an integer from -32768 to 32767",
-                )),
-                "invalid VLESS xudpConcurrency" => Some((
-                    "invalid-config-value",
-                    SettingPath::new("nodes").field("multiplex").field("udp"),
-                    "VLESS xudpConcurrency must be an integer from -32768 to 32767",
-                )),
-                "unsupported VLESS xudpProxyUDP443 (expected reject, skip, or allow)" => Some((
-                    "invalid-config-value",
-                    SettingPath::new("nodes").field("multiplex").field("udp443"),
-                    "VLESS xudpProxyUDP443 must be reject, skip, or allow",
-                )),
-                "unsupported VLESS udp value (expected 1/true or 0/false)"
-                | "conflicting VLESS udp parameters" => Some((
-                    "invalid-config-value",
-                    SettingPath::new("nodes").field("network"),
-                    "VLESS udp must be 1/true or 0/false; repeated values must agree",
-                )),
-                "unsupported VLESS xtls value" => Some((
-                    "invalid-config-value",
-                    SettingPath::new("nodes").field("flow"),
-                    "VLESS xtls must be 0 (disabled) or 2 (Vision)",
-                )),
-                "VLESS vless_mode was removed; use packetEncoding and mux" => Some((
-                    "removed-vless-mode",
-                    SettingPath::new("nodes").field("vless_mode"),
-                    "VLESS vless_mode was removed; use packetEncoding and mux",
                 )),
                 "dns.hosts_file was removed; use one or more use_host paths" => Some((
                     "removed-dns-hosts-file",
@@ -403,19 +280,4 @@ impl DetailedConfigError {
             ErrorCategory::UnsupportedPolicy => ConfigError::UnsupportedPolicy(message),
         }
     }
-}
-
-fn vless_parameter_setting(parameter: &str) -> Option<crate::diagnostic::SettingPath> {
-    use crate::diagnostic::SettingPath;
-    Some(match parameter {
-        "packetEncoding" => SettingPath::new("nodes").field("packet_encoding"),
-        "mux" => SettingPath::new("nodes").field("multiplex"),
-        "padding" => SettingPath::new("nodes")
-            .field("multiplex")
-            .field("padding"),
-        "concurrency" => SettingPath::new("nodes").field("multiplex").field("tcp"),
-        "xudpConcurrency" => SettingPath::new("nodes").field("multiplex").field("udp"),
-        "xudpProxyUDP443" => SettingPath::new("nodes").field("multiplex").field("udp443"),
-        _ => return None,
-    })
 }

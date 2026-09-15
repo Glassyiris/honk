@@ -1,6 +1,7 @@
 //! Apply share-link query fields before validating and deriving node identity.
 
-use crate::error::ConfigError;
+use crate::diagnostic::{SettingPath, SourceRef};
+use crate::error::{ConfigError, DetailedConfigError, ErrorCategory};
 use crate::node::{
     Hysteria2Config, Node, OutboundConfig, QuicOptions, Udp443Policy, VlessConfig, VlessMultiplex,
     VlessUdpEncoding,
@@ -51,11 +52,30 @@ impl Query {
     }
 }
 
+fn query_error(
+    source: &SourceRef,
+    fields: &[&'static str],
+    code: &'static str,
+    message: &'static str,
+) -> DetailedConfigError {
+    DetailedConfigError::new(
+        ErrorCategory::Parse,
+        code,
+        source.clone(),
+        fields
+            .iter()
+            .fold(SettingPath::new("nodes"), |path, field| path.field(field)),
+        message,
+    )
+}
+
 pub(super) fn parse_query(
     url: &url::Url,
     protocol: NodeProtocol,
     shadowrocket: bool,
-) -> Result<Query, ConfigError> {
+    source: &SourceRef,
+) -> Result<Query, DetailedConfigError> {
+    let legacy = |error| DetailedConfigError::from_legacy(error, source.clone());
     let shadowrocket_vmess = shadowrocket && protocol == NodeProtocol::VMess;
     let mut query = Query::default();
     for (key, value) in url.query_pairs() {
@@ -80,13 +100,16 @@ pub(super) fn parse_query(
                         && vmess_cipher([previous.as_str(), value.as_ref()]).is_ok())
             })
         {
-            return Err(ConfigError::Parse(
+            return Err(legacy(ConfigError::Parse(
                 "duplicate VMess share-link parameter".into(),
-            ));
+            )));
         }
         if protocol == NodeProtocol::VLess && key == "vless_mode" {
-            return Err(ConfigError::Parse(
-                "VLESS vless_mode was removed; use packetEncoding and mux".into(),
+            return Err(query_error(
+                source,
+                &["vless_mode"],
+                "removed-vless-mode",
+                "VLESS vless_mode was removed; use packetEncoding and mux",
             ));
         }
         query.push(key, value.into_owned());
@@ -95,9 +118,9 @@ pub(super) fn parse_query(
         && (query.contains_key("vless_mode")
             || query.get("packetEncoding").is_some_and(|v| v != "none"))
     {
-        return Err(ConfigError::Parse(
+        return Err(legacy(ConfigError::Parse(
             "vless_mode/packetEncoding are valid only for VLESS share links".into(),
-        ));
+        )));
     }
     if shadowrocket_vmess {
         vmess_cipher(
@@ -105,19 +128,19 @@ pub(super) fn parse_query(
                 .values("security")
                 .filter(|value| !matches!(*value, "none" | "tls")),
         )
-        .map_err(|reason| ConfigError::Parse(reason.into()))?;
+        .map_err(|reason| legacy(ConfigError::Parse(reason.into())))?;
         if ["pbk", "sid", "spx"]
             .iter()
             .any(|key| query.get(key).is_some_and(|value| !value.is_empty()))
         {
-            return Err(ConfigError::Parse(
+            return Err(legacy(ConfigError::Parse(
                 "REALITY parameters are unsupported in encoded VMess links".into(),
-            ));
+            )));
         }
         if query.get("alterId").is_some_and(|value| value != "0") {
-            return Err(ConfigError::Parse(
+            return Err(legacy(ConfigError::Parse(
                 "unsupported VMess share-link option".into(),
-            ));
+            )));
         }
     }
     Ok(query)
@@ -129,7 +152,7 @@ pub(super) fn apply_tls(
     shadowrocket: bool,
     source: &crate::diagnostic::SourceRef,
     emit: &mut impl FnMut(crate::diagnostic::DetailedDiagnostic),
-) -> Result<(), ConfigError> {
+) -> Result<(), DetailedConfigError> {
     let protocol = node.protocol();
     let shadowrocket_vless = shadowrocket && protocol == NodeProtocol::VLess;
     let shadowrocket_vmess = shadowrocket && protocol == NodeProtocol::VMess;
@@ -141,7 +164,7 @@ pub(super) fn apply_tls(
             None => None,
             Some("0") => Some(false),
             Some("1") => Some(true),
-            Some(_) => return Err(ConfigError::Parse("unsupported VLESS tls value".into())),
+            Some(_) => return Err(super::invalid_link(source)),
         };
         let reality_fields = ["pbk", "sid", "spx"]
             .iter()
@@ -152,9 +175,7 @@ pub(super) fn apply_tls(
                     || (!enabled && reality_fields)
             })
         {
-            return Err(ConfigError::Parse(
-                "conflicting VLESS TLS parameters".into(),
-            ));
+            return Err(super::invalid_link(source));
         }
         reality |= reality_fields;
     }
@@ -177,22 +198,18 @@ pub(super) fn apply_tls(
                     None => security_tls.unwrap_or(false),
                     Some("0") => {
                         if security_tls == Some(true) {
-                            return Err(ConfigError::Parse(
-                                "conflicting VMess TLS parameters".into(),
-                            ));
+                            return Err(super::invalid_link(source));
                         }
                         false
                     }
                     Some("1") => {
                         if security_tls == Some(false) {
-                            return Err(ConfigError::Parse(
-                                "conflicting VMess TLS parameters".into(),
-                            ));
+                            return Err(super::invalid_link(source));
                         }
                         true
                     }
                     Some(_) => {
-                        return Err(ConfigError::Parse("unsupported VMess tls value".into()));
+                        return Err(super::invalid_link(source));
                     }
                 }
             }
@@ -205,17 +222,32 @@ pub(super) fn apply_tls(
                 .map(Some)
                 .chain(query.values("peer").map(Some)),
         )
-        .map_err(|_| ConfigError::Parse("conflicting TLS server name parameters".into()))?
+        .map_err(|_| {
+            query_error(
+                source,
+                &["sni"],
+                "invalid-config-value",
+                "conflicting TLS server name aliases",
+            )
+        })?
         .map(str::to_string);
         let mut verification = None;
         for (ordinal, value) in query.verification_values_with_indices() {
             let parsed = verification_text(value).map_err(|_| {
-                ConfigError::Parse("invalid certificate verification boolean".into())
+                query_error(
+                    source,
+                    &["skip_cert_verify"],
+                    "invalid-config-value",
+                    "certificate verification aliases must be valid agreeing booleans",
+                )
             })?;
             if let Some(previous) = verification {
                 if previous != parsed {
-                    return Err(ConfigError::Parse(
-                        "conflicting certificate verification aliases".into(),
+                    return Err(query_error(
+                        source,
+                        &["skip_cert_verify"],
+                        "invalid-config-value",
+                        "certificate verification aliases must be valid agreeing booleans",
                     ));
                 }
             } else {
@@ -261,38 +293,35 @@ pub(super) fn apply_tls(
     }
     Ok(())
 }
-fn resolve_stream_transport(
-    query: &Query,
+fn resolve_stream_transport<'a>(
+    query: &'a Query,
     protocol: NodeProtocol,
-) -> Result<Option<&str>, ConfigError> {
+    source: &SourceRef,
+) -> Result<Option<&'a str>, DetailedConfigError> {
+    let invalid = || {
+        query_error(
+            source,
+            &["transport"],
+            "invalid-config-value",
+            "stream transport must be tcp, ws, or grpc; aliases must agree",
+        )
+    };
     let mut resolved = None;
     for (key, value) in &query.0 {
         let canonical = match key.as_str() {
-            "type" | "network" => stream_transport(value)
-                .map_err(|_| ConfigError::Parse("unsupported stream transport".into()))?,
+            "type" | "network" => stream_transport(value).map_err(|_| invalid())?,
             "obfs" if matches!(protocol, NodeProtocol::VLess | NodeProtocol::VMess) => {
                 match value.as_str() {
                     "" | "none" => "tcp",
                     "websocket" => "ws",
                     "grpc" => "grpc",
-                    _ => {
-                        return Err(ConfigError::Parse(
-                            if protocol == NodeProtocol::VLess {
-                                "unsupported VLESS obfs transport"
-                            } else {
-                                "unsupported VMess obfs transport"
-                            }
-                            .into(),
-                        ));
-                    }
+                    _ => return Err(invalid()),
                 }
             }
             _ => continue,
         };
         if resolved.is_some_and(|previous| previous != canonical) {
-            return Err(ConfigError::Parse(
-                "conflicting stream transport aliases".into(),
-            ));
+            return Err(invalid());
         }
         resolved = Some(canonical);
     }
@@ -303,11 +332,15 @@ fn resolve_stream_transport(
         .or(resolved))
 }
 
-pub(super) fn apply_transport(node: &mut Node, query: &Query) -> Result<(), ConfigError> {
+pub(super) fn apply_transport(
+    node: &mut Node,
+    query: &Query,
+    source: &SourceRef,
+) -> Result<(), DetailedConfigError> {
     let protocol = node.protocol();
     let host_fallback = query.get("host").map(String::as_str);
-    let host_sni_fallback = optional_text([host_fallback])
-        .map_err(|_| ConfigError::Parse("invalid share-link host parameter".into()))?;
+    let host_sni_fallback =
+        optional_text([host_fallback]).map_err(|_| super::invalid_link(source))?;
     let obfs_host = if matches!(protocol, NodeProtocol::VLess | NodeProtocol::VMess) {
         query.get("obfsParam").map(String::as_str)
     } else {
@@ -315,11 +348,17 @@ pub(super) fn apply_transport(node: &mut Node, query: &Query) -> Result<(), Conf
     };
     let mut host_consumed = false;
     if let Some(transport) = node.transport_mut() {
-        if let Some(value) = resolve_stream_transport(query, protocol)? {
+        if let Some(value) = resolve_stream_transport(query, protocol, source)? {
             transport.transport = value.to_string();
         }
-        let transport_kind = stream_transport(&transport.transport)
-            .map_err(|_| ConfigError::Parse("unsupported stream transport".into()))?;
+        let transport_kind = stream_transport(&transport.transport).map_err(|_| {
+            query_error(
+                source,
+                &["transport"],
+                "invalid-config-value",
+                "stream transport must be tcp, ws, or grpc; aliases must agree",
+            )
+        })?;
         match transport_kind {
             "ws" => {
                 if let Some(value) = host_fallback.or(obfs_host) {
@@ -360,15 +399,14 @@ pub(super) fn apply_protocol(
     shadowrocket: bool,
     source: &crate::diagnostic::SourceRef,
     emit: &mut impl FnMut(crate::diagnostic::DetailedDiagnostic),
-) -> Result<(), ConfigError> {
+) -> Result<(), DetailedConfigError> {
+    let legacy = |error| DetailedConfigError::from_legacy(error, source.clone());
     if node.protocol() != NodeProtocol::SS
         && ["plugin", "plugin-opts", "plugin_opts"]
             .iter()
             .any(|key| query.contains_key(key))
     {
-        return Err(ConfigError::Parse(
-            "plugin parameters are valid only for Shadowsocks links".into(),
-        ));
+        return Err(super::invalid_link(source));
     }
     match &mut node.outbound {
         OutboundConfig::Shadowsocks(config) => {
@@ -397,13 +435,13 @@ pub(super) fn apply_protocol(
                         .filter(|value| !matches!(*value, "none" | "tls")),
                 ),
             )
-            .map_err(|reason| ConfigError::Parse(reason.into()))?
+            .map_err(|reason| legacy(ConfigError::Parse(reason.into())))?
             .map(str::to_owned)
             .or_else(|| config.encryption.take());
         }
-        OutboundConfig::Vless(config) => apply_vless(config, query)?,
+        OutboundConfig::Vless(config) => apply_vless(config, query, source)?,
         OutboundConfig::Hysteria2(config) => {
-            apply_hysteria2(config, query, embedded_hop_ports)?;
+            apply_hysteria2(config, query, embedded_hop_ports).map_err(legacy)?;
             for (ordinal, (key, value)) in query.0.iter().enumerate() {
                 if key == "mhop" && value.parse::<u64>().is_err() {
                     let mut warning = crate::diagnostic::DetailedDiagnostic::warning(
@@ -425,7 +463,9 @@ pub(super) fn apply_protocol(
                 .chain(query.values("udp_relay_mode"))
             {
                 if !matches!(value, "" | "native") {
-                    return Err(ConfigError::Parse("unsupported TUIC UDP relay mode".into()));
+                    return Err(legacy(ConfigError::Parse(
+                        "unsupported TUIC UDP relay mode".into(),
+                    )));
                 }
             }
             config.init_stream_recv_window = query
@@ -530,7 +570,14 @@ fn apply_mtu(quic: &mut QuicOptions, query: &Query) {
     }
 }
 
-fn apply_vless(config: &mut VlessConfig, query: &Query) -> Result<(), ConfigError> {
+fn apply_vless(
+    config: &mut VlessConfig,
+    query: &Query,
+    source: &SourceRef,
+) -> Result<(), DetailedConfigError> {
+    let invalid = |fields: &[&'static str], message| {
+        query_error(source, fields, "invalid-config-value", message)
+    };
     if let Some(parameter) = [
         "smux",
         "multiplex",
@@ -556,22 +603,44 @@ fn apply_vless(config: &mut VlessConfig, query: &Query) -> Result<(), ConfigErro
     .into_iter()
     .find(|parameter| query.contains_key(parameter))
     {
-        return Err(ConfigError::Parse(format!(
-            "unsupported VLESS share-link parameter '{parameter}'"
-        )));
+        let (field, message) = match parameter {
+            "udp-over-tcp" | "udp_over_tcp" | "packet-encoding" | "packet_encoding"
+            | "packet-addr" | "packet_addr" | "xudp" => (
+                "packet_encoding",
+                "unsupported VLESS UDP encoding alias; use packetEncoding=auto, none, xudp, or uot-v2",
+            ),
+            "only-tcp" | "only_tcp" => (
+                "network",
+                "unsupported VLESS network alias; use udp=0 to disable UDP",
+            ),
+            _ => (
+                "multiplex",
+                "unsupported VLESS multiplex parameter; use mux=off, h2mux, or xray and its supported controls",
+            ),
+        };
+        return Err(query_error(
+            source,
+            &[field],
+            "unsupported-vless-parameter",
+            message,
+        ));
     }
-    for parameter in [
-        "packetEncoding",
-        "mux",
-        "padding",
-        "concurrency",
-        "xudpConcurrency",
-        "xudpProxyUDP443",
-    ] {
+    const CONTROLS: [(&str, &[&str]); 6] = [
+        ("packetEncoding", &["packet_encoding"]),
+        ("mux", &["multiplex"]),
+        ("padding", &["multiplex", "padding"]),
+        ("concurrency", &["multiplex", "tcp"]),
+        ("xudpConcurrency", &["multiplex", "udp"]),
+        ("xudpProxyUDP443", &["multiplex", "udp443"]),
+    ];
+    for (parameter, fields) in CONTROLS {
         if query.values(parameter).nth(1).is_some() {
-            return Err(ConfigError::Parse(format!(
-                "duplicate VLESS share-link parameter '{parameter}'"
-            )));
+            return Err(query_error(
+                source,
+                fields,
+                "duplicate-vless-parameter",
+                "VLESS share-link controls must occur only once",
+            ));
         }
     }
 
@@ -582,43 +651,46 @@ fn apply_vless(config: &mut VlessConfig, query: &Query) -> Result<(), ConfigErro
             "xudp" => VlessUdpEncoding::Xudp,
             "uot-v2" => VlessUdpEncoding::UotV2,
             _ => {
-                return Err(ConfigError::Parse(
-                    "unsupported VLESS packetEncoding (expected auto, none, xudp, or uot-v2)"
-                        .into(),
+                return Err(invalid(
+                    &["packet_encoding"],
+                    "VLESS packetEncoding must be auto, none, xudp, or uot-v2",
                 ));
             }
         };
     }
 
     let mux = query.get("mux").map(String::as_str).unwrap_or("off");
-    let xray_control = ["concurrency", "xudpConcurrency", "xudpProxyUDP443"]
-        .into_iter()
-        .find(|parameter| query.contains_key(parameter));
+    let xray_control = CONTROLS[3..]
+        .iter()
+        .find(|(parameter, _)| query.contains_key(parameter));
     config.multiplex = match mux {
         "off" => {
-            if let Some(parameter) = query
+            if let Some((_, fields)) = query
                 .contains_key("padding")
-                .then_some("padding")
+                .then_some(&CONTROLS[2])
                 .or(xray_control)
             {
-                return Err(ConfigError::Parse(format!(
-                    "VLESS parameter '{parameter}' is inactive with mux=off"
-                )));
+                return Err(invalid(
+                    fields,
+                    "VLESS multiplex tuning requires an enabled mux; padding uses h2mux and concurrency/UDP policy use xray",
+                ));
             }
             VlessMultiplex::Off
         }
         "h2mux" => {
-            if let Some(parameter) = xray_control {
-                return Err(ConfigError::Parse(format!(
-                    "VLESS parameter '{parameter}' requires mux=xray"
-                )));
+            if let Some((_, fields)) = xray_control {
+                return Err(invalid(
+                    fields,
+                    "VLESS concurrency and UDP policy controls require mux=xray",
+                ));
             }
             let padding = match query.get("padding").map(String::as_str) {
                 None | Some("false") => false,
                 Some("true") => true,
                 Some(_) => {
-                    return Err(ConfigError::Parse(
-                        "unsupported VLESS padding (expected true or false)".into(),
+                    return Err(invalid(
+                        &["multiplex", "padding"],
+                        "VLESS padding must be true or false",
                     ));
                 }
             };
@@ -626,38 +698,50 @@ fn apply_vless(config: &mut VlessConfig, query: &Query) -> Result<(), ConfigErro
         }
         "xray" => {
             if query.contains_key("padding") {
-                return Err(ConfigError::Parse(
-                    "VLESS padding requires mux=h2mux".into(),
+                return Err(invalid(
+                    &["multiplex", "padding"],
+                    "VLESS padding requires mux=h2mux",
                 ));
             }
             let concurrency = query
                 .get("concurrency")
                 .map(|value| value.parse::<i16>())
                 .transpose()
-                .map_err(|_| ConfigError::Parse("invalid VLESS concurrency".into()))?
+                .map_err(|_| {
+                    invalid(
+                        &["multiplex", "tcp"],
+                        "VLESS concurrency must be an integer from -32768 to 32767",
+                    )
+                })?
                 .unwrap_or(0);
             let xudp_concurrency = query
                 .get("xudpConcurrency")
                 .map(|value| value.parse::<i16>())
                 .transpose()
-                .map_err(|_| ConfigError::Parse("invalid VLESS xudpConcurrency".into()))?
+                .map_err(|_| {
+                    invalid(
+                        &["multiplex", "udp"],
+                        "VLESS xudpConcurrency must be an integer from -32768 to 32767",
+                    )
+                })?
                 .unwrap_or(0);
             let udp443 = match query.get("xudpProxyUDP443").map(String::as_str) {
                 None | Some("reject") => Udp443Policy::Reject,
                 Some("skip") => Udp443Policy::Skip,
                 Some("allow") => Udp443Policy::Allow,
                 Some(_) => {
-                    return Err(ConfigError::Parse(
-                        "unsupported VLESS xudpProxyUDP443 (expected reject, skip, or allow)"
-                            .into(),
+                    return Err(invalid(
+                        &["multiplex", "udp443"],
+                        "VLESS xudpProxyUDP443 must be reject, skip, or allow",
                     ));
                 }
             };
             VlessMultiplex::xray(concurrency, xudp_concurrency, udp443)
         }
         _ => {
-            return Err(ConfigError::Parse(
-                "unsupported VLESS mux (expected off, h2mux, or xray)".into(),
+            return Err(invalid(
+                &["multiplex"],
+                "VLESS mux must be off, h2mux, or xray",
             ));
         }
     };
@@ -674,28 +758,43 @@ fn apply_vless(config: &mut VlessConfig, query: &Query) -> Result<(), ConfigErro
         }),
         "conflicting VLESS udp parameters",
     )
-    .map_err(|reason| ConfigError::Parse(reason.into()))?
-    {
+    .map_err(|_| {
+        invalid(
+            &["network"],
+            "VLESS udp must be 1/true or 0/false; repeated values must agree",
+        )
+    })? {
         config.network = (!enabled).then(|| "tcp".to_string());
     }
+    let flow_error = |category| {
+        let mut error = invalid(
+            &["flow"],
+            "VLESS flow must be absent, xtls-rprx-vision, or xtls-rprx-vision-udp443; aliases must agree",
+        );
+        error.category = category;
+        error
+    };
     let flow = optional_text(query.values("flow").map(Some))
-        .map_err(|_| ConfigError::Parse("conflicting VLESS flow parameters".into()))?;
+        .map_err(|_| flow_error(ErrorCategory::Parse))?;
     config.flow = optional_flow(flow)
-        .map_err(|_| ConfigError::Validation("unsupported VLESS flow".into()))?
+        .map_err(|_| flow_error(ErrorCategory::Validation))?
         .map(str::to_string);
     // Shadowrocket's exporter maps 1 to retired XTLS Direct and 2 to Vision.
     if let Some(xtls) = query.get("xtls") {
         let flow = match xtls.as_str() {
             "0" => None,
             "2" => Some("xtls-rprx-vision"),
-            _ => return Err(ConfigError::Parse("unsupported VLESS xtls value".into())),
+            _ => {
+                return Err(invalid(
+                    &["flow"],
+                    "VLESS xtls must be 0 (disabled) or 2 (Vision)",
+                ));
+            }
         };
         if config.flow.is_some() && config.flow.as_deref() != flow
             || flow.is_some() && !config.tls.enabled
         {
-            return Err(ConfigError::Parse(
-                "conflicting VLESS flow parameters".into(),
-            ));
+            return Err(flow_error(ErrorCategory::Parse));
         }
         config.flow = flow.map(str::to_string);
     }
