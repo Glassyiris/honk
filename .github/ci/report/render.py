@@ -418,13 +418,24 @@ def measurement_rows(reports: dict[str, Any], baseline: dict[str, Any]) -> tuple
     size = metric(smoke, "binary_size")
     old_size = metric(old_smoke, "binary_size")
     if size is not None:
-        current = require_integer(size, "binary size") / 1048576
-        old = require_integer(old_size, "baseline binary size") / 1048576 if old_size is not None else None
+        size_bytes = require_integer(size, "binary size")
+        old_bytes = require_integer(old_size, "baseline binary size") if old_size is not None else None
+        current = size_bytes / 1048576
+        old = old_bytes / 1048576 if old_bytes is not None else None
         limit = old * 1.1 if old is not None else None
         over = limit is not None and current > limit
         shown = f"{decimal(current, 1)} MB"
         baseline_cell = f"{decimal(old, 1)} MB" if old is not None else "no baseline"
-        change = signed(current - old, "MB", 1) if old is not None else "—"
+        # Most PRs move the binary by a few dozen KB, which one decimal of MB
+        # would print as +0; show KB below 0.1 MB and 0 only for identical files.
+        if old_bytes is None:
+            change = "—"
+        elif size_bytes == old_bytes:
+            change = "0"
+        elif abs(size_bytes - old_bytes) < 104858:
+            change = signed(round((size_bytes - old_bytes) / 1024), "KB", 0)
+        else:
+            change = signed(current - old, "MB", 1)
         limit_cell = f"{decimal(limit, 1)} MB" if limit is not None else "—"
         rows.append(["`honk-core` release binary", f"**{shown}**" if over else shown, baseline_cell, change, limit_cell])
         if over:

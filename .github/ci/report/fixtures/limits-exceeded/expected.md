@@ -9,7 +9,7 @@
 | | This PR | `main` | Change | Limit |
 |---|---|---|---|---|
 | `honk-core` peak memory in the smoke | **33 MB** | 20 MB | +13 MB | 24 MB |
-| `honk-core` release binary | 19.5 MB | 19 MB | +0.5 MB | 20.9 MB |
+| `honk-core` release binary | 19.5 MB | 19.5 MB | +37 KB | 21.4 MB |
 | Slowest test | **61 s** | 50 s | +11 s | 60 s |
 
 </details>
