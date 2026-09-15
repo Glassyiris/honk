@@ -743,24 +743,11 @@ impl MuxResponse {
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Ready(Ok(())) => {}
         }
-        if !self.current.is_empty() {
-            return Poll::Ready(Ok(Some(std::mem::take(&mut self.current))));
-        }
-        match self
-            .recv
-            .as_mut()
-            .expect("response body initialized")
-            .poll_data(cx)
-        {
+        match self.poll_fill(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Some(Err(error))) if h2_clean_eof(&error) => Poll::Ready(Ok(None)),
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Err(h2_io(error))),
-            Poll::Ready(Some(Ok(data))) if data.is_empty() => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Poll::Ready(Some(Ok(data))) => Poll::Ready(Ok(Some(data))),
-            Poll::Ready(None) => Poll::Ready(Ok(None)),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Ok(false)) => Poll::Ready(Ok(None)),
+            Poll::Ready(Ok(true)) => Poll::Ready(Ok(Some(std::mem::take(&mut self.current)))),
         }
     }
 }

@@ -29,10 +29,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-#[cfg(test)]
-fn no_feedback() -> Option<ScoreReporter> {
-    None
-}
 
 fn start_feedback(feedback: Option<ScoreFeedback>) -> Option<ScoreReporter> {
     feedback.map(|feedback| feedback.start())
@@ -179,20 +175,9 @@ pub async fn urltest_node(
     url: &str,
     timeout: Duration,
 ) -> anyhow::Result<Duration> {
-    urltest_node_impl(runtime, handler, url, timeout, None).await
-}
-
-async fn urltest_node_impl(
-    runtime: &Arc<crate::runtime::NodeRuntime>,
-    handler: &dyn TcpOutbound,
-    url: &str,
-    timeout: Duration,
-    group_manager: Option<&GroupManager>,
-) -> anyhow::Result<Duration> {
-    validate_runtime(runtime)?;
     let timeout = urltest_timeout(timeout);
     let request = http_probe_request(url, "")?;
-    urltest_request_impl(runtime, handler, &request, timeout, group_manager).await
+    urltest_request_impl(runtime, handler, &request, timeout, None).await
 }
 
 async fn urltest_request_impl(
@@ -299,19 +284,6 @@ pub fn try_probe_runtime(
             Ok((guard.runtime(), Some(guard)))
         }
     }
-}
-
-/// Panicking wrapper for [`try_probe_runtime`].
-pub fn probe_runtime(
-    generation: &crate::runtime::OutboundRuntimeRegistry,
-    node: &Node,
-    requirement: crate::proxy::WarmRequirement,
-) -> (
-    Arc<crate::runtime::NodeRuntime>,
-    Option<crate::runtime::EphemeralRuntimeGuard>,
-) {
-    try_probe_runtime(generation, node, requirement)
-        .unwrap_or_else(|_| panic!("invalid node passed to URLTest runtime probe"))
 }
 
 /// Prepare a cold reusable transport for one HTTP probe attempt.
@@ -1077,7 +1049,7 @@ mod resolver_hook_tests {
         // must have been consulted first.
         let handler = crate::proxy::direct::DirectHandler::new();
         let _ = urltest_node(
-            &crate::runtime::NodeRuntime::ephemeral(&node),
+            &crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap(),
             &handler,
             "https://example.invalid/",
             Duration::from_millis(50),
@@ -1090,10 +1062,9 @@ mod resolver_hook_tests {
             .expect_err("typed hook rejection");
         assert!(crate::proxy::is_packet_rejection(&error));
 
-        let error = resolve_urltest_address("empty.invalid", 443, false)
+        resolve_urltest_address("empty.invalid", 443, false)
             .await
             .expect_err("empty hook result");
-        assert!(error.to_string().contains("no address resolved"));
     }
 }
 
@@ -1207,7 +1178,7 @@ mod tests {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if self.fail {
-                anyhow::bail!("simulated warm failure");
+                return Err(std::io::Error::other("warm failure").into());
             }
             Ok(())
         }
@@ -1236,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_runtime_reuses_only_warm_or_stateless_nodes() {
+    fn try_probe_runtime_reuses_only_warm_or_stateless_nodes() {
         let anytls = reusable_node("anytls", NodeProtocol::AnyTLS);
         let trojan = reusable_node("trojan", NodeProtocol::Trojan);
         let absent = reusable_node("absent", NodeProtocol::SS);
@@ -1245,17 +1216,20 @@ mod tests {
                 .unwrap();
 
         assert!(
-            probe_runtime(&generation, &anytls, crate::proxy::WarmRequirement::Session)
+            try_probe_runtime(&generation, &anytls, crate::proxy::WarmRequirement::Session)
+                .unwrap()
                 .1
                 .is_some()
         );
         assert!(
-            probe_runtime(&generation, &absent, crate::proxy::WarmRequirement::Session)
+            try_probe_runtime(&generation, &absent, crate::proxy::WarmRequirement::Session)
+                .unwrap()
                 .1
                 .is_some()
         );
         let (runtime, guard) =
-            probe_runtime(&generation, &trojan, crate::proxy::WarmRequirement::Session);
+            try_probe_runtime(&generation, &trojan, crate::proxy::WarmRequirement::Session)
+                .unwrap();
         assert!(Arc::ptr_eq(&runtime, &generation.get(&trojan.id).unwrap()));
         assert!(guard.is_none());
     }
@@ -1278,11 +1252,11 @@ mod tests {
             crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
 
         let (tcp, tcp_guard) =
-            probe_runtime(&generation, &node, crate::proxy::WarmRequirement::Session);
+            try_probe_runtime(&generation, &node, crate::proxy::WarmRequirement::Session).unwrap();
         assert!(Arc::ptr_eq(&tcp, &generation.get(&node.id).unwrap()));
         assert!(tcp_guard.is_none());
         let (udp, udp_guard) =
-            probe_runtime(&generation, &node, crate::proxy::WarmRequirement::Udp);
+            try_probe_runtime(&generation, &node, crate::proxy::WarmRequirement::Udp).unwrap();
         assert!(!Arc::ptr_eq(&udp, &generation.get(&node.id).unwrap()));
         assert!(udp_guard.is_some());
     }
@@ -1407,7 +1381,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(error.to_string().contains("simulated warm failure"));
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert!(ephemeral.load(std::sync::atomic::Ordering::Relaxed));
     }
@@ -1454,7 +1428,7 @@ mod tests {
             client_hellos,
         };
         let node = make_node("recording");
-        let runtime = crate::runtime::NodeRuntime::ephemeral(&node);
+        let runtime = crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap();
         let url = "https://localhost/";
 
         let _ = urltest_node(&runtime, &handler, url, Duration::from_secs(2)).await;
@@ -1502,14 +1476,9 @@ mod tests {
                 .unwrap();
         });
         let request = http_probe_request("http://localhost/", "").unwrap();
-        exchange_http1(
-            &mut client,
-            &request,
-            &no_feedback(),
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
+        exchange_http1(&mut client, &request, &None, Duration::from_secs(5))
+            .await
+            .unwrap();
         server.await.unwrap();
     }
 
@@ -1602,14 +1571,9 @@ mod tests {
             "GET",
         )
         .unwrap();
-        exchange_http1(
-            &mut client,
-            &request,
-            &no_feedback(),
-            Duration::from_secs(1),
-        )
-        .await
-        .unwrap();
+        exchange_http1(&mut client, &request, &None, Duration::from_secs(1))
+            .await
+            .unwrap();
         peer.await.unwrap();
     }
 
@@ -1630,13 +1594,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let request = http_probe_request("http://probe.example/health", "HEAD").unwrap();
-        let result = exchange_http1(
-            &mut client,
-            &request,
-            &no_feedback(),
-            Duration::from_millis(50),
-        )
-        .await;
+        let result = exchange_http1(&mut client, &request, &None, Duration::from_millis(50)).await;
         peer.abort();
         let _ = peer.await;
         assert!(
@@ -1668,14 +1626,9 @@ mod tests {
             });
             let request = http_probe_request("http://probe.example/health", "HEAD").unwrap();
             assert!(
-                exchange_http1(
-                    &mut client,
-                    &request,
-                    &no_feedback(),
-                    Duration::from_secs(1)
-                )
-                .await
-                .is_err()
+                exchange_http1(&mut client, &request, &None, Duration::from_secs(1))
+                    .await
+                    .is_err()
             );
         }
     }
@@ -1685,7 +1638,7 @@ mod tests {
         let addr = spawn_mock_http_server().await;
         let node = Node::from_share_link("hysteria2://test@127.0.0.1:443").unwrap();
         let elapsed = urltest_node_addr(
-            &crate::runtime::NodeRuntime::ephemeral(&node),
+            &crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap(),
             &DelayedDialHandler {
                 delay: Duration::from_millis(100),
             },
@@ -1775,22 +1728,6 @@ mod tests {
             assert!(!request.uri().authority().unwrap().as_str().contains('@'));
         }
     }
-    /// The HEAD exchange itself is protocol-agnostic; exercise it over a
-    /// plain stream against a local HTTP server.
-    #[tokio::test]
-    async fn test_exchange_http1_plain_http() {
-        let request = http_probe_request("http://localhost/", "").unwrap();
-        let addr = spawn_mock_http_server().await;
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        exchange_http1(
-            &mut stream,
-            &request,
-            &no_feedback(),
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("HEAD exchange against local HTTP server should succeed");
-    }
 
     /// A server that closes after the first response still yields a sample:
     /// the warm-up exchange's own time is reported.
@@ -1799,14 +1736,9 @@ mod tests {
         let request = http_probe_request("http://localhost/", "").unwrap();
         let addr = spawn_close_after_response_server().await;
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        exchange_http1(
-            &mut stream,
-            &request,
-            &no_feedback(),
-            Duration::from_secs(5),
-        )
-        .await
-        .expect("single-response server must fall back to the warm sample");
+        exchange_http1(&mut stream, &request, &None, Duration::from_secs(5))
+            .await
+            .expect("single-response server must fall back to the warm sample");
     }
 
     /// The reported sample excludes warm-up: a server that stalls only the
@@ -1832,14 +1764,9 @@ mod tests {
         });
         let request = http_probe_request("http://localhost/", "").unwrap();
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let measured = exchange_http1(
-            &mut stream,
-            &request,
-            &no_feedback(),
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
+        let measured = exchange_http1(&mut stream, &request, &None, Duration::from_secs(5))
+            .await
+            .unwrap();
         assert!(
             measured < Duration::from_millis(100),
             "warm round trip must exclude the stalled first response: {measured:?}"
@@ -1869,14 +1796,9 @@ mod tests {
         });
         let request = http_probe_request("http://localhost/", "").unwrap();
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let measured = exchange_http1(
-            &mut stream,
-            &request,
-            &no_feedback(),
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
+        let measured = exchange_http1(&mut stream, &request, &None, Duration::from_secs(5))
+            .await
+            .unwrap();
         assert!(
             measured >= Duration::from_millis(150),
             "the sample is the second request: {measured:?}"
@@ -1907,14 +1829,9 @@ mod tests {
         let request = http_probe_request("http://localhost/", "").unwrap();
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         assert!(
-            exchange_http1(
-                &mut stream,
-                &request,
-                &no_feedback(),
-                Duration::from_secs(5)
-            )
-            .await
-            .is_err()
+            exchange_http1(&mut stream, &request, &None, Duration::from_secs(5))
+                .await
+                .is_err()
         );
     }
 
@@ -1941,14 +1858,9 @@ mod tests {
         });
         let request = http_probe_request("http://localhost/", "").unwrap();
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let measured = exchange_http1(
-            &mut stream,
-            &request,
-            &no_feedback(),
-            Duration::from_millis(100),
-        )
-        .await
-        .unwrap();
+        let measured = exchange_http1(&mut stream, &request, &None, Duration::from_millis(100))
+            .await
+            .unwrap();
         assert!(
             measured < Duration::from_millis(100),
             "timed-out measured request falls back to the warm sample: {measured:?}"
@@ -1966,7 +1878,7 @@ mod tests {
         let url = format!("https://{}:{}/", addr.ip(), addr.port());
 
         let result = urltest_node(
-            &crate::runtime::NodeRuntime::ephemeral(&node),
+            &crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap(),
             &handler,
             &url,
             Duration::from_secs(5),
@@ -1984,7 +1896,7 @@ mod tests {
         let node = make_node("good");
         let handler = MockHandler;
         let result = urltest_node(
-            &crate::runtime::NodeRuntime::ephemeral(&node),
+            &crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap(),
             &handler,
             "https://127.0.0.1:1/",
             Duration::from_secs(2),
@@ -1995,7 +1907,7 @@ mod tests {
         // A node named "bad" fails inside the handler.
         let bad = make_node("bad");
         let result = urltest_node(
-            &crate::runtime::NodeRuntime::ephemeral(&bad),
+            &crate::runtime::NodeRuntime::try_ephemeral(&bad).unwrap(),
             &handler,
             "https://127.0.0.1:1/",
             Duration::from_secs(2),

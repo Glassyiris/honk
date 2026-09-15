@@ -80,6 +80,7 @@ struct TransportQuinnSocket {
 }
 
 impl TransportQuinnSocket {
+    #[cfg(test)]
     fn new(transport: Arc<dyn PacketTransport>, remote: SocketAddr) -> Arc<Self> {
         Self::new_with_metrics(transport, remote, false)
     }
@@ -491,11 +492,7 @@ pub fn packet_transport_endpoint_with_metrics(
     }
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
-    let socket = if metrics_enabled {
-        TransportQuinnSocket::new_with_metrics(transport, remote, true)
-    } else {
-        TransportQuinnSocket::new(transport, remote)
-    };
+    let socket = TransportQuinnSocket::new_with_metrics(transport, remote, metrics_enabled);
     let endpoint = Endpoint::new_with_abstract_socket(
         endpoint_config_with_mtu(1252)?,
         None,

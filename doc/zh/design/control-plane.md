@@ -58,6 +58,8 @@ UDP 域名发现解密 QUIC v1/v2 Initial packet，重组 CRYPTO fragment，并�
 
 `build_tuples_key` 必须用 `mem::zeroed()` 初始化 `TuplesKey`。这个 `#[repr(C)]` key 在 40 字节布局中只有 37 字节字段，内核会散列包括三个 padding 字节在内的全部 40 字节。因此逐字段初始化可能产生用户态无法可靠查询或删除的 key。
 
+权威单候选 TCP 的 transport 失败只重试一次，且重新解析必须提供有效替代项。URLTest 使用 target-aware retry plan 中按延迟排序的前三个候选；Score 记录失败、重新评估精确目标，只重试不同的替代节点。本地 typed refusal 是终态，包括排空竞速任务时发现的已完成拒绝；其他策略或真正的单叶结果不重试。
+
 ## UDP endpoint 流水线
 
 ### 目的地址 provenance

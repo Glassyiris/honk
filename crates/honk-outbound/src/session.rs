@@ -928,28 +928,10 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         Err(last_err.expect("open_with attempts always record an error"))
     }
 
-    /// Insert an externally-established session (e.g. one built on a
-    /// pooled TCP stream). The session is always tracked — even over the
-    /// hard cap: an untracked session is orphaned from the janitor while
-    /// its demux task holds it (and its TCP connection) open forever.
-    /// Over-cap entries are transient; the janitor reaps them when idle.
-    /// After shutdown the session is closed instead of inserted.
+    /// Seed a session for tests that exercise the production pool paths.
     #[cfg(test)]
     pub fn insert(&self, session: &Arc<S>) {
-        if self.state() != PoolState::Running {
-            session.close();
-            return;
-        }
-        let mut pool = self.pool.lock();
-        // Re-check under the registration lock: shutdown marks terminal
-        // before draining the pool, so a late dial cannot repopulate it.
-        if self.state() != PoolState::Running {
-            drop(pool);
-            session.close();
-            return;
-        }
-        pool.sessions.retain(|s| !s.is_closed());
-        pool.sessions.push(Arc::clone(session));
+        self.pool.lock().sessions.push(Arc::clone(session));
     }
 
     /// Current metrics snapshot.
@@ -994,14 +976,14 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     return;
                 }
                 pool.sessions.retain(|s| !s.is_closed());
-                let live: Vec<Arc<S>> = pool.sessions.clone();
+                let live = &pool.sessions;
                 let mut to_close = Vec::new();
                 idle_since.retain(|ptr, _| live.iter().any(|s| Arc::as_ptr(s) as usize == *ptr));
                 drain_at.retain(|ptr, _| live.iter().any(|s| Arc::as_ptr(s) as usize == *ptr));
                 let min_idle = pool
                     .base_min_idle
                     .max(if pool.warm_retained { 1 } else { 0 });
-                for s in &live {
+                for s in live {
                     let ptr = Arc::as_ptr(s) as usize;
                     // Max-age drain: stop taking new streams past the
                     // jittered deadline; close once fully drained.

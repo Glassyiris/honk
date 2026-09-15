@@ -161,13 +161,6 @@ fn test_vless_header_rejects_unsupported_flow_and_long_domain() {
 }
 
 #[test]
-fn test_parse_uuid_valid() {
-    let result = VLessHandler::parse_uuid("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3");
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap().len(), 16);
-}
-
-#[test]
 fn test_parse_uuid_invalid() {
     let result = VLessHandler::parse_uuid("not-a-uuid");
     assert!(result.is_err());

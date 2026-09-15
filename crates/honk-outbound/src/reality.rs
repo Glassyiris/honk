@@ -230,8 +230,8 @@ unsafe extern "C" fn reality_state_free(
     }
 }
 
-/// Rewrites the serialized ClientHello in place (patched BoringSSL hook,
-/// see examples/reality_hook_spike.rs for the verified message layout):
+/// Rewrites the serialized ClientHello in place (patched BoringSSL hook;
+/// `reality/wire_tests.rs` verifies the production wire layout):
 /// [0..4] handshake header, [4..6] legacy_version, [6..38] client_random,
 /// [38] session_id_len, [39..71] session_id. Returning 0 aborts the
 /// handshake — a REALITY ClientHello must never go out unauthenticated.

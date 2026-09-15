@@ -211,9 +211,16 @@ REALITY 参数时，它分派到 `reality_connect`，而不是普通 TLS。因�
 共享路径为 Trojan、VMess 与 VLESS 提供一致的 TLS、REALITY、WS 与 gRPC
 建立过程。
 
+Trojan 冷连接和 pool 中取出的裸连接使用同一套完整 transport。
+TLS 批量读取先返回已经读到的字节，再在下一次非空读取中报告后续的 I/O
+错误，不会把该错误转换成 EOF。
+
 gRPC transport 是手写的最小 gRPC-over-HTTP/2 client。opening HEADERS
 frame 不设置 `END_STREAM`，TLS 请求使用 `:scheme: https`。DATA 携带 gRPC
 长度前缀，以及 gun 风格服务端预期的 protobuf 单 bytes 字段 envelope。
+gRPC over TLS 始终协商 `h2`，与指纹 profile 无关。有界 write queue 取得字节
+所有权后才报告已接受长度；取消不能把这些字节归到后一次调用的 buffer。
+只要 HTTP/2 正窗口能容纳一个 payload 字节及其 envelope，就允许推进。
 
 ### 带 mark socket 与名称解析
 
@@ -514,6 +521,11 @@ fallback。
 | Juicity | ALPN `h3`；TLS-exporter 认证；bi-stream header `[network][trojanc metadata]` | 一条含 `[metadata][u16 length][payload]` record 的 bi stream | 默认 BBR；8 MiB stream 与 8 MiB connection 接收窗口 |
 | Hysteria2 | ALPN `h3`；最小 HTTP/3/QPACK `POST https://hysteria/auth`，成功状态 `233` | Native Hysteria2 QUIC datagram 与分片 | 设置上传 Mbps 时使用 Brutal 定速发送端，否则 BBR；接收带宽按 bytes/s 写入 `Hysteria-CC-RX`；同样默认 8/8 MiB 接收窗口 |
 
+Go `juicity-server` v0.4.3 有实现层面的 UDP relay 限制：它申请的 1,500 字节
+buffer 被池扩展为 2,048 字节，服务端会截断更大的分帧数据包。互操作实测
+8,192 字节 payload 只返回 2,048 字节，而 2,048 字节回显正常。这不是 Juicity
+线协议限制，因此 honk 不会对其他服务端任意施加 2,048 字节上限。
+
 Hysteria2 HTTP/3 层刻意保持本地且最小：control/QPACK uni stream、静态表
 QPACK，以及认证所需的 HEADERS 处理。它不得宣告
 `SETTINGS_H3_DATAGRAM`；否则会启动一个竞争的 quic-go datagram reader，
@@ -582,17 +594,13 @@ pending chunk，也不会重复入队。
 frame 按 SID 有序停放到 overflow，而不是等待，从而保持 sibling 进度与
 精确 frame/byte 计数。
 
-Soft limit 为：
-
-- 每 session 512 个 parked frame 与 8 MiB；以及
-- 每 stream 2 MiB。
-
-越过 soft limit 不会杀死 stream。第一个 parked frame 启动每 250 ms tick
+第一个 parked frame 启动每 250 ms tick
 一次的 watchdog。只有整整 3 秒没有成功 overflow flush 的 stream 才被
 reset；仅存在 queued byte 不是 stall 证据。
 
-Emergency hard limit 为每 session 768 个 frame 或 12 MiB。如果某 stream
-已经超过 3 秒 grace，admission 立即 reap 它。否则 demultiplexer 以有界
+Emergency hard limit 为每 session 768 个 parked frame；retained payload
+字节数由下文的 pool-wide budget 单独约束。如果某 stream 已超过 3 秒 grace，
+admission 立即 reap 它。否则 demultiplexer 以有界
 100 ms `OVERFLOW_EMERGENCY_WAIT` 轮次等待，并缩短到最近的 grace 到期时间，
 在 reader progress 后重新判断。
 

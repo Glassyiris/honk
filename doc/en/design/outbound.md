@@ -238,10 +238,18 @@ When REALITY parameters are present, it dispatches to `reality::reality_connect`
 of ordinary TLS. The same shared path therefore gives Trojan, VMess, and VLESS
 consistent TLS, REALITY, WS, and gRPC setup.
 
+Cold and pooled-bare Trojan streams use that same complete transport stack.
+TLS batching returns bytes already read before surfacing a later I/O error on
+the next non-empty read; it never converts that error into EOF.
+
 The gRPC transport is a hand-written minimal gRPC-over-HTTP/2 client that interoperates with official sing-box Trojan+gRPC. The
 opening HEADERS frame does not set `END_STREAM`, and TLS requests use
 `:scheme: https`. DATA carries gRPC length prefixes and the protobuf
 single-bytes-field envelope expected by gun-style servers.
+gRPC over TLS always negotiates `h2`, independent of the fingerprint profile.
+Its bounded write queue reports bytes once it owns them; cancellation cannot
+attribute those bytes to a later caller buffer. Positive HTTP/2 windows are
+usable whenever one payload byte and its envelope fit.
 
 ### Marked sockets and name resolution
 
@@ -597,6 +605,12 @@ protocol heartbeat datagrams are unavailable.
 | Juicity (`src/proxy/juicity.rs`, verified juicity-rs server interop) | ALPN `h3`; TLS-exporter auth; bi-stream header `[network][trojanc metadata]` | One bi stream with `[metadata][u16 length][payload]` records (`[metadata][len u16][payload]`) | Upstream juicity/juicity-rs default BBR; 8 MiB stream and 8 MiB connection receive windows |
 | Hysteria2 (`src/proxy/hysteria2/`, `mod.rs`) | ALPN `h3`; minimal `h3.rs` HTTP/3/QPACK `POST https://hysteria/auth`, success status `233` | Native Hysteria2 QUIC datagrams and fragmentation | `hy2_up_mbps` selects `quic::BrutalConfig` (window = rate×RTT, ignores loss), otherwise BBR; `hy2_down_mbps` is sent in bytes/s through `Hysteria-CC-RX`; same 8/8 MiB default receive windows |
 
+The Go `juicity-server` v0.4.3 has an implementation-specific UDP relay limit:
+its 1,500-byte requested buffer is rounded to 2,048 bytes, and oversized framed
+packets are truncated by the server. Interop observed 8,192-byte payloads returning
+2,048 bytes; 2,048-byte echoes passed. This is not a Juicity wire limit, so honk
+does not impose an arbitrary 2,048-byte cap on other servers.
+
 Hysteria2's HTTP/3 layer is deliberately local and minimal: control/QPACK
 unidirectional streams, static-table QPACK, and enough HEADERS handling for
 authentication. It must not advertise `SETTINGS_H3_DATAGRAM`; doing so starts a
@@ -684,16 +698,12 @@ Each TCP child has a bounded delivery queue, demultiplexed by `sid`. When it fil
 parks frames in a per-SID ordered overflow instead of waiting, preserving
 sibling progress and exact frame/byte accounting.
 
-Soft limits are:
-
-- 512 parked frames and 8 MiB per session; and
-- 2 MiB per stream.
-
-Crossing a soft limit does not kill the stream. The first parked frame starts a
-watchdog ticking every 250 ms; it retires on overflow drain and is aborted on close. Only a stream with no successful overflow flush
+The first parked frame starts a watchdog ticking every 250 ms; it retires on
+overflow drain and is aborted on close. Only a stream with no successful overflow flush
 for a full 3 seconds is reset; queued bytes alone are not evidence of a stall.
 
-Emergency hard limits are 768 frames or 12 MiB per session. If a stream is
+The emergency hard limit is 768 parked frames per session. Retained payload bytes
+are bounded separately by the pool-wide budgets below. If a stream is
 already past the 3-second grace, admission reaps that stream immediately.
 Otherwise the demultiplexer waits in bounded 100 ms
 `OVERFLOW_EMERGENCY_WAIT` rounds, shortened to the nearest grace expiry, and

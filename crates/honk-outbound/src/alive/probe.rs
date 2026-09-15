@@ -3,9 +3,8 @@ use crate::group::{ScoreOutcome, ScoreReporter, ScoreSelectionContext, Selection
 
 impl AliveDialerSet {
     fn raw_probe_reporter(&self, node_id: Uuid, ipver: IpVersion) -> Option<ScoreReporter> {
-        self.score_feedback
-            .read()
-            .as_ref()
+        let factory = self.score_feedback.read().clone();
+        factory
             .and_then(|factory| {
                 factory(
                     node_id,
@@ -21,6 +20,49 @@ impl AliveDialerSet {
 }
 
 impl AliveDialerSet {
+    fn same_registration(
+        current: Option<&Arc<RegisteredNode>>,
+        captured: Option<&Arc<RegisteredNode>>,
+    ) -> bool {
+        match (current, captured) {
+            (Some(current), Some(captured)) => Arc::ptr_eq(current, captured),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn apply_probe_result(
+        &self,
+        node_id: Uuid,
+        registration: Option<&Arc<RegisteredNode>>,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+        latency: Option<Duration>,
+    ) {
+        let registered = self.registered.read();
+        if !Self::same_registration(registered.get(&node_id), registration) {
+            return;
+        }
+        let changed = match latency {
+            Some(latency) => self.record_probe_latency_state(
+                node_id,
+                domain,
+                ipver,
+                latency,
+                domain != ProbeDomain::Tcp,
+            ),
+            None => self.mark_unavailable_state(node_id, domain, ipver, false, false),
+        };
+        // Removal and result mutation have one order. Notifications run unlocked;
+        // a reentrant resolver/callback must not authorize another old update.
+        drop(registered);
+        if changed {
+            self.notify_health_change(node_id, domain, ipver, latency.is_some(), || {
+                Self::same_registration(self.registered.read().get(&node_id), registration)
+            });
+        }
+    }
+
     /// Probe a single node's TCP reachability.
     ///
     /// When an HTTP prober is configured (Go: `TcpCheckOption`), this resolves
@@ -39,9 +81,10 @@ impl AliveDialerSet {
         // latency ranking but never the liveness verdict (see
         // mark_unavailable_internal).
         if node_id == honk_config::config::DIRECT_NODE_ID {
+            let registration = self.registered.read().get(&node_id).cloned();
             let target = self.direct_check_addr.read().clone();
             return self
-                .probe_node_tcp(node_id, "direct", &target, timeout)
+                .probe_node_tcp(node_id, "direct", &target, timeout, registration.as_ref())
                 .await;
         }
         let registered = self.registered.read().get(&node_id).cloned();
@@ -50,15 +93,20 @@ impl AliveDialerSet {
         };
 
         // Clone the Arc out of the lock before awaiting (parking_lot guard is !Send).
-        let prober_opt = self.http_prober.read().clone();
-        if let Some(ref prober) = prober_opt {
-            return self
-                .probe_node_http(node_id, &registered, timeout, prober)
-                .await;
-        }
-
-        self.probe_node_tcp(node_id, &registered.name, &registered.address, timeout)
+        let prober = self.http_prober.read().clone();
+        if let Some(prober) = &prober {
+            self.probe_node_http(node_id, &registered, timeout, prober)
+                .await
+        } else {
+            self.probe_node_tcp(
+                node_id,
+                &registered.name,
+                &registered.address,
+                timeout,
+                Some(&registered),
+            )
             .await
+        }
     }
 
     /// HTTP-based health check: resolves the check URL hostname, dials through
@@ -66,7 +114,7 @@ impl AliveDialerSet {
     async fn probe_node_http(
         &self,
         node_id: Uuid,
-        registered: &RegisteredNode,
+        registered: &Arc<RegisteredNode>,
         timeout: Duration,
         prober: &HttpProberRef,
     ) -> bool {
@@ -74,13 +122,25 @@ impl AliveDialerSet {
         let check_url = self.check_url.read().clone();
         if check_url.is_empty() {
             return self
-                .probe_node_tcp(node_id, node_name, &registered.address, timeout)
+                .probe_node_tcp(
+                    node_id,
+                    node_name,
+                    &registered.address,
+                    timeout,
+                    Some(registered),
+                )
                 .await;
         }
 
         let Ok(target) = honk_config::check::decode_health_http_target(&check_url) else {
             return self
-                .probe_node_tcp(node_id, node_name, &registered.address, timeout)
+                .probe_node_tcp(
+                    node_id,
+                    node_name,
+                    &registered.address,
+                    timeout,
+                    Some(registered),
+                )
                 .await;
         };
         let hostname = target.host();
@@ -147,7 +207,13 @@ impl AliveDialerSet {
                             a,
                             elapsed.as_millis()
                         );
-                        self.record_probe_latency(node_id, ProbeDomain::Tcp, ipver, elapsed);
+                        self.apply_probe_result(
+                            node_id,
+                            Some(registered),
+                            ProbeDomain::Tcp,
+                            ipver,
+                            Some(elapsed),
+                        );
                         any_ok = true;
                         family_ok = true;
                         break;
@@ -175,7 +241,7 @@ impl AliveDialerSet {
                 }
             }
             if !family_ok {
-                self.mark_dead_for(node_id, ProbeDomain::Tcp, ipver);
+                self.apply_probe_result(node_id, Some(registered), ProbeDomain::Tcp, ipver, None);
             }
         }
 
@@ -298,6 +364,7 @@ impl AliveDialerSet {
         node_name: &str,
         node_addr: &str,
         timeout: Duration,
+        registration: Option<&Arc<RegisteredNode>>,
     ) -> bool {
         let addr = node_addr.to_string();
         let (host, port) = match addr.rsplit_once(':') {
@@ -315,8 +382,20 @@ impl AliveDialerSet {
                     node_name,
                     addr
                 );
-                self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V4);
-                self.mark_dead_for(node_id, ProbeDomain::Tcp, IpVersion::V6);
+                self.apply_probe_result(
+                    node_id,
+                    registration,
+                    ProbeDomain::Tcp,
+                    IpVersion::V4,
+                    None,
+                );
+                self.apply_probe_result(
+                    node_id,
+                    registration,
+                    ProbeDomain::Tcp,
+                    IpVersion::V6,
+                    None,
+                );
                 return false;
             }
             Err(_) => {
@@ -377,7 +456,13 @@ impl AliveDialerSet {
                         a,
                         elapsed.as_millis()
                     );
-                    self.record_probe_latency(node_id, ProbeDomain::Tcp, ipver, elapsed);
+                    self.apply_probe_result(
+                        node_id,
+                        registration,
+                        ProbeDomain::Tcp,
+                        ipver,
+                        Some(elapsed),
+                    );
                     any_ok = true;
                 }
                 Ok(Err(e)) => {
@@ -394,7 +479,7 @@ impl AliveDialerSet {
                         a,
                         e
                     );
-                    self.mark_dead_for(node_id, ProbeDomain::Tcp, ipver);
+                    self.apply_probe_result(node_id, registration, ProbeDomain::Tcp, ipver, None);
                 }
                 Err(_) => {
                     if let Some(reporter) = &reporter {
@@ -406,7 +491,7 @@ impl AliveDialerSet {
                         a,
                         timeout
                     );
-                    self.mark_dead_for(node_id, ProbeDomain::Tcp, ipver);
+                    self.apply_probe_result(node_id, registration, ProbeDomain::Tcp, ipver, None);
                 }
             }
         }
@@ -446,6 +531,20 @@ impl AliveDialerSet {
     /// legacy TCP-fallback selection semantics (see
     /// [`AliveDialerSet::has_udp_state`]).
     pub async fn probe_node_udp(&self, node_id: Uuid, timeout: Duration) -> bool {
+        let registration = self.registered.read().get(&node_id).cloned();
+        self.probe_node_udp_registered(node_id, timeout, registration)
+            .await
+    }
+
+    async fn probe_node_udp_registered(
+        &self,
+        node_id: Uuid,
+        timeout: Duration,
+        registration: Option<Arc<RegisteredNode>>,
+    ) -> bool {
+        if !Self::same_registration(self.registered.read().get(&node_id), registration.as_ref()) {
+            return false;
+        }
         // direct/block UDP liveness carries no verdict: the builtins are
         // never marked dead, and the UDP check target (e.g. 8.8.8.8) is not
         // a reliable direct-egress signal either.
@@ -457,12 +556,15 @@ impl AliveDialerSet {
         }
         // Clone the Arc out of the lock before awaiting (parking_lot guard
         // is !Send).
-        let prober_opt = self.udp_prober.read().clone();
-        let Some(ref prober) = prober_opt else {
+        let prober = self.udp_prober.read().clone();
+        let Some(prober) = &prober else {
             return false;
         };
 
-        let node_name = self.node_name(node_id);
+        let node_name = registration
+            .as_ref()
+            .map(|node| node.name.clone())
+            .unwrap_or_else(|| node_id.to_string());
         const IPVERS: [IpVersion; 2] = [IpVersion::V4, IpVersion::V6];
         let outcome = prober.probe_udp(&node_name, timeout).await;
         let measured = |result: Option<anyhow::Result<Duration>>| {
@@ -481,7 +583,13 @@ impl AliveDialerSet {
                 );
                 for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
                     for ipver in IPVERS {
-                        self.mark_alive_for_latency(node_id, domain, ipver, elapsed);
+                        self.apply_probe_result(
+                            node_id,
+                            registration.as_ref(),
+                            domain,
+                            ipver,
+                            Some(elapsed),
+                        );
                     }
                 }
                 true
@@ -494,8 +602,20 @@ impl AliveDialerSet {
                     dns_err
                 );
                 for ipver in IPVERS {
-                    self.mark_dead_for(node_id, ProbeDomain::DnsUdp, ipver);
-                    self.mark_alive_for_latency(node_id, ProbeDomain::DataUdp, ipver, data_elapsed);
+                    self.apply_probe_result(
+                        node_id,
+                        registration.as_ref(),
+                        ProbeDomain::DnsUdp,
+                        ipver,
+                        None,
+                    );
+                    self.apply_probe_result(
+                        node_id,
+                        registration.as_ref(),
+                        ProbeDomain::DataUdp,
+                        ipver,
+                        Some(data_elapsed),
+                    );
                 }
                 true
             }
@@ -515,20 +635,38 @@ impl AliveDialerSet {
                 }
                 for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
                     for ipver in IPVERS {
-                        self.mark_dead_for(node_id, domain, ipver);
+                        self.apply_probe_result(
+                            node_id,
+                            registration.as_ref(),
+                            domain,
+                            ipver,
+                            None,
+                        );
                     }
                 }
                 false
             }
             (None, Some(Ok(data_elapsed))) => {
                 for ipver in IPVERS {
-                    self.mark_alive_for_latency(node_id, ProbeDomain::DataUdp, ipver, data_elapsed);
+                    self.apply_probe_result(
+                        node_id,
+                        registration.as_ref(),
+                        ProbeDomain::DataUdp,
+                        ipver,
+                        Some(data_elapsed),
+                    );
                 }
                 true
             }
             (None, Some(Err(_))) => {
                 for ipver in IPVERS {
-                    self.mark_dead_for(node_id, ProbeDomain::DataUdp, ipver);
+                    self.apply_probe_result(
+                        node_id,
+                        registration.as_ref(),
+                        ProbeDomain::DataUdp,
+                        ipver,
+                        None,
+                    );
                 }
                 false
             }
@@ -548,11 +686,16 @@ impl AliveDialerSet {
         timeout: Duration,
         concurrency: usize,
     ) {
-        let nodes: Vec<Uuid> = self.registered.read().keys().copied().collect();
+        let nodes: Vec<_> = self
+            .registered
+            .read()
+            .iter()
+            .map(|(id, node)| (*id, Arc::clone(node)))
+            .collect();
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
         let mut join_set = tokio::task::JoinSet::new();
 
-        for id in nodes {
+        for (id, registration) in nodes {
             if self.is_probe_suspended(id) {
                 continue;
             }
@@ -579,7 +722,8 @@ impl AliveDialerSet {
                     this.probe_node(id, timeout).await;
                 }
                 if udp_due {
-                    this.probe_node_udp(id, timeout).await;
+                    this.probe_node_udp_registered(id, timeout, Some(registration))
+                        .await;
                 }
             });
         }
@@ -602,7 +746,12 @@ impl AliveDialerSet {
         // Matches Go's TcpCheckOptionRaw.Reset().
         self.refresh_check_ips().await;
 
-        let nodes: Vec<Uuid> = self.registered.read().keys().copied().collect();
+        let nodes: Vec<_> = self
+            .registered
+            .read()
+            .iter()
+            .map(|(id, node)| (*id, Arc::clone(node)))
+            .collect();
         if nodes.is_empty() {
             return;
         }
@@ -611,7 +760,7 @@ impl AliveDialerSet {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
         let mut join_set = tokio::task::JoinSet::new();
 
-        for id in nodes {
+        for (id, registration) in nodes {
             // URLTest idle suspension: skip nodes whose groups are all idle
             // (lazy start: never-active groups start suspended).
             if self.is_probe_suspended(id) {
@@ -636,7 +785,8 @@ impl AliveDialerSet {
                 // stops) instead of re-probing every cycle. No-op without
                 // an installed UdpProber.
                 if this.should_probe(id, ProbeDomain::DataUdp, IpVersion::V4) {
-                    this.probe_node_udp(id, timeout).await;
+                    this.probe_node_udp_registered(id, timeout, Some(registration))
+                        .await;
                 }
             });
         }

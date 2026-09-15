@@ -2,7 +2,6 @@ use super::*;
 #[tokio::test]
 async fn successful_offer_releases_reusable_admission_permit() {
     let pool_a = Arc::new(pool(SessionPoolConfig::default()));
-    let pool_b = Arc::new(pool(SessionPoolConfig::default()));
     let generation = crate::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
         &[],
         1,
@@ -15,8 +14,7 @@ async fn successful_offer_releases_reusable_admission_permit() {
     let admission = generation
         .scope_dials(async { crate::runtime::capture_dial_admission() })
         .await;
-    pool_a.set_dial_admission(admission.clone());
-    pool_b.set_dial_admission(admission);
+    pool_a.set_dial_admission(admission);
 
     let offer_admission = pool_a
         .dial_admission
@@ -42,7 +40,6 @@ async fn successful_offer_releases_reusable_admission_permit() {
     .await
     .expect("completed pool offer retained its physical dial permit")
     .unwrap();
-    assert!(!pool_b.is_retired());
 }
 
 #[tokio::test]

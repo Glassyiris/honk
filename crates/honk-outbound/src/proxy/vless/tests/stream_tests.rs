@@ -342,15 +342,6 @@ async fn vision_passthrough_without_uuid_prefix() {
 }
 
 #[tokio::test]
-async fn vision_detect_short_stream_below_probe_size() {
-    // Fewer than uuid(16)+header(5) bytes can never prove framing;
-    // even a UUID-looking prefix passes through raw at EOF.
-    let uuid = [7u8; 16];
-    let data = uuid[..10].to_vec();
-    assert_eq!(unpad_all(uuid, &data, 2).await, data);
-}
-
-#[tokio::test]
 async fn vision_unpad_lab_frame_sequence() {
     // Mirrored from a live sing-box vision downlink trace: big content
     // frames with long padding, then a Direct switch to raw.

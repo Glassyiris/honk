@@ -92,9 +92,7 @@ async fn saturated_writer_still_delivers_required_end() {
             gate: Arc::clone(&gate),
         }),
         MAX_STREAMS_PER_SESSION,
-    )
-    .await
-    .unwrap();
+    );
     let blocker = {
         let writer = session.writer.clone();
         tokio::spawn(async move { writer.flush().await })
@@ -159,9 +157,7 @@ async fn pre_admission_cancel_keeps_an_active_shared_xudp_sid_usable() {
             gate: Arc::clone(&gate),
         }),
         MAX_STREAMS_PER_SESSION,
-    )
-    .await
-    .unwrap();
+    );
     let udp = open_xudp(
         Arc::clone(&session),
         session.try_reserve().unwrap(),
@@ -258,9 +254,7 @@ async fn cancelled_tcp_write_does_not_send_or_replay_bytes() {
             gate: Arc::clone(&gate),
         }),
         MAX_STREAMS_PER_SESSION,
-    )
-    .await
-    .unwrap();
+    );
     let mut stream = open_tcp(
         Arc::clone(&session),
         session.try_reserve().unwrap(),
@@ -314,9 +308,7 @@ async fn cancelled_tcp_write_does_not_send_or_replay_bytes() {
 #[tokio::test]
 async fn dropping_a_pending_shutdown_still_sends_end() {
     let (client, mut wire) = tokio::io::duplex(1 << 16);
-    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION)
-        .await
-        .unwrap();
+    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION);
     let mut stream = open_tcp(
         Arc::clone(&session),
         session.try_reserve().unwrap(),
@@ -337,6 +329,54 @@ async fn dropping_a_pending_shutdown_still_sends_end() {
 }
 
 #[tokio::test]
+async fn cancelled_pending_flush_then_shutdown_sends_end() {
+    let (client, mut wire) = tokio::io::duplex(1 << 16);
+    let gate = Arc::new(FlushGate::default());
+    gate.open();
+    let session = connect(
+        Box::new(GatedFlushIo {
+            inner: client,
+            gate: Arc::clone(&gate),
+        }),
+        MAX_STREAMS_PER_SESSION,
+    );
+    let mut stream = open_tcp(
+        Arc::clone(&session),
+        session.try_reserve().unwrap(),
+        "127.0.0.1:80".parse().unwrap(),
+        None,
+    )
+    .await
+    .unwrap_or_else(|_| panic!("TCP stream must open"));
+    let id = read_wire_frame(&mut wire).await.id;
+
+    gate.close();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), stream.flush())
+            .await
+            .is_err()
+    );
+    assert!(matches!(stream.operation, Some(StreamOperation::Flush(_))));
+
+    gate.open();
+    stream.shutdown().await.unwrap();
+    let end = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut wire))
+        .await
+        .expect("shutdown completed without delivering END")
+        .unwrap();
+    assert_eq!((end.id, end.status), (id, STATUS_END));
+    assert_eq!(
+        stream
+            .write_all(b"after shutdown")
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    session.close();
+}
+
+#[tokio::test]
 async fn first_send_waits_for_flush_and_cancellation_never_replays() {
     let (client, mut wire) = tokio::io::duplex(1 << 16);
     let gate = Arc::new(FlushGate::default());
@@ -346,9 +386,7 @@ async fn first_send_waits_for_flush_and_cancellation_never_replays() {
             gate: Arc::clone(&gate),
         }),
         MAX_STREAMS_PER_SESSION,
-    )
-    .await
-    .unwrap();
+    );
     let udp = open_udp(
         Arc::clone(&session),
         session.try_reserve().unwrap(),

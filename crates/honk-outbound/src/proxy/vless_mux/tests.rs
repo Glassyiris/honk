@@ -535,7 +535,7 @@ async fn prepare_detached(
         .unwrap_or_else(|_| panic!("detached UDP stream must open"));
     let transport: Arc<dyn PacketTransport> = transport;
     (
-        super::super::PreparedUdpTransport::new(move || async move {
+        super::super::PreparedUdpTransport::new(async move {
             reservation.commit()?;
             Ok(transport)
         }),

@@ -718,10 +718,10 @@ async fn run_reader<R: AsyncRead + Unpin>(
     }
 }
 
-pub(crate) async fn connect(
+pub(crate) fn connect(
     stream: Box<dyn AsyncReadWrite>,
     active_limit: usize,
-) -> anyhow::Result<Arc<VlessCoolSession>> {
+) -> Arc<VlessCoolSession> {
     let (reader, writer) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel(WRITER_QUEUE_CAPACITY);
     let session = Arc::new(VlessCoolSession {
@@ -742,7 +742,7 @@ pub(crate) async fn connect(
     session.install_task(writer_task.abort_handle());
     let reader_task = tokio::spawn(run_reader(reader, Arc::downgrade(&session)));
     session.install_task(reader_task.abort_handle());
-    Ok(session)
+    session
 }
 
 impl MuxSession for VlessCoolSession {

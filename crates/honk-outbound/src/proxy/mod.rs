@@ -539,16 +539,12 @@ where
     })
 }
 
-type PreparedUdpCommitFuture<T> =
-    std::pin::Pin<Box<dyn Future<Output = anyhow::Result<Arc<T>>> + Send>>;
-type PreparedUdpCommit<T> = Box<dyn FnOnce() -> PreparedUdpCommitFuture<T> + Send>;
-
 /// A prepared UDP transport that is usable only after its final side effects
 /// have been committed. Dropping it without [`Self::commit`] abandons the
 /// preparation; protocol-specific resources then clean themselves up via
 /// normal RAII. Commit failure drops the transport and returns no value.
 pub struct PreparedUdpTransport<T: ?Sized = dyn PacketTransport> {
-    commit: PreparedUdpCommit<T>,
+    commit: std::pin::Pin<Box<dyn Future<Output = anyhow::Result<Arc<T>>> + Send>>,
 }
 
 impl<T: ?Sized> std::fmt::Debug for PreparedUdpTransport<T> {
@@ -559,27 +555,26 @@ impl<T: ?Sized> std::fmt::Debug for PreparedUdpTransport<T> {
 }
 
 impl<T: ?Sized + Send + Sync + 'static> PreparedUdpTransport<T> {
-    pub fn new<F, Fut>(commit: F) -> Self
+    pub fn new<Fut>(commit: Fut) -> Self
     where
-        F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = anyhow::Result<Arc<T>>> + Send + 'static,
     {
         Self {
-            commit: Box::new(move || Box::pin(commit())),
+            commit: Box::pin(commit),
         }
     }
     /// Wrap an already-authoritative ordinary transport. This deliberately
     /// preserves `dial_udp_transport` semantics for protocols with no
     /// speculative ownership to promote.
     pub fn ready(transport: Arc<T>) -> Self {
-        Self::new(move || async move { Ok(transport) })
+        Self::new(async move { Ok(transport) })
     }
 
     /// Consume the preparation, run its one-shot promotion, then expose the
     /// transport. A failed promotion is fail-closed: the transport is dropped
     /// and cannot be sent on by a caller.
     pub async fn commit(self) -> anyhow::Result<Arc<T>> {
-        (self.commit)().await
+        self.commit.await
     }
 }
 async fn prepare_detached_quic_transport<T, F, Fut>(
@@ -596,7 +591,7 @@ where
         anyhow::bail!("node '{}' has no QUIC runtime", runtime.node.name);
     }
     let transport = prepare(Arc::clone(&client)).await?;
-    Ok(PreparedUdpTransport::new(move || async move {
+    Ok(PreparedUdpTransport::new(async move {
         let crate::runtime::ProtocolRuntime::Quic(quic) = &runtime.runtime else {
             anyhow::bail!("node '{}' lost its QUIC runtime", runtime.node.name);
         };
@@ -831,8 +826,7 @@ impl ProtocolEntry {
                 protocol.as_str()
             );
         }
-        if self.descriptor.generation_runtime(&default_node)
-            != crate::runtime::GenerationRuntime::None
+        if self.descriptor.generation_runtime != crate::runtime::GenerationRuntime::None
             && self.warmable.is_none()
         {
             panic!(

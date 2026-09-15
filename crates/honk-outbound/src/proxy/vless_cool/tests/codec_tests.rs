@@ -23,7 +23,7 @@ fn documented_xudp_new_vector_is_exact() {
 #[tokio::test]
 async fn configured_active_limit_is_a_hard_semaphore() {
     let (client, _wire) = tokio::io::duplex(1024);
-    let session = connect(Box::new(client), 1).await.unwrap();
+    let session = connect(Box::new(client), 1);
     let first = session.try_reserve().expect("first active child");
     assert!(session.try_reserve().is_none());
     drop(first);

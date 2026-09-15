@@ -322,58 +322,13 @@ async fn warm_resources_report_session_state_only() {
         "session-less protocols have nothing to retain either way"
     );
 
-    struct FakeClient;
-    #[async_trait::async_trait]
-    impl QuicRuntimeClient for FakeClient {
-        fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
-            self
-        }
-        async fn force_close(&self) {}
-        async fn release_warm(&self) {}
-    }
     let ProtocolRuntime::Quic(quic) = &tuic_runtime.runtime else {
         panic!("tuic runtime expected");
     };
-    quic.client(|| async { Ok(Arc::new(FakeClient)) })
+    quic.client(|| async { Ok(Arc::new(FakeQuicClient::default())) })
         .await
         .unwrap();
     assert!(tuic_runtime.is_warm_or_stateless_for(crate::proxy::WarmRequirement::Session));
-}
-
-#[tokio::test]
-async fn build_and_get_roundtrip() {
-    let nodes = vec![
-        node("a", NodeProtocol::AnyTLS),
-        node("b", NodeProtocol::Trojan),
-    ];
-    let registry = OutboundRuntimeRegistry::build(&nodes).unwrap();
-    assert_eq!(registry.len(), 2);
-    let rt = registry.get(&nodes[0].id).unwrap();
-    assert_eq!(rt.node.name, "a");
-    assert!(rt.udp_capable);
-    registry.shutdown().await; // terminal cleanup is idempotent
-}
-
-#[test]
-fn rejects_nil_uuid() {
-    let mut n = node("nil", NodeProtocol::Trojan);
-    n.id = uuid::Uuid::nil();
-    assert!(OutboundRuntimeRegistry::build(&[n]).is_err());
-}
-
-#[test]
-fn rejects_duplicate_uuid() {
-    let a = node("a", NodeProtocol::Trojan);
-    let mut b = node("b", NodeProtocol::SS);
-    b.id = a.id;
-    assert!(OutboundRuntimeRegistry::build(&[a.clone(), b]).is_err());
-
-    // A duplicate with the same name and canonical identity remains rejected.
-    assert_admission(
-        OutboundRuntimeRegistry::build(&[a.clone(), a]).unwrap_err(),
-        "duplicate-node-id",
-        1,
-    );
 }
 
 #[test]

@@ -395,34 +395,6 @@ async fn udp_policy_denial_skips_dns_before_dial_and_health_feedback() {
 }
 
 #[tokio::test]
-async fn c27_legacy_factories_fail_fast_on_invalid_nodes() {
-    for node in invalid_probe_nodes() {
-        assert!(
-            std::panic::catch_unwind(|| { honk_outbound::runtime::NodeRuntime::ephemeral(&node) })
-                .is_err()
-        );
-        assert!(
-            std::panic::catch_unwind(|| {
-                honk_outbound::runtime::NodeRuntime::ephemeral_guarded(&node)
-            })
-            .is_err()
-        );
-        let generation =
-            honk_outbound::runtime::OutboundRuntimeRegistry::build(&[udp_test_node()]).unwrap();
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                honk_outbound::urltest::probe_runtime(
-                    &generation,
-                    &node,
-                    honk_outbound::proxy::WarmRequirement::Session,
-                )
-            }))
-            .is_err()
-        );
-    }
-}
-
-#[tokio::test]
 async fn c27_urltest_propagates_admission_before_dial() {
     let generation = Arc::new(
         honk_outbound::runtime::OutboundRuntimeRegistry::build(&[udp_test_node()]).unwrap(),

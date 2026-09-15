@@ -330,7 +330,7 @@ impl honk_outbound::proxy::PacketOutbound for UdpTestHandler {
         if let UdpTestMode::PreparedCommitError { commits, .. } = &self.mode {
             let commits = Arc::clone(commits);
             return Ok(honk_outbound::proxy::PreparedUdpTransport::new(
-                move || async move {
+                async move {
                     let _transport = transport;
                     commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     Err(anyhow::anyhow!(
@@ -350,7 +350,7 @@ impl honk_outbound::proxy::PacketOutbound for UdpTestHandler {
             let entered = Arc::clone(entered);
             let release = Arc::clone(release);
             return Ok(honk_outbound::proxy::PreparedUdpTransport::new(
-                move || async move {
+                async move {
                     entered.notify_one();
                     release.notified().await;
                     commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

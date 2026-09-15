@@ -379,7 +379,7 @@ async fn cool_c8_opens_seventeen_tcp_children_on_three_global_carriers() {
                     inner: Box::new(client),
                     _owner: permit,
                 };
-                super::super::vless_cool::connect(Box::new(carrier), 8).await
+                Ok(super::super::vless_cool::connect(Box::new(carrier), 8))
             }
         }
     };
@@ -452,9 +452,7 @@ async fn idle_reap_returns_carrier_credit_without_cutting_retained_or_active_ses
                 _owner: permit,
             }),
             8,
-        )
-        .await
-        .unwrap();
+        );
         pool.insert(&session);
         peers.push(peer);
         sessions.push(session);

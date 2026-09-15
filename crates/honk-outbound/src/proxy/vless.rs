@@ -206,7 +206,7 @@ impl VLessHandler {
             .ok_or_else(|| super::PacketRejection::Policy.into())
     }
 
-    async fn open_unpooled_udp(
+    async fn open_udp(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,
         path: VlessUdpPath,
@@ -215,6 +215,15 @@ impl VLessHandler {
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         match path {
+            VlessUdpPath::H2 => {
+                Self::open_h2_udp(runtime, target, target_domain, connect_timeout).await
+            }
+            VlessUdpPath::CoolShared => {
+                Self::open_cool_udp(runtime, false, target, target_domain, connect_timeout).await
+            }
+            VlessUdpPath::CoolSeparate => {
+                Self::open_cool_udp(runtime, true, target, target_domain, connect_timeout).await
+            }
             VlessUdpPath::Native => {
                 let vless = runtime.node.vless().unwrap();
                 let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
@@ -256,9 +265,6 @@ impl VLessHandler {
                     super::vless_cool::connect_single_xudp(stream, target, target_domain, [0; 8])
                         .await?,
                 )
-            }
-            VlessUdpPath::H2 | VlessUdpPath::CoolShared | VlessUdpPath::CoolSeparate => {
-                unreachable!("pooled VLESS UDP path passed to unpooled opener")
             }
         }
     }
@@ -352,7 +358,7 @@ impl VLessHandler {
         let stream = Self::new()
             .dial_retained_mux_carrier(&runtime, connect_timeout)
             .await?;
-        super::vless_cool::connect(stream, active_limit).await
+        Ok(super::vless_cool::connect(stream, active_limit))
     }
 
     async fn open_cool_tcp(
@@ -460,7 +466,7 @@ impl VLessHandler {
                         .await
                         .map_err(Self::open_error)?;
                     let transport: Arc<dyn PacketTransport> = transport;
-                    return Ok(PreparedUdpTransport::new(move || async move {
+                    return Ok(PreparedUdpTransport::new(async move {
                         reservation.commit()?;
                         Ok(transport)
                     }));
@@ -528,7 +534,7 @@ impl VLessHandler {
                     )
                     .await
                     .map_err(Self::open_error)?;
-                    return Ok(PreparedUdpTransport::new(move || async move {
+                    return Ok(PreparedUdpTransport::new(async move {
                         reservation.commit()?;
                         Ok(transport)
                     }));
@@ -721,22 +727,15 @@ impl PacketOutbound for VLessHandler {
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let path = Self::udp_path(node, target.port())?;
         let owner = crate::runtime::NodeRuntime::try_ephemeral_guarded(node)?;
-        let runtime = owner.runtime();
-        let transport = match path {
-            VlessUdpPath::H2 => {
-                Self::open_h2_udp(runtime, target, target_domain, connect_timeout).await?
-            }
-            VlessUdpPath::CoolShared => {
-                Self::open_cool_udp(runtime, false, target, target_domain, connect_timeout).await?
-            }
-            VlessUdpPath::CoolSeparate => {
-                Self::open_cool_udp(runtime, true, target, target_domain, connect_timeout).await?
-            }
-            VlessUdpPath::Native | VlessUdpPath::Xudp | VlessUdpPath::UotV2 => {
-                self.open_unpooled_udp(runtime, path, target, target_domain, connect_timeout)
-                    .await?
-            }
-        };
+        let transport = self
+            .open_udp(
+                owner.runtime(),
+                path,
+                target,
+                target_domain,
+                connect_timeout,
+            )
+            .await?;
         Ok(super::packet_transport_with_owner(transport, owner))
     }
 
@@ -748,21 +747,8 @@ impl PacketOutbound for VLessHandler {
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let path = Self::udp_path(&runtime.node, target.port())?;
-        match path {
-            VlessUdpPath::H2 => {
-                Self::open_h2_udp(runtime, target, target_domain, connect_timeout).await
-            }
-            VlessUdpPath::CoolShared => {
-                Self::open_cool_udp(runtime, false, target, target_domain, connect_timeout).await
-            }
-            VlessUdpPath::CoolSeparate => {
-                Self::open_cool_udp(runtime, true, target, target_domain, connect_timeout).await
-            }
-            VlessUdpPath::Native | VlessUdpPath::Xudp | VlessUdpPath::UotV2 => {
-                self.open_unpooled_udp(runtime, path, target, target_domain, connect_timeout)
-                    .await
-            }
-        }
+        self.open_udp(runtime, path, target, target_domain, connect_timeout)
+            .await
     }
 
     async fn dial_udp_transport_speculative_runtime(
@@ -809,7 +795,7 @@ impl PacketOutbound for VLessHandler {
                 .await
             }
             VlessUdpPath::Native | VlessUdpPath::Xudp | VlessUdpPath::UotV2 => self
-                .open_unpooled_udp(runtime, path, target, target_domain, connect_timeout)
+                .open_udp(runtime, path, target, target_domain, connect_timeout)
                 .await
                 .map(PreparedUdpTransport::ready),
         }

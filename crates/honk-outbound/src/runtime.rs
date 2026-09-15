@@ -429,7 +429,7 @@ impl NodeRuntime {
             node: Arc::new(node.clone()),
             udp_capable: (crate::descriptor::descriptor(node.protocol()).supports_udp)(node),
             runtime: crate::descriptor::descriptor(node.protocol())
-                .generation_runtime(node)
+                .generation_runtime
                 .build(node, false),
             ephemeral: true,
             warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
@@ -470,19 +470,6 @@ impl NodeRuntime {
         EphemeralRuntimeGuard {
             runtime: Some(Self::build_ephemeral(node)),
         }
-    }
-
-    /// Compatibility wrapper for [`Self::try_ephemeral`]; panics on invalid input.
-    /// The caller retains the same explicit-close obligation.
-    pub fn ephemeral(node: &Node) -> Arc<Self> {
-        Self::try_ephemeral(node)
-            .unwrap_or_else(|_| panic!("invalid node passed to one-shot runtime factory"))
-    }
-
-    /// Compatibility wrapper for [`Self::try_ephemeral_guarded`]; panics on invalid input.
-    pub fn ephemeral_guarded(node: &Node) -> EphemeralRuntimeGuard {
-        Self::try_ephemeral_guarded(node)
-            .unwrap_or_else(|_| panic!("invalid node passed to one-shot runtime factory"))
     }
 
     pub(crate) fn is_ephemeral(&self) -> bool {
@@ -784,10 +771,10 @@ impl Drop for EphemeralRuntimeGuard {
 /// the parse-time `created_at`/`updated_at` stamps (metadata, not dial
 /// configuration).
 fn same_node_config(a: &Node, b: &Node) -> bool {
-    let (mut a, b) = (a.clone(), b.clone());
+    let mut a = a.clone();
     a.created_at = b.created_at;
     a.updated_at = b.updated_at;
-    a == b
+    &a == b
 }
 
 /// Registry build/validation errors. A failure here aborts the reload
@@ -971,7 +958,7 @@ impl OutboundRuntimeRegistry {
                         node,
                     ),
                     runtime: crate::descriptor::descriptor(node.protocol())
-                        .generation_runtime(node)
+                        .generation_runtime
                         .build(node, true),
                     ephemeral: false,
                     warm_retention: Arc::new(tokio::sync::Mutex::new(0)),

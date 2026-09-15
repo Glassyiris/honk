@@ -37,16 +37,16 @@ impl std::fmt::Debug for VlessCoolStream {
 }
 
 impl VlessCoolStream {
-    fn poll_operation(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<usize>>> {
+    fn poll_operation(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let Some(operation) = self.operation.as_mut() else {
-            return Poll::Ready(Ok(None));
+            return Poll::Ready(Ok(()));
         };
         let result = match operation {
             StreamOperation::Reserve(_) => unreachable!("write reserves are polled by poll_write"),
             StreamOperation::Flush(future) | StreamOperation::Shutdown(future) => {
                 match future.as_mut().poll(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(result) => result.map(|()| None),
+                    Poll::Ready(result) => result,
                 }
             }
         };
@@ -149,16 +149,13 @@ impl AsyncWrite for VlessCoolStream {
         }
         match self.poll_operation(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(None)) if shutdown_pending => {
+            Poll::Ready(Ok(())) if shutdown_pending => {
                 self.closed = true;
                 Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
             }
-            Poll::Ready(Ok(None)) => {
+            Poll::Ready(Ok(())) => {
                 cx.waker().wake_by_ref();
                 Poll::Pending
-            }
-            Poll::Ready(Ok(Some(_))) => {
-                unreachable!("TCP data writes do not await acknowledgements")
             }
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
         }
@@ -168,31 +165,28 @@ impl AsyncWrite for VlessCoolStream {
         if matches!(self.operation, Some(StreamOperation::Reserve(_))) {
             self.operation = None;
         }
-        loop {
-            if self.operation.is_none() {
-                if self.ended.load(Ordering::Acquire) {
-                    return Poll::Ready(Ok(()));
-                }
-                if let Some(error) = self.terminal_error() {
-                    return Poll::Ready(Err(error));
-                }
-                let writer = self.writer.clone();
-                self.operation = Some(StreamOperation::Flush(Box::pin(async move {
-                    writer.flush().await
-                })));
+        if self.operation.is_none() {
+            if self.ended.load(Ordering::Acquire) {
+                return Poll::Ready(Ok(()));
             }
-            let shutdown_pending = matches!(self.operation, Some(StreamOperation::Shutdown(_)));
-            match self.poll_operation(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(Some(_))) => continue,
-                Poll::Ready(Ok(None)) => {
-                    if shutdown_pending {
-                        self.closed = true;
-                    }
-                    return Poll::Ready(Ok(()));
-                }
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            if let Some(error) = self.terminal_error() {
+                return Poll::Ready(Err(error));
             }
+            let writer = self.writer.clone();
+            self.operation = Some(StreamOperation::Flush(Box::pin(async move {
+                writer.flush().await
+            })));
+        }
+        let shutdown_pending = matches!(self.operation, Some(StreamOperation::Shutdown(_)));
+        match self.poll_operation(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
+                if shutdown_pending {
+                    self.closed = true;
+                }
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
         }
     }
 
@@ -219,10 +213,11 @@ impl AsyncWrite for VlessCoolStream {
                     result
                 })));
             }
+            let shutdown_pending = matches!(self.operation, Some(StreamOperation::Shutdown(_)));
             match self.poll_operation(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(Some(_))) => continue,
-                Poll::Ready(Ok(None)) => {
+                Poll::Ready(Ok(())) if !shutdown_pending => continue,
+                Poll::Ready(Ok(())) => {
                     self.closed = true;
                     return Poll::Ready(Ok(()));
                 }
@@ -590,7 +585,7 @@ pub(crate) async fn connect_single_xudp(
     target_domain: Option<&str>,
     global_id: [u8; 8],
 ) -> anyhow::Result<Arc<VlessXudpTransport>> {
-    let session = connect(stream, 1).await?;
+    let session = connect(stream, 1);
     let permit = session
         .try_reserve()
         .ok_or_else(|| anyhow::anyhow!("Single XUDP carrier has no capacity"))?;

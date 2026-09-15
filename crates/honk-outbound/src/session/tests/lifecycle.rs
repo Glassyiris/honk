@@ -118,8 +118,8 @@ async fn dial_panic_wakes_waiters_and_reelects() {
     assert!(!session.is_closed());
 }
 
-/// Phase 1: shutdown aborts the in-flight dial (leader), wakes every
-/// waiter with PoolClosed, and rejects offers/inserts afterwards.
+/// Shutdown aborts the in-flight dial, wakes every waiter with PoolClosed,
+/// and rejects later offers.
 #[tokio::test(start_paused = true)]
 async fn shutdown_wakes_leader_and_waiters() {
     let pool = Arc::new(pool(SessionPoolConfig::default()));
@@ -145,16 +145,6 @@ async fn shutdown_wakes_leader_and_waiters() {
             .await
             .is_err(),
         "offers stay rejected after shutdown"
-    );
-    let s = TestSession::new();
-    pool.insert(&s);
-    assert!(
-        s.closed.load(Ordering::Relaxed),
-        "insert after shutdown closes the session"
-    );
-    assert!(
-        !pool.has_usable_session(),
-        "a shutdown pool cannot retain a late session insertion"
     );
 }
 

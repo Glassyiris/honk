@@ -3,9 +3,7 @@ use super::*;
 #[tokio::test]
 async fn fragmented_and_coalesced_responses_are_demultiplexed() {
     let (client, mut wire) = tokio::io::duplex(1 << 16);
-    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION)
-        .await
-        .unwrap();
+    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION);
     let mut stream = open_tcp(
         Arc::clone(&session),
         session.try_reserve().unwrap(),
@@ -39,9 +37,7 @@ async fn fragmented_and_coalesced_responses_are_demultiplexed() {
 #[tokio::test]
 async fn tcp_receive_budget_waits_for_transient_reader_backpressure() {
     let (client, mut wire) = tokio::io::duplex(1 << 16);
-    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION)
-        .await
-        .unwrap();
+    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION);
     let mut stream = open_tcp(
         Arc::clone(&session),
         session.try_reserve().unwrap(),
@@ -88,9 +84,7 @@ async fn tcp_receive_budget_waits_for_transient_reader_backpressure() {
 #[tokio::test]
 async fn unread_tcp_child_does_not_block_siblings() {
     let (client, mut wire) = tokio::io::duplex(1 << 16);
-    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION)
-        .await
-        .unwrap();
+    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION);
     let _blocked = open_tcp(
         Arc::clone(&session),
         session.try_reserve().unwrap(),
@@ -144,9 +138,7 @@ async fn unread_tcp_child_does_not_block_siblings() {
 #[tokio::test]
 async fn source_reply_fallback_uses_first_sender_not_preparation_or_latest() {
     let (client, mut wire) = tokio::io::duplex(1 << 16);
-    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION)
-        .await
-        .unwrap();
+    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION);
     let unused_preparation_domain = "x".repeat(256);
     let udp = open_xudp(
         Arc::clone(&session),
@@ -288,9 +280,7 @@ fn keep_domain_preserves_wire_port_and_validates_identity() {
 #[tokio::test]
 async fn udp_receive_byte_budget_drops_excess_datagrams() {
     let (client, mut wire) = tokio::io::duplex(1 << 16);
-    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION)
-        .await
-        .unwrap();
+    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION);
     Arc::clone(&session.receive_budget)
         .acquire_many_owned((RECEIVE_BYTE_BUDGET - 4) as u32)
         .await
@@ -358,9 +348,7 @@ async fn new_tcp_is_flushed_for_target_speaks_first() {
         .await
         .unwrap();
     });
-    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION)
-        .await
-        .unwrap();
+    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION);
     let mut stream = open_tcp(
         Arc::clone(&session),
         session.try_reserve().unwrap(),
@@ -380,9 +368,7 @@ async fn new_tcp_is_flushed_for_target_speaks_first() {
 async fn ready_tcp_consumer_survives_a_large_carrier_burst() {
     const FRAMES: usize = 2048;
     let (client, mut wire) = tokio::io::duplex(20 << 20);
-    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION)
-        .await
-        .unwrap();
+    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION);
     let mut stream = open_tcp(
         Arc::clone(&session),
         session.try_reserve().unwrap(),
@@ -410,9 +396,7 @@ async fn ready_tcp_consumer_survives_a_large_carrier_burst() {
 #[tokio::test]
 async fn concurrent_tcp_and_udp_share_one_atomic_writer() {
     let (client, mut wire) = tokio::io::duplex(1 << 20);
-    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION)
-        .await
-        .unwrap();
+    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION);
     let mut tcp = open_tcp(
         Arc::clone(&session),
         session.try_reserve().unwrap(),
@@ -465,9 +449,7 @@ async fn session_ids_are_never_reused_and_carrier_drains_at_128() {
         }
         ids
     });
-    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION)
-        .await
-        .unwrap();
+    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION);
     for _ in 0..MAX_STREAMS_PER_SESSION {
         let permit = session.try_reserve().unwrap();
         let mut stream = open_tcp(
@@ -493,9 +475,7 @@ async fn session_ids_are_never_reused_and_carrier_drains_at_128() {
 #[tokio::test]
 async fn end_error_and_physical_eof_fail_children() {
     let (client, mut wire) = tokio::io::duplex(1 << 16);
-    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION)
-        .await
-        .unwrap();
+    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION);
     let mut first = open_tcp(
         Arc::clone(&session),
         session.try_reserve().unwrap(),
@@ -564,9 +544,7 @@ async fn end_error_and_physical_eof_fail_children() {
 #[tokio::test]
 async fn zero_global_id_is_omitted_without_a_source_identity() {
     let (client, mut wire) = tokio::io::duplex(1 << 16);
-    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION)
-        .await
-        .unwrap();
+    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION);
     let first = open_udp(
         Arc::clone(&session),
         session.try_reserve().unwrap(),
