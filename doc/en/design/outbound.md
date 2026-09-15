@@ -494,6 +494,9 @@ Intentional endpoint retirement after queue admission ends the ambiguous source
 without replay or negative transport health. Later senders and the receiver
 retain the same cancellation cause, so a sibling send cannot reinterpret it as
 a carrier failure.
+Send start/completion and retirement intent share the source-state critical
+section. It publishes both endpoint and source-view retirement flags after the
+matching sender's intent, before either send or receive can classify cancellation.
 
 Selector and UDP warm retention resolve independently: the TCP-selected pool
 answers `WarmRequirement::Session`, while the UDP-selected pool answers

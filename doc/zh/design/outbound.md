@@ -434,6 +434,9 @@ reply 没有逐 flow Score。source 容量耗尽返回 `PacketRejection::Capacit
 endpoint 在 packet 入队后有意退役时，会终结结果不明确的 source，但不重放 packet，
 也不产生负向 transport health。后续 sender 与 receiver 保留相同的取消原因，
 避免兄弟 flow 的发送将其重新解释为 carrier 故障。
+发送开始、完成与退役意图共用 source-state 临界区；先记录匹配 sender 的意图，
+再在同一临界区发布 endpoint 和 source-view 退役标志，之后发送或接收端才能
+对取消原因进行分类。
 
 Selector 与 UDP warm retention 独立解析：TCP 所选 pool 响应
 `WarmRequirement::Session`，UDP 所选 pool 响应 `WarmRequirement::Udp`。因此

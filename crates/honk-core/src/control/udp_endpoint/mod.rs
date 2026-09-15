@@ -290,11 +290,13 @@ impl UdpEndpoint {
         // A retirement ordered before `begin_send_attempt` must prevent the
         // transport call; an attempt already admitted remains ambiguous.
         let _send_gate = self.send_gate.lock();
-        if !self.dead.swap(true, Ordering::AcqRel) {
+        if self.dead.load(Ordering::Acquire) {
+            return;
+        }
+        match &self.transport {
+            EndpointTransport::Flow(_) => self.dead.store(true, Ordering::Release),
             #[cfg(feature = "rprx")]
-            if let EndpointTransport::Source(source) = &self.transport {
-                source.retire();
-            }
+            EndpointTransport::Source(source) => source.retire(&self.dead),
         }
     }
 

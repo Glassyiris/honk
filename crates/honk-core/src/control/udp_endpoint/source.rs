@@ -59,6 +59,16 @@ struct SourceState {
     admitting: bool,
     attachments: usize,
     bindings: usize,
+    active_sender: u64,
+    intentional_sender: u64,
+}
+
+impl SourceState {
+    fn mark_intentional_sender(&mut self, view: u64) {
+        if self.active_sender == view {
+            self.intentional_sender = view;
+        }
+    }
 }
 
 pub(super) struct SourceOwner {
@@ -73,8 +83,6 @@ pub(super) struct SourceOwner {
     receive_started: AtomicBool,
     has_reply: AtomicBool,
     send_gate: tokio::sync::Mutex<()>,
-    active_sender: AtomicU64,
-    intentional_sender: AtomicU64,
     next_view: AtomicU64,
     receive_notify: Notify,
     next_alive_report_at: AtomicI64,
@@ -113,6 +121,8 @@ impl SourceOwner {
                 admitting: true,
                 attachments: 1,
                 bindings: 0,
+                active_sender: 0,
+                intentional_sender: 0,
             }),
             ready: AtomicBool::new(true),
             retire_notify: Notify::new(),
@@ -123,8 +133,6 @@ impl SourceOwner {
             next_alive_report_at: AtomicI64::new(0),
             pool: Arc::downgrade(pool),
             send_gate: tokio::sync::Mutex::new(()),
-            active_sender: AtomicU64::new(0),
-            intentional_sender: AtomicU64::new(0),
             next_view: AtomicU64::new(1),
             alive_set,
             node_id,
@@ -267,20 +275,17 @@ impl SourceOwner {
         );
     }
 
-    fn mark_intentional_sender(&self, view: u64) {
-        if self.active_sender.load(Ordering::Acquire) == view {
-            self.intentional_sender.store(view, Ordering::Release);
-        }
-    }
-
     pub(super) fn handle_transport_error(&self, error: &io::Error) -> bool {
-        if !honk_outbound::proxy::vless::is_vless_source_post_admission_cancel(error) {
-            self.intentional_sender.store(0, Ordering::Release);
-            return false;
-        }
-        // Sender and receiver can observe the same terminal before retirement linearizes.
-        if self.intentional_sender.load(Ordering::Acquire) == 0 {
-            return false;
+        {
+            let mut state = self.state.lock();
+            if !honk_outbound::proxy::vless::is_vless_source_post_admission_cancel(error) {
+                state.intentional_sender = 0;
+                return false;
+            }
+            // Sender and receiver can observe the same terminal before retirement linearizes.
+            if state.intentional_sender == 0 {
+                return false;
+            }
         }
         if let Some(pool) = self.pool.upgrade() {
             pool.retire_interrupted_source(self);
@@ -535,7 +540,7 @@ impl SourceEndpoint {
 
     #[cfg(test)]
     pub(super) fn mark_send_active_for_test(&self) {
-        self.owner.active_sender.store(self.view, Ordering::Release);
+        self.owner.state.lock().active_sender = self.view;
     }
 
     pub(super) fn commit_binding(&self, endpoint_permit: OwnedSemaphorePermit) -> bool {
@@ -552,12 +557,19 @@ impl SourceEndpoint {
         true
     }
 
-    pub(super) fn retire(&self) {
-        self.retired.store(true, Ordering::Release);
+    pub(super) fn retire(&self, dead: &AtomicBool) {
         let mut binding = self.binding.lock();
         binding.attachment.take();
+        {
+            let mut state = self.owner.state.lock();
+            if binding.bound {
+                state.mark_intentional_sender(self.view);
+            }
+            // Publish intent before a sender can observe retirement and drop its send.
+            self.retired.store(true, Ordering::Release);
+            dead.store(true, Ordering::Release);
+        }
         if binding.bound {
-            self.owner.mark_intentional_sender(self.view);
             binding.bound = false;
             self.owner.release_binding();
         }
@@ -573,33 +585,34 @@ impl SourceEndpoint {
 
     pub(super) async fn send(&self, data: &[u8], admitted: Option<&AtomicBool>) -> io::Result<()> {
         let _send = self.owner.send_gate.lock().await;
-        if self.owner.transport.source_send_usable().await {
-            self.owner.intentional_sender.store(0, Ordering::Release);
-        }
-        self.owner.active_sender.store(self.view, Ordering::Release);
-        let mut active = ActiveSourceSend {
-            owner: &self.owner,
-            view: self.view,
-            completed: false,
+        let reusable = self.owner.transport.source_send_usable().await;
+        let mut active = {
+            let mut state = self.owner.state.lock();
+            if self.retired.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "VLESS UDP flow retired before source send",
+                ));
+            }
+            if !state.admitting {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "VLESS UDP source retired before send",
+                ));
+            }
+            if !self.owner.sent.load(Ordering::Acquire) && data.is_empty() {
+                return Err(honk_outbound::proxy::PacketRejection::InvalidSize.into());
+            }
+            if reusable {
+                state.intentional_sender = 0;
+            }
+            state.active_sender = self.view;
+            ActiveSourceSend {
+                owner: &self.owner,
+                view: self.view,
+                clear_intent: false,
+            }
         };
-        if self.retired.load(Ordering::Acquire) {
-            active.completed = true;
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "VLESS UDP flow retired before source send",
-            ));
-        }
-        if !self.owner.is_ready() {
-            active.completed = true;
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "VLESS UDP source retired before send",
-            ));
-        }
-        if !self.owner.sent.load(Ordering::Acquire) && data.is_empty() {
-            active.completed = true;
-            return Err(honk_outbound::proxy::PacketRejection::InvalidSize.into());
-        }
         self.owner.begin_receive();
         let result = self
             .owner
@@ -607,14 +620,11 @@ impl SourceEndpoint {
             .send_to(self.target, self.target_domain.as_deref(), data, admitted)
             .await;
         if result.is_ok() {
-            // A later successful write proves a cancelled pre-admission command
-            // rolled back without poisoning the shared SID.
-            self.owner.intentional_sender.store(0, Ordering::Release);
+            active.clear_intent = true;
             self.owner.note_sent();
         } else if let Err(error) = &result {
-            self.owner.handle_transport_error(error);
+            active.clear_intent = !self.owner.handle_transport_error(error);
         }
-        active.completed = true;
         result
     }
 
@@ -641,24 +651,17 @@ impl SourceEndpoint {
 struct ActiveSourceSend<'a> {
     owner: &'a SourceOwner,
     view: u64,
-    completed: bool,
+    clear_intent: bool,
 }
 
 impl Drop for ActiveSourceSend<'_> {
     fn drop(&mut self) {
-        let _ = self.owner.active_sender.compare_exchange(
-            self.view,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        if self.completed {
-            let _ = self.owner.intentional_sender.compare_exchange(
-                self.view,
-                0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+        let mut state = self.owner.state.lock();
+        if state.active_sender == self.view {
+            state.active_sender = 0;
+        }
+        if self.clear_intent && state.intentional_sender == self.view {
+            state.intentional_sender = 0;
         }
     }
 }
@@ -668,7 +671,7 @@ impl Drop for SourceEndpoint {
         let binding = self.binding.get_mut();
         binding.attachment.take();
         if binding.bound {
-            self.owner.mark_intentional_sender(self.view);
+            self.owner.state.lock().mark_intentional_sender(self.view);
             binding.bound = false;
             self.owner.release_binding();
         }
