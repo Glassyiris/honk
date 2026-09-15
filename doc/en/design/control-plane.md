@@ -210,6 +210,11 @@ When both sides are plain `TcpStream`, `relay_splice` runs two concurrent `splic
 
 The first splice in each direction is also a capability probe. `EINVAL`, `ENOSYS`, or `EXDEV` before any byte has reached a destination permits a lossless userspace-copy fallback and sets a process-wide latch; later connections skip the probe. Other errors, or an unsupported result after bytes have been staged, fail the relay rather than risk loss. Wrapped TLS or protocol streams use `relay_auto`, which always uses the select-based copy loop.
 
+The copy pumps flush bytes buffered by sniffing or protocol setup before reading
+new input, then use Tokio's native copier, which flushes pending writes when input
+becomes idle. Each direction uses its default 8 KiB buffer; buffering never requires
+the application to send another request or close before its current request leaves.
+
 After the first EOF, both relay paths bound only idle drain time: `DRAIN_DEADLINE` is 30 seconds without a byte of progress. An active survivor may run longer than 30 seconds; a silent survivor cannot pin accepted sockets indefinitely.
 
 An accepted TCP socket is adopted only if its canonical forward `CONN_STATE_MAP` entry still exists. `TcpFlowPins` reference-counts that directional tuple for every accepted owner. The BPF janitor skips pinned conn-state and matching redirect metadata. When the final owner retires, it reads the current entry and conditionally removes it only if the state and timestamp still match the observed incarnation; an older relay cannot delete a reused tuple.
