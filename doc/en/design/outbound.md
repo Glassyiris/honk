@@ -226,6 +226,8 @@ a warm session could serve an ordinary failed spread attempt.
 Pool-owned tasks recheck terminal state before polling the dial. An in-flight
 normal dial reserves a reusable slot; an overlapping detached commit goes
 drain-only when that reservation fills the cap, preserving its existing child.
+Releasing warm retention also wakes capacity waiters as excess live carriers
+enter Draining, without waiting for their existing children to finish.
 
 VLESS physical carriers additionally hold one permit from the immutable
 process-wide VLESS-carrier gate. The startup resource budget computes

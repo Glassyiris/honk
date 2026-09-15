@@ -280,6 +280,49 @@ async fn warm_retention_pins_one_idle_session_until_release() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn warm_unpin_wakes_waiters_without_cutting_live_children() {
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+        max_sessions: 1,
+        max_streams_per_session: 1,
+        ..Default::default()
+    }));
+    let old = ReservedTestSession::new(1);
+    pool.insert(&old);
+    let held = pool
+        .open_with(
+            || async { unreachable!("seeded carrier must be reused") },
+            |_session, permit| async { Ok::<_, OpenError>(permit) },
+        )
+        .await
+        .unwrap();
+    pool.set_warm_retained(true);
+    let mut normal = std::pin::pin!(pool.offer(|| async { Ok(ReservedTestSession::new(1)) }));
+    let mut speculative = std::pin::pin!(pool.checkout_speculative());
+    assert!(futures_util::poll!(normal.as_mut()).is_pending());
+    assert!(futures_util::poll!(speculative.as_mut()).is_pending());
+
+    pool.set_warm_retained(false);
+    assert_eq!(old.state(), SessionState::Draining);
+    assert_eq!(old.active_streams(), 1);
+    assert!(!old.is_closed());
+    let std::task::Poll::Ready(Ok(SpeculativeCheckout::Detached(reservation))) =
+        futures_util::poll!(speculative.as_mut())
+    else {
+        panic!("unpin stranded a speculative waiter behind a draining carrier");
+    };
+    let replacement = tokio::time::timeout(Duration::from_secs(1), normal)
+        .await
+        .expect("unpin stranded the normal offer")
+        .unwrap();
+    assert!(!Arc::ptr_eq(&replacement, &old));
+    assert_eq!(replacement.state(), SessionState::Active);
+    assert!(!old.is_closed());
+    drop(reservation);
+    drop(held);
+    pool.shutdown();
+}
+
+#[tokio::test(start_paused = true)]
 async fn janitor_preserves_and_replenishes_warm_carriers_while_old_streams_drain() {
     let pool = Arc::new(pool(SessionPoolConfig {
         janitor_interval: Duration::from_secs(1),

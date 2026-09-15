@@ -544,6 +544,9 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         for session in to_close {
             session.close();
         }
+        if !retained {
+            self.capacity_notify.notify_waiters();
+        }
     }
 
     #[cfg(test)]
