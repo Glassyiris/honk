@@ -56,6 +56,9 @@ Linux mechanism used only by `honk-core`'s `ebpf` feature.
 Parse one exact-sized datagram allocation. `QueueStats` separates current-instance
 depth from process-wide drops accumulated across hard rebinds, reports latest
 kernel-read availability/errors, and always refreshes held-guard/effective-buffer gauges.
+Each sample opens procfs in the calling thread's queue namespace before reading
+asynchronously through that namespace-bound descriptor; neither the process leader
+nor a blocking worker selects the queue being sampled.
 
 ## Decision-token protocol
 

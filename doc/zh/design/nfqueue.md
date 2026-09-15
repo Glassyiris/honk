@@ -52,6 +52,8 @@ flowchart LR
 
 服务先绑定队列 `320`，再发布 nftables 事务。安装阶段在单实例锁保护下回收残留的保留 table；最终有序关闭时，它会 drain 所有已分发 guard、关闭队列，并最后删除自有 table。同一网络命名空间的防火墙管理器不得在 honk 运行期间修改任一保留 nftables 对象。
 
+每次内核统计采样先在调用线程所在的队列网络命名空间中打开 procfs 文件，再通过已绑定该命名空间的文件描述符异步读取；采样对象不由进程主线程或阻塞工作线程的命名空间决定。
+
 ## 决策 token 协议
 
 `UDP_DECISION_SEQUENCE` 是 pinned、持久化的单槽 spin-lock allocator。其 legacy 值恰好是 12 字节：lock、`next` 中的完整 raw token，以及 `exhausted`。启动只验证该 ABI 和值，绝不重写。普通重启和清理会保留该 pin，因此回滚后的旧版程序可以从同一 raw-token 边界继续。
