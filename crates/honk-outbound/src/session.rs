@@ -631,7 +631,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 }
             };
 
-            match step {
+            let mut rx = match step {
                 Step::Closed => return Err(Self::pool_closed_err()),
                 Step::Have(s) => return Ok(s),
                 Step::Capacity => {
@@ -646,6 +646,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                             return Err(Self::pool_closed_err());
                         }
                     }
+                    continue;
                 }
                 Step::Backoff(wait, failures) => {
                     // The breaker only paces redials; callers fail fast
@@ -654,35 +655,11 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         "session dial backing off ({failures} consecutive, {wait:?} remaining)"
                     ));
                 }
-                Step::Wait(mut rx) => {
-                    tracing::debug!("offer parked on in-flight dial");
-                    let signal = tokio::select! {
-                        // `wait_for` checks the current value first — no
-                        // race with a dial that completed before parking.
-                        r = rx.wait_for(|s| !matches!(s, DialSignal::Pending)) => {
-                            match r {
-                                Ok(v) => v.clone(),
-                                // Sender dropped (leader cancelled): the
-                                // inflight entry is gone — re-elect.
-                                Err(_) => DialSignal::Done,
-                            }
-                        }
-                        _ = shutdown_rx.changed() => {
-                            return Err(Self::pool_closed_err());
-                        }
-                    };
-                    match signal {
-                        DialSignal::Closed => return Err(Self::pool_closed_err()),
-                        DialSignal::Failed(e) => {
-                            if self.config.spread_sessions && self.has_usable_session() {
-                                continue;
-                            }
-                            return Err(anyhow::Error::new(e).context("session dial failed"));
-                        }
-                        DialSignal::Pending | DialSignal::Done => {}
-                    }
-                }
+                Step::Wait(rx) => rx,
                 Step::Register(id, done) => {
+                    // Subscribe before spawning: a fast failure can clear the
+                    // pool's entry before this caller gets to await it.
+                    let rx = done.subscribe();
                     // Pool-owned dial task: no caller's cancellation can
                     // poison it; the DialGuard is the panic backstop.
                     let Some(dial_fut) = dial.take().map(|d| d()) else {
@@ -789,8 +766,37 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         let _ = done.send(signal);
                         capacity_notify.notify_waiters();
                     }));
-                    // Fall through: wait on the dial like everyone else.
+                    rx
                 }
+            };
+            tracing::debug!("offer parked on in-flight dial");
+            let signal = tokio::select! {
+                // `wait_for` checks the current value first — no
+                // race with a dial that completed before parking.
+                r = rx.wait_for(|s| !matches!(s, DialSignal::Pending)) => {
+                    match r {
+                        Ok(v) => v.clone(),
+                        // The pool task dropped its sender: re-elect.
+                        Err(_) => DialSignal::Done,
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    return Err(Self::pool_closed_err());
+                }
+            };
+            match signal {
+                DialSignal::Closed => return Err(Self::pool_closed_err()),
+                DialSignal::Failed(e) => {
+                    let error = anyhow::Error::new(e);
+                    if self.config.spread_sessions
+                        && !crate::proxy::is_packet_rejection(&error)
+                        && self.has_usable_session()
+                    {
+                        continue;
+                    }
+                    return Err(error.context("session dial failed"));
+                }
+                DialSignal::Pending | DialSignal::Done => {}
             }
         }
     }

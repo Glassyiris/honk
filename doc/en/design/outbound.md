@@ -220,6 +220,9 @@ Pool waiters register for capacity changes before checking availability. Every
 pool-owned stream permit, including the first detached permit, notifies waiters
 when released. Carrier publication wakes all eligible waiters; a non-reserving
 warm offer must not consume the only notification and strand a stream checkout.
+The initiating caller subscribes before its dial task starts and consumes that
+attempt's result directly. A completed local refusal remains terminal even when
+a warm session could serve an ordinary failed spread attempt.
 
 VLESS physical carriers additionally hold one permit from the immutable
 process-wide VLESS-carrier gate. The startup resource budget computes

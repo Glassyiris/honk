@@ -148,6 +148,37 @@ async fn spread_sessions_reuses_busy_session_when_extra_dial_fails() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn spread_sessions_preserves_capacity_rejection_without_backoff() {
+    let pool = pool(SessionPoolConfig {
+        max_sessions: 2,
+        spread_sessions: true,
+        ..Default::default()
+    });
+    let first = TestSession::new();
+    first.streams.store(1, Ordering::Relaxed);
+    pool.insert(&first);
+
+    let error = pool
+        .offer(|| async {
+            Err(anyhow::Error::new(crate::proxy::PacketRejection::Capacity)
+                .context("carrier admission"))
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        crate::proxy::packet_rejection(&error),
+        Some(crate::proxy::PacketRejection::Capacity)
+    );
+    assert!(!first.is_closed());
+
+    let second = pool
+        .offer(|| async { Ok(TestSession::new()) })
+        .await
+        .expect("released capacity must admit without a synthetic backoff");
+    assert!(!Arc::ptr_eq(&first, &second));
+}
+
+#[tokio::test(start_paused = true)]
 async fn least_loaded_is_offered() {
     let pool = Arc::new(pool(SessionPoolConfig {
         max_streams_per_session: 2,

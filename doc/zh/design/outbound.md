@@ -194,6 +194,8 @@ Pool waiter 在检查容量前注册容量变化通知。每个由 pool 持有�
 （包括 detached session 的首个 permit）释放时都会通知 waiter。carrier 发布会
 唤醒所有符合条件的 waiter，避免不预留 stream 的 warm offer 消耗唯一通知，
 导致仍有可用容量的 stream checkout 一直等待。
+拨号发起者在启动 task 前订阅结果，并直接消费该次尝试的结果。即使已有 warm
+session 可以承接普通 spread 拨号失败，已完成的本地拒绝仍保持终态。
 
 VLESS 物理 carrier 还持有不可变进程级 VLESS-carrier gate 的一个 permit。
 启动资源预算在计算 UDP endpoint 前先分出 `min(after_dials / 8, 8192)`；零值
