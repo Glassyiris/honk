@@ -131,6 +131,62 @@ async fn detached_commit_at_capacity_admits_drain_only() {
 }
 
 #[tokio::test]
+async fn detached_commit_preserves_inflight_normal_dial_slot() {
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+        max_sessions: 1,
+        ..Default::default()
+    }));
+    let SpeculativeCheckout::Detached(mut reservation) = pool.checkout_speculative().await.unwrap()
+    else {
+        panic!("empty pool must reserve a detached dial");
+    };
+    let detached = ReservedTestSession::new(1);
+    let detached_permit = reservation.attach(&detached).unwrap();
+    let (started, entered) = tokio::sync::oneshot::channel();
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    let normal = tokio::spawn({
+        let pool = Arc::clone(&pool);
+        async move {
+            pool.offer(move || async move {
+                started.send(()).unwrap();
+                blocked.await.unwrap();
+                Ok(ReservedTestSession::new(1))
+            })
+            .await
+        }
+    });
+    entered.await.unwrap();
+
+    let committed = reservation.commit().unwrap();
+    assert!(Arc::ptr_eq(&committed, &detached));
+    assert_eq!(committed.state(), SessionState::Draining);
+    assert_eq!(committed.active_streams(), 1);
+    assert!(!committed.is_closed());
+
+    release.send(()).unwrap();
+    let active = normal.await.unwrap().unwrap();
+    assert_eq!(active.state(), SessionState::Active);
+    assert!(!Arc::ptr_eq(&active, &detached));
+    assert_eq!(pool.active_session_total(), 1);
+    assert_eq!(pool.live_session_count(), 2);
+    let active_permit = pool
+        .open_with(
+            || async { unreachable!("normal publication must remain reusable") },
+            |_session, permit| async { Ok::<_, OpenError>(permit) },
+        )
+        .await
+        .unwrap();
+
+    drop(detached_permit);
+    assert_eq!(pool.reap_unretained_idle(), 1);
+    assert!(detached.is_closed());
+    assert!(!active.is_closed());
+    assert_eq!(active.active_streams(), 1);
+    assert_eq!(pool.live_session_count(), 1);
+    drop(active_permit);
+}
+
+#[tokio::test]
 async fn shared_checkout_reserves_its_stream_permit_atomically() {
     let pool = Arc::new(SessionPool::new(SessionPoolConfig {
         max_sessions: 1,

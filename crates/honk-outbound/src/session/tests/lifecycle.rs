@@ -148,6 +148,36 @@ async fn shutdown_wakes_leader_and_waiters() {
     );
 }
 
+#[tokio::test]
+async fn shutdown_during_dial_factory_never_polls_dial() {
+    let pool = Arc::new(pool(SessionPoolConfig::default()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (dial_lifetime, discarded) = tokio::sync::oneshot::channel::<()>();
+    let result = pool
+        .offer({
+            let pool = Arc::clone(&pool);
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                pool.shutdown();
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    drop(dial_lifetime);
+                    Ok(TestSession::new())
+                }
+            }
+        })
+        .await;
+
+    assert!(result.is_err());
+    let _ = discarded.await;
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "the factory must run, but shutdown must prevent polling its dial future"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn shutdown_before_ensure_does_not_register_janitor_or_prewarm() {
     let pool = Arc::new(pool(SessionPoolConfig {

@@ -196,6 +196,8 @@ Pool waiter 在检查容量前注册容量变化通知。每个由 pool 持有�
 导致仍有可用容量的 stream checkout 一直等待。
 拨号发起者在启动 task 前订阅结果，并直接消费该次尝试的结果。即使已有 warm
 session 可以承接普通 spread 拨号失败，已完成的本地拒绝仍保持终态。
+Pool-owned task 在 poll 拨号前重新检查终态。进行中的普通拨号预留一个可复用
+slot；并发的 detached commit 在该预留占满上限时进入 drain-only，保留已有 child。
 
 VLESS 物理 carrier 还持有不可变进程级 VLESS-carrier gate 的一个 permit。
 启动资源预算在计算 UDP endpoint 前先分出 `min(after_dials / 8, 8192)`；零值

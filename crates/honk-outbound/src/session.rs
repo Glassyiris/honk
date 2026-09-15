@@ -694,9 +694,16 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                             inflight_id: id,
                             armed: true,
                         };
-                        let result = tokio::select! {
-                            result = std::panic::AssertUnwindSafe(dial_fut).catch_unwind() => Some(result),
-                            _ = task_shutdown_rx.changed() => None,
+                        // Subscription cannot replay a shutdown that preceded it.
+                        let result = if PoolState::from(task_state.load(Ordering::Acquire))
+                            != PoolState::Running
+                        {
+                            None
+                        } else {
+                            tokio::select! {
+                                result = std::panic::AssertUnwindSafe(dial_fut).catch_unwind() => Some(result),
+                                _ = task_shutdown_rx.changed() => None,
+                            }
                         };
                         let signal = {
                             let mut pool = task_pool.lock();
@@ -1308,16 +1315,17 @@ impl<S: ManagedSession + 'static> DetachedSessionReservation<S> {
             if self.pool.state() == PoolState::Running {
                 if let Some(session) = session {
                     pool.sessions.retain(|existing| !existing.is_closed());
-                    // Normal offers don't count provisional slots, so a commit
-                    // can arrive after the pool filled up meanwhile. Admit the
-                    // winner drain-only instead of exceeding max_sessions; its
-                    // already-reserved streams are unaffected.
+                    // Normal offers don't count provisional slots. Preserve their
+                    // in-flight publication slot as well as established sessions;
+                    // detached winners keep their already-reserved streams drain-only.
                     let active = pool
                         .sessions
                         .iter()
                         .filter(|s| s.state() == SessionState::Active)
                         .count();
-                    if active >= self.pool.config.max_sessions {
+                    if active + usize::from(pool.dial_done.is_some())
+                        >= self.pool.config.max_sessions
+                    {
                         session.begin_drain();
                     }
                     pool.sessions.push(Arc::clone(&session));
