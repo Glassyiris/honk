@@ -238,8 +238,10 @@ impl Lexer {
             let mut error = None;
             let mut path_quotes = adjacent_quotes;
             while index < end && source.whitespace_width(index) == 0 {
+                // dae's grammar tokenizes `:` on its own, so `key:'value'` and
+                // `suffix:'x'` open a quote there just as `key: 'value'` does.
                 let boundary =
-                    index == start || matches!(bytes[index - 1], b'(' | b',') || path_quotes;
+                    index == start || matches!(bytes[index - 1], b'(' | b',' | b':') || path_quotes;
                 if boundary && matches!(bytes[index], b'\'' | b'"') {
                     if let Some(close) = quoted_end(&bytes[..end], index) {
                         quoted.push(source.span(index, close));

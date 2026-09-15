@@ -914,6 +914,28 @@ group {
     }
 
     #[test]
+    fn test_quoted_value_without_a_space_after_the_colon() {
+        // dae's grammar tokenizes `:` on its own, so these are the same
+        // entries as `key: 'value'`; they used to keep the quotes as data.
+        let config = parse_dae_config(
+            "global {\n    log_file:'honk.log'\n}\nnode {\n    a:'socks5://127.0.0.1:1080'\n}\nsubscription {\n    paid:\"https://example.com/sub\"\n}\nrouting {\n    domain(suffix:'example.com') -> direct\n    fallback: direct\n}\n",
+        )
+        .unwrap();
+        assert_eq!(config.global.log_file, "honk.log");
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].name, "a");
+        assert_eq!(config.nodes[0].address, "127.0.0.1:1080");
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "paid");
+        assert_eq!(config.subscriptions[0].url, "https://example.com/sub");
+        assert_eq!(config.routing.rules.len(), 1);
+        assert_eq!(
+            config.routing.rules[0].condition.domain_suffix,
+            vec!["example.com".to_owned()]
+        );
+    }
+
+    #[test]
     fn test_entry_subscription_apostrophe_tag() {
         let config =
             parse_dae_config("subscription {\n edge': https://example.com/sub\n}").unwrap();
