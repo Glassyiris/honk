@@ -429,6 +429,10 @@ Score reporter；匹配 reply 与共享 terminal outcome 分别结算这些 flow
 reply 没有逐 flow Score。source 容量耗尽返回 `PacketRejection::Capacity`：对该
 候选终结，但不影响 health 或 Score。
 
+endpoint 在 packet 入队后有意退役时，会终结结果不明确的 source，但不重放 packet，
+也不产生负向 transport health。后续 sender 与 receiver 保留相同的取消原因，
+避免兄弟 flow 的发送将其重新解释为 carrier 故障。
+
 Selector 与 UDP warm retention 独立解析：TCP 所选 pool 响应
 `WarmRequirement::Session`，UDP 所选 pool 响应 `WarmRequirement::Udp`。因此
 仅 UDP 的 Xray pool 可参加 UDP 预热，而 direct TCP 仍可使用 bare pool。现有

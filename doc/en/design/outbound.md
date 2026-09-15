@@ -487,6 +487,11 @@ settle those flows separately. Foreign replies have no per-flow Score. Source
 capacity exhaustion is `PacketRejection::Capacity`, terminal for that candidate
 but health- and Score-neutral.
 
+Intentional endpoint retirement after queue admission ends the ambiguous source
+without replay or negative transport health. Later senders and the receiver
+retain the same cancellation cause, so a sibling send cannot reinterpret it as
+a carrier failure.
+
 Selector and UDP warm retention resolve independently: the TCP-selected pool
 answers `WarmRequirement::Session`, while the UDP-selected pool answers
 `WarmRequirement::Udp`. A UDP-only Xray pool therefore remains eligible for UDP

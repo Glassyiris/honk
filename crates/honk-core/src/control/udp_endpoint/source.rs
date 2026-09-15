@@ -278,7 +278,8 @@ impl SourceOwner {
             self.intentional_sender.store(0, Ordering::Release);
             return false;
         }
-        if self.intentional_sender.swap(0, Ordering::AcqRel) == 0 {
+        // Sender and receiver can observe the same terminal before retirement linearizes.
+        if self.intentional_sender.load(Ordering::Acquire) == 0 {
             return false;
         }
         if let Some(pool) = self.pool.upgrade() {

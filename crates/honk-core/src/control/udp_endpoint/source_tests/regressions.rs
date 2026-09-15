@@ -664,3 +664,169 @@ async fn shared_source_failure_finishes_every_flow_before_death_cleanup() {
     wire_task.abort();
     let _ = wire_task.await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn post_admission_view_cancel_is_health_neutral() {
+    use honk_outbound::PacketTransport;
+
+    for repeated_consumers in [false, true] {
+        let (server, mut events, wire_task) = start_wire_peer().await;
+        let (node, generation, runtime) = source_runtime(server, 2);
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let raw_a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let raw_b = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let target_a = raw_a.local_addr().unwrap();
+        let target_b = raw_b.local_addr().unwrap();
+        let pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
+            2,
+            Arc::new(SourceReplySocketFactory::new([raw_a, raw_b])),
+        ));
+        let stats = Arc::new(StatsManager::new());
+        let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
+        let (removed_tx, mut removed_rx) = mpsc::channel(4);
+        pool.set_remove_sink(removed_tx);
+
+        let lease_a = reserve_source(&pool, &stats, client_addr, target_a, node.id);
+        let lease_b = reserve_source(&pool, &stats, client_addr, target_b, node.id);
+        let prepared_a = pool
+            .prepare_vless_source(
+                Arc::clone(&generation),
+                Arc::clone(&runtime),
+                client_addr,
+                VlessUdpPath::Xudp,
+                None,
+                target_a,
+                None,
+                Duration::from_secs(2),
+                Arc::clone(&alive),
+                Arc::clone(&stats),
+                honk_outbound::alive::IpVersion::V4,
+            )
+            .await
+            .unwrap();
+        let VlessSourcePreparation::Fresh {
+            scope: prepared_scope,
+            prepared,
+            source_permit,
+            runtime: prepared_runtime,
+            alive_set,
+            stats: prepared_stats,
+            node_id,
+            node_name,
+            health_family,
+        } = prepared_a
+        else {
+            panic!("first source preparation must be fresh");
+        };
+        let transport = prepared.commit().await.unwrap();
+        let attachment_a = VlessSourcePreparation::Fresh {
+            scope: prepared_scope,
+            prepared: honk_outbound::proxy::PreparedUdpTransport::ready(Arc::clone(&transport)),
+            source_permit,
+            runtime: prepared_runtime,
+            alive_set,
+            stats: prepared_stats,
+            node_id,
+            node_name,
+            health_family,
+        }
+        .commit(&pool)
+        .await
+        .unwrap();
+        let attachment_b = attach_source(
+            &pool,
+            &generation,
+            &runtime,
+            client_addr,
+            target_b,
+            &alive,
+            &stats,
+        )
+        .await;
+        let owner = attachment_a.owner();
+        assert!(Arc::ptr_eq(&owner, &attachment_b.owner()));
+        let scope = SourceScope::new(&runtime, client_addr, VlessUdpPath::Xudp, None);
+        let endpoint_a = install_source(&pool, lease_a, attachment_a, target_a, &stats, node.id);
+        let endpoint_b = install_source(&pool, lease_b, attachment_b, target_b, &stats, node.id);
+
+        endpoint_a.send_packet(b"first", true).await.unwrap();
+        let mut replies = HashMap::new();
+        let first = next_data_frame(&mut events, &mut replies).await;
+        replies[&first.connection]
+            .send((target_a, b"healthy".to_vec()))
+            .unwrap();
+        assert_eq!(
+            receive_reply(&client).await,
+            (b"healthy".to_vec(), target_a)
+        );
+        for _ in 0..49 {
+            alive.report_unavailable_traffic(
+                node.id,
+                honk_outbound::alive::ProbeDomain::DataUdp,
+                honk_outbound::alive::IpVersion::V4,
+            );
+        }
+        assert!(alive.is_alive_for(
+            node.id,
+            honk_outbound::alive::ProbeDomain::DataUdp,
+            honk_outbound::alive::IpVersion::V4,
+        ));
+
+        let mut pending_send = Box::pin(endpoint_b.send_packet(b"cancel-after-admission", false));
+        let pending = poll_fn(|cx| {
+            std::task::Poll::Ready(Future::poll(pending_send.as_mut(), cx).is_pending())
+        })
+        .await;
+        assert!(
+            pending,
+            "single poll must stop at the carrier writer acknowledgement"
+        );
+        let identity_b = endpoint_identity(&pool, client_addr, target_b).unwrap();
+        assert!(pool.retire_if_same(
+            EndpointKey::new(client_addr, target_b),
+            identity_b.0,
+            identity_b.1,
+        ));
+        drop(pending_send);
+        if repeated_consumers {
+            let send_error = transport
+                .send_to(target_a, None, b"sibling-after-cancel", None)
+                .await
+                .unwrap_err();
+            let receive_error = transport.recv_packet(&mut [0; 1]).await.unwrap_err();
+            // Both paths see the same real terminal; neither may consume its intent.
+            for error in [&send_error, &receive_error] {
+                assert!(owner.handle_transport_error(error));
+            }
+        } else {
+            endpoint_a
+                .send_packet(b"sibling-after-cancel", false)
+                .await
+                .expect_err("cancelled source must refuse the sibling send");
+        }
+        wait_source_removed(&pool, &scope).await;
+        assert!(alive.is_alive_for(
+            node.id,
+            honk_outbound::alive::ProbeDomain::DataUdp,
+            honk_outbound::alive::IpVersion::V4,
+        ));
+        for _ in 0..2 {
+            let removed = removed_rx.recv().await.unwrap();
+            assert!(pool.complete_removal(
+                removed.client,
+                removed.dst,
+                removed.decision_token,
+                removed.generation,
+            ));
+        }
+        drop(endpoint_a);
+        drop(endpoint_b);
+        drop(owner);
+        drop(transport);
+        assert!(pool.shutdown().await);
+        generation.shutdown().await;
+        wire_task.abort();
+        let _ = wire_task.await;
+    }
+}

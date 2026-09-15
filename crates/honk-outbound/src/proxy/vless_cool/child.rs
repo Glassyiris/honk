@@ -404,6 +404,9 @@ impl VlessXudpTransport {
         admission: Option<&AtomicBool>,
     ) -> io::Result<()> {
         let mut state = self.write.lock().await;
+        if let Some(failure) = self.failure.lock().as_ref() {
+            return Err(failure.io());
+        }
         if self.ended.load(Ordering::Acquire) {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
@@ -412,9 +415,6 @@ impl VlessXudpTransport {
                 io::ErrorKind::BrokenPipe,
                 "XUDP transport is closed after an interrupted send",
             ));
-        }
-        if let Some(failure) = self.failure.lock().as_ref() {
-            return Err(failure.io());
         }
         let first = !state.started;
         let frame = udp_frame(

@@ -408,15 +408,10 @@ async fn first_send_waits_for_flush_and_cancellation_never_replays() {
     gate.open();
     tokio::task::yield_now().await;
     assert!(!udp.source_send_usable().await);
+    let error = udp.send_packet_confirmed(b"second").await.unwrap_err();
+    assert!(is_vless_source_post_admission_cancel(&error));
     let terminal = udp.recv_packet(&mut [0; 1]).await.unwrap_err();
     assert!(is_vless_source_post_admission_cancel(&terminal));
-    assert_eq!(
-        udp.send_packet_confirmed(b"second")
-            .await
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::BrokenPipe
-    );
     let end = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut wire))
         .await
         .unwrap()
