@@ -190,6 +190,11 @@ Session pool 的自主 replacement dial 只绑定已发布 owner 的 admission�
 generation 的 gate。退役会立即清除已存 admission；未 commit 的
 `PreparedUdpTransport` 不保留 generation 或进程级 dial-admission permit。
 
+Pool waiter 在检查容量前注册容量变化通知。每个由 pool 持有的 stream permit
+（包括 detached session 的首个 permit）释放时都会通知 waiter。carrier 发布会
+唤醒所有符合条件的 waiter，避免不预留 stream 的 warm offer 消耗唯一通知，
+导致仍有可用容量的 stream checkout 一直等待。
+
 VLESS 物理 carrier 还持有不可变进程级 VLESS-carrier gate 的一个 permit。
 启动资源预算在计算 UDP endpoint 前先分出 `min(after_dials / 8, 8192)`；零值
 保持为零。重载流量与 DNS runtime fork 共用同一个 gate。permit 随实际 carrier

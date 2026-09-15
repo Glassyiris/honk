@@ -130,7 +130,8 @@ impl<S: ManagedSession> Drop for SessionPermit<S> {
         drop(self.permit.take());
         self.session.permit_released();
         if let Some(notify) = self.capacity_notify.take() {
-            notify.notify_one();
+            // An offer can wake without reserving, so one wake can strand a checkout.
+            notify.notify_waiters();
         }
     }
 }
@@ -408,6 +409,12 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             + pool.provisional.len()
     }
 
+    fn try_reserve(&self, session: &Arc<S>) -> Option<SessionPermit<S>> {
+        session
+            .try_reserve()
+            .map(|permit| permit.with_capacity_notify(Arc::clone(&self.capacity_notify)))
+    }
+
     #[cfg(test)]
     pub(crate) fn is_retired(&self) -> bool {
         self.state() != PoolState::Running
@@ -556,6 +563,9 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         let mut dial = Some(dial);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         loop {
+            let capacity_changed = self.capacity_notify.notified();
+            tokio::pin!(capacity_changed);
+            capacity_changed.as_mut().enable();
             if self.state() != PoolState::Running {
                 return Err(Self::pool_closed_err());
             }
@@ -631,7 +641,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         "offer parked on pool capacity"
                     );
                     tokio::select! {
-                        _ = self.capacity_notify.notified() => {}
+                        _ = &mut capacity_changed => {}
                         _ = shutdown_rx.changed() => {
                             return Err(Self::pool_closed_err());
                         }
@@ -696,6 +706,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     };
                     let task_pool = Arc::clone(&self.pool);
                     let task_state = Arc::clone(&self.state);
+                    let capacity_notify = Arc::clone(&self.capacity_notify);
                     let config = self.config.clone();
                     let mut task_shutdown_rx = self.shutdown_tx.subscribe();
                     let dial_scope = crate::runtime::capture_dial_scope();
@@ -776,6 +787,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                             }
                         };
                         let _ = done.send(signal);
+                        capacity_notify.notify_waiters();
                     }));
                     // Fall through: wait on the dial like everyone else.
                 }
@@ -790,6 +802,9 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
     pub async fn checkout_speculative(self: &Arc<Self>) -> anyhow::Result<SpeculativeCheckout<S>> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         loop {
+            let capacity_changed = self.capacity_notify.notified();
+            tokio::pin!(capacity_changed);
+            capacity_changed.as_mut().enable();
             enum Step<S: ManagedSession + 'static> {
                 Closed,
                 Shared(Arc<S>, SessionPermit<S>),
@@ -809,12 +824,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                             return None;
                         }
                         let session = Arc::clone(session);
-                        session.try_reserve().map(|permit| {
-                            (
-                                session,
-                                permit.with_capacity_notify(Arc::clone(&self.capacity_notify)),
-                            )
-                        })
+                        self.try_reserve(&session).map(|permit| (session, permit))
                     }) {
                         Step::Shared(session, permit)
                     } else if let Some((_, done)) = &pool.dial_done {
@@ -852,7 +862,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 }
                 Step::Capacity => {
                     tokio::select! {
-                        _ = self.capacity_notify.notified() => {}
+                        _ = &mut capacity_changed => {}
                         _ = shutdown_rx.changed() => return Err(Self::pool_closed_err()),
                     }
                 }
@@ -892,7 +902,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             let mut pool = self.pool.lock();
             pool.sessions.retain(|s| !Arc::ptr_eq(s, session));
         }
-        self.capacity_notify.notify_one();
+        self.capacity_notify.notify_waiters();
     }
 
     /// Open a logical channel on a pooled session: atomically reserve a
@@ -911,7 +921,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         let mut last_err: Option<anyhow::Error> = None;
         for _attempt in 0..2 {
             let session = self.offer(dial.clone()).await?;
-            let Some(permit) = session.try_reserve() else {
+            let Some(permit) = self.try_reserve(&session) else {
                 if session.state() == SessionState::Closed {
                     self.invalidate(&session);
                 }
@@ -921,7 +931,6 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 last_err = Some(anyhow!("session has no stream capacity"));
                 continue;
             };
-            let permit = permit.with_capacity_notify(Arc::clone(&self.capacity_notify));
             // A shared session is already physically admitted; time the
             // logical open before protocol negotiation can block or cancel.
             // A cold offer has already fired this one-shot hook on admission.
@@ -1255,9 +1264,9 @@ impl<S: ManagedSession + 'static> DetachedSessionReservation<S> {
         let _ = shutdown_rx.changed().await;
     }
 
-    /// Attach a completed detached session so pool retirement/shutdown and reservation
-    /// cancellation close it before it can escape as a pooled session.
-    pub fn attach(&mut self, session: &Arc<S>) -> anyhow::Result<()> {
+    /// Attach a completed detached session and reserve its first pool-owned stream
+    /// permit. Retirement, shutdown, and cancellation close it until commit.
+    pub fn attach(&mut self, session: &Arc<S>) -> anyhow::Result<SessionPermit<S>> {
         let attached = {
             let mut pool = self.pool.pool.lock();
             if !self.active || self.pool.state() != PoolState::Running {
@@ -1274,7 +1283,9 @@ impl<S: ManagedSession + 'static> DetachedSessionReservation<S> {
             }
         };
         if attached {
-            Ok(())
+            self.pool
+                .try_reserve(session)
+                .ok_or_else(|| anyhow!("detached session has no stream capacity"))
         } else {
             session.close();
             Err(SessionPool::<S>::pool_closed_err())
@@ -1313,6 +1324,7 @@ impl<S: ManagedSession + 'static> DetachedSessionReservation<S> {
             }
         };
         self.active = false;
+        self.pool.capacity_notify.notify_waiters();
         match outcome {
             Ok(session) => Ok(session),
             Err(session) => {
@@ -1341,7 +1353,7 @@ impl<S: ManagedSession + 'static> Drop for DetachedSessionReservation<S> {
         if let Some(session) = session {
             session.close();
         }
-        self.pool.capacity_notify.notify_one();
+        self.pool.capacity_notify.notify_waiters();
     }
 }
 

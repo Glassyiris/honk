@@ -21,7 +21,7 @@ use super::{
     MuxSession as _, PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound,
     ProxyStream, TcpOutbound, WarmRequirement, WarmableOutbound,
 };
-use crate::session::{ManagedSession as _, SpeculativeCheckout};
+use crate::session::SpeculativeCheckout;
 
 mod inbound;
 mod uot;
@@ -2269,10 +2269,7 @@ impl AnyTlsHandler {
                         anyhow::bail!("AnyTLS speculative dial cancelled by pool shutdown")
                     }
                 };
-                reservation.attach(&session)?;
-                let permit = session.try_reserve().ok_or_else(|| {
-                    anyhow::anyhow!("fresh AnyTLS session has no stream capacity")
-                })?;
+                let permit = reservation.attach(&session)?;
                 (session, permit, Some(reservation))
             }
         };

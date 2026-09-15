@@ -527,8 +527,7 @@ async fn prepare_detached(
     let (client, server) = tokio::io::duplex(1 << 20);
     let server = tokio::spawn(serve_idle_h2mux(server));
     let session = connect(Box::new(client), false).await.unwrap();
-    reservation.attach(&session).unwrap();
-    let permit = session.try_reserve().unwrap();
+    let permit = reservation.attach(&session).unwrap();
     let transport = Arc::clone(&session)
         .open_packet(permit, "8.8.8.8:53".parse().unwrap(), None)
         .await

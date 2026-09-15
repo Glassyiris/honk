@@ -51,23 +51,30 @@ fn pool(config: SessionPoolConfig) -> SessionPool<TestSession> {
 #[derive(Debug)]
 struct ReservedTestSession {
     closed: AtomicBool,
+    draining: AtomicBool,
     stream_permits: Arc<tokio::sync::Semaphore>,
     capacity: usize,
+    // Release after taking a stale capacity snapshot, before the caller can park.
+    release_on_check: Mutex<Option<SessionPermit<Self>>>,
 }
 
 impl ReservedTestSession {
     fn new(capacity: usize) -> Arc<Self> {
         Arc::new(Self {
             closed: AtomicBool::new(false),
+            draining: AtomicBool::new(false),
             stream_permits: Arc::new(tokio::sync::Semaphore::new(capacity)),
             capacity,
+            release_on_check: Mutex::new(None),
         })
     }
 }
 
 impl ManagedSession for ReservedTestSession {
     fn active_streams(&self) -> usize {
-        self.capacity - self.stream_permits.available_permits()
+        let active = self.capacity - self.stream_permits.available_permits();
+        drop(self.release_on_check.lock().take());
+        active
     }
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
@@ -75,12 +82,26 @@ impl ManagedSession for ReservedTestSession {
     fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
     }
-    fn try_reserve(self: &Arc<Self>) -> Option<SessionPermit<Self>> {
+    fn state(&self) -> SessionState {
         if self.is_closed() {
+            SessionState::Closed
+        } else if self.draining.load(Ordering::Relaxed) {
+            SessionState::Draining
+        } else {
+            SessionState::Active
+        }
+    }
+    fn begin_drain(&self) {
+        self.draining.store(true, Ordering::Relaxed);
+    }
+    fn try_reserve(self: &Arc<Self>) -> Option<SessionPermit<Self>> {
+        if self.state() != SessionState::Active {
             return None;
         }
-        let permit = Arc::clone(&self.stream_permits).try_acquire_owned().ok()?;
-        if self.is_closed() {
+        let permit = Arc::clone(&self.stream_permits).try_acquire_owned();
+        drop(self.release_on_check.lock().take());
+        let permit = permit.ok()?;
+        if self.state() != SessionState::Active {
             drop(permit);
             return None;
         }

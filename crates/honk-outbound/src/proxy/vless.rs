@@ -452,10 +452,7 @@ impl VLessHandler {
                         result = dial() => result?,
                         _ = reservation.cancelled() => anyhow::bail!(retired_error),
                     };
-                    reservation.attach(&session)?;
-                    let permit = session
-                        .try_reserve()
-                        .ok_or_else(|| anyhow::anyhow!("new VLESS mux session has no capacity"))?;
+                    let permit = reservation.attach(&session)?;
                     let transport = open(session, permit).await.map_err(Self::open_error)?;
                     return Ok(PreparedUdpTransport::new(async move {
                         reservation.commit()?;
@@ -547,7 +544,7 @@ impl VLessHandler {
                         result = dial() => result?,
                         _ = reservation.cancelled() => anyhow::bail!(retired_error),
                     };
-                    reservation.attach(&session)?;
+                    let _permit = reservation.attach(&session)?;
                     session
                         .clone()
                         .check_ready()

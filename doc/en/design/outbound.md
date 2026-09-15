@@ -216,6 +216,11 @@ predecessor retirement; a late speculative commit cannot restore its predecessor
 gate. Retirement clears the stored admission immediately, and an uncommitted
 `PreparedUdpTransport` retains neither generation nor process dial-admission permit.
 
+Pool waiters register for capacity changes before checking availability. Every
+pool-owned stream permit, including the first detached permit, notifies waiters
+when released. Carrier publication wakes all eligible waiters; a non-reserving
+warm offer must not consume the only notification and strand a stream checkout.
+
 VLESS physical carriers additionally hold one permit from the immutable
 process-wide VLESS-carrier gate. The startup resource budget computes
 `min(after_dials / 8, 8192)` before sizing UDP endpoints; zero remains zero.

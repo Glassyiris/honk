@@ -315,3 +315,31 @@ async fn pre_reservation_drain_does_not_close_live_session() {
     assert!(!draining.is_closed());
     assert_eq!(pool.metrics().sessions, 2);
 }
+
+#[tokio::test]
+async fn offer_registers_before_checking_capacity() {
+    let pool = SessionPool::new(SessionPoolConfig {
+        max_sessions: 1,
+        max_streams_per_session: 1,
+        ..Default::default()
+    });
+    let session = ReservedTestSession::new(1);
+    pool.insert(&session);
+    let held = pool
+        .open_with(
+            || async { unreachable!("seeded session must be reused") },
+            |_session, permit| async { Ok::<_, OpenError>(permit) },
+        )
+        .await
+        .unwrap();
+    *session.release_on_check.lock() = Some(held);
+
+    let mut offer = std::pin::pin!(
+        pool.offer(|| async { unreachable!("released capacity must not require a dial") })
+    );
+    let std::task::Poll::Ready(Ok(reused)) = futures_util::poll!(offer.as_mut()) else {
+        panic!("a release during the capacity check was lost before parking");
+    };
+    assert!(Arc::ptr_eq(&reused, &session));
+    assert_eq!(session.active_streams(), 0);
+}

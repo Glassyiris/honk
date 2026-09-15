@@ -33,13 +33,13 @@ async fn speculative_checkout_cancellation_releases_blocked_dial_slot() {
 
 #[tokio::test]
 async fn detached_checkout_shutdown_closes_attached_session_and_rejects_commit() {
-    let pool = Arc::new(pool(SessionPoolConfig::default()));
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig::default()));
     let mut reservation = match pool.checkout_speculative().await.unwrap() {
         SpeculativeCheckout::Detached(reservation) => reservation,
         SpeculativeCheckout::Shared { .. } => panic!("empty pool cannot be shared"),
     };
-    let session = TestSession::new();
-    reservation.attach(&session).unwrap();
+    let session = ReservedTestSession::new(1);
+    let _permit = reservation.attach(&session).unwrap();
 
     pool.shutdown();
 
@@ -76,13 +76,13 @@ async fn provisional_slot_does_not_block_normal_offer() {
 
 #[tokio::test]
 async fn detached_commit_inserts_once_into_the_captured_pool() {
-    let pool = Arc::new(pool(SessionPoolConfig::default()));
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig::default()));
     let mut reservation = match pool.checkout_speculative().await.unwrap() {
         SpeculativeCheckout::Detached(reservation) => reservation,
         SpeculativeCheckout::Shared { .. } => panic!("empty pool cannot be shared"),
     };
-    let session = TestSession::new();
-    reservation.attach(&session).unwrap();
+    let session = ReservedTestSession::new(2);
+    let _permit = reservation.attach(&session).unwrap();
     let committed = reservation.commit().unwrap();
 
     assert!(Arc::ptr_eq(&session, &committed));
@@ -102,7 +102,7 @@ async fn detached_commit_inserts_once_into_the_captured_pool() {
 
 #[tokio::test]
 async fn detached_commit_at_capacity_admits_drain_only() {
-    let pool = Arc::new(pool(SessionPoolConfig {
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
         max_sessions: 1,
         ..Default::default()
     }));
@@ -110,12 +110,12 @@ async fn detached_commit_at_capacity_admits_drain_only() {
         SpeculativeCheckout::Detached(reservation) => reservation,
         SpeculativeCheckout::Shared { .. } => panic!("empty pool cannot be shared"),
     };
-    let winner = TestSession::new();
-    reservation.attach(&winner).unwrap();
+    let winner = ReservedTestSession::new(1);
+    let _permit = reservation.attach(&winner).unwrap();
     // Normal offers don't count provisional slots, so the pool can fill
     // while the speculative dial is detached.
     let active = pool
-        .offer(|| async { Ok(TestSession::new()) })
+        .offer(|| async { Ok(ReservedTestSession::new(1)) })
         .await
         .unwrap();
 
@@ -151,20 +151,165 @@ async fn shared_checkout_reserves_its_stream_permit_atomically() {
     };
     assert_eq!(session.active_streams(), 1);
 
-    let blocked = tokio::spawn({
-        let pool = Arc::clone(&pool);
-        async move { pool.checkout_speculative().await }
-    });
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    assert!(
-        !blocked.is_finished(),
-        "the occupied shared stream slot must not be offered twice"
-    );
+    let mut blocked = std::pin::pin!(pool.checkout_speculative());
+    assert!(futures_util::poll!(blocked.as_mut()).is_pending());
     drop(permit);
-    let next = tokio::time::timeout(Duration::from_millis(100), blocked)
-        .await
-        .expect("second checkout did not observe released stream capacity")
-        .unwrap()
-        .unwrap();
+    let std::task::Poll::Ready(Ok(next)) = futures_util::poll!(blocked.as_mut()) else {
+        panic!("second checkout did not observe released stream capacity");
+    };
     assert!(matches!(next, SpeculativeCheckout::Shared { .. }));
+}
+
+#[tokio::test]
+async fn detached_commit_wakes_all_eligible_waiters_without_oversubscribing() {
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+        max_sessions: 1,
+        max_streams_per_session: 3,
+        ..Default::default()
+    }));
+    let SpeculativeCheckout::Detached(mut reservation) = pool.checkout_speculative().await.unwrap()
+    else {
+        panic!("empty pool must reserve a detached dial");
+    };
+    let mut cancelled = Box::pin(pool.checkout_speculative());
+    let mut first = std::pin::pin!(pool.checkout_speculative());
+    let mut second = std::pin::pin!(pool.checkout_speculative());
+    let mut third = std::pin::pin!(pool.checkout_speculative());
+    assert!(futures_util::poll!(cancelled.as_mut()).is_pending());
+    assert!(futures_util::poll!(first.as_mut()).is_pending());
+    assert!(futures_util::poll!(second.as_mut()).is_pending());
+    assert!(futures_util::poll!(third.as_mut()).is_pending());
+
+    let session = ReservedTestSession::new(3);
+    let held = reservation.attach(&session).unwrap();
+    reservation.commit().unwrap();
+    drop(cancelled);
+
+    let std::task::Poll::Ready(Ok(SpeculativeCheckout::Shared {
+        session: first_session,
+        permit: _first_permit,
+    })) = futures_util::poll!(first.as_mut())
+    else {
+        panic!("commit did not wake the first eligible checkout");
+    };
+    let std::task::Poll::Ready(Ok(SpeculativeCheckout::Shared {
+        session: second_session,
+        permit: _second_permit,
+    })) = futures_util::poll!(second.as_mut())
+    else {
+        panic!("commit stranded an eligible checkout");
+    };
+    assert!(Arc::ptr_eq(&first_session, &session));
+    assert!(Arc::ptr_eq(&second_session, &session));
+    assert!(futures_util::poll!(third.as_mut()).is_pending());
+    assert_eq!(session.active_streams(), 3);
+
+    pool.shutdown();
+    assert!(matches!(
+        futures_util::poll!(third.as_mut()),
+        std::task::Poll::Ready(Err(_))
+    ));
+    drop(held);
+}
+
+#[tokio::test]
+async fn detached_first_permit_release_wakes_offer_and_speculative_waiters() {
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+        max_sessions: 1,
+        max_streams_per_session: 1,
+        ..Default::default()
+    }));
+    let SpeculativeCheckout::Detached(mut reservation) = pool.checkout_speculative().await.unwrap()
+    else {
+        panic!("empty pool must reserve a detached dial");
+    };
+    let session = ReservedTestSession::new(1);
+    let held = reservation.attach(&session).unwrap();
+    reservation.commit().unwrap();
+
+    let mut offered = std::pin::pin!(
+        pool.offer(|| async { unreachable!("released capacity must not require a dial") })
+    );
+    let mut first = std::pin::pin!(pool.checkout_speculative());
+    let mut second = std::pin::pin!(pool.checkout_speculative());
+    assert!(futures_util::poll!(offered.as_mut()).is_pending());
+    assert!(futures_util::poll!(first.as_mut()).is_pending());
+    assert!(futures_util::poll!(second.as_mut()).is_pending());
+    drop(held);
+
+    let std::task::Poll::Ready(Ok(offered)) = futures_util::poll!(offered.as_mut()) else {
+        panic!("first detached permit release did not wake the normal offer");
+    };
+    assert!(Arc::ptr_eq(&offered, &session));
+    let std::task::Poll::Ready(Ok(SpeculativeCheckout::Shared { permit, .. })) =
+        futures_util::poll!(first.as_mut())
+    else {
+        panic!("a non-reserving offer consumed the only capacity wakeup");
+    };
+    assert!(futures_util::poll!(second.as_mut()).is_pending());
+    drop(permit);
+    let std::task::Poll::Ready(Ok(SpeculativeCheckout::Shared {
+        permit: _permit, ..
+    })) = futures_util::poll!(second.as_mut())
+    else {
+        panic!("shared permit release did not wake the remaining checkout");
+    };
+    assert_eq!(session.active_streams(), 1);
+}
+
+#[tokio::test]
+async fn speculative_checkout_registers_before_checking_capacity() {
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+        max_sessions: 1,
+        max_streams_per_session: 1,
+        ..Default::default()
+    }));
+    let session = ReservedTestSession::new(1);
+    pool.insert(&session);
+    let held = pool
+        .open_with(
+            || async { unreachable!("seeded session must be reused") },
+            |_session, permit| async { Ok::<_, OpenError>(permit) },
+        )
+        .await
+        .unwrap();
+    *session.release_on_check.lock() = Some(held);
+
+    let mut checkout = std::pin::pin!(pool.checkout_speculative());
+    let std::task::Poll::Ready(Ok(SpeculativeCheckout::Shared {
+        session: reused,
+        permit: _permit,
+    })) = futures_util::poll!(checkout.as_mut())
+    else {
+        panic!("a release during the capacity check was lost before parking");
+    };
+    assert!(Arc::ptr_eq(&reused, &session));
+    assert_eq!(session.active_streams(), 1);
+}
+
+#[tokio::test]
+async fn normal_dial_publication_wakes_a_speculative_capacity_waiter() {
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+        max_sessions: 1,
+        ..Default::default()
+    }));
+    let SpeculativeCheckout::Detached(_reservation) = pool.checkout_speculative().await.unwrap()
+    else {
+        panic!("empty pool must reserve a detached dial");
+    };
+    let mut checkout = std::pin::pin!(pool.checkout_speculative());
+    assert!(futures_util::poll!(checkout.as_mut()).is_pending());
+
+    let session = pool
+        .offer(|| async { Ok(ReservedTestSession::new(1)) })
+        .await
+        .unwrap();
+    let std::task::Poll::Ready(Ok(SpeculativeCheckout::Shared {
+        session: reused,
+        permit: _permit,
+    })) = futures_util::poll!(checkout.as_mut())
+    else {
+        panic!("normal publication stranded an already-parked speculative checkout");
+    };
+    assert!(Arc::ptr_eq(&reused, &session));
 }

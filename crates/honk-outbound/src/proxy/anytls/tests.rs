@@ -1,4 +1,5 @@
 use super::*;
+use crate::session::ManagedSession as _;
 mod overflow_runtime;
 mod overflow_state;
 mod payload_budget;
