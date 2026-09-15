@@ -117,7 +117,6 @@ impl ControlPlane {
         let current = Arc::clone(&current_guard);
         let retained_providers = rebase_subscription_nodes(&current, &mut new_config);
         drop(current_guard);
-        new_config.ensure_local_direct_rules();
         crate::dns::ecs::resolve_client_subnet(&mut new_config.dns).await;
         self.apply_resolved_runtime_config_locked(
             new_config,

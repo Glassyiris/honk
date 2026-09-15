@@ -34,6 +34,91 @@ fn cgroup_attached_prog_count(cgroup_fd: RawFd) -> u32 {
     total
 }
 
+#[test]
+#[ignore = "requires root; run via just test-netns"]
+fn missing_dae0peer_attach_failure_is_propagated() {
+    std::thread::spawn(|| {
+        // Lazy daens creation may add compatibility mounts; confine them to
+        // this thread's disposable mount namespace.
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)
+            .expect("create test mount namespace");
+        nix::mount::mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            nix::mount::MsFlags::MS_REC | nix::mount::MsFlags::MS_PRIVATE,
+            None::<&str>,
+        )
+        .expect("make test mounts private");
+        nix::mount::mount(
+            Some("tmpfs"),
+            "/run",
+            Some("tmpfs"),
+            nix::mount::MsFlags::empty(),
+            None::<&str>,
+        )
+        .expect("isolate test runtime directory");
+
+        crate::daens_fd().expect("create test daens namespace");
+        let dae0peer_ifindex = || {
+            crate::with_daens_netns("inspect test daens", || {
+                let mut netlink = crate::netlink::NlSock::new()?;
+                netlink.get_link("lo")?;
+                match netlink.get_link("dae0peer") {
+                    Ok((ifindex, _)) => Ok(Some(ifindex)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error.into()),
+                }
+            })
+            .expect("inspect test daens namespace")
+        };
+        assert!(
+            dae0peer_ifindex().is_none(),
+            "test daens already contains dae0peer; refusing to remove an unowned link"
+        );
+
+        let mut backend = RealEbpfBackend::load_routing_test_fixture(
+            crate::DEFAULT_BPF_OBJECT,
+            DaeParam::default(),
+        )
+        .expect("load embedded production object");
+        let program: &mut aya::programs::SchedClassifier = backend
+            .bpf_mut()
+            .unwrap()
+            .program_mut("dae0peer_ingress")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        program
+            .load()
+            .expect("load valid peer program before attach");
+        let caller_netns =
+            std::fs::read_link("/proc/thread-self/ns/net").expect("read caller network namespace");
+        let links_before = held_bpf_link_count();
+
+        backend
+            .attach_dae0peer_ingress()
+            .expect_err("missing dae0peer attach must fail");
+        assert_eq!(
+            std::fs::read_link("/proc/thread-self/ns/net")
+                .expect("read restored caller network namespace"),
+            caller_netns,
+            "failed attach stranded its caller in daens"
+        );
+        assert_eq!(
+            held_bpf_link_count(),
+            links_before,
+            "failed attach leaked a BPF link"
+        );
+        assert!(
+            dae0peer_ifindex().is_none(),
+            "failed attach created or retained dae0peer"
+        );
+    })
+    .join()
+    .expect("peer attach regression thread");
+}
+
 /// Regression test: every link aya hands us (TC, cgroup sock/sock_addr)
 /// stays owned by the backend until its interface is forgotten or global
 /// shutdown. Forgetting a startup WAN must release its TCX links so the
@@ -413,4 +498,12 @@ fn test_event_ip() {
         event_ip(&v6),
         std::net::IpAddr::V6("::1".parse::<std::net::Ipv6Addr>().unwrap())
     );
+}
+
+#[test]
+fn routing_handoff_layout_validation_rejects_legacy_value_size() {
+    let key = core::mem::size_of::<TuplesKey>() as u32;
+    let current = core::mem::size_of::<RoutingHandoffEntry>() as u32;
+    assert!(validate_routing_handoff_sizes(key, current).is_ok());
+    assert!(validate_routing_handoff_sizes(key, 48).is_err());
 }

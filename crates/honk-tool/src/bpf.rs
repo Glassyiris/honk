@@ -570,6 +570,13 @@ fn show(args: ShowArgs) -> anyhow::Result<()> {
         }
         "routing-handoff" => {
             let fd = open(&args.pin_root, "ROUTING_HANDOFF_MAP")?;
+            query_map_layout(
+                fd,
+                "ROUTING_HANDOFF_MAP",
+                1,
+                std::mem::size_of::<TuplesKey>() as u32,
+                std::mem::size_of::<RoutingHandoffEntry>() as u32,
+            )?;
             let entries = map_entries(
                 fd,
                 std::mem::size_of::<TuplesKey>(),

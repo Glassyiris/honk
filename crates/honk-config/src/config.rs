@@ -446,7 +446,8 @@ impl Config {
         }
     }
 
-    /// Current host CIDRs on configured LAN/WAN interfaces. Missing
+    /// Current host CIDRs on configured LAN/WAN interfaces, used to detect
+    /// address changes rather than synthesize routing rules. Missing
     /// interfaces and an unresolved `auto` entry are omitted.
     pub fn local_direct_cidrs(&self) -> Vec<String> {
         let mut cidrs = Vec::new();
@@ -459,48 +460,6 @@ impl Config {
         cidrs.sort();
         cidrs.dedup();
         cidrs
-    }
-
-    /// Inject terminal must-direct routing rules for every address assigned to
-    /// configured lan/wan interfaces, so traffic to the gateway itself
-    /// (admin UI, SSH, clash API) bypasses the proxy even when every node is
-    /// dead. Generated rules use priority 0 and are appended after user rules:
-    /// they outrank user rules with a higher priority, while stable equal-
-    /// priority ordering lets an existing user priority-0 rule win first.
-    ///
-    /// Best-effort and idempotent: interfaces that cannot be read
-    /// (missing, `auto` without a default route) are skipped. Returns whether
-    /// the generated address set changed.
-    pub fn ensure_local_direct_rules(&mut self) -> bool {
-        const MARK: &str = "__local_direct_";
-        let mut previous: Vec<String> = self
-            .routing
-            .rules
-            .iter()
-            .filter_map(|rule| rule.name.strip_prefix(MARK).map(str::to_owned))
-            .collect();
-        previous.sort();
-        previous.dedup();
-        self.routing
-            .rules
-            .retain(|rule| !rule.name.starts_with(MARK));
-
-        let cidrs = self.local_direct_cidrs();
-        let changed = previous != cidrs;
-        for cidr in cidrs {
-            self.routing.rules.push(crate::routing::RoutingRule {
-                name: format!("{MARK}{cidr}"),
-                condition: crate::routing::RoutingCondition {
-                    ip: vec![cidr],
-                    ..Default::default()
-                },
-                outbound: crate::routing::RoutingOutbound::Simple("direct".to_string()),
-                priority: 0,
-                must: true,
-                mark: 0,
-            });
-        }
-        changed
     }
 
     /// Apply the removed experimental NFQUEUE setting without retaining it in
@@ -1622,49 +1581,6 @@ mod builtin_nodes_tests {
             config.builtin_node("block").unwrap().subscription_id,
             registered.subscription_id,
             "a registered built-in wins over the fresh definition"
-        );
-    }
-
-    #[test]
-    fn test_ensure_local_direct_rules_injects_refreshes_and_is_idempotent() {
-        let mut config = Config::default();
-        config.global.wan_interface =
-            vec!["lo".to_string(), "definitely-not-an-iface0".to_string()];
-        assert!(config.ensure_local_direct_rules());
-
-        let injected: Vec<_> = config
-            .routing
-            .rules
-            .iter()
-            .filter(|r| r.name.starts_with("__local_direct_"))
-            .collect();
-        // lo carries 127.0.0.1 and ::1 (host scope) on every Linux host.
-        assert!(
-            injected
-                .iter()
-                .any(|r| r.condition.ip == vec!["127.0.0.1/32".to_string()]),
-            "loopback v4 must be injected: {injected:?}"
-        );
-        assert!(injected.iter().all(|r| r.must));
-        assert!(
-            injected
-                .iter()
-                .all(|rule| rule.outbound.as_str() == "direct")
-        );
-
-        let count = config.routing.rules.len();
-        assert!(!config.ensure_local_direct_rules());
-        assert_eq!(config.routing.rules.len(), count, "must be idempotent");
-
-        config.global.wan_interface = vec!["definitely-not-an-iface0".to_string()];
-        assert!(config.ensure_local_direct_rules());
-        assert!(
-            config
-                .routing
-                .rules
-                .iter()
-                .all(|rule| !rule.name.starts_with("__local_direct_")),
-            "stale generated rules must be removed"
         );
     }
 

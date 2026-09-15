@@ -31,15 +31,16 @@ mod shutdown;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-use runtime::{
+use udp_ingress::{
     UdpLoopState, UdpSlowPathWork, begin_udp_slow_path, dispatch_udp_slow_path,
-    reserve_udp_slow_path, try_admit_udp_slow_path,
+    reserve_udp_slow_path, try_admit_udp_slow_path, udp_fast_path,
 };
 pub mod routing_matcher;
 mod sockets;
 pub mod tcp_sniff;
 mod udp_dial;
 pub mod udp_endpoint;
+mod udp_ingress;
 mod udp_removal;
 use crate::connection_tracker::ConnectionTracker;
 use crate::control::packet_sniffer::PacketSnifferPool;
@@ -95,8 +96,8 @@ pub(crate) use resource_budget::{MAX_EFFECTIVE_NOFILE, ResourceBudget};
 use sockets::*;
 
 /// Re-send `NetworkChanged` with bounded backoff after a rejected refresh.
-/// The handler re-derives rules from live interface addresses, so duplicate
-/// deliveries after convergence are cheap no-ops.
+/// Duplicate deliveries after the interface-dependent state converges are
+/// cheap no-ops.
 fn spawn_network_refresh_retry(tx: mpsc::Sender<ControlCommand>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         for delay_secs in [5, 15, 60] {
@@ -105,7 +106,7 @@ fn spawn_network_refresh_retry(tx: mpsc::Sender<ControlCommand>) -> tokio::task:
                 return;
             }
         }
-        warn!("network-triggered routing refresh retries exhausted");
+        warn!("network-triggered ECS refresh retries exhausted");
     })
 }
 
@@ -135,9 +136,9 @@ pub struct ControlPlane {
     tcp_sniff_neg_cache: Arc<crate::control::tcp_sniff::TcpSniffNegCache>,
     command_tx: mpsc::Sender<ControlCommand>,
     command_rx: Option<mpsc::Receiver<ControlCommand>>,
-    /// Backoff retry for a rejected network-triggered rule refresh: the
+    /// Backoff retry for rejected interface-dependent runtime refreshes: the
     /// iface watcher consumes each change once, so a transient rejection
-    /// would otherwise strand the generated gateway-address rules.
+    /// would otherwise leave ECS on stale network-derived state.
     network_refresh_retry: Option<tokio::task::JoinHandle<()>>,
     alive_set: Arc<crate::outbound::AliveDialerSet>,
     connection_pool: Arc<ConnectionPool>,

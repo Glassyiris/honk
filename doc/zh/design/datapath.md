@@ -54,18 +54,18 @@ flowchart LR
 
 `auto` 解析为当前默认路由接口。没有默认路由时，该项保持未挂载，而不会回退到 loopback。`IfaceWatcher` 订阅 rtnetlink 的链路、IPv4/IPv6 地址和 IPv4/IPv6 路由组；每 60 秒一次的协调 tick 作为事件交付的后备。协调过程重新解析 `auto`，通过 ifindex 识别接口重建，重新计算单网卡或双网卡角色，并安装或忘记进程持有的挂钩。
 
-链路、地址、路由或接口角色变化时，系统还会为已配置 LAN/WAN 接口上的每个地址重新发布生成的 `direct(must)` 规则。它清除健康检查 cooldown 并触发新探测。在新探测成功前，失效 UDP 和多叶节点出站仍保持 fail-closed；未配置 `final` 的单叶节点 TCP 组仍可作为用户态最后尝试。
+链路、地址、路由或接口角色变化时，接口地址仍用于拓扑检测与 ECS 刷新，不再发布生成的 `direct(must)` 规则，也没有隐藏的内核地址白名单。系统仍清除健康检查 cooldown 并触发新探测。在新探测成功前，失效 UDP 和多叶节点出站仍保持 fail-closed；未配置 `final` 的单叶节点 TCP 组仍可作为用户态最后尝试。
 
 ## 程序清单
 
 | 程序 | 挂钩 | 内核职责 |
 | --- | --- | --- |
-| `lan_ingress_l2`, `lan_ingress_l3` | LAN TC ingress | 检查准入，绕过特殊/本地流量，执行端口 53 快速路径、路由、连接状态、direct 卸载、代理重定向、TX 计数，以及可选的歧义 UDP 暂存。 |
+| `lan_ingress_l2`, `lan_ingress_l3` | LAN TC ingress | 检查准入，绕过特殊/本地流量，执行包含端口 53 的有序路由策略、DNS 接管判断、连接状态、direct 卸载、代理重定向、TX 计数，以及可选的歧义 UDP 暂存。 |
 | `wan_ingress_l2`, `wan_ingress_l3` | WAN TC ingress | 刷新反向连接状态；单网卡拓扑不挂载。 |
 | `lan_egress_l2`, `lan_egress_l3` | LAN TC egress | 刷新反向连接状态并抑制本机生成的 ICMPv6 Redirect 数据包；单网卡拓扑在共用接口上跳过。 |
 | `wan_egress_l2`, `wan_egress_l3` | WAN TC egress | 路由主机发起的 TCP/UDP，使用进程名与控制平面 bypass 数据，检查出站连通性，缓存决策并重定向代理流量。 |
 | `dae0_ingress` | 主机 `dae0` 的 TC ingress | 反查 `REDIRECT_TRACK`，恢复原始 MAC/接口交付，并统计 RX 流量。 |
-| `dae0peer_ingress` | `daens` `dae0peer` 的 TC ingress | 校验重定向数据包，应用 `TPROXY_MARK`，并用 `bpf_sk_assign` 把 UDP 和新 TCP 交给监听器。 |
+| `dae0peer_ingress` | `daens` `dae0peer` 的必需 TC ingress | 校验重定向数据包，恢复跨链路保存的逐报文 DNS 出站/代际 mark，应用透明交付标记，并用 `bpf_sk_assign` 把 UDP 和新 TCP 交给监听器。 |
 | `tproxy_sk_lookup` | `daens` 中的 `sk_lookup` | 用 `LISTEN_SOCKET_MAP` 中的透明监听器覆盖普通套接字查找。 |
 | `tproxy_wan_cg_sock_create`, `tproxy_wan_cg_sock_release` | cgroup `sock_create`, `sock_release` | 创建/刷新或删除套接字 cookie 到 PID/`comm` 的条目。 |
 | `tproxy_wan_cg_connect4`, `tproxy_wan_cg_connect6` | cgroup `connect4`, `connect6` | 刷新已连接套接字的 cookie 到进程元数据。 |
@@ -81,7 +81,7 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 | --- | --- |
 | `CONN_STATE_MAP` | 不预分配的普通 hash，最多 524,288 项。保存每流 TCP/UDP 状态和已发布路由元数据；用户空间负责压力驱逐。 |
 | `REDIRECT_TRACK` | 不预分配的 65,536 项 hash。把有方向的五元组映射到原始 MAC/接口、出站、时间戳和决策身份，用于恢复回复路径。 |
-| `ROUTING_HANDOFF_MAP` | 不预分配的 65,536 项 hash。向用户空间传递以 tuple 为 key 的路由元数据。 |
+| `ROUTING_HANDOFF_MAP` | 不预分配的 65,536 项 hash。TCP SYN handoff 包含已提交策略代际，暂存 UDP 携带 decision token。原始 must UDP/53 不发布 tuple handoff，所有权使用逐报文 mark；非 must UDP/53 保留供畸形 payload 回退使用的事实。 |
 | `ROUTING_POLICY_ROOT` | 单项 map-in-map，选择不可变 policy descriptor 和两个同步生成函数槽之一。root 成功替换返回后，旧 non-sleepable 读者已完成 grace。 |
 | 按代持有的 IP/MAC 索引 | 分离的目的/源 IPv4、IPv6 LPM maps 及 MAC LPM。value 是完整的本代谓词 bitmap，更具体前缀继承祖先位。 |
 | 按代持有的 domain map | 不预分配的 IP 到域名谓词 bitmap hash。DNS/sniff 事实覆盖正负条件；存在的零 bitmap 表示 known-false。descriptor 提供其 map ID 供诊断读取。 |
@@ -101,6 +101,8 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 
 内核/用户空间共用的 map key 和 value 是 `#[repr(C)]` ABI。共享流结构中的 IPv4 地址都以网络字节序的 IPv4-mapped IPv6 值保存。
 
+TCP SYN handoff 尾部增加 `u64 routing_generation`：`RoutingHandoffEntry` 为 56 字节，`result` 仍在偏移 8，UDP `decision_token` 仍在偏移 44。生成路由函数的 `RoutingInput`/`RoutingDecision` ABI、`ConnState` 和 `UDP_DECISION_SEQUENCE` 不变。旧显式 BPF 对象或不兼容的 handoff map 布局会在原始读取前被拒绝；`honk-tool` 也检查布局，请使用匹配版本的 core、工具和对象。
+
 ## Mark 及其所有权
 
 | 常量 | 值 | 含义 |
@@ -113,15 +115,23 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 
 `SKB_MARK_RESERVED_MASK` 为 `0xc0000000`，即 `CLASSIFIED_MARK` 与 `NFQUEUE_PENDING_MARK` 的并集。配置校验拒绝与这些 bit 重叠的 `global.so_mark_from_dae` 和路由规则 mark。NFQUEUE direct 完成路径在接受规则 mark 前重复相同检查。
 
+真实透明 UDP/53 从 `SO_RCVMARK` 启用的 `SOL_SOCKET`/`SO_MARK` 辅助数据取得逐报文出站及策略代际，不能用最新的 tuple handoff 替代。同一个 skb 的 `cb[2]` 跨链路保存路由编码与不回绕的 20 位已提交策略代际，再由必需的 `dae0peer` TC 恢复。内部可变携带位为 `0x37fffeff`，其余签名匹配掩码为 `0xc8000100`；`daens` 内部 fwmark 规则只忽略这些专用可变位，不改变用户规则 mark 的保留位约束。
+
 本地套接字探测必须区分 honk 自身的透明监听器和普通本地服务。`bpf_sock_is_dae_socket` 把完整套接字 mark 与 `PARAM.dae_socket_mark` 比较，后者由用户空间设为 `DAE_BYPASS_MARK`。相等表示“honk 监听器”，探测继续透明路径；普通未标记监听器可以取得该目的地址。主机网络命名空间中的 `dns.bind` 套接字有意保持为普通未标记监听器。
 
 ## 数据包行为与不变量
 
 ### DNS 与本地监听器优先级
 
-LAN TCP 和 UDP 的目的端口为 `53` 时跳过路由循环，直接进入控制平面。LAN 出站健康检查导致的丢包也豁免端口 `53`，让用户空间 DNS 自行执行 fallback。
+LAN/WAN TCP/UDP 目的端口 `53` 在现有入口排除与本地监听优先判断后执行一次正常有序策略，不单独扫描 must 规则。[流量规则所有权](../reference/routing.md#出站目标与-must)决定原生、丢弃、原始转发或控制器路径。端口 `53` 仍豁免 LAN 出站健康检查丢包，但不豁免终局用户 `must` 结果。
 
-本地套接字探测先于该快速路径运行，并按传输协议分别判断。绑定到具体地址的 UDP 套接字，或处于 `LISTEN` 状态的 TCP 套接字，对其传输协议优先。wildcard 匹配仅在完整 FIB 查找返回 `NOT_FWDED` 时优先；单独的套接字查找也会匹配转发目的地址。监听器 mark 检查把 honk 自身的透明监听器排除在该优先规则之外。因此，本地 `dns.bind` 监听器可拥有主机本地 `:53`，而远端解析器流量仍走透明 DNS。
+本地套接字探测先于流量策略运行，并按传输协议分别判断；探测使用报文所在的当前网络命名空间（负 netns ID），不是相对命名空间 ID `0`。绑定到具体地址的 UDP 套接字，或处于 `LISTEN` 状态的 TCP 套接字，对其传输协议优先。wildcard 匹配仅在完整 FIB 查找返回 `NOT_FWDED` 时优先；单独的套接字查找也会匹配转发目的地址。监听器 mark 检查把 honk 自身的透明监听器排除在该优先规则之外。因此，本地 `dns.bind` 监听器可拥有主机本地 `:53`，而远端解析器流量继续接受流量策略与 DNS 接管判断。空 bind 不代表关闭透明 DNS。
+
+实际本地 socket 的优先接收不等于所有网关地址强制直连。非 DNS TCP 纯 SYN 的现有探测策略不变，因此不能承诺无需配置即可始终访问网关管理面；需要时使用[显式用户规则](../reference/routing.md#显式本地路由)。
+
+原生直连仍受外部防火墙/NAT 影响；它与 `asis` 及客户端侧 anyfrom 回复的区别见[DNS 来源边界](./dns.md#入口路径)。
+
+UDP/53 仍不进入普通 UDP conn-state 或 NFQUEUE staging，不分配 decision token；没有新的 DNS 注册表、map、依赖或配置键。
 
 ### 特殊与内部流量
 
@@ -135,11 +145,11 @@ LAN TCP 和 UDP 的目的端口为 `53` 时跳过路由循环，直接进入控�
 
 ### 出站存活状态
 
-用户空间把 group-OR 健康状态发布到 `OUTBOUND_CONNECTIVITY_MAP`。若新 LAN 流被路由到显式标为失效的槽，内核以 `TC_ACT_SHOT` 丢弃；这是有意的 fail-closed 行为。唯一的窄例外是：未配置 `final` 且只有一个唯一叶节点的 TCP 组保持槽开放，使真实流量可经同一代理尝试并证明恢复，而不会隐式回退到 `direct`。UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed；但含有 `direct`/`block` 内建成员的组永不失活：内建节点永远不会被判定死亡，因此 group-OR 槽保持开放。LAN ingress 上的 TCP 和 UDP 目的端口 `53` 均获豁免。为当前每个网关接口地址生成的 must-direct 规则通过同一路由发布路径下发，即使代理出站失效也能保持本地管理可达。
+用户空间把 group-OR 健康状态发布到 `OUTBOUND_CONNECTIVITY_MAP`。若新 LAN 流被路由到显式标为失效的槽，内核以 `TC_ACT_SHOT` 丢弃；这是有意的 fail-closed 行为。唯一的窄例外是：未配置 `final` 且只有一个唯一叶节点的 TCP 组保持槽开放，使真实流量可经同一代理尝试并证明恢复，而不会隐式回退到 `direct`。UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed；但含有 `direct`/`block` 内建成员的组永不失活：内建节点永远不会被判定死亡，因此 group-OR 槽保持开放。LAN ingress 上的 TCP 和 UDP 目的端口 `53` 均豁免该健康检查丢包，但仍执行用户的终局 `must` 结果。网关管理访问不再由自动地址规则保障。
 
 ### 路由时 direct 卸载
 
-是否让非 `must` 流留在内核 direct 路由，只在路由时决定一次，并缓存到 `RoutingMeta` bit 57。已建立流检查该缓存 bit，而不再读取 `DATAPATH_FLAGS_MAP`。
+是否让非 `must`、非 DNS 流留在内核 direct 路由，只在路由时决定一次，并缓存到 `RoutingMeta` bit 57。已建立流检查该缓存 bit，而不再读取 `DATAPATH_FLAGS_MAP`。下表的模式卸载不适用于非 `must` DNS，不能抢走 DNS 控制器的接管权限。
 
 | 有效模式 | 路由时策略 |
 | --- | --- |
@@ -147,7 +157,7 @@ LAN TCP 和 UDP 的目的端口为 `53` 时跳过路由循环，直接进入控�
 | `Direct` | 每个非 final、非 `block` 流都归一化为 `direct` 并卸载，因为用户空间最终也会选择 direct。 |
 | `Global` | 全局选择恰为 `direct` 时使用相同的全 direct 策略。其他全局选择让非 final 流留在用户空间，以应用所选出站。 |
 
-`direct(must)` 始终保持 direct，不需要 bit 57 标志。`block` 保持 final。完整规则求值与模式语义见[路由设计](./routing.md)。
+`direct(must)` 始终保持 direct，不需要 bit 57 标志。非 DNS 的 `block` 与 DNS 的 `block(must)` 保持 final；普通非 `must` DNS `block` 仍交给 DNS 控制器。完整规则求值与模式语义见[路由设计](./routing.md)。
 
 ### 主机发起的 WAN UDP
 

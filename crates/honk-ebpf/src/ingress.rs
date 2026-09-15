@@ -31,7 +31,7 @@ use aya_ebpf_bindings::{
 use honk_ebpf_common::{
     CLASSIFIED_MARK, DATAPATH_FLAG_NFQ_ENABLED, DATAPATH_FLAG_NFQ_READY, IpVersionType,
     L4ProtoType, NFQUEUE_PENDING_MARK, NFQUEUE_SIGNATURE_MARK, RedirectEntry, RedirectTuple,
-    RoutingMeta, TPROXY_MARK,
+    RoutingMeta, TPROXY_MARK, UdpDnsRoute,
     conn::{BpfStatsKey, ConnState, UdpDecisionState},
     pack_nfqueue_mark,
     redirect_need::{RoutingHandoffEntry, TuplesKey},
@@ -67,11 +67,10 @@ const AF_INET6: u8 = 10;
 ///   Userspace never looks up handoffs for these packets, so writing one
 ///   would just sit in the map until the janitor sweeps it.
 ///   `REDIRECT_TRACK` is refreshed only when stale.
-/// `HANDOFF_WRITE_REFRESH`: UDP, first packet and cached path alike.
-///   Write when no entry exists or the existing one is older than
-///   [`crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS`]. A new flow's first
-///   packet always finds the entry absent (or long consumed) and therefore
-///   rewrites it, so userspace still sees a handoff on endpoint-pool miss.
+/// `HANDOFF_WRITE_REFRESH`: UDP that may need tuple fallback, on the first
+///   packet and cached path alike. Write when absent or stale so userspace
+///   can recover metadata on an endpoint-pool miss. Raw must UDP53 uses its
+///   per-packet carrier instead and is excluded by the redirect helper.
 const HANDOFF_WRITE_ALWAYS: u8 = 0;
 const HANDOFF_WRITE_SKIP: u8 = 1;
 const HANDOFF_WRITE_REFRESH: u8 = 2;
@@ -84,9 +83,20 @@ fn redirect_lan_packet_to_control_plane(
     routing_meta_raw: u64,
     handoff_mode: u8,
     decision_token: u32,
+    routing_generation: u64,
 ) -> Verdict {
     let routing_meta = RoutingMeta {
         raw: routing_meta_raw,
+    };
+    let dns_route_mark = if pkt.l4proto == IPPROTO_UDP && pkt.tuples.five.dst_port == 53 {
+        let Some(route) =
+            UdpDnsRoute::new(unsafe { routing_meta.data.outbound }, routing_generation)
+        else {
+            return Err(TC_ACT_SHOT);
+        };
+        route.to_mark()
+    } else {
+        0
     };
     let now = unsafe { bpf_ktime_get_ns() };
 
@@ -94,36 +104,42 @@ fn redirect_lan_packet_to_control_plane(
     // (redirect path; the direct+must pass-through exits count separately).
     crate::stats::count_tx(ctx, unsafe { routing_meta.data.outbound });
 
-    // Set mark and cb for later processing.  The cross-namespace redirect
-    // path preserves skb->mark but not cb[], so encode the listener l4proto
-    // in the low byte of the mark (TPROXY_MARK only uses bit 27).
+    // The link crossing may scrub skb->mark; dae0peer restores routing
+    // authority from cb[2] after validating the carrier.
     ctx.skb
         .set_mark(TPROXY_MARK | (pkt.listener_l4proto as u32));
     unsafe {
         (*ctx.skb.skb).cb[0] = TPROXY_MARK;
         (*ctx.skb.skb).cb[1] = pkt.listener_l4proto as u32;
+        (*ctx.skb.skb).cb[2] = dns_route_mark;
     }
 
-    // Handoff entry for userspace lookup, throttled by mode (see the
-    // HANDOFF_WRITE_* constants): established TCP flows never write, UDP
-    // flows write at most once per AUXILIARY_MAP_REFRESH_INTERVAL_NS.
-    let write_handoff = match handoff_mode {
-        HANDOFF_WRITE_ALWAYS => true,
-        HANDOFF_WRITE_REFRESH => match ROUTING_HANDOFF_MAP.get_ptr_mut(pkt.tuples.five) {
-            Some(old) => unsafe {
-                if (*old).result.decision_token != decision_token {
-                    return Err(TC_ACT_SHOT);
-                }
-                now.wrapping_sub((*old).last_seen_ns)
-                    >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
+    // Raw must UDP53 is admitted from the per-packet carrier, so only flows
+    // that userspace may look up publish a tuple handoff.
+    let raw_must_dns = dns_route_mark != 0 && unsafe { routing_meta.data.must != 0 };
+    let write_handoff = !raw_must_dns
+        && match handoff_mode {
+            HANDOFF_WRITE_ALWAYS => true,
+            HANDOFF_WRITE_REFRESH => match ROUTING_HANDOFF_MAP.get_ptr_mut(pkt.tuples.five) {
+                Some(old) => unsafe {
+                    if (*old).result.decision_token != decision_token {
+                        return Err(TC_ACT_SHOT);
+                    }
+                    now.wrapping_sub((*old).last_seen_ns)
+                        >= crate::contrack::AUXILIARY_MAP_REFRESH_INTERVAL_NS
+                },
+                None => true,
             },
-            None => true,
-        },
-        _ => false,
-    };
+            _ => false,
+        };
     if write_handoff {
         let mut handoff: RoutingHandoffEntry = unsafe { mem::zeroed() };
         handoff.last_seen_ns = now;
+        handoff.routing_generation = if pkt.l4proto == IPPROTO_TCP {
+            routing_generation
+        } else {
+            0
+        };
         unsafe {
             handoff.result.mark = routing_meta.data.mark;
             handoff.result.must = routing_meta.data.must;
@@ -250,6 +266,7 @@ fn stage_udp_decision(ctx: &TcContext, pkt: &ParsedPacket, routing_meta_raw: u64
     }
 
     scratch.handoff.last_seen_ns = now;
+    scratch.handoff.routing_generation = 0;
     scratch.handoff.result.mark = mark;
     scratch.handoff.result.must = must;
     scratch.handoff.result.outbound = outbound;
@@ -370,6 +387,7 @@ fn cached_udp_decision_inner(
             meta_raw,
             HANDOFF_WRITE_SKIP,
             state.decision_token,
+            0,
         );
     }
     if state.decision_token != 0 && (outbound != OUTBOUND_DIRECT || !offload || must != 0) {
@@ -393,6 +411,7 @@ fn cached_udp_decision_inner(
         meta_raw,
         HANDOFF_WRITE_REFRESH,
         state.decision_token,
+        0,
     )
 }
 
@@ -409,7 +428,6 @@ fn pass_through_classified(ctx: &TcContext) -> Verdict {
 
 #[inline(always)]
 fn lan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: u16) -> bool {
-    // LAN sends both TCP and UDP DNS to userspace; WAN egress exempts only UDP DNS.
     dport == 53 || crate::egress::wan_outbound_is_alive(ctx, outbound, l4proto, dport)
 }
 
@@ -455,7 +473,7 @@ fn wildcard_socket_destination_is_local(ctx: &TcContext, pkt: &ParsedPacket) -> 
 
 /// Existing flows probe for a local owner as before. Pure SYNs normally skip
 /// this lookup, except TCP DNS: a real host-netns port-53 LISTEN socket must
-/// get first refusal before the unconditional DNS redirect.
+/// get first refusal before ordered traffic routing.
 #[inline(always)]
 const fn tcp_socket_probe_required(pure_syn: bool, destination_port: u16) -> bool {
     !pure_syn || destination_port == 53
@@ -466,8 +484,6 @@ const _: [(); 1] = [(); tcp_socket_probe_required(true, 53) as usize];
 const _: [(); 0] = [(); tcp_socket_probe_required(true, 443) as usize];
 const _: [(); 1] = [(); tcp_socket_probe_required(false, 443) as usize];
 
-/// Check if a destination IP is likely a local address where a socket lookup
-/// could find a matching listening socket (RFC 1918, loopback, ULA, link-local).
 // #[inline(never)]: shared by lan_ingress_l2/l3. 5-level call chain
 // with 256B baseline stays under the 512B BPF stack limit.
 #[inline(never)]
@@ -523,13 +539,14 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         let mark = unsafe { tcp_state.meta.data.mark };
 
         let must = unsafe { tcp_state.meta.data.must };
+        if pkt.tuples.five.dst_port == 53 && outbound == OUTBOUND_BLOCK {
+            return Err(TC_ACT_SHOT);
+        }
         let offload =
             unsafe { tcp_state.meta.raw } & honk_ebpf_common::ROUTING_META_FLAG_OFFLOAD != 0;
 
-        // The offload decision was cached per flow at route-decision time
-        // (must-direct, or the mode-based policy).  Flows the DNS fast path
-        // publishes carry neither bit and keep redirecting to the control
-        // plane, so TCP DNS is never split by this pass-through.
+        // DNS never carries the mode-offload bit; only a terminal must-direct
+        // result can pass natively on this path.
         if outbound == OUTBOUND_DIRECT && (must != 0 || offload) {
             crate::stats::count_tx(ctx, outbound);
             ctx.skb.set_mark(mark | CLASSIFIED_MARK);
@@ -549,6 +566,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             pkt,
             unsafe { tcp_state.meta.raw },
             HANDOFF_WRITE_SKIP,
+            0,
             0,
         );
     }
@@ -580,10 +598,9 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         }
     }
 
-    // New-flow handoff policy from here on: a pure TCP SYN must always leave
-    // a handoff for userspace to consume at accept time; UDP writes are
-    // throttled to absent-or-stale (userspace only reads them on endpoint
-    // pool miss, and the first packet always finds the entry absent).
+    // A pure TCP SYN always leaves a handoff for accept-time consumption.
+    // UDP tuple handoffs are refreshed only when userspace may need them;
+    // raw must UDP53 is authoritative from its per-packet carrier.
     let handoff_mode = if pkt.l4proto == IPPROTO_TCP {
         HANDOFF_WRITE_ALWAYS
     } else {
@@ -627,8 +644,8 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
 
         if pkt.l4proto == IPPROTO_TCP {
             // Preserve the general pure-SYN lookup skip. TCP DNS is the sole
-            // exception so LAN clients can reach an ordinary host listener
-            // before the unconditional port-53 fast path below.
+            // exception so a LAN host listener gets first refusal before
+            // compiled routing.
             let pure_syn = pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0;
             if tcp_socket_probe_required(pure_syn, pkt.tuples.five.dst_port) {
                 let param = PARAM.load();
@@ -656,28 +673,6 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                 return pass_through_classified(ctx);
             }
         }
-    }
-
-    // DNS fast path: skip the compiled policy call and fact lookups.
-    if pkt.tuples.five.dst_port == 53 {
-        // Update conn state for TCP DNS (UDP DNS is short-lived, skipped anyway)
-        if pkt.l4proto == IPPROTO_TCP
-            && let Some(state) = &mut tcp_state
-        {
-            state.mac.copy_from_slice(&pkt.ethh.src_addr);
-            let meta = crate::contrack::build_routing_meta(OUTBOUND_DIRECT, 0, 0, pkt.tuples.dscp);
-            crate::contrack::publish_routing_meta(&mut state.meta, meta);
-        }
-        return redirect_lan_packet_to_control_plane(
-            ctx,
-            link_h_len,
-            pkt,
-            unsafe {
-                crate::contrack::build_routing_meta(OUTBOUND_DIRECT, 0, 0, pkt.tuples.dscp).raw
-            },
-            handoff_mode,
-            0,
-        );
     }
 
     let flags = crate::maps::datapath_flags();
@@ -715,8 +710,8 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         ip_version,
         false,
     );
-    let decision = match crate::route::route(&mut pkt.routing_input, None) {
-        Ok(decision) => decision,
+    let (decision, routing_generation) = match crate::route::route(&mut pkt.routing_input, None) {
+        Ok(result) => result,
         Err(_error) => {
             error!(ctx, target: "honk", "lan_ingress route fail: {}", _error);
             if udp_claimed {
@@ -734,7 +729,8 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     // Cache mode-owned offload once per new flow. The generated decision's
     // finality is from the same policy generation as its outbound, so direct
     // safety no longer depends on a separately published global flag.
-    let offload_direct = must == 0
+    let offload_direct = pkt.tuples.five.dst_port != 53
+        && must == 0
         && outbound != OUTBOUND_BLOCK
         && ((flags & honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_ALL != 0)
             || (flags & honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_RULE_DIRECT != 0
@@ -863,6 +859,9 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         return Err(TC_ACT_SHOT);
     }
 
+    if pkt.tuples.five.dst_port == 53 && outbound == OUTBOUND_BLOCK {
+        return Err(TC_ACT_SHOT);
+    }
     if (outbound == OUTBOUND_DIRECT && must != 0) || offload_direct {
         if PARAM.load().padding2 & 1 != 0 {
             info!(ctx, target: "honk", "direct offload path");
@@ -897,6 +896,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         },
         handoff_mode,
         0,
+        routing_generation,
     )
 }
 
@@ -953,10 +953,7 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
 // #[inline(never)]: standalone program, no deep call chain.
 #[inline(never)]
 fn do_tproxy_dae0peer_ingress(ctx: &TcContext) -> Verdict {
-    // Only packets redirected from wan_egress or lan_ingress carry this cb
-    // mark.  Other traffic (e.g. replies to locally-generated proxy outbound
-    // connections) must be passed through so the daens IP stack can deliver it
-    // to the correct local socket.
+    // This private link accepts only same-skb handoffs from the LAN/WAN classifiers.
     let cb0 = unsafe { (*ctx.skb.skb).cb[0] };
     if cb0 != TPROXY_MARK {
         return Err(TC_ACT_SHOT);
@@ -968,13 +965,21 @@ fn do_tproxy_dae0peer_ingress(ctx: &TcContext) -> Verdict {
     // to the stack without bpf_sk_assign; the kernel will find the child
     // socket via normal socket lookup.
     let listener_l4proto = (unsafe { (*ctx.skb.skb).cb[1] }) as u8;
-    ctx.set_mark(TPROXY_MARK);
-    // Force the packet type to HOST so the IP stack accepts it and returns
-    // it to the stack, letting the netfilter PREROUTING TPROXY rule (or the
-    // attached sk_lookup BPF program) deliver it to the transparent listener
-    // socket.  Established TCP (cb[1] == 0) intentionally skips bpf_sk_assign:
-    // assigning here would bypass PREROUTING and prevent the kernel from
-    // creating proper child sockets for intercepted TCP flows.
+    if listener_l4proto != 0 && listener_l4proto != IPPROTO_TCP && listener_l4proto != IPPROTO_UDP {
+        return Err(TC_ACT_SHOT);
+    }
+    let route_mark = unsafe { (*ctx.skb.skb).cb[2] };
+    let mark = if route_mark == 0 {
+        TPROXY_MARK
+    } else {
+        // Ingress already parsed the packet; peer redirects may retain L3-only framing.
+        if listener_l4proto != IPPROTO_UDP || UdpDnsRoute::from_mark(route_mark).is_none() {
+            return Err(TC_ACT_SHOT);
+        }
+        route_mark
+    };
+    ctx.set_mark(mark);
+    // Redirected frames may still carry the original destination MAC.
     let _ = ctx.change_type(0);
     if listener_l4proto != 0 {
         let _ = assign_listener(ctx, listener_l4proto);

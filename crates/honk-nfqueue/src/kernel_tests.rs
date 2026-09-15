@@ -59,6 +59,18 @@ fn nfqueue_service_isolated_netns_kernel_contract() {
     std::thread::Builder::new()
         .name("honk-nfq-netns-test".into())
         .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .thread_keep_alive(Duration::from_secs(3600))
+                .build()
+                .expect("build statistics runtime");
+            // Procfs reads must not follow a blocking worker into its original namespace.
+            runtime.block_on(async {
+                tokio::task::spawn_blocking(|| {})
+                    .await
+                    .expect("prewarm statistics worker");
+            });
             let result = unsafe { libc::unshare(libc::CLONE_NEWNET) };
             assert_eq!(
                 result,
@@ -67,14 +79,14 @@ fn nfqueue_service_isolated_netns_kernel_contract() {
                 io::Error::last_os_error()
             );
             configure_loopback();
-            exercise_kernel_contract();
+            exercise_kernel_contract(&runtime);
         })
         .expect("spawn isolated netns test")
         .join()
         .expect("isolated netns test panicked");
 }
 
-fn exercise_kernel_contract() {
+fn exercise_kernel_contract(runtime: &tokio::runtime::Runtime) {
     assert!(
         !owned_table_exists(),
         "fresh netns must have no owned table"
@@ -162,6 +174,14 @@ fn exercise_kernel_contract() {
         .expect("restart must reclaim a stale owned table");
     service = new_service;
     assert!(owned_table_exists(), "restart must publish the owned table");
+    let stats_reader = service.stats_reader();
+    assert_eq!(
+        runtime
+            .block_on(stats_reader.stats())
+            .expect("sample the live queue in its caller's namespace")
+            .kernel_queue_depth,
+        0
+    );
 
     let ipv4_receiver = marked_receiver("127.0.0.1:0".parse().unwrap());
     let ipv6_receiver = marked_receiver("[::1]:0".parse().unwrap());
@@ -215,6 +235,13 @@ fn exercise_kernel_contract() {
         "hard rebind must retain the owned nftables table"
     );
     assert_queue_configuration_in_proc();
+    assert_eq!(
+        runtime
+            .block_on(stats_reader.stats())
+            .expect("sample the rebound queue with the existing reader")
+            .kernel_queue_depth,
+        0
+    );
     exercise_datagram(
         &ipv4_client,
         &ipv4_receiver,
@@ -232,6 +259,10 @@ fn exercise_kernel_contract() {
         "the exercised kernel path must not report a fatal listener or verdict error"
     );
     service.shutdown().expect("clean NFQUEUE shutdown");
+    assert_eq!(
+        runtime.block_on(stats_reader.stats()).unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
     assert!(
         !owned_table_exists(),
         "shutdown must remove the wholly owned nftables table"

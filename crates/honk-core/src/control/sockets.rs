@@ -1,5 +1,4 @@
 use super::*;
-use crate::dns::query::{ValidatedDnsQuery, validate_exact_dns_query};
 
 #[cfg(target_os = "linux")]
 const IPV6_ORIGDSTADDR_OPT: libc::c_int = 74;
@@ -35,8 +34,13 @@ pub(super) fn bind_tproxy_tcp(
 /// tests stay entirely in the host netns), so this flag is the switch
 /// between "bind inside daens" and "bind here".
 #[cfg(target_os = "linux")]
-fn daens_netns_exists() -> bool {
+pub(super) fn daens_netns_exists() -> bool {
     crate::DAENS_READY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn daens_netns_exists() -> bool {
+    false
 }
 
 fn build_tproxy_tcp(addr: SocketAddr, transparent: bool) -> anyhow::Result<std::net::TcpListener> {
@@ -128,6 +132,25 @@ pub(super) fn new_udp_listener_socket(domain: Domain, reuse_port: bool) -> io::R
     }
     Ok(socket)
 }
+#[cfg(target_os = "linux")]
+pub(super) fn set_so_recvmark(socket: &Socket) -> io::Result<()> {
+    let enabled: libc::c_int = 1;
+    // SAFETY: the option payload points to a live native integer for this call.
+    let status = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVMARK,
+            (&enabled as *const libc::c_int).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
 
 fn build_tproxy_udp(
     addr: SocketAddr,
@@ -152,6 +175,7 @@ fn build_tproxy_udp(
     {
         if transparent {
             set_ip_transparent(&socket, addr.is_ipv6())?;
+            set_so_recvmark(&socket)?;
             if addr.is_ipv4() {
                 nix::sys::socket::setsockopt(
                     &socket,
@@ -552,7 +576,7 @@ pub(super) async fn send_to_with_src(
         .await
 }
 
-// Accommodate two IPv6-sized ancillary records (ORIGDST + PKTINFO). Capacity
+// Accommodate IPv6 ORIGDST, PKTINFO, and one native packet-mark record. Capacity
 // is validated before scalar receives and when each reusable batch is built.
 const CMSG_CONTROL_CAPACITY: usize = 256;
 const UDP_RECV_BATCH_SIZE: usize = 8;
@@ -587,20 +611,22 @@ fn cmsg_space(data_len: usize) -> usize {
 pub(super) fn cmsg_control_capacity_is_sufficient() -> bool {
     let Some(required) = cmsg_space(std::mem::size_of::<libc::sockaddr_in6>())
         .checked_add(cmsg_space(std::mem::size_of::<libc::in6_pktinfo>()))
+        .and_then(|required| required.checked_add(cmsg_space(std::mem::size_of::<u32>())))
     else {
         return false;
     };
     CMSG_CONTROL_CAPACITY >= required
 }
 
-/// Provenance captured for one UDP datagram before any destination is
-/// selected.  The listener's address is deliberately retained separately: a
+/// Metadata captured for one UDP datagram before any destination or owner is
+/// selected. The listener's address is deliberately retained separately: a
 /// wildcard bind is not an original destination and must not become one.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct UdpRecvMeta {
     pub(super) original_dst_cmsg: Option<SocketAddr>,
     pub(super) packet_dst_ip: Option<std::net::IpAddr>,
     pub(super) packet_ifindex: Option<u32>,
+    pub(super) packet_mark: Option<u32>,
     pub(super) local_addr: SocketAddr,
 }
 
@@ -649,7 +675,7 @@ impl UdpRecvBatch {
         if !cmsg_control_capacity_is_sufficient() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "recvmmsg control buffer cannot hold IPv6 ORIGDST and PKTINFO",
+                "recvmmsg control buffer cannot hold IPv6 ORIGDST, PKTINFO, and SO_MARK",
             ));
         }
         let slots = std::array::from_fn(|_| UdpRecvStorage::new(packet_capacity));
@@ -758,19 +784,15 @@ impl UdpRecvBatch {
                 #[cfg(not(target_env = "musl"))]
                 let returned_control_len = message.msg_hdr.msg_controllen;
                 let control_len = returned_control_len.min(slot.control.bytes.len());
-                let (original_dst_cmsg, packet_dst_ip, packet_ifindex) = parse_cmsg_control(
+                let meta = parse_cmsg_control(
                     &slot.control.bytes[..control_len],
                     message.msg_hdr.msg_flags,
+                    local_addr,
                 )?;
                 Ok(UdpRecvPacket {
                     length,
                     source,
-                    meta: UdpRecvMeta {
-                        original_dst_cmsg,
-                        packet_dst_ip,
-                        packet_ifindex,
-                        local_addr,
-                    },
+                    meta,
                 })
             })());
         }
@@ -819,12 +841,11 @@ fn recvmsg_origdst(
     if !cmsg_control_capacity_is_sufficient() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "recvmsg control buffer cannot hold IPv6 ORIGDST and PKTINFO",
+            "recvmsg control buffer cannot hold IPv6 ORIGDST, PKTINFO, and SO_MARK",
         ));
     }
-    // CmsgStorage makes this pointer naturally aligned for libc's cmsghdr
-    // access; CMSG_SPACE capacity above ensures neither IPv6 record crowds
-    // the other out.
+    // CmsgStorage is naturally aligned and the checked CMSG_SPACE total keeps
+    // the IPv6 provenance records and packet mark from crowding each other out.
     let mut cmsg_buf = CmsgStorage::new();
     if !(cmsg_buf.bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<libc::cmsghdr>()) {
         return Err(io::Error::new(
@@ -860,30 +881,21 @@ fn recvmsg_origdst(
     // Only kernel-returned bytes are trusted. A larger value can never make
     // the parser read past our actual allocation.
     let control_len = returned_control_len.min(cmsg_buf.bytes.len());
-    let (original_dst_cmsg, packet_dst_ip, packet_ifindex) =
-        parse_cmsg_control(&cmsg_buf.bytes[..control_len], msg.msg_flags)?;
+    let meta = parse_cmsg_control(&cmsg_buf.bytes[..control_len], msg.msg_flags, local_addr)?;
 
-    Ok((
-        n as usize,
-        src,
-        UdpRecvMeta {
-            original_dst_cmsg,
-            packet_dst_ip,
-            packet_ifindex,
-            local_addr,
-        },
-    ))
+    Ok((n as usize, src, meta))
 }
 
 /// Parse the returned ancillary byte range without looking past
 /// `msg_controllen`. Every recognized record must be complete and decodable;
-/// malformed provenance is an InvalidData error, never a missing-metadata
-/// fallback. The production buffer is cmsghdr-aligned, while unaligned reads
-/// here keep this validator safe for any slice used by focused tests.
+/// malformed ancillary data is an InvalidData error, never missing metadata.
+/// The production buffer is cmsghdr-aligned, while unaligned reads here keep
+/// this validator safe for any slice used by focused tests.
 pub(super) fn parse_cmsg_control(
     control: &[u8],
     msg_flags: libc::c_int,
-) -> io::Result<(Option<SocketAddr>, Option<std::net::IpAddr>, Option<u32>)> {
+    local_addr: SocketAddr,
+) -> io::Result<UdpRecvMeta> {
     if msg_flags & libc::MSG_CTRUNC != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -896,6 +908,7 @@ pub(super) fn parse_cmsg_control(
     let mut original_dst_cmsg = None;
     let mut packet_dst_ip = None;
     let mut packet_ifindex = None;
+    let mut packet_mark = None;
     while offset < control.len() {
         if control.len() - offset < header_len {
             return Err(io::Error::new(
@@ -962,6 +975,21 @@ pub(super) fn parse_cmsg_control(
                 })?;
             packet_dst_ip = Some(packet_dst);
             packet_ifindex = Some(ifindex);
+        } else if cmsg.cmsg_level == libc::SOL_SOCKET && cmsg.cmsg_type == libc::SO_MARK {
+            if packet_mark.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate SO_MARK cmsg",
+                ));
+            }
+            if data.len() != std::mem::size_of::<u32>() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "malformed SO_MARK cmsg",
+                ));
+            }
+            // SAFETY: the exact native-u32 payload length was checked above.
+            packet_mark = Some(unsafe { std::ptr::read_unaligned(data.as_ptr().cast::<u32>()) });
         }
 
         let next = offset
@@ -981,7 +1009,13 @@ pub(super) fn parse_cmsg_control(
         offset = next;
     }
 
-    Ok((original_dst_cmsg, packet_dst_ip, packet_ifindex))
+    Ok(UdpRecvMeta {
+        original_dst_cmsg,
+        packet_dst_ip,
+        packet_ifindex,
+        packet_mark,
+        local_addr,
+    })
 }
 
 fn original_dst_from_cmsg(
@@ -1061,43 +1095,6 @@ pub(super) fn packet_dst_ip_from_cmsg(
     packet_info_from_cmsg(cmsg_level, cmsg_type, data).map(|(ip, _)| ip)
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) struct UdpOriginalDst {
-    pub(super) address: SocketAddr,
-    pub(super) validated_dns: Option<ValidatedDnsQuery>,
-}
-
-/// Select a real original destination without inventing one from UDP payload
-/// shape. An ORIGDST cmsg is authoritative; PKTINFO can only supply an IP for
-/// a validated DNS query on port 53; a specifically bound listener is the
-/// final fallback. Wildcard listeners with no valid metadata fail closed.
-pub(super) fn udp_original_dst(meta: &UdpRecvMeta, data: &[u8]) -> Option<UdpOriginalDst> {
-    // A present ORIGDST cmsg is authoritative. An unspecified ORIGDST is
-    // invalid provenance, so do not downgrade it to pktinfo/local fallback.
-    if let Some(original_dst) = meta.original_dst_cmsg {
-        return (!original_dst.ip().is_unspecified()).then_some(UdpOriginalDst {
-            address: original_dst,
-            validated_dns: None,
-        });
-    }
-
-    let validated_dns = validate_exact_dns_query(data);
-    if let Some(validated_dns) = validated_dns
-        && let Some(packet_dst_ip) = meta.packet_dst_ip
-        && !packet_dst_ip.is_unspecified()
-    {
-        return Some(UdpOriginalDst {
-            address: SocketAddr::new(packet_dst_ip, 53),
-            validated_dns: Some(validated_dns),
-        });
-    }
-
-    (!meta.local_addr.ip().is_unspecified()).then_some(UdpOriginalDst {
-        address: meta.local_addr,
-        validated_dns,
-    })
-}
-
 fn sockaddr_to_std(addr: &libc::sockaddr_storage, len: libc::socklen_t) -> io::Result<SocketAddr> {
     if len < std::mem::size_of::<libc::sa_family_t>() as libc::socklen_t {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "short sockaddr"));
@@ -1162,93 +1159,5 @@ pub(super) fn get_original_dst(stream: &TcpStream) -> anyhow::Result<SocketAddr>
     }
 }
 
-/// UDP datapath fast path: classify/drop and, for a live Ready endpoint,
-/// perform a bounded synchronous `try_enqueue` in the accept loop.
-///
-/// Runs on the reusable receive buffer with no task spawn, no QUIC sniffer,
-/// and no slow-path concurrency permit. Ready hits may copy into the
-/// bounded per-flow queue (permits first). Returns `true` when the datagram
-/// was fully handled (enqueued, drop-newest, or dropped by pre-checks) and
-/// the accept loop can move on; `false` when it must take the slow path:
-/// Initializing followers, new-flow setup, or a possible DNS query.
-///
-/// This function is the sole production owner of endpoint hit/miss
-/// accounting. Skipping the QUIC sniffer on Ready hits is safe because
-/// routing for this flow was already decided when its first packet took the
-/// slow path.
 #[cfg(test)]
-pub(super) async fn udp_fast_path(
-    udp_pool: &UdpEndpointPool,
-    stats: &StatsManager,
-    data: &[u8],
-    client_addr: SocketAddr,
-    original_dst: SocketAddr,
-    validated_dns: Option<ValidatedDnsQuery>,
-) -> bool {
-    udp_fast_path_at(
-        udp_pool,
-        stats,
-        data,
-        client_addr,
-        original_dst,
-        validated_dns,
-        udp_endpoint::queue_now(),
-    )
-    .await
-}
-
-pub(super) async fn udp_fast_path_at(
-    udp_pool: &UdpEndpointPool,
-    stats: &StatsManager,
-    data: &[u8],
-    client_addr: SocketAddr,
-    original_dst: SocketAddr,
-    validated_dns: Option<ValidatedDnsQuery>,
-    enqueued_at: u32,
-) -> bool {
-    // Same drop pre-checks as serve_udp_connection: honk-internal subnet and
-    // broadcast/multicast traffic must never be proxied.
-    if is_honk_internal_addr(&original_dst.ip()) || is_honk_internal_addr(&client_addr.ip()) {
-        trace!(
-            "Skipping honk-internal UDP {} -> {}",
-            client_addr, original_dst
-        );
-        return true;
-    }
-    if is_broadcast_or_multicast(&original_dst.ip()) {
-        trace!(
-            "Skipping broadcast/multicast UDP {} -> {}",
-            client_addr, original_dst
-        );
-        return true;
-    }
-
-    // A carried proof keeps strict validation out of the Ready hot path.
-    if original_dst.port() == 53 && validated_dns.is_some() {
-        return false;
-    }
-
-    // The receive loop only performs a synchronous bounded enqueue. Transport
-    // I/O belongs exclusively to the per-endpoint driver, so a blocked send
-    // on one flow cannot delay classification of another datagram.
-    let Some(result) =
-        udp_pool.fast_path_enqueue_at(client_addr, original_dst, data, enqueued_at, stats)
-    else {
-        stats.record_udp_endpoint_miss();
-        return false;
-    };
-    if matches!(result, EndpointReservation::QueueClosed) {
-        return true;
-    }
-    stats.record_udp_endpoint_hit();
-
-    debug!(
-        "UDP endpoint enqueue for {} -> {}",
-        client_addr, original_dst
-    );
-    debug_assert!(matches!(
-        result,
-        EndpointReservation::Enqueued | EndpointReservation::QueueFull
-    ));
-    true
-}
+mod tests;

@@ -20,7 +20,7 @@ The hook is deliberately narrow:
 | --- | --- |
 | New, ambiguous LAN-forwarded UDP after LAN TC | Stage a unique token and hold the original skb in NFQUEUE when enabled and ready |
 | Host-originated WAN UDP | Keep the canonical TPROXY path; host egress does not cross this `inet prerouting` hook |
-| UDP port `53` | Keep the dedicated DNS fast path; never stage |
+| UDP port `53` | Follow [traffic-rule ownership](../reference/routing.md#outbound-targets-and-must); never use ordinary UDP conn-state, stage, or allocate an NFQUEUE decision token |
 | Internal/special or reverse-direction traffic | Never stage |
 | A `must` or `block` routing result | Treat as final; never stage |
 | A direct result already safe at route time | Pass through the kernel direct path; never stage |
@@ -56,6 +56,9 @@ Linux mechanism used only by `honk-core`'s `ebpf` feature.
 Parse one exact-sized datagram allocation. `QueueStats` separates current-instance
 depth from process-wide drops accumulated across hard rebinds, reports latest
 kernel-read availability/errors, and always refreshes held-guard/effective-buffer gauges.
+Each sample opens procfs in the calling thread's queue namespace before reading
+asynchronously through that namespace-bound descriptor; neither the process leader
+nor a blocking worker selects the queue being sampled.
 
 ## Decision-token protocol
 

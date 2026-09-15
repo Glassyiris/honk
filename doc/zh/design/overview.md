@@ -70,17 +70,19 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-  PACKET[LAN 转发或本机发起的 TCP/UDP] --> TC[TC 分类]
-  TC -->|direct must 或路由时安全 direct| NATIVE[Linux 原生路径]
-  TC -->|block 或执行 fail-closed 的失活出站| DROP[丢弃]
-  TC -->|DNS :53 快速路径| DAE0[dae0]
+  PACKET[LAN 转发或本机发起的 TCP/UDP] --> TC[入口排除、本地监听优先、有序策略]
+  TC -->|本地 socket 优先接收| LOCAL[本地服务]
+  TC -->|direct must 或非 DNS 安全 direct| NATIVE[Linux 原生路径]
+  TC -->|block must、非 DNS block 或失活丢包| DROP[丢弃]
+  TC -->|非 must DNS :53| DAE0[dae0]
   TC -->|proxy 或用户态决策| DAE0
   TC -->|有歧义的 LAN UDP，可选| NFQ[NFQUEUE 320]
   DAE0 --> SK[daens sk_lookup]
   SK --> LISTEN[透明 TCP/UDP 监听器]
-  LISTEN --> CP[原始目的地址与路由 handoff]
+  LISTEN --> CP[原始目的地址、handoff 或逐报文 mark]
   NFQ --> CP
-  CP --> DECIDE[嗅探、路由回退、Clash 模式、组叶子]
+  CP -->|非 must DNS| DNS[DnsController]
+  CP -->|其余流量，must 跳过嗅探| DECIDE[嗅探、路由回退、Clash 模式、组叶子]
   DECIDE --> DIAL[出站拨号与中继]
   DIAL -->|DAE_BYPASS_MARK 0x100| WAN[WAN 出口]
   DIAL -->|anyfrom| REPLY[以原始目的地址发出 UDP 回包]
@@ -88,11 +90,11 @@ flowchart TB
 
 ### 报文路径
 
-1. [数据路径](./datapath.md)在 LAN TC 分类 LAN 转发流量，并在 WAN TC 分类本机发起的 TCP/UDP。`direct(must)` 与路由时已安全的 direct 决策留在 Linux 原生路径；仍需用户态处理的决策不会卸载。
-2. [DNS 路径](./dns.md)让 LAN TCP/UDP 目的端口 `53` 进入快速路径，跳过已编译的 traffic policy；WAN 路由保留非 must 的 53 端口控制面覆盖。
+1. [数据路径](./datapath.md)在 LAN TC 分类 LAN 转发流量，并在 WAN TC 分类本机发起的 TCP/UDP。现有入口排除和实际本地 socket 所有权先于有序流量策略；`direct(must)` 与非 DNS 路由时已安全的 direct 决策留在 Linux 原生路径。
+2. [流量规则所有权](../reference/routing.md#出站目标与-must)决定哪些端口 53 查询进入[DNS 管线](./dns.md)。已准入的透明查询、可选 host-netns `dns.bind` 与流关联 reality/目标查询共用按代固定的 DNS 策略、缓存/singleflight、上游池和路由投影。
 3. [数据路径](./datapath.md)将普通 proxy 和用户态决策经 `dae0` 重定向；在 `daens` 内，`sk_lookup` 将其指派给[控制面](./control-plane.md)的透明 TCP 或 UDP 监听器。
 4. [NFQUEUE 暂存](./nfqueue.md)默认由 `global.nfqueue_enable` 开启，但只有启动前置条件通过时才激活；它仅在 LAN TC 之后、conntrack/NAT 之前保留仍有歧义的 LAN 转发 UDP。每个暂存流在固定队列 `320` 中携带唯一决策 token；本机发起的 WAN 流量继续走普通透明路径。
-5. [控制面](./control-plane.md)恢复原始目的地址并消费 eBPF 路由 handoff。handoff 缺失或结果为 `ControlPlaneRouting` 时进入用户态路由。
+5. [控制面](./control-plane.md)恢复原始目的地址；普通流消费 eBPF 路由 handoff，缺失或结果为 `ControlPlaneRouting` 时进入用户态路由。端口 53 流量遵循不同的[TCP handoff 与 UDP 逐报文准入规则](./control-plane.md#透明代理入口)。
 6. [路由路径](./routing.md)可嗅探 TLS SNI、HTTP Host 或 QUIC Initial SNI，并在内核结果尚未终结时运行用户态 `Router`。
 7. [组层](./groups.md)应用 Clash 模式覆盖但不改写最终 `must`/`block` 结果，再将权威组策略选择解析为叶节点。显式选择 Score 时，它只在健康合格成员中按目标的 TCP/UDP 与目标地址族 transport-quality 评分排名；服务特定的语义解锁应由 routing 或 geosite 选择专用 Score 组表达。省略策略仍使用 Selector。
 8. [出站层](./outbound.md)拨号该叶节点，并中继 TCP 或数据报。嗅探得到的 TCP 字节先于后续流量转发。
@@ -108,7 +110,8 @@ flowchart TB
 - **NFQUEUE 就绪与所有权：** 启用但尚未 ready 时，只丢弃需要暂存的新流。honk 独占队列 `320` 和 nftables `inet honk_nfqueue` / `udp_decision`；ready 变更必须经过 fence，生命周期歧义为致命错误，同一 netns 的防火墙管理器不得修改这些对象。
 - **Token 校验终态：** 暂存 UDP token 必须在 skb mark、内核状态、handoff、redirect track、用户态 verdict 状态、lease/endpoint 和后端转换间一致。Direct 遵循 Arm → 全部带标记 verdict → Activate；proxy 在唯一的规范拨号/发送路径之前发布最终状态。
 - **`must`/`block` 终结性：** Clash 模式覆盖永远不会替换 `block` 结果或 dae `(must)` 结果。
-- **失活出站 fail-closed：** `lan_ingress` 丢弃路由到失活出站的新流。未配置 `final` 且只有一个唯一叶节点的 TCP 组会让同一代理继续作为用户态最后尝试；UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed；但含有 `direct`/`block` 内建成员的组永不失活：内建节点永远不会被判定死亡，因此 group-OR 槽保持开放。TCP 与 UDP 端口 `53` 例外；`honk-core` 在启动、重载和接口拓扑变化时注入 `dip(<每个 LAN/WAN 接口地址>) -> direct(must)`，使本机管理流量不依赖代理健康状态。
+- **失活出站 fail-closed：** `lan_ingress` 丢弃路由到失活出站的新流。未配置 `final` 且只有一个唯一叶节点的 TCP 组会让同一代理继续作为用户态最后尝试；UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed；但含有 `direct`/`block` 内建成员的组永不失活：内建节点永远不会被判定死亡，因此 group-OR 槽保持开放。TCP 与 UDP 端口 `53` 豁免该健康检查丢包，但仍遵循用户的终局 `must` 结果。
+- **显式本地路由：** 网关管理访问由用户[显式配置](../reference/routing.md#显式本地路由)，不依赖自动生成的接口规则或隐藏白名单；接口观察仍用于拓扑/ECS/健康，非 DNS TCP 纯 SYN 的现有本地探测跳过策略不变。
 - **组 OR 连通性：** 一个组的 eBPF alive slot 是全部叶子成员状态的 OR，并包含上述单叶 TCP 最后尝试例外。多叶节点组中的单个成员失活不得使整个组 fail-closed。
 - **Score 隔离与原因：** Score 用业务目标地址族评分，用代理服务器地址族过滤健康状态；其权威单叶选择不能让死亡成员重新入选。周期探索按 `(group, TCP/UDP, 目标 IP 地址族或 none)` 分域，并选择 Beta 可靠性上置信界最高的非当前成员；连败将叶节点按指数退避移出探索（5 分钟起翻倍、上限 6 小时，独立于证据衰减），成功恢复探索资格但连败只逐级递减；连败只由真实流量驱动（探测结果中立）；连续三次新鲜失败还会让叶节点在存在更健康候选时退出可靠性带；组内相对延迟/吞吐只微调可靠性接近区间，现任余量随有效完成证据增长。全局、地址族与精确目标的新鲜失败 envelope 取最大值而非相加。每次已授权的多候选 Apply 按优先级只记录一个最终原因：`coldExplore`、`periodicExplore`、`incumbentHeld`、`freshFailureBypass`、`reliabilityWinner`，然后是 `performanceWinner`；`deadFiltered` 计数唯一死亡叶节点，`switchFlap` 计数同一目标作用域内八次选择切回前一已提交胜者，`failStreakExcluded` 累计被新鲜失败门排除的候选数，`exploreBackedOff` 累计处于探索退避的候选数。精确目标键与聚合先验只存在于两个各 4,096 项的进程内 LRU，通过共享状态跨成功 reload 保留，进程重启即清空，且不会进入日志或持久化。经鉴权的 `/stats.score` 只导出组名和这些聚合 TCP/UDP 计数，绝不导出 cell、节点、目标、cadence 或 authority；`/stats.score.cache` 另导出每个证据 LRU 的 cell 数与累计淘汰数；既有 `/proxies`、`/stats.outbounds` 与 `/connections` 元数据契约保持不变。
 - **Score 反馈覆盖：** 评分器始终编译，但仅在计划经过 Score 组时按需创建 `ScoreReporter` 和评分 cell；非 Score 路径不创建它们。实际 attempt 会报告 setup、首响应、双向字节和一个紧凑终态，包括透明 TCP/UDP、受支持的 DNS transport、健康与 delay 探测、preconnect/session/UDP 预热，以及直连或经代理的 UI 下载；没有业务目标的任务只更新聚合 setup 证据。

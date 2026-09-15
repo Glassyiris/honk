@@ -170,6 +170,8 @@ routing {
     # ============================================================
     # GeoIP 规则
     # ============================================================
+    # Broad private must-direct also bypasses LAN private DNS.
+    # Add && !dport(53) yourself if you want that DNS intercepted.
     dip(geoip: private) -> direct(must)
     dip(geoip: cn) -> direct(must)
 
