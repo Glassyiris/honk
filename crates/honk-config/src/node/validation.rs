@@ -185,12 +185,13 @@ impl Node {
         }
         let Some(tls) = self.tls() else { return Ok(()) };
         tls.validate_alpn()?;
+        let reality = tls
+            .effective_reality_public_key()
+            .map_err(|message| ValidationFailure::new(Some("reality_public_key"), message))?
+            .is_some();
         if tls.alpn.is_empty() {
             return Ok(());
         }
-        let reality = tls.reality_public_key.is_some()
-            || tls.reality_short_id.is_some()
-            || tls.reality_spider_x.is_some();
         let raw_tcp = self.anytls().is_some()
             || self
                 .transport()

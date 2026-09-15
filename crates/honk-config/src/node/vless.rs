@@ -369,20 +369,9 @@ impl VlessConfig {
             ));
         }
 
-        let has_key = self
-            .tls
-            .reality_public_key
-            .as_deref()
-            .is_some_and(|key| !key.trim().is_empty());
-        let wants_reality = self.tls.reality_public_key.is_some()
-            || self.tls.reality_short_id.is_some()
-            || self.tls.reality_spider_x.is_some();
-        if wants_reality && !has_key {
-            return Err(ValidationFailure::new(
-                Some("reality_public_key"),
-                "REALITY requires reality_public_key",
-            ));
-        }
+        self.tls
+            .effective_reality_public_key()
+            .map_err(|message| ValidationFailure::new(Some("reality_public_key"), message))?;
         Ok(())
     }
 

@@ -19,6 +19,16 @@ pub struct TlsOptions {
 }
 
 impl TlsOptions {
+    /// Resolve key presence without turning incomplete REALITY intent into ordinary TLS.
+    /// Decoding the key and short ID belongs to the outbound handshake parser.
+    pub fn effective_reality_public_key(&self) -> Result<Option<&str>, &'static str> {
+        match self.reality_public_key.as_deref().map(str::trim) {
+            Some(key) if !key.is_empty() => Ok(Some(key)),
+            None if self.reality_short_id.is_none() && self.reality_spider_x.is_none() => Ok(None),
+            _ => Err("REALITY requires reality_public_key"),
+        }
+    }
+
     pub(super) fn validate_alpn(&self) -> Result<(), ValidationFailure> {
         let mut encoded_len = 0usize;
         for protocol in &self.alpn {

@@ -1671,18 +1671,21 @@ fn test_reality_without_public_key_is_rejected_on_every_load_path() {
 
     // Either an auxiliary REALITY field or the key itself signals the intent; an empty key is
     // still the intent, and only a node with none of the three is an ordinary TLS node.
-    for (key, short_id) in [
-        (None, Some("0123456789abcdef".to_string())),
+    for (key, short_id, spider_x) in [
+        (None, Some("0123456789abcdef".to_string()), None),
         // An empty short id is documented as valid, so it still signals REALITY.
-        (None, Some(String::new())),
-        (Some(String::new()), None),
-        (Some("  ".to_string()), None),
+        (None, Some(String::new()), None),
+        (Some(String::new()), None, None),
+        (Some("  ".to_string()), None, None),
+        (None, None, Some("/".to_string())),
+        (None, None, Some(String::new())),
     ] {
         let mut node = node.clone();
         let tls = node.tls_mut().unwrap();
         tls.reality_public_key = key;
         tls.reality_short_id = short_id;
-        tls.reality_spider_x = None;
+        tls.reality_spider_x = spider_x;
+        assert!(node.vless().unwrap().validate(&node.name).is_err());
         let mut config = Config::default();
         config.nodes.push(node);
         assert!(config.validate().is_err());

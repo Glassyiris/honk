@@ -396,6 +396,66 @@ mod node_collection_admission {
     }
 
     #[test]
+    fn structured_reality_intent_requires_nonblank_key() {
+        use serde_json::json;
+
+        for protocol in ["trojan", "vmess"] {
+            for enabled in [false, true] {
+                let base: Node = serde_json::from_value(json!({
+                    "name": "endpoint",
+                    "protocol": protocol,
+                    "address": "192.0.2.10:443",
+                    "host": "192.0.2.10",
+                    "port": 443,
+                    "password": "00000000-0000-0000-0000-000000000001",
+                    "tls": enabled,
+                }))
+                .unwrap();
+                for (key, short_id, spider_x, valid) in [
+                    (None, None, None, true),
+                    (Some(""), None, None, false),
+                    (Some(" \t"), None, None, false),
+                    (None, Some("a1b2"), None, false),
+                    (None, Some(""), None, false),
+                    (None, None, Some("/"), false),
+                    (None, None, Some(""), false),
+                    (Some("AAA"), None, None, true),
+                    (Some("AAA"), Some(""), None, true),
+                ] {
+                    let mut node = base.clone();
+                    let tls = node.tls_mut().unwrap();
+                    tls.reality_public_key = key.map(str::to_owned);
+                    tls.reality_short_id = short_id.map(str::to_owned);
+                    tls.reality_spider_x = spider_x.map(str::to_owned);
+                    node.id = node.derive_id();
+                    let config = config_with_node(node);
+                    let mut diagnostics = Vec::new();
+                    let loaded = Config::from_json_str_with_detailed_diagnostics(
+                        &serde_json::to_string(&config).unwrap(),
+                        &mut diagnostics,
+                    );
+                    if valid {
+                        config.validate().unwrap();
+                        loaded.unwrap().validate().unwrap();
+                    } else {
+                        for error in [config.validate_detailed().unwrap_err(), loaded.unwrap_err()]
+                        {
+                            assert_eq!(error.category, ErrorCategory::Validation);
+                            assert_eq!(error.diagnostic.code, "invalid-config-value");
+                            assert_eq!(
+                                error.diagnostic.setting.to_string(),
+                                "nodes[1].reality_public_key"
+                            );
+                            assert_eq!(error.diagnostic.entry_index, Some(1));
+                            assert!(error.diagnostic.terminal);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn c20_config_admission_preserves_canonical_identity() {
         let canonical = canonical_socks5_node();
         let config = Config {

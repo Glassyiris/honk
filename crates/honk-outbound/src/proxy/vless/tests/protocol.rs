@@ -289,6 +289,57 @@ async fn test_vless_dial_bare_tcp() {
 }
 
 #[tokio::test]
+async fn reality_intent_without_key_rejects_provided_tcp_without_writing() {
+    let timeout = std::time::Duration::from_secs(3);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    for enabled in [false, true] {
+        for (key, short_id, spider_x) in [
+            (Some(""), None, None),
+            (Some(" \t"), None, None),
+            (None, Some("a1b2"), None),
+            (None, Some(""), None),
+            (None, None, Some("/")),
+            (None, None, Some("")),
+        ] {
+            let tcp = TcpStream::connect(address).await.unwrap();
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut node = vless_node("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3");
+            node.name = "vless-reality-missing-key".into();
+            node.host = address.ip().to_string();
+            node.port = address.port();
+            let tls = node.tls_mut().unwrap();
+            tls.enabled = enabled;
+            tls.reality_public_key = key.map(str::to_owned);
+            tls.reality_short_id = short_id.map(str::to_owned);
+            tls.reality_spider_x = spider_x.map(str::to_owned);
+            node.id = node.derive_id();
+
+            let result = tokio::time::timeout(
+                timeout,
+                VLessHandler::new().dial_with_tcp(
+                    &node,
+                    "192.0.2.1:80".parse().unwrap(),
+                    None,
+                    tcp,
+                    timeout,
+                ),
+            )
+            .await;
+            let rejected = matches!(&result, Ok(Err(_)));
+            drop(result);
+            let mut byte = [0; 1];
+            let received = tokio::time::timeout(timeout, peer.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(received, 0, "invalid REALITY intent wrote to the peer");
+            assert!(rejected, "invalid REALITY intent must fail before I/O");
+        }
+    }
+}
+
+#[tokio::test]
 async fn vision_rejects_plaintext_before_vless_header() {
     use tokio::io::AsyncReadExt as _;
 
