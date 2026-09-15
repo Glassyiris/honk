@@ -432,6 +432,9 @@ VLESS 专用 timer。active、provisional、draining 与 idle carrier 都会持�
 carrier permit，直至实际 I/O task teardown。
 同步未变化的 retention 不会 drain 任一 pool；只有实际解除保留才会 drain
 该 pool 的多余 carrier，已有子流仍可继续完成。
+只有 Active carrier 计入可复用的 warm/standby 下限。携带活动子流的 Draining
+carrier 独立保留，不能挤掉空闲 replacement；idle 回收和解除保留的删除过程
+均对 pool 进行线性遍历。
 
 文件描述符分区在进程启动时固定，并在 reload 与 DNS fork 间共享；即使初始
 配置没有 VLESS 节点也会预留。UDP endpoint 定额划分前先保留

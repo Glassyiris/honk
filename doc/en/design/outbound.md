@@ -163,7 +163,7 @@ H2/shared-Cool/separate-Cool pools selected by configuration plus the lazy
 private source-ID key. Handlers remain stateless with respect to these
 generation-owned resources.
 
-- Structured/imported raw TCP TLS ALPN lives in `TlsOptions.alpn` (flat serde `tls_alpn`, omitted when empty). `Node::validate_protocol` requires enabled ordinary TLS on AnyTLS or TCP Trojan/VMess/VLESS, rejects REALITY/WS/gRPC/QUIC overrides, and bounds names to 1–255 bytes plus the encoded list to 65,533 bytes. Nonempty ALPN derives a child UUID v5 using the legacy ID as namespace and the JSON tuple `["tls-alpn", <ordered list>]` as name, separating it from arbitrary credential text; empty lists keep all legacy IDs. URI/v2rayN ALPN compatibility and TUIC's separate `tuic_alpn` remain unchanged.
+- Structured/imported raw TCP TLS ALPN lives in `TlsOptions.alpn` (flat serde `tls_alpn`, omitted when empty). `Node::validate_protocol` requires enabled ordinary TLS on AnyTLS or TCP Trojan/VMess/VLESS, rejects REALITY/WS/gRPC/QUIC overrides, and bounds names to 1–255 bytes plus the encoded list to 65,533 bytes. Nonempty ALPN derives a child UUID v5 using the base ID as namespace and the JSON tuple `["tls-alpn", <ordered list>]` as name, separating it from arbitrary credential text; empty lists retain that base ID, including VLESS's re-derived identity. URI/v2rayN ALPN compatibility and TUIC's separate `tuic_alpn` remain unchanged.
 
 Admission-scoped TCP feedback starts once at the first admitted physical attempt or before logical open on a reused session/QUIC connection; cold admission waiting remains unstarted, while completed paths without either boundary retain the completion fallback.
 
@@ -491,6 +491,9 @@ timer. Active, provisional, draining, and idle carriers all hold the process
 carrier permit until their actual I/O task tears down.
 Synchronizing unchanged retention does not drain either pool. Only an actual
 unpin drains that pool's excess carriers; existing children continue to finish.
+Only Active carriers count toward the reusable warm/standby floor. Draining
+carriers with live children remain independently and cannot displace the idle
+replacement; idle reaping and unpin removal traverse the pool linearly.
 
 The descriptor partition is fixed at process startup and shared across reloads
 and DNS forks, even when the initial configuration has no VLESS nodes. It reserves

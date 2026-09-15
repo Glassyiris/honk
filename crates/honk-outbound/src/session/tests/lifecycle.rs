@@ -249,6 +249,49 @@ async fn warm_retention_pins_one_idle_session_until_release() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn janitor_preserves_and_replenishes_warm_carriers_while_old_streams_drain() {
+    let pool = Arc::new(pool(SessionPoolConfig {
+        janitor_interval: Duration::from_secs(1),
+        ..Default::default()
+    }));
+    let old = TestSession::new();
+    old.streams.store(1, Ordering::Relaxed);
+    old.begin_drain();
+    let replacement = TestSession::new();
+    pool.insert(&old);
+    pool.insert(&replacement);
+    pool.set_warm_retained(true);
+    let rewarmed = TestSession::new();
+    pool.ensure_janitor(0, Duration::from_secs(2), {
+        let rewarmed = Arc::clone(&rewarmed);
+        move || {
+            let rewarmed = Arc::clone(&rewarmed);
+            async move { Ok(rewarmed) }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let offered = pool
+        .offer(|| async { anyhow::bail!("warm replacement must avoid redial") })
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&offered, &replacement));
+    assert!(!old.is_closed(), "the old live stream must survive reaping");
+
+    replacement.streams.store(1, Ordering::Relaxed);
+    replacement.begin_drain();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let offered = pool
+        .offer(|| async { anyhow::bail!("janitor must restore a reusable warm carrier") })
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&offered, &rewarmed));
+    assert!(!old.is_closed());
+    assert!(!replacement.is_closed());
+    pool.shutdown();
+}
+
 /// v2 max-age: past the jittered deadline the session drains (no new
 /// channels) and the janitor closes it once empty.
 #[tokio::test(start_paused = true)]

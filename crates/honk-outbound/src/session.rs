@@ -442,8 +442,8 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         pool.sessions.len()
     }
 
-    /// Drain idle sessions above the configured or runtime-retained floor.
-    /// Active sessions are never disturbed; terminal sessions are pruned.
+    /// Drain idle sessions above the configured or runtime-retained reusable floor.
+    /// Sessions with live streams are never disturbed; terminal sessions are pruned.
     pub fn reap_unretained_idle(&self) -> usize {
         if self.state() != PoolState::Running {
             return 0;
@@ -453,27 +453,34 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             if self.state() != PoolState::Running {
                 return 0;
             }
-            pool.sessions.retain(|session| !session.is_closed());
             let min_live = pool
                 .base_min_idle
                 .max(if pool.warm_retained { 1 } else { 0 });
-            let mut remaining = pool.sessions.len();
+            let mut remaining = pool
+                .sessions
+                .iter()
+                .filter(|session| session.state() == SessionState::Active)
+                .count();
             let mut to_close = Vec::new();
-            for session in &pool.sessions {
-                if remaining <= min_live {
-                    break;
+            pool.sessions.retain(|session| {
+                if session.is_closed() {
+                    return false;
                 }
-                if session.active_streams() != 0 {
-                    continue;
+                let active = session.state() == SessionState::Active;
+                if session.active_streams() != 0 || (active && remaining <= min_live) {
+                    return true;
                 }
                 session.begin_drain();
-                if session.active_streams() == 0 {
-                    to_close.push(Arc::clone(session));
+                if active {
                     remaining -= 1;
                 }
-            }
-            pool.sessions
-                .retain(|session| !to_close.iter().any(|closed| Arc::ptr_eq(closed, session)));
+                if session.active_streams() == 0 {
+                    to_close.push(Arc::clone(session));
+                    false
+                } else {
+                    true
+                }
+            });
             to_close
         };
         let reaped = to_close.len();
@@ -505,21 +512,25 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             if retained {
                 Vec::new()
             } else {
-                pool.sessions.retain(|session| !session.is_closed());
+                let base_min_idle = pool.base_min_idle;
                 let mut active_kept = 0usize;
                 let mut to_close = Vec::new();
-                for session in &pool.sessions {
-                    if session.state() == SessionState::Active && active_kept < pool.base_min_idle {
+                pool.sessions.retain(|session| {
+                    if session.is_closed() {
+                        return false;
+                    }
+                    if session.state() == SessionState::Active && active_kept < base_min_idle {
                         active_kept += 1;
-                        continue;
+                        return true;
                     }
                     session.begin_drain();
                     if session.active_streams() == 0 {
                         to_close.push(Arc::clone(session));
+                        false
+                    } else {
+                        true
                     }
-                }
-                pool.sessions
-                    .retain(|session| !to_close.iter().any(|closed| Arc::ptr_eq(closed, session)));
+                });
                 to_close
             }
         };
@@ -986,8 +997,13 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 let min_idle = pool
                     .base_min_idle
                     .max(if pool.warm_retained { 1 } else { 0 });
+                let mut remaining_active = live
+                    .iter()
+                    .filter(|session| session.state() == SessionState::Active)
+                    .count();
                 for s in live {
                     let ptr = Arc::as_ptr(s) as usize;
+                    let was_active = s.state() == SessionState::Active;
                     // Max-age drain: stop taking new streams past the
                     // jittered deadline; close once fully drained.
                     if let Some(max_age) = self.config.max_session_age {
@@ -999,7 +1015,10 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                             s.begin_drain();
                         }
                     }
-                    if s.state() == SessionState::Draining && s.active_streams() == 0 {
+                    if was_active && s.state() != SessionState::Active {
+                        remaining_active -= 1;
+                    }
+                    if s.state() != SessionState::Active && s.active_streams() == 0 {
                         to_close.push(Arc::clone(s));
                         continue;
                     }
@@ -1008,10 +1027,9 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         continue;
                     }
                     let since = idle_since.entry(ptr).or_insert(now);
-                    if now.duration_since(*since) >= idle_timeout
-                        && live.len() - to_close.len() > min_idle
-                    {
+                    if now.duration_since(*since) >= idle_timeout && remaining_active > min_idle {
                         to_close.push(Arc::clone(s));
+                        remaining_active -= 1;
                     }
                 }
                 to_close
@@ -1027,7 +1045,10 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     return;
                 }
                 (
-                    pool.sessions.len(),
+                    pool.sessions
+                        .iter()
+                        .filter(|session| session.state() == SessionState::Active)
+                        .count(),
                     pool.base_min_idle
                         .max(if pool.warm_retained { 1 } else { 0 }),
                 )

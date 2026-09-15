@@ -485,3 +485,60 @@ async fn idle_reap_returns_carrier_credit_without_cutting_retained_or_active_ses
     drop(peers);
     registry.shutdown().await;
 }
+
+#[tokio::test]
+async fn idle_reap_preserves_warm_replacement_while_old_carrier_drains() {
+    use super::super::MuxSession as _;
+    use crate::session::ManagedSession as _;
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let pool =
+            crate::session::SessionPool::new(super::super::vless_cool::session_pool_config(8));
+        let (client, mut old_peer) = tokio::io::duplex(1 << 16);
+        let old = super::super::vless_cool::connect(Box::new(client), 8);
+        pool.insert(&old);
+        let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let mut old_child = pool
+            .open_with(
+                || async { anyhow::bail!("the existing carrier must be reused") },
+                |session, permit| async move { session.open_stream(permit, target, None).await },
+            )
+            .await
+            .unwrap();
+        old.begin_drain();
+
+        let (client, mut replacement_peer) = tokio::io::duplex(1 << 16);
+        let replacement = super::super::vless_cool::connect(Box::new(client), 8);
+        pool.insert(&replacement);
+        pool.set_warm_retained(true);
+        assert_eq!(pool.reap_unretained_idle(), 0);
+
+        let mut new_child = pool
+            .open_with(
+                || async { anyhow::bail!("warm replacement must avoid redial") },
+                |session, permit| async move { session.open_stream(permit, target, None).await },
+            )
+            .await
+            .unwrap();
+        // Independent KEEP/DATA replies on SID 1 prove both physical carriers still serve children.
+        old_peer
+            .write_all(b"\x00\x04\x00\x01\x02\x01\x00\x03old")
+            .await
+            .unwrap();
+        replacement_peer
+            .write_all(b"\x00\x04\x00\x01\x02\x01\x00\x03new")
+            .await
+            .unwrap();
+        let mut output = [0; 3];
+        old_child.read_exact(&mut output).await.unwrap();
+        assert_eq!(&output, b"old");
+        new_child.read_exact(&mut output).await.unwrap();
+        assert_eq!(&output, b"new");
+
+        drop(old_child);
+        drop(new_child);
+        pool.shutdown();
+    })
+    .await
+    .expect("retained replacement admission or old-child delivery stalled");
+}
