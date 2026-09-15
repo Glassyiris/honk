@@ -158,6 +158,9 @@ default UDP check target. Independently permitted probes and configured literal
 fallback IPs remain usable. A typed refusal cannot become a stale-cache answer
 or a successful non-preferred-family answer. Ordinary failures, empty responses,
 and accepted SERVFAIL retain the documented fallback behavior.
+This also covers cold and cached `udp://` attempts carried over a proxy TCP
+session: a refusal stops before resolving a retry, and a refusal on the final
+attempt retains its typed cause instead of becoming a display-only error.
 
 ### DNS routing
 

@@ -49,6 +49,98 @@ impl PacketOutbound for CountingVlessHandler {
     }
 }
 
+#[derive(Debug)]
+struct RefusingTcpHandler {
+    calls: AtomicUsize,
+    failures_before_refusal: usize,
+}
+
+#[async_trait::async_trait]
+impl TcpOutbound for RefusingTcpHandler {
+    async fn dial(
+        &self,
+        _node: &Node,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) < self.failures_before_refusal {
+            return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset).into());
+        }
+        Err(honk_outbound::proxy::PacketRejection::Capacity.into())
+    }
+}
+
+#[tokio::test]
+async fn udp_proxy_refusal_stops_cold_and_cached_attempts() {
+    for cached in [false, true] {
+        check_udp_proxy_refusal(cached, 0).await;
+    }
+}
+
+#[tokio::test]
+async fn udp_proxy_retry_preserves_terminal_cause() {
+    // The TCP transport retries a reset once before the outer address retry.
+    check_udp_proxy_refusal(false, 2).await;
+}
+
+async fn check_udp_proxy_refusal(cached: bool, failures_before_refusal: usize) {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let upstream = make_upstream(
+        "refusal",
+        &server.local_addr().unwrap().to_string(),
+        DnsProtocol::Udp,
+    );
+    let node = Node::from_share_link("socks5://127.0.0.1:1080#refusing-proxy").unwrap();
+    let handler = Arc::new(RefusingTcpHandler {
+        calls: AtomicUsize::new(0),
+        failures_before_refusal,
+    });
+    let mut registry = crate::proxy::ProxyRegistry::new();
+    registry.register(ProtocolEntry::new(
+        NodeProtocol::Socks5,
+        Arc::clone(&handler),
+    ));
+    let traffic = Arc::new(tokio::sync::RwLock::new(
+        Router::new(&[], "direct").unwrap(),
+    ));
+    let pool = UpstreamPool::new_with_proxy(
+        &[upstream],
+        make_router(),
+        Some(Arc::new(registry)),
+        vec![node.clone()],
+        vec![],
+    )
+    .unwrap()
+    .with_traffic_router(Arc::clone(&traffic));
+    let query = mock_dns_query(0x1234);
+    if cached {
+        let reply = tokio::spawn(async move {
+            let mut buf = [0; 512];
+            let (_, peer) = server.recv_from(&mut buf).await.unwrap();
+            let response = mock_dns_response(u16::from_be_bytes([buf[0], buf[1]]));
+            server.send_to(&response, peer).await.unwrap();
+        });
+        assert_eq!(
+            pool.query("refusal", &query).await.unwrap(),
+            mock_dns_response(0x1234)
+        );
+        reply.await.unwrap();
+    }
+    *traffic.write().await = Router::new(&[], &node.name).unwrap();
+    let error = pool.query("refusal", &query).await.unwrap_err();
+    assert_eq!(
+        honk_outbound::proxy::packet_rejection(&error),
+        Some(honk_outbound::proxy::PacketRejection::Capacity),
+        "cached={cached}, prior failures={failures_before_refusal}: {error:#}",
+    );
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        failures_before_refusal + 1
+    );
+    pool.close().await;
+}
+
 async fn bind_matching_tcp_udp(
     tcp_ip: IpAddr,
     udp_ip: IpAddr,

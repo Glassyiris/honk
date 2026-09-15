@@ -140,6 +140,9 @@ route、bootstrap 或 system-DNS attempt。health 与 URLTest resolver hook 把�
 UDP check target。独立允许的 probe 与配置 literal fallback IP 仍可使用。
 Typed refusal 不会变成 stale-cache 应答或成功的非偏好地址族应答；普通失败、
 空 response 及已接受的 SERVFAIL 保持文档规定的 fallback 行为。
+此规则同样覆盖通过代理 TCP session 承载的 `udp://` 冷启动及缓存路径：
+收到拒绝后不会继续解析重试地址，最终一次尝试的拒绝也保留类型化原因，
+而不是变成仅有显示文本的错误。
 
 ### DNS 路由
 
