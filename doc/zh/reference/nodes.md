@@ -23,7 +23,7 @@ VMess JSON 的 `ps` 备注缺失或为空时，先使用 `vmess-{host}` 通过�
 
 识别 tag 与链接的结束引号时，反斜杠会转义下一个字符；解析后的文本保留原始转义序列。
 
-协议已识别但格式错误的链接会被丢弃，并产生 `invalid-node-entry` 诊断。诊断使用原始节点条目序号，不包含链接或节点名称。数据接口返回诊断而不记录日志；普通接口只报告一次。未知协议属于配置硬错误。独立的 `mux:` 或 `mux=` 行也会被拒绝；VLESS 数据包与 carrier 选择必须写在该链接精确的 `packetEncoding=`、`mux=` 和 `udp=` query 参数中。
+协议已识别但格式错误的链接会被丢弃并产生 warning。已知的无效字段保留具体的安全原因及 schema 路径；未知解析失败使用 `invalid-node-entry`。诊断携带原始节点条目序号与来源位置，不包含原始链接、值或节点名称。数据接口返回诊断而不记录日志；普通接口只报告一次。未知协议或已删除的 VLESS `vless_mode` 属于配置硬错误。独立的 `mux:` 或 `mux=` 行也会被拒绝；VLESS 数据包与 carrier 选择必须写在该链接精确的 `packetEncoding=`、`mux=` 和 `udp=` query 参数中。
 
 旧版 `ss://base64(method:password@host:port)` 格式按字面值读取解码后的凭据，不做 URL 解码：`%20` 保持为 `%20`，`?`、`/`、`#`、`:` 和 `@` 仍是密码字符。最后一个 `@` 分隔凭据与端点；userinfo 本身也可以是 `base64(method:password)`。解码后的载荷缺少 `@`，或凭据无法解析为方法与密码时，拒绝解析。URL userinfo 格式仍按百分号解码凭据。端点、路径、query（包括 `/?plugin=...`）和 fragment 继续按 URL 处理。
 
@@ -39,7 +39,9 @@ protocol|host|port|credential-fingerprint|dial-shape
 
 拼接前，每个原始凭据字段、拨号形态字段和有效的 `host` 值都会将 `\` 转义为 `\\`，将 `|` 转义为 `\|`。拼接后的指纹不再转义。对于通过 `Config::validate` 的节点，不同的身份字段会产生不同的哈希输入。完整配置校验拒绝的节点不在此保证范围内，即使 `Node::from_share_link` 能为其派生 ID。
 
-本次升级时，上述以 `|` 拼接的身份字段中含有 `|` 或 `\` 的节点，其 ID 会变更一次，以 ID 为键的健康状态和预热状态会重新建立。从 `vless_mode` 迁移到独立 packet/multiplex 字段也可能改变 VLESS 节点 ID。ALPN 使用独立的 JSON 子 UUID 派生步骤，因此仅 ALPN 含有 `|` 或 `\` 不会在本次升级时改变已有 ID。Selector 选择按成员名称迁移。连接池中的就绪流原本就会在所属配置版本退出时移除。`name`/`subtag` 筛选器不受影响。
+**破坏性升级：**所有成功重新派生身份的 VLESS 节点都会获得新 ID，包括从未填写 `vless_mode`、关闭 UDP 或设置 ALPN 的节点。以 ID 为键的健康、预热及 session 状态会重新建立。其他协议仅在上述以 `|` 拼接的身份字段中含有 `|` 或 `\` 时变更 ID；ALPN 使用独立的 JSON 子 UUID 步骤，仅 ALPN 含有这些字符不触发该变化。
+
+不要为了迁移 ID 而删除缓存。持久化已启用且可读时，未变更的组名、成员名可用于恢复 Selector 选择；有效且不超过 24 小时的 TCP-v4 延迟样本会在启动时按节点名关联到新 ID。这些样本只用于排名，不恢复存活性；改名或重复名称不能保证恢复同一个叶节点。就绪流原本就随所属 generation 退役，`name`/`subtag` 筛选语义不变。
 
 只要可拨号端点和 dial shape 不变，身份在改名、reload 和订阅刷新后仍保持稳定。配置/运行时组装会拒绝重复的派生 ID。`Node::default()` 的 ID 为 nil；构造路径会派生 ID，出站运行时注册表会拒绝任何抵达该处的 nil ID。
 
@@ -200,7 +202,7 @@ query 映射遵循 [Shadowrocket 导出器](https://github.com/cedar2025/Xboard/
 | `obfs=websocket`、`obfsParam`、`path` | WebSocket transport、Host header 回退值和路径。 |
 | `obfs=grpc`、`path` | gRPC transport 和 service name 回退值。 |
 
-TLS/REALITY、flow 或传输声明相互冲突时会拒绝链接，不会静默降级。VLESS 的 `obfs` 仅接受空值/`none`、`websocket` 或 `grpc`，不会把不支持的传输方式当作 TCP。`host` 和 `serviceName`/`service_name` 保留原有回退顺序。显式 SNI 别名在赋值前按原始字节比较：相同值合并，不同值报错，不转换大小写。空值或纯空白的 SNI 和 flow 在派生节点 ID 前规范化为未指定；非空 flow 必须为 `xtls-rprx-vision`。
+TLS/REALITY、flow 或传输声明相互冲突时会拒绝链接，不会静默降级。VLESS 的 `obfs` 仅接受空值/`none`、`websocket` 或 `grpc`，不会把不支持的传输方式当作 TCP。`host` 和 `serviceName`/`service_name` 保留原有回退顺序。显式 SNI 别名在赋值前按原始字节比较：相同值合并，不同值报错，不转换大小写。空值或纯空白的 SNI 和 flow 在派生节点 ID 前规范化为未指定；非空 flow 必须为 `xtls-rprx-vision` 或 `xtls-rprx-vision-udp443`。
 
 Clash 导入会比较 `servername`、`server-name` 和 `sni`；记录格式还会比较 `tls-name` 和 `tls-host`，并保留较低优先级的 `obfs_sni` 回退值，包括 Quantumult X 的 WSS Host。记录中的 `off` 仍为无效值。分享链接和 VMess JSON 的 WebSocket `host` 仅用作 Host 请求头；非 WebSocket 传输则将其作为较低优先级的 SNI 回退值。TLS 使用方最终仍可回退到节点主机名。
 
@@ -286,6 +288,8 @@ node {
 
 #### 从 `vless_mode` 迁移
 
+**破坏性配置变更：**`vless_mode` 已删除，不是兼容别名。升级前应迁移静态链接与 provider 内容。静态 `node {}` 中出现该字段会拒绝候选配置；订阅只丢弃对应条目，保留其他有效节点。全部使用旧模式的订阅缓存无法在离线状态下恢复节点；离线升级前应确保本地已有迁移后的 body，不要删除仍可用的 Selector 或延迟状态。单个 provider 恢复失败本身不导致启动退出，但最终组装的配置仍须通过校验。
+
 每种旧 mode 都有直接且保留能力的替代组合：
 
 | 已移除的 `vless_mode` | `packetEncoding` | `mux` | `udp` | 额外 query |
@@ -299,7 +303,7 @@ node {
 | `xudp` | `xudp` | `off` | `1` | — |
 | `mux-cool` | `auto` | `xray` | `1` | `concurrency=0&xudpConcurrency=0&xudpProxyUDP443=skip` |
 
-最后一行保留 TCP/UDP 可用性及原来的 Vision UDP/443 gate；对被 skip 的非 Vision UDP/443 目标，它可能使用协议回退，而不是 pooled XUDP。迁移可能改变派生的 VLESS 节点 ID，并重建以 ID 为键的运行时与健康状态。
+最后一行保留 TCP/UDP 可用性及原来的 Vision UDP/443 gate；对被 skip 的非 Vision UDP/443 目标，它可能使用协议回退，而不是 pooled XUDP。本次升级中所有接纳的 VLESS 节点都使用新的身份派生规则，见[节点身份](#节点身份)。
 
 旧版 `vless_mode` URI 语法会被拒绝。解析器也拒绝 `smux`、`multiplex`、`udp-over-tcp`、`packet-encoding`、`packet_encoding`、`packet-addr`、`xudp`、`only-tcp`、Brutal 控制项与 H2 stream 数量调优等含义不明确的第三方 URI 拼写；只有上表中的精确规范参数会配置这些选择。
 

@@ -23,7 +23,7 @@ An absent or empty VMess JSON `ps` remark uses `vmess-{host}` before validation.
 
 In quoted tags and links, a backslash escapes the next character when locating the closing quote; the source escape is retained in the parsed text.
 
-A malformed recognized link is dropped with an `invalid-node-entry` diagnostic using the original node-entry ordinal, never the link or node name. Data entrypoints return it without logging; plain entrypoints report it once. An unknown scheme is a hard configuration error. A standalone `mux:` or `mux=` line is also rejected; VLESS packet and carrier choices belong in that link's exact `packetEncoding=`, `mux=`, and `udp=` query parameters.
+A malformed recognized link is dropped with a warning. Known invalid fields retain a specific safe reason and schema path; unknown parse failures use `invalid-node-entry`. Diagnostics carry the original node-entry ordinal and source location, never the raw link, value, or node name. Data entrypoints return them without logging; plain entrypoints report them once. An unknown scheme or removed VLESS `vless_mode` is a hard configuration error. A standalone `mux:` or `mux=` line is also rejected; VLESS packet and carrier choices belong in that link's exact `packetEncoding=`, `mux=`, and `udp=` query parameters.
 
 In the legacy `ss://base64(method:password@host:port)` form, decoded credentials are literal text, not URL-decoded: `%20` stays `%20`, and `?`, `/`, `#`, `:` and `@` remain password characters. The last `@` separates the endpoint; the userinfo may itself be `base64(method:password)`. A decoded payload without `@`, or credentials that cannot supply a method and password, is rejected. URL userinfo forms still percent-decode their credentials. The endpoint, path, query (including `/?plugin=...`) and fragment keep the usual URL handling.
 
@@ -39,7 +39,9 @@ The credential fingerprint follows each handler's field precedence. The dial sha
 
 Before joining, each raw credential and dial-shape field and the effective host escapes `\` as `\\` and `|` as `\|`. Joined fingerprints are not escaped again. For nodes accepted by `Config::validate`, different identity fields produce different hash material. This guarantee does not cover nodes rejected by full configuration validation, even if `Node::from_share_link` can derive their IDs.
 
-At this upgrade, a node with `|` or `\` in one of these pipe-joined identity fields receives a new ID once; its ID-keyed health and warm state starts fresh. VLESS nodes may also receive a new ID when migrated from `vless_mode` to the independent packet/multiplex fields. ALPN uses the separate JSON child-UUID step, so `|` or `\` in ALPN alone does not change an existing ID at this upgrade. Selector choices migrate by member name, pooled ready streams already retire per generation, and `name`/`subtag` filters are unaffected.
+**Breaking upgrade:** every successfully re-derived VLESS node receives a new ID, including links that never specified `vless_mode`, UDP-disabled nodes, and nodes with ALPN overrides. ID-keyed health and warm/session state is rebuilt. Other protocols change ID only when `|` or `\` occurs in the pipe-joined identity fields; delimiters in ALPN alone do not trigger that change because ALPN uses a separate JSON child-UUID step.
+
+Do not delete the cache to migrate IDs. With persistence enabled and readable, unchanged group/member names can restore Selector choices, and valid TCP-v4 delay samples no older than 24 hours are re-keyed by node name at startup. These samples seed ranking, not liveness; renamed or ambiguous duplicate names do not guarantee the same leaf. Ready streams already retire with their generation, and `name`/`subtag` filter semantics are unchanged.
 
 Identity is stable across rename, reload, and subscription refresh when the dialable endpoint and dial shape are unchanged. Configuration/runtime assembly rejects duplicate derived IDs. `Node::default()` has a nil ID; construction paths derive it, and the outbound runtime registry rejects any nil ID that reaches it.
 
@@ -201,7 +203,7 @@ The query mapping follows the [Shadowrocket exporter](https://github.com/cedar20
 | `obfs=websocket`, `obfsParam`, `path` | WebSocket transport, Host header fallback, and path. |
 | `obfs=grpc`, `path` | gRPC transport and service-name fallback. |
 
-Conflicting TLS/REALITY, flow, or transport declarations are rejected rather than silently downgraded. `obfs` accepts only empty/`none`, `websocket`, or `grpc` for VLESS; unsupported transports are not reinterpreted as TCP. Canonical `host` and `serviceName`/`service_name` fields retain their existing fallback precedence. Explicit SNI aliases are compared before assignment; equal bytes coalesce, unequal names reject without case rewriting. Empty or whitespace-only SNI and flow normalize to absent before node-ID derivation. Nonempty flow must be exactly `xtls-rprx-vision`.
+Conflicting TLS/REALITY, flow, or transport declarations are rejected rather than silently downgraded. `obfs` accepts only empty/`none`, `websocket`, or `grpc` for VLESS; unsupported transports are not reinterpreted as TCP. Canonical `host` and `serviceName`/`service_name` fields retain their existing fallback precedence. Explicit SNI aliases are compared before assignment; equal bytes coalesce, unequal names reject without case rewriting. Empty or whitespace-only SNI and flow normalize to absent before node-ID derivation. Nonempty flow must be `xtls-rprx-vision` or `xtls-rprx-vision-udp443`.
 
 Clash imports compare `servername`, `server-name`, and `sni`; record imports additionally compare `tls-name` and `tls-host`, retaining `obfs_sni` as a lower-priority fallback, including Quantumult X WSS Host. Record `off` remains invalid. In share links and VMess JSON, WebSocket `host` is only the Host header; outside WebSocket it is a lower-priority SNI fallback. The endpoint hostname remains the final TLS consumer fallback.
 
@@ -287,6 +289,8 @@ Structured TOML/YAML/JSON uses `network` for packet permission (`tcp` disables U
 
 #### Migration from `vless_mode`
 
+**Breaking configuration change:** `vless_mode` is removed, not a deprecated alias. Migrate static links and provider content before upgrading. A static `node {}` entry containing it rejects the candidate configuration; a subscription drops that entry while keeping other valid nodes. An all-old-mode cached subscription body cannot restore nodes offline. Ensure a migrated body is available locally before an offline upgrade; do not delete usable Selector or delay state. Failure to restore one provider does not itself abort startup, though the assembled configuration must still validate.
+
 Every old mode has a direct capability-preserving replacement:
 
 | Removed `vless_mode` | `packetEncoding` | `mux` | `udp` | Additional query |
@@ -300,7 +304,7 @@ Every old mode has a direct capability-preserving replacement:
 | `xudp` | `xudp` | `off` | `1` | — |
 | `mux-cool` | `auto` | `xray` | `1` | `concurrency=0&xudpConcurrency=0&xudpProxyUDP443=skip` |
 
-The last row preserves TCP/UDP availability and the former Vision UDP/443 gate. It may use the protocol fallback rather than pooled XUDP for a skipped non-Vision UDP/443 target. Migration can change the derived VLESS node ID and rebuild ID-keyed runtime and health state.
+The last row preserves TCP/UDP availability and the former Vision UDP/443 gate. It may use the protocol fallback rather than pooled XUDP for a skipped non-Vision UDP/443 target. Every admitted VLESS node uses the new identity derivation at this upgrade, as described under [Node identity](#node-identity).
 
 Old `vless_mode` URI syntax is rejected. The parser also rejects ambiguous third-party URI spellings such as `smux`, `multiplex`, `udp-over-tcp`, `packet-encoding`, `packet_encoding`, `packet-addr`, `xudp`, `only-tcp`, Brutal controls, and H2 stream-count tuning; only the exact canonical parameters in the table above configure these choices.
 

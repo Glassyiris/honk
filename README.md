@@ -38,6 +38,8 @@ VLESS now composes three independent choices: `udp=0|1` controls packet permissi
 
 Vision always forbids TCP multiplexing, but UDP-only Xray mux is valid. Base Vision rejects UDP/443 on the protocol fallback; actual Xray UDP mux requires its `allow` policy to bypass that gate. VLESS Encryption can combine with Vision under the direct-TCP and eligible XUDP/disabled-UDP path rules. Carrier capacity comes from the process-wide file-descriptor budget, so exhaustion is a local, health-neutral refusal rather than fallback or packet replay. XUDP Global IDs have a scoped ownership boundary rather than process-wide collision-free NAT semantics. See the [node reference](doc/en/reference/nodes.md#vless-udp-and-multiplexing) for canonical links, migration, composition, and REALITY handshake/pool behavior, and the canonical [VLESS outbound design](doc/en/design/outbound.md#sourcesession-ownership-and-capacity) for lifecycle and ownership.
 
+**Upgrade warning:** `vless_mode` is removed and every VLESS node ID is re-derived. Migrate static links and cached/provider content before upgrading, especially offline. Name-based Selector choices and recent persisted delay samples can survive; do not delete them. See the [migration guide](doc/en/reference/nodes.md#migration-from-vless_mode).
+
 ## Before Using This Repository
 
 ### Important: Review Status

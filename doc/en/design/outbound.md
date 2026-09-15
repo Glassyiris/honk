@@ -490,6 +490,22 @@ maintenance pass reaps unretained idle VLESS sessions; there is no VLESS-only
 timer. Active, provisional, draining, and idle carriers all hold the process
 carrier permit until their actual I/O task tears down.
 
+The descriptor partition is fixed at process startup and shared across reloads
+and DNS forks, even when the initial configuration has no VLESS nodes. It reserves
+`min(after_dials / 8, 8192)` carrier slots before sizing UDP endpoints; native
+VLESS UDP, UoT, and Single XUDP consume this gate too, not just multiplexed paths.
+Exhaustion returns an immediate typed Capacity refusal, not a wait queue.
+
+| Effective `nofile` | UDP endpoints without carrier reserve | UDP endpoints with carrier reserve | Reduction |
+| ---: | ---: | ---: | ---: |
+| 1,024 | 50 | 44 | 12.00% |
+| 4,096 | 216 | 189 | 12.50% |
+| 65,536 | 4,588 | 4,015 | 12.49% |
+| 1,048,576 | 8,192 | 8,192 | 0% (endpoint cap) |
+
+These are descriptor-derived limits, not preallocated endpoint memory. Reload
+does not recompute or enlarge the startup partition.
+
 ### Vision and VLESS Encryption
 
 `xtls-rprx-vision` is carried in the VLESS addons. The response header is
@@ -497,8 +513,11 @@ stripped lazily on first read because it may arrive with target bytes. Vision
 removes response padding. Without VLESS Encryption it requires raw TCP with
 TLS 1.3 or REALITY; TCP multiplexing is always invalid, even when Encryption is
 enabled. UDP-only Xray multiplexing is legal. Vision rejects native, UoT, and H2
-UDP paths; UDP/443 is admitted only by the configured allow policy on an actual
-UDP mux path. The wire addon remains the base Vision flow.
+UDP paths. Base `xtls-rprx-vision` rejects UDP/443 on the protocol fallback;
+`xtls-rprx-vision-udp443` permits that target over Single XUDP even with `mux=off`.
+For enabled Xray mux, `reject` remains terminal for either flow; `skip` uses the
+protocol fallback and its flow gate, while `allow` bypasses the base-flow gate
+only on an actual UDP mux path. The wire addon remains the base Vision flow.
 
 `src/proxy/vless_encryption.rs` wraps the selected transport before the VLESS
 request. The implemented protocol is `mlkem768x25519plus`, with `native`,

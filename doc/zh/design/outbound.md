@@ -431,14 +431,32 @@ outbound maintenance pass 回收未被 retention 持有的 idle VLESS session；
 VLESS 专用 timer。active、provisional、draining 与 idle carrier 都会持有进程
 carrier permit，直至实际 I/O task teardown。
 
+文件描述符分区在进程启动时固定，并在 reload 与 DNS fork 间共享；即使初始
+配置没有 VLESS 节点也会预留。UDP endpoint 定额划分前先保留
+`min(after_dials / 8, 8192)` 个 carrier slot。原生 VLESS UDP、UoT 与 Single XUDP
+也使用此 gate，不仅是多路复用路径。耗尽后立即返回 typed Capacity 拒绝，不排队等待。
+
+| 生效 `nofile` | 不预留 carrier 时的 UDP endpoint 上限 | 预留后的上限 | 减少 |
+| ---: | ---: | ---: | ---: |
+| 1,024 | 50 | 44 | 12.00% |
+| 4,096 | 216 | 189 | 12.50% |
+| 65,536 | 4,588 | 4,015 | 12.49% |
+| 1,048,576 | 8,192 | 8,192 | 0%（已达 endpoint 封顶） |
+
+这些是按描述符推导的上限，并非预分配 endpoint 内存。Reload 不会重新划分或
+扩大启动时的分区。
+
 ### Vision 与 VLESS Encryption
 
 `xtls-rprx-vision` 通过 VLESS addon 携带。response header 在第一次 read 时
 lazy strip，因为它可能与目标字节同时到达。Vision 移除 response padding。
 没有 VLESS Encryption 时，它要求 raw TCP 搭配 TLS 1.3 或 REALITY。即使启用
 Encryption，TCP multiplex 也始终非法；仅 UDP 的 Xray multiplex 合法。Vision
-拒绝 native、UoT 与 H2 UDP path；只有配置的 allow policy 落在实际 UDP mux
-path 上才接纳 UDP/443。wire addon 始终是基础 Vision flow。
+拒绝 native、UoT 与 H2 UDP path。基础 `xtls-rprx-vision` 在协议回退路径拒绝
+UDP/443；`xtls-rprx-vision-udp443` 即使在 `mux=off` 时也允许经 Single XUDP
+访问该端口。启用 Xray mux 后，`reject` 对两种 flow 都是终态；`skip` 使用协议
+回退并遵循对应 flow 的门槛，`allow` 仅在实际 UDP mux 路径绕过基础 flow 的限制。
+wire addon 始终是基础 Vision flow。
 
 `src/proxy/vless_encryption.rs` 在 VLESS 请求前包装所选 transport。实现的协议
 是 `mlkem768x25519plus`，wire mode 为 `native`、`xorpub` 与 `random`。它接受

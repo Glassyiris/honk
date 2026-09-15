@@ -254,6 +254,8 @@ impl VlessConfig {
         }
     }
 
+    /// Canonicalize only equivalent or unreachable settings so identity and
+    /// structural runtime reuse agree without changing any selected path.
     pub fn normalize(&mut self) {
         if let Some(network) = &mut self.network
             && let Ok(enabled) = packet_network(network)
@@ -282,6 +284,8 @@ impl VlessConfig {
                     }
                     VlessUdpMux::Protocol | VlessUdpMux::SharedTcp => {}
                 }
+                // Skip and Reject coincide when base Vision denies the only
+                // fallback target; without a UDP pool, Skip and Allow coincide.
                 if vision_blocks_443 && *udp443 == Udp443Policy::Skip {
                     *udp443 = Udp443Policy::Reject;
                 }
@@ -294,6 +298,8 @@ impl VlessConfig {
                 } else if *udp443 != Udp443Policy::Skip
                     || (!vision && self.udp_encoding == VlessUdpEncoding::Native)
                 {
+                    // A pooled fallback is reachable only through Skip at :443,
+                    // where ordinary Auto and Native select the same protocol.
                     self.udp_encoding = VlessUdpEncoding::Auto;
                 }
             }
