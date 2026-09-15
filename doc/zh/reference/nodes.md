@@ -286,6 +286,8 @@ node {
 
 结构化 TOML/YAML/JSON 使用 `network` 表示 packet 权限（`tcp` 关闭 UDP；省略、`udp` 或 `tcp,udp` 允许），使用 `packet_encoding`（`auto`、`native`、`xudp`、`uot-v2`）表示回退，并使用带 tag 的 `multiplex` 值。Multiplex 形态为 `{"protocol":"off"}`、`{"protocol":"h2","padding":true|false}`，以及 `{"protocol":"xray","tcp":N|null,"udp":"protocol"|"shared-tcp"|{"separate":N},"udp443":"reject"|"skip"|"allow"}`。`tcp` 和每个 `separate` 值都是正数的逐 carrier 逻辑 child 并发上限，且最多 128；省略/null 表示关闭 TCP mux pool。
 
+`udp: "shared-tcp"` 要求非 null 的 `tcp` 并发值。超出 `1..=128` 的值或没有 TCP pool 的共享 UDP pool 会使节点被拒绝，即使配置了 `network: "tcp"`；这些无效值不会被截断或归一化成关闭的 pool。这与上文有符号 URI 控制项（以及对应的 Clash 控制项）不同，后者会将大于 128 的正值截断为 128。
+
 #### 从 `vless_mode` 迁移
 
 **破坏性配置变更：**`vless_mode` 已删除，不是兼容别名。升级前应迁移静态链接与 provider 内容。静态 `node {}` 中出现该字段会拒绝候选配置；订阅只丢弃对应条目，保留其他有效节点。全部使用旧模式的订阅缓存无法在离线状态下恢复节点；离线升级前应确保本地已有迁移后的 body，不要删除仍可用的 Selector 或延迟状态。单个 provider 恢复失败本身不导致启动退出，但最终组装的配置仍须通过校验。

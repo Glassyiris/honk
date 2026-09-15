@@ -287,6 +287,8 @@ node {
 
 Structured TOML/YAML/JSON uses `network` for packet permission (`tcp` disables UDP; omission, `udp`, or `tcp,udp` permits it), `packet_encoding` (`auto`, `native`, `xudp`, `uot-v2`) for fallback, and a tagged `multiplex` value. Multiplex shapes are `{"protocol":"off"}`, `{"protocol":"h2","padding":true|false}`, and `{"protocol":"xray","tcp":N|null,"udp":"protocol"|"shared-tcp"|{"separate":N},"udp443":"reject"|"skip"|"allow"}`. `tcp` and every `separate` value are positive per-carrier logical-child concurrency limits of at most 128; omission/null disables the TCP mux pool.
 
+`udp: "shared-tcp"` requires a non-null `tcp` limit. Limits outside `1..=128` or a shared pool without TCP reject the node, even with `network: "tcp"`; they are not clamped or normalized into a disabled pool. This differs from the signed URI controls above (and corresponding Clash controls), whose positive values above 128 are clamped to 128.
+
 #### Migration from `vless_mode`
 
 **Breaking configuration change:** `vless_mode` is removed, not a deprecated alias. Migrate static links and provider content before upgrading. A static `node {}` entry containing it rejects the candidate configuration; a subscription drops that entry while keeping other valid nodes. An all-old-mode cached subscription body cannot restore nodes offline. Ensure a migrated body is available locally before an offline upgrade; do not delete usable Selector or delay state. Failure to restore one provider does not itself abort startup, though the assembled configuration must still validate.

@@ -332,6 +332,70 @@ mod node_collection_admission {
     }
 
     #[test]
+    fn structured_vless_mux_rejects_invalid_limits_and_missing_shared_tcp() {
+        use honk_config::diagnostic::Severity;
+        use honk_config::node::{Udp443Policy, VlessMultiplex, VlessUdpMux};
+        use std::num::NonZeroU16;
+
+        let base = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?security=tls",
+        )
+        .unwrap();
+        for (tcp, udp) in [
+            (NonZeroU16::new(129), VlessUdpMux::Protocol),
+            (None, VlessUdpMux::Separate(NonZeroU16::new(129).unwrap())),
+            (None, VlessUdpMux::SharedTcp),
+        ] {
+            for network in [None, Some("tcp")] {
+                let mut node = base.clone();
+                let vless = node.vless_mut().unwrap();
+                vless.multiplex = VlessMultiplex::Xray {
+                    tcp,
+                    udp,
+                    udp443: Udp443Policy::Allow,
+                };
+                vless.network = network.map(str::to_owned);
+                assert!(node.validate().is_err(), "{tcp:?}, {udp:?}, {network:?}");
+                for rejected in [
+                    serde_json::from_str::<Node>(&serde_json::to_string(&node).unwrap()).is_err(),
+                    serde_yaml::from_str::<Node>(&serde_yaml::to_string(&node).unwrap()).is_err(),
+                    toml::from_str::<Node>(&toml::to_string(&node).unwrap()).is_err(),
+                ] {
+                    assert!(rejected, "{tcp:?}, {udp:?}, {network:?}");
+                }
+
+                let config = config_with_node(node);
+                let error = config.validate_detailed().unwrap_err();
+                assert_eq!(error.diagnostic.setting.to_string(), "nodes[1].multiplex");
+                for (extension, text) in [
+                    ("json", serde_json::to_string(&config).unwrap()),
+                    ("yaml", serde_yaml::to_string(&config).unwrap()),
+                    ("toml", toml::to_string(&config).unwrap()),
+                ] {
+                    let file = tempfile::Builder::new()
+                        .suffix(&format!(".{extension}"))
+                        .tempfile()
+                        .unwrap();
+                    std::fs::write(file.path(), text).unwrap();
+                    let mut diagnostics = Vec::new();
+                    let error = Config::from_file_with_detailed_diagnostics(
+                        file.path().to_str().unwrap(),
+                        &mut diagnostics,
+                    )
+                    .unwrap_err();
+                    assert_eq!(error.diagnostic.code, "invalid-config-value");
+                    assert_eq!(error.diagnostic.setting.to_string(), "nodes[1].multiplex");
+                    assert_eq!(error.diagnostic.entry_index, Some(1));
+                    assert_eq!(error.diagnostic.severity, Severity::Error);
+                    assert!(error.diagnostic.terminal);
+                    assert_eq!(diagnostics.iter().filter(|d| d.terminal).count(), 1);
+                    assert!(diagnostics.iter().all(|d| d.severity == Severity::Error));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn c20_config_admission_preserves_canonical_identity() {
         let canonical = canonical_socks5_node();
         let config = Config {

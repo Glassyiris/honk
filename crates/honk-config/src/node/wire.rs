@@ -599,7 +599,7 @@ impl FlatNode {
             NodeProtocol::VLess => {
                 let transport = flat.take_transport();
                 let tls = flat.take_tls();
-                let mut config = VlessConfig {
+                OutboundConfig::Vless(VlessConfig {
                     uuid: flat.password.take(),
                     encryption: flat.encryption.take(),
                     udp_encoding: flat.packet_encoding.take().unwrap_or_default(),
@@ -608,9 +608,7 @@ impl FlatNode {
                     network: flat.network.take(),
                     transport,
                     tls,
-                };
-                config.normalize();
-                OutboundConfig::Vless(config)
+                })
             }
             NodeProtocol::Socks5 => OutboundConfig::Socks5(Socks5Config {
                 username: flat.username.take(),
@@ -681,7 +679,7 @@ impl FlatNode {
                 "TLS ALPN requires a TLS-capable protocol",
             ));
         }
-        let node = Node {
+        let mut node = Node {
             id: flat.id,
             name: flat.name,
             address: flat.address,
@@ -696,6 +694,9 @@ impl FlatNode {
             updated_at: flat.updated_at,
         };
         node.validate_detailed_at(source, setting)?;
+        if let Some(config) = node.vless_mut() {
+            config.normalize();
+        }
         Ok(node)
     }
 }
