@@ -67,19 +67,6 @@ pub(crate) fn resolve_outbound_nodes(
                     "resolve_outbound_nodes: group '{}' has no available node (ipver={:?})",
                     group.name, ipver
                 );
-                if let Some(final_name) = group_manager.get_final_outbound(&group.name) {
-                    info!(
-                        "Group '{}' has no available selection, using final outbound '{}'",
-                        group.name, final_name
-                    );
-                    return resolve_outbound_nodes(
-                        config,
-                        group_manager,
-                        &final_name,
-                        domain,
-                        ipver,
-                    );
-                }
             }
             return nodes.into_iter().cloned().collect();
         }
@@ -132,24 +119,6 @@ pub(super) fn resolve_outbound_plan_for_target(
     outbound_name: &str,
     context: &honk_outbound::group::ScoreSelectionContext,
 ) -> ResolvedScorePlan {
-    resolve_outbound_plan_for_target_inner(
-        config,
-        group_manager,
-        outbound_name,
-        context,
-        0,
-        &mut Vec::new(),
-    )
-}
-
-fn resolve_outbound_plan_for_target_inner(
-    config: &Config,
-    group_manager: &GroupManager,
-    outbound_name: &str,
-    context: &honk_outbound::group::ScoreSelectionContext,
-    depth: usize,
-    visited: &mut Vec<String>,
-) -> ResolvedScorePlan {
     if let Some(node) = config.builtin_node(outbound_name) {
         return ResolvedScorePlan {
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
@@ -188,11 +157,11 @@ fn resolve_outbound_plan_for_target_inner(
                 .collect(),
         };
     }
-    let Some(group) = config
+    if !config
         .groups
         .iter()
-        .find(|group| group.name == outbound_name)
-    else {
+        .any(|group| group.name == outbound_name)
+    {
         return ResolvedScorePlan {
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
             nodes: vec![Config::builtin_direct_node()],
@@ -200,55 +169,10 @@ fn resolve_outbound_plan_for_target_inner(
             feedback: vec![None],
             selection_chains: vec![vec![Config::BUILTIN_DIRECT_NODE.to_owned()]],
         };
-    };
-    if depth >= honk_outbound::group::MAX_GROUP_DEPTH
-        || visited.iter().any(|name| name == outbound_name)
-    {
-        return ResolvedScorePlan {
-            mode: honk_outbound::group::SelectionPlanMode::Authoritative,
-            nodes: Vec::new(),
-            health_family: context.health_family,
-            feedback: Vec::new(),
-            selection_chains: Vec::new(),
-        };
     }
-    let plan = group_manager.selection_plan_for_target_with_health_fallback(outbound_name, context);
-    if !plan.entries.is_empty() {
-        return own_score_plan(plan);
-    }
-    let Some(final_name) = group.final_outbound.as_deref() else {
-        return ResolvedScorePlan {
-            mode: plan.mode,
-            nodes: Vec::new(),
-            health_family: plan.health_family,
-            feedback: Vec::new(),
-            selection_chains: Vec::new(),
-        };
-    };
-    visited.push(outbound_name.to_owned());
-    let mut terminal = resolve_outbound_plan_for_target_inner(
-        config,
-        group_manager,
-        final_name,
-        context,
-        depth + 1,
-        visited,
-    );
-    visited.pop();
-    for chain in &mut terminal.selection_chains {
-        chain.insert(0, outbound_name.to_owned());
-    }
-    for (index, node) in terminal.nodes.iter().enumerate() {
-        let outer = group_manager.feedback_for_group_node(outbound_name, node.id, context.clone());
-        terminal.feedback[index] = match (outer, terminal.feedback[index].take()) {
-            (Some(outer), Some(inner)) => {
-                Some(inner.prepend_attribution(outer.attributions()[0].group.clone(), node.id))
-            }
-            (Some(outer), None) => Some(outer),
-            (None, inner) => inner,
-        };
-    }
-    terminal
+    own_score_plan(
+        group_manager.selection_plan_for_target_with_health_fallback(outbound_name, context),
+    )
 }
 
 /// Concrete UDP candidates plus target-aware Score feedback, attribution,

@@ -14,53 +14,12 @@ impl super::GroupManager {
     pub fn publish_score_membership(&self) {
         let groups = self.groups.keys().cloned().collect::<Vec<_>>();
         let membership = self.groups.values().flat_map(|group| {
-            let mut node_ids: HashSet<_> = self
-                .leaf_nodes_in_group(&group.name)
+            self.reachable_leaf_nodes_in_group(&group.name)
                 .into_iter()
-                .map(|node| node.id)
-                .collect();
-            let mut visited = HashSet::new();
-            self.collect_final_outbound_node_ids(group, &mut visited, &mut node_ids);
-            node_ids
-                .into_iter()
-                .map(move |node_id| (group.name.clone(), node_id))
+                .map(move |node| (group.name.clone(), node.id))
         });
         self.score_state
             .publish_generation(Arc::clone(&self.score_authority), groups, membership);
-    }
-
-    fn collect_final_outbound_node_ids(
-        &self,
-        group: &honk_config::group::Group,
-        visited: &mut HashSet<String>,
-        node_ids: &mut HashSet<Uuid>,
-    ) {
-        if !visited.insert(group.name.clone()) {
-            return;
-        }
-        let Some(final_name) = group.final_outbound.as_deref() else {
-            return;
-        };
-        match final_name {
-            honk_config::Config::BUILTIN_DIRECT_NODE => {
-                node_ids.insert(honk_config::config::DIRECT_NODE_ID);
-            }
-            honk_config::Config::BUILTIN_BLOCK_NODE => {
-                node_ids.insert(honk_config::config::BLOCK_NODE_ID);
-            }
-            _ => {
-                if let Some(node) = self.node_by_name(final_name) {
-                    node_ids.insert(node.id);
-                } else if let Some(final_group) = self.groups.get(final_name) {
-                    node_ids.extend(
-                        self.leaf_nodes_in_group(final_name)
-                            .into_iter()
-                            .map(|node| node.id),
-                    );
-                    self.collect_final_outbound_node_ids(final_group, visited, node_ids);
-                }
-            }
-        }
     }
 
     /// Aggregate scorer feedback for concrete work scheduled by leaf ID.
@@ -75,11 +34,7 @@ impl super::GroupManager {
             .groups
             .values()
             .filter(|group| group.policy == honk_config::group::GroupPolicy::Score)
-            .filter(|group| {
-                self.leaf_nodes_in_group(&group.name)
-                    .iter()
-                    .any(|node| node.id == node_id)
-            })
+            .filter(|group| self.group_reaches_node(&group.name, node_id))
             .map(|group| ScoreAttribution {
                 group: group.name.clone(),
                 node_id,
@@ -96,8 +51,8 @@ impl super::GroupManager {
             })
     }
 
-    /// Feedback for a terminal `final` leaf attributed to one outer Honk
-    /// group. Ordinary selected leaves should use their plan-carried feedback.
+    /// Feedback for work explicitly attributed to one Score group.
+    /// Selected leaves should use their plan-carried feedback.
     pub fn feedback_for_group_node(
         &self,
         group_name: &str,
@@ -129,7 +84,11 @@ impl super::GroupManager {
         group_name: &str,
         context: &ScoreSelectionContext,
     ) -> super::ScoreSelectionPlan<'_> {
-        let plan = self.selection_plan_for_target(group_name, context);
+        let plan = self.selection_plan_for_target_with_effects(
+            group_name,
+            context,
+            super::SelectionEffects::ApplyWithHealthFallback,
+        );
         if !plan.entries.is_empty() || context.health_family != IpVersion::V6 {
             return plan;
         }
@@ -244,24 +203,142 @@ impl super::GroupManager {
         group_name: &str,
         context: &ScoreSelectionContext,
     ) -> super::ScoreSelectionPlan<'_> {
+        self.selection_plan_for_target_with_effects(
+            group_name,
+            context,
+            super::SelectionEffects::Apply,
+        )
+    }
+
+    fn selection_plan_for_target_with_effects(
+        &self,
+        group_name: &str,
+        context: &ScoreSelectionContext,
+        effects: super::SelectionEffects,
+    ) -> super::ScoreSelectionPlan<'_> {
         let Some(group) = self.groups.get(group_name) else {
-            return super::ScoreSelectionPlan {
-                mode: super::SelectionPlanMode::Authoritative,
-                health_family: context.health_family,
-                entries: Vec::new(),
-            };
+            return self.score_selection_plan(
+                Vec::new(),
+                super::SelectionPlanMode::Authoritative,
+                context,
+            );
         };
-        self.mark_used(group_name);
-        let selected_member = self.selector_member(group);
-        let mut visited = Vec::new();
-        let mut candidates = self.flatten_candidates_for_target(
+        if effects.applies() {
+            self.mark_used(group_name);
+        }
+        let (mode, candidates) =
+            self.selection_candidates_for_target(group, context, &mut Vec::new(), 0, effects, true);
+        self.score_selection_plan(candidates, mode, context)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::group) fn selection_candidates_for_target<'a>(
+        &'a self,
+        group: &'a honk_config::group::Group,
+        context: &ScoreSelectionContext,
+        visited: &mut Vec<&'a str>,
+        depth: usize,
+        effects: super::SelectionEffects,
+        cold_urltest: bool,
+    ) -> (super::SelectionPlanMode, Vec<super::Candidate<'a>>) {
+        if depth >= super::MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
+            return (super::SelectionPlanMode::Authoritative, Vec::new());
+        }
+        let (mut mode, mut candidates) = self.normal_candidates_for_target(
             group,
             context,
-            &mut visited,
-            0,
-            super::SelectionEffects::Apply,
+            visited,
+            depth,
+            effects,
+            cold_urltest,
         );
-        let before_filter = (group.policy == honk_config::group::GroupPolicy::Score
+        if candidates.is_empty()
+            && let Some(member) = self.final_member(group)
+        {
+            // A business IPv6 target may use an IPv4 proxy. Defer this final
+            // until the outer health-family retry has tried that ordinary path.
+            if effects.health_fallback() && context.health_family == IpVersion::V6 {
+                let mut ipv4 = context.clone();
+                ipv4.health_family = IpVersion::V4;
+                if !self
+                    .normal_candidates_for_target(
+                        group,
+                        &ipv4,
+                        visited,
+                        depth,
+                        effects.peek(),
+                        cold_urltest,
+                    )
+                    .1
+                    .is_empty()
+                {
+                    return (mode, candidates);
+                }
+            }
+            match member {
+                GroupMember::Node(node) => {
+                    if matches!(
+                        node.protocol(),
+                        honk_config::types::NodeProtocol::Direct
+                            | honk_config::types::NodeProtocol::Block
+                    ) || self.is_node_selectable_for_domain(
+                        node.id,
+                        context.probe_domain,
+                        context.health_family,
+                    ) {
+                        mode = super::SelectionPlanMode::Authoritative;
+                        candidates.push(super::Candidate {
+                            via: None,
+                            node,
+                            attribution: Vec::new(),
+                            selection_chain: vec![node.name.as_str()],
+                        });
+                    }
+                }
+                GroupMember::Group(final_group) => {
+                    if effects.applies() {
+                        self.mark_used(&final_group.name);
+                    }
+                    visited.push(group.name.as_str());
+                    (mode, candidates) = self.selection_candidates_for_target(
+                        final_group,
+                        context,
+                        visited,
+                        depth + 1,
+                        effects,
+                        cold_urltest,
+                    );
+                    visited.pop();
+                    for candidate in &mut candidates {
+                        candidate.via = Some(final_group);
+                    }
+                }
+            }
+        }
+        for candidate in &mut candidates {
+            if group.policy == honk_config::group::GroupPolicy::Score {
+                candidate.attribution.insert(0, group.name.as_str());
+            }
+            candidate.selection_chain.insert(0, group.name.as_str());
+        }
+        (mode, candidates)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn normal_candidates_for_target<'a>(
+        &'a self,
+        group: &'a honk_config::group::Group,
+        context: &ScoreSelectionContext,
+        visited: &mut Vec<&'a str>,
+        depth: usize,
+        effects: super::SelectionEffects,
+        cold_urltest: bool,
+    ) -> (super::SelectionPlanMode, Vec<super::Candidate<'a>>) {
+        let selected_member = self.selector_member(group);
+        let mut candidates =
+            self.flatten_candidates_for_target(group, context, visited, depth, effects);
+        let before_filter = (effects.applies()
+            && group.policy == honk_config::group::GroupPolicy::Score
             && self.score_state.is_current_authority(&self.score_authority))
         .then(|| super::unique_candidate_ids(&candidates))
         .flatten();
@@ -278,19 +355,21 @@ impl super::GroupManager {
                 super::removed_unique_candidate_count(before_filter, &candidates),
             );
         }
-        let (mode, candidates) = if candidates.is_empty() {
-            let candidate = self.last_resort_candidate_for_target(
-                group,
-                context,
-                &mut visited,
-                0,
-                super::SelectionEffects::Apply,
-            );
-            (
-                super::SelectionPlanMode::Authoritative,
-                candidate.into_iter().collect(),
-            )
-        } else if group.policy == honk_config::group::GroupPolicy::URLTest
+        if candidates.is_empty() {
+            let candidate =
+                self.last_resort_candidate_for_target(group, context, visited, depth, effects);
+            let mode = if candidate.is_none()
+                && cold_urltest
+                && group.policy == honk_config::group::GroupPolicy::URLTest
+            {
+                super::SelectionPlanMode::ColdUrlTest
+            } else {
+                super::SelectionPlanMode::Authoritative
+            };
+            return (mode, candidate.into_iter().collect());
+        }
+        if cold_urltest
+            && group.policy == honk_config::group::GroupPolicy::URLTest
             && !candidates.iter().any(|candidate| {
                 self.node_latency(
                     candidate.node,
@@ -301,7 +380,7 @@ impl super::GroupManager {
                 ) != Duration::MAX
             })
         {
-            (
+            return (
                 super::SelectionPlanMode::ColdUrlTest,
                 self.order_by_latency(
                     candidates,
@@ -309,65 +388,37 @@ impl super::GroupManager {
                     context.health_family,
                     group.check_url.as_deref(),
                 ),
-            )
-        } else {
-            let candidate = match group.policy {
-                honk_config::group::GroupPolicy::Selector => {
-                    let picked =
-                        selected_member.and_then(|member| Self::pick_selector(&candidates, member));
-                    picked.and_then(|picked| {
-                        self.commit_selector_pick_for_target(
-                            group,
-                            picked,
-                            context,
-                            &mut visited,
-                            0,
-                            super::SelectionEffects::Apply,
-                        )
-                    })
-                }
-                honk_config::group::GroupPolicy::URLTest => Some(self.pick_urltest(
-                    &candidates,
-                    group,
-                    context.network,
-                    context.health_family,
-                    super::SelectionEffects::Apply,
-                )),
-                honk_config::group::GroupPolicy::LoadBalance => Some(self.pick_load_balance(
-                    &candidates,
-                    group,
-                    context.network,
-                    super::SelectionEffects::Apply,
-                )),
-                honk_config::group::GroupPolicy::Fallback => Some(self.pick_fallback(
-                    &candidates,
-                    group,
-                    context.network,
-                    super::SelectionEffects::Apply,
-                )),
-                honk_config::group::GroupPolicy::Score => Some(self.pick_score(
-                    &candidates,
-                    group,
-                    context,
-                    super::SelectionEffects::Apply,
-                )),
-            };
-            (
-                super::SelectionPlanMode::Authoritative,
-                candidate.into_iter().collect(),
-            )
+            );
+        }
+        let candidate = match group.policy {
+            honk_config::group::GroupPolicy::Selector => selected_member
+                .and_then(|member| Self::pick_selector(&candidates, member))
+                .and_then(|picked| {
+                    self.commit_selector_pick_for_target(
+                        group, picked, context, visited, depth, effects,
+                    )
+                }),
+            honk_config::group::GroupPolicy::URLTest => Some(self.pick_urltest(
+                &candidates,
+                group,
+                context.network,
+                context.health_family,
+                effects,
+            )),
+            honk_config::group::GroupPolicy::LoadBalance => {
+                Some(self.pick_load_balance(&candidates, group, context.network, effects))
+            }
+            honk_config::group::GroupPolicy::Fallback => {
+                Some(self.pick_fallback(&candidates, group, context.network, effects))
+            }
+            honk_config::group::GroupPolicy::Score => {
+                Some(self.pick_score(&candidates, group, context, effects))
+            }
         };
-        let candidates = candidates
-            .into_iter()
-            .map(|mut candidate| {
-                if group.policy == honk_config::group::GroupPolicy::Score {
-                    candidate.attribution.insert(0, group.name.as_str());
-                }
-                candidate.selection_chain.insert(0, group.name.as_str());
-                candidate
-            })
-            .collect();
-        self.score_selection_plan(candidates, mode, context)
+        (
+            super::SelectionPlanMode::Authoritative,
+            candidate.into_iter().collect(),
+        )
     }
 
     fn last_resort_candidate_for_target<'a>(
@@ -419,7 +470,7 @@ impl super::GroupManager {
         candidate
     }
 
-    fn pick_candidate_for_target<'a>(
+    pub(in crate::group) fn pick_candidate_for_target<'a>(
         &'a self,
         group: &'a honk_config::group::Group,
         context: &ScoreSelectionContext,
@@ -427,64 +478,14 @@ impl super::GroupManager {
         depth: usize,
         effects: super::SelectionEffects,
     ) -> Option<super::Candidate<'a>> {
-        let selected_member = self.selector_member(group);
-        let mut candidates =
-            self.flatten_candidates_for_target(group, context, visited, depth, effects);
-        let before_filter = (effects.applies()
-            && group.policy == honk_config::group::GroupPolicy::Score
-            && self.score_state.is_current_authority(&self.score_authority))
-        .then(|| super::unique_candidate_ids(&candidates))
-        .flatten();
-        candidates = self.filter_alive_candidates(
-            candidates,
-            context.probe_domain,
-            context.health_family,
-            group.check_url.as_deref(),
-        );
-        if let Some(before_filter) = before_filter {
-            self.score_state.record_dead_filtered(
-                &self.score_authority,
-                SelectionReasonKey::new(&group.name, context.network),
-                super::removed_unique_candidate_count(before_filter, &candidates),
-            );
-        }
-        let mut candidate = if candidates.is_empty() {
-            self.last_resort_candidate_for_target(group, context, visited, depth, effects)
-        } else {
-            Some(match group.policy {
-                honk_config::group::GroupPolicy::Selector => {
-                    let picked = Self::pick_selector(&candidates, selected_member?)?;
-                    self.commit_selector_pick_for_target(
-                        group, picked, context, visited, depth, effects,
-                    )?
-                }
-                honk_config::group::GroupPolicy::URLTest => self.pick_urltest(
-                    &candidates,
-                    group,
-                    context.network,
-                    context.health_family,
-                    effects,
-                ),
-                honk_config::group::GroupPolicy::LoadBalance => {
-                    self.pick_load_balance(&candidates, group, context.network, effects)
-                }
-                honk_config::group::GroupPolicy::Fallback => {
-                    self.pick_fallback(&candidates, group, context.network, effects)
-                }
-                honk_config::group::GroupPolicy::Score => {
-                    self.pick_score(&candidates, group, context, effects)
-                }
-            })
-        }?;
-        if group.policy == honk_config::group::GroupPolicy::Score {
-            candidate.attribution.insert(0, group.name.as_str());
-        }
-        candidate.selection_chain.insert(0, group.name.as_str());
-        Some(candidate)
+        self.selection_candidates_for_target(group, context, visited, depth, effects, false)
+            .1
+            .into_iter()
+            .next()
     }
 
-    /// Target-aware counterpart of `commit_selector_pick`.
-    fn commit_selector_pick_for_target<'a>(
+    /// Commit only the serving Selector subgroup; refusal cannot restore its stale peek.
+    pub(in crate::group) fn commit_selector_pick_for_target<'a>(
         &'a self,
         group: &'a honk_config::group::Group,
         picked: super::Candidate<'a>,
@@ -508,7 +509,7 @@ impl super::GroupManager {
         Some(committed)
     }
 
-    fn flatten_candidates_for_target<'a>(
+    pub(in crate::group) fn flatten_candidates_for_target<'a>(
         &'a self,
         group: &'a honk_config::group::Group,
         context: &ScoreSelectionContext,
@@ -520,10 +521,10 @@ impl super::GroupManager {
             return Vec::new();
         }
         visited.push(group.name.as_str());
-        // Same rule as `flatten_candidates` (see `commit_selector_pick`).
+        // Only the serving Selector member may advance nested policy state.
         let sub_effects =
             if group.policy == honk_config::group::GroupPolicy::Selector && effects.applies() {
-                super::SelectionEffects::Peek
+                effects.peek()
             } else {
                 effects
             };
@@ -572,24 +573,14 @@ impl super::GroupManager {
             IpVersion::V4,
         );
         let mut visited = Vec::new();
-        let mut candidates = self.flatten_candidates_for_target(
+        self.pick_candidate_for_target(
             group,
             &context,
             &mut visited,
             0,
             super::SelectionEffects::Peek,
-        );
-        candidates = self.filter_alive_candidates(
-            candidates,
-            context.probe_domain,
-            context.health_family,
-            group.check_url.as_deref(),
-        );
-        (!candidates.is_empty()).then(|| {
-            self.pick_score(&candidates, group, &context, super::SelectionEffects::Peek)
-                .tag()
-                .to_string()
-        })
+        )
+        .map(|candidate| candidate.tag().to_owned())
     }
 }
 
@@ -597,6 +588,7 @@ impl super::GroupManager {
 fn selector_commit_does_not_restore_a_stale_sibling() {
     use crate::alive::AliveDialerSet;
     use honk_config::group::{Group, GroupPolicy};
+    use honk_config::node::Node;
 
     let nodes: Vec<_> = ["a", "b", "outside"]
         .into_iter()
@@ -665,26 +657,14 @@ fn selector_commit_does_not_restore_a_stale_sibling() {
             // A failed serving commit must not resurrect the child's old leaf.
             manager.set_selector_choice("child", "b");
             let picked = GroupManager::pick_selector(&candidates, selected_member).unwrap();
-            let committed: Option<Candidate<'_>> = if target_aware {
-                manager.commit_selector_pick_for_target(
-                    parent,
-                    picked,
-                    &context,
-                    &mut visited,
-                    0,
-                    SelectionEffects::Apply,
-                )
-            } else {
-                manager.commit_selector_pick(
-                    parent,
-                    picked,
-                    context.probe_domain,
-                    context.health_family,
-                    &mut visited,
-                    0,
-                    SelectionEffects::Apply,
-                )
-            };
+            let committed = manager.commit_selector_pick_for_target(
+                parent,
+                picked,
+                &context,
+                &mut visited,
+                0,
+                SelectionEffects::Apply,
+            );
             results.push(committed.map(|candidate| candidate.node.id));
         }
     }

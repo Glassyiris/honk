@@ -19,6 +19,7 @@
 
 use futures_util::{SinkExt, StreamExt};
 use honk_config::node::Node;
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -44,6 +45,13 @@ pub(crate) async fn wrap_transport(
     tcp: TcpStream,
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
     let stream = maybe_tls_wrap(node, tcp).await?;
+    wrap_after_tls(node, stream).await
+}
+
+pub(crate) async fn wrap_after_tls(
+    node: &Node,
+    stream: Box<dyn AsyncReadWrite>,
+) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
     match node.transport().unwrap().transport.as_str() {
         "" | "tcp" => Ok(stream), // raw TCP/TLS
         "ws" => wrap_ws(node, stream).await,
@@ -262,9 +270,8 @@ struct GrpcStream {
     /// DATA-frame payloads awaiting message parsing; a message may span
     /// multiple DATA frames.
     msg_buf: Vec<u8>,
-    /// Outbound bytes not yet fully written; short writes keep the rest
-    /// queued instead of losing half a frame.
-    write_queue: std::collections::VecDeque<u8>,
+    /// Outbound frames owned until the inner transport consumes them.
+    write_queue: VecDeque<u8>,
     /// Client→server flow-control windows (RFC 7540 §6.9): the server's
     /// advertised initial stream window plus WINDOW_UPDATE increments,
     /// minus queued DATA payload bytes.
@@ -277,9 +284,6 @@ struct GrpcStream {
     peer_max_frame: usize,
     /// DATA payload bytes received since the last WINDOW_UPDATE top-up.
     recv_unacked: u32,
-    /// A poll_write chunk accepted into `write_queue` but not yet fully
-    /// flushed; reported to the caller only once the drain completes.
-    pending_accepted: Option<usize>,
     /// SETTINGS ACKs / WINDOW_UPDATEs sit in `write_queue`; the read path
     /// flushes them while downloading so a pure receiver never stalls.
     control_pending: bool,
@@ -314,9 +318,8 @@ const H2_DEFAULT_MAX_FRAME: usize = 16384;
 /// far below the advertised ~2 GiB window, so the top-up frames are
 /// always flushed by ongoing reads long before the peer could stall.
 const H2_WINDOW_REFRESH: u32 = 8 * 1024 * 1024;
-/// poll_write waits for at least this much send window, keeping tiny
-/// sliver frames off the wire.
-const H2_MIN_WRITE_WINDOW: i64 = 1024;
+/// gRPC prefix plus protobuf tag and the one-byte varint for one payload byte.
+const GRPC_MESSAGE_OVERHEAD_MIN: usize = 7;
 
 /// Encode an uncompressed HPACK string length (RFC 7541 §5.1).
 fn push_hpack_string_length(hpack: &mut Vec<u8>, length: usize) {
@@ -348,13 +351,12 @@ impl GrpcStream {
             read_buf: Vec::new(),
             undecoded: Vec::new(),
             msg_buf: Vec::new(),
-            write_queue: std::collections::VecDeque::new(),
+            write_queue: VecDeque::new(),
             send_stream_window: H2_DEFAULT_WINDOW,
             send_conn_window: H2_DEFAULT_WINDOW,
             peer_initial_window: H2_DEFAULT_WINDOW,
             peer_max_frame: H2_DEFAULT_MAX_FRAME,
             recv_unacked: 0,
-            pending_accepted: None,
             control_pending: false,
             stream_eof: false,
             end_stream_sent: false,
@@ -438,24 +440,16 @@ impl GrpcStream {
         hpack.push(4); // "honk" len
         hpack.extend_from_slice(b"honk");
 
-        let payload_len = hpack.len() as u32;
-        let frame_header: [u8; 9] = [
-            (payload_len >> 16) as u8,
-            (payload_len >> 8) as u8,
-            payload_len as u8,
+        let mut frame = Vec::with_capacity(9 + hpack.len());
+        push_frame_header(
+            &mut frame,
+            hpack.len() as u32,
             H2_HEADERS,
-            // gRPC is bidirectional streaming: DATA frames follow, so the
-            // HEADERS frame must NOT carry END_STREAM (servers reject
-            // writes on a client-closed stream with 400).
             H2_FLAG_END_HEADERS,
-            ((self.stream_id >> 24) & 0x7F) as u8,
-            (self.stream_id >> 16) as u8,
-            (self.stream_id >> 8) as u8,
-            self.stream_id as u8,
-        ];
-
-        self.inner.write_all(&frame_header).await?;
-        self.inner.write_all(&hpack).await?;
+            self.stream_id,
+        );
+        frame.extend_from_slice(&hpack);
+        self.inner.write_all(&frame).await?;
         self.inner.flush().await?;
         Ok(())
     }
@@ -631,11 +625,12 @@ impl GrpcStream {
         self.control_pending = true;
     }
 
-    /// Drive inbound frames until the send window allows another DATA
-    /// frame; Pending when the socket would block (the waker is armed on
-    /// the read side, so an arriving WINDOW_UPDATE re-polls the writer).
+    /// Drive inbound frames until the send window fits at least one application
+    /// byte and its gRPC/protobuf envelope. Pending arms the read-side waker for
+    /// the WINDOW_UPDATE or SETTINGS change that can make progress.
     fn poll_send_window(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        while self.send_stream_window.min(self.send_conn_window) < H2_MIN_WRITE_WINDOW {
+        while self.send_stream_window.min(self.send_conn_window) <= GRPC_MESSAGE_OVERHEAD_MIN as i64
+        {
             if self.try_parse_frame() {
                 continue;
             }
@@ -711,19 +706,39 @@ fn push_varint(out: &mut Vec<u8>, mut value: usize) {
     out.push(value as u8);
 }
 
+fn grpc_chunk_len(input_len: usize, max_data_frame: usize) -> usize {
+    let mut chunk = input_len.min(max_data_frame.saturating_sub(GRPC_MESSAGE_OVERHEAD_MIN));
+    while chunk != 0 && chunk + 6 + protobuf_varint_len(chunk) > max_data_frame {
+        chunk -= 1;
+    }
+    chunk
+}
+
+fn protobuf_varint_len(mut value: usize) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
+}
+
 impl GrpcStream {
     /// Write as much of the queued frame as possible; Pending keeps the
     /// remainder queued for the next call.
     fn drain_write_queue(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         while !self.write_queue.is_empty() {
-            let n = {
-                let contiguous = self.write_queue.make_contiguous();
-                match Pin::new(&mut self.inner).poll_write(cx, contiguous) {
-                    Poll::Ready(Ok(n)) => n,
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                }
+            let n = match Pin::new(&mut self.inner).poll_write(cx, self.write_queue.as_slices().0) {
+                Poll::Ready(Ok(n)) => n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             };
+            if n == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "grpc: inner transport accepted zero bytes",
+                )));
+            }
             self.write_queue.drain(..n);
         }
         Poll::Ready(Ok(()))
@@ -736,31 +751,28 @@ impl AsyncWrite for GrpcStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        // A previously accepted chunk must be fully flushed (and reported)
-        // before another frame is queued, or the caller's buffer accounting
-        // would consume bytes twice.
-        if let Some(n) = self.pending_accepted {
-            match self.drain_write_queue(cx) {
-                Poll::Ready(Ok(())) => {
-                    self.pending_accepted = None;
-                    return Poll::Ready(Ok(n));
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if self.end_stream_sent {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "grpc: stream write side is closed",
+            )));
+        }
+        match self.drain_write_queue(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
         }
         match self.poll_send_window(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => return Poll::Pending,
         }
-        let available = self.send_stream_window.min(self.send_conn_window);
-        // Frame overhead beyond the chunk: 5B gRPC length prefix + the
-        // protobuf envelope (0x0a tag + varint, ≤ 6B) + a margin.
-        let chunk_len = buf
-            .len()
-            .min(self.peer_max_frame.saturating_sub(16))
-            .min((available - 16).max(0) as usize);
+        let available = self.send_stream_window.min(self.send_conn_window) as usize;
+        let chunk_len = grpc_chunk_len(buf.len(), self.peer_max_frame.min(available));
+        debug_assert!(chunk_len != 0);
         let chunk = &buf[..chunk_len];
         // Message: [1B uncompressed] [4B BE length] [protobuf envelope]:
         // field 1 bytes content (0x0a tag + varint length + payload).
@@ -777,14 +789,7 @@ impl AsyncWrite for GrpcStream {
         self.send_stream_window -= h2_len as i64;
         self.send_conn_window -= h2_len as i64;
         self.write_queue.extend(frame);
-        match self.drain_write_queue(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(chunk_len)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => {
-                self.pending_accepted = Some(chunk_len);
-                Poll::Pending
-            }
-        }
+        Poll::Ready(Ok(chunk_len))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -818,507 +823,4 @@ impl AsyncWrite for GrpcStream {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    fn transport_node(port: u16) -> Node {
-        Node {
-            name: "transport-node".into(),
-            address: format!("127.0.0.1:{port}"),
-            host: "127.0.0.1".into(),
-            port,
-            outbound: honk_config::node::OutboundConfig::Trojan(Default::default()),
-            ..Default::default()
-        }
-    }
-
-    /// An inner stream that yields at most one byte per poll_read and
-    /// accepts at most one byte per poll_write — the short-IO regression
-    /// case for gRPC framing.
-    #[derive(Debug)]
-    struct DribbleStream {
-        reader: std::collections::VecDeque<u8>,
-        written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-    }
-
-    impl tokio::io::AsyncRead for DribbleStream {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            if let Some(b) = self.reader.pop_front() {
-                buf.put_slice(&[b]);
-            }
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    impl tokio::io::AsyncWrite for DribbleStream {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
-            if buf.is_empty() {
-                return Poll::Ready(Ok(0));
-            }
-            self.written.lock().unwrap().push(buf[0]);
-            Poll::Ready(Ok(1))
-        }
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[tokio::test]
-    async fn test_grpc_stream_tolerates_short_reads_and_writes() {
-        // One gRPC DATA frame on stream 1: [9B h2 hdr][5B length prefix]
-        // [protobuf envelope: 0a <len> "pong"].
-        let mut wire = Vec::new();
-        wire.extend_from_slice(&[0, 0, 11, H2_DATA, 0, 0, 0, 0, 1]);
-        wire.extend_from_slice(&[0, 0, 0, 0, 6, 0x0a, 0x04]);
-        wire.extend_from_slice(b"pong");
-        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let inner = DribbleStream {
-            reader: wire.into(),
-            written: written.clone(),
-        };
-        let mut stream = GrpcStream {
-            inner: Box::new(inner),
-            stream_id: 1,
-            read_buf: Vec::new(),
-            undecoded: Vec::new(),
-            msg_buf: Vec::new(),
-            write_queue: std::collections::VecDeque::new(),
-            send_stream_window: H2_DEFAULT_WINDOW,
-            send_conn_window: H2_DEFAULT_WINDOW,
-            peer_initial_window: H2_DEFAULT_WINDOW,
-            peer_max_frame: H2_DEFAULT_MAX_FRAME,
-            recv_unacked: 0,
-            pending_accepted: None,
-            control_pending: false,
-            stream_eof: false,
-            end_stream_sent: false,
-        };
-
-        // Read: the frame arrives one byte at a time but must decode whole.
-        let mut out = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut out)
-            .await
-            .unwrap();
-        assert_eq!(&out, b"pong");
-
-        // Write: the frame leaves one byte at a time but must be complete.
-        tokio::io::AsyncWriteExt::write_all(&mut stream, b"ping")
-            .await
-            .unwrap();
-        tokio::io::AsyncWriteExt::flush(&mut stream).await.unwrap();
-        let got = written.lock().unwrap().clone();
-        let mut want = Vec::new();
-        want.extend_from_slice(&[0, 0, 11, H2_DATA, 0, 0, 0, 0, 1]);
-        want.extend_from_slice(&[0, 0, 0, 0, 6, 0x0a, 0x04]);
-        want.extend_from_slice(b"ping");
-        assert_eq!(got, want);
-    }
-
-    /// WebSocket transport: the mock server verifies the upgrade request
-    /// (path + Host header) and echoes one binary message.
-    // The accept callback's Result type (and its large Err variant) is
-    // dictated by tungstenite's `Callback` trait.
-    #[allow(clippy::result_large_err)]
-    #[tokio::test]
-    async fn test_ws_transport_roundtrip() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
-
-        let server = tokio::spawn(async move {
-            use futures_util::{SinkExt, StreamExt};
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut seen_tx = Some(seen_tx);
-            let callback = |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                            resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                let host = req
-                    .headers()
-                    .get("host")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string);
-                if let Some(tx) = seen_tx.take() {
-                    let _ = tx.send((req.uri().path().to_string(), host));
-                }
-                Ok(resp)
-            };
-            let mut ws = tokio_tungstenite::accept_hdr_async(stream, callback)
-                .await
-                .unwrap();
-            let msg = ws.next().await.unwrap().unwrap();
-            assert_eq!(&msg.into_data()[..], b"ping");
-            ws.send(tokio_tungstenite::tungstenite::Message::Binary(
-                b"pong".to_vec().into(),
-            ))
-            .await
-            .unwrap();
-        });
-
-        let mut node = transport_node(port);
-        let transport = node.transport_mut().unwrap();
-        transport.transport = "ws".into();
-        transport.ws_path = Some("/ws-path".into());
-        transport.ws_host = Some("cdn.example.com".into());
-
-        let mut stream = connect_transport(&node, std::time::Duration::from_secs(3))
-            .await
-            .unwrap();
-        stream.write_all(b"ping").await.unwrap();
-        stream.flush().await.unwrap();
-
-        let mut buf = [0u8; 4];
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            stream.read_exact(&mut buf),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(&buf, b"pong");
-
-        let (path, host) = seen_rx.await.unwrap();
-        assert_eq!(path, "/ws-path");
-        assert_eq!(host.as_deref(), Some("cdn.example.com"));
-
-        server.await.unwrap();
-    }
-
-    #[allow(clippy::result_large_err)]
-    #[tokio::test]
-    async fn vmess_json_empty_ws_host_uses_endpoint_in_handshake() {
-        use base64::Engine as _;
-
-        let payload = r#"{
-            "add": "example.invalid",
-            "port": 443,
-            "id": "00000000-0000-0000-0000-000000000001",
-            "net": "ws",
-            "host": "",
-            "path": "/ws"
-        }"#;
-        let link = format!(
-            "vmess://{}",
-            base64::engine::general_purpose::STANDARD.encode(payload),
-        );
-        let node = Node::from_share_link(&link).unwrap();
-        let (client, server) = tokio::io::duplex(4096);
-        let receive = async {
-            let mut host = None;
-            let callback = |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                            response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                host = request.headers().get("host").cloned();
-                Ok(response)
-            };
-            let _connection = tokio_tungstenite::accept_hdr_async(server, callback)
-                .await
-                .unwrap();
-            host.unwrap()
-        };
-        let (stream, host) = tokio::join!(wrap_ws(&node, Box::new(client)), receive);
-        let _stream = stream.unwrap();
-        assert_eq!(host, "example.invalid");
-    }
-
-    async fn decoded_grpc_headers(service_len: usize, authority: &str) -> (String, String) {
-        let mut node = transport_node(443);
-        node.host = authority.to_owned();
-        node.transport_mut().unwrap().grpc_service = Some("s".repeat(service_len));
-        let (client, server) = tokio::io::duplex(4096);
-        let receive = async {
-            let mut connection = h2::server::handshake(server).await.unwrap();
-            let request = connection.accept().await.expect("gRPC request");
-            assert!(request.is_ok(), "invalid gRPC headers: {request:?}");
-            let (request, _) = request.unwrap();
-            assert_eq!(request.headers()["content-type"], "application/grpc");
-            assert_eq!(request.headers()["te"], "trailers");
-            assert_eq!(request.headers()["user-agent"], "honk");
-            (
-                request.uri().path().to_owned(),
-                request.uri().authority().unwrap().as_str().to_owned(),
-            )
-        };
-        let (stream, headers) = tokio::join!(wrap_grpc(&node, Box::new(client)), receive);
-        stream.unwrap();
-        headers
-    }
-
-    #[tokio::test]
-    async fn test_grpc_hpack_path_length_200() {
-        let (path, _) = decoded_grpc_headers(195, "example.com").await;
-        assert_eq!(path.len(), 200);
-        assert_eq!(path, format!("/{}/Tun", "s".repeat(195)));
-    }
-
-    #[tokio::test]
-    async fn test_grpc_hpack_path_length_127_boundary() {
-        let (path, _) = decoded_grpc_headers(122, "example.com").await;
-        assert_eq!(path.len(), 127);
-        assert_eq!(path, format!("/{}/Tun", "s".repeat(122)));
-    }
-
-    #[tokio::test]
-    async fn test_grpc_hpack_authority_length_300() {
-        let authority = "a".repeat(300);
-        let (_, decoded) = decoded_grpc_headers(1, &authority).await;
-        assert_eq!(decoded, authority);
-    }
-
-    /// gRPC transport: the mock server verifies the HTTP/2 preface, the
-    /// client SETTINGS frame, the HEADERS frame (path, content-type,
-    /// authority) and the DATA+gRPC-LP framing in both directions.
-    #[tokio::test]
-    async fn test_grpc_transport_roundtrip() {
-        const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-
-            // HTTP/2 connection preface.
-            let mut preface = [0u8; 24];
-            stream.read_exact(&mut preface).await.unwrap();
-            assert_eq!(&preface, H2_PREFACE);
-
-            // Client SETTINGS frame: INITIAL_WINDOW_SIZE = 2^31 - 1.
-            let (len, ty, sid) = read_h2_header(&mut stream).await;
-            assert_eq!((len, ty, sid), (6, H2_SETTINGS, 0));
-            let mut payload = vec![0u8; len as usize];
-            stream.read_exact(&mut payload).await.unwrap();
-            assert_eq!(&payload[..2], &[0, 4]);
-            assert_eq!(
-                u32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]),
-                0x7FFF_FFFF
-            );
-
-            // Connection-level WINDOW_UPDATE: 65535 + inc = 2^31 - 1.
-            let (len, ty, sid) = read_h2_header(&mut stream).await;
-            assert_eq!((len, ty, sid), (4, H2_WINDOW_UPDATE, 0));
-            let mut payload = vec![0u8; 4];
-            stream.read_exact(&mut payload).await.unwrap();
-            assert_eq!(
-                u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]),
-                0x7FFF_FFFF - 65535
-            );
-
-            // HEADERS frame opening stream 1.
-            let (len, ty, sid) = read_h2_header(&mut stream).await;
-            assert_eq!(ty, H2_HEADERS);
-            assert_eq!(sid, 1);
-            let mut payload = vec![0u8; len as usize];
-            stream.read_exact(&mut payload).await.unwrap();
-            let payload = String::from_utf8_lossy(&payload);
-            assert!(payload.contains("/testSvc/Tun"));
-            assert!(payload.contains("application/grpc"));
-            assert!(payload.contains("127.0.0.1"));
-
-            // DATA frame carrying one gRPC message "hello".
-            let (len, ty, sid) = read_h2_header(&mut stream).await;
-            assert_eq!(ty, H2_DATA);
-            assert_eq!(sid, 1);
-            assert_eq!(len, 5 + 7);
-            let mut frame = vec![0u8; len as usize];
-            stream.read_exact(&mut frame).await.unwrap();
-            assert_eq!(frame[0], 0x00); // uncompressed
-            assert_eq!(&frame[1..5], &[0, 0, 0, 7]);
-            assert_eq!(&frame[5..7], &[0x0a, 0x05]); // protobuf bytes field
-            assert_eq!(&frame[7..], b"hello");
-
-            // Reply with one DATA frame carrying a gRPC message "world",
-            // coalesced into a single write so the client's single-poll
-            // reads observe complete frames.
-            let h2_len: u32 = 5 + 7;
-            let mut reply = Vec::new();
-            reply.extend_from_slice(&[
-                (h2_len >> 16) as u8,
-                (h2_len >> 8) as u8,
-                h2_len as u8,
-                H2_DATA,
-                0x00,
-                0,
-                0,
-                0,
-                1,
-            ]);
-            reply.push(0x00); // uncompressed
-            reply.extend_from_slice(&7u32.to_be_bytes());
-            reply.extend_from_slice(&[0x0a, 0x05]);
-            reply.extend_from_slice(b"world");
-            stream.write_all(&reply).await.unwrap();
-        });
-
-        let mut node = transport_node(port);
-        let transport = node.transport_mut().unwrap();
-        transport.transport = "grpc".into();
-        transport.grpc_service = Some("testSvc".into());
-
-        let mut stream = connect_transport(&node, std::time::Duration::from_secs(3))
-            .await
-            .unwrap();
-        stream.write_all(b"hello").await.unwrap();
-        stream.flush().await.unwrap();
-
-        let mut buf = [0u8; 5];
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            stream.read_exact(&mut buf),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(&buf, b"world");
-
-        server.await.unwrap();
-    }
-
-    /// gRPC flow control: the server's SETTINGS_INITIAL_WINDOW_SIZE
-    /// applies to the already-open stream by delta; with a zero window the
-    /// client must hold DATA frames until a WINDOW_UPDATE arrives, and
-    /// poll_shutdown must emit an empty END_STREAM DATA frame.
-    #[tokio::test]
-    async fn test_grpc_transport_send_window_and_end_stream() {
-        let (client_side, mut server_side) = tokio::io::duplex(8192);
-        let mut stream = GrpcStream {
-            inner: Box::new(client_side),
-            stream_id: 1,
-            read_buf: Vec::new(),
-            undecoded: Vec::new(),
-            msg_buf: Vec::new(),
-            write_queue: std::collections::VecDeque::new(),
-            send_stream_window: H2_DEFAULT_WINDOW,
-            send_conn_window: H2_DEFAULT_WINDOW,
-            peer_initial_window: H2_DEFAULT_WINDOW,
-            peer_max_frame: H2_DEFAULT_MAX_FRAME,
-            recv_unacked: 0,
-            pending_accepted: None,
-            control_pending: false,
-            stream_eof: false,
-            end_stream_sent: false,
-        };
-
-        // Shrink the open stream's send window to zero.
-        let mut settings = Vec::new();
-        push_frame_header(&mut settings, 6, H2_SETTINGS, 0, 0);
-        settings.extend_from_slice(&[0, 4]);
-        settings.extend_from_slice(&0u32.to_be_bytes());
-        server_side.write_all(&settings).await.unwrap();
-
-        // Drive one read so the client processes the SETTINGS before the
-        // write attempt (frame parsing is read-driven by design).
-        let mut sink = [0u8; 16];
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            stream.read(&mut sink),
-        )
-        .await;
-
-        // The write must stall while the window is zero.
-        let stalled = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
-            stream.write_all(b"hello"),
-        )
-        .await;
-        assert!(stalled.is_err(), "client wrote with a zero window");
-
-        // Grant stream + connection window; the stalled write proceeds.
-        let mut grant = Vec::new();
-        push_frame_header(&mut grant, 4, H2_WINDOW_UPDATE, 0, 1);
-        grant.extend_from_slice(&2048u32.to_be_bytes());
-        push_frame_header(&mut grant, 4, H2_WINDOW_UPDATE, 0, 0);
-        grant.extend_from_slice(&2048u32.to_be_bytes());
-        server_side.write_all(&grant).await.unwrap();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            stream.write_all(b"hello"),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        // Wire order: the SETTINGS ACK the client queued while stalled,
-        // then the DATA frame.
-        let mut got = vec![0u8; 9 + 9 + 12];
-        server_side.read_exact(&mut got).await.unwrap();
-        assert_eq!(&got[..9], &[0, 0, 0, H2_SETTINGS, H2_FLAG_ACK, 0, 0, 0, 0]);
-        let data = &got[9..];
-        assert_eq!(&data[..9], &[0, 0, 12, H2_DATA, 0, 0, 0, 0, 1]);
-        assert_eq!(&data[9 + 7..], b"hello");
-
-        // poll_shutdown queues an empty DATA frame with END_STREAM.
-        tokio::time::timeout(std::time::Duration::from_secs(2), stream.shutdown())
-            .await
-            .unwrap()
-            .unwrap();
-        let mut end = [0u8; 9];
-        server_side.read_exact(&mut end).await.unwrap();
-        assert_eq!(&end, &[0, 0, 0, H2_DATA, H2_FLAG_END_STREAM, 0, 0, 0, 1]);
-    }
-
-    /// gRPC read side: the read window is topped up once the received DATA
-    /// crosses H2_WINDOW_REFRESH, as one stream-level and one
-    /// connection-level WINDOW_UPDATE.
-    #[tokio::test]
-    async fn test_grpc_transport_window_refresh() {
-        let mut stream = GrpcStream {
-            inner: Box::new(DribbleStream {
-                reader: Default::default(),
-                written: Default::default(),
-            }),
-            stream_id: 1,
-            read_buf: Vec::new(),
-            undecoded: Vec::new(),
-            msg_buf: Vec::new(),
-            write_queue: std::collections::VecDeque::new(),
-            send_stream_window: H2_DEFAULT_WINDOW,
-            send_conn_window: H2_DEFAULT_WINDOW,
-            peer_initial_window: H2_DEFAULT_WINDOW,
-            peer_max_frame: H2_DEFAULT_MAX_FRAME,
-            recv_unacked: 0,
-            pending_accepted: None,
-            control_pending: false,
-            stream_eof: false,
-            end_stream_sent: false,
-        };
-        let data_len = H2_WINDOW_REFRESH + 100;
-        let mut wire = Vec::new();
-        push_frame_header(&mut wire, data_len, H2_DATA, 0, 1);
-        wire.extend(std::iter::repeat_n(0u8, data_len as usize));
-        stream.undecoded = wire;
-
-        assert!(stream.try_parse_frame());
-        assert_eq!(stream.msg_buf.len(), data_len as usize);
-        let mut expect = Vec::new();
-        for sid in [1, 0] {
-            push_frame_header(&mut expect, 4, H2_WINDOW_UPDATE, 0, sid);
-            expect.extend_from_slice(&data_len.to_be_bytes());
-        }
-        assert_eq!(
-            stream.write_queue.make_contiguous(),
-            &expect,
-            "one WINDOW_UPDATE pair topping up the received bytes"
-        );
-        assert!(stream.control_pending);
-    }
-
-    /// Read one HTTP/2 frame header: returns (payload_len, type, stream_id).
-    async fn read_h2_header(stream: &mut tokio::net::TcpStream) -> (u32, u8, u32) {
-        let mut hdr = [0u8; 9];
-        stream.read_exact(&mut hdr).await.unwrap();
-        let len = ((hdr[0] as u32) << 16) | ((hdr[1] as u32) << 8) | hdr[2] as u32;
-        let ty = hdr[3];
-        let sid = u32::from_be_bytes([hdr[5] & 0x7F, hdr[6], hdr[7], hdr[8]]);
-        (len, ty, sid)
-    }
-}
+mod tests;

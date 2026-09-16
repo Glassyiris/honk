@@ -44,6 +44,45 @@ async fn caller_cancel_does_not_stop_shared_dial() {
     assert_eq!(pool.pool.lock().dial_failures, 0);
 }
 
+#[tokio::test(start_paused = true)]
+async fn shared_dial_waiters_preserve_typed_capacity_rejection() {
+    let pool = Arc::new(pool(SessionPoolConfig::default()));
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    let leader_pool = Arc::clone(&pool);
+    let leader = tokio::spawn(async move {
+        leader_pool
+            .offer(move || async move {
+                blocked.await.unwrap();
+                Err(anyhow::Error::new(crate::proxy::PacketRejection::Capacity))
+            })
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let waiter_pool = Arc::clone(&pool);
+    let waiter = tokio::spawn(async move {
+        waiter_pool
+            .offer(|| async { unreachable!("waiter must share the in-flight dial") })
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    release.send(()).unwrap();
+
+    for result in [leader.await.unwrap(), waiter.await.unwrap()] {
+        let error = result.unwrap_err();
+        assert!(error.chain().any(|cause| matches!(
+            cause.downcast_ref::<crate::proxy::PacketRejection>(),
+            Some(crate::proxy::PacketRejection::Capacity)
+        )));
+    }
+    assert_eq!(pool.pool.lock().dial_failures, 0);
+    assert!(pool.pool.lock().next_dial_at.is_none());
+    let session = pool
+        .offer(|| async { Ok(TestSession::new()) })
+        .await
+        .expect("released capacity must admit without a synthetic backoff");
+    assert!(!session.is_closed());
+}
+
 /// v2: a panicking dial surfaces as an internal failure to every
 /// waiter; the inflight entry clears and the next offer re-dials.
 #[tokio::test(start_paused = true)]
@@ -79,8 +118,8 @@ async fn dial_panic_wakes_waiters_and_reelects() {
     assert!(!session.is_closed());
 }
 
-/// Phase 1: shutdown aborts the in-flight dial (leader), wakes every
-/// waiter with PoolClosed, and rejects offers/inserts afterwards.
+/// Shutdown aborts the in-flight dial, wakes every waiter with PoolClosed,
+/// and rejects later offers.
 #[tokio::test(start_paused = true)]
 async fn shutdown_wakes_leader_and_waiters() {
     let pool = Arc::new(pool(SessionPoolConfig::default()));
@@ -107,15 +146,35 @@ async fn shutdown_wakes_leader_and_waiters() {
             .is_err(),
         "offers stay rejected after shutdown"
     );
-    let s = TestSession::new();
-    pool.insert(&s);
-    assert!(
-        s.closed.load(Ordering::Relaxed),
-        "insert after shutdown closes the session"
-    );
-    assert!(
-        !pool.has_usable_session(),
-        "a shutdown pool cannot retain a late session insertion"
+}
+
+#[tokio::test]
+async fn shutdown_during_dial_factory_never_polls_dial() {
+    let pool = Arc::new(pool(SessionPoolConfig::default()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (dial_lifetime, discarded) = tokio::sync::oneshot::channel::<()>();
+    let result = pool
+        .offer({
+            let pool = Arc::clone(&pool);
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                pool.shutdown();
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    drop(dial_lifetime);
+                    Ok(TestSession::new())
+                }
+            }
+        })
+        .await;
+
+    assert!(result.is_err());
+    let _ = discarded.await;
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "the factory must run, but shutdown must prevent polling its dial future"
     );
 }
 
@@ -218,6 +277,127 @@ async fn warm_retention_pins_one_idle_session_until_release() {
         session.is_closed(),
         "unpin restores the configured zero floor"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn warm_unpin_wakes_waiters_without_cutting_live_children() {
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+        max_sessions: 1,
+        max_streams_per_session: 1,
+        ..Default::default()
+    }));
+    let old = ReservedTestSession::new(1);
+    pool.insert(&old);
+    let held = pool
+        .open_with(
+            || async { unreachable!("seeded carrier must be reused") },
+            |_session, permit| async { Ok::<_, OpenError>(permit) },
+        )
+        .await
+        .unwrap();
+    pool.set_warm_retained(true);
+    let mut normal = std::pin::pin!(pool.offer(|| async { Ok(ReservedTestSession::new(1)) }));
+    let mut speculative = std::pin::pin!(pool.checkout_speculative());
+    assert!(futures_util::poll!(normal.as_mut()).is_pending());
+    assert!(futures_util::poll!(speculative.as_mut()).is_pending());
+
+    pool.set_warm_retained(false);
+    assert_eq!(old.state(), SessionState::Draining);
+    assert_eq!(old.active_streams(), 1);
+    assert!(!old.is_closed());
+    let std::task::Poll::Ready(Ok(SpeculativeCheckout::Detached(reservation))) =
+        futures_util::poll!(speculative.as_mut())
+    else {
+        panic!("unpin stranded a speculative waiter behind a draining carrier");
+    };
+    let replacement = tokio::time::timeout(Duration::from_secs(1), normal)
+        .await
+        .expect("unpin stranded the normal offer")
+        .unwrap();
+    assert!(!Arc::ptr_eq(&replacement, &old));
+    assert_eq!(replacement.state(), SessionState::Active);
+    assert!(!old.is_closed());
+    drop(reservation);
+    drop(held);
+    pool.shutdown();
+}
+
+#[tokio::test(start_paused = true)]
+async fn manual_closed_pruning_wakes_capacity_waiters_without_reaping_idle_sessions() {
+    let pool = Arc::new(pool(SessionPoolConfig {
+        max_sessions: 1,
+        max_streams_per_session: 1,
+        ..Default::default()
+    }));
+    let old = TestSession::new();
+    old.streams.store(1, Ordering::Relaxed);
+    pool.insert(&old);
+    let mut normal = std::pin::pin!(pool.offer(|| async { Ok(TestSession::new()) }));
+    let mut speculative = std::pin::pin!(pool.checkout_speculative());
+    assert!(futures_util::poll!(normal.as_mut()).is_pending());
+    assert!(futures_util::poll!(speculative.as_mut()).is_pending());
+
+    old.close();
+    assert_eq!(pool.reap_unretained_idle(), 0);
+    let SpeculativeCheckout::Detached(reservation) =
+        tokio::time::timeout(Duration::from_secs(1), speculative)
+            .await
+            .expect("closed pruning stranded the speculative checkout")
+            .unwrap()
+    else {
+        panic!("closed pruning must release a carrier slot");
+    };
+    let replacement = tokio::time::timeout(Duration::from_secs(1), normal)
+        .await
+        .expect("closed pruning stranded the normal offer")
+        .unwrap();
+    assert!(!Arc::ptr_eq(&replacement, &old));
+    assert_eq!(replacement.state(), SessionState::Active);
+    drop(reservation);
+    pool.shutdown();
+}
+
+#[tokio::test(start_paused = true)]
+async fn janitor_preserves_and_replenishes_warm_carriers_while_old_streams_drain() {
+    let pool = Arc::new(pool(SessionPoolConfig {
+        janitor_interval: Duration::from_secs(1),
+        ..Default::default()
+    }));
+    let old = TestSession::new();
+    old.streams.store(1, Ordering::Relaxed);
+    old.begin_drain();
+    let replacement = TestSession::new();
+    pool.insert(&old);
+    pool.insert(&replacement);
+    pool.set_warm_retained(true);
+    let rewarmed = TestSession::new();
+    pool.ensure_janitor(0, Duration::from_secs(2), {
+        let rewarmed = Arc::clone(&rewarmed);
+        move || {
+            let rewarmed = Arc::clone(&rewarmed);
+            async move { Ok(rewarmed) }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let offered = pool
+        .offer(|| async { anyhow::bail!("warm replacement must avoid redial") })
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&offered, &replacement));
+    assert!(!old.is_closed(), "the old live stream must survive reaping");
+
+    replacement.streams.store(1, Ordering::Relaxed);
+    replacement.begin_drain();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let offered = pool
+        .offer(|| async { anyhow::bail!("janitor must restore a reusable warm carrier") })
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&offered, &rewarmed));
+    assert!(!old.is_closed());
+    assert!(!replacement.is_closed());
+    pool.shutdown();
 }
 
 /// v2 max-age: past the jittered deadline the session drains (no new
@@ -452,4 +632,42 @@ async fn shutdown_after_retirement_force_closes_live_sessions() {
 
     assert!(session.is_closed());
     assert_eq!(pool.metrics().sessions, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn max_age_drain_wakes_waiters_with_live_children() {
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+        max_sessions: 1,
+        max_streams_per_session: 1,
+        max_session_age: Some(Duration::from_secs(60)),
+        janitor_interval: Duration::from_secs(5),
+        ..Default::default()
+    }));
+    let old = ReservedTestSession::new(1);
+    pool.insert(&old);
+    let held = pool
+        .open_with(
+            || async { unreachable!("seeded carrier must be reused") },
+            |_session, permit| async { Ok::<_, OpenError>(permit) },
+        )
+        .await
+        .unwrap();
+    pool.ensure_janitor(0, Duration::from_secs(3600), || async {
+        unreachable!("zero standby floor must not prewarm")
+    });
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let mut waiting = std::pin::pin!(pool.offer(|| async { Ok(ReservedTestSession::new(1)) }));
+    assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+    tokio::time::sleep(Duration::from_secs(80)).await;
+    let replacement = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("age drain stranded a waiter behind a live old child")
+        .unwrap();
+    assert!(!Arc::ptr_eq(&replacement, &old));
+    assert_eq!(old.state(), SessionState::Draining);
+    assert_eq!(old.active_streams(), 1);
+    assert!(!old.is_closed());
+    assert_eq!(replacement.state(), SessionState::Active);
+    drop(held);
+    pool.shutdown();
 }

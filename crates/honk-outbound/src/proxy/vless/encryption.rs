@@ -21,8 +21,8 @@ use parking_lot::RwLock;
 use rand::{Rng as _, RngExt as _};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use super::AsyncReadWrite;
-use super::shadowsocks::AeadCipher;
+use crate::proxy::AsyncReadWrite;
+use crate::proxy::shadowsocks::AeadCipher;
 
 const X25519_KEY_LEN: usize = 32;
 const MLKEM_PUBLIC_KEY_LEN: usize = 1184;
@@ -681,6 +681,10 @@ pub(crate) struct EncryptedStream {
     read_plaintext: Vec<u8>,
     read_plaintext_offset: usize,
     read_eof: bool,
+    direct_read: bool,
+    direct_xor_header: [u8; FRAME_HEADER_LEN],
+    direct_xor_header_len: usize,
+    direct_xor_skip: usize,
     ticket_use: Option<TicketUse>,
 }
 
@@ -722,6 +726,10 @@ impl EncryptedStream {
             read_plaintext: Vec::new(),
             read_plaintext_offset: 0,
             read_eof: false,
+            direct_read: false,
+            direct_xor_header: [0; FRAME_HEADER_LEN],
+            direct_xor_header_len: 0,
+            direct_xor_skip: 0,
             ticket_use,
         }
     }
@@ -794,6 +802,73 @@ impl EncryptedStream {
             self.read_plaintext_offset = 0;
         }
         true
+    }
+
+    /// Bypass Encryption framing after an authenticated Vision Direct command.
+    /// Pending authenticated plaintext remains ahead of the underlying outer
+    /// transport, and random mode keeps XORing only each TLS-like header.
+    pub(super) fn poll_direct_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if output.remaining() == 0 || self.copy_plaintext(output) {
+            return Poll::Ready(Ok(()));
+        }
+        if !self.direct_read {
+            if !matches!(self.read_phase, ReadPhase::Header) || self.read_offset != 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "VLESS Encryption Direct switch outside a frame boundary",
+                )));
+            }
+            self.direct_read = true;
+        }
+
+        let start = output.filled().len();
+        let poll = Pin::new(&mut *self.inner).poll_read(cx, output);
+        if let Poll::Ready(Ok(())) = &poll {
+            let end = output.filled().len();
+            self.apply_direct_xor(&mut output.filled_mut()[start..end]);
+        }
+        poll
+    }
+
+    // Xray unwraps CommonConn at Direct but deliberately leaves XorConn in place.
+    fn apply_direct_xor(&mut self, data: &mut [u8]) {
+        let Some(xor) = self.recv_xor.as_mut() else {
+            return;
+        };
+        let mut offset = 0;
+        while offset < data.len() {
+            if self.direct_xor_skip > 0 {
+                let count = self.direct_xor_skip.min(data.len() - offset);
+                self.direct_xor_skip -= count;
+                offset += count;
+                continue;
+            }
+
+            let count = (FRAME_HEADER_LEN - self.direct_xor_header_len).min(data.len() - offset);
+            xor.apply(&mut data[offset..offset + count]);
+            self.direct_xor_header[self.direct_xor_header_len..self.direct_xor_header_len + count]
+                .copy_from_slice(&data[offset..offset + count]);
+            self.direct_xor_header_len += count;
+            offset += count;
+
+            if self.direct_xor_header_len == FRAME_HEADER_LEN {
+                let length =
+                    u16::from_be_bytes([self.direct_xor_header[3], self.direct_xor_header[4]])
+                        as usize;
+                self.direct_xor_skip = if self.direct_xor_header[..3] == [23, 3, 3]
+                    && (TAG_LEN + 1..=MAX_FRAME_CIPHERTEXT).contains(&length)
+                {
+                    length
+                } else {
+                    0
+                };
+                self.direct_xor_header_len = 0;
+            }
+        }
     }
 
     fn invalidate_ticket(&mut self) {
@@ -1261,174 +1336,4 @@ mod raw_blake3 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn raw_context_derive_matches_blake3_for_utf8_context() {
-        let context = b"VLESS";
-        let material = b"shared secret";
-        assert_eq!(
-            derive_key(context, material),
-            blake3::derive_key(std::str::from_utf8(context).unwrap(), material)
-        );
-    }
-
-    #[test]
-    fn parses_x25519_config_and_padding() {
-        let key = URL_SAFE_NO_PAD.encode([7u8; 32]);
-        let config = ClientConfig::parse(&format!(
-            "mlkem768x25519plus.xorpub.0rtt.100-111-1111.75-0-111.50-0-3333.{key}"
-        ))
-        .unwrap();
-        assert_eq!(config.auth_keys.len(), 1);
-        assert_eq!(config.mode, XorMode::XorPub);
-        assert!(config.allow_0rtt);
-        assert_eq!(
-            config.padding_lengths,
-            vec![
-                PaddingSpec {
-                    probability: 100,
-                    min: 111,
-                    max: 1111
-                },
-                PaddingSpec {
-                    probability: 50,
-                    min: 0,
-                    max: 3333
-                }
-            ]
-        );
-        assert_eq!(
-            config.padding_gaps,
-            vec![PaddingSpec {
-                probability: 75,
-                min: 0,
-                max: 111
-            }]
-        );
-    }
-
-    #[test]
-    fn rejects_missing_or_malformed_keys_and_padding() {
-        assert!(ClientConfig::parse("mlkem768x25519plus.native.1rtt").is_err());
-        assert!(ClientConfig::parse("mlkem768x25519plus.native.1rtt.not-a-key").is_err());
-        let key = URL_SAFE_NO_PAD.encode([7u8; 32]);
-        assert!(
-            ClientConfig::parse(&format!("mlkem768x25519plus.native.1rtt.50-1-2.{key}")).is_err()
-        );
-    }
-
-    #[test]
-    fn xor_stream_round_trips_across_segments() {
-        let material = [9u8; 96];
-        let iv = [4u8; 16];
-        let mut encrypted = [1u8; 97];
-        let original = encrypted;
-        let mut sender = AesCtr::new(&material, &iv);
-        sender.apply(&mut encrypted[..31]);
-        sender.apply(&mut encrypted[31..]);
-        let mut receiver = AesCtr::new(&material, &iv);
-        receiver.apply(&mut encrypted);
-        assert_eq!(encrypted, original);
-    }
-
-    #[tokio::test]
-    async fn frame_codec_round_trips_large_payload() {
-        let key = vec![11u8; 96];
-        let (client_io, server_io) = tokio::io::duplex(4096);
-        let mut client = EncryptedStream::new(
-            Box::new(client_io),
-            key.clone(),
-            true,
-            StreamAead::new(b"client", &key, true).unwrap(),
-            Some(StreamAead::new(b"server", &key, true).unwrap()),
-            None,
-            None,
-            None,
-            PeerInit::Ready,
-            None,
-            false,
-        );
-        let mut server = EncryptedStream::new(
-            Box::new(server_io),
-            key.clone(),
-            true,
-            StreamAead::new(b"server", &key, true).unwrap(),
-            Some(StreamAead::new(b"client", &key, true).unwrap()),
-            None,
-            None,
-            None,
-            PeerInit::Ready,
-            None,
-            false,
-        );
-        let payload = vec![0x5a; MAX_FRAME_PLAINTEXT * 2 + 321];
-        let expected = payload.clone();
-        let server_task = tokio::spawn(async move {
-            let mut received = vec![0; expected.len()];
-            server.read_exact(&mut received).await.unwrap();
-            assert_eq!(received, expected);
-            server.write_all(b"reply").await.unwrap();
-            server.shutdown().await.unwrap();
-        });
-        client.write_all(&payload).await.unwrap();
-        client.flush().await.unwrap();
-        let mut reply = Vec::new();
-        client.read_to_end(&mut reply).await.unwrap();
-        assert_eq!(reply, b"reply");
-        server_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    #[ignore = "requires HONK_VLESS_ENCRYPTION_SERVER and an Xray VLESS Encryption server"]
-    async fn xray_interop_covers_1rtt_then_0rtt() {
-        use honk_config::node::Node;
-
-        use crate::proxy::TcpOutbound as _;
-
-        let server: std::net::SocketAddr = std::env::var("HONK_VLESS_ENCRYPTION_SERVER")
-            .expect("HONK_VLESS_ENCRYPTION_SERVER")
-            .parse()
-            .unwrap();
-        let target: std::net::SocketAddr = std::env::var("HONK_VLESS_ENCRYPTION_TARGET")
-            .expect("HONK_VLESS_ENCRYPTION_TARGET")
-            .parse()
-            .unwrap();
-        let encryption =
-            std::env::var("HONK_VLESS_ENCRYPTION_CONFIG").expect("HONK_VLESS_ENCRYPTION_CONFIG");
-        let node = Node {
-            name: "xray-vless-encryption".into(),
-            address: server.to_string(),
-            host: server.ip().to_string(),
-            port: server.port(),
-            outbound: honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
-                uuid: Some("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3".into()),
-                encryption: Some(encryption),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let handler = crate::proxy::vless::VLessHandler::new();
-        for payload in [b"first-1rtt".as_slice(), b"second-0rtt".as_slice()] {
-            let mut stream = tokio::time::timeout(
-                Duration::from_secs(10),
-                handler.dial(&node, target, None, Duration::from_secs(3)),
-            )
-            .await
-            .expect("VLESS Encryption dial timed out")
-            .unwrap();
-            let echoed = tokio::time::timeout(Duration::from_secs(10), async {
-                stream.stream.write_all(payload).await?;
-                stream.stream.flush().await?;
-                let mut echoed = vec![0; payload.len()];
-                stream.stream.read_exact(&mut echoed).await?;
-                Ok::<_, io::Error>(echoed)
-            })
-            .await
-            .expect("VLESS Encryption relay timed out")
-            .unwrap();
-            assert_eq!(echoed, payload);
-        }
-    }
-}
+mod tests;

@@ -1206,6 +1206,18 @@ jobs:
       - run: cargo check -p honk-core --no-default-features --features clash-api
       - run: cargo check -p honk-core --no-default-features --features ebpf
       - run: cargo check -p honk-tool
+      - name: Test outbound without rprx
+        run: |
+          set -euo pipefail
+          test_name=parsed_vless_has_no_backend_without_rprx
+          test "$(cargo test -p honk-outbound --no-default-features --test feature_boundary "$test_name" -- --exact --list --format terse)" = "$test_name: test"
+          cargo test -p honk-outbound --no-default-features --test feature_boundary
+      - name: Test toolbox without rprx
+        run: |
+          set -euo pipefail
+          test_name=sub::tests::unavailable_vless_handler_refuses_before_target_resolution
+          test "$(cargo test -p honk-tool --no-default-features --bin honk-tool "$test_name" -- --exact --list --format terse)" = "$test_name: test"
+          cargo test -p honk-tool --no-default-features
       - name: Write feature-set CI report
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0

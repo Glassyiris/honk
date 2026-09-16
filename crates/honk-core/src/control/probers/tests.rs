@@ -325,15 +325,14 @@ async fn c27_udp_rejects_invalid_nodes_without_data_path() {
             Arc::new(registry),
             generation,
             Arc::new(StatsManager::new()),
-            target,
-            target.into(),
+            UdpDnsProbeTarget::new(vec![target.to_string()], None),
             None,
             manager,
         );
         let result = prober
             .probe_udp(&node.name, Duration::from_millis(50))
             .await;
-        assert!(result.dns.is_err());
+        assert!(matches!(result.dns, Some(Err(_))));
         assert!(result.data_path.is_none());
         assert!(
             captured.lock().unwrap().is_none(),
@@ -343,26 +342,69 @@ async fn c27_udp_rejects_invalid_nodes_without_data_path() {
 }
 
 #[tokio::test]
-async fn c27_legacy_factories_fail_fast_on_invalid_nodes() {
-    for node in invalid_probe_nodes() {
-        assert!(
-            std::panic::catch_unwind(|| { honk_outbound::runtime::NodeRuntime::ephemeral(&node) })
-                .is_err()
+async fn udp_capability_and_policy_gates_skip_target_resolution_and_health_feedback() {
+    for udp_disabled in [false, true] {
+        let mut node = udp_test_node();
+        node.name = "vision-vless".into();
+        node.outbound = honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
+            uuid: Some("00000000-0000-4000-8000-000000000001".into()),
+            network: udp_disabled.then(|| "tcp".into()),
+            flow: Some("xtls-rprx-vision".into()),
+            multiplex: honk_config::node::VlessMultiplex::xray(
+                -1,
+                -1,
+                honk_config::node::Udp443Policy::Reject,
+            ),
+            tls: honk_config::node::TlsOptions {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        node.id = node.derive_id();
+        let generation = Arc::new(parking_lot::RwLock::new(Arc::new(
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(&[udp_test_node()]).unwrap(),
+        )));
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let handler = Arc::new(UdpTestHandler {
+            mode: UdpTestMode::UdpCaptureTarget(captured.clone()),
+        });
+        let mut registry = ProxyRegistry::new();
+        registry.register(
+            honk_outbound::proxy::ProtocolEntry::new(node.protocol(), handler.clone())
+                .with_packet(handler),
         );
-        assert!(
-            std::panic::catch_unwind(|| {
-                honk_outbound::runtime::NodeRuntime::ephemeral_guarded(&node)
-            })
-            .is_err()
+        let config = Config {
+            nodes: vec![node.clone()],
+            ..Config::default()
+        };
+        let manager = Arc::new(parking_lot::RwLock::new(Arc::new(GroupManager::new(
+            &[],
+            std::slice::from_ref(&node),
+        ))));
+        let resolver: crate::outbound::ResolveHook = Arc::new(|_, _| {
+            panic!("policy-denied DNS target must not be resolved");
+        });
+        let prober = ProxyUdpProber::new(
+            Arc::new(RwLock::new(Arc::new(config))),
+            Arc::new(registry),
+            generation,
+            Arc::new(StatsManager::new()),
+            UdpDnsProbeTarget::new(vec!["denied.example:443".into()], Some(resolver.clone())),
+            Some(QuicScoreProbeTarget::new(
+                "https://denied.example/".into(),
+                Some(resolver),
+            )),
+            manager,
         );
-        let generation =
-            honk_outbound::runtime::OutboundRuntimeRegistry::build(&[udp_test_node()]).unwrap();
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                honk_outbound::urltest::probe_runtime(&generation, &node)
-            }))
-            .is_err()
-        );
+
+        let outcome = prober
+            .probe_udp(&node.name, Duration::from_millis(50))
+            .await;
+
+        assert!(outcome.dns.is_none());
+        assert!(outcome.data_path.is_none());
+        assert!(captured.lock().unwrap().is_none());
     }
 }
 
@@ -393,5 +435,82 @@ async fn c27_urltest_propagates_admission_before_dial() {
                 .is_some()
         );
         assert!(captured.lock().unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn quic_target_refusal_is_retried_by_later_udp_probe() {
+    use honk_outbound::proxy::PacketRejection;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for rejection in [PacketRejection::Policy, PacketRejection::Capacity] {
+        let node = udp_test_node();
+        let group = Group {
+            name: "score".into(),
+            policy: GroupPolicy::Score,
+            nodes: vec![node.id],
+            ..Default::default()
+        };
+        let manager = Arc::new(parking_lot::RwLock::new(Arc::new(GroupManager::new(
+            std::slice::from_ref(&group),
+            std::slice::from_ref(&node),
+        ))));
+        let generation = Arc::new(parking_lot::RwLock::new(Arc::new(
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
+                .unwrap(),
+        )));
+        let dials = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(UdpTestHandler {
+            mode: UdpTestMode::CountDialError {
+                dials: dials.clone(),
+            },
+        });
+        let mut registry = ProxyRegistry::new();
+        registry
+            .register(ProtocolEntry::new(node.protocol(), handler.clone()).with_packet(handler));
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolver: crate::outbound::ResolveHook = {
+            let resolutions = resolutions.clone();
+            Arc::new(move |_, port| {
+                let attempt = resolutions.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if attempt < 2 {
+                        Err(anyhow::Error::new(rejection).context("target resolution refused"))
+                    } else {
+                        Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))])
+                    }
+                })
+            })
+        };
+        let target = QuicScoreProbeTarget::new("https://quic.example:9443/".into(), Some(resolver));
+        let error = target.resolve().await.err().expect("initial refusal");
+        assert!(honk_outbound::proxy::is_packet_rejection(&error));
+        let prober = ProxyUdpProber::new(
+            Arc::new(RwLock::new(Arc::new(Config {
+                nodes: vec![node.clone()],
+                groups: vec![group],
+                ..Default::default()
+            }))),
+            Arc::new(registry),
+            generation,
+            Arc::new(StatsManager::new()),
+            UdpDnsProbeTarget::new(vec!["127.0.0.1:53".into()], None),
+            Some(target),
+            manager,
+        );
+
+        let first = prober.probe_udp(&node.name, Duration::from_secs(1)).await;
+        let error = first
+            .data_path
+            .expect("refusal must propagate")
+            .unwrap_err();
+        assert!(honk_outbound::proxy::is_packet_rejection(&error));
+        assert_eq!(dials.load(Ordering::SeqCst), 1, "only DNS was dialed");
+
+        let second = prober.probe_udp(&node.name, Duration::from_secs(1)).await;
+        let error = second.data_path.expect("QUIC must be retried").unwrap_err();
+        assert!(!honk_outbound::proxy::is_packet_rejection(&error));
+        assert_eq!(resolutions.load(Ordering::SeqCst), 3);
+        assert_eq!(dials.load(Ordering::SeqCst), 3, "DNS and QUIC were dialed");
     }
 }

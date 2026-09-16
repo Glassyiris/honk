@@ -7,6 +7,7 @@ use super::addr;
 
 pub(crate) const MAGIC_ADDRESS: &str = "sp.v2.udp-over-tcp.arpa";
 pub(crate) const MAX_PACKET_SIZE: usize = u16::MAX as usize;
+#[cfg(any(feature = "rprx", test))]
 const MAX_BUFFERED_BYTES: usize = 2 * (2 + MAX_PACKET_SIZE);
 pub(crate) const V1_ATYP_V4: u8 = 0x00;
 pub(crate) const V1_ATYP_V6: u8 = 0x01;
@@ -87,10 +88,7 @@ pub(crate) fn encode_packet(data: &[u8], max_payload: usize) -> io::Result<Bytes
 
 pub(crate) fn validate_packet_len(data: &[u8], max_payload: usize) -> io::Result<()> {
     if data.len() > max_payload.min(MAX_PACKET_SIZE) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "UoT datagram exceeds transport capacity",
-        ));
+        return Err(super::PacketRejection::InvalidSize.into());
     }
     Ok(())
 }
@@ -134,21 +132,14 @@ pub(crate) fn copy_frame(
     Ok(payload_len)
 }
 
-pub(crate) struct Decoder<C = UotV2> {
+#[cfg(any(feature = "rprx", test))]
+#[derive(Default)]
+pub(crate) struct Decoder {
     buffered: BytesMut,
-    _codec: std::marker::PhantomData<fn() -> C>,
 }
 
-impl<C> Default for Decoder<C> {
-    fn default() -> Self {
-        Self {
-            buffered: BytesMut::new(),
-            _codec: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<C: UotCodec> Decoder<C> {
+#[cfg(any(feature = "rprx", test))]
+impl Decoder {
     pub(crate) fn push(&mut self, data: &[u8]) -> io::Result<()> {
         if self.buffered.len().saturating_add(data.len()) > MAX_BUFFERED_BYTES {
             return Err(io::Error::new(
@@ -161,7 +152,7 @@ impl<C: UotCodec> Decoder<C> {
     }
 
     pub(crate) fn next_packet(&mut self, output: &mut [u8]) -> io::Result<Option<usize>> {
-        let Some(frame) = C::frame_bounds(&self.buffered)? else {
+        let Some(frame) = UotV2::frame_bounds(&self.buffered)? else {
             return Ok(None);
         };
         copy_frame(&mut self.buffered, frame, output).map(Some)
@@ -186,7 +177,7 @@ mod tests {
         let frame = encode_packet(&payload, MAX_PACKET_SIZE).unwrap();
         assert!(encode_packet(&[0; 1], 0).is_err());
 
-        let mut decoder = Decoder::<UotV2>::default();
+        let mut decoder = Decoder::default();
         decoder.push(&frame[..123]).unwrap();
         assert!(decoder.next_packet(&mut []).unwrap().is_none());
         decoder.push(&frame[123..]).unwrap();
@@ -205,7 +196,7 @@ mod tests {
         let mut wire = BytesMut::new();
         wire.extend_from_slice(&encode_packet(b"first", MAX_PACKET_SIZE).unwrap());
         wire.extend_from_slice(&encode_packet(b"second", MAX_PACKET_SIZE).unwrap());
-        let mut decoder = Decoder::<UotV2>::default();
+        let mut decoder = Decoder::default();
         decoder.push(&wire).unwrap();
         let mut output = [0; 8];
         assert_eq!(decoder.next_packet(&mut output).unwrap(), Some(5));

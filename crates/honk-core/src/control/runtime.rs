@@ -157,7 +157,6 @@ pub(super) struct OutboundHealthPublisher {
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     config: Arc<RwLock<Arc<Config>>>,
     group_manager: SharedGroupManager,
-    outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
     alive_set: Arc<AliveDialerSet>,
 }
 
@@ -166,14 +165,12 @@ impl OutboundHealthPublisher {
         ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
         config: Arc<RwLock<Arc<Config>>>,
         group_manager: SharedGroupManager,
-        outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
         alive_set: Arc<AliveDialerSet>,
     ) -> Self {
         Self {
             ebpf,
             config,
             group_manager,
-            outbound_id_map,
             alive_set,
         }
     }
@@ -183,16 +180,6 @@ impl OutboundHealthPublisher {
         // pinned while waiting so a queued edge cannot update a recycled slot.
         let config = self.config.read().await;
         let mut backend = self.ebpf.write().await;
-        let Some(outbound_idx) = self.outbound_id_map.read().get(&node_id).copied() else {
-            return;
-        };
-        let Some(group) = outbound_idx
-            .checked_sub(honk_ebpf_common::OutboundIndex::UserBase as u8)
-            .and_then(|idx| config.groups.get(idx as usize))
-        else {
-            warn!(outbound_idx, %node_id, "outbound health slot has no current group");
-            return;
-        };
         let probe_domain = match domain {
             1 => ProbeDomain::DnsUdp,
             2 => ProbeDomain::DataUdp,
@@ -204,21 +191,27 @@ impl OutboundHealthPublisher {
             IpVersion::V4
         };
         let group_manager = self.group_manager.read().clone();
-        let alive = reload::group_datapath_alive(
-            group,
-            &group_manager,
-            &self.alive_set,
-            probe_domain,
-            ip_version,
-        );
-        if let Err(error) = backend.set_outbound_alive(outbound_idx, domain, ipver, alive) {
-            warn!(
-                %error,
-                outbound_idx,
-                domain,
-                ipver,
-                "failed to update outbound health in eBPF"
+        for (index, group) in config.groups.iter().enumerate() {
+            if !group_manager.group_reaches_node(&group.name, node_id) {
+                continue;
+            }
+            let outbound_idx = honk_ebpf_common::OutboundIndex::UserBase as u8 + index as u8;
+            let alive = reload::group_datapath_alive(
+                group,
+                &group_manager,
+                &self.alive_set,
+                probe_domain,
+                ip_version,
             );
+            if let Err(error) = backend.set_outbound_alive(outbound_idx, domain, ipver, alive) {
+                warn!(
+                    %error,
+                    outbound_idx,
+                    domain,
+                    ipver,
+                    "failed to update outbound health in eBPF"
+                );
+            }
         }
     }
 }
@@ -691,32 +684,33 @@ impl ControlPlane {
                     Arc::new(move |host: String, port: u16| {
                         let controller = controller.clone();
                         Box::pin(async move {
-                            controller
-                                .resolve_domain(&host)
-                                .await
-                                .into_iter()
-                                .map(|ip| std::net::SocketAddr::new(ip, port))
-                                .collect()
+                            controller.resolve_domain(&host).await.map(|addresses| {
+                                addresses
+                                    .into_iter()
+                                    .map(|ip| std::net::SocketAddr::new(ip, port))
+                                    .collect()
+                            })
                         })
                     })
                 };
-                let dns_target = resolve_udp_check_target(&dns_raw, Some(resolver.clone())).await;
-                let quic_score_target = if quic_url.is_empty() {
-                    None
-                } else {
-                    resolve_quic_score_target(&quic_url, Some(resolver)).await
-                };
+                let dns_probe = UdpDnsProbeTarget::new(dns_raw, Some(resolver.clone()));
+                match tokio::time::timeout(check_timeout, dns_probe.resolve()).await {
+                    Ok(Ok((target, _))) => info!("UDP health check enabled (dns={})", target),
+                    _ => info!(
+                        "UDP DNS health target initialization deferred to later health checks"
+                    ),
+                }
+                let quic_score_target = (!quic_url.is_empty())
+                    .then(|| QuicScoreProbeTarget::new(quic_url, Some(resolver)));
                 alive_set.set_udp_probe(Arc::new(ProxyUdpProber::new(
                     self.config.clone(),
                     self.proxy_registry.clone(),
                     self.runtime_registry.clone(),
                     self.stats.clone(),
-                    dns_target,
-                    udp_probe_identity(&dns_raw, dns_target),
+                    dns_probe,
                     quic_score_target,
                     self.group_manager.clone(),
                 )));
-                info!("UDP health check enabled (dns={})", dns_target);
             }
 
             info!(
@@ -728,7 +722,6 @@ impl ControlPlane {
                 self.ebpf.clone(),
                 self.config.clone(),
                 self.group_manager.clone(),
-                self.outbound_id_map.clone(),
                 alive_set.clone(),
             ));
             alive_set.set_ebpf_callback(Box::new(
@@ -771,10 +764,10 @@ impl ControlPlane {
                     interval.tick().await;
                     let generation = runtime_registry.read().clone();
                     let now = std::time::Instant::now();
-                    let evicted = generation.reap_tls_connectors(now)
-                        + dns_runtime.acquire().runtime().reap_tls_connectors(now);
+                    let evicted = generation.reap_idle_resources(now)
+                        + dns_runtime.acquire().runtime().reap_idle_resources(now);
                     if evicted > 0 {
-                        debug!(evicted, "released idle outbound TLS connectors");
+                        debug!(evicted, "released idle outbound resources");
                     }
                 }
             });

@@ -1,8 +1,25 @@
-use super::*;
+use std::future::Future;
+use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use parking_lot::Mutex as SyncMutex;
+use quinn::{ClientConfig, Endpoint, VarInt};
+use tokio::sync::Mutex;
 
-use crate::proxy::{PacketErrorClass, PacketTransport, QuicSendAttempt, packet_error_class};
+use super::endpoint::endpoint_config_with_mtu;
+use super::metrics::{
+    record_transport_rx_drop, record_transport_tx_drop, record_transport_tx_would_block,
+};
+
+use crate::proxy::{
+    PacketErrorClass, PacketRejection, PacketTransport, QuicSendAttempt, io_packet_rejection,
+    packet_error_class,
+};
 
 /// quinn [`AsyncUdpSocket`] over a framed [`PacketTransport`]: outbound
 /// datagrams ride a bounded channel drained by a forwarder task (the
@@ -23,13 +40,16 @@ struct QueuedTransportPacket {
 struct TransportIoError {
     kind: io::ErrorKind,
     message: String,
+    rejection: Option<PacketRejection>,
 }
 
 impl TransportIoError {
     fn new(error: io::Error) -> Self {
+        let rejection = io_packet_rejection(&error);
         Self {
             kind: error.kind(),
             message: error.to_string(),
+            rejection,
         }
     }
 
@@ -44,7 +64,10 @@ impl TransportIoError {
     }
 
     fn to_io_error(&self) -> io::Error {
-        io::Error::new(self.kind, self.message.clone())
+        self.rejection.map_or_else(
+            || io::Error::new(self.kind, self.message.clone()),
+            io::Error::from,
+        )
     }
 }
 
@@ -71,6 +94,7 @@ struct TransportQuinnSocket {
 }
 
 impl TransportQuinnSocket {
+    #[cfg(test)]
     fn new(transport: Arc<dyn PacketTransport>, remote: SocketAddr) -> Arc<Self> {
         Self::new_with_metrics(transport, remote, false)
     }
@@ -482,11 +506,7 @@ pub fn packet_transport_endpoint_with_metrics(
     }
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
-    let socket = if metrics_enabled {
-        TransportQuinnSocket::new_with_metrics(transport, remote, true)
-    } else {
-        TransportQuinnSocket::new(transport, remote)
-    };
+    let socket = TransportQuinnSocket::new_with_metrics(transport, remote, metrics_enabled);
     let endpoint = Endpoint::new_with_abstract_socket(
         endpoint_config_with_mtu(1252)?,
         None,
@@ -500,7 +520,7 @@ pub fn packet_transport_endpoint_with_metrics(
 /// handshake.  This is the real QUIC liveness probe: unlike a bare
 /// Version-Negotiation trigger (which many frontends ignore), it proves
 /// TLS-in-QUIC reachability through the node's UDP path.  `config` comes from
-/// [`client_config`] — pass a node with `skip_cert_verify` for pure liveness
+/// [`super::client_config`] — pass a node with `skip_cert_verify` for pure liveness
 /// probing.
 pub async fn quic_handshake_probe(
     transport: Arc<dyn PacketTransport>,
@@ -528,7 +548,18 @@ pub async fn quic_handshake_probe(
 
 #[cfg(test)]
 mod probe_tests {
+    use super::super::{QuicClientOptions, client_config, testutil};
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn packet_rejection_survives_transport_error_storage() {
+        let stored = TransportIoError::new(io::Error::from(PacketRejection::InvalidSize));
+        assert_eq!(
+            packet_error_class(&stored.to_io_error()),
+            PacketErrorClass::Rejected
+        );
+    }
 
     #[derive(Debug)]
     struct SendFailedPacketTransport;

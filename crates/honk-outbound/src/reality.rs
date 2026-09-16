@@ -8,12 +8,11 @@
 //! `authKey = HKDF-SHA256(shared, salt = client_random[..20], "REALITY")`
 //! and the AAD is the whole ClientHello with the session_id slot zeroed.
 //!
-//! Server authentication replaces PKI (which the mask target would always
-//! fail): a genuine REALITY server presents an ephemeral ed25519
+//! Server authentication replaces PKI: a REALITY server presents an ed25519
 //! certificate whose signature equals
-//! `HMAC-SHA512(authKey, ed25519_raw_public_key)`. Anything else — notably a
-//! real certificate relayed from the mask target when our session_id did
-//! not decrypt — is a hard failure, never a downgrade.
+//! `HMAC-SHA512(authKey, ed25519_raw_public_key)`. An ordinary mask-target
+//! certificate does not satisfy this check, even if it is PKI-valid.
+//! Authentication failure never yields an ordinary TLS proxy connection.
 
 use std::ffi::c_void;
 use std::os::raw::{c_int, c_long};
@@ -33,7 +32,6 @@ use sha2::{Sha256, Sha512};
 
 use crate::tls::TlsStream;
 
-const SSL_GROUP_X25519: u16 = 29;
 const HKDF_INFO: &[u8] = b"REALITY";
 const SESSION_ID_OFFSET: usize = 39;
 const SESSION_ID_LEN: usize = 32;
@@ -58,10 +56,8 @@ pub fn parse_reality_config(node: &Node) -> anyhow::Result<Option<RealityConfig>
         return Ok(None);
     };
     let Some(encoded) = tls
-        .reality_public_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .effective_reality_public_key()
+        .map_err(anyhow::Error::msg)?
     else {
         return Ok(None);
     };
@@ -195,15 +191,14 @@ fn reality_session_id(
     Some((session_id, auth_key))
 }
 
-/// Per-connection state shared with the ClientHello fixup callback. Owned
-/// by the SSL object via ex_data (`reality_state_free` drops it), so it
-/// stays valid for a HelloRetryRequest second ClientHello without any
-/// lifetime coupling to the async connect future.
+/// Per-connection authentication state owned by the SSL object. REALITY seals
+/// exactly one ClientHello: resealing after HRR would reuse the GCM key/nonce.
 struct RealityHandshake {
     eph_priv: [u8; 32],
     server_pub: [u8; 32],
     short_id: [u8; 8],
     auth_key: [u8; 32],
+    sealed: bool,
 }
 
 fn reality_ex_index() -> c_int {
@@ -232,8 +227,8 @@ unsafe extern "C" fn reality_state_free(
     }
 }
 
-/// Rewrites the serialized ClientHello in place (patched BoringSSL hook,
-/// see examples/reality_hook_spike.rs for the verified message layout):
+/// Rewrites the serialized ClientHello in place (patched BoringSSL hook;
+/// `reality/wire_tests.rs` verifies the production wire layout):
 /// [0..4] handshake header, [4..6] legacy_version, [6..38] client_random,
 /// [38] session_id_len, [39..71] session_id. Returning 0 aborts the
 /// handshake — a REALITY ClientHello must never go out unauthenticated.
@@ -244,6 +239,9 @@ extern "C" fn reality_fixup_cb(ssl: *mut boring_sys::SSL, msg: *mut u8, msg_len:
             return 0;
         }
         let state = &mut *state;
+        if state.sealed {
+            return 0;
+        }
         let msg = std::slice::from_raw_parts_mut(msg, msg_len);
         if msg[0] != 1 || msg[38] != SESSION_ID_LEN as u8 {
             return 0;
@@ -267,6 +265,7 @@ extern "C" fn reality_fixup_cb(ssl: *mut boring_sys::SSL, msg: *mut u8, msg_len:
                 msg[SESSION_ID_OFFSET..SESSION_ID_OFFSET + SESSION_ID_LEN]
                     .copy_from_slice(&session_id);
                 state.auth_key = auth_key;
+                state.sealed = true;
                 1
             }
             None => 0,
@@ -275,13 +274,9 @@ extern "C" fn reality_fixup_cb(ssl: *mut boring_sys::SSL, msg: *mut u8, msg_len:
 }
 
 fn setup_reality_ssl(ssl: &SslRef, config: &RealityConfig) -> anyhow::Result<()> {
-    // The REALITY server's ephemeral certificate is ed25519, and BoringSSL
-    // sanity-checks the leaf key type against the offered signature
-    // algorithms even with verification disabled — Chrome's list has no
-    // ed25519, so widen it per connection or the handshake dies with
-    // WRONG_SIGNATURE_TYPE before authentication can even run. The ed25519
-    // entry makes JA4_c differ from real Chrome; that is the price of a
-    // BoringSSL client speaking REALITY at all, and is accepted.
+    // CertificateVerify still needs an offered Ed25519 signature scheme even
+    // when ordinary chain verification is disabled. This deliberately differs
+    // from the Chrome-derived list; it is not an exact browser fingerprint.
     let sigalgs = c"ed25519:ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:rsa_pkcs1_sha256:\
 ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:rsa_pss_rsae_sha512:rsa_pkcs1_sha512";
     let ok = unsafe { boring_sys::SSL_set1_sigalgs_list(ssl.as_ptr(), sigalgs.as_ptr()) };
@@ -293,6 +288,7 @@ ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:rsa_pss_rsae_sha512:
         server_pub: config.public_key,
         short_id: config.short_id,
         auth_key: [0u8; 32],
+        sealed: false,
     });
     let ok = unsafe { boring_sys::RAND_bytes(state.eph_priv.as_mut_ptr(), state.eph_priv.len()) };
     if ok != 1 {
@@ -306,20 +302,14 @@ ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:rsa_pss_rsae_sha512:
     if ok != 1 {
         return Err(ErrorStack::get()).context("SSL_set1_client_x25519_private_key");
     }
-    // X25519 only: the server scans key_share for X25519, and an MLKEM
-    // hybrid share would bloat the ClientHello for nothing.
-    let groups = c"X25519";
+    // New REALITY servers require the hybrid share first, but authenticate
+    // against the preset standalone X25519 share when both are present.
+    let groups = c"X25519MLKEM768:X25519";
     let ok = unsafe { boring_sys::SSL_set1_groups_list(ssl.as_ptr(), groups.as_ptr()) };
     if ok != 1 {
         return Err(ErrorStack::get()).context("SSL_set1_groups_list");
     }
-    let shares = [SSL_GROUP_X25519];
-    let ok = unsafe {
-        boring_sys::SSL_set1_client_key_shares(ssl.as_ptr(), shares.as_ptr(), shares.len())
-    };
-    if ok != 1 {
-        return Err(ErrorStack::get()).context("SSL_set1_client_key_shares");
-    }
+    crate::tls::set_chrome_key_shares_ssl_ref(ssl)?;
     let ok = unsafe {
         boring_sys::SSL_set_ex_data(
             ssl.as_ptr(),
@@ -334,10 +324,9 @@ ecdsa_secp384r1_sha384:rsa_pss_rsae_sha384:rsa_pkcs1_sha384:rsa_pss_rsae_sha512:
     Ok(())
 }
 
-/// REALITY server authentication: the leaf must be an ephemeral ed25519
-/// certificate whose signature is HMAC-SHA512(authKey, raw public key).
-/// A real certificate means the server relayed us to the mask target —
-/// wrong key, MITM, or redirection — and is always fatal.
+/// REALITY server authentication: the Ed25519 leaf signature must equal
+/// HMAC-SHA512(authKey, raw public key). Ordinary PKI certificates fail this
+/// check; the failure does not identify a unique remote cause.
 fn verify_server_certificate(ssl: &SslRef, auth_key: &[u8; 32]) -> anyhow::Result<()> {
     let cert = ssl
         .peer_certificate()
@@ -475,9 +464,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_config_none_without_public_key() {
-        let node = reality_node();
-        assert!(parse_reality_config(&node).unwrap().is_none());
+    fn parse_config_none_without_reality_intent() {
+        let mut node = reality_node();
+        for enabled in [false, true] {
+            node.tls_mut().unwrap().enabled = enabled;
+            assert!(parse_reality_config(&node).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn parse_config_rejects_reality_intent_without_nonblank_key() {
+        for (key, short_id, spider_x) in [
+            (Some(""), None, None),
+            (Some(" \t"), None, None),
+            (None, Some("a1b2"), None),
+            (None, Some(""), None),
+            (None, None, Some("/")),
+            (None, None, Some("")),
+        ] {
+            let mut node = reality_node();
+            let tls = node.tls_mut().unwrap();
+            tls.reality_public_key = key.map(str::to_owned);
+            tls.reality_short_id = short_id.map(str::to_owned);
+            tls.reality_spider_x = spider_x.map(str::to_owned);
+            assert!(parse_reality_config(&node).is_err());
+        }
     }
 
     #[test]
@@ -496,6 +507,12 @@ mod tests {
         let cfg = parse_reality_config(&node).unwrap().unwrap();
         assert_eq!(cfg.server_name, "dl.google.com");
 
+        for short_id in [None, Some("")] {
+            node.tls_mut().unwrap().reality_short_id = short_id.map(str::to_owned);
+            let cfg = parse_reality_config(&node).unwrap().unwrap();
+            assert_eq!(cfg.short_id, [0; 8]);
+        }
+
         let mut bad = reality_node();
         bad.tls_mut().unwrap().reality_public_key = Some("not-a-key".into());
         assert!(
@@ -513,3 +530,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod wire_tests;

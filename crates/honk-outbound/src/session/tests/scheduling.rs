@@ -148,6 +148,37 @@ async fn spread_sessions_reuses_busy_session_when_extra_dial_fails() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn spread_sessions_preserves_capacity_rejection_without_backoff() {
+    let pool = pool(SessionPoolConfig {
+        max_sessions: 2,
+        spread_sessions: true,
+        ..Default::default()
+    });
+    let first = TestSession::new();
+    first.streams.store(1, Ordering::Relaxed);
+    pool.insert(&first);
+
+    let error = pool
+        .offer(|| async {
+            Err(anyhow::Error::new(crate::proxy::PacketRejection::Capacity)
+                .context("carrier admission"))
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        crate::proxy::packet_rejection(&error),
+        Some(crate::proxy::PacketRejection::Capacity)
+    );
+    assert!(!first.is_closed());
+
+    let second = pool
+        .offer(|| async { Ok(TestSession::new()) })
+        .await
+        .expect("released capacity must admit without a synthetic backoff");
+    assert!(!Arc::ptr_eq(&first, &second));
+}
+
+#[tokio::test(start_paused = true)]
 async fn least_loaded_is_offered() {
     let pool = Arc::new(pool(SessionPoolConfig {
         max_streams_per_session: 2,
@@ -316,21 +347,69 @@ async fn pre_reservation_drain_does_not_close_live_session() {
     assert_eq!(pool.metrics().sessions, 2);
 }
 
-#[tokio::test(start_paused = true)]
-async fn insert_over_cap_still_tracked() {
-    let pool = pool(SessionPoolConfig {
+#[tokio::test]
+async fn stream_capacity_race_is_a_health_neutral_refusal() {
+    let pool = SessionPool::new(SessionPoolConfig {
         max_sessions: 1,
+        max_streams_per_session: 1,
         ..Default::default()
     });
-    let s1 = TestSession::new();
-    let s2 = TestSession::new();
-    pool.insert(&s1);
-    pool.insert(&s2); // over the cap: must still be tracked
-    let offered = pool
-        .offer(|| async { unreachable!("no dial needed") })
+    let session = ReservedTestSession::new(1);
+    pool.insert(&session);
+    session.compete_on_reserve.store(true, Ordering::Relaxed);
+
+    let error = pool
+        .open_with(
+            || async { unreachable!("the offered session has capacity") },
+            |_session, _permit| async { Ok::<_, OpenError>(()) },
+        )
+        .await
+        .expect_err("both reservations must lose the last stream slot");
+    assert_eq!(
+        crate::proxy::packet_rejection(&error),
+        Some(crate::proxy::PacketRejection::Capacity)
+    );
+    assert_eq!(
+        crate::group::ScoreOutcome::from_error(&error),
+        crate::group::ScoreOutcome::Rejected
+    );
+    assert_eq!(session.state(), SessionState::Active);
+
+    session.compete_on_reserve.store(false, Ordering::Relaxed);
+    let reused = pool
+        .open_with(
+            || async { unreachable!("capacity races must not invalidate the session") },
+            |session, _permit| async { Ok::<_, OpenError>(session) },
+        )
         .await
         .unwrap();
-    assert!(Arc::ptr_eq(&offered, &s1) || Arc::ptr_eq(&offered, &s2));
-    // An orphaned (untracked) session would be invisible here.
-    assert_eq!(pool.metrics().sessions, 2);
+    assert!(Arc::ptr_eq(&reused, &session));
+}
+
+#[tokio::test]
+async fn offer_registers_before_checking_capacity() {
+    let pool = SessionPool::new(SessionPoolConfig {
+        max_sessions: 1,
+        max_streams_per_session: 1,
+        ..Default::default()
+    });
+    let session = ReservedTestSession::new(1);
+    pool.insert(&session);
+    let held = pool
+        .open_with(
+            || async { unreachable!("seeded session must be reused") },
+            |_session, permit| async { Ok::<_, OpenError>(permit) },
+        )
+        .await
+        .unwrap();
+    *session.release_on_check.lock() = Some(held);
+
+    let mut offer = std::pin::pin!(
+        pool.offer(|| async { unreachable!("released capacity must not require a dial") })
+    );
+    let std::task::Poll::Ready(Ok(reused)) = futures_util::poll!(offer.as_mut()) else {
+        panic!("a release during the capacity check was lost before parking");
+    };
+    assert!(Arc::ptr_eq(&reused, &session));
+    assert_eq!(session.active_streams(), 0);
 }

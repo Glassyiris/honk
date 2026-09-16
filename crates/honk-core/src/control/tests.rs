@@ -67,9 +67,6 @@ async fn health_push_re_resolves_after_reload_writer() {
     let group_manager: SharedGroupManager = Arc::new(parking_lot::RwLock::new(Arc::new(
         GroupManager::new(&old_config.groups, &old_config.nodes),
     )));
-    let outbound_id_map = Arc::new(parking_lot::RwLock::new(reload::build_outbound_id_map(
-        &old_config,
-    )));
     let alive_set = Arc::new(AliveDialerSet::new());
     let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
         crate::ebpf::mock::MockEbpfBackend::new(),
@@ -78,7 +75,6 @@ async fn health_push_re_resolves_after_reload_writer() {
         Arc::clone(&ebpf),
         Arc::clone(&config),
         Arc::clone(&group_manager),
-        Arc::clone(&outbound_id_map),
         Arc::clone(&alive_set),
     ));
 
@@ -87,7 +83,6 @@ async fn health_push_re_resolves_after_reload_writer() {
     backend_writer.set_outbound_alive(2, 1, 0, false).unwrap();
     backend_writer.set_outbound_alive(3, 1, 0, false).unwrap();
     *config_writer = Arc::new(new_config.clone());
-    *outbound_id_map.write() = reload::build_outbound_id_map(&new_config);
     *group_manager.write() = Arc::new(GroupManager::new(&new_config.groups, &new_config.nodes));
 
     let update = tokio::spawn(Arc::clone(&health_publisher).publish(node.id, 1, 0));
@@ -289,37 +284,51 @@ fn test_build_dns_probe_query() {
 #[tokio::test]
 async fn test_resolve_udp_check_target() {
     let fallback: SocketAddr = "8.8.8.8:53".parse().unwrap();
-    assert_eq!(resolve_udp_check_target(&[], None).await, fallback);
+    assert_eq!(resolve_udp_check_target(&[], None).await.unwrap(), fallback);
     assert_eq!(
-        resolve_udp_check_target(&["   ".into()], None).await,
+        resolve_udp_check_target(&["   ".into()], None)
+            .await
+            .unwrap(),
         fallback
     );
     // Bare IP literals get the default DNS port.
     assert_eq!(
-        resolve_udp_check_target(&["1.1.1.1".into()], None).await,
+        resolve_udp_check_target(&["1.1.1.1".into()], None)
+            .await
+            .unwrap(),
         "1.1.1.1:53".parse().unwrap()
     );
     assert_eq!(
-        resolve_udp_check_target(&["2001:4860:4860::8888".into()], None).await,
+        resolve_udp_check_target(&["2001:4860:4860::8888".into()], None)
+            .await
+            .unwrap(),
         "[2001:4860:4860::8888]:53".parse().unwrap()
     );
     // Full socket addresses (v4 or bracketed v6) are kept as-is.
     assert_eq!(
-        resolve_udp_check_target(&["1.1.1.1:5353".into()], None).await,
+        resolve_udp_check_target(&["1.1.1.1:5353".into()], None)
+            .await
+            .unwrap(),
         "1.1.1.1:5353".parse().unwrap()
     );
     assert_eq!(
-        resolve_udp_check_target(&["[2606:4700:4700::1111]:53".into()], None).await,
+        resolve_udp_check_target(&["[2606:4700:4700::1111]:53".into()], None)
+            .await
+            .unwrap(),
         "[2606:4700:4700::1111]:53".parse().unwrap()
     );
     // Literals win over domain entries anywhere in the list (poison-proof).
     assert_eq!(
-        resolve_udp_check_target(&["dns.google".into(), "8.8.8.8".into()], None).await,
+        resolve_udp_check_target(&["dns.google".into(), "8.8.8.8".into()], None)
+            .await
+            .unwrap(),
         "8.8.8.8:53".parse().unwrap()
     );
     // host:port resolves via the system resolver ("localhost" needs no
     // external network).
-    let addr = resolve_udp_check_target(&["localhost:5353".into()], None).await;
+    let addr = resolve_udp_check_target(&["localhost:5353".into()], None)
+        .await
+        .unwrap();
     assert_eq!(addr.port(), 5353);
     assert!(addr.ip().is_loopback());
 
@@ -327,15 +336,38 @@ async fn test_resolve_udp_check_target() {
     let hook: crate::outbound::ResolveHook = std::sync::Arc::new(|host, port| {
         Box::pin(async move {
             assert_eq!(host, "dns.example");
-            vec![std::net::SocketAddr::new(
+            Ok(vec![std::net::SocketAddr::new(
                 std::net::IpAddr::from([10, 9, 8, 7]),
                 port,
-            )]
+            )])
         })
     });
     assert_eq!(
-        resolve_udp_check_target(&["dns.example".into()], Some(hook)).await,
+        resolve_udp_check_target(&["dns.example".into()], Some(hook))
+            .await
+            .unwrap(),
         "10.9.8.7:53".parse().unwrap()
+    );
+
+    let rejection: crate::outbound::ResolveHook = Arc::new(|_, _| {
+        Box::pin(async {
+            Err(anyhow::Error::new(
+                honk_outbound::proxy::PacketRejection::Policy,
+            ))
+        })
+    });
+    let error = resolve_udp_check_target(&["denied.example:443".into()], Some(rejection))
+        .await
+        .expect_err("typed target rejection");
+    assert!(honk_outbound::proxy::is_packet_rejection(&error));
+
+    let failure: crate::outbound::ResolveHook =
+        Arc::new(|_, _| Box::pin(async { anyhow::bail!("ordinary resolution failure") }));
+    assert_eq!(
+        resolve_udp_check_target(&["failed.example".into()], Some(failure))
+            .await
+            .unwrap(),
+        fallback
     );
 }
 
@@ -348,8 +380,9 @@ async fn c24_dns_target_resolution_and_score_identity_agree() {
         ("::1", "[::1]:53"),
     ] {
         let raws = vec!["resolver.test".into(), value.into()];
-        let hook: crate::outbound::ResolveHook = Arc::new(|_, _| Box::pin(async { Vec::new() }));
-        let resolved = resolve_udp_check_target(&raws, Some(hook)).await;
+        let hook: crate::outbound::ResolveHook =
+            Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) }));
+        let resolved = resolve_udp_check_target(&raws, Some(hook)).await.unwrap();
         let expected: SocketAddr = address.parse().unwrap();
         assert_eq!(resolved, expected);
         assert_eq!(
@@ -361,10 +394,10 @@ async fn c24_dns_target_resolution_and_score_identity_agree() {
     let hook: crate::outbound::ResolveHook = Arc::new(|host, port| {
         Box::pin(async move {
             assert_eq!((host.as_str(), port), ("resolver.test", 53));
-            vec![SocketAddr::from(([127, 0, 0, 1], port))]
+            Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))])
         })
     });
-    let resolved = resolve_udp_check_target(&raws, Some(hook)).await;
+    let resolved = resolve_udp_check_target(&raws, Some(hook)).await.unwrap();
     assert_eq!(resolved, SocketAddr::from(([127, 0, 0, 1], 53)));
     assert_eq!(
         super::probers::udp_probe_identity(&raws, resolved),
@@ -410,12 +443,12 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
     );
     let runtime = cp.runtime_registry();
     let resolver: crate::outbound::ResolveHook = Arc::new(|_host, port| {
-        Box::pin(async move { vec![SocketAddr::from(([127, 0, 0, 1], port))] })
+        Box::pin(async move { Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))]) })
     });
-    let quic_target = resolve_quic_score_target(&config.global.tcp_check_url[0], Some(resolver))
-        .await
-        .unwrap();
-    let context = probers::quic_probe_context(&quic_target);
+    let quic_target =
+        probers::QuicScoreProbeTarget::new(config.global.tcp_check_url[0].clone(), Some(resolver));
+    let context =
+        probers::quic_probe_context(quic_target.resolve().await.unwrap().as_ref().unwrap());
     assert_eq!(context.network, SelectionNetwork::Udp);
     assert_eq!(context.probe_domain, ProbeDomain::DataUdp);
     assert_eq!(context.target_family, Some(IpVersion::V4));
@@ -437,8 +470,7 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
         Arc::new(registry),
         runtime,
         cp.stats_handle(),
-        "127.0.0.1:53".parse().unwrap(),
-        "127.0.0.1:53".parse::<SocketAddr>().unwrap().into(),
+        probers::UdpDnsProbeTarget::new(vec!["127.0.0.1:53".into()], None),
         Some(quic_target),
         manager.clone(),
     );
@@ -451,7 +483,10 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
     let result =
         honk_outbound::alive::UdpProber::probe_udp(&prober, &node.name, Duration::from_millis(30))
             .await;
-    assert!(result.dns.is_ok(), "DNS health result: {result:?}");
+    assert!(
+        matches!(result.dns, Some(Ok(_))),
+        "DNS health result: {result:?}"
+    );
     assert!(
         result.data_path.is_some(),
         "Score QUIC probe must run: {result:?}"
@@ -471,13 +506,11 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
 }
 
 #[tokio::test]
-async fn quic_probe_still_runs_when_dns_probe_fails() {
+async fn quic_probe_still_runs_when_dns_target_resolution_is_refused() {
     use honk_config::node::{Group, GroupPolicy};
     use honk_outbound::group::GroupManager;
 
-    // The DNS check target may be blocked through a healthy UDP path; the
-    // Score handshake probe must still run so its success can attest the
-    // data path (here it fails too — the mock refuses every dial).
+    // Local DNS setup refusal must not suppress the independent Score handshake.
     let node = udp_test_node();
     let group = Group {
         name: "score".into(),
@@ -509,21 +542,27 @@ async fn quic_probe_still_runs_when_dns_probe_fails() {
             .unwrap(),
     )));
     let resolver: crate::outbound::ResolveHook = Arc::new(|_host, port| {
-        Box::pin(async move { vec![SocketAddr::from(([127, 0, 0, 1], port))] })
+        Box::pin(async move { Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))]) })
     });
-    let quic_target = resolve_quic_score_target(
-        "https://quic.example.test:9443/generate_204",
+    let quic_target = probers::QuicScoreProbeTarget::new(
+        "https://quic.example.test:9443/generate_204".into(),
         Some(resolver),
-    )
-    .await
-    .unwrap();
+    );
     let prober = probers::ProxyUdpProber::new(
         Arc::new(RwLock::new(Arc::new(config))),
         Arc::new(registry),
         runtime,
         Arc::new(StatsManager::new()),
-        "127.0.0.1:53".parse().unwrap(),
-        "127.0.0.1:53".parse::<SocketAddr>().unwrap().into(),
+        probers::UdpDnsProbeTarget::new(
+            vec!["denied.example:53".into()],
+            Some(Arc::new(|_, _| {
+                Box::pin(async {
+                    Err(anyhow::Error::new(
+                        honk_outbound::proxy::PacketRejection::Capacity,
+                    ))
+                })
+            })),
+        ),
         Some(quic_target),
         manager.clone(),
     );
@@ -531,12 +570,12 @@ async fn quic_probe_still_runs_when_dns_probe_fails() {
     let result =
         honk_outbound::alive::UdpProber::probe_udp(&prober, &node.name, Duration::from_millis(30))
             .await;
-    assert!(result.dns.is_err(), "DNS health result: {result:?}");
+    assert!(result.dns.is_none(), "DNS health result: {result:?}");
     assert!(
         matches!(result.data_path, Some(Err(_))),
-        "the Score QUIC probe must be attempted even when DNS fails: {result:?}"
+        "the Score QUIC probe must be attempted despite DNS initialization refusal: {result:?}"
     );
-    assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 
 async fn ready_udp_endpoint(
@@ -3380,8 +3419,14 @@ fn resolve_udp_score_plan_tracks_v4_fallback_and_final_resolution_guards() {
     assert_eq!(empty.mode, crate::group::SelectionPlanMode::Authoritative);
 
     let missing = resolve_udp_score_plan(&config, &manager, "missing-final", IpVersion::V4);
+    assert!(
+        missing.nodes.is_empty(),
+        "an unresolved final must not bypass group policy"
+    );
+
+    let unknown = resolve_udp_score_plan(&config, &manager, "not-configured", IpVersion::V4);
     assert_eq!(
-        missing
+        unknown
             .nodes
             .iter()
             .map(|node| node.name.as_str())
@@ -3515,6 +3560,7 @@ async fn udp_stagger_uses_absolute_offsets_bounds_inflight_and_drains_losers() {
         })
     };
     let callbacks = UdpStaggerCallbacks {
+        allows_target: Arc::new(|_| true),
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = errors.clone();
@@ -3585,6 +3631,7 @@ async fn udp_stagger_uses_absolute_offsets_bounds_inflight_and_drains_losers() {
     let (winner, _) = task
         .await
         .unwrap()
+        .expect("scheduler succeeds")
         .expect("the first successful preparation wins");
     assert_eq!(winner.name, "winner");
     let starts = starts.lock().unwrap();
@@ -3616,7 +3663,7 @@ async fn udp_stagger_uses_absolute_offsets_bounds_inflight_and_drains_losers() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn udp_stagger_drain_reports_completed_error_without_cancelling_ready_losers() {
+async fn udp_stagger_drain_counts_error_but_rejection_prevents_winner() {
     let release = Arc::new(tokio::sync::Notify::new());
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3630,13 +3677,16 @@ async fn udp_stagger_drain_reports_completed_error_without_cancelling_ready_lose
                 match node.name.as_str() {
                     "winner" => Ok(node.name),
                     "completed-error" => Err(anyhow::anyhow!("scripted dial error")),
-                    "completed-ok" => Ok(node.name),
+                    "completed-rejection" => Err(anyhow::Error::new(
+                        honk_outbound::proxy::PacketRejection::Policy,
+                    )),
                     _ => unreachable!(),
                 }
             })
         })
     };
     let callbacks = UdpStaggerCallbacks {
+        allows_target: Arc::new(|_| true),
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = errors.clone();
@@ -3658,7 +3708,7 @@ async fn udp_stagger_drain_reports_completed_error_without_cancelling_ready_lose
             })
         },
     };
-    let candidates = ["winner", "completed-error", "completed-ok"]
+    let candidates = ["winner", "completed-error", "completed-rejection"]
         .into_iter()
         .map(|name| Node {
             id: uuid::Uuid::new_v4(),
@@ -3682,11 +3732,8 @@ async fn udp_stagger_drain_reports_completed_error_without_cancelling_ready_lose
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
 
     release.notify_waiters();
-    let (winner, _) = task
-        .await
-        .unwrap()
-        .expect("the first completed success should win");
-    assert_eq!(winner.name, "winner");
+    let error = task.await.unwrap().unwrap_err();
+    assert!(honk_outbound::proxy::is_packet_rejection(&error));
     assert_eq!(errors.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
@@ -3699,6 +3746,7 @@ async fn udp_stagger_authoritative_prepares_only_the_current_node_without_delay(
     let prepare: UdpPrepare<String> =
         Arc::new(|_: usize, node: Node| Box::pin(async move { Ok(node.name) }));
     let callbacks = UdpStaggerCallbacks {
+        allows_target: Arc::new(|_| true),
         is_eligible: Arc::new(|_| true),
         on_dial_error: Arc::new(|_| panic!("authoritative success must not report an error")),
         on_attempt: {
@@ -3737,6 +3785,7 @@ async fn udp_stagger_authoritative_prepares_only_the_current_node_without_delay(
         callbacks,
     )
     .await
+    .expect("scheduler succeeds")
     .expect("authoritative candidate should start at offset zero");
     assert_eq!(winner.name, "authoritative");
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -3753,6 +3802,7 @@ async fn udp_stagger_authoritative_failure_preserves_fixed_metric_zeros() {
     let prepare: UdpPrepare<()> =
         Arc::new(|_: usize, _: Node| Box::pin(async { Err(anyhow::anyhow!("dial failed")) }));
     let callbacks = UdpStaggerCallbacks {
+        allows_target: Arc::new(|_| true),
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = errors.clone();
@@ -3794,6 +3844,7 @@ async fn udp_stagger_authoritative_failure_preserves_fixed_metric_zeros() {
             callbacks,
         )
         .await
+        .unwrap()
         .is_none()
     );
     assert_eq!(errors.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -3810,6 +3861,7 @@ async fn udp_stagger_all_dial_failures_report_health_without_cancellation() {
     let prepare: UdpPrepare<()> =
         Arc::new(|_: usize, _: Node| Box::pin(async { Err(anyhow::anyhow!("dial failed")) }));
     let callbacks = UdpStaggerCallbacks {
+        allows_target: Arc::new(|_| true),
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = errors.clone();
@@ -3848,7 +3900,7 @@ async fn udp_stagger_all_dial_failures_report_health_without_cancellation() {
     ));
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_millis(30)).await;
-    assert!(task.await.unwrap().is_none());
+    assert!(task.await.unwrap().unwrap().is_none());
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(errors.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(cancellations.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -3871,6 +3923,7 @@ async fn udp_stagger_rechecks_eligibility_before_accepting_prepared_transport() 
         })
     };
     let callbacks = UdpStaggerCallbacks {
+        allows_target: Arc::new(|_| true),
         is_eligible: {
             let became_ineligible = became_ineligible.clone();
             Arc::new(move |node| {
@@ -3908,6 +3961,7 @@ async fn udp_stagger_rechecks_eligibility_before_accepting_prepared_transport() 
     let (winner, _) = task
         .await
         .unwrap()
+        .expect("scheduler succeeds")
         .expect("eligible candidate should still win");
     assert_eq!(winner.name, "eligible-winner");
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);

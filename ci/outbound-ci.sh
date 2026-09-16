@@ -3,9 +3,9 @@
 #
 # Runs, in order and with early exit on failure:
 #   1. fmt check
-#   2. clippy (all targets, warnings denied)
+#   2. clippy (all targets, warnings denied, rprx off and on separately)
 #   3. honk-config tests (node/share-link fields change together)
-#   4. honk-outbound full test suite
+#   4. honk-outbound test suites (rprx off and on separately)
 #
 # Optional live-server e2e (skipped by default):
 #   HONK_HY2_SERVER=host:port HONK_HY2_PASSWORD=... [HONK_HY2_MPORT=.. HONK_HY2_MHOP=..]
@@ -22,14 +22,20 @@ step() { printf '\n==> %s\n' "$1"; }
 step "cargo fmt --check"
 cargo fmt -p honk-outbound -- --check
 
-step "cargo clippy --all-targets -D warnings"
-cargo clippy -p honk-outbound --all-targets -- -D warnings
+step "cargo clippy --all-targets --no-default-features -D warnings"
+cargo clippy -p honk-outbound --all-targets --no-default-features -- -D warnings
+
+step "cargo clippy --all-targets --no-default-features --features rprx -D warnings"
+cargo clippy -p honk-outbound --all-targets --no-default-features --features rprx -- -D warnings
 
 step "cargo test -p honk-config"
 cargo test -p honk-config
 
-step "cargo test -p honk-outbound"
-cargo test -p honk-outbound
+step "cargo test -p honk-outbound --no-default-features"
+cargo test -p honk-outbound --no-default-features
+
+step "cargo test -p honk-outbound --no-default-features --features rprx"
+cargo test -p honk-outbound --no-default-features --features rprx
 
 if [ "${1:-}" = "--with-e2e-env" ]; then
     if [ -n "${HONK_HY2_SERVER:-}" ]; then

@@ -3,16 +3,13 @@
 use crate::tls::TlsConnector;
 use async_trait::async_trait;
 use honk_config::node::Node;
-use md5::Md5;
-use rand::RngExt as _;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, warn};
@@ -22,17 +19,25 @@ use super::{
     MuxSession as _, PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound,
     ProxyStream, TcpOutbound, WarmRequirement, WarmableOutbound,
 };
-use crate::session::{ManagedSession as _, SpeculativeCheckout};
+use crate::session::SpeculativeCheckout;
 
 mod inbound;
+mod overflow;
+mod padding;
 mod uot;
+mod writer;
 
 use inbound::{
     INBOUND_PAYLOAD_BUDGET, InboundPayload, InboundPayloadBudget, TcpInbound, TcpReceiveState,
     session_demux,
 };
+use overflow::{OVERFLOW_EMERGENCY_WAIT, OVERFLOW_STALL_GRACE, OverflowLimit, StreamOverflow};
+use padding::PaddingInstruction;
 pub(crate) use uot::AnyTlsUotTransport;
 use uot::{UOT_DRAIN_QUEUE_CAP, UotReceiveState};
+use writer::{FrameCommand, session_writer};
+#[cfg(test)]
+use writer::{WRITER_CONTROL_RESERVED, WRITER_IO_TIMEOUT, WRITER_QUEUE_CAP};
 
 const CMD_WASTE: u8 = 0;
 const CMD_SYN: u8 = 1;
@@ -64,12 +69,6 @@ const DEFAULT_PADDING_SCHEME: &[u8] = b"stop=8\n\
 /// Reused v2 sessions must prove that a newly opened target is still live.
 const SYNACK_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[derive(Clone, Copy, Debug)]
-enum PaddingInstruction {
-    Range(u16, u16),
-    Check,
-}
-
 #[derive(Debug)]
 struct PaddingScheme {
     stop: u32,
@@ -77,176 +76,14 @@ struct PaddingScheme {
     md5: String,
 }
 
-impl PaddingScheme {
-    fn parse(raw: &[u8]) -> Option<Self> {
-        let mut values = HashMap::<&[u8], &[u8]>::new();
-        for line in raw.split(|byte| *byte == b'\n') {
-            let Some(separator) = line.iter().position(|byte| *byte == b'=') else {
-                continue;
-            };
-            values.insert(&line[..separator], &line[separator + 1..]);
-        }
-
-        let stop = std::str::from_utf8(values.get(b"stop".as_slice()).copied()?)
-            .ok()?
-            .parse::<u32>()
-            .ok()?;
-        let mut packets = HashMap::new();
-        for (key, value) in values {
-            if key == b"stop"
-                || key.is_empty()
-                || (key.len() > 1 && key[0] == b'0')
-                || !key.iter().all(u8::is_ascii_digit)
-            {
-                continue;
-            }
-            let Ok(packet) = std::str::from_utf8(key).unwrap().parse::<u32>() else {
-                continue;
-            };
-            let instructions: Vec<_> = value
-                .split(|byte| *byte == b',')
-                .filter_map(|part| {
-                    if part == b"c" {
-                        return Some(PaddingInstruction::Check);
-                    }
-                    let mut bounds = part.split(|byte| *byte == b'-');
-                    let (Some(start), Some(end), None) =
-                        (bounds.next(), bounds.next(), bounds.next())
-                    else {
-                        return None;
-                    };
-                    let (mut start, mut end) = (
-                        std::str::from_utf8(start).ok()?.parse::<i64>().ok()?,
-                        std::str::from_utf8(end).ok()?.parse::<i64>().ok()?,
-                    );
-                    if start <= 0 || end <= 0 {
-                        return None;
-                    }
-                    if start > end {
-                        std::mem::swap(&mut start, &mut end);
-                    }
-                    Some(PaddingInstruction::Range(
-                        u16::try_from(start).ok()?,
-                        u16::try_from(end).ok()?,
-                    ))
-                })
-                .collect();
-            if instructions.is_empty() {
-                packets.remove(&packet);
-            } else {
-                packets.insert(packet, instructions);
-            }
-        }
-        if packets
-            .get(&0)
-            .and_then(|instructions| instructions.first())
-            .is_some_and(|instruction| matches!(instruction, PaddingInstruction::Check))
-        {
-            return None;
-        }
-        let digest = Md5::digest(raw);
-        let mut md5 = String::with_capacity(32);
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        for byte in digest {
-            md5.push(HEX[(byte >> 4) as usize] as char);
-            md5.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        Some(Self { stop, packets, md5 })
-    }
-
-    fn sample_range(start: u16, end: u16) -> usize {
-        if start == end {
-            start as usize
-        } else {
-            rand::rng().random_range(start..end) as usize
-        }
-    }
-
-    fn auth_padding_len(&self) -> usize {
-        match self
-            .packets
-            .get(&0)
-            .and_then(|instructions| instructions.first())
-        {
-            Some(PaddingInstruction::Range(start, end)) => Self::sample_range(*start, *end),
-            Some(PaddingInstruction::Check) | None => 0,
-        }
-    }
-
-    fn settings_payload(&self) -> bytes::Bytes {
-        bytes::Bytes::from(format!(
-            "v=2\nclient={CLIENT_NAME}\npadding-md5={}\n",
-            self.md5
-        ))
-    }
-}
-
 #[derive(Debug)]
 struct PaddingState {
     current: parking_lot::RwLock<Arc<PaddingScheme>>,
 }
 
-impl Default for PaddingState {
-    fn default() -> Self {
-        Self {
-            current: parking_lot::RwLock::new(Arc::new(
-                PaddingScheme::parse(DEFAULT_PADDING_SCHEME)
-                    .expect("built-in AnyTLS padding scheme is valid"),
-            )),
-        }
-    }
-}
-
-impl PaddingState {
-    fn snapshot(&self) -> Arc<PaddingScheme> {
-        Arc::clone(&self.current.read())
-    }
-
-    fn update(&self, raw: &[u8]) -> bool {
-        let Some(scheme) = PaddingScheme::parse(raw) else {
-            return false;
-        };
-        *self.current.write() = Arc::new(scheme);
-        true
-    }
-}
-
 /// Per-stream demux queue depth (frames). A full queue parks frames in
 /// the session overflow instead of blocking the demux.
 const STREAM_QUEUE_CAP: usize = 64;
-/// Soft caps on parked overflow (data frames/payload, session-wide and
-/// per stream). Tripping one never blocks the demux: the frame parks and
-/// the stall watchdog reaps consumers that make no flush progress for
-/// [`OVERFLOW_STALL_GRACE`]. Soft because a fast peer can burst past
-/// them in the milliseconds before the reader task is first scheduled.
-const SESSION_OVERFLOW_CAP: usize = 512;
-const STREAM_OVERFLOW_BYTES_CAP: usize = 2 * 1024 * 1024;
-const SESSION_OVERFLOW_BYTES_CAP: usize = 8 * 1024 * 1024;
-/// Emergency session-wide frame cap. Tripping it reaps the most-stalled
-/// parked stream on the spot when it is past the grace; while every
-/// stalled stream is inside the grace the demux waits bounded
-/// [`OVERFLOW_EMERGENCY_WAIT`] rounds for reader progress (woken by
-/// flushes) — TCP-style backpressure, since at wire rate a healthy burst
-/// fills any feasible buffer before the reader task is first scheduled,
-/// so the only alternatives are blocking reads or killing the innocent.
-const SESSION_OVERFLOW_HARD_CAP: usize = 768;
-/// Terminal events (Fin/Error) parked per stream. They bypass the frame
-/// quota — a full quota must not break stream termination — but are not
-/// unbounded: the stream is already terminating, so extras are dropped.
-const MAX_OVERFLOW_TERMINAL_EVENTS: usize = 2;
-/// How long a parked stream may go without flush progress before the
-/// watchdog judges it a stuck consumer and resets it. Parked bytes are
-/// not a stall — only the absence of reader progress is.
-const OVERFLOW_STALL_GRACE: Duration = Duration::from_secs(3);
-/// One bounded wait round at an emergency hard cap with no stream past
-/// the grace. Sized well above the 12–16ms reader-task startup delay
-/// measured on a 9.4Gbps burst (a healthy reader's first flush wakes the
-/// wait immediately), and far below the stall grace so a genuinely stuck
-/// consumer is reaped the round it crosses the grace.
-const OVERFLOW_EMERGENCY_WAIT: Duration = Duration::from_millis(100);
-/// Overflow watchdog tick. The task is spawned by the first park,
-/// retires when the overflow drains, and is aborted on session close.
-const OVERFLOW_WATCHDOG_TICK: Duration = Duration::from_millis(250);
 const MAX_STREAM_ERROR_SOURCE_BYTES: usize = 1024;
 
 /// Transport halves behind trait objects so tests can drive a session over
@@ -284,28 +121,10 @@ enum StreamEvent {
     Error(Arc<str>),
 }
 
-impl StreamEvent {
-    fn payload_len(&self) -> usize {
-        match self {
-            Self::Data(data) => data.len(),
-            Self::Fin | Self::Error(_) => 0,
-        }
-    }
-}
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct OverflowUsage {
     frames: usize,
     bytes: usize,
-}
-
-#[derive(Default)]
-struct StreamOverflow {
-    events: VecDeque<StreamEvent>,
-    /// Data frames only: terminal events bypass the frame quota.
-    frames: usize,
-    bytes: usize,
-    terminal_events: usize,
-    last_progress_at: Option<tokio::time::Instant>,
 }
 
 #[derive(Default)]
@@ -318,308 +137,12 @@ struct OverflowState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OverflowLimit {
-    SessionFrames,
-    StreamBytes,
-    SessionBytes,
-    /// Watchdog reap: no flush progress for a full stall grace.
-    StallGrace,
-}
-
-impl OverflowLimit {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::SessionFrames => "session_frames",
-            Self::StreamBytes => "stream_bytes",
-            Self::SessionBytes => "session_bytes",
-            Self::StallGrace => "stall_grace",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OverflowVictim {
     sid: u32,
     limit: OverflowLimit,
     session: OverflowUsage,
     stream: OverflowUsage,
     stalled_for: Duration,
-}
-
-enum OverflowAction {
-    Parked,
-    /// A terminal event past the per-stream cap: the stream is already
-    /// terminating, so dropping it is harmless.
-    Dropped,
-    /// Emergency-cap reap: the caller kills the victim outside the lock
-    /// and retries with the returned event.
-    Kill(OverflowVictim, StreamEvent),
-    /// Hard cap with every stalled stream inside the grace: the caller
-    /// waits up to the given bound for flush progress, then retries with
-    /// the returned event.
-    Wait(StreamEvent, Duration),
-}
-
-impl OverflowState {
-    fn is_empty(&self) -> bool {
-        self.streams.is_empty()
-    }
-    fn has(&self, sid: u32) -> bool {
-        self.streams.contains_key(&sid)
-    }
-
-    fn usage(&self) -> OverflowUsage {
-        OverflowUsage {
-            frames: self.frames,
-            bytes: self.bytes,
-        }
-    }
-
-    fn stream_usage(&self, sid: u32) -> OverflowUsage {
-        self.streams
-            .get(&sid)
-            .map(|stream| OverflowUsage {
-                frames: stream.frames,
-                bytes: stream.bytes,
-            })
-            .unwrap_or_default()
-    }
-
-    /// Soft bounds, checked for data frames only (terminal events bypass
-    /// the quota). Session-wide bounds first: a stream past its soft cap
-    /// keeps parking until the watchdog's grace expires, so only this
-    /// order keeps session memory capped while stall age accrues.
-    fn limit_for(&self, sid: u32, event: &StreamEvent) -> Option<OverflowLimit> {
-        let bytes = event.payload_len();
-        if bytes != 0 && self.bytes.saturating_add(bytes) > SESSION_OVERFLOW_BYTES_CAP {
-            return Some(OverflowLimit::SessionBytes);
-        }
-        if self.frames >= SESSION_OVERFLOW_CAP {
-            return Some(OverflowLimit::SessionFrames);
-        }
-        if bytes != 0
-            && self.stream_usage(sid).bytes.saturating_add(bytes) > STREAM_OVERFLOW_BYTES_CAP
-        {
-            return Some(OverflowLimit::StreamBytes);
-        }
-        None
-    }
-
-    /// Time since the reader last made flush progress on this stream (or
-    /// since the first park, if it never has).
-    fn stalled_for(&self, sid: u32) -> Duration {
-        self.streams
-            .get(&sid)
-            .and_then(|stream| stream.last_progress_at)
-            .map(|progress| progress.elapsed())
-            .unwrap_or_default()
-    }
-
-    fn last_progress_at(&self, sid: u32) -> Option<tokio::time::Instant> {
-        self.streams
-            .get(&sid)
-            .and_then(|stream| stream.last_progress_at)
-    }
-
-    fn restore_last_progress_at(&mut self, sid: u32, progress: Option<tokio::time::Instant>) {
-        if let (Some(stream), Some(progress)) = (self.streams.get_mut(&sid), progress) {
-            stream.last_progress_at = Some(progress);
-        }
-    }
-
-    /// A parked frame reached the stream queue: the consumer is alive.
-    fn note_progress(&mut self, sid: u32) {
-        if let Some(stream) = self.streams.get_mut(&sid) {
-            stream.last_progress_at = Some(tokio::time::Instant::now());
-        }
-    }
-
-    /// (data frames, payload bytes) — terminal events bypass the quota.
-    fn event_weight(event: &StreamEvent) -> (usize, usize) {
-        match event {
-            StreamEvent::Data(data) => (1, data.len()),
-            StreamEvent::Fin | StreamEvent::Error(_) => (0, 0),
-        }
-    }
-
-    fn push_back(&mut self, sid: u32, event: StreamEvent) {
-        let (frames, bytes) = Self::event_weight(&event);
-        let stream = self.streams.entry(sid).or_default();
-        stream
-            .last_progress_at
-            .get_or_insert_with(tokio::time::Instant::now);
-        stream.events.push_back(event);
-        stream.frames += frames;
-        stream.bytes += bytes;
-        stream.terminal_events += usize::from(frames == 0);
-        self.frames += frames;
-        self.bytes += bytes;
-    }
-
-    fn push_front(&mut self, sid: u32, event: StreamEvent) {
-        let (frames, bytes) = Self::event_weight(&event);
-        let stream = self.streams.entry(sid).or_default();
-        stream
-            .last_progress_at
-            .get_or_insert_with(tokio::time::Instant::now);
-        stream.events.push_front(event);
-        stream.frames += frames;
-        stream.bytes += bytes;
-        stream.terminal_events += usize::from(frames == 0);
-        self.frames += frames;
-        self.bytes += bytes;
-    }
-
-    fn pop_front(&mut self, sid: u32) -> Option<StreamEvent> {
-        let (event, empty) = {
-            let stream = self.streams.get_mut(&sid)?;
-            let event = stream.events.pop_front()?;
-            let (frames, bytes) = Self::event_weight(&event);
-            stream.frames -= frames;
-            stream.bytes -= bytes;
-            stream.terminal_events -= usize::from(frames == 0);
-            self.frames -= frames;
-            self.bytes -= bytes;
-            (event, stream.events.is_empty())
-        };
-        if empty {
-            self.streams.remove(&sid);
-        }
-        Some(event)
-    }
-
-    fn remove_stream(&mut self, sid: u32) -> OverflowUsage {
-        let Some(stream) = self.streams.remove(&sid) else {
-            return OverflowUsage::default();
-        };
-        self.frames -= stream.frames;
-        self.bytes -= stream.bytes;
-        OverflowUsage {
-            frames: stream.frames,
-            bytes: stream.bytes,
-        }
-    }
-
-    fn clear(&mut self) -> OverflowUsage {
-        let usage = self.usage();
-        self.streams.clear();
-        self.frames = 0;
-        self.bytes = 0;
-        usage
-    }
-
-    fn request_flush(&mut self, sid: u32) -> bool {
-        if self.flushing.insert(sid) {
-            true
-        } else {
-            self.flush_requested.insert(sid);
-            false
-        }
-    }
-
-    fn finish_flush(&mut self, sid: u32) -> bool {
-        if self.flush_requested.remove(&sid) {
-            true
-        } else {
-            self.flushing.remove(&sid);
-            false
-        }
-    }
-
-    fn cancel_flush(&mut self, sid: u32) {
-        self.flushing.remove(&sid);
-        self.flush_requested.remove(&sid);
-    }
-
-    /// The parked stream with the oldest flush progress (ties to the
-    /// lowest sid): the prime stuck-consumer suspect at a session cap.
-    fn most_stalled_stream(&self) -> Option<u32> {
-        self.streams
-            .iter()
-            .filter_map(|(&sid, stream)| stream.last_progress_at.map(|at| (at, sid)))
-            .min()
-            .map(|(_, sid)| sid)
-    }
-
-    /// The most-stalled parked stream among those past
-    /// [`OVERFLOW_STALL_GRACE`] without flush progress.
-    fn most_stalled_past_grace(&self) -> Option<u32> {
-        self.streams
-            .iter()
-            .filter_map(|(&sid, stream)| stream.last_progress_at.map(|at| (at, sid)))
-            .filter(|(at, _)| at.elapsed() >= OVERFLOW_STALL_GRACE)
-            .min()
-            .map(|(_, sid)| sid)
-    }
-
-    /// Detach a parked stream's overflow and snapshot its usage for the
-    /// kill log line.
-    fn take_victim(&mut self, sid: u32, limit: OverflowLimit) -> OverflowVictim {
-        let victim = OverflowVictim {
-            sid,
-            limit,
-            session: self.usage(),
-            stream: self.stream_usage(sid),
-            stalled_for: self.stalled_for(sid),
-        };
-        self.remove_stream(sid);
-        victim
-    }
-
-    /// Emergency session-wide bound on parked data frames. Payload bytes are
-    /// already bounded across every owner by the pool semaphore.
-    fn hard_limit(&self) -> Option<OverflowLimit> {
-        (self.frames >= SESSION_OVERFLOW_HARD_CAP).then_some(OverflowLimit::SessionFrames)
-    }
-
-    /// One wait round at a hard cap, clamped to the nearest grace expiry
-    /// so a stream crossing the grace is reaped without a stale round.
-    fn emergency_wait(&self) -> Duration {
-        let remaining = self
-            .most_stalled_stream()
-            .map(|sid| OVERFLOW_STALL_GRACE.saturating_sub(self.stalled_for(sid)))
-            .unwrap_or(OVERFLOW_EMERGENCY_WAIT);
-        remaining.min(OVERFLOW_EMERGENCY_WAIT)
-    }
-
-    /// Admit an overflow-bound event, parking it inline or returning the
-    /// verdict for the caller to execute outside the lock. Below the
-    /// emergency hard caps every frame parks and the watchdog reaps
-    /// consumers stalled past [`OVERFLOW_STALL_GRACE`]. At a hard cap a
-    /// past-grace stream is reaped on the spot; with every stalled stream
-    /// inside the grace the caller waits bounded
-    /// [`OVERFLOW_EMERGENCY_WAIT`] rounds for flush progress (woken via
-    /// the session overflow notify) — bounded TCP-style backpressure, and
-    /// each elapsed round re-judges, so a stream is only ever reaped once
-    /// its full grace has expired. Terminal events bypass the frame quota
-    /// but are capped per stream: the stream is already terminating, so
-    /// extras drop.
-    fn admit(&mut self, sid: u32, event: StreamEvent) -> OverflowAction {
-        if !matches!(event, StreamEvent::Data(_)) {
-            let terminals = self
-                .streams
-                .get(&sid)
-                .map(|stream| stream.terminal_events)
-                .unwrap_or_default();
-            if terminals >= MAX_OVERFLOW_TERMINAL_EVENTS {
-                return OverflowAction::Dropped;
-            }
-            self.push_back(sid, event);
-            return OverflowAction::Parked;
-        }
-        if self.limit_for(sid, &event).is_none() {
-            self.push_back(sid, event);
-            return OverflowAction::Parked;
-        }
-        let Some(hard) = self.hard_limit() else {
-            self.push_back(sid, event);
-            return OverflowAction::Parked;
-        };
-        if let Some(victim_sid) = self.most_stalled_past_grace() {
-            return OverflowAction::Kill(self.take_victim(victim_sid, hard), event);
-        }
-        OverflowAction::Wait(event, self.emergency_wait())
-    }
 }
 
 /// Per-stream demux delivery channel.
@@ -692,49 +215,6 @@ impl Drop for StreamRegistration {
     }
 }
 
-/// One ordered writer command. Data commands hold a queue permit until
-/// popped (bounded → backpressure); control commands ride the reserved
-/// headroom so SYN/FIN can never be starved by payload.
-enum FrameCommand {
-    Data {
-        sid: u32,
-        payload: bytes::Bytes,
-        _permit: tokio::sync::OwnedSemaphorePermit,
-        completion: Option<tokio::sync::oneshot::Sender<bool>>,
-    },
-    Control {
-        cmd: u8,
-        sid: u32,
-        payload: bytes::Bytes,
-    },
-}
-
-impl FrameCommand {
-    /// Serialized size (header + payload).
-    fn wire_len(&self) -> usize {
-        let payload = match self {
-            FrameCommand::Data { payload, .. } | FrameCommand::Control { payload, .. } => {
-                payload.len()
-            }
-        };
-        FRAME_HEADER_LEN + payload
-    }
-
-    /// Append the serialized frame to `buf`.
-    fn encode_into(&self, buf: &mut bytes::BytesMut) {
-        use bytes::BufMut as _;
-        let (cmd, sid, payload) = match self {
-            FrameCommand::Data { sid, payload, .. } => (CMD_PSH, *sid, payload),
-            FrameCommand::Control { cmd, sid, payload } => (*cmd, *sid, payload),
-        };
-        debug_assert!(payload.len() <= u16::MAX as usize);
-        buf.put_u8(cmd);
-        buf.put_u32(sid);
-        buf.put_u16(payload.len() as u16);
-        buf.extend_from_slice(payload);
-    }
-}
-
 /// Session writer queue: every frame goes out in enqueue order through a
 /// single task — no cross-stream mutex, and a cancelled caller can never
 /// truncate a queued frame (only a physical write failure closes the
@@ -753,256 +233,6 @@ struct WriterQueue {
 #[derive(Default)]
 struct SynackPending {
     sids: std::collections::HashMap<u32, Option<tokio::task::AbortHandle>>,
-}
-
-/// Total writer-queue depth (data + control headroom).
-const WRITER_QUEUE_CAP: usize = 1024;
-/// Slots reserved for control frames (SYN/FIN/HEART) — data can never
-/// fill the queue past `WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED`.
-const WRITER_CONTROL_RESERVED: usize = 128;
-/// sing-anytls bounds control writes at five seconds. A stuck shared writer
-/// must become terminal instead of remaining selectable by the session pool.
-/// Data batches stay unbounded like upstream: under uplink congestion the
-/// queue cap backpressures streams instead of killing the session and every
-/// sibling flow with it.
-const WRITER_IO_TIMEOUT: Duration = Duration::from_secs(5);
-
-impl WriterQueue {
-    fn new() -> Self {
-        Self {
-            queue: parking_lot::Mutex::new(std::collections::VecDeque::new()),
-            notify: tokio::sync::Notify::new(),
-            data_permits: Arc::new(tokio::sync::Semaphore::new(
-                WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED,
-            )),
-            closed: AtomicBool::new(false),
-        }
-    }
-
-    /// Push commands atomically as one batch (the SYN+PSH opening pair is
-    /// never interleaved with another stream's frame).
-    fn push_batch<const N: usize>(&self, cmds: [FrameCommand; N]) -> Result<(), [FrameCommand; N]> {
-        let mut queue = self.queue.lock();
-        if self.closed.load(Ordering::Acquire) || queue.len().saturating_add(N) > WRITER_QUEUE_CAP {
-            return Err(cmds);
-        }
-        queue.extend(cmds);
-        drop(queue);
-        self.notify.notify_one();
-        Ok(())
-    }
-
-    async fn pop(&self) -> Option<FrameCommand> {
-        loop {
-            if let Some(cmd) = self.queue.lock().pop_front() {
-                return Some(cmd);
-            }
-            if self.closed.load(Ordering::Acquire) {
-                return None;
-            }
-            self.notify.notified().await;
-        }
-    }
-
-    /// Move up to `max_frames` already-queued commands (staying under
-    /// `max_bytes` of serialized payload) to the end of `out` without
-    /// blocking. Only drains what is queued *now* — never waits, so it adds
-    /// no latency to a live writer loop.
-    fn drain_available(&self, out: &mut Vec<FrameCommand>, max_frames: usize, max_bytes: usize) {
-        let mut queue = self.queue.lock();
-        let mut bytes = 0usize;
-        let mut taken = 0usize;
-        while taken < max_frames {
-            let Some(front) = queue.front() else { break };
-            let next = bytes + front.wire_len();
-            if next > max_bytes {
-                break;
-            }
-            bytes = next;
-            out.push(queue.pop_front().expect("front checked"));
-            taken += 1;
-        }
-    }
-
-    fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
-    }
-
-    fn close(&self) {
-        let mut queue = self.queue.lock();
-        self.closed.store(true, Ordering::Release);
-        queue.clear();
-        self.data_permits.close();
-        drop(queue);
-        self.notify.notify_one();
-    }
-}
-
-/// Batch caps for the writer's opportunistic gather: after the blocking
-/// pop, at most this many extra queued frames (or this many serialized
-/// bytes) ride the same `write_all` + single `flush`. Only what is already
-/// queued is taken — batching never waits, so it adds no latency.
-const WRITER_BATCH_MAX_FRAMES: usize = 64;
-const WRITER_BATCH_MAX_BYTES: usize = 256 * 1024;
-
-async fn write_padded<W>(
-    writer: &mut W,
-    mut payload: &[u8],
-    scheme: &PaddingScheme,
-    packet: u32,
-) -> std::io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let Some(instructions) = (packet < scheme.stop)
-        .then(|| scheme.packets.get(&packet))
-        .flatten()
-    else {
-        return writer.write_all(payload).await;
-    };
-
-    for instruction in instructions {
-        let PaddingInstruction::Range(start, end) = instruction else {
-            if payload.is_empty() {
-                return Ok(());
-            }
-            continue;
-        };
-        let target = PaddingScheme::sample_range(*start, *end);
-        if payload.len() > target {
-            writer.write_all(&payload[..target]).await?;
-            payload = &payload[target..];
-        } else if !payload.is_empty() {
-            let padding_len = target.saturating_sub(payload.len() + FRAME_HEADER_LEN);
-            if padding_len == 0 {
-                writer.write_all(payload).await?;
-            } else {
-                let mut padded = Vec::with_capacity(payload.len() + FRAME_HEADER_LEN + padding_len);
-                padded.extend_from_slice(payload);
-                padded.push(CMD_WASTE);
-                padded.extend_from_slice(&0u32.to_be_bytes());
-                padded.extend_from_slice(&(padding_len as u16).to_be_bytes());
-                padded.resize(padded.len() + padding_len, 0);
-                writer.write_all(&padded).await?;
-            }
-            payload = &[];
-        } else {
-            let mut waste = vec![0; FRAME_HEADER_LEN + target];
-            waste[0] = CMD_WASTE;
-            waste[5..7].copy_from_slice(&(target as u16).to_be_bytes());
-            writer.write_all(&waste).await?;
-        }
-    }
-    if !payload.is_empty() {
-        writer.write_all(payload).await?;
-    }
-    Ok(())
-}
-
-/// The single writer task for a session: drains the queue in order and
-/// gather-writes whole batches per flush — one `write_all` of the
-/// concatenated frames instead of a header/payload write pair plus flush
-/// per frame (profiling showed flush-per-frame dominating CPU at line
-/// rate). Order is preserved; framing is byte-level so batches are
-/// transparent to the peer. A physical write failure kills the session
-/// (sing `writeControlFrame` parity) — frames already queued are lost
-/// with it.
-async fn session_writer(
-    session: Arc<AnyTlsSession>,
-    mut write: BoxedWriter,
-    queue: Arc<WriterQueue>,
-) {
-    let mut batch: Vec<FrameCommand> = Vec::with_capacity(WRITER_BATCH_MAX_FRAMES);
-    let mut buf = bytes::BytesMut::with_capacity(64 * 1024);
-    let mut packet = 0u32;
-    let mut send_padding = true;
-    loop {
-        let Some(first) = queue.pop().await else {
-            break;
-        };
-        let initial = matches!(
-            &first,
-            FrameCommand::Control {
-                cmd: CMD_SETTINGS,
-                ..
-            }
-        );
-        batch.push(first);
-        let next_packet = packet.wrapping_add(1);
-        let padding = session.padding_state.snapshot();
-        let apply_padding = send_padding && next_packet < padding.stop;
-        if send_padding && !apply_padding {
-            send_padding = false;
-        }
-        let extra_frames = if initial {
-            2
-        } else if apply_padding {
-            0
-        } else {
-            WRITER_BATCH_MAX_FRAMES - 1
-        };
-        queue.drain_available(&mut batch, extra_frames, WRITER_BATCH_MAX_BYTES);
-        buf.clear();
-        buf.reserve(batch.iter().map(FrameCommand::wire_len).sum());
-        for cmd in &batch {
-            cmd.encode_into(&mut buf);
-        }
-        packet = next_packet;
-        // The activity marker for any SYN in this batch must be sampled
-        // before the write: frames arriving while a blocked flush is still
-        // in flight belong to the window and must count as session activity.
-        let pre_write_activity = session.rx_frame_seq.load(Ordering::Relaxed);
-        let control_only = !batch
-            .iter()
-            .any(|cmd| matches!(cmd, FrameCommand::Data { .. }));
-        let write_op = async {
-            if apply_padding {
-                write_padded(&mut write, &buf, &padding, packet).await?;
-            } else {
-                write.write_all(&buf).await?;
-            }
-            write.flush().await
-        };
-        let write_result = if control_only {
-            tokio::time::timeout(WRITER_IO_TIMEOUT, write_op).await
-        } else {
-            Ok(write_op.await)
-        };
-        let write_error = match &write_result {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(format!("{e}")),
-            Err(_) => Some(format!("write timed out after {WRITER_IO_TIMEOUT:?}")),
-        };
-        let succeeded = write_error.is_none();
-        for command in &mut batch {
-            match command {
-                FrameCommand::Control {
-                    cmd: CMD_SYN, sid, ..
-                } if succeeded => {
-                    session.start_synack_deadline(*sid, pre_write_activity);
-                }
-                FrameCommand::Data { completion, .. } => {
-                    if let Some(completion) = completion.take() {
-                        let _ = completion.send(succeeded);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        batch.clear();
-        if let Some(reason) = write_error {
-            debug!(
-                "AnyTLS session {} writer failed, closing: {}",
-                session.seq, reason
-            );
-            session.fail(anyhow::anyhow!("writer task write failed: {reason}"));
-            break;
-        }
-        if session.is_closed() {
-            break;
-        }
-    }
 }
 
 /// Session pool plus server-specific padding state for one AnyTLS node.
@@ -1102,6 +332,7 @@ pub(crate) struct AnyTlsSession {
     /// Stream-slot capacity: the single capacity truth (replaces the old
     /// active_streams counter — a permit outlives the counter's races).
     stream_permits: Arc<tokio::sync::Semaphore>,
+    capacity_notify: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
     /// Shared across every physical session retained or draining under the
     /// originating node pool.
     inbound_payload_budget: Arc<InboundPayloadBudget>,
@@ -1152,6 +383,7 @@ impl AnyTlsSession {
             overflow_notify: tokio::sync::Notify::new(),
             watchdog: Mutex::new(None),
             stream_permits: Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS_PER_SESSION)),
+            capacity_notify: std::sync::OnceLock::new(),
             inbound_payload_budget,
             inbound_budget_epoch: AtomicU64::new(0),
             demux: Mutex::new(None),
@@ -1317,22 +549,26 @@ impl AnyTlsSession {
         payload: bytes::Bytes,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> std::io::Result<tokio::sync::oneshot::Receiver<bool>> {
-        if self.is_closed() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "AnyTLS session is closed",
-            ));
-        }
-
         let (completion, completed) = tokio::sync::oneshot::channel();
-        self.writer_q
-            .push_batch([FrameCommand::Data {
+        let queued = {
+            let streams = self.streams.lock().unwrap();
+            if !streams.contains_key(&sid) {
+                return Err(Self::stream_not_registered_error());
+            }
+            if self.is_closed() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "AnyTLS session is closed",
+                ));
+            }
+            self.writer_q.push_batch([FrameCommand::Data {
                 sid,
                 payload,
                 _permit: permit,
                 completion: Some(completion),
             }])
-            .map_err(|_| self.writer_queue_error())?;
+        };
+        queued.map_err(|_| self.writer_queue_error())?;
         Ok(completed)
     }
 
@@ -1400,20 +636,25 @@ impl AnyTlsSession {
         payload: bytes::Bytes,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> std::io::Result<()> {
-        if self.is_closed() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "AnyTLS session is closed",
-            ));
-        }
-        self.writer_q
-            .push_batch([FrameCommand::Data {
+        let queued = {
+            let streams = self.streams.lock().unwrap();
+            if !streams.contains_key(&sid) {
+                return Err(Self::stream_not_registered_error());
+            }
+            if self.is_closed() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "AnyTLS session is closed",
+                ));
+            }
+            self.writer_q.push_batch([FrameCommand::Data {
                 sid,
                 payload,
                 _permit: permit,
                 completion: None,
             }])
-            .map_err(|_| self.writer_queue_error())
+        };
+        queued.map_err(|_| self.writer_queue_error())
     }
 
     async fn write_uot_datagram(&self, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
@@ -1514,15 +755,20 @@ impl AnyTlsSession {
         Ok((sid, rx, guard))
     }
 
+    fn stream_not_registered_error() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "AnyTLS stream is no longer registered",
+        )
+    }
+
     fn ensure_stream_registered(&self, sid: u32) -> std::io::Result<()> {
-        if self.streams.lock().unwrap().contains_key(&sid) {
-            Ok(())
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "AnyTLS UoT stream is no longer registered",
-            ))
-        }
+        self.streams
+            .lock()
+            .unwrap()
+            .contains_key(&sid)
+            .then_some(())
+            .ok_or_else(Self::stream_not_registered_error)
     }
 
     fn tcp_sink_is_live(&self, sid: u32) -> bool {
@@ -1712,19 +958,15 @@ impl AnyTlsSession {
             handle.abort();
         }
         self.writer_q.close();
+        if let Some(notify) = self.capacity_notify.get() {
+            notify.notify_waiters();
+        }
         debug!("AnyTLS session {} for {} closed", self.seq, self.addr);
     }
 
-    /// Deliver a server payload frame to its stream. TCP sinks park a
-    /// full per-stream queue into the session overflow (flushed later by
-    /// the reader's progress — see [`Self::flush_overflow`]). Below the
-    /// emergency hard caps parking never waits: every frame parks and the
-    /// stall watchdog resets consumers with no flush progress past
-    /// [`OVERFLOW_STALL_GRACE`] — parked bytes are not a stall (a fast
-    /// peer bursts megabytes before the reader task is first scheduled),
-    /// only missing flush progress past the grace kills. At a hard cap
-    /// the demux waits bounded rounds for that progress (see
-    /// [`Self::park_overflow`]). A saturated UoT sink retires only its sid.
+    /// Deliver a server TCP payload without blocking the demultiplexer.
+    /// Full per-stream queues park in SID order until reader progress, while
+    /// the stall watchdog resets only consumers idle past the grace period.
     #[cfg(test)]
     async fn dispatch_data(self: &Arc<Self>, sid: u32, data: Vec<u8>) {
         let (credit, _wait) = self
@@ -1741,43 +983,28 @@ impl AnyTlsSession {
     }
 
     async fn dispatch_payload(self: &Arc<Self>, sid: u32, data: InboundPayload) {
-        let sink = self.streams.lock().unwrap().get(&sid).cloned();
-        match sink {
-            Some(StreamSink::Tcp(tx)) => {
-                let delivery_owner = data.delivery_owner();
-                let delivery = delivery_owner.delivery_guard();
-                if !self.tcp_sink_is_live(sid) {
-                    return;
-                }
-                if self.overflow_has(sid) {
-                    drop(delivery);
-                    self.park_overflow(sid, StreamEvent::Data(data)).await;
-                    return;
-                }
-                let result = tx.try_send(StreamEvent::Data(data));
-                drop(delivery);
-                match result {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(ev)) => {
-                        self.park_overflow(sid, ev).await;
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        self.end_stream(sid, false);
-                    }
-                }
+        let Some(StreamSink::Tcp(tx)) = self.streams.lock().unwrap().get(&sid).cloned() else {
+            return;
+        };
+        let delivery_owner = data.delivery_owner();
+        let delivery = delivery_owner.delivery_guard();
+        if !self.tcp_sink_is_live(sid) {
+            return;
+        }
+        if self.overflow_has(sid) {
+            drop(delivery);
+            self.park_overflow(sid, StreamEvent::Data(data)).await;
+            return;
+        }
+        let result = tx.try_send(StreamEvent::Data(data));
+        drop(delivery);
+        match result {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(ev)) => {
+                self.park_overflow(sid, ev).await;
             }
-            Some(StreamSink::Uot(tx)) => {
-                if tx.try_send(StreamEvent::Data(data)).is_err() {
-                    self.end_uot_stream(sid, true);
-                }
-            }
-            None => {
-                debug!(
-                    "AnyTLS session {} PSH for unknown sid={} ({} bytes)",
-                    self.seq,
-                    sid,
-                    data.len()
-                );
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.end_stream(sid, false);
             }
         }
     }
@@ -1805,195 +1032,6 @@ impl AnyTlsSession {
                 Err(_) => self.end_uot_stream(sid, false),
             },
             None => {}
-        }
-    }
-
-    fn overflow_sink_is_live(&self, sid: u32) -> bool {
-        let closed = match self.streams.lock().unwrap().get(&sid) {
-            Some(StreamSink::Tcp(tx)) => tx.is_closed(),
-            Some(StreamSink::Uot(_)) | None => return false,
-        };
-        if closed {
-            self.end_stream(sid, false);
-            false
-        } else {
-            true
-        }
-    }
-
-    fn overflow_has(&self, sid: u32) -> bool {
-        self.overflow.lock().has(sid)
-    }
-
-    fn discard_overflow(&self, sid: u32) -> OverflowUsage {
-        self.overflow.lock().remove_stream(sid)
-    }
-
-    fn clear_overflow(&self) -> OverflowUsage {
-        self.overflow.lock().clear()
-    }
-
-    fn kill_overflow_victim(&self, victim: OverflowVictim) {
-        let Some(queue_capacity) = self.kill_stream(victim.sid) else {
-            return;
-        };
-        let stall_ms = u64::try_from(victim.stalled_for.as_millis()).unwrap_or(u64::MAX);
-        warn!(
-            session = self.seq,
-            victim_sid = victim.sid,
-            cap_reason = victim.limit.as_str(),
-            after_stall_grace = victim.stalled_for >= OVERFLOW_STALL_GRACE,
-            session_frames = victim.session.frames,
-            session_bytes = victim.session.bytes,
-            stream_frames = victim.stream.frames,
-            stream_bytes = victim.stream.bytes,
-            stall_ms,
-            queue_capacity,
-            "AnyTLS overflow killed stream"
-        );
-        if self
-            .enqueue_control(CMD_FIN, victim.sid, bytes::Bytes::new())
-            .is_err()
-        {
-            self.fail(anyhow::anyhow!("writer queue unavailable on overflow kill"));
-        }
-    }
-
-    async fn park_overflow(self: &Arc<Self>, sid: u32, mut event: StreamEvent) {
-        loop {
-            if !self.overflow_sink_is_live(sid) {
-                self.discard_overflow(sid);
-                return;
-            }
-
-            let wait = self.overflow_notify.notified();
-            tokio::pin!(wait);
-            wait.as_mut().enable();
-
-            let action = self.overflow.lock().admit(sid, event);
-            match action {
-                OverflowAction::Parked => {
-                    self.flush_overflow(sid);
-                    if !self.overflow_sink_is_live(sid) {
-                        self.discard_overflow(sid);
-                    }
-                    self.ensure_watchdog();
-                    return;
-                }
-                OverflowAction::Dropped => return,
-                OverflowAction::Kill(victim, returned) => {
-                    let own = victim.sid == sid;
-                    self.kill_overflow_victim(victim);
-                    if own {
-                        return;
-                    }
-                    event = returned;
-                }
-                OverflowAction::Wait(returned, wait_for) => {
-                    event = returned;
-                    let _ = tokio::time::timeout(wait_for, wait).await;
-                }
-            }
-        }
-    }
-
-    fn ensure_watchdog(self: &Arc<Self>) {
-        if self.overflow.lock().is_empty() {
-            return;
-        }
-        let mut handle = self.watchdog.lock().unwrap();
-        if handle.is_none() {
-            let session = Arc::clone(self);
-            *handle = Some(
-                tokio::spawn(async move { session.run_overflow_watchdog().await }).abort_handle(),
-            );
-        }
-    }
-
-    async fn run_overflow_watchdog(self: &Arc<Self>) {
-        let mut ticker = tokio::time::interval(OVERFLOW_WATCHDOG_TICK);
-        loop {
-            ticker.tick().await;
-            if self.is_closed() {
-                return;
-            }
-            let victim = {
-                let mut overflow = self.overflow.lock();
-                if overflow.is_empty() {
-                    *self.watchdog.lock().unwrap() = None;
-                    return;
-                }
-                overflow
-                    .most_stalled_past_grace()
-                    .map(|sid| overflow.take_victim(sid, OverflowLimit::StallGrace))
-            };
-            if let Some(victim) = victim {
-                self.kill_overflow_victim(victim);
-            }
-        }
-    }
-
-    fn flush_overflow(&self, sid: u32) {
-        if self.drain_overflow(sid) {
-            self.overflow_notify.notify_waiters();
-        }
-    }
-
-    /// Returns whether any parked event reached the stream queue.
-    fn drain_overflow(&self, sid: u32) -> bool {
-        {
-            let mut overflow = self.overflow.lock();
-            if !overflow.has(sid) || !overflow.request_flush(sid) {
-                return false;
-            }
-        }
-
-        let mut moved = false;
-        loop {
-            let tx = match self.streams.lock().unwrap().get(&sid).cloned() {
-                Some(StreamSink::Tcp(tx)) => tx,
-                _ => {
-                    let mut overflow = self.overflow.lock();
-                    overflow.remove_stream(sid);
-                    overflow.cancel_flush(sid);
-                    drop(overflow);
-                    return moved;
-                }
-            };
-
-            let mut overflow = self.overflow.lock();
-            let last_progress_at = overflow.last_progress_at(sid);
-            let Some(event) = overflow.pop_front(sid) else {
-                if overflow.finish_flush(sid) {
-                    drop(overflow);
-                    continue;
-                }
-                drop(overflow);
-                return moved;
-            };
-            match tx.try_send(event) {
-                Ok(()) => {
-                    overflow.note_progress(sid);
-                    moved = true;
-                }
-                Err(mpsc::error::TrySendError::Full(event)) => {
-                    overflow.push_front(sid, event);
-                    overflow.restore_last_progress_at(sid, last_progress_at);
-                    if overflow.finish_flush(sid) {
-                        drop(overflow);
-                        continue;
-                    }
-                    drop(overflow);
-                    return moved;
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    overflow.remove_stream(sid);
-                    overflow.cancel_flush(sid);
-                    drop(overflow);
-                    self.end_stream(sid, false);
-                    return moved;
-                }
-            }
         }
     }
 
@@ -2045,6 +1083,14 @@ impl crate::session::ManagedSession for AnyTlsSession {
     fn close(&self) {
         AnyTlsSession::close(self)
     }
+    fn bind_capacity_notify(&self, notify: Arc<tokio::sync::Notify>) {
+        if let Err(notify) = self.capacity_notify.set(notify) {
+            assert!(
+                Arc::ptr_eq(self.capacity_notify.get().unwrap(), &notify),
+                "session cannot belong to multiple pools"
+            );
+        }
+    }
     fn state(&self) -> crate::session::SessionState {
         match self.session_state.load(Ordering::Acquire) {
             0 => crate::session::SessionState::Active,
@@ -2055,12 +1101,19 @@ impl crate::session::ManagedSession for AnyTlsSession {
     /// GOAWAY/max-age: stop taking new streams; the pool stops offering
     /// this session and existing streams run to the end.
     fn begin_drain(&self) {
-        let _ = self.session_state.compare_exchange(
-            crate::session::SessionState::Active as usize,
-            crate::session::SessionState::Draining as usize,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        if self
+            .session_state
+            .compare_exchange(
+                crate::session::SessionState::Active as usize,
+                crate::session::SessionState::Draining as usize,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+            && let Some(notify) = self.capacity_notify.get()
+        {
+            notify.notify_waiters();
+        }
     }
     fn created_at(&self) -> Instant {
         self.created
@@ -2166,7 +1219,7 @@ async fn dial_session(
         let padding = padding_state.snapshot();
         let settings = padding.settings_payload();
         let (read, write, auth) =
-            connect_transport(node, addr, connect_timeout, None, tls_connector, &padding).await?;
+            connect_transport(node, addr, connect_timeout, tls_connector, &padding).await?;
         AnyTlsSession::establish(
             addr,
             read,
@@ -2191,23 +1244,17 @@ fn authentication_payload(password: &str, padding: &PaddingScheme) -> Vec<u8> {
     auth
 }
 
-/// Connect to the AnyTLS server (using `tcp` when the caller provides a
-/// pre-connected stream), wrap it in TLS, and build packet 0 authentication.
+/// Connect to the AnyTLS server, wrap it in TLS, and build packet 0 authentication.
 async fn connect_transport(
     node: &Node,
     addr: &str,
     connect_timeout: Duration,
-    tcp: Option<TcpStream>,
     tls_connector: Option<Arc<TlsConnector>>,
     padding: &PaddingScheme,
 ) -> anyhow::Result<(BoxedReader, BoxedWriter, Vec<u8>)> {
-    let auth = authentication_payload(AnyTlsHandler::resolve_password(node), padding);
-
-    let tcp = match tcp {
-        Some(tcp) => tcp,
-
-        None => crate::util::connect_outbound(addr, connect_timeout).await?,
-    };
+    let password = node.anytls().unwrap().password.as_deref().unwrap_or("");
+    let auth = authentication_payload(password, padding);
+    let tcp = crate::util::connect_outbound(addr, connect_timeout).await?;
     debug!("AnyTLS: TCP connected to {}", addr);
 
     let connector = match tls_connector {
@@ -2236,10 +1283,6 @@ impl AnyTlsHandler {
     /// Create a new AnyTLS handler.
     pub fn new() -> Self {
         Self
-    }
-
-    fn resolve_password(node: &Node) -> &str {
-        node.anytls().unwrap().password.as_deref().unwrap_or("")
     }
 
     /// Lazily start the pool janitor for this node (once per pool).
@@ -2303,31 +1346,6 @@ impl AnyTlsHandler {
         Ok(())
     }
 
-    /// Keeps cancellation observable without opening a physical session.
-    #[cfg(test)]
-    async fn dial_udp_transport_speculative_with<F, Fut>(
-        &self,
-        node: &Node,
-        pool: Arc<AnyTlsPool>,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        dial: F,
-    ) -> anyhow::Result<PreparedUdpTransport>
-    where
-        F: FnOnce() -> Fut + Send,
-        Fut: Future<Output = anyhow::Result<Arc<AnyTlsSession>>> + Send,
-    {
-        Self::dial_udp_transport_speculative_for_pool_with(
-            node,
-            pool,
-            target,
-            target_domain,
-            None,
-            dial,
-        )
-        .await
-    }
-
     /// Prepare an AnyTLS UoT transport on an explicitly captured pool without
     /// publishing a detached session or starting the janitor. The injected
     /// dial seam keeps cancellation observable in tests.
@@ -2357,10 +1375,7 @@ impl AnyTlsHandler {
                         anyhow::bail!("AnyTLS speculative dial cancelled by pool shutdown")
                     }
                 };
-                reservation.attach(&session)?;
-                let permit = session.try_reserve().ok_or_else(|| {
-                    anyhow::anyhow!("fresh AnyTLS session has no stream capacity")
-                })?;
+                let permit = reservation.attach(&session)?;
                 (session, permit, Some(reservation))
             }
         };
@@ -2375,82 +1390,16 @@ impl AnyTlsHandler {
             })?;
         let transport: Arc<dyn PacketTransport> = transport;
 
-        if let Some(reservation) = detached {
-            let commit_node = node.clone();
-            let commit_pool = Arc::clone(&pool);
-            let commit_runtime = runtime.clone();
-            return Ok(PreparedUdpTransport::new(transport, move || async move {
-                reservation.commit()?;
-                if commit_runtime.is_some() {
-                    Self::ensure_janitor(&commit_node, &commit_pool, commit_runtime);
-                }
-                Ok(())
-            }));
-        }
-
         let commit_node = node.clone();
-        Ok(PreparedUdpTransport::new(transport, move || async move {
+        Ok(PreparedUdpTransport::new(async move {
+            if let Some(reservation) = detached {
+                reservation.commit()?;
+            }
             if runtime.is_some() {
                 Self::ensure_janitor(&commit_node, &pool, runtime);
             }
-            Ok(())
+            Ok(transport)
         }))
-    }
-
-    async fn dial_udp_transport_for_pool(
-        &self,
-        node: Arc<Node>,
-        pool: Arc<AnyTlsPool>,
-        target: SocketAddr,
-        target_domain: Option<&str>,
-        connect_timeout: Duration,
-        runtime: Option<Arc<crate::runtime::NodeRuntime>>,
-    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        if !crate::descriptor::network_allows_udp(&node) {
-            anyhow::bail!("node '{}' does not allow UDP", node.name);
-        }
-
-        let addr = format!("{}:{}", node.host(), node.port);
-        if runtime.as_ref().is_some_and(|r| !r.is_ephemeral()) {
-            Self::ensure_janitor(node.as_ref(), &pool, runtime.clone());
-        }
-        let dial_node = Arc::clone(&node);
-        let dial_addr = addr.clone();
-        let padding_state = pool.padding_state();
-        let inbound_payload_budget = pool.inbound_payload_budget();
-        let transport = pool
-            .open_with(
-                move || {
-                    let node = Arc::clone(&dial_node);
-                    let addr = dial_addr.clone();
-                    let runtime = runtime.clone();
-                    let padding_state = Arc::clone(&padding_state);
-                    let inbound_payload_budget = Arc::clone(&inbound_payload_budget);
-                    async move {
-                        let tls_connector = runtime
-                            .as_ref()
-                            .map(|runtime| runtime.anytls_tls_connector())
-                            .transpose()?;
-                        dial_session(
-                            node.as_ref(),
-                            &addr,
-                            connect_timeout,
-                            tls_connector,
-                            padding_state,
-                            inbound_payload_budget,
-                        )
-                        .await
-                    }
-                },
-                move |session, permit| {
-                    let domain = target_domain.map(str::to_string);
-                    async move { session.open_packet(permit, target, domain.as_deref()).await }
-                },
-            )
-            .await?;
-
-        let transport: Arc<dyn PacketTransport> = transport;
-        Ok(transport)
     }
 }
 
@@ -2749,15 +1698,48 @@ impl PacketOutbound for AnyTlsHandler {
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let pool = runtime.anytls_pool()?;
         let node = Arc::clone(&runtime.node);
-        self.dial_udp_transport_for_pool(
-            node,
-            pool,
-            target,
-            target_domain,
-            connect_timeout,
-            Some(runtime),
-        )
-        .await
+        if !crate::descriptor::network_allows_udp(&node) {
+            anyhow::bail!("node '{}' does not allow UDP", node.name);
+        }
+
+        if !runtime.is_ephemeral() {
+            Self::ensure_janitor(&node, &pool, Some(Arc::clone(&runtime)));
+        }
+        let dial_node = Arc::clone(&node);
+        let dial_runtime = Arc::clone(&runtime);
+        let dial_addr = format!("{}:{}", node.host(), node.port);
+        let padding_state = pool.padding_state();
+        let inbound_payload_budget = pool.inbound_payload_budget();
+        let transport = pool
+            .open_with(
+                move || {
+                    let node = Arc::clone(&dial_node);
+                    let runtime = Arc::clone(&dial_runtime);
+                    let addr = dial_addr.clone();
+                    let padding_state = Arc::clone(&padding_state);
+                    let inbound_payload_budget = Arc::clone(&inbound_payload_budget);
+                    async move {
+                        let tls_connector = runtime.anytls_tls_connector()?;
+                        dial_session(
+                            &node,
+                            &addr,
+                            connect_timeout,
+                            Some(tls_connector),
+                            padding_state,
+                            inbound_payload_budget,
+                        )
+                        .await
+                    }
+                },
+                move |session, permit| {
+                    let domain = target_domain.map(str::to_string);
+                    async move { session.open_packet(permit, target, domain.as_deref()).await }
+                },
+            )
+            .await?;
+
+        let transport: Arc<dyn PacketTransport> = transport;
+        Ok(transport)
     }
 
     async fn dial_udp_transport_speculative_runtime(
@@ -2871,6 +1853,5 @@ where
     Ok((cmd, sid, data))
 }
 
-/// Compute the lowercase hex MD5 digest of a byte slice.
 #[cfg(test)]
 mod tests;

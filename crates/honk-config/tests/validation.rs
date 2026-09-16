@@ -279,6 +279,183 @@ mod node_collection_admission {
     }
 
     #[test]
+    fn incompatible_vless_fields_report_once_without_changing_node_identity() {
+        use honk_config::diagnostic::{DiagnosticSources, SettingPath};
+        use honk_config::node::NodeSeed;
+        use serde::de::DeserializeSeed as _;
+        use serde_json::json;
+
+        let canonical = canonical_socks5_node();
+        let base = serde_json::to_value(&canonical).unwrap();
+        for (fields, expected) in [
+            (json!({}), vec![]),
+            (json!({"packet_encoding": null, "multiplex": null}), vec![]),
+            (
+                json!({"packet_encoding": "auto", "multiplex": {"protocol": "off"}}),
+                vec![],
+            ),
+            (
+                json!({"packet_encoding": "xudp", "multiplex": {"protocol": "xray", "tcp": 8}, "tls": true}),
+                vec!["multiplex", "packet_encoding", "tls"],
+            ),
+        ] {
+            let mut input = base.clone();
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let mut diagnostics = Vec::new();
+            let node = NodeSeed {
+                diagnostics: &mut diagnostics,
+                source: DiagnosticSources::new(None).root(),
+                setting: SettingPath::new("nodes").index(1),
+            }
+            .deserialize(input)
+            .unwrap();
+            assert_eq!(node.id, canonical.id);
+            assert_eq!(node.outbound, canonical.outbound);
+            if expected.is_empty() {
+                assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            } else {
+                assert_eq!(diagnostics.len(), 1);
+                let diagnostic = &diagnostics[0];
+                assert_eq!(diagnostic.code, "incompatible-node-fields");
+                assert_eq!(diagnostic.setting.to_string(), "nodes[1]");
+                assert!(!diagnostic.terminal);
+                let SafeValue::Fields(mut fields) = diagnostic.value.clone() else {
+                    panic!("discarded fields must be safe schema names");
+                };
+                fields.sort_unstable();
+                assert_eq!(fields, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn structured_vless_mux_rejects_invalid_limits_and_missing_shared_tcp() {
+        use honk_config::diagnostic::Severity;
+        use honk_config::node::{Udp443Policy, VlessMultiplex, VlessUdpMux};
+        use std::num::NonZeroU16;
+
+        let base = Node::from_share_link(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?security=tls",
+        )
+        .unwrap();
+        for (tcp, udp) in [
+            (NonZeroU16::new(129), VlessUdpMux::Protocol),
+            (None, VlessUdpMux::Separate(NonZeroU16::new(129).unwrap())),
+            (None, VlessUdpMux::SharedTcp),
+        ] {
+            for network in [None, Some("tcp")] {
+                let mut node = base.clone();
+                let vless = node.vless_mut().unwrap();
+                vless.multiplex = VlessMultiplex::Xray {
+                    tcp,
+                    udp,
+                    udp443: Udp443Policy::Allow,
+                };
+                vless.network = network.map(str::to_owned);
+                assert!(node.validate().is_err(), "{tcp:?}, {udp:?}, {network:?}");
+                for rejected in [
+                    serde_json::from_str::<Node>(&serde_json::to_string(&node).unwrap()).is_err(),
+                    serde_yaml::from_str::<Node>(&serde_yaml::to_string(&node).unwrap()).is_err(),
+                    toml::from_str::<Node>(&toml::to_string(&node).unwrap()).is_err(),
+                ] {
+                    assert!(rejected, "{tcp:?}, {udp:?}, {network:?}");
+                }
+
+                let config = config_with_node(node);
+                let error = config.validate_detailed().unwrap_err();
+                assert_eq!(error.diagnostic.setting.to_string(), "nodes[1].multiplex");
+                for (extension, text) in [
+                    ("json", serde_json::to_string(&config).unwrap()),
+                    ("yaml", serde_yaml::to_string(&config).unwrap()),
+                    ("toml", toml::to_string(&config).unwrap()),
+                ] {
+                    let file = tempfile::Builder::new()
+                        .suffix(&format!(".{extension}"))
+                        .tempfile()
+                        .unwrap();
+                    std::fs::write(file.path(), text).unwrap();
+                    let mut diagnostics = Vec::new();
+                    let error = Config::from_file_with_detailed_diagnostics(
+                        file.path().to_str().unwrap(),
+                        &mut diagnostics,
+                    )
+                    .unwrap_err();
+                    assert_eq!(error.diagnostic.code, "invalid-config-value");
+                    assert_eq!(error.diagnostic.setting.to_string(), "nodes[1].multiplex");
+                    assert_eq!(error.diagnostic.entry_index, Some(1));
+                    assert_eq!(error.diagnostic.severity, Severity::Error);
+                    assert!(error.diagnostic.terminal);
+                    assert_eq!(diagnostics.iter().filter(|d| d.terminal).count(), 1);
+                    assert!(diagnostics.iter().all(|d| d.severity == Severity::Error));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn structured_reality_intent_requires_nonblank_key() {
+        use serde_json::json;
+
+        for protocol in ["trojan", "vmess"] {
+            for enabled in [false, true] {
+                let base: Node = serde_json::from_value(json!({
+                    "name": "endpoint",
+                    "protocol": protocol,
+                    "address": "192.0.2.10:443",
+                    "host": "192.0.2.10",
+                    "port": 443,
+                    "password": "00000000-0000-0000-0000-000000000001",
+                    "tls": enabled,
+                }))
+                .unwrap();
+                for (key, short_id, spider_x, valid) in [
+                    (None, None, None, true),
+                    (Some(""), None, None, false),
+                    (Some(" \t"), None, None, false),
+                    (None, Some("a1b2"), None, false),
+                    (None, Some(""), None, false),
+                    (None, None, Some("/"), false),
+                    (None, None, Some(""), false),
+                    (Some("AAA"), None, None, true),
+                    (Some("AAA"), Some(""), None, true),
+                ] {
+                    let mut node = base.clone();
+                    let tls = node.tls_mut().unwrap();
+                    tls.reality_public_key = key.map(str::to_owned);
+                    tls.reality_short_id = short_id.map(str::to_owned);
+                    tls.reality_spider_x = spider_x.map(str::to_owned);
+                    node.id = node.derive_id();
+                    let config = config_with_node(node);
+                    let mut diagnostics = Vec::new();
+                    let loaded = Config::from_json_str_with_detailed_diagnostics(
+                        &serde_json::to_string(&config).unwrap(),
+                        &mut diagnostics,
+                    );
+                    if valid {
+                        config.validate().unwrap();
+                        loaded.unwrap().validate().unwrap();
+                    } else {
+                        for error in [config.validate_detailed().unwrap_err(), loaded.unwrap_err()]
+                        {
+                            assert_eq!(error.category, ErrorCategory::Validation);
+                            assert_eq!(error.diagnostic.code, "invalid-config-value");
+                            assert_eq!(
+                                error.diagnostic.setting.to_string(),
+                                "nodes[1].reality_public_key"
+                            );
+                            assert_eq!(error.diagnostic.entry_index, Some(1));
+                            assert!(error.diagnostic.terminal);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn c20_config_admission_preserves_canonical_identity() {
         let canonical = canonical_socks5_node();
         let config = Config {
@@ -342,5 +519,92 @@ mod node_collection_admission {
         assert_eq!(error.diagnostic.setting.to_string(), "nodes[1]");
         assert_eq!(error.diagnostic.entry_index, Some(1));
         assert_eq!(error.diagnostic.value, SafeValue::Ordinal(1));
+    }
+}
+
+mod share_link_security {
+    use base64::Engine as _;
+    use honk_config::node::Node;
+
+    const AUTHORITY: &str = "00000000-0000-0000-0000-000000000001@example.com:443";
+    const PUBLIC_KEY: &str = "jHkr1EmJCyQxjU0HXJlNblVdXB4Z7yODHJhgJ5lqmzc";
+
+    #[test]
+    fn trojan_reality_preserves_authentication_intent() {
+        let node = Node::from_share_link(&format!(
+            "trojan://pw@example.com:443?security=reality&pbk={PUBLIC_KEY}&sid=ab&spx=%2Fmask&sni=mask.example"
+        ))
+        .unwrap();
+        let tls = node.tls().unwrap();
+        assert_eq!(tls.effective_reality_public_key(), Ok(Some(PUBLIC_KEY)));
+        assert_eq!(tls.reality_short_id.as_deref(), Some("ab"));
+        assert_eq!(tls.reality_spider_x.as_deref(), Some("/mask"));
+        assert_eq!(tls.sni.as_deref(), Some("mask.example"));
+
+        let implicit = Node::from_share_link(&format!(
+            "trojan://pw@example.com:443?pbk={PUBLIC_KEY}&tls=1"
+        ))
+        .unwrap();
+        assert_eq!(
+            implicit.tls().unwrap().effective_reality_public_key(),
+            Ok(Some(PUBLIC_KEY))
+        );
+        assert_eq!(
+            implicit.tls().unwrap().reality_spider_x.as_deref(),
+            Some("/")
+        );
+        for query in [
+            "security=reality",
+            "security=reality&pbk=",
+            "sid=ab",
+            "tls=0",
+        ] {
+            assert!(
+                Node::from_share_link(&format!("trojan://pw@example.com:443?{query}")).is_err()
+            );
+        }
+        for query in ["security=reality", "pbk=AAA"] {
+            assert!(
+                Node::from_share_link(&format!("anytls://pw@example.com:443?{query}")).is_err()
+            );
+        }
+        let default = Node::from_share_link("trojan://pw@example.com:443").unwrap();
+        let ignored_tls = Node::from_share_link("trojan://pw@example.com:443?tls=true").unwrap();
+        assert_eq!(default.outbound, ignored_tls.outbound);
+        assert_eq!(default.id, ignored_tls.id);
+    }
+
+    #[test]
+    fn repeated_tls_claims_are_order_independent() {
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(AUTHORITY);
+        for authority in [AUTHORITY, encoded.as_str()] {
+            for query in [
+                "security=tls&security=none",
+                "security=none&security=tls",
+                "tls=1&tls=0",
+                "tls=0&tls=1",
+                "security=none&tls=1",
+                "tls=0&security=tls",
+            ] {
+                let mut diagnostics = Vec::new();
+                let error = Node::from_share_link_with_detailed_diagnostics(
+                    &format!("vless://{authority}?{query}"),
+                    &mut diagnostics,
+                )
+                .unwrap_err();
+                assert_eq!(error.diagnostic.setting.to_string(), "nodes.tls");
+            }
+            for (query, enabled) in [
+                ("security=tls&security=tls&tls=1&tls=1", true),
+                ("security=none&tls=0&security=none&tls=0", false),
+            ] {
+                let node = Node::from_share_link(&format!("vless://{authority}?{query}")).unwrap();
+                assert_eq!(node.tls().unwrap().enabled, enabled);
+            }
+        }
+        let canonical = Node::from_share_link(&format!("vless://{AUTHORITY}")).unwrap();
+        let shadowrocket = Node::from_share_link(&format!("vless://{encoded}")).unwrap();
+        assert!(canonical.tls().unwrap().enabled);
+        assert!(!shadowrocket.tls().unwrap().enabled);
     }
 }
