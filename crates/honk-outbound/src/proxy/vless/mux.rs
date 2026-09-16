@@ -867,9 +867,7 @@ impl VlessMuxUdpTransport {
 
 impl Drop for VlessMuxUdpTransport {
     fn drop(&mut self) {
-        if let Ok(mut writer) = self.writer.try_lock() {
-            writer.send.send_reset(h2::Reason::CANCEL);
-        }
+        self.writer.get_mut().send.send_reset(h2::Reason::CANCEL);
     }
 }
 

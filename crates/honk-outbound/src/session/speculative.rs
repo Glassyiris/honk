@@ -160,9 +160,10 @@ impl<S: ManagedSession + 'static> DetachedSessionReservation<S> {
             }
         };
         if attached {
-            self.pool
-                .try_reserve(session)
-                .ok_or_else(|| anyhow!("detached session has no stream capacity"))
+            self.pool.try_reserve(session).ok_or_else(|| {
+                anyhow::Error::new(crate::proxy::PacketRejection::Capacity)
+                    .context("detached session has no stream capacity")
+            })
         } else {
             session.close();
             Err(SessionPool::<S>::pool_closed_err())

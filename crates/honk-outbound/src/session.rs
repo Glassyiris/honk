@@ -730,7 +730,10 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 // Active means capacity raced us; Draining means GOAWAY or
                 // protocol exhaustion raced us. Both retain live streams and
                 // must stay tracked while the next attempt finds a carrier.
-                last_err = Some(anyhow!("session has no stream capacity"));
+                last_err = Some(
+                    anyhow::Error::new(crate::proxy::PacketRejection::Capacity)
+                        .context("session has no stream capacity"),
+                );
                 continue;
             };
             // A shared session is already physically admitted; time the

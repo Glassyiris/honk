@@ -54,6 +54,38 @@ async fn detached_checkout_shutdown_closes_attached_session_and_rejects_commit()
     assert_eq!(pool.metrics().sessions, 0);
 }
 
+#[tokio::test]
+async fn detached_capacity_refusal_is_health_neutral_and_rolls_back() {
+    let pool = Arc::new(SessionPool::new(SessionPoolConfig {
+        max_sessions: 1,
+        ..Default::default()
+    }));
+    let SpeculativeCheckout::Detached(mut reservation) = pool.checkout_speculative().await.unwrap()
+    else {
+        panic!("empty pool must reserve a detached dial");
+    };
+    let session = ReservedTestSession::new(1);
+    let held = session.try_reserve().unwrap();
+    let error = reservation.attach(&session).unwrap_err();
+    assert_eq!(
+        crate::proxy::packet_rejection(&error),
+        Some(crate::proxy::PacketRejection::Capacity)
+    );
+    assert_eq!(
+        crate::group::ScoreOutcome::from_error(&error),
+        crate::group::ScoreOutcome::Rejected
+    );
+
+    drop(reservation);
+    drop(held);
+    assert!(session.is_closed());
+    assert_eq!(pool.metrics().sessions, 0);
+    assert!(matches!(
+        pool.checkout_speculative().await.unwrap(),
+        SpeculativeCheckout::Detached(_)
+    ));
+}
+
 #[tokio::test(start_paused = true)]
 async fn provisional_slot_does_not_block_normal_offer() {
     let pool = Arc::new(pool(SessionPoolConfig {

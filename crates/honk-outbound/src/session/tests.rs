@@ -56,6 +56,8 @@ struct ReservedTestSession {
     capacity: usize,
     // Release after taking a stale capacity snapshot, before the caller can park.
     release_on_check: Mutex<Option<SessionPermit<Self>>>,
+    // Occupy the last slot after offer's snapshot but before its reservation.
+    compete_on_reserve: AtomicBool,
 }
 
 impl ReservedTestSession {
@@ -66,6 +68,7 @@ impl ReservedTestSession {
             stream_permits: Arc::new(tokio::sync::Semaphore::new(capacity)),
             capacity,
             release_on_check: Mutex::new(None),
+            compete_on_reserve: AtomicBool::new(false),
         })
     }
 }
@@ -98,7 +101,13 @@ impl ManagedSession for ReservedTestSession {
         if self.state() != SessionState::Active {
             return None;
         }
+        let competing = self.compete_on_reserve.load(Ordering::Relaxed).then(|| {
+            Arc::clone(&self.stream_permits)
+                .try_acquire_owned()
+                .unwrap()
+        });
         let permit = Arc::clone(&self.stream_permits).try_acquire_owned();
+        drop(competing);
         drop(self.release_on_check.lock().take());
         let permit = permit.ok()?;
         if self.state() != SessionState::Active {

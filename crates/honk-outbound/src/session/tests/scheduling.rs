@@ -348,6 +348,45 @@ async fn pre_reservation_drain_does_not_close_live_session() {
 }
 
 #[tokio::test]
+async fn stream_capacity_race_is_a_health_neutral_refusal() {
+    let pool = SessionPool::new(SessionPoolConfig {
+        max_sessions: 1,
+        max_streams_per_session: 1,
+        ..Default::default()
+    });
+    let session = ReservedTestSession::new(1);
+    pool.insert(&session);
+    session.compete_on_reserve.store(true, Ordering::Relaxed);
+
+    let error = pool
+        .open_with(
+            || async { unreachable!("the offered session has capacity") },
+            |_session, _permit| async { Ok::<_, OpenError>(()) },
+        )
+        .await
+        .expect_err("both reservations must lose the last stream slot");
+    assert_eq!(
+        crate::proxy::packet_rejection(&error),
+        Some(crate::proxy::PacketRejection::Capacity)
+    );
+    assert_eq!(
+        crate::group::ScoreOutcome::from_error(&error),
+        crate::group::ScoreOutcome::Rejected
+    );
+    assert_eq!(session.state(), SessionState::Active);
+
+    session.compete_on_reserve.store(false, Ordering::Relaxed);
+    let reused = pool
+        .open_with(
+            || async { unreachable!("capacity races must not invalidate the session") },
+            |session, _permit| async { Ok::<_, OpenError>(session) },
+        )
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&reused, &session));
+}
+
+#[tokio::test]
 async fn offer_registers_before_checking_capacity() {
     let pool = SessionPool::new(SessionPoolConfig {
         max_sessions: 1,
