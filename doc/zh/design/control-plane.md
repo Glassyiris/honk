@@ -174,9 +174,10 @@ memory 或 scheduler capacity。TCP 从描述符导出的 floor 开始，封顶 
 
 每个方向的首次 splice 同时是 capability probe。在任何字节到达目的 socket 前返回 `EINVAL`、`ENOSYS` 或 `EXDEV`，即可无损回退到用户态 copy，并设置进程全局 latch；后续连接跳过 probe。其他错误，或字节已经暂存后返回 unsupported，会使中继失败，而不是冒数据丢失风险。TLS 或协议包装流使用 `relay_auto`，它始终使用基于 select 的 copy loop。
 
-copy pump 在读取新输入前先 flush 嗅探或协议设置阶段已缓冲的字节，再使用
-Tokio 原生 copier；输入暂时空闲时也会 flush 待发字节。每个方向使用默认
-8 KiB 缓冲区，不要求应用再发一个请求或关闭连接才能送出当前请求。
+copy pump 在读取新输入前先 flush 嗅探或协议设置阶段已缓冲的字节；输入暂时
+空闲时也会 flush 待发字节。每个方向使用 65,535 字节缓冲区，使满载 read
+恰好容纳一个最大 AnyTLS frame，不拆成 8 KiB write，也不留下单字节尾帧。
+应用不需要再发一个请求或关闭连接才能送出当前请求。
 
 首次 EOF 后，两条中继路径只限制空闲排空时间：`DRAIN_DEADLINE` 是没有任何字节进展的 30 秒。活跃 survivor 可以运行超过 30 秒；静默 survivor 不能无限持有 accepted socket。
 

@@ -2,7 +2,7 @@
 //!
 //! Handles bidirectional data relay between a client connection and a
 //! proxy connection. Wrapped streams (TLS/protocol) use async I/O with
-//! a pair of `tokio::io::copy` pumps; when both ends are plain `TcpStream`s
+//! a pair of frame-sized async copy loops; when both ends are plain `TcpStream`s
 //! (direct connections), the `splice` module relays them zero-copy via
 //! `splice(2)` with automatic fallback to the copy path.
 //!
@@ -146,6 +146,9 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ReadCounter<S> 
 /// [`splice::DRAIN_DEADLINE`] for why the drain must be bounded.
 const DRAIN_DEADLINE: std::time::Duration = splice::DRAIN_DEADLINE;
 
+// A saturated read fits one AnyTLS frame without a one-byte tail.
+const RELAY_BUF_SIZE: usize = u16::MAX as usize;
+
 /// Copy one direction until EOF, then half-close the destination's write
 /// side (same contract as `copy_bidirectional`). Bytes read are counted
 /// into `progress` so the drain supervisor can tell a stalled survivor
@@ -160,10 +163,34 @@ where
     W: AsyncWrite + Unpin,
 {
     // Sniffing or protocol setup may already have buffered bytes before the
-    // copier starts; copy only flushes writes it performs itself.
+    // relay starts, independently of bytes read by this copy loop.
     wr.flush().await?;
     let mut rd = ReadCounter::wrap(rd, progress, None);
-    let n = tokio::io::copy(&mut rd, wr).await?;
+    let mut buffer = vec![0; RELAY_BUF_SIZE];
+    let mut n = 0;
+    loop {
+        let read = std::future::poll_fn(|cx| {
+            use std::pin::Pin;
+            use std::task::{Poll, ready};
+
+            let mut chunk = tokio::io::ReadBuf::new(&mut buffer);
+            match Pin::new(&mut rd).poll_read(cx, &mut chunk) {
+                Poll::Ready(result) => Poll::Ready(result.map(|()| chunk.filled().len())),
+                Poll::Pending => {
+                    // copy_buf waits here without flushing buffered protocol writes.
+                    ready!(Pin::new(&mut *wr).poll_flush(cx))?;
+                    Poll::Pending
+                }
+            }
+        })
+        .await?;
+        if read == 0 {
+            break;
+        }
+        wr.write_all(&buffer[..read]).await?;
+        n += read as u64;
+    }
+    wr.flush().await?;
     wr.shutdown().await?;
     Ok(n)
 }
@@ -290,6 +317,72 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
     use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn saturated_relay_keeps_large_frames_and_partial_write_integrity() {
+        struct FramedWriter {
+            bytes: Vec<u8>,
+            frames: usize,
+            limit: usize,
+            pending: bool,
+        }
+
+        impl AsyncWrite for FramedWriter {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                self.pending = !self.pending;
+                if self.pending {
+                    cx.waker().wake_by_ref();
+                    return std::task::Poll::Pending;
+                }
+                let n = buf.len().min(self.limit);
+                self.bytes.extend_from_slice(&buf[..n]);
+                self.frames += 1;
+                std::task::Poll::Ready(Ok(n))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let payload: Vec<u8> = (0..3 * u16::MAX as usize).map(|n| n as u8).collect();
+        for limit in [u16::MAX as usize, 4093] {
+            let mut source = payload.as_slice();
+            let mut writer = FramedWriter {
+                bytes: Vec::new(),
+                frames: 0,
+                limit,
+                pending: false,
+            };
+            let progress = Arc::new(AtomicU64::new(0));
+            let copied = copy_way(&mut source, &mut writer, Arc::clone(&progress))
+                .await
+                .unwrap();
+            assert_eq!(writer.bytes, payload);
+            assert_eq!(copied, payload.len() as u64);
+            assert_eq!(progress.load(Ordering::Relaxed), copied);
+            if limit == u16::MAX as usize {
+                assert_eq!(
+                    writer.frames, 3,
+                    "saturated data must not fragment into small frames"
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn relay_tcp_flushes_buffered_request_without_client_eof() {
