@@ -272,7 +272,7 @@ VLESS has three independent choices. `udp=0|1` controls whether packet dialing i
 | `padding` | `false` | Boolean, valid only with `mux=h2mux`; selects sing-mux v1 padding. |
 | `concurrency` | `0` | Signed `i16`, valid only with `mux=xray`: negative disables TCP mux, zero allows 8 concurrent logical children per TCP carrier, and a positive value sets that per-carrier concurrency, capped at 128. It does not set the number of physical carriers. |
 | `xudpConcurrency` | `0` | Signed `i16`, valid only with `mux=xray`: negative uses the protocol fallback; zero shares the TCP pool and its per-carrier concurrency when TCP mux is enabled (otherwise the protocol fallback); a positive value creates a separate UDP pool with that many concurrent logical children per carrier, capped at 128. |
-| `xudpProxyUDP443` | `reject` | `reject`, `skip`, or `allow`, valid only with `mux=xray`; the exact UDP/443 precedence is below. |
+| `xudpProxyUDP443` | `allow` | `reject`, `skip`, or `allow`, valid only with `mux=xray`; the exact UDP/443 precedence is below. |
 
 `packetEncoding`, `mux`, and each mux control may occur at most once. Repeated `udp` claims are accepted only when all values agree.
 
@@ -310,7 +310,7 @@ Every old mode has a direct capability-preserving replacement:
 | `xudp` | `xudp` | `off` | `1` | — |
 | `mux-cool` | `auto` | `xray` | `1` | `concurrency=0&xudpConcurrency=0&xudpProxyUDP443=skip` |
 
-The last row preserves TCP/UDP availability and the former Vision UDP/443 gate. It may use the protocol fallback rather than pooled XUDP for a skipped non-Vision UDP/443 target. Every admitted VLESS node uses the new identity derivation at this upgrade, as described under [Node identity](#node-identity).
+The last row preserves TCP/UDP availability. A skipped UDP/443 target uses the protocol fallback rather than pooled XUDP. UDP/443 is now allowed by default, including with Vision; use routing rules to block QUIC when desired. Every admitted VLESS node uses the new identity derivation at this upgrade, as described under [Node identity](#node-identity).
 
 Old `vless_mode` URI syntax is rejected. The parser also rejects ambiguous third-party URI spellings such as `smux`, `multiplex`, `udp-over-tcp`, `packet-encoding`, `packet_encoding`, `packet-addr`, `xudp`, `only-tcp`, Brutal controls, and H2 stream-count tuning; only the exact canonical parameters in the table above configure these choices.
 
@@ -318,7 +318,7 @@ Old `vless_mode` URI syntax is rejected. The parser also rejects ambiguous third
 
 Without Vision, `packetEncoding=auto` uses native VLESS UDP for destination ports 53 and 443 and Single XUDP elsewhere. With Vision, permitted targets use Single XUDP. Native sends accept 1–8190 bytes and Single XUDP sends 1–7526 bytes; empty or oversized sends are packet-local refusals, while a received zero-length frame is still a datagram.
 
-For `mux=xray`, UDP/443 policy is applied first. `reject` refuses UDP/443 even if both mux pools are disabled. `skip` selects `packetEncoding` and then applies the ordinary Vision gate. `allow` bypasses the Vision UDP/443 gate only when that target actually uses an Xray UDP mux pool; a protocol-fallback target still follows the normal gate. Outside Xray mux, base `xtls-rprx-vision` rejects UDP/443 and `xtls-rprx-vision-udp443` permits it while sending the base flow on the wire. Policy and capacity refusals are terminal for that attempt and health/Score-neutral; they never trigger another-node/direct fallback or automatic packet replay.
+UDP/443 is allowed by default, including with base `xtls-rprx-vision`. Block it explicitly in routing when desired, for example `l4proto(udp) && dport(443) -> block`, before a broader matching rule. For `mux=xray`, an explicit `reject` refuses UDP/443 even if both mux pools are disabled. `skip` selects `packetEncoding`; the default `allow` uses the configured UDP pool, or the protocol fallback when no pool is enabled. `xtls-rprx-vision-udp443` normalizes to base Vision; it no longer changes permission or identity, and the wire addon remains the base flow. Policy and capacity refusals are terminal for that attempt and health/Score-neutral; they never trigger another-node/direct fallback or automatic packet replay.
 
 Vision always requires a direct TCP path: `mux=off`, or `mux=xray` with TCP mux disabled. Every H2MUX TCP composition is invalid, including with Encryption. An Xray UDP-only pool is legal with Vision; with `concurrency=-1`, use a positive `xudpConcurrency` to create it. Unencrypted Vision additionally requires raw TCP over negotiated TLS 1.3 or REALITY. Encrypted Vision may retain its selected outer stream transport and random-XOR handling, but it still cannot enable TCP mux, H2MUX UDP, native UDP, or UoT v2; XUDP/Xray UDP or disabled UDP are valid.
 
@@ -345,7 +345,7 @@ For VLESS URL links, `security=reality` enables TLS and maps the REALITY query f
 | `sid` | Even-length hexadecimal short ID, at most 8 bytes; empty is valid. |
 | `spx` | Stored spider path; defaults to `/` when REALITY is selected. |
 | `flow=xtls-rprx-vision` | Enable Vision with the UDP/443 rules above. |
-| `flow=xtls-rprx-vision-udp443` | Enable Vision's ordinary UDP/443 exception; the wire addon remains the base flow. |
+| `flow=xtls-rprx-vision-udp443` | Normalizes to `xtls-rprx-vision`; UDP/443 is already allowed by default. |
 | `fp` | Accepted but ignored; global TLS mode owns the ClientHello fingerprint. |
 
 An explicit `security=` overrides the historical VLESS default: `none` disables TLS; any other value enables it. Without `security`, VLESS defaults TLS on. Standard VMess links use their v2rayN JSON `tls` field instead.

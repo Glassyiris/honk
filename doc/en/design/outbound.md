@@ -450,10 +450,10 @@ UDP permission, protocol packet encoding, and multiplexing are independent axes:
 Xray TCP concurrency zero means 8 and a negative value disables TCP mux. XUDP
 concurrency zero follows the TCP pool, negative returns UDP to its protocol
 encoding, and a positive value creates a separate UDP pool. Positive values
-normalize to `1..=128`. Its UDP/443 policy defaults to `reject`; that rejection
-still applies when Xray is enabled but both pools are disabled. `skip` uses the
-protocol encoding and then the ordinary Vision gate. `allow` bypasses Vision's
-port-443 gate only when the selected UDP path actually uses Mux.Cool.
+normalize to `1..=128`. Its UDP/443 policy defaults to `allow`: use the configured
+UDP pool, or the protocol encoding when no pool is enabled. An explicit `reject`
+remains terminal even with both pools disabled. `skip` selects the protocol
+encoding instead of the pool. Vision adds no implicit port-443 restriction.
 
 The client never probes the server for another path, retries with another
 framing, or replays a first UDP packet. Native VLESS uses u16-framed connected
@@ -588,11 +588,11 @@ stripped lazily on first read because it may arrive with target bytes. Vision
 removes response padding. Without VLESS Encryption it requires raw TCP with
 TLS 1.3 or REALITY; TCP multiplexing is always invalid, even when Encryption is
 enabled. UDP-only Xray multiplexing is legal. Vision rejects native, UoT, and H2
-UDP paths. Base `xtls-rprx-vision` rejects UDP/443 on the protocol fallback;
-`xtls-rprx-vision-udp443` permits that target over Single XUDP even with `mux=off`.
-For enabled Xray mux, `reject` remains terminal for either flow; `skip` uses the
-protocol fallback and its flow gate, while `allow` bypasses the base-flow gate
-only on an actual UDP mux path. The wire addon remains the base Vision flow.
+UDP paths. Base `xtls-rprx-vision` allows UDP/443 over Single XUDP, including
+with `mux=off`; users can block QUIC with routing rules. The input spelling
+`xtls-rprx-vision-udp443` normalizes to base Vision before identity and runtime
+reuse decisions. An explicit Xray `reject` remains terminal; `skip` uses the
+protocol fallback. The wire addon remains the base Vision flow.
 
 **Current limitation: Vision is downstream-only.** Honk removes response
 padding and honors downstream Direct commands, but does not add client-uplink

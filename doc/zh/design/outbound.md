@@ -398,9 +398,9 @@ target 缓冲限制取决于服务端版本，不是 honk 客户端统一的证�
 
 Xray TCP concurrency 为零表示 8，负值关闭 TCP mux。XUDP concurrency 为零
 跟随 TCP pool，负值让 UDP 回到协议 encoding，正值创建独立 UDP pool。正值
-规范化为 `1..=128`。UDP/443 policy 缺省为 `reject`；即使 Xray 已开启但两个
-pool 都关闭，该拒绝仍生效。`skip` 使用协议 encoding，再经过普通 Vision gate。
-只有所选 UDP path 确实使用 Mux.Cool 时，`allow` 才绕过 Vision 的 443 gate。
+规范化为 `1..=128`。UDP/443 policy 缺省为 `allow`：使用配置的 UDP pool，
+没有 pool 时使用协议 encoding。显式 `reject` 即使在两个 pool 都关闭时仍是
+终态；`skip` 使用协议 encoding 而不是 pool。Vision 不隐式限制 443 端口。
 
 客户端绝不探测另一条服务端 path、以其他 framing 重试或重放首个 UDP packet。
 原生 VLESS 使用 u16 分帧的 connected command-UDP，不发送 UoT magic destination
@@ -519,10 +519,10 @@ carrier 独立保留，不能挤掉空闲 replacement；idle 回收和解除保�
 lazy strip，因为它可能与目标字节同时到达。Vision 移除 response padding。
 没有 VLESS Encryption 时，它要求 raw TCP 搭配 TLS 1.3 或 REALITY。即使启用
 Encryption，TCP multiplex 也始终非法；仅 UDP 的 Xray multiplex 合法。Vision
-拒绝 native、UoT 与 H2 UDP path。基础 `xtls-rprx-vision` 在协议回退路径拒绝
-UDP/443；`xtls-rprx-vision-udp443` 即使在 `mux=off` 时也允许经 Single XUDP
-访问该端口。启用 Xray mux 后，`reject` 对两种 flow 都是终态；`skip` 使用协议
-回退并遵循对应 flow 的门槛，`allow` 仅在实际 UDP mux 路径绕过基础 flow 的限制。
+拒绝 native、UoT 与 H2 UDP path。基础 `xtls-rprx-vision` 默认允许经 Single
+XUDP 访问 UDP/443，包括 `mux=off`；用户可通过路由规则阻断 QUIC。
+输入拼写 `xtls-rprx-vision-udp443` 在身份派生与 runtime 复用判断前规范化为
+基础 Vision。显式 Xray `reject` 仍是终态，`skip` 使用协议回退。
 wire addon 始终是基础 Vision flow。
 
 **当前限制：Vision 只实现下行。** Honk 移除 response padding 并处理下行 Direct

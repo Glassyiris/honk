@@ -184,7 +184,7 @@ VLESS 字段会在派生节点身份前应用：
 
 对 H2MUX，`padding: true` 选择现有 padded wire 格式，false 选择无 padding 的 H2MUX。现有 `only-tcp`、Brutal 和非零 `max-connections`/`min-streams`/`max-streams` 限制不变。启用 H2MUX 与 Xray mux、UoT 互斥；启用 UoT 也与 Xray mux 互斥。显式 XUDP 与 H2MUX 或 UoT 冲突；原生/auto 声明只会在 wrapper 接管时不生效。
 
-启用的 Clash `mux` block 只接受名为 `enabled`、有符号 `i16` `concurrency`、有符号 `i16` `xudpConcurrency` 与 `xudpProxyUDP443` 的有效设置；非 active 的额外设置会被忽略。TCP concurrency 为零时允许每条 carrier 同时承载 8 个逻辑 child，负值关闭 TCP mux，正值设置最多 128 的逐 carrier 并发；它绝不表示物理 carrier 数量。XUDP concurrency 为零时共享已启用的 TCP pool 及其逐 carrier 并发；若 TCP mux 关闭，则使用 packet 回退；负值始终回退，正值建立独立 UDP pool，并以该值作为每条 carrier 的逻辑 child 并发（最多 128）。UDP/443 策略默认 `reject`，也接受 `skip` 或 `allow`；优先级见[节点参考](./nodes.md#vless-udp-and-multiplexing)。
+启用的 Clash `mux` block 只接受名为 `enabled`、有符号 `i16` `concurrency`、有符号 `i16` `xudpConcurrency` 与 `xudpProxyUDP443` 的有效设置；非 active 的额外设置会被忽略。TCP concurrency 为零时允许每条 carrier 同时承载 8 个逻辑 child，负值关闭 TCP mux，正值设置最多 128 的逐 carrier 并发；它绝不表示物理 carrier 数量。XUDP concurrency 为零时共享已启用的 TCP pool 及其逐 carrier 并发；若 TCP mux 关闭，则使用 packet 回退；负值始终回退，正值建立独立 UDP pool，并以该值作为每条 carrier 的逻辑 child 并发（最多 128）。UDP/443 策略默认 `allow`，也接受 `skip` 或 `reject`；优先级见[节点参考](./nodes.md#vless-udp-and-multiplexing)。
 
 `udp: false` 独立关闭 packet 拨号，不会关闭仍符合条件的裸 TCP 路径。别名冲突、重复 XUDP 表示、启用 packet-address、未支持的 packet encoding、未支持的 UoT version，或启用的 Xray mux 中无效/未支持的设置，也会使 VLESS Clash 条目被拒绝。
 

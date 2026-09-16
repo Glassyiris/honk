@@ -43,7 +43,7 @@ fn parse_xray_multiplex(mapping: &Mapping) -> Result<Option<VlessMultiplex>, &'s
         }
     }
     let udp443 = match yaml_value(options, "xudpProxyUDP443") {
-        None | Some(Value::Null) => Udp443Policy::Reject,
+        None | Some(Value::Null) => Udp443Policy::default(),
         Some(Value::String(value)) => match value.trim() {
             "reject" => Udp443Policy::Reject,
             "skip" => Udp443Policy::Skip,

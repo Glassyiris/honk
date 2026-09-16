@@ -36,7 +36,7 @@ global {
 
 VLESS 现由三个独立选项组合：`udp=0|1` 控制 packet 权限，`packetEncoding=auto|none|xudp|uot-v2` 选择非复用 UDP 回退路径，`mux=off|h2mux|xray` 选择 carrier 多路复用。规范链接默认允许 UDP、使用 `packetEncoding=auto` 和 `mux=off`；例如 `vless://00000000-0000-4000-8000-000000000001@edge.example:443?security=tls&packetEncoding=auto&mux=off&udp=1#edge`。未启用 Vision 时，Auto 对 53/443 使用原生 VLESS UDP；其他获准目标使用 Single XUDP。
 
-Vision 始终禁止 TCP 多路复用，但允许仅 UDP 的 Xray mux。基础 Vision 会在协议回退路径拒绝 UDP/443；实际 Xray UDP mux 只有 `allow` 策略能绕过该门槛。VLESS Encryption 可在 direct-TCP 与合法 XUDP/关闭 UDP 的路径规则下和 Vision 组合。Carrier 容量来自进程级文件描述符预算；容量耗尽属于本地且不影响健康的拒绝，不会触发回退或 packet 重放。XUDP Global ID 使用有作用域的所有权边界，不具备进程级无碰撞 NAT 语义。规范链接、迁移、组合及 REALITY 握手/pool 行为见[节点参考](doc/zh/reference/nodes.md#vless-udp-and-multiplexing)，生命周期及所有权见规范的 [VLESS 出站设计](doc/zh/design/outbound.md#sourcesession-ownership-and-capacity)。
+Vision 始终禁止 TCP 多路复用，但允许仅 UDP 的 Xray mux。默认允许 UDP/443，包括 Vision；是否阻断 QUIC 由用户路由规则决定，显式 Xray `reject` 仍是终态。VLESS Encryption 可在 direct-TCP 与合法 XUDP/关闭 UDP 的路径规则下和 Vision 组合。Carrier 容量来自进程级文件描述符预算；容量耗尽属于本地且不影响健康的拒绝，不会触发回退或 packet 重放。XUDP Global ID 使用有作用域的所有权边界，不具备进程级无碰撞 NAT 语义。规范链接、迁移、组合及 REALITY 握手/pool 行为见[节点参考](doc/zh/reference/nodes.md#vless-udp-and-multiplexing)，生命周期及所有权见规范的 [VLESS 出站设计](doc/zh/design/outbound.md#sourcesession-ownership-and-capacity)。
 
 当前 Vision 只实现下行 unpadding 与 Direct 处理；上行不添加 Vision padding，也不执行 Direct 切换，仍保留所选 outer transport。参见[支持边界](doc/zh/design/outbound.md)。
 

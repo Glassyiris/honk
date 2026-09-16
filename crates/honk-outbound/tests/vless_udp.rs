@@ -3,7 +3,9 @@
 #[path = "vless_udp/reality.rs"]
 mod reality;
 
-use honk_config::node::{Node, VlessTcpPath, VlessUdpEncoding, VlessUdpPath};
+use honk_config::node::{
+    Node, Udp443Policy, VlessMultiplex, VlessTcpPath, VlessUdpEncoding, VlessUdpPath,
+};
 use honk_outbound::ProxyRegistry;
 use honk_outbound::proxy::{
     PacketErrorClass, PacketRejection, is_packet_rejection, packet_error_class,
@@ -777,16 +779,34 @@ async fn official_xray_and_sing_box_vless_udp_loopback_interop() {
         .expect("VLESS TLS config")
         .skip_cert_verify = true;
     vision_base.id = vision_base.derive_id();
-    let denial = bounded("xray-vision-base-udp443-denied", async {
+    assert_eq!(
+        vision_base.vless().unwrap().udp_path(443),
+        Some(VlessUdpPath::Xudp)
+    );
+    udp_size_contract(
+        &registry,
+        "xray-vision-base-single-xudp-443",
+        &vision_base,
+        echoes.native_v6_443,
+        None,
+        XUDP_MAX,
+    )
+    .await;
+
+    let mut vision_reject = vision_base.clone();
+    vision_reject.vless_mut().unwrap().multiplex =
+        VlessMultiplex::xray(-1, -1, Udp443Policy::Reject);
+    vision_reject.id = vision_reject.derive_id();
+    let denial = bounded("xray-vision-explicit-udp443-reject", async {
         registry
             .dial_udp_transport(
-                &vision_base,
+                &vision_reject,
                 echoes.native_v6_443,
                 None,
                 Duration::from_secs(3),
             )
             .await
-            .expect_err("base Vision flow must deny UDP/443")
+            .expect_err("explicit policy must deny UDP/443")
     })
     .await;
     assert!(is_packet_rejection(&denial));
@@ -794,26 +814,6 @@ async fn official_xray_and_sing_box_vless_udp_loopback_interop() {
         cause.downcast_ref::<PacketRejection>(),
         Some(PacketRejection::Policy)
     )));
-
-    let mut vision_suffix = canonical_node(
-        xray_vision_port,
-        "xray-vision-udp443",
-        "&security=tls&sni=localhost&flow=xtls-rprx-vision-udp443",
-    );
-    vision_suffix
-        .tls_mut()
-        .expect("VLESS TLS config")
-        .skip_cert_verify = true;
-    vision_suffix.id = vision_suffix.derive_id();
-    udp_echo(
-        &registry,
-        "xray-vision-suffix-xudp-443",
-        &vision_suffix,
-        echoes.native_v6_443,
-        None,
-        512,
-    )
-    .await;
 
     for (udp_encoding, target, domain) in [
         (VlessUdpEncoding::Native, echoes.domain, Some("localhost")),
@@ -861,7 +861,7 @@ async fn official_xray_and_sing_box_vless_udp_loopback_interop() {
     let mut encrypted_vision = canonical_node(
         xray_encrypted_vision_port,
         "xray-encrypted-vision",
-        "&security=tls&sni=localhost&flow=xtls-rprx-vision-udp443&packetEncoding=auto&mux=xray&concurrency=-1&xudpConcurrency=4&xudpProxyUDP443=allow",
+        "&security=tls&sni=localhost&flow=xtls-rprx-vision&packetEncoding=auto&mux=xray&concurrency=-1&xudpConcurrency=4",
     );
     {
         let vless = encrypted_vision.vless_mut().expect("VLESS config");

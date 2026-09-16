@@ -84,7 +84,7 @@ explicit target. Pass dae-style targets to skip DNS:
 VLESS output uses only the display name and this normalized redacted shape:
 
 ```text
-vless/{plain|tls|reality}/{tcp|ws|grpc}[/vision|/vision-udp443]/tcp={plain|h2mux|mux-cool}/{udp-fallback=auto|native|xudp|uot-v2|udp=disabled}[/padding=true|false][/mux=TCP:UDP:POLICY]
+vless/{plain|tls|reality}/{tcp|ws|grpc}[/vision]/tcp={plain|h2mux|mux-cool}/{udp-fallback=auto|native|xudp|uot-v2|udp=disabled}[/padding=true|false][/mux=TCP:UDP:POLICY]
 ```
 
 `udp-fallback=` remains visible when a mux owns the current UDP target;

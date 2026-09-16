@@ -346,12 +346,18 @@ fn parsed_equivalent_vless_udp_fallbacks_reuse_runtime() {
                 "vless://{uuid}@example.com:443?security=tls&flow=xtls-rprx-vision&packetEncoding=auto&{common}#same-name"
             ),
             format!(
-                "vless://{uuid}@example.com:443?security=tls&flow=xtls-rprx-vision&packetEncoding=uot-v2&{common}#same-name"
+                "vless://{uuid}@example.com:443?security=tls&flow=xtls-rprx-vision&packetEncoding=xudp&{common}#same-name"
             ),
         ),
         (
             format!("vless://{uuid}@example.com:443?packetEncoding=auto&{common}#same-name"),
             format!("vless://{uuid}@example.com:443?packetEncoding=none&{common}#same-name"),
+        ),
+        (
+            format!("vless://{uuid}@example.com:443?security=tls&flow=xtls-rprx-vision#same-name"),
+            format!(
+                "vless://{uuid}@example.com:443?security=tls&flow=xtls-rprx-vision-udp443#same-name"
+            ),
         ),
     ] {
         let left = Node::from_share_link(&left).unwrap();

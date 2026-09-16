@@ -120,6 +120,7 @@ async fn udp_policy_denied_target_skips_dns_resolution() {
     let vless = node.vless_mut().unwrap();
     vless.network = None;
     vless.flow = Some("xtls-rprx-vision".into());
+    vless.multiplex = VlessMultiplex::xray(-1, -1, honk_config::node::Udp443Policy::Reject);
     assert_eq!(
         probe_udp_dns(
             &registry,
@@ -147,6 +148,7 @@ async fn udp_policy_denied_target_skips_quic_resolution() {
     let vless = node.vless_mut().unwrap();
     vless.network = None;
     vless.flow = Some("xtls-rprx-vision".into());
+    vless.multiplex = VlessMultiplex::xray(-1, -1, honk_config::node::Udp443Policy::Reject);
 
     assert_eq!(
         probe_udp_quic(
@@ -341,6 +343,7 @@ fn timed_out_vision_targets_are_rendered_per_port_policy() {
     let vless = node.vless_mut().unwrap();
     vless.network = None;
     vless.flow = Some("xtls-rprx-vision".into());
+    vless.multiplex = VlessMultiplex::xray(-1, -1, honk_config::node::Udp443Policy::Reject);
     let outcome = ProbeOutcome::timed_out(&registry, &node, &timeout_targets(443, 443));
     assert_eq!(outcome.udp_dns, None);
     assert_eq!(outcome.udp_quic, None);
@@ -348,10 +351,15 @@ fn timed_out_vision_targets_are_rendered_per_port_policy() {
     assert!(rendered.contains("dns: n/a"));
     assert!(rendered.contains("quic: n/a"));
 
-    node.vless_mut().unwrap().flow = Some("xtls-rprx-vision-udp443".into());
-    let outcome = ProbeOutcome::timed_out(&registry, &node, &timeout_targets(443, 443));
-    assert_eq!(outcome.udp_dns, Some(Err(ProbeFailureKind::Timeout)));
-    assert_eq!(outcome.udp_quic, Some(Err(ProbeFailureKind::Timeout)));
+    node.vless_mut().unwrap().multiplex = VlessMultiplex::Off;
+    let base_shape = vless_shape(&node);
+    for flow in ["xtls-rprx-vision", "xtls-rprx-vision-udp443"] {
+        node.vless_mut().unwrap().flow = Some(flow.into());
+        let outcome = ProbeOutcome::timed_out(&registry, &node, &timeout_targets(443, 443));
+        assert_eq!(outcome.udp_dns, Some(Err(ProbeFailureKind::Timeout)));
+        assert_eq!(outcome.udp_quic, Some(Err(ProbeFailureKind::Timeout)));
+        assert_eq!(vless_shape(&node), base_shape);
+    }
 }
 
 #[test]

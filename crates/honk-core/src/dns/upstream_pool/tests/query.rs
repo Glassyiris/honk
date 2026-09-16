@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
 use honk_config::dns::DnsStrategy;
-use honk_config::node::{OutboundConfig, TlsOptions, VlessConfig};
+use honk_config::node::{OutboundConfig, TlsOptions, Udp443Policy, VlessConfig, VlessMultiplex};
 use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
 use honk_config::types::NodeProtocol;
 use honk_outbound::proxy::{
@@ -354,18 +354,19 @@ async fn udp_cold_retry_rechecks_route_for_alternate_address() {
 }
 
 #[tokio::test]
-async fn doh3_base_vision_refusal_stops_resolved_route_fallback() {
+async fn doh3_explicit_udp443_refusal_stops_resolved_route_fallback() {
     let (bootstrap_address, bootstrap_task) = spawn_dual_stack_bootstrap(2).await;
     let resolver =
         honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{bootstrap_address}"));
     let mut denied = Node {
-        name: "base-vision".into(),
+        name: "denied-vision".into(),
         address: "127.0.0.1:443".into(),
         host: "127.0.0.1".into(),
         port: 443,
         outbound: OutboundConfig::Vless(VlessConfig {
             uuid: Some("00000000-0000-4000-8000-000000000001".into()),
             flow: Some("xtls-rprx-vision".into()),
+            multiplex: VlessMultiplex::xray(-1, -1, Udp443Policy::Reject),
             tls: TlsOptions {
                 enabled: true,
                 ..Default::default()
@@ -376,8 +377,8 @@ async fn doh3_base_vision_refusal_stops_resolved_route_fallback() {
     };
     denied.id = denied.derive_id();
     let mut allowed = denied.clone();
-    allowed.name = "vision-udp443".into();
-    allowed.vless_mut().unwrap().flow = Some("xtls-rprx-vision-udp443".into());
+    allowed.name = "allowed-vision".into();
+    allowed.vless_mut().unwrap().multiplex = VlessMultiplex::Off;
     allowed.id = allowed.derive_id();
     let route = |ip: &str, outbound: &str| RoutingRule {
         name: format!("route-{outbound}"),
@@ -429,7 +430,7 @@ async fn doh3_base_vision_refusal_stops_resolved_route_fallback() {
     let error = pool
         .query("vision-h3", &mock_dns_query(0x1234))
         .await
-        .expect_err("base Vision must refuse DoH3 UDP/443 without route fallback");
+        .expect_err("explicit policy must refuse DoH3 UDP/443 without route fallback");
 
     assert!(honk_outbound::proxy::is_packet_rejection(&error));
     assert_eq!(

@@ -726,7 +726,8 @@ fn apply_vless(
                 })?
                 .unwrap_or(0);
             let udp443 = match query.get("xudpProxyUDP443").map(String::as_str) {
-                None | Some("reject") => Udp443Policy::Reject,
+                None => Udp443Policy::default(),
+                Some("reject") => Udp443Policy::Reject,
                 Some("skip") => Udp443Policy::Skip,
                 Some("allow") => Udp443Policy::Allow,
                 Some(_) => {

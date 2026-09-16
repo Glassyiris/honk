@@ -836,7 +836,7 @@ impl<'a> WireOptions<'a> {
                 wire.encryption = config.encryption.as_deref();
                 wire.packet_encoding = Some(config.udp_encoding);
                 wire.multiplex = Some(&config.multiplex);
-                wire.flow = config.flow.as_deref();
+                wire.flow = config.wire_flow();
                 wire.network = config.network.as_deref();
                 wire.set_transport(&config.transport);
                 wire.set_tls(&config.tls);

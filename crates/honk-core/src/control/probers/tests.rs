@@ -346,7 +346,13 @@ async fn udp_policy_denial_skips_dns_before_dial_and_health_feedback() {
     let mut node = udp_test_node();
     node.name = "vision-vless".into();
     node.outbound = honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
+        uuid: Some("00000000-0000-4000-8000-000000000001".into()),
         flow: Some("xtls-rprx-vision".into()),
+        multiplex: honk_config::node::VlessMultiplex::xray(
+            -1,
+            -1,
+            honk_config::node::Udp443Policy::Reject,
+        ),
         tls: honk_config::node::TlsOptions {
             enabled: true,
             ..Default::default()

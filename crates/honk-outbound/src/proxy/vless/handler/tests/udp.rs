@@ -215,7 +215,7 @@ async fn packet_policy_precedes_every_vless_dial_path() {
     let handler = VLessHandler::new();
     let target: SocketAddr = "8.8.8.8:443".parse().unwrap();
     let node = Node::from_share_link(&format!(
-            "vless://b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3@127.0.0.1:{port}?flow=xtls-rprx-vision&udp=1#policy"
+            "vless://b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3@127.0.0.1:{port}?flow=xtls-rprx-vision&udp=1&mux=xray&concurrency=-1&xudpConcurrency=-1&xudpProxyUDP443=reject#policy"
         ))
         .unwrap();
     let deadline = std::time::Duration::from_secs(1);

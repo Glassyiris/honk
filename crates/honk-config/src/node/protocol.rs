@@ -328,7 +328,7 @@ impl OutboundConfig {
             tls.and_then(|tls| tls.reality_spider_x.as_deref())
                 .unwrap_or(""),
             match self {
-                Self::Vless(config) => config.flow.as_deref().unwrap_or(""),
+                Self::Vless(config) => config.wire_flow().unwrap_or(""),
                 _ => "",
             },
         ]

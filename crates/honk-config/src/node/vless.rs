@@ -91,9 +91,9 @@ impl<'de> Deserialize<'de> for VlessUdpMux {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Udp443Policy {
-    #[default]
     Reject,
     Skip,
+    #[default]
     Allow,
 }
 
@@ -257,6 +257,11 @@ impl VlessConfig {
     /// Canonicalize only equivalent or unreachable settings so identity and
     /// structural runtime reuse agree without changing any selected path.
     pub fn normalize(&mut self) {
+        if let Some(flow) = &mut self.flow
+            && flow == "xtls-rprx-vision-udp443"
+        {
+            flow.truncate("xtls-rprx-vision".len());
+        }
         if let Some(network) = &mut self.network
             && let Ok(enabled) = packet_network(network)
         {
@@ -268,7 +273,6 @@ impl VlessConfig {
             }
         }
         let vision = self.is_vision();
-        let vision_blocks_443 = self.flow.as_deref() == Some("xtls-rprx-vision");
         if vision && self.udp_encoding == VlessUdpEncoding::Xudp {
             self.udp_encoding = VlessUdpEncoding::Auto;
         }
@@ -284,15 +288,9 @@ impl VlessConfig {
                     }
                     VlessUdpMux::Protocol | VlessUdpMux::SharedTcp => {}
                 }
-                // Skip and Reject coincide when base Vision denies the only
-                // fallback target; without a UDP pool, Skip and Allow coincide.
-                if vision_blocks_443 && *udp443 == Udp443Policy::Skip {
-                    *udp443 = Udp443Policy::Reject;
-                }
                 if matches!(udp, VlessUdpMux::Protocol) {
-                    if vision_blocks_443 {
-                        *udp443 = Udp443Policy::Reject;
-                    } else if *udp443 == Udp443Policy::Skip {
+                    // Without a UDP pool, Skip and Allow select the same path.
+                    if *udp443 == Udp443Policy::Skip {
                         *udp443 = Udp443Policy::Allow;
                     }
                 } else if *udp443 != Udp443Policy::Skip
@@ -412,9 +410,6 @@ impl VlessConfig {
     }
 
     fn protocol_udp_path(&self, port: u16) -> Option<VlessUdpPath> {
-        if port == 443 && self.flow.as_deref() == Some("xtls-rprx-vision") {
-            return None;
-        }
         Some(match self.udp_encoding {
             VlessUdpEncoding::Auto if self.is_vision() || !matches!(port, 53 | 443) => {
                 VlessUdpPath::Xudp
@@ -499,6 +494,47 @@ mod tests {
         };
         skipped.normalize();
         assert_eq!(skipped.udp_encoding, VlessUdpEncoding::UotV2);
+    }
+
+    #[test]
+    fn vision_udp443_skip_preserves_protocol_fallback() {
+        let mut skipped = VlessConfig {
+            flow: Some("xtls-rprx-vision".into()),
+            multiplex: VlessMultiplex::xray(-1, 4, Udp443Policy::Skip),
+            ..Default::default()
+        };
+        skipped.normalize();
+        assert_eq!(skipped.udp_path(443), Some(VlessUdpPath::Xudp));
+        assert_eq!(skipped.udp_path(53), Some(VlessUdpPath::CoolSeparate));
+
+        let mut allowed = skipped.clone();
+        allowed.multiplex = VlessMultiplex::xray(-1, 4, Udp443Policy::Allow);
+        allowed.normalize();
+        assert_eq!(allowed.udp_path(443), Some(VlessUdpPath::CoolSeparate));
+        assert_ne!(
+            skipped.identity_fingerprint(),
+            allowed.identity_fingerprint()
+        );
+
+        for encoding in [VlessUdpEncoding::Native, VlessUdpEncoding::UotV2] {
+            let mut invalid = skipped.clone();
+            invalid.udp_encoding = encoding;
+            invalid.normalize();
+            assert!(invalid.validate("unused").is_err());
+        }
+
+        skipped.multiplex = VlessMultiplex::xray(-1, -1, Udp443Policy::Skip);
+        allowed.multiplex = VlessMultiplex::xray(-1, -1, Udp443Policy::Allow);
+        skipped.normalize();
+        allowed.normalize();
+        assert_eq!(skipped.udp_path(443), Some(VlessUdpPath::Xudp));
+        assert_eq!(skipped, allowed);
+
+        let mut rejected = allowed;
+        rejected.multiplex = VlessMultiplex::xray(-1, -1, Udp443Policy::Reject);
+        rejected.normalize();
+        assert_eq!(rejected.udp_path(443), None);
+        assert_eq!(rejected.udp_path(53), Some(VlessUdpPath::Xudp));
     }
 
     #[test]

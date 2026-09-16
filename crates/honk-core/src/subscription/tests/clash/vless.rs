@@ -173,7 +173,7 @@ fn external_vless_options_preserve_clash_defaults() {
         (
             "mux: { enabled: true }",
             VlessUdpEncoding::Auto,
-            VlessMultiplex::xray(0, 0, Udp443Policy::Reject),
+            VlessMultiplex::xray(0, 0, Udp443Policy::Allow),
             true,
         ),
         (
@@ -199,9 +199,9 @@ fn external_vless_options_preserve_clash_defaults() {
 }
 
 #[test]
-fn clash_projects_xray_mux_controls_into_canonical_config() {
+fn clash_xray_udp443_defaults_to_allow_and_preserves_explicit_reject() {
     let yaml = r#"proxies:
-  - name: xray-mux
+  - name: xray-default
     type: vless
     server: mux.example
     port: 443
@@ -210,7 +210,16 @@ fn clash_projects_xray_mux_controls_into_canonical_config() {
       enabled: true
       concurrency: -1
       xudpConcurrency: 4
-      xudpProxyUDP443: allow
+  - name: xray-reject
+    type: vless
+    server: mux.example
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    mux:
+      enabled: true
+      concurrency: -1
+      xudpConcurrency: 4
+      xudpProxyUDP443: reject
 "#;
     let nodes = parse_clash_subscription(yaml, None).unwrap();
     let config = nodes[0].vless().unwrap();
@@ -221,6 +230,12 @@ fn clash_projects_xray_mux_controls_into_canonical_config() {
     assert_eq!(config.udp_encoding, VlessUdpEncoding::Auto);
     assert!(config.udp_enabled());
     assert_eq!(nodes[0].id, nodes[0].derive_id());
+    assert_eq!(
+        config.udp_path(443),
+        Some(honk_config::node::VlessUdpPath::CoolSeparate)
+    );
+    assert_eq!(nodes[1].vless().unwrap().udp_path(443), None);
+    assert_ne!(nodes[0].id, nodes[1].id);
 }
 
 #[test]

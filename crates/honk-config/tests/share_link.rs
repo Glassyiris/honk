@@ -1737,7 +1737,7 @@ fn test_vless_vision_udp443_and_unreachable_native_fallback() {
     )
     .unwrap();
     let vless = opted_in.vless().unwrap();
-    assert_eq!(vless.flow.as_deref(), Some("xtls-rprx-vision-udp443"));
+    assert_eq!(vless.flow.as_deref(), Some("xtls-rprx-vision"));
     assert_eq!(vless.wire_flow(), Some("xtls-rprx-vision"));
     assert!(vless.is_vision());
     assert_eq!(vless.udp_path(443), Some(VlessUdpPath::Xudp));
@@ -1746,13 +1746,26 @@ fn test_vless_vision_udp443_and_unreachable_native_fallback() {
         "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&flow=xtls-rprx-vision",
     )
     .unwrap();
-    assert_eq!(base.vless().unwrap().udp_path(443), None);
+    assert_eq!(
+        base.vless().unwrap().udp_path(443),
+        Some(VlessUdpPath::Xudp)
+    );
+    assert_eq!(base.id, opted_in.id);
+    assert_eq!(base.outbound, opted_in.outbound);
+
+    let mut typed_alias = base.clone();
+    typed_alias.vless_mut().unwrap().flow = Some("xtls-rprx-vision-udp443".into());
+    assert_eq!(typed_alias.derive_id(), base.id);
+    typed_alias.vless_mut().unwrap().normalize();
+    assert_eq!(typed_alias.outbound, base.outbound);
 
     let tcp_only = Node::from_share_link(
         "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&packetEncoding=none&udp=false&flow=xtls-rprx-vision",
     )
     .unwrap();
     assert!(!tcp_only.vless().unwrap().udp_enabled());
+    assert_eq!(tcp_only.vless().unwrap().udp_path(443), None);
+    assert_eq!(tcp_only.vless().unwrap().udp_path(53), None);
 
     assert!(
         Node::from_share_link(
@@ -1760,6 +1773,103 @@ fn test_vless_vision_udp443_and_unreachable_native_fallback() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn test_vless_udp443_defaults_across_config_entrypoints() {
+    use honk_config::node::{TlsOptions, VlessConfig};
+
+    for (query, multiplex, typed_multiplex, expected) in [
+        (
+            "",
+            serde_json::json!({ "protocol": "off" }),
+            VlessMultiplex::Off,
+            VlessUdpPath::Xudp,
+        ),
+        (
+            "&mux=xray&concurrency=-1",
+            serde_json::json!({ "protocol": "xray" }),
+            VlessMultiplex::xray(-1, 0, Udp443Policy::default()),
+            VlessUdpPath::Xudp,
+        ),
+        (
+            "&mux=xray&concurrency=-1&xudpConcurrency=4",
+            serde_json::json!({ "protocol": "xray", "udp": { "separate": 4 } }),
+            VlessMultiplex::xray(-1, 4, Udp443Policy::default()),
+            VlessUdpPath::CoolSeparate,
+        ),
+    ] {
+        let linked = Node::from_share_link(&format!(
+            "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&flow=xtls-rprx-vision{query}"
+        ))
+        .unwrap();
+        let flat: Node = serde_json::from_value(serde_json::json!({
+            "name": "flat",
+            "protocol": "vless",
+            "address": "example.com:443",
+            "host": "example.com",
+            "port": 443,
+            "password": "b831381d-6324-4d53-ad4f-8cda48b30811",
+            "tls": true,
+            "flow": "xtls-rprx-vision",
+            "multiplex": multiplex,
+        }))
+        .unwrap();
+        let typed = VlessConfig {
+            flow: Some("xtls-rprx-vision".into()),
+            multiplex: typed_multiplex,
+            tls: TlsOptions {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for config in [linked.vless().unwrap(), flat.vless().unwrap(), &typed] {
+            assert_eq!(config.udp_path(443), Some(expected), "{query}");
+        }
+        assert_eq!(linked.derive_id(), flat.derive_id(), "{query}");
+    }
+
+    let ordinary = VlessConfig::default();
+    assert_eq!(ordinary.udp_path(53), Some(VlessUdpPath::Native));
+    assert_eq!(ordinary.udp_path(443), Some(VlessUdpPath::Native));
+    assert_eq!(ordinary.udp_path(54), Some(VlessUdpPath::Xudp));
+}
+
+#[test]
+fn test_vless_udp443_flow_alias_preserves_explicit_reject_and_disable() {
+    let base = "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&flow=xtls-rprx-vision";
+    let alias = format!("{base}-udp443");
+    for query in [
+        "&mux=xray&concurrency=-1&xudpProxyUDP443=reject",
+        "&mux=xray&concurrency=-1&xudpConcurrency=4&xudpProxyUDP443=reject",
+        "&mux=xray&concurrency=-1&xudpConcurrency=4&xudpProxyUDP443=allow&udp=0",
+    ] {
+        let canonical = Node::from_share_link(&format!("{base}{query}")).unwrap();
+        let alias = Node::from_share_link(&format!("{alias}{query}")).unwrap();
+        assert_eq!(alias.id, canonical.id);
+        assert_eq!(alias.outbound, canonical.outbound);
+        assert_eq!(alias.vless().unwrap().udp_path(443), None);
+        if query.ends_with("udp=0") {
+            assert_eq!(alias.vless().unwrap().udp_path(53), None);
+        } else {
+            assert!(alias.vless().unwrap().udp_path(53).is_some());
+            assert_eq!(
+                serde_json::to_value(&alias).unwrap()["multiplex"]["udp443"],
+                "reject"
+            );
+        }
+
+        for decoded in [
+            serde_json::from_str::<Node>(&serde_json::to_string(&alias).unwrap()).unwrap(),
+            serde_yaml::from_str::<Node>(&serde_yaml::to_string(&alias).unwrap()).unwrap(),
+            toml::from_str::<Node>(&toml::to_string(&alias).unwrap()).unwrap(),
+        ] {
+            assert_eq!(decoded.vless().unwrap().udp_path(443), None);
+            assert_eq!(decoded.outbound, alias.outbound);
+            assert_eq!(decoded.derive_id(), canonical.id);
+        }
+    }
 }
 
 #[test]

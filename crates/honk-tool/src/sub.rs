@@ -383,13 +383,7 @@ fn vless_shape(node: &Node) -> String {
         "grpc" => "grpc",
         _ => "unsupported",
     };
-    let vision = if !vless.is_vision() {
-        ""
-    } else if vless.flow.as_deref() == vless.wire_flow() {
-        "/vision"
-    } else {
-        "/vision-udp443"
-    };
+    let vision = if vless.is_vision() { "/vision" } else { "" };
     let tcp = match vless.tcp_path() {
         VlessTcpPath::Direct => "plain",
         VlessTcpPath::H2 => "h2mux",

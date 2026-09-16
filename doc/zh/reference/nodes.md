@@ -270,7 +270,7 @@ VLESS 有三个独立选择。`udp=0|1` 控制是否允许 packet 拨号，`pack
 | `padding` | `false` | 仅对 `mux=h2mux` 有效的 bool；选择 sing-mux v1 padding。 |
 | `concurrency` | `0` | 仅对 `mux=xray` 有效的有符号 `i16`：负值关闭 TCP mux，零允许每条 TCP carrier 同时承载 8 个逻辑 child，正值设置该逐 carrier 并发且最多 128；它不设置物理 carrier 数量。 |
 | `xudpConcurrency` | `0` | 仅对 `mux=xray` 有效的有符号 `i16`：负值使用协议回退；零在 TCP mux 启用时共享 TCP pool 及其逐 carrier 并发，否则使用协议回退；正值建立独立 UDP pool，每条 carrier 的逻辑 child 并发使用该值且最多 128。 |
-| `xudpProxyUDP443` | `reject` | 仅对 `mux=xray` 有效的 `reject`、`skip` 或 `allow`；UDP/443 的精确优先级见下文。 |
+| `xudpProxyUDP443` | `allow` | 仅对 `mux=xray` 有效的 `reject`、`skip` 或 `allow`；UDP/443 的精确优先级见下文。 |
 
 `packetEncoding`、`mux` 与每个 mux 控制项最多出现一次。重复的 `udp` 声明仅在所有值一致时接受。
 
@@ -308,7 +308,7 @@ node {
 | `xudp` | `xudp` | `off` | `1` | — |
 | `mux-cool` | `auto` | `xray` | `1` | `concurrency=0&xudpConcurrency=0&xudpProxyUDP443=skip` |
 
-最后一行保留 TCP/UDP 可用性及原来的 Vision UDP/443 gate；对被 skip 的非 Vision UDP/443 目标，它可能使用协议回退，而不是 pooled XUDP。本次升级中所有接纳的 VLESS 节点都使用新的身份派生规则，见[节点身份](#节点身份)。
+最后一行保留 TCP/UDP 可用性；被 skip 的 UDP/443 目标使用协议回退，而不是 pooled XUDP。现在默认允许 UDP/443，包括 Vision；需要阻断 QUIC 时使用路由规则。本次升级中所有接纳的 VLESS 节点都使用新的身份派生规则，见[节点身份](#节点身份)。
 
 旧版 `vless_mode` URI 语法会被拒绝。解析器也拒绝 `smux`、`multiplex`、`udp-over-tcp`、`packet-encoding`、`packet_encoding`、`packet-addr`、`xudp`、`only-tcp`、Brutal 控制项与 H2 stream 数量调优等含义不明确的第三方 URI 拼写；只有上表中的精确规范参数会配置这些选择。
 
@@ -316,7 +316,7 @@ node {
 
 未启用 Vision 时，`packetEncoding=auto` 对目标端口 53、443 使用原生 VLESS UDP，其他端口使用 Single XUDP。启用 Vision 时，获准目标使用 Single XUDP。原生 UDP 发送范围为 1–8190 字节，Single XUDP 为 1–7526 字节；空包或超长包是 packet 局部拒绝，接收到的零长度 frame 仍是数据报。
 
-对 `mux=xray`，先应用 UDP/443 策略。`reject` 即使在两个 mux pool 都关闭时也拒绝 UDP/443。`skip` 选择 `packetEncoding`，再应用普通 Vision gate。只有该目标实际使用 Xray UDP mux pool 时，`allow` 才绕过 Vision UDP/443 gate；协议回退目标仍遵循普通 gate。在 Xray mux 之外，基础 `xtls-rprx-vision` 拒绝 UDP/443，`xtls-rprx-vision-udp443` 则放行并在线上发送基础 flow。策略和容量拒绝对本次尝试是终止性的，且不影响健康/Score；不会触发其他节点/direct 回退或自动重放 packet。
+默认允许 UDP/443，包括基础 `xtls-rprx-vision`。需要阻断时，由用户在更宽泛的匹配规则之前配置路由，例如 `l4proto(udp) && dport(443) -> block`。对 `mux=xray`，显式 `reject` 即使在两个 mux pool 都关闭时也拒绝 UDP/443；`skip` 选择 `packetEncoding`；默认的 `allow` 使用配置的 UDP pool，没有 pool 时使用协议回退。`xtls-rprx-vision-udp443` 规范化为基础 Vision，不再改变权限或身份，线上 addon 仍为基础 flow。策略和容量拒绝对本次尝试是终止性的，且不影响健康/Score；不会触发其他节点/direct 回退或自动重放 packet。
 
 Vision 始终要求 direct TCP 路径：`mux=off`，或 `mux=xray` 且关闭 TCP mux。所有 H2MUX TCP 组合都无效，包括使用 Encryption 时。Vision 可以使用仅 UDP 的 Xray pool；`concurrency=-1` 时，用正数 `xudpConcurrency` 建立该 pool。未加密 Vision 还要求使用协商 TLS 1.3 或 REALITY 的裸 TCP。加密 Vision 可以保留已选 outer stream transport 与 random-XOR 处理，但仍不能启用 TCP mux、H2MUX UDP、原生 UDP 或 UoT v2；XUDP/Xray UDP 或关闭 UDP 均有效。
 
@@ -343,7 +343,7 @@ mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<base64url-key>
 | `sid` | 偶数长度十六进制 short ID，最多 8 字节；允许为空。 |
 | `spx` | 存储 spider path；选择 REALITY 时默认为 `/`。 |
 | `flow=xtls-rprx-vision` | 按上述 UDP/443 规则启用 Vision。 |
-| `flow=xtls-rprx-vision-udp443` | 启用 Vision 的普通 UDP/443 例外；线上 addon 仍使用基础 flow。 |
+| `flow=xtls-rprx-vision-udp443` | 规范化为 `xtls-rprx-vision`；默认已经允许 UDP/443。 |
 | `fp` | 接受但忽略；ClientHello 指纹由全局 TLS mode 控制。 |
 
 显式 `security=` 会覆盖 VLESS 历史默认值：`none` 关闭 TLS，其他值开启。没有 `security` 时 VLESS 默认开启 TLS。标准 VMess 链接改用其 v2rayN JSON `tls` 字段。
