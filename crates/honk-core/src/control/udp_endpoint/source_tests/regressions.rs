@@ -84,7 +84,7 @@ fn score_context(target: SocketAddr) -> honk_outbound::group::ScoreSelectionCont
     }
 }
 
-#[tokio::test(start_paused = true, flavor = "current_thread")]
+#[tokio::test(flavor = "current_thread")]
 async fn queued_source_view_timeout_is_local_congestion() {
     let (server, mut events, wire_task) = start_wire_peer().await;
     let (node, generation, runtime) = source_runtime(server, 3);
@@ -181,8 +181,6 @@ async fn queued_source_view_timeout_is_local_congestion() {
     assert!(lease_c.commit_ready(Arc::clone(&endpoint_c)));
     driver.start(lease_c.take_first().unwrap()).unwrap();
     drop(lease_c);
-    tokio::task::yield_now().await;
-    tokio::time::advance(TRANSPORT_SEND_TIMEOUT).await;
 
     let queued_error = driver.wait_first_ack().await.unwrap_err();
     assert_eq!(queued_error.kind(), io::ErrorKind::WouldBlock);
@@ -402,6 +400,7 @@ async fn retired_source_preparation_is_typed_and_score_neutral() {
     }
     pool.remove(client_addr, target_a);
     drop(endpoint_a);
+    assert!(pool.shutdown().await);
     wait_source_removed(&pool, &scope).await;
     let Err(error) = stale.commit(&pool).await else {
         panic!("retired source attachment must reject commit");
@@ -431,7 +430,6 @@ async fn retired_source_preparation_is_typed_and_score_neutral() {
         "cancelled preparation must not resurrect a source or emit NEW/END"
     );
 
-    assert!(pool.shutdown().await);
     generation.shutdown().await;
     wire_task.abort();
     let _ = wire_task.await;

@@ -55,7 +55,11 @@ impl ResourceBudget {
                 .min(after_tcp_pool)
         };
         let after_dials = after_tcp_pool.saturating_sub(transient_dials);
-        let vless_carriers = (after_dials / 8).min(MAX_ENDPOINTS);
+        let vless_carriers = if cfg!(feature = "rprx") {
+            (after_dials / 8).min(MAX_ENDPOINTS)
+        } else {
+            0
+        };
         let udp_endpoints = (after_dials.saturating_sub(vless_carriers)
             / UDP_ENDPOINT_DESCRIPTOR_COST)
             .min(MAX_ENDPOINTS);
@@ -146,6 +150,23 @@ mod tests {
             assert!(budget.udp_endpoints <= MAX_ENDPOINTS);
             assert!(budget.udp_slow_path <= budget.udp_endpoints);
             assert!(budget.dns_slow_path <= budget.transient_dials);
+        }
+    }
+
+    #[cfg(not(feature = "rprx"))]
+    #[test]
+    fn udp_endpoints_reclaim_disabled_vless_partition() {
+        for nofile in [256, 1_024, 4_096] {
+            let budget = ResourceBudget::for_nofile(nofile);
+            let available = budget.effective_nofile
+                - budget.fixed_reserve
+                - budget.active_tcp_flows * TCP_FLOW_DESCRIPTOR_COST
+                - budget.tcp_pool_entries
+                - budget.transient_dials;
+            assert_eq!(
+                budget.udp_endpoints,
+                available / UDP_ENDPOINT_DESCRIPTOR_COST
+            );
         }
     }
 

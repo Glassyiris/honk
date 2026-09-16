@@ -202,7 +202,7 @@ impl SourceOwner {
             let mut state = self.state.lock();
             debug_assert_ne!(state.bindings, 0);
             state.bindings -= 1;
-            if state.retirement.is_none() && state.bindings == 0 {
+            if state.retirement.is_none() && state.bindings == 0 && state.attachments == 0 {
                 state.retirement = Some(SourceRetirement::Neutral(ScoreOutcome::Cancelled));
                 true
             } else {
