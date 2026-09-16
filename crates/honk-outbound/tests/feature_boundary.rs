@@ -23,7 +23,7 @@ async fn parsed_vless_has_no_backend_without_rprx() {
     ] {
         assert!(matches!(runtime.runtime, ProtocolRuntime::None));
     }
-    let registry = ProxyRegistry::new();
+    let registry = ProxyRegistry::default_resolver().unwrap();
     let timeout = Duration::from_millis(100);
     let target = "127.0.0.1:9".parse().unwrap();
     assert!(registry.dial(&node, target, None, timeout).await.is_err());

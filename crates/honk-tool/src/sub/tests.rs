@@ -86,6 +86,27 @@ async fn udp_dns_without_system_resolver_reports_resolve() {
     );
 }
 
+#[cfg(not(feature = "rprx"))]
+#[tokio::test]
+async fn unavailable_vless_handler_refuses_before_target_resolution() {
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let node = vless_node();
+    let target = UdpCheckTarget::Host {
+        host: "must-not-resolve.invalid".into(),
+        port: 443,
+    };
+    let timeout = Duration::from_millis(40);
+    assert_eq!(
+        probe_udp_dns(&registry, &node, &target, None, timeout).await,
+        Some(Err(ProbeFailureKind::Handler))
+    );
+    assert_eq!(
+        probe_udp_quic(&registry, &node, "must-not-resolve.invalid", 443, timeout).await,
+        Some(Err(ProbeFailureKind::Handler))
+    );
+}
+
+#[cfg(feature = "rprx")]
 #[tokio::test]
 async fn udp_policy_denied_target_skips_dns_resolution() {
     let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -99,11 +120,6 @@ async fn udp_policy_denied_target_skips_dns_resolution() {
     let vless = node.vless_mut().unwrap();
     vless.network = None;
     vless.flow = Some("xtls-rprx-vision".into());
-    assert!((registry
-        .find(NodeProtocol::VLess)
-        .unwrap()
-        .descriptor
-        .supports_udp)(&node));
     assert_eq!(
         probe_udp_dns(
             &registry,
@@ -123,6 +139,7 @@ async fn udp_policy_denied_target_skips_dns_resolution() {
     );
 }
 
+#[cfg(feature = "rprx")]
 #[tokio::test]
 async fn udp_policy_denied_target_skips_quic_resolution() {
     let registry = ProxyRegistry::default_resolver().unwrap();
@@ -301,6 +318,7 @@ fn vless_udp_is_rendered_as_not_applicable() {
     assert!(rendered.contains("quic: n/a"));
 }
 
+#[cfg(feature = "rprx")]
 #[test]
 fn vless_udp_mode_is_rendered_as_probeable() {
     let registry = ProxyRegistry::default_resolver().unwrap();
@@ -315,6 +333,7 @@ fn vless_udp_mode_is_rendered_as_probeable() {
     assert!(render_outcome(&outcome).contains("dns: FAIL(timeout)"));
 }
 
+#[cfg(feature = "rprx")]
 #[test]
 fn timed_out_vision_targets_are_rendered_per_port_policy() {
     let registry = ProxyRegistry::default_resolver().unwrap();
