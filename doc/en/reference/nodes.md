@@ -35,7 +35,7 @@ In the legacy `ss://base64(method:password@host:port)` form, decoded credentials
 protocol|host|port|credential-fingerprint|dial-shape
 ```
 
-The credential fingerprint follows each handler's field precedence. The dial shape includes `sni`, transport, WebSocket/gRPC shape, Hysteria2 obfuscation, REALITY parameters, `flow`, and the effective VLESS UDP permission, fallback encoding, and multiplex paths. Nonempty structured `tls_alpn` derives a child UUID v5 using the base ID as its namespace and the JSON tuple `["tls-alpn", <ordered list>]` as its name; this separates ALPN from arbitrary credential text. Empty `tls_alpn` retains the base ID. Tuning and display metadata do not participate, except VLESS multiplex limits that change a physical path.
+The credential fingerprint follows each handler's field precedence. The dial shape includes `sni`, transport, WebSocket/gRPC shape, Hysteria2 obfuscation, REALITY parameters, `flow`, and the effective VLESS TLS posture, UDP permission, fallback encoding, and multiplex paths. Plaintext VLESS is distinct from TLS; a REALITY key selects the authenticated transport regardless of a redundant TLS flag. Nonempty structured `tls_alpn` derives a child UUID v5 using the base ID as its namespace and the JSON tuple `["tls-alpn", <ordered list>]` as its name; this separates ALPN from arbitrary credential text. Empty `tls_alpn` retains the base ID. Tuning and display metadata do not participate, except VLESS multiplex limits that change a physical path.
 
 Before joining, each raw credential and dial-shape field and the effective host escapes `\` as `\\` and `|` as `\|`. Joined fingerprints are not escaped again. For nodes accepted by `Config::validate`, different identity fields produce different hash material. This guarantee does not cover nodes rejected by full configuration validation, even if `Node::from_share_link` can derive their IDs.
 
@@ -336,7 +336,7 @@ A key decodes to either a 32-byte X25519 key or a 1184-byte ML-KEM-768 key; chai
 
 ### REALITY and Vision
 
-For VLESS URL links, `security=reality` enables TLS and maps the REALITY query fields; `flow` selects Vision.
+For VLESS and Trojan URL links, `security=reality` enables TLS and maps the REALITY query fields instead of silently falling back to ordinary PKI TLS. Other share-link schemes reject REALITY intent; structured VMess REALITY remains supported. Only VLESS uses `flow` to select Vision.
 
 | Query | Meaning |
 | --- | --- |
@@ -349,6 +349,7 @@ For VLESS URL links, `security=reality` enables TLS and maps the REALITY query f
 | `fp` | Accepted but ignored; global TLS mode owns the ClientHello fingerprint. |
 
 An explicit `security=` overrides the historical VLESS default: `none` disables TLS; any other value enables it. Without `security`, VLESS defaults TLS on. Standard VMess links use their v2rayN JSON `tls` field instead.
+Repeated `security` and recognized `tls` claims must agree, including cross-alias TLS enablement; a later value never overrides an earlier contradiction. VLESS and encoded VMess accept only `tls=0|1`; other schemes retain their handling of unrecognized `tls` text. Trojan and AnyTLS reject explicit plaintext claims rather than silently retaining mandatory TLS.
 
 REALITY is TLS-1.3-only and advertises the hybrid `X25519MLKEM768` key share first and the preset classic `X25519` share second. Client authentication derives from that preset classic share and binds the complete ClientHello; server authentication checks the REALITY key/HMAC and fails closed. A ClientHello is sealed exactly once. A HelloRetryRequest that invokes the callback again aborts before key/nonce reuse; honk does not retry that REALITY handshake.
 

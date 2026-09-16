@@ -35,7 +35,7 @@ VMess JSON 的 `ps` 备注缺失或为空时，先使用 `vmess-{host}` 通过�
 protocol|host|port|credential-fingerprint|dial-shape
 ```
 
-凭据指纹遵循各 handler 的字段优先级。dial shape 包含 `sni`、transport、WebSocket/gRPC 形态、Hysteria2 混淆、REALITY 参数、`flow`，以及有效的 VLESS UDP 权限、回退 encoding 和 multiplex 路径。非空的结构化 `tls_alpn` 以基础 ID 为 namespace、JSON 元组 `["tls-alpn", <有序列表>]` 为 name 派生子 UUID v5，从而将 ALPN 与任意凭据文本分离。空 `tls_alpn` 保留基础 ID。调优参数与显示元数据不参与，但改变物理路径的 VLESS multiplex 上限除外。
+凭据指纹遵循各 handler 的字段优先级。dial shape 包含 `sni`、transport、WebSocket/gRPC 形态、Hysteria2 混淆、REALITY 参数、`flow`，以及有效的 VLESS TLS 安全姿态、UDP 权限、回退 encoding 和 multiplex 路径。明文 VLESS 与 TLS 使用不同身份；REALITY key 选择认证 transport，不受冗余 TLS 标志影响。非空的结构化 `tls_alpn` 以基础 ID 为 namespace、JSON 元组 `["tls-alpn", <有序列表>]` 为 name 派生子 UUID v5，从而将 ALPN 与任意凭据文本分离。空 `tls_alpn` 保留基础 ID。调优参数与显示元数据不参与，但改变物理路径的 VLESS multiplex 上限除外。
 
 拼接前，每个原始凭据字段、拨号形态字段和有效的 `host` 值都会将 `\` 转义为 `\\`，将 `|` 转义为 `\|`。拼接后的指纹不再转义。对于通过 `Config::validate` 的节点，不同的身份字段会产生不同的哈希输入。完整配置校验拒绝的节点不在此保证范围内，即使 `Node::from_share_link` 能为其派生 ID。
 
@@ -334,7 +334,7 @@ mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<base64url-key>
 
 ### REALITY 与 Vision
 
-对于 VLESS URL 链接，`security=reality` 开启 TLS 并映射 REALITY query 字段；`flow` 选择 Vision。
+对于 VLESS 与 Trojan URL 链接，`security=reality` 开启 TLS 并映射 REALITY query 字段，不再静默回退到普通 PKI TLS。其他分享链接 scheme 拒绝 REALITY 意图；结构化 VMess REALITY 仍受支持。仅 VLESS 使用 `flow` 选择 Vision。
 
 | Query | 含义 |
 | --- | --- |
@@ -347,6 +347,7 @@ mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<base64url-key>
 | `fp` | 接受但忽略；ClientHello 指纹由全局 TLS mode 控制。 |
 
 显式 `security=` 会覆盖 VLESS 历史默认值：`none` 关闭 TLS，其他值开启。没有 `security` 时 VLESS 默认开启 TLS。标准 VMess 链接改用其 v2rayN JSON `tls` 字段。
+重复的 `security` 与已识别的 `tls` 声明必须一致，包括别名之间的 TLS 开关；后值不能覆盖前面的冲突声明。VLESS 与编码 VMess 只接受 `tls=0|1`；其他 scheme 保留对未识别 `tls` 文本的处理。Trojan 与 AnyTLS 会拒绝显式明文声明，而不是静默保留强制 TLS。
 
 REALITY 仅使用 TLS 1.3，并依次通告 hybrid `X25519MLKEM768` 与预设 classic `X25519` key share。客户端认证从该预设 classic share 派生并绑定完整 ClientHello；服务端认证校验 REALITY key/HMAC，并 fail-closed。每个 ClientHello 只 seal 一次；HelloRetryRequest 再次调用 callback 时，会在复用 key/nonce 前中止，honk 不会重试该 REALITY 握手。
 

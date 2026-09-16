@@ -337,6 +337,10 @@ impl OutboundConfig {
         if let Self::Vless(config) = self {
             fingerprint.push('|');
             fingerprint.push_str(&config.identity_fingerprint());
+            // Keep TLS-on IDs stable while separating the plaintext dial path.
+            if !config.tls.enabled && config.tls.reality_public_key.is_none() {
+                fingerprint.push_str("|tls:0");
+            }
         }
         fingerprint
     }

@@ -93,12 +93,10 @@ pub(super) fn parse_query(
                     | "obfs"
                     | "scy"
                     | "encryption"
+                    | "security"
+                    | "tls"
             )
-            && query.get(&key).is_some_and(|previous| {
-                previous != &value
-                    && !(key == "security"
-                        && vmess_cipher([previous.as_str(), value.as_ref()]).is_ok())
-            })
+            && query.get(&key).is_some_and(|previous| previous != &value)
         {
             return Err(legacy(ConfigError::Parse(
                 "duplicate VMess share-link parameter".into(),
@@ -156,28 +154,62 @@ pub(super) fn apply_tls(
     let protocol = node.protocol();
     let shadowrocket_vless = shadowrocket && protocol == NodeProtocol::VLess;
     let shadowrocket_vmess = shadowrocket && protocol == NodeProtocol::VMess;
-    let security = query.get("security").map(String::as_str);
-    let mut vless_tls = None;
-    let mut reality = security == Some("reality");
-    if protocol == NodeProtocol::VLess {
-        vless_tls = match query.get("tls").map(String::as_str) {
-            None => None,
-            Some("0") => Some(false),
-            Some("1") => Some(true),
-            Some(_) => return Err(super::invalid_link(source)),
-        };
-        let reality_fields = ["pbk", "sid", "spx"]
-            .iter()
-            .any(|key| query.contains_key(key));
-        if reality_fields && security.is_some_and(|value| value != "reality")
-            || vless_tls.is_some_and(|enabled| {
-                security.is_some_and(|value| (value != "none") != enabled)
-                    || (!enabled && reality_fields)
-            })
-        {
-            return Err(super::invalid_link(source));
-        }
-        reality |= reality_fields;
+    let invalid_tls = || {
+        query_error(
+            source,
+            &["tls"],
+            "invalid-config-value",
+            "TLS security claims must be supported and agree",
+        )
+    };
+    let security = coalesce_equal(
+        query.values("security").map(|value| {
+            if shadowrocket_vmess && !matches!(value, "none" | "tls") {
+                vmess_cipher([value])
+            } else {
+                Ok(Some(value))
+            }
+        }),
+        "conflicting security parameters",
+    )
+    .map_err(|_| invalid_tls())?;
+    let explicit_tls = coalesce_equal(
+        query.values("tls").map(|value| match value {
+            "0" => Ok(Some(false)),
+            "1" => Ok(Some(true)),
+            _ if protocol == NodeProtocol::VLess || shadowrocket_vmess => {
+                Err("unsupported tls parameter")
+            }
+            _ => Ok(None),
+        }),
+        "conflicting tls parameters",
+    )
+    .map_err(|_| invalid_tls())?;
+    let security_tls = match security {
+        Some("none") => Some(false),
+        Some("tls" | "reality") => Some(true),
+        Some(_) if !shadowrocket_vmess => Some(true),
+        _ => None,
+    };
+    let reality_fields = ["pbk", "sid", "spx"]
+        .iter()
+        .any(|key| query.contains_key(key));
+    let reality = security == Some("reality") || reality_fields;
+    if explicit_tls.is_some_and(|enabled| security_tls.is_some_and(|claim| claim != enabled))
+        || reality_fields && security.is_some_and(|value| value != "reality")
+        || reality && explicit_tls == Some(false)
+        || matches!(protocol, NodeProtocol::Trojan | NodeProtocol::AnyTLS)
+            && (explicit_tls == Some(false) || security_tls == Some(false))
+    {
+        return Err(invalid_tls());
+    }
+    if reality && !matches!(protocol, NodeProtocol::VLess | NodeProtocol::Trojan) {
+        return Err(query_error(
+            source,
+            &["reality_public_key"],
+            "invalid-config-value",
+            "REALITY share-link parameters are supported only for VLESS and Trojan",
+        ));
     }
 
     if let Some(tls) = node.tls_mut() {
@@ -186,32 +218,10 @@ pub(super) fn apply_tls(
             NodeProtocol::VLess => match security {
                 Some("none") => false,
                 Some(_) => true,
-                None => reality || vless_tls.unwrap_or(!shadowrocket_vless),
+                None => reality || explicit_tls.unwrap_or(!shadowrocket_vless),
             },
             NodeProtocol::VMess if shadowrocket_vmess => {
-                let security_tls = match security {
-                    Some("none") => Some(false),
-                    Some("tls") => Some(true),
-                    _ => None,
-                };
-                match query.get("tls").map(String::as_str) {
-                    None => security_tls.unwrap_or(false),
-                    Some("0") => {
-                        if security_tls == Some(true) {
-                            return Err(super::invalid_link(source));
-                        }
-                        false
-                    }
-                    Some("1") => {
-                        if security_tls == Some(false) {
-                            return Err(super::invalid_link(source));
-                        }
-                        true
-                    }
-                    Some(_) => {
-                        return Err(super::invalid_link(source));
-                    }
-                }
+                explicit_tls.or(security_tls).unwrap_or(false)
             }
             NodeProtocol::VMess => security.is_some_and(|value| value != "none"),
             _ => tls.enabled,
@@ -278,7 +288,7 @@ pub(super) fn apply_tls(
         } else if let Some(value) = query.get("ech") {
             tls.ech_enabled = value == "1" || value.eq_ignore_ascii_case("true");
         }
-        if protocol == NodeProtocol::VLess && reality {
+        if reality {
             tls.enabled = true;
             tls.reality_public_key = query.get("pbk").cloned();
             tls.reality_short_id = query.get("sid").cloned();

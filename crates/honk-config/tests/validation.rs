@@ -521,3 +521,90 @@ mod node_collection_admission {
         assert_eq!(error.diagnostic.value, SafeValue::Ordinal(1));
     }
 }
+
+mod share_link_security {
+    use base64::Engine as _;
+    use honk_config::node::Node;
+
+    const AUTHORITY: &str = "00000000-0000-0000-0000-000000000001@example.com:443";
+    const PUBLIC_KEY: &str = "jHkr1EmJCyQxjU0HXJlNblVdXB4Z7yODHJhgJ5lqmzc";
+
+    #[test]
+    fn trojan_reality_preserves_authentication_intent() {
+        let node = Node::from_share_link(&format!(
+            "trojan://pw@example.com:443?security=reality&pbk={PUBLIC_KEY}&sid=ab&spx=%2Fmask&sni=mask.example"
+        ))
+        .unwrap();
+        let tls = node.tls().unwrap();
+        assert_eq!(tls.effective_reality_public_key(), Ok(Some(PUBLIC_KEY)));
+        assert_eq!(tls.reality_short_id.as_deref(), Some("ab"));
+        assert_eq!(tls.reality_spider_x.as_deref(), Some("/mask"));
+        assert_eq!(tls.sni.as_deref(), Some("mask.example"));
+
+        let implicit = Node::from_share_link(&format!(
+            "trojan://pw@example.com:443?pbk={PUBLIC_KEY}&tls=1"
+        ))
+        .unwrap();
+        assert_eq!(
+            implicit.tls().unwrap().effective_reality_public_key(),
+            Ok(Some(PUBLIC_KEY))
+        );
+        assert_eq!(
+            implicit.tls().unwrap().reality_spider_x.as_deref(),
+            Some("/")
+        );
+        for query in [
+            "security=reality",
+            "security=reality&pbk=",
+            "sid=ab",
+            "tls=0",
+        ] {
+            assert!(
+                Node::from_share_link(&format!("trojan://pw@example.com:443?{query}")).is_err()
+            );
+        }
+        for query in ["security=reality", "pbk=AAA"] {
+            assert!(
+                Node::from_share_link(&format!("anytls://pw@example.com:443?{query}")).is_err()
+            );
+        }
+        let default = Node::from_share_link("trojan://pw@example.com:443").unwrap();
+        let ignored_tls = Node::from_share_link("trojan://pw@example.com:443?tls=true").unwrap();
+        assert_eq!(default.outbound, ignored_tls.outbound);
+        assert_eq!(default.id, ignored_tls.id);
+    }
+
+    #[test]
+    fn repeated_tls_claims_are_order_independent() {
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(AUTHORITY);
+        for authority in [AUTHORITY, encoded.as_str()] {
+            for query in [
+                "security=tls&security=none",
+                "security=none&security=tls",
+                "tls=1&tls=0",
+                "tls=0&tls=1",
+                "security=none&tls=1",
+                "tls=0&security=tls",
+            ] {
+                let mut diagnostics = Vec::new();
+                let error = Node::from_share_link_with_detailed_diagnostics(
+                    &format!("vless://{authority}?{query}"),
+                    &mut diagnostics,
+                )
+                .unwrap_err();
+                assert_eq!(error.diagnostic.setting.to_string(), "nodes.tls");
+            }
+            for (query, enabled) in [
+                ("security=tls&security=tls&tls=1&tls=1", true),
+                ("security=none&tls=0&security=none&tls=0", false),
+            ] {
+                let node = Node::from_share_link(&format!("vless://{authority}?{query}")).unwrap();
+                assert_eq!(node.tls().unwrap().enabled, enabled);
+            }
+        }
+        let canonical = Node::from_share_link(&format!("vless://{AUTHORITY}")).unwrap();
+        let shadowrocket = Node::from_share_link(&format!("vless://{encoded}")).unwrap();
+        assert!(canonical.tls().unwrap().enabled);
+        assert!(!shadowrocket.tls().unwrap().enabled);
+    }
+}

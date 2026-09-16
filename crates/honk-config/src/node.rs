@@ -623,6 +623,34 @@ mod tests {
     }
 
     #[test]
+    fn test_vless_tls_identity_matches_effective_transport() {
+        const LINK: &str = "vless://00000000-0000-0000-0000-000000000001@example.com:443";
+        let tls = Node::from_share_link(LINK).unwrap();
+        let plain = Node::from_share_link(&format!("{LINK}?security=none")).unwrap();
+        assert_ne!(tls.id, plain.id);
+        for (query, expected) in [("security=tls&tls=1", tls.id), ("tls=0", plain.id)] {
+            assert_eq!(
+                Node::from_share_link(&format!("{LINK}?{query}"))
+                    .unwrap()
+                    .id,
+                expected
+            );
+        }
+        crate::Config {
+            nodes: vec![tls, plain],
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+
+        let reality = Node::from_share_link(&format!("{LINK}?security=reality&pbk=AAA")).unwrap();
+        let mut equivalent = reality.clone();
+        equivalent.tls_mut().unwrap().enabled = false;
+        equivalent.validate().unwrap();
+        assert_eq!(reality.id, equivalent.derive_id());
+    }
+
+    #[test]
     fn test_vless_packet_disable_identity_is_effective() {
         let enabled = Node::from_share_link(
             "vless://00000000-0000-0000-0000-000000000001@example.com:443?packetEncoding=none",
