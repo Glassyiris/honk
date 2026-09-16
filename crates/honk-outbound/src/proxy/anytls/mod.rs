@@ -35,7 +35,7 @@ use overflow::{OVERFLOW_EMERGENCY_WAIT, OVERFLOW_STALL_GRACE, OverflowLimit, Str
 use padding::PaddingInstruction;
 pub(crate) use uot::AnyTlsUotTransport;
 use uot::{UOT_DRAIN_QUEUE_CAP, UotReceiveState};
-use writer::{FrameCommand, session_writer};
+use writer::{FrameCommand, WRITER_DATA_BYTES_CAP, session_writer};
 #[cfg(test)]
 use writer::{WRITER_CONTROL_RESERVED, WRITER_IO_TIMEOUT, WRITER_QUEUE_CAP};
 
@@ -218,13 +218,23 @@ impl Drop for StreamRegistration {
 /// Session writer queue: every frame goes out in enqueue order through a
 /// single task — no cross-stream mutex, and a cancelled caller can never
 /// truncate a queued frame (only a physical write failure closes the
-/// session). Data capacity is `WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED`;
-/// control frames take the reserved headroom.
+/// session). Data capacity is `WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED`
+/// frames and `WRITER_DATA_BYTES_CAP` bytes of payload, whichever fills
+/// first; control frames take the reserved headroom.
 struct WriterQueue {
     queue: parking_lot::Mutex<std::collections::VecDeque<FrameCommand>>,
     notify: tokio::sync::Notify,
     data_permits: Arc<tokio::sync::Semaphore>,
+    data_bytes: Arc<tokio::sync::Semaphore>,
     closed: AtomicBool,
+}
+
+/// What one queued data frame holds until the writer has flushed it: a
+/// frame slot and its payload's bytes. Dropped together with the command,
+/// so a batch in flight still counts against both caps.
+struct DataPermit {
+    _frame: tokio::sync::OwnedSemaphorePermit,
+    _bytes: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// Open streams awaiting their SYNACK. A SID is registered when its SYN is
@@ -530,7 +540,7 @@ impl AnyTlsSession {
                 "AnyTLS session is closed",
             ));
         }
-        let permit = self.acquire_data_permit().await?;
+        let permit = self.acquire_data_permit(payload.len()).await?;
         self.enqueue_data_with_permit(sid, payload, permit)
     }
 
@@ -538,7 +548,7 @@ impl AnyTlsSession {
     /// Used where an enqueue acknowledgement would turn writer loss into a
     /// false successful send.
     async fn enqueue_confirmed_data(&self, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
-        let permit = self.acquire_data_permit().await?;
+        let permit = self.acquire_data_permit(payload.len()).await?;
         let completed = self.enqueue_confirmed_data_with_permit(sid, payload, permit)?;
         Self::wait_for_confirmed_data(completed).await
     }
@@ -547,7 +557,7 @@ impl AnyTlsSession {
         &self,
         sid: u32,
         payload: bytes::Bytes,
-        permit: tokio::sync::OwnedSemaphorePermit,
+        permit: DataPermit,
     ) -> std::io::Result<tokio::sync::oneshot::Receiver<bool>> {
         let (completion, completed) = tokio::sync::oneshot::channel();
         let queued = {
@@ -584,23 +594,40 @@ impl AnyTlsSession {
         }
     }
 
-    /// Acquire one writer-queue data permit (async).
-    async fn acquire_data_permit(&self) -> std::io::Result<tokio::sync::OwnedSemaphorePermit> {
+    /// Acquire a writer-queue data permit for a `bytes`-long payload
+    /// (async): one frame slot, then the payload's bytes.
+    async fn acquire_data_permit(&self, bytes: usize) -> std::io::Result<DataPermit> {
         if self.is_closed() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 "AnyTLS session is closed",
             ));
         }
-        Arc::clone(&self.writer_q.data_permits)
+        let closed = || {
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "AnyTLS writer queue is closed",
+            )
+        };
+        let frame = Arc::clone(&self.writer_q.data_permits)
             .acquire_owned()
             .await
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::ConnectionAborted,
-                    "AnyTLS writer queue is closed",
-                )
-            })
+            .map_err(|_| closed())?;
+        let bytes = Arc::clone(&self.writer_q.data_bytes)
+            .acquire_many_owned(Self::byte_permits(bytes))
+            .await
+            .map_err(|_| closed())?;
+        Ok(DataPermit {
+            _frame: frame,
+            _bytes: bytes,
+        })
+    }
+
+    /// Frame payloads are at most `u16::MAX`, far below the byte cap, so a
+    /// request can always be satisfied once the queue drains.
+    fn byte_permits(bytes: usize) -> u32 {
+        debug_assert!(bytes <= WRITER_DATA_BYTES_CAP);
+        u32::try_from(bytes.min(WRITER_DATA_BYTES_CAP)).expect("byte cap fits u32")
     }
 
     /// Try to enqueue a data frame without waiting; returns the payload
@@ -609,13 +636,21 @@ impl AnyTlsSession {
         if self.is_closed() {
             return Err(payload);
         }
-        let Ok(permit) = Arc::clone(&self.writer_q.data_permits).try_acquire_owned() else {
+        let Ok(frame) = Arc::clone(&self.writer_q.data_permits).try_acquire_owned() else {
+            return Err(payload);
+        };
+        let Ok(bytes) = Arc::clone(&self.writer_q.data_bytes)
+            .try_acquire_many_owned(Self::byte_permits(payload.len()))
+        else {
             return Err(payload);
         };
         match self.writer_q.push_batch([FrameCommand::Data {
             sid,
             payload,
-            _permit: permit,
+            _permit: DataPermit {
+                _frame: frame,
+                _bytes: bytes,
+            },
             completion: None,
         }]) {
             Ok(()) => Ok(()),
@@ -634,7 +669,7 @@ impl AnyTlsSession {
         &self,
         sid: u32,
         payload: bytes::Bytes,
-        permit: tokio::sync::OwnedSemaphorePermit,
+        permit: DataPermit,
     ) -> std::io::Result<()> {
         let queued = {
             let streams = self.streams.lock().unwrap();
@@ -1425,11 +1460,7 @@ pub(crate) struct AnyTlsStream {
     /// derived from a different call's buffer).
     out_slot: Option<(bytes::Bytes, usize)>,
     /// Waiter for a writer-queue data permit while `out_slot` is occupied.
-    permit_fut: Option<
-        std::pin::Pin<
-            Box<dyn Future<Output = std::io::Result<tokio::sync::OwnedSemaphorePermit>> + Send>,
-        >,
-    >,
+    permit_fut: Option<std::pin::Pin<Box<dyn Future<Output = std::io::Result<DataPermit>> + Send>>>,
     /// Stream-slot capacity, held until either endpoint closes the stream.
     /// A server FIN releases it immediately even if callers retain the EOF
     /// stream object.
@@ -1510,19 +1541,36 @@ impl tokio::io::AsyncWrite for AnyTlsStream {
         // keeps a resumed write from reallocating on every poll.
         match &this.out_slot {
             Some((payload, _)) if payload.as_ref() == &buf[..chunk] => {}
-            _ => this.out_slot = Some((bytes::Bytes::copy_from_slice(&buf[..chunk]), chunk)),
+            _ => {
+                // A permit being awaited was sized for the replaced payload.
+                this.permit_fut = None;
+                this.out_slot = Some((bytes::Bytes::copy_from_slice(&buf[..chunk]), chunk));
+            }
         }
 
         if let Some((payload, n)) = this.out_slot.take() {
             match this.session.try_enqueue_data(this.sid, payload) {
-                Ok(()) => return std::task::Poll::Ready(Ok(n)),
+                Ok(()) => {
+                    // A retry that got in through the fast path leaves its
+                    // earlier waiter behind; that waiter may already hold
+                    // permits for this payload, so drop it here rather than
+                    // keep a second reservation until the next write.
+                    this.permit_fut = None;
+                    return std::task::Poll::Ready(Ok(n));
+                }
                 Err(payload) => this.out_slot = Some((payload, n)),
             }
         }
 
         if this.permit_fut.is_none() {
             let session = Arc::clone(&this.session);
-            this.permit_fut = Some(Box::pin(async move { session.acquire_data_permit().await }));
+            let bytes = this
+                .out_slot
+                .as_ref()
+                .map_or(0, |(payload, _)| payload.len());
+            this.permit_fut = Some(Box::pin(
+                async move { session.acquire_data_permit(bytes).await },
+            ));
         }
         let fut = this.permit_fut.as_mut().expect("permit wait just queued");
         match fut.as_mut().poll(cx) {

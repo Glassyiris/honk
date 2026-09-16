@@ -6,17 +6,19 @@ use tracing::debug;
 
 use super::padding::write_padded;
 use super::{
-    AnyTlsSession, BoxedWriter, CMD_PSH, CMD_SETTINGS, CMD_SYN, FRAME_HEADER_LEN, WriterQueue,
+    AnyTlsSession, BoxedWriter, CMD_PSH, CMD_SETTINGS, CMD_SYN, DataPermit, FRAME_HEADER_LEN,
+    WriterQueue,
 };
 
-/// One ordered writer command. Data commands hold a queue permit until
-/// popped (bounded → backpressure); control commands ride the reserved
-/// headroom so SYN/FIN can never be starved by payload.
+/// One ordered writer command. Data commands hold their frame and byte
+/// permits until the writer has flushed the batch they rode in (bounded →
+/// backpressure); control commands ride the reserved headroom so SYN/FIN
+/// can never be starved by payload.
 pub(super) enum FrameCommand {
     Data {
         sid: u32,
         payload: bytes::Bytes,
-        _permit: tokio::sync::OwnedSemaphorePermit,
+        _permit: DataPermit,
         completion: Option<tokio::sync::oneshot::Sender<bool>>,
     },
     Control {
@@ -57,6 +59,12 @@ pub(super) const WRITER_QUEUE_CAP: usize = 1024;
 /// Slots reserved for control frames (SYN/FIN/HEART) — data can never
 /// fill the queue past `WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED`.
 pub(super) const WRITER_CONTROL_RESERVED: usize = 128;
+/// Payload bytes queued ahead of the TLS writer, per session. The frame cap
+/// alone allowed 896 × 65,535 bytes (56 MiB) of in-flight payload: at line
+/// rate the relay fills it and RSS follows (124 MB peak measured with four
+/// upload streams). 8 MiB covers the writer's latency without changing
+/// throughput on the same run (62 MB peak).
+pub(super) const WRITER_DATA_BYTES_CAP: usize = 8 * 1024 * 1024;
 /// sing-anytls bounds control writes at five seconds. A stuck shared writer
 /// must become terminal instead of remaining selectable by the session pool.
 /// Data batches stay unbounded like upstream: under uplink congestion the
@@ -72,6 +80,7 @@ impl WriterQueue {
             data_permits: Arc::new(tokio::sync::Semaphore::new(
                 WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED,
             )),
+            data_bytes: Arc::new(tokio::sync::Semaphore::new(WRITER_DATA_BYTES_CAP)),
             closed: AtomicBool::new(false),
         }
     }
@@ -138,6 +147,7 @@ impl WriterQueue {
         self.closed.store(true, Ordering::Release);
         queue.clear();
         self.data_permits.close();
+        self.data_bytes.close();
         drop(queue);
         self.notify.notify_one();
     }
