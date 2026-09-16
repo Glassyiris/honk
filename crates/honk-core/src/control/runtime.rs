@@ -700,11 +700,8 @@ impl ControlPlane {
                         "UDP DNS health target initialization deferred to later health checks"
                     ),
                 }
-                let quic_score_target = if quic_url.is_empty() {
-                    None
-                } else {
-                    resolve_quic_score_target(&quic_url, Some(resolver)).await
-                };
+                let quic_score_target = (!quic_url.is_empty())
+                    .then(|| QuicScoreProbeTarget::new(quic_url, Some(resolver)));
                 alive_set.set_udp_probe(Arc::new(ProxyUdpProber::new(
                     self.config.clone(),
                     self.proxy_registry.clone(),

@@ -178,10 +178,10 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
     },
 ];
 
-/// Whether a selected node permits packets to the target port.
+/// Target policy only; absent UDP capability is handled separately by callers.
 pub fn udp_target_allowed(node: &Node, port: u16) -> bool {
     node.vless()
-        .is_none_or(|vless| vless.udp_path(port).is_some())
+        .is_none_or(|vless| !vless.udp_enabled() || vless.udp_path(port).is_some())
 }
 
 pub fn descriptor(protocol: NodeProtocol) -> &'static ProtocolDescriptor {

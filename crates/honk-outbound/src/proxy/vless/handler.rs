@@ -200,6 +200,9 @@ impl VLessHandler {
 
 impl VLessHandler {
     fn udp_path(node: &Node, port: u16) -> anyhow::Result<VlessUdpPath> {
+        if !node.vless().is_some_and(|vless| vless.udp_enabled()) {
+            anyhow::bail!("UDP not supported for protocol vless");
+        }
         node.vless()
             .and_then(|vless| vless.udp_path(port))
             .ok_or_else(|| crate::proxy::PacketRejection::Policy.into())

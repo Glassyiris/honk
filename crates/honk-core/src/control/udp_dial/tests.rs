@@ -294,3 +294,95 @@ async fn unscheduled_policy_denial_does_not_veto_an_earlier_winner() {
     .unwrap();
     assert_eq!(winner.0.name, "allowed");
 }
+
+#[tokio::test(start_paused = true)]
+async fn udp_disabled_capability_falls_back_but_explicit_policy_is_terminal() {
+    use crate::control::tests::support::{UdpTestHandler, UdpTestMode};
+    use honk_config::node::{OutboundConfig, Udp443Policy, VlessConfig, VlessMultiplex};
+    use honk_outbound::proxy::{ProtocolEntry, ProxyRegistry};
+
+    for policy_rejected in [false, true] {
+        let mut first = candidate("vless");
+        first.outbound = OutboundConfig::Vless(VlessConfig {
+            uuid: Some("00000000-0000-4000-8000-000000000001".into()),
+            network: (!policy_rejected).then(|| "tcp".into()),
+            multiplex: VlessMultiplex::xray(8, -1, Udp443Policy::Reject),
+            ..Default::default()
+        });
+        first.id = first.derive_id();
+        let second = candidate("fallback");
+        let dials = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(UdpTestHandler {
+            mode: UdpTestMode::CountDialAndSend {
+                dials: dials.clone(),
+                sends: Arc::new(AtomicUsize::new(0)),
+            },
+        });
+        let mut registry = ProxyRegistry::new();
+        for node in [&first, &second] {
+            registry.register(
+                ProtocolEntry::new(node.protocol(), handler.clone()).with_packet(handler.clone()),
+            );
+        }
+        let registry = Arc::new(registry);
+        let generation = Arc::new(
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(&[
+                first.clone(),
+                second.clone(),
+            ])
+            .unwrap(),
+        );
+        let target = "127.0.0.1:443".parse().unwrap();
+        let prepare: UdpPrepare<()> = Arc::new(move |_, node| {
+            let registry = registry.clone();
+            let generation = generation.clone();
+            Box::pin(async move {
+                registry
+                    .dial_udp_transport_speculative(
+                        generation,
+                        node.id,
+                        target,
+                        None,
+                        Duration::from_secs(1),
+                    )
+                    .await?;
+                Ok(())
+            })
+        });
+        let errors = Arc::new(AtomicUsize::new(0));
+        let callbacks = UdpStaggerCallbacks {
+            allows_target: Arc::new(move |node| {
+                honk_outbound::descriptor::udp_target_allowed(node, 443)
+            }),
+            is_eligible: Arc::new(|_| true),
+            on_dial_error: {
+                let errors = errors.clone();
+                Arc::new(move |_| {
+                    errors.fetch_add(1, Ordering::SeqCst);
+                })
+            },
+            on_attempt: Arc::new(|| {}),
+            on_winner: Arc::new(|| {}),
+            on_cancellation: Arc::new(|| {}),
+        };
+        let result = prepare_udp_plan(
+            SelectionPlanMode::ColdUrlTest,
+            vec![first, second],
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            prepare,
+            callbacks,
+        )
+        .await;
+        if policy_rejected {
+            assert!(honk_outbound::proxy::is_packet_rejection(
+                &result.unwrap_err()
+            ));
+            assert_eq!(errors.load(Ordering::SeqCst), 0);
+            assert_eq!(dials.load(Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(result.unwrap().unwrap().0.name, "fallback");
+            assert_eq!(errors.load(Ordering::SeqCst), 1);
+            assert_eq!(dials.load(Ordering::SeqCst), 1);
+        }
+    }
+}

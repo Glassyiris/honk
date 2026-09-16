@@ -257,9 +257,9 @@ async fn packet_policy_precedes_every_vless_dial_path() {
         handler.dial_udp_transport(&disabled, "8.8.8.8:53".parse().unwrap(), None, deadline),
     )
     .await
-    .expect("VLESS network policy blocked during preflight")
+    .expect("VLESS capability checked during preflight")
     .unwrap_err();
-    assert!(super::super::is_packet_rejection(&network_error));
+    assert!(!super::super::is_packet_rejection(&network_error));
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
             .await

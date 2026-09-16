@@ -96,7 +96,8 @@ transport 上实现 framing。
 
 `ProtocolDescriptor` 是唯一的逐协议事实表。predicate 接收具体节点，
 因为 VLESS 的 `network` 与 TCP path、以及 Trojan transport 会影响 capability
-或 pooling。
+或 pooling。Trojan 与 AnyTLS 共用 `network_allows_udp`；VLESS 使用规范的
+`VlessConfig::udp_enabled()`。
 
 | 协议 | `supports_udp` | `pool_ready_streams` | `pool_bare_tcp` | Generation runtime | 分享链接 scheme |
 | --- | --- | --- | --- | --- | --- |
@@ -134,6 +135,8 @@ Registry 组装会检查 descriptor capability 与填充的槽是否一致。
 依赖节点的 entry 即使默认节点没有 UDP，也可以携带 packet 槽。`block`
 是显式例外：其 descriptor 声明没有 UDP capability，但分派允许其 packet
 槽通过，使选定的 block 决策能够终结并拒绝该流。
+关闭 UDP 的节点返回普通 capability 拒绝，允许继续配置中的冷候选回退。
+显式目标策略拒绝仍是终态且不影响健康，不等同于缺少 UDP 支持。
 
 ### 协议与 UDP 清单
 
@@ -478,6 +481,8 @@ reply 没有逐 flow Score。source 容量耗尽返回 `PacketRejection::Capacit
 source 关闭准入时同时发布中立或失败的结算结果；即使 driver cleanup 抢先取得
 reporter，统一的 endpoint Score 结算入口也使用该结果。未绑定的 view，以及
 在 source 关闭前已经退役的 view，保留自己的局部结果；shutdown 仍保持中立。
+最后一个已绑定 view 只在 pending attachment 也全部释放后才退休 source；
+兄弟 view 退休时，已有 attachment 仍可完成 commit。
 
 endpoint 在 packet 入队后有意退役时，会终结结果不明确的 source，但不重放 packet，
 也不产生负向 transport health。后续 sender 与 receiver 保留相同的取消原因，
@@ -498,10 +503,11 @@ carrier permit，直至实际 I/O task teardown。
 carrier 独立保留，不能挤掉空闲 replacement；idle 回收和解除保留的删除过程
 均对 pool 进行线性遍历。
 
-文件描述符分区在进程启动时固定，并在 reload 与 DNS fork 间共享；即使初始
-配置没有 VLESS 节点也会预留。UDP endpoint 定额划分前先保留
-`min(after_dials / 8, 8192)` 个 carrier slot。原生 VLESS UDP、UoT 与 Single XUDP
-也使用此 gate，不仅是多路复用路径。耗尽后立即返回 typed Capacity 拒绝，不排队等待。
+文件描述符分区在进程启动时固定，并在 reload 与 DNS fork 间共享。启用 `rprx`
+时，即使初始配置没有 VLESS 节点，也会在划分 UDP endpoint 定额前预留
+`min(after_dials / 8, 8192)` 个 carrier slot；原生 VLESS UDP、UoT 与 Single XUDP
+也使用此 gate。关闭 `rprx` 时不预留 carrier，相关余量保留给 UDP endpoint。
+耗尽后立即返回 typed Capacity 拒绝，不排队等待。
 
 | 生效 `nofile` | 不预留 carrier 时的 UDP endpoint 上限 | 预留后的上限 | 减少 |
 | ---: | ---: | ---: | ---: |

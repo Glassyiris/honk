@@ -287,6 +287,34 @@ pub(super) struct QuicScoreTarget {
     config: quinn::ClientConfig,
 }
 
+pub(super) struct QuicScoreProbeTarget {
+    url: String,
+    port: Option<u16>,
+    resolver: Option<crate::outbound::ResolveHook>,
+    resolved: tokio::sync::OnceCell<Option<QuicScoreTarget>>,
+}
+
+impl QuicScoreProbeTarget {
+    pub(super) fn new(url: String, resolver: Option<crate::outbound::ResolveHook>) -> Self {
+        let port = honk_config::check::decode_health_http_target(&url)
+            .ok()
+            .filter(|_| url.trim().starts_with("https://"))
+            .map(|target| target.port());
+        Self {
+            url,
+            port,
+            resolver,
+            resolved: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    pub(super) async fn resolve(&self) -> anyhow::Result<&Option<QuicScoreTarget>> {
+        self.resolved
+            .get_or_try_init(|| resolve_quic_score_target(&self.url, self.resolver.clone()))
+            .await
+    }
+}
+
 pub(super) struct UdpDnsProbeTarget {
     raws: Vec<String>,
     resolver: Option<crate::outbound::ResolveHook>,
@@ -349,7 +377,7 @@ pub(super) struct ProxyUdpProber {
     stats: Arc<StatsManager>,
     dns_probe: Arc<UdpDnsProbeTarget>,
     group_manager: SharedGroupManager,
-    quic_score_target: Option<QuicScoreTarget>,
+    quic_score_target: Option<Arc<QuicScoreProbeTarget>>,
 }
 
 impl ProxyUdpProber {
@@ -359,7 +387,7 @@ impl ProxyUdpProber {
         runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
         stats: Arc<StatsManager>,
         dns_probe: UdpDnsProbeTarget,
-        quic_score_target: Option<QuicScoreTarget>,
+        quic_score_target: Option<QuicScoreProbeTarget>,
         group_manager: SharedGroupManager,
     ) -> Self {
         Self {
@@ -369,7 +397,7 @@ impl ProxyUdpProber {
             stats,
             dns_probe: Arc::new(dns_probe),
             group_manager,
-            quic_score_target,
+            quic_score_target: quic_score_target.map(Arc::new),
         }
     }
 
@@ -414,11 +442,16 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                     data_path: None,
                 };
             };
-            let dns_allowed =
-                honk_outbound::descriptor::udp_target_allowed(&node, dns_probe.port());
-            let data_allowed = quic_score_target.as_ref().is_some_and(|target| {
-                honk_outbound::descriptor::udp_target_allowed(&node, target.addr.port())
-            });
+            let udp_capable =
+                (honk_outbound::descriptor::descriptor(node.protocol()).supports_udp)(&node);
+            let dns_allowed = udp_capable
+                && honk_outbound::descriptor::udp_target_allowed(&node, dns_probe.port());
+            let data_allowed = udp_capable
+                && quic_score_target.as_ref().is_some_and(|target| {
+                    target.port.is_some_and(|port| {
+                        honk_outbound::descriptor::udp_target_allowed(&node, port)
+                    })
+                });
             let failed = |error: String| honk_outbound::alive::UdpProbeOutcome {
                 dns: dns_allowed.then(|| Err(anyhow::Error::msg(error.clone()))),
                 data_path: (!dns_allowed && data_allowed).then_some(Err(anyhow::Error::msg(error))),
@@ -512,23 +545,32 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             } else {
                 None
             };
+            let mut data_attempted = false;
             let data_path = match quic_score_target.as_ref() {
                 Some(target) if data_allowed => {
-                    score_quic_probe(
-                        &packet,
-                        &generation,
-                        Arc::clone(&runtime),
-                        &node,
-                        target,
-                        &group_manager,
-                        connect_timeout,
-                        timeout,
-                    )
-                    .await
+                    let deadline = tokio::time::Instant::now() + timeout;
+                    match tokio::time::timeout_at(deadline, target.resolve()).await {
+                        Ok(Ok(Some(target))) if tokio::time::Instant::now() < deadline => {
+                            data_attempted = true;
+                            score_quic_probe(
+                                &packet,
+                                &generation,
+                                Arc::clone(&runtime),
+                                &node,
+                                target,
+                                &group_manager,
+                                connect_timeout,
+                                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                            )
+                            .await
+                        }
+                        Ok(Err(error)) => Some(Err(error)),
+                        Ok(Ok(_)) | Err(_) => None,
+                    }
                 }
                 Some(_) | None => None,
             };
-            if ephemeral.is_none() && (dns.is_some() || data_path.is_some()) {
+            if ephemeral.is_none() && (dns.is_some() || (data_attempted && data_path.is_some())) {
                 stats.mark_warm(node.id, crate::stats::WarmReason::Health);
             }
             close_ephemeral(ephemeral).await;
@@ -698,16 +740,16 @@ pub(super) fn udp_probe_identity(raws: &[String], resolved: SocketAddr) -> Score
 pub(super) async fn resolve_quic_score_target(
     url: &str,
     resolver: Option<crate::outbound::ResolveHook>,
-) -> Option<QuicScoreTarget> {
+) -> anyhow::Result<Option<QuicScoreTarget>> {
     if !url.trim().starts_with("https://") {
         warn!("Score QUIC probe disabled: tcp_check_url is not HTTPS");
-        return None;
+        return Ok(None);
     }
     let target = match honk_config::check::decode_health_http_target(url) {
         Ok(target) => target,
         Err(_) => {
             warn!("Score QUIC probe disabled: invalid tcp_check_url");
-            return None;
+            return Ok(None);
         }
     };
     let host = target.host().to_owned();
@@ -718,9 +760,12 @@ pub(super) async fn resolve_quic_score_target(
         match resolver {
             Some(resolve) => match resolve(host.clone(), port).await {
                 Ok(addrs) => addrs,
+                Err(error) if honk_outbound::proxy::is_packet_rejection(&error) => {
+                    return Err(error);
+                }
                 Err(_) => {
                     warn!("Score QUIC probe disabled: tcp_check_url host resolution failed");
-                    return None;
+                    return Ok(None);
                 }
             },
             None => tokio::net::lookup_host((host.as_str(), port))
@@ -733,7 +778,7 @@ pub(super) async fn resolve_quic_score_target(
         Some(addr) => addr,
         None => {
             warn!("Score QUIC probe disabled: tcp_check_url host did not resolve");
-            return None;
+            return Ok(None);
         }
     };
     let identity = host
@@ -765,16 +810,16 @@ pub(super) async fn resolve_quic_score_target(
         Ok(config) => config,
         Err(error) => {
             warn!("Score QUIC probe disabled: failed to build QUIC client: {error:#}");
-            return None;
+            return Ok(None);
         }
     };
     debug!(host, %addr, "Score QUIC probe enabled");
-    Some(QuicScoreTarget {
+    Ok(Some(QuicScoreTarget {
         addr,
         host,
         identity,
         config,
-    })
+    }))
 }
 
 /// Returns true if `ip` belongs to honk's own dae0 link subnets.

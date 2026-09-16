@@ -102,8 +102,8 @@ framing on their actual transport.
 
 `src/descriptor.rs` owns `ProtocolDescriptor`, the single per-protocol facts table.
 Predicates accept the concrete node because VLESS `network` and TCP path, and
-Trojan transport, affect capability or pooling. `network_allows_udp` is shared by
-Trojan, AnyTLS, and VLESS.
+Trojan transport, affect capability or pooling. Trojan and AnyTLS share
+`network_allows_udp`; VLESS uses canonical `VlessConfig::udp_enabled()`.
 
 | Protocol | `supports_udp` | `pool_ready_streams` | `pool_bare_tcp` | Generation runtime | Share-link schemes |
 | --- | --- | --- | --- | --- | --- |
@@ -146,6 +146,9 @@ Node-dependent entries may carry a packet slot even when the default node lacks
 UDP. `block` is the explicit exception: its descriptor says no UDP capability,
 but its packet slot is allowed through dispatch so the selected block decision
 can reject the flow terminally.
+UDP-disabled nodes produce an ordinary capability refusal, allowing configured
+cold-candidate fallback. Explicit target policy remains a terminal, health-neutral
+refusal; it is not interchangeable with missing UDP support.
 
 ### Protocol and UDP inventory
 
@@ -543,6 +546,8 @@ Source admission closure also publishes its neutral or failure settlement. The
 common endpoint Score finalizer uses it even if driver cleanup wins the reporter
 race. Never-bound views and views retired before that closure retain their local
 result; shutdown remains neutral.
+The last bound view retires its source only after pending attachments are also
+gone; an attachment can still commit while a sibling view retires.
 
 Intentional endpoint retirement after queue admission ends the ambiguous source
 without replay or negative transport health. Later senders and the receiver
@@ -566,9 +571,10 @@ carriers with live children remain independently and cannot displace the idle
 replacement; idle reaping and unpin removal traverse the pool linearly.
 
 The descriptor partition is fixed at process startup and shared across reloads
-and DNS forks, even when the initial configuration has no VLESS nodes. It reserves
-`min(after_dials / 8, 8192)` carrier slots before sizing UDP endpoints; native
-VLESS UDP, UoT, and Single XUDP consume this gate too, not just multiplexed paths.
+and DNS forks. With `rprx`, it reserves `min(after_dials / 8, 8192)` carrier slots
+before sizing UDP endpoints, even when the initial configuration has no VLESS
+nodes; native VLESS UDP, UoT, and Single XUDP consume this gate too. Without
+`rprx`, no carrier slots are reserved and UDP endpoints retain that headroom.
 Exhaustion returns an immediate typed Capacity refusal, not a wait queue.
 
 | Effective `nofile` | UDP endpoints without carrier reserve | UDP endpoints with carrier reserve | Reduction |

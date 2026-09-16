@@ -161,6 +161,10 @@ and accepted SERVFAIL retain the documented fallback behavior.
 This also covers cold and cached `udp://` attempts carried over a proxy TCP
 session: a refusal stops before resolving a retry, and a refusal on the final
 attempt retains its typed cause instead of becoming a display-only error.
+QUIC health-target resolution is lazy and generation-scoped. A typed refusal
+does not initialize its cache, so a later eligible probe can retry; target
+resolution and that QUIC attempt share one timeout budget. Unsupported UDP
+nodes and explicitly policy-denied targets skip resolution entirely.
 
 ### DNS routing
 

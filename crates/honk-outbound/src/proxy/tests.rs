@@ -169,45 +169,55 @@ fn consistency_rejects_missing_warm_implementation() {
 
 #[cfg(feature = "rprx")]
 #[tokio::test]
-async fn vless_target_policy_is_checked_by_every_packet_registry_path() {
+async fn vless_capability_and_policy_are_distinct_in_every_packet_registry_path() {
     let registry = ProxyRegistry::default_resolver().unwrap();
-    let mut node = registry_test_node("udp-disabled", NodeProtocol::VLess);
-    let vless = node.vless_mut().unwrap();
-    vless.network = Some("tcp".into());
-    node.id = node.derive_id();
-    let target = "8.8.8.8:443".parse().unwrap();
+    for policy_rejected in [false, true] {
+        let mut node = registry_test_node("udp-gate", NodeProtocol::VLess);
+        let vless = node.vless_mut().unwrap();
+        if policy_rejected {
+            vless.multiplex = honk_config::node::VlessMultiplex::xray(
+                -1,
+                -1,
+                honk_config::node::Udp443Policy::Reject,
+            );
+        } else {
+            vless.network = Some("tcp".into());
+        }
+        node.id = node.derive_id();
+        let target = "8.8.8.8:443".parse().unwrap();
 
-    let error = registry
-        .dial_udp_transport(&node, target, None, Duration::from_millis(10))
-        .await
-        .unwrap_err();
-    assert!(is_packet_rejection(&error));
+        let error = registry
+            .dial_udp_transport(&node, target, None, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        assert_eq!(is_packet_rejection(&error), policy_rejected);
 
-    let generation = Arc::new(
-        crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
-    );
-    let error = registry
-        .dial_udp_transport_runtime(
-            Arc::clone(&generation),
-            node.id,
-            target,
-            None,
-            Duration::from_millis(10),
-        )
-        .await
-        .unwrap_err();
-    assert!(is_packet_rejection(&error));
-    let error = registry
-        .dial_udp_transport_speculative(
-            generation,
-            node.id,
-            target,
-            None,
-            Duration::from_millis(10),
-        )
-        .await
-        .unwrap_err();
-    assert!(is_packet_rejection(&error));
+        let generation = Arc::new(
+            crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+        );
+        let error = registry
+            .dial_udp_transport_runtime(
+                Arc::clone(&generation),
+                node.id,
+                target,
+                None,
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(is_packet_rejection(&error), policy_rejected);
+        let error = registry
+            .dial_udp_transport_speculative(
+                generation,
+                node.id,
+                target,
+                None,
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(is_packet_rejection(&error), policy_rejected);
+    }
 }
 
 /// The built-in block node carries NodeProtocol::Block; the registry must
