@@ -417,7 +417,7 @@ async fn interop_chrome_mode_with_ech_grease() {
 /// ECH extension really reached the wire inside the QUIC ClientHello.
 #[tokio::test]
 async fn ech_over_quic_fails_closed_without_server_support() {
-    static ECH_CONFIG_LIST: &[u8] = include_bytes!("../../tests/fixtures/echconfiglist");
+    static ECH_CONFIG_LIST: &[u8] = include_bytes!("../../../tests/fixtures/echconfiglist");
     crate::tls::set_tls_mode("utls");
     let mut node = skip_verify_node();
     let tls = node.tls_mut().unwrap();

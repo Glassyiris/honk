@@ -1,5 +1,16 @@
+use super::flow_control::{
+    AdaptiveFlowSampler, FLOW_CONTROL_MAX_WINDOW, adaptive_window, flow_nears_window,
+    seed_flow_control_profile, update_flow_window,
+};
+use super::metrics::quic_metrics;
+use super::path_health::{
+    PATH_MIN_UNACKED_SENDS, PATH_TIMEOUT_STREAK, PATH_WAITING, bounded_quic_send_timeout,
+    elapsed_since_millis, path_now_millis, path_state, should_retire_path, timeout_state,
+    timeout_state_streak,
+};
 use super::*;
 use crate::proxy::QuicSendToken;
+use std::sync::atomic::Ordering;
 
 fn health(last_ack: u64, epoch: u64, streak: u8, since: u64) -> QuicPathHealth {
     QuicPathHealth {

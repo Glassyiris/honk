@@ -37,9 +37,9 @@ fn vless_registry_builds_only_selected_path_pools() {
     }
 }
 async fn reserve_existing_cool_child(
-    pool: &Arc<crate::proxy::vless_cool::VlessCoolPool>,
-    expected: &Arc<crate::proxy::vless_cool::VlessCoolSession>,
-) -> crate::session::SessionPermit<crate::proxy::vless_cool::VlessCoolSession> {
+    pool: &Arc<crate::proxy::vless::cool::VlessCoolPool>,
+    expected: &Arc<crate::proxy::vless::cool::VlessCoolSession>,
+) -> crate::session::SessionPermit<crate::proxy::vless::cool::VlessCoolSession> {
     let crate::session::SpeculativeCheckout::Shared { session, permit } =
         pool.checkout_speculative().await.unwrap()
     else {
@@ -83,13 +83,13 @@ async fn separate_cool_warm_transitions_preserve_opposite_child_admission() {
             WarmRetention::Udp => (separate, shared),
         };
         let (opposite_io, _opposite_peer) = tokio::io::duplex(1024);
-        let opposite = crate::proxy::vless_cool::connect(Box::new(opposite_io), 8);
+        let opposite = crate::proxy::vless::cool::connect(Box::new(opposite_io), 8);
         opposite_pool.insert(&opposite);
         let opposite_child = opposite.try_reserve().unwrap();
 
         for finish in [Finish::Release, Finish::Rollback, Finish::Cancel] {
             let (owned_io, _owned_peer) = tokio::io::duplex(1024);
-            let owned = crate::proxy::vless_cool::connect(Box::new(owned_io), 8);
+            let owned = crate::proxy::vless::cool::connect(Box::new(owned_io), 8);
             owned_pool.insert(&owned);
             let owned_child = owned.try_reserve().unwrap();
 

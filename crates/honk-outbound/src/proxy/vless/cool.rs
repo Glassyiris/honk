@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
-use super::{AsyncReadWrite, MuxSession, PacketTransport};
+use crate::proxy::{AsyncReadWrite, MuxSession, PacketTransport};
 use crate::session::{
     ManagedSession, OpenError, SessionPermit, SessionPool, SessionPoolConfig, SessionState,
 };
@@ -31,7 +31,12 @@ pub use child::VlessXudpTransport;
 pub(crate) use child::connect_single_xudp;
 pub(crate) use child::open_xudp;
 use child::{VlessCoolStream, open_tcp};
-use codec::*;
+use codec::{
+    IncomingFrame, OPTION_ERROR, STATUS_END, STATUS_KEEP, STATUS_KEEPALIVE, STATUS_NEW, end_frame,
+    parse_keep_peer, read_frame,
+};
+#[cfg(test)]
+use codec::{NETWORK_UDP, OPTION_DATA, base_metadata, encode_address, metadata_frame, udp_frame};
 
 pub(crate) const VLESS_MUX_COMMAND: u8 = 0x03;
 pub(crate) const MAX_STREAMS_PER_SESSION: usize = 128;

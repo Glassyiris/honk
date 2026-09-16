@@ -1,4 +1,9 @@
-use super::*;
+use async_trait::async_trait;
+use std::net::SocketAddr;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use super::MAX_NATIVE_PACKET_SIZE;
+use crate::proxy::{AsyncReadWrite, PacketTransport};
 
 struct VlessPacketReader {
     stream: tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>,

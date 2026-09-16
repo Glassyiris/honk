@@ -603,7 +603,7 @@ impl NodeRuntime {
     #[cfg(feature = "rprx")]
     pub(crate) fn vless_h2_pool(
         &self,
-    ) -> anyhow::Result<Arc<crate::proxy::vless_mux::VlessMuxPool>> {
+    ) -> anyhow::Result<Arc<crate::proxy::vless::mux::VlessMuxPool>> {
         let ProtocolRuntime::Vless(runtime) = &self.runtime else {
             anyhow::bail!("node '{}' has no VLESS runtime", self.node.name);
         };
@@ -613,7 +613,7 @@ impl NodeRuntime {
     #[cfg(feature = "rprx")]
     pub(crate) fn vless_shared_cool_pool(
         &self,
-    ) -> anyhow::Result<Arc<crate::proxy::vless_cool::VlessCoolPool>> {
+    ) -> anyhow::Result<Arc<crate::proxy::vless::cool::VlessCoolPool>> {
         let ProtocolRuntime::Vless(runtime) = &self.runtime else {
             anyhow::bail!("node '{}' has no VLESS runtime", self.node.name);
         };
@@ -623,7 +623,7 @@ impl NodeRuntime {
     #[cfg(feature = "rprx")]
     pub(crate) fn vless_separate_cool_pool(
         &self,
-    ) -> anyhow::Result<Arc<crate::proxy::vless_cool::VlessCoolPool>> {
+    ) -> anyhow::Result<Arc<crate::proxy::vless::cool::VlessCoolPool>> {
         let ProtocolRuntime::Vless(runtime) = &self.runtime else {
             anyhow::bail!("node '{}' has no VLESS runtime", self.node.name);
         };

@@ -21,6 +21,27 @@
 `direct` 不使用代理协议而直接到达目标。`block` 终止请求。其他每个
 handler 都把选定节点转换成其代理服务器能够理解的字节。
 
+## 实现模块归属
+
+公开的 `proxy::*`、`quic::*` 与 `quic_boring::*` import 路径保持支持；
+实现拆为较小的普通 Rust 模块：
+
+| 范围 | 实现模块 |
+| --- | --- |
+| Proxy 契约 | `proxy/{error,packet,outbound,registry}.rs` |
+| 协议族 | `proxy/shadowsocks/{mod,aead2022,stream}.rs`；`proxy/vless/{mod,handler,mux,cool,encryption}.rs` |
+| QUIC | `quic/{path_health,flow_control,metrics,endpoint,client,stream,boring}.rs` |
+| AnyTLS | `proxy/anytls/{padding,writer,overflow}.rs` |
+| Score 与健康 | `group/score/{evidence,ranking,feedback}.rs`；`alive/{health,urltest}.rs` |
+| Session pool | `session/{maintenance,speculative}.rs` |
+
+共享状态仍留在共同祖先中，子模块实现不会把字段公开。REALITY、TLS、
+stream transport 与 UoT 仍由多个协议共用，不归 VLESS 独占。既有测试主题
+名称在对应协议族内保留。物理文件/行号及定义模块 metadata 随归属变化；
+公开 reexport 不会保留 `type_name` 或默认 tracing target。旧 `quic_boring`、
+`vless_mux`、`shadowsocks_2022` 日志过滤目标应改为 `honk_outbound::` 前缀下的
+`quic::boring`、`proxy::vless::mux`、`proxy::shadowsocks::aead2022`。
+
 ## Registry 与 capability 模型
 
 ```mermaid
@@ -390,7 +411,7 @@ pool 都关闭，该拒绝仍生效。`skip` 使用协议 encoding，再经过�
 
 ### H2MUX
 
-`src/proxy/uot.rs` 与 `src/proxy/vless_mux.rs` 实现共享 UoT v2 framing 和
+`src/proxy/uot.rs` 与 `src/proxy/vless/mux.rs` 实现共享 UoT v2 framing 和
 sing-box H2MUX。H2MUX 把物理 VLESS 请求发往 `sp.mux.sing-box.arpa:444`，
 选择 backend `2`，然后在 carrier 上运行 HTTP/2。逻辑 stream 承载 TCP 或
 native connected UDP；UDP 使用共享 UoT 长度 codec，而不是 loopback bridge。
@@ -408,7 +429,7 @@ UoT response frame。
 
 ### Mux.Cool 与 XUDP
 
-`src/proxy/vless_cool.rs` 及其 `codec`/`child` 模块实现 Xray mux command、
+`src/proxy/vless/cool.rs` 及其 `codec`/`child` 模块实现 Xray mux command、
 child TCP 与 XUDP record。一个有序 writer 串行化所有 child frame。每条
 carrier 的有效并发为配置正值与 128 的较小值。Session ID 单调增长且不复用；
 发出 ID 128 后 carrier 进入 draining，由 replacement 接纳新工作。不存在逐节点
@@ -508,7 +529,7 @@ wire addon 始终是基础 Vision flow。
 Encryption 组合不应称为双层 TLS。互通 echo 成功不代表具有 Xray 的上行整形、
 隐蔽性或上传性能保证。
 
-`src/proxy/vless_encryption.rs` 在 VLESS 请求前包装所选 transport。实现的协议
+`src/proxy/vless/encryption.rs` 在 VLESS 请求前包装所选 transport。实现的协议
 是 `mlkem768x25519plus`，wire mode 为 `native`、`xorpub` 与 `random`。它接受
 X25519 或 ML-KEM-768 服务端 key，包括 chained relay key；新的 1-RTT 连接组合
 ML-KEM-768 与 X25519，认证 record 使用选定 AEAD。可选 0-RTT cache 按规范化
@@ -528,7 +549,7 @@ TUIC、Juicity 与 Hysteria2 使用 quinn 0.11。`quic.rs` 负责 transport
 
 ### BoringSSL crypto backend
 
-`quic_boring.rs` 在 BoringSSL QUIC callback 上实现 client 侧
+`src/quic/boring.rs` 在 BoringSSL QUIC callback 上实现 client 侧
 `quinn_proto::crypto::Session`。它提供：
 
 - TLS 1.3 握手字节与 traffic-secret 交付；

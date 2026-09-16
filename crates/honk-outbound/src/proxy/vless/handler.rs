@@ -8,7 +8,7 @@
 //!
 //! Protocol flow:
 //! 1. Connect to the server via the shared transport layer
-//!    (`super::transport`): TCP, optionally TLS-wrapped (`node.tls`),
+//!    (`crate::proxy::transport`): TCP, optionally TLS-wrapped (`node.tls`),
 //!    optionally carried over WebSocket (`node.transport = "ws"`) or
 //!    gRPC (`"grpc"`).
 //! 2. When configured, complete the VLESS Encryption key exchange, then send the VLESS request header:
@@ -37,14 +37,14 @@ mod packet;
 mod stream;
 
 #[cfg(test)]
-use super::RuntimeOwnedIo;
+use crate::proxy::RuntimeOwnedIo;
 use packet::VlessConnectedTransport;
 
-pub use super::vless_cool::{VlessXudpTransport, is_vless_source_post_admission_cancel};
+use super::cool::VlessXudpTransport;
 #[cfg(test)]
-use super::{
-    PacketRejection, ProxyRegistry, WarmOutcome, is_packet_rejection, uot, vless_cool, vless_mux,
-};
+use super::{cool, mux};
+#[cfg(test)]
+use crate::proxy::{PacketRejection, ProxyRegistry, WarmOutcome, is_packet_rejection, uot};
 #[cfg(test)]
 use stream::{DirectRead, VISION_COMMAND_DIRECT, VISION_COMMAND_END};
 use stream::{ResponseHeaderStrip, VisionStream};
@@ -54,12 +54,13 @@ use honk_config::node::{Node, VlessTcpPath, VlessUdpPath};
 use parking_lot::RwLock;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(test)]
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-use super::{
-    AsyncReadWrite, MuxSession, PacketOutbound, PacketTransport, PreparedUdpTransport,
-    ProbeableOutbound, ProxyStream, TcpOutbound, WarmRequirement, WarmableOutbound,
+use crate::proxy::{
+    MuxSession, PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound,
+    ProxyStream, TcpOutbound, WarmRequirement, WarmableOutbound,
 };
 use crate::session::{OpenError, SpeculativeCheckout};
 
@@ -78,7 +79,7 @@ pub struct VLessHandler {
     // Short-lived source-carrier handlers stay allocation-free when unencrypted;
     // encryption ticket reuse exists only while a registry handler retains this cache.
     encryption_configs:
-        OnceLock<RwLock<lru::LruCache<uuid::Uuid, Arc<super::vless_encryption::ClientConfig>>>>,
+        OnceLock<RwLock<lru::LruCache<uuid::Uuid, Arc<super::encryption::ClientConfig>>>>,
 }
 
 impl VLessHandler {
@@ -89,7 +90,7 @@ impl VLessHandler {
     fn encryption_config(
         &self,
         node: &Node,
-    ) -> anyhow::Result<Option<Arc<super::vless_encryption::ClientConfig>>> {
+    ) -> anyhow::Result<Option<Arc<super::encryption::ClientConfig>>> {
         let vless = node.vless().unwrap();
         let Some(value) = vless
             .encryption
@@ -112,7 +113,7 @@ impl VLessHandler {
         if let Some(config) = configs.read().peek(&cache_key).cloned() {
             return Ok(Some(config));
         }
-        let parsed = super::vless_encryption::ClientConfig::parse(value)?;
+        let parsed = super::encryption::ClientConfig::parse(value)?;
         let mut configs = configs.write();
         if let Some(config) = configs.peek(&cache_key).cloned() {
             return Ok(Some(config));
@@ -141,9 +142,7 @@ impl VLessHandler {
         anyhow::ensure!(
             matches!(
                 (command, target),
-                (CMD_TCP, Some(_))
-                    | (CMD_UDP, Some(_))
-                    | (super::vless_cool::VLESS_MUX_COMMAND, None)
+                (CMD_TCP, Some(_)) | (CMD_UDP, Some(_)) | (super::cool::VLESS_MUX_COMMAND, None)
             ),
             "VLESS: invalid command target"
         );
@@ -203,7 +202,7 @@ impl VLessHandler {
     fn udp_path(node: &Node, port: u16) -> anyhow::Result<VlessUdpPath> {
         node.vless()
             .and_then(|vless| vless.udp_path(port))
-            .ok_or_else(|| super::PacketRejection::Policy.into())
+            .ok_or_else(|| crate::proxy::PacketRejection::Policy.into())
     }
 
     async fn open_udp(
@@ -240,13 +239,13 @@ impl VLessHandler {
                 Ok(Arc::new(VlessConnectedTransport::new(stream, target, None)))
             }
             VlessUdpPath::UotV2 => {
-                let setup = super::uot::connect_request(target, target_domain)?;
+                let setup = crate::proxy::uot::connect_request(target, target_domain)?;
                 let magic_target = SocketAddr::from(([0, 0, 0, 0], 0));
                 let stream = self
                     .dial_retained_base(
                         &runtime,
                         magic_target,
-                        Some(super::uot::MAGIC_ADDRESS),
+                        Some(crate::proxy::uot::MAGIC_ADDRESS),
                         connect_timeout,
                     )
                     .await?
@@ -261,10 +260,7 @@ impl VLessHandler {
                 let stream = self
                     .dial_retained_mux_carrier(&runtime, connect_timeout)
                     .await?;
-                Ok(
-                    super::vless_cool::connect_single_xudp(stream, target, target_domain, [0; 8])
-                        .await?,
-                )
+                Ok(super::cool::connect_single_xudp(stream, target, target_domain, [0; 8]).await?)
             }
         }
     }
@@ -290,8 +286,8 @@ impl VLessHandler {
     async fn dial_h2_session(
         runtime: Arc<crate::runtime::NodeRuntime>,
         connect_timeout: std::time::Duration,
-    ) -> anyhow::Result<Arc<super::vless_mux::VlessMuxSession>> {
-        let (target, domain) = super::vless_mux::physical_target();
+    ) -> anyhow::Result<Arc<super::mux::VlessMuxSession>> {
+        let (target, domain) = super::mux::physical_target();
         let honk_config::node::VlessMultiplex::H2 { padding } =
             &runtime.node.vless().unwrap().multiplex
         else {
@@ -301,7 +297,7 @@ impl VLessHandler {
             .dial_retained_base(&runtime, target, Some(domain), connect_timeout)
             .await?
             .stream;
-        super::vless_mux::connect(stream, *padding).await
+        super::mux::connect(stream, *padding).await
     }
 
     async fn open_h2_tcp(
@@ -354,11 +350,11 @@ impl VLessHandler {
         runtime: Arc<crate::runtime::NodeRuntime>,
         active_limit: usize,
         connect_timeout: std::time::Duration,
-    ) -> anyhow::Result<Arc<super::vless_cool::VlessCoolSession>> {
+    ) -> anyhow::Result<Arc<super::cool::VlessCoolSession>> {
         let stream = Self::new()
             .dial_retained_mux_carrier(&runtime, connect_timeout)
             .await?;
-        Ok(super::vless_cool::connect(stream, active_limit))
+        Ok(super::cool::connect(stream, active_limit))
     }
 
     async fn open_cool_tcp(
@@ -421,7 +417,7 @@ impl VLessHandler {
         retired_error: &'static str,
     ) -> anyhow::Result<PreparedUdpTransport<T>>
     where
-        S: super::MuxSession,
+        S: MuxSession,
         T: PacketTransport + ?Sized + 'static,
         Dial: FnOnce() -> DialFuture + Send,
         DialFuture: Future<Output = anyhow::Result<Arc<S>>> + Send,
@@ -479,8 +475,7 @@ impl VLessHandler {
                     .dial_retained_mux_carrier(&runtime, timeout)
                     .await?;
                 let transport =
-                    super::vless_cool::connect_single_xudp(stream, target, domain, global_id)
-                        .await?;
+                    super::cool::connect_single_xudp(stream, target, domain, global_id).await?;
                 Ok(PreparedUdpTransport::ready(transport))
             }
             path @ (VlessUdpPath::CoolShared | VlessUdpPath::CoolSeparate) => {
@@ -496,7 +491,7 @@ impl VLessHandler {
                     pool,
                     move || Self::dial_cool_session(dial_runtime, active_limit, timeout),
                     move |session, permit| {
-                        super::vless_cool::open_xudp(session, permit, target, domain, global_id)
+                        super::cool::open_xudp(session, permit, target, domain, global_id)
                     },
                     if separate {
                         "VLESS separate Cool pool retired during source preparation"
@@ -507,7 +502,7 @@ impl VLessHandler {
                 .await
             }
             VlessUdpPath::Native | VlessUdpPath::UotV2 | VlessUdpPath::H2 => {
-                Err(super::PacketRejection::Policy.into())
+                Err(crate::proxy::PacketRejection::Policy.into())
             }
         }
     }
@@ -518,7 +513,7 @@ impl VLessHandler {
         retired_error: &'static str,
     ) -> anyhow::Result<()>
     where
-        S: super::MuxSession,
+        S: MuxSession,
         Dial: FnOnce() -> DialFuture + Send,
         DialFuture: Future<Output = anyhow::Result<Arc<S>>> + Send,
     {
@@ -656,7 +651,7 @@ impl PacketOutbound for VLessHandler {
                 connect_timeout,
             )
             .await?;
-        Ok(super::packet_transport_with_owner(transport, owner))
+        Ok(crate::proxy::packet_transport_with_owner(transport, owner))
     }
 
     async fn dial_udp_transport_runtime(

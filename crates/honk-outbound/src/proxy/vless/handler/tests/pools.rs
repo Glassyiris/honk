@@ -19,7 +19,7 @@ async fn cancelled_mux_warm_dial_does_not_outlive_its_caller() {
     let guard = crate::runtime::NodeRuntime::try_ephemeral_guarded(&node).unwrap();
     let runtime = guard.runtime();
     let pool = Arc::new(crate::session::SessionPool::new(
-        super::super::vless_mux::session_pool_config(),
+        super::super::mux::session_pool_config(),
     ));
     let warming = {
         let pool = Arc::clone(&pool);
@@ -379,7 +379,7 @@ async fn cool_c8_opens_seventeen_tcp_children_on_three_global_carriers() {
                     inner: Box::new(client),
                     _owner: permit,
                 };
-                Ok(super::super::vless_cool::connect(Box::new(carrier), 8))
+                Ok(super::super::cool::connect(Box::new(carrier), 8))
             }
         }
     };
@@ -446,7 +446,7 @@ async fn idle_reap_returns_carrier_credit_without_cutting_retained_or_active_ses
     for (runtime, pool) in runtimes.iter().zip(&pools) {
         let permit = runtime.acquire_vless_carrier().unwrap();
         let (client, peer) = tokio::io::duplex(1 << 16);
-        let session = super::super::vless_cool::connect(
+        let session = super::super::cool::connect(
             Box::new(RuntimeOwnedIo {
                 inner: Box::new(client),
                 _owner: permit,
@@ -492,10 +492,9 @@ async fn idle_reap_preserves_warm_replacement_while_old_carrier_drains() {
     use crate::session::ManagedSession as _;
 
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        let pool =
-            crate::session::SessionPool::new(super::super::vless_cool::session_pool_config(8));
+        let pool = crate::session::SessionPool::new(super::super::cool::session_pool_config(8));
         let (client, mut old_peer) = tokio::io::duplex(1 << 16);
-        let old = super::super::vless_cool::connect(Box::new(client), 8);
+        let old = super::super::cool::connect(Box::new(client), 8);
         pool.insert(&old);
         let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
         let mut old_child = pool
@@ -508,7 +507,7 @@ async fn idle_reap_preserves_warm_replacement_while_old_carrier_drains() {
         old.begin_drain();
 
         let (client, mut replacement_peer) = tokio::io::duplex(1 << 16);
-        let replacement = super::super::vless_cool::connect(Box::new(client), 8);
+        let replacement = super::super::cool::connect(Box::new(client), 8);
         pool.insert(&replacement);
         pool.set_warm_retained(true);
         assert_eq!(pool.reap_unretained_idle(), 0);

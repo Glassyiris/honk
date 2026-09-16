@@ -21,8 +21,8 @@ use parking_lot::RwLock;
 use rand::{Rng as _, RngExt as _};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use super::AsyncReadWrite;
-use super::shadowsocks::AeadCipher;
+use crate::proxy::AsyncReadWrite;
+use crate::proxy::shadowsocks::AeadCipher;
 
 const X25519_KEY_LEN: usize = 32;
 const MLKEM_PUBLIC_KEY_LEN: usize = 1184;

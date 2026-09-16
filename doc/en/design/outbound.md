@@ -26,6 +26,29 @@ its proxy server.
 
 Outbound dialing, groups, and health checking. Re-exported by `honk-core` as `honk_core::{proxy, group, outbound}`.
 
+## Implementation ownership
+
+Public `proxy::*`, `quic::*`, and `quic_boring::*` imports remain supported.
+Implementation owners are smaller ordinary Rust modules:
+
+| Area | Implementation owners |
+| --- | --- |
+| Proxy contracts | `proxy/{error,packet,outbound,registry}.rs` |
+| Protocol families | `proxy/shadowsocks/{mod,aead2022,stream}.rs`; `proxy/vless/{mod,handler,mux,cool,encryption}.rs` |
+| QUIC | `quic/{path_health,flow_control,metrics,endpoint,client,stream,boring}.rs` |
+| AnyTLS | `proxy/anytls/{padding,writer,overflow}.rs` |
+| Score and health | `group/score/{evidence,ranking,feedback}.rs`; `alive/{health,urltest}.rs` |
+| Session pool | `session/{maintenance,speculative}.rs` |
+
+Common state remains at the shared ancestor; child implementations do not make
+its fields public. REALITY, TLS, stream transport and UoT remain shared rather
+than VLESS-owned. Existing test-topic names stay intact within their owning
+family. Physical file/line and defining-module metadata change with ownership:
+public reexports do not preserve `type_name` or default tracing targets. Log
+filters for the former `quic_boring`, `vless_mux` and `shadowsocks_2022` targets
+must use `quic::boring`, `proxy::vless::mux` and `proxy::shadowsocks::aead2022`
+under the `honk_outbound::` prefix.
+
 ## Registry and capability model
 
 ```mermaid
@@ -442,7 +465,7 @@ fallback or reporting the path as not applicable.
 
 ### H2MUX
 
-`src/proxy/uot.rs` and `src/proxy/vless_mux.rs` implement shared UoT v2 framing
+`src/proxy/uot.rs` and `src/proxy/vless/mux.rs` implement shared UoT v2 framing
 and sing-box H2MUX. H2MUX sends the physical VLESS request to
 `sp.mux.sing-box.arpa:444`, selects backend `2`, then runs HTTP/2 over that
 carrier. Logical streams carry TCP or native connected UDP. UDP uses the shared
@@ -462,7 +485,7 @@ large enough for one maximum UoT response frame for each admitted stream.
 
 ### Mux.Cool and XUDP
 
-`src/proxy/vless_cool.rs` and its `codec`/`child` modules implement the Xray mux
+`src/proxy/vless/cool.rs` and its `codec`/`child` modules implement the Xray mux
 command, child TCP, and XUDP records. One ordered writer serializes every child
 frame. Each carrier's effective concurrency is the configured positive limit
 capped at 128. Session IDs increase monotonically and are not reused; issuing
@@ -576,7 +599,7 @@ non-TLS Encryption compositions are not two TLS sessions. Do not infer Xray's
 uplink shaping, camouflage or upload-performance guarantees from a successful
 interop echo.
 
-`src/proxy/vless_encryption.rs` wraps the selected transport before the VLESS
+`src/proxy/vless/encryption.rs` wraps the selected transport before the VLESS
 request. The implemented protocol is `mlkem768x25519plus`, with `native`,
 `xorpub`, and `random` wire modes. It accepts X25519 or ML-KEM-768 server keys,
 including chained relay keys; new 1-RTT connections combine ML-KEM-768 and
@@ -606,7 +629,7 @@ uses `SO_MARK`'ed UDP sockets. The module also owns `QuicBiStream` and
 
 ### BoringSSL crypto backend
 
-`src/quic_boring.rs` implements the client side of `quinn_proto::crypto::Session`
+`src/quic/boring.rs` implements the client side of `quinn_proto::crypto::Session`
 over BoringSSL's QUIC APIs (`SSL_set_quic_method`, `SSL_provide_quic_data`,
 `SSL_export_keying_material`). It provides:
 
@@ -709,7 +732,7 @@ throughput-neutral on a 75ms/15%-loss link. Overrides:
 
 ## AnyTLS session engine
 
-`src/proxy/anytls.rs` implements sing-anytls multiplexing with stateless handlers. Each generation's `NodeRuntime::AnyTls` owns one
+`src/proxy/anytls/mod.rs` implements sing-anytls multiplexing with stateless handlers. Each generation's `NodeRuntime::AnyTls` owns one
 `SessionPool<AnyTlsSession>` and lazily materialized BoringSSL connector.
 Generation-free calls use a guarded ephemeral equivalent.
 

@@ -15,9 +15,9 @@ enum PoolKind {
 
 #[derive(Debug)]
 pub struct VlessRuntime {
-    h2: Option<Arc<crate::proxy::vless_mux::VlessMuxPool>>,
-    shared_cool: Option<Arc<crate::proxy::vless_cool::VlessCoolPool>>,
-    separate_cool: Option<Arc<crate::proxy::vless_cool::VlessCoolPool>>,
+    h2: Option<Arc<crate::proxy::vless::mux::VlessMuxPool>>,
+    shared_cool: Option<Arc<crate::proxy::vless::cool::VlessCoolPool>>,
+    separate_cool: Option<Arc<crate::proxy::vless::cool::VlessCoolPool>>,
     tcp_warm: Option<PoolKind>,
     udp_warm: Option<PoolKind>,
     source_key: OnceLock<[u8; 32]>,
@@ -29,7 +29,7 @@ impl VlessRuntime {
             VlessMultiplex::Off => (None, None, None),
             VlessMultiplex::H2 { .. } => (
                 Some(Arc::new(crate::session::SessionPool::new(
-                    crate::proxy::vless_mux::session_pool_config(),
+                    crate::proxy::vless::mux::session_pool_config(),
                 ))),
                 None,
                 None,
@@ -38,13 +38,13 @@ impl VlessRuntime {
                 None,
                 tcp.map(|limit| {
                     Arc::new(crate::session::SessionPool::new(
-                        crate::proxy::vless_cool::session_pool_config(limit.get() as usize),
+                        crate::proxy::vless::cool::session_pool_config(limit.get() as usize),
                     ))
                 }),
                 match udp {
                     VlessUdpMux::Separate(limit) => {
                         Some(Arc::new(crate::session::SessionPool::new(
-                            crate::proxy::vless_cool::session_pool_config(limit.get() as usize),
+                            crate::proxy::vless::cool::session_pool_config(limit.get() as usize),
                         )))
                     }
                     VlessUdpMux::Protocol | VlessUdpMux::SharedTcp => None,
@@ -72,7 +72,7 @@ impl VlessRuntime {
         }
     }
 
-    pub(crate) fn h2_pool(&self) -> anyhow::Result<Arc<crate::proxy::vless_mux::VlessMuxPool>> {
+    pub(crate) fn h2_pool(&self) -> anyhow::Result<Arc<crate::proxy::vless::mux::VlessMuxPool>> {
         self.h2
             .as_ref()
             .map(Arc::clone)
@@ -81,7 +81,7 @@ impl VlessRuntime {
 
     pub(crate) fn shared_cool_pool(
         &self,
-    ) -> anyhow::Result<Arc<crate::proxy::vless_cool::VlessCoolPool>> {
+    ) -> anyhow::Result<Arc<crate::proxy::vless::cool::VlessCoolPool>> {
         self.shared_cool
             .as_ref()
             .map(Arc::clone)
@@ -90,7 +90,7 @@ impl VlessRuntime {
 
     pub(crate) fn separate_cool_pool(
         &self,
-    ) -> anyhow::Result<Arc<crate::proxy::vless_cool::VlessCoolPool>> {
+    ) -> anyhow::Result<Arc<crate::proxy::vless::cool::VlessCoolPool>> {
         self.separate_cool
             .as_ref()
             .map(Arc::clone)

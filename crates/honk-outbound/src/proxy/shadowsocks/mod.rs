@@ -6,13 +6,13 @@
 //! - `chacha20-ietf-poly1305` (alias `chacha20-poly1305`)
 //!
 //! and the Shadowsocks 2022 methods (SIP022, implemented in
-//! [`super::shadowsocks_2022`]):
+//! [`aead2022`]):
 //! - `2022-blake3-aes-128-gcm`
 //! - `2022-blake3-aes-256-gcm`
 //! - `2022-blake3-chacha20-poly1305`
 //!
 //! The handler dials the Shadowsocks server, writes the salt + request
-//! prologue, and returns the inline codec in [`super::ss_stream::SsStream`].
+//! prologue, and returns the inline codec in [`stream::SsStream`].
 //! Caller-driven reads and writes apply Shadowsocks record chunking directly.
 //!
 //! UDP is supported for both cipher families through `dial_udp_transport`:
@@ -22,6 +22,9 @@
 //!
 //! References: <https://shadowsocks.org/doc/aead.html>,
 //! <https://shadowsocks.org/doc/sip022.html>
+
+mod aead2022;
+mod stream;
 
 use async_trait::async_trait;
 use hkdf::Hkdf;
@@ -36,8 +39,8 @@ use tokio::net::TcpStream;
 use tracing::debug;
 
 use super::addr;
-use super::shadowsocks_2022::{self, Ss2022Method, Ss2022UdpSession};
 use super::{PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, TcpOutbound};
+use aead2022::{Ss2022Method, Ss2022UdpSession};
 
 pub(crate) const SS_SUBKEY_INFO: &[u8] = b"ss-subkey";
 pub(crate) const CHUNK_MAX_LEN: usize = 0x3FFF; // 2^14 - 1
@@ -338,7 +341,7 @@ impl ShadowsocksHandler {
     ) -> anyhow::Result<ProxyStream> {
         let stream: Box<dyn super::AsyncReadWrite> = if is_2022_method(method) {
             let method_2022 = Ss2022Method::new(method, password)?;
-            Box::new(shadowsocks_2022::dial_stream(server, method_2022, header).await?)
+            Box::new(aead2022::dial_stream(server, method_2022, header).await?)
         } else {
             let conf = CipherConf::for_method(method)?;
             let master_key = Self::master_key(password, conf.key_len);
@@ -356,20 +359,14 @@ impl ShadowsocksHandler {
             server.write_all(&send_salt).await?;
 
             let mut send_nonce = vec![0u8; conf.nonce_len];
-            crate::proxy::ss_stream::write_all_sealed(
-                &mut server,
-                &send_cipher,
-                &mut send_nonce,
-                &header,
-            )
-            .await?;
+            stream::write_all_sealed(&mut server, &send_cipher, &mut send_nonce, &header).await?;
 
-            let prologue = crate::proxy::ss_stream::LegacyPrologue {
+            let prologue = stream::LegacyPrologue {
                 conf,
                 master_key,
                 method: method.to_string(),
             };
-            Box::new(crate::proxy::ss_stream::SsStream::new_legacy(
+            Box::new(stream::SsStream::new_legacy(
                 server,
                 send_cipher,
                 send_nonce,
@@ -584,7 +581,7 @@ impl PacketTransport for SsUdpTransport {
 
 /// Steady-state relay read batch (64KB = 4 chunks): batched seal/decrypt
 /// without the per-connection memory cost of the old 256KB draft — see
-/// ss_stream.rs for why it is not larger.
+/// stream.rs for why it is not larger.
 pub(crate) const RELAY_BATCH: usize = 64 * 1024;
 
 /// Seal `payload` as Shadowsocks chunks into `out` (cleared first). One

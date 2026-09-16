@@ -13,7 +13,7 @@ pub mod descriptor;
 pub mod group;
 pub mod proxy;
 pub mod quic;
-pub mod quic_boring;
+pub use quic::boring as quic_boring;
 pub mod reality;
 pub mod runtime;
 pub(crate) mod session;

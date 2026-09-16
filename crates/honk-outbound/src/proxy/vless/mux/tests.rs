@@ -4,7 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
 fn receive_windows_cover_every_maximum_udp_frame() {
-    let maximum_response_frame = 1 + 2 + super::super::uot::MAX_PACKET_SIZE;
+    let maximum_response_frame = 1 + 2 + crate::proxy::uot::MAX_PACKET_SIZE;
     assert!(H2_STREAM_RECV_WINDOW as usize >= maximum_response_frame);
     assert!(H2_CONNECTION_RECV_WINDOW as usize >= maximum_response_frame * MAX_STREAMS_PER_SESSION);
 }
@@ -125,12 +125,12 @@ async fn serve_logical_stream(
             }
             assert_eq!(&body[9..14], b"\0\x03dns");
             let answer = if maximum {
-                vec![0x5a; super::super::uot::MAX_PACKET_SIZE]
+                vec![0x5a; crate::proxy::uot::MAX_PACKET_SIZE]
             } else {
                 b"answer".to_vec()
             };
             let packet =
-                super::super::uot::encode_packet(&answer, super::super::uot::MAX_PACKET_SIZE)
+                crate::proxy::uot::encode_packet(&answer, crate::proxy::uot::MAX_PACKET_SIZE)
                     .unwrap();
             let mut response = BytesMut::with_capacity(1 + packet.len());
             response.extend_from_slice(&[0]);
@@ -246,7 +246,7 @@ async fn maximum_udp_frame_cannot_exhaust_the_h2_receive_window() {
         .unwrap_or_else(|_| panic!("maximum-frame UDP stream must open"));
     udp.send_packet_confirmed(b"dns").await.unwrap();
 
-    let mut packet = vec![0; super::super::uot::MAX_PACKET_SIZE];
+    let mut packet = vec![0; crate::proxy::uot::MAX_PACKET_SIZE];
     let (size, peer) = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         udp.recv_packet(&mut packet),
@@ -254,7 +254,7 @@ async fn maximum_udp_frame_cannot_exhaust_the_h2_receive_window() {
     .await
     .expect("maximum UoT frame deadlocked HTTP/2 flow control")
     .unwrap();
-    assert_eq!(size, super::super::uot::MAX_PACKET_SIZE);
+    assert_eq!(size, crate::proxy::uot::MAX_PACKET_SIZE);
     assert_eq!(peer, "1.1.1.1:53".parse().unwrap());
     assert!(packet.iter().all(|byte| *byte == 0x5a));
 
@@ -516,7 +516,7 @@ async fn saturated_carrier_opens_the_second_pool_slot() {
 async fn prepare_detached(
     pool: &Arc<VlessMuxPool>,
 ) -> (
-    super::super::PreparedUdpTransport,
+    crate::proxy::PreparedUdpTransport,
     Arc<VlessMuxSession>,
     tokio::task::JoinHandle<usize>,
 ) {
@@ -534,7 +534,7 @@ async fn prepare_detached(
         .unwrap_or_else(|_| panic!("detached UDP stream must open"));
     let transport: Arc<dyn PacketTransport> = transport;
     (
-        super::super::PreparedUdpTransport::new(async move {
+        crate::proxy::PreparedUdpTransport::new(async move {
             reservation.commit()?;
             Ok(transport)
         }),

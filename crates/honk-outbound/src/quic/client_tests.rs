@@ -1,4 +1,7 @@
+use super::endpoint::{MAX_QUIC_GSO_SEGMENTS, default_gso_enabled, gso_transmit_segments};
+use super::flow_control::apply_flow_control_profile;
 use super::*;
+use std::sync::atomic::Ordering;
 
 fn quic_node() -> honk_config::node::Node {
     honk_config::node::Node {

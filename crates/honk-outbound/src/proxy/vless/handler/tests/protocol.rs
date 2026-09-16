@@ -70,20 +70,20 @@ fn vless_mux_command_carries_no_target() {
     let uuid = VLessHandler::parse_uuid("b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3").unwrap();
     let header = VLessHandler::build_request_header(
         &uuid,
-        super::super::vless_cool::VLESS_MUX_COMMAND,
+        super::super::cool::VLESS_MUX_COMMAND,
         None,
         None,
         None,
     )
     .unwrap();
     assert_eq!(header.len(), 19);
-    assert_eq!(header[18], super::super::vless_cool::VLESS_MUX_COMMAND);
+    assert_eq!(header[18], super::super::cool::VLESS_MUX_COMMAND);
 
     let target = Some("127.0.0.1:9527".parse().unwrap());
     assert!(
         VLessHandler::build_request_header(
             &uuid,
-            super::super::vless_cool::VLESS_MUX_COMMAND,
+            super::super::cool::VLESS_MUX_COMMAND,
             target,
             None,
             None,

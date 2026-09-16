@@ -28,8 +28,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::debug;
 
-use super::addr::socks_addr_len;
-use super::shadowsocks::{AeadCipher, increment_nonce};
+use super::{AeadCipher, increment_nonce};
+use crate::proxy::addr::socks_addr_len;
 
 const HEADER_TYPE_CLIENT: u8 = 0;
 pub(crate) const HEADER_TYPE_SERVER: u8 = 1;
@@ -295,7 +295,7 @@ pub(crate) async fn dial_stream(
     mut server: TcpStream,
     method: Ss2022Method,
     socks_header: Vec<u8>,
-) -> anyhow::Result<crate::proxy::ss_stream::SsStream> {
+) -> anyhow::Result<super::stream::SsStream> {
     // Request: salt | EIH* | enc(fixed header) | enc(variable header)
     let mut request_salt = vec![0u8; method.key_len];
     rand::rng().fill_bytes(&mut request_salt);
@@ -344,11 +344,11 @@ pub(crate) async fn dial_stream(
     // SIP022 3.1.4: salt + header chunks MUST go out in a single write.
     server.write_all(&request).await?;
 
-    let prologue = crate::proxy::ss_stream::Ss2022Prologue {
+    let prologue = super::stream::Ss2022Prologue {
         method,
         request_salt,
     };
-    Ok(crate::proxy::ss_stream::SsStream::new_2022(
+    Ok(super::stream::SsStream::new_2022(
         server,
         send_cipher,
         send_nonce,

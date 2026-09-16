@@ -1,4 +1,11 @@
-use super::*;
+use honk_config::node::Node;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+
+use super::{CMD_TCP, ResponseHeaderStrip, VLessHandler, VisionStream};
+use crate::proxy::{AsyncReadWrite, ProxyStream};
 
 impl VLessHandler {
     /// Build the post-connect stream for a dial. Encrypted Vision keeps the
@@ -176,7 +183,7 @@ impl VLessHandler {
         let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
         let header = Self::build_request_header(
             &uuid,
-            crate::proxy::vless_cool::VLESS_MUX_COMMAND,
+            crate::proxy::vless::cool::VLESS_MUX_COMMAND,
             None,
             None,
             vless.wire_flow(),

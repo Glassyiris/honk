@@ -8,7 +8,8 @@ use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
-use super::super::{AsyncReadWrite, vless_encryption::EncryptedStream};
+use super::super::encryption::EncryptedStream;
+use crate::proxy::AsyncReadWrite;
 
 /// A read path a Vision Direct command may select without changing writes.
 ///

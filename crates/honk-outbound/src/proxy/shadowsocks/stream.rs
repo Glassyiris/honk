@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
-use super::shadowsocks::{
+use super::{
     AeadCipher, CipherConf, RELAY_BATCH, decrypt_chunks_in_place, hkdf_sha1_derive,
     seal_chunks_into,
 };
@@ -421,7 +421,7 @@ impl LegacyPrologue {
 /// 2022 response prologue: everything needed to read and validate the
 /// server's fixed response header once the request is out.
 pub(crate) struct Ss2022Prologue {
-    pub(crate) method: super::shadowsocks_2022::Ss2022Method,
+    pub(crate) method: super::aead2022::Ss2022Method,
     pub(crate) request_salt: Vec<u8>,
 }
 
@@ -430,8 +430,8 @@ impl Ss2022Prologue {
         self,
         mut read_half: OwnedReadHalf,
     ) -> io::Result<(OwnedReadHalf, AeadCipher, Vec<u8>, Vec<u8>)> {
-        use super::shadowsocks::increment_nonce;
-        use super::shadowsocks_2022::{NONCE_LEN, TAG_LEN, unix_timestamp};
+        use super::aead2022::{NONCE_LEN, TAG_LEN, unix_timestamp};
+        use super::increment_nonce;
         use anyhow::anyhow;
         let method = &self.method;
 
@@ -450,7 +450,7 @@ impl Ss2022Prologue {
             .open(&recv_nonce, &fixed_buf)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         increment_nonce(&mut recv_nonce);
-        if fixed[0] != super::shadowsocks_2022::HEADER_TYPE_SERVER {
+        if fixed[0] != super::aead2022::HEADER_TYPE_SERVER {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("bad response header type {}", fixed[0]),

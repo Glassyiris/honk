@@ -597,6 +597,7 @@ impl super::GroupManager {
 fn selector_commit_does_not_restore_a_stale_sibling() {
     use crate::alive::AliveDialerSet;
     use honk_config::group::{Group, GroupPolicy};
+    use honk_config::node::Node;
 
     let nodes: Vec<_> = ["a", "b", "outside"]
         .into_iter()

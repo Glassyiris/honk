@@ -1,6 +1,20 @@
-use super::*;
+use std::future::Future;
+use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use parking_lot::Mutex as SyncMutex;
+use quinn::{ClientConfig, Endpoint, VarInt};
+use tokio::sync::Mutex;
+
+use super::endpoint::endpoint_config_with_mtu;
+use super::metrics::{
+    record_transport_rx_drop, record_transport_tx_drop, record_transport_tx_would_block,
+};
 
 use crate::proxy::{
     PacketErrorClass, PacketRejection, PacketTransport, QuicSendAttempt, io_packet_rejection,
@@ -506,7 +520,7 @@ pub fn packet_transport_endpoint_with_metrics(
 /// handshake.  This is the real QUIC liveness probe: unlike a bare
 /// Version-Negotiation trigger (which many frontends ignore), it proves
 /// TLS-in-QUIC reachability through the node's UDP path.  `config` comes from
-/// [`client_config`] — pass a node with `skip_cert_verify` for pure liveness
+/// [`super::client_config`] — pass a node with `skip_cert_verify` for pure liveness
 /// probing.
 pub async fn quic_handshake_probe(
     transport: Arc<dyn PacketTransport>,
@@ -534,7 +548,9 @@ pub async fn quic_handshake_probe(
 
 #[cfg(test)]
 mod probe_tests {
+    use super::super::{QuicClientOptions, client_config, testutil};
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn packet_rejection_survives_transport_error_storage() {

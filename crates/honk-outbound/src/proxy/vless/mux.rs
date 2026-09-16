@@ -15,7 +15,7 @@ use rand::RngExt as _;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::time::Instant;
 
-use super::{AsyncReadWrite, MuxSession, PacketTransport};
+use crate::proxy::{AsyncReadWrite, MuxSession, PacketTransport};
 use crate::session::{
     ManagedSession, OpenError, SessionPermit, SessionPool, SessionPoolConfig, SessionState,
 };
@@ -29,7 +29,7 @@ const MAX_ERROR_MESSAGE: usize = 64 * 1024;
 // the carrier; aggregate credit still covers one maximum response frame per slot.
 const H2_STREAM_RECV_WINDOW: u32 = 2 * 1024 * 1024;
 const H2_CONNECTION_RECV_WINDOW: u32 =
-    ((1 + 2 + super::uot::MAX_PACKET_SIZE) * MAX_STREAMS_PER_SESSION) as u32;
+    ((1 + 2 + crate::proxy::uot::MAX_PACKET_SIZE) * MAX_STREAMS_PER_SESSION) as u32;
 #[cfg(feature = "rprx")]
 const MUX_MAGIC_ADDRESS: &str = "sp.mux.sing-box.arpa";
 #[cfg(feature = "rprx")]
@@ -441,7 +441,7 @@ fn stream_request(
     target: std::net::SocketAddr,
     target_domain: Option<&str>,
 ) -> io::Result<Bytes> {
-    let address = super::addr::encode_address(target, target_domain)?;
+    let address = crate::proxy::addr::encode_address(target, target_domain)?;
     let mut request = BytesMut::with_capacity(2 + address.len());
     request.extend_from_slice(&flags.to_be_bytes());
     request.extend_from_slice(&address);
@@ -800,7 +800,7 @@ struct MuxUdpWriter {
 
 struct MuxUdpReader {
     response: MuxResponse,
-    decoder: super::uot::Decoder,
+    decoder: crate::proxy::uot::Decoder,
 }
 
 pub(crate) struct VlessMuxUdpTransport {
@@ -820,7 +820,7 @@ impl std::fmt::Debug for VlessMuxUdpTransport {
 
 impl VlessMuxUdpTransport {
     async fn send(&self, data: &[u8]) -> io::Result<()> {
-        let packet = super::uot::encode_packet(data, super::uot::MAX_PACKET_SIZE)?;
+        let packet = crate::proxy::uot::encode_packet(data, crate::proxy::uot::MAX_PACKET_SIZE)?;
         let mut writer = self.writer.lock().await;
         if writer.pending {
             return Err(io::Error::new(
@@ -943,7 +943,7 @@ impl MuxSession for VlessMuxSession {
                 }),
                 reader: tokio::sync::Mutex::new(MuxUdpReader {
                     response: MuxResponse::new(opened.response),
-                    decoder: super::uot::Decoder::default(),
+                    decoder: crate::proxy::uot::Decoder::default(),
                 }),
                 target,
                 _permit: opened.permit,
