@@ -189,6 +189,62 @@ fn feedback_for_node_merges_nested_score_memberships_once() {
     groups.sort_unstable();
     assert_eq!(groups, ["child", "parent"]);
 }
+
+#[test]
+fn nested_final_feedback_reaches_score_ancestors_and_probe_membership() {
+    let nodes = [node("dead"), node("backup"), node("outside")];
+    let mut child = group("child", &nodes[..1]);
+    child.final_outbound = Some("terminal".into());
+    let terminal = group("terminal", &nodes[1..2]);
+    let bridge = selector_with_children("bridge", &[], &["child"]);
+    let outer = group_with_children("outer", &[], &["bridge"]);
+    let alive = Arc::new(super::super::super::AliveDialerSet::new());
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        alive.report_unavailable_forced(nodes[0].id, domain, IpVersion::V4);
+    }
+    let manager = super::super::super::GroupManager::with_alive_set(
+        &[
+            outer,
+            bridge,
+            child,
+            terminal,
+            group("unrelated", &nodes[2..]),
+        ],
+        &nodes,
+        Some(alive),
+    );
+    let target = ScoreSelectionContext {
+        network: SelectionNetwork::Udp,
+        probe_domain: ProbeDomain::DataUdp,
+        ..context("nested-final.example", IpVersion::V4)
+    };
+    let plan = manager.selection_plan_for_target("outer", &target);
+    assert_eq!(plan.entries[0].node.id, nodes[1].id);
+    assert_eq!(
+        plan.entries[0].selection_chain,
+        ["outer", "bridge", "child", "terminal", "backup"]
+    );
+    finish_success(&plan);
+    for name in ["outer", "child", "terminal"] {
+        assert!(
+            manager.score_state().has_exact(name, &target, nodes[1].id),
+            "{name}"
+        );
+    }
+    assert!(
+        !manager
+            .score_state()
+            .has_exact("unrelated", &target, nodes[1].id)
+    );
+    let feedback = manager.feedback_for_node(nodes[1].id, target).unwrap();
+    let mut groups: Vec<_> = feedback
+        .attributions()
+        .iter()
+        .map(|entry| entry.group.as_str())
+        .collect();
+    groups.sort_unstable();
+    assert_eq!(groups, ["child", "outer", "terminal"]);
+}
 #[test]
 fn nested_score_last_resort_keeps_child_attribution() {
     let leaf = node("leaf");

@@ -31,7 +31,7 @@ Selection follows one invariant (sing-box semantics): after resolution and liven
 
 | Policy | Runtime behavior |
 | --- | --- |
-| Selector | TCP and UDP resolve the runtime choice, then `group.default`, then the first declared member independently of health; only missing/non-member tags fall through. No eligible candidate for that member means an empty plan, except for the same-leaf TCP last resort above; an explicit `final` remains available to the caller. The Clash API changes the runtime choice. `PersistCallback` stores effective writes in `cache.db` via honk-core's `cachedb`; when `interrupt_connections` is enabled, `InterruptCallback` removes tracking records but does not cancel live relays. Typed configuration diagnostics warn about this limitation. |
+| Selector | TCP and UDP resolve the runtime choice, then `group.default`, then the first declared member independently of health; only missing/non-member tags fall through. No eligible candidate for that member invokes only the group's explicit `final` or the same-leaf TCP last resort above; without either, the plan is empty. GroupManager resolves finals at every nested level. The Clash API changes the runtime choice. `PersistCallback` stores effective writes in `cache.db` via honk-core's `cachedb`; when `interrupt_connections` is enabled, `InterruptCallback` removes tracking records but does not cancel live relays. Typed configuration diagnostics warn about this limitation. |
 | URLTest | Chooses the lowest halving moving average, keeps independent TCP and UDP selections, applies tolerance hysteresis, and re-evaluates lazily on dial and selection queries. A real selection change may invoke `InterruptCallback`. |
 | LoadBalance | Round-robins eligible members in declaration order. Every group owns independent `AtomicUsize` cursors for TCP and UDP. Rotation never invokes `InterruptCallback`. |
 | Fallback | Pins the first eligible member in declaration order independently for TCP and UDP. The pin stays until that member dies; recovery of an earlier member does not cause failback. |
@@ -95,7 +95,18 @@ A group `check_url` creates independent TCP-only liveness and latency state keye
 
 Resolution is bounded by `MAX_GROUP_DEPTH = 8` and a per-walk visited set. Construction also runs DFS over group edges and cuts every cycle-closing edge with a warning. These checks prevent a malformed graph from hanging selection or introspection.
 
-Selector captures a concrete node or sub-group member before candidate expansion and health filtering; repeated node tags bind the first matching declared `NodeId`. Parents retain the existing subgroup Peek, parent-health gate, and serving-commit order, so unchosen Score state is not advanced. For both TCP and UDP, a failed serving commit yields an empty parent plan rather than restoring the earlier peek. Candidates retain their originating subgroup reference instead of rediscovering it from a display tag. A chosen automatic sub-group may still select a different leaf within its own membership. The sole TCP leaf's last-resort walk also respects every nested Selector choice, while explicit delay tests may inspect all members for recovery.
+Membership and explicit `final` edges share the bounded recursive resolver. A
+subgroup with no eligible policy pick follows only its configured final; the
+parent still sees that subgroup as the selected member. Final chains preserve
+selection chains and Score attribution. Ordinary member/display lists exclude
+final edges, while health registration, warm discovery, Score membership and
+datapath connectivity use the reachable-final closure. A leaf health transition
+recomputes every affected ancestor's alive slot, not only its first mapped group.
+IPv6 health-family retries prefer a usable ordinary IPv4 proxy path before a
+final, without changing the business target family. Missing or cyclic finals
+remain refusals; no transport error or terminal packet rejection is retried here.
+
+Selector captures a concrete node or sub-group member before candidate expansion and health filtering; repeated node tags bind the first matching declared `NodeId`. Parents retain the existing subgroup Peek, parent-health gate, and serving-commit order, so unchosen Score state is not advanced. For both TCP and UDP, a failed serving commit cannot restore the earlier peek; only a configured final may continue selection. Candidates retain their originating subgroup reference instead of rediscovering it from a display tag. A chosen automatic sub-group may still select a different leaf within its own membership. The sole TCP leaf's last-resort walk also respects every nested Selector choice, while explicit delay tests may inspect all members for recovery.
 
 Display and API output retain member tags even when the physical dial reaches a deeper leaf; serving selection retains concrete node or subgroup identity separately:
 

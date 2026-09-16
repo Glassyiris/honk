@@ -403,3 +403,286 @@ fn selector_duplicate_names_keep_one_identity_across_entrypoints() {
         }
     }
 }
+
+#[test]
+fn named_final_uses_first_declaration_not_hash_order_or_health() {
+    let nodes = [
+        Node::from_share_link("socks5://127.0.0.1:1080#shared").unwrap(),
+        Node::from_share_link("socks5://127.0.0.1:1081#shared").unwrap(),
+    ];
+    let mut child = make_group("child", GroupPolicy::Selector, vec![]);
+    child.final_outbound = Some("shared".into());
+    let parent = make_subgroup("parent", GroupPolicy::Selector, &["child"]);
+    let groups = [parent, child];
+    let alive = Arc::new(AliveDialerSet::new());
+    let forward = GroupManager::with_alive_set(&groups, &nodes, Some(alive.clone()));
+    let mut reverse = GroupManager::with_alive_set(
+        &groups,
+        &[nodes[1].clone(), nodes[0].clone()],
+        Some(alive.clone()),
+    );
+    // Identical hash iteration makes opposite declaration orders a deterministic control.
+    reverse.nodes = forward.nodes.clone();
+    let context = ScoreSelectionContext::aggregate(
+        SelectionNetwork::Udp,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+    );
+    for (manager, first, second) in [(&forward, 0, 1), (&reverse, 1, 0)] {
+        for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+            alive.report_available_traffic(nodes[first].id, domain, IpVersion::V4);
+            alive.report_unavailable_forced(nodes[second].id, domain, IpVersion::V4);
+        }
+        let plan = manager.selection_plan_for_target("parent", &context);
+        assert_eq!(
+            plan.entries
+                .iter()
+                .map(|entry| entry.node.id)
+                .collect::<Vec<_>>(),
+            [nodes[first].id]
+        );
+        for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+            alive.report_unavailable_forced(nodes[first].id, domain, IpVersion::V4);
+            alive.report_available_traffic(nodes[second].id, domain, IpVersion::V4);
+        }
+        assert!(
+            manager
+                .selection_plan_for_target("parent", &context)
+                .entries
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn nested_score_udp_final_is_explicit_and_health_checked() {
+    let nodes = [
+        make_node(nid("dead"), "dead"),
+        make_node(nid("backup"), "backup"),
+        make_node(nid("outside"), "outside"),
+    ];
+    let mut child = make_group("child", GroupPolicy::Score, vec![nodes[0].id]);
+    child.final_outbound = Some("backup".into());
+    let mut parent = make_subgroup("parent", GroupPolicy::Selector, &["child", "empty"]);
+    parent.nodes.push(nodes[2].id);
+    parent.default = Some("child".into());
+    let alive = Arc::new(AliveDialerSet::new());
+    for family in [IpVersion::V4, IpVersion::V6] {
+        for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+            alive.report_unavailable_forced(nodes[0].id, domain, family);
+        }
+    }
+    let manager = GroupManager::with_alive_set(
+        &[
+            parent,
+            child,
+            make_group("empty", GroupPolicy::Selector, vec![]),
+        ],
+        &nodes,
+        Some(alive.clone()),
+    );
+    assert_udp_selection(&manager, "parent", Some("backup"));
+    assert_eq!(manager.node_names_in_group("child"), ["dead"]);
+    assert_eq!(
+        manager.leaf_node_names_in_group("parent"),
+        ["outside", "dead"]
+    );
+    let context = ScoreSelectionContext::aggregate(
+        SelectionNetwork::Udp,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+    );
+    let plan = manager.selection_plan_for_target("parent", &context);
+    assert_eq!(
+        plan.entries[0].selection_chain,
+        ["parent", "child", "backup"]
+    );
+    assert_eq!(
+        manager.selection_chain_for_network("parent", SelectionNetwork::Udp),
+        ["parent", "child", "backup"]
+    );
+    assert_eq!(
+        manager
+            .ranked_udp_leaves("child", IpVersion::V4, 3)
+            .iter()
+            .map(|node| node.id)
+            .collect::<Vec<_>>(),
+        [nodes[1].id]
+    );
+
+    manager.set_selector_choice("parent", "empty");
+    assert_udp_selection(&manager, "parent", None);
+    manager.set_selector_choice("parent", "child");
+    for family in [IpVersion::V4, IpVersion::V6] {
+        for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+            alive.report_unavailable_forced(nodes[1].id, domain, family);
+        }
+    }
+    assert_udp_selection(&manager, "parent", None);
+}
+
+#[test]
+fn nested_final_waits_for_ipv4_proxy_health_before_direct() {
+    let nodes = [make_node(nid("proxy"), "proxy")];
+    let mut child = make_group("child", GroupPolicy::Score, vec![nodes[0].id]);
+    child.final_outbound = Some("direct".into());
+    let mut parent = make_subgroup("parent", GroupPolicy::Selector, &["child"]);
+    parent.final_outbound = Some("block".into());
+    let alive = Arc::new(AliveDialerSet::new());
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        alive.report_unavailable_forced(nodes[0].id, domain, IpVersion::V6);
+    }
+    let manager = GroupManager::with_alive_set(&[child, parent], &nodes, Some(alive.clone()));
+    let context = ScoreSelectionContext {
+        target_family: Some(IpVersion::V6),
+        target: Some(ScoreTarget::domain("ipv6.example", 443)),
+        ..ScoreSelectionContext::aggregate(
+            SelectionNetwork::Udp,
+            ProbeDomain::DataUdp,
+            IpVersion::V6,
+        )
+    };
+    let plan = manager.selection_plan_for_target_with_health_fallback("parent", &context);
+    assert_eq!(plan.health_family, IpVersion::V4);
+    assert_eq!(plan.entries[0].node.id, nodes[0].id);
+    assert_eq!(
+        plan.entries[0].selection_chain,
+        ["parent", "child", "proxy"]
+    );
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        alive.report_unavailable_forced(nodes[0].id, domain, IpVersion::V4);
+    }
+    let plan = manager.selection_plan_for_target_with_health_fallback("parent", &context);
+    assert_eq!(plan.entries[0].node.id, honk_config::config::DIRECT_NODE_ID);
+    assert_eq!(
+        plan.entries[0].selection_chain,
+        ["parent", "child", "direct"]
+    );
+}
+
+#[test]
+fn final_peek_and_unselected_subgroups_do_not_advance_rotation() {
+    let nodes = [
+        make_node(nid("a"), "a"),
+        make_node(nid("b"), "b"),
+        make_node(nid("outside"), "outside"),
+    ];
+    let final_group = make_group(
+        "rotation",
+        GroupPolicy::LoadBalance,
+        vec![nodes[0].id, nodes[1].id],
+    );
+    let mut child = make_group("child", GroupPolicy::Score, vec![]);
+    child.final_outbound = Some("rotation".into());
+    let mut parent = make_subgroup("parent", GroupPolicy::Selector, &["child"]);
+    parent.nodes.push(nodes[2].id);
+    let manager = GroupManager::new(&[parent, child, final_group], &nodes);
+    assert_eq!(manager.select_node("parent").unwrap().id, nodes[2].id);
+    manager.set_selector_choice("parent", "child");
+    for _ in 0..2 {
+        assert_eq!(
+            manager
+                .peek_selection_plan_for_domain("parent", ProbeDomain::DataUdp, IpVersion::V4)
+                .nodes[0]
+                .id,
+            nodes[0].id
+        );
+    }
+    let warmed = manager.ranked_udp_leaves("child", IpVersion::V4, 2);
+    assert_eq!(
+        warmed.iter().map(|node| node.id).collect::<Vec<_>>(),
+        [nodes[0].id, nodes[1].id]
+    );
+    assert_eq!(
+        manager
+            .select_node_for_domain("parent", ProbeDomain::DataUdp, IpVersion::V4)
+            .unwrap()
+            .id,
+        nodes[0].id
+    );
+    assert_eq!(
+        manager
+            .select_node_for_domain("parent", ProbeDomain::DataUdp, IpVersion::V4)
+            .unwrap()
+            .id,
+        nodes[1].id
+    );
+}
+
+#[test]
+fn final_chains_preserve_cold_provenance_and_bound_mixed_cycles() {
+    let nodes = [make_node(nid("a"), "a"), make_node(nid("b"), "b")];
+    let terminal = make_group(
+        "terminal",
+        GroupPolicy::URLTest,
+        vec![nodes[0].id, nodes[1].id],
+    );
+    let mut bridge = make_group("bridge", GroupPolicy::Selector, vec![]);
+    bridge.final_outbound = Some("terminal".into());
+    let mut root = make_group("root", GroupPolicy::Score, vec![]);
+    root.final_outbound = Some("bridge".into());
+    let member = make_subgroup("member", GroupPolicy::Selector, &["root"]);
+    let manager = GroupManager::new(&[root, bridge, terminal, member], &nodes);
+    let context = ScoreSelectionContext::aggregate(
+        SelectionNetwork::Udp,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+    );
+    let plan = manager.selection_plan_for_target("root", &context);
+    assert_eq!(plan.mode, SelectionPlanMode::ColdUrlTest);
+    assert_eq!(
+        plan.entries
+            .iter()
+            .map(|entry| entry.node.id)
+            .collect::<Vec<_>>(),
+        [nodes[0].id, nodes[1].id]
+    );
+    assert_eq!(
+        plan.entries[0].selection_chain,
+        ["root", "bridge", "terminal", "a"]
+    );
+    let nested = manager.selection_plan_for_target("member", &context);
+    assert_eq!(nested.mode, SelectionPlanMode::Authoritative);
+    assert_eq!(
+        nested
+            .entries
+            .iter()
+            .map(|entry| entry.node.id)
+            .collect::<Vec<_>>(),
+        [nodes[0].id]
+    );
+
+    let mut cycle = make_subgroup("cycle", GroupPolicy::Selector, &["back"]);
+    let mut back = make_group("back", GroupPolicy::Score, vec![]);
+    back.final_outbound = Some("cycle".into());
+    let manager = GroupManager::new(&[cycle.clone(), back.clone()], &[]);
+    assert_udp_selection(&manager, "cycle", None);
+    assert!(
+        manager
+            .ranked_udp_leaves("cycle", IpVersion::V4, 3)
+            .is_empty()
+    );
+    for (name, id) in [
+        ("direct", honk_config::config::DIRECT_NODE_ID),
+        ("block", honk_config::config::BLOCK_NODE_ID),
+    ] {
+        cycle.final_outbound = Some(name.into());
+        let manager = GroupManager::new(&[cycle.clone(), back.clone()], &[]);
+        let plan = manager.selection_plan_for_target("cycle", &context);
+        assert_eq!(plan.entries[0].node.id, id);
+        assert_eq!(plan.entries[0].selection_chain, ["cycle", name]);
+        assert_udp_selection(&manager, "cycle", Some(name));
+    }
+
+    let mut chain: Vec<_> = (0..=MAX_GROUP_DEPTH)
+        .map(|index| {
+            let mut group = make_group(&format!("level-{index}"), GroupPolicy::Score, vec![]);
+            group.final_outbound = Some(format!("level-{}", index + 1));
+            group
+        })
+        .collect();
+    chain[MAX_GROUP_DEPTH].final_outbound = Some("direct".into());
+    let manager = GroupManager::new(&chain, &[]);
+    assert_udp_selection(&manager, "level-0", None);
+    assert_udp_selection(&manager, "level-1", Some("direct"));
+}

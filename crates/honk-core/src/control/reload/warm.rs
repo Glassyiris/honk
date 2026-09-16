@@ -315,15 +315,7 @@ pub(in crate::control) fn udp_warm_candidates(
     let mut selected: Vec<(uuid::Uuid, Duration)> = Vec::new();
     for group in &config.groups {
         for ipver in [IpVersion::V4, IpVersion::V6] {
-            let mut leaves = group_manager.ranked_udp_leaves(&group.name, ipver, per_group);
-            // `flatten_candidates` covers sub-groups but not a bare `final:`
-            // hop — resolve one final hop so final-only groups still warm
-            // their terminal leaves.
-            if leaves.is_empty()
-                && let Some(final_name) = group_manager.get_final_outbound(&group.name)
-            {
-                leaves = group_manager.ranked_udp_leaves(&final_name, ipver, per_group);
-            }
+            let leaves = group_manager.ranked_udp_leaves(&group.name, ipver, per_group);
             for node in leaves {
                 if matches!(
                     node.protocol(),

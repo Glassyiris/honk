@@ -80,11 +80,14 @@ fn dead_single_leaf_remains_a_tcp_last_resort_only() {
     with_final.final_outbound = Some("block".into());
     let manager =
         GroupManager::with_alive_set(&[with_final], std::slice::from_ref(&node), Some(alive));
-    assert!(
+    assert_eq!(
         manager
             .selection_plan_for_domain("single", ProbeDomain::Tcp, IpVersion::V4)
             .nodes
-            .is_empty()
+            .iter()
+            .map(|node| node.id)
+            .collect::<Vec<_>>(),
+        [honk_config::config::BLOCK_NODE_ID],
     );
 }
 

@@ -36,7 +36,7 @@ group {
 | `filter: subtag(...)` | `filters` + `nodes` | `[]` | 按产生节点的订阅的当前 tag 选择节点。 |
 | `filter: group(...)` | `groups` | `[]` | 加入嵌套组 tag。接受逗号分隔的参数和竖线分隔的 tag。 |
 | `default` | `default` | `null` | `selector` 的初始或回退成员 tag。 |
-| `final` | `final_outbound` | `null` | 组策略没有合格选择时使用的节点、组、`direct` 或 `block`。 |
+| `final` | `final_outbound` | `null` | 组策略没有合格选择时使用的节点、组、`direct` 或 `block`，该组嵌套在其他组中时同样生效。Final 节点仍受健康检查约束；缺失或成环的 final 会拒绝，不会隐式直连。 |
 | `check_url` | `check_url` | `null` | 非 Selector 策略的按组 TCP 健康检查目标。Selector 会忽略该字段并告警。 |
 | —（dae 中不可配置） | `check_interval` | `null` | 按组间隔字段，单位为秒。当前运行时不读取该字段，而使用全局间隔。 |
 | —（dae 中不可配置） | `tolerance` | `50` | URLTest 切换阈值，单位为毫秒。dae URLTest 组接收 `global.check_tolerance`；运行时的有效下限为 1 ms。 |
@@ -58,7 +58,10 @@ group {
 
 只有在选择缺失或已不属于该组时，才继续使用 `default` 或声明顺序中的第一个成员。现存的已选成员没有合格叶节点时，TCP 和 UDP 都不会回退到兄弟成员：仅可继续执行显式配置的 `final` 或下述同一叶节点的 TCP 最后尝试。选中的嵌套组仍执行自己的策略，因此 URLTest 可以在该子组内部选择其他叶节点。
 
+已选子组会先解析自己的显式 `final`，再向父组返回空结果。这不允许改选其他 Selector 兄弟成员，也不允许重试终态协议拒绝。IPv6 目标仍优先尝试经 IPv4 代理健康状态可达的普通已选叶节点，然后才执行 final 路径。
+
 不同节点使用同一显示 tag 时，Selector 在健康过滤前按组内声明顺序绑定第一个匹配成员的 `NodeId`，不会因另一个同名节点健康而改选它。
+按名称指定的 `final` 节点同样绑定配置中第一个匹配声明，不会用健康的同名节点替换；选择与 final 节点健康注册使用同一身份。
 
 若组只有一个唯一叶节点、未配置 `final`，且 TCP 健康状态排除了该节点，honk 仍可把同一节点作为最后尝试，但当前 Selector 选择路径必须能到达它。这不能绕过选中的空子组，也不表示回退到 `direct`。节点保持 dead，直到真实流量或探测使其恢复；UDP 继续正常排除死亡成员。最后尝试服务会记录限流警告（每组 60 秒）。
 

@@ -219,6 +219,271 @@ fn single_leaf_tcp_connectivity_stays_open_for_recovery() {
     assert!(snapshot.contains(&(OutboundIndex::UserBase as u8, 2, 0, false)));
 }
 
+fn nested_final_config() -> Config {
+    let mut config = honk_config::parser::parse_dae_config(
+        r#"
+node {
+    primary: 'anytls://password@127.0.0.1:4433'
+    backup: 'hy2://password@127.0.0.1:4434'
+    unused: 'anytls://password@127.0.0.1:4435'
+}
+group {
+    root {
+        filter: group(automatic)
+        policy: select
+        default: automatic
+    }
+    automatic {
+        filter: name(primary)
+        policy: score
+        final: backup-chain
+    }
+    backup-chain {
+        filter: name(missing)
+        final: backup
+    }
+}
+routing {
+    fallback: root
+}
+"#,
+    )
+    .unwrap();
+    config.ensure_builtin_nodes();
+    config.validate().unwrap();
+    config
+}
+
+#[test]
+fn nested_final_only_leaf_is_health_registered_and_keeps_probe_ownership() {
+    let mut config = nested_final_config();
+    let primary = config.nodes[0].id;
+    let backup = config.nodes[1].id;
+    let alive = AliveDialerSet::new();
+    sync_health_check_nodes(&alive, &config);
+    assert_eq!(
+        alive
+            .registered_nodes()
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [primary, backup].into_iter().collect()
+    );
+
+    for group in &mut config.groups {
+        group.policy = GroupPolicy::URLTest;
+    }
+    alive.sync_urltest_groups(&urltest_group_registrations(&config));
+    assert!(alive.is_probe_suspended(backup));
+
+    config.groups[0].policy = GroupPolicy::Selector;
+    config.groups[2].groups.push("root".into());
+    alive.sync_urltest_groups(&urltest_group_registrations(&config));
+    assert!(!alive.is_probe_suspended(backup));
+
+    config.groups[2].final_outbound = None;
+    sync_health_check_nodes(&alive, &config);
+    assert!(!alive.registered_nodes().contains_key(&backup));
+
+    for (name, id) in [
+        ("direct", honk_config::config::DIRECT_NODE_ID),
+        ("block", honk_config::config::BLOCK_NODE_ID),
+    ] {
+        config.groups[2].final_outbound = Some(name.into());
+        sync_health_check_nodes(&alive, &config);
+        assert_eq!(
+            alive
+                .registered_nodes()
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [primary, id].into_iter().collect()
+        );
+    }
+}
+
+#[test]
+fn nested_final_keeps_datapath_group_alive_without_reviving_dead_members() {
+    let mut config = nested_final_config();
+    let primary = config.nodes[0].id;
+    let backup = config.nodes[1].id;
+    let alive = Arc::new(AliveDialerSet::new());
+    for ipver in [IpVersion::V4, IpVersion::V6] {
+        for domain in [ProbeDomain::Tcp, ProbeDomain::DnsUdp, ProbeDomain::DataUdp] {
+            alive.report_unavailable_forced(primary, domain, ipver);
+        }
+    }
+    let manager = GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive.clone()));
+    let mut backend = MockEbpfBackend::new();
+    publish_group_connectivity(
+        &mut backend,
+        &group_connectivity_snapshot(&config, &manager, &alive),
+    )
+    .unwrap();
+    for index in 0..config.groups.len() {
+        assert!(
+            backend
+                .get_outbound_alive(OutboundIndex::UserBase as u8 + index as u8, 2, 0)
+                .unwrap()
+        );
+    }
+    assert!(!alive.is_alive_for(primary, ProbeDomain::DataUdp, IpVersion::V4));
+
+    alive.report_unavailable_forced(backup, ProbeDomain::DataUdp, IpVersion::V4);
+    publish_group_connectivity(
+        &mut backend,
+        &group_connectivity_snapshot(&config, &manager, &alive),
+    )
+    .unwrap();
+    assert!(
+        !backend
+            .get_outbound_alive(OutboundIndex::UserBase as u8, 2, 0)
+            .unwrap()
+    );
+
+    for final_name in ["direct", "block"] {
+        config.groups[2].final_outbound = Some(final_name.into());
+        let manager =
+            GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive.clone()));
+        publish_group_connectivity(
+            &mut backend,
+            &group_connectivity_snapshot(&config, &manager, &alive),
+        )
+        .unwrap();
+        assert!(
+            backend
+                .get_outbound_alive(OutboundIndex::UserBase as u8, 2, 0)
+                .unwrap()
+        );
+    }
+}
+
+#[test]
+fn parsed_nested_score_udp_plan_uses_healthy_final_chain() {
+    let config = nested_final_config();
+    let primary = config.nodes[0].id;
+    let backup = config.nodes[1].id;
+    let alive = Arc::new(AliveDialerSet::new());
+    for ipver in [IpVersion::V4, IpVersion::V6] {
+        for domain in [ProbeDomain::DnsUdp, ProbeDomain::DataUdp] {
+            alive.report_unavailable_forced(primary, domain, ipver);
+        }
+    }
+    let manager = GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive));
+    let context = honk_outbound::group::ScoreSelectionContext::aggregate(
+        honk_outbound::group::SelectionNetwork::Udp,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+    );
+    let plan = resolve_udp_outbound_plan_for_target(&config, &manager, "root", &context);
+    assert_eq!(
+        plan.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+        [backup]
+    );
+    assert_eq!(
+        plan.mode,
+        honk_outbound::group::SelectionPlanMode::Authoritative
+    );
+    assert_eq!(
+        plan.selection_chains,
+        [vec!["root", "automatic", "backup-chain", "backup"]]
+    );
+}
+
+#[test]
+fn udp_warm_candidates_include_healthy_final_only_leaf() {
+    let config = nested_final_config();
+    let primary = config.nodes[0].id;
+    let backup = config.nodes[1].id;
+    let alive = Arc::new(AliveDialerSet::new());
+    for ipver in [IpVersion::V4, IpVersion::V6] {
+        for domain in [ProbeDomain::DnsUdp, ProbeDomain::DataUdp] {
+            alive.report_unavailable_forced(primary, domain, ipver);
+        }
+    }
+    let manager = GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive));
+    let runtime = honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes).unwrap();
+    assert_eq!(
+        udp_warm_candidates(&config, &manager, &runtime, 1),
+        [backup]
+    );
+}
+
+#[tokio::test]
+async fn final_only_leaf_health_push_updates_all_ancestor_datapath_slots() {
+    let mut config = nested_final_config();
+    let primary = config.nodes[0].id;
+    let backup = config.nodes[1].id;
+    let affected_count = config.groups.len();
+    config.groups.push(Group {
+        name: "unrelated".into(),
+        nodes: vec![config.nodes[2].id],
+        ..Default::default()
+    });
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.report_unavailable_forced(primary, ProbeDomain::DataUdp, IpVersion::V4);
+    alive.report_unavailable_forced(backup, ProbeDomain::DataUdp, IpVersion::V4);
+    let outbound_ids = build_outbound_id_map(&config);
+    alive.set_outbound_resolver(Some(Arc::new(move |id| outbound_ids.get(&id).copied())));
+    let (updates, received) = std::sync::mpsc::channel();
+    alive.set_ebpf_callback(Box::new(move |node_id, _, domain, ipver, _| {
+        updates.send((node_id, domain, ipver)).unwrap();
+    }));
+    let manager = Arc::new(parking_lot::RwLock::new(Arc::new(
+        GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive.clone())),
+    )));
+    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
+        Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
+    let outbound = OutboundIndex::UserBase as u8;
+    for index in 0..config.groups.len() {
+        backend
+            .write()
+            .await
+            .set_outbound_alive(outbound + index as u8, 2, 0, false)
+            .unwrap();
+    }
+    let publisher = Arc::new(super::runtime::OutboundHealthPublisher::new(
+        backend.clone(),
+        Arc::new(RwLock::new(Arc::new(config))),
+        manager,
+        alive.clone(),
+    ));
+
+    alive.report_available_traffic(backup, ProbeDomain::DataUdp, IpVersion::V4);
+    let (node_id, domain, ipver) = received.try_recv().unwrap();
+    publisher.clone().publish(node_id, domain, ipver).await;
+    for index in 0..affected_count {
+        assert!(
+            backend
+                .read()
+                .await
+                .get_outbound_alive(outbound + index as u8, 2, 0)
+                .unwrap()
+        );
+    }
+    assert!(
+        !backend
+            .read()
+            .await
+            .get_outbound_alive(outbound + affected_count as u8, 2, 0)
+            .unwrap()
+    );
+    for _ in 0..50 {
+        alive.report_unavailable_traffic(backup, ProbeDomain::DataUdp, IpVersion::V4);
+    }
+    let (node_id, domain, ipver) = received.try_recv().unwrap();
+    publisher.publish(node_id, domain, ipver).await;
+    for index in 0..affected_count {
+        assert!(
+            !backend
+                .read()
+                .await
+                .get_outbound_alive(outbound + index as u8, 2, 0)
+                .unwrap()
+        );
+    }
+}
+
 #[test]
 fn group_connectivity_follows_reordered_outbound_ids() {
     let a = Node {

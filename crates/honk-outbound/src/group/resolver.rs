@@ -16,100 +16,18 @@ impl GroupManager {
         depth: usize,
         effects: SelectionEffects,
     ) -> Option<&'a Node> {
-        self.pick_candidate_in_group(group, domain, ipver, visited, depth, effects)
-            .map(|candidate| candidate.node)
-    }
-
-    /// After a Selector pick, commit the serving sub-group's own selection:
-    /// sub-groups are peeked during flattening, so only the real service
-    /// path records selection state (ranks, incumbent marks, URLTest
-    /// caches) only for the member actually serving traffic.
-    /// Refusal at commit is final; a stale peek is not a fallback.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn commit_selector_pick<'a>(
-        &'a self,
-        group: &'a Group,
-        picked: Candidate<'a>,
-        domain: ProbeDomain,
-        ipver: IpVersion,
-        visited: &mut Vec<&'a str>,
-        depth: usize,
-        effects: SelectionEffects,
-    ) -> Option<Candidate<'a>> {
-        if !effects.applies() {
-            return Some(picked);
-        }
-        let Some(sub) = picked.via else {
-            return Some(picked);
-        };
-        self.mark_used(&sub.name);
-        visited.push(group.name.as_str());
-        let committed =
-            self.pick_candidate_in_group(sub, domain, ipver, visited, depth + 1, effects);
-        visited.pop();
-        let mut committed = committed?;
-        committed.via = picked.via;
-        Some(committed)
-    }
-
-    pub(super) fn pick_candidate_in_group<'a>(
-        &'a self,
-        group: &'a Group,
-        domain: ProbeDomain,
-        ipver: IpVersion,
-        visited: &mut Vec<&'a str>,
-        depth: usize,
-        effects: SelectionEffects,
-    ) -> Option<Candidate<'a>> {
-        let selected_member = self.selector_member(group);
-        let candidates = self.flatten_candidates(group, domain, ipver, visited, depth, effects);
-        let before_filter = (effects.applies()
-            && group.policy == GroupPolicy::Score
-            && self.score_state.is_current_authority(&self.score_authority))
-        .then(|| unique_candidate_ids(&candidates))
-        .flatten();
-        let candidates =
-            self.filter_alive_candidates(candidates, domain, ipver, group.check_url.as_deref());
-        let network = SelectionNetwork::from_probe_domain(domain);
-        if let Some(before_filter) = before_filter {
-            self.score_state.record_dead_filtered(
-                &self.score_authority,
-                score::SelectionReasonKey::new(&group.name, network),
-                removed_unique_candidate_count(before_filter, &candidates),
-            );
-        }
-        if candidates.is_empty() {
-            return self
-                .last_resort_tcp_leaf(group, domain, effects)
-                .map(|node| Candidate {
-                    via: None,
-                    node,
-                    attribution: Vec::new(),
-                    selection_chain: vec![node.name.as_str()],
-                });
-        }
-        let candidate = match group.policy {
-            GroupPolicy::Selector => {
-                let picked = Self::pick_selector(&candidates, selected_member?)?;
-                self.commit_selector_pick(group, picked, domain, ipver, visited, depth, effects)?
-            }
-            GroupPolicy::URLTest => self.pick_urltest(&candidates, group, network, ipver, effects),
-            GroupPolicy::LoadBalance => {
-                self.pick_load_balance(&candidates, group, network, effects)
-            }
-            GroupPolicy::Fallback => self.pick_fallback(&candidates, group, network, effects),
-            GroupPolicy::Score => self.pick_score(
-                &candidates,
-                group,
-                &ScoreSelectionContext::aggregate(network, domain, ipver),
-                effects,
+        self.pick_candidate_for_target(
+            group,
+            &ScoreSelectionContext::aggregate(
+                SelectionNetwork::from_probe_domain(domain),
+                domain,
+                ipver,
             ),
-        };
-        let mut candidate = candidate;
-        if group.policy == GroupPolicy::Score {
-            candidate.attribution.push(group.name.as_str());
-        }
-        Some(candidate)
+            visited,
+            depth,
+            effects,
+        )
+        .map(|candidate| candidate.node)
     }
 
     /// Flatten a group's members into dial candidates: every direct member
@@ -126,46 +44,17 @@ impl GroupManager {
         depth: usize,
         effects: SelectionEffects,
     ) -> Vec<Candidate<'a>> {
-        if depth >= MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
-            return Vec::new();
-        }
-        visited.push(group.name.as_str());
-        // A Selector peeks all sub-groups here; `commit_selector_pick`
-        // re-resolves the serving one with applied effects after the pick.
-        let sub_effects = if group.policy == GroupPolicy::Selector && effects.applies() {
-            SelectionEffects::Peek
-        } else {
-            effects
-        };
-        let mut out: Vec<Candidate<'a>> = group
-            .nodes
-            .iter()
-            .filter_map(|id| self.nodes.get(id))
-            .map(|node| Candidate {
-                via: None,
-                node,
-                attribution: Vec::new(),
-                selection_chain: vec![node.name.as_str()],
-            })
-            .collect();
-        for sub_tag in &group.groups {
-            let Some(sub) = self.groups.get(sub_tag.as_str()) else {
-                continue;
-            };
-            // Sub-group participation wakes health checks only for real
-            // traffic; peek must remain observational.
-            if sub_effects.applies() {
-                self.mark_used(sub_tag);
-            }
-            if let Some(mut candidate) =
-                self.pick_candidate_in_group(sub, domain, ipver, visited, depth + 1, sub_effects)
-            {
-                candidate.via = Some(sub);
-                out.push(candidate);
-            }
-        }
-        visited.pop();
-        out
+        self.flatten_candidates_for_target(
+            group,
+            &ScoreSelectionContext::aggregate(
+                SelectionNetwork::from_probe_domain(domain),
+                domain,
+                ipver,
+            ),
+            visited,
+            depth,
+            effects,
+        )
     }
 
     pub(super) fn members<'a>(&'a self, group: &'a Group) -> impl Iterator<Item = GroupMember<'a>> {
@@ -181,6 +70,23 @@ impl GroupManager {
                     .filter_map(move |tag| self.groups.get(tag))
                     .map(GroupMember::Group),
             )
+    }
+
+    pub(super) fn final_member<'a>(&'a self, group: &Group) -> Option<GroupMember<'a>> {
+        use honk_config::Config;
+        use std::sync::LazyLock;
+
+        static DIRECT: LazyLock<Node> = LazyLock::new(Config::builtin_direct_node);
+        static BLOCK: LazyLock<Node> = LazyLock::new(Config::builtin_block_node);
+        let name = group.final_outbound.as_deref()?;
+        match name {
+            Config::BUILTIN_DIRECT_NODE => Some(GroupMember::Node(&DIRECT)),
+            Config::BUILTIN_BLOCK_NODE => Some(GroupMember::Node(&BLOCK)),
+            _ => self
+                .node_by_name(name)
+                .map(GroupMember::Node)
+                .or_else(|| self.groups.get(name).map(GroupMember::Group)),
+        }
     }
 
     /// Borrowed member tags of a group (direct node names, then sub-group
@@ -202,8 +108,7 @@ impl GroupManager {
     /// This is the member list a dashboard shows (the clash `all` field):
     /// sing-box nested groups drill down layer by layer, so sub-groups
     /// appear under their own tag, not expanded to leaves. Use
-    /// [`GroupManager::leaf_node_names_in_group`] where the real nodes
-    /// underneath matter (health checks, eBPF connectivity aggregation).
+    /// [`GroupManager::reachable_leaf_nodes_in_group`] for health and connectivity.
     pub fn node_names_in_group(&self, group_name: &str) -> Vec<String> {
         let Some(group) = self.groups.get(group_name) else {
             return vec![];
@@ -214,11 +119,7 @@ impl GroupManager {
             .collect()
     }
 
-    /// All leaf node names reachable from a group, expanding nested
-    /// sub-groups recursively (deduplicated, cycle-guarded). Unlike
-    /// [`GroupManager::node_names_in_group`] — which lists display tags —
-    /// this resolves to the real nodes whose health state drives probing
-    /// and eBPF connectivity pushes.
+    /// Ordinary member leaf names, excluding explicit final edges.
     pub fn leaf_node_names_in_group(&self, group_name: &str) -> Vec<String> {
         self.leaf_nodes_in_group(group_name)
             .into_iter()
@@ -226,13 +127,42 @@ impl GroupManager {
             .collect()
     }
 
-    /// All leaf nodes reachable from a group (deduplicated by NodeId,
-    /// cycle-guarded) — the health-state carriers behind
-    /// [`GroupManager::leaf_node_names_in_group`].
+    /// Ordinary member leaves, deduplicated by NodeId and cycle-guarded.
     pub fn leaf_nodes_in_group(&self, group_name: &str) -> Vec<&Node> {
+        self.group_leaf_nodes(group_name, false)
+    }
+
+    /// All leaves reachable through membership and explicit final edges.
+    /// Final leaves remain separate from the ordinary member/display list.
+    pub fn reachable_leaf_nodes_in_group(&self, group_name: &str) -> Vec<&Node> {
+        self.group_leaf_nodes(group_name, true)
+    }
+
+    /// Whether membership or explicit final edges can reach this health carrier.
+    pub fn group_reaches_node(&self, group_name: &str, node_id: uuid::Uuid) -> bool {
+        self.visit_group_leaves(
+            group_name,
+            0,
+            &mut [""; MAX_GROUP_DEPTH],
+            true,
+            &mut |node| node.id == node_id,
+        )
+    }
+
+    fn group_leaf_nodes(&self, group_name: &str, include_final: bool) -> Vec<&Node> {
         let mut out: Vec<&Node> = Vec::new();
-        let mut visited: Vec<&str> = Vec::new();
-        self.collect_leaf_nodes(group_name, 0, &mut visited, &mut out);
+        self.visit_group_leaves(
+            group_name,
+            0,
+            &mut [""; MAX_GROUP_DEPTH],
+            include_final,
+            &mut |node| {
+                if !out.iter().any(|existing| existing.id == node.id) {
+                    out.push(node);
+                }
+                false
+            },
+        );
         out
     }
 
@@ -262,34 +192,38 @@ impl GroupManager {
         }
     }
 
-    fn collect_leaf_nodes<'a>(
+    fn visit_group_leaves<'a>(
         &'a self,
         group_name: &str,
         depth: usize,
-        visited: &mut Vec<&'a str>,
-        out: &mut Vec<&'a Node>,
-    ) {
-        if depth >= MAX_GROUP_DEPTH {
-            return;
+        visited: &mut [&'a str; MAX_GROUP_DEPTH],
+        include_final: bool,
+        visit: &mut impl FnMut(&'a Node) -> bool,
+    ) -> bool {
+        if depth >= MAX_GROUP_DEPTH || visited[..depth].contains(&group_name) {
+            return false;
         }
         let Some(group) = self.groups.get(group_name) else {
-            return;
+            return false;
         };
-        if visited.contains(&group.name.as_str()) {
-            return;
-        }
-        visited.push(group.name.as_str());
-        for id in &group.nodes {
-            if let Some(n) = self.nodes.get(id)
-                && !out.iter().any(|o| o.id == n.id)
-            {
-                out.push(n);
-            }
-        }
-        for tag in &group.groups {
-            self.collect_leaf_nodes(tag, depth + 1, visited, out);
-        }
-        visited.pop();
+        visited[depth] = group.name.as_str();
+        group
+            .nodes
+            .iter()
+            .filter_map(|id| self.nodes.get(id))
+            .any(&mut *visit)
+            || group
+                .groups
+                .iter()
+                .any(|tag| self.visit_group_leaves(tag, depth + 1, visited, include_final, visit))
+            || (include_final
+                && match self.final_member(group) {
+                    Some(GroupMember::Node(node)) => visit(node),
+                    Some(GroupMember::Group(group)) => {
+                        self.visit_group_leaves(&group.name, depth + 1, visited, true, visit)
+                    }
+                    None => false,
+                })
     }
 
     /// First leaf node reachable from a group in declaration order,
@@ -376,7 +310,14 @@ impl GroupManager {
                 GroupPolicy::LoadBalance => None,
                 GroupPolicy::Score => self
                     .get_score_selection_for_network(&group.name, network)
-                    .and_then(|tag| self.members(group).find(|member| member.tag() == tag)),
+                    .and_then(|tag| {
+                        self.members(group)
+                            .find(|member| member.tag() == tag)
+                            .or_else(|| {
+                                self.final_member(group)
+                                    .filter(|member| member.tag() == tag)
+                            })
+                    }),
             };
             let Some(member) = member else { break };
             match member {

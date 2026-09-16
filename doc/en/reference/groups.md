@@ -36,7 +36,7 @@ group {
 | `filter: subtag(...)` | `filters` + `nodes` | `[]` | Select nodes by the current tag of the subscription that produced them. |
 | `filter: group(...)` | `groups` | `[]` | Add nested group tags. Comma-separated arguments and pipe-separated tags are accepted. |
 | `default` | `default` | `null` | Initial or fallback member tag for `selector`. |
-| `final` | `final_outbound` | `null` | Node, group, `direct`, or `block` used when the group's policy has no eligible selection. |
+| `final` | `final_outbound` | `null` | Node, group, `direct`, or `block` used when the group's policy has no eligible selection, including when that group is nested. Final nodes remain health-gated; missing or cyclic finals fail closed, never implicitly direct. |
 | `check_url` | `check_url` | `null` | Per-group TCP health-check target for non-Selector policies. A Selector ignores it with a warning. |
 | — (not in dae) | `check_interval` | `null` | Per-group interval field in seconds. The current runtime does not consult it and uses the global interval. |
 | — (not in dae) | `tolerance` | `50` | URLTest switch threshold in milliseconds. dae URLTest groups receive `global.check_tolerance`; the runtime applies an effective minimum of 1 ms. |
@@ -58,7 +58,10 @@ Policy matching is ASCII case-insensitive. The parser removes a parenthesized su
 
 Only missing or no-longer-member choices fall through to `default` or the first declared member. An existing chosen member without an eligible leaf does not fall back to a sibling, on either TCP or UDP: the only continuations are an explicit `final` or the same-leaf TCP last-resort rule below. A chosen nested group still applies its own policy, so URLTest may select another leaf inside that group.
 
+Each selected subgroup resolves its own explicit `final` before returning an empty result to its parent. This is not permission to choose a different Selector sibling or retry a terminal protocol refusal. For IPv6 targets, an ordinary selected leaf reachable through IPv4 proxy health is tried before a final route.
+
 When distinct nodes share a display tag, Selector binds the first matching member in the group's declaration order by `NodeId`, before health filtering. A healthy same-name node cannot replace that member.
+Named `final` nodes likewise resolve the first matching configuration declaration; a healthy duplicate cannot replace it. Selection and final-node health registration use that same identity.
 
 If a group has exactly one unique leaf, no `final`, and that leaf is excluded by TCP health, honk can still dial the same leaf as a last resort, but only if the current Selector choices lead to it. This cannot bypass a chosen empty sub-group or imply a `direct` fallback. The node remains marked dead until real traffic or probes recover it; UDP keeps normal dead-member exclusion. Last-resort serving logs a rate-limited warning (60s per group).
 

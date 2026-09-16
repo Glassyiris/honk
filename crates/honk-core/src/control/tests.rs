@@ -67,9 +67,6 @@ async fn health_push_re_resolves_after_reload_writer() {
     let group_manager: SharedGroupManager = Arc::new(parking_lot::RwLock::new(Arc::new(
         GroupManager::new(&old_config.groups, &old_config.nodes),
     )));
-    let outbound_id_map = Arc::new(parking_lot::RwLock::new(reload::build_outbound_id_map(
-        &old_config,
-    )));
     let alive_set = Arc::new(AliveDialerSet::new());
     let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
         crate::ebpf::mock::MockEbpfBackend::new(),
@@ -78,7 +75,6 @@ async fn health_push_re_resolves_after_reload_writer() {
         Arc::clone(&ebpf),
         Arc::clone(&config),
         Arc::clone(&group_manager),
-        Arc::clone(&outbound_id_map),
         Arc::clone(&alive_set),
     ));
 
@@ -87,7 +83,6 @@ async fn health_push_re_resolves_after_reload_writer() {
     backend_writer.set_outbound_alive(2, 1, 0, false).unwrap();
     backend_writer.set_outbound_alive(3, 1, 0, false).unwrap();
     *config_writer = Arc::new(new_config.clone());
-    *outbound_id_map.write() = reload::build_outbound_id_map(&new_config);
     *group_manager.write() = Arc::new(GroupManager::new(&new_config.groups, &new_config.nodes));
 
     let update = tokio::spawn(Arc::clone(&health_publisher).publish(node.id, 1, 0));
@@ -3426,8 +3421,14 @@ fn resolve_udp_score_plan_tracks_v4_fallback_and_final_resolution_guards() {
     assert_eq!(empty.mode, crate::group::SelectionPlanMode::Authoritative);
 
     let missing = resolve_udp_score_plan(&config, &manager, "missing-final", IpVersion::V4);
+    assert!(
+        missing.nodes.is_empty(),
+        "an unresolved final must not bypass group policy"
+    );
+
+    let unknown = resolve_udp_score_plan(&config, &manager, "not-configured", IpVersion::V4);
     assert_eq!(
-        missing
+        unknown
             .nodes
             .iter()
             .map(|node| node.name.as_str())

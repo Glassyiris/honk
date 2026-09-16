@@ -157,7 +157,6 @@ pub(super) struct OutboundHealthPublisher {
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     config: Arc<RwLock<Arc<Config>>>,
     group_manager: SharedGroupManager,
-    outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
     alive_set: Arc<AliveDialerSet>,
 }
 
@@ -166,14 +165,12 @@ impl OutboundHealthPublisher {
         ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
         config: Arc<RwLock<Arc<Config>>>,
         group_manager: SharedGroupManager,
-        outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
         alive_set: Arc<AliveDialerSet>,
     ) -> Self {
         Self {
             ebpf,
             config,
             group_manager,
-            outbound_id_map,
             alive_set,
         }
     }
@@ -183,16 +180,6 @@ impl OutboundHealthPublisher {
         // pinned while waiting so a queued edge cannot update a recycled slot.
         let config = self.config.read().await;
         let mut backend = self.ebpf.write().await;
-        let Some(outbound_idx) = self.outbound_id_map.read().get(&node_id).copied() else {
-            return;
-        };
-        let Some(group) = outbound_idx
-            .checked_sub(honk_ebpf_common::OutboundIndex::UserBase as u8)
-            .and_then(|idx| config.groups.get(idx as usize))
-        else {
-            warn!(outbound_idx, %node_id, "outbound health slot has no current group");
-            return;
-        };
         let probe_domain = match domain {
             1 => ProbeDomain::DnsUdp,
             2 => ProbeDomain::DataUdp,
@@ -204,21 +191,27 @@ impl OutboundHealthPublisher {
             IpVersion::V4
         };
         let group_manager = self.group_manager.read().clone();
-        let alive = reload::group_datapath_alive(
-            group,
-            &group_manager,
-            &self.alive_set,
-            probe_domain,
-            ip_version,
-        );
-        if let Err(error) = backend.set_outbound_alive(outbound_idx, domain, ipver, alive) {
-            warn!(
-                %error,
-                outbound_idx,
-                domain,
-                ipver,
-                "failed to update outbound health in eBPF"
+        for (index, group) in config.groups.iter().enumerate() {
+            if !group_manager.group_reaches_node(&group.name, node_id) {
+                continue;
+            }
+            let outbound_idx = honk_ebpf_common::OutboundIndex::UserBase as u8 + index as u8;
+            let alive = reload::group_datapath_alive(
+                group,
+                &group_manager,
+                &self.alive_set,
+                probe_domain,
+                ip_version,
             );
+            if let Err(error) = backend.set_outbound_alive(outbound_idx, domain, ipver, alive) {
+                warn!(
+                    %error,
+                    outbound_idx,
+                    domain,
+                    ipver,
+                    "failed to update outbound health in eBPF"
+                );
+            }
         }
     }
 }
@@ -732,7 +725,6 @@ impl ControlPlane {
                 self.ebpf.clone(),
                 self.config.clone(),
                 self.group_manager.clone(),
-                self.outbound_id_map.clone(),
                 alive_set.clone(),
             ));
             alive_set.set_ebpf_callback(Box::new(

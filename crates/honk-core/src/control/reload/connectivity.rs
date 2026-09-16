@@ -1,12 +1,11 @@
 use super::*;
 
-/// Recursively collect the member node ids of a group, expanding nested
-/// sub-groups (`Group.groups`). Config-level twin of the GroupManager's
-/// leaf expansion — the config may still contain group cycles (the
-/// GroupManager cuts them on its own copy), so a visited guard and the
-/// shared depth cap apply here too.
+/// Collect reachable leaf ids through membership and explicit final edges.
+/// Config retains cycles cut from GroupManager's copy, so both walks use
+/// a path guard and the shared group-depth cap.
 pub(in crate::control) fn collect_group_leaf_ids<'a>(
     group: &'a Group,
+    config: &'a Config,
     groups_by_name: &std::collections::HashMap<&'a str, &'a Group>,
     depth: usize,
     visited: &mut Vec<&'a str>,
@@ -19,7 +18,24 @@ pub(in crate::control) fn collect_group_leaf_ids<'a>(
     out.extend(group.nodes.iter().copied());
     for tag in &group.groups {
         if let Some(sub) = groups_by_name.get(tag.as_str()) {
-            collect_group_leaf_ids(sub, groups_by_name, depth + 1, visited, out);
+            collect_group_leaf_ids(sub, config, groups_by_name, depth + 1, visited, out);
+        }
+    }
+    if let Some(final_name) = group.final_outbound.as_deref() {
+        match final_name {
+            Config::BUILTIN_DIRECT_NODE => {
+                out.insert(honk_config::config::DIRECT_NODE_ID);
+            }
+            Config::BUILTIN_BLOCK_NODE => {
+                out.insert(honk_config::config::BLOCK_NODE_ID);
+            }
+            name => {
+                if let Some(node) = config.nodes.iter().find(|node| node.name == name) {
+                    out.insert(node.id);
+                } else if let Some(sub) = groups_by_name.get(name) {
+                    collect_group_leaf_ids(sub, config, groups_by_name, depth + 1, visited, out);
+                }
+            }
         }
     }
     visited.pop();
@@ -32,10 +48,9 @@ pub(in crate::control) fn groups_by_name(
     config.groups.iter().map(|g| (g.name.as_str(), g)).collect()
 }
 
-/// Nodes that should be health-checked: members of any group — with
-/// nested sub-groups expanded to their leaf nodes (Selector members are
-/// probed too — alive display + failure discovery — not just URLTest
-/// members). Ungrouped nodes are skipped unless no groups exist at all.
+/// Nodes reachable through group membership or explicit finals are probed
+/// for alive display and recovery, including Selector leaves. Ungrouped
+/// nodes are skipped unless no reachable leaves exist.
 /// Returns `(NodeId, node name, address)` triples.
 pub(in crate::control) fn health_check_targets(
     config: &Config,
@@ -46,7 +61,7 @@ pub(in crate::control) fn health_check_targets(
         .iter()
         .flat_map(|g| {
             let mut ids = std::collections::BTreeSet::new();
-            collect_group_leaf_ids(g, &by_name, 0, &mut Vec::new(), &mut ids);
+            collect_group_leaf_ids(g, config, &by_name, 0, &mut Vec::new(), &mut ids);
             ids
         })
         .collect();
@@ -95,18 +110,16 @@ pub(in crate::control) fn sync_health_check_nodes(
 
 /// URLTest group registrations for the alive set's idle-suspension table:
 /// `(group name, member NodeIds, idle timeout)` per URLTest group.
-/// Members shared with any non-URLTest group (Selector, LoadBalance,
-/// Fallback) are excluded — those are probed unconditionally, same as
-/// Selector members. Nested sub-groups are expanded to their leaf nodes
-/// (health state lives on real nodes). Used identically at startup and on
-/// config reload.
+/// Leaves shared with any non-URLTest group are probed unconditionally.
+/// Membership and explicit final edges both participate, since health state
+/// lives on real nodes. Used identically at startup and on config reload.
 pub(in crate::control) fn urltest_group_registrations(
     config: &Config,
 ) -> Vec<(String, Vec<uuid::Uuid>, Option<Duration>)> {
     let by_name = groups_by_name(config);
     let leaf_ids = |g: &Group| {
         let mut ids = std::collections::BTreeSet::new();
-        collect_group_leaf_ids(g, &by_name, 0, &mut Vec::new(), &mut ids);
+        collect_group_leaf_ids(g, config, &by_name, 0, &mut Vec::new(), &mut ids);
         ids
     };
     let always_probed_node_ids: std::collections::BTreeSet<uuid::Uuid> = config
@@ -210,11 +223,9 @@ pub(in crate::control) fn install_selector_warm_callback(
 /// Build the NodeId → eBPF outbound id map used for
 /// `OUTBOUND_CONNECTIVITY_MAP` pushes. Numbering matches
 /// `push_routing_to_ebpf`: direct=0, block=1, group i → `UserBase + i`;
-/// group member nodes inherit their group's id (first group wins when a
-/// node is in several groups), with nested sub-groups expanded to their
-/// leaves so a leaf dialed via a sub-group still maps to the top group's
-/// slot. Nodes outside any group have no eBPF outbound id and are absent
-/// from the map.
+/// Reachable leaves inherit their group's id (first group wins), expanding
+/// membership and explicit final edges so final-only health transitions also
+/// update the containing group's slot. Unreachable nodes are absent.
 pub(in crate::control) fn build_outbound_id_map(
     config: &Config,
 ) -> std::collections::HashMap<uuid::Uuid, u8> {
@@ -223,7 +234,7 @@ pub(in crate::control) fn build_outbound_id_map(
     for (i, group) in config.groups.iter().enumerate() {
         let id = OutboundIndex::UserBase as u8 + i as u8;
         let mut leaf_ids = std::collections::BTreeSet::new();
-        collect_group_leaf_ids(group, &by_name, 0, &mut Vec::new(), &mut leaf_ids);
+        collect_group_leaf_ids(group, config, &by_name, 0, &mut Vec::new(), &mut leaf_ids);
         for node_id in leaf_ids {
             map.entry(node_id).or_insert(id);
         }
@@ -242,9 +253,11 @@ pub(in crate::control) fn group_datapath_alive(
     domain: ProbeDomain,
     ipver: IpVersion,
 ) -> bool {
-    let leaves = group_manager.leaf_nodes_in_group(&group.name);
-    (domain == ProbeDomain::Tcp && group.final_outbound.is_none() && leaves.len() == 1)
-        || leaves
+    (domain == ProbeDomain::Tcp
+        && group.final_outbound.is_none()
+        && group_manager.leaf_nodes_in_group(&group.name).len() == 1)
+        || group_manager
+            .reachable_leaf_nodes_in_group(&group.name)
             .iter()
             .any(|node| alive_set.is_alive_for(node.id, domain, ipver))
 }
