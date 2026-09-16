@@ -1,0 +1,656 @@
+{
+  "baseline": "289ecb3",
+  "syntax_items_before": 3105,
+  "syntax_items_after": 3105,
+  "identical_bodies": 3074,
+  "changed_bodies": [
+    {
+      "kind": "fn",
+      "name": "selector_commit_does_not_restore_a_stale_sibling",
+      "deltas": [
+        [
+          "",
+          " ; use honk_config :: node :: Node"
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "start_relay",
+      "deltas": [
+        [
+          "sh",
+          "ae"
+        ],
+        [
+          "owsocks_",
+          ""
+        ],
+        [
+          "crate :: proxy :: ss_",
+          ""
+        ],
+        [
+          " ,",
+          ""
+        ],
+        [
+          "crate :: proxy :: ss_",
+          ""
+        ],
+        [
+          "crate :: proxy :: ss_",
+          ""
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "dial_stream",
+      "deltas": [
+        [
+          "c",
+          "supe"
+        ],
+        [
+          "ate",
+          ""
+        ],
+        [
+          "proxy :: ss_",
+          ""
+        ],
+        [
+          "c",
+          "supe"
+        ],
+        [
+          "ate",
+          ""
+        ],
+        [
+          "proxy :: ss_",
+          ""
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "run",
+      "deltas": [
+        [
+          "sh",
+          "ae"
+        ],
+        [
+          "owsocks :: increment_nonce ; use super :: shadowsocks_",
+          ""
+        ],
+        [
+          "",
+          " ; use super :: increment_nonce"
+        ],
+        [
+          "sh",
+          "ae"
+        ],
+        [
+          "owsocks_",
+          ""
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "encryption_config",
+      "deltas": [
+        [
+          "vless_",
+          ""
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "build_request_header",
+      "deltas": [
+        [
+          "vless_",
+          ""
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "udp_path",
+      "deltas": [
+        [
+          "su",
+          "crate :: "
+        ],
+        [
+          "e",
+          ""
+        ],
+        [
+          "",
+          "oxy"
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "open_udp",
+      "deltas": [
+        [
+          "su",
+          "crate :: "
+        ],
+        [
+          "e",
+          ""
+        ],
+        [
+          "",
+          "oxy"
+        ],
+        [
+          "su",
+          "crate :: "
+        ],
+        [
+          "e",
+          ""
+        ],
+        [
+          "",
+          "oxy"
+        ],
+        [
+          "vless_",
+          ""
+        ],
+        [
+          " ,",
+          ""
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "dial_h2_session",
+      "deltas": [
+        [
+          "vless_",
+          ""
+        ],
+        [
+          "vless_",
+          ""
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "dial_cool_session",
+      "deltas": [
+        [
+          "vless_",
+          ""
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "prepare_source_udp",
+      "deltas": [
+        [
+          "vless_",
+          ""
+        ],
+        [
+          "vless_",
+          ""
+        ],
+        [
+          "su",
+          "crate :: "
+        ],
+        [
+          "e",
+          ""
+        ],
+        [
+          "",
+          "oxy"
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "dial_udp_transport",
+      "deltas": [
+        [
+          "su",
+          "crate :: "
+        ],
+        [
+          "e",
+          ""
+        ],
+        [
+          "",
+          "oxy"
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "dial_retained_mux_carrier",
+      "deltas": [
+        [
+          "_",
+          " :: "
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "cancelled_mux_warm_dial_does_not_outlive_its_caller",
+      "deltas": [
+        [
+          "vless_",
+          ""
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "cool_c8_opens_seventeen_tcp_children_on_three_global_carriers",
+      "deltas": [
+        [
+          "vless_",
+          ""
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "idle_reap_returns_carrier_credit_without_cutting_retained_or_active_sessions",
+      "deltas": [
+        [
+          "vless_",
+          ""
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "idle_reap_preserves_warm_replacement_while_old_carrier_drains",
+      "deltas": [
+        [
+          "vless_",
+          ""
+        ],
+        [
+          "vless_",
+          ""
+        ],
+        [
+          "vless_",
+          ""
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "vless_mux_command_carries_no_target",
+      "deltas": [
+        [
+          "vless_",
+          ""
+        ],
+        [
+          "vless_",
+          ""
+        ],
+        [
+          "vless_",
+          ""
+        ]
+      ]
+    },
+    {
+      "kind": "const",
+      "name": "H2_CONNECTION_RECV_WINDOW",
+      "deltas": [
+        [
+          "su",
+          "crate :: "
+        ],
+        [
+          "e",
+          ""
+        ],
+        [
+          "",
+          "oxy"
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "stream_request",
+      "deltas": [
+        [
+          "su",
+          "crate :: "
+        ],
+        [
+          "e",
+          ""
+        ],
+        [
+          "",
+          "oxy"
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "send",
+      "deltas": [
+        [
+          "su",
+          "crate :: "
+        ],
+        [
+          "e",
+          ""
+        ],
+        [
+          "",
+          "oxy"
+        ],
+        [
+          "su",
+          "crate :: "
+        ],
+        [
+          "e",
+          ""
+        ],
+        [
+          "",
+          "oxy"
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "open_packet",
+      "deltas": [
+        [
+          "su",
+          "crate :: "
+        ],
+        [
+          "e",
+          ""
+        ],
+        [
+          "",
+          "oxy"
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "receive_windows_cover_every_maximum_udp_frame",
+      "deltas": [
+        [
+          "sup",
+          "crat"
+        ],
+        [
+          "r",
+          ""
+        ],
+        [
+          "su",
+          ""
+        ],
+        [
+          "e",
+          ""
+        ],
+        [
+          "",
+          "oxy"
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "serve_logical_stream",
+      "deltas": [
+        [
+          "sup",
+          "crat"
+        ],
+        [
+          "r",
+          ""
+        ],
+        [
+          "su",
+          ""
+        ],
+        [
+          "e",
+          ""
+        ],
+        [
+          "",
+          "oxy"
+        ],
+        [
+          "sup",
+          "crat"
+        ],
+        [
+          "r",
+          ""
+        ],
+        [
+          "su",
+          ""
+        ],
+        [
+          "e",
+          ""
+        ],
+        [
+          "",
+          "oxy"
+        ],
+        [
+          "sup",
+          "crat"
+        ],
+        [
+          "r",
+          ""
+        ],
+        [
+          "su",
+          ""
+        ],
+        [
+          "e",
+          ""
+        ],
+        [
+          "",
+          "oxy"
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "maximum_udp_frame_cannot_exhaust_the_h2_receive_window",
+      "deltas": [
+        [
+          "sup",
+          "crat"
+        ],
+        [
+          "r",
+          ""
+        ],
+        [
+          "su",
+          ""
+        ],
+        [
+          "e",
+          ""
+        ],
+        [
+          "",
+          "oxy"
+        ],
+        [
+          "sup",
+          "crat"
+        ],
+        [
+          "r",
+          ""
+        ],
+        [
+          "su",
+          ""
+        ],
+        [
+          "e",
+          ""
+        ],
+        [
+          "",
+          "oxy"
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "prepare_detached",
+      "deltas": [
+        [
+          "sup",
+          "crat"
+        ],
+        [
+          "r",
+          ""
+        ],
+        [
+          "su",
+          ""
+        ],
+        [
+          "e",
+          ""
+        ],
+        [
+          "",
+          "oxy"
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "client_config",
+      "deltas": [
+        [
+          "_",
+          " :: "
+        ],
+        [
+          "_",
+          " :: "
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "ech_over_quic_fails_closed_without_server_support",
+      "deltas": [
+        [
+          "",
+          "../"
+        ]
+      ]
+    },
+    {
+      "kind": "static",
+      "name": "ECH_CONFIG_LIST",
+      "deltas": [
+        [
+          "",
+          "../"
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "separate_cool_warm_transitions_preserve_opposite_child_admission",
+      "deltas": [
+        [
+          "_",
+          " :: "
+        ],
+        [
+          "_",
+          " :: "
+        ]
+      ]
+    },
+    {
+      "kind": "fn",
+      "name": "new",
+      "deltas": [
+        [
+          "_",
+          " :: "
+        ],
+        [
+          "_",
+          " :: "
+        ],
+        [
+          "_",
+          " :: "
+        ]
+      ]
+    }
+  ],
+  "allowed_deltas": [
+    "qualified module paths",
+    "local test import",
+    "fixture include path",
+    "trailing commas from rustfmt"
+  ],
+  "test_prefix_map": {
+    "quic_boring::tests::": "quic::boring::tests::",
+    "proxy::shadowsocks_2022::tests::": "proxy::shadowsocks::aead2022::tests::",
+    "proxy::ss_stream::tests::": "proxy::shadowsocks::stream::tests::",
+    "proxy::vless::tests::": "proxy::vless::handler::tests::",
+    "proxy::vless::stream::tests::": "proxy::vless::handler::stream::tests::",
+    "proxy::vless_cool::tests::": "proxy::vless::cool::tests::",
+    "proxy::vless_mux::tests::": "proxy::vless::mux::tests::",
+    "proxy::vless_encryption::tests::": "proxy::vless::encryption::tests::"
+  },
+  "off_tests": 705,
+  "on_tests": 769
+}

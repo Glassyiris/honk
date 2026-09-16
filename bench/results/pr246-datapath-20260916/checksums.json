@@ -1,0 +1,7 @@
+{
+  "x86-evidence.tar.gz": "1060df05ef77e66ec012ae67668555d34cde88ab742ef2ac499dcbfcc875f51d",
+  "arm64-evidence.tar.gz": "221602547aba098f45c6df4769c50e9a3a01614b2d06a3d869e6f756c02981e3",
+  "fixture-configs.tar.gz": "a7aa31437a7b7c964c9d73d3aa940e6ea356f5a7c42cf6e3796345245a4ba311",
+  "diagnostic-old-base-x86.tar.gz": "233281ff1ecd4df430c3d2d4586b0737525f72b7ddfd47f7184de80974b55550",
+  "diagnostic-arm-prerequisites.tar.gz": "ebda19fc1a9d7218153d6728fb7d4424a36dcf0ccde3bcd4407d4b49a579bcb4"
+}

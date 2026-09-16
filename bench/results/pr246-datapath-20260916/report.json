@@ -1,0 +1,214 @@
+{
+  "candidate_status": "PASS all measured functional/integrity/provenance cases on both hosts",
+  "whole_ab_status": "NOT ALL GREEN: baseline REALITY fails every attempt on both hosts",
+  "candidate_attempts": 6660,
+  "candidate_failures": 0,
+  "baseline_reality_attempts": 1332,
+  "baseline_reality_failures": 1332,
+  "comparison": [
+    {
+      "host": "x86",
+      "case": "direct",
+      "baseline_failures": 0,
+      "candidate_failures": 0,
+      "http_download": {
+        "baseline_mbps": 7136.85228326775,
+        "candidate_mbps": 8128.949045126061,
+        "change_percent": 13.901040997923797
+      },
+      "https_download": {
+        "baseline_mbps": 6446.28230478041,
+        "candidate_mbps": 6121.839903559549,
+        "change_percent": -5.033015711711264
+      },
+      "udp_median_ms": {
+        "baseline": 0.070494,
+        "candidate": 0.0667855
+      }
+    },
+    {
+      "host": "x86",
+      "case": "xudp",
+      "baseline_failures": 0,
+      "candidate_failures": 0,
+      "http_download": {
+        "baseline_mbps": 7140.759022011222,
+        "candidate_mbps": 7175.989551599457,
+        "change_percent": 0.4933723359048736
+      },
+      "https_download": {
+        "baseline_mbps": 4224.219526667277,
+        "candidate_mbps": 4154.617406717712,
+        "change_percent": -1.647691828281428
+      },
+      "udp_median_ms": {
+        "baseline": 0.20971049999999997,
+        "candidate": 0.18951
+      }
+    },
+    {
+      "host": "x86",
+      "case": "h2mux",
+      "baseline_failures": 0,
+      "candidate_failures": 0,
+      "http_download": {
+        "baseline_mbps": 4925.635227600348,
+        "candidate_mbps": 5110.827983760984,
+        "change_percent": 3.7597740718379846
+      },
+      "https_download": {
+        "baseline_mbps": 5488.38646026244,
+        "candidate_mbps": 4710.625008247769,
+        "change_percent": -14.171040207279429
+      },
+      "udp_median_ms": {
+        "baseline": 0.216294,
+        "candidate": 0.2202795
+      }
+    },
+    {
+      "host": "x86",
+      "case": "vision",
+      "baseline_failures": 0,
+      "candidate_failures": 0,
+      "http_download": {
+        "baseline_mbps": 5218.342578597707,
+        "candidate_mbps": 4804.759505938357,
+        "change_percent": -7.92556384388412
+      },
+      "https_download": {
+        "baseline_mbps": 2070.833454064566,
+        "candidate_mbps": 5073.37439955832,
+        "change_percent": 144.99190843186648
+      },
+      "udp_median_ms": {
+        "baseline": 0.272691,
+        "candidate": 0.212351
+      }
+    },
+    {
+      "host": "x86",
+      "case": "reality",
+      "baseline_failures": 666,
+      "candidate_failures": 0,
+      "http_download": {
+        "baseline_mbps": null,
+        "candidate_mbps": 4846.425366782973,
+        "change_percent": null
+      },
+      "https_download": {
+        "baseline_mbps": null,
+        "candidate_mbps": 4668.829373312621,
+        "change_percent": null
+      },
+      "udp_median_ms": {
+        "baseline": null,
+        "candidate": 0.224478
+      }
+    },
+    {
+      "host": "arm64",
+      "case": "direct",
+      "baseline_failures": 0,
+      "candidate_failures": 0,
+      "http_download": {
+        "baseline_mbps": 363.17034690926147,
+        "candidate_mbps": 390.6745984053582,
+        "change_percent": 7.573374789591147
+      },
+      "https_download": {
+        "baseline_mbps": 216.15560557871532,
+        "candidate_mbps": 222.52345981100922,
+        "change_percent": 2.9459584058646904
+      },
+      "udp_median_ms": {
+        "baseline": 1.62857,
+        "candidate": 1.6895305
+      }
+    },
+    {
+      "host": "arm64",
+      "case": "xudp",
+      "baseline_failures": 0,
+      "candidate_failures": 0,
+      "http_download": {
+        "baseline_mbps": 327.0929009839665,
+        "candidate_mbps": 288.41405135012667,
+        "change_percent": -11.825034880758789
+      },
+      "https_download": {
+        "baseline_mbps": 170.96485232408696,
+        "candidate_mbps": 167.78148907024604,
+        "change_percent": -1.8619986567802949
+      },
+      "udp_median_ms": {
+        "baseline": 2.7468535,
+        "candidate": 2.7287695000000003
+      }
+    },
+    {
+      "host": "arm64",
+      "case": "h2mux",
+      "baseline_failures": 0,
+      "candidate_failures": 0,
+      "http_download": {
+        "baseline_mbps": 304.6391773508055,
+        "candidate_mbps": 297.98532446055873,
+        "change_percent": -2.184175045412673
+      },
+      "https_download": {
+        "baseline_mbps": 159.96003214981727,
+        "candidate_mbps": 161.039826637968,
+        "change_percent": 0.6750401794989536
+      },
+      "udp_median_ms": {
+        "baseline": 8.282417500000001,
+        "candidate": 8.2357485
+      }
+    },
+    {
+      "host": "arm64",
+      "case": "vision",
+      "baseline_failures": 0,
+      "candidate_failures": 0,
+      "http_download": {
+        "baseline_mbps": 147.6349573932402,
+        "candidate_mbps": 147.30922071126315,
+        "change_percent": -0.22063655365132107
+      },
+      "https_download": {
+        "baseline_mbps": 159.81752573341188,
+        "candidate_mbps": 160.568774037579,
+        "change_percent": 0.47006628385690696
+      },
+      "udp_median_ms": {
+        "baseline": 3.0970104999999997,
+        "candidate": 3.130991
+      }
+    },
+    {
+      "host": "arm64",
+      "case": "reality",
+      "baseline_failures": 666,
+      "candidate_failures": 0,
+      "http_download": {
+        "baseline_mbps": null,
+        "candidate_mbps": 146.84154142650087,
+        "change_percent": null
+      },
+      "https_download": {
+        "baseline_mbps": null,
+        "candidate_mbps": 155.2471719375699,
+        "change_percent": null
+      },
+      "udp_median_ms": {
+        "baseline": null,
+        "candidate": 3.173867
+      }
+    }
+  ],
+  "performance_verdict": "No throughput-parity or zero-regression claim: x86 H2MUX HTTPS and ARM XUDP HTTP medians decreased in this finite-body workload; direct controls also varied. Rates include connection setup and client hashing, not pure NIC/engine throughput.",
+  "attribution": "Changes are measured vs actual PR merge base c2cec879; no controlled ablation isolates causes of individual throughput differences.",
+  "scope": "Three alternating pairs per host, four proxy cases plus direct. Native UDP, other protocols, full Vision uplink, long-duration stress and privacy guarantees are outside this matrix.",
+  "restoration": "ARM original service, binary/config/cron hashes and live authenticated API verified; owned links/namespace/nft table/fw4 rule removed."
+}

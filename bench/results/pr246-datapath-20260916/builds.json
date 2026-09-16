@@ -1,0 +1,34 @@
+[
+  {
+    "arm": "candidate",
+    "target": "x86_64-unknown-linux-musl",
+    "commit": "d31f0241e41006e76d04651ebb4772463376dff4",
+    "binary": "/tmp/honk-datapath-w__yjkca/candidate/x86_64-unknown-linux-musl/honk-core",
+    "sha256": "e7229d09f527e4106eed77b70fd8569e0445ba6dc0481c8240596d75344ff703",
+    "profile": "release; defaults(clash-api,mimalloc,rprx)+ebpf; zig0.14.1-musl"
+  },
+  {
+    "arm": "candidate",
+    "target": "aarch64-unknown-linux-musl",
+    "commit": "d31f0241e41006e76d04651ebb4772463376dff4",
+    "binary": "/tmp/honk-datapath-w__yjkca/candidate/aarch64-unknown-linux-musl/honk-core",
+    "sha256": "0d6fc956bcf1485374a0581dcad4162633c18085edfe6a3eeb3737875f1cfd6a",
+    "profile": "release; defaults(clash-api,mimalloc,rprx)+ebpf; zig0.14.1-musl"
+  },
+  {
+    "arm": "baseline",
+    "target": "x86_64-unknown-linux-musl",
+    "commit": "c2cec879d072d7fe543391e7fcbf3f295de2cd41",
+    "binary": "/tmp/honk-datapath-w__yjkca/baseline/x86_64-unknown-linux-musl/honk-core",
+    "sha256": "9fd077178eb4c73ebb676e059e64f1b99721edc424b6dea095749b73876f1fd9",
+    "profile": "release; defaults(clash-api,mimalloc,rprx)+ebpf; zig0.14.1-musl"
+  },
+  {
+    "arm": "baseline",
+    "target": "aarch64-unknown-linux-musl",
+    "commit": "c2cec879d072d7fe543391e7fcbf3f295de2cd41",
+    "binary": "/tmp/honk-datapath-w__yjkca/baseline/aarch64-unknown-linux-musl/honk-core",
+    "sha256": "9e9df50fe80977168b2a6c22ddb5081d722910a14d30e8ab50f5f085aaf2358d",
+    "profile": "release; defaults(clash-api,mimalloc,rprx)+ebpf; zig0.14.1-musl"
+  }
+]

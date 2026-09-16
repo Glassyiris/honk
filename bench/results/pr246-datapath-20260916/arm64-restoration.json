@@ -1,0 +1,14 @@
+{
+  "/etc/honk/config.dae": true,
+  "/etc/config/honk": true,
+  "/etc/honk/config.d/99-openwrt.dae": true,
+  "/etc/crontabs/root": true,
+  "binary_unchanged": true,
+  "service_running": true,
+  "bench_links_absent": true,
+  "bench_namespace_absent": true,
+  "bench_table_absent": true,
+  "bench_forward_rules_absent": true,
+  "restored_api_status": 200,
+  "restored_api_version": "honk 0.0.1-alpha"
+}

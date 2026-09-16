@@ -1,0 +1,599 @@
+{
+  "identity": {
+    "api_url": "http://127.0.0.1:19090",
+    "arms": {
+      "baseline": {
+        "binary": "/tmp/honk-pr246-final.IFBelH/honk-core-baseline",
+        "commit": "c2cec879d072d7fe543391e7fcbf3f295de2cd41",
+        "config": "/tmp/honk-pr246-final.IFBelH/baseline.dae",
+        "config_sha256": "50a3df7b0c5650c64aaa6d3147ff215b5a90c4e4b072187256625141c42af645",
+        "profile": "release; defaults(clash-api,mimalloc,rprx)+ebpf; zig0.14.1-musl; TOKIO_WORKER_THREADS=2",
+        "sha256": "9e9df50fe80977168b2a6c22ddb5081d722910a14d30e8ab50f5f085aaf2358d"
+      },
+      "candidate": {
+        "binary": "/tmp/honk-pr246-final.IFBelH/honk-core-candidate",
+        "commit": "d31f0241e41006e76d04651ebb4772463376dff4",
+        "config": "/tmp/honk-pr246-final.IFBelH/candidate.dae",
+        "config_sha256": "83312861c50363b6eefcc546f48ab5451728c3e7edf72d52bb2a74361cfeeee2",
+        "profile": "release; defaults(clash-api,mimalloc,rprx)+ebpf; zig0.14.1-musl; TOKIO_WORKER_THREADS=2",
+        "sha256": "0d6fc956bcf1485374a0581dcad4162633c18085edfe6a3eeb3737875f1cfd6a"
+      }
+    },
+    "cases": [
+      {
+        "http_port": 56473,
+        "https_port": 48041,
+        "name": "xudp",
+        "udp_ports": [
+          60220,
+          58203
+        ]
+      },
+      {
+        "http_port": 40089,
+        "https_port": 38685,
+        "name": "h2mux",
+        "udp_ports": [
+          33058,
+          44948
+        ]
+      },
+      {
+        "http_port": 58661,
+        "https_port": 34343,
+        "name": "vision",
+        "udp_ports": [
+          56199,
+          50593
+        ]
+      },
+      {
+        "http_port": 47615,
+        "https_port": 34141,
+        "name": "reality",
+        "udp_ports": [
+          37216,
+          39047
+        ]
+      }
+    ],
+    "cleanup_scope": "owns only child process groups, client namespace/veth and scoped NAT table; preserves BPF pins/sequence; cannot restore after SIGKILL/power loss",
+    "client": "192.168.246.2",
+    "clock_ticks_per_second": 100,
+    "direct": {
+      "http_port": 54621,
+      "https_port": 33831,
+      "udp_ports": [
+        39488,
+        56476
+      ]
+    },
+    "driver_sha256": "d3235282f10bdb8900fbb0a61ae7a41e424aa307d52ad14d3709816790e64af0",
+    "host": {
+      "machine": "aarch64",
+      "nodename": "OpenWrt",
+      "release": "6.12.94",
+      "sysname": "Linux",
+      "version": "#0 SMP Mon Jun 29 12:59:20 2026"
+    },
+    "identity_scope": "binary/config/driver SHA256 measured; commits/build profiles are manifest-supplied labels, not inferred from executable bytes",
+    "manifest_sha256": "e55430d1f5e0cf0c8448a63c63c1e797f8ef227800530cc182576a7476a71a0f",
+    "python": "3.13.9 (main, Oct 14 2025, 13:52:31) [GCC 14.3.0]",
+    "record": "identity",
+    "runs": 3,
+    "schema_version": 1,
+    "scope": "real-core forwarded LAN IPv4; 15 sequential HTTP opens; 3 x 16 MiB HTTP and 3 x 16 MiB HTTPS downloads; 100 x 1200-byte UDP echoes per destination on one socket across two ports; HTTPS test certificate deliberately unverified; no full VLESS uplink, Internet or performance-threshold claim",
+    "sequence": 1,
+    "target": "10.10.10.70",
+    "time_utc": "2026-09-16T02:55:20.803032+00:00"
+  },
+  "result": {
+    "cleanup_errors": [],
+    "complete": true,
+    "completed_cases": 30,
+    "error": null,
+    "expected_cases": 30,
+    "failed_cases": 3,
+    "ok": false,
+    "record": "result",
+    "schema_version": 1,
+    "sequence": 6783,
+    "time_utc": "2026-09-16T03:09:30.000705+00:00"
+  },
+  "cases": [
+    {
+      "arm": "baseline",
+      "case": "direct",
+      "groups": 3,
+      "attempts": 666,
+      "failures": 0,
+      "groups_ok": 3,
+      "metrics": {
+        "http_open": {
+          "attempts": 45,
+          "failures": 0,
+          "median_ms": 5.367704,
+          "p95_ms": 6.418611
+        },
+        "http_download": {
+          "attempts": 9,
+          "failures": 0,
+          "median_ms": 369.57237599999996,
+          "p95_ms": 391.942117,
+          "median_mbps": 363.17034690926147,
+          "min_mbps": 342.44272860321365,
+          "max_mbps": 391.6185386461052
+        },
+        "https_download": {
+          "attempts": 9,
+          "failures": 0,
+          "median_ms": 620.931054,
+          "p95_ms": 695.134683,
+          "median_mbps": 216.15560557871532,
+          "min_mbps": 193.0816160988474,
+          "max_mbps": 226.5019633691962
+        },
+        "udp_echo": {
+          "attempts": 600,
+          "failures": 0,
+          "median_ms": 1.62857,
+          "p95_ms": 1.9863099999999998
+        }
+      },
+      "rss_after_mib": [
+        21.602,
+        22.094,
+        21.652
+      ],
+      "cpu_ticks": [
+        4,
+        4,
+        5
+      ]
+    },
+    {
+      "arm": "baseline",
+      "case": "xudp",
+      "groups": 3,
+      "attempts": 666,
+      "failures": 0,
+      "groups_ok": 3,
+      "metrics": {
+        "http_open": {
+          "attempts": 45,
+          "failures": 0,
+          "median_ms": 6.315357,
+          "p95_ms": 7.935032
+        },
+        "http_download": {
+          "attempts": 9,
+          "failures": 0,
+          "median_ms": 410.335191,
+          "p95_ms": 424.98987,
+          "median_mbps": 327.0929009839665,
+          "min_mbps": 315.8139463418269,
+          "max_mbps": 396.5012927750292
+        },
+        "https_download": {
+          "attempts": 9,
+          "failures": 0,
+          "median_ms": 785.060357,
+          "p95_ms": 821.654786,
+          "median_mbps": 170.96485232408696,
+          "min_mbps": 163.35050958980236,
+          "max_mbps": 191.536224857482
+        },
+        "udp_echo": {
+          "attempts": 600,
+          "failures": 0,
+          "median_ms": 2.7468535,
+          "p95_ms": 3.288933
+        }
+      },
+      "rss_after_mib": [
+        21.695,
+        22.719,
+        22.152
+      ],
+      "cpu_ticks": [
+        115,
+        115,
+        111
+      ]
+    },
+    {
+      "arm": "baseline",
+      "case": "h2mux",
+      "groups": 3,
+      "attempts": 666,
+      "failures": 0,
+      "groups_ok": 3,
+      "metrics": {
+        "http_open": {
+          "attempts": 45,
+          "failures": 0,
+          "median_ms": 7.617688,
+          "p95_ms": 8.556883
+        },
+        "http_download": {
+          "attempts": 9,
+          "failures": 0,
+          "median_ms": 440.579341,
+          "p95_ms": 457.742665,
+          "median_mbps": 304.6391773508055,
+          "min_mbps": 293.2165565121617,
+          "max_mbps": 326.56109850998587
+        },
+        "https_download": {
+          "attempts": 9,
+          "failures": 0,
+          "median_ms": 839.0703990000001,
+          "p95_ms": 851.6401529999999,
+          "median_mbps": 159.96003214981727,
+          "min_mbps": 157.59910747186203,
+          "max_mbps": 168.93721842195365
+        },
+        "udp_echo": {
+          "attempts": 600,
+          "failures": 0,
+          "median_ms": 8.282417500000001,
+          "p95_ms": 8.763974000000001
+        }
+      },
+      "rss_after_mib": [
+        26.504,
+        25.766,
+        26.375
+      ],
+      "cpu_ticks": [
+        150,
+        146,
+        149
+      ]
+    },
+    {
+      "arm": "baseline",
+      "case": "vision",
+      "groups": 3,
+      "attempts": 666,
+      "failures": 0,
+      "groups_ok": 3,
+      "metrics": {
+        "http_open": {
+          "attempts": 45,
+          "failures": 0,
+          "median_ms": 75.971253,
+          "p95_ms": 83.35268599999999
+        },
+        "http_download": {
+          "attempts": 9,
+          "failures": 0,
+          "median_ms": 909.118886,
+          "p95_ms": 999.808191,
+          "median_mbps": 147.6349573932402,
+          "min_mbps": 134.24347710710043,
+          "max_mbps": 153.42009097144674
+        },
+        "https_download": {
+          "attempts": 9,
+          "failures": 0,
+          "median_ms": 839.818583,
+          "p95_ms": 904.033565,
+          "median_mbps": 159.81752573341188,
+          "min_mbps": 148.46542561724462,
+          "max_mbps": 210.0532728656796
+        },
+        "udp_echo": {
+          "attempts": 600,
+          "failures": 0,
+          "median_ms": 3.0970104999999997,
+          "p95_ms": 3.639235
+        }
+      },
+      "rss_after_mib": [
+        26.004,
+        26.234,
+        25.988
+      ],
+      "cpu_ticks": [
+        384,
+        384,
+        400
+      ]
+    },
+    {
+      "arm": "baseline",
+      "case": "reality",
+      "groups": 3,
+      "attempts": 666,
+      "failures": 666,
+      "groups_ok": 0,
+      "metrics": {
+        "http_open": {
+          "attempts": 45,
+          "failures": 45,
+          "median_ms": null,
+          "p95_ms": null
+        },
+        "http_download": {
+          "attempts": 9,
+          "failures": 9,
+          "median_ms": null,
+          "p95_ms": null
+        },
+        "https_download": {
+          "attempts": 9,
+          "failures": 9,
+          "median_ms": null,
+          "p95_ms": null
+        },
+        "udp_echo": {
+          "attempts": 600,
+          "failures": 600,
+          "median_ms": null,
+          "p95_ms": null
+        }
+      },
+      "rss_after_mib": [
+        22.059,
+        22.227,
+        22.133
+      ],
+      "cpu_ticks": [
+        1088,
+        1067,
+        1063
+      ]
+    },
+    {
+      "arm": "candidate",
+      "case": "direct",
+      "groups": 3,
+      "attempts": 666,
+      "failures": 0,
+      "groups_ok": 3,
+      "metrics": {
+        "http_open": {
+          "attempts": 45,
+          "failures": 0,
+          "median_ms": 5.2877849999999995,
+          "p95_ms": 6.50378
+        },
+        "http_download": {
+          "attempts": 9,
+          "failures": 0,
+          "median_ms": 343.553762,
+          "p95_ms": 376.908313,
+          "median_mbps": 390.6745984053582,
+          "min_mbps": 356.1017981580045,
+          "max_mbps": 393.4562100112614
+        },
+        "https_download": {
+          "attempts": 9,
+          "failures": 0,
+          "median_ms": 603.162148,
+          "p95_ms": 632.913928,
+          "median_mbps": 222.52345981100922,
+          "min_mbps": 212.0631606640832,
+          "max_mbps": 233.2724684421127
+        },
+        "udp_echo": {
+          "attempts": 600,
+          "failures": 0,
+          "median_ms": 1.6895305,
+          "p95_ms": 1.979602
+        }
+      },
+      "rss_after_mib": [
+        21.516,
+        21.609,
+        21.988
+      ],
+      "cpu_ticks": [
+        3,
+        3,
+        5
+      ]
+    },
+    {
+      "arm": "candidate",
+      "case": "xudp",
+      "groups": 3,
+      "attempts": 666,
+      "failures": 0,
+      "groups_ok": 3,
+      "metrics": {
+        "http_open": {
+          "attempts": 45,
+          "failures": 0,
+          "median_ms": 6.528572,
+          "p95_ms": 8.118204
+        },
+        "http_download": {
+          "attempts": 9,
+          "failures": 0,
+          "median_ms": 465.364733,
+          "p95_ms": 561.89153,
+          "median_mbps": 288.41405135012667,
+          "min_mbps": 238.86768323416442,
+          "max_mbps": 327.81408764662694
+        },
+        "https_download": {
+          "attempts": 9,
+          "failures": 0,
+          "median_ms": 799.955518,
+          "p95_ms": 814.153775,
+          "median_mbps": 167.78148907024604,
+          "min_mbps": 164.85550042435167,
+          "max_mbps": 230.83205110195613
+        },
+        "udp_echo": {
+          "attempts": 600,
+          "failures": 0,
+          "median_ms": 2.7287695000000003,
+          "p95_ms": 3.2839739999999997
+        }
+      },
+      "rss_after_mib": [
+        21.891,
+        21.984,
+        21.688
+      ],
+      "cpu_ticks": [
+        170,
+        130,
+        140
+      ]
+    },
+    {
+      "arm": "candidate",
+      "case": "h2mux",
+      "groups": 3,
+      "attempts": 666,
+      "failures": 0,
+      "groups_ok": 3,
+      "metrics": {
+        "http_open": {
+          "attempts": 45,
+          "failures": 0,
+          "median_ms": 7.421683,
+          "p95_ms": 8.329376
+        },
+        "http_download": {
+          "attempts": 9,
+          "failures": 0,
+          "median_ms": 450.417242,
+          "p95_ms": 462.430477,
+          "median_mbps": 297.98532446055873,
+          "min_mbps": 290.2441224694626,
+          "max_mbps": 308.7625660951887
+        },
+        "https_download": {
+          "attempts": 9,
+          "failures": 0,
+          "median_ms": 833.4443150000001,
+          "p95_ms": 842.6923889999999,
+          "median_mbps": 161.039826637968,
+          "min_mbps": 159.27250530798375,
+          "max_mbps": 174.23595138562789
+        },
+        "udp_echo": {
+          "attempts": 600,
+          "failures": 0,
+          "median_ms": 8.2357485,
+          "p95_ms": 8.710305
+        }
+      },
+      "rss_after_mib": [
+        25.531,
+        26.918,
+        25.738
+      ],
+      "cpu_ticks": [
+        144,
+        214,
+        165
+      ]
+    },
+    {
+      "arm": "candidate",
+      "case": "vision",
+      "groups": 3,
+      "attempts": 666,
+      "failures": 0,
+      "groups_ok": 3,
+      "metrics": {
+        "http_open": {
+          "attempts": 45,
+          "failures": 0,
+          "median_ms": 76.540897,
+          "p95_ms": 84.93152599999999
+        },
+        "http_download": {
+          "attempts": 9,
+          "failures": 0,
+          "median_ms": 911.12917,
+          "p95_ms": 953.0277609999999,
+          "median_mbps": 147.30922071126315,
+          "min_mbps": 140.83296782369388,
+          "max_mbps": 155.38590042352394
+        },
+        "https_download": {
+          "attempts": 9,
+          "failures": 0,
+          "median_ms": 835.889349,
+          "p95_ms": 857.189615,
+          "median_mbps": 160.568774037579,
+          "min_mbps": 156.57880782888392,
+          "max_mbps": 175.77941738841895
+        },
+        "udp_echo": {
+          "attempts": 600,
+          "failures": 0,
+          "median_ms": 3.130991,
+          "p95_ms": 3.638068
+        }
+      },
+      "rss_after_mib": [
+        26.449,
+        24.797,
+        24.23
+      ],
+      "cpu_ticks": [
+        369,
+        390,
+        376
+      ]
+    },
+    {
+      "arm": "candidate",
+      "case": "reality",
+      "groups": 3,
+      "attempts": 666,
+      "failures": 0,
+      "groups_ok": 3,
+      "metrics": {
+        "http_open": {
+          "attempts": 45,
+          "failures": 0,
+          "median_ms": 77.53520999999999,
+          "p95_ms": 85.769509
+        },
+        "http_download": {
+          "attempts": 9,
+          "failures": 0,
+          "median_ms": 914.031048,
+          "p95_ms": 990.627843,
+          "median_mbps": 146.84154142650087,
+          "min_mbps": 135.48753848219872,
+          "max_mbps": 152.80501933115835
+        },
+        "https_download": {
+          "attempts": 9,
+          "failures": 0,
+          "median_ms": 864.542177,
+          "p95_ms": 1127.104363,
+          "median_mbps": 155.2471719375699,
+          "min_mbps": 119.0818990734401,
+          "max_mbps": 157.57621596143935
+        },
+        "udp_echo": {
+          "attempts": 600,
+          "failures": 0,
+          "median_ms": 3.173867,
+          "p95_ms": 3.7214869999999998
+        }
+      },
+      "rss_after_mib": [
+        24.645,
+        25.824,
+        25.289
+      ],
+      "cpu_ticks": [
+        464,
+        420,
+        518
+      ]
+    }
+  ]
+}

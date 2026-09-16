@@ -1,0 +1,34 @@
+{
+  "reviewed_head": "d31f0241e41006e76d04651ebb4772463376dff4",
+  "test_correction_head": "901f56314cff574ea7fd822842f6ea10e6856745",
+  "actual_pr_merge_base": "c2cec879d072d7fe543391e7fcbf3f295de2cd41",
+  "upstream_main": "19d81255f1cb30406a255b430570ff83f2286fa5",
+  "review_comparison_base": "780c3f158bbe6e69c02327d5e7ce46d1b594cf4e",
+  "review_comparison_scope": "broader ancestor comparison, includes all actual PR changes",
+  "production_diff_d31_to_901": "empty for core/config/outbound source and manifest/lock",
+  "resolved_findings": [
+    {
+      "priority": "P2",
+      "area": "honk-tool feature-off unit assumptions",
+      "fix": "Gate four handler-dependent cases; assert actual no-handler DNS/QUIC outcome with feature off",
+      "negative_control": "Old hard-enabled outbound dependency makes regression fail; artifact1914",
+      "verification": "26 feature-off and29 feature-on toolbox tests; artifact1929"
+    },
+    {
+      "area": "feature-boundary evidence quality",
+      "fix": "Use production default_resolver, not always-empty ProxyRegistry::new",
+      "verification": "normal-library off-feature integration passes; artifact1929"
+    }
+  ],
+  "static_reviews": [
+    "agent://FinalConfigAdmission",
+    "agent://FinalCoreOwnership",
+    "agent://FinalOutboundWire"
+  ],
+  "limits": [
+    "No full uplink Vision implementation or privacy equivalence claim",
+    "Two public loopback cases are not all ignored interop cases",
+    "No native ignored kernel suite or CI VM rerun claimed",
+    "Remote benchmark recorded separately by actual binary/source identities"
+  ]
+}

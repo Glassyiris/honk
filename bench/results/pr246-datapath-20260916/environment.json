@@ -1,0 +1,91 @@
+{
+  "candidate_commit": "d31f0241e41006e76d04651ebb4772463376dff4",
+  "final_test_only_commit": "901f56314cff574ea7fd822842f6ea10e6856745",
+  "baseline_commit": "c2cec879d072d7fe543391e7fcbf3f295de2cd41",
+  "upstream_main": "19d81255f1cb30406a255b430570ff83f2286fa5",
+  "candidate_production_equivalent_to_final": true,
+  "server_host": {
+    "sysname": "Linux",
+    "nodename": "nixos",
+    "release": "7.2.0-cachyos",
+    "version": "#1-NixOS SMP PREEMPT_DYNAMIC Tue Jan  1 00:00:00 UTC 1980",
+    "machine": "x86_64"
+  },
+  "server_address": "10.10.10.70",
+  "builds": [
+    {
+      "arm": "candidate",
+      "target": "x86_64-unknown-linux-musl",
+      "commit": "d31f0241e41006e76d04651ebb4772463376dff4",
+      "binary": "/tmp/honk-datapath-w__yjkca/candidate/x86_64-unknown-linux-musl/honk-core",
+      "sha256": "e7229d09f527e4106eed77b70fd8569e0445ba6dc0481c8240596d75344ff703",
+      "profile": "release; defaults(clash-api,mimalloc,rprx)+ebpf; zig0.14.1-musl"
+    },
+    {
+      "arm": "candidate",
+      "target": "aarch64-unknown-linux-musl",
+      "commit": "d31f0241e41006e76d04651ebb4772463376dff4",
+      "binary": "/tmp/honk-datapath-w__yjkca/candidate/aarch64-unknown-linux-musl/honk-core",
+      "sha256": "0d6fc956bcf1485374a0581dcad4162633c18085edfe6a3eeb3737875f1cfd6a",
+      "profile": "release; defaults(clash-api,mimalloc,rprx)+ebpf; zig0.14.1-musl"
+    },
+    {
+      "arm": "baseline",
+      "target": "x86_64-unknown-linux-musl",
+      "commit": "c2cec879d072d7fe543391e7fcbf3f295de2cd41",
+      "binary": "/tmp/honk-datapath-w__yjkca/baseline/x86_64-unknown-linux-musl/honk-core",
+      "sha256": "9fd077178eb4c73ebb676e059e64f1b99721edc424b6dea095749b73876f1fd9",
+      "profile": "release; defaults(clash-api,mimalloc,rprx)+ebpf; zig0.14.1-musl"
+    },
+    {
+      "arm": "baseline",
+      "target": "aarch64-unknown-linux-musl",
+      "commit": "c2cec879d072d7fe543391e7fcbf3f295de2cd41",
+      "binary": "/tmp/honk-datapath-w__yjkca/baseline/aarch64-unknown-linux-musl/honk-core",
+      "sha256": "9e9df50fe80977168b2a6c22ddb5081d722910a14d30e8ab50f5f085aaf2358d",
+      "profile": "release; defaults(clash-api,mimalloc,rprx)+ebpf; zig0.14.1-musl"
+    }
+  ],
+  "peers": {
+    "xray": {
+      "sha256": "c4ae6798c38e0e5343b192406746333cd0ba7ff3eb984f8c4b9939dcb68c3f8a",
+      "version": "Xray 26.9.9 (Xray, Penetrates Everything.) 52a412d (go1.27.1 linux/amd64)\nA unified platform for anti-censorship."
+    },
+    "sing-box": {
+      "sha256": "031042edfd30a215e4c69d83eb7d13c194e6ef50c782e2e1308d9d8fa128454a",
+      "version": "sing-box version 1.13.19\n\nEnvironment: go1.25.12 linux/amd64\nTags: with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_naive_outbound,badlinkname,tfogo_checklinkname0,with_musl\nRevision: b5ebaa1fc0f2b94256180b95468e73ef53caa27d\nCGO: enabled"
+    }
+  },
+  "configuration_contract": "Baseline vless_mode=xudp/h2mux vs canonical candidate Auto/Off/H2, equivalent selected paths at measured ports. Four comparable paths; native-UDP baseline not claimed.",
+  "workload": {
+    "pairs": 3,
+    "order": "baseline/candidate, candidate/baseline, baseline/candidate",
+    "cases": [
+      "direct",
+      "xudp",
+      "h2mux",
+      "vision",
+      "reality"
+    ],
+    "per_case": "1 HTTP warmup +15 HTTP opens +3 x16MiB HTTP +3 x16MiB HTTPS +100 x1200-byte UDP on each of two destinations using one client socket",
+    "integrity": "Exact Z-body SHA256, exact UDP nonce/sequence/payload, original reply peer and independent target-observed upstream sender marker. No failed sample exclusion.",
+    "workers_requested": 2
+  },
+  "limits": [
+    "IPv4 LAN real eBPF/NFQUEUE/TPROXY only",
+    "HTTPS uses test certificate without PKI validation",
+    "No full Vision uplink, Internet privacy, stress/race-freedom or unsupported 0-RTT claim",
+    "Diagnostic 780c3f1 run was interrupted and excluded from formal comparison",
+    "OpenWrt requires FD-based client netns entry because the pre-existing honk compat mount temporarily hides named namespace entries; no production code was changed for that host behavior.",
+    "OpenWrt fw4 direct-control admission is a temporary exact-handle rule limited to owned hp246, client192.168.246.2, target10.10.10.70 and four direct-control ports; default firewall policy is unchanged.",
+    "x86 and ARM raw archives contain their actual driver source/hash; ARM adds FD entry and scoped firewall prerequisite handling, outside measured client request timing.",
+    "The fixture Xray tls-cert command emitted a PKCS8 key with RSA PRIVATE KEY armor; only the PEM label was corrected before Python TLS fixture startup."
+  ],
+  "verification_totals": {
+    "candidate_attempts": 6660,
+    "candidate_failures": 0,
+    "baseline_reality_failures": 1332,
+    "per_host_cases_completed": 30
+  },
+  "fixture_credentials": "Ephemeral test-only keys/configs; all three owned upstream/target services were stopped before publication. Never reuse these credentials for production."
+}
