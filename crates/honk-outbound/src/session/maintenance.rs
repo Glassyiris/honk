@@ -15,7 +15,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         if self.state() != PoolState::Running {
             return 0;
         }
-        let to_close = {
+        let (to_close, capacity_changed) = {
             let mut pool = self.pool.lock();
             if self.state() != PoolState::Running {
                 return 0;
@@ -29,8 +29,10 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 .filter(|session| session.state() == SessionState::Active)
                 .count();
             let mut to_close = Vec::new();
+            let mut capacity_changed = false;
             pool.sessions.retain(|session| {
                 if session.is_closed() {
+                    capacity_changed = true;
                     return false;
                 }
                 let active = session.state() == SessionState::Active;
@@ -39,6 +41,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                 }
                 session.begin_drain();
                 if active {
+                    capacity_changed = true;
                     remaining -= 1;
                 }
                 if session.active_streams() == 0 {
@@ -48,13 +51,13 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     true
                 }
             });
-            to_close
+            (to_close, capacity_changed)
         };
         let reaped = to_close.len();
         for session in to_close {
             session.close();
         }
-        if reaped != 0 {
+        if capacity_changed || reaped != 0 {
             self.capacity_notify.notify_waiters();
         }
         reaped

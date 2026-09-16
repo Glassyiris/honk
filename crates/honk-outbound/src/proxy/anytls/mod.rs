@@ -332,6 +332,7 @@ pub(crate) struct AnyTlsSession {
     /// Stream-slot capacity: the single capacity truth (replaces the old
     /// active_streams counter — a permit outlives the counter's races).
     stream_permits: Arc<tokio::sync::Semaphore>,
+    capacity_notify: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
     /// Shared across every physical session retained or draining under the
     /// originating node pool.
     inbound_payload_budget: Arc<InboundPayloadBudget>,
@@ -382,6 +383,7 @@ impl AnyTlsSession {
             overflow_notify: tokio::sync::Notify::new(),
             watchdog: Mutex::new(None),
             stream_permits: Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS_PER_SESSION)),
+            capacity_notify: std::sync::OnceLock::new(),
             inbound_payload_budget,
             inbound_budget_epoch: AtomicU64::new(0),
             demux: Mutex::new(None),
@@ -956,6 +958,9 @@ impl AnyTlsSession {
             handle.abort();
         }
         self.writer_q.close();
+        if let Some(notify) = self.capacity_notify.get() {
+            notify.notify_waiters();
+        }
         debug!("AnyTLS session {} for {} closed", self.seq, self.addr);
     }
 
@@ -1078,6 +1083,14 @@ impl crate::session::ManagedSession for AnyTlsSession {
     fn close(&self) {
         AnyTlsSession::close(self)
     }
+    fn bind_capacity_notify(&self, notify: Arc<tokio::sync::Notify>) {
+        if let Err(notify) = self.capacity_notify.set(notify) {
+            assert!(
+                Arc::ptr_eq(self.capacity_notify.get().unwrap(), &notify),
+                "session cannot belong to multiple pools"
+            );
+        }
+    }
     fn state(&self) -> crate::session::SessionState {
         match self.session_state.load(Ordering::Acquire) {
             0 => crate::session::SessionState::Active,
@@ -1088,12 +1101,19 @@ impl crate::session::ManagedSession for AnyTlsSession {
     /// GOAWAY/max-age: stop taking new streams; the pool stops offering
     /// this session and existing streams run to the end.
     fn begin_drain(&self) {
-        let _ = self.session_state.compare_exchange(
-            crate::session::SessionState::Active as usize,
-            crate::session::SessionState::Draining as usize,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        if self
+            .session_state
+            .compare_exchange(
+                crate::session::SessionState::Active as usize,
+                crate::session::SessionState::Draining as usize,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+            && let Some(notify) = self.capacity_notify.get()
+        {
+            notify.notify_waiters();
+        }
     }
     fn created_at(&self) -> Instant {
         self.created

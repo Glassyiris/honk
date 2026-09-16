@@ -152,6 +152,7 @@ impl<S: ManagedSession + 'static> DetachedSessionReservation<S> {
                     if slot.is_some() {
                         false
                     } else {
+                        session.bind_capacity_notify(Arc::clone(&self.pool.capacity_notify));
                         *slot = Some(Arc::clone(session));
                         true
                     }

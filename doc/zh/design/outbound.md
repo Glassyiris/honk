@@ -226,6 +226,9 @@ slot；并发的 detached commit 在该预留占满上限时进入 drain-only，
 waiter，无需等待这些 carrier 上已有的 child 结束。
 maintenance 因 max-age 退役或清理已关闭 session 释放容量时，也会发布通知，
 即使没有关闭 idle carrier 或执行 prewarm。
+Backend 关闭或从 Active 进入 Draining 时会通知同一个所属 pool，包括 child
+permit 仍持有时的 H2 driver 终止。Session 在发布或 detached attach 前绑定
+pool 通知；手动清理已关闭 carrier 时也会广播容量变化。
 
 VLESS 物理 carrier 还持有不可变进程级 VLESS-carrier gate 的一个 permit。
 启动资源预算在计算 UDP endpoint 前先分出 `min(after_dials / 8, 8192)`；零值

@@ -148,6 +148,10 @@ pub trait ManagedSession: Send + Sync {
     fn is_closed(&self) -> bool;
     /// Close the session (idle reap, pool shutdown).
     fn close(&self);
+    /// Bind the owning pool before publication or provisional attachment.
+    /// Autonomous close/drain transitions must wake this notification after
+    /// publishing their state. Repeated binding must preserve the same owner.
+    fn bind_capacity_notify(&self, _notify: Arc<Notify>) {}
     /// Session state; `Draining` takes no new permits. Default derives
     /// from `is_closed` (legacy sessions without a real machine).
     fn state(&self) -> SessionState {
@@ -614,6 +618,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                                         pool.dial_failures = 0;
                                         pool.next_dial_at = None;
                                         tracing::debug!(id, "pool dial succeeded");
+                                        session.bind_capacity_notify(Arc::clone(&capacity_notify));
                                         pool.sessions.push(session);
                                         DialSignal::Done
                                     }
@@ -751,7 +756,9 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
     /// Seed a session for tests that exercise the production pool paths.
     #[cfg(test)]
     pub fn insert(&self, session: &Arc<S>) {
+        session.bind_capacity_notify(Arc::clone(&self.capacity_notify));
         self.pool.lock().sessions.push(Arc::clone(session));
+        self.capacity_notify.notify_waiters();
     }
 
     /// Current metrics snapshot.

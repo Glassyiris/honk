@@ -62,6 +62,7 @@ pub struct VlessMuxSession {
     state: AtomicU8,
     created_at: Instant,
     capacity: Arc<tokio::sync::Semaphore>,
+    capacity_notify: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
     sender: Mutex<SendRequest<Bytes>>,
     driver: Mutex<Option<tokio::task::AbortHandle>>,
 }
@@ -72,6 +73,7 @@ impl VlessMuxSession {
             state: AtomicU8::new(SessionState::Active as u8),
             created_at: Instant::now(),
             capacity: Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS_PER_SESSION)),
+            capacity_notify: std::sync::OnceLock::new(),
             sender: Mutex::new(sender),
             driver: Mutex::new(None),
         })
@@ -99,6 +101,9 @@ impl VlessMuxSession {
         self.state
             .store(SessionState::Closed as u8, Ordering::Release);
         self.capacity.close();
+        if let Some(notify) = self.capacity_notify.get() {
+            notify.notify_waiters();
+        }
     }
 }
 
@@ -121,6 +126,18 @@ impl ManagedSession for VlessMuxSession {
             if let Some(driver) = self.driver.lock().take() {
                 driver.abort();
             }
+            if let Some(notify) = self.capacity_notify.get() {
+                notify.notify_waiters();
+            }
+        }
+    }
+
+    fn bind_capacity_notify(&self, notify: Arc<tokio::sync::Notify>) {
+        if let Err(notify) = self.capacity_notify.set(notify) {
+            assert!(
+                Arc::ptr_eq(self.capacity_notify.get().unwrap(), &notify),
+                "session cannot belong to multiple pools"
+            );
         }
     }
 
@@ -146,9 +163,13 @@ impl ManagedSession for VlessMuxSession {
                 Ordering::Acquire,
             )
             .is_ok()
-            && self.active_streams() == 0
         {
-            self.close();
+            if let Some(notify) = self.capacity_notify.get() {
+                notify.notify_waiters();
+            }
+            if self.active_streams() == 0 {
+                self.close();
+            }
         }
     }
 

@@ -256,6 +256,10 @@ Releasing warm retention also wakes capacity waiters as excess live carriers
 enter Draining, without waiting for their existing children to finish.
 Maintenance likewise publishes capacity released by max-age drains or closed
 session pruning, even when no idle carrier is closed and no prewarm runs.
+Backend close and Active-to-Draining transitions notify that same owning pool,
+including H2 driver termination while child permits remain held. Sessions bind
+the pool notification before publication or detached attachment; manual pruning
+also broadcasts when it removes an already-closed carrier.
 
 VLESS physical carriers additionally hold one permit from the immutable
 process-wide VLESS-carrier gate. The startup resource budget computes

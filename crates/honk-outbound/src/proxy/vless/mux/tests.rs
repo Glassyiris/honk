@@ -513,6 +513,91 @@ async fn saturated_carrier_opens_the_second_pool_slot() {
     assert_eq!(second_server.await.unwrap(), 0);
 }
 
+#[tokio::test]
+async fn carrier_death_wakes_full_pool_waiters_with_child_permits_held() {
+    enum Publication {
+        Ordinary,
+        Detached,
+        Inserted,
+    }
+    for publication in [
+        Publication::Ordinary,
+        Publication::Detached,
+        Publication::Inserted,
+    ] {
+        let pool = Arc::new(SessionPool::new(session_pool_config()));
+        let (first_client, first_server) = tokio::io::duplex(1 << 20);
+        let first_server = tokio::spawn(serve_idle_h2mux(first_server));
+        let mut permits = Vec::new();
+        let first = match publication {
+            Publication::Ordinary => pool
+                .offer(move || async move { connect(Box::new(first_client), false).await })
+                .await
+                .unwrap(),
+            Publication::Detached => {
+                let SpeculativeCheckout::Detached(mut reservation) =
+                    pool.checkout_speculative().await.unwrap()
+                else {
+                    panic!("empty pool must reserve a detached dial");
+                };
+                let session = connect(Box::new(first_client), false).await.unwrap();
+                permits.push(reservation.attach(&session).unwrap());
+                reservation.commit().unwrap()
+            }
+            Publication::Inserted => {
+                let session = connect(Box::new(first_client), false).await.unwrap();
+                pool.insert(&session);
+                session
+            }
+        };
+        permits
+            .extend((permits.len()..MAX_STREAMS_PER_SESSION).map(|_| first.try_reserve().unwrap()));
+        let (second_client, second_server) = tokio::io::duplex(1 << 20);
+        let second_server = tokio::spawn(serve_idle_h2mux(second_server));
+        let second = pool
+            .offer(move || async move { connect(Box::new(second_client), false).await })
+            .await
+            .unwrap();
+        permits.extend((0..MAX_STREAMS_PER_SESSION).map(|_| second.try_reserve().unwrap()));
+
+        let (replacement_client, replacement_server) = tokio::io::duplex(1 << 20);
+        let replacement_server = tokio::spawn(serve_idle_h2mux(replacement_server));
+        let mut normal = std::pin::pin!(
+            pool.offer(move || async move { connect(Box::new(replacement_client), false).await })
+        );
+        let mut speculative = std::pin::pin!(pool.checkout_speculative());
+        assert!(futures_util::poll!(normal.as_mut()).is_pending());
+        assert!(futures_util::poll!(speculative.as_mut()).is_pending());
+
+        first_server.abort();
+        let _ = first_server.await;
+        let SpeculativeCheckout::Detached(reservation) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), speculative)
+                .await
+                .expect("carrier death stranded the speculative checkout")
+                .unwrap()
+        else {
+            panic!("the surviving carrier is still full");
+        };
+        let replacement = tokio::time::timeout(std::time::Duration::from_secs(1), normal)
+            .await
+            .expect("carrier death stranded the replacement dial")
+            .unwrap();
+        assert!(first.is_closed());
+        assert_eq!(first.active_streams(), MAX_STREAMS_PER_SESSION);
+        assert_eq!(second.active_streams(), MAX_STREAMS_PER_SESSION);
+        assert_eq!(second.state(), SessionState::Active);
+        assert!(!Arc::ptr_eq(&replacement, &first));
+        assert!(!Arc::ptr_eq(&replacement, &second));
+
+        drop(reservation);
+        pool.shutdown();
+        drop(permits);
+        second_server.await.unwrap();
+        replacement_server.await.unwrap();
+    }
+}
+
 async fn prepare_detached(
     pool: &Arc<VlessMuxPool>,
 ) -> (

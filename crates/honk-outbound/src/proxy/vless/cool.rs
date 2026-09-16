@@ -251,6 +251,7 @@ pub struct VlessCoolSession {
     state: AtomicU8,
     created_at: Instant,
     capacity: Arc<tokio::sync::Semaphore>,
+    capacity_notify: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
     active_limit: usize,
     receive_budget: Arc<tokio::sync::Semaphore>,
     next_id: AtomicU16,
@@ -371,6 +372,9 @@ impl VlessCoolSession {
         }
         for task in self.tasks.lock().drain(..) {
             task.abort();
+        }
+        if let Some(notify) = self.capacity_notify.get() {
+            notify.notify_waiters();
         }
     }
 
@@ -599,6 +603,15 @@ impl ManagedSession for VlessCoolSession {
         ));
     }
 
+    fn bind_capacity_notify(&self, notify: Arc<tokio::sync::Notify>) {
+        if let Err(notify) = self.capacity_notify.set(notify) {
+            assert!(
+                Arc::ptr_eq(self.capacity_notify.get().unwrap(), &notify),
+                "session cannot belong to multiple pools"
+            );
+        }
+    }
+
     fn state(&self) -> SessionState {
         match self.state.load(Ordering::Acquire) {
             value if value == SessionState::Active as u8 => SessionState::Active,
@@ -621,9 +634,13 @@ impl ManagedSession for VlessCoolSession {
                 Ordering::Acquire,
             )
             .is_ok()
-            && self.active_streams() == 0
         {
-            self.close();
+            if let Some(notify) = self.capacity_notify.get() {
+                notify.notify_waiters();
+            }
+            if self.active_streams() == 0 {
+                self.close();
+            }
         }
     }
 
@@ -733,6 +750,7 @@ pub(crate) fn connect(
         state: AtomicU8::new(SessionState::Active as u8),
         created_at: Instant::now(),
         capacity: Arc::new(tokio::sync::Semaphore::new(active_limit)),
+        capacity_notify: std::sync::OnceLock::new(),
         active_limit,
         next_id: AtomicU16::new(1),
         zero_id_issued: AtomicBool::new(false),

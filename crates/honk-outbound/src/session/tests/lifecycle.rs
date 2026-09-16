@@ -323,6 +323,41 @@ async fn warm_unpin_wakes_waiters_without_cutting_live_children() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn manual_closed_pruning_wakes_capacity_waiters_without_reaping_idle_sessions() {
+    let pool = Arc::new(pool(SessionPoolConfig {
+        max_sessions: 1,
+        max_streams_per_session: 1,
+        ..Default::default()
+    }));
+    let old = TestSession::new();
+    old.streams.store(1, Ordering::Relaxed);
+    pool.insert(&old);
+    let mut normal = std::pin::pin!(pool.offer(|| async { Ok(TestSession::new()) }));
+    let mut speculative = std::pin::pin!(pool.checkout_speculative());
+    assert!(futures_util::poll!(normal.as_mut()).is_pending());
+    assert!(futures_util::poll!(speculative.as_mut()).is_pending());
+
+    old.close();
+    assert_eq!(pool.reap_unretained_idle(), 0);
+    let SpeculativeCheckout::Detached(reservation) =
+        tokio::time::timeout(Duration::from_secs(1), speculative)
+            .await
+            .expect("closed pruning stranded the speculative checkout")
+            .unwrap()
+    else {
+        panic!("closed pruning must release a carrier slot");
+    };
+    let replacement = tokio::time::timeout(Duration::from_secs(1), normal)
+        .await
+        .expect("closed pruning stranded the normal offer")
+        .unwrap();
+    assert!(!Arc::ptr_eq(&replacement, &old));
+    assert_eq!(replacement.state(), SessionState::Active);
+    drop(reservation);
+    pool.shutdown();
+}
+
+#[tokio::test(start_paused = true)]
 async fn janitor_preserves_and_replenishes_warm_carriers_while_old_streams_drain() {
     let pool = Arc::new(pool(SessionPoolConfig {
         janitor_interval: Duration::from_secs(1),
