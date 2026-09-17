@@ -145,14 +145,63 @@ impl ControlPlane {
         );
         let outbound_runtime = runtime_registry.read().clone();
         dns_upstream_pool.set_runtime_generation(Arc::clone(&outbound_runtime))?;
+        #[cfg(feature = "native-api")]
+        let native = config.experimental.native_api.enabled.then(|| {
+            alive_set.enable_native_observations();
+            Arc::new(crate::native_api::observation::NativeObservation::new(
+                &config,
+            ))
+        });
         {
             let gm_cell = group_manager.clone();
+            #[cfg(feature = "native-api")]
+            let native = native.clone();
             alive_set.set_url_member_resolver(Some(Arc::new(move |group: &str| {
-                gm_cell
-                    .read()
+                let manager = gm_cell.read();
+                #[cfg(feature = "native-api")]
+                if let Some(native) = &native {
+                    let identity = native.catalog.snapshot();
+                    let group_id = identity
+                        .groups
+                        .get(group)
+                        .and_then(|id| uuid::Uuid::parse_str(id).ok());
+                    return manager
+                        .native_delay_test_members(group)
+                        .into_iter()
+                        .map(|(member, node)| {
+                            let (tag, member_id) = match member {
+                                honk_outbound::group::NativeGroupMember::Node(member) => {
+                                    (member.name.clone(), Some(member.id))
+                                }
+                                honk_outbound::group::NativeGroupMember::Group(member) => (
+                                    member.name.clone(),
+                                    identity
+                                        .groups
+                                        .get(&member.name)
+                                        .and_then(|id| uuid::Uuid::parse_str(id).ok()),
+                                ),
+                            };
+                            honk_outbound::alive::UrlProbeMember {
+                                tag,
+                                leaf: node.id,
+                                native: group_id.zip(member_id).map(|(group_id, member_id)| {
+                                    honk_outbound::alive::NativeGroupProbeContext {
+                                        group_id,
+                                        member_id,
+                                    }
+                                }),
+                            }
+                        })
+                        .collect();
+                }
+                manager
                     .delay_test_members(group)
                     .into_iter()
-                    .map(|(tag, node)| (tag, node.name))
+                    .map(|(tag, node)| honk_outbound::alive::UrlProbeMember {
+                        tag,
+                        leaf: node.id,
+                        native: None,
+                    })
                     .collect()
             })));
         }
@@ -274,6 +323,8 @@ impl ControlPlane {
             datapath_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(feature = "native-api")]
             phase: None,
+            #[cfg(feature = "native-api")]
+            native,
             active_routing_plan: Arc::new(parking_lot::RwLock::new(initial_routing_plan)),
             #[cfg(feature = "reload-bench-counters")]
             reload_slow_path_entries: std::sync::atomic::AtomicU64::new(0),

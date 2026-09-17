@@ -455,13 +455,13 @@ struct MockHttpProber {
 impl HttpProber for MockHttpProber {
     fn probe_http(
         &self,
-        _node_name: &str,
+        _node_id: Uuid,
         _addr: std::net::SocketAddr,
         _url: &str,
         _timeout: Duration,
-    ) -> Pin<Box<dyn Future<Output = HttpProbeResult> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = HttpProbeOutcome> + Send + 'static>> {
         let result = self.result.clone();
-        Box::pin(async move { result })
+        Box::pin(async move { result.into() })
     }
 }
 
@@ -474,18 +474,35 @@ struct DelayedHttpProber {
 impl HttpProber for DelayedHttpProber {
     fn probe_http(
         &self,
-        _node_name: &str,
-        _addr: std::net::SocketAddr,
+        _node_id: Uuid,
+        addr: std::net::SocketAddr,
         _url: &str,
         _timeout: Duration,
-    ) -> Pin<Box<dyn Future<Output = HttpProbeResult> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = HttpProbeOutcome> + Send + 'static>> {
         let started = Arc::clone(&self.started);
         let release = Arc::clone(&self.release);
         let result = self.result.clone();
         Box::pin(async move {
             started.notify_one();
             release.notified().await;
-            result
+            let observation = match &result {
+                HttpProbeResult::WarmSuccess(latency) => Some(NativeHealthObservation::probe(
+                    ProbeDomain::Tcp,
+                    HealthMeasurement::HttpHeaders,
+                    if addr.is_ipv4() {
+                        IpVersion::V4
+                    } else {
+                        IpVersion::V6
+                    },
+                    Some(*latency),
+                    std::time::SystemTime::now(),
+                )),
+                _ => None,
+            };
+            HttpProbeOutcome {
+                result,
+                observation,
+            }
         })
     }
 }
@@ -646,7 +663,7 @@ impl MockUdpProber {
 impl UdpProber for MockUdpProber {
     fn probe_udp(
         &self,
-        _node_name: &str,
+        _node_id: Uuid,
         _timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>> {
         let r = self
@@ -657,7 +674,13 @@ impl UdpProber for MockUdpProber {
             .data_path
             .clone()
             .map(|result| result.map_err(anyhow::Error::msg));
-        Box::pin(async move { UdpProbeOutcome { dns: r, data_path } })
+        Box::pin(async move {
+            UdpProbeOutcome {
+                dns: r,
+                data_path,
+                observations: [None, None],
+            }
+        })
     }
 }
 
@@ -666,7 +689,7 @@ struct PendingUdpProber;
 impl UdpProber for PendingUdpProber {
     fn probe_udp(
         &self,
-        _node_name: &str,
+        _node_id: Uuid,
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>> {
         Box::pin(async move {
@@ -674,6 +697,7 @@ impl UdpProber for PendingUdpProber {
             UdpProbeOutcome {
                 dns: Some(Err(anyhow::anyhow!("UDP probe timeout"))),
                 data_path: None,
+                observations: [None, None],
             }
         })
     }
@@ -684,13 +708,14 @@ struct CapacityUdpProber;
 impl UdpProber for CapacityUdpProber {
     fn probe_udp(
         &self,
-        _node_name: &str,
+        _node_id: Uuid,
         _timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>> {
         Box::pin(async {
             UdpProbeOutcome {
                 dns: Some(Err(crate::proxy::PacketRejection::Capacity.into())),
                 data_path: Some(Err(crate::proxy::PacketRejection::Capacity.into())),
+                observations: [None, None],
             }
         })
     }
@@ -704,7 +729,7 @@ struct DelayedUdpProber {
 impl UdpProber for DelayedUdpProber {
     fn probe_udp(
         &self,
-        _node_name: &str,
+        _node_id: Uuid,
         _timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>> {
         let started = Arc::clone(&self.started);
@@ -715,6 +740,16 @@ impl UdpProber for DelayedUdpProber {
             UdpProbeOutcome {
                 dns: Some(Ok(Duration::from_millis(11))),
                 data_path: None,
+                observations: [
+                    Some(NativeHealthObservation::probe(
+                        ProbeDomain::DnsUdp,
+                        HealthMeasurement::DnsRoundTrip,
+                        IpVersion::V4,
+                        Some(Duration::from_millis(11)),
+                        std::time::SystemTime::now(),
+                    )),
+                    None,
+                ],
             }
         })
     }
@@ -762,6 +797,7 @@ async fn removed_node_discards_collections_and_late_probe_results() {
         let set = Arc::new(AliveDialerSet::new());
         let node = id(1);
         set.register_node(node, "same".into(), "127.0.0.1:1".into());
+        set.enable_native_observations();
         set.record_probe_latency(
             node,
             ProbeDomain::DataUdp,
@@ -816,6 +852,7 @@ async fn removed_node_discards_collections_and_late_probe_results() {
 
         release.notify_one();
         assert!(probe.await.unwrap());
+        assert!(set.native_observations(node).is_empty());
         assert_eq!(set.registered_nodes().contains_key(&node), re_register);
         assert!(!set.is_alive_for(node, ProbeDomain::DataUdp, IpVersion::V4));
         assert!(set.has_udp_state(node));
@@ -907,6 +944,7 @@ async fn late_raw_tcp_probe_preserves_replacement_health() {
     let set = Arc::new(AliveDialerSet::new());
     let node = id(1);
     set.register_node(node, "same".into(), addr.to_string());
+    set.enable_native_observations();
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     set.set_resolver(Arc::new({
@@ -938,6 +976,7 @@ async fn late_raw_tcp_probe_preserves_replacement_health() {
     set.report_unavailable_forced(node, ProbeDomain::DataUdp, IpVersion::V4);
     release.notify_one();
     assert!(probe.await.unwrap());
+    assert!(set.native_observations(node).is_empty());
     assert!(!set.is_alive_for(node, ProbeDomain::DataUdp, IpVersion::V4));
     assert_eq!(
         set.get_last_latency(node, ProbeDomain::Tcp, IpVersion::V4),
@@ -1501,9 +1540,10 @@ async fn test_block_probe_exempt() {
     assert!(
         set.probe_node_with_url(
             "block",
-            "block",
+            BLOCK_NODE_ID,
             "http://x.example",
-            Duration::from_millis(1)
+            Duration::from_millis(1),
+            None,
         )
         .await
     );
@@ -1568,7 +1608,7 @@ async fn test_builtin_leaf_probe_recovers_url_state() {
     assert!(!set.is_alive_for_url("sub", url));
 
     assert!(
-        set.probe_node_with_url("sub", "direct", url, Duration::from_millis(1))
+        set.probe_node_with_url("sub", DIRECT_NODE_ID, url, Duration::from_millis(1), None)
             .await
     );
     assert!(
@@ -1576,7 +1616,7 @@ async fn test_builtin_leaf_probe_recovers_url_state() {
         "recovery keeps the two-success hysteresis"
     );
     assert!(
-        set.probe_node_with_url("sub", "direct", url, Duration::from_millis(1))
+        set.probe_node_with_url("sub", DIRECT_NODE_ID, url, Duration::from_millis(1), None)
             .await
     );
     assert!(set.is_alive_for_url("sub", url));
@@ -1605,9 +1645,10 @@ async fn test_direct_probe_uses_direct_check_addr() {
     assert!(
         set.probe_node_with_url(
             "direct",
-            "direct",
+            DIRECT_NODE_ID,
             "http://x.example",
-            Duration::from_millis(1)
+            Duration::from_millis(1),
+            None,
         )
         .await
     );
@@ -1809,4 +1850,292 @@ fn test_report_dial_latency_ignores_builtin_nodes() {
             Duration::from_secs(9),
         ));
     }
+}
+
+#[test]
+fn native_observations_exclude_legacy_and_preserve_zero_and_failures() {
+    let set = AliveDialerSet::new();
+    let node = id(1);
+    set.register_node(node, "node".into(), "127.0.0.1:1".into());
+    let registration = set.registered.read().get(&node).cloned().unwrap();
+    let at = std::time::SystemTime::now();
+    let zero = NativeHealthObservation::probe(
+        ProbeDomain::Tcp,
+        HealthMeasurement::HttpHeaders,
+        IpVersion::V4,
+        Some(Duration::ZERO),
+        at,
+    );
+    set.record_native_observation(node, Some(&registration), zero);
+    assert!(set.native_observations(node).is_empty());
+    set.enable_native_observations();
+    assert!(set.native_observations(node).is_empty());
+    set.restore_latency(node, Duration::from_millis(8), at);
+    set.record_probe_latency(
+        node,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+        Duration::from_millis(9),
+    );
+    set.report_unavailable_forced(node, ProbeDomain::Tcp, IpVersion::V4);
+    assert!(set.native_observations(node).is_empty());
+    for _ in 0..1000 {
+        set.record_native_observation(node, Some(&registration), zero);
+    }
+    assert_eq!(set.native_observations(node), vec![zero]);
+    assert_eq!(zero.state, HealthState::Healthy);
+    assert_eq!(zero.latency, Some(Duration::ZERO));
+    let failed = NativeHealthObservation::probe(
+        ProbeDomain::Tcp,
+        HealthMeasurement::HttpHeaders,
+        IpVersion::V4,
+        None,
+        at + Duration::from_secs(1),
+    );
+    set.record_native_observation(node, Some(&registration), failed);
+    set.record_native_observation(node, Some(&registration), zero);
+    assert_eq!(set.native_observations(node), vec![failed]);
+    assert_eq!(failed.state, HealthState::Unavailable);
+    assert_eq!(failed.latency, None);
+    assert_eq!(failed.error, Some("probe_failed"));
+    set.remove_node(node);
+    assert!(set.native_observations(node).is_empty());
+}
+
+#[tokio::test]
+async fn native_udp_observations_precede_legacy_family_fanout() {
+    struct QualifiedUdp;
+    impl UdpProber for QualifiedUdp {
+        fn probe_udp(
+            &self,
+            _: Uuid,
+            _: Duration,
+        ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>> {
+            Box::pin(async {
+                let at = std::time::SystemTime::now();
+                UdpProbeOutcome {
+                    dns: Some(Ok(Duration::from_millis(30))),
+                    data_path: Some(Ok(Duration::from_millis(40))),
+                    observations: [
+                        Some(NativeHealthObservation::probe(
+                            ProbeDomain::DnsUdp,
+                            HealthMeasurement::DnsRoundTrip,
+                            IpVersion::V4,
+                            Some(Duration::from_millis(3)),
+                            at,
+                        )),
+                        Some(NativeHealthObservation::probe(
+                            ProbeDomain::DataUdp,
+                            HealthMeasurement::QuicHandshake,
+                            IpVersion::V6,
+                            Some(Duration::from_millis(4)),
+                            at,
+                        )),
+                    ],
+                }
+            })
+        }
+    }
+    let set = AliveDialerSet::new();
+    let node = id(1);
+    set.register_node(node, "node".into(), "127.0.0.1:1".into());
+    set.enable_native_observations();
+    set.set_udp_probe(Arc::new(QualifiedUdp));
+    assert!(set.probe_node_udp(node, Duration::from_secs(1)).await);
+    let observations = set.native_observations(node);
+    assert_eq!(observations.len(), 2);
+    assert!(
+        observations
+            .iter()
+            .any(|sample| sample.purpose == HealthPurpose::Dns
+                && sample.ip_version == IpVersion::V4
+                && sample.latency == Some(Duration::from_millis(3)))
+    );
+    assert!(
+        observations
+            .iter()
+            .any(|sample| sample.purpose == HealthPurpose::Data
+                && sample.ip_version == IpVersion::V6
+                && sample.latency == Some(Duration::from_millis(4)))
+    );
+    assert_eq!(
+        set.get_last_latency(node, ProbeDomain::DataUdp, IpVersion::V6),
+        Some(Duration::from_millis(30))
+    );
+    assert_eq!(set.native_observations(node), observations);
+}
+
+#[tokio::test]
+async fn native_custom_probe_retains_sampled_leaf_and_rejects_old_config() {
+    for reload in [false, true] {
+        let set = Arc::new(AliveDialerSet::new());
+        set.enable_native_observations();
+        set.register_node(id(1), "old".into(), "127.0.0.1:1".into());
+        set.register_node(id(2), "new".into(), "127.0.0.1:2".into());
+        let url = "http://127.0.0.1/";
+        set.sync_group_check_urls(&[("group".into(), url.into())]);
+        let epoch = set.native_group_epoch().unwrap();
+        let context = NativeGroupProbeContext {
+            group_id: id(3),
+            member_id: id(4),
+        };
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        set.set_http_probe(
+            Arc::new(DelayedHttpProber {
+                started: started.clone(),
+                release: release.clone(),
+                result: HttpProbeResult::WarmSuccess(Duration::from_millis(7)),
+            }),
+            url.into(),
+            "HEAD".into(),
+        )
+        .await;
+        let probe = tokio::spawn({
+            let set = set.clone();
+            async move {
+                set.probe_node_with_url(
+                    "sub",
+                    id(1),
+                    url,
+                    Duration::from_secs(1),
+                    Some((context, epoch)),
+                )
+                .await
+            }
+        });
+        started.notified().await;
+        set.set_url_member_resolver(Some(Arc::new(move |_| {
+            vec![UrlProbeMember {
+                tag: "sub".into(),
+                leaf: id(2),
+                native: Some(context),
+            }]
+        })));
+        if reload {
+            set.invalidate_native_group_observations();
+        }
+        release.notify_one();
+        assert!(probe.await.unwrap());
+        assert!(set.native_observations(id(1)).is_empty());
+        assert!(set.native_observations(id(2)).is_empty());
+        let samples = set.native_group_observations(id(3));
+        if reload {
+            assert!(samples.is_empty());
+        } else {
+            assert_eq!(samples.len(), 1);
+            assert_eq!(samples[0].member_id, id(4));
+            assert_eq!(samples[0].node_id, id(1));
+            assert_eq!(
+                samples[0].observation.latency,
+                Some(Duration::from_millis(7))
+            );
+            set.remove_node(id(1));
+            assert!(set.native_group_observations(id(3)).is_empty());
+        }
+    }
+}
+
+#[test]
+fn native_group_retention_has_a_fixed_slot_bound() {
+    let set = AliveDialerSet::new();
+    set.enable_native_observations();
+    let node = id(1);
+    let group = id(2);
+    set.register_node(node, "node".into(), "127.0.0.1:1".into());
+    let registration = set.registered.read().get(&node).cloned().unwrap();
+    let epoch = set.native_group_epoch().unwrap();
+    let observation = NativeHealthObservation::probe(
+        ProbeDomain::Tcp,
+        HealthMeasurement::HttpHeaders,
+        IpVersion::V4,
+        Some(Duration::ZERO),
+        std::time::SystemTime::now(),
+    );
+    for member in 0..4097 {
+        set.record_native_group_observation(
+            node,
+            Some(&registration),
+            NativeGroupProbeContext {
+                group_id: group,
+                member_id: id(member),
+            },
+            epoch,
+            observation,
+        );
+    }
+    let retained = set.native_group_observations(group);
+    assert_eq!(retained.len(), 4096);
+    assert!(!retained.iter().any(|sample| sample.member_id == id(0)));
+    assert!(retained.iter().any(|sample| sample.member_id == id(4096)));
+}
+
+#[test]
+fn native_group_publication_invalidates_evidence_before_target_sync() {
+    let set = AliveDialerSet::new();
+    set.enable_native_observations();
+    set.register_node(id(1), "node".into(), "127.0.0.1:1".into());
+    set.sync_group_check_urls(&[("group".into(), "http://old.example/".into())]);
+    let registration = set.registered.read().get(&id(1)).cloned().unwrap();
+    let context = NativeGroupProbeContext {
+        group_id: id(2),
+        member_id: id(1),
+    };
+    let observation = NativeHealthObservation::probe(
+        ProbeDomain::Tcp,
+        HealthMeasurement::HttpHeaders,
+        IpVersion::V4,
+        Some(Duration::ZERO),
+        std::time::SystemTime::now(),
+    );
+    let old_epoch = set.native_group_epoch().unwrap();
+    set.record_native_group_observation(
+        id(1),
+        Some(&registration),
+        context,
+        old_epoch,
+        observation,
+    );
+    assert_eq!(set.native_group_observations(id(2)).len(), 1);
+    set.record_native_observation(id(1), Some(&registration), observation);
+
+    set.invalidate_native_group_observations();
+    assert!(set.native_group_observations(id(2)).is_empty());
+    set.record_native_group_observation(
+        id(1),
+        Some(&registration),
+        context,
+        old_epoch,
+        observation,
+    );
+    assert!(set.native_group_observations(id(2)).is_empty());
+    if let Some(epoch) = set.native_group_epoch() {
+        set.record_native_group_observation(
+            id(1),
+            Some(&registration),
+            context,
+            epoch,
+            observation,
+        );
+    }
+    assert!(
+        set.native_group_observations(id(2)).is_empty(),
+        "old targets cannot acquire new observation authority"
+    );
+    assert_eq!(set.native_observations(id(1)), vec![observation]);
+    assert_eq!(
+        set.group_check_urls(),
+        vec![("group".into(), "http://old.example/".into())]
+    );
+
+    set.sync_group_check_urls(&[("group".into(), "http://new.example/".into())]);
+    let new_epoch = set.native_group_epoch().unwrap();
+    set.record_native_group_observation(
+        id(1),
+        Some(&registration),
+        context,
+        new_epoch,
+        observation,
+    );
+    assert_eq!(set.native_group_observations(id(2)).len(), 1);
 }

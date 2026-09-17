@@ -25,6 +25,7 @@
 | `allow_origins` | 空列表 | 额外允许的完整 HTTP(S) Origin；不含路径、凭据、query、fragment、`null` 或通配符。 |
 | `allowed_hosts` | 空列表 | 额外允许的 HTTP Host authority；不含 URL scheme、路径、凭据或通配符。省略端口表示 80，不是监听端口。 |
 | `ui` | `""` | 空值关闭托管；非空为含可读 `index.html` 的可信本地目录。不支持内嵌产物，也不在启动时下载或构建。 |
+| `record_flows` | `true` | 原生 API 启用后保留有界用户态决策，无客户端也记录；`false` 关闭记录并释放缓冲，需重启。 |
 
 ```dae
 experimental {

@@ -67,7 +67,8 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let status = self.status;
+        let mut response = (
             self.status,
             [
                 ("cache-control", "no-store"),
@@ -75,7 +76,16 @@ impl IntoResponse for ApiError {
             ],
             Json(self),
         )
-            .into_response()
+            .into_response();
+        if matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            response
+                .headers_mut()
+                .insert("retry-after", axum::http::HeaderValue::from_static("1"));
+        }
+        response
     }
 }
 
@@ -229,7 +239,7 @@ pub(super) fn version() -> Value {
     })
 }
 
-pub(super) fn capabilities() -> Value {
+pub(super) fn capabilities(record_flows: bool) -> Value {
     json!({
         "observed_at": chrono::Utc::now().to_rfc3339(),
         "profiles": ["base"],
@@ -248,19 +258,19 @@ pub(super) fn capabilities() -> Value {
             "memory_history": {"available": false},
             "runtime_mode": {"available": false},
             "datapath": {"available": false},
-            "nodes": {"available": false},
+            "nodes": {"available": true},
             "providers": {"available": false},
-            "groups": {"available": false},
+            "groups": {"available": true, "config_patch": false, "selection": false, "max_patch_operations":32},
             "probes": {"available": false},
             "connections": {
                 "available": true,
                 "can_close": false,
                 "max_bulk_close": 1000,
             },
-            "flows": {"available": false},
+            "flows": {"available": true, "recording": if record_flows { "on" } else { "off" }, "scopes":["userspace_tcp","userspace_udp"], "max_flows":1024, "max_steps_per_flow":64, "retention_seconds":300, "snapshot_ttl_seconds":30, "max_page_size":1000},
             "routing_trace": {"available": false},
             "rules": {"available": false},
-            "events": {"available": false},
+            "events": {"available": true, "kinds":["stream.ready","runtime.updated","flow.updated","flow.gap","generation.changed"], "retention_seconds":60, "max_buffered_events":512, "max_clients":16, "heartbeat_seconds":15},
             "logs": {"available": false},
             "dns_query": {"available": false},
             "dns_cache": {"available": false},

@@ -6,7 +6,7 @@
 
 以 `--features native-api` 构建并启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是配置权威；原生 API 不返回配置正文，也不写配置或 SQLite 状态。
 
-固定契约为 [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992)。实现 `base` profile，不声明 `full_transparency`。仅 `runtime` 与 `connections` resource 可用；其他 capability key 保留且为 false。原生 API 不支持关闭连接。
+固定契约为 [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992)。实现 `base` profile，不声明 `full_transparency`。Runtime、connections、flows、nodes、groups、events 可用；配置、组写入、probe、history、runtime mode 与关闭连接仍明确不可用。
 
 | 方法 | 路径 | 含义 |
 | --- | --- | --- |
@@ -15,24 +15,50 @@
 | GET | `/api/v1/capabilities` | 已实现资源与请求上限。 |
 | GET | `/api/v1/runtime?detail=summary\|full` | 引擎 phase、已接受代次与具有独立时间戳的用户态流量。 |
 | GET | `/api/v1/connections?type=all\|tcp\|udp&src=192.0.2.1&limit=100&detail=summary\|full` | 可见的活跃用户态连接；可选 `src` 必须为无端口 IP literal。 |
+| GET | `/api/v1/flows`、`/api/v1/flows/{flow_id}` | 活跃及保留的终态用户态决策；detail 包含捕获的 partial trace。 |
+| GET | `/api/v1/nodes` | 稳定节点 ID、当前直接成员/订阅来源与真实测量。 |
+| GET | `/api/v1/groups`、`/api/v1/groups/{groupId}` | 无副作用组观测、直接成员、配置 revision/ETag 与捕获的健康数据。 |
+| GET | `/api/v1/events` | 有界且需认证的 SSE，支持绑定过滤器的续传游标。 |
 
 `detail` 默认 `summary`，`type` 默认 `all`，`limit` 默认 100、范围 1–1000。拒绝重复单值或未知 query 参数。先过滤，再统计总量与应用 TCP+UDP 合计 limit；按注册观测时间降序、相同时间按 ID 字典序升序排列。total 是匹配的完整可见数量。IPv4-mapped IPv6 来源按 IPv4 比较。summary 省略 `src/dst/domain`，full 包含它们，未知 domain 为 null；full 不表示更高权限。
 
-连接 `outbound` 是选路当时的组/动作，不是当前叶节点或重建的选择。未实现的 flow ID、rule/chain 来源、开始 UTC 和逐连接速率保持 null/unknown。空列表仍是 `visibility: partial`，不代表设备没有连接。mock 数据面显示 disabled/none；未核验 hooks/policy 的真实后端显示 unknown/none，已知健康失败时可为 degraded。HTTP 就绪不等于数据面就绪。
+连接 `outbound` 是选路当时的组/动作，不是当前叶节点或重建选择。启用记录时，`flow_id`、捕获的 root-first 组/叶 ID、首次观测 UTC 与 domain 来源关联保留证据；缺失或淘汰的证据保持 unknown。逐连接 rate 与未捕获 rule ID 仍为 null。空列表是 `visibility: partial`，不代表设备没有连接。mock 数据面显示 disabled/none；未核验 hooks/policy 的真实后端显示 unknown/none，已知健康失败时可为 degraded。HTTP 就绪不等于数据面就绪。
 
 TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，成功写出的嗅探前缀仅计一次；UDP 保持原逐包语义。唯一的一秒 sampler 使用实际时间间隔；初次采样、reset 和 overflow 返回 null rate，不补零。`counter_since` 属于共用计数器生命周期，`sampled_at` 属于流量样本，`observed_at` 属于 HTTP 观察。UInt64 使用十进制字符串，有界数量仍为 JSON number。CPU、activation 时间、配置 revision 和 last reload 目前未知。
 
 配置 secret 后，所有 API 路径（包括 discovery/version/capabilities、禁用 action、未知 API path）都要求单个有效 Bearer header。Query token、重复凭据、错误凭据均不能回退匿名，同源 UI 也不豁免。无 secret 需显式 loopback 授权，并拒绝 `Sec-Fetch-Site: cross-site`。公共静态文件也接受 Host/Origin 校验；OPTIONS preflight 无需 bearer，但必须通过 Host、Origin、method 与 header 白名单。不返回 cookie credentials 或通配 CORS。
 
-已知禁用 action 返回 JSON `404 capability_not_supported`，未知 path 或未定义 method 返回 JSON `404 resource_not_found`。错误信封为 `{error:{code,message,details},request_id}`。HEAD 保留 GET 的状态/header，无 body。API 响应带 `Cache-Control: no-store` 与 `X-Content-Type-Options: nosniff`。应用上限为 target 4096 字节、header 名/值合计 16384 字节、body 65536 字节（含 chunked）；已认证 GET/HEAD 携带非空 body 会被拒绝。不实现 WebSocket、SSE、history ring 或读取触发 probe。
+已知禁用 action 返回 JSON `404 capability_not_supported`，未知 path 或未定义 method 返回 JSON `404 resource_not_found`。错误信封为 `{error:{code,message,details},request_id}`。HEAD 保留 GET 状态/header，无 body。API 响应带 `no-store` 与 `nosniff`。应用上限为规范化 target 4096 字节、规范化 header 名/值合计 16384 字节、body 65536 字节（含 chunked）；已认证 GET/HEAD 携带非空 body 会被拒绝。原生读取不触发 probe 或选择变化。
 
-原生 server 最多拥有 64 条 HTTP/1.1 连接，达到上限暂停 accept；header 读取最多五秒，每条连接存活最多 30 秒。关闭时给全部连接合计五秒 graceful drain，随后 abort 并逐一 join。连接存活上限也回收停读的公共文件响应，客户端可重新连接。TLS/HTTP2 可由可信反向代理终止；支持根路径/独立域名反代，Forwarded headers 不改写固定 discovery path，也不授予 Host/Origin 权限。
+原生 server 最多拥有 64 条 HTTP/1.1 连接，满时暂停 accept，header 读取上限五秒；关闭时全部连接共享五秒 graceful drain，随后 abort 并逐一 join。空闲 I/O 与停滞写入分别受 30 秒期限约束；SSE heartbeat 成功写入使健康长连接保持活跃，读取不能延长阻塞 writer 的期限。TLS/HTTP2 可由可信反代终止。Forwarded headers 不改写固定 discovery path，也不授予 Host/Origin 权限。
 
 **已记录的契约差异：** bootstrap 采用 common bearer 安全规则，尽管该 pin 的 bootstrap 标记了 `security: []`。Hyper 可在应用处理前以 400/414/431 或断连拒绝畸形/硬超限 HTTP；这些 transport 拒绝不保证 JSON 信封或应用 headers。
 
 应用 target/header 上限作用于 Hyper **解析并规范化后的表示**，不是原始 wire 字节。Hyper 可能先移除 request-target fragment，或合并相同 `Content-Length` 字段，再交给应用计量；这些形式的原始文本即使超过应用上限，也可能得到正常响应而不是 413。原始输入仍受 Hyper 传输处理约束。这是已接受的边界差异，不另写 HTTP parser，也不宣称原始 wire 大小保证；body 限制仍覆盖全部交付的 body 字节。
 
 配置 `ui` 后，`/` 与 `/ui` 重定向到 `/ui/`。合法的无扩展名导航可 fallback 到 `index.html`；缺失的静态资产、fonts/icons、manifest 或 service worker 返回 404，不返回 HTML。静态响应统一 `no-cache`、`nosniff`、`X-Frame-Options: DENY`，不修改 UI 自身 CSP，也不注入凭证。目录托管独立验收；不宣称已内嵌/下载 doona 或通过真实 doona/checker conformance。
+
+### 用户态记录流（M2）
+
+原生 listener 启用后默认记录，不依赖 dashboard 订阅。`record_flows: false` 在重启后关闭记录并释放缓冲。进程内最多保留 1024 条 flow、每条 64 steps，含 snapshot 的总保留预算 8 MiB；终态最多保留 300 秒，压力下可提前淘汰，重启清空。由既有 sampler 清理，不新增 timer。
+
+Flow ID 表示 incarnation，不是五元组。TCP/UDP 在真实 route/sniff/verification/selected-leaf/attempt/terminal 边界捕获，拨号失败或阻断即使没有 live connection 也保留。名称、ID、代次取自决策时，不与当前选择重建关联。内核 offload 以 unknown 结束观察，不伪造连接 closed。Rule 内部执行、DNS 子步骤和底层 transport attempt 尚未完整捕获，因此 trace 为 partial，kernel/DNS scope 为 none，不开放 full_transparency。
+
+Flow list 接受 `network/state/connection_id/detail/limit/cursor`。最多八份有界不可变 snapshot，TTL 30 秒，游标绑定 instance 与原过滤器/detail。过期列表返回 `410 snapshot_expired`，已知淘汰 ID 的有界 tombstone 返回 `410 flow_expired`，未知 ID 返回 `404 resource_not_found`；snapshot 满返回 503 与 Retry-After。Detail 不接受 query，始终返回保留的 full input/trace。计数为十进制字符串，revision/seq/elapsed_us 为 safe JSON number；不安全的可选显示字段置 null，不丢弃因果 ID 或结果。
+
+### 节点与组（M3）
+
+节点读取接受 `group_id`、`limit`（1–1000）及 `cursor`；只筛直接成员，不展开叶节点。节点分页最多八份 snapshot、30 秒、4 MiB，冻结分页期间观测；无效或过滤器不匹配游标返回 400。Groups 返回摘要数组，detail 的带引号 ETag 对应仅由配置决定的 revision。组 ID 为进程生命周期随机身份：同名 reload/重排保持，删除再添加获得新 ID，重启重新发现；不使用位置 UUID 或名称 hash。
+
+Health 来自已完成且维度明确的 producer 测量，不把乐观 alive、跨族复制的排名信号、synthetic failure 或恢复延迟当真实测量。Raw TCP、HTTP 响应头、DNS exchange、QUIC handshake 保留实际目标地址族与完成时间；未知 average/ranking/warmth 保持 null/unknown。自定义组测量保留当时 member/leaf，不绑定到后来的选择。GET 不推进 URLTest、轮询或 Score 状态；尚无配置 icon 时返回 null。
+
+按本轮明确决策，所有组写入继续关闭。Per-network Selector 变更等待共同 control/reload/persistence/warm owner 切换；JSON Patch 等待 M6 无损文件权威事务，不提供仅改内存的 PATCH 或假中断。自动策略 override 仍受双网络响应契约门槛限制。
+
+### 原生事件（M4）
+
+使用带 Bearer 与 `Accept: text/event-stream` 的 streaming fetch；浏览器 EventSource 不能设置所需 Authorization。可选 `kinds/flow_id` 绑定续传游标。最多保留 512 事件/60 秒，16 clients，每 client 64 条 live 队列；队满断流，不静默 skip。每 15 秒 heartbeat。Fresh 先 ready；有效续传 replay→ready→live，原子挂接不留空窗。过期、未知、旧 instance 或不同过滤器游标在 HTTP 200 前返回 `409 event_cursor_expired`。
+
+实际发布 `stream.ready/runtime.updated/flow.updated/flow.gap/generation.changed`；operations 不可用时不制造 operation 事件。Generation 事件只来自已接受发布，不来自 reload 收件。事件仅含有界安全 ID/状态，不含包正文或原始配置。Flow/event 保留只在内存，不是耐久日志。
 
 ## 启用与鉴权
 

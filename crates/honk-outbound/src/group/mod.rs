@@ -35,6 +35,8 @@ use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 
 use state::UrlTestSelections;
 
+#[cfg(feature = "native-api")]
+pub use resolver::{NativeGroupMember, NativeGroupSelection};
 pub use score::{
     ScoreAttribution, ScoreCacheSnapshot, ScoreFeedback, ScoreOutcome, ScorePolicyState,
     ScoreReasonCounters, ScoreReasonGroupSnapshot, ScoreReporter, ScoreSelectionContext,

@@ -4,6 +4,141 @@
 
 use super::*;
 
+/// Exact direct-member identity; display tags are not unique node keys.
+#[cfg(feature = "native-api")]
+#[derive(Clone, Copy)]
+pub enum NativeGroupMember<'a> {
+    Node(&'a Node),
+    Group(&'a Group),
+}
+
+#[cfg(feature = "native-api")]
+pub struct NativeGroupSelection<'a> {
+    pub member: NativeGroupMember<'a>,
+    pub leaf: Option<&'a Node>,
+}
+
+#[cfg(feature = "native-api")]
+impl<'a> From<GroupMember<'a>> for NativeGroupMember<'a> {
+    fn from(member: GroupMember<'a>) -> Self {
+        match member {
+            GroupMember::Node(node) => Self::Node(node),
+            GroupMember::Group(group) => Self::Group(group),
+        }
+    }
+}
+
+#[cfg(feature = "native-api")]
+impl GroupManager {
+    /// Apply the same last-definition and cycle rules as the runtime graph.
+    pub fn native_effective_groups(groups: &[Group]) -> HashMap<String, Group> {
+        let mut groups = groups
+            .iter()
+            .map(|group| (group.name.clone(), group.clone()))
+            .collect();
+        break_group_cycles(&mut groups);
+        groups
+    }
+
+    pub fn native_group(&self, name: &str) -> Option<&Group> {
+        self.groups.get(name)
+    }
+
+    pub fn native_members(&self, name: &str) -> impl Iterator<Item = NativeGroupMember<'_>> {
+        self.groups
+            .get(name)
+            .into_iter()
+            .flat_map(|group| self.members(group))
+            .map(Into::into)
+    }
+
+    /// Preserve the production probe set while retaining direct member identity.
+    pub fn native_delay_test_members(&self, name: &str) -> Vec<(NativeGroupMember<'_>, Node)> {
+        let Some(group) = self.groups.get(name) else {
+            return Vec::new();
+        };
+        self.delay_test_members(name)
+            .into_iter()
+            .filter_map(|(tag, leaf)| {
+                let member = self.members(group).find(|member| match member {
+                    GroupMember::Node(node) => node.id == leaf.id && node.name == tag,
+                    GroupMember::Group(group) => group.name == tag,
+                })?;
+                Some((member.into(), leaf))
+            })
+            .collect()
+    }
+
+    /// Observe stable choices, without marking activity or advancing policy state.
+    pub fn native_selection(
+        &self,
+        name: &str,
+        network: SelectionNetwork,
+    ) -> Option<NativeGroupSelection<'_>> {
+        self.native_selection_inner(self.groups.get(name)?, network, 0)
+    }
+
+    fn native_selection_inner<'a>(
+        &'a self,
+        group: &'a Group,
+        network: SelectionNetwork,
+        depth: usize,
+    ) -> Option<NativeGroupSelection<'a>> {
+        if depth >= MAX_GROUP_DEPTH {
+            return None;
+        }
+        let member = match group.policy {
+            GroupPolicy::Selector => self.selector_member(group)?,
+            GroupPolicy::LoadBalance => return None,
+            GroupPolicy::Score => {
+                let context = ScoreSelectionContext::aggregate(
+                    network,
+                    match network {
+                        SelectionNetwork::Tcp => ProbeDomain::Tcp,
+                        SelectionNetwork::Udp => ProbeDomain::DataUdp,
+                    },
+                    IpVersion::V4,
+                );
+                let candidate = self.pick_candidate_for_target(
+                    group,
+                    &context,
+                    &mut Vec::new(),
+                    depth,
+                    SelectionEffects::Peek,
+                )?;
+                return Some(NativeGroupSelection {
+                    member: candidate.member().into(),
+                    leaf: Some(candidate.node),
+                });
+            }
+            GroupPolicy::URLTest | GroupPolicy::Fallback => {
+                let tag = if group.policy == GroupPolicy::URLTest {
+                    self.get_urltest_selection_for_network(&group.name, network)?
+                } else {
+                    self.get_fallback_selection_for_network(&group.name, network)?
+                };
+                let mut matches = self.members(group).filter(|member| member.tag() == tag);
+                let member = matches.next()?;
+                // These legacy caches retain tags, not NodeIds. Ambiguity is unknown.
+                if matches.next().is_some() {
+                    return None;
+                }
+                member
+            }
+        };
+        let leaf = match member {
+            GroupMember::Node(node) => Some(node),
+            GroupMember::Group(child) => self
+                .native_selection_inner(child, network, depth + 1)
+                .and_then(|selection| selection.leaf),
+        };
+        Some(NativeGroupSelection {
+            member: member.into(),
+            leaf,
+        })
+    }
+}
+
 impl GroupManager {
     /// Resolve a group to the single leaf node its policy selects.
     /// `visited`/`depth` thread the cycle/depth guards through nesting.

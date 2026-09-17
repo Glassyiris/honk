@@ -613,6 +613,7 @@ fn entry(id: &str, network: &str, source: &str, observed: Instant) -> Connection
         destination: "198.51.100.10:443".into(),
         proxy: "current-leaf-must-not-be-used".into(),
         routed_outbound: Some("routed-group".into()),
+        native_flow_id: None,
         rule: "private-legacy-rule".into(),
         rule_payload: "private-legacy-payload".into(),
         chains: vec!["private-legacy-chain".into()],
@@ -853,6 +854,8 @@ async fn shutdown_reclaims_an_authenticated_incomplete_body_and_state() {
     tokio::task::yield_now().await;
 }
 
+#[path = "native_api_test/observations.rs"]
+mod observations;
 #[path = "native_api_test/ui.rs"]
 mod ui;
 

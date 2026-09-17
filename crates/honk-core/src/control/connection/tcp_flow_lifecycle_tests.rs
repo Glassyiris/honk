@@ -49,6 +49,8 @@ fn tracked_entry(id: &str) -> ConnectionEntry {
         proxy: "direct".to_string(),
         #[cfg(feature = "native-api")]
         routed_outbound: None,
+        #[cfg(feature = "native-api")]
+        native_flow_id: None,
         rule: "Fallback".to_string(),
         rule_payload: String::new(),
         chains: vec!["direct".to_string()],

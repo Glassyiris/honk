@@ -228,6 +228,10 @@ impl ControlPlane {
                 if !matches!(&diagnostic_update, DiagnosticUpdate::Preserve) {
                     let _config = self.config.write().await;
                     self.diagnostics.write().buckets.apply(diagnostic_update);
+                    #[cfg(feature = "native-api")]
+                    if let Some(native) = &self.native {
+                        native.catalog.install(&new_config);
+                    }
                 }
                 info!("Configuration unchanged — retaining active runtime generation");
                 return Ok(true);
@@ -585,8 +589,15 @@ impl ControlPlane {
                 *config_guard = Arc::new(new_config);
                 {
                     let mut active_diagnostics = self.diagnostics.write();
+                    #[cfg(feature = "native-api")]
+                    let previous_generation = active_diagnostics.generation;
                     active_diagnostics.generation = generation.get();
                     active_diagnostics.buckets.apply(diagnostic_update);
+                    #[cfg(feature = "native-api")]
+                    if let Some(native) = &self.native {
+                        self.alive_set.invalidate_native_group_observations();
+                        native.committed(&config_guard, previous_generation, generation.get());
+                    }
                 }
                 if let Some(authorizations) = authorizations {
                     authorizations

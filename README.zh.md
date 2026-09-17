@@ -34,7 +34,7 @@ global {
 
 ## 可选原生观测 API
 
-以 `--features native-api` 构建并配置 `experimental.native_api`，可在 `127.0.0.1:9527` 独立读取 discovery、runtime 与用户态连接。除显式匿名 loopback 外均要求 bearer；可托管可信本地 UI 目录，不下载资产。配置仍由 `.dae` 管理，不提供配置写入，也不宣称完整内核透明观测。详见[原生设置](doc/zh/reference/experimental.md#native_api)与 [API 契约](doc/zh/reference/api.md#原生-api-m1)。
+以 `--features native-api` 构建并配置 `experimental.native_api`，可在 `127.0.0.1:9527` 独立读取 runtime/connections、有界记录流、节点/组健康观测及可续传 SSE。除显式匿名 loopback 外均要求 bearer；可托管可信本地 UI 目录，不下载资产。配置仍由 `.dae` 管理，组写入保持依赖门槛，不宣称完整内核透明观测。详见[原生设置](doc/zh/reference/experimental.md#native_api)与 [API 契约](doc/zh/reference/api.md#原生-api-m1)。
 
 ## VLESS UDP 与多路复用
 

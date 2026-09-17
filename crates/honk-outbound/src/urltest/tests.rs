@@ -688,7 +688,7 @@ async fn test_exchange_http1_reports_warm_round_trip() {
         .await
         .unwrap();
     assert!(
-        measured < Duration::from_millis(100),
+        measured.latency < Duration::from_millis(100),
         "warm round trip must exclude the stalled first response: {measured:?}"
     );
 }
@@ -720,7 +720,7 @@ async fn test_exchange_http1_reports_the_second_round_trip() {
         .await
         .unwrap();
     assert!(
-        measured >= Duration::from_millis(150),
+        measured.latency >= Duration::from_millis(150),
         "the sample is the second request: {measured:?}"
     );
 }
@@ -782,8 +782,14 @@ async fn test_exchange_http1_slow_second_request_falls_back() {
         .await
         .unwrap();
     assert!(
-        measured < Duration::from_millis(100),
+        measured.latency < Duration::from_millis(100),
         "timed-out measured request falls back to the warm sample: {measured:?}"
+    );
+    assert!(
+        SystemTime::now()
+            .duration_since(measured.observed_at)
+            .unwrap()
+            >= Duration::from_millis(90)
     );
 }
 

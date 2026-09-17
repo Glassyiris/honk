@@ -528,7 +528,7 @@ pub async fn quic_handshake_probe(
     server_name: &str,
     config: &ClientConfig,
     timeout: Duration,
-) -> anyhow::Result<Duration> {
+) -> anyhow::Result<crate::alive::ProbeMeasurement> {
     let endpoint = packet_transport_endpoint(transport, target)?;
 
     let start = Instant::now();
@@ -539,11 +539,14 @@ pub async fn quic_handshake_probe(
     let conn = tokio::time::timeout(timeout, connecting)
         .await
         .context("QUIC handshake timeout")??;
-    let elapsed = start.elapsed();
+    let measured = crate::alive::ProbeMeasurement {
+        latency: start.elapsed(),
+        observed_at: std::time::SystemTime::now(),
+    };
     conn.close(quinn::VarInt::from_u32(0), b"probe");
     drop(conn);
     endpoint.close(Duration::ZERO).await;
-    Ok(elapsed)
+    Ok(measured)
 }
 
 #[cfg(test)]

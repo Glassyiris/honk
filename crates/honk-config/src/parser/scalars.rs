@@ -573,6 +573,7 @@ pub(super) fn parse_experimental_section(
                     "allow_origins",
                     "allowed_hosts",
                     "ui",
+                    "record_flows",
                 ][..],
                 _ => {
                     return Err(scalar_error(
@@ -721,6 +722,11 @@ pub(super) fn parse_experimental_section(
                             "enabled",
                             "experimental.native_api.enabled",
                             &mut config.native_api.enabled,
+                        ),
+                        (
+                            "record_flows",
+                            "experimental.native_api.record_flows",
+                            &mut config.native_api.record_flows,
                         ),
                         (
                             "allow_anonymous_loopback",

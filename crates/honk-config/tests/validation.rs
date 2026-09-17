@@ -618,6 +618,7 @@ mod native_api {
             "secrett: PRIVATE",
             "enabled: maybe",
             "allow_anonymous_loopback: maybe",
+            "record_flows: maybe",
             "secret { value: PRIVATE }",
             "unknown { secret: PRIVATE }",
             "allowed_hosts: 'localhost', ''",

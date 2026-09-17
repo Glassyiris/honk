@@ -92,6 +92,7 @@ fn native_api_settings_require_restart() {
             serde_json::json!(["https://panel.example"]),
         ),
         ("ui", serde_json::json!("/srv/ui")),
+        ("record_flows", serde_json::json!(false)),
     ] {
         let mut replacement = current.clone();
         let mut native = serde_json::to_value(&replacement.experimental.native_api).unwrap();

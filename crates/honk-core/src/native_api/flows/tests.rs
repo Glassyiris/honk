@@ -1,0 +1,404 @@
+use super::*;
+
+fn store() -> Arc<FlowStore> {
+    let instance = Uuid::new_v4().to_string();
+    Arc::new(FlowStore::new(
+        instance.clone(),
+        Arc::new(EventHub::new(instance)),
+    ))
+}
+
+fn begin(store: &Arc<FlowStore>, network: &'static str) -> FlowGuard {
+    store.begin(
+        network,
+        "127.0.0.1:31000".parse().unwrap(),
+        "127.0.0.2:443".parse().unwrap(),
+    )
+}
+
+fn request_id() -> RequestId {
+    RequestId("flow-test".to_owned())
+}
+
+fn filters(network: &str, state: &str, full: bool, limit: usize) -> Filters {
+    Filters {
+        network: network.to_owned(),
+        state: state.to_owned(),
+        connection_id: None,
+        full,
+        limit,
+    }
+}
+
+fn error_code(error: ApiError, status: StatusCode, code: &str) {
+    assert_eq!(serde_json::to_value(&error).unwrap()["error"]["code"], code);
+    assert_eq!(error.into_response().status(), status);
+}
+
+fn dial_mode() -> Value {
+    json!({"configured": "ip", "effective_target": "ip", "domain": null,
+        "domain_source": null, "verification": "not_required", "reason": "original_destination"})
+}
+
+#[test]
+fn tuple_reincarnation_keeps_history_and_exact_connection_identity() {
+    let store = store();
+    let first = begin(&store, "tcp");
+    first.attach_connection("connection-old");
+    first.routed("original-group", None, "unknown");
+    first.selected(vec![
+        "original-group-id".to_owned(),
+        "original-node-id".to_owned(),
+    ]);
+    first.step("dial_mode", Some(7), dial_mode());
+    first.finish("closed", "relay_finished");
+    let second = begin(&store, "tcp");
+    second.attach_connection("connection-new");
+    second.routed("replacement-group", None, "unknown");
+    second.selected(vec![
+        "replacement-group-id".to_owned(),
+        "replacement-node-id".to_owned(),
+    ]);
+    assert_ne!(first.id(), second.id());
+    let evidence = store.connection_evidence(first.id()).unwrap();
+    assert_eq!(evidence.chain, ["original-group-id", "original-node-id"]);
+    let detail = store.get(first.id(), &request_id()).unwrap();
+    assert_eq!(detail["outbound"], "original-group");
+    assert_eq!(
+        detail["trace"]["steps"][1]["generation_id"],
+        format!("{}:7", store.instance_id)
+    );
+    let mut query = filters("all", "all", true, 100);
+    query.connection_id = Some("connection-old".to_owned());
+    let page = store.page(query, None, &request_id()).unwrap();
+    assert_eq!(page["flows"].as_array().unwrap().len(), 1);
+    assert_eq!(page["flows"][0]["id"], first.id());
+    assert_eq!(page["flows"][0]["input"]["src"], "127.0.0.1:31000");
+}
+
+#[test]
+fn guards_finalize_once_and_do_not_fabricate_kernel_connection_close() {
+    let store = store();
+    let flow = begin(&store, "udp");
+    assert!(flow.first_reply());
+    assert!(!flow.first_reply());
+    flow.finish("closed", "idle_after_reply");
+    let id = flow.id().to_owned();
+    let terminal = store.get(&id, &request_id()).unwrap();
+    flow.finish("failed", "late_error");
+    flow.routed("late-outbound", None, "unknown");
+    drop(flow);
+    assert_eq!(store.get(&id, &request_id()).unwrap(), terminal);
+    assert_eq!(
+        terminal["trace"]["steps"][1]["data"]["reply_received"],
+        true
+    );
+
+    let cancelled = begin(&store, "tcp");
+    let id = cancelled.id().to_owned();
+    drop(cancelled);
+    let detail = store.get(&id, &request_id()).unwrap();
+    assert_eq!(detail["state"], "failed");
+    assert_eq!(detail["trace"]["steps"][1]["data"]["reason"], "cancelled");
+
+    let handoff = begin(&store, "udp");
+    handoff.finish("unknown", "kernel_handoff");
+    let detail = store.get(handoff.id(), &request_id()).unwrap();
+    assert_eq!(detail["state"], "unknown");
+    assert!(detail["ended_at"].is_string());
+}
+
+#[test]
+fn pinned_pages_survive_mutation_and_bind_all_filters() {
+    let store = store();
+    let old = begin(&store, "tcp");
+    old.transition("active", "ready", "transport_ready", None);
+    let ignored = begin(&store, "udp");
+    ignored.transition("active", "ready", "transport_ready", None);
+    let recent = begin(&store, "tcp");
+    recent.transition("active", "ready", "transport_ready", None);
+    let query = filters("tcp", "active", true, 1);
+    let first = store.page(query.clone(), None, &request_id()).unwrap();
+    assert_eq!(first["flows"][0]["id"], recent.id());
+    let cursor = first["next_cursor"].as_str().unwrap();
+    old.finish("closed", "relay_finished");
+    let newcomer = begin(&store, "tcp");
+    newcomer.transition("active", "ready", "transport_ready", None);
+    let second = store
+        .page(query.clone(), Some(cursor), &request_id())
+        .unwrap();
+    assert_eq!(second["observed_at"], first["observed_at"]);
+    assert_eq!(second["flows"][0]["id"], old.id());
+    assert_eq!(second["flows"][0]["state"], "active");
+    assert!(second["next_cursor"].is_null());
+    for changed in [
+        filters("udp", "active", true, 1),
+        filters("tcp", "closed", true, 1),
+        filters("tcp", "active", false, 1),
+    ] {
+        error_code(
+            store
+                .page(changed, Some(cursor), &request_id())
+                .unwrap_err(),
+            StatusCode::GONE,
+            "snapshot_expired",
+        );
+    }
+    let other_instance = super::tests::store();
+    error_code(
+        other_instance
+            .page(query.clone(), Some(cursor), &request_id())
+            .unwrap_err(),
+        StatusCode::GONE,
+        "snapshot_expired",
+    );
+    store.inner.lock().snapshots[0].created = Instant::now() - SNAPSHOT_TTL;
+    error_code(
+        store.page(query, Some(cursor), &request_id()).unwrap_err(),
+        StatusCode::GONE,
+        "snapshot_expired",
+    );
+}
+
+#[test]
+fn snapshot_capacity_is_explicit_and_recording_disable_releases_every_owner() {
+    let store = store();
+    let first = begin(&store, "tcp");
+    let _second = begin(&store, "tcp");
+    let query = filters("all", "all", true, 1);
+    let mut cursor = String::new();
+    for _ in 0..MAX_SNAPSHOTS {
+        let page = store.page(query.clone(), None, &request_id()).unwrap();
+        cursor = page["next_cursor"].as_str().unwrap().to_owned();
+    }
+    error_code(
+        store.page(query.clone(), None, &request_id()).unwrap_err(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "temporarily_unavailable",
+    );
+    store.set_recording(false);
+    let inert = begin(&store, "tcp");
+    assert!(inert.id().is_empty());
+    assert!(!inert.first_reply());
+    first.finish("closed", "late_finish");
+    error_code(
+        store
+            .page(query.clone(), Some(&cursor), &request_id())
+            .unwrap_err(),
+        StatusCode::GONE,
+        "snapshot_expired",
+    );
+    let page = store.page(query, None, &request_id()).unwrap();
+    assert_eq!(page["flows"], json!([]));
+    assert_eq!(page["coverage"]["userspace_tcp"], "none");
+    let inner = store.inner.lock();
+    assert_eq!(inner.records.capacity(), 0);
+    assert_eq!(inner.snapshots.capacity(), 0);
+    assert_eq!(inner.tombstones.capacity(), 0);
+    assert_eq!(inner.record_bytes + inner.snapshot_bytes, 0);
+    drop(inner);
+    store.set_recording(true);
+    let restarted = begin(&store, "tcp");
+    assert_ne!(restarted.id(), first.id());
+    assert!(!restarted.id().is_empty());
+}
+
+#[test]
+fn retention_distinguishes_expired_unknown_and_active_records() {
+    let store = store();
+    let terminal = begin(&store, "tcp");
+    terminal.finish("failed", "dial_failed");
+    let active = begin(&store, "udp");
+    let future = Instant::now() + TERMINAL_TTL;
+    store.prune(&mut store.inner.lock(), future);
+    error_code(
+        store.get(terminal.id(), &request_id()).unwrap_err(),
+        StatusCode::GONE,
+        "flow_expired",
+    );
+    error_code(
+        store.get("not-a-recorded-id", &request_id()).unwrap_err(),
+        StatusCode::NOT_FOUND,
+        "resource_not_found",
+    );
+    assert_eq!(
+        store.get(active.id(), &request_id()).unwrap()["state"],
+        "observed"
+    );
+    store.prune(&mut store.inner.lock(), future + TERMINAL_TTL);
+    error_code(
+        store.get(terminal.id(), &request_id()).unwrap_err(),
+        StatusCode::NOT_FOUND,
+        "resource_not_found",
+    );
+}
+
+#[test]
+fn trace_bounds_keep_terminal_state_and_explicit_loss_without_private_errors() {
+    let store = store();
+    let flow = begin(&store, "tcp");
+    for _ in 0..MAX_STEPS + 10 {
+        flow.step("dial_mode", Some(1), dial_mode());
+    }
+    let mut unsafe_data = dial_mode();
+    unsafe_data["domain"] = json!("https://operator:credential@example.test");
+    flow.step("dial_mode", Some(1), unsafe_data);
+    flow.finish("failed", "dial_failed");
+    let detail = store.get(flow.id(), &request_id()).unwrap();
+    assert_eq!(detail["state"], "failed");
+    assert!(detail["ended_at"].is_string());
+    assert_eq!(
+        detail["trace"]["steps"].as_array().unwrap().len(),
+        MAX_STEPS
+    );
+    assert_eq!(
+        detail["trace"]["missing"],
+        json!(["not_instrumented", "buffer_overflow", "redacted"])
+    );
+    assert!(!detail.to_string().contains("credential"));
+    assert!(detail["input"]["process_path"].is_null());
+    assert!(detail["input"]["domain_rule_ids"].is_null());
+}
+
+#[test]
+fn unsafe_error_text_is_redacted_without_losing_the_observed_outcome() {
+    let store = store();
+    let flow = begin(&store, "udp");
+    flow.step(
+        "connection",
+        None,
+        json!({
+            "state": "dialing", "reason": "transport_failed", "milestone": "unknown",
+            "attempt_id": null, "reply_received": null,
+            "error": "dial https://operator:credential@example.test/private failed"
+        }),
+    );
+    flow.step("route", Some(1), json!({"outbound": "incomplete"}));
+    let detail = store.get(flow.id(), &request_id()).unwrap();
+    assert_eq!(detail["trace"]["steps"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        detail["trace"]["steps"][1]["data"]["reason"],
+        "transport_failed"
+    );
+    assert!(detail["trace"]["steps"][1]["data"]["error"].is_null());
+    assert_eq!(
+        detail["trace"]["missing"],
+        json!(["not_instrumented", "redacted"])
+    );
+    assert!(!detail.to_string().contains("credential"));
+}
+
+#[test]
+fn fixed_error_codes_and_safe_addresses_do_not_invent_input_provenance() {
+    let store = store();
+    let flow = store.begin(
+        "udp",
+        "[::1]:31000".parse().unwrap(),
+        "[2001:db8::1]:443".parse().unwrap(),
+    );
+    flow.update_input(None, None, Some("client"), Some(42), None, Some(0), Some(0));
+    let detail = store.get(flow.id(), &request_id()).unwrap();
+    assert_eq!(detail["trace"]["steps"].as_array().unwrap().len(), 1);
+    assert_eq!(detail["input"]["pid"], 42);
+    flow.update_input(
+        Some("secret.example.test"),
+        Some("quic_sni"),
+        Some("client"),
+        Some(42),
+        None,
+        Some(0),
+        Some(0),
+    );
+    flow.step(
+        "connection",
+        None,
+        json!({
+            "state": "dialing", "reason": "transport_failed", "milestone": "unknown",
+            "attempt_id": "attempt-1", "reply_received": null, "error": "udp_prepare_failed"
+        }),
+    );
+    let detail = store.get(flow.id(), &request_id()).unwrap();
+    assert_eq!(detail["input"]["domain"], "secret.example.test");
+    assert_eq!(detail["trace"]["steps"][1]["data"]["source"], "sniffer");
+    assert_eq!(
+        detail["trace"]["steps"][1]["data"]["values"]["src"],
+        "[::1]:31000"
+    );
+    assert_eq!(
+        detail["trace"]["steps"][1]["data"]["values"]["dst"],
+        "[2001:db8::1]:443"
+    );
+    assert_eq!(
+        detail["trace"]["steps"][2]["data"]["error"],
+        "udp_prepare_failed"
+    );
+    assert_eq!(detail["trace"]["missing"], json!(["not_instrumented"]));
+}
+
+#[test]
+fn optional_display_redaction_preserves_attempt_transitions_and_selection_ids() {
+    let store = store();
+    let flow = begin(&store, "tcp");
+    for status in ["started", "succeeded"] {
+        flow.step("outbound", Some(1), json!({
+            "attempt_id": "attempt-1", "parent_attempt_id": null, "kind": "leaf",
+            "evaluation_id": "evaluation-1", "routing_source": "evaluation",
+            "routed_outbound": "Group/Proxy", "effective_outbound": "Group/Proxy",
+            "mode_override": "none", "selection_path": [{
+                "group_id": "group-1", "member_id": "node-1", "member_name": "HK/Trojan",
+                "policy": "urltest", "reason": "selected", "selection": null
+            }], "leaf_node_id": "node-1", "leaf_node_name": "HK/Trojan", "target": "127.0.0.2:443",
+            "target_kind": "ip", "dial_ip": "127.0.0.2", "server_addr": null,
+            "resolution_location": "original_ip", "status": status, "error": null
+        }));
+    }
+    let detail = store.get(flow.id(), &request_id()).unwrap();
+    assert_eq!(detail["trace"]["steps"].as_array().unwrap().len(), 3);
+    for (index, status) in [(1, "started"), (2, "succeeded")] {
+        let data = &detail["trace"]["steps"][index]["data"];
+        assert_eq!(data["attempt_id"], "attempt-1");
+        assert_eq!(data["status"], status);
+        assert_eq!(data["leaf_node_id"], "node-1");
+        assert_eq!(data["selection_path"][0]["group_id"], "group-1");
+        assert_eq!(data["selection_path"][0]["member_id"], "node-1");
+        assert!(data["selection_path"][0]["member_name"].is_null());
+        assert!(data["routed_outbound"].is_null());
+    }
+    assert_eq!(
+        detail["trace"]["missing"],
+        json!(["not_instrumented", "redacted"])
+    );
+}
+
+#[test]
+fn recorder_and_snapshots_share_the_byte_budget_and_tombstones_are_bounded() {
+    let store = store();
+    let original = begin(&store, "tcp");
+    let original_id = original.id().to_owned();
+    for _ in 0..MAX_RECORDS * 2 {
+        let flow = begin(&store, "tcp");
+        flow.step("dial_mode", Some(1), dial_mode());
+        flow.finish("closed", "relay_finished");
+    }
+    let inner = store.inner.lock();
+    assert!(inner.bytes() <= MAX_BYTES);
+    assert!(inner.records.len() <= MAX_RECORDS);
+    assert!(inner.tombstones.len() <= MAX_RECORDS);
+    assert!(inner.dropped > 0);
+    assert!(
+        inner
+            .records
+            .iter()
+            .all(|record| record.id() != original_id)
+    );
+    drop(inner);
+    let query = filters("all", "all", true, 1);
+    match store.page(query, None, &request_id()) {
+        Ok(_) => assert!(store.inner.lock().bytes() <= MAX_BYTES),
+        Err(error) => error_code(
+            error,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "temporarily_unavailable",
+        ),
+    }
+}

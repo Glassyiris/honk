@@ -6,6 +6,8 @@ use std::collections::{HashMap, VecDeque};
 use std::future::{Future, poll_fn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 mod cross_source;
+#[cfg(feature = "native-api")]
+mod native_flow_tests;
 mod regressions;
 
 const STATUS_NEW: u8 = 1;

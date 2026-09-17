@@ -96,6 +96,10 @@ pub struct UdpEndpoint {
     score_reporter: Mutex<Option<ScoreReporter>>,
     health_family: honk_outbound::alive::IpVersion,
     tracker_id: Mutex<Option<String>>,
+    #[cfg(feature = "native-api")]
+    native_flow: Option<Arc<crate::native_api::flows::FlowGuard>>,
+    #[cfg(feature = "native-api")]
+    native_pool: std::sync::Weak<UdpEndpointPool>,
 }
 
 impl UdpEndpoint {
@@ -196,7 +200,59 @@ impl UdpEndpoint {
             tracker_id: Mutex::new(None),
             score_reporter: Mutex::new(score_reporter),
             health_family,
+            #[cfg(feature = "native-api")]
+            native_flow: None,
+            #[cfg(feature = "native-api")]
+            native_pool: std::sync::Weak::new(),
         }
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn set_native_flow(
+        &mut self,
+        flow: Option<Arc<crate::native_api::flows::FlowGuard>>,
+        pool: &Arc<UdpEndpointPool>,
+    ) {
+        self.native_flow = flow;
+        self.native_pool = Arc::downgrade(pool);
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn native_flow(
+        &self,
+    ) -> Option<&Arc<crate::native_api::flows::FlowGuard>> {
+        self.native_flow.as_ref()
+    }
+
+    #[cfg(feature = "native-api")]
+    fn finish_native(&self, state: &'static str, reason: &'static str) {
+        if let Some(flow) = &self.native_flow {
+            let shutdown = self
+                .native_pool
+                .upgrade()
+                .is_some_and(|pool| pool.terminal.load(Ordering::Acquire));
+            if shutdown {
+                flow.finish("closed", "shutdown");
+            } else {
+                flow.finish(state, reason);
+            }
+        }
+    }
+
+    #[cfg(all(feature = "native-api", feature = "rprx"))]
+    fn finish_native_source(&self, retirement: SourceRetirement) {
+        let (state, reason) = match retirement {
+            SourceRetirement::Neutral(ScoreOutcome::Timeout) if self.has_reply() => {
+                ("closed", "reply_idle")
+            }
+            SourceRetirement::Neutral(ScoreOutcome::Timeout) => ("failed", "timeout_before_reply"),
+            SourceRetirement::Neutral(_) => ("closed", "intentional_retirement"),
+            SourceRetirement::Failure(
+                ScoreOutcome::Timeout | ScoreOutcome::Io(io::ErrorKind::TimedOut),
+            ) => ("failed", "transport_timeout"),
+            SourceRetirement::Failure(_) => ("failed", "transport_error"),
+        };
+        self.finish_native(state, reason);
     }
 
     /// Bind the clash-API tracker entry to this endpoint: the entry shares
@@ -271,6 +327,12 @@ impl UdpEndpoint {
 
     pub fn mark_reply(&self) {
         self.has_reply.store(true, Ordering::Relaxed);
+        #[cfg(feature = "native-api")]
+        if let Some(flow) = &self.native_flow
+            && flow.first_reply()
+        {
+            flow.transition("active", "reply_received", "first_reply", Some(true));
+        }
         self.refresh();
         self.reply_epoch.fetch_add(1, Ordering::Release);
         self.reply_notify.notify_waiters();

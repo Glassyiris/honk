@@ -49,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
         let total = started.elapsed();
         if round >= 5 {
-            println!("{}\t{}", elapsed.as_nanos(), total.as_nanos());
+            println!("{}\t{}", elapsed.latency.as_nanos(), total.as_nanos());
         }
     }
     Ok(())

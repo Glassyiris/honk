@@ -20,7 +20,7 @@ impl AliveDialerSet {
 }
 
 impl AliveDialerSet {
-    fn same_registration(
+    pub(super) fn same_registration(
         current: Option<&Arc<RegisteredNode>>,
         captured: Option<&Arc<RegisteredNode>>,
     ) -> bool {
@@ -199,7 +199,11 @@ impl AliveDialerSet {
 
             let mut family_ok = false;
             for a in family_addrs {
-                match prober.probe_http(node_name, *a, &check_url, timeout).await {
+                let outcome = prober.probe_http(node_id, *a, &check_url, timeout).await;
+                if let Some(observation) = outcome.observation {
+                    self.record_native_observation(node_id, Some(registered), observation);
+                }
+                match outcome.result {
                     HttpProbeResult::WarmSuccess(elapsed) => {
                         tracing::debug!(
                             "HTTP health check succeeded for node '{}' via {} ({}ms)",
@@ -267,21 +271,26 @@ impl AliveDialerSet {
     /// path: try up to 3 resolved addresses (any family),
     /// first success wins. State is tracked per (tag, url) and never
     /// touches the global six domains.
-    pub async fn probe_node_with_url(
+    pub(super) async fn probe_node_with_url(
         &self,
         tag: &str,
-        leaf: &str,
+        leaf: Uuid,
         url: &str,
         timeout: Duration,
+        native: Option<(NativeGroupProbeContext, Uuid)>,
     ) -> bool {
         // direct/block exemption, same rationale as probe_node. The
         // vacuous success still advances the (tag, url) liveness machine:
         // the tag may carry failures earned by a previous non-builtin leaf,
         // and leaving them would filter this member forever.
-        if matches!(leaf, "direct" | "block") {
+        if matches!(
+            leaf,
+            honk_config::config::DIRECT_NODE_ID | honk_config::config::BLOCK_NODE_ID
+        ) {
             self.mark_url_probe_succeeded(tag, url);
             return true;
         }
+        let registration = self.registered.read().get(&leaf).cloned();
         let prober_opt = self.http_prober.read().clone();
         let Some(ref prober) = prober_opt else {
             return false;
@@ -305,7 +314,17 @@ impl AliveDialerSet {
 
         let mut any_ok = false;
         for a in addrs.into_iter().take(3) {
-            match prober.probe_http(leaf, a, url, timeout).await {
+            let outcome = prober.probe_http(leaf, a, url, timeout).await;
+            if let (Some(observation), Some((context, epoch))) = (outcome.observation, native) {
+                self.record_native_group_observation(
+                    leaf,
+                    registration.as_ref(),
+                    context,
+                    epoch,
+                    observation,
+                );
+            }
+            match outcome.result {
                 HttpProbeResult::WarmSuccess(elapsed) => {
                     tracing::debug!(
                         "HTTP health check succeeded for member '{}' (leaf '{}') via {} ({}ms, url={})",
@@ -443,6 +462,17 @@ impl AliveDialerSet {
             )
             .await;
             let elapsed = start.elapsed();
+            self.record_native_observation(
+                node_id,
+                registration,
+                NativeHealthObservation::probe(
+                    ProbeDomain::Tcp,
+                    HealthMeasurement::TcpConnect,
+                    ipver,
+                    matches!(&result, Ok(Ok(_))).then_some(elapsed),
+                    std::time::SystemTime::now(),
+                ),
+            );
 
             match result {
                 Ok(Ok(_stream)) => {
@@ -566,7 +596,10 @@ impl AliveDialerSet {
             .map(|node| node.name.clone())
             .unwrap_or_else(|| node_id.to_string());
         const IPVERS: [IpVersion; 2] = [IpVersion::V4, IpVersion::V6];
-        let outcome = prober.probe_udp(&node_name, timeout).await;
+        let outcome = prober.probe_udp(node_id, timeout).await;
+        for observation in outcome.observations.into_iter().flatten() {
+            self.record_native_observation(node_id, registration.as_ref(), observation);
+        }
         let measured = |result: Option<anyhow::Result<Duration>>| {
             result.filter(|result| {
                 !result
@@ -799,6 +832,7 @@ impl AliveDialerSet {
         // member the probe dials its CURRENT pick, and the result is
         // recorded under the sub-group's tag (sing-box RealTag semantics),
         // so nested groups rank correctly even as sub-picks change.
+        let native_epoch = self.native_group_epoch();
         for (group, url) in self.group_check_urls() {
             if self.is_urltest_group_idle(&group) {
                 tracing::trace!(
@@ -807,8 +841,8 @@ impl AliveDialerSet {
                 );
                 continue;
             }
-            for (tag, leaf) in self.url_members_for(&group) {
-                if !self.should_probe_url(&tag, &url) {
+            for member in self.url_members_for(&group) {
+                if !self.should_probe_url(&member.tag, &url) {
                     continue;
                 }
                 let this = self.clone();
@@ -816,7 +850,14 @@ impl AliveDialerSet {
                 let permit = semaphore.clone();
                 join_set.spawn(async move {
                     let _p = permit.acquire().await;
-                    this.probe_node_with_url(&tag, &leaf, &url, timeout).await;
+                    this.probe_node_with_url(
+                        &member.tag,
+                        member.leaf,
+                        &url,
+                        timeout,
+                        member.native.zip(native_epoch),
+                    )
+                    .await;
                 });
             }
         }

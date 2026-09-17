@@ -1,5 +1,6 @@
 use super::*;
 use anyhow::Context as _;
+use honk_outbound::alive::{HealthMeasurement, NativeHealthObservation, ProbeMeasurement};
 use honk_outbound::group::{
     ScoreFeedback, ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreTarget,
     SelectionNetwork,
@@ -117,14 +118,14 @@ impl ProxyHttpProber {
         }
     }
 
-    /// Find a node by name in the current config.
-    fn find_node(&self, node_name: &str) -> Option<Node> {
+    /// Find the exact admitted node; display names need not be unique.
+    fn find_node(&self, node_id: uuid::Uuid) -> Option<Node> {
         self.config
             .try_read()
             .ok()?
             .nodes
             .iter()
-            .find(|n| n.name == node_name)
+            .find(|n| n.id == node_id)
             .cloned()
     }
 }
@@ -132,15 +133,14 @@ impl ProxyHttpProber {
 impl honk_outbound::alive::HttpProber for ProxyHttpProber {
     fn probe_http(
         &self,
-        node_name: &str,
+        node_id: uuid::Uuid,
         addr: SocketAddr,
         url: &str,
         timeout: Duration,
     ) -> std::pin::Pin<
-        Box<dyn Future<Output = honk_outbound::alive::HttpProbeResult> + Send + 'static>,
+        Box<dyn Future<Output = honk_outbound::alive::HttpProbeOutcome> + Send + 'static>,
     > {
-        let node = self.find_node(node_name);
-        let node_name = node_name.to_string();
+        let node = self.find_node(node_id);
         let registry = self.proxy_registry.clone();
         let generation = self.runtime_registry.read().clone();
         let check_url = url.to_string();
@@ -150,23 +150,26 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
 
         Box::pin(async move {
             let Some(node) = node else {
-                return honk_outbound::alive::HttpProbeResult::SetupFailure(format!(
-                    "node '{node_name}' not found"
-                ));
+                return honk_outbound::alive::HttpProbeResult::SetupFailure(
+                    "node not found".into(),
+                )
+                .into();
             };
             let protocol = node.protocol();
             let Some(entry) = registry.find(protocol) else {
                 return honk_outbound::alive::HttpProbeResult::SetupFailure(format!(
                     "no handler for protocol {:?}",
                     protocol
-                ));
+                ))
+                .into();
             };
             let connect_timeout = match config.try_read() {
                 Ok(config) => Duration::from_millis(config.global.connect_timeout_ms),
                 Err(_) => {
                     return honk_outbound::alive::HttpProbeResult::SetupFailure(
                         "config lock busy".to_string(),
-                    );
+                    )
+                    .into();
                 }
             };
 
@@ -178,7 +181,8 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 Err(error) => {
                     return honk_outbound::alive::HttpProbeResult::SetupFailure(format!(
                         "invalid HTTP probe request: {error:#}"
-                    ));
+                    ))
+                    .into();
                 }
             };
             let host = request
@@ -201,7 +205,8 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 Err(_) => {
                     return honk_outbound::alive::HttpProbeResult::SetupFailure(
                         "invalid node for health probe".into(),
-                    );
+                    )
+                    .into();
                 }
             };
             let warm_feedback = if runtime
@@ -231,11 +236,12 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
             {
                 close_ephemeral(ephemeral).await;
                 if let Some(rejection) = honk_outbound::proxy::packet_rejection(&error) {
-                    return honk_outbound::alive::HttpProbeResult::LocalRefusal(rejection);
+                    return honk_outbound::alive::HttpProbeResult::LocalRefusal(rejection).into();
                 }
                 return honk_outbound::alive::HttpProbeResult::SetupFailure(format!(
                     "warm failed: {error:#}"
-                ));
+                ))
+                .into();
             }
 
             let feedback =
@@ -252,15 +258,37 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                     feedback,
                 ))
                 .await;
+            let observation = if result
+                .as_ref()
+                .is_err_and(honk_outbound::proxy::is_packet_rejection)
+            {
+                None
+            } else {
+                Some(honk_outbound::alive::NativeHealthObservation::probe(
+                    ProbeDomain::Tcp,
+                    honk_outbound::alive::HealthMeasurement::HttpHeaders,
+                    target_family(addr),
+                    result.as_ref().ok().map(|sample| sample.latency),
+                    result.as_ref().map_or_else(
+                        |_| std::time::SystemTime::now(),
+                        |sample| sample.observed_at,
+                    ),
+                ))
+            };
             close_ephemeral(ephemeral).await;
-            match result {
-                Ok(elapsed) => honk_outbound::alive::HttpProbeResult::WarmSuccess(elapsed),
+            let result = match result {
+                Ok(sample) => honk_outbound::alive::HttpProbeResult::WarmSuccess(sample.latency),
                 Err(error) => {
                     if let Some(rejection) = honk_outbound::proxy::packet_rejection(&error) {
-                        return honk_outbound::alive::HttpProbeResult::LocalRefusal(rejection);
+                        return honk_outbound::alive::HttpProbeResult::LocalRefusal(rejection)
+                            .into();
                     }
                     honk_outbound::alive::HttpProbeResult::ExchangeFailure(format!("{error:#}"))
                 }
+            };
+            honk_outbound::alive::HttpProbeOutcome {
+                result,
+                observation,
             }
         })
     }
@@ -401,14 +429,14 @@ impl ProxyUdpProber {
         }
     }
 
-    /// Find a node by name in the current config.
-    fn find_node(&self, node_name: &str) -> Option<Node> {
+    /// Find the exact admitted node; display names need not be unique.
+    fn find_node(&self, node_id: uuid::Uuid) -> Option<Node> {
         self.config
             .try_read()
             .ok()?
             .nodes
             .iter()
-            .find(|n| n.name == node_name)
+            .find(|n| n.id == node_id)
             .cloned()
     }
 }
@@ -416,7 +444,7 @@ impl ProxyUdpProber {
 impl honk_outbound::alive::UdpProber for ProxyUdpProber {
     fn probe_udp(
         &self,
-        node_name: &str,
+        node_id: uuid::Uuid,
         timeout: Duration,
     ) -> std::pin::Pin<
         Box<
@@ -425,8 +453,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                 + 'static,
         >,
     > {
-        let node = self.find_node(node_name);
-        let node_name_owned = node_name.to_string();
+        let node = self.find_node(node_id);
         let registry = self.proxy_registry.clone();
         let generation = self.runtime_registry.read().clone();
         let config = self.config.clone();
@@ -438,8 +465,9 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
         Box::pin(async move {
             let Some(node) = node else {
                 return honk_outbound::alive::UdpProbeOutcome {
-                    dns: Some(Err(anyhow::anyhow!("node '{}' not found", node_name_owned))),
+                    dns: Some(Err(anyhow::anyhow!("node not found"))),
                     data_path: None,
+                    observations: [None, None],
                 };
             };
             let udp_capable =
@@ -455,11 +483,13 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             let failed = |error: String| honk_outbound::alive::UdpProbeOutcome {
                 dns: dns_allowed.then(|| Err(anyhow::Error::msg(error.clone()))),
                 data_path: (!dns_allowed && data_allowed).then_some(Err(anyhow::Error::msg(error))),
+                observations: [None, None],
             };
             if !dns_allowed && !data_allowed {
                 return honk_outbound::alive::UdpProbeOutcome {
                     dns: None,
                     data_path: None,
+                    observations: [None, None],
                 };
             }
             let protocol = node.protocol();
@@ -498,6 +528,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             } else {
                 None
             };
+            let mut dns_observation = None;
             let dns = if let Some((dns_target, dns_identity)) = dns_target.filter(|(target, _)| {
                 tokio::time::Instant::now() < dns_deadline
                     && honk_outbound::descriptor::udp_target_allowed(&node, target.port())
@@ -514,6 +545,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                     },
                 );
                 let start = std::time::Instant::now();
+                let mut measurement = HealthMeasurement::Mixed;
                 let attempt = async {
                     let transport = generation
                         .scope_dials(packet.dial_udp_transport_runtime(
@@ -524,12 +556,25 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                         ))
                         .await?;
                     probe_setup(&reporter);
-                    udp_probe_exchange(&transport, &reporter, timeout).await?;
+                    measurement = HealthMeasurement::DnsRoundTrip;
+                    let elapsed = udp_probe_exchange(&transport, &reporter, timeout).await?;
                     drop(transport);
-                    Ok::<(), anyhow::Error>(())
+                    Ok::<ProbeMeasurement, anyhow::Error>(elapsed)
                 };
-                Some(match tokio::time::timeout_at(dns_deadline, attempt).await {
-                    Ok(Ok(())) => {
+                let result = tokio::time::timeout_at(dns_deadline, attempt).await;
+                if !matches!(&result, Ok(Err(error)) if honk_outbound::proxy::is_packet_rejection(error))
+                {
+                    let sample = result.as_ref().ok().and_then(|result| result.as_ref().ok());
+                    dns_observation = Some(NativeHealthObservation::probe(
+                        ProbeDomain::DnsUdp,
+                        measurement,
+                        target_family(*dns_target),
+                        sample.map(|sample| sample.latency),
+                        sample.map_or_else(std::time::SystemTime::now, |sample| sample.observed_at),
+                    ));
+                }
+                Some(match result {
+                    Ok(Ok(_)) => {
                         probe_finish(&reporter, ScoreOutcome::Success);
                         Ok(start.elapsed())
                     }
@@ -546,6 +591,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                 None
             };
             let mut data_attempted = false;
+            let mut data_observation = None;
             let data_path = match quic_score_target.as_ref() {
                 Some(target) if data_allowed => {
                     let deadline = tokio::time::Instant::now() + timeout;
@@ -561,6 +607,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                                 &group_manager,
                                 connect_timeout,
                                 deadline.saturating_duration_since(tokio::time::Instant::now()),
+                                &mut data_observation,
                             )
                             .await
                         }
@@ -574,7 +621,11 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                 stats.mark_warm(node.id, crate::stats::WarmReason::Health);
             }
             close_ephemeral(ephemeral).await;
-            honk_outbound::alive::UdpProbeOutcome { dns, data_path }
+            honk_outbound::alive::UdpProbeOutcome {
+                dns,
+                data_path,
+                observations: [dns_observation, data_observation],
+            }
         })
     }
 }
@@ -584,8 +635,9 @@ async fn udp_probe_exchange(
     transport: &Arc<dyn honk_outbound::proxy::PacketTransport>,
     reporter: &ProbeReporter,
     timeout: Duration,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ProbeMeasurement> {
     let query = build_dns_probe_query();
+    let start = std::time::Instant::now();
     transport
         .send_packet(&query)
         .await
@@ -602,7 +654,10 @@ async fn udp_probe_exchange(
         n >= 12 && buf[0] == query[0] && buf[1] == query[1] && buf[2] & 0x80 != 0,
         "malformed DNS probe response"
     );
-    Ok(())
+    Ok(ProbeMeasurement {
+        latency: start.elapsed(),
+        observed_at: std::time::SystemTime::now(),
+    })
 }
 
 pub(super) fn quic_probe_context(target: &QuicScoreTarget) -> ScoreSelectionContext {
@@ -626,6 +681,7 @@ async fn score_quic_probe(
     group_manager: &SharedGroupManager,
     connect_timeout: Duration,
     timeout: Duration,
+    observation: &mut Option<NativeHealthObservation>,
 ) -> Option<anyhow::Result<Duration>> {
     if !honk_outbound::descriptor::udp_target_allowed(node, target.addr.port()) {
         return None;
@@ -638,6 +694,7 @@ async fn score_quic_probe(
         ScoreTarget::Socket(_) => None,
     };
     let start = std::time::Instant::now();
+    let mut measurement = HealthMeasurement::Mixed;
     let attempt = async {
         let transport = generation
             .scope_dials(packet.dial_udp_transport_runtime(
@@ -648,6 +705,7 @@ async fn score_quic_probe(
             ))
             .await?;
         probe_setup(&reporter);
+        measurement = HealthMeasurement::QuicHandshake;
         honk_outbound::quic::quic_handshake_probe(
             transport,
             target.addr,
@@ -657,7 +715,18 @@ async fn score_quic_probe(
         )
         .await
     };
-    Some(match tokio::time::timeout(timeout, attempt).await {
+    let result = tokio::time::timeout(timeout, attempt).await;
+    if !matches!(&result, Ok(Err(error)) if honk_outbound::proxy::is_packet_rejection(error)) {
+        let sample = result.as_ref().ok().and_then(|result| result.as_ref().ok());
+        *observation = Some(NativeHealthObservation::probe(
+            ProbeDomain::DataUdp,
+            measurement,
+            target_family(target.addr),
+            sample.map(|sample| sample.latency),
+            sample.map_or_else(std::time::SystemTime::now, |sample| sample.observed_at),
+        ));
+    }
+    Some(match result {
         Ok(Ok(_)) => {
             probe_first_response(&reporter);
             // The handshake probe exposes no wire counters. Record only the

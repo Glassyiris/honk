@@ -3,7 +3,9 @@ use super::support::{
 };
 use crate::control::{ControlPlane, drain::DrainTracker, probers::UdpDnsProbeTarget};
 use honk_config::{Config, node::Node, parser::parse_dae_config, types::NodeProtocol};
-use honk_outbound::alive::{HttpProbeResult, HttpProber, IpVersion, ProbeDomain, UdpProber};
+use honk_outbound::alive::{
+    HttpProbeOutcome, HttpProbeResult, HttpProber, IpVersion, ProbeDomain, UdpProber,
+};
 use honk_outbound::proxy::{ProtocolEntry, ProxyRegistry, ProxyStream, TcpOutbound};
 use parking_lot::Mutex;
 use std::{
@@ -41,13 +43,13 @@ struct PeriodProbe(tokio::sync::mpsc::UnboundedSender<tokio::time::Instant>);
 impl HttpProber for PeriodProbe {
     fn probe_http(
         &self,
-        _: &str,
+        _: uuid::Uuid,
         _: SocketAddr,
         _: &str,
         _: Duration,
-    ) -> Pin<Box<dyn Future<Output = HttpProbeResult> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = HttpProbeOutcome> + Send + 'static>> {
         let _ = self.0.send(tokio::time::Instant::now());
-        Box::pin(async { HttpProbeResult::WarmSuccess(Duration::from_millis(1)) })
+        Box::pin(async { HttpProbeResult::WarmSuccess(Duration::from_millis(1)).into() })
     }
 }
 
@@ -297,7 +299,7 @@ async fn c28_udp_reload_preserves_the_configured_probe_target() {
         let accepted = cp
             .apply_runtime_config(candidate.clone(), Default::default(), &DrainTracker::new())
             .await;
-        let outcome = UdpProber::probe_udp(&prober, &node.name, Duration::from_secs(1)).await;
+        let outcome = UdpProber::probe_udp(&prober, node.id, Duration::from_secs(1)).await;
         assert!(matches!(outcome.dns, Some(Ok(_))), "{outcome:?}");
         assert_eq!(
             *capture.lock(),
@@ -491,9 +493,7 @@ async fn udp_dns_resolution_and_transport_share_one_deadline() {
         },
     );
     let start = tokio::time::Instant::now();
-    let outcome = prober
-        .probe_udp(&node.name, Duration::from_millis(50))
-        .await;
+    let outcome = prober.probe_udp(node.id, Duration::from_millis(50)).await;
     assert!(matches!(outcome.dns, Some(Err(_))), "{outcome:?}");
     assert!(outcome.data_path.is_none());
     assert!(

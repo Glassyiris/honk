@@ -7,6 +7,16 @@ use crate::control::udp_endpoint::{UdpEndpoint, UdpInitLease};
 use crate::control::*;
 use crate::group::{SelectionNetwork, SelectionPlanMode};
 
+#[cfg(feature = "native-api")]
+fn native_udp_target_kind(node: &Node, target_is_domain: bool) -> &'static str {
+    match node.protocol() {
+        honk_config::types::NodeProtocol::Direct => "ip",
+        honk_config::types::NodeProtocol::Block => "none",
+        _ if target_is_domain => "domain",
+        _ => "ip",
+    }
+}
+
 enum PreparedEndpointTransport {
     Flow(honk_outbound::proxy::PreparedUdpTransport),
     #[cfg(feature = "rprx")]
@@ -53,19 +63,38 @@ impl ControlPlaneHandle {
         if lease.decision_token() != 0 {
             anyhow::bail!("staged UDP lease requires the ebpf feature");
         }
+        #[cfg(feature = "native-api")]
+        let mut native_flow = self.native.as_ref().and_then(|native| {
+            let flow = native
+                .flows
+                .begin("udp", lease.client_addr(), lease.original_dst());
+            (!flow.id().is_empty()).then(|| Arc::new(flow))
+        });
         let cancellation = lease.wait_cancellation();
         tokio::select! {
             _ = cancellation => {
+                #[cfg(feature = "native-api")]
+                if let Some(flow) = &native_flow {
+                    flow.finish("failed", "initializer_cancelled");
+                }
                 #[cfg(feature = "ebpf")]
                 if let Some((verdicts, identity)) = &pending_cleanup {
                     verdicts.cancel(*identity).await?;
                 }
                 Ok(())
             }
-            result = self.initialize_udp_connection(lease) => {
+            result = self.initialize_udp_connection(
+                lease,
+                #[cfg(feature = "native-api")]
+                &mut native_flow,
+            ) => {
                 let Err(error) = result else {
                     return Ok(());
                 };
+                #[cfg(feature = "native-api")]
+                if let Some(flow) = &native_flow {
+                    flow.finish("failed", "setup_failed");
+                }
                 #[cfg(feature = "ebpf")]
                 if let Some((verdicts, identity)) = &pending_cleanup
                     && let Err(cancel_error) = verdicts.cancel(*identity).await
@@ -79,7 +108,13 @@ impl ControlPlaneHandle {
         }
     }
 
-    async fn initialize_udp_connection(&self, mut lease: UdpInitLease) -> anyhow::Result<()> {
+    async fn initialize_udp_connection(
+        &self,
+        mut lease: UdpInitLease,
+        #[cfg(feature = "native-api")] native_flow: &mut Option<
+            Arc<crate::native_api::flows::FlowGuard>,
+        >,
+    ) -> anyhow::Result<()> {
         let client_addr = lease.client_addr();
         let original_dst = lease.original_dst();
         let data = lease.first_payload();
@@ -126,6 +161,10 @@ impl ControlPlaneHandle {
 
         // A staged early exit must retire its held originals immediately.
         if is_honk_internal_addr(&original_dst.ip()) || is_honk_internal_addr(&client_addr.ip()) {
+            #[cfg(feature = "native-api")]
+            if let Some(flow) = native_flow.as_ref() {
+                flow.finish("failed", "internal_address_skipped");
+            }
             trace!(
                 "Skipping honk-internal UDP {} -> {}",
                 client_addr, original_dst
@@ -137,6 +176,10 @@ impl ControlPlaneHandle {
             return Ok(());
         }
         if is_broadcast_or_multicast(&original_dst.ip()) {
+            #[cfg(feature = "native-api")]
+            if let Some(flow) = native_flow.as_ref() {
+                flow.finish("failed", "special_address_skipped");
+            }
             trace!(
                 "Skipping broadcast/multicast UDP {} -> {}",
                 client_addr, original_dst
@@ -161,6 +204,23 @@ impl ControlPlaneHandle {
             self.lookup_udp_handoff(&tuples, lease.decision_token())
                 .await?
         };
+        #[cfg(feature = "native-api")]
+        if let (Some(flow), Some(handoff)) = (native_flow.as_ref(), handoff.as_ref()) {
+            flow.step(
+                "input",
+                None,
+                serde_json::json!({
+                    "source": "kernel",
+                    "values": {
+                        "src": client_addr.to_string(), "dst": original_dst.to_string(),
+                        "domain": null, "domain_source": null, "pname": handoff.process_name(),
+                        "pid": (handoff.pid != 0).then_some(handoff.pid), "process_path": null,
+                        "src_mac": handoff.mac_address(), "ingress": null, "domain_rule_ids": null,
+                        "dscp": handoff.dscp, "mark": handoff.mark,
+                    },
+                }),
+            );
+        }
         let skip_sniff = matches!(dial_mode, DialMode::Ip)
             || handoff.as_ref().is_some_and(|ho| {
                 ho.must != 0
@@ -190,6 +250,10 @@ impl ControlPlaneHandle {
                 }
             }
             if matches!(outcome, QuicSniffOutcome::Incomplete) {
+                #[cfg(feature = "native-api")]
+                if let Some(flow) = native_flow.as_ref() {
+                    flow.finish("failed", "quic_sniff_incomplete");
+                }
                 debug!(
                     "QUIC ClientHello unresolved within budget; dropping for retransmit {} -> {}",
                     client_addr, original_dst
@@ -202,7 +266,24 @@ impl ControlPlaneHandle {
             }
             outcome.into_domain()
         };
-        let (quic_domain, domain_verified) = self
+        #[cfg(feature = "native-api")]
+        if let Some(flow) = native_flow.as_ref() {
+            flow.update_input(
+                quic_domain.as_deref(),
+                quic_domain.as_ref().map(|_| "quic_sni"),
+                handoff
+                    .as_ref()
+                    .and_then(|handoff| handoff.process_name())
+                    .as_deref(),
+                handoff
+                    .as_ref()
+                    .and_then(|handoff| (handoff.pid != 0).then_some(handoff.pid)),
+                handoff.as_ref().and_then(|handoff| handoff.mac_address()),
+                handoff.as_ref().map(|handoff| handoff.dscp),
+                handoff.as_ref().map(|handoff| handoff.mark),
+            );
+        }
+        let (quic_domain, domain_verified, _native_verification) = self
             .apply_domain_reality_check(dial_mode, quic_domain, original_dst.ip(), client_addr.ip())
             .await;
 
@@ -214,6 +295,8 @@ impl ControlPlaneHandle {
                 mark: 0,
                 matched_rule: None,
                 reroute_by_sniffed_domain: false,
+                #[cfg(feature = "native-api")]
+                native_route: None,
             }
         } else {
             let conn_info = build_connection_info(
@@ -226,6 +309,27 @@ impl ControlPlaneHandle {
             self.prepare_routing(dial_mode, &conn_info, domain_verified, handoff.as_ref())
                 .await
         };
+        #[cfg(feature = "native-api")]
+        let native_route = route.native_route;
+        #[cfg(feature = "native-api")]
+        let native_routed_outbound = native_flow.as_ref().map(|_| route.outbound.clone());
+        #[cfg(feature = "native-api")]
+        if let Some(flow) = native_flow.as_ref() {
+            if let Some(capture) = &native_route {
+                flow.step("route", capture.generation, serde_json::json!({
+                    "evaluation_id": capture.evaluation_id, "chain": "traffic", "plane": capture.plane,
+                    "rule_id": null, "rules": [], "outbound": route.outbound, "must": route.must,
+                    "mark": route.mark, "input": capture.input, "dns_action": null,
+                }));
+            }
+            flow.step("reroute", native_route.as_ref().and_then(|route| route.generation), serde_json::json!({
+                "performed": route.reroute_by_sniffed_domain, "reason": "sniff_routing_decision",
+                "from_evaluation_id": null,
+                "to_evaluation_id": if route.reroute_by_sniffed_domain {
+                    native_route.as_ref().map(|route| route.evaluation_id.as_str())
+                } else { None },
+            }));
+        }
         #[cfg(feature = "ebpf")]
         let reroute_by_sniffed_domain = route.reroute_by_sniffed_domain;
         #[cfg(feature = "ebpf")]
@@ -242,6 +346,21 @@ impl ControlPlaneHandle {
             quic_domain.as_deref().map(Arc::<str>::from)
         };
         let target_is_domain = target_domain.is_some();
+        #[cfg(feature = "native-api")]
+        if let Some(flow) = native_flow.as_ref() {
+            flow.routed(&outbound_name, None, "unknown");
+            flow.step("dial_mode", native_route.as_ref().and_then(|route| route.generation), serde_json::json!({
+                "configured": dial_mode,
+                "effective_target": match outbound_name.as_str() { "block" => "none", "direct" => "ip", _ => "unknown" },
+                "domain": quic_domain,
+                "domain_source": quic_domain.as_ref().map(|_| "quic_sni"),
+                "verification": _native_verification,
+                "reason": "dial_mode_applied",
+            }));
+            if outbound_name == "block" {
+                flow.finish("blocked", "routing_block");
+            }
+        }
         #[cfg(feature = "ebpf")]
         let final_rule_mark = final_udp_rule_mark(routed_direct, &outbound_name, routed_mark);
         #[cfg(not(feature = "ebpf"))]
@@ -275,6 +394,10 @@ impl ControlPlaneHandle {
                         client_addr,
                         original_dst,
                     );
+                    #[cfg(feature = "native-api")]
+                    if let Some(flow) = native_flow.as_ref() {
+                        flow.finish("unknown", "kernel_handoff");
+                    }
                     return Ok(());
                 }
                 "block" => {
@@ -298,8 +421,20 @@ impl ControlPlaneHandle {
         } else {
             IpVersion::V4
         };
+        #[cfg(feature = "native-api")]
+        let mut native_plan = None;
         let (plan, selection_chains) = {
             let config = self.config.read().await;
+            #[cfg(feature = "native-api")]
+            let native_identity = native_flow
+                .as_ref()
+                .and(self.native.as_ref())
+                .map(|native| {
+                    (
+                        self.diagnostics.read().generation,
+                        native.catalog.snapshot(),
+                    )
+                });
             let gm = self.group_manager.read();
             let plan = crate::control::reload::resolve_udp_outbound_plan_for_target(
                 &config,
@@ -319,6 +454,20 @@ impl ControlPlaneHandle {
                 },
             );
             let selection_chains = plan.selection_chains.clone();
+            #[cfg(feature = "native-api")]
+            if let Some((generation, catalog)) = native_identity {
+                let paths: Vec<_> = plan
+                    .nodes
+                    .iter()
+                    .zip(&selection_chains)
+                    .map(|(node, chain)| {
+                        crate::native_api::observation::native_selection_path(
+                            &config, &catalog, chain, node,
+                        )
+                    })
+                    .collect();
+                native_plan = Some(Arc::new((generation, catalog, paths)));
+            }
             (plan, selection_chains)
         };
 
@@ -332,8 +481,18 @@ impl ControlPlaneHandle {
                 self.alive_set.notify_check_tcp(node.id);
             }
             self.stats.record_error(&outbound_name);
+            #[cfg(feature = "native-api")]
+            if let Some(flow) = native_flow.as_ref() {
+                flow.finish("failed", "no_available_candidate");
+            }
             return Ok(());
         }
+        #[cfg(feature = "native-api")]
+        let native_all_block = native_flow.is_some()
+            && plan
+                .nodes
+                .iter()
+                .all(|node| node.protocol() == honk_config::types::NodeProtocol::Block);
 
         let (connect_timeout, transport_deadline) = {
             let config = self.config.read().await;
@@ -365,6 +524,16 @@ impl ControlPlaneHandle {
             #[cfg(feature = "rprx")]
             let alive_set = Arc::clone(&self.alive_set);
             let target_domain = target_domain.clone();
+            #[cfg(feature = "native-api")]
+            let native_flow = native_flow.clone();
+            #[cfg(feature = "native-api")]
+            let native_plan = native_plan.clone();
+            #[cfg(feature = "native-api")]
+            let native_evaluation = native_route
+                .as_ref()
+                .map(|route| route.evaluation_id.clone());
+            #[cfg(feature = "native-api")]
+            let native_outbound = native_flow.as_ref().map(|_| outbound_name.clone());
             Arc::new(move |index: usize, node: Node| {
                 let registry = registry.clone();
                 let stats = stats.clone();
@@ -376,13 +545,58 @@ impl ControlPlaneHandle {
                 #[cfg(feature = "rprx")]
                 let alive_set = Arc::clone(&alive_set);
                 let target_domain = target_domain.clone();
+                #[cfg(feature = "native-api")]
+                let native_flow = native_flow.clone();
+                #[cfg(feature = "native-api")]
+                let native_plan = native_plan.clone();
+                #[cfg(feature = "native-api")]
+                let native_evaluation = native_evaluation.clone();
+                #[cfg(feature = "native-api")]
+                let native_routed_outbound = native_routed_outbound.clone();
+                #[cfg(feature = "native-api")]
+                let native_outbound = native_outbound.clone();
                 Box::pin(async move {
+                    #[cfg(feature = "native-api")]
+                    let mut native_attempt = native_flow.as_ref().map(|flow| {
+                        let target_kind = native_udp_target_kind(&node, target_is_domain);
+                        crate::native_api::observation::NativeAttempt::new(
+                            Arc::clone(flow), native_plan.as_ref().map(|plan| plan.0),
+                            serde_json::json!({
+                                "parent_attempt_id": null, "kind": "leaf",
+                                "evaluation_id": native_evaluation,
+                                "routing_source": if native_evaluation.is_some() { "evaluation" } else { "forced" },
+                                "routed_outbound": native_routed_outbound,
+                                "effective_outbound": native_outbound,
+                                "mode_override": if native_routed_outbound == native_outbound { "none" }
+                                    else if native_outbound.as_deref() == Some("direct") { "direct" } else { "global" },
+                                "selection_path": native_plan.as_ref().and_then(|plan| plan.2.get(index)).cloned().unwrap_or_default(),
+                                "leaf_node_id": node.id.to_string(), "leaf_node_name": node.name,
+                                "target": match target_kind {
+                                    "none" => None,
+                                    "domain" => target_domain.as_deref().map(|domain| format!("{domain}:{}", original_dst.port())),
+                                    _ => Some(original_dst.to_string()),
+                                },
+                                "target_kind": target_kind,
+                                "dial_ip": (node.protocol() == honk_config::types::NodeProtocol::Direct).then(|| original_dst.ip().to_string()),
+                                "server_addr": null,
+                                "resolution_location": match node.protocol() {
+                                    honk_config::types::NodeProtocol::Direct => "original_ip",
+                                    honk_config::types::NodeProtocol::Block => "not_applicable",
+                                    _ => "unknown",
+                                },
+                            }),
+                        )
+                    });
                     let reporter = feedback.map(|feedback| feedback.start());
                     let dial_started_at = std::time::Instant::now();
                     let result = {
                         #[cfg(feature = "rprx")]
                         if let Some(path) = vless_source_path(&node, original_dst.port()) {
                             let runtime = runtime_generation.get(&node.id).ok_or_else(|| {
+                                #[cfg(feature = "native-api")]
+                                if let Some(attempt) = &mut native_attempt {
+                                    attempt.finish("failed", Some("runtime_generation_missing"));
+                                }
                                 anyhow::anyhow!(
                                     "node {} is not in the captured runtime generation",
                                     node.id
@@ -454,6 +668,13 @@ impl ControlPlaneHandle {
                                 .map(PreparedEndpointTransport::Flow)
                         }
                     };
+                    #[cfg(feature = "native-api")]
+                    if let Some(attempt) = &mut native_attempt {
+                        match &result {
+                            Ok(_) => attempt.finish("succeeded", None),
+                            Err(_) => attempt.finish("failed", Some("udp_prepare_failed")),
+                        }
+                    }
                     stats.record_udp_dial_latency(dial_started_at.elapsed());
                     match result {
                         Ok(transport) => Ok((transport, reporter, selection_chain)),
@@ -510,6 +731,10 @@ impl ControlPlaneHandle {
                 Arc::new(move || stats.record_udp_stagger_cancellation())
             },
         };
+        #[cfg(feature = "native-api")]
+        if let Some(flow) = native_flow.as_ref() {
+            flow.transition("dialing", "udp_prepare_started", "unknown", Some(false));
+        }
         let Some((node, (prepared_transport, score_reporter, selection_chain))) = prepare_udp_plan(
             plan_mode,
             plan.nodes,
@@ -524,8 +749,44 @@ impl ControlPlaneHandle {
                 outbound_name
             );
             self.stats.record_error(&outbound_name);
+            #[cfg(feature = "native-api")]
+            if let Some(flow) = native_flow.as_ref() {
+                if native_all_block {
+                    flow.selected(Vec::new());
+                    flow.finish("blocked", "policy_block");
+                } else {
+                    flow.finish("failed", "udp_prepare_failed");
+                }
+            }
             return Ok(());
         };
+        #[cfg(feature = "native-api")]
+        if let (Some(flow), Some(plan)) = (native_flow.as_ref(), native_plan.as_ref()) {
+            flow.step("dial_mode", Some(plan.0), serde_json::json!({
+                "configured": dial_mode, "effective_target": native_udp_target_kind(&node, target_is_domain),
+                "domain": quic_domain, "domain_source": quic_domain.as_ref().map(|_| "quic_sni"),
+                "verification": _native_verification, "reason": "leaf_target_selected",
+            }));
+            if matches!(
+                node.protocol(),
+                honk_config::types::NodeProtocol::Direct | honk_config::types::NodeProtocol::Block
+            ) {
+                flow.selected(Vec::new());
+            } else {
+                let group_count = selection_chain
+                    .len()
+                    .saturating_sub(usize::from(selection_chain.last() == Some(&node.name)));
+                let groups: Option<Vec<_>> = selection_chain
+                    .iter()
+                    .take(group_count)
+                    .map(|name| plan.1.groups.get(name).cloned())
+                    .collect();
+                if let Some(mut chain) = groups {
+                    chain.push(node.id.to_string());
+                    flow.selected(chain);
+                }
+            }
+        }
 
         // The prepared winner is bound only after every speculative loser has
         // been aborted/drained. Close the death-before-bind race again before
@@ -561,6 +822,10 @@ impl ControlPlaneHandle {
         let transport = tokio::select! {
             biased;
             _ = tokio::time::sleep_until(transport_deadline) => {
+                #[cfg(feature = "native-api")]
+                if let Some(flow) = native_flow.as_ref() {
+                    flow.finish("failed", "udp_commit_timeout");
+                }
                 if let Some(reporter) = &score_reporter {
                     reporter.finish(crate::group::ScoreOutcome::Timeout);
                 }
@@ -583,6 +848,10 @@ impl ControlPlaneHandle {
             } => match result {
                 Ok(transport) => transport,
                 Err(error) => {
+                    #[cfg(feature = "native-api")]
+                    if let Some(flow) = native_flow.as_ref() {
+                        flow.finish("failed", "udp_commit_failed");
+                    }
                     if let Some(reporter) = &score_reporter {
                         reporter.finish(score_runtime_outcome(&runtime_generation, &error));
                     }
@@ -601,6 +870,10 @@ impl ControlPlaneHandle {
         let reply_socket = match self.udp_pool.create_reply_socket(original_dst) {
             Ok(socket) => Arc::new(socket),
             Err(error) => {
+                #[cfg(feature = "native-api")]
+                if let Some(flow) = native_flow.as_ref() {
+                    flow.finish("failed", "reply_socket_failed");
+                }
                 self.stats
                     .record_udp_reply_ready_latency(reply_ready_started.elapsed());
                 self.stats.record_error(&outbound_name);
@@ -613,7 +886,7 @@ impl ControlPlaneHandle {
         self.stats
             .record_udp_reply_ready_latency(reply_ready_started.elapsed());
 
-        let endpoint = Arc::new(match transport {
+        let endpoint = match transport {
             CommittedEndpointTransport::Flow(transport) => {
                 let relay_addr = transport.relay_addr();
                 let endpoint = UdpEndpoint::new_scored(
@@ -638,7 +911,14 @@ impl ControlPlaneHandle {
                 scheduler_ipver,
                 score_reporter,
             ),
-        });
+        };
+        #[cfg(feature = "native-api")]
+        let endpoint = {
+            let mut endpoint = endpoint;
+            endpoint.set_native_flow(native_flow.take(), &self.udp_pool);
+            endpoint
+        };
+        let endpoint = Arc::new(endpoint);
 
         let tracker_id = if let Some(conn_id) = self.connection_tracker.register_if_enabled(|| {
             let id = uuid::Uuid::new_v4().to_string();
@@ -655,6 +935,11 @@ impl ControlPlaneHandle {
                     .connection_tracker
                     .native_enabled()
                     .then(|| outbound_name.clone()),
+                #[cfg(feature = "native-api")]
+                native_flow_id: endpoint
+                    .native_flow()
+                    .filter(|flow| !flow.id().is_empty())
+                    .map(|flow| flow.id().to_owned()),
                 rule,
                 rule_payload,
                 chains: connection_chains(selection_chain, &node.name),
@@ -668,7 +953,15 @@ impl ControlPlaneHandle {
             }
         }) {
             endpoint.set_tracker(conn_id.clone());
+            #[cfg(feature = "native-api")]
+            if let Some(flow) = endpoint.native_flow() {
+                flow.attach_connection(&conn_id);
+            }
             if !lease.set_tracker_id(conn_id.clone()) {
+                #[cfg(feature = "native-api")]
+                if let Some(flow) = endpoint.native_flow() {
+                    flow.finish("failed", "initializer_cancelled");
+                }
                 // The generation was cancelled between route selection and
                 // registration. No pool entry owns this tracker, so retire it
                 // directly rather than leaking it.
@@ -686,6 +979,10 @@ impl ControlPlaneHandle {
             // Already taken while collecting a fragmented ClientHello.
             Some(rx) => rx,
             None => lease.take_queue_receiver().ok_or_else(|| {
+                #[cfg(feature = "native-api")]
+                if let Some(flow) = endpoint.native_flow() {
+                    flow.finish("failed", "initializer_queue_missing");
+                }
                 anyhow::anyhow!("UDP initializer lost its bounded queue before driver start")
             })?,
         };
@@ -702,17 +999,38 @@ impl ControlPlaneHandle {
             outbound_name.clone(),
         );
         driver.wait_ready().await?;
+        #[cfg(feature = "native-api")]
+        if let Some(flow) = endpoint.native_flow() {
+            flow.transition(
+                "active",
+                "udp_transport_ready",
+                "transport_ready",
+                Some(false),
+            );
+        }
         if !lease.still_initializing() {
+            #[cfg(feature = "native-api")]
+            if let Some(flow) = endpoint.native_flow() {
+                flow.finish("failed", "initializer_cancelled");
+            }
             return Err(anyhow::anyhow!(
                 "UDP initializer generation was retired before ready commit"
             ));
         }
         if !lease.commit_ready(Arc::clone(&endpoint)) {
+            #[cfg(feature = "native-api")]
+            if let Some(flow) = endpoint.native_flow() {
+                flow.finish("failed", "initializer_cancelled");
+            }
             return Err(anyhow::anyhow!(
                 "UDP initializer generation was cancelled before ready commit"
             ));
         }
         let first = lease.take_first().ok_or_else(|| {
+            #[cfg(feature = "native-api")]
+            if let Some(flow) = endpoint.native_flow() {
+                flow.finish("failed", "initializer_first_packet_missing");
+            }
             anyhow::anyhow!("UDP initializer lost its first packet before driver start")
         })?;
         driver.start_with_followers(first, sniffed_followers)?;

@@ -241,6 +241,8 @@ pub(super) struct UdpDriverContext {
 
 impl Drop for UdpDriverCleanupGuard {
     fn drop(&mut self) {
+        #[cfg(feature = "native-api")]
+        self.endpoint.finish_native("failed", "driver_cancelled");
         self.endpoint
             .finish_score(if self.pool.terminal.load(Ordering::Acquire) {
                 ScoreOutcome::Shutdown
@@ -335,6 +337,42 @@ pub(super) fn score_driver_outcome(
             }
         }
         Err(error) => ScoreOutcome::Io(error.kind()),
+    }
+}
+
+#[cfg(feature = "native-api")]
+impl UdpEndpoint {
+    fn finish_native_driver(&self, result: &io::Result<()>) {
+        #[cfg(feature = "rprx")]
+        if let EndpointTransport::Source(source) = &self.transport
+            && let Some(retirement) = source.score_retirement()
+        {
+            self.finish_native_source(retirement);
+            return;
+        }
+        let (state, reason) = if self.dead.load(Ordering::Acquire) {
+            ("closed", "intentional_retirement")
+        } else {
+            match result {
+                Err(error) if is_reply_idle_timeout(error) => {
+                    if self.has_reply() {
+                        ("closed", "reply_idle")
+                    } else {
+                        ("failed", "timeout_before_reply")
+                    }
+                }
+                Err(error) => match honk_outbound::proxy::packet_error_class(error) {
+                    honk_outbound::proxy::PacketErrorClass::Rejected => {
+                        ("failed", "packet_rejected")
+                    }
+                    honk_outbound::proxy::PacketErrorClass::Congestion => ("failed", "congestion"),
+                    _ if error.kind() == io::ErrorKind::TimedOut => ("failed", "transport_timeout"),
+                    _ => ("failed", "transport_error"),
+                },
+                Ok(()) => ("unknown", "driver_completed"),
+            }
+        };
+        self.finish_native(state, reason);
     }
 }
 
@@ -473,6 +511,8 @@ pub(super) async fn run_endpoint_driver(
         let result = Err(failure.into_io_error());
         // Health reporting can synchronously retire and mark this endpoint dead.
         let outcome = score_driver_outcome(&endpoint, &result);
+        #[cfg(feature = "native-api")]
+        endpoint.finish_native_driver(&result);
         if !neutral && !endpoint.is_source() && !endpoint.dead.load(Ordering::Acquire) {
             alive_set.report_unavailable_traffic(
                 endpoint.node_id,
@@ -505,12 +545,16 @@ pub(super) async fn run_endpoint_driver(
             Err(PacketSendFailure::Rejected(error)) => {
                 let result = Err(error);
                 let outcome = score_driver_outcome(&endpoint, &result);
+                #[cfg(feature = "native-api")]
+                endpoint.finish_native_driver(&result);
                 let _ = first_ack.send(result.as_ref().map(|_| ()).map_err(duplicate_send_error));
                 return UdpDriverResult { result, outcome };
             }
             Err(PacketSendFailure::Transport(error)) => {
                 let result = Err(error);
                 let outcome = score_driver_outcome(&endpoint, &result);
+                #[cfg(feature = "native-api")]
+                endpoint.finish_native_driver(&result);
                 if !endpoint.is_source() && !endpoint.dead.load(Ordering::Acquire) {
                     alive_set.report_unavailable_traffic(
                         endpoint.node_id,
@@ -560,6 +604,8 @@ pub(super) async fn run_endpoint_driver(
             result = &mut receiver => result,
         }
     };
+    #[cfg(feature = "native-api")]
+    endpoint.finish_native_driver(&result);
     if endpoint.is_source() && result.as_ref().err().is_some_and(is_reply_idle_timeout) {
         endpoint.source_flow_idle_expired();
     }
@@ -750,6 +796,15 @@ async fn send_one(
     }
     match result {
         Ok(()) => {
+            #[cfg(feature = "native-api")]
+            if first && let Some(flow) = endpoint.native_flow() {
+                flow.transition(
+                    "active",
+                    "first_packet_sent",
+                    "target_request_sent",
+                    Some(false),
+                );
+            }
             endpoint.refresh();
             endpoint.tracker_upload(packet.data.len() as u64);
             outbound_tracker.add_bytes(packet.data.len() as u64, 0);

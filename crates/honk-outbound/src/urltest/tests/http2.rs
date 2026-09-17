@@ -194,7 +194,7 @@ async fn h2_keeps_cancelled_warm_stream_until_measurement_finishes() {
         .expect("peer must deliver both response endings");
     let measured = result.expect("late warm completion must not fail the measured request");
     assert!(
-        measured >= Duration::from_secs(1),
+        measured.latency >= Duration::from_secs(1),
         "expected the delayed measured RTT, not warm fallback: {measured:?}"
     );
 }

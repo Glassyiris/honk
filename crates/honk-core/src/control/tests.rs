@@ -487,7 +487,7 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
         .await;
 
     let result =
-        honk_outbound::alive::UdpProber::probe_udp(&prober, &node.name, Duration::from_millis(30))
+        honk_outbound::alive::UdpProber::probe_udp(&prober, node.id, Duration::from_millis(30))
             .await;
     assert!(
         matches!(result.dns, Some(Ok(_))),
@@ -574,7 +574,7 @@ async fn quic_probe_still_runs_when_dns_target_resolution_is_refused() {
     );
 
     let result =
-        honk_outbound::alive::UdpProber::probe_udp(&prober, &node.name, Duration::from_millis(30))
+        honk_outbound::alive::UdpProber::probe_udp(&prober, node.id, Duration::from_millis(30))
             .await;
     assert!(result.dns.is_none(), "DNS health result: {result:?}");
     assert!(
@@ -1356,7 +1356,7 @@ fn tls_client_hello(sni: &str) -> Vec<u8> {
     record
 }
 
-async fn store_active_tcp_flow(
+pub(in crate::control) async fn store_active_tcp_flow(
     handle: &ControlPlaneHandle,
     original_dst: SocketAddr,
     client_addr: SocketAddr,

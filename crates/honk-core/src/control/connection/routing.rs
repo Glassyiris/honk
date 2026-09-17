@@ -28,6 +28,8 @@ pub(super) struct RoutingDecision {
     pub(super) mark: u32,
     pub(super) matched_rule: Option<(String, String)>,
     pub(super) reroute_by_sniffed_domain: bool,
+    #[cfg(feature = "native-api")]
+    pub(super) native_route: Option<crate::native_api::observation::NativeRoute>,
 }
 
 pub(super) fn build_connection_info(
@@ -68,7 +70,7 @@ impl ControlPlaneHandle {
         domain: &str,
         expected: std::net::IpAddr,
         source_ip: std::net::IpAddr,
-    ) -> bool {
+    ) -> RealityOutcome {
         let dns_timeout = std::time::Duration::from_millis(
             self.config.read().await.global.dns_resolve_timeout_ms,
         );
@@ -80,20 +82,20 @@ impl ControlPlaneHandle {
         {
             Ok(Ok(resolved)) => {
                 match domain_reality_outcome(expected, &resolved.ipv4, &resolved.ipv6) {
-                    RealityOutcome::ExactMatch => true,
+                    RealityOutcome::ExactMatch => RealityOutcome::ExactMatch,
                     RealityOutcome::OtherFamilyOnly => {
                         debug!(
                             "Domain reality check: {} has no records for {}; other family present — trusting SNI (got v4={:?} v6={:?})",
                             domain, expected, resolved.ipv4, resolved.ipv6
                         );
-                        true
+                        RealityOutcome::OtherFamilyOnly
                     }
                     RealityOutcome::Mismatch => {
                         debug!(
                             "Domain reality check failed: {} does not resolve to {} (got {:?} {:?})",
                             domain, expected, resolved.ipv4, resolved.ipv6
                         );
-                        false
+                        RealityOutcome::Mismatch
                     }
                 }
             }
@@ -102,11 +104,11 @@ impl ControlPlaneHandle {
                     "Domain reality check failed: unable to resolve {}: {}",
                     domain, e
                 );
-                false
+                RealityOutcome::Mismatch
             }
             Err(_) => {
                 debug!("Domain reality check timed out for {}", domain);
-                false
+                RealityOutcome::Mismatch
             }
         }
     }
@@ -117,27 +119,24 @@ impl ControlPlaneHandle {
         domain: Option<String>,
         original_dst: std::net::IpAddr,
         client_addr: std::net::IpAddr,
-    ) -> (Option<String>, bool) {
-        let domain = match (dial_mode, domain) {
+    ) -> (Option<String>, bool, &'static str) {
+        match (dial_mode, domain) {
             (DialMode::Domain, Some(domain)) => {
-                if self
+                match self
                     .verify_domain_reality(&domain, original_dst, client_addr)
                     .await
                 {
-                    Some(domain)
-                } else {
-                    debug!(
-                        domain = %domain,
-                        destination = %original_dst,
-                        "sniffed domain failed reality check; falling back to IP"
-                    );
-                    None
+                    RealityOutcome::ExactMatch => (Some(domain), true, "matched"),
+                    RealityOutcome::OtherFamilyOnly => (Some(domain), true, "other_family_trusted"),
+                    RealityOutcome::Mismatch => {
+                        debug!(domain = %domain, destination = %original_dst,
+                            "sniffed domain failed reality check; falling back to IP");
+                        (None, false, "failed")
+                    }
                 }
             }
-            (_, domain) => domain,
-        };
-        let verified = matches!(dial_mode, DialMode::Domain) && domain.is_some();
-        (domain, verified)
+            (_, domain) => (domain, false, "not_required"),
+        }
     }
 
     /// Whether a sniffed domain should participate in userspace routing.
@@ -211,6 +210,17 @@ impl ControlPlaneHandle {
                 mark: handoff.mark,
                 matched_rule: None,
                 reroute_by_sniffed_domain: false,
+                #[cfg(feature = "native-api")]
+                native_route: self
+                    .native
+                    .as_ref()
+                    .filter(|native| native.record_flows)
+                    .map(|_| crate::native_api::observation::NativeRoute {
+                        generation: None,
+                        evaluation_id: uuid::Uuid::new_v4().to_string(),
+                        plane: "kernel",
+                        input: None,
+                    }),
             };
         }
         let route_with_domain = Self::should_route_with_sniffed_domain(
@@ -224,8 +234,32 @@ impl ControlPlaneHandle {
         if !route_with_domain {
             routing_conn_info.domain = None;
         }
+        #[cfg(feature = "native-api")]
+        let mut native_route = None;
         let (userspace_outbound, userspace_must, userspace_mark, matched_rule) = {
             let router = self.router.read().await;
+            #[cfg(feature = "native-api")]
+            if self
+                .native
+                .as_ref()
+                .is_some_and(|native| native.record_flows)
+            {
+                let _config = self.config.read().await;
+                let generation = self.diagnostics.read().generation;
+                native_route = Some(crate::native_api::observation::NativeRoute {
+                    generation: Some(generation),
+                    evaluation_id: uuid::Uuid::new_v4().to_string(),
+                    plane: "userspace",
+                    input: Some(serde_json::json!({
+                        "network":routing_conn_info.protocol,
+                        "src_ip":routing_conn_info.src_ip.to_string(), "src_port":routing_conn_info.src_port,
+                        "dst_ip":routing_conn_info.dst_ip.to_string(), "dst_port":routing_conn_info.dst_port,
+                        "domain":routing_conn_info.domain, "pname":routing_conn_info.process_name,
+                        "src_mac":routing_conn_info.mac,
+                        "dscp":routing_conn_info.dscp, "mark":null, "ingress":null, "domain_rule_ids":null,
+                    })),
+                });
+            }
             match router.route_full(&routing_conn_info) {
                 Some(route) => (
                     route.outbound_name.to_string(),
@@ -251,6 +285,14 @@ impl ControlPlaneHandle {
                 {
                     (userspace_outbound, userspace_must, userspace_mark)
                 } else {
+                    {
+                        #[cfg(feature = "native-api")]
+                        if let Some(native_route) = native_route.as_mut() {
+                            native_route.generation = None;
+                            native_route.plane = "kernel";
+                            native_route.input = None;
+                        }
+                    }
                     (
                         self.outbound_index_to_name(ho.outbound).await,
                         ho.must != 0,
@@ -266,6 +308,8 @@ impl ControlPlaneHandle {
             mark,
             matched_rule,
             reroute_by_sniffed_domain,
+            #[cfg(feature = "native-api")]
+            native_route,
         }
     }
 

@@ -5,6 +5,59 @@ use crate::group::{SelectionNetwork, SelectionPlanMode};
 
 use std::collections::{HashMap, HashSet};
 
+#[cfg(feature = "native-api")]
+use crate::native_api::{
+    catalog::CatalogIdentity,
+    flows::FlowGuard,
+    observation::{NativeAttempt, native_selection_path},
+};
+
+#[cfg(feature = "native-api")]
+struct TcpNativeDial {
+    flow: Arc<FlowGuard>,
+    generation: u64,
+    catalog: Arc<CatalogIdentity>,
+    config: Arc<Config>,
+    evaluation_id: Option<String>,
+    routed_outbound: String,
+    mode_override: &'static str,
+}
+
+#[cfg(feature = "native-api")]
+impl TcpNativeDial {
+    fn selected(&self, chain: &[String], node: &Node) {
+        if matches!(
+            node.protocol(),
+            honk_config::types::NodeProtocol::Direct | honk_config::types::NodeProtocol::Block
+        ) {
+            self.flow.selected(Vec::new());
+            return;
+        }
+        let group_count = chain
+            .len()
+            .saturating_sub(usize::from(chain.last() == Some(&node.name)));
+        let groups: Option<Vec<_>> = chain
+            .iter()
+            .take(group_count)
+            .map(|name| self.catalog.groups.get(name).cloned())
+            .collect();
+        if let Some(mut chain) = groups {
+            chain.push(node.id.to_string());
+            self.flow.selected(chain);
+        }
+    }
+}
+
+#[cfg(feature = "native-api")]
+fn native_tcp_target_kind(node: &Node, domain: Option<&str>) -> &'static str {
+    match node.protocol() {
+        honk_config::types::NodeProtocol::Block => "none",
+        honk_config::types::NodeProtocol::Direct => "ip",
+        _ if domain.is_some() => "domain",
+        _ => "ip",
+    }
+}
+
 type UnpackedTcpScorePlan = (
     Vec<Node>,
     SelectionPlanMode,
@@ -18,6 +71,8 @@ struct TcpDnsRoute {
     config: Arc<Config>,
     group_manager: Arc<honk_outbound::group::GroupManager>,
     runtime: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+    #[cfg(feature = "native-api")]
+    native: Option<(u64, Arc<CatalogIdentity>)>,
 }
 
 async fn write_sniffed_prefix<W: tokio::io::AsyncWrite + Unpin + ?Sized>(
@@ -145,6 +200,8 @@ impl ControlPlaneHandle {
             mark: handoff.mark,
             matched_rule: None,
             reroute_by_sniffed_domain: false,
+            #[cfg(feature = "native-api")]
+            native_route: None,
         };
         drop(backend);
         Ok(TcpDnsRoute {
@@ -152,6 +209,13 @@ impl ControlPlaneHandle {
             config: Arc::clone(&config),
             group_manager: self.group_manager.read().clone(),
             runtime: self.runtime_registry.read().clone(),
+            #[cfg(feature = "native-api")]
+            native: self.native.as_ref().map(|native| {
+                (
+                    self.diagnostics.read().generation,
+                    native.catalog.snapshot(),
+                )
+            }),
         })
     }
 
@@ -193,6 +257,12 @@ impl ControlPlaneHandle {
             }
         };
         debug!("Original destination: {}", original_dst);
+        #[cfg(feature = "native-api")]
+        let native_flow = self.native.as_ref().and_then(|native| {
+            let guard = native.flows.begin("tcp", client_addr, original_dst);
+            (!guard.id().is_empty()).then(|| Arc::new(guard))
+        });
+        let result = async {
         let tuples = build_tuples_key(
             original_dst.ip(),
             original_dst.port(),
@@ -201,6 +271,40 @@ impl ControlPlaneHandle {
             6, // TCP
         );
         let (mut flow, handoff) = self.adopt_tcp_flow(stream, tuples).await?;
+        #[cfg(feature = "native-api")]
+        if let (Some(native), Some(handoff)) = (&native_flow, &handoff) {
+            native.update_input(
+                None, None, handoff.process_name().as_deref(),
+                (handoff.pid != 0).then_some(handoff.pid), handoff.mac_address(),
+                Some(handoff.dscp), Some(handoff.mark),
+            );
+            native.step("input", None, serde_json::json!({
+                "source": "kernel",
+                "values": {
+                    "src": client_addr.to_string(), "dst": original_dst.to_string(),
+                    "domain": null, "domain_source": null, "pname": handoff.process_name(),
+                    "pid": (handoff.pid != 0).then_some(handoff.pid), "process_path": null,
+                    "src_mac": handoff.mac_address(), "ingress": null, "domain_rule_ids": null,
+                    "dscp": (handoff.dscp <= 63).then_some(handoff.dscp), "mark": handoff.mark,
+                },
+            }));
+        }
+        #[cfg(feature = "native-api")]
+        let kernel_evaluation_id = native_flow.as_ref().zip(handoff.as_ref()).map(|(native, handoff)| {
+            let evaluation_id = uuid::Uuid::new_v4().to_string();
+            let outbound = match handoff.outbound {
+                x if x == OutboundIndex::Direct as u8 => Some("direct"),
+                x if x == OutboundIndex::Block as u8 => Some("block"),
+                _ => None,
+            };
+            native.step("route", None, serde_json::json!({
+                "evaluation_id": evaluation_id, "chain": "traffic", "plane": "kernel",
+                "rule_id": null, "rules": [], "outbound": outbound,
+                "must": handoff.must != 0, "mark": handoff.mark,
+                "input": null, "dns_action": null,
+            }));
+            evaluation_id
+        });
 
         let pinned_dns_route = if original_dst.port() == 53 {
             let handoff = handoff
@@ -214,12 +318,18 @@ impl ControlPlaneHandle {
                 self.dns_controller
                     .handle_tcp_dns(flow.stream_mut(), client_addr, original_dst)
                     .await?;
+                #[cfg(feature = "native-api")]
+                if let Some(native) = &native_flow {
+                    native.finish("closed", "dns_intercept_completed");
+                }
                 return Ok(());
             }
         } else {
             None
         };
 
+        #[cfg(feature = "native-api")]
+        let dial_mode_generation;
         let (dial_mode, connect_timeout, overall_dial_timeout) = {
             let current_config;
             let config = if let Some(snapshot) = &pinned_dns_route {
@@ -228,6 +338,14 @@ impl ControlPlaneHandle {
                 current_config = self.config.read().await;
                 &*current_config
             };
+            #[cfg(feature = "native-api")]
+            {
+                dial_mode_generation = if let Some(snapshot) = &pinned_dns_route {
+                    snapshot.native.as_ref().map(|(generation, _)| *generation)
+                } else {
+                    native_flow.as_ref().map(|_| self.diagnostics.read().generation)
+                };
+            }
             let connect_timeout = Duration::from_millis(config.global.connect_timeout_ms);
             (
                 config
@@ -275,7 +393,23 @@ impl ControlPlaneHandle {
         if let Some(ref domain) = sniffed_domain {
             debug!("SNI sniffed domain: {}", domain);
         }
-        let (domain, domain_verified) = self
+        #[cfg(feature = "native-api")]
+        let domain_source = match &sniff_result.traffic_type {
+            sniffing::TrafficType::Tls { sni: Some(_) } => Some("tls_sni"),
+            sniffing::TrafficType::Http { host: Some(_) } => Some("http_host"),
+            _ => None,
+        };
+        #[cfg(feature = "native-api")]
+        if let Some(native) = &native_flow {
+            native.update_input(
+                sniff_result.domain.as_deref(), domain_source,
+                handoff.as_ref().and_then(|ho| ho.process_name()).as_deref(),
+                handoff.as_ref().and_then(|ho| (ho.pid != 0).then_some(ho.pid)),
+                handoff.as_ref().and_then(|ho| ho.mac_address()),
+                handoff.as_ref().map(|ho| ho.dscp), handoff.as_ref().map(|ho| ho.mark),
+            );
+        }
+        let (domain, domain_verified, domain_verification) = self
             .apply_domain_reality_check(
                 dial_mode,
                 sniffed_domain,
@@ -283,6 +417,8 @@ impl ControlPlaneHandle {
                 client_addr.ip(),
             )
             .await;
+        #[cfg(not(feature = "native-api"))]
+        let _ = domain_verification;
 
         if !skip_sniff && let Some(ref ho) = handoff {
             let cache_key = (original_dst, ho.outbound);
@@ -301,6 +437,8 @@ impl ControlPlaneHandle {
             "tcp",
             handoff.as_ref(),
         );
+        #[cfg(feature = "native-api")]
+        let mut pinned_native = pinned_dns_route.as_ref().and_then(|snapshot| snapshot.native.clone());
         let (route, pinned_generation) = if let Some(snapshot) = pinned_dns_route {
             (
                 snapshot.decision,
@@ -313,9 +451,38 @@ impl ControlPlaneHandle {
                 None,
             )
         };
+        #[cfg(feature = "native-api")]
+        let native_route = route.native_route;
+        #[cfg(feature = "native-api")]
+        let native_evaluation_id = native_route.as_ref()
+            .filter(|route| route.plane == "userspace")
+            .map(|route| route.evaluation_id.clone())
+            .or_else(|| kernel_evaluation_id.clone());
+        #[cfg(feature = "native-api")]
+        let native_routed_outbound = native_flow.as_ref().map(|_| route.outbound.clone());
+        #[cfg(feature = "native-api")]
+        if let Some(native) = &native_flow {
+            if let Some(capture) = &native_route && capture.plane == "userspace" {
+                native.step("route", capture.generation, serde_json::json!({
+                    "evaluation_id": capture.evaluation_id, "chain": "traffic", "plane": capture.plane,
+                    "rule_id": null, "rules": [], "outbound": route.outbound,
+                    "must": route.must, "mark": route.mark, "input": capture.input, "dns_action": null,
+                }));
+            }
+            native.step("reroute", native_route.as_ref().and_then(|capture| capture.generation), serde_json::json!({
+                "performed": route.reroute_by_sniffed_domain,
+                "reason": if route.reroute_by_sniffed_domain { "sniffed_domain" } else { "not_required" },
+                "from_evaluation_id": kernel_evaluation_id,
+                "to_evaluation_id": native_evaluation_id,
+            }));
+        }
         let reroute_by_sniffed_domain = route.reroute_by_sniffed_domain;
         let matched_rule = route.matched_rule;
         let outbound_name = self.apply_mode_override(route.outbound, route.must).await;
+        #[cfg(feature = "native-api")]
+        if let Some(native) = &native_flow {
+            native.routed(&outbound_name, None, "unknown");
+        }
 
         // Seed current predicate facts so later flows need not repeat sniffing.
         if let Some(domain) = &domain
@@ -352,6 +519,10 @@ impl ControlPlaneHandle {
                 original_dst,
             );
             self.stats.record_close(&outbound_name);
+            #[cfg(feature = "native-api")]
+            if let Some(native) = &native_flow {
+                native.finish("unknown", "kernel_handoff");
+            }
             return Ok(());
         }
 
@@ -366,12 +537,36 @@ impl ControlPlaneHandle {
             } else {
                 // Config's publication guard pins the group and runtime handles.
                 let config = self.config.read().await;
+                #[cfg(feature = "native-api")]
+                if native_flow.is_some() {
+                    pinned_native = self.native.as_ref().map(|native| {
+                        (self.diagnostics.read().generation, native.catalog.snapshot())
+                    });
+                }
                 (
                     Arc::clone(&config),
                     self.group_manager.read().clone(),
                     self.runtime_registry.read().clone(),
                 )
             };
+        #[cfg(feature = "native-api")]
+        let native_dial = native_flow.as_ref().map(|flow| {
+            let (generation, catalog) = pinned_native.expect("native selection capture");
+            let routed_outbound = native_routed_outbound.expect("native route capture");
+            let mode_override = if routed_outbound == outbound_name {
+                "none"
+            } else if outbound_name == "direct" {
+                "direct"
+            } else {
+                "global"
+            };
+            TcpNativeDial {
+                flow: Arc::clone(flow), generation, catalog,
+                config: Arc::clone(&generation_config),
+                evaluation_id: native_evaluation_id,
+                routed_outbound, mode_override,
+            }
+        });
         let (mut candidates, selection_mode, score_feedback, mut selection_chains, health_ipver) = {
             let context = tcp_score_context(original_dst, domain.as_deref(), ipver);
             let plan = crate::control::reload::resolve_outbound_plan_for_target(
@@ -404,6 +599,10 @@ impl ControlPlaneHandle {
             }
             self.stats.record_error(&outbound_name);
             self.stats.record_close(&outbound_name);
+            #[cfg(feature = "native-api")]
+            if let Some(native) = &native_flow {
+                native.finish("failed", "no_available_nodes");
+            }
             return Ok(());
         }
 
@@ -417,6 +616,26 @@ impl ControlPlaneHandle {
         } else {
             domain.clone()
         };
+        #[cfg(feature = "native-api")]
+        if let Some(native) = &native_flow {
+            let configured = match dial_mode {
+                DialMode::Ip => "ip", DialMode::Domain => "domain",
+                DialMode::DomainPlus => "domain+", DialMode::DomainPlusPlus => "domain++",
+            };
+            let target_kind = native_tcp_target_kind(&candidates[0], target_domain.as_deref());
+            let target_kind = if candidates.iter().all(|node| native_tcp_target_kind(node, target_domain.as_deref()) == target_kind) {
+                target_kind
+            } else {
+                "unknown"
+            };
+            native.step("dial_mode", dial_mode_generation, serde_json::json!({
+                "configured": configured,
+                "effective_target": target_kind,
+                "domain": sniff_result.domain, "domain_source": domain_source,
+                "verification": domain_verification,
+                "reason": match target_kind { "none" => "policy_block", "domain" => "sniffed_domain", "ip" => "original_destination", _ => "candidate_dependent" },
+            }));
+        }
 
         let cold_urltest = selection_mode == SelectionPlanMode::ColdUrlTest;
         let candidate_refs: Vec<&Node> = candidates.iter().collect();
@@ -432,6 +651,10 @@ impl ControlPlaneHandle {
                 health_ipver,
                 &score_feedback,
                 cold_urltest,
+                #[cfg(feature = "native-api")]
+                &selection_chains,
+                #[cfg(feature = "native-api")]
+                native_dial.as_ref(),
             )
             .await;
         let (mut proxy_stream, node, score_reporter) = match raced {
@@ -493,6 +716,10 @@ impl ControlPlaneHandle {
                                     retry_health_ipver,
                                     &retry_feedback,
                                     false,
+                                    #[cfg(feature = "native-api")]
+                                    &retry_selection_chains,
+                                    #[cfg(feature = "native-api")]
+                                    native_dial.as_ref(),
                                 )
                                 .await;
                             let retry = match retry {
@@ -502,6 +729,13 @@ impl ControlPlaneHandle {
                                     return Err(error);
                                 }
                             };
+                            #[cfg(feature = "native-api")]
+                            if retry.is_none()
+                                && retry_nodes.iter().take(3).all(|node| node.protocol() == honk_config::types::NodeProtocol::Block)
+                                && let Some(native) = &native_flow
+                            {
+                                native.finish("blocked", "policy_block");
+                            }
                             if retry.is_some() {
                                 selection_chains = retry_selection_chains;
                             }
@@ -513,11 +747,26 @@ impl ControlPlaneHandle {
                     Some(pair) => pair,
                     None => {
                         self.stats.record_close(&outbound_name);
+                        #[cfg(feature = "native-api")]
+                        if let Some(native) = &native_flow {
+                            if outbound_name == "block" || candidates.iter().all(|node| node.protocol() == honk_config::types::NodeProtocol::Block) {
+                                native.finish("blocked", "policy_block");
+                            } else {
+                                native.finish("failed", "dial_failed");
+                            }
+                        }
                         return Ok(());
                     }
                 }
             }
         };
+        #[cfg(feature = "native-api")]
+        if let Some(native) = &native_flow {
+            if let Some(capture) = &native_dial {
+                capture.selected(selection_chains.get(&node.id).map(Vec::as_slice).unwrap_or_default(), &node);
+            }
+            native.transition("active", "dial_succeeded", "transport_ready", None);
+        }
 
         let dscp_val = handoff.as_ref().map(|ho| ho.dscp).unwrap_or(0);
 
@@ -538,6 +787,8 @@ impl ControlPlaneHandle {
                     .connection_tracker
                     .native_enabled()
                     .then(|| outbound_name.clone()),
+                #[cfg(feature = "native-api")]
+                native_flow_id: native_flow.as_ref().map(|flow| flow.id().to_owned()),
                 rule,
                 rule_payload,
                 chains: connection_chains(
@@ -553,6 +804,10 @@ impl ControlPlaneHandle {
                 process_path: None,
             }
         }) {
+            #[cfg(feature = "native-api")]
+            if let Some(native) = &native_flow {
+                native.attach_connection(&conn_id);
+            }
             self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
         }
 
@@ -578,6 +833,10 @@ impl ControlPlaneHandle {
         {
             Ok(sent) => sent,
             Err(e) => {
+                #[cfg(feature = "native-api")]
+                if let Some(native) = &native_flow {
+                    native.finish("failed", "prefix_write_failed");
+                }
                 warn!("Failed to write sniffed bytes to proxy: {}", e);
                 self.stats.record_error(&outbound_name);
                 self.stats.record_close(&outbound_name);
@@ -598,6 +857,19 @@ impl ControlPlaneHandle {
             std::sync::Arc::new(move || reporter.first_response())
                 as std::sync::Arc<dyn Fn() + Send + Sync>
         });
+        #[cfg(feature = "native-api")]
+        let first_response = match &native_flow {
+            Some(native) => {
+                let native = Arc::clone(native);
+                Some(Arc::new(move || {
+                    if let Some(callback) = &first_response { callback(); }
+                    if native.first_reply() {
+                        native.transition("active", "response_received", "first_reply", Some(true));
+                    }
+                }) as Arc<dyn Fn() + Send + Sync>)
+            }
+            None => first_response,
+        };
         let conn_progress = relay::RelayProgress {
             upload: conn_upload.clone(),
             download: conn_download.clone(),
@@ -634,6 +906,14 @@ impl ControlPlaneHandle {
             reporter.rx(download);
             if download > 0 {
                 reporter.first_response();
+            }
+        }
+        #[cfg(feature = "native-api")]
+        if let Some(native) = &native_flow {
+            if relay_result.is_ok() {
+                native.finish("closed", "relay_closed");
+            } else {
+                native.finish("failed", "relay_failed");
             }
         }
         flow.retire().await;
@@ -801,6 +1081,14 @@ impl ControlPlaneHandle {
         }
 
         Ok(())
+        }.await;
+        #[cfg(feature = "native-api")]
+        if result.is_err()
+            && let Some(native) = &native_flow
+        {
+            native.finish("failed", "connection_failed");
+        }
+        result
     }
 
     /// Race the candidate dials: the first success wins, losers are
@@ -823,6 +1111,8 @@ impl ControlPlaneHandle {
         ipver: IpVersion,
         feedback: &HashMap<uuid::Uuid, crate::group::ScoreFeedback>,
         cold_urltest: bool,
+        #[cfg(feature = "native-api")] selection_chains: &HashMap<uuid::Uuid, Vec<String>>,
+        #[cfg(feature = "native-api")] native: Option<&TcpNativeDial>,
     ) -> anyhow::Result<
         Option<(
             crate::proxy::ProxyStream,
@@ -844,6 +1134,32 @@ impl ControlPlaneHandle {
             let generation = Arc::clone(&runtime_generation);
             let feedback = feedback.clone();
             let started_reporters = Arc::clone(&started_reporters);
+            #[cfg(feature = "native-api")]
+            let native_attempt = native.map(|capture| {
+                let chain = selection_chains.get(&node.id).map(Vec::as_slice).unwrap_or_default();
+                if candidates.len() == 1 {
+                    capture.selected(chain, &node);
+                }
+                let selection_path = native_selection_path(&capture.config, &capture.catalog, chain, &node);
+                let target_kind = native_tcp_target_kind(&node, target_domain.as_deref());
+                let target_value = match target_kind {
+                    "none" => None,
+                    "domain" => target_domain.as_ref().map(|domain| format!("{domain}:{}", target.port())),
+                    _ => Some(target.to_string()),
+                };
+                let data = serde_json::json!({
+                    "parent_attempt_id": null, "kind": "leaf",
+                    "evaluation_id": capture.evaluation_id,
+                    "routing_source": if capture.evaluation_id.is_some() { "evaluation" } else { "unknown" },
+                    "routed_outbound": capture.routed_outbound, "effective_outbound": outbound_name,
+                    "mode_override": capture.mode_override, "selection_path": selection_path,
+                    "leaf_node_id": node.id.to_string(), "leaf_node_name": node.name,
+                    "target": target_value, "target_kind": target_kind,
+                    "dial_ip": null, "server_addr": null,
+                    "resolution_location": match target_kind { "none" => "not_applicable", "ip" => "original_ip", _ => "unknown" },
+                });
+                (Arc::clone(&capture.flow), capture.generation, data)
+            });
             set.spawn(async move {
                 if cold_urltest {
                     // Absolute releases make only candidate zero immediate;
@@ -851,6 +1167,10 @@ impl ControlPlaneHandle {
                     // cancels it before it can start.
                     wait_for_cold_urltest_release(idx).await;
                 }
+                #[cfg(feature = "native-api")]
+                let mut native_attempt = native_attempt.map(|(flow, generation, data)| {
+                    NativeAttempt::new(flow, Some(generation), data)
+                });
                 let reporter = Arc::new(parking_lot::Mutex::new(None));
                 let on_start = {
                     let feedback = feedback.get(&node.id).cloned();
@@ -895,6 +1215,27 @@ impl ControlPlaneHandle {
                     Err(error) => {
                         if let Some(reporter) = &reporter {
                             reporter.setup_failed(score_runtime_outcome(&generation, error));
+                        }
+                    }
+                }
+                #[cfg(feature = "native-api")]
+                if let Some(attempt) = &mut native_attempt {
+                    match &result {
+                        Ok(_) => attempt.finish("succeeded", None),
+                        Err(error) => {
+                            let code =
+                                if node.protocol() == honk_config::types::NodeProtocol::Block {
+                                    "policy_block"
+                                } else if honk_outbound::proxy::is_packet_rejection(error) {
+                                    "local_refusal"
+                                } else if error.downcast_ref::<std::io::Error>().is_some_and(
+                                    |error| error.kind() == std::io::ErrorKind::TimedOut,
+                                ) {
+                                    "dial_timeout"
+                                } else {
+                                    "dial_failed"
+                                };
+                            attempt.finish("failed", Some(code));
                         }
                     }
                 }
@@ -1375,6 +1716,10 @@ mod cold_urltest_tests;
 #[cfg(test)]
 #[path = "dial_permit_scope_tests.rs"]
 mod dial_permit_scope_tests;
+
+#[cfg(all(test, feature = "native-api"))]
+#[path = "tcp_native_flow_tests.rs"]
+mod tcp_native_flow_tests;
 
 #[cfg(test)]
 mod native_accounting_tests {

@@ -42,6 +42,8 @@ pub struct ConnectionEntry {
     pub proxy: String,
     #[cfg(feature = "native-api")]
     pub routed_outbound: Option<String>,
+    #[cfg(feature = "native-api")]
+    pub native_flow_id: Option<String>,
     pub rule: String,
     pub rule_payload: String,
     pub chains: Vec<String>,
@@ -262,6 +264,7 @@ mod tests {
                 destination: "127.0.0.1:2".into(),
                 proxy: "direct".into(),
                 routed_outbound: Some("direct".into()),
+                native_flow_id: None,
                 rule: String::new(),
                 rule_payload: String::new(),
                 chains: Vec::new(),

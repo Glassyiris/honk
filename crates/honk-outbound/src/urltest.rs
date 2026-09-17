@@ -14,7 +14,7 @@
 //! Shared by clash delay measurements and periodic HTTP health checks; their
 //! wrappers remain responsible for alive-state updates.
 
-use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
+use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain, ProbeMeasurement};
 use crate::group::{
     GroupManager, ScoreFeedback, ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreTarget,
     SelectionNetwork,
@@ -27,7 +27,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 fn start_feedback(feedback: Option<ScoreFeedback>) -> Option<ScoreReporter> {
@@ -227,6 +227,7 @@ async fn urltest_request_impl(
         feedback,
     )
     .await
+    .map(|measurement| measurement.latency)
 }
 
 async fn resolve_urltest_address(
@@ -413,6 +414,7 @@ pub async fn urltest_node_addr(
         runtime, handler, &request, addr, None, timeout, timeout, None,
     )
     .await
+    .map(|measurement| measurement.latency)
 }
 
 fn phase_timeout(message: &'static str) -> anyhow::Error {
@@ -431,7 +433,7 @@ pub async fn measure_http_probe(
     connect_timeout: Duration,
     timeout: Duration,
     feedback: Option<ScoreFeedback>,
-) -> anyhow::Result<Duration> {
+) -> anyhow::Result<ProbeMeasurement> {
     validate_runtime(runtime)?;
     let target = request_target(request)?;
     let normalized_request = build_http_probe_request(&target, request.method().clone())?;
@@ -565,7 +567,7 @@ async fn h2_round(
     method: http::Method,
     reporter: &Option<ScoreReporter>,
     first_response: bool,
-) -> Result<(Duration, http::StatusCode), RoundError> {
+) -> Result<(ProbeMeasurement, http::StatusCode), RoundError> {
     std::future::poll_fn(|context| sender.poll_ready(context))
         .await
         .map_err(|error| h2_round_error(error, "HTTP/2 request readiness failed"))?;
@@ -593,7 +595,13 @@ async fn h2_round(
     }
     reporter_rx(reporter, 1);
     // ponytail: h2 defaults missing :status to 200; await hyperium/h2#958 rather than fork locally.
-    Ok((start.elapsed(), response.status()))
+    Ok((
+        ProbeMeasurement {
+            latency: start.elapsed(),
+            observed_at: SystemTime::now(),
+        },
+        response.status(),
+    ))
 }
 
 /// Two requests over a fresh HTTP/2 connection. The connection driver is
@@ -603,7 +611,7 @@ async fn exchange_http2<S>(
     request: &http::Request<()>,
     reporter: &Option<ScoreReporter>,
     timeout: Duration,
-) -> anyhow::Result<Duration>
+) -> anyhow::Result<ProbeMeasurement>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -756,7 +764,7 @@ async fn http1_round<S>(
     reporter: &Option<ScoreReporter>,
     first_response: bool,
     timeout: Duration,
-) -> Result<(Duration, http::StatusCode), RoundError>
+) -> Result<(ProbeMeasurement, http::StatusCode), RoundError>
 where
     S: AsyncBufRead + AsyncWrite + Unpin,
 {
@@ -770,7 +778,13 @@ where
         reporter_tx(reporter, wire.len());
         let status =
             read_response_head(stream, reporter, first_response, &mut response_started).await?;
-        Ok((start.elapsed(), status))
+        Ok((
+            ProbeMeasurement {
+                latency: start.elapsed(),
+                observed_at: SystemTime::now(),
+            },
+            status,
+        ))
     };
     match tokio::time::timeout(timeout, round).await {
         Ok(result) => result,
@@ -794,7 +808,7 @@ async fn exchange_http1<S>(
     request: &http::Request<()>,
     reporter: &Option<ScoreReporter>,
     timeout: Duration,
-) -> anyhow::Result<Duration>
+) -> anyhow::Result<ProbeMeasurement>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {

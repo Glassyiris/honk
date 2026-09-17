@@ -111,7 +111,7 @@ default = ["clash-api", "mimalloc", "rprx"]
 ebpf = ["aya", "aya-obj", "aya-log", "dep:honk-nfqueue"]
 # Enable the Clash-compatible REST API (experimental.clash_api)
 clash-api = ["dep:axum", "axum/ws", "dep:tower-http", "dep:percent-encoding", "dep:zip"]
-native-api = ["dep:axum", "dep:tower-http", "dep:subtle", "dep:hyper", "dep:hyper-util"]
+native-api = ["dep:axum", "dep:tower-http", "dep:subtle", "dep:hyper", "dep:hyper-util", "honk-outbound/native-api"]
 # Route the shipped binary's allocations through mimalloc (see main.rs)
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # VLESS / VMess proxy handlers (xtls-rprx-vision flow support)

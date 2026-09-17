@@ -192,6 +192,8 @@ pub struct ControlPlane {
     datapath_healthy: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "native-api")]
     phase: Option<tokio::sync::watch::Sender<EnginePhase>>,
+    #[cfg(feature = "native-api")]
+    native: Option<Arc<crate::native_api::observation::NativeObservation>>,
     active_routing_plan: Arc<parking_lot::RwLock<Arc<routing_matcher::RoutingPushPlan>>>,
     #[cfg(feature = "reload-bench-counters")]
     reload_slow_path_entries: std::sync::atomic::AtomicU64,
@@ -218,6 +220,22 @@ impl ControlPlane {
         if let Some(sender) = &self.phase {
             sender.send_replace(phase);
         }
+        if let Some(native) = &self.native {
+            native
+                .events
+                .publish("runtime.updated", serde_json::json!({}), None);
+        }
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn native_observation(
+        &mut self,
+    ) -> Arc<crate::native_api::observation::NativeObservation> {
+        Arc::clone(
+            self.native
+                .as_ref()
+                .expect("native observation configured at control-plane construction"),
+        )
     }
 
     #[cfg(feature = "native-api")]

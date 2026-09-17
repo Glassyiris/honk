@@ -3,6 +3,7 @@
 pub mod collection;
 mod health;
 pub mod latencies;
+mod observations;
 mod probe;
 mod urltest;
 
@@ -11,6 +12,11 @@ mod tests;
 
 use self::collection::DialerCollection;
 use crate::group::{ScoreFeedback, ScoreSelectionContext};
+pub use observations::{
+    HealthMeasurement, HealthPurpose, HealthState, HealthTransport, HealthWarmth,
+    NativeGroupHealthObservation, NativeGroupProbeContext, NativeHealthObservation,
+    ProbeMeasurement, UrlProbeMember,
+};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -107,6 +113,21 @@ pub enum HttpProbeResult {
     LocalRefusal(crate::proxy::PacketRejection),
 }
 
+#[derive(Debug)]
+pub struct HttpProbeOutcome {
+    pub result: HttpProbeResult,
+    pub observation: Option<NativeHealthObservation>,
+}
+
+impl From<HttpProbeResult> for HttpProbeOutcome {
+    fn from(result: HttpProbeResult) -> Self {
+        Self {
+            result,
+            observation: None,
+        }
+    }
+}
+
 /// Trait for HTTP-based health check probing through proxy nodes.
 ///
 /// Implemented by `honk-core` to route HTTP requests through the proxy
@@ -119,11 +140,11 @@ pub enum HttpProbeResult {
 pub trait HttpProber: Send + Sync {
     fn probe_http(
         &self,
-        node_name: &str,
+        node_id: Uuid,
         addr: SocketAddr,
         url: &str,
         timeout: Duration,
-    ) -> Pin<Box<dyn Future<Output = HttpProbeResult> + Send + 'static>>;
+    ) -> Pin<Box<dyn Future<Output = HttpProbeOutcome> + Send + 'static>>;
 }
 
 /// Type-erased HTTP prober stored in `AliveDialerSet`.
@@ -139,12 +160,14 @@ pub type HttpProberRef = Arc<dyn HttpProber>;
 /// from UDP selection permanently (no traffic left to revive them).
 #[derive(Debug)]
 pub struct UdpProbeOutcome {
-    /// Round-trip of the minimal DNS query through the node's UDP transport;
-    /// `None` when target policy skips it or local target initialization is still pending.
+    /// Legacy setup-inclusive DNS attempt timing; qualified exchange-only
+    /// timing is retained separately in `observations`. `None` means no attempt.
     pub dns: Option<anyhow::Result<Duration>>,
     /// Independent data-path handshake result; `None` when not run (no HTTPS
     /// check URL, no Score group, or target policy skips it).
     pub data_path: Option<anyhow::Result<Duration>>,
+    /// Qualified DNS and data measurements, captured before legacy family fanout.
+    pub observations: [Option<NativeHealthObservation>; 2],
 }
 
 /// Trait for UDP-based health check probing through proxy nodes.
@@ -162,7 +185,7 @@ pub struct UdpProbeOutcome {
 pub trait UdpProber: Send + Sync {
     fn probe_udp(
         &self,
-        node_name: &str,
+        node_id: Uuid,
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>>;
 }
@@ -265,9 +288,9 @@ type EbpfAliveCallback = dyn Fn(Uuid, u8, u32, u32, bool) + Send + Sync;
 /// must be idempotent.
 type DeathCallback = dyn Fn(Uuid, &str) + Send + Sync;
 
-/// Resolves a custom-check-URL group's member tags to `(tag, current
-/// leaf node)` pairs for probing (see `url_member_resolver`).
-pub type UrlMemberResolver = Arc<dyn Fn(&str) -> Vec<(String, String)> + Send + Sync>;
+/// Resolves custom-check members with concrete leaf IDs and optional captured
+/// native group/member identities; display tags are not node lookup keys.
+pub type UrlMemberResolver = Arc<dyn Fn(&str) -> Vec<UrlProbeMember> + Send + Sync>;
 
 /// Default URLTest group idle timeout when the group config has none
 /// (sing-box default: 30 minutes). Periodic probing of a URLTest group's
@@ -282,7 +305,7 @@ pub const DEFAULT_URLTEST_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
 pub type OutboundIdResolver = Arc<dyn Fn(Uuid) -> Option<u8> + Send + Sync>;
 
 /// A node registered for health checking: the content-derived NodeId is
-/// the map key; the name is kept for logs and the prober's node lookup.
+/// the map key; the name is kept only for display and logs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredNode {
     pub name: String,
@@ -318,6 +341,7 @@ pub struct AliveDialerSet {
     /// Per-node-per-domain latency collections (Go `collection` struct).
     collections: RwLock<HashMap<Uuid, [Arc<DialerCollection>; ALIVE_STATES_PER_NODE]>>,
     registered: RwLock<HashMap<Uuid, Arc<RegisteredNode>>>,
+    native_observations: RwLock<Option<observations::NativeObservations>>,
     ebpf_callback: RwLock<Option<Arc<EbpfAliveCallback>>>,
     death_callback: RwLock<Option<Arc<DeathCallback>>>,
     base_cooldown: Duration,
@@ -403,6 +427,7 @@ impl AliveDialerSet {
             states: RwLock::new(HashMap::new()),
             collections: RwLock::new(HashMap::new()),
             registered: RwLock::new(HashMap::new()),
+            native_observations: RwLock::new(None),
             ebpf_callback: RwLock::new(None),
             death_callback: RwLock::new(None),
             resolver: RwLock::new(None),
@@ -631,7 +656,7 @@ impl AliveDialerSet {
             .collect()
     }
 
-    /// Registered display name for logs and prober lookups; falls back to
+    /// Registered display name for logs; falls back to
     /// the ID itself for nodes driven without registration (tests).
     pub fn node_name(&self, node_id: Uuid) -> String {
         self.registered
@@ -646,6 +671,12 @@ impl AliveDialerSet {
         registered.remove(&node_id);
         self.states.write().remove(&node_id);
         self.collections.write().remove(&node_id);
+        if let Some(observations) = self.native_observations.write().as_mut() {
+            observations.nodes.remove(&node_id);
+            observations
+                .groups
+                .retain(|sample| sample.node_id != node_id);
+        }
         self.node_registered_at.write().remove(&node_id);
         self.node_urltest_groups.write().remove(&node_id);
         self.probe_history

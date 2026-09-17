@@ -34,7 +34,7 @@ The path owns raw-netlink queue `320` and nftables objects `inet honk_nfqueue` /
 
 ## Opt-in native observation API
 
-Build with `--features native-api` and configure `experimental.native_api` for independent discovery, runtime and userspace connection reads on `127.0.0.1:9527`. Bearer authentication is required unless anonymous loopback is explicitly enabled; an optional trusted local UI directory is served without downloading assets. Configuration stays in `.dae`; no configuration writes or full kernel transparency are claimed. See [native settings](doc/en/reference/experimental.md#native_api) and the [API contract](doc/en/reference/api.md#native-api-m1).
+Build with `--features native-api` and configure `experimental.native_api` for independent runtime/connections, bounded recorded flows, node/group health observations and resumable SSE on `127.0.0.1:9527`. Bearer authentication is required unless anonymous loopback is explicitly enabled; an optional trusted local UI directory is served without downloads. Configuration stays in `.dae`; group writes remain gated and full kernel transparency is not claimed. See [native settings](doc/en/reference/experimental.md#native_api) and the [API contract](doc/en/reference/api.md#native-api-m1).
 
 ## VLESS UDP and multiplexing
 

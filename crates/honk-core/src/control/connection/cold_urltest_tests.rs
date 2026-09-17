@@ -74,6 +74,10 @@ async fn tcp_carrier_capacity_is_terminal_without_health_demotion() {
                 IpVersion::V4,
                 &HashMap::new(),
                 true,
+                #[cfg(feature = "native-api")]
+                &HashMap::new(),
+                #[cfg(feature = "native-api")]
+                None,
             )
             .await;
         assert!(
@@ -122,6 +126,10 @@ async fn tcp_carrier_capacity_is_terminal_without_health_demotion() {
             IpVersion::V4,
             &HashMap::new(),
             false,
+            #[cfg(feature = "native-api")]
+            &HashMap::new(),
+            #[cfg(feature = "native-api")]
+            None,
         )
         .await;
     let Err(error) = result else {

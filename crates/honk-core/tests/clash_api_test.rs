@@ -1196,6 +1196,8 @@ async fn test_connections_snapshot_and_delete() {
         proxy: "proxy".into(),
         #[cfg(feature = "native-api")]
         routed_outbound: None,
+        #[cfg(feature = "native-api")]
+        native_flow_id: None,
         rule: "suffix".into(),
         rule_payload: "example.com".into(),
         chains: vec!["node-a".into(), "hk".into(), "proxy".into()],
@@ -1215,6 +1217,8 @@ async fn test_connections_snapshot_and_delete() {
         proxy: "proxy".into(),
         #[cfg(feature = "native-api")]
         routed_outbound: None,
+        #[cfg(feature = "native-api")]
+        native_flow_id: None,
         rule: "Match".into(),
         rule_payload: String::new(),
         chains: vec!["node-a".into(), "proxy".into()],
@@ -1803,6 +1807,8 @@ async fn test_connections_ws_stream() {
         proxy: "proxy".into(),
         #[cfg(feature = "native-api")]
         routed_outbound: None,
+        #[cfg(feature = "native-api")]
+        native_flow_id: None,
         rule: "Match".into(),
         rule_payload: String::new(),
         chains: vec!["node-a".into(), "proxy".into()],

@@ -92,6 +92,7 @@ pub struct NativeApiConfig {
     pub allow_origins: Vec<String>,
     pub allowed_hosts: Vec<String>,
     pub ui: String,
+    pub record_flows: bool,
 }
 
 impl Default for NativeApiConfig {
@@ -104,6 +105,7 @@ impl Default for NativeApiConfig {
             allow_origins: Vec::new(),
             allowed_hosts: Vec::new(),
             ui: String::new(),
+            record_flows: true,
         }
     }
 }

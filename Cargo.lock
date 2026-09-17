@@ -1607,6 +1607,7 @@ dependencies = [
  "quinn-proto",
  "rand 0.10.2",
  "rcgen",
+ "serde",
  "sha1 0.11.0",
  "sha2 0.11.0",
  "sha3",

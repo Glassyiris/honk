@@ -661,3 +661,67 @@ pub(in crate::control) fn score_reload_config(revision: u64) -> Config {
     }];
     config
 }
+
+#[cfg(feature = "native-api")]
+pub(in crate::control) struct NativeFlowApi {
+    pub(in crate::control) flows: Arc<crate::native_api::flows::FlowStore>,
+    addr: SocketAddr,
+    client: reqwest::Client,
+    server: crate::native_api::NativeServer,
+}
+
+#[cfg(feature = "native-api")]
+impl NativeFlowApi {
+    pub(in crate::control) async fn new() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = Config::default();
+        config.global.nfqueue_enable = false;
+        config.global.store_subscribe = false;
+        config.experimental.native_api.enabled = true;
+        config.experimental.native_api.listen = addr.to_string();
+        config.experimental.native_api.secret = "native-flow-test".into();
+        config.ensure_builtin_nodes();
+        let mut control = control_plane(config);
+        let state = Arc::new(
+            crate::native_api::NativeState::new(
+                &mut control,
+                addr,
+                std::time::SystemTime::now(),
+                std::time::Instant::now(),
+                true,
+            )
+            .await
+            .unwrap(),
+        );
+        let flows = Arc::clone(&control.native_observation().flows);
+        Self {
+            flows,
+            addr,
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap(),
+            server: crate::native_api::NativeServer::start(listener, state),
+        }
+    }
+
+    pub(in crate::control) async fn detail(&self, id: &str) -> serde_json::Value {
+        self.client
+            .get(format!("http://{}/api/v1/flows/{id}", self.addr))
+            .bearer_auth("native-flow-test")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    pub(in crate::control) async fn shutdown(self) {
+        self.server.shutdown().await;
+    }
+}

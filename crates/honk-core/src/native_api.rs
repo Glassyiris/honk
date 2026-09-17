@@ -1,5 +1,9 @@
 //! Independent, opt-in native observation API.
 
+pub(crate) mod catalog;
+pub(crate) mod events;
+pub(crate) mod flows;
+pub(crate) mod observation;
 mod security;
 mod types;
 mod ui;
@@ -43,6 +47,9 @@ pub struct NativeState {
     diagnostics: crate::config_diagnostics::SharedDiagnostics,
     stats: Arc<StatsManager>,
     tracker: Arc<ConnectionTracker>,
+    observation: Arc<observation::NativeObservation>,
+    alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
+    group_manager: honk_outbound::group::SharedGroupManager,
     phase: watch::Receiver<EnginePhase>,
     healthy: Arc<AtomicBool>,
     #[cfg(test)]
@@ -61,11 +68,15 @@ impl NativeState {
     ) -> anyhow::Result<Self> {
         let config = control.config_handle();
         let settings = config.read().await.experimental.native_api.clone();
+        let observation = control.native_observation();
         Ok(Self {
             security: security::Security::new(&settings, listen),
             ui: ui::load(&settings.ui).await?,
             settings,
-            instance_id: uuid::Uuid::new_v4().to_string(),
+            instance_id: observation.instance_id.clone(),
+            observation,
+            alive_set: control.alive_set(),
+            group_manager: control.group_manager(),
             started_at,
             started,
             config,
@@ -222,17 +233,40 @@ async fn dispatch(
         )
         .into_response();
     };
+    if route.template == "/api/v1/events" && method == "GET" {
+        return events::serve(&state, request, &id)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     if method == "GET" {
         let result = match route.template {
             "/api" | "/api/v1/version" | "/api/v1/capabilities" => {
                 parse_query(request.uri(), &[], &id).map(|_| match path {
                     "/api" => Json(discovery()).into_response(),
                     "/api/v1/version" => Json(version()).into_response(),
-                    _ => Json(capabilities()).into_response(),
+                    _ => Json(capabilities(state.settings.record_flows)).into_response(),
                 })
             }
             "/api/v1/runtime" => runtime(&state, request.uri(), &id).await,
             "/api/v1/connections" => connections(&state, request.uri(), &id),
+            "/api/v1/flows" => flows::list(&state, request.uri(), &id),
+            "/api/v1/flows/{flow_id}" => flows::detail(
+                &state,
+                path.trim_start_matches("/api/v1/flows/"),
+                request.uri(),
+                &id,
+            ),
+            "/api/v1/nodes" => catalog::nodes(&state, request.uri(), &id).await,
+            "/api/v1/groups" => catalog::groups(&state, request.uri(), &id).await,
+            "/api/v1/groups/{groupId}" => {
+                catalog::group(
+                    &state,
+                    path.trim_start_matches("/api/v1/groups/"),
+                    request.uri(),
+                    &id,
+                )
+                .await
+            }
             _ => Err(error(
                 StatusCode::NOT_FOUND,
                 ErrorCode::CapabilityNotSupported,
@@ -399,24 +433,37 @@ impl Ord for Candidate {
     }
 }
 
-fn connection(entry: &ConnectionEntry, full: bool) -> Connection {
+fn connection(state: &NativeState, entry: &ConnectionEntry, full: bool) -> Connection {
+    let evidence = entry
+        .native_flow_id
+        .as_deref()
+        .and_then(|id| state.observation.flows.connection_evidence(id));
     Connection {
         id: entry.id.clone(),
-        flow_id: None,
+        flow_id: entry.native_flow_id.clone(),
         pname: entry.process.clone(),
         state: "active",
         src: full.then(|| entry.source.clone()),
         dst: full.then(|| entry.destination.clone()),
         domain: full.then(|| entry.domain.clone()),
         outbound: entry.routed_outbound.clone(),
-        chain: Vec::new(),
-        chain_source: "unknown",
+        chain: evidence
+            .as_ref()
+            .map(|value| value.chain.clone())
+            .unwrap_or_default(),
+        chain_source: evidence
+            .as_ref()
+            .map_or("unknown", |value| value.chain_source),
         rule_id: None,
-        rule_expression: None,
-        rule_source: "unknown",
+        rule_expression: evidence
+            .as_ref()
+            .and_then(|value| value.rule_expression.clone()),
+        rule_source: evidence
+            .as_ref()
+            .map_or("unknown", |value| value.rule_source),
         ingress: None,
-        domain_source: None,
-        started_at: None,
+        domain_source: evidence.as_ref().and_then(|value| value.domain_source),
+        started_at: evidence.map(|value| value.started_at),
         observed_by: "userspace",
         upload_bytes: Some(entry.upload.load(Ordering::Relaxed).to_string()),
         download_bytes: Some(entry.download.load(Ordering::Relaxed).to_string()),
@@ -484,7 +531,7 @@ fn connections(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respons
         selected.push(Candidate {
             observed: entry.start_time,
             tcp,
-            value: connection(entry, full),
+            value: connection(state, entry, full),
         });
     });
     let truncated = total_tcp + total_udp > selected.len() as u64;
@@ -519,6 +566,7 @@ async fn sample_traffic(state: Arc<NativeState>, mut stop: watch::Receiver<bool>
             biased;
             _ = stop.changed() => break,
             _ = interval.tick() => {
+                state.observation.flows.maintain();
                 let now = Instant::now();
                 let totals = state.stats.traffic_totals();
                 let rates = previous.and_then(|(instant, old)| {
@@ -539,6 +587,7 @@ async fn sample_traffic(state: Arc<NativeState>, mut stop: watch::Receiver<bool>
                     bytes: TrafficBytes { upload: totals.map(|bytes| bytes.0.to_string()), download: totals.map(|bytes| bytes.1.to_string()) }, rates,
                 });
                 previous = Some((now, totals));
+                state.observation.events.publish("runtime.updated", serde_json::json!({}), None);
             }
         }
     }
@@ -573,6 +622,99 @@ impl NativeServer {
         }
     }
 }
+struct NativeIo {
+    stream: tokio::net::TcpStream,
+    idle: std::pin::Pin<Box<tokio::time::Sleep>>,
+    write_idle: std::pin::Pin<Box<tokio::time::Sleep>>,
+    write_pending: bool,
+}
+
+impl NativeIo {
+    fn new(stream: tokio::net::TcpStream) -> Self {
+        Self {
+            stream,
+            idle: Box::pin(tokio::time::sleep(Duration::from_secs(30))),
+            write_idle: Box::pin(tokio::time::sleep(Duration::from_secs(30))),
+            write_pending: false,
+        }
+    }
+
+    fn progress(&mut self) {
+        self.idle
+            .as_mut()
+            .reset(tokio::time::Instant::now() + Duration::from_secs(30));
+    }
+
+    fn pending_write(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use std::future::Future;
+        if !self.write_pending {
+            self.write_pending = true;
+            self.write_idle
+                .as_mut()
+                .reset(tokio::time::Instant::now() + Duration::from_secs(30));
+        }
+        if self.write_idle.as_mut().poll(cx).is_ready() {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()))
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for NativeIo {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::future::Future;
+        let before = buf.filled().len();
+        let result = std::pin::Pin::new(&mut self.stream).poll_read(cx, buf);
+        if matches!(result, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.progress();
+        }
+        if result.is_pending() && self.idle.as_mut().poll(cx).is_ready() {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()));
+        }
+        result
+    }
+}
+
+impl tokio::io::AsyncWrite for NativeIo {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let result = std::pin::Pin::new(&mut self.stream).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = result
+            && n > 0
+        {
+            self.progress();
+            self.write_pending = false;
+        }
+        if result.is_pending() {
+            self.pending_write(cx)
+        } else {
+            result
+        }
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
 
 async fn supervise(
     listener: TcpListener,
@@ -581,6 +723,7 @@ async fn supervise(
     _consumer: NativeConsumer,
 ) {
     let router = router(Arc::clone(&state));
+    let observation = Arc::clone(&state.observation);
     let (sampler_stop, sampler_receiver) = watch::channel(false);
     let (connections_stop, connection_receiver) = watch::channel(false);
     let mut sampler = tokio::spawn(sample_traffic(state, sampler_receiver));
@@ -611,23 +754,21 @@ async fn supervise(
                 children.spawn(async move {
                     let mut builder = hyper::server::conn::http1::Builder::new();
                     builder.timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(5)).max_headers(100).max_buf_size(32768);
-                    let connection = builder.serve_connection(TokioIo::new(stream), service);
+                    let connection = builder.serve_connection(TokioIo::new(NativeIo::new(stream)), service);
                     tokio::pin!(connection);
-                    // ponytail: M1 expires even active files at 30s; use I/O-idle deadlines before adding SSE.
-                    let _ = tokio::time::timeout(Duration::from_secs(30), async {
-                        tokio::select! {
-                            result = &mut connection => { let _ = result; }
-                            _ = stop.changed() => {
-                                connection.as_mut().graceful_shutdown();
-                                let _ = connection.await;
-                            }
+                    tokio::select! {
+                        result = &mut connection => { let _ = result; }
+                        _ = stop.changed() => {
+                            connection.as_mut().graceful_shutdown();
+                            let _ = connection.await;
                         }
-                    }).await;
+                    }
                 });
             }
         }
     }
     drop(listener);
+    observation.events.shutdown();
     let _ = sampler_stop.send(true);
     if sampler_running {
         let _ = sampler.await;
@@ -651,6 +792,8 @@ mod tests {
     async fn state() -> Arc<NativeState> {
         let mut config = Config::default();
         config.global.nfqueue_enable = false;
+        config.experimental.native_api.enabled = true;
+        config.experimental.native_api.allow_anonymous_loopback = true;
         config.ensure_builtin_nodes();
         let resolver = crate::dns::DnsResolver::new(&config.dns).unwrap();
         let forwarder = resolver.forwarder();

@@ -896,6 +896,8 @@ impl UdpEndpointPool {
         }
         let stale = self.source_settlement_endpoints(owner);
         for (key, token, generation, endpoint) in stale {
+            #[cfg(feature = "native-api")]
+            endpoint.finish_native_source(SourceRetirement::Neutral(no_reply));
             endpoint.finish_score(no_reply);
             self.retire_if_same(key, token, generation);
         }
@@ -916,6 +918,8 @@ impl UdpEndpointPool {
         };
         let stale = self.source_settlement_endpoints(owner);
         for (_, _, _, endpoint) in &stale {
+            #[cfg(feature = "native-api")]
+            endpoint.finish_native_source(SourceRetirement::Failure(outcome));
             endpoint.finish_score(outcome);
         }
         for (key, token, generation, _) in stale {

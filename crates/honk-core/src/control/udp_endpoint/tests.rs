@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(feature = "native-api")]
+mod native_flow_tests;
+
 fn transport(
     sock: Arc<UdpSocket>,
     relay: SocketAddr,
