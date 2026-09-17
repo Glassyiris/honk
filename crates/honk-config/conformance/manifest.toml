@@ -1721,7 +1721,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-global-01"
-source = { file = "doc/en/reference/global.md", lines = "129-152" }
+source = { file = "doc/en/reference/global.md", lines = "131-154" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2005,7 +2005,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-global-01"
-source = { file = "doc/zh/reference/global.md", lines = "127-150" }
+source = { file = "doc/zh/reference/global.md", lines = "129-152" }
 wrap = ""
 layer = "structure"
 honk = "accept"
