@@ -83,3 +83,5 @@ Vision 始终禁止 TCP 多路复用，但允许仅 UDP 的 Xray mux。默认允
 SPDX-License-Identifier: GPL-3.0-only
 Copyright (c) 2025, glassyiris <honk@catmint.cc> and honk contributors
 ```
+
+`tools/dae-parse/` 下仅用于开发的测试 oracle 链接了 dae（AGPL-3.0-only），边界见该目录的 `README.md`。它不随发布物分发。
