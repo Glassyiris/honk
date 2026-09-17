@@ -94,24 +94,31 @@ fn redirect_lan_packet_to_control_plane(
         else {
             return Err(TC_ACT_SHOT);
         };
-        route.to_mark()
+        if pkt.is_fragmented != 0 {
+            route.to_nfqueue_mark()
+        } else {
+            route.to_mark()
+        }
     } else {
         0
     };
+    let dns_fragment = dns_route_mark & NFQUEUE_SIGNATURE_MARK != 0;
     let now = unsafe { bpf_ktime_get_ns() };
 
     // Account this LAN → outbound packet against the final outbound
     // (redirect path; the direct+must pass-through exits count separately).
     crate::stats::count_tx(ctx, unsafe { routing_meta.data.outbound });
 
-    // The link crossing may scrub skb->mark; dae0peer restores routing
-    // authority from cb[2] after validating the carrier.
-    ctx.skb
-        .set_mark(TPROXY_MARK | (pkt.listener_l4proto as u32));
-    unsafe {
-        (*ctx.skb.skb).cb[0] = TPROXY_MARK;
-        (*ctx.skb.skb).cb[1] = pkt.listener_l4proto as u32;
-        (*ctx.skb.skb).cb[2] = dns_route_mark;
+    if !dns_fragment {
+        // The link crossing may scrub skb->mark; dae0peer restores routing
+        // authority from cb[2] after validating the carrier.
+        ctx.skb
+            .set_mark(TPROXY_MARK | (pkt.listener_l4proto as u32));
+        unsafe {
+            (*ctx.skb.skb).cb[0] = TPROXY_MARK;
+            (*ctx.skb.skb).cb[1] = pkt.listener_l4proto as u32;
+            (*ctx.skb.skb).cb[2] = dns_route_mark;
+        }
     }
 
     // Raw must UDP53 is admitted from the per-packet carrier, so only flows
@@ -195,6 +202,13 @@ fn redirect_lan_packet_to_control_plane(
             // Do not redirect when reply restoration cannot be guaranteed.
             return Err(TC_ACT_SHOT);
         }
+    }
+
+    if dns_fragment {
+        // Keep all pieces in the host for native reassembly. TC cb is not
+        // netfilter metadata; the offset-zero skb mark carries DNS authority.
+        ctx.skb.set_mark(dns_route_mark);
+        return Err(TC_ACT_OK);
     }
 
     // Redirect to host-side dae0. The netkit or veth peer delivers it inside
@@ -471,19 +485,6 @@ fn wildcard_socket_destination_is_local(ctx: &TcContext, pkt: &ParsedPacket) -> 
     result == BPF_FIB_LKUP_RET_NOT_FWDED as c_long
 }
 
-/// Existing flows probe for a local owner as before. Pure SYNs normally skip
-/// this lookup, except TCP DNS: a real host-netns port-53 LISTEN socket must
-/// get first refusal before ordered traffic routing.
-#[inline(always)]
-const fn tcp_socket_probe_required(pure_syn: bool, destination_port: u16) -> bool {
-    !pure_syn || destination_port == 53
-}
-
-// Host-build-free structural coverage for the no_std eBPF crate.
-const _: [(); 1] = [(); tcp_socket_probe_required(true, 53) as usize];
-const _: [(); 0] = [(); tcp_socket_probe_required(true, 443) as usize];
-const _: [(); 1] = [(); tcp_socket_probe_required(false, 443) as usize];
-
 // #[inline(never)]: shared by lan_ingress_l2/l3. 5-level call chain
 // with 256B baseline stays under the 512B BPF stack limit.
 #[inline(never)]
@@ -512,6 +513,15 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     // be routed, marked, or conntracked — pass through immediately.
     if crate::transport::dst_is_special(pkt, link_h_len) {
         return pass_through_classified(ctx);
+    }
+
+    if pkt.tuples.five.dst_port == 53 && (pkt.l4proto == IPPROTO_TCP || pkt.l4proto == IPPROTO_UDP)
+    {
+        // A marked backend query must also survive an explicitly LAN-bound lo.
+        let bypass_mark = PARAM.load().dae_socket_mark;
+        if bypass_mark != 0 && unsafe { (*ctx.skb.skb).mark } == bypass_mark {
+            return pass_through_classified(ctx);
+        }
     }
 
     if pkt.l4proto == IPPROTO_TCP && !crate::contrack::is_new_tcp_connection(&pkt.tcph) {
@@ -614,7 +624,8 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         IpVersionType::V6 as u8
     };
 
-    if pkt.l4proto == IPPROTO_TCP || pkt.l4proto == IPPROTO_UDP {
+    // A local DNS listener must not short-circuit the configured traffic policy.
+    if pkt.l4proto == IPPROTO_UDP && pkt.tuples.five.dst_port != 53 {
         let mut tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
         let tuple_size = if pkt.ethh.ether_type == ETH_P_IP.to_be() {
             unsafe {
@@ -642,36 +653,13 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             mem::size_of::<bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2>() as u32
         };
 
-        if pkt.l4proto == IPPROTO_TCP {
-            // Preserve the general pure-SYN lookup skip. TCP DNS is the sole
-            // exception so a LAN host listener gets first refusal before
-            // compiled routing.
-            let pure_syn = pkt.tcph.syn() != 0 && pkt.tcph.ack() == 0;
-            if tcp_socket_probe_required(pure_syn, pkt.tuples.five.dst_port) {
-                let param = PARAM.load();
-                if let Some(probe) =
-                    sk::probe_tcp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
-                {
-                    // A local (non-dae) LISTEN socket owns this destination:
-                    // NAT loopback — leave it to the kernel.
-                    // BPF_TCP_LISTEN = 10
-                    if !probe.is_dae_socket
-                        && probe.state == 10
-                        && (!probe.is_wildcard || wildcard_socket_destination_is_local(ctx, pkt))
-                    {
-                        return pass_through_classified(ctx);
-                    }
-                }
-            }
-        } else {
-            let param = PARAM.load();
-            if let Some(probe) =
-                sk::probe_udp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
-                && !probe.is_dae_socket
-                && (!probe.is_wildcard || wildcard_socket_destination_is_local(ctx, pkt))
-            {
-                return pass_through_classified(ctx);
-            }
+        let param = PARAM.load();
+        if let Some(probe) =
+            sk::probe_udp_socket(ctx, &mut tuple, tuple_size, param.dae_netns_id as u64)
+            && !probe.is_dae_socket
+            && (!probe.is_wildcard || wildcard_socket_destination_is_local(ctx, pkt))
+        {
+            return pass_through_classified(ctx);
         }
     }
 
@@ -886,7 +874,29 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         return Err(TC_ACT_SHOT);
     }
     let redirect_must = if outbound == OUTBOUND_BLOCK { 0 } else { must };
-    redirect_lan_packet_to_control_plane(
+    let dns_fragment_epoch =
+        if pkt.l4proto == IPPROTO_UDP && pkt.tuples.five.dst_port == 53 && pkt.is_fragmented != 0 {
+            // Non-host Ethernet traffic may be bridged without inet prerouting, even before
+            // an interface watcher has installed the destination port's egress fence.
+            if link_h_len != 0 && unsafe { (*ctx.skb.skb).pkt_type } != 0 {
+                return Err(TC_ACT_SHOT);
+            }
+            let Some(epoch) = crate::maps::begin_udp_decision() else {
+                return Err(TC_ACT_SHOT);
+            };
+            // Read readiness inside the epoch so its fence covers publication.
+            let current_nfq_flags = crate::maps::datapath_flags();
+            if current_nfq_flags & (DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
+                != (DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)
+            {
+                crate::maps::end_udp_decision(epoch);
+                return Err(TC_ACT_SHOT);
+            }
+            Some(epoch)
+        } else {
+            None
+        };
+    let verdict = redirect_lan_packet_to_control_plane(
         ctx,
         link_h_len,
         pkt,
@@ -897,7 +907,11 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         handoff_mode,
         0,
         routing_generation,
-    )
+    );
+    if let Some(epoch) = dns_fragment_epoch {
+        crate::maps::end_udp_decision(epoch);
+    }
+    verdict
 }
 
 // #[inline(never)]: shared by wan_ingress_l2/l3. Shallow call chain

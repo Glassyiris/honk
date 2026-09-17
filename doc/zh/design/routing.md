@@ -46,8 +46,8 @@ native-direct 与已有流缓存路径保持原生执行。
 - 配置 `(must)` 是终结结果：设置显式的 `must` 决策字段并跳过嗅探。
   Clash 模式不能覆盖 `must` 或 `block`。
 
-LAN/WAN TCP/UDP 目的端口 `53` 在现有入口排除与本地监听优先判断后，
-执行一次正常有序策略，不单独扫描 must 规则。[路由参考](../reference/routing.md#出站目标与-must)
+LAN/WAN TCP/UDP 目的端口 `53` 在既有入口与控制平面排除后，
+执行一次正常有序策略，不单独扫描 must 规则；本地监听器不能提前放行普通 LAN DNS。[路由参考](../reference/routing.md#出站目标与-must)
 定义 DNS 所有权及[显式本地路由迁移](../reference/routing.md#显式本地路由)。
 
 旧 lowering 丢弃 full/regex、把协议 OR 降成 TCP、截断规则链、DNS 只投影首条整规则、
@@ -172,9 +172,10 @@ lookup；仅清零 IPv4 key 的 padding，不清零马上会被覆盖的字节�
 及供诊断使用的 active domain-map ID。一次路由只取一个 descriptor，再同步调用一个
 槽；缓存命中报文不新增这个 lookup。
 
-已提交路由代际不回绕。单进程最多成功发布 1,048,575 次**编译路由策略**，
-耗尽后保留当前策略并拒绝替换，重启后才能继续。这不是所有 SIGHUP 或 DNS
-runtime 重载的次数限制：未变化的编译策略可以跳过发布。物理携带格式见
+已提交路由代际不回绕。`ROUTING_GENERATION_SEQUENCE` 跨进程重启保留预留值，
+20 位空间最多预留 1,048,575 次，包括失败发布和仅替换 descriptor 的 NFQUEUE fence。
+耗尽时保留当前策略、拒绝进一步发布，并保持 NFQUEUE fence 关闭；只要 host 分片队列
+仍可能存活，就不能删除该 pin。未变化策略可跳过重编译，但队列 fence 仍发布新 descriptor 代际。物理携带格式见
 [数据路径 ABI](./datapath.md#map-清单)，排队元数据与代际生命周期见
 [控制面准入](./control-plane.md#透明代理入口)。
 
