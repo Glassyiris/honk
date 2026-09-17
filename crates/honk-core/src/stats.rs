@@ -385,6 +385,8 @@ pub struct StatsManager {
     trackers: DashMap<String, OutboundTracker>,
     udp: UdpStats,
     tcp: TcpStats,
+    #[cfg(feature = "native-api")]
+    counter_since: std::time::SystemTime,
     /// Warm-reason attribution bits per node id, pruned at snapshot time to
     /// nodes that still hold warm resources.
     warm_marks: DashMap<uuid::Uuid, AtomicU8>,
@@ -458,6 +460,8 @@ impl StatsManager {
             trackers: DashMap::new(),
             udp: UdpStats::default(),
             tcp: TcpStats::default(),
+            #[cfg(feature = "native-api")]
+            counter_since: std::time::SystemTime::now(),
             warm_marks: DashMap::new(),
         }
     }
@@ -916,6 +920,31 @@ impl StatsManager {
             .add_bytes(tx, rx);
     }
 
+    pub(crate) fn byte_counters(&self, outbound: &str) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+        if let Some(tracker) = self.trackers.get(outbound) {
+            return (Arc::clone(&tracker.tx_bytes), Arc::clone(&tracker.rx_bytes));
+        }
+        let tracker = self.trackers.entry(outbound.to_owned()).or_default();
+        (Arc::clone(&tracker.tx_bytes), Arc::clone(&tracker.rx_bytes))
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn traffic_totals(&self) -> Option<(u64, u64)> {
+        self.trackers
+            .iter()
+            .try_fold((0u64, 0u64), |(tx, rx), tracker| {
+                Some((
+                    tx.checked_add(tracker.tx_bytes.load(Ordering::Relaxed))?,
+                    rx.checked_add(tracker.rx_bytes.load(Ordering::Relaxed))?,
+                ))
+            })
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn counter_since(&self) -> std::time::SystemTime {
+        self.counter_since
+    }
+
     /// Record an error on an outbound.
     pub fn record_error(&self, outbound: &str) {
         if let Some(tracker) = self.trackers.get(outbound) {
@@ -1297,5 +1326,15 @@ mod tests {
         assert_eq!(unavailable.held_packets, 1);
         assert_eq!(unavailable.held_peak, 6);
         assert_eq!(unavailable.socket_receive_buffer_bytes, 8192);
+    }
+
+    #[cfg(feature = "native-api")]
+    #[test]
+    fn native_traffic_overflow_is_unknown_not_wrapped() {
+        let stats = StatsManager::new();
+        stats.record_bytes("first", u64::MAX, 1);
+        assert_eq!(stats.traffic_totals(), Some((u64::MAX, 1)));
+        stats.record_bytes("second", 1, 0);
+        assert_eq!(stats.traffic_totals(), None);
     }
 }

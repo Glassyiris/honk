@@ -565,6 +565,15 @@ pub(super) fn parse_experimental_section(
                 ][..],
                 "cache_file" => &["enabled", "path", "cache_id", "store_fakeip", "store_dns"][..],
                 "udp_nfqueue" => &["enabled"][..],
+                "native_api" => &[
+                    "enabled",
+                    "listen",
+                    "secret",
+                    "allow_anonymous_loopback",
+                    "allow_origins",
+                    "allowed_hosts",
+                    "ui",
+                ][..],
                 _ => {
                     return Err(scalar_error(
                         header,
@@ -575,20 +584,32 @@ pub(super) fn parse_experimental_section(
                     .into());
                 }
             };
-            let lines = if name == "udp_nfqueue" {
+            let strict_section = matches!(name, "udp_nfqueue" | "native_api");
+            let strict_error = |text| {
+                if name == "native_api" {
+                    scalar_error(
+                        text,
+                        "unknown-native-api-setting",
+                        "experimental.native_api",
+                        "unknown native API setting",
+                    )
+                } else {
+                    scalar_error(
+                        text,
+                        "unknown-nfqueue-setting",
+                        "experimental.udp_nfqueue",
+                        "unknown NFQUEUE setting; only enabled is supported",
+                    )
+                }
+            };
+            let lines = if strict_section {
                 let mut lines = Vec::new();
                 if let Some(body) = segment.body() {
                     for child in body {
                         let text = Text::segment(&child);
                         diagnostics.at_text(text);
                         if read::block_header(&child).is_some() {
-                            return Err(scalar_error(
-                                text,
-                                "unknown-nfqueue-setting",
-                                "experimental.udp_nfqueue",
-                                "unknown NFQUEUE setting; only enabled is supported",
-                            )
-                            .into());
+                            return Err(strict_error(text).into());
                         }
                         lines.push(text);
                     }
@@ -600,14 +621,8 @@ pub(super) fn parse_experimental_section(
             for line in lines {
                 diagnostics.at_text(line);
                 let Some((key, value)) = line.kv() else {
-                    if name == "udp_nfqueue" {
-                        return Err(scalar_error(
-                            line,
-                            "unknown-nfqueue-setting",
-                            "experimental.udp_nfqueue",
-                            "unknown NFQUEUE setting; only enabled is supported",
-                        )
-                        .into());
+                    if strict_section {
+                        return Err(strict_error(line).into());
                     }
                     line.notice(
                         diagnostics,
@@ -618,14 +633,8 @@ pub(super) fn parse_experimental_section(
                     continue;
                 };
                 if !known_keys.contains(&key.raw()) {
-                    if name == "udp_nfqueue" {
-                        return Err(scalar_error(
-                            line,
-                            "unknown-nfqueue-setting",
-                            "experimental.udp_nfqueue",
-                            "unknown NFQUEUE setting; only enabled is supported",
-                        )
-                        .into());
+                    if strict_section {
+                        return Err(strict_error(line).into());
                     }
                     key.notice(
                         diagnostics,
@@ -704,6 +713,73 @@ pub(super) fn parse_experimental_section(
                             "experimental.cache_file.store_dns",
                             diagnostics,
                         );
+                    }
+                }
+                "native_api" => {
+                    for (key, setting, target) in [
+                        (
+                            "enabled",
+                            "experimental.native_api.enabled",
+                            &mut config.native_api.enabled,
+                        ),
+                        (
+                            "allow_anonymous_loopback",
+                            "experimental.native_api.allow_anonymous_loopback",
+                            &mut config.native_api.allow_anonymous_loopback,
+                        ),
+                    ] {
+                        if let Some(text) = values.get(key) {
+                            *target = strict_bool(text.unquote().raw()).ok_or_else(|| {
+                                scalar_error(
+                                    *text,
+                                    "invalid-config-value",
+                                    setting,
+                                    "expected true/false, yes/no, 1/0 or on/off",
+                                )
+                            })?;
+                        }
+                    }
+                    for (key, target) in [
+                        ("listen", &mut config.native_api.listen),
+                        ("secret", &mut config.native_api.secret),
+                        ("ui", &mut config.native_api.ui),
+                    ] {
+                        if let Some(text) = values.get(key) {
+                            *target = text.unquote().raw().to_owned();
+                        }
+                    }
+                    for (key, setting, target) in [
+                        (
+                            "allowed_hosts",
+                            "experimental.native_api.allowed_hosts",
+                            &mut config.native_api.allowed_hosts,
+                        ),
+                        (
+                            "allow_origins",
+                            "experimental.native_api.allow_origins",
+                            &mut config.native_api.allow_origins,
+                        ),
+                    ] {
+                        if let Some(text) = values.get(key) {
+                            let items = list_value(*text, false, false, false, diagnostics);
+                            let invalid = items.iter().any(|value| {
+                                if key == "allowed_hosts" {
+                                    crate::experimental::parse_native_authority(value, 80).is_none()
+                                } else {
+                                    crate::experimental::parse_native_origin(value).is_none()
+                                }
+                            });
+                            if invalid {
+                                return Err(scalar_error(
+                                    *text,
+                                    "invalid-config-value",
+                                    setting,
+                                    "expected individually quoted nonempty authorities or origins",
+                                )
+                                .into());
+                            }
+                            *target = items;
+                        }
                     }
                 }
                 "udp_nfqueue" => {

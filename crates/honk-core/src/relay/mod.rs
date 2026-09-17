@@ -60,6 +60,8 @@ pub struct RelayStats {
 pub struct RelayProgress {
     pub upload: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub download: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub outbound_upload: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    pub outbound_download: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     pub first_response: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -70,6 +72,7 @@ pub type OptionalRelayProgress = Option<RelayProgress>;
 pub(crate) struct ReadCounter<S> {
     inner: S,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    aggregate: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     on_progress: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -77,11 +80,13 @@ impl<S> ReadCounter<S> {
     pub(crate) fn wrap(
         inner: S,
         counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        aggregate: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
         on_progress: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     ) -> Self {
         Self {
             inner,
             counter,
+            aggregate,
             on_progress,
         }
     }
@@ -100,6 +105,9 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ReadCounter<S> {
             if n > 0 {
                 self.counter
                     .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                if let Some(aggregate) = &self.aggregate {
+                    aggregate.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                }
                 if let Some(callback) = self.on_progress.take() {
                     callback();
                 }
@@ -165,7 +173,7 @@ where
     // Sniffing or protocol setup may already have buffered bytes before the
     // relay starts, independently of bytes read by this copy loop.
     wr.flush().await?;
-    let mut rd = ReadCounter::wrap(rd, progress, None);
+    let mut rd = ReadCounter::wrap(rd, progress, None, None);
     let mut buffer = vec![0; RELAY_BUF_SIZE];
     let mut n = 0;
     loop {
@@ -504,6 +512,8 @@ mod tests {
                         Some(RelayProgress {
                             upload: upload.clone(),
                             download: download.clone(),
+                            outbound_upload: None,
+                            outbound_download: None,
                             first_response: Some(Arc::new(move || {
                                 first_response.fetch_add(1, Ordering::Relaxed);
                             })),
@@ -646,5 +656,51 @@ mod tests {
             .expect("relay pinned by stalled survivor")
             .unwrap();
         assert_eq!(stats.proxy_to_client, 4096);
+    }
+
+    #[tokio::test]
+    async fn native_copy_accounting_survives_error_and_cancellation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+        for cancel in [false, true] {
+            let (mut client, relayed_client) = tokio::io::duplex(64);
+            let (upstream, mut peer) = tokio::io::duplex(64);
+            let upload = Arc::new(AtomicU64::new(0));
+            let aggregate = Arc::new(AtomicU64::new(17));
+            let progress = RelayProgress {
+                upload: upload.clone(),
+                download: Arc::new(AtomicU64::new(0)),
+                outbound_upload: Some(aggregate.clone()),
+                outbound_download: None,
+                first_response: None,
+            };
+            client.write_all(b"abcdef").await.unwrap();
+            let mut peer = if cancel {
+                Some(&mut peer)
+            } else {
+                drop(peer);
+                None
+            };
+            let task = tokio::spawn(splice::relay_auto(
+                relayed_client,
+                upstream,
+                "127.0.0.1:1".parse().unwrap(),
+                "127.0.0.1:2".parse().unwrap(),
+                Some(progress),
+            ));
+            if let Some(peer) = peer.as_mut() {
+                let mut received = [0; 6];
+                peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"abcdef");
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(task.await.unwrap().is_err());
+            }
+            assert_eq!(upload.load(Ordering::Relaxed), 6);
+            assert_eq!(aggregate.load(Ordering::Relaxed), 23);
+        }
     }
 }

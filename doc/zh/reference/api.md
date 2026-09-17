@@ -1,6 +1,38 @@
-# Clash API 与 `/stats` 参考
+# 原生 API、Clash API 与 `/stats` 参考
 
-本文档说明 honk 已实现的 Clash 兼容 HTTP 接口及其用户态统计快照。
+原生与 Clash API 具有独立的 feature、listener、凭证及 HTTP 边界，共用底层引擎 handles 与用户态统计。
+
+## 原生 API (M1)
+
+以 `--features native-api` 构建并启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是配置权威；原生 API 不返回配置正文，也不写配置或 SQLite 状态。
+
+固定契约为 [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992)。实现 `base` profile，不声明 `full_transparency`。仅 `runtime` 与 `connections` resource 可用；其他 capability key 保留且为 false。原生 API 不支持关闭连接。
+
+| 方法 | 路径 | 含义 |
+| --- | --- | --- |
+| GET | `/api` | Discovery，固定 `/api/v1` base 与全部契约 links。 |
+| GET | `/api/v1/version` | 原生契约身份与引擎构建版本，不伪造构建时间。 |
+| GET | `/api/v1/capabilities` | 已实现资源与请求上限。 |
+| GET | `/api/v1/runtime?detail=summary\|full` | 引擎 phase、已接受代次与具有独立时间戳的用户态流量。 |
+| GET | `/api/v1/connections?type=all\|tcp\|udp&src=192.0.2.1&limit=100&detail=summary\|full` | 可见的活跃用户态连接；可选 `src` 必须为无端口 IP literal。 |
+
+`detail` 默认 `summary`，`type` 默认 `all`，`limit` 默认 100、范围 1–1000。拒绝重复单值或未知 query 参数。先过滤，再统计总量与应用 TCP+UDP 合计 limit；按注册观测时间降序、相同时间按 ID 字典序升序排列。total 是匹配的完整可见数量。IPv4-mapped IPv6 来源按 IPv4 比较。summary 省略 `src/dst/domain`，full 包含它们，未知 domain 为 null；full 不表示更高权限。
+
+连接 `outbound` 是选路当时的组/动作，不是当前叶节点或重建的选择。未实现的 flow ID、rule/chain 来源、开始 UTC 和逐连接速率保持 null/unknown。空列表仍是 `visibility: partial`，不代表设备没有连接。mock 数据面显示 disabled/none；未核验 hooks/policy 的真实后端显示 unknown/none，已知健康失败时可为 degraded。HTTP 就绪不等于数据面就绪。
+
+TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，成功写出的嗅探前缀仅计一次；UDP 保持原逐包语义。唯一的一秒 sampler 使用实际时间间隔；初次采样、reset 和 overflow 返回 null rate，不补零。`counter_since` 属于共用计数器生命周期，`sampled_at` 属于流量样本，`observed_at` 属于 HTTP 观察。UInt64 使用十进制字符串，有界数量仍为 JSON number。CPU、activation 时间、配置 revision 和 last reload 目前未知。
+
+配置 secret 后，所有 API 路径（包括 discovery/version/capabilities、禁用 action、未知 API path）都要求单个有效 Bearer header。Query token、重复凭据、错误凭据均不能回退匿名，同源 UI 也不豁免。无 secret 需显式 loopback 授权，并拒绝 `Sec-Fetch-Site: cross-site`。公共静态文件也接受 Host/Origin 校验；OPTIONS preflight 无需 bearer，但必须通过 Host、Origin、method 与 header 白名单。不返回 cookie credentials 或通配 CORS。
+
+已知禁用 action 返回 JSON `404 capability_not_supported`，未知 path 或未定义 method 返回 JSON `404 resource_not_found`。错误信封为 `{error:{code,message,details},request_id}`。HEAD 保留 GET 的状态/header，无 body。API 响应带 `Cache-Control: no-store` 与 `X-Content-Type-Options: nosniff`。应用上限为 target 4096 字节、header 名/值合计 16384 字节、body 65536 字节（含 chunked）；已认证 GET/HEAD 携带非空 body 会被拒绝。不实现 WebSocket、SSE、history ring 或读取触发 probe。
+
+原生 server 最多拥有 64 条 HTTP/1.1 连接，达到上限暂停 accept；header 读取最多五秒，每条连接存活最多 30 秒。关闭时给全部连接合计五秒 graceful drain，随后 abort 并逐一 join。连接存活上限也回收停读的公共文件响应，客户端可重新连接。TLS/HTTP2 可由可信反向代理终止；支持根路径/独立域名反代，Forwarded headers 不改写固定 discovery path，也不授予 Host/Origin 权限。
+
+**已记录的契约差异：** bootstrap 采用 common bearer 安全规则，尽管该 pin 的 bootstrap 标记了 `security: []`。Hyper 可在应用处理前以 400/414/431 或断连拒绝畸形/硬超限 HTTP；这些 transport 拒绝不保证 JSON 信封或应用 headers。
+
+应用 target/header 上限作用于 Hyper **解析并规范化后的表示**，不是原始 wire 字节。Hyper 可能先移除 request-target fragment，或合并相同 `Content-Length` 字段，再交给应用计量；这些形式的原始文本即使超过应用上限，也可能得到正常响应而不是 413。原始输入仍受 Hyper 传输处理约束。这是已接受的边界差异，不另写 HTTP parser，也不宣称原始 wire 大小保证；body 限制仍覆盖全部交付的 body 字节。
+
+配置 `ui` 后，`/` 与 `/ui` 重定向到 `/ui/`。合法的无扩展名导航可 fallback 到 `index.html`；缺失的静态资产、fonts/icons、manifest 或 service worker 返回 404，不返回 HTML。静态响应统一 `no-cache`、`nosniff`、`X-Frame-Options: DENY`，不修改 UI 自身 CSP，也不注入凭证。目录托管独立验收；不宣称已内嵌/下载 doona 或通过真实 doona/checker conformance。
 
 ## 启用与鉴权
 

@@ -272,6 +272,8 @@ impl ControlPlane {
             #[cfg(feature = "ebpf")]
             pending_udp_verdicts: None,
             datapath_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            #[cfg(feature = "native-api")]
+            phase: None,
             active_routing_plan: Arc::new(parking_lot::RwLock::new(initial_routing_plan)),
             #[cfg(feature = "reload-bench-counters")]
             reload_slow_path_entries: std::sync::atomic::AtomicU64::new(0),

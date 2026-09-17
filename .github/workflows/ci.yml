@@ -285,7 +285,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake libclang-dev
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all --all-targets -- -D warnings
+      - run: cargo clippy --all --all-targets --features honk-core/native-api -- -D warnings
       - name: Write lint CI report
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -389,9 +389,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p target/ci-report
-          cargo nextest list --workspace --profile ci --message-format json \
+          cargo nextest list --workspace --features honk-core/native-api --profile ci --message-format json \
             > target/ci-report/nextest-list.json
-      - run: cargo nextest run --workspace --profile ci
+      - run: cargo nextest run --workspace --features honk-core/native-api --profile ci
       - name: Upload workspace JUnit
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1327,6 +1327,17 @@ jobs:
           printf '%s' "$EBPF_TOOLCHAIN" > target/bpfel-unknown-none/release/honk-ebpf.toolchain
       - run: cargo check -p honk-core --no-default-features
       - run: cargo check -p honk-core --no-default-features --features clash-api
+      - run: cargo check -p honk-core --no-default-features --features native-api
+      - run: cargo check -p honk-core --no-default-features --features native-api,clash-api
+      - name: Test independent native API
+        run: |
+          set -euo pipefail
+          test_name=authentication_precedes_capability_and_query_validation
+          test "$(cargo test -p honk-core --no-default-features --features native-api --test native_api_test "$test_name" -- --exact --list --format terse)" = "$test_name: test"
+          env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY cargo test -p honk-core --no-default-features --features native-api --test native_api_test
+          test_name=native_and_clash_tokens_do_not_cross_authorize
+          test "$(cargo test -p honk-core --no-default-features --features native-api,clash-api --test native_api_test "$test_name" -- --exact --list --format terse)" = "$test_name: test"
+          env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY cargo test -p honk-core --no-default-features --features native-api,clash-api --test native_api_test "$test_name" -- --exact
       - run: cargo check -p honk-core --no-default-features --features ebpf
       - run: cargo check -p honk-tool
       - name: Test outbound without rprx

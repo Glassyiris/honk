@@ -20,6 +20,30 @@ struct TcpDnsRoute {
     runtime: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
 }
 
+async fn write_sniffed_prefix<W: tokio::io::AsyncWrite + Unpin + ?Sized>(
+    stream: &mut W,
+    bytes: &[u8],
+    connection: &std::sync::atomic::AtomicU64,
+    outbound: &std::sync::atomic::AtomicU64,
+    reporter: Option<&crate::group::ScoreReporter>,
+) -> std::io::Result<usize> {
+    use tokio::io::AsyncWriteExt;
+    let mut sent = 0;
+    while sent < bytes.len() {
+        let n = stream.write(&bytes[sent..]).await?;
+        if n == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+        }
+        sent += n;
+        connection.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        outbound.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        if let Some(reporter) = reporter {
+            reporter.tx(n as u64);
+        }
+    }
+    Ok(sent)
+}
+
 fn tcp_score_context(
     target: SocketAddr,
     domain: Option<&str>,
@@ -499,6 +523,7 @@ impl ControlPlaneHandle {
 
         let conn_upload = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let conn_download = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (outbound_upload, outbound_download) = self.stats.byte_counters(&outbound_name);
         if let Some(conn_id) = flow.track_if_enabled(|| {
             let id = uuid::Uuid::new_v4().to_string();
             let (rule, rule_payload) =
@@ -508,6 +533,11 @@ impl ControlPlaneHandle {
                 source: client_addr.to_string(),
                 destination: original_dst.to_string(),
                 proxy: node.name.clone(),
+                #[cfg(feature = "native-api")]
+                routed_outbound: self
+                    .connection_tracker
+                    .native_enabled()
+                    .then(|| outbound_name.clone()),
                 rule,
                 rule_payload,
                 chains: connection_chains(
@@ -537,9 +567,17 @@ impl ControlPlaneHandle {
             "TCP connection: {} <-> {}", client_addr, original_dst,
         );
 
-        if !sniff_result.buffered.is_empty() {
-            use tokio::io::AsyncWriteExt;
-            if let Err(e) = proxy_stream.stream.write_all(&sniff_result.buffered).await {
+        let sniffed_upload = match write_sniffed_prefix(
+            &mut *proxy_stream.stream,
+            &sniff_result.buffered,
+            &conn_upload,
+            &outbound_upload,
+            score_reporter.as_ref(),
+        )
+        .await
+        {
+            Ok(sent) => sent,
+            Err(e) => {
                 warn!("Failed to write sniffed bytes to proxy: {}", e);
                 self.stats.record_error(&outbound_name);
                 self.stats.record_close(&outbound_name);
@@ -548,10 +586,7 @@ impl ControlPlaneHandle {
                 }
                 return Ok(());
             }
-        }
-        if let Some(reporter) = &score_reporter {
-            reporter.tx(sniff_result.buffered.len() as u64);
-        }
+        };
 
         // Zero-copy fast path: a direct dial yields plain `TcpStream`s on
         // both ends, so relay through `splice(2)` (with automatic lossless
@@ -566,6 +601,8 @@ impl ControlPlaneHandle {
         let conn_progress = relay::RelayProgress {
             upload: conn_upload.clone(),
             download: conn_download.clone(),
+            outbound_upload: Some(outbound_upload),
+            outbound_download: Some(outbound_download),
             first_response,
         };
         let relay_result = match proxy_stream.into_tcp_stream() {
@@ -593,7 +630,7 @@ impl ControlPlaneHandle {
         if let Some(reporter) = &score_reporter {
             let upload = conn_upload.load(std::sync::atomic::Ordering::Relaxed);
             let download = conn_download.load(std::sync::atomic::Ordering::Relaxed);
-            reporter.tx(upload);
+            reporter.tx(upload - sniffed_upload as u64);
             reporter.rx(download);
             if download > 0 {
                 reporter.first_response();
@@ -602,12 +639,7 @@ impl ControlPlaneHandle {
         flow.retire().await;
 
         match relay_result {
-            Ok(relay_stats) => {
-                self.stats.record_bytes(
-                    &outbound_name,
-                    relay_stats.client_to_proxy,
-                    relay_stats.proxy_to_client,
-                );
+            Ok(_) => {
                 if let Some(reporter) = &score_reporter {
                     reporter.finish(crate::group::ScoreOutcome::Success);
                 }
@@ -747,14 +779,6 @@ impl ControlPlaneHandle {
                 }
             }
             Err(e) => {
-                // The relay updates these atomics as every read/splice completes.
-                // Preserve bytes moved before an I/O failure rather than turning
-                // the whole flow into a synthetic zero-byte success.
-                self.stats.record_bytes(
-                    &outbound_name,
-                    conn_upload.load(std::sync::atomic::Ordering::Relaxed),
-                    conn_download.load(std::sync::atomic::Ordering::Relaxed),
-                );
                 let io_err = e.downcast_ref::<std::io::Error>();
                 if let Some(io_err) = io_err {
                     if relay::is_ignorable_connection_error(io_err) {
@@ -1351,3 +1375,30 @@ mod cold_urltest_tests;
 #[cfg(test)]
 #[path = "dial_permit_scope_tests.rs"]
 mod dial_permit_scope_tests;
+
+#[cfg(test)]
+mod native_accounting_tests {
+    use super::write_sniffed_prefix;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn native_prefix_partial_failure_keeps_only_written_bytes() {
+        let connection = AtomicU64::new(0);
+        let outbound = AtomicU64::new(7);
+        let (mut writer, mut reader) = tokio::io::duplex(3);
+        let (result, received) = tokio::join!(
+            write_sniffed_prefix(&mut writer, b"abcdef", &connection, &outbound, None),
+            async move {
+                let mut received = [0; 3];
+                reader.read_exact(&mut received).await.unwrap();
+                drop(reader);
+                received
+            }
+        );
+        assert_eq!(&received, b"abc");
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(connection.load(Ordering::Relaxed), 3);
+        assert_eq!(outbound.load(Ordering::Relaxed), 10);
+    }
+}

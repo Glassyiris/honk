@@ -262,6 +262,7 @@ The current process-scoped consumers reject a SIGHUP reload when any of these va
 | Process state | `global.log_level`, `global.data_dir`, `global.store_subscribe` |
 | DNS listener | Semantic `dns.bind` endpoint or transport change |
 | Clash API | `experimental.clash_api.external_controller`, `external_ui`, `external_ui_download_url`, `external_ui_download_detour`, `secret`, `default_mode` |
+| Native API | Any `experimental.native_api` change |
 | Persistence | Any `experimental.cache_file` change |
 | NFQUEUE | `global.nfqueue_enable` |
 | Health probes and TLS | `global.check_interval`, the effective first `global.tcp_check_url`, `global.tcp_check_http_method` when HTTP probing is enabled, the selected `global.udp_check_dns` target, or a native TLS/uTLS mode change ([health-check reload semantics](../reference/global.md#reloading-health-checks-and-tls-mode)) |
@@ -285,6 +286,14 @@ Body acceptance and runtime publication are reported separately. A collection-ad
 - `src/subscription.rs` — fetch/parse and atomic raw-body persistence: `<global.data_dir>/.sub` mode `0700`, hash-named files `0600`; existing `/var/share/honk/.sub`, then `./.sub` are legacy fallbacks. Never move/delete automatically or write subscription nodes into config. `src/subscription/supervisor.rs` owns revision-authorized startup/immediate/periodic workers; reconcile/shutdown joins replaced workers. Startup/reload in `src/lib.rs` restores valid bodies before network refresh, skips restored subscriptions' five-second first-fetch wait, and reconciles workers only after SIGHUP commit. Fetch/parse/write failure preserves active nodes and the last valid body.
 - Daemon fetch/restore and `honk-tool sub` local files share body detection. Simple/Custom accept BOM, wrapped standard/URL-safe Base64, raw share links, Clash YAML/JSON, SIP008, sing-box JSON, Surge/Surfboard/Loon/Quantumult X records. `src/subscription/json.rs` and `records.rs` normalize foreign records; `clash.rs` constructs/validates typed nodes. Never import full-profile routing/DNS/groups. Native JSON preserves Unicode surrogate-pair names. Skip unsupported nodes, retain first usable duplicate identity, preserve active subscriptions on empty results. Imported Trojan/AnyTLS/QUIC require TLS, never silent plaintext.
   Clash and sing-box TCP ALPN normalize to the shared TLS model, not TUIC's QUIC field. Shared-builder skip warnings expose only a one-based proxy index and static rejection reason, never raw node records or credentials.
+
+## Native observation API
+
+The independent, default-off `native-api` feature binds before control-plane admission. Its optional phase watch reports running only after the real admission-open result, and draining before shutdown fencing; the existing health handle can refine running to degraded. Reads hold the config publication barrier through generation and health observation without changing publication lock order. HTTP availability is not datapath health.
+
+`native_api.rs` owns its listener, 64-connection JoinSet, one one-second sampler and native tracker consumer through joined shutdown. Headers have a five-second budget, HTTP connections a 30-second lifetime, and shutdown one five-second connection grace budget. Native tracker ownership is separate from Clash/interrupt ownership, and native-only final handoffs do not request legacy routing evidence. The API exposes partial userspace visibility, not kernel transparency; no history/log/flow rings are allocated.
+
+TCP copy reads and successful splice writes increment the existing per-outbound atomics live; accepted sniff-prefix writes are counted once, including partial failures. Closing or cancelling a relay never adds its totals again. The same counters serve existing statistics and native sampling; UDP's per-packet accounting remains unchanged. Wire contract, limits and unknown fields: [API reference](../reference/api.md#native-api-m1).
 
 ## Clash API and cache DB
 

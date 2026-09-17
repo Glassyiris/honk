@@ -650,6 +650,11 @@ impl ControlPlaneHandle {
                 source: client_addr.to_string(),
                 destination: original_dst.to_string(),
                 proxy: node.name.clone(),
+                #[cfg(feature = "native-api")]
+                routed_outbound: self
+                    .connection_tracker
+                    .native_enabled()
+                    .then(|| outbound_name.clone()),
                 rule,
                 rule_payload,
                 chains: connection_chains(selection_chain, &node.name),

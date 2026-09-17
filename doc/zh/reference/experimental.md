@@ -1,6 +1,6 @@
 # Experimental 配置参考
 
-本文档说明 `experimental { ... }` 下当前支持的两个嵌套 section。
+本文档说明 `experimental { ... }` 下当前支持的嵌套 section。
 
 ## Section 概览
 
@@ -8,8 +8,45 @@
 | --- | --- |
 | `clash_api` | Clash 兼容 HTTP API 与外部 dashboard |
 | `cache_file` | 用 SQLite 持久化运行时选择、模式、延迟样本和可选 DNS 状态 |
+| `native_api` | 独立、显式启用的只读原生 API 与本地 UI 目录 |
 
 `udp_nfqueue { enabled: ... }` 是已弃用的兼容 section。dae 和结构化配置加载器仍会接受它，打印迁移 warning，并将值复制到 `global.nfqueue_enable`；新配置应直接使用全局字段。
+
+## `native_api`
+
+需要默认关闭的 Cargo feature `native-api`，不依赖 `clash-api`。未编译该 feature 却启用配置时，启动报错。所有字段都要求重启；SIGHUP 拒绝其变更并保留当前 listener 与配置代次。未知字段、标量中的嵌套块、无效布尔值及安全列表空成员均报错。
+
+| 字段 | 默认值 | 含义 |
+| --- | --- | --- |
+| `enabled` | `false` | 启动独立原生 listener。 |
+| `listen` | `"127.0.0.1:9527"` | 数字 IP 与 1–65535 端口，不接受主机名或 `:port` 简写。 |
+| `secret` | `""` | 独立于 Clash 的 bearer 凭证。除显式匿名 loopback 外必须配置。 |
+| `allow_anonymous_loopback` | `false` | 仅在 secret 为空且实际监听 IP 为 loopback 时允许无凭证请求。配置 secret 后仍必须认证。 |
+| `allow_origins` | 空列表 | 额外允许的完整 HTTP(S) Origin；不含路径、凭据、query、fragment、`null` 或通配符。 |
+| `allowed_hosts` | 空列表 | 额外允许的 HTTP Host authority；不含 URL scheme、路径、凭据或通配符。省略端口表示 80，不是监听端口。 |
+| `ui` | `""` | 空值关闭托管；非空为含可读 `index.html` 的可信本地目录。不支持内嵌产物，也不在启动时下载或构建。 |
+
+```dae
+experimental {
+    native_api {
+        enabled: true
+        listen: '127.0.0.1:9527'
+        secret: 'operator-supplied-random-token'
+        allow_anonymous_loopback: false
+        ui: '/usr/share/doona'
+    }
+}
+```
+
+非空原生 secret 必须为不含空白或逗号的可见 ASCII，与 HTTP bearer parser 一致；不支持的字节在共同配置准入处报错，不会启动一个无法认证的 listener。
+
+请替换示例 secret。本地无凭证开发需省略 `secret` 并显式设置 `allow_anonymous_loopback: true`；不能通过反向代理公开该匿名 listener。非 loopback 网络上的明文 HTTP 加 token 不是安全部署，应由可信代理终止 TLS。
+
+默认 Host 只接受具体监听 authority；loopback 另接受同端口的 `localhost`、`127.0.0.1` 与 `[::1]`。通配监听不授权任意 Host。只有真实直连对应的 HTTP Origin 自动允许。TLS 反代若保留 `Host: panel.example`，需配置 `allowed_hosts: 'panel.example'` 与 `allow_origins: 'https://panel.example'`；若保留 `Host: panel.example:443`，则使用 `allowed_hosts: 'panel.example', 'panel.example:443'`。Forwarded headers 不授予权限。
+
+列表采用逐项引号与逗号分隔，例如 `allow_origins: 'http://localhost:3000', 'https://panel.example'`。省略表示空列表；不接受 JSON 方括号或整段引号聚合。
+
+相对 UI 路径沿用依赖搜索顺序：`global.data_dir` 下已有路径、`/var/share/honk` 下已有路径、工作目录已有路径；均不存在时定位到 `global.data_dir` 并在启动时报错。目录及其符号链接目标均由可信管理员负责。参见[原生 API 契约](./api.md#原生-api-m1)。
 
 ## `clash_api`
 

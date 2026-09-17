@@ -47,6 +47,8 @@ fn tracked_entry(id: &str) -> ConnectionEntry {
         source: "192.0.2.1:50000".to_string(),
         destination: "203.0.113.2:443".to_string(),
         proxy: "direct".to_string(),
+        #[cfg(feature = "native-api")]
+        routed_outbound: None,
         rule: "Fallback".to_string(),
         rule_payload: String::new(),
         chains: vec!["direct".to_string()],

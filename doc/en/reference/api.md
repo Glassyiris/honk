@@ -1,6 +1,38 @@
-# Clash API and `/stats` reference
+# Native API, Clash API and `/stats` reference
 
-This reference describes honk's implemented Clash-compatible HTTP surface and its userspace statistics snapshot.
+The native and Clash APIs have independent features, listeners, credentials, and HTTP boundaries; both reuse the same engine handles and userspace statistics.
+
+## Native API (M1)
+
+Build with `--features native-api` and enable [`experimental.native_api`](./experimental.md#native_api). `--no-default-features --features native-api` works without Clash. `.dae` remains the configuration authority; this API neither reads configuration bodies nor writes configuration or SQLite state.
+
+The frozen contract is [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992). Its `base` profile is implemented, not `full_transparency`. Only `runtime` and `connections` resources are available; all other capability keys remain present and false. Connections cannot be closed through this API.
+
+| Method | Path | Meaning |
+| --- | --- | --- |
+| GET | `/api` | Discovery, fixed `/api/v1` base and all contract links. |
+| GET | `/api/v1/version` | Native contract identity and the engine's build version; no invented build timestamp. |
+| GET | `/api/v1/capabilities` | Implemented resources and request limits. |
+| GET | `/api/v1/runtime?detail=summary\|full` | Engine phase, accepted generation and independently timestamped visible userspace traffic. |
+| GET | `/api/v1/connections?type=all\|tcp\|udp&src=192.0.2.1&limit=100&detail=summary\|full` | Visible active userspace connections; `src` is an optional IP literal without port. |
+
+`detail` defaults to `summary`; `type` to `all`; `limit` to 100 (range 1–1000). Duplicate single-value or unknown query parameters are rejected. Connection filters apply before totals and the combined TCP+UDP limit. Rows are newest registered first, with lexical ID tie-breaking; totals describe all matching visible rows. IPv4-mapped IPv6 sources compare as IPv4. Summary omits `src`, `dst`, and `domain`; full includes them, with unknown domain null. Full is not an elevated permission level.
+
+Connection `outbound` is the routing-time group/action, not a current leaf or a reconstructed selection. Unsupported flow IDs, rule/chain provenance, start UTC, and per-connection rates remain null/unknown. Empty lists have `visibility: partial`, not proof that the device has no connections. Runtime mock datapaths are disabled/none; a real backend without verified hook/policy evidence is unknown/none (or degraded when health is known false). HTTP readiness is not datapath readiness.
+
+TCP accounting advances during successful copy reads or splice destination writes, including successfully written sniff prefixes once. UDP retains its per-packet accounting. A single one-second sampler uses the actual elapsed interval; first samples, resets and overflow produce null rates rather than synthetic zeros. `counter_since` belongs to the shared counter lifetime, `sampled_at` to the traffic sample, and `observed_at` to the HTTP observation. UInt64 fields are decimal strings; bounded counts remain JSON numbers. CPU usage, activation timestamp, configuration revision and last reload are currently unknown.
+
+All API paths—including discovery/version/capabilities, unavailable actions and unknown API paths—require one valid Bearer header when a secret is configured. Query tokens, duplicate credentials and invalid credentials never fall back to anonymous. Same-origin UI is not exempt. Secretless operation requires explicit loopback authorization and rejects `Sec-Fetch-Site: cross-site`. Host and Origin checks also apply to public static files; OPTIONS preflight requires a permitted Host/Origin/method/header set but no bearer. No cookie credentials or wildcard CORS is returned.
+
+Known unavailable actions return JSON `404 capability_not_supported`; unknown paths or undefined methods return JSON `404 resource_not_found`. Errors use `{error:{code,message,details},request_id}`. HEAD follows GET status/headers without a body. API responses use `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. Application limits are 4096 target bytes, 16384 aggregate header-name/value bytes and 65536 body bytes, including chunked requests; authenticated GET/HEAD with a nonempty body is invalid. No WebSocket, SSE, history ring or probe side effect is implemented.
+
+The native server owns at most 64 HTTP/1.1 connections, pauses acceptance at capacity, bounds header reading to five seconds and connection lifetime to 30 seconds, and drains connections for at most five seconds before aborting and joining them on shutdown. The lifetime also reclaims stalled public file responses; clients may reconnect. TLS/HTTP2 can terminate at a trusted reverse proxy. Root-path/independent-domain proxying is supported; forwarded headers neither rewrite fixed discovery paths nor authorize a Host/Origin.
+
+**Documented contract differences:** bootstrap authentication follows the common bearer security rule despite the pin's bootstrap `security: []`. Hyper can reject malformed/hard-limit HTTP with 400/414/431 or a disconnect before application code; those transport rejections need not carry the JSON envelope or application headers.
+
+Application target/header budgets apply to Hyper's **parsed, normalized representation**, not the original wire bytes. Hyper may remove a request-target fragment or coalesce equal `Content-Length` fields before application counting; oversized original text in those forms can therefore reach a normal response instead of 413. Raw input remains subject to Hyper's transport handling. This is an accepted boundary difference, not a second HTTP parser or a raw-wire size guarantee; body limits still cover all delivered body bytes.
+
+With `ui` configured, `/` and `/ui` redirect to `/ui/`. Valid extensionless navigation may fall back to `index.html`; missing static assets, fonts/icons, manifest or service worker return 404, never HTML. Static responses use `no-cache`, `nosniff` and `X-Frame-Options: DENY`, without modifying the UI's CSP or injecting credentials. Directory hosting is independently verified; no bundled/downloaded doona artifact or real doona/checker conformance is claimed.
 
 ## Enablement and authentication
 

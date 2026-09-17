@@ -213,6 +213,7 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 | 进程状态 | `global.log_level`、`global.data_dir`、`global.store_subscribe` |
 | DNS listener | `dns.bind` endpoint 或 transport 的语义变更 |
 | Clash API | `experimental.clash_api.external_controller`、`external_ui`、`external_ui_download_url`、`external_ui_download_detour`、`secret`、`default_mode` |
+| 原生 API | 任意 `experimental.native_api` 变更 |
 | 持久化 | 任意 `experimental.cache_file` 变更 |
 | NFQUEUE | `global.nfqueue_enable` |
 | 健康检查与 TLS | `global.check_interval`、生效的第一个 `global.tcp_check_url`、启用 HTTP 检查时的 `global.tcp_check_http_method`、选中的 `global.udp_check_dns` 目标，或原生 TLS/uTLS 模式切换（参见[健康检查重载语义](../reference/global.md#重载健康检查与-tls-模式)） |
@@ -235,6 +236,14 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 - 守护进程的拉取/恢复路径与 `honk-tool sub` 的本地文件共用正文格式检测。`Simple`/`Custom` 接受 BOM、可换行的标准/URL-safe Base64、原始分享链接、Clash YAML/JSON、SIP008、sing-box JSON，以及 Surge/Surfboard/Loon/Quantumult X 记录。`src/subscription/json.rs` 与 `records.rs` 规范化外部记录，`clash.rs` 构造并校验类型化节点。
   只导入节点，不导入完整配置中的路由、DNS 或组。原生 JSON 保留以 Unicode 代理项对编码的名称。跳过不支持的节点，身份重复时保留首个可用节点，空结果不替换活动订阅。导入的 Trojan/AnyTLS/QUIC 节点必须使用 TLS，不会静默降级为明文。
   Clash 与 sing-box 的 TCP ALPN 归入共享 TLS 模型，而不是 TUIC 的 QUIC 字段。共享构造器的跳过告警只包含从 1 开始的代理序号和静态拒绝原因，不包含原始节点记录或凭据。
+
+## 原生观测 API
+
+独立且默认关闭的 `native-api` feature 在控制面准入前绑定。按需 phase watch 仅在真实 admission-open 成功后报告 running，在关闭栅栏前报告 draining；现有 health handle 可将 running 细化为 degraded。读取 generation 与 health 期间保留 config 发布屏障，不改变发布锁序。HTTP 可用不代表数据面健康。
+
+`native_api.rs` 完整持有 listener、最多 64 个连接的 JoinSet、唯一的一秒 sampler 与独立 native tracker consumer，直到关闭 join 完成。Header 读取预算五秒，HTTP 连接存活最多 30 秒，关闭时全部连接共享五秒 grace。Clash/interrupt 与 native 的 tracker 所有权独立；native-only final handoff 不重复生成旧 API 的选路证据。只声明部分用户态可见性，不声明内核透明观测，不分配 history/log/flow ring。
+
+TCP copy 成功读取与 splice 成功写入实时累加既有逐出站 atomics；成功接受的嗅探前缀仅计一次，部分写失败也保留已写字节。Relay 关闭或取消不再次累加总量。既有统计与原生采样共用这些计数，UDP 原逐包语义不变。Wire 契约、上限与未知字段见 [API 参考](../reference/api.md#原生-api-m1)。
 
 ## Clash API 与 cache DB
 

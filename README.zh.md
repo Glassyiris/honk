@@ -32,6 +32,10 @@ global {
 
 该路径拥有 raw-netlink 队列 `320` 和 nftables 对象 `inet honk_nfqueue` / `udp_decision`；honk 运行期间，同一网络命名空间中的防火墙管理器必须保持这些对象不变。Direct 释放被保留的 skb，proxy 把一份保留的 payload 提交给正常 UDP 初始化器，block/取消则丢弃报文。ingest actor 最多保留 256 个报文和 8 MiB payload；每个报文从 listener 收到时起都保留固定的三秒绝对期限。启用 Clash API 后，`/stats.udp.nfqueue` 会暴露 actor 深度、字节数、最老年龄，以及明确的内核统计可用状态和读取失败数。完整不变量与指标 schema 见 [NFQUEUE 设计](doc/zh/design/nfqueue.md)和 [API 参考](doc/zh/reference/api.md)。
 
+## 可选原生观测 API
+
+以 `--features native-api` 构建并配置 `experimental.native_api`，可在 `127.0.0.1:9527` 独立读取 discovery、runtime 与用户态连接。除显式匿名 loopback 外均要求 bearer；可托管可信本地 UI 目录，不下载资产。配置仍由 `.dae` 管理，不提供配置写入，也不宣称完整内核透明观测。详见[原生设置](doc/zh/reference/experimental.md#native_api)与 [API 契约](doc/zh/reference/api.md#原生-api-m1)。
+
 ## VLESS UDP 与多路复用
 
 VLESS 现由三个独立选项组合：`udp=0|1` 控制 packet 权限，`packetEncoding=auto|none|xudp|uot-v2` 选择非复用 UDP 回退路径，`mux=off|h2mux|xray` 选择 carrier 多路复用。规范链接默认允许 UDP、使用 `packetEncoding=auto` 和 `mux=off`；例如 `vless://00000000-0000-4000-8000-000000000001@edge.example:443?security=tls&packetEncoding=auto&mux=off&udp=1#edge`。未启用 Vision 时，Auto 对 53/443 使用原生 VLESS UDP；其他获准目标使用 Single XUDP。

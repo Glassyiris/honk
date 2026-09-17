@@ -1,6 +1,6 @@
 # Experimental Configuration Reference
 
-This reference describes the two current nested sections under `experimental { ... }`.
+This reference describes the current nested sections under `experimental { ... }`.
 
 ## Section overview
 
@@ -8,8 +8,45 @@ This reference describes the two current nested sections under `experimental { .
 | --- | --- |
 | `clash_api` | Clash-compatible HTTP API and external dashboard |
 | `cache_file` | SQLite persistence for runtime choices, mode, delay samples, and optional DNS state |
+| `native_api` | Independent, opt-in read-only native API and local UI directory |
 
 `udp_nfqueue { enabled: ... }` is a deprecated compatibility section. Dae and structured loaders accept it, print a migration warning, and copy its value to `global.nfqueue_enable`; new configurations should use the global field directly.
+
+## `native_api`
+
+Requires the default-off `native-api` Cargo feature; it does not require `clash-api`. Enabling it without that feature fails startup. All fields are restart-required: SIGHUP rejects changes and preserves the active listener and configuration generation. Unknown fields, nested scalar blocks, malformed booleans, and empty security-list members are errors.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Start the independent native listener. |
+| `listen` | `"127.0.0.1:9527"` | Numeric IP plus port 1–65535; no hostname or `:port` shorthand. |
+| `secret` | `""` | Bearer credential, independent of the Clash credential. Required unless explicit anonymous loopback is enabled. |
+| `allow_anonymous_loopback` | `false` | Permit credential-free requests only when secret is empty and the actual listening IP is loopback. A configured secret always requires authentication. |
+| `allow_origins` | empty list | Additional explicit HTTP(S) origins, without paths, credentials, query, fragment, `null`, or wildcards. |
+| `allowed_hosts` | empty list | Additional explicit HTTP Host authorities, without URL schemes, paths, credentials, or wildcards. Omitted port means 80, not the listener's port. |
+| `ui` | `""` | Empty disables hosting; otherwise a trusted local directory with readable `index.html`. No embedded UI or startup download/build. |
+
+```dae
+experimental {
+    native_api {
+        enabled: true
+        listen: '127.0.0.1:9527'
+        secret: 'operator-supplied-random-token'
+        allow_anonymous_loopback: false
+        ui: '/usr/share/doona'
+    }
+}
+```
+
+Nonempty native secrets must be visible ASCII without whitespace or commas, matching the HTTP bearer parser; unsupported bytes fail shared configuration admission rather than creating an unusable listener.
+
+Replace the example secret. For local credential-free development, omit `secret` and explicitly set `allow_anonymous_loopback: true`; never publish that anonymous listener through a reverse proxy. Plain HTTP with a token on a non-loopback network is not a secure deployment. Terminate TLS at a trusted proxy.
+
+Default Host acceptance is the concrete listening authority; loopback also accepts `localhost`, `127.0.0.1`, and `[::1]` at that port. A wildcard bind does not authorize arbitrary Hosts. Only directly corresponding HTTP origins are automatically allowed. A TLS proxy preserving `Host: panel.example` needs `allowed_hosts: 'panel.example'` and `allow_origins: 'https://panel.example'`; if it preserves `Host: panel.example:443`, add `allowed_hosts: 'panel.example', 'panel.example:443'`. Forwarded headers do not grant authorization.
+
+Lists use individually quoted comma-separated entries, such as `allow_origins: 'http://localhost:3000', 'https://panel.example'`. Omit a list to leave it empty; JSON brackets and a single aggregate-quoted list are not accepted.
+
+Relative UI paths follow the existing dependency search: an existing path under `global.data_dir`, then `/var/share/honk`, then the working directory; a missing dependency resolves under `global.data_dir` and startup fails. The administrator owns the directory and any symlink targets. See the [native API contract](./api.md#native-api-m1).
 
 ## `clash_api`
 

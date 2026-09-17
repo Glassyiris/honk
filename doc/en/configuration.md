@@ -12,7 +12,7 @@ honk uses dae configuration syntax as a dialect: the known differences from dae 
 | `routing` | Apply ordered traffic rules and a fallback outbound. | [Routing reference](./reference/routing.md) |
 | `dns` | Configure listeners, upstreams, request/response policy, and cache behavior. | [DNS reference](./reference/dns.md) |
 | `subscription` | Fetch remote node lists. | [Subscription reference](./reference/subscription.md) |
-| `experimental` | Enable the Clash API or persistent cache. | [Experimental reference](./reference/experimental.md) |
+| `experimental` | Enable the independent native API, Clash API, or persistent cache. | [Experimental reference](./reference/experimental.md) |
 | CLI | Select a config, backend, object file, or local command. | [CLI reference](./reference/cli.md) |
 
 The built-in outbounds `direct` and `block` are injected at startup and may be used in groups and routing rules.
@@ -267,6 +267,8 @@ Declare each source as `tag: 'url'`, append `(UA)` after the quoted URL for a pe
 See the [subscription reference](./reference/subscription.md).
 
 ## Enabling the Clash API, cache file, and held-first-packet UDP
+
+**Native API.** Build with `--features native-api`, then set `experimental.native_api.enabled: true` and a separate strong `secret`. The default address is `127.0.0.1:9527`; explicitly anonymous loopback is available for local development only. All native fields require restart. An optional `ui` directory must already contain readable `index.html`; no UI is downloaded. See the [native settings](./reference/experimental.md#native_api) and [read-only API](./reference/api.md#native-api-m1).
 
 **Clash API.** A non-empty `experimental.clash_api.external_controller` enables the server. Keep it on loopback unless a firewall and non-empty `secret` protect it; an empty secret disables API authentication. A relative `external_ui` prefers an existing directory below `data_dir`, then `/var/share/honk`, then the working directory; if none exists, the dashboard is downloaded under `data_dir`. `external_ui_download_url` selects the ZIP source, while `external_ui_download_detour` forces the download through one node or group; empty values retain the built-in URL and normal traffic routing.
 

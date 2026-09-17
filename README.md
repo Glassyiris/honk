@@ -32,6 +32,10 @@ Changing `global.nfqueue_enable` requires a restart. If NFQUEUE is requested wit
 
 The path owns raw-netlink queue `320` and nftables objects `inet honk_nfqueue` / `udp_decision`; same-namespace firewall managers must leave them untouched while honk runs. Direct releases the held skb, proxy submits one retained payload to the normal UDP initializer, and block/cancellation drops it. The ingest actor is bounded to 256 packets and 8 MiB of payload, and every packet keeps a three-second absolute deadline from listener receipt. With the Clash API enabled, `/stats.udp.nfqueue` exposes actor depth/bytes/oldest age plus explicit kernel-stat availability and read failures. See the [NFQUEUE design](doc/en/design/nfqueue.md) and [API reference](doc/en/reference/api.md) for invariants and the full metric schema.
 
+## Opt-in native observation API
+
+Build with `--features native-api` and configure `experimental.native_api` for independent discovery, runtime and userspace connection reads on `127.0.0.1:9527`. Bearer authentication is required unless anonymous loopback is explicitly enabled; an optional trusted local UI directory is served without downloading assets. Configuration stays in `.dae`; no configuration writes or full kernel transparency are claimed. See [native settings](doc/en/reference/experimental.md#native_api) and the [API contract](doc/en/reference/api.md#native-api-m1).
+
 ## VLESS UDP and multiplexing
 
 VLESS now composes three independent choices: `udp=0|1` controls packet permission, `packetEncoding=auto|none|xudp|uot-v2` selects the non-multiplexed UDP fallback, and `mux=off|h2mux|xray` selects carrier multiplexing. Canonical links default to UDP enabled, `packetEncoding=auto`, and `mux=off`; for example, `vless://00000000-0000-4000-8000-000000000001@edge.example:443?security=tls&packetEncoding=auto&mux=off&udp=1#edge`. Without Vision, Auto uses native VLESS UDP on ports 53/443; other permitted targets use Single XUDP.

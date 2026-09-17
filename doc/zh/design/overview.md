@@ -68,6 +68,8 @@ flowchart LR
 
 `src/share_link.rs` 是唯一 `Node::from_share_link` parser；`src/share_link/options.rs` 把 URI packet encoding 与独立 mux controls 归入规范协议模型，再进行 normalization、validation 与 identity derivation。`src/node/wire.rs` 是唯一 flat serde adapter；VLESS 输入即使以 `null` 出现已移除的旧字段也会拒绝，而同一字段在非 VLESS 输入上仅为兼容 artifact。`VlessConfig.network`、`udp_encoding` 与 `multiplex` 参与 identity，因此规范 cutover 可以改变 VLESS `Node.id`，但不改变 VMess 行为或 identity。行为概要见[出站设计](./outbound.md#vless-wire-契约)，字段语法见[节点参考](../reference/nodes.md)。
 
+`src/experimental.rs` 的 `ExperimentalConfig` 持有 `clash_api`、`native_api` 与 `cache_file`。原生设置严格校验、独立启用且均需重启；默认关闭的 `native-api` feature 仅提供可见用户态观测。弃用的 `udp_nfqueue` 块仍只用于迁移，将 `enabled` 复制到 `GlobalConfig::nfqueue_enable` 并发出 warning。
+
 ## 高层数据路径
 
 ```mermaid
@@ -128,6 +130,7 @@ flowchart TB
 | --- | --- | --- |
 | `ebpf` | 否 | 引入 `aya`、`aya-obj`、`aya-log` 和可选 `honk-nfqueue`；`build.rs` 嵌入静态 `honk-ebpf` 对象，用户态在运行时编译 policy extension。运行时要求 Linux kernel 6.12+。 |
 | `clash-api` | 是 | 引入可选 `axum` 与 `tower-http`，提供 Clash 兼容 REST/WebSocket 服务。 |
+| `native-api` | 否 | 独立的 HTTP/1.1 原生观测 API 与本地目录 UI；完整拥有有界连接，严格校验 bearer/Host/Origin，不依赖 Clash。 |
 | `mimalloc` | 是 | 引入 `mimalloc` 与 `libmimalloc-sys`，并将 mimalloc 安装为 `honk-core` 二进制的 allocator。在 Linux 上，程序会在启动 Tokio 前为当前进程禁用透明大页。 |
 | `rprx` | 是 | 启用 `honk-outbound/rprx`，注册 VLESS 与 VMess Handler，包括受支持的 VLESS Encryption 和 `xtls-rprx-vision` 路径。 |
 

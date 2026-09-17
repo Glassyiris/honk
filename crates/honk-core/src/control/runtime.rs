@@ -818,6 +818,8 @@ impl ControlPlane {
                 .await;
             return Err(anyhow::anyhow!("open eBPF datapath admission: {error}"));
         }
+        #[cfg(feature = "native-api")]
+        self.publish_phase(EnginePhase::Running);
         info!("eBPF datapath admission opened after listener publication");
         let tcp_scaler = tokio::spawn(run_tcp_admission_scaler(
             Arc::clone(&self.concurrency_limit),
@@ -939,6 +941,8 @@ impl ControlPlane {
                 }
             }
         }
+        #[cfg(feature = "native-api")]
+        self.publish_phase(EnginePhase::Draining);
 
         if let Some(flags) = self.datapath_flags.as_ref()
             && let Err(error) = flags.fence_nfqueue().await

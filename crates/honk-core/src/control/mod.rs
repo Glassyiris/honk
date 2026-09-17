@@ -113,6 +113,15 @@ fn spawn_network_refresh_retry(tx: mpsc::Sender<ControlCommand>) -> tokio::task:
 #[cfg(test)]
 type PreDnsPublicationHook = Box<dyn FnOnce(&Arc<GroupManager>) + Send>;
 
+#[cfg(feature = "native-api")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EnginePhase {
+    Starting,
+    Running,
+    Draining,
+    Failed,
+}
+
 /// The main control plane.
 pub struct ControlPlane {
     config: Arc<RwLock<Arc<Config>>>,
@@ -181,6 +190,8 @@ pub struct ControlPlane {
     #[cfg(feature = "ebpf")]
     pending_udp_verdicts: Option<Arc<nfqueue::PendingUdpVerdicts>>,
     datapath_healthy: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "native-api")]
+    phase: Option<tokio::sync::watch::Sender<EnginePhase>>,
     active_routing_plan: Arc<parking_lot::RwLock<Arc<routing_matcher::RoutingPushPlan>>>,
     #[cfg(feature = "reload-bench-counters")]
     reload_slow_path_entries: std::sync::atomic::AtomicU64,
@@ -195,6 +206,25 @@ pub struct ControlPlane {
 pub(crate) use udp_removal::spawn_udp_removal_worker;
 
 impl ControlPlane {
+    #[cfg(feature = "native-api")]
+    pub(crate) fn observe_phase(&mut self) -> tokio::sync::watch::Receiver<EnginePhase> {
+        self.phase
+            .get_or_insert_with(|| tokio::sync::watch::channel(EnginePhase::Starting).0)
+            .subscribe()
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn publish_phase(&self, phase: EnginePhase) {
+        if let Some(sender) = &self.phase {
+            sender.send_replace(phase);
+        }
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn datapath_health_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.datapath_healthy)
+    }
+
     /// Install the startup mode snapshot before the flags writer starts.
     pub fn set_mode_state(&mut self, mode_state: crate::mode::SharedModeState) {
         assert!(

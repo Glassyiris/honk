@@ -247,6 +247,8 @@ async fn startup_failure_drops_saturated_control_receiver() {
         udp_test_forwarder(),
     )
     .unwrap();
+    #[cfg(feature = "native-api")]
+    let phase = control_plane.observe_phase();
 
     let command_tx = control_plane.command_sender();
     for _ in 0..command_tx.max_capacity() {
@@ -264,6 +266,8 @@ async fn startup_failure_drops_saturated_control_receiver() {
         .run()
         .await
         .expect_err("occupied dns.bind must fail startup");
+    #[cfg(feature = "native-api")]
+    assert_eq!(*phase.borrow(), EnginePhase::Starting);
 
     assert!(
         tokio::time::timeout(Duration::from_secs(1), blocked_delivery)
@@ -1557,6 +1561,7 @@ async fn tcp_proxy_protocols_pass_domain_without_local_resolution() -> anyhow::R
         let mut config = udp_test_config(name, vec![node], vec![]);
         config.ensure_builtin_nodes();
         config.global.dial_mode = "domain+".into();
+        let routed_outbound = config.routing.default_outbound.clone();
         let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
         let dial_target = Arc::new(std::sync::Mutex::new(None));
         let handler = Arc::new(UdpTestHandler {
@@ -1606,16 +1611,198 @@ async fn tcp_proxy_protocols_pass_domain_without_local_resolution() -> anyhow::R
         let mut received = vec![0; hello.len()];
         upstream.read_exact(&mut received).await?;
         assert_eq!(received, hello, "{protocol:?}");
+        assert_eq!(
+            handle.stats.snapshot()[&routed_outbound].tx_bytes,
+            hello.len() as u64
+        );
         client.shutdown().await?;
         upstream.shutdown().await?;
         drop(client);
         drop(upstream);
         tokio::time::timeout(Duration::from_secs(5), task).await???;
         assert_eq!(
+            handle.stats.snapshot()[&routed_outbound].tx_bytes,
+            hello.len() as u64
+        );
+        assert_eq!(
             dns_queries.load(std::sync::atomic::Ordering::Relaxed),
             0,
             "{protocol:?} resolved the target locally"
         );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_tcp_accounting_updates_before_close() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let destination = listener.local_addr()?;
+    let mut client = TcpStream::connect(destination).await?;
+    let (accepted, peer) = listener.accept().await?;
+    let mut config = Config::default();
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "ip".into();
+    config.routing.default_outbound = "G".into();
+    config.groups.push(Group {
+        name: "G".into(),
+        nodes: config.nodes.iter().map(|node| node.id).collect(),
+        ..Default::default()
+    });
+    #[cfg(feature = "native-api")]
+    {
+        config.experimental.native_api.enabled = true;
+        config.experimental.native_api.allow_anonymous_loopback = true;
+    }
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+    let plane = ControlPlane::new(
+        config,
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        router,
+        Arc::new(ProxyRegistry::default_resolver()?),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
+        udp_test_forwarder(),
+    )?;
+    plane
+        .group_manager()
+        .read()
+        .set_selector_choice("G", "direct");
+    #[cfg(feature = "native-api")]
+    let mut plane = plane;
+    #[cfg(feature = "native-api")]
+    let (native, api_url, http) = {
+        plane.udp_pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
+            4,
+            Arc::new(support::UdpTestReplySocketFactory),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let state = crate::native_api::NativeState::new(
+            &mut plane,
+            address,
+            std::time::SystemTime::now(),
+            std::time::Instant::now(),
+            true,
+        )
+        .await?;
+        let server = crate::native_api::NativeServer::start(listener, Arc::new(state));
+        let url = format!("http://{address}/api/v1/runtime");
+        let http = reqwest::Client::builder().no_proxy().build()?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let body: serde_json::Value =
+                    http.get(&url).send().await.unwrap().json().await.unwrap();
+                if body["traffic"]["sampled_at"].is_string() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        (server, url, http)
+    };
+    let handle = plane.spawn_handle();
+    handle.connection_tracker.disable_api();
+    store_active_tcp_flow(&handle, destination, peer).await?;
+    let worker = handle.clone();
+    let task = tokio::spawn(async move { worker.serve_connection(accepted, peer).await });
+    let (mut upstream, _) =
+        tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+
+    client.write_all(b"upload").await?;
+    let mut received = [0; 6];
+    upstream.read_exact(&mut received).await?;
+    assert_eq!(&received, b"upload");
+    upstream.write_all(b"download").await?;
+    let mut received = [0; 8];
+    client.read_exact(&mut received).await?;
+    assert_eq!(&received, b"download");
+    assert!(!task.is_finished());
+    let totals = handle.stats.snapshot();
+    assert_eq!((totals["G"].tx_bytes, totals["G"].rx_bytes), (6, 8));
+    #[cfg(feature = "native-api")]
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let body: serde_json::Value = http
+                .get(&api_url)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if body["traffic"]["rates"]["upload_bytes_per_second"]
+                .as_str()
+                .is_some_and(|rate| rate.parse::<u64>().unwrap() > 0)
+            {
+                assert_eq!(body["traffic"]["bytes"]["upload"], "6");
+                assert_eq!(body["traffic"]["bytes"]["download"], "8");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    #[cfg(feature = "native-api")]
+    {
+        let url = api_url.replace("runtime", "connections");
+        let before: serde_json::Value = http.get(&url).send().await?.json().await?;
+        assert_eq!(before["tcp"][0]["outbound"], "G");
+        handle
+            .group_manager
+            .read()
+            .set_selector_choice("G", "block");
+        let after: serde_json::Value = http.get(&url).send().await?.json().await?;
+        assert_eq!(after["tcp"][0]["id"], before["tcp"][0]["id"]);
+        assert_eq!(after["tcp"][0]["outbound"], "G");
+    }
+
+    client.shutdown().await?;
+    upstream.shutdown().await?;
+    drop(client);
+    drop(upstream);
+    tokio::time::timeout(Duration::from_secs(5), task).await???;
+    let totals = handle.stats.snapshot();
+    assert_eq!((totals["G"].tx_bytes, totals["G"].rx_bytes), (6, 8));
+    #[cfg(feature = "native-api")]
+    {
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let body: serde_json::Value = http.get(&api_url).send().await?.json().await?;
+        assert_eq!(body["traffic"]["rates"]["upload_bytes_per_second"], "0");
+        assert_eq!(body["traffic"]["rates"]["download_bytes_per_second"], "0");
+        assert_eq!(body["traffic"]["bytes"]["upload"], "6");
+        handle
+            .group_manager
+            .read()
+            .set_selector_choice("G", "direct");
+        let echo = UdpSocket::bind("127.0.0.1:0").await?;
+        let udp_client = UdpSocket::bind("127.0.0.1:0").await?;
+        let source = udp_client.local_addr()?;
+        let target = echo.local_addr()?;
+        serve_test_udp_to(&handle, source, target, b"packet").await?;
+        let mut packet = [0; 16];
+        let (size, sender) =
+            tokio::time::timeout(Duration::from_secs(3), echo.recv_from(&mut packet)).await??;
+        assert_eq!(&packet[..size], b"packet");
+        echo.send_to(&packet[..size], sender).await?;
+        let (size, _) =
+            tokio::time::timeout(Duration::from_secs(3), udp_client.recv_from(&mut packet))
+                .await??;
+        assert_eq!(&packet[..size], b"packet");
+        let body: serde_json::Value = http
+            .get(api_url.replace("runtime", "connections?type=udp"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert_eq!(body["udp"][0]["outbound"], "G");
+        assert_eq!(body["udp"][0]["upload_bytes"], "6");
+        assert_eq!(body["udp"][0]["download_bytes"], "6");
+        let totals = handle.stats.snapshot();
+        assert_eq!((totals["G"].tx_bytes, totals["G"].rx_bytes), (12, 14));
+        handle.udp_pool.remove(source, target);
+        native.shutdown().await;
     }
     Ok(())
 }

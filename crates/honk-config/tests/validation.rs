@@ -608,3 +608,104 @@ mod share_link_security {
         assert!(!shadowrocket.tls().unwrap().enabled);
     }
 }
+
+mod native_api {
+    use honk_config::{Config, parser::parse_dae_config_with_detailed_diagnostics};
+
+    #[test]
+    fn native_api_security_syntax_never_falls_back() {
+        for input in [
+            "secrett: PRIVATE",
+            "enabled: maybe",
+            "allow_anonymous_loopback: maybe",
+            "secret { value: PRIVATE }",
+            "unknown { secret: PRIVATE }",
+            "allowed_hosts: 'localhost', ''",
+            "allow_origins: 'http://localhost',",
+            "allow_origins: 'http://localhost,http://example.test'",
+            "allowed_hosts: ['localhost']",
+        ] {
+            let mut diagnostics = Vec::new();
+            let error = parse_dae_config_with_detailed_diagnostics(
+                &format!("experimental {{\n native_api {{\n {input}\n }}\n}}"),
+                &mut diagnostics,
+            )
+            .unwrap_err();
+            assert_eq!(error.diagnostic.line, Some(3), "{input}");
+            assert!(
+                error
+                    .diagnostic
+                    .setting
+                    .to_string()
+                    .starts_with("experimental.native_api")
+            );
+            assert!(!format!("{error:?}{diagnostics:?}").contains("PRIVATE"));
+        }
+        let config = parse_dae_config_with_detailed_diagnostics(
+            "experimental {\n native_api {\n allow_origins: 'http://localhost:3000', 'https://panel.example'\n allowed_hosts: 'panel.example', '[::1]:9527'\n }\n}", &mut Vec::new()
+        ).unwrap();
+        assert_eq!(
+            config.experimental.native_api.allow_origins,
+            ["http://localhost:3000", "https://panel.example"]
+        );
+        assert!(
+            serde_json::from_str::<Config>(
+                r#"{"experimental":{"native_api":{"secrett":"PRIVATE"}}}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn native_api_security_uses_every_admission_boundary() {
+        for native in [
+            serde_json::json!({"enabled":true}),
+            serde_json::json!({"enabled":true,"listen":"0.0.0.0:9527","allow_anonymous_loopback":true}),
+            serde_json::json!({"enabled":true,"listen":":9527","secret":"PRIVATE"}),
+            serde_json::json!({"enabled":true,"listen":"localhost:9527","secret":"PRIVATE"}),
+            serde_json::json!({"enabled":true,"listen":"127.0.0.1:0","secret":"PRIVATE"}),
+            serde_json::json!({"enabled":true,"secret":"PRIVATE phrase"}),
+            serde_json::json!({"enabled":true,"secret":"PRIVATE,token"}),
+            serde_json::json!({"enabled":true,"secret":"PRIVATE密钥"}),
+            serde_json::json!({"allowed_hosts":["panel.example:bad"]}),
+            serde_json::json!({"allowed_hosts":["*.example"]}),
+            serde_json::json!({"allowed_hosts":["https://panel.example"]}),
+            serde_json::json!({"allowed_hosts":["user@panel.example"]}),
+            serde_json::json!({"allowed_hosts":["::1"]}),
+            serde_json::json!({"allow_origins":["null"]}),
+            serde_json::json!({"allow_origins":["https://panel.example/"]}),
+            serde_json::json!({"allow_origins":["https://panel.example?secret=PRIVATE"]}),
+            serde_json::json!({"allow_origins":["https://user:PRIVATE@panel.example"]}),
+            serde_json::json!({"ui":"embedded"}),
+        ] {
+            let config: Config =
+                serde_json::from_value(serde_json::json!({"experimental":{"native_api":native}}))
+                    .unwrap();
+            for error in [
+                config.validate_detailed().unwrap_err(),
+                config.validate_assembled().unwrap_err(),
+            ] {
+                assert!(
+                    error
+                        .diagnostic
+                        .setting
+                        .to_string()
+                        .starts_with("experimental.native_api")
+                );
+                assert!(!format!("{error:?}").contains("PRIVATE"));
+            }
+        }
+        for native in [
+            serde_json::json!({}),
+            serde_json::json!({"enabled":true,"allow_anonymous_loopback":true}),
+            serde_json::json!({"enabled":true,"listen":"[::1]:9527","allow_anonymous_loopback":true}),
+            serde_json::json!({"enabled":true,"listen":"0.0.0.0:9527","secret":"PRIVATE"}),
+        ] {
+            let config: Config =
+                serde_json::from_value(serde_json::json!({"experimental":{"native_api":native}}))
+                    .unwrap();
+            config.validate_detailed().unwrap();
+            config.validate_assembled().unwrap();
+        }
+    }
+}

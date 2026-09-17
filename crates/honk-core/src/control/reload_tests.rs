@@ -79,6 +79,33 @@ fn udp_nfqueue_toggle_requires_restart() {
 }
 
 #[test]
+fn native_api_settings_require_restart() {
+    let current = Config::default();
+    for (field, value) in [
+        ("enabled", serde_json::json!(true)),
+        ("listen", serde_json::json!("127.0.0.1:9528")),
+        ("secret", serde_json::json!("replacement")),
+        ("allow_anonymous_loopback", serde_json::json!(true)),
+        ("allowed_hosts", serde_json::json!(["panel.example"])),
+        (
+            "allow_origins",
+            serde_json::json!(["https://panel.example"]),
+        ),
+        ("ui", serde_json::json!("/srv/ui")),
+    ] {
+        let mut replacement = current.clone();
+        let mut native = serde_json::to_value(&replacement.experimental.native_api).unwrap();
+        native[field] = value;
+        replacement.experimental.native_api = serde_json::from_value(native).unwrap();
+        assert_eq!(
+            restart_required_changes(&current, &replacement),
+            ["experimental.native_api"],
+            "{field}"
+        );
+    }
+}
+
+#[test]
 fn semantically_equivalent_dns_bind_does_not_require_restart() {
     let mut current = Config::default();
     current.dns.bind = "127.0.0.1:53".into();

@@ -656,6 +656,7 @@ impl Config {
     }
 
     fn validate_globals_detailed(&self, source: &SourceRef) -> Result<(), DetailedConfigError> {
+        self.experimental.native_api.validate_detailed(source)?;
         if let Err(mut error) = crate::check::validate_dns_check_targets(&self.global.udp_check_dns)
         {
             error.diagnostic.source = source.clone();

@@ -1,4 +1,4 @@
-//! Per-connection state tracker for the Clash API and interrupting groups.
+//! Per-connection state tracker for HTTP APIs and interrupting groups.
 //!
 //! Uses [`DashMap`] for concurrent-safe access from multiple tokio tasks
 //! (accept loop, relay workers, and HTTP API handlers).
@@ -40,6 +40,8 @@ pub struct ConnectionEntry {
     pub source: String,
     pub destination: String,
     pub proxy: String,
+    #[cfg(feature = "native-api")]
+    pub routed_outbound: Option<String>,
     pub rule: String,
     pub rule_payload: String,
     pub chains: Vec<String>,
@@ -86,11 +88,13 @@ impl ConnectionEntry {
 pub struct ConnectionTracker {
     entries: DashMap<String, ConnectionEntry>,
     consumers: AtomicU8,
+    consumer_transition: parking_lot::Mutex<()>,
 }
 
-#[cfg(any(feature = "clash-api", test))]
 const API_CONSUMER: u8 = 1;
 const INTERRUPT_CONSUMER: u8 = 2;
+#[cfg(feature = "native-api")]
+const NATIVE_CONSUMER: u8 = 4;
 
 impl ConnectionTracker {
     /// Create an empty tracker.
@@ -98,17 +102,20 @@ impl ConnectionTracker {
         Self {
             entries: DashMap::new(),
             consumers: AtomicU8::new(0),
+            consumer_transition: parking_lot::Mutex::new(()),
         }
     }
 
     /// Enable tracking for the Clash API.
     #[cfg(any(feature = "clash-api", test))]
     pub(crate) fn enable(&self) {
+        let _transition = self.consumer_transition.lock();
         self.consumers.fetch_or(API_CONSUMER, Ordering::AcqRel);
     }
 
     /// Enable tracking for interrupting group selections.
     pub(crate) fn enable_for_interrupts(&self) {
+        let _transition = self.consumer_transition.lock();
         self.consumers
             .fetch_or(INTERRUPT_CONSUMER, Ordering::AcqRel);
     }
@@ -116,6 +123,7 @@ impl ConnectionTracker {
     /// Stop API-only tracking after its server terminates.
     #[cfg(any(feature = "clash-api", test))]
     pub(crate) fn disable_api(&self) {
+        let _transition = self.consumer_transition.lock();
         let previous = self.consumers.fetch_and(!API_CONSUMER, Ordering::AcqRel);
         if previous & !API_CONSUMER == 0 {
             self.entries.clear();
@@ -124,6 +132,38 @@ impl ConnectionTracker {
 
     pub(crate) fn is_enabled(&self) -> bool {
         self.consumers.load(Ordering::Acquire) != 0
+    }
+
+    pub(crate) fn needs_rule_details(&self) -> bool {
+        self.consumers.load(Ordering::Acquire) & (API_CONSUMER | INTERRUPT_CONSUMER) != 0
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn enable_native(&self) {
+        let _transition = self.consumer_transition.lock();
+        self.consumers.fetch_or(NATIVE_CONSUMER, Ordering::AcqRel);
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn disable_native(&self) {
+        let _transition = self.consumer_transition.lock();
+        let previous = self.consumers.fetch_and(!NATIVE_CONSUMER, Ordering::AcqRel);
+        if previous & !NATIVE_CONSUMER == 0 {
+            self.entries.clear();
+        }
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn native_enabled(&self) -> bool {
+        self.consumers.load(Ordering::Acquire) & NATIVE_CONSUMER != 0
+    }
+
+    /// The visitor must not re-enter the tracker or acquire control-plane locks.
+    #[cfg(feature = "native-api")]
+    pub(crate) fn visit(&self, mut visitor: impl FnMut(&ConnectionEntry)) {
+        for entry in &self.entries {
+            visitor(entry.value());
+        }
     }
 
     pub(crate) fn register_if_enabled(
@@ -190,5 +230,78 @@ mod tests {
         tracker.enable_for_interrupts();
         tracker.disable_api();
         assert!(tracker.is_enabled());
+    }
+
+    #[cfg(feature = "native-api")]
+    #[test]
+    fn native_consumer_preserves_other_observers() {
+        let tracker = ConnectionTracker::new();
+        tracker.enable_native();
+        assert!(!tracker.needs_rule_details());
+        tracker.enable();
+        tracker.disable_native();
+        assert!(tracker.is_enabled());
+        assert!(tracker.needs_rule_details());
+        tracker.enable_native();
+        tracker.disable_api();
+        assert!(tracker.native_enabled());
+        assert!(!tracker.needs_rule_details());
+        tracker.enable_for_interrupts();
+        tracker.disable_native();
+        assert!(tracker.needs_rule_details());
+    }
+
+    #[cfg(feature = "native-api")]
+    #[test]
+    fn native_enable_cannot_overtake_last_consumer_clear() {
+        use super::*;
+        fn entry(id: &str) -> ConnectionEntry {
+            ConnectionEntry {
+                id: id.into(),
+                source: "127.0.0.1:1".into(),
+                destination: "127.0.0.1:2".into(),
+                proxy: "direct".into(),
+                routed_outbound: Some("direct".into()),
+                rule: String::new(),
+                rule_payload: String::new(),
+                chains: Vec::new(),
+                upload: Arc::new(AtomicU64::new(0)),
+                download: Arc::new(AtomicU64::new(0)),
+                start_time: Instant::now(),
+                domain: None,
+                network: "tcp".into(),
+                process: None,
+                process_path: None,
+            }
+        }
+        let tracker = Arc::new(ConnectionTracker::new());
+        tracker.enable();
+        tracker.register(entry("old"));
+        let old = tracker.entries.get("old").unwrap();
+        let disabling = Arc::clone(&tracker);
+        let disabled = std::thread::spawn(move || disabling.disable_api());
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while tracker.is_enabled() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(tracker.consumer_transition.try_lock().is_none());
+        let enabling = Arc::clone(&tracker);
+        let enabled = std::thread::spawn(move || {
+            enabling.enable_native();
+            enabling.register(entry("new"));
+        });
+        drop(old);
+        disabled.join().unwrap();
+        enabled.join().unwrap();
+        assert!(tracker.native_enabled());
+        assert_eq!(
+            tracker
+                .snapshot()
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["new"]
+        );
     }
 }

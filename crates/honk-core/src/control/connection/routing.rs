@@ -203,7 +203,7 @@ impl ControlPlaneHandle {
         if let Some(handoff) = handoff
             && handoff.outbound != OutboundIndex::ControlPlaneRouting as u8
             && !reroute_by_sniffed_domain
-            && !self.connection_tracker.is_enabled()
+            && !self.connection_tracker.needs_rule_details()
         {
             return RoutingDecision {
                 outbound: self.outbound_index_to_name(handoff.outbound).await,
@@ -334,3 +334,42 @@ pub(in crate::control) fn domain_reality_outcome(
 #[cfg(test)]
 #[path = "sniffed_domain_routing_tests.rs"]
 mod sniffed_domain_routing_tests;
+
+#[cfg(all(test, feature = "native-api"))]
+mod native_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn native_final_handoff_does_not_wait_for_router_evidence() {
+        let mut config = Config::default();
+        config.ensure_builtin_nodes();
+        let plane = crate::control::tests::support::control_plane(config);
+        let handle = plane.spawn_handle();
+        handle.connection_tracker.disable_api();
+        handle.connection_tracker.enable_native();
+        let handoff = HandoffResult::from(RoutingHandoffEntry {
+            result: RoutingResult {
+                outbound: OutboundIndex::Direct as u8,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let info = build_connection_info(
+            None,
+            "192.0.2.1:443".parse().unwrap(),
+            "127.0.0.1:1234".parse().unwrap(),
+            "tcp",
+            Some(&handoff),
+        );
+        let _router = handle.router.write().await;
+        let decision = tokio::time::timeout(
+            Duration::from_millis(100),
+            handle.prepare_routing(DialMode::Ip, &info, false, Some(&handoff)),
+        )
+        .await
+        .expect("native observation must not repeat routing");
+        assert_eq!(decision.outbound, "direct");
+        assert!(decision.matched_rule.is_none());
+        handle.connection_tracker.disable_native();
+    }
+}

@@ -55,6 +55,8 @@ reqwest = { version = "0.13", features = [
 ], default-features = false }
 h2 = "0.4"
 http = "1"
+hyper = { version = "1.11.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio", "service"] }
 
 # eBPF / Aya
 aya = "0.14"
@@ -90,6 +92,7 @@ hmac = "0.13"
 hkdf = "0.13"
 md-5 = "0.11"
 blake3 = "1"
+subtle = "2.6.1"
 
 # Networking
 socket2 = { version = "0.6", features = ["all"] }

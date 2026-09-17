@@ -12,7 +12,7 @@ honk 使用 dae 配置语法的一种方言；与 dae 的已知差异见[方言�
 | `routing` | 应用有序流量规则与默认出站。 | [路由参考](./reference/routing.md) |
 | `dns` | 配置监听、上游、请求/响应策略与缓存行为。 | [DNS 参考](./reference/dns.md) |
 | `subscription` | 获取远程节点列表。 | [订阅参考](./reference/subscription.md) |
-| `experimental` | 启用 Clash API 或持久化缓存。 | [Experimental 参考](./reference/experimental.md) |
+| `experimental` | 启用独立原生 API、Clash API 或持久化缓存。 | [Experimental 参考](./reference/experimental.md) |
 | CLI | 选择配置、后端、目标文件或本地命令。 | [CLI 参考](./reference/cli.md) |
 
 内置出站 `direct` 与 `block` 会在启动时注入，可用于组和路由规则。
@@ -269,6 +269,8 @@ dns {
 详见 [订阅参考](./reference/subscription.md)。
 
 ## 启用 Clash API、缓存文件与首包保留 UDP
+
+**原生 API。** 使用 `--features native-api` 构建，再设置 `experimental.native_api.enabled: true` 与独立的强 `secret`。默认地址为 `127.0.0.1:9527`；显式匿名 loopback 仅供本地开发。所有原生字段均需重启。可选 `ui` 目录必须已有可读 `index.html`，不会下载 UI。详见[原生设置](./reference/experimental.md#native_api)与[只读 API](./reference/api.md#原生-api-m1)。
 
 **Clash API。** 非空的 `experimental.clash_api.external_controller` 会启用服务器。除非防火墙和非空 `secret` 已提供保护，否则应保持 loopback 绑定；空 secret 会关闭 API 认证。相对 `external_ui` 依次优先使用 `data_dir` 下、`/var/share/honk` 下和工作目录中的已有目录；都不存在时，在 `data_dir` 下下载 dashboard。`external_ui_download_url` 选择 ZIP 来源，`external_ui_download_detour` 强制下载经过指定节点或组；空值分别保留内建 URL 和普通流量路由。
 

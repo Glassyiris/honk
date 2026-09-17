@@ -18,6 +18,8 @@ pub mod control;
 pub mod dns;
 pub mod ebpf;
 pub mod mode;
+#[cfg(feature = "native-api")]
+pub mod native_api;
 #[cfg(feature = "ebpf")]
 pub(crate) mod netlink;
 pub mod pool;
@@ -650,12 +652,21 @@ pub(crate) fn report_runtime_admission_error(error: &DetailedConfigError) {
 }
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    #[cfg(feature = "native-api")]
+    let started_at = std::time::SystemTime::now();
+    #[cfg(feature = "native-api")]
+    let started = std::time::Instant::now();
     // Load the configuration before initializing logging so `log_level` in
     // the config file is honored (previously only --debug/RUST_LOG had any
     // effect and config log_level was silently ignored).
     let mut diagnostics = Vec::new();
     let startup = (|| -> anyhow::Result<_> {
         let mut config = load_operator_config(cli.config.to_str().unwrap(), &mut diagnostics)?;
+        #[cfg(not(feature = "native-api"))]
+        anyhow::ensure!(
+            !config.experimental.native_api.enabled,
+            "native-api feature is required"
+        );
         let requested_data_dir = PathBuf::from(&config.global.data_dir);
         let (runtime_data_dir, data_dir_creation_error) =
             prepare_runtime_data_dir(&requested_data_dir)?;
@@ -1257,6 +1268,36 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     control_plane.set_mode_state(mode_state.clone());
     control_plane.start_datapath_flags_coordinator()?;
 
+    #[cfg(feature = "native-api")]
+    let native_server = {
+        let settings = control_plane
+            .config_handle()
+            .read()
+            .await
+            .experimental
+            .native_api
+            .clone();
+        if settings.enabled {
+            let listener = tokio::net::TcpListener::bind(&settings.listen)
+                .await
+                .map_err(|_| anyhow::anyhow!("native API listener bind failed"))?;
+            let listen = listener.local_addr()?;
+            let state = native_api::NativeState::new(
+                &mut control_plane,
+                listen,
+                started_at,
+                started,
+                mock_mode,
+            )
+            .await?;
+            let server = native_api::NativeServer::start(listener, std::sync::Arc::new(state));
+            info!(%listen, "native API listener ready");
+            Some(server)
+        } else {
+            None
+        }
+    };
+
     // Starts only when external_controller is configured; bind/parse
     // failures are logged and never abort startup.
     #[cfg(feature = "clash-api")]
@@ -1393,6 +1434,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     info!("honk-core is running. Press Ctrl+C to stop.");
     let control_result = control_plane.run().await;
+    #[cfg(feature = "native-api")]
+    {
+        if control_result.is_err() {
+            control_plane.publish_phase(control::EnginePhase::Failed);
+        }
+        if let Some(server) = native_server {
+            server.shutdown().await;
+        }
+    }
 
     // Signal systemd that we're stopping (Type=notify)
     #[cfg(target_os = "linux")]

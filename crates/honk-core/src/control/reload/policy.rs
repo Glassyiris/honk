@@ -97,6 +97,9 @@ pub(crate) fn restart_required_changes(
     if old_api.default_mode != new_api.default_mode {
         changed.push("experimental.clash_api.default_mode");
     }
+    if current.experimental.native_api != candidate.experimental.native_api {
+        changed.push("experimental.native_api");
+    }
     if serde_json::to_value(&current.experimental.cache_file).ok()
         != serde_json::to_value(&candidate.experimental.cache_file).ok()
     {

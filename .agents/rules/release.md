@@ -6,6 +6,8 @@ Read with: `AGENTS.md` (Current validation guidance, the workspace gate); `deplo
 
 The `features` lane also runs the outbound `feature_boundary` integration target and the `honk-tool` suite with `cargo test --no-default-features`, each in a separate Cargo invocation so workspace feature unification cannot hide `rprx`-off cases. Exact nonempty test-list checks require both no-backend regressions before execution; this lane uses plain Cargo rather than nextest.
 
+Workspace lint and nextest explicitly enable `honk-core/native-api` so ordinary code CI covers the default-off API alongside Clash. The independent `features` lane checks native-only and native+Clash builds, requires nonempty authentication/coexistence selections, and executes native-only HTTP regressions plus cross-token isolation separately. Shipping feature defaults and release builds are unchanged.
+
 The `parser` lane compares config corpus inputs against the pinned dae Go oracle and replays saved fuzz inputs on stable Rust. Its filter covers `honk-config`, `tools/dae-parse`, `fuzz`, corpus source documents and shared build inputs. Dialect-only PRs select parser and docs without selecting workspace code lanes; `ci:full`, failed change detection, pushes and manual CI runs also select parser. Its timeout is eight minutes, and `ci-report-parser` carries conformance/replay counts and the first failing case/path.
 
 `.github/workflows/report.yml` joins stage-1 lane artefacts and per-attempt job results into one marker-bearing bot comment on each matching open pull request. `.github/ci/report/fixtures/ordinary.md` extends the agreed fork layout with parser metrics and anchors the renderer's eight byte-for-byte fixtures.
