@@ -221,7 +221,7 @@ R = {
 | 字段 | 含义 |
 | --- | --- |
 | `selected` | 本次只读判定对应的既有公开成员 tag；没有普通合格候选时为 null。存在时 TCP `now` 使用同一次判定的选择。 |
-| `state` | `provisional` 或 `observedUsable`；后者需要近期业务证据，不能仅由 HEAD 成功获得。 |
+| `state` | `provisional` 或 `observedUsable`；后者需要近期成功终态的业务证据，不能仅由探测或活跃 RX 获得。普通资格续租和恢复不会放宽这一认证。 |
 | `comparison` / `basis` | `unconfirmed`、`equivalent` 或 `supported`，依据为 `none`、`configuredProbe`、`targetResponse`、`aggregateResponse`、`upload` 或 `download`。不代表误判概率或保证最优。 |
 | `missing` | 相关候选覆盖范围内的 availability/response/transfer 布尔缺口；当前路径已观测可用时，备选仍可能需要验证。 |
 | `nextAction` | `nextBusinessFlow` 仅在共享预算允许时使用未来真实流量；`awaitTransfer` 等待真实负载，不主动大流量测速；`backoff` 保留失败隔离；`none` 表示没有可执行的缺失工作。 |

@@ -7,6 +7,7 @@ mod cadence;
 mod evidence;
 mod live;
 mod performance;
+mod progress;
 mod reasons;
 mod selection;
 mod verification;

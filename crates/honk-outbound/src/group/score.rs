@@ -53,6 +53,8 @@ const MAX_THROUGHPUT_DURATION: Duration = Duration::from_secs(10);
 const REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
 const PERFORMANCE_VALIDATION_SAMPLES: f64 = 4.0;
 const PERFORMANCE_SWITCH_MARGIN: f64 = 0.1;
+const LIVE_RX_INTERVAL: Duration = Duration::from_secs(1);
+const LIVE_QUALIFICATION_TTL: Duration = Duration::from_secs(60);
 
 /// Separates business outcomes from configured health and preparation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -188,7 +190,8 @@ struct Stats {
     useful_business: WeightedMean,
     business_invalidated_through: Option<Instant>,
     failed_at: Option<Instant>,
-    last_successful_rx_at: Option<Instant>,
+    last_business_rx_at: Option<Instant>,
+    qualified_until: Option<Instant>,
     warm_setup_ms: WeightedMean,
     probes: [evidence::ProbeMetric; 6],
     last_attempt: Option<Instant>,
@@ -754,6 +757,7 @@ struct ScoreSnapshot {
     reliability: f64,
     reliability_upper: f64,
     useful_completed: f64,
+    qualification_retained: bool,
     performance: PerformanceSnapshot,
     target_performance: PerformanceSnapshot,
     probe: MetricSnapshot,
@@ -767,6 +771,12 @@ struct ScoreSnapshot {
     fail_streak: u32,
     selected_at: u64,
     verification: verification::VerificationEvidence,
+}
+
+impl ScoreSnapshot {
+    fn qualified(&self) -> bool {
+        self.useful_completed >= PERFORMANCE_VALIDATION_SAMPLES || self.qualification_retained
+    }
 }
 
 #[derive(Clone, Copy)]

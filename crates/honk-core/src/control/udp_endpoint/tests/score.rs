@@ -187,3 +187,165 @@ async fn accepted_udp_progress_changes_selection_before_endpoint_finishes() {
     control.finish(ScoreOutcome::Cancelled);
     assert!(pool.shutdown().await);
 }
+
+#[tokio::test]
+async fn delivered_udp_reply_restores_incumbent_protection_before_endpoint_finishes() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target = server.local_addr().unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_addr = client.local_addr().unwrap();
+    let outbound = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let outbound_addr = outbound.local_addr().unwrap();
+    let nodes = [
+        Node {
+            name: "live".into(),
+            id: TEST_NODE_ID,
+            ..Default::default()
+        },
+        Node {
+            name: "challenger".into(),
+            id: OTHER_NODE_ID,
+            ..Default::default()
+        },
+    ];
+    let manager = GroupManager::new(
+        &[Group {
+            name: "score".into(),
+            policy: GroupPolicy::Score,
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            ..Default::default()
+        }],
+        &nodes,
+    );
+    let context = ScoreSelectionContext {
+        network: SelectionNetwork::Udp,
+        probe_domain: honk_outbound::alive::ProbeDomain::DataUdp,
+        target_family: Some(honk_outbound::alive::IpVersion::V4),
+        health_family: honk_outbound::alive::IpVersion::V4,
+        target: Some(target.into()),
+    };
+    for (index, node) in nodes.iter().enumerate() {
+        let feedback = manager.feedback_for_node(node.id, context.clone()).unwrap();
+        // One failure stays below the mature switching margin. Response-free
+        // histories and fixed probes isolate recovery from scheduler latency.
+        for _ in 0..512 {
+            let reporter = feedback.start();
+            reporter.setup_succeeded();
+            reporter.tx(1);
+            reporter.rx(1);
+            reporter.finish(ScoreOutcome::Success);
+        }
+        let probe = feedback.with_source(honk_outbound::group::ScoreSource::HealthProbe);
+        for _ in 0..8 {
+            let reporter = probe.start();
+            reporter.probe_latency(Duration::from_millis(100 + index as u64));
+            reporter.finish(ScoreOutcome::Success);
+        }
+    }
+    let aggregate = ScoreSelectionContext::aggregate(
+        SelectionNetwork::Udp,
+        honk_outbound::alive::ProbeDomain::DataUdp,
+        honk_outbound::alive::IpVersion::V4,
+    );
+    assert_eq!(
+        manager
+            .selection_plan_for_target("score", &aggregate)
+            .entries[0]
+            .node
+            .id,
+        TEST_NODE_ID,
+    );
+    let feedback = manager.feedback_for_node(TEST_NODE_ID, context).unwrap();
+    let reporter = feedback.start();
+    reporter.setup_succeeded();
+    let endpoint = Arc::new(UdpEndpoint::new_scored(
+        transport(outbound, target),
+        target,
+        false,
+        TEST_NODE_ID,
+        honk_outbound::alive::IpVersion::V4,
+        Some(reporter),
+    ));
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = Arc::new(StatsManager::new());
+    let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+    let mut lease = match pool.reserve_or_enqueue(client_addr, target, b"q", permit, &stats) {
+        EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("live flow must reserve a fresh endpoint"),
+    };
+    let mut driver = pool.spawn_driver(
+        client_addr,
+        target,
+        lease.generation(),
+        lease.decision_token(),
+        Arc::clone(&endpoint),
+        lease.take_queue_receiver().unwrap(),
+        test_reply_socket().await,
+        Arc::new(honk_outbound::alive::AliveDialerSet::new()),
+        Arc::clone(&stats),
+        "live".into(),
+    );
+    tokio::time::timeout(Duration::from_secs(1), driver.wait_ready())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(lease.commit_ready(Arc::clone(&endpoint)));
+    driver.start(lease.take_first().unwrap()).unwrap();
+    drop(lease);
+    tokio::time::timeout(Duration::from_secs(1), driver.wait_first_ack())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut buf = [0; 8];
+    let (len, peer) = tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(peer, outbound_addr);
+    assert_eq!(&buf[..len], b"q");
+
+    let failed = feedback.start();
+    failed.setup_succeeded();
+    failed.finish(ScoreOutcome::Timeout);
+    // Peek uses the same aggregate history without committing the bypass.
+    assert_eq!(
+        manager.get_score_selection_for_network("score", SelectionNetwork::Udp),
+        Some("challenger".into()),
+    );
+    let before = manager.score_reason_snapshot()[0].udp;
+    assert_eq!(before.ordinary_switch, 0);
+
+    server.send_to(b"r", outbound_addr).await.unwrap();
+    let (len, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf[..len], b"r");
+    assert_eq!(endpoint.upload.load(Ordering::Relaxed), 1);
+    assert_eq!(endpoint.download.load(Ordering::Relaxed), 1);
+    assert_eq!(pool.driver_count(), 1);
+    assert!(!endpoint.dead.load(Ordering::Acquire));
+    assert_eq!(
+        manager
+            .selection_plan_for_target("score", &aggregate)
+            .entries[0]
+            .node
+            .id,
+        TEST_NODE_ID,
+        "accepted RX must restore protection before terminal settlement",
+    );
+    let recovered = manager.score_reason_snapshot()[0].udp;
+    assert_eq!(recovered.incumbent_held, before.incumbent_held + 1);
+    assert_eq!(recovered.fresh_failure_bypass, 0);
+    assert_eq!(recovered.incumbent_ineligible, 0);
+    assert_eq!(recovered.ordinary_switch, 0);
+
+    endpoint.finish_score(ScoreOutcome::Success);
+    endpoint.finish_score(ScoreOutcome::Io(io::ErrorKind::ConnectionReset));
+    assert_eq!(
+        manager.get_score_selection_for_network("score", SelectionNetwork::Udp),
+        Some("live".into()),
+        "a duplicate terminal failure must not replace the settled success",
+    );
+    assert!(pool.shutdown().await);
+}

@@ -1,10 +1,10 @@
 use super::ranking::explore_backoff;
 use super::{
-    AggregateKey, ExactKey, FlowSample, MAX_THROUGHPUT_DURATION, MIN_THROUGHPUT_BYTES,
-    MIN_THROUGHPUT_DURATION, PERFORMANCE_MAX_AGE, PERFORMANCE_VALIDATION_SAMPLES,
-    RELIABILITY_CONFIDENCE_Z, SCORE_EVIDENCE_HALF_LIFE, ScoreAttribution, ScoreAuthority,
-    ScoreOutcome, ScorePolicyState, ScoreSelectionContext, ScoreSource, StartedCells, Stats,
-    WeightedMean,
+    AggregateKey, ExactKey, FlowSample, LIVE_QUALIFICATION_TTL, MAX_THROUGHPUT_DURATION,
+    MIN_THROUGHPUT_BYTES, MIN_THROUGHPUT_DURATION, PERFORMANCE_MAX_AGE,
+    PERFORMANCE_VALIDATION_SAMPLES, RELIABILITY_CONFIDENCE_Z, SCORE_EVIDENCE_HALF_LIFE,
+    ScoreAttribution, ScoreAuthority, ScoreOutcome, ScorePolicyState, ScoreSelectionContext,
+    ScoreSource, StartedCells, Stats, WeightedMean,
 };
 use lru::LruCache;
 use std::sync::Arc;
@@ -95,6 +95,9 @@ impl WeightedMean {
 pub(super) enum Observation {
     Setup(Duration),
     Response(Duration),
+    BusinessProgress {
+        rx_at: Instant,
+    },
     Probe {
         latency: Duration,
         scope: u64,
@@ -207,12 +210,56 @@ impl Stats {
                         .record(*rx as f64 / elapsed.as_secs_f64(), now);
                 }
             }
+            (ScoreSource::Traffic, Observation::BusinessProgress { rx_at })
+                if self
+                    .business_invalidated_through
+                    .is_none_or(|fence| *rx_at > fence) =>
+            {
+                self.last_business_rx_at = Some(
+                    self.last_business_rx_at
+                        .map_or(*rx_at, |seen| seen.max(*rx_at)),
+                );
+                self.retain_qualification(*rx_at, now);
+            }
             _ => {}
+        }
+    }
+
+    fn retain_qualification(&mut self, rx_at: Instant, now: Instant) {
+        let factor = self
+            .updated_at
+            .map_or(1.0, |at| evidence_decay(now.saturating_duration_since(at)));
+        let qualified = self.useful_completed() * factor >= PERFORMANCE_VALIDATION_SAMPLES;
+        let rx_at = if qualified {
+            self.last_business_rx_at.unwrap_or(rx_at)
+        } else {
+            rx_at
+        };
+        if now.saturating_duration_since(rx_at) >= LIVE_QUALIFICATION_TTL
+            || self
+                .business_invalidated_through
+                .is_some_and(|fence| rx_at <= fence)
+        {
+            return;
+        }
+        if qualified || self.qualified_until.is_some_and(|until| rx_at < until) {
+            let until = rx_at + LIVE_QUALIFICATION_TTL;
+            // A delayed terminal can bridge the lease to newer observed RX, but not across a silent gap.
+            let latest = self
+                .last_business_rx_at
+                .filter(|at| *at < until)
+                .unwrap_or(rx_at);
+            let until = latest + LIVE_QUALIFICATION_TTL;
+            self.qualified_until = Some(
+                self.qualified_until
+                    .map_or(until, |previous| previous.max(until)),
+            );
         }
     }
 
     pub(super) fn invalidate_business(&mut self, now: Instant) {
         self.useful_business = WeightedMean::default();
+        self.qualified_until = None;
         self.business_invalidated_through = Some(
             self.business_invalidated_through
                 .map_or(now, |at| at.max(now)),
@@ -254,8 +301,9 @@ impl Stats {
             if sample.outcome == ScoreOutcome::Success && sample.tx > 0 && sample.rx > 0 {
                 self.useful_success += 1.0;
                 if let Some(at) = sample.last_rx_at {
-                    self.last_successful_rx_at =
-                        Some(self.last_successful_rx_at.map_or(at, |seen| seen.max(at)));
+                    self.last_business_rx_at =
+                        Some(self.last_business_rx_at.map_or(at, |seen| seen.max(at)));
+                    self.retain_qualification(at, now);
                 }
                 if let Some(at) = sample.last_rx_at
                     && now.saturating_duration_since(at) < PERFORMANCE_MAX_AGE
@@ -490,6 +538,9 @@ impl ScorePolicyState {
         observation: Observation,
         now: Instant,
     ) {
+        if matches!(observation, Observation::BusinessProgress { .. }) && context.target.is_none() {
+            return;
+        }
         Self::update_started(inner, context, attributions, cells, |stats, _| {
             stats.observe(&observation, source, now)
         });

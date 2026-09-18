@@ -1,12 +1,12 @@
 use super::evidence::evidence_decay;
 use super::{
     AggregateKey, ExactKey, MIN_TRAINED_EVIDENCE, MetricSnapshot, PERFORMANCE_SWITCH_MARGIN,
-    PERFORMANCE_VALIDATION_SAMPLES, PerformanceBaseline, PerformanceSnapshot, RELIABILITY_CLOSE,
-    REVALIDATION_INTERVAL, RankedSelection, SCORE_EXPLORATION_MAX_PERIOD,
-    SCORE_EXPLORATION_MIN_PERIOD, SCORE_EXPLORE_BACKOFF_BASE, SCORE_EXPLORE_BACKOFF_MAX,
-    SCORE_FAIL_STREAK_EXCLUDE, SCORE_SWITCH_FULL_EVIDENCE, ScoreAuthority, ScorePolicyState,
-    ScoreSelectionContext, ScoreSnapshot, SelectionCadence, SelectionCadenceKey,
-    SelectionHistoryKey, SelectionReason, SelectionReasonKey, StateInner, Stats,
+    PerformanceBaseline, PerformanceSnapshot, RELIABILITY_CLOSE, REVALIDATION_INTERVAL,
+    RankedSelection, SCORE_EXPLORATION_MAX_PERIOD, SCORE_EXPLORATION_MIN_PERIOD,
+    SCORE_EXPLORE_BACKOFF_BASE, SCORE_EXPLORE_BACKOFF_MAX, SCORE_FAIL_STREAK_EXCLUDE,
+    SCORE_SWITCH_FULL_EVIDENCE, ScoreAuthority, ScorePolicyState, ScoreSelectionContext,
+    ScoreSnapshot, SelectionCadence, SelectionCadenceKey, SelectionHistoryKey, SelectionReason,
+    SelectionReasonKey, StateInner, Stats,
 };
 use honk_config::node::Node;
 use std::sync::Arc;
@@ -347,7 +347,7 @@ pub(super) fn normal_eligible(score: &ScoreSnapshot, baseline: PerformanceBaseli
         return false;
     }
     if baseline.any_qualified {
-        score.useful_completed >= PERFORMANCE_VALIDATION_SAMPLES
+        score.qualified()
             && score.reliability_upper + RELIABILITY_CLOSE >= baseline.best_reliability
             && score.observed_reliability + RELIABILITY_CLOSE >= baseline.best_observed_reliability
     } else {
@@ -413,9 +413,7 @@ fn promotion_gain(incumbent: &ScoreSnapshot, candidate: &ScoreSnapshot) -> (f64,
         incumbent_rate = incumbent_rate.max((pair.0 / best).clamp(0.0, 1.0));
         candidate_rate = candidate_rate.max((pair.1 / best).clamp(0.0, 1.0));
     }
-    let reliability_gain = if incumbent.useful_completed >= PERFORMANCE_VALIDATION_SAMPLES
-        && candidate.useful_completed >= PERFORMANCE_VALIDATION_SAMPLES
-    {
+    let reliability_gain = if incumbent.qualified() && candidate.qualified() {
         candidate.observed_reliability - incumbent.observed_reliability
     } else {
         0.0
@@ -500,6 +498,7 @@ pub(super) fn score_snapshot(
         );
         score.completed = score.completed.max(family.completed);
         score.useful_completed = score.useful_completed.max(family.useful_completed);
+        score.qualification_retained |= family.qualification_retained;
         score.attempts = score.attempts.max(family.attempts);
         score.performance = prefer_specific(score.performance, family.performance);
         score.unresolved_failure |= family.unresolved_failure;
@@ -536,6 +535,7 @@ pub(super) fn score_snapshot(
         );
         score.completed = score.completed.max(exact.completed);
         score.useful_completed = score.useful_completed.max(exact.useful_completed);
+        score.qualification_retained |= exact.qualification_retained;
         score.target_performance = exact.performance;
         score.unresolved_failure |= exact.unresolved_failure;
         score.fail_streak = score.fail_streak.max(exact.fail_streak);
@@ -562,6 +562,7 @@ pub(super) fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
         attempts: stats.attempts * factor,
         completed: stats.completed() * factor,
         useful_completed: stats.useful_completed() * factor,
+        qualification_retained: stats.qualified_until.is_some_and(|until| now < until),
         reliability,
         reliability_upper,
         observed_reliability: if observations > 0.0 {
@@ -573,7 +574,7 @@ pub(super) fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
         warm_setup: stats.warm_setup_ms.snapshot(now),
         unresolved_failure: stats.failed_at.is_some_and(|failure| {
             stats
-                .last_successful_rx_at
+                .last_business_rx_at
                 .is_none_or(|success| success <= failure)
         }),
         explore_backed_off: stats.explore_not_before.is_some_and(|until| until > now),
@@ -619,17 +620,17 @@ pub(super) fn performance_baseline(snapshots: &[ScoreSnapshot]) -> PerformanceBa
     let any_qualified = snapshots
         .iter()
         .filter(healthy)
-        .any(|score| score.useful_completed >= PERFORMANCE_VALIDATION_SAMPLES);
+        .any(|score| score.qualified());
     let best_reliability = snapshots
         .iter()
         .filter(healthy)
-        .filter(|score| !any_qualified || score.useful_completed >= PERFORMANCE_VALIDATION_SAMPLES)
+        .filter(|score| !any_qualified || score.qualified())
         .map(|score| score.reliability)
         .fold(0.0, f64::max);
     let best_observed_reliability = snapshots
         .iter()
         .filter(healthy)
-        .filter(|score| !any_qualified || score.useful_completed >= PERFORMANCE_VALIDATION_SAMPLES)
+        .filter(|score| !any_qualified || score.qualified())
         .map(|score| score.observed_reliability)
         .fold(0.0, f64::max);
     let mut baseline = PerformanceBaseline {

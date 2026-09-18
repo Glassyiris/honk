@@ -49,7 +49,7 @@ fn recovered_historical_failure_holds_five_percent_latency_jitter() {
 }
 
 #[test]
-fn only_newer_successful_business_rx_restores_incumbent_protection() {
+fn only_newer_business_rx_restores_incumbent_protection() {
     for recovery in [
         "none",
         "old-rx",
@@ -138,7 +138,9 @@ fn only_newer_successful_business_rx_restores_incumbent_protection() {
                 };
                 let reporter = feedback.clone().with_source(source).start_at(at);
                 reporter.setup_succeeded_at(at);
-                reporter.transfer_at(1, 1, at);
+                if recovery != "setup-only" {
+                    reporter.transfer_at(1, 1, at);
+                }
                 let outcome = if recovery == "neutral" {
                     ScoreOutcome::Cancelled
                 } else {
@@ -152,7 +154,10 @@ fn only_newer_successful_business_rx_restores_incumbent_protection() {
         if let Some(late) = late {
             late.finish_at(ScoreOutcome::Success, true, selected_at);
         }
-        let recovered = matches!(recovery, "business-rx" | "new-rx-before-old-finish");
+        let recovered = matches!(
+            recovery,
+            "business-rx" | "new-rx-before-old-finish" | "neutral"
+        );
         assert_eq!(
             rank_at(&manager, &nodes, &target, selected_at),
             usize::from(!recovered),

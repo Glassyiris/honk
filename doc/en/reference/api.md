@@ -255,7 +255,7 @@ Score group objects in `/proxies` and `/proxies/{name}` add `scoreVerification`.
 | Field | Meaning |
 | --- | --- |
 | `selected` | Existing public member tag for this readonly evaluation, or null with no ordinary eligible candidate. TCP `now` uses this same evaluated choice when present. |
-| `state` | `provisional` or `observedUsable`; the latter requires recent business evidence, not successful HEAD probes alone. |
+| `state` | `provisional` or `observedUsable`; the latter requires recent successful-terminal business evidence, not probes or live RX alone. Ordinary qualification retention and recovery do not relax this certification. |
 | `comparison` / `basis` | `unconfirmed`, `equivalent` or `supported`, with `none`, `configuredProbe`, `targetResponse`, `aggregateResponse`, `upload` or `download` as the limited evidence basis. No probability or guaranteed optimum is implied. |
 | `missing` | Boolean availability/response/transfer gaps across the relevant candidate coverage; selected usability can be observed while an alternative still needs validation. |
 | `nextAction` | `nextBusinessFlow` reserves future real work only when the shared budget permits; `awaitTransfer` waits for real offered load, never active bulk testing; `backoff` retains failure isolation; `none` means no actionable missing work. |
