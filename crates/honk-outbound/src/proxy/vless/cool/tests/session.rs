@@ -322,6 +322,77 @@ async fn udp_receive_byte_budget_drops_excess_datagrams() {
     session.close();
 }
 
+/// A KEEP frame with unreadable UDP metadata fails only the child it names;
+/// the carrier and its other logical connections keep working.
+#[tokio::test]
+async fn malformed_xudp_keep_metadata_fails_only_its_child() {
+    let (client, mut wire) = tokio::io::duplex(1 << 16);
+    let session = connect(Box::new(client), MAX_STREAMS_PER_SESSION);
+    let first = open_udp(
+        Arc::clone(&session),
+        session.try_reserve().unwrap(),
+        udp_target(),
+        None,
+    )
+    .await
+    .unwrap_or_else(|_| panic!("first UDP transport must open"));
+    let second = open_udp(
+        Arc::clone(&session),
+        session.try_reserve().unwrap(),
+        "5.6.7.8:53".parse().unwrap(),
+        None,
+    )
+    .await
+    .unwrap_or_else(|_| panic!("second UDP transport must open"));
+    first.send_packet_confirmed(b"one").await.unwrap();
+    let first_request = read_wire_frame(&mut wire).await;
+    second.send_packet_confirmed(b"two").await.unwrap();
+    let second_request = read_wire_frame(&mut wire).await;
+
+    // Eight metadata bytes whose network byte is TCP: not a UDP endpoint.
+    let mut metadata = base_metadata(first_request.id, STATUS_KEEP, OPTION_DATA);
+    metadata.extend_from_slice(&[codec::NETWORK_TCP, 0, 53, codec::ATYP_IPV4]);
+    wire.write_all(&metadata_frame(metadata, Some(b"bad")).unwrap())
+        .await
+        .unwrap();
+    wire.write_all(&response_frame(
+        second_request.id,
+        STATUS_KEEP,
+        OPTION_DATA,
+        None,
+        Some(b"reply"),
+    ))
+    .await
+    .unwrap();
+
+    let mut output = [0; 8];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), second.recv_packet(&mut output))
+        .await
+        .expect("the carrier must survive another child's malformed KEEP")
+        .unwrap();
+    assert_eq!(&output[..n], b"reply");
+    let failed = tokio::time::timeout(Duration::from_secs(2), first.recv_packet(&mut output))
+        .await
+        .expect("the named child must observe its failure")
+        .unwrap_err();
+    assert_eq!(failed.kind(), io::ErrorKind::InvalidData);
+    // The carrier still answers a new logical connection.
+    let third = open_udp(
+        Arc::clone(&session),
+        session.try_reserve().unwrap(),
+        udp_target(),
+        None,
+    )
+    .await
+    .unwrap_or_else(|_| panic!("the carrier must still open children"));
+    third.send_packet_confirmed(b"three").await.unwrap();
+    // The failed child's END goes out first; the new child's NEW follows.
+    let ended = read_wire_frame(&mut wire).await;
+    assert_eq!((ended.id, ended.status), (first_request.id, STATUS_END));
+    assert_eq!(read_wire_frame(&mut wire).await.status, STATUS_NEW);
+    session.close();
+}
+
 #[tokio::test]
 async fn new_tcp_is_flushed_for_target_speaks_first() {
     let (client, mut wire) = tokio::io::duplex(1 << 16);

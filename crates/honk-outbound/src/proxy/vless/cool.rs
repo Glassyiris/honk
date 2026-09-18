@@ -473,6 +473,9 @@ impl VlessCoolSession {
             Tcp(mpsc::Sender<QueuedPayload>),
             Udp(mpsc::Sender<Datagram>, SocketAddr),
         }
+        // A KEEP frame whose UDP metadata cannot be read, or that arrives
+        // before its child committed a destination, is that child's failure:
+        // the other logical connections on the carrier are untouched.
         let delivery = {
             let children = self.children.lock();
             match children.get(&frame.id) {
@@ -481,20 +484,36 @@ impl VlessCoolSession {
                 Some(ChildSink::Udp {
                     tx, destination, ..
                 }) => {
-                    let destination = destination.lock().clone().ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "XUDP peer replied before the first NEW destination was committed",
-                        )
-                    })?;
-                    Some(Delivery::Udp(
-                        tx.clone(),
-                        parse_keep_peer(
-                            &frame.metadata,
-                            destination.peer,
-                            destination.target_domain.as_deref(),
-                        )?,
-                    ))
+                    let peer = destination
+                        .lock()
+                        .clone()
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "XUDP peer replied before the first NEW destination was committed",
+                            )
+                        })
+                        .and_then(|destination| {
+                            parse_keep_peer(
+                                &frame.metadata,
+                                destination.peer,
+                                destination.target_domain.as_deref(),
+                            )
+                        });
+                    match peer {
+                        Ok(peer) => Some(Delivery::Udp(tx.clone(), peer)),
+                        Err(error) => {
+                            drop(children);
+                            self.fail_child(
+                                frame.id,
+                                Failure::from_io(error, "invalid XUDP KEEP frame"),
+                            );
+                            if !terminal {
+                                self.schedule_end(frame.id)?;
+                            }
+                            return Ok(());
+                        }
+                    }
                 }
             }
         };
