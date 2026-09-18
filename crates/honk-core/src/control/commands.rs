@@ -2,6 +2,35 @@ use honk_config::{Config, node::Node};
 
 use crate::subscription::AuthorizedSubscription;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReloadOutcome {
+    Rejected,
+    Noop { generation: u64 },
+    Committed { generation: u64 },
+    CommittedDegraded { generation: u64 },
+}
+
+impl ReloadOutcome {
+    pub(crate) fn accepted(self) -> bool {
+        self.generation().is_some()
+    }
+
+    pub(crate) fn generation(self) -> Option<u64> {
+        match self {
+            Self::Rejected => None,
+            Self::Noop { generation }
+            | Self::Committed { generation }
+            | Self::CommittedDegraded { generation } => Some(generation),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ReloadReply {
+    pub outcome: ReloadOutcome,
+    pub authorized: Vec<AuthorizedSubscription>,
+}
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ControlCommand {
@@ -9,7 +38,9 @@ pub(crate) enum ControlCommand {
         request_id: u64,
         config: Box<Config>,
         diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
-        result: tokio::sync::oneshot::Sender<Option<Vec<AuthorizedSubscription>>>,
+        #[cfg(feature = "native-api")]
+        sources: Option<std::sync::Arc<crate::native_api::config::SourceUpdate>>,
+        result: tokio::sync::oneshot::Sender<ReloadReply>,
     },
     /// Merge freshly fetched subscription nodes into the running config,
     /// replacing the previous node set of that subscription. Used by

@@ -41,6 +41,41 @@ impl SubscriptionStore {
         )
     }
 
+    #[cfg(feature = "native-api")]
+    pub(crate) fn open_readonly(data_dir: &Path) -> io::Result<Self> {
+        let preferred = data_dir.join(SUBSCRIPTION_STORE_DIR);
+        let legacy = [
+            Path::new(honk_config::paths::LEGACY_DATA_DIR).join(SUBSCRIPTION_STORE_DIR),
+            PathBuf::from(SUBSCRIPTION_STORE_DIR),
+        ];
+        Self::open_readonly_with_legacy(preferred, legacy)
+    }
+
+    #[cfg(feature = "native-api")]
+    fn open_readonly_with_legacy(preferred: PathBuf, legacy: [PathBuf; 2]) -> io::Result<Self> {
+        for (index, root) in std::iter::once(preferred).chain(legacy).enumerate() {
+            let opened = open_store_directory(&root).and_then(|file| {
+                inspect_store_directory(&file)?;
+                Ok(file)
+            });
+            match opened {
+                Ok(file) => {
+                    return Ok(Self {
+                        directory: Arc::new(StoreDirectory { root, file }),
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound || index != 0 => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::from(io::ErrorKind::NotFound))
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn open_cached(&self, sub: &Subscription) -> io::Result<File> {
+        open_store_file(&self.directory.file, &subscription_filename(sub))
+    }
+
     pub(super) fn open_with_legacy(
         preferred: PathBuf,
         legacy_roots: [PathBuf; 2],
@@ -228,23 +263,33 @@ fn open_store_directory(root: &Path) -> io::Result<File> {
 }
 
 fn validate_store_directory(directory: &File) -> anyhow::Result<()> {
+    inspect_store_directory(directory)?;
     let metadata = directory.metadata()?;
-    anyhow::ensure!(metadata.is_dir(), "subscription store is not a directory");
-    anyhow::ensure!(
-        metadata.uid() == effective_uid(),
-        "subscription store is not owned by the process"
-    );
-    anyhow::ensure!(
-        metadata.mode() & 0o022 == 0,
-        "subscription store is writable by another user"
-    );
     if metadata.mode() & 0o7777 != 0o700 {
         directory.set_permissions(fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
 
+fn inspect_store_directory(directory: &File) -> io::Result<()> {
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.uid() != effective_uid() || metadata.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "subscription store directory is not private to the process",
+        ));
+    }
+    Ok(())
+}
+
 fn read_store_file(directory: &File, filename: &str) -> io::Result<String> {
+    let mut file = open_store_file(directory, filename)?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+fn open_store_file(directory: &File, filename: &str) -> io::Result<File> {
     let descriptor = openat(
         directory,
         filename,
@@ -252,7 +297,7 @@ fn read_store_file(directory: &File, filename: &str) -> io::Result<String> {
         Mode::empty(),
     )
     .map_err(io::Error::from)?;
-    let mut file = File::from(descriptor);
+    let file = File::from(descriptor);
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(io::Error::other("subscription cache is not a regular file"));
@@ -269,9 +314,7 @@ fn read_store_file(directory: &File, filename: &str) -> io::Result<String> {
             "subscription cache is writable by another user",
         ));
     }
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
-    Ok(content)
+    Ok(file)
 }
 
 fn write_store_file(directory: &File, destination: &str, content: &[u8]) -> anyhow::Result<()> {
@@ -304,4 +347,40 @@ fn write_store_file(directory: &File, destination: &str, content: &[u8]) -> anyh
         let _ = unlinkat(directory, temporary.as_str(), UnlinkatFlags::NoRemoveDir);
     }
     result
+}
+
+#[cfg(all(test, feature = "native-api"))]
+mod readonly_tests {
+    use super::*;
+
+    #[test]
+    fn readonly_open_neither_creates_nor_hardens_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("cache");
+        let fallbacks = [temp.path().join("old"), temp.path().join("cwd")];
+        assert_eq!(
+            SubscriptionStore::open_readonly_with_legacy(root.clone(), fallbacks.clone())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!root.exists());
+        assert!(fallbacks.iter().all(|path| !path.exists()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let subscription = Subscription::default();
+        let path = root.join(subscription_filename(&subscription));
+        fs::write(&path, "socks5://127.0.0.1:1080#cached").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        let store = SubscriptionStore::open_readonly_with_legacy(root.clone(), fallbacks).unwrap();
+        let mut body = String::new();
+        store
+            .open_cached(&subscription)
+            .unwrap()
+            .read_to_string(&mut body)
+            .unwrap();
+        assert_eq!(body, "socks5://127.0.0.1:1080#cached");
+        assert_eq!(fs::metadata(&root).unwrap().mode() & 0o7777, 0o755);
+        assert_eq!(fs::metadata(path).unwrap().mode() & 0o7777, 0o400);
+    }
 }

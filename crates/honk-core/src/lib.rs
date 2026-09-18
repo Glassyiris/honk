@@ -89,7 +89,7 @@ async fn request_runtime_reload(
     request_id: u64,
     config: Config,
     diagnostics: Vec<DetailedDiagnostic>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<control::ReloadOutcome> {
     let (result, applied) = tokio::sync::oneshot::channel();
     reload_tx
         .send(control::ControlCommand::ReloadConfig {
@@ -97,16 +97,18 @@ async fn request_runtime_reload(
             config: Box::new(config),
             diagnostics,
             result,
+            #[cfg(feature = "native-api")]
+            sources: None,
         })
         .await
         .map_err(|error| anyhow::anyhow!("command send failed: {error}"))?;
-    if let Some(authorized) = applied
+    let reply = applied
         .await
-        .map_err(|error| anyhow::anyhow!("result channel failed: {error}"))?
-    {
-        subscription_supervisor.reconcile(authorized).await?;
+        .map_err(|error| anyhow::anyhow!("result channel failed: {error}"))?;
+    if reply.outcome.accepted() {
+        subscription_supervisor.reconcile(reply.authorized).await?;
     }
-    Ok(())
+    Ok(reply.outcome)
 }
 
 #[cfg(feature = "ebpf")]
@@ -607,6 +609,14 @@ fn load_operator_config(
         || DiagnosticSources::new(Some(path.into())).root(),
         |diagnostic| diagnostic.source.sources().root(),
     );
+    admit_operator_config(config, source, diagnostics)
+}
+
+fn admit_operator_config(
+    config: Config,
+    source: honk_config::diagnostic::SourceRef,
+    diagnostics: &mut Vec<DetailedDiagnostic>,
+) -> Result<Config, DetailedConfigError> {
     config.append_diagnostics(source.clone(), diagnostics);
     let result = config.validate_detailed().and_then(|()| {
         subscription::validate_subscription_ids(&config.subscriptions).map_err(|_| {
@@ -624,6 +634,48 @@ fn load_operator_config(
         error
     });
     finish_attempt(result.map(|()| config), diagnostics)
+}
+
+#[cfg(feature = "native-api")]
+fn load_operator_config_captured(
+    path: &std::path::Path,
+    diagnostics: &mut Vec<DetailedDiagnostic>,
+) -> Result<(Config, Option<native_api::config::SourceUpdate>), DetailedConfigError> {
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dae"))
+    {
+        return load_operator_config(path.to_str().unwrap_or(""), diagnostics)
+            .map(|config| (config, None));
+    }
+    let start = diagnostics.len();
+    let loaded = match Config::from_dae_file_with_sources(
+        path,
+        &std::collections::HashMap::new(),
+        honk_config::parser::SourceLimits::default(),
+        diagnostics,
+    ) {
+        Ok(loaded) => loaded,
+        Err(captured_error) => {
+            diagnostics.truncate(start);
+            let config = load_operator_config(path.to_str().unwrap_or(""), diagnostics)?;
+            if config.experimental.native_api.config_content
+                || config.experimental.native_api.config_write
+            {
+                return Err(captured_error);
+            }
+            return Ok((config, None));
+        }
+    };
+    let source = loaded.sources[0].source.clone();
+    let config = admit_operator_config(loaded.config, source, diagnostics)?;
+    Ok((
+        config,
+        Some(native_api::config::SourceUpdate {
+            sources: loaded.sources,
+            dependencies: Vec::new(),
+        }),
+    ))
 }
 
 fn report_startup_failure(diagnostics: &[DetailedDiagnostic]) {
@@ -660,7 +712,22 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // the config file is honored (previously only --debug/RUST_LOG had any
     // effect and config log_level was silently ignored).
     let mut diagnostics = Vec::new();
+    #[cfg(feature = "native-api")]
+    let mut native_sources = None;
     let startup = (|| -> anyhow::Result<_> {
+        #[cfg(feature = "native-api")]
+        let mut config = {
+            let (config, sources) = load_operator_config_captured(&cli.config, &mut diagnostics)?;
+            anyhow::ensure!(
+                sources.is_some()
+                    || !(config.experimental.native_api.config_content
+                        || config.experimental.native_api.config_write),
+                "native configuration administration requires a dae source file"
+            );
+            native_sources = sources;
+            config
+        };
+        #[cfg(not(feature = "native-api"))]
         let mut config = load_operator_config(cli.config.to_str().unwrap(), &mut diagnostics)?;
         #[cfg(not(feature = "native-api"))]
         anyhow::ensure!(
@@ -1358,6 +1425,33 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     subscription_supervisor.start(cmd_tx.clone());
     let reload_subscription_supervisor = subscription_supervisor.handle();
+    #[cfg(feature = "native-api")]
+    let (config_coordinator, native_configuration) = {
+        let enabled = control_plane
+            .config_handle()
+            .read()
+            .await
+            .experimental
+            .native_api
+            .enabled;
+        if let (true, Some(sources)) = (enabled, native_sources) {
+            let service = control_plane.native_observation().configuration.clone();
+            let entry = sources.sources[0].path.clone();
+            let owner = service
+                .start(
+                    entry,
+                    sources,
+                    control_plane.config_handle(),
+                    control_plane.diagnostics_handle(),
+                    cmd_tx.clone(),
+                    reload_subscription_supervisor.clone(),
+                )
+                .await;
+            (Some(owner), Some(service))
+        } else {
+            (None, None)
+        }
+    };
 
     // SIGHUP handler: reload configuration from disk and push it to the
     // control plane without interrupting established connections.
@@ -1377,6 +1471,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             sighup.recv().await;
             request_id = request_id.wrapping_add(1).max(1);
             info!("SIGHUP reload request {request_id} received");
+            #[cfg(feature = "native-api")]
+            if let Some(service) = &native_configuration {
+                if service.request_sighup().is_err() {
+                    warn!("SIGHUP reload coordinator is unavailable or busy");
+                }
+                continue;
+            }
             let mut diagnostics = Vec::new();
             let result = load_operator_config(
                 config_path.to_str().unwrap_or("/etc/honk/config.dae"),
@@ -1434,6 +1535,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     info!("honk-core is running. Press Ctrl+C to stop.");
     let control_result = control_plane.run().await;
+    #[cfg(feature = "native-api")]
+    if let Some(coordinator) = config_coordinator {
+        coordinator.shutdown().await;
+    }
     #[cfg(feature = "native-api")]
     {
         if control_result.is_err() {

@@ -270,7 +270,9 @@ dns {
 
 ## 启用 Clash API、缓存文件与首包保留 UDP
 
-**原生 API。** 使用 `--features native-api` 构建，再设置 `experimental.native_api.enabled: true` 与独立的强 `secret`。默认地址为 `127.0.0.1:9527`；显式匿名 loopback 仅供本地开发。所有原生字段均需重启。可选 `ui` 目录必须已有可读 `index.html`，不会下载 UI。详见[原生设置](./reference/experimental.md#native_api)与[只读 API](./reference/api.md#原生-api-m1)。
+**原生 API。** 使用 `--features native-api` 构建，再设置 `experimental.native_api.enabled: true` 与独立的强 `secret`。默认地址为 `127.0.0.1:9527`；显式匿名 loopback 仅供本地开发。所有原生字段均需重启。除连接/flow/节点/组/SSE 外，提供共用出站计数与真实 RSS/cgroup 内存；`record_traffic`、`record_memory` 默认 true，各保留最多 600 点/600 秒，无客户端也采样，false 在重启后释放缓冲。可选 `ui` 目录必须已有可读 `index.html`，不会下载 UI。
+
+`.dae` 仍是唯一配置权威。真实启动捕获的源提供 accepted 元数据、离线校验与 reload operations；`config_content`、`config_write` 默认 false，`writable_includes` 默认空列表。Content/write 必须有非空 bearer secret；含 API 凭据的整个源省略正文且只读，其他原文不是脱敏后的保存载荷。显式开启写入只授权非凭据主文件和精确许可的已接受 include；原生设置与凭据只能本地修改后重启。写入成功不等于 reload 成功，失败时磁盘新字节不会自动回滚。M3b 组写入仍关闭。详见[原生设置](./reference/experimental.md#native_api)与 [API 契约](./reference/api.md#原生-api-m1)。
 
 **Clash API。** 非空的 `experimental.clash_api.external_controller` 会启用服务器。除非防火墙和非空 `secret` 已提供保护，否则应保持 loopback 绑定；空 secret 会关闭 API 认证。相对 `external_ui` 依次优先使用 `data_dir` 下、`/var/share/honk` 下和工作目录中的已有目录；都不存在时，在 `data_dir` 下下载 dashboard。`external_ui_download_url` 选择 ZIP 来源，`external_ui_download_detour` 强制下载经过指定节点或组；空值分别保留内建 URL 和普通流量路由。
 

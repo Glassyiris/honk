@@ -1714,7 +1714,7 @@ async fn test_traffic_ws_with_token_auth() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     {
         let stats = &app.state.stats;
-        stats.record_bytes("proxy", 500, 1500);
+        stats.record_bytes("proxy", honk_core::stats::OutboundKind::Node, 500, 1500);
     }
 
     use futures::StreamExt;

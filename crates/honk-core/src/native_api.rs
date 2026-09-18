@@ -1,10 +1,15 @@
 //! Independent, opt-in native observation API.
 
 pub(crate) mod catalog;
+pub(crate) mod config;
+mod config_write;
 pub(crate) mod events;
 pub(crate) mod flows;
 pub(crate) mod observation;
+pub(crate) mod offline;
+pub(crate) mod operations;
 mod security;
+pub(crate) mod telemetry;
 mod types;
 mod ui;
 
@@ -238,16 +243,64 @@ async fn dispatch(
             .await
             .unwrap_or_else(IntoResponse::into_response);
     }
+    match (method, route.template) {
+        ("PUT", "/api/v1/config/sources/{source_id}") => {
+            return config::replace(
+                &state,
+                path.trim_start_matches("/api/v1/config/sources/")
+                    .to_owned(),
+                request,
+                &id,
+            )
+            .await
+            .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
+        }
+        ("POST", "/api/v1/config/validate") => {
+            return config::validate(&state, request, &id)
+                .await
+                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
+        }
+        ("POST", "/api/v1/operations/reload") => {
+            return config::reload(&state, request, &id)
+                .await
+                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
+        }
+        _ => {}
+    }
     if method == "GET" {
         let result = match route.template {
             "/api" | "/api/v1/version" | "/api/v1/capabilities" => {
                 parse_query(request.uri(), &[], &id).map(|_| match path {
                     "/api" => Json(discovery()).into_response(),
                     "/api/v1/version" => Json(version()).into_response(),
-                    _ => Json(capabilities(state.settings.record_flows)).into_response(),
+                    _ => Json(capabilities(&state)).into_response(),
                 })
             }
             "/api/v1/runtime" => runtime(&state, request.uri(), &id).await,
+            "/api/v1/runtime/memory" => telemetry::memory(&state, request.uri(), &id).await,
+            "/api/v1/runtime/outbounds" => telemetry::outbounds(&state, request.uri(), &id).await,
+            "/api/v1/runtime/traffic/history" => {
+                telemetry::traffic_history(&state, request.uri(), &id).await
+            }
+            "/api/v1/runtime/memory/history" => {
+                telemetry::memory_history(&state, request.uri(), &id).await
+            }
+            "/api/v1/config" => config::get(&state, request.uri(), &id).await,
+            "/api/v1/config/sources/{source_id}" => {
+                config::source(
+                    &state,
+                    path.trim_start_matches("/api/v1/config/sources/"),
+                    request.uri(),
+                    &id,
+                )
+                .await
+            }
+            "/api/v1/operations/{id}" => config::operation(
+                &state,
+                path.trim_start_matches("/api/v1/operations/"),
+                request.uri(),
+                &id,
+            ),
             "/api/v1/connections" => connections(&state, request.uri(), &id),
             "/api/v1/flows" => flows::list(&state, request.uri(), &id),
             "/api/v1/flows/{flow_id}" => flows::detail(
@@ -274,7 +327,7 @@ async fn dispatch(
                 &id,
             )),
         };
-        return result.unwrap_or_else(IntoResponse::into_response);
+        return result.unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
     }
     error(
         StatusCode::NOT_FOUND,
@@ -329,7 +382,7 @@ fn timestamp(time: SystemTime) -> String {
 async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Response, ApiError> {
     let query = parse_query(uri, &["detail"], id)?;
     let full = full_detail(&query, id)?;
-    let (generation, phase, healthy) = {
+    let (generation, phase, healthy, config_revision, last_reload) = {
         let _config = state.config.read().await;
         let generation = state.diagnostics.read().generation;
         #[cfg(test)]
@@ -343,6 +396,8 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
             generation,
             *state.phase.borrow(),
             state.healthy.load(Ordering::Acquire),
+            state.observation.configuration.revision(),
+            state.observation.configuration.last_reload(),
         )
     };
     let lifecycle = match phase {
@@ -382,7 +437,7 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
         },
         generation: Generation {
             active_id: format!("{}:{generation}", state.instance_id),
-            config_revision: None,
+            config_revision,
             state: "active",
             activated_at: None,
         },
@@ -403,7 +458,7 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
             pid: full.then_some(std::process::id()),
             cpu_percent: None,
         },
-        last_reload: (),
+        last_reload,
     })
     .into_response())
 }
@@ -587,6 +642,8 @@ async fn sample_traffic(state: Arc<NativeState>, mut stop: watch::Receiver<bool>
                     bytes: TrafficBytes { upload: totals.map(|bytes| bytes.0.to_string()), download: totals.map(|bytes| bytes.1.to_string()) }, rates,
                 });
                 previous = Some((now, totals));
+                let sample = state.sample.read().clone().expect("sample published above");
+                state.observation.telemetry.sample(&sample).await;
                 state.observation.events.publish("runtime.updated", serde_json::json!({}), None);
             }
         }
@@ -882,7 +939,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn native_sampler_reset_and_overflow_are_unknown() {
         let state = state().await;
-        let (upload, _) = state.stats.byte_counters("first");
+        let (upload, _) = state
+            .stats
+            .byte_counters("first", crate::stats::OutboundKind::Node);
         upload.store(100, Ordering::Relaxed);
         let (stop, receiver) = watch::channel(false);
         let sampler = tokio::spawn(sample_traffic(state.clone(), receiver));
@@ -905,7 +964,9 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(state.sample.read().as_ref().unwrap().rates.is_none());
-        state.stats.record_bytes("second", u64::MAX, 0);
+        state
+            .stats
+            .record_bytes("second", crate::stats::OutboundKind::Node, u64::MAX, 0);
         tokio::time::advance(Duration::from_secs(1)).await;
         while state.sample.read().as_ref().unwrap().bytes.upload.is_some() {
             tokio::task::yield_now().await;

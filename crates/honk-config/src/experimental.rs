@@ -93,6 +93,11 @@ pub struct NativeApiConfig {
     pub allowed_hosts: Vec<String>,
     pub ui: String,
     pub record_flows: bool,
+    pub record_traffic: bool,
+    pub record_memory: bool,
+    pub config_write: bool,
+    pub config_content: bool,
+    pub writable_includes: Vec<String>,
 }
 
 impl Default for NativeApiConfig {
@@ -106,6 +111,11 @@ impl Default for NativeApiConfig {
             allowed_hosts: Vec::new(),
             ui: String::new(),
             record_flows: true,
+            record_traffic: true,
+            record_memory: true,
+            config_write: false,
+            config_content: false,
+            writable_includes: Vec::new(),
         }
     }
 }
@@ -130,6 +140,27 @@ impl NativeApiConfig {
             return Err(invalid(
                 "secret",
                 "native API secret must be visible ASCII without commas or whitespace",
+            ));
+        }
+        if (self.config_write || self.config_content) && self.secret.is_empty() {
+            return Err(invalid(
+                "secret",
+                "configuration administration requires a bearer secret",
+            ));
+        }
+        if self.writable_includes.iter().any(|value| {
+            let path = std::path::Path::new(value);
+            value.is_empty()
+                || path.is_absolute()
+                || path
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                || path.extension().and_then(|value| value.to_str()) != Some("dae")
+                || value.contains(['*', '?', '[', ']', '\\'])
+        }) {
+            return Err(invalid(
+                "writable_includes",
+                "writable includes must be explicit relative dae paths without traversal or globs",
             ));
         }
         if self.enabled {

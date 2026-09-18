@@ -241,9 +241,15 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 
 独立且默认关闭的 `native-api` feature 在控制面准入前绑定。按需 phase watch 仅在真实 admission-open 成功后报告 running，在关闭栅栏前报告 draining；现有 health handle 可将 running 细化为 degraded。读取 generation 与 health 期间保留 config 发布屏障，不改变发布锁序。HTTP 可用不代表数据面健康。
 
-`native_api.rs` 完整持有 listener、64 连接 JoinSet、唯一一秒 sampler 与 native tracker consumer，直到关闭 join。Header 预算五秒，空闲 I/O 与停滞写入有独立 30 秒期限，健康 SSE 可持续超过 30 秒；关闭共享五秒 grace。`observation.rs` 拥有进程身份与有界 flow/catalog/event store。TCP/UDP 真实 producer 捕获不可变 partial 证据，不改变路由或清理；已接受 reload 发布在既有屏障下发出 generation 事件。Native-only final handoff 仍不重复生成旧选路证据；不宣称内核透明观测、traffic-history 或 log ring。
+`native_api.rs` 完整持有 listener、64 连接 JoinSet、唯一一秒 sampler 与 native tracker consumer，直到关闭 join。Header 预算五秒，空闲 I/O 与停滞写入有独立 30 秒期限，健康 SSE 可持续超过 30 秒；关闭共享五秒 grace。`observation.rs` 拥有进程身份与有界 flow/catalog/event、telemetry 和配置 operation 状态。TCP/UDP 真实 producer 捕获不可变 partial 证据，不改变路由或清理；已接受 reload 发布在既有屏障下发出 generation 事件。Native-only final handoff 仍不重复生成旧选路证据；不宣称完整内核透明观测或 log ring。
 
 TCP copy 成功读取与 splice 成功写入实时累加既有逐出站 atomics；成功接受的嗅探前缀仅计一次，部分写失败也保留已写字节。Relay 关闭或取消不再次累加总量。既有统计与原生采样共用这些计数，UDP 原逐包语义不变。Wire 契约、上限与未知字段见 [API 参考](../reference/api.md#原生-api-m1)。
+
+M5 的出站读取保留共用账本的 `kind/name` 与完整 UInt64，reload 不重置计数生命周期。`telemetry.rs` 复用唯一一秒 sampler（Skip），无客户端也保留各 600 点/600 秒的流量与内存 history；关闭对应记录开关并重启后释放缓冲，不插值或补零。内存读取实际 RSS/cgroup v2 文件，未知值为 null，未实现 kernel memory 核算。
+
+M6 的 `config.rs` 只接受启动 loader 当时捕获的 `.dae` 源快照；元数据与 diagnostics 不授予私有路径访问权。`config/coordinator.rs` 的 daemon-owned 队列在读盘前串行化 SIGHUP 与 API 写入，先预留有界 operation，再进行单源 overlay 离线准入、目标/依赖复查、原子替换及 fsync，最后提交真实 ReloadConfig 并等待 supervisor reconciliation。HTTP 断开不取消任务，同 scope/key/body 重放共用结果；PUT 的 202 仅代表耐久写入且真实 reload 已排队。外部编辑器仍可能在最后检查与 rename 间竞争，rename 后目录 fsync 失败必须报告已写但耐久性未确认，不能称为回滚。
+
+Accepted 源在真实 no-op 或 commit 时随原有 config 发布屏障更新，不改变 router→config→eBPF 的发布锁序或订阅 revision fence。拒绝 reload 保留旧快照/代次但不回滚已写文件；提交后 degraded 保留新快照/代次并令 operation 失败。API operation 的真实结果投影到 GET、`runtime.last_reload` 与 `operation.updated`，SIGHUP 本身不创建 API operation。注释变更可更新 source hash/config revision 而不推进 runtime generation，有效组成员变更影响 revision，健康变化不影响。M3b 组 selection/PATCH/override 仍等待共同控制、持久化和暖池语义，不因 M6 源写入已交付而开放。
 
 ## Clash API 与 cache DB
 

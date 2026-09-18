@@ -612,7 +612,7 @@ async fn ready_udp_endpoint(
         reply_socket,
         Arc::new(crate::outbound::AliveDialerSet::new()),
         stats.clone(),
-        "test-node".into(),
+        stats.outbound_tracker("test-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease.commit_ready(Arc::clone(&endpoint)));
@@ -4374,10 +4374,12 @@ async fn reload_and_merge_never_touch_ebpf_hooks() {
     assert!(
         cp.apply_runtime_config(Config::default(), Default::default(), &drain)
             .await
+            .accepted()
     );
     assert!(
         cp.apply_runtime_config(Config::default(), Default::default(), &drain)
             .await
+            .accepted()
     );
 
     assert_eq!(

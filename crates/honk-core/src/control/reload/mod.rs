@@ -11,6 +11,8 @@ pub(in crate::control) use fingerprint::{
     subscription_nodes_unchanged,
 };
 pub(in crate::control) use policy::restart_required_changes;
+#[cfg(feature = "native-api")]
+pub(crate) use transaction::rebase_subscription_nodes;
 
 #[cfg(test)]
 pub(in crate::control) use warm::{

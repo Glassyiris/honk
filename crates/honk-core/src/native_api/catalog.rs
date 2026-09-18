@@ -160,6 +160,13 @@ fn check_url(group: &Group) -> Option<String> {
     ))
 }
 
+pub(crate) fn revision_for(config: &Config) -> String {
+    config_revision(
+        config,
+        &GroupManager::native_effective_groups(&config.groups),
+    )
+}
+
 fn config_revision(config: &Config, groups: &HashMap<String, Group>) -> String {
     let nodes: HashMap<_, _> = config.nodes.iter().map(|node| (node.id, node)).collect();
     let mut ordered: Vec<_> = groups.values().collect();
@@ -575,10 +582,19 @@ pub(super) async fn groups(
     let manager = state.group_manager.read().clone();
     let mut names: Vec<_> = identity.groups.keys().collect();
     names.sort_unstable();
+    let revision = state
+        .observation
+        .configuration
+        .revision()
+        .unwrap_or_else(|| identity.revision.clone());
     let groups: Vec<_> = names
         .into_iter()
         .filter_map(|name| manager.native_group(name))
-        .map(|group| group_value(&manager, group, &identity, &state.alive_set, false))
+        .map(|group| {
+            let mut value = group_value(&manager, group, &identity, &state.alive_set, false);
+            value["config_revision"] = json!(revision);
+            value
+        })
         .collect();
     Ok(Json(groups).into_response())
 }
@@ -602,17 +618,14 @@ pub(super) async fn group(
     let group = manager
         .native_group(name)
         .ok_or_else(|| group_not_found(id))?;
-    Ok((
-        [(header::ETAG, format!("\"{}\"", identity.revision))],
-        Json(group_value(
-            &manager,
-            group,
-            &identity,
-            &state.alive_set,
-            true,
-        )),
-    )
-        .into_response())
+    let revision = state
+        .observation
+        .configuration
+        .revision()
+        .unwrap_or_else(|| identity.revision.clone());
+    let mut value = group_value(&manager, group, &identity, &state.alive_set, true);
+    value["config_revision"] = json!(revision);
+    Ok(([(header::ETAG, format!("\"{revision}\""))], Json(value)).into_response())
 }
 
 fn group_not_found(id: &RequestId) -> ApiError {

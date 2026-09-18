@@ -8,7 +8,7 @@ This reference describes the current nested sections under `experimental { ... }
 | --- | --- |
 | `clash_api` | Clash-compatible HTTP API and external dashboard |
 | `cache_file` | SQLite persistence for runtime choices, mode, delay samples, and optional DNS state |
-| `native_api` | Independent, opt-in read-only native API and local UI directory |
+| `native_api` | Independent, opt-in native observations, accepted-source administration and local UI directory |
 
 `udp_nfqueue { enabled: ... }` is a deprecated compatibility section. Dae and structured loaders accept it, print a migration warning, and copy its value to `global.nfqueue_enable`; new configurations should use the global field directly.
 
@@ -26,6 +26,11 @@ Requires the default-off `native-api` Cargo feature; it does not require `clash-
 | `allowed_hosts` | empty list | Additional explicit HTTP Host authorities, without URL schemes, paths, credentials, or wildcards. Omitted port means 80, not the listener's port. |
 | `ui` | `""` | Empty disables hosting; otherwise a trusted local directory with readable `index.html`. No embedded UI or startup download/build. |
 | `record_flows` | `true` | Retain bounded userspace decisions while native API is enabled, even without clients. `false` disables recording and releases its buffers; restart-required. |
+| `record_traffic` | `true` | Keep up to 600 traffic samples for 600 seconds, even without clients. `false` disables history and releases its buffer on restart; current counters remain available. |
+| `record_memory` | `true` | Keep up to 600 memory samples for 600 seconds, even without clients. `false` disables history and releases its buffer on restart; current readings remain available. |
+| `config_content` | `false` | Allow authenticated administrators to read exact accepted source text, excluding entire API-credential-bearing sources. Requires a nonempty `secret`. |
+| `config_write` | `false` | Allow whole-source replacement and reload for the accepted main file and explicitly authorized includes, excluding API-credential-bearing sources. Requires a nonempty `secret`. |
+| `writable_includes` | empty list | Explicit canonical entry-directory-relative `.dae` paths, such as `'parts/routing.dae'`; only already accepted includes qualify. No absolute paths, traversal or globs; ignored for write permission unless `config_write` is true. |
 
 ```dae
 experimental {
@@ -48,6 +53,12 @@ Default Host acceptance is the concrete listening authority; loopback also accep
 Lists use individually quoted comma-separated entries, such as `allow_origins: 'http://localhost:3000', 'https://panel.example'`. Omit a list to leave it empty; JSON brackets and a single aggregate-quoted list are not accepted.
 
 Relative UI paths follow the existing dependency search: an existing path under `global.data_dir`, then `/var/share/honk`, then the working directory; a missing dependency resolves under `global.data_dir` and startup fails. The administrator owns the directory and any symlink targets. See the [native API contract](./api.md#native-api-m1).
+
+Traffic and memory histories share the existing one-second sampler; missing samples/measurements remain gaps/nulls rather than zero-filled or interpolated points. Memory is actual process RSS and available cgroup-v2 data, not kernel accounting. All five settings above, like the other native settings, require restart.
+
+Configuration metadata, validation and reload operations require a genuine `.dae` source snapshot captured at startup; programmatic configs and compatibility serde loaders do not supply one. Content and write permission are independent opt-ins. Exact disclosed text may contain sensitive configuration: it is not a sandboxed or generally redacted save payload. Entire API-credential-bearing sources are omitted from content and stay read-only; metadata paths remain `<redacted>`. Move credentials to a dedicated read-only include locally if the main source must be editable. The API cannot change/move API credentials or alter native settings; those require a local edit and restart.
+
+For example, `writable_includes: 'parts/routing.dae', 'parts/groups.dae'` authorizes only those accepted canonical paths when writing is enabled; it does not change ordinary `include` glob or no-match semantics. Save by opaque source ID with a strong disk-content SHA-256 `If-Match`, then follow the real reload operation. A successful write is not activation success, and externally uncoordinated editors can still race the final check/rename window. See [M6 safety and failure semantics](./api.md#accepted-configuration-and-reload-operations-m6). M3b group controls remain gated despite source-write support.
 
 ## `clash_api`
 

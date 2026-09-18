@@ -412,10 +412,6 @@ impl ControlPlaneHandle {
                 }
             }
         }
-        // This guard is created exactly once and is transferred to Ready only
-        // after a real driver has reached its barrier.
-        lease.set_connection_guard(self.stats.track_connection(&outbound_name));
-
         let requested_ipver = if original_dst.is_ipv6() {
             IpVersion::V6
         } else {
@@ -423,7 +419,7 @@ impl ControlPlaneHandle {
         };
         #[cfg(feature = "native-api")]
         let mut native_plan = None;
-        let (plan, selection_chains) = {
+        let (plan, selection_chains, outbound_kind) = {
             let config = self.config.read().await;
             #[cfg(feature = "native-api")]
             let native_identity = native_flow
@@ -468,8 +464,12 @@ impl ControlPlaneHandle {
                     .collect();
                 native_plan = Some(Arc::new((generation, catalog, paths)));
             }
-            (plan, selection_chains)
+            let kind = crate::stats::OutboundKind::routed(&config, &outbound_name);
+            (plan, selection_chains, kind)
         };
+        let outbound_tracker = self.stats.outbound_tracker(&outbound_name, outbound_kind);
+        // The same accounting identity survives candidate selection and driver publication.
+        lease.set_connection_guard(self.stats.track_outbound(outbound_tracker.clone()));
 
         if plan.nodes.is_empty() {
             warn!(
@@ -480,19 +480,17 @@ impl ControlPlaneHandle {
             for node in group_manager.leaf_nodes_in_group(&outbound_name) {
                 self.alive_set.notify_check_tcp(node.id);
             }
-            self.stats.record_error(&outbound_name);
+            outbound_tracker.increment_errors();
             #[cfg(feature = "native-api")]
             if let Some(flow) = native_flow.as_ref() {
                 flow.finish("failed", "no_available_candidate");
             }
             return Ok(());
         }
-        #[cfg(feature = "native-api")]
-        let native_all_block = native_flow.is_some()
-            && plan
-                .nodes
-                .iter()
-                .all(|node| node.protocol() == honk_config::types::NodeProtocol::Block);
+        let all_block = plan
+            .nodes
+            .iter()
+            .all(|node| node.protocol() == honk_config::types::NodeProtocol::Block);
 
         let (connect_timeout, transport_deadline) = {
             let config = self.config.read().await;
@@ -748,10 +746,12 @@ impl ControlPlaneHandle {
                 "All UDP transport preparations failed for '{}'",
                 outbound_name
             );
-            self.stats.record_error(&outbound_name);
+            if !all_block {
+                outbound_tracker.increment_errors();
+            }
             #[cfg(feature = "native-api")]
             if let Some(flow) = native_flow.as_ref() {
-                if native_all_block {
+                if all_block {
                     flow.selected(Vec::new());
                     flow.finish("blocked", "policy_block");
                 } else {
@@ -876,7 +876,7 @@ impl ControlPlaneHandle {
                 }
                 self.stats
                     .record_udp_reply_ready_latency(reply_ready_started.elapsed());
-                self.stats.record_error(&outbound_name);
+                outbound_tracker.increment_errors();
                 if let Some(reporter) = &score_reporter {
                     reporter.finish(crate::group::ScoreOutcome::Cancelled);
                 }
@@ -906,7 +906,7 @@ impl ControlPlaneHandle {
                 original_dst,
                 target_domain.as_deref(),
                 Arc::clone(&reply_socket),
-                self.stats.outbound_tracker(&outbound_name),
+                outbound_tracker.clone(),
                 node.id,
                 scheduler_ipver,
                 score_reporter,
@@ -996,7 +996,7 @@ impl ControlPlaneHandle {
             reply_socket,
             self.alive_set.clone(),
             self.stats.clone(),
-            outbound_name.clone(),
+            outbound_tracker.clone(),
         );
         driver.wait_ready().await?;
         #[cfg(feature = "native-api")]
@@ -1040,7 +1040,7 @@ impl ControlPlaneHandle {
         if let Err(error) = driver.wait_first_ack().await {
             // First-send failures are terminal for this endpoint; once the
             // transport call starts, the packet is never replayed.
-            self.stats.record_error(&outbound_name);
+            outbound_tracker.increment_errors();
             return Err(error.into());
         }
         debug!(

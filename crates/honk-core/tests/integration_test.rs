@@ -253,19 +253,29 @@ fn test_stats_manager_full_workflow() {
     let mgr = StatsManager::new();
 
     for _ in 0..10 {
-        mgr.record_connection("proxy-us");
+        mgr.record_connection("proxy-us", honk_core::stats::OutboundKind::Node);
     }
     for _ in 0..5 {
-        mgr.record_connection("proxy-jp");
+        mgr.record_connection("proxy-jp", honk_core::stats::OutboundKind::Node);
     }
 
-    mgr.record_close("proxy-us");
-    mgr.record_close("proxy-us");
+    mgr.record_close("proxy-us", honk_core::stats::OutboundKind::Node);
+    mgr.record_close("proxy-us", honk_core::stats::OutboundKind::Node);
 
-    mgr.record_bytes("proxy-us", 1024 * 1024, 2048 * 1024); // 1MB up, 2MB down
-    mgr.record_bytes("proxy-jp", 512 * 1024, 256 * 1024);
+    mgr.record_bytes(
+        "proxy-us",
+        honk_core::stats::OutboundKind::Node,
+        1024 * 1024,
+        2048 * 1024,
+    ); // 1MB up, 2MB down
+    mgr.record_bytes(
+        "proxy-jp",
+        honk_core::stats::OutboundKind::Node,
+        512 * 1024,
+        256 * 1024,
+    );
 
-    mgr.record_error("proxy-jp");
+    mgr.record_error("proxy-jp", honk_core::stats::OutboundKind::Node);
 
     let snap = mgr.snapshot();
 

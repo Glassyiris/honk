@@ -500,13 +500,27 @@ impl Config {
         finish_attempt(result, diagnostics)
     }
 
+    /// Load a bounded dae candidate, retaining the exact consumed source bytes.
+    /// Overlay paths must already be authorized by the caller.
+    pub fn from_dae_file_with_sources(
+        path: &std::path::Path,
+        overlay: &std::collections::HashMap<std::path::PathBuf, std::sync::Arc<str>>,
+        limits: crate::parser::SourceLimits,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+    ) -> Result<crate::parser::LoadedConfig, DetailedConfigError> {
+        let mut loaded = crate::parser::load_dae_sources(path, overlay, limits, diagnostics)?;
+        loaded.config.derive_node_ids();
+        Ok(loaded)
+    }
+
     fn load_file_attempt(
         path: &str,
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> Result<Self, DetailedConfigError> {
         let source = DiagnosticSources::new(Some(path.into())).root();
-        let content = std::fs::read_to_string(path)
-            .map_err(|error| DetailedConfigError::from_legacy(error.into(), source.clone()))?;
+        let content: std::sync::Arc<str> = std::fs::read_to_string(path)
+            .map_err(|error| DetailedConfigError::from_legacy(error.into(), source.clone()))?
+            .into();
         let ext = std::path::Path::new(path)
             .extension()
             .and_then(|ext| ext.to_str())
@@ -518,8 +532,12 @@ impl Config {
             Some("toml") => &[ConfigFormat::Toml, ConfigFormat::Yaml, ConfigFormat::Json],
             _ => {
                 let mut semantic = false;
-                let result =
-                    crate::parser::parse_dae_config_file_attempt(path, diagnostics, &mut semantic);
+                let result = crate::parser::parse_dae_config_file_attempt(
+                    path,
+                    Some(content.clone()),
+                    diagnostics,
+                    &mut semantic,
+                );
                 match result {
                     Ok(mut config) => {
                         config.derive_node_ids();

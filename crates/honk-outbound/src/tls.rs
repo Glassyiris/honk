@@ -331,6 +331,17 @@ fn decode_ech_config_list(encoded: &str) -> anyhow::Result<Vec<u8>> {
 /// `ech_config_path`. `ech_enabled` without configs is handled separately at
 /// connect time via DNS HTTPS-RR discovery ([`discover_ech_config`]).
 pub fn load_ech_config_list(node: &Node) -> anyhow::Result<Option<Vec<u8>>> {
+    load_ech_config_list_with_reader(node, |path| {
+        let path = honk_config::paths::resolve_dependency_path(path);
+        std::fs::read_to_string(&path)
+            .with_context(|| format!("node {}: read {}", node.name, path.display()))
+    })
+}
+
+fn load_ech_config_list_with_reader(
+    node: &Node,
+    read: impl FnOnce(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<Option<Vec<u8>>> {
     let Some(tls) = node.tls() else {
         return Ok(None);
     };
@@ -340,9 +351,7 @@ pub fn load_ech_config_list(node: &Node) -> anyhow::Result<Option<Vec<u8>>> {
             .with_context(|| format!("node {}: ech_config", node.name));
     }
     if let Some(path) = &tls.ech_config_path {
-        let path = honk_config::paths::resolve_dependency_path(path);
-        let contents = std::fs::read_to_string(&path)
-            .with_context(|| format!("node {}: read {}", node.name, path.display()))?;
+        let contents = read(path)?;
         return decode_ech_config_list(&contents)
             .map(Some)
             .with_context(|| format!("node {}: ech_config_path", node.name));
@@ -353,10 +362,23 @@ pub fn load_ech_config_list(node: &Node) -> anyhow::Result<Option<Vec<u8>>> {
 /// root store. Runtime registries use this before publication; connectors are
 /// built lazily when a node first enters the active working set.
 pub fn validate_connector_config(node: &Node) -> anyhow::Result<()> {
+    validate_connector_config_with_ech_reader(node, |path| {
+        let path = honk_config::paths::resolve_dependency_path(path);
+        std::fs::read_to_string(&path)
+            .with_context(|| format!("node {}: read {}", node.name, path.display()))
+    })
+}
+
+/// Validate the same TLS inputs using caller-authorized, captured ECH bytes.
+/// Inline ECH takes precedence; this never performs discovery or constructs a connector.
+pub fn validate_connector_config_with_ech_reader(
+    node: &Node,
+    read: impl FnOnce(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<()> {
     if node.tls().is_some_and(|tls| !tls.alpn.is_empty()) {
         node.validate_protocol()?;
     }
-    load_ech_config_list(node)?;
+    load_ech_config_list_with_reader(node, read)?;
     if let Some(pin) = node.tls().and_then(|tls| tls.pin_sha256.as_deref())
         && parse_pin_sha256(pin).is_none()
     {

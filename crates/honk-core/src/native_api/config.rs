@@ -1,0 +1,738 @@
+//! Accepted `.dae` sources and the native file-authority boundary.
+
+mod coordinator;
+
+use axum::body::HttpBody;
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use axum::{
+    Json,
+    extract::Request,
+    http::{StatusCode, Uri},
+    response::{IntoResponse, Response},
+};
+use honk_config::{
+    Config,
+    diagnostic::{DetailedDiagnostic, Severity},
+    experimental::NativeApiConfig,
+    parser::{SourceLimits, SourceSnapshot},
+};
+use parking_lot::{Mutex, RwLock};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tokio::sync::{mpsc, oneshot};
+
+use super::offline::DependencySnapshot;
+use super::operations::{OperationStore, Reservation};
+use super::{ApiError, ErrorCode, NativeState, error, parse_query, timestamp, types::RequestId};
+
+pub(crate) const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_SOURCES: usize = 32;
+
+#[derive(Clone, Debug)]
+pub(crate) struct SourceUpdate {
+    pub(crate) sources: Vec<SourceSnapshot>,
+    pub(crate) dependencies: Vec<DependencySnapshot>,
+}
+
+#[derive(Clone)]
+struct Accepted {
+    update: Arc<SourceUpdate>,
+    ids: HashMap<PathBuf, String>,
+    hashes: Vec<String>,
+    revision: String,
+    config_key: String,
+    generation: u64,
+    accepted_at: String,
+}
+
+pub(crate) struct ConfigService {
+    settings: NativeApiConfig,
+    instance_id: String,
+    operations: Arc<OperationStore>,
+    accepted: RwLock<Option<Accepted>>,
+    entry: Mutex<Option<PathBuf>>,
+    sender: Mutex<Option<mpsc::Sender<Work>>>,
+    last_reload: RwLock<Option<Value>>,
+    #[cfg(test)]
+    before_replace: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+enum Work {
+    Replace {
+        source_id: String,
+        content: String,
+        if_match: Result<String, ApiError>,
+        reservation: Reservation,
+    },
+    Reload {
+        reservation: Reservation,
+    },
+    Validate {
+        request: ValidationRequest,
+        response: oneshot::Sender<Result<Value, ApiError>>,
+    },
+    Sighup,
+}
+
+impl ConfigService {
+    pub(crate) fn new(
+        settings: NativeApiConfig,
+        instance_id: String,
+        operations: Arc<OperationStore>,
+    ) -> Self {
+        Self {
+            settings,
+            instance_id,
+            operations,
+            accepted: RwLock::new(None),
+            entry: Mutex::new(None),
+            sender: Mutex::new(None),
+            last_reload: RwLock::new(None),
+            #[cfg(test)]
+            before_replace: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn accept(&self, update: &SourceUpdate, generation: u64) {
+        if update.sources.is_empty()
+            || update.sources.len() + update.dependencies.len() > MAX_SOURCES
+            || update
+                .sources
+                .iter()
+                .map(|source| source.content.len())
+                .chain(update.dependencies.iter().map(|source| source.bytes))
+                .try_fold(0usize, usize::checked_add)
+                .is_none_or(|bytes| bytes > MAX_SOURCE_BYTES)
+        {
+            self.invalidate();
+            return;
+        }
+        let mut entry = self.entry.lock();
+        if entry
+            .as_ref()
+            .is_some_and(|path| path != &update.sources[0].path)
+        {
+            drop(entry);
+            self.invalidate();
+            return;
+        }
+        *entry = Some(update.sources[0].path.clone());
+        drop(entry);
+        let hashes: Vec<_> = update
+            .sources
+            .iter()
+            .map(|source| digest(source.content.as_bytes()))
+            .collect();
+        let mut current = self.accepted.write();
+        let same = current.as_ref().is_some_and(|current| {
+            current.hashes == hashes
+                && current
+                    .update
+                    .sources
+                    .iter()
+                    .map(|source| (&source.path, source.parent))
+                    .eq(update
+                        .sources
+                        .iter()
+                        .map(|source| (&source.path, source.parent)))
+                && same_dependencies(&current.update.dependencies, &update.dependencies)
+        });
+        let ids = update
+            .sources
+            .iter()
+            .map(|source| {
+                let id = current
+                    .as_ref()
+                    .and_then(|current| current.ids.get(&source.path))
+                    .cloned()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                (source.path.clone(), id)
+            })
+            .collect();
+        let revision = if same {
+            current.as_ref().unwrap().revision.clone()
+        } else {
+            uuid::Uuid::new_v4().to_string()
+        };
+        let config_key = current
+            .as_ref()
+            .map(|current| current.config_key.clone())
+            .unwrap_or_default();
+        *current = Some(Accepted {
+            update: Arc::new(update.clone()),
+            ids,
+            hashes,
+            revision,
+            config_key,
+            generation,
+            accepted_at: timestamp(SystemTime::now()),
+        });
+    }
+
+    pub(crate) fn invalidate(&self) {
+        *self.accepted.write() = None;
+    }
+
+    pub(crate) fn generation_committed(&self, config_revision: &str, generation: u64) {
+        if let Some(accepted) = self.accepted.write().as_mut() {
+            if !accepted.config_key.is_empty() && accepted.config_key != config_revision {
+                accepted.revision = uuid::Uuid::new_v4().to_string();
+            }
+            accepted.config_key = config_revision.to_owned();
+            accepted.generation = generation;
+        }
+    }
+
+    pub(crate) fn revision(&self) -> Option<String> {
+        self.accepted
+            .read()
+            .as_ref()
+            .map(|value| value.revision.clone())
+    }
+    pub(crate) fn available(&self) -> bool {
+        self.accepted.read().is_some()
+    }
+    pub(crate) fn writable(&self) -> bool {
+        self.available()
+            && self.settings.config_write
+            && !self.settings.secret.is_empty()
+            && self.sender.lock().is_some()
+    }
+    pub(crate) fn content_enabled(&self) -> bool {
+        self.available() && self.settings.config_content && !self.settings.secret.is_empty()
+    }
+    pub(crate) fn running(&self) -> bool {
+        self.available() && self.sender.lock().is_some()
+    }
+    pub(crate) fn last_reload(&self) -> Option<Value> {
+        self.last_reload.read().clone()
+    }
+
+    fn credential_source(&self, source: &SourceSnapshot) -> bool {
+        source.contains_api_secret
+            || (!self.settings.secret.is_empty() && source.content.contains(&self.settings.secret))
+    }
+
+    fn source_writable(&self, accepted: &Accepted, index: usize) -> bool {
+        if !self.settings.config_write
+            || self.settings.secret.is_empty()
+            || self.credential_source(&accepted.update.sources[index])
+        {
+            return false;
+        }
+        if index == 0 {
+            return true;
+        }
+        let Some(root) = accepted.update.sources[0].path.parent() else {
+            return false;
+        };
+        let Ok(relative) = accepted.update.sources[index].path.strip_prefix(root) else {
+            return false;
+        };
+        self.settings
+            .writable_includes
+            .iter()
+            .any(|path| Path::new(path) == relative)
+    }
+
+    fn source_value(&self, accepted: &Accepted, index: usize) -> Value {
+        let source = &accepted.update.sources[index];
+        let mut value = json!({
+            "id":accepted.ids[&source.path], "path":"<redacted>", "kind":if index==0 {"main"} else {"include"},
+            "content_sha256":accepted.hashes[index], "bytes":source.content.len(),
+            "writable":self.source_writable(accepted,index), "loaded_at":accepted.accepted_at,
+            "line_count":source.content.lines().count(),
+        });
+        if self.settings.config_content
+            && !self.settings.secret.is_empty()
+            && !self.credential_source(source)
+        {
+            value["content"] = json!(source.content.as_ref());
+        }
+        value
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<Value> {
+        let guard = self.accepted.read();
+        let accepted = guard.as_ref()?;
+        Some(
+            json!({"generation_id":format!("{}:{}",self.instance_id,accepted.generation),"revision":accepted.revision,
+            "sources":(0..accepted.update.sources.len()).map(|index| self.source_value(accepted,index)).collect::<Vec<_>>(),
+            "diagnostics":[],"secrets_redacted":true}),
+        )
+    }
+
+    fn enqueue(&self, work: Work) -> Result<(), ApiError> {
+        self.sender
+            .lock()
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .try_send(work)
+            .map_err(|_| unavailable())
+    }
+
+    pub(crate) fn request_sighup(&self) -> Result<(), ApiError> {
+        self.enqueue(Work::Sighup)
+    }
+}
+
+pub(crate) fn digest(bytes: &[u8]) -> String {
+    encode_digest(&Sha256::digest(bytes))
+}
+
+pub(super) fn encode_digest(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(output, "{byte:02x}").expect("writing to a String is infallible");
+    }
+    output
+}
+
+fn same_dependencies(left: &[DependencySnapshot], right: &[DependencySnapshot]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.path == right.path && left.sha256 == right.sha256 && left.bytes == right.bytes
+        })
+}
+
+fn same_sources(left: &SourceUpdate, right: &SourceUpdate) -> bool {
+    left.sources.len() == right.sources.len()
+        && left
+            .sources
+            .iter()
+            .zip(&right.sources)
+            .all(|(left, right)| {
+                left.path == right.path
+                    && left.parent == right.parent
+                    && left.content == right.content
+            })
+        && same_dependencies(&left.dependencies, &right.dependencies)
+}
+
+fn limits() -> SourceLimits {
+    SourceLimits {
+        max_bytes: MAX_SOURCE_BYTES,
+        max_sources: MAX_SOURCES,
+    }
+}
+fn unavailable() -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        ErrorCode::TemporarilyUnavailable,
+        "Configuration coordinator is unavailable",
+        None,
+    )
+}
+fn denied() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        ErrorCode::PermissionDenied,
+        "Configuration administration is not permitted",
+        None,
+    )
+}
+fn not_found() -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        ErrorCode::ResourceNotFound,
+        "Configuration source was not found",
+        None,
+    )
+}
+fn too_large() -> ApiError {
+    ApiError::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        ErrorCode::RequestTooLarge,
+        "Configuration source budget exceeded",
+        None,
+    )
+}
+fn unsupported() -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        ErrorCode::CapabilityNotSupported,
+        "Configuration sources are unavailable",
+        None,
+    )
+}
+fn invalid() -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        ErrorCode::InvalidRequest,
+        "Invalid configuration request",
+        None,
+    )
+}
+fn stale() -> ApiError {
+    ApiError::new(
+        StatusCode::PRECONDITION_FAILED,
+        ErrorCode::StaleRevision,
+        "Configuration changed on disk",
+        None,
+    )
+}
+
+fn request_header<'a>(request: &'a Request, name: &str) -> Result<Option<&'a str>, ApiError> {
+    let mut values = request.headers().get_all(name).iter();
+    let first = values.next();
+    if values.next().is_some() {
+        return Err(invalid());
+    }
+    first
+        .map(|value| value.to_str().map_err(|_| invalid()))
+        .transpose()
+}
+fn if_match(request: &Request) -> Result<String, ApiError> {
+    let tag = request_header(request, "if-match")?.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::PRECONDITION_REQUIRED,
+            ErrorCode::PreconditionRequired,
+            "A strong source revision is required",
+            None,
+        )
+    })?;
+    let hash = tag
+        .strip_prefix('"')
+        .and_then(|tag| tag.strip_suffix('"'))
+        .filter(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(invalid)?;
+    Ok(hash.to_owned())
+}
+fn json_type(request: &Request) -> Result<(), ApiError> {
+    if request_header(request, "content-type")?
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ErrorCode::UnsupportedMediaType,
+            "Expected application/json",
+            None,
+        ))
+    }
+}
+fn principal(state: &NativeState) -> &'static str {
+    if state.settings.secret.is_empty() {
+        "anonymous"
+    } else {
+        "control"
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Replacement {
+    content: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidationSource {
+    id: Option<String>,
+    path: Option<String>,
+    content: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidationRequest {
+    sources: Vec<ValidationSource>,
+    mode: String,
+}
+
+pub(super) async fn get(
+    state: &NativeState,
+    uri: &Uri,
+    id: &RequestId,
+) -> Result<Response, ApiError> {
+    parse_query(uri, &[], id)?;
+    let _config = state.config.read().await;
+    let mut value = state.observation.configuration.snapshot().ok_or_else(|| {
+        error(
+            StatusCode::NOT_FOUND,
+            ErrorCode::CapabilityNotSupported,
+            "Configuration sources are unavailable",
+            id,
+        )
+    })?;
+    let accepted = state.observation.configuration.accepted.read();
+    let accepted = accepted
+        .as_ref()
+        .expect("source snapshot pinned by config publication guard");
+    let active = state.diagnostics.read();
+    value["generation_id"] = json!(format!("{}:{}", state.instance_id, active.generation));
+    let diagnostics = active
+        .buckets
+        .static_diagnostics
+        .iter()
+        .chain(active.buckets.providers.iter().flat_map(|(_, rows)| rows));
+    value["diagnostics"] = json!(
+        diagnostics
+            .map(|diagnostic| project_diagnostic(
+                diagnostic,
+                &accepted.update.sources,
+                &accepted.ids,
+                None
+            ))
+            .collect::<Vec<_>>()
+    );
+    Ok(Json(value).into_response())
+}
+
+pub(super) async fn source(
+    state: &NativeState,
+    source_id: &str,
+    uri: &Uri,
+    id: &RequestId,
+) -> Result<Response, ApiError> {
+    parse_query(uri, &[], id)?;
+    let _config = state.config.read().await;
+    let accepted = state.observation.configuration.accepted.read();
+    let accepted = accepted.as_ref().ok_or_else(unsupported)?;
+    let index = accepted
+        .update
+        .sources
+        .iter()
+        .position(|source| accepted.ids[&source.path] == source_id)
+        .ok_or_else(not_found)?;
+    Ok(Json(
+        state
+            .observation
+            .configuration
+            .source_value(accepted, index),
+    )
+    .into_response())
+}
+
+pub(super) async fn replace(
+    state: &NativeState,
+    source_id: String,
+    request: Request,
+    id: &RequestId,
+) -> Result<Response, ApiError> {
+    parse_query(request.uri(), &[], id)?;
+    if !state.observation.configuration.available() {
+        return Err(unsupported());
+    }
+    if !state.observation.configuration.writable() {
+        return Err(denied());
+    }
+    json_type(&request)?;
+    let expected = if_match(&request);
+    let key = request_header(&request, "idempotency-key")?.map(str::to_owned);
+    let path = request.uri().path().to_owned();
+    let bytes = axum::body::to_bytes(request.into_body(), 65536)
+        .await
+        .map_err(|_| too_large())?;
+    let replacement: Replacement = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let reservation = state.observation.configuration.operations.reserve(
+        principal(state),
+        "PUT",
+        &path,
+        key.as_deref(),
+        &bytes,
+    )?;
+    let admission = reservation.admission();
+    if reservation.fresh {
+        state.observation.configuration.enqueue(Work::Replace {
+            source_id,
+            content: replacement.content,
+            if_match: expected,
+            reservation,
+        })?;
+    }
+    Ok(admission.await?.into_response())
+}
+
+pub(super) async fn reload(
+    state: &NativeState,
+    request: Request,
+    id: &RequestId,
+) -> Result<Response, ApiError> {
+    parse_query(request.uri(), &[], id)?;
+    if !state.observation.configuration.running() {
+        return Err(unsupported());
+    }
+    let key = request_header(&request, "idempotency-key")?.map(str::to_owned);
+    let has_body = request.body().size_hint().upper() != Some(0);
+    if has_body {
+        json_type(&request)?;
+    }
+    let bytes = axum::body::to_bytes(request.into_body(), 65536)
+        .await
+        .map_err(|_| too_large())?;
+    if !bytes.is_empty() {
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if !value.as_object().is_some_and(|object| object.is_empty()) {
+            return Err(invalid());
+        }
+    }
+    let reservation = state.observation.configuration.operations.reserve(
+        principal(state),
+        "POST",
+        "/api/v1/operations/reload",
+        key.as_deref(),
+        &bytes,
+    )?;
+    let admission = reservation.admission();
+    if reservation.fresh {
+        state
+            .observation
+            .configuration
+            .enqueue(Work::Reload { reservation })?;
+    }
+    Ok(admission.await?.into_response())
+}
+
+pub(super) async fn validate(
+    state: &NativeState,
+    request: Request,
+    id: &RequestId,
+) -> Result<Response, ApiError> {
+    if !state.observation.configuration.running() {
+        return Err(unsupported());
+    }
+    parse_query(request.uri(), &[], id)?;
+    json_type(&request)?;
+    let bytes = axum::body::to_bytes(request.into_body(), 65536)
+        .await
+        .map_err(|_| too_large())?;
+    let request: ValidationRequest = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    if request.sources.is_empty() || request.sources.len() > MAX_SOURCES {
+        return Err(if request.sources.is_empty() {
+            invalid()
+        } else {
+            too_large()
+        });
+    }
+    if !matches!(request.mode.as_str(), "syntax" | "full") {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            ErrorCode::UnsupportedValue,
+            "Validation mode is not supported",
+            None,
+        ));
+    }
+    let mut seen = HashSet::new();
+    let mut paths = HashSet::new();
+    let mut total = 0usize;
+    for (index, source) in request.sources.iter().enumerate() {
+        let name = source
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("source-{}", index + 1));
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+            || !seen.insert(name)
+        {
+            return Err(invalid());
+        }
+        if let Some(path) = &source.path
+            && (path.is_empty() || !paths.insert(path))
+        {
+            return Err(invalid());
+        }
+        total = total
+            .checked_add(source.content.len())
+            .ok_or_else(too_large)?;
+    }
+    if total > MAX_SOURCE_BYTES {
+        return Err(too_large());
+    }
+    let (response, result) = oneshot::channel();
+    state
+        .observation
+        .configuration
+        .enqueue(Work::Validate { request, response })?;
+    Ok(Json(result.await.map_err(|_| unavailable())??).into_response())
+}
+
+pub(super) fn operation(
+    state: &NativeState,
+    operation_id: &str,
+    uri: &Uri,
+    id: &RequestId,
+) -> Result<Response, ApiError> {
+    parse_query(uri, &[], id)?;
+    state
+        .observation
+        .configuration
+        .operations
+        .get(operation_id, principal(state), true)
+}
+
+fn project_diagnostic(
+    diagnostic: &DetailedDiagnostic,
+    sources: &[SourceSnapshot],
+    ids: &HashMap<PathBuf, String>,
+    fallback: Option<&str>,
+) -> Value {
+    let source = sources
+        .iter()
+        .find(|source| source.source.same_source(&diagnostic.source));
+    let metadata = diagnostic.source.sources().metadata();
+    let mapped = source.and_then(|source| ids.get(&source.path)).or_else(|| {
+        fallback
+            .and_then(|_| metadata.get(diagnostic.source.index())?.path.as_ref())
+            .and_then(|path| ids.get(path))
+    });
+    let source_id = mapped
+        .map(String::as_str)
+        .or(fallback)
+        .or_else(|| {
+            sources
+                .first()
+                .and_then(|source| ids.get(&source.path))
+                .map(String::as_str)
+        })
+        .unwrap_or("source-1");
+    let exact = mapped.is_some();
+    json!({"level":match diagnostic.severity{Severity::Error=>"error",Severity::Warning=>"warning",Severity::Info=>"info"},
+        "source_id":source_id,"line":if exact{diagnostic.line}else{None},"column":if exact{diagnostic.byte_column}else{None},
+        "span":null,"code":diagnostic.code,"message":diagnostic.message})
+}
+
+fn resolve_source_path(root: &Path, label: &str) -> Result<PathBuf, ApiError> {
+    let input = Path::new(label);
+    let path = if input.is_absolute() {
+        input.strip_prefix(root).map_err(|_| denied())?
+    } else {
+        input
+    };
+    if path
+        .components()
+        .any(|part| !matches!(part, Component::Normal(_)))
+        || path.extension().and_then(|value| value.to_str()) != Some("dae")
+    {
+        return Err(denied());
+    }
+    let joined = root.join(path);
+    let resolved = if joined.exists() {
+        std::fs::canonicalize(&joined).map_err(|_| unavailable())?
+    } else {
+        let parent =
+            std::fs::canonicalize(joined.parent().ok_or_else(invalid)?).map_err(|_| denied())?;
+        parent.join(joined.file_name().ok_or_else(invalid)?)
+    };
+    if !resolved.starts_with(root) {
+        return Err(denied());
+    }
+    Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests;

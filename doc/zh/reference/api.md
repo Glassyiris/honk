@@ -4,9 +4,9 @@
 
 ## 原生 API (M1)
 
-以 `--features native-api` 构建并启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是配置权威；原生 API 不返回配置正文，也不写配置或 SQLite 状态。
+本节保留 M1 标题锚点，内容覆盖已交付的 M1–M6 能力（M3b 组写入除外）。以 `--features native-api` 构建并启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是唯一配置权威；M6 在显式授权下读取与替换已接受的源文件，不引入 SQLite 配置主存储。
 
-固定契约为 [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992)。实现 `base` profile，不声明 `full_transparency`。Runtime、connections、flows、nodes、groups、events 可用；配置、组写入、probe、history、runtime mode 与关闭连接仍明确不可用。
+固定契约为 [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992)。实现 `base` profile，不声明 `full_transparency`。Runtime、connections、flows、nodes、groups、events、出站计数与内存观测可用；history 由记录设置控制，配置与 reload operations 依赖真实启动时捕获的 `.dae` 来源。组写入、provider/geodata 管理、probe、runtime mode/settings、suspend/resume、关闭连接及其他未实现资源仍不可用，以 capabilities 为准。
 
 | 方法 | 路径 | 含义 |
 | --- | --- | --- |
@@ -19,16 +19,25 @@
 | GET | `/api/v1/nodes` | 稳定节点 ID、当前直接成员/订阅来源与真实测量。 |
 | GET | `/api/v1/groups`、`/api/v1/groups/{groupId}` | 无副作用组观测、直接成员、配置 revision/ETag 与捕获的健康数据。 |
 | GET | `/api/v1/events` | 有界且需认证的 SSE，支持绑定过滤器的续传游标。 |
+| GET | `/api/v1/runtime/outbounds` | 共用计数生命周期内按 `kind/name` 区分的全宽出站计数。 |
+| GET | `/api/v1/runtime/memory` | 实际进程 RSS 与可读的 cgroup v2 内存事实。 |
+| GET | `/api/v1/runtime/traffic/history`、`/api/v1/runtime/memory/history` | 可选 `window_seconds`、`max_points`，均默认 600、范围 1–600。 |
+| GET | `/api/v1/config` | 已接受的源快照、配置 revision 与安全诊断。 |
+| GET | `/api/v1/config/sources/{source_id}` | 单个已接受源的元数据及获准返回的原文。 |
+| POST | `/api/v1/config/validate` | `syntax` 或离线 `full` 校验，不写盘、不 reload。 |
+| PUT | `/api/v1/config/sources/{source_id}` | 强 `If-Match` 保护的单源原文替换；写盘后排队真实 reload，返回 operation。 |
+| POST | `/api/v1/operations/reload` | 从磁盘重新加载，返回 daemon-owned operation；body 留空或为 `{}`。 |
+| GET | `/api/v1/operations/{id}` | 真实排队、运行及终态结果。 |
 
-`detail` 默认 `summary`，`type` 默认 `all`，`limit` 默认 100、范围 1–1000。拒绝重复单值或未知 query 参数。先过滤，再统计总量与应用 TCP+UDP 合计 limit；按注册观测时间降序、相同时间按 ID 字典序升序排列。total 是匹配的完整可见数量。IPv4-mapped IPv6 来源按 IPv4 比较。summary 省略 `src/dst/domain`，full 包含它们，未知 domain 为 null；full 不表示更高权限。
+Connections 的 `detail` 默认 `summary`，`type` 默认 `all`，`limit` 默认 100、范围 1–1000。拒绝重复单值或未知 query 参数。先过滤，再统计总量与应用 TCP+UDP 合计 limit；按注册观测时间降序、相同时间按 ID 字典序升序排列。total 是匹配的完整可见数量。IPv4-mapped IPv6 来源按 IPv4 比较。summary 省略 `src/dst/domain`，full 包含它们，未知 domain 为 null；full 不表示更高权限。
 
 连接 `outbound` 是选路当时的组/动作，不是当前叶节点或重建选择。启用记录时，`flow_id`、捕获的 root-first 组/叶 ID、首次观测 UTC 与 domain 来源关联保留证据；缺失或淘汰的证据保持 unknown。逐连接 rate 与未捕获 rule ID 仍为 null。空列表是 `visibility: partial`，不代表设备没有连接。mock 数据面显示 disabled/none；未核验 hooks/policy 的真实后端显示 unknown/none，已知健康失败时可为 degraded。HTTP 就绪不等于数据面就绪。
 
-TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，成功写出的嗅探前缀仅计一次；UDP 保持原逐包语义。唯一的一秒 sampler 使用实际时间间隔；初次采样、reset 和 overflow 返回 null rate，不补零。`counter_since` 属于共用计数器生命周期，`sampled_at` 属于流量样本，`observed_at` 属于 HTTP 观察。UInt64 使用十进制字符串，有界数量仍为 JSON number。CPU、activation 时间、配置 revision 和 last reload 目前未知。
+TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，成功写出的嗅探前缀仅计一次；UDP 保持原逐包语义。唯一的一秒 sampler 使用实际时间间隔；初次采样、reset 和 overflow 返回 null rate，不补零。`counter_since` 属于共用计数器生命周期，`sampled_at` 属于流量样本，`observed_at` 属于 HTTP 观察。UInt64 使用十进制字符串，有界数量仍为 JSON number。CPU 与 activation 时间仍未知；有源管理器时提供配置 revision，`last_reload` 提供最近完成的 API reload operation 结果，否则为 null。
 
 配置 secret 后，所有 API 路径（包括 discovery/version/capabilities、禁用 action、未知 API path）都要求单个有效 Bearer header。Query token、重复凭据、错误凭据均不能回退匿名，同源 UI 也不豁免。无 secret 需显式 loopback 授权，并拒绝 `Sec-Fetch-Site: cross-site`。公共静态文件也接受 Host/Origin 校验；OPTIONS preflight 无需 bearer，但必须通过 Host、Origin、method 与 header 白名单。不返回 cookie credentials 或通配 CORS。
 
-已知禁用 action 返回 JSON `404 capability_not_supported`，未知 path 或未定义 method 返回 JSON `404 resource_not_found`。错误信封为 `{error:{code,message,details},request_id}`。HEAD 保留 GET 状态/header，无 body。API 响应带 `no-store` 与 `nosniff`。应用上限为规范化 target 4096 字节、规范化 header 名/值合计 16384 字节、body 65536 字节（含 chunked）；已认证 GET/HEAD 携带非空 body 会被拒绝。原生读取不触发 probe 或选择变化。
+已知禁用 action 返回 JSON `404 capability_not_supported`，未知 path 或未定义 method 返回 JSON `404 resource_not_found`；配置来源可读但未授权写入时，PUT 返回 `403 permission_denied`。错误信封为 `{error:{code,message,details},request_id}`。HEAD 保留 GET 状态/header，无 body。API 响应带 `no-store` 与 `nosniff`。应用上限为规范化 target 4096 字节、规范化 header 名/值合计 16384 字节、body 65536 字节（含 chunked）；已认证 GET/HEAD 携带非空 body 会被拒绝。原生读取不触发 probe 或选择变化。
 
 原生 server 最多拥有 64 条 HTTP/1.1 连接，满时暂停 accept，header 读取上限五秒；关闭时全部连接共享五秒 graceful drain，随后 abort 并逐一 join。空闲 I/O 与停滞写入分别受 30 秒期限约束；SSE heartbeat 成功写入使健康长连接保持活跃，读取不能延长阻塞 writer 的期限。TLS/HTTP2 可由可信反代终止。Forwarded headers 不改写固定 discovery path，也不授予 Host/Origin 权限。
 
@@ -52,13 +61,48 @@ Flow list 接受 `network/state/connection_id/detail/limit/cursor`。最多八�
 
 Health 来自已完成且维度明确的 producer 测量，不把乐观 alive、跨族复制的排名信号、synthetic failure 或恢复延迟当真实测量。Raw TCP、HTTP 响应头、DNS exchange、QUIC handshake 保留实际目标地址族与完成时间；未知 average/ranking/warmth 保持 null/unknown。自定义组测量保留当时 member/leaf，不绑定到后来的选择。GET 不推进 URLTest、轮询或 Score 状态；尚无配置 icon 时返回 null。
 
-按本轮明确决策，所有组写入继续关闭。Per-network Selector 变更等待共同 control/reload/persistence/warm owner 切换；JSON Patch 等待 M6 无损文件权威事务，不提供仅改内存的 PATCH 或假中断。自动策略 override 仍受双网络响应契约门槛限制。
+M3b 的组 selection、JSON Patch 与自动策略 override 仍关闭。M6 已有无损源文件写入，但这不等于组控制已完成共同 control/reload/persistence/warm owner 集成；不能用仅改内存的 PATCH 或假中断绕过该门槛。自动策略 override 还受双网络响应契约限制。
 
 ### 原生事件（M4）
 
 使用带 Bearer 与 `Accept: text/event-stream` 的 streaming fetch；浏览器 EventSource 不能设置所需 Authorization。可选 `kinds/flow_id` 绑定续传游标。最多保留 512 事件/60 秒，16 clients，每 client 64 条 live 队列；队满断流，不静默 skip。每 15 秒 heartbeat。Fresh 先 ready；有效续传 replay→ready→live，原子挂接不留空窗。过期、未知、旧 instance 或不同过滤器游标在 HTTP 200 前返回 `409 event_cursor_expired`。
 
-实际发布 `stream.ready/runtime.updated/flow.updated/flow.gap/generation.changed`；operations 不可用时不制造 operation 事件。Generation 事件只来自已接受发布，不来自 reload 收件。事件仅含有界安全 ID/状态，不含包正文或原始配置。Flow/event 保留只在内存，不是耐久日志。
+实际发布 `stream.ready/runtime.updated/flow.updated/flow.gap/generation.changed`，配置协调器可用时还发布真实 operation 状态转换的 `operation.updated`。Generation 事件只来自已接受发布，不来自 reload 收件。事件仅含有界安全 ID/状态，不含包正文或原始配置。Flow/event 保留只在内存，不是耐久日志。
+
+### 出站、内存与历史（M5）
+
+`runtime/outbounds` 复用逐出站账本，不按 HTTP 客户端建立计数器。`kind` 区分 `builtin/node/group`，名称可能相同，不能只按 name 合并。累计连接、upload/download bytes 与 errors 保留完整 UInt64 十进制字符串；`active_connections` 为 safe JSON number。计数与 `counter_since` 属于共用 StatsManager 生命周期，reload 不清零。
+
+RSS 来自 `/proc/self/status`；cgroup v2 依据实际 membership/mountinfo 定位，读取 `memory.current`、`memory.max` 与 `memory.events`。不可读取或未知的值为 null，不伪造零；`memory.max=max` 的 limit 为 null，cgroup scope 保持 unknown。Capabilities 只声明实际读到的 metric，`kernel` 为 null，不宣称内核内存核算，也不把 RSS、cgroup 和 kernel 相加。
+
+`record_traffic` 与 `record_memory` 默认 true。两种 history 共用既有的一秒 sampler（错过 tick 使用 Skip），无客户端也记录；各最多 600 点、600 秒，仅存内存，重启清空。设 false 并重启后释放对应缓冲，history 返回 `404 capability_not_supported`，即时 runtime/outbounds/memory 仍可读。`max_points` 从最新点向前按能满足上限的最小 stride 抽取，再按时间从旧到新返回；`sampled_every_seconds` 表示该名义 stride，不保证无缺口。保留原始时间戳、null 与采样缺口，不插值或补零。
+
+### 配置来源、校验与操作（M6）
+
+只有真实 `.dae` 启动加载时捕获的源集合才启用配置管理；程序内构造的 Config 或 serde 格式加载不能冒充无损来源，其配置能力不可用。GET 返回最后已接受的快照，不临时重扫磁盘。源 ID 不含路径，元数据的私有路径显示为 `<redacted>`；原文 SHA-256、字节数、加载时间与逐源 `writable` 单独提供。源集合与校验最多 32 个来源、8 MiB 原始字节，依赖的每次实体化也计入数量和字节预算；HTTP JSON body 的 64 KiB 上限仍独立生效，超限返回 413。
+
+默认 `config_content: false`、`config_write: false`、`writable_includes: []`，以上设置及 history 设置都需重启。Content 或 write 为 true 必须配置非空有效 bearer secret；完整正文仅供通过控制凭证认证的管理员，匿名模式不能取得。包含 API 凭据的整个源不返回 content，并且只读；不要把省略正文误当成可保存的空字符串。获准返回的 content 是逐字原文，可能含出站凭据、订阅 URL 或路径，不是沙箱化/脱敏后的保存载荷；`secrets_redacted` 不表示可以无检查地公开或回写整个响应。
+
+启用 `config_write` 后，非凭据主文件可写；include 只有在已接受集合中，且其规范化路径相对入口目录精确匹配 `writable_includes` 时才可写。该列表不接受绝对路径、遍历或 glob，也不能授权任意新文件；generated/subscription 来源不因此可写。普通 include 仍使用原有入口相对 glob、排序、无匹配及重复/越界检查语义，不因写许可列表改变。API 禁止修改原生设置或改变、移动 API 凭据；如需编辑含凭据主文件，先在本地把凭据迁到专用只读 include 并重启，不能通过 API 完成迁移。
+
+校验使用 `Content-Type: application/json`，例如 `{"mode":"syntax","sources":[{"id":"source-1","content":"..."}]}`；mode 可选 `syntax` 或 `full`，每个 source 的 id/path 可省略。`syntax` 只解析提交的文档，path 仅作来源标签，不授权文件访问，也不跟随磁盘 include。`full` 的首份文档对应入口主文件，额外路径须通过入口根目录授权；使用 overlay、获准本地 include、只读订阅缓存、实际本地 geodata/hosts/ECH 依赖做完整离线准入。缺失或无效依赖是错误，不联网、不创建目录或改权限、不启动 worker、不发布 generation。完成的无效 dry-run 返回 `200` 与 `valid:false`；这不代替之后真实 reload 的运行时校验，也不承诺 reload 一定成功。
+
+PUT 的 JSON body 为 `{"content":"完整的新原文"}`。`If-Match` 必须是**单个带双引号、含 64 个小写十六进制字符的 SHA-256 强标签**，可将读取到的 `content_sha256` 加双引号使用；它比较磁盘当前原始字节，不是 config revision 或 runtime generation。源 GET 仍是 accepted 快照，因此外部编辑后可能需要本地处理或显式 reload，而不是用旧快照覆盖磁盘。
+
+| 写入条件/结果 | HTTP 语义 |
+| --- | --- |
+| 缺少 `If-Match` | `428 precondition_required` |
+| weak、wildcard、多个标签/重复 header、非小写 SHA-256 | `400 invalid_request` |
+| 磁盘 hash 或复查的目标/依赖变化 | `412 stale_revision`，检测到的外部内容不覆盖 |
+| 候选配置或依赖校验失败 | `422 unsupported_value`，不写盘、不 reload |
+| 未授权源、凭据或原生设置修改 | `403 permission_denied` |
+| 操作容量或协调队列繁忙 | `503 temporarily_unavailable` 与 `Retry-After` |
+
+协调器在副作用前预留 operation，串行处理 API 新写入和 SIGHUP，SIGHUP 也先入队再读盘。单源 overlay 完整校验后，采用目录 FD、拒绝符号链接的普通文件检查、独占临时文件、保留 mode、文件 fsync、目标与完整依赖集复查、原子 rename、目录 fsync。外部编辑器不受协调器约束，最后检查到 rename 之间仍有竞争窗口；UI 保存期间不要并行手工改同一文件。Rename 后若目录 fsync 失败，错误明确携带 `written:true,durability_confirmed:false`：可见内容已经改变，不表示未写或回滚。
+
+PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST reload 入协调队列后返回 `202`。响应含 `operation_id`、`href`、相同的 `Location` 与 `Retry-After: 1`，不表示配置已经生效。操作由 daemon 持有，HTTP 断连不取消它或其 supervisor reconciliation。可选 `Idempotency-Key` 绑定 principal、method、path、instance 与原始 body：同 key 同 body 的并发/重试共用结果，不重复写入或 reload，丢失首个 202 后仍可用原 If-Match 重试；不同 body 返回 `409 idempotency_conflict`。总共最多 32 个预留/保留操作，终态保留 300 秒，未过期记录不因容量提前淘汰；重启后不保留。
+
+通过 GET operation、`runtime.last_reload` 及 `operation.updated` 读取真实结果，不能把收到 202 当作 succeeded。Reload 拒绝时保留旧 accepted 快照和 generation，但已写入字节不回滚；提交后 degraded 时保留新快照/generation 并报告 failed，而不是声称旧代仍活动。管理员应据磁盘内容与结果修复，再显式 reload。SIGHUP 本身不创建 API operation。仅改注释也会更新 source hash/config revision，但有效配置未变时不增加 runtime generation；有效组成员变化会改变 revision，健康测量变化不会。这三种版本不是可互换的并发令牌。
 
 ## 启用与鉴权
 

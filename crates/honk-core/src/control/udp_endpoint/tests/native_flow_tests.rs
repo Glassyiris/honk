@@ -28,7 +28,9 @@ async fn native_udp_terminal_evidence_survives_retirement_and_tuple_reuse() {
             EndpointReservation::Initializing(lease) => lease,
             _ => panic!("retired tuple must allow a new initializer"),
         };
-        lease.set_connection_guard(stats.track_connection("test-node"));
+        lease.set_connection_guard(
+            stats.track_connection("test-node", crate::stats::OutboundKind::Node),
+        );
         let transport = Arc::new(ScriptedPacketTransport::with_receive_actions(
             dst,
             [if reason == "transport_error" {
@@ -76,7 +78,7 @@ async fn native_udp_terminal_evidence_survives_retirement_and_tuple_reuse() {
             test_reply_socket().await,
             alive,
             Arc::clone(&stats),
-            "test-node".into(),
+            stats.outbound_tracker("test-node", crate::stats::OutboundKind::Node),
         );
         driver.wait_ready().await.unwrap();
         assert!(lease.commit_ready(Arc::clone(&endpoint)));
@@ -300,6 +302,7 @@ async fn assert_native_udp_builtin_plan(selector_block: bool) {
             io::ErrorKind::WouldBlock
         );
         assert_eq!(handle.stats.snapshot()["cold"].active_conns, 0);
+        assert_eq!(handle.stats.snapshot()["cold"].errors, 0);
     }
     let flows: serde_json::Value = reqwest::Client::builder()
         .no_proxy()

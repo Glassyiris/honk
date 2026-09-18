@@ -68,9 +68,13 @@ enum GeoSource {
 
 impl GeoSource {
     fn present(bytes: Vec<u8>) -> Self {
+        Self::captured(bytes.into())
+    }
+
+    fn captured(bytes: Arc<[u8]>) -> Self {
         let content_digest = Sha256::digest(&bytes).into();
         Self::Present {
-            bytes: Some(bytes.into()),
+            bytes: Some(bytes),
             content_digest,
         }
     }
@@ -101,6 +105,32 @@ impl GeoSourceSet {
         let geosite = capture_source(!requirements.geosite_codes.is_empty(), "geosite.dat");
         let geoip = capture_source(!requirements.geoip_codes.is_empty(), "geoip.dat");
         Self::from_sources(geosite, geoip)
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn load_captured(
+        requirements: &GeoRequirements,
+        data_dir: &std::path::Path,
+        mut read: impl FnMut(&std::path::Path) -> std::io::Result<Arc<[u8]>>,
+    ) -> std::io::Result<Self> {
+        let mut capture = |required: bool, name: &str| {
+            if !required {
+                return Ok(GeoSource::Unused);
+            }
+            let path = find_dat_from(name, data_dir)
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+            read(&path).map(GeoSource::captured)
+        };
+        let geosite = capture(!requirements.geosite_codes.is_empty(), "geosite.dat")?;
+        let geoip = capture(!requirements.geoip_codes.is_empty(), "geoip.dat")?;
+        let invalid = |_| std::io::Error::from(std::io::ErrorKind::InvalidData);
+        if let Some(bytes) = geosite.bytes() {
+            parse_geosite_index_inner(bytes, &requirements.geosite_codes, true).map_err(invalid)?;
+        }
+        if let Some(bytes) = geoip.bytes() {
+            parse_geoip_index(bytes, &requirements.geoip_codes).map_err(invalid)?;
+        }
+        Ok(Self::from_sources(geosite, geoip))
     }
 
     pub(crate) fn probe_union(first: &GeoRequirements, second: &GeoRequirements) -> Self {
@@ -422,13 +452,17 @@ pub fn find_geosite_dat() -> Option<std::path::PathBuf> {
 }
 
 fn find_dat(name: &str) -> Option<std::path::PathBuf> {
+    find_dat_from(name, honk_config::paths::data_dir())
+}
+
+fn find_dat_from(name: &str, data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
     if let Ok(asset) = std::env::var("DAE_LOCATION_ASSET") {
         let path = std::path::Path::new(&asset).join(name);
         if path.is_file() {
             return Some(path);
         }
     }
-    let mut path = honk_config::paths::resolve_artifact_path(name);
+    let mut path = data_dir.join(name);
     if path.is_file() {
         return Some(path);
     }
@@ -459,6 +493,14 @@ fn find_dat(name: &str) -> Option<std::path::PathBuf> {
 fn parse_geosite_index(
     data: &[u8],
     codes: &std::collections::HashSet<String>,
+) -> anyhow::Result<std::collections::HashMap<String, IndexedGeosite>> {
+    parse_geosite_index_inner(data, codes, false)
+}
+
+fn parse_geosite_index_inner(
+    data: &[u8],
+    codes: &std::collections::HashSet<String>,
+    strict: bool,
 ) -> anyhow::Result<std::collections::HashMap<String, IndexedGeosite>> {
     use std::collections::HashSet;
     let mut bases: HashSet<String> = HashSet::with_capacity(codes.len());
@@ -500,6 +542,7 @@ fn parse_geosite_index(
                     }
                 }
                 Ok(None) => {}
+                Err(error) if strict => return Err(error),
                 Err(e) => {
                     tracing::warn!("skipping invalid geosite entry in '{}': {}", code, e);
                 }
@@ -1103,6 +1146,35 @@ fn split_geoip_entry(data: &[u8]) -> anyhow::Result<(Option<String>, Vec<&[u8]>)
 #[cfg(test)]
 mod scan_tests {
     use super::*;
+
+    #[cfg(feature = "native-api")]
+    #[test]
+    fn offline_geo_rejects_malformed_bytes_without_changing_runtime_leniency() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("geosite.dat"), []).unwrap();
+        let mut requirements = GeoRequirements::default();
+        requirements.add_geosite("test");
+        let malformed = geosite_dat(&[("test", vec![domain_msg(1, "[", &[])])]);
+        assert!(parse_geosite_index(&malformed, &requirements.geosite_codes).is_ok());
+        let result = GeoSourceSet::load_captured(&requirements, directory.path(), |_| {
+            Ok(malformed.clone().into())
+        });
+        assert_eq!(
+            result.err().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let result = GeoSourceSet::load_captured(&requirements, directory.path(), |_| {
+            Err(std::io::ErrorKind::NotFound.into())
+        });
+        assert_eq!(result.err().unwrap().kind(), std::io::ErrorKind::NotFound);
+        let result = GeoSourceSet::load_captured(&requirements, directory.path(), |_| {
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        });
+        assert_eq!(
+            result.err().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
 
     #[test]
     fn geoip_code_expanding_to_nothing_warns_like_geosite() {

@@ -52,7 +52,7 @@ async fn native_shared_source_idle_keeps_reply_evidence_per_flow_view() {
             target,
             None,
             Arc::new(pool.create_reply_socket(target).unwrap()),
-            stats.outbound_tracker("core-source-vless"),
+            stats.outbound_tracker("core-source-vless", crate::stats::OutboundKind::Node),
             node.id,
             honk_outbound::alive::IpVersion::V4,
             None,

@@ -31,7 +31,7 @@ pub enum ErrorCode {
     TemporarilyUnavailable,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ApiError {
     #[serde(skip)]
     status: StatusCode,
@@ -39,11 +39,11 @@ pub struct ApiError {
     request_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct ErrorBody {
     code: ErrorCode,
     message: &'static str,
-    details: (),
+    details: Option<Value>,
 }
 
 impl ApiError {
@@ -58,10 +58,20 @@ impl ApiError {
             error: ErrorBody {
                 code,
                 message,
-                details: (),
+                details: None,
             },
             request_id,
         }
+    }
+
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.error.details = Some(details);
+        self
+    }
+
+    pub fn with_request_id(mut self, request_id: String) -> Self {
+        self.request_id = Some(request_id);
+        self
     }
 }
 
@@ -101,8 +111,7 @@ pub(super) struct Runtime {
     pub(super) datapath: DatapathSummary,
     pub(super) traffic: TrafficSummary,
     pub(super) process: Process,
-    // M1 has no reload-operation producer; unit serializes the required null.
-    pub(super) last_reload: (),
+    pub(super) last_reload: Option<Value>,
 }
 
 #[derive(Clone, Serialize)]
@@ -239,7 +248,19 @@ pub(super) fn version() -> Value {
     })
 }
 
-pub(super) fn capabilities(record_flows: bool) -> Value {
+pub(super) fn capabilities(state: &super::NativeState) -> Value {
+    let config = &state.observation.configuration;
+    let telemetry = &state.observation.telemetry;
+    let mut kinds = vec![
+        "stream.ready",
+        "runtime.updated",
+        "flow.updated",
+        "flow.gap",
+        "generation.changed",
+    ];
+    if config.running() {
+        kinds.push("operation.updated");
+    }
     json!({
         "observed_at": chrono::Utc::now().to_rfc3339(),
         "profiles": ["base"],
@@ -249,13 +270,13 @@ pub(super) fn capabilities(record_flows: bool) -> Value {
             "max_json_body_bytes": 65536,
         },
         "resources": {
-            "config": {"available": false},
-            "config_validate": {"available": false},
+            "config": {"available":config.available(),"content":config.content_enabled(),"writable":config.writable(),"max_bytes":super::config::MAX_SOURCE_BYTES,"max_sources":super::config::MAX_SOURCES},
+            "config_validate": {"available":config.running(),"modes":["syntax","full"],"max_bytes":super::config::MAX_SOURCE_BYTES,"max_sources":super::config::MAX_SOURCES},
             "runtime": {"available": true},
-            "runtime_memory": {"available": false},
-            "runtime_outbounds": {"available": false},
-            "traffic_history": {"available": false},
-            "memory_history": {"available": false},
+            "runtime_memory": {"available":true,"metrics":telemetry.metrics()},
+            "runtime_outbounds": {"available":true},
+            "traffic_history": {"available":telemetry.record_traffic(),"max_window_seconds":600,"max_points":600},
+            "memory_history": {"available":telemetry.record_memory(),"max_window_seconds":600,"max_points":600},
             "runtime_mode": {"available": false},
             "datapath": {"available": false},
             "nodes": {"available": true},
@@ -267,17 +288,17 @@ pub(super) fn capabilities(record_flows: bool) -> Value {
                 "can_close": false,
                 "max_bulk_close": 1000,
             },
-            "flows": {"available": true, "recording": if record_flows { "on" } else { "off" }, "scopes":["userspace_tcp","userspace_udp"], "max_flows":1024, "max_steps_per_flow":64, "retention_seconds":300, "snapshot_ttl_seconds":30, "max_page_size":1000},
+            "flows": {"available": true, "recording": if state.settings.record_flows { "on" } else { "off" }, "scopes":["userspace_tcp","userspace_udp"], "max_flows":1024, "max_steps_per_flow":64, "retention_seconds":300, "snapshot_ttl_seconds":30, "max_page_size":1000},
             "routing_trace": {"available": false},
             "rules": {"available": false},
-            "events": {"available": true, "kinds":["stream.ready","runtime.updated","flow.updated","flow.gap","generation.changed"], "retention_seconds":60, "max_buffered_events":512, "max_clients":16, "heartbeat_seconds":15},
+            "events": {"available":true,"kinds":kinds,"retention_seconds":60,"max_buffered_events":512,"max_clients":16,"heartbeat_seconds":15},
             "logs": {"available": false},
             "dns_query": {"available": false},
             "dns_cache": {"available": false},
             "dns_log": {"available": false},
             "runtime_settings": {"available": false},
-            "operations": {"available": false},
-            "reload": {"available": false},
+            "operations": {"available":config.running(),"retention_seconds":300},
+            "reload": {"available":config.running()},
             "suspend": {"available": false},
             "resume": {"available": false},
         },

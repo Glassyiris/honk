@@ -264,6 +264,7 @@ async fn c20_authorized_refresh_admits_reserved_provider_name() {
         )
         .await
         .unwrap()
+        .accepted()
     );
     let handle = cp.config_handle();
     let after = handle.read().await;

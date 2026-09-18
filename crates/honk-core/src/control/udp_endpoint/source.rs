@@ -474,7 +474,10 @@ impl VlessSourcePreparation {
                                     alive_set,
                                     node_id,
                                     health_family,
-                                    stats.outbound_tracker(&node_name),
+                                    stats.outbound_tracker(
+                                        &node_name,
+                                        crate::stats::OutboundKind::Node,
+                                    ),
                                     stats,
                                     source_permit,
                                 );

@@ -492,7 +492,6 @@ impl ControlPlaneHandle {
                 .await;
         }
 
-        self.stats.record_connection(&outbound_name);
         // If eBPF already decided this flow should go direct (not just punted
         // it to userspace), skip userspace proxy dial, DNS, and relay entirely.
         // For ControlPlaneRouting handoffs we must relay in userspace even if
@@ -518,7 +517,8 @@ impl ControlPlaneHandle {
                 client_addr,
                 original_dst,
             );
-            self.stats.record_close(&outbound_name);
+            self.stats.record_connection(&outbound_name, crate::stats::OutboundKind::Builtin);
+            self.stats.record_close(&outbound_name, crate::stats::OutboundKind::Builtin);
             #[cfg(feature = "native-api")]
             if let Some(native) = &native_flow {
                 native.finish("unknown", "kernel_handoff");
@@ -549,6 +549,8 @@ impl ControlPlaneHandle {
                     self.runtime_registry.read().clone(),
                 )
             };
+        let outbound_kind = crate::stats::OutboundKind::routed(&generation_config, &outbound_name);
+        let outbound_guard = self.stats.track_connection(&outbound_name, outbound_kind);
         #[cfg(feature = "native-api")]
         let native_dial = native_flow.as_ref().map(|flow| {
             let (generation, catalog) = pinned_native.expect("native selection capture");
@@ -597,8 +599,8 @@ impl ControlPlaneHandle {
             for node in group_manager.leaf_nodes_in_group(&outbound_name) {
                 self.alive_set.notify_check_tcp(node.id);
             }
-            self.stats.record_error(&outbound_name);
-            self.stats.record_close(&outbound_name);
+            self.stats.record_error(&outbound_name, outbound_kind);
+            drop(outbound_guard);
             #[cfg(feature = "native-api")]
             if let Some(native) = &native_flow {
                 native.finish("failed", "no_available_nodes");
@@ -645,6 +647,7 @@ impl ControlPlaneHandle {
                 original_dst,
                 target_domain.clone(),
                 &outbound_name,
+                outbound_kind,
                 connect_timeout,
                 overall_dial_timeout,
                 Arc::clone(&runtime_generation),
@@ -660,7 +663,7 @@ impl ControlPlaneHandle {
         let (mut proxy_stream, node, score_reporter) = match raced {
             Ok(Some(pair)) => pair,
             Err(error) => {
-                self.stats.record_close(&outbound_name);
+                drop(outbound_guard);
                 return Err(error);
             }
             Ok(None) => {
@@ -710,6 +713,7 @@ impl ControlPlaneHandle {
                                     original_dst,
                                     target_domain.clone(),
                                     &outbound_name,
+                                    outbound_kind,
                                     connect_timeout,
                                     overall_dial_timeout,
                                     Arc::clone(&runtime_generation),
@@ -725,7 +729,7 @@ impl ControlPlaneHandle {
                             let retry = match retry {
                                 Ok(retry) => retry,
                                 Err(error) => {
-                                    self.stats.record_close(&outbound_name);
+                                    drop(outbound_guard);
                                     return Err(error);
                                 }
                             };
@@ -746,7 +750,7 @@ impl ControlPlaneHandle {
                 match retried {
                     Some(pair) => pair,
                     None => {
-                        self.stats.record_close(&outbound_name);
+                        drop(outbound_guard);
                         #[cfg(feature = "native-api")]
                         if let Some(native) = &native_flow {
                             if outbound_name == "block" || candidates.iter().all(|node| node.protocol() == honk_config::types::NodeProtocol::Block) {
@@ -772,7 +776,7 @@ impl ControlPlaneHandle {
 
         let conn_upload = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let conn_download = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let (outbound_upload, outbound_download) = self.stats.byte_counters(&outbound_name);
+        let (outbound_upload, outbound_download) = self.stats.byte_counters(&outbound_name, outbound_kind);
         if let Some(conn_id) = flow.track_if_enabled(|| {
             let id = uuid::Uuid::new_v4().to_string();
             let (rule, rule_payload) =
@@ -838,8 +842,8 @@ impl ControlPlaneHandle {
                     native.finish("failed", "prefix_write_failed");
                 }
                 warn!("Failed to write sniffed bytes to proxy: {}", e);
-                self.stats.record_error(&outbound_name);
-                self.stats.record_close(&outbound_name);
+                self.stats.record_error(&outbound_name, outbound_kind);
+                drop(outbound_guard);
                 if let Some(reporter) = &score_reporter {
                     reporter.finish(crate::group::ScoreOutcome::Io(e.kind()));
                 }
@@ -923,7 +927,7 @@ impl ControlPlaneHandle {
                 if let Some(reporter) = &score_reporter {
                     reporter.finish(crate::group::ScoreOutcome::Success);
                 }
-                self.stats.record_close(&outbound_name);
+                drop(outbound_guard);
 
                 // Deposit a fresh connection for future reuse. Ready-capable
                 // handlers get a fully-dialed, target-bound stream (handshake
@@ -1072,8 +1076,8 @@ impl ControlPlaneHandle {
                 } else {
                     warn!("Relay error for {} -> {}: {}", client_addr, original_dst, e);
                 }
-                self.stats.record_error(&outbound_name);
-                self.stats.record_close(&outbound_name);
+                self.stats.record_error(&outbound_name, outbound_kind);
+                drop(outbound_guard);
                 if let Some(reporter) = &score_reporter {
                     reporter.finish(crate::group::ScoreOutcome::from_error(&e));
                 }
@@ -1105,6 +1109,7 @@ impl ControlPlaneHandle {
         target: SocketAddr,
         target_domain: Option<String>,
         outbound_name: &str,
+        outbound_kind: crate::stats::OutboundKind,
         connect_timeout: Duration,
         overall_dial_timeout: Duration,
         runtime_generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
@@ -1285,7 +1290,9 @@ impl ControlPlaneHandle {
                     }
                     Ok((Err(e), _idx, _elapsed, node, _reporter)) => {
                         debug!("Parallel dial to {} failed: {}", node.name, e);
-                        ctx.stats.record_error(&outbound);
+                        if node.protocol() != honk_config::types::NodeProtocol::Block {
+                            ctx.stats.record_error(&outbound, outbound_kind);
+                        }
                         if honk_outbound::proxy::is_packet_rejection(&e) {
                             rejection = Some(e);
                             set.abort_all();

@@ -273,28 +273,44 @@ impl ControlPlane {
                 request_id,
                 config,
                 diagnostics,
+                #[cfg(feature = "native-api")]
+                sources,
                 result,
             } => {
                 info!("SIGHUP reload request {request_id} started");
-                let applied = match self
-                    .apply_sighup_config(*config, diagnostics, drain, subscription_authorizations)
+                let outcome = match self
+                    .apply_sighup_config(
+                        *config,
+                        diagnostics,
+                        drain,
+                        subscription_authorizations,
+                        #[cfg(feature = "native-api")]
+                        sources.as_deref(),
+                    )
                     .await
                 {
                     Ok(applied) => applied,
                     Err(error) => {
                         crate::report_runtime_admission_error(&error);
-                        false
+                        ReloadOutcome::Rejected
                     }
                 };
-                let committed = if applied {
-                    info!("SIGHUP reload request {request_id} applied");
+                let authorized = if outcome.accepted() {
+                    info!(?outcome, "SIGHUP reload request {request_id} applied");
                     let config = self.config.read().await;
-                    Some(subscription_authorizations.committed(&config.subscriptions))
+                    subscription_authorizations.committed(&config.subscriptions)
                 } else {
                     warn!("SIGHUP reload request {request_id} rejected");
-                    None
+                    Vec::new()
                 };
-                if result.send(committed).is_err() && applied {
+                if result
+                    .send(ReloadReply {
+                        outcome,
+                        authorized,
+                    })
+                    .is_err()
+                    && outcome.accepted()
+                {
                     error!("SIGHUP reload request {request_id} lost its supervisor handoff");
                     return false;
                 }
@@ -317,8 +333,10 @@ impl ControlPlane {
                     )
                     .await
                 {
-                    Ok(true) => info!("Subscription runtime publication applied"),
-                    Ok(false) => warn!("Subscription runtime publication rejected"),
+                    Ok(outcome) if outcome.accepted() => {
+                        info!(?outcome, "Subscription runtime publication applied")
+                    }
+                    Ok(_) => warn!("Subscription runtime publication rejected"),
                     Err(error) => crate::report_runtime_admission_error(&error),
                 }
             }
@@ -346,10 +364,12 @@ impl ControlPlane {
                                 drain,
                                 crate::config_diagnostics::DiagnosticUpdate::Preserve,
                                 None,
+                                #[cfg(feature = "native-api")]
+                                None,
                             )
                             .await
                         {
-                            Ok(applied) => applied,
+                            Ok(outcome) => outcome.accepted(),
                             Err(error) => {
                                 crate::report_runtime_admission_error(&error);
                                 false
@@ -379,6 +399,61 @@ impl ControlPlane {
             ControlCommand::Shutdown => return false,
         }
         true
+    }
+
+    #[cfg(all(test, feature = "native-api"))]
+    pub(crate) async fn run_native_config_test_commands(
+        &mut self,
+        reloads: Arc<std::sync::atomic::AtomicUsize>,
+        gate: Option<mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>,
+    ) -> anyhow::Result<()> {
+        let mut receiver = self
+            .command_rx
+            .take()
+            .expect("command receiver already taken");
+        let drain = Arc::clone(&self.drain_tracker);
+        let (fatal, mut failures) = mpsc::unbounded_channel();
+        let mut removals = spawn_udp_removal_worker(
+            Arc::clone(&self.udp_pool),
+            Arc::clone(&self.ebpf),
+            Arc::clone(&self.connection_tracker),
+            fatal,
+        );
+        let result = async {
+            self.initialize_datapath_flags(false, false).await?;
+            let mut authorizations = crate::subscription::SubscriptionAuthorizations::new(
+                &self.config.read().await.subscriptions,
+            )?;
+            while let Some(command) = receiver.recv().await {
+                if matches!(&command, ControlCommand::ReloadConfig { .. }) {
+                    reloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(gate) = &gate {
+                        let (release, wait) = tokio::sync::oneshot::channel();
+                        if gate.send(release).is_ok() {
+                            let _ = tokio::time::timeout(Duration::from_secs(5), wait).await?;
+                        }
+                    }
+                }
+                if !self
+                    .dispatch_control_command(command, &drain, &mut authorizations)
+                    .await
+                {
+                    break;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        drain.start_rejecting();
+        let shutdown = self.shutdown_datapath(&drain, &mut removals, None).await;
+        let finalized = self.finalize_shutdown().await;
+        result?;
+        shutdown?;
+        finalized?;
+        if let Ok(error) = failures.try_recv() {
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {

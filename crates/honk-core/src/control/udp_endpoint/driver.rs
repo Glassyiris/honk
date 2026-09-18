@@ -389,11 +389,10 @@ impl UdpEndpointPool {
         reply_socket: impl Into<DriverReplySocket>,
         alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
         stats: Arc<StatsManager>,
-        outbound_name: String,
+        outbound_tracker: OutboundTracker,
     ) -> UdpDriverHandle {
         let reply_socket = reply_socket.into().into_socket();
         let key = EndpointKey::new(client_addr, client_dst);
-        let outbound_tracker = stats.outbound_tracker(&outbound_name);
         let (ready_tx, ready) = oneshot::channel();
         let (start, start_rx) = oneshot::channel();
         let (first_ack_tx, first_ack) = oneshot::channel();

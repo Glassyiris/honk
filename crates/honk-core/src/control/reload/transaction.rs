@@ -13,7 +13,7 @@ impl Drop for PreDnsPublicationHookGuard<'_> {
     }
 }
 
-fn rebase_subscription_nodes(
+pub(crate) fn rebase_subscription_nodes(
     current: &Config,
     candidate: &mut Config,
 ) -> std::collections::HashSet<uuid::Uuid> {
@@ -90,18 +90,25 @@ impl ControlPlane {
         mut new_config: Config,
         diagnostics: crate::config_diagnostics::DiagnosticBuckets,
         drain: &DrainTracker,
-    ) -> bool {
+    ) -> ReloadOutcome {
         let _reload = self.reload_lock.lock().await;
         crate::dns::ecs::resolve_client_subnet(&mut new_config.dns).await;
         let update = DiagnosticUpdate::Replace(diagnostics);
         match self
-            .apply_resolved_runtime_config_locked(new_config, drain, update, None)
+            .apply_resolved_runtime_config_locked(
+                new_config,
+                drain,
+                update,
+                None,
+                #[cfg(feature = "native-api")]
+                None,
+            )
             .await
         {
             Ok(applied) => applied,
             Err(error) => {
                 crate::report_runtime_admission_error(&error);
-                false
+                ReloadOutcome::Rejected
             }
         }
     }
@@ -111,7 +118,8 @@ impl ControlPlane {
         diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
         drain: &DrainTracker,
         authorizations: &mut crate::subscription::SubscriptionAuthorizations,
-    ) -> Result<bool, honk_config::error::DetailedConfigError> {
+        #[cfg(feature = "native-api")] sources: Option<&crate::native_api::config::SourceUpdate>,
+    ) -> Result<ReloadOutcome, honk_config::error::DetailedConfigError> {
         let _reload = self.reload_lock.lock().await;
         let current_guard = self.config.read().await;
         let current = Arc::clone(&current_guard);
@@ -126,6 +134,8 @@ impl ControlPlane {
                 retained_provider_ids: retained_providers,
             },
             Some(authorizations),
+            #[cfg(feature = "native-api")]
+            sources,
         )
         .await
     }
@@ -155,6 +165,7 @@ impl ControlPlane {
         let drain = Arc::clone(&self.drain_tracker);
         self.apply_runtime_config(new_config, diagnostics, &drain)
             .await
+            .accepted()
     }
 
     pub(in crate::control) async fn apply_resolved_runtime_config_locked(
@@ -163,7 +174,13 @@ impl ControlPlane {
         drain: &DrainTracker,
         diagnostic_update: DiagnosticUpdate,
         authorizations: Option<&mut crate::subscription::SubscriptionAuthorizations>,
-    ) -> Result<bool, honk_config::error::DetailedConfigError> {
+        #[cfg(feature = "native-api")] sources: Option<&crate::native_api::config::SourceUpdate>,
+    ) -> Result<ReloadOutcome, honk_config::error::DetailedConfigError> {
+        #[cfg(feature = "native-api")]
+        let replaces_sources = matches!(
+            &diagnostic_update,
+            DiagnosticUpdate::Replace(_) | DiagnosticUpdate::Rebase { .. }
+        );
         if let DiagnosticUpdate::Replace(buckets) = &diagnostic_update
             && buckets.providers.len() > 1
         {
@@ -175,14 +192,14 @@ impl ControlPlane {
                 .any(|(id, _)| !provider_ids.insert(*id))
             {
                 error!("reload rejected: duplicate provider diagnostic buckets");
-                return Ok(false);
+                return Ok(ReloadOutcome::Rejected);
             }
         }
         if let Err(error) =
             crate::subscription::validate_subscription_ids(&new_config.subscriptions)
         {
             error!(%error, "reload rejected: invalid subscription ids");
-            return Ok(false);
+            return Ok(ReloadOutcome::Rejected);
         }
         let current_router = self.router.read().await.clone();
         let current_config = self.config.read().await.clone();
@@ -193,7 +210,7 @@ impl ControlPlane {
             )
         {
             error!("reload rejected: subscription worker changes require the control command path");
-            return Ok(false);
+            return Ok(ReloadOutcome::Rejected);
         }
         // Same proof as at the public entry: equality with the admitted active
         // configuration is admission. Anything else is verified before any shortcut.
@@ -216,7 +233,7 @@ impl ControlPlane {
                     Err(error) => {
                         error!(%error, "Failed to fingerprint DNS hosts snapshot");
                         self.stop_reload_rejection_if_healthy(drain);
-                        return Ok(false);
+                        return Ok(ReloadOutcome::Rejected);
                     }
                 };
             if current_router.geo_fingerprint() == traffic_geo_fingerprint
@@ -225,16 +242,25 @@ impl ControlPlane {
                     policy.matches_artifacts(&hosts_fingerprint, &dns_geo_fingerprint)
                 })
             {
+                let _config = self.config.write().await;
+                let generation = self.diagnostics.read().generation;
                 if !matches!(&diagnostic_update, DiagnosticUpdate::Preserve) {
-                    let _config = self.config.write().await;
                     self.diagnostics.write().buckets.apply(diagnostic_update);
                     #[cfg(feature = "native-api")]
                     if let Some(native) = &self.native {
                         native.catalog.install(&new_config);
                     }
                 }
+                #[cfg(feature = "native-api")]
+                if let Some(native) = &self.native {
+                    if let Some(sources) = sources {
+                        native.configuration.accept(sources, generation);
+                    } else if replaces_sources {
+                        native.configuration.invalidate();
+                    }
+                }
                 info!("Configuration unchanged — retaining active runtime generation");
-                return Ok(true);
+                return Ok(ReloadOutcome::Noop { generation });
             }
         }
         let candidate_log_file =
@@ -250,7 +276,7 @@ impl ControlPlane {
                 fields = ?restart_required,
                 "reload rejected: changed fields require process restart"
             );
-            return Ok(false);
+            return Ok(ReloadOutcome::Rejected);
         }
 
         #[cfg(feature = "reload-bench-counters")]
@@ -268,7 +294,7 @@ impl ControlPlane {
             Err(error) => {
                 error!(%error, "Failed to load DNS hosts snapshot");
                 self.stop_reload_rejection_if_healthy(drain);
-                return Ok(false);
+                return Ok(ReloadOutcome::Rejected);
             }
         };
         let candidate_dns_policy = match crate::dns::policy::PolicyId::from_config_with_artifacts(
@@ -280,7 +306,7 @@ impl ControlPlane {
             Err(error) => {
                 error!(%error, "Failed to derive DNS policy identity");
                 self.stop_reload_rejection_if_healthy(drain);
-                return Ok(false);
+                return Ok(ReloadOutcome::Rejected);
             }
         };
         let old_plan = self.active_routing_plan.read().clone();
@@ -299,7 +325,7 @@ impl ControlPlane {
                 Err(error) => {
                     error!(%error, "Failed to build new router");
                     self.stop_reload_rejection_if_healthy(drain);
-                    return Ok(false);
+                    return Ok(ReloadOutcome::Rejected);
                 }
             }
         };
@@ -333,7 +359,7 @@ impl ControlPlane {
                 Err(e) => {
                     error!("Failed to build runtime registry (reload aborted): {}", e);
                     self.stop_reload_rejection_if_healthy(drain);
-                    return Ok(false);
+                    return Ok(ReloadOutcome::Rejected);
                 }
             };
         let reuse_dns_router = dns_routing_state_reusable(&current_config, &new_config)
@@ -349,7 +375,7 @@ impl ControlPlane {
                 Err(error) => {
                     error!(%error, "Failed to build DNS router");
                     self.stop_reload_rejection_if_healthy(drain);
-                    return Ok(false);
+                    return Ok(ReloadOutcome::Rejected);
                 }
             }
         };
@@ -363,7 +389,7 @@ impl ControlPlane {
                 Err(error) => {
                     error!(%error, "Failed to parse DNS hosts snapshot");
                     self.stop_reload_rejection_if_healthy(drain);
-                    return Ok(false);
+                    return Ok(ReloadOutcome::Rejected);
                 }
             }
         };
@@ -383,7 +409,7 @@ impl ControlPlane {
             Err(e) => {
                 error!("Failed to build DNS forwarder: {}", e);
                 self.stop_reload_rejection_if_healthy(drain);
-                return Ok(false);
+                return Ok(ReloadOutcome::Rejected);
             }
         };
         let new_outbound_id_map = build_outbound_id_map(&new_config);
@@ -398,7 +424,7 @@ impl ControlPlane {
                 Err(error) => {
                     error!(%error, "Failed to compile routing publication");
                     self.stop_reload_rejection_if_healthy(drain);
-                    return Ok(false);
+                    return Ok(ReloadOutcome::Rejected);
                 }
             }
         };
@@ -433,7 +459,7 @@ impl ControlPlane {
         } else {
             if current_config.global.nfqueue_enable || new_config.global.nfqueue_enable {
                 error!("datapath flags writer is unavailable during NFQUEUE reload");
-                return Ok(false);
+                return Ok(ReloadOutcome::Rejected);
             }
             let mode_state = self.mode_state.clone().unwrap_or_else(|| {
                 Arc::new(parking_lot::RwLock::new(crate::mode::ModeState::new(
@@ -444,7 +470,7 @@ impl ControlPlane {
                 crate::mode::DatapathFlagsHandle::new(Arc::clone(&self.ebpf), mode_state, None);
             if let Err(error) = handle.initialize(false, false).await {
                 error!(%error, "failed to initialize reload-scoped datapath flags writer");
-                return Ok(false);
+                return Ok(ReloadOutcome::Rejected);
             }
             handle
         };
@@ -460,7 +486,7 @@ impl ControlPlane {
             // serving instead of rejecting new connections forever.
             self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
                 .await;
-            return Ok(false);
+            return Ok(ReloadOutcome::Rejected);
         }
         drain.start_rejecting();
         #[cfg(feature = "ebpf")]
@@ -471,7 +497,7 @@ impl ControlPlane {
             warn!("UDP initializers did not drain before reload commit");
             self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
                 .await;
-            return Ok(false);
+            return Ok(ReloadOutcome::Rejected);
         }
         #[cfg(feature = "ebpf")]
         if let Some(pending) = self.pending_udp_verdicts.as_ref() {
@@ -481,7 +507,7 @@ impl ControlPlane {
             warn!("UDP endpoint retirements did not drain before reload commit");
             self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
                 .await;
-            return Ok(false);
+            return Ok(ReloadOutcome::Rejected);
         }
         let old_registry_result = {
             let mut router_guard = self.router.write().await;
@@ -596,6 +622,11 @@ impl ControlPlane {
                     #[cfg(feature = "native-api")]
                     if let Some(native) = &self.native {
                         self.alive_set.invalidate_native_group_observations();
+                        if let Some(sources) = sources {
+                            native.configuration.accept(sources, generation.get());
+                        } else if replaces_sources {
+                            native.configuration.invalidate();
+                        }
                         native.committed(&config_guard, previous_generation, generation.get());
                     }
                 }
@@ -622,7 +653,7 @@ impl ControlPlane {
             Err(()) => {
                 self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
                     .await;
-                return Ok(false);
+                return Ok(ReloadOutcome::Rejected);
             }
         };
 
@@ -661,7 +692,9 @@ impl ControlPlane {
                 .store(false, std::sync::atomic::Ordering::Release);
             drain.start_rejecting();
             self.drain_tracker.start_rejecting();
-            return Ok(true);
+            return Ok(ReloadOutcome::CommittedDegraded {
+                generation: generation.get(),
+            });
         }
         info!("Configuration applied — {} routes active", route_count);
         #[cfg(feature = "ebpf")]
@@ -674,7 +707,9 @@ impl ControlPlane {
         self.datapath_healthy
             .store(true, std::sync::atomic::Ordering::Release);
         self.stop_reload_rejection_if_healthy(drain);
-        Ok(true)
+        Ok(ReloadOutcome::Committed {
+            generation: generation.get(),
+        })
     }
 
     async fn restore_datapath_flags_after_rejected_reload(

@@ -15,6 +15,8 @@ pub(crate) struct NativeObservation {
     pub(crate) flows: Arc<FlowStore>,
     pub(crate) record_flows: bool,
     pub(crate) catalog: Arc<Catalog>,
+    pub(crate) telemetry: super::telemetry::Telemetry,
+    pub(crate) configuration: Arc<super::config::ConfigService>,
 }
 
 impl NativeObservation {
@@ -23,17 +25,33 @@ impl NativeObservation {
         let events = Arc::new(EventHub::new(instance_id.clone()));
         let flows = Arc::new(FlowStore::new(instance_id.clone(), Arc::clone(&events)));
         flows.set_recording(config.experimental.native_api.record_flows);
+        let operations = Arc::new(super::operations::OperationStore::new(
+            instance_id.clone(),
+            Arc::clone(&events),
+        ));
+        let configuration = Arc::new(super::config::ConfigService::new(
+            config.experimental.native_api.clone(),
+            instance_id.clone(),
+            operations,
+        ));
         Self {
             instance_id,
             events,
             flows,
             catalog: Arc::new(Catalog::new(config)),
             record_flows: config.experimental.native_api.record_flows,
+            telemetry: super::telemetry::Telemetry::new(
+                config.experimental.native_api.record_traffic,
+                config.experimental.native_api.record_memory,
+            ),
+            configuration,
         }
     }
 
     pub(crate) fn committed(&self, config: &Config, previous: u64, generation: u64) {
         self.catalog.install(config);
+        self.configuration
+            .generation_committed(&self.catalog.snapshot().revision, generation);
         if previous != generation {
             self.events.publish(
                 "generation.changed",

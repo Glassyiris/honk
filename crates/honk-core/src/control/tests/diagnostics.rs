@@ -42,9 +42,12 @@ async fn reload(cp: &ControlPlane, config: Config, diagnostics: Vec<DetailedDiag
         diagnostics,
         &DrainTracker::new(),
         &mut authorizations,
+        #[cfg(feature = "native-api")]
+        None,
     )
     .await
     .unwrap()
+    .accepted()
 }
 
 fn provider_config() -> (Config, DiagnosticBuckets) {
@@ -93,6 +96,7 @@ async fn refresh(
         &DrainTracker::new(),
     )
     .await
+    .map(ReloadOutcome::accepted)
 }
 
 #[tokio::test]

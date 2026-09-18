@@ -258,7 +258,7 @@ fn install_source(
         target,
         None,
         reply_socket,
-        stats.outbound_tracker("core-source-vless"),
+        stats.outbound_tracker("core-source-vless", crate::stats::OutboundKind::Node),
         node_id,
         honk_outbound::alive::IpVersion::V4,
         None,

@@ -8,7 +8,7 @@
 | --- | --- |
 | `clash_api` | Clash 兼容 HTTP API 与外部 dashboard |
 | `cache_file` | 用 SQLite 持久化运行时选择、模式、延迟样本和可选 DNS 状态 |
-| `native_api` | 独立、显式启用的只读原生 API 与本地 UI 目录 |
+| `native_api` | 独立、显式启用的原生观测、受控 `.dae` 源管理与本地 UI 目录 |
 
 `udp_nfqueue { enabled: ... }` 是已弃用的兼容 section。dae 和结构化配置加载器仍会接受它，打印迁移 warning，并将值复制到 `global.nfqueue_enable`；新配置应直接使用全局字段。
 
@@ -26,6 +26,11 @@
 | `allowed_hosts` | 空列表 | 额外允许的 HTTP Host authority；不含 URL scheme、路径、凭据或通配符。省略端口表示 80，不是监听端口。 |
 | `ui` | `""` | 空值关闭托管；非空为含可读 `index.html` 的可信本地目录。不支持内嵌产物，也不在启动时下载或构建。 |
 | `record_flows` | `true` | 原生 API 启用后保留有界用户态决策，无客户端也记录；`false` 关闭记录并释放缓冲，需重启。 |
+| `record_traffic` | `true` | 无客户端也记录流量 history；最多 600 点/600 秒，false 在重启后释放对应缓冲，不关闭即时计数。 |
+| `record_memory` | `true` | 无客户端也记录 RSS/cgroup history；最多 600 点/600 秒，false 在重启后释放对应缓冲，不关闭即时内存观测。 |
+| `config_content` | `false` | 向通过控制 bearer 认证的管理员返回获准源的完整原文；要求非空 secret，含 API 凭据的整个源仍省略正文。 |
+| `config_write` | `false` | 允许非凭据主文件及明确授权的已接受 include 原文替换，耐久写入后排队真实 reload；要求非空 secret。 |
+| `writable_includes` | 空列表（`[]`） | 已接受 include 相对入口目录的规范化 `.dae` 路径精确许可列表；不接受绝对路径、遍历、glob 或任意新文件。dae 中省略字段表示空列表。 |
 
 ```dae
 experimental {
@@ -48,6 +53,17 @@ experimental {
 列表采用逐项引号与逗号分隔，例如 `allow_origins: 'http://localhost:3000', 'https://panel.example'`。省略表示空列表；不接受 JSON 方括号或整段引号聚合。
 
 相对 UI 路径沿用依赖搜索顺序：`global.data_dir` 下已有路径、`/var/share/honk` 下已有路径、工作目录已有路径；均不存在时定位到 `global.data_dir` 并在启动时报错。目录及其符号链接目标均由可信管理员负责。参见[原生 API 契约](./api.md#原生-api-m1)。
+
+### M5：共用采样与可选历史
+
+流量与内存 history 共用既有一秒 sampler，错过 tick 使用 Skip；仅存内存，重启清空，不插值、不补零，缺口与 null 原样保留。读取依据实际 RSS/cgroup v2 文件，不把未知值伪装为零，也不宣称内核内存核算。关闭 history 不关闭即时 runtime、出站或内存读取；所有记录开关仍需重启。
+
+### M6：配置管理的信任边界
+
+配置来源仅在真实 `.dae` 启动加载时捕获；程序内构造的配置或 serde 加载不提供无损源管理。默认只公开已接受的元数据，私有路径显示为 `<redacted>`。开启 `config_content` 或 `config_write` 必须设置非空有效 secret，匿名 loopback 不例外。完整 content 可能包含节点凭据、订阅 URL 或路径，不是脱敏或沙箱化保存载荷；含 API 凭据的整个源不返回正文且只读。API 禁止改变或迁移凭据及原生设置；需管理员本地修改并重启。若主文件包含凭据，要先在本地将其移至专用只读 include，再重启，才能通过 API 编辑该主文件。
+
+例如 `writable_includes: 'conf.d/routing.dae', 'conf.d/groups.dae'` 只授权已接受集合中的这两个规范化路径，不改变普通 include 的 glob、排序或无匹配语义。全量源/校验预算为 32 个来源、8 MiB，依赖的每次实体化也计入预算；HTTP JSON body 仍最多 64 KiB。PUT 要求磁盘原字节 SHA-256 的强 `If-Match`，不是配置 revision；正文披露与写许可是两个独立开关，content 缺失时不得回写空字符串或脱敏响应。具体校验、冲突、幂等、耐久性与 reload 失败恢复见 [M6 API 契约](./api.md#配置来源校验与操作m6)。源写入已交付并不开放 M3b 组 selection/PATCH/override，后者仍等待共同控制与持久化语义。
+
 
 ## `clash_api`
 

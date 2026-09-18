@@ -156,7 +156,7 @@ async fn rewritten_sources_keep_distinct_original_reply_addresses() {
             remote,
             None,
             Arc::new(pool.create_reply_socket(original).unwrap()),
-            stats.outbound_tracker("core-source-vless"),
+            stats.outbound_tracker("core-source-vless", crate::stats::OutboundKind::Node),
             node.id,
             honk_outbound::alive::IpVersion::V4,
             None,

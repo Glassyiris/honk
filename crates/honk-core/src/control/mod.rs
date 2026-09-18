@@ -88,7 +88,7 @@ use tracing::{debug, error, info, trace, warn};
 
 mod commands;
 
-pub(crate) use commands::ControlCommand;
+pub(crate) use commands::{ControlCommand, ReloadOutcome, ReloadReply};
 use connection::*;
 use probers::*;
 use reload::*;
@@ -379,7 +379,7 @@ impl ControlPlane {
 }
 
 impl ControlPlane {
-    fn compile_routing_plan(
+    pub(crate) fn compile_routing_plan(
         config: &Config,
         router: &Router,
     ) -> anyhow::Result<routing_matcher::RoutingPushPlan> {

@@ -574,6 +574,11 @@ pub(super) fn parse_experimental_section(
                     "allowed_hosts",
                     "ui",
                     "record_flows",
+                    "record_traffic",
+                    "record_memory",
+                    "config_write",
+                    "config_content",
+                    "writable_includes",
                 ][..],
                 _ => {
                     return Err(scalar_error(
@@ -729,6 +734,26 @@ pub(super) fn parse_experimental_section(
                             &mut config.native_api.record_flows,
                         ),
                         (
+                            "record_traffic",
+                            "experimental.native_api.record_traffic",
+                            &mut config.native_api.record_traffic,
+                        ),
+                        (
+                            "record_memory",
+                            "experimental.native_api.record_memory",
+                            &mut config.native_api.record_memory,
+                        ),
+                        (
+                            "config_write",
+                            "experimental.native_api.config_write",
+                            &mut config.native_api.config_write,
+                        ),
+                        (
+                            "config_content",
+                            "experimental.native_api.config_content",
+                            &mut config.native_api.config_content,
+                        ),
+                        (
                             "allow_anonymous_loopback",
                             "experimental.native_api.allow_anonymous_loopback",
                             &mut config.native_api.allow_anonymous_loopback,
@@ -752,6 +777,24 @@ pub(super) fn parse_experimental_section(
                     ] {
                         if let Some(text) = values.get(key) {
                             *target = text.unquote().raw().to_owned();
+                        }
+                    }
+                    if let Some(text) = values.get("writable_includes") {
+                        config.native_api.writable_includes =
+                            list_value(*text, false, false, false, diagnostics);
+                        if config
+                            .native_api
+                            .writable_includes
+                            .iter()
+                            .any(String::is_empty)
+                        {
+                            return Err(scalar_error(
+                                *text,
+                                "invalid-config-value",
+                                "experimental.native_api.writable_includes",
+                                "include allowlist entries must not be empty",
+                            )
+                            .into());
                         }
                     }
                     for (key, setting, target) in [

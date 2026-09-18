@@ -64,7 +64,7 @@ Shared configuration schema/parsers. Pure-Rust deps: serde, regex, url, base64, 
 - `src/share_link.rs` is the sole `Node::from_share_link` parser. `src/share_link/options.rs` maps URI packet encoding and independent mux controls into the canonical protocol model, then normalization/validation precedes identity derivation. It does not retain a second VLESS mode model.
 - `src/node/wire.rs` is the sole flat serde adapter. It rejects the removed VLESS legacy field by raw presence, including `null`; the same field on non-VLESS input remains only a compatibility artifact. `VlessConfig.network`, `udp_encoding`, and `multiplex` determine identity, so a canonical cutover can change a VLESS `Node.id` without changing VMess behavior or identity.
 - Canonical VLESS behavior is summarized in [Outbound design](./outbound.md#vless-wire-contracts); field-level syntax and URI values belong in the [node reference](../reference/nodes.md).
-- `src/experimental.rs` — `ExperimentalConfig` owns `clash_api`, `native_api`, and `cache_file`. Native settings are strict, independent and restart-required; the default-off `native-api` feature exposes only user-visible observations. The deprecated `udp_nfqueue` block remains migration-only and copies `enabled` to `GlobalConfig::nfqueue_enable` with a warning.
+- `src/experimental.rs` — `ExperimentalConfig` owns `clash_api`, `native_api`, and `cache_file`. Native settings are strict, independent and restart-required; the default-off `native-api` feature provides userspace observations, bounded traffic/memory histories and opt-in administration of captured `.dae` sources with real reload operations. `.dae` remains authoritative; M3b group controls and full kernel transparency remain unavailable. The deprecated `udp_nfqueue` block remains migration-only and copies `enabled` to `GlobalConfig::nfqueue_enable` with a warning.
 - `src/subscription.rs`, `src/types.rs` (`NodeProtocol` 11 variants (Direct/Block reserved for the built-ins), `DialMode` ip/domain/domain+/domain++, `SubscriptionType`, `DnsProtocol`, plus the shared `default_true`/`parse_duration_secs` helpers), `src/error.rs` (`ConfigError`).
 
 ## High-level data path
@@ -125,7 +125,7 @@ flowchart TB
 | --- | --- | --- |
 | `ebpf` | no | Pulls in `aya`, `aya-obj`, `aya-log`, and optional `honk-nfqueue`; `build.rs` embeds the static `honk-ebpf` object, and userspace compiles policy extensions at runtime. Requires Linux kernel 6.12+ at runtime. |
 | `clash-api` | yes | Pulls in optional `axum` and `tower-http` for the Clash-compatible REST/WebSocket service. |
-| `native-api` | no | Independent HTTP/1.1 native observation API and local-directory UI, with owned bounded connections, strict bearer/Host/Origin checks, and no dependency on Clash. |
+| `native-api` | no | Independent HTTP/1.1 native observations, opt-in accepted-source administration and local-directory UI, with owned bounded connections, strict bearer/Host/Origin checks, and no dependency on Clash. |
 | `mimalloc` | yes | Pulls in `mimalloc` and `libmimalloc-sys` and installs mimalloc as the `honk-core` binary allocator. On Linux, startup disables transparent huge pages for the process before starting Tokio. |
 | `rprx` | yes | Enables `honk-outbound/rprx`, which registers the VLESS and VMess handlers, including the supported VLESS Encryption and `xtls-rprx-vision` paths. |
 

@@ -67,7 +67,7 @@ fn source_endpoint(
         target,
         None,
         Arc::new(pool.create_reply_socket(target).unwrap()),
-        stats.outbound_tracker("core-source-vless"),
+        stats.outbound_tracker("core-source-vless", crate::stats::OutboundKind::Node),
         node_id,
         honk_outbound::alive::IpVersion::V4,
         reporter,
@@ -175,7 +175,7 @@ async fn queued_source_view_timeout_is_local_congestion() {
         Arc::clone(endpoint_c.source_reply_socket()),
         Arc::clone(&alive),
         Arc::clone(&stats),
-        node.name.clone(),
+        stats.outbound_tracker(&node.name, crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease_c.commit_ready(Arc::clone(&endpoint_c)));
@@ -282,7 +282,7 @@ async fn admitted_source_transport_timeout_still_demotes_health() {
             client_dst: target,
             alive_set: Arc::clone(&alive),
             stats: Arc::clone(&stats),
-            outbound_tracker: stats.outbound_tracker(&node.name),
+            outbound_tracker: stats.outbound_tracker(&node.name, crate::stats::OutboundKind::Node),
             health_family: honk_outbound::alive::IpVersion::V4,
         },
         UdpDriverStart {
@@ -567,7 +567,7 @@ async fn shared_source_failure_finishes_every_flow_before_death_cleanup() {
         Arc::clone(endpoint_a.source_reply_socket()),
         Arc::clone(&alive),
         Arc::clone(&stats),
-        node.name.clone(),
+        stats.outbound_tracker(&node.name, crate::stats::OutboundKind::Node),
     );
     let mut driver_b = pool.spawn_driver(
         client_addr,
@@ -579,7 +579,7 @@ async fn shared_source_failure_finishes_every_flow_before_death_cleanup() {
         Arc::clone(endpoint_b.source_reply_socket()),
         Arc::clone(&alive),
         Arc::clone(&stats),
-        node.name.clone(),
+        stats.outbound_tracker(&node.name, crate::stats::OutboundKind::Node),
     );
     driver_a.wait_ready().await.unwrap();
     driver_b.wait_ready().await.unwrap();

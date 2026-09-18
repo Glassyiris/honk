@@ -271,6 +271,11 @@ async fn native_tcp_retains_block_and_failed_dial_without_connection() -> anyhow
                 attempts[1]["data"]["attempt_id"]
             );
             (&mut fixture.task).await??;
+            assert_eq!(
+                fixture.handle.stats.snapshot()["outer"].errors,
+                u32::from(selected == "peer")
+            );
+            assert_eq!(fixture.handle.stats.snapshot()["outer"].active_conns, 0);
             fixture.server.shutdown().await;
         }
         Ok::<_, anyhow::Error>(())
@@ -310,6 +315,7 @@ async fn native_tcp_cancelled_attempt_keeps_pre_reload_generation_and_name() -> 
         );
         fixture.task.abort();
         assert!((&mut fixture.task).await.unwrap_err().is_cancelled());
+        assert_eq!(fixture.handle.stats.snapshot()["outer"].active_conns, 0);
         let cancelled = fixture.flow("failed").await?;
         let attempts = steps(&cancelled, "outbound");
         assert_eq!(attempts.len(), 2);
