@@ -99,7 +99,7 @@ Sampling resolves explicit availability/response gaps within the shared budget, 
 4. Filter-derived membership is rebuilt after every subscription refresh. Stable node UUIDs therefore do not retain stale membership after their subscription provenance changes.
 5. A group with neither node filters nor nested groups receives all current nodes. Explicit `group()`, an empty filter, an empty nested group, or a filter emptied by subscription refresh selects nothing. Empty contributions remain explicit through JSON/YAML/TOML round-trips and refresh; valid sibling filters still contribute by OR, and `final` remains independent.
 
-A filter honk cannot parse is ignored and reported by its ordinal among the group's node filters, excluding only nonempty standalone `group(...)` lines; mixed lines are counted. `group()` emits `empty-subgroup`. Remove the filter for all nodes; explicit `group()` now selects none.
+A filter honk cannot parse is ignored and reported by its ordinal among the group's node filters, excluding only nonempty standalone `group(...)` lines; mixed lines are counted. `group()` emits `empty-subgroup`. Remove the filter for all nodes; explicit `group()` now selects none. The injected `direct` and `block` are outbounds, not pool members: an unfiltered group, `keyword:`, `regex:` and `subtag(...)` never select them, and only a filter that spells the name exactly (`filter: name(direct)`) admits one.
 
 ## Nested groups
 
