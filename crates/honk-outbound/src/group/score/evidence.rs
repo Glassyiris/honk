@@ -1,26 +1,110 @@
 use super::ranking::explore_backoff;
 use super::{
-    AggregateKey, FlowSample, IpVersion, MIN_THROUGHPUT_BYTES, MIN_THROUGHPUT_DURATION,
-    RELIABILITY_CONFIDENCE_Z, SCORE_EVIDENCE_HALF_LIFE, ScoreAttribution, ScoreOutcome,
-    ScoreSelectionContext, StateInner, Stats, WeightedMean,
+    AggregateKey, ExactKey, FlowSample, MAX_THROUGHPUT_DURATION, MIN_THROUGHPUT_BYTES,
+    MIN_THROUGHPUT_DURATION, PERFORMANCE_MAX_AGE, PERFORMANCE_VALIDATION_SAMPLES,
+    RELIABILITY_CONFIDENCE_Z, SCORE_EVIDENCE_HALF_LIFE, ScoreAttribution, ScoreAuthority,
+    ScoreOutcome, ScorePolicyState, ScoreSelectionContext, ScoreSource, StartedCells, Stats,
+    WeightedMean,
 };
 use lru::LruCache;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-impl WeightedMean {
-    fn decay(&mut self, factor: f64) {
-        self.sum *= factor;
-        self.weight *= factor;
-    }
+#[derive(Debug, Clone, Default)]
+pub(super) struct Performance {
+    pub setup: WeightedMean,
+    pub response: WeightedMean,
+    pub upload: WeightedMean,
+    pub download: WeightedMean,
+}
 
-    pub(super) fn record(&mut self, sample: f64) {
+#[derive(Debug, Clone, Default)]
+pub(super) struct ProbeMetric {
+    pub latency: WeightedMean,
+    pub scope: u64,
+}
+
+pub(super) fn probe_slot(context: &ScoreSelectionContext) -> usize {
+    context.probe_domain as usize * 2 + context.health_family as usize
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct MetricSnapshot {
+    pub value: Option<f64>,
+    pub confidence: f64,
+    pub observed_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct PerformanceSnapshot {
+    pub setup: MetricSnapshot,
+    pub response: MetricSnapshot,
+    pub upload: MetricSnapshot,
+    pub download: MetricSnapshot,
+}
+
+impl Performance {
+    pub(super) fn snapshot(&self, now: Instant) -> PerformanceSnapshot {
+        PerformanceSnapshot {
+            setup: self.setup.snapshot(now),
+            response: self.response.snapshot(now),
+            upload: self.upload.snapshot(now),
+            download: self.download.snapshot(now),
+        }
+    }
+}
+
+impl WeightedMean {
+    pub(super) fn record(&mut self, sample: f64, now: Instant) {
+        if self
+            .observed_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= PERFORMANCE_MAX_AGE)
+        {
+            self.sum = 0.0;
+            self.weight = 0.0;
+        }
+        // Bound inertia as well as freshness: ten thousand old samples must
+        // not outvote the next few observations of a degraded path.
+        if self.weight >= PERFORMANCE_VALIDATION_SAMPLES {
+            self.sum *= (PERFORMANCE_VALIDATION_SAMPLES - 1.0) / self.weight;
+            self.weight = PERFORMANCE_VALIDATION_SAMPLES - 1.0;
+        }
         self.sum += sample;
         self.weight += 1.0;
+        self.observed_at = Some(now);
     }
 
-    pub(super) fn mean(&self) -> Option<f64> {
-        (self.weight > 0.0).then(|| self.sum / self.weight)
+    pub(super) fn snapshot(&self, now: Instant) -> MetricSnapshot {
+        let Some(at) = self.observed_at else {
+            return MetricSnapshot::default();
+        };
+        let age = now.saturating_duration_since(at);
+        if age >= PERFORMANCE_MAX_AGE || self.weight <= 0.0 {
+            return MetricSnapshot::default();
+        }
+        let freshness =
+            (2.0 * (1.0 - age.as_secs_f64() / PERFORMANCE_MAX_AGE.as_secs_f64())).min(1.0);
+        MetricSnapshot {
+            value: Some(self.sum / self.weight),
+            confidence: (self.weight / PERFORMANCE_VALIDATION_SAMPLES).min(1.0) * freshness,
+            observed_at: Some(at),
+        }
     }
+}
+
+pub(super) enum Observation {
+    Setup(Duration),
+    Response(Duration),
+    Probe {
+        latency: Duration,
+        scope: u64,
+        slot: usize,
+    },
+    Transfer {
+        tx: u64,
+        rx: u64,
+        elapsed: Duration,
+    },
 }
 
 impl Stats {
@@ -33,8 +117,6 @@ impl Stats {
     }
 
     pub(super) fn reliability_bounds(&self, factor: f64) -> (f64, f64) {
-        // Setup failure is already a useful failure. Counting two additional
-        // failures makes it the strongest negative signal without a knob.
         let successes = self.useful_success * factor;
         let failures = (self.useful_failure + self.setup_failure * 2.0) * factor;
         let a = successes + 1.0;
@@ -58,16 +140,75 @@ impl Stats {
         self.setup_failure *= factor;
         self.useful_success *= factor;
         self.useful_failure *= factor;
-        self.setup_ms.decay(factor);
-        self.first_response_ms.decay(factor);
-        self.throughput_bytes *= factor;
-        self.throughput_seconds *= factor;
-        self.throughput_windows *= factor;
     }
 
-    fn record_start(&mut self, now: Instant) {
-        self.decay_to(now);
-        self.attempts += 1.0;
+    fn record_start(&mut self, now: Instant, source: ScoreSource) {
+        if source == ScoreSource::Traffic {
+            self.decay_to(now);
+            self.attempts += 1.0;
+            self.last_attempt = Some(now);
+        }
+    }
+
+    fn observe(&mut self, observation: &Observation, source: ScoreSource, now: Instant) {
+        match (source, observation) {
+            (
+                ScoreSource::Traffic,
+                Observation::Setup(latency) | Observation::Response(latency),
+            ) => {
+                let metric = if matches!(observation, Observation::Setup(_)) {
+                    &mut self.performance.setup
+                } else {
+                    &mut self.performance.response
+                };
+                let sample = latency.as_secs_f64() * 1000.0;
+                let previous = metric.snapshot(now);
+                if previous.confidence == 1.0
+                    && previous
+                        .value
+                        .is_some_and(|old| sample > old.max(1.0) * 1.5)
+                {
+                    self.degraded_at = Some(now);
+                }
+                metric.record(sample, now);
+            }
+            (ScoreSource::Warmup, Observation::Setup(latency)) => {
+                self.warm_setup_ms
+                    .record(latency.as_secs_f64() * 1000.0, now);
+            }
+            (
+                ScoreSource::HealthProbe,
+                Observation::Probe {
+                    latency,
+                    scope,
+                    slot,
+                },
+            ) => {
+                let probe = &mut self.probes[*slot];
+                if probe.scope != *scope {
+                    probe.latency = WeightedMean::default();
+                    probe.scope = *scope;
+                }
+                probe.latency.record(latency.as_secs_f64() * 1000.0, now);
+            }
+            (ScoreSource::Traffic, Observation::Transfer { tx, rx, elapsed })
+                if *elapsed >= MIN_THROUGHPUT_DURATION && *elapsed <= MAX_THROUGHPUT_DURATION =>
+            {
+                // Directional rates are not summed: a request body and its
+                // response are different workloads, not twice the capacity.
+                if *tx >= MIN_THROUGHPUT_BYTES {
+                    self.performance
+                        .upload
+                        .record(*tx as f64 / elapsed.as_secs_f64(), now);
+                }
+                if *rx >= MIN_THROUGHPUT_BYTES {
+                    self.performance
+                        .download
+                        .record(*rx as f64 / elapsed.as_secs_f64(), now);
+                }
+            }
+            _ => {}
+        }
     }
 
     pub(super) fn record_finish(
@@ -76,6 +217,9 @@ impl Stats {
         sample: &FlowSample,
         count_usefulness: bool,
     ) {
+        if sample.source != ScoreSource::Traffic {
+            return;
+        }
         self.decay_to(now);
         if matches!(
             sample.outcome,
@@ -84,38 +228,24 @@ impl Stats {
             self.attempts = (self.attempts - evidence_decay(sample.elapsed)).max(0.0);
             return;
         }
-        if !sample.streak_neutral {
-            if sample.outcome == ScoreOutcome::Success {
-                // Liveness is proven, but the streak steps down one at a
-                // time: a flapping leaf earns the fast cadence back.
-                self.fail_streak = self.fail_streak.saturating_sub(1);
-                self.explore_not_before = None;
-            } else {
-                self.fail_streak = self.fail_streak.saturating_add(1);
-                self.explore_not_before = Some(now + explore_backoff(self.fail_streak));
-            }
+        if sample.outcome == ScoreOutcome::Success {
+            self.fail_streak = self.fail_streak.saturating_sub(1);
+            self.explore_not_before = None;
+        } else {
+            self.fail_streak = self.fail_streak.saturating_add(1);
+            self.explore_not_before = Some(now + explore_backoff(self.fail_streak));
+            self.useful_business = WeightedMean::default();
+            self.failed_at = Some(now);
         }
-        if let Some(setup) = sample.setup {
+        if sample.setup.is_some() {
             self.setup_success += 1.0;
-            self.setup_ms.record(setup.as_secs_f64() * 1000.0);
         } else {
             self.setup_failure += 1.0;
         }
-        if let Some(first_response) = sample.first_response {
-            self.first_response_ms
-                .record(first_response.as_secs_f64() * 1000.0);
-        }
         if count_usefulness {
-            let useful = sample.outcome == ScoreOutcome::Success && sample.tx > 0 && sample.rx > 0;
-            if useful {
+            if sample.outcome == ScoreOutcome::Success && sample.tx > 0 && sample.rx > 0 {
                 self.useful_success += 1.0;
-                if sample.elapsed >= MIN_THROUGHPUT_DURATION
-                    && sample.tx.max(sample.rx) >= MIN_THROUGHPUT_BYTES
-                {
-                    self.throughput_bytes += sample.tx.max(sample.rx) as f64;
-                    self.throughput_seconds += sample.elapsed.as_secs_f64();
-                    self.throughput_windows += 1.0;
-                }
+                self.useful_business.record(1.0, now);
             } else {
                 self.useful_failure += 1.0;
             }
@@ -127,26 +257,23 @@ pub(super) fn evidence_decay(elapsed: Duration) -> f64 {
     (-elapsed.as_secs_f64() / SCORE_EVIDENCE_HALF_LIFE.as_secs_f64()).exp2()
 }
 
-pub(super) fn record_cell_start<K>(
+fn record_cell_start<K: std::hash::Hash + Eq>(
     cache: &mut LruCache<K, Stats>,
     key: K,
     now: Instant,
     tick: u64,
     evictions: &mut u64,
-) -> u64
-where
-    K: std::hash::Hash + Eq,
-{
+    source: ScoreSource,
+) -> u64 {
     if let Some(stats) = cache.get_mut(&key) {
-        stats.record_start(now);
+        stats.record_start(now, source);
         return stats.incarnation;
     }
     let mut stats = Stats {
         incarnation: tick,
         ..Default::default()
     };
-    stats.record_start(now);
-    // A full cache means this put evicts the LRU tail.
+    stats.record_start(now, source);
     if cache.len() == cache.cap().get() {
         *evictions = evictions.saturating_add(1);
     }
@@ -154,89 +281,222 @@ where
     tick
 }
 
-pub(super) fn record_cell_finish<K>(
+fn update_cell<K: std::hash::Hash + Eq>(
     cache: &mut LruCache<K, Stats>,
     key: &K,
     incarnation: Option<u64>,
-    now: Instant,
-    sample: &FlowSample,
-    count_usefulness: bool,
-) where
-    K: std::hash::Hash + Eq,
-{
-    let Some(incarnation) = incarnation else {
-        return;
-    };
-    let remove_empty = match cache.get_mut(key) {
-        Some(stats) if stats.incarnation == incarnation => {
-            stats.record_finish(now, sample, count_usefulness);
-            stats.attempts == 0.0 && stats.completed() == 0.0
-        }
-        _ => false,
-    };
-    if remove_empty {
-        cache.pop(key);
-    }
-}
-
-fn aggregate_families(context: &ScoreSelectionContext) -> [Option<IpVersion>; 2] {
-    [None, context.target_family]
-}
-
-pub(super) fn record_aggregate_start(
-    inner: &mut StateInner,
-    attribution: &ScoreAttribution,
-    context: &ScoreSelectionContext,
-    now: Instant,
-    tick: u64,
-) -> [Option<u64>; 2] {
-    let mut cells = [None; 2];
-    for (index, family) in aggregate_families(context).into_iter().enumerate() {
-        if index == 1 && family.is_none() {
-            break;
-        }
-        let key = AggregateKey {
-            group: attribution.group.clone(),
-            network: context.network,
-            family,
-            node_id: attribution.node_id,
-        };
-        cells[index] = Some(record_cell_start(
-            &mut inner.aggregate,
-            key,
-            now,
-            tick,
-            &mut inner.aggregate_evictions,
-        ));
-    }
-    cells
-}
-
-pub(super) fn record_aggregate_finish(
-    inner: &mut StateInner,
-    attribution: &ScoreAttribution,
-    context: &ScoreSelectionContext,
-    cells: [Option<u64>; 2],
-    now: Instant,
-    sample: &FlowSample,
+    update: &mut impl FnMut(&mut Stats, bool),
+    exact: bool,
 ) {
-    for (index, family) in aggregate_families(context).into_iter().enumerate() {
-        if index == 1 && family.is_none() {
-            break;
+    if let Some(stats) = cache.get_mut(key)
+        && Some(stats.incarnation) == incarnation
+    {
+        update(stats, exact);
+    }
+}
+
+impl ScorePolicyState {
+    #[cfg(test)]
+    pub(super) fn start(
+        &self,
+        context: &ScoreSelectionContext,
+        attributions: &[ScoreAttribution],
+    ) -> Vec<StartedCells> {
+        self.start_at(context, attributions, Instant::now())
+    }
+
+    #[cfg(test)]
+    pub(super) fn start_at(
+        &self,
+        context: &ScoreSelectionContext,
+        attributions: &[ScoreAttribution],
+        now: Instant,
+    ) -> Vec<StartedCells> {
+        let authority = self
+            .inner
+            .lock()
+            .active_authority
+            .clone()
+            .unwrap_or_else(|| Arc::new(ScoreAuthority));
+        self.start_at_with_authority(&authority, context, attributions, now, ScoreSource::Traffic)
+    }
+
+    pub(super) fn start_at_with_authority(
+        &self,
+        authority: &Arc<ScoreAuthority>,
+        context: &ScoreSelectionContext,
+        attributions: &[ScoreAttribution],
+        now: Instant,
+        source: ScoreSource,
+    ) -> Vec<StartedCells> {
+        let mut inner = self.inner.lock();
+        if !inner
+            .active_authority
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, authority))
+        {
+            return vec![StartedCells::default(); attributions.len()];
         }
-        let key = AggregateKey {
-            group: attribution.group.clone(),
-            network: context.network,
-            family,
-            node_id: attribution.node_id,
-        };
-        record_cell_finish(
-            &mut inner.aggregate,
-            &key,
-            cells[index],
-            now,
-            sample,
-            sample.count_usefulness && context.target.is_some(),
+        inner.tick = inner.tick.saturating_add(1);
+        let tick = inner.tick;
+        let mut cells = Vec::with_capacity(attributions.len());
+        for attribution in attributions {
+            let mut started = StartedCells::default();
+            if inner
+                .valid
+                .contains(&(attribution.group.clone(), attribution.node_id))
+            {
+                for (index, family) in [None, context.target_family].into_iter().enumerate() {
+                    if index == 1 && (family.is_none() || source == ScoreSource::HealthProbe) {
+                        break;
+                    }
+                    let key = AggregateKey {
+                        group: attribution.group.clone(),
+                        network: context.network,
+                        family,
+                        node_id: attribution.node_id,
+                    };
+                    let super::StateInner {
+                        aggregate,
+                        aggregate_evictions,
+                        ..
+                    } = &mut *inner;
+                    started.aggregate[index] = Some(record_cell_start(
+                        aggregate,
+                        key,
+                        now,
+                        tick,
+                        aggregate_evictions,
+                        source,
+                    ));
+                }
+                if source != ScoreSource::HealthProbe
+                    && let (Some(family), Some(target)) =
+                        (context.target_family, context.target.as_ref())
+                {
+                    let key = ExactKey {
+                        group: attribution.group.clone(),
+                        network: context.network,
+                        family,
+                        target: target.clone(),
+                        node_id: attribution.node_id,
+                    };
+                    let super::StateInner {
+                        exact,
+                        exact_evictions,
+                        ..
+                    } = &mut *inner;
+                    started.exact = Some(record_cell_start(
+                        exact,
+                        key,
+                        now,
+                        tick,
+                        exact_evictions,
+                        source,
+                    ));
+                }
+            }
+            cells.push(started);
+        }
+        cells
+    }
+
+    fn update_started(
+        inner: &mut super::StateInner,
+        context: &ScoreSelectionContext,
+        attributions: &[ScoreAttribution],
+        cells: &[StartedCells],
+        mut update: impl FnMut(&mut Stats, bool),
+    ) {
+        for (attribution, started) in attributions.iter().zip(cells) {
+            if !inner
+                .valid
+                .contains(&(attribution.group.clone(), attribution.node_id))
+            {
+                continue;
+            }
+            for (index, family) in [None, context.target_family].into_iter().enumerate() {
+                if started.aggregate[index].is_none() {
+                    continue;
+                }
+                if index == 1 && family.is_none() {
+                    break;
+                }
+                let key = AggregateKey {
+                    group: attribution.group.clone(),
+                    network: context.network,
+                    family,
+                    node_id: attribution.node_id,
+                };
+                update_cell(
+                    &mut inner.aggregate,
+                    &key,
+                    started.aggregate[index],
+                    &mut update,
+                    false,
+                );
+            }
+            if started.exact.is_some()
+                && let (Some(family), Some(target)) =
+                    (context.target_family, context.target.as_ref())
+            {
+                let key = ExactKey {
+                    group: attribution.group.clone(),
+                    network: context.network,
+                    family,
+                    target: target.clone(),
+                    node_id: attribution.node_id,
+                };
+                update_cell(&mut inner.exact, &key, started.exact, &mut update, true);
+            }
+        }
+    }
+
+    pub(super) fn observe(
+        inner: &mut super::StateInner,
+        context: &ScoreSelectionContext,
+        attributions: &[ScoreAttribution],
+        cells: &[StartedCells],
+        source: ScoreSource,
+        observation: Observation,
+        now: Instant,
+    ) {
+        Self::update_started(inner, context, attributions, cells, |stats, _| {
+            stats.observe(&observation, source, now)
+        });
+    }
+
+    #[cfg(test)]
+    pub(super) fn finish(
+        &self,
+        context: &ScoreSelectionContext,
+        attributions: &[ScoreAttribution],
+        cells: &[StartedCells],
+        sample: &FlowSample,
+    ) {
+        self.finish_at(context, attributions, cells, sample, Instant::now());
+    }
+
+    pub(super) fn finish_at(
+        &self,
+        context: &ScoreSelectionContext,
+        attributions: &[ScoreAttribution],
+        cells: &[StartedCells],
+        sample: &FlowSample,
+        now: Instant,
+    ) {
+        Self::update_started(
+            &mut self.inner.lock(),
+            context,
+            attributions,
+            cells,
+            |stats, exact| {
+                stats.record_finish(
+                    now,
+                    sample,
+                    sample.count_usefulness && (exact || context.target.is_some()),
+                );
+            },
         );
     }
 }

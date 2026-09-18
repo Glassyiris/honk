@@ -1,19 +1,19 @@
 use super::evidence::evidence_decay;
 use super::{
-    AggregateKey, ExactKey, HoldDecision, MIN_TRAINED_EVIDENCE, PerformanceBaseline,
-    RELIABILITY_CLOSE, RankedSelection, SCORE_EXPLORATION_MAX_PERIOD, SCORE_EXPLORATION_MIN_PERIOD,
-    SCORE_EXPLORE_BACKOFF_BASE, SCORE_EXPLORE_BACKOFF_MAX, SCORE_FAIL_STREAK_EXCLUDE,
-    SCORE_FAILURE_FORGIVENESS_THRESHOLD, SCORE_SWITCH_FULL_EVIDENCE, SCORE_SWITCH_MARGIN,
-    ScoreAuthority, ScorePolicyState, ScoreSelectionContext, ScoreSnapshot, SelectionCadenceKey,
-    SelectionHistoryKey, SelectionReason, SelectionReasonKey, StateInner, Stats,
+    AggregateKey, ExactKey, HoldDecision, MIN_TRAINED_EVIDENCE, MetricSnapshot,
+    PERFORMANCE_SWITCH_MARGIN, PERFORMANCE_VALIDATION_SAMPLES, PerformanceBaseline,
+    PerformanceSnapshot, RELIABILITY_CLOSE, REVALIDATION_INTERVAL, RankedSelection,
+    SCORE_EXPLORATION_MAX_PERIOD, SCORE_EXPLORATION_MIN_PERIOD, SCORE_EXPLORE_BACKOFF_BASE,
+    SCORE_EXPLORE_BACKOFF_MAX, SCORE_FAIL_STREAK_EXCLUDE, SCORE_FAILURE_FORGIVENESS_THRESHOLD,
+    SCORE_SWITCH_FULL_EVIDENCE, ScoreAuthority, ScorePolicyState, ScoreSelectionContext,
+    ScoreSnapshot, SelectionCadence, SelectionCadenceKey, SelectionHistoryKey, SelectionReason,
+    SelectionReasonKey, StateInner, Stats,
 };
 use honk_config::node::Node;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-/// Exploration retry delay for a consecutive-failure streak, tracked outside
-/// the decaying evidence so a dead leaf is not rediscovered as cold.
 pub(super) fn explore_backoff(streak: u32) -> Duration {
     SCORE_EXPLORE_BACKOFF_BASE
         .saturating_mul(2u32.saturating_pow(streak.saturating_sub(1).min(7)))
@@ -34,22 +34,6 @@ pub(super) fn exploration_period(candidate_count: usize) -> u64 {
         .clamp(SCORE_EXPLORATION_MIN_PERIOD, SCORE_EXPLORATION_MAX_PERIOD)
 }
 
-fn exploration_attempts(score: &ScoreSnapshot) -> f64 {
-    if score.targeted {
-        score.target_attempts
-    } else {
-        score.attempts
-    }
-}
-
-fn exploration_completed(score: &ScoreSnapshot) -> f64 {
-    if score.targeted {
-        score.target_completed
-    } else {
-        score.completed
-    }
-}
-
 impl ScorePolicyState {
     pub(in crate::group) fn rank(
         &self,
@@ -58,7 +42,7 @@ impl ScorePolicyState {
         context: &ScoreSelectionContext,
         nodes: &[&Node],
     ) -> usize {
-        self.rank_at_with_authority(authority, group, context, nodes, Instant::now())
+        self.rank_inner(Some(authority), group, context, nodes, Instant::now(), true)
     }
 
     pub(in crate::group) fn peek_rank(
@@ -84,18 +68,7 @@ impl ScorePolicyState {
             .active_authority
             .clone()
             .unwrap_or_else(|| Arc::new(ScoreAuthority));
-        self.rank_at_with_authority(&authority, group, context, nodes, now)
-    }
-
-    fn rank_at_with_authority(
-        &self,
-        authority: &Arc<ScoreAuthority>,
-        group: &str,
-        context: &ScoreSelectionContext,
-        nodes: &[&Node],
-        now: Instant,
-    ) -> usize {
-        self.rank_inner(Some(authority), group, context, nodes, now, true)
+        self.rank_inner(Some(&authority), group, context, nodes, now, true)
     }
 
     fn rank_inner(
@@ -107,7 +80,7 @@ impl ScorePolicyState {
         now: Instant,
         apply: bool,
     ) -> usize {
-        if nodes.len() < 2 {
+        if nodes.is_empty() {
             return 0;
         }
         let mut inner = self.inner.lock();
@@ -125,95 +98,159 @@ impl ScorePolicyState {
             .collect();
         let performance = performance_baseline(&snapshots);
         let cadence_key = SelectionCadenceKey::new(group, context);
-        let selection_count = if authorized {
-            let count = inner
-                .selection_counts
-                .entry(cadence_key.clone())
-                .or_default();
-            *count = count.saturating_add(1);
-            *count
+        let history_key = SelectionHistoryKey::new(group, context);
+        let incumbent = inner
+            .selection_history
+            .peek(&history_key)
+            .filter(|history| history.selections > 0)
+            .and_then(|history| nodes.iter().position(|node| node.id == history.current));
+        let (selection_count, due) = if authorized {
+            let cadence =
+                inner
+                    .selection_counts
+                    .entry(cadence_key.clone())
+                    .or_insert(SelectionCadence {
+                        count: 0,
+                        revalidated_count: 0,
+                        revalidated_at: now,
+                        validation_node: None,
+                        validation_attempts: 0,
+                    });
+            cadence.count = cadence.count.saturating_add(1);
+            let elapsed_count = cadence.count.saturating_sub(cadence.revalidated_count);
+            let degraded = incumbent
+                .and_then(|index| snapshots[index].degraded_at)
+                .is_some_and(|at| at > cadence.revalidated_at);
+            let due = elapsed_count >= exploration_period(nodes.len())
+                || now.saturating_duration_since(cadence.revalidated_at) >= REVALIDATION_INTERVAL
+                || (degraded && elapsed_count >= SCORE_EXPLORATION_MIN_PERIOD);
+            (cadence.count, due)
         } else {
-            let count = inner
-                .selection_counts
-                .get(&cadence_key)
-                .copied()
-                .unwrap_or(0);
-            if apply {
-                count.saturating_add(1)
-            } else {
-                count
-            }
+            (
+                inner
+                    .selection_counts
+                    .get(&cadence_key)
+                    .map_or(0, |cadence| cadence.count),
+                false,
+            )
         };
-        let best = best_index(&snapshots, nodes, selection_count, apply, performance);
-        let incumbent = snapshots
-            .iter()
-            .enumerate()
-            .filter(|(_, score)| score.selected_at != 0)
-            .max_by(|(left_index, left), (right_index, right)| {
-                left.selected_at
-                    .cmp(&right.selected_at)
-                    .then_with(|| left_index.cmp(right_index))
-            })
-            .map(|(index, _)| index);
-        let selection = if best.reason.is_exploration() {
-            best
-        } else {
-            match incumbent.filter(|&index| index != best.index) {
-                Some(index) => {
-                    match hold_decision(&snapshots[index], &snapshots[best.index], performance) {
-                        HoldDecision::Held => RankedSelection {
-                            index,
-                            reason: SelectionReason::IncumbentHeld,
-                        },
-                        HoldDecision::FreshFailureBypass => RankedSelection {
-                            index: best.index,
-                            reason: SelectionReason::FreshFailureBypass,
-                        },
-                        HoldDecision::UseBest => best,
-                    }
-                }
-                None => best,
+        let ordinary = ordinary_selection(&snapshots, nodes, incumbent, performance);
+        if !authorized {
+            return ordinary.index;
+        }
+        let evaluation = super::verification::evaluate(
+            &snapshots,
+            nodes,
+            ordinary.index,
+            context,
+            inner.selection_counts.get(&cadence_key),
+            performance,
+            now,
+        );
+        let mut selection = ordinary;
+        if selection_count <= exploration_target(nodes.len()) as u64 {
+            let startup = best_index(&snapshots, nodes, selection_count, true, performance);
+            if startup.reason.is_exploration() {
+                selection = startup;
             }
-        };
-        if authorized {
-            let any_healthy = snapshots
-                .iter()
-                .any(|score| score.fail_streak < SCORE_FAIL_STREAK_EXCLUDE);
+        }
+        if due
+            && !selection.reason.is_exploration()
+            && let Some(index) = evaluation.validation_index
+            && Some(index) != incumbent.filter(|&previous| previous != ordinary.index)
+        {
+            selection = RankedSelection {
+                index,
+                reason: SelectionReason::PeriodicExplore,
+            };
+        }
+        if selection.reason.is_exploration()
+            && let Some(cadence) = inner.selection_counts.get_mut(&cadence_key)
+        {
+            cadence.revalidated_count = selection_count;
+            cadence.revalidated_at = now;
+            let node_id = nodes[selection.index].id;
+            if cadence.validation_node == Some(node_id) {
+                cadence.validation_attempts = cadence.validation_attempts.saturating_add(1);
+            } else if cadence.validation_node.is_none()
+                || selection.reason != SelectionReason::ColdExplore
+            {
+                cadence.validation_node = Some(node_id);
+                cadence.validation_attempts = 1;
+            }
+        }
+        Self::record_verification(
+            &mut inner,
+            &history_key,
+            nodes[ordinary.index].id,
+            super::verification::usable(&snapshots[selection.index]),
+            selection.reason.is_exploration(),
+            &evaluation,
+            now,
+        );
+        if nodes.len() > 1 {
             let streak_excluded = snapshots
                 .iter()
-                .filter(|score| any_healthy && score.fail_streak >= SCORE_FAIL_STREAK_EXCLUDE)
+                .filter(|score| {
+                    performance.any_healthy && score.fail_streak >= SCORE_FAIL_STREAK_EXCLUDE
+                })
                 .count() as u64;
             let backed_off = snapshots
                 .iter()
                 .filter(|score| score.explore_backed_off)
                 .count() as u64;
-            if streak_excluded > 0 || backed_off > 0 {
-                let counts = inner
-                    .selection_reasons
-                    .entry(SelectionReasonKey::new(group, context.network))
-                    .or_default();
-                counts.fail_streak_excluded =
-                    counts.fail_streak_excluded.saturating_add(streak_excluded);
-                counts.explore_backed_off = counts.explore_backed_off.saturating_add(backed_off);
-            }
+            let counts = inner
+                .selection_reasons
+                .entry(SelectionReasonKey::new(group, context.network))
+                .or_default();
+            counts.fail_streak_excluded =
+                counts.fail_streak_excluded.saturating_add(streak_excluded);
+            counts.explore_backed_off = counts.explore_backed_off.saturating_add(backed_off);
             Self::record_selection_reason(&mut inner, group, context.network, selection);
             Self::record_switch_flap(
                 &mut inner,
-                &SelectionHistoryKey::new(group, context),
+                &history_key,
                 nodes[selection.index].id,
                 selection.reason,
             );
-            inner.tick = inner.tick.saturating_add(1);
-            let selection_tick = inner.tick;
-            mark_selected(
-                &mut inner,
-                group,
-                context,
-                nodes[selection.index].id,
-                selection_tick,
-            );
         }
+        inner.tick = inner.tick.saturating_add(1);
+        let tick = inner.tick;
+        mark_selected(&mut inner, group, context, nodes[selection.index].id, tick);
         selection.index
+    }
+}
+
+pub(super) fn ordinary_selection(
+    snapshots: &[ScoreSnapshot],
+    nodes: &[&Node],
+    incumbent: Option<usize>,
+    performance: PerformanceBaseline,
+) -> RankedSelection {
+    let best = best_index(snapshots, nodes, 0, false, performance);
+    let Some(index) = incumbent.filter(|&index| index != best.index) else {
+        return best;
+    };
+    if !normal_eligible(&snapshots[index], performance) {
+        return if snapshots[index].failures >= SCORE_FAILURE_FORGIVENESS_THRESHOLD {
+            RankedSelection {
+                index: best.index,
+                reason: SelectionReason::FreshFailureBypass,
+            }
+        } else {
+            best
+        };
+    }
+    match hold_decision(&snapshots[index], &snapshots[best.index], performance) {
+        HoldDecision::Held => RankedSelection {
+            index,
+            reason: SelectionReason::IncumbentHeld,
+        },
+        HoldDecision::FreshFailureBypass => RankedSelection {
+            index: best.index,
+            reason: SelectionReason::FreshFailureBypass,
+        },
+        HoldDecision::UseBest => best,
     }
 }
 
@@ -224,82 +261,34 @@ pub(super) fn best_index(
     explore: bool,
     performance: PerformanceBaseline,
 ) -> RankedSelection {
-    if explore {
-        let candidate_count = snapshots.len();
-        let target = exploration_target(candidate_count);
-        let explored = snapshots
-            .iter()
-            .filter(|score| exploration_attempts(score) >= MIN_TRAINED_EVIDENCE)
-            .count();
-        let cold = snapshots
+    // The startup allowance is coarse-scope and finite. Cancellation, a new
+    // target or an evicted exact cell cannot mint another startup allowance.
+    if explore
+        && snapshots.len() > 1
+        && selection_count <= exploration_target(snapshots.len()) as u64
+        && let Some((index, _)) = snapshots
             .iter()
             .enumerate()
             .filter(|(_, score)| {
-                exploration_completed(score) < MIN_TRAINED_EVIDENCE && !score.explore_backed_off
+                score.completed < MIN_TRAINED_EVIDENCE && !score.explore_backed_off
             })
             .min_by(|(left_index, left), (right_index, right)| {
-                exploration_attempts(left)
-                    .total_cmp(&exploration_attempts(right))
+                left.attempts
+                    .total_cmp(&right.attempts)
+                    .then_with(|| super::verification::untried_hint(left, right))
+                    .then_with(|| left.selected_at.cmp(&right.selected_at))
                     .then_with(|| left_index.cmp(right_index))
-                    .then_with(|| nodes[*left_index].id.cmp(&nodes[*right_index].id))
             })
-            .map(|(index, _)| index);
-        let periodic = candidate_count > target
-            && selection_count != 0
-            && selection_count.is_multiple_of(exploration_period(candidate_count));
-        if let Some(index) = cold
-            && (explored < target || candidate_count <= target)
-        {
-            return RankedSelection {
-                index,
-                reason: SelectionReason::ColdExplore,
-            };
-        }
-        if periodic {
-            let incumbent = snapshots
-                .iter()
-                .enumerate()
-                .filter(|(_, score)| score.selected_at != 0)
-                .max_by_key(|(_, score)| score.selected_at)
-                .map(|(index, _)| index);
-            if let Some((index, _)) = snapshots
-                .iter()
-                .enumerate()
-                .filter(|(index, score)| Some(*index) != incumbent && !score.explore_backed_off)
-                .max_by(|(left_index, left), (right_index, right)| {
-                    left.reliability_upper
-                        .total_cmp(&right.reliability_upper)
-                        .then_with(|| {
-                            exploration_attempts(right).total_cmp(&exploration_attempts(left))
-                        })
-                        .then_with(|| right_index.cmp(left_index))
-                        .then_with(|| nodes[*right_index].id.cmp(&nodes[*left_index].id))
-                })
-            {
-                return RankedSelection {
-                    index,
-                    reason: SelectionReason::PeriodicExplore,
-                };
-            }
-        }
+    {
+        return RankedSelection {
+            index,
+            reason: SelectionReason::ColdExplore,
+        };
     }
-    // Fresh consecutive failures outweigh decayed success history.
-    let any_healthy = snapshots
-        .iter()
-        .any(|score| score.fail_streak < SCORE_FAIL_STREAK_EXCLUDE);
-    let rankable =
-        |score: &&ScoreSnapshot| !any_healthy || score.fail_streak < SCORE_FAIL_STREAK_EXCLUDE;
-    let best_reliability = snapshots
-        .iter()
-        .filter(rankable)
-        .map(|score| score.reliability)
-        .fold(0.0_f64, f64::max);
     let index = snapshots
         .iter()
         .enumerate()
-        .filter(|(_, score)| {
-            rankable(score) && best_reliability - score.reliability <= RELIABILITY_CLOSE
-        })
+        .filter(|(_, score)| normal_eligible(score, performance))
         .max_by(|(left_index, left), (right_index, right)| {
             utility(left, performance)
                 .total_cmp(&utility(right, performance))
@@ -308,22 +297,37 @@ pub(super) fn best_index(
         })
         .map(|(index, _)| index)
         .unwrap_or(0);
-    let reason = if snapshots
+    let alternatives = snapshots
         .iter()
         .enumerate()
-        .filter(|(candidate, _)| *candidate != index)
-        .all(|(_, alternative)| {
-            snapshots[index].reliability - alternative.reliability > RELIABILITY_CLOSE
-        }) {
-        SelectionReason::ReliabilityWinner
+        .any(|(other, score)| other != index && normal_eligible(score, performance));
+    RankedSelection {
+        index,
+        reason: if alternatives {
+            SelectionReason::PerformanceWinner
+        } else {
+            SelectionReason::ReliabilityWinner
+        },
+    }
+}
+
+pub(super) fn normal_eligible(score: &ScoreSnapshot, baseline: PerformanceBaseline) -> bool {
+    if baseline.any_healthy && score.fail_streak >= SCORE_FAIL_STREAK_EXCLUDE {
+        return false;
+    }
+    if baseline.any_qualified {
+        score.useful_completed >= PERFORMANCE_VALIDATION_SAMPLES
+            && score.reliability_upper + RELIABILITY_CLOSE >= baseline.best_reliability
+            && score.observed_reliability + RELIABILITY_CLOSE >= baseline.best_observed_reliability
     } else {
-        SelectionReason::PerformanceWinner
-    };
-    RankedSelection { index, reason }
+        score.reliability + RELIABILITY_CLOSE >= baseline.best_reliability
+    }
 }
 
 pub(super) fn switch_margin(completed: f64) -> f64 {
-    SCORE_SWITCH_MARGIN * (completed / SCORE_SWITCH_FULL_EVIDENCE).clamp(0.0, 1.0)
+    // Ten percent of the available performance range: a 50% rate gain
+    // clears this margin, while small latency jitter does not.
+    0.05 * PERFORMANCE_SWITCH_MARGIN * (completed / SCORE_SWITCH_FULL_EVIDENCE).clamp(0.0, 1.0)
 }
 
 pub(super) fn hold_decision(
@@ -333,10 +337,11 @@ pub(super) fn hold_decision(
 ) -> HoldDecision {
     let trained =
         incumbent.completed >= MIN_TRAINED_EVIDENCE && best.completed >= MIN_TRAINED_EVIDENCE;
-    let margin = switch_margin(incumbent.hysteresis_completed);
-    let within_switch_margin =
-        utility(best, performance) - utility(incumbent, performance) < margin;
-    if !trained || !within_switch_margin {
+    if !normal_eligible(incumbent, performance)
+        || !trained
+        || utility(best, performance) - utility(incumbent, performance)
+            >= switch_margin(incumbent.hysteresis_completed)
+    {
         HoldDecision::UseBest
     } else if incumbent.failures < SCORE_FAILURE_FORGIVENESS_THRESHOLD {
         HoldDecision::Held
@@ -361,7 +366,6 @@ fn mark_selected(
     if let Some(stats) = inner.aggregate.get_mut(&key) {
         stats.selected_at = tick;
     } else {
-        // A full cache means this put evicts the LRU tail.
         if inner.aggregate.len() == inner.aggregate.cap().get() {
             inner.aggregate_evictions = inner.aggregate_evictions.saturating_add(1);
         }
@@ -395,152 +399,99 @@ pub(super) fn score_snapshot(
     node_id: Uuid,
     now: Instant,
 ) -> ScoreSnapshot {
-    let family_score = context.target_family.and_then(|family| {
-        inner
-            .aggregate
-            .peek(&AggregateKey {
-                group: group.to_string(),
-                network: context.network,
-                family: Some(family),
-                node_id,
-            })
-            .map(|stats| snapshot(stats, now))
-    });
-    let global_score = inner
-        .aggregate
-        .peek(&AggregateKey {
+    let layer = |family| {
+        inner.aggregate.peek(&AggregateKey {
             group: group.to_string(),
             network: context.network,
-            family: None,
+            family,
             node_id,
         })
-        .map_or_else(
-            || snapshot(&Stats::default(), now),
-            |stats| snapshot(stats, now),
+    };
+    let global_stats = layer(None);
+    let mut score = global_stats.map_or_else(
+        || snapshot(&Stats::default(), now),
+        |stats| snapshot(stats, now),
+    );
+    if let Some(stats) = context.target_family.and_then(|family| layer(Some(family))) {
+        let family = snapshot(stats, now);
+        let weight = (family.useful_completed / SCORE_SWITCH_FULL_EVIDENCE).clamp(0.0, 1.0);
+        score.reliability = blend(score.reliability, family.reliability, weight);
+        score.reliability_upper = blend(score.reliability_upper, family.reliability_upper, weight);
+        score.observed_reliability = blend(
+            score.observed_reliability,
+            family.observed_reliability,
+            weight,
         );
-    let aggregate_score = family_score.map_or(global_score, |family| {
-        let reliability_weight = (family.useful_completed / 8.0).clamp(0.0, 1.0);
-        let setup_weight = (family.completed / 8.0).clamp(0.0, 1.0);
-        ScoreSnapshot {
-            attempts: family.attempts,
-            completed: global_score.completed + family.completed,
-            hysteresis_completed: if family.completed > 0.0 {
-                family.hysteresis_completed
-            } else {
-                global_score.hysteresis_completed
-            },
-            useful_completed: global_score.useful_completed + family.useful_completed,
-            reliability: blend(
-                global_score.reliability,
-                family.reliability,
-                reliability_weight,
-            ),
-            reliability_upper: blend(
-                global_score.reliability_upper,
-                family.reliability_upper,
-                reliability_weight,
-            ),
-            latency_ms: blend_option(global_score.latency_ms, family.latency_ms, setup_weight),
-            latency_confidence: blend(
-                global_score.latency_confidence,
-                family.latency_confidence,
-                setup_weight,
-            ),
-            throughput: blend_option(
-                global_score.throughput,
-                family.throughput,
-                reliability_weight,
-            ),
-            throughput_confidence: blend(
-                global_score.throughput_confidence,
-                family.throughput_confidence,
-                reliability_weight,
-            ),
-            failures: global_score.failures.max(family.failures),
-            explore_backed_off: global_score.explore_backed_off,
-            fail_streak: global_score.fail_streak,
-            selected_at: global_score.selected_at.max(family.selected_at),
-            targeted: false,
-            target_attempts: 0.0,
-            target_completed: 0.0,
-        }
-    });
-    let exact_score = match (context.target_family, context.target.as_ref()) {
-        (Some(family), Some(target)) => inner
-            .exact
-            .peek(&ExactKey {
-                group: group.to_string(),
-                network: context.network,
-                family,
-                target: target.clone(),
-                node_id,
-            })
-            .map(|stats| snapshot(stats, now)),
-        _ => None,
-    };
-    let Some(exact) = exact_score else {
-        return aggregate_score;
-    };
-    let reliability_weight = (exact.useful_completed / 8.0).clamp(0.0, 1.0);
-    let setup_weight = (exact.completed / 8.0).clamp(0.0, 1.0);
-    ScoreSnapshot {
-        attempts: exact.attempts,
-        completed: aggregate_score.completed + exact.completed,
-        hysteresis_completed: if exact.completed > 0.0 {
-            exact.hysteresis_completed
+        score.completed = score.completed.max(family.completed);
+        score.useful_completed = score.useful_completed.max(family.useful_completed);
+        score.attempts = score.attempts.max(family.attempts);
+        score.hysteresis_completed = if family.completed > 0.0 {
+            family.completed
         } else {
-            aggregate_score.hysteresis_completed
-        },
-        useful_completed: aggregate_score.useful_completed + exact.useful_completed,
-        reliability: blend(
-            aggregate_score.reliability,
-            exact.reliability,
-            reliability_weight,
-        ),
-        reliability_upper: blend(
-            aggregate_score.reliability_upper,
-            exact.reliability_upper,
-            reliability_weight,
-        ),
-        latency_ms: blend_option(aggregate_score.latency_ms, exact.latency_ms, setup_weight),
-        latency_confidence: blend(
-            aggregate_score.latency_confidence,
-            exact.latency_confidence,
-            setup_weight,
-        ),
-        throughput: blend_option(
-            aggregate_score.throughput,
-            exact.throughput,
-            reliability_weight,
-        ),
-        throughput_confidence: blend(
-            aggregate_score.throughput_confidence,
-            exact.throughput_confidence,
-            reliability_weight,
-        ),
-        failures: aggregate_score.failures.max(exact.failures),
-        explore_backed_off: aggregate_score.explore_backed_off,
-        fail_streak: aggregate_score.fail_streak,
-        selected_at: aggregate_score.selected_at.max(exact.selected_at),
-        targeted: exact.completed >= MIN_TRAINED_EVIDENCE
-            || aggregate_score.completed < MIN_TRAINED_EVIDENCE,
-        target_attempts: exact.attempts,
-        target_completed: exact.completed,
+            score.hysteresis_completed
+        };
+        score.performance = prefer_specific(score.performance, family.performance);
+        score.failures = score.failures.max(family.failures);
+        score.fail_streak = score.fail_streak.max(family.fail_streak);
+        score.explore_backed_off |= family.explore_backed_off;
+        score.selected_at = score.selected_at.max(family.selected_at);
+        score.last_attempt = score.last_attempt.max(family.last_attempt);
+        score.degraded_at = score.degraded_at.max(family.degraded_at);
     }
+    // Proxy health-family and probe protocol are independent of target family.
+    if let Some(stats) = global_stats {
+        let probe = &stats.probes[super::evidence::probe_slot(context)];
+        score.probe = probe.latency.snapshot(now);
+        score.probe_scope = probe.scope;
+    }
+    if let (Some(family), Some(target)) = (context.target_family, context.target.as_ref())
+        && let Some(stats) = inner.exact.peek(&ExactKey {
+            group: group.to_string(),
+            network: context.network,
+            family,
+            target: target.clone(),
+            node_id,
+        })
+    {
+        score.verification = super::verification::VerificationEvidence::new(stats, now);
+        let exact = snapshot(stats, now);
+        let weight = (exact.useful_completed / SCORE_SWITCH_FULL_EVIDENCE).clamp(0.0, 1.0);
+        score.reliability = blend(score.reliability, exact.reliability, weight);
+        score.reliability_upper = blend(score.reliability_upper, exact.reliability_upper, weight);
+        score.observed_reliability = blend(
+            score.observed_reliability,
+            exact.observed_reliability,
+            weight,
+        );
+        score.completed = score.completed.max(exact.completed);
+        score.useful_completed = score.useful_completed.max(exact.useful_completed);
+        score.hysteresis_completed = if exact.completed > 0.0 {
+            exact.completed
+        } else {
+            score.hysteresis_completed
+        };
+        score.target_performance = exact.performance;
+        score.failures = score.failures.max(exact.failures);
+        score.fail_streak = score.fail_streak.max(exact.fail_streak);
+        score.explore_backed_off |= exact.explore_backed_off;
+        score.selected_at = score.selected_at.max(exact.selected_at);
+        score.degraded_at = score.degraded_at.max(exact.degraded_at);
+    }
+    if context.target.is_none() {
+        score.verification = layer(context.target_family)
+            .map(|stats| super::verification::VerificationEvidence::new(stats, now))
+            .unwrap_or_default();
+    }
+    score
 }
+
 pub(super) fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
-    let factor = stats.updated_at.map_or(1.0, |updated_at| {
-        evidence_decay(now.saturating_duration_since(updated_at))
-    });
-    let (latency_ms, latency_weight) = stats
-        .first_response_ms
-        .mean()
-        .map(|mean| (Some(mean), stats.first_response_ms.weight))
-        .unwrap_or_else(|| (stats.setup_ms.mean(), stats.setup_ms.weight));
-    // Dominant-direction bytes per second; utility normalizes this within the group.
-    let throughput =
-        (stats.throughput_seconds > 0.0).then(|| stats.throughput_bytes / stats.throughput_seconds);
+    let factor = stats
+        .updated_at
+        .map_or(1.0, |at| evidence_decay(now.saturating_duration_since(at)));
     let (reliability, reliability_upper) = stats.reliability_bounds(factor);
+    let failures = stats.useful_failure + stats.setup_failure * 2.0;
+    let observations = stats.useful_success + failures;
     ScoreSnapshot {
         attempts: stats.attempts * factor,
         completed: stats.completed() * factor,
@@ -548,64 +499,219 @@ pub(super) fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
         useful_completed: stats.useful_completed() * factor,
         reliability,
         reliability_upper,
-        latency_ms,
-        latency_confidence: (latency_weight * factor / 8.0).clamp(0.0, 1.0),
-        throughput,
-        throughput_confidence: (stats.throughput_windows * factor / 8.0).clamp(0.0, 1.0),
+        observed_reliability: if observations > 0.0 {
+            stats.useful_success / observations
+        } else {
+            0.5
+        },
+        performance: stats.performance.snapshot(now),
+        warm_setup: stats.warm_setup_ms.snapshot(now),
         failures: (stats.setup_failure + stats.useful_failure) * factor,
         explore_backed_off: stats.explore_not_before.is_some_and(|until| until > now),
+        degraded_at: stats
+            .degraded_at
+            .filter(|at| now.saturating_duration_since(*at) < super::PERFORMANCE_MAX_AGE),
         fail_streak: stats.fail_streak,
         selected_at: stats.selected_at,
-        targeted: false,
-        target_attempts: 0.0,
-        target_completed: 0.0,
+        last_attempt: stats.last_attempt,
+        ..Default::default()
     }
 }
-fn blend(base: f64, exact: f64, exact_weight: f64) -> f64 {
-    base * (1.0 - exact_weight) + exact * exact_weight
+
+fn blend(base: f64, specific: f64, weight: f64) -> f64 {
+    base * (1.0 - weight) + specific * weight
 }
 
-fn blend_option(base: Option<f64>, exact: Option<f64>, exact_weight: f64) -> Option<f64> {
-    match (base, exact) {
-        (Some(base), Some(exact)) => Some(blend(base, exact, exact_weight)),
-        (None, exact) => exact,
-        (base, None) => base,
+fn prefer_specific(
+    base: PerformanceSnapshot,
+    specific: PerformanceSnapshot,
+) -> PerformanceSnapshot {
+    let pick = |base: MetricSnapshot, specific: MetricSnapshot| {
+        if specific.value.is_some() {
+            specific
+        } else {
+            base
+        }
+    };
+    PerformanceSnapshot {
+        setup: pick(base.setup, specific.setup),
+        response: pick(base.response, specific.response),
+        upload: pick(base.upload, specific.upload),
+        download: pick(base.download, specific.download),
     }
 }
 
 pub(super) fn performance_baseline(snapshots: &[ScoreSnapshot]) -> PerformanceBaseline {
+    let any_healthy = snapshots
+        .iter()
+        .any(|score| score.fail_streak < SCORE_FAIL_STREAK_EXCLUDE);
+    let healthy =
+        |score: &&ScoreSnapshot| !any_healthy || score.fail_streak < SCORE_FAIL_STREAK_EXCLUDE;
+    let any_qualified = snapshots
+        .iter()
+        .filter(healthy)
+        .any(|score| score.useful_completed >= PERFORMANCE_VALIDATION_SAMPLES);
     let best_reliability = snapshots
         .iter()
+        .filter(healthy)
+        .filter(|score| !any_qualified || score.useful_completed >= PERFORMANCE_VALIDATION_SAMPLES)
         .map(|score| score.reliability)
-        .fold(0.0_f64, f64::max);
-    let eligible = || {
-        snapshots
-            .iter()
-            .filter(|score| best_reliability - score.reliability <= RELIABILITY_CLOSE)
+        .fold(0.0, f64::max);
+    let best_observed_reliability = snapshots
+        .iter()
+        .filter(healthy)
+        .filter(|score| !any_qualified || score.useful_completed >= PERFORMANCE_VALIDATION_SAMPLES)
+        .map(|score| score.observed_reliability)
+        .fold(0.0, f64::max);
+    let mut baseline = PerformanceBaseline {
+        performance: PerformanceSnapshot::default(),
+        target_performance: PerformanceSnapshot::default(),
+        probe: MetricSnapshot::default(),
+        probe_scope: 0,
+        warm_setup: MetricSnapshot::default(),
+        best_reliability,
+        best_observed_reliability,
+        any_healthy,
+        any_qualified,
     };
-    PerformanceBaseline {
-        latency_ms: eligible()
-            .filter_map(|score| score.latency_ms)
-            .map(|latency| latency.max(1.0))
-            .min_by(f64::total_cmp),
-        throughput: eligible()
-            .filter_map(|score| score.throughput)
-            .max_by(f64::total_cmp),
+    let eligible = |score: &&ScoreSnapshot| normal_eligible(score, baseline);
+    baseline.probe_scope = snapshots
+        .iter()
+        .filter(eligible)
+        .find(|score| {
+            score.probe.value.is_some()
+                && snapshots
+                    .iter()
+                    .filter(eligible)
+                    .filter(|other| {
+                        other.probe.value.is_some() && other.probe_scope == score.probe_scope
+                    })
+                    .take(2)
+                    .count()
+                    == 2
+        })
+        .map_or(0, |score| score.probe_scope);
+    let metric = |get: fn(&ScoreSnapshot) -> MetricSnapshot, larger: bool, scope: Option<u64>| {
+        let mut values = snapshots
+            .iter()
+            .filter(|score| normal_eligible(score, baseline))
+            .filter(|score| scope.is_none_or(|scope| score.probe_scope == scope))
+            .filter_map(|score| get(score).value);
+        let first = values.next();
+        let second = values.next();
+        match (first, second) {
+            (Some(a), Some(b)) => MetricSnapshot {
+                value: Some(values.fold(
+                    if larger { a.max(b) } else { a.min(b) },
+                    |best, value| {
+                        if larger {
+                            best.max(value)
+                        } else {
+                            best.min(value)
+                        }
+                    },
+                )),
+                confidence: 1.0,
+                observed_at: None,
+            },
+            _ => MetricSnapshot::default(),
+        }
+    };
+    let performance = PerformanceSnapshot {
+        setup: metric(|s| s.performance.setup, false, None),
+        response: metric(|s| s.performance.response, false, None),
+        upload: metric(|s| s.performance.upload, true, None),
+        download: metric(|s| s.performance.download, true, None),
+    };
+    let target_performance = PerformanceSnapshot {
+        setup: metric(|s| s.target_performance.setup, false, None),
+        response: metric(|s| s.target_performance.response, false, None),
+        upload: metric(|s| s.target_performance.upload, true, None),
+        download: metric(|s| s.target_performance.download, true, None),
+    };
+    let probe = metric(|s| s.probe, false, Some(baseline.probe_scope));
+    let warm_setup = metric(|s| s.warm_setup, false, None);
+    baseline.performance = performance;
+    baseline.target_performance = target_performance;
+    baseline.probe = probe;
+    baseline.warm_setup = warm_setup;
+    baseline
+}
+
+fn relative(metric: MetricSnapshot, best: MetricSnapshot, larger: bool) -> Option<f64> {
+    match (metric.value, best.value) {
+        (Some(value), Some(best)) => Some(if larger {
+            (value / best.max(1.0)).clamp(0.0, 1.0)
+        } else {
+            (best.max(1.0) / value.max(1.0)).clamp(0.0, 1.0)
+        }),
+        _ => None,
+    }
+}
+
+fn correction(base: f64, metric: MetricSnapshot, best: MetricSnapshot, larger: bool) -> f64 {
+    relative(metric, best, larger).map_or(base, |value| blend(base, value, metric.confidence))
+}
+
+fn scoped_correction(
+    base: f64,
+    aggregate: MetricSnapshot,
+    aggregate_best: MetricSnapshot,
+    exact: MetricSnapshot,
+    exact_best: MetricSnapshot,
+    larger: bool,
+) -> f64 {
+    if relative(exact, exact_best, larger).is_some() {
+        correction(base, exact, exact_best, larger)
+    } else {
+        correction(base, aggregate, aggregate_best, larger)
     }
 }
 
 pub(super) fn utility(score: &ScoreSnapshot, baseline: PerformanceBaseline) -> f64 {
-    let latency_penalty = match (score.latency_ms, baseline.latency_ms) {
-        (Some(latency), Some(best)) => {
-            (1.0 - best / latency.max(1.0)).clamp(0.0, 1.0) * 0.03 * score.latency_confidence
-        }
-        _ => 0.0,
+    let mut latency = if score.probe_scope == baseline.probe_scope {
+        correction(0.0, score.probe, baseline.probe, false)
+    } else {
+        0.0
     };
-    let throughput_bonus = match (score.throughput, baseline.throughput) {
-        (Some(throughput), Some(best)) if best > 0.0 => {
-            (throughput / best).clamp(0.0, 1.0) * 0.02 * score.throughput_confidence
+    if baseline.probe.value.is_none() {
+        if baseline.performance.setup.value.is_none() {
+            latency = correction(latency, score.warm_setup, baseline.warm_setup, false);
         }
-        _ => 0.0,
-    };
-    score.reliability + throughput_bonus - latency_penalty
+        latency = scoped_correction(
+            latency,
+            score.performance.setup,
+            baseline.performance.setup,
+            score.target_performance.setup,
+            baseline.target_performance.setup,
+            false,
+        );
+    }
+    latency = scoped_correction(
+        latency,
+        score.performance.response,
+        baseline.performance.response,
+        score.target_performance.response,
+        baseline.target_performance.response,
+        false,
+    );
+    let upload = scoped_correction(
+        0.0,
+        score.performance.upload,
+        baseline.performance.upload,
+        score.target_performance.upload,
+        baseline.target_performance.upload,
+        true,
+    );
+    let download = scoped_correction(
+        0.0,
+        score.performance.download,
+        baseline.performance.download,
+        score.target_performance.download,
+        baseline.target_performance.download,
+        true,
+    );
+    // Uncertainty gates admission, not the payoff: zero observed failures
+    // must not reward a thousand samples over twenty forever.
+    score.observed_reliability + 0.03 * latency + 0.02 * upload.max(download)
 }

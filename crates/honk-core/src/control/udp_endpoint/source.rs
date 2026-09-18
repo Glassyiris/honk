@@ -557,6 +557,11 @@ impl SourceEndpoint {
     }
 
     #[cfg(test)]
+    pub(super) fn hold_binding_for_test(&self) -> impl Drop + '_ {
+        self.binding.lock()
+    }
+
+    #[cfg(test)]
     pub(super) fn mark_send_active_for_test(&self) {
         self.owner.state.lock().active_sender = self.view;
     }

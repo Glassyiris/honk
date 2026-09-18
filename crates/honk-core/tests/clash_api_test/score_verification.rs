@@ -1,0 +1,342 @@
+use super::*;
+use honk_config::group::GroupPolicy;
+use honk_outbound::group::{
+    ScoreOutcome, ScoreSelectionContext, ScoreSource, ScoreTarget, SelectionNetwork,
+};
+
+async fn get_json(app: &TestApp, path: &str) -> serde_json::Value {
+    let response = http_client().get(app.url(path)).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    response.json().await.unwrap()
+}
+
+fn context(network: SelectionNetwork) -> ScoreSelectionContext {
+    ScoreSelectionContext::aggregate(
+        network,
+        match network {
+            SelectionNetwork::Tcp => ProbeDomain::Tcp,
+            SelectionNetwork::Udp => ProbeDomain::DataUdp,
+        },
+        IpVersion::V4,
+    )
+}
+
+fn business_success(
+    manager: &GroupManager,
+    node: &Node,
+    context: &ScoreSelectionContext,
+    response: bool,
+) {
+    let reporter = manager
+        .feedback_for_node(node.id, context.clone())
+        .unwrap()
+        .start();
+    reporter.setup_succeeded();
+    reporter.tx(1);
+    if response {
+        reporter.first_response();
+    }
+    reporter.rx(1);
+    reporter.finish(ScoreOutcome::Success);
+}
+
+#[tokio::test]
+async fn score_verification_is_private_readonly_and_uses_canonical_candidates() {
+    let (a, b, dead, unchosen) = (
+        make_node("private-a"),
+        make_node("private-b"),
+        make_node("private-dead"),
+        make_node("private-unchosen"),
+    );
+    let nodes = vec![a.clone(), b.clone(), dead.clone(), unchosen.clone()];
+    let app = spawn_app_with_config(
+        Config {
+            nodes: nodes.clone(),
+            groups: vec![
+                Group {
+                    name: "auto".into(),
+                    policy: GroupPolicy::Score,
+                    nodes: vec![a.id, a.id, dead.id],
+                    groups: vec!["selected".into(), "alias".into()],
+                    ..Default::default()
+                },
+                Group {
+                    name: "selected".into(),
+                    policy: GroupPolicy::Selector,
+                    nodes: vec![b.id, unchosen.id],
+                    ..Default::default()
+                },
+                Group {
+                    name: "alias".into(),
+                    policy: GroupPolicy::Selector,
+                    nodes: vec![b.id],
+                    ..Default::default()
+                },
+                Group {
+                    name: "empty".into(),
+                    policy: GroupPolicy::Score,
+                    final_outbound: Some(unchosen.name.clone()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+        "",
+        "",
+    )
+    .await;
+    for domain in [ProbeDomain::Tcp, ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        app.state
+            .alive_set
+            .report_unavailable_forced(dead.id, domain, IpVersion::V4);
+    }
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        app.state
+            .alive_set
+            .report_unavailable_forced(b.id, domain, IpVersion::V4);
+    }
+    let manager = app.state.group_manager.read().clone();
+    let private_context = ScoreSelectionContext {
+        target: Some(ScoreTarget::domain("private-target.example", 6543)),
+        target_family: Some(IpVersion::V6),
+        ..context(SelectionNetwork::Tcp)
+    };
+    drop(
+        manager
+            .feedback_for_node(a.id, private_context)
+            .unwrap()
+            .start(),
+    );
+    let before = get_json(&app, "/stats").await;
+    for path in ["/proxies", "/proxies/auto"] {
+        let body = get_json(&app, path).await;
+        let proxy = if path == "/proxies" {
+            &body["proxies"]["auto"]
+        } else {
+            &body
+        };
+        let verification = &proxy["scoreVerification"];
+        assert_eq!(proxy["type"], "url_test");
+        assert_eq!(verification["objective"], "responseQualityWithAvailability");
+        assert_eq!(verification["scope"], "aggregate");
+        for (network, candidates) in [("tcp", 2), ("udp", 1)] {
+            let summary = &verification[network];
+            assert_eq!(summary["state"], "provisional");
+            assert_eq!(summary["comparison"], "unconfirmed");
+            assert_eq!(summary["basis"], "none");
+            assert_eq!(summary["coverage"]["candidates"], candidates);
+            assert_eq!(summary["coverage"]["compared"], 0);
+            assert_eq!(
+                summary["missing"],
+                serde_json::json!({
+                    "availability": true, "response": true, "transfer": true,
+                })
+            );
+            assert_eq!(summary["nextAction"], "nextBusinessFlow");
+            assert_eq!(summary["network"], network);
+            assert_eq!(summary["targetSpecific"], false);
+            assert!(summary["targetFamily"].is_null());
+            assert!(summary["evidenceAgeMs"].is_null());
+            assert!(summary["validForMs"].is_null());
+        }
+        let encoded = verification.to_string();
+        assert!(!encoded.contains("private-target.example"));
+        assert!(!encoded.contains("6543"));
+        for node in &nodes {
+            assert!(!encoded.contains(&node.id.to_string()));
+        }
+        assert!(!encoded.contains(&dead.name));
+        assert!(!encoded.contains(&unchosen.name));
+        assert_eq!(verification["tcp"]["selected"], proxy["now"]);
+        if path == "/proxies" {
+            assert!(
+                body["proxies"]["selected"]
+                    .get("scoreVerification")
+                    .is_none()
+            );
+            let empty = &body["proxies"]["empty"];
+            assert_eq!(empty["now"], unchosen.name);
+            for network in ["tcp", "udp"] {
+                let summary = &empty["scoreVerification"][network];
+                assert_eq!(summary["state"], "provisional");
+                assert_eq!(summary["comparison"], "unconfirmed");
+                assert_eq!(summary["nextAction"], "none");
+                assert_eq!(
+                    summary["coverage"],
+                    serde_json::json!({
+                        "candidates": 0, "compared": 0, "pending": 0,
+                    })
+                );
+            }
+        }
+    }
+    let after = get_json(&app, "/stats").await;
+    assert_eq!(before["score"], after["score"]);
+}
+
+#[tokio::test]
+async fn score_verification_separates_probe_comparison_from_business_usability() {
+    let nodes = [make_node("fast"), make_node("slow")];
+    let group = Group {
+        name: "auto".into(),
+        policy: GroupPolicy::Score,
+        nodes: nodes.iter().map(|node| node.id).collect(),
+        ..Default::default()
+    };
+    let config = Config {
+        nodes: nodes.to_vec(),
+        groups: vec![group],
+        ..Default::default()
+    };
+    let app = spawn_app_with_config(config.clone(), "", "").await;
+    let manager = app.state.group_manager.read().clone();
+    let context = ScoreSelectionContext {
+        target: Some(ScoreTarget::domain("business-private.example", 443)),
+        target_family: Some(IpVersion::V4),
+        ..context(SelectionNetwork::Tcp)
+    };
+    for (node, latency) in nodes.iter().zip([10, 100]) {
+        for _ in 0..16 {
+            let reporter = manager
+                .feedback_for_node(node.id, context.clone())
+                .unwrap()
+                .with_source(ScoreSource::HealthProbe)
+                .start();
+            reporter.probe_latency(Duration::from_millis(latency));
+            reporter.finish(ScoreOutcome::Success);
+        }
+    }
+    let probes = get_json(&app, "/proxies/auto").await;
+    let verification = &probes["scoreVerification"]["tcp"];
+    assert_eq!(verification["state"], "provisional");
+    assert_eq!(verification["comparison"], "supported");
+    assert_eq!(verification["basis"], "configuredProbe");
+    assert_eq!(verification["missing"]["availability"], true);
+    assert_eq!(verification["missing"]["transfer"], true);
+    assert_eq!(verification["nextAction"], "nextBusinessFlow");
+
+    for node in &nodes {
+        for _ in 0..16 {
+            business_success(&manager, node, &context, false);
+        }
+    }
+    let observed = get_json(&app, "/proxies/auto").await;
+    let verification = &observed["scoreVerification"]["tcp"];
+    assert_eq!(observed["now"], "fast");
+    assert_eq!(verification["state"], "observedUsable");
+    assert_eq!(verification["comparison"], "supported");
+    assert_eq!(verification["basis"], "configuredProbe");
+    assert_eq!(
+        verification["coverage"],
+        serde_json::json!({
+            "candidates": 2, "compared": 2, "pending": 0,
+        })
+    );
+    assert_eq!(
+        verification["missing"],
+        serde_json::json!({
+            "availability": false, "response": false, "transfer": true,
+        })
+    );
+    assert_eq!(verification["nextAction"], "awaitTransfer");
+    assert!(verification["evidenceAgeMs"].as_u64().unwrap() < 120_000);
+    let validity = verification["validForMs"].as_u64().unwrap();
+    assert!(validity > 0 && validity <= 120_000);
+    assert_eq!(observed["scoreVerification"]["udp"]["state"], "provisional");
+
+    manager.selection_plan_for_target("auto", &context);
+    let before = get_json(&app, "/stats").await;
+    assert_eq!(
+        before["score"]["groups"][0]["verification"]["tcp"]["usableSelections"],
+        1
+    );
+    for path in ["/proxies", "/proxies/auto", "/stats"] {
+        get_json(&app, path).await;
+    }
+    assert_eq!(get_json(&app, "/stats").await["score"], before["score"]);
+
+    let replacement = GroupManager::with_alive_set_and_score_state(
+        &config.groups,
+        &config.nodes,
+        Some(app.state.alive_set.clone()),
+        manager.score_state(),
+    );
+    replacement.publish_score_membership();
+    *app.state.group_manager.write() = Arc::new(replacement);
+    let reloaded = get_json(&app, "/proxies/auto").await;
+    let verification = &reloaded["scoreVerification"]["tcp"];
+    assert_eq!(verification["state"], "provisional");
+    assert_eq!(verification["comparison"], "unconfirmed");
+    assert_eq!(verification["basis"], "none");
+    assert_eq!(verification["missing"]["response"], true);
+    assert_eq!(verification["nextAction"], "nextBusinessFlow");
+
+    let manager = app.state.group_manager.read().clone();
+    for node in &nodes {
+        manager
+            .feedback_for_node(node.id, context.clone())
+            .unwrap()
+            .start()
+            .finish(ScoreOutcome::Timeout);
+    }
+    let failed = get_json(&app, "/proxies/auto").await;
+    assert_eq!(failed["scoreVerification"]["tcp"]["state"], "provisional");
+    assert_eq!(
+        failed["scoreVerification"]["tcp"]["missing"]["availability"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn score_verification_reports_response_only_singleton_without_a_best_claim() {
+    let node = make_node("single");
+    let app = spawn_app_with_config(
+        Config {
+            nodes: vec![node.clone()],
+            groups: vec![Group {
+                name: "auto".into(),
+                policy: GroupPolicy::Score,
+                nodes: vec![node.id],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        "",
+        "",
+    )
+    .await;
+    let manager = app.state.group_manager.read().clone();
+    for network in [SelectionNetwork::Tcp, SelectionNetwork::Udp] {
+        let context = ScoreSelectionContext {
+            target: Some(ScoreTarget::domain("business-private.example", 443)),
+            target_family: Some(IpVersion::V6),
+            ..context(network)
+        };
+        for _ in 0..16 {
+            business_success(&manager, &node, &context, true);
+        }
+    }
+    let observed = get_json(&app, "/proxies/auto").await;
+    for network in ["tcp", "udp"] {
+        let verification = &observed["scoreVerification"][network];
+        assert_eq!(verification["state"], "observedUsable");
+        assert_eq!(verification["comparison"], "unconfirmed");
+        assert_eq!(verification["basis"], "aggregateResponse");
+        assert_eq!(verification["coverage"]["candidates"], 1);
+        assert_eq!(
+            verification["missing"],
+            serde_json::json!({
+                "availability": false, "response": false, "transfer": true,
+            })
+        );
+        assert_eq!(verification["nextAction"], "awaitTransfer");
+        assert_eq!(verification["targetSpecific"], false);
+        assert!(verification["targetFamily"].is_null());
+        assert!(verification["validForMs"].as_u64().unwrap() > 0);
+    }
+    assert!(
+        !observed["scoreVerification"]
+            .to_string()
+            .contains("business-private.example")
+    );
+}

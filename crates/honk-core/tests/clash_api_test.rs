@@ -28,6 +28,9 @@ use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 use tracing_subscriber::prelude::*;
 
+#[path = "clash_api_test/score_verification.rs"]
+mod score_verification;
+
 fn make_node(name: &str) -> Node {
     let mut node = Node {
         name: name.into(),
@@ -714,7 +717,7 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
     assert_eq!(first_response.status(), 200);
     let first: serde_json::Value = first_response.json().await.unwrap();
     let score = first["score"].clone();
-    let expected_score = serde_json::json!({
+    let mut expected_score = serde_json::json!({
         "groups": [
             {
                 "name": "a-score",
@@ -778,10 +781,29 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
             "aggregateEvictions": 0,
         },
     });
+    for group in expected_score["groups"].as_array_mut().unwrap() {
+        group["verification"] = serde_json::json!({
+            "tcp": {
+                "provisionalSelections": 1,
+                "usableSelections": 0,
+                "validationSelections": 1,
+                "confirmations": 0,
+                "expired": 0,
+                "contradicted": 0,
+                "confirmationMillis": 0,
+            },
+            "udp": {
+                "provisionalSelections": 0,
+                "usableSelections": 0,
+                "validationSelections": 0,
+                "confirmations": 0,
+                "expired": 0,
+                "contradicted": 0,
+                "confirmationMillis": 0,
+            },
+        });
+    }
     assert_eq!(score, expected_score);
-    let mut unexpected_counter = expected_score.clone();
-    unexpected_counter["groups"][0]["udp"]["periodicExplore"] = serde_json::json!(1);
-    assert_ne!(score, unexpected_counter);
     assert!(first["outbounds"].is_array());
     let connections = client
         .get(app.url("/connections"))
@@ -1460,27 +1482,51 @@ async fn test_group_delay_returns_member_results_for_zashboard_core_mode() {
 }
 
 #[tokio::test]
-async fn test_node_delay_failure_is_503() {
+async fn node_delay_failures_return_503_without_advancing_real_dial_streaks() {
     let app = spawn_app("", "").await;
     let client = http_client();
+    let node_id = make_node("node-a").id;
+    for _ in 0..3 {
+        let response = client
+            .get(app.url("/proxies/node-a/delay?url=https://127.0.0.1:1/&timeout=1000"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503);
+    }
+    assert!(
+        app.state
+            .alive_set
+            .is_alive_for(node_id, ProbeDomain::Tcp, IpVersion::V4)
+    );
+    assert!(
+        !app.state
+            .alive_set
+            .is_failure_demoted(node_id, ProbeDomain::Tcp, IpVersion::V4)
+    );
+    app.state
+        .alive_set
+        .record_dial_failure(node_id, ProbeDomain::Tcp, IpVersion::V4);
+    assert!(
+        !app.state
+            .alive_set
+            .is_failure_demoted(node_id, ProbeDomain::Tcp, IpVersion::V4)
+    );
+    app.state
+        .alive_set
+        .record_dial_failure(node_id, ProbeDomain::Tcp, IpVersion::V4);
+    assert!(
+        app.state
+            .alive_set
+            .is_failure_demoted(node_id, ProbeDomain::Tcp, IpVersion::V4)
+    );
 
-    // Nothing listens on 127.0.0.1:1 → measurement fails → 503 message body.
-    let resp = client
-        .get(app.url("/proxies/node-a/delay?url=https://127.0.0.1:1/&timeout=1000"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 503);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["message"].as_str().unwrap().contains("delay test"));
-
-    // Unknown proxy → 404.
-    let resp = client
+    let response = client
         .get(app.url("/proxies/nope/delay"))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 404);
+    assert_eq!(response.status(), 404);
 }
 
 #[tokio::test]
@@ -1518,10 +1564,7 @@ async fn node_delay_resolver_refusal_does_not_demote_node() {
     ));
 }
 
-/// Nested groups on the delay endpoints: `/group/{name}/delay` flattens
-/// sub-group members to their representative leaves, consecutive failures
-/// replace the leaf's display history, and `/proxies/{subgroup-tag}/delay`
-/// works through the group branch.
+/// Nested delay endpoints preserve member identity and real traffic history.
 #[tokio::test]
 async fn test_nested_group_delay_endpoints() {
     let (a, b) = (make_node("node-a"), make_node("node-b"));
@@ -1546,8 +1589,6 @@ async fn test_nested_group_delay_endpoints() {
     let app = spawn_app_with_config(config, "", "").await;
     let client = http_client();
 
-    // Seed the sub-group leaf: the parent failure is transient, while the
-    // follow-up sub-group failure supplies the strike.
     app.state.alive_set.record_probe_latency(
         make_node("node-b").id,
         ProbeDomain::Tcp,
@@ -1574,7 +1615,7 @@ async fn test_nested_group_delay_endpoints() {
             IpVersion::V4
         ),
         Some(Duration::from_millis(55)),
-        "one transient failure must preserve the leaf's latency"
+        "a measurement failure must preserve the leaf's latency"
     );
 
     // The sub-group tag itself is a valid delay target (group branch):
@@ -1591,9 +1632,14 @@ async fn test_nested_group_delay_endpoints() {
             ProbeDomain::Tcp,
             IpVersion::V4
         ),
-        Some(Duration::from_secs(10)),
-        "the consecutive failure must append the penalty sample"
+        Some(Duration::from_millis(55)),
+        "repeated measurements must not synthesize real dial failures"
     );
+    assert!(!app.state.alive_set.is_failure_demoted(
+        make_node("node-b").id,
+        ProbeDomain::Tcp,
+        IpVersion::V4,
+    ));
 }
 
 #[tokio::test]

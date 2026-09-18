@@ -1,5 +1,7 @@
 use super::*;
-use crate::group::{ScoreOutcome, ScoreReporter, ScoreSelectionContext, SelectionNetwork};
+use crate::group::{
+    ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreSource, SelectionNetwork,
+};
 
 impl AliveDialerSet {
     fn raw_probe_reporter(&self, node_id: Uuid, ipver: IpVersion) -> Option<ScoreReporter> {
@@ -15,7 +17,7 @@ impl AliveDialerSet {
                     ),
                 )
             })
-            .map(|feedback| feedback.streak_neutral().start())
+            .map(|feedback| feedback.with_source(ScoreSource::HealthProbe).start())
     }
 }
 
@@ -448,6 +450,7 @@ impl AliveDialerSet {
                 Ok(Ok(_stream)) => {
                     if let Some(reporter) = &reporter {
                         reporter.setup_succeeded();
+                        reporter.probe_latency(elapsed);
                         reporter.finish_setup_only();
                     }
                     tracing::debug!(

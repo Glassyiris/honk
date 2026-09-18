@@ -1,7 +1,7 @@
 use super::*;
 use anyhow::Context as _;
 use honk_outbound::group::{
-    ScoreFeedback, ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreTarget,
+    ScoreFeedback, ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreSource, ScoreTarget,
     SelectionNetwork,
 };
 
@@ -15,7 +15,7 @@ fn probe_feedback(
     manager
         .read()
         .feedback_for_node(node_id, context)
-        .map(ScoreFeedback::streak_neutral)
+        .map(|feedback| feedback.with_source(ScoreSource::HealthProbe))
 }
 
 fn start_probe_feedback(
@@ -24,30 +24,6 @@ fn start_probe_feedback(
     context: ScoreSelectionContext,
 ) -> ProbeReporter {
     probe_feedback(manager, node_id, context).map(|feedback| feedback.start())
-}
-
-fn probe_setup(reporter: &ProbeReporter) {
-    if let Some(reporter) = reporter {
-        reporter.setup_succeeded();
-    }
-}
-
-fn probe_first_response(reporter: &ProbeReporter) {
-    if let Some(reporter) = reporter {
-        reporter.first_response();
-    }
-}
-
-fn probe_tx(reporter: &ProbeReporter, bytes: usize) {
-    if let Some(reporter) = reporter {
-        reporter.tx(bytes as u64);
-    }
-}
-
-fn probe_rx(reporter: &ProbeReporter, bytes: usize) {
-    if let Some(reporter) = reporter {
-        reporter.rx(bytes as u64);
-    }
 }
 
 fn probe_finish(reporter: &ProbeReporter, outcome: ScoreOutcome) {
@@ -161,8 +137,16 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                     protocol
                 ));
             };
-            let connect_timeout = match config.try_read() {
-                Ok(config) => Duration::from_millis(config.global.connect_timeout_ms),
+            let (connect_timeout, default_probe_url) = match config.try_read() {
+                Ok(config) => (
+                    Duration::from_millis(config.global.connect_timeout_ms),
+                    config
+                        .global
+                        .tcp_check_url
+                        .first()
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
                 Err(_) => {
                     return honk_outbound::alive::HttpProbeResult::SetupFailure(
                         "config lock busy".to_string(),
@@ -218,6 +202,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                         target_family(addr),
                     ),
                 )
+                .map(|feedback| feedback.with_source(ScoreSource::Warmup))
             };
             if let Err(error) = generation
                 .scope_dials(honk_outbound::urltest::warm_http_probe(
@@ -238,8 +223,12 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 ));
             }
 
-            let feedback =
-                probe_feedback(&group_manager, node.id, http_probe_context(&request, addr));
+            let feedback = group_manager.read().feedback_for_http_probe(
+                node.id,
+                http_probe_context(&request, addr),
+                &check_url,
+                &default_probe_url,
+            );
             let result = generation
                 .scope_dials(honk_outbound::urltest::measure_http_probe(
                     &runtime,
@@ -523,15 +512,18 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                             connect_timeout,
                         ))
                         .await?;
-                    probe_setup(&reporter);
-                    udp_probe_exchange(&transport, &reporter, timeout).await?;
+                    udp_probe_exchange(&transport, timeout).await?;
                     drop(transport);
                     Ok::<(), anyhow::Error>(())
                 };
                 Some(match tokio::time::timeout_at(dns_deadline, attempt).await {
                     Ok(Ok(())) => {
+                        let elapsed = start.elapsed();
+                        if let Some(reporter) = &reporter {
+                            reporter.probe_latency(elapsed);
+                        }
                         probe_finish(&reporter, ScoreOutcome::Success);
-                        Ok(start.elapsed())
+                        Ok(elapsed)
                     }
                     Ok(Err(error)) => {
                         probe_finish(&reporter, ScoreOutcome::from_error(&error));
@@ -582,7 +574,6 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
 /// Send the minimal DNS probe query and await a well-formed answer.
 async fn udp_probe_exchange(
     transport: &Arc<dyn honk_outbound::proxy::PacketTransport>,
-    reporter: &ProbeReporter,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let query = build_dns_probe_query();
@@ -590,14 +581,11 @@ async fn udp_probe_exchange(
         .send_packet(&query)
         .await
         .context("UDP probe send failed")?;
-    probe_tx(reporter, query.len());
     let mut buf = [0u8; 512];
     let (n, _src) = tokio::time::timeout(timeout, transport.recv_packet(&mut buf))
         .await
         .map_err(|_| anyhow::anyhow!("UDP probe recv timeout"))?
         .context("UDP probe recv failed")?;
-    probe_first_response(reporter);
-    probe_rx(reporter, n);
     anyhow::ensure!(
         n >= 12 && buf[0] == query[0] && buf[1] == query[1] && buf[2] & 0x80 != 0,
         "malformed DNS probe response"
@@ -647,7 +635,6 @@ async fn score_quic_probe(
                 connect_timeout,
             ))
             .await?;
-        probe_setup(&reporter);
         honk_outbound::quic::quic_handshake_probe(
             transport,
             target.addr,
@@ -659,13 +646,12 @@ async fn score_quic_probe(
     };
     Some(match tokio::time::timeout(timeout, attempt).await {
         Ok(Ok(_)) => {
-            probe_first_response(&reporter);
-            // The handshake probe exposes no wire counters. Record only the
-            // bidirectional fact so it contributes reliability, not volume.
-            probe_tx(&reporter, 1);
-            probe_rx(&reporter, 1);
+            let elapsed = start.elapsed();
+            if let Some(reporter) = &reporter {
+                reporter.probe_latency(elapsed);
+            }
             probe_finish(&reporter, ScoreOutcome::Success);
-            Ok(start.elapsed())
+            Ok(elapsed)
         }
         Ok(Err(error)) => {
             probe_finish(&reporter, ScoreOutcome::from_error(&error));

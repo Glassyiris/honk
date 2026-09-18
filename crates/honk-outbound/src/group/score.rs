@@ -4,11 +4,14 @@ mod ranking;
 mod selection;
 #[cfg(test)]
 mod tests;
+mod verification;
 
-use evidence::{
-    record_aggregate_finish, record_aggregate_start, record_cell_finish, record_cell_start,
-};
+use evidence::{MetricSnapshot, Performance, PerformanceSnapshot};
 pub use feedback::{ScoreFeedback, ScoreReporter};
+pub use verification::{
+    ScoreComparison, ScoreEvidenceBasis, ScoreEvidenceGaps, ScoreValidationAction,
+    ScoreVerificationCounters, ScoreVerificationSnapshot, ScoreVerificationState,
+};
 
 use super::{
     Candidate, GroupManager, IpVersion, MAX_GROUP_DEPTH, ProbeDomain, ScoreSelectionEntry,
@@ -31,7 +34,6 @@ const RELIABILITY_CLOSE: f64 = 0.05;
 const RELIABILITY_CONFIDENCE_Z: f64 = 1.64;
 const SCORE_EVIDENCE_HALF_LIFE: Duration = Duration::from_secs(30 * 60);
 const MIN_TRAINED_EVIDENCE: f64 = 0.5;
-const SCORE_SWITCH_MARGIN: f64 = 0.01;
 const SCORE_SWITCH_FULL_EVIDENCE: f64 = 8.0;
 const SCORE_SWITCH_FLAP_WINDOW: u64 = 8;
 const SELECTION_HISTORY_CAPACITY: usize = 4096;
@@ -46,6 +48,21 @@ const SCORE_EXPLORE_BACKOFF_MAX: Duration = Duration::from_secs(6 * 3600);
 const SCORE_FAIL_STREAK_EXCLUDE: u32 = 3;
 const MIN_THROUGHPUT_DURATION: Duration = Duration::from_secs(1);
 const MIN_THROUGHPUT_BYTES: u64 = 64 * 1024;
+// Experimental demand-driven bounds, not estimates of link capacity.
+const PERFORMANCE_MAX_AGE: Duration = Duration::from_secs(120);
+const MAX_THROUGHPUT_DURATION: Duration = Duration::from_secs(10);
+const REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
+const PERFORMANCE_VALIDATION_SAMPLES: f64 = 4.0;
+const PERFORMANCE_SWITCH_MARGIN: f64 = 0.1;
+
+/// Separates business outcomes from configured health and preparation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ScoreSource {
+    #[default]
+    Traffic,
+    HealthProbe,
+    Warmup,
+}
 
 /// A normalized business target used only as an in-memory score key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -69,7 +86,7 @@ impl From<SocketAddr> for ScoreTarget {
 
 /// Business-target scoring dimensions plus the independent proxy-health
 /// dimensions used to form the alive candidate set.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ScoreSelectionContext {
     pub network: SelectionNetwork,
     pub probe_domain: ProbeDomain,
@@ -157,6 +174,7 @@ struct AggregateKey {
 struct WeightedMean {
     sum: f64,
     weight: f64,
+    observed_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -167,11 +185,13 @@ struct Stats {
     setup_failure: f64,
     useful_success: f64,
     useful_failure: f64,
-    setup_ms: WeightedMean,
-    first_response_ms: WeightedMean,
-    throughput_bytes: f64,
-    throughput_seconds: f64,
-    throughput_windows: f64,
+    performance: Performance,
+    useful_business: WeightedMean,
+    failed_at: Option<Instant>,
+    warm_setup_ms: WeightedMean,
+    probes: [evidence::ProbeMetric; 6],
+    last_attempt: Option<Instant>,
+    degraded_at: Option<Instant>,
     fail_streak: u32,
     explore_not_before: Option<Instant>,
     updated_at: Option<Instant>,
@@ -204,6 +224,15 @@ impl SelectionCadenceKey {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SelectionCadence {
+    count: u64,
+    revalidated_count: u64,
+    revalidated_at: Instant,
+    validation_node: Option<Uuid>,
+    validation_attempts: u8,
+}
+
 /// Flap history is scoped to the same target the pick was ranked for:
 /// unrelated targets interleaving their own winners is not a flap. The
 /// exploration cadence keeps the coarser [`SelectionCadenceKey`].
@@ -233,6 +262,7 @@ struct SelectionHistory {
     /// Committed non-exploration selections seen by this target scope.
     selections: u64,
     switched_at: u64,
+    verification: Option<verification::VerificationHistory>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,9 +345,10 @@ struct StateInner {
     aggregate: LruCache<AggregateKey, Stats>,
     valid: HashSet<(String, Uuid)>,
     valid_groups: HashSet<String>,
-    selection_counts: HashMap<SelectionCadenceKey, u64>,
+    selection_counts: HashMap<SelectionCadenceKey, SelectionCadence>,
     selection_history: LruCache<SelectionHistoryKey, SelectionHistory>,
     selection_reasons: HashMap<SelectionReasonKey, ScoreReasonCounters>,
+    verification_counters: HashMap<SelectionReasonKey, ScoreVerificationCounters>,
     active_authority: Option<Arc<ScoreAuthority>>,
     tick: u64,
     exact_evictions: u64,
@@ -341,6 +372,7 @@ impl Default for StateInner {
                 NonZeroUsize::new(SELECTION_HISTORY_CAPACITY).expect("non-zero capacity"),
             ),
             selection_reasons: HashMap::new(),
+            verification_counters: HashMap::new(),
             active_authority: None,
             tick: 0,
             exact_evictions: 0,
@@ -410,6 +442,7 @@ impl ScorePolicyState {
         let StateInner {
             selection_counts,
             selection_reasons,
+            verification_counters,
             selection_history,
             valid,
             valid_groups,
@@ -417,16 +450,28 @@ impl ScorePolicyState {
         } = &mut *inner;
         selection_counts.retain(|key, _| valid_groups.contains(&key.group));
         selection_reasons.retain(|key, _| valid_groups.contains(&key.group));
+        verification_counters.retain(|key, _| valid_groups.contains(&key.group));
         let invalid_history: Vec<_> = selection_history
             .iter()
             .filter(|(key, history)| {
                 !valid_groups.contains(&key.group)
-                    || !valid.contains(&(key.group.clone(), history.current))
+                    || (!valid.contains(&(key.group.clone(), history.current))
+                        && history
+                            .verification
+                            .is_none_or(|verification| verification.claims == 0))
             })
             .map(|(key, _)| key.clone())
             .collect();
         for key in invalid_history {
             selection_history.pop(&key);
+        }
+        // Preserve only pending claim revocation until the next authorized Apply;
+        // a removed winner must no longer participate in incumbent/flap protection.
+        for (key, history) in selection_history.iter_mut() {
+            if !valid.contains(&(key.group.clone(), history.current)) {
+                history.selections = 0;
+                history.previous = None;
+            }
         }
         let stale_previous: Vec<_> = selection_history
             .iter()
@@ -459,6 +504,17 @@ impl ScorePolicyState {
             .collect();
         for key in invalid_aggregate {
             inner.aggregate.pop(&key);
+        }
+        // Probe cohorts can change without changing group or leaf identity.
+        // In-flight traffic keeps its cells, but a new generation must remeasure health.
+        for (_, stats) in inner.aggregate.iter_mut() {
+            stats.probes = Default::default();
+        }
+        for (_, stats) in inner.aggregate.iter_mut() {
+            stats.useful_business = WeightedMean::default();
+        }
+        for (_, stats) in inner.exact.iter_mut() {
+            stats.useful_business = WeightedMean::default();
         }
     }
 
@@ -518,10 +574,16 @@ impl ScorePolicyState {
                     previous: None,
                     selections: 1,
                     switched_at: 0,
+                    verification: None,
                 },
             );
             return;
         };
+        if history.selections == 0 {
+            history.current = node_id;
+            history.selections = 1;
+            return;
+        }
         history.selections = history.selections.saturating_add(1);
         if history.current == node_id {
             return;
@@ -582,141 +644,6 @@ impl ScorePolicyState {
             .get(&SelectionReasonKey::new(group, network))
             .copied()
             .unwrap_or_default()
-    }
-
-    #[cfg(test)]
-    fn start(
-        &self,
-        context: &ScoreSelectionContext,
-        attributions: &[ScoreAttribution],
-    ) -> Vec<StartedCells> {
-        self.start_at(context, attributions, Instant::now())
-    }
-
-    #[cfg(test)]
-    fn start_at(
-        &self,
-        context: &ScoreSelectionContext,
-        attributions: &[ScoreAttribution],
-        now: Instant,
-    ) -> Vec<StartedCells> {
-        let authority = self
-            .inner
-            .lock()
-            .active_authority
-            .clone()
-            .unwrap_or_else(|| Arc::new(ScoreAuthority));
-        self.start_at_with_authority(&authority, context, attributions, now)
-    }
-
-    fn start_at_with_authority(
-        &self,
-        authority: &Arc<ScoreAuthority>,
-        context: &ScoreSelectionContext,
-        attributions: &[ScoreAttribution],
-        now: Instant,
-    ) -> Vec<StartedCells> {
-        let mut inner = self.inner.lock();
-        if !inner
-            .active_authority
-            .as_ref()
-            .is_some_and(|active| Arc::ptr_eq(active, authority))
-        {
-            return vec![StartedCells::default(); attributions.len()];
-        }
-        inner.tick = inner.tick.saturating_add(1);
-        let tick = inner.tick;
-        let mut cells = Vec::with_capacity(attributions.len());
-        for attribution in attributions {
-            let mut started = StartedCells::default();
-            if inner
-                .valid
-                .contains(&(attribution.group.clone(), attribution.node_id))
-            {
-                started.aggregate =
-                    record_aggregate_start(&mut inner, attribution, context, now, tick);
-                if let (Some(family), Some(target)) =
-                    (context.target_family, context.target.as_ref())
-                {
-                    let key = ExactKey {
-                        group: attribution.group.clone(),
-                        network: context.network,
-                        family,
-                        target: target.clone(),
-                        node_id: attribution.node_id,
-                    };
-                    let StateInner {
-                        exact,
-                        exact_evictions,
-                        ..
-                    } = &mut *inner;
-                    started.exact = Some(record_cell_start(exact, key, now, tick, exact_evictions));
-                }
-            }
-            cells.push(started);
-        }
-        cells
-    }
-
-    fn finish(
-        &self,
-        context: &ScoreSelectionContext,
-        attributions: &[ScoreAttribution],
-        cells: &[StartedCells],
-        sample: &FlowSample,
-    ) {
-        self.finish_at(context, attributions, cells, sample, Instant::now());
-    }
-
-    fn finish_at(
-        &self,
-        context: &ScoreSelectionContext,
-        attributions: &[ScoreAttribution],
-        cells: &[StartedCells],
-        sample: &FlowSample,
-        now: Instant,
-    ) {
-        let mut inner = self.inner.lock();
-        if !cells
-            .iter()
-            .any(|started| started.exact.is_some() || started.aggregate.iter().any(Option::is_some))
-        {
-            return;
-        }
-        for (index, attribution) in attributions.iter().enumerate() {
-            if !inner
-                .valid
-                .contains(&(attribution.group.clone(), attribution.node_id))
-            {
-                continue;
-            }
-            let started = cells.get(index).copied().unwrap_or_default();
-            record_aggregate_finish(
-                &mut inner,
-                attribution,
-                context,
-                started.aggregate,
-                now,
-                sample,
-            );
-            if let (Some(family), Some(target)) = (context.target_family, context.target.as_ref()) {
-                let key = ExactKey {
-                    group: attribution.group.clone(),
-                    network: context.network,
-                    family,
-                    target: target.clone(),
-                    node_id: attribution.node_id,
-                };
-                record_cell_finish(
-                    &mut inner.exact,
-                    &key,
-                    started.exact,
-                    now,
-                    sample,
-                    sample.count_usefulness,
-                );
-            }
-        }
     }
 
     #[cfg(test)]
@@ -820,7 +747,7 @@ impl ScorePolicyState {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct ScoreSnapshot {
     attempts: f64,
     completed: f64,
@@ -828,32 +755,40 @@ struct ScoreSnapshot {
     reliability: f64,
     reliability_upper: f64,
     useful_completed: f64,
-    latency_ms: Option<f64>,
-    latency_confidence: f64,
-    throughput: Option<f64>,
-    throughput_confidence: f64,
+    performance: PerformanceSnapshot,
+    target_performance: PerformanceSnapshot,
+    probe: MetricSnapshot,
+    warm_setup: MetricSnapshot,
+    probe_scope: u64,
+    observed_reliability: f64,
+    last_attempt: Option<Instant>,
+    degraded_at: Option<Instant>,
     failures: f64,
     explore_backed_off: bool,
     fail_streak: u32,
     selected_at: u64,
-    targeted: bool,
-    target_attempts: f64,
-    target_completed: f64,
+    verification: verification::VerificationEvidence,
 }
 
 #[derive(Clone, Copy)]
 struct PerformanceBaseline {
-    latency_ms: Option<f64>,
-    throughput: Option<f64>,
+    performance: PerformanceSnapshot,
+    target_performance: PerformanceSnapshot,
+    probe: MetricSnapshot,
+    warm_setup: MetricSnapshot,
+    probe_scope: u64,
+    best_reliability: f64,
+    best_observed_reliability: f64,
+    any_healthy: bool,
+    any_qualified: bool,
 }
 
 struct FlowSample {
     outcome: ScoreOutcome,
     setup: Option<Duration>,
-    first_response: Option<Duration>,
+    source: ScoreSource,
     tx: u64,
     rx: u64,
     elapsed: Duration,
     count_usefulness: bool,
-    streak_neutral: bool,
 }

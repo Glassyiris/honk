@@ -1,4 +1,5 @@
 mod http2;
+mod score;
 
 use super::*;
 use crate::proxy::ProxyStream;
@@ -888,15 +889,9 @@ async fn test_urltest_group_does_not_penalize_resolver_rejection() {
 }
 
 #[tokio::test]
-async fn test_urltest_group_marks_failure_with_synthetic_sample() {
-    // Plaintext HTTP server: every https measurement fails the TLS
-    // handshake, so two consecutive failing group runs must append a
-    // synthetic penalty sample for both the dial-failing and the
-    // handshake-failing member (a lone transient failure strikes
-    // nothing).
+async fn urltest_group_failures_do_not_advance_real_dial_streaks() {
     let addr = spawn_mock_http_server().await;
     let url = format!("https://{}:{}/", addr.ip(), addr.port());
-
     let mut registry = ProxyRegistry::new();
     registry.register(crate::proxy::ProtocolEntry::new(
         NodeProtocol::Socks5,
@@ -904,65 +899,40 @@ async fn test_urltest_group_marks_failure_with_synthetic_sample() {
     ));
     let registry = Arc::new(registry);
     let alive_set = Arc::new(AliveDialerSet::new());
-
     let members = vec![make_node("good"), make_node("bad")];
-    for m in &members {
+    for member in &members {
         alive_set.record_probe_latency(
-            m.id,
+            member.id,
             ProbeDomain::Tcp,
             IpVersion::V4,
             Duration::from_millis(999),
         );
     }
-
     let runtime = Arc::new(crate::runtime::OutboundRuntimeRegistry::build(&members).unwrap());
-    let results = urltest_group_impl(
-        &members,
-        &runtime,
-        &registry,
-        &alive_set,
-        &url,
-        Duration::from_secs(5),
-        None,
-    )
-    .await;
-    assert_eq!(results.len(), 2);
-    // Member order preserved.
-    assert_eq!(results[0].0, "good");
-    assert_eq!(results[1].0, "bad");
-    assert!(results[0].1.is_err());
-    assert!(results[1].1.is_err());
-
-    // One failed run leaves no selection state.
-    for m in &members {
-        assert!(!alive_set.is_failure_demoted(m.id, ProbeDomain::Tcp, IpVersion::V4));
+    for _ in 0..3 {
+        let results = urltest_group_impl(
+            &members,
+            &runtime,
+            &registry,
+            &alive_set,
+            &url,
+            Duration::from_secs(5),
+            None,
+        )
+        .await;
+        assert_eq!(results.len(), members.len());
+        assert!(results.iter().all(|(_, result)| result.is_err()));
     }
-
-    let results = urltest_group_impl(
-        &members,
-        &runtime,
-        &registry,
-        &alive_set,
-        &url,
-        Duration::from_secs(5),
-        None,
-    )
-    .await;
-    assert!(results.iter().all(|(_, r)| r.is_err()));
-
-    // The second consecutive failure → synthetic penalty sample on top
-    // of the retained history: the latest sample is the 10s placeholder
-    // (display-only) and a failure strike demotes the node, while the
-    // real 999ms moving average survives unpoisoned.
-    for m in &members {
+    for member in &members {
+        assert!(alive_set.is_alive_for(member.id, ProbeDomain::Tcp, IpVersion::V4));
+        assert!(!alive_set.is_failure_demoted(member.id, ProbeDomain::Tcp, IpVersion::V4));
         assert_eq!(
-            alive_set.get_last_latency(m.id, ProbeDomain::Tcp, IpVersion::V4),
-            Some(Duration::from_secs(10))
+            alive_set.get_last_latency(member.id, ProbeDomain::Tcp, IpVersion::V4),
+            Some(Duration::from_millis(999)),
         );
-        assert!(alive_set.is_failure_demoted(m.id, ProbeDomain::Tcp, IpVersion::V4));
-        assert_eq!(
-            alive_set.get_moving_average(m.id, ProbeDomain::Tcp, IpVersion::V4),
-            Some(Duration::from_millis(999))
-        );
+        alive_set.record_dial_failure(member.id, ProbeDomain::Tcp, IpVersion::V4);
+        assert!(!alive_set.is_failure_demoted(member.id, ProbeDomain::Tcp, IpVersion::V4));
+        alive_set.record_dial_failure(member.id, ProbeDomain::Tcp, IpVersion::V4);
+        assert!(alive_set.is_failure_demoted(member.id, ProbeDomain::Tcp, IpVersion::V4));
     }
 }

@@ -98,6 +98,64 @@ async fn feedback_does_not_start_while_waiting_for_dial_admission() {
 
     assert!(result.is_err());
     assert!(!started.load(std::sync::atomic::Ordering::Acquire));
+
+    let mut alternate = node.clone();
+    alternate.name = "alternate".into();
+    alternate.port += 1;
+    alternate.id = alternate.derive_id();
+    let nodes = [node.clone(), alternate];
+    let group = honk_config::group::Group {
+        name: "score".into(),
+        policy: honk_config::group::GroupPolicy::Score,
+        nodes: nodes.iter().map(|node| node.id).collect(),
+        ..Default::default()
+    };
+    let control = crate::control::tests::support::control_plane(Config {
+        nodes: nodes.to_vec(),
+        groups: vec![group],
+        ..Default::default()
+    });
+    let handle = control.spawn_handle();
+    let manager = handle.group_manager.read().clone();
+    let context = tcp_score_context(target, None, IpVersion::V4);
+    let feedback = manager.feedback_for_node(node.id, context.clone()).unwrap();
+    let feedback = HashMap::from([(node.id, feedback)]);
+    for _ in 0..2 {
+        let result = handle
+            .race_candidates(
+                &[&node],
+                target,
+                None,
+                "score",
+                Duration::from_millis(5),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                Arc::clone(&generation),
+                IpVersion::V4,
+                &feedback,
+                false,
+            )
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("unstarted admission expiry must be terminal, not retryable"),
+        };
+        assert_eq!(
+            honk_outbound::proxy::packet_rejection(&error),
+            Some(honk_outbound::proxy::PacketRejection::Capacity)
+        );
+    }
+    assert!(
+        !handle
+            .alive_set
+            .is_failure_demoted(node.id, ProbeDomain::Tcp, IpVersion::V4)
+    );
+    assert_eq!(
+        manager.selection_plan_for_target("score", &context).entries[0]
+            .node
+            .id,
+        node.id,
+        "unstarted waits must not train failure evidence or explore an alternate"
+    );
 }
 
 #[test]
