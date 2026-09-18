@@ -1020,3 +1020,20 @@ async fn remote_fin_drop_does_not_enqueue_a_second_fin() {
     );
     session.close();
 }
+
+/// Frame bodies come out exact and sized to the frame, and a body the peer
+/// cuts short is an error rather than a padded read.
+#[tokio::test]
+async fn frame_bodies_are_exact_and_reject_short_reads() {
+    let (mut peer, mut reader) = tokio::io::duplex(1 << 16);
+    peer.write_all(b"firstsecond").await.unwrap();
+    let first = read_frame_body(&mut reader, 5).await.unwrap();
+    let second = read_frame_body(&mut reader, 6).await.unwrap();
+    assert_eq!(&first[..], b"first");
+    assert_eq!(&second[..], b"second");
+
+    peer.write_all(b"tail").await.unwrap();
+    drop(peer);
+    let short = read_frame_body(&mut reader, 8).await.unwrap_err();
+    assert_eq!(short.kind(), std::io::ErrorKind::UnexpectedEof);
+}

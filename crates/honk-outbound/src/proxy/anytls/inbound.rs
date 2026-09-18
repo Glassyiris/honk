@@ -4,6 +4,7 @@ use std::future::Future;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 
+use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
 use tokio::time::Instant;
@@ -252,7 +253,7 @@ impl TcpReceiveState {
 }
 
 pub(super) struct InboundPayload {
-    data: Vec<u8>,
+    data: Bytes,
     credit: Option<OwnedSemaphorePermit>,
     retention: Option<Arc<TcpInbound>>,
 }
@@ -266,7 +267,7 @@ impl std::fmt::Debug for InboundPayload {
 }
 
 impl InboundPayload {
-    pub(super) fn new(data: Vec<u8>, credit: OwnedSemaphorePermit) -> Self {
+    pub(super) fn new(data: Bytes, credit: OwnedSemaphorePermit) -> Self {
         debug_assert_eq!(data.len(), credit.num_permits());
         Self {
             data,
@@ -276,7 +277,7 @@ impl InboundPayload {
     }
 
     pub(super) fn for_tcp(
-        data: Vec<u8>,
+        data: Bytes,
         credit: OwnedSemaphorePermit,
         retention: Arc<TcpInbound>,
     ) -> Self {
@@ -294,7 +295,7 @@ impl InboundPayload {
         let credit = permits
             .try_acquire_many_owned(data.len() as u32)
             .expect("test payload budget");
-        Self::new(data, credit)
+        Self::new(Bytes::from(data), credit)
     }
 
     pub(super) fn note_progress(&self) {
@@ -310,7 +311,7 @@ impl InboundPayload {
             .clone()
     }
 
-    pub(super) fn into_parts(mut self) -> (Vec<u8>, OwnedSemaphorePermit) {
+    pub(super) fn into_parts(mut self) -> (Bytes, OwnedSemaphorePermit) {
         debug_assert!(self.retention.is_none());
         let data = std::mem::take(&mut self.data);
         let credit = self.credit.take().expect("inbound payload owns credit");
@@ -337,7 +338,7 @@ impl std::ops::Deref for InboundPayload {
 #[cfg(test)]
 impl PartialEq<Vec<u8>> for InboundPayload {
     fn eq(&self, other: &Vec<u8>) -> bool {
-        self.data.as_slice() == other.as_slice()
+        self.data.as_ref() == other.as_slice()
     }
 }
 async fn complete_frame_body<T>(
@@ -527,7 +528,7 @@ pub(super) async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedRe
                 fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
                 break;
             }
-            Vec::new()
+            Bytes::new()
         };
 
         session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
