@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use honk_config::Config;
-use honk_config::diagnostic::{DetailedDiagnostic, SettingPath, SourceRef, finish_attempt};
+use honk_config::diagnostic::{
+    DetailedDiagnostic, SafeValue, SettingPath, SourceRef, finish_attempt,
+};
 use honk_config::error::{DetailedConfigError, ErrorCategory};
 use honk_config::parser::{LoadedConfig, SourceLimits, SourceSnapshot};
 
@@ -112,17 +114,40 @@ fn validate_inner(
     config.ensure_builtin_nodes();
 
     if config.subscriptions.iter().any(|sub| sub.enabled) {
-        let store = SubscriptionStore::open_readonly(&capture.data_dir)
-            .map_err(|cause| dependency_error(source, "subscription", cause))?;
+        // No store yet means no subscription has ever been fetched on this host.
+        let store = match SubscriptionStore::open_readonly(&capture.data_dir) {
+            Ok(store) => Some(store),
+            Err(cause) if cause.kind() == io::ErrorKind::NotFound => None,
+            Err(cause) => return Err(dependency_error(source, "subscription", cause)),
+        };
         for (index, subscription) in config
             .subscriptions
             .iter()
             .enumerate()
             .filter(|(_, sub)| sub.enabled)
         {
-            let contents = store
-                .open_cached(subscription)
-                .and_then(|file| capture.file(file, true))
+            let cached = match store.as_ref().map(|store| store.open_cached(subscription)) {
+                Some(Ok(file)) => Some(file),
+                Some(Err(cause)) if cause.kind() != io::ErrorKind::NotFound => {
+                    return Err(dependency_error(source, "subscription", cause));
+                }
+                _ => None,
+            };
+            // The runtime starts a never-fetched subscription with no nodes and
+            // fills it in after the first fetch; offline admission mirrors that
+            // instead of refusing the configuration that would add it.
+            let Some(cached) = cached else {
+                diagnostics.push(DetailedDiagnostic::warning(
+                    "subscription-not-fetched",
+                    source.clone(),
+                    SettingPath::new("subscription").index(index + 1),
+                    SafeValue::Redacted,
+                    "subscription has not been fetched yet; its nodes join after the first fetch",
+                ));
+                continue;
+            };
+            let contents = capture
+                .file(cached, true)
                 .map_err(|cause| dependency_error(source, "subscription", cause))?;
             let contents = std::str::from_utf8(&contents).map_err(|_| {
                 error(

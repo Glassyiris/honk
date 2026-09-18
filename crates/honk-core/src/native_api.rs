@@ -441,6 +441,8 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
             state: "active",
             activated_at: None,
         },
+        // The control plane's own health flag is the engine's verdict on its
+        // datapath; only the kernel detail (attachments, maps) is out of view.
         datapath: DatapathSummary {
             kind: if state.mock_mode { "mock" } else { "ebpf" },
             state: if state.mock_mode {
@@ -448,7 +450,7 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
             } else if !healthy {
                 "degraded"
             } else {
-                "unknown"
+                "active"
             },
             visibility: "none",
             ebpf: (),
