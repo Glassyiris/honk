@@ -30,6 +30,9 @@ use super::{
 const MAX_RECORDS: usize = 1024;
 const MAX_STEPS: usize = 64;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Listings keep this much of the budget for their snapshots, so a ring that
+/// has grown to its own limit still leaves room to page through it.
+const SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SNAPSHOTS: usize = 8;
 const TERMINAL_TTL: Duration = Duration::from_secs(300);
 const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
@@ -125,6 +128,9 @@ impl Store {
         }
     }
 
+    /// Everything the owner holds; the records' own share is bounded in
+    /// `enforce_limit`, the listings' in `page`.
+    #[cfg(test)]
     fn bytes(&self) -> usize {
         OWNER_BYTES + self.record_bytes + self.snapshot_bytes
     }
@@ -332,7 +338,9 @@ impl FlowStore {
     }
 
     fn enforce_limit(&self, store: &mut Store, now: Instant) {
-        while store.records.len() > store.max_records || store.bytes() > MAX_BYTES {
+        while store.records.len() > store.max_records
+            || OWNER_BYTES + store.record_bytes > MAX_BYTES - SNAPSHOT_BYTES
+        {
             if store.records.is_empty() {
                 break;
             }
@@ -394,20 +402,9 @@ impl FlowStore {
             .iter()
             .filter(|record| filters.matches(record))
             .count();
-        // A full snapshot table drops its oldest entry rather than refusing the
-        // page: a reader still on that cursor gets `snapshot_expired` and starts
-        // over, which is the same outcome the ttl gives it thirty seconds later.
-        if count > filters.limit && store.snapshots.len() == MAX_SNAPSHOTS {
-            let oldest = store
-                .snapshots
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, snapshot)| snapshot.created)
-                .map(|(index, _)| index)
-                .expect("a full snapshot table has an oldest entry");
-            let stale = store.snapshots.remove(oldest);
-            store.snapshot_bytes -= stale.bytes;
-        }
+        // Only a walk that continues past this page keeps a snapshot; a result
+        // that fits in one page is answered from the records and costs no budget.
+        let retained = count > filters.limit;
         let mut snapshot = Snapshot {
             token: Uuid::new_v4().to_string(),
             filters,
@@ -425,13 +422,32 @@ impl FlowStore {
         {
             let row = record.project(snapshot.filters.full, false);
             snapshot.bytes += value_heap_bytes(&row);
-            if store.bytes() + snapshot.bytes > MAX_BYTES {
+            if retained && snapshot.bytes > SNAPSHOT_BYTES {
                 return Err(snapshot_busy(id));
             }
             snapshot.rows.push(row);
         }
+        if retained {
+            // Older snapshots make room before a new walk is refused: a reader
+            // still on one of those cursors gets `snapshot_expired` and starts
+            // over, which the ttl would have given it thirty seconds later.
+            while !store.snapshots.is_empty()
+                && (store.snapshots.len() == MAX_SNAPSHOTS
+                    || store.snapshot_bytes + snapshot.bytes > SNAPSHOT_BYTES)
+            {
+                let oldest = store
+                    .snapshots
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, snapshot)| snapshot.created)
+                    .map(|(index, _)| index)
+                    .expect("a non-empty snapshot table has an oldest entry");
+                let stale = store.snapshots.remove(oldest);
+                store.snapshot_bytes -= stale.bytes;
+            }
+        }
         let page = self.snapshot_page(&snapshot, 0, store.recording);
-        if count > snapshot.filters.limit {
+        if retained {
             store.snapshot_bytes += snapshot.bytes;
             store.snapshots.push(snapshot);
         }

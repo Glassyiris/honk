@@ -463,13 +463,24 @@ fn recorder_and_snapshots_share_the_byte_budget_and_tombstones_are_bounded() {
             .all(|record| record.id() != original_id)
     );
     drop(inner);
-    let query = filters("all", "all", true, 1);
-    match store.page(query, None, &request_id()) {
-        Ok(_) => assert!(store.inner.lock().bytes() <= MAX_BYTES),
-        Err(error) => error_code(
-            error,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "temporarily_unavailable",
-        ),
-    }
+    // The ring at its own limit still leaves the listing its reserved share:
+    // a walk over every record starts, and the whole store stays in budget.
+    let page = store
+        .page(filters("all", "all", true, 1), None, &request_id())
+        .unwrap();
+    assert!(page["next_cursor"].is_string());
+    let inner = store.inner.lock();
+    assert!(inner.snapshot_bytes > 0);
+    assert!(inner.bytes() <= MAX_BYTES);
+    drop(inner);
+    // A result that fits in one page keeps nothing.
+    let before = store.inner.lock().snapshot_bytes;
+    store
+        .page(
+            filters("all", "all", true, MAX_RECORDS),
+            None,
+            &request_id(),
+        )
+        .unwrap();
+    assert_eq!(store.inner.lock().snapshot_bytes, before);
 }
