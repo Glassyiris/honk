@@ -1,7 +1,7 @@
 //! One projection of backend-owned observations for runtime and datapath reads.
 
 use super::{
-    NativeState, parse_query, timestamp,
+    NativeState, full_detail, parse_query, timestamp,
     types::{ApiError, DatapathSummary, RequestId},
 };
 use crate::ebpf::{DatapathCheck, DatapathKind, DatapathObservation, DatapathObservationError};
@@ -42,12 +42,16 @@ struct Datapath {
     errors: Vec<SafeError>,
 }
 
+/// The kernel detail is optional in the contract: `detail=summary` (the
+/// default) answers without attachments and maps.
 #[derive(Serialize)]
 struct EbpfDetail {
     #[serde(flatten)]
     summary: EbpfSummary,
-    attachments: Vec<Attachment>,
-    maps: Maps,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attachments: Option<Vec<Attachment>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    maps: Option<Maps>,
 }
 
 #[derive(Serialize)]
@@ -204,7 +208,7 @@ pub(super) fn summary(
     }
 }
 
-fn detail(observation: DatapathObservation, instance: &str, healthy: bool) -> Datapath {
+fn detail(observation: DatapathObservation, instance: &str, healthy: bool, full: bool) -> Datapath {
     let summary = summary(&observation, instance, healthy);
     Datapath {
         observed_at: timestamp(SystemTime::now()),
@@ -213,26 +217,28 @@ fn detail(observation: DatapathObservation, instance: &str, healthy: bool) -> Da
         visibility: summary.visibility,
         ebpf: summary.ebpf.map(|summary| EbpfDetail {
             summary,
-            attachments: observation
-                .attachments
-                .into_iter()
-                .map(|attachment| Attachment {
-                    name: attachment.program,
-                    interface: attachment.interface,
-                    direction: if attachment.egress {
-                        "egress"
-                    } else {
-                        "ingress"
-                    },
-                    state: match attachment.state {
-                        DatapathCheck::Verified => "attached",
-                        DatapathCheck::Absent => "detached",
-                        DatapathCheck::Error => "error",
-                        DatapathCheck::Unknown => "unknown",
-                    },
-                })
-                .collect(),
-            maps: Maps {
+            attachments: full.then(|| {
+                observation
+                    .attachments
+                    .into_iter()
+                    .map(|attachment| Attachment {
+                        name: attachment.program,
+                        interface: attachment.interface,
+                        direction: if attachment.egress {
+                            "egress"
+                        } else {
+                            "ingress"
+                        },
+                        state: match attachment.state {
+                            DatapathCheck::Verified => "attached",
+                            DatapathCheck::Absent => "detached",
+                            DatapathCheck::Error => "error",
+                            DatapathCheck::Unknown => "unknown",
+                        },
+                    })
+                    .collect()
+            }),
+            maps: full.then(|| Maps {
                 state: if observation.errors.contains(&DatapathObservationError::Maps) {
                     "error"
                 } else if observation.conn_state_capacity.is_some() {
@@ -247,7 +253,7 @@ fn detail(observation: DatapathObservation, instance: &str, healthy: bool) -> Da
                         capacity,
                         occupancy_known: false,
                     }),
-            },
+            }),
         }),
         errors: observation.errors.into_iter().map(safe_error).collect(),
     }
@@ -258,7 +264,7 @@ pub(super) async fn get(
     uri: &Uri,
     id: &RequestId,
 ) -> Result<Response, ApiError> {
-    parse_query(uri, &[], id)?;
+    let full = full_detail(&parse_query(uri, &["detail"], id)?, id)?;
     let (observation, healthy) = {
         let _config = state.config.read().await;
         let backend = state.backend.read().await;
@@ -267,7 +273,7 @@ pub(super) async fn get(
             state.healthy.load(Ordering::Acquire),
         )
     };
-    Ok(Json(detail(observation, &state.instance_id, healthy)).into_response())
+    Ok(Json(detail(observation, &state.instance_id, healthy, full)).into_response())
 }
 
 pub(super) fn capability() -> Value {
@@ -288,7 +294,7 @@ mod tests {
         let observation = backend.observe_datapath();
         assert!(observation.checked_at >= before);
         assert!(observation.checked_at <= SystemTime::now());
-        let body = serde_json::to_value(detail(observation, "instance", true)).unwrap();
+        let body = serde_json::to_value(detail(observation, "instance", true, true)).unwrap();
         assert_eq!(body["kind"], "mock");
         assert_eq!(body["state"], "disabled");
         assert_eq!(body["visibility"], "none");
@@ -308,8 +314,18 @@ mod tests {
         observation.conn_state_capacity = Some(524_288);
         let mut backend = MockEbpfBackend::new();
         backend.datapath_observation_fixture = Some(observation);
-        let body =
-            serde_json::to_value(detail(backend.observe_datapath(), "instance", true)).unwrap();
+        // The default projection stops at the summary; the kernel detail is asked for.
+        let brief =
+            serde_json::to_value(detail(backend.observe_datapath(), "instance", true, false))
+                .unwrap();
+        assert_eq!(
+            brief["ebpf"]["routing"]["generation_id"],
+            "instance:datapath:91"
+        );
+        assert!(brief["ebpf"].get("attachments").is_none());
+        assert!(brief["ebpf"].get("maps").is_none());
+        let body = serde_json::to_value(detail(backend.observe_datapath(), "instance", true, true))
+            .unwrap();
         assert_eq!(body["state"], "unknown");
         assert_eq!(body["ebpf"]["checked_at"], "1970-01-01T00:00:00.000Z");
         assert_eq!(
@@ -344,7 +360,7 @@ mod tests {
         }
         assert_eq!(observation.errors.len(), 2);
         observation.routing = DatapathCheck::Error;
-        let body = serde_json::to_value(detail(observation, "instance", true)).unwrap();
+        let body = serde_json::to_value(detail(observation, "instance", true, true)).unwrap();
         assert_eq!(body["state"], "degraded");
         assert!(body["ebpf"]["routing"]["generation_id"].is_null());
         assert_eq!(body["errors"][0]["code"], "routing_observation_failed");
