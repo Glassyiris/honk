@@ -212,6 +212,17 @@ impl EventHub {
         }
     }
 
+    /// Test seam: the kinds of the buffered notifications, oldest first.
+    #[cfg(test)]
+    pub(crate) fn buffered_kinds(&self) -> Vec<&'static str> {
+        let state = self.state.lock();
+        state
+            .records
+            .iter()
+            .map(|record| KINDS[record.kind])
+            .collect()
+    }
+
     pub(crate) fn shutdown(&self) {
         let mut state = self.state.lock();
         state.stopped = true;

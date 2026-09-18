@@ -167,15 +167,29 @@ fn snapshot_capacity_is_explicit_and_recording_disable_releases_every_owner() {
     let _second = begin(&store, "tcp");
     let query = filters("all", "all", true, 1);
     let mut cursor = String::new();
-    for _ in 0..MAX_SNAPSHOTS {
+    let mut oldest = String::new();
+    for round in 0..MAX_SNAPSHOTS {
         let page = store.page(query.clone(), None, &request_id()).unwrap();
         cursor = page["next_cursor"].as_str().unwrap().to_owned();
+        if round == 0 {
+            oldest = cursor.clone();
+        }
     }
+    // A full table makes room by dropping its oldest snapshot; only that
+    // reader starts over, the newest cursors stay valid.
+    let page = store.page(query.clone(), None, &request_id()).unwrap();
+    assert!(page["next_cursor"].is_string());
+    assert_eq!(store.inner.lock().snapshots.len(), MAX_SNAPSHOTS);
     error_code(
-        store.page(query.clone(), None, &request_id()).unwrap_err(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "temporarily_unavailable",
+        store
+            .page(query.clone(), Some(&oldest), &request_id())
+            .unwrap_err(),
+        StatusCode::GONE,
+        "snapshot_expired",
     );
+    store
+        .page(query.clone(), Some(&cursor), &request_id())
+        .unwrap();
     store.set_recording(false);
     let inert = begin(&store, "tcp");
     assert!(inert.id().is_empty());
@@ -201,6 +215,63 @@ fn snapshot_capacity_is_explicit_and_recording_disable_releases_every_owner() {
     let restarted = begin(&store, "tcp");
     assert_ne!(restarted.id(), first.id());
     assert!(!restarted.id().is_empty());
+}
+
+#[test]
+fn aged_out_records_report_one_gap_per_interval_with_the_running_count() {
+    let store = store();
+    let gaps = || {
+        store
+            .events
+            .buffered_kinds()
+            .into_iter()
+            .filter(|kind| *kind == "flow.gap")
+            .count()
+    };
+    for _ in 0..5 {
+        begin(&store, "tcp").finish("closed", "relay_finished");
+    }
+    assert_eq!(gaps(), 0);
+    let later = Instant::now() + TERMINAL_TTL;
+    store.prune(&mut store.inner.lock(), later);
+    assert_eq!(gaps(), 1);
+    let inner = store.inner.lock();
+    assert_eq!(inner.dropped, 5);
+    assert!(inner.records.is_empty());
+    drop(inner);
+    // Within the interval a further eviction only advances the count; after
+    // it the next eviction is reported again.
+    begin(&store, "tcp").finish("closed", "relay_finished");
+    store.prune(&mut store.inner.lock(), later + Duration::from_secs(1));
+    assert_eq!((gaps(), store.inner.lock().dropped), (1, 6));
+    begin(&store, "tcp").finish("closed", "relay_finished");
+    store.prune(&mut store.inner.lock(), later + EVICTED_GAP_INTERVAL);
+    assert_eq!((gaps(), store.inner.lock().dropped), (2, 7));
+}
+
+#[test]
+fn room_making_overflow_is_reported_per_interval_but_lost_history_per_record() {
+    let store = store();
+    let gaps = || {
+        store
+            .events
+            .buffered_kinds()
+            .into_iter()
+            .filter(|kind| *kind == "flow.gap")
+            .count()
+    };
+    // The byte budget fills before the record cap; keep going until twenty
+    // records had to make room for newer ones.
+    while store.inner.lock().dropped < 20 {
+        begin(&store, "tcp").finish("closed", "relay_finished");
+    }
+    assert_eq!(gaps(), 1);
+    // A record that overflowed its own step budget is still named on its own.
+    let flow = begin(&store, "tcp");
+    for _ in 0..MAX_STEPS + 1 {
+        flow.step("dial_mode", Some(1), dial_mode());
+    }
+    assert_eq!(gaps(), 2);
 }
 
 #[test]
