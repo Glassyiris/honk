@@ -820,6 +820,9 @@ async fn send_one(
             }
             endpoint.refresh();
             endpoint.tracker_upload(packet.data.len() as u64);
+            if let Some(reporter) = &endpoint.score_reporter {
+                reporter.tx(packet.data.len() as u64);
+            }
             outbound_tracker.add_bytes(packet.data.len() as u64, 0);
             Ok(())
         }
@@ -934,7 +937,7 @@ async fn receive_loop(
             stats.record_udp_first_reply_latency(elapsed);
         }
         endpoint.tracker_download(n as u64);
-        endpoint.score_first_response();
+        endpoint.score_reply(n as u64);
         outbound_tracker.add_bytes(0, n as u64);
         if endpoint.take_alive_report_slot() {
             alive_set.report_available_traffic(

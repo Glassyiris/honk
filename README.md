@@ -16,7 +16,7 @@ It is **not** a line-for-line port of either project. The packet path retains da
 
 License: **GPL-3.0-only**.
 
-The always-compiled, reliability-first Score group policy is selected explicitly with `policy: score`; omitted policy still defaults to Selector. Score learns only in process memory from actual traffic plus DNS, real QUIC handshakes, probes, delay tests, warm-up, and direct or proxied UI downloads. Authenticated `GET /stats` exports only safe aggregate selection-reason counters by group; scorer cells, target keys, and other private scorer data are never logged, persisted, or exported. See the [group reference](doc/en/reference/groups.md#score-policy).
+The always-compiled Score policy is selected explicitly with `policy: score`; omitted policy remains Selector. It separates observed business reliability, fresh configured-probe quality and target performance, using bounded validation rather than rewarding historical sample volume. Live observations need not wait for connection termination. Score TCP setup can try one different permitted leaf under the same deadline, without replaying application data. Scorer cells and target keys remain private process memory; aggregate API verification distinguishes provisional choices, observed usability and scope-limited comparisons, never guaranteed optimality. See the [group reference](doc/en/reference/groups.md#score-policy).
 
 ## Experimental held-first-packet UDP decisions
 

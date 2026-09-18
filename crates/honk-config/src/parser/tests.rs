@@ -2814,3 +2814,66 @@ fn test_filter_ordinal_skips_subgroup_declarations() {
     assert!(config.groups[0].nodes.is_empty());
     assert_eq!(config.groups[0].groups, ["hk"]);
 }
+
+/// The injected `direct`/`block` are outbounds, not pool members: an
+/// unfiltered group, a regex and a keyword skip them; only a filter that
+/// spells the name admits one, and a negated name never does.
+#[test]
+fn test_group_filters_skip_injected_builtins_unless_named() {
+    let input = r#"
+node {
+    a: 'juicity://00000000-0000-0000-0000-000000000001:p@1.1.1.1:443'
+    b: 'juicity://00000000-0000-0000-0000-000000000001:p@2.2.2.2:443'
+}
+group {
+    all { policy: min_moving_avg }
+    re {
+        filter: name(regex: '.')
+        policy: min_moving_avg
+    }
+    kw {
+        filter: name(keyword: 'ir')
+        policy: select
+    }
+    named {
+        filter: name('direct', 'a')
+        policy: select
+    }
+    negated {
+        filter: !name('a')
+        policy: select
+    }
+    tag {
+        filter: subtag(regex: '.*')
+        policy: select
+    }
+}
+"#;
+    let mut config = parse_dae_config(input).unwrap();
+    config.ensure_builtin_nodes();
+    crate::parser::resolve_group_filters(&mut config.groups, &config.nodes, &config.subscriptions);
+    let names = |tag: &str| {
+        let group = config.groups.iter().find(|g| g.name == tag).unwrap();
+        let mut names: Vec<&str> = group
+            .nodes
+            .iter()
+            .map(|id| {
+                config
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == *id)
+                    .unwrap()
+                    .name
+                    .as_str()
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(names("all"), vec!["a", "b"]);
+    assert_eq!(names("re"), vec!["a", "b"]);
+    assert!(names("kw").is_empty(), "keyword must not reach `direct`");
+    assert_eq!(names("named"), vec!["a", "direct"]);
+    assert_eq!(names("negated"), vec!["b"]);
+    assert!(names("tag").is_empty());
+}

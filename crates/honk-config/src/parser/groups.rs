@@ -319,9 +319,13 @@ pub(super) fn resolve_group_filters_inner(
             }
         }
 
+        // The injected `direct` and `block` are outbounds, not part of the
+        // node pool a group draws from: an unfiltered group and every
+        // pattern skip them, and only a filter line that spells the name
+        // literally (`name(direct)`) admits one.
         if !has_node_filter {
             if group.groups.is_empty() {
-                for node in nodes {
+                for node in nodes.iter().filter(|node| !is_builtin(node)) {
                     if !group.nodes.contains(&node.id) {
                         group.nodes.push(node.id);
                     }
@@ -332,16 +336,24 @@ pub(super) fn resolve_group_filters_inner(
         group.nodes.clear();
 
         for node in nodes {
-            if parsed_filters.iter().any(|filter| {
-                filter
-                    .iter()
-                    .all(|term| term.matches(node, &subscription_tags))
-            }) && !group.nodes.contains(&node.id)
-            {
+            let admitted = parsed_filters.iter().any(|filter| {
+                (!is_builtin(node) || filter.iter().any(|term| term.names_literally(&node.name)))
+                    && filter
+                        .iter()
+                        .all(|term| term.matches(node, &subscription_tags))
+            });
+            if admitted && !group.nodes.contains(&node.id) {
                 group.nodes.push(node.id);
             }
         }
     }
+}
+
+fn is_builtin(node: &Node) -> bool {
+    matches!(
+        node.outbound,
+        crate::node::OutboundConfig::Direct | crate::node::OutboundConfig::Block
+    )
 }
 
 struct GroupFilterTerm {
@@ -350,14 +362,25 @@ struct GroupFilterTerm {
 }
 
 enum GroupFilterMatcher {
-    Name(Regex),
+    /// The compiled pattern and the names the filter spelled out exactly.
+    Name(Regex, Vec<String>),
     SubscriptionTag(Regex),
 }
 
 impl GroupFilterTerm {
+    /// A positive `name(...)` term that lists `name` as an exact argument.
+    fn names_literally(&self, name: &str) -> bool {
+        match &self.matcher {
+            GroupFilterMatcher::Name(_, exact) => {
+                !self.negated && exact.iter().any(|literal| literal == name)
+            }
+            GroupFilterMatcher::SubscriptionTag(_) => false,
+        }
+    }
+
     fn matches(&self, node: &Node, subscription_tags: &HashMap<uuid::Uuid, Vec<&str>>) -> bool {
         let matched = match &self.matcher {
-            GroupFilterMatcher::Name(pattern) => pattern.is_match(&node.name),
+            GroupFilterMatcher::Name(pattern, _) => pattern.is_match(&node.name),
             GroupFilterMatcher::SubscriptionTag(pattern) => node
                 .subscription_id
                 .and_then(|id| subscription_tags.get(&id))
@@ -424,9 +447,10 @@ fn parse_group_filter_expression(text: Text<'_, '_>) -> Option<Vec<GroupFilterTe
             (false, raw_term)
         };
         let matcher = if predicate.raw().starts_with("name(") {
-            GroupFilterMatcher::Name(parse_text_filter(predicate, "name")?)
+            let (pattern, exact) = parse_text_filter(predicate, "name")?;
+            GroupFilterMatcher::Name(pattern, exact)
         } else if predicate.raw().starts_with("subtag(") {
-            GroupFilterMatcher::SubscriptionTag(parse_text_filter(predicate, "subtag")?)
+            GroupFilterMatcher::SubscriptionTag(parse_text_filter(predicate, "subtag")?.0)
         } else {
             return None;
         };
@@ -435,7 +459,9 @@ fn parse_group_filter_expression(text: Text<'_, '_>) -> Option<Vec<GroupFilterTe
     (!terms.is_empty()).then_some(terms)
 }
 
-fn parse_text_filter(text: Text<'_, '_>, function: &str) -> Option<Regex> {
+/// The compiled alternation and, separately, the arguments given as exact
+/// names (neither `keyword:` nor `regex:`).
+fn parse_text_filter(text: Text<'_, '_>, function: &str) -> Option<(Regex, Vec<String>)> {
     let text = text.trim();
     let raw = text.raw();
     let body = raw.strip_prefix(function)?;
@@ -445,6 +471,7 @@ fn parse_text_filter(text: Text<'_, '_>, function: &str) -> Option<Regex> {
     // Parentheses inside a regex remain pattern data, including escaped literals.
     let args = text.sub(function.len() + 1, raw.len() - 1);
     let mut patterns = Vec::new();
+    let mut exact = Vec::new();
     for argument in args.split(",") {
         let argument = argument.trim();
         let raw = argument.raw();
@@ -473,6 +500,7 @@ fn parse_text_filter(text: Text<'_, '_>, function: &str) -> Option<Regex> {
             if value.is_empty() {
                 continue;
             }
+            exact.push(value.to_string());
             format!("^(?:{})$", regex::escape(value))
         };
         patterns.push(pattern);
@@ -480,5 +508,5 @@ fn parse_text_filter(text: Text<'_, '_>, function: &str) -> Option<Regex> {
     if patterns.is_empty() {
         return None;
     }
-    Regex::new(&patterns.join("|")).ok()
+    Some((Regex::new(&patterns.join("|")).ok()?, exact))
 }

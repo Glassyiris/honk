@@ -818,6 +818,7 @@ pub(super) async fn validate(
             return Err(invalid());
         }
         if let Some(path) = &source.path
+            && path != REDACTED_PATH
             && (path.is_empty() || !paths.insert(path))
         {
             return Err(invalid());

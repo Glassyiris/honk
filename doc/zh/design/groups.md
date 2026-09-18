@@ -35,7 +35,7 @@ facade 与内部实现按职责拆分：
 | URLTest | 选择最小减半递推移动平均，分别保存 TCP 与 UDP 选择，应用 tolerance 滞后，并在拨号和选择查询时惰性重算。真实选择变化可以调用 `InterruptCallback`。 |
 | LoadBalance | 按声明顺序轮询合格成员。每个组分别为 TCP 和 UDP 持有独立 `AtomicUsize` 游标。轮转从不调用 `InterruptCallback`。 |
 | Fallback | 分别为 TCP 和 UDP 固定声明顺序中的第一个合格成员。该成员死亡前保持固定；更靠前的成员恢复不会触发 failback。 |
-| Score | 以 `policy: score` 显式选择后，通过自动的 target-aware 可靠性优先评分和有界的确定性冷启动探索，选择一个权威存活成员。评分器始终编译；省略策略仍默认使用 Selector。 |
+| Score | 以 `policy: score` 显式选择后，根据实际可靠性、新鲜目标质量和有界验证选择一个健康合格叶节点；历史样本数量不是性能加分。省略策略仍默认 Selector。 |
 
 组中断根据连接建立时捕获的胜出组身份/路径和网络选择精确 TCP/UDP owner，不从今天的组成员或叶名称重建匹配；不依赖 flow recorder 是否启用。显式选择在发布前捕获旧集合，回调在同步 guard 外运行，再等待发生变化网络的关闭确认；相同选择不重拨。TCP 绑定 UUID/cancel/completion，UDP 绑定 token/generation/source view 并确认 backend 与 driver 退役；共享 XUDP 不杀其他 view 的 carrier，也不重放数据。选择已发布但关闭确认失败可返回错误，不声称回滚。
 
@@ -47,23 +47,37 @@ Score 首先运行与其他策略相同的存活性过滤。过滤所用的 heal
 
 精确键为 `(group, TCP/UDP, target IPv4/IPv6, normalized target, NodeId)`。domain 会转为 ASCII 小写、去掉一个末尾点并保留端口；IP 目标保留 socket address。第二个有界的 `(group, TCP/UDP, optional target family, NodeId)` 聚合层为冷目标提供先验，并接收无目标预热样本。精确目标、target-family 和全局聚合层按衰减后的有效证据分层混合：精确证据增多时逐渐覆盖聚合证据，老化后又逐渐让出权重。递归选择携带同一 target context，并把叶节点结果归因到路径上的每个 Score 组。
 
-每次评分操作只读取一次单调时钟。cell 中的 attempt、setup、useful outcome、setup/首响应加权和与权重，以及吞吐字节、时长和窗口数，全部按固定 30 分钟半衰期应用指数衰减：`factor(dt) = 2^(-dt / 30 min)`。setup 与首响应延迟为衰减后的 `sum / weight`，新样本权重为 1；排名还会按有效权重降低稀疏或陈旧延迟的影响。衰减应用于开始、完成和排名快照，因此失败、成功、探索次数与各项指标会按相同时间尺度老化。该半衰期没有配置项。
+业务 attempt 与终态证据使用 30 分钟半衰期，setup 失败在 Beta 置信界中承担更强惩罚。正常性能候选需要四个有效 useful 完成、相容的可靠性置信界和接近的实际失败风险；稀疏候选通过有界试用获得验证。合格后的 utility 使用实际可靠性，不再奖励样本最多者的下置信界。普通排名、性能基准、现任资格和胜出原因共用候选资格，重叠的全局、地址族和精确目标完成证据不作为独立样本相加。
 
-可靠性使用带 Beta 先验的下置信估计，setup 失败受到最强惩罚。只有终态成功且双向流量均非零才算 useful success。吞吐量还要求交换持续至少 1 秒，且 `max(tx, rx)` 至少为 64 KiB；不满足条件的成功仍更新可靠性和延迟，但不更新吞吐。合格窗口只累加主导方向字节、实际秒数和一个窗口，以主导方向 `bytes / second` 表示速率，再相对当前组内最高速率归一，并以衰减窗口数限制置信度；这既不双计请求与响应，也不让短小快速交换影响选择。门槛和吞吐权重均为固定实现常量。
+性能使用独立事件时间和四次观测封顶的惯性；各指标在 60 秒后降低置信度、120 秒时过期，不受历史完成数影响。配置探测 RTT 提供基线，新鲜且可比的目标响应和分方向 goodput 可以覆盖基线。探测 RTT、setup 与首响应分别在自己的测量范围内归一，不把不同含义的毫秒值混池。HTTP 探测身份包含规范化 URI 与方法，探测 domain 和健康地址族也分别隔离。
 
-只有物理拨号、逻辑 stream、transport preparation 或 exchange 真正启动时才调用 `ScoreFeedback::start()` 并创建 `ScoreReporter`。可 clone reporter 记录 setup、首响应、发送/接收字节，并且只接受 success、timeout、`io::ErrorKind`、cancellation、shutdown 或 other 中的一个终态；第一个终态调用生效，最后一个未完成 handle 被 drop 时报告 cancellation。cancellation 与 shutdown 会撤销本次 attempt 而不增加终态证据。retry 会启动新的 reporter，未实际启动的 speculative work 没有 reporter。instrumentation 始终编译但按需运行：非 Score 计划不会创建 reporter 或评分 cell。
+实际工作开始时才创建可 clone 的 `ScoreReporter`。setup 与首响应按事件时间各发布一次；TCP 已接受的写入和 UDP 已成功发送、交付的进展进入互不重叠的 1–10 秒事件驱动窗口。被测方向至少传输 64 KiB，且 flow 已有双向进展及响应；窗口不增加 Beta 成功次数。终态最多结算一次，不重复加入已发布字节，最后一个未完成 handle 被释放时取消。拒绝、取消与关闭撤销 attempt 而不制造失败，已实际发生的观测保留。空闲或应用限速不是拥塞证据；不新增采样任务、负载重放或连接迁移。
 
 带拨号准入作用域的 TCP 拨号，在首个物理尝试获准后，或复用 session/QUIC 连接上的逻辑 open 开始前启动 reporter；等待冷物理拨号准入时不启动。回调只执行一次；未经过这两个边界便已完成的路径保留完成时的兜底回调。
+
+尚未开始工作的作用域，只有仍在等待物理拨号准入时，超时才属于本地容量拒绝。准入前的 DNS 解析超时仍是普通超时，保留既有的合格候选重试路径。分类先检查作用域，再取消 future；取消只移除该次申请的待准入登记。
 
 普通路径和竞速后的 TCP ready/bare 补池仍记录 setup 质量，但其成功与失败都不改变真实流量的连败计数或探索退避。UDP driver 在自己的健康回调可能同步退役 endpoint 之前判定终态，避免该回调把错误改写成中性的取消或成功。主动退役在没有回包时保持中性，已有回包时计为成功；进程关闭和单包拥塞保持中性，回包空闲到期仅在从未收到回包时计为超时。
 
 对仍存活的 endpoint，已明确判定的 QUIC 通路停滞保留更高优先级：即使当前错误原本属于单包拥塞或已有回包后的空闲到期，也仍归因为超时。
 
-同一 reporter 路径覆盖透明 TCP relay 与 UDP endpoint 生命周期、受支持的 DNS upstream exchange、周期 HTTP/UDP 健康探测、按需 Clash delay 测量、启动 preconnect、Selector/session 与 UDP 预热，以及外部 UI 下载。DNS 反馈跟随实际尝试的 carrier：直连 UDP、DoQ 与 DoH3 使用 UDP 分桶；TCP、DoT、DoH 与经代理的 UDP（以 TCP-DNS 承载，因此适用 TCP 健康与 TCP 分桶）使用 TCP；UDP truncated answer 后的 TCP retry 会相应切换分桶。每个周期 UDP 探测会为 Score 组中的每个节点另外打开一个 packet transport，对第一个 HTTPS `global.tcp_check_url` 完成 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手，且无论 DNS 探测成败都会运行。这个精确目标 `DataUdp` 评分与决定 UDP 存活性的 DNS exchange 相互独立；URL 缺失或不是 HTTPS 时不运行。由于 adapter 不提供 wire counter，成功握手只记录双向有效性，不奖励虚构的 byte volume；当 DNS exchange 失败而握手成功时，它还会把 `DataUdp` 标记为存活，使被封禁的 `:53` 检查目标不能永久判死一条正常的 UDP 数据通路。URL test 与下载对代理叶节点和内建 `direct` 叶节点都使用真实请求目标。周期 direct liveness 仍使用稳定 bootstrap 目标；仅连接 server/session 的预热只更新聚合 setup 证据。
+Traffic reporter 覆盖透明 TCP/UDP、受支持的 DNS exchange 和 UI 下载，DNS 归因跟随实际 carrier，包括 UDP 截断后的 TCP 重试。`HealthProbe` 只在全局聚合探测槽记录配置测量质量，不结算业务可靠性或清除真实连败；`Warmup` 只记录 setup 质量。按需 delay 测量保留 API/Alive 延迟历史，但不创建无消费者的 Score exchange reporter，也不把任意目标失败计入真实拨号序列；实际 session 准备仍可报告预热质量。独立 QUIC 握手提供 DataUdp 探测质量和既有存活性恢复，不虚构吞吐或业务成功。
 
-排名以可靠性为主：Beta 先验的下置信估计先排除固定「可靠性接近」区间之外的成员，延迟与吞吐只在该区间内微调。延迟惩罚相对组内已观测最快候选归一，吞吐 bonus 相对组内最高主导方向 bytes/s 归一。有效完成证据不足或衰减到训练阈值以下的候选会重新视为冷候选。候选数不超过 4 时冷探索覆盖全部成员；更大的组探索 `ceil(sqrt(n)) + 1` 个成员，并每进行 `2n` 次选择（限制在 16–64）复检 Beta 可靠性上置信界最高的非当前成员。cadence 只按 `(group, TCP/UDP, 目标 IPv4/IPv6 地址族或 none)` 分域。连败会把叶节点按指数退避移出冷探索与周期探索——从 5 分钟起随连败翻倍，上限 6 小时，退避状态独立于证据衰减；成功立即恢复探索资格，但连败只降一级——抖动节点必须逐级挣回快速探索节奏。只有真实流量的结果会移动连败计数——探测、urltest 与预热结果对连败中立，健康检查目标的畅通洗不掉真实连败。同一连败计数也门控排名：连续三次新鲜失败时，只要还有更健康的候选，该叶节点就退出可靠性带；仅当所有候选都在连败时回退到全量排名，保证选择永不消失。现任滞回随有效完成证据线性增长，在八次完成时达到完整 `0.01` 余量；全局、目标地址族和精确目标的新鲜失败 envelope 在决定是否绕过余量前取 `max`，而不相加。探索与其余平局保持确定性，最终计划始终只包含一个权威叶节点。
+冷启动只有一份组/网络/目标地址族预算：四个及以下覆盖全部，否则为 `ceil(sqrt(n)) + 1`。后续时间/次数/退化机会共享一次预留，仅用于尚未解决的可用性或响应问题。有真实进展的有希望候选得到最多八次试用选择的集中验证；取消或无进展会轮转，不能永久占住验证。这让低流量大组有机会在历史衰减前完成资格确认。新鲜且已经解决或近似等价的候选停止强制采样，过期、矛盾或成员/探测变化再产生缺口。粗粒度边界仍为 30 秒或 `clamp(2n,16,64)` 次选择，退化加速至少要求距前次试用经过 16 次选择。真实失败保留 5 分钟至 6 小时退避，只有业务成功降低连败；试用不获得现任保持保护，三连败排除也不能永久封死退避到期后的恢复验证。
 
 共享状态由 mutex 保护且仅存于当前进程内存：精确 cell 使用 4,096-entry LRU，聚合 cell 使用另一个 4,096-entry LRU。精确目标证据衡量 transport 质量，并不是语义解锁能力的结果；需要这种粗粒度 cohort 时，可用已有 routing 或 geosite 规则选择专用服务 Score 组。已提交的进程内 reload 会复用同一共享状态、发布新的合法 `(group, member)` 集合并裁剪已删除 cell；已删除成员的迟到反馈会被忽略。进程重启会清空一切。Score 不提供调节项；评分 cell 与仅由 scorer 持有的目标数据不会进入日志、持久化存储或任何 API 输出，已有的 `/connections` 目标元数据保持不变。
+
+中性 cell 保留在有界 LRU 中，不在其他 reporter 仍持有 incarnation 时提前删除。reload 清空配置探测基线并拒绝旧代探测观测；已准入业务 flow 对存续成员和匹配 incarnation 仍可报告。淘汰后的旧 reporter 不能重建 cell。
+
+#### 有条件的验证结论
+
+默认目标是以已观测业务可用性为保护比较响应质量，有可比证据时才纳入分方向 goodput。转发仍立即选择，但选中不等于确认。`provisional` 与 `observedUsable` 描述当前路径的业务证据；`unconfirmed`、`equivalent`、`supported` 独立描述所标明依据的比较结论。10% 指标容差表示实际意义上的近似等价，不是误判概率，也不是全局最优证明；这里的置信度是经验性证据门槛，不是时间一致置信序列。
+
+同一判定器识别可用性、响应和传输证据缺口，安排下一次预算内真实流量验证，并生成只读 API 摘要。精确目标结论不能继承聚合或探测的认证；HEAD/QUIC 成功最多支持其配置测量范围，不证明业务目标可用或持续带宽。缺少传输证据时为 `awaitTransfer`，不后台测速或复制用户请求；`nextBusinessFlow` 表示共享预算允许后的真实流量机会，并非已经派发 I/O；`backoff` 保留失败隔离。
+
+结论在最弱支持证据跌破完整置信门槛时失效（此处最多 60 秒）；有效完成数或作为依据的失败排除更早失效时相应提前。业务失败与提交 reload 撤销近期可用性确认，但不清空长期可靠性。API 读取即时重算有效性，不推进采样或计数；已授权 Apply 利用既有有界历史累计确认、过期/矛盾、验证选择和确认耗时。一次确认可以仅指探测比较，业务仍处于临时状态；详见 [API 语义](../reference/api.md#score-验证信息)。
+
+近期可用性以最近一次非零业务 RX 的观测时间计时，单向 TX 和终态清理都不能刷新它。迟到的完成仍保留一次性的长期终态，但已过期的 RX，以及不晚于最近失败／reload 失效边界的 RX，都不能补回近期证据。尚未过期但乱序到达的完成保留最新观测时钟；已准入且继续存活的 flow 可以用边界之后真正新增的 RX 重新提供证据。
 
 一次已授权的多候选 Apply 按优先级恰好增加一个最终原因：`coldExplore`、`periodicExplore`、`incumbentHeld`、`freshFailureBypass`、`reliabilityWinner`，然后是 `performanceWinner`。`deadFiltered` 独立计数被活性过滤移除的唯一叶候选。`switchFlap` 独立计数同一 `(group, network, family, target)` 作用域内已提交胜者在八次选择内切回前一胜者——无关目标交错各自的胜者永远不计入；无目标选择共享一个桶，历史由 4,096 项 LRU 封顶。冷探索与周期探索不修改这段后悔窗口。`failStreakExcluded` 按每次已授权 rank 累计被三连败新鲜失败门排除的候选数，`exploreBackedOff` 累计当前处于探索退避的候选数。Peek、proxy/stat 读取、单例旁路和最后尝试选择均保持中性。经鉴权的 `/stats.score.groups[]` 快照只公开这些按组的 TCP/UDP 计数，不包含 cell、节点、目标、cadence 或 manager authority。`/stats.score.cache` 公开两个 4,096 项证据 LRU 各自的当前 cell 数与累计淘汰数，同样不含任何组、节点或目标身份。
 
@@ -87,7 +101,7 @@ Score 首先运行与其他策略相同的存活性过滤。过滤所用的 heal
 
 真实流量也会直接回馈排名（仅 TCP）。每个节点为自身的新鲜拨号延迟维护一个自引用 EMA（α=1/8，前 3 次拨号为预热期）；命中就绪连接池的拨号不产生网络往返，不计入。连续 3 次拨号慢于 `max(min(2×EMA, EMA+500 ms), 250 ms)` 会记一次失败 strike 并触发紧急探测；250 ms 下限避免快节点现任的正常负载抖动（如 60→120 ms）误触发判定。探测移动平均不受影响；误报（目标分布变化而非节点劣化）会自愈——紧急探测成功后，连续探测成功会清除 strike。渐进式劣化仍由探测周期负责；UDP 劣化保持探测周期加 `DataUdp` 流量阈值的处理方式。
 
-当权威单候选拨号失败时，该流量恰好重试一次：对 URLTest 按延迟排序的前 3 个候选发起 race——若刚记录的 strike 改变了首选则现任被替换，否则现任与备选一同重赛，单次瞬时失败不留 strike、不应让流量硬失败。非 URLTest 计划（Selector 固定、Fallback 固定）与单叶结果不产生重试候选，直接失败。
+权威 URLTest 建立失败保留既有的一轮前三候选重赛。Score 所属建立失败则至多顺序尝试一个不同叶节点，在排名前排除失败 `NodeId`，不要求普通评分先改选。Score 两次尝试共享一个绝对建立 deadline 和物理拨号预算；规范解析保留 Selector 选择，只允许首选真正经过的 final 组边，显示名称不授权兜底。类型化本地拒绝、未准入时容量耗尽、取消和 generation 关闭均为终态；应用负载写入后不重试。
 
 组的 `check_url` 会建立独立的 TCP-only 存活性和延迟状态，键为 `(member tag, check_url)`。失败只会从使用该目标的组中排除该成员。Selector 组忽略 `check_url` 并打印告警。URLTest 在超过 `idle_timeout` 后暂停探测；未设置时使用健康层默认的 30 分钟，下一次真实选择会立即唤醒探测。
 
@@ -143,7 +157,7 @@ Selector 在候选展开和健康过滤前绑定具体节点或子组成员；�
 | --- | --- |
 | TCP | 通过节点向 `tcp_check_url` 发送已配置 HTTP 方法；不适用 HTTP 探测时执行裸 TCP 连接。`ProxyHttpProber` 将 HTTP 执行交给 outbound 共享测量路径；只有 `NodeRuntime::is_warm_or_stateless_for(WarmRequirement::Session)` 才复用 runtime，否则探测后关闭 guarded cold runtime。只有成功 warm-path RTT 进入匹配 TCP 地址族状态；setup 与目标交换 failure 更新 liveness/cooldown，但不贡献 latency 或 ranking strike。 |
 | UDP 健康 | 通过节点 packet path 向第一个 `udp_check_dns` 目标发送最小 DNS query。它独立检查 `NodeRuntime::is_warm_or_stateless_for(WarmRequirement::Udp)`；该 requirement 未预热时，探测后关闭 guarded cold runtime。成功记录 RTT，并把 `DnsUdp` 与 `DataUdp` 标为存活；失败分别给两个 UDP domain 增加一次 probe failure，除非同周期独立 Score QUIC handshake 成功，此时只让 `DnsUdp` 失败而保持 `DataUdp` 存活。它绝不修改 TCP state。 |
-| Score QUIC 评分 | 通过新的 packet transport 为 Score 组中的每个节点单独执行一次 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手，目标为第一个 HTTPS `tcp_check_url`，无论 DNS 探测成败都会运行。成功或失败会更新精确 `DataUdp` 分数与聚合先验，不奖励未观测的 byte volume；当 DNS 探测失败而握手成功时，还会按上表所述复活 `DataUdp` 活性。 |
+| Score QUIC 质量 | 通过新的 packet transport 为每个 Score 叶节点执行 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手，目标为第一个 HTTPS `tcp_check_url`，与 DNS 探测成败无关。测得时长提供独立 DataUdp 探测质量，不增加业务成功或虚构吞吐；DNS 探测失败而握手成功时仍按既有规则恢复 DataUdp 活性。 |
 | 按组 URL | 用与全局 TCP 探测相同的临时暖路径计时，探测动态解析出的 `(member tag, current leaf)` 对。状态为 TCP-only，连续三次失败即死亡，并使用相同冷却与连续两次成功恢复。重载时 `sync_group_check_urls` 替换有效的组/URL 注册表。 |
 
 `has_udp_state` 区分从未观察过 UDP 的节点与已明确观察为死亡的节点。对于普通 endpoint，终止性 send/receive error 与从未收到 reply 时的 idle expiry，会在 driver 捕获 terminal per-flow Score outcome 后上报 `DataUdp` failure。对于来源共享 VLESS，source owner 负责报告 transport health，而每个绑定 endpoint 保留并结算自己的 Score reporter；匹配 reply 属于对应 endpoint，foreign reply 没有 flow Score owner。source terminal event 会退役其 endpoints，并把 terminal outcome 分发给这些 flow。
@@ -156,7 +170,8 @@ Selector 在候选展开和健康过滤前绑定具体节点或子组成员；�
 HTTP/2 探测连接在首个本地检测到的协议错误时终止，避免后续远端 reset 覆盖已经拒绝的响应头错误并触发首轮样本回退。
 已取消流的记录保留窗口设为每轮超时的两倍，覆盖两轮请求预算，使迟到的合法 warm 流帧仍可被忽略。每次探测最多保留两条流记录；完成或取消时随连接释放，不等待记录过期。
 
-报告值为第二轮请求的热路径 RTT，不含代理拨号、目标 TLS 和 session 准备。第二轮 I/O 失败或超时可以回退到已验证的第一轮样本；HTTP/1 要求尚未收到响应字节，HTTP/2 还将正常 GOAWAY 和远端 `REFUSED_STREAM` 视为传输失败。畸形、截断、过大或部分接收后超时的 HTTP/1 响应头会失败。只复用已经预热或无状态的 generation runtime；冷可复用 generation 探测使用带 guard 的临时 runtime，结束后关闭；HTTP/2 driver 在完成或取消后释放。session 准备、拨号、TLS、HTTP/2 启动与每轮请求分别使用阶段预算；core 仍单独保留配置的连接超时。空 delay URL 使用 `https://www.gstatic.com/generate_204`。健康调度与记账仍由 `alive` 负责；只有 delay 包装层写入拨号失败 strike，组 delay 并发上限仍为 10。
+报告值为第二轮热路径 RTT，不含代理拨号、目标 TLS 和 session 准备。第二轮传输失败可返回已验证的第一轮样本；HTTP/1 要求没有部分响应，HTTP/2 接受正常 GOAWAY 或远端 `REFUSED_STREAM`，畸形或部分响应仍失败。冷可复用探测关闭 guarded runtime，HTTP/2 driver 在完成或取消后停止。准备、拨号、TLS、HTTP/2 启动和每轮请求分别有阶段预算，core 保留连接超时。空 delay URL 使用 `https://www.gstatic.com/generate_204`。`alive` 负责健康调度，只有真实流量增加拨号失败 strike；组 delay 并发上限仍为 10。
+API 返回的首轮预热回退值不会作为配置方法的 Score 证据发布；只有成功测得的第二轮才更新该方法的质量 cohort。
 
 已知上游限制：[`h2` 0.4.19 会把缺少响应 `:status` 的情况默认解码为 200](https://github.com/hyperium/h2/issues/958)。探测器只能检查解码后的状态，无法恢复被遗漏的伪头，因此这种畸形 HTTP/2 响应仍可能被判为健康。该依赖修复已明确延期，等待上游处理，不引入本地 fork 或 vendor 补丁。
 

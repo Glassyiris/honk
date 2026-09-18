@@ -436,6 +436,61 @@ fn cache_body(
 }
 
 #[test]
+fn cached_subscriptions_remain_inside_source_budgets() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut loaded = fixture(temp.path(), "");
+    let subscription = honk_config::subscription::Subscription {
+        name: "bounded".into(),
+        url: "https://example.invalid/nodes".into(),
+        ..Default::default()
+    };
+    let body = "socks5://127.0.0.1:1080#cached";
+    cache_body(
+        Path::new(&loaded.config.global.data_dir),
+        &subscription,
+        body,
+    );
+    loaded.config.subscriptions.push(subscription);
+    let exact = SourceLimits {
+        max_sources: 2,
+        max_bytes: loaded.sources[0].content.len() + body.len(),
+    };
+    let admitted = admit_with_limits(loaded.clone(), &loaded.config, exact).unwrap();
+    assert!(
+        admitted
+            .config
+            .nodes
+            .iter()
+            .any(|node| node.name == "cached")
+    );
+    for (limits, code) in [
+        (
+            SourceLimits {
+                max_sources: 1,
+                ..exact
+            },
+            "config-source-limit",
+        ),
+        (
+            SourceLimits {
+                max_bytes: exact.max_bytes - 1,
+                ..exact
+            },
+            "config-byte-limit",
+        ),
+    ] {
+        assert_eq!(
+            admit_with_limits(loaded.clone(), &loaded.config, limits)
+                .err()
+                .unwrap()
+                .diagnostic
+                .code,
+            code,
+        );
+    }
+}
+
+#[test]
 fn cached_presence_and_rebased_active_semantics_are_both_required() {
     let temp = tempfile::tempdir().unwrap();
     let mut loaded = fixture(temp.path(), "");

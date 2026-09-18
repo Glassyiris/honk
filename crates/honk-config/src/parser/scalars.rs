@@ -818,8 +818,7 @@ pub(super) fn parse_experimental_section(
                         }
                     }
                     if let Some(text) = values.get("probe_allowed_cidrs") {
-                        config.native_api.probe_allowed_cidrs =
-                            list_value(*text, false, false, false, diagnostics);
+                        config.native_api.probe_allowed_cidrs = new_list_value(*text, diagnostics);
                         if config
                             .native_api
                             .probe_allowed_cidrs
@@ -836,7 +835,7 @@ pub(super) fn parse_experimental_section(
                         }
                     }
                     if let Some(text) = values.get("probe_allowed_ports") {
-                        let entries = list_value(*text, false, false, false, diagnostics);
+                        let entries = new_list_value(*text, diagnostics);
                         config.native_api.probe_allowed_ports = entries.iter().map(|value| {
                             value.parse::<u16>().ok().filter(|port| *port != 0 && value.bytes().all(|byte| byte.is_ascii_digit()))
                                 .ok_or_else(|| scalar_error(*text, "invalid-config-value", "experimental.native_api.probe_allowed_ports", "probe port allowlist requires ports from 1 through 65535"))

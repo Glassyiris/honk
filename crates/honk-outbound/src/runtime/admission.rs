@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::sync::{Arc, LazyLock};
+use std::task::Poll;
 
 use super::{OutboundRuntimeRegistry, ProtocolRuntime};
 
@@ -56,36 +57,108 @@ static STANDALONE_DIAL_ADMISSION: LazyLock<DialAdmission> = LazyLock::new(|| Dia
     endpoint: None,
 });
 
-type DialStart = Arc<parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
-
 #[derive(Default)]
-struct HeldDialPermits {
+struct DialScopeState {
     first: Option<DialPermit>,
     extra: Vec<DialPermit>,
+    started: bool,
+    pending: usize,
+    on_start: Option<Box<dyn FnOnce() + Send>>,
 }
 
-struct DialScope {
+/// One logical dial's physical admission, retained permits, and start boundary.
+pub struct DialScope {
     admission: DialAdmission,
-    held: parking_lot::Mutex<HeldDialPermits>,
-    on_start: Option<DialStart>,
+    state: parking_lot::Mutex<DialScopeState>,
 }
 
 impl DialScope {
-    fn new(admission: DialAdmission, on_start: Option<DialStart>) -> Arc<Self> {
+    fn new(admission: DialAdmission, on_start: Option<Box<dyn FnOnce() + Send>>) -> Arc<Self> {
         Arc::new(Self {
             admission,
-            held: parking_lot::Mutex::new(HeldDialPermits::default()),
-            on_start,
+            state: parking_lot::Mutex::new(DialScopeState {
+                on_start,
+                ..Default::default()
+            }),
         })
     }
 
-    fn start(&self) {
-        let callback = self
-            .on_start
-            .as_ref()
-            .and_then(|callback| callback.lock().take());
+    /// Start once before a physical attempt or a logical open on reused state.
+    pub fn start(&self) {
+        let callback = {
+            let mut state = self.state.lock();
+            state.started = true;
+            state.on_start.take()
+        };
         if let Some(callback) = callback {
             callback();
+        }
+    }
+
+    /// Whether an unstarted dial is currently blocked on physical admission.
+    /// Snapshot before cancelling the scoped future, which removes its waiters.
+    pub fn is_waiting_for_admission(&self) -> bool {
+        let state = self.state.lock();
+        !state.started && state.pending > 0
+    }
+
+    /// Completed paths without a physical or logical start retain the
+    /// completion fallback; cancellation never starts untouched work.
+    pub async fn scope<F>(self: &Arc<Self>, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        let output = DIAL_SCOPE.scope(Arc::clone(self), future).await;
+        self.start();
+        output
+    }
+
+    async fn acquire(&self) -> DialPermit {
+        let mut acquire = std::pin::pin!(self.admission.clone().acquire());
+        let mut waiter = DialWaiter {
+            scope: self,
+            pending: false,
+        };
+        std::future::poll_fn(|cx| {
+            // Poll and publish under the same lock so a timeout cannot see
+            // a gap between leaving admission and starting the attempt.
+            let mut state = self.state.lock();
+            match acquire.as_mut().poll(cx) {
+                Poll::Pending => {
+                    if !waiter.pending {
+                        state.pending += 1;
+                        waiter.pending = true;
+                    }
+                    Poll::Pending
+                }
+                Poll::Ready(permit) => {
+                    if waiter.pending {
+                        state.pending -= 1;
+                        waiter.pending = false;
+                    }
+                    state.started = true;
+                    let callback = state.on_start.take();
+                    drop(state);
+                    if let Some(callback) = callback {
+                        callback();
+                    }
+                    Poll::Ready(permit)
+                }
+            }
+        })
+        .await
+    }
+}
+
+struct DialWaiter<'a> {
+    scope: &'a DialScope,
+    pending: bool,
+}
+
+impl Drop for DialWaiter<'_> {
+    fn drop(&mut self) {
+        if self.pending {
+            self.scope.state.lock().pending -= 1;
         }
     }
 }
@@ -216,24 +289,21 @@ where
 {
     let scope = DIAL_SCOPE.try_with(Arc::clone).ok();
     let retained = scope.as_ref().filter(|_| reuse_existing).and_then(|scope| {
-        let mut held = scope.held.lock();
+        let mut held = scope.state.lock();
         held.extra.pop().or_else(|| held.first.take())
     });
     let permit = match retained {
         Some(permit) => permit,
         None => match &scope {
-            Some(scope) => scope.admission.clone().acquire().await,
+            Some(scope) => scope.acquire().await,
             None => DialAdmission::standalone().acquire().await,
         },
     };
-    if let Some(scope) = &scope {
-        scope.start();
-    }
     let result = future.await;
     if result.is_ok()
         && let Some(scope) = scope
     {
-        let mut held = scope.held.lock();
+        let mut held = scope.state.lock();
         if held.first.is_none() {
             held.first = Some(permit);
         } else {
@@ -301,19 +371,12 @@ impl OutboundRuntimeRegistry {
             .await
     }
 
-    /// Start at the first admitted physical attempt or at the first logical
-    /// open on reused state; completed paths without either boundary retain
-    /// the historical completion fallback.
-    pub async fn scope_dials_with_start<F, C>(&self, future: F, on_start: C) -> F::Output
+    /// Create a logical dial scope whose start callback fires only once.
+    pub fn dial_scope<C>(&self, on_start: C) -> Arc<DialScope>
     where
-        F: Future,
         C: FnOnce() + Send + 'static,
     {
-        let callback: DialStart = Arc::new(parking_lot::Mutex::new(Some(Box::new(on_start))));
-        let scope = DialScope::new(DialAdmission::for_registry(self), Some(callback));
-        let output = DIAL_SCOPE.scope(Arc::clone(&scope), future).await;
-        scope.start();
-        output
+        DialScope::new(DialAdmission::for_registry(self), Some(Box::new(on_start)))
     }
     /// Rebind autonomous AnyTLS replacement dials after this generation is
     /// published. Reused pools must stop consulting the predecessor's gate.

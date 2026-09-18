@@ -269,8 +269,9 @@ async fn payloads_preserve_integer_contracts_and_omit_untrusted_fields() {
 #[tokio::test]
 async fn flow_filter_keeps_global_events_but_excludes_other_flows() {
     let hub = hub();
-    let mut stream = subscribe(&hub, Filter::new(63, Some("flow-a".into())), None);
-    next(&mut stream).await;
+    let filter = Filter::new(63, Some("flow-a".into()));
+    let mut stream = subscribe(&hub, filter.clone(), None);
+    let ready = next(&mut stream).await;
     publish_flow(&hub, "flow-b", 1);
     hub.publish("runtime.updated", json!({}), None);
     assert!(
@@ -279,6 +280,27 @@ async fn flow_filter_keeps_global_events_but_excludes_other_flows() {
             .starts_with("event: runtime.updated\n")
     );
     assert!(stream.next().now_or_never().is_none());
+    hub.publish(
+        "flow.gap",
+        json!({"resource_id":"flow-b","reason":"buffer_overflow","dropped_records":"1"}),
+        Some("flow-b"),
+    );
+    hub.publish(
+        "flow.gap",
+        json!({"resource_id":null,"reason":"buffer_overflow","dropped_records":"2"}),
+        None,
+    );
+    let live = tokio::time::timeout(Duration::from_secs(1), next(&mut stream))
+        .await
+        .unwrap();
+    assert_eq!(data(&live)["dropped_records"], "2");
+    let mut resumed = subscribe(&hub, filter, Some(cursor(&ready)));
+    assert!(
+        next(&mut resumed)
+            .await
+            .starts_with("event: runtime.updated\n")
+    );
+    assert_eq!(cursor(&next(&mut resumed).await), cursor(&live));
 }
 
 #[test]

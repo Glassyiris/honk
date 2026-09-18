@@ -15,6 +15,9 @@
 
 pub mod splice;
 
+#[cfg(test)]
+mod progress_tests;
+
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
@@ -54,45 +57,64 @@ pub struct RelayStats {
     pub duration_ms: u64,
 }
 
-/// Live relay progress shared with connection accounting and optional
-/// first-response notification.
+/// Live relay counters, source-arrival notification and accepted-write observation.
 #[derive(Clone)]
 pub struct RelayProgress {
     pub upload: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub download: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub outbound_upload: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     pub outbound_download: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// First nonempty upstream read, independent of client write backpressure.
     pub first_response: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// Accepted destination writes as `(upload_bytes, download_bytes)`.
+    pub on_transfer: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
 }
 
 pub type OptionalRelayProgress = Option<RelayProgress>;
 
-/// AsyncRead wrapper that counts bytes read from the inner stream into a
-/// shared counter. Writes pass through untouched.
-pub(crate) struct ReadCounter<S> {
+/// Preserve read-based tracker/drain accounting while observing accepted writes.
+pub(crate) struct RelayIo<S> {
     inner: S,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
     aggregate: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     on_progress: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    on_transfer: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
+    write_is_upload: bool,
 }
 
-impl<S> ReadCounter<S> {
+impl<S> RelayIo<S> {
     pub(crate) fn wrap(
         inner: S,
         counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
         aggregate: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
         on_progress: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+        on_transfer: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>>,
+        write_is_upload: bool,
     ) -> Self {
         Self {
             inner,
             counter,
             aggregate,
             on_progress,
+            on_transfer,
+            write_is_upload,
+        }
+    }
+
+    fn transferred(&self, n: usize) {
+        if n > 0
+            && let Some(callback) = &self.on_transfer
+        {
+            if self.write_is_upload {
+                callback(n as u64, 0);
+            } else {
+                callback(0, n as u64);
+            }
         }
     }
 }
 
-impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ReadCounter<S> {
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for RelayIo<S> {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -117,13 +139,15 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ReadCounter<S> {
     }
 }
 
-impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ReadCounter<S> {
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for RelayIo<S> {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         data: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.inner).poll_write(cx, data)
+        let n = std::task::ready!(std::pin::Pin::new(&mut self.inner).poll_write(cx, data))?;
+        self.transferred(n);
+        std::task::Poll::Ready(Ok(n))
     }
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
@@ -142,7 +166,10 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ReadCounter<S> 
         cx: &mut std::task::Context<'_>,
         bufs: &[std::io::IoSlice<'_>],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+        let n =
+            std::task::ready!(std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs))?;
+        self.transferred(n);
+        std::task::Poll::Ready(Ok(n))
     }
     fn is_write_vectored(&self) -> bool {
         self.inner.is_write_vectored()
@@ -173,7 +200,7 @@ where
     // Sniffing or protocol setup may already have buffered bytes before the
     // relay starts, independently of bytes read by this copy loop.
     wr.flush().await?;
-    let mut rd = ReadCounter::wrap(rd, progress, None, None);
+    let mut rd = RelayIo::wrap(rd, progress, None, None, None, false);
     let mut buffer = vec![0; RELAY_BUF_SIZE];
     let mut n = 0;
     loop {
@@ -517,6 +544,7 @@ mod tests {
                             first_response: Some(Arc::new(move || {
                                 first_response.fetch_add(1, Ordering::Relaxed);
                             })),
+                            on_transfer: None,
                         }),
                     ),
                     async move {
@@ -675,6 +703,7 @@ mod tests {
                 outbound_upload: Some(aggregate.clone()),
                 outbound_download: None,
                 first_response: None,
+                on_transfer: None,
             };
             client.write_all(b"abcdef").await.unwrap();
             let mut peer = if cancel {

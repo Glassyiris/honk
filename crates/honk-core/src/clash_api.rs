@@ -10,6 +10,7 @@
 
 pub mod doh;
 pub mod logs;
+mod score;
 pub mod ui;
 
 use axum::{
@@ -438,6 +439,8 @@ fn build_group_proxy_info(
     alive_set: &AliveDialerSet,
 ) -> serde_json::Value {
     let node_names = group_manager.node_names_in_group(&group.name);
+    let verification = (group.policy == GroupPolicy::Score)
+        .then(|| score::verification(group_manager, &group.name));
     let now = match group.policy {
         GroupPolicy::Selector => group_manager
             .get_selector_choice(&group.name, SelectionNetwork::Tcp)
@@ -454,8 +457,12 @@ fn build_group_proxy_info(
             .get_fallback_selection(&group.name)
             .or_else(|| node_names.first().cloned())
             .unwrap_or_default(),
-        GroupPolicy::Score => group_manager
-            .get_score_selection_for_network(&group.name, SelectionNetwork::Tcp)
+        GroupPolicy::Score => verification
+            .as_ref()
+            .and_then(|(selected, _)| selected.clone())
+            .or_else(|| {
+                group_manager.get_score_selection_for_network(&group.name, SelectionNetwork::Tcp)
+            })
             .or_else(|| node_names.first().cloned())
             .unwrap_or_default(),
     };
@@ -471,13 +478,17 @@ fn build_group_proxy_info(
         }
     }
 
-    serde_json::json!({
+    let mut info = serde_json::json!({
         "name": group.name,
         "type": clash_group_type(group.policy),
         "all": node_names,
         "now": now,
         "history": history,
-    })
+    });
+    if let Some((_, verification)) = verification {
+        info["scoreVerification"] = verification;
+    }
+    info
 }
 
 /// Build a proxy info object for an individual node.
@@ -700,8 +711,7 @@ fn delay_ms(d: Duration) -> u64 {
 
 /// GET /proxies/{name}/delay — live latency measurement (HEAD request
 /// through the node / group members). Successes refresh the alive-set
-/// history; errors return 503. Repeated transport failures demote the node,
-/// while local policy refusals remain neutral.
+/// history; errors return 503 without changing real dial failure streaks.
 async fn get_proxy_delay(
     State(s): State<Arc<ClashState>>,
     Path(name): Path<String>,
@@ -758,16 +768,10 @@ async fn proxy_delay(
                     .record_probe_latency(node.id, ProbeDomain::Tcp, IpVersion::V4, latency);
                 Json(serde_json::json!({"delay": delay_ms(latency)})).into_response()
             }
-            Err(e) => {
-                if !honk_outbound::proxy::is_packet_rejection(&e) {
-                    s.alive_set
-                        .record_dial_failure(node.id, ProbeDomain::Tcp, IpVersion::V4);
-                }
-                error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &format!("An error occurred in the delay test: {e}"),
-                )
-            }
+            Err(e) => error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("An error occurred in the delay test: {e}"),
+            ),
         };
     }
 
@@ -945,14 +949,10 @@ fn udp_histogram_json(histogram: &crate::stats::UdpLatencyHistogramSnapshot) -> 
 /// standard; handy for headless ops.
 async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value> {
     let snap = s.stats.snapshot();
-    let (score_groups, score_cache) = {
-        let group_manager = s.group_manager.read();
-        (
-            group_manager.score_reason_snapshot(),
-            group_manager.score_cache_snapshot(),
-        )
-    };
-    let score_groups: Vec<_> = score_groups
+    let group_manager = s.group_manager.read().clone();
+    let score_cache = group_manager.score_cache_snapshot();
+    let score_groups: Vec<_> = group_manager
+        .score_reason_snapshot()
         .into_iter()
         .map(|group| {
             let counters = |counters: honk_outbound::group::ScoreReasonCounters| {
@@ -973,6 +973,10 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
                 "name": group.name,
                 "tcp": counters(group.tcp),
                 "udp": counters(group.udp),
+                "verification": {
+                    "tcp": score::counters(group_manager.score_verification_counters(&group.name, SelectionNetwork::Tcp)),
+                    "udp": score::counters(group_manager.score_verification_counters(&group.name, SelectionNetwork::Udp)),
+                },
             })
         })
         .collect();

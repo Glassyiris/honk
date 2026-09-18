@@ -118,8 +118,9 @@ flowchart TB
 - **失活出站 fail-closed：** `lan_ingress` 丢弃路由到失活出站的新流。未配置 `final` 且只有一个唯一叶节点的 TCP 组会让同一代理继续作为用户态最后尝试；UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed；但含有 `direct`/`block` 内建成员的组永不失活：内建节点永远不会被判定死亡，因此 group-OR 槽保持开放。TCP 与 UDP 端口 `53` 豁免该健康检查丢包，但仍遵循用户的终局 `must` 结果。
 - **显式本地路由：** 网关管理访问由用户[显式配置](../reference/routing.md#显式本地路由)，不依赖自动生成的接口规则或隐藏白名单；接口观察仍用于拓扑/ECS/健康，非 DNS TCP 纯 SYN 的现有本地探测跳过策略不变。
 - **组 OR 连通性：** 一个组的 eBPF alive slot 是全部叶子成员状态的 OR，并包含上述单叶 TCP 最后尝试例外。多叶节点组中的单个成员失活不得使整个组 fail-closed。
-- **Score 隔离与原因：** Score 用业务目标地址族评分，用代理服务器地址族过滤健康状态；其权威单叶选择不能让死亡成员重新入选。周期探索按 `(group, TCP/UDP, 目标 IP 地址族或 none)` 分域，并选择 Beta 可靠性上置信界最高的非当前成员；连败将叶节点按指数退避移出探索（5 分钟起翻倍、上限 6 小时，独立于证据衰减），成功恢复探索资格但连败只逐级递减；连败只由真实流量驱动（探测结果中立）；连续三次新鲜失败还会让叶节点在存在更健康候选时退出可靠性带；组内相对延迟/吞吐只微调可靠性接近区间，现任余量随有效完成证据增长。全局、地址族与精确目标的新鲜失败 envelope 取最大值而非相加。每次已授权的多候选 Apply 按优先级只记录一个最终原因：`coldExplore`、`periodicExplore`、`incumbentHeld`、`freshFailureBypass`、`reliabilityWinner`，然后是 `performanceWinner`；`deadFiltered` 计数唯一死亡叶节点，`switchFlap` 计数同一目标作用域内八次选择切回前一已提交胜者，`failStreakExcluded` 累计被新鲜失败门排除的候选数，`exploreBackedOff` 累计处于探索退避的候选数。精确目标键与聚合先验只存在于两个各 4,096 项的进程内 LRU，通过共享状态跨成功 reload 保留，进程重启即清空，且不会进入日志或持久化。经鉴权的 `/stats.score` 只导出组名和这些聚合 TCP/UDP 计数，绝不导出 cell、节点、目标、cadence 或 authority；`/stats.score.cache` 另导出每个证据 LRU 的 cell 数与累计淘汰数；既有 `/proxies`、`/stats.outbounds` 与 `/connections` 元数据契约保持不变。
-- **Score 反馈覆盖：** 评分器始终编译，但仅在计划经过 Score 组时按需创建 `ScoreReporter` 和评分 cell；非 Score 路径不创建它们。实际 attempt 会报告 setup、首响应、双向字节和一个紧凑终态，包括透明 TCP/UDP、受支持的 DNS transport、健康与 delay 探测、preconnect/session/UDP 预热，以及直连或经代理的 UI 下载；没有业务目标的任务只更新聚合 setup 证据。
+- **Score 隔离与原因：** 健康过滤与业务目标地址族保持独立。Score 根据实际失败风险判断资格，不奖励历史样本数量，再比较新鲜配置探测与目标质量。验证共享组/网络/地址族时间与计数预算，试用不取得已提交现任身份；真实连败保留退避和三连败排除。精确与聚合证据各有 4,096 项 LRU，重叠完成不相加。reload 保留已准入业务结果，同时撤销近期确认与探测基线。公开摘要和计数始终限定范围，不导出原始目标键，详见[组设计](./groups.md#score-评分与生命周期)。
+- **Score 按需反馈：** setup/首响应与有界分方向进展可在终态前发布，不增加 Beta 完成。业务、配置健康与预热分别承担不同作用；任意手动 delay 测量不变成业务可靠性或配置基线。Score TCP 建立失败可在原 deadline 内通过不同的合格叶节点恢复一次，不打开新 final、不越过 Selector、不重放负载。
+- **条件性验证接口：** Score 代理组额外发布聚合临时/可用状态、比较依据、证据缺口和剩余有效期，并与同一次只读选择的成员一致。`/stats` 增加有界的组/网络验证转移和开销计数；两者都不导出原始目标键或最优概率。详见 [API 验证](../reference/api.md#score-验证信息)。
 - **内部与特殊流量：** honk 的内部链路地址范围 `169.254.0.0/16` 和 `fd00:686f:6e6b::/64` 永不代理。L2 广播/组播、IPv4 广播/组播/未指定目的地址以及 IPv6 组播会在路由或 conntrack 前直通。
 
 ## 构建 feature 与 mock 模式

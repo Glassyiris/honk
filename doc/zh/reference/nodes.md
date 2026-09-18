@@ -151,7 +151,7 @@ VMess JSON 使用 `net: "ws"` 时，缺失或为空的 `host` 会让 WebSocket �
 
 没有 `rprx` Cargo feature 时，VMess 与 VLESS 节点仍能解析，但不会注册 handler，拨号以 `No handler for protocol` 失败；正常 feature-off 构建不会分配 VLESS pool 或 carrier semaphore。`honk-core` 与 `honk-tool` 默认启用 `rprx`。
 
-`honk-core` 在启动和 reload 时注入具有固定保留 ID 的 `direct` 与 `block`。用户节点不得使用这些名称或协议。
+`honk-core` 在启动和 reload 时注入具有固定保留 ID 的 `direct` 与 `block`。用户节点不得使用这些名称或协议。组不会从节点池里取到它们，只有按名字写出的 `filter: name(direct)` 或 `name(block)` 才会收入，见[组参考](./groups.md#语法)。
 
 ## 协议参数
 

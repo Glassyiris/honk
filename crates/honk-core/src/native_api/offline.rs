@@ -147,7 +147,7 @@ fn validate_inner(
                 continue;
             };
             let contents = capture
-                .file(cached, true)
+                .file(cached, true, false)
                 .map_err(|cause| dependency_error(source, "subscription", cause))?;
             let contents = std::str::from_utf8(&contents).map_err(|_| {
                 error(
@@ -428,15 +428,15 @@ impl Capture {
             nix::sys::stat::Mode::empty(),
         )
         .map_err(io::Error::from)?;
-        self.file(File::from(descriptor), standard)
+        self.file(File::from(descriptor), standard, standard)
     }
 
-    fn file(&mut self, file: File, standard: bool) -> io::Result<Arc<[u8]>> {
+    fn file(&mut self, file: File, trusted: bool, asset: bool) -> io::Result<Arc<[u8]>> {
         let path = fs::canonicalize(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
-        if !standard && !self.authorized(&path) {
+        if !trusted && !self.authorized(&path) {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
-        if !standard && self.source_count >= self.limits.max_sources {
+        if !asset && self.source_count >= self.limits.max_sources {
             return Err(io::ErrorKind::QuotaExceeded.into());
         }
         if let Some((_, bytes)) = self
@@ -444,7 +444,7 @@ impl Capture {
             .iter()
             .find(|(snapshot, _)| snapshot.path == path)
         {
-            if standard {
+            if asset {
                 return Ok(Arc::clone(bytes));
             }
             if bytes.len() > self.limits.max_bytes - self.bytes {
@@ -461,7 +461,7 @@ impl Capture {
         }
         // Standard assets have their own bound: the engine loads them whole at
         // startup regardless of what an administrator submits.
-        let remaining = if standard {
+        let remaining = if asset {
             MAX_ASSET_BYTES
         } else {
             self.limits.max_bytes - self.bytes
@@ -478,9 +478,9 @@ impl Capture {
             path,
             sha256: super::config::digest(&bytes),
             bytes: bytes.len(),
-            asset: standard,
+            asset,
         };
-        if !standard {
+        if !asset {
             self.bytes += bytes.len();
             self.source_count += 1;
         }

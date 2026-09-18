@@ -38,9 +38,10 @@ use state::{SelectorState, UrlTestSelections};
 #[cfg(feature = "native-api")]
 pub use resolver::{NativeGroupMember, NativeGroupSelection};
 pub use score::{
-    ScoreAttribution, ScoreCacheSnapshot, ScoreFeedback, ScoreOutcome, ScorePolicyState,
-    ScoreReasonCounters, ScoreReasonGroupSnapshot, ScoreReporter, ScoreSelectionContext,
-    ScoreTarget,
+    ScoreAttribution, ScoreCacheSnapshot, ScoreComparison, ScoreEvidenceBasis, ScoreEvidenceGaps,
+    ScoreFeedback, ScoreOutcome, ScorePolicyState, ScoreReasonCounters, ScoreReasonGroupSnapshot,
+    ScoreReporter, ScoreSelectionContext, ScoreSource, ScoreTarget, ScoreValidationAction,
+    ScoreVerificationCounters, ScoreVerificationSnapshot, ScoreVerificationState,
 };
 pub use state::{
     InterruptCallback, PersistCallback, SelectorChangeCallback, SelectorChoices, SelectorError,
@@ -104,6 +105,9 @@ pub struct ScoreSelectionEntry<'a> {
     pub node: &'a Node,
     pub feedback: Option<ScoreFeedback>,
     pub selection_chain: Vec<String>,
+    /// Owners of group-valued final edges traversed by this entry, valid only
+    /// with the manager that produced the plan. Display chains are not authority.
+    pub final_owners: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -186,6 +190,7 @@ struct Candidate<'a> {
     node: &'a Node,
     attribution: Vec<&'a str>,
     selection_chain: Vec<&'a str>,
+    final_owners: Vec<&'a str>,
 }
 
 impl<'a> Candidate<'a> {
@@ -468,6 +473,7 @@ impl GroupManager {
             0,
             effects,
             true,
+            None,
         );
         SelectionPlan {
             mode,

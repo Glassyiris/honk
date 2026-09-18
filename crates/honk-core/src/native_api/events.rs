@@ -102,6 +102,7 @@ impl Filter {
         self.kinds & (1 << record.kind) != 0
             && (!matches!(record.kind, 2 | 3)
                 || self.flow_id.is_none()
+                || (record.kind == 3 && record.flow_id.is_none())
                 || self.flow_id.as_deref() == record.flow_id.as_deref())
     }
 }

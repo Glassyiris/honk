@@ -80,7 +80,7 @@ The sniffers feed the canonical initializer and may resolve a staged decision, b
 
 `build_tuples_key` must initialize `TuplesKey` with `mem::zeroed()`. The `#[repr(C)]` key has 37 field bytes in a 40-byte layout, and the kernel hashes all 40 bytes, including its three padding bytes. Field-wise initialization can therefore create keys that userspace cannot look up or delete reliably.
 
-An authoritative single-candidate TCP transport failure is retried exactly once, only if re-resolution offers a useful alternative. URLTest races the latency-ordered top three from the target-aware retry plan; Score records failure, re-ranks the exact target, and retries only a different replacement. Local typed refusals remain terminal, including already-completed refusals discovered while draining a race. Never retry other policies or true single-leaf outcomes.
+An authoritative URLTest setup failure retains one retry round over its latency-ordered top three. A Score-owned failure can try one different permitted leaf sequentially, excluding the failed identity before ranking even if its ordinary score remains highest. Score attempts share one absolute deadline; request-local recovery preserves the pinned generation, Selector choices and actual primary final-edge provenance. Typed refusal, local admission-capacity exhaustion, cancellation and shutdown remain terminal, including completed refusals found while draining a race. Application writes and established relays are never replayed.
 
 - `src/sniffing.rs` — **TCP only**: TLS SNI + HTTP Host (≤4096 bytes; buffered bytes returned for forwarding); `parse_client_hello_body` shared with the QUIC sniffer in `control/quic.rs`.
 

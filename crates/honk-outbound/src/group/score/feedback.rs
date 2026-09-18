@@ -1,10 +1,13 @@
+use super::evidence::Observation;
 use super::{
-    FlowSample, ScoreAttribution, ScoreAuthority, ScoreOutcome, ScorePolicyState,
-    ScoreSelectionContext, StartedCells,
+    FlowSample, MAX_THROUGHPUT_DURATION, MIN_THROUGHPUT_BYTES, MIN_THROUGHPUT_DURATION,
+    ScoreAttribution, ScoreAuthority, ScoreOutcome, ScorePolicyState, ScoreSelectionContext,
+    ScoreSource, StartedCells,
 };
 use parking_lot::Mutex;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -14,7 +17,8 @@ pub struct ScoreFeedback {
     authority: Arc<ScoreAuthority>,
     context: ScoreSelectionContext,
     attributions: Arc<[ScoreAttribution]>,
-    streak_neutral: bool,
+    source: ScoreSource,
+    probe_scope: u64,
 }
 
 impl std::fmt::Debug for ScoreFeedback {
@@ -36,15 +40,29 @@ impl ScoreFeedback {
             authority,
             context,
             attributions: attributions.into(),
-            streak_neutral: false,
+            source: ScoreSource::Traffic,
+            probe_scope: 0,
         }
     }
 
-    /// Probe, urltest, and warm-up outcomes must not touch the failure
-    /// streak: a probe succeeding through a half-dead leaf must not wash out
-    /// consecutive real-flow failures (and vice versa).
-    pub fn streak_neutral(mut self) -> Self {
-        self.streak_neutral = true;
+    /// Classify an attempt before admission; only traffic settles business reliability.
+    pub fn with_source(mut self, source: ScoreSource) -> Self {
+        self.source = source;
+        if source == ScoreSource::HealthProbe {
+            let mut scope = std::collections::hash_map::DefaultHasher::new();
+            self.context.hash(&mut scope);
+            self.probe_scope = scope.finish();
+        }
+        self
+    }
+
+    /// Bind an HTTP health sample to the complete canonical request cohort.
+    pub(crate) fn with_probe_identity(mut self, uri: &str, method: &str) -> Self {
+        if self.source == ScoreSource::HealthProbe {
+            let mut scope = std::collections::hash_map::DefaultHasher::new();
+            (&self.context, uri, method).hash(&mut scope);
+            self.probe_scope = scope.finish();
+        }
         self
     }
 
@@ -74,56 +92,65 @@ impl ScoreFeedback {
     /// transport dimensions, such as a UDP DNS reply retried over TCP.
     pub fn with_context(mut self, context: ScoreSelectionContext) -> Self {
         self.context = context;
-        self
+        let source = self.source;
+        self.with_source(source)
     }
 
     /// Call only when the physical dial or logical stream actually starts.
     pub fn start(&self) -> ScoreReporter {
-        let started = Instant::now();
+        self.start_at(Instant::now())
+    }
+
+    pub(super) fn start_at(&self, started: Instant) -> ScoreReporter {
         let cells = self.state.start_at_with_authority(
             &self.authority,
             &self.context,
             &self.attributions,
             started,
+            self.source,
         );
         ScoreReporter {
             shared: Arc::new(ReporterShared {
-                state: Arc::clone(&self.state),
-                authority: Arc::clone(&self.authority),
-                context: self.context.clone(),
-                attributions: Arc::clone(&self.attributions),
+                feedback: self.clone(),
                 cells: cells.into(),
                 started,
-                finished: AtomicBool::new(false),
                 handles: AtomicUsize::new(1),
-                tx: AtomicU64::new(0),
-                rx: AtomicU64::new(0),
-                progress: Mutex::new(ReporterProgress::default()),
-                streak_neutral: self.streak_neutral,
+                progress: Mutex::new(ReporterProgress {
+                    window_start: started,
+                    setup: None,
+                    first_response: false,
+                    probe: false,
+                    finished: false,
+                    tx: 0,
+                    rx: 0,
+                    last_rx_at: None,
+                    window_tx: 0,
+                    window_rx: 0,
+                }),
             }),
         }
     }
 }
 
-#[derive(Default)]
 struct ReporterProgress {
     setup: Option<Duration>,
-    first_response: Option<Duration>,
+    first_response: bool,
+    probe: bool,
+    finished: bool,
+    tx: u64,
+    rx: u64,
+    last_rx_at: Option<Instant>,
+    window_start: Instant,
+    window_tx: u64,
+    window_rx: u64,
 }
 
 struct ReporterShared {
-    state: Arc<ScorePolicyState>,
-    authority: Arc<ScoreAuthority>,
-    context: ScoreSelectionContext,
-    attributions: Arc<[ScoreAttribution]>,
+    feedback: ScoreFeedback,
     cells: Arc<[StartedCells]>,
     started: Instant,
-    finished: AtomicBool,
     handles: AtomicUsize,
-    tx: AtomicU64,
-    rx: AtomicU64,
     progress: Mutex<ReporterProgress>,
-    streak_neutral: bool,
 }
 
 /// Cloneable exact-once flow reporter. The first terminal call wins; dropping
@@ -143,10 +170,18 @@ impl Clone for ScoreReporter {
 
 impl ScoreReporter {
     pub fn setup_succeeded(&self) {
+        self.setup_succeeded_at(Instant::now());
+    }
+
+    pub(super) fn setup_succeeded_at(&self, now: Instant) {
         let mut progress = self.shared.progress.lock();
-        progress
-            .setup
-            .get_or_insert_with(|| self.shared.started.elapsed());
+        if progress.finished || progress.setup.is_some() {
+            return;
+        }
+        let elapsed = now.saturating_duration_since(self.shared.started);
+        progress.setup = Some(elapsed);
+        progress.window_start = now;
+        self.observe(Observation::Setup(elapsed), now);
     }
 
     pub fn setup_failed(&self, outcome: ScoreOutcome) {
@@ -154,65 +189,161 @@ impl ScoreReporter {
     }
 
     pub fn first_response(&self) {
+        self.first_response_at(Instant::now());
+    }
+
+    pub(super) fn first_response_at(&self, now: Instant) {
         let mut progress = self.shared.progress.lock();
-        progress
-            .first_response
-            .get_or_insert_with(|| self.shared.started.elapsed());
+        if progress.finished || progress.first_response {
+            return;
+        }
+        progress.first_response = true;
+        self.observe(
+            Observation::Response(now.saturating_duration_since(self.shared.started)),
+            now,
+        );
+    }
+
+    /// Publish a genuinely measured configured-probe RTT, never a cached average.
+    pub fn probe_latency(&self, latency: Duration) {
+        self.probe_latency_at(latency, Instant::now());
+    }
+
+    pub(super) fn probe_latency_at(&self, latency: Duration, now: Instant) {
+        let mut progress = self.shared.progress.lock();
+        let feedback = &self.shared.feedback;
+        if progress.finished || progress.probe || feedback.source != ScoreSource::HealthProbe {
+            return;
+        }
+        progress.probe = true;
+        self.observe(
+            Observation::Probe {
+                latency,
+                scope: feedback.probe_scope,
+                slot: super::evidence::probe_slot(&feedback.context),
+            },
+            now,
+        );
     }
 
     pub fn tx(&self, bytes: u64) {
-        saturating_add(&self.shared.tx, bytes);
+        self.transfer_at(bytes, 0, Instant::now());
     }
 
     pub fn rx(&self, bytes: u64) {
-        saturating_add(&self.shared.rx, bytes);
+        self.transfer_at(0, bytes, Instant::now());
+    }
+
+    pub(super) fn transfer_at(&self, tx: u64, rx: u64, now: Instant) {
+        if tx == 0 && rx == 0 {
+            return;
+        }
+        let mut progress = self.shared.progress.lock();
+        if progress.finished {
+            return;
+        }
+        progress.tx = progress.tx.saturating_add(tx);
+        progress.rx = progress.rx.saturating_add(rx);
+        if self.shared.feedback.source != ScoreSource::Traffic {
+            return;
+        }
+        if rx > 0 {
+            progress.last_rx_at = Some(progress.last_rx_at.map_or(now, |at| at.max(now)));
+        }
+        if now.saturating_duration_since(progress.window_start) > MAX_THROUGHPUT_DURATION {
+            progress.window_start = now;
+            progress.window_tx = 0;
+            progress.window_rx = 0;
+        }
+        progress.window_tx = progress.window_tx.saturating_add(tx);
+        progress.window_rx = progress.window_rx.saturating_add(rx);
+        self.publish_window(&mut progress, now);
+    }
+
+    fn publish_window(&self, progress: &mut ReporterProgress, now: Instant) {
+        let elapsed = now.saturating_duration_since(progress.window_start);
+        if progress.setup.is_none()
+            || !progress.first_response
+            || progress.tx == 0
+            || progress.rx == 0
+            || elapsed < MIN_THROUGHPUT_DURATION
+            || progress.window_tx.max(progress.window_rx) < MIN_THROUGHPUT_BYTES
+        {
+            return;
+        }
+        self.observe(
+            Observation::Transfer {
+                tx: progress.window_tx,
+                rx: progress.window_rx,
+                elapsed,
+            },
+            now,
+        );
+        progress.window_tx = 0;
+        progress.window_rx = 0;
+        progress.window_start = now;
+    }
+
+    fn observe(&self, observation: Observation, now: Instant) {
+        let feedback = &self.shared.feedback;
+        let mut inner = feedback.state.inner.lock();
+        if feedback.source == ScoreSource::HealthProbe
+            && !inner
+                .active_authority
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, &feedback.authority))
+        {
+            return;
+        }
+        ScorePolicyState::observe(
+            &mut inner,
+            &feedback.context,
+            &feedback.attributions,
+            &self.shared.cells,
+            feedback.source,
+            observation,
+            now,
+        );
     }
 
     /// Recover the immutable attribution plan for a related physical attempt.
     pub fn feedback(&self) -> ScoreFeedback {
-        ScoreFeedback {
-            state: Arc::clone(&self.shared.state),
-            authority: Arc::clone(&self.shared.authority),
-            context: self.shared.context.clone(),
-            attributions: Arc::clone(&self.shared.attributions),
-            streak_neutral: self.shared.streak_neutral,
-        }
+        self.shared.feedback.clone()
     }
 
     /// Complete a successful preparation that carried no application payload.
     pub fn finish_setup_only(&self) {
-        self.finish_inner(ScoreOutcome::Success, false);
+        self.finish_at(ScoreOutcome::Success, false, Instant::now());
     }
 
     pub fn finish(&self, outcome: ScoreOutcome) {
-        self.finish_inner(outcome, true);
+        self.finish_at(outcome, true, Instant::now());
     }
 
-    fn finish_inner(&self, outcome: ScoreOutcome, count_usefulness: bool) {
-        if self
-            .shared
-            .finished
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+    pub(super) fn finish_at(&self, outcome: ScoreOutcome, count_usefulness: bool, now: Instant) {
+        let mut progress = self.shared.progress.lock();
+        if progress.finished {
             return;
         }
-        let progress = self.shared.progress.lock();
+        progress.finished = true;
+        self.publish_window(&mut progress, now);
+        let feedback = &self.shared.feedback;
         let sample = FlowSample {
             outcome,
             setup: progress.setup,
-            first_response: progress.first_response,
-            tx: self.shared.tx.load(Ordering::Relaxed),
-            rx: self.shared.rx.load(Ordering::Relaxed),
-            elapsed: self.shared.started.elapsed(),
+            source: feedback.source,
+            tx: progress.tx,
+            rx: progress.rx,
+            last_rx_at: progress.last_rx_at,
+            elapsed: now.saturating_duration_since(self.shared.started),
             count_usefulness,
-            streak_neutral: self.shared.streak_neutral,
         };
-        self.shared.state.finish(
-            &self.shared.context,
-            &self.shared.attributions,
+        feedback.state.finish_at(
+            &feedback.context,
+            &feedback.attributions,
             &self.shared.cells,
             &sample,
+            now,
         );
     }
 }
@@ -220,13 +351,7 @@ impl ScoreReporter {
 impl Drop for ScoreReporter {
     fn drop(&mut self) {
         if self.shared.handles.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.finish_inner(ScoreOutcome::Cancelled, false);
+            self.finish_at(ScoreOutcome::Cancelled, false, Instant::now());
         }
     }
-}
-
-fn saturating_add(value: &AtomicU64, amount: u64) {
-    let _ = value.try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-        Some(old.saturating_add(amount))
-    });
 }

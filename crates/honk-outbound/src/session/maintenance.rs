@@ -131,8 +131,9 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
         }
         let mut interval = tokio::time::interval(self.config.janitor_interval);
         interval.tick().await;
-        // Per-session zero-stream streak start, keyed by Arc identity
-        // (positions in the vec shift as sessions come and go).
+        // Zero-stream streak start for sessions that keep no idle clock,
+        // keyed by Arc identity (positions in the vec shift as sessions
+        // come and go). Sessions with a clock answer from their own transitions.
         let mut idle_since: HashMap<usize, Instant> = HashMap::new();
         // Per-session max-age deadline (jittered ±10% by pointer so a
         // fleet of same-age sessions never reconnects in lockstep).
@@ -189,8 +190,11 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                         idle_since.remove(&ptr);
                         continue;
                     }
-                    let since = idle_since.entry(ptr).or_insert(now);
-                    if now.duration_since(*since) >= idle_timeout && remaining_active > min_idle {
+                    let since = match s.idle_since() {
+                        Some(since) => since,
+                        None => *idle_since.entry(ptr).or_insert(now),
+                    };
+                    if now.duration_since(since) >= idle_timeout && remaining_active > min_idle {
                         to_close.push(Arc::clone(s));
                         remaining_active -= 1;
                     }

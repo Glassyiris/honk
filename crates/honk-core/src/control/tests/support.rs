@@ -226,20 +226,27 @@ impl honk_outbound::proxy::TcpOutbound for UdpTestHandler {
         target_domain: Option<&str>,
         _connect_timeout: Duration,
     ) -> anyhow::Result<honk_outbound::proxy::ProxyStream> {
-        match &self.mode {
+        let stream = match &self.mode {
             #[cfg(feature = "ebpf")]
-            UdpTestMode::TcpConnect => {}
+            UdpTestMode::TcpConnect => TcpStream::connect(target).await?,
             UdpTestMode::TcpHold { entered, release } => {
+                let stream = honk_outbound::util::connect_marked(
+                    &target.to_string(),
+                    None,
+                    _connect_timeout,
+                )
+                .await?;
                 entered.notify_one();
                 release.notified().await;
+                stream
             }
             UdpTestMode::TcpCaptureTarget(captured) => {
                 *captured.lock().expect("dial target") =
                     Some((target, target_domain.map(str::to_owned)));
+                TcpStream::connect(target).await?
             }
             _ => anyhow::bail!("TCP dial is not used by the UDP lifecycle tests"),
-        }
-        let stream = TcpStream::connect(target).await?;
+        };
         Ok(honk_outbound::proxy::ProxyStream {
             stream: Box::new(stream),
             target_addr: target,

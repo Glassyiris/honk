@@ -174,34 +174,32 @@ async fn warm_quic_starts_feedback_before_blocked_stream_open() {
         let release_open = Arc::clone(&release_open);
         tokio::spawn(async move {
             generation
-                .scope_dials_with_start(
-                    dial_quic_stream(
-                        &client,
-                        |timeout| {
-                            let client = Arc::clone(&client);
-                            async move {
-                                client
-                                    .connection_with(timeout, |_| async {
-                                        Ok::<_, anyhow::Error>(TestConnState::default())
-                                    })
-                                    .await
-                            }
-                        },
-                        Duration::from_secs(1),
-                        move |_conn| {
-                            let open_entered = Arc::clone(&open_entered);
-                            let release_open = Arc::clone(&release_open);
-                            async move {
-                                open_entered.notify_one();
-                                release_open.notified().await;
-                                Err(anyhow::anyhow!("released test stream open"))
-                            }
-                        },
-                        |_| false,
-                        "test",
-                    ),
-                    move || feedback_started.store(true, Ordering::Release),
-                )
+                .dial_scope(move || feedback_started.store(true, Ordering::Release))
+                .scope(dial_quic_stream(
+                    &client,
+                    |timeout| {
+                        let client = Arc::clone(&client);
+                        async move {
+                            client
+                                .connection_with(timeout, |_| async {
+                                    Ok::<_, anyhow::Error>(TestConnState::default())
+                                })
+                                .await
+                        }
+                    },
+                    Duration::from_secs(1),
+                    move |_conn| {
+                        let open_entered = Arc::clone(&open_entered);
+                        let release_open = Arc::clone(&release_open);
+                        async move {
+                            open_entered.notify_one();
+                            release_open.notified().await;
+                            Err(anyhow::anyhow!("released test stream open"))
+                        }
+                    },
+                    |_| false,
+                    "test",
+                ))
                 .await
         })
     };

@@ -88,7 +88,11 @@ impl ControlPlane {
                 let sem = semaphore.clone();
                 let _ = task_owner.spawn_background(async move {
                     let _permit = sem.acquire_owned().await;
-                    let reporter = feedback.map(|feedback| feedback.streak_neutral().start());
+                    let reporter = feedback.map(|feedback| {
+                        feedback
+                            .with_source(crate::group::ScoreSource::Warmup)
+                            .start()
+                    });
                     match generation
                         .scope_dials(honk_outbound::util::connect_outbound(
                             &addr,

@@ -99,6 +99,47 @@ pub enum SessionState {
     Closed,
 }
 
+/// When a session last had no open stream. A session stamps it at the two
+/// transitions the janitor cannot see from its tick — a permit taken, the
+/// last permit released — so a stream that opened and closed between two
+/// ticks still counts as activity.
+#[derive(Debug)]
+pub struct IdleClock {
+    since: Mutex<Option<Instant>>,
+}
+
+impl Default for IdleClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IdleClock {
+    /// A fresh session is idle from now.
+    pub fn new() -> Self {
+        Self {
+            since: Mutex::new(Some(Instant::now())),
+        }
+    }
+
+    /// A stream slot was taken.
+    pub fn stream_opened(&self) {
+        *self.since.lock() = None;
+    }
+
+    /// A stream slot was released; `active_streams` is the count after the release.
+    pub fn stream_released(&self, active_streams: usize) {
+        if active_streams == 0 {
+            *self.since.lock() = Some(Instant::now());
+        }
+    }
+
+    /// `Some` while no stream is open: the instant the last one closed, or creation.
+    pub fn idle_since(&self) -> Option<Instant> {
+        *self.since.lock()
+    }
+}
+
 /// RAII stream-slot reservation on one session — the single capacity
 /// truth. Released on Drop (stream end, failed open, caller cancel).
 pub struct SessionPermit<S: ManagedSession> {
@@ -171,6 +212,13 @@ pub trait ManagedSession: Send + Sync {
     fn begin_drain(&self) {}
     /// Observe release after the semaphore slot becomes available.
     fn permit_released(&self) {}
+    /// When the session last went to zero streams, or creation for a session
+    /// that has never carried one; `None` while a stream is open. A session
+    /// that keeps no [`IdleClock`] returns `None` and the janitor samples
+    /// instead, which can miss a stream shorter than one tick.
+    fn idle_since(&self) -> Option<Instant> {
+        None
+    }
     /// Atomically reserve one stream slot: check `Active` → acquire →
     /// re-check `Active` (a session that began draining in between
     /// releases the permit immediately and reports `None`). Default `None`

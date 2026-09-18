@@ -7,5 +7,7 @@ experimental {
         secret: 'token'
         allow_origins: 'http://one.example', 'http://two.example', 'http://three.example'
         allowed_hosts: 'one.example', 'two.example', 'three.example'
+        probe_allowed_cidrs: '127.0.0.0/8', '192.0.2.0/24', '::1/128'
+        probe_allowed_ports: '53', '443', '8443'
     }
 }

@@ -71,7 +71,7 @@ TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，
 
 Flow ID 表示 incarnation，不是五元组。TCP/UDP 在真实 route/sniff/verification/selected-leaf/attempt/terminal 边界捕获，拨号失败或阻断即使没有 live connection 也保留。名称、ID、代次取自决策时，不与当前选择重建关联。内核 offload 以 unknown 结束观察，不伪造连接 closed。Rule 内部执行、DNS 子步骤和底层 transport attempt 尚未完整捕获，因此 trace 为 partial，kernel/DNS scope 为 none，不开放 full_transparency。
 
-Flow list 接受 `network/state/connection_id/detail/limit/cursor`。最多八份有界不可变 snapshot，TTL 30 秒，游标绑定 instance 与原过滤器/detail。过期列表返回 `410 snapshot_expired`，已知淘汰 ID 的有界 tombstone 返回 `410 flow_expired`，未知 ID 返回 `404 resource_not_found`；snapshot 满返回 503 与 Retry-After。Detail 不接受 query，始终返回保留的 full input/trace。计数为十进制字符串，revision/seq/elapsed_us 为 safe JSON number；不安全的可选显示字段置 null，不丢弃因果 ID 或结果。
+Flow list 接受 `network/state/connection_id/detail/limit/cursor`。最多八份有界不可变 snapshot，TTL 30 秒，游标绑定 instance 与原过滤器/detail。表满时淘汰最旧 snapshot；保留字节预算耗尽才返回 503 与 Retry-After。过期或被淘汰的列表返回 `410 snapshot_expired`，已知淘汰 ID 的有界 tombstone 返回 `410 flow_expired`，未知 ID 返回 `404 resource_not_found`。Detail 不接受 query，始终返回保留的 full input/trace。计数为十进制字符串，revision/seq/elapsed_us 为 safe JSON number；不安全的可选显示字段置 null，不丢弃因果 ID 或结果。
 
 ### 节点与组（M3）
 
@@ -107,7 +107,7 @@ RSS 来自 `/proc/self/status`；cgroup v2 依据实际 membership/mountinfo 定
 
 启用 `config_write` 后，非凭据主文件可写；include 只有在已接受集合中，且其规范化路径相对入口目录精确匹配 `writable_includes` 时才可写。该列表不接受绝对路径、遍历或 glob，也不能授权任意新文件；generated/subscription 来源不因此可写。普通 include 仍使用原有入口相对 glob、排序、无匹配及重复/越界检查语义，不因写许可列表改变。API 禁止修改原生设置或改变、移动 API 凭据；如需编辑含凭据主文件，先在本地把凭据迁到专用只读 include 并重启，不能通过 API 完成迁移。
 
-校验使用 `Content-Type: application/json`，例如 `{"mode":"syntax","sources":[{"id":"source-1","content":"..."}]}`；mode 可选 `syntax` 或 `full`，每个 source 的 id/path 可省略。`syntax` 只解析提交的文档，path 仅作来源标签，不授权文件访问，也不跟随磁盘 include。`full` 的首份文档对应入口主文件，额外路径须通过入口根目录授权；使用 overlay、获准本地 include、只读订阅缓存、实际本地 geodata/hosts/ECH 依赖做完整离线准入。缺失或无效依赖是错误，不联网、不创建目录或改权限、不启动 worker、不发布 generation。完成的无效 dry-run 返回 `200` 与 `valid:false`；这不代替之后真实 reload 的运行时校验，也不承诺 reload 一定成功。
+校验使用 `Content-Type: application/json`，例如 `{"mode":"syntax","sources":[{"id":"source-1","content":"..."}]}`；mode 可选 `syntax` 或 `full`，每个 source 的 id/path 可省略。`syntax` 只解析提交的文档，path 仅作来源标签，不授权文件访问，也不跟随磁盘 include。`full` 的首份文档对应入口主文件，额外路径须通过入口根目录授权；使用 overlay、获准本地 include、只读订阅缓存、实际本地 geodata/hosts/ECH 依赖做完整离线准入。从未拉取的订阅以 warning 准入、不产生缓存节点；已有 same-fetch 活动节点仍可 rebase。其他缺失或无效依赖是错误。校验不联网、不创建目录或改权限、不启动 worker、不发布 generation。完成的无效 dry-run 返回 `200` 与 `valid:false`；这不代替之后真实 reload 的运行时校验，也不承诺 reload 一定成功。
 
 PUT 的 JSON body 为 `{"content":"完整的新原文"}`。`If-Match` 必须是**单个带双引号、含 64 个小写十六进制字符的 SHA-256 强标签**，可将读取到的 `content_sha256` 加双引号使用；它比较磁盘当前原始字节，不是 config revision 或 runtime generation。源 GET 仍是 accepted 快照，因此外部编辑后可能需要本地处理或显式 reload，而不是用旧快照覆盖磁盘。
 
@@ -365,11 +365,28 @@ R = {
 
 `score.groups` 是经鉴权 `/stats` 响应中的附加部分。当前没有任何组使用 `policy: score` 时它为 `[]`；否则它包含每个当前 Score 组（包括没有解析出叶节点的组），按 `name` 的字典序排列。每组始终都有 `tcp` 和 `udp` 对象，且每个对象始终包含全部 `R` 字段；没有网络活动时以零表示，绝不省略字段。
 
-每个值都是饱和的 `u64` 计数，不是延迟、字节、时长、目标或健康度量。前六个字段按固定优先级分类一次已授权的多候选 Score **Apply**：初始预算探索为 `coldExplore`；周期上置信界非现任为 `periodicExplore`；成功保持现任为 `incumbentHeld`；只有新鲜失败证据打破已训练且效用差距很小的保持条件时为 `freshFailureBypass`；所有备选均在所选可靠性带之外时为 `reliabilityWinner`；其余为 `performanceWinner`。`deadFiltered` 独立计数活性过滤移除的唯一叶候选。`switchFlap` 独立计数已提交胜者在八次选择内切回前一胜者；有意的冷探索和周期探索不改变这段后悔窗口。`failStreakExcluded` 按每次已授权 rank 累计被三连败新鲜失败门排除的候选数，`exploreBackedOff` 累计当前处于探索退避的候选数。Peek、`/proxies`、`/stats`、单例旁路和最后尝试选择均不计数。
+每个值是饱和 `u64` 计数，不是延迟、吞吐或健康测量。一次已授权的多候选 Score Apply 记录一个最终原因：`coldExplore` 表示有限冷启动预算；`periodicExplore` 表示共享时间/计数/退化验证；`incumbentHeld` 表示保持已提交胜者；`freshFailureBypass` 表示新鲜失败使资格或保持失效；没有其他普通合格候选时为 `reliabilityWinner`，其余为 `performanceWinner`。性能原因不证明提速或发生切换。`deadFiltered` 计数唯一健康过滤叶节点；`switchFlap` 计数同目标八次选择内返回前一已提交胜者，不包含试用；`failStreakExcluded` 和 `exploreBackedOff` 按 rank 计数受影响候选。Peek、API 读取、单例与最后尝试旁路不增加这些计数。
 
 计数在进程启动时从零开始，只在进程内存中累积。只要组名仍在已提交配置中，成功 reload 会保留它们，包括零叶节点以及临时 Score→非 Score→Score 转换；非 Score 组不会显示在此响应中。已提交的删除会清除该名称的计数，之后重新创建同名组从零开始。受 generation fence 约束的已淘汰 manager 在被替换后不能再修改计数，即使同名组随后被重新创建。快照在 JSON 序列化前复制，读取不会改变选路状态。
 
-`/stats.score` 只公开组名和 TCP/UDP 的二十个聚合计数，外加一个 `cache` 对象，给出两个 4,096 项证据 LRU 的当前 cell 数（`exactCells`、`aggregateCells`）与累计淘汰数（`exactEvictions`、`aggregateEvictions`）。它绝不包含节点、节点 ID/tag、目标/domain/IP/port、目标地址族、评分 cell、cadence 键、manager authority、凭据或其他 scorer 私有值；这些值也不会进入新的 Score 日志或持久化。此新增内容不改变 `/proxies` 或 `/stats.outbounds` 中既有的节点名，也不改变 `/connections` 中既有的目标元数据。
+`/stats.score` 公开组名、固定的 TCP/UDP 原因与验证计数，以及有界证据缓存的占用/淘汰数，不包含节点身份、目标/domain/IP/port、原始 cell、cadence 键、authority 或凭据。`/proxies` 中既有公开成员名和 `/connections` 中目标元数据保持不变。
+
+### Score 验证信息
+
+`/proxies` 与 `/proxies/{name}` 中的 Score 组增加 `scoreVerification`。固定目标为 `responseQualityWithAvailability`，范围为 `aggregate`，不是对每个精确目的地的认证。`tcp` 和 `udp` 分别包含：
+
+| 字段 | 含义 |
+| --- | --- |
+| `selected` | 本次只读判定对应的既有公开成员 tag；没有普通合格候选时为 null。存在时 TCP `now` 使用同一次判定的选择。 |
+| `state` | `provisional` 或 `observedUsable`；后者需要近期业务证据，不能仅由 HEAD 成功获得。 |
+| `comparison` / `basis` | `unconfirmed`、`equivalent` 或 `supported`，依据为 `none`、`configuredProbe`、`targetResponse`、`aggregateResponse`、`upload` 或 `download`。不代表误判概率或保证最优。 |
+| `missing` | 相关候选覆盖范围内的 availability/response/transfer 布尔缺口；当前路径已观测可用时，备选仍可能需要验证。 |
+| `nextAction` | `nextBusinessFlow` 仅在共享预算允许时使用未来真实流量；`awaitTransfer` 等待真实负载，不主动大流量测速；`backoff` 保留失败隔离；`none` 表示没有可执行的缺失工作。 |
+| `coverage` | 候选、已比较与待确认数量；单节点可以证明已观测可用，不代表优于其他路径。 |
+| `evidenceAgeMs` / `validForMs` | 最弱支持证据的年龄与条件性剩余有效期；没有结论时为 null。新证据可以提前撤销结论。 |
+| `network`、`targetFamily`、`healthFamily`、`targetSpecific` | transport 与适用范围；此聚合接口没有精确目标，不导出 domain/IP/port 或原始节点 ID。 |
+
+`/stats.score.groups[].verification.tcp` 与 `.udp` 增加饱和计数：`provisionalSelections`、`usableSelections`、`validationSelections`、`confirmations`、`expired`、`contradicted`、`confirmationMillis`。确认计数包括新成立的配置探测比较等经验性结论，不表示所有维度的业务或带宽认证；`confirmationMillis / confirmations` 是这些结论的累计平均确认耗时，不是网络延迟。只读查询立即反映过期，转移计数只在后续授权 Apply 时推进。没有流量或预算不能授予确认；查询不派发验证，也不改变计数。10% 比较容差表示实际意义上的近似等价，不是已校准的误判概率。
 
 ### 出站与 ready pool 字段
 

@@ -554,28 +554,43 @@ impl PacketTransport for SsUdpTransport {
         let mut recv_buf = self.recv_buf.lock().await;
         // Core already supplies a full datagram buffer; only smaller callers
         // need reusable ciphertext scratch separate from their plaintext output.
-        let wire = if buf.len() >= UDP_PACKET_BUFFER_SIZE {
-            &mut *buf
+        let mut scratch = if buf.len() >= UDP_PACKET_BUFFER_SIZE {
+            None
         } else {
-            recv_buf
-                .get_or_insert_with(|| vec![0u8; UDP_PACKET_BUFFER_SIZE])
-                .as_mut_slice()
+            Some(recv_buf.get_or_insert_with(|| vec![0u8; UDP_PACKET_BUFFER_SIZE]))
         };
-        let n = self.socket.recv(wire).await?;
-        let payload = self
-            .crypto
-            .lock()
-            .await
-            .open(&wire[..n])
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        if payload.len() > buf.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "shadowsocks packet exceeds buffer",
-            ));
+        // A datagram that fails to open (short, wrong key, replayed, bad
+        // address) is that datagram's problem: the session and the endpoint
+        // stay valid, so drop it and keep receiving. Only the socket ends the
+        // transport.
+        loop {
+            let wire = match scratch.as_deref_mut() {
+                Some(scratch) => scratch.as_mut_slice(),
+                None => &mut *buf,
+            };
+            let n = self.socket.recv(wire).await?;
+            let payload = match self.crypto.lock().await.open(&wire[..n]) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    debug!(
+                        "Shadowsocks UDP: dropping {} byte datagram for {}: {}",
+                        n, self.target, error
+                    );
+                    continue;
+                }
+            };
+            if payload.len() > buf.len() {
+                debug!(
+                    "Shadowsocks UDP: dropping {} byte payload for {} that exceeds the {} byte buffer",
+                    payload.len(),
+                    self.target,
+                    buf.len()
+                );
+                continue;
+            }
+            buf[..payload.len()].copy_from_slice(&payload);
+            return Ok((payload.len(), self.target));
         }
-        buf[..payload.len()].copy_from_slice(&payload);
-        Ok((payload.len(), self.target))
     }
 }
 

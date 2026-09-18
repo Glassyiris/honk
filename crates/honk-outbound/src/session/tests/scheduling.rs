@@ -51,24 +51,22 @@ async fn warm_session_starts_feedback_before_blocked_open() {
         let feedback_started_for_open = Arc::clone(&feedback_started);
         tokio::spawn(async move {
             generation
-                .scope_dials_with_start(
-                    pool.open_with(
-                        || async { anyhow::bail!("warm session must not dial") },
-                        move |_session, permit| {
-                            let feedback_started = Arc::clone(&feedback_started_for_open);
-                            let open_entered = Arc::clone(&open_entered);
-                            let release_open = Arc::clone(&release_open);
-                            async move {
-                                assert!(feedback_started.load(Ordering::Acquire));
-                                open_entered.notify_one();
-                                release_open.notified().await;
-                                drop(permit);
-                                Ok::<_, OpenError>(())
-                            }
-                        },
-                    ),
-                    move || feedback_started.store(true, Ordering::Release),
-                )
+                .dial_scope(move || feedback_started.store(true, Ordering::Release))
+                .scope(pool.open_with(
+                    || async { anyhow::bail!("warm session must not dial") },
+                    move |_session, permit| {
+                        let feedback_started = Arc::clone(&feedback_started_for_open);
+                        let open_entered = Arc::clone(&open_entered);
+                        let release_open = Arc::clone(&release_open);
+                        async move {
+                            assert!(feedback_started.load(Ordering::Acquire));
+                            open_entered.notify_one();
+                            release_open.notified().await;
+                            drop(permit);
+                            Ok::<_, OpenError>(())
+                        }
+                    },
+                ))
                 .await
         })
     };

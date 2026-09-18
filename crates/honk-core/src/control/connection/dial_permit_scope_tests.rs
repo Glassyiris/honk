@@ -1,6 +1,93 @@
 use super::*;
 
 #[tokio::test]
+async fn dns_wait_timeout_remains_retryable_with_free_admission() {
+    // Bootstrap DNS is process-global; isolate it from parallel core tests.
+    const CHILD: &str = "HONK_DIAL_DNS_TIMEOUT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "control::connection::tcp::dial_permit_scope_tests::dns_wait_timeout_remains_retryable_with_free_admission",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("isolated DNS timeout test");
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let target: SocketAddr = "192.0.2.1:443".parse().unwrap();
+    let mut node = Node {
+        name: "dns-wait".into(),
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
+        address: "pending.invalid".into(),
+        port: 1080,
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    let generation = Arc::new(
+        honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(&[node.clone()], 1, None)
+            .unwrap()
+            .0,
+    );
+    let control = crate::control::tests::support::control_plane(Config {
+        nodes: vec![node.clone()],
+        ..Default::default()
+    });
+    let handle = control.spawn_handle();
+    let dns = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    honk_outbound::bootstrap::set_global(honk_outbound::bootstrap::BootstrapResolver::parse(
+        &dns.local_addr().unwrap().to_string(),
+    ));
+    let candidates = [&node];
+    let feedback = HashMap::new();
+    #[cfg(feature = "native-api")]
+    let selection_chains = HashMap::new();
+    let (result, ()) = tokio::join!(
+        handle.race_candidates(
+            &candidates,
+            target,
+            None,
+            "score",
+            crate::stats::OutboundKind::Group,
+            Duration::from_millis(100),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            Arc::clone(&generation),
+            IpVersion::V4,
+            &feedback,
+            false,
+            #[cfg(feature = "native-api")]
+            &selection_chains,
+            #[cfg(feature = "native-api")]
+            None,
+        ),
+        async {
+            let mut packet = [0; 512];
+            tokio::time::timeout(Duration::from_secs(1), dns.recv_from(&mut packet))
+                .await
+                .expect("the candidate must reach bootstrap DNS")
+                .unwrap();
+            let permit =
+                tokio::time::timeout(Duration::from_millis(100), generation.acquire_dial_permit())
+                    .await
+                    .expect("physical admission must remain available during DNS");
+            drop(permit);
+        }
+    );
+    assert!(
+        matches!(result, Ok(None)),
+        "DNS timeout must remain an ordinary failed attempt, not terminal Capacity"
+    );
+}
+
+#[tokio::test]
 async fn ready_pool_hit_does_not_wait_for_physical_dial_permit() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = listener.local_addr().unwrap();
@@ -37,6 +124,8 @@ async fn ready_pool_hit_does_not_wait_for_physical_dial_permit() {
     )
     .await;
     let registry = ProxyRegistry::default_resolver().unwrap();
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started_on_dial = Arc::clone(&started);
 
     let (stream, fresh) = tokio::time::timeout(
         Duration::from_millis(100),
@@ -47,12 +136,15 @@ async fn ready_pool_hit_does_not_wait_for_physical_dial_permit() {
             &node,
             (target, None),
             Duration::from_secs(1),
-            || {},
+            &generation.dial_scope(move || {
+                started_on_dial.store(true, std::sync::atomic::Ordering::Release)
+            }),
         ),
     )
     .await
     .expect("ready stream must bypass an exhausted physical-dial gate")
     .unwrap();
+    assert!(started.load(std::sync::atomic::Ordering::Acquire));
     assert!(
         !fresh,
         "a ready-pool acquire performs no network round trip"
@@ -91,13 +183,78 @@ async fn feedback_does_not_start_while_waiting_for_dial_admission() {
             &node,
             (target, None),
             Duration::from_secs(1),
-            move || started_on_dial.store(true, std::sync::atomic::Ordering::Release),
+            &generation.dial_scope(move || {
+                started_on_dial.store(true, std::sync::atomic::Ordering::Release)
+            }),
         ),
     )
     .await;
 
     assert!(result.is_err());
     assert!(!started.load(std::sync::atomic::Ordering::Acquire));
+
+    let mut alternate = node.clone();
+    alternate.name = "alternate".into();
+    alternate.port += 1;
+    alternate.id = alternate.derive_id();
+    let nodes = [node.clone(), alternate];
+    let group = honk_config::group::Group {
+        name: "score".into(),
+        policy: honk_config::group::GroupPolicy::Score,
+        nodes: nodes.iter().map(|node| node.id).collect(),
+        ..Default::default()
+    };
+    let control = crate::control::tests::support::control_plane(Config {
+        nodes: nodes.to_vec(),
+        groups: vec![group],
+        ..Default::default()
+    });
+    let handle = control.spawn_handle();
+    let manager = handle.group_manager.read().clone();
+    let context = tcp_score_context(target, None, IpVersion::V4);
+    let feedback = manager.feedback_for_node(node.id, context.clone()).unwrap();
+    let feedback = HashMap::from([(node.id, feedback)]);
+    for _ in 0..2 {
+        let result = handle
+            .race_candidates(
+                &[&node],
+                target,
+                None,
+                "score",
+                crate::stats::OutboundKind::Group,
+                Duration::from_millis(5),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                Arc::clone(&generation),
+                IpVersion::V4,
+                &feedback,
+                false,
+                #[cfg(feature = "native-api")]
+                &HashMap::new(),
+                #[cfg(feature = "native-api")]
+                None,
+            )
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("unstarted admission expiry must be terminal, not retryable"),
+        };
+        assert_eq!(
+            honk_outbound::proxy::packet_rejection(&error),
+            Some(honk_outbound::proxy::PacketRejection::Capacity)
+        );
+    }
+    assert!(
+        !handle
+            .alive_set
+            .is_failure_demoted(node.id, ProbeDomain::Tcp, IpVersion::V4)
+    );
+    assert_eq!(
+        manager.selection_plan_for_target("score", &context).entries[0]
+            .node
+            .id,
+        node.id,
+        "unstarted waits must not train failure evidence or explore an alternate"
+    );
 }
 
 #[test]

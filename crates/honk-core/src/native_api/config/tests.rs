@@ -710,10 +710,23 @@ async fn validation_ids_and_display_paths_cannot_expand_file_authority() {
     })).send().await.unwrap()).await;
     assert_eq!(syntax["valid"], true);
     // The display path GET /config hands out names no file; a client may echo it with the id.
-    let main_id = before["sources"][0]["id"].clone();
-    let echoed = ok(fixture.request(Method::POST, VALIDATE).json(&json!({
-        "mode":"full","sources":[{"id":main_id,"path":"<redacted>","content":fixture.originals["main.dae"]}]
-    })).send().await.unwrap()).await;
+    let echoed_sources: Vec<_> = before["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["content"].is_string())
+        .map(|row| json!({"id":row["id"],"path":row["path"],"content":row["content"]}))
+        .collect();
+    assert!(echoed_sources.len() > 1);
+    let echoed = ok(fixture
+        .request(Method::POST, VALIDATE)
+        .json(&json!({
+            "mode":"full","sources":echoed_sources
+        }))
+        .send()
+        .await
+        .unwrap())
+    .await;
     assert_eq!(echoed["valid"], true);
     let outside = tempfile::tempdir().unwrap();
     let outside_path = outside.path().join("outside.dae");

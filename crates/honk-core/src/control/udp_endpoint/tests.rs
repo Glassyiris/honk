@@ -4,6 +4,8 @@ pub(super) mod closure;
 #[cfg(feature = "native-api")]
 mod native_flow_tests;
 
+mod score;
+
 fn transport(
     sock: Arc<UdpSocket>,
     relay: SocketAddr,
@@ -1504,7 +1506,7 @@ async fn udp_endpoint_worker_rejects_stale_first_packet() {
     let endpoint = driver_test_endpoint(Arc::clone(&transport), relay);
     let (first_ack_tx, first_ack_rx) = oneshot::channel();
     let worker = tokio::spawn(run_endpoint_driver(
-        endpoint,
+        Arc::clone(&endpoint),
         queue_rx,
         test_reply_socket().await,
         client,
@@ -1521,6 +1523,8 @@ async fn udp_endpoint_worker_rejects_stale_first_packet() {
     assert_eq!(transport.confirmed_send_count(), 0);
     assert_eq!(stats.udp_snapshot().first_send_failures, 1);
     worker.await.unwrap().unwrap_err();
+    assert_eq!(endpoint.upload.load(Ordering::Relaxed), 0);
+    assert_eq!(endpoint.download.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1581,7 +1585,7 @@ async fn udp_endpoint_worker_keeps_flow_alive_on_congested_steady_send() {
     let endpoint = driver_test_endpoint(Arc::clone(&transport), relay);
     let (first_ack_tx, first_ack_rx) = oneshot::channel();
     let worker = tokio::spawn(run_endpoint_driver(
-        endpoint,
+        Arc::clone(&endpoint),
         queue_rx,
         test_reply_socket().await,
         client,
@@ -1600,6 +1604,10 @@ async fn udp_endpoint_worker_keeps_flow_alive_on_congested_steady_send() {
         io::ErrorKind::Interrupted
     );
     assert_eq!(stats.udp_snapshot().first_send_failures, 0);
+    assert_eq!(
+        endpoint.upload.load(Ordering::Relaxed),
+        b"first".len() as u64
+    );
     assert!(
         alive
             .get_probe_history(
@@ -1807,6 +1815,8 @@ async fn udp_endpoint_node_death_stops_after_blocked_first_send() {
         io::ErrorKind::ConnectionAborted
     );
     assert_eq!(transport.sent_packets(), vec![b"first".to_vec()]);
+    assert_eq!(endpoint.upload.load(Ordering::Relaxed), 0);
+    assert_eq!(endpoint.download.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]

@@ -193,6 +193,7 @@ impl GroupManager {
                     &mut Vec::new(),
                     depth,
                     SelectionEffects::Peek,
+                    None,
                 )?;
                 return Some(NativeGroupSelection {
                     member: candidate.member().into(),
@@ -249,6 +250,7 @@ impl GroupManager {
             visited,
             depth,
             effects,
+            None,
         )
         .map(|candidate| candidate.node)
     }
@@ -277,6 +279,7 @@ impl GroupManager {
             visited,
             depth,
             effects,
+            None,
         )
     }
 

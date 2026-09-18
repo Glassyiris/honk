@@ -98,16 +98,19 @@ pub(super) struct ResolvedScorePlan {
     pub(super) health_family: IpVersion,
     pub(super) feedback: Vec<Option<honk_outbound::group::ScoreFeedback>>,
     pub(super) selection_chains: Vec<Vec<String>>,
+    pub(super) final_owners: Vec<Vec<String>>,
 }
 
 fn own_score_plan(plan: honk_outbound::group::ScoreSelectionPlan<'_>) -> ResolvedScorePlan {
     let mut nodes = Vec::with_capacity(plan.entries.len());
     let mut feedback = Vec::with_capacity(plan.entries.len());
     let mut selection_chains = Vec::with_capacity(plan.entries.len());
+    let mut final_owners = Vec::with_capacity(plan.entries.len());
     for entry in plan.entries {
         nodes.push(entry.node.clone());
         feedback.push(entry.feedback);
         selection_chains.push(entry.selection_chain);
+        final_owners.push(entry.final_owners);
     }
     ResolvedScorePlan {
         mode: plan.mode,
@@ -115,6 +118,7 @@ fn own_score_plan(plan: honk_outbound::group::ScoreSelectionPlan<'_>) -> Resolve
         health_family: plan.health_family,
         feedback,
         selection_chains,
+        final_owners,
     }
 }
 
@@ -124,6 +128,21 @@ pub(super) fn resolve_urltest_retry_plan_for_target(
     context: &honk_outbound::group::ScoreSelectionContext,
 ) -> ResolvedScorePlan {
     own_score_plan(group_manager.urltest_retry_plan_for_target(outbound_name, context))
+}
+
+pub(super) fn resolve_score_retry_plan_for_target(
+    group_manager: &GroupManager,
+    outbound_name: &str,
+    context: &honk_outbound::group::ScoreSelectionContext,
+    failed_node: uuid::Uuid,
+    final_owners: &[String],
+) -> ResolvedScorePlan {
+    own_score_plan(group_manager.score_retry_plan_for_target(
+        outbound_name,
+        context,
+        failed_node,
+        final_owners,
+    ))
 }
 
 pub(super) fn resolve_outbound_plan_for_target(
@@ -143,6 +162,7 @@ pub(super) fn resolve_outbound_plan_for_target(
             health_family: context.health_family,
             feedback: Vec::new(),
             selection_chains: Vec::new(),
+            final_owners: Vec::new(),
         };
     }
     if matches!(constraint, OutboundConstraint::Any)
@@ -154,6 +174,7 @@ pub(super) fn resolve_outbound_plan_for_target(
             health_family: context.health_family,
             feedback: vec![None],
             selection_chains: vec![vec![outbound_name.to_owned()]],
+            final_owners: vec![Vec::new()],
         };
     }
     if let Some(node) = config.nodes.iter().find(|node| match constraint {
@@ -189,6 +210,7 @@ pub(super) fn resolve_outbound_plan_for_target(
                 .map(|_| vec![node.name.clone()])
                 .into_iter()
                 .collect(),
+            final_owners: health_family.map(|_| Vec::new()).into_iter().collect(),
         };
     }
     if !config
@@ -202,6 +224,7 @@ pub(super) fn resolve_outbound_plan_for_target(
             health_family: context.health_family,
             feedback: vec![None],
             selection_chains: vec![vec![Config::BUILTIN_DIRECT_NODE.to_owned()]],
+            final_owners: vec![Vec::new()],
         };
     }
     own_score_plan(
