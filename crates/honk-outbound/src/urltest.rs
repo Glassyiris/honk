@@ -8,15 +8,15 @@
 //! whose transport fails or times out falls back to the first exchange's time;
 //! rejected response heads and bad decoded status codes never do. Successful measurements
 //! feed the node's latency history in [`AliveDialerSet`].
-//! A lone ordinary failure leaves history unchanged; a second consecutive one
-//! adds a synthetic penalty and demotes the node. Local packet refusal is neutral.
+//! An arbitrary measurement failure does not alter real dial failure streaks
+//! or establish a node-wide outage; configured health probes own liveness.
 //!
 //! Shared by clash delay measurements and periodic HTTP health checks; their
 //! wrappers remain responsible for alive-state updates.
 
 use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 use crate::group::{
-    GroupManager, ScoreFeedback, ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreTarget,
+    GroupManager, ScoreFeedback, ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreSource,
     SelectionNetwork,
 };
 use crate::proxy::{ProxyRegistry, TcpOutbound};
@@ -177,7 +177,7 @@ pub async fn urltest_node(
 ) -> anyhow::Result<Duration> {
     let timeout = urltest_timeout(timeout);
     let request = http_probe_request(url, "")?;
-    urltest_request_impl(runtime, handler, &request, timeout, None).await
+    urltest_request_impl(runtime, handler, &request, timeout).await
 }
 
 async fn urltest_request_impl(
@@ -185,7 +185,6 @@ async fn urltest_request_impl(
     handler: &dyn TcpOutbound,
     request: &http::Request<()>,
     timeout: Duration,
-    group_manager: Option<&GroupManager>,
 ) -> anyhow::Result<Duration> {
     validate_runtime(runtime)?;
     let node = runtime.node.as_ref();
@@ -194,28 +193,6 @@ async fn urltest_request_impl(
     let port = target.port();
     let direct = node.protocol() == honk_config::types::NodeProtocol::Direct;
     let addr = resolve_urltest_address(host, port, direct).await?;
-    let feedback = group_manager.and_then(|manager| {
-        let family = if addr.is_ipv6() {
-            IpVersion::V6
-        } else {
-            IpVersion::V4
-        };
-        let target = host
-            .parse::<std::net::IpAddr>()
-            .map_or_else(|_| ScoreTarget::domain(host, port), |_| addr.into());
-        manager
-            .feedback_for_node(
-                node.id,
-                ScoreSelectionContext {
-                    network: SelectionNetwork::Tcp,
-                    probe_domain: ProbeDomain::Tcp,
-                    target_family: Some(family),
-                    health_family: family,
-                    target: Some(target),
-                },
-            )
-            .map(|feedback| feedback.streak_neutral())
-    });
     measure_http_probe(
         runtime,
         handler,
@@ -224,7 +201,7 @@ async fn urltest_request_impl(
         Some(host),
         timeout,
         timeout,
-        feedback,
+        None,
     )
     .await
 }
@@ -383,13 +360,13 @@ async fn urltest_node_in_generation_impl(
                         IpVersion::V4,
                     ),
                 )
-                .map(|feedback| feedback.streak_neutral())
+                .map(|feedback| feedback.with_source(ScoreSource::Warmup))
         })
     };
     let result = generation
         .scope_dials(async {
             warm_http_probe(&runtime, warmable, timeout, timeout, warm_feedback).await?;
-            urltest_request_impl(&runtime, handler, &request, timeout, group_manager).await
+            urltest_request_impl(&runtime, handler, &request, timeout).await
         })
         .await;
     if let Some(guard) = guard {
@@ -439,7 +416,9 @@ pub async fn measure_http_probe(
     let host = target.host();
     let is_https = target.is_https();
     let node = runtime.node.as_ref();
-    let reporter = start_feedback(feedback);
+    let reporter = start_feedback(feedback.map(|feedback| {
+        feedback.with_probe_identity(&request.uri().to_string(), request.method().as_str())
+    }));
     let result = async {
         // Dial, target TLS, HTTP/2 startup, and both exchanges each receive
         // their own phase budget rather than sharing one outer clock.
@@ -650,6 +629,9 @@ where
         {
             Ok(Ok((measured, status))) => {
                 validate_status_code(status)?;
+                if let Some(reporter) = reporter {
+                    reporter.probe_latency(measured);
+                }
                 Ok(measured)
             }
             Ok(Err(RoundError::Transport(_))) | Err(_) => Ok(warm),
@@ -824,6 +806,9 @@ where
     {
         Ok((measured, status)) => {
             validate_status_code(status)?;
+            if let Some(reporter) = reporter {
+                reporter.probe_latency(measured);
+            }
             Ok(measured)
         }
         Err(RoundError::Transport(_)) => Ok(warm),
@@ -833,8 +818,8 @@ where
 
 /// Measure every member of a group concurrently (at most
 /// [`URLTEST_MAX_CONCURRENT`] at a time) and fold the results into the
-/// alive set: successes record the measured TCP latency; only a second
-/// consecutive ordinary failure adds a synthetic penalty and demotes the node.
+/// alive set: successes record measured TCP latency. An arbitrary measurement
+/// target failing does not establish a real dial failure or node-wide outage.
 ///
 /// Returns one `(node_name, result)` entry per member, in member order.
 pub async fn urltest_group_with_feedback(
@@ -896,17 +881,8 @@ async fn urltest_group_impl(
                 }
                 None => Err(anyhow!("no handler for protocol {:?}", node.protocol())),
             };
-            match &result {
-                Ok(latency) => alive_set.record_probe_latency(
-                    node.id,
-                    ProbeDomain::Tcp,
-                    IpVersion::V4,
-                    *latency,
-                ),
-                Err(error) if !crate::proxy::is_packet_rejection(error) => {
-                    alive_set.record_dial_failure(node.id, ProbeDomain::Tcp, IpVersion::V4)
-                }
-                Err(_) => {}
+            if let Ok(latency) = &result {
+                alive_set.record_probe_latency(node.id, ProbeDomain::Tcp, IpVersion::V4, *latency);
             }
             (node.name.clone(), result)
         });

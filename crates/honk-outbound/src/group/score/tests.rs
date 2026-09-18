@@ -1,15 +1,16 @@
 use super::evidence::evidence_decay;
-use super::ranking::{
-    best_index, exploration_period, exploration_target, hold_decision, performance_baseline,
-    score_snapshot, snapshot, switch_margin, utility,
-};
+use super::ranking::{exploration_period, exploration_target, score_snapshot};
 use super::*;
 use honk_config::group::{Group, GroupPolicy};
 use honk_config::node::Node;
 mod attribution;
 mod cadence;
 mod evidence;
+mod live;
+mod performance;
 mod reasons;
+mod selection;
+mod verification;
 
 fn assert_close(actual: f64, expected: f64) {
     assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
@@ -66,9 +67,18 @@ fn trained_stats(successes: f64, latency_ms: f64, now: Instant) -> Stats {
         attempts: successes,
         setup_success: successes,
         useful_success: successes,
-        first_response_ms: WeightedMean {
-            sum: latency_ms * successes,
-            weight: successes,
+        useful_business: WeightedMean {
+            sum: successes,
+            weight: successes.min(PERFORMANCE_VALIDATION_SAMPLES),
+            observed_at: Some(now),
+        },
+        performance: Performance {
+            response: WeightedMean {
+                sum: latency_ms * successes,
+                weight: successes,
+                observed_at: Some(now),
+            },
+            ..Default::default()
         },
         updated_at: Some(now),
         ..Default::default()
@@ -99,4 +109,56 @@ fn selected(manager: &super::super::GroupManager, context: &ScoreSelectionContex
     manager.selection_plan_for_target("score", context).entries[0]
         .node
         .id
+}
+
+fn train_at(
+    manager: &GroupManager,
+    leaf: &Node,
+    target: &ScoreSelectionContext,
+    samples: usize,
+    response: Duration,
+    download: u64,
+    now: Instant,
+) {
+    for _ in 0..samples {
+        let reporter = manager
+            .feedback_for_group_node("score", leaf.id, target.clone())
+            .unwrap()
+            .start_at(now);
+        reporter.setup_succeeded_at(now);
+        reporter.first_response_at(now + response);
+        reporter.transfer_at(1, download.max(1), now + Duration::from_secs(1));
+        reporter.finish_at(ScoreOutcome::Success, true, now + Duration::from_secs(1));
+    }
+}
+
+fn probe_at(
+    manager: &GroupManager,
+    leaf: &Node,
+    probe_context: &ScoreSelectionContext,
+    source: ScoreSource,
+    latency: Duration,
+    now: Instant,
+) {
+    for _ in 0..4 {
+        let reporter = manager
+            .feedback_for_group_node("score", leaf.id, probe_context.clone())
+            .unwrap()
+            .with_source(source)
+            .start_at(now);
+        reporter.setup_succeeded_at(now);
+        reporter.probe_latency_at(latency, now);
+        reporter.finish_at(ScoreOutcome::Success, false, now);
+    }
+}
+
+fn rank_at(
+    manager: &GroupManager,
+    nodes: &[Node],
+    target: &ScoreSelectionContext,
+    now: Instant,
+) -> usize {
+    manager
+        .score_state()
+        .rank_at("score", target, &nodes.iter().collect::<Vec<_>>(), now)
 }

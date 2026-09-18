@@ -57,6 +57,91 @@ fn test_prober(method: &str) -> (ProxyHttpProber, String) {
     )
 }
 
+#[tokio::test]
+async fn configured_http_measurements_update_score_quality_baseline() {
+    async fn peer(delay: Duration) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for _ in 0..2 {
+                read_request_head(&mut stream).await;
+                tokio::time::sleep(delay).await;
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        (addr, task)
+    }
+
+    let nodes: Vec<_> = ["slow", "fast"]
+        .into_iter()
+        .map(|name| {
+            let mut node = Node {
+                name: name.into(),
+                address: "127.0.0.1".into(),
+                host: "127.0.0.1".into(),
+                port: 1,
+                outbound: honk_config::node::OutboundConfig::Socks5(
+                    honk_config::node::Socks5Config {
+                        username: Some(name.into()),
+                        ..Default::default()
+                    },
+                ),
+                ..Node::default()
+            };
+            node.id = node.derive_id();
+            node
+        })
+        .collect();
+    let url = "http://quality.example.test/";
+    let mut config = Config {
+        nodes: nodes.clone(),
+        groups: vec![honk_config::group::Group {
+            name: "score".into(),
+            policy: honk_config::group::GroupPolicy::Score,
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    config.global.tcp_check_url = vec![url.into()];
+    let manager = Arc::new(GroupManager::new(&config.groups, &nodes));
+    let mut registry = ProxyRegistry::new();
+    registry.register(ProtocolEntry::new(
+        NodeProtocol::Socks5,
+        Arc::new(LoopbackOutbound),
+    ));
+    let generation =
+        Arc::new(honk_outbound::runtime::OutboundRuntimeRegistry::build(&nodes).unwrap());
+    let prober = ProxyHttpProber::new(
+        Arc::new(RwLock::new(Arc::new(config))),
+        Arc::new(registry),
+        Arc::new(parking_lot::RwLock::new(generation)),
+        "HEAD".into(),
+        Arc::new(parking_lot::RwLock::new(Arc::clone(&manager))),
+    );
+    for (name, delay) in [
+        ("slow", Duration::from_millis(100)),
+        ("fast", Duration::ZERO),
+    ] {
+        let (addr, task) = peer(delay).await;
+        assert!(matches!(
+            prober
+                .probe_http(name, addr, url, Duration::from_secs(2))
+                .await,
+            HttpProbeResult::WarmSuccess(_),
+        ));
+        finish_server(task).await;
+    }
+    assert_eq!(
+        manager.get_score_selection_for_network("score", SelectionNetwork::Tcp),
+        Some("fast".into()),
+    );
+}
+
 async fn read_request_head(stream: &mut tokio::net::TcpStream) -> String {
     let mut request = Vec::new();
     loop {

@@ -33,18 +33,32 @@ fn cold_exploration_is_deterministic_and_cancelled_loser_is_neutral() {
     assert_eq!(first.entries[0].node.id, nodes[0].id);
     drop(first.entries[0].feedback.as_ref().unwrap().start());
     assert_eq!(
-        manager.selection_plan_for_target("score", &context).entries[0]
-            .node
-            .id,
-        nodes[0].id
+        manager
+            .score_state()
+            .exact_stats("score", &context, nodes[0].id),
+        Some((0, 0, 0))
     );
-    finish_success(&manager.selection_plan_for_target("score", &context));
     assert_eq!(
-        manager.selection_plan_for_target("score", &context).entries[0]
-            .node
-            .id,
-        nodes[1].id,
-        "the first useful success must release the next cold candidate"
+        manager
+            .score_state()
+            .peek_rank("score", &context, &nodes.iter().collect::<Vec<_>>()),
+        0
+    );
+    let next = manager.selection_plan_for_target("score", &context);
+    assert_ne!(next.entries[0].node.id, first.entries[0].node.id);
+    finish_success(&next);
+    let mut tried_other = false;
+    for _ in 0..=exploration_period(nodes.len()) {
+        let plan = manager.selection_plan_for_target("score", &context);
+        if plan.entries[0].node.id == nodes[1].id {
+            tried_other = true;
+            break;
+        }
+        finish_success(&plan);
+    }
+    assert!(
+        tried_other,
+        "cancellation stays neutral without renewing the startup allowance"
     );
 }
 
@@ -62,12 +76,19 @@ fn rejected_exact_attempt_is_neutral() {
         .start()
         .setup_failed(ScoreOutcome::Rejected);
 
-    assert!(
-        !manager
+    assert_eq!(
+        manager
             .score_state()
-            .has_exact("score", &context, nodes[0].id)
+            .exact_stats("score", &context, nodes[0].id)
+            .unwrap_or_default(),
+        (0, 0, 0)
     );
-    assert_eq!(selected(&manager, &context), nodes[0].id);
+    assert_eq!(
+        manager
+            .score_state()
+            .peek_rank("score", &context, &nodes.iter().collect::<Vec<_>>()),
+        0
+    );
 }
 
 #[test]
@@ -96,10 +117,12 @@ fn cancelled_exact_attempt_does_not_hide_aggregate_failure() {
             .start(),
     );
 
-    assert!(
-        !manager
+    assert_eq!(
+        manager
             .score_state()
-            .has_exact("score", &context, nodes[0].id)
+            .exact_stats("score", &context, nodes[0].id)
+            .unwrap_or_default(),
+        (0, 0, 0)
     );
     assert_eq!(selected(&manager, &context), nodes[1].id);
 }
@@ -402,8 +425,9 @@ fn aggregate_feedback_completion_and_cancellation_are_accounted_once() {
     assert_eq!(
         manager
             .score_state()
-            .aggregate_stats("score", SelectionNetwork::Tcp, leaf.id),
-        None
+            .aggregate_stats("score", SelectionNetwork::Tcp, leaf.id)
+            .unwrap_or_default(),
+        (0, 0, 0)
     );
     let reporter = feedback.start();
     reporter.setup_succeeded();
@@ -574,8 +598,9 @@ fn setup_failure_switches_to_the_other_candidate() {
     let manager = super::super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
     let context = context("failure.example", IpVersion::V4);
 
-    assert_eq!(selected(&manager, &context), nodes[0].id);
-    finish_failure(&manager.selection_plan_for_target("score", &context));
+    let first = manager.selection_plan_for_target("score", &context);
+    assert_eq!(first.entries[0].node.id, nodes[0].id);
+    finish_failure(&first);
     assert_eq!(selected(&manager, &context), nodes[1].id);
 }
 
@@ -743,12 +768,12 @@ fn stale_aggregate_completion_does_not_mutate_recreated_cell() {
     let sample = FlowSample {
         outcome: ScoreOutcome::Success,
         setup: Some(Duration::ZERO),
-        first_response: None,
+        source: ScoreSource::Traffic,
         tx: 1,
         rx: 1,
+        last_rx_at: Some(Instant::now()),
         elapsed: Duration::from_millis(1),
         count_usefulness: true,
-        streak_neutral: false,
     };
     state.finish(
         &context,

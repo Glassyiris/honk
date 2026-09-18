@@ -1,645 +1,299 @@
 use super::*;
-#[test]
-fn latency_samples_use_a_decayed_weighted_mean() {
-    let mut latency = WeightedMean::default();
-    latency.record(10.0);
-    latency.record(20.0);
-    latency.record(30.0);
-
-    assert_close(latency.mean().unwrap(), 20.0);
-    assert_close(latency.weight, 3.0);
-}
 
 #[test]
-fn trained_utility_does_not_trade_latency_for_attempt_balance() {
-    let candidate = |attempts, latency_ms| ScoreSnapshot {
-        attempts,
-        completed: 8.0,
-        hysteresis_completed: 8.0,
-        reliability: 0.9,
-        reliability_upper: 0.9,
-        useful_completed: 8.0,
-        latency_ms: Some(latency_ms),
-        latency_confidence: 1.0,
-        throughput: None,
-        throughput_confidence: 0.0,
-        failures: 0.0,
-        selected_at: 0,
-        explore_backed_off: false,
-        fail_streak: 0,
-        targeted: false,
-        target_attempts: 0.0,
-        target_completed: 0.0,
-    };
-
-    let scores = [candidate(100.0, 50.0), candidate(8.0, 500.0)];
-    let baseline = performance_baseline(&scores);
-    assert!(utility(&scores[0], baseline) > utility(&scores[1], baseline));
-}
-
-#[test]
-fn relative_performance_is_scale_invariant() {
-    let candidate = |latency_ms, throughput| ScoreSnapshot {
-        attempts: 8.0,
-        completed: 8.0,
-        hysteresis_completed: 8.0,
-        reliability: 0.9,
-        reliability_upper: 0.9,
-        useful_completed: 8.0,
-        latency_ms: Some(latency_ms),
-        latency_confidence: 1.0,
-        throughput: Some(throughput),
-        throughput_confidence: 1.0,
-        failures: 0.0,
-        selected_at: 0,
-        explore_backed_off: false,
-        fail_streak: 0,
-        targeted: false,
-        target_attempts: 0.0,
-        target_completed: 0.0,
-    };
-    let local = [candidate(30.0, 20_000_000.0), candidate(60.0, 10_000_000.0)];
-    let remote = [
-        candidate(300.0, 200_000_000.0),
-        candidate(600.0, 100_000_000.0),
-    ];
-    let local_baseline = performance_baseline(&local);
-    let remote_baseline = performance_baseline(&remote);
-
-    assert_close(
-        utility(&local[0], local_baseline) - utility(&local[1], local_baseline),
-        utility(&remote[0], remote_baseline) - utility(&remote[1], remote_baseline),
+fn overlapping_layers_count_each_terminal_completion_once() {
+    let leaf = node("only");
+    let manager = GroupManager::new(
+        &[group("score", std::slice::from_ref(&leaf))],
+        std::slice::from_ref(&leaf),
     );
-}
-
-#[test]
-fn hold_decision_scales_margin_with_incumbent_evidence() {
-    let candidate = |completed, reliability, latency_ms, failures| ScoreSnapshot {
-        attempts: completed,
-        completed,
-        hysteresis_completed: completed,
-        reliability,
-        reliability_upper: reliability,
-        useful_completed: completed,
-        latency_ms,
-        latency_confidence: f64::from(latency_ms.is_some()),
-        throughput: None,
-        throughput_confidence: 0.0,
-        failures,
-        selected_at: 0,
-        explore_backed_off: false,
-        fail_streak: 0,
-        targeted: false,
-        target_attempts: 0.0,
-        target_completed: 0.0,
-    };
-    let decision = |incumbent: ScoreSnapshot, best: ScoreSnapshot| {
-        let performance = performance_baseline(&[incumbent, best]);
-        hold_decision(&incumbent, &best, performance)
-    };
-    let trained = MIN_TRAINED_EVIDENCE;
-    let low_margin = switch_margin(trained);
-    let incumbent = candidate(trained, 0.0, None, 0.0);
-    let proven = candidate(SCORE_SWITCH_FULL_EVIDENCE, 0.0, None, 0.0);
-
-    assert_eq!(
-        decision(
-            candidate(trained - f64::EPSILON, 0.0, None, 0.0),
-            candidate(trained, low_margin / 2.0, None, 0.0),
-        ),
-        HoldDecision::UseBest,
-    );
-    assert_eq!(
-        decision(incumbent, candidate(trained, low_margin * 1.01, None, 0.0),),
-        HoldDecision::UseBest,
-    );
-    assert_eq!(
-        decision(incumbent, candidate(trained, low_margin / 2.0, None, 0.0),),
-        HoldDecision::Held,
-    );
-    assert_eq!(
-        decision(
-            proven,
-            candidate(
-                SCORE_SWITCH_FULL_EVIDENCE,
-                SCORE_SWITCH_MARGIN / 2.0,
-                None,
-                0.0,
-            ),
-        ),
-        HoldDecision::Held,
-    );
-    assert_eq!(
-        decision(
-            proven,
-            candidate(
-                SCORE_SWITCH_FULL_EVIDENCE,
-                SCORE_SWITCH_MARGIN * 1.01,
-                None,
-                0.0,
-            ),
-        ),
-        HoldDecision::UseBest,
-    );
-    assert_eq!(
-        decision(
-            candidate(trained, 0.0, Some(1_048_576.0), 0.0),
-            candidate(trained, 0.0, Some(1.0), 0.0),
-        ),
-        HoldDecision::UseBest,
-    );
-    assert_eq!(
-        decision(
-            candidate(trained, 0.0, None, SCORE_FAILURE_FORGIVENESS_THRESHOLD,),
-            candidate(trained, low_margin / 2.0, None, 0.0),
-        ),
-        HoldDecision::FreshFailureBypass,
-    );
-}
-
-#[test]
-fn hysteresis_evidence_counts_each_reporter_completion_once() {
-    let assert_near = |actual: f64, expected: f64| {
-        assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
-    };
-    let node = node("only");
-    let manager = super::super::super::GroupManager::new(
-        &[group("score", std::slice::from_ref(&node))],
-        std::slice::from_ref(&node),
-    );
-    let context = context("evidence.example", IpVersion::V4);
+    let target = context("counts.example", IpVersion::V4);
     for _ in 0..3 {
-        finish_success(&manager.selection_plan_for_target("score", &context));
+        finish_success(&manager.selection_plan_for_target("score", &target));
     }
-    let score = {
-        let state = manager.score_state();
-        let inner = state.inner.lock();
-        score_snapshot(&inner, "score", &context, node.id, Instant::now())
-    };
-    assert_near(score.completed, 9.0);
-    assert_near(score.hysteresis_completed, 3.0);
-    assert_near(
-        switch_margin(score.hysteresis_completed),
-        SCORE_SWITCH_MARGIN * 3.0 / SCORE_SWITCH_FULL_EVIDENCE,
+    let state = manager.score_state();
+    let score = score_snapshot(
+        &state.inner.lock(),
+        "score",
+        &target,
+        leaf.id,
+        Instant::now(),
     );
-
-    for _ in 3..8 {
-        finish_success(&manager.selection_plan_for_target("score", &context));
-    }
-    let score = {
-        let state = manager.score_state();
-        let inner = state.inner.lock();
-        score_snapshot(&inner, "score", &context, node.id, Instant::now())
-    };
-    assert_near(score.completed, 24.0);
-    assert_near(score.hysteresis_completed, 8.0);
-    assert_near(
-        switch_margin(score.hysteresis_completed),
-        SCORE_SWITCH_MARGIN,
-    );
+    assert!((score.completed - 3.0).abs() < 0.001);
+    assert!((score.useful_completed - 3.0).abs() < 0.001);
+    assert!((score.hysteresis_completed - 3.0).abs() < 0.001);
 }
 
 #[test]
-fn exploration_budget_scales_with_candidate_count() {
-    assert_eq!(exploration_target(3), 3);
-    assert_eq!(exploration_target(4), 4);
-    assert_eq!(exploration_target(14), 5);
-    assert_eq!(exploration_target(28), 7);
-    assert_eq!(exploration_period(3), SCORE_EXPLORATION_MIN_PERIOD);
-    assert_eq!(exploration_period(28), 56);
-    assert_eq!(exploration_period(128), SCORE_EXPLORATION_MAX_PERIOD);
+fn settled_cohorts_stop_sampling_and_expiry_restores_bounded_coverage() {
+    for count in [2, 3, 4, 8, 32] {
+        let nodes: Vec<_> = (0..count).map(|i| node(&format!("node-{i}"))).collect();
+        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+        let target = context("business.example", IpVersion::V4);
+        let now = Instant::now();
+        for (index, leaf) in nodes.iter().enumerate() {
+            train_at(
+                &manager,
+                leaf,
+                &target,
+                20,
+                Duration::from_millis(if index == 0 { 10 } else { 600 }),
+                1,
+                now,
+            );
+        }
+        let period = exploration_period(count);
+        for _ in 0..period * count as u64 {
+            assert_eq!(
+                rank_at(&manager, &nodes, &target, now + Duration::from_secs(2)),
+                0
+            );
+        }
+        assert_eq!(
+            manager
+                .score_state()
+                .verification_counters("score", SelectionNetwork::Tcp)
+                .validation_selections,
+            0
+        );
+        let mut trials = std::collections::HashSet::new();
+        let expired = now + PERFORMANCE_MAX_AGE + Duration::from_secs(2);
+        for request in 0..period * (count as u64 - 1) {
+            let index = rank_at(&manager, &nodes, &target, expired);
+            if request.is_multiple_of(period) {
+                assert_ne!(index, 0);
+                trials.insert(index);
+            } else {
+                assert_eq!(index, 0);
+            }
+        }
+        assert_eq!(trials.len(), count - 1);
+        let reasons = manager
+            .score_state()
+            .selection_reason_counts("score", SelectionNetwork::Tcp);
+        assert_eq!(reasons.periodic_explore, count as u64 - 1);
+        assert_eq!(reasons.cold_explore, 0);
+    }
 }
 
 #[test]
-fn cold_exploration_skips_backed_off_candidates() {
-    let nodes = [node("a"), node("b")];
-    let node_refs: Vec<_> = nodes.iter().collect();
-    let cold = |backed_off| ScoreSnapshot {
-        attempts: 0.0,
-        completed: 0.0,
-        hysteresis_completed: 0.0,
-        reliability: 0.0,
-        reliability_upper: 0.5,
-        useful_completed: 0.0,
-        latency_ms: None,
-        latency_confidence: 0.0,
-        throughput: None,
-        throughput_confidence: 0.0,
-        failures: 0.0,
-        explore_backed_off: backed_off,
-        fail_streak: 0,
-        selected_at: 0,
-        targeted: false,
-        target_attempts: 0.0,
-        target_completed: 0.0,
-    };
-    let snapshots = [cold(true), cold(false)];
-    let performance = performance_baseline(&snapshots);
-    let selection = best_index(&snapshots, &node_refs, 1, true, performance);
-    assert_eq!(selection.index, 1);
-    assert_eq!(selection.reason, SelectionReason::ColdExplore);
+fn new_targets_cannot_mint_exploration_and_peek_cannot_spend_it() {
+    let nodes: Vec<_> = (0..8).map(|i| node(&format!("node-{i}"))).collect();
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let now = Instant::now();
+    let state = manager.score_state();
+    for request in 0..64 {
+        let target = context(&format!("{request}.example"), IpVersion::V4);
+        let before = state.selection_reason_counts("score", SelectionNetwork::Tcp);
+        for _ in 0..10 {
+            state.peek_rank("score", &target, &nodes.iter().collect::<Vec<_>>());
+        }
+        assert_eq!(
+            state.selection_reason_counts("score", SelectionNetwork::Tcp),
+            before
+        );
+        let index = rank_at(&manager, &nodes, &target, now);
+        train_at(
+            &manager,
+            &nodes[index],
+            &target,
+            1,
+            Duration::from_millis(100),
+            1,
+            now,
+        );
+    }
+    let reasons = state.selection_reason_counts("score", SelectionNetwork::Tcp);
+    assert!(reasons.cold_explore <= exploration_target(nodes.len()) as u64);
+    assert!(reasons.periodic_explore <= 64 / exploration_period(nodes.len()));
+    assert_eq!(state.inner.lock().selection_counts.len(), 1);
+}
 
-    let snapshots = [cold(false), cold(false)];
-    let performance = performance_baseline(&snapshots);
+#[test]
+fn sparse_traffic_revalidates_on_time_without_minting_burst_trials() {
+    let nodes: Vec<_> = (0..32).map(|i| node(&format!("node-{i}"))).collect();
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    for leaf in &nodes {
+        train_at(
+            &manager,
+            leaf,
+            &target,
+            20,
+            Duration::from_millis(100),
+            1,
+            now,
+        );
+    }
+    assert_eq!(rank_at(&manager, &nodes, &target, now), 0);
+    let expired = now + PERFORMANCE_MAX_AGE + Duration::from_secs(2);
+    assert_ne!(rank_at(&manager, &nodes, &target, expired), 0);
+    let before = manager
+        .score_state()
+        .selection_reason_counts("score", SelectionNetwork::Tcp);
+    assert_eq!(before.periodic_explore, 1);
+    for _ in 0..15 {
+        rank_at(&manager, &nodes, &target, expired);
+    }
     assert_eq!(
-        best_index(&snapshots, &node_refs, 1, true, performance).index,
+        manager
+            .score_state()
+            .selection_reason_counts("score", SelectionNetwork::Tcp)
+            .periodic_explore,
+        before.periodic_explore,
+    );
+    rank_at(&manager, &nodes, &target, expired + REVALIDATION_INTERVAL);
+    assert_eq!(
+        manager
+            .score_state()
+            .selection_reason_counts("score", SelectionNetwork::Tcp)
+            .periodic_explore,
+        before.periodic_explore + 1,
+    );
+}
+
+#[test]
+fn expired_backoff_gets_bounded_recovery_despite_normal_exclusion() {
+    let nodes = [node("working"), node("failed")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    for leaf in &nodes {
+        train_at(
+            &manager,
+            leaf,
+            &target,
+            20,
+            Duration::from_millis(100),
+            1,
+            now,
+        );
+    }
+    for _ in 0..3 {
+        manager
+            .feedback_for_group_node("score", nodes[1].id, target.clone())
+            .unwrap()
+            .start_at(now)
+            .finish_at(ScoreOutcome::Timeout, true, now);
+    }
+    for _ in 0..32 {
+        assert_eq!(rank_at(&manager, &nodes, &target, now), 0);
+    }
+    let expired = now + SCORE_EXPLORE_BACKOFF_BASE * 4 + Duration::from_secs(1);
+    assert_eq!(rank_at(&manager, &nodes, &target, expired), 1);
+    assert_eq!(rank_at(&manager, &nodes, &target, expired), 0);
+}
+
+#[test]
+fn all_failing_fallback_remains_selectable() {
+    let nodes = [node("a"), node("b")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    for leaf in &nodes {
+        for _ in 0..3 {
+            manager
+                .feedback_for_group_node("score", leaf.id, target.clone())
+                .unwrap()
+                .start_at(now)
+                .finish_at(ScoreOutcome::Timeout, true, now);
+        }
+    }
+    assert_eq!(rank_at(&manager, &nodes, &target, now), 0);
+}
+
+#[test]
+fn source_outcomes_do_not_forgive_traffic_backoff() {
+    let nodes = [node("a"), node("b")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    for _ in 0..2 {
+        manager
+            .feedback_for_group_node("score", nodes[0].id, target.clone())
+            .unwrap()
+            .start_at(now)
+            .finish_at(ScoreOutcome::Timeout, true, now);
+    }
+    for source in [ScoreSource::HealthProbe, ScoreSource::Warmup] {
+        probe_at(
+            &manager,
+            &nodes[0],
+            &target,
+            source,
+            Duration::from_millis(1),
+            now,
+        );
+        manager
+            .feedback_for_group_node("score", nodes[0].id, target.clone())
+            .unwrap()
+            .with_source(source)
+            .start_at(now)
+            .finish_at(ScoreOutcome::Timeout, true, now);
+    }
+    let state = manager.score_state();
+    let score = score_snapshot(
+        &state.inner.lock(),
+        "score",
+        &target,
+        nodes[0].id,
+        now + SCORE_EXPLORE_BACKOFF_BASE,
+    );
+    assert_eq!(score.fail_streak, 2);
+    assert!(score.explore_backed_off);
+}
+
+#[test]
+fn latency_degradation_revalidation_cannot_bypass_exposure_budget() {
+    let nodes: Vec<_> = (0..32).map(|i| node(&format!("node-{i}"))).collect();
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    for (index, leaf) in nodes.iter().enumerate() {
+        train_at(
+            &manager,
+            leaf,
+            &target,
+            20,
+            Duration::from_millis(if index == 0 { 10 } else { 600 }),
+            1,
+            now,
+        );
+    }
+    assert_eq!(
+        rank_at(&manager, &nodes, &target, now + Duration::from_secs(2)),
         0
     );
-
-    // All backed off: exploration skips, ranking still returns a leaf.
-    let snapshots = [cold(true), cold(true)];
-    let performance = performance_baseline(&snapshots);
-    let selection = best_index(&snapshots, &node_refs, 1, true, performance);
-    assert!(!selection.reason.is_exploration());
-    assert_eq!(selection.reason, SelectionReason::PerformanceWinner);
-}
-
-#[test]
-fn consecutive_failures_exclude_leaf_from_ranking() {
-    let nodes = [node("a"), node("b")];
-    let node_refs: Vec<_> = nodes.iter().collect();
-    let trained = |reliability, fail_streak| ScoreSnapshot {
-        attempts: 8.0,
-        completed: 8.0,
-        hysteresis_completed: 8.0,
-        reliability,
-        reliability_upper: reliability,
-        useful_completed: 8.0,
-        latency_ms: None,
-        latency_confidence: 0.0,
-        throughput: None,
-        throughput_confidence: 0.0,
-        failures: 0.0,
-        explore_backed_off: false,
-        fail_streak,
-        selected_at: 0,
-        targeted: false,
-        target_attempts: 0.0,
-        target_completed: 0.0,
-    };
-    let snapshots = [trained(0.9, SCORE_FAIL_STREAK_EXCLUDE), trained(0.8, 0)];
-    let performance = performance_baseline(&snapshots);
+    train_at(
+        &manager,
+        &nodes[0],
+        &target,
+        1,
+        Duration::from_millis(100),
+        1,
+        now + Duration::from_secs(3),
+    );
+    for _ in 1..15 {
+        assert_eq!(
+            rank_at(&manager, &nodes, &target, now + Duration::from_secs(4)),
+            0
+        );
+    }
+    assert_ne!(
+        rank_at(&manager, &nodes, &target, now + Duration::from_secs(4)),
+        0
+    );
     assert_eq!(
-        best_index(&snapshots, &node_refs, 1, false, performance).index,
+        rank_at(&manager, &nodes, &target, now + Duration::from_secs(4)),
+        0
+    );
+    assert_eq!(
+        manager
+            .score_state()
+            .selection_reason_counts("score", SelectionNetwork::Tcp)
+            .periodic_explore,
         1
-    );
-    // Pinned fallback: with every candidate excluded, rank the full set.
-    let snapshots = [
-        trained(0.9, SCORE_FAIL_STREAK_EXCLUDE),
-        trained(0.8, SCORE_FAIL_STREAK_EXCLUDE),
-    ];
-    let performance = performance_baseline(&snapshots);
-    assert_eq!(
-        best_index(&snapshots, &node_refs, 1, false, performance).index,
-        0
-    );
-}
-
-#[test]
-fn rank_counts_fail_streak_excluded_candidates() {
-    let state = ScorePolicyState::default();
-    let nodes = [node("a"), node("b")];
-    let node_refs: Vec<_> = nodes.iter().collect();
-    state.publish_membership([("score".into(), nodes[0].id), ("score".into(), nodes[1].id)]);
-    let context = context("example.com", IpVersion::V4);
-    let attributions = [ScoreAttribution {
-        group: "score".into(),
-        node_id: nodes[0].id,
-    }];
-    let now = Instant::now();
-    let sample = FlowSample {
-        outcome: ScoreOutcome::Timeout,
-        setup: None,
-        first_response: None,
-        tx: 0,
-        rx: 0,
-        elapsed: Duration::ZERO,
-        count_usefulness: true,
-        streak_neutral: false,
-    };
-    for _ in 0..SCORE_FAIL_STREAK_EXCLUDE {
-        let cells = state.start_at(&context, &attributions, now);
-        state.finish_at(&context, &attributions, &cells, &sample, now);
-    }
-    let _ = state.rank_at("score", &context, &node_refs, now);
-    let counts = state.selection_reason_counts("score", SelectionNetwork::Tcp);
-    assert_eq!(counts.fail_streak_excluded, 1);
-    assert_eq!(counts.explore_backed_off, 1);
-
-    let _ = state.peek_rank("score", &context, &node_refs);
-    let counts = state.selection_reason_counts("score", SelectionNetwork::Tcp);
-    assert_eq!(counts.fail_streak_excluded, 1);
-    assert_eq!(counts.explore_backed_off, 1);
-}
-
-#[test]
-fn rank_counts_explore_backed_off_candidates() {
-    let state = ScorePolicyState::default();
-    let nodes = [node("a"), node("b")];
-    let node_refs: Vec<_> = nodes.iter().collect();
-    state.publish_membership([("score".into(), nodes[0].id), ("score".into(), nodes[1].id)]);
-    let context = context("backoff.example", IpVersion::V4);
-    let attributions = [ScoreAttribution {
-        group: "score".into(),
-        node_id: nodes[0].id,
-    }];
-    let now = Instant::now();
-    let sample = FlowSample {
-        outcome: ScoreOutcome::Timeout,
-        setup: None,
-        first_response: None,
-        tx: 0,
-        rx: 0,
-        elapsed: Duration::ZERO,
-        count_usefulness: true,
-        streak_neutral: false,
-    };
-    let cells = state.start_at(&context, &attributions, now);
-    state.finish_at(&context, &attributions, &cells, &sample, now);
-    let _ = state.rank_at("score", &context, &node_refs, now);
-    let counts = state.selection_reason_counts("score", SelectionNetwork::Tcp);
-    assert_eq!(counts.explore_backed_off, 1);
-    assert_eq!(counts.fail_streak_excluded, 0);
-}
-
-#[test]
-fn exploration_backoff_grows_with_failures_and_shrinks_with_success() {
-    let state = ScorePolicyState::default();
-    let leaf = node("leaf");
-    state.publish_membership([("score".into(), leaf.id)]);
-    let context = context("example.com", IpVersion::V4);
-    let attributions = [ScoreAttribution {
-        group: "score".into(),
-        node_id: leaf.id,
-    }];
-    let now = Instant::now();
-    let sample = |outcome, setup| FlowSample {
-        outcome,
-        setup,
-        first_response: None,
-        tx: 0,
-        rx: 0,
-        elapsed: Duration::ZERO,
-        count_usefulness: true,
-        streak_neutral: false,
-    };
-    let backed_off = |at: Instant| {
-        let inner = state.inner.lock();
-        score_snapshot(&inner, "score", &context, leaf.id, at).explore_backed_off
-    };
-    let fail = |at: Instant| {
-        let cells = state.start_at(&context, &attributions, at);
-        state.finish_at(
-            &context,
-            &attributions,
-            &cells,
-            &sample(ScoreOutcome::Timeout, None),
-            at,
-        );
-    };
-    let neutral = |outcome, at: Instant| {
-        let cells = state.start_at(&context, &attributions, at);
-        let mut neutral_sample = sample(outcome, None);
-        neutral_sample.streak_neutral = true;
-        state.finish_at(&context, &attributions, &cells, &neutral_sample, at);
-    };
-    let streak = |at: Instant| {
-        let inner = state.inner.lock();
-        score_snapshot(&inner, "score", &context, leaf.id, at).fail_streak
-    };
-
-    fail(now);
-    // Probe/urltest/warm outcomes never move the streak or the backoff.
-    neutral(ScoreOutcome::Success, now);
-    assert_eq!(streak(now), 1);
-    assert!(backed_off(now + Duration::from_secs(1)));
-    neutral(ScoreOutcome::Timeout, now);
-    assert_eq!(streak(now), 1);
-    assert!(backed_off(now + Duration::from_secs(1)));
-    assert!(!backed_off(
-        now + SCORE_EXPLORE_BACKOFF_BASE + Duration::from_secs(1)
-    ));
-
-    let second = now + SCORE_EXPLORE_BACKOFF_BASE + Duration::from_secs(2);
-    fail(second);
-    assert!(backed_off(
-        second + SCORE_EXPLORE_BACKOFF_BASE + Duration::from_secs(1)
-    ));
-    assert!(!backed_off(
-        second + SCORE_EXPLORE_BACKOFF_BASE * 2 + Duration::from_secs(1)
-    ));
-
-    let cells = state.start_at(&context, &attributions, second);
-    state.finish_at(
-        &context,
-        &attributions,
-        &cells,
-        &sample(ScoreOutcome::Success, Some(Duration::from_millis(10))),
-        second,
-    );
-    // Success steps the streak down (2 → 1), so the next failure lands
-    // back on the doubled cadence rather than the base one.
-    assert!(!backed_off(second + Duration::from_secs(1)));
-    let third = second + Duration::from_secs(2);
-    fail(third);
-    assert!(backed_off(
-        third + SCORE_EXPLORE_BACKOFF_BASE + Duration::from_secs(1)
-    ));
-    assert!(!backed_off(
-        third + SCORE_EXPLORE_BACKOFF_BASE * 2 + Duration::from_secs(1)
-    ));
-}
-
-#[test]
-fn large_score_groups_periodically_try_non_incumbent() {
-    let nodes: Vec<_> = (0..8).map(|index| node(&format!("node-{index}"))).collect();
-    let node_refs: Vec<_> = nodes.iter().collect();
-    let context = context("example.com", IpVersion::V4);
-    let state = ScorePolicyState::default();
-    state.publish_membership(nodes.iter().map(|node| ("score".into(), node.id)));
-    let now = Instant::now();
-    {
-        let mut inner = state.inner.lock();
-        for (index, node) in nodes.iter().enumerate() {
-            inner.aggregate.put(
-                AggregateKey {
-                    group: "score".into(),
-                    network: SelectionNetwork::Tcp,
-                    family: None,
-                    node_id: node.id,
-                },
-                Stats {
-                    setup_success: 8.0,
-                    useful_success: 8.0,
-                    first_response_ms: WeightedMean {
-                        sum: 800.0,
-                        weight: 8.0,
-                    },
-                    updated_at: Some(now),
-                    selected_at: u64::from(index == 0),
-                    ..Default::default()
-                },
-            );
-        }
-        inner.selection_counts.insert(
-            SelectionCadenceKey::new("score", &context),
-            exploration_period(nodes.len()) - 1,
-        );
-    }
-
-    assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
-}
-
-#[test]
-fn periodic_exploration_prefers_reliability_upper_bound() {
-    let nodes: Vec<_> = (0..8).map(|index| node(&format!("node-{index}"))).collect();
-    let node_refs: Vec<_> = nodes.iter().collect();
-    let candidate = |attempts, reliability_upper, selected_at| ScoreSnapshot {
-        attempts,
-        completed: 8.0,
-        hysteresis_completed: 8.0,
-        reliability: 0.2,
-        reliability_upper,
-        useful_completed: 8.0,
-        latency_ms: None,
-        latency_confidence: 0.0,
-        throughput: None,
-        throughput_confidence: 0.0,
-        failures: 0.0,
-        selected_at,
-        explore_backed_off: false,
-        fail_streak: 0,
-        targeted: false,
-        target_attempts: 0.0,
-        target_completed: 0.0,
-    };
-    let mut snapshots = vec![candidate(8.0, 0.2, 0); nodes.len()];
-    snapshots[0] = candidate(8.0, 0.9, 1);
-    snapshots[1] = candidate(1.0, 0.3, 0);
-    snapshots[2] = candidate(8.0, 0.8, 0);
-    let performance = performance_baseline(&snapshots);
-
-    let selected = best_index(
-        &snapshots,
-        &node_refs,
-        exploration_period(nodes.len()),
-        true,
-        performance,
-    );
-
-    assert_eq!(selected.index, 2);
-    assert_eq!(selected.reason, SelectionReason::PeriodicExplore);
-}
-
-#[test]
-fn large_score_groups_cap_initial_target_exploration() {
-    let nodes: Vec<_> = (0..8).map(|index| node(&format!("node-{index}"))).collect();
-    let manager = super::super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
-    let context = context("example.com", IpVersion::V4);
-    let mut seen = std::collections::HashSet::new();
-
-    for _ in 0..exploration_target(nodes.len()) {
-        let plan = manager.selection_plan_for_target("score", &context);
-        seen.insert(plan.entries[0].node.id);
-        finish_success(&plan);
-    }
-
-    assert_eq!(seen.len(), exploration_target(nodes.len()));
-}
-
-#[test]
-fn score_peek_does_not_consume_group_exploration_budget() {
-    let nodes: Vec<_> = (0..8).map(|index| node(&format!("node-{index}"))).collect();
-    let node_refs: Vec<_> = nodes.iter().collect();
-    let context =
-        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
-    let state = ScorePolicyState::default();
-    state.publish_membership(nodes.iter().map(|node| ("score".into(), node.id)));
-    let now = Instant::now();
-    {
-        let mut inner = state.inner.lock();
-        for (index, node) in nodes.iter().enumerate() {
-            inner.aggregate.put(
-                AggregateKey {
-                    group: "score".into(),
-                    network: SelectionNetwork::Tcp,
-                    family: None,
-                    node_id: node.id,
-                },
-                Stats {
-                    setup_success: 8.0,
-                    useful_success: 8.0,
-                    first_response_ms: WeightedMean {
-                        sum: 800.0,
-                        weight: 8.0,
-                    },
-                    updated_at: Some(now),
-                    selected_at: u64::from(index == 0),
-                    ..Default::default()
-                },
-            );
-        }
-        inner.selection_counts.insert(
-            SelectionCadenceKey::new("score", &context),
-            exploration_period(nodes.len()) - 1,
-        );
-    }
-
-    let selected = state.rank_at("score", &context, &node_refs, now);
-    assert_eq!(selected, 1);
-    let key = SelectionCadenceKey::new("score", &context);
-    let count = state.inner.lock().selection_counts[&key];
-    assert_eq!(state.peek_rank("score", &context, &node_refs), selected);
-    assert_eq!(state.inner.lock().selection_counts[&key], count);
-}
-
-#[test]
-fn same_scope_exploration_period_and_peek_are_unchanged() {
-    let nodes: Vec<_> = (0..8).map(|index| node(&format!("node-{index}"))).collect();
-    let node_refs: Vec<_> = nodes.iter().collect();
-    let context = context("example.com", IpVersion::V4);
-    let state = ScorePolicyState::default();
-    state.publish_membership(nodes.iter().map(|node| ("score".into(), node.id)));
-    let now = Instant::now();
-    {
-        let mut inner = state.inner.lock();
-        for (index, node) in nodes.iter().enumerate() {
-            inner.aggregate.put(
-                AggregateKey {
-                    group: "score".into(),
-                    network: SelectionNetwork::Tcp,
-                    family: None,
-                    node_id: node.id,
-                },
-                Stats {
-                    setup_success: 8.0,
-                    useful_success: 8.0,
-                    first_response_ms: WeightedMean {
-                        sum: 800.0,
-                        weight: 8.0,
-                    },
-                    updated_at: Some(now),
-                    selected_at: u64::from(index == 0),
-                    ..Default::default()
-                },
-            );
-        }
-        inner.selection_counts.insert(
-            SelectionCadenceKey::new("score", &context),
-            exploration_period(nodes.len()) - 1,
-        );
-    }
-
-    let selected = state.rank_at("score", &context, &node_refs, now);
-    assert_eq!(selected, 1);
-    assert_eq!(
-        state.inner.lock().selection_counts[&SelectionCadenceKey::new("score", &context)],
-        exploration_period(nodes.len())
-    );
-    assert_eq!(state.peek_rank("score", &context, &node_refs), selected);
-    assert_eq!(
-        state.inner.lock().selection_counts[&SelectionCadenceKey::new("score", &context)],
-        exploration_period(nodes.len())
     );
 }
 
@@ -692,16 +346,18 @@ fn periodic_exploration_is_scoped_by_network_and_family() {
         .inner
         .lock()
         .selection_counts
-        .insert(tcp_v4_key.clone(), exploration_period(nodes.len()) - 1);
+        .get_mut(&tcp_v4_key)
+        .unwrap()
+        .count = exploration_period(nodes.len()) - 1;
     let _ = manager.selection_plan_for_target("score", &contexts[2]);
     assert_eq!(
-        state.inner.lock().selection_counts[&tcp_v4_key],
+        state.inner.lock().selection_counts[&tcp_v4_key].count,
         exploration_period(nodes.len()) - 1,
         "UDP-V4 must not consume TCP-V4 cadence"
     );
     let _ = manager.selection_plan_for_target("score", &contexts[0]);
     assert_eq!(
-        state.inner.lock().selection_counts[&tcp_v4_key],
+        state.inner.lock().selection_counts[&tcp_v4_key].count,
         exploration_period(nodes.len())
     );
 
@@ -717,7 +373,13 @@ fn selection_count_reload_lifecycle_matches_group_name() {
     let context = context("reload.example", IpVersion::V4);
     let _ = old.selection_plan_for_target("score", &context);
     let state = old.score_state();
-    let before: u64 = state.inner.lock().selection_counts.values().copied().sum();
+    let before: u64 = state
+        .inner
+        .lock()
+        .selection_counts
+        .values()
+        .map(|cadence| cadence.count)
+        .sum();
 
     let empty = super::super::super::GroupManager::with_alive_set_and_score_state(
         &[group("score", &[])],
@@ -732,7 +394,7 @@ fn selection_count_reload_lifecycle_matches_group_name() {
             .lock()
             .selection_counts
             .values()
-            .copied()
+            .map(|cadence| cadence.count)
             .sum::<u64>(),
         before,
         "a committed group name retains cadence through zero leaves"
@@ -753,7 +415,7 @@ fn selection_count_reload_lifecycle_matches_group_name() {
             .lock()
             .selection_counts
             .values()
-            .copied()
+            .map(|cadence| cadence.count)
             .sum::<u64>(),
         before,
         "a surviving name retains cadence through Score to non-Score"
@@ -767,4 +429,174 @@ fn selection_count_reload_lifecycle_matches_group_name() {
     );
     removed.publish_score_membership();
     assert!(state.inner.lock().selection_counts.is_empty());
+}
+
+#[test]
+fn cancelled_cold_trials_keep_alternative_coverage() {
+    let nodes = [node("winner"), node("cold-b"), node("cold-c")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    train_at(
+        &manager,
+        &nodes[0],
+        &target,
+        20,
+        Duration::from_millis(100),
+        1,
+        now,
+    );
+    let state = manager.score_state();
+    let mut trials = std::collections::HashSet::new();
+    let requests = exploration_target(nodes.len()) as u64 + exploration_period(nodes.len()) * 2;
+    for _ in 0..requests {
+        let before = state.selection_reason_counts("score", SelectionNetwork::Tcp);
+        let index = rank_at(&manager, &nodes, &target, now + Duration::from_secs(2));
+        let after = state.selection_reason_counts("score", SelectionNetwork::Tcp);
+        if after.periodic_explore > before.periodic_explore {
+            trials.insert(index);
+        }
+        if index != 0 {
+            manager
+                .feedback_for_group_node("score", nodes[index].id, target.clone())
+                .unwrap()
+                .start_at(now)
+                .finish_at(ScoreOutcome::Cancelled, true, now);
+        }
+    }
+    assert_eq!(trials, std::collections::HashSet::from([1, 2]));
+    let reasons = state.selection_reason_counts("score", SelectionNetwork::Tcp);
+    assert_eq!(reasons.periodic_explore, 2);
+    for leaf in &nodes[1..] {
+        let score = score_snapshot(&state.inner.lock(), "score", &target, leaf.id, now);
+        assert_eq!(
+            (score.attempts, score.completed, score.failures),
+            (0.0, 0.0, 0.0)
+        );
+    }
+}
+
+#[test]
+fn qualified_trial_does_not_replace_committed_incumbent_without_new_evidence() {
+    let nodes = [node("incumbent"), node("near-equal-trial")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    for (leaf, latency) in nodes.iter().zip([100, 105]) {
+        train_at(
+            &manager,
+            leaf,
+            &target,
+            20,
+            Duration::from_millis(latency),
+            1,
+            now,
+        );
+    }
+    let mut at = now + Duration::from_secs(2);
+    for _ in 1..exploration_period(nodes.len()) {
+        assert_eq!(rank_at(&manager, &nodes, &target, at), 0);
+    }
+    at += PERFORMANCE_MAX_AGE;
+    assert_eq!(rank_at(&manager, &nodes, &target, at), 1);
+    manager
+        .feedback_for_group_node("score", nodes[1].id, target.clone())
+        .unwrap()
+        .start_at(at)
+        .finish_at(ScoreOutcome::Cancelled, true, at);
+    assert_eq!(rank_at(&manager, &nodes, &target, at), 0);
+    train_at(
+        &manager,
+        &nodes[0],
+        &target,
+        20,
+        Duration::from_millis(100),
+        1,
+        at,
+    );
+    train_at(
+        &manager,
+        &nodes[1],
+        &target,
+        20,
+        Duration::from_millis(50),
+        1,
+        at,
+    );
+    assert_eq!(
+        rank_at(&manager, &nodes, &target, at + Duration::from_secs(1)),
+        1
+    );
+    assert_eq!(
+        manager
+            .score_state()
+            .selection_reason_counts("score", SelectionNetwork::Tcp)
+            .periodic_explore,
+        1
+    );
+}
+
+#[test]
+fn first_normal_selection_uses_quality_not_the_last_startup_trial() {
+    let nodes = [node("better"), node("last-trial")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("startup.example", IpVersion::V4);
+    let now = Instant::now();
+    for (index, latency) in [100, 105].into_iter().enumerate() {
+        assert_eq!(rank_at(&manager, &nodes, &target, now), index);
+        train_at(
+            &manager,
+            &nodes[index],
+            &target,
+            20,
+            Duration::from_millis(latency),
+            1,
+            now,
+        );
+    }
+    assert_eq!(
+        rank_at(&manager, &nodes, &target, now + Duration::from_secs(2)),
+        0
+    );
+}
+
+#[test]
+fn real_success_steps_down_failure_backoff_instead_of_resetting_the_streak() {
+    let leaf = node("recovering");
+    let nodes = std::slice::from_ref(&leaf);
+    let manager = GroupManager::new(&[group("score", nodes)], nodes);
+    let target = context("recovery.example", IpVersion::V4);
+    let feedback = manager
+        .feedback_for_group_node("score", leaf.id, target.clone())
+        .unwrap();
+    let now = Instant::now();
+    for _ in 0..2 {
+        feedback
+            .start_at(now)
+            .finish_at(ScoreOutcome::Timeout, true, now);
+    }
+    let success = feedback.start_at(now);
+    success.setup_succeeded_at(now);
+    success.transfer_at(1, 1, now);
+    success.finish_at(ScoreOutcome::Success, true, now);
+    let state = manager.score_state();
+    let recovered = score_snapshot(&state.inner.lock(), "score", &target, leaf.id, now);
+    assert_eq!(recovered.fail_streak, 1);
+    assert!(!recovered.explore_backed_off);
+
+    feedback
+        .start_at(now)
+        .finish_at(ScoreOutcome::Timeout, true, now);
+    let until = now + SCORE_EXPLORE_BACKOFF_BASE * 2;
+    let before = score_snapshot(
+        &state.inner.lock(),
+        "score",
+        &target,
+        leaf.id,
+        until - Duration::from_nanos(1),
+    );
+    let expired = score_snapshot(&state.inner.lock(), "score", &target, leaf.id, until);
+    assert_eq!(expired.fail_streak, 2);
+    assert!(before.explore_backed_off);
+    assert!(!expired.explore_backed_off);
 }

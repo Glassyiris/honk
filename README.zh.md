@@ -16,7 +16,7 @@
 
 许可证：**GPL-3.0-only**。
 
-可靠性优先的 Score 组策略始终随程序编译，并通过 `policy: score` 显式选择；省略 policy 时仍默认使用 Selector。Score 只在进程内存中从真实流量以及 DNS、真实 QUIC 握手、探测、delay test、预热和直连或经代理的 UI 下载中学习。经鉴权的 `GET /stats` 只导出按组汇总的安全选路原因计数；scorer cell、目标键和其他私有 scorer 数据绝不会写入日志、持久化或导出。详见[组参考](doc/zh/reference/groups.md#score-策略)。
+Score 始终编译，通过 `policy: score` 显式选择，省略策略仍为 Selector。它区分业务可靠性、新鲜配置探测和目标性能，用有界验证补齐证据，而不是奖励历史样本数量；实时观测无需等待连接结束。Score TCP 建立失败可在同一 deadline 内尝试一个不同的合格叶节点，不重放应用数据。评分 cell 和目标键只保留在私有进程内存；聚合 API 验证信息区分临时选择、已观测可用性和限定范围的比较，不承诺绝对最优。详见[组参考](doc/zh/reference/groups.md#score-策略)。
 
 ## 实验性首包保留 UDP 决策
 

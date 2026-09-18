@@ -184,6 +184,7 @@ async fn queued_source_view_timeout_is_local_congestion() {
 
     let queued_error = driver.wait_first_ack().await.unwrap_err();
     assert_eq!(queued_error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(endpoint_c.upload.load(Ordering::Relaxed), 0);
     assert!(alive.is_alive_for(
         node.id,
         honk_outbound::alive::ProbeDomain::DataUdp,
@@ -389,6 +390,8 @@ async fn retired_source_preparation_is_typed_and_score_neutral() {
     };
     let manager = honk_outbound::group::GroupManager::new(&[group], &[node.clone(), other]);
     let context = score_context(target_b);
+    let before = manager
+        .get_score_selection_for_network("score", honk_outbound::group::SelectionNetwork::Udp);
     let reporter = manager.feedback_for_node(node.id, context).unwrap().start();
 
     for _ in 0..49 {
@@ -411,8 +414,9 @@ async fn retired_source_preparation_is_typed_and_score_neutral() {
     );
     reporter.finish(honk_outbound::group::ScoreOutcome::from_error(&error));
     assert_eq!(
-        manager.score_cache_snapshot(),
-        honk_outbound::group::ScoreCacheSnapshot::default(),
+        manager
+            .get_score_selection_for_network("score", honk_outbound::group::SelectionNetwork::Udp),
+        before,
     );
     assert!(alive.is_alive_for(
         node.id,
@@ -600,6 +604,23 @@ async fn shared_source_failure_finishes_every_flow_before_death_cleanup() {
             || (first.target == Some(target_b) && second.target == Some(target_a))
     );
     assert_eq!(first.connection, second.connection);
+    let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+    assert!(matches!(
+        pool.reserve_or_enqueue(client_addr, target_a, b"second-a", permit, &stats),
+        EndpointReservation::Enqueued
+    ));
+    let followup = next_data_frame(&mut events, &mut replies).await;
+    assert_eq!(followup.target, Some(target_a));
+    assert_eq!(followup.payload.as_deref(), Some(&b"second-a"[..]));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while endpoint_a.upload.load(Ordering::Relaxed) < 12 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("source send must finish after its frame reaches the peer");
+    assert_eq!(endpoint_a.upload.load(Ordering::Relaxed), 12);
+    assert_eq!(endpoint_b.upload.load(Ordering::Relaxed), 4);
     replies[&first.connection]
         .send((target_a, b"only-a-replied".to_vec()))
         .unwrap();
@@ -923,24 +944,25 @@ async fn shared_source_failure_wins_late_cleanup_but_preserves_local_cancellatio
     };
     let settlement = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         std::thread::scope(|threads| {
-            // Keep the stable DashMap sweep blocked at its first reporter, not this flow.
-            let first_reporter = sweep[0].score_reporter.lock();
-            let later_reporter = sweep[1].score_reporter.lock();
+            let EndpointTransport::Source(first) = &sweep[0].transport else {
+                unreachable!();
+            };
+            // Pause settlement collection, after source retirement closes admission,
+            // without blocking a different endpoint's local finalizer.
+            let first_binding = first.hold_binding_for_test();
             let retirer = threads.spawn(|| {
-                owner.fail(honk_outbound::group::ScoreOutcome::Io(
-                    io::ErrorKind::ConnectionReset,
-                ));
+                owner.fail(ScoreOutcome::Io(io::ErrorKind::ConnectionReset));
             });
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(wait_source_removed(&pool, &scope));
             });
-            drop(later_reporter);
-            sweep[1].finish_score(honk_outbound::group::ScoreOutcome::Cancelled);
+            sweep[1].finish_score(ScoreOutcome::Cancelled);
             let bound_winner = winner(later);
-            drop(first_reporter);
+            drop(first_binding);
             retirer.join().unwrap();
             for endpoint in &endpoints[2..] {
-                endpoint.finish_score(honk_outbound::group::ScoreOutcome::Cancelled);
+                endpoint.finish_score(ScoreOutcome::Cancelled);
+                endpoint.finish_score(ScoreOutcome::Success);
             }
             [bound_winner, winner(2), winner(3)]
         })

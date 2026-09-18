@@ -633,6 +633,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
         receive_reply(&client).await,
         (b"foreign-a".to_vec(), target_a)
     );
+    assert_eq!(endpoint_b.byte_counters().1.load(Ordering::Relaxed), 7);
 
     endpoint_b.send_packet(b"b-alive", false).await.unwrap();
     let b_alive = next_data_frame(&mut events, &mut replies).await;
@@ -647,6 +648,7 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
         receive_reply(&client).await,
         (b"still-b".to_vec(), target_b)
     );
+    assert_eq!(endpoint_b.byte_counters().1.load(Ordering::Relaxed), 14);
 
     let flow_lease = reserve_source(&pool, &stats, client_addr, target_a, node.id);
     let flow_identity = (flow_lease.decision_token(), flow_lease.generation());

@@ -26,6 +26,7 @@ impl GroupManager {
             visited,
             depth,
             effects,
+            None,
         )
         .map(|candidate| candidate.node)
     }
@@ -54,6 +55,7 @@ impl GroupManager {
             visited,
             depth,
             effects,
+            None,
         )
     }
 

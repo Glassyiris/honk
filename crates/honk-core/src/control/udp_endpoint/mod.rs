@@ -93,7 +93,7 @@ pub struct UdpEndpoint {
     /// Live byte counters shared with the clash-API tracker entry.
     upload: Arc<AtomicU64>,
     download: Arc<AtomicU64>,
-    score_reporter: Mutex<Option<ScoreReporter>>,
+    score_reporter: Option<ScoreReporter>,
     health_family: honk_outbound::alive::IpVersion,
     tracker_id: Mutex<Option<String>>,
 }
@@ -194,7 +194,7 @@ impl UdpEndpoint {
             upload: Arc::new(AtomicU64::new(0)),
             download: Arc::new(AtomicU64::new(0)),
             tracker_id: Mutex::new(None),
-            score_reporter: Mutex::new(score_reporter),
+            score_reporter,
             health_family,
         }
     }
@@ -220,17 +220,17 @@ impl UdpEndpoint {
         self.download.fetch_add(n, Ordering::Relaxed);
     }
 
-    pub(crate) fn score_first_response(&self) {
-        if let Some(reporter) = self.score_reporter.lock().as_ref() {
+    fn score_reply(&self, bytes: u64) {
+        if let Some(reporter) = &self.score_reporter {
             reporter.first_response();
+            reporter.rx(bytes);
         }
     }
 
     pub(crate) fn finish_score(&self, outcome: ScoreOutcome) {
-        let mut score_reporter = self.score_reporter.lock();
-        if score_reporter.is_none() {
+        let Some(reporter) = &self.score_reporter else {
             return;
-        }
+        };
         #[cfg(feature = "rprx")]
         let outcome = match &self.transport {
             EndpointTransport::Source(source) if outcome != ScoreOutcome::Shutdown => {
@@ -244,13 +244,7 @@ impl UdpEndpoint {
             }
             _ => outcome,
         };
-        if let Some(reporter) = score_reporter.take() {
-            let upload = self.upload.load(Ordering::Relaxed);
-            let download = self.download.load(Ordering::Relaxed);
-            reporter.tx(upload);
-            reporter.rx(download);
-            reporter.finish(outcome);
-        }
+        reporter.finish(outcome);
     }
 
     /// Take the tracker connection id (on endpoint removal).
@@ -439,7 +433,7 @@ impl UdpEndpoint {
     #[cfg(feature = "rprx")]
     fn record_source_reply(&self, len: u64) {
         self.tracker_download(len);
-        self.score_first_response();
+        self.score_reply(len);
         #[cfg(feature = "rprx")]
         if let EndpointTransport::Source(source) = &self.transport {
             source.record_reply(len);

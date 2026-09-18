@@ -15,11 +15,11 @@ mod admission;
 #[cfg(any(feature = "rprx", test))]
 mod vless;
 
-pub use admission::DialPermit;
 pub(crate) use admission::{
     CapturedDialAdmission, admit_physical_dial, admit_replacement_dial, capture_dial_admission,
     capture_dial_scope, start_scoped_dial, try_capture_dial_admission,
 };
+pub use admission::{DialPermit, DialScope};
 #[cfg(any(feature = "rprx", test))]
 pub use vless::VlessRuntime;
 

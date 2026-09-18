@@ -99,46 +99,6 @@ fn captured_feedback_requires_current_authority_at_start() {
 }
 
 #[test]
-fn trained_score_holds_incumbent_against_small_gain() {
-    let nodes = [node("a"), node("b")];
-    let node_refs = [&nodes[0], &nodes[1]];
-    let context = context("example.com", IpVersion::V4);
-    let state = ScorePolicyState::default();
-    state.publish_membership(nodes.iter().map(|node| ("score".into(), node.id)));
-    let now = Instant::now();
-    let key = |node_id| AggregateKey {
-        group: "score".into(),
-        network: SelectionNetwork::Tcp,
-        family: Some(IpVersion::V4),
-        node_id,
-    };
-    {
-        let mut inner = state.inner.lock();
-        for (node, latency_ms) in [(&nodes[0], 1_000.0), (&nodes[1], 1_200.0)] {
-            inner.aggregate.put(
-                key(node.id),
-                Stats {
-                    setup_success: 8.0,
-                    useful_success: 8.0,
-                    first_response_ms: WeightedMean {
-                        sum: latency_ms * 8.0,
-                        weight: 8.0,
-                    },
-                    updated_at: Some(now),
-                    ..Default::default()
-                },
-            );
-        }
-    }
-
-    assert_eq!(state.rank_at("score", &context, &node_refs, now), 0);
-    inner_update_response(&state, key(nodes[1].id), 900.0);
-    assert_eq!(state.rank_at("score", &context, &node_refs, now), 0);
-    inner_update_response(&state, key(nodes[1].id), 1.0);
-    assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
-}
-
-#[test]
 fn single_failure_layer_freshness_is_unchanged() {
     // Given: one aggregate failure cell with exactly one half-life of age.
     let node = node("leaf");
@@ -239,36 +199,19 @@ fn layered_failure_freshness_uses_one_envelope() {
         Some(Duration::from_secs(SCORE_EVIDENCE_HALF_LIFE.as_secs() * 8)),
         Some(Duration::from_secs(SCORE_EVIDENCE_HALF_LIFE.as_secs() * 8)),
     ]);
-    let incumbent = ScoreSnapshot {
-        attempts: 1.0,
-        completed: 1.0,
-        hysteresis_completed: 1.0,
-        reliability: 0.8,
-        reliability_upper: 0.8,
-        useful_completed: 1.0,
-        latency_ms: None,
-        latency_confidence: 0.0,
-        throughput: None,
-        throughput_confidence: 0.0,
-        failures: aged,
-        explore_backed_off: false,
-        fail_streak: 0,
-        selected_at: 1,
-        targeted: false,
-        target_attempts: 0.0,
-        target_completed: 0.0,
-    };
+    let incumbent =
+        super::super::ranking::snapshot(&trained_stats(8.0, 100.0, Instant::now()), Instant::now());
     let challenger = ScoreSnapshot {
-        reliability: 0.8005,
-        reliability_upper: 0.8005,
         failures: 0.0,
-        selected_at: 0,
         ..incumbent
     };
-    let retained = hold_decision(
-        &incumbent,
+    let retained = super::super::ranking::hold_decision(
+        &ScoreSnapshot {
+            failures: aged,
+            ..incumbent
+        },
         &challenger,
-        performance_baseline(&[incumbent, challenger]),
+        super::super::ranking::performance_baseline(&[incumbent, challenger]),
     ) == HoldDecision::Held;
     println!("aged layered envelope={aged:.12} retained_incumbent={retained}");
     assert!(aged < SCORE_FAILURE_FORGIVENESS_THRESHOLD);
@@ -296,269 +239,10 @@ fn specific_failure_freshness_is_not_hidden() {
     assert_close(effective, exact);
 }
 
-#[test]
-fn aged_failure_restores_incumbent_margin() {
-    // Given: two trained nodes and negligible failure evidence on the incumbent.
-    let nodes = [node("a"), node("b")];
-    let node_refs = [&nodes[0], &nodes[1]];
-    let context = context("example.com", IpVersion::V4);
-    let state = ScorePolicyState::default();
-    state.publish_membership(nodes.iter().map(|node| ("score".into(), node.id)));
-    let start = Instant::now();
-    let now = start + Duration::from_secs(SCORE_EVIDENCE_HALF_LIFE.as_secs() * 8);
-    {
-        let mut inner = state.inner.lock();
-        for (index, node) in nodes.iter().enumerate() {
-            let incumbent = index == 0;
-            inner.aggregate.put(
-                AggregateKey {
-                    group: "score".into(),
-                    network: SelectionNetwork::Tcp,
-                    family: Some(IpVersion::V4),
-                    node_id: node.id,
-                },
-                Stats {
-                    attempts: 256.0 + f64::from(incumbent),
-                    setup_success: 256.0,
-                    setup_failure: f64::from(incumbent),
-                    useful_success: 256.0,
-                    useful_failure: f64::from(incumbent),
-                    first_response_ms: WeightedMean {
-                        sum: 256_000.0,
-                        weight: 256.0,
-                    },
-                    updated_at: Some(start),
-                    selected_at: u64::from(incumbent),
-                    ..Default::default()
-                },
-            );
-        }
-    }
-    let snapshots: Vec<_> = {
-        let inner = state.inner.lock();
-        nodes
-            .iter()
-            .map(|node| score_snapshot(&inner, "score", &context, node.id, now))
-            .collect()
-    };
-    assert!(
-        snapshots[0].failures > 0.0 && snapshots[0].failures < SCORE_FAILURE_FORGIVENESS_THRESHOLD
-    );
-    assert!(
-        snapshots
-            .iter()
-            .all(|score| score.completed >= MIN_TRAINED_EVIDENCE)
-    );
-    let performance = performance_baseline(&snapshots);
-    assert!(utility(&snapshots[1], performance) > utility(&snapshots[0], performance));
-    assert!(
-        utility(&snapshots[1], performance) - utility(&snapshots[0], performance)
-            < switch_margin(snapshots[0].completed)
-    );
-
-    // When: the scorer ranks the candidates.
-    let selected = state.rank_at("score", &context, &node_refs, now);
-
-    // Then: the normal small-gain protection retains the incumbent.
-    assert_eq!(selected, 0);
-}
-
 pub(super) fn inner_update_response(state: &ScorePolicyState, key: AggregateKey, latency_ms: f64) {
-    state
-        .inner
-        .lock()
-        .aggregate
-        .get_mut(&key)
-        .unwrap()
-        .first_response_ms
-        .sum = latency_ms * 8.0;
-}
-
-#[test]
-fn throughput_ignores_bursts_and_pools_dominant_direction() {
-    let now = Instant::now();
-    let mut stats = Stats::default();
-    let sample = |tx, rx, elapsed| FlowSample {
-        outcome: ScoreOutcome::Success,
-        setup: Some(Duration::from_millis(10)),
-        first_response: None,
-        tx,
-        rx,
-        elapsed,
-        count_usefulness: true,
-        streak_neutral: false,
-    };
-
-    stats.record_finish(
-        now,
-        &sample(10_000_000, 1, Duration::from_millis(999)),
-        true,
-    );
-    stats.record_finish(now, &sample(65_535, 1, Duration::from_secs(2)), true);
-    assert_close(stats.throughput_windows, 0.0);
-
-    stats.record_finish(now, &sample(65_536, 1, Duration::from_secs(1)), true);
-    stats.record_finish(now, &sample(1, 131_072, Duration::from_secs(3)), true);
-
-    assert_close(stats.throughput_bytes, 196_608.0);
-    assert_close(stats.throughput_seconds, 4.0);
-    assert_close(stats.throughput_windows, 2.0);
-    let score = snapshot(&stats, now);
-    assert_close(score.throughput.unwrap(), 49_152.0);
-    assert_close(score.throughput_confidence, 0.25);
-}
-
-#[test]
-fn stale_exact_metrics_yield_back_to_aggregate_evidence() {
-    let now = Instant::now();
-    let context = context("example.com", IpVersion::V4);
-    let node = node("leaf");
-    let mut inner = StateInner::default();
-    inner.aggregate.put(
-        AggregateKey {
-            group: "score".into(),
-            network: SelectionNetwork::Tcp,
-            family: None,
-            node_id: node.id,
-        },
-        Stats {
-            setup_success: 8.0,
-            useful_success: 8.0,
-            first_response_ms: WeightedMean {
-                sum: 800.0,
-                weight: 8.0,
-            },
-            updated_at: Some(now),
-            ..Default::default()
-        },
-    );
-    inner.exact.put(
-        ExactKey {
-            group: "score".into(),
-            network: SelectionNetwork::Tcp,
-            family: IpVersion::V4,
-            target: context.target.clone().unwrap(),
-            node_id: node.id,
-        },
-        Stats {
-            setup_success: 8.0,
-            useful_success: 8.0,
-            first_response_ms: WeightedMean {
-                sum: 8_000.0,
-                weight: 8.0,
-            },
-            updated_at: Some(now),
-            ..Default::default()
-        },
-    );
-
-    let fresh = score_snapshot(&inner, "score", &context, node.id, now);
-    assert_close(fresh.latency_ms.unwrap(), 1_000.0);
-    assert_close(fresh.latency_confidence, 1.0);
-
-    let aged = score_snapshot(
-        &inner,
-        "score",
-        &context,
-        node.id,
-        now + Duration::from_secs(SCORE_EVIDENCE_HALF_LIFE.as_secs() * 3),
-    );
-    assert_close(aged.latency_ms.unwrap(), 212.5);
-    assert_close(aged.latency_confidence, 0.125);
-}
-
-#[test]
-fn evidence_half_life_decays_every_historical_field() {
-    let start = Instant::now();
-    let mut stats = Stats {
-        incarnation: 7,
-        attempts: 8.0,
-        setup_success: 6.0,
-        setup_failure: 2.0,
-        useful_success: 4.0,
-        useful_failure: 2.0,
-        setup_ms: WeightedMean {
-            sum: 800.0,
-            weight: 8.0,
-        },
-        first_response_ms: WeightedMean {
-            sum: 600.0,
-            weight: 6.0,
-        },
-        throughput_bytes: 1_000_000.0,
-        throughput_seconds: 10.0,
-        throughput_windows: 4.0,
-        fail_streak: 0,
-        explore_not_before: None,
-        updated_at: Some(start),
-        selected_at: 0,
-    };
-
-    stats.decay_to(start + SCORE_EVIDENCE_HALF_LIFE);
-
-    assert_close(stats.attempts, 4.0);
-    assert_close(stats.setup_success, 3.0);
-    assert_close(stats.setup_failure, 1.0);
-    assert_close(stats.useful_success, 2.0);
-    assert_close(stats.useful_failure, 1.0);
-    assert_close(stats.setup_ms.sum, 400.0);
-    assert_close(stats.setup_ms.weight, 4.0);
-    assert_close(stats.first_response_ms.sum, 300.0);
-    assert_close(stats.first_response_ms.weight, 3.0);
-    assert_close(stats.throughput_bytes, 500_000.0);
-    assert_close(stats.throughput_seconds, 5.0);
-    assert_close(stats.throughput_windows, 2.0);
-    assert_eq!(stats.incarnation, 7);
-}
-
-#[test]
-fn aged_evidence_reenters_deterministic_cold_exploration() {
-    let nodes = [node("a"), node("b")];
-    let node_refs = [&nodes[0], &nodes[1]];
-    let context = context("example.com", IpVersion::V4);
-    let state = ScorePolicyState::default();
-    state.publish_membership(nodes.iter().map(|node| ("score".to_string(), node.id)));
-    let now = Instant::now();
-
-    for (index, node) in nodes.iter().enumerate() {
-        let attributions = [ScoreAttribution {
-            group: "score".into(),
-            node_id: node.id,
-        }];
-        let cells = state.start_at(&context, &attributions, now);
-        let success = index == 1;
-        state.finish_at(
-            &context,
-            &attributions,
-            &cells,
-            &FlowSample {
-                outcome: if success {
-                    ScoreOutcome::Success
-                } else {
-                    ScoreOutcome::Timeout
-                },
-                setup: success.then_some(Duration::from_millis(10)),
-                first_response: success.then_some(Duration::from_millis(20)),
-                tx: u64::from(success),
-                rx: u64::from(success),
-                elapsed: Duration::from_secs(1),
-                count_usefulness: true,
-                streak_neutral: false,
-            },
-            now,
-        );
-    }
-
-    assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
-    assert_eq!(
-        state.rank_at(
-            "score",
-            &context,
-            &node_refs,
-            now + Duration::from_secs(SCORE_EVIDENCE_HALF_LIFE.as_secs() * 3),
-        ),
-        0
-    );
+    let mut inner = state.inner.lock();
+    let stats = inner.aggregate.get_mut(&key).unwrap();
+    stats.performance.response.sum = latency_ms * stats.performance.response.weight;
 }
 
 #[test]

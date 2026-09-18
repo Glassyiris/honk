@@ -170,6 +170,7 @@ fn score_reload_prunes_removed_switch_history_members() {
                 previous: Some(second),
                 selections: 1,
                 switched_at: 1,
+                verification: None,
             },
         );
         inner.selection_history.push(
@@ -179,6 +180,7 @@ fn score_reload_prunes_removed_switch_history_members() {
                 previous: Some(first),
                 selections: 1,
                 switched_at: 1,
+                verification: None,
             },
         );
     }
@@ -236,13 +238,20 @@ fn selection_reason_precedence_is_stable() {
                 },
                 Stats {
                     selected_at: u64::from(index == 0),
+                    useful_business: WeightedMean::default(),
                     ..trained_stats(8.0, 100.0, now)
                 },
             );
         }
         inner.selection_counts.insert(
             SelectionCadenceKey::new("periodic", &context),
-            exploration_period(periodic.len()) - 1,
+            SelectionCadence {
+                count: exploration_period(periodic.len()) - 1,
+                revalidated_count: 0,
+                revalidated_at: now,
+                validation_node: None,
+                validation_attempts: 0,
+            },
         );
         for (group, nodes, stats) in [
             (
@@ -301,6 +310,14 @@ fn selection_reason_precedence_is_stable() {
                     stats,
                 );
             }
+        }
+        for (group, node) in [("held", &held[0]), ("bypass", &bypass[0])] {
+            ScorePolicyState::record_switch_flap(
+                &mut inner,
+                &SelectionHistoryKey::new(group, &context),
+                node.id,
+                SelectionReason::PerformanceWinner,
+            );
         }
     }
 
@@ -751,173 +768,6 @@ fn score_reason_snapshot_is_sorted_fixed_and_private() {
     let saturated_snapshot = manager.score_reason_snapshot();
     assert_eq!(saturated_snapshot[1].udp, saturated);
     println!("owned score snapshot={snapshot:?} later={later:?} saturated={saturated_snapshot:?}");
-}
-
-#[test]
-fn delay_test_members_do_not_record_score_selection() {
-    let nodes = [node("delay-peek-alpha"), node("delay-peek-beta")];
-    let sub = group("delay-peek-sub", &nodes);
-    let parent = Group {
-        id: Uuid::new_v4(),
-        name: "delay-peek-parent".into(),
-        policy: GroupPolicy::Selector,
-        nodes: vec![],
-        groups: vec!["delay-peek-sub".into()],
-        ..Default::default()
-    };
-    let manager = super::super::super::GroupManager::new(&[parent, sub], &nodes);
-
-    let members = manager.delay_test_members("delay-peek-parent");
-    assert_eq!(members.len(), 1);
-    assert_eq!(members[0].0, "delay-peek-sub");
-
-    let state = manager.score_state();
-    assert_eq!(
-        state.selection_reason_counts("delay-peek-sub", SelectionNetwork::Tcp),
-        ScoreReasonCounters::default()
-    );
-    assert!(state.inner.lock().selection_history.is_empty());
-}
-
-#[test]
-fn selector_parent_peeks_unchosen_score_subgroups() {
-    let nodes = [
-        node("sel-sub-alpha-a"),
-        node("sel-sub-alpha-b"),
-        node("sel-sub-beta-a"),
-        node("sel-sub-beta-b"),
-    ];
-    let sub_a = group("sel-sub-a", &nodes[..2]);
-    let sub_b = group("sel-sub-b", &nodes[2..]);
-    let parent = Group {
-        id: Uuid::new_v4(),
-        name: "sel-parent".into(),
-        policy: GroupPolicy::Selector,
-        nodes: vec![],
-        groups: vec!["sel-sub-a".into(), "sel-sub-b".into()],
-        ..Default::default()
-    };
-    let manager = super::super::super::GroupManager::new(&[sub_a, sub_b, parent], &nodes);
-    let state = manager.score_state();
-
-    // Default choice is the first member: only sub-a commits a rank.
-    let _ = manager.selection_plan_for_domain("sel-parent", ProbeDomain::Tcp, IpVersion::V4);
-    assert_eq!(
-        state
-            .selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp)
-            .cold_explore,
-        1
-    );
-    assert_eq!(
-        state.selection_reason_counts("sel-sub-b", SelectionNetwork::Tcp),
-        ScoreReasonCounters::default()
-    );
-    assert!(state.inner.lock().selection_history.is_empty());
-
-    // Switching the choice moves the committed rank to sub-b.
-    manager.set_selector_choice("sel-parent", "sel-sub-b");
-    let _ = manager.selection_plan_for_domain("sel-parent", ProbeDomain::Tcp, IpVersion::V4);
-    assert_eq!(
-        state
-            .selection_reason_counts("sel-sub-b", SelectionNetwork::Tcp)
-            .cold_explore,
-        1
-    );
-    assert_eq!(
-        state
-            .selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp)
-            .cold_explore,
-        1
-    );
-
-    // The target-aware dial path applies the same rule.
-    manager.set_selector_choice("sel-parent", "sel-sub-a");
-    let before_a = state.selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp);
-    let before_b = state.selection_reason_counts("sel-sub-b", SelectionNetwork::Tcp);
-    let _ = manager
-        .selection_plan_for_target("sel-parent", &context("sel-target.internal", IpVersion::V4));
-    assert_ne!(
-        state.selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp),
-        before_a
-    );
-    assert_eq!(
-        state.selection_reason_counts("sel-sub-b", SelectionNetwork::Tcp),
-        before_b
-    );
-
-    // A stale stored choice names no member: the fallback serving
-    // sub-group still commits its rank instead of everything peeking.
-    manager.set_selector_choice("sel-parent", "sel-sub-renamed-away");
-    let before_a = state.selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp);
-    let _ = manager.selection_plan_for_domain("sel-parent", ProbeDomain::Tcp, IpVersion::V4);
-    assert_ne!(
-        state.selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp),
-        before_a
-    );
-}
-
-#[test]
-fn selector_commit_follows_non_first_default() {
-    let nodes = [
-        node("def-alpha-a"),
-        node("def-alpha-b"),
-        node("def-beta-a"),
-        node("def-beta-b"),
-    ];
-    let sub_a = group("def-sub-a", &nodes[..2]);
-    let sub_b = group("def-sub-b", &nodes[2..]);
-    let mut parent = selector_with_children("def-parent", &[], &["def-sub-a", "def-sub-b"]);
-    parent.default = Some("def-sub-b".into());
-    let manager = super::super::super::GroupManager::new(&[sub_a, sub_b, parent], &nodes);
-    let state = manager.score_state();
-
-    // No stored choice: the default (non-first) member serves and must
-    // be the one committing its rank.
-    let _ = manager.selection_plan_for_domain("def-parent", ProbeDomain::Tcp, IpVersion::V4);
-    assert_eq!(
-        state
-            .selection_reason_counts("def-sub-b", SelectionNetwork::Tcp)
-            .cold_explore,
-        1
-    );
-    assert_eq!(
-        state.selection_reason_counts("def-sub-a", SelectionNetwork::Tcp),
-        ScoreReasonCounters::default()
-    );
-}
-
-#[test]
-fn selector_refusal_does_not_commit_a_sibling_score_group() {
-    let dead = node("fallback-dead");
-    let nodes = [dead.clone(), node("fallback-alpha"), node("fallback-beta")];
-    let sub = group("fallback-sub", &nodes[1..]);
-    let parent = Group {
-        id: Uuid::new_v4(),
-        name: "fallback-parent".into(),
-        policy: GroupPolicy::Selector,
-        nodes: vec![dead.id],
-        groups: vec!["fallback-sub".into()],
-        ..Default::default()
-    };
-    let alive = Arc::new(super::super::super::AliveDialerSet::new());
-    alive.report_unavailable_forced(dead.id, ProbeDomain::Tcp, IpVersion::V4);
-    let manager =
-        super::super::super::GroupManager::with_alive_set(&[sub, parent], &nodes, Some(alive));
-    let state = manager.score_state();
-
-    manager.set_selector_choice("fallback-parent", "fallback-dead");
-    assert!(
-        manager
-            .selection_plan_for_domain("fallback-parent", ProbeDomain::Tcp, IpVersion::V4)
-            .nodes
-            .is_empty()
-    );
-    assert_eq!(
-        state
-            .selection_reason_counts("fallback-sub", SelectionNetwork::Tcp)
-            .cold_explore,
-        0
-    );
 }
 
 #[test]
