@@ -13,6 +13,214 @@ fn verification_at(
 }
 
 #[test]
+fn idle_terminal_does_not_refresh_old_business_evidence() {
+    let nodes = [node("idle")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let mut target = context("business.example", IpVersion::V4);
+    target.network = SelectionNetwork::Udp;
+    target.probe_domain = ProbeDomain::DataUdp;
+    let now = Instant::now();
+    let reporters: Vec<_> = (0..5)
+        .map(|_| {
+            let reporter = manager
+                .feedback_for_group_node("score", nodes[0].id, target.clone())
+                .unwrap()
+                .start_at(now);
+            reporter.setup_succeeded_at(now);
+            reporter.first_response_at(now);
+            reporter.transfer_at(1, 1, now);
+            reporter
+        })
+        .collect();
+    for second in [20, 40, 60, 80, 100] {
+        for reporter in &reporters {
+            reporter.transfer_at(1, 0, now + Duration::from_secs(second));
+        }
+    }
+    let expired = now + Duration::from_secs(120);
+    for reporter in &reporters {
+        reporter.finish_at(ScoreOutcome::Success, true, expired);
+        reporter.finish_at(ScoreOutcome::Timeout, true, expired);
+    }
+    let report = verification_at(&manager, &nodes, &target, expired);
+    assert_eq!(report.state, ScoreVerificationState::Provisional);
+    assert_eq!(report.evidence_age_ms, None);
+    let state = manager.score_state();
+    let score = score_snapshot(&state.inner.lock(), "score", &target, nodes[0].id, expired);
+    assert_eq!(score.completed, 5.0);
+    assert_eq!(score.useful_completed, 5.0);
+    assert_eq!(score.failures, 0.0);
+}
+
+#[test]
+fn recent_business_uses_latest_rx_across_out_of_order_completions() {
+    let nodes = [node("live")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    let feedback = manager
+        .feedback_for_group_node("score", nodes[0].id, target.clone())
+        .unwrap();
+    let reporters: Vec<_> = (0..5)
+        .map(|_| {
+            let reporter = feedback.start_at(now);
+            reporter.setup_succeeded_at(now);
+            reporter.transfer_at(1, 1, now + Duration::from_secs(10));
+            reporter
+        })
+        .collect();
+    reporters[0].transfer_at(0, 1, now + Duration::from_secs(20));
+    reporters[0].transfer_at(0, 1, now + Duration::from_secs(15));
+    reporters[0].finish_at(ScoreOutcome::Success, true, now + Duration::from_secs(30));
+    let terminal = now + Duration::from_secs(31);
+    for reporter in &reporters[1..] {
+        reporter.finish_at(ScoreOutcome::Success, true, terminal);
+    }
+    let report = verification_at(&manager, &nodes, &target, terminal);
+    assert_eq!(report.state, ScoreVerificationState::ObservedUsable);
+    assert_eq!(report.evidence_age_ms, Some(11_000));
+    assert_eq!(report.valid_for_ms, Some(49_000));
+    assert_eq!(
+        verification_at(&manager, &nodes, &target, now + Duration::from_secs(81)).state,
+        ScoreVerificationState::Provisional
+    );
+}
+
+#[test]
+fn delayed_business_does_not_revive_expired_weight_or_admit_expired_rx() {
+    let nodes = [node("delayed")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    let feedback = manager
+        .feedback_for_group_node("score", nodes[0].id, target.clone())
+        .unwrap();
+    let replied = |rx_at| {
+        let reporter = feedback.start_at(now);
+        reporter.setup_succeeded_at(now);
+        reporter.transfer_at(1, 1, rx_at);
+        reporter
+    };
+    for _ in 0..5 {
+        replied(now).finish_at(ScoreOutcome::Success, true, now);
+    }
+    let stale: Vec<_> = (0..3).map(|_| replied(now)).collect();
+    let fresh: Vec<_> = (0..5)
+        .map(|_| replied(now + Duration::from_secs(110)))
+        .collect();
+    let terminal = now + Duration::from_secs(130);
+    fresh[0].finish_at(ScoreOutcome::Success, true, terminal);
+    assert_eq!(
+        verification_at(&manager, &nodes, &target, terminal).state,
+        ScoreVerificationState::Provisional
+    );
+    for reporter in &stale {
+        reporter.finish_at(ScoreOutcome::Success, true, terminal);
+    }
+    assert_eq!(
+        verification_at(&manager, &nodes, &target, terminal).state,
+        ScoreVerificationState::Provisional
+    );
+    for reporter in &fresh[1..] {
+        reporter.finish_at(ScoreOutcome::Success, true, terminal);
+    }
+    let report = verification_at(&manager, &nodes, &target, terminal);
+    assert_eq!(report.state, ScoreVerificationState::ObservedUsable);
+    assert_eq!(report.evidence_age_ms, Some(20_000));
+}
+
+#[test]
+fn failure_requires_strictly_newer_rx_even_after_older_failure_completion() {
+    let nodes = [node("recovering")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    let fence = now + Duration::from_secs(10);
+    let feedback = manager
+        .feedback_for_group_node("score", nodes[0].id, target.clone())
+        .unwrap();
+    let replied = |rx_at| {
+        let reporter = feedback.start_at(now);
+        reporter.setup_succeeded_at(now);
+        reporter.transfer_at(1, 1, rx_at);
+        reporter
+    };
+    let old: Vec<_> = (0..5).map(|_| replied(now)).collect();
+    let tied: Vec<_> = (0..5).map(|_| replied(fence)).collect();
+    let surviving: Vec<_> = (0..5).map(|_| replied(now)).collect();
+    let older_failure = feedback.start_at(now);
+    feedback
+        .start_at(now)
+        .finish_at(ScoreOutcome::Timeout, true, fence);
+    older_failure.finish_at(ScoreOutcome::Timeout, true, fence - Duration::from_secs(1));
+    let terminal = fence + Duration::from_secs(1);
+    for batch in [&old, &tied] {
+        for reporter in batch {
+            reporter.finish_at(ScoreOutcome::Success, true, terminal);
+        }
+        let report = verification_at(&manager, &nodes, &target, terminal);
+        assert_eq!(report.state, ScoreVerificationState::Provisional);
+        assert_eq!(report.evidence_age_ms, None);
+    }
+    for reporter in &surviving {
+        reporter.transfer_at(0, 1, terminal);
+        reporter.finish_at(
+            ScoreOutcome::Success,
+            true,
+            terminal + Duration::from_secs(1),
+        );
+    }
+    let report = verification_at(&manager, &nodes, &target, terminal + Duration::from_secs(1));
+    assert_eq!(report.state, ScoreVerificationState::ObservedUsable);
+    assert_eq!(report.evidence_age_ms, Some(1000));
+}
+
+#[test]
+fn reload_rejects_old_rx_but_accepts_surviving_flow_progress() {
+    let nodes = [node("survivor")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let before = Instant::now() - Duration::from_secs(1);
+    let feedback = manager
+        .feedback_for_group_node("score", nodes[0].id, target.clone())
+        .unwrap();
+    let reporters: Vec<_> = (0..10)
+        .map(|_| {
+            let reporter = feedback.start_at(before);
+            reporter.setup_succeeded_at(before);
+            reporter.transfer_at(1, 1, before);
+            reporter
+        })
+        .collect();
+    let replacement = GroupManager::with_alive_set_and_score_state(
+        &[group("score", &nodes)],
+        &nodes,
+        None,
+        manager.score_state(),
+    );
+    replacement.publish_score_membership();
+    let after = Instant::now() + Duration::from_secs(1);
+    for reporter in &reporters[..5] {
+        reporter.finish_at(ScoreOutcome::Success, true, after);
+    }
+    let report = verification_at(&replacement, &nodes, &target, after);
+    assert_eq!(report.state, ScoreVerificationState::Provisional);
+    assert_eq!(report.evidence_age_ms, None);
+    for reporter in &reporters[5..] {
+        reporter.transfer_at(0, 1, after);
+        reporter.finish_at(ScoreOutcome::Success, true, after + Duration::from_secs(1));
+    }
+    let report = verification_at(
+        &replacement,
+        &nodes,
+        &target,
+        after + Duration::from_secs(1),
+    );
+    assert_eq!(report.state, ScoreVerificationState::ObservedUsable);
+    assert_eq!(report.evidence_age_ms, Some(1000));
+}
+
+#[test]
 fn real_flow_gaps_become_usable_and_supported_with_measured_exposure() {
     let nodes = [node("quick"), node("unvalidated")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);

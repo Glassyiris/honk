@@ -211,6 +211,14 @@ impl Stats {
         }
     }
 
+    pub(super) fn invalidate_business(&mut self, now: Instant) {
+        self.useful_business = WeightedMean::default();
+        self.business_invalidated_through = Some(
+            self.business_invalidated_through
+                .map_or(now, |at| at.max(now)),
+        );
+    }
+
     pub(super) fn record_finish(
         &mut self,
         now: Instant,
@@ -234,8 +242,8 @@ impl Stats {
         } else {
             self.fail_streak = self.fail_streak.saturating_add(1);
             self.explore_not_before = Some(now + explore_backoff(self.fail_streak));
-            self.useful_business = WeightedMean::default();
-            self.failed_at = Some(now);
+            self.invalidate_business(now);
+            self.failed_at = Some(self.failed_at.map_or(now, |at| at.max(now)));
         }
         if sample.setup.is_some() {
             self.setup_success += 1.0;
@@ -245,7 +253,24 @@ impl Stats {
         if count_usefulness {
             if sample.outcome == ScoreOutcome::Success && sample.tx > 0 && sample.rx > 0 {
                 self.useful_success += 1.0;
-                self.useful_business.record(1.0, now);
+                if let Some(at) = sample.last_rx_at
+                    && now.saturating_duration_since(at) < PERFORMANCE_MAX_AGE
+                    && self
+                        .business_invalidated_through
+                        .is_none_or(|fence| at > fence)
+                {
+                    // Terminal order is not RX order; expired weight must not be revived.
+                    if self.useful_business.observed_at.is_some_and(|seen| {
+                        now.saturating_duration_since(seen) >= PERFORMANCE_MAX_AGE
+                    }) {
+                        self.useful_business = WeightedMean::default();
+                    }
+                    let at = self
+                        .useful_business
+                        .observed_at
+                        .map_or(at, |seen| seen.max(at));
+                    self.useful_business.record(1.0, at);
+                }
             } else {
                 self.useful_failure += 1.0;
             }

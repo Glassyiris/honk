@@ -187,6 +187,7 @@ struct Stats {
     useful_failure: f64,
     performance: Performance,
     useful_business: WeightedMean,
+    business_invalidated_through: Option<Instant>,
     failed_at: Option<Instant>,
     warm_setup_ms: WeightedMean,
     probes: [evidence::ProbeMetric; 6],
@@ -436,6 +437,7 @@ impl ScorePolicyState {
         G: IntoIterator<Item = String>,
     {
         let mut inner = self.inner.lock();
+        let now = Instant::now();
         inner.active_authority = Some(authority);
         inner.valid = membership.into_iter().collect();
         inner.valid_groups = groups.into_iter().collect();
@@ -509,12 +511,10 @@ impl ScorePolicyState {
         // In-flight traffic keeps its cells, but a new generation must remeasure health.
         for (_, stats) in inner.aggregate.iter_mut() {
             stats.probes = Default::default();
-        }
-        for (_, stats) in inner.aggregate.iter_mut() {
-            stats.useful_business = WeightedMean::default();
+            stats.invalidate_business(now);
         }
         for (_, stats) in inner.exact.iter_mut() {
-            stats.useful_business = WeightedMean::default();
+            stats.invalidate_business(now);
         }
     }
 
@@ -789,6 +789,7 @@ struct FlowSample {
     source: ScoreSource,
     tx: u64,
     rx: u64,
+    last_rx_at: Option<Instant>,
     elapsed: Duration,
     count_usefulness: bool,
 }

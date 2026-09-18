@@ -73,6 +73,8 @@ Traffic reporter 覆盖透明 TCP/UDP、受支持的 DNS exchange 和 UI 下载�
 
 结论在最弱支持证据跌破完整置信门槛时失效（此处最多 60 秒）；有效完成数或作为依据的失败排除更早失效时相应提前。业务失败与提交 reload 撤销近期可用性确认，但不清空长期可靠性。API 读取即时重算有效性，不推进采样或计数；已授权 Apply 利用既有有界历史累计确认、过期/矛盾、验证选择和确认耗时。一次确认可以仅指探测比较，业务仍处于临时状态；详见 [API 语义](../reference/api.md#score-验证信息)。
 
+近期可用性以最近一次非零业务 RX 的观测时间计时，单向 TX 和终态清理都不能刷新它。迟到的完成仍保留一次性的长期终态，但已过期的 RX，以及不晚于最近失败／reload 失效边界的 RX，都不能补回近期证据。尚未过期但乱序到达的完成保留最新观测时钟；已准入且继续存活的 flow 可以用边界之后真正新增的 RX 重新提供证据。
+
 一次已授权的多候选 Apply 按优先级恰好增加一个最终原因：`coldExplore`、`periodicExplore`、`incumbentHeld`、`freshFailureBypass`、`reliabilityWinner`，然后是 `performanceWinner`。`deadFiltered` 独立计数被活性过滤移除的唯一叶候选。`switchFlap` 独立计数同一 `(group, network, family, target)` 作用域内已提交胜者在八次选择内切回前一胜者——无关目标交错各自的胜者永远不计入；无目标选择共享一个桶，历史由 4,096 项 LRU 封顶。冷探索与周期探索不修改这段后悔窗口。`failStreakExcluded` 按每次已授权 rank 累计被三连败新鲜失败门排除的候选数，`exploreBackedOff` 累计当前处于探索退避的候选数。Peek、proxy/stat 读取、单例旁路和最后尝试选择均保持中性。经鉴权的 `/stats.score.groups[]` 快照只公开这些按组的 TCP/UDP 计数，不包含 cell、节点、目标、cadence 或 manager authority。`/stats.score.cache` 公开两个 4,096 项证据 LRU 各自的当前 cell 数与累计淘汰数，同样不含任何组、节点或目标身份。
 
 ### URLTest 排名与滞后

@@ -771,6 +771,7 @@ fn stale_aggregate_completion_does_not_mutate_recreated_cell() {
         source: ScoreSource::Traffic,
         tx: 1,
         rx: 1,
+        last_rx_at: Some(Instant::now()),
         elapsed: Duration::from_millis(1),
         count_usefulness: true,
     };
