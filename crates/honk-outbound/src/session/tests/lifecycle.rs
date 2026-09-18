@@ -253,6 +253,72 @@ async fn shutdown_before_first_janitor_poll_exits_without_mutating_pool() {
     assert_eq!(prewarm_calls.load(Ordering::Relaxed), 0);
 }
 
+/// A session that keeps an idle clock and takes one short stream.
+#[derive(Debug)]
+struct ClockedSession {
+    closed: AtomicBool,
+    permits: Arc<tokio::sync::Semaphore>,
+    idle: IdleClock,
+}
+
+impl ManagedSession for ClockedSession {
+    fn active_streams(&self) -> usize {
+        1 - self.permits.available_permits()
+    }
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+    }
+    fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+    }
+    fn permit_released(&self) {
+        self.idle.stream_released(self.active_streams());
+    }
+    fn idle_since(&self) -> Option<Instant> {
+        self.idle.idle_since()
+    }
+    fn try_reserve(self: &Arc<Self>) -> Option<SessionPermit<Self>> {
+        let permit = Arc::clone(&self.permits).try_acquire_owned().ok()?;
+        self.idle.stream_opened();
+        Some(SessionPermit::new(Arc::clone(self), permit))
+    }
+}
+
+/// The janitor ticks every 10 s and retires a session idle for 15 s. The
+/// 10 s tick starts the session's idle age; a stream that opens at 18 s and
+/// closes at 19 s is never seen by a tick. The session has still been busy,
+/// so it must survive the 30 s tick (11 s idle) and go at 40 s.
+#[tokio::test(start_paused = true)]
+async fn a_stream_between_two_janitor_ticks_still_resets_the_idle_age() {
+    let pool = Arc::new(SessionPool::<ClockedSession>::new(SessionPoolConfig {
+        janitor_interval: Duration::from_secs(10),
+        max_streams_per_session: 1,
+        ..Default::default()
+    }));
+    let session = Arc::new(ClockedSession {
+        closed: AtomicBool::new(false),
+        permits: Arc::new(tokio::sync::Semaphore::new(1)),
+        idle: IdleClock::new(),
+    });
+    pool.insert(&session);
+    pool.ensure_janitor(0, Duration::from_secs(15), || async {
+        unreachable!("no prewarm with a zero floor")
+    });
+
+    tokio::time::sleep(Duration::from_secs(18)).await;
+    let permit = session.try_reserve().expect("one slot is free");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    drop(permit);
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    assert!(
+        !session.is_closed(),
+        "busy at 19 s, so the 30 s tick sees 11 s idle, under the 15 s timeout"
+    );
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(session.is_closed(), "21 s idle at the 40 s tick");
+    pool.shutdown();
+}
+
 #[tokio::test(start_paused = true)]
 async fn warm_retention_pins_one_idle_session_until_release() {
     let pool = Arc::new(pool(SessionPoolConfig {

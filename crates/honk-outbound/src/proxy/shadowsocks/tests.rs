@@ -309,6 +309,53 @@ async fn test_dial_tcp_legacy_end_to_end() {
     assert_eq!(received, expected);
 }
 
+/// A datagram the session cannot open is dropped; the next valid one is
+/// delivered and the transport stays usable.
+#[tokio::test]
+async fn udp_receive_drops_an_unopenable_datagram_and_keeps_the_session() {
+    let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.connect(server.local_addr().unwrap()).await.unwrap();
+    let client_addr = client.local_addr().unwrap();
+    let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
+    let transport = SsUdpTransport {
+        socket: client,
+        crypto: tokio::sync::Mutex::new(SsUdpCrypto::Legacy(
+            LegacyUdpCrypto::new("aes-128-gcm", "test-password").unwrap(),
+        )),
+        recv_buf: tokio::sync::Mutex::new(None),
+        socks: addr::encode_address(target, None).unwrap(),
+        target,
+    };
+    let server_crypto = LegacyUdpCrypto::new("aes-128-gcm", "test-password").unwrap();
+    let wrong_key = LegacyUdpCrypto::new("aes-128-gcm", "other-password").unwrap();
+    let socks = addr::encode_address(target, None).unwrap();
+    // Too short, wrong key, then a valid packet.
+    server.send_to(&[0u8; 8], client_addr).await.unwrap();
+    server
+        .send_to(&wrong_key.seal(&socks, b"forged").unwrap(), client_addr)
+        .await
+        .unwrap();
+    server
+        .send_to(
+            &server_crypto.seal(&socks, b"genuine").unwrap(),
+            client_addr,
+        )
+        .await
+        .unwrap();
+
+    let mut buf = [0u8; 1500];
+    let (n, src) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        transport.recv_packet(&mut buf),
+    )
+    .await
+    .expect("the valid datagram must be delivered after the dropped ones")
+    .unwrap();
+    assert_eq!(src, target);
+    assert_eq!(&buf[..n], b"genuine");
+}
+
 /// End-to-end UDP test over the real framed `dial_udp_transport` path.
 #[tokio::test]
 async fn test_dial_udp_transport_legacy_end_to_end() {

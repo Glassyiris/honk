@@ -293,6 +293,8 @@ pub(crate) struct AnyTlsSession {
     addr: String,
     /// Server-specific scheme shared by every live session in this pool.
     padding_state: Arc<PaddingState>,
+    /// Idle bookkeeping for the pool janitor, stamped at stream open and close.
+    idle: crate::session::IdleClock,
     /// Settings waits for the first stream so packet 1 is SETTINGS+SYN+PSH.
     initial_settings: parking_lot::Mutex<Option<bytes::Bytes>>,
     /// Ordered writer queue: every frame goes out through the single
@@ -393,6 +395,7 @@ impl AnyTlsSession {
             overflow_notify: tokio::sync::Notify::new(),
             watchdog: Mutex::new(None),
             stream_permits: Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS_PER_SESSION)),
+            idle: crate::session::IdleClock::new(),
             capacity_notify: std::sync::OnceLock::new(),
             inbound_payload_budget,
             inbound_budget_epoch: AtomicU64::new(0),
@@ -1010,6 +1013,7 @@ impl AnyTlsSession {
             .await
             .expect("test session payload budget open");
         let credit = credit.expect("test stream remains live");
+        let data = bytes::Bytes::from(data);
         let payload = match self.tcp_inbound.lock().get(&sid).cloned() {
             Some(inbound) => InboundPayload::for_tcp(data, credit, inbound),
             None => InboundPayload::new(data, credit),
@@ -1166,7 +1170,14 @@ impl crate::session::ManagedSession for AnyTlsSession {
             drop(permit);
             return None;
         }
+        self.idle.stream_opened();
         Some(SessionPermit::new(Arc::clone(self), permit))
+    }
+    fn permit_released(&self) {
+        self.idle.stream_released(self.active_streams());
+    }
+    fn idle_since(&self) -> Option<Instant> {
+        self.idle.idle_since()
     }
 }
 
@@ -1868,13 +1879,28 @@ where
     ))
 }
 
-async fn read_frame_body<R>(reader: &mut R, len: usize) -> std::io::Result<Vec<u8>>
+/// Read `len` body bytes into a buffer of exactly that size and hand it out
+/// frozen. `read_buf` fills spare capacity, so the body is not zeroed before
+/// the read, and a full buffer freezes without a second allocation. One
+/// allocation per frame remains: consumers own the body, and recycling it
+/// needs the buffer to come back from them.
+async fn read_frame_body<R>(reader: &mut R, len: usize) -> std::io::Result<bytes::Bytes>
 where
     R: AsyncReadExt + Unpin,
 {
-    let mut data = vec![0u8; len];
-    reader.read_exact(&mut data).await?;
-    Ok(data)
+    use bytes::BufMut;
+    let mut body = bytes::BytesMut::with_capacity(len);
+    while body.len() < len {
+        let remaining = len - body.len();
+        let n = reader.read_buf(&mut (&mut body).limit(remaining)).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "AnyTLS frame body ended early",
+            ));
+        }
+    }
+    Ok(body.freeze())
 }
 
 async fn drain_frame_body<R>(reader: &mut R, mut len: usize) -> std::io::Result<()>
@@ -1898,7 +1924,7 @@ where
 {
     let (cmd, sid, len) = read_frame_header(reader).await?;
     let data = read_frame_body(reader, len).await?;
-    Ok((cmd, sid, data))
+    Ok((cmd, sid, data.to_vec()))
 }
 
 #[cfg(test)]

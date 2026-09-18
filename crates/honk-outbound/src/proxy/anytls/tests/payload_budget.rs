@@ -217,7 +217,7 @@ async fn terminal_event_releases_later_payload_credit() {
         .unwrap();
     failed_tx
         .send(StreamEvent::Data(InboundPayload::for_tcp(
-            vec![1; BUDGET],
+            bytes::Bytes::from(vec![1; BUDGET]),
             credit,
             inbound,
         )))

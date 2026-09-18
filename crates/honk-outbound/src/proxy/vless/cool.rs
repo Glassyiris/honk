@@ -18,7 +18,8 @@ use tokio::time::Instant;
 
 use crate::proxy::{AsyncReadWrite, MuxSession, PacketTransport};
 use crate::session::{
-    ManagedSession, OpenError, SessionPermit, SessionPool, SessionPoolConfig, SessionState,
+    IdleClock, ManagedSession, OpenError, SessionPermit, SessionPool, SessionPoolConfig,
+    SessionState,
 };
 
 mod child;
@@ -250,6 +251,8 @@ impl ChildSink {
 pub struct VlessCoolSession {
     state: AtomicU8,
     created_at: Instant,
+    /// Idle bookkeeping for the pool janitor, stamped at stream open and close.
+    idle: IdleClock,
     capacity: Arc<tokio::sync::Semaphore>,
     capacity_notify: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
     active_limit: usize,
@@ -473,6 +476,9 @@ impl VlessCoolSession {
             Tcp(mpsc::Sender<QueuedPayload>),
             Udp(mpsc::Sender<Datagram>, SocketAddr),
         }
+        // A KEEP frame whose UDP metadata cannot be read, or that arrives
+        // before its child committed a destination, is that child's failure:
+        // the other logical connections on the carrier are untouched.
         let delivery = {
             let children = self.children.lock();
             match children.get(&frame.id) {
@@ -481,20 +487,36 @@ impl VlessCoolSession {
                 Some(ChildSink::Udp {
                     tx, destination, ..
                 }) => {
-                    let destination = destination.lock().clone().ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "XUDP peer replied before the first NEW destination was committed",
-                        )
-                    })?;
-                    Some(Delivery::Udp(
-                        tx.clone(),
-                        parse_keep_peer(
-                            &frame.metadata,
-                            destination.peer,
-                            destination.target_domain.as_deref(),
-                        )?,
-                    ))
+                    let peer = destination
+                        .lock()
+                        .clone()
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "XUDP peer replied before the first NEW destination was committed",
+                            )
+                        })
+                        .and_then(|destination| {
+                            parse_keep_peer(
+                                &frame.metadata,
+                                destination.peer,
+                                destination.target_domain.as_deref(),
+                            )
+                        });
+                    match peer {
+                        Ok(peer) => Some(Delivery::Udp(tx.clone(), peer)),
+                        Err(error) => {
+                            drop(children);
+                            self.fail_child(
+                                frame.id,
+                                Failure::from_io(error, "invalid XUDP KEEP frame"),
+                            );
+                            if !terminal {
+                                self.schedule_end(frame.id)?;
+                            }
+                            return Ok(());
+                        }
+                    }
                 }
             }
         };
@@ -645,9 +667,15 @@ impl ManagedSession for VlessCoolSession {
     }
 
     fn permit_released(&self) {
-        if self.state() == SessionState::Draining && self.active_streams() == 0 {
+        let active = self.active_streams();
+        self.idle.stream_released(active);
+        if self.state() == SessionState::Draining && active == 0 {
             self.close();
         }
+    }
+
+    fn idle_since(&self) -> Option<Instant> {
+        self.idle.idle_since()
     }
 
     fn try_reserve(self: &Arc<Self>) -> Option<SessionPermit<Self>> {
@@ -655,6 +683,7 @@ impl ManagedSession for VlessCoolSession {
             return None;
         }
         let permit = Arc::clone(&self.capacity).try_acquire_owned().ok()?;
+        self.idle.stream_opened();
         let permit = SessionPermit::new(Arc::clone(self), permit);
         if self.state() != SessionState::Active {
             drop(permit);
@@ -749,6 +778,7 @@ pub(crate) fn connect(
     let session = Arc::new(VlessCoolSession {
         state: AtomicU8::new(SessionState::Active as u8),
         created_at: Instant::now(),
+        idle: IdleClock::new(),
         capacity: Arc::new(tokio::sync::Semaphore::new(active_limit)),
         capacity_notify: std::sync::OnceLock::new(),
         active_limit,

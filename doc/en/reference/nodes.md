@@ -151,7 +151,7 @@ For protocols that own `network`, flat structured input accepts comma-separated 
 
 VMess and VLESS nodes still parse without the `rprx` Cargo feature, but no handler is registered and dialing fails with `No handler for protocol`; normal feature-off builds do not allocate VLESS pools or carrier semaphores. `honk-core` and `honk-tool` enable `rprx` by default.
 
-`honk-core` injects `direct` and `block` at startup and reload with fixed reserved IDs. User nodes may use neither those names nor those protocols.
+`honk-core` injects `direct` and `block` at startup and reload with fixed reserved IDs. User nodes may use neither those names nor those protocols. Groups do not draw them from the pool: only `filter: name(direct)` or `name(block)` spelled exactly admits one; see the [group reference](./groups.md#syntax).
 
 ## Protocol parameters
 
