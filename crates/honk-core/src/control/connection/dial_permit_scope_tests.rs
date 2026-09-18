@@ -1,6 +1,86 @@
 use super::*;
 
 #[tokio::test]
+async fn dns_wait_timeout_remains_retryable_with_free_admission() {
+    // Bootstrap DNS is process-global; isolate it from parallel core tests.
+    const CHILD: &str = "HONK_DIAL_DNS_TIMEOUT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "control::connection::tcp::dial_permit_scope_tests::dns_wait_timeout_remains_retryable_with_free_admission",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("isolated DNS timeout test");
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let target: SocketAddr = "192.0.2.1:443".parse().unwrap();
+    let mut node = Node {
+        name: "dns-wait".into(),
+        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
+        address: "pending.invalid".into(),
+        port: 1080,
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    let generation = Arc::new(
+        honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing(&[node.clone()], 1, None)
+            .unwrap()
+            .0,
+    );
+    let control = crate::control::tests::support::control_plane(Config {
+        nodes: vec![node.clone()],
+        ..Default::default()
+    });
+    let handle = control.spawn_handle();
+    let dns = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    honk_outbound::bootstrap::set_global(honk_outbound::bootstrap::BootstrapResolver::parse(
+        &dns.local_addr().unwrap().to_string(),
+    ));
+    let candidates = [&node];
+    let feedback = HashMap::new();
+    let (result, ()) = tokio::join!(
+        handle.race_candidates(
+            &candidates,
+            target,
+            None,
+            "score",
+            Duration::from_millis(100),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            Arc::clone(&generation),
+            IpVersion::V4,
+            &feedback,
+            false,
+        ),
+        async {
+            let mut packet = [0; 512];
+            tokio::time::timeout(Duration::from_secs(1), dns.recv_from(&mut packet))
+                .await
+                .expect("the candidate must reach bootstrap DNS")
+                .unwrap();
+            let permit =
+                tokio::time::timeout(Duration::from_millis(100), generation.acquire_dial_permit())
+                    .await
+                    .expect("physical admission must remain available during DNS");
+            drop(permit);
+        }
+    );
+    assert!(
+        matches!(result, Ok(None)),
+        "DNS timeout must remain an ordinary failed attempt, not terminal Capacity"
+    );
+}
+
+#[tokio::test]
 async fn ready_pool_hit_does_not_wait_for_physical_dial_permit() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = listener.local_addr().unwrap();
@@ -37,6 +117,8 @@ async fn ready_pool_hit_does_not_wait_for_physical_dial_permit() {
     )
     .await;
     let registry = ProxyRegistry::default_resolver().unwrap();
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started_on_dial = Arc::clone(&started);
 
     let (stream, fresh) = tokio::time::timeout(
         Duration::from_millis(100),
@@ -47,12 +129,15 @@ async fn ready_pool_hit_does_not_wait_for_physical_dial_permit() {
             &node,
             (target, None),
             Duration::from_secs(1),
-            || {},
+            &generation.dial_scope(move || {
+                started_on_dial.store(true, std::sync::atomic::Ordering::Release)
+            }),
         ),
     )
     .await
     .expect("ready stream must bypass an exhausted physical-dial gate")
     .unwrap();
+    assert!(started.load(std::sync::atomic::Ordering::Acquire));
     assert!(
         !fresh,
         "a ready-pool acquire performs no network round trip"
@@ -91,7 +176,9 @@ async fn feedback_does_not_start_while_waiting_for_dial_admission() {
             &node,
             (target, None),
             Duration::from_secs(1),
-            move || started_on_dial.store(true, std::sync::atomic::Ordering::Release),
+            &generation.dial_scope(move || {
+                started_on_dial.store(true, std::sync::atomic::Ordering::Release)
+            }),
         ),
     )
     .await;

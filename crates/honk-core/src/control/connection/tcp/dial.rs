@@ -55,7 +55,7 @@ impl ControlPlaneHandle {
                     // cancels it before it can start.
                     wait_for_cold_urltest_release(idx).await;
                 }
-                let reporter = Arc::new(parking_lot::Mutex::new((false, None)));
+                let reporter = Arc::new(parking_lot::Mutex::new(None));
                 let on_start = {
                     let feedback = feedback.get(&node.id).cloned();
                     let reporter = Arc::clone(&reporter);
@@ -64,35 +64,38 @@ impl ControlPlaneHandle {
                         if let Some(reporter) = &started {
                             started_reporters.lock().push(reporter.clone());
                         }
-                        *reporter.lock() = (true, started);
+                        *reporter.lock() = started;
                     }
                 };
+                let scope = generation.dial_scope(on_start);
                 let start = std::time::Instant::now();
                 let per_dial_timeout = connect_timeout * 3;
-                let result = tokio::time::timeout(
-                    per_dial_timeout,
-                    Self::dial_pooled(
+                let result = {
+                    let mut dial = std::pin::pin!(Self::dial_pooled(
                         &ctx.proxy_registry,
                         &ctx.connection_pool,
                         &generation,
                         &node,
                         (target, target_domain.as_deref()),
                         connect_timeout,
-                        on_start,
-                    ),
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    if !reporter.lock().0 {
-                        return Err(honk_outbound::proxy::PacketRejection::Capacity.into());
-                    }
-                    Err(anyhow::Error::new(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("dial timed out after {per_dial_timeout:?}"),
-                    )))
-                });
+                        &scope,
+                    ));
+                    // Poll the dial before the timer, and keep its pending
+                    // acquisitions alive until the timeout is classified.
+                    tokio::time::timeout(per_dial_timeout, dial.as_mut())
+                        .await
+                        .unwrap_or_else(|_| {
+                            if scope.is_waiting_for_admission() {
+                                return Err(honk_outbound::proxy::PacketRejection::Capacity.into());
+                            }
+                            Err(anyhow::Error::new(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!("dial timed out after {per_dial_timeout:?}"),
+                            )))
+                        })
+                };
                 let elapsed = start.elapsed();
-                let reporter = reporter.lock().1.clone();
+                let reporter = reporter.lock().clone();
                 match &result {
                     Ok(_) => {
                         if let Some(reporter) = &reporter {
@@ -414,7 +417,7 @@ impl ControlPlaneHandle {
         node: &Node,
         target: (SocketAddr, Option<&str>),
         connect_timeout: Duration,
-        on_start: impl FnOnce() + Send + 'static,
+        scope: &Arc<honk_outbound::runtime::DialScope>,
     ) -> anyhow::Result<(crate::proxy::ProxyStream, bool)> {
         anyhow::ensure!(
             !generation.is_shutdown(),
@@ -427,7 +430,6 @@ impl ControlPlaneHandle {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false)
         });
-        let on_start = Arc::new(parking_lot::Mutex::new(Some(on_start)));
 
         let addr = format!("{}:{}", node.host(), node.port);
         let protocol = node.protocol();
@@ -444,9 +446,7 @@ impl ControlPlaneHandle {
                     addr,
                     target
                 );
-                if let Some(on_start) = on_start.lock().take() {
-                    on_start();
-                }
+                scope.start();
                 return Ok((stream, false));
             }
         }
@@ -458,9 +458,7 @@ impl ControlPlaneHandle {
                 && (entry.descriptor.pool_bare_tcp)(node)
                 && let Some(tcp) = pool.acquire_tcp(&addr).await
             {
-                if let Some(on_start) = on_start.lock().take() {
-                    on_start();
-                }
+                scope.start();
                 tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);
                 return entry
                     .tcp
@@ -493,13 +491,6 @@ impl ControlPlaneHandle {
                     .map(|stream| (stream, true))
             }
         };
-        let on_start = Arc::clone(&on_start);
-        generation
-            .scope_dials_with_start(dial, move || {
-                if let Some(on_start) = on_start.lock().take() {
-                    on_start();
-                }
-            })
-            .await
+        scope.scope(dial).await
     }
 }

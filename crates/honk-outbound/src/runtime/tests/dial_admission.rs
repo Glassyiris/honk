@@ -5,6 +5,85 @@ use std::future::ready;
 use std::sync::atomic::AtomicUsize;
 
 #[tokio::test]
+async fn cancelled_parallel_waits_preserve_siblings_without_sticky_capacity() {
+    let (predecessor, _) =
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, None).unwrap();
+    let (registry, _) =
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, Some(&predecessor))
+            .unwrap();
+    let occupied = predecessor.acquire_dial_permit().await;
+    let scope = registry.dial_scope(|| panic!("cancelled admission must not start feedback"));
+    let mut first = Box::pin(scope.scope(admit_physical_dial(ready(Ok::<_, ()>(())))));
+    let mut second = Box::pin(scope.scope(admit_physical_dial(ready(Ok::<_, ()>(())))));
+
+    // The first wait holds generation capacity at the process gate;
+    // its sibling is still waiting for that generation capacity.
+    assert!(first.as_mut().now_or_never().is_none());
+    assert!(second.as_mut().now_or_never().is_none());
+    assert!(scope.is_waiting_for_admission());
+    drop(first);
+    assert!(
+        scope.is_waiting_for_admission(),
+        "cancelling one acquisition must not hide its pending sibling"
+    );
+    assert!(second.as_mut().now_or_never().is_none());
+    assert!(second.as_mut().now_or_never().is_none());
+    drop(second);
+
+    let mut unrelated = Box::pin(scope.scope(std::future::pending::<()>()));
+    assert!(unrelated.as_mut().now_or_never().is_none());
+    assert!(
+        !scope.is_waiting_for_admission(),
+        "cancelled admission cannot classify unrelated pending work as Capacity"
+    );
+    drop(unrelated);
+    drop(occupied);
+    registry
+        .acquire_dial_permit()
+        .now_or_never()
+        .expect("cancellation must release both generation and process admission");
+}
+
+#[tokio::test]
+async fn started_dials_do_not_reclassify_later_waits_as_unstarted_capacity() {
+    for logical_start in [false, true] {
+        let (registry, _) =
+            OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, None).unwrap();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let scope = registry.dial_scope({
+            let starts = Arc::clone(&starts);
+            move || {
+                starts.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let occupied = if logical_start {
+            let occupied = registry.acquire_dial_permit().await;
+            scope.start();
+            Some(occupied)
+        } else {
+            scope
+                .scope(admit_physical_dial(ready(Ok::<_, ()>(()))))
+                .await
+                .unwrap();
+            None
+        };
+        let mut later = Box::pin(scope.scope(admit_physical_dial(ready(Ok::<_, ()>(())))));
+        assert!(later.as_mut().now_or_never().is_none());
+        assert!(
+            !scope.is_waiting_for_admission(),
+            "later physical waits cannot undo a physical or reused logical start"
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        drop(later);
+        drop((scope, occupied));
+        registry
+            .acquire_dial_permit()
+            .now_or_never()
+            .expect("scope exit must release retained and cancelled admission");
+    }
+}
+
+#[tokio::test]
 async fn overlapping_generations_share_the_startup_dial_ceiling() {
     let (first, _) =
         OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 3, 4, 4, None).unwrap();
@@ -39,18 +118,16 @@ async fn cold_replacement_retains_shared_scope_admission() {
             .unwrap();
     let starts = Arc::new(AtomicUsize::new(0));
     let scope = registry
-        .scope_dials_with_start(
-            async {
-                admit_physical_dial(ready(Ok::<_, ()>(()))).await.unwrap();
-                capture_dial_scope()
-            },
-            {
-                let starts = Arc::clone(&starts);
-                move || {
-                    starts.fetch_add(1, Ordering::SeqCst);
-                }
-            },
-        )
+        .dial_scope({
+            let starts = Arc::clone(&starts);
+            move || {
+                starts.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .scope(async {
+            admit_physical_dial(ready(Ok::<_, ()>(()))).await.unwrap();
+            capture_dial_scope()
+        })
         .await;
     let mut competing = std::pin::pin!(successor.acquire_dial_permit());
     assert!(competing.as_mut().now_or_never().is_none());

@@ -51,6 +51,8 @@ Performance has its own event timestamps and bounded four-observation inertia. E
 
 Admission-scoped TCP dialing starts its reporter at the first admitted physical attempt or immediately before a logical open on a reused session or QUIC connection, not while waiting for cold physical admission. The callback is one-shot; completed paths without either boundary retain the completion fallback.
 
+An unstarted scope's timeout is a local capacity refusal only while a physical-admission acquisition is still pending. DNS resolution before admission remains an ordinary timeout, allowing the existing eligible retry path. Classification inspects the scope before cancelling its future; cancellation removes only that acquisition's pending registration.
+
 Ordinary and post-race TCP ready/bare refills retain setup-quality evidence, but their successes and failures never alter real-flow failure streaks or exploration backoff. UDP drivers classify their terminal result before their health callback can synchronously retire the endpoint, so that callback cannot turn an error into neutral cancellation or success. Intentional retirement remains neutral without a reply and successful after a reply; process shutdown and packet-local congestion stay neutral, and reply-idle expiry is a timeout only when no reply was received.
 
 On live endpoints, a proven QUIC path stall takes precedence and remains a timeout even when the immediate error would otherwise be classified as packet-local congestion or idle-after-reply.
