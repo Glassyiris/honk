@@ -337,7 +337,10 @@ async fn test_reload_rebuilds_group_manager_preserving_choices() {
     .unwrap();
 
     // Runtime selector choice made before the reload.
-    cp.group_manager().read().set_selector_choice("proxy", "b");
+    cp.group_manager()
+        .read()
+        .set_selector_choice("proxy", "b", honk_outbound::group::SelectorNetworks::Both)
+        .unwrap();
 
     // v2: "proxy" unchanged; new group "extra" with c; new URLTest
     // group "ut" with b.
@@ -355,7 +358,10 @@ async fn test_reload_rebuilds_group_manager_preserving_choices() {
         let gm = cp.group_manager();
         let gm = gm.read();
         // The old runtime choice migrated to the rebuilt manager.
-        assert_eq!(gm.get_selector_choice("proxy"), Some("b".to_string()));
+        assert_eq!(
+            gm.get_selector_choice("proxy", honk_outbound::group::SelectionNetwork::Tcp),
+            Some("b".to_string())
+        );
         assert_eq!(gm.select_node("proxy").map(|n| n.name.as_str()), Some("b"));
         // The new group is selectable right after the reload.
         assert_eq!(gm.select_node("extra").map(|n| n.name.as_str()), Some("c"));
@@ -382,7 +388,10 @@ async fn test_reload_rebuilds_group_manager_preserving_choices() {
     {
         let gm = cp.group_manager();
         let gm = gm.read();
-        assert_eq!(gm.get_selector_choice("proxy"), None);
+        assert_eq!(
+            gm.get_selector_choice("proxy", honk_outbound::group::SelectionNetwork::Tcp),
+            None
+        );
         assert!(gm.select_node("extra").is_none());
     }
     let registered = cp.alive_set().registered_nodes();

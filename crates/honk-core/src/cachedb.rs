@@ -128,6 +128,38 @@ fn run_writer(mut conn: Connection, receiver: mpsc::Receiver<Write>) {
                 let result = flush(&mut conn, &mut latest).and_then(|_| conn.execute("DELETE FROM kv WHERE key LIKE ?1 ESCAPE '\\' OR key LIKE ?2 ESCAPE '\\'", params![format!("{legacy}%"), format!("{v2}%")]).map(|_| ())).map_err(CacheDbError::from);
                 let _ = ack.send(result);
             }
+            #[cfg(any(feature = "native-api", test))]
+            Write::DeleteDns(mut keys, legacy, ack) => {
+                let result = (|| -> Result<(), rusqlite::Error> {
+                    flush(&mut conn, &mut latest)?;
+                    let transaction = conn.transaction()?;
+                    if let Some((prefix, name, types)) = legacy {
+                        let mut statement = transaction
+                            .prepare("SELECT key FROM kv WHERE key LIKE ?1 ESCAPE '\\'")?;
+                        let rows = statement.query_map(
+                            params![format!("{}%", escape_like_prefix(&prefix))],
+                            |row| row.get::<_, String>(0),
+                        )?;
+                        for row in rows {
+                            let key = row?;
+                            if key.strip_prefix(&prefix).is_some_and(|key| {
+                                !key.starts_with("v2:")
+                                    && crate::dns::cache::legacy_matches(key, &name, &types)
+                            }) {
+                                keys.push(key);
+                            }
+                        }
+                    }
+                    let mut statement = transaction.prepare("DELETE FROM kv WHERE key = ?1")?;
+                    for key in keys {
+                        statement.execute(params![key])?;
+                    }
+                    drop(statement);
+                    transaction.commit()
+                })()
+                .map_err(CacheDbError::from);
+                let _ = ack.send(result);
+            }
             #[cfg(test)]
             Write::SetQueryOnly(enabled, ack) => {
                 let result = conn
@@ -157,6 +189,12 @@ enum Write {
         mpsc::Sender<Result<(), CacheDbError>>,
     ),
     FlushDns(String, String, mpsc::Sender<Result<(), CacheDbError>>),
+    #[cfg(any(feature = "native-api", test))]
+    DeleteDns(
+        Vec<String>,
+        Option<(String, String, Vec<u16>)>,
+        mpsc::Sender<Result<(), CacheDbError>>,
+    ),
     #[cfg(test)]
     SetQueryOnly(bool, mpsc::Sender<Result<(), CacheDbError>>),
     #[cfg(test)]
@@ -461,12 +499,77 @@ impl CacheDb {
         Ok(())
     }
 
+    #[cfg(any(feature = "native-api", test))]
+    pub(crate) fn delete_dns_entries(
+        &self,
+        suffixes: &[String],
+        name: Option<(&str, &[u16])>,
+    ) -> Result<(), CacheDbError> {
+        let keys: Vec<_> = suffixes
+            .iter()
+            .map(|suffix| self.wrap(&format!("dns:v2:{suffix}")))
+            .collect();
+        let prefix = self.wrap("dns:");
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| CacheDbError::LockPoisoned)?;
+        let (ack, result) = mpsc::channel();
+        self.writer
+            .send(Write::DeleteDns(
+                keys.clone(),
+                name.map(|(name, types)| (prefix.clone(), name.to_owned(), types.to_vec())),
+                ack,
+            ))
+            .map_err(|_| CacheDbError::LockPoisoned)?;
+        result.recv().map_err(|_| CacheDbError::LockPoisoned)??;
+        pending.retain(|key, _| {
+            !keys.contains(key)
+                && !name.is_some_and(|(name, types)| {
+                    key.strip_prefix(&prefix).is_some_and(|key| {
+                        !key.starts_with("v2:")
+                            && crate::dns::cache::legacy_matches(key, name, types)
+                    })
+                })
+        });
+        Ok(())
+    }
+
     pub fn load_selector_choice(&self, group: &str) -> Option<String> {
         self.get(&format!("selector:{}", group))
     }
 
     pub fn save_selector_choice(&self, group: &str, node: &str) {
         self.set(&format!("selector:{}", group), node);
+    }
+
+    pub(crate) fn load_network_selector(
+        &self,
+        group: &str,
+        network: honk_outbound::group::SelectionNetwork,
+    ) -> Option<Result<honk_outbound::group::SelectorMember, serde_json::Error>> {
+        let network = match network {
+            honk_outbound::group::SelectionNetwork::Tcp => "tcp",
+            honk_outbound::group::SelectionNetwork::Udp => "udp",
+        };
+        self.get(&format!("selector:{network}:{group}"))
+            .map(|value| serde_json::from_str(&value))
+    }
+
+    pub(crate) fn save_network_selector(
+        &self,
+        group: &str,
+        network: honk_outbound::group::SelectionNetwork,
+        member: &honk_outbound::group::SelectorMember,
+    ) {
+        let network = match network {
+            honk_outbound::group::SelectionNetwork::Tcp => "tcp",
+            honk_outbound::group::SelectionNetwork::Udp => "udp",
+        };
+        self.set(
+            &format!("selector:{network}:{group}"),
+            &serde_json::to_string(member).expect("selector identity serializes"),
+        );
     }
 
     pub fn load_clash_mode(&self) -> Option<String> {

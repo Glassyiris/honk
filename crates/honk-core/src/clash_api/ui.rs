@@ -33,7 +33,8 @@ use honk_outbound::group::{
 use honk_outbound::proxy::{AsyncReadWrite, ProxyRegistry};
 use honk_outbound::runtime::SharedRuntimeRegistry;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
+use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::routing::{ConnectionInfo, Router};
@@ -72,17 +73,58 @@ pub struct UiDownloadContext {
     pub runtime_registry: SharedRuntimeRegistry,
 }
 
-/// Spawn a background task that downloads the dashboard when the configured
-/// directory is missing or empty. Fire-and-forget: outcomes are only logged.
-pub fn spawn_ui_download_if_needed(ctx: UiDownloadContext) {
-    let dir = ctx.external_ui.clone();
-    tokio::spawn(async move {
-        match ensure_external_ui(&ctx).await {
-            Ok(true) => tracing::info!("external UI downloaded into {}", dir),
+/// Owns the one startup download; stopping never schedules a retry.
+#[must_use = "retain the UI download owner and call stop_and_join before teardown"]
+pub struct UiDownloadTask {
+    stop: watch::Sender<bool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl UiDownloadTask {
+    pub(crate) async fn stop_and_join(&mut self) -> anyhow::Result<()> {
+        self.stop.send_replace(true);
+        if let Some(handle) = self.handle.as_mut() {
+            // Await in place: a caller's deadline must not lose the extraction join.
+            let result = handle.await;
+            self.handle = None;
+            result.map_err(|error| anyhow::anyhow!("external UI download task failed: {error}"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for UiDownloadTask {
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
+        if self.handle.is_some() {
+            tracing::error!("external UI download owner dropped without stop_and_join");
+        }
+    }
+}
+
+/// Spawn an owned download when the configured directory is missing or empty.
+pub(crate) fn spawn_ui_download_if_needed(ctx: UiDownloadContext) -> UiDownloadTask {
+    let (stop, stop_rx) = watch::channel(false);
+    let handle = tokio::spawn(async move {
+        match ensure_external_ui_with_stop(&ctx, &mut Some(stop_rx)).await {
+            Ok(true) => tracing::info!("external UI downloaded into {}", ctx.external_ui),
             Ok(false) => {}
             Err(e) => tracing::warn!("download external ui error: {:#}", e),
         }
     });
+    UiDownloadTask {
+        stop,
+        handle: Some(handle),
+    }
+}
+
+async fn download_stopped(stop: &mut Option<watch::Receiver<bool>>) {
+    match stop {
+        Some(stop) => {
+            let _ = stop.wait_for(|stopped| *stopped).await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// Ensure the configured directory exists and holds the dashboard,
@@ -90,6 +132,13 @@ pub fn spawn_ui_download_if_needed(ctx: UiDownloadContext) {
 /// `Ok(true)` when a download was performed, `Ok(false)` when the directory
 /// was already populated.
 pub async fn ensure_external_ui(ctx: &UiDownloadContext) -> anyhow::Result<bool> {
+    ensure_external_ui_with_stop(ctx, &mut None).await
+}
+
+async fn ensure_external_ui_with_stop(
+    ctx: &UiDownloadContext,
+    stop: &mut Option<watch::Receiver<bool>>,
+) -> anyhow::Result<bool> {
     let dir = &ctx.external_ui;
     if dir.is_empty() {
         return Ok(false);
@@ -103,16 +152,16 @@ pub async fn ensure_external_ui(ctx: &UiDownloadContext) -> anyhow::Result<bool>
         }
         Err(_) => std::fs::create_dir_all(path)?,
     }
-    let configured_url = {
-        let config = ctx.config.read().await;
-        config
+    let configured_url = tokio::select! {
+        biased;
+        _ = download_stopped(stop) => return Ok(false),
+        config = ctx.config.read() => config
             .experimental
             .clash_api
             .external_ui_download_url
-            .clone()
+            .clone(),
     };
-    download_external_ui(ctx, &download_url(&configured_url)).await?;
-    Ok(true)
+    download_external_ui_with_stop(ctx, &download_url(&configured_url), stop).await
 }
 
 /// The environment override wins over the configured URL, then the default.
@@ -280,12 +329,28 @@ async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow:
 /// contents are removed again, matching sing-box's cleanup so the next
 /// start retries the download.
 pub async fn download_external_ui(ctx: &UiDownloadContext, url: &str) -> anyhow::Result<()> {
+    download_external_ui_with_stop(ctx, url, &mut None)
+        .await
+        .map(|_| ())
+}
+
+async fn download_external_ui_with_stop(
+    ctx: &UiDownloadContext,
+    url: &str,
+    stop: &mut Option<watch::Receiver<bool>>,
+) -> anyhow::Result<bool> {
     info!("downloading external ui from {}", url);
-    let bytes = fetch_routed(ctx, url).await?;
+    let Some(bytes) = fetch_routed(ctx, url, stop).await? else {
+        return Ok(false);
+    };
+    if stop.as_ref().is_some_and(|stop| *stop.borrow()) {
+        return Ok(false);
+    }
     let dir = ctx.external_ui.clone();
+    // Once accepted, blocking filesystem work must finish even if stop arrives.
     let result = tokio::task::spawn_blocking(move || extract_ui_zip(&bytes, Path::new(&dir))).await;
     match result {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(())) => Ok(true),
         Ok(Err(e)) => {
             remove_all_in_directory(Path::new(&ctx.external_ui));
             Err(e)
@@ -302,21 +367,31 @@ pub async fn download_external_ui(ctx: &UiDownloadContext, url: &str) -> anyhow:
 
 /// Fetch `url` following the traffic routing decision; proxied redirects
 /// re-enter the router because the Location host usually differs.
-async fn fetch_routed(ctx: &UiDownloadContext, url: &str) -> anyhow::Result<Vec<u8>> {
+async fn fetch_routed(
+    ctx: &UiDownloadContext,
+    url: &str,
+    stop: &mut Option<watch::Receiver<bool>>,
+) -> anyhow::Result<Option<Vec<u8>>> {
     let mut url = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
         let (host, port, path, is_https) = parse_download_url(&url)?;
-        let response = match decide_route(ctx, &host, port).await? {
-            UiRoute::Direct { feedback } => fetch_direct(&url, feedback).await?,
+        let route = tokio::select! {
+            biased;
+            _ = download_stopped(stop) => return Ok(None),
+            route = decide_route(ctx, &host, port) => route?,
+        };
+        let response = match route {
+            UiRoute::Direct { feedback } => fetch_direct(&url, feedback, stop).await?,
             UiRoute::Block => {
                 anyhow::bail!("routing sends the external UI download to 'block'");
             }
             UiRoute::Proxy { node, feedback } => {
-                fetch_proxied(ctx, &node, feedback, &host, port, &path, is_https).await?
+                fetch_proxied(ctx, &node, feedback, (&host, port, &path, is_https), stop).await?
             }
         };
         match response {
-            ProxiedFetch::Body(bytes) => return Ok(bytes),
+            ProxiedFetch::Body(bytes) => return Ok(Some(bytes)),
+            ProxiedFetch::Stopped => return Ok(None),
             ProxiedFetch::Redirect(location) => {
                 url = reqwest::Url::parse(&url)?.join(&location)?.to_string();
                 info!(url = %url, "external UI download following redirect");
@@ -329,9 +404,16 @@ async fn fetch_routed(ctx: &UiDownloadContext, url: &str) -> anyhow::Result<Vec<
 /// Direct fetch: plain reqwest (the control-plane PID bypass keeps the
 /// gateway's own traffic out of the datapath), streaming with the archive
 /// size cap.
-async fn fetch_direct(url: &str, feedback: Option<ScoreFeedback>) -> anyhow::Result<ProxiedFetch> {
+async fn fetch_direct(
+    url: &str,
+    feedback: Option<ScoreFeedback>,
+    stop: &mut Option<watch::Receiver<bool>>,
+) -> anyhow::Result<ProxiedFetch> {
     let reporter = feedback.as_ref().map(ScoreFeedback::start);
-    let result = async {
+    let result = tokio::select! {
+        biased;
+        _ = download_stopped(stop) => Ok(ProxiedFetch::Stopped),
+        result = async {
         let client = reqwest::Client::builder()
             .timeout(DOWNLOAD_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
@@ -368,10 +450,11 @@ async fn fetch_direct(url: &str, feedback: Option<ScoreFeedback>) -> anyhow::Res
             bytes.extend_from_slice(&chunk);
         }
         Ok(ProxiedFetch::Body(bytes))
-    }
-    .await;
+        } => result,
+    };
     if let Some(reporter) = &reporter {
         reporter.finish(match &result {
+            Ok(ProxiedFetch::Stopped) => ScoreOutcome::Cancelled,
             Ok(_) => ScoreOutcome::Success,
             Err(error) => ScoreOutcome::from_error(error),
         });
@@ -382,6 +465,7 @@ async fn fetch_direct(url: &str, feedback: Option<ScoreFeedback>) -> anyhow::Res
 enum ProxiedFetch {
     Body(Vec<u8>),
     Redirect(String),
+    Stopped,
 }
 
 /// One proxied GET through `node`'s tunnel: dial by domain (the node's
@@ -391,17 +475,19 @@ async fn fetch_proxied(
     ctx: &UiDownloadContext,
     node: &Node,
     feedback: Option<ScoreFeedback>,
-    host: &str,
-    port: u16,
-    path: &str,
-    is_https: bool,
+    (host, port, path, is_https): (&str, u16, &str, bool),
+    stop: &mut Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<ProxiedFetch> {
     let protocol = node.protocol();
     let entry = ctx
         .proxy_registry
         .find(protocol)
         .ok_or_else(|| anyhow::anyhow!("no handler for protocol {:?}", protocol))?;
-    let connect_timeout = Duration::from_millis(ctx.config.read().await.global.connect_timeout_ms);
+    let connect_timeout = tokio::select! {
+        biased;
+        _ = download_stopped(stop) => return Ok(ProxiedFetch::Stopped),
+        config = ctx.config.read() => Duration::from_millis(config.global.connect_timeout_ms),
+    };
     // Tunnel handlers dial by domain; the address is only a fallback for
     // handlers that need a numeric target.
     let host_ip = parse_host_ip(host);
@@ -416,7 +502,10 @@ async fn fetch_proxied(
         honk_outbound::proxy::WarmRequirement::Session,
     )?;
     let reporter = feedback.as_ref().map(ScoreFeedback::start);
-    let result = match generation
+    let result = tokio::select! {
+        biased;
+        _ = download_stopped(stop) => Ok(ProxiedFetch::Stopped),
+        result = async { match generation
         .scope_dials(
             entry
                 .tcp
@@ -437,9 +526,11 @@ async fn fetch_proxied(
             ))),
         },
         Err(e) => Err(e.context("external UI download dial failed")),
+        } } => result,
     };
     if let Some(reporter) = &reporter {
         reporter.finish(match &result {
+            Ok(ProxiedFetch::Stopped) => ScoreOutcome::Cancelled,
             Ok(_) => ScoreOutcome::Success,
             Err(error) => ScoreOutcome::from_error(error),
         });
@@ -813,6 +904,176 @@ mod tests {
         addr
     }
 
+    async fn read_test_request(socket: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(socket.read_u8().await.unwrap());
+            assert!(request.len() < MAX_HEADER_BYTES);
+        }
+    }
+
+    async fn assert_stop_closes_stalled_body(ctx: UiDownloadContext) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        {
+            let mut config = ctx.config.write().await;
+            Arc::make_mut(&mut config)
+                .experimental
+                .clash_api
+                .external_ui_download_url = format!("http://{addr}/ui.zip");
+        }
+        let (headers_tx, headers_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_test_request(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\nx")
+                .await
+                .unwrap();
+            headers_tx.send(()).unwrap();
+            let mut byte = [0];
+            let closed = socket.read(&mut byte).await;
+            assert!(
+                matches!(&closed, Ok(0))
+                    || matches!(&closed, Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset),
+                "stopping the download must close the peer connection: {closed:?}"
+            );
+        });
+        let directory = ctx.external_ui.clone();
+        let mut task = spawn_ui_download_if_needed(ctx);
+        tokio::time::timeout(Duration::from_secs(2), headers_rx)
+            .await
+            .expect("the request must reach the loopback server")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task.stop_and_join())
+            .await
+            .expect("stop must cancel the body, not wait for the 30-second download timeout")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("the peer must observe the canceled connection")
+            .unwrap();
+        assert!(std::fs::read_dir(directory).unwrap().next().is_none());
+        task.stop_and_join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_stalled_direct_body_and_joins() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_stop_closes_stalled_body(test_ctx(dir.path(), &[])).await;
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_stalled_proxy_body_and_joins() {
+        let mut registry = ProxyRegistry::new();
+        registry.register(ProtocolEntry::new(
+            NodeProtocol::Socks5,
+            Arc::new(LoopbackHandler),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx_with_registry(dir.path(), &[], Arc::new(registry));
+        let mut node = Node {
+            name: "ui-proxy".into(),
+            outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
+            address: "127.0.0.1".into(),
+            port: 1,
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        {
+            let mut config = ctx.config.write().await;
+            let config = Arc::make_mut(&mut config);
+            config.experimental.clash_api.external_ui_download_detour = node.name.clone();
+            config.nodes.push(node);
+        }
+        assert_stop_closes_stalled_body(ctx).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_retains_started_extraction_across_canceled_join() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo_path = dir.path().join("barrier");
+        let started_path = dir.path().join("started");
+        let index_path = dir.path().join("index.html");
+        let zip_bytes = make_zip(&[
+            ("dist/started", b"started".as_slice()),
+            ("dist/barrier", b"release".as_slice()),
+            ("dist/index.html", b"complete".as_slice()),
+        ]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let (body_tx, body_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_test_request(&mut socket).await;
+            request_tx.send(()).unwrap();
+            body_rx.await.unwrap();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                zip_bytes.len()
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(&zip_bytes).await.unwrap();
+        });
+        let ctx = test_ctx(dir.path(), &[]);
+        {
+            let mut config = ctx.config.write().await;
+            Arc::make_mut(&mut config)
+                .experimental
+                .clash_api
+                .external_ui_download_url = format!("http://{addr}/ui.zip");
+        }
+        let mut task = spawn_ui_download_if_needed(ctx);
+        tokio::time::timeout(Duration::from_secs(2), request_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        // Create the barrier after the empty-directory check, before delivering the ZIP.
+        nix::unistd::mkfifo(&fifo_path, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        body_tx.send(()).unwrap();
+        let started = tokio::time::timeout(Duration::from_secs(2), async {
+            while !started_path.exists() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        let first_stop =
+            tokio::time::timeout(Duration::from_millis(20), task.stop_and_join()).await;
+
+        // Release blocking extraction before asserting, including on a broken early-ack path.
+        let _reader = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo_path)
+            .unwrap();
+        let joined = tokio::time::timeout(Duration::from_secs(2), task.stop_and_join()).await;
+        let completed = tokio::time::timeout(Duration::from_secs(2), async {
+            while !index_path.exists() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        server.await.unwrap();
+        assert!(
+            started.is_ok(),
+            "the real extractor must reach the filesystem barrier"
+        );
+        assert!(
+            first_stop.is_err(),
+            "stop must not acknowledge unfinished extraction"
+        );
+        joined
+            .expect("a canceled stop wait must retain the task join")
+            .unwrap();
+        completed.expect("already-started extraction must finish after stop");
+        assert_eq!(std::fs::read(index_path).unwrap(), b"complete");
+    }
+
     #[tokio::test]
     async fn configured_url_and_detour_download_into_empty_directory() {
         let zip_bytes = make_zip(&[("dist/index.html", b"<html>y</html>".as_slice())]);
@@ -952,6 +1213,7 @@ mod tests {
         let error = fetch_routed(
             &test_ctx(dir.path(), &rules),
             &format!("http://{addr}/redirect"),
+            &mut None,
         )
         .await
         .unwrap_err();
@@ -1106,10 +1368,8 @@ mod tests {
             &ctx,
             &node,
             Some(feedback),
-            "127.0.0.1",
-            addr.port(),
-            "/ui.zip",
-            false,
+            ("127.0.0.1", addr.port(), "/ui.zip", false),
+            &mut None,
         )
         .await
         .unwrap();
@@ -1189,7 +1449,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["ui-direct"]
         );
-        let fetched = fetch_direct(&format!("http://{addr}/ui.zip"), feedback)
+        let fetched = fetch_direct(&format!("http://{addr}/ui.zip"), feedback, &mut None)
             .await
             .unwrap();
         assert!(matches!(fetched, ProxiedFetch::Body(bytes) if bytes == body));

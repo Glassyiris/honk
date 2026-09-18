@@ -1,5 +1,98 @@
 use super::*;
 
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn native_log_records_one_client_completion_not_internal_resolution() {
+    let (controller, _) =
+        test_controller(response_with_txid("example.com", 0x1234), Duration::ZERO);
+    let api = Arc::new(crate::native_api::dns::DnsApi::new("tcp-log".into(), true));
+    controller
+        .dns_service()
+        .attach_observer(Arc::downgrade(&api));
+    let query = query_with_txid("example.com", 0x1234);
+    controller
+        .dns_service()
+        .resolve(&query, IngressProfile::Api)
+        .await
+        .unwrap();
+    let (mut client, mut server) = tcp_pair().await;
+    let source = server.peer_addr().unwrap();
+    let task = tokio::spawn(async move {
+        controller
+            .handle_tcp_dns(&mut server, source, "127.0.0.1:53".parse().unwrap())
+            .await
+            .unwrap();
+    });
+    write_tcp_query(&mut client, &query).await;
+    let response = read_tcp_response(&mut client).await;
+    assert_eq!(response[3] & 15, 0);
+    drop(client);
+    task.await.unwrap();
+    let response = api.log_for_test().page_for_test();
+    let body = axum::body::to_bytes(response.into_body(), 262144)
+        .await
+        .unwrap();
+    let log: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(log["total"], 1);
+    assert_eq!(log["records"][0]["src"], source.to_string());
+    assert_eq!(log["records"][0]["status"], "NOERROR");
+    assert_eq!(log["records"][0]["question"]["name"], "example.com.");
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn native_log_keeps_admission_refusal_and_forward_failure() {
+    let upstream = Arc::new(SlowUpstream {
+        calls: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+        response: Vec::new(),
+    });
+    let mut config = honk_config::dns::DnsConfig::default();
+    config.routing.request.rules = vec![honk_config::dns::DnsRequestRule {
+        conditions: vec![honk_config::dns::DnsCond::Sip {
+            not: false,
+            cidrs: vec!["127.0.0.0/8".into()],
+        }],
+        action: honk_config::dns::DnsRequestAction::Upstream("default".into()),
+    }];
+    let controller = controller_with_dns_config(upstream, &config);
+    let api = Arc::new(crate::native_api::dns::DnsApi::new(
+        "tcp-errors".into(),
+        true,
+    ));
+    controller
+        .dns_service()
+        .attach_observer(Arc::downgrade(&api));
+    let held: Vec<_> = (0..2048)
+        .map(|_| controller.try_admit_query(false).unwrap())
+        .collect();
+    let (mut client, mut server) = tcp_pair().await;
+    let source = server.peer_addr().unwrap();
+    let task = tokio::spawn(async move {
+        controller
+            .serve_bound_tcp_dns(&mut server, source)
+            .await
+            .unwrap();
+    });
+    write_tcp_query(&mut client, &query_with_txid("refused.example", 1)).await;
+    assert_eq!(read_tcp_response(&mut client).await[3] & 15, 5);
+    drop(held);
+    write_tcp_query(&mut client, &query_with_txid("failed.example", 2)).await;
+    assert_eq!(read_tcp_response(&mut client).await[3] & 15, 2);
+    drop(client);
+    task.await.unwrap();
+    let response = api.log_for_test().page_for_test();
+    let body = axum::body::to_bytes(response.into_body(), 262144)
+        .await
+        .unwrap();
+    let log: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(log["total"], 2);
+    assert_eq!(log["records"][0]["status"], "SERVFAIL");
+    assert_eq!(log["records"][1]["status"], "REFUSED");
+    assert_eq!(log["records"][0]["route"]["source"], "dns.routing");
+    assert_eq!(log["records"][1]["route"]["source"], "default");
+}
+
 #[tokio::test]
 async fn first_tcp_frame_holds_permit_until_response_is_written() {
     let upstream = Arc::new(BlockingFirstUpstream {

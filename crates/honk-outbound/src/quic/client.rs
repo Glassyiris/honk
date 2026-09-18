@@ -37,7 +37,7 @@ fn spawn_tracked_connection_cleanup<C: Send + Sync + 'static>(
     owner: Weak<C>,
     monitor: Arc<QuicClientConnectionMonitor>,
 ) {
-    tokio::spawn(async move {
+    let _ = crate::runtime::spawn_owned(async move {
         let _monitor = monitor;
         let mut removed = false;
         loop {
@@ -100,6 +100,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             endpoint_factory: None,
             mtu: 1252,
             flow_control_profiles: Arc::new(AdaptiveFlowProfiles::default()),
+            task_scope: crate::runtime::TaskScope::capture(),
             state: Arc::new(Mutex::new(State {
                 endpoint: None,
                 conn: None,
@@ -168,7 +169,8 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         F: FnOnce(Connection) -> Fut,
         Fut: Future<Output = anyhow::Result<C>>,
     {
-        self.connection_with_inner(connect_timeout, setup, |_, _| {})
+        self.task_scope
+            .scope(self.connection_with_inner(connect_timeout, setup, |_, _| {}))
             .await
     }
 
@@ -182,10 +184,13 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         F: FnOnce(Connection) -> Fut,
         Fut: Future<Output = anyhow::Result<C>>,
     {
-        self.connection_with_inner(connect_timeout, setup, |ctx, _| {
-            ctx.enable_telemetry();
-        })
-        .await
+        self.task_scope
+            .scope(
+                self.connection_with_inner(connect_timeout, setup, |ctx, _| {
+                    ctx.enable_telemetry();
+                }),
+            )
+            .await
     }
 
     async fn connection_with_inner<F, Fut, H>(
@@ -246,11 +251,13 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             async move {
                 let endpoint = match endpoint {
                     Some(endpoint) => endpoint,
-                    None => match &self.endpoint_factory {
-                        Some(factory) => factory(ipv6),
-                        None => client_endpoint_with_mtu(ipv6, self.mtu),
+                    None => {
+                        crate::runtime::new_owned_quic_endpoint(|| match &self.endpoint_factory {
+                            Some(factory) => factory(ipv6),
+                            None => client_endpoint_with_mtu(ipv6, self.mtu),
+                        })
+                        .with_context(|| format!("create QUIC endpoint (ipv6={ipv6})"))?
                     }
-                    .with_context(|| format!("create QUIC endpoint (ipv6={ipv6})"))?,
                 };
                 let mut last_error = None;
                 // Keep retries inside one address job: the shared scheduler
@@ -356,15 +363,18 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
     /// in-flight dial's single-flight section so its late connection is also
     /// closed; a try-lock skip would leak that connection and endpoint driver.
     pub async fn force_close(&self) {
-        let mut state = self.state.lock().await;
-        state.closed = true;
-        state.conn = None;
-        for tracked in state.connections.drain(..) {
-            tracked
-                .connection
-                .close(VarInt::from_u32(0), b"generation shutdown");
-        }
-        if let Some((_, endpoint)) = state.endpoint.take() {
+        let endpoint = {
+            let mut state = self.state.lock().await;
+            state.closed = true;
+            state.conn = None;
+            for tracked in state.connections.drain(..) {
+                tracked
+                    .connection
+                    .close(VarInt::from_u32(0), b"generation shutdown");
+            }
+            state.endpoint.take().map(|(_, endpoint)| endpoint)
+        };
+        if let Some(endpoint) = endpoint {
             endpoint.close(VarInt::from_u32(0), b"generation shutdown");
         }
     }

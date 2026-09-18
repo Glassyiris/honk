@@ -52,6 +52,94 @@ impl GroupManager {
             .map(Into::into)
     }
 
+    /// Enumerate unique ordinary leaves, stopping before exceeding the request limit.
+    pub fn native_probe_leaves(&self, name: &str, limit: usize) -> Vec<&Node> {
+        let mut leaves: Vec<&Node> = Vec::new();
+        if limit == 0 {
+            return leaves;
+        }
+        self.visit_group_leaves(name, 0, &mut [""; MAX_GROUP_DEPTH], false, &mut |node| {
+            if !leaves.iter().any(|leaf| leaf.id == node.id) {
+                leaves.push(node);
+            }
+            leaves.len() == limit
+        });
+        leaves
+    }
+
+    /// Bound the graph work before invoking allocation-producing policy planners.
+    pub fn native_probe_plan_within_limit(&self, name: &str, mut limit: usize) -> bool {
+        self.native_probe_graph_budget(name, &mut limit, &mut [""; MAX_GROUP_DEPTH], 0)
+    }
+
+    fn native_probe_graph_budget<'a>(
+        &'a self,
+        name: &str,
+        remaining: &mut usize,
+        visited: &mut [&'a str; MAX_GROUP_DEPTH],
+        depth: usize,
+    ) -> bool {
+        if depth >= MAX_GROUP_DEPTH || visited[..depth].contains(&name) {
+            return true;
+        }
+        let Some(group) = self.groups.get(name) else {
+            return true;
+        };
+        let cost = 1usize
+            .saturating_add(group.nodes.len())
+            .saturating_add(group.groups.len());
+        let Some(next) = remaining.checked_sub(cost) else {
+            return false;
+        };
+        *remaining = next;
+        visited[depth] = group.name.as_str();
+        for child in &group.groups {
+            if !self.native_probe_graph_budget(child, remaining, visited, depth + 1) {
+                return false;
+            }
+        }
+        match self.final_member(group) {
+            Some(GroupMember::Group(child)) => {
+                self.native_probe_graph_budget(&child.name, remaining, visited, depth + 1)
+            }
+            Some(GroupMember::Node(_)) => match remaining.checked_sub(1) {
+                Some(next) => {
+                    *remaining = next;
+                    true
+                }
+                None => false,
+            },
+            None => true,
+        }
+    }
+
+    /// Resolve one direct member without changing selection state or falling back
+    /// to an arbitrary leaf when a cold URLTest plan has several candidates.
+    pub fn native_probe_leaf<'a>(
+        &'a self,
+        member: NativeGroupMember<'a>,
+        domain: ProbeDomain,
+        ip: IpVersion,
+    ) -> Option<&'a Node> {
+        let node = match member {
+            NativeGroupMember::Node(node) => node,
+            NativeGroupMember::Group(group) => {
+                if !self.native_probe_plan_within_limit(&group.name, 256) {
+                    return None;
+                }
+                let plan = self.peek_selection_plan_for_domain(&group.name, domain, ip);
+                match plan.nodes.as_slice() {
+                    [node] => *node,
+                    _ => return None,
+                }
+            }
+        };
+        (node.protocol() != honk_config::types::NodeProtocol::Block
+            && (domain == ProbeDomain::Tcp
+                || (crate::descriptor::descriptor(node.protocol()).supports_udp)(node)))
+        .then_some(node)
+    }
+
     /// Preserve the production probe set while retaining direct member identity.
     pub fn native_delay_test_members(&self, name: &str) -> Vec<(NativeGroupMember<'_>, Node)> {
         let Some(group) = self.groups.get(name) else {
@@ -88,7 +176,7 @@ impl GroupManager {
             return None;
         }
         let member = match group.policy {
-            GroupPolicy::Selector => self.selector_member(group)?,
+            GroupPolicy::Selector => self.selector_member(group, network)?,
             GroupPolicy::LoadBalance => return None,
             GroupPolicy::Score => {
                 let context = ScoreSelectionContext::aggregate(
@@ -375,7 +463,7 @@ impl GroupManager {
             return None;
         }
         let selected = if respect_selectors && group.policy == GroupPolicy::Selector {
-            Some(self.selector_member(group)?)
+            Some(self.selector_member(group, SelectionNetwork::Tcp)?)
         } else {
             None
         };
@@ -435,7 +523,7 @@ impl GroupManager {
         };
         for _ in 0..MAX_GROUP_DEPTH {
             let member = match group.policy {
-                GroupPolicy::Selector => self.selector_member(group),
+                GroupPolicy::Selector => self.selector_member(group, network),
                 GroupPolicy::URLTest => self
                     .get_urltest_selection_for_network(&group.name, network)
                     .and_then(|tag| self.members(group).find(|member| member.tag() == tag)),
@@ -476,19 +564,20 @@ impl GroupManager {
     /// warm. Unlike traffic selection, an explicitly chosen direct node is
     /// retained even while unhealthy so recovery can make it hot again.
     /// Nested policies use their stable current selection; a cold/invalid
-    /// chain falls back to the next production TCP leaf without mutating it.
-    pub fn selector_warm_node(&self, group_name: &str) -> Option<&Node> {
+    /// chain falls back to the production network pick without mutating it.
+    pub fn selector_warm_node(&self, group_name: &str, network: SelectionNetwork) -> Option<&Node> {
         let group = self.groups.get(group_name)?;
         if group.policy != GroupPolicy::Selector {
             return None;
         }
-        if let Some(node) = self
-            .selection_path_for_network(group_name, SelectionNetwork::Tcp)
-            .1
-        {
+        if let Some(node) = self.selection_path_for_network(group_name, network).1 {
             return Some(node);
         }
-        self.peek_selection_plan_for_domain(group_name, ProbeDomain::Tcp, IpVersion::V4)
+        let domain = match network {
+            SelectionNetwork::Tcp => ProbeDomain::Tcp,
+            SelectionNetwork::Udp => ProbeDomain::DataUdp,
+        };
+        self.peek_selection_plan_for_domain(group_name, domain, IpVersion::V4)
             .nodes
             .first()
             .copied()
@@ -545,35 +634,25 @@ impl GroupManager {
         out
     }
 
-    /// Copy runtime selector choices from a previous instance (used on
-    /// config reload). Choices whose group no longer exists, or whose
-    /// selected member tag (node name or sub-group tag) is no longer a
-    /// member of that group, are dropped. Persist/interrupt callbacks are
-    /// not fired — they are wired after migration by the caller.
+    /// Migrate exact choices, dropping removed members rather than retargeting a
+    /// same-named node. The control owner fences writes against this publication.
     pub fn migrate_selector_choices_from(&self, old: &GroupManager) {
-        let old_choices = old.selector_choice.read().clone();
-        if old_choices.is_empty() {
-            return;
-        }
-        let mut migrated = 0usize;
-        let mut choices = self.selector_choice.write();
-        for (group_name, member_tag) in old_choices {
-            let still_valid = self
-                .groups
-                .get(&group_name)
-                .map(|g| self.member_tags(g).contains(&member_tag.as_str()))
-                .unwrap_or(false);
-            if still_valid {
-                choices.insert(group_name, member_tag);
-                migrated += 1;
+        let mut state = old.selector_choice.read().clone();
+        state.choices.retain(|name, choices| {
+            let Ok(group) = self.selector_group(name) else {
+                return false;
+            };
+            for member in choices.iter_mut() {
+                if member
+                    .as_ref()
+                    .is_some_and(|member| self.member_by_identity(group, member).is_none())
+                {
+                    *member = None;
+                }
             }
-        }
-        if migrated > 0 {
-            tracing::info!(
-                "migrated {} selector choice(s) across config reload",
-                migrated
-            );
-        }
+            choices.iter().any(Option::is_some)
+        });
+        *self.selector_choice.write() = state;
     }
 }
 
@@ -636,6 +715,243 @@ pub(super) fn break_group_cycles(groups: &mut HashMap<String, Group>) {
                     child
                 );
             }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "native-api"))]
+mod native_probe_tests {
+    use super::*;
+    use honk_config::node::OutboundConfig;
+    use uuid::Uuid;
+
+    fn nodes() -> [Node; 2] {
+        [1, 2].map(|id| Node {
+            id: Uuid::from_u128(id),
+            name: format!("node-{id}"),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn native_probe_bounds_nested_planner_inputs_before_candidate_expansion() {
+        let nodes = nodes();
+        let child = Group {
+            name: "large".into(),
+            policy: GroupPolicy::URLTest,
+            nodes: vec![nodes[0].id; 256],
+            ..Default::default()
+        };
+        let parent = Group {
+            name: "parent".into(),
+            final_outbound: Some(child.name.clone()),
+            ..Default::default()
+        };
+        let manager = GroupManager::new(&[parent, child], &nodes);
+        assert!(!manager.native_probe_plan_within_limit("parent", 256));
+        assert!(manager.native_probe_plan_within_limit("parent", 258));
+        let member = NativeGroupMember::Group(manager.native_group("large").unwrap());
+        assert!(
+            manager
+                .native_probe_leaf(member, ProbeDomain::Tcp, IpVersion::V4)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn native_probe_leaves_bound_unique_members_and_exclude_final() {
+        let nodes = nodes();
+        let child = Group {
+            name: "child".into(),
+            nodes: vec![nodes[0].id, nodes[1].id],
+            ..Default::default()
+        };
+        let parent = Group {
+            name: "parent".into(),
+            nodes: vec![nodes[0].id, nodes[0].id],
+            groups: vec![child.name.clone()],
+            final_outbound: Some("direct".into()),
+            ..Default::default()
+        };
+        let manager = GroupManager::new(&[parent, child], &nodes);
+        let ids = |limit| {
+            manager
+                .native_probe_leaves("parent", limit)
+                .into_iter()
+                .map(|node| node.id)
+                .collect::<Vec<_>>()
+        };
+        assert!(ids(0).is_empty());
+        assert_eq!(ids(1), [nodes[0].id]);
+        assert_eq!(ids(2), [nodes[0].id, nodes[1].id]);
+        assert_eq!(ids(65), [nodes[0].id, nodes[1].id]);
+        assert!(manager.native_probe_leaves("missing", 65).is_empty());
+    }
+
+    #[test]
+    fn native_probe_members_preserve_duplicate_names_and_dead_node_identity() {
+        let mut nodes = nodes();
+        nodes[1].name = nodes[0].name.clone();
+        let child = Group {
+            name: "child".into(),
+            nodes: vec![nodes[0].id],
+            ..Default::default()
+        };
+        let parent = Group {
+            name: "parent".into(),
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            groups: vec![child.name.clone()],
+            ..Default::default()
+        };
+        let alive = Arc::new(AliveDialerSet::new());
+        let manager = GroupManager::with_alive_set(&[parent, child], &nodes, Some(alive.clone()));
+        let leaves: Vec<_> = manager
+            .native_members("parent")
+            .map(|member| {
+                manager
+                    .native_probe_leaf(member, ProbeDomain::Tcp, IpVersion::V4)
+                    .unwrap()
+                    .id
+            })
+            .collect();
+        assert_eq!(leaves, [nodes[0].id, nodes[1].id, nodes[0].id]);
+        for domain in [ProbeDomain::Tcp, ProbeDomain::DnsUdp, ProbeDomain::DataUdp] {
+            alive.report_unavailable_forced(nodes[0].id, domain, IpVersion::V4);
+            assert_eq!(
+                manager
+                    .native_probe_leaf(NativeGroupMember::Node(&nodes[0]), domain, IpVersion::V4)
+                    .map(|node| node.id),
+                Some(nodes[0].id)
+            );
+        }
+        let child = NativeGroupMember::Group(manager.native_group("child").unwrap());
+        assert!(
+            manager
+                .native_probe_leaf(child, ProbeDomain::DataUdp, IpVersion::V4)
+                .is_none()
+        );
+        let tcp_only = Node {
+            outbound: OutboundConfig::Vmess(Default::default()),
+            ..nodes[0].clone()
+        };
+        let member = NativeGroupMember::Node(&tcp_only);
+        assert!(
+            manager
+                .native_probe_leaf(member, ProbeDomain::Tcp, IpVersion::V4)
+                .is_some()
+        );
+        assert!(
+            manager
+                .native_probe_leaf(member, ProbeDomain::DnsUdp, IpVersion::V4)
+                .is_none()
+        );
+        let direct = honk_config::Config::builtin_direct_node();
+        let block = honk_config::Config::builtin_block_node();
+        for domain in [ProbeDomain::Tcp, ProbeDomain::DnsUdp, ProbeDomain::DataUdp] {
+            assert_eq!(
+                manager
+                    .native_probe_leaf(NativeGroupMember::Node(&direct), domain, IpVersion::V4)
+                    .map(|node| node.id),
+                Some(direct.id)
+            );
+            assert!(
+                manager
+                    .native_probe_leaf(NativeGroupMember::Node(&block), domain, IpVersion::V4)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn native_probe_subgroup_peek_rejects_ambiguous_cold_plans() {
+        let nodes = nodes();
+        let group = Group {
+            name: "urltest".into(),
+            policy: GroupPolicy::URLTest,
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            ..Default::default()
+        };
+        let alive = Arc::new(AliveDialerSet::new());
+        alive.register_urltest_group(&group.name, &group.nodes, Some(Duration::from_secs(60)));
+        let manager = GroupManager::with_alive_set(&[group], &nodes, Some(alive.clone()));
+        let member = NativeGroupMember::Group(manager.native_group("urltest").unwrap());
+        assert!(
+            manager
+                .native_probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V6)
+                .is_none()
+        );
+        alive.record_probe_latency(
+            nodes[1].id,
+            ProbeDomain::DataUdp,
+            IpVersion::V6,
+            Duration::from_millis(10),
+        );
+        assert_eq!(
+            manager
+                .native_probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V6)
+                .map(|node| node.id),
+            Some(nodes[1].id)
+        );
+        assert!(
+            manager
+                .native_probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V4)
+                .is_none()
+        );
+        assert!(alive.is_urltest_group_idle("urltest"));
+        assert_eq!(
+            manager.get_urltest_selection_for_network("urltest", SelectionNetwork::Udp),
+            None
+        );
+        for domain in [ProbeDomain::DnsUdp, ProbeDomain::DataUdp] {
+            alive.report_unavailable_forced(nodes[1].id, domain, IpVersion::V4);
+        }
+        assert_eq!(
+            manager
+                .native_probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V4)
+                .map(|node| node.id),
+            Some(nodes[0].id)
+        );
+        for domain in [ProbeDomain::DnsUdp, ProbeDomain::DataUdp] {
+            alive.report_unavailable_forced(nodes[0].id, domain, IpVersion::V4);
+        }
+        assert!(
+            manager
+                .native_probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V4)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn native_probe_peek_does_not_advance_nested_load_balance() {
+        let nodes = nodes();
+        let child = Group {
+            name: "child".into(),
+            policy: GroupPolicy::LoadBalance,
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            ..Default::default()
+        };
+        let parent = Group {
+            name: "parent".into(),
+            groups: vec![child.name.clone()],
+            ..Default::default()
+        };
+        let manager = GroupManager::new(&[parent, child], &nodes);
+        let member = NativeGroupMember::Group(manager.native_group("parent").unwrap());
+        for _ in 0..2 {
+            assert_eq!(
+                manager
+                    .native_probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V4)
+                    .map(|node| node.id),
+                Some(nodes[0].id)
+            );
+        }
+        for node in nodes {
+            assert_eq!(
+                manager
+                    .select_node_for_domain("parent", ProbeDomain::DataUdp, IpVersion::V4)
+                    .map(|selected| selected.id),
+                Some(node.id)
+            );
         }
     }
 }

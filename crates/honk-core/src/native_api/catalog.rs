@@ -190,6 +190,7 @@ fn config_revision(config: &Config, groups: &HashMap<String, Group>) -> String {
             filters.dedup();
             json!([
                 group.name,
+                group.icon,
                 policy(group.policy),
                 nodes,
                 children,
@@ -289,6 +290,7 @@ struct NodeRow<'a> {
     name: &'a str,
     protocol: &'static str,
     subscription_tag: Option<&'a str>,
+    provider_id: Option<Uuid>,
     group_ids: Vec<&'a String>,
     health: Vec<Value>,
 }
@@ -377,6 +379,7 @@ fn node_snapshot(
             name: &node.name,
             protocol: node.protocol().as_str(),
             subscription_tag,
+            provider_id: node.subscription_id,
             group_ids,
             health: alive
                 .native_observations(node.id)
@@ -473,38 +476,45 @@ fn group_health(
     identity: &CatalogIdentity,
     alive: &AliveDialerSet,
 ) -> Vec<Value> {
-    if group.check_url.is_some() {
-        let group_id =
-            Uuid::parse_str(&identity.groups[&group.name]).expect("catalog group IDs are UUIDs");
-        let members: HashSet<_> = manager
-            .native_members(&group.name)
-            .filter_map(|member| member_id(member, identity))
-            .collect();
-        return alive
-            .native_group_observations(group_id)
-            .into_iter()
-            .filter_map(|sample| {
-                let member_id = sample.member_id.to_string();
-                members
-                    .contains(&member_id)
-                    .then(|| group_observation(member_id, sample.node_id, sample.observation))
-            })
-            .collect();
+    let group_id =
+        Uuid::parse_str(&identity.groups[&group.name]).expect("catalog group IDs are UUIDs");
+    // Accepted-epoch retention owns member/leaf associations, including explicit leaf probes.
+    let samples = alive.native_group_observations(group_id);
+    let mut result: Vec<_> = samples
+        .iter()
+        .map(|sample| {
+            group_observation(
+                sample.member_id.to_string(),
+                sample.node_id,
+                sample.observation,
+            )
+        })
+        .collect();
+    if group.check_url.is_none() {
+        let mut seen = HashSet::new();
+        for member in manager.native_members(&group.name) {
+            let NativeGroupMember::Node(node) = member else {
+                continue;
+            };
+            if !seen.insert(node.id) {
+                continue;
+            }
+            for sample in alive.native_observations(node.id) {
+                if samples.iter().any(|retained| {
+                    retained.member_id == node.id
+                        && retained.observation.transport == sample.transport
+                        && retained.observation.purpose == sample.purpose
+                        && retained.observation.measurement == sample.measurement
+                        && retained.observation.ip_version == sample.ip_version
+                        && retained.observation.warmth == sample.warmth
+                }) {
+                    continue;
+                }
+                result.push(group_observation(node.id.to_string(), node.id, sample));
+            }
+        }
     }
-    let mut seen = HashSet::new();
-    manager
-        .native_members(&group.name)
-        .filter_map(|member| match member {
-            NativeGroupMember::Node(node) if seen.insert(node.id) => Some(node.id),
-            _ => None,
-        })
-        .flat_map(|node_id| {
-            alive
-                .native_observations(node_id)
-                .into_iter()
-                .map(move |sample| group_observation(node_id.to_string(), node_id, sample))
-        })
-        .collect()
+    result
 }
 
 fn group_observation(member_id: String, node_id: Uuid, sample: NativeHealthObservation) -> Value {
@@ -526,7 +536,7 @@ fn group_value(
     let tcp = selection(manager, group, SelectionNetwork::Tcp, identity);
     let udp = selection(manager, group, SelectionNetwork::Udp, identity);
     let mut result = json!({
-        "id": identity.groups[&group.name], "name": group.name, "icon": null,
+        "id": identity.groups[&group.name], "name": group.name, "icon": group.icon,
         "config_revision": identity.revision,
         "policy": { "kind": policy(group.policy), "native": policy(group.policy) }
     });
@@ -565,8 +575,8 @@ fn group_value(
     });
     result["runtime"] = json!({ "selection": { "tcp": tcp, "udp": udp }, "health": group_health(manager, group, identity, alive) });
     result["capabilities"] = json!({
-        "can_select": false, "can_override": false, "supports_nested_groups": true,
-        "mutable_config": [], "probe_transports": []
+        "can_select": group.policy == honk_config::group::GroupPolicy::Selector, "can_override": false, "supports_nested_groups": true,
+        "mutable_config": [], "probe_transports": ["tcp", "udp"]
     });
     result
 }
@@ -625,6 +635,9 @@ pub(super) async fn group(
         .unwrap_or_else(|| identity.revision.clone());
     let mut value = group_value(&manager, group, &identity, &state.alive_set, true);
     value["config_revision"] = json!(revision);
+    if state.observation.configuration.group_writable(name) {
+        value["capabilities"]["mutable_config"] = json!(super::groups::MUTABLE_CONFIG);
+    }
     Ok(([(header::ETAG, format!("\"{revision}\""))], Json(value)).into_response())
 }
 

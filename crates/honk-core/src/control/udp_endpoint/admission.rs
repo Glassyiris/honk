@@ -162,9 +162,6 @@ pub(super) struct InitializingEndpoint {
     pub(super) queue_rx: Mutex<Option<mpsc::Receiver<QueuedDatagram>>>,
     pub(super) flow_slots: Arc<Semaphore>,
     pub(super) endpoint_permit: Mutex<Option<OwnedSemaphorePermit>>,
-    /// A tracker registered after route selection but before the Ready
-    /// transition. It must be removed if this initialization is cancelled.
-    pub(super) tracker_id: Mutex<Option<String>>,
     /// Finalized transport winner for this generation. Bound only after
     /// speculative preparation has drained, so a death callback can
     /// generation-safely retire the entry before `commit_ready` publishes Ready.
@@ -180,19 +177,6 @@ impl InitializingEndpoint {
 
     pub(super) fn take_endpoint_permit(&self) -> Option<OwnedSemaphorePermit> {
         self.endpoint_permit.lock().take()
-    }
-
-    pub(super) fn set_tracker_id(&self, tracker_id: String) -> bool {
-        let mut current = self.tracker_id.lock();
-        if current.is_some() {
-            return false;
-        }
-        *current = Some(tracker_id);
-        true
-    }
-
-    pub(super) fn take_tracker_id(&self) -> Option<String> {
-        self.tracker_id.lock().take()
     }
 
     pub(super) fn bind_selected_node(&self, node_id: uuid::Uuid) {
@@ -239,7 +223,11 @@ pub(super) struct ReadyEndpoint {
 pub(super) enum EndpointEntry {
     Initializing(Arc<InitializingEndpoint>),
     Ready(Arc<ReadyEndpoint>),
-    Retiring { generation: u64, token: u32 },
+    Retiring {
+        generation: u64,
+        token: u32,
+        io: Option<Arc<RetirementIo>>,
+    },
 }
 
 impl EndpointEntry {
@@ -265,7 +253,7 @@ impl EndpointEntry {
 
     pub(super) fn retire(&self) -> Option<String> {
         match self {
-            Self::Initializing(entry) => entry.take_tracker_id(),
+            Self::Initializing(_) => None,
             Self::Ready(entry) => {
                 entry.alive.store(false, Ordering::Release);
                 entry.endpoint.kill();
@@ -358,24 +346,6 @@ impl UdpInitLease {
     pub(in crate::control) fn set_connection_guard(&mut self, guard: ActiveConnectionGuard) {
         debug_assert!(self.connection_guard.is_none());
         self.connection_guard = Some(guard);
-    }
-
-    /// Associate a tracker created after route selection with this exact
-    /// Initializing incarnation. If commit never happens, `Drop` transfers it
-    /// to the removal sink; Ready cleanup continues to use `UdpEndpoint`.
-    pub(in crate::control) fn set_tracker_id(&self, tracker_id: String) -> bool {
-        let Some(entry) = self.pool.endpoints.get(&self.key) else {
-            return false;
-        };
-        match entry.value() {
-            EndpointEntry::Initializing(initializing)
-                if initializing.generation == self.generation
-                    && initializing.decision_token == self.decision_token =>
-            {
-                initializing.set_tracker_id(tracker_id)
-            }
-            _ => false,
-        }
     }
 
     /// Bind the finalized transport winner (NodeId) to this Initializing
@@ -528,6 +498,7 @@ impl UdpInitLease {
         let entry = occupied.insert(EndpointEntry::Retiring {
             generation: self.generation,
             token: self.decision_token,
+            io: None,
         });
         drop(occupied);
         let conn_id = entry.retire();
@@ -763,7 +734,6 @@ impl UdpEndpointPool {
             queue_rx: Mutex::new(Some(queue_rx)),
             flow_slots,
             endpoint_permit: Mutex::new(Some(endpoint_permit)),
-            tracker_id: Mutex::new(None),
             selected_node: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             cancel_notify: Notify::new(),

@@ -18,16 +18,34 @@ impl ControlPlane {
         // Restore persisted selector choices before wiring the persist
         // callback so restoration does not rewrite the same values.
         {
-            let config = self.config.read().await;
-            // The setter runs its callbacks synchronously and interrupt handling
-            // reacquires this lock, so the guard is released before the calls.
+            let groups = self.config.read().await.groups.clone();
             let group_manager = self.group_manager.read().clone();
-            for group in &config.groups {
-                if group.policy == GroupPolicy::Selector
-                    && let Some(node) = db.load_selector_choice(&group.name)
-                {
-                    info!("cache.db: restored selector '{}' = '{}'", group.name, node);
-                    group_manager.set_selector_choice(&group.name, &node);
+            for group in groups
+                .iter()
+                .filter(|group| group.policy == GroupPolicy::Selector)
+            {
+                for network in [
+                    honk_outbound::group::SelectionNetwork::Tcp,
+                    honk_outbound::group::SelectionNetwork::Udp,
+                ] {
+                    let member = match db.load_network_selector(&group.name, network) {
+                        Some(Ok(member)) => Some(member),
+                        Some(Err(_)) => None,
+                        None => db.load_selector_choice(&group.name).and_then(|name| {
+                            group_manager
+                                .selector_member_by_name(&group.name, &name)
+                                .ok()
+                        }),
+                    };
+                    if let Some(member) = member
+                        && let Ok(update) = group_manager.publish_selector_choice(
+                            &group.name,
+                            &member,
+                            network.into(),
+                        )
+                    {
+                        update.run_callbacks_without_interrupt();
+                    }
                 }
             }
         }
@@ -35,8 +53,8 @@ impl ControlPlane {
         let db_cb = db.clone();
         self.group_manager
             .read()
-            .set_persist_callback(Some(Arc::new(move |group, node| {
-                db_cb.save_selector_choice(group, node);
+            .set_persist_callback(Some(Arc::new(move |group, network, member| {
+                db_cb.save_network_selector(group, network, member);
             })));
 
         // Delay-history persistence (sing-box URLTest history storage

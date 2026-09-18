@@ -1,4 +1,6 @@
 mod http2;
+#[cfg(feature = "native-api")]
+mod native;
 
 use super::*;
 use crate::proxy::ProxyStream;
@@ -204,6 +206,7 @@ async fn assert_cold_reusable_transport_warms_before_measurement(node: Node) {
         &format!("http://{addr}/"),
         Duration::from_secs(1),
         None,
+        Default::default(),
     )
     .await
     .unwrap();
@@ -265,6 +268,7 @@ async fn cold_quic_warm_time_is_not_reported() {
             &format!("http://{addr}/"),
             Duration::from_secs(1),
             None,
+            Default::default(),
         )
         .await
         .unwrap();
@@ -298,6 +302,7 @@ async fn cold_vless_mux_warm_failure_skips_measurement() {
         "http://localhost/",
         Duration::from_millis(50),
         None,
+        Default::default(),
     )
     .await
     .unwrap_err();
@@ -879,6 +884,7 @@ async fn test_urltest_group_does_not_penalize_resolver_rejection() {
             "https://rejected.invalid/",
             Duration::from_millis(50),
             None,
+            Default::default(),
         )
         .await;
         assert!(crate::proxy::is_packet_rejection(
@@ -930,6 +936,7 @@ async fn test_urltest_group_marks_failure_with_synthetic_sample() {
         &url,
         Duration::from_secs(5),
         None,
+        Default::default(),
     )
     .await;
     assert_eq!(results.len(), 2);
@@ -952,6 +959,7 @@ async fn test_urltest_group_marks_failure_with_synthetic_sample() {
         &url,
         Duration::from_secs(5),
         None,
+        Default::default(),
     )
     .await;
     assert!(results.iter().all(|(_, r)| r.is_err()));

@@ -442,15 +442,30 @@ impl DnsRouter {
         qtype: u16,
         source_ip: Option<IpAddr>,
     ) -> DnsRequestDecision {
+        self.select_request_with_source(domain, qtype, source_ip).0
+    }
+
+    pub(crate) fn select_request_with_source(
+        &self,
+        domain: &str,
+        qtype: u16,
+        source_ip: Option<IpAddr>,
+    ) -> (DnsRequestDecision, crate::dns::outcome::RouteSource) {
         let evaluation = Evaluation::request(domain, qtype, source_ip);
         for rule in &self.request_rules {
             if eval_conditions(&rule.conditions, &evaluation) {
                 debug!(qtype, action = ?rule.action, "DNS request route selected");
-                return map_request_action(&rule.action);
+                return (
+                    map_request_action(&rule.action),
+                    crate::dns::outcome::RouteSource::Routing,
+                );
             }
         }
         debug!(qtype, action = ?self.request_fallback, fallback = true, "DNS request route selected");
-        map_request_action(&self.request_fallback)
+        (
+            map_request_action(&self.request_fallback),
+            crate::dns::outcome::RouteSource::Default,
+        )
     }
 
     pub fn select_request(&self, domain: &str, qtype: u16) -> DnsRequestDecision {

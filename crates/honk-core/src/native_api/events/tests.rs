@@ -350,3 +350,36 @@ fn request_validation_rejects_ambiguous_filters_headers_and_accept() {
         request_options(&second, &request_id()).unwrap().0.binding
     );
 }
+
+#[tokio::test]
+async fn notification_live_queue_survives_unrelated_history_eviction() {
+    let hub = hub();
+    let mut stream = subscribe(&hub, Filter::new(1 << 2, None), None);
+    next(&mut stream).await;
+    publish_flow(&hub, "flow-a", 1);
+    for _ in 0..MAX_EVENTS {
+        hub.publish("runtime.updated", json!({}), None);
+    }
+    assert_eq!(data(&next(&mut stream).await)["revision"], 1);
+}
+
+#[tokio::test]
+async fn log_stream_binding_and_rejected_payload_invalidate_cursors() {
+    let events = hub();
+    let logs = Arc::new(EventHub::logs("instance-a".into()));
+    let mut event_stream = subscribe(&events, all(), None);
+    let event_ready = next(&mut event_stream).await;
+    let filter = Filter::logs(5, None);
+    assert_expired(&logs, filter.clone(), cursor(&event_ready));
+    let mut stream = subscribe(&logs, filter.clone(), None);
+    let ready = next(&mut stream).await;
+    assert_expired(&events, all(), cursor(&ready));
+    assert_expired(&logs, all(), cursor(&ready));
+    logs.publish_log(
+        3,
+        "honk_core",
+        Bytes::from(vec![b'x'; MAX_PAYLOAD_BYTES + 1]),
+    );
+    assert!(stream.next().await.unwrap().is_err());
+    assert_expired(&logs, filter, cursor(&ready));
+}

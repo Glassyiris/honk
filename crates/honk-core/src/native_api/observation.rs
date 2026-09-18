@@ -17,6 +17,13 @@ pub(crate) struct NativeObservation {
     pub(crate) catalog: Arc<Catalog>,
     pub(crate) telemetry: super::telemetry::Telemetry,
     pub(crate) configuration: Arc<super::config::ConfigService>,
+    pub(crate) operations: Arc<super::operations::OperationStore>,
+    pub(crate) dns: Arc<super::dns::DnsApi>,
+    pub(crate) probes: Arc<super::probes::ProbeService>,
+    pub(crate) logs: Arc<super::logs::LogStore>,
+    pub(crate) trace: super::routing::TraceState,
+    pub(crate) settings: super::settings::Settings,
+    pub(crate) providers: super::providers::ProviderApi,
 }
 
 impl NativeObservation {
@@ -32,7 +39,21 @@ impl NativeObservation {
         let configuration = Arc::new(super::config::ConfigService::new(
             config.experimental.native_api.clone(),
             instance_id.clone(),
-            operations,
+            Arc::clone(&operations),
+        ));
+        let dns = Arc::new(super::dns::DnsApi::new(
+            instance_id.clone(),
+            config.experimental.native_api.record_dns_log,
+        ));
+        let probes = Arc::new(super::probes::ProbeService::new(
+            &config.experimental.native_api,
+            Arc::clone(&operations),
+        ));
+        let level = super::settings::Level::configured(&config.global.log_level);
+        let logs = Arc::new(super::logs::LogStore::new(
+            instance_id.clone(),
+            config.experimental.native_api.record_logs,
+            level.as_str(),
         ));
         Self {
             instance_id,
@@ -45,6 +66,13 @@ impl NativeObservation {
                 config.experimental.native_api.record_memory,
             ),
             configuration,
+            operations,
+            dns,
+            probes,
+            logs,
+            trace: super::routing::TraceState::new(),
+            settings: super::settings::Settings::new(config),
+            providers: super::providers::ProviderApi::new(),
         }
     }
 
@@ -69,6 +97,8 @@ impl NativeObservation {
 #[derive(Debug)]
 pub(crate) struct NativeRoute {
     pub(crate) generation: Option<u64>,
+    pub(crate) rule_id: Option<String>,
+    pub(crate) rule_expression: Option<String>,
     pub(crate) evaluation_id: String,
     pub(crate) plane: &'static str,
     pub(crate) input: Option<Value>,

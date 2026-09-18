@@ -1,4 +1,4 @@
-//! Bounded reload operations. Reservation admission precedes all coordinator side effects.
+//! Bounded daemon operations. Reservation admission precedes coordinator side effects.
 
 use std::{
     io::{self, Write},
@@ -23,6 +23,52 @@ use super::{ApiError, ErrorCode, events::EventHub, timestamp};
 const MAX_OPERATIONS: usize = 32;
 const RETENTION: Duration = Duration::from_secs(300);
 const MAX_ERROR_DETAILS: usize = 4096;
+const MAX_RESULT_BYTES: usize = 262144;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OperationKind {
+    Reload,
+    Probe,
+    ProviderRefresh,
+    GroupUpdate,
+    Suspend,
+    Resume,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum OperationResult {
+    Reload {
+        active_generation_id: Option<String>,
+        datapath_generation_id: Option<String>,
+    },
+    Probe(super::probes::ProbeResult),
+    ProviderRefresh(super::providers::Provider),
+    GroupUpdate {
+        group_id: String,
+        config_revision: String,
+    },
+    Suspend {
+        runtime_state: &'static str,
+    },
+    Resume {
+        runtime_state: &'static str,
+    },
+}
+
+impl OperationResult {
+    fn kind(&self) -> OperationKind {
+        match self {
+            Self::Reload { .. } => OperationKind::Reload,
+            Self::Probe(_) => OperationKind::Probe,
+            Self::ProviderRefresh(_) => OperationKind::ProviderRefresh,
+            Self::GroupUpdate { .. } => OperationKind::GroupUpdate,
+            Self::Suspend { .. } => OperationKind::Suspend,
+            Self::Resume { .. } => OperationKind::Resume,
+        }
+    }
+}
 
 type Admission = Option<Result<OperationAcceptedResponse, ApiError>>;
 
@@ -36,6 +82,7 @@ pub(crate) struct OperationStore {
 struct Record {
     id: String,
     principal: [u8; 32],
+    kind: OperationKind,
     replay: Option<Replay>,
     admission: watch::Sender<Admission>,
     operation: Option<Operation>,
@@ -52,7 +99,7 @@ struct Operation {
     created_at: SystemTime,
     started_at: Option<SystemTime>,
     finished_at: Option<SystemTime>,
-    result: Option<ReloadResult>,
+    result: Option<OperationResult>,
     error: Option<SafeError>,
 }
 
@@ -66,12 +113,6 @@ enum Status {
 }
 
 #[derive(Serialize)]
-struct ReloadResult {
-    active_generation_id: Option<String>,
-    datapath_generation_id: Option<String>,
-}
-
-#[derive(Serialize)]
 struct SafeError {
     code: &'static str,
     message: &'static str,
@@ -81,7 +122,7 @@ struct SafeError {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct OperationAcceptedResponse {
     pub(crate) operation_id: String,
-    pub(crate) kind: &'static str,
+    pub(crate) kind: OperationKind,
     pub(crate) status: &'static str,
     pub(crate) href: String,
 }
@@ -158,6 +199,7 @@ impl OperationStore {
         path: &str,
         key: Option<&str>,
         body: &[u8],
+        kind: OperationKind,
     ) -> Result<Reservation, ApiError> {
         if key == Some("") {
             return Err(ApiError::new(
@@ -218,6 +260,7 @@ impl OperationStore {
         records.push(Record {
             id: id.clone(),
             principal,
+            kind,
             replay,
             admission: sender,
             operation: None,
@@ -253,7 +296,7 @@ impl OperationStore {
             .admission
             .send_replace(Some(Ok(OperationAcceptedResponse {
                 operation_id: id.into(),
-                kind: "reload",
+                kind: record.kind,
                 status: "queued",
                 href: format!("/api/v1/operations/{id}"),
             })));
@@ -291,19 +334,16 @@ impl OperationStore {
         true
     }
 
-    pub(crate) fn succeed(
-        &self,
-        id: &str,
-        active_generation: Option<String>,
-        datapath_generation: Option<String>,
-    ) -> bool {
-        self.finish(
-            id,
-            Ok(ReloadResult {
-                active_generation_id: active_generation,
-                datapath_generation_id: datapath_generation,
-            }),
-        )
+    pub(crate) fn succeed(&self, id: &str, result: OperationResult) -> bool {
+        if serde_json::to_writer(DetailsBudget(MAX_RESULT_BYTES), &result).is_err() {
+            return self.fail(
+                id,
+                "result_too_large",
+                "Operation result exceeds its memory limit",
+                None,
+            );
+        }
+        self.finish(id, Ok(result))
     }
 
     /// Details must already be safe structured fields, not engine error strings or source text.
@@ -328,7 +368,7 @@ impl OperationStore {
         )
     }
 
-    fn finish(&self, id: &str, result: Result<ReloadResult, SafeError>) -> bool {
+    fn finish(&self, id: &str, result: Result<OperationResult, SafeError>) -> bool {
         let mut records = self.records.lock();
         let Some(record) = records.iter_mut().find(|record| record.id == id) else {
             return false;
@@ -339,6 +379,17 @@ impl OperationStore {
         if record.terminal_at.is_some() || (result.is_ok() && operation.status != Status::Running) {
             return false;
         }
+        let result = result.and_then(|result| {
+            if result.kind() == record.kind {
+                Ok(result)
+            } else {
+                Err(SafeError {
+                    code: "invalid_operation_result",
+                    message: "Operation result has an incompatible kind",
+                    details: None,
+                })
+            }
+        });
         match result {
             Ok(result) => {
                 operation.status = Status::Succeeded;
@@ -379,7 +430,7 @@ impl OperationStore {
             .ok_or_else(not_found)?;
         let body = json!({
             "operation_id": record.id,
-            "kind": "reload",
+            "kind": record.kind,
             "status": operation.status,
             "created_at": timestamp(operation.created_at),
             "started_at": operation.started_at.map(timestamp),

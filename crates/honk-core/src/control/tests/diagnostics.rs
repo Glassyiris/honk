@@ -44,6 +44,8 @@ async fn reload(cp: &ControlPlane, config: Config, diagnostics: Vec<DetailedDiag
         &mut authorizations,
         #[cfg(feature = "native-api")]
         None,
+        #[cfg(feature = "native-api")]
+        None,
     )
     .await
     .unwrap()
@@ -138,7 +140,7 @@ async fn c14_startup_snapshot_follows_body_and_collection_admission() {
     assert_eq!(active.diagnostics[1].source, 1);
     assert_eq!(cp.config.read().await.nodes.len(), 1);
     server.await.unwrap();
-    supervisor.shutdown().await;
+    supervisor.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -536,6 +538,8 @@ async fn c14_get_waits_for_a_consistent_reload_commit() {
         runtime_registry: cp.runtime_registry(),
         mode_state: cp.mode_state.clone().unwrap(),
         datapath_flags: cp.datapath_flags_handle().unwrap(),
+        control: Some(cp.control_client()),
+        ui_download: cp.ui_download_handle(),
         secret: String::new(),
         connection_pool: cp.connection_pool(),
         external_ui: String::new(),

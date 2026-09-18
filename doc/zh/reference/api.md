@@ -4,9 +4,9 @@
 
 ## 原生 API (M1)
 
-本节保留 M1 标题锚点，内容覆盖已交付的 M1–M6 能力（M3b 组写入除外）。以 `--features native-api` 构建并启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是唯一配置权威；M6 在显式授权下读取与替换已接受的源文件，不引入 SQLite 配置主存储。
+本节保留 M1 标题锚点，说明当前已实现的原生观测与控制契约。以 `--features native-api` 构建并启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是唯一配置权威；显式授权后可读取与替换已接受的源文件，不引入 SQLite 配置主存储。
 
-固定契约为 [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992)。实现 `base` profile，不声明 `full_transparency`。Runtime、connections、flows、nodes、groups、events、出站计数与内存观测可用；history 由记录设置控制，配置与 reload operations 依赖真实启动时捕获的 `.dae` 来源。组写入、provider/geodata 管理、probe、runtime mode/settings、suspend/resume、关闭连接及其他未实现资源仍不可用，以 capabilities 为准。
+固定契约为 [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992)。实现 `base` profile，不声明 `full_transparency`。下表列出已实现资源；记录、源写入与运行状态仍影响具体可用性，以 capabilities 和逐资源权限为准。自动策略 override、M9 节点/provider CRUD 与 geodata 管理仍未开放；provider 观测/刷新不等于 CRUD。内嵌 UI 与真实 doona/checker 联调仍不可用。
 
 | 方法 | 路径 | 含义 |
 | --- | --- | --- |
@@ -15,29 +15,47 @@
 | GET | `/api/v1/capabilities` | 已实现资源与请求上限。 |
 | GET | `/api/v1/runtime?detail=summary\|full` | 引擎 phase、已接受代次与具有独立时间戳的用户态流量。 |
 | GET | `/api/v1/connections?type=all\|tcp\|udp&src=192.0.2.1&limit=100&detail=summary\|full` | 可见的活跃用户态连接；可选 `src` 必须为无端口 IP literal。 |
+| DELETE | `/api/v1/connections/{connection_id}`、`/api/v1/connections` | 确认精确 transport owner 关闭；批量需过滤器或显式 `all=true`。 |
 | GET | `/api/v1/flows`、`/api/v1/flows/{flow_id}` | 活跃及保留的终态用户态决策；detail 包含捕获的 partial trace。 |
 | GET | `/api/v1/nodes` | 稳定节点 ID、当前直接成员/订阅来源与真实测量。 |
 | GET | `/api/v1/groups`、`/api/v1/groups/{groupId}` | 无副作用组观测、直接成员、配置 revision/ETag 与捕获的健康数据。 |
+| PUT | `/api/v1/groups/{groupId}/selection` | 按直接成员 ID 设置 Selector 的 `tcp`、`udp` 或 `both` 选择。 |
+| PATCH | `/api/v1/groups/{groupId}` | 对可写 `.dae` 来源执行受限 JSON Patch，返回真实更新 operation。 |
 | GET | `/api/v1/events` | 有界且需认证的 SSE，支持绑定过滤器的续传游标。 |
 | GET | `/api/v1/runtime/outbounds` | 共用计数生命周期内按 `kind/name` 区分的全宽出站计数。 |
 | GET | `/api/v1/runtime/memory` | 实际进程 RSS 与可读的 cgroup v2 内存事实。 |
 | GET | `/api/v1/runtime/traffic/history`、`/api/v1/runtime/memory/history` | 可选 `window_seconds`、`max_points`，均默认 600、范围 1–600。 |
+| GET / PUT | `/api/v1/runtime/mode` | 失败契约未完整固定，保持 `404 capability_not_supported`。 |
+| GET / PATCH | `/api/v1/runtime/settings` | 原子读取/合并支持的日志、DNS 日志与 flow 留存设置。 |
+| GET | `/api/v1/datapath` | 后端实际观测的程序、hooks、路由发布和 map 状态，未知项不推测。 |
+| POST | `/api/v1/probes` | 有界的节点/组 TCP、HTTP、DNS 测量 operation。 |
+| GET | `/api/v1/dns/query`、`/api/v1/dns/cache`、`/api/v1/dns/log` | 显式 DNS 诊断、精确缓存快照与客户端查询历史。 |
+| DELETE | `/api/v1/dns/cache/{entry_id}`、`/api/v1/dns/cache?name=example.org` | 删除精确缓存 incarnation，或按完整名称及可选 type 删除。 |
+| POST | `/api/v1/dns/cache/flush` | 等待内存与启用的持久化缓存失效确认，不清空域名路由事实。 |
+| POST | `/api/v1/routing/trace` | 固定当前 generation 的无联网路由模拟，仅支持 `resolve=none`。 |
+| GET | `/api/v1/rules` | 当前 generation 的完整规则字典、fallback 与可用来源位置。 |
+| GET | `/api/v1/providers`、`/api/v1/providers/{id}` | 真实订阅 owner 状态，不在读取时拉取。 |
+| POST | `/api/v1/providers/{id}/refresh` | 显式刷新订阅，并等待真实 runtime publication 的 operation。 |
+| GET | `/api/v1/logs` | 结构化、安全投影的原生日志 SSE，独立于 Clash 格式化日志。 |
 | GET | `/api/v1/config` | 已接受的源快照、配置 revision 与安全诊断。 |
 | GET | `/api/v1/config/sources/{source_id}` | 单个已接受源的元数据及获准返回的原文。 |
 | POST | `/api/v1/config/validate` | `syntax` 或离线 `full` 校验，不写盘、不 reload。 |
 | PUT | `/api/v1/config/sources/{source_id}` | 强 `If-Match` 保护的单源原文替换；写盘后排队真实 reload，返回 operation。 |
 | POST | `/api/v1/operations/reload` | 从磁盘重新加载，返回 daemon-owned operation；body 留空或为 `{}`。 |
+| POST | `/api/v1/operations/suspend`、`/api/v1/operations/resume` | 关闭连接的真实无网络负载暂停/恢复，返回 operation。 |
 | GET | `/api/v1/operations/{id}` | 真实排队、运行及终态结果。 |
 
 Connections 的 `detail` 默认 `summary`，`type` 默认 `all`，`limit` 默认 100、范围 1–1000。拒绝重复单值或未知 query 参数。先过滤，再统计总量与应用 TCP+UDP 合计 limit；按注册观测时间降序、相同时间按 ID 字典序升序排列。total 是匹配的完整可见数量。IPv4-mapped IPv6 来源按 IPv4 比较。summary 省略 `src/dst/domain`，full 包含它们，未知 domain 为 null；full 不表示更高权限。
 
-连接 `outbound` 是选路当时的组/动作，不是当前叶节点或重建选择。启用记录时，`flow_id`、捕获的 root-first 组/叶 ID、首次观测 UTC 与 domain 来源关联保留证据；缺失或淘汰的证据保持 unknown。逐连接 rate 与未捕获 rule ID 仍为 null。空列表是 `visibility: partial`，不代表设备没有连接。mock 数据面显示 disabled/none；未核验 hooks/policy 的真实后端显示 unknown/none，已知健康失败时可为 degraded。HTTP 就绪不等于数据面就绪。
+连接 `outbound` 是选路当时的组/动作，不是当前叶节点或重建选择。启用记录时，`flow_id`、捕获的 root-first 组/叶 ID、首次观测 UTC、domain 来源与用户态 rule ID 关联保留证据；缺失或淘汰的证据保持 unknown。逐连接 rate 仍为 null。空列表是 `visibility: partial`，不代表设备没有连接。Mock 数据面显示 disabled/none；真实后端只依据实际程序、hooks、routing root、listener 和 admission 观测报告状态，未知项为 unknown/null，覆盖仍为 partial。HTTP 就绪不等于数据面就绪。
+
+单项 DELETE 的 `204` 表示已确认精确 TCP UUID 的转发任务结束，或精确 UDP token/generation/source view 的退役、backend 确认及已准入发送/回复排空；不是删除 tracker 行。共享 XUDP 只关闭本 view，不关闭其他 view 共用的 carrier，也不重放报文。已消失返回 404，不可关闭的非用户态 owner 返回 409，无法确认退役返回 503。批量只捕获一次匹配集合，支持 `type=tcp|udp|all`、无端口 `src`；未限制网络或来源时必须 `all=true`（仅 `type=all` 不算过滤）。超过 1000 条先返回 413，零关闭；成功返回实际 `closed/skipped`。关闭已选集合后出现的新连接不受影响；503 不表示已完成的关闭回滚。DELETE body 必须为空；重复 `Idempotency-Key` 仍检查当前连接状态，不重放旧结果。
 
 TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，成功写出的嗅探前缀仅计一次；UDP 保持原逐包语义。唯一的一秒 sampler 使用实际时间间隔；初次采样、reset 和 overflow 返回 null rate，不补零。`counter_since` 属于共用计数器生命周期，`sampled_at` 属于流量样本，`observed_at` 属于 HTTP 观察。UInt64 使用十进制字符串，有界数量仍为 JSON number。CPU 与 activation 时间仍未知；有源管理器时提供配置 revision，`last_reload` 提供最近完成的 API reload operation 结果，否则为 null。
 
 配置 secret 后，所有 API 路径（包括 discovery/version/capabilities、禁用 action、未知 API path）都要求单个有效 Bearer header。Query token、重复凭据、错误凭据均不能回退匿名，同源 UI 也不豁免。无 secret 需显式 loopback 授权，并拒绝 `Sec-Fetch-Site: cross-site`。公共静态文件也接受 Host/Origin 校验；OPTIONS preflight 无需 bearer，但必须通过 Host、Origin、method 与 header 白名单。不返回 cookie credentials 或通配 CORS。
 
-已知禁用 action 返回 JSON `404 capability_not_supported`，未知 path 或未定义 method 返回 JSON `404 resource_not_found`；配置来源可读但未授权写入时，PUT 返回 `403 permission_denied`。错误信封为 `{error:{code,message,details},request_id}`。HEAD 保留 GET 状态/header，无 body。API 响应带 `no-store` 与 `nosniff`。应用上限为规范化 target 4096 字节、规范化 header 名/值合计 16384 字节、body 65536 字节（含 chunked）；已认证 GET/HEAD 携带非空 body 会被拒绝。原生读取不触发 probe 或选择变化。
+已知禁用 action 返回 JSON `404 capability_not_supported`，未知 path 或未定义 method 返回 JSON `404 resource_not_found`；配置来源可读但未授权写入时，PUT 返回 `403 permission_denied`。错误信封为 `{error:{code,message,details},request_id}`。HEAD 保留 GET 状态/header，无 body。API 响应带 `no-store` 与 `nosniff`。应用上限为规范化 target 4096 字节、规范化 header 名/值合计 16384 字节、body 65536 字节（含 chunked）；已认证 GET/HEAD 携带非空 body 会被拒绝。普通观测读取不触发 probe 或选择变化；显式 `/dns/query` 是可联网的诊断请求。
 
 原生 server 最多拥有 64 条 HTTP/1.1 连接，满时暂停 accept，header 读取上限五秒；关闭时全部连接共享五秒 graceful drain，随后 abort 并逐一 join。空闲 I/O 与停滞写入分别受 30 秒期限约束；SSE heartbeat 成功写入使健康长连接保持活跃，读取不能延长阻塞 writer 的期限。TLS/HTTP2 可由可信反代终止。Forwarded headers 不改写固定 discovery path，也不授予 Host/Origin 权限。
 
@@ -59,15 +77,19 @@ Flow list 接受 `network/state/connection_id/detail/limit/cursor`。最多八�
 
 节点读取接受 `group_id`、`limit`（1–1000）及 `cursor`；只筛直接成员，不展开叶节点。节点分页最多八份 snapshot、30 秒、4 MiB，冻结分页期间观测；无效或过滤器不匹配游标返回 400。Groups 返回摘要数组，detail 的带引号 ETag 对应仅由配置决定的 revision。组 ID 为进程生命周期随机身份：同名 reload/重排保持，删除再添加获得新 ID，重启重新发现；不使用位置 UUID 或名称 hash。
 
-Health 来自已完成且维度明确的 producer 测量，不把乐观 alive、跨族复制的排名信号、synthetic failure 或恢复延迟当真实测量。Raw TCP、HTTP 响应头、DNS exchange、QUIC handshake 保留实际目标地址族与完成时间；未知 average/ranking/warmth 保持 null/unknown。自定义组测量保留当时 member/leaf，不绑定到后来的选择。GET 不推进 URLTest、轮询或 Score 状态；尚无配置 icon 时返回 null。
+Health 来自已完成且维度明确的 producer 测量，不把乐观 alive、跨族复制的排名信号、synthetic failure 或恢复延迟当真实测量。Raw TCP、HTTP 响应头、DNS exchange、QUIC handshake 保留实际目标地址族与完成时间；未知 average/ranking/warmth 保持 null/unknown。自定义组测量保留当时 member/leaf，不绑定到后来的选择。GET 不推进 URLTest、轮询或 Score 状态；`icon` 原样返回通过配置校验的 HTTP(S)/data URI，未配置为 null，不猜测或抓取图标。
 
-M3b 的组 selection、JSON Patch 与自动策略 override 仍关闭。M6 已有无损源文件写入，但这不等于组控制已完成共同 control/reload/persistence/warm owner 集成；不能用仅改内存的 PATCH 或假中断绕过该门槛。自动策略 override 还受双网络响应契约限制。
+Selector selection body 为 `{"member_id":"直接成员 ID","network":"tcp"}`，network 必填且接受 `tcp/udp/both`。TCP 与 UDP 分开保存，`both` 一次校验并原子发布；自动策略拒绝手动选择。原生与 Clash 写入都由共同 control/reload owner 串行化，Clash 写入等价于 both，读取 `now` 是 TCP 投影。返回独立的 `selection_revision` 与实际 `connections_interrupted`，不将选择 revision 当作配置 ETag。启用 `interrupt_connections` 时，按流量建立时捕获的组身份/路径和发生变更的网络关闭旧 owner，而非按当前可达叶名称删除记录；已有选择不触发中断。关闭确认失败可能在选择已发布后报错，不承诺回滚。
+
+组 PATCH 需要 `Content-Type: application/json-patch+json`、非空 RFC 6902 数组（最多 32 项）及 detail GET 的带引号强 `If-Match`；缺失 428、过期 412。仅允许 `/policy`、`/config/default_member_id`、`/config/final_outbound`、`/config/tolerance`、`/config/idle_timeout`、`/config/interrupt_connections`，支持 `add/replace/remove/test/copy/move`，其中路径和值类型均受上述字段约束。Policy 值如 `{"kind":"selector","native":"selector"}`，两者必须匹配；默认成员用直接成员 ID，final 用出站名称，tolerance/idle timeout 用非负安全整数。此接口不改成员列表或 icon。
+
+PATCH 只修改 parser 定位的可写源片段，保留其他原文字节、注释与 include 结构；权限、完整离线校验、耐久替换与 operation 幂等复用 M6 源协调器。其 `If-Match` 是 accepted 组/配置 revision，**不是**文件 SHA-256：写前校验 revision，同时独立检查源字节 hash 和依赖拓扑，真实激活前还会在 reload lock 下再次检查 accepted revision。并发 provider publication 可在写后使激活被拒绝，此时 `written:true,committed:false`，磁盘不回滚。自动策略 pin/clear 仍受双网络 divergent/null 响应形状限制而关闭（`can_override=false`）。
 
 ### 原生事件（M4）
 
 使用带 Bearer 与 `Accept: text/event-stream` 的 streaming fetch；浏览器 EventSource 不能设置所需 Authorization。可选 `kinds/flow_id` 绑定续传游标。最多保留 512 事件/60 秒，16 clients，每 client 64 条 live 队列；队满断流，不静默 skip。每 15 秒 heartbeat。Fresh 先 ready；有效续传 replay→ready→live，原子挂接不留空窗。过期、未知、旧 instance 或不同过滤器游标在 HTTP 200 前返回 `409 event_cursor_expired`。
 
-实际发布 `stream.ready/runtime.updated/flow.updated/flow.gap/generation.changed`，配置协调器可用时还发布真实 operation 状态转换的 `operation.updated`。Generation 事件只来自已接受发布，不来自 reload 收件。事件仅含有界安全 ID/状态，不含包正文或原始配置。Flow/event 保留只在内存，不是耐久日志。
+实际发布 `stream.ready/runtime.updated/flow.updated/flow.gap/generation.changed` 及真实 operation 状态转换的 `operation.updated`；operation store 不依赖是否具有可写 `.dae` 来源。Generation 事件只来自已接受发布，不来自 reload 收件。事件仅含有界安全 ID/状态，不含包正文或原始配置。Flow/event 保留只在内存，不是耐久日志。
 
 ### 出站、内存与历史（M5）
 
@@ -103,6 +125,40 @@ PUT 的 JSON body 为 `{"content":"完整的新原文"}`。`If-Match` 必须是*
 PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST reload 入协调队列后返回 `202`。响应含 `operation_id`、`href`、相同的 `Location` 与 `Retry-After: 1`，不表示配置已经生效。操作由 daemon 持有，HTTP 断连不取消它或其 supervisor reconciliation。可选 `Idempotency-Key` 绑定 principal、method、path、instance 与原始 body：同 key 同 body 的并发/重试共用结果，不重复写入或 reload，丢失首个 202 后仍可用原 If-Match 重试；不同 body 返回 `409 idempotency_conflict`。总共最多 32 个预留/保留操作，终态保留 300 秒，未过期记录不因容量提前淘汰；重启后不保留。
 
 通过 GET operation、`runtime.last_reload` 及 `operation.updated` 读取真实结果，不能把收到 202 当作 succeeded。Reload 拒绝时保留旧 accepted 快照和 generation，但已写入字节不回滚；提交后 degraded 时保留新快照/generation 并报告 failed，而不是声称旧代仍活动。管理员应据磁盘内容与结果修复，再显式 reload。SIGHUP 本身不创建 API operation。仅改注释也会更新 source hash/config revision，但有效配置未变时不增加 runtime generation；有效组成员变化会改变 revision，健康测量变化不会。这三种版本不是可互换的并发令牌。
+
+### 有界探测、DNS 与路由诊断
+
+`POST /probes` 接受节点/组 target、`kind=tcp_connect|http|dns`、purpose、transport 数组、地址族与 `warmth=cold|warm`，不接受任意调用方 URL。组可选直接成员、叶节点或显式成员 ID；先固定当前配置/成员/注册代次，再去重执行并保留 member→leaf 关联。TCP-connect 测节点实际端口；HTTP 使用配置检查 URL，不跟随重定向；DNS 执行实际 UDP 或带长度帧的 TCP exchange。HTTP/HTTPS 默认仅端口 80/443，DNS 默认 53，额外端口需管理员 `probe_allowed_ports`；私网、loopback、link-local 等受限目标（包括节点地址）另需 `probe_allowed_cidrs`。解析后的地址规范化、校验并固定，不能以端口许可代替 CIDR 许可或交给代理重新解析。
+
+每个 probe job 最多 64 个成员关联、256 行结果；最多 4 个 active、16 个 queued、每 target 1 个，准备/排队/拨号/清理共享 30 秒 deadline。每分钟 principal/global 均最多 30 次（当前只有一个 principal）；限流为 `429 rate_limited`，队列/owner 不可用为 503，均带正数 Retry-After。202 只表示 daemon 接管；断开 HTTP 不取消任务。结果保留真实 measurement/family/warmth/时间与 health 更新是否被当前 epoch 接受；过时代次、取消或 deadline 不伪造成 unhealthy，TCP-connect 不冒充 HTTP 排名样本。
+
+`GET /dns/query` 必填 `domain`，`type` 默认 A，可重复指定最多 8 个不同类型；支持类型见 capabilities。一次请求的所有类型固定同一 DNS generation，共享 10 秒期限；每分钟 principal/global 各 30 次。`upstream` 只接受已配置名称，包括未被规则引用的名称；它替换请求路由选择，不绕过 hosts/strategy 或响应侧 requery。Hosts 命中报告 default route、无 upstream。`cache_mode=bypass` 不读正/负/stale 缓存，不写缓存，不加入普通写入 singleflight/refresh，也不启动后台刷新；不提供该选项时保留正常生产语义。
+
+缓存 GET 只观察运行时 exact-key 正/负记录（`persistent:false`），不提升 LRU 或计入 hit。支持 `name` 精确名称、`domain` 子串、重复 `type`、`include_expired`、`detail`、`limit`（1–1000，默认 100）及 cursor；最多 8 份过滤器/instance 绑定的不可变快照、30 秒、合计 8 MiB，底层淘汰后快照占用仍计费。`entry_id` 标识精确 incarnation，旧 ID 不能删除替代记录；按 name 删除可跨 exact-key 变体并用 type 限制。删除/flush 与入库发布串行化，等待启用的持久化失效确认，旧 foreground/refresh 不能在确认后复活所删缓存；flush 不清空 DNS 路由投影。DNS query/cache/log 的完整 JSON 响应上限均为 262144 字节，不能完整表示或保留快照时返回 503 与 Retry-After，不裁剪 RRset 冒充完整答案。
+
+`POST /routing/trace` 仅支持 `resolve=none`，返回 `mode:simulation`；`live` 为 422。模拟固定当前 compiled router/config/generation，不查询 DNS、不探测、不推进组选择、不建立连接；缺失输入保留 `indeterminate/missing_inputs`，不能视为历史 flow 或真实转发承诺。上限为 1 个地址、256 个规则/条件 steps、5 秒和每分钟 principal/global 各 30 次。`GET /rules` 返回含 fallback 的完整当前字典，最多 4096 行，超限拒绝而不截断。规则 ID 与用户态捕获证据共用 generation-scoped 身份；真实 parser 来源可用时给出 `source_id/line/column`，file 为 `<redacted>`，否则 source 为 null。历史 flow 不从当前字典重建，内核 final provenance 仍可为 unknown；编辑应使用 source ID，不猜私有路径。
+
+### Provider、日志与临时设置
+
+Provider GET 连接真实 SubscriptionSupervisor 观测与已接受节点的 `subscription_id`，不联网；`Node.provider_id` 可用于关联。显示名为安全的 `provider-<id>`，不披露原始订阅 tag/URL；未观测 usage/expiry 为 null。从未加载、等待加载或禁用且无缓存时是 `stale`、零节点及 null 时间/错误，不伪造失败；有真实失败且无节点才是 error，保留旧/缓存节点时为 stale。列表 `limit` 默认 100、范围 1–1000，snapshot 上限 8 份/30 秒/4 MiB。启用且有运行 supervisor 的 provider 可用空 body POST refresh；同 provider 的不同并发 refresh 返回 409，保留的幂等重放先于该冲突检查。刷新成功须真实 revision-fenced publication 被接受，单纯 fetch 或写缓存不算成功；HTTP 断连不丢失结果。没有 provider 创建/编辑/删除接口。
+
+`record_logs` 默认 true，结构化 tracing layer 无客户端也保留最多 512 条/60 秒日志，仅内存。保留真实 timestamp/level/target；只有审查过的静态消息和有类型的安全字段可披露，其他 message/fields 明确 withheld，不靠正则猜测所有秘密，也不转发控制台或 Clash 格式化输出。`GET /logs` 以 SSE 返回 `stream.ready` 与日志，支持 level/target 过滤和绑定 stream/instance/过滤器的 cursor；与 `/events` **不同，续传顺序为 ready→replay→live**，ready 保留请求 cursor，之后才由 replay 推进。每 stream 最多 16 clients、每 client 64 队列、15 秒 heartbeat；过期 cursor 在 200 前返回 409，队满或 replay 丢失则断流。
+
+`record_dns_log` 默认 true，在真实客户端完成点记录普通 DNS 和有来源的客户端解析，排除原生/Clash 诊断与后台刷新重复项。最多 512 条、8 MiB，仅内存；完整 wire 与元数据一起计费，按整条旧记录淘汰。`GET /dns/log` 最新优先，支持大小写不敏感的 name 子串、type、无端口 src、limit（1–500，默认 100）及过滤器绑定 cursor；淘汰使相关 cursor 失效。关闭任一记录开关需重启并释放对应缓冲，不影响正常 DNS 服务。
+
+`PATCH /runtime/settings` 使用 JSON 对象，仅合并 capabilities 列出的字段：`log.level`（trace/debug/info/warn/error）、`log.buffered_records`（64–512）、`dns_log.max_records`（64–512）、`flows.max_flows`（64–1024）与 `flows.retention_seconds`（1–300）。未知、null、空对象、越界或启动时未启用的记录字段使整次请求 400，任何字段都不改变。通过校验后由一个 owner 原子发布，source 为 runtime；缩容淘汰旧记录并使受影响 cursor 失效。原生日志级别只影响该 capture layer，不修改控制台/Clash 过滤器。这些 override 不写 `.dae` 或 cache DB；每次成功的显式配置激活（含 no-op）恢复配置级别和初始留存上限，provider/network refresh 保留。
+
+### 共用模式与数据面生命周期
+
+原生 `runtime_mode` 暂不可用：固定 PUT 契约未声明暂停冲突与 owner/backend 不可用的错误响应，capability 又不区分读写。GET/HEAD/PUT 均返回 `404 capability_not_supported`，不宣告接受任何 mode。内部共享的 `DatapathFlagsHandle` 及 Clash 控制仍保留；它不是 `dial_mode`，不覆盖 must/block 终态，也不合成网关规则。**仅 native 启用时**，mode/global target 是临时状态，不恢复或写入模式缓存；启动及成功显式配置激活（含 no-op）重置 rule，provider/network refresh 和 suspend/resume 保留。Global 绑定稳定身份，目标消失后新流量 fail closed，不回退普通路由或改投同名替代者。Native 未启用时保留原有 Clash 缓存行为。
+
+显式激活的提交与模式 reset 是不同结果：若 routing/config 已提交但 backend mode 写入失败，settings 已恢复配置值，而 mode/source 保留先前值，控制面关闭准入并返回 committed-degraded，operation 失败。此时既不能声称 Rule 已生效，也不能声称配置回滚；通过 Clash `/configs`（启用时）与 operation 结果检查实际状态。正常 no-op 接受也触发 reset，provider/network 更新不触发。
+
+Suspend/resume 经现有配置协调器和 control owner 串行执行；202 和 HTTP 断连均不代表终态。Suspend 先关闭 datapath admission、完成 NFQUEUE fence/held-verdict 排空，再关闭可见及尚未产生 ID 的 TCP、精确 UDP views、独立 DNS listener，并停止/join probe、健康检查、预热、订阅网络、协议后台任务和接口扫描。只有这些 owner 完成停止才报告 suspended；不是仅暂停健康探测。API、accepted 配置/来源、同一 GroupManager 的策略状态、mode/settings、计数、缓存与已有内存历史保留（仍受留存期限约束）。程序、maps 与自有 hooks 可继续加载/附着，但 closed admission 下 TC 放行，不代表数据面 active。
+
+Resume 使用 accepted 内存配置与 artifact，不重读磁盘配置/geodata/hosts；保留 Selector/Fallback/轮询/Score 状态，重新绑定 listener、创建 fresh TCP/UDP/DNS/协议 transport owner，仍共享进程物理资源上限。重新检查真实拓扑、routing/listener/queue 就绪后才开放准入，不恢复旧连接或重放取消的数据。重复 suspend/resume，或已知暂停/转换状态下的新 probe/provider refresh、组变更与配置激活返回 409；owner 实际失败或不可用返回 503。DNS query 按固定端点契约，在所有不可用生命周期状态下均于联网前返回带 `Retry-After` 的 503。内存/缓存/历史读取仍可用，不涉及网络 owner 的 recorder settings 与缓存管理也可使用，并非一律禁止所有修改。安全清理完成的恢复失败保持 suspended；fence、队列或清理所有权不确定则进入 failed 并终止。若恢复已发布新代次后失败，operation 如实报告 committed/current generation，不声称旧代仍 active。
+
+暂停不是硬时间上限承诺：已开始的阻塞系统解析/NSS 不能被 Tokio 取消，仍须等真实 join；清理阶段超期不能丢弃 owner 或宣称暂停成功。终止关闭不同于 suspend：关闭准入并停止 watcher、detach hooks 后，健康运行中的连接有默认 5 秒 drain grace，随后强制取消并 join；故障退出不承诺该 grace。原生 HTTP 自身另有 5 秒 graceful drain，上述阻塞 join 仍可能延长总退出时间。
 
 ## 启用与鉴权
 
@@ -217,11 +273,11 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 {"mode":"Global"}
 ```
 
-模式更新经过 `DatapathFlagsHandle`；它是 shared mode 与 `DATAPATH_FLAGS_MAP` 唯一的串行化 writer。因此模式修改会与 reload 的 NFQUEUE fence、reopen 和 disable 操作原子组合，不会重新发布过期的 readiness bit。规则派生的 feature bit 属于不可变的路由 policy descriptor。启用 cache database 时会保存规范化后的模式。
+模式更新经过 `DatapathFlagsHandle`；它是 shared mode 与 `DATAPATH_FLAGS_MAP` 唯一的串行化 writer。因此模式修改会与 reload 的 NFQUEUE fence、reopen 和 disable 操作原子组合，不会重新发布过期的 readiness bit。规则派生的 feature bit 属于不可变的路由 policy descriptor。Native 未启用时，启用 cache database 会保存规范化模式；native 启用时两种 API 共用不恢复、不持久化且在显式配置激活后重置为 Rule 的临时模式。
 
-`PUT /proxies/{name}` 不要求特定 `Content-Type`。对已配置的 Selector 组，目标必须是直接成员 tag；只能经嵌套组到达的叶节点并非直接成员。选择确实发生变化时会调用 group manager 的 cache callback，因此启用 `cache_file` 后会把选择持久化到 `cache.db`。若该组设置了 `interrupt_connections`，honk 会移除与该组、其成员 tag 及可达叶节点关联的已跟踪连接，使后续流量通过新选择重新拨号。写入已有选择不会触发操作。URLTest、LoadBalance、Fallback 及 Score 组都会拒绝该修改。
+`PUT /proxies/{name}` 不要求特定 `Content-Type`。对已配置 Selector，目标必须是直接成员 tag；只能经嵌套组到达的叶节点并非直接成员。写入同时原子设置 TCP/UDP，Clash `now` 只显示 TCP；原生 API 可分别设置两种网络。有效变更通过共同 control/reload owner 发布，启用 `cache_file` 后分别持久化网络选择。`interrupt_connections` 按建立时捕获的组路径及发生变化的网络关闭精确 TCP/UDP owner，并等待确认，不再只删 tracker。已有选择不触发中断；URLTest、LoadBalance、Fallback 与 Score 拒绝手动选择。
 
-`GLOBAL` 是合成 Selector，但其 `all` 中每个成员都是具体的已配置组或节点，并有对应的顶层 proxy 文档。`PUT /proxies/GLOBAL` 只接受其中的名称，并通过同一个 `DatapathFlagsHandle` 更新；启用 cache database 时以 `GLOBAL` Selector key 保存。空值、已移除、未知及旧虚拟选择都会回退到第一个具体成员。
+`GLOBAL` 是合成 Selector，但其 `all` 中每个成员都是具体的已配置组或节点，并有对应的顶层 proxy 文档。`PUT /proxies/GLOBAL` 只接受其中的名称，并通过同一个 `DatapathFlagsHandle` 更新。Native 未启用时，cache database 以 `GLOBAL` key 保存选择，空值、已移除、未知及旧虚拟选择会回退到第一个具体成员；native 启用时保留共用的稳定目标身份，不持久化，目标消失不自动改投同名对象或其他成员。
 
 ## 外部 UI hosting
 

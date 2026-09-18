@@ -521,6 +521,7 @@ impl ControlPlane {
         let drain = Arc::clone(&self.drain_tracker);
         let ingest_queue = Arc::clone(&actor_queue);
         let dns_ingress = super::udp_ingress::UdpLoopState::new(self, true);
+        let initializer_tasks = Arc::clone(&self.udp_pool);
         let ingest_worker = tokio::spawn(async move {
             while let Some((packet, guard, epoch)) = ingest_rx.recv().await {
                 let dns = packet.tuple.destination.port() == 53;
@@ -539,7 +540,7 @@ impl ControlPlane {
                 let initializer = initializer.clone();
                 let pending = Arc::clone(&actor_pending);
                 let drain = Arc::clone(&drain);
-                tokio::spawn(async move {
+                initializer_tasks.spawn_slow_path(async move {
                     let _guard = ConnectionGuard::new(drain);
                     match std::panic::AssertUnwindSafe(initializer.serve_udp_connection(lease))
                         .catch_unwind()

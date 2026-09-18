@@ -290,17 +290,21 @@ impl VLessHandler {
         runtime: Arc<crate::runtime::NodeRuntime>,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<super::mux::VlessMuxSession>> {
-        let (target, domain) = super::mux::physical_target();
-        let honk_config::node::VlessMultiplex::H2 { padding } =
-            &runtime.node.vless().unwrap().multiplex
-        else {
-            anyhow::bail!("VLESS H2 path has no H2 multiplex settings");
-        };
-        let stream = Self::new()
-            .dial_retained_base(&runtime, target, Some(domain), connect_timeout)
-            .await?
-            .stream;
-        super::mux::connect(stream, *padding).await
+        runtime
+            .scope_tasks(Box::pin(async {
+                let (target, domain) = super::mux::physical_target();
+                let honk_config::node::VlessMultiplex::H2 { padding } =
+                    &runtime.node.vless().unwrap().multiplex
+                else {
+                    anyhow::bail!("VLESS H2 path has no H2 multiplex settings");
+                };
+                let stream = Self::new()
+                    .dial_retained_base(&runtime, target, Some(domain), connect_timeout)
+                    .await?
+                    .stream;
+                super::mux::connect(stream, *padding).await
+            }))
+            .await
     }
 
     async fn open_h2_tcp(
@@ -354,10 +358,14 @@ impl VLessHandler {
         active_limit: usize,
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Arc<super::cool::VlessCoolSession>> {
-        let stream = Self::new()
-            .dial_retained_mux_carrier(&runtime, connect_timeout)
-            .await?;
-        Ok(super::cool::connect(stream, active_limit))
+        runtime
+            .scope_tasks(Box::pin(async {
+                let stream = Self::new()
+                    .dial_retained_mux_carrier(&runtime, connect_timeout)
+                    .await?;
+                Ok(super::cool::connect(stream, active_limit))
+            }))
+            .await
     }
 
     async fn open_cool_tcp(
@@ -472,42 +480,48 @@ impl VLessHandler {
         timeout: std::time::Duration,
         global_id: [u8; 8],
     ) -> anyhow::Result<PreparedUdpTransport<VlessXudpTransport>> {
-        match Self::udp_path(&runtime.node, target.port())? {
-            VlessUdpPath::Xudp => {
-                let stream = Self::new()
-                    .dial_retained_mux_carrier(&runtime, timeout)
-                    .await?;
-                let transport =
-                    super::cool::connect_single_xudp(stream, target, domain, global_id).await?;
-                Ok(PreparedUdpTransport::ready(transport))
-            }
-            path @ (VlessUdpPath::CoolShared | VlessUdpPath::CoolSeparate) => {
-                let separate = path == VlessUdpPath::CoolSeparate;
-                let pool = if separate {
-                    runtime.vless_separate_cool_pool()?
-                } else {
-                    runtime.vless_shared_cool_pool()?
-                };
-                let active_limit = Self::cool_limit(&runtime.node, separate)?;
-                let dial_runtime = Arc::clone(&runtime);
-                Self::prepare_mux_udp(
-                    pool,
-                    move || Self::dial_cool_session(dial_runtime, active_limit, timeout),
-                    move |session, permit| {
-                        super::cool::open_xudp(session, permit, target, domain, global_id)
-                    },
-                    if separate {
-                        "VLESS separate Cool pool retired during source preparation"
-                    } else {
-                        "VLESS shared Cool pool retired during source preparation"
-                    },
-                )
-                .await
-            }
-            VlessUdpPath::Native | VlessUdpPath::UotV2 | VlessUdpPath::H2 => {
-                Err(crate::proxy::PacketRejection::Policy.into())
-            }
-        }
+        // This large cold handshake must not inflate each task-scope poll frame.
+        runtime
+            .scope_tasks(Box::pin(async {
+                match Self::udp_path(&runtime.node, target.port())? {
+                    VlessUdpPath::Xudp => {
+                        let stream = Self::new()
+                            .dial_retained_mux_carrier(&runtime, timeout)
+                            .await?;
+                        let transport =
+                            super::cool::connect_single_xudp(stream, target, domain, global_id)
+                                .await?;
+                        Ok(PreparedUdpTransport::ready(transport))
+                    }
+                    path @ (VlessUdpPath::CoolShared | VlessUdpPath::CoolSeparate) => {
+                        let separate = path == VlessUdpPath::CoolSeparate;
+                        let pool = if separate {
+                            runtime.vless_separate_cool_pool()?
+                        } else {
+                            runtime.vless_shared_cool_pool()?
+                        };
+                        let active_limit = Self::cool_limit(&runtime.node, separate)?;
+                        let dial_runtime = Arc::clone(&runtime);
+                        Self::prepare_mux_udp(
+                            pool,
+                            move || Self::dial_cool_session(dial_runtime, active_limit, timeout),
+                            move |session, permit| {
+                                super::cool::open_xudp(session, permit, target, domain, global_id)
+                            },
+                            if separate {
+                                "VLESS separate Cool pool retired during source preparation"
+                            } else {
+                                "VLESS shared Cool pool retired during source preparation"
+                            },
+                        )
+                        .await
+                    }
+                    VlessUdpPath::Native | VlessUdpPath::UotV2 | VlessUdpPath::H2 => {
+                        Err(crate::proxy::PacketRejection::Policy.into())
+                    }
+                }
+            }))
+            .await
     }
 
     async fn warm_mux_pool<S, Dial, DialFuture>(

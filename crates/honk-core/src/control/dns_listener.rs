@@ -85,6 +85,7 @@ enum ListenerPhase {
 pub(super) struct BoundDnsListener {
     tcp: Option<std::net::TcpListener>,
     udp: Option<std::net::UdpSocket>,
+    #[cfg(test)]
     local_addr: SocketAddr,
 }
 
@@ -123,11 +124,7 @@ impl BoundDnsListener {
         stats: Arc<StatsManager>,
         drain: Arc<DrainTracker>,
     ) -> io::Result<DnsListener> {
-        let Self {
-            tcp,
-            udp,
-            local_addr,
-        } = self;
+        let Self { tcp, udp, .. } = self;
         let udp = udp.map(UdpSocket::from_std).transpose()?.map(Arc::new);
         let tcp = tcp.map(TcpListener::from_std).transpose()?;
         let (phase, phase_rx) = watch::channel(ListenerPhase::Running);
@@ -156,11 +153,7 @@ impl BoundDnsListener {
             ));
         }
 
-        Ok(DnsListener {
-            phase,
-            supervisors,
-            local_addr,
-        })
+        Ok(DnsListener { phase, supervisors })
     }
 
     #[cfg(test)]
@@ -197,14 +190,9 @@ impl BoundDnsListener {
 pub(super) struct DnsListener {
     phase: watch::Sender<ListenerPhase>,
     supervisors: JoinSet<()>,
-    local_addr: SocketAddr,
 }
 
 impl DnsListener {
-    pub(super) fn local_addr(&self) -> SocketAddr {
-        self.local_addr
-    }
-
     /// Close receive/accept admission while allowing already tracked children
     /// to finish as part of the control plane's ordinary bounded drain.
     pub(super) fn stop_accepting(&self) {
@@ -319,6 +307,7 @@ fn bind_selected(
     } else {
         None
     };
+    #[cfg(test)]
     let local_addr = match (&udp, &tcp) {
         (Some(socket), _) => socket.local_addr()?,
         (None, Some(listener)) => listener.local_addr()?,
@@ -328,6 +317,7 @@ fn bind_selected(
     Ok(BoundDnsListener {
         tcp,
         udp,
+        #[cfg(test)]
         local_addr,
     })
 }
@@ -376,9 +366,13 @@ async fn run_udp_supervisor(
                     continue;
                 };
                 let query = &buffer[..length];
+                #[cfg(feature = "native-api")]
+                let started = std::time::Instant::now();
 
                 if drain.should_reject() {
                     send_udp_refused(socket.as_ref(), query, response_source, client_addr).await;
+                    #[cfg(feature = "native-api")]
+                    controller.dns_service().observe_client(query, crate::dns::query::IngressProfile::Udp { advertised_size: 512 }, Some(client_addr), None, &minimal_dns_error_response(query, 5), started.elapsed());
                     continue;
                 }
 
@@ -396,6 +390,8 @@ async fn run_udp_supervisor(
                         let _ = error
                             .run_reply(send_udp_refused(socket.as_ref(), query, response_source, client_addr))
                             .await;
+                        #[cfg(feature = "native-api")]
+                        controller.dns_service().observe_client(query, crate::dns::query::IngressProfile::Udp { advertised_size: 512 }, Some(client_addr), None, &minimal_dns_error_response(query, 5), started.elapsed());
                         continue;
                     }
                 };
@@ -412,6 +408,8 @@ async fn run_udp_supervisor(
                     {
                         debug!(error_kind = ?error.kind(), %client_addr, "standalone UDP DNS FORMERR send failed");
                     }
+                    #[cfg(feature = "native-api")]
+                    controller.dns_service().observe_client(query, crate::dns::query::IngressProfile::Udp { advertised_size: 512 }, Some(client_addr), None, &response, started.elapsed());
                     continue;
                 };
                 // All bounded admission is owned before the datagram copy and
@@ -431,7 +429,7 @@ async fn run_udp_supervisor(
                     match admission
                         .run_reply(send_bound_udp_response(
                             child_socket.as_ref(),
-                            &response,
+                            response.wire(),
                             response_source,
                             client_addr,
                         ))
@@ -445,6 +443,8 @@ async fn run_udp_supervisor(
                         }
                         Ok(Ok(_)) => {}
                     }
+                    #[cfg(feature = "native-api")]
+                    child_controller.dns_service().observe_client(&query, ingress, Some(client_addr), response.outcome(), response.wire(), started.elapsed());
                 });
             }
         }
@@ -820,6 +820,61 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "native-api")]
+    #[tokio::test]
+    async fn native_log_records_bound_udp_success_and_header_only_refusal() {
+        let (controller, _) = controller([192, 0, 2, 10]);
+        let api = Arc::new(crate::native_api::dns::DnsApi::new(
+            "bound-log".into(),
+            true,
+        ));
+        controller
+            .dns_service()
+            .attach_observer(Arc::downgrade(&api));
+        let (mut listener, address, drain) =
+            start_listener("udp://127.0.0.1:0", Arc::clone(&controller));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let source = client.local_addr().unwrap();
+        let mut bytes = [0; 512];
+        client
+            .send_to(&query("accepted.example", 1), address)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), client.recv(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes[3] & 15, 0);
+        stop_listener(&mut listener, &drain).await;
+        let (saturated, _) =
+            controller_with_config([192, 0, 2, 10], &honk_config::dns::DnsConfig::default(), 0);
+        saturated
+            .dns_service()
+            .attach_observer(Arc::downgrade(&api));
+        let (mut listener, address, drain) = start_listener("udp://127.0.0.1:0", saturated);
+        client
+            .send_to(&query("refused.example", 2), address)
+            .await
+            .unwrap();
+        let length = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(length, 12);
+        assert_eq!(bytes[3] & 15, 5);
+        stop_listener(&mut listener, &drain).await;
+        let page = api.log_for_test().page_for_test();
+        let body = axum::body::to_bytes(page.into_body(), 262144)
+            .await
+            .unwrap();
+        let log: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(log["total"], 2);
+        assert_eq!(log["records"][0]["status"], "REFUSED");
+        assert_eq!(log["records"][0]["question"]["name"], "refused.example.");
+        assert_eq!(log["records"][0]["src"], source.to_string());
+        assert_eq!(log["records"][1]["answers"][0]["data"], "192.0.2.10");
+    }
+
     #[tokio::test]
     async fn udp_listener_routes_query_and_reports_malformed_and_admission_errors() {
         let (controller, calls) = controller([192, 0, 2, 10]);
@@ -1086,10 +1141,10 @@ mod tests {
         let (replacement_forwarder, replacement_calls) = forwarder([192, 0, 2, 2]);
         let provider = controller.runtime_provider();
         let (generation, projection) = {
-            let current = provider.acquire();
+            let current = provider.current();
             (
-                current.runtime().generation().get().saturating_add(1),
-                Arc::clone(current.runtime().routing_projection()),
+                current.generation().get().saturating_add(1),
+                Arc::clone(current.routing_projection()),
             )
         };
         provider.publish(crate::dns::runtime::DnsRuntime::new(

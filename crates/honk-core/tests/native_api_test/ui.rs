@@ -148,7 +148,6 @@ async fn ui_without_a_readable_index_rejects_startup() {
             "127.0.0.1:9527".parse().unwrap(),
             SystemTime::now(),
             Instant::now(),
-            true
         )
         .await
         .is_err()

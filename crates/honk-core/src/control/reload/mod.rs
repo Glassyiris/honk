@@ -5,6 +5,7 @@ mod policy;
 mod subscription;
 mod transaction;
 mod warm;
+pub(in crate::control) use warm::WarmTask;
 
 pub(in crate::control) use fingerprint::{
     dns_routing_state_reusable, effective_config_unchanged, routing_state_reusable,
@@ -80,6 +81,16 @@ pub(crate) fn resolve_outbound_nodes(
     vec![Config::builtin_direct_node()]
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::control) enum OutboundConstraint {
+    #[default]
+    Any,
+    #[cfg(feature = "native-api")]
+    Node(uuid::Uuid),
+    #[cfg(feature = "native-api")]
+    Unavailable,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ResolvedScorePlan {
     pub(super) mode: honk_outbound::group::SelectionPlanMode,
@@ -120,8 +131,23 @@ pub(super) fn resolve_outbound_plan_for_target(
     group_manager: &GroupManager,
     outbound_name: &str,
     context: &honk_outbound::group::ScoreSelectionContext,
+    constraint: OutboundConstraint,
 ) -> ResolvedScorePlan {
-    if let Some(node) = config.builtin_node(outbound_name) {
+    #[cfg(feature = "native-api")]
+    if matches!(constraint, OutboundConstraint::Unavailable)
+        || matches!(constraint, OutboundConstraint::Node(id) if !config.nodes.iter().any(|node| node.id == id))
+    {
+        return ResolvedScorePlan {
+            mode: honk_outbound::group::SelectionPlanMode::Authoritative,
+            nodes: Vec::new(),
+            health_family: context.health_family,
+            feedback: Vec::new(),
+            selection_chains: Vec::new(),
+        };
+    }
+    if matches!(constraint, OutboundConstraint::Any)
+        && let Some(node) = config.builtin_node(outbound_name)
+    {
         return ResolvedScorePlan {
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
             nodes: vec![node],
@@ -130,7 +156,13 @@ pub(super) fn resolve_outbound_plan_for_target(
             selection_chains: vec![vec![outbound_name.to_owned()]],
         };
     }
-    if let Some(node) = config.nodes.iter().find(|node| node.name == outbound_name) {
+    if let Some(node) = config.nodes.iter().find(|node| match constraint {
+        OutboundConstraint::Any => node.name == outbound_name,
+        #[cfg(feature = "native-api")]
+        OutboundConstraint::Node(id) => node.id == id,
+        #[cfg(feature = "native-api")]
+        OutboundConstraint::Unavailable => false,
+    }) {
         let health_family = if group_manager.is_node_selectable_for_domain(
             node.id,
             context.probe_domain,
@@ -193,8 +225,10 @@ pub(super) fn resolve_udp_outbound_plan_for_target(
     group_manager: &GroupManager,
     outbound_name: &str,
     context: &honk_outbound::group::ScoreSelectionContext,
+    constraint: OutboundConstraint,
 ) -> ResolvedUdpPlan {
-    let plan = resolve_outbound_plan_for_target(config, group_manager, outbound_name, context);
+    let plan =
+        resolve_outbound_plan_for_target(config, group_manager, outbound_name, context, constraint);
     ResolvedUdpPlan {
         mode: plan.mode,
         nodes: plan.nodes,

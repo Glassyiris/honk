@@ -45,7 +45,7 @@ fn tuple_reincarnation_keeps_history_and_exact_connection_identity() {
     let store = store();
     let first = begin(&store, "tcp");
     first.attach_connection("connection-old");
-    first.routed("original-group", None, "unknown");
+    first.routed("original-group", None, None, "unknown");
     first.selected(vec![
         "original-group-id".to_owned(),
         "original-node-id".to_owned(),
@@ -54,7 +54,7 @@ fn tuple_reincarnation_keeps_history_and_exact_connection_identity() {
     first.finish("closed", "relay_finished");
     let second = begin(&store, "tcp");
     second.attach_connection("connection-new");
-    second.routed("replacement-group", None, "unknown");
+    second.routed("replacement-group", None, None, "unknown");
     second.selected(vec![
         "replacement-group-id".to_owned(),
         "replacement-node-id".to_owned(),
@@ -86,7 +86,7 @@ fn guards_finalize_once_and_do_not_fabricate_kernel_connection_close() {
     let id = flow.id().to_owned();
     let terminal = store.get(&id, &request_id()).unwrap();
     flow.finish("failed", "late_error");
-    flow.routed("late-outbound", None, "unknown");
+    flow.routed("late-outbound", None, None, "unknown");
     drop(flow);
     assert_eq!(store.get(&id, &request_id()).unwrap(), terminal);
     assert_eq!(

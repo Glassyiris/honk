@@ -25,51 +25,7 @@ impl ControlPlane {
         self.pending_udp_verdicts = None;
     }
 
-    async fn cleanup_flags_startup_failure(&mut self) {
-        if let Some(flags) = self.datapath_flags.as_ref()
-            && let Err(error) = flags.disable().await
-        {
-            error!(%error, "datapath flags startup cleanup failed");
-        }
-    }
-    pub(super) async fn cleanup_pre_admission_failure(&mut self) {
-        self.drain_tracker.start_rejecting();
-        self.cleanup_flags_startup_failure().await;
-        {
-            let mut tasks = self.background_tasks.lock().await;
-            for task in tasks.drain(..) {
-                task.abort();
-            }
-        }
-        #[cfg(feature = "ebpf")]
-        if let Some(watcher) = self.iface_watcher.take() {
-            watcher.shutdown(SHUTDOWN_STAGE_TIMEOUT).await;
-        }
-        if let Err(error) = self.ebpf.write().await.detach_hooks() {
-            error!(%error, "failed to detach eBPF hooks after startup failure");
-        }
-        if let Err(error) = self.finalize_shutdown().await {
-            error!(%error, "failed to finalize startup rollback");
-        }
-    }
-    pub(super) async fn cleanup_started_control_tasks(
-        &mut self,
-        udp_removal_task: &mut tokio::task::JoinHandle<()>,
-        dns_listener: Option<&mut dns_listener::DnsListener>,
-    ) {
-        if let Some(listener) = dns_listener {
-            listener.stop_accepting();
-            listener.abort_and_join().await;
-        }
-        if !self.udp_pool.shutdown().await {
-            error!("UDP endpoint shutdown required forced cleanup during startup rollback");
-        }
-        if let Err(error) = udp_removal_task.await {
-            error!(%error, "UDP removal worker failed during startup rollback");
-        }
-        self.cleanup_pre_admission_failure().await;
-    }
-
+    #[cfg(test)]
     /// Datapath half of shutdown: close admission, stop background work,
     /// detach the eBPF hooks (network restored before the connection drain,
     /// Go dae behaviour), then drain flows and retire the outbound runtime
@@ -91,7 +47,7 @@ impl ControlPlane {
         }
         self.stop_udp_warm_coordinator().await;
         self.stop_selector_warm_coordinator().await;
-        if !self.udp_pool.shutdown().await {
+        if !self.udp_pool.shutdown().await.joined {
             error!("UDP endpoint shutdown required forced cleanup");
         }
         // Keep the removal consumer alive until terminal endpoint cleanup has
@@ -103,8 +59,12 @@ impl ControlPlane {
         // only after UDP drivers and their removal sink have drained.
         {
             let mut tasks = self.background_tasks.lock().await;
-            for handle in tasks.drain(..) {
+            for handle in tasks.iter() {
                 handle.abort();
+            }
+            while let Some(handle) = tasks.last_mut() {
+                let _ = handle.await;
+                tasks.pop();
             }
         }
         // Stop the interface watcher first: it shares the backend and could

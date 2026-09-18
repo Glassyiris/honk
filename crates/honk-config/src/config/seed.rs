@@ -2,7 +2,6 @@ use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use super::Config;
-use crate::config::diagnostics::ineffective_group_option_diagnostic;
 use crate::diagnostic::{
     DetailedDiagnostic, DiagnosticSources, SettingPath, SourceRef, report_detailed_diagnostics,
 };
@@ -95,14 +94,6 @@ impl<'de> Visitor<'de> for RawConfigSeed<'_> {
                 }
                 Field::Groups => {
                     config.groups = map.next_value()?;
-                    for (index, group) in config.groups.iter().enumerate() {
-                        if group.interrupt_connections {
-                            self.diagnostics.push(ineffective_group_option_diagnostic(
-                                self.source.clone(),
-                                index + 1,
-                            ));
-                        }
-                    }
                 }
                 Field::Subscriptions => config.subscriptions = map.next_value()?,
                 Field::Experimental => {
@@ -138,14 +129,6 @@ impl<'de> Visitor<'de> for RawConfigSeed<'_> {
             })?
             .unwrap_or_default();
         let groups: Vec<crate::node::Group> = seq.next_element()?.unwrap_or_default();
-        for (index, group) in groups.iter().enumerate() {
-            if group.interrupt_connections {
-                self.diagnostics.push(ineffective_group_option_diagnostic(
-                    self.source.clone(),
-                    index + 1,
-                ));
-            }
-        }
         let subscriptions = seq.next_element()?.unwrap_or_default();
         let experimental: crate::experimental::ExperimentalConfig =
             seq.next_element()?.unwrap_or_default();

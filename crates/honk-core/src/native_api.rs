@@ -3,12 +3,22 @@
 pub(crate) mod catalog;
 pub(crate) mod config;
 mod config_write;
+mod connections;
+mod datapath;
+pub(crate) mod dns;
 pub(crate) mod events;
 pub(crate) mod flows;
+mod groups;
+pub(crate) mod logs;
+pub(crate) mod mode;
 pub(crate) mod observation;
 pub(crate) mod offline;
 pub(crate) mod operations;
+pub(crate) mod probes;
+pub(crate) mod providers;
+pub(crate) mod routing;
 mod security;
+mod settings;
 pub(crate) mod telemetry;
 mod types;
 mod ui;
@@ -55,11 +65,17 @@ pub struct NativeState {
     observation: Arc<observation::NativeObservation>,
     alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
     group_manager: honk_outbound::group::SharedGroupManager,
+    dns: crate::dns::DnsService,
+    traffic_router: Arc<RwLock<crate::routing::Router>>,
+    backend: Arc<RwLock<Box<dyn crate::ebpf::EbpfBackend>>>,
+    control_tx: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
+    datapath_flags: Option<crate::mode::DatapathFlagsHandle>,
+    runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
+    proxy_registry: Arc<crate::proxy::ProxyRegistry>,
     phase: watch::Receiver<EnginePhase>,
     healthy: Arc<AtomicBool>,
     #[cfg(test)]
     after_generation: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    mock_mode: bool,
     sample: parking_lot::RwLock<Option<TrafficSummary>>,
 }
 
@@ -69,11 +85,12 @@ impl NativeState {
         listen: SocketAddr,
         started_at: SystemTime,
         started: Instant,
-        mock_mode: bool,
     ) -> anyhow::Result<Self> {
         let config = control.config_handle();
         let settings = config.read().await.experimental.native_api.clone();
         let observation = control.native_observation();
+        let phase = control.observe_phase();
+        observation.configuration.attach_phase(phase.clone());
         Ok(Self {
             security: security::Security::new(&settings, listen),
             ui: ui::load(&settings.ui).await?,
@@ -82,19 +99,45 @@ impl NativeState {
             observation,
             alive_set: control.alive_set(),
             group_manager: control.group_manager(),
+            dns: control.dns_service(),
+            traffic_router: control.traffic_router(),
+            backend: control.ebpf_handle(),
+            control_tx: control.command_sender(),
+            datapath_flags: control.datapath_flags_handle(),
+            runtime_registry: control.runtime_registry(),
+            proxy_registry: control.proxy_registry(),
             started_at,
             started,
             config,
             diagnostics: control.diagnostics_handle(),
             stats: control.stats_handle(),
             tracker: control.connection_tracker(),
-            phase: control.observe_phase(),
+            phase,
             #[cfg(test)]
             after_generation: parking_lot::Mutex::new(None),
             healthy: control.datapath_health_handle(),
-            mock_mode,
             sample: parking_lot::RwLock::new(None),
         })
+    }
+
+    pub(crate) fn require_running(&self) -> Result<(), ApiError> {
+        match *self.phase.borrow() {
+            EnginePhase::Running if self.healthy.load(Ordering::Acquire) => Ok(()),
+            EnginePhase::Suspending | EnginePhase::Suspended | EnginePhase::Resuming => {
+                Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    ErrorCode::StateConflict,
+                    "Engine lifecycle prevents this operation",
+                    None,
+                ))
+            }
+            _ => Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::TemporarilyUnavailable,
+                "Engine is not ready for this operation",
+                None,
+            )),
+        }
     }
 }
 
@@ -238,12 +281,108 @@ async fn dispatch(
         )
         .into_response();
     };
+    // The pinned mode contract has no lifecycle/owner failure responses.
+    if route.template == "/api/v1/runtime/mode" {
+        return error(
+            StatusCode::NOT_FOUND,
+            ErrorCode::CapabilityNotSupported,
+            "Capability is not supported",
+            &id,
+        )
+        .into_response();
+    }
     if route.template == "/api/v1/events" && method == "GET" {
         return events::serve(&state, request, &id)
             .await
             .unwrap_or_else(IntoResponse::into_response);
     }
+    if route.template == "/api/v1/logs" && method == "GET" {
+        return logs::serve(&state, request, &id)
+            .await
+            .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
+    }
     match (method, route.template) {
+        ("PUT", "/api/v1/runtime/mode") => {
+            return mode::put(&state, request, &id)
+                .await
+                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
+        }
+        ("POST", "/api/v1/operations/suspend") => {
+            return config::lifecycle(&state, request, &id, false)
+                .await
+                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
+        }
+        ("POST", "/api/v1/operations/resume") => {
+            return config::lifecycle(&state, request, &id, true)
+                .await
+                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
+        }
+        ("PUT", "/api/v1/groups/{groupId}/selection") => {
+            let group_id = path
+                .trim_start_matches("/api/v1/groups/")
+                .trim_end_matches("/selection")
+                .to_owned();
+            return groups::select(&state, &group_id, request, &id)
+                .await
+                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
+        }
+        ("PATCH", "/api/v1/groups/{groupId}") => {
+            let group_id = path.trim_start_matches("/api/v1/groups/").to_owned();
+            return groups::patch(&state, &group_id, request, &id)
+                .await
+                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
+        }
+        ("POST", "/api/v1/providers/{id}/refresh") => {
+            let provider_id = path
+                .trim_start_matches("/api/v1/providers/")
+                .trim_end_matches("/refresh")
+                .to_owned();
+            return providers::refresh(&state, &provider_id, request, &id)
+                .await
+                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
+        }
+        ("DELETE", "/api/v1/connections") => {
+            return connections::close_bulk(&state, request, &id)
+                .await
+                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
+        }
+        ("DELETE", "/api/v1/connections/{connection_id}") => {
+            let connection_id = path.trim_start_matches("/api/v1/connections/").to_owned();
+            return connections::close(&state, &connection_id, request, &id)
+                .await
+                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
+        }
+        ("PATCH", "/api/v1/runtime/settings") => {
+            return settings::patch(&state, request, &id)
+                .await
+                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
+        }
+        ("POST", "/api/v1/probes") => {
+            return probes::create(&state, request, &id)
+                .await
+                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
+        }
+        ("POST", "/api/v1/routing/trace") => {
+            return routing::trace(&state, request, &id)
+                .await
+                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
+        }
+        ("DELETE", "/api/v1/dns/cache") => {
+            return dns::delete_name(&state, request, &id)
+                .await
+                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
+        }
+        ("DELETE", "/api/v1/dns/cache/{entry_id}") => {
+            let entry = path.trim_start_matches("/api/v1/dns/cache/").to_owned();
+            return dns::delete_entry(&state, &entry, request, &id)
+                .await
+                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
+        }
+        ("POST", "/api/v1/dns/cache/flush") => {
+            return dns::flush(&state, request, &id)
+                .await
+                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
+        }
         ("PUT", "/api/v1/config/sources/{source_id}") => {
             return config::replace(
                 &state,
@@ -286,6 +425,23 @@ async fn dispatch(
                 telemetry::memory_history(&state, request.uri(), &id).await
             }
             "/api/v1/config" => config::get(&state, request.uri(), &id).await,
+            "/api/v1/datapath" => datapath::get(&state, request.uri(), &id).await,
+            "/api/v1/runtime/mode" => mode::get(&state, request.uri(), &id).await,
+            "/api/v1/providers" => providers::list(&state, request.uri(), &id).await,
+            "/api/v1/providers/{id}" => {
+                providers::detail(
+                    &state,
+                    path.trim_start_matches("/api/v1/providers/"),
+                    request.uri(),
+                    &id,
+                )
+                .await
+            }
+            "/api/v1/runtime/settings" => settings::get(&state, request.uri(), &id).await,
+            "/api/v1/rules" => routing::rules(&state, request.uri(), &id).await,
+            "/api/v1/dns/query" => dns::query(&state, request.uri(), &id).await,
+            "/api/v1/dns/cache" => dns::cache(&state, request.uri(), &id).await,
+            "/api/v1/dns/log" => dns::log(&state, request.uri(), &id).await,
             "/api/v1/config/sources/{source_id}" => {
                 config::source(
                     &state,
@@ -295,12 +451,17 @@ async fn dispatch(
                 )
                 .await
             }
-            "/api/v1/operations/{id}" => config::operation(
-                &state,
-                path.trim_start_matches("/api/v1/operations/"),
-                request.uri(),
-                &id,
-            ),
+            "/api/v1/operations/{id}" => parse_query(request.uri(), &[], &id).and_then(|_| {
+                state.observation.operations.get(
+                    path.trim_start_matches("/api/v1/operations/"),
+                    if state.settings.secret.is_empty() {
+                        "anonymous"
+                    } else {
+                        "control"
+                    },
+                    true,
+                )
+            }),
             "/api/v1/connections" => connections(&state, request.uri(), &id),
             "/api/v1/flows" => flows::list(&state, request.uri(), &id),
             "/api/v1/flows/{flow_id}" => flows::detail(
@@ -382,7 +543,7 @@ fn timestamp(time: SystemTime) -> String {
 async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Response, ApiError> {
     let query = parse_query(uri, &["detail"], id)?;
     let full = full_detail(&query, id)?;
-    let (generation, phase, healthy, config_revision, last_reload) = {
+    let (generation, phase, healthy, config_revision, last_reload, datapath_observation) = {
         let _config = state.config.read().await;
         let generation = state.diagnostics.read().generation;
         #[cfg(test)]
@@ -392,18 +553,23 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
                 hook();
             }
         }
+        let phase = *state.phase.borrow();
         (
             generation,
-            *state.phase.borrow(),
+            phase,
             state.healthy.load(Ordering::Acquire),
             state.observation.configuration.revision(),
             state.observation.configuration.last_reload(),
+            state.backend.read().await.observe_datapath(),
         )
     };
     let lifecycle = match phase {
         EnginePhase::Starting => "starting",
         EnginePhase::Running if !healthy => "degraded",
         EnginePhase::Running => "running",
+        EnginePhase::Suspending => "draining",
+        EnginePhase::Suspended => "suspended",
+        EnginePhase::Resuming => "starting",
         EnginePhase::Draining => "draining",
         EnginePhase::Failed => "failed",
     };
@@ -441,18 +607,7 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
             state: "active",
             activated_at: None,
         },
-        datapath: DatapathSummary {
-            kind: if state.mock_mode { "mock" } else { "ebpf" },
-            state: if state.mock_mode {
-                "disabled"
-            } else if !healthy {
-                "degraded"
-            } else {
-                "unknown"
-            },
-            visibility: "none",
-            ebpf: (),
-        },
+        datapath: datapath::summary(&datapath_observation, &state.instance_id, healthy),
         traffic,
         process: Process {
             pid: full.then_some(std::process::id()),
@@ -509,7 +664,7 @@ fn connection(state: &NativeState, entry: &ConnectionEntry, full: bool) -> Conne
         chain_source: evidence
             .as_ref()
             .map_or("unknown", |value| value.chain_source),
-        rule_id: None,
+        rule_id: evidence.as_ref().and_then(|value| value.rule_id.clone()),
         rule_expression: evidence
             .as_ref()
             .and_then(|value| value.rule_expression.clone()),
@@ -675,7 +830,7 @@ impl NativeServer {
     pub async fn shutdown(self) {
         let _ = self.stop.send(true);
         if self.supervisor.await.is_err() {
-            tracing::error!("native HTTP supervisor failed");
+            tracing::error!(message = "native HTTP supervisor failed");
         }
     }
 }
@@ -783,6 +938,11 @@ async fn supervise(
     let observation = Arc::clone(&state.observation);
     let (sampler_stop, sampler_receiver) = watch::channel(false);
     let (connections_stop, connection_receiver) = watch::channel(false);
+    let (probes_stop, probes_receiver) = watch::channel(false);
+    let mut probes = observation
+        .probes
+        .start(Arc::clone(&state), probes_receiver);
+    let mut probes_running = true;
     let mut sampler = tokio::spawn(sample_traffic(state, sampler_receiver));
     let mut sampler_running = true;
     let mut children = JoinSet::new();
@@ -790,20 +950,25 @@ async fn supervise(
         tokio::select! {
             biased;
             _ = stop.changed() => break,
+            _ = &mut probes => {
+                probes_running = false;
+                tracing::error!(message = "native probe supervisor stopped unexpectedly");
+                break;
+            }
             _ = &mut sampler => {
                 sampler_running = false;
-                tracing::error!("native HTTP sampler stopped unexpectedly");
+                tracing::error!(message = "native HTTP sampler stopped unexpectedly");
                 break;
             }
             child = children.join_next(), if !children.is_empty() => {
                 if child.is_some_and(|result| result.is_err()) {
-                    tracing::error!("native HTTP connection task failed");
+                    tracing::error!(message = "native HTTP connection task failed");
                     break;
                 }
             }
             accepted = listener.accept(), if children.len() < 64 => {
                 let Ok((stream, _)) = accepted else {
-                    tracing::error!("native HTTP listener failed");
+                    tracing::error!(message = "native HTTP listener failed");
                     break;
                 };
                 let service = TowerToHyperService::new(router.clone());
@@ -825,6 +990,11 @@ async fn supervise(
         }
     }
     drop(listener);
+    let _ = probes_stop.send(true);
+    if probes_running {
+        let _ = probes.await;
+    }
+    observation.logs.shutdown();
     observation.events.shutdown();
     let _ = sampler_stop.send(true);
     if sampler_running {
@@ -868,7 +1038,6 @@ mod tests {
             "127.0.0.1:9527".parse().unwrap(),
             SystemTime::now(),
             Instant::now(),
-            false,
         )
         .await
         .unwrap();
@@ -890,6 +1059,22 @@ mod tests {
                 .unwrap(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn suspended_dns_query_uses_declared_unavailable_response() {
+        let mut state = state().await;
+        Arc::get_mut(&mut state).unwrap().phase = watch::channel(EnginePhase::Suspended).1;
+        let response = dns::query(
+            &state,
+            &"/api/v1/dns/query?domain=example.test".parse().unwrap(),
+            &RequestId("test".into()),
+        )
+        .await
+        .unwrap_err()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "1");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

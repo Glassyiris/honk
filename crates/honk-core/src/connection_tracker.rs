@@ -8,6 +8,163 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
+use std::net::{IpAddr, SocketAddr};
+use tokio::sync::watch;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloseOutcome {
+    Closed,
+    Gone,
+    NotClosable,
+    Failed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClosePhase {
+    Active,
+    Closing,
+    Closed,
+    Failed,
+}
+
+pub(crate) struct CloseSignal(watch::Sender<ClosePhase>);
+
+impl CloseSignal {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self(watch::channel(ClosePhase::Active).0))
+    }
+
+    fn claim(&self) -> bool {
+        self.0.send_if_modified(|phase| {
+            if *phase != ClosePhase::Active {
+                return false;
+            }
+            *phase = ClosePhase::Closing;
+            true
+        })
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        let mut receiver = self.0.subscribe();
+        let _ = receiver
+            .wait_for(|phase| *phase != ClosePhase::Active)
+            .await;
+    }
+
+    pub(crate) fn finish(&self, success: bool) {
+        self.0.send_replace(if success {
+            ClosePhase::Closed
+        } else {
+            ClosePhase::Failed
+        });
+    }
+
+    async fn completed(&self) -> CloseOutcome {
+        let mut receiver = self.0.subscribe();
+        match receiver
+            .wait_for(|phase| matches!(phase, ClosePhase::Closed | ClosePhase::Failed))
+            .await
+        {
+            Ok(phase) if *phase == ClosePhase::Closed => CloseOutcome::Closed,
+            _ => CloseOutcome::Failed,
+        }
+    }
+}
+
+/// A dropped owner is not an acknowledgement of transport/backend cleanup.
+pub(crate) struct CloseCompletion(pub(crate) Arc<CloseSignal>);
+
+impl Drop for CloseCompletion {
+    fn drop(&mut self) {
+        self.0.0.send_if_modified(|phase| {
+            if matches!(*phase, ClosePhase::Closed | ClosePhase::Failed) {
+                return false;
+            }
+            *phase = ClosePhase::Failed;
+            true
+        });
+    }
+}
+
+pub(crate) enum CloseAction {
+    Tcp,
+    Udp {
+        pool: std::sync::Weak<crate::control::udp_endpoint::UdpEndpointPool>,
+        client: SocketAddr,
+        destination: SocketAddr,
+        token: u32,
+        generation: u64,
+    },
+}
+
+pub(crate) struct ConnectionOwner {
+    pub(crate) signal: Arc<CloseSignal>,
+    pub(crate) action: CloseAction,
+    pub(crate) groups: Vec<String>,
+}
+
+struct TrackedConnection {
+    entry: ConnectionEntry,
+    owner: Option<Arc<ConnectionOwner>>,
+}
+
+pub(crate) struct SelectedConnection {
+    id: String,
+    owner: Option<Arc<ConnectionOwner>>,
+}
+
+pub(crate) enum CloseRequest {
+    Immediate(CloseOutcome),
+    Pending(Arc<CloseSignal>),
+}
+
+impl CloseRequest {
+    pub(crate) async fn wait(self) -> CloseOutcome {
+        match self {
+            Self::Immediate(outcome) => outcome,
+            Self::Pending(signal) => signal.completed().await,
+        }
+    }
+}
+
+pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ip)),
+        ip => ip,
+    }
+}
+
+pub(crate) fn captured_groups(
+    chain: &[String],
+    leaf: &str,
+    config: &honk_config::Config,
+    native_ids: Option<&std::collections::HashMap<String, String>>,
+) -> Vec<String> {
+    chain
+        .iter()
+        .take(
+            chain
+                .len()
+                .saturating_sub(usize::from(chain.last().is_some_and(|name| name == leaf))),
+        )
+        .filter_map(|name| {
+            if let Some(ids) = native_ids {
+                ids.get(name).cloned()
+            } else {
+                config
+                    .groups
+                    .iter()
+                    .rev()
+                    .find(|group| group.name == *name)
+                    .map(|group| group.id.to_string())
+            }
+        })
+        .collect()
+}
+
 /// Snapshot of a connection's state, safe to serialize and expose via API.
 #[derive(Debug, Clone)]
 pub struct ConnectionSnapshot {
@@ -88,7 +245,7 @@ impl ConnectionEntry {
 ///
 /// Thread-safe by construction via [`DashMap`] — no external locks needed.
 pub struct ConnectionTracker {
-    entries: DashMap<String, ConnectionEntry>,
+    entries: DashMap<String, TrackedConnection>,
     consumers: AtomicU8,
     consumer_transition: parking_lot::Mutex<()>,
 }
@@ -164,22 +321,131 @@ impl ConnectionTracker {
     #[cfg(feature = "native-api")]
     pub(crate) fn visit(&self, mut visitor: impl FnMut(&ConnectionEntry)) {
         for entry in &self.entries {
-            visitor(entry.value());
+            visitor(&entry.value().entry);
         }
-    }
-
-    pub(crate) fn register_if_enabled(
-        &self,
-        make_entry: impl FnOnce() -> ConnectionEntry,
-    ) -> Option<String> {
-        self.is_enabled().then(|| self.register(make_entry()))
     }
 
     /// Register a new connection and return its unique ID (UUID v4).
     pub fn register(&self, entry: ConnectionEntry) -> String {
         let id = entry.id.clone();
-        self.entries.insert(id.clone(), entry);
+        self.entries
+            .insert(id.clone(), TrackedConnection { entry, owner: None });
         id
+    }
+
+    pub(crate) fn register_owned(&self, entry: ConnectionEntry, owner: ConnectionOwner) -> String {
+        let id = entry.id.clone();
+        self.entries.insert(
+            id.clone(),
+            TrackedConnection {
+                entry,
+                owner: Some(Arc::new(owner)),
+            },
+        );
+        id
+    }
+
+    pub(crate) fn snapshot_close(
+        &self,
+        network: Option<&str>,
+        source: Option<IpAddr>,
+        maximum: usize,
+    ) -> Result<Vec<SelectedConnection>, ()> {
+        let source = source.map(normalize_ip);
+        let mut selected = Vec::new();
+        for tracked in &self.entries {
+            let entry = &tracked.entry;
+            if network.is_some_and(|network| entry.network != network)
+                || source.is_some_and(|source| {
+                    entry
+                        .source
+                        .parse::<SocketAddr>()
+                        .ok()
+                        .is_none_or(|addr| normalize_ip(addr.ip()) != source)
+                })
+            {
+                continue;
+            }
+            if selected.len() == maximum {
+                return Err(());
+            }
+            selected.push(SelectedConnection {
+                id: entry.id.clone(),
+                owner: tracked.owner.clone(),
+            });
+        }
+        Ok(selected)
+    }
+
+    pub(crate) fn snapshot_group(
+        &self,
+        group: &str,
+        network: Option<&str>,
+    ) -> Vec<SelectedConnection> {
+        self.entries
+            .iter()
+            .filter_map(|tracked| {
+                let owner = tracked.owner.as_ref()?;
+                (network.is_none_or(|network| tracked.entry.network == network)
+                    && owner.groups.iter().any(|id| id == group))
+                .then(|| SelectedConnection {
+                    id: tracked.entry.id.clone(),
+                    owner: Some(Arc::clone(owner)),
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(any(test, feature = "native-api", feature = "clash-api"))]
+    pub(crate) async fn close_id(&self, id: &str) -> CloseOutcome {
+        let selected = self.entries.get(id).map(|tracked| SelectedConnection {
+            id: id.to_owned(),
+            owner: tracked.owner.clone(),
+        });
+        match selected {
+            Some(selected) => self.close_selected(selected).await,
+            None => CloseOutcome::Gone,
+        }
+    }
+
+    #[cfg(any(test, feature = "native-api", feature = "clash-api"))]
+    pub(crate) async fn close_selected(&self, selected: SelectedConnection) -> CloseOutcome {
+        self.start_close(selected).wait().await
+    }
+
+    pub(crate) fn start_close(&self, selected: SelectedConnection) -> CloseRequest {
+        let claimed = {
+            let Some(tracked) = self.entries.get(&selected.id) else {
+                return CloseRequest::Immediate(CloseOutcome::Gone);
+            };
+            match (&tracked.owner, &selected.owner) {
+                (None, None) => return CloseRequest::Immediate(CloseOutcome::NotClosable),
+                (Some(current), Some(selected)) if Arc::ptr_eq(current, selected) => {
+                    current.signal.claim()
+                }
+                _ => false,
+            }
+        };
+        if !claimed {
+            return CloseRequest::Immediate(CloseOutcome::Gone);
+        }
+        let owner = selected.owner.expect("claimed transport owner");
+        if let CloseAction::Udp {
+            pool,
+            client,
+            destination,
+            token,
+            generation,
+        } = &owner.action
+        {
+            let Some(pool) = pool.upgrade() else {
+                return CloseRequest::Immediate(CloseOutcome::Failed);
+            };
+            if !pool.close_exact(*client, *destination, *token, *generation) {
+                return CloseRequest::Immediate(CloseOutcome::Gone);
+            }
+        }
+        CloseRequest::Pending(Arc::clone(&owner.signal))
     }
 
     /// Add upload/download bytes to an existing connection.
@@ -188,8 +454,14 @@ impl ConnectionTracker {
     /// dropped (the relay task may have raced with a close).
     pub fn update_bytes(&self, id: &str, upload_delta: u64, download_delta: u64) {
         if let Some(entry) = self.entries.get(id) {
-            entry.upload.fetch_add(upload_delta, Ordering::Relaxed);
-            entry.download.fetch_add(download_delta, Ordering::Relaxed);
+            entry
+                .entry
+                .upload
+                .fetch_add(upload_delta, Ordering::Relaxed);
+            entry
+                .entry
+                .download
+                .fetch_add(download_delta, Ordering::Relaxed);
         }
     }
 
@@ -197,7 +469,7 @@ impl ConnectionTracker {
     /// flow closed before the blocking `/proc` lookup completed.
     pub fn update_process_path(&self, id: &str, process_path: String) {
         if let Some(mut entry) = self.entries.get_mut(id) {
-            entry.process_path = Some(process_path);
+            entry.entry.process_path = Some(process_path);
         }
     }
 
@@ -210,7 +482,7 @@ impl ConnectionTracker {
     pub fn snapshot(&self) -> Vec<ConnectionSnapshot> {
         self.entries
             .iter()
-            .map(|ref_multi| ref_multi.value().snapshot())
+            .map(|ref_multi| ref_multi.value().entry.snapshot())
             .collect()
     }
 }

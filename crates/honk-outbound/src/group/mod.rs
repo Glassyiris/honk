@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 
-use state::UrlTestSelections;
+use state::{SelectorState, UrlTestSelections};
 
 #[cfg(feature = "native-api")]
 pub use resolver::{NativeGroupMember, NativeGroupSelection};
@@ -42,7 +42,10 @@ pub use score::{
     ScoreReasonCounters, ScoreReasonGroupSnapshot, ScoreReporter, ScoreSelectionContext,
     ScoreTarget,
 };
-pub use state::{InterruptCallback, PersistCallback, SelectorChangeCallback};
+pub use state::{
+    InterruptCallback, PersistCallback, SelectorChangeCallback, SelectorChoices, SelectorError,
+    SelectorMember, SelectorNetworks, SelectorUpdate,
+};
 
 /// Maximum nesting depth for group → sub-group resolution. Construction-
 /// time cycle breaking keeps the group graph acyclic; this bound (plus the
@@ -50,11 +53,7 @@ pub use state::{InterruptCallback, PersistCallback, SelectorChangeCallback};
 /// configs.
 pub const MAX_GROUP_DEPTH: usize = 8;
 
-/// Network dimension for per-network group selections.
-///
-/// sing-box keeps `selectedOutboundTCP` and `selectedOutboundUDP` apart;
-/// honk does the same for URLTest groups so a node with fast TCP but
-/// broken UDP does not drag UDP flows down (and vice versa).
+/// Network dimension for independent group selections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SelectionNetwork {
     Tcp,
@@ -169,6 +168,13 @@ impl<'a> GroupMember<'a> {
             Self::Group(group) => &group.name,
         }
     }
+
+    fn identity(self) -> SelectorMember {
+        match self {
+            Self::Node(node) => SelectorMember::Node(node.id),
+            Self::Group(group) => SelectorMember::Group(group.name.clone()),
+        }
+    }
 }
 
 /// A leaf and its immediate member path, independent of display-name collisions.
@@ -242,9 +248,8 @@ pub struct GroupManager {
     lb_counters: HashMap<String, [AtomicUsize; 2]>,
     /// Per-group TCP/UDP Fallback pins.
     fallback_cache: RwLock<HashMap<String, [Option<String>; 2]>>,
-    /// Per-group selector choice (set via API, persisted by caller).
-    /// group_name → selected node name.
-    selector_choice: RwLock<HashMap<String, String>>,
+    /// One publication barrier for both Selector networks and their revision.
+    selector_choice: RwLock<SelectorState>,
     /// Per-group rate limiter for the sole TCP leaf's last-resort warning.
     last_resort_log: RwLock<HashMap<String, Instant>>,
     /// Invoked on selector choice changes (cache.db persistence hook).
@@ -321,7 +326,7 @@ impl GroupManager {
                 })
                 .collect(),
             fallback_cache: RwLock::new(HashMap::new()),
-            selector_choice: RwLock::new(HashMap::new()),
+            selector_choice: RwLock::new(SelectorState::default()),
             last_resort_log: RwLock::new(HashMap::new()),
             persist_callback: RwLock::new(None),
             selector_change_callback: RwLock::new(None),

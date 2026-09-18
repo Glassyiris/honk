@@ -367,6 +367,12 @@ impl UpstreamPool {
             .map_or(0, |generation| generation.reap_idle_resources(now))
     }
 
+    pub(crate) fn tasks_failed(&self) -> bool {
+        self.runtime_generation
+            .get()
+            .is_some_and(|generation| generation.tasks_failed())
+    }
+
     pub fn set_group_manager(&self, group_manager: Option<SharedGroupManager>) {
         *self.group_manager.write() = group_manager;
     }

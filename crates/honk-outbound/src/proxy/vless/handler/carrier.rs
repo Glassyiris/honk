@@ -135,15 +135,16 @@ impl VLessHandler {
         connect_timeout: std::time::Duration,
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
         let permit = runtime.acquire_vless_carrier()?;
-        self.dial_carrier(
-            &runtime.node,
-            uuid,
-            header,
-            None,
-            connect_timeout,
-            Some(permit),
-        )
-        .await
+        runtime
+            .scope_tasks(self.dial_carrier(
+                &runtime.node,
+                uuid,
+                header,
+                None,
+                connect_timeout,
+                Some(permit),
+            ))
+            .await
     }
 
     pub(super) async fn dial_retained_base(

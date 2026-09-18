@@ -45,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
             "inner.test",
             &config,
             timeout,
+            honk_outbound::alive::ProbeCancellation::default(),
         )
         .await?;
         let total = started.elapsed();

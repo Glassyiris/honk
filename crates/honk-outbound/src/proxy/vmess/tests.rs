@@ -203,6 +203,58 @@ async fn dropping_vmess_stream_closes_physical_transport() {
     .unwrap();
 }
 
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn runtime_shutdown_joins_vmess_relay_with_live_stream() -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = listener.local_addr()?;
+    let physical = TcpStream::connect(endpoint).await?;
+    let (mut peer, _) = listener.accept().await?;
+    let mut node = Node {
+        name: "owned-vmess".into(),
+        address: endpoint.to_string(),
+        host: endpoint.ip().to_string(),
+        port: endpoint.port(),
+        outbound: honk_config::node::OutboundConfig::Vmess(honk_config::node::VmessConfig {
+            uuid: Some(UUID.into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    let (registry, _) = crate::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+        std::slice::from_ref(&node),
+        1,
+        1,
+        1,
+        true,
+        None,
+    )?;
+    let runtime = registry.get(&node.id).unwrap();
+    let uuid = uuid::Uuid::parse_str(UUID)?;
+    let target = "192.0.2.1:80".parse()?;
+    let stream = runtime
+        .scope_tasks(async {
+            VmessHandler::perform_handshake(uuid.as_bytes(), Box::new(physical), target, None)
+        })
+        .await?;
+    let mut first = [0];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        peer.read_exact(&mut first),
+    )
+    .await??;
+    tokio::time::timeout(std::time::Duration::from_secs(1), registry.shutdown()).await?;
+    let mut remaining_header = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        peer.read_to_end(&mut remaining_header),
+    )
+    .await??;
+    drop(stream);
+    Ok(())
+}
+
 /// End-to-end over the WebSocket transport: a mock server parses the
 /// real AEAD wire format — auth ID, sealed header length, sealed header
 /// (version/option/security/address) — exactly like a sing-box/Xray

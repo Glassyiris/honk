@@ -117,8 +117,6 @@ async fn native_catalog_capabilities_and_recording_disable_are_honest() {
     let app = TestApp::new(|config| config.experimental.native_api.record_flows = false).await;
     let capabilities = response_json(app.get("/api/v1/capabilities").send().await.unwrap()).await;
     assert_eq!(capabilities["resources"]["flows"]["recording"], "off");
-    assert_eq!(capabilities["resources"]["groups"]["selection"], false);
-    assert_eq!(capabilities["resources"]["groups"]["config_patch"], false);
     let flows = response_json(app.get("/api/v1/flows?detail=full").send().await.unwrap()).await;
     assert_eq!(flows["flows"], serde_json::json!([]));
     assert_eq!(flows["coverage"]["userspace_tcp"], "none");

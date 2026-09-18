@@ -127,7 +127,7 @@ async fn native_shared_source_idle_keeps_reply_evidence_per_flow_view() {
             usize::from(index == 0)
         );
     }
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
     wire_task.abort();
     let _ = wire_task.await;
     api.shutdown().await;

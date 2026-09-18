@@ -79,8 +79,8 @@ impl VlessMuxSession {
         })
     }
 
-    fn install_driver(&self, driver: tokio::task::AbortHandle) {
-        *self.driver.lock() = Some(driver);
+    fn install_driver(&self, driver: Option<tokio::task::AbortHandle>) {
+        *self.driver.lock() = driver;
     }
 
     fn sender(&self) -> anyhow::Result<SendRequest<Bytes>> {
@@ -414,7 +414,7 @@ pub(crate) async fn connect(
     let (sender, connection) = builder.handshake(carrier).await?;
     let session = VlessMuxSession::new(sender);
     let weak = Arc::downgrade(&session);
-    let driver = tokio::spawn(async move {
+    let driver = crate::runtime::spawn_owned(async move {
         let result = connection.await;
         if let Some(session) = weak.upgrade() {
             if let Err(error) = result {
@@ -423,7 +423,7 @@ pub(crate) async fn connect(
             session.driver_finished();
         }
     });
-    session.install_driver(driver.abort_handle());
+    session.install_driver(driver);
     Ok(session)
 }
 

@@ -79,6 +79,9 @@ pub async fn resolve_with(
     host: &str,
 ) -> io::Result<Vec<IpAddr>> {
     let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Some(ip) = crate::runtime::pinned_server_address(host) {
+        return Ok(vec![ip]);
+    }
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![ip]);
     }
@@ -96,11 +99,27 @@ pub async fn resolve_with(
             }
         }
     }
-    let addrs: Vec<IpAddr> = tokio::net::lookup_host(format!("{}:0", host))
+    let addrs: Vec<IpAddr> = lookup_host(host, 0)
         .await?
+        .into_iter()
         .map(|a| a.ip())
         .collect();
     Ok(addrs)
+}
+
+/// Resolve with the platform resolver, retaining its blocking job when scoped
+/// to a native runtime/health/DNS owner. Cancellation never detaches owned libc work.
+pub async fn lookup_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    #[cfg(feature = "native-api")]
+    if let Some(result) = crate::runtime::lookup_host_owned(host, port).await {
+        return result;
+    }
+    tokio::net::lookup_host((host, port))
+        .await
+        .map(Iterator::collect)
 }
 
 impl BootstrapResolver {

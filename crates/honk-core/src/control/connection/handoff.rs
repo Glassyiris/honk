@@ -232,12 +232,16 @@ impl TcpFlowGuard {
     pub(super) fn track_if_enabled(
         &mut self,
         make_entry: impl FnOnce() -> crate::connection_tracker::ConnectionEntry,
+        owner: crate::connection_tracker::ConnectionOwner,
     ) -> Option<String> {
         assert!(
             self.tracker_id.is_none(),
             "TCP flow tracker attached more than once"
         );
-        let id = self.tracker.register_if_enabled(make_entry)?;
+        if !self.tracker.is_enabled() {
+            return None;
+        }
+        let id = self.tracker.register_owned(make_entry(), owner);
         self.tracker_id = Some(id.clone());
         Some(id)
     }
@@ -259,28 +263,29 @@ impl TcpFlowGuard {
         }
     }
 
-    pub(super) async fn retire(mut self) {
-        self.untrack();
+    pub(super) async fn retire(mut self) -> bool {
         let now_ns = match crate::control::janitor::monotonic_now_ns() {
             Ok(now_ns) => now_ns,
             Err(error) => {
                 error!(%error, "TCP flow retirement could not read monotonic clock");
-                return;
+                return false;
             }
         };
         let retire_cutoff_ns = now_ns.saturating_sub(1);
         let ebpf = Arc::clone(&self.ebpf);
         let mut backend = ebpf.write().await;
-        if self.release_pin() != Some(true) {
-            return;
+        match self.release_pin() {
+            Some(false) => return true,
+            Some(true) => {}
+            None => return false,
         }
 
         let current = match backend.tcp_conn_state_lookup(&self.tuples) {
             Ok(Some(current)) => current,
-            Ok(None) => return,
+            Ok(None) => return true,
             Err(error) => {
                 error!(%error, ?self.tuples, "TCP flow retirement lookup failed");
-                return;
+                return false;
             }
         };
         match backend.conn_state_remove_if_unchanged(&[(self.tuples, current)], retire_cutoff_ns) {
@@ -290,9 +295,11 @@ impl TcpFlowGuard {
                         .fetch_add(removed, std::sync::atomic::Ordering::Relaxed);
                 }
                 debug!(removed, ?self.tuples, "TCP flow conn-state retired");
+                true
             }
             Err(error) => {
                 error!(%error, ?self.tuples, "TCP flow conditional retirement failed");
+                false
             }
         }
     }
@@ -303,6 +310,13 @@ impl Drop for TcpFlowGuard {
         self.untrack();
         self.release_pin();
     }
+}
+
+pub(super) struct ModeDecision {
+    pub(super) name: String,
+    pub(super) constraint: crate::control::reload::OutboundConstraint,
+    #[cfg(feature = "native-api")]
+    pub(super) group_id: Option<String>,
 }
 
 impl ControlPlaneHandle {
@@ -446,43 +460,71 @@ impl ControlPlaneHandle {
         }
     }
 
-    /// Clash mode override (approximate clash semantics), applied after the
-    /// eBPF handoff / userspace Router produced an outbound and before
-    /// `resolve_outbound_nodes`:
-    ///
-    /// - mode `Direct` forces `direct`;
-    /// - mode `Global` forces the current GLOBAL selection (a group or node
-    ///   name, resolved via the normal path; when it resolves to nothing the
-    ///   original routing result is kept);
-    /// - `block` results and `must` results (dae `(must)` rules / eBPF
-    ///   handoff must flag) are never overridden — both are final routing
-    ///   decisions that mode switches must not bypass.
-    pub(super) async fn apply_mode_override(&self, outbound_name: String, must: bool) -> String {
-        let Some(ref mode_state) = self.mode_state else {
-            return outbound_name;
+    /// Preserve exact native target identity until the selected generation is pinned.
+    pub(super) async fn apply_mode_override(
+        &self,
+        outbound_name: String,
+        must: bool,
+    ) -> ModeDecision {
+        let mut result = ModeDecision {
+            name: outbound_name,
+            constraint: Default::default(),
+            #[cfg(feature = "native-api")]
+            group_id: None,
         };
-        if must || outbound_name == "block" {
-            return outbound_name;
+        let Some(mode_state) = &self.mode_state else {
+            return result;
+        };
+        if must || result.name == "block" {
+            return result;
         }
-        let state = { mode_state.read().clone() };
-        // The GLOBAL selection needs a config lookup to decide whether it
-        // resolves to a group/node; only do it in Global mode.
-        let mut selection_resolvable = false;
-        if state.is_global() && !state.global_selection.is_empty() {
-            let selection = &state.global_selection;
-            selection_resolvable = *selection == "direct" || *selection == "block" || {
-                let config = self.config.read().await;
-                config.groups.iter().any(|g| g.name == *selection)
-                    || config.nodes.iter().any(|n| n.name == *selection)
+        let state = mode_state.read().clone();
+        #[cfg(feature = "native-api")]
+        if state.native_enabled {
+            let config = self.config.read().await;
+            let state = mode_state.read().clone();
+            let Some(native) = &self.native else {
+                result.name = "block".into();
+                return result;
             };
-            if !selection_resolvable {
-                debug!(
-                    "clash Global selection '{}' does not resolve; keeping routed outbound '{}'",
-                    selection, outbound_name
-                );
+            let catalog = native.catalog.snapshot();
+            match state.native_override(&result.name, must, &config, &catalog.groups) {
+                crate::mode::ModeOverride::Unchanged => {}
+                crate::mode::ModeOverride::Direct => result.name = "direct".into(),
+                crate::mode::ModeOverride::Block => result.name = "block".into(),
+                crate::mode::ModeOverride::Node(id) => {
+                    result.name = config
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == id)
+                        .expect("validated mode target")
+                        .name
+                        .clone();
+                    result.constraint = crate::control::reload::OutboundConstraint::Node(id);
+                }
+                crate::mode::ModeOverride::Group(name) => {
+                    result.group_id = catalog.groups.get(&name).cloned();
+                    result.name = name;
+                }
             }
+            return result;
         }
-        state.override_outbound(&outbound_name, false, selection_resolvable)
+        let selection_resolvable = if state.is_global() && !state.global_selection.is_empty() {
+            let config = self.config.read().await;
+            matches!(state.global_selection.as_str(), "direct" | "block")
+                || config
+                    .groups
+                    .iter()
+                    .any(|group| group.name == state.global_selection)
+                || config
+                    .nodes
+                    .iter()
+                    .any(|node| node.name == state.global_selection)
+        } else {
+            false
+        };
+        result.name = state.override_outbound(&result.name, false, selection_resolvable);
+        result
     }
 }
 

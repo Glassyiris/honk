@@ -430,7 +430,13 @@ fn native_probe_context_keeps_exact_members_without_expanding_probe_set() {
             .map(|(_, leaf)| leaf.id)
             .collect::<Vec<_>>()
     );
-    manager.set_selector_choice("child", "child");
+    manager
+        .set_selector_choice(
+            "child",
+            "child",
+            honk_outbound::group::SelectorNetworks::Both,
+        )
+        .unwrap();
     let probes = manager.native_delay_test_members("parent");
     assert_eq!(
         probes
@@ -443,4 +449,144 @@ fn native_probe_context_keeps_exact_members_without_expanding_probe_set() {
         ]
     );
     assert_eq!(probes.len(), manager.delay_test_members("parent").len());
+}
+
+#[test]
+fn group_health_falls_back_by_member_and_full_measurement_key() {
+    use honk_outbound::alive::{
+        HealthMeasurement, HealthPurpose, HealthState, HealthTransport, HealthWarmth,
+        NativeGroupProbeContext, ProbeDomain,
+    };
+
+    let mut config = fixture();
+    let node = &config.nodes[0];
+    for (name, check_url) in [
+        ("other", None),
+        ("custom", Some("https://example.test/".into())),
+    ] {
+        config.groups.push(Group {
+            name: name.into(),
+            nodes: vec![node.id],
+            check_url,
+            ..Default::default()
+        });
+    }
+    let manager = GroupManager::new(&config.groups, &config.nodes);
+    let identity = Catalog::new(&config).snapshot();
+    let alive = AliveDialerSet::new();
+    alive.enable_native_observations();
+    alive.register_node(node.id, node.name.clone(), "127.0.0.1:1".into());
+    let ticket = alive.native_probe_ticket(node.id);
+    let tcp = NativeHealthObservation::probe(
+        ProbeDomain::Tcp,
+        HealthMeasurement::TcpConnect,
+        IpVersion::V4,
+        Some(Duration::from_millis(12)),
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+    );
+    let http = NativeHealthObservation {
+        measurement: HealthMeasurement::HttpHeaders,
+        ..tcp
+    };
+    let dns = NativeHealthObservation {
+        measurement: HealthMeasurement::DnsRoundTrip,
+        purpose: HealthPurpose::Dns,
+        ..tcp
+    };
+    let udp_dns = NativeHealthObservation {
+        transport: HealthTransport::Udp,
+        ..dns
+    };
+    let global = [
+        tcp,
+        http,
+        NativeHealthObservation {
+            warmth: HealthWarmth::Warm,
+            ..http
+        },
+        NativeHealthObservation {
+            ip_version: IpVersion::V6,
+            ..http
+        },
+        dns,
+        udp_dns,
+        NativeHealthObservation {
+            purpose: HealthPurpose::Data,
+            ..udp_dns
+        },
+    ];
+    for sample in global {
+        assert!(alive.complete_native_probe(&ticket, None, sample));
+    }
+    for sample in [http, udp_dns] {
+        assert!(alive.complete_native_probe(
+            &ticket,
+            Some(NativeGroupProbeContext {
+                group_id: identity.groups["parent"].parse().unwrap(),
+                member_id: node.id,
+            }),
+            NativeHealthObservation {
+                state: HealthState::Unavailable,
+                latency: None,
+                error: Some("probe_failed"),
+                ..sample
+            },
+        ));
+    }
+    let rows = group_health(
+        &manager,
+        manager.native_group("parent").unwrap(),
+        &identity,
+        &alive,
+    );
+    assert_eq!(rows.len(), global.len());
+    for row in &rows {
+        assert_eq!(row["member_id"], node.id.to_string());
+        assert_eq!(row["resolved_leaf_node_id"], node.id.to_string());
+        let scoped = row["ip_version"] == "ipv4"
+            && row["warmth"] == "cold"
+            && (row["measurement"] == "http_headers"
+                || row["transport"] == "udp" && row["purpose"] == "dns");
+        assert_eq!(row["state"], if scoped { "unavailable" } else { "healthy" });
+        assert_eq!(
+            row["latency_ms"],
+            if scoped { Value::Null } else { json!(12.0) }
+        );
+    }
+    for sample in global {
+        assert!(rows.iter().any(|row| {
+            row["transport"] == json!(sample.transport)
+                && row["purpose"] == json!(sample.purpose)
+                && row["measurement"] == json!(sample.measurement)
+                && row["ip_version"]
+                    == if sample.ip_version == IpVersion::V4 {
+                        "ipv4"
+                    } else {
+                        "ipv6"
+                    }
+                && row["warmth"] == json!(sample.warmth)
+        }));
+    }
+    let other = group_health(
+        &manager,
+        manager.native_group("other").unwrap(),
+        &identity,
+        &alive,
+    );
+    assert_eq!(other.len(), global.len());
+    assert!(
+        other
+            .iter()
+            .all(|row| row["state"] == "healthy" && row["latency_ms"] == json!(12.0))
+    );
+    assert!(
+        group_health(
+            &manager,
+            manager.native_group("custom").unwrap(),
+            &identity,
+            &alive
+        )
+        .is_empty()
+    );
+    assert_eq!(alive.native_observations(node.id), global);
 }

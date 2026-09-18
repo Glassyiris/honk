@@ -30,6 +30,7 @@ mod retirement;
 mod source;
 #[cfg(all(test, feature = "rprx"))]
 mod source_tests;
+use retirement::{EndpointIoGuard, RetirementIo};
 pub(crate) use retirement::{EndpointRemoval, RemovalReason};
 #[cfg(feature = "rprx")]
 pub(in crate::control) use source::{SourceAttachment, VlessSourcePreparation};
@@ -95,11 +96,14 @@ pub struct UdpEndpoint {
     download: Arc<AtomicU64>,
     score_reporter: Mutex<Option<ScoreReporter>>,
     health_family: honk_outbound::alive::IpVersion,
+    #[cfg(all(test, feature = "rprx"))]
+    source_reply_hook: Mutex<Option<Arc<source::ReplyAdmissionHook>>>,
     tracker_id: Mutex<Option<String>>,
     #[cfg(feature = "native-api")]
     native_flow: Option<Arc<crate::native_api::flows::FlowGuard>>,
     #[cfg(feature = "native-api")]
     native_pool: std::sync::Weak<UdpEndpointPool>,
+    retirement: EndpointIoGuard,
 }
 
 impl UdpEndpoint {
@@ -197,6 +201,8 @@ impl UdpEndpoint {
             pending_reply_next: AtomicU64::new(0),
             upload: Arc::new(AtomicU64::new(0)),
             download: Arc::new(AtomicU64::new(0)),
+            #[cfg(all(test, feature = "rprx"))]
+            source_reply_hook: Mutex::new(None),
             tracker_id: Mutex::new(None),
             score_reporter: Mutex::new(score_reporter),
             health_family,
@@ -204,6 +210,7 @@ impl UdpEndpoint {
             native_flow: None,
             #[cfg(feature = "native-api")]
             native_pool: std::sync::Weak::new(),
+            retirement: EndpointIoGuard(RetirementIo::new()),
         }
     }
 
@@ -485,8 +492,10 @@ impl UdpEndpoint {
 
     #[cfg(feature = "rprx")]
     fn begin_source_reply(&self, owner_id: u64) -> bool {
-        let _send_gate = self.send_gate.lock();
-        !self.dead.load(Ordering::Acquire) && self.source_owner_id() == Some(owner_id)
+        match &self.transport {
+            EndpointTransport::Source(source) => source.reply_admitted(owner_id),
+            EndpointTransport::Flow(_) => false,
+        }
     }
 
     #[cfg(feature = "rprx")]
@@ -611,6 +620,11 @@ impl UdpReplySocketFactory for SystemUdpReplySocketFactory {
     fn create(&self, source: SocketAddr) -> io::Result<UdpSocket> {
         super::new_udp_reply_socket(source)
     }
+}
+
+pub(in crate::control) struct UdpShutdown {
+    pub joined: bool,
+    pub graceful: bool,
 }
 
 /// Pool state is a single map entry per tuple: Initializing, Ready, or the

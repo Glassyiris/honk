@@ -15,9 +15,10 @@ use crate::group::{ScoreFeedback, ScoreSelectionContext};
 pub use observations::{
     HealthMeasurement, HealthPurpose, HealthState, HealthTransport, HealthWarmth,
     NativeGroupHealthObservation, NativeGroupProbeContext, NativeHealthObservation,
-    ProbeMeasurement, UrlProbeMember,
+    NativeProbeTicket, ProbeMeasurement, UrlProbeMember,
 };
 use parking_lot::{Mutex, RwLock};
+pub use probe::{HealthCheckError, HealthProbePermit, ProbeCancellation};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -111,6 +112,7 @@ pub enum HttpProbeResult {
     SetupFailure(String),
     ExchangeFailure(String),
     LocalRefusal(crate::proxy::PacketRejection),
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -137,6 +139,7 @@ impl From<HttpProbeResult> for HttpProbeOutcome {
 /// is healthy and carries a ranking RTT.
 /// Implementations own timeout handling; callers do not wrap the future in a
 /// competing deadline.
+/// Cancellation must stop network work and join owned children before returning.
 pub trait HttpProber: Send + Sync {
     fn probe_http(
         &self,
@@ -144,6 +147,7 @@ pub trait HttpProber: Send + Sync {
         addr: SocketAddr,
         url: &str,
         timeout: Duration,
+        cancel: ProbeCancellation,
     ) -> Pin<Box<dyn Future<Output = HttpProbeOutcome> + Send + 'static>>;
 }
 
@@ -182,11 +186,13 @@ pub struct UdpProbeOutcome {
 /// never see that failure mode.
 /// Implementations own timeout handling; callers do not wrap the future in a
 /// competing deadline.
+/// Cancellation preserves completed measurements and joins owned children.
 pub trait UdpProber: Send + Sync {
     fn probe_udp(
         &self,
         node_id: Uuid,
         timeout: Duration,
+        cancel: ProbeCancellation,
     ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>>;
 }
 
@@ -351,6 +357,12 @@ pub struct AliveDialerSet {
     trigger_tx: tokio::sync::mpsc::Sender<Uuid>,
     trigger_rx: Mutex<Option<tokio::sync::mpsc::Receiver<Uuid>>>,
     trigger_pending: Mutex<HashSet<Uuid>>,
+    health_control: Mutex<probe::HealthControl>,
+    health_mode: tokio::sync::watch::Sender<probe::HealthMode>,
+    health_changed: tokio::sync::Notify,
+    external_probes: Mutex<tokio::task::JoinSet<()>>,
+    #[cfg(feature = "native-api")]
+    health_resolver_tasks: Mutex<Option<Arc<crate::runtime::TaskOwner>>>,
     /// Optional `SO_MARK` value applied to probe sockets so the eBPF datapath
     /// treats them as control-plane traffic and does not re-route them.
     so_mark: Option<u32>,
@@ -423,6 +435,7 @@ impl AliveDialerSet {
     pub fn new() -> Self {
         const TRIGGER_QUEUE_CAPACITY: usize = 256;
         let (tx, rx) = tokio::sync::mpsc::channel(TRIGGER_QUEUE_CAPACITY);
+        let (health_mode, _) = tokio::sync::watch::channel(probe::HealthMode::Running(0));
         Self {
             states: RwLock::new(HashMap::new()),
             collections: RwLock::new(HashMap::new()),
@@ -436,6 +449,12 @@ impl AliveDialerSet {
             trigger_tx: tx,
             trigger_rx: Mutex::new(Some(rx)),
             trigger_pending: Mutex::new(HashSet::new()),
+            health_control: Mutex::new(probe::HealthControl::default()),
+            health_mode,
+            health_changed: tokio::sync::Notify::new(),
+            external_probes: Mutex::new(tokio::task::JoinSet::new()),
+            #[cfg(feature = "native-api")]
+            health_resolver_tasks: Mutex::new(None),
             so_mark: None,
             last_emergency_tcp: Mutex::new(HashMap::new()),
             last_emergency_udp: Mutex::new(HashMap::new()),
@@ -538,6 +557,16 @@ impl AliveDialerSet {
     /// Resolve `host` via the installed hook. Typed local refusal is returned;
     /// ordinary empty or failed hook results retain the system fallback.
     pub async fn resolve_host(&self, host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
+        let permit = self.acquire_health_probe()?;
+        let cancel = permit.cancellation();
+        let operation = self.resolve_host_inner(host, port);
+        cancel
+            .run(cancel.scope_resolution(operation))
+            .await
+            .ok_or(HealthCheckError::Paused)?
+    }
+
+    async fn resolve_host_inner(&self, host: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
         let hook = self.resolver.read().clone();
         if let Some(hook) = hook {
             match hook(host.to_string(), port).await {
@@ -553,9 +582,8 @@ impl AliveDialerSet {
                 }
             }
         }
-        Ok(tokio::net::lookup_host((host, port))
+        Ok(crate::bootstrap::lookup_host(host, port)
             .await
-            .map(|it| it.collect())
             .unwrap_or_default())
     }
 
@@ -714,6 +742,10 @@ impl AliveDialerSet {
     }
 
     pub fn trigger_probe(&self, node_id: Uuid) {
+        let _control = self.health_control.lock();
+        if !matches!(*self.health_mode.borrow(), probe::HealthMode::Running(_)) {
+            return;
+        }
         let mut pending = self.trigger_pending.lock();
         if !pending.insert(node_id) {
             return;

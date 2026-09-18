@@ -241,3 +241,36 @@ async fn dependency_change_before_rename_rejects_without_overwriting_external_co
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn suspended_admission_rejects_without_waiting_for_busy_coordinator() {
+    let mut fixture = Fixture::new(Access::Admin, true).await;
+    let before = fixture.get(CONFIG).await;
+    let main = source(&before, &fixture.originals["main.dae"]);
+    let accepted = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    let release = fixture.next_reload().await;
+    let (phase, receiver) = tokio::sync::watch::channel(crate::control::EnginePhase::Suspending);
+    fixture.service.attach_phase(receiver);
+    let candidate = fixture.originals["main.dae"].replace("fallback: direct", "fallback: block");
+    let response = fixture
+        .replace(main, &candidate)
+        .header("idempotency-key", "during-suspend")
+        .send()
+        .await
+        .unwrap();
+    error(response, StatusCode::CONFLICT, "state_conflict").await;
+    assert_eq!(
+        std::fs::read_to_string(fixture.path("main.dae")).unwrap(),
+        fixture.originals["main.dae"]
+    );
+    phase.send_replace(crate::control::EnginePhase::Running);
+    release.send(()).unwrap();
+    assert_eq!(fixture.terminal(&accepted).await["status"], "succeeded");
+    fixture.barrier().await;
+    assert_eq!(fixture.reloads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        std::fs::read_to_string(fixture.path("main.dae")).unwrap(),
+        fixture.originals["main.dae"]
+    );
+    fixture.shutdown().await;
+}

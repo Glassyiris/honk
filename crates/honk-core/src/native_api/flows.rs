@@ -47,6 +47,8 @@ pub(crate) struct FlowStore {
 
 struct Store {
     recording: bool,
+    max_records: usize,
+    retention: Duration,
     records: VecDeque<Record>,
     snapshots: Vec<Snapshot>,
     tombstones: VecDeque<(String, Instant)>,
@@ -94,6 +96,7 @@ pub(crate) struct FlowGuard {
 pub(crate) struct ConnectionEvidence {
     pub(crate) chain: Vec<String>,
     pub(crate) chain_source: &'static str,
+    pub(crate) rule_id: Option<String>,
     pub(crate) rule_expression: Option<String>,
     pub(crate) rule_source: &'static str,
     pub(crate) domain_source: Option<&'static str>,
@@ -104,6 +107,8 @@ impl Store {
     fn new(recording: bool) -> Self {
         Self {
             recording,
+            max_records: MAX_RECORDS,
+            retention: TERMINAL_TTL,
             records: VecDeque::new(),
             snapshots: Vec::new(),
             tombstones: VecDeque::new(),
@@ -134,6 +139,23 @@ impl FlowStore {
         }
         *store = Store::new(enabled);
         self.gap(&store, None, "recording_changed");
+    }
+
+    pub(crate) fn set_limits(&self, max_records: usize, retention_seconds: u64) {
+        let mut store = self.inner.lock();
+        if max_records < store.max_records
+            || Duration::from_secs(retention_seconds) < store.retention
+        {
+            store.snapshots.clear();
+            store.snapshot_bytes = 0;
+        }
+        store.max_records = max_records;
+        store.retention = Duration::from_secs(retention_seconds);
+        let now = Instant::now();
+        self.prune(&mut store, now);
+        self.enforce_limit(&mut store, now);
+        store.records.shrink_to_fit();
+        store.snapshots.shrink_to_fit();
     }
 
     pub(crate) fn maintain(&self) {
@@ -210,6 +232,7 @@ impl FlowStore {
             } else {
                 "unknown"
             },
+            rule_id: summary["rule_id"].as_str().map(str::to_owned),
             rule_expression: summary["rule_expression"].as_str().map(str::to_owned),
             rule_source: rule_source(summary["rule_source"].as_str().unwrap_or("unknown")),
             domain_source: summary["domain_source"].as_str().map(domain_source),
@@ -284,7 +307,7 @@ impl FlowStore {
     }
 
     fn enforce_limit(&self, store: &mut Store, now: Instant) {
-        while store.records.len() > MAX_RECORDS || store.bytes() > MAX_BYTES {
+        while store.records.len() > store.max_records || store.bytes() > MAX_BYTES {
             if store.records.is_empty() {
                 break;
             }
@@ -308,7 +331,7 @@ impl FlowStore {
         while index < store.records.len() {
             if store.records[index]
                 .ended
-                .is_some_and(|ended| now.saturating_duration_since(ended) >= TERMINAL_TTL)
+                .is_some_and(|ended| now.saturating_duration_since(ended) >= store.retention)
             {
                 self.evict(store, index, now, "evicted");
             } else {
@@ -581,20 +604,29 @@ impl FlowGuard {
         });
     }
 
-    pub(crate) fn routed(&self, outbound: &str, expression: Option<&str>, source: &'static str) {
+    pub(crate) fn routed(
+        &self,
+        outbound: &str,
+        rule_id: Option<&str>,
+        expression: Option<&str>,
+        source: &'static str,
+    ) {
         let Some(store) = self.store.upgrade() else {
             return;
         };
         store.mutate(&self.id, |record| {
             let mut redacted = record.redacted;
             let outbound = safe_optional(Some(outbound), &mut redacted);
+            let rule_id = safe_optional(rule_id, &mut redacted);
             let expression = safe_optional(expression, &mut redacted);
             let source = rule_source(source);
             let changed = record.summary["outbound"] != json!(outbound)
+                || record.summary["rule_id"] != json!(rule_id)
                 || record.summary["rule_expression"] != json!(expression)
                 || record.summary["rule_source"] != source
                 || record.redacted != redacted;
             record.summary["outbound"] = json!(outbound);
+            record.summary["rule_id"] = json!(rule_id);
             record.summary["rule_expression"] = json!(expression);
             record.summary["rule_source"] = json!(source);
             record.redacted = redacted;

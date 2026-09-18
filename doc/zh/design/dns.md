@@ -255,6 +255,8 @@ worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired
 
 Provider 持有、回收退役 supervisor，并在关闭时 join。监听 socket 与进程级物理资源限制仍共享，因此代际隔离不承诺描述符耗尽后仍可服务。
 
+原生 suspend 是显式关闭连接的无网络负载边界：停止独立 listener、关闭 provider query admission、取消并 join foreground lease/应答 I/O、refresh、DNS transport 与其协议任务。保留稳定 DnsService/controller、答案缓存、persister 和路由投影 owner；不把 controller 的终止关闭当可逆暂停。Resume 使用 accepted 的 hosts/geo/router 快照和保留缓存构建 fresh forwarder、DNS runtime/fork，仍共享进程物理资源 gate，不恢复旧 flight 或重放数据。已开始的阻塞系统解析必须实际结束并 join，取消 waiter 不是完成证明，因而总暂停时间不保证硬上限。
+
 SIGHUP 在 commit point 前构建 policy、`/etc/hosts`、组、路由、上游 transport、投影数据与 outbound runtime。发布在持有控制面 routing/config lock 时进行；准备失败会完整保留当前 generation。`dns.bind` 的语义变化是例外：监听器所有权为进程级，reload 会被拒绝并要求重启。
 
 路由发布在准入前拒绝旧代排队元数据；已准入查询保留原代 lease。20 位 carrier 使用持久化、启动周期内不回绕的分配器，也计入只替换 descriptor 的 NFQUEUE fence。失败预留值不复用，普通重启不重置耗尽；见[路由发布](./routing.md)。
@@ -267,7 +269,15 @@ DNS 诊断使用相互独立、单调递增的 atomic counter。类别覆盖缓�
 
 结构化 DNS 失败事件将错误压缩为有界 `error_kind` 类别：forwarder（`engine`、`exchange`、`response`、`internal`、`rejected_plan`、`overloaded`）、持久化（`worker_closed`、`ack_dropped`、`worker_failed`、`database`）、投影（`map_full`、`backend_write`）及 transport（`exchange_failed`，另带有界 transport label）。这些事件字段不包含 query name、upstream 地址或自由格式 error payload。
 
-该快照仅供内部使用。honk 不公开 DNS metrics endpoint、配置开关或 DNS telemetry API。
+上述 atomic counter 快照仅供内部使用，不公开 DNS metrics endpoint。原生 API 另从真实 DNS owner 提供有界 query/cache/log 资源，不能把这些不同观测面视为同一原子快照。
+
+### 原生诊断、精确失效与客户端历史
+
+`/api/v1/dns/query` 把 cache access 与可选强制配置 upstream 作为同一个请求局部 options 贯穿 planning、preferred-family sibling 和 exchange；一次请求固定同一 DNS generation。强制 upstream 替换普通请求路由，但保留 hosts/strategy 与响应侧 requery，hosts 命中不虚构 upstream exchange。`bypass` 不读正/负/stale 答案、不写缓存、不加入普通 singleflight/refresh，也不启动后台 refresher；普通生产请求不带 override 时语义不变。最多 8 个不同 type，共享 10 秒请求期限、262144 字节完整 JSON 预算与每分钟 30 次 principal/global 限额。
+
+Cache list 的 opaque ID 对应 exact-key incarnation，检查不触发 LRU promotion 或 hit 统计；`persistent:false` 明确只覆盖运行时记录。分页固定 filters/instance，最多 8 个 snapshot、30 秒和合计 8 MiB，底层淘汰不释放仍由 snapshot 持有的预算。按 ID 删除只影响该 incarnation，按完整 name/type 删除可覆盖不同 exact 变体。原生与 Clash 失效共用 DNS/cache owner 的 publication→shard 屏障，等待持久化删除及此前 queued put 的确认；旧 foreground/refresh 不能复活已经确认失效的记录。Flush 仅清答案缓存，不清域名路由投影，持久化失败不能假报成功。
+
+`record_dns_log` 默认 true，进程级 ring 在客户端真实完成点捕获普通 DNS 和有来源的客户端解析；排除原生/Clash diagnostics 与背景 refresh 重复项。保留实际 SocketAddr、问题、最终状态、缓存/上游/路由与时间，最多 512 条/8 MiB，wire 与元数据一起计费；不截断 RRset，超限淘汰整条旧记录。列表最新优先，支持 name/type/src 过滤、最多 500 条一页及绑定过滤器的 cursor，淘汰会使旧 cursor 失效。Query/cache/log 投影不能完整装入 262144 字节时返回 503 与 Retry-After，不返回伪完整答案。关闭 recorder 需重启并释放缓冲；临时缩容由原子 runtime settings owner 处理，显式配置激活重置，provider/network refresh 保留。
 
 ## 相关文档
 

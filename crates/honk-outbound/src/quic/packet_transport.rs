@@ -257,15 +257,17 @@ impl TransportQuinnSocket {
         self.recv_error().or_else(|| self.send_error())
     }
 
-    async fn close_tasks(&self) {
+    async fn close_tasks(&self) -> bool {
         let mut tasks = self.tasks.lock().await;
+        let mut joined = true;
         for task in tasks.iter() {
             task.abort();
         }
         for task in tasks.iter_mut() {
-            let _ = task.await;
+            joined &= !task.await.is_err_and(|error| !error.is_cancelled());
         }
         tasks.clear();
+        joined
     }
 }
 
@@ -498,6 +500,18 @@ pub fn packet_transport_endpoint_with_metrics(
     remote: SocketAddr,
     metrics_enabled: bool,
 ) -> io::Result<PacketTransportEndpoint> {
+    let (socket, endpoint) = packet_transport_endpoint_parts(transport, remote, metrics_enabled)?;
+    Ok(PacketTransportEndpoint {
+        endpoint: endpoint?,
+        socket,
+    })
+}
+
+fn packet_transport_endpoint_parts(
+    transport: Arc<dyn PacketTransport>,
+    remote: SocketAddr,
+    metrics_enabled: bool,
+) -> io::Result<(Arc<TransportQuinnSocket>, io::Result<Endpoint>)> {
     if transport.relay_addr() != remote {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -506,14 +520,10 @@ pub fn packet_transport_endpoint_with_metrics(
     }
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
+    let config = endpoint_config_with_mtu(1252)?;
     let socket = TransportQuinnSocket::new_with_metrics(transport, remote, metrics_enabled);
-    let endpoint = Endpoint::new_with_abstract_socket(
-        endpoint_config_with_mtu(1252)?,
-        None,
-        socket.clone(),
-        runtime,
-    )?;
-    Ok(PacketTransportEndpoint { endpoint, socket })
+    let endpoint = Endpoint::new_with_abstract_socket(config, None, socket.clone(), runtime);
+    Ok((socket, endpoint))
 }
 
 /// Establish a QUIC connection through a proxied UDP tunnel and time the
@@ -528,25 +538,47 @@ pub async fn quic_handshake_probe(
     server_name: &str,
     config: &ClientConfig,
     timeout: Duration,
+    cancel: crate::alive::ProbeCancellation,
 ) -> anyhow::Result<crate::alive::ProbeMeasurement> {
-    let endpoint = packet_transport_endpoint(transport, target)?;
-
-    let start = Instant::now();
-    let connecting = endpoint
-        .endpoint()
-        .connect_with(config.clone(), target, server_name)
-        .context("create QUIC connecting")?;
-    let conn = tokio::time::timeout(timeout, connecting)
-        .await
-        .context("QUIC handshake timeout")??;
-    let measured = crate::alive::ProbeMeasurement {
-        latency: start.elapsed(),
-        observed_at: std::time::SystemTime::now(),
+    if cancel.is_cancelled() {
+        return Err(crate::alive::HealthCheckError::Paused.into());
+    }
+    let (socket, endpoint) = packet_transport_endpoint_parts(transport, target, false)?;
+    let endpoint = match endpoint {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            if !socket.close_tasks().await {
+                cancel.report_cleanup_failure();
+            }
+            return Err(error.into());
+        }
     };
-    conn.close(quinn::VarInt::from_u32(0), b"probe");
-    drop(conn);
-    endpoint.close(Duration::ZERO).await;
-    Ok(measured)
+    let result = async {
+        let start = Instant::now();
+        let connecting = endpoint
+            .connect_with(config.clone(), target, server_name)
+            .context("create QUIC connecting")?;
+        let conn = cancel
+            .run(tokio::time::timeout(timeout, connecting))
+            .await
+            .ok_or(crate::alive::HealthCheckError::Paused)?
+            .context("QUIC handshake timeout")??;
+        let measured = crate::alive::ProbeMeasurement {
+            latency: start.elapsed(),
+            observed_at: std::time::SystemTime::now(),
+        };
+        conn.close(quinn::VarInt::from_u32(0), b"probe");
+        Ok(measured)
+    }
+    .await;
+    endpoint.close(quinn::VarInt::from_u32(0), b"probe closed");
+    let idle = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
+    let joined = socket.close_tasks().await;
+    if idle.is_err() || !joined {
+        cancel.report_cleanup_failure();
+        return result.and_then(|_| Err(crate::alive::HealthCheckError::WorkerFailed.into()));
+    }
+    result
 }
 
 #[cfg(test)]
@@ -960,6 +992,7 @@ mod probe_tests {
             "localhost",
             &config,
             Duration::from_secs(5),
+            crate::alive::ProbeCancellation::default(),
         )
         .await
         .unwrap();

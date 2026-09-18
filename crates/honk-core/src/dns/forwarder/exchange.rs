@@ -16,7 +16,7 @@ use honk_ebpf_common::DAE_BYPASS_MARK;
 
 use super::message::{build_dns_query, new_asis_socket_with_mark};
 use super::ttl::{patch_txid, rewrite_answer_ttls};
-use super::{DnsForwardError, DnsForwarder, ResolveMode};
+use super::{CacheAccess, DnsForwardError, DnsForwarder, ResolveMode, ResolveOptions};
 
 impl DnsForwarder {
     pub(crate) async fn exchange(
@@ -50,7 +50,7 @@ impl DnsForwarder {
         requery_history: Vec<String>,
         mode: ResolveMode,
     ) -> Result<DnsOutcome, DnsForwardError> {
-        self.outcome_from_query(
+        let outcome = self.outcome_from_query(
             engine,
             prepared.query(),
             prepared.domain_arc(),
@@ -63,7 +63,10 @@ impl DnsForwarder {
             final_upstream,
             requery_history,
             mode,
-        )
+        )?;
+        #[cfg(feature = "native-api")]
+        let outcome = outcome.with_route(prepared.request_source());
+        Ok(outcome)
     }
 
     pub(crate) fn local_outcome_from_wire(
@@ -151,12 +154,13 @@ impl DnsForwarder {
         cache_key: &CacheKey,
         raw_query: &[u8],
         mode: ResolveMode,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<(Vec<u8>, u64)> {
         if !self.cache_enabled {
             return None;
         }
         let cache = self.cache_service().await;
-        let entry = cache.get_stale_exact(cache_key, matches!(mode, ResolveMode::Strict))?;
+        let (entry, revision) =
+            cache.get_stale_exact(cache_key, matches!(mode, ResolveMode::Strict))?;
         let mut response = entry.response.to_vec();
         if self.stale_reply_ttl != 0 {
             rewrite_answer_ttls(&mut response, self.stale_reply_ttl);
@@ -165,13 +169,14 @@ impl DnsForwarder {
             response[0..2].copy_from_slice(&raw_query[0..2]);
         }
         debug!("DNS forwarder serving stale cache after upstream failure");
-        Some(response)
+        Some((response, revision))
     }
 
     /// Spawn a deduplicated background refresh for a hot entry nearing
     /// expiry (stale-while-revalidate). The refresh bypasses the cache read
     /// so it always reaches the upstream; the normal pipeline writes the
     /// fresh answer back.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn maybe_spawn_refresh(
         &self,
         raw_query: &[u8],
@@ -180,6 +185,7 @@ impl DnsForwarder {
         flight_key: CacheKey,
         publication_epoch: PublicationEpoch,
         refreshing: u64,
+        options: &ResolveOptions,
     ) {
         let ingress = flight_key.ingress();
         let crate::dns::singleflight::FlightRole::Leader(owner) =
@@ -189,19 +195,24 @@ impl DnsForwarder {
         };
         let this = self.clone();
         let query = raw_query.to_vec();
+        let options = ResolveOptions {
+            cache: CacheAccess::Refresh,
+            forced_upstream: options.forced_upstream.clone(),
+        };
         let spawned = self.refresh_tasks.spawn(async move {
             let result = crate::dns::engine::pipeline::resolve_with_owner(
                 &this,
                 &query,
                 metadata,
                 ingress,
-                true,
+                &options,
                 mode,
                 crate::dns::engine::pipeline::ResolveExecution::refresh(
                     owner,
                     publication_epoch,
                     refreshing,
                 ),
+                None,
             )
             .await;
             if result.is_err() {

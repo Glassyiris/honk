@@ -334,7 +334,7 @@ impl super::GroupManager {
         effects: super::SelectionEffects,
         cold_urltest: bool,
     ) -> (super::SelectionPlanMode, Vec<super::Candidate<'a>>) {
-        let selected_member = self.selector_member(group);
+        let selected_member = self.selector_member(group, context.network);
         let mut candidates =
             self.flatten_candidates_for_target(group, context, visited, depth, effects);
         let before_filter = (effects.applies()
@@ -433,7 +433,7 @@ impl super::GroupManager {
             return None;
         }
         let selected_member = if group.policy == honk_config::group::GroupPolicy::Selector {
-            Some(self.selector_member(group)?)
+            Some(self.selector_member(group, context.network)?)
         } else {
             None
         };
@@ -622,10 +622,16 @@ fn selector_commit_does_not_restore_a_stale_sibling() {
                 alive.report_unavailable_forced(nodes[1].id, domain, IpVersion::V4);
             }
             let manager = GroupManager::with_alive_set(&groups, &nodes, Some(alive));
-            manager.set_selector_choice("parent", "child");
-            manager.set_selector_choice("child", "a");
+            manager
+                .set_selector_choice("parent", "child", crate::group::SelectorNetworks::Both)
+                .unwrap();
+            manager
+                .set_selector_choice("child", "a", crate::group::SelectorNetworks::Both)
+                .unwrap();
             let parent = &manager.groups["parent"];
-            let selected_member = manager.selector_member(parent).unwrap();
+            let selected_member = manager
+                .selector_member(parent, SelectionNetwork::from_probe_domain(domain))
+                .unwrap();
             let context = ScoreSelectionContext {
                 target: Some(ScoreTarget::domain("commit.example", 443)),
                 ..ScoreSelectionContext::aggregate(
@@ -655,7 +661,9 @@ fn selector_commit_does_not_restore_a_stale_sibling() {
             };
 
             // A failed serving commit must not resurrect the child's old leaf.
-            manager.set_selector_choice("child", "b");
+            manager
+                .set_selector_choice("child", "b", crate::group::SelectorNetworks::Both)
+                .unwrap();
             let picked = GroupManager::pick_selector(&candidates, selected_member).unwrap();
             let committed = manager.commit_selector_pick_for_target(
                 parent,

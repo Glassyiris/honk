@@ -16,6 +16,7 @@ fn source_runtime(
             capacity,
             capacity,
             capacity,
+            false,
             None,
         )
         .unwrap()
@@ -218,7 +219,7 @@ async fn queued_source_view_timeout_is_local_congestion() {
     drop(endpoint_b);
     drop(endpoint_c);
     wait_source_removed(&pool, &scope).await;
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
     generation.shutdown().await;
     wire_task.abort();
     let _ = wire_task.await;
@@ -323,7 +324,7 @@ async fn admitted_source_transport_timeout_still_demotes_health() {
 
     drop(driver);
     drop(endpoint);
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
     generation.shutdown().await;
     wire_task.abort();
     let _ = wire_task.await;
@@ -400,7 +401,7 @@ async fn retired_source_preparation_is_typed_and_score_neutral() {
     }
     pool.remove(client_addr, target_a);
     drop(endpoint_a);
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
     wait_source_removed(&pool, &scope).await;
     let Err(error) = stale.commit(&pool).await else {
         panic!("retired source attachment must reject commit");
@@ -657,7 +658,7 @@ async fn shared_source_failure_finishes_every_flow_before_death_cleanup() {
     drop(endpoint_b);
     drop(owner);
     wait_source_removed(&pool, &scope).await;
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
     generation.shutdown().await;
     wire_task.abort();
     let _ = wire_task.await;
@@ -822,7 +823,7 @@ async fn post_admission_view_cancel_is_health_neutral() {
         drop(endpoint_b);
         drop(owner);
         drop(transport);
-        assert!(pool.shutdown().await);
+        assert!(pool.shutdown().await.joined);
         generation.shutdown().await;
         wire_task.abort();
         let _ = wire_task.await;
@@ -956,7 +957,7 @@ async fn shared_source_failure_wins_late_cleanup_but_preserves_local_cancellatio
         Ok(winners) => winners,
         Err(panic) => std::panic::resume_unwind(panic),
     };
-    assert!(shutdown);
+    assert!(shutdown.joined);
     assert_eq!(
         bound_winner, other.id,
         "late local cancellation must not consume the shared source's I/O failure",

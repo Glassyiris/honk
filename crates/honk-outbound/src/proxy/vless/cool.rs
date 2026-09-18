@@ -261,6 +261,7 @@ pub struct VlessCoolSession {
     ending_ids: Mutex<HashSet<u16>>,
     failure: Mutex<Option<Failure>>,
     tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+    task_scope: crate::runtime::TaskScope,
 }
 
 impl std::fmt::Debug for VlessCoolSession {
@@ -309,7 +310,8 @@ impl Drop for ChildCancellationGuard {
 }
 
 impl VlessCoolSession {
-    fn install_task(&self, task: tokio::task::AbortHandle) {
+    fn install_task(&self, task: Option<tokio::task::AbortHandle>) {
+        let Some(task) = task else { return };
         let mut tasks = self.tasks.lock();
         if self.is_closed() {
             task.abort();
@@ -330,7 +332,7 @@ impl VlessCoolSession {
                 "Mux.Cool peer referenced an unissued session ID",
             ));
         }
-        let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+        tokio::runtime::Handle::try_current().map_err(|error| {
             io::Error::other(format!(
                 "Mux.Cool END scheduling requires a Tokio runtime: {error}"
             ))
@@ -340,7 +342,7 @@ impl VlessCoolSession {
         }
         let session = Arc::clone(self);
         let writer = self.writer.clone();
-        runtime.spawn(async move {
+        let _ = self.task_scope.spawn(async move {
             let failure =
                 match tokio::time::timeout(WRITER_IO_TIMEOUT, writer.send(end_frame(id), true))
                     .await
@@ -760,11 +762,12 @@ pub(crate) fn connect(
         receive_budget: Arc::new(tokio::sync::Semaphore::new(RECEIVE_BYTE_BUDGET)),
         failure: Mutex::new(None),
         tasks: Mutex::new(Vec::with_capacity(2)),
+        task_scope: crate::runtime::TaskScope::capture(),
     });
-    let writer_task = tokio::spawn(run_writer(writer, rx, Arc::downgrade(&session)));
-    session.install_task(writer_task.abort_handle());
-    let reader_task = tokio::spawn(run_reader(reader, Arc::downgrade(&session)));
-    session.install_task(reader_task.abort_handle());
+    let writer_task = crate::runtime::spawn_owned(run_writer(writer, rx, Arc::downgrade(&session)));
+    session.install_task(writer_task);
+    let reader_task = crate::runtime::spawn_owned(run_reader(reader, Arc::downgrade(&session)));
+    session.install_task(reader_task);
     session
 }
 

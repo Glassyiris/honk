@@ -95,6 +95,10 @@ pub struct NativeApiConfig {
     pub record_flows: bool,
     pub record_traffic: bool,
     pub record_memory: bool,
+    pub record_logs: bool,
+    pub record_dns_log: bool,
+    pub probe_allowed_cidrs: Vec<String>,
+    pub probe_allowed_ports: Vec<u16>,
     pub config_write: bool,
     pub config_content: bool,
     pub writable_includes: Vec<String>,
@@ -113,6 +117,10 @@ impl Default for NativeApiConfig {
             record_flows: true,
             record_traffic: true,
             record_memory: true,
+            record_logs: true,
+            record_dns_log: true,
+            probe_allowed_cidrs: Vec::new(),
+            probe_allowed_ports: Vec::new(),
             config_write: false,
             config_content: false,
             writable_includes: Vec::new(),
@@ -161,6 +169,22 @@ impl NativeApiConfig {
             return Err(invalid(
                 "writable_includes",
                 "writable includes must be explicit relative dae paths without traversal or globs",
+            ));
+        }
+        if self
+            .probe_allowed_cidrs
+            .iter()
+            .any(|value| value.parse::<ipnet::IpNet>().is_err())
+        {
+            return Err(invalid(
+                "probe_allowed_cidrs",
+                "probe destination allowlist requires explicit IP CIDRs",
+            ));
+        }
+        if self.probe_allowed_ports.contains(&0) {
+            return Err(invalid(
+                "probe_allowed_ports",
+                "probe port allowlist requires ports from 1 through 65535",
             ));
         }
         if self.enabled {

@@ -354,6 +354,7 @@ pub(crate) struct AnyTlsSession {
     /// deadline distinguish a silently-dead session from one whose server is
     /// merely slow to open a stream.
     rx_frame_seq: AtomicU64,
+    task_scope: crate::runtime::TaskScope,
 }
 
 impl AnyTlsSession {
@@ -398,20 +399,23 @@ impl AnyTlsSession {
             inbound_budget_epoch: AtomicU64::new(0),
             demux: Mutex::new(None),
             rx_frame_seq: AtomicU64::new(0),
+            task_scope: crate::runtime::TaskScope::capture(),
         });
         session.inbound_payload_budget.register(&session);
 
         let demux_handle = {
             let session = Arc::clone(&session);
-            tokio::spawn(async move { session_demux(session, transport_read).await })
+            crate::runtime::spawn_owned(async move { session_demux(session, transport_read).await })
         };
-        *session.demux.lock().unwrap() = Some(demux_handle.abort_handle());
+        *session.demux.lock().unwrap() = demux_handle;
         let writer_handle = {
             let session = Arc::clone(&session);
             let queue = Arc::clone(&session.writer_q);
-            tokio::spawn(async move { session_writer(session, transport_write, queue).await })
+            crate::runtime::spawn_owned(async move {
+                session_writer(session, transport_write, queue).await
+            })
         };
-        *session.writer_task.lock().unwrap() = Some(writer_handle.abort_handle());
+        *session.writer_task.lock().unwrap() = writer_handle;
 
         debug!("AnyTLS session {} for {} established", session.seq, addr);
         Ok(session)
@@ -450,31 +454,27 @@ impl AnyTlsSession {
             return;
         }
         let session = Arc::clone(self);
-        *slot = Some(
-            tokio::spawn(async move {
-                tokio::time::sleep(SYNACK_TIMEOUT).await;
-                let overdue = session.synack_pending.lock().sids.remove(&sid).is_some();
-                if !overdue {
-                    return;
-                }
-                let budget_waiting = session.inbound_budget_epoch.load(Ordering::SeqCst) & 1 != 0;
-                if budget_waiting || session.rx_frame_seq.load(Ordering::Relaxed) > activity_marker
-                {
-                    // Frames kept arriving through the window: the server is
-                    // alive but never acknowledged this open. Reset only this
-                    // stream — failing the session would kill every healthy
-                    // sibling with it.
-                    session
-                        .dispatch_error(sid, Arc::from("stream open not acknowledged"))
-                        .await;
-                } else {
-                    session.fail(anyhow::anyhow!(
-                        "stream {sid} SYNACK timed out after {SYNACK_TIMEOUT:?}"
-                    ));
-                }
-            })
-            .abort_handle(),
-        );
+        *slot = self.task_scope.spawn(async move {
+            tokio::time::sleep(SYNACK_TIMEOUT).await;
+            let overdue = session.synack_pending.lock().sids.remove(&sid).is_some();
+            if !overdue {
+                return;
+            }
+            let budget_waiting = session.inbound_budget_epoch.load(Ordering::SeqCst) & 1 != 0;
+            if budget_waiting || session.rx_frame_seq.load(Ordering::Relaxed) > activity_marker {
+                // Frames kept arriving through the window: the server is
+                // alive but never acknowledged this open. Reset only this
+                // stream — failing the session would kill every healthy
+                // sibling with it.
+                session
+                    .dispatch_error(sid, Arc::from("stream open not acknowledged"))
+                    .await;
+            } else {
+                session.fail(anyhow::anyhow!(
+                    "stream {sid} SYNACK timed out after {SYNACK_TIMEOUT:?}"
+                ));
+            }
+        });
     }
 
     /// Settle a pending open: cancel its deadline and drop the entry. A SYNACK
@@ -1804,28 +1804,29 @@ impl PacketOutbound for AnyTlsHandler {
         let dial_addr = format!("{}:{}", node.host(), node.port);
         let padding_state = pool.padding_state();
         let inbound_payload_budget = pool.inbound_payload_budget();
-        Self::dial_udp_transport_speculative_for_pool_with(
-            node.as_ref(),
-            pool,
-            target,
-            target_domain,
-            Some(runtime),
-            move || async move {
-                let tls_connector = dial_runtime.anytls_tls_connector()?;
-                let padding_state = Arc::clone(&padding_state);
-                let inbound_payload_budget = Arc::clone(&inbound_payload_budget);
-                dial_session(
-                    dial_node.as_ref(),
-                    &dial_addr,
-                    connect_timeout,
-                    Some(tls_connector),
-                    padding_state,
-                    inbound_payload_budget,
-                )
-                .await
-            },
-        )
-        .await
+        runtime
+            .scope_tasks(Self::dial_udp_transport_speculative_for_pool_with(
+                node.as_ref(),
+                pool,
+                target,
+                target_domain,
+                Some(Arc::clone(&runtime)),
+                move || async move {
+                    let tls_connector = dial_runtime.anytls_tls_connector()?;
+                    let padding_state = Arc::clone(&padding_state);
+                    let inbound_payload_budget = Arc::clone(&inbound_payload_budget);
+                    dial_session(
+                        dial_node.as_ref(),
+                        &dial_addr,
+                        connect_timeout,
+                        Some(tls_connector),
+                        padding_state,
+                        inbound_payload_budget,
+                    )
+                    .await
+                },
+            ))
+            .await
     }
 }
 

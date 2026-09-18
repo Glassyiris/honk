@@ -32,6 +32,7 @@ const MAX_EVENTS: usize = 512;
 const MAX_CLIENTS: usize = 16;
 const CLIENT_QUEUE: usize = 64;
 const MAX_PAYLOAD_BYTES: usize = 4096;
+const MAX_RETAINED_BYTES: usize = MAX_EVENTS * MAX_PAYLOAD_BYTES;
 const RETENTION: Duration = Duration::from_secs(60);
 const HEARTBEAT: Duration = Duration::from_secs(15);
 const MAX_SAFE_UINT: u64 = 9_007_199_254_740_991;
@@ -44,16 +45,24 @@ const KINDS: [&str; 6] = [
     "generation.changed",
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamKind {
+    Events,
+    Logs,
+}
+
 #[derive(Clone)]
-struct Filter {
+pub(super) struct Filter {
     kinds: u8,
     flow_id: Option<String>,
+    logs: Option<(u8, Option<String>)>,
     binding: [u8; 32],
 }
 
 impl Filter {
     fn new(kinds: u8, flow_id: Option<String>) -> Self {
         let mut hash = Sha256::new();
+        hash.update(b"events");
         hash.update([kinds, u8::from(flow_id.is_some())]);
         if let Some(id) = &flow_id {
             hash.update(id.as_bytes());
@@ -61,11 +70,35 @@ impl Filter {
         Self {
             kinds,
             flow_id,
+            logs: None,
+            binding: hash.finalize().into(),
+        }
+    }
+
+    pub(super) fn logs(level: u8, target: Option<String>) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"logs");
+        hash.update([level, u8::from(target.is_some())]);
+        if let Some(target) = &target {
+            hash.update(target.as_bytes());
+        }
+        Self {
+            kinds: 0,
+            flow_id: None,
+            logs: Some((level, target)),
             binding: hash.finalize().into(),
         }
     }
 
     fn matches(&self, record: &Record) -> bool {
+        if let Some((level, target)) = &self.logs {
+            return record.logs.is_some_and(|(severity, module)| {
+                severity <= *level
+                    && target
+                        .as_ref()
+                        .is_none_or(|target| module.starts_with(target))
+            });
+        }
         self.kinds & (1 << record.kind) != 0
             && (!matches!(record.kind, 2 | 3)
                 || self.flow_id.is_none()
@@ -80,6 +113,7 @@ struct Record {
     created: Instant,
     kind: usize,
     flow_id: Option<String>,
+    logs: Option<(u8, &'static str)>,
     payload: Bytes,
 }
 
@@ -93,7 +127,7 @@ struct Subscriber {
 impl Subscriber {
     fn close(&mut self) {
         self.closed = true;
-        self.queue.clear();
+        self.queue = VecDeque::new();
         self.waker.wake();
     }
 }
@@ -105,6 +139,9 @@ struct State {
     evicted_through: u64,
     signer: Hkdf<Sha256>,
     stopped: bool,
+    enabled: bool,
+    limit: usize,
+    retained_bytes: usize,
 }
 
 impl State {
@@ -121,6 +158,18 @@ impl State {
     fn evict(&mut self) {
         if let Some(record) = self.records.pop_front() {
             self.evicted_through = record.seq;
+            self.retained_bytes -= record.payload.len();
+            if record.logs.is_some() {
+                for subscriber in self.subscribers.iter_mut().flatten() {
+                    if subscriber
+                        .queue
+                        .front()
+                        .is_some_and(|queued| queued.seq <= record.seq)
+                    {
+                        subscriber.close();
+                    }
+                }
+            }
         }
     }
 
@@ -135,10 +184,19 @@ pub(crate) struct EventHub {
     instance_id: String,
     started: Instant,
     state: Mutex<State>,
+    kind: StreamKind,
 }
 
 impl EventHub {
     pub(crate) fn new(instance_id: String) -> Self {
+        Self::with_kind(instance_id, StreamKind::Events)
+    }
+
+    pub(super) fn logs(instance_id: String) -> Self {
+        Self::with_kind(instance_id, StreamKind::Logs)
+    }
+
+    fn with_kind(instance_id: String, kind: StreamKind) -> Self {
         assert!(
             !instance_id.is_empty() && instance_id.len() <= 256,
             "invalid native instance ID"
@@ -147,6 +205,7 @@ impl EventHub {
         Self {
             instance_id,
             started: Instant::now(),
+            kind,
             state: Mutex::new(State {
                 records: VecDeque::new(),
                 subscribers: std::array::from_fn(|_| None),
@@ -154,6 +213,9 @@ impl EventHub {
                 evicted_through: 0,
                 signer,
                 stopped: false,
+                enabled: true,
+                limit: MAX_EVENTS,
+                retained_bytes: 0,
             }),
         }
     }
@@ -161,16 +223,36 @@ impl EventHub {
     /// Producers supply only schema fields, never raw errors or configuration.
     pub(crate) fn publish(&self, kind: &'static str, data: Value, flow_id: Option<&str>) {
         let payload = self.payload(kind, &data, flow_id);
+        self.publish_record(payload, flow_id, None);
+    }
+
+    pub(super) fn publish_log(&self, level: u8, target: &'static str, payload: Bytes) {
+        self.publish_record(Some((0, payload)), None, Some((level, target)));
+    }
+
+    pub(super) fn reject_log(&self) {
+        self.publish_record(None, None, None);
+    }
+
+    fn publish_record(
+        &self,
+        payload: Option<(usize, Bytes)>,
+        flow_id: Option<&str>,
+        logs: Option<(u8, &'static str)>,
+    ) {
         let mut state = self.state.lock();
-        if state.stopped {
+        if state.stopped || !state.enabled {
             return;
         }
         let now = Instant::now();
         state.prune(now);
-        let Some((kind, payload)) = payload else {
+        let Some((kind, payload)) =
+            payload.filter(|(_, payload)| payload.len() <= MAX_PAYLOAD_BYTES)
+        else {
             // A refused notification is a replay discontinuity, not a silent skip.
             state.close_clients();
             state.records.clear();
+            state.retained_bytes = 0;
             state.evicted_through = state.sequence;
             state.signer = new_signer(&self.instance_id);
             return;
@@ -194,10 +276,14 @@ impl EventHub {
             kind,
             flow_id: flow_id.map(str::to_owned),
             payload,
+            logs,
         });
-        if state.records.len() == MAX_EVENTS {
+        while state.records.len() >= state.limit
+            || state.retained_bytes + record.payload.len() > MAX_RETAINED_BYTES
+        {
             state.evict();
         }
+        state.retained_bytes += record.payload.len();
         state.records.push_back(Arc::clone(&record));
         for subscriber in state.subscribers.iter_mut().flatten() {
             if subscriber.closed || !subscriber.filter.matches(&record) {
@@ -216,7 +302,30 @@ impl EventHub {
         let mut state = self.state.lock();
         state.stopped = true;
         state.close_clients();
-        state.records.clear();
+        state.records = VecDeque::new();
+        state.retained_bytes = 0;
+    }
+
+    pub(super) fn set_limit(&self, limit: usize) {
+        assert!((1..=MAX_EVENTS).contains(&limit), "validated stream limit");
+        let mut state = self.state.lock();
+        state.limit = limit;
+        while state.records.len() > limit {
+            state.evict();
+        }
+        state.records.shrink_to_fit();
+    }
+
+    pub(super) fn set_recording(&self, enabled: bool) {
+        let mut state = self.state.lock();
+        state.enabled = enabled;
+        if !enabled {
+            state.close_clients();
+            state.records = VecDeque::new();
+            state.retained_bytes = 0;
+            state.evicted_through = state.sequence;
+            state.signer = new_signer(&self.instance_id);
+        }
     }
 
     fn payload(&self, kind: &str, data: &Value, flow_id: Option<&str>) -> Option<(usize, Bytes)> {
@@ -281,12 +390,15 @@ impl EventHub {
         (bytes.len() <= MAX_PAYLOAD_BYTES).then(|| (kind, Bytes::from(bytes)))
     }
 
-    fn subscribe(
+    pub(super) fn subscribe(
         self: &Arc<Self>,
         filter: Filter,
         cursor: Option<&str>,
         id: &RequestId,
     ) -> Result<Subscription, ApiError> {
+        if (self.kind == StreamKind::Logs) != filter.logs.is_some() {
+            return Err(expired(id));
+        }
         let mut state = self.state.lock();
         let now = Instant::now();
         state.prune(now);
@@ -295,7 +407,7 @@ impl EventHub {
             .map(|cursor| self.resume_sequence(&state, cursor, &filter, now, id))
             .transpose()?
             .map(|after| (after, cutoff));
-        if state.stopped {
+        if state.stopped || !state.enabled {
             return Err(error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorCode::TemporarilyUnavailable,
@@ -317,13 +429,16 @@ impl EventHub {
             })?;
         let stamp =
             u64::try_from(now.duration_since(self.started).as_nanos()).map_err(|_| expired(id))?;
-        let ready_id = encode_cursor(
-            &state.signer,
-            cutoff,
-            stamp,
-            Uuid::new_v4().as_bytes(),
-            &filter.binding,
-        );
+        let ready_id = match (self.kind, cursor) {
+            (StreamKind::Logs, Some(cursor)) => cursor.to_owned(),
+            _ => encode_cursor(
+                &state.signer,
+                cutoff,
+                stamp,
+                Uuid::new_v4().as_bytes(),
+                &filter.binding,
+            ),
+        };
         let ready = frame(
             "stream.ready",
             &ready_id,
@@ -386,7 +501,7 @@ impl EventHub {
     }
 }
 
-struct Subscription {
+pub(super) struct Subscription {
     hub: Arc<EventHub>,
     slot: usize,
     replay: Option<(u64, u64)>,
@@ -422,6 +537,11 @@ impl Stream for Subscription {
                 io::ErrorKind::ConnectionAborted,
                 "event subscription ended",
             ))));
+        }
+        if this.hub.kind == StreamKind::Logs
+            && let Some(ready) = this.ready.take()
+        {
+            return Poll::Ready(Some(Ok(ready)));
         }
         if let Some((after, cutoff)) = this.replay {
             let filter = &state.subscribers[this.slot]
@@ -505,7 +625,15 @@ fn record_frame(signer: &Hkdf<Sha256>, record: &Record, filter: &Filter) -> Byte
         &record.nonce,
         &filter.binding,
     );
-    frame(KINDS[record.kind], &cursor, &record.payload)
+    frame(
+        if record.logs.is_some() {
+            "log"
+        } else {
+            KINDS[record.kind]
+        },
+        &cursor,
+        &record.payload,
+    )
 }
 
 fn frame(kind: &str, cursor: &str, payload: &[u8]) -> Bytes {
@@ -587,6 +715,16 @@ fn request_options(
     {
         return Err(invalid(id));
     }
+    Ok((Filter::new(kinds, flow_id), request_cursor(request, id)?))
+}
+
+pub(super) fn request_cursor(
+    request: &Request,
+    id: &RequestId,
+) -> Result<Option<String>, ApiError> {
+    if !accepts_events(request.headers()) {
+        return Err(invalid(id));
+    }
     let mut cursors = request.headers().get_all("last-event-id").iter();
     let cursor = cursors
         .next()
@@ -595,7 +733,7 @@ fn request_options(
     if cursors.next().is_some() || cursor.as_ref().is_some_and(String::is_empty) {
         return Err(invalid(id));
     }
-    Ok((Filter::new(kinds, flow_id), cursor))
+    Ok(cursor)
 }
 
 fn accepts_events(headers: &HeaderMap) -> bool {
@@ -703,7 +841,11 @@ pub(super) async fn serve(
         .observation
         .events
         .subscribe(filter, cursor.as_deref(), id)?;
-    Ok((
+    Ok(stream_response(subscription))
+}
+
+pub(super) fn stream_response(subscription: Subscription) -> Response {
+    (
         [
             (header::CONTENT_TYPE, "text/event-stream"),
             (header::CACHE_CONTROL, "no-store"),
@@ -715,7 +857,7 @@ pub(super) async fn serve(
         ],
         Body::from_stream(subscription),
     )
-        .into_response())
+        .into_response()
 }
 
 #[cfg(test)]

@@ -95,8 +95,15 @@ enum Command {
         epoch: u64,
         ack: oneshot::Sender<Result<(), PersistControlError>>,
     },
+    #[cfg(any(feature = "native-api", test))]
+    Invalidate {
+        epoch: u64,
+        selection: PersistInvalidation,
+        ack: oneshot::Sender<Result<(), PersistControlError>>,
+    },
     Restore {
         cache: Arc<DnsCacheService>,
+        publication_epoch: super::cache::PublicationEpoch,
         policy: Option<PolicyId>,
         ack: oneshot::Sender<usize>,
     },
@@ -115,6 +122,89 @@ pub enum PersistControlError {
     WorkerFailed,
     #[error("DNS persistence database operation failed: {0}")]
     Database(String),
+}
+
+pub(crate) enum PersistInvalidation {
+    All,
+    #[cfg(any(feature = "native-api", test))]
+    Keys(Vec<CacheKey>),
+    #[cfg(any(feature = "native-api", test))]
+    Name {
+        name: String,
+        types: Vec<u16>,
+    },
+}
+
+pub(crate) struct ReservedInvalidation<'a> {
+    permit: mpsc::Permit<'a, Command>,
+    persister: &'a DnsCachePersister,
+}
+
+pub(crate) struct PendingInvalidation {
+    receive: oneshot::Receiver<Result<(), PersistControlError>>,
+    #[cfg(test)]
+    gate: Option<FlushGate>,
+}
+
+impl ReservedInvalidation<'_> {
+    pub(crate) fn send(self, selection: PersistInvalidation) -> PendingInvalidation {
+        let epoch = self
+            .persister
+            .epoch
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
+                epoch.checked_add(1)
+            })
+            .expect("DNS persistence epoch exhausted")
+            + 1;
+        let (ack, receive) = oneshot::channel();
+        let command = match selection {
+            PersistInvalidation::All => Command::Flush { epoch, ack },
+            #[cfg(any(feature = "native-api", test))]
+            selection => Command::Invalidate {
+                epoch,
+                selection,
+                ack,
+            },
+        };
+        self.persister
+            .counters
+            .queued
+            .fetch_add(1, Ordering::Relaxed);
+        self.permit.send(command);
+        PendingInvalidation {
+            receive,
+            #[cfg(test)]
+            gate: self
+                .persister
+                .flush_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        }
+    }
+}
+
+impl PendingInvalidation {
+    pub(crate) async fn complete(self) -> Result<(), PersistControlError> {
+        #[cfg(test)]
+        if let Some(gate) = self.gate {
+            gate.entered.notify_one();
+            gate.release
+                .acquire()
+                .await
+                .unwrap_or_else(|_| unreachable!("test flush gate remains open"))
+                .forget();
+        }
+        let result = self
+            .receive
+            .await
+            .map_err(|_| PersistControlError::AckDropped)
+            .and_then(std::convert::identity);
+        if let Err(error) = &result {
+            record_flush_failure(error);
+        }
+        result
+    }
 }
 
 #[derive(Clone)]
@@ -196,8 +286,14 @@ impl DnsCachePersister {
         policy: Option<PolicyId>,
     ) -> Result<usize, PersistControlError> {
         let (ack, receive) = oneshot::channel();
-        self.send_control(Command::Restore { cache, policy, ack })
-            .await?;
+        let publication_epoch = cache.publication_epoch();
+        self.send_control(Command::Restore {
+            cache,
+            publication_epoch,
+            policy,
+            ack,
+        })
+        .await?;
         receive.await.map_err(|_| PersistControlError::AckDropped)
     }
 
@@ -211,35 +307,25 @@ impl DnsCachePersister {
     }
 
     pub async fn flush(&self) -> Result<(), PersistControlError> {
-        let epoch = self.epoch.fetch_add(1, Ordering::SeqCst).saturating_add(1);
-        let (ack, receive) = oneshot::channel();
-        if let Err(error) = self.send_control(Command::Flush { epoch, ack }).await {
-            record_flush_failure(&error);
-            return Err(error);
-        }
-        #[cfg(test)]
-        let flush_gate = self
-            .flush_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        #[cfg(test)]
-        if let Some(gate) = flush_gate {
-            gate.entered.notify_one();
-            gate.release
-                .acquire()
-                .await
-                .unwrap_or_else(|_| unreachable!("test flush gate remains open"))
-                .forget();
-        }
-        let result = receive
+        self.reserve_invalidation()
+            .await?
+            .send(PersistInvalidation::All)
+            .complete()
             .await
-            .map_err(|_| PersistControlError::AckDropped)
-            .and_then(std::convert::identity);
-        if let Err(error) = &result {
-            record_flush_failure(error);
-        }
-        result
+    }
+
+    pub(crate) async fn reserve_invalidation(
+        &self,
+    ) -> Result<ReservedInvalidation<'_>, PersistControlError> {
+        let permit = self
+            .tx
+            .reserve()
+            .await
+            .map_err(|_| PersistControlError::Closed)?;
+        Ok(ReservedInvalidation {
+            permit,
+            persister: self,
+        })
     }
 
     #[cfg(test)]
@@ -284,11 +370,13 @@ impl DnsCachePersister {
     }
 
     async fn send_control(&self, command: Command) -> Result<(), PersistControlError> {
+        let permit = self
+            .tx
+            .reserve()
+            .await
+            .map_err(|_| PersistControlError::Closed)?;
         self.counters.queued.fetch_add(1, Ordering::Relaxed);
-        if self.tx.send(command).await.is_err() {
-            self.counters.queued.fetch_sub(1, Ordering::Relaxed);
-            return Err(PersistControlError::Closed);
-        }
+        permit.send(command);
         Ok(())
     }
 }

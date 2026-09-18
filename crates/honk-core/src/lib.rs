@@ -99,6 +99,8 @@ async fn request_runtime_reload(
             result,
             #[cfg(feature = "native-api")]
             sources: None,
+            #[cfg(feature = "native-api")]
+            expected_group_revision: None,
         })
         .await
         .map_err(|error| anyhow::anyhow!("command send failed: {error}"))?;
@@ -805,6 +807,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // With no `/logs` subscription, the API layer contributes no callsite interest.
     #[cfg(feature = "clash-api")]
     let (clash_log_layer, clash_log_handle) = clash_api::logs::layer();
+    #[cfg(feature = "native-api")]
+    let (native_log_layer, native_log_binding) = native_api::logs::tracing_layer();
 
     use tracing_subscriber::prelude::*;
     let registry = tracing_subscriber::registry()
@@ -816,6 +820,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .with(log_file_layer);
     #[cfg(feature = "clash-api")]
     let registry = registry.with(clash_log_layer);
+    #[cfg(feature = "native-api")]
+    let registry = registry.with(native_log_layer);
     registry.init();
 
     info!("honk-core {} starting", VERSION);
@@ -1240,6 +1246,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             dns_cache,
             dns_router,
         )
+        .with_configured_upstreams(&config.dns)
         .with_timeouts(
             std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
             std::time::Duration::from_millis(config.global.connect_timeout_ms),
@@ -1299,15 +1306,27 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .clash_api
         .clone();
     let cache_db = control_plane.cache_db();
+    let native_mode = cfg!(feature = "native-api")
+        && control_plane
+            .config_handle()
+            .read()
+            .await
+            .experimental
+            .native_api
+            .enabled;
     #[cfg(feature = "clash-api")]
-    let mode = cache_db
-        .as_ref()
-        .and_then(|db| db.load_clash_mode())
-        .and_then(|mode| mode::ModeState::normalize(&mode))
-        .or_else(|| mode::ModeState::normalize(&clash_cfg.default_mode))
-        .unwrap_or_else(|| "Rule".to_string());
+    let mode = if native_mode {
+        "Rule".to_owned()
+    } else {
+        cache_db
+            .as_ref()
+            .and_then(|db| db.load_clash_mode())
+            .and_then(|mode| mode::ModeState::normalize(&mode))
+            .or_else(|| mode::ModeState::normalize(&clash_cfg.default_mode))
+            .unwrap_or_else(|| "Rule".to_owned())
+    };
     #[cfg(not(feature = "clash-api"))]
-    let mode = "Rule".to_string();
+    let mode = "Rule".to_owned();
     let (default_selection, valid_global_selections) = {
         let config = control_plane.config_handle();
         let config = config.read().await;
@@ -1317,21 +1336,30 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             .map(|group| group.name.clone())
             .chain(config.nodes.iter().map(|node| node.name.clone()))
             .collect::<Vec<_>>();
-        let default = selections.first().cloned().unwrap_or_default();
-        (default, selections)
+        (selections.first().cloned().unwrap_or_default(), selections)
     };
-    let global_selection = cache_db
-        .as_ref()
-        .and_then(|db| db.load_selector_choice("GLOBAL"))
-        .filter(|selection| {
-            valid_global_selections
-                .iter()
-                .any(|valid| valid == selection)
-        })
-        .unwrap_or(default_selection);
-    let mode_state: mode::SharedModeState = std::sync::Arc::new(parking_lot::RwLock::new(
-        mode::ModeState::new(&mode, global_selection),
-    ));
+    let global_selection = if native_mode {
+        String::new()
+    } else {
+        cache_db
+            .as_ref()
+            .and_then(|db| db.load_selector_choice("GLOBAL"))
+            .filter(|selection| {
+                valid_global_selections
+                    .iter()
+                    .any(|valid| valid == selection)
+            })
+            .unwrap_or(default_selection)
+    };
+    let mode_value = mode::ModeState::new(&mode, global_selection);
+    #[cfg(feature = "native-api")]
+    let mode_value = if native_mode {
+        mode::ModeState::native()
+    } else {
+        mode_value
+    };
+    let mode_state: mode::SharedModeState =
+        std::sync::Arc::new(parking_lot::RwLock::new(mode_value));
     control_plane.set_mode_state(mode_state.clone());
     control_plane.start_datapath_flags_coordinator()?;
 
@@ -1349,16 +1377,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 .await
                 .map_err(|_| anyhow::anyhow!("native API listener bind failed"))?;
             let listen = listener.local_addr()?;
-            let state = native_api::NativeState::new(
-                &mut control_plane,
-                listen,
-                started_at,
-                started,
-                mock_mode,
-            )
-            .await?;
+            let state =
+                native_api::NativeState::new(&mut control_plane, listen, started_at, started)
+                    .await?;
+            native_log_binding.bind(std::sync::Arc::downgrade(
+                &control_plane.native_observation().logs,
+            ));
             let server = native_api::NativeServer::start(listener, std::sync::Arc::new(state));
-            info!(%listen, "native API listener ready");
+            info!(%listen, message = "native API listener ready");
             Some(server)
         } else {
             None
@@ -1400,6 +1426,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     datapath_flags: control_plane
                         .datapath_flags_handle()
                         .expect("datapath flags writer started above"),
+                    control: Some(control_plane.control_client()),
+                    ui_download: control_plane.ui_download_handle(),
                     secret: clash_cfg.secret.clone(),
                     connection_pool: control_plane.connection_pool(),
                     external_ui,
@@ -1424,6 +1452,22 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let cmd_tx = control_plane.command_sender();
 
     subscription_supervisor.start(cmd_tx.clone());
+    #[cfg(feature = "native-api")]
+    control_plane.attach_subscriptions(subscription_supervisor.handle());
+    #[cfg(feature = "native-api")]
+    if control_plane
+        .config_handle()
+        .read()
+        .await
+        .experimental
+        .native_api
+        .enabled
+    {
+        control_plane
+            .native_observation()
+            .providers
+            .attach(subscription_supervisor.handle());
+    }
     let reload_subscription_supervisor = subscription_supervisor.handle();
     #[cfg(feature = "native-api")]
     let (config_coordinator, native_configuration) = {
@@ -1434,13 +1478,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             .experimental
             .native_api
             .enabled;
-        if let (true, Some(sources)) = (enabled, native_sources) {
+        if enabled {
             let service = control_plane.native_observation().configuration.clone();
-            let entry = sources.sources[0].path.clone();
             let owner = service
                 .start(
-                    entry,
-                    sources,
+                    Some(cli.config.clone()),
+                    native_sources,
                     control_plane.config_handle(),
                     control_plane.diagnostics_handle(),
                     cmd_tx.clone(),
@@ -1508,6 +1551,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     });
 
+    #[cfg(feature = "native-api")]
+    let shutdown_intent = control_plane.shutdown_intent();
     let sig_handle = tokio::spawn(async move {
         // The shell may start us with SIGINT/SIGTERM ignored (e.g. background
         // job). Reset them to the default disposition so tokio can install its
@@ -1530,6 +1575,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 info!("Received SIGTERM, shutting down...");
             }
         }
+        #[cfg(feature = "native-api")]
+        shutdown_intent.store(true, std::sync::atomic::Ordering::Release);
         let _ = cmd_tx.send(control::ControlCommand::Shutdown).await;
     });
 
@@ -1557,11 +1604,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     sighup_handle.abort();
     let _ = sig_handle.await;
     let _ = sighup_handle.await;
-    let remaining_subscription_tasks = subscription_supervisor.shutdown().await;
-    debug_assert_eq!(remaining_subscription_tasks, 0);
+    let subscription_result = subscription_supervisor.shutdown().await;
     info!("honk-core stopped");
 
-    control_result
+    control_result?;
+    anyhow::ensure!(
+        subscription_result? == 0,
+        "subscription tasks remained after shutdown"
+    );
+    Ok(())
 }
 
 #[cfg(feature = "ebpf")]

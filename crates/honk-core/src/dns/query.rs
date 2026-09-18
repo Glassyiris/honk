@@ -5,7 +5,7 @@ use thiserror::Error;
 
 mod parser;
 
-pub(crate) use parser::{NameParseState, parse_name};
+pub(crate) use parser::{NameParseState, parse_name, parse_name_into};
 use parser::{parse_edns, parse_rr, read_u16};
 
 const HEADER_LEN: usize = 12;

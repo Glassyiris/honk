@@ -47,6 +47,7 @@ impl HttpProber for PeriodProbe {
         _: SocketAddr,
         _: &str,
         _: Duration,
+        _cancel: honk_outbound::alive::ProbeCancellation,
     ) -> Pin<Box<dyn Future<Output = HttpProbeOutcome> + Send + 'static>> {
         let _ = self.0.send(tokio::time::Instant::now());
         Box::pin(async { HttpProbeResult::WarmSuccess(Duration::from_millis(1)).into() })
@@ -90,8 +91,8 @@ async fn c28_health_reload_retains_old_period_after_rejection() {
         Duration::from_secs(30)
     );
     assert_eq!(cp.config_handle().read().await.as_ref(), &old);
-    task.abort();
-    let _ = task.await;
+    alive.shutdown_health_checks().await.unwrap();
+    task.await.unwrap();
 }
 
 async fn http_fixture() -> (
@@ -300,7 +301,9 @@ async fn c28_udp_reload_preserves_the_configured_probe_target() {
             .apply_runtime_config(candidate.clone(), Default::default(), &DrainTracker::new())
             .await
             .accepted();
-        let outcome = UdpProber::probe_udp(&prober, node.id, Duration::from_secs(1)).await;
+        let outcome =
+            UdpProber::probe_udp(&prober, node.id, Duration::from_secs(1), Default::default())
+                .await;
         assert!(matches!(outcome.dns, Some(Ok(_))), "{outcome:?}");
         assert_eq!(
             *capture.lock(),
@@ -494,7 +497,13 @@ async fn udp_dns_resolution_and_transport_share_one_deadline() {
         },
     );
     let start = tokio::time::Instant::now();
-    let outcome = prober.probe_udp(node.id, Duration::from_millis(50)).await;
+    let outcome = prober
+        .probe_udp(
+            node.id,
+            Duration::from_millis(50),
+            honk_outbound::alive::ProbeCancellation::default(),
+        )
+        .await;
     assert!(matches!(outcome.dns, Some(Err(_))), "{outcome:?}");
     assert!(outcome.data_path.is_none());
     assert!(

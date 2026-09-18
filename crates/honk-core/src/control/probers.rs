@@ -137,6 +137,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
         addr: SocketAddr,
         url: &str,
         timeout: Duration,
+        cancel: honk_outbound::alive::ProbeCancellation,
     ) -> std::pin::Pin<
         Box<dyn Future<Output = honk_outbound::alive::HttpProbeOutcome> + Send + 'static>,
     > {
@@ -149,6 +150,9 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
         let group_manager = self.group_manager.clone();
 
         Box::pin(async move {
+            if cancel.is_cancelled() {
+                return honk_outbound::alive::HttpProbeResult::Cancelled.into();
+            }
             let Some(node) = node else {
                 return honk_outbound::alive::HttpProbeResult::SetupFailure(
                     "node not found".into(),
@@ -224,17 +228,23 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                     ),
                 )
             };
-            if let Err(error) = generation
-                .scope_dials(honk_outbound::urltest::warm_http_probe(
-                    &runtime,
-                    entry.warmable.as_deref(),
-                    connect_timeout,
-                    timeout,
-                    warm_feedback,
-                ))
-                .await
-            {
-                close_ephemeral(ephemeral).await;
+            let warm = cancel
+                .run(runtime.scope_tasks(generation.scope_dials(
+                    honk_outbound::urltest::warm_http_probe(
+                        &runtime,
+                        entry.warmable.as_deref(),
+                        connect_timeout,
+                        timeout,
+                        warm_feedback,
+                    ),
+                )))
+                .await;
+            let Some(warm) = warm else {
+                close_ephemeral(ephemeral, &runtime, &cancel).await;
+                return honk_outbound::alive::HttpProbeResult::Cancelled.into();
+            };
+            if let Err(error) = warm {
+                close_ephemeral(ephemeral, &runtime, &cancel).await;
                 if let Some(rejection) = honk_outbound::proxy::packet_rejection(&error) {
                     return honk_outbound::alive::HttpProbeResult::LocalRefusal(rejection).into();
                 }
@@ -246,18 +256,24 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
 
             let feedback =
                 probe_feedback(&group_manager, node.id, http_probe_context(&request, addr));
-            let result = generation
-                .scope_dials(honk_outbound::urltest::measure_http_probe(
-                    &runtime,
-                    entry.tcp.as_ref(),
-                    &request,
-                    addr,
-                    target_domain.as_deref(),
-                    connect_timeout,
-                    timeout,
-                    feedback,
-                ))
+            let result = cancel
+                .run(runtime.scope_tasks(generation.scope_dials(
+                    honk_outbound::urltest::measure_http_probe(
+                        &runtime,
+                        entry.tcp.as_ref(),
+                        &request,
+                        addr,
+                        target_domain.as_deref(),
+                        connect_timeout,
+                        timeout,
+                        feedback,
+                    ),
+                )))
                 .await;
+            let Some(result) = result else {
+                close_ephemeral(ephemeral, &runtime, &cancel).await;
+                return honk_outbound::alive::HttpProbeResult::Cancelled.into();
+            };
             let observation = if result
                 .as_ref()
                 .is_err_and(honk_outbound::proxy::is_packet_rejection)
@@ -275,7 +291,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                     ),
                 ))
             };
-            close_ephemeral(ephemeral).await;
+            close_ephemeral(ephemeral, &runtime, &cancel).await;
             let result = match result {
                 Ok(sample) => honk_outbound::alive::HttpProbeResult::WarmSuccess(sample.latency),
                 Err(error) => {
@@ -294,9 +310,16 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
     }
 }
 
-async fn close_ephemeral(guard: Option<honk_outbound::runtime::EphemeralRuntimeGuard>) {
+async fn close_ephemeral(
+    guard: Option<honk_outbound::runtime::EphemeralRuntimeGuard>,
+    runtime: &honk_outbound::runtime::NodeRuntime,
+    cancel: &honk_outbound::alive::ProbeCancellation,
+) {
     if let Some(guard) = guard {
         guard.close().await;
+        if runtime.tasks_failed() {
+            cancel.report_cleanup_failure();
+        }
     }
 }
 
@@ -446,6 +469,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
         &self,
         node_id: uuid::Uuid,
         timeout: Duration,
+        cancel: honk_outbound::alive::ProbeCancellation,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = honk_outbound::alive::UdpProbeOutcome>
@@ -463,6 +487,13 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
         let quic_score_target = self.quic_score_target.clone();
 
         Box::pin(async move {
+            if cancel.is_cancelled() {
+                return honk_outbound::alive::UdpProbeOutcome {
+                    dns: None,
+                    data_path: None,
+                    observations: [None, None],
+                };
+            }
             let Some(node) = node else {
                 return honk_outbound::alive::UdpProbeOutcome {
                     dns: Some(Err(anyhow::anyhow!("node not found"))),
@@ -521,9 +552,13 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             let dns_deadline = tokio::time::Instant::now() + timeout;
             let dns_target = if dns_allowed {
                 // Resolving the shared check target is local setup, not node evidence.
-                tokio::time::timeout_at(dns_deadline, dns_probe.resolve())
+                cancel
+                    .run(tokio::time::timeout_at(
+                        dns_deadline,
+                        cancel.scope_resolution(dns_probe.resolve()),
+                    ))
                     .await
-                    .ok()
+                    .and_then(Result::ok)
                     .and_then(Result::ok)
             } else {
                 None
@@ -547,13 +582,13 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                 let start = std::time::Instant::now();
                 let mut measurement = HealthMeasurement::Mixed;
                 let attempt = async {
-                    let transport = generation
-                        .scope_dials(packet.dial_udp_transport_runtime(
+                    let transport = runtime
+                        .scope_tasks(generation.scope_dials(packet.dial_udp_transport_runtime(
                             Arc::clone(&runtime),
                             *dns_target,
                             None,
                             connect_timeout,
-                        ))
+                        )))
                         .await?;
                     probe_setup(&reporter);
                     measurement = HealthMeasurement::DnsRoundTrip;
@@ -561,32 +596,40 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                     drop(transport);
                     Ok::<ProbeMeasurement, anyhow::Error>(elapsed)
                 };
-                let result = tokio::time::timeout_at(dns_deadline, attempt).await;
-                if !matches!(&result, Ok(Err(error)) if honk_outbound::proxy::is_packet_rejection(error))
+                if let Some(result) = cancel
+                    .run(tokio::time::timeout_at(dns_deadline, attempt))
+                    .await
                 {
-                    let sample = result.as_ref().ok().and_then(|result| result.as_ref().ok());
-                    dns_observation = Some(NativeHealthObservation::probe(
-                        ProbeDomain::DnsUdp,
-                        measurement,
-                        target_family(*dns_target),
-                        sample.map(|sample| sample.latency),
-                        sample.map_or_else(std::time::SystemTime::now, |sample| sample.observed_at),
-                    ));
+                    if !matches!(&result, Ok(Err(error)) if honk_outbound::proxy::is_packet_rejection(error))
+                    {
+                        let sample = result.as_ref().ok().and_then(|result| result.as_ref().ok());
+                        dns_observation = Some(NativeHealthObservation::probe(
+                            ProbeDomain::DnsUdp,
+                            measurement,
+                            target_family(*dns_target),
+                            sample.map(|sample| sample.latency),
+                            sample.map_or_else(std::time::SystemTime::now, |sample| {
+                                sample.observed_at
+                            }),
+                        ));
+                    }
+                    Some(match result {
+                        Ok(Ok(_)) => {
+                            probe_finish(&reporter, ScoreOutcome::Success);
+                            Ok(start.elapsed())
+                        }
+                        Ok(Err(error)) => {
+                            probe_finish(&reporter, ScoreOutcome::from_error(&error));
+                            Err(error.context("UDP probe failed"))
+                        }
+                        Err(_) => {
+                            probe_finish(&reporter, ScoreOutcome::Timeout);
+                            Err(anyhow::anyhow!("UDP probe timeout"))
+                        }
+                    })
+                } else {
+                    None
                 }
-                Some(match result {
-                    Ok(Ok(_)) => {
-                        probe_finish(&reporter, ScoreOutcome::Success);
-                        Ok(start.elapsed())
-                    }
-                    Ok(Err(error)) => {
-                        probe_finish(&reporter, ScoreOutcome::from_error(&error));
-                        Err(error.context("UDP probe failed"))
-                    }
-                    Err(_) => {
-                        probe_finish(&reporter, ScoreOutcome::Timeout);
-                        Err(anyhow::anyhow!("UDP probe timeout"))
-                    }
-                })
             } else {
                 None
             };
@@ -595,8 +638,14 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             let data_path = match quic_score_target.as_ref() {
                 Some(target) if data_allowed => {
                     let deadline = tokio::time::Instant::now() + timeout;
-                    match tokio::time::timeout_at(deadline, target.resolve()).await {
-                        Ok(Ok(Some(target))) if tokio::time::Instant::now() < deadline => {
+                    match cancel
+                        .run(tokio::time::timeout_at(
+                            deadline,
+                            cancel.scope_resolution(target.resolve()),
+                        ))
+                        .await
+                    {
+                        Some(Ok(Ok(Some(target)))) if tokio::time::Instant::now() < deadline => {
                             data_attempted = true;
                             score_quic_probe(
                                 &packet,
@@ -608,11 +657,12 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                                 connect_timeout,
                                 deadline.saturating_duration_since(tokio::time::Instant::now()),
                                 &mut data_observation,
+                                &cancel,
                             )
                             .await
                         }
-                        Ok(Err(error)) => Some(Err(error)),
-                        Ok(Ok(_)) | Err(_) => None,
+                        Some(Ok(Err(error))) => Some(Err(error)),
+                        Some(Ok(Ok(_)) | Err(_)) | None => None,
                     }
                 }
                 Some(_) | None => None,
@@ -620,7 +670,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             if ephemeral.is_none() && (dns.is_some() || (data_attempted && data_path.is_some())) {
                 stats.mark_warm(node.id, crate::stats::WarmReason::Health);
             }
-            close_ephemeral(ephemeral).await;
+            close_ephemeral(ephemeral, &runtime, &cancel).await;
             honk_outbound::alive::UdpProbeOutcome {
                 dns,
                 data_path,
@@ -682,6 +732,7 @@ async fn score_quic_probe(
     connect_timeout: Duration,
     timeout: Duration,
     observation: &mut Option<NativeHealthObservation>,
+    cancel: &honk_outbound::alive::ProbeCancellation,
 ) -> Option<anyhow::Result<Duration>> {
     if !honk_outbound::descriptor::udp_target_allowed(node, target.addr.port()) {
         return None;
@@ -694,16 +745,26 @@ async fn score_quic_probe(
         ScoreTarget::Socket(_) => None,
     };
     let start = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut measurement = HealthMeasurement::Mixed;
     let attempt = async {
-        let transport = generation
-            .scope_dials(packet.dial_udp_transport_runtime(
-                runtime,
-                target.addr,
-                target_domain,
-                connect_timeout,
+        let Some(transport) = cancel
+            .run(tokio::time::timeout_at(
+                deadline,
+                runtime.scope_tasks(generation.scope_dials(packet.dial_udp_transport_runtime(
+                    Arc::clone(&runtime),
+                    target.addr,
+                    target_domain,
+                    connect_timeout,
+                ))),
             ))
-            .await?;
+            .await
+        else {
+            return Ok(None);
+        };
+        let transport = transport.map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "QUIC probe dial timed out")
+        })??;
         probe_setup(&reporter);
         measurement = HealthMeasurement::QuicHandshake;
         honk_outbound::quic::quic_handshake_probe(
@@ -711,13 +772,26 @@ async fn score_quic_probe(
             target.addr,
             &target.host,
             &target.config,
-            timeout,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            cancel.clone(),
         )
         .await
+        .map(Some)
     };
-    let result = tokio::time::timeout(timeout, attempt).await;
-    if !matches!(&result, Ok(Err(error)) if honk_outbound::proxy::is_packet_rejection(error)) {
-        let sample = result.as_ref().ok().and_then(|result| result.as_ref().ok());
+    let result = match attempt.await {
+        Ok(Some(sample)) => Ok(sample),
+        Ok(None) => return None,
+        Err(error)
+            if error
+                .downcast_ref::<honk_outbound::alive::HealthCheckError>()
+                .is_some() =>
+        {
+            return None;
+        }
+        Err(error) => Err(error),
+    };
+    if !matches!(&result, Err(error) if honk_outbound::proxy::is_packet_rejection(error)) {
+        let sample = result.as_ref().ok();
         *observation = Some(NativeHealthObservation::probe(
             ProbeDomain::DataUdp,
             measurement,
@@ -727,7 +801,7 @@ async fn score_quic_probe(
         ));
     }
     Some(match result {
-        Ok(Ok(_)) => {
+        Ok(_) => {
             probe_first_response(&reporter);
             // The handshake probe exposes no wire counters. Record only the
             // bidirectional fact so it contributes reliability, not volume.
@@ -736,13 +810,9 @@ async fn score_quic_probe(
             probe_finish(&reporter, ScoreOutcome::Success);
             Ok(start.elapsed())
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             probe_finish(&reporter, ScoreOutcome::from_error(&error));
             Err(error)
-        }
-        Err(_) => {
-            probe_finish(&reporter, ScoreOutcome::Timeout);
-            Err(anyhow::anyhow!("Score QUIC probe timeout"))
         }
     })
 }
@@ -783,9 +853,8 @@ pub(super) async fn resolve_udp_check_target(
                 }
                 Err(_) => Vec::new(),
             },
-            None => tokio::net::lookup_host((host, port))
+            None => honk_outbound::bootstrap::lookup_host(host, port)
                 .await
-                .map(|it| it.collect())
                 .unwrap_or_default(),
         };
         if let Some(addr) = addrs.into_iter().next() {
@@ -837,9 +906,8 @@ pub(super) async fn resolve_quic_score_target(
                     return Ok(None);
                 }
             },
-            None => tokio::net::lookup_host((host.as_str(), port))
+            None => honk_outbound::bootstrap::lookup_host(host.as_str(), port)
                 .await
-                .map(|addrs| addrs.collect())
                 .unwrap_or_default(),
         }
     };

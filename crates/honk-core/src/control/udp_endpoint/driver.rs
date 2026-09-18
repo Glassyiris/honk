@@ -86,17 +86,20 @@ impl Default for TaskRegistry {
     }
 }
 
-async fn drain_registered_tasks(tasks: &mut tokio::task::JoinSet<()>, label: &str) -> bool {
-    let mut clean = true;
+async fn drain_registered_tasks(
+    tasks: &mut tokio::task::JoinSet<()>,
+    label: &str,
+    disposition: &mut UdpShutdown,
+) {
     while let Some(result) = tasks.join_next().await {
-        if let Err(error) = result
-            && !error.is_cancelled()
-        {
-            clean = false;
-            debug!("UDP {} task join failed during shutdown: {}", label, error);
+        if let Err(error) = result {
+            disposition.graceful = false;
+            if !error.is_cancelled() {
+                disposition.joined = false;
+                debug!("UDP {} task join failed during shutdown: {}", label, error);
+            }
         }
     }
-    clean
 }
 
 pub(super) async fn join_registered_tasks(
@@ -104,38 +107,43 @@ pub(super) async fn join_registered_tasks(
     label: &str,
     graceful_timeout: Duration,
     abort_first: bool,
-) -> bool {
+) -> UdpShutdown {
+    let mut disposition = UdpShutdown {
+        joined: true,
+        graceful: !abort_first,
+    };
     if abort_first {
         tasks.abort_all();
     }
-    match tokio::time::timeout(
+    if tokio::time::timeout(
         if abort_first {
             DRIVER_ABORT_TIMEOUT
         } else {
             graceful_timeout
         },
-        drain_registered_tasks(&mut tasks, label),
+        drain_registered_tasks(&mut tasks, label, &mut disposition),
     )
     .await
+    .is_err()
     {
-        Ok(clean) => clean,
-        Err(_) => {
-            debug!(
-                "Forcing cancellation of UDP {} tasks during shutdown",
-                label
-            );
-            tasks.abort_all();
-            tokio::time::timeout(
-                DRIVER_ABORT_TIMEOUT,
-                drain_registered_tasks(&mut tasks, label),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                debug!("Timed out joining aborted UDP {} tasks", label);
-                false
-            })
+        disposition.graceful = false;
+        debug!(
+            "Forcing cancellation of UDP {} tasks during shutdown",
+            label
+        );
+        tasks.abort_all();
+        if tokio::time::timeout(
+            DRIVER_ABORT_TIMEOUT,
+            drain_registered_tasks(&mut tasks, label, &mut disposition),
+        )
+        .await
+        .is_err()
+        {
+            debug!("Timed out joining aborted UDP {} tasks", label);
+            disposition.joined = false;
         }
     }
+    disposition
 }
 
 pub(super) struct UdpDriverStart {
@@ -415,47 +423,53 @@ impl UdpEndpointPool {
                 task: None,
             };
         }
+        let mut io = endpoint.retirement.0.start_driver();
         let task = drivers.tasks.spawn(async move {
-            // Construct before every await so abort and panic take the same
-            // cleanup path as an ordinary driver return.
-            let mut _cleanup = UdpDriverCleanupGuard::new(
-                Arc::clone(&pool),
-                key,
-                generation,
-                decision_token,
-                Arc::clone(&endpoint),
-            );
-            let _ = ready_tx.send(());
-            let initial = match start_rx.await {
-                Ok(initial) => initial,
-                Err(_) => return,
-            };
-            let driver_result = run_endpoint_driver(
-                UdpDriverContext {
-                    endpoint: Arc::clone(&endpoint),
-                    queue_rx,
-                    reply_socket,
-                    reply_socket_factory: Arc::clone(&pool.reply_socket_factory),
-                    reply_socket_slots: Arc::clone(&pool.reply_socket_slots),
-                    client_addr,
-                    client_dst,
-                    alive_set,
-                    stats,
-                    outbound_tracker,
-                    health_family: endpoint.health_family,
-                },
-                initial,
-                first_ack_tx,
-            )
-            .await;
-            let UdpDriverResult { result, outcome } = driver_result;
-            _cleanup.set_outcome(outcome);
-            if let Err(error) = result {
-                debug!(
-                    "UDP endpoint driver {} -> {} stopped: {}",
-                    client_addr, client_dst, error
+            async move {
+                // Construct before every await so abort and panic take the same
+                // cleanup path as an ordinary driver return.
+                let mut _cleanup = UdpDriverCleanupGuard::new(
+                    Arc::clone(&pool),
+                    key,
+                    generation,
+                    decision_token,
+                    Arc::clone(&endpoint),
                 );
+                let _ = ready_tx.send(());
+                let initial = match start_rx.await {
+                    Ok(initial) => initial,
+                    Err(_) => return,
+                };
+                let driver_result = run_endpoint_driver(
+                    UdpDriverContext {
+                        endpoint: Arc::clone(&endpoint),
+                        queue_rx,
+                        reply_socket,
+                        reply_socket_factory: Arc::clone(&pool.reply_socket_factory),
+                        reply_socket_slots: Arc::clone(&pool.reply_socket_slots),
+                        client_addr,
+                        client_dst,
+                        alive_set,
+                        stats,
+                        outbound_tracker,
+                        health_family: endpoint.health_family,
+                    },
+                    initial,
+                    first_ack_tx,
+                )
+                .await;
+                let UdpDriverResult { result, outcome } = driver_result;
+                _cleanup.set_outcome(outcome);
+                if let Err(error) = result {
+                    debug!(
+                        "UDP endpoint driver {} -> {} stopped: {}",
+                        client_addr, client_dst, error
+                    );
+                }
             }
+            .await;
+            io.completed = true;
+            drop(io);
         });
         drop(drivers);
         #[cfg(not(test))]

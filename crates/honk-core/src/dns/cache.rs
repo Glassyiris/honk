@@ -147,6 +147,7 @@ mod counters {
         }
     }
 }
+mod control;
 mod key;
 mod maintenance {
     use std::time::Instant;
@@ -356,6 +357,13 @@ mod storage {
 }
 mod store;
 
+#[cfg(any(feature = "native-api", test))]
+pub(crate) use control::CacheInspectionError;
+#[cfg(feature = "native-api")]
+pub(crate) use control::ExactCacheEntry;
+pub(crate) use control::{CacheInvalidation, CacheMutation};
+#[cfg(any(feature = "native-api", test))]
+pub(crate) use control::{legacy_matches, question_matches};
 pub use counters::CacheCounters;
 pub(crate) use key::{CacheKey, KeyIdentity, OperationKind};
 pub(crate) use service::PublicationEpoch;

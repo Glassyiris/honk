@@ -124,6 +124,7 @@ impl ControlPlane {
                 dial_limit,
                 resource_budget.transient_dials,
                 resource_budget.vless_carriers,
+                config.experimental.native_api.enabled,
                 None,
             )
             .map_err(|e| anyhow::anyhow!("invalid node set: {}", e))?;
@@ -215,6 +216,7 @@ impl ControlPlane {
             .map_err(|error| anyhow::anyhow!("publish initial routing policy: {error:#}"))?;
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));
+        let interrupt_groups = config.groups.clone();
         let config_arc = Arc::new(RwLock::new(Arc::new(config)));
         let initial_runtime =
             crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
@@ -232,6 +234,11 @@ impl ControlPlane {
             initial_runtime,
         ));
         let dns_service = crate::dns::DnsService::with_provider(Arc::clone(&runtime_provider));
+        #[cfg(feature = "native-api")]
+        if let Some(native) = &native {
+            runtime_provider.enable_lifecycle();
+            dns_service.attach_observer(Arc::downgrade(&native.dns));
+        }
         let dns_resolver = Arc::new(DnsResolver::with_service(dns_service.clone()));
 
         let dns_controller = Arc::new(
@@ -306,10 +313,14 @@ impl ControlPlane {
             concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
                 resource_budget.active_tcp_flows,
             )),
+            tcp_admission_target: Arc::new(std::sync::atomic::AtomicUsize::new(
+                resource_budget.active_tcp_flows,
+            )),
             udp_concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
                 resource_budget.udp_slow_path,
             )),
             background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            health_task: None,
             udp_warm_task: tokio::sync::Mutex::new(None),
             udp_warm_ids: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             selector_warm_task: tokio::sync::Mutex::new(None),
@@ -325,6 +336,12 @@ impl ControlPlane {
             phase: None,
             #[cfg(feature = "native-api")]
             native,
+            #[cfg(feature = "native-api")]
+            subscriptions: None,
+            #[cfg(feature = "native-api")]
+            shutdown_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "clash-api")]
+            ui_download: Arc::new(tokio::sync::Mutex::new(None)),
             active_routing_plan: Arc::new(parking_lot::RwLock::new(initial_routing_plan)),
             #[cfg(feature = "reload-bench-counters")]
             reload_slow_path_entries: std::sync::atomic::AtomicU64::new(0),
@@ -338,8 +355,12 @@ impl ControlPlane {
         // its tracked connections so they re-dial through the new node.
         install_interrupt_callback(
             &control_plane.group_manager.read(),
-            &control_plane.group_manager,
+            &interrupt_groups,
             &control_plane.connection_tracker,
+            &control_plane.diagnostics,
+            0,
+            #[cfg(feature = "native-api")]
+            control_plane.native.as_ref(),
         );
         install_selector_warm_callback(
             &control_plane.group_manager.read(),
@@ -364,7 +385,7 @@ impl ControlPlane {
     /// Reap node-bound UDP entries as soon as a real AliveDialerSet transition
     /// reports death. Installing this at construction covers blocked dials and
     /// driver-ready work before `run()` has created listener tasks.
-    fn install_node_death_callback(&self) {
+    pub(super) fn install_node_death_callback(&self) {
         let pool = self.connection_pool.clone();
         let udp_pool = self.udp_pool.clone();
         let config_for_purge = self.config.clone();

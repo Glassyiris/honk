@@ -196,7 +196,7 @@ pub(crate) fn spawn_conn_reaper(
     idle_timeout: Duration,
     on_tick: Option<ReaperTick>,
 ) {
-    tokio::spawn(async move {
+    let _ = crate::runtime::spawn_owned(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.tick().await;
         loop {

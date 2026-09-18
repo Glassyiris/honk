@@ -459,6 +459,7 @@ impl HttpProber for MockHttpProber {
         _addr: std::net::SocketAddr,
         _url: &str,
         _timeout: Duration,
+        _cancel: ProbeCancellation,
     ) -> Pin<Box<dyn Future<Output = HttpProbeOutcome> + Send + 'static>> {
         let result = self.result.clone();
         Box::pin(async move { result.into() })
@@ -478,13 +479,16 @@ impl HttpProber for DelayedHttpProber {
         addr: std::net::SocketAddr,
         _url: &str,
         _timeout: Duration,
+        cancel: ProbeCancellation,
     ) -> Pin<Box<dyn Future<Output = HttpProbeOutcome> + Send + 'static>> {
         let started = Arc::clone(&self.started);
         let release = Arc::clone(&self.release);
         let result = self.result.clone();
         Box::pin(async move {
             started.notify_one();
-            release.notified().await;
+            if cancel.run(release.notified()).await.is_none() {
+                return HttpProbeResult::Cancelled.into();
+            }
             let observation = match &result {
                 HttpProbeResult::WarmSuccess(latency) => Some(NativeHealthObservation::probe(
                     ProbeDomain::Tcp,
@@ -665,6 +669,7 @@ impl UdpProber for MockUdpProber {
         &self,
         _node_id: Uuid,
         _timeout: Duration,
+        _cancel: ProbeCancellation,
     ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>> {
         let r = self
             .result
@@ -691,11 +696,12 @@ impl UdpProber for PendingUdpProber {
         &self,
         _node_id: Uuid,
         timeout: Duration,
+        cancel: ProbeCancellation,
     ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>> {
         Box::pin(async move {
-            tokio::time::sleep(timeout).await;
+            let completed = cancel.run(tokio::time::sleep(timeout)).await;
             UdpProbeOutcome {
-                dns: Some(Err(anyhow::anyhow!("UDP probe timeout"))),
+                dns: completed.map(|()| Err(anyhow::anyhow!("UDP probe timeout"))),
                 data_path: None,
                 observations: [None, None],
             }
@@ -710,6 +716,7 @@ impl UdpProber for CapacityUdpProber {
         &self,
         _node_id: Uuid,
         _timeout: Duration,
+        _cancel: ProbeCancellation,
     ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>> {
         Box::pin(async {
             UdpProbeOutcome {
@@ -731,12 +738,19 @@ impl UdpProber for DelayedUdpProber {
         &self,
         _node_id: Uuid,
         _timeout: Duration,
+        cancel: ProbeCancellation,
     ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>> {
         let started = Arc::clone(&self.started);
         let release = Arc::clone(&self.release);
         Box::pin(async move {
             started.notify_one();
-            release.notified().await;
+            if cancel.run(release.notified()).await.is_none() {
+                return UdpProbeOutcome {
+                    dns: None,
+                    data_path: None,
+                    observations: [None, None],
+                };
+            }
             UdpProbeOutcome {
                 dns: Some(Ok(Duration::from_millis(11))),
                 data_path: None,
@@ -1910,6 +1924,7 @@ async fn native_udp_observations_precede_legacy_family_fanout() {
             &self,
             _: Uuid,
             _: Duration,
+            _cancel: ProbeCancellation,
         ) -> Pin<Box<dyn Future<Output = UdpProbeOutcome> + Send + 'static>> {
             Box::pin(async {
                 let at = std::time::SystemTime::now();
@@ -2138,4 +2153,315 @@ fn native_group_publication_invalidates_evidence_before_target_sync() {
         observation,
     );
     assert_eq!(set.native_group_observations(id(2)).len(), 1);
+}
+
+struct JoinedSocketProbe {
+    cleanup_started: Arc<tokio::sync::Notify>,
+    cleanup_release: Arc<tokio::sync::Semaphore>,
+    completed: tokio::sync::mpsc::UnboundedSender<Uuid>,
+}
+
+impl HttpProber for JoinedSocketProbe {
+    fn probe_http(
+        &self,
+        node: Uuid,
+        addr: SocketAddr,
+        _: &str,
+        _: Duration,
+        cancel: ProbeCancellation,
+    ) -> Pin<Box<dyn Future<Output = HttpProbeOutcome> + Send + 'static>> {
+        let cleanup_started = Arc::clone(&self.cleanup_started);
+        let cleanup_release = Arc::clone(&self.cleanup_release);
+        let completed = self.completed.clone();
+        Box::pin(async move {
+            let mut children = tokio::task::JoinSet::new();
+            children.spawn(async move {
+                use tokio::io::AsyncReadExt;
+                cancel
+                    .run(async {
+                        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+                        socket.read_u8().await.unwrap();
+                    })
+                    .await
+            });
+            let result = children.join_next().await.unwrap().unwrap();
+            assert!(children.join_next().await.is_none());
+            let result = if result.is_some() {
+                HttpProbeResult::WarmSuccess(Duration::from_millis(1))
+            } else {
+                cleanup_started.notify_one();
+                cleanup_release.acquire().await.unwrap().forget();
+                HttpProbeResult::Cancelled
+            };
+            completed.send(node).unwrap();
+            result.into()
+        })
+    }
+}
+
+#[tokio::test]
+async fn health_pause_drains_nested_probe_and_retains_loop() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let set = Arc::new(AliveDialerSet::new());
+        set.register_node(id(1), "first".into(), addr.to_string());
+        set.enable_native_observations();
+        let ticket = set.native_probe_ticket(id(1));
+        let sample = NativeHealthObservation::probe(
+            ProbeDomain::Tcp,
+            HealthMeasurement::HttpHeaders,
+            IpVersion::V4,
+            Some(Duration::from_millis(7)),
+            std::time::SystemTime::now(),
+        );
+        assert!(set.complete_native_probe(&ticket, None, sample));
+        let context = NativeGroupProbeContext {
+            group_id: id(3),
+            member_id: id(4),
+        };
+        assert!(set.complete_native_probe(&ticket, Some(context), sample));
+        let cleanup_started = Arc::new(tokio::sync::Notify::new());
+        let cleanup_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (completed, mut completions) = tokio::sync::mpsc::unbounded_channel();
+        set.set_http_probe(
+            Arc::new(JoinedSocketProbe {
+                cleanup_started: Arc::clone(&cleanup_started),
+                cleanup_release: Arc::clone(&cleanup_release),
+                completed,
+            }),
+            format!("http://{addr}/"),
+            "HEAD".into(),
+        )
+        .await;
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        set.set_ebpf_callback(Box::new({
+            let callbacks = Arc::clone(&callbacks);
+            move |_, _, _, _, _| {
+                callbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+        let owner = set.spawn_health_check_loop_concurrent(
+            Duration::from_secs(3600),
+            Duration::from_secs(30),
+            1,
+        );
+        let (mut peer, _) = listener.accept().await.unwrap();
+        set.register_node(id(2), "queued".into(), addr.to_string());
+        set.trigger_probe(id(2));
+        let pause = tokio::spawn({
+            let set = Arc::clone(&set);
+            async move { set.pause_health_checks().await }
+        });
+        cleanup_started.notified().await;
+        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+        assert!(
+            !pause.is_finished(),
+            "cleanup completion is part of the ack"
+        );
+        assert!(!set.probe_node(id(2), Duration::from_secs(1)).await);
+        cleanup_release.add_permits(1);
+        pause.await.unwrap().unwrap();
+        assert_eq!(completions.recv().await, Some(id(1)));
+        assert!(
+            set.get_probe_history(id(1), ProbeDomain::Tcp, IpVersion::V4)
+                .is_empty()
+        );
+        assert!(
+            set.get_probe_history(id(2), ProbeDomain::Tcp, IpVersion::V4)
+                .is_empty()
+        );
+        assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(set.native_observations(id(1)), vec![sample]);
+        assert_eq!(set.native_group_observations(id(3)).len(), 1);
+        set.trigger_probe(id(2));
+        set.resume_health_checks().unwrap();
+        assert!(!set.complete_native_probe(&ticket, None, sample));
+        for _ in 0..2 {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            peer.write_u8(1).await.unwrap();
+            completions.recv().await.unwrap();
+        }
+        cleanup_release.add_permits(10);
+        set.shutdown_health_checks().await.unwrap();
+        owner.await.unwrap();
+        assert!(
+            completions.try_recv().is_err(),
+            "pre-pause triggers must not replay"
+        );
+        for node in [id(1), id(2)] {
+            let history = set.get_probe_history(node, ProbeDomain::Tcp, IpVersion::V4);
+            assert_eq!(history.len(), 1);
+            assert!(history[0].success);
+        }
+        assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(set.resume_health_checks(), Err(HealthCheckError::Stopped));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn health_pause_timeout_keeps_admission_closed_and_discards_queued_triggers() {
+    let set = AliveDialerSet::new();
+    set.trigger_probe(id(1));
+    let permit = set.acquire_health_probe().unwrap();
+    let old_cancel = permit.cancellation();
+    assert_eq!(
+        set.pause_health_checks().await,
+        Err(HealthCheckError::DrainTimeout)
+    );
+    assert_eq!(
+        set.resume_health_checks(),
+        Err(HealthCheckError::NotDrained)
+    );
+    assert!(matches!(
+        set.acquire_health_probe(),
+        Err(HealthCheckError::Paused)
+    ));
+    set.trigger_probe(id(2));
+    drop(permit);
+    set.pause_health_checks().await.unwrap();
+    set.resume_health_checks().unwrap();
+    assert!(old_cancel.is_cancelled());
+    assert!(
+        !set.acquire_health_probe()
+            .unwrap()
+            .cancellation()
+            .is_cancelled()
+    );
+    set.trigger_probe(id(3));
+    let mut receiver = set.take_trigger_rx().unwrap();
+    assert_eq!(receiver.try_recv(), Ok(id(3)));
+    assert!(receiver.try_recv().is_err());
+    set.shutdown_health_checks().await.unwrap();
+}
+
+#[tokio::test]
+async fn health_external_jobs_survive_response_disconnect_and_join_on_pause() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let set = Arc::new(AliveDialerSet::new());
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut requests = Vec::new();
+        for _ in 0..10 {
+            let set = Arc::clone(&set);
+            let started = started.clone();
+            let completed = Arc::clone(&completed);
+            requests.push(tokio::spawn(async move {
+                set.run_external_probe(move |cancel| async move {
+                    started.send(()).unwrap();
+                    cancel.cancelled().await;
+                    completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+                .await
+            }));
+            starts.recv().await.unwrap();
+        }
+        assert_eq!(
+            set.run_external_probe(|_| async { 1 }).await,
+            Err(HealthCheckError::Busy)
+        );
+        for request in requests {
+            request.abort();
+            let _ = request.await;
+        }
+        set.pause_health_checks().await.unwrap();
+        assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 10);
+        assert_eq!(
+            set.run_external_probe(|_| async { 1 }).await,
+            Err(HealthCheckError::Paused)
+        );
+        set.resume_health_checks().unwrap();
+        assert_eq!(set.run_external_probe(|_| async { 42 }).await, Ok(42));
+        set.shutdown_health_checks().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn health_pause_preserves_completed_failure_before_cancelled_retry() {
+    struct RetryProbe(Arc<tokio::sync::Notify>, std::sync::atomic::AtomicUsize);
+    impl HttpProber for RetryProbe {
+        fn probe_http(
+            &self,
+            _: Uuid,
+            _: SocketAddr,
+            _: &str,
+            _: Duration,
+            cancel: ProbeCancellation,
+        ) -> Pin<Box<dyn Future<Output = HttpProbeOutcome> + Send + 'static>> {
+            let first = self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            let started = Arc::clone(&self.0);
+            Box::pin(async move {
+                if first {
+                    HttpProbeResult::ExchangeFailure("peer closed".into()).into()
+                } else {
+                    started.notify_one();
+                    cancel.cancelled().await;
+                    HttpProbeResult::Cancelled.into()
+                }
+            })
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let set = Arc::new(AliveDialerSet::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        set.register_node(id(1), "retry".into(), "127.0.0.1:1".into());
+        set.set_http_probe(
+            Arc::new(RetryProbe(Arc::clone(&started), Default::default())),
+            "http://127.0.0.1,127.0.0.2".into(),
+            "HEAD".into(),
+        )
+        .await;
+        let probe = tokio::spawn({
+            let set = Arc::clone(&set);
+            async move { set.probe_node(id(1), Duration::from_secs(1)).await }
+        });
+        started.notified().await;
+        set.pause_health_checks().await.unwrap();
+        assert!(!probe.await.unwrap());
+        let history = set.get_probe_history(id(1), ProbeDomain::Tcp, IpVersion::V4);
+        assert_eq!(history.len(), 1);
+        assert!(!history[0].success);
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn health_pause_rejects_panicked_resolver_child() {
+    let set = AliveDialerSet::new();
+    set.enable_native_observations();
+    let permit = set.acquire_health_probe().unwrap();
+    let cancel = permit.cancellation();
+    let (started, receive) = tokio::sync::oneshot::channel();
+    cancel
+        .scope_resolution(async {
+            crate::runtime::spawn_owned(async move {
+                started.send(()).unwrap();
+                panic!("resolver child failed");
+            })
+            .unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    receive.await.unwrap();
+    drop(permit);
+    assert_eq!(
+        set.pause_health_checks().await,
+        Err(HealthCheckError::WorkerFailed)
+    );
+    assert_eq!(
+        set.resume_health_checks(),
+        Err(HealthCheckError::WorkerFailed)
+    );
+    assert_eq!(
+        set.shutdown_health_checks().await,
+        Err(HealthCheckError::WorkerFailed)
+    );
 }

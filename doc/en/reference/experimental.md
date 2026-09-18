@@ -8,7 +8,7 @@ This reference describes the current nested sections under `experimental { ... }
 | --- | --- |
 | `clash_api` | Clash-compatible HTTP API and external dashboard |
 | `cache_file` | SQLite persistence for runtime choices, mode, delay samples, and optional DNS state |
-| `native_api` | Independent, opt-in native observations, accepted-source administration and local UI directory |
+| `native_api` | Independent, opt-in observations, bounded diagnostics, runtime/source control and local UI directory |
 
 `udp_nfqueue { enabled: ... }` is a deprecated compatibility section. Dae and structured loaders accept it, print a migration warning, and copy its value to `global.nfqueue_enable`; new configurations should use the global field directly.
 
@@ -28,6 +28,10 @@ Requires the default-off `native-api` Cargo feature; it does not require `clash-
 | `record_flows` | `true` | Retain bounded userspace decisions while native API is enabled, even without clients. `false` disables recording and releases its buffers; restart-required. |
 | `record_traffic` | `true` | Keep up to 600 traffic samples for 600 seconds, even without clients. `false` disables history and releases its buffer on restart; current counters remain available. |
 | `record_memory` | `true` | Keep up to 600 memory samples for 600 seconds, even without clients. `false` disables history and releases its buffer on restart; current readings remain available. |
+| `record_logs` | `true` | Retain up to 512 sanitized structured logs for 60 seconds without subscribers. `false` disables native capture and releases storage; console/Clash logging is independent. |
+| `record_dns_log` | `true` | Retain up to 512 completed client DNS outcomes within an 8 MiB wire/metadata budget. `false` disables history and releases storage. |
+| `probe_allowed_cidrs` | empty list | Explicit IP CIDRs authorizing otherwise restricted resolved probe targets and proxy-server addresses. Empty denies restricted addresses, including loopback/private/link-local ranges. |
+| `probe_allowed_ports` | empty list | Additional ports 1–65535 for configured HTTP/DNS probe targets. Defaults permit HTTP 80, HTTPS 443 and DNS 53; raw TCP probes use only the node's configured server port. CIDR authorization remains independently required. |
 | `config_content` | `false` | Allow authenticated administrators to read exact accepted source text, excluding entire API-credential-bearing sources. Requires a nonempty `secret`. |
 | `config_write` | `false` | Allow whole-source replacement and reload for the accepted main file and explicitly authorized includes, excluding API-credential-bearing sources. Requires a nonempty `secret`. |
 | `writable_includes` | empty list | Explicit canonical entry-directory-relative `.dae` paths, such as `'parts/routing.dae'`; only already accepted includes qualify. No absolute paths, traversal or globs; ignored for write permission unless `config_write` is true. |
@@ -54,11 +58,13 @@ Lists use individually quoted comma-separated entries, such as `allow_origins: '
 
 Relative UI paths follow the existing dependency search: an existing path under `global.data_dir`, then `/var/share/honk`, then the working directory; a missing dependency resolves under `global.data_dir` and startup fails. The administrator owns the directory and any symlink targets. See the [native API contract](./api.md#native-api-m1).
 
-Traffic and memory histories share the existing one-second sampler; missing samples/measurements remain gaps/nulls rather than zero-filled or interpolated points. Memory is actual process RSS and available cgroup-v2 data, not kernel accounting. All five settings above, like the other native settings, require restart.
+Traffic and memory histories share the existing one-second sampler; missing samples/measurements remain gaps/nulls rather than zero-filled or interpolated points. Memory is actual process RSS and available cgroup-v2 data, not kernel accounting. File settings remain restart-required. `PATCH /api/v1/runtime/settings` can transiently adjust the supported log/DNS-log/flow limits and native log level, but cannot enable a disabled recorder. Accepted explicit activation, including no-op, restores configured values; provider/network refresh and suspend/resume preserve overrides.
 
 Configuration metadata, validation and reload operations require a genuine `.dae` source snapshot captured at startup; programmatic configs and compatibility serde loaders do not supply one. Content and write permission are independent opt-ins. Exact disclosed text may contain sensitive configuration: it is not a sandboxed or generally redacted save payload. Entire API-credential-bearing sources are omitted from content and stay read-only; metadata paths remain `<redacted>`. Move credentials to a dedicated read-only include locally if the main source must be editable. The API cannot change/move API credentials or alter native settings; those require a local edit and restart.
 
-For example, `writable_includes: 'parts/routing.dae', 'parts/groups.dae'` authorizes only those accepted canonical paths when writing is enabled; it does not change ordinary `include` glob or no-match semantics. Save by opaque source ID with a strong disk-content SHA-256 `If-Match`, then follow the real reload operation. A successful write is not activation success, and externally uncoordinated editors can still race the final check/rename window. See [M6 safety and failure semantics](./api.md#accepted-configuration-and-reload-operations-m6). M3b group controls remain gated despite source-write support.
+For example, `writable_includes: 'parts/routing.dae', 'parts/groups.dae'` authorizes only those accepted canonical paths when writing is enabled; it does not change ordinary `include` glob or no-match semantics. Save by opaque source ID with a strong disk-content SHA-256 `If-Match`, then follow the real reload operation. A successful write is not activation success, and externally uncoordinated editors can still race the final check/rename window. Restricted Group PATCH uses the same source transaction but requires the accepted group/config ETag, checked before writing and again before activation; that revision is not the disk hash. See [source safety and failure semantics](./api.md#accepted-configuration-and-reload-operations-m6).
+
+Probe requests cannot supply URLs or allowlist exceptions. For an intentionally local test target, an administrator might set `probe_allowed_cidrs: '127.0.0.1/32'` and `probe_allowed_ports: '18080'`; authorize only the necessary destinations/ports. Resolution checks and address pinning still apply. Native source writes cannot change these allowlists.
 
 ## `clash_api`
 
@@ -69,7 +75,7 @@ For example, `writable_includes: 'parts/routing.dae', 'parts/groups.dae'` author
 | `external_ui_download_url` | `""` | HTTP(S) dashboard ZIP URL. An empty value uses the built-in zashboard URL. |
 | `external_ui_download_detour` | `""` | Node or group tag used for the download. An empty value follows normal traffic routing. |
 | `secret` | `""` | API authentication secret. An empty value disables authentication. |
-| `default_mode` | `"Rule"` | Startup mode: `Rule`, `Global`, or `Direct`. A valid cached mode takes precedence. |
+| `default_mode` | `"Rule"` | Startup mode when native API is disabled: `Rule`, `Global`, or `Direct`; a valid cached mode takes precedence. Native-enabled startup uses shared transient rule mode instead. |
 
 All `clash_api` fields are startup-owned. SIGHUP rejects a candidate configuration that changes any of them.
 
@@ -87,7 +93,7 @@ A non-empty `external_ui_download_detour` forces the initial request and every r
 
 ### Startup mode
 
-`default_mode` accepts the canonical modes `Rule`, `Global`, and `Direct`. When `cache_file` is enabled and contains a valid cached Clash mode, that value is restored instead. Invalid cached or configured values fall back to `Rule`.
+With native disabled, `default_mode` accepts `Rule`, `Global`, and `Direct`; a valid cached Clash mode takes precedence, and invalid values fall back to `Rule`. With native enabled, both APIs use one transient mode owner: no mode restore/persistence, rule at startup and every accepted explicit activation (including no-op), and preservation across provider/network refresh or suspend/resume. Native global mode targets a stable node/group identity and fails closed if refresh removes it. See [runtime mode](./api.md#connection-closing-mode-and-datapath-lifecycle).
 
 ## `cache_file`
 
@@ -103,7 +109,7 @@ The whole `cache_file` section is startup-owned. SIGHUP rejects a candidate conf
 
 ### Always-persisted state
 
-Whenever `enabled` successfully opens the database, honk persists Selector choices, the Clash mode, and each node's last real delay sample independently of `store_fakeip` and `store_dns`. Delay samples are snapshotted every minute; restoration discards malformed, zero, or older-than-24-hour samples. Liveness is not restored.
+Whenever `enabled` successfully opens the database, honk persists per-network Selector choices and each node's last real delay sample independently of `store_fakeip` and `store_dns`. Clash mode is restored/persisted only with native API disabled. Delay samples are snapshotted every minute; restoration discards malformed, zero, or older-than-24-hour samples. Liveness is not restored.
 
 ### DNS persistence
 

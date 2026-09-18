@@ -1,12 +1,12 @@
 use super::*;
 
-async fn raw_h2_init(peer: &mut tokio::io::DuplexStream) {
+async fn raw_h2_init<S: AsyncRead + AsyncWrite + Unpin>(peer: &mut S) {
     let mut preface = [0; 24];
     peer.read_exact(&mut preface).await.unwrap();
     peer.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await.unwrap();
 }
 
-async fn next_h2_request_stream(peer: &mut tokio::io::DuplexStream) -> u32 {
+async fn next_h2_request_stream<S: AsyncRead + AsyncWrite + Unpin>(peer: &mut S) -> u32 {
     loop {
         let mut header = [0; 9];
         peer.read_exact(&mut header).await.unwrap();
@@ -316,4 +316,145 @@ async fn cancelling_stalled_h2_probe_drops_its_driver_stream() {
     .expect("cancelled HTTP/2 driver must release its stream");
     server.abort();
     let _ = server.await;
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn native_h2_cold_and_warm_exchange_configured_request() {
+    for cold in [true, false] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(stream).await.unwrap();
+            let mut methods = Vec::new();
+            while let Some(Ok((request, mut respond))) = connection.accept().await {
+                assert_eq!(
+                    request.uri().authority().unwrap().as_str(),
+                    "probe.example:8080"
+                );
+                assert_eq!(
+                    request.uri().path_and_query().unwrap().as_str(),
+                    "/check?raw=%2f"
+                );
+                methods.push(request.method().clone());
+                respond
+                    .send_response(
+                        http::Response::builder().status(204).body(()).unwrap(),
+                        true,
+                    )
+                    .unwrap();
+            }
+            methods
+        });
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = http_probe_request("http://probe.example:8080/check?raw=%2f", "GET").unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        tokio::time::timeout_at(
+            deadline,
+            native_exchange_http2(stream, &request, cold, deadline),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let methods = tokio::time::timeout(Duration::from_secs(1), peer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            methods,
+            if cold {
+                vec![http::Method::GET]
+            } else {
+                vec![http::Method::HEAD, http::Method::GET]
+            }
+        );
+    }
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn native_h2_rejects_bad_status_and_duplicate_status_without_warm_fallback() {
+    for cold in [true, false] {
+        // HPACK static :status 500; then duplicate :status 204 pseudo-headers.
+        for headers in [vec![0x8e], vec![0x89, 0x89]] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let peer = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                raw_h2_init(&mut stream).await;
+                let mut id = next_h2_request_stream(&mut stream).await;
+                if !cold {
+                    stream
+                        .write_all(&[0, 0, 1, 1, 5, 0, 0, 0, 1, 0x89])
+                        .await
+                        .unwrap();
+                    id = next_h2_request_stream(&mut stream).await;
+                }
+                let mut frame = vec![0, 0, headers.len() as u8, 1, 5];
+                frame.extend_from_slice(&id.to_be_bytes());
+                frame.extend_from_slice(&headers);
+                stream.write_all(&frame).await.unwrap();
+                let mut rest = Vec::new();
+                let _ = stream.read_to_end(&mut rest).await;
+            });
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let request = http_probe_request("http://probe.example/check", "GET").unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let result = tokio::time::timeout_at(
+                deadline,
+                native_exchange_http2(stream, &request, cold, deadline),
+            )
+            .await
+            .expect("peer sends a terminal response, not a timeout");
+            assert!(result.is_err(), "invalid HTTP/2 response: {result:?}");
+            tokio::time::timeout(Duration::from_secs(1), peer)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn native_h2_cancellation_drops_stalled_driver_inline() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (accepted, accepted_rx) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut connection = h2::server::handshake(stream).await.unwrap();
+        let (request, respond) = connection.accept().await.unwrap().unwrap();
+        accepted.send(()).unwrap();
+        let _held = (connection, request, respond);
+        std::future::pending::<()>().await;
+    });
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let block_writes = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watched = DropWatch {
+        stream: tokio::net::TcpStream::connect(addr).await.unwrap(),
+        dropped: Arc::clone(&dropped),
+        block_writes: Arc::clone(&block_writes),
+    };
+    let request = http_probe_request("http://probe.example/stall", "GET").unwrap();
+    let mut probe = Box::pin(native_exchange_http2(
+        watched,
+        &request,
+        false,
+        tokio::time::Instant::now() + Duration::from_secs(2),
+    ));
+    tokio::select! {
+        result = &mut probe => panic!("probe completed before cancellation: {result:?}"),
+        accepted = accepted_rx => accepted.unwrap(),
+        _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("probe did not send HEAD"),
+    }
+    block_writes.store(true, std::sync::atomic::Ordering::Release);
+    drop(probe);
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::Acquire),
+        "cancellation must release the HTTP/2 driver without another task being scheduled"
+    );
+    peer.abort();
+    let _ = peer.await;
 }

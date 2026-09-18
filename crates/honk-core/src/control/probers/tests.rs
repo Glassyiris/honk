@@ -102,6 +102,7 @@ async fn rejected_first_response_cannot_become_fallback_success() {
             addr,
             &format!("http://probe.invalid:{}/health", addr.port()),
             Duration::from_secs(1),
+            honk_outbound::alive::ProbeCancellation::default(),
         )
         .await;
 
@@ -147,7 +148,13 @@ async fn c25_health_sends_authority_and_path_query_without_credentials() {
         let url = format!("http://user:PRIVATE@{url_host}:{}{suffix}", addr.port());
         let (prober, node_id) = test_prober("HEAD");
         let result = prober
-            .probe_http(node_id, addr, &url, Duration::from_secs(2))
+            .probe_http(
+                node_id,
+                addr,
+                &url,
+                Duration::from_secs(2),
+                honk_outbound::alive::ProbeCancellation::default(),
+            )
             .await;
         assert!(
             matches!(&result.result, HttpProbeResult::WarmSuccess(_)),
@@ -186,6 +193,7 @@ async fn configured_target_and_method_reach_the_server() {
                 addr.port()
             ),
             Duration::from_secs(1),
+            honk_outbound::alive::ProbeCancellation::default(),
         )
         .await;
 
@@ -231,6 +239,7 @@ async fn https_probe_starts_with_tls() {
             addr,
             &format!("https://localhost:{}/secure", addr.port()),
             Duration::from_secs(1),
+            honk_outbound::alive::ProbeCancellation::default(),
         )
         .await;
 
@@ -289,6 +298,7 @@ async fn c27_http_rejects_invalid_nodes_before_dial() {
                 "127.0.0.1:9".parse().unwrap(),
                 "http://127.0.0.1:9/",
                 Duration::from_millis(50),
+                honk_outbound::alive::ProbeCancellation::default(),
             )
             .await;
         assert!(matches!(result.result, HttpProbeResult::SetupFailure(_)));
@@ -332,7 +342,13 @@ async fn c27_udp_rejects_invalid_nodes_without_data_path() {
             None,
             manager,
         );
-        let result = prober.probe_udp(node.id, Duration::from_millis(50)).await;
+        let result = prober
+            .probe_udp(
+                node.id,
+                Duration::from_millis(50),
+                honk_outbound::alive::ProbeCancellation::default(),
+            )
+            .await;
         assert!(matches!(result.dns, Some(Err(_))));
         assert!(result.data_path.is_none());
         assert!(
@@ -399,7 +415,13 @@ async fn udp_capability_and_policy_gates_skip_target_resolution_and_health_feedb
             manager,
         );
 
-        let outcome = prober.probe_udp(node.id, Duration::from_millis(50)).await;
+        let outcome = prober
+            .probe_udp(
+                node.id,
+                Duration::from_millis(50),
+                honk_outbound::alive::ProbeCancellation::default(),
+            )
+            .await;
 
         assert!(outcome.dns.is_none());
         assert!(outcome.data_path.is_none());
@@ -425,6 +447,7 @@ async fn c27_urltest_propagates_admission_before_dial() {
             "http://127.0.0.1:9/",
             Duration::from_millis(50),
             &GroupManager::new(&[], &[]),
+            Default::default(),
         )
         .await;
         assert!(
@@ -498,7 +521,13 @@ async fn quic_target_refusal_is_retried_by_later_udp_probe() {
             manager,
         );
 
-        let first = prober.probe_udp(node.id, Duration::from_secs(1)).await;
+        let first = prober
+            .probe_udp(
+                node.id,
+                Duration::from_secs(1),
+                honk_outbound::alive::ProbeCancellation::default(),
+            )
+            .await;
         let error = first
             .data_path
             .expect("refusal must propagate")
@@ -506,7 +535,13 @@ async fn quic_target_refusal_is_retried_by_later_udp_probe() {
         assert!(honk_outbound::proxy::is_packet_rejection(&error));
         assert_eq!(dials.load(Ordering::SeqCst), 1, "only DNS was dialed");
 
-        let second = prober.probe_udp(node.id, Duration::from_secs(1)).await;
+        let second = prober
+            .probe_udp(
+                node.id,
+                Duration::from_secs(1),
+                honk_outbound::alive::ProbeCancellation::default(),
+            )
+            .await;
         let error = second.data_path.expect("QUIC must be retried").unwrap_err();
         assert!(!honk_outbound::proxy::is_packet_rejection(&error));
         assert_eq!(resolutions.load(Ordering::SeqCst), 3);
@@ -641,7 +676,13 @@ async fn native_udp_dns_records_only_the_actual_target_family() {
         )))),
     );
     let before = std::time::SystemTime::now();
-    let result = prober.probe_udp(node.id, Duration::from_secs(1)).await;
+    let result = prober
+        .probe_udp(
+            node.id,
+            Duration::from_secs(1),
+            honk_outbound::alive::ProbeCancellation::default(),
+        )
+        .await;
     finish_server(peer).await;
     let sample = result.observations[0].unwrap();
     assert_eq!(sample.measurement, HealthMeasurement::DnsRoundTrip);
@@ -649,4 +690,53 @@ async fn native_udp_dns_records_only_the_actual_target_family() {
     assert!(sample.observed_at >= before);
     assert!(sample.latency.unwrap() <= result.dns.unwrap().unwrap());
     assert!(result.observations[1].is_none());
+}
+
+#[tokio::test]
+async fn health_pause_closes_real_http_probe_without_failure_evidence() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (prober, node) = test_prober("HEAD");
+        let alive = Arc::new(AliveDialerSet::new());
+        alive.enable_native_observations();
+        alive.register_node(node, "probe".into(), addr.to_string());
+        alive
+            .set_http_probe(Arc::new(prober), format!("http://{addr}/"), "HEAD".into())
+            .await;
+        let request = tokio::spawn({
+            let alive = Arc::clone(&alive);
+            async move { alive.probe_node(node, Duration::from_secs(30)).await }
+        });
+        let (mut peer, _) = listener.accept().await.unwrap();
+        read_request_head(&mut peer).await;
+        alive.pause_health_checks().await.unwrap();
+        assert!(!request.await.unwrap());
+        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+        assert!(alive.native_observations(node).is_empty());
+        assert!(
+            alive
+                .get_probe_history(node, ProbeDomain::Tcp, IpVersion::V4)
+                .is_empty()
+        );
+        alive.resume_health_checks().unwrap();
+        let request = tokio::spawn({
+            let alive = Arc::clone(&alive);
+            async move { alive.probe_node(node, Duration::from_secs(1)).await }
+        });
+        let (mut peer, _) = listener.accept().await.unwrap();
+        for _ in 0..2 {
+            read_request_head(&mut peer).await;
+            peer.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        }
+        assert!(request.await.unwrap());
+        alive.shutdown_health_checks().await.unwrap();
+        let history = alive.get_probe_history(node, ProbeDomain::Tcp, IpVersion::V4);
+        assert_eq!(history.len(), 1);
+        assert!(history[0].success);
+    })
+    .await
+    .unwrap();
 }

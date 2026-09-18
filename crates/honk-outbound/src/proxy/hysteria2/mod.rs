@@ -167,7 +167,7 @@ impl Hy2ConnState {
             let recv_conn = conn.clone();
             let recv_sessions = Arc::clone(&sessions);
             let recv_health = Arc::clone(&path_health);
-            tokio::spawn(async move {
+            let _ = crate::runtime::spawn_owned(async move {
                 loop {
                     let Ok(data) = recv_conn.read_datagram().await else {
                         break;

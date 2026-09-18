@@ -1,0 +1,245 @@
+use std::time::{Duration, Instant, SystemTime};
+
+use axum::{http::Uri, response::Response};
+use serde_json::json;
+use uuid::Uuid;
+
+use super::{
+    ApiError, MAX_RESPONSE_BYTES, NativeState, RequestId, bounded_response, canonical_name,
+    full_detail, invalid_query, parameters, records, timestamp, unavailable,
+};
+use crate::dns::cache::ExactCacheEntry;
+
+const SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
+const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
+
+#[derive(PartialEq, Eq)]
+struct Filters {
+    name: Option<String>,
+    domain: Option<String>,
+    types: Vec<u16>,
+    expired: bool,
+    full: bool,
+}
+
+pub(super) struct Snapshot {
+    id: String,
+    instance: String,
+    created: Instant,
+    observed_at: String,
+    filters: Filters,
+    entries: Vec<ExactCacheEntry>,
+    bytes: usize,
+    wall: SystemTime,
+}
+
+pub(super) async fn serve(
+    state: &NativeState,
+    uri: &Uri,
+    id: &RequestId,
+) -> Result<Response, ApiError> {
+    let (values, mut types) = parameters(
+        uri,
+        &[
+            "name",
+            "domain",
+            "type",
+            "include_expired",
+            "limit",
+            "cursor",
+            "detail",
+        ],
+        id,
+    )?;
+    types.sort_unstable();
+    let filters = Filters {
+        name: values
+            .get("name")
+            .map(|name| canonical_name(name, id))
+            .transpose()?,
+        domain: values
+            .get("domain")
+            .map(|domain| domain.to_ascii_lowercase()),
+        types,
+        expired: match values
+            .get("include_expired")
+            .map(String::as_str)
+            .unwrap_or("false")
+        {
+            "true" => true,
+            "false" => false,
+            _ => return Err(invalid_query(id)),
+        },
+        full: full_detail(&values, id)?,
+    };
+    let limit = values
+        .get("limit")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|_| invalid_query(id))?
+        .unwrap_or(100);
+    if !(1..=1000).contains(&limit) {
+        return Err(invalid_query(id));
+    }
+    let api = &state.observation.dns;
+    let mut snapshots = api.snapshots.lock().await;
+    snapshots.retain(|snapshot| snapshot.created.elapsed() < SNAPSHOT_TTL);
+    if let Some(cursor) = values.get("cursor") {
+        let (snapshot_id, position) = cursor.rsplit_once(':').ok_or_else(|| invalid_query(id))?;
+        let position = position.parse::<usize>().map_err(|_| invalid_query(id))?;
+        let snapshot = snapshots
+            .iter()
+            .find(|snapshot| {
+                snapshot.id == snapshot_id
+                    && snapshot.instance == api.instance
+                    && snapshot.filters == filters
+            })
+            .ok_or_else(|| invalid_query(id))?;
+        if position == 0 || position >= snapshot.entries.len() {
+            return Err(invalid_query(id));
+        }
+        return page(snapshot, position, limit, id);
+    }
+    if snapshots.len() == 8 {
+        return Err(unavailable(id));
+    }
+    let retained = snapshots
+        .iter()
+        .map(|snapshot| snapshot.bytes)
+        .sum::<usize>();
+    let overhead = std::mem::size_of::<Snapshot>()
+        + api.instance.len()
+        + 256
+        + filters.name.as_ref().map_or(0, String::capacity)
+        + filters.domain.as_ref().map_or(0, String::capacity)
+        + filters.types.capacity() * std::mem::size_of::<u16>();
+    let available = SNAPSHOT_BYTES
+        .checked_sub(retained.saturating_add(overhead))
+        .ok_or_else(|| unavailable(id))?;
+    let mut entries = state
+        .dns
+        .inspect_cache(available)
+        .await
+        .map_err(|_| unavailable(id))?;
+    let created = Instant::now();
+    let wall = SystemTime::now();
+    entries.retain(|entry| {
+        if !filters.expired && entry.expires_at <= created {
+            return false;
+        }
+        let Ok(question) = records::question(entry.key.wire_identity(), entry.key.ingress()) else {
+            return false;
+        };
+        let name = question.name.to_ascii_lowercase();
+        filters.name.as_ref().is_none_or(|filter| filter == &name)
+            && filters
+                .domain
+                .as_ref()
+                .is_none_or(|filter| name.contains(filter))
+            && (filters.types.is_empty()
+                || records::parse_type(&question.rtype)
+                    .is_some_and(|qtype| filters.types.contains(&qtype)))
+    });
+    entries.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+    let bytes = overhead
+        + entries.iter().map(|entry| entry.cost).sum::<usize>()
+        + (entries.capacity() - entries.len()) * std::mem::size_of::<ExactCacheEntry>();
+    let snapshot = Snapshot {
+        id: Uuid::new_v4().to_string(),
+        instance: api.instance.clone(),
+        created,
+        observed_at: timestamp(wall),
+        filters,
+        entries,
+        bytes,
+        wall,
+    };
+    let response = page(&snapshot, 0, limit, id)?;
+    if snapshot.entries.len() > limit {
+        snapshots.push_back(snapshot);
+    }
+    Ok(response)
+}
+
+fn at(snapshot: &Snapshot, instant: Instant) -> String {
+    let wall = if instant >= snapshot.created {
+        snapshot
+            .wall
+            .checked_add(instant.duration_since(snapshot.created))
+    } else {
+        snapshot
+            .wall
+            .checked_sub(snapshot.created.duration_since(instant))
+    };
+    timestamp(wall.unwrap_or(snapshot.wall))
+}
+
+fn page(
+    snapshot: &Snapshot,
+    offset: usize,
+    limit: usize,
+    id: &RequestId,
+) -> Result<Response, ApiError> {
+    let end = offset.saturating_add(limit).min(snapshot.entries.len());
+    let mut budget = MAX_RESPONSE_BYTES.saturating_sub(1024);
+    let mut rows = Vec::with_capacity(end - offset);
+    for entry in &snapshot.entries[offset..end] {
+        let question = records::question(entry.key.wire_identity(), entry.key.ingress())
+            .map_err(|_| unavailable(id))?;
+        if question.name.len() < 2 {
+            return Err(unavailable(id));
+        }
+        let metadata_cost = entry
+            .id
+            .len()
+            .saturating_add(question.name.len())
+            .saturating_add(512);
+        budget = budget
+            .checked_sub(metadata_cost)
+            .ok_or_else(|| unavailable(id))?;
+        let status = if let Some(rcode) = entry.negative {
+            match rcode {
+                0 => "NODATA".to_owned(),
+                2 => "SERVFAIL".to_owned(),
+                3 => "NXDOMAIN".to_owned(),
+                5 => "REFUSED".to_owned(),
+                other => format!("RCODE{other}"),
+            }
+        } else if let Some(response) = &entry.response {
+            if response.get(3).is_some_and(|value| value & 15 == 0)
+                && response.get(6..8) == Some(&[0, 0])
+            {
+                "NODATA".to_owned()
+            } else {
+                records::status(response)
+            }
+        } else {
+            return Err(unavailable(id));
+        };
+        let mut row = json!({"entry_id":entry.id,"domain":question.name,"type":question.rtype,"class":question.class,"status":status,
+            "expires_at":at(snapshot,entry.expires_at),"stale_until":entry.stale_until.map(|value| at(snapshot,value))});
+        if snapshot.filters.full {
+            let answers = if let Some(response) =
+                entry.response.as_ref().filter(|_| entry.negative.is_none())
+            {
+                records::project(
+                    entry.key.wire_identity(),
+                    response,
+                    entry.key.ingress(),
+                    &mut budget,
+                )
+                .map_err(|_| unavailable(id))?
+            } else {
+                Vec::new()
+            };
+            row["answers"] = json!(answers);
+        }
+        rows.push(row);
+    }
+    let cursor = (end < snapshot.entries.len()).then(|| format!("{}:{end}", snapshot.id));
+    bounded_response(
+        &json!({"observed_at":snapshot.observed_at,"coverage":{"positive":true,"negative":true,"persistent":false},
+        "entries":rows,"total":snapshot.entries.len(),"next_cursor":cursor}),
+        id,
+    )
+}

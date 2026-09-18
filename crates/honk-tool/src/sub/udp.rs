@@ -237,9 +237,16 @@ pub(super) async fn probe_udp_quic(
     };
 
     Some(
-        honk_outbound::quic::quic_handshake_probe(transport, addr, url_host, &config, timeout)
-            .await
-            .map(|measurement| measurement.latency)
-            .map_err(|_| ProbeFailureKind::Exchange),
+        honk_outbound::quic::quic_handshake_probe(
+            transport,
+            addr,
+            url_host,
+            &config,
+            timeout,
+            honk_outbound::alive::ProbeCancellation::default(),
+        )
+        .await
+        .map(|measurement| measurement.latency)
+        .map_err(|_| ProbeFailureKind::Exchange),
     )
 }

@@ -563,3 +563,154 @@ fn routing_handoff_layout_validation_rejects_legacy_value_size() {
     assert!(validate_routing_handoff_sizes(key, current).is_ok());
     assert!(validate_routing_handoff_sizes(key, 48).is_err());
 }
+
+#[test]
+#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+fn datapath_observation_crosschecks_program_hook_root_and_admission() {
+    use crate::ebpf::{DatapathCheck, DatapathObservationError};
+    use aya::maps::{ArrayOfMaps, IterableMap};
+
+    std::thread::spawn(|| {
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
+        let mut netlink = crate::netlink::NlSock::new().unwrap();
+        let (loopback, _) = netlink.get_link("lo").unwrap();
+        netlink.set_link_up(loopback, true).unwrap();
+        let mut backend = RealEbpfBackend::load_routing_test_fixture(
+            crate::DEFAULT_BPF_OBJECT,
+            DaeParam::default(),
+        )
+        .unwrap();
+        let before = backend.observe_datapath();
+        assert_eq!(before.programs, DatapathCheck::Absent);
+        assert_eq!(before.hooks, DatapathCheck::Absent);
+        assert_eq!(before.routing, DatapathCheck::Absent);
+        assert_eq!(before.admission, Some(false));
+
+        backend.attach_lan("lo", false).unwrap();
+        let router = crate::routing::Router::new(&[], "direct").unwrap();
+        let plan = crate::control::routing_matcher::RoutingPushPlan::compile(
+            &router,
+            &std::collections::HashMap::from([("direct".into(), 0), ("block".into(), 1)]),
+            "direct",
+            honk_config::types::DialMode::Ip,
+        )
+        .unwrap();
+        backend.publish_routing_plan(&plan, &[]).unwrap();
+        let tcp4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp6 = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let udp4 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp6 = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        backend
+            .publish_listener_sockets(
+                tcp4.as_raw_fd(),
+                tcp6.as_raw_fd(),
+                &[udp4.as_raw_fd(); 4],
+                &[udp6.as_raw_fd(); 4],
+            )
+            .unwrap();
+        backend.set_datapath_ready(true).unwrap();
+        let checked = backend.observe_datapath();
+        assert_eq!(checked.programs, DatapathCheck::Verified);
+        assert!(backend.clear_listener_sockets().is_err());
+        assert!(backend.listeners_published);
+        assert_eq!(checked.routing, DatapathCheck::Verified);
+        assert_eq!(
+            checked.routing_generation,
+            Some(backend.routing_policy_generation())
+        );
+        assert_eq!(checked.admission, Some(true));
+        assert_eq!(checked.listeners_published, Some(true));
+        assert_eq!(checked.hooks, DatapathCheck::Unknown);
+        assert_eq!(checked.attachments.len(), 2);
+        assert!(checked.attachments.iter().all(|attachment| {
+            attachment.interface == "lo" && attachment.state == DatapathCheck::Verified
+        }));
+        let capacity = backend
+            .hash_map::<TuplesKey, ConnState>("CONN_STATE_MAP")
+            .unwrap()
+            .map()
+            .info()
+            .unwrap()
+            .max_entries();
+        assert_eq!(checked.conn_state_capacity, Some(capacity));
+        assert!(checked.errors.is_empty());
+
+        let root = backend
+            .bpf()
+            .unwrap()
+            .map(ROUTING_POLICY_ROOT_NAME)
+            .unwrap();
+        let root = ArrayOfMaps::<_, AyaArray<AyaMapData, RoutingPolicyDescriptor>>::try_from(root)
+            .unwrap();
+        let old_descriptor = root.get(&0, 0).unwrap();
+        let mut foreign_descriptor = AyaArray::<_, RoutingPolicyDescriptor>::create(1, 0).unwrap();
+        foreign_descriptor
+            .set(0, old_descriptor.get(&0, 0).unwrap(), 0)
+            .unwrap();
+        let root = backend
+            .bpf_mut()
+            .unwrap()
+            .map_mut(ROUTING_POLICY_ROOT_NAME)
+            .unwrap();
+        ArrayOfMaps::<_, AyaArray<AyaMapData, RoutingPolicyDescriptor>>::try_from(root)
+            .unwrap()
+            .set(0, &foreign_descriptor, 0)
+            .unwrap();
+        let mismatch = backend.observe_datapath();
+        assert_eq!(mismatch.routing, DatapathCheck::Error);
+        assert_eq!(mismatch.routing_generation, None);
+        assert!(mismatch.errors.contains(&DatapathObservationError::Routing));
+        assert_eq!(mismatch.admission, Some(true));
+        assert_eq!(
+            backend.array_get::<u32>("DATAPATH_STATE_MAP", 0).unwrap(),
+            Some(1)
+        );
+
+        backend.set_datapath_ready(false).unwrap();
+        backend.clear_listener_sockets().unwrap();
+        assert!(!backend.listeners_published);
+        assert!(backend.set_datapath_ready(true).is_err());
+        {
+            let map = backend
+                .bpf_mut()
+                .unwrap()
+                .map_mut("LISTEN_SOCKET_MAP")
+                .unwrap();
+            let mut sockets = AyaSockMap::try_from(map).unwrap();
+            for key in 0..10 {
+                assert!(RealEbpfBackend::sockmap_slot_is_empty(
+                    &sockets.clear_index(&key).unwrap_err()
+                ));
+            }
+        }
+        backend
+            .publish_listener_sockets(
+                tcp4.as_raw_fd(),
+                tcp6.as_raw_fd(),
+                &[udp4.as_raw_fd(); 4],
+                &[],
+            )
+            .unwrap();
+        {
+            let map = backend
+                .bpf_mut()
+                .unwrap()
+                .map_mut("LISTEN_SOCKET_MAP")
+                .unwrap();
+            let mut sockets = AyaSockMap::try_from(map).unwrap();
+            for key in 6..10 {
+                assert!(RealEbpfBackend::sockmap_slot_is_empty(
+                    &sockets.clear_index(&key).unwrap_err()
+                ));
+            }
+        }
+        backend.clear_listener_sockets().unwrap();
+        backend.detach_hooks().unwrap();
+        let detached = backend.observe_datapath();
+        assert_eq!(detached.admission, Some(false));
+        assert_eq!(detached.hooks, DatapathCheck::Absent);
+        assert!(detached.attachments.is_empty());
+    })
+    .join()
+    .unwrap();
+}

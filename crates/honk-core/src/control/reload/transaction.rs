@@ -119,8 +119,20 @@ impl ControlPlane {
         drain: &DrainTracker,
         authorizations: &mut crate::subscription::SubscriptionAuthorizations,
         #[cfg(feature = "native-api")] sources: Option<&crate::native_api::config::SourceUpdate>,
+        #[cfg(feature = "native-api")] expected_group_revision: Option<&str>,
     ) -> Result<ReloadOutcome, honk_config::error::DetailedConfigError> {
         let _reload = self.reload_lock.lock().await;
+        #[cfg(feature = "native-api")]
+        if let Some(expected) = expected_group_revision
+            && self
+                .native
+                .as_ref()
+                .and_then(|native| native.configuration.revision())
+                .as_deref()
+                != Some(expected)
+        {
+            return Ok(ReloadOutcome::Rejected);
+        }
         let current_guard = self.config.read().await;
         let current = Arc::clone(&current_guard);
         let retained_providers = rebase_subscription_nodes(&current, &mut new_config);
@@ -243,6 +255,15 @@ impl ControlPlane {
                 })
             {
                 let _config = self.config.write().await;
+                #[cfg(feature = "native-api")]
+                if replaces_sources && let Some(flags) = &self.datapath_flags {
+                    let mut mode = flags.publication().await;
+                    let mut backend = self.ebpf.write().await;
+                    if let Err(error) = mode.reset_for_activation(backend.as_mut()) {
+                        error!(%error, "reload rejected: runtime mode reset failed");
+                        return Ok(ReloadOutcome::Rejected);
+                    }
+                }
                 let generation = self.diagnostics.read().generation;
                 if !matches!(&diagnostic_update, DiagnosticUpdate::Preserve) {
                     self.diagnostics.write().buckets.apply(diagnostic_update);
@@ -253,6 +274,9 @@ impl ControlPlane {
                 }
                 #[cfg(feature = "native-api")]
                 if let Some(native) = &self.native {
+                    if replaces_sources {
+                        native.settings.activate(native, &new_config);
+                    }
                     if let Some(sources) = sources {
                         native.configuration.accept(sources, generation);
                     } else if replaces_sources {
@@ -353,6 +377,7 @@ impl ControlPlane {
                 dial_limit,
                 self.resource_budget.transient_dials,
                 self.resource_budget.vless_carriers,
+                new_config.experimental.native_api.enabled,
                 Some(&self.runtime_registry.read()),
             ) {
                 Ok((registry, reused)) => (Arc::new(registry), reused),
@@ -436,8 +461,8 @@ impl ControlPlane {
                 .saturating_add(1),
         );
         let old_projection_snapshot = {
-            let current = self.dns_controller.runtime_provider().acquire();
-            Arc::clone(current.runtime().routing_projection())
+            let current = self.dns_controller.runtime_provider().current();
+            Arc::clone(current.routing_projection())
         };
         let projection_snapshot = Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
             generation.get(),
@@ -509,9 +534,17 @@ impl ControlPlane {
                 .await;
             return Ok(ReloadOutcome::Rejected);
         }
+        #[cfg(feature = "native-api")]
+        let mut mode_reset_failed = false;
         let old_registry_result = {
             let mut router_guard = self.router.write().await;
             let mut config_guard = self.config.write().await;
+            #[cfg(feature = "native-api")]
+            let mut mode_publication = if replaces_sources {
+                Some(datapath_flags.publication().await)
+            } else {
+                None
+            };
             let mut ebpf = self.ebpf.write().await;
             let projection_publication = self.dns_controller.prepare_projection_publication();
             let mut group_guard = self.group_manager.write();
@@ -576,6 +609,13 @@ impl ControlPlane {
                         break 'publication Err(());
                     }
                 }
+                #[cfg(feature = "native-api")]
+                if let Some(mode) = &mut mode_publication
+                    && let Err(error) = mode.reset_for_activation(ebpf.as_mut())
+                {
+                    error!(%error, "configuration committed but runtime mode reset failed");
+                    mode_reset_failed = true;
+                }
 
                 if let Err(error) = publish_group_connectivity(ebpf.as_mut(), &new_connectivity) {
                     warn!(
@@ -592,15 +632,21 @@ impl ControlPlane {
                 old_registry.mark_moved_out(reused_runtime_ids);
                 install_interrupt_callback(
                     &new_group_manager,
-                    &self.group_manager,
+                    &new_config.groups,
                     &self.connection_tracker,
+                    &self.diagnostics,
+                    generation.get(),
+                    #[cfg(feature = "native-api")]
+                    self.native.as_ref(),
                 );
                 install_selector_warm_callback(&new_group_manager, &self.selector_warm_notify);
                 if let Some(ref db) = self.cache_db {
                     let db_cb = Arc::clone(db);
-                    new_group_manager.set_persist_callback(Some(Arc::new(move |group, node| {
-                        db_cb.save_selector_choice(group, node);
-                    })));
+                    new_group_manager.set_persist_callback(Some(Arc::new(
+                        move |group, network, member| {
+                            db_cb.save_network_selector(group, network, member);
+                        },
+                    )));
                 }
                 new_group_manager.publish_score_membership();
                 #[cfg(test)]
@@ -622,6 +668,9 @@ impl ControlPlane {
                     #[cfg(feature = "native-api")]
                     if let Some(native) = &self.native {
                         self.alive_set.invalidate_native_group_observations();
+                        if replaces_sources {
+                            native.settings.activate(native, &config_guard);
+                        }
                         if let Some(sources) = sources {
                             native.configuration.accept(sources, generation.get());
                         } else if replaces_sources {
@@ -667,6 +716,16 @@ impl ControlPlane {
             .retire_generation(old_registry.generation());
         self.stop_udp_warm_coordinator().await;
         self.stop_selector_warm_coordinator().await;
+        #[cfg(feature = "native-api")]
+        if mode_reset_failed {
+            self.datapath_healthy
+                .store(false, std::sync::atomic::Ordering::Release);
+            drain.start_rejecting();
+            self.drain_tracker.start_rejecting();
+            return Ok(ReloadOutcome::CommittedDegraded {
+                generation: generation.get(),
+            });
+        }
         self.start_udp_warm_coordinator(Arc::clone(&new_runtime_registry))
             .await;
         self.start_selector_warm_coordinator(new_runtime_registry)
@@ -775,6 +834,142 @@ impl ControlPlane {
         }
     }
 
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) async fn rebuild_suspended_runtime(
+        &mut self,
+    ) -> Result<ReloadOutcome, honk_config::error::DetailedConfigError> {
+        let invalid = || {
+            honk_config::error::DetailedConfigError::new(
+                honk_config::error::ErrorCategory::Validation,
+                "lifecycle-rebuild-failed",
+                honk_config::diagnostic::DiagnosticSources::new(None).root(),
+                honk_config::diagnostic::SettingPath::new("runtime"),
+                "Suspended runtime could not be rebuilt",
+            )
+        };
+        let _reload = self.reload_lock.lock().await;
+        let previous = self.runtime_registry.read().clone();
+        if !self.drain_tracker.should_reject() || !previous.is_shutdown() {
+            return Err(invalid());
+        }
+        let mut config = self.config.read().await.as_ref().clone();
+        crate::dns::ecs::resolve_client_subnet(&mut config.dns).await;
+        let router = self.router.read().await.clone();
+        let manager = self.group_manager.read().clone();
+        let plan = self.active_routing_plan.read().clone();
+        let old_forwarder = self.dns_controller.forwarder();
+        let dns_router = old_forwarder.routing_snapshot();
+        let hosts = old_forwarder.hosts_snapshot();
+        let policy = crate::dns::policy::PolicyId::from_config_with_artifacts(
+            &config.dns,
+            &hosts.fingerprint(),
+            &dns_router.geo_fingerprint(),
+        )
+        .map_err(|_| invalid())?;
+        let (runtime, _) =
+            honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+                &config.nodes,
+                self.resource_budget
+                    .clamp_dials(config.global.max_concurrent_dials),
+                self.resource_budget.transient_dials,
+                self.resource_budget.vless_carriers,
+                config.experimental.native_api.enabled,
+                Some(&previous),
+            )
+            .map_err(|_| invalid())?;
+        let runtime = Arc::new(runtime);
+        let pinned_router = Arc::new(router);
+        let (forwarder, transport) = match self
+            .build_dns_forwarder(
+                &config,
+                Arc::clone(&pinned_router),
+                Arc::clone(&manager),
+                Arc::clone(&runtime),
+                policy,
+                dns_router,
+                hosts,
+            )
+            .await
+        {
+            Ok(parts) => parts,
+            Err(_) => {
+                runtime.shutdown().await;
+                return Err(invalid());
+            }
+        };
+        let provider = self.dns_controller.runtime_provider();
+        let generation = crate::dns::runtime::RuntimeGeneration::new(
+            provider
+                .current_generation()
+                .get()
+                .checked_add(1)
+                .ok_or_else(invalid)?,
+        );
+        let projection = Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
+            generation.get(),
+            pinned_router,
+        ));
+        let candidate =
+            crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
+                generation,
+                udp_query_limit: self.resource_budget.dns_slow_path,
+                forwarder,
+                routing_projection: Arc::clone(&projection),
+                outbound_runtime: Some(Arc::clone(&runtime)),
+                transport,
+            });
+        let published = {
+            let _router = self.router.write().await;
+            let mut current = self.config.write().await;
+            let mut backend = self.ebpf.write().await;
+            let projection_publication = self.dns_controller.prepare_projection_publication();
+            let mut registry = self.runtime_registry.write();
+            let publication = provider.prepare_publication(Arc::clone(&candidate));
+            let learned = projection_publication.project(&projection);
+            let mut domains: Vec<_> = learned
+                .iter()
+                .map(|(ip, bitmap)| (crate::ebpf::maps::ip_addr_to_lpm_key(*ip), *bitmap))
+                .collect();
+            domains.sort_unstable_by_key(|(key, _)| crate::ebpf::maps::lpm_key_bytes(key));
+            match backend.publish_routing_plan(&plan, &domains) {
+                Err(_) => false,
+                Ok(()) => {
+                    *registry = Arc::clone(&runtime);
+                    runtime.activate_background_dial_admission();
+                    publication.commit();
+                    *current = Arc::new(config);
+                    let previous_generation = {
+                        let mut diagnostics = self.diagnostics.write();
+                        let previous = diagnostics.generation;
+                        diagnostics.generation = generation.get();
+                        previous
+                    };
+                    if let Some(native) = &self.native {
+                        native.committed(&current, previous_generation, generation.get());
+                    }
+                    install_interrupt_callback(
+                        &manager,
+                        &current.groups,
+                        &self.connection_tracker,
+                        &self.diagnostics,
+                        generation.get(),
+                        self.native.as_ref(),
+                    );
+                    projection_publication.commit(projection, Some(learned));
+                    true
+                }
+            }
+        };
+        if !published {
+            candidate.retire(std::time::Duration::ZERO).await;
+            runtime.shutdown().await;
+            return Err(invalid());
+        }
+        Ok(ReloadOutcome::Committed {
+            generation: generation.get(),
+        })
+    }
+
     /// Build a DNS forwarder from an explicit config (used by the reload
     /// pipeline's build phase — must not read live state, so the caller can
     /// abort before commit without having mutated anything).
@@ -821,6 +1016,7 @@ impl ControlPlane {
                 self.dns_controller.cache().await,
                 dns_router,
             )
+            .with_configured_upstreams(&config.dns)
             .with_timeouts(
                 std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
                 std::time::Duration::from_millis(config.global.connect_timeout_ms),

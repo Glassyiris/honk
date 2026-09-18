@@ -10,6 +10,7 @@ mod routing;
 
 mod read;
 mod scalars;
+pub mod source_edit;
 mod sources;
 use entries::{parse_node_section, parse_subscription_section};
 use groups::{parse_group_section, resolve_group_filters_inner};
@@ -632,7 +633,7 @@ fn parse_documents(
             Some(Root::Dns) => config.dns = dns::parse_section(segments, diagnostics)?,
             Some(Root::Routing) => config.routing = routing::parse_section(segments, diagnostics)?,
             Some(Root::Node) => config.nodes = parse_node_section(segments, diagnostics)?,
-            Some(Root::Group) => config.groups = parse_group_section(segments, diagnostics)?,
+            Some(Root::Group) => {}
             Some(Root::Subscription) => {
                 config.subscriptions = parse_subscription_section(segments, diagnostics)?
             }
@@ -647,10 +648,9 @@ fn parse_documents(
     }
     config.apply_legacy_nfqueue(canonical_nfqueue_present);
 
-    for group in &mut config.groups {
-        if group.policy == crate::node::GroupPolicy::URLTest {
-            group.tolerance = config.global.check_tolerance_ms;
-        }
+    if let Some((_, segments)) = sections.iter().find(|(name, _)| *name == "group") {
+        config.groups =
+            parse_group_section(segments, diagnostics, config.global.check_tolerance_ms)?;
     }
 
     resolve_group_filters_inner(

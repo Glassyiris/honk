@@ -36,50 +36,257 @@ impl UrlTestSelections {
     }
 }
 
-/// Callback invoked when a Selector group's choice changes (group, node).
-/// Used by honk-core to persist choices to cache.db.
-pub type PersistCallback = Arc<dyn Fn(&str, &str) + Send + Sync>;
+/// Exact direct-member identity, also used by the per-network persistence cache.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SelectorMember {
+    Node(uuid::Uuid),
+    Group(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectorNetworks {
+    Tcp,
+    Udp,
+    Both,
+}
+
+impl SelectorNetworks {
+    fn contains(self, network: SelectionNetwork) -> bool {
+        matches!(
+            (self, network),
+            (Self::Both, _)
+                | (Self::Tcp, SelectionNetwork::Tcp)
+                | (Self::Udp, SelectionNetwork::Udp)
+        )
+    }
+}
+
+impl From<SelectionNetwork> for SelectorNetworks {
+    fn from(network: SelectionNetwork) -> Self {
+        match network {
+            SelectionNetwork::Tcp => Self::Tcp,
+            SelectionNetwork::Udp => Self::Udp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectorChoices {
+    pub tcp: Option<SelectorMember>,
+    pub udp: Option<SelectorMember>,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SelectorError {
+    #[error("group not found")]
+    GroupNotFound,
+    #[error("group is not a selector")]
+    NotSelector,
+    #[error("choice is not a direct group member")]
+    NotMember,
+    #[error("selector revision exhausted")]
+    RevisionExhausted,
+}
+
+#[derive(Default, Clone)]
+pub(super) struct SelectorState {
+    pub(super) choices: HashMap<String, [Option<SelectorMember>; 2]>,
+    pub(super) revision: u64,
+}
+
+/// Invoked for each network whose explicit runtime choice changed.
+pub type PersistCallback = Arc<dyn Fn(&str, SelectionNetwork, &SelectorMember) + Send + Sync>;
 
 /// Callback invoked after an effective Selector choice write. The callback
 /// is deliberately argument-free: the warm coordinator re-reads the whole
 /// deduplicated selector set, which handles shared and nested selections.
 pub type SelectorChangeCallback = Arc<dyn Fn() + Send + Sync>;
 
-/// Callback invoked when a group's selected node changes while the group
-/// has `interrupt_connections = true`. Argument is the group name;
-/// honk-core closes the group's tracked connections.
-pub type InterruptCallback = Arc<dyn Fn(&str) + Send + Sync>;
+/// Invoked for the changed network of a group opting into interruption.
+pub type InterruptCallback = Arc<dyn Fn(&str, SelectionNetwork) + Send + Sync>;
+
+/// Committed selection and callbacks deferred until the caller drops its guards.
+#[must_use = "run callbacks after releasing the publication guards"]
+pub struct SelectorUpdate {
+    pub revision: u64,
+    pub changed_networks: Vec<SelectionNetwork>,
+    persisted_networks: [bool; 2],
+    group: String,
+    member: SelectorMember,
+    persist: Option<PersistCallback>,
+    changed: Option<SelectorChangeCallback>,
+    interrupt: Option<InterruptCallback>,
+}
+
+impl SelectorUpdate {
+    /// The control owner already captured the exact pre-transition close set.
+    pub fn run_callbacks_without_interrupt(mut self) {
+        self.interrupt = None;
+        self.run_callbacks();
+    }
+
+    pub fn run_callbacks(self) {
+        for (network, stored) in [SelectionNetwork::Tcp, SelectionNetwork::Udp]
+            .into_iter()
+            .zip(self.persisted_networks)
+        {
+            if stored && let Some(callback) = &self.persist {
+                callback(&self.group, network, &self.member);
+            }
+        }
+        if !self.changed_networks.is_empty()
+            && let Some(callback) = self.changed
+        {
+            callback();
+        }
+        for network in self.changed_networks {
+            if let Some(callback) = &self.interrupt {
+                callback(&self.group, network);
+            }
+        }
+    }
+}
 
 impl GroupManager {
-    /// Set the selected node for a Selector group at runtime.
-    ///
-    /// On an actual change: the persist callback (cache.db persistence) and
-    /// — when the group has `interrupt_connections` — the interrupt
-    /// callback are invoked.
-    pub fn set_selector_choice(&self, group_name: &str, node_name: &str) {
-        {
-            let mut choices = self.selector_choice.write();
-            if choices.get(group_name).map(String::as_str) == Some(node_name) {
-                return; // unchanged
+    /// Name-based callers retain first-declared-member tie breaking.
+    pub fn set_selector_choice(
+        &self,
+        group_name: &str,
+        member_name: &str,
+        networks: SelectorNetworks,
+    ) -> Result<u64, SelectorError> {
+        let member = self.selector_member_by_name(group_name, member_name)?;
+        let update = self.publish_selector_choice(group_name, &member, networks)?;
+        let revision = update.revision;
+        update.run_callbacks();
+        Ok(revision)
+    }
+
+    pub fn selector_member_by_name(
+        &self,
+        group_name: &str,
+        member_name: &str,
+    ) -> Result<SelectorMember, SelectorError> {
+        let group = self.selector_group(group_name)?;
+        self.members(group)
+            .find(|member| member.tag() == member_name)
+            .map(GroupMember::identity)
+            .ok_or(SelectorError::NotMember)
+    }
+
+    pub(super) fn selector_group(&self, group_name: &str) -> Result<&Group, SelectorError> {
+        let group = self
+            .groups
+            .get(group_name)
+            .ok_or(SelectorError::GroupNotFound)?;
+        if group.policy != GroupPolicy::Selector {
+            return Err(SelectorError::NotSelector);
+        }
+        Ok(group)
+    }
+
+    /// Validate once and publish both networks atomically. Control-plane callers
+    /// serialize this with manager replacement, then run effects outside guards.
+    pub fn publish_selector_choice(
+        &self,
+        group_name: &str,
+        member: &SelectorMember,
+        networks: SelectorNetworks,
+    ) -> Result<SelectorUpdate, SelectorError> {
+        let group = self.selector_group(group_name)?;
+        let selected = self
+            .member_by_identity(group, member)
+            .ok_or(SelectorError::NotMember)?;
+        let mut state = self.selector_choice.write();
+        let changed_networks: Vec<_> = [SelectionNetwork::Tcp, SelectionNetwork::Udp]
+            .into_iter()
+            .filter(|network| networks.contains(*network))
+            .filter(|network| {
+                self.selector_member_in(group, *network, &state)
+                    .is_none_or(|current| !Self::same_member(current, selected))
+            })
+            .collect();
+        let persisted_networks = [SelectionNetwork::Tcp, SelectionNetwork::Udp].map(|network| {
+            networks.contains(network)
+                && state
+                    .choices
+                    .get(group_name)
+                    .and_then(|choices| choices[network.slot()].as_ref())
+                    != Some(member)
+        });
+        if persisted_networks.into_iter().any(|stored| stored) {
+            let revision = state
+                .revision
+                .checked_add(1)
+                .ok_or(SelectorError::RevisionExhausted)?;
+            let choices = state.choices.entry(group_name.to_owned()).or_default();
+            for network in [SelectionNetwork::Tcp, SelectionNetwork::Udp] {
+                if persisted_networks[network.slot()] {
+                    choices[network.slot()] = Some(member.clone());
+                }
             }
-            choices.insert(group_name.to_string(), node_name.to_string());
+            state.revision = revision;
         }
-        if let Some(ref cb) = *self.persist_callback.read() {
-            cb(group_name, node_name);
-        }
-        if let Some(ref cb) = *self.selector_change_callback.read() {
-            cb();
-        }
-        self.maybe_interrupt(group_name);
+        let revision = state.revision;
+        drop(state);
+        Ok(SelectorUpdate {
+            revision,
+            changed_networks,
+            persisted_networks,
+            group: group_name.to_owned(),
+            member: member.clone(),
+            persist: self.persist_callback.read().clone(),
+            changed: self.selector_change_callback.read().clone(),
+            interrupt: group
+                .interrupt_connections
+                .then(|| self.interrupt_callback.read().clone())
+                .flatten(),
+        })
     }
 
-    /// Get the current selected node name for a Selector group.
-    pub fn get_selector_choice(&self, group_name: &str) -> Option<String> {
-        self.selector_choice.read().get(group_name).cloned()
+    /// Both effective identities and their revision from one publication read.
+    pub fn selector_choices(&self, group_name: &str) -> Option<SelectorChoices> {
+        let group = self.selector_group(group_name).ok()?;
+        let state = self.selector_choice.read();
+        Some(SelectorChoices {
+            tcp: self
+                .selector_member_in(group, SelectionNetwork::Tcp, &state)
+                .map(GroupMember::identity),
+            udp: self
+                .selector_member_in(group, SelectionNetwork::Udp, &state)
+                .map(GroupMember::identity),
+            revision: state.revision,
+        })
     }
 
-    /// Install the callback invoked when a Selector group's choice changes
-    /// (group_name, node_name). Re-callable; pass `None` to remove.
+    pub fn selector_revision(&self) -> u64 {
+        self.selector_choice.read().revision
+    }
+
+    pub fn selector_member_choice(
+        &self,
+        group_name: &str,
+        network: SelectionNetwork,
+    ) -> Option<SelectorMember> {
+        self.selector_member(self.groups.get(group_name)?, network)
+            .map(GroupMember::identity)
+    }
+
+    /// Explicit runtime choice, projected to its display tag for legacy readers.
+    pub fn get_selector_choice(
+        &self,
+        group_name: &str,
+        network: SelectionNetwork,
+    ) -> Option<String> {
+        let group = self.groups.get(group_name)?;
+        let state = self.selector_choice.read();
+        let member = state.choices.get(group_name)?[network.slot()].as_ref()?;
+        self.member_by_identity(group, member)
+            .map(|member| member.tag().to_owned())
+    }
+
+    /// Install the callback for each changed (group, network, member).
     pub fn set_persist_callback(&self, cb: Option<PersistCallback>) {
         *self.persist_callback.write() = cb;
     }
@@ -111,7 +318,7 @@ impl GroupManager {
 
     /// Fire the interrupt callback when the group opted into connection
     /// interruption on selection changes (`interrupt_connections`).
-    pub(super) fn maybe_interrupt(&self, group_name: &str) {
+    pub(super) fn maybe_interrupt(&self, group_name: &str, network: SelectionNetwork) {
         let interrupt = self
             .groups
             .get(group_name)
@@ -120,8 +327,9 @@ impl GroupManager {
         if !interrupt {
             return;
         }
-        if let Some(ref cb) = *self.interrupt_callback.read() {
-            cb(group_name);
+        let callback = self.interrupt_callback.read().clone();
+        if let Some(callback) = callback {
+            callback(group_name, network);
         }
     }
 

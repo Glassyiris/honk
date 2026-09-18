@@ -22,6 +22,9 @@ pub struct DnsCacheService {
     pub(super) persister: Mutex<Option<crate::dns::persist::DnsCachePersister>>,
     pub(super) publication: Mutex<PublicationState>,
     pub(super) next_revision: AtomicU64,
+    pub(super) mutation: tokio::sync::Mutex<()>,
+    #[cfg(any(feature = "native-api", test))]
+    pub(super) identity_nonce: uuid::Uuid,
 }
 
 pub(super) struct PublicationState {
@@ -184,48 +187,17 @@ impl DnsCache {
                     accepting: true,
                 }),
                 next_revision: AtomicU64::new(1),
+                mutation: tokio::sync::Mutex::new(()),
+                #[cfg(any(feature = "native-api", test))]
+                identity_nonce: uuid::Uuid::new_v4(),
             }),
         }
-    }
-}
-
-pub(crate) struct PublicationFlushGuard {
-    service: Arc<DnsCacheService>,
-    persistence: Option<crate::dns::persist::DnsCachePersister>,
-}
-
-impl PublicationFlushGuard {
-    pub(crate) const fn persistence(&self) -> Option<&crate::dns::persist::DnsCachePersister> {
-        self.persistence.as_ref()
-    }
-}
-
-impl Drop for PublicationFlushGuard {
-    fn drop(&mut self) {
-        self.service.finish_flush();
     }
 }
 
 impl DnsCacheService {
     pub(crate) fn publication_epoch(&self) -> PublicationEpoch {
         PublicationEpoch(lock(&self.publication).epoch)
-    }
-
-    pub(crate) fn begin_flush(self: &Arc<Self>) -> PublicationFlushGuard {
-        let mut publication = lock(&self.publication);
-        publication.epoch = publication.epoch.saturating_add(1);
-        publication.accepting = false;
-        self.clear();
-        PublicationFlushGuard {
-            service: Arc::clone(self),
-            persistence: lock(&self.persister).clone(),
-        }
-    }
-
-    fn finish_flush(&self) {
-        let mut publication = lock(&self.publication);
-        publication.epoch = publication.epoch.saturating_add(1);
-        publication.accepting = true;
     }
 
     pub(crate) fn persistence(&self) -> Option<crate::dns::persist::DnsCachePersister> {

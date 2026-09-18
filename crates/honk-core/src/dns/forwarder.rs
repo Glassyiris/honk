@@ -94,6 +94,33 @@ pub(crate) enum ResolveMode {
     Compatibility,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CacheAccess {
+    #[default]
+    Normal,
+    Refresh,
+    Bypass,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ResolveOptions {
+    pub(crate) cache: CacheAccess,
+    pub(crate) forced_upstream: Option<super::planner::UpstreamTag>,
+}
+
+impl ResolveOptions {
+    fn sibling(&self) -> Self {
+        Self {
+            cache: if self.cache == CacheAccess::Refresh {
+                CacheAccess::Normal
+            } else {
+                self.cache
+            },
+            forced_upstream: self.forced_upstream.clone(),
+        }
+    }
+}
+
 /// DNS query pipeline: strategy and request routing, exact-identity cache,
 /// upstream exchange, bounded response re-query, TTL policy, then cache write.
 /// Domain-route learning is owned by `DnsController`'s outcome projection.
@@ -124,6 +151,8 @@ pub struct DnsForwarder {
     flights: Singleflight,
     refresh_tasks: Arc<refresh::RefreshTasks>,
     prefetch_tasks: Arc<prefetch::PrefetchTasks>,
+    #[cfg(feature = "native-api")]
+    configured_upstreams: Arc<[String]>,
 }
 
 impl DnsForwarder {
@@ -152,6 +181,8 @@ impl DnsForwarder {
             flights: Singleflight::default(),
             refresh_tasks: refresh::RefreshTasks::new(),
             prefetch_tasks: prefetch::PrefetchTasks::new(),
+            #[cfg(feature = "native-api")]
+            configured_upstreams: Arc::from([]),
         }
     }
 
@@ -201,15 +232,43 @@ impl DnsForwarder {
     }
 
     pub fn with_policy_from_config(self, config: &DnsConfig) -> anyhow::Result<Self> {
+        #[cfg(feature = "native-api")]
+        let this = self.with_configured_upstreams(config);
+        #[cfg(not(feature = "native-api"))]
+        let this = self;
         let sources = hosts::HostsSourceSet::load(config)?;
         let policy_id = PolicyId::from_config_with_artifacts(
             config,
             &sources.fingerprint(),
-            &self.routing.geo_fingerprint(),
+            &this.routing.geo_fingerprint(),
         )
         .context("failed to derive effective DNS policy identity")?;
         let snapshot = sources.parse().map_err(anyhow::Error::new)?;
-        Ok(self.with_policy_id(policy_id).with_hosts_snapshot(snapshot))
+        Ok(this.with_policy_id(policy_id).with_hosts_snapshot(snapshot))
+    }
+
+    pub(crate) fn with_configured_upstreams(self, _config: &DnsConfig) -> Self {
+        #[cfg(feature = "native-api")]
+        {
+            let mut this = self;
+            this.configured_upstreams = _config
+                .upstream
+                .iter()
+                .map(|upstream| upstream.name.clone())
+                .collect();
+            this
+        }
+        #[cfg(not(feature = "native-api"))]
+        {
+            self
+        }
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn has_configured_upstream(&self, name: &str) -> bool {
+        self.configured_upstreams
+            .iter()
+            .any(|configured| configured == name)
     }
 
     #[cfg(test)]
@@ -294,12 +353,20 @@ impl DnsForwarder {
             flights: self.flights.clone(),
             refresh_tasks: Arc::clone(&self.refresh_tasks),
             prefetch_tasks: prefetch::PrefetchTasks::closed(),
+            #[cfg(feature = "native-api")]
+            configured_upstreams: Arc::clone(&self.configured_upstreams),
         }
     }
 
-    pub(crate) async fn shutdown_background_tasks(&self) {
-        self.prefetch_tasks.shutdown().await;
-        self.refresh_tasks.shutdown().await;
+    pub(crate) fn request_background_shutdown(&self) {
+        self.prefetch_tasks.request_shutdown();
+        self.refresh_tasks.request_shutdown();
+    }
+
+    pub(crate) async fn shutdown_background_tasks(&self) -> bool {
+        let prefetch = self.prefetch_tasks.shutdown().await;
+        let refresh = self.refresh_tasks.shutdown().await;
+        prefetch && refresh
     }
 }
 
@@ -366,8 +433,11 @@ mod message {
     ///
     /// Example: `"example.com"` → `[0x07, b'e', ..., 0x03, b'c', b'o', b'm', 0x00]`
     fn encode_dns_name(domain: &str) -> Vec<u8> {
+        if domain == "." || domain.is_empty() {
+            return vec![0];
+        }
         let mut encoded = Vec::new();
-        for label in domain.split('.') {
+        for label in domain.strip_suffix('.').unwrap_or(domain).split('.') {
             if label.len() > 63 {
                 continue;
             }
@@ -533,13 +603,14 @@ mod strategy {
     use honk_config::dns::DnsStrategy;
 
     use super::response::{make_empty_response, qtype_name, response_has_family_ips};
-    use super::{DnsForwarder, ResolveMode};
+    use super::{DnsForwarder, ResolveMode, ResolveOptions};
 
     impl DnsForwarder {
         /// Prefer-mode strategy (sing-box / dae `ipversion_prefer` semantics):
         /// when the preferred family has answers for the same name, suppress the
         /// non-preferred family's response with NODATA; otherwise return it
         /// unchanged. Only-modes are handled earlier at request time.
+        #[allow(clippy::too_many_arguments)]
         pub(crate) async fn apply_prefer_strategy(
             &self,
             raw_query: &[u8],
@@ -548,6 +619,7 @@ mod strategy {
             response: Bytes,
             metadata: DnsRequestMeta,
             mode: ResolveMode,
+            options: &ResolveOptions,
         ) -> anyhow::Result<Bytes> {
             let preferred = match (&self.strategy, qtype) {
                 (DnsStrategy::PreferIpv4, 28) => 1u16,
@@ -555,7 +627,7 @@ mod strategy {
                 _ => return Ok(response),
             };
             if self
-                .preferred_family_has_answers(raw_query, query, preferred, metadata, mode)
+                .preferred_family_has_answers(raw_query, query, preferred, metadata, mode, options)
                 .await?
             {
                 debug!(
@@ -578,6 +650,7 @@ mod strategy {
             preferred_qtype: u16,
             metadata: DnsRequestMeta,
             mode: ResolveMode,
+            options: &ResolveOptions,
         ) -> anyhow::Result<bool> {
             let offsets = query
                 .question_offsets()
@@ -599,8 +672,9 @@ mod strategy {
                 &sibling_query,
                 metadata,
                 query.ingress(),
-                false,
+                &options.sibling(),
                 mode,
+                None,
             ))
             .await
             .map_err(anyhow::Error::from);

@@ -219,12 +219,12 @@ async fn tcp_retire_preserves_newer_incarnation() -> anyhow::Result<()> {
 
     let mut backend_guard = backend.write().await;
     let retire = tokio::spawn(flow.retire());
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while !tracker.snapshot().is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await?;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        tracker.snapshot().len(),
+        1,
+        "retirement retains its ID until backend cleanup completes"
+    );
     backend_guard.tcp_conn_state_store(
         &tuple,
         &ConnState {

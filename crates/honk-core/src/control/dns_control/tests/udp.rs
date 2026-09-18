@@ -1,5 +1,35 @@
 use super::*;
 
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn native_log_captures_transparent_udp_completion_with_full_source() {
+    let query = query_with_txid("example.com", 0x1111);
+    let (controller, _) = test_controller(a_response(&query, [192, 0, 2, 5]), Duration::ZERO);
+    let api = Arc::new(crate::native_api::dns::DnsApi::new("udp-log".into(), true));
+    controller
+        .dns_service()
+        .attach_observer(Arc::downgrade(&api));
+    let source: SocketAddr = "[2001:db8::12]:53000".parse().unwrap();
+    let admission = controller.try_admit_query(true).unwrap();
+    controller
+        .handle_udp_dns_admitted(
+            &admission,
+            &query,
+            source,
+            "[::1]:53".parse().unwrap(),
+            crate::dns::query::validate_exact_dns_query(&query).unwrap(),
+        )
+        .await;
+    let response = api.log_for_test().page_for_test();
+    let bytes = axum::body::to_bytes(response.into_body(), 262144)
+        .await
+        .unwrap();
+    let log: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(log["total"], 1);
+    assert_eq!(log["records"][0]["src"], source.to_string());
+    assert_eq!(log["records"][0]["answers"][0]["data"], "192.0.2.5");
+}
+
 #[tokio::test]
 async fn admitted_transparent_udp_routes_by_client_source() {
     struct SourceRouteUpstream {
@@ -95,7 +125,7 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
         ),
     ));
     let (controller, _ebpf) = projection_controller(forwarder);
-    let runtime = controller.runtime_provider().acquire();
+    let runtime = controller.runtime_provider().try_acquire().unwrap();
     let snapshot = Arc::clone(runtime.runtime().routing_projection());
     let learned_ip = "192.0.2.10".parse().expect("learned IP");
     controller.routing_projection.submit(

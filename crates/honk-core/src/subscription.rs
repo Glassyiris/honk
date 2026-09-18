@@ -15,6 +15,8 @@ use honk_config::types::SubscriptionType;
 
 mod clash;
 mod json;
+#[cfg(feature = "native-api")]
+mod network;
 mod records;
 mod store;
 mod supervisor;
@@ -22,6 +24,9 @@ mod supervisor;
 pub use store::SubscriptionStore;
 pub(crate) use store::same_subscription_fetch_identity;
 
+#[cfg(feature = "native-api")]
+pub(crate) use supervisor::ProviderLoad;
+pub(crate) use supervisor::SubscriptionMergeReply;
 pub(crate) use supervisor::{
     AuthorizedSubscription, SubscriptionAuthorizations, SubscriptionSupervisor,
     SubscriptionSupervisorHandle, same_subscription_worker_set, validate_subscription_ids,
@@ -361,19 +366,70 @@ async fn read_capped_body(mut response: reqwest::Response) -> anyhow::Result<Vec
     Ok(body)
 }
 
+fn subscription_client() -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .dns_resolver(std::sync::Arc::new(BootstrapDnsResolve))
+        .redirect(subscription_redirect_policy())
+        .build()?)
+}
+
+async fn fetch_body(client: &reqwest::Client, sub: &Subscription) -> anyhow::Result<Vec<u8>> {
+    let mut request = client
+        .get(&sub.url)
+        .header("User-Agent", effective_subscription_user_agent(sub));
+    for header in &sub.headers {
+        request = request.header(&header.key, &header.value);
+    }
+    let response = request.send().await.map_err(reqwest::Error::without_url)?;
+    let response = response
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)?;
+    read_capped_body(response).await
+}
+
+enum SubscriptionHttp {
+    Shared(reqwest::Client),
+    #[cfg(feature = "native-api")]
+    Owned(network::SubscriptionNetwork),
+}
+
 /// Manager for fetching and parsing proxy subscriptions.
 pub struct SubscriptionManager {
-    client: reqwest::Client,
+    http: SubscriptionHttp,
 }
 
 impl SubscriptionManager {
     pub fn new() -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .dns_resolver(std::sync::Arc::new(BootstrapDnsResolve))
-            .redirect(subscription_redirect_policy())
-            .build()?;
-        Ok(Self { client })
+        Ok(Self {
+            http: SubscriptionHttp::Shared(subscription_client()?),
+        })
+    }
+
+    #[cfg(feature = "native-api")]
+    async fn new_owned() -> anyhow::Result<Self> {
+        let network = network::SubscriptionNetwork::new()?;
+        network.ready().await?;
+        Ok(Self {
+            http: SubscriptionHttp::Owned(network),
+        })
+    }
+
+    async fn pause_network(&self) -> anyhow::Result<()> {
+        #[cfg(feature = "native-api")]
+        if let SubscriptionHttp::Owned(network) = &self.http {
+            network.pause().await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(any(feature = "native-api", test))]
+    async fn resume_network(&self) -> anyhow::Result<()> {
+        #[cfg(feature = "native-api")]
+        if let SubscriptionHttp::Owned(network) = &self.http {
+            network.resume().await?;
+        }
+        Ok(())
     }
 
     /// Fetch a subscription URL and parse its contents into a list of nodes.
@@ -400,20 +456,22 @@ impl SubscriptionManager {
         store: Option<&SubscriptionStore>,
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> anyhow::Result<Vec<Node>> {
-        let mut request = self
-            .client
-            .get(&sub.url)
-            .header("User-Agent", effective_subscription_user_agent(sub));
+        let start = diagnostics.len();
+        let (nodes, content) = self.fetch_content(sub, diagnostics).await?;
+        Self::persist_content(sub, store, content, diagnostics, start).await;
+        Ok(nodes)
+    }
 
-        for header in &sub.headers {
-            request = request.header(&header.key, &header.value);
-        }
-
-        let response = request.send().await.map_err(reqwest::Error::without_url)?;
-        let response = response
-            .error_for_status()
-            .map_err(reqwest::Error::without_url)?;
-        let body = read_capped_body(response).await?;
+    async fn fetch_content(
+        &self,
+        sub: &Subscription,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+    ) -> anyhow::Result<(Vec<Node>, String)> {
+        let body = match &self.http {
+            SubscriptionHttp::Shared(client) => fetch_body(client, sub).await?,
+            #[cfg(feature = "native-api")]
+            SubscriptionHttp::Owned(network) => network.fetch(sub).await?,
+        };
         let content = finish_attempt(
             String::from_utf8(body).map_err(|_| {
                 subscription_error(
@@ -423,8 +481,17 @@ impl SubscriptionManager {
             }),
             diagnostics,
         )?;
-        let start = diagnostics.len();
         let nodes = parse_subscription_content_with_diagnostics(sub, &content, diagnostics)?;
+        Ok((nodes, content))
+    }
+
+    async fn persist_content(
+        sub: &Subscription,
+        store: Option<&SubscriptionStore>,
+        content: String,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+        start: usize,
+    ) {
         if let Some(store) = store
             && store.store_content(sub, content).await.is_err()
         {
@@ -440,7 +507,6 @@ impl SubscriptionManager {
                 "subscription body accepted but could not be persisted",
             ));
         }
-        Ok(nodes)
     }
 }
 

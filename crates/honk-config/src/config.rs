@@ -793,6 +793,18 @@ impl Config {
             ));
         }
         for (index, group) in self.groups.iter().enumerate() {
+            if group
+                .icon
+                .as_deref()
+                .is_some_and(|icon| !crate::node::Group::valid_icon(icon))
+            {
+                return Err(config_validation_error(
+                    source,
+                    SettingPath::new("groups").index(index + 1).field("icon"),
+                    "invalid-config-value",
+                    "icon must be an absolute http(s) URL or data URI of at most 2048 characters",
+                ));
+            }
             if group.name.is_empty() {
                 return Err(config_validation_error(
                     source,
@@ -1186,6 +1198,7 @@ fn setting_from_decode_path(path: &serde_path_to_error::Path) -> (SettingPath, O
                     "groups" if entry_index.is_some() => [
                         "id",
                         "name",
+                        "icon",
                         "policy",
                         "nodes",
                         "filters",

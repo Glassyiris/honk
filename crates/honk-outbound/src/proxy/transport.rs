@@ -188,7 +188,7 @@ async fn wrap_ws(
 
     let (client_half, server_half) = tokio::io::duplex(65536);
 
-    tokio::spawn(ws_bridge_relay(ws_stream, server_half));
+    let _ = crate::runtime::spawn_owned(ws_bridge_relay(ws_stream, server_half));
 
     Ok(Box::new(client_half))
 }

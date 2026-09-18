@@ -77,7 +77,7 @@ impl TestApp {
         configure(&mut config);
         let mut control = control_plane(config);
         let state = Arc::new(
-            NativeState::new(&mut control, addr, SystemTime::now(), Instant::now(), true)
+            NativeState::new(&mut control, addr, SystemTime::now(), Instant::now())
                 .await
                 .unwrap(),
         );
@@ -498,18 +498,18 @@ async fn disabled_actions_unknown_resources_and_methods_are_distinct_json_errors
             "capability_not_supported",
         ),
         (
-            Method::DELETE,
-            "/api/v1/connections",
+            Method::GET,
+            "/api/v1/runtime/mode?unknown=x",
+            "capability_not_supported",
+        ),
+        (
+            Method::PUT,
+            "/api/v1/runtime/mode",
             "capability_not_supported",
         ),
         (
             Method::DELETE,
-            "/api/v1/connections/live-id",
-            "capability_not_supported",
-        ),
-        (
-            Method::PATCH,
-            "/api/v1/groups/group",
+            "/api/v1/groups/group/selection",
             "capability_not_supported",
         ),
         (
@@ -540,6 +540,7 @@ async fn disabled_actions_unknown_resources_and_methods_are_distinct_json_errors
     for (path, status) in [
         ("/api", StatusCode::OK),
         ("/api/v1/config", StatusCode::NOT_FOUND),
+        ("/api/v1/runtime/mode", StatusCode::NOT_FOUND),
         ("/api/v1/missing", StatusCode::NOT_FOUND),
     ] {
         let response = app
@@ -884,6 +885,8 @@ async fn native_and_clash_tokens_do_not_cross_authorize() {
         runtime_registry: app.control.runtime_registry(),
         mode_state: mode,
         datapath_flags: app.control.datapath_flags_handle().unwrap(),
+        control: Some(app.control.control_client()),
+        ui_download: app.control.ui_download_handle(),
         secret: "clash-test-only-secret".into(),
         connection_pool: app.control.connection_pool(),
         external_ui: String::new(),

@@ -12,7 +12,7 @@ The scope is `GroupManager`, `AliveDialerSet`, the always-compiled Score scorer,
 
 `SharedGroupManager = Arc<parking_lot::RwLock<Arc<GroupManager>>>`
 
-A reload builds a complete replacement `GroupManager`, migrates Selector choices whose group and member tag still exist via `migrate_selector_choices_from`, installs interrupt, warm-up, and persistence callbacks before publication, and swaps the inner `Arc`. Readers therefore see either the old or the new manager, never a partially rebuilt graph.
+A reload builds a complete replacement `GroupManager`, migrates surviving per-network Selector member identities via `migrate_selector_choices_from`, installs interrupt, warm-up and persistence callbacks before publication, and swaps the inner `Arc`. A removed node is not retargeted to a same-named replacement. Native/Clash selection writes serialize with this publication, so they cannot acknowledge a write to an already-replaced manager. Readers see either complete manager; suspend/resume instead retains the same manager and its automatic-policy state.
 
 The `src/group/` facade and its internals are split by responsibility:
 
@@ -31,11 +31,15 @@ Selection follows one invariant (sing-box semantics): after resolution and liven
 
 | Policy | Runtime behavior |
 | --- | --- |
-| Selector | TCP and UDP resolve the runtime choice, then `group.default`, then the first declared member independently of health; only missing/non-member tags fall through. No eligible candidate for that member invokes only the group's explicit `final` or the same-leaf TCP last resort above; without either, the plan is empty. GroupManager resolves finals at every nested level. The Clash API changes the runtime choice. `PersistCallback` stores effective writes in `cache.db` via honk-core's `cachedb`; when `interrupt_connections` is enabled, `InterruptCallback` removes tracking records but does not cancel live relays. Typed configuration diagnostics warn about this limitation. |
+| Selector | TCP and UDP resolve their separate concrete runtime member choices, then `group.default`, then the first declared member independently of health. Only missing/non-member choices fall through. An ineligible chosen member invokes only explicit `final` or the same-leaf TCP last resort; otherwise the plan is empty. Native writes choose TCP, UDP or atomic both; Clash writes both and displays TCP. `PersistCallback` stores each changed network's identity in the cache. |
 | URLTest | Chooses the lowest halving moving average, keeps independent TCP and UDP selections, applies tolerance hysteresis, and re-evaluates lazily on dial and selection queries. A real selection change may invoke `InterruptCallback`. |
 | LoadBalance | Round-robins eligible members in declaration order. Every group owns independent `AtomicUsize` cursors for TCP and UDP. Rotation never invokes `InterruptCallback`. |
 | Fallback | Pins the first eligible member in declaration order independently for TCP and UDP. The pin stays until that member dies; recovery of an earlier member does not cause failback. |
 | Score | When explicitly selected with `policy: score`, chooses one authoritative alive member using automatic target-aware, reliability-first scoring and bounded deterministic cold-start exploration. Selector remains the omitted/default policy. |
+
+Selector validation/publication is one shared transition; callbacks run after synchronous guards are released. `interrupt_connections` captures the pre-transition transport owners by their actual selected group path and network, then closes them outside manager/entry locks. The response reports interruption only after confirmed completion. TCP closes its exact UUID owner; UDP retires its token/generation-bound view and waits for backend/driver/reply fences. Shared XUDP siblings and the carrier remain alive. This path is independent of optional native flow recording, not a deletion of tracking metadata.
+
+Native group observations are non-mutating, and icons are configured validated values. Restricted configuration PATCH belongs to the accepted source owner: parser spans, full offline admission, disk/dependency fences and reload—not a second in-memory Group configuration. Its accepted revision is distinct from disk SHA-256 and is checked again before activation. Automatic-policy pin/clear stays unavailable; endpoint details are in the [group API contract](../reference/api.md#nodes-and-groups-m3).
 
 ### Score scoring and lifecycle
 
@@ -106,7 +110,7 @@ IPv6 health-family retries prefer a usable ordinary IPv4 proxy path before a
 final, without changing the business target family. Missing or cyclic finals
 remain refusals; no transport error or terminal packet rejection is retried here.
 
-Selector captures a concrete node or sub-group member before candidate expansion and health filtering; repeated node tags bind the first matching declared `NodeId`. Parents retain the existing subgroup Peek, parent-health gate, and serving-commit order, so unchosen Score state is not advanced. For both TCP and UDP, a failed serving commit cannot restore the earlier peek; only a configured final may continue selection. Candidates retain their originating subgroup reference instead of rediscovering it from a display tag. A chosen automatic sub-group may still select a different leaf within its own membership. The sole TCP leaf's last-resort walk also respects every nested Selector choice, while explicit delay tests may inspect all members for recovery.
+Selector captures a concrete node or sub-group member before candidate expansion and health filtering. Name-based defaults and Clash writes bind the first matching declared member; native IDs can select a particular direct member even when display tags collide. Parents retain the existing subgroup Peek, parent-health gate and serving-commit order, so unchosen Score state is not advanced. For both TCP and UDP, a failed serving commit cannot restore the earlier peek; only a configured final may continue selection. Candidates retain their originating subgroup reference rather than rediscovering it from a display tag. A chosen automatic sub-group may select another leaf within its own membership. The sole TCP leaf's last-resort walk also respects every nested Selector choice.
 
 Display and API output retain member tags even when the physical dial reaches a deeper leaf; serving selection retains concrete node or subgroup identity separately:
 
@@ -187,7 +191,7 @@ Warm-up has three independent mechanisms:
 | Mechanism | Candidate and lifetime | Retained resource | Bounds |
 | --- | --- | --- | --- |
 | Startup preconnect | One startup-only pass; current group picks first, then config order. Only bare-TCP-poolable proxy nodes qualify. | One bare server TCP connection deposited in the pool | `'auto'` selects at most 8 nodes; `0` disables it. It owns no policy-retention bit. |
-| Selector pin | Always tracks every Selector's configured leaf, including an unhealthy explicit choice; shared leaves are UUID-deduplicated. | The reusable session selected by the TCP path (AnyTLS or VLESS H2/shared Mux.Cool), one QUIC client/connection, or otherwise one bare server TCP | Effective-choice changes wake immediately; a 10-second pass repairs lost, consumed, or expired state. |
+| Selector pin | Tracks every Selector's TCP choice, including an unhealthy explicit choice; shared leaves are UUID-deduplicated. | The reusable session selected by the TCP path (AnyTLS or VLESS H2/shared Mux.Cool), one QUIC client/connection, or otherwise one bare server TCP | Effective-choice changes wake immediately; a 10-second pass repairs lost, consumed, or expired state. |
 | UDP warm set | Opt-in; re-ranks each group's top `min(N, 3)` reusable UDP leaves for each address family on every pass, then UUID-deduplicates globally. | The reusable state selected by the UDP path, including a VLESS H2/shared/separate Mux.Cool pool, or a QUIC client | At most 4 warm attempts run concurrently; the retained process set is re-ranked and capped at `4 × N`. |
 
 Selector and UDP ownership are independent bits on reusable node runtimes.
@@ -202,6 +206,8 @@ including AnyTLS, VLESS pools/source key, and QUIC state. Changed configuration
 gets a fresh runtime. The existing outbound maintenance pass reaps unretained
 idle VLESS carriers together with its other idle resources; no new protocol
 timer is created.
+
+Native probes capture member-to-leaf associations and generation owners without advancing policy state. Real raw-TCP, HTTP and TCP/UDP DNS measurements retain transport/purpose/family/warmth; obsolete or cancelled results do not publish fresh health. Restricted destination/port admission and pinned resolution apply even to configured endpoints. Suspension stops and joins probes, warm producers and protocol runtime tasks; resume uses fresh network owners while preserving group observations and choices. See [bounded probes](../reference/api.md#bounded-probes).
 
 ## Dial admission budget
 

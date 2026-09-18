@@ -18,6 +18,7 @@ fn reserve(store: &Arc<OperationStore>, key: &str) -> Reservation {
             "/api/v1/operations/reload",
             Some(key),
             b"{}",
+            crate::native_api::operations::OperationKind::Reload,
         )
         .unwrap()
 }
@@ -98,7 +99,13 @@ async fn concurrent_retries_share_pending_admission_and_the_original_operation()
     }
     assert!(store.running(&id));
     assert!(!store.running(&id));
-    assert!(store.succeed(&id, Some("instance-a:7".into()), None));
+    assert!(store.succeed(
+        &id,
+        OperationResult::Reload {
+            active_generation_id: Some("instance-a:7".into()),
+            datapath_generation_id: None
+        }
+    ));
     assert!(!store.fail(&id, "reload_failed", "Reload failed.", None));
     let replay = reserve(&store, "same-key");
     assert!(!replay.fresh);
@@ -130,6 +137,7 @@ async fn keys_are_scoped_and_different_bodies_conflict_before_capacity_checks() 
             "/api/v1/operations/reload",
             Some("key"),
             b"{ }",
+            crate::native_api::operations::OperationKind::Reload,
         )
         .err()
         .unwrap();
@@ -148,13 +156,29 @@ async fn keys_are_scoped_and_different_bodies_conflict_before_capacity_checks() 
         ("owner", "POST", "/api/v1/operations/reload", None),
         ("owner", "POST", "/api/v1/operations/reload", None),
     ] {
-        let reservation = store.reserve(principal, method, path, key, b"{}").unwrap();
+        let reservation = store
+            .reserve(
+                principal,
+                method,
+                path,
+                key,
+                b"{}",
+                crate::native_api::operations::OperationKind::Reload,
+            )
+            .unwrap();
         assert!(reservation.fresh);
         assert!(owners.iter().all(|old| old.id != reservation.id));
         owners.push(reservation);
     }
     let invalid = store
-        .reserve("owner", "POST", "/reload", Some(""), b"{}")
+        .reserve(
+            "owner",
+            "POST",
+            "/reload",
+            Some(""),
+            b"{}",
+            crate::native_api::operations::OperationKind::Reload,
+        )
         .err()
         .unwrap();
     assert_error(invalid, StatusCode::BAD_REQUEST, "invalid_request").await;
@@ -237,7 +261,13 @@ async fn capacity_never_evicts_preparing_running_or_unexpired_terminal_operation
             assert!(store.running(&reservation.id));
         }
         if number > 1 {
-            assert!(store.succeed(&reservation.id, None, None));
+            assert!(store.succeed(
+                &reservation.id,
+                OperationResult::Reload {
+                    active_generation_id: None,
+                    datapath_generation_id: None
+                }
+            ));
         }
         owners.push(reservation);
     }
@@ -249,6 +279,7 @@ async fn capacity_never_evicts_preparing_running_or_unexpired_terminal_operation
             "/api/v1/operations/reload",
             Some("new"),
             b"{}",
+            crate::native_api::operations::OperationKind::Reload,
         )
         .err()
         .unwrap();
@@ -273,6 +304,7 @@ async fn capacity_never_evicts_preparing_running_or_unexpired_terminal_operation
             "/api/v1/operations/reload",
             Some("2"),
             b"different",
+            crate::native_api::operations::OperationKind::Reload,
         )
         .err()
         .unwrap();
@@ -327,6 +359,7 @@ async fn operation_reads_hide_ownership_and_never_echo_sensitive_admission_input
             "/private/source",
             Some("private-key"),
             b"secret-config-text",
+            crate::native_api::operations::OperationKind::Reload,
         )
         .unwrap();
     assert!(store.accept(&reservation.id));
@@ -372,7 +405,14 @@ async fn operation_reads_hide_ownership_and_never_echo_sensitive_admission_input
         json!({"oversized": "x".repeat(MAX_ERROR_DETAILS)}),
     ] {
         let reservation = store
-            .reserve("owner", "POST", "/reload", None, b"{}")
+            .reserve(
+                "owner",
+                "POST",
+                "/reload",
+                None,
+                b"{}",
+                crate::native_api::operations::OperationKind::Reload,
+            )
             .unwrap();
         store.accept(&reservation.id);
         store.fail(
@@ -411,7 +451,6 @@ async fn events_describe_only_accepted_transitions_in_order() {
         "127.0.0.1:9527".parse().unwrap(),
         SystemTime::now(),
         std::time::Instant::now(),
-        true,
     )
     .await
     .unwrap();
@@ -442,12 +481,30 @@ async fn events_describe_only_accepted_transitions_in_order() {
     let accepted = reserve(&store, "accepted");
     assert!(stream.next().now_or_never().is_none());
     assert!(!store.running(&accepted.id));
-    assert!(!store.succeed(&accepted.id, None, None));
+    assert!(!store.succeed(
+        &accepted.id,
+        OperationResult::Reload {
+            active_generation_id: None,
+            datapath_generation_id: None
+        }
+    ));
     store.accept(&accepted.id);
     assert!(!store.reject(&accepted.id, unavailable()));
-    assert!(!store.succeed(&accepted.id, None, None));
+    assert!(!store.succeed(
+        &accepted.id,
+        OperationResult::Reload {
+            active_generation_id: None,
+            datapath_generation_id: None
+        }
+    ));
     store.running(&accepted.id);
-    store.succeed(&accepted.id, Some("instance:4".into()), Some("9".into()));
+    store.succeed(
+        &accepted.id,
+        crate::native_api::operations::OperationResult::Reload {
+            active_generation_id: Some("instance:4".into()),
+            datapath_generation_id: Some("9".into()),
+        },
+    );
     assert!(!store.fail(&accepted.id, "reload_failed", "Reload failed.", None));
     let replay = reserve(&store, "accepted");
     assert!(!replay.fresh);

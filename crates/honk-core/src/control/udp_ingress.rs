@@ -54,6 +54,10 @@ pub(super) enum UdpSlowPathWork {
         runtime: crate::dns::runtime::RuntimeLease,
         udp_permit: tokio::sync::OwnedSemaphorePermit,
         response: Vec<u8>,
+        #[cfg(feature = "native-api")]
+        query: Option<Bytes>,
+        #[cfg(feature = "native-api")]
+        ingress: crate::dns::query::IngressProfile,
     },
     Done,
 }
@@ -152,6 +156,13 @@ fn begin_udp_dns_query(
                     runtime,
                     udp_permit,
                     response: crate::dns::response::build_dns_refused(data.as_slice()),
+                    #[cfg(feature = "native-api")]
+                    query: dns_controller
+                        .dns_service()
+                        .observation_enabled()
+                        .then(|| data.into_bytes()),
+                    #[cfg(feature = "native-api")]
+                    ingress: validated.ingress(),
                 };
             }
             stats.record_udp_slow_permit_rejected();
@@ -437,11 +448,19 @@ impl UdpLoopState {
                 runtime,
                 udp_permit,
                 response,
+                #[cfg(feature = "native-api")]
+                query,
+                #[cfg(feature = "native-api")]
+                ingress,
             } => {
                 let guard = ConnectionGuard::new(Arc::clone(&self.drain));
+                #[cfg(feature = "native-api")]
+                let dns_controller = Arc::clone(&self.dns_controller);
                 self.udp_pool.spawn_slow_path(async move {
                     let _guard = guard;
                     let _permit = udp_permit;
+                    #[cfg(feature = "native-api")]
+                    let started = std::time::Instant::now();
                     let _ = runtime
                         .run_reply(send_udp_reply_from_orig_dst(
                             &response,
@@ -449,6 +468,17 @@ impl UdpLoopState {
                             original_dst,
                         ))
                         .await;
+                    #[cfg(feature = "native-api")]
+                    if let Some(query) = query {
+                        dns_controller.dns_service().observe_client(
+                            &query,
+                            ingress,
+                            Some(src_addr),
+                            None,
+                            &response,
+                            started.elapsed(),
+                        );
+                    }
                 });
             }
         }

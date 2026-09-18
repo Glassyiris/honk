@@ -85,8 +85,15 @@ fn registry_admission_rejects_invalid_collections() {
     let mut intrinsic = canonical_node("invalid-endpoint");
     intrinsic.port = 0;
     assert_admission(
-        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[intrinsic], 1, 1, 1, None)
-            .unwrap_err(),
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+            &[intrinsic],
+            1,
+            1,
+            1,
+            false,
+            None,
+        )
+        .unwrap_err(),
         "invalid-config-value",
         0,
     );
@@ -339,6 +346,7 @@ async fn dns_fork_owns_sessions_but_preserves_dial_limits() {
         1,
         2,
         2,
+        false,
         None,
     )
     .unwrap();
@@ -359,7 +367,7 @@ async fn dns_fork_owns_sessions_but_preserves_dial_limits() {
         .await
         .expect("released generation capacity must admit DNS");
     let (successor, _) =
-        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 2, 2, Some(&main))
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 2, 2, false, Some(&main))
             .unwrap();
     let successor_permit = successor.acquire_dial_permit().await;
     assert!(
@@ -615,6 +623,127 @@ async fn retirement_is_terminal_and_shutdown_remains_idempotent() {
         registry.is_shutdown(),
         "retirement and force shutdown remain terminal and idempotent"
     );
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn native_terminal_rebuild_is_fresh_and_keeps_process_admission() {
+    use futures_util::FutureExt as _;
+
+    let node = canonical_node("resume-fresh");
+    let (first, _) = OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+        std::slice::from_ref(&node),
+        1,
+        1,
+        1,
+        true,
+        None,
+    )
+    .unwrap();
+    let old = first.get(&node.id).unwrap();
+    let held_dial = first.acquire_dial_permit().await;
+    let held_carrier = old.acquire_vless_carrier().unwrap();
+    first.shutdown().await;
+    let (resumed, reused) = OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+        std::slice::from_ref(&node),
+        2,
+        99,
+        99,
+        true,
+        Some(&first),
+    )
+    .unwrap();
+    assert!(reused.is_empty());
+    let fresh = resumed.get(&node.id).unwrap();
+    assert!(!Arc::ptr_eq(&old, &fresh));
+    assert!(Arc::ptr_eq(
+        &first.dial_ceiling_semaphore,
+        &resumed.dial_ceiling_semaphore
+    ));
+    assert!(Arc::ptr_eq(
+        &first.vless_carrier_semaphore,
+        &resumed.vless_carrier_semaphore
+    ));
+    assert!(resumed.acquire_dial_permit().now_or_never().is_none());
+    assert!(fresh.acquire_vless_carrier().is_err());
+    drop((held_dial, held_carrier));
+    assert!(resumed.acquire_dial_permit().now_or_never().is_some());
+    assert!(fresh.acquire_vless_carrier().is_ok());
+    let ProtocolRuntime::AnyTls(anytls) = &fresh.runtime else {
+        panic!("AnyTLS expected")
+    };
+    assert!(!anytls.pool.is_retired());
+    assert!(old.scope_tasks(async { Ok(()) }).await.is_err());
+    let fork = resumed.fork_for_dns().unwrap();
+    assert!(fork.owns_tasks());
+    resumed.shutdown().await;
+    assert!(
+        fork.get(&node.id)
+            .unwrap()
+            .scope_tasks(async { Ok(()) })
+            .await
+            .is_ok()
+    );
+    fork.shutdown().await;
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn native_generation_deposits_stop_without_closing_reused_node_tasks() {
+    let node = canonical_node("moved-tasks");
+    let (first, _) = OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+        std::slice::from_ref(&node),
+        1,
+        1,
+        1,
+        true,
+        None,
+    )
+    .unwrap();
+    let runtime = first.get(&node.id).unwrap();
+    let capacity = Arc::new(tokio::sync::Semaphore::new(2));
+    let deposit = Arc::clone(&capacity).acquire_owned().await.unwrap();
+    first
+        .spawn_background(async move {
+            let _deposit = deposit;
+            std::future::pending::<()>().await;
+        })
+        .unwrap();
+    let driver = Arc::clone(&capacity).acquire_owned().await.unwrap();
+    runtime
+        .task_scope()
+        .spawn(async move {
+            let _driver = driver;
+            std::future::pending::<()>().await;
+        })
+        .unwrap();
+    let (next, reused) =
+        OutboundRuntimeRegistry::build_reusing(std::slice::from_ref(&node), 1, Some(&first))
+            .unwrap();
+    first.mark_moved_out(reused);
+    first.shutdown().await;
+    assert_eq!(capacity.available_permits(), 1);
+    assert!(first.spawn_background(async {}).is_none());
+    next.shutdown().await;
+    assert_eq!(capacity.available_permits(), 2);
+}
+
+#[tokio::test]
+async fn generation_shutdown_joins_background_jobs_without_native_tracking() {
+    let generation = OutboundRuntimeRegistry::build(&[]).unwrap();
+    let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = Arc::clone(&capacity).acquire_owned().await.unwrap();
+    generation
+        .spawn_background(async move {
+            let _permit = permit;
+            std::future::pending::<()>().await;
+        })
+        .unwrap();
+    generation.begin_retirement();
+    assert!(generation.spawn_background(async {}).is_none());
+    generation.shutdown().await;
+    assert_eq!(capacity.available_permits(), 1);
+    assert!(!generation.tasks_failed());
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@ use crate::dns::planner::{RequestScope, UpstreamTag};
 use crate::dns::query::{IngressProfile, QueryContext};
 
 mod actor;
+mod invalidation;
 mod restore;
 
 fn test_db(dir: &tempfile::TempDir, cache_id: &str) -> Arc<CacheDb> {

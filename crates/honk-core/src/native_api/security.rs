@@ -27,6 +27,34 @@ const MAX_BODY_BYTES: usize = 65536;
 const ALLOW_HEADERS: &str =
     "Authorization, Last-Event-ID, Content-Type, If-Match, Idempotency-Key, Accept";
 
+pub(crate) struct RequestRate(parking_lot::Mutex<(Instant, u32)>);
+
+impl RequestRate {
+    pub(crate) fn new() -> Self {
+        Self(parking_lot::Mutex::new((Instant::now(), 0)))
+    }
+
+    pub(crate) fn admit(&self, id: &RequestId) -> Result<(), ApiError> {
+        let now = Instant::now();
+        let mut window = self.0.lock();
+        let elapsed = now.duration_since(window.0);
+        if elapsed >= std::time::Duration::from_secs(60) {
+            *window = (now, 0);
+        }
+        if window.1 == 30 {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::RateLimited,
+                "Request rate limit reached",
+                Some(id.0.clone()),
+            )
+            .with_retry_after((60 - elapsed.as_secs()) as u32));
+        }
+        window.1 += 1;
+        Ok(())
+    }
+}
+
 pub(super) struct Security {
     expected: Option<[u8; 32]>,
     anonymous_loopback: bool,

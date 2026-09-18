@@ -137,6 +137,7 @@ impl RealEbpfBackend {
 mod attach;
 mod events;
 mod iface_watch;
+mod observation;
 mod process_name;
 mod routing;
 mod syscall;
@@ -254,6 +255,14 @@ impl RealEbpfBackend {
                 MapError::SyscallError(error)
                     if error.io_error.raw_os_error() == Some(libc::ENOENT)
             )
+    }
+
+    fn sockmap_slot_is_empty(error: &MapError) -> bool {
+        // Linux __sock_map_delete returns EINVAL for vacant slots; Aya checks
+        // index bounds before issuing this SOCKMAP-specific syscall.
+        Self::map_error_is_missing(error)
+            || matches!(error,
+            MapError::SyscallError(error) if error.io_error.raw_os_error() == Some(libc::EINVAL))
     }
 
     fn array_set<V: Pod>(&mut self, name: &str, index: u32, value: &V) -> anyhow::Result<()> {
@@ -455,6 +464,10 @@ impl RealEbpfBackend {
 
 #[async_trait]
 impl EbpfBackend for RealEbpfBackend {
+    fn observe_datapath(&self) -> super::DatapathObservation {
+        self.observe_backend()
+    }
+
     fn attach_dynamic_interface(
         &mut self,
         ifname: &str,
@@ -1159,6 +1172,28 @@ impl EbpfBackend for RealEbpfBackend {
             }
         }
         self.listeners_published = true;
+        Ok(())
+    }
+
+    fn clear_listener_sockets(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.array_get::<u32>("DATAPATH_STATE_MAP", 0)? == Some(0),
+            "datapath admission must be closed before clearing listeners"
+        );
+        // Invalidation precedes removal: a partial failure must not permit READY.
+        self.listeners_published = false;
+        let map = self
+            .bpf_mut()?
+            .map_mut("LISTEN_SOCKET_MAP")
+            .ok_or_else(|| anyhow::anyhow!("listener socket map unavailable"))?;
+        let mut sockets = AyaSockMap::try_from(map)?;
+        for key in 0..10 {
+            match sockets.clear_index(&key) {
+                Ok(()) => {}
+                Err(error) if Self::sockmap_slot_is_empty(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         Ok(())
     }
 

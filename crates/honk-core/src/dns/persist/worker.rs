@@ -1,10 +1,14 @@
 use std::collections::HashMap;
+#[cfg(any(feature = "native-api", test))]
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+#[cfg(any(feature = "native-api", test))]
+use super::PersistInvalidation;
 use super::codec;
 use super::{COMMAND_CAPACITY, Command, CounterSet, PersistControlError, Put};
 use crate::cachedb::CacheDb;
@@ -21,6 +25,7 @@ mod restore {
     pub(super) fn restore(
         db: &CacheDb,
         cache: &DnsCacheService,
+        publication_epoch: crate::dns::cache::PublicationEpoch,
         policy: Option<&PolicyId>,
         counters: &CounterSet,
     ) -> usize {
@@ -45,9 +50,15 @@ mod restore {
                         counters.corrupt.fetch_add(1, Ordering::Relaxed);
                         continue;
                     };
-                    cache.put_restored_exact(entry.key, entry.response, ttl);
-                    restored = restored.saturating_add(1);
-                    counters.restored.fetch_add(1, Ordering::Relaxed);
+                    if cache.put_restored_exact_if_current(
+                        publication_epoch,
+                        entry.key,
+                        entry.response,
+                        ttl,
+                    ) {
+                        restored = restored.saturating_add(1);
+                        counters.restored.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 Err(DecodeError::Version(_)) => {
                     counters.version_mismatch.fetch_add(1, Ordering::Relaxed);
@@ -126,8 +137,14 @@ async fn run_loop(
                         );
                         let _ = ack.send(result);
                     }
-                    Command::Restore { cache, policy, ack } => {
-                        let restored = restore::restore(&db, &cache, policy.as_ref(), &counters);
+                    #[cfg(any(feature = "native-api", test))]
+                    Command::Invalidate { epoch, selection, ack } => {
+                        let result = invalidate(&db, &mut pending, &mut active_epoch,
+                            epoch, selection, &counters);
+                        let _ = ack.send(result);
+                    }
+                    Command::Restore { cache, publication_epoch, policy, ack } => {
+                        let restored = restore::restore(&db, &cache, publication_epoch, policy.as_ref(), &counters);
                         let _ = ack.send(restored);
                     }
                     Command::Shutdown { ack } => {
@@ -237,6 +254,63 @@ fn flush(
     })?;
     *cleared_epoch = epoch;
     write_active(db, pending, *active_epoch, counters)
+}
+
+#[cfg(any(feature = "native-api", test))]
+fn invalidate(
+    db: &CacheDb,
+    pending: &mut HashMap<String, Pending>,
+    active_epoch: &mut u64,
+    epoch: u64,
+    selection: PersistInvalidation,
+    counters: &CounterSet,
+) -> Result<(), PersistControlError> {
+    if epoch < *active_epoch {
+        return Err(PersistControlError::Database(
+            "DNS invalidation barrier was superseded".into(),
+        ));
+    }
+    let keys: HashSet<_> = match &selection {
+        PersistInvalidation::Keys(keys) => keys.iter().map(codec::key_suffix).collect(),
+        PersistInvalidation::Name { .. } => HashSet::new(),
+        PersistInvalidation::All => unreachable!("full invalidations use Flush"),
+    };
+    let matches = |suffix: &str, bytes: &[u8]| match &selection {
+        PersistInvalidation::Keys(_) => keys.contains(suffix),
+        PersistInvalidation::Name { name, types } => codec::question_matches(bytes, name, types),
+        PersistInvalidation::All => unreachable!("full invalidations use Flush"),
+    };
+    let before = pending.len();
+    pending.retain(|suffix, value| value.epoch >= epoch || !matches(suffix, &value.bytes));
+    *active_epoch = (*active_epoch).max(epoch);
+    // Unrelated queued puts remain live across the global stale-work fence.
+    for value in pending.values_mut() {
+        value.epoch = value.epoch.max(*active_epoch);
+    }
+    counters
+        .old_epoch_discarded
+        .fetch_add((before - pending.len()) as u64, Ordering::Relaxed);
+    counters.pending.store(pending.len(), Ordering::Relaxed);
+    let result = (|| {
+        let (suffixes, name): (Vec<String>, _) = match &selection {
+            PersistInvalidation::Keys(_) => (keys.iter().cloned().collect(), None),
+            PersistInvalidation::Name { name, types } => {
+                let suffixes = db
+                    .load_dns_v2()?
+                    .into_iter()
+                    .filter(|(suffix, bytes)| matches(suffix, bytes))
+                    .map(|(suffix, _)| suffix)
+                    .collect();
+                (suffixes, Some((name.as_str(), types.as_slice())))
+            }
+            PersistInvalidation::All => unreachable!("full invalidations use Flush"),
+        };
+        db.delete_dns_entries(&suffixes, name)
+    })();
+    result.map_err(|error| {
+        counters.db_errors.fetch_add(1, Ordering::Relaxed);
+        PersistControlError::Database(error.to_string())
+    })
 }
 
 fn write_newest(

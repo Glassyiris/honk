@@ -1,5 +1,6 @@
 //! File-authority regressions through real HTTP, reload publication and supervisor handoff.
 
+mod groups;
 mod transactions;
 
 use super::coordinator::ConfigCoordinator;
@@ -144,23 +145,17 @@ impl Fixture {
             .install_startup_diagnostics(subscriptions.take_startup_diagnostics())
             .await;
         let state = Arc::new(
-            NativeState::new(
-                &mut control_plane,
-                addr,
-                SystemTime::now(),
-                Instant::now(),
-                true,
-            )
-            .await
-            .unwrap(),
+            NativeState::new(&mut control_plane, addr, SystemTime::now(), Instant::now())
+                .await
+                .unwrap(),
         );
         let service = Arc::clone(&state.observation.configuration);
         let commands = control_plane.command_sender();
         subscriptions.start(commands.clone());
         let coordinator = service
             .start(
-                entry,
-                initial,
+                Some(entry),
+                Some(initial),
                 control_plane.config_handle(),
                 control_plane.diagnostics_handle(),
                 commands.clone(),
@@ -238,7 +233,7 @@ impl Fixture {
             loop {
                 let operation = self.get(href).await;
                 assert_eq!(operation["operation_id"], accepted["operation_id"]);
-                assert_eq!(operation["kind"], "reload");
+                assert_eq!(operation["kind"], accepted["kind"]);
                 match operation["status"].as_str().unwrap() {
                     "succeeded" | "failed" => {
                         for field in ["created_at", "started_at", "finished_at"] {
@@ -334,6 +329,7 @@ impl Fixture {
         assert_eq!(
             timeout(WAIT, self.subscriptions.take().unwrap().shutdown())
                 .await
+                .unwrap()
                 .unwrap(),
             0
         );
@@ -386,7 +382,10 @@ async fn accepted(response: Response) -> Value {
     );
     let location = response.headers()["location"].to_str().unwrap().to_owned();
     let body: Value = response.json().await.unwrap();
-    assert_eq!(body["kind"], "reload");
+    assert!(matches!(
+        body["kind"].as_str(),
+        Some("reload" | "group_update")
+    ));
     assert_eq!(body["href"], location);
     assert_eq!(
         location,
@@ -487,7 +486,6 @@ async fn metadata_defaults_and_anonymous_never_grant_source_authority() {
         let capabilities = fixture.get("/api/v1/capabilities").await;
         assert_eq!(capabilities["resources"]["config"]["content"], false);
         assert_eq!(capabilities["resources"]["config"]["writable"], false);
-        assert_eq!(capabilities["resources"]["groups"]["selection"], false);
         assert_eq!(capabilities["resources"]["groups"]["config_patch"], false);
         let main = source(&config, &fixture.originals["main.dae"]);
         let before = disk(fixture.directory.path());
@@ -499,17 +497,6 @@ async fn metadata_defaults_and_anonymous_never_grant_source_authority() {
                 .unwrap(),
             StatusCode::FORBIDDEN,
             "permission_denied",
-        )
-        .await;
-        error(
-            fixture
-                .request(Method::PUT, "/api/v1/groups/unknown/selection")
-                .json(&json!({}))
-                .send()
-                .await
-                .unwrap(),
-            StatusCode::NOT_FOUND,
-            "capability_not_supported",
         )
         .await;
         assert_eq!(disk(fixture.directory.path()), before);

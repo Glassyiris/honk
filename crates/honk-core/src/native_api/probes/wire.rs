@@ -1,0 +1,276 @@
+use super::*;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+pub(super) async fn bounded<T>(
+    deadline: Instant,
+    mut cancel: watch::Receiver<bool>,
+    future: impl Future<Output = T>,
+) -> std::io::Result<T> {
+    if *cancel.borrow() {
+        return Err(std::io::ErrorKind::Interrupted.into());
+    }
+    tokio::select! {
+        biased;
+        _ = cancel.changed() => Err(std::io::ErrorKind::Interrupted.into()),
+        result = tokio::time::timeout_at(deadline, future) => result.map_err(|_| std::io::ErrorKind::TimedOut.into()),
+    }
+}
+
+pub(super) struct AttemptOutcome {
+    pub(super) sample: Option<ProbeMeasurement>,
+    pub(super) completed: bool,
+    pub(super) error: Option<&'static str>,
+    pub(super) observed_at: SystemTime,
+}
+impl AttemptOutcome {
+    fn completed(
+        result: anyhow::Result<ProbeMeasurement>,
+        deadline: Instant,
+        cancel: &watch::Receiver<bool>,
+    ) -> Self {
+        match result {
+            Ok(sample) => Self {
+                sample: Some(sample),
+                completed: true,
+                error: None,
+                observed_at: sample.observed_at,
+            },
+            Err(error) => {
+                let io = error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+                    .map(std::io::Error::kind);
+                let reason = if io == Some(std::io::ErrorKind::Interrupted) && *cancel.borrow() {
+                    "cancelled"
+                } else if io == Some(std::io::ErrorKind::TimedOut) && Instant::now() >= deadline {
+                    "deadline"
+                } else if honk_outbound::proxy::is_packet_rejection(&error)
+                    || io == Some(std::io::ErrorKind::Interrupted)
+                {
+                    "local_refusal"
+                } else {
+                    "probe_failed"
+                };
+                Self {
+                    sample: None,
+                    completed: reason == "probe_failed",
+                    error: Some(reason),
+                    observed_at: SystemTime::now(),
+                }
+            }
+        }
+    }
+    fn refused() -> Self {
+        Self {
+            sample: None,
+            completed: false,
+            error: Some("local_refusal"),
+            observed_at: SystemTime::now(),
+        }
+    }
+}
+pub(super) async fn attempt(
+    state: &NativeState,
+    plan: &Plan,
+    attempt: &Attempt,
+    addr: SocketAddr,
+    deadline: Instant,
+    cancel: watch::Receiver<bool>,
+) -> AttemptOutcome {
+    if plan.request.kind == Kind::TcpConnect {
+        let result = bounded(deadline, cancel.clone(), async {
+            let _permit = plan.registry.acquire_dial_permit().await;
+            let start = std::time::Instant::now();
+            let socket = honk_outbound::util::connect_marked_addr(
+                addr,
+                Some(honk_ebpf_common::DAE_BYPASS_MARK),
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .await?;
+            let sample = ProbeMeasurement {
+                latency: start.elapsed(),
+                observed_at: SystemTime::now(),
+            };
+            drop(socket);
+            Ok(sample)
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+        return AttemptOutcome::completed(result, deadline, &cancel);
+    }
+    let Some(entry) = state.proxy_registry.find(attempt.node.protocol()) else {
+        return AttemptOutcome::refused();
+    };
+    // Disposable runtime identity remains the canonical node's identity. Only its
+    // inherited dial scope pins the previously validated physical server address.
+    let Ok(ephemeral) = plan.registry.try_ephemeral_guarded(&attempt.node) else {
+        return AttemptOutcome::refused();
+    };
+    let runtime = ephemeral.runtime();
+    let operation = async {
+        if plan.request.kind == Kind::Http {
+            honk_outbound::urltest::native_http_probe(
+                &runtime,
+                entry.tcp.as_ref(),
+                plan.http.as_ref().expect("HTTP plan"),
+                addr,
+                plan.request.warmth == Warmth::Cold,
+                deadline,
+                cancel.clone(),
+            )
+            .await
+        } else {
+            bounded(deadline, cancel.clone(), async {
+                let connect_timeout = Duration::from_millis(plan.config.global.connect_timeout_ms)
+                    .min(deadline.saturating_duration_since(Instant::now()));
+                match attempt.transport {
+                    Transport::Tcp => {
+                        let mut proxy = entry
+                            .tcp
+                            .dial_runtime(Arc::clone(&runtime), addr, None, connect_timeout)
+                            .await?;
+                        tcp_dns(&mut proxy.stream).await
+                    }
+                    Transport::Udp => {
+                        let packet = entry
+                            .packet
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("packet handler unavailable"))?;
+                        let transport = packet
+                            .dial_udp_transport_runtime(
+                                Arc::clone(&runtime),
+                                addr,
+                                None,
+                                connect_timeout,
+                            )
+                            .await?;
+                        udp_dns(transport.as_ref()).await
+                    }
+                }
+            })
+            .await?
+        }
+    };
+    let result = if let Some(server) = attempt.server {
+        runtime
+            .scope_tasks(
+                plan.registry
+                    .scope_pinned_dials(attempt.node.host(), server, operation),
+            )
+            .await
+    } else {
+        runtime
+            .scope_tasks(plan.registry.scope_dials(operation))
+            .await
+    };
+    let outcome = AttemptOutcome::completed(result, deadline, &cancel);
+    drop(runtime);
+    // Never cancel this owner boundary: close must drain every factory/driver
+    // admitted before the request deadline, even when the HTTP caller is gone.
+    ephemeral.close().await;
+    outcome
+}
+
+fn dns_query() -> Vec<u8> {
+    let mut query = crate::dns::forwarder::build_dns_query("google.com", 1);
+    query[..2].copy_from_slice(&Uuid::new_v4().as_bytes()[..2]);
+    query
+}
+fn validate_dns(query: &[u8], response: &[u8]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        response.get(..2) == query.get(..2),
+        "DNS response transaction mismatch"
+    );
+    let context = crate::dns::query::QueryContext::parse_with_profile(
+        query,
+        crate::dns::query::IngressProfile::Tcp,
+    )?;
+    crate::dns::response::ResponseTemplate::check(&context, response)?;
+    anyhow::ensure!(response[3] & 15 == 0, "DNS response reports failure");
+    Ok(())
+}
+async fn tcp_dns<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> anyhow::Result<ProbeMeasurement> {
+    let query = dns_query();
+    let start = std::time::Instant::now();
+    stream.write_u16(u16::try_from(query.len())?).await?;
+    stream.write_all(&query).await?;
+    stream.flush().await?;
+    let length = usize::from(stream.read_u16().await?);
+    let mut response = vec![0; length];
+    stream.read_exact(&mut response).await?;
+    validate_dns(&query, &response)?;
+    Ok(ProbeMeasurement {
+        latency: start.elapsed(),
+        observed_at: SystemTime::now(),
+    })
+}
+async fn udp_dns(
+    transport: &dyn honk_outbound::proxy::PacketTransport,
+) -> anyhow::Result<ProbeMeasurement> {
+    let query = dns_query();
+    let start = std::time::Instant::now();
+    transport.send_packet_confirmed(&query).await?;
+    let mut response = vec![0; 65535];
+    let (length, source) = transport.recv_packet(&mut response).await?;
+    anyhow::ensure!(
+        normalize(source.ip()) == normalize(transport.relay_addr().ip())
+            && source.port() == transport.relay_addr().port(),
+        "DNS response peer mismatch"
+    );
+    validate_dns(&query, &response[..length])?;
+    Ok(ProbeMeasurement {
+        latency: start.elapsed(),
+        observed_at: SystemTime::now(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn completed_error_survives_later_cancel_and_deadline() {
+        let (cancel, receiver) = watch::channel(false);
+        let error = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        cancel.send_replace(true);
+        let outcome = AttemptOutcome::completed(Err(error), Instant::now(), &receiver);
+        assert!(outcome.completed);
+        assert_eq!(outcome.error, Some("probe_failed"));
+    }
+
+    #[tokio::test]
+    async fn dns_probes_validate_framed_tcp_and_udp_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let tcp = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let size = stream.read_u16().await.unwrap() as usize;
+            let mut query = vec![0; size];
+            stream.read_exact(&mut query).await.unwrap();
+            query[2] |= 0x80;
+            stream.write_u16(size as u16).await.unwrap();
+            stream.write_all(&query).await.unwrap();
+        });
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let sample = tcp_dns(&mut stream).await.unwrap();
+        assert!(sample.observed_at <= SystemTime::now());
+        tcp.await.unwrap();
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let udp = tokio::spawn(async move {
+            let mut query = [0; 512];
+            let (size, peer) = server.recv_from(&mut query).await.unwrap();
+            query[2] |= 0x80;
+            // Echoing the right transaction is insufficient: the question must match.
+            query[13] = b'x';
+            server.send_to(&query[..size], peer).await.unwrap();
+        });
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(address).await.unwrap();
+        let transport = honk_outbound::proxy::UdpSocketTransport::new(Arc::new(socket), address);
+        assert!(udp_dns(&transport).await.is_err());
+        udp.await.unwrap();
+    }
+}

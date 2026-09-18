@@ -171,6 +171,14 @@ pub(super) fn parse_section(
     section: &[Segment<'_, '_>],
     diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Result<RoutingConfig, super::ParseFailure> {
+    parse_section_indexed(section, diagnostics, |_, _| {})
+}
+
+pub(super) fn parse_section_indexed(
+    section: &[Segment<'_, '_>],
+    diagnostics: &mut ParserDiagnostics<'_>,
+    mut location: impl FnMut(Option<usize>, Span),
+) -> Result<RoutingConfig, super::ParseFailure> {
     let mut config = RoutingConfig::default();
     let lines = read::statements(section, diagnostics, super::cursor::BodySyntax::Expressions);
     let mut start = 0;
@@ -208,12 +216,14 @@ pub(super) fn parse_section(
                 .trim();
             value.warn_glued_hash(diagnostics);
             config.default_outbound = value.display();
+            location(None, statement.span);
         } else {
             match parse_routing_rule(statement, config.rules.len(), ordinal, diagnostics) {
                 Ok(Some((rule, source))) => {
                     if let Some(source) = source {
                         config.record_complex_rule_source(rule.name.clone(), source);
                     }
+                    location(Some(config.rules.len()), statement.span);
                     config.rules.push(rule);
                 }
                 Ok(None) => statement.parts().next().unwrap().notice(

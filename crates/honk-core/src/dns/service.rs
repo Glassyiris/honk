@@ -9,12 +9,19 @@ use super::outcome::DnsOutcome;
 use super::query::{DnsRequestMeta, IngressProfile};
 use super::runtime::{DnsServiceProvider, RuntimeLease};
 
+mod cache_control;
+#[cfg(feature = "native-api")]
+mod diagnostic;
 mod name_resolution;
+#[cfg(feature = "native-api")]
+pub(crate) use diagnostic::{DiagnosticError, DiagnosticFailure};
 
 #[derive(Clone)]
 pub struct DnsService {
     backend: Arc<DnsServiceBackend>,
     flush_generation: watch::Sender<u64>,
+    #[cfg(feature = "native-api")]
+    observer: Arc<parking_lot::RwLock<std::sync::Weak<crate::native_api::dns::DnsApi>>>,
 }
 
 enum DnsServiceBackend {
@@ -55,11 +62,45 @@ impl OperationToken {
 }
 
 impl DnsService {
+    #[cfg(feature = "native-api")]
+    pub(crate) fn attach_observer(
+        &self,
+        observer: std::sync::Weak<crate::native_api::dns::DnsApi>,
+    ) {
+        *self.observer.write() = observer;
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn observation_enabled(&self) -> bool {
+        self.observer
+            .read()
+            .upgrade()
+            .is_some_and(|observer| observer.recording())
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn observe_client(
+        &self,
+        query: &[u8],
+        ingress: IngressProfile,
+        source: Option<std::net::SocketAddr>,
+        outcome: Option<&DnsOutcome>,
+        response: &[u8],
+        elapsed: std::time::Duration,
+    ) {
+        let observer = self.observer.read().upgrade();
+        if let Some(observer) = observer {
+            observer.observe_client(query, ingress, source, outcome, response, elapsed);
+        }
+    }
+
     pub fn with_forwarder(forwarder: Arc<DnsForwarder>) -> Self {
         let (flush_generation, _) = watch::channel(0);
         Self {
             backend: Arc::new(DnsServiceBackend::Standalone(forwarder)),
             flush_generation,
+            #[cfg(feature = "native-api")]
+            observer: Arc::new(parking_lot::RwLock::new(std::sync::Weak::new())),
         }
     }
 
@@ -68,6 +109,8 @@ impl DnsService {
         Self {
             backend: Arc::new(DnsServiceBackend::Runtime(provider)),
             flush_generation,
+            #[cfg(feature = "native-api")]
+            observer: Arc::new(parking_lot::RwLock::new(std::sync::Weak::new())),
         }
     }
 
@@ -89,7 +132,7 @@ impl DnsService {
         let mut operation = self.operation();
         match self.backend.as_ref() {
             DnsServiceBackend::Runtime(provider) => {
-                let lease = provider.acquire();
+                let lease = provider.try_acquire()?;
                 operation
                     .run(
                         lease.run(
@@ -114,6 +157,7 @@ impl DnsService {
         }
     }
 
+    #[cfg(any(feature = "native-api", test))]
     pub(crate) async fn resolve_outcome_with_runtime(
         &self,
         runtime: &RuntimeLease,
@@ -121,36 +165,42 @@ impl DnsService {
         metadata: DnsRequestMeta,
         ingress: IngressProfile,
     ) -> anyhow::Result<DnsOutcome> {
+        self.resolve_client_outcome_with_runtime(runtime, raw_query, metadata, ingress, None)
+            .await
+    }
+
+    pub(crate) async fn resolve_client_outcome_with_runtime(
+        &self,
+        runtime: &RuntimeLease,
+        raw_query: &[u8],
+        metadata: DnsRequestMeta,
+        ingress: IngressProfile,
+        evidence: Option<&mut crate::dns::outcome::RouteSource>,
+    ) -> anyhow::Result<DnsOutcome> {
         let mut operation = self.operation();
         operation
-            .run(
-                runtime.run(
-                    runtime
-                        .runtime()
-                        .forwarder()
-                        .resolve_outcome_with_context_and_profile(raw_query, metadata, ingress),
-                ),
-            )
+            .run(runtime.run(runtime.runtime().forwarder().resolve_inner(
+                raw_query,
+                metadata,
+                ingress,
+                &crate::dns::forwarder::ResolveOptions::default(),
+                crate::dns::forwarder::ResolveMode::Strict,
+                evidence,
+            )))
             .await??
             .map_err(Into::into)
     }
 
     pub async fn flush_cache(&self) -> anyhow::Result<bool> {
-        self.flush_generation
-            .send_modify(|generation| *generation = generation.saturating_add(1));
-        let cache_service = self.cache().lock().await.service();
-        let flush = cache_service.begin_flush();
-        if let Some(persistence) = flush.persistence() {
-            persistence.flush().await.map(|()| true)
-        } else {
-            Ok(false)
-        }
-        .map_err(anyhow::Error::from)
+        Ok(self
+            .invalidate_cache(crate::dns::cache::CacheInvalidation::All)
+            .await?
+            .persistent)
     }
 
     pub fn cache(&self) -> Arc<Mutex<DnsCache>> {
         match self.backend.as_ref() {
-            DnsServiceBackend::Runtime(provider) => provider.acquire().runtime().cache(),
+            DnsServiceBackend::Runtime(provider) => provider.current().cache(),
             DnsServiceBackend::Standalone(forwarder) => forwarder.cache(),
         }
     }
@@ -164,9 +214,7 @@ impl DnsService {
 
     pub fn forwarder(&self) -> Arc<DnsForwarder> {
         match self.backend.as_ref() {
-            DnsServiceBackend::Runtime(provider) => {
-                Arc::clone(provider.acquire().runtime().forwarder())
-            }
+            DnsServiceBackend::Runtime(provider) => Arc::clone(provider.current().forwarder()),
             DnsServiceBackend::Standalone(forwarder) => Arc::clone(forwarder),
         }
     }

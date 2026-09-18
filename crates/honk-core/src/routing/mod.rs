@@ -12,6 +12,8 @@ mod ir;
 mod lan_protection;
 mod lpm;
 
+#[cfg(feature = "native-api")]
+pub(crate) mod native;
 pub(crate) use geo::{GeoAssets, GeoRequirements, GeoSourceSet};
 pub use ir::{CompiledCondition, CompiledPredicate, IpMatcher, PortRange};
 pub(crate) use lpm::BinaryLpmTrie;
@@ -104,6 +106,14 @@ impl GeositeMatcher {
     }
 
     pub(crate) fn matches(&self, domain: &str) -> bool {
+        self.matches_bounded::<false>(domain, None)
+    }
+
+    fn matches_bounded<const BOUNDED: bool>(
+        &self,
+        domain: &str,
+        deadline: Option<std::time::Instant>,
+    ) -> bool {
         let lower = domain.to_lowercase();
         if self.full.contains(lower.as_str()) {
             return true;
@@ -126,7 +136,7 @@ impl GeositeMatcher {
         {
             return true;
         }
-        self.regex.iter().any(|re| re.is_match(domain))
+        bounded_any::<BOUNDED, _>(&self.regex, deadline, |re| re.is_match(domain))
     }
 }
 
@@ -218,6 +228,14 @@ impl DomainMatcher {
     }
 
     fn matches(&self, domain: &str) -> bool {
+        self.matches_bounded::<false>(domain, None)
+    }
+
+    fn matches_bounded<const BOUNDED: bool>(
+        &self,
+        domain: &str,
+        deadline: Option<std::time::Instant>,
+    ) -> bool {
         match self {
             Self::Ordinary {
                 patterns,
@@ -225,13 +243,29 @@ impl DomainMatcher {
                 keywords,
                 ..
             } => {
-                patterns.iter().any(|pattern| pattern.is_match(domain))
-                    || suffixes.iter().any(|suffix| domain.ends_with(suffix))
-                    || keywords.iter().any(|keyword| domain.contains(keyword))
+                bounded_any::<BOUNDED, _>(patterns, deadline, |pattern| pattern.is_match(domain))
+                    || bounded_any::<BOUNDED, _>(suffixes, deadline, |suffix| {
+                        domain.ends_with(suffix)
+                    })
+                    || bounded_any::<BOUNDED, _>(keywords, deadline, |keyword| {
+                        domain.contains(keyword)
+                    })
             }
-            Self::Geosite { matcher, .. } => matcher.matches(domain),
+            Self::Geosite { matcher, .. } => matcher.matches_bounded::<BOUNDED>(domain, deadline),
         }
     }
+}
+
+// The untimed production specialization has no clock reads or per-alternative budget branch.
+fn bounded_any<const BOUNDED: bool, T>(
+    values: &[T],
+    deadline: Option<std::time::Instant>,
+    mut matches: impl FnMut(&T) -> bool,
+) -> bool {
+    values
+        .iter()
+        .take_while(|_| !BOUNDED || deadline.is_some_and(|end| std::time::Instant::now() < end))
+        .any(&mut matches)
 }
 
 #[derive(Debug, Default)]
@@ -267,6 +301,19 @@ pub struct ConnectionInfo {
     pub process_name: Option<String>,
     pub mac: Option<String>,
     pub dscp: Option<u8>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PredicateInput<'a> {
+    pub(crate) domain: Option<&'a str>,
+    pub(crate) dst_ip: Option<IpAddr>,
+    pub(crate) dst_port: Option<u16>,
+    pub(crate) src_ip: Option<IpAddr>,
+    pub(crate) src_port: Option<u16>,
+    pub(crate) protocol: &'a str,
+    pub(crate) process_name: Option<&'a str>,
+    pub(crate) mac: Option<&'a str>,
+    pub(crate) dscp: Option<u8>,
 }
 
 /// Human-readable connection identity for routing debug logs.
@@ -487,19 +534,34 @@ impl Router {
         conn: &ConnectionInfo,
         domain_bitmap: Option<&DomainRouting>,
     ) -> bool {
+        let input = PredicateInput {
+            domain: conn.domain.as_deref(),
+            dst_ip: Some(conn.dst_ip),
+            dst_port: Some(conn.dst_port),
+            src_ip: Some(conn.src_ip),
+            src_port: Some(conn.src_port),
+            protocol: conn.protocol,
+            process_name: conn.process_name.as_deref(),
+            mac: conn.mac.as_deref(),
+            dscp: conn.dscp,
+        };
         !route.conditions.is_empty()
             && route.conditions.iter().all(|condition| {
-                let matched = self.matches_predicate(&condition.predicate, conn, domain_bitmap);
+                // Production absence is a miss before negation; simulations retain unknown.
+                let matched = self
+                    .evaluate_predicate::<false>(&condition.predicate, input, domain_bitmap, None)
+                    .unwrap_or(false);
                 if condition.not { !matched } else { matched }
             })
     }
 
-    fn matches_predicate(
+    fn evaluate_predicate<const BOUNDED: bool>(
         &self,
         predicate: &CompiledPredicate,
-        conn: &ConnectionInfo,
+        input: PredicateInput<'_>,
         domain_bitmap: Option<&DomainRouting>,
-    ) -> bool {
+        deadline: Option<std::time::Instant>,
+    ) -> Option<bool> {
         match predicate {
             CompiledPredicate::Domain(id) => domain_bitmap
                 .map(|bitmap| {
@@ -507,36 +569,40 @@ impl Router {
                     id < ROUTING_FACT_CAPACITY && bitmap.bitmap[id / 32] & (1 << (id % 32)) != 0
                 })
                 .or_else(|| {
-                    conn.domain.as_deref().map(|domain| {
+                    input.domain.map(|domain| {
                         self.domain_matchers
                             .get(*id as usize)
-                            .is_some_and(|matcher| matcher.matches(domain))
+                            .is_some_and(|matcher| {
+                                matcher.matches_bounded::<BOUNDED>(domain, deadline)
+                            })
                     })
-                })
-                .unwrap_or(false),
-            CompiledPredicate::DestinationIp(matcher) => matcher.matches(&conn.dst_ip),
-            CompiledPredicate::SourceIp(matcher) => matcher.matches(&conn.src_ip),
-            CompiledPredicate::DestinationPort(ranges) => {
-                ranges.iter().any(|range| range.contains(conn.dst_port))
+                }),
+            CompiledPredicate::DestinationIp(matcher) => {
+                input.dst_ip.map(|ip| matcher.matches(&ip))
             }
-            CompiledPredicate::SourcePort(ranges) => {
-                ranges.iter().any(|range| range.contains(conn.src_port))
-            }
-            CompiledPredicate::Protocol(mask) => protocol_value(conn.protocol) & *mask != 0,
-            CompiledPredicate::IpVersion(mask) => {
-                let version = if conn.dst_ip.is_ipv4() { 1 } else { 2 };
+            CompiledPredicate::SourceIp(matcher) => input.src_ip.map(|ip| matcher.matches(&ip)),
+            CompiledPredicate::DestinationPort(ranges) => input.dst_port.map(|port| {
+                bounded_any::<BOUNDED, _>(ranges, deadline, |range| range.contains(port))
+            }),
+            CompiledPredicate::SourcePort(ranges) => input.src_port.map(|port| {
+                bounded_any::<BOUNDED, _>(ranges, deadline, |range| range.contains(port))
+            }),
+            CompiledPredicate::Protocol(mask) => Some(protocol_value(input.protocol) & *mask != 0),
+            CompiledPredicate::IpVersion(mask) => input.dst_ip.map(|ip| {
+                let version = if ip.is_ipv4() { 1 } else { 2 };
                 *mask & version != 0
-            }
-            CompiledPredicate::Dscp(values) => conn.dscp.is_some_and(|dscp| values.contains(&dscp)),
-            CompiledPredicate::ProcessName(patterns) => conn
-                .process_name
-                .as_deref()
-                .is_some_and(|name| patterns.iter().any(|pattern| name.contains(pattern))),
-            CompiledPredicate::Mac(macs) => conn
-                .mac
-                .as_deref()
-                .and_then(normalize_mac_bytes)
-                .is_some_and(|mac| macs.contains(&mac)),
+            }),
+            CompiledPredicate::Dscp(values) => input
+                .dscp
+                .map(|dscp| bounded_any::<BOUNDED, _>(values, deadline, |value| *value == dscp)),
+            CompiledPredicate::ProcessName(patterns) => input.process_name.map(|name| {
+                bounded_any::<BOUNDED, _>(patterns, deadline, |pattern| name.contains(pattern))
+            }),
+            CompiledPredicate::Mac(macs) => input.mac.map(|mac| {
+                normalize_mac_bytes(mac).is_some_and(|mac| {
+                    bounded_any::<BOUNDED, _>(macs, deadline, |value| *value == mac)
+                })
+            }),
         }
     }
 

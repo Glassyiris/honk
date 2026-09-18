@@ -16,7 +16,8 @@ pub(crate) struct ConfigCoordinator {
 
 struct Worker {
     service: Arc<ConfigService>,
-    entry: PathBuf,
+    entry: Option<PathBuf>,
+    source_managed: bool,
     active: Arc<tokio::sync::RwLock<Arc<Config>>>,
     diagnostics: crate::config_diagnostics::SharedDiagnostics,
     commands: mpsc::Sender<ControlCommand>,
@@ -27,17 +28,21 @@ struct Worker {
 impl ConfigService {
     pub(crate) async fn start(
         self: &Arc<Self>,
-        entry: PathBuf,
-        initial: SourceUpdate,
+        entry: Option<PathBuf>,
+        initial: Option<SourceUpdate>,
         active: Arc<tokio::sync::RwLock<Arc<Config>>>,
         diagnostics: crate::config_diagnostics::SharedDiagnostics,
         commands: mpsc::Sender<ControlCommand>,
         subscriptions: SubscriptionSupervisorHandle,
     ) -> ConfigCoordinator {
-        {
+        let entry = initial
+            .as_ref()
+            .and_then(|initial| initial.sources.first().map(|source| source.path.clone()))
+            .or(entry);
+        if let Some(initial) = &initial {
             let config = active.read().await;
             let generation = diagnostics.read().generation;
-            self.accept(&initial, generation);
+            self.accept(initial, generation);
             self.generation_committed(&super::super::catalog::revision_for(&config), generation);
         }
         let (sender, mut receiver) = mpsc::channel(16);
@@ -48,6 +53,7 @@ impl ConfigService {
             let mut worker = Worker {
                 service,
                 entry,
+                source_managed: initial.is_some(),
                 active,
                 diagnostics,
                 commands,
@@ -85,7 +91,103 @@ impl ConfigCoordinator {
 
 impl Worker {
     async fn perform(&mut self, work: Work) {
+        if let Err(error) = self.service.check_phase(&work) {
+            match work {
+                Work::Replace { reservation, .. }
+                | Work::GroupPatch { reservation, .. }
+                | Work::Reload { reservation }
+                | Work::Lifecycle { reservation, .. } => {
+                    self.service.operations.reject(&reservation.id, error);
+                }
+                Work::Sighup => tracing::warn!("SIGHUP refused while engine is not running"),
+                _ => unreachable!("excluded non-activation work"),
+            }
+            return;
+        }
         match work {
+            Work::Lifecycle {
+                resume,
+                reservation,
+            } => {
+                let id = &reservation.id;
+                let (reply, result) = oneshot::channel();
+                let command = if resume {
+                    ControlCommand::Resume { reply }
+                } else {
+                    ControlCommand::Suspend { reply }
+                };
+                if self.commands.send(command).await.is_err() {
+                    self.service.operations.reject(id, unavailable());
+                    return;
+                }
+                self.service.operations.accept(id);
+                self.service.operations.running(id);
+                match result.await {
+                    Ok(Ok(())) => {
+                        self.service.operations.succeed(
+                            id,
+                            if resume {
+                                super::super::operations::OperationResult::Resume {
+                                    runtime_state: "running",
+                                }
+                            } else {
+                                super::super::operations::OperationResult::Suspend {
+                                    runtime_state: "suspended",
+                                }
+                            },
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        self.service.operations.fail(
+                            id,
+                            "lifecycle_failed",
+                            "Lifecycle transition failed",
+                            error.into_details(),
+                        );
+                    }
+                    Err(_) => {
+                        self.service.operations.fail(
+                            id,
+                            "engine_unavailable",
+                            "Lifecycle owner is unavailable",
+                            None,
+                        );
+                    }
+                }
+            }
+            Work::GroupPatch { patch, reservation } => {
+                let id = reservation.id.clone();
+                let group_id = patch.id.clone();
+                let revision = patch.revision.clone();
+                match self.prepare_group_patch(*patch).await {
+                    Ok(Some((candidate, sources, diagnostics))) => {
+                        self.apply(
+                            candidate,
+                            Some(sources),
+                            diagnostics,
+                            Some(&id),
+                            false,
+                            Some((&group_id, &revision)),
+                        )
+                        .await;
+                    }
+                    Ok(None) => {
+                        self.service.operations.accept(&id);
+                        self.service.operations.running(&id);
+                        self.service.operations.succeed(
+                            &id,
+                            crate::native_api::operations::OperationResult::GroupUpdate {
+                                group_id,
+                                config_revision: revision,
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        self.service.operations.reject(&id, error);
+                    }
+                }
+                drop(reservation);
+            }
             Work::Validate { request, response } => {
                 let result = self.validate(request).await;
                 let _ = response.send(result);
@@ -97,10 +199,20 @@ impl Worker {
                 reservation,
             } => {
                 let id = reservation.id.clone();
-                match self.prepare_replace(&source_id, content, if_match).await {
+                match self
+                    .prepare_replace(&source_id, content, if_match, None)
+                    .await
+                {
                     Ok((candidate, sources, diagnostics)) => {
-                        self.apply(candidate, sources, diagnostics, Some(&id), false)
-                            .await
+                        self.apply(
+                            candidate,
+                            Some(sources),
+                            diagnostics,
+                            Some(&id),
+                            false,
+                            None,
+                        )
+                        .await
                     }
                     Err(error) => {
                         self.service.operations.reject(&id, error);
@@ -114,7 +226,7 @@ impl Worker {
                 self.service.operations.running(&id);
                 match self.load().await {
                     Ok((candidate, sources, diagnostics)) => {
-                        self.apply(candidate, sources, diagnostics, Some(&id), true)
+                        self.apply(candidate, sources, diagnostics, Some(&id), true, None)
                             .await
                     }
                     Err(_) => self.failed(
@@ -128,7 +240,7 @@ impl Worker {
             }
             Work::Sighup => match self.load().await {
                 Ok((candidate, sources, diagnostics)) => {
-                    self.apply(candidate, sources, diagnostics, None, true)
+                    self.apply(candidate, sources, diagnostics, None, true, None)
                         .await
                 }
                 Err(_) => tracing::warn!("SIGHUP configuration admission rejected"),
@@ -136,10 +248,22 @@ impl Worker {
         }
     }
 
-    async fn load(&self) -> Result<(Config, SourceUpdate, Vec<DetailedDiagnostic>), ApiError> {
-        let entry = self.entry.clone();
+    async fn load(
+        &self,
+    ) -> Result<(Config, Option<SourceUpdate>, Vec<DetailedDiagnostic>), ApiError> {
+        let entry = self.entry.clone().ok_or_else(unsupported)?;
+        let source_managed = self.source_managed;
         tokio::task::spawn_blocking(move || {
             let mut diagnostics = Vec::new();
+            if !source_managed {
+                let mut config = crate::load_operator_config(
+                    entry.to_str().ok_or_else(invalid)?,
+                    &mut diagnostics,
+                )
+                .map_err(|error| config_error(error, &diagnostics, &[], None, None))?;
+                config.ensure_builtin_nodes();
+                return Ok((config, None, diagnostics));
+            }
             let loaded = Config::from_dae_file_with_sources(
                 &entry,
                 &HashMap::new(),
@@ -156,10 +280,10 @@ impl Worker {
             config.ensure_builtin_nodes();
             Ok((
                 config,
-                SourceUpdate {
+                Some(SourceUpdate {
                     sources: loaded.sources,
                     dependencies: Vec::new(),
-                },
+                }),
                 diagnostics,
             ))
         })
@@ -167,11 +291,78 @@ impl Worker {
         .map_err(|_| unavailable())?
     }
 
+    async fn prepare_group_patch(
+        &self,
+        patch: super::super::groups::GroupPatch,
+    ) -> Result<Option<(Config, SourceUpdate, Vec<DetailedDiagnostic>)>, ApiError> {
+        let expected = patch.expected.as_ref().map_err(Clone::clone)?;
+        let accepted = self
+            .service
+            .accepted
+            .read()
+            .clone()
+            .ok_or_else(unavailable)?;
+        if accepted.revision != *expected || accepted.revision != patch.revision {
+            return Err(ApiError::new(
+                StatusCode::PRECONDITION_FAILED,
+                ErrorCode::StaleRevision,
+                "Group configuration revision changed",
+                None,
+            ));
+        }
+        let index = *accepted
+            .group_sources
+            .get(&patch.name)
+            .ok_or_else(not_found)?;
+        if !self.service.source_writable(&accepted, index) {
+            return Err(denied());
+        }
+        let changes = patch.changes()?;
+        let content = honk_config::parser::source_edit::edit_group_source(
+            &accepted.update.sources[index],
+            &patch.name,
+            &changes,
+        )
+        .map_err(|_| invalid())?;
+        if content == accepted.update.sources[index].content.as_ref() {
+            let entry = self.entry.clone().ok_or_else(unsupported)?;
+            let service = Arc::clone(&self.service);
+            tokio::task::spawn_blocking(move || {
+                let mut diagnostics = Vec::new();
+                let baseline = Config::from_dae_file_with_sources(
+                    &entry,
+                    &HashMap::new(),
+                    limits(),
+                    &mut diagnostics,
+                )
+                .map_err(|_| stale())?;
+                if service.revision().as_ref() != Some(&patch.revision)
+                    || !same_source_documents(&accepted.update.sources, &baseline.sources)
+                {
+                    return Err(stale());
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| unavailable())??;
+            return Ok(None);
+        }
+        self.prepare_replace(
+            &accepted.ids[&accepted.update.sources[index].path],
+            content,
+            Ok(accepted.hashes[index].clone()),
+            Some(patch.revision),
+        )
+        .await
+        .map(Some)
+    }
+
     async fn prepare_replace(
         &self,
         source_id: &str,
         content: String,
         expected: Result<String, ApiError>,
+        group_revision: Option<String>,
     ) -> Result<(Config, SourceUpdate, Vec<DetailedDiagnostic>), ApiError> {
         let expected = expected?;
         if content.len() > MAX_SOURCE_BYTES {
@@ -188,15 +379,32 @@ impl Worker {
             return Err(denied());
         }
         let target = accepted.update.sources[index].path.clone();
-        let entry = self.entry.clone();
+        let entry = self.entry.clone().ok_or_else(unsupported)?;
         let active = self.active.read().await.clone();
         let source_id = source_id.to_owned();
         #[cfg(test)]
         let before_replace = self.service.before_replace.lock().take();
+        let service = Arc::clone(&self.service);
         tokio::task::spawn_blocking(move || {
             let file = SourceFile::open(&target, MAX_SOURCE_BYTES).map_err(write_error)?;
             if file.sha256() != expected {
                 return Err(stale());
+            }
+            if let Some(revision) = &group_revision {
+                if service.revision().as_ref() != Some(revision) {
+                    return Err(stale());
+                }
+                let mut diagnostics = Vec::new();
+                let baseline = Config::from_dae_file_with_sources(
+                    &entry,
+                    &HashMap::new(),
+                    limits(),
+                    &mut diagnostics,
+                )
+                .map_err(|_| stale())?;
+                if !same_source_documents(&accepted.update.sources, &baseline.sources) {
+                    return Err(stale());
+                }
             }
             let mut overlay = HashMap::new();
             overlay.insert(target.clone(), Arc::<str>::from(content.as_str()));
@@ -277,6 +485,12 @@ impl Worker {
                     hook();
                 }
                 let mut recheck_diagnostics = Vec::new();
+                if group_revision
+                    .as_ref()
+                    .is_some_and(|revision| service.revision().as_ref() != Some(revision))
+                {
+                    return Err(WriteError::Conflict);
+                }
                 let reloaded = Config::from_dae_file_with_sources(
                     &entry,
                     &overlay,
@@ -306,10 +520,11 @@ impl Worker {
     async fn apply(
         &mut self,
         candidate: Config,
-        sources: SourceUpdate,
+        sources: Option<SourceUpdate>,
         diagnostics: Vec<DetailedDiagnostic>,
         operation: Option<&str>,
         already_accepted: bool,
+        group: Option<(&str, &str)>,
     ) {
         let Some(next) = self.request_id.checked_add(1) else {
             if let Some(id) = operation {
@@ -335,7 +550,8 @@ impl Worker {
                 config: Box::new(candidate),
                 diagnostics,
                 result,
-                sources: Some(Arc::new(sources)),
+                sources: sources.map(Arc::new),
+                expected_group_revision: group.map(|(_, revision)| revision.to_owned()),
             })
             .await
             .is_err()
@@ -405,7 +621,7 @@ impl Worker {
                         id,
                         "reload_rejected",
                         "Configuration reload was rejected",
-                        None,
+                        (!already_accepted).then(|| json!({"written":true,"committed":false})),
                     );
                 } else {
                     tracing::warn!("SIGHUP reload rejected");
@@ -420,11 +636,30 @@ impl Worker {
             }
             ReloadOutcome::Noop { generation } | ReloadOutcome::Committed { generation } => {
                 if let Some(id) = operation {
-                    self.service.operations.succeed(
-                        id,
-                        Some(format!("{}:{generation}", self.service.instance_id)),
-                        None,
-                    );
+                    let result = if let Some((group_id, _)) = group {
+                        let Some(config_revision) = self.service.revision() else {
+                            self.failed(
+                                id,
+                                "source_authority_lost",
+                                "Group committed without retained source authority",
+                                None,
+                            );
+                            return;
+                        };
+                        crate::native_api::operations::OperationResult::GroupUpdate {
+                            group_id: group_id.to_owned(),
+                            config_revision,
+                        }
+                    } else {
+                        crate::native_api::operations::OperationResult::Reload {
+                            active_generation_id: Some(format!(
+                                "{}:{generation}",
+                                self.service.instance_id
+                            )),
+                            datapath_generation_id: None,
+                        }
+                    };
+                    self.service.operations.succeed(id, result);
                     *self.service.last_reload.write() = Some(
                         json!({"operation_id":id,"status":"succeeded","finished_at":timestamp(SystemTime::now()),"error":null}),
                     );
@@ -448,7 +683,7 @@ impl Worker {
         let active = self.active.read().await.clone();
         let generation = self.diagnostics.read().generation;
         let instance = self.service.instance_id.clone();
-        let entry = self.entry.clone();
+        let entry = self.entry.clone().ok_or_else(unsupported)?;
         let accepted = self.service.accepted.read().clone();
         tokio::task::spawn_blocking(move||{
             let root=entry.parent().ok_or_else(invalid)?;

@@ -576,3 +576,127 @@ async fn ephemeral_guard_releases_quic_client_when_probe_is_aborted() {
     .await
     .expect("the guard Drop must drive the QUIC close after abort");
 }
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn native_ephemeral_close_waits_for_quic_endpoint_idle() {
+    use futures_util::FutureExt as _;
+
+    let (server_endpoint, addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
+    let peer = tokio::spawn(async move {
+        let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+        connection.closed().await;
+    });
+    let guard = crate::runtime::NodeRuntime::try_ephemeral_guarded(&tuic_test_node()).unwrap();
+    let runtime = guard.runtime();
+    let (client, connection) = runtime
+        .scope_tasks(async { Ok(probe_client(&runtime, addr.port()).await) })
+        .await
+        .unwrap();
+    let endpoint = client
+        .0
+        .state
+        .lock()
+        .await
+        .endpoint
+        .as_ref()
+        .unwrap()
+        .1
+        .clone();
+    assert!(endpoint.wait_idle().now_or_never().is_none());
+    guard.close().await;
+    assert!(connection.close_reason().is_some());
+    assert!(endpoint.wait_idle().now_or_never().is_some());
+    peer.await.unwrap();
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn native_close_drains_endpoint_from_cancelled_unpublished_handshake() {
+    use futures_util::FutureExt as _;
+
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let guard = crate::runtime::NodeRuntime::try_ephemeral_guarded(&tuic_test_node()).unwrap();
+    let runtime = guard.runtime();
+    let observed = Arc::new(parking_lot::Mutex::new(None));
+    let endpoint_observed = Arc::clone(&observed);
+    let client = test_client(blackhole.local_addr().unwrap().port())
+        .await
+        .with_endpoint_factory(move |ipv6| {
+            let endpoint = client_endpoint(ipv6)?;
+            *endpoint_observed.lock() = Some(endpoint.clone());
+            Ok(endpoint)
+        });
+    let mut probe = Box::pin(runtime.scope_tasks(
+        client.connection_with(Duration::from_secs(5), |_conn| async {
+            Ok::<(), anyhow::Error>(())
+        }),
+    ));
+    assert!(probe.as_mut().now_or_never().is_none());
+    let endpoint = observed
+        .lock()
+        .clone()
+        .expect("dial must create its endpoint before handshake");
+    drop(probe);
+    guard.close().await;
+    assert!(endpoint.wait_idle().now_or_never().is_some());
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn native_production_close_drains_cancelled_quic_handshake() {
+    use futures_util::FutureExt as _;
+
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let node = tuic_test_node();
+    let generation = crate::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+        std::slice::from_ref(&node),
+        1,
+        1,
+        1,
+        true,
+        None,
+    )
+    .unwrap()
+    .0;
+    let runtime = generation.get(&node.id).unwrap();
+    let observed = Arc::new(parking_lot::Mutex::new(None));
+    let endpoint_observed = Arc::clone(&observed);
+    let client = runtime
+        .quic_client(|| async {
+            let client = test_client(blackhole.local_addr().unwrap().port())
+                .await
+                .with_endpoint_factory(move |ipv6| {
+                    let endpoint = client_endpoint(ipv6)?;
+                    *endpoint_observed.lock() = Some(endpoint.clone());
+                    Ok(endpoint)
+                });
+            Ok(Arc::new(ProbeClient(client)))
+        })
+        .await
+        .unwrap();
+    let mut dial = Box::pin(
+        client
+            .0
+            .connection_with(Duration::from_secs(5), |_conn| async {
+                Ok::<(), anyhow::Error>(())
+            }),
+    );
+    assert!(dial.as_mut().now_or_never().is_none());
+    let endpoint = observed
+        .lock()
+        .clone()
+        .expect("unpublished endpoint created");
+    drop(dial);
+    generation.shutdown().await;
+    assert!(endpoint.wait_idle().now_or_never().is_some());
+    assert!(
+        client
+            .0
+            .connection_with(Duration::from_secs(5), |_conn| async {
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .is_err()
+    );
+}

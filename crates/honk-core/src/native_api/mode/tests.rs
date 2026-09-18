@@ -1,0 +1,467 @@
+use super::super::catalog::Catalog;
+use super::*;
+use crate::{
+    ebpf::{EbpfBackend, mock::MockEbpfBackend},
+    mode::{ModeOverride, SharedModeState},
+};
+use honk_config::{Config, experimental::CacheFileConfig, node::Node};
+use std::{collections::HashMap, sync::Arc};
+
+type Backend = Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>>;
+
+fn config() -> Config {
+    let mut config = Config::default();
+    config.experimental.native_api.enabled = true;
+    config.nodes = vec![
+        Node {
+            id: uuid::Uuid::from_u128(1),
+            name: "duplicate".into(),
+            ..Default::default()
+        },
+        Node {
+            id: uuid::Uuid::from_u128(2),
+            name: "duplicate".into(),
+            ..Default::default()
+        },
+    ];
+    config.groups.push(honk_config::group::Group {
+        name: "Proxy".into(),
+        nodes: vec![config.nodes[0].id],
+        ..Default::default()
+    });
+    config.ensure_builtin_nodes();
+    config
+}
+
+async fn owner(
+    mode: ModeState,
+    cache: Option<Arc<crate::cachedb::CacheDb>>,
+) -> (DatapathFlagsHandle, Backend) {
+    let backend: Backend = Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
+    let state: SharedModeState = Arc::new(parking_lot::RwLock::new(mode));
+    let flags = DatapathFlagsHandle::new(backend.clone(), state, cache);
+    flags.initialize(true, true).await.unwrap();
+    (flags, backend)
+}
+
+fn runtime(mode: OutboundMode, target: Option<String>) -> ModeRequest {
+    ModeRequest::Runtime { mode, target }
+}
+
+#[tokio::test]
+async fn native_mode_and_target_publish_once_and_failure_preserves_both() {
+    use honk_ebpf_common::{
+        DATAPATH_FLAG_NFQ_ENABLED as ENABLED, DATAPATH_FLAG_NFQ_READY as READY,
+    };
+    let config = config();
+    let catalog = Catalog::new(&config);
+    let identity = catalog.snapshot();
+    let (flags, backend) = owner(ModeState::native(), None).await;
+    let node = config.nodes[1].id;
+    let first = apply(
+        &config,
+        &identity,
+        &flags,
+        runtime(OutboundMode::Global, Some(node.to_string())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first["mode"], "global");
+    assert_eq!(first["target"], node.to_string());
+    assert_eq!(first["source"], "runtime");
+    assert_eq!(backend.read().await.datapath_flags_write_log().len(), 2);
+    assert_eq!(
+        backend.read().await.datapath_flags_write_log()[1],
+        ENABLED | READY
+    );
+    let before = flags.snapshot();
+    backend
+        .write()
+        .await
+        .arm_datapath_flags_write_fault(1)
+        .unwrap();
+    assert!(
+        apply(
+            &config,
+            &identity,
+            &flags,
+            runtime(OutboundMode::Direct, None)
+        )
+        .await
+        .is_err()
+    );
+    let after = flags.snapshot();
+    assert_eq!(after.mode, before.mode);
+    assert_eq!(after.target, before.target);
+    assert_eq!(after.source, before.source);
+    assert!(
+        backend
+            .read()
+            .await
+            .datapath_flags_write_trace()
+            .last()
+            .unwrap()
+            .failed
+    );
+}
+
+#[tokio::test]
+async fn concurrent_fence_and_atomic_mode_write_never_reopen_nfqueue() {
+    use honk_ebpf_common::{
+        DATAPATH_FLAG_NFQ_ENABLED as ENABLED, DATAPATH_FLAG_NFQ_READY as READY,
+        DATAPATH_FLAG_OFFLOAD_ALL as ALL,
+    };
+    let config = config();
+    let catalog = Catalog::new(&config);
+    let identity = catalog.snapshot();
+    let (flags, backend) = owner(ModeState::native(), None).await;
+    let (mode, fence) = tokio::join!(
+        apply(
+            &config,
+            &identity,
+            &flags,
+            runtime(OutboundMode::Direct, None)
+        ),
+        flags.fence_nfqueue(),
+    );
+    mode.unwrap();
+    fence.unwrap();
+    assert_eq!(
+        backend
+            .read()
+            .await
+            .datapath_flags_write_log()
+            .last()
+            .copied(),
+        Some(ALL | ENABLED)
+    );
+    apply(
+        &config,
+        &identity,
+        &flags,
+        runtime(OutboundMode::Global, Some(identity.groups["Proxy"].clone())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        backend
+            .read()
+            .await
+            .datapath_flags_write_log()
+            .last()
+            .copied(),
+        Some(ENABLED)
+    );
+    assert_eq!(
+        backend
+            .read()
+            .await
+            .datapath_flags_write_log()
+            .last()
+            .unwrap()
+            & READY,
+        0
+    );
+}
+
+#[tokio::test]
+async fn refresh_retains_identity_and_missing_or_recreated_targets_fail_closed() {
+    let mut config = config();
+    let catalog = Catalog::new(&config);
+    let (flags, _) = owner(ModeState::native(), None).await;
+    let chosen = config.nodes[1].id;
+    apply(
+        &config,
+        &catalog.snapshot(),
+        &flags,
+        runtime(OutboundMode::Global, Some(chosen.to_string())),
+    )
+    .await
+    .unwrap();
+    assert!(ModeTarget::from_name("duplicate", &config, &catalog.snapshot().groups).is_none());
+    assert_eq!(
+        flags
+            .snapshot()
+            .native_override("direct", false, &config, &catalog.snapshot().groups),
+        ModeOverride::Node(chosen)
+    );
+    config.nodes[1].name = "renamed".into();
+    catalog.install(&config);
+    assert_eq!(
+        flags
+            .snapshot()
+            .native_override("direct", false, &config, &catalog.snapshot().groups),
+        ModeOverride::Node(chosen)
+    );
+    config.nodes.remove(1);
+    catalog.install(&config);
+    assert_eq!(
+        flags
+            .snapshot()
+            .native_override("direct", false, &config, &catalog.snapshot().groups),
+        ModeOverride::Block
+    );
+    assert_eq!(flags.snapshot().source, ModeSource::Runtime);
+    assert_eq!(value(&flags.snapshot())["target"], chosen.to_string());
+
+    let group_id = catalog.snapshot().groups["Proxy"].clone();
+    apply(
+        &config,
+        &catalog.snapshot(),
+        &flags,
+        runtime(OutboundMode::Global, Some(group_id.clone())),
+    )
+    .await
+    .unwrap();
+    let group = config.groups.remove(0);
+    catalog.install(&config);
+    assert_eq!(
+        flags
+            .snapshot()
+            .native_override("direct", false, &config, &catalog.snapshot().groups),
+        ModeOverride::Block
+    );
+    config.groups.push(group);
+    catalog.install(&config);
+    assert_ne!(catalog.snapshot().groups["Proxy"], group_id);
+    assert_eq!(
+        flags
+            .snapshot()
+            .native_override("direct", false, &config, &catalog.snapshot().groups),
+        ModeOverride::Block
+    );
+    assert!(
+        flags
+            .set_clash_mode("Global", &config, &catalog.snapshot().groups)
+            .await
+            .is_err()
+    );
+    for (outbound, must) in [("direct", true), ("Proxy", true), ("block", false)] {
+        assert_eq!(
+            flags
+                .snapshot()
+                .native_override(outbound, must, &config, &catalog.snapshot().groups),
+            ModeOverride::Unchanged
+        );
+    }
+    assert!(
+        flags
+            .set_native_mode(
+                "Global",
+                flags.snapshot().target,
+                &config,
+                &catalog.snapshot().groups
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn explicit_activation_reset_is_transactional_and_keeps_the_fence() {
+    use honk_ebpf_common::{
+        DATAPATH_FLAG_NFQ_ENABLED as ENABLED, DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as RULE,
+    };
+    let config = config();
+    let catalog = Catalog::new(&config);
+    let (flags, backend) = owner(ModeState::native(), None).await;
+    apply(
+        &config,
+        &catalog.snapshot(),
+        &flags,
+        runtime(OutboundMode::Direct, None),
+    )
+    .await
+    .unwrap();
+    flags.fence_nfqueue().await.unwrap();
+    {
+        let mut publication = flags.publication().await;
+        let mut backend = backend.write().await;
+        backend.arm_datapath_flags_write_fault(1).unwrap();
+        assert!(publication.reset_for_activation(backend.as_mut()).is_err());
+        assert_eq!(flags.snapshot().mode, "Direct");
+        assert_eq!(flags.snapshot().source, ModeSource::Runtime);
+        publication.reset_for_activation(backend.as_mut()).unwrap();
+        assert_eq!(flags.snapshot().mode, "Rule");
+        assert_eq!(flags.snapshot().source, ModeSource::Config);
+        assert!(flags.snapshot().target.is_none());
+        assert_eq!(
+            backend.datapath_flags_write_log().last().copied(),
+            Some(RULE | ENABLED)
+        );
+    }
+    // A no-op explicit activation has the same reset semantics; ordinary reads do not.
+    apply(
+        &config,
+        &catalog.snapshot(),
+        &flags,
+        runtime(OutboundMode::Rule, None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(flags.snapshot().source, ModeSource::Runtime);
+    flags
+        .publication()
+        .await
+        .reset_for_activation(backend.write().await.as_mut())
+        .unwrap();
+    assert_eq!(value(&flags.snapshot())["source"], "config");
+}
+
+#[tokio::test]
+async fn native_clash_mutations_do_not_restore_or_persist_legacy_mode_cache() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        crate::cachedb::CacheDb::open(&CacheFileConfig {
+            enabled: true,
+            path: directory
+                .path()
+                .join("cache.db")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    db.save_clash_mode("Direct");
+    db.save_selector_choice("GLOBAL", "old-choice");
+    let config = config();
+    let catalog = Catalog::new(&config);
+    let (native, _) = owner(ModeState::native(), Some(db.clone())).await;
+    assert_eq!(value(&native.snapshot())["mode"], "rule");
+    assert_eq!(value(&native.snapshot())["source"], "config");
+    native
+        .set_clash_global_selection("Proxy".into(), &config, &catalog.snapshot().groups)
+        .await
+        .unwrap();
+    native
+        .set_clash_mode("Global", &config, &catalog.snapshot().groups)
+        .await
+        .unwrap();
+    assert_eq!(
+        value(&native.snapshot())["target"],
+        catalog.snapshot().groups["Proxy"]
+    );
+    assert_eq!(value(&native.snapshot())["source"], "runtime");
+    assert_eq!(db.load_clash_mode().as_deref(), Some("Direct"));
+    assert_eq!(
+        db.load_selector_choice("GLOBAL").as_deref(),
+        Some("old-choice")
+    );
+    assert!(native.set_mode("Rule").await.is_err());
+    assert!(native.set_global_selection("Proxy".into()).await.is_err());
+
+    let (legacy, backend) = owner(ModeState::new("Direct", "old-choice"), Some(db.clone())).await;
+    legacy.set_mode("Global").await.unwrap();
+    legacy.set_global_selection("Proxy".into()).await.unwrap();
+    assert_eq!(db.load_clash_mode().as_deref(), Some("Global"));
+    assert_eq!(db.load_selector_choice("GLOBAL").as_deref(), Some("Proxy"));
+    legacy
+        .publication()
+        .await
+        .reset_for_activation(backend.write().await.as_mut())
+        .unwrap();
+    assert_eq!(legacy.snapshot().mode, "Global");
+    assert_eq!(
+        legacy.snapshot().override_outbound("other", false, false),
+        "other"
+    );
+}
+
+#[tokio::test]
+async fn malformed_or_unknown_mode_target_never_mutates_the_owner() {
+    for body in [
+        json!({}),
+        json!({"mode":"unknown"}),
+        json!({"mode":"GLOBAL","target":"x"}),
+        json!({"mode":"global"}),
+        json!({"mode":"global","target":""}),
+        json!({"mode":"direct","target":"x"}),
+        json!({"mode":"rule","target":null}),
+        json!({"mode":"global","target":7}),
+        json!({"mode":"rule","extra":true}),
+    ] {
+        assert_eq!(
+            decode(&serde_json::to_vec(&body).unwrap())
+                .unwrap_err()
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let config = config();
+    let catalog = Catalog::new(&config);
+    let (flags, backend) = owner(ModeState::native(), None).await;
+    let request = decode(br#"{"mode":"global","target":"missing"}"#).unwrap();
+    assert_eq!(
+        apply(&config, &catalog.snapshot(), &flags, request)
+            .await
+            .unwrap_err()
+            .into_response()
+            .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(flags.snapshot().mode, "Rule");
+    assert_eq!(flags.snapshot().source, ModeSource::Config);
+    assert_eq!(backend.read().await.datapath_flags_write_log().len(), 1);
+    let invalid = flags
+        .set_native_mode(
+            "Direct",
+            Some(ModeTarget::Group {
+                id: "missing".into(),
+                name: "Proxy".into(),
+            }),
+            &config,
+            &HashMap::new(),
+        )
+        .await;
+    assert!(invalid.is_err());
+}
+
+#[tokio::test]
+async fn incomplete_fence_blocks_mode_ready_resurrection_and_explicit_reopen() {
+    use honk_ebpf_common::{
+        DATAPATH_FLAG_NFQ_ENABLED as ENABLED, DATAPATH_FLAG_NFQ_READY as READY,
+        DATAPATH_FLAG_OFFLOAD_ALL as ALL,
+    };
+    let config = config();
+    let catalog = Catalog::new(&config);
+    let (flags, backend) = owner(ModeState::native(), None).await;
+    backend.write().await.arm_quiesce_fault();
+    assert!(flags.fence_nfqueue().await.is_err());
+    apply(
+        &config,
+        &catalog.snapshot(),
+        &flags,
+        runtime(OutboundMode::Direct, None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        backend
+            .read()
+            .await
+            .datapath_flags_write_log()
+            .last()
+            .copied(),
+        Some(ALL | ENABLED)
+    );
+    let written = backend.read().await.datapath_flags_write_log().len();
+    assert!(flags.reopen_nfqueue().await.is_err());
+    assert_eq!(
+        backend.read().await.datapath_flags_write_log().len(),
+        written
+    );
+    flags.fence_nfqueue().await.unwrap();
+    flags.reopen_nfqueue().await.unwrap();
+    assert_eq!(
+        backend
+            .read()
+            .await
+            .datapath_flags_write_log()
+            .last()
+            .copied(),
+        Some(ALL | ENABLED | READY)
+    );
+}

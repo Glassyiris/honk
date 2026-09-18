@@ -7,15 +7,22 @@ use std::sync::atomic::AtomicUsize;
 #[tokio::test]
 async fn overlapping_generations_share_the_startup_dial_ceiling() {
     let (first, _) =
-        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 3, 4, 4, None).unwrap();
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 3, 4, 4, false, None)
+            .unwrap();
     let mut held = Vec::new();
     for _ in 0..3 {
         held.push(first.acquire_dial_permit().await);
     }
 
-    let (second, _) =
-        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 4, 99, 99, Some(&first))
-            .unwrap();
+    let (second, _) = OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+        &[],
+        4,
+        99,
+        99,
+        false,
+        Some(&first),
+    )
+    .unwrap();
     assert_eq!(second.dial_limit(), 4);
     held.push(second.acquire_dial_permit().await);
     assert!(
@@ -33,10 +40,17 @@ async fn overlapping_generations_share_the_startup_dial_ceiling() {
 #[tokio::test]
 async fn cold_replacement_retains_shared_scope_admission() {
     let (registry, _) =
-        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, None).unwrap();
-    let (successor, _) =
-        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, Some(&registry))
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, false, None)
             .unwrap();
+    let (successor, _) = OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+        &[],
+        1,
+        1,
+        1,
+        false,
+        Some(&registry),
+    )
+    .unwrap();
     let starts = Arc::new(AtomicUsize::new(0));
     let scope = registry
         .scope_dials_with_start(
@@ -90,7 +104,8 @@ async fn cold_replacement_retains_shared_scope_admission() {
 async fn replacement_failure_and_cancellation_release_transferred_admission() {
     for cancel in [false, true] {
         let (registry, _) =
-            OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, None).unwrap();
+            OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, false, None)
+                .unwrap();
         let scope = registry
             .scope_dials(async {
                 admit_physical_dial(ready(Ok::<_, ()>(()))).await.unwrap();
@@ -128,7 +143,8 @@ async fn replacement_failure_and_cancellation_release_transferred_admission() {
 #[tokio::test]
 async fn cold_replacement_without_retained_credit_waits_for_admission() {
     let (registry, _) =
-        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, None).unwrap();
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 1, 1, 1, false, None)
+            .unwrap();
     let occupied = registry.acquire_dial_permit().await;
     let scope = registry.scope_dials(async { capture_dial_scope() }).await;
     let mut replacement =
@@ -248,10 +264,17 @@ async fn overlapping_generations_bound_physical_address_attempts() {
     }
 
     let (first, _) =
-        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 2, 2, None).unwrap();
-    let (second, _) =
-        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 99, 99, Some(&first))
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&[], 2, 2, 2, false, None)
             .unwrap();
+    let (second, _) = OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+        &[],
+        2,
+        99,
+        99,
+        false,
+        Some(&first),
+    )
+    .unwrap();
     let active = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     let run = |generation: Arc<OutboundRuntimeRegistry>| {
@@ -287,4 +310,36 @@ async fn overlapping_generations_bound_physical_address_attempts() {
     assert!(matches!(new_result, Some(Err(_))));
     assert_eq!(peak.load(Ordering::SeqCst), 2);
     assert_eq!(active.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn captured_factory_keeps_pinned_server_address_outside_initial_scope() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let registry = OutboundRuntimeRegistry::build(&[]).unwrap();
+    let admission = registry
+        .scope_pinned_dials("unresolvable.invalid", addr.ip(), async {
+            capture_dial_admission()
+        })
+        .await;
+    let factory = tokio::spawn(admission.scope(async move {
+        let mut stream = crate::util::connect_outbound(
+            &format!("unresolvable.invalid:{}", addr.port()),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        stream.write_all(b"pinned").await.unwrap();
+    }));
+    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut received = [0; 6];
+    socket.read_exact(&mut received).await.unwrap();
+    assert_eq!(&received, b"pinned");
+    factory.await.unwrap();
 }

@@ -142,6 +142,25 @@ pub(super) fn encode(key: &CacheKey, response: &[u8], expire_at_unix: u64) -> En
     EncodedEntry { suffix, bytes }
 }
 
+#[cfg(any(feature = "native-api", test))]
+pub(super) fn key_suffix(key: &CacheKey) -> String {
+    digest_hex(&encode_key(key))
+}
+
+#[cfg(any(feature = "native-api", test))]
+pub(super) fn question_matches(bytes: &[u8], name: &str, types: &[u16]) -> bool {
+    fn query_wire(bytes: &[u8]) -> Result<&[u8], DecodeError> {
+        let mut reader = Reader::new(bytes);
+        if reader.take(MAGIC.len())? != MAGIC || reader.byte()? != VERSION {
+            return Err(DecodeError::Corrupt);
+        }
+        reader.u64()?;
+        let mut key = Reader::new(reader.bytes()?);
+        key.bytes()
+    }
+    query_wire(bytes).is_ok_and(|wire| crate::dns::cache::question_matches(wire, name, types))
+}
+
 pub(super) fn decode(
     suffix: &str,
     bytes: &[u8],

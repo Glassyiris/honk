@@ -123,7 +123,7 @@ impl SubscriptionStore {
         Self::open(preferred)
     }
 
-    pub(super) fn open(root: PathBuf) -> anyhow::Result<Self> {
+    pub(crate) fn open(root: PathBuf) -> anyhow::Result<Self> {
         let directory = match open_store_directory(&root) {
             Ok(directory) => directory,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -193,7 +193,7 @@ impl SubscriptionStore {
             .map_err(|error| anyhow::anyhow!(error.to_string()))
     }
 
-    pub(super) async fn store_content(
+    pub(crate) async fn store_content(
         &self,
         sub: &Subscription,
         content: String,

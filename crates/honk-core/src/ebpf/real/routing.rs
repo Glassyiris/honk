@@ -302,6 +302,35 @@ pub(super) fn open_routing_generation_sequence(
 }
 
 impl RealEbpfBackend {
+    pub(super) fn observed_routing_generation(&self) -> anyhow::Result<Option<u64>> {
+        let root = self
+            .bpf()?
+            .map(ROUTING_POLICY_ROOT_NAME)
+            .ok_or_else(|| anyhow::anyhow!("routing root unavailable"))?;
+        let root = AyaArrayOfMaps::<_, RoutingDescriptor>::try_from(root)?;
+        let descriptor = match root.get(&0, 0) {
+            Ok(descriptor) => descriptor,
+            Err(MapError::KeyNotFound) if self.routing_generation.is_none() => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let owner = self
+            .routing_generation
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("routing root has no owner"))?;
+        let value = descriptor.get(&0, 0)?;
+        anyhow::ensure!(
+            descriptor.map().info()?.id() == owner.descriptor.map().info()?.id()
+                && value.generation == self.routing_generation_counter
+                && value.generation != 0
+                && value.slot == self.routing_slot
+                && value.slot < ROUTING_SLOT_NAMES.len() as u32
+                && value.reserved == 0
+                && value.domain_map_id == owner.domain.map().info()?.id(),
+            "routing root differs from its owner"
+        );
+        Ok(Some(value.generation))
+    }
+
     fn reserve_routing_generation(&mut self) -> anyhow::Result<u64> {
         let generation = self
             .routing_generation_sequence

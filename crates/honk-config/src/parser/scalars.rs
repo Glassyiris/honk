@@ -15,7 +15,7 @@ fn scalar_path(setting: &'static str) -> SettingPath {
     SettingPath(setting.split('.').map(SettingSegment::Field).collect())
 }
 
-fn strict_bool(value: &str) -> Option<bool> {
+pub(super) fn strict_bool(value: &str) -> Option<bool> {
     if ["true", "yes", "1", "on"]
         .iter()
         .any(|spelling| value.eq_ignore_ascii_case(spelling))
@@ -576,6 +576,10 @@ pub(super) fn parse_experimental_section(
                     "record_flows",
                     "record_traffic",
                     "record_memory",
+                    "record_logs",
+                    "record_dns_log",
+                    "probe_allowed_cidrs",
+                    "probe_allowed_ports",
                     "config_write",
                     "config_content",
                     "writable_includes",
@@ -744,6 +748,16 @@ pub(super) fn parse_experimental_section(
                             &mut config.native_api.record_memory,
                         ),
                         (
+                            "record_logs",
+                            "experimental.native_api.record_logs",
+                            &mut config.native_api.record_logs,
+                        ),
+                        (
+                            "record_dns_log",
+                            "experimental.native_api.record_dns_log",
+                            &mut config.native_api.record_dns_log,
+                        ),
+                        (
                             "config_write",
                             "experimental.native_api.config_write",
                             &mut config.native_api.config_write,
@@ -778,6 +792,31 @@ pub(super) fn parse_experimental_section(
                         if let Some(text) = values.get(key) {
                             *target = text.unquote().raw().to_owned();
                         }
+                    }
+                    if let Some(text) = values.get("probe_allowed_cidrs") {
+                        config.native_api.probe_allowed_cidrs =
+                            list_value(*text, false, false, false, diagnostics);
+                        if config
+                            .native_api
+                            .probe_allowed_cidrs
+                            .iter()
+                            .any(|value| value.parse::<ipnet::IpNet>().is_err())
+                        {
+                            return Err(scalar_error(
+                                *text,
+                                "invalid-config-value",
+                                "experimental.native_api.probe_allowed_cidrs",
+                                "probe destination allowlist requires explicit IP CIDRs",
+                            )
+                            .into());
+                        }
+                    }
+                    if let Some(text) = values.get("probe_allowed_ports") {
+                        let entries = list_value(*text, false, false, false, diagnostics);
+                        config.native_api.probe_allowed_ports = entries.iter().map(|value| {
+                            value.parse::<u16>().ok().filter(|port| *port != 0 && value.bytes().all(|byte| byte.is_ascii_digit()))
+                                .ok_or_else(|| scalar_error(*text, "invalid-config-value", "experimental.native_api.probe_allowed_ports", "probe port allowlist requires ports from 1 through 65535"))
+                        }).collect::<Result<Vec<_>,_>>()?;
                     }
                     if let Some(text) = values.get("writable_includes") {
                         config.native_api.writable_includes =

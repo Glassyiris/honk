@@ -128,7 +128,7 @@ async fn native_udp_terminal_evidence_survives_retirement_and_tuple_reuse() {
                 let shutting_pool = Arc::clone(&pool);
                 let shutdown = tokio::spawn(async move { shutting_pool.shutdown().await });
                 recv_and_ack(&pool, &mut removed_rx).await.unwrap();
-                assert!(shutdown.await.unwrap());
+                assert!(shutdown.await.unwrap().joined);
             }
             _ => {
                 recv_and_ack(&pool, &mut removed_rx).await.unwrap();
@@ -251,7 +251,6 @@ async fn assert_native_udp_builtin_plan(selector_block: bool) {
             api_addr,
             std::time::SystemTime::now(),
             Instant::now(),
-            true,
         )
         .await
         .unwrap(),
@@ -363,7 +362,7 @@ async fn assert_native_udp_builtin_plan(selector_block: bool) {
         assert_eq!(terminal.len(), 1);
         assert_eq!(terminal[0]["data"]["state"], "blocked");
         assert_eq!(terminal[0]["data"]["reason"], "policy_block");
-        assert!(handle.udp_pool.shutdown().await);
+        assert!(handle.udp_pool.shutdown().await.joined);
         server.shutdown().await;
         return;
     }
@@ -389,6 +388,6 @@ async fn assert_native_udp_builtin_plan(selector_block: bool) {
             .iter()
             .any(|step| step["data"]["milestone"] == "terminal")
     );
-    assert!(handle.udp_pool.shutdown().await);
+    assert!(handle.udp_pool.shutdown().await.joined);
     server.shutdown().await;
 }

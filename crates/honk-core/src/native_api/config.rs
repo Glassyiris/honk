@@ -47,6 +47,8 @@ struct Accepted {
     revision: String,
     config_key: String,
     generation: u64,
+    group_sources: HashMap<String, usize>,
+    rule_sources: honk_config::parser::source_edit::RuleSourceIndex,
     accepted_at: String,
 }
 
@@ -58,11 +60,20 @@ pub(crate) struct ConfigService {
     entry: Mutex<Option<PathBuf>>,
     sender: Mutex<Option<mpsc::Sender<Work>>>,
     last_reload: RwLock<Option<Value>>,
+    phase: RwLock<Option<tokio::sync::watch::Receiver<crate::control::EnginePhase>>>,
     #[cfg(test)]
     before_replace: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 enum Work {
+    Lifecycle {
+        resume: bool,
+        reservation: Reservation,
+    },
+    GroupPatch {
+        patch: Box<super::groups::GroupPatch>,
+        reservation: Reservation,
+    },
     Replace {
         source_id: String,
         content: String,
@@ -93,6 +104,7 @@ impl ConfigService {
             entry: Mutex::new(None),
             sender: Mutex::new(None),
             last_reload: RwLock::new(None),
+            phase: RwLock::new(None),
             #[cfg(test)]
             before_replace: Mutex::new(None),
         }
@@ -123,6 +135,12 @@ impl ConfigService {
         }
         *entry = Some(update.sources[0].path.clone());
         drop(entry);
+        let Ok((group_sources, rule_sources)) =
+            honk_config::parser::source_edit::source_indices(&update.sources)
+        else {
+            self.invalidate();
+            return;
+        };
         let hashes: Vec<_> = update
             .sources
             .iter()
@@ -170,6 +188,8 @@ impl ConfigService {
             revision,
             config_key,
             generation,
+            group_sources,
+            rule_sources,
             accepted_at: timestamp(SystemTime::now()),
         });
     }
@@ -209,6 +229,18 @@ impl ConfigService {
     pub(crate) fn running(&self) -> bool {
         self.available() && self.sender.lock().is_some()
     }
+    pub(crate) fn attach_phase(
+        &self,
+        phase: tokio::sync::watch::Receiver<crate::control::EnginePhase>,
+    ) {
+        *self.phase.write() = Some(phase);
+    }
+    pub(crate) fn coordinator_running(&self) -> bool {
+        self.sender.lock().is_some()
+    }
+    fn engine_phase(&self) -> Option<crate::control::EnginePhase> {
+        self.phase.read().as_ref().map(|phase| *phase.borrow())
+    }
     pub(crate) fn last_reload(&self) -> Option<Value> {
         self.last_reload.read().clone()
     }
@@ -240,6 +272,44 @@ impl ConfigService {
             .any(|path| Path::new(path) == relative)
     }
 
+    pub(crate) fn group_writable(&self, name: &str) -> bool {
+        self.writable()
+            && self.accepted.read().as_ref().is_some_and(|accepted| {
+                accepted
+                    .group_sources
+                    .get(name)
+                    .is_some_and(|index| self.source_writable(accepted, *index))
+            })
+    }
+
+    pub(super) fn enqueue_group_patch(
+        &self,
+        patch: super::groups::GroupPatch,
+        reservation: Reservation,
+    ) -> Result<(), ApiError> {
+        self.enqueue(Work::GroupPatch {
+            patch: Box::new(patch),
+            reservation,
+        })
+    }
+
+    pub(crate) fn rule_source(
+        &self,
+        index: Option<usize>,
+    ) -> Option<(String, honk_config::parser::source_edit::RuleSourceLocation)> {
+        let guard = self.accepted.read();
+        let accepted = guard.as_ref()?;
+        let location = match index {
+            Some(index) => accepted.rule_sources.rules.get(index)?,
+            None => accepted.rule_sources.fallback.as_ref()?,
+        };
+        let source = &accepted.update.sources[location.source_index];
+        if self.credential_source(source) {
+            return None;
+        }
+        Some((accepted.ids[&source.path].clone(), location.clone()))
+    }
+
     fn source_value(&self, accepted: &Accepted, index: usize) -> Value {
         let source = &accepted.update.sources[index];
         let mut value = json!({
@@ -267,7 +337,50 @@ impl ConfigService {
         )
     }
 
+    fn check_phase(&self, work: &Work) -> Result<(), ApiError> {
+        use crate::control::EnginePhase;
+        if matches!(work, Work::Validate { .. }) {
+            return Ok(());
+        }
+        let phase = self.engine_phase();
+        let expected = if matches!(work, Work::Lifecycle { resume: true, .. }) {
+            EnginePhase::Suspended
+        } else {
+            EnginePhase::Running
+        };
+        if phase == Some(expected) {
+            return Ok(());
+        }
+        Err(
+            if matches!(
+                phase,
+                None | Some(EnginePhase::Starting | EnginePhase::Failed | EnginePhase::Draining)
+            ) {
+                unavailable()
+            } else {
+                ApiError::new(
+                    StatusCode::CONFLICT,
+                    ErrorCode::StateConflict,
+                    "Engine lifecycle prevents this transition",
+                    None,
+                )
+            },
+        )
+    }
+
     fn enqueue(&self, work: Work) -> Result<(), ApiError> {
+        if let Err(error) = self.check_phase(&work) {
+            match &work {
+                Work::Replace { reservation, .. }
+                | Work::GroupPatch { reservation, .. }
+                | Work::Reload { reservation }
+                | Work::Lifecycle { reservation, .. } => {
+                    self.operations.reject(&reservation.id, error.clone());
+                }
+                _ => {}
+            }
+            return Err(error);
+        }
         self.sender
             .lock()
             .as_ref()
@@ -302,17 +415,15 @@ fn same_dependencies(left: &[DependencySnapshot], right: &[DependencySnapshot]) 
 }
 
 fn same_sources(left: &SourceUpdate, right: &SourceUpdate) -> bool {
-    left.sources.len() == right.sources.len()
-        && left
-            .sources
-            .iter()
-            .zip(&right.sources)
-            .all(|(left, right)| {
-                left.path == right.path
-                    && left.parent == right.parent
-                    && left.content == right.content
-            })
+    same_source_documents(&left.sources, &right.sources)
         && same_dependencies(&left.dependencies, &right.dependencies)
+}
+
+fn same_source_documents(left: &[SourceSnapshot], right: &[SourceSnapshot]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.path == right.path && left.parent == right.parent && left.content == right.content
+        })
 }
 
 fn limits() -> SourceLimits {
@@ -378,7 +489,10 @@ fn stale() -> ApiError {
     )
 }
 
-fn request_header<'a>(request: &'a Request, name: &str) -> Result<Option<&'a str>, ApiError> {
+pub(super) fn request_header<'a>(
+    request: &'a Request,
+    name: &str,
+) -> Result<Option<&'a str>, ApiError> {
     let mut values = request.headers().get_all(name).iter();
     let first = values.next();
     if values.next().is_some() {
@@ -409,7 +523,7 @@ fn if_match(request: &Request) -> Result<String, ApiError> {
         .ok_or_else(invalid)?;
     Ok(hash.to_owned())
 }
-fn json_type(request: &Request) -> Result<(), ApiError> {
+pub(super) fn json_type(request: &Request) -> Result<(), ApiError> {
     if request_header(request, "content-type")?
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
@@ -542,6 +656,7 @@ pub(super) async fn replace(
         &path,
         key.as_deref(),
         &bytes,
+        crate::native_api::operations::OperationKind::Reload,
     )?;
     let admission = reservation.admission();
     if reservation.fresh {
@@ -584,6 +699,7 @@ pub(super) async fn reload(
         "/api/v1/operations/reload",
         key.as_deref(),
         &bytes,
+        crate::native_api::operations::OperationKind::Reload,
     )?;
     let admission = reservation.admission();
     if reservation.fresh {
@@ -591,6 +707,60 @@ pub(super) async fn reload(
             .observation
             .configuration
             .enqueue(Work::Reload { reservation })?;
+    }
+    Ok(admission.await?.into_response())
+}
+
+pub(super) async fn lifecycle(
+    state: &NativeState,
+    request: Request,
+    id: &RequestId,
+    resume: bool,
+) -> Result<Response, ApiError> {
+    parse_query(request.uri(), &[], id)?;
+    let service = &state.observation.configuration;
+    if !service.coordinator_running() {
+        return Err(unsupported());
+    }
+    let key = request_header(&request, "idempotency-key")?.map(str::to_owned);
+    if request.body().size_hint().upper() != Some(0) {
+        json_type(&request)?;
+    }
+    let bytes = axum::body::to_bytes(request.into_body(), 65536)
+        .await
+        .map_err(|_| too_large())?;
+    if !bytes.is_empty()
+        && !serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .is_some_and(|body| body.as_object().is_some_and(|object| object.is_empty()))
+    {
+        return Err(invalid());
+    }
+    let (path, kind) = if resume {
+        (
+            "/api/v1/operations/resume",
+            super::operations::OperationKind::Resume,
+        )
+    } else {
+        (
+            "/api/v1/operations/suspend",
+            super::operations::OperationKind::Suspend,
+        )
+    };
+    let reservation = state.observation.operations.reserve(
+        principal(state),
+        "POST",
+        path,
+        key.as_deref(),
+        &bytes,
+        kind,
+    )?;
+    let admission = reservation.admission();
+    if reservation.fresh {
+        service.enqueue(Work::Lifecycle {
+            resume,
+            reservation,
+        })?;
     }
     Ok(admission.await?.into_response())
 }
@@ -659,20 +829,6 @@ pub(super) async fn validate(
         .configuration
         .enqueue(Work::Validate { request, response })?;
     Ok(Json(result.await.map_err(|_| unavailable())??).into_response())
-}
-
-pub(super) fn operation(
-    state: &NativeState,
-    operation_id: &str,
-    uri: &Uri,
-    id: &RequestId,
-) -> Result<Response, ApiError> {
-    parse_query(uri, &[], id)?;
-    state
-        .observation
-        .configuration
-        .operations
-        .get(operation_id, principal(state), true)
 }
 
 fn project_diagnostic(

@@ -302,6 +302,9 @@ pub struct Group {
     #[serde(default = "uuid::Uuid::new_v4")]
     pub id: uuid::Uuid,
     pub name: String,
+    /// Configured client icon, passed through without fetching or normalization.
+    #[serde(default)]
+    pub icon: Option<String>,
     /// Group selection policy.
     #[serde(default)]
     pub policy: GroupPolicy,
@@ -331,18 +334,18 @@ pub struct Group {
     /// URL for health checks (overrides global tcp_check_url).
     #[serde(default)]
     pub check_url: Option<String>,
-    /// Health check interval override in seconds.
+    /// Retained interval metadata; runtime checks use the global interval.
     #[serde(default)]
     pub check_interval: Option<u64>,
     /// Minimum latency difference (ms) before switching the URLTest selection.
-    /// Zero means switch on any improvement. Default: 50 (matches sing-box).
+    /// Default: 50; the runtime applies a minimum of one millisecond.
     #[serde(default = "default_tolerance")]
     pub tolerance: u64,
-    /// Stop health checks after this many seconds of inactivity.
-    /// `None` means never stop. Zero means never stop.
+    /// URLTest inactivity threshold in seconds; `None` uses 1800 seconds.
+    /// Zero makes the group immediately idle between selections.
     #[serde(default)]
     pub idle_timeout: Option<u64>,
-    /// Request tracking removal on selection changes; live relays are not cancelled.
+    /// Close owned connections when the selected member changes.
     #[serde(default)]
     pub interrupt_connections: bool,
     #[serde(default = "chrono::Utc::now")]
@@ -354,6 +357,7 @@ impl Default for Group {
         Self {
             id: uuid::Uuid::new_v4(),
             name: String::new(),
+            icon: None,
             policy: GroupPolicy::default(),
             nodes: Vec::new(),
             filters: Vec::new(),
@@ -366,6 +370,32 @@ impl Default for Group {
             idle_timeout: None,
             interrupt_connections: false,
             created_at: chrono::Utc::now(),
+        }
+    }
+}
+
+impl Group {
+    pub fn valid_icon(value: &str) -> bool {
+        if value.chars().count() > 2048
+            || value.chars().any(char::is_whitespace)
+            || value.chars().any(char::is_control)
+        {
+            return false;
+        }
+        let Ok(url) = url::Url::parse(value) else {
+            return false;
+        };
+        match url.scheme() {
+            "http" | "https" => {
+                value
+                    .split_once(':')
+                    .is_some_and(|(_, rest)| rest.starts_with("//"))
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+            }
+            "data" => url.path().contains(','),
+            _ => false,
         }
     }
 }

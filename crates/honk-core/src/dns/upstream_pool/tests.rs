@@ -112,6 +112,7 @@ fn test_group(
     Group {
         id: uuid::Uuid::new_v4(),
         name: name.into(),
+        icon: None,
         policy,
         nodes: node_ids,
         filters: vec![],

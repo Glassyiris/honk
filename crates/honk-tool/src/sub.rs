@@ -437,7 +437,8 @@ async fn probe_node(registry: &ProxyRegistry, node: Node, targets: &ProbeTargets
         return ProbeOutcome::skipped(&node, eligibility);
     }
 
-    let deadline = targets.timeout.saturating_add(Duration::from_secs(1));
+    // Include the QUIC probe's two-second joined teardown before the outer margin.
+    let deadline = targets.timeout.saturating_add(Duration::from_secs(3));
     match tokio::time::timeout(deadline, probe_supported_node(registry, &node, targets)).await {
         Ok(outcome) => outcome,
         Err(_) => ProbeOutcome::timed_out(registry, &node, targets),

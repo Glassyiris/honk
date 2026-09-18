@@ -214,6 +214,91 @@ pub struct DynamicHooks {
     pub egress: bool,
 }
 
+pub const MAX_DATAPATH_PROGRAMS: usize = 64;
+pub const MAX_DATAPATH_ATTACHMENTS: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatapathKind {
+    Real,
+    Mock,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatapathCheck {
+    Verified,
+    Absent,
+    Unknown,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatapathObservationError {
+    Programs,
+    Hooks,
+    Routing,
+    Admission,
+    Maps,
+    Limit,
+}
+
+#[derive(Debug, Clone)]
+pub struct DatapathProgram {
+    pub name: String,
+    pub id: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct DatapathAttachment {
+    pub program: String,
+    pub interface: String,
+    pub egress: bool,
+    pub state: DatapathCheck,
+}
+
+/// Facts checked during one read of the backend cell, not configuration intent.
+/// Unknown occupancy is deliberate: observation never walks a traffic map.
+#[derive(Debug, Clone)]
+pub struct DatapathObservation {
+    pub kind: DatapathKind,
+    pub checked_at: std::time::SystemTime,
+    pub programs: DatapathCheck,
+    pub loaded_programs: Vec<DatapathProgram>,
+    pub hooks: DatapathCheck,
+    pub routing: DatapathCheck,
+    pub routing_generation: Option<u64>,
+    pub admission: Option<bool>,
+    pub listeners_published: Option<bool>,
+    pub attachments: Vec<DatapathAttachment>,
+    pub conn_state_capacity: Option<u32>,
+    pub errors: Vec<DatapathObservationError>,
+}
+
+impl DatapathObservation {
+    pub fn unknown(kind: DatapathKind) -> Self {
+        Self {
+            kind,
+            checked_at: std::time::SystemTime::now(),
+            programs: DatapathCheck::Unknown,
+            loaded_programs: Vec::new(),
+            hooks: DatapathCheck::Unknown,
+            routing: DatapathCheck::Unknown,
+            routing_generation: None,
+            admission: None,
+            listeners_published: None,
+            attachments: Vec::new(),
+            conn_state_capacity: None,
+            errors: Vec::new(),
+        }
+    }
+
+    pub fn record_error(&mut self, error: DatapathObservationError) {
+        if !self.errors.contains(&error) {
+            self.errors.push(error);
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum DatapathFlagsWriteOrigin {
@@ -235,6 +320,11 @@ pub struct DatapathFlagsWriteTrace {
 
 #[async_trait]
 pub trait EbpfBackend: Send + Sync {
+    /// Bounded readonly kernel/owner facts; never repairs or reopens the datapath.
+    fn observe_datapath(&self) -> DatapathObservation {
+        DatapathObservation::unknown(DatapathKind::Unknown)
+    }
+
     fn inject_routing_fault(
         &mut self,
         _phase: RoutingPushPhase,
@@ -352,6 +442,10 @@ pub trait EbpfBackend: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Release all published listener references only after admission is closed
+    /// and the caller has joined ingress. Errors never authorize reopening.
+    fn clear_listener_sockets(&mut self) -> anyhow::Result<()>;
 
     async fn cleanup(&mut self) -> anyhow::Result<()>;
 

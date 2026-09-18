@@ -159,6 +159,8 @@ vless/{plain|tls|reality}/{tcp|ws|grpc}[/vision]/tcp={plain|h2mux|mux-cool}/{udp
 
 UDP DNS 目标解析、packet transport 建立、发送与接收共用一个 `--timeout` 预算。解析失败或超时只体现在 DNS 列，TCP、URLTest 和 QUIC 探测继续进行。不支持 UDP 的节点跳过该解析；主机名解析失败时不会替换为另一个目标。
 
+外层逐节点预算另留两秒用于 join QUIC 清理，再加一秒调度余量。清理耗时不是延迟样本，也不应抹掉已完成的其他探测结果。
+
 UDP DNS 主机名目标使用共享异步解析器，读取 `/etc/resolv.conf` 中首个数字形式的 nameserver（UDP 端口 `53`），并在 `/etc/hosts` 存在时加载它，不执行阻塞的 NSS 查询。此路径不应用 NSS 插件或解析器搜索后缀。解析器不可用时，DNS 列报告 `resolve`，不会回退到公共解析器；字面量目标不需要解析器。
 
 VLESS carrier/session 按 runtime 与规范化 wire shape 复用，因此更改规范 UDP/mux query 可能更改节点身份与 pool 复用。共享物理 carrier 容量是全局的；XUDP 的 8-byte Global ID 则按 honk 的 runtime/client/path/destination source identity 确定作用域，不作为进程级无碰撞 NAT key。见[节点参考](./nodes.md#vless-udp-and-multiplexing)与规范的 [VLESS 出站设计](../design/outbound.md#sourcesession-ownership-and-capacity)。

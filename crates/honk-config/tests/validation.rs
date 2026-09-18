@@ -619,6 +619,14 @@ mod native_api {
             "enabled: maybe",
             "allow_anonymous_loopback: maybe",
             "record_flows: maybe",
+            "record_logs: maybe",
+            "record_dns_log: maybe",
+            "probe_allowed_cidrs: 'PRIVATE'",
+            "probe_allowed_cidrs: '127.0.0.0/8', ''",
+            "probe_allowed_ports: 0",
+            "probe_allowed_ports: 65536",
+            "probe_allowed_ports: '+80'",
+            "probe_allowed_ports: 'PRIVATE'",
             "secret { value: PRIVATE }",
             "unknown { secret: PRIVATE }",
             "allowed_hosts: 'localhost', ''",
@@ -678,6 +686,8 @@ mod native_api {
             serde_json::json!({"allow_origins":["https://panel.example?secret=PRIVATE"]}),
             serde_json::json!({"allow_origins":["https://user:PRIVATE@panel.example"]}),
             serde_json::json!({"ui":"embedded"}),
+            serde_json::json!({"probe_allowed_cidrs":["PRIVATE"]}),
+            serde_json::json!({"probe_allowed_ports":[0]}),
         ] {
             let config: Config =
                 serde_json::from_value(serde_json::json!({"experimental":{"native_api":native}}))

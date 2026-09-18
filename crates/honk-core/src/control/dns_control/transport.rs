@@ -18,6 +18,8 @@ impl DnsController {
         original_dst: SocketAddr,
         validated: ValidatedDnsQuery,
     ) {
+        #[cfg(feature = "native-api")]
+        let started = std::time::Instant::now();
         debug!(%client_addr, "DNS controller (UDP): forwarding query");
         let response = self
             .answer_query(
@@ -29,11 +31,20 @@ impl DnsController {
             .await;
         let _ = admission
             .run_reply(super::super::send_udp_reply_from_orig_dst(
-                &response,
+                response.wire(),
                 client_addr,
                 original_dst,
             ))
             .await;
+        #[cfg(feature = "native-api")]
+        self.dns_service.observe_client(
+            data,
+            validated.ingress(),
+            Some(client_addr),
+            response.outcome(),
+            response.wire(),
+            started.elapsed(),
+        );
     }
 
     /// Handle a TCP DNS-over-TCP connection from TPROXY.
@@ -77,13 +88,15 @@ impl DnsController {
         }
 
         debug!(%client_addr, "DNS controller (TCP): forwarding query");
-        self.process_tcp_query(stream, &query, metadata).await?;
+        self.process_tcp_query(stream, &query, client_addr, metadata)
+            .await?;
 
         loop {
             if !read_tcp_dns_query(stream, &mut query, Some(TCP_DNS_IO_TIMEOUT)).await {
                 return Ok(true);
             }
-            self.process_tcp_query(stream, &query, metadata).await?;
+            self.process_tcp_query(stream, &query, client_addr, metadata)
+                .await?;
         }
     }
 
@@ -91,31 +104,52 @@ impl DnsController {
         &self,
         stream: &mut TcpStream,
         query: &[u8],
+        client_addr: SocketAddr,
         metadata: DnsRequestMeta,
     ) -> anyhow::Result<()> {
+        #[cfg(feature = "native-api")]
+        let started = std::time::Instant::now();
+        #[cfg(not(feature = "native-api"))]
+        let _ = client_addr;
         // Each persistent frame gets the current generation independently.
         let admission = match self.try_admit_query(false) {
             Ok(admission) => admission,
             Err(_) => {
-                return write_tcp_dns_response(
-                    stream,
-                    &build_dns_refused(query),
-                    TCP_DNS_IO_TIMEOUT,
-                )
-                .await;
+                let response = build_dns_refused(query);
+                let result = write_tcp_dns_response(stream, &response, TCP_DNS_IO_TIMEOUT).await;
+                #[cfg(feature = "native-api")]
+                self.dns_service.observe_client(
+                    query,
+                    IngressProfile::Tcp,
+                    Some(client_addr),
+                    None,
+                    &response,
+                    started.elapsed(),
+                );
+                return result;
             }
         };
         let response = self
             .answer_query(&admission, query, metadata, IngressProfile::Tcp)
             .await;
-        admission
+        let result = admission
             .run_reply(write_tcp_dns_response(
                 stream,
-                &response,
+                response.wire(),
                 TCP_DNS_IO_TIMEOUT,
             ))
             .await
-            .map_err(|_| anyhow::anyhow!("DNS runtime retired during TCP response write"))??;
+            .map_err(|_| anyhow::anyhow!("DNS runtime retired during TCP response write"));
+        #[cfg(feature = "native-api")]
+        self.dns_service.observe_client(
+            query,
+            IngressProfile::Tcp,
+            Some(client_addr),
+            response.outcome(),
+            response.wire(),
+            started.elapsed(),
+        );
+        result??;
         Ok(())
     }
 }

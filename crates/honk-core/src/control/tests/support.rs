@@ -689,7 +689,6 @@ impl NativeFlowApi {
                 addr,
                 std::time::SystemTime::now(),
                 std::time::Instant::now(),
-                true,
             )
             .await
             .unwrap(),

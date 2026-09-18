@@ -95,6 +95,8 @@ pub struct ClashState {
     pub mode_state: SharedModeState,
     /// Sole writer for mode/global persistence and datapath policy flags.
     pub datapath_flags: DatapathFlagsHandle,
+    pub control: Option<crate::control::ControlClient>,
+    pub ui_download: Arc<tokio::sync::Mutex<Option<ui::UiDownloadTask>>>,
     /// Bearer secret from `experimental.clash_api.secret`; empty = no auth.
     pub secret: String,
     /// Shared connection pool (ready-pool hit/miss metrics in `/stats`).
@@ -149,14 +151,18 @@ pub fn router(state: Arc<ClashState>) -> Router {
         // background when the directory is missing/empty; ServeDir keeps
         // returning 404 until the files land (never blocks startup). The
         // fetch follows the traffic routing decision (direct/block/proxy).
-        ui::spawn_ui_download_if_needed(ui::UiDownloadContext {
-            external_ui: state.external_ui.clone(),
-            router: state.router.clone(),
-            config: state.config.clone(),
-            group_manager: state.group_manager.clone(),
-            proxy_registry: state.proxy_registry.clone(),
-            runtime_registry: state.runtime_registry.clone(),
-        });
+        if let Ok(mut owner) = state.ui_download.try_lock()
+            && owner.is_none()
+        {
+            *owner = Some(ui::spawn_ui_download_if_needed(ui::UiDownloadContext {
+                external_ui: state.external_ui.clone(),
+                router: state.router.clone(),
+                config: state.config.clone(),
+                group_manager: state.group_manager.clone(),
+                proxy_registry: state.proxy_registry.clone(),
+                runtime_registry: state.runtime_registry.clone(),
+            }));
+        }
         app = app
             // 301 Moved Permanently, matching sing-box's RedirectHandler.
             .route(
@@ -369,6 +375,22 @@ async fn patch_configs(State(s): State<Arc<ClashState>>, body: Bytes) -> Respons
                 "invalid mode (expected Rule/Global/Direct)",
             );
         };
+        #[cfg(feature = "native-api")]
+        if s.datapath_flags.snapshot().native_enabled {
+            let Some(control) = &s.control else {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "control owner is unavailable",
+                );
+            };
+            return match control
+                .mode(crate::native_api::mode::ModeRequest::ClashMode(mode))
+                .await
+            {
+                Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(_) => error_response(StatusCode::SERVICE_UNAVAILABLE, "mode transition failed"),
+            };
+        }
         if let Err(error) = s.datapath_flags.set_mode(&mode).await {
             tracing::error!(%error, mode = %mode, "failed to update clash mode");
             return error_response(
@@ -418,7 +440,7 @@ fn build_group_proxy_info(
     let node_names = group_manager.node_names_in_group(&group.name);
     let now = match group.policy {
         GroupPolicy::Selector => group_manager
-            .get_selector_choice(&group.name)
+            .get_selector_choice(&group.name, SelectionNetwork::Tcp)
             .or_else(|| group.default.clone())
             .or_else(|| node_names.first().cloned())
             .unwrap_or_default(),
@@ -584,6 +606,27 @@ async fn put_proxy(
     };
     // GLOBAL is a synthetic selector backed by the shared mode state.
     if group_name == "GLOBAL" {
+        #[cfg(feature = "native-api")]
+        if s.datapath_flags.snapshot().native_enabled {
+            let Some(control) = &s.control else {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "control owner is unavailable",
+                );
+            };
+            return match control
+                .mode(crate::native_api::mode::ModeRequest::ClashSelection(
+                    body.name,
+                ))
+                .await
+            {
+                Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(_) => error_response(
+                    StatusCode::BAD_REQUEST,
+                    "GLOBAL selection transition failed",
+                ),
+            };
+        }
         let config = s.config.read().await;
         let valid = config.groups.iter().any(|g| g.name == body.name)
             || config.nodes.iter().any(|n| n.name == body.name);
@@ -605,34 +648,31 @@ async fn put_proxy(
         return StatusCode::NO_CONTENT.into_response();
     }
 
-    let config = s.config.read().await;
-    let Some(group) = config.groups.iter().find(|g| g.name == group_name) else {
-        return error_response(StatusCode::NOT_FOUND, "group not found");
+    let Some(control) = &s.control else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "control owner is unavailable",
+        );
     };
-    if group.policy != GroupPolicy::Selector {
-        return error_response(StatusCode::BAD_REQUEST, "must be a Selector group");
+    match control
+        .select(crate::control::client::SelectionRequest::Name {
+            group: group_name,
+            member: body.name,
+        })
+        .await
+    {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(crate::control::client::ControlError::NotFound) => {
+            error_response(StatusCode::NOT_FOUND, "group not found")
+        }
+        Err(crate::control::client::ControlError::Unsupported) => {
+            error_response(StatusCode::BAD_REQUEST, "selection is unsupported")
+        }
+        Err(_) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "selection transition could not be confirmed",
+        ),
     }
-    // Members are member TAGS (node names + nested sub-group tags): picking
-    // a sub-group defers to its own selection (sing-box drill-down). A leaf
-    // inside a sub-group is not a direct member and is rejected here.
-    let is_member = {
-        let gm = s.group_manager.read();
-        gm.node_names_in_group(&group_name)
-            .iter()
-            .any(|t| t == &body.name)
-    };
-    drop(config);
-    if !is_member {
-        return error_response(StatusCode::BAD_REQUEST, "node is not a member of the group");
-    }
-
-    // cache.db persistence runs through the group manager's persist
-    // callback, wired by ControlPlane::init_cache_db.
-    // The setter runs its callbacks synchronously and interrupt handling
-    // reacquires this lock, so the guard is released before the call.
-    let group_manager = s.group_manager.read().clone();
-    group_manager.set_selector_choice(&group_name, &body.name);
-    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Query params for delay endpoints: `?url=<url>&timeout=<ms>`.
@@ -667,6 +707,24 @@ async fn get_proxy_delay(
     Path(name): Path<String>,
     Query(query): Query<DelayQuery>,
 ) -> Response {
+    let owner = Arc::clone(&s.alive_set);
+    owner
+        .run_external_probe(move |cancel| async move { proxy_delay(s, name, query, cancel).await })
+        .await
+        .unwrap_or_else(|_| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "health probe owner is unavailable",
+            )
+        })
+}
+
+async fn proxy_delay(
+    s: Arc<ClashState>,
+    name: String,
+    query: DelayQuery,
+    cancel: honk_outbound::alive::ProbeCancellation,
+) -> Response {
     let config = s.config.read().await;
 
     if let Some(node) = config.nodes.iter().find(|n| n.name == name).cloned() {
@@ -690,6 +748,7 @@ async fn get_proxy_delay(
                 &query.url,
                 query.timeout(),
                 &group_manager,
+                cancel.clone(),
             )
             .await
         };
@@ -734,9 +793,13 @@ async fn get_proxy_delay(
                 &query.url,
                 query.timeout(),
                 group_manager,
+                cancel.clone(),
             )
             .await
         };
+        if cancel.is_cancelled() {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "delay test was cancelled");
+        }
         // sing-box performUpdateCheck: an explicit delay test immediately
         // re-evaluates the URLTest selection with the fresh measurements
         // (tolerance hysteresis applies). Without this the group's `now`
@@ -751,7 +814,7 @@ async fn get_proxy_delay(
         // tag); its delay is the measurement of that member's leaf.
         let current = {
             let gm = s.group_manager.read();
-            gm.get_selector_choice(&name)
+            gm.get_selector_choice(&name, SelectionNetwork::Tcp)
                 .or_else(|| gm.get_urltest_selection(&name))
                 .or_else(|| gm.get_score_selection_for_network(&name, SelectionNetwork::Tcp))
         }
@@ -781,6 +844,24 @@ async fn get_group_delay(
     Path(name): Path<String>,
     Query(query): Query<DelayQuery>,
 ) -> Response {
+    let owner = Arc::clone(&s.alive_set);
+    owner
+        .run_external_probe(move |cancel| async move { group_delay(s, name, query, cancel).await })
+        .await
+        .unwrap_or_else(|_| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "health probe owner is unavailable",
+            )
+        })
+}
+
+async fn group_delay(
+    s: Arc<ClashState>,
+    name: String,
+    query: DelayQuery,
+    cancel: honk_outbound::alive::ProbeCancellation,
+) -> Response {
     let exists = {
         let config = s.config.read().await;
         config.groups.iter().any(|group| group.name == name)
@@ -805,9 +886,13 @@ async fn get_group_delay(
             &query.url,
             query.timeout(),
             group_manager,
+            cancel.clone(),
         )
         .await
     };
+    if cancel.is_cancelled() {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "delay test was cancelled");
+    }
     // sing-box performUpdateCheck: re-evaluate the URLTest selection with
     // the fresh measurements (see get_proxy_delay's group branch).
     {
@@ -1256,15 +1341,33 @@ fn spawn_connection_sampler(
 }
 
 async fn delete_connections(State(s): State<Arc<ClashState>>) -> StatusCode {
-    for snap in s.connection_tracker.snapshot() {
-        s.connection_tracker.remove(&snap.id);
+    use futures::StreamExt;
+    let selected = s
+        .connection_tracker
+        .snapshot_close(None, None, usize::MAX)
+        .expect("all current tracked entries fit usize");
+    let mut pending: futures::stream::FuturesUnordered<_> = selected
+        .into_iter()
+        .map(|entry| s.connection_tracker.start_close(entry).wait())
+        .collect();
+    let mut failed = false;
+    while let Some(outcome) = pending.next().await {
+        failed |= outcome == crate::connection_tracker::CloseOutcome::Failed;
     }
-    StatusCode::NO_CONTENT
+    if failed {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::NO_CONTENT
+    }
 }
 
 async fn delete_connection(State(s): State<Arc<ClashState>>, Path(id): Path<String>) -> StatusCode {
-    s.connection_tracker.remove(&id);
-    StatusCode::NO_CONTENT
+    match s.connection_tracker.close_id(&id).await {
+        crate::connection_tracker::CloseOutcome::Closed
+        | crate::connection_tracker::CloseOutcome::Gone => StatusCode::NO_CONTENT,
+        crate::connection_tracker::CloseOutcome::NotClosable => StatusCode::CONFLICT,
+        crate::connection_tracker::CloseOutcome::Failed => StatusCode::SERVICE_UNAVAILABLE,
+    }
 }
 
 async fn traffic_totals(s: &ClashState) -> (u64, u64) {
@@ -1574,17 +1677,18 @@ async fn flush_fakeip(State(s): State<Arc<ClashState>>) -> StatusCode {
 
 async fn flush_dns(State(s): State<Arc<ClashState>>) -> StatusCode {
     match s.dns_service.flush_cache().await {
-        Ok(true) => {}
+        Ok(true) => StatusCode::NO_CONTENT,
         Ok(false) => {
-            if let Some(ref db) = s.cache_db {
-                db.flush_dns();
+            let Some(db) = s.cache_db.clone() else {
+                return StatusCode::NO_CONTENT;
+            };
+            match tokio::task::spawn_blocking(move || db.flush_dns_namespaces()).await {
+                Ok(Ok(())) => StatusCode::NO_CONTENT,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
             }
         }
-        Err(error) => {
-            tracing::warn!(%error, "DNS persistence flush command failed");
-        }
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
-    StatusCode::NO_CONTENT
 }
 
 /// Each group is exposed as a proxy provider holding its members — the

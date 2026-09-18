@@ -35,6 +35,8 @@ pub enum ErrorCode {
 pub struct ApiError {
     #[serde(skip)]
     status: StatusCode,
+    #[serde(skip)]
+    retry_after: Option<u32>,
     error: ErrorBody,
     request_id: Option<String>,
 }
@@ -55,6 +57,7 @@ impl ApiError {
     ) -> Self {
         Self {
             status,
+            retry_after: None,
             error: ErrorBody {
                 code,
                 message,
@@ -73,11 +76,27 @@ impl ApiError {
         self.request_id = Some(request_id);
         self
     }
+
+    pub fn with_retry_after(mut self, seconds: u32) -> Self {
+        self.retry_after = Some(seconds.max(1));
+        self
+    }
+
+    pub(crate) fn into_details(self) -> Option<Value> {
+        self.error.details
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status;
+        let retry_after = self.retry_after.or_else(|| {
+            matches!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+            )
+            .then_some(1)
+        });
         let mut response = (
             self.status,
             [
@@ -87,13 +106,10 @@ impl IntoResponse for ApiError {
             Json(self),
         )
             .into_response();
-        if matches!(
-            status,
-            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
-        ) {
+        if let Some(seconds) = retry_after {
             response
                 .headers_mut()
-                .insert("retry-after", axum::http::HeaderValue::from_static("1"));
+                .insert("retry-after", axum::http::HeaderValue::from(seconds));
         }
         response
     }
@@ -134,8 +150,7 @@ pub(super) struct DatapathSummary {
     pub(super) kind: &'static str,
     pub(super) state: &'static str,
     pub(super) visibility: &'static str,
-    // No kernel inspection is performed by the M1 API.
-    pub(super) ebpf: (),
+    pub(super) ebpf: Option<super::datapath::EbpfSummary>,
 }
 
 #[derive(Clone, Serialize)]
@@ -251,16 +266,14 @@ pub(super) fn version() -> Value {
 pub(super) fn capabilities(state: &super::NativeState) -> Value {
     let config = &state.observation.configuration;
     let telemetry = &state.observation.telemetry;
-    let mut kinds = vec![
+    let kinds = vec![
         "stream.ready",
         "runtime.updated",
         "flow.updated",
         "flow.gap",
         "generation.changed",
+        "operation.updated",
     ];
-    if config.running() {
-        kinds.push("operation.updated");
-    }
     json!({
         "observed_at": chrono::Utc::now().to_rfc3339(),
         "profiles": ["base"],
@@ -277,30 +290,30 @@ pub(super) fn capabilities(state: &super::NativeState) -> Value {
             "runtime_outbounds": {"available":true},
             "traffic_history": {"available":telemetry.record_traffic(),"max_window_seconds":600,"max_points":600},
             "memory_history": {"available":telemetry.record_memory(),"max_window_seconds":600,"max_points":600},
-            "runtime_mode": {"available": false},
-            "datapath": {"available": false},
+            "runtime_mode": {"available":false},
+            "datapath": super::datapath::capability(),
             "nodes": {"available": true},
-            "providers": {"available": false},
-            "groups": {"available": true, "config_patch": false, "selection": false, "max_patch_operations":32},
-            "probes": {"available": false},
+            "providers": state.observation.providers.capability(),
+            "groups": {"available": true, "config_patch":config.writable(), "selection": true, "max_patch_operations":32},
+            "probes": state.observation.probes.capability(),
             "connections": {
                 "available": true,
-                "can_close": false,
+                "can_close": true,
                 "max_bulk_close": 1000,
             },
             "flows": {"available": true, "recording": if state.settings.record_flows { "on" } else { "off" }, "scopes":["userspace_tcp","userspace_udp"], "max_flows":1024, "max_steps_per_flow":64, "retention_seconds":300, "snapshot_ttl_seconds":30, "max_page_size":1000},
-            "routing_trace": {"available": false},
-            "rules": {"available": false},
+            "routing_trace": state.observation.trace.capability(),
+            "rules": super::routing::rules_capability(),
             "events": {"available":true,"kinds":kinds,"retention_seconds":60,"max_buffered_events":512,"max_clients":16,"heartbeat_seconds":15},
-            "logs": {"available": false},
-            "dns_query": {"available": false},
-            "dns_cache": {"available": false},
-            "dns_log": {"available": false},
-            "runtime_settings": {"available": false},
-            "operations": {"available":config.running(),"retention_seconds":300},
+            "logs": state.observation.logs.capability(),
+            "dns_query": state.observation.dns.query_capability(),
+            "dns_cache": state.observation.dns.cache_capability(),
+            "dns_log": state.observation.dns.log_capability(),
+            "runtime_settings": super::settings::capability(&state.settings),
+            "operations": {"available":true,"retention_seconds":300},
             "reload": {"available":config.running()},
-            "suspend": {"available": false},
-            "resume": {"available": false},
+            "suspend": {"available":config.coordinator_running()},
+            "resume": {"available":config.coordinator_running()},
         },
     })
 }

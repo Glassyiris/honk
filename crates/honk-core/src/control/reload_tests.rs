@@ -403,7 +403,13 @@ fn parsed_nested_score_udp_plan_uses_healthy_final_chain() {
         ProbeDomain::DataUdp,
         IpVersion::V4,
     );
-    let plan = resolve_udp_outbound_plan_for_target(&config, &manager, "root", &context);
+    let plan = resolve_udp_outbound_plan_for_target(
+        &config,
+        &manager,
+        "root",
+        &context,
+        crate::control::reload::OutboundConstraint::Any,
+    );
     assert_eq!(
         plan.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
         [backup]
@@ -610,6 +616,89 @@ fn source_update(content: &str) -> crate::native_api::config::SourceUpdate {
 
 #[cfg(feature = "native-api")]
 #[tokio::test]
+async fn group_patch_revision_rejects_same_named_provider_replacement_before_activation() {
+    let provider = honk_config::subscription::Subscription {
+        name: "provider".into(),
+        url: "https://example.invalid/nodes".into(),
+        ..Default::default()
+    };
+    let first = canonical_socks5("peer", "127.0.0.1", 1080, Some(provider.id));
+    let replacement = canonical_socks5("peer", "127.0.0.1", 1081, Some(provider.id));
+    let mut config = Config::default();
+    config.ensure_builtin_nodes();
+    config.nodes.push(first.clone());
+    config.subscriptions.push(provider.clone());
+    config.groups.push(Group {
+        name: "selected".into(),
+        nodes: vec![first.id],
+        filters: vec!["name(peer)".into()],
+        ..Default::default()
+    });
+    let mut cp = control_plane(config.clone());
+    cp.set_mode_state(Arc::new(parking_lot::RwLock::new(
+        crate::mode::ModeState::new("Rule", ""),
+    )));
+    cp.start_datapath_flags_coordinator().unwrap();
+    cp.initialize_datapath_flags(false, false).await.unwrap();
+    let native = Arc::new(crate::native_api::observation::NativeObservation::new(
+        &config,
+    ));
+    cp.native = Some(Arc::clone(&native));
+    let sources =
+        source_update("group { selected { filter: name(peer) } }\nrouting { fallback: direct }\n");
+    native.configuration.accept(&sources, 0);
+    native
+        .configuration
+        .generation_committed(&crate::native_api::catalog::revision_for(&config), 0);
+    let expected = native.configuration.revision().unwrap();
+    let mut candidate = config.clone();
+    candidate.groups[0].default = Some(first.name.clone());
+    let mut authorizations =
+        crate::subscription::SubscriptionAuthorizations::new(&config.subscriptions).unwrap();
+    let revision = authorizations.revision(provider.id).unwrap();
+    assert!(
+        cp.merge_authorized_subscription_nodes_with_drain(
+            provider.id,
+            revision,
+            &authorizations,
+            vec![replacement.clone()],
+            Vec::new(),
+            &DrainTracker::new()
+        )
+        .await
+        .unwrap()
+        .accepted()
+    );
+    let before = native.configuration.snapshot().unwrap();
+    assert_ne!(before["revision"], expected);
+    let (result, applied) = tokio::sync::oneshot::channel();
+    assert!(
+        cp.dispatch_control_command(
+            ControlCommand::ReloadConfig {
+                request_id: 1,
+                config: Box::new(candidate),
+                diagnostics: Vec::new(),
+                sources: Some(Arc::new(source_update(
+                    "group { selected { filter: name(peer)\n default: peer } }\n"
+                ))),
+                expected_group_revision: Some(expected),
+                result,
+            },
+            &DrainTracker::new(),
+            &mut authorizations
+        )
+        .await
+    );
+    assert_eq!(applied.await.unwrap().outcome, ReloadOutcome::Rejected);
+    assert_eq!(native.configuration.snapshot().unwrap(), before);
+    let current = cp.config.read().await;
+    assert_eq!(current.groups[0].default, None);
+    assert!(current.nodes.iter().any(|node| node.id == replacement.id));
+    assert!(!current.nodes.iter().any(|node| node.id == first.id));
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
 async fn accepted_sources_follow_noop_rejection_and_derived_updates() {
     let mut cp = test_cp().await;
     let config = cp.config.read().await.as_ref().clone();
@@ -626,6 +715,7 @@ async fn accepted_sources_follow_noop_rejection_and_derived_updates() {
             &DrainTracker::new(),
             &mut authorizations,
             Some(&initial),
+            None,
         )
         .await
         .unwrap();
@@ -640,6 +730,7 @@ async fn accepted_sources_follow_noop_rejection_and_derived_updates() {
             &DrainTracker::new(),
             &mut authorizations,
             Some(&changed),
+            None,
         )
         .await
         .unwrap(),
@@ -664,6 +755,7 @@ async fn accepted_sources_follow_noop_rejection_and_derived_updates() {
             &DrainTracker::new(),
             &mut authorizations,
             Some(&initial),
+            None,
         )
         .await
         .unwrap(),
@@ -744,8 +836,8 @@ async fn first_subscription_publication_invalidates_source_revision() {
     let owner = native
         .configuration
         .start(
-            initial.sources[0].path.clone(),
-            initial,
+            Some(initial.sources[0].path.clone()),
+            Some(initial),
             cp.config_handle(),
             cp.diagnostics_handle(),
             cp.command_sender(),
@@ -771,7 +863,7 @@ async fn first_subscription_publication_invalidates_source_revision() {
     assert_ne!(after["revision"], before["revision"]);
     assert_ne!(after["generation_id"], before["generation_id"]);
     owner.shutdown().await;
-    subscriptions.shutdown().await;
+    subscriptions.shutdown().await.unwrap();
 }
 
 fn score_reload_context() -> honk_outbound::group::ScoreSelectionContext {
@@ -811,13 +903,29 @@ async fn reload_persists_selector_choice_before_manager_publication() {
         ..Default::default()
     }];
     let db_at_hook = Arc::clone(&db);
+    let member = honk_outbound::group::SelectorMember::Node(config.nodes[1].id);
+    let expected = member.clone();
     let _hook_guard = cp.set_pre_dns_publication_hook(move |manager| {
-        manager.set_selector_choice("selector", "b");
-        assert_eq!(
-            db_at_hook.load_selector_choice("selector").as_deref(),
-            Some("b"),
-            "a selector write before publication must reach the cache database"
-        );
+        manager
+            .set_selector_choice(
+                "selector",
+                "b",
+                honk_outbound::group::SelectorNetworks::Both,
+            )
+            .unwrap();
+        for network in [
+            honk_outbound::group::SelectionNetwork::Tcp,
+            honk_outbound::group::SelectionNetwork::Udp,
+        ] {
+            assert_eq!(
+                db_at_hook
+                    .load_network_selector("selector", network)
+                    .unwrap()
+                    .unwrap(),
+                expected,
+                "a selector write before publication must reach the cache database"
+            );
+        }
     });
     assert!(
         cp.apply_runtime_config(config, Default::default(), &DrainTracker::new())
@@ -832,7 +940,17 @@ async fn reload_persists_selector_choice_before_manager_publication() {
             .name,
         "b"
     );
-    assert_eq!(db.load_selector_choice("selector").as_deref(), Some("b"));
+    for network in [
+        honk_outbound::group::SelectionNetwork::Tcp,
+        honk_outbound::group::SelectionNetwork::Udp,
+    ] {
+        assert_eq!(
+            db.load_network_selector("selector", network)
+                .unwrap()
+                .unwrap(),
+            member
+        );
+    }
     cp.stop_selector_warm_coordinator().await;
     cp.stop_udp_warm_coordinator().await;
 }
@@ -994,6 +1112,8 @@ async fn post_publication_datapath_failure_is_committed_degraded() {
             &mut authorizations,
             #[cfg(feature = "native-api")]
             Some(&sources),
+            #[cfg(feature = "native-api")]
+            None,
         )
         .await
         .unwrap(),
@@ -1105,11 +1225,8 @@ async fn fence_failure_rejects_reload_without_stranding_datapath() {
     );
 }
 
-/// The production incident shape: quiesce fails after READY=false was
-/// published. The reload is rejected and restore must republish the exact
-/// pre-fence flags (READY set) while keeping admission open.
 #[tokio::test]
-async fn quiesce_failure_rejects_reload_and_restores_ready_flags() {
+async fn quiesce_failure_keeps_reload_fenced_and_unhealthy() {
     let cp = test_cp_with_nfq(true).await;
     let expected_flags = {
         let ebpf = cp.ebpf.read().await;
@@ -1132,9 +1249,9 @@ async fn quiesce_failure_rejects_reload_and_restores_ready_flags() {
         ReloadOutcome::Rejected,
         "quiesce failure must reject the reload"
     );
-    assert!(cp.is_datapath_healthy());
-    assert!(!drain.should_reject());
-    assert!(!cp.drain_tracker.should_reject());
+    assert!(!cp.is_datapath_healthy());
+    assert!(drain.should_reject());
+    assert!(cp.drain_tracker.should_reject());
     let ebpf = cp.ebpf.read().await;
     let trace = ebpf.datapath_flags_write_trace();
     assert!(!trace.iter().any(|write| write.failed));
@@ -1145,8 +1262,8 @@ async fn quiesce_failure_rejects_reload_and_restores_ready_flags() {
     );
     assert_eq!(
         trace.last().unwrap().flags,
-        expected_flags,
-        "restore must republish the exact pre-fence flags (READY set)"
+        expected_flags & !honk_ebpf_common::DATAPATH_FLAG_NFQ_READY,
+        "a failed quiescence cannot reopen NFQUEUE without a complete fence"
     );
 }
 
@@ -1211,6 +1328,8 @@ async fn reload_dispatch_assigns_worker_revision_and_accepts_only_that_revision(
                 diagnostics: Vec::new(),
                 #[cfg(feature = "native-api")]
                 sources: None,
+                #[cfg(feature = "native-api")]
+                expected_group_revision: None,
                 result,
             },
             &drain,
@@ -1253,6 +1372,7 @@ async fn reload_dispatch_assigns_worker_revision_and_accepts_only_that_revision(
                     ..Default::default()
                 }],
                 diagnostics: Vec::new(),
+                result: tokio::sync::oneshot::channel().0,
             },
             &drain,
             &mut authorizations,
@@ -1269,7 +1389,7 @@ async fn reload_dispatch_assigns_worker_revision_and_accepts_only_that_revision(
     );
 
     server.await.unwrap();
-    assert_eq!(supervisor.shutdown().await, 0);
+    assert_eq!(supervisor.shutdown().await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -1296,6 +1416,8 @@ async fn applied_reload_with_dropped_supervisor_handoff_stops_dispatch() {
                 diagnostics: Vec::new(),
                 #[cfg(feature = "native-api")]
                 sources: None,
+                #[cfg(feature = "native-api")]
+                expected_group_revision: None,
                 result,
             },
             &DrainTracker::new(),
@@ -1639,15 +1761,12 @@ async fn valid_reload_commits() {
     let expected_tolerance = Config::default().global.check_tolerance_ms + 1;
     let cp = test_cp().await;
     let before_routing_generation = cp.ebpf.read().await.active_routing_slot().unwrap();
-    let before_runtime = cp.dns_controller.runtime_provider().acquire();
-    let cache = before_runtime.runtime().cache();
-    let before_forwarder = Arc::clone(before_runtime.runtime().forwarder());
+    let before_runtime = cp.dns_controller.runtime_provider().current();
+    let cache = before_runtime.cache();
+    let before_forwarder = Arc::clone(before_runtime.forwarder());
     let before_dns_router = before_forwarder.routing_snapshot();
     let before_upstream_pool = Arc::clone(&before_forwarder.upstream_pool);
-    assert_eq!(
-        before_runtime.runtime().routing_projection().generation(),
-        0
-    );
+    assert_eq!(before_runtime.routing_projection().generation(), 0);
     drop(before_runtime);
 
     let mut good = Config::default();
@@ -1667,10 +1786,10 @@ async fn valid_reload_commits() {
         cp.ebpf.read().await.active_routing_slot().unwrap(),
         before_routing_generation,
     );
-    let after_runtime = cp.dns_controller.runtime_provider().acquire();
-    let after_forwarder = Arc::clone(after_runtime.runtime().forwarder());
-    assert!(Arc::ptr_eq(&after_runtime.runtime().cache(), &cache));
-    assert_eq!(after_runtime.runtime().routing_projection().generation(), 1);
+    let after_runtime = cp.dns_controller.runtime_provider().current();
+    let after_forwarder = Arc::clone(after_runtime.forwarder());
+    assert!(Arc::ptr_eq(&after_runtime.cache(), &cache));
+    assert_eq!(after_runtime.routing_projection().generation(), 1);
     assert!(!Arc::ptr_eq(&before_forwarder, &after_forwarder));
     assert!(Arc::ptr_eq(
         &before_dns_router,
@@ -1937,10 +2056,9 @@ async fn client_subnet_reload_injects_upstream_query() {
         Some("198.51.100.0/24".parse().unwrap())
     );
     let expected_policy = crate::dns::policy::PolicyId::from_config(&config.dns).unwrap();
-    let runtime = cp.dns_controller.runtime_provider().acquire();
+    let runtime = cp.dns_controller.runtime_provider().current();
     assert_eq!(
         runtime
-            .runtime()
             .forwarder()
             .policy_id
             .as_ref()
@@ -1948,7 +2066,7 @@ async fn client_subnet_reload_injects_upstream_query() {
             .canonical_bytes(),
         expected_policy.canonical_bytes()
     );
-    let forwarder = Arc::clone(runtime.runtime().forwarder());
+    let forwarder = Arc::clone(runtime.forwarder());
     drop(runtime);
 
     let query = crate::dns::forwarder::build_dns_query("example.com", 1);
@@ -2229,7 +2347,13 @@ async fn selector_choice_switch_replaces_bare_tcp_pin_immediately() {
     .await
     .unwrap();
 
-    manager.set_selector_choice("manual", "selector-second");
+    manager
+        .set_selector_choice(
+            "manual",
+            "selector-second",
+            honk_outbound::group::SelectorNetworks::Both,
+        )
+        .unwrap();
     let (second_server, _) = tokio::time::timeout(Duration::from_secs(1), second_listener.accept())
         .await
         .expect("choice change must preconnect immediately")
@@ -2582,7 +2706,7 @@ fn udp_warm_candidates_do_not_mutate_group_selection_state() {
     );
     let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let callback_interrupts = Arc::clone(&interrupts);
-    manager.set_interrupt_callback(Some(Arc::new(move |_| {
+    manager.set_interrupt_callback(Some(Arc::new(move |_, _| {
         callback_interrupts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     })));
     for ipver in [IpVersion::V4, IpVersion::V6] {
@@ -2655,7 +2779,15 @@ async fn udp_warm_coordinator_limits_concurrency_and_keeps_shutdown_errors_neutr
             }
         })
     };
-    run_udp_warm_dispatches(ids, Arc::clone(&generation), stats.clone(), dispatch).await;
+    let (_stop, stopping) = tokio::sync::watch::channel(false);
+    run_udp_warm_dispatches(
+        ids,
+        Arc::clone(&generation),
+        stats.clone(),
+        dispatch,
+        stopping.clone(),
+    )
+    .await;
     assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 4);
     let snapshot = stats.udp_snapshot();
     assert_eq!(
@@ -2676,6 +2808,7 @@ async fn udp_warm_coordinator_limits_concurrency_and_keeps_shutdown_errors_neutr
         generation,
         neutral_stats.clone(),
         neutral_dispatch,
+        stopping,
     )
     .await;
     let neutral = neutral_stats.udp_snapshot();
@@ -2747,7 +2880,15 @@ async fn udp_warm_dispatch_metrics_distinguish_live_and_terminal_errors_and_pani
             },
         );
 
-        run_udp_warm_dispatches(vec![node.id], generation, Arc::clone(&stats), dispatch).await;
+        let (_stop, stopping) = tokio::sync::watch::channel(false);
+        run_udp_warm_dispatches(
+            vec![node.id],
+            generation,
+            Arc::clone(&stats),
+            dispatch,
+            stopping,
+        )
+        .await;
         let snapshot = stats.udp_snapshot();
         assert_eq!(
             (
@@ -3088,6 +3229,7 @@ async fn subscription_refresh_duplicate_static_node_reports_one_safe_rejection()
         revision: authorizations.revision(subscription.id).unwrap(),
         nodes,
         diagnostics: Vec::new(),
+        result: tokio::sync::oneshot::channel().0,
     };
     let log = capture_runtime_admission(cp.dispatch_control_command(
         command,

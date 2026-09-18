@@ -249,6 +249,7 @@ struct TuicConnState {
     /// Last activity (unix seconds) for the idle-connection reaper.
     last_activity: Arc<AtomicU64>,
     path_health: Arc<crate::quic::QuicPathHealth>,
+    task_scope: crate::runtime::TaskScope,
 }
 
 impl QuicConnState for TuicConnState {
@@ -276,13 +277,14 @@ impl TuicConnState {
             open: Arc::new(AtomicUsize::new(0)),
             last_activity: Arc::new(AtomicU64::new(now_secs())),
             path_health: Arc::clone(&path_health),
+            task_scope: crate::runtime::TaskScope::capture(),
         };
-        tokio::spawn(Self::datagram_loop(
+        let _ = crate::runtime::spawn_owned(Self::datagram_loop(
             conn.clone(),
             Arc::clone(&sessions),
             Arc::clone(&path_health),
         ));
-        tokio::spawn(Self::uni_stream_loop(
+        let _ = crate::runtime::spawn_owned(Self::uni_stream_loop(
             conn.clone(),
             Arc::clone(&sessions),
             Arc::clone(&path_health),
@@ -371,7 +373,7 @@ impl TuicConnState {
             };
             let sessions = Arc::clone(&sessions);
             let path_health = Arc::clone(&path_health);
-            tokio::spawn(async move {
+            let _ = crate::runtime::spawn_owned(async move {
                 let mut head = [0u8; 2];
                 if read_exact(&mut recv, &mut head).await.is_err() {
                     return;
@@ -762,7 +764,7 @@ impl Drop for TuicUdpTransport {
         self.state.open.fetch_sub(1, Ordering::Relaxed);
         let conn = self.state.conn.clone();
         let session_id = self.session_id;
-        tokio::spawn(async move {
+        let _ = self.state.task_scope.spawn(async move {
             TuicHandler::send_dissociate(&conn, session_id).await;
         });
     }

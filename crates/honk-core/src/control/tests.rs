@@ -18,24 +18,6 @@ mod dns_tcp_ownership;
 mod dns_udp_ownership;
 mod health;
 
-#[test]
-fn interrupting_groups_enable_tracking_without_the_clash_api() {
-    let groups = [Group {
-        interrupt_connections: true,
-        ..Default::default()
-    }];
-    let manager = GroupManager::new(&groups, &[]);
-    let manager_cell = Arc::new(parking_lot::RwLock::new(Arc::new(GroupManager::new(
-        &groups,
-        &[],
-    ))));
-    let tracker = Arc::new(ConnectionTracker::new());
-
-    reload::install_interrupt_callback(&manager, &manager_cell, &tracker);
-
-    assert!(tracker.is_enabled());
-}
-
 #[tokio::test]
 async fn health_push_re_resolves_after_reload_writer() {
     let node = udp_test_node();
@@ -247,8 +229,6 @@ async fn startup_failure_drops_saturated_control_receiver() {
         udp_test_forwarder(),
     )
     .unwrap();
-    #[cfg(feature = "native-api")]
-    let phase = control_plane.observe_phase();
 
     let command_tx = control_plane.command_sender();
     for _ in 0..command_tx.max_capacity() {
@@ -266,8 +246,6 @@ async fn startup_failure_drops_saturated_control_receiver() {
         .run()
         .await
         .expect_err("occupied dns.bind must fail startup");
-    #[cfg(feature = "native-api")]
-    assert_eq!(*phase.borrow(), EnginePhase::Starting);
 
     assert!(
         tokio::time::timeout(Duration::from_secs(1), blocked_delivery)
@@ -486,9 +464,13 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
         .reload_runtime_config(candidate, Default::default())
         .await;
 
-    let result =
-        honk_outbound::alive::UdpProber::probe_udp(&prober, node.id, Duration::from_millis(30))
-            .await;
+    let result = honk_outbound::alive::UdpProber::probe_udp(
+        &prober,
+        node.id,
+        Duration::from_millis(30),
+        Default::default(),
+    )
+    .await;
     assert!(
         matches!(result.dns, Some(Ok(_))),
         "DNS health result: {result:?}"
@@ -573,9 +555,13 @@ async fn quic_probe_still_runs_when_dns_target_resolution_is_refused() {
         manager.clone(),
     );
 
-    let result =
-        honk_outbound::alive::UdpProber::probe_udp(&prober, node.id, Duration::from_millis(30))
-            .await;
+    let result = honk_outbound::alive::UdpProber::probe_udp(
+        &prober,
+        node.id,
+        Duration::from_millis(30),
+        Default::default(),
+    )
+    .await;
     assert!(result.dns.is_none(), "DNS health result: {result:?}");
     assert!(
         matches!(result.data_path, Some(Err(_))),
@@ -1667,7 +1653,8 @@ async fn native_tcp_accounting_updates_before_close() -> anyhow::Result<()> {
     plane
         .group_manager()
         .read()
-        .set_selector_choice("G", "direct");
+        .set_selector_choice("G", "direct", honk_outbound::group::SelectorNetworks::Both)
+        .unwrap();
     #[cfg(feature = "native-api")]
     let mut plane = plane;
     #[cfg(feature = "native-api")]
@@ -1683,7 +1670,6 @@ async fn native_tcp_accounting_updates_before_close() -> anyhow::Result<()> {
             address,
             std::time::SystemTime::now(),
             std::time::Instant::now(),
-            true,
         )
         .await?;
         let server = crate::native_api::NativeServer::start(listener, Arc::new(state));
@@ -1752,7 +1738,8 @@ async fn native_tcp_accounting_updates_before_close() -> anyhow::Result<()> {
         handle
             .group_manager
             .read()
-            .set_selector_choice("G", "block");
+            .set_selector_choice("G", "block", honk_outbound::group::SelectorNetworks::Both)
+            .unwrap();
         let after: serde_json::Value = http.get(&url).send().await?.json().await?;
         assert_eq!(after["tcp"][0]["id"], before["tcp"][0]["id"]);
         assert_eq!(after["tcp"][0]["outbound"], "G");
@@ -1775,7 +1762,8 @@ async fn native_tcp_accounting_updates_before_close() -> anyhow::Result<()> {
         handle
             .group_manager
             .read()
-            .set_selector_choice("G", "direct");
+            .set_selector_choice("G", "direct", honk_outbound::group::SelectorNetworks::Both)
+            .unwrap();
         let echo = UdpSocket::bind("127.0.0.1:0").await?;
         let udp_client = UdpSocket::bind("127.0.0.1:0").await?;
         let source = udp_client.local_addr()?;
@@ -2233,7 +2221,12 @@ async fn tcp_tracker_keeps_the_dial_selection_snapshot() -> anyhow::Result<()> {
     handle
         .group_manager
         .read()
-        .set_selector_choice("devops", "us-163");
+        .set_selector_choice(
+            "devops",
+            "us-163",
+            honk_outbound::group::SelectorNetworks::Both,
+        )
+        .unwrap();
     assert_eq!(
         handle.group_manager.read().selection_chain("devops"),
         vec!["devops", "us-163"]
@@ -3393,6 +3386,7 @@ fn resolve_udp_score_plan(
             ProbeDomain::DataUdp,
             ipver,
         ),
+        crate::control::reload::OutboundConstraint::Any,
     )
 }
 
@@ -3440,7 +3434,11 @@ fn resolve_selector_refusal_uses_only_explicit_final() {
             crate::group::ScoreSelectionContext::aggregate(network, domain, IpVersion::V6);
         assert!(
             super::reload::resolve_outbound_plan_for_target(
-                &config, &manager, "selector", &context
+                &config,
+                &manager,
+                "selector",
+                &context,
+                crate::control::reload::OutboundConstraint::Any
             )
             .nodes
             .is_empty()
@@ -3450,6 +3448,7 @@ fn resolve_selector_refusal_uses_only_explicit_final() {
             &manager,
             "selector-final",
             &context,
+            crate::control::reload::OutboundConstraint::Any,
         );
         assert_eq!(plan.mode, crate::group::SelectionPlanMode::Authoritative);
         assert_eq!(
@@ -4174,6 +4173,7 @@ fn preconnect_test_group(name: &str, policy: GroupPolicy, ids: Vec<uuid::Uuid>) 
     Group {
         id: uuid::Uuid::new_v4(),
         name: name.into(),
+        icon: None,
         policy,
         nodes: ids,
         filters: vec![],
@@ -4477,7 +4477,7 @@ async fn udp_removal_worker_retires_legacy_token_zero_conn_state() {
     );
     assert!(fatal_rx.try_recv().is_err());
 
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
     removal_task.await.unwrap();
 }
 
@@ -4537,7 +4537,7 @@ async fn udp_removal_worker_acknowledges_superseding_token() {
     );
     assert!(fatal_rx.try_recv().is_err());
 
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
     removal_task.await.unwrap();
 }
 

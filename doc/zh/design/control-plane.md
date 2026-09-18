@@ -241,7 +241,7 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 
 独立且默认关闭的 `native-api` feature 在控制面准入前绑定。按需 phase watch 仅在真实 admission-open 成功后报告 running，在关闭栅栏前报告 draining；现有 health handle 可将 running 细化为 degraded。读取 generation 与 health 期间保留 config 发布屏障，不改变发布锁序。HTTP 可用不代表数据面健康。
 
-`native_api.rs` 完整持有 listener、64 连接 JoinSet、唯一一秒 sampler 与 native tracker consumer，直到关闭 join。Header 预算五秒，空闲 I/O 与停滞写入有独立 30 秒期限，健康 SSE 可持续超过 30 秒；关闭共享五秒 grace。`observation.rs` 拥有进程身份与有界 flow/catalog/event、telemetry 和配置 operation 状态。TCP/UDP 真实 producer 捕获不可变 partial 证据，不改变路由或清理；已接受 reload 发布在既有屏障下发出 generation 事件。Native-only final handoff 仍不重复生成旧选路证据；不宣称完整内核透明观测或 log ring。
+`native_api.rs` 完整持有 listener、64 连接 JoinSet、唯一一秒 sampler 与 native tracker consumer，直到关闭 join。Header 预算五秒，空闲 I/O 与停滞写入有独立 30 秒期限，健康 SSE 可持续超过 30 秒；关闭共享五秒 grace。`observation.rs` 拥有进程身份、有界 flow/catalog/event、telemetry、结构化日志、DNS 历史及共用 operation store。TCP/UDP producer 在真实决策点捕获不可变 partial 证据，已接受发布在既有屏障下发出 generation 事件；native-only final handoff 不重复生成旧选路证据，不宣称完整内核透明观测。日志直接捕获审查过的结构化安全字段，不转发 Clash 格式化输出；`/events` 续传 replay→ready，而 `/logs` 按自身契约 ready→replay。
 
 TCP copy 成功读取与 splice 成功写入实时累加既有逐出站 atomics；成功接受的嗅探前缀仅计一次，部分写失败也保留已写字节。Relay 关闭或取消不再次累加总量。既有统计与原生采样共用这些计数，UDP 原逐包语义不变。Wire 契约、上限与未知字段见 [API 参考](../reference/api.md#原生-api-m1)。
 
@@ -249,11 +249,29 @@ M5 的出站读取保留共用账本的 `kind/name` 与完整 UInt64，reload �
 
 M6 的 `config.rs` 只接受启动 loader 当时捕获的 `.dae` 源快照；元数据与 diagnostics 不授予私有路径访问权。`config/coordinator.rs` 的 daemon-owned 队列在读盘前串行化 SIGHUP 与 API 写入，先预留有界 operation，再进行单源 overlay 离线准入、目标/依赖复查、原子替换及 fsync，最后提交真实 ReloadConfig 并等待 supervisor reconciliation。HTTP 断开不取消任务，同 scope/key/body 重放共用结果；PUT 的 202 仅代表耐久写入且真实 reload 已排队。外部编辑器仍可能在最后检查与 rename 间竞争，rename 后目录 fsync 失败必须报告已写但耐久性未确认，不能称为回滚。
 
-Accepted 源在真实 no-op 或 commit 时随原有 config 发布屏障更新，不改变 router→config→eBPF 的发布锁序或订阅 revision fence。拒绝 reload 保留旧快照/代次但不回滚已写文件；提交后 degraded 保留新快照/代次并令 operation 失败。API operation 的真实结果投影到 GET、`runtime.last_reload` 与 `operation.updated`，SIGHUP 本身不创建 API operation。注释变更可更新 source hash/config revision 而不推进 runtime generation，有效组成员变更影响 revision，健康变化不影响。M3b 组 selection/PATCH/override 仍等待共同控制、持久化和暖池语义，不因 M6 源写入已交付而开放。
+Accepted 源在真实 no-op 或 commit 时随原有 config 发布屏障更新，不改变 router→config→eBPF 的发布锁序或订阅 revision fence。拒绝 reload 保留旧快照/代次但不回滚已写文件；提交后 degraded 保留新快照/代次并令 operation 失败。API operation 的真实结果投影到 GET、`runtime.last_reload` 与 `operation.updated`，SIGHUP 本身不创建 API operation。注释变更可更新 source hash/config revision 而不推进 runtime generation，有效组成员变更影响 revision，健康变化不影响。
+
+Selector 写入由同一 control/reload owner 序列化，TCP/UDP 分开保存，both 原子发布；Clash 写 both、读 TCP 投影。精确连接关闭绑定 TCP UUID 或 UDP token/generation/source view，等待真实 transport 与 backend/driver 退役，不用 tracker 删除充数。组中断按建立时捕获的组路径及变更网络选择旧 owner，回调和异步等待均离开同步 guard。受限组 PATCH 使用 parser 的来源 span 和原有源码写入协调器；accepted revision 写前检查，激活前在 reload lock 下再次检查，同时独立校验文件 hash/依赖。Provider 并发发布可使已写文件不能激活，结果必须保留 written/committed 区分。自动策略 override 与 M9 CRUD/geodata 仍未开放。
+
+Probe worker 拥有有界准备/排队/执行/清理，DNS 诊断使用真实 generation 与精确缓存 owner，provider refresh 由 SubscriptionSupervisor 拉取并等待 revision-fenced publication；GET 不伪造这些 producer。Routing trace 只模拟当前 compiled predicate，不 DNS/探测/选组；当前规则字典只在 parser 来源可用时提供脱敏 source location。Runtime settings 由一个 owner 先校验全量 merge 再发布，native+Clash mode 共用 `DatapathFlagsHandle`。Native 启用时模式不恢复/持久化；显式接受配置激活（含 no-op）重置 Rule 与 settings，provider/network refresh 不重置。
+
+显式激活已提交 routing/config 后若 backend mode reset 失败，保留先前 mode/source，但 settings 已恢复配置值；事务报告 committed-degraded 并关闭准入，operation 失败。不把这一结果写成 mode 已重置为 Rule 或旧配置仍 active。
+
+原生 mode 资源因固定 PUT 契约缺少生命周期冲突及 owner/backend 不可用的响应而暂缓；同一 capability 覆盖读写，所以 GET/HEAD/PUT 均返回 `404 capability_not_supported`。内部临时模式、Clash 控制与上述激活 reset 不受影响。
+
+### 暂停、恢复与终止所有权
+
+Suspend/resume 与源写入共用 daemon-owned 配置协调器，再由唯一 control command owner 执行。暂停先关闭 datapath admission 和 NFQUEUE readiness，完成 epoch fence 与 held verdict 排空；停止/join TCP accept（含 pre-ID sniff/dial）、UDP initializer/view/source driver/退役 worker、独立 DNS listener、健康与按需探测、预热/预连接、协议 session 后台任务、订阅网络及接口 watcher 扫描。只有真实 owner 全部停止才发布 suspended，不能用暂停健康检查代替无负载状态。暂停期间拒绝新网络工作、模式/组修改和配置激活；API 的内存观测仍可用。
+
+保留同一 API/operation owner、instance、accepted 配置/来源、router/compiled plan、GroupManager（含 Selector/Fallback/轮询/Score 状态）、mode/settings、统计、DNS 缓存与留存历史；留存期限仍正常生效。程序、maps 与自有 TC/cgroup/sk_lookup hooks 可保留，但 admission 关闭时 TC pass-through，附着不表示 active。接口 watcher 保留真实 attached map，在暂停确认后不再改 hook 或扫描网络。
+
+恢复从 accepted 内存配置与 hosts/geodata artifact 重建 fresh runtime/listener、UDP pool、DNS fork 与协议任务 owner，不从磁盘悄悄 reload，也不复用已终止的 transport。新的 owner 继续共用原进程 FD/dial/carrier gate；完整重查拓扑，确认 listeners/routing/NFQUEUE 就绪后最后打开 admission。旧连接不会恢复，取消的流量与订阅正文不会重放；provider/network 通知不改变 retained settings/mode。安全清理完成的恢复失败保持 suspended；fence 或清理不确定则 failed 并终止。已经发布的新 userspace generation 不因后续 reopen 失败伪装成旧代，operation 分别报告 committed/current generation。
+
+已开始的系统 blocking lookup/NSS 无法靠取消 async waiter 停止；subscription 专有 runtime 及 DNS/协议 task owner 必须等实际 join。阶段 deadline 超过后仍保有 join，不能声称十秒内一定暂停或丢弃线程继续运行。终止关闭具有不同顺序：关闭 admission，停止 watcher 并 detach hooks；健康正常退出给既有连接默认五秒 drain grace，再强制取消/join epoch，故障退出可跳过 grace。原生 HTTP 另有五秒 graceful drain；阻塞 join 可能延长总退出时间，shutdown 优先于恢复，不在半完成 transition 中遗失任务所有权。
 
 ## Clash API 与 cache DB
 
-可选的 Clash-compatible axum server 是当前配置、GroupManager、mode/flags handle、connection tracker、DNS service、统计和出站 runtime pointer 上的用户态视图与修改接口；endpoint 细节见 [API 参考](../reference/api.md)。当 API 成功绑定，或任一配置组使用 `interrupt_connections` 时，才启用连接元数据，因此即使没有 API 也能在选择变化时中断连接。可选 SQLite `cachedb` 在数据路径准入前打开，持久化 Selector 选择、Clash 模式和可选 DNS 应答。相对路径依次优先使用 `global.data_dir` 下、`/var/share/honk` 下和原始配置目录中的已有数据库；缺失数据库在 `global.data_dir` 下创建。配置和持久化语义见 [Experimental 参考](../reference/experimental.md)。
+可选的 Clash-compatible axum server 是当前配置、GroupManager、mode/flags handle、connection tracker、DNS service、统计和出站 runtime pointer 上的用户态视图与修改接口；endpoint 细节见 [API 参考](../reference/api.md)。当任一 API 成功绑定，或任一配置组使用 `interrupt_connections` 时启用连接元数据；真实 transport 关闭不等于移除记录。可选 SQLite `cachedb` 在数据路径准入前打开，持久化分网络 Selector 选择与可选 DNS 应答；Clash mode/GLOBAL 仅在 native 未启用时恢复与保存。相对路径依次优先使用 `global.data_dir` 下、`/var/share/honk` 下和原始配置目录中的已有数据库；缺失数据库在 `global.data_dir` 下创建。配置和持久化语义见 [Experimental 参考](../reference/experimental.md)。
 
 ## 相关文档
 

@@ -12,7 +12,7 @@
 
 `Arc<parking_lot::RwLock<Arc<GroupManager>>>`
 
-重载会构建完整的替代 `GroupManager`，迁移组和成员 tag 仍然存在的 Selector 选择，在发布前安装连接中断、预热和持久化回调，再切换内部 `Arc`。因此读者只会看到旧管理器或新管理器，不会看到构建到一半的组图。
+普通重载构建完整的替代 `GroupManager`，分别迁移 TCP/UDP Selector 选择，在发布前安装连接中断、预热和持久化回调，再切换内部 `Arc`。两种 API 的选择写入与 accepted-manager 替换通过同一 control/reload owner 串行化，不能确认对旧管理器的写入。因此读者只会看到完整旧图或新图。Suspend/resume 不是普通 reload：保留同一管理器及所有策略状态，只重建 transport/task owner。
 
 facade 与内部实现按职责拆分：
 
@@ -31,11 +31,15 @@ facade 与内部实现按职责拆分：
 
 | 策略 | 运行时行为 |
 | --- | --- |
-| Selector | TCP 与 UDP 都不依赖健康状态，依次解析运行时选择、`default` 和声明顺序中的第一个成员；只有缺失或不再属于该组的 tag 才继续向后查找。该成员没有合格候选时，仅执行该组显式 `final` 或上述同一叶节点的 TCP 最后尝试；两者都不可用时计划为空。GroupManager 在每级嵌套中解析 final。Clash API 修改运行时选择。`PersistCallback` 把有效写入持久化到 `cache.db`；启用 `interrupt_connections` 时，`InterruptCallback` 只移除跟踪记录，不会取消正在运行的转发任务。配置诊断会对此限制发出警告。 |
+| Selector | TCP/UDP 各自维护选择，都在健康过滤前依次解析对应网络运行时选择、`default` 和第一个成员；仅缺失或非成员 tag 才向后查找。无合格叶时仅执行显式 `final` 或同叶 TCP 最后尝试。原生 API 可写 tcp/udp/both，Clash 写 both、读 TCP 投影；both 一次校验并原子发布。有效选择按网络持久化；启用 `interrupt_connections` 时关闭捕获了该组路径的旧 transport owner，而非只删除 tracker。 |
 | URLTest | 选择最小减半递推移动平均，分别保存 TCP 与 UDP 选择，应用 tolerance 滞后，并在拨号和选择查询时惰性重算。真实选择变化可以调用 `InterruptCallback`。 |
 | LoadBalance | 按声明顺序轮询合格成员。每个组分别为 TCP 和 UDP 持有独立 `AtomicUsize` 游标。轮转从不调用 `InterruptCallback`。 |
 | Fallback | 分别为 TCP 和 UDP 固定声明顺序中的第一个合格成员。该成员死亡前保持固定；更靠前的成员恢复不会触发 failback。 |
 | Score | 以 `policy: score` 显式选择后，通过自动的 target-aware 可靠性优先评分和有界的确定性冷启动探索，选择一个权威存活成员。评分器始终编译；省略策略仍默认使用 Selector。 |
+
+组中断根据连接建立时捕获的胜出组身份/路径和网络选择精确 TCP/UDP owner，不从今天的组成员或叶名称重建匹配；不依赖 flow recorder 是否启用。显式选择在发布前捕获旧集合，回调在同步 guard 外运行，再等待发生变化网络的关闭确认；相同选择不重拨。TCP 绑定 UUID/cancel/completion，UDP 绑定 token/generation/source view 并确认 backend 与 driver 退役；共享 XUDP 不杀其他 view 的 carrier，也不重放数据。选择已发布但关闭确认失败可返回错误，不声称回滚。
+
+组配置与运行时选择分离：受限原生 JSON Patch 由 parser source span 和既有配置协调器持久化为 `.dae`，全量验证后真实 reload；accepted revision 与文件 hash 是不同 fence。配置 icon 只原样展示通过校验的 HTTP(S)/data URI，不派生或抓取。自动策略 pin/clear 仍不支持，M9 节点/provider CRUD 不因源编辑可用而开放，见[API 参考](../reference/api.md#节点与组m3)。
 
 ### Score 评分与生命周期
 
@@ -179,7 +183,7 @@ eBPF alive slot 属于组，而不是某个节点。对于每个域和地址族�
 | 机制 | 候选与生命周期 | 保留资源 | 边界 |
 | --- | --- | --- | --- |
 | 启动预连接 | 仅在启动时运行一轮；先取各组当前选择，再按配置顺序。只有可池化裸 TCP 的代理节点合格。 | 向池中存入一条服务端裸 TCP 连接 | `'auto'` 最多选择 8 个节点；`0` 关闭。它不持有策略 retention bit。 |
-| Selector 固定 | 始终跟踪每个 Selector 的配置叶节点，包括不健康的显式选择；多个组共享的叶节点按 UUID 去重。 | TCP path 选择的可复用 session（AnyTLS 或 VLESS H2/shared Mux.Cool）、一个 QUIC client/connection，否则一条服务端裸 TCP | 有效选择变化会立即唤醒；10 秒周期修复丢失、已消费或已过期状态。 |
+| Selector 固定 | 跟踪每个 Selector 的 TCP 配置选择叶，包括不健康的显式选择；共享叶按 UUID 去重。UDP 预热另按 UDP 选择。 | TCP path 选择的可复用 session（AnyTLS 或 VLESS H2/shared Mux.Cool）、一个 QUIC client/connection，否则一条服务端裸 TCP | 有效选择变化会立即唤醒；10 秒周期修复丢失、已消费或已过期状态。 |
 | UDP 预热集 | 需显式启用；每轮对每个地址族重新选择各组 top `min(N, 3)` 的可复用 UDP 叶节点，再按 UUID 全局去重。 | UDP path 选择的可复用状态，包括 VLESS H2/shared/separate Mux.Cool pool，或一个 QUIC client | 最多并发 4 个预热尝试；进程保留集会重新排名并封顶 `4 × N`。 |
 
 Selector 与 UDP ownership 是 reusable node runtime 上相互独立的 bit。

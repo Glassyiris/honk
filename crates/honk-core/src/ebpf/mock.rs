@@ -76,10 +76,15 @@ pub struct MockEbpfBackend {
     /// Whether TC entry points may redirect traffic into the control plane.
     pub datapath_ready: bool,
     pub listener_sockets_published: bool,
+    listener_socket_slots: HashMap<u32, std::os::fd::RawFd>,
+    #[cfg(test)]
+    pub listener_clear_fault_at: Option<u32>,
     /// Every mode-policy write, shared so tests can inspect boxed backends.
     pub datapath_flags_writes: std::sync::Arc<parking_lot::Mutex<Vec<u32>>>,
     pub detach_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub dynamic_attach_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    pub dynamic_attach_fault: bool,
     pub dynamic_forget_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub routing_publication_order: Vec<MockRoutingPublicationWrite>,
     #[cfg(feature = "reload-bench-counters")]
@@ -106,6 +111,8 @@ pub struct MockEbpfBackend {
     datapath_flags_write_origin: DatapathFlagsWriteOrigin,
     #[cfg(test)]
     datapath_flags_write_trace: Vec<DatapathFlagsWriteTrace>,
+    #[cfg(test)]
+    pub datapath_observation_fixture: Option<super::DatapathObservation>,
 }
 
 impl MockEbpfBackend {
@@ -379,6 +386,14 @@ impl MockEbpfBackend {
 
 #[async_trait]
 impl EbpfBackend for MockEbpfBackend {
+    fn observe_datapath(&self) -> super::DatapathObservation {
+        #[cfg(test)]
+        if let Some(observation) = &self.datapath_observation_fixture {
+            return observation.clone();
+        }
+        super::DatapathObservation::unknown(super::DatapathKind::Mock)
+    }
+
     fn inject_routing_fault(
         &mut self,
         phase: RoutingPushPhase,
@@ -441,12 +456,36 @@ impl EbpfBackend for MockEbpfBackend {
     }
     fn publish_listener_sockets(
         &mut self,
-        _tcp4_fd: std::os::fd::RawFd,
-        _tcp6_fd: std::os::fd::RawFd,
-        _udp4_fds: &[std::os::fd::RawFd],
-        _udp6_fds: &[std::os::fd::RawFd],
+        tcp4_fd: std::os::fd::RawFd,
+        tcp6_fd: std::os::fd::RawFd,
+        udp4_fds: &[std::os::fd::RawFd],
+        udp6_fds: &[std::os::fd::RawFd],
     ) -> anyhow::Result<()> {
+        self.listener_socket_slots.insert(0, tcp4_fd);
+        self.listener_socket_slots.insert(1, tcp6_fd);
+        for (base, fds) in [(2, udp4_fds), (6, udp6_fds)] {
+            for (offset, fd) in fds.iter().enumerate() {
+                self.listener_socket_slots.insert(base + offset as u32, *fd);
+            }
+        }
         self.listener_sockets_published = true;
+        Ok(())
+    }
+
+    fn clear_listener_sockets(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.datapath_ready,
+            "datapath admission must be closed before clearing listeners"
+        );
+        self.listener_sockets_published = false;
+        for key in 0..10 {
+            #[cfg(test)]
+            if self.listener_clear_fault_at == Some(key) {
+                self.listener_clear_fault_at = None;
+                anyhow::bail!("injected listener clear failure");
+            }
+            self.listener_socket_slots.remove(&key);
+        }
         Ok(())
     }
 
@@ -1097,6 +1136,11 @@ impl EbpfBackend for MockEbpfBackend {
         _role: super::IfaceRole,
         _single_homed: bool,
     ) -> anyhow::Result<super::DynamicHooks> {
+        #[cfg(test)]
+        anyhow::ensure!(
+            !self.dynamic_attach_fault,
+            "injected dynamic attach failure"
+        );
         self.dynamic_attach_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(super::DynamicHooks {
@@ -1113,6 +1157,7 @@ impl EbpfBackend for MockEbpfBackend {
     async fn cleanup(&mut self) -> anyhow::Result<()> {
         self.datapath_ready = false;
         self.listener_sockets_published = false;
+        self.listener_socket_slots.clear();
         self.routing_generation = None;
         self.descriptor = RoutingPolicyDescriptor::default();
         self.tcp_conn_states.clear();
@@ -1233,6 +1278,35 @@ mod tests {
         assert!(backend.datapath_ready);
         backend.set_datapath_ready(false).unwrap();
         assert!(!backend.datapath_ready);
+    }
+
+    #[test]
+    fn listener_clear_rejects_live_admission_and_fences_partial_failure() {
+        let mut backend = MockEbpfBackend::new();
+        backend
+            .publish_listener_sockets(10, 11, &[12, 13, 14, 15], &[16, 17, 18, 19])
+            .unwrap();
+        backend.set_datapath_ready(true).unwrap();
+        assert!(backend.clear_listener_sockets().is_err());
+        assert!(backend.listener_sockets_published);
+        assert_eq!(backend.listener_socket_slots.len(), 10);
+        backend.set_datapath_ready(false).unwrap();
+        backend.listener_clear_fault_at = Some(4);
+        assert!(backend.clear_listener_sockets().is_err());
+        assert!(!backend.listener_sockets_published);
+        assert!(!backend.datapath_ready);
+        assert!(!backend.listener_socket_slots.contains_key(&3));
+        assert_eq!(backend.listener_socket_slots.get(&4), Some(&14));
+        assert!(backend.set_datapath_ready(true).is_err());
+        backend.clear_listener_sockets().unwrap();
+        assert!(backend.listener_socket_slots.is_empty());
+        assert!(backend.set_datapath_ready(true).is_err());
+        backend
+            .publish_listener_sockets(20, 21, &[22, 23, 24, 25], &[])
+            .unwrap();
+        assert_eq!(backend.listener_socket_slots.len(), 6);
+        assert!(!backend.listener_socket_slots.contains_key(&6));
+        backend.set_datapath_ready(true).unwrap();
     }
 
     fn decision_test_key() -> TuplesKey {

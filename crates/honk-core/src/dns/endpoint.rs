@@ -123,7 +123,9 @@ impl DnsEndpoint {
         } else {
             let ips = honk_outbound::bootstrap::resolve_with(bootstrap_resolver, &self.host)
                 .await
-                .map_err(|e| anyhow::anyhow!("bootstrap resolve '{}': {}", self.host, e))?;
+                .map_err(|error| {
+                    anyhow::Error::new(error).context(format!("bootstrap resolve '{}'", self.host))
+                })?;
             if ips.is_empty() {
                 anyhow::bail!("bootstrap resolve '{}' returned no addresses", self.host);
             }

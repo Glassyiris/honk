@@ -69,14 +69,14 @@ impl ControlPlaneHandle {
         &self,
         domain: &str,
         expected: std::net::IpAddr,
-        source_ip: std::net::IpAddr,
+        source: std::net::SocketAddr,
     ) -> RealityOutcome {
         let dns_timeout = std::time::Duration::from_millis(
             self.config.read().await.global.dns_resolve_timeout_ms,
         );
         match tokio::time::timeout(
             dns_timeout,
-            self.dns_resolver.resolve_for_source(domain, source_ip),
+            self.dns_resolver.resolve_for_source(domain, source),
         )
         .await
         {
@@ -118,7 +118,7 @@ impl ControlPlaneHandle {
         dial_mode: DialMode,
         domain: Option<String>,
         original_dst: std::net::IpAddr,
-        client_addr: std::net::IpAddr,
+        client_addr: std::net::SocketAddr,
     ) -> (Option<String>, bool, &'static str) {
         match (dial_mode, domain) {
             (DialMode::Domain, Some(domain)) => {
@@ -217,6 +217,8 @@ impl ControlPlaneHandle {
                     .filter(|native| native.record_flows)
                     .map(|_| crate::native_api::observation::NativeRoute {
                         generation: None,
+                        rule_id: None,
+                        rule_expression: None,
                         evaluation_id: uuid::Uuid::new_v4().to_string(),
                         plane: "kernel",
                         input: None,
@@ -248,6 +250,8 @@ impl ControlPlaneHandle {
                 let generation = self.diagnostics.read().generation;
                 native_route = Some(crate::native_api::observation::NativeRoute {
                     generation: Some(generation),
+                    rule_id: None,
+                    rule_expression: None,
                     evaluation_id: uuid::Uuid::new_v4().to_string(),
                     plane: "userspace",
                     input: Some(serde_json::json!({
@@ -260,7 +264,32 @@ impl ControlPlaneHandle {
                     })),
                 });
             }
-            match router.route_full(&routing_conn_info) {
+            let matched = router.route_full(&routing_conn_info);
+            #[cfg(feature = "native-api")]
+            if let Some(capture) = native_route.as_mut() {
+                let instance = &self
+                    .native
+                    .as_ref()
+                    .expect("native route owner")
+                    .instance_id;
+                capture.rule_id = Some(crate::native_api::routing::rule_id(
+                    instance,
+                    capture.generation.expect("userspace generation"),
+                    matched.as_ref().map(|route| route.rule_id),
+                ));
+                capture.rule_expression = Some(match &matched {
+                    Some(route) => router
+                        .compiled_routes()
+                        .iter()
+                        .find(|compiled| compiled.id == route.rule_id)
+                        .map(|compiled| {
+                            crate::routing::native::rule_expression(&compiled.conditions)
+                        })
+                        .expect("matched compiled rule"),
+                    None => "fallback".to_owned(),
+                });
+            }
+            match matched {
                 Some(route) => (
                     route.outbound_name.to_string(),
                     route.must,
@@ -289,6 +318,8 @@ impl ControlPlaneHandle {
                         #[cfg(feature = "native-api")]
                         if let Some(native_route) = native_route.as_mut() {
                             native_route.generation = None;
+                            native_route.rule_id = None;
+                            native_route.rule_expression = None;
                             native_route.plane = "kernel";
                             native_route.input = None;
                         }

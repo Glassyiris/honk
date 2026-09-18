@@ -13,14 +13,12 @@ use honk_config::node::{Group, Node};
 use honk_config::types::NodeProtocol;
 use honk_core::cachedb::CacheDb;
 use honk_core::clash_api::{self, ClashState};
-use honk_core::connection_tracker::{ConnectionEntry, ConnectionTracker};
+use honk_core::connection_tracker::ConnectionEntry;
 use honk_core::dns::cache::DnsCache;
 use honk_core::dns::forwarder::{DnsForwarder, DnsUpstreamPool, build_dns_query};
 use honk_core::dns::routing::DnsRouter;
-use honk_core::mode::{DatapathFlagsHandle, ModeState};
-use honk_core::stats::StatsManager;
-use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
-use honk_outbound::group::GroupManager;
+use honk_core::mode::ModeState;
+use honk_outbound::alive::{IpVersion, ProbeDomain};
 use honk_outbound::proxy::ProxyRegistry;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -66,7 +64,14 @@ struct TestApp {
     db_path: std::path::PathBuf,
     /// Every `set_datapath_flags` value the mock backend received.
     ebpf_datapath_flags_writes: std::sync::Arc<parking_lot::Mutex<Vec<u32>>>,
+    control_task: tokio::task::JoinHandle<anyhow::Result<()>>,
     _tmp: tempfile::TempDir,
+}
+
+impl Drop for TestApp {
+    fn drop(&mut self) {
+        self.control_task.abort();
+    }
 }
 
 impl TestApp {
@@ -125,7 +130,7 @@ async fn spawn_app(secret: &str, external_ui: &str) -> TestApp {
     spawn_app_with_config(test_config(), secret, external_ui).await
 }
 
-async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) -> TestApp {
+async fn spawn_app_with_config(mut config: Config, secret: &str, external_ui: &str) -> TestApp {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("cache.db");
     let cache_cfg = CacheFileConfig {
@@ -133,32 +138,16 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         path: db_path.to_str().unwrap().to_string(),
         ..Default::default()
     };
-    let db = Arc::new(CacheDb::open(&cache_cfg).expect("cache.db opens"));
-
-    let alive_set = Arc::new(AliveDialerSet::new());
-    let group_manager =
-        GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive_set.clone()));
-    // Wire the same persistence the control plane installs in production.
-    {
-        let db_cb = db.clone();
-        group_manager.set_persist_callback(Some(Arc::new(move |group, node| {
-            db_cb.save_selector_choice(group, node);
-        })));
-    }
-    let group_manager = group_manager.into_shared();
-
+    config.experimental.cache_file = cache_cfg;
+    config.global.nfqueue_enable = false;
     let (log_layer, log_handle) = clash_api::logs::layer();
     let log_dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(log_layer));
     let dns_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
-    let dns_service = honk_core::dns::DnsService::with_forwarder(Arc::new(test_dns_forwarder(
+    let forwarder = Arc::new(test_dns_forwarder(
         dns_cache,
         a_record_response([93, 184, 216, 34], 300),
-    )));
-    let stats = Arc::new(StatsManager::new());
-    let connection_tracker = Arc::new(ConnectionTracker::new());
-    let runtime_registry = honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes)
-        .unwrap()
-        .into_shared();
+    ));
+    let resolver = honk_core::dns::DnsResolver::new(&config.dns).unwrap();
     let traffic_router =
         honk_core::routing::Router::new(&config.routing.rules, &config.routing.default_outbound)
             .unwrap();
@@ -166,33 +155,45 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
     let mut mock_ebpf = honk_core::ebpf::mock::MockEbpfBackend::new();
     mock_ebpf.datapath_flags_writes = ebpf_datapath_flags_writes.clone();
     let mode_state = Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "proxy")));
-    let ebpf: Arc<tokio::sync::RwLock<Box<dyn honk_core::ebpf::EbpfBackend>>> =
-        Arc::new(tokio::sync::RwLock::new(Box::new(mock_ebpf)));
-    let datapath_flags =
-        DatapathFlagsHandle::new(ebpf, Arc::clone(&mode_state), Some(Arc::clone(&db)));
+    let mut control = honk_core::control::ControlPlane::new(
+        config,
+        Box::new(mock_ebpf),
+        traffic_router,
+        Arc::new(ProxyRegistry::default_resolver().unwrap()),
+        resolver,
+        forwarder,
+    )
+    .unwrap();
+    control.init_cache_db(None).await;
+    control.set_mode_state(Arc::clone(&mode_state));
+    control.start_datapath_flags_coordinator().unwrap();
+    let datapath_flags = control.datapath_flags_handle().unwrap();
     datapath_flags.initialize(false, false).await.unwrap();
+    let stats = control.stats_handle();
+    let connection_tracker = control.connection_tracker();
     let state = Arc::new(ClashState {
-        config: Arc::new(tokio::sync::RwLock::new(Arc::new(config))),
-        stats: stats.clone(),
-        alive_set,
-        group_manager,
-        cache_db: Some(db),
-        connection_tracker: connection_tracker.clone(),
-        proxy_registry: Arc::new(ProxyRegistry::default_resolver().unwrap()),
-        runtime_registry,
+        config: control.config_handle(),
+        stats: Arc::clone(&stats),
+        alive_set: control.alive_set(),
+        group_manager: control.group_manager(),
+        cache_db: control.cache_db(),
+        connection_tracker: Arc::clone(&connection_tracker),
+        proxy_registry: control.proxy_registry(),
+        runtime_registry: control.runtime_registry(),
         mode_state,
         datapath_flags,
-        diagnostics: Arc::new(parking_lot::RwLock::new(
-            honk_core::config_diagnostics::ActiveDiagnostics::default(),
-        )),
+        control: Some(control.control_client()),
+        ui_download: control.ui_download_handle(),
+        diagnostics: control.diagnostics_handle(),
         secret: secret.to_string(),
         external_ui: external_ui.to_string(),
-        router: Arc::new(tokio::sync::RwLock::new(traffic_router)),
+        router: control.traffic_router(),
         log_handle,
-        dns_service,
-        connection_pool: Arc::new(honk_core::pool::ConnectionPool::new()),
+        dns_service: control.dns_service(),
+        connection_pool: control.connection_pool(),
         stream_samplers: Arc::new(clash_api::StreamSamplers::new()),
     });
+    let control_task = tokio::spawn(async move { control.serve_control_commands().await });
 
     let app = clash_api::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -211,6 +212,7 @@ async fn spawn_app_with_config(config: Config, secret: &str, external_ui: &str) 
         log_dispatch,
         db_path,
         ebpf_datapath_flags_writes,
+        control_task,
         _tmp: tmp,
     }
 }
@@ -319,6 +321,7 @@ async fn test_auth_secret_enforced() {
 async fn test_rules_aggregate_simple_and_preserve_complex() {
     let config = honk_config::parser::parse_dae_config(
         r#"
+group { proxy {} }
 routing {
     sip(10.10.10.24/32,
         10.10.10.25/32
@@ -474,10 +477,6 @@ async fn test_proxies_structure_and_selector_switch() {
         .unwrap();
     assert_eq!(body["proxies"]["proxy"]["now"], "node-b");
 
-    // The persist callback must have written cache.db.
-    let db = app.state.cache_db.as_ref().unwrap();
-    assert_eq!(db.load_selector_choice("proxy").as_deref(), Some("node-b"));
-
     // Unknown member → 400.
     let resp = client
         .put(app.url("/proxies/proxy"))
@@ -587,7 +586,12 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
     let missing_default = fixture.replacen("    log_level: info\n", "", 1);
     assert!(!score_stats_fixture_matches(&missing_default));
 
-    let config = honk_config::parser::parse_dae_config(fixture).unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let config = honk_config::parser::parse_dae_config(&fixture.replace(
+        "__HONK_SCORE_QA_DATA_DIR__",
+        data_dir.path().to_str().unwrap(),
+    ))
+    .unwrap();
     assert_eq!(
         config.experimental.clash_api.external_controller,
         "127.0.0.1:19090"
@@ -598,7 +602,6 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
     assert_eq!(config.global.log_level, "info");
     assert!(!config.global.auto_config_kernel_parameter);
     assert!(!config.global.nfqueue_enable);
-    assert_eq!(config.global.data_dir, "__HONK_SCORE_QA_DATA_DIR__");
     assert_eq!(config.routing.default_outbound, "direct");
     assert_eq!(
         config
@@ -853,8 +856,6 @@ async fn test_put_and_patch_without_content_type() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
-    let db = app.state.cache_db.as_ref().unwrap();
-    assert_eq!(db.load_selector_choice("proxy").as_deref(), Some("node-b"));
 
     let resp = client
         .patch(app.url("/configs"))
@@ -944,9 +945,7 @@ async fn test_configs_additive_safe_diagnostics_snapshot() {
     );
 }
 
-/// Parent selector containing a sub-group: the sub-group tag appears in
-/// `all`, is a valid PUT target (persisted + restored on "restart"), and
-/// the selection chain resolves through it to the leaf.
+/// Nested Selector membership is layer-local; reachable leaves are not direct members.
 #[tokio::test]
 async fn test_nested_group_selector_via_api() {
     let (a, b, c) = (
@@ -1020,35 +1019,6 @@ async fn test_nested_group_selector_via_api() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
-
-    // The persist callback wrote the sub-group tag to cache.db.
-    let db = app.state.cache_db.as_ref().unwrap();
-    assert_eq!(db.load_selector_choice("parent").as_deref(), Some("sub"));
-
-    // "Restart": rebuild the manager from the same config and restore the
-    // persisted choices exactly like ControlPlane::init_cache_db does.
-    let restored = GroupManager::with_alive_set(
-        &config.groups,
-        &config.nodes,
-        Some(app.state.alive_set.clone()),
-    );
-    for group in &config.groups {
-        if group.policy == honk_config::group::GroupPolicy::Selector
-            && let Some(choice) = db.load_selector_choice(&group.name)
-        {
-            restored.set_selector_choice(&group.name, &choice);
-        }
-    }
-    assert_eq!(
-        restored.get_selector_choice("parent").as_deref(),
-        Some("sub")
-    );
-    // The restored choice drives selection: parent → sub → sub's leaf.
-    assert_eq!(restored.select_node("parent").unwrap().name, "node-b");
-    assert_eq!(
-        restored.selection_chain("parent"),
-        vec!["parent", "sub", "node-b"]
-    );
 }
 
 #[tokio::test]
@@ -1272,13 +1242,13 @@ async fn test_connections_snapshot_and_delete() {
     assert_eq!(body["uploadTotal"], 100);
     assert_eq!(body["downloadTotal"], 200);
 
-    // DELETE the single connection.
+    // Metadata without an owning transport cannot claim successful closure.
     let resp = client
         .delete(app.url(&format!("/connections/{}", id)))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 409);
     let body: serde_json::Value = client
         .get(app.url("/connections"))
         .send()
@@ -1288,8 +1258,8 @@ async fn test_connections_snapshot_and_delete() {
         .await
         .unwrap();
     let remaining = body["connections"].as_array().unwrap();
-    assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0]["id"], "conn-2");
+    assert_eq!(remaining.len(), 2);
+    assert!(remaining.iter().any(|row| row["id"] == id));
 }
 
 /// Plaintext HTTP server answering 204 to everything.
@@ -1493,6 +1463,26 @@ async fn test_node_delay_failure_is_503() {
 
 #[tokio::test]
 async fn node_delay_resolver_refusal_does_not_demote_node() {
+    const ISOLATED: &str = "HONK_CLASH_REFUSAL_ISOLATED";
+    if std::env::var_os(ISOLATED).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "node_delay_resolver_refusal_does_not_demote_node",
+                "--nocapture",
+            ])
+            .env(ISOLATED, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let app = spawn_app("", "").await;
     honk_outbound::urltest::set_urltest_resolver(Arc::new(|host, port| {
         Box::pin(async move {
             if host == "packet-refusal.invalid" {
@@ -1503,7 +1493,6 @@ async fn node_delay_resolver_refusal_does_not_demote_node() {
                 .collect())
         })
     }));
-    let app = spawn_app("", "").await;
     app.state.alive_set.record_probe_latency(
         make_node("node-a").id,
         ProbeDomain::Tcp,
@@ -1947,6 +1936,8 @@ async fn test_dns_query_upstream_and_nxdomain() {
         runtime_registry: app.state.runtime_registry.clone(),
         mode_state: app.state.mode_state.clone(),
         datapath_flags: app.state.datapath_flags.clone(),
+        control: app.state.control.clone(),
+        ui_download: app.state.ui_download.clone(),
         diagnostics: app.state.diagnostics.clone(),
         secret: String::new(),
         external_ui: String::new(),

@@ -13,8 +13,11 @@
 //!
 //! Shared by clash delay measurements and periodic HTTP health checks; their
 //! wrappers remain responsible for alive-state updates.
+//!
+//! Native probes use a caller-owned absolute deadline and cancellation signal;
+//! cold probes include connection setup and do not publish legacy health/Score feedback.
 
-use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain, ProbeMeasurement};
+use crate::alive::{AliveDialerSet, IpVersion, ProbeCancellation, ProbeDomain, ProbeMeasurement};
 use crate::group::{
     GroupManager, ScoreFeedback, ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreTarget,
     SelectionNetwork,
@@ -177,7 +180,15 @@ pub async fn urltest_node(
 ) -> anyhow::Result<Duration> {
     let timeout = urltest_timeout(timeout);
     let request = http_probe_request(url, "")?;
-    urltest_request_impl(runtime, handler, &request, timeout, None).await
+    urltest_request_impl(
+        runtime,
+        handler,
+        &request,
+        timeout,
+        None,
+        &ProbeCancellation::default(),
+    )
+    .await
 }
 
 async fn urltest_request_impl(
@@ -186,6 +197,7 @@ async fn urltest_request_impl(
     request: &http::Request<()>,
     timeout: Duration,
     group_manager: Option<&GroupManager>,
+    cancel: &ProbeCancellation,
 ) -> anyhow::Result<Duration> {
     validate_runtime(runtime)?;
     let node = runtime.node.as_ref();
@@ -193,7 +205,9 @@ async fn urltest_request_impl(
     let host = target.host();
     let port = target.port();
     let direct = node.protocol() == honk_config::types::NodeProtocol::Direct;
-    let addr = resolve_urltest_address(host, port, direct).await?;
+    let addr = cancel
+        .scope_resolution(resolve_urltest_address(host, port, direct))
+        .await?;
     let feedback = group_manager.and_then(|manager| {
         let family = if addr.is_ipv6() {
             IpVersion::V6
@@ -252,9 +266,10 @@ async fn resolve_urltest_address(
             .map(|ip| SocketAddr::new(ip, port))
             .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"));
     }
-    tokio::net::lookup_host((host, port))
+    crate::bootstrap::lookup_host(host, port)
         .await
         .with_context(|| format!("failed to resolve '{host}:{port}'"))?
+        .into_iter()
         .next()
         .ok_or_else(|| anyhow!("no address resolved for '{host}:{port}'"))
 }
@@ -336,6 +351,7 @@ pub async fn warm_http_probe(
 
 /// Reuse an already-warm generation runtime. Cold reusable transports warm a
 /// throwaway runtime before measurement so a group scan retains no new state.
+#[allow(clippy::too_many_arguments)]
 pub async fn urltest_node_in_generation_with_feedback(
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
     node: &Node,
@@ -344,6 +360,7 @@ pub async fn urltest_node_in_generation_with_feedback(
     url: &str,
     timeout: Duration,
     group_manager: &GroupManager,
+    cancel: ProbeCancellation,
 ) -> anyhow::Result<Duration> {
     urltest_node_in_generation_impl(
         generation,
@@ -353,10 +370,12 @@ pub async fn urltest_node_in_generation_with_feedback(
         url,
         timeout,
         Some(group_manager),
+        cancel,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn urltest_node_in_generation_impl(
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
     node: &Node,
@@ -365,7 +384,11 @@ async fn urltest_node_in_generation_impl(
     url: &str,
     timeout: Duration,
     group_manager: Option<&GroupManager>,
+    cancel: ProbeCancellation,
 ) -> anyhow::Result<Duration> {
+    if cancel.is_cancelled() {
+        return Err(crate::proxy::PacketRejection::Cancelled.into());
+    }
     let timeout = urltest_timeout(timeout);
     let request = http_probe_request(url, "")?;
     let (runtime, guard) =
@@ -387,14 +410,18 @@ async fn urltest_node_in_generation_impl(
                 .map(|feedback| feedback.streak_neutral())
         })
     };
-    let result = generation
-        .scope_dials(async {
+    let result = cancel
+        .run(runtime.scope_tasks(generation.scope_dials(Box::pin(async {
             warm_http_probe(&runtime, warmable, timeout, timeout, warm_feedback).await?;
-            urltest_request_impl(&runtime, handler, &request, timeout, group_manager).await
-        })
-        .await;
+            urltest_request_impl(&runtime, handler, &request, timeout, group_manager, &cancel).await
+        }))))
+        .await
+        .unwrap_or_else(|| Err(crate::proxy::PacketRejection::Cancelled.into()));
     if let Some(guard) = guard {
         guard.close().await;
+        if runtime.tasks_failed() {
+            cancel.report_cleanup_failure();
+        }
     }
     result
 }
@@ -493,6 +520,139 @@ pub async fn measure_http_probe(
     }
 }
 
+/// Probe one pinned address without resolving or forwarding the request hostname.
+///
+/// Cold probes time dial, TLS and one configured request; warm probes time the
+/// configured request after a validated HEAD. Host/SNI come from the request URI.
+/// The caller owns runtime teardown. HTTP/2 is driven inline, so returning or
+/// dropping this future releases its connection without a detached driver task.
+#[cfg(feature = "native-api")]
+pub async fn native_http_probe(
+    runtime: &Arc<crate::runtime::NodeRuntime>,
+    handler: &dyn TcpOutbound,
+    request: &http::Request<()>,
+    addr: SocketAddr,
+    cold: bool,
+    deadline: tokio::time::Instant,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<ProbeMeasurement> {
+    let probe = async {
+        validate_runtime(runtime)?;
+        let target = request_target(request)?;
+        let request = build_http_probe_request(&target, request.method().clone())?;
+        let start = Instant::now();
+        let proxy = crate::runtime::capture_dial_admission()
+            .scope(handler.dial_runtime(
+                Arc::clone(runtime),
+                addr,
+                None,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            ))
+            .await?;
+        let mut measurement = if target.is_https() {
+            let tls = https_connector()?
+                .connect(target.host(), proxy.stream)
+                .await
+                .context("HTTP probe TLS handshake failed")?;
+            if tls.ssl().selected_alpn_protocol() == Some(b"h2") {
+                native_exchange_http2(tls, &request, cold, deadline).await?
+            } else {
+                native_exchange_http1(tls, &request, cold, deadline).await?
+            }
+        } else {
+            native_exchange_http1(proxy.stream, &request, cold, deadline).await?
+        };
+        if cold {
+            measurement.latency = start.elapsed();
+        }
+        Ok(measurement)
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.wait_for(|cancelled| *cancelled) => {
+            Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "HTTP probe cancelled").into())
+        }
+        _ = tokio::time::sleep_until(deadline) => {
+            Err(phase_timeout("HTTP probe deadline expired"))
+        }
+        result = runtime.scope_tasks(probe) => result,
+    }
+}
+
+#[cfg(feature = "native-api")]
+async fn native_exchange_http1<S>(
+    mut stream: S,
+    request: &http::Request<()>,
+    cold: bool,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<ProbeMeasurement>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if !cold {
+        return exchange_http1(&mut stream, request, &None, timeout).await;
+    }
+    let (measurement, status) = http1_round(
+        &mut BufReader::new(stream),
+        request,
+        request.method(),
+        true,
+        &None,
+        false,
+        timeout,
+    )
+    .await
+    .map_err(RoundError::into_error)?;
+    validate_status_code(status)?;
+    Ok(measurement)
+}
+
+#[cfg(feature = "native-api")]
+async fn native_exchange_http2<S>(
+    stream: S,
+    request: &http::Request<()>,
+    cold: bool,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<ProbeMeasurement>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut sender, connection) = h2::client::Builder::new()
+        .enable_push(false)
+        .max_local_error_reset_streams(Some(0))
+        .reset_stream_duration(deadline.saturating_duration_since(tokio::time::Instant::now()))
+        .max_header_list_size(MAX_HTTP_RESPONSE_HEAD as u32)
+        .handshake(stream)
+        .await
+        .context("HTTP/2 probe startup failed")?;
+    let rounds = async {
+        let warm = if cold {
+            None
+        } else {
+            let (measurement, status) =
+                h2_round(&mut sender, request, http::Method::HEAD, &None, false)
+                    .await
+                    .map_err(RoundError::into_error)?;
+            validate_status_code(status)?;
+            Some(measurement)
+        };
+        match h2_round(&mut sender, request, request.method().clone(), &None, false).await {
+            Ok((measurement, status)) => {
+                validate_status_code(status)?;
+                Ok(measurement)
+            }
+            Err(RoundError::Transport(error)) => warm.ok_or(error),
+            Err(RoundError::Invalid(error)) => Err(error),
+        }
+    };
+    tokio::pin!(rounds);
+    tokio::select! {
+        result = &mut rounds => result,
+        _ = connection => rounds.await,
+    }
+}
+
 /// BoringSSL connector with webpki root verification for HTTP probes.
 /// Built once and reused across measurements (it never changes at runtime).
 /// Offers `h2,http/1.1`; the exchange dispatches on the negotiated ALPN.
@@ -515,25 +675,6 @@ impl RoundError {
     fn into_error(self) -> anyhow::Error {
         match self {
             Self::Transport(error) | Self::Invalid(error) => error,
-        }
-    }
-}
-
-struct H2Driver(Option<tokio::task::JoinHandle<()>>);
-
-impl H2Driver {
-    async fn stop(mut self) {
-        if let Some(driver) = self.0.take() {
-            driver.abort();
-            let _ = driver.await;
-        }
-    }
-}
-
-impl Drop for H2Driver {
-    fn drop(&mut self) {
-        if let Some(driver) = self.0.take() {
-            driver.abort();
         }
     }
 }
@@ -604,8 +745,8 @@ async fn h2_round(
     ))
 }
 
-/// Two requests over a fresh HTTP/2 connection. The connection driver is
-/// owned by this future and aborted on both ordinary return and cancellation.
+/// Two requests over a fresh HTTP/2 connection, driven inline so cancellation
+/// drops the actual connection instead of detaching an aborted driver.
 async fn exchange_http2<S>(
     stream: S,
     request: &http::Request<()>,
@@ -619,10 +760,7 @@ where
         timeout,
         h2::client::Builder::new()
             .enable_push(false)
-            // Fail this disposable connection on its first local protocol rejection,
-            // before a remote reset can overwrite the error.
             .max_local_error_reset_streams(Some(0))
-            // Cover both request budgets so late warm-stream frames stay ignorable.
             .reset_stream_duration(timeout.saturating_mul(2))
             .max_header_list_size(MAX_HTTP_RESPONSE_HEAD as u32)
             .handshake(stream),
@@ -630,10 +768,7 @@ where
     .await
     .map_err(|_| phase_timeout("HTTP/2 probe startup timed out"))?
     .map_err(|error| anyhow::Error::new(error).context("HTTP/2 probe startup failed"))?;
-    let driver = H2Driver(Some(tokio::spawn(async move {
-        let _ = connection.await;
-    })));
-    let result = async {
+    let rounds = async {
         let (warm, status) = match tokio::time::timeout(
             timeout,
             h2_round(&mut sender, request, http::Method::HEAD, reporter, true),
@@ -663,10 +798,12 @@ where
             Ok(Err(RoundError::Transport(_))) | Err(_) => Ok(warm),
             Ok(Err(RoundError::Invalid(error))) => Err(error),
         }
+    };
+    tokio::pin!(rounds);
+    tokio::select! {
+        result = &mut rounds => result,
+        _ = connection => rounds.await,
     }
-    .await;
-    driver.stop().await;
-    result
 }
 
 fn http1_wire_request(
@@ -851,6 +988,7 @@ where
 /// consecutive ordinary failure adds a synthetic penalty and demotes the node.
 ///
 /// Returns one `(node_name, result)` entry per member, in member order.
+#[allow(clippy::too_many_arguments)]
 pub async fn urltest_group_with_feedback(
     members: &[Node],
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
@@ -859,6 +997,7 @@ pub async fn urltest_group_with_feedback(
     url: &str,
     timeout: Duration,
     group_manager: Arc<GroupManager>,
+    cancel: ProbeCancellation,
 ) -> Vec<(String, anyhow::Result<Duration>)> {
     urltest_group_impl(
         members,
@@ -868,10 +1007,12 @@ pub async fn urltest_group_with_feedback(
         url,
         timeout,
         Some(group_manager),
+        cancel,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn urltest_group_impl(
     members: &[Node],
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
@@ -880,6 +1021,7 @@ async fn urltest_group_impl(
     url: &str,
     timeout: Duration,
     group_manager: Option<Arc<GroupManager>>,
+    cancel: ProbeCancellation,
 ) -> Vec<(String, anyhow::Result<Duration>)> {
     let timeout = urltest_timeout(timeout);
     let semaphore = Arc::new(tokio::sync::Semaphore::new(URLTEST_MAX_CONCURRENT));
@@ -893,8 +1035,14 @@ async fn urltest_group_impl(
         let url = url.clone();
         let permit = semaphore.clone();
         let group_manager = group_manager.clone();
+        let cancel = cancel.clone();
         join_set.spawn(async move {
-            let _permit = permit.acquire_owned().await;
+            let Some(_permit) = cancel.run(permit.acquire_owned()).await else {
+                return (
+                    node.name.clone(),
+                    Err(crate::proxy::PacketRejection::Cancelled.into()),
+                );
+            };
             let result = match registry.find(node.protocol()) {
                 Some(entry) => {
                     urltest_node_in_generation_impl(
@@ -905,6 +1053,7 @@ async fn urltest_group_impl(
                         &url,
                         timeout,
                         group_manager.as_deref(),
+                        cancel,
                     )
                     .await
                 }
@@ -929,6 +1078,8 @@ async fn urltest_group_impl(
     while let Some(res) = join_set.join_next().await {
         if let Ok(pair) = res {
             results.push(pair);
+        } else {
+            cancel.report_cleanup_failure();
         }
     }
     let order: std::collections::HashMap<&str, usize> = members

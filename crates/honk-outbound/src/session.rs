@@ -341,6 +341,7 @@ pub struct SessionPool<S: ManagedSession + 'static> {
     shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
     capacity_notify: Arc<Notify>,
     dial_admission: RwLock<Option<crate::runtime::CapturedDialAdmission>>,
+    task_scope: crate::runtime::TaskScope,
 }
 
 impl<S: ManagedSession + 'static> std::fmt::Debug for SessionPool<S> {
@@ -362,6 +363,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
             shutdown_tx: Arc::new(shutdown_tx),
             capacity_notify: Arc::new(Notify::new()),
             dial_admission: RwLock::new(None),
+            task_scope: crate::runtime::TaskScope::capture(),
         }
     }
 
@@ -574,9 +576,11 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                     let capacity_notify = Arc::clone(&self.capacity_notify);
                     let config = self.config.clone();
                     let mut task_shutdown_rx = self.shutdown_tx.subscribe();
-                    let dial_scope = crate::runtime::capture_dial_scope();
+                    let dial_scope = self
+                        .task_scope
+                        .sync_scope(crate::runtime::capture_dial_scope);
                     tracing::debug!(id, "pool dial task spawned");
-                    tokio::spawn(dial_scope.scope(async move {
+                    let _ = self.task_scope.spawn(dial_scope.scope(async move {
                         let mut guard = DialGuard {
                             pool: Arc::clone(&task_pool),
                             inflight_id: id,

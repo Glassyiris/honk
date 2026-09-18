@@ -388,12 +388,15 @@ impl VmessHandler {
         let header_wire = Self::seal_request_header(&cmd_key, &auth_id, &conn_nonce, &plain);
 
         let (client_half, server_half) = tokio::io::duplex(65536);
-        let relay = tokio::spawn(vmess_relay(stream, server_half, header_wire, session));
+        let relay = crate::runtime::spawn_owned(async move {
+            let _ = vmess_relay(stream, server_half, header_wire, session).await;
+        })
+        .ok_or(crate::proxy::PacketRejection::Cancelled)?;
 
         Ok(ProxyStream {
             stream: Box::new(VmessStream {
                 inner: client_half,
-                relay: relay.abort_handle(),
+                relay,
             }),
             target_addr: target,
             target_domain: target_domain.map(|s| s.to_string()),

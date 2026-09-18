@@ -2,6 +2,7 @@
 
 mod bootstrap;
 mod cache;
+pub(crate) mod client;
 mod connection;
 pub mod dns_control;
 mod dns_listener;
@@ -18,6 +19,7 @@ use nfqueue_runtime::{
 };
 #[cfg(feature = "ebpf")]
 use nfqueue_runtime::{NfqueueRuntime, NfqueueRuntimeEvent, wait_nfqueue_event};
+mod lifecycle;
 pub mod packet_sniffer;
 mod preconnect;
 mod probers;
@@ -88,6 +90,7 @@ use tracing::{debug, error, info, trace, warn};
 
 mod commands;
 
+pub use client::ControlClient;
 pub(crate) use commands::{ControlCommand, ReloadOutcome, ReloadReply};
 use connection::*;
 use probers::*;
@@ -118,6 +121,9 @@ type PreDnsPublicationHook = Box<dyn FnOnce(&Arc<GroupManager>) + Send>;
 pub(crate) enum EnginePhase {
     Starting,
     Running,
+    Suspending,
+    Suspended,
+    Resuming,
     Draining,
     Failed,
 }
@@ -161,19 +167,21 @@ pub struct ControlPlane {
     outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
     resource_budget: ResourceBudget,
     concurrency_limit: Arc<tokio::sync::Semaphore>,
+    tcp_admission_target: Arc<std::sync::atomic::AtomicUsize>,
     /// Cold non-DNS UDP initialization budget. Ready endpoints bypass it.
     udp_concurrency_limit: Arc<tokio::sync::Semaphore>,
     /// Background task handles (health check, janitor) for clean shutdown.
     background_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    health_task: Option<tokio::task::JoinHandle<()>>,
     /// The generation-owned UDP warm coordinator. It is deliberately kept
     /// separate from generic background tasks so reload/shutdown can abort
     /// and drain it in the required ownership order.
-    udp_warm_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    udp_warm_task: tokio::sync::Mutex<Option<reload::WarmTask>>,
     /// UDP warm NodeIds survive task replacement so a reload can release
     /// retention that disappeared from the replacement plan.
     udp_warm_ids: Arc<parking_lot::Mutex<std::collections::HashSet<uuid::Uuid>>>,
     /// Generation-owned task that pins every Selector's configured leaf.
-    selector_warm_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    selector_warm_task: tokio::sync::Mutex<Option<reload::WarmTask>>,
     /// Choice changes wake reconciliation immediately; a short periodic pass
     /// repairs sessions lost independently of group changes.
     selector_warm_notify: Arc<tokio::sync::Notify>,
@@ -194,6 +202,12 @@ pub struct ControlPlane {
     phase: Option<tokio::sync::watch::Sender<EnginePhase>>,
     #[cfg(feature = "native-api")]
     native: Option<Arc<crate::native_api::observation::NativeObservation>>,
+    #[cfg(feature = "native-api")]
+    subscriptions: Option<crate::subscription::SubscriptionSupervisorHandle>,
+    #[cfg(feature = "native-api")]
+    shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "clash-api")]
+    ui_download: Arc<tokio::sync::Mutex<Option<crate::clash_api::ui::UiDownloadTask>>>,
     active_routing_plan: Arc<parking_lot::RwLock<Arc<routing_matcher::RoutingPushPlan>>>,
     #[cfg(feature = "reload-bench-counters")]
     reload_slow_path_entries: std::sync::atomic::AtomicU64,
@@ -361,6 +375,30 @@ impl ControlPlane {
 
     pub(crate) fn command_sender(&self) -> mpsc::Sender<ControlCommand> {
         self.command_tx.clone()
+    }
+
+    pub fn control_client(&self) -> ControlClient {
+        ControlClient::new(self.command_sender())
+    }
+
+    #[cfg(feature = "clash-api")]
+    pub fn ui_download_handle(
+        &self,
+    ) -> Arc<tokio::sync::Mutex<Option<crate::clash_api::ui::UiDownloadTask>>> {
+        Arc::clone(&self.ui_download)
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn attach_subscriptions(
+        &mut self,
+        subscriptions: crate::subscription::SubscriptionSupervisorHandle,
+    ) {
+        self.subscriptions = Some(subscriptions);
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn shutdown_intent(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.shutdown_requested)
     }
 
     pub fn is_datapath_healthy(&self) -> bool {

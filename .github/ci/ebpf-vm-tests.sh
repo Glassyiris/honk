@@ -39,3 +39,7 @@ watcher_test=ebpf::real::iface_watch::tests::route_only_change_wakes_network_sub
 test "$("$HONK_CORE_TEST_BIN" "$watcher_test" --exact --ignored --list --format terse)" = "$watcher_test: test"
 "$HONK_CORE_TEST_BIN" "$watcher_test" --exact --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/honk-core-iface-watch.log"
+native_lifecycle_test=control::lifecycle::tests::xudp::suspend_closes_two_shared_xudp_views_and_resume_uses_fresh_carrier
+test "$("$HONK_CORE_TEST_BIN" "$native_lifecycle_test" --exact --ignored --list --format terse)" = "$native_lifecycle_test: test"
+"$HONK_CORE_TEST_BIN" control::lifecycle::tests --ignored --test-threads=1 \
+  2>&1 | tee "$log_dir/honk-core-native-lifecycle.log"

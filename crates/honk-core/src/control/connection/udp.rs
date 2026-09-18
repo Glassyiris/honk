@@ -284,7 +284,7 @@ impl ControlPlaneHandle {
             );
         }
         let (quic_domain, domain_verified, _native_verification) = self
-            .apply_domain_reality_check(dial_mode, quic_domain, original_dst.ip(), client_addr.ip())
+            .apply_domain_reality_check(dial_mode, quic_domain, original_dst.ip(), client_addr)
             .await;
 
         let route_started_at = std::time::Instant::now();
@@ -318,7 +318,7 @@ impl ControlPlaneHandle {
             if let Some(capture) = &native_route {
                 flow.step("route", capture.generation, serde_json::json!({
                     "evaluation_id": capture.evaluation_id, "chain": "traffic", "plane": capture.plane,
-                    "rule_id": null, "rules": [], "outbound": route.outbound, "must": route.must,
+                    "rule_id": capture.rule_id, "rules": [], "outbound": route.outbound, "must": route.must,
                     "mark": route.mark, "input": capture.input, "dns_action": null,
                 }));
             }
@@ -336,7 +336,9 @@ impl ControlPlaneHandle {
         let routed_direct = route.outbound == "direct";
         let routed_mark = route.mark;
         let matched_rule = route.matched_rule;
-        let outbound_name = self.apply_mode_override(route.outbound, route.must).await;
+        let mode_decision = self.apply_mode_override(route.outbound, route.must).await;
+        let outbound_name = mode_decision.name;
+        let mode_constraint = mode_decision.constraint;
         let target_domain = if matches!(
             outbound_name.as_str(),
             "direct" | "block" | "must_rules" | "control_plane_routing"
@@ -348,7 +350,23 @@ impl ControlPlaneHandle {
         let target_is_domain = target_domain.is_some();
         #[cfg(feature = "native-api")]
         if let Some(flow) = native_flow.as_ref() {
-            flow.routed(&outbound_name, None, "unknown");
+            flow.routed(
+                &outbound_name,
+                native_route
+                    .as_ref()
+                    .and_then(|capture| capture.rule_id.as_deref()),
+                native_route
+                    .as_ref()
+                    .and_then(|capture| capture.rule_expression.as_deref()),
+                if native_route
+                    .as_ref()
+                    .is_some_and(|capture| capture.rule_id.is_some())
+                {
+                    "evaluation"
+                } else {
+                    "unknown"
+                },
+            );
             flow.step("dial_mode", native_route.as_ref().and_then(|route| route.generation), serde_json::json!({
                 "configured": dial_mode,
                 "effective_target": match outbound_name.as_str() { "block" => "none", "direct" => "ip", _ => "unknown" },
@@ -419,8 +437,27 @@ impl ControlPlaneHandle {
         };
         #[cfg(feature = "native-api")]
         let mut native_plan = None;
-        let (plan, selection_chains, outbound_kind) = {
+        let (plan, selection_chains, close_group_ids, outbound_kind) = {
             let config = self.config.read().await;
+            #[cfg(feature = "native-api")]
+            let mode_constraint = if mode_decision.group_id.as_ref().is_some_and(|expected| {
+                self.native
+                    .as_ref()
+                    .and_then(|native| {
+                        native
+                            .catalog
+                            .snapshot()
+                            .groups
+                            .get(&outbound_name)
+                            .cloned()
+                    })
+                    .as_ref()
+                    != Some(expected)
+            }) {
+                crate::control::reload::OutboundConstraint::Unavailable
+            } else {
+                mode_constraint
+            };
             #[cfg(feature = "native-api")]
             let native_identity = native_flow
                 .as_ref()
@@ -448,8 +485,35 @@ impl ControlPlaneHandle {
                         None => original_dst.into(),
                     }),
                 },
+                mode_constraint,
             );
             let selection_chains = plan.selection_chains.clone();
+            let close_group_ids: std::collections::HashMap<String, String> =
+                if self.connection_tracker.is_enabled() {
+                    #[cfg(feature = "native-api")]
+                    let catalog = self.native.as_ref().map(|native| native.catalog.snapshot());
+                    selection_chains
+                        .iter()
+                        .flatten()
+                        .filter_map(|name| {
+                            #[cfg(feature = "native-api")]
+                            if let Some(catalog) = &catalog {
+                                return catalog
+                                    .groups
+                                    .get(name)
+                                    .map(|id| (name.clone(), id.clone()));
+                            }
+                            config
+                                .groups
+                                .iter()
+                                .rev()
+                                .find(|group| group.name == *name)
+                                .map(|group| (name.clone(), group.id.to_string()))
+                        })
+                        .collect()
+                } else {
+                    std::collections::HashMap::new()
+                };
             #[cfg(feature = "native-api")]
             if let Some((generation, catalog)) = native_identity {
                 let paths: Vec<_> = plan
@@ -465,7 +529,7 @@ impl ControlPlaneHandle {
                 native_plan = Some(Arc::new((generation, catalog, paths)));
             }
             let kind = crate::stats::OutboundKind::routed(&config, &outbound_name);
-            (plan, selection_chains, kind)
+            (plan, selection_chains, close_group_ids, kind)
         };
         let outbound_tracker = self.stats.outbound_tracker(&outbound_name, outbound_kind);
         // The same accounting identity survives candidate selection and driver publication.
@@ -920,61 +984,6 @@ impl ControlPlaneHandle {
         };
         let endpoint = Arc::new(endpoint);
 
-        let tracker_id = if let Some(conn_id) = self.connection_tracker.register_if_enabled(|| {
-            let id = uuid::Uuid::new_v4().to_string();
-            let (rule, rule_payload) =
-                matched_rule.unwrap_or_else(|| ("Fallback".to_string(), String::new()));
-            let (upload, download) = endpoint.byte_counters();
-            crate::connection_tracker::ConnectionEntry {
-                id,
-                source: client_addr.to_string(),
-                destination: original_dst.to_string(),
-                proxy: node.name.clone(),
-                #[cfg(feature = "native-api")]
-                routed_outbound: self
-                    .connection_tracker
-                    .native_enabled()
-                    .then(|| outbound_name.clone()),
-                #[cfg(feature = "native-api")]
-                native_flow_id: endpoint
-                    .native_flow()
-                    .filter(|flow| !flow.id().is_empty())
-                    .map(|flow| flow.id().to_owned()),
-                rule,
-                rule_payload,
-                chains: connection_chains(selection_chain, &node.name),
-                upload,
-                download,
-                start_time: std::time::Instant::now(),
-                domain: quic_domain.clone(),
-                network: "udp".to_string(),
-                process: handoff.as_ref().and_then(|ho| ho.process_name()),
-                process_path: None,
-            }
-        }) {
-            endpoint.set_tracker(conn_id.clone());
-            #[cfg(feature = "native-api")]
-            if let Some(flow) = endpoint.native_flow() {
-                flow.attach_connection(&conn_id);
-            }
-            if !lease.set_tracker_id(conn_id.clone()) {
-                #[cfg(feature = "native-api")]
-                if let Some(flow) = endpoint.native_flow() {
-                    flow.finish("failed", "initializer_cancelled");
-                }
-                // The generation was cancelled between route selection and
-                // registration. No pool entry owns this tracker, so retire it
-                // directly rather than leaking it.
-                self.connection_tracker.remove(&conn_id);
-                return Err(anyhow::anyhow!(
-                    "UDP initializer generation was cancelled before tracker attachment"
-                ));
-            }
-            Some(conn_id)
-        } else {
-            None
-        };
-
         let queue_rx = match follower_rx {
             // Already taken while collecting a fragmented ClientHello.
             Some(rx) => rx,
@@ -1025,6 +1034,63 @@ impl ControlPlaneHandle {
             return Err(anyhow::anyhow!(
                 "UDP initializer generation was cancelled before ready commit"
             ));
+        }
+        let groups = selection_chain
+            .iter()
+            .take(
+                selection_chain
+                    .len()
+                    .saturating_sub(usize::from(selection_chain.last() == Some(&node.name))),
+            )
+            .filter_map(|name| close_group_ids.get(name).cloned())
+            .collect();
+        let tracker_id = self
+            .udp_pool
+            .register_ready_tracker(
+                client_addr,
+                original_dst,
+                lease.decision_token(),
+                lease.generation(),
+                &endpoint,
+                &self.connection_tracker,
+                groups,
+                || {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let (rule, rule_payload) =
+                        matched_rule.unwrap_or_else(|| ("Fallback".to_string(), String::new()));
+                    let (upload, download) = endpoint.byte_counters();
+                    crate::connection_tracker::ConnectionEntry {
+                        id,
+                        source: client_addr.to_string(),
+                        destination: original_dst.to_string(),
+                        proxy: node.name.clone(),
+                        #[cfg(feature = "native-api")]
+                        routed_outbound: self
+                            .connection_tracker
+                            .native_enabled()
+                            .then(|| outbound_name.clone()),
+                        #[cfg(feature = "native-api")]
+                        native_flow_id: endpoint
+                            .native_flow()
+                            .filter(|flow| !flow.id().is_empty())
+                            .map(|flow| flow.id().to_owned()),
+                        rule,
+                        rule_payload,
+                        chains: connection_chains(selection_chain, &node.name),
+                        upload,
+                        download,
+                        start_time: std::time::Instant::now(),
+                        domain: quic_domain.clone(),
+                        network: "udp".to_string(),
+                        process: handoff.as_ref().and_then(|ho| ho.process_name()),
+                        process_path: None,
+                    }
+                },
+            )
+            .map_err(|()| anyhow::anyhow!("UDP endpoint retired before tracker publication"))?;
+        #[cfg(feature = "native-api")]
+        if let (Some(flow), Some(id)) = (endpoint.native_flow(), tracker_id.as_deref()) {
+            flow.attach_connection(id);
         }
         let first = lease.take_first().ok_or_else(|| {
             #[cfg(feature = "native-api")]

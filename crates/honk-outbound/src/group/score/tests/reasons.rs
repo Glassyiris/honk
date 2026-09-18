@@ -815,7 +815,13 @@ fn selector_parent_peeks_unchosen_score_subgroups() {
     assert!(state.inner.lock().selection_history.is_empty());
 
     // Switching the choice moves the committed rank to sub-b.
-    manager.set_selector_choice("sel-parent", "sel-sub-b");
+    manager
+        .set_selector_choice(
+            "sel-parent",
+            "sel-sub-b",
+            crate::group::SelectorNetworks::Both,
+        )
+        .unwrap();
     let _ = manager.selection_plan_for_domain("sel-parent", ProbeDomain::Tcp, IpVersion::V4);
     assert_eq!(
         state
@@ -831,7 +837,13 @@ fn selector_parent_peeks_unchosen_score_subgroups() {
     );
 
     // The target-aware dial path applies the same rule.
-    manager.set_selector_choice("sel-parent", "sel-sub-a");
+    manager
+        .set_selector_choice(
+            "sel-parent",
+            "sel-sub-a",
+            crate::group::SelectorNetworks::Both,
+        )
+        .unwrap();
     let before_a = state.selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp);
     let before_b = state.selection_reason_counts("sel-sub-b", SelectionNetwork::Tcp);
     let _ = manager
@@ -845,9 +857,15 @@ fn selector_parent_peeks_unchosen_score_subgroups() {
         before_b
     );
 
-    // A stale stored choice names no member: the fallback serving
-    // sub-group still commits its rank instead of everything peeking.
-    manager.set_selector_choice("sel-parent", "sel-sub-renamed-away");
+    // Invalid writes leave the selected subgroup and its attribution intact.
+    assert_eq!(
+        manager.set_selector_choice(
+            "sel-parent",
+            "sel-sub-renamed-away",
+            crate::group::SelectorNetworks::Both
+        ),
+        Err(crate::group::SelectorError::NotMember)
+    );
     let before_a = state.selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp);
     let _ = manager.selection_plan_for_domain("sel-parent", ProbeDomain::Tcp, IpVersion::V4);
     assert_ne!(
@@ -905,7 +923,13 @@ fn selector_refusal_does_not_commit_a_sibling_score_group() {
         super::super::super::GroupManager::with_alive_set(&[sub, parent], &nodes, Some(alive));
     let state = manager.score_state();
 
-    manager.set_selector_choice("fallback-parent", "fallback-dead");
+    manager
+        .set_selector_choice(
+            "fallback-parent",
+            "fallback-dead",
+            crate::group::SelectorNetworks::Both,
+        )
+        .unwrap();
     assert!(
         manager
             .selection_plan_for_domain("fallback-parent", ProbeDomain::Tcp, IpVersion::V4)
