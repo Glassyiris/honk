@@ -641,7 +641,9 @@ async fn validation_is_offline_readonly_and_distinguishes_syntax_from_full_admis
     let before_disk = disk(fixture.directory.path());
     for (mode, content, valid) in [
         ("syntax", candidate.as_str(), true),
-        ("full", candidate.as_str(), false),
+        // Full admission of a subscription that was never fetched passes with a
+        // warning and, above all, without fetching it.
+        ("full", candidate.as_str(), true),
         ("full", fixture.originals["main.dae"].as_str(), true),
         ("syntax", "routing {\n", false),
     ] {
@@ -655,6 +657,14 @@ async fn validation_is_offline_readonly_and_distinguishes_syntax_from_full_admis
                 "candidate",
                 "private-candidate-token",
             );
+        } else if mode == "full" && content == candidate.as_str() {
+            let rows = result["diagnostics"].as_array().unwrap();
+            let notice = rows
+                .iter()
+                .find(|row| row["code"] == "subscription-not-fetched")
+                .unwrap();
+            assert_eq!(notice["level"], "warning");
+            assert!(!result.to_string().contains("private-candidate-token"));
         }
         assert_eq!(disk(fixture.directory.path()), before_disk);
         assert_eq!(fixture.get(CONFIG).await, before);

@@ -94,9 +94,24 @@ fn offline_admission_does_not_create_runtime_state_or_connect() {
             ),
             ..Default::default()
         });
-    let error = admit(loaded, &active).err().unwrap();
-    assert_eq!(error.diagnostic.code, "missing-offline-dependency");
-    assert!(!format!("{error:?}").contains("private-credential"));
+    // A subscription that was never fetched is admitted without its nodes, as
+    // the runtime would start it; the notice names neither the URL nor a path.
+    let mut notices = Vec::new();
+    let admitted = validate_with_data_dir(
+        loaded,
+        &active,
+        Path::new(&active.global.data_dir),
+        SourceLimits::default(),
+        &mut notices,
+    )
+    .unwrap();
+    assert!(admitted.dependencies.is_empty());
+    let notice = notices
+        .iter()
+        .find(|notice| notice.code == "subscription-not-fetched")
+        .unwrap();
+    assert_eq!(notice.severity, honk_config::diagnostic::Severity::Warning);
+    assert!(!format!("{notice:?}").contains("private-credential"));
     assert!(!temp.path().join("state").exists());
     assert_eq!(
         listener.accept().unwrap_err().kind(),
@@ -493,11 +508,20 @@ fn cached_presence_and_rebased_active_semantics_are_both_required() {
         fs::metadata(&cache).unwrap().permissions().mode() & 0o7777,
         0o400
     );
+    // Without the cache the subscription contributes no cached node; the
+    // configuration is still admitted and the runtime's same-fetch node still
+    // rebases onto it.
     fs::remove_file(cache).unwrap();
-    assert_eq!(
-        admit(loaded, &active).err().unwrap().diagnostic.code,
-        "missing-offline-dependency"
-    );
+    let admitted = admit(loaded, &active).unwrap();
+    assert!(admitted.dependencies.is_empty());
+    let names: Vec<_> = admitted
+        .config
+        .nodes
+        .iter()
+        .map(|node| node.name.as_str())
+        .collect();
+    assert!(names.contains(&"active"));
+    assert!(!names.contains(&"cached"));
 }
 
 #[test]
