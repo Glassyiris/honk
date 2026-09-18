@@ -23,7 +23,16 @@ pub(crate) struct DependencySnapshot {
     pub(crate) path: PathBuf,
     pub(crate) sha256: String,
     pub(crate) bytes: usize,
+    /// A standard runtime asset (geodata) rather than an operator source: it is
+    /// still hashed for conflict detection but never counts toward the source
+    /// budget, which bounds what an administrator may submit, not what the
+    /// engine already loads.
+    pub(crate) asset: bool,
 }
+
+/// Upper bound for one standard asset read during offline validation. A
+/// `geoip.dat` is tens of megabytes; this only guards against a runaway file.
+const MAX_ASSET_BYTES: usize = 256 * 1024 * 1024;
 
 impl std::fmt::Debug for DependencySnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -402,7 +411,7 @@ impl Capture {
         if !standard && !self.authorized(&path) {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
-        if self.source_count >= self.limits.max_sources {
+        if !standard && self.source_count >= self.limits.max_sources {
             return Err(io::ErrorKind::QuotaExceeded.into());
         }
         if let Some((_, bytes)) = self
@@ -410,6 +419,9 @@ impl Capture {
             .iter()
             .find(|(snapshot, _)| snapshot.path == path)
         {
+            if standard {
+                return Ok(Arc::clone(bytes));
+            }
             if bytes.len() > self.limits.max_bytes - self.bytes {
                 return Err(io::ErrorKind::FileTooLarge.into());
             }
@@ -422,7 +434,13 @@ impl Capture {
         if !metadata.is_file() {
             return Err(io::ErrorKind::InvalidData.into());
         }
-        let remaining = self.limits.max_bytes - self.bytes;
+        // Standard assets have their own bound: the engine loads them whole at
+        // startup regardless of what an administrator submits.
+        let remaining = if standard {
+            MAX_ASSET_BYTES
+        } else {
+            self.limits.max_bytes - self.bytes
+        };
         if metadata.len() > remaining as u64 {
             return Err(io::ErrorKind::FileTooLarge.into());
         }
@@ -435,9 +453,12 @@ impl Capture {
             path,
             sha256: super::config::digest(&bytes),
             bytes: bytes.len(),
+            asset: standard,
         };
-        self.bytes += bytes.len();
-        self.source_count += 1;
+        if !standard {
+            self.bytes += bytes.len();
+            self.source_count += 1;
+        }
         let bytes: Arc<[u8]> = bytes.into();
         self.files.push((snapshot, Arc::clone(&bytes)));
         Ok(bytes)

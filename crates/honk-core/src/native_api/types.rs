@@ -242,9 +242,12 @@ pub(super) fn discovery() -> Value {
 }
 
 pub(super) fn version() -> Value {
+    let optional = |value: &str| (!value.is_empty()).then(|| Value::from(value));
     json!({
         "api": {"name": "dae/honk-native", "major": 1, "status": "draft"},
         "engine": {"name": "honk", "version": crate::VERSION},
+        // No build timestamp: the binary carries none, and inventing one would mislead.
+        "build": {"revision": optional(crate::REVISION), "target": optional(crate::TARGET), "built_at": null},
     })
 }
 

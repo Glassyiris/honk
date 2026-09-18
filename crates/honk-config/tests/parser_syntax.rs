@@ -47,6 +47,35 @@ mod scalar_syntax {
     }
 
     #[test]
+    fn native_api_lists_have_no_legacy_reading_to_warn_about() {
+        let mut diagnostics = Vec::new();
+        let config = parse_dae_config_with_detailed_diagnostics(
+            include_str!("fixtures/parser/scalars/k14-native-lists.dae"),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(
+            config.experimental.native_api.allow_origins,
+            [
+                "http://one.example",
+                "http://two.example",
+                "http://three.example"
+            ]
+        );
+        assert_eq!(
+            config.experimental.native_api.allowed_hosts,
+            ["one.example", "two.example", "three.example"]
+        );
+        // Three quoted interfaces did read differently once; three quoted origins never did.
+        let quoting: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "legacy-list-quoting")
+            .map(|diagnostic| diagnostic.line)
+            .collect();
+        assert_eq!(quoting, [Some(2)]);
+    }
+
+    #[test]
     fn scalar_remainder_does_not_enter_subscription_ua_logic() {
         let mut diagnostics = Vec::new();
         let config = parse_dae_config_with_detailed_diagnostics(

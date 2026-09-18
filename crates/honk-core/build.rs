@@ -50,6 +50,11 @@ fn emit_version() {
         .or_else(|| git_output(&["describe", "--tags", "--always", "--match", "v*"]))
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     println!("cargo:rustc-env=HONK_VERSION={version}");
+    // The commit and target triple identify a build precisely when the version is a tag.
+    let revision = git_output(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_default();
+    println!("cargo:rustc-env=HONK_REVISION={revision}");
+    let target = std::env::var("TARGET").unwrap_or_default();
+    println!("cargo:rustc-env=HONK_TARGET={target}");
 }
 
 #[cfg(feature = "ebpf")]

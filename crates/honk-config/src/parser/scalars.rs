@@ -181,6 +181,30 @@ fn list_value(
     filter_empty: bool,
     diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Vec<String> {
+    list_value_inner(
+        value,
+        aggregate_compat,
+        legacy_unquote_items,
+        filter_empty,
+        true,
+        diagnostics,
+    )
+}
+
+/// A list for a setting that never existed before the item-wise parser: there is no legacy
+/// reading to compare against, so quoting differences are not migration notices.
+fn new_list_value(value: Text<'_, '_>, diagnostics: &mut ParserDiagnostics<'_>) -> Vec<String> {
+    list_value_inner(value, false, false, false, false, diagnostics)
+}
+
+fn list_value_inner(
+    value: Text<'_, '_>,
+    aggregate_compat: bool,
+    legacy_unquote_items: bool,
+    filter_empty: bool,
+    legacy_notice: bool,
+    diagnostics: &mut ParserDiagnostics<'_>,
+) -> Vec<String> {
     let trimmed = value.trim();
     let whole_quoted = trimmed
         .quoted_prefix()
@@ -209,7 +233,7 @@ fn list_value(
             }
         })
         .filter(|item| !filter_empty || !item.is_empty());
-    if aggregate || !parsed.iter().map(String::as_str).eq(legacy) {
+    if aggregate || (legacy_notice && !parsed.iter().map(String::as_str).eq(legacy)) {
         trimmed.notice(
             diagnostics,
             Severity::Warning,
@@ -780,8 +804,7 @@ pub(super) fn parse_experimental_section(
                         }
                     }
                     if let Some(text) = values.get("writable_includes") {
-                        config.native_api.writable_includes =
-                            list_value(*text, false, false, false, diagnostics);
+                        config.native_api.writable_includes = new_list_value(*text, diagnostics);
                         if config
                             .native_api
                             .writable_includes
@@ -810,7 +833,7 @@ pub(super) fn parse_experimental_section(
                         ),
                     ] {
                         if let Some(text) = values.get(key) {
-                            let items = list_value(*text, false, false, false, diagnostics);
+                            let items = new_list_value(*text, diagnostics);
                             let invalid = items.iter().any(|value| {
                                 if key == "allowed_hosts" {
                                     crate::experimental::parse_native_authority(value, 80).is_none()

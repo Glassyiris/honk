@@ -712,6 +712,12 @@ async fn validation_ids_and_display_paths_cannot_expand_file_authority() {
         "mode":"syntax","sources":[{"id":"label","path":"../not-opened.dae","content":"routing { fallback: direct }"}]
     })).send().await.unwrap()).await;
     assert_eq!(syntax["valid"], true);
+    // The display path GET /config hands out names no file; a client may echo it with the id.
+    let main_id = before["sources"][0]["id"].clone();
+    let echoed = ok(fixture.request(Method::POST, VALIDATE).json(&json!({
+        "mode":"full","sources":[{"id":main_id,"path":"<redacted>","content":fixture.originals["main.dae"]}]
+    })).send().await.unwrap()).await;
+    assert_eq!(echoed["valid"], true);
     let outside = tempfile::tempdir().unwrap();
     let outside_path = outside.path().join("outside.dae");
     std::fs::write(&outside_path, "routing { fallback: block }").unwrap();
