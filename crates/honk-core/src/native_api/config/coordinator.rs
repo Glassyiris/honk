@@ -689,11 +689,13 @@ impl Worker {
             let root=entry.parent().ok_or_else(invalid)?;
             let mut documents=Vec::new();let mut ids=HashMap::new();
             for (index,source) in request.sources.iter().enumerate(){
-                let resolved=if request.mode=="syntax" {PathBuf::from(source.path.clone().unwrap_or_else(||format!("source-{}.dae",index+1)))}
+                // GET /config shows private paths as `<redacted>`; a client echoing that label names no file.
+                let path=source.path.as_deref().filter(|path|*path!=super::REDACTED_PATH);
+                let resolved=if request.mode=="syntax" {PathBuf::from(path.map(str::to_owned).unwrap_or_else(||format!("source-{}.dae",index+1)))}
                     else if index==0 {
-                        if let Some(path)=&source.path {let supplied=resolve_source_path(root,path)?;if supplied!=entry{return Err(denied());}}
+                        if let Some(path)=path {let supplied=resolve_source_path(root,path)?;if supplied!=entry{return Err(denied());}}
                         entry.clone()
-                    }else if let Some(path)=&source.path { resolve_source_path(root,path)? }
+                    }else if let Some(path)=path { resolve_source_path(root,path)? }
                     else if let Some(path)=source.id.as_ref().and_then(|id|accepted.as_ref()?.ids.iter().find(|(_,value)|*value==id).map(|(path,_)|path.clone())) { path }
                     else { root.join(format!("source-{}.dae",index+1)) };
                 if ids.insert(resolved.clone(),source.id.clone().unwrap_or_else(||format!("source-{}",index+1))).is_some(){return Err(invalid());}
@@ -709,8 +711,9 @@ impl Worker {
                     let validated=offline::validate(loaded,&active,limits(),&mut diagnostics)?;
                     let loaded_paths:HashSet<_>=validated.sources.iter().map(|source|&source.path).collect();
                     let unused:Vec<_>=documents.iter().filter(|(path,_)|!loaded_paths.contains(path)).collect();
-                    let bytes=validated.sources.iter().map(|source|source.content.len()).chain(validated.dependencies.iter().map(|source|source.bytes)).chain(unused.iter().map(|(_,text)|text.len())).sum::<usize>();
-                    if bytes>MAX_SOURCE_BYTES||validated.sources.len()+validated.dependencies.len()+unused.len()>MAX_SOURCES{
+                    let budgeted=validated.dependencies.iter().filter(|dependency|!dependency.asset);
+                    let bytes=validated.sources.iter().map(|source|source.content.len()).chain(budgeted.clone().map(|source|source.bytes)).chain(unused.iter().map(|(_,text)|text.len())).sum::<usize>();
+                    if bytes>MAX_SOURCE_BYTES||validated.sources.len()+budgeted.count()+unused.len()>MAX_SOURCES{
                         return Err(honk_config::error::DetailedConfigError::new(honk_config::error::ErrorCategory::Validation,"config-byte-limit",honk_config::diagnostic::DiagnosticSources::new(None).root(),honk_config::diagnostic::SettingPath::new("config"),"configuration dependency budget exceeded"));
                     }
                     Ok(LoadedConfig {config:validated.config,sources:validated.sources})

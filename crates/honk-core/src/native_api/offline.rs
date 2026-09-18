@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use honk_config::Config;
-use honk_config::diagnostic::{DetailedDiagnostic, SettingPath, SourceRef, finish_attempt};
+use honk_config::diagnostic::{
+    DetailedDiagnostic, SafeValue, SettingPath, SourceRef, finish_attempt,
+};
 use honk_config::error::{DetailedConfigError, ErrorCategory};
 use honk_config::parser::{LoadedConfig, SourceLimits, SourceSnapshot};
 
@@ -23,7 +25,16 @@ pub(crate) struct DependencySnapshot {
     pub(crate) path: PathBuf,
     pub(crate) sha256: String,
     pub(crate) bytes: usize,
+    /// A standard runtime asset (geodata) rather than an operator source: it is
+    /// still hashed for conflict detection but never counts toward the source
+    /// budget, which bounds what an administrator may submit, not what the
+    /// engine already loads.
+    pub(crate) asset: bool,
 }
+
+/// Upper bound for one standard asset read during offline validation. A
+/// `geoip.dat` is tens of megabytes; this only guards against a runaway file.
+const MAX_ASSET_BYTES: usize = 256 * 1024 * 1024;
 
 impl std::fmt::Debug for DependencySnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -103,17 +114,40 @@ fn validate_inner(
     config.ensure_builtin_nodes();
 
     if config.subscriptions.iter().any(|sub| sub.enabled) {
-        let store = SubscriptionStore::open_readonly(&capture.data_dir)
-            .map_err(|cause| dependency_error(source, "subscription", cause))?;
+        // No store yet means no subscription has ever been fetched on this host.
+        let store = match SubscriptionStore::open_readonly(&capture.data_dir) {
+            Ok(store) => Some(store),
+            Err(cause) if cause.kind() == io::ErrorKind::NotFound => None,
+            Err(cause) => return Err(dependency_error(source, "subscription", cause)),
+        };
         for (index, subscription) in config
             .subscriptions
             .iter()
             .enumerate()
             .filter(|(_, sub)| sub.enabled)
         {
-            let contents = store
-                .open_cached(subscription)
-                .and_then(|file| capture.file(file, true))
+            let cached = match store.as_ref().map(|store| store.open_cached(subscription)) {
+                Some(Ok(file)) => Some(file),
+                Some(Err(cause)) if cause.kind() != io::ErrorKind::NotFound => {
+                    return Err(dependency_error(source, "subscription", cause));
+                }
+                _ => None,
+            };
+            // The runtime starts a never-fetched subscription with no nodes and
+            // fills it in after the first fetch; offline admission mirrors that
+            // instead of refusing the configuration that would add it.
+            let Some(cached) = cached else {
+                diagnostics.push(DetailedDiagnostic::warning(
+                    "subscription-not-fetched",
+                    source.clone(),
+                    SettingPath::new("subscription").index(index + 1),
+                    SafeValue::Redacted,
+                    "subscription has not been fetched yet; its nodes join after the first fetch",
+                ));
+                continue;
+            };
+            let contents = capture
+                .file(cached, true)
                 .map_err(|cause| dependency_error(source, "subscription", cause))?;
             let contents = std::str::from_utf8(&contents).map_err(|_| {
                 error(
@@ -402,7 +436,7 @@ impl Capture {
         if !standard && !self.authorized(&path) {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
-        if self.source_count >= self.limits.max_sources {
+        if !standard && self.source_count >= self.limits.max_sources {
             return Err(io::ErrorKind::QuotaExceeded.into());
         }
         if let Some((_, bytes)) = self
@@ -410,6 +444,9 @@ impl Capture {
             .iter()
             .find(|(snapshot, _)| snapshot.path == path)
         {
+            if standard {
+                return Ok(Arc::clone(bytes));
+            }
             if bytes.len() > self.limits.max_bytes - self.bytes {
                 return Err(io::ErrorKind::FileTooLarge.into());
             }
@@ -422,7 +459,13 @@ impl Capture {
         if !metadata.is_file() {
             return Err(io::ErrorKind::InvalidData.into());
         }
-        let remaining = self.limits.max_bytes - self.bytes;
+        // Standard assets have their own bound: the engine loads them whole at
+        // startup regardless of what an administrator submits.
+        let remaining = if standard {
+            MAX_ASSET_BYTES
+        } else {
+            self.limits.max_bytes - self.bytes
+        };
         if metadata.len() > remaining as u64 {
             return Err(io::ErrorKind::FileTooLarge.into());
         }
@@ -435,9 +478,12 @@ impl Capture {
             path,
             sha256: super::config::digest(&bytes),
             bytes: bytes.len(),
+            asset: standard,
         };
-        self.bytes += bytes.len();
-        self.source_count += 1;
+        if !standard {
+            self.bytes += bytes.len();
+            self.source_count += 1;
+        }
         let bytes: Arc<[u8]> = bytes.into();
         self.files.push((snapshot, Arc::clone(&bytes)));
         Ok(bytes)

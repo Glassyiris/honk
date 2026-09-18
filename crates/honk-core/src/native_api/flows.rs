@@ -33,6 +33,11 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SNAPSHOTS: usize = 8;
 const TERMINAL_TTL: Duration = Duration::from_secs(300);
 const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
+/// Records leave the ring one at a time as flows end or newer ones need the
+/// room, so a `flow.gap` per departure would shadow every flow under load.
+/// Room-making is reported at most once per interval, with the cumulative
+/// `dropped_records`; the count itself never skips.
+const EVICTED_GAP_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_SAFE_UINT: u64 = 9_007_199_254_740_991;
 const MAX_TEXT: usize = 512;
 const MAX_STEP_BYTES: usize = 64 * 1024;
@@ -55,6 +60,7 @@ struct Store {
     record_bytes: usize,
     snapshot_bytes: usize,
     dropped: u64,
+    evicted_gap_at: Option<Instant>,
 }
 
 struct Record {
@@ -115,6 +121,7 @@ impl Store {
             record_bytes: 0,
             snapshot_bytes: 0,
             dropped: 0,
+            evicted_gap_at: None,
         }
     }
 
@@ -259,7 +266,7 @@ impl FlowStore {
         }
         let revision = record.summary["revision"].as_u64().unwrap_or(1);
         if revision == MAX_SAFE_UINT {
-            self.evict(&mut store, index, now, "buffer_overflow");
+            self.evict(&mut store, index, now, "buffer_overflow", false);
             return;
         }
         record.summary["revision"] = (revision + 1).into();
@@ -295,11 +302,29 @@ impl FlowStore {
         );
     }
 
-    fn evict(&self, store: &mut Store, index: usize, now: Instant, reason: &'static str) {
+    /// A record that lost its own history (`routine` false) is named in its
+    /// gap; one that merely left the ring to make room is folded into the
+    /// interval notice.
+    fn evict(
+        &self,
+        store: &mut Store,
+        index: usize,
+        now: Instant,
+        reason: &'static str,
+        routine: bool,
+    ) {
         let record = store.records.remove(index).expect("known record index");
         store.record_bytes -= record.bytes;
         store.dropped = store.dropped.saturating_add(1);
-        self.gap(store, Some(record.id()), reason);
+        if !routine {
+            self.gap(store, Some(record.id()), reason);
+        } else if store
+            .evicted_gap_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= EVICTED_GAP_INTERVAL)
+        {
+            store.evicted_gap_at = Some(now);
+            self.gap(store, None, reason);
+        }
         if store.tombstones.len() == MAX_RECORDS {
             store.tombstones.pop_front();
         }
@@ -311,7 +336,7 @@ impl FlowStore {
             if store.records.is_empty() {
                 break;
             }
-            self.evict(store, 0, now, "buffer_overflow");
+            self.evict(store, 0, now, "buffer_overflow", true);
         }
     }
 
@@ -333,7 +358,7 @@ impl FlowStore {
                 .ended
                 .is_some_and(|ended| now.saturating_duration_since(ended) >= store.retention)
             {
-                self.evict(store, index, now, "evicted");
+                self.evict(store, index, now, "evicted", true);
             } else {
                 index += 1;
             }
@@ -369,8 +394,19 @@ impl FlowStore {
             .iter()
             .filter(|record| filters.matches(record))
             .count();
+        // A full snapshot table drops its oldest entry rather than refusing the
+        // page: a reader still on that cursor gets `snapshot_expired` and starts
+        // over, which is the same outcome the ttl gives it thirty seconds later.
         if count > filters.limit && store.snapshots.len() == MAX_SNAPSHOTS {
-            return Err(snapshot_busy(id));
+            let oldest = store
+                .snapshots
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, snapshot)| snapshot.created)
+                .map(|(index, _)| index)
+                .expect("a full snapshot table has an oldest entry");
+            let stale = store.snapshots.remove(oldest);
+            store.snapshot_bytes -= stale.bytes;
         }
         let mut snapshot = Snapshot {
             token: Uuid::new_v4().to_string(),

@@ -11,7 +11,7 @@ The frozen contract is [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992
 | Method | Path | Meaning |
 | --- | --- | --- |
 | GET | `/api` | Discovery, fixed `/api/v1` base and all contract links. |
-| GET | `/api/v1/version` | Native contract identity and the engine's build version; no invented build timestamp. |
+| GET | `/api/v1/version` | Native contract identity, the engine's build version, and the build's commit and target; no invented build timestamp. |
 | GET | `/api/v1/capabilities` | Implemented resources and request limits. |
 | GET | `/api/v1/runtime?detail=summary\|full` | Engine phase, accepted generation and independently timestamped visible userspace traffic. |
 | GET | `/api/v1/runtime/outbounds` | Full-width per-kind outbound counters from the shared statistics lifetime. |
@@ -106,7 +106,7 @@ With `config_write: true`, the accepted main source is writable unless credentia
 
 Validation takes JSON `{"mode":"syntax","sources":[{"id":"candidate","content":"..."}]}`; each source may also carry `path`. Syntax mode parses only submitted documents: IDs/paths are diagnostic labels, not filesystem authority. Full mode overlays the first document on the configured entry file, resolves additional `.dae` paths within its authorized entry root, and checks real local dependencies: cached subscriptions, geodata, hosts and ECH material. Missing dependencies are errors; validation never fetches them, creates/chmods cache directories, starts workers or publishes a generation. A completed invalid candidate returns HTTP 200 with `valid:false` and safe diagnostics. This offline admission is not a promise that later runtime activation will succeed.
 
-Source/dependency admission is bounded to 32 sources and 8 MiB in total, counting each dependency materialization, including repeated references. The independent HTTP JSON body limit remains **64 KiB**, so it is not possible to upload an 8 MiB body. Full validation and PUT use these bounds; limits are errors, not silent truncation.
+Source/dependency admission is bounded to 32 sources and 8 MiB in total, counting each dependency materialization, including repeated references. Geodata files are runtime assets the engine loads whole anyway: they are hashed for conflict detection but never count toward this budget. The independent HTTP JSON body limit remains **64 KiB**, so it is not possible to upload an 8 MiB body. Full validation and PUT use these bounds; limits are errors, not silent truncation.
 
 PUT takes JSON `{"content":"..."}` and one strong `If-Match: "<64 lowercase hex SHA-256 digits>"` over the current **disk bytes**, not the config revision or runtime generation. Missing `If-Match` is 428; weak tags, wildcard, lists, duplicate headers and malformed hashes are 400; a stale target or detected dependency conflict is 412. Invalid candidates are 422 with no write/reload, and denied writes are 403. JSON-bearing requests require `Content-Type: application/json`. The whole candidate is validated before a mode-preserving, exclusive temporary write, file sync, atomic rename and parent-directory sync; target identity/hash and the complete dependency set are rechecked before rename.
 

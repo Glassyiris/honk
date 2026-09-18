@@ -60,6 +60,11 @@ pub(super) struct Security {
     anonymous_loopback: bool,
     hosts: HashSet<(String, u16)>,
     origins: HashSet<(String, String, u16)>,
+    /// The listen port when bound to an unspecified address: an IP-literal
+    /// `Host` (or `localhost`) at that port is the listener itself, whatever
+    /// interface the request arrived on. DNS names still need `allowed_hosts`,
+    /// since only a name can be rebound to point at this listener.
+    wildcard_port: Option<u16>,
 }
 
 impl Security {
@@ -95,7 +100,24 @@ impl Security {
                 && listen.ip().is_loopback(),
             hosts,
             origins,
+            wildcard_port: listen.ip().is_unspecified().then_some(listen.port()),
         }
+    }
+
+    fn listener_itself(&self, host: &str, port: u16) -> bool {
+        self.wildcard_port == Some(port)
+            && (host == "localhost" || host.parse::<std::net::IpAddr>().is_ok())
+    }
+
+    fn host_allowed(&self, authority: &(String, u16)) -> bool {
+        self.hosts.contains(authority) || self.listener_itself(&authority.0, authority.1)
+    }
+
+    // The plain-HTTP origin of the listener itself is as trustworthy as its Host; an extra
+    // `allowed_hosts` entry still says nothing about the scheme and needs `allow_origins`.
+    fn origin_allowed(&self, origin: &(String, String, u16)) -> bool {
+        let (scheme, host, port) = origin;
+        self.origins.contains(origin) || (scheme == "http" && self.listener_itself(host, *port))
     }
 
     fn check_origin(
@@ -108,7 +130,7 @@ impl Security {
             .flatten()
             .and_then(|value| value.to_str().ok())
             .and_then(|value| parse_native_authority(value, 80))
-            .filter(|authority| self.hosts.contains(authority))
+            .filter(|authority| self.host_allowed(authority))
             .ok_or_else(|| forbidden(request_id))?;
         let origin = single_header(headers, "origin").map_err(|()| forbidden(request_id))?;
         if let Some(origin) = origin {
@@ -116,7 +138,7 @@ impl Security {
                 .to_str()
                 .ok()
                 .and_then(parse_native_origin)
-                .is_some_and(|origin| self.origins.contains(&origin));
+                .is_some_and(|origin| self.origin_allowed(&origin));
             if !allowed {
                 return Err(forbidden(request_id));
             }
@@ -270,14 +292,28 @@ pub(super) async fn boundary(
         | Method::PATCH => method.as_str(),
         _ => "OTHER",
     };
-    tracing::info!(
-        method = logged_method,
-        route = template,
-        status = response.status().as_u16(),
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        request_id = %request_id,
-        "native HTTP request"
-    );
+    // A dashboard polls every few seconds; only rejected or failed requests earn an INFO line.
+    let status = response.status().as_u16();
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    if status >= 400 {
+        tracing::info!(
+            method = logged_method,
+            route = template,
+            status,
+            elapsed_ms,
+            request_id = %request_id,
+            "native HTTP request"
+        );
+    } else {
+        tracing::debug!(
+            method = logged_method,
+            route = template,
+            status,
+            elapsed_ms,
+            request_id = %request_id,
+            "native HTTP request"
+        );
+    }
     response
 }
 

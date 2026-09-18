@@ -35,6 +35,10 @@ pub use honk_outbound::proxy;
 
 /// Build-time release tag or Git description; package version without Git metadata.
 pub const VERSION: &str = env!("HONK_VERSION");
+/// The commit this binary was built from; empty when the build had no Git checkout.
+pub const REVISION: &str = env!("HONK_REVISION");
+/// The target triple this binary was built for.
+pub const TARGET: &str = env!("HONK_TARGET");
 
 use clap::Parser;
 use honk_config::Config;

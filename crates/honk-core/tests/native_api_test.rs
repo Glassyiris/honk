@@ -65,7 +65,11 @@ struct TestApp {
 
 impl TestApp {
     async fn new(configure: impl FnOnce(&mut Config)) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::bound("127.0.0.1:0", configure).await
+    }
+
+    async fn bound(bind: &str, configure: impl FnOnce(&mut Config)) -> Self {
+        let listener = TcpListener::bind(bind).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mut config = Config::default();
         config.global.nfqueue_enable = false;
@@ -98,7 +102,13 @@ impl TestApp {
     }
 
     fn url(&self, path: &str) -> String {
-        format!("http://{}{path}", self.addr)
+        // A wildcard bind is reached through loopback.
+        let addr = if self.addr.ip().is_unspecified() {
+            SocketAddr::new("127.0.0.1".parse().unwrap(), self.addr.port())
+        } else {
+            self.addr
+        };
+        format!("http://{addr}{path}")
     }
 
     fn get(&self, path: &str) -> reqwest::RequestBuilder {
@@ -410,6 +420,58 @@ async fn host_origin_and_proxy_authorities_are_not_inferred_from_forwarded_heade
         400,
         "invalid_request",
     );
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn wildcard_bind_accepts_its_own_ip_literal_authorities_but_no_names() {
+    let app = TestApp::bound("0.0.0.0:0", |_| {}).await;
+    let port = app.addr.port();
+    for host in [
+        format!("127.0.0.1:{port}"),
+        format!("192.0.2.7:{port}"),
+        format!("[2001:db8::7]:{port}"),
+        format!("localhost:{port}"),
+    ] {
+        response_json(app.get("/api").header("host", &host).send().await.unwrap()).await;
+        // The listener's own plain-HTTP origin follows its Host; the UI it hosts posts with it.
+        let response = app
+            .get("/api")
+            .header("host", &host)
+            .header("origin", format!("http://{host}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            format!("http://{host}")
+        );
+        response_json(response).await;
+    }
+    for host in [
+        format!("192.0.2.7:{}", port.wrapping_add(1)),
+        "192.0.2.7".to_string(),
+        format!("panel.example:{port}"),
+    ] {
+        error_response(
+            app.get("/api").header("host", &host).send().await.unwrap(),
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+        )
+        .await;
+    }
+    // Only plain HTTP is the listener's own scheme; a TLS proxy still declares its origin.
+    error_response(
+        app.get("/api")
+            .header("host", format!("192.0.2.7:{port}"))
+            .header("origin", format!("https://192.0.2.7:{port}"))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::FORBIDDEN,
+        "permission_denied",
+    )
+    .await;
     app.shutdown().await;
 }
 

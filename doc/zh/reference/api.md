@@ -11,7 +11,7 @@
 | 方法 | 路径 | 含义 |
 | --- | --- | --- |
 | GET | `/api` | Discovery，固定 `/api/v1` base 与全部契约 links。 |
-| GET | `/api/v1/version` | 原生契约身份与引擎构建版本，不伪造构建时间。 |
+| GET | `/api/v1/version` | 原生契约身份、引擎构建版本以及构建的提交与目标平台，不伪造构建时间。 |
 | GET | `/api/v1/capabilities` | 已实现资源与请求上限。 |
 | GET | `/api/v1/runtime?detail=summary\|full` | 引擎 phase、已接受代次与具有独立时间戳的用户态流量。 |
 | GET | `/api/v1/connections?type=all\|tcp\|udp&src=192.0.2.1&limit=100&detail=summary\|full` | 可见的活跃用户态连接；可选 `src` 必须为无端口 IP literal。 |
@@ -101,7 +101,7 @@ RSS 来自 `/proc/self/status`；cgroup v2 依据实际 membership/mountinfo 定
 
 ### 配置来源、校验与操作（M6）
 
-只有真实 `.dae` 启动加载时捕获的源集合才启用配置管理；程序内构造的 Config 或 serde 格式加载不能冒充无损来源，其配置能力不可用。GET 返回最后已接受的快照，不临时重扫磁盘。源 ID 不含路径，元数据的私有路径显示为 `<redacted>`；原文 SHA-256、字节数、加载时间与逐源 `writable` 单独提供。源集合与校验最多 32 个来源、8 MiB 原始字节，依赖的每次实体化也计入数量和字节预算；HTTP JSON body 的 64 KiB 上限仍独立生效，超限返回 413。
+只有真实 `.dae` 启动加载时捕获的源集合才启用配置管理；程序内构造的 Config 或 serde 格式加载不能冒充无损来源，其配置能力不可用。GET 返回最后已接受的快照，不临时重扫磁盘。源 ID 不含路径，元数据的私有路径显示为 `<redacted>`；原文 SHA-256、字节数、加载时间与逐源 `writable` 单独提供。源集合与校验最多 32 个来源、8 MiB 原始字节，依赖的每次实体化也计入数量和字节预算；geodata 文件是引擎本来就整体加载的运行时资产，只参与哈希冲突检测，不计入预算；HTTP JSON body 的 64 KiB 上限仍独立生效，超限返回 413。
 
 默认 `config_content: false`、`config_write: false`、`writable_includes: []`，以上设置及 history 设置都需重启。Content 或 write 为 true 必须配置非空有效 bearer secret；完整正文仅供通过控制凭证认证的管理员，匿名模式不能取得。包含 API 凭据的整个源不返回 content，并且只读；不要把省略正文误当成可保存的空字符串。获准返回的 content 是逐字原文，可能含出站凭据、订阅 URL 或路径，不是沙箱化/脱敏后的保存载荷；`secrets_redacted` 不表示可以无检查地公开或回写整个响应。
 

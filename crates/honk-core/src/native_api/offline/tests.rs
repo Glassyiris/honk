@@ -94,9 +94,24 @@ fn offline_admission_does_not_create_runtime_state_or_connect() {
             ),
             ..Default::default()
         });
-    let error = admit(loaded, &active).err().unwrap();
-    assert_eq!(error.diagnostic.code, "missing-offline-dependency");
-    assert!(!format!("{error:?}").contains("private-credential"));
+    // A subscription that was never fetched is admitted without its nodes, as
+    // the runtime would start it; the notice names neither the URL nor a path.
+    let mut notices = Vec::new();
+    let admitted = validate_with_data_dir(
+        loaded,
+        &active,
+        Path::new(&active.global.data_dir),
+        SourceLimits::default(),
+        &mut notices,
+    )
+    .unwrap();
+    assert!(admitted.dependencies.is_empty());
+    let notice = notices
+        .iter()
+        .find(|notice| notice.code == "subscription-not-fetched")
+        .unwrap();
+    assert_eq!(notice.severity, honk_config::diagnostic::Severity::Warning);
+    assert!(!format!("{notice:?}").contains("private-credential"));
     assert!(!temp.path().join("state").exists());
     assert_eq!(
         listener.accept().unwrap_err().kind(),
@@ -140,6 +155,7 @@ fn hosts_admission_charges_each_materialized_reference() {
             path: fs::canonicalize(&hosts).unwrap(),
             bytes: body.len(),
             sha256: crate::native_api::config::digest(body.as_bytes()),
+            asset: false,
         }]
     );
     let short = SourceLimits {
@@ -173,6 +189,96 @@ fn hosts_admission_charges_each_materialized_reference() {
     assert_eq!(
         admit(loaded, &active).err().unwrap().diagnostic.code,
         "missing-offline-dependency"
+    );
+}
+
+// A minimal geoip.dat: one country code with `count` /24 networks, in the
+// v2fly protobuf wire format the runtime reads.
+fn geoip_dat(code: &str, count: u32) -> Vec<u8> {
+    fn varint(mut value: u64, out: &mut Vec<u8>) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+    fn delimited(tag: u8, payload: &[u8], out: &mut Vec<u8>) {
+        out.push(tag << 3 | 2);
+        varint(payload.len() as u64, out);
+        out.extend_from_slice(payload);
+    }
+    let mut entry = Vec::new();
+    delimited(1, code.as_bytes(), &mut entry);
+    for index in 0..count {
+        let mut cidr = Vec::new();
+        delimited(1, &[10, (index >> 8) as u8, index as u8, 0], &mut cidr);
+        cidr.push(2 << 3);
+        varint(24, &mut cidr);
+        delimited(2, &cidr, &mut entry);
+    }
+    let mut dat = Vec::new();
+    delimited(1, &entry, &mut dat);
+    dat
+}
+
+#[test]
+fn geodata_assets_are_hashed_but_stay_outside_the_source_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    // The fixture's routing has no geo rule; validation must need geoip.dat.
+    fixture(temp.path(), "");
+    let path = temp.path().join("config.dae");
+    let text = fs::read_to_string(&path).unwrap().replace(
+        "routing { fallback: direct }",
+        "routing { dip(geoip: lab) -> direct\n fallback: direct }",
+    );
+    fs::write(&path, &text).unwrap();
+    let loaded = Config::from_dae_file_with_sources(
+        &path,
+        &HashMap::new(),
+        SourceLimits::default(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let active = loaded.config.clone();
+    let data_dir = PathBuf::from(&active.global.data_dir);
+    fs::create_dir_all(&data_dir).unwrap();
+    let dat = geoip_dat("lab", 2000);
+    fs::write(data_dir.join("geoip.dat"), &dat).unwrap();
+    let source_bytes = loaded
+        .sources
+        .iter()
+        .map(|source| source.content.len())
+        .sum::<usize>();
+    assert!(dat.len() > source_bytes);
+    // Exactly the sources fit: the asset is larger than the whole budget and must not count.
+    let exact = SourceLimits {
+        max_bytes: source_bytes,
+        max_sources: 1,
+    };
+    let admitted = admit_with_limits(loaded.clone(), &active, exact).unwrap();
+    let asset = admitted
+        .dependencies
+        .iter()
+        .find(|dependency| dependency.asset)
+        .expect("geoip.dat is a recorded dependency");
+    assert_eq!(asset.bytes, dat.len());
+    assert_eq!(asset.sha256, crate::native_api::config::digest(&dat));
+    // The source budget itself still applies.
+    let short = SourceLimits {
+        max_bytes: source_bytes - 1,
+        max_sources: 1,
+    };
+    assert_eq!(
+        admit_with_limits(loaded, &active, short)
+            .err()
+            .unwrap()
+            .diagnostic
+            .code,
+        "config-byte-limit"
     );
 }
 
@@ -402,11 +508,20 @@ fn cached_presence_and_rebased_active_semantics_are_both_required() {
         fs::metadata(&cache).unwrap().permissions().mode() & 0o7777,
         0o400
     );
+    // Without the cache the subscription contributes no cached node; the
+    // configuration is still admitted and the runtime's same-fetch node still
+    // rebases onto it.
     fs::remove_file(cache).unwrap();
-    assert_eq!(
-        admit(loaded, &active).err().unwrap().diagnostic.code,
-        "missing-offline-dependency"
-    );
+    let admitted = admit(loaded, &active).unwrap();
+    assert!(admitted.dependencies.is_empty());
+    let names: Vec<_> = admitted
+        .config
+        .nodes
+        .iter()
+        .map(|node| node.name.as_str())
+        .collect();
+    assert!(names.contains(&"active"));
+    assert!(!names.contains(&"cached"));
 }
 
 #[test]
