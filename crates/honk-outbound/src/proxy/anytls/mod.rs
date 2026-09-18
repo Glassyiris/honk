@@ -293,6 +293,8 @@ pub(crate) struct AnyTlsSession {
     addr: String,
     /// Server-specific scheme shared by every live session in this pool.
     padding_state: Arc<PaddingState>,
+    /// Idle bookkeeping for the pool janitor, stamped at stream open and close.
+    idle: crate::session::IdleClock,
     /// Settings waits for the first stream so packet 1 is SETTINGS+SYN+PSH.
     initial_settings: parking_lot::Mutex<Option<bytes::Bytes>>,
     /// Ordered writer queue: every frame goes out through the single
@@ -393,6 +395,7 @@ impl AnyTlsSession {
             overflow_notify: tokio::sync::Notify::new(),
             watchdog: Mutex::new(None),
             stream_permits: Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS_PER_SESSION)),
+            idle: crate::session::IdleClock::new(),
             capacity_notify: std::sync::OnceLock::new(),
             inbound_payload_budget,
             inbound_budget_epoch: AtomicU64::new(0),
@@ -1166,7 +1169,14 @@ impl crate::session::ManagedSession for AnyTlsSession {
             drop(permit);
             return None;
         }
+        self.idle.stream_opened();
         Some(SessionPermit::new(Arc::clone(self), permit))
+    }
+    fn permit_released(&self) {
+        self.idle.stream_released(self.active_streams());
+    }
+    fn idle_since(&self) -> Option<Instant> {
+        self.idle.idle_since()
     }
 }
 

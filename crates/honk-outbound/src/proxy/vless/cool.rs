@@ -18,7 +18,8 @@ use tokio::time::Instant;
 
 use crate::proxy::{AsyncReadWrite, MuxSession, PacketTransport};
 use crate::session::{
-    ManagedSession, OpenError, SessionPermit, SessionPool, SessionPoolConfig, SessionState,
+    IdleClock, ManagedSession, OpenError, SessionPermit, SessionPool, SessionPoolConfig,
+    SessionState,
 };
 
 mod child;
@@ -250,6 +251,8 @@ impl ChildSink {
 pub struct VlessCoolSession {
     state: AtomicU8,
     created_at: Instant,
+    /// Idle bookkeeping for the pool janitor, stamped at stream open and close.
+    idle: IdleClock,
     capacity: Arc<tokio::sync::Semaphore>,
     capacity_notify: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
     active_limit: usize,
@@ -664,9 +667,15 @@ impl ManagedSession for VlessCoolSession {
     }
 
     fn permit_released(&self) {
-        if self.state() == SessionState::Draining && self.active_streams() == 0 {
+        let active = self.active_streams();
+        self.idle.stream_released(active);
+        if self.state() == SessionState::Draining && active == 0 {
             self.close();
         }
+    }
+
+    fn idle_since(&self) -> Option<Instant> {
+        self.idle.idle_since()
     }
 
     fn try_reserve(self: &Arc<Self>) -> Option<SessionPermit<Self>> {
@@ -674,6 +683,7 @@ impl ManagedSession for VlessCoolSession {
             return None;
         }
         let permit = Arc::clone(&self.capacity).try_acquire_owned().ok()?;
+        self.idle.stream_opened();
         let permit = SessionPermit::new(Arc::clone(self), permit);
         if self.state() != SessionState::Active {
             drop(permit);
@@ -768,6 +778,7 @@ pub(crate) fn connect(
     let session = Arc::new(VlessCoolSession {
         state: AtomicU8::new(SessionState::Active as u8),
         created_at: Instant::now(),
+        idle: IdleClock::new(),
         capacity: Arc::new(tokio::sync::Semaphore::new(active_limit)),
         capacity_notify: std::sync::OnceLock::new(),
         active_limit,
