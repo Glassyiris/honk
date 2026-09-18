@@ -85,6 +85,8 @@ Score keeps business reliability separate from event-timed performance and confi
 
 Score verification is a scoped empirical claim, not a statistical error guarantee or automatic optimality certificate. The same evaluator identifies availability/response gaps, schedules bounded real-flow validation and publishes readonly validity; missing transfer waits for actual offered load. Keep practical equivalence, provisional forwarding, observed usability and supported comparison separate. Claims must expire with their weakest supporting evidence; API reads cannot spend validation budgets or mutate counters.
 
+Score ordinary incumbent protection is separate from verification. Keep first-choice utility and existing trial budgets; an ineligible or unresolved-failure incumbent may escape without waiting. Recovery provenance is a successful bidirectional Traffic outcome's actual RX strictly newer than the cell failure, never probe/setup-only/neutral or stale terminal time. Hold maturity uses the maximum of separately decayed applicable completion counts. Healthy promotion compares qualified common metric pairs against a fixed incumbent; expiry alone is not a performance advantage. `ordinarySwitch` counts normal committed identity changes, excludes first choice/trials/Peek, and is distinct from the narrower `switchFlap`. Do not turn these into per-packet logs or exported target identities.
+
 ## Build and test commands
 
 ### Rust workspace

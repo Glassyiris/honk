@@ -41,6 +41,147 @@ fn business_success(
 }
 
 #[tokio::test]
+async fn score_stats_count_only_committed_switches_and_distinguish_ineligible_incumbents() {
+    let nodes = [make_node("private-a"), make_node("private-b")];
+    let app = spawn_app_with_config(
+        Config {
+            nodes: nodes.to_vec(),
+            groups: vec![
+                Group {
+                    name: "auto".into(),
+                    policy: GroupPolicy::Score,
+                    nodes: nodes.iter().map(|node| node.id).collect(),
+                    ..Default::default()
+                },
+                Group {
+                    name: "empty".into(),
+                    policy: GroupPolicy::Score,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+        "",
+        "",
+    )
+    .await;
+    let manager = app.state.group_manager.read().clone();
+    let zero = serde_json::json!({
+        "coldExplore": 0,
+        "periodicExplore": 0,
+        "reliabilityWinner": 0,
+        "performanceWinner": 0,
+        "incumbentHeld": 0,
+        "insufficientEvidenceHeld": 0,
+        "incumbentIneligible": 0,
+        "freshFailureBypass": 0,
+        "deadFiltered": 0,
+        "ordinarySwitch": 0,
+        "switchFlap": 0,
+        "failStreakExcluded": 0,
+        "exploreBackedOff": 0,
+    });
+    let initial = get_json(&app, "/stats").await;
+    let groups = initial["score"]["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0]["name"], "auto");
+    assert_eq!(groups[1]["name"], "empty");
+    for group in groups {
+        for network in ["tcp", "udp"] {
+            assert_eq!(group[network], zero);
+        }
+    }
+
+    for (network, label) in [
+        (SelectionNetwork::Tcp, "tcp"),
+        (SelectionNetwork::Udp, "udp"),
+    ] {
+        let context = ScoreSelectionContext {
+            target: Some(ScoreTarget::domain("private-switch.example", 6543)),
+            target_family: Some(IpVersion::V4),
+            ..context(network)
+        };
+        for node in &nodes {
+            let trial = manager.selection_plan_for_target("auto", &context);
+            assert_eq!(trial.entries[0].node.id, node.id);
+            assert_eq!(
+                get_json(&app, "/stats").await["score"]["groups"][0][label]["ordinarySwitch"],
+                0
+            );
+        }
+        for node in &nodes {
+            for _ in 0..16 {
+                business_success(&manager, node, &context, true);
+            }
+        }
+
+        let first = manager.selection_plan_for_target("auto", &context);
+        let incumbent = first.entries[0].node.id;
+        let first_stats = get_json(&app, "/stats").await;
+        assert_eq!(
+            first_stats["score"]["groups"][0][label]["ordinarySwitch"],
+            0
+        );
+        let stay = manager.selection_plan_for_target("auto", &context);
+        assert_eq!(stay.entries[0].node.id, incumbent);
+        let before = get_json(&app, "/stats").await;
+        let before_counts = &before["score"]["groups"][0][label];
+        assert_eq!(before_counts["ordinarySwitch"], 0);
+        assert_eq!(before_counts["incumbentIneligible"], 0);
+
+        for _ in 0..3 {
+            manager
+                .feedback_for_node(incumbent, context.clone())
+                .unwrap()
+                .start()
+                .setup_failed(ScoreOutcome::Timeout);
+        }
+        let switched = manager.selection_plan_for_target("auto", &context);
+        let challenger = nodes.iter().find(|node| node.id != incumbent).unwrap();
+        assert_eq!(switched.entries[0].node.id, challenger.id);
+        let after = get_json(&app, "/stats").await;
+        let after_counts = &after["score"]["groups"][0][label];
+        assert_eq!(after_counts["ordinarySwitch"], 1);
+        assert_eq!(after_counts["incumbentIneligible"], 1);
+        assert_eq!(after_counts["freshFailureBypass"], 0);
+        for reason in [
+            "coldExplore",
+            "periodicExplore",
+            "reliabilityWinner",
+            "performanceWinner",
+            "incumbentHeld",
+            "insufficientEvidenceHeld",
+            "freshFailureBypass",
+        ] {
+            assert_eq!(
+                after_counts[reason], before_counts[reason],
+                "{label}: {reason}"
+            );
+        }
+        for path in ["/proxies", "/proxies/auto", "/stats"] {
+            get_json(&app, path).await;
+        }
+        assert_eq!(get_json(&app, "/stats").await["score"], after["score"]);
+    }
+
+    let final_stats = get_json(&app, "/stats").await;
+    for network in ["tcp", "udp"] {
+        assert_eq!(
+            final_stats["score"]["groups"][0][network]["ordinarySwitch"],
+            1
+        );
+        assert_eq!(final_stats["score"]["groups"][1][network], zero);
+    }
+    let encoded = final_stats["score"].to_string();
+    assert!(!encoded.contains("private-switch.example"));
+    assert!(!encoded.contains("6543"));
+    for node in &nodes {
+        assert!(!encoded.contains(&node.name));
+        assert!(!encoded.contains(&node.id.to_string()));
+    }
+}
+
+#[tokio::test]
 async fn score_verification_is_private_readonly_and_uses_canonical_candidates() {
     let (a, b, dead, unchosen) = (
         make_node("private-a"),

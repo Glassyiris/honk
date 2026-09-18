@@ -21,7 +21,6 @@ fn overlapping_layers_count_each_terminal_completion_once() {
     );
     assert!((score.completed - 3.0).abs() < 0.001);
     assert!((score.useful_completed - 3.0).abs() < 0.001);
-    assert!((score.hysteresis_completed - 3.0).abs() < 0.001);
 }
 
 #[test]
@@ -470,8 +469,8 @@ fn cancelled_cold_trials_keep_alternative_coverage() {
     for leaf in &nodes[1..] {
         let score = score_snapshot(&state.inner.lock(), "score", &target, leaf.id, now);
         assert_eq!(
-            (score.attempts, score.completed, score.failures),
-            (0.0, 0.0, 0.0)
+            (score.attempts, score.completed, score.unresolved_failure),
+            (0.0, 0.0, false)
         );
     }
 }

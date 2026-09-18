@@ -47,6 +47,10 @@ Score 首先运行与其他策略相同的存活性过滤。过滤所用的 heal
 
 性能使用独立事件时间和四次观测封顶的惯性；各指标在 60 秒后降低置信度、120 秒时过期，不受历史完成数影响。配置探测 RTT 提供基线，新鲜且可比的目标响应和分方向 goodput 可以覆盖基线。探测 RTT、setup 与首响应分别在自己的测量范围内归一，不把不同含义的毫秒值混池。HTTP 探测身份包含规范化 URI 与方法，探测 domain 和健康地址族也分别隔离。
 
+普通首次选择仍使用组内相对 utility；该赢家已经是现任时保持不变。不再合格的现任可立即替换；仍合格但业务失败尚未恢复的现任也可绕过保持。恢复要求双向 Traffic 成功终态中的实际 RX 严格晚于适用 cell 的最后失败；失败前回包的迟到结算、仅 setup 成功、探测、预热和中性结果都不能恢复保持保护。历史失败计数及连败／退避的终态结算规则不变。
+
+对于已训练、合格且已恢复的现任，所有合格且已训练的挑战者都与同一个现任比较。性能证据必须双方均有完整置信：依次选择精确响应、既有地址族优先聚合响应、同 cohort 探测、同类 setup、同类预热 setup。吞吐各方向分别选择双方共同的精确或聚合证据，双方在共同方向集合上保留既有的最佳方向 utility。实际可靠性差仅在双方都有四次有效 useful 完成时参与。优势必须超过既有保持门槛，上限仍为 `0.005`；支撑量取全局／地址族／精确完成数分别衰减后的最大值，不能相加。稀疏精确证据不再削弱成熟保护。性能缺失或过期本身不构成优势；保持现任不等于确认可用，既有有界试用仍可进行。不新增固定驻留时间，也不保证每个性能维度同时改善。
+
 实际工作开始时才创建可 clone 的 `ScoreReporter`。setup 与首响应按事件时间各发布一次；TCP 已接受的写入和 UDP 已成功发送、交付的进展进入互不重叠的 1–10 秒事件驱动窗口。被测方向至少传输 64 KiB，且 flow 已有双向进展及响应；窗口不增加 Beta 成功次数。终态最多结算一次，不重复加入已发布字节，最后一个未完成 handle 被释放时取消。拒绝、取消与关闭撤销 attempt 而不制造失败，已实际发生的观测保留。空闲或应用限速不是拥塞证据；不新增采样任务、负载重放或连接迁移。
 
 带拨号准入作用域的 TCP 拨号，在首个物理尝试获准后，或复用 session/QUIC 连接上的逻辑 open 开始前启动 reporter；等待冷物理拨号准入时不启动。回调只执行一次；未经过这两个边界便已完成的路径保留完成时的兜底回调。
@@ -75,7 +79,7 @@ Traffic reporter 覆盖透明 TCP/UDP、受支持的 DNS exchange 和 UI 下载�
 
 近期可用性以最近一次非零业务 RX 的观测时间计时，单向 TX 和终态清理都不能刷新它。迟到的完成仍保留一次性的长期终态，但已过期的 RX，以及不晚于最近失败／reload 失效边界的 RX，都不能补回近期证据。尚未过期但乱序到达的完成保留最新观测时钟；已准入且继续存活的 flow 可以用边界之后真正新增的 RX 重新提供证据。
 
-一次已授权的多候选 Apply 按优先级恰好增加一个最终原因：`coldExplore`、`periodicExplore`、`incumbentHeld`、`freshFailureBypass`、`reliabilityWinner`，然后是 `performanceWinner`。`deadFiltered` 独立计数被活性过滤移除的唯一叶候选。`switchFlap` 独立计数同一 `(group, network, family, target)` 作用域内已提交胜者在八次选择内切回前一胜者——无关目标交错各自的胜者永远不计入；无目标选择共享一个桶，历史由 4,096 项 LRU 封顶。冷探索与周期探索不修改这段后悔窗口。`failStreakExcluded` 按每次已授权 rank 累计被三连败新鲜失败门排除的候选数，`exploreBackedOff` 累计当前处于探索退避的候选数。Peek、proxy/stat 读取、单例旁路和最后尝试选择均保持中性。经鉴权的 `/stats.score.groups[]` 快照只公开这些按组的 TCP/UDP 计数，不包含 cell、节点、目标、cadence 或 manager authority。`/stats.score.cache` 公开两个 4,096 项证据 LRU 各自的当前 cell 数与累计淘汰数，同样不含任何组、节点或目标身份。
+一次已授权的多候选 rank 只增加一个最终原因：`coldExplore`、`periodicExplore`、`incumbentIneligible`、`freshFailureBypass`、`insufficientEvidenceHeld`、`incumbentHeld`、`reliabilityWinner` 或 `performanceWinner`。`insufficientEvidenceHeld` 表示没有挑战者获得晋升，且普通 utility 赢家缺少双方均完整合格的性能比较，并不表示没有可靠性历史。`ordinarySwitch` 独立统计同一 `(group, network, family, target)` 历史中的普通已提交 A→B 变更，不含首次选择和试用；`switchFlap` 是其中在八次普通选择内返回前一赢家的子集。`deadFiltered`、`failStreakExcluded`、`exploreBackedOff` 累计受影响候选，不是失败连接数。历史仍是 4,096 项 LRU，缺失／淘汰的历史不能证明发生了切换。Peek、proxy/stat 读取、单例旁路和最后尝试选择不增加这些计数。经鉴权的 `/stats.score` 只导出固定组／网络计数和两个证据缓存的占用／淘汰数，不导出 scorer 私有节点／目标／cell 身份。
 
 ### URLTest 排名与滞后
 

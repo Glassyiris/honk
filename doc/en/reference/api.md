@@ -187,7 +187,8 @@ A non-empty `external_ui_download_detour` forces the initial request and redirec
 H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
 R = {
   coldExplore, periodicExplore, reliabilityWinner, performanceWinner,
-  incumbentHeld, freshFailureBypass, deadFiltered, switchFlap,
+  incumbentHeld, insufficientEvidenceHeld, incumbentIneligible,
+  freshFailureBypass, deadFiltered, ordinarySwitch, switchFlap,
   failStreakExcluded, exploreBackedOff
 } // every R value is a u64 count
 ```
@@ -241,7 +242,7 @@ events.
 
 `score.groups` is an additive part of the authenticated `/stats` response. It is an empty array when no group currently uses `policy: score`; otherwise it contains every current Score group, including groups with no resolved leaves, sorted lexicographically by `name`. Each group always has both `tcp` and `udp` objects, and each object always has every `R` field above. Missing network activity is represented by zeroes, never omitted fields.
 
-Each value is a saturating `u64` count, not a latency, throughput or health measurement. One authorized multi-candidate Score Apply records one final reason: `coldExplore` for the finite startup allowance; `periodicExplore` for shared time/count/degradation revalidation; `incumbentHeld` for a retained committed winner; `freshFailureBypass` when fresh failure defeats eligibility or holding; `reliabilityWinner` when no alternative qualifies for normal comparison; otherwise `performanceWinner`. A performance reason does not prove improvement or a switch. `deadFiltered` counts unique health-filtered leaves. `switchFlap` counts return to the prior committed winner within eight target-scoped selections, excluding trials. `failStreakExcluded` and `exploreBackedOff` count affected candidates per rank. Peek, API reads, singleton bypass and last resort do not increment these counters.
+Each value is a saturating `u64` count, not a latency, throughput or health measurement. One authorized multi-candidate Score Apply records one final reason: `coldExplore` or `periodicExplore` for validation; `incumbentIneligible` for leaving an incumbent outside ordinary eligibility; `freshFailureBypass` for an eligible incumbent's unresolved business failure; `insufficientEvidenceHeld` when no challenger earns promotion and the ordinary utility winner lacks a qualified shared performance comparison; `incumbentHeld` when comparison does not clear the hold margin; otherwise `reliabilityWinner` or `performanceWinner` retain their alternative-eligibility classification. `performanceWinner` does not prove improvement or a switch, and `insufficientEvidenceHeld` does not mean reliability history is absent. `ordinarySwitch` counts actual committed normal A→B choices; `switchFlap` counts returns to the prior winner within eight same-target ordinary choices. First choices, trials and missing prior history cannot add switches. `deadFiltered`, `failStreakExcluded` and `exploreBackedOff` count affected candidates per rank. Peek, API reads, singleton bypass and last resort do not increment these counters; ranks in nested groups are not a one-to-one count of dispatched connections.
 
 Counters begin at zero on process start and accumulate in process memory only. They survive a successful reload while the group name remains configured, including zero-leaf and temporary Score-to-non-Score-to-Score transitions; non-Score groups are hidden from this response. A committed deletion prunes that name's counters, and a recreated name starts at zero. Generation-fenced superseded managers cannot mutate counters after replacement, including after same-name recreation. The snapshot is copied before JSON serialization, so reading it cannot mutate selection state.
 

@@ -1,6 +1,258 @@
 use super::*;
 
 #[test]
+fn one_exact_success_cannot_weaken_mature_incumbent_protection() {
+    let nodes = [node("incumbent"), node("challenger")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let previous = context("previous.example", IpVersion::V4);
+    let target = context("new.example", IpVersion::V4);
+    let now = Instant::now();
+    for (index, leaf) in nodes.iter().enumerate() {
+        train_at(
+            &manager,
+            leaf,
+            &previous,
+            200,
+            Duration::from_millis(100 + index as u64 * 10),
+            1,
+            now + Duration::from_secs(index as u64 * 2),
+        );
+    }
+    assert_eq!(
+        rank_at(&manager, &nodes, &target, now + Duration::from_secs(4)),
+        0
+    );
+    train_at(
+        &manager,
+        &nodes[0],
+        &target,
+        1,
+        Duration::from_millis(100),
+        1,
+        now + Duration::from_secs(5),
+    );
+    train_at(
+        &manager,
+        &nodes[1],
+        &previous,
+        200,
+        Duration::from_millis(95),
+        1,
+        now + Duration::from_secs(7),
+    );
+    assert_eq!(
+        rank_at(&manager, &nodes, &target, now + Duration::from_secs(9)),
+        0
+    );
+    let state = manager.score_state();
+    assert_eq!(
+        state
+            .selection_reason_counts("score", SelectionNetwork::Tcp)
+            .incumbent_held,
+        1
+    );
+
+    for (index, leaf) in nodes.iter().enumerate() {
+        train_at(
+            &manager,
+            leaf,
+            &target,
+            20,
+            Duration::from_millis(if index == 0 { 600 } else { 60 }),
+            1,
+            now + Duration::from_secs(10 + index as u64 * 2),
+        );
+    }
+    assert_eq!(
+        rank_at(&manager, &nodes, &target, now + Duration::from_secs(14)),
+        1
+    );
+    assert_eq!(
+        state
+            .selection_reason_counts("score", SelectionNetwork::Tcp)
+            .ordinary_switch,
+        1
+    );
+}
+
+#[test]
+fn expired_incumbent_holds_unmatched_refresh_but_shared_probe_can_promote() {
+    let nodes = [node("a-100ms"), node("b-110ms"), node("c-120ms")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    let start = now - Duration::from_secs(124);
+    for (index, leaf) in nodes.iter().enumerate() {
+        train_at(
+            &manager,
+            leaf,
+            &target,
+            20,
+            Duration::from_millis(100 + index as u64 * 10),
+            1,
+            start + Duration::from_secs(index as u64 * 2),
+        );
+    }
+    assert_eq!(
+        rank_at(&manager, &nodes, &target, start + Duration::from_secs(6)),
+        0
+    );
+    for (index, leaf) in nodes.iter().enumerate().skip(1) {
+        train_at(
+            &manager,
+            leaf,
+            &target,
+            20,
+            Duration::from_millis(100 + index as u64 * 10),
+            1,
+            start + Duration::from_secs(80 + index as u64 * 2),
+        );
+    }
+    let state = manager.score_state();
+    let refs = nodes.iter().collect::<Vec<_>>();
+    assert_eq!(state.peek_rank("score", &target, &refs), 0);
+    let _ = rank_at(&manager, &nodes, &target, now);
+    assert_eq!(rank_at(&manager, &nodes, &target, now), 0);
+    let reasons = state.selection_reason_counts("score", SelectionNetwork::Tcp);
+    assert_eq!(reasons.insufficient_evidence_held, 2);
+    assert_eq!(reasons.ordinary_switch, 0);
+    assert_eq!(reasons.periodic_explore, 0);
+
+    let probe = context("configured.example", IpVersion::V4);
+    for (leaf, latency) in nodes[..2].iter().zip([600, 60]) {
+        probe_at(
+            &manager,
+            leaf,
+            &probe,
+            ScoreSource::HealthProbe,
+            Duration::from_millis(latency),
+            now,
+        );
+    }
+    assert_eq!(rank_at(&manager, &nodes, &target, now), 1);
+    assert_eq!(
+        state
+            .selection_reason_counts("score", SelectionNetwork::Tcp)
+            .ordinary_switch,
+        1
+    );
+}
+
+#[test]
+fn unsupported_global_best_cannot_mask_comparable_third_challenger() {
+    let nodes = [
+        node("incumbent"),
+        node("unmatched-fast"),
+        node("shared-probe-fast"),
+    ];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    let start = now - Duration::from_secs(124);
+    for (index, leaf) in nodes.iter().enumerate() {
+        train_at(
+            &manager,
+            leaf,
+            &target,
+            20,
+            Duration::from_millis(100 + index as u64 * 10),
+            1,
+            start + Duration::from_secs(index as u64 * 2),
+        );
+    }
+    assert_eq!(
+        rank_at(&manager, &nodes, &target, start + Duration::from_secs(6)),
+        0
+    );
+    for (index, latency) in [(1, 10), (2, 100)] {
+        train_at(
+            &manager,
+            &nodes[index],
+            &target,
+            20,
+            Duration::from_millis(latency),
+            1,
+            start + Duration::from_secs(80 + index as u64 * 2),
+        );
+    }
+    let probe = context("configured.example", IpVersion::V4);
+    for (index, latency) in [(0, 600), (2, 60)] {
+        probe_at(
+            &manager,
+            &nodes[index],
+            &probe,
+            ScoreSource::HealthProbe,
+            Duration::from_millis(latency),
+            now,
+        );
+    }
+    assert_eq!(
+        manager
+            .score_state()
+            .peek_rank("score", &target, &nodes.iter().collect::<Vec<_>>()),
+        2
+    );
+}
+
+#[test]
+fn opposite_direction_strengths_do_not_create_a_pairwise_rate_gain() {
+    let nodes = [node("upload"), node("download"), node("extreme-upload")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    for (index, leaf) in nodes.iter().enumerate() {
+        train_at(
+            &manager,
+            leaf,
+            &target,
+            20,
+            Duration::from_millis(100),
+            1,
+            now + Duration::from_secs(index as u64 * 2),
+        );
+    }
+    assert_eq!(
+        rank_at(&manager, &nodes, &target, now + Duration::from_secs(6)),
+        0
+    );
+    for (index, (tx, rx)) in [
+        (1_000_000, 100_000),
+        (100_000, 1_000_000),
+        (10_000_000, 65_536),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let at = now + Duration::from_secs(7 + index as u64 * 2);
+        let feedback = manager
+            .feedback_for_group_node("score", nodes[index].id, target.clone())
+            .unwrap();
+        let reporters: Vec<_> = (0..4).map(|_| feedback.start_at(at)).collect();
+        for reporter in &reporters {
+            reporter.setup_succeeded_at(at);
+        }
+        for reporter in &reporters {
+            reporter.first_response_at(at + Duration::from_millis(100));
+        }
+        for reporter in &reporters {
+            reporter.transfer_at(tx, rx, at + Duration::from_secs(1));
+        }
+        for reporter in reporters {
+            reporter.finish_at(ScoreOutcome::Success, true, at + Duration::from_secs(1));
+        }
+    }
+    assert_eq!(
+        rank_at(&manager, &nodes, &target, now + Duration::from_secs(13)),
+        0
+    );
+    let reasons = manager
+        .score_state()
+        .selection_reason_counts("score", SelectionNetwork::Tcp);
+    assert_eq!(reasons.incumbent_held, 1);
+    assert_eq!(reasons.ordinary_switch, 0);
+}
+
+#[test]
 fn less_sampled_faster_leaf_wins_normal_selection() {
     let nodes = [node("historical"), node("faster")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);

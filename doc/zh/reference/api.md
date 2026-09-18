@@ -182,7 +182,8 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
 R = {
   coldExplore, periodicExplore, reliabilityWinner, performanceWinner,
-  incumbentHeld, freshFailureBypass, deadFiltered, switchFlap,
+  incumbentHeld, insufficientEvidenceHeld, incumbentIneligible,
+  freshFailureBypass, deadFiltered, ordinarySwitch, switchFlap,
   failStreakExcluded, exploreBackedOff
 } // R 的每个值均为 u64 计数
 ```
@@ -207,7 +208,7 @@ R = {
 
 `score.groups` 是经鉴权 `/stats` 响应中的附加部分。当前没有任何组使用 `policy: score` 时它为 `[]`；否则它包含每个当前 Score 组（包括没有解析出叶节点的组），按 `name` 的字典序排列。每组始终都有 `tcp` 和 `udp` 对象，且每个对象始终包含全部 `R` 字段；没有网络活动时以零表示，绝不省略字段。
 
-每个值是饱和 `u64` 计数，不是延迟、吞吐或健康测量。一次已授权的多候选 Score Apply 记录一个最终原因：`coldExplore` 表示有限冷启动预算；`periodicExplore` 表示共享时间/计数/退化验证；`incumbentHeld` 表示保持已提交胜者；`freshFailureBypass` 表示新鲜失败使资格或保持失效；没有其他普通合格候选时为 `reliabilityWinner`，其余为 `performanceWinner`。性能原因不证明提速或发生切换。`deadFiltered` 计数唯一健康过滤叶节点；`switchFlap` 计数同目标八次选择内返回前一已提交胜者，不包含试用；`failStreakExcluded` 和 `exploreBackedOff` 按 rank 计数受影响候选。Peek、API 读取、单例与最后尝试旁路不增加这些计数。
+每个值是饱和 `u64` 计数，不是延迟、吞吐或健康测量。一次已授权的多候选 Score Apply 记录一个最终原因：`coldExplore` 或 `periodicExplore` 表示验证；`incumbentIneligible` 表示现任已不满足普通资格；`freshFailureBypass` 表示合格现任的业务失败尚未恢复；`insufficientEvidenceHeld` 表示没有挑战者获得晋升且普通 utility 赢家缺少双方合格的性能比较；`incumbentHeld` 表示比较优势未跨过保持门槛；其余 `reliabilityWinner`、`performanceWinner` 保留按替代候选资格分类的含义。`performanceWinner` 不证明提速或发生切换，`insufficientEvidenceHeld` 不表示可靠性历史缺失。`ordinarySwitch` 统计实际普通已提交 A→B 选择；`switchFlap` 统计其中同目标八次普通选择内返回前一赢家的情况。首次选择、试用及缺少之前历史时不能增加切换计数。`deadFiltered`、`failStreakExcluded` 和 `exploreBackedOff` 按 rank 累计受影响候选。Peek、API 读取、单例与最后尝试旁路不增加这些计数；嵌套组 rank 与实际出站连接并非一一对应。
 
 计数在进程启动时从零开始，只在进程内存中累积。只要组名仍在已提交配置中，成功 reload 会保留它们，包括零叶节点以及临时 Score→非 Score→Score 转换；非 Score 组不会显示在此响应中。已提交的删除会清除该名称的计数，之后重新创建同名组从零开始。受 generation fence 约束的已淘汰 manager 在被替换后不能再修改计数，即使同名组随后被重新创建。快照在 JSON 序列化前复制，读取不会改变选路状态。
 

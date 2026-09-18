@@ -253,6 +253,10 @@ impl Stats {
         if count_usefulness {
             if sample.outcome == ScoreOutcome::Success && sample.tx > 0 && sample.rx > 0 {
                 self.useful_success += 1.0;
+                if let Some(at) = sample.last_rx_at {
+                    self.last_successful_rx_at =
+                        Some(self.last_successful_rx_at.map_or(at, |seen| seen.max(at)));
+                }
                 if let Some(at) = sample.last_rx_at
                     && now.saturating_duration_since(at) < PERFORMANCE_MAX_AGE
                     && self

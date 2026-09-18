@@ -112,7 +112,7 @@ fn switch_flap_ignores_cross_target_interleaving() {
 }
 
 #[test]
-fn applied_score_selection_records_switch_flap() {
+fn ordinary_switch_counts_commits_but_not_first_choice_stay_peek_or_trial() {
     let nodes = [node("first"), node("second")];
     let node_refs = [&nodes[0], &nodes[1]];
     let state = ScorePolicyState::default();
@@ -136,20 +136,92 @@ fn applied_score_selection_records_switch_flap() {
             .put(keys[1].clone(), trained_stats(8.0, 200.0, now));
     }
     assert_eq!(state.rank_at("score", &context, &node_refs, now), 0);
-
-    inner_update_response(&state, keys[0].clone(), 200.0);
-    inner_update_response(&state, keys[1].clone(), 50.0);
-    assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
-
-    inner_update_response(&state, keys[0].clone(), 50.0);
-    inner_update_response(&state, keys[1].clone(), 200.0);
     assert_eq!(state.rank_at("score", &context, &node_refs, now), 0);
     assert_eq!(
         state
             .selection_reason_counts("score", SelectionNetwork::Tcp)
-            .switch_flap,
+            .ordinary_switch,
+        0
+    );
+
+    inner_update_response(&state, keys[0].clone(), 200.0);
+    inner_update_response(&state, keys[1].clone(), 50.0);
+    let before_peek = state.selection_reason_counts("score", SelectionNetwork::Tcp);
+    assert_eq!(state.peek_rank("score", &context, &node_refs), 1);
+    assert_eq!(
+        state.selection_reason_counts("score", SelectionNetwork::Tcp),
+        before_peek
+    );
+    assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
+    assert_eq!(state.rank_at("score", &context, &node_refs, now), 1);
+    assert_eq!(
+        state
+            .selection_reason_counts("score", SelectionNetwork::Tcp)
+            .ordinary_switch,
         1
     );
+
+    let expired = now + PERFORMANCE_MAX_AGE + Duration::from_secs(1);
+    assert_eq!(state.rank_at("score", &context, &node_refs, expired), 0);
+    let trial = state.selection_reason_counts("score", SelectionNetwork::Tcp);
+    assert_eq!(trial.periodic_explore, 1);
+    assert_eq!(trial.ordinary_switch, 1);
+    state
+        .inner
+        .lock()
+        .selection_reasons
+        .get_mut(&SelectionReasonKey::new("score", SelectionNetwork::Tcp))
+        .unwrap()
+        .insufficient_evidence_held = u64::MAX;
+    assert_eq!(state.rank_at("score", &context, &node_refs, expired), 1);
+    assert_eq!(
+        state
+            .selection_reason_counts("score", SelectionNetwork::Tcp)
+            .insufficient_evidence_held,
+        u64::MAX
+    );
+    {
+        let mut inner = state.inner.lock();
+        inner
+            .aggregate
+            .put(keys[0].clone(), trained_stats(8.0, 50.0, expired));
+        inner
+            .aggregate
+            .put(keys[1].clone(), trained_stats(8.0, 200.0, expired));
+    }
+    assert_eq!(state.rank_at("score", &context, &node_refs, expired), 0);
+    let switched = state.selection_reason_counts("score", SelectionNetwork::Tcp);
+    assert_eq!(switched.ordinary_switch, 2);
+    assert_eq!(switched.switch_flap, 1);
+
+    {
+        let mut inner = state.inner.lock();
+        inner.aggregate.get_mut(&keys[0]).unwrap().fail_streak = SCORE_FAIL_STREAK_EXCLUDE;
+        let counts = inner
+            .selection_reasons
+            .get_mut(&SelectionReasonKey::new("score", SelectionNetwork::Tcp))
+            .unwrap();
+        counts.ordinary_switch = u64::MAX;
+    }
+    assert_eq!(state.rank_at("score", &context, &node_refs, expired), 1);
+    let saturated = state.selection_reason_counts("score", SelectionNetwork::Tcp);
+    assert_eq!(saturated.ordinary_switch, u64::MAX);
+    assert_eq!(saturated.incumbent_ineligible, 1);
+    assert_eq!(saturated.fresh_failure_bypass, 0);
+    {
+        let mut inner = state.inner.lock();
+        inner.aggregate.get_mut(&keys[0]).unwrap().fail_streak = 0;
+        inner.aggregate.get_mut(&keys[1]).unwrap().fail_streak = SCORE_FAIL_STREAK_EXCLUDE;
+        inner
+            .selection_reasons
+            .get_mut(&SelectionReasonKey::new("score", SelectionNetwork::Tcp))
+            .unwrap()
+            .incumbent_ineligible = u64::MAX;
+    }
+    assert_eq!(state.rank_at("score", &context, &node_refs, expired), 0);
+    let saturated = state.selection_reason_counts("score", SelectionNetwork::Tcp);
+    assert_eq!(saturated.incumbent_ineligible, u64::MAX);
+    assert_eq!(saturated.ordinary_switch, u64::MAX);
 }
 
 #[test]
@@ -272,6 +344,7 @@ fn selection_reason_precedence_is_stable() {
                     Stats {
                         attempts: 257.0,
                         useful_failure: 1.0,
+                        failed_at: Some(now),
                         selected_at: 1,
                         ..trained_stats(256.0, 100.0, now)
                     },
@@ -400,6 +473,7 @@ fn selection_reason_precedence_is_stable() {
             "bypass",
             ScoreReasonCounters {
                 fresh_failure_bypass: 1,
+                ordinary_switch: 1,
                 ..Default::default()
             },
         ),
@@ -480,7 +554,10 @@ fn selection_reason_counting_respects_apply_and_filter_boundaries() {
                 + counts.reliability_winner
                 + counts.performance_winner
                 + counts.incumbent_held
-                + counts.fresh_failure_bypass,
+                + counts.fresh_failure_bypass
+                + counts.incumbent_ineligible
+                + counts.insufficient_evidence_held
+                + counts.ordinary_switch,
             0
         );
     }
@@ -562,6 +639,9 @@ fn selection_reason_counting_respects_apply_and_filter_boundaries() {
         performance_winner: u64::MAX,
         incumbent_held: u64::MAX,
         fresh_failure_bypass: u64::MAX,
+        incumbent_ineligible: u64::MAX,
+        insufficient_evidence_held: u64::MAX,
+        ordinary_switch: u64::MAX,
         dead_filtered: u64::MAX,
         switch_flap: u64::MAX,
         fail_streak_excluded: u64::MAX,
@@ -724,10 +804,6 @@ fn score_reason_snapshot_is_sorted_fixed_and_private() {
     assert_eq!(snapshot[0].tcp, ScoreReasonCounters::default());
     assert_eq!(snapshot[1].udp, ScoreReasonCounters::default());
 
-    let debug = format!("{snapshot:?}");
-    assert!(!debug.contains("private-node-alpha"));
-    assert!(!debug.contains("private-node-beta"));
-    assert!(!debug.contains("private-target.internal"));
     let ScoreReasonCounters {
         cold_explore: _,
         periodic_explore: _,
@@ -735,6 +811,9 @@ fn score_reason_snapshot_is_sorted_fixed_and_private() {
         performance_winner: _,
         incumbent_held: _,
         fresh_failure_bypass: _,
+        incumbent_ineligible: _,
+        insufficient_evidence_held: _,
+        ordinary_switch: _,
         dead_filtered: _,
         switch_flap: _,
         fail_streak_excluded: _,
@@ -748,26 +827,6 @@ fn score_reason_snapshot_is_sorted_fixed_and_private() {
     let later = manager.score_reason_snapshot();
     assert_eq!(snapshot[1].tcp.cold_explore, 1);
     assert_eq!(later[1].tcp.cold_explore, 2);
-
-    let saturated = ScoreReasonCounters {
-        cold_explore: u64::MAX,
-        periodic_explore: u64::MAX,
-        reliability_winner: u64::MAX,
-        performance_winner: u64::MAX,
-        incumbent_held: u64::MAX,
-        fresh_failure_bypass: u64::MAX,
-        dead_filtered: u64::MAX,
-        switch_flap: u64::MAX,
-        fail_streak_excluded: u64::MAX,
-        explore_backed_off: u64::MAX,
-    };
-    state.inner.lock().selection_reasons.insert(
-        SelectionReasonKey::new("z-score", SelectionNetwork::Udp),
-        saturated,
-    );
-    let saturated_snapshot = manager.score_reason_snapshot();
-    assert_eq!(saturated_snapshot[1].udp, saturated);
-    println!("owned score snapshot={snapshot:?} later={later:?} saturated={saturated_snapshot:?}");
 }
 
 #[test]

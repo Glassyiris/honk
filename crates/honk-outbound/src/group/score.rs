@@ -37,7 +37,6 @@ const MIN_TRAINED_EVIDENCE: f64 = 0.5;
 const SCORE_SWITCH_FULL_EVIDENCE: f64 = 8.0;
 const SCORE_SWITCH_FLAP_WINDOW: u64 = 8;
 const SELECTION_HISTORY_CAPACITY: usize = 4096;
-const SCORE_FAILURE_FORGIVENESS_THRESHOLD: f64 = 0.01;
 const SCORE_EXPLORATION_MIN_PERIOD: u64 = 16;
 const SCORE_EXPLORATION_MAX_PERIOD: u64 = 64;
 const SCORE_EXPLORE_BACKOFF_BASE: Duration = Duration::from_secs(5 * 60);
@@ -189,6 +188,7 @@ struct Stats {
     useful_business: WeightedMean,
     business_invalidated_through: Option<Instant>,
     failed_at: Option<Instant>,
+    last_successful_rx_at: Option<Instant>,
     warm_setup_ms: WeightedMean,
     probes: [evidence::ProbeMetric; 6],
     last_attempt: Option<Instant>,
@@ -273,14 +273,9 @@ enum SelectionReason {
     ReliabilityWinner,
     PerformanceWinner,
     IncumbentHeld,
+    InsufficientEvidenceHeld,
+    IncumbentIneligible,
     FreshFailureBypass,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HoldDecision {
-    Held,
-    FreshFailureBypass,
-    UseBest,
 }
 
 impl SelectionReason {
@@ -317,8 +312,11 @@ pub struct ScoreReasonCounters {
     pub reliability_winner: u64,
     pub performance_winner: u64,
     pub incumbent_held: u64,
+    pub insufficient_evidence_held: u64,
+    pub incumbent_ineligible: u64,
     pub fresh_failure_bypass: u64,
     pub dead_filtered: u64,
+    pub ordinary_switch: u64,
     pub switch_flap: u64,
     pub fail_streak_excluded: u64,
     pub explore_backed_off: u64,
@@ -552,6 +550,8 @@ impl ScorePolicyState {
             SelectionReason::ReliabilityWinner => &mut counts.reliability_winner,
             SelectionReason::PerformanceWinner => &mut counts.performance_winner,
             SelectionReason::IncumbentHeld => &mut counts.incumbent_held,
+            SelectionReason::InsufficientEvidenceHeld => &mut counts.insufficient_evidence_held,
+            SelectionReason::IncumbentIneligible => &mut counts.incumbent_ineligible,
             SelectionReason::FreshFailureBypass => &mut counts.fresh_failure_bypass,
         };
         *counter = counter.saturating_add(1);
@@ -593,16 +593,16 @@ impl ScorePolicyState {
         history.previous = Some(history.current);
         history.current = node_id;
         history.switched_at = history.selections;
+        let counters = inner
+            .selection_reasons
+            .entry(SelectionReasonKey::new(
+                &history_key.group,
+                history_key.network,
+            ))
+            .or_default();
+        counters.ordinary_switch = counters.ordinary_switch.saturating_add(1);
         if switch_flap {
-            let counter = &mut inner
-                .selection_reasons
-                .entry(SelectionReasonKey::new(
-                    &history_key.group,
-                    history_key.network,
-                ))
-                .or_default()
-                .switch_flap;
-            *counter = counter.saturating_add(1);
+            counters.switch_flap = counters.switch_flap.saturating_add(1);
         }
     }
 
@@ -751,7 +751,6 @@ impl ScorePolicyState {
 struct ScoreSnapshot {
     attempts: f64,
     completed: f64,
-    hysteresis_completed: f64,
     reliability: f64,
     reliability_upper: f64,
     useful_completed: f64,
@@ -763,7 +762,7 @@ struct ScoreSnapshot {
     observed_reliability: f64,
     last_attempt: Option<Instant>,
     degraded_at: Option<Instant>,
-    failures: f64,
+    unresolved_failure: bool,
     explore_backed_off: bool,
     fail_streak: u32,
     selected_at: u64,
