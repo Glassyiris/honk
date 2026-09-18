@@ -30,6 +30,8 @@ use super::offline::DependencySnapshot;
 use super::operations::{OperationStore, Reservation};
 use super::{ApiError, ErrorCode, NativeState, error, parse_query, timestamp, types::RequestId};
 
+/// What `GET /config` shows in place of a private source path.
+pub(crate) const REDACTED_PATH: &str = "<redacted>";
 pub(crate) const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_SOURCES: usize = 32;
 
@@ -99,13 +101,17 @@ impl ConfigService {
     }
 
     pub(crate) fn accept(&self, update: &SourceUpdate, generation: u64) {
+        let budgeted = update
+            .dependencies
+            .iter()
+            .filter(|dependency| !dependency.asset);
         if update.sources.is_empty()
-            || update.sources.len() + update.dependencies.len() > MAX_SOURCES
+            || update.sources.len() + budgeted.clone().count() > MAX_SOURCES
             || update
                 .sources
                 .iter()
                 .map(|source| source.content.len())
-                .chain(update.dependencies.iter().map(|source| source.bytes))
+                .chain(budgeted.map(|source| source.bytes))
                 .try_fold(0usize, usize::checked_add)
                 .is_none_or(|bytes| bytes > MAX_SOURCE_BYTES)
         {
@@ -243,7 +249,7 @@ impl ConfigService {
     fn source_value(&self, accepted: &Accepted, index: usize) -> Value {
         let source = &accepted.update.sources[index];
         let mut value = json!({
-            "id":accepted.ids[&source.path], "path":"<redacted>", "kind":if index==0 {"main"} else {"include"},
+            "id":accepted.ids[&source.path], "path":REDACTED_PATH, "kind":if index==0 {"main"} else {"include"},
             "content_sha256":accepted.hashes[index], "bytes":source.content.len(),
             "writable":self.source_writable(accepted,index), "loaded_at":accepted.accepted_at,
             "line_count":source.content.lines().count(),
