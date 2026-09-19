@@ -685,9 +685,13 @@ mod native_api {
             serde_json::json!({"allow_origins":["https://panel.example/"]}),
             serde_json::json!({"allow_origins":["https://panel.example?secret=PRIVATE"]}),
             serde_json::json!({"allow_origins":["https://user:PRIVATE@panel.example"]}),
-            serde_json::json!({"ui":"embedded"}),
             serde_json::json!({"probe_allowed_cidrs":["PRIVATE"]}),
             serde_json::json!({"probe_allowed_ports":[0]}),
+            serde_json::json!({"geosite_download_url":"https://user:PRIVATE@example.test/data"}),
+            serde_json::json!({"geoip_download_url":"file:///PRIVATE"}),
+            serde_json::json!({"geoip_download_url":"https://example.test/#PRIVATE"}),
+            serde_json::json!({"geosite_download_url":"https://@example.test/data"}),
+            serde_json::json!({"geosite_download_url":"https://example.test:0/data"}),
         ] {
             let config: Config =
                 serde_json::from_value(serde_json::json!({"experimental":{"native_api":native}}))
@@ -708,9 +712,11 @@ mod native_api {
         }
         for native in [
             serde_json::json!({}),
+            serde_json::json!({"ui":"embedded"}),
             serde_json::json!({"enabled":true,"allow_anonymous_loopback":true}),
             serde_json::json!({"enabled":true,"listen":"[::1]:9527","allow_anonymous_loopback":true}),
             serde_json::json!({"enabled":true,"listen":"0.0.0.0:9527","secret":"PRIVATE"}),
+            serde_json::json!({"geosite_download_url":"https://example.test/data?token=PRIVATE","geoip_download_url":"http://[::1]:8080/data"}),
         ] {
             let config: Config =
                 serde_json::from_value(serde_json::json!({"experimental":{"native_api":native}}))
@@ -718,5 +724,17 @@ mod native_api {
             config.validate_detailed().unwrap();
             config.validate_assembled().unwrap();
         }
+        let config = parse_dae_config_with_detailed_diagnostics(
+            "experimental { native_api {\n geosite_download_url: 'https://example.test/site?token=PRIVATE'\n geoip_download_url: 'http://[::1]:8080/ip'\n } }", &mut Vec::new(),
+        ).unwrap();
+        config.validate_detailed().unwrap();
+        assert_eq!(
+            config.experimental.native_api.geosite_download_url,
+            "https://example.test/site?token=PRIVATE"
+        );
+        assert_eq!(
+            config.experimental.native_api.geoip_download_url,
+            "http://[::1]:8080/ip"
+        );
     }
 }

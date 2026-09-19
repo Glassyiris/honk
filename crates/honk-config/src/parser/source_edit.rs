@@ -164,6 +164,209 @@ fn quote_scalar(value: &str, preferred: Option<char>) -> Result<String, GroupSou
     Err(GroupSourceError)
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("managed source cannot represent the requested edit")]
+pub struct ManagedSourceError;
+
+/// Append one validated, explicitly named node without expanding includes.
+/// Duplicate names or derived node identities in this source are rejected.
+pub fn append_node_source(
+    source: &SourceSnapshot,
+    name: &str,
+    link: &str,
+) -> Result<String, ManagedSourceError> {
+    let (entry, config) = managed_entry("node", name, link)?;
+    let [node] = config.nodes.as_slice() else {
+        return Err(ManagedSourceError);
+    };
+    if node.name != name {
+        return Err(ManagedSourceError);
+    }
+    let document = managed_document(source)?;
+    let sections = document
+        .sections()
+        .filter(|root| root.header() == "node")
+        .collect::<Vec<_>>();
+    let mut notices = Vec::new();
+    let mut diagnostics =
+        super::diagnostics::ParserDiagnostics::new(&mut notices, source.source.clone());
+    let nodes = super::entries::parse_node_section(&sections, &mut diagnostics)
+        .map_err(|_| ManagedSourceError)?;
+    if nodes
+        .iter()
+        .any(|existing| existing.name == name || existing.id == node.id)
+    {
+        return Err(ManagedSourceError);
+    }
+    Ok(append_entry(&document, "node", &entry))
+}
+
+/// Remove the unique declaration with this parser-derived node identity.
+/// `None` means this source owns no matching declaration; includes are untouched.
+pub fn remove_node_source(
+    source: &SourceSnapshot,
+    id: uuid::Uuid,
+) -> Result<Option<String>, ManagedSourceError> {
+    let document = managed_document(source)?;
+    let sections = document
+        .sections()
+        .filter(|root| root.header() == "node")
+        .collect::<Vec<_>>();
+    let mut notices = Vec::new();
+    let mut diagnostics =
+        super::diagnostics::ParserDiagnostics::new(&mut notices, source.source.clone());
+    let mut target = None;
+    let mut duplicate = false;
+    super::entries::parse_node_section_indexed(&sections, &mut diagnostics, |node, span| {
+        if node.id == id {
+            duplicate |= target.replace(span.start..span.end).is_some();
+        }
+    })
+    .map_err(|_| ManagedSourceError)?;
+    if duplicate {
+        return Err(ManagedSourceError);
+    }
+    Ok(target.map(|range| {
+        let mut output = source.content.to_string();
+        output.replace_range(range, "");
+        output
+    }))
+}
+
+/// Append an unfetched HTTP(S) subscription, rejecting duplicate source names.
+/// Fetching and whole-candidate admission remain the coordinator's responsibility.
+pub fn append_subscription_source(
+    source: &SourceSnapshot,
+    name: &str,
+    url: &str,
+) -> Result<String, ManagedSourceError> {
+    let (entry, config) = managed_entry("subscription", name, url)?;
+    let [subscription] = config.subscriptions.as_slice() else {
+        return Err(ManagedSourceError);
+    };
+    if subscription.name != name
+        || subscription.url != url
+        || url::Url::parse(url)
+            .ok()
+            .is_none_or(|url| url.host_str().is_none())
+    {
+        return Err(ManagedSourceError);
+    }
+    let document = managed_document(source)?;
+    let sections = document
+        .sections()
+        .filter(|root| root.header() == "subscription")
+        .collect::<Vec<_>>();
+    let mut notices = Vec::new();
+    let mut diagnostics =
+        super::diagnostics::ParserDiagnostics::new(&mut notices, source.source.clone());
+    let subscriptions = super::entries::parse_subscription_section(&sections, &mut diagnostics)
+        .map_err(|_| ManagedSourceError)?;
+    if subscriptions.iter().any(|existing| existing.name == name) {
+        return Err(ManagedSourceError);
+    }
+    Ok(append_entry(&document, "subscription", &entry))
+}
+
+/// Match by name and fetch identity (URL, configured UA, headers), never the
+/// parser's random subscription UUID or mutable refresh metadata. Ambiguous
+/// duplicate declarations and legacy headers owning child entries are rejected.
+pub fn remove_subscription_source(
+    source: &SourceSnapshot,
+    subscription: &crate::subscription::Subscription,
+) -> Result<Option<String>, ManagedSourceError> {
+    let document = managed_document(source)?;
+    let sections = document
+        .sections()
+        .filter(|root| root.header() == "subscription")
+        .collect::<Vec<_>>();
+    let mut notices = Vec::new();
+    let mut diagnostics =
+        super::diagnostics::ParserDiagnostics::new(&mut notices, source.source.clone());
+    let mut target = None;
+    let mut ambiguous = false;
+    super::entries::parse_subscription_section_indexed(
+        &sections,
+        &mut diagnostics,
+        |existing, span| {
+            if existing.name == subscription.name
+                && existing.url == subscription.url
+                && existing.user_agent.as_deref().unwrap_or_default()
+                    == subscription.user_agent.as_deref().unwrap_or_default()
+                && existing.headers == subscription.headers
+            {
+                if let Some(span) = span {
+                    ambiguous |= target.replace(span.start..span.end).is_some();
+                } else {
+                    ambiguous = true;
+                }
+            }
+        },
+    )
+    .map_err(|_| ManagedSourceError)?;
+    if ambiguous {
+        return Err(ManagedSourceError);
+    }
+    Ok(target.map(|range| {
+        let mut output = source.content.to_string();
+        output.replace_range(range, "");
+        output
+    }))
+}
+
+fn managed_document(source: &SourceSnapshot) -> Result<Document<'_>, ManagedSourceError> {
+    Document::parse_attempt(
+        Source::new(&source.content, source.source.clone()),
+        &mut Vec::new(),
+        false,
+    )
+    .map_err(|_| ManagedSourceError)
+}
+
+fn managed_entry(
+    section: &str,
+    name: &str,
+    value: &str,
+) -> Result<(String, crate::Config), ManagedSourceError> {
+    if name.trim().is_empty() {
+        return Err(ManagedSourceError);
+    }
+    let name = quote_scalar(name, None).map_err(|_| ManagedSourceError)?;
+    let value = quote_scalar(value, None).map_err(|_| ManagedSourceError)?;
+    let entry = format!("{name}: {value}");
+    let config = super::parse_dae_config_with_detailed_diagnostics(
+        &format!("{section} {{\n    {entry}\n}}"),
+        &mut Vec::new(),
+    )
+    .map_err(|_| ManagedSourceError)?;
+    config.validate().map_err(|_| ManagedSourceError)?;
+    Ok((entry, config))
+}
+
+fn append_entry(document: &Document<'_>, section: &str, entry: &str) -> String {
+    let content = document.source().text();
+    let newline = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut output = content.to_owned();
+    if let Some(root) = document.sections().rfind(|root| root.header() == section) {
+        output.insert_str(
+            root.span().end - 1,
+            &format!("{newline}    {entry}{newline}"),
+        );
+    } else {
+        if !content.is_empty() && !content.ends_with('\n') {
+            output.push_str(newline);
+        }
+        output.push_str(&format!(
+            "{section} {{{newline}    {entry}{newline}}}{newline}"
+        ));
+    }
+    output
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleSourceLocation {
     pub source_index: usize,
@@ -235,6 +438,238 @@ mod tests {
     use super::*;
     use crate::parser::{SourceLimits, parse_dae_sources};
     use std::{path::PathBuf, sync::Arc};
+
+    fn managed_source(content: &str) -> super::super::LoadedConfig {
+        parse_dae_sources(
+            &[(PathBuf::from("main.dae"), Arc::from(content))],
+            SourceLimits::default(),
+            &mut Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn managed_appends_use_last_roots_and_preserve_literal_names_and_crlf() {
+        let text = "include { 'child.dae' }\r\nnode {} # first\r\nsubscription {} # first\r\nnode {} # last\r\nsubscription {} # last\r\n# untouched\r\n";
+        let loaded = managed_source(text);
+        let name = "east's # }: node {";
+        let edited = append_node_source(
+            &loaded.sources[0],
+            name,
+            "socks5://127.0.0.1:1080#link-name",
+        )
+        .unwrap();
+        assert_eq!(edited, text.replace("node {} # last", "node {\r\n    \"east's # }: node {\": 'socks5://127.0.0.1:1080#link-name'\r\n} # last"));
+        let loaded = managed_source(&edited);
+        assert_eq!(loaded.config.nodes[0].name, name);
+        let edited = append_subscription_source(
+            &loaded.sources[0],
+            "paid # east",
+            "https://example.test/sub?q=%2F#token",
+        )
+        .unwrap();
+        assert_eq!(edited, loaded.sources[0].content.replace("subscription {} # last", "subscription {\r\n    'paid # east': 'https://example.test/sub?q=%2F#token'\r\n} # last"));
+        let config = managed_source(&edited).config;
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.subscriptions.len(), 1);
+        assert_eq!(config.subscriptions[0].name, "paid # east");
+        assert_eq!(
+            config.subscriptions[0].url,
+            "https://example.test/sub?q=%2F#token"
+        );
+    }
+
+    #[test]
+    fn managed_appends_create_sections_after_unterminated_comments() {
+        let loaded = managed_source("# preserved EOF comment");
+        let edited =
+            append_node_source(&loaded.sources[0], "node", "socks5://127.0.0.1:1080").unwrap();
+        assert_eq!(
+            edited,
+            "# preserved EOF comment\nnode {\n    'node': 'socks5://127.0.0.1:1080'\n}\n"
+        );
+        let loaded = managed_source(&edited);
+        let edited =
+            append_subscription_source(&loaded.sources[0], "provider", "https://example.test/sub")
+                .unwrap();
+        let config = managed_source(&edited).config;
+        assert_eq!(config.nodes[0].name, "node");
+        assert_eq!(config.subscriptions[0].name, "provider");
+    }
+
+    #[test]
+    fn managed_appends_reject_injection_parse_skips_and_duplicate_identities() {
+        let loaded = managed_source(
+            "node { old: 'socks5://127.0.0.1:1080' }\nsubscription { old: 'https://example.test/old' }\n",
+        );
+        let source = &loaded.sources[0];
+        for name in [
+            "",
+            " \t",
+            "two'quotes\"",
+            "trailing\\",
+            "new\n}\nrouting { fallback: block }",
+        ] {
+            assert!(append_node_source(source, name, "socks5://127.0.0.1:1081").is_err());
+            assert!(append_subscription_source(source, name, "https://example.test/new").is_err());
+        }
+        for link in [
+            "unsupported://PRIVATE",
+            "socks5://127.0.0.1:badport",
+            "socks5://127.0.0.1:1081\nPRIVATE",
+        ] {
+            let error = append_node_source(source, "new", link).unwrap_err();
+            assert!(!format!("{error:?} {error}").contains("PRIVATE"));
+        }
+        for url in [
+            "file:///PRIVATE",
+            "https://",
+            "https://example.test/PRIVATE\n}",
+            "https://example.test/two'quotes\"",
+        ] {
+            assert!(append_subscription_source(source, "new", url).is_err());
+        }
+        assert!(append_node_source(source, "old", "socks5://127.0.0.1:1081").is_err());
+        assert!(
+            append_node_source(source, "new", "socks5://127.0.0.1:1080#different-name").is_err()
+        );
+        assert!(append_subscription_source(source, "old", "https://example.test/new").is_err());
+    }
+
+    #[test]
+    fn managed_node_deletion_uses_normalized_identity_and_keeps_nested_siblings() {
+        let declaration = "'display # name': 'vless://00000000-0000-0000-0000-000000000001@example.test:443?security=tls&flow=xtls-rprx-vision-udp443'";
+        let text = format!(
+            "include {{ 'child.dae' }}\r\nnode {{\r\n wrapper {{\r\n  {declaration}# keep this comment\r\n  other: 'socks5://127.0.0.1:1080' # sibling\r\n }}\r\n}}\r\n"
+        );
+        let loaded = managed_source(&text);
+        let id = crate::node::Node::from_share_link("vless://00000000-0000-0000-0000-000000000001@example.test:443?security=tls&flow=xtls-rprx-vision#different-name").unwrap().id;
+        assert_eq!(loaded.config.nodes[0].id, id);
+        let edited = remove_node_source(&loaded.sources[0], id).unwrap().unwrap();
+        assert_eq!(edited, text.replace(declaration, ""));
+        let loaded = managed_source(&edited);
+        assert_eq!(loaded.config.nodes.len(), 1);
+        assert_eq!(loaded.config.nodes[0].name, "other");
+        assert!(
+            remove_node_source(&loaded.sources[0], id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn managed_subscription_deletion_matches_fetch_identity_not_parser_uuid() {
+        let declaration = "'same # name': 'https://example.test/sub'('agent:A')";
+        let text = format!(
+            "subscription {{\r\n wrapper {{\r\n  {declaration}# keep\r\n  'same # name': 'https://example.test/sub'('agent:B') # sibling\r\n }}\r\n}}\r\n"
+        );
+        let loaded = managed_source(&text);
+        let mut subscription = loaded.config.subscriptions[0].clone();
+        subscription.id = uuid::Uuid::nil();
+        subscription.node_count = 100;
+        subscription.update_interval = 17;
+        let edited = remove_subscription_source(&loaded.sources[0], &subscription)
+            .unwrap()
+            .unwrap();
+        assert_eq!(edited, text.replace(declaration, ""));
+        let remaining = managed_source(&edited);
+        assert_eq!(remaining.config.subscriptions.len(), 1);
+        assert_eq!(
+            remaining.config.subscriptions[0].user_agent.as_deref(),
+            Some("agent:B")
+        );
+        assert!(
+            remove_subscription_source(&remaining.sources[0], &subscription)
+                .unwrap()
+                .is_none()
+        );
+        subscription.user_agent = Some("agent:B".into());
+        subscription
+            .headers
+            .push(crate::subscription::SubscriptionHeader {
+                key: "X-Fetch".into(),
+                value: "different".into(),
+            });
+        assert!(
+            remove_subscription_source(&remaining.sources[0], &subscription)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn managed_subscription_deletion_owns_blocks_but_not_legacy_wrapper_headers() {
+        let declaration =
+            "'paid # tag': {\n wrapper { url: 'https://example.test/sub' }\n interval: 30s\n}";
+        let text = format!(
+            "subscription {{\n {declaration} # keep\n empty: {{}} sibling: {{ url: 'https://example.test/other' }}\n}}\n"
+        );
+        let loaded = managed_source(&text);
+        let mut subscription = loaded.config.subscriptions[0].clone();
+        subscription.user_agent = Some(String::new());
+        let edited = remove_subscription_source(&loaded.sources[0], &subscription)
+            .unwrap()
+            .unwrap();
+        assert_eq!(edited, text.replace(declaration, ""));
+        let loaded = managed_source(&edited);
+        assert_eq!(
+            loaded
+                .config
+                .subscriptions
+                .iter()
+                .map(|sub| sub.name.as_str())
+                .collect::<Vec<_>>(),
+            ["empty", "sibling"]
+        );
+        let edited =
+            remove_subscription_source(&loaded.sources[0], &loaded.config.subscriptions[0])
+                .unwrap()
+                .unwrap();
+        assert_eq!(edited, loaded.sources[0].content.replace("empty: {}", ""));
+        assert_eq!(
+            managed_source(&edited).config.subscriptions[0].name,
+            "sibling"
+        );
+        let legacy =
+            managed_source("subscription {\n a: b: {\n url: 'https://example.test/sub'\n }\n}\n");
+        assert!(
+            remove_subscription_source(&legacy.sources[0], &legacy.config.subscriptions[0])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn managed_deletion_rejects_duplicate_declarations_and_never_edits_includes() {
+        let text = "node {\n one: 'socks5://127.0.0.1:1080'\n two: 'socks5://127.0.0.1:1080'\n}\nsubscription {\n same: 'https://example.test/sub'\n same: 'https://example.test/sub'\n}\n";
+        let loaded = managed_source(text);
+        assert!(remove_node_source(&loaded.sources[0], loaded.config.nodes[0].id).is_err());
+        assert!(
+            remove_subscription_source(&loaded.sources[0], &loaded.config.subscriptions[0])
+                .is_err()
+        );
+        let sources = parse_dae_sources(
+            &[
+                (
+                    PathBuf::from("main.dae"),
+                    Arc::from("include { 'child.dae' }"),
+                ),
+                (PathBuf::from("child.dae"), Arc::from(text)),
+            ],
+            SourceLimits::default(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            remove_node_source(&sources.sources[0], sources.config.nodes[0].id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            remove_subscription_source(&sources.sources[0], &sources.config.subscriptions[0])
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn exact_group_edit_preserves_crlf_comments_includes_and_last_winners() {

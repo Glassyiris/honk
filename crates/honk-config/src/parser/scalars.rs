@@ -607,6 +607,8 @@ pub(super) fn parse_experimental_section(
                     "config_write",
                     "config_content",
                     "writable_includes",
+                    "geosite_download_url",
+                    "geoip_download_url",
                 ][..],
                 _ => {
                     return Err(scalar_error(
@@ -812,6 +814,14 @@ pub(super) fn parse_experimental_section(
                         ("listen", &mut config.native_api.listen),
                         ("secret", &mut config.native_api.secret),
                         ("ui", &mut config.native_api.ui),
+                        (
+                            "geosite_download_url",
+                            &mut config.native_api.geosite_download_url,
+                        ),
+                        (
+                            "geoip_download_url",
+                            &mut config.native_api.geoip_download_url,
+                        ),
                     ] {
                         if let Some(text) = values.get(key) {
                             *target = text.unquote().raw().to_owned();

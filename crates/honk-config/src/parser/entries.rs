@@ -1,5 +1,6 @@
 use super::cursor::Segment;
 use super::diagnostics::ParserDiagnostics;
+use super::lexer::Span;
 use super::read::Text;
 use crate::ConfigDiagnostic;
 use crate::diagnostic::Severity;
@@ -10,6 +11,14 @@ pub(super) fn parse_node_section(
     section: &[Segment<'_, '_>],
     diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Result<Vec<Node>, super::ParseFailure> {
+    parse_node_section_indexed(section, diagnostics, |_, _| {})
+}
+
+pub(super) fn parse_node_section_indexed(
+    section: &[Segment<'_, '_>],
+    diagnostics: &mut ParserDiagnostics<'_>,
+    mut on_entry: impl FnMut(&Node, Span),
+) -> Result<Vec<Node>, super::ParseFailure> {
     let mut nodes = Vec::new();
     let mut entry_index = 0;
     for root in section {
@@ -17,7 +26,13 @@ pub(super) fn parse_node_section(
             continue;
         };
         for child in body {
-            visit_node_segment(&child, diagnostics, &mut nodes, &mut entry_index)?;
+            visit_node_segment(
+                &child,
+                diagnostics,
+                &mut nodes,
+                &mut entry_index,
+                &mut on_entry,
+            )?;
         }
     }
     Ok(nodes)
@@ -28,6 +43,7 @@ fn visit_node_segment<'d, 'a>(
     diagnostics: &mut ParserDiagnostics<'_>,
     nodes: &mut Vec<Node>,
     entry_index: &mut usize,
+    on_entry: &mut impl FnMut(&Node, Span),
 ) -> Result<(), super::ParseFailure> {
     diagnostics.at_section("node", Text::segment(segment));
     if let Some(header) = super::read::block_header(segment) {
@@ -39,7 +55,7 @@ fn visit_node_segment<'d, 'a>(
         );
         if let Some(body) = segment.body_with(super::cursor::BodySyntax::Entries) {
             for child in body {
-                visit_node_segment(&child, diagnostics, nodes, entry_index)?;
+                visit_node_segment(&child, diagnostics, nodes, entry_index, on_entry)?;
             }
         }
         return Ok(());
@@ -51,13 +67,14 @@ fn visit_node_segment<'d, 'a>(
     }
     *entry_index += 1;
     diagnostics.entry_text(text, *entry_index);
-    parse_node_entry(text, diagnostics, nodes)
+    parse_node_entry(text, diagnostics, nodes, on_entry)
 }
 
 fn parse_node_entry(
     text: Text<'_, '_>,
     diagnostics: &mut ParserDiagnostics<'_>,
     nodes: &mut Vec<Node>,
+    on_entry: &mut impl FnMut(&Node, Span),
 ) -> Result<(), super::ParseFailure> {
     let raw = text.raw();
     if let Some(rest) = raw.strip_prefix("mux")
@@ -96,7 +113,7 @@ fn parse_node_entry(
         (None, value)
     };
 
-    let Some(uri) = complete_quoted_value(uri, diagnostics) else {
+    let Some((uri, end)) = complete_quoted_value(uri, diagnostics) else {
         return Ok(());
     };
     match diagnostics.parse_share_link(uri.raw()) {
@@ -104,6 +121,7 @@ fn parse_node_entry(
             if let Some(tag) = tag.filter(|tag| !tag.raw().is_empty()) {
                 node.name = tag.raw().to_owned();
             }
+            on_entry(&node, text.source.span(text.span.start, end));
             nodes.push(node);
         }
         Err(error) if error.category == crate::error::ErrorCategory::UnknownProtocol => {
@@ -134,17 +152,17 @@ fn parse_node_entry(
 fn complete_quoted_value<'d, 'a>(
     value: Text<'d, 'a>,
     diagnostics: &mut ParserDiagnostics<'_>,
-) -> Option<Text<'d, 'a>> {
+) -> Option<(Text<'d, 'a>, usize)> {
     let value = value.trim();
     let Some(quote) = value.quoted_prefix() else {
-        return Some(value);
+        return Some((value, value.span.end));
     };
     if quote.span == value.span {
-        return Some(quote.unquote());
+        return Some((quote.unquote(), quote.span.end));
     }
     let tail = value.sub(quote.raw().len(), value.raw().len()).trim();
     if warn_glued_comment(tail, diagnostics) {
-        return Some(quote.unquote());
+        return Some((quote.unquote(), quote.span.end));
     }
     if !tail.raw().is_empty() {
         tail.notice(
@@ -175,6 +193,16 @@ pub(super) fn parse_subscription_section(
     section: &[Segment<'_, '_>],
     diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Result<Vec<Subscription>, crate::ConfigError> {
+    parse_subscription_section_indexed(section, diagnostics, |_, _| {})
+}
+
+/// A legacy wrapper header may itself emit a subscription while owning other
+/// entries. Its absent span forbids deleting that header along with its children.
+pub(super) fn parse_subscription_section_indexed(
+    section: &[Segment<'_, '_>],
+    diagnostics: &mut ParserDiagnostics<'_>,
+    mut on_entry: impl FnMut(&Subscription, Option<Span>),
+) -> Result<Vec<Subscription>, crate::ConfigError> {
     let mut subscriptions = Vec::new();
     let mut entry_index = 0;
     for root in section {
@@ -182,7 +210,13 @@ pub(super) fn parse_subscription_section(
             continue;
         };
         for child in body {
-            visit_subscription_segment(&child, diagnostics, &mut subscriptions, &mut entry_index);
+            visit_subscription_segment(
+                &child,
+                diagnostics,
+                &mut subscriptions,
+                &mut entry_index,
+                &mut on_entry,
+            );
         }
     }
     Ok(subscriptions)
@@ -193,12 +227,15 @@ fn visit_subscription_segment<'d, 'a>(
     diagnostics: &mut ParserDiagnostics<'_>,
     subscriptions: &mut Vec<Subscription>,
     entry_index: &mut usize,
+    on_entry: &mut impl FnMut(&Subscription, Option<Span>),
 ) {
     diagnostics.at_section("subscription", Text::segment(segment));
     if let Some(tag) = block_tag(segment) {
         *entry_index += 1;
         diagnostics.subscription_text(Text::segment(segment).trim(), *entry_index);
-        subscriptions.push(parse_subscription_block(segment, tag, diagnostics));
+        let subscription = parse_subscription_block(segment, tag, diagnostics);
+        on_entry(&subscription, Some(segment.span()));
+        subscriptions.push(subscription);
         return;
     }
 
@@ -215,12 +252,19 @@ fn visit_subscription_segment<'d, 'a>(
         }
         *entry_index += 1;
         diagnostics.entry_text(entry, *entry_index);
-        if let Some(subscription) = parse_subscription_entry(entry, diagnostics) {
+        if let Some((subscription, _)) = parse_subscription_entry(entry, diagnostics) {
+            on_entry(&subscription, None);
             subscriptions.push(subscription);
         }
         if let Some(body) = segment.body_with(super::cursor::BodySyntax::Entries) {
             for child in body {
-                visit_subscription_segment(&child, diagnostics, subscriptions, entry_index);
+                visit_subscription_segment(
+                    &child,
+                    diagnostics,
+                    subscriptions,
+                    entry_index,
+                    on_entry,
+                );
             }
         }
         return;
@@ -232,7 +276,8 @@ fn visit_subscription_segment<'d, 'a>(
     }
     *entry_index += 1;
     diagnostics.entry_text(text, *entry_index);
-    if let Some(subscription) = parse_subscription_entry(text, diagnostics) {
+    if let Some((subscription, span)) = parse_subscription_entry(text, diagnostics) {
+        on_entry(&subscription, Some(span));
         subscriptions.push(subscription);
     }
 }
@@ -328,13 +373,13 @@ fn parse_subscription_block<'d, 'a>(
 fn parse_subscription_entry(
     text: Text<'_, '_>,
     diagnostics: &mut ParserDiagnostics<'_>,
-) -> Option<Subscription> {
+) -> Option<(Subscription, Span)> {
     if text.has_error() {
         // Keep the lexer diagnostic; do not add a second malformed-entry warning.
         return None;
     }
     let (tag, value) = split_entry(text, diagnostics);
-    let (value, user_agent) = parse_subscription_value(value, diagnostics)?;
+    let (value, user_agent, end) = parse_subscription_value(value, diagnostics)?;
     let (tag, value) = if tag.is_none() {
         embedded_tag(value, diagnostics).unwrap_or((None, value))
     } else {
@@ -352,12 +397,15 @@ fn parse_subscription_entry(
             .and_then(|url| url.host_str().map(str::to_owned))
             .unwrap_or_default()
     };
-    Some(Subscription {
-        name,
-        url,
-        user_agent,
-        ..Default::default()
-    })
+    Some((
+        Subscription {
+            name,
+            url,
+            user_agent,
+            ..Default::default()
+        },
+        text.source.span(text.span.start, end),
+    ))
 }
 
 fn embedded_tag<'d, 'a>(
@@ -388,17 +436,17 @@ fn embedded_tag<'d, 'a>(
 fn parse_subscription_value<'d, 'a>(
     value: Text<'d, 'a>,
     diagnostics: &mut ParserDiagnostics<'_>,
-) -> Option<(Text<'d, 'a>, Option<String>)> {
+) -> Option<(Text<'d, 'a>, Option<String>, usize)> {
     let value = value.trim();
     let Some(quote) = value.quoted_prefix() else {
-        return Some((value, None));
+        return Some((value, None, value.span.end));
     };
     if quote.span == value.span {
-        return Some((quote, None));
+        return Some((quote, None, quote.span.end));
     }
     let remainder = value.sub(quote.raw().len(), value.raw().len()).trim();
     if warn_glued_comment(remainder, diagnostics) {
-        return Some((quote, None));
+        return Some((quote, None, quote.span.end));
     }
     if !remainder.raw().starts_with('(') {
         remainder.trim().notice(
@@ -432,7 +480,7 @@ fn parse_subscription_value<'d, 'a>(
         );
         return None;
     }
-    Some((quote, Some(canonical_ua(ua_text))))
+    Some((quote, Some(canonical_ua(ua_text)), tail.span.start))
 }
 
 fn canonical_ua(value: Text<'_, '_>) -> String {

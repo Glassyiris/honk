@@ -102,6 +102,8 @@ pub struct NativeApiConfig {
     pub config_write: bool,
     pub config_content: bool,
     pub writable_includes: Vec<String>,
+    pub geosite_download_url: String,
+    pub geoip_download_url: String,
 }
 
 impl Default for NativeApiConfig {
@@ -124,6 +126,8 @@ impl Default for NativeApiConfig {
             config_write: false,
             config_content: false,
             writable_includes: Vec::new(),
+            geosite_download_url: String::new(),
+            geoip_download_url: String::new(),
         }
     }
 }
@@ -155,6 +159,17 @@ impl NativeApiConfig {
                 "secret",
                 "configuration administration requires a bearer secret",
             ));
+        }
+        for (field, value) in [
+            ("geosite_download_url", &self.geosite_download_url),
+            ("geoip_download_url", &self.geoip_download_url),
+        ] {
+            if !value.is_empty() && parse_geodata_url(value).is_none() {
+                return Err(invalid(
+                    field,
+                    "geodata source requires a credential-free HTTP(S) URL without a fragment",
+                ));
+            }
         }
         if self.writable_includes.iter().any(|value| {
             let path = std::path::Path::new(value);
@@ -228,14 +243,30 @@ impl NativeApiConfig {
                 "expected explicit HTTP origins without paths or credentials",
             ));
         }
-        if self.ui == "embedded" {
-            return Err(invalid(
-                "ui",
-                "embedded native UI is not available; configure a directory",
-            ));
-        }
         Ok(())
     }
+}
+
+/// Parse an administrator-configured direct geodata source without credentials.
+pub fn parse_geodata_url(value: &str) -> Option<url::Url> {
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        || value.contains('\\')
+    {
+        return None;
+    }
+    let (scheme, rest) = value.split_once("://")?;
+    if !matches!(scheme, "http" | "https") || rest.split(['/', '?', '#']).next()?.contains('@') {
+        return None;
+    }
+    let url = url::Url::parse(value).ok()?;
+    (url.has_host()
+        && url.port_or_known_default()? != 0
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none())
+    .then_some(url)
 }
 
 /// Credential syntax shared by configuration admission and HTTP authentication.
