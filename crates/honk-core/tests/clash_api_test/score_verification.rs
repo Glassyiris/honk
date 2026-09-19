@@ -81,6 +81,8 @@ async fn score_stats_count_only_committed_switches_and_distinguish_ineligible_in
         "failStreakExcluded": 0,
         "exploreBackedOff": 0,
         "carrierPressure": 0,
+        "carrierRttPressure": 0,
+        "carrierLossPressure": 0,
         "carrierValidation": 0,
     });
     let initial = get_json(&app, "/stats").await;

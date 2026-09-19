@@ -115,6 +115,8 @@ impl ScorePolicyState {
                     continue;
                 };
                 let mut accepted = 0_u64;
+                let mut rtt_episodes = 0_u64;
+                let mut loss_episodes = 0_u64;
                 for (family, observation) in observations.iter().enumerate() {
                     let Some(observation) = observation else {
                         continue;
@@ -130,6 +132,14 @@ impl ScorePolicyState {
                     }
                     stats.carrier_pressure[family] = Some(*observation);
                     accepted += 1;
+                    match observation.reason {
+                        crate::transport_quality::PressureReason::Rtt => rtt_episodes += 1,
+                        crate::transport_quality::PressureReason::Loss => loss_episodes += 1,
+                        crate::transport_quality::PressureReason::Both => {
+                            rtt_episodes += 1;
+                            loss_episodes += 1;
+                        }
+                    }
                 }
                 if accepted != 0 {
                     let counts = inner
@@ -137,6 +147,10 @@ impl ScorePolicyState {
                         .entry(SelectionReasonKey::new(group, network))
                         .or_default();
                     counts.carrier_pressure = counts.carrier_pressure.saturating_add(accepted);
+                    counts.carrier_rtt_pressure =
+                        counts.carrier_rtt_pressure.saturating_add(rtt_episodes);
+                    counts.carrier_loss_pressure =
+                        counts.carrier_loss_pressure.saturating_add(loss_episodes);
                 }
             }
         }

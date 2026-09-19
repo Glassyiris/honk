@@ -70,6 +70,8 @@ fn carrier_pressure_reopens_only_budgeted_comparison_without_penalizing_business
         }
         assert_eq!(state.selection_reason_counts("score", network), counters);
         assert_eq!(counters.carrier_pressure, 1);
+        assert_eq!(counters.carrier_rtt_pressure, 1);
+        assert_eq!(counters.carrier_loss_pressure, 1);
         assert_eq!(rank_at(&manager, &nodes, &target, at), 1);
         let validated = state.selection_reason_counts("score", network);
         assert_eq!(validated.periodic_explore, 1);
@@ -82,6 +84,8 @@ fn carrier_pressure_reopens_only_budgeted_comparison_without_penalizing_business
         let bounded = state.selection_reason_counts("score", network);
         assert_eq!(bounded.periodic_explore, 1);
         assert_eq!(bounded.carrier_pressure, 1);
+        assert_eq!(bounded.carrier_rtt_pressure, 1);
+        assert_eq!(bounded.carrier_loss_pressure, 1);
         assert_eq!(bounded.ordinary_switch, 0);
         // A successful measurement, not the hint, earns ordinary promotion.
         train_at(
@@ -126,7 +130,20 @@ fn carrier_pressure_is_owner_scoped_expiring_and_cannot_create_flow_evidence() {
         );
     }
     let at = start + Duration::from_secs(2);
-    pressure_at(&manager, nodes[0].id, IpVersion::V4, at);
+    manager.score_state.observe_carrier_pressure(
+        &manager.score_authority,
+        nodes[0].id,
+        &["score".into()],
+        true,
+        [
+            Some(TransportPressure {
+                observed_at: at,
+                reason: PressureReason::Rtt,
+            }),
+            None,
+        ],
+        at,
+    );
     let state = manager.score_state();
     let score = |context: &ScoreSelectionContext, now| {
         score_snapshot(&state.inner.lock(), "score", context, nodes[0].id, now)
@@ -141,6 +158,8 @@ fn carrier_pressure_is_owner_scoped_expiring_and_cannot_create_flow_evidence() {
     let expired = at + CARRIER_PRESSURE_TTL;
     assert!(score(&target, expired).carrier_pressure_at.is_none());
     let reasons = state.selection_reason_counts("score", target.network);
+    assert_eq!(reasons.carrier_rtt_pressure, 1);
+    assert_eq!(reasons.carrier_loss_pressure, 0);
     let late = [
         Some(TransportPressure {
             observed_at: at,
@@ -148,6 +167,18 @@ fn carrier_pressure_is_owner_scoped_expiring_and_cannot_create_flow_evidence() {
         }),
         None,
     ];
+    state.observe_carrier_pressure(
+        &manager.score_authority,
+        nodes[0].id,
+        &["score".into()],
+        true,
+        late,
+        at,
+    );
+    assert_eq!(
+        state.selection_reason_counts("score", target.network),
+        reasons
+    );
     state.observe_carrier_pressure(
         &manager.score_authority,
         nodes[0].id,
@@ -287,6 +318,10 @@ fn shadowsocks_tcp_pressure_does_not_spend_native_udp_validation() {
             .is_none()
     );
     drop(inner);
+    let tcp_counts = state.selection_reason_counts("score", SelectionNetwork::Tcp);
+    assert_eq!(tcp_counts.carrier_pressure, 1);
+    assert_eq!(tcp_counts.carrier_rtt_pressure, 0);
+    assert_eq!(tcp_counts.carrier_loss_pressure, 1);
     assert_eq!(
         state
             .selection_reason_counts("score", SelectionNetwork::Udp)

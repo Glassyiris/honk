@@ -647,6 +647,8 @@ fn selection_reason_counting_respects_apply_and_filter_boundaries() {
         fail_streak_excluded: u64::MAX,
         explore_backed_off: u64::MAX,
         carrier_pressure: u64::MAX,
+        carrier_rtt_pressure: u64::MAX,
+        carrier_loss_pressure: u64::MAX,
         carrier_validation: u64::MAX,
     };
     stale_state.inner.lock().selection_reasons.insert(
@@ -821,6 +823,8 @@ fn score_reason_snapshot_is_sorted_fixed_and_private() {
         fail_streak_excluded: _,
         explore_backed_off: _,
         carrier_pressure: _,
+        carrier_rtt_pressure: _,
+        carrier_loss_pressure: _,
         carrier_validation: _,
     } = snapshot[0].tcp;
 

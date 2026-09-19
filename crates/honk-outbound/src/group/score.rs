@@ -328,6 +328,8 @@ pub struct ScoreReasonCounters {
     pub fail_streak_excluded: u64,
     pub explore_backed_off: u64,
     pub carrier_pressure: u64,
+    pub carrier_rtt_pressure: u64,
+    pub carrier_loss_pressure: u64,
     pub carrier_validation: u64,
 }
 
