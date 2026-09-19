@@ -897,10 +897,13 @@ fn domain_source(value: &str) -> &'static str {
     }
 }
 
+/// The wire vocabulary knows a kernel decision and userspace evidence. The
+/// userspace connection paths name their route `evaluation`; that is the
+/// recomputed kind, not an unknown one.
 fn rule_source(value: &str) -> &'static str {
     match value {
         "kernel" => "kernel",
-        "recomputed" => "recomputed",
+        "recomputed" | "evaluation" => "recomputed",
         _ => "unknown",
     }
 }

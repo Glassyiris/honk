@@ -275,6 +275,26 @@ fn room_making_overflow_is_reported_per_interval_but_lost_history_per_record() {
 }
 
 #[test]
+fn a_userspace_evaluation_is_recomputed_evidence_on_the_wire() {
+    let store = store();
+    let flow = begin(&store, "tcp");
+    flow.routed(
+        "group",
+        Some("gen:0:rule:0"),
+        Some("dip(<redacted>)"),
+        "evaluation",
+    );
+    let detail = store.get(flow.id(), &request_id()).unwrap();
+    assert_eq!(detail["rule_id"], "gen:0:rule:0");
+    assert_eq!(detail["rule_source"], "recomputed");
+    flow.routed("group", None, None, "forced");
+    assert_eq!(
+        store.get(flow.id(), &request_id()).unwrap()["rule_source"],
+        "unknown"
+    );
+}
+
+#[test]
 fn retention_distinguishes_expired_unknown_and_active_records() {
     let store = store();
     let terminal = begin(&store, "tcp");
