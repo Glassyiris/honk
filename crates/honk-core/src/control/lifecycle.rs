@@ -9,6 +9,8 @@ use std::sync::atomic::Ordering;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
+mod teardown;
+
 const STAGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct BoundListeners {
@@ -25,6 +27,7 @@ struct RuntimeEpoch {
     stop: watch::Sender<bool>,
     ingress: JoinSet<()>,
     tcp: JoinSet<()>,
+    maintenance: [Option<tokio::task::JoinHandle<()>>; 6],
     dns: Option<dns_listener::DnsListener>,
     janitor: Option<tokio::task::JoinHandle<()>>,
     removals: Option<tokio::task::JoinHandle<()>>,
@@ -33,6 +36,14 @@ struct RuntimeEpoch {
     health_updates: Option<HealthUpdates>,
     #[cfg(feature = "ebpf")]
     queue: Option<NfqueueRuntime>,
+}
+
+impl Drop for RuntimeEpoch {
+    fn drop(&mut self) {
+        for task in self.maintenance.iter().flatten() {
+            task.abort();
+        }
+    }
 }
 
 type HealthUpdateKey = (uuid::Uuid, u32, u32);
@@ -345,6 +356,7 @@ impl ControlPlane {
             stop,
             ingress: JoinSet::new(),
             tcp: JoinSet::new(),
+            maintenance: std::array::from_fn(|_| None),
             janitor: None,
             removals: None,
             removal_errors,
@@ -448,7 +460,7 @@ impl ControlPlane {
         if let Err(error) = prepared {
             // Preparation has not opened admission. Cleanup must not borrow the
             // terminal process shutdown path or discard retained API owners.
-            if let Err(cleanup) = self.stop_epoch(&mut epoch).await {
+            if let Err(cleanup) = self.stop_network_epoch(Some(&mut epoch)).await {
                 return Err(anyhow::Error::new(EpochCleanupFailure(cleanup)).context(error));
             }
             return Err(error);
@@ -491,68 +503,37 @@ impl ControlPlane {
         Ok(())
     }
 
-    async fn start_epoch_maintenance(&self) {
-        let mut tasks = self.background_tasks.lock().await;
-        tasks.push(self.udp_pool.spawn_janitor());
-        tasks.push(self.sniffer_pool.spawn_janitor());
-        tasks.push(super::tcp_sniff::spawn_sniff_neg_cache_janitor(
-            self.tcp_sniff_neg_cache.clone(),
-        ));
-        tasks.push(self.connection_pool.spawn_janitor());
-        tasks.push(tokio::spawn(run_tcp_admission_scaler(
-            self.concurrency_limit.clone(),
-            self.resource_budget,
-            self.stats.clone(),
-            self.tcp_admission_target.clone(),
-        )));
+    async fn start_epoch_maintenance(&self, epoch: &mut RuntimeEpoch) {
         let registry = self.runtime_registry.clone();
         let dns = self.dns_controller.runtime_provider();
-        tasks.push(tokio::spawn(async move {
-            let mut tick = tokio::time::interval(honk_outbound::runtime::TLS_REAP_INTERVAL);
-            tick.tick().await;
-            loop {
+        epoch.maintenance = [
+            self.udp_pool.spawn_janitor(),
+            self.sniffer_pool.spawn_janitor(),
+            super::tcp_sniff::spawn_sniff_neg_cache_janitor(self.tcp_sniff_neg_cache.clone()),
+            self.connection_pool.spawn_janitor(),
+            tokio::spawn(run_tcp_admission_scaler(
+                self.concurrency_limit.clone(),
+                self.resource_budget,
+                self.stats.clone(),
+                self.tcp_admission_target.clone(),
+            )),
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(honk_outbound::runtime::TLS_REAP_INTERVAL);
                 tick.tick().await;
-                let now = std::time::Instant::now();
-                registry.read().reap_idle_resources(now);
-                dns.current().reap_idle_resources(now);
-            }
-        }));
-        drop(tasks);
+                loop {
+                    tick.tick().await;
+                    let now = std::time::Instant::now();
+                    registry.read().reap_idle_resources(now);
+                    dns.current().reap_idle_resources(now);
+                }
+            }),
+        ]
+        .map(Some);
         self.start_preconnect().await;
         let generation = self.runtime_registry.read().clone();
         self.start_udp_warm_coordinator(generation.clone()).await;
         self.start_selector_warm_coordinator(generation).await;
     }
-}
-
-#[cfg(feature = "native-api")]
-fn conflict() -> crate::native_api::ApiError {
-    crate::native_api::ApiError::new(
-        axum::http::StatusCode::CONFLICT,
-        crate::native_api::ErrorCode::StateConflict,
-        "Runtime transition conflicts with the current state",
-        None,
-    )
-}
-
-#[cfg(feature = "native-api")]
-fn transition_failed(plane: &ControlPlane, before: u64) -> crate::native_api::ApiError {
-    let generation = plane.diagnostics.read().generation;
-    let mut error = crate::native_api::ApiError::new(
-        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        crate::native_api::ErrorCode::TemporarilyUnavailable,
-        "Runtime transition could not be completed",
-        None,
-    );
-    if generation != before {
-        let active = plane
-            .native
-            .as_ref()
-            .map(|native| format!("{}:{generation}", native.instance_id));
-        error =
-            error.with_details(serde_json::json!({"committed":true,"active_generation_id":active}));
-    }
-    error
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -590,6 +571,24 @@ async fn joined(task: &mut Option<tokio::task::JoinHandle<()>>) -> anyhow::Resul
     };
     task.take();
     result
+}
+
+pub(super) async fn abort_and_join(
+    task: &mut Option<tokio::task::JoinHandle<()>>,
+) -> anyhow::Result<()> {
+    if let Some(handle) = task.as_ref() {
+        handle.abort();
+    }
+    match joined(task).await {
+        Err(error)
+            if error
+                .downcast_ref::<tokio::task::JoinError>()
+                .is_some_and(tokio::task::JoinError::is_cancelled) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 fn retain_error(target: &mut Option<anyhow::Error>, result: anyhow::Result<()>) {
@@ -657,164 +656,6 @@ impl ControlPlane {
         error.map_or(Ok(()), Err)
     }
 
-    async fn stop_epoch(&mut self, epoch: &mut RuntimeEpoch) -> anyhow::Result<()> {
-        let mut error = None;
-        #[cfg(feature = "ebpf")]
-        if let Some(queue) = epoch.queue.as_mut() {
-            retain_error(
-                &mut error,
-                queue
-                    .check_startup_health()
-                    .await
-                    .map_err(anyhow::Error::from),
-            );
-            retain_error(
-                &mut error,
-                cleanup_stage(async {
-                    queue.begin_pending_drain().await;
-                    Ok(())
-                })
-                .await,
-            );
-        }
-        epoch.stop.send_replace(true);
-        if let Some(listener) = epoch.dns.as_mut() {
-            listener.stop_accepting();
-            retain_error(
-                &mut error,
-                cleanup_stage(async {
-                    listener.abort_and_join().await;
-                    Ok(())
-                })
-                .await,
-            );
-        }
-        epoch.dns.take();
-        while let Some(result) = epoch.ingress.join_next().await {
-            retain_error(&mut error, result.map_err(anyhow::Error::from));
-        }
-        retain_error(
-            &mut error,
-            cleanup_stage(async {
-                anyhow::ensure!(
-                    self.stop_udp_warm_coordinator().await,
-                    "UDP warm coordinator join failed"
-                );
-                Ok(())
-            })
-            .await,
-        );
-        retain_error(
-            &mut error,
-            cleanup_stage(async {
-                anyhow::ensure!(
-                    self.stop_selector_warm_coordinator().await,
-                    "Selector warm coordinator join failed"
-                );
-                Ok(())
-            })
-            .await,
-        );
-        let registry = self.runtime_registry.read().clone();
-        registry.begin_retirement();
-        {
-            let mut tasks = self.background_tasks.lock().await;
-            for task in tasks.iter() {
-                task.abort();
-            }
-            while let Some(task) = tasks.last_mut() {
-                if let Err(join_error) = task.await
-                    && !join_error.is_cancelled()
-                {
-                    error.get_or_insert_with(|| join_error.into());
-                }
-                tasks.pop();
-            }
-        }
-        // Signal all visible TCP owners together before waiting for them. The
-        // accepted JoinSet also contains connections still before UUID binding.
-        if let Ok(selected) = self
-            .connection_tracker
-            .snapshot_close(Some("tcp"), None, usize::MAX)
-        {
-            use futures::StreamExt;
-            let mut closing: futures::stream::FuturesUnordered<_> = selected
-                .into_iter()
-                .map(|selected| self.connection_tracker.start_close(selected).wait())
-                .collect();
-            while let Some(outcome) = closing.next().await {
-                if matches!(outcome, crate::connection_tracker::CloseOutcome::Failed) {
-                    error.get_or_insert_with(|| {
-                        anyhow::anyhow!("TCP retirement could not be confirmed")
-                    });
-                }
-            }
-        }
-        epoch.tcp.abort_all();
-        while let Some(result) = epoch.tcp.join_next().await {
-            if let Err(join_error) = result
-                && !join_error.is_cancelled()
-            {
-                error.get_or_insert_with(|| join_error.into());
-            }
-        }
-        let udp = self.udp_pool.shutdown().await;
-        if !udp.joined || !udp.graceful {
-            error.get_or_insert_with(|| anyhow::anyhow!("UDP quiescence required forced cleanup"));
-        }
-        retain_error(&mut error, joined(&mut epoch.removals).await);
-        retain_error(&mut error, joined(&mut epoch.janitor).await);
-        if let Some(updates) = epoch.health_updates.as_mut() {
-            retain_error(&mut error, updates.stop().await);
-        }
-        epoch.health_updates.take();
-        #[cfg(feature = "ebpf")]
-        if let Some(queue) = epoch.queue.as_mut() {
-            retain_error(&mut error, cleanup_stage(queue.shutdown_service()).await);
-            if let Some(fatal) = queue.take_shutdown_fatal() {
-                error.get_or_insert_with(|| fatal.into());
-            }
-            retain_error(
-                &mut error,
-                cleanup_stage(queue.finish_pending_drain()).await,
-            );
-            self.pending_udp_verdicts = None;
-        }
-        #[cfg(feature = "ebpf")]
-        {
-            epoch.queue.take();
-        }
-        while let Ok(fatal) = epoch.removal_errors.try_recv() {
-            error.get_or_insert(fatal);
-        }
-        while let Ok(fatal) = epoch.critical_errors.try_recv() {
-            error.get_or_insert(fatal);
-        }
-        retain_error(&mut error, self.ebpf.write().await.clear_listener_sockets());
-        retain_error(
-            &mut error,
-            cleanup_stage(async {
-                registry.shutdown().await;
-                Ok(())
-            })
-            .await,
-        );
-        self.connection_pool.clear();
-        for runtime in registry.values() {
-            for reason in [
-                crate::stats::WarmReason::Udp,
-                crate::stats::WarmReason::Selector,
-                crate::stats::WarmReason::Preconnect,
-            ] {
-                self.stats.clear_warm(runtime.node.id, reason);
-            }
-        }
-        self.udp_warm_ids.lock().clear();
-        self.selector_warm_ids.lock().clear();
-        self.selector_bare_warm.lock().clear();
-        error.map_or(Ok(()), Err)
-    }
-
     #[cfg(feature = "native-api")]
     async fn reject_paused_command(
         &self,
@@ -823,10 +664,11 @@ impl ControlPlane {
     ) {
         match command {
             ControlCommand::Suspend { reply } | ControlCommand::Resume { reply } => {
-                let _ = reply.send(Err(conflict()));
+                let _ = reply.send(Err(super::client::ControlError::StateConflict));
             }
+            #[cfg(feature = "clash-api")]
             ControlCommand::SetRuntimeMode { reply, .. } => {
-                let _ = reply.send(Err(conflict()));
+                let _ = reply.send(Err(super::client::ControlError::StateConflict));
             }
             ControlCommand::SetSelector { reply, .. } => {
                 let _ = reply.send(Err(super::client::ControlError::StateConflict));
@@ -926,19 +768,7 @@ impl ControlPlane {
             &mut error,
             self.pause_network_owners(commands, authorizations).await,
         );
-        if let Some(active) = epoch.as_mut() {
-            retain_error(&mut error, self.stop_epoch(active).await);
-        }
-        retain_error(&mut error, self.ebpf.write().await.clear_listener_sockets());
-        let registry = self.runtime_registry.read().clone();
-        retain_error(
-            &mut error,
-            cleanup_stage(async {
-                registry.shutdown().await;
-                Ok(())
-            })
-            .await,
-        );
+        retain_error(&mut error, self.stop_network_epoch(epoch.as_mut()).await);
         self.dns_controller.runtime_provider().begin_pause();
         retain_error(
             &mut error,
@@ -951,12 +781,6 @@ impl ControlPlane {
             })
             .await,
         );
-        self.connection_pool.clear();
-        if let Some(retry) = self.network_refresh_retry.as_mut() {
-            retry.abort();
-            let _ = retry.await;
-        }
-        self.network_refresh_retry.take();
         anyhow::ensure!(
             self.drain_tracker.active_count() == 0,
             "accepted runtime tasks did not drain"
@@ -1012,7 +836,8 @@ impl ControlPlane {
         if let Some(watcher) = &self.iface_watcher {
             watcher.resume().await?;
         }
-        self.start_epoch_maintenance().await;
+        self.start_epoch_maintenance(epoch.as_mut().expect("resumed epoch"))
+            .await;
         self.alive_set.notify_network_change();
         anyhow::ensure!(
             !self.shutdown_requested.load(Ordering::Acquire),
@@ -1054,7 +879,8 @@ impl ControlPlane {
         .await;
         let mut fatal = startup.err();
         if fatal.is_none() {
-            self.start_epoch_maintenance().await;
+            self.start_epoch_maintenance(epoch.as_mut().expect("startup epoch"))
+                .await;
             #[cfg(feature = "native-api")]
             self.publish_phase(EnginePhase::Running);
             #[cfg(target_os = "linux")]
@@ -1078,10 +904,9 @@ impl ControlPlane {
                     match command {
                         ControlCommand::Suspend { reply } => {
                             if epoch.is_none() || !self.is_datapath_healthy() {
-                                let _ = reply.send(Err(conflict()));
+                                let _ = reply.send(Err(super::client::ControlError::StateConflict));
                                 continue;
                             }
-                            let before = self.diagnostics.read().generation;
                             match self
                                 .suspend_epoch(&mut epoch, &mut commands, &authorizations)
                                 .await
@@ -1090,7 +915,8 @@ impl ControlPlane {
                                     let _ = reply.send(Ok(()));
                                 }
                                 Err(error) => {
-                                    let _ = reply.send(Err(transition_failed(self, before)));
+                                    let _ =
+                                        reply.send(Err(super::client::ControlError::Unavailable));
                                     fatal = Some(error);
                                 }
                             }
@@ -1098,10 +924,9 @@ impl ControlPlane {
                         }
                         ControlCommand::Resume { reply } => {
                             if epoch.is_some() {
-                                let _ = reply.send(Err(conflict()));
+                                let _ = reply.send(Err(super::client::ControlError::StateConflict));
                                 continue;
                             }
-                            let before = self.diagnostics.read().generation;
                             if let Err(error) = self.resume_epoch(&mut epoch).await {
                                 let fatal_cleanup = error.is::<EpochCleanupFailure>();
                                 if fatal_cleanup {
@@ -1112,7 +937,7 @@ impl ControlPlane {
                                 {
                                     fatal = Some(cleanup.context(error));
                                 }
-                                let _ = reply.send(Err(transition_failed(self, before)));
+                                let _ = reply.send(Err(super::client::ControlError::Unavailable));
                             } else {
                                 let _ = reply.send(Ok(()));
                             }
@@ -1233,14 +1058,11 @@ impl ControlPlane {
         if fatal.is_none() && self.is_datapath_healthy() && epoch.is_some() {
             retain_error(&mut fatal, self.drain_tracker.drain().await.map(|_| ()));
         }
-        if let Some(epoch) = epoch.as_mut() {
-            retain_error(&mut fatal, self.stop_epoch(epoch).await);
-        }
+        retain_error(&mut fatal, self.stop_network_epoch(epoch.as_mut()).await);
         if let Some(flags) = &self.datapath_flags {
             retain_error(&mut fatal, flags.disable().await);
         }
         retain_error(&mut fatal, self.finalize_shutdown().await);
-        self.connection_pool.clear();
         fatal.map_or(Ok(()), Err)
     }
 }

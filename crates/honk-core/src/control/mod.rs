@@ -162,6 +162,7 @@ pub struct ControlPlane {
     /// Persistent cache (selector choices, clash mode); opened by `run()`
     /// via `init_cache_db` when `experimental.cache_file` is enabled.
     cache_db: Option<Arc<crate::cachedb::CacheDb>>,
+    delay_writer: cache::DelayWriter,
     /// Node name → eBPF outbound id (push_routing_to_ebpf numbering),
     /// shared with the alive set's outbound resolver; rebuilt on reload.
     outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
@@ -170,12 +171,8 @@ pub struct ControlPlane {
     tcp_admission_target: Arc<std::sync::atomic::AtomicUsize>,
     /// Cold non-DNS UDP initialization budget. Ready endpoints bypass it.
     udp_concurrency_limit: Arc<tokio::sync::Semaphore>,
-    /// Background task handles (health check, janitor) for clean shutdown.
-    background_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     health_task: Option<tokio::task::JoinHandle<()>>,
-    /// The generation-owned UDP warm coordinator. It is deliberately kept
-    /// separate from generic background tasks so reload/shutdown can abort
-    /// and drain it in the required ownership order.
+    /// Generation-owned UDP warm coordinator, joined before transport retirement.
     udp_warm_task: tokio::sync::Mutex<Option<reload::WarmTask>>,
     /// UDP warm NodeIds survive task replacement so a reload can release
     /// retention that disappeared from the replacement plan.
@@ -200,6 +197,8 @@ pub struct ControlPlane {
     datapath_healthy: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "native-api")]
     phase: Option<tokio::sync::watch::Sender<EnginePhase>>,
+    #[cfg(feature = "native-api")]
+    configuration: Option<Arc<crate::configuration::AcceptedSources>>,
     #[cfg(feature = "native-api")]
     native: Option<Arc<crate::native_api::observation::NativeObservation>>,
     #[cfg(feature = "native-api")]

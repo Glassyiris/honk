@@ -599,9 +599,9 @@ async fn test_cp_with_nfq(nfqueue: bool) -> ControlPlane {
 }
 
 #[cfg(feature = "native-api")]
-fn source_update(content: &str) -> crate::native_api::config::SourceUpdate {
+fn source_update(content: &str) -> crate::configuration::SourceUpdate {
     let path = std::path::PathBuf::from("/private/config.dae");
-    crate::native_api::config::SourceUpdate {
+    crate::configuration::SourceUpdate {
         sources: vec![honk_config::parser::SourceSnapshot {
             source: honk_config::diagnostic::DiagnosticSources::new(Some(path.clone())).root(),
             path,
@@ -611,6 +611,7 @@ fn source_update(content: &str) -> crate::native_api::config::SourceUpdate {
             loaded_at: std::time::SystemTime::now(),
         }],
         dependencies: Vec::new(),
+        geo_sources: None,
     }
 }
 
@@ -644,13 +645,18 @@ async fn group_patch_revision_rejects_same_named_provider_replacement_before_act
         &config,
     ));
     cp.native = Some(Arc::clone(&native));
+    cp.configuration = Some(Arc::clone(&native.configuration.sources));
     let sources =
         source_update("group { selected { filter: name(peer) } }\nrouting { fallback: direct }\n");
-    native.configuration.accept(&sources, 0);
     native
         .configuration
+        .sources
+        .accept(native.configuration.sources.prepare_accept(&sources), 0);
+    native
+        .configuration
+        .sources
         .generation_committed(&crate::native_api::catalog::revision_for(&config), 0);
-    let expected = native.configuration.revision().unwrap();
+    let expected = native.configuration.sources.revision().unwrap();
     let mut candidate = config.clone();
     candidate.groups[0].default = Some(first.name.clone());
     let mut authorizations =
@@ -706,6 +712,7 @@ async fn accepted_sources_follow_noop_rejection_and_derived_updates() {
         &config,
     ));
     cp.native = Some(Arc::clone(&native));
+    cp.configuration = Some(Arc::clone(&native.configuration.sources));
     let mut authorizations = crate::subscription::SubscriptionAuthorizations::new(&[]).unwrap();
     let initial = source_update("routing { fallback: direct }\n");
     let first = cp
@@ -737,7 +744,7 @@ async fn accepted_sources_follow_noop_rejection_and_derived_updates() {
         ReloadOutcome::Noop { generation },
     );
     let accepted = native.configuration.snapshot().unwrap();
-    let hash = crate::native_api::config::digest(changed.sources[0].content.as_bytes());
+    let hash = crate::configuration::digest(changed.sources[0].content.as_bytes());
     assert_eq!(accepted["sources"][0]["content_sha256"], hash);
     assert_ne!(
         accepted["sources"][0]["content_sha256"],
@@ -827,6 +834,7 @@ async fn first_subscription_publication_invalidates_source_revision() {
         &config,
     ));
     cp.native = Some(Arc::clone(&native));
+    cp.configuration = Some(Arc::clone(&native.configuration.sources));
     let mut subscriptions =
         crate::subscription::SubscriptionSupervisor::prepare(&mut config, None, Vec::new())
             .await
@@ -838,6 +846,7 @@ async fn first_subscription_publication_invalidates_source_revision() {
         .start(
             Some(initial.sources[0].path.clone()),
             Some(initial),
+            honk_config::paths::data_dir().to_path_buf(),
             cp.config_handle(),
             cp.diagnostics_handle(),
             cp.command_sender(),
@@ -1079,6 +1088,9 @@ async fn post_publication_datapath_failure_is_committed_degraded() {
         cp.native = Some(Arc::new(
             crate::native_api::observation::NativeObservation::new(&config),
         ));
+        cp.configuration = Some(Arc::clone(
+            &cp.native.as_ref().unwrap().configuration.sources,
+        ));
         cp
     };
     let first_revision = 1;
@@ -1133,7 +1145,7 @@ async fn post_publication_datapath_failure_is_committed_degraded() {
             .unwrap();
         assert_eq!(
             snapshot["sources"][0]["content_sha256"],
-            crate::native_api::config::digest(sources.sources[0].content.as_bytes())
+            crate::configuration::digest(sources.sources[0].content.as_bytes())
         );
         assert!(
             snapshot["generation_id"]
@@ -1304,8 +1316,9 @@ async fn reload_dispatch_assigns_worker_revision_and_accepts_only_that_revision(
             .await
             .unwrap();
     let (command_tx, mut commands) = tokio::sync::mpsc::channel(4);
-    supervisor.start(command_tx);
+    supervisor.start(command_tx.clone());
     let supervisor_handle = supervisor.handle();
+    let mut activation = crate::configuration::Activation::new(command_tx, supervisor_handle);
     let mut authorizations = crate::subscription::SubscriptionAuthorizations::new(&[]).unwrap();
     let subscription_id = uuid::Uuid::new_v4();
     let subscription = honk_config::subscription::Subscription {
@@ -1318,31 +1331,30 @@ async fn reload_dispatch_assigns_worker_revision_and_accepts_only_that_revision(
     let mut candidate = cp.config_handle().read().await.as_ref().clone();
     candidate.subscriptions = vec![subscription];
     let drain = DrainTracker::new();
-    let (result, applied) = tokio::sync::oneshot::channel();
+    let pending = activation
+        .dispatch(crate::configuration::ActivationRequest {
+            candidate,
+            diagnostics: Vec::new(),
+            #[cfg(feature = "native-api")]
+            sources: None,
+            #[cfg(feature = "native-api")]
+            expected_revision: None,
+            #[cfg(feature = "native-api")]
+            deferred_provider: None,
+        })
+        .await
+        .unwrap();
 
     assert!(
-        cp.dispatch_control_command(
-            ControlCommand::ReloadConfig {
-                request_id: 1,
-                config: Box::new(candidate),
-                diagnostics: Vec::new(),
-                #[cfg(feature = "native-api")]
-                sources: None,
-                #[cfg(feature = "native-api")]
-                expected_group_revision: None,
-                result,
-            },
-            &drain,
-            &mut authorizations,
-        )
-        .await
+        cp.dispatch_control_command(commands.recv().await.unwrap(), &drain, &mut authorizations,)
+            .await
     );
-    let reply = applied.await.unwrap();
-    assert!(matches!(reply.outcome, ReloadOutcome::Committed { .. }));
-    let authorized = reply.authorized;
-    let revision = authorized[0].revision;
+    assert!(matches!(
+        activation.complete(pending).await.unwrap(),
+        ReloadOutcome::Committed { .. }
+    ));
+    let revision = authorizations.revision(subscription_id).unwrap();
     assert!(authorizations.authorizes(subscription_id, revision));
-    supervisor_handle.reconcile(authorized).await.unwrap();
 
     let merge = tokio::time::timeout(Duration::from_secs(2), commands.recv())
         .await

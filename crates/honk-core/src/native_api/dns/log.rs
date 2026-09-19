@@ -201,7 +201,7 @@ impl LogStore {
         }
         format!(
             "{sequence}:{}",
-            crate::native_api::config::encode_digest(&digest.finalize())
+            crate::configuration::encode_digest(&digest.finalize())
         )
     }
 

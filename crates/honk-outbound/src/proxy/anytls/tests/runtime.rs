@@ -76,7 +76,7 @@ async fn native_ephemeral_close_joins_drivers_after_closed_session_was_pruned() 
     use futures_util::FutureExt as _;
     use tokio::io::AsyncReadExt as _;
 
-    let guard =
+    let mut guard =
         crate::runtime::NodeRuntime::try_ephemeral_guarded(&anytls_node("native-joined")).unwrap();
     let runtime = guard.runtime();
     let (session, mut server) = runtime
@@ -90,7 +90,7 @@ async fn native_ephemeral_close_joins_drivers_after_closed_session_was_pruned() 
     anytls.pool.insert(&session);
     session.close();
     assert_eq!(anytls.pool.live_session_count(), 0);
-    guard.close().await;
+    guard.close().await.unwrap();
     assert!(matches!(
         server.read(&mut [0; 1]).now_or_never(),
         Some(Ok(0))
@@ -102,7 +102,7 @@ async fn native_ephemeral_close_joins_drivers_after_closed_session_was_pruned() 
 async fn native_ephemeral_close_joins_cancelled_pool_factory_before_releasing_capacity() {
     use futures_util::FutureExt as _;
 
-    let guard =
+    let mut guard =
         crate::runtime::NodeRuntime::try_ephemeral_guarded(&anytls_node("native-factory")).unwrap();
     let runtime = guard.runtime();
     let crate::runtime::ProtocolRuntime::AnyTls(anytls) = &runtime.runtime else {
@@ -116,7 +116,7 @@ async fn native_ephemeral_close_joins_cancelled_pool_factory_before_releasing_ca
     })));
     assert!(offer.as_mut().now_or_never().is_none());
     drop(offer);
-    guard.close().await;
+    guard.close().await.unwrap();
     assert_eq!(capacity.available_permits(), 1);
     assert!(!anytls.pool.has_usable_session());
 }

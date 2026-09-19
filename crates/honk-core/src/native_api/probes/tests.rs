@@ -3,6 +3,7 @@ use axum::body::{Body, to_bytes};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 mod lifecycle;
+mod preparation;
 
 async fn state(mut config: Config) -> Arc<NativeState> {
     config.global.nfqueue_enable = false;
@@ -222,11 +223,10 @@ async fn duplicate_group_members_share_execution_but_keep_both_associations() {
         json!(["tcp"]),
         "ipv4",
     );
-    let mut plan = capture(&state, serde_json::from_value(input).unwrap())
+    let plan = capture(&state, serde_json::from_value(input).unwrap())
         .await
         .unwrap();
-    assert_eq!(plan.attempts.len(), 1);
-    prepare(&state, &state.observation.probes.policy, &mut plan)
+    let mut plan = prepare(&state.observation.probes.policy, plan)
         .await
         .unwrap();
     let (_stop, receiver) = watch::channel(false);
@@ -236,7 +236,8 @@ async fn duplicate_group_members_share_execution_but_keep_both_associations() {
         Instant::now() + Duration::from_secs(2),
         receiver,
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(plan.result.results.len(), 2);
     assert_ne!(
         plan.result.results[0].member_id,
@@ -299,10 +300,10 @@ async fn group_probe_health_keeps_inherited_targets_and_expanded_leaf_scope() {
                 "ipv4",
             );
             input["members"] = json!(scope);
-            let mut plan = capture(&state, serde_json::from_value(input).unwrap())
+            let plan = capture(&state, serde_json::from_value(input).unwrap())
                 .await
                 .unwrap();
-            prepare(&state, &state.observation.probes.policy, &mut plan)
+            let mut plan = prepare(&state.observation.probes.policy, plan)
                 .await
                 .unwrap();
             let (_stop, receiver) = watch::channel(false);
@@ -312,7 +313,8 @@ async fn group_probe_health_keeps_inherited_targets_and_expanded_leaf_scope() {
                 Instant::now() + Duration::from_secs(2),
                 receiver,
             )
-            .await;
+            .await
+            .unwrap();
             let members = if scope == "direct" {
                 vec![
                     identity.groups["left"].clone(),
@@ -405,7 +407,7 @@ async fn queue_and_target_refusals_wake_all_same_body_waiters_with_exact_error()
         let mut plan = capture(&state, serde_json::from_value(input).unwrap())
             .await
             .unwrap();
-        plan.request.target = Target::Node {
+        plan.context.spec.target = Target::Node {
             node_id: index.to_string(),
         };
         let reservation = service
@@ -440,7 +442,7 @@ async fn queue_and_target_refusals_wake_all_same_body_waiters_with_exact_error()
         let mut plan = capture(&state, serde_json::from_value(input).unwrap())
             .await
             .unwrap();
-        plan.request.target = Target::Node {
+        plan.context.spec.target = Target::Node {
             node_id: target.into(),
         };
         let key = format!("refused-{target}");
@@ -501,10 +503,10 @@ async fn deadline_drains_started_socket_and_keeps_unstarted_rows_neutral() {
         json!(["tcp"]),
         "any",
     );
-    let mut plan = capture(&state, serde_json::from_value(input).unwrap())
+    let plan = capture(&state, serde_json::from_value(input).unwrap())
         .await
         .unwrap();
-    prepare(&state, &state.observation.probes.policy, &mut plan)
+    let mut plan = prepare(&state.observation.probes.policy, plan)
         .await
         .unwrap();
     let peer = tokio::spawn(async move {
@@ -520,7 +522,8 @@ async fn deadline_drains_started_socket_and_keeps_unstarted_rows_neutral() {
         Instant::now() + Duration::from_millis(50),
         receiver,
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(plan.result.results[0].error, Some("deadline"));
     assert!(
         plan.result
@@ -666,10 +669,10 @@ async fn dns_tcp_and_udp_through_runtime_publish_separate_dns_purpose_samples() 
         json!(["tcp", "udp"]),
         "ipv4",
     );
-    let mut plan = capture(&state, serde_json::from_value(input).unwrap())
+    let plan = capture(&state, serde_json::from_value(input).unwrap())
         .await
         .unwrap();
-    prepare(&state, &state.observation.probes.policy, &mut plan)
+    let mut plan = prepare(&state.observation.probes.policy, plan)
         .await
         .unwrap();
     let (_stop, receiver) = watch::channel(false);
@@ -679,7 +682,8 @@ async fn dns_tcp_and_udp_through_runtime_publish_separate_dns_purpose_samples() 
         Instant::now() + Duration::from_secs(2),
         receiver,
     )
-    .await;
+    .await
+    .unwrap();
     assert!(
         plan.result
             .results
@@ -755,13 +759,13 @@ async fn production_socks_probe_sends_numeric_destination_and_preserves_http_aut
         json!(["tcp"]),
         "ipv4",
     );
-    let mut plan = capture(&state, serde_json::from_value(input).unwrap())
+    let plan = capture(&state, serde_json::from_value(input).unwrap())
         .await
         .unwrap();
-    prepare(&state, &state.observation.probes.policy, &mut plan)
+    let mut plan = prepare(&state.observation.probes.policy, plan)
         .await
         .unwrap();
-    plan.http = Some(
+    plan.context.http = Some(
         honk_outbound::urltest::health_http_probe_request("http://authority.example/check", "HEAD")
             .unwrap(),
     );
@@ -772,7 +776,8 @@ async fn production_socks_probe_sends_numeric_destination_and_preserves_http_aut
         Instant::now() + Duration::from_secs(2),
         receiver,
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(plan.result.results[0].state, "healthy");
     peer.await.unwrap();
 }
@@ -822,10 +827,10 @@ async fn ipv6_raw_probe_dials_the_requested_family_without_ipv4_fallback() {
         json!(["tcp"]),
         "ipv6",
     );
-    let mut plan = capture(&state, serde_json::from_value(input).unwrap())
+    let plan = capture(&state, serde_json::from_value(input).unwrap())
         .await
         .unwrap();
-    prepare(&state, &state.observation.probes.policy, &mut plan)
+    let mut plan = prepare(&state.observation.probes.policy, plan)
         .await
         .unwrap();
     let (_stop, receiver) = watch::channel(false);
@@ -835,7 +840,8 @@ async fn ipv6_raw_probe_dials_the_requested_family_without_ipv4_fallback() {
         Instant::now() + Duration::from_secs(2),
         receiver,
     )
-    .await;
+    .await
+    .unwrap();
     let (_socket, peer) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
         .await
         .unwrap()

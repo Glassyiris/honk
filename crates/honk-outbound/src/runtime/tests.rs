@@ -746,6 +746,72 @@ async fn generation_shutdown_joins_background_jobs_without_native_tracking() {
     assert!(!generation.tasks_failed());
 }
 
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn ephemeral_close_reports_reaped_panic_but_not_intentional_abort() {
+    for panic in [true, false] {
+        let mut guard = NodeRuntime::try_ephemeral_guarded(&canonical_node("cleanup")).unwrap();
+        let runtime = guard.runtime();
+        let owner = runtime.task_owner.as_ref().unwrap();
+        let child = owner
+            .spawn(async move {
+                if panic {
+                    panic!("private probe child failed");
+                }
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
+        if panic {
+            while !child.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            owner.reap();
+        }
+        assert_eq!(
+            guard.close().await,
+            if panic {
+                Err(RuntimeCleanupError)
+            } else {
+                Ok(())
+            }
+        );
+        assert!(child.is_finished());
+    }
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn cancelled_ephemeral_close_retains_owner_until_joined() {
+    use futures_util::FutureExt as _;
+
+    let mut guard = NodeRuntime::try_ephemeral_guarded(&canonical_node("retained-close")).unwrap();
+    let runtime = guard.runtime();
+    let retained = Arc::downgrade(&runtime);
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let child = runtime
+        .task_owner
+        .as_ref()
+        .unwrap()
+        .spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _ = released.recv();
+        })
+        .unwrap();
+    ready.await.unwrap();
+    drop(runtime);
+    assert!(guard.close().now_or_never().is_none());
+    assert!(
+        retained.upgrade().is_some(),
+        "cancelled close lost its runtime owner"
+    );
+    assert!(!child.is_finished());
+    release.send(()).unwrap();
+    guard.close().await.unwrap();
+    assert!(child.is_finished());
+    assert!(retained.upgrade().is_none());
+}
+
 #[cfg(test)]
 mod fallible_factory_tests {
     use super::*;

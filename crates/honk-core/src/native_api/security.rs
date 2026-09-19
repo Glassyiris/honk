@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::{Body, HttpBody};
-use axum::extract::{Query, Request, State};
+use axum::extract::{MatchedPath, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -18,8 +18,8 @@ use serde::de::IgnoredAny;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use super::NativeState;
 use super::types::{ApiError, ErrorCode, RequestId};
-use super::{NativeState, RouteInfo, route_info};
 
 const MAX_TARGET_BYTES: usize = 4096;
 const MAX_HEADER_BYTES: usize = 16384;
@@ -202,8 +202,8 @@ pub(super) async fn boundary(
     let path = request.uri().path();
     let is_api = path == "/api" || path.starts_with("/api/");
     let is_ui = state.ui.is_some() && (matches!(path, "/" | "/ui") || path.starts_with("/ui/"));
-    let route = route_info(path);
-    let template = route.as_ref().map_or("unmatched", |route| route.template);
+    let route = request.extensions().get::<MatchedPath>().cloned();
+    let template = route.as_ref().map_or("unmatched", MatchedPath::as_str);
     request
         .extensions_mut()
         .insert(RequestId(request_id.clone()));
@@ -214,7 +214,11 @@ pub(super) async fn boundary(
             .security
             .check_origin(request.headers(), &request_id)?;
         if is_api && method == Method::OPTIONS {
-            return preflight(&request, route.as_ref(), origin.is_some(), &request_id);
+            return if route.is_some() {
+                Ok(next.run(request).await)
+            } else {
+                preflight(&request, &[], &request_id)
+            };
         }
         if is_api {
             state.security.authenticate(&request, &request_id)?;
@@ -394,30 +398,25 @@ async fn read_body(
     Ok(bytes)
 }
 
-fn preflight(
+pub(super) fn preflight(
     request: &Request,
-    route: Option<&RouteInfo>,
-    has_origin: bool,
+    methods: &[&str],
     request_id: &str,
 ) -> Result<Response, ApiError> {
     let method = single_header(request.headers(), "access-control-request-method")
         .ok()
         .flatten()
         .and_then(|value| value.to_str().ok())
-        .filter(|_| has_origin)
+        .filter(|_| request.headers().contains_key(header::ORIGIN))
         .ok_or_else(|| invalid_request(request_id))?;
-    let route = route
-        .filter(|route| {
-            route.methods.contains(&method) || (method == "HEAD" && route.methods.contains(&"GET"))
-        })
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                ErrorCode::ResourceNotFound,
-                "The requested resource was not found.",
-                Some(request_id.to_owned()),
-            )
-        })?;
+    if !methods.contains(&method) && !(method == "HEAD" && methods.contains(&"GET")) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::ResourceNotFound,
+            "The requested resource was not found.",
+            Some(request_id.to_owned()),
+        ));
+    }
     for value in request
         .headers()
         .get_all(header::ACCESS_CONTROL_REQUEST_HEADERS)
@@ -435,14 +434,14 @@ fn preflight(
             }
         }
     }
-    let mut methods = route.methods.join(", ");
-    if route.methods.contains(&"GET") {
-        methods.push_str(", HEAD");
+    let mut allowed_methods = methods.join(", ");
+    if methods.contains(&"GET") {
+        allowed_methods.push_str(", HEAD");
     }
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
         header::ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_str(&methods).expect("native route methods are HTTP tokens"),
+        HeaderValue::from_str(&allowed_methods).expect("native route methods are HTTP tokens"),
     );
     response.headers_mut().insert(
         header::ACCESS_CONTROL_ALLOW_HEADERS,

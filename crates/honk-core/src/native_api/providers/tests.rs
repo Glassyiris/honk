@@ -624,6 +624,7 @@ async fn provider_snapshot_is_immutable_and_unknown_cursor_is_invalid() {
     }
     let fixture = Fixture::start(config, None, None, &mut origin).await;
     let first = fixture.get("/api/v1/providers?limit=1").await;
+    assert_eq!(first["providers"][0]["id"], "inline");
     let cursor = first["next_cursor"].as_str().unwrap();
     let mut changed = fixture.state.config.read().await.as_ref().clone();
     changed.subscriptions.clear();
@@ -631,7 +632,7 @@ async fn provider_snapshot_is_immutable_and_unknown_cursor_is_invalid() {
     let rest = fixture
         .get(&format!("/api/v1/providers?limit=1000&cursor={cursor}"))
         .await;
-    assert_eq!(rest["providers"].as_array().unwrap().len(), 2);
+    assert_eq!(rest["providers"].as_array().unwrap().len(), 3);
     assert!(
         rest["providers"]
             .as_array()

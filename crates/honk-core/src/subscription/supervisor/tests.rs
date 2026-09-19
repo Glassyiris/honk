@@ -15,25 +15,8 @@ fn authorized(id: uuid::Uuid, revision: u64, url: String) -> AuthorizedSubscript
     }
 }
 
-fn state(command_tx: mpsc::Sender<ControlCommand>) -> SupervisorState {
-    SupervisorState {
-        manager: Arc::new(SubscriptionManager::new().unwrap()),
-        store: None,
-        command_tx,
-        observations: Arc::new(parking_lot::RwLock::new(HashMap::new())),
-        authorized: HashMap::new(),
-        fetches: JoinSet::new(),
-        fetch_ids: HashMap::new(),
-        stop: watch::channel(false).0,
-        paused: false,
-        pause_done: None,
-        pause_failure: None,
-        publications: JoinSet::new(),
-        publication_ids: HashMap::new(),
-        flights: HashMap::new(),
-        pending: VecDeque::new(),
-        periodic: HashMap::new(),
-    }
+fn state() -> SupervisorState {
+    SupervisorState::new(Arc::new(SubscriptionManager::new().unwrap()), None)
 }
 
 #[tokio::test]
@@ -44,10 +27,9 @@ async fn shutdown_joins_pending_fetch_socket_instead_of_detaching_it() {
         1,
         format!("http://{}", listener.local_addr().unwrap()),
     );
-    let (commands, _receiver) = mpsc::channel(4);
-    let mut state = state(commands);
+    let mut state = state();
     state.reconcile(vec![subscription]);
-    state.start_pending();
+    state.start_pending(MAX_ACTIVE_FETCHES);
     let (mut socket, _) = listener.accept().await.unwrap();
     let mut header = Vec::new();
     while !header.ends_with(b"\r\n\r\n") {
@@ -71,9 +53,9 @@ async fn replacement_during_fetch_keeps_original_revision_until_publication_fenc
     let id = uuid::Uuid::new_v4();
     let original = authorized(id, 1, format!("http://{}", listener.local_addr().unwrap()));
     let (commands, mut receiver) = mpsc::channel(4);
-    let mut state = state(commands);
+    let mut state = state();
     state.reconcile(vec![original]);
-    state.start_pending();
+    state.start_pending(MAX_ACTIVE_FETCHES);
     let (mut socket, _) = listener.accept().await.unwrap();
     let mut header = Vec::new();
     while !header.ends_with(b"\r\n\r\n") {
@@ -96,7 +78,7 @@ async fn replacement_during_fetch_keeps_original_revision_until_publication_fenc
         .await
         .unwrap();
     let completion = state.fetches.join_next().await.unwrap().unwrap();
-    state.fetched(completion);
+    state.fetched(completion, &commands);
     let ControlCommand::MergeSubscription {
         revision, result, ..
     } = receiver.recv().await.unwrap()
@@ -111,7 +93,7 @@ async fn replacement_during_fetch_keeps_original_revision_until_publication_fenc
         .send(SubscriptionMergeReply {
             outcome: ReloadOutcome::Rejected,
             node_count: 0,
-            authorized: vec![state.authorized[&id].clone()],
+            authorized: vec![state.providers[&id].authorized.clone()],
         })
         .unwrap();
     let (id, reply) = state.publications.join_next().await.unwrap().unwrap();
@@ -131,9 +113,9 @@ async fn shutdown_waits_for_admitted_merge_acknowledgement() {
         format!("http://{}", listener.local_addr().unwrap()),
     );
     let (commands, mut receiver) = mpsc::channel(4);
-    let mut state = state(commands);
+    let mut state = state();
     state.reconcile(vec![subscription.clone()]);
-    state.start_pending();
+    state.start_pending(MAX_ACTIVE_FETCHES);
     let (mut socket, _) = listener.accept().await.unwrap();
     let body = "socks5://127.0.0.1:1080";
     socket
@@ -147,7 +129,7 @@ async fn shutdown_waits_for_admitted_merge_acknowledgement() {
         .await
         .unwrap();
     let completion = state.fetches.join_next().await.unwrap().unwrap();
-    state.fetched(completion);
+    state.fetched(completion, &commands);
     let ControlCommand::MergeSubscription { result, .. } = receiver.recv().await.unwrap() else {
         panic!("expected merge");
     };
@@ -186,8 +168,7 @@ async fn refresh_queue_refusal_wakes_idempotent_waiters_and_shutdown_settles_acc
         providers::RefreshOperation,
     };
     use axum::response::IntoResponse;
-    let (commands, _receiver) = mpsc::channel(4);
-    let mut state = state(commands);
+    let mut state = state();
     let instance = uuid::Uuid::new_v4().to_string();
     let operations = Arc::new(OperationStore::new(
         instance.clone(),
@@ -200,9 +181,10 @@ async fn refresh_queue_refusal_wakes_idempotent_waiters_and_shutdown_settles_acc
             index as u64 + 1,
             "http://127.0.0.1:9".into(),
         );
-        state
-            .authorized
-            .insert(authorized.subscription.id, authorized.clone());
+        state.providers.insert(
+            authorized.subscription.id,
+            Provider::new(authorized.clone()),
+        );
         let path = format!("/api/v1/providers/{}/refresh", authorized.subscription.id);
         let reservation = operations
             .reserve(
@@ -269,7 +251,7 @@ async fn pause_joins_fetches_and_resume_fetches_only_current_authorizations() {
     periodic.subscription.update_interval = 1;
     let startup = authorized(uuid::Uuid::new_v4(), 8, periodic.subscription.url.clone());
     let (commands, mut receiver) = mpsc::channel(4);
-    let mut state = state(commands);
+    let mut state = state();
     state.reconcile(vec![periodic.clone(), startup]);
     let accepted_at = SystemTime::UNIX_EPOCH + Duration::from_secs(17);
     state
@@ -282,7 +264,7 @@ async fn pause_joins_fetches_and_resume_fetches_only_current_authorizations() {
         cached: true,
         error: Some("cache_load_failed"),
     };
-    state.start_pending();
+    state.start_pending(MAX_ACTIVE_FETCHES);
     let mut sockets = Vec::new();
     for _ in 0..2 {
         let (mut socket, _) = listener.accept().await.unwrap();
@@ -308,11 +290,11 @@ async fn pause_joins_fetches_and_resume_fetches_only_current_authorizations() {
     assert!(load.cached);
     assert_eq!(load.error, Some("cache_load_failed"));
     state.reconcile(vec![periodic.clone()]);
-    state.start_pending();
+    state.start_pending(MAX_ACTIVE_FETCHES);
     assert!(receiver.try_recv().is_err());
     assert!(state.flights.is_empty());
     state.resume().await.unwrap();
-    state.start_pending();
+    state.start_pending(MAX_ACTIVE_FETCHES);
     let (mut socket, _) = listener.accept().await.unwrap();
     let body = "socks5://127.0.0.1:1081#fresh";
     socket
@@ -326,7 +308,7 @@ async fn pause_joins_fetches_and_resume_fetches_only_current_authorizations() {
         .await
         .unwrap();
     let completion = state.fetches.join_next().await.unwrap().unwrap();
-    state.fetched(completion);
+    state.fetched(completion, &commands);
     let ControlCommand::MergeSubscription {
         subscription_id,
         revision,
@@ -352,7 +334,7 @@ async fn pause_joins_fetches_and_resume_fetches_only_current_authorizations() {
 }
 
 #[test]
-fn pause_joins_queued_blocking_persistence_and_discards_its_body() {
+fn pause_joins_queued_blocking_persistence() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .max_blocking_threads(1)
@@ -366,8 +348,7 @@ fn pause_joins_queued_blocking_persistence_and_discards_its_body() {
         )
         .unwrap();
         let subscription = authorized(uuid::Uuid::new_v4(), 1, "http://127.0.0.1:9".into());
-        let (commands, mut receiver) = mpsc::channel(4);
-        let mut state = state(commands);
+        let mut state = state();
         state.reconcile(vec![subscription.clone()]);
         state.pending.clear();
         let (entered, entered_rx) = oneshot::channel();
@@ -428,10 +409,6 @@ fn pause_joins_queued_blocking_persistence_and_discards_its_body() {
             .unwrap()
             .unwrap();
         assert_eq!(cached[0].name, "old");
-        assert!(
-            receiver.try_recv().is_err(),
-            "a joined old body must not be published"
-        );
     });
 }
 
@@ -445,7 +422,7 @@ async fn finish_pause_waits_for_late_enqueue_and_retains_removed_provider_commit
     };
     let (merge_tx, mut merge_rx) = mpsc::channel(1);
     let held_capacity = merge_tx.clone().reserve_owned().await.unwrap();
-    let mut state = state(merge_tx);
+    let mut state = state();
     let subscription = authorized(uuid::Uuid::new_v4(), 4, "http://127.0.0.1:9".into());
     state.reconcile(vec![subscription.clone()]);
     state.pending.clear();
@@ -477,17 +454,20 @@ async fn finish_pause_waits_for_late_enqueue_and_retains_removed_provider_commit
     );
     state.pending.clear();
     operations.running(&operation_id);
-    state.fetched(FetchCompletion {
-        authorized: subscription.clone(),
-        result: Some(Ok(Vec::new())),
-        diagnostics: Vec::new(),
-    });
+    state.fetched(
+        FetchCompletion {
+            authorized: subscription.clone(),
+            result: Some(Ok(Vec::new())),
+            diagnostics: Vec::new(),
+        },
+        &merge_tx,
+    );
     let (command_tx, commands) = mpsc::channel(4);
     let handle = SubscriptionSupervisorHandle {
         command_tx,
         observations: Arc::clone(&state.observations),
     };
-    let worker = tokio::spawn(state.run(commands));
+    let worker = tokio::spawn(state.run(commands, merge_tx));
     handle.begin_pause().await.unwrap();
     assert!(
         merge_rx.try_recv().is_err(),
@@ -575,8 +555,7 @@ async fn pause_cancels_periodic_and_explicit_fetches_without_losing_replay() {
     periodic.subscription.update_interval = 1;
     let explicit = authorized(uuid::Uuid::new_v4(), 2, periodic.subscription.url.clone());
     let queued = authorized(uuid::Uuid::new_v4(), 3, periodic.subscription.url.clone());
-    let (commands, mut receiver) = mpsc::channel(4);
-    let mut state = state(commands);
+    let mut state = state();
     state.reconcile(vec![periodic, explicit.clone(), queued.clone()]);
     for id in [explicit.subscription.id, queued.subscription.id] {
         state.pending.retain(|pending| *pending != id);
@@ -611,7 +590,7 @@ async fn pause_cancels_periodic_and_explicit_fetches_without_losing_replay() {
         );
         admitted.push((path, id));
         if subscription.subscription.id == explicit.subscription.id {
-            state.start_pending();
+            state.start_pending(MAX_ACTIVE_FETCHES);
         }
     }
     let mut sockets = Vec::new();
@@ -679,7 +658,6 @@ async fn pause_cancels_periodic_and_explicit_fetches_without_losing_replay() {
         admission.await.unwrap_err().into_response().status(),
         axum::http::StatusCode::CONFLICT
     );
-    assert!(receiver.try_recv().is_err());
     assert_eq!(state.owned_task_count(), 0);
     state.shutdown().await.unwrap();
 }
@@ -693,8 +671,7 @@ async fn pause_preserves_a_completed_http_failure() {
         format!("http://{}", listener.local_addr().unwrap()),
     );
     let id = subscription.subscription.id;
-    let (commands, _receiver) = mpsc::channel(4);
-    let mut state = state(commands);
+    let mut state = state();
     state.reconcile(vec![subscription.clone()]);
     state.pending.clear();
     let fetch = fetch_once(
@@ -880,4 +857,87 @@ async fn native_supervisor_pause_closes_completed_keepalive_before_reopening() {
         "cancelled bodies must never become runtime publications"
     );
     assert_eq!(supervisor.shutdown().await.unwrap(), 0);
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn deferred_provider_survives_pause_and_same_revision_reconcile_until_replaced() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut provider = authorized(
+        uuid::Uuid::new_v4(),
+        1,
+        format!("http://{}", listener.local_addr().unwrap()),
+    );
+    provider.subscription.update_interval = 1;
+    let mut supervisor = SubscriptionSupervisor::prepare(&mut Config::default(), None, Vec::new())
+        .await
+        .unwrap();
+    let (merge_tx, mut merges) = mpsc::channel(4);
+    supervisor.start(merge_tx);
+    let handle = supervisor.handle();
+    handle
+        .reconcile_managed(vec![provider.clone()], provider.subscription.id)
+        .await
+        .unwrap();
+    handle.begin_pause().await.unwrap();
+    handle.finish_pause().await.unwrap();
+    handle.reconcile(vec![provider.clone()]).await.unwrap();
+    handle.resume().await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1100), listener.accept())
+            .await
+            .is_err(),
+        "neither resume nor periodic ticks may activate a deferred provider"
+    );
+    let deferred = handle.deferred_subscriptions().await.unwrap();
+    assert_eq!(deferred.len(), 1);
+    assert!(same_worker_spec(&deferred[0], &provider.subscription));
+
+    provider.revision += 1;
+    provider.subscription.name = "replacement-with-same-fetch-identity".into();
+    handle.reconcile(vec![provider.clone()]).await.unwrap();
+    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let body = "socks5://127.0.0.1:11088#replacement";
+    socket
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let ControlCommand::MergeSubscription {
+        revision,
+        nodes,
+        result,
+        ..
+    } = tokio::time::timeout(Duration::from_secs(1), merges.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected replacement publication");
+    };
+    assert_eq!(revision, 2);
+    assert_eq!(nodes[0].name, "replacement");
+    assert!(handle.deferred_subscriptions().await.unwrap().is_empty());
+    result
+        .send(SubscriptionMergeReply {
+            outcome: ReloadOutcome::Committed { generation: 2 },
+            node_count: nodes.len(),
+            authorized: vec![provider.clone()],
+        })
+        .unwrap();
+    supervisor.shutdown().await.unwrap();
+    assert!(
+        handle
+            .observation(&provider.subscription)
+            .updated_at
+            .is_some()
+    );
 }

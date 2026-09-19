@@ -23,7 +23,7 @@ impl ControlPlaneHandle {
         feedback: &HashMap<uuid::Uuid, crate::group::ScoreFeedback>,
         cold_urltest: bool,
         #[cfg(feature = "native-api")] selection_chains: &HashMap<uuid::Uuid, Vec<String>>,
-        #[cfg(feature = "native-api")] native: Option<&TcpNativeDial>,
+        #[cfg(feature = "native-api")] native: &ConnectionObservation,
     ) -> anyhow::Result<
         Option<(
             crate::proxy::ProxyStream,
@@ -52,31 +52,14 @@ impl ControlPlaneHandle {
             let feedback = feedback.clone();
             let started_reporters = Arc::clone(&started_reporters);
             #[cfg(feature = "native-api")]
-            let native_attempt = native.map(|capture| {
-                let chain = selection_chains.get(&node.id).map(Vec::as_slice).unwrap_or_default();
-                if candidates.len() == 1 {
-                    capture.selected(chain, &node);
-                }
-                let selection_path = native_selection_path(&capture.config, &capture.catalog, chain, &node);
-                let target_kind = native_tcp_target_kind(&node, target_domain.as_deref());
-                let target_value = match target_kind {
-                    "none" => None,
-                    "domain" => target_domain.as_ref().map(|domain| format!("{domain}:{}", target.port())),
-                    _ => Some(target.to_string()),
-                };
-                let data = serde_json::json!({
-                    "parent_attempt_id": null, "kind": "leaf",
-                    "evaluation_id": capture.evaluation_id,
-                    "routing_source": if capture.evaluation_id.is_some() { "evaluation" } else { "unknown" },
-                    "routed_outbound": capture.routed_outbound, "effective_outbound": outbound_name,
-                    "mode_override": capture.mode_override, "selection_path": selection_path,
-                    "leaf_node_id": node.id.to_string(), "leaf_node_name": node.name,
-                    "target": target_value, "target_kind": target_kind,
-                    "dial_ip": null, "server_addr": null,
-                    "resolution_location": match target_kind { "none" => "not_applicable", "ip" => "original_ip", _ => "unknown" },
-                });
-                (Arc::clone(&capture.flow), capture.generation, data)
-            });
+            let chain = selection_chains
+                .get(&node.id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            #[cfg(feature = "native-api")]
+            if candidates.len() == 1 {
+                native.selected(chain, &node);
+            }
             set.push(
                 std::panic::AssertUnwindSafe(async move {
                     if cold_urltest {
@@ -84,9 +67,7 @@ impl ControlPlaneHandle {
                         wait_for_cold_urltest_release(idx).await;
                     }
                     #[cfg(feature = "native-api")]
-                    let mut native_attempt = native_attempt.map(|(flow, generation, data)| {
-                        NativeAttempt::new(flow, Some(generation), data)
-                    });
+                    let mut native_attempt = native.attempt(chain, &node, target_domain.as_deref());
                     let reporter = Arc::new(parking_lot::Mutex::new(None));
                     let on_start = {
                         let feedback = feedback.get(&node.id).cloned();
@@ -144,24 +125,7 @@ impl ControlPlaneHandle {
                     }
                     #[cfg(feature = "native-api")]
                     if let Some(attempt) = &mut native_attempt {
-                        match &result {
-                            Ok(_) => attempt.finish("succeeded", None),
-                            Err(error) => {
-                                let code =
-                                    if node.protocol() == honk_config::types::NodeProtocol::Block {
-                                        "policy_block"
-                                    } else if honk_outbound::proxy::is_packet_rejection(error) {
-                                        "local_refusal"
-                                    } else if error.downcast_ref::<std::io::Error>().is_some_and(
-                                        |error| error.kind() == std::io::ErrorKind::TimedOut,
-                                    ) {
-                                        "dial_timeout"
-                                    } else {
-                                        "dial_failed"
-                                    };
-                                attempt.finish("failed", Some(code));
-                            }
-                        }
+                        attempt.tcp_finished(result.as_ref().err(), &node);
                     }
                     (result, idx, elapsed, node, reporter)
                 })
@@ -448,6 +412,142 @@ impl ControlPlaneHandle {
                 None
             }
         })
+    }
+
+    pub(super) fn replenish_tcp_pool(
+        &self,
+        node: Node,
+        target: (SocketAddr, Option<String>),
+        runtime_generation: &Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+        connect_timeout: Duration,
+        score_reporter: Option<crate::group::ScoreReporter>,
+        health_ipver: IpVersion,
+    ) {
+        let (original_dst, target_domain) = target;
+        let node_addr = format!("{}:{}", node.host(), node.port);
+        let pool = self.connection_pool.clone();
+        let registry = self.proxy_registry.clone();
+        let generation = Arc::clone(runtime_generation);
+        let pool_feedback = score_reporter.as_ref().map(|reporter| {
+            reporter
+                .feedback()
+                .with_source(crate::group::ScoreSource::Warmup)
+        });
+        let pool_health_family = health_ipver;
+        let _ = runtime_generation.spawn_background(async move {
+            let (ready_capable, bare_capable) = registry
+                .find(node.protocol())
+                .map(|entry| {
+                    (
+                        (entry.descriptor.pool_ready_streams)(&node),
+                        (entry.descriptor.pool_bare_tcp)(&node),
+                    )
+                })
+                .unwrap_or((false, false));
+            if ready_capable {
+                let key = ConnectionPool::ready_key(
+                    generation.generation(),
+                    node.id,
+                    original_dst,
+                    target_domain.as_deref(),
+                );
+                // Only hot targets earn a speculative ready
+                // dial; a one-off flow gets none.
+                if !pool.note_target(generation.generation(), &key) {
+                    return;
+                }
+                let pool_reporter = pool_feedback.as_ref().map(|feedback| feedback.start());
+                match registry
+                    .dial_runtime(
+                        Arc::clone(&generation),
+                        node.id,
+                        original_dst,
+                        target_domain.as_deref(),
+                        connect_timeout,
+                    )
+                    .await
+                {
+                    Ok(stream) => {
+                        if generation.is_shutdown() {
+                            if let Some(reporter) = &pool_reporter {
+                                reporter.finish(crate::group::ScoreOutcome::Shutdown);
+                            }
+                            return;
+                        }
+                        if let Some(reporter) = &pool_reporter {
+                            reporter.setup_succeeded();
+                            reporter.finish_setup_only();
+                        }
+                        pool.deposit_ready(generation.generation(), &key, stream)
+                            .await;
+                    }
+                    Err(e) => {
+                        if let Some(reporter) = &pool_reporter {
+                            reporter.setup_failed(score_runtime_outcome(&generation, &e));
+                        }
+                        debug!(
+                            "Pool deposit: ready dial to {} via {} failed: {}",
+                            original_dst, node_addr, e
+                        );
+                    }
+                }
+                return;
+            }
+            if !bare_capable {
+                // Multiplexed protocols pool whole sessions
+                // instead; a bare TCP is useless to them.
+                return;
+            }
+            let pool_reporter = pool_feedback.as_ref().map(|feedback| {
+                feedback
+                    .clone()
+                    .with_context(crate::group::ScoreSelectionContext::aggregate(
+                        SelectionNetwork::Tcp,
+                        ProbeDomain::Tcp,
+                        pool_health_family,
+                    ))
+                    .start()
+            });
+            match generation
+                .scope_dials(honk_outbound::util::connect_outbound(
+                    &node_addr,
+                    connect_timeout,
+                ))
+                .await
+            {
+                Ok(stream) => {
+                    if generation.is_shutdown() {
+                        if let Some(reporter) = &pool_reporter {
+                            reporter.finish(crate::group::ScoreOutcome::Shutdown);
+                        }
+                        return;
+                    }
+                    if pool.deposit_tcp(&node_addr, stream).await {
+                        if let Some(reporter) = &pool_reporter {
+                            reporter.setup_succeeded();
+                            reporter.finish_setup_only();
+                        }
+                    } else {
+                        if let Some(reporter) = &pool_reporter {
+                            reporter.setup_failed(crate::group::ScoreOutcome::Io(
+                                std::io::ErrorKind::ConnectionReset,
+                            ));
+                        }
+                        debug!("Pool deposit: stream to {} is dead", node_addr);
+                    }
+                }
+                Err(e) => {
+                    if let Some(reporter) = &pool_reporter {
+                        reporter.setup_failed(if generation.is_shutdown() {
+                            crate::group::ScoreOutcome::Shutdown
+                        } else {
+                            crate::group::ScoreOutcome::Io(e.kind())
+                        });
+                    }
+                    debug!("Pool deposit: connect to {} failed: {}", node_addr, e);
+                }
+            }
+        });
     }
 
     /// Dial through a node using the TCP connection pool.

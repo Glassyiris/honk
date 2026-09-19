@@ -12,6 +12,9 @@ fn main() {
 
     #[cfg(feature = "ebpf")]
     embed_ebpf_object();
+
+    #[cfg(feature = "native-ui")]
+    embed_native_ui().expect("failed to embed native UI assets");
 }
 
 fn git_output(args: &[&str]) -> Option<String> {
@@ -55,6 +58,68 @@ fn emit_version() {
     println!("cargo:rustc-env=HONK_REVISION={revision}");
     let target = std::env::var("TARGET").unwrap_or_default();
     println!("cargo:rustc-env=HONK_TARGET={target}");
+}
+
+#[cfg(feature = "native-ui")]
+fn embed_native_ui() -> anyhow::Result<()> {
+    use std::{fmt::Write, fs, path::Path};
+
+    use anyhow::{Context, ensure};
+
+    fn collect(root: &Path, path: &Path, files: &mut Vec<String>) -> anyhow::Result<()> {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        ensure!(
+            !metadata.file_type().is_symlink(),
+            "native UI assets must not contain symlinks: {}",
+            path.display()
+        );
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path)? {
+                collect(root, &entry?.path(), files)?;
+            }
+        } else {
+            ensure!(
+                metadata.is_file(),
+                "native UI asset must be a regular file: {}",
+                path.display()
+            );
+            files.push(
+                path.strip_prefix(root)?
+                    .to_str()
+                    .context("native UI asset paths must be UTF-8")?
+                    .replace(std::path::MAIN_SEPARATOR, "/"),
+            );
+        }
+        Ok(())
+    }
+
+    println!("cargo:rerun-if-changed=assets/doona");
+    let root = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?).join("assets/doona");
+    ensure!(
+        fs::symlink_metadata(&root)?.is_dir(),
+        "native UI assets must be a directory"
+    );
+    let mut files = Vec::new();
+    collect(&root, &root, &mut files)?;
+    files.sort_unstable();
+    ensure!(
+        files
+            .binary_search_by(|path| path.as_str().cmp("index.html"))
+            .is_ok(),
+        "native UI assets must include index.html"
+    );
+    let mut generated = String::from("&[\n");
+    for path in files {
+        writeln!(
+            generated,
+            "    ({path:?}, include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/assets/doona/\", {path:?}))),"
+        )?;
+    }
+    generated.push_str("]\n");
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
+    fs::write(out.join("native_ui_assets.rs"), generated)?;
+    Ok(())
 }
 
 #[cfg(feature = "ebpf")]

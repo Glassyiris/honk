@@ -50,7 +50,7 @@ async fn native_http1_cold_and_warm_keep_pinned_authority_without_redirects() {
             }
             assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
         });
-        let guard =
+        let mut guard =
             crate::runtime::NodeRuntime::try_ephemeral_guarded(&make_node("native-wire")).unwrap();
         let request =
             http_probe_request("http://probe.example:8080/ready/../check?raw=%2f", "GET").unwrap();
@@ -80,7 +80,7 @@ async fn native_http1_cold_and_warm_keep_pinned_authority_without_redirects() {
             .await
             .unwrap()
             .unwrap();
-        guard.close().await;
+        guard.close().await.unwrap();
     }
 }
 
@@ -109,7 +109,7 @@ async fn native_http1_rejects_invalid_responses_but_keeps_validated_close_fallba
                 stream.write_all(response).await.unwrap();
             }
         });
-        let guard =
+        let mut guard =
             crate::runtime::NodeRuntime::try_ephemeral_guarded(&make_node("native-invalid"))
                 .unwrap();
         let request = http_probe_request("http://probe.example/check", "GET").unwrap();
@@ -126,7 +126,7 @@ async fn native_http1_rejects_invalid_responses_but_keeps_validated_close_fallba
         .await;
         assert_eq!(result.is_ok(), succeeds, "cold={cold}: {result:?}");
         peer.await.unwrap();
-        guard.close().await;
+        guard.close().await.unwrap();
     }
 }
 
@@ -142,7 +142,7 @@ async fn native_http_deadline_includes_dial_and_warmup() {
         let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await;
         assert!(matches!(stream.read(&mut [0; 1]).await, Ok(0) | Err(_)));
     });
-    let guard =
+    let mut guard =
         crate::runtime::NodeRuntime::try_ephemeral_guarded(&make_node("native-deadline")).unwrap();
     let handler = PinnedHandler {
         addr,
@@ -166,7 +166,7 @@ async fn native_http_deadline_includes_dial_and_warmup() {
         std::io::ErrorKind::TimedOut
     );
     peer.await.unwrap();
-    guard.close().await;
+    guard.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -185,7 +185,7 @@ async fn native_http_cancellation_releases_connection_before_return() {
         received.send(()).unwrap();
         assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
     });
-    let guard =
+    let mut guard =
         crate::runtime::NodeRuntime::try_ephemeral_guarded(&make_node("native-cancel")).unwrap();
     let runtime = guard.runtime();
     let request = http_probe_request("http://probe.example/check", "GET").unwrap();
@@ -213,7 +213,7 @@ async fn native_http_cancellation_releases_connection_before_return() {
         .await
         .unwrap()
         .unwrap();
-    guard.close().await;
+    guard.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -237,7 +237,7 @@ async fn native_https_keeps_request_sni_on_pinned_dial() {
                 .any(|protocol| protocol == b"h2")
         );
     });
-    let guard =
+    let mut guard =
         crate::runtime::NodeRuntime::try_ephemeral_guarded(&make_node("native-sni")).unwrap();
     let request = http_probe_request("https://probe.example:8443/check", "GET").unwrap();
     let (_cancel, cancel) = tokio::sync::watch::channel(false);
@@ -256,7 +256,7 @@ async fn native_https_keeps_request_sni_on_pinned_dial() {
     .await;
     assert!(result.is_err(), "peer intentionally does not complete TLS");
     peer.await.unwrap();
-    guard.close().await;
+    guard.close().await.unwrap();
 }
 
 #[test]

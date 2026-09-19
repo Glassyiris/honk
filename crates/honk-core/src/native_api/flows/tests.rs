@@ -1,4 +1,6 @@
+use super::record::{FlowError, OutboundAttempt, Selection};
 use super::*;
+use honk_config::types::DialMode;
 
 fn store() -> Arc<FlowStore> {
     let instance = Uuid::new_v4().to_string();
@@ -35,9 +37,15 @@ fn error_code(error: ApiError, status: StatusCode, code: &str) {
     assert_eq!(error.into_response().status(), status);
 }
 
-fn dial_mode() -> Value {
-    json!({"configured": "ip", "effective_target": "ip", "domain": null,
-        "domain_source": null, "verification": "not_required", "reason": "original_destination"})
+fn dial_mode() -> StepData {
+    StepData::DialMode {
+        configured: DialMode::Ip,
+        effective_target: "ip",
+        domain: None,
+        domain_source: None,
+        verification: "not_required",
+        reason: "original_destination",
+    }
 }
 
 #[test]
@@ -50,7 +58,7 @@ fn tuple_reincarnation_keeps_history_and_exact_connection_identity() {
         "original-group-id".to_owned(),
         "original-node-id".to_owned(),
     ]);
-    first.step("dial_mode", Some(7), dial_mode());
+    first.step(Some(7), dial_mode());
     first.finish("closed", "relay_finished");
     let second = begin(&store, "tcp");
     second.attach_connection("connection-new");
@@ -260,8 +268,7 @@ fn room_making_overflow_is_reported_per_interval_but_lost_history_per_record() {
             .filter(|kind| *kind == "flow.gap")
             .count()
     };
-    // The byte budget fills before the record cap; keep going until twenty
-    // records had to make room for newer ones.
+    // Keep going until twenty records had to make room for newer ones.
     while store.inner.lock().dropped < 20 {
         begin(&store, "tcp").finish("closed", "relay_finished");
     }
@@ -269,7 +276,7 @@ fn room_making_overflow_is_reported_per_interval_but_lost_history_per_record() {
     // A record that overflowed its own step budget is still named on its own.
     let flow = begin(&store, "tcp");
     for _ in 0..MAX_STEPS + 1 {
-        flow.step("dial_mode", Some(1), dial_mode());
+        flow.step(Some(1), dial_mode());
     }
     assert_eq!(gaps(), 2);
 }
@@ -329,11 +336,13 @@ fn trace_bounds_keep_terminal_state_and_explicit_loss_without_private_errors() {
     let store = store();
     let flow = begin(&store, "tcp");
     for _ in 0..MAX_STEPS + 10 {
-        flow.step("dial_mode", Some(1), dial_mode());
+        flow.step(Some(1), dial_mode());
     }
     let mut unsafe_data = dial_mode();
-    unsafe_data["domain"] = json!("https://operator:credential@example.test");
-    flow.step("dial_mode", Some(1), unsafe_data);
+    if let StepData::DialMode { domain, .. } = &mut unsafe_data {
+        *domain = Some("https://operator:credential@example.test".into());
+    }
+    flow.step(Some(1), unsafe_data);
     flow.finish("failed", "dial_failed");
     let detail = store.get(flow.id(), &request_id()).unwrap();
     assert_eq!(detail["state"], "failed");
@@ -352,26 +361,28 @@ fn trace_bounds_keep_terminal_state_and_explicit_loss_without_private_errors() {
 }
 
 #[test]
-fn unsafe_error_text_is_redacted_without_losing_the_observed_outcome() {
+fn unsafe_causal_identity_drops_step_without_losing_the_terminal_outcome() {
     let store = store();
     let flow = begin(&store, "udp");
     flow.step(
-        "connection",
         None,
-        json!({
-            "state": "dialing", "reason": "transport_failed", "milestone": "unknown",
-            "attempt_id": null, "reply_received": null,
-            "error": "dial https://operator:credential@example.test/private failed"
-        }),
+        StepData::Connection {
+            state: "dialing",
+            reason: "transport_failed",
+            milestone: "unknown",
+            attempt_id: Some("https://operator:credential@example.test/private".into()),
+            reply_received: None,
+            error: Some(FlowError::UdpPrepareFailed),
+        },
     );
-    flow.step("route", Some(1), json!({"outbound": "incomplete"}));
+    flow.finish("failed", "transport_failed");
     let detail = store.get(flow.id(), &request_id()).unwrap();
     assert_eq!(detail["trace"]["steps"].as_array().unwrap().len(), 2);
+    assert_eq!(detail["state"], "failed");
     assert_eq!(
         detail["trace"]["steps"][1]["data"]["reason"],
         "transport_failed"
     );
-    assert!(detail["trace"]["steps"][1]["data"]["error"].is_null());
     assert_eq!(
         detail["trace"]["missing"],
         json!(["not_instrumented", "redacted"])
@@ -401,12 +412,15 @@ fn fixed_error_codes_and_safe_addresses_do_not_invent_input_provenance() {
         Some(0),
     );
     flow.step(
-        "connection",
         None,
-        json!({
-            "state": "dialing", "reason": "transport_failed", "milestone": "unknown",
-            "attempt_id": "attempt-1", "reply_received": null, "error": "udp_prepare_failed"
-        }),
+        StepData::Connection {
+            state: "dialing",
+            reason: "transport_failed",
+            milestone: "unknown",
+            attempt_id: Some("attempt-1".into()),
+            reply_received: None,
+            error: Some(FlowError::UdpPrepareFailed),
+        },
     );
     let detail = store.get(flow.id(), &request_id()).unwrap();
     assert_eq!(detail["input"]["domain"], "secret.example.test");
@@ -431,17 +445,38 @@ fn optional_display_redaction_preserves_attempt_transitions_and_selection_ids() 
     let store = store();
     let flow = begin(&store, "tcp");
     for status in ["started", "succeeded"] {
-        flow.step("outbound", Some(1), json!({
-            "attempt_id": "attempt-1", "parent_attempt_id": null, "kind": "leaf",
-            "evaluation_id": "evaluation-1", "routing_source": "evaluation",
-            "routed_outbound": "Group/Proxy", "effective_outbound": "Group/Proxy",
-            "mode_override": "none", "selection_path": [{
-                "group_id": "group-1", "member_id": "node-1", "member_name": "HK/Trojan",
-                "policy": "urltest", "reason": "selected", "selection": null
-            }], "leaf_node_id": "node-1", "leaf_node_name": "HK/Trojan", "target": "127.0.0.2:443",
-            "target_kind": "ip", "dial_ip": "127.0.0.2", "server_addr": null,
-            "resolution_location": "original_ip", "status": status, "error": null
-        }));
+        flow.step(
+            Some(1),
+            StepData::Outbound {
+                attempt_id: "attempt-1".into(),
+                status,
+                error: None,
+                attempt: OutboundAttempt {
+                    parent_attempt_id: None,
+                    kind: "leaf",
+                    evaluation_id: Some("evaluation-1".into()),
+                    routing_source: "evaluation",
+                    routed_outbound: Some("Group/Proxy".into()),
+                    effective_outbound: Some("Group/Proxy".into()),
+                    mode_override: "none",
+                    selection_path: vec![Selection {
+                        group_id: "group-1".into(),
+                        member_id: "node-1".into(),
+                        member_name: Some("HK/Trojan".into()),
+                        policy: "urltest",
+                        reason: "selected",
+                        selection: (),
+                    }],
+                    leaf_node_id: "node-1".into(),
+                    leaf_node_name: Some("HK/Trojan".into()),
+                    target: Some("127.0.0.2:443".into()),
+                    target_kind: "ip",
+                    dial_ip: Some("127.0.0.2".parse().unwrap()),
+                    server_addr: (),
+                    resolution_location: "original_ip",
+                },
+            },
+        );
     }
     let detail = store.get(flow.id(), &request_id()).unwrap();
     assert_eq!(detail["trace"]["steps"].as_array().unwrap().len(), 3);
@@ -468,7 +503,7 @@ fn recorder_and_snapshots_share_the_byte_budget_and_tombstones_are_bounded() {
     let original_id = original.id().to_owned();
     for _ in 0..MAX_RECORDS * 2 {
         let flow = begin(&store, "tcp");
-        flow.step("dial_mode", Some(1), dial_mode());
+        flow.step(Some(1), dial_mode());
         flow.finish("closed", "relay_finished");
     }
     let inner = store.inner.lock();
@@ -503,4 +538,141 @@ fn recorder_and_snapshots_share_the_byte_budget_and_tombstones_are_bounded() {
         )
         .unwrap();
     assert_eq!(store.inner.lock().snapshot_bytes, before);
+}
+
+#[test]
+fn six_captured_forms_preserve_wire_fields_and_nulls() {
+    let store = store();
+    let flow = begin(&store, "tcp");
+    flow.step(Some(7), dial_mode());
+    flow.step(
+        Some(7),
+        StepData::Route {
+            evaluation_id: "evaluation-1".into(),
+            chain: "traffic",
+            plane: "userspace",
+            rule_id: Some("rule-1".into()),
+            rules: [],
+            outbound: Some("direct".into()),
+            must: false,
+            mark: 0,
+            input: Some(super::record::RouteInput {
+                network: "tcp",
+                src_ip: "127.0.0.1".parse().unwrap(),
+                src_port: 31000,
+                dst_ip: "127.0.0.2".parse().unwrap(),
+                dst_port: 443,
+                domain: None,
+                pname: None,
+                src_mac: None,
+                dscp: None,
+                mark: (),
+                ingress: (),
+                domain_rule_ids: (),
+            }),
+            dns_action: (),
+        },
+    );
+    flow.step(
+        Some(7),
+        StepData::Reroute {
+            performed: false,
+            reason: "not_required",
+            from_evaluation_id: None,
+            to_evaluation_id: Some("evaluation-1".into()),
+        },
+    );
+    flow.step(
+        Some(7),
+        StepData::Outbound {
+            attempt_id: "attempt-1".into(),
+            status: "failed",
+            error: Some(FlowError::DialTimeout),
+            attempt: OutboundAttempt {
+                parent_attempt_id: None,
+                kind: "leaf",
+                evaluation_id: Some("evaluation-1".into()),
+                routing_source: "evaluation",
+                routed_outbound: Some("direct".into()),
+                effective_outbound: Some("direct".into()),
+                mode_override: "none",
+                selection_path: vec![],
+                leaf_node_id: "direct-id".into(),
+                leaf_node_name: Some("direct".into()),
+                target: Some("127.0.0.2:443".into()),
+                target_kind: "ip",
+                dial_ip: Some("127.0.0.2".parse().unwrap()),
+                server_addr: (),
+                resolution_location: "original_ip",
+            },
+        },
+    );
+    flow.finish("failed", "dial_failed");
+    let detail = store.get(flow.id(), &request_id()).unwrap();
+    let steps: Vec<_> = detail["trace"]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| json!({"stage": step["stage"], "data": step["data"]}))
+        .collect();
+    assert_eq!(
+        steps,
+        vec![
+            json!({"stage":"input","data":{"source":"socket","values":{
+                "src":"127.0.0.1:31000","dst":"127.0.0.2:443","domain":null,"domain_source":null,
+                "pid":null,"process_path":null,"src_mac":null,"ingress":null,"domain_rule_ids":null,
+                "dscp":null,"mark":null,"pname":null
+            }}}),
+            json!({"stage":"dial_mode","data":{"configured":"ip","effective_target":"ip",
+            "domain":null,"domain_source":null,"verification":"not_required","reason":"original_destination"}}),
+            json!({"stage":"route","data":{"evaluation_id":"evaluation-1","chain":"traffic","plane":"userspace",
+            "rule_id":"rule-1","rules":[],"outbound":"direct","must":false,"mark":0,"dns_action":null,
+            "input":{"network":"tcp","src_ip":"127.0.0.1","src_port":31000,"dst_ip":"127.0.0.2","dst_port":443,
+                "domain":null,"pname":null,"src_mac":null,"dscp":null,"mark":null,"ingress":null,"domain_rule_ids":null}}}),
+            json!({"stage":"reroute","data":{"performed":false,"reason":"not_required",
+            "from_evaluation_id":null,"to_evaluation_id":"evaluation-1"}}),
+            json!({"stage":"outbound","data":{"attempt_id":"attempt-1","parent_attempt_id":null,"kind":"leaf",
+            "evaluation_id":"evaluation-1","routing_source":"evaluation","routed_outbound":"direct","effective_outbound":"direct",
+            "mode_override":"none","selection_path":[],"leaf_node_id":"direct-id","leaf_node_name":"direct",
+            "target":"127.0.0.2:443","target_kind":"ip","dial_ip":"127.0.0.2","server_addr":null,
+            "resolution_location":"original_ip","status":"failed","error":"dial_timeout"}}),
+            json!({"stage":"connection","data":{"state":"failed","reason":"dial_failed","milestone":"terminal",
+            "attempt_id":null,"reply_received":null,"error":null}}),
+        ]
+    );
+    let summary = store
+        .page(filters("all", "all", false, 100), None, &request_id())
+        .unwrap();
+    assert!(summary["flows"][0].get("input").is_none());
+    assert!(summary["flows"][0].get("trace").is_none());
+    let full = store
+        .page(filters("all", "all", true, 100), None, &request_id())
+        .unwrap();
+    assert_eq!(full["flows"][0]["input"], detail["input"]);
+    assert!(full["flows"][0].get("trace").is_none());
+}
+
+#[test]
+fn step_capacity_not_only_string_length_counts_toward_retention() {
+    let store = store();
+    let flow = begin(&store, "tcp");
+    let mut evaluation_id = String::with_capacity(MAX_STEP_BYTES + 1);
+    evaluation_id.push_str("evaluation-1");
+    flow.step(
+        None,
+        StepData::Reroute {
+            performed: false,
+            reason: "not_required",
+            from_evaluation_id: Some(evaluation_id),
+            to_evaluation_id: None,
+        },
+    );
+    flow.finish("closed", "relay_finished");
+    let detail = store.get(flow.id(), &request_id()).unwrap();
+    assert_eq!(detail["trace"]["steps"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        detail["trace"]["missing"],
+        json!(["not_instrumented", "buffer_overflow"])
+    );
+    assert_eq!(detail["state"], "closed");
 }

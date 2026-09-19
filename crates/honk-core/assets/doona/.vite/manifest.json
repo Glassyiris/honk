@@ -1,0 +1,167 @@
+{
+  "_names-D35MwC4M.js": {
+    "file": "assets/names-D35MwC4M.js",
+    "name": "names"
+  },
+  "_vendor-aria-BEPq3xWb.js": {
+    "file": "assets/vendor-aria-BEPq3xWb.js",
+    "name": "vendor-aria",
+    "imports": [
+      "_vendor-react-CY7D1GJF.js"
+    ]
+  },
+  "_vendor-editor-DdP9aXG2.js": {
+    "file": "assets/vendor-editor-DdP9aXG2.js",
+    "name": "vendor-editor"
+  },
+  "_vendor-react-CY7D1GJF.js": {
+    "file": "assets/vendor-react-CY7D1GJF.js",
+    "name": "vendor-react"
+  },
+  "index.html": {
+    "file": "assets/index-CJeseAej.js",
+    "name": "index",
+    "src": "index.html",
+    "isEntry": true,
+    "imports": [
+      "_vendor-react-CY7D1GJF.js",
+      "_vendor-aria-BEPq3xWb.js"
+    ],
+    "dynamicImports": [
+      "node_modules/.pnpm/recharts@3.10.1_@types+react@19.3.0_react-dom@19.3.0_react@19.3.0__react-is@19.3.0_react@19.3.0_redux@5.0.1/node_modules/recharts/es6/index.js",
+      "node_modules/.pnpm/recharts@3.10.1_@types+react@19.3.0_react-dom@19.3.0_react@19.3.0__react-is@19.3.0_react@19.3.0_redux@5.0.1/node_modules/recharts/es6/index.js",
+      "node_modules/.pnpm/recharts@3.10.1_@types+react@19.3.0_react-dom@19.3.0_react@19.3.0__react-is@19.3.0_react@19.3.0_redux@5.0.1/node_modules/recharts/es6/index.js",
+      "src/features/overview/Overview.tsx",
+      "src/features/connections/Connections.tsx",
+      "src/features/policies/Policies.tsx",
+      "src/features/nodes/Nodes.tsx",
+      "src/features/rules/Rules.tsx",
+      "src/features/config/Config.tsx",
+      "src/features/dns/Dns.tsx",
+      "src/features/logs/Logs.tsx",
+      "src/features/events/Events.tsx"
+    ],
+    "css": [
+      "assets/index-Ct8DLfKq.css"
+    ],
+    "assets": [
+      "assets/logo-obi05X1B.svg"
+    ]
+  },
+  "node_modules/.pnpm/recharts@3.10.1_@types+react@19.3.0_react-dom@19.3.0_react@19.3.0__react-is@19.3.0_react@19.3.0_redux@5.0.1/node_modules/recharts/es6/index.js": {
+    "file": "assets/vendor-charts-D0IX8Chg.js",
+    "name": "vendor-charts",
+    "src": "node_modules/.pnpm/recharts@3.10.1_@types+react@19.3.0_react-dom@19.3.0_react@19.3.0__react-is@19.3.0_react@19.3.0_redux@5.0.1/node_modules/recharts/es6/index.js",
+    "isDynamicEntry": true,
+    "imports": [
+      "_vendor-react-CY7D1GJF.js",
+      "_vendor-aria-BEPq3xWb.js"
+    ]
+  },
+  "src/features/config/Config.tsx": {
+    "file": "assets/Config-iyEquJMK.js",
+    "name": "Config",
+    "src": "src/features/config/Config.tsx",
+    "isDynamicEntry": true,
+    "imports": [
+      "_vendor-react-CY7D1GJF.js",
+      "index.html",
+      "_vendor-editor-DdP9aXG2.js",
+      "_names-D35MwC4M.js",
+      "_vendor-aria-BEPq3xWb.js"
+    ]
+  },
+  "src/features/connections/Connections.tsx": {
+    "file": "assets/Connections-V8U0_oxq.js",
+    "name": "Connections",
+    "src": "src/features/connections/Connections.tsx",
+    "isDynamicEntry": true,
+    "imports": [
+      "_vendor-react-CY7D1GJF.js",
+      "index.html",
+      "_vendor-aria-BEPq3xWb.js"
+    ]
+  },
+  "src/features/dns/Dns.tsx": {
+    "file": "assets/Dns-CcOFGkPj.js",
+    "name": "Dns",
+    "src": "src/features/dns/Dns.tsx",
+    "isDynamicEntry": true,
+    "imports": [
+      "_vendor-react-CY7D1GJF.js",
+      "index.html",
+      "_vendor-aria-BEPq3xWb.js"
+    ]
+  },
+  "src/features/events/Events.tsx": {
+    "file": "assets/Events-DnNaeBuq.js",
+    "name": "Events",
+    "src": "src/features/events/Events.tsx",
+    "isDynamicEntry": true,
+    "imports": [
+      "_vendor-react-CY7D1GJF.js",
+      "index.html",
+      "_vendor-aria-BEPq3xWb.js"
+    ]
+  },
+  "src/features/logs/Logs.tsx": {
+    "file": "assets/Logs-Co1tWukS.js",
+    "name": "Logs",
+    "src": "src/features/logs/Logs.tsx",
+    "isDynamicEntry": true,
+    "imports": [
+      "_vendor-react-CY7D1GJF.js",
+      "index.html",
+      "_vendor-aria-BEPq3xWb.js"
+    ]
+  },
+  "src/features/nodes/Nodes.tsx": {
+    "file": "assets/Nodes-BW14yCyO.js",
+    "name": "Nodes",
+    "src": "src/features/nodes/Nodes.tsx",
+    "isDynamicEntry": true,
+    "imports": [
+      "_vendor-react-CY7D1GJF.js",
+      "index.html",
+      "_vendor-aria-BEPq3xWb.js"
+    ]
+  },
+  "src/features/overview/Overview.tsx": {
+    "file": "assets/Overview-CM_vHD6i.js",
+    "name": "Overview",
+    "src": "src/features/overview/Overview.tsx",
+    "isDynamicEntry": true,
+    "imports": [
+      "_vendor-react-CY7D1GJF.js",
+      "index.html",
+      "_vendor-aria-BEPq3xWb.js"
+    ]
+  },
+  "src/features/policies/Policies.tsx": {
+    "file": "assets/Policies-DeMnTaWi.js",
+    "name": "Policies",
+    "src": "src/features/policies/Policies.tsx",
+    "isDynamicEntry": true,
+    "imports": [
+      "_vendor-react-CY7D1GJF.js",
+      "index.html",
+      "_vendor-aria-BEPq3xWb.js"
+    ]
+  },
+  "src/features/rules/Rules.tsx": {
+    "file": "assets/Rules-Cew56YL3.js",
+    "name": "Rules",
+    "src": "src/features/rules/Rules.tsx",
+    "isDynamicEntry": true,
+    "imports": [
+      "_vendor-react-CY7D1GJF.js",
+      "index.html",
+      "_names-D35MwC4M.js",
+      "_vendor-aria-BEPq3xWb.js"
+    ]
+  },
+  "src/logo.svg": {
+    "file": "assets/logo-obi05X1B.svg",
+    "src": "src/logo.svg"
+  }
+}

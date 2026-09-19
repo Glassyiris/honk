@@ -4411,7 +4411,7 @@ async fn shutdown_detaches_hooks_and_stays_bounded_with_stuck_flow() {
     let mut removal_task = tokio::spawn(async {});
 
     tokio::time::timeout(Duration::from_secs(30), async {
-        cp.shutdown_datapath(&drain, &mut removal_task, None)
+        cp.shutdown_datapath(&drain, &mut removal_task)
             .await
             .unwrap();
         cp.finalize_shutdown().await.unwrap();
@@ -4954,9 +4954,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
             let pending_shutdown = nfqueue.finish_pending_drain().await;
             control.pending_udp_verdicts = None;
             let drain = Arc::clone(&control.drain_tracker);
-            let datapath_shutdown = control
-                .shutdown_datapath(&drain, &mut removal_task, None)
-                .await;
+            let datapath_shutdown = control.shutdown_datapath(&drain, &mut removal_task).await;
             if let Some(flags) = control.datapath_flags.as_ref() {
                 let _ = flags.disable().await;
             }

@@ -118,16 +118,16 @@ impl ControlPlane {
         diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
         drain: &DrainTracker,
         authorizations: &mut crate::subscription::SubscriptionAuthorizations,
-        #[cfg(feature = "native-api")] sources: Option<&crate::native_api::config::SourceUpdate>,
+        #[cfg(feature = "native-api")] sources: Option<&crate::configuration::SourceUpdate>,
         #[cfg(feature = "native-api")] expected_group_revision: Option<&str>,
     ) -> Result<ReloadOutcome, honk_config::error::DetailedConfigError> {
         let _reload = self.reload_lock.lock().await;
         #[cfg(feature = "native-api")]
         if let Some(expected) = expected_group_revision
             && self
-                .native
+                .configuration
                 .as_ref()
-                .and_then(|native| native.configuration.revision())
+                .and_then(|configuration| configuration.revision())
                 .as_deref()
                 != Some(expected)
         {
@@ -186,7 +186,7 @@ impl ControlPlane {
         drain: &DrainTracker,
         diagnostic_update: DiagnosticUpdate,
         authorizations: Option<&mut crate::subscription::SubscriptionAuthorizations>,
-        #[cfg(feature = "native-api")] sources: Option<&crate::native_api::config::SourceUpdate>,
+        #[cfg(feature = "native-api")] sources: Option<&crate::configuration::SourceUpdate>,
     ) -> Result<ReloadOutcome, honk_config::error::DetailedConfigError> {
         #[cfg(feature = "native-api")]
         let replaces_sources = matches!(
@@ -215,6 +215,12 @@ impl ControlPlane {
         }
         let current_router = self.router.read().await.clone();
         let current_config = self.config.read().await.clone();
+        #[cfg(feature = "native-api")]
+        let prepared_sources = sources.and_then(|sources| {
+            self.configuration
+                .as_ref()
+                .map(|configuration| configuration.prepare_accept(sources))
+        });
         if authorizations.is_none()
             && !crate::subscription::same_subscription_worker_set(
                 &current_config.subscriptions,
@@ -233,9 +239,23 @@ impl ControlPlane {
         let config_unchanged = effective_config_unchanged(current_config.as_ref(), &mut new_config);
         let current_dns_forwarder = self.dns_controller.forwarder();
         let current_dns_router = current_dns_forwarder.routing_snapshot();
+        #[cfg(feature = "native-api")]
+        let supplied_geo_sources = sources.and_then(|sources| sources.geo_sources.as_ref());
         if config_unchanged && self.is_datapath_healthy() {
             let traffic_geo = current_router.geo_requirements();
             let dns_geo = current_dns_router.geo_requirements_snapshot();
+            #[cfg(feature = "native-api")]
+            let probed_geo_sources;
+            #[cfg(feature = "native-api")]
+            let geo_probe = match supplied_geo_sources {
+                Some(sources) => sources,
+                None => {
+                    probed_geo_sources =
+                        crate::routing::GeoSourceSet::probe_union(traffic_geo, dns_geo);
+                    &probed_geo_sources
+                }
+            };
+            #[cfg(not(feature = "native-api"))]
             let geo_probe = crate::routing::GeoSourceSet::probe_union(traffic_geo, dns_geo);
             let traffic_geo_fingerprint = geo_probe.fingerprint_for(traffic_geo);
             let dns_geo_fingerprint = geo_probe.fingerprint_for(dns_geo);
@@ -256,6 +276,15 @@ impl ControlPlane {
             {
                 let _config = self.config.write().await;
                 #[cfg(feature = "native-api")]
+                if let Some(prepared) = &prepared_sources
+                    && self
+                        .configuration
+                        .as_ref()
+                        .is_some_and(|configuration| !configuration.can_accept(prepared))
+                {
+                    return Ok(ReloadOutcome::Rejected);
+                }
+                #[cfg(feature = "native-api")]
                 if replaces_sources && let Some(flags) = &self.datapath_flags {
                     let mut mode = flags.publication().await;
                     let mut backend = self.ebpf.write().await;
@@ -273,15 +302,18 @@ impl ControlPlane {
                     }
                 }
                 #[cfg(feature = "native-api")]
-                if let Some(native) = &self.native {
-                    if replaces_sources {
-                        native.settings.activate(native, &new_config);
-                    }
-                    if let Some(sources) = sources {
-                        native.configuration.accept(sources, generation);
+                if let Some(configuration) = &self.configuration {
+                    if let Some(prepared) = prepared_sources {
+                        configuration.accept(prepared, generation);
                     } else if replaces_sources {
-                        native.configuration.invalidate();
+                        configuration.invalidate();
                     }
+                }
+                #[cfg(feature = "native-api")]
+                if let Some(native) = &self.native
+                    && replaces_sources
+                {
+                    native.settings.activate(native, &new_config);
                 }
                 info!("Configuration unchanged — retaining active runtime generation");
                 return Ok(ReloadOutcome::Noop { generation });
@@ -309,8 +341,21 @@ impl ControlPlane {
 
         let traffic_geo = crate::routing::GeoRequirements::for_traffic(&new_config.routing.rules);
         let dns_geo = crate::dns::routing::DnsRouter::geo_requirements(&new_config.dns);
+        #[cfg(feature = "native-api")]
+        let loaded_geo_sources;
+        #[cfg(feature = "native-api")]
+        let geo_sources = match supplied_geo_sources {
+            Some(sources) => sources,
+            None => {
+                loaded_geo_sources =
+                    crate::routing::GeoSourceSet::load(&traffic_geo.union(&dns_geo));
+                &loaded_geo_sources
+            }
+        };
+        #[cfg(not(feature = "native-api"))]
         let geo_requirements = traffic_geo.union(&dns_geo);
-        let geo_sources = crate::routing::GeoSourceSet::load(&geo_requirements);
+        #[cfg(not(feature = "native-api"))]
+        let geo_sources = &crate::routing::GeoSourceSet::load(&geo_requirements);
         let traffic_geo_fingerprint = geo_sources.fingerprint_for(&traffic_geo);
         let dns_geo_fingerprint = geo_sources.fingerprint_for(&dns_geo);
         let hosts_sources = match crate::dns::forwarder::HostsSourceSet::load(&new_config.dns) {
@@ -343,7 +388,7 @@ impl ControlPlane {
             match Router::new_with_geo_sources(
                 &new_config.routing.rules,
                 &new_config.routing.default_outbound,
-                &geo_sources,
+                geo_sources,
             ) {
                 Ok(router) => router,
                 Err(error) => {
@@ -392,10 +437,8 @@ impl ControlPlane {
         let dns_router = if reuse_dns_router {
             current_dns_router
         } else {
-            match crate::dns::routing::DnsRouter::new_with_geo_sources(
-                &new_config.dns,
-                &geo_sources,
-            ) {
+            match crate::dns::routing::DnsRouter::new_with_geo_sources(&new_config.dns, geo_sources)
+            {
                 Ok(router) => Arc::new(router),
                 Err(error) => {
                     error!(%error, "Failed to build DNS router");
@@ -552,6 +595,15 @@ impl ControlPlane {
             let mut plan_guard = self.active_routing_plan.write();
             let mut runtime_guard = self.runtime_registry.write();
             'publication: {
+                #[cfg(feature = "native-api")]
+                if let Some(prepared) = &prepared_sources
+                    && self
+                        .configuration
+                        .as_ref()
+                        .is_some_and(|configuration| !configuration.can_accept(prepared))
+                {
+                    break 'publication Err(());
+                }
                 let old_connectivity = group_connectivity_snapshot(
                     &current_config,
                     &old_group_manager,
@@ -664,17 +716,20 @@ impl ControlPlane {
                     #[cfg(feature = "native-api")]
                     let previous_generation = active_diagnostics.generation;
                     active_diagnostics.generation = generation.get();
+                    #[cfg(feature = "native-api")]
+                    if let Some(configuration) = &self.configuration {
+                        if let Some(prepared) = prepared_sources {
+                            configuration.accept(prepared, generation.get());
+                        } else if replaces_sources {
+                            configuration.invalidate();
+                        }
+                    }
                     active_diagnostics.buckets.apply(diagnostic_update);
                     #[cfg(feature = "native-api")]
                     if let Some(native) = &self.native {
                         self.alive_set.invalidate_native_group_observations();
                         if replaces_sources {
                             native.settings.activate(native, &config_guard);
-                        }
-                        if let Some(sources) = sources {
-                            native.configuration.accept(sources, generation.get());
-                        } else if replaces_sources {
-                            native.configuration.invalidate();
                         }
                         native.committed(&config_guard, previous_generation, generation.get());
                     }

@@ -258,3 +258,81 @@ async fn repeated_cycles_retain_accepted_artifacts_policy_cache_and_history() ->
     fixture.finish(false).await;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires transparent-listener permissions; run in the isolated lifecycle gate"]
+async fn delay_samples_persist_across_suspend_resume_and_stop_at_shutdown() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("cache.db");
+    let mut node_id = uuid::Uuid::nil();
+    let fixture = Fixture::start_with(|config, _| {
+        config.experimental.cache_file.enabled = true;
+        config.experimental.cache_file.path = path.to_string_lossy().into_owned();
+        node_id = config
+            .nodes
+            .iter()
+            .find(|node| node.name == "peer")
+            .unwrap()
+            .id;
+    })
+    .await?;
+    let db = fixture.cache_db.as_ref().unwrap().clone();
+    let sqlite = rusqlite::Connection::open(&path)?;
+    let alive = fixture.alive.clone();
+    let record = |delay| {
+        alive.report_available_traffic(node_id, ProbeDomain::Tcp, IpVersion::V4);
+        alive.record_probe_latency(
+            node_id,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_millis(delay),
+        );
+    };
+    let persisted = || -> anyhow::Result<Option<u64>> {
+        use rusqlite::OptionalExtension;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let _ = db.load_delay_samples(now, 24 * 3600);
+        let value: Option<String> = sqlite
+            .query_row("SELECT value FROM kv WHERE key = 'delay:peer'", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(value
+            .map(|value| serde_json::from_str::<serde_json::Value>(&value))
+            .transpose()?
+            .and_then(|value| value["delay_ms"].as_u64()))
+    };
+    for delay in [13, 29] {
+        fixture.alive.pause_health_checks().await?;
+        record(delay);
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::timeout(WAIT, async {
+            while persisted()? != Some(delay) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        tokio::time::resume();
+        if delay == 13 {
+            fixture.transition(false).await?;
+            assert_eq!(*fixture.phase.borrow(), EnginePhase::Suspended);
+            fixture.transition(true).await?;
+            assert_eq!(*fixture.phase.borrow(), EnginePhase::Running);
+        }
+    }
+    let _plane = fixture.finish(false).await;
+    record(47);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(120)).await;
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(
+        persisted()?,
+        Some(29),
+        "terminal shutdown must join the delay writer"
+    );
+    Ok(())
+}

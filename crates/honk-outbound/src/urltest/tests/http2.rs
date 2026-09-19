@@ -50,7 +50,7 @@ async fn h2_uses_configured_method_target_and_authority() {
     });
     let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let request = http_probe_request("http://probe.example:8080?source=urltest", "GET").unwrap();
-    exchange_http2(stream, &request, &None, Duration::from_secs(5))
+    exchange_http2(stream, &request, &None, Duration::from_secs(5), false)
         .await
         .expect("HTTP/2 exchange must succeed");
 
@@ -87,7 +87,7 @@ async fn h2_rejects_bad_warm_status() {
     let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let request = http_probe_request("http://probe.example/health", "HEAD").unwrap();
     assert!(
-        exchange_http2(stream, &request, &None, Duration::from_secs(1))
+        exchange_http2(stream, &request, &None, Duration::from_secs(1), false)
             .await
             .is_err()
     );
@@ -122,7 +122,7 @@ async fn h2_falls_back_only_for_remote_refused_stream() {
         });
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let request = http_probe_request("http://probe.example/health", "HEAD").unwrap();
-        let result = exchange_http2(stream, &request, &None, Duration::from_secs(1)).await;
+        let result = exchange_http2(stream, &request, &None, Duration::from_secs(1), false).await;
         peer.abort();
         let _ = peer.await;
         assert_eq!(result.is_ok(), healthy, "RST_STREAM({reason}): {result:?}");
@@ -152,7 +152,7 @@ async fn h2_rejected_headers_cannot_be_overridden_by_remote_refusal() {
         std::future::pending::<()>().await;
     });
     let request = http_probe_request("http://probe.example/health", "HEAD").unwrap();
-    let result = exchange_http2(client, &request, &None, Duration::from_secs(1)).await;
+    let result = exchange_http2(client, &request, &None, Duration::from_secs(1), false).await;
     peer.abort();
     let _ = peer.await;
     received
@@ -186,7 +186,7 @@ async fn h2_keeps_cancelled_warm_stream_until_measurement_finishes() {
         std::future::pending::<()>().await;
     });
     let request = http_probe_request("http://probe.example/health", "HEAD").unwrap();
-    let result = exchange_http2(client, &request, &None, Duration::from_secs(5)).await;
+    let result = exchange_http2(client, &request, &None, Duration::from_secs(5), false).await;
     peer.abort();
     let _ = peer.await;
     received
@@ -215,7 +215,7 @@ async fn h2_falls_back_only_for_graceful_goaway() {
             std::future::pending::<()>().await;
         });
         let request = http_probe_request("http://probe.example/health", "HEAD").unwrap();
-        let result = exchange_http2(client, &request, &None, Duration::from_secs(1)).await;
+        let result = exchange_http2(client, &request, &None, Duration::from_secs(1), false).await;
         peer.abort();
         let _ = peer.await;
         assert_eq!(result.is_ok(), healthy, "GOAWAY({reason}): {result:?}");
@@ -298,7 +298,7 @@ async fn cancelling_stalled_h2_probe_drops_its_driver_stream() {
     });
     let probe = tokio::spawn(async move {
         let request = http_probe_request("http://probe.example/stall", "HEAD").unwrap();
-        exchange_http2(watched, &request, &None, Duration::from_secs(5)).await
+        exchange_http2(watched, &request, &None, Duration::from_secs(5), false).await
     });
     tokio::time::timeout(Duration::from_secs(1), accepted_rx)
         .await
@@ -352,7 +352,13 @@ async fn native_h2_cold_and_warm_exchange_configured_request() {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         tokio::time::timeout_at(
             deadline,
-            native_exchange_http2(stream, &request, cold, deadline),
+            exchange_http2(
+                stream,
+                &request,
+                &None,
+                (deadline).saturating_duration_since(tokio::time::Instant::now()),
+                cold,
+            ),
         )
         .await
         .unwrap()
@@ -403,7 +409,13 @@ async fn native_h2_rejects_bad_status_and_duplicate_status_without_warm_fallback
             let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
             let result = tokio::time::timeout_at(
                 deadline,
-                native_exchange_http2(stream, &request, cold, deadline),
+                exchange_http2(
+                    stream,
+                    &request,
+                    &None,
+                    (deadline).saturating_duration_since(tokio::time::Instant::now()),
+                    cold,
+                ),
             )
             .await
             .expect("peer sends a terminal response, not a timeout");
@@ -438,11 +450,13 @@ async fn native_h2_cancellation_drops_stalled_driver_inline() {
         block_writes: Arc::clone(&block_writes),
     };
     let request = http_probe_request("http://probe.example/stall", "GET").unwrap();
-    let mut probe = Box::pin(native_exchange_http2(
+    let mut probe = Box::pin(exchange_http2(
         watched,
         &request,
+        &None,
+        (tokio::time::Instant::now() + Duration::from_secs(2))
+            .saturating_duration_since(tokio::time::Instant::now()),
         false,
-        tokio::time::Instant::now() + Duration::from_secs(2),
     ));
     tokio::select! {
         result = &mut probe => panic!("probe completed before cancellation: {result:?}"),

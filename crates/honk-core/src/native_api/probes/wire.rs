@@ -1,6 +1,117 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+pub(super) async fn execute(
+    state: &NativeState,
+    plan: &mut PreparedPlan,
+    deadline: Instant,
+    stop: watch::Receiver<bool>,
+) -> Result<(), honk_outbound::runtime::RuntimeCleanupError> {
+    let mut cleanup = Ok(());
+    for skipped in &plan.skipped {
+        for &row in &skipped.rows {
+            plan.result.results[row].error = Some("address_unavailable");
+            plan.result.results[row].observed_at = timestamp(skipped.observed_at);
+        }
+    }
+    for attempt in &plan.attempts {
+        let candidate = &attempt.candidate;
+        if *stop.borrow() || Instant::now() >= deadline {
+            for &row in &candidate.rows {
+                plan.result.results[row].error = Some(if *stop.borrow() {
+                    "cancelled"
+                } else {
+                    "deadline"
+                });
+                plan.result.results[row].observed_at = timestamp(SystemTime::now());
+            }
+            continue;
+        }
+        let outcome = attempt_wire(state, &plan.context, attempt, deadline, stop.clone()).await;
+        cleanup = cleanup.and(outcome.cleanup);
+        let sample = outcome.sample;
+        let completed = outcome.completed;
+        let error = outcome.error;
+        let warmth = if sample.is_some() {
+            if plan.context.spec.kind == Kind::Http && plan.context.spec.warmth == Warmth::Warm {
+                "warm"
+            } else {
+                "cold"
+            }
+        } else {
+            "unknown"
+        };
+        let observed_at = outcome.observed_at;
+        let observation = NativeHealthObservation {
+            transport: if candidate.transport == Transport::Tcp {
+                HealthTransport::Tcp
+            } else {
+                HealthTransport::Udp
+            },
+            purpose: if plan.context.spec.purpose == Purpose::Data {
+                HealthPurpose::Data
+            } else {
+                HealthPurpose::Dns
+            },
+            measurement: match plan.context.spec.kind {
+                Kind::TcpConnect => HealthMeasurement::TcpConnect,
+                Kind::Http => HealthMeasurement::HttpHeaders,
+                Kind::Dns => HealthMeasurement::DnsRoundTrip,
+            },
+            ip_version: candidate.family.ip(),
+            warmth: match warmth {
+                "cold" => HealthWarmth::Cold,
+                "warm" => HealthWarmth::Warm,
+                _ => HealthWarmth::Unknown,
+            },
+            sample_source: "probe",
+            state: if sample.is_some() {
+                HealthState::Healthy
+            } else {
+                HealthState::Unavailable
+            },
+            latency: sample.map(|sample| sample.latency),
+            observed_at,
+            error,
+        };
+        for &index in &candidate.rows {
+            let row = &mut plan.result.results[index];
+            let context = match &plan.context.spec.target {
+                Target::Group { group_id } => Some(NativeGroupProbeContext {
+                    group_id: Uuid::parse_str(group_id).expect("catalog UUID"),
+                    member_id: Uuid::parse_str(&row.member_id).expect("catalog member UUID"),
+                }),
+                Target::Node { .. } => None,
+            };
+            row.health_updated = completed
+                && state
+                    .alive_set
+                    .complete_native_probe(&candidate.ticket, context, observation);
+            row.state = if sample.is_some() {
+                "healthy"
+            } else if completed {
+                "unavailable"
+            } else {
+                "unknown"
+            };
+            row.latency_ms = sample.map(|sample| sample.latency.as_secs_f64() * 1000.0);
+            row.warmth = warmth;
+            row.error = error;
+            row.observed_at = timestamp(observed_at);
+        }
+    }
+    plan.result.selection_after = planning::selections(
+        &plan.context.manager,
+        &plan.context.identity,
+        plan.context.group.as_deref(),
+    );
+    plan.result.selection_changed = TransportMap {
+        tcp: plan.result.selection_before.tcp != plan.result.selection_after.tcp,
+        udp: plan.result.selection_before.udp != plan.result.selection_after.udp,
+    };
+    cleanup
+}
+
 pub(super) async fn bounded<T>(
     deadline: Instant,
     mut cancel: watch::Receiver<bool>,
@@ -21,6 +132,7 @@ pub(super) struct AttemptOutcome {
     pub(super) completed: bool,
     pub(super) error: Option<&'static str>,
     pub(super) observed_at: SystemTime,
+    pub(super) cleanup: Result<(), honk_outbound::runtime::RuntimeCleanupError>,
 }
 impl AttemptOutcome {
     fn completed(
@@ -34,6 +146,7 @@ impl AttemptOutcome {
                 completed: true,
                 error: None,
                 observed_at: sample.observed_at,
+                cleanup: Ok(()),
             },
             Err(error) => {
                 let io = error
@@ -56,6 +169,7 @@ impl AttemptOutcome {
                     completed: reason == "probe_failed",
                     error: Some(reason),
                     observed_at: SystemTime::now(),
+                    cleanup: Ok(()),
                 }
             }
         }
@@ -66,18 +180,20 @@ impl AttemptOutcome {
             completed: false,
             error: Some("local_refusal"),
             observed_at: SystemTime::now(),
+            cleanup: Ok(()),
         }
     }
 }
-pub(super) async fn attempt(
+async fn attempt_wire(
     state: &NativeState,
-    plan: &Plan,
+    plan: &Context,
     attempt: &Attempt,
-    addr: SocketAddr,
     deadline: Instant,
     cancel: watch::Receiver<bool>,
 ) -> AttemptOutcome {
-    if plan.request.kind == Kind::TcpConnect {
+    let addr = attempt.addr;
+    let candidate = &attempt.candidate;
+    if plan.spec.kind == Kind::TcpConnect {
         let result = bounded(deadline, cancel.clone(), async {
             let _permit = plan.registry.acquire_dial_permit().await;
             let start = std::time::Instant::now();
@@ -99,23 +215,23 @@ pub(super) async fn attempt(
         .and_then(|result| result);
         return AttemptOutcome::completed(result, deadline, &cancel);
     }
-    let Some(entry) = state.proxy_registry.find(attempt.node.protocol()) else {
+    let Some(entry) = state.proxy_registry.find(candidate.node.protocol()) else {
         return AttemptOutcome::refused();
     };
     // Disposable runtime identity remains the canonical node's identity. Only its
     // inherited dial scope pins the previously validated physical server address.
-    let Ok(ephemeral) = plan.registry.try_ephemeral_guarded(&attempt.node) else {
+    let Ok(mut ephemeral) = plan.registry.try_ephemeral_guarded(&candidate.node) else {
         return AttemptOutcome::refused();
     };
     let runtime = ephemeral.runtime();
     let operation = async {
-        if plan.request.kind == Kind::Http {
+        if plan.spec.kind == Kind::Http {
             honk_outbound::urltest::native_http_probe(
                 &runtime,
                 entry.tcp.as_ref(),
                 plan.http.as_ref().expect("HTTP plan"),
                 addr,
-                plan.request.warmth == Warmth::Cold,
+                plan.spec.warmth == Warmth::Cold,
                 deadline,
                 cancel.clone(),
             )
@@ -124,7 +240,7 @@ pub(super) async fn attempt(
             bounded(deadline, cancel.clone(), async {
                 let connect_timeout = Duration::from_millis(plan.config.global.connect_timeout_ms)
                     .min(deadline.saturating_duration_since(Instant::now()));
-                match attempt.transport {
+                match candidate.transport {
                     Transport::Tcp => {
                         let mut proxy = entry
                             .tcp
@@ -156,7 +272,7 @@ pub(super) async fn attempt(
         runtime
             .scope_tasks(
                 plan.registry
-                    .scope_pinned_dials(attempt.node.host(), server, operation),
+                    .scope_pinned_dials(candidate.node.host(), server, operation),
             )
             .await
     } else {
@@ -164,11 +280,11 @@ pub(super) async fn attempt(
             .scope_tasks(plan.registry.scope_dials(operation))
             .await
     };
-    let outcome = AttemptOutcome::completed(result, deadline, &cancel);
+    let mut outcome = AttemptOutcome::completed(result, deadline, &cancel);
     drop(runtime);
     // Never cancel this owner boundary: close must drain every factory/driver
     // admitted before the request deadline, even when the HTTP caller is gone.
-    ephemeral.close().await;
+    outcome.cleanup = ephemeral.close().await;
     outcome
 }
 

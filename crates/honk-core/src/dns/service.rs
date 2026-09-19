@@ -15,6 +15,8 @@ mod diagnostic;
 mod name_resolution;
 #[cfg(feature = "native-api")]
 pub(crate) use diagnostic::{DiagnosticError, DiagnosticFailure};
+#[cfg(feature = "native-api")]
+pub(crate) use name_resolution::PinnedNameResolver;
 
 #[derive(Clone)]
 pub struct DnsService {
@@ -157,18 +159,6 @@ impl DnsService {
         }
     }
 
-    #[cfg(any(feature = "native-api", test))]
-    pub(crate) async fn resolve_outcome_with_runtime(
-        &self,
-        runtime: &RuntimeLease,
-        raw_query: &[u8],
-        metadata: DnsRequestMeta,
-        ingress: IngressProfile,
-    ) -> anyhow::Result<DnsOutcome> {
-        self.resolve_client_outcome_with_runtime(runtime, raw_query, metadata, ingress, None)
-            .await
-    }
-
     pub(crate) async fn resolve_client_outcome_with_runtime(
         &self,
         runtime: &RuntimeLease,
@@ -217,6 +207,11 @@ impl DnsService {
             DnsServiceBackend::Runtime(provider) => Arc::clone(provider.current().forwarder()),
             DnsServiceBackend::Standalone(forwarder) => Arc::clone(forwarder),
         }
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn geo_assets(&self) -> Vec<crate::routing::GeoAssetSnapshot> {
+        self.forwarder().routing_snapshot().geo_assets().to_vec()
     }
 
     fn operation(&self) -> OperationToken {

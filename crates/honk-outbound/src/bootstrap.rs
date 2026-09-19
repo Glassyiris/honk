@@ -124,8 +124,8 @@ pub async fn lookup_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
 
 impl BootstrapResolver {
     /// Query A and AAAA records for `host` directly from the configured
-    /// server over a bypass-marked socket.
-    async fn query(&self, host: &str) -> io::Result<Vec<IpAddr>> {
+    /// server over a bypass-marked socket, without a system-resolver fallback.
+    pub async fn query(&self, host: &str) -> io::Result<Vec<IpAddr>> {
         if self.use_tcp {
             let ips_a = self.query_tcp(host, 1).await?;
             let ips_aaaa = self.query_tcp(host, 28).await.unwrap_or_default();

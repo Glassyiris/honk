@@ -453,13 +453,14 @@ async fn retirement_cancels_every_foreground_entry_path() {
                         .await
                         .map(|_| ()),
                     1 => service
-                        .resolve_outcome_with_runtime(
+                        .resolve_client_outcome_with_runtime(
                             &service.provider().unwrap().try_acquire().unwrap(),
                             &query,
                             DnsRequestMeta::EMPTY,
                             IngressProfile::Udp {
                                 advertised_size: 1232,
                             },
+                            None,
                         )
                         .await
                         .map(|_| ()),

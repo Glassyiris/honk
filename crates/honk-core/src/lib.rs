@@ -13,6 +13,7 @@ pub mod cachedb;
 #[cfg(feature = "clash-api")]
 pub mod clash_api;
 pub mod config_diagnostics;
+pub(crate) mod configuration;
 pub mod connection_tracker;
 pub mod control;
 pub mod dns;
@@ -86,35 +87,6 @@ fn raise_nofile_rlimit() -> anyhow::Result<usize> {
     Ok(usize::try_from(active_soft)
         .unwrap_or(control::MAX_EFFECTIVE_NOFILE)
         .min(control::MAX_EFFECTIVE_NOFILE))
-}
-async fn request_runtime_reload(
-    reload_tx: &tokio::sync::mpsc::Sender<control::ControlCommand>,
-    subscription_supervisor: &subscription::SubscriptionSupervisorHandle,
-    request_id: u64,
-    config: Config,
-    diagnostics: Vec<DetailedDiagnostic>,
-) -> anyhow::Result<control::ReloadOutcome> {
-    let (result, applied) = tokio::sync::oneshot::channel();
-    reload_tx
-        .send(control::ControlCommand::ReloadConfig {
-            request_id,
-            config: Box::new(config),
-            diagnostics,
-            result,
-            #[cfg(feature = "native-api")]
-            sources: None,
-            #[cfg(feature = "native-api")]
-            expected_group_revision: None,
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("command send failed: {error}"))?;
-    let reply = applied
-        .await
-        .map_err(|error| anyhow::anyhow!("result channel failed: {error}"))?;
-    if reply.outcome.accepted() {
-        subscription_supervisor.reconcile(reply.authorized).await?;
-    }
-    Ok(reply.outcome)
 }
 
 #[cfg(feature = "ebpf")]
@@ -646,7 +618,7 @@ fn admit_operator_config(
 fn load_operator_config_captured(
     path: &std::path::Path,
     diagnostics: &mut Vec<DetailedDiagnostic>,
-) -> Result<(Config, Option<native_api::config::SourceUpdate>), DetailedConfigError> {
+) -> Result<(Config, Option<configuration::SourceUpdate>), DetailedConfigError> {
     if !path
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("dae"))
@@ -677,9 +649,10 @@ fn load_operator_config_captured(
     let config = admit_operator_config(loaded.config, source, diagnostics)?;
     Ok((
         config,
-        Some(native_api::config::SourceUpdate {
+        Some(configuration::SourceUpdate {
             sources: loaded.sources,
             dependencies: Vec::new(),
+            geo_sources: None,
         }),
     ))
 }
@@ -1488,6 +1461,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 .start(
                     Some(cli.config.clone()),
                     native_sources,
+                    honk_config::paths::data_dir().to_path_buf(),
                     control_plane.config_handle(),
                     control_plane.diagnostics_handle(),
                     cmd_tx.clone(),
@@ -1504,6 +1478,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // control plane without interrupting established connections.
     let config_path = cli.config.clone();
     let reload_tx = cmd_tx.clone();
+    let mut activation =
+        configuration::Activation::new(reload_tx.clone(), reload_subscription_supervisor);
     let sighup_handle = tokio::spawn(async move {
         let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         {
@@ -1534,18 +1510,32 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             match result {
                 Ok(mut new_config) => {
                     new_config.ensure_builtin_nodes();
-                    if let Err(error) = request_runtime_reload(
-                        &reload_tx,
-                        &reload_subscription_supervisor,
-                        request_id,
-                        new_config,
-                        diagnostics,
-                    )
-                    .await
+                    match activation
+                        .activate(configuration::ActivationRequest {
+                            candidate: new_config,
+                            diagnostics,
+                            #[cfg(feature = "native-api")]
+                            sources: None,
+                            #[cfg(feature = "native-api")]
+                            expected_revision: None,
+                            #[cfg(feature = "native-api")]
+                            deferred_provider: None,
+                        })
+                        .await
                     {
-                        warn!("SIGHUP reload request {request_id} failed: {error}");
-                        let _ = reload_tx.send(control::ControlCommand::Shutdown).await;
-                        break;
+                        Ok(_) | Err(configuration::ActivationFailure::Rejected) => {}
+                        Err(configuration::ActivationFailure::Degraded(generation)) => {
+                            warn!(generation, "SIGHUP reload committed with degraded datapath");
+                        }
+                        Err(configuration::ActivationFailure::Reconciliation(generation)) => {
+                            warn!(generation, "SIGHUP reload worker reconciliation failed");
+                            break;
+                        }
+                        Err(failure) => {
+                            warn!(?failure, "SIGHUP reload request {request_id} failed");
+                            let _ = reload_tx.send(control::ControlCommand::Shutdown).await;
+                            break;
+                        }
                     }
                 }
                 Err(error) => {

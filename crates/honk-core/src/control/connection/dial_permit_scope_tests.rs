@@ -50,6 +50,8 @@ async fn dns_wait_timeout_remains_retryable_with_free_admission() {
     let feedback = HashMap::new();
     #[cfg(feature = "native-api")]
     let selection_chains = HashMap::new();
+    #[cfg(feature = "native-api")]
+    let observation = ConnectionObservation::default();
     let (result, ()) = tokio::join!(
         handle.race_candidates(
             &candidates,
@@ -66,7 +68,7 @@ async fn dns_wait_timeout_remains_retryable_with_free_admission() {
             #[cfg(feature = "native-api")]
             &selection_chains,
             #[cfg(feature = "native-api")]
-            None,
+            &observation,
         ),
         async {
             let mut packet = [0; 512];
@@ -231,7 +233,7 @@ async fn feedback_does_not_start_while_waiting_for_dial_admission() {
                 #[cfg(feature = "native-api")]
                 &HashMap::new(),
                 #[cfg(feature = "native-api")]
-                None,
+                &ConnectionObservation::default(),
             )
             .await;
         let error = match result {

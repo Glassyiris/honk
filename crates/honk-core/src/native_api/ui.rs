@@ -1,4 +1,4 @@
-//! Static assets from a trusted administrator-supplied directory.
+//! Static assets embedded at build time or from a trusted administrator directory.
 //!
 //! The administrator also owns any symlink targets; this is not a sandbox for
 //! untrusted uploads or downloaded archives.
@@ -14,16 +14,22 @@ use axum::{
 };
 use tower_http::services::{ServeDir, ServeFile};
 
-pub(super) struct Ui {
-    files: ServeDir,
-    index: ServeFile,
+pub(super) enum Ui {
+    Directory(Box<(ServeDir, ServeFile)>),
+    #[cfg(feature = "native-ui")]
+    Embedded,
 }
 
 pub(super) async fn load(path: &str) -> anyhow::Result<Option<Ui>> {
     if path.is_empty() {
         return Ok(None);
     }
-    ensure!(path != "embedded", "embedded native UI is not available");
+    if path == "embedded" {
+        #[cfg(feature = "native-ui")]
+        return Ok(Some(Ui::Embedded));
+        #[cfg(not(feature = "native-ui"))]
+        anyhow::bail!("embedded native UI requires the native-ui feature");
+    }
 
     let root = honk_config::paths::resolve_dependency_path(path);
     ensure!(
@@ -45,10 +51,10 @@ pub(super) async fn load(path: &str) -> anyhow::Result<Option<Ui>> {
         .await
         .context("native UI index.html must be readable")?;
 
-    Ok(Some(Ui {
-        files: ServeDir::new(root).append_index_html_on_directories(false),
-        index: ServeFile::new(index),
-    }))
+    Ok(Some(Ui::Directory(Box::new((
+        ServeDir::new(root).append_index_html_on_directories(false),
+        ServeFile::new(index),
+    )))))
 }
 
 impl Ui {
@@ -90,13 +96,19 @@ impl Ui {
             return StatusCode::NOT_FOUND.into_response();
         }
 
-        // ServeDir also invokes its fallback for invalid paths. Only validated
-        // navigation paths may ever install the index fallback.
+        // Only validated navigation paths may reach the UI entry point.
         let navigation = !decoded.contains('.')
             && !matches!(
                 decoded.split('/').next(),
                 Some("assets" | "fonts" | "icons")
             );
+        let (files, index) = match self {
+            Self::Directory(directory) => (&directory.0, &directory.1),
+            #[cfg(feature = "native-ui")]
+            Self::Embedded => {
+                return embedded_response(&decoded, navigation, request.method() == Method::HEAD);
+            }
+        };
         let Some(uri) = request
             .uri()
             .path_and_query()
@@ -107,13 +119,13 @@ impl Ui {
         };
         *request.uri_mut() = uri;
         let result = if navigation {
-            self.files
+            files
                 .clone()
-                .fallback(self.index.clone())
+                .fallback(index.clone())
                 .try_call(request)
                 .await
         } else {
-            self.files.clone().try_call(request).await
+            files.clone().try_call(request).await
         };
         match result {
             Ok(response) => response.map(Body::new),
@@ -125,6 +137,43 @@ impl Ui {
             },
         }
     }
+}
+
+#[cfg(feature = "native-ui")]
+fn embedded_response(path: &str, navigation: bool, head: bool) -> Response {
+    static FILES: &[(&str, &[u8])] = include!(concat!(env!("OUT_DIR"), "/native_ui_assets.rs"));
+
+    let path = if path.is_empty() { "index.html" } else { path };
+    let Ok(index) = FILES.binary_search_by(|(name, _)| name.cmp(&path)) else {
+        return if navigation {
+            // The hash router's relative assets and service worker require /ui/.
+            Redirect::temporary("/ui/").into_response()
+        } else {
+            StatusCode::NOT_FOUND.into_response()
+        };
+    };
+    let (path, bytes) = FILES[index];
+    let content_type = match path.rsplit('.').next().unwrap_or_default() {
+        "html" => "text/html",
+        "js" => "text/javascript",
+        "css" => "text/css",
+        "svg" => "image/svg+xml",
+        "json" => "application/json",
+        "webmanifest" => "application/manifest+json",
+        "woff2" => "font/woff2",
+        "png" => "image/png",
+        "txt" => "text/plain",
+        _ => "application/octet-stream",
+    };
+    let mut response = Response::new(if head {
+        Body::empty()
+    } else {
+        Body::from(bytes)
+    });
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(bytes.len()));
+    response
 }
 
 fn decode_path(path: &str) -> Option<Cow<'_, str>> {

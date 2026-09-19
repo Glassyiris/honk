@@ -135,6 +135,38 @@ async fn native_catalog_capabilities_and_recording_disable_are_honest() {
 }
 
 #[tokio::test]
+async fn native_head_disposes_event_stream_without_consuming_client_capacity() {
+    let app = TestApp::new(|_| {}).await;
+    let path = "/api/v1/events?kinds=generation.changed";
+    for _ in 0..17 {
+        let response = app
+            .client
+            .head(app.url(path))
+            .bearer_auth(SECRET)
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        assert!(response.bytes().await.unwrap().is_empty());
+    }
+    let mut response = app
+        .get(path)
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        next_event(&mut response, &mut String::new()).await.0,
+        "stream.ready"
+    );
+    drop(response);
+    app.shutdown().await;
+}
+
+#[tokio::test]
 async fn native_sse_heartbeat_survives_connection_lifetime_and_shutdown_releases_state() {
     let app = TestApp::new(|_| {}).await;
     let client = Client::builder().no_proxy().build().unwrap();

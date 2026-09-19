@@ -49,7 +49,7 @@ fn replacement_preserves_exact_bytes_mode_and_old_open_inode() {
     assert_eq!(fs::read_to_string(&path).unwrap(), REPLACEMENT);
     assert_eq!(
         replaced.sha256(),
-        crate::native_api::config::digest(REPLACEMENT.as_bytes())
+        crate::configuration::digest(REPLACEMENT.as_bytes())
     );
     assert_only_config(directory.path());
 }
@@ -282,5 +282,61 @@ fn file_sync_failure_is_invisible_but_directory_sync_failure_keeps_new_bytes() {
         }
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o640);
         assert_only_config(directory.path());
+    }
+}
+
+#[test]
+fn binary_staging_preserves_old_files_until_commit_and_reports_directory_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("geosite.dat");
+    let second = directory.path().join("geoip.dat");
+    fs::write(&first, [0xff, 0, 1]).unwrap();
+    fs::write(&second, [0xfe, 0, 2]).unwrap();
+    let first_file = SourceFile::open_binary(&first, LIMIT).unwrap();
+    let mut second_file = SourceFile::open_binary(&second, LIMIT).unwrap();
+    let first_hash = first_file.sha256();
+    let second_hash = second_file.sha256();
+    second_file.sync_fault = Some(SyncFault::Directory);
+    let first_staged = first_file.stage(&first_hash, &[0xff, 3]).unwrap();
+    let second_staged = second_file.stage(&second_hash, &[0xfe, 4]).unwrap();
+    assert_eq!(fs::read(&first).unwrap(), [0xff, 0, 1]);
+    assert_eq!(fs::read(&second).unwrap(), [0xfe, 0, 2]);
+    assert!(first_staged.modified_at().is_some());
+    let installed = first_staged.replace(|| second_staged.recheck()).unwrap();
+    assert!(installed.durability_confirmed);
+    installed.file.recheck().unwrap();
+    let undurable = second_staged.replace(|| Ok(())).unwrap();
+    assert!(!undurable.durability_confirmed);
+    undurable.file.recheck().unwrap();
+    assert_eq!(fs::read(&first).unwrap(), [0xff, 3]);
+    assert_eq!(fs::read(&second).unwrap(), [0xfe, 4]);
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+}
+
+#[test]
+fn installed_guard_detects_later_replacement_and_content_edits() {
+    for rename in [false, true] {
+        let (directory, path) = fixture();
+        let source = SourceFile::open(&path, LIMIT).unwrap();
+        let staged = source
+            .stage(
+                &crate::configuration::digest(ORIGINAL.as_bytes()),
+                REPLACEMENT.as_bytes(),
+            )
+            .unwrap();
+        let installed = staged.replace(|| Ok(())).unwrap();
+        installed.file.recheck().unwrap();
+        assert_eq!(
+            installed.file.sha256(),
+            crate::configuration::digest(REPLACEMENT.as_bytes())
+        );
+        if rename {
+            let replacement = directory.path().join("editor.dae");
+            fs::write(&replacement, REPLACEMENT).unwrap();
+            fs::rename(replacement, &path).unwrap();
+        } else {
+            fs::write(&path, ORIGINAL).unwrap();
+        }
+        assert_eq!(installed.file.recheck(), Err(WriteError::Conflict));
     }
 }

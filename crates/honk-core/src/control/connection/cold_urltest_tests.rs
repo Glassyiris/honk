@@ -79,7 +79,7 @@ async fn tcp_carrier_capacity_is_terminal_without_health_demotion() {
                 #[cfg(feature = "native-api")]
                 &HashMap::new(),
                 #[cfg(feature = "native-api")]
-                None,
+                &ConnectionObservation::default(),
             )
             .await;
         assert!(
@@ -160,7 +160,7 @@ async fn tcp_carrier_capacity_is_terminal_without_health_demotion() {
             #[cfg(feature = "native-api")]
             &HashMap::new(),
             #[cfg(feature = "native-api")]
-            None,
+            &ConnectionObservation::default(),
         )
         .await;
     let Err(error) = result else {

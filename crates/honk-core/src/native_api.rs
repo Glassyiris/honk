@@ -8,9 +8,11 @@ mod datapath;
 pub(crate) mod dns;
 pub(crate) mod events;
 pub(crate) mod flows;
+pub(crate) mod geodata;
 mod groups;
+mod handlers;
 pub(crate) mod logs;
-pub(crate) mod mode;
+mod management;
 pub(crate) mod observation;
 pub(crate) mod offline;
 pub(crate) mod operations;
@@ -32,9 +34,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use axum::extract::{Extension, Query, Request, State};
-use axum::http::{Method, StatusCode, Uri};
+use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::any;
 use axum::{Json, Router};
 use honk_config::{Config, experimental::NativeApiConfig};
 use hyper_util::{
@@ -69,7 +70,6 @@ pub struct NativeState {
     traffic_router: Arc<RwLock<crate::routing::Router>>,
     backend: Arc<RwLock<Box<dyn crate::ebpf::EbpfBackend>>>,
     control_tx: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
-    datapath_flags: Option<crate::mode::DatapathFlagsHandle>,
     runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
     proxy_registry: Arc<crate::proxy::ProxyRegistry>,
     phase: watch::Receiver<EnginePhase>,
@@ -103,7 +103,6 @@ impl NativeState {
             traffic_router: control.traffic_router(),
             backend: control.ebpf_handle(),
             control_tx: control.command_sender(),
-            datapath_flags: control.datapath_flags_handle(),
             runtime_registry: control.runtime_registry(),
             proxy_registry: control.proxy_registry(),
             started_at,
@@ -141,77 +140,8 @@ impl NativeState {
     }
 }
 
-pub(super) struct RouteInfo {
-    pub template: &'static str,
-    pub methods: &'static [&'static str],
-}
-
-const ROUTES: &[(&str, &[&str])] = &[
-    ("/api", &["GET"]),
-    ("/api/v1/version", &["GET"]),
-    ("/api/v1/capabilities", &["GET"]),
-    ("/api/v1/config", &["GET"]),
-    ("/api/v1/config/validate", &["POST"]),
-    ("/api/v1/config/sources/{source_id}", &["GET", "PUT"]),
-    ("/api/v1/runtime", &["GET"]),
-    ("/api/v1/runtime/memory", &["GET"]),
-    ("/api/v1/runtime/outbounds", &["GET"]),
-    ("/api/v1/runtime/traffic/history", &["GET"]),
-    ("/api/v1/runtime/memory/history", &["GET"]),
-    ("/api/v1/runtime/mode", &["GET", "PUT"]),
-    ("/api/v1/datapath", &["GET"]),
-    ("/api/v1/nodes", &["GET"]),
-    ("/api/v1/providers", &["GET"]),
-    ("/api/v1/providers/{id}", &["GET"]),
-    ("/api/v1/providers/{id}/refresh", &["POST"]),
-    ("/api/v1/groups", &["GET"]),
-    ("/api/v1/groups/{groupId}", &["GET", "PATCH"]),
-    ("/api/v1/groups/{groupId}/selection", &["PUT", "DELETE"]),
-    ("/api/v1/probes", &["POST"]),
-    ("/api/v1/connections", &["GET", "DELETE"]),
-    ("/api/v1/connections/{connection_id}", &["DELETE"]),
-    ("/api/v1/flows", &["GET"]),
-    ("/api/v1/flows/{flow_id}", &["GET"]),
-    ("/api/v1/routing/trace", &["POST"]),
-    ("/api/v1/rules", &["GET"]),
-    ("/api/v1/events", &["GET"]),
-    ("/api/v1/logs", &["GET"]),
-    ("/api/v1/runtime/settings", &["GET", "PATCH"]),
-    ("/api/v1/dns/query", &["GET"]),
-    ("/api/v1/dns/log", &["GET"]),
-    ("/api/v1/dns/cache", &["GET", "DELETE"]),
-    ("/api/v1/dns/cache/{entry_id}", &["DELETE"]),
-    ("/api/v1/dns/cache/flush", &["POST"]),
-    ("/api/v1/operations/reload", &["POST"]),
-    ("/api/v1/operations/suspend", &["POST"]),
-    ("/api/v1/operations/resume", &["POST"]),
-    ("/api/v1/operations/{id}", &["GET"]),
-];
-
-pub(super) fn route_info(path: &str) -> Option<RouteInfo> {
-    if let Some(&(template, methods)) = ROUTES.iter().find(|(template, _)| *template == path) {
-        return Some(RouteInfo { template, methods });
-    }
-    ROUTES.iter().find_map(|&(template, methods)| {
-        let mut actual = path.split('/');
-        let matches = template.split('/').all(|part| {
-            actual.next().is_some_and(|value| {
-                if part.starts_with('{') {
-                    !value.is_empty()
-                } else {
-                    part == value
-                }
-            })
-        }) && actual.next().is_none();
-        matches.then_some(RouteInfo { template, methods })
-    })
-}
-
 pub fn router(state: Arc<NativeState>) -> Router {
-    let mut router = Router::new();
-    for &(path, _) in ROUTES {
-        router = router.route(path, any(dispatch));
-    }
+    let router = handlers::routes();
     let router = if state.settings.ui.is_empty() {
         router.fallback(not_found)
     } else {
@@ -256,244 +186,6 @@ async fn not_found(Extension(id): Extension<RequestId>) -> Response {
         StatusCode::NOT_FOUND,
         ErrorCode::ResourceNotFound,
         "Resource not found",
-        &id,
-    )
-    .into_response()
-}
-
-async fn dispatch(
-    State(state): State<Arc<NativeState>>,
-    Extension(id): Extension<RequestId>,
-    request: Request,
-) -> Response {
-    let path = request.uri().path();
-    let method = if request.method() == Method::HEAD {
-        "GET"
-    } else {
-        request.method().as_str()
-    };
-    let Some(route) = route_info(path).filter(|route| route.methods.contains(&method)) else {
-        return error(
-            StatusCode::NOT_FOUND,
-            ErrorCode::ResourceNotFound,
-            "Resource not found",
-            &id,
-        )
-        .into_response();
-    };
-    // The pinned mode contract has no lifecycle/owner failure responses.
-    if route.template == "/api/v1/runtime/mode" {
-        return error(
-            StatusCode::NOT_FOUND,
-            ErrorCode::CapabilityNotSupported,
-            "Capability is not supported",
-            &id,
-        )
-        .into_response();
-    }
-    if route.template == "/api/v1/events" && method == "GET" {
-        return events::serve(&state, request, &id)
-            .await
-            .unwrap_or_else(IntoResponse::into_response);
-    }
-    if route.template == "/api/v1/logs" && method == "GET" {
-        return logs::serve(&state, request, &id)
-            .await
-            .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-    }
-    match (method, route.template) {
-        ("PUT", "/api/v1/runtime/mode") => {
-            return mode::put(&state, request, &id)
-                .await
-                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-        }
-        ("POST", "/api/v1/operations/suspend") => {
-            return config::lifecycle(&state, request, &id, false)
-                .await
-                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-        }
-        ("POST", "/api/v1/operations/resume") => {
-            return config::lifecycle(&state, request, &id, true)
-                .await
-                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-        }
-        ("PUT", "/api/v1/groups/{groupId}/selection") => {
-            let group_id = path
-                .trim_start_matches("/api/v1/groups/")
-                .trim_end_matches("/selection")
-                .to_owned();
-            return groups::select(&state, &group_id, request, &id)
-                .await
-                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-        }
-        ("PATCH", "/api/v1/groups/{groupId}") => {
-            let group_id = path.trim_start_matches("/api/v1/groups/").to_owned();
-            return groups::patch(&state, &group_id, request, &id)
-                .await
-                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-        }
-        ("POST", "/api/v1/providers/{id}/refresh") => {
-            let provider_id = path
-                .trim_start_matches("/api/v1/providers/")
-                .trim_end_matches("/refresh")
-                .to_owned();
-            return providers::refresh(&state, &provider_id, request, &id)
-                .await
-                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-        }
-        ("DELETE", "/api/v1/connections") => {
-            return connections::close_bulk(&state, request, &id)
-                .await
-                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-        }
-        ("DELETE", "/api/v1/connections/{connection_id}") => {
-            let connection_id = path.trim_start_matches("/api/v1/connections/").to_owned();
-            return connections::close(&state, &connection_id, request, &id)
-                .await
-                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-        }
-        ("PATCH", "/api/v1/runtime/settings") => {
-            return settings::patch(&state, request, &id)
-                .await
-                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-        }
-        ("POST", "/api/v1/probes") => {
-            return probes::create(&state, request, &id)
-                .await
-                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-        }
-        ("POST", "/api/v1/routing/trace") => {
-            return routing::trace(&state, request, &id)
-                .await
-                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-        }
-        ("DELETE", "/api/v1/dns/cache") => {
-            return dns::delete_name(&state, request, &id)
-                .await
-                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-        }
-        ("DELETE", "/api/v1/dns/cache/{entry_id}") => {
-            let entry = path.trim_start_matches("/api/v1/dns/cache/").to_owned();
-            return dns::delete_entry(&state, &entry, request, &id)
-                .await
-                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-        }
-        ("POST", "/api/v1/dns/cache/flush") => {
-            return dns::flush(&state, request, &id)
-                .await
-                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-        }
-        ("PUT", "/api/v1/config/sources/{source_id}") => {
-            return config::replace(
-                &state,
-                path.trim_start_matches("/api/v1/config/sources/")
-                    .to_owned(),
-                request,
-                &id,
-            )
-            .await
-            .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-        }
-        ("POST", "/api/v1/config/validate") => {
-            return config::validate(&state, request, &id)
-                .await
-                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-        }
-        ("POST", "/api/v1/operations/reload") => {
-            return config::reload(&state, request, &id)
-                .await
-                .unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-        }
-        _ => {}
-    }
-    if method == "GET" {
-        let result = match route.template {
-            "/api" | "/api/v1/version" | "/api/v1/capabilities" => {
-                parse_query(request.uri(), &[], &id).map(|_| match path {
-                    "/api" => Json(discovery()).into_response(),
-                    "/api/v1/version" => Json(version()).into_response(),
-                    _ => Json(capabilities(&state)).into_response(),
-                })
-            }
-            "/api/v1/runtime" => runtime(&state, request.uri(), &id).await,
-            "/api/v1/runtime/memory" => telemetry::memory(&state, request.uri(), &id).await,
-            "/api/v1/runtime/outbounds" => telemetry::outbounds(&state, request.uri(), &id).await,
-            "/api/v1/runtime/traffic/history" => {
-                telemetry::traffic_history(&state, request.uri(), &id).await
-            }
-            "/api/v1/runtime/memory/history" => {
-                telemetry::memory_history(&state, request.uri(), &id).await
-            }
-            "/api/v1/config" => config::get(&state, request.uri(), &id).await,
-            "/api/v1/datapath" => datapath::get(&state, request.uri(), &id).await,
-            "/api/v1/runtime/mode" => mode::get(&state, request.uri(), &id).await,
-            "/api/v1/providers" => providers::list(&state, request.uri(), &id).await,
-            "/api/v1/providers/{id}" => {
-                providers::detail(
-                    &state,
-                    path.trim_start_matches("/api/v1/providers/"),
-                    request.uri(),
-                    &id,
-                )
-                .await
-            }
-            "/api/v1/runtime/settings" => settings::get(&state, request.uri(), &id).await,
-            "/api/v1/rules" => routing::rules(&state, request.uri(), &id).await,
-            "/api/v1/dns/query" => dns::query(&state, request.uri(), &id).await,
-            "/api/v1/dns/cache" => dns::cache(&state, request.uri(), &id).await,
-            "/api/v1/dns/log" => dns::log(&state, request.uri(), &id).await,
-            "/api/v1/config/sources/{source_id}" => {
-                config::source(
-                    &state,
-                    path.trim_start_matches("/api/v1/config/sources/"),
-                    request.uri(),
-                    &id,
-                )
-                .await
-            }
-            "/api/v1/operations/{id}" => parse_query(request.uri(), &[], &id).and_then(|_| {
-                state.observation.operations.get(
-                    path.trim_start_matches("/api/v1/operations/"),
-                    if state.settings.secret.is_empty() {
-                        "anonymous"
-                    } else {
-                        "control"
-                    },
-                    true,
-                )
-            }),
-            "/api/v1/connections" => connections(&state, request.uri(), &id),
-            "/api/v1/flows" => flows::list(&state, request.uri(), &id),
-            "/api/v1/flows/{flow_id}" => flows::detail(
-                &state,
-                path.trim_start_matches("/api/v1/flows/"),
-                request.uri(),
-                &id,
-            ),
-            "/api/v1/nodes" => catalog::nodes(&state, request.uri(), &id).await,
-            "/api/v1/groups" => catalog::groups(&state, request.uri(), &id).await,
-            "/api/v1/groups/{groupId}" => {
-                catalog::group(
-                    &state,
-                    path.trim_start_matches("/api/v1/groups/"),
-                    request.uri(),
-                    &id,
-                )
-                .await
-            }
-            _ => Err(error(
-                StatusCode::NOT_FOUND,
-                ErrorCode::CapabilityNotSupported,
-                "Capability is not supported",
-                &id,
-            )),
-        };
-        return result.unwrap_or_else(|error| error.with_request_id(id.0.clone()).into_response());
-    }
-    error(
-        StatusCode::NOT_FOUND,
-        ErrorCode::CapabilityNotSupported,
-        "Capability is not supported",
         &id,
     )
     .into_response()
@@ -558,7 +250,7 @@ async fn runtime(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respo
             generation,
             phase,
             state.healthy.load(Ordering::Acquire),
-            state.observation.configuration.revision(),
+            state.observation.configuration.sources.revision(),
             state.observation.configuration.last_reload(),
             state.backend.read().await.observe_datapath(),
         )

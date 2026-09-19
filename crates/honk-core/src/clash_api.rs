@@ -385,7 +385,7 @@ async fn patch_configs(State(s): State<Arc<ClashState>>, body: Bytes) -> Respons
                 );
             };
             return match control
-                .mode(crate::native_api::mode::ModeRequest::ClashMode(mode))
+                .mode(crate::control::client::ModeRequest::ClashMode(mode))
                 .await
             {
                 Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -626,7 +626,7 @@ async fn put_proxy(
                 );
             };
             return match control
-                .mode(crate::native_api::mode::ModeRequest::ClashSelection(
+                .mode(crate::control::client::ModeRequest::ClashSelection(
                     body.name,
                 ))
                 .await

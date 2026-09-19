@@ -14,6 +14,20 @@ pub struct ControlClient {
     sender: mpsc::Sender<super::ControlCommand>,
 }
 
+#[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
+#[derive(Debug)]
+pub(crate) enum ModeRequest {
+    #[cfg(test)]
+    Runtime {
+        mode: &'static str,
+        target: Option<String>,
+    },
+    #[cfg(feature = "clash-api")]
+    ClashMode(String),
+    #[cfg(feature = "clash-api")]
+    ClashSelection(String),
+}
+
 #[cfg(any(feature = "native-api", feature = "clash-api"))]
 #[derive(Debug)]
 pub(crate) enum SelectionRequest {
@@ -78,21 +92,13 @@ impl ControlClient {
     #[cfg(all(feature = "native-api", feature = "clash-api"))]
     pub(crate) async fn mode(
         &self,
-        request: crate::native_api::mode::ModeRequest,
-    ) -> Result<serde_json::Value, crate::native_api::ApiError> {
-        let unavailable = || {
-            crate::native_api::ApiError::new(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                crate::native_api::ErrorCode::TemporarilyUnavailable,
-                "Control owner is unavailable",
-                None,
-            )
-        };
+        request: ModeRequest,
+    ) -> Result<crate::mode::ModeState, ControlError> {
         let (reply, response) = oneshot::channel();
         self.sender
             .try_send(super::ControlCommand::SetRuntimeMode { request, reply })
-            .map_err(|_| unavailable())?;
-        response.await.map_err(|_| unavailable())?
+            .map_err(|_| ControlError::Unavailable)?;
+        response.await.map_err(|_| ControlError::Unavailable)?
     }
 }
 

@@ -1,4 +1,4 @@
-//! Accepted `.dae` sources and the native file-authority boundary.
+//! Native file permissions, HTTP projections and configuration work admission.
 
 mod coordinator;
 
@@ -18,48 +18,28 @@ use honk_config::{
     Config,
     diagnostic::{DetailedDiagnostic, Severity},
     experimental::NativeApiConfig,
-    parser::{SourceLimits, SourceSnapshot},
+    parser::SourceSnapshot,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 
-use super::offline::DependencySnapshot;
 use super::operations::{OperationStore, Reservation};
 use super::{ApiError, ErrorCode, NativeState, error, parse_query, timestamp, types::RequestId};
+use crate::configuration::{
+    Accepted, AcceptedSources, MAX_SOURCE_BYTES, MAX_SOURCES, SourceUpdate, limits,
+    same_dependencies,
+};
 
 /// What `GET /config` shows in place of a private source path.
 pub(crate) const REDACTED_PATH: &str = "<redacted>";
-pub(crate) const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
-pub(crate) const MAX_SOURCES: usize = 32;
-
-#[derive(Clone, Debug)]
-pub(crate) struct SourceUpdate {
-    pub(crate) sources: Vec<SourceSnapshot>,
-    pub(crate) dependencies: Vec<DependencySnapshot>,
-}
-
-#[derive(Clone)]
-struct Accepted {
-    update: Arc<SourceUpdate>,
-    ids: HashMap<PathBuf, String>,
-    hashes: Vec<String>,
-    revision: String,
-    config_key: String,
-    generation: u64,
-    group_sources: HashMap<String, usize>,
-    rule_sources: honk_config::parser::source_edit::RuleSourceIndex,
-    accepted_at: String,
-}
 
 pub(crate) struct ConfigService {
     settings: NativeApiConfig,
     instance_id: String,
     operations: Arc<OperationStore>,
-    accepted: RwLock<Option<Accepted>>,
-    entry: Mutex<Option<PathBuf>>,
+    pub(crate) sources: Arc<AcceptedSources>,
     sender: Mutex<Option<mpsc::Sender<Work>>>,
     last_reload: RwLock<Option<Value>>,
     phase: RwLock<Option<tokio::sync::watch::Receiver<crate::control::EnginePhase>>>,
@@ -68,6 +48,17 @@ pub(crate) struct ConfigService {
 }
 
 enum Work {
+    GeoUpdate {
+        plan: Box<super::geodata::GeoUpdatePlan>,
+        reservation: Reservation,
+    },
+    Manage {
+        mutation: super::management::Mutation,
+        catalog: Arc<super::catalog::Catalog>,
+        group_manager: honk_outbound::group::SharedGroupManager,
+        alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
+        response: oneshot::Sender<Result<super::management::Completion, ApiError>>,
+    },
     Lifecycle {
         resume: bool,
         reservation: Reservation,
@@ -102,8 +93,7 @@ impl ConfigService {
             settings,
             instance_id,
             operations,
-            accepted: RwLock::new(None),
-            entry: Mutex::new(None),
+            sources: Arc::new(AcceptedSources::default()),
             sender: Mutex::new(None),
             last_reload: RwLock::new(None),
             phase: RwLock::new(None),
@@ -112,128 +102,62 @@ impl ConfigService {
         }
     }
 
-    pub(crate) fn accept(&self, update: &SourceUpdate, generation: u64) {
-        let budgeted = update
-            .dependencies
-            .iter()
-            .filter(|dependency| !dependency.asset);
-        if update.sources.is_empty()
-            || update.sources.len() + budgeted.clone().count() > MAX_SOURCES
-            || update
-                .sources
-                .iter()
-                .map(|source| source.content.len())
-                .chain(budgeted.map(|source| source.bytes))
-                .try_fold(0usize, usize::checked_add)
-                .is_none_or(|bytes| bytes > MAX_SOURCE_BYTES)
-        {
-            self.invalidate();
-            return;
-        }
-        let mut entry = self.entry.lock();
-        if entry
-            .as_ref()
-            .is_some_and(|path| path != &update.sources[0].path)
-        {
-            drop(entry);
-            self.invalidate();
-            return;
-        }
-        *entry = Some(update.sources[0].path.clone());
-        drop(entry);
-        let Ok((group_sources, rule_sources)) =
-            honk_config::parser::source_edit::source_indices(&update.sources)
-        else {
-            self.invalidate();
-            return;
-        };
-        let hashes: Vec<_> = update
-            .sources
-            .iter()
-            .map(|source| digest(source.content.as_bytes()))
-            .collect();
-        let mut current = self.accepted.write();
-        let same = current.as_ref().is_some_and(|current| {
-            current.hashes == hashes
-                && current
-                    .update
-                    .sources
-                    .iter()
-                    .map(|source| (&source.path, source.parent))
-                    .eq(update
-                        .sources
-                        .iter()
-                        .map(|source| (&source.path, source.parent)))
-                && same_dependencies(&current.update.dependencies, &update.dependencies)
-        });
-        let ids = update
-            .sources
-            .iter()
-            .map(|source| {
-                let id = current
-                    .as_ref()
-                    .and_then(|current| current.ids.get(&source.path))
-                    .cloned()
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                (source.path.clone(), id)
-            })
-            .collect();
-        let revision = if same {
-            current.as_ref().unwrap().revision.clone()
-        } else {
-            uuid::Uuid::new_v4().to_string()
-        };
-        let config_key = current
-            .as_ref()
-            .map(|current| current.config_key.clone())
-            .unwrap_or_default();
-        *current = Some(Accepted {
-            update: Arc::new(update.clone()),
-            ids,
-            hashes,
-            revision,
-            config_key,
-            generation,
-            group_sources,
-            rule_sources,
-            accepted_at: timestamp(SystemTime::now()),
-        });
-    }
-
-    pub(crate) fn invalidate(&self) {
-        *self.accepted.write() = None;
-    }
-
-    pub(crate) fn generation_committed(&self, config_revision: &str, generation: u64) {
-        if let Some(accepted) = self.accepted.write().as_mut() {
-            if !accepted.config_key.is_empty() && accepted.config_key != config_revision {
-                accepted.revision = uuid::Uuid::new_v4().to_string();
-            }
-            accepted.config_key = config_revision.to_owned();
-            accepted.generation = generation;
-        }
-    }
-
-    pub(crate) fn revision(&self) -> Option<String> {
-        self.accepted
-            .read()
-            .as_ref()
-            .map(|value| value.revision.clone())
-    }
-    pub(crate) fn available(&self) -> bool {
-        self.accepted.read().is_some()
-    }
     pub(crate) fn writable(&self) -> bool {
-        self.available()
+        self.sources.available()
             && self.settings.config_write
             && !self.settings.secret.is_empty()
             && self.sender.lock().is_some()
     }
+    pub(crate) fn can_manage(&self) -> bool {
+        self.sender
+            .lock()
+            .as_ref()
+            .is_some_and(|sender| !sender.is_closed())
+            && self
+                .sources
+                .accepted
+                .read()
+                .as_ref()
+                .is_some_and(|accepted| self.source_writable(accepted, 0))
+    }
+
+    pub(super) async fn manage(
+        &self,
+        mutation: super::management::Mutation,
+        catalog: Arc<super::catalog::Catalog>,
+        group_manager: honk_outbound::group::SharedGroupManager,
+        alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
+    ) -> Result<super::management::Completion, ApiError> {
+        let deleting = mutation.deleting();
+        let (response, wait) = oneshot::channel();
+        self.enqueue(Work::Manage {
+            mutation,
+            catalog,
+            group_manager,
+            alive_set,
+            response,
+        })
+        .map_err(|error| error.for_management(deleting))?;
+        wait.await.map_err(|_| {
+            super::management::activation_error("coordinator_stopped", None, None, None)
+        })?
+    }
+
+    pub(super) fn queue_geodata(
+        &self,
+        plan: super::geodata::GeoUpdatePlan,
+        reservation: Reservation,
+    ) -> Result<(), ApiError> {
+        self.enqueue(Work::GeoUpdate {
+            plan: Box::new(plan),
+            reservation,
+        })
+    }
     pub(crate) fn content_enabled(&self) -> bool {
-        self.available() && self.settings.config_content && !self.settings.secret.is_empty()
+        self.sources.available() && self.settings.config_content && !self.settings.secret.is_empty()
     }
     pub(crate) fn running(&self) -> bool {
-        self.available() && self.sender.lock().is_some()
+        self.sources.available() && self.sender.lock().is_some()
     }
     pub(crate) fn attach_phase(
         &self,
@@ -280,12 +204,17 @@ impl ConfigService {
 
     pub(crate) fn group_writable(&self, name: &str) -> bool {
         self.writable()
-            && self.accepted.read().as_ref().is_some_and(|accepted| {
-                accepted
-                    .group_sources
-                    .get(name)
-                    .is_some_and(|index| self.source_writable(accepted, *index))
-            })
+            && self
+                .sources
+                .accepted
+                .read()
+                .as_ref()
+                .is_some_and(|accepted| {
+                    accepted
+                        .group_sources
+                        .get(name)
+                        .is_some_and(|index| self.source_writable(accepted, *index))
+                })
     }
 
     pub(super) fn enqueue_group_patch(
@@ -303,7 +232,7 @@ impl ConfigService {
         &self,
         index: Option<usize>,
     ) -> Option<(String, honk_config::parser::source_edit::RuleSourceLocation)> {
-        let guard = self.accepted.read();
+        let guard = self.sources.accepted.read();
         let accepted = guard.as_ref()?;
         let location = match index {
             Some(index) => accepted.rule_sources.rules.get(index)?,
@@ -321,7 +250,7 @@ impl ConfigService {
         let mut value = json!({
             "id":accepted.ids[&source.path], "path":REDACTED_PATH, "kind":if index==0 {"main"} else {"include"},
             "content_sha256":accepted.hashes[index], "bytes":source.content.len(),
-            "writable":self.source_writable(accepted,index), "loaded_at":accepted.accepted_at,
+            "writable":self.source_writable(accepted,index), "loaded_at":timestamp(accepted.accepted_at),
             "line_count":source.content.lines().count(),
         });
         if self.settings.config_content
@@ -334,7 +263,7 @@ impl ConfigService {
     }
 
     pub(crate) fn snapshot(&self) -> Option<Value> {
-        let guard = self.accepted.read();
+        let guard = self.sources.accepted.read();
         let accepted = guard.as_ref()?;
         Some(
             json!({"generation_id":format!("{}:{}",self.instance_id,accepted.generation),"revision":accepted.revision,
@@ -357,6 +286,9 @@ impl ConfigService {
         if phase == Some(expected) {
             return Ok(());
         }
+        if matches!(work, Work::Manage { .. }) {
+            return Err(unavailable());
+        }
         Err(
             if matches!(
                 phase,
@@ -378,6 +310,7 @@ impl ConfigService {
         if let Err(error) = self.check_phase(&work) {
             match &work {
                 Work::Replace { reservation, .. }
+                | Work::GeoUpdate { reservation, .. }
                 | Work::GroupPatch { reservation, .. }
                 | Work::Reload { reservation }
                 | Work::Lifecycle { reservation, .. } => {
@@ -400,31 +333,6 @@ impl ConfigService {
     }
 }
 
-pub(crate) fn digest(bytes: &[u8]) -> String {
-    encode_digest(&Sha256::digest(bytes))
-}
-
-pub(super) fn encode_digest(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(output, "{byte:02x}").expect("writing to a String is infallible");
-    }
-    output
-}
-
-fn same_dependencies(left: &[DependencySnapshot], right: &[DependencySnapshot]) -> bool {
-    left.len() == right.len()
-        && left.iter().zip(right).all(|(left, right)| {
-            left.path == right.path && left.sha256 == right.sha256 && left.bytes == right.bytes
-        })
-}
-
-fn same_sources(left: &SourceUpdate, right: &SourceUpdate) -> bool {
-    same_source_documents(&left.sources, &right.sources)
-        && same_dependencies(&left.dependencies, &right.dependencies)
-}
-
 fn same_source_documents(left: &[SourceSnapshot], right: &[SourceSnapshot]) -> bool {
     left.len() == right.len()
         && left.iter().zip(right).all(|(left, right)| {
@@ -432,12 +340,6 @@ fn same_source_documents(left: &[SourceSnapshot], right: &[SourceSnapshot]) -> b
         })
 }
 
-fn limits() -> SourceLimits {
-    SourceLimits {
-        max_bytes: MAX_SOURCE_BYTES,
-        max_sources: MAX_SOURCES,
-    }
-}
 fn unavailable() -> ApiError {
     ApiError::new(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -586,7 +488,7 @@ pub(super) async fn get(
             id,
         )
     })?;
-    let accepted = state.observation.configuration.accepted.read();
+    let accepted = state.observation.configuration.sources.accepted.read();
     let accepted = accepted
         .as_ref()
         .expect("source snapshot pinned by config publication guard");
@@ -618,7 +520,7 @@ pub(super) async fn source(
 ) -> Result<Response, ApiError> {
     parse_query(uri, &[], id)?;
     let _config = state.config.read().await;
-    let accepted = state.observation.configuration.accepted.read();
+    let accepted = state.observation.configuration.sources.accepted.read();
     let accepted = accepted.as_ref().ok_or_else(unsupported)?;
     let index = accepted
         .update
@@ -642,7 +544,7 @@ pub(super) async fn replace(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     parse_query(request.uri(), &[], id)?;
-    if !state.observation.configuration.available() {
+    if !state.observation.configuration.sources.available() {
         return Err(unsupported());
     }
     if !state.observation.configuration.writable() {

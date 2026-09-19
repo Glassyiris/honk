@@ -27,6 +27,9 @@ use super::{
     types::{ApiError, ErrorCode, RequestId},
 };
 
+pub(crate) mod record;
+use record::{Input, InputValues, SnapshotRow, Step, StepData, Summary};
+
 const MAX_RECORDS: usize = 1024;
 const MAX_STEPS: usize = 64;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -67,9 +70,9 @@ struct Store {
 }
 
 struct Record {
-    summary: Value,
-    input: Value,
-    steps: Vec<Value>,
+    summary: Summary,
+    input: Input,
+    steps: Vec<Step>,
     started: Instant,
     ended: Option<Instant>,
     redacted: bool,
@@ -89,7 +92,7 @@ struct Filters {
 struct Snapshot {
     token: String,
     filters: Filters,
-    rows: Vec<Value>,
+    rows: Vec<SnapshotRow>,
     observed_at: String,
     dropped: String,
     created: Instant,
@@ -128,11 +131,15 @@ impl Store {
         }
     }
 
+    fn retained_record_bytes(&self) -> usize {
+        self.record_bytes + (self.records.capacity() - self.records.len()) * size_of::<Record>()
+    }
+
     /// Everything the owner holds; the records' own share is bounded in
     /// `enforce_limit`, the listings' in `page`.
     #[cfg(test)]
     fn bytes(&self) -> usize {
-        OWNER_BYTES + self.record_bytes + self.snapshot_bytes
+        OWNER_BYTES + self.retained_record_bytes() + self.snapshot_bytes
     }
 }
 
@@ -192,21 +199,41 @@ impl FlowStore {
         let now = Instant::now();
         self.prune(&mut store, now);
         let id = Uuid::new_v4().to_string();
-        let input = json!({
-            "src": src.to_string(), "dst": dst.to_string(), "domain": null,
-            "domain_source": null, "pid": null, "process_path": null, "src_mac": null,
-            "ingress": null, "domain_rule_ids": null, "dscp": null, "mark": null
-        });
         let mut record = Record {
-            summary: json!({
-                "id": id, "instance_id": self.instance_id, "revision": 1, "network": network,
-                "state": "observed", "pname": null, "connection_id": null, "outbound": null,
-                "chain": [], "chain_source": "unknown", "rule_id": null, "rule_expression": null,
-                "rule_source": "unknown", "ingress": null, "domain_source": null,
-                "observed_by": "userspace", "started_at": timestamp(SystemTime::now()),
-                "ended_at": null, "trace_status": "partial"
-            }),
-            input,
+            summary: Summary {
+                id: id.clone(),
+                instance_id: self.instance_id.clone(),
+                revision: 1,
+                network,
+                state: "observed",
+                pname: None,
+                connection_id: None,
+                outbound: None,
+                chain: Vec::new(),
+                chain_source: "unknown",
+                rule_id: None,
+                rule_expression: None,
+                rule_source: "unknown",
+                ingress: (),
+                domain_source: None,
+                observed_by: "userspace",
+                started_at: timestamp(SystemTime::now()),
+                ended_at: None,
+                trace_status: "partial",
+            },
+            input: Input {
+                src,
+                dst,
+                domain: None,
+                domain_source: None,
+                pid: None,
+                process_path: (),
+                src_mac: None,
+                ingress: (),
+                domain_rule_ids: (),
+                dscp: None,
+                mark: None,
+            },
             steps: Vec::new(),
             started: now,
             ended: None,
@@ -214,9 +241,16 @@ impl FlowStore {
             overflow: false,
             bytes: 0,
         };
-        let mut values = record.input.clone();
-        values["pname"] = Value::Null;
-        record.push_step("input", None, json!({"values": values, "source": "socket"}));
+        record.push_step(
+            None,
+            StepData::Input {
+                values: InputValues {
+                    input: record.input.clone(),
+                    pname: None,
+                },
+                source: "socket",
+            },
+        );
         record.bytes = record.retained_bytes();
         store.record_bytes += record.bytes;
         self.updated(&record);
@@ -235,21 +269,13 @@ impl FlowStore {
         let record = store.records.iter().find(|record| record.id() == flow_id)?;
         let summary = &record.summary;
         Some(ConnectionEvidence {
-            chain: summary["chain"]
-                .as_array()?
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect(),
-            chain_source: if summary["chain_source"] == "evaluation" {
-                "evaluation"
-            } else {
-                "unknown"
-            },
-            rule_id: summary["rule_id"].as_str().map(str::to_owned),
-            rule_expression: summary["rule_expression"].as_str().map(str::to_owned),
-            rule_source: rule_source(summary["rule_source"].as_str().unwrap_or("unknown")),
-            domain_source: summary["domain_source"].as_str().map(domain_source),
-            started_at: summary["started_at"].as_str()?.to_owned(),
+            chain: summary.chain.clone(),
+            chain_source: summary.chain_source,
+            rule_id: summary.rule_id.clone(),
+            rule_expression: summary.rule_expression.clone(),
+            rule_source: summary.rule_source,
+            domain_source: summary.domain_source,
+            started_at: summary.started_at.clone(),
         })
     }
 
@@ -270,12 +296,12 @@ impl FlowStore {
         if !change(record) {
             return;
         }
-        let revision = record.summary["revision"].as_u64().unwrap_or(1);
+        let revision = record.summary.revision;
         if revision == MAX_SAFE_UINT {
             self.evict(&mut store, index, now, "buffer_overflow", false);
             return;
         }
-        record.summary["revision"] = (revision + 1).into();
+        record.summary.revision += 1;
         record.bytes = record.retained_bytes();
         let new_bytes = record.bytes;
         let lost_steps = record.overflow && !overflow;
@@ -291,7 +317,7 @@ impl FlowStore {
         self.events.publish(
             "flow.updated",
             json!({
-                "resource_id": record.id(), "revision": record.summary["revision"],
+                "resource_id": record.id(), "revision": record.summary.revision,
                 "href": format!("/api/v1/flows/{}", record.id())
             }),
             Some(record.id()),
@@ -339,7 +365,7 @@ impl FlowStore {
 
     fn enforce_limit(&self, store: &mut Store, now: Instant) {
         while store.records.len() > store.max_records
-            || OWNER_BYTES + store.record_bytes > MAX_BYTES - SNAPSHOT_BYTES
+            || OWNER_BYTES + store.retained_record_bytes() > MAX_BYTES - SNAPSHOT_BYTES
         {
             if store.records.is_empty() {
                 break;
@@ -412,7 +438,7 @@ impl FlowStore {
             observed_at: timestamp(SystemTime::now()),
             dropped: store.dropped.to_string(),
             created: Instant::now(),
-            bytes: size_of::<Snapshot>() + count * size_of::<Value>() + 8192,
+            bytes: size_of::<Snapshot>() + count * size_of::<SnapshotRow>() + 8192,
         };
         for record in store
             .records
@@ -420,8 +446,11 @@ impl FlowStore {
             .rev()
             .filter(|record| snapshot.filters.matches(record))
         {
-            let row = record.project(snapshot.filters.full, false);
-            snapshot.bytes += value_heap_bytes(&row);
+            let row = SnapshotRow {
+                summary: record.summary.clone(),
+                input: snapshot.filters.full.then(|| record.input.clone()),
+            };
+            snapshot.bytes += row.heap_bytes();
             if retained && snapshot.bytes > SNAPSHOT_BYTES {
                 return Err(snapshot_busy(id));
             }
@@ -494,40 +523,37 @@ impl FlowStore {
 
 impl Record {
     fn id(&self) -> &str {
-        self.summary["id"].as_str().expect("record ID")
+        &self.summary.id
     }
 
     fn retained_bytes(&self) -> usize {
         size_of::<Self>()
-            + value_heap_bytes(&self.summary)
-            + value_heap_bytes(&self.input)
-            + self.steps.capacity() * size_of::<Value>()
-            + self.steps.iter().map(value_heap_bytes).sum::<usize>()
+            + self.summary.heap_bytes()
+            + self.input.heap_bytes()
+            + self.steps.capacity() * size_of::<Step>()
+            + self.steps.iter().map(Step::heap_bytes).sum::<usize>()
     }
 
-    fn push_step(
-        &mut self,
-        stage: &'static str,
-        generation_id: Option<String>,
-        data: Value,
-    ) -> bool {
+    fn push_step(&mut self, generation_id: Option<String>, data: StepData) -> bool {
         if self.steps.len() == MAX_STEPS {
             return !std::mem::replace(&mut self.overflow, true);
         }
         let elapsed = self.started.elapsed().as_micros();
-        self.steps.push(json!({
-            "seq": self.steps.len() + 1, "stage": stage,
-            "observed_at": timestamp(SystemTime::now()),
-            "elapsed_us": (elapsed <= u128::from(MAX_SAFE_UINT)).then_some(elapsed as u64),
-            "generation_id": generation_id, "evidence": "observed", "data": data
-        }));
+        self.steps.push(Step {
+            seq: self.steps.len() + 1,
+            observed_at: timestamp(SystemTime::now()),
+            elapsed_us: (elapsed <= u128::from(MAX_SAFE_UINT)).then_some(elapsed as u64),
+            generation_id,
+            evidence: "observed",
+            data,
+        });
         true
     }
 
     fn project(&self, full: bool, trace: bool) -> Value {
-        let mut row = self.summary.clone();
+        let mut row = json!(self.summary);
         if full {
-            row["input"] = self.input.clone();
+            row["input"] = json!(self.input);
         }
         if trace {
             let mut missing = vec!["not_instrumented"];
@@ -545,12 +571,12 @@ impl Record {
 
 impl Filters {
     fn matches(&self, record: &Record) -> bool {
-        (self.network == "all" || record.summary["network"] == self.network)
-            && (self.state == "all" || record.summary["state"] == self.state)
+        (self.network == "all" || record.summary.network == self.network)
+            && (self.state == "all" || record.summary.state == self.state)
             && self
                 .connection_id
                 .as_ref()
-                .is_none_or(|id| record.summary["connection_id"] == *id)
+                .is_none_or(|id| record.summary.connection_id.as_ref() == Some(id))
     }
 }
 
@@ -564,30 +590,26 @@ impl FlowGuard {
         !self.id.is_empty() && !self.replied.swap(true, Ordering::Relaxed)
     }
 
-    pub(crate) fn step(&self, stage: &'static str, generation: Option<u64>, mut data: Value) {
+    pub(crate) fn step(&self, generation: Option<u64>, mut data: StepData) {
         let Some(store) = self.store.upgrade() else {
             return;
         };
         store.mutate(&self.id, |record| {
-            if !complete_step(stage, &data) {
-                return !std::mem::replace(&mut record.redacted, true);
-            }
             let mut redacted = false;
             let mut overflow = false;
-            if !sanitize_step(&mut data, 0, &mut 512, &mut redacted, &mut overflow) {
+            if !data.sanitize(&mut redacted, &mut overflow) {
                 return if overflow {
                     !std::mem::replace(&mut record.overflow, true)
                 } else {
                     !std::mem::replace(&mut record.redacted, true)
                 };
             }
-            if value_heap_bytes(&data) > MAX_STEP_BYTES {
+            if size_of::<StepData>() + data.heap_bytes() > MAX_STEP_BYTES {
                 return !std::mem::replace(&mut record.overflow, true);
             }
             let changed = redacted && !record.redacted;
             record.redacted |= redacted;
             record.push_step(
-                stage,
                 generation.map(|generation| format!("{}:{generation}", store.instance_id)),
                 data,
             ) || changed
@@ -612,44 +634,49 @@ impl FlowGuard {
             let mut redacted = record.redacted;
             let domain = safe_optional(domain, &mut redacted);
             let pname = safe_optional(pname, &mut redacted);
-            let src_mac = safe_optional(src_mac.as_deref(), &mut redacted);
+            let src_mac = src_mac.filter(|value| {
+                let safe = safe_text(value);
+                redacted |= !safe;
+                safe
+            });
             let source = source.map(domain_source);
             let dscp = dscp.filter(|value| *value <= 63);
-            let mut changed = record.redacted != redacted;
+            let input = Input {
+                src: record.input.src,
+                dst: record.input.dst,
+                domain,
+                domain_source: source,
+                pid,
+                process_path: (),
+                src_mac,
+                ingress: (),
+                domain_rule_ids: (),
+                dscp,
+                mark,
+            };
+            let changed = record.redacted != redacted
+                || record.input != input
+                || record.summary.pname != pname
+                || record.summary.domain_source != source;
             record.redacted = redacted;
-            for (key, value) in [
-                ("domain", json!(domain)),
-                ("domain_source", json!(source)),
-                ("pid", json!(pid)),
-                ("src_mac", json!(src_mac)),
-                ("dscp", json!(dscp)),
-                ("mark", json!(mark)),
-            ] {
-                if record.input[key] != value {
-                    record.input[key] = value;
-                    changed = true;
-                }
-            }
-            if record.summary["pname"] != json!(pname) {
-                record.summary["pname"] = json!(pname);
-                changed = true;
-            }
-            if record.summary["domain_source"] != json!(source) {
-                record.summary["domain_source"] = json!(source);
-                changed = true;
-            }
+            record.input = input;
+            record.summary.pname = pname;
+            record.summary.domain_source = source;
             let input_source = match source {
                 Some("dns_mapping") => Some("dns_mapping"),
                 Some("tls_sni" | "http_host" | "quic_sni") => Some("sniffer"),
                 _ => None,
             };
             if changed && let Some(input_source) = input_source {
-                let mut values = record.input.clone();
-                values["pname"] = record.summary["pname"].clone();
                 record.push_step(
-                    "input",
                     None,
-                    json!({"values": values, "source": input_source}),
+                    StepData::Input {
+                        values: InputValues {
+                            input: record.input.clone(),
+                            pname: record.summary.pname.clone(),
+                        },
+                        source: input_source,
+                    },
                 );
             }
             changed
@@ -672,15 +699,15 @@ impl FlowGuard {
             let rule_id = safe_optional(rule_id, &mut redacted);
             let expression = safe_optional(expression, &mut redacted);
             let source = rule_source(source);
-            let changed = record.summary["outbound"] != json!(outbound)
-                || record.summary["rule_id"] != json!(rule_id)
-                || record.summary["rule_expression"] != json!(expression)
-                || record.summary["rule_source"] != source
+            let changed = record.summary.outbound != outbound
+                || record.summary.rule_id != rule_id
+                || record.summary.rule_expression != expression
+                || record.summary.rule_source != source
                 || record.redacted != redacted;
-            record.summary["outbound"] = json!(outbound);
-            record.summary["rule_id"] = json!(rule_id);
-            record.summary["rule_expression"] = json!(expression);
-            record.summary["rule_source"] = json!(source);
+            record.summary.outbound = outbound;
+            record.summary.rule_id = rule_id;
+            record.summary.rule_expression = expression;
+            record.summary.rule_source = source;
             record.redacted = redacted;
             changed
         });
@@ -694,12 +721,11 @@ impl FlowGuard {
             if chain.len() > MAX_STEPS || chain.iter().any(|part| !safe_text(part)) {
                 return !std::mem::replace(&mut record.redacted, true);
             }
-            let chain = json!(chain);
-            if record.summary["chain"] == chain && record.summary["chain_source"] == "evaluation" {
+            if record.summary.chain == chain && record.summary.chain_source == "evaluation" {
                 return false;
             }
-            record.summary["chain"] = chain;
-            record.summary["chain_source"] = json!("evaluation");
+            record.summary.chain = chain;
+            record.summary.chain_source = "evaluation";
             true
         });
     }
@@ -712,10 +738,10 @@ impl FlowGuard {
             if !safe_text(id) {
                 return !std::mem::replace(&mut record.redacted, true);
             }
-            if record.summary["connection_id"] == id {
+            if record.summary.connection_id.as_deref() == Some(id) {
                 return false;
             }
-            record.summary["connection_id"] = json!(id);
+            record.summary.connection_id = Some(id.to_owned());
             true
         });
     }
@@ -742,23 +768,26 @@ impl FlowGuard {
             };
             let redacted = !safe_text(reason);
             let reason = if redacted { "redacted" } else { reason };
-            let changed = record.summary["state"] != state
+            let changed = record.summary.state != state
                 || milestone == "terminal"
                 || matches!(state, "closed" | "blocked" | "failed")
                 || (redacted && !record.redacted);
             record.redacted |= redacted;
-            record.summary["state"] = json!(state);
+            record.summary.state = state;
             if milestone == "terminal" || matches!(state, "closed" | "blocked" | "failed") {
                 record.ended = Some(Instant::now());
-                record.summary["ended_at"] = json!(timestamp(SystemTime::now()));
+                record.summary.ended_at = Some(timestamp(SystemTime::now()));
             }
             record.push_step(
-                "connection",
                 None,
-                json!({
-                    "state": state, "reason": reason, "milestone": milestone, "attempt_id": null,
-                    "reply_received": reply_received, "error": null
-                }),
+                StepData::Connection {
+                    state,
+                    reason,
+                    milestone,
+                    attempt_id: None,
+                    reply_received,
+                    error: None,
+                },
             ) || changed
         });
     }
@@ -925,236 +954,6 @@ fn safe_optional(value: Option<&str>, redacted: &mut bool) -> Option<String> {
             None
         }
     })
-}
-
-fn complete_step(stage: &str, data: &Value) -> bool {
-    let required: &[&str] = match stage {
-        "input" => &["values", "source"],
-        "route" => &[
-            "evaluation_id",
-            "chain",
-            "plane",
-            "rule_id",
-            "rules",
-            "outbound",
-            "must",
-            "mark",
-            "input",
-            "dns_action",
-        ],
-        "dial_mode" => &[
-            "configured",
-            "effective_target",
-            "domain",
-            "domain_source",
-            "verification",
-            "reason",
-        ],
-        "reroute" => &[
-            "performed",
-            "reason",
-            "from_evaluation_id",
-            "to_evaluation_id",
-        ],
-        "outbound" => &[
-            "attempt_id",
-            "parent_attempt_id",
-            "kind",
-            "evaluation_id",
-            "routing_source",
-            "routed_outbound",
-            "effective_outbound",
-            "mode_override",
-            "selection_path",
-            "leaf_node_id",
-            "leaf_node_name",
-            "target",
-            "target_kind",
-            "dial_ip",
-            "server_addr",
-            "resolution_location",
-            "status",
-            "error",
-        ],
-        "connection" => &[
-            "state",
-            "reason",
-            "milestone",
-            "attempt_id",
-            "reply_received",
-            "error",
-        ],
-        _ => return false,
-    };
-    data.as_object()
-        .is_some_and(|data| required.iter().all(|key| data.contains_key(*key)))
-}
-
-fn sanitize_step(
-    value: &mut Value,
-    depth: usize,
-    remaining: &mut usize,
-    redacted: &mut bool,
-    overflow: &mut bool,
-) -> bool {
-    if depth > 8 || *remaining == 0 {
-        *overflow = true;
-        return false;
-    }
-    *remaining -= 1;
-    match value {
-        Value::String(value) => safe_text(value),
-        Value::Array(values) => {
-            if values.len() > MAX_STEPS {
-                *overflow = true;
-                return false;
-            }
-            values
-                .iter_mut()
-                .all(|value| sanitize_step(value, depth + 1, remaining, redacted, overflow))
-        }
-        Value::Object(values) => {
-            if values.len() > 32 {
-                *overflow = true;
-                return false;
-            }
-            for (key, value) in values.iter_mut() {
-                let private_error = key == "error"
-                    && !matches!(
-                        value.as_str(),
-                        Some(
-                            "policy_block"
-                                | "dial_failed"
-                                | "dial_timeout"
-                                | "local_refusal"
-                                | "udp_prepare_failed"
-                                | "runtime_generation_missing"
-                                | "cancelled"
-                        )
-                    );
-                let private_display = matches!(
-                    key.as_str(),
-                    "expression"
-                        | "member_name"
-                        | "leaf_node_name"
-                        | "outbound"
-                        | "routed_outbound"
-                        | "effective_outbound"
-                        | "pname"
-                        | "domain"
-                        | "src"
-                        | "dst"
-                        | "src_mac"
-                        | "target"
-                        | "server_addr"
-                ) && value.as_str().is_some_and(|value| !safe_text(value));
-                if (key == "process_path" || private_display || private_error) && !value.is_null() {
-                    *value = Value::Null;
-                    *redacted = true;
-                }
-                if !matches!(
-                    key.as_str(),
-                    "values"
-                        | "source"
-                        | "src"
-                        | "dst"
-                        | "domain"
-                        | "domain_source"
-                        | "pid"
-                        | "process_path"
-                        | "src_mac"
-                        | "ingress"
-                        | "domain_rule_ids"
-                        | "dscp"
-                        | "mark"
-                        | "pname"
-                        | "evaluation_id"
-                        | "chain"
-                        | "plane"
-                        | "rule_id"
-                        | "rules"
-                        | "outbound"
-                        | "must"
-                        | "input"
-                        | "dns_action"
-                        | "network"
-                        | "src_ip"
-                        | "src_port"
-                        | "dst_ip"
-                        | "dst_port"
-                        | "configured"
-                        | "effective_target"
-                        | "verification"
-                        | "reason"
-                        | "performed"
-                        | "from_evaluation_id"
-                        | "to_evaluation_id"
-                        | "attempt_id"
-                        | "parent_attempt_id"
-                        | "kind"
-                        | "routing_source"
-                        | "routed_outbound"
-                        | "effective_outbound"
-                        | "mode_override"
-                        | "selection_path"
-                        | "leaf_node_id"
-                        | "leaf_node_name"
-                        | "target"
-                        | "target_kind"
-                        | "dial_ip"
-                        | "server_addr"
-                        | "resolution_location"
-                        | "status"
-                        | "error"
-                        | "group_id"
-                        | "member_id"
-                        | "member_name"
-                        | "policy"
-                        | "selection"
-                        | "previous_member_id"
-                        | "metric"
-                        | "tolerance_ms"
-                        | "candidates"
-                        | "eligible"
-                        | "sorting_latency_ms"
-                        | "score"
-                        | "selected"
-                        | "state"
-                        | "milestone"
-                        | "reply_received"
-                        | "expression"
-                        | "result"
-                        | "missing_inputs"
-                        | "conditions"
-                        | "id"
-                ) || !sanitize_step(value, depth + 1, remaining, redacted, overflow)
-                {
-                    return false;
-                }
-            }
-            true
-        }
-        _ => true,
-    }
-}
-
-// Conservative allocation accounting, not a temporary serialization buffer. The
-// per-map allowance covers spare B-tree nodes; strings/arrays use owned capacity.
-fn value_heap_bytes(value: &Value) -> usize {
-    match value {
-        Value::String(value) => value.capacity(),
-        Value::Array(values) => {
-            values.capacity() * size_of::<Value>()
-                + values.iter().map(value_heap_bytes).sum::<usize>()
-        }
-        Value::Object(values) => {
-            1024 + values
-                .iter()
-                .map(|(key, value)| 128 + key.capacity() + value_heap_bytes(value))
-                .sum::<usize>()
-        }
-        _ => 0,
-    }
 }
 
 #[cfg(test)]

@@ -356,7 +356,7 @@ pub(super) async fn patch(
             Ok::<_, ApiError>(GroupPatch {
                 id: group_id.to_owned(),
                 name: name.clone(),
-                revision: service.revision().ok_or_else(invalid)?,
+                revision: service.sources.revision().ok_or_else(invalid)?,
                 expected,
                 group,
                 members,

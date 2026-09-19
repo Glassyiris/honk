@@ -29,7 +29,7 @@ pub(super) struct RoutingDecision {
     pub(super) matched_rule: Option<(String, String)>,
     pub(super) reroute_by_sniffed_domain: bool,
     #[cfg(feature = "native-api")]
-    pub(super) native_route: Option<crate::native_api::observation::NativeRoute>,
+    pub(super) native_route: Option<super::observation::RouteObservation>,
 }
 
 pub(super) fn build_connection_info(
@@ -192,6 +192,7 @@ impl ControlPlaneHandle {
         conn_info: &ConnectionInfo,
         domain_verified: bool,
         handoff: Option<&HandoffResult>,
+        #[cfg(feature = "native-api")] record_route: bool,
     ) -> RoutingDecision {
         let reroute_by_sniffed_domain = Self::should_reroute_sniffed_domain(
             dial_mode,
@@ -211,18 +212,7 @@ impl ControlPlaneHandle {
                 matched_rule: None,
                 reroute_by_sniffed_domain: false,
                 #[cfg(feature = "native-api")]
-                native_route: self
-                    .native
-                    .as_ref()
-                    .filter(|native| native.record_flows)
-                    .map(|_| crate::native_api::observation::NativeRoute {
-                        generation: None,
-                        rule_id: None,
-                        rule_expression: None,
-                        evaluation_id: uuid::Uuid::new_v4().to_string(),
-                        plane: "kernel",
-                        input: None,
-                    }),
+                native_route: record_route.then(super::observation::RouteObservation::kernel),
             };
         }
         let route_with_domain = Self::should_route_with_sniffed_domain(
@@ -240,54 +230,17 @@ impl ControlPlaneHandle {
         let mut native_route = None;
         let (userspace_outbound, userspace_must, userspace_mark, matched_rule) = {
             let router = self.router.read().await;
-            #[cfg(feature = "native-api")]
-            if self
-                .native
-                .as_ref()
-                .is_some_and(|native| native.record_flows)
-            {
-                let _config = self.config.read().await;
-                let generation = self.diagnostics.read().generation;
-                native_route = Some(crate::native_api::observation::NativeRoute {
-                    generation: Some(generation),
-                    rule_id: None,
-                    rule_expression: None,
-                    evaluation_id: uuid::Uuid::new_v4().to_string(),
-                    plane: "userspace",
-                    input: Some(serde_json::json!({
-                        "network":routing_conn_info.protocol,
-                        "src_ip":routing_conn_info.src_ip.to_string(), "src_port":routing_conn_info.src_port,
-                        "dst_ip":routing_conn_info.dst_ip.to_string(), "dst_port":routing_conn_info.dst_port,
-                        "domain":routing_conn_info.domain, "pname":routing_conn_info.process_name,
-                        "src_mac":routing_conn_info.mac,
-                        "dscp":routing_conn_info.dscp, "mark":null, "ingress":null, "domain_rule_ids":null,
-                    })),
-                });
-            }
             let matched = router.route_full(&routing_conn_info);
             #[cfg(feature = "native-api")]
-            if let Some(capture) = native_route.as_mut() {
-                let instance = &self
-                    .native
-                    .as_ref()
-                    .expect("native route owner")
-                    .instance_id;
-                capture.rule_id = Some(crate::native_api::routing::rule_id(
-                    instance,
-                    capture.generation.expect("userspace generation"),
-                    matched.as_ref().map(|route| route.rule_id),
+            if record_route && let Some(native) = &self.native {
+                let _config = self.config.read().await;
+                native_route = Some(super::observation::RouteObservation::userspace(
+                    &native.instance_id,
+                    self.diagnostics.read().generation,
+                    &routing_conn_info,
+                    &router,
+                    matched.as_ref(),
                 ));
-                capture.rule_expression = Some(match &matched {
-                    Some(route) => router
-                        .compiled_routes()
-                        .iter()
-                        .find(|compiled| compiled.id == route.rule_id)
-                        .map(|compiled| {
-                            crate::routing::native::rule_expression(&compiled.conditions)
-                        })
-                        .expect("matched compiled rule"),
-                    None => "fallback".to_owned(),
-                });
             }
             match matched {
                 Some(route) => (
@@ -317,11 +270,7 @@ impl ControlPlaneHandle {
                     {
                         #[cfg(feature = "native-api")]
                         if let Some(native_route) = native_route.as_mut() {
-                            native_route.generation = None;
-                            native_route.rule_id = None;
-                            native_route.rule_expression = None;
-                            native_route.plane = "kernel";
-                            native_route.input = None;
+                            native_route.retain_kernel_decision();
                         }
                     }
                     (
@@ -439,7 +388,7 @@ mod native_tests {
         let _router = handle.router.write().await;
         let decision = tokio::time::timeout(
             Duration::from_millis(100),
-            handle.prepare_routing(DialMode::Ip, &info, false, Some(&handoff)),
+            handle.prepare_routing(DialMode::Ip, &info, false, Some(&handoff), false),
         )
         .await
         .expect("native observation must not repeat routing");

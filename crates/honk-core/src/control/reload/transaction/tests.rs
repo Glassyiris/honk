@@ -176,3 +176,136 @@ async fn build_dns_forwarder_propagates_missing_external_ech_config() {
         .expect("preparation must preserve the file I/O error");
     assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
 }
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn supplied_geo_bytes_drive_reload_and_rejection_retains_live_metadata() {
+    use crate::configuration::SourceUpdate;
+    use crate::dns::routing::DnsRequestDecision;
+    use crate::routing::{GeoAssetSnapshot, GeoRequirements, GeoSourceSet};
+
+    let mut cp = crate::control::tests::support::control_plane(Config::default());
+    cp.set_mode_state(Arc::new(parking_lot::RwLock::new(
+        crate::mode::ModeState::new("Rule", ""),
+    )));
+    cp.start_datapath_flags_coordinator().unwrap();
+    cp.initialize_datapath_flags(false, false).await.unwrap();
+    let mut config = honk_config::parser::parse_dae_config(
+        "routing {\n domain(geosite:lab) -> block\n fallback: direct\n }\n\
+         dns { routing { request {\n qname(geosite:lab) -> reject\n fallback: asis\n } } }",
+    )
+    .unwrap();
+    config.ensure_builtin_nodes();
+    let requirements = GeoRequirements::for_traffic(&config.routing.rules).union(
+        &crate::dns::routing::DnsRouter::geo_requirements(&config.dns),
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("geosite.dat");
+    let old = b"\x0a\x13\x0a\x03lab\x12\x0c\x08\x02\x12\x08old.test";
+    let new = b"\x0a\x13\x0a\x03lab\x12\x0c\x08\x02\x12\x08new.test";
+    let update = |bytes: &[u8]| SourceUpdate {
+        sources: Vec::new(),
+        dependencies: Vec::new(),
+        geo_sources: Some(
+            GeoSourceSet::from_assets(
+                &requirements,
+                vec![(
+                    GeoAssetSnapshot {
+                        kind: "geosite",
+                        path: Some(path.clone()),
+                        sha256: crate::configuration::digest(bytes),
+                        size_bytes: bytes.len() as u64,
+                        modified_at: None,
+                    },
+                    Arc::from(bytes),
+                )],
+            )
+            .unwrap(),
+        ),
+    };
+    let initial = update(old);
+    let replacement = update(new);
+    std::fs::write(&path, b"changed after capture").unwrap();
+    let mut authorizations = crate::subscription::SubscriptionAuthorizations::new(&[]).unwrap();
+    let drain = DrainTracker::new();
+    let applied = cp
+        .apply_sighup_config(
+            config.clone(),
+            Vec::new(),
+            &drain,
+            &mut authorizations,
+            Some(&initial),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(applied, ReloadOutcome::Committed { .. }));
+    let generation = applied.generation().unwrap();
+    assert_eq!(
+        cp.dns_controller
+            .forwarder()
+            .routing_snapshot()
+            .select_request("old.test", 1),
+        DnsRequestDecision::Reject,
+    );
+    assert_eq!(
+        cp.apply_sighup_config(
+            config.clone(),
+            Vec::new(),
+            &drain,
+            &mut authorizations,
+            Some(&initial),
+            None,
+        )
+        .await
+        .unwrap(),
+        ReloadOutcome::Noop { generation },
+    );
+    assert!(matches!(
+        cp.apply_sighup_config(
+            config.clone(),
+            Vec::new(),
+            &drain,
+            &mut authorizations,
+            Some(&replacement),
+            None,
+        )
+        .await
+        .unwrap(),
+        ReloadOutcome::Committed { .. },
+    ));
+    let live_assets = cp.router.read().await.geo_assets().to_vec();
+    assert_eq!(live_assets[0].sha256, crate::configuration::digest(new));
+    let service = crate::dns::DnsService::with_provider(cp.dns_controller.runtime_provider());
+    assert_eq!(service.geo_assets(), live_assets);
+    let dns_router = service.forwarder().routing_snapshot();
+    assert_eq!(
+        dns_router.select_request("new.test", 1),
+        DnsRequestDecision::Reject
+    );
+    assert_eq!(
+        dns_router.select_request("old.test", 1),
+        DnsRequestDecision::AsIs
+    );
+
+    config.global.tproxy_port += 1;
+    assert_eq!(
+        cp.apply_sighup_config(
+            config,
+            Vec::new(),
+            &drain,
+            &mut authorizations,
+            Some(&initial),
+            None,
+        )
+        .await
+        .unwrap(),
+        ReloadOutcome::Rejected,
+    );
+    assert_eq!(cp.router.read().await.geo_assets(), live_assets);
+    assert_eq!(service.geo_assets(), live_assets);
+    let provider = cp.dns_controller.runtime_provider();
+    provider.begin_pause();
+    provider.finish_pause().await.unwrap();
+    assert_eq!(service.geo_assets(), live_assets);
+}

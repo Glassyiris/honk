@@ -35,6 +35,9 @@ pub(super) use handoff::{TcpFlowKey, TcpFlowPins};
 
 mod context;
 
+#[cfg(feature = "native-api")]
+mod observation;
+
 pub(super) use context::{ConnectionGuard, ControlPlaneHandle};
 
 mod tcp;

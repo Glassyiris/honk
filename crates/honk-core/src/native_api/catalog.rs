@@ -285,14 +285,84 @@ fn health(observation: NativeHealthObservation) -> Value {
 }
 
 #[derive(serde::Serialize)]
+#[serde(untagged)]
+enum ProviderId {
+    Subscription(Uuid),
+    Inline(&'static str),
+}
+
+#[derive(serde::Serialize)]
 struct NodeRow<'a> {
     id: Uuid,
     name: &'a str,
     protocol: &'static str,
     subscription_tag: Option<&'a str>,
-    provider_id: Option<Uuid>,
+    provider_id: Option<ProviderId>,
     group_ids: Vec<&'a String>,
     health: Vec<Value>,
+}
+
+pub(super) fn is_inline_node(node: &honk_config::node::Node) -> bool {
+    node.subscription_id.is_none()
+        && !matches!(
+            node.protocol(),
+            honk_config::types::NodeProtocol::Direct | honk_config::types::NodeProtocol::Block
+        )
+}
+
+fn node_row<'a>(
+    node: &'a honk_config::node::Node,
+    config: &'a Config,
+    alive: &AliveDialerSet,
+    group_ids: Vec<&'a String>,
+) -> NodeRow<'a> {
+    NodeRow {
+        id: node.id,
+        name: &node.name,
+        protocol: node.protocol().as_str(),
+        subscription_tag: node
+            .subscription_id
+            .and_then(|id| {
+                config
+                    .subscriptions
+                    .iter()
+                    .find(|subscription| subscription.id == id)
+            })
+            .map(|subscription| subscription.name.as_str()),
+        provider_id: node
+            .subscription_id
+            .map(ProviderId::Subscription)
+            .or_else(|| is_inline_node(node).then_some(ProviderId::Inline("inline"))),
+        group_ids,
+        health: alive
+            .native_observations(node.id)
+            .into_iter()
+            .map(health)
+            .collect(),
+    }
+}
+
+pub(super) fn node_value(
+    config: &Config,
+    identity: &CatalogIdentity,
+    manager: &GroupManager,
+    alive: &AliveDialerSet,
+    node_id: Uuid,
+) -> Option<Value> {
+    let node = config.nodes.iter().find(|node| node.id == node_id)?;
+    let mut groups: Vec<_> = identity
+        .groups
+        .iter()
+        .filter_map(|(name, id)| {
+            manager
+                .native_members(name)
+                .any(|member| matches!(member, NativeGroupMember::Node(node) if node.id == node_id))
+                .then_some(id)
+        })
+        .collect();
+    groups.sort_unstable();
+    groups.dedup();
+    serde_json::to_value(node_row(node, config, alive, groups)).ok()
 }
 
 fn node_snapshot(
@@ -365,28 +435,7 @@ fn node_snapshot(
         let mut group_ids = membership.remove(&node.id).unwrap_or_default();
         group_ids.sort_unstable();
         group_ids.dedup();
-        let subscription_tag = node
-            .subscription_id
-            .and_then(|id| {
-                config
-                    .subscriptions
-                    .iter()
-                    .find(|subscription| subscription.id == id)
-            })
-            .map(|subscription| subscription.name.as_str());
-        let value = NodeRow {
-            id: node.id,
-            name: &node.name,
-            protocol: node.protocol().as_str(),
-            subscription_tag,
-            provider_id: node.subscription_id,
-            group_ids,
-            health: alive
-                .native_observations(node.id)
-                .into_iter()
-                .map(health)
-                .collect(),
-        };
+        let value = node_row(node, config, alive, group_ids);
         let mut writer = BoundedJson {
             bytes: Vec::new(),
             limit: MAX_SNAPSHOT_BYTES - snapshot.bytes,
@@ -595,6 +644,7 @@ pub(super) async fn groups(
     let revision = state
         .observation
         .configuration
+        .sources
         .revision()
         .unwrap_or_else(|| identity.revision.clone());
     let groups: Vec<_> = names
@@ -631,6 +681,7 @@ pub(super) async fn group(
     let revision = state
         .observation
         .configuration
+        .sources
         .revision()
         .unwrap_or_else(|| identity.revision.clone());
     let mut value = group_value(&manager, group, &identity, &state.alive_set, true);

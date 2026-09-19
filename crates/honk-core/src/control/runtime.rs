@@ -262,33 +262,23 @@ impl ControlPlane {
         match command {
             #[cfg(feature = "native-api")]
             ControlCommand::Suspend { reply } | ControlCommand::Resume { reply } => {
-                let _ = reply.send(Err(crate::native_api::ApiError::new(
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    crate::native_api::ErrorCode::TemporarilyUnavailable,
-                    "Listener lifecycle owner is unavailable",
-                    None,
-                )));
+                let _ = reply.send(Err(super::client::ControlError::Unavailable));
             }
-            #[cfg(feature = "native-api")]
+            #[cfg(all(feature = "native-api", feature = "clash-api"))]
             ControlCommand::SetRuntimeMode { request, reply } => {
                 let _reload = self.reload_lock.lock().await;
                 let config = self.config.read().await;
                 let result =
                     if let (Some(native), Some(flags)) = (&self.native, &self.datapath_flags) {
-                        crate::native_api::mode::apply(
+                        crate::mode::apply_mode_request(
                             &config,
-                            &native.catalog.snapshot(),
+                            &native.catalog.snapshot().groups,
                             flags,
                             request,
                         )
                         .await
                     } else {
-                        Err(crate::native_api::ApiError::new(
-                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                            crate::native_api::ErrorCode::TemporarilyUnavailable,
-                            "Native mode owner is unavailable",
-                            None,
-                        ))
+                        Err(super::client::ControlError::Unavailable)
                     };
                 let _ = reply.send(result);
             }
@@ -503,7 +493,7 @@ impl ControlPlane {
         .await;
         self.publish_phase(EnginePhase::Draining);
         drain.start_rejecting();
-        let shutdown = self.shutdown_datapath(&drain, &mut removals, None).await;
+        let shutdown = self.shutdown_datapath(&drain, &mut removals).await;
         let finalized = self.finalize_shutdown().await;
         result?;
         shutdown?;

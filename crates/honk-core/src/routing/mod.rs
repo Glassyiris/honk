@@ -14,6 +14,8 @@ mod lpm;
 
 #[cfg(feature = "native-api")]
 pub(crate) mod native;
+#[cfg(feature = "native-api")]
+pub(crate) use geo::GeoAssetSnapshot;
 pub(crate) use geo::{GeoAssets, GeoRequirements, GeoSourceSet};
 pub use ir::{CompiledCondition, CompiledPredicate, IpMatcher, PortRange};
 pub(crate) use lpm::BinaryLpmTrie;
@@ -336,18 +338,23 @@ struct CompiledRoutes {
     routes: Arc<[CompiledRoute]>,
     geo_fingerprint: [u8; 32],
     geo_requirements: GeoRequirements,
+    #[cfg(feature = "native-api")]
+    geo_assets: Arc<[GeoAssetSnapshot]>,
 }
 
 impl CompiledRoutes {
     fn new(
         routes: Vec<CompiledRoute>,
         geo_fingerprint: [u8; 32],
+        #[cfg(feature = "native-api")] geo_assets: Vec<GeoAssetSnapshot>,
         geo_requirements: GeoRequirements,
     ) -> Self {
         Self {
             routes: routes.into(),
             geo_fingerprint,
             geo_requirements,
+            #[cfg(feature = "native-api")]
+            geo_assets: geo_assets.into(),
         }
     }
 }
@@ -356,7 +363,13 @@ impl From<Vec<CompiledRoute>> for CompiledRoutes {
     fn from(routes: Vec<CompiledRoute>) -> Self {
         let requirements = GeoRequirements::default();
         let sources = GeoSourceSet::load(&requirements);
-        Self::new(routes, sources.fingerprint(), requirements)
+        Self::new(
+            routes,
+            sources.fingerprint(),
+            #[cfg(feature = "native-api")]
+            Vec::new(),
+            requirements,
+        )
     }
 }
 
@@ -434,7 +447,13 @@ impl Router {
         let policy_fingerprint =
             fingerprint::policy(&compiled, &registry.0, &default_outbound, geo_fingerprint);
         Ok(Self {
-            routes: CompiledRoutes::new(compiled, geo_fingerprint, requirements),
+            routes: CompiledRoutes::new(
+                compiled,
+                geo_fingerprint,
+                #[cfg(feature = "native-api")]
+                geo_sources.snapshots(&requirements),
+                requirements,
+            ),
             default_outbound: default_outbound.into(),
             domain_matchers: registry.0.into(),
             policy_fingerprint,
@@ -447,6 +466,11 @@ impl Router {
 
     pub(crate) fn geo_fingerprint(&self) -> [u8; 32] {
         self.routes.geo_fingerprint
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn geo_assets(&self) -> &[GeoAssetSnapshot] {
+        &self.routes.geo_assets
     }
 
     pub(crate) fn geo_requirements(&self) -> &GeoRequirements {

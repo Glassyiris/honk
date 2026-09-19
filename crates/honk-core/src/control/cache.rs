@@ -1,5 +1,24 @@
 use super::*;
 
+#[derive(Default)]
+pub(super) struct DelayWriter {
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl DelayWriter {
+    pub(super) async fn stop_and_join(&mut self) -> anyhow::Result<()> {
+        super::lifecycle::abort_and_join(&mut self.task).await
+    }
+}
+
+impl Drop for DelayWriter {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
 impl ControlPlane {
     /// Open the persistent cache database (sing-box `cache_file`), wire
     /// selector-choice persistence into the group manager, and restore
@@ -122,7 +141,7 @@ impl ControlPlane {
                     interval.tick().await;
                 }
             });
-            self.background_tasks.lock().await.push(delay_task);
+            self.delay_writer.task = Some(delay_task);
         }
 
         // store_dns: restore persisted DNS answers into the shared DNS
@@ -150,5 +169,78 @@ impl ControlPlane {
     /// Shared handle to the persistent cache database (clash API, etc.).
     pub fn cache_db(&self) -> Option<Arc<crate::cachedb::CacheDb>> {
         self.cache_db.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::tests::support::{canonical_socks5, control_plane};
+    use honk_outbound::alive::{IpVersion, ProbeDomain};
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_failure_and_drop_stop_delay_persistence() -> anyhow::Result<()> {
+        for fail_startup in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let occupied = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let node = canonical_socks5("cache-peer", "127.0.0.1", 9, None);
+            let node_id = node.id;
+            let mut config = Config::default();
+            config.ensure_builtin_nodes();
+            config.nodes.push(node);
+            config.dns.bind = format!("tcp://{}", occupied.local_addr()?);
+            config.experimental.cache_file.enabled = true;
+            config.experimental.cache_file.path = directory
+                .path()
+                .join("cache.db")
+                .to_string_lossy()
+                .into_owned();
+            let mut plane = control_plane(config);
+            plane.init_cache_db(None).await;
+            let db = plane.cache_db().unwrap();
+            let alive = plane.alive_set();
+            let record = |delay| {
+                alive.record_probe_latency(
+                    node_id,
+                    ProbeDomain::Tcp,
+                    IpVersion::V4,
+                    Duration::from_millis(delay),
+                );
+            };
+            let persisted = || {
+                db.load_delay_samples(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    24 * 3600,
+                )
+                .into_iter()
+                .find(|(name, _, _)| name == "cache-peer")
+                .map(|(_, delay, _)| delay)
+            };
+            record(13);
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while persisted() != Some(13) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await?;
+            if fail_startup {
+                plane.run().await.expect_err("occupied DNS listener");
+            } else {
+                drop(plane);
+            }
+            record(29);
+            tokio::time::advance(Duration::from_secs(120)).await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert_eq!(
+                persisted(),
+                Some(13),
+                "stopped cache writer must not snapshot again"
+            );
+        }
+        Ok(())
     }
 }

@@ -1,5 +1,7 @@
 //! Offline admission consumes captured bytes; it never starts runtime owners.
 
+mod admission;
+
 use std::fs::{self, File};
 use std::io::{self, Read as _};
 use std::os::fd::AsRawFd as _;
@@ -13,6 +15,7 @@ use honk_config::diagnostic::{
 use honk_config::error::{DetailedConfigError, ErrorCategory};
 use honk_config::parser::{LoadedConfig, SourceLimits, SourceSnapshot};
 
+use crate::configuration::{DependencyReader, DependencySnapshot};
 use crate::control::ControlPlane;
 use crate::dns::forwarder::HostsSourceSet;
 use crate::dns::policy::PolicyId;
@@ -20,69 +23,77 @@ use crate::dns::routing::DnsRouter;
 use crate::routing::{GeoRequirements, GeoSourceSet, Router};
 use crate::subscription::{SubscriptionStore, parse_subscription_content_with_diagnostics};
 
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct DependencySnapshot {
-    pub(crate) path: PathBuf,
-    pub(crate) sha256: String,
-    pub(crate) bytes: usize,
-    /// A standard runtime asset (geodata) rather than an operator source: it is
-    /// still hashed for conflict detection but never counts toward the source
-    /// budget, which bounds what an administrator may submit, not what the
-    /// engine already loads.
-    pub(crate) asset: bool,
-}
-
 /// Upper bound for one standard asset read during offline validation. A
 /// `geoip.dat` is tens of megabytes; this only guards against a runaway file.
-const MAX_ASSET_BYTES: usize = 256 * 1024 * 1024;
-
-impl std::fmt::Debug for DependencySnapshot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DependencySnapshot")
-            .field("bytes", &self.bytes)
-            .finish_non_exhaustive()
-    }
-}
+pub(crate) const MAX_ASSET_BYTES: usize = 256 * 1024 * 1024;
 
 pub(crate) struct ValidatedConfig {
     pub(crate) config: Config,
     pub(crate) sources: Vec<SourceSnapshot>,
     pub(crate) dependencies: Vec<DependencySnapshot>,
+    pub(crate) geo_sources: Option<GeoSourceSet>,
+    ech_paths: Vec<String>,
 }
 
-pub(crate) fn validate(
-    loaded: LoadedConfig,
-    active: &Config,
-    limits: SourceLimits,
-    diagnostics: &mut Vec<DetailedDiagnostic>,
-) -> Result<ValidatedConfig, DetailedConfigError> {
-    validate_with_data_dir(
-        loaded,
-        active,
-        honk_config::paths::data_dir(),
-        limits,
-        diagnostics,
-    )
+pub(crate) struct CapturedConfig {
+    config: Config,
+    pub(crate) sources: Vec<SourceSnapshot>,
+    pub(crate) dependencies: Vec<DependencySnapshot>,
+    geo: GeoSourceSet,
+    retain_geo: bool,
+    hosts: HostsSourceSet,
+    ech_paths: Vec<String>,
 }
 
-fn validate_with_data_dir(
+pub(crate) fn capture_for_coordinator(
     loaded: LoadedConfig,
     active: &Config,
     data_dir: &Path,
     limits: SourceLimits,
     diagnostics: &mut Vec<DetailedDiagnostic>,
-) -> Result<ValidatedConfig, DetailedConfigError> {
-    let result = validate_inner(loaded, active, data_dir, limits, diagnostics);
+    deferred: &[honk_config::subscription::Subscription],
+    geo: Option<&GeoSourceSet>,
+) -> Result<CapturedConfig, DetailedConfigError> {
+    let result = capture_inner(loaded, active, data_dir, limits, diagnostics, geo, deferred);
     finish_attempt(result, diagnostics)
 }
 
-fn validate_inner(
+pub(crate) fn validate_for_coordinator(
+    loaded: LoadedConfig,
+    active: &Config,
+    data_dir: &Path,
+    limits: SourceLimits,
+    diagnostics: &mut Vec<DetailedDiagnostic>,
+    deferred: &[honk_config::subscription::Subscription],
+    geo: Option<&GeoSourceSet>,
+) -> Result<ValidatedConfig, DetailedConfigError> {
+    let result = capture_inner(loaded, active, data_dir, limits, diagnostics, geo, deferred)
+        .and_then(CapturedConfig::validate);
+    finish_attempt(result, diagnostics)
+}
+
+#[cfg(test)]
+pub(crate) fn validate_with_data_dir(
     loaded: LoadedConfig,
     active: &Config,
     data_dir: &Path,
     limits: SourceLimits,
     diagnostics: &mut Vec<DetailedDiagnostic>,
 ) -> Result<ValidatedConfig, DetailedConfigError> {
+    let result = capture_inner(loaded, active, data_dir, limits, diagnostics, None, &[])
+        .and_then(CapturedConfig::validate);
+    finish_attempt(result, diagnostics)
+}
+
+fn capture_inner(
+    loaded: LoadedConfig,
+    active: &Config,
+    data_dir: &Path,
+    limits: SourceLimits,
+    diagnostics: &mut Vec<DetailedDiagnostic>,
+    geo_override: Option<&GeoSourceSet>,
+    deferred: &[honk_config::subscription::Subscription],
+) -> Result<CapturedConfig, DetailedConfigError> {
     let LoadedConfig {
         mut config,
         sources,
@@ -126,6 +137,11 @@ fn validate_inner(
             .enumerate()
             .filter(|(_, sub)| sub.enabled)
         {
+            if deferred.iter().any(|owner| {
+                crate::subscription::same_subscription_source_spec(owner, subscription)
+            }) {
+                continue;
+            }
             let cached = match store.as_ref().map(|store| store.open_cached(subscription)) {
                 Some(Ok(file)) => Some(file),
                 Some(Err(cause)) if cause.kind() != io::ErrorKind::NotFound => {
@@ -147,7 +163,7 @@ fn validate_inner(
                 continue;
             };
             let contents = capture
-                .file(cached, true, false)
+                .file(cached, true, false, DependencyReader::Subscription(index))
                 .map_err(|cause| dependency_error(source, "subscription", cause))?;
             let contents = std::str::from_utf8(&contents).map_err(|_| {
                 error(
@@ -191,20 +207,36 @@ fn validate_inner(
     let dns_requirements = DnsRouter::geo_requirements(&config.dns);
     let requirements = GeoRequirements::for_traffic(&config.routing.rules).union(&dns_requirements);
     let data_dir = capture.data_dir.clone();
-    let geo =
-        GeoSourceSet::load_captured(&requirements, &data_dir, |path| capture.path(path, true))
-            .map_err(|cause| dependency_error(source, "routing", cause))?;
-    let hosts = HostsSourceSet::load_captured(&config.dns, |path| capture.text(path))
-        .map_err(|cause| dependency_error(source, "dns", cause))?
-        .parse()
-        .map_err(|cause| dependency_error(source, "dns", cause))?;
+    let geo = match geo_override {
+        Some(geo) => geo.clone(),
+        None => GeoSourceSet::capture_for_admission(&requirements, &data_dir, |kind, path| {
+            capture.path(path, true, DependencyReader::Geo(kind))
+        })
+        .map_err(|cause| dependency_error(source, "routing", cause))?,
+    };
+    let mut dependencies = if geo_override.is_some() {
+        geo_dependencies(&geo, &requirements)
+            .map_err(|cause| dependency_error(source, "routing", cause))?
+    } else {
+        Vec::new()
+    };
+    let mut host_index = 0;
+    let hosts = HostsSourceSet::load_captured(&config.dns, |path| {
+        let reader = DependencyReader::Hosts(host_index, path.to_owned());
+        host_index += 1;
+        capture.text(path, reader)
+    })
+    .map_err(|cause| dependency_error(source, "dns", cause))?;
+    let mut ech_paths = Vec::new();
     for node in &config.nodes {
         if node
             .tls()
             .is_some_and(|tls| tls.enabled || !tls.alpn.is_empty())
         {
             honk_outbound::tls::validate_connector_config_with_ech_reader(node, |path| {
-                capture.text(path).map_err(anyhow::Error::new)
+                let reader = DependencyReader::Ech(ech_paths.len(), path.to_owned());
+                ech_paths.push(path.to_owned());
+                capture.text(path, reader).map_err(anyhow::Error::new)
             })
             .map_err(|cause| {
                 if let Some(io) = cause
@@ -223,57 +255,44 @@ fn validate_inner(
             })?;
         }
     }
-    let router = Router::new_with_geo_sources(
-        &config.routing.rules,
-        &config.routing.default_outbound,
-        &geo,
-    )
-    .map_err(|_| {
-        error(
-            source,
-            "routing",
-            "invalid-routing-config",
-            "routing configuration cannot be compiled",
-        )
-    })?;
-    ControlPlane::compile_routing_plan(&config, &router).map_err(|_| {
-        error(
-            source,
-            "routing",
-            "invalid-routing-config",
-            "routing configuration cannot be compiled",
-        )
-    })?;
-    DnsRouter::new_with_geo_sources(&config.dns, &geo).map_err(|_| {
-        error(
-            source,
-            "dns",
-            "invalid-dns-config",
-            "DNS routing configuration cannot be compiled",
-        )
-    })?;
-    PolicyId::from_config_with_artifacts(
-        &config.dns,
-        &hosts.fingerprint(),
-        &geo.fingerprint_for(&dns_requirements),
-    )
-    .map_err(|_| {
-        error(
-            source,
-            "dns",
-            "invalid-dns-config",
-            "DNS policy configuration is invalid",
-        )
-    })?;
-    Ok(ValidatedConfig {
+    dependencies.extend(capture.files.into_iter().map(|(snapshot, _)| snapshot));
+    dependencies.sort_unstable();
+    Ok(CapturedConfig {
         config,
         sources,
-        dependencies: capture
-            .files
-            .into_iter()
-            .map(|(snapshot, _)| snapshot)
-            .collect(),
+        geo,
+        retain_geo: geo_override.is_some(),
+        hosts,
+        ech_paths,
+        dependencies,
     })
+}
+
+fn geo_dependencies(
+    geo: &GeoSourceSet,
+    requirements: &GeoRequirements,
+) -> io::Result<Vec<DependencySnapshot>> {
+    let mut dependencies: Vec<DependencySnapshot> = Vec::new();
+    for snapshot in geo.snapshots(requirements) {
+        let path = fs::canonicalize(snapshot.path.ok_or(io::ErrorKind::InvalidData)?)?;
+        let reader = DependencyReader::Geo(snapshot.kind);
+        if let Some(dependency) = dependencies.iter_mut().find(|dependency| {
+            dependency.path == path
+                && dependency.sha256 == snapshot.sha256
+                && dependency.bytes == snapshot.size_bytes as usize
+        }) {
+            dependency.readers.push(reader);
+        } else {
+            dependencies.push(DependencySnapshot {
+                path,
+                sha256: snapshot.sha256,
+                bytes: snapshot.size_bytes as usize,
+                asset: true,
+                readers: vec![reader],
+            });
+        }
+    }
+    Ok(dependencies)
 }
 
 fn error(
@@ -400,9 +419,9 @@ impl Capture {
         })
     }
 
-    fn text(&mut self, path: &str) -> io::Result<String> {
+    fn text(&mut self, path: &str, reader: DependencyReader) -> io::Result<String> {
         let path = honk_config::paths::resolve_dependency_path_from(path, &self.data_dir);
-        let bytes = self.path(&path, false)?;
+        let bytes = self.path(&path, false, reader)?;
         String::from_utf8(bytes.to_vec()).map_err(|_| io::ErrorKind::InvalidData.into())
     }
 
@@ -414,7 +433,12 @@ impl Capture {
                 .any(|allowed| path == allowed)
     }
 
-    fn path(&mut self, path: &Path, standard: bool) -> io::Result<Arc<[u8]>> {
+    fn path(
+        &mut self,
+        path: &Path,
+        standard: bool,
+        reader: DependencyReader,
+    ) -> io::Result<Arc<[u8]>> {
         let canonical = fs::canonicalize(path)?;
         if !standard && !self.authorized(&canonical) {
             return Err(io::ErrorKind::PermissionDenied.into());
@@ -428,10 +452,16 @@ impl Capture {
             nix::sys::stat::Mode::empty(),
         )
         .map_err(io::Error::from)?;
-        self.file(File::from(descriptor), standard, standard)
+        self.file(File::from(descriptor), standard, standard, reader)
     }
 
-    fn file(&mut self, file: File, trusted: bool, asset: bool) -> io::Result<Arc<[u8]>> {
+    fn file(
+        &mut self,
+        file: File,
+        trusted: bool,
+        asset: bool,
+        reader: DependencyReader,
+    ) -> io::Result<Arc<[u8]>> {
         let path = fs::canonicalize(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
         if !trusted && !self.authorized(&path) {
             return Err(io::ErrorKind::PermissionDenied.into());
@@ -439,12 +469,13 @@ impl Capture {
         if !asset && self.source_count >= self.limits.max_sources {
             return Err(io::ErrorKind::QuotaExceeded.into());
         }
-        if let Some((_, bytes)) = self
+        if let Some((snapshot, bytes)) = self
             .files
-            .iter()
-            .find(|(snapshot, _)| snapshot.path == path)
+            .iter_mut()
+            .find(|(snapshot, _)| snapshot.path == path && snapshot.asset == asset)
         {
             if asset {
+                snapshot.readers.push(reader);
                 return Ok(Arc::clone(bytes));
             }
             if bytes.len() > self.limits.max_bytes - self.bytes {
@@ -453,6 +484,7 @@ impl Capture {
             // Each reference can materialize another hosts body or provider node set.
             self.source_count += 1;
             self.bytes += bytes.len();
+            snapshot.readers.push(reader);
             return Ok(Arc::clone(bytes));
         }
         let metadata = file.metadata()?;
@@ -476,9 +508,10 @@ impl Capture {
         }
         let snapshot = DependencySnapshot {
             path,
-            sha256: super::config::digest(&bytes),
+            sha256: crate::configuration::digest(&bytes),
             bytes: bytes.len(),
             asset,
+            readers: vec![reader],
         };
         if !asset {
             self.bytes += bytes.len();

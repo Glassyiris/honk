@@ -543,3 +543,45 @@ async fn events_describe_only_accepted_transitions_in_order() {
     }
     assert!(stream.next().now_or_never().is_none());
 }
+
+#[tokio::test]
+async fn geodata_replay_precedes_exclusivity_and_capacity() {
+    let store = store();
+    let geodata = |key| {
+        store.reserve(
+            "owner",
+            "POST",
+            "/api/v1/geodata/update",
+            Some(key),
+            b"",
+            OperationKind::GeodataUpdate,
+        )
+    };
+    let first = geodata("first").unwrap();
+    let replay = geodata("first").unwrap();
+    assert_eq!(first.id, replay.id);
+    assert!(!replay.fresh);
+    let error = geodata("other").err().unwrap();
+    assert_error(error, StatusCode::CONFLICT, "state_conflict").await;
+    store.accept(&first.id);
+    store.running(&first.id);
+    let mut retained = Vec::new();
+    for index in 1..MAX_OPERATIONS {
+        retained.push(reserve(&store, &format!("reload-{index}")));
+    }
+    assert_eq!(geodata("first").unwrap().id, first.id);
+    assert_error(
+        geodata("other").err().unwrap(),
+        StatusCode::CONFLICT,
+        "state_conflict",
+    )
+    .await;
+    store.fail(&first.id, "download_failed", "Download failed", None);
+    assert_eq!(geodata("first").unwrap().id, first.id);
+    assert_error(
+        geodata("other").err().unwrap(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "temporarily_unavailable",
+    )
+    .await;
+}

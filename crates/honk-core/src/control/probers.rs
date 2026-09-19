@@ -225,11 +225,11 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 )))
                 .await;
             let Some(warm) = warm else {
-                close_ephemeral(ephemeral, &runtime, &cancel).await;
+                close_ephemeral(ephemeral, &cancel).await;
                 return honk_outbound::alive::HttpProbeResult::Cancelled.into();
             };
             if let Err(error) = warm {
-                close_ephemeral(ephemeral, &runtime, &cancel).await;
+                close_ephemeral(ephemeral, &cancel).await;
                 if let Some(rejection) = honk_outbound::proxy::packet_rejection(&error) {
                     return honk_outbound::alive::HttpProbeResult::LocalRefusal(rejection).into();
                 }
@@ -260,7 +260,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 )))
                 .await;
             let Some(result) = result else {
-                close_ephemeral(ephemeral, &runtime, &cancel).await;
+                close_ephemeral(ephemeral, &cancel).await;
                 return honk_outbound::alive::HttpProbeResult::Cancelled.into();
             };
             let observation = if result
@@ -280,7 +280,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                     ),
                 ))
             };
-            close_ephemeral(ephemeral, &runtime, &cancel).await;
+            close_ephemeral(ephemeral, &cancel).await;
             let result = match result {
                 Ok(sample) => honk_outbound::alive::HttpProbeResult::WarmSuccess(sample.latency),
                 Err(error) => {
@@ -301,14 +301,12 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
 
 async fn close_ephemeral(
     guard: Option<honk_outbound::runtime::EphemeralRuntimeGuard>,
-    runtime: &honk_outbound::runtime::NodeRuntime,
     cancel: &honk_outbound::alive::ProbeCancellation,
 ) {
-    if let Some(guard) = guard {
-        guard.close().await;
-        if runtime.tasks_failed() {
-            cancel.report_cleanup_failure();
-        }
+    if let Some(mut guard) = guard
+        && guard.close().await.is_err()
+    {
+        cancel.report_cleanup_failure();
     }
 }
 
@@ -662,7 +660,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             if ephemeral.is_none() && (dns.is_some() || (data_attempted && data_path.is_some())) {
                 stats.mark_warm(node.id, crate::stats::WarmReason::Health);
             }
-            close_ephemeral(ephemeral, &runtime, &cancel).await;
+            close_ephemeral(ephemeral, &cancel).await;
             honk_outbound::alive::UdpProbeOutcome {
                 dns,
                 data_path,

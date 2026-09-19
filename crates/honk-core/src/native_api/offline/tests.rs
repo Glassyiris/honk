@@ -151,12 +151,9 @@ fn hosts_admission_charges_each_materialized_reference() {
     let admitted = admit_with_limits(loaded.clone(), &active, exact).unwrap();
     assert_eq!(
         admitted.dependencies,
-        vec![DependencySnapshot {
-            path: fs::canonicalize(&hosts).unwrap(),
-            bytes: body.len(),
-            sha256: crate::native_api::config::digest(body.as_bytes()),
-            asset: false,
-        }]
+        admitted
+            .recapture_dependencies(&active, Path::new(&active.global.data_dir), exact, &[],)
+            .unwrap()
     );
     let short = SourceLimits {
         max_bytes: size - 1,
@@ -189,6 +186,46 @@ fn hosts_admission_charges_each_materialized_reference() {
     assert_eq!(
         admit(loaded, &active).err().unwrap().diagnostic.code,
         "missing-offline-dependency"
+    );
+}
+
+#[test]
+fn revalidation_binds_ordered_host_aliases_to_their_targets() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first.rules");
+    let last = temp.path().join("last.rules");
+    fs::write(&first, "full:shared.test 192.0.2.1\n").unwrap();
+    fs::write(&last, "full:shared.test 192.0.2.2\n").unwrap();
+    let first_reader = temp.path().join("first-reader");
+    let last_reader = temp.path().join("last-reader");
+    std::os::unix::fs::symlink(&first, &first_reader).unwrap();
+    std::os::unix::fs::symlink(&last, &last_reader).unwrap();
+    let loaded = fixture(
+        temp.path(),
+        &format!(
+            "dns {{ use_host: '{}'\n use_host: '{}' }}",
+            first_reader.display(),
+            last_reader.display(),
+        ),
+    );
+    let active = loaded.config.clone();
+    let data_dir = Path::new(&active.global.data_dir);
+    let admitted = admit(loaded, &active).unwrap();
+    assert_eq!(
+        admitted.dependencies,
+        admitted
+            .recapture_dependencies(&active, data_dir, SourceLimits::default(), &[])
+            .unwrap()
+    );
+    fs::remove_file(&first_reader).unwrap();
+    fs::remove_file(&last_reader).unwrap();
+    std::os::unix::fs::symlink(&last, &first_reader).unwrap();
+    std::os::unix::fs::symlink(&first, &last_reader).unwrap();
+    assert_ne!(
+        admitted.dependencies,
+        admitted
+            .recapture_dependencies(&active, data_dir, SourceLimits::default(), &[])
+            .unwrap()
     );
 }
 
@@ -266,7 +303,7 @@ fn geodata_assets_are_hashed_but_stay_outside_the_source_budget() {
         .find(|dependency| dependency.asset)
         .expect("geoip.dat is a recorded dependency");
     assert_eq!(asset.bytes, dat.len());
-    assert_eq!(asset.sha256, crate::native_api::config::digest(&dat));
+    assert_eq!(asset.sha256, crate::configuration::digest(&dat));
     // The source budget itself still applies.
     let short = SourceLimits {
         max_bytes: source_bytes - 1,
@@ -328,8 +365,11 @@ fn repeated_aliases_cannot_retain_bodies_beyond_byte_or_source_limits() {
         )
         .unwrap();
         let mut retained_bytes = 0;
+        let mut index = 0;
         let result = HostsSourceSet::load_captured(&loaded.config.dns, |path| {
-            let text = capture.text(path)?;
+            let reader = DependencyReader::Hosts(index, path.to_owned());
+            index += 1;
+            let text = capture.text(path, reader)?;
             retained_bytes += text.len();
             Ok::<_, io::Error>(text)
         });
@@ -396,10 +436,33 @@ fn ech_is_bounded_and_inline_material_wins_without_opening_a_file() {
     fs::write(&ech, "AA==\n").unwrap();
     let admitted = admit(loaded.clone(), &active).unwrap();
     assert_eq!(admitted.dependencies[0].bytes, 5);
+    assert_eq!(
+        admitted.dependencies,
+        admitted
+            .recapture_dependencies(
+                &active,
+                Path::new(&active.global.data_dir),
+                SourceLimits::default(),
+                &[],
+            )
+            .unwrap()
+    );
     fs::remove_file(&ech).unwrap();
     loaded.config.nodes[0].tls_mut().unwrap().ech_config = Some("AA==".into());
     loaded.config.nodes[0].id = loaded.config.nodes[0].derive_id();
-    assert!(admit(loaded, &active).unwrap().dependencies.is_empty());
+    let admitted = admit(loaded, &active).unwrap();
+    assert!(admitted.dependencies.is_empty());
+    assert!(
+        admitted
+            .recapture_dependencies(
+                &active,
+                Path::new(&active.global.data_dir),
+                SourceLimits::default(),
+                &[],
+            )
+            .unwrap()
+            .is_empty()
+    );
 }
 
 fn cache_body(
@@ -463,6 +526,17 @@ fn cached_subscriptions_remain_inside_source_budgets() {
             .iter()
             .any(|node| node.name == "cached")
     );
+    assert_eq!(
+        admitted.dependencies,
+        admitted
+            .recapture_dependencies(
+                &loaded.config,
+                Path::new(&loaded.config.global.data_dir),
+                exact,
+                &[],
+            )
+            .unwrap()
+    );
     for (limits, code) in [
         (
             SourceLimits {
@@ -509,6 +583,7 @@ fn cached_presence_and_rebased_active_semantics_are_both_required() {
     .unwrap();
     active.nodes[0].tls_mut().unwrap().pin_sha256 = Some("invalid-pin".into());
     active.nodes[0].id = active.nodes[0].derive_id();
+    loaded.config.subscriptions[0].id = uuid::Uuid::new_v4();
     let cache = cache_body(
         Path::new(&active.global.data_dir),
         &subscription,
@@ -550,6 +625,18 @@ fn cached_presence_and_rebased_active_semantics_are_both_required() {
     assert_eq!(
         admitted.dependencies[0].path,
         fs::canonicalize(&cache).unwrap()
+    );
+    assert_eq!(
+        admitted
+            .recapture_dependencies(
+                &active,
+                Path::new(&active.global.data_dir),
+                SourceLimits::default(),
+                &[],
+            )
+            .unwrap(),
+        admitted.dependencies,
+        "unchanged cached input must survive subscription identity rebasing",
     );
     assert_eq!(
         fs::metadata(cache.parent().unwrap())
@@ -596,10 +683,62 @@ fn revalidation_detects_a_new_higher_priority_dependency() {
         .hosts
         .push(relative.to_string_lossy().into_owned());
     let active = loaded.config.clone();
-    let old = admit(loaded.clone(), &active).unwrap();
+    let old = admit(loaded, &active).unwrap();
     fs::create_dir_all(higher.parent().unwrap()).unwrap();
     fs::write(&higher, "full:new.test 192.0.2.2\n").unwrap();
-    let new = admit(loaded, &active).unwrap();
-    assert_ne!(old.dependencies, new.dependencies);
-    assert_eq!(new.dependencies[0].path, fs::canonicalize(higher).unwrap());
+    let dependencies = old
+        .recapture_dependencies(&active, &data_dir, SourceLimits::default(), &[])
+        .unwrap();
+    assert_ne!(old.dependencies, dependencies);
+    assert_eq!(dependencies[0].path, fs::canonicalize(higher).unwrap());
+}
+
+#[test]
+fn geodata_overlay_compiles_and_retains_verified_bytes_instead_of_disk() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut loaded = fixture(directory.path(), "");
+    loaded.config.routing = honk_config::parser::parse_dae_config_with_detailed_diagnostics(
+        "routing { dip(geoip: lab) -> block\n fallback: direct }",
+        &mut Vec::new(),
+    )
+    .unwrap()
+    .routing;
+    let active = loaded.config.clone();
+    let data_dir = Path::new(&active.global.data_dir);
+    fs::create_dir_all(data_dir).unwrap();
+    let path = data_dir.join("geoip.dat");
+    fs::write(&path, b"invalid live disk").unwrap();
+    let requirements = GeoRequirements::for_traffic(&active.routing.rules);
+    let bytes = geoip_dat("lab", 2);
+    let expected = crate::routing::GeoAssetSnapshot {
+        kind: "geoip",
+        path: Some(path),
+        sha256: crate::configuration::digest(&bytes),
+        size_bytes: bytes.len() as u64,
+        modified_at: None,
+    };
+    let geo =
+        GeoSourceSet::from_assets(&requirements, vec![(expected.clone(), bytes.into())]).unwrap();
+    assert!(admit(loaded.clone(), &active).is_err());
+    let admitted = validate_for_coordinator(
+        loaded,
+        &active,
+        data_dir,
+        SourceLimits::default(),
+        &mut Vec::new(),
+        &[],
+        Some(&geo),
+    )
+    .unwrap();
+    assert_eq!(admitted.dependencies[0].sha256, expected.sha256);
+    assert_eq!(
+        admitted.dependencies,
+        admitted
+            .recapture_dependencies(&active, data_dir, SourceLimits::default(), &[])
+            .unwrap()
+    );
+    assert_eq!(
+        admitted.geo_sources.unwrap().snapshots(&requirements),
+        vec![expected]
+    );
 }

@@ -30,7 +30,9 @@ impl TaskScope {
         }
     }
 
-    pub(crate) fn spawn<F>(&self, future: F) -> Option<tokio::task::AbortHandle>
+    /// Spawn in the captured runtime owner. Closed, expired, or full owners
+    /// refuse with `None`; without an owner, this is an ordinary Tokio task.
+    pub fn spawn<F>(&self, future: F) -> Option<tokio::task::AbortHandle>
     where
         F: Future<Output = ()> + Send + 'static,
     {

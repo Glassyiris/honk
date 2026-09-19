@@ -219,15 +219,22 @@ async fn authentication_precedes_capability_and_query_validation() {
         config.experimental.native_api.allow_anonymous_loopback = true;
     })
     .await;
-    for path in [
-        "/api",
-        "/api/v1/version",
-        "/api/v1/capabilities",
-        "/api/v1/config",
-        "/api/v1/missing",
+    for (method, path) in [
+        (Method::GET, "/api"),
+        (Method::GET, "/api/v1/version"),
+        (Method::GET, "/api/v1/capabilities"),
+        (Method::GET, "/api/v1/config"),
+        (Method::GET, "/api/v1/missing"),
+        (Method::GET, "/api/v1/runtime?unknown=x"),
+        (Method::GET, "/api/v1/runtime/mode?unknown=x"),
+        (Method::POST, "/api/v1/runtime"),
     ] {
         error_response(
-            app.client.get(app.url(path)).send().await.unwrap(),
+            app.client
+                .request(method, app.url(path))
+                .send()
+                .await
+                .unwrap(),
             StatusCode::UNAUTHORIZED,
             "authentication_required",
         )
@@ -489,7 +496,14 @@ async fn preflight_uses_route_methods_but_never_grants_authorization() {
                 "authorization, Content-Type",
             )
     };
-    for (path, method) in [("/api", "GET"), ("/api/v1/connections", "DELETE")] {
+    for (path, method) in [
+        ("/api", "GET"),
+        ("/api", "HEAD"),
+        ("/api/v1/connections", "DELETE"),
+        ("/api/v1/providers/raw%2Fid/refresh", "POST"),
+        ("/api/v1/dns/cache/flush", "POST"),
+        ("/api/v1/runtime/mode", "PUT"),
+    ] {
         let response = preflight(path, method).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         api_headers(&response);
@@ -518,7 +532,12 @@ async fn preflight_uses_route_methods_but_never_grants_authorization() {
         "authentication_required",
     )
     .await;
-    for (path, method) in [("/api", "PUT"), ("/api/v1/missing", "GET")] {
+    for (path, method) in [
+        ("/api", "PUT"),
+        ("/api/v1/missing", "GET"),
+        ("/api/v1/dns/cache/flush", "DELETE"),
+        ("/api/v1/dns/cache/%66lush", "POST"),
+    ] {
         error_response(
             preflight(path, method).send().await.unwrap(),
             StatusCode::NOT_FOUND,
@@ -605,6 +624,10 @@ async fn disabled_actions_unknown_resources_and_methods_are_distinct_json_errors
         ("/api/v1/runtime/mode", StatusCode::NOT_FOUND),
         ("/api/v1/missing", StatusCode::NOT_FOUND),
     ] {
+        let get = app.get(path).send().await.unwrap();
+        assert_eq!(get.status(), status);
+        let content_type = get.headers()["content-type"].clone();
+        let length = get.bytes().await.unwrap().len().to_string();
         let response = app
             .client
             .head(app.url(path))
@@ -614,6 +637,8 @@ async fn disabled_actions_unknown_resources_and_methods_are_distinct_json_errors
             .unwrap();
         assert_eq!(response.status(), status);
         api_headers(&response);
+        assert_eq!(response.headers()["content-type"], content_type);
+        assert_eq!(response.headers()["content-length"], length);
         assert!(response.bytes().await.unwrap().is_empty());
     }
     let ui = app.client.get(app.url("/ui/")).send().await.unwrap();
@@ -623,6 +648,41 @@ async fn disabled_actions_unknown_resources_and_methods_are_distinct_json_errors
             .get("content-type")
             .is_some_and(|value| value.to_str().unwrap().starts_with("text/html"))
     );
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn encoded_resource_segments_are_not_decoded_into_other_ids() {
+    let app = TestApp::new(|config| {
+        config.groups.push(honk_config::node::Group {
+            name: "route-identity".into(),
+            ..Default::default()
+        });
+    })
+    .await;
+    let groups = response_json(app.get("/api/v1/groups").send().await.unwrap()).await;
+    let group_id = groups[0]["id"].as_str().unwrap();
+    response_json(
+        app.get(&format!("/api/v1/groups/{group_id}"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    let encoded_id = format!("%{:02X}{}", group_id.as_bytes()[0], &group_id[1..]);
+    for path in [
+        format!("/api/v1/groups/{encoded_id}"),
+        "/api/v1/groups/raw%2Fid".into(),
+        "/api/v1/groups/%FF".into(),
+        "/api/v1/%76ersion".into(),
+    ] {
+        error_response(
+            app.get(&path).send().await.unwrap(),
+            StatusCode::NOT_FOUND,
+            "resource_not_found",
+        )
+        .await;
+    }
     app.shutdown().await;
 }
 

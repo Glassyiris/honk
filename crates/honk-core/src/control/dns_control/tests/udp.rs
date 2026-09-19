@@ -141,13 +141,14 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
 
     let outcome = controller
         .dns_service()
-        .resolve_outcome_with_runtime(
+        .resolve_client_outcome_with_runtime(
             &runtime,
             &query,
             DnsRequestMeta::EMPTY,
             IngressProfile::Udp {
                 advertised_size: 1232,
             },
+            None,
         )
         .await
         .expect("truncated outcome");

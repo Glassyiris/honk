@@ -43,6 +43,14 @@ pub(crate) struct SourceFile {
 
 impl SourceFile {
     pub(crate) fn open(path: &Path, max_bytes: usize) -> Result<Self, WriteError> {
+        Self::open_inner(path, max_bytes, true)
+    }
+
+    pub(crate) fn open_binary(path: &Path, max_bytes: usize) -> Result<Self, WriteError> {
+        Self::open_inner(path, max_bytes, false)
+    }
+
+    fn open_inner(path: &Path, max_bytes: usize, text: bool) -> Result<Self, WriteError> {
         let path = std::path::absolute(path).map_err(|_| WriteError::Unavailable)?;
         let parent_path = path.parent().ok_or(WriteError::UnsafePath)?.to_owned();
         let filename = path.file_name().ok_or(WriteError::UnsafePath)?.to_owned();
@@ -57,8 +65,10 @@ impl SourceFile {
         if bytes.len() > max_bytes {
             return Err(WriteError::TooLarge);
         }
-        let content = String::from_utf8(bytes).map_err(|_| WriteError::InvalidUtf8)?;
-        if metadata.len() != content.len() as u64
+        if text && std::str::from_utf8(&bytes).is_err() {
+            return Err(WriteError::InvalidUtf8);
+        }
+        if metadata.len() != bytes.len() as u64
             || !same_version(
                 &metadata,
                 &file.metadata().map_err(|_| WriteError::Unavailable)?,
@@ -66,7 +76,7 @@ impl SourceFile {
         {
             return Err(WriteError::Conflict);
         }
-        let hash = super::config::digest(content.as_bytes());
+        let hash = crate::configuration::digest(&bytes);
         Ok(Self {
             directory,
             parent_path,
@@ -85,6 +95,10 @@ impl SourceFile {
         self.hash.clone()
     }
 
+    pub(crate) fn same_target(&self, other: &Self) -> bool {
+        same_inode(&self.metadata, &other.metadata)
+    }
+
     /// The callback must recheck the accepted root and complete dependency set.
     /// Neither this check nor the subsequent rename locks out external editors.
     pub(crate) fn replace(
@@ -93,6 +107,21 @@ impl SourceFile {
         content: &str,
         before_rename: impl FnOnce() -> Result<(), WriteError>,
     ) -> Result<(), WriteError> {
+        let installed = self
+            .stage(expected_hash, content.as_bytes())?
+            .replace(before_rename)?;
+        if installed.durability_confirmed {
+            Ok(())
+        } else {
+            Err(WriteError::ChangedButNotDurable)
+        }
+    }
+
+    pub(crate) fn stage(
+        self,
+        expected_hash: &str,
+        content: &[u8],
+    ) -> Result<StagedFile, WriteError> {
         if self.hash != expected_hash {
             return Err(WriteError::Conflict);
         }
@@ -102,7 +131,7 @@ impl SourceFile {
         let mut temporary = TemporaryFile::create(&self.directory)?;
         temporary
             .file
-            .write_all(content.as_bytes())
+            .write_all(content)
             .map_err(|_| WriteError::Unavailable)?;
         temporary
             .file
@@ -117,27 +146,14 @@ impl SourceFile {
             .sync_all()
             .map_err(|_| WriteError::Unavailable)?;
 
-        self.recheck()?;
-        before_rename()?;
-        self.recheck()?;
-        renameat(
-            &self.directory,
-            temporary.name.as_str(),
-            &self.directory,
-            self.filename.as_os_str(),
-        )
-        .map_err(path_error)?;
-        temporary.renamed = true;
-        #[cfg(test)]
-        if self.sync_fault == Some(SyncFault::Directory) {
-            return Err(WriteError::ChangedButNotDurable);
-        }
-        self.directory
-            .sync_all()
-            .map_err(|_| WriteError::ChangedButNotDurable)
+        Ok(StagedFile {
+            source: self,
+            temporary,
+            hash: crate::configuration::digest(content),
+        })
     }
 
-    fn recheck(&self) -> Result<(), WriteError> {
+    pub(crate) fn recheck(&self) -> Result<(), WriteError> {
         let current_directory = open_directory(&self.parent_path).map_err(recheck_error)?;
         let original_directory = self
             .directory
@@ -179,7 +195,7 @@ impl SourceFile {
             digest.update(&buffer[..count]);
         }
         if total != metadata.len()
-            || super::config::encode_digest(&digest.finalize()) != self.hash
+            || crate::configuration::encode_digest(&digest.finalize()) != self.hash
             || !same_version(
                 &metadata,
                 &current.metadata().map_err(|_| WriteError::Unavailable)?,
@@ -188,6 +204,68 @@ impl SourceFile {
             return Err(WriteError::Conflict);
         }
         Ok(())
+    }
+}
+
+pub(crate) struct StagedFile {
+    source: SourceFile,
+    temporary: TemporaryFile,
+    hash: String,
+}
+
+pub(crate) struct InstalledFile {
+    pub(crate) file: SourceFile,
+    pub(crate) durability_confirmed: bool,
+}
+
+impl StagedFile {
+    pub(crate) fn sha256(&self) -> &str {
+        &self.hash
+    }
+
+    pub(crate) fn same_target(&self, other: &SourceFile) -> bool {
+        self.source.same_target(other)
+    }
+
+    pub(crate) fn recheck(&self) -> Result<(), WriteError> {
+        self.source.recheck()
+    }
+
+    pub(crate) fn modified_at(&self) -> Option<std::time::SystemTime> {
+        self.temporary.file.metadata().ok()?.modified().ok()
+    }
+
+    pub(crate) fn replace(
+        mut self,
+        before_rename: impl FnOnce() -> Result<(), WriteError>,
+    ) -> Result<InstalledFile, WriteError> {
+        self.source.recheck()?;
+        before_rename()?;
+        self.source.recheck()?;
+        renameat(
+            &self.source.directory,
+            self.temporary.name.as_str(),
+            &self.source.directory,
+            self.source.filename.as_os_str(),
+        )
+        .map_err(path_error)?;
+        self.temporary.renamed = true;
+        let metadata = self
+            .temporary
+            .file
+            .metadata()
+            .map_err(|_| WriteError::ChangedButNotDurable)?;
+        let durability_confirmed = self.source.directory.sync_all().is_ok();
+        #[cfg(test)]
+        let durability_confirmed =
+            durability_confirmed && self.source.sync_fault != Some(SyncFault::Directory);
+        std::mem::swap(&mut self.source.file, &mut self.temporary.file);
+        self.source.metadata = metadata;
+        self.source.hash = self.hash;
+        Ok(InstalledFile {
+            file: self.source,
+            durability_confirmed,
+        })
     }
 }
 
@@ -261,18 +339,19 @@ fn recheck_error(error: Errno) -> WriteError {
     }
 }
 
-struct TemporaryFile<'a> {
-    directory: &'a File,
+struct TemporaryFile {
+    directory: File,
     name: String,
     file: File,
     renamed: bool,
 }
 
-impl<'a> TemporaryFile<'a> {
-    fn create(directory: &'a File) -> Result<Self, WriteError> {
+impl TemporaryFile {
+    fn create(directory: &File) -> Result<Self, WriteError> {
+        let directory = directory.try_clone().map_err(|_| WriteError::Unavailable)?;
         let name = format!(".honk-config-{}.tmp", uuid::Uuid::new_v4());
         let descriptor = openat(
-            directory,
+            &directory,
             name.as_str(),
             OFlag::O_WRONLY
                 | OFlag::O_CREAT
@@ -292,11 +371,11 @@ impl<'a> TemporaryFile<'a> {
     }
 }
 
-impl Drop for TemporaryFile<'_> {
+impl Drop for TemporaryFile {
     fn drop(&mut self) {
         if !self.renamed {
             let _ = unlinkat(
-                self.directory,
+                &self.directory,
                 self.name.as_str(),
                 UnlinkatFlags::NoRemoveDir,
             );

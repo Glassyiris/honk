@@ -535,8 +535,8 @@ async fn fetch_proxied(
             Err(error) => ScoreOutcome::from_error(error),
         });
     }
-    if let Some(guard) = guard {
-        guard.close().await;
+    if let Some(mut guard) = guard {
+        guard.close().await?;
     }
     result
 }

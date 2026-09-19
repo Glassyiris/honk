@@ -85,6 +85,42 @@ impl ApiError {
     pub(crate) fn into_details(self) -> Option<Value> {
         self.error.details
     }
+
+    pub(crate) fn for_management(mut self, deleting: bool) -> Self {
+        let stage = match self.status {
+            StatusCode::PRECONDITION_FAILED => "revision_conflict",
+            StatusCode::UNPROCESSABLE_ENTITY => "validation",
+            StatusCode::CONFLICT => "state_conflict",
+            StatusCode::NOT_FOUND => "capability",
+            _ => "admission",
+        };
+        if !matches!(
+            self.status,
+            StatusCode::NOT_FOUND | StatusCode::SERVICE_UNAVAILABLE
+        ) && (deleting
+            || !matches!(
+                self.status,
+                StatusCode::CONFLICT
+                    | StatusCode::UNPROCESSABLE_ENTITY
+                    | StatusCode::BAD_REQUEST
+                    | StatusCode::PAYLOAD_TOO_LARGE
+                    | StatusCode::UNSUPPORTED_MEDIA_TYPE
+            ))
+        {
+            self.status = StatusCode::SERVICE_UNAVAILABLE;
+            self.error.code = ErrorCode::TemporarilyUnavailable;
+        }
+        let details = self.error.details.get_or_insert_with(|| json!({}));
+        if let Some(details) = details.as_object_mut() {
+            details.entry("stage").or_insert(json!(stage));
+            details.entry("written").or_insert(json!(false));
+            details
+                .entry("durability_confirmed")
+                .or_insert(json!(false));
+            details.entry("committed").or_insert(json!(false));
+        }
+        self
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -251,6 +287,7 @@ pub(super) fn discovery() -> Value {
             "logs": "/api/v1/logs",
             "providers": "/api/v1/providers",
             "rules": "/api/v1/rules",
+            "geodata": "/api/v1/geodata",
             "operations": "/api/v1/operations/{id}",
         },
     })
@@ -266,7 +303,7 @@ pub(super) fn version() -> Value {
     })
 }
 
-pub(super) fn capabilities(state: &super::NativeState) -> Value {
+pub(super) async fn capabilities(state: &super::NativeState) -> Value {
     let config = &state.observation.configuration;
     let telemetry = &state.observation.telemetry;
     let kinds = vec![
@@ -277,6 +314,9 @@ pub(super) fn capabilities(state: &super::NativeState) -> Value {
         "generation.changed",
         "operation.updated",
     ];
+    let mut providers = state.observation.providers.capability();
+    providers["can_manage"] = json!(config.can_manage());
+    let geodata = super::geodata::capability(state).await;
     json!({
         "observed_at": chrono::Utc::now().to_rfc3339(),
         "profiles": ["base"],
@@ -286,8 +326,8 @@ pub(super) fn capabilities(state: &super::NativeState) -> Value {
             "max_json_body_bytes": 65536,
         },
         "resources": {
-            "config": {"available":config.available(),"content":config.content_enabled(),"writable":config.writable(),"max_bytes":super::config::MAX_SOURCE_BYTES,"max_sources":super::config::MAX_SOURCES},
-            "config_validate": {"available":config.running(),"modes":["syntax","full"],"max_bytes":super::config::MAX_SOURCE_BYTES,"max_sources":super::config::MAX_SOURCES},
+            "config": {"available":config.sources.available(),"content":config.content_enabled(),"writable":config.writable(),"max_bytes":crate::configuration::MAX_SOURCE_BYTES,"max_sources":crate::configuration::MAX_SOURCES},
+            "config_validate": {"available":config.running(),"modes":["syntax","full"],"max_bytes":crate::configuration::MAX_SOURCE_BYTES,"max_sources":crate::configuration::MAX_SOURCES},
             "runtime": {"available": true},
             "runtime_memory": {"available":true,"metrics":telemetry.metrics()},
             "runtime_outbounds": {"available":true},
@@ -295,8 +335,9 @@ pub(super) fn capabilities(state: &super::NativeState) -> Value {
             "memory_history": {"available":telemetry.record_memory(),"max_window_seconds":600,"max_points":600},
             "runtime_mode": {"available":false},
             "datapath": super::datapath::capability(),
-            "nodes": {"available": true},
-            "providers": state.observation.providers.capability(),
+            "nodes": {"available": true, "can_manage":config.can_manage()},
+            "providers": providers,
+            "geodata": geodata,
             "groups": {"available": true, "config_patch":config.writable(), "selection": true, "max_patch_operations":32},
             "probes": state.observation.probes.capability(),
             "connections": {

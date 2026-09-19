@@ -132,26 +132,162 @@ async fn ui_serves_only_its_directory_with_navigation_and_static_cache_policy() 
     app.shutdown().await;
 }
 
+#[cfg(feature = "native-ui")]
 #[tokio::test]
-async fn ui_without_a_readable_index_rejects_startup() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut config = Config::default();
-    config.global.nfqueue_enable = false;
-    config.experimental.native_api.enabled = true;
-    config.experimental.native_api.secret = SECRET.into();
-    config.experimental.native_api.ui = directory.path().to_str().unwrap().into();
-    config.ensure_builtin_nodes();
-    let mut control = control_plane(config);
-    assert!(
-        NativeState::new(
-            &mut control,
-            "127.0.0.1:9527".parse().unwrap(),
-            SystemTime::now(),
-            Instant::now(),
+async fn embedded_ui_preserves_assets_head_and_safe_navigation() {
+    let app = TestApp::new(|config| config.experimental.native_api.ui = "embedded".into()).await;
+    for path in ["/", "/ui", "/ui/a/", "/ui/a/b"] {
+        for method in [Method::GET, Method::HEAD] {
+            let response = app
+                .client
+                .request(method, app.url(path))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{path}");
+            assert_eq!(response.headers()["location"], "/ui/");
+        }
+    }
+
+    let navigation = app.client.get(app.url("/ui/a/b")).send().await.unwrap();
+    let entry_url = navigation
+        .url()
+        .join(navigation.headers()["location"].to_str().unwrap())
+        .unwrap();
+    let response = app.client.get(entry_url).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.url().path(), "/ui/");
+    assert_eq!(response.headers()["content-type"], "text/html");
+    let entry_url = response.url().clone();
+    let index = response.text().await.unwrap();
+    assert_eq!(index, include_str!("../../assets/doona/index.html"));
+    let references = regex::Regex::new(r#"(?:src|href)="(\./[^"]+)""#).unwrap();
+    let paths = references
+        .captures_iter(&index)
+        .map(|value| value[1].to_owned());
+    for path in paths.chain(["./index.html".into(), "./sw.js".into()]) {
+        let url = entry_url.join(&path).unwrap();
+        let expected = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets/doona")
+                .join(&path),
         )
-        .await
-        .is_err()
-    );
+        .unwrap();
+        for method in [Method::GET, Method::HEAD] {
+            let response = app
+                .client
+                .request(method.clone(), url.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(response.headers()["cache-control"], "no-cache");
+            assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+            assert_eq!(response.headers()["x-frame-options"], "DENY");
+            assert_eq!(
+                response.headers()["content-length"]
+                    .to_str()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap(),
+                expected.len()
+            );
+            let mime = match path.rsplit('.').next().unwrap() {
+                "html" => "text/html",
+                "js" => "text/javascript",
+                "css" => "text/css",
+                "svg" => "image/svg+xml",
+                "webmanifest" => "application/manifest+json",
+                "png" => "image/png",
+                extension => panic!("unexpected entry asset extension: {extension}"),
+            };
+            assert_eq!(response.headers()["content-type"], mime, "{path}");
+            let body = response.bytes().await.unwrap();
+            if method == Method::HEAD {
+                assert!(body.is_empty(), "{path}");
+            } else {
+                assert_eq!(body.as_ref(), expected, "{path}");
+            }
+        }
+    }
+    for path in [
+        "/ui/missing.js",
+        "/ui/assets/missing",
+        "/ui/fonts/missing",
+        "/ui/icons/missing",
+        "/ui/missing.webmanifest",
+        "/ui/provenance/source.tar.gz",
+    ] {
+        let response = app.client.get(app.url(path)).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_ne!(response.text().await.unwrap(), index);
+    }
+    for path in [
+        "/ui/../private",
+        "/ui/%2e%2e/private",
+        "/ui/%2E%2E%2Fprivate",
+        "/ui/%2e%2e%5cprivate",
+        "/ui/%00",
+        "/ui/%FF",
+        "/ui/%zz",
+    ] {
+        let response = raw_request(&app, path, "", b"").await;
+        assert!(
+            (400..500).contains(&response.status),
+            "{path}: {}",
+            response.status
+        );
+        assert_ne!(response.body, index.as_bytes());
+    }
+    for (header, value) in [
+        ("host", "attacker.example"),
+        ("origin", "https://attacker.example"),
+    ] {
+        let response = app
+            .client
+            .get(app.url("/ui/"))
+            .header(header, value)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    error_response(
+        app.client.get(app.url("/api")).send().await.unwrap(),
+        StatusCode::UNAUTHORIZED,
+        "authentication_required",
+    )
+    .await;
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn ui_without_available_assets_rejects_startup() {
+    let directory = tempfile::tempdir().unwrap();
+    for path in [
+        directory.path().to_str().unwrap(),
+        #[cfg(not(feature = "native-ui"))]
+        "embedded",
+    ] {
+        let mut config = Config::default();
+        config.global.nfqueue_enable = false;
+        config.experimental.native_api.enabled = true;
+        config.experimental.native_api.secret = SECRET.into();
+        config.experimental.native_api.ui = path.into();
+        config.validate_detailed().unwrap();
+        config.ensure_builtin_nodes();
+        let mut control = control_plane(config);
+        assert!(
+            NativeState::new(
+                &mut control,
+                "127.0.0.1:9527".parse().unwrap(),
+                SystemTime::now(),
+                Instant::now(),
+            )
+            .await
+            .is_err()
+        );
+    }
 }
 
 #[tokio::test]

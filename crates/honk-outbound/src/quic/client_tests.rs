@@ -585,7 +585,7 @@ async fn native_ephemeral_close_waits_for_quic_endpoint_idle() {
         let connection = server_endpoint.accept().await.unwrap().await.unwrap();
         connection.closed().await;
     });
-    let guard = crate::runtime::NodeRuntime::try_ephemeral_guarded(&tuic_test_node()).unwrap();
+    let mut guard = crate::runtime::NodeRuntime::try_ephemeral_guarded(&tuic_test_node()).unwrap();
     let runtime = guard.runtime();
     let (client, connection) = runtime
         .scope_tasks(async { Ok(probe_client(&runtime, addr.port()).await) })
@@ -602,7 +602,7 @@ async fn native_ephemeral_close_waits_for_quic_endpoint_idle() {
         .1
         .clone();
     assert!(endpoint.wait_idle().now_or_never().is_none());
-    guard.close().await;
+    guard.close().await.unwrap();
     assert!(connection.close_reason().is_some());
     assert!(endpoint.wait_idle().now_or_never().is_some());
     peer.await.unwrap();
@@ -614,7 +614,7 @@ async fn native_close_drains_endpoint_from_cancelled_unpublished_handshake() {
     use futures_util::FutureExt as _;
 
     let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let guard = crate::runtime::NodeRuntime::try_ephemeral_guarded(&tuic_test_node()).unwrap();
+    let mut guard = crate::runtime::NodeRuntime::try_ephemeral_guarded(&tuic_test_node()).unwrap();
     let runtime = guard.runtime();
     let observed = Arc::new(parking_lot::Mutex::new(None));
     let endpoint_observed = Arc::clone(&observed);
@@ -636,7 +636,7 @@ async fn native_close_drains_endpoint_from_cancelled_unpublished_handshake() {
         .clone()
         .expect("dial must create its endpoint before handshake");
     drop(probe);
-    guard.close().await;
+    guard.close().await.unwrap();
     assert!(endpoint.wait_idle().now_or_never().is_some());
 }
 

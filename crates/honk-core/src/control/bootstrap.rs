@@ -308,6 +308,7 @@ impl ControlPlane {
             connection_tracker: Arc::new(ConnectionTracker::new()),
             tcp_flow_pins: Arc::new(TcpFlowPins::default()),
             cache_db: None,
+            delay_writer: cache::DelayWriter::default(),
             outbound_id_map,
             resource_budget,
             concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
@@ -319,7 +320,6 @@ impl ControlPlane {
             udp_concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
                 resource_budget.udp_slow_path,
             )),
-            background_tasks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             health_task: None,
             udp_warm_task: tokio::sync::Mutex::new(None),
             udp_warm_ids: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
@@ -334,6 +334,10 @@ impl ControlPlane {
             datapath_healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(feature = "native-api")]
             phase: None,
+            #[cfg(feature = "native-api")]
+            configuration: native
+                .as_ref()
+                .map(|native| Arc::clone(&native.configuration.sources)),
             #[cfg(feature = "native-api")]
             native,
             #[cfg(feature = "native-api")]

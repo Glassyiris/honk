@@ -43,8 +43,11 @@ pub(crate) struct AuthorizedSubscription {
 }
 
 fn same_worker_spec(left: &Subscription, right: &Subscription) -> bool {
-    left.id == right.id
-        && left.name == right.name
+    left.id == right.id && same_subscription_source_spec(left, right)
+}
+
+pub(crate) fn same_subscription_source_spec(left: &Subscription, right: &Subscription) -> bool {
+    left.name == right.name
         && left.url == right.url
         && left.sub_type == right.sub_type
         && left.update_interval == right.update_interval
@@ -192,24 +195,50 @@ struct Flight {
     operation: Option<crate::native_api::providers::RefreshOperation>,
 }
 
-struct PeriodicWorker {
+enum ProviderSchedule {
+    #[cfg(feature = "native-api")]
+    Deferred,
+    RefreshEligible(Option<Instant>),
+}
+
+struct Provider {
     authorized: AuthorizedSubscription,
-    next: Instant,
+    schedule: ProviderSchedule,
+}
+
+impl Provider {
+    fn new(authorized: AuthorizedSubscription) -> Self {
+        let mut provider = Self {
+            authorized,
+            schedule: ProviderSchedule::RefreshEligible(None),
+        };
+        provider.reset_deadline(Instant::now());
+        provider
+    }
+
+    fn reset_deadline(&mut self, now: Instant) {
+        match &mut self.schedule {
+            ProviderSchedule::RefreshEligible(next) => {
+                let interval = self.authorized.subscription.update_interval;
+                *next = (interval > 0).then(|| now + Duration::from_secs(interval));
+            }
+            #[cfg(feature = "native-api")]
+            ProviderSchedule::Deferred => {}
+        }
+    }
 }
 
 struct SupervisorState {
     manager: Arc<SubscriptionManager>,
     store: Option<SubscriptionStore>,
-    command_tx: mpsc::Sender<ControlCommand>,
     observations: Observations,
-    authorized: HashMap<uuid::Uuid, AuthorizedSubscription>,
+    providers: HashMap<uuid::Uuid, Provider>,
     fetches: JoinSet<FetchCompletion>,
     fetch_ids: HashMap<tokio::task::Id, uuid::Uuid>,
     publications: JoinSet<(uuid::Uuid, Result<SubscriptionMergeReply, ()>)>,
     publication_ids: HashMap<tokio::task::Id, uuid::Uuid>,
     flights: HashMap<uuid::Uuid, Flight>,
     pending: VecDeque<uuid::Uuid>,
-    periodic: HashMap<uuid::Uuid, PeriodicWorker>,
     stop: watch::Sender<bool>,
     paused: bool,
     pause_done: Option<oneshot::Sender<anyhow::Result<()>>>,
@@ -217,15 +246,40 @@ struct SupervisorState {
 }
 
 impl SupervisorState {
-    fn schedule(&mut self, authorized: AuthorizedSubscription) {
-        let id = authorized.subscription.id;
+    fn new(manager: Arc<SubscriptionManager>, store: Option<SubscriptionStore>) -> Self {
+        Self {
+            manager,
+            store,
+            observations: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            providers: HashMap::new(),
+            fetches: JoinSet::new(),
+            fetch_ids: HashMap::new(),
+            publications: JoinSet::new(),
+            publication_ids: HashMap::new(),
+            flights: HashMap::new(),
+            pending: VecDeque::new(),
+            stop: watch::channel(false).0,
+            paused: false,
+            pause_done: None,
+            pause_failure: None,
+        }
+    }
+
+    fn schedule(&mut self, id: uuid::Uuid) {
+        let Some(provider) = self.providers.get(&id) else {
+            return;
+        };
+        #[cfg(feature = "native-api")]
+        if matches!(provider.schedule, ProviderSchedule::Deferred) {
+            return;
+        }
         if self.paused || self.flights.contains_key(&id) {
             return;
         }
         self.flights.insert(
             id,
             Flight {
-                authorized,
+                authorized: provider.authorized.clone(),
                 #[cfg(feature = "native-api")]
                 operation: None,
             },
@@ -233,11 +287,11 @@ impl SupervisorState {
         self.pending.push_back(id);
     }
 
-    fn start_pending(&mut self) {
+    fn start_pending(&mut self, limit: usize) {
         if self.paused {
             return;
         }
-        while self.fetches.len() + self.publications.len() < MAX_ACTIVE_FETCHES {
+        while self.fetches.len() + self.publications.len() < limit {
             let Some(id) = self.pending.pop_front() else {
                 break;
             };
@@ -257,19 +311,27 @@ impl SupervisorState {
     }
 
     fn reconcile(&mut self, subscriptions: Vec<AuthorizedSubscription>) {
-        self.authorized = subscriptions
+        let mut previous = std::mem::take(&mut self.providers);
+        let ids: Vec<_> = subscriptions.iter().map(|a| a.subscription.id).collect();
+        self.providers = subscriptions
             .into_iter()
-            .map(|a| (a.subscription.id, a))
+            .map(|authorized| {
+                let id = authorized.subscription.id;
+                let provider = match previous.remove(&id) {
+                    Some(mut provider) if provider.authorized.revision == authorized.revision => {
+                        provider.authorized = authorized;
+                        provider
+                    }
+                    _ => Provider::new(authorized),
+                };
+                (id, provider)
+            })
             .collect();
-        self.periodic.retain(|id, worker| {
-            self.authorized
-                .get(id)
-                .is_some_and(|a| a.revision == worker.authorized.revision)
-        });
         {
             let mut observations = self.observations.write();
-            observations.retain(|id, _| self.authorized.contains_key(id));
-            for (id, authorized) in &self.authorized {
+            observations.retain(|id, _| self.providers.contains_key(id));
+            for (id, provider) in &self.providers {
+                let authorized = &provider.authorized;
                 let keep = observations.get(id).is_some_and(|old| {
                     same_worker_spec(&old.subscription, &authorized.subscription)
                 });
@@ -286,10 +348,9 @@ impl SupervisorState {
         }
         let mut pending = std::mem::take(&mut self.pending);
         while let Some(id) = pending.pop_front() {
-            let current = self
-                .authorized
-                .get(&id)
-                .is_some_and(|a| a.revision == self.flights[&id].authorized.revision);
+            let current = self.providers.get(&id).is_some_and(|provider| {
+                provider.authorized.revision == self.flights[&id].authorized.revision
+            });
             if current {
                 self.pending.push_back(id);
             } else {
@@ -298,16 +359,8 @@ impl SupervisorState {
         }
         // Existing work keeps its captured revision until the control owner fences its result.
         // Do not abort a task that may already have committed a runtime publication.
-        for authorized in self.authorized.values().cloned().collect::<Vec<_>>() {
-            let id = authorized.subscription.id;
-            if authorized.subscription.update_interval > 0 {
-                self.periodic.entry(id).or_insert_with(|| PeriodicWorker {
-                    next: Instant::now()
-                        + Duration::from_secs(authorized.subscription.update_interval),
-                    authorized: authorized.clone(),
-                });
-            }
-            self.schedule(authorized);
+        for id in ids {
+            self.schedule(id);
         }
     }
 
@@ -316,9 +369,9 @@ impl SupervisorState {
             return;
         };
         let current = self
-            .authorized
+            .providers
             .get(&id)
-            .is_some_and(|a| a.revision == flight.authorized.revision);
+            .is_some_and(|provider| provider.authorized.revision == flight.authorized.revision);
         let result = match result {
             Ok(reply) if reply.outcome.accepted() => Ok(reply),
             result if current => result,
@@ -378,17 +431,17 @@ impl SupervisorState {
         }
         #[cfg(not(feature = "native-api"))]
         let _ = load;
-        if !current && let Some(authorized) = self.authorized.get(&id).cloned() {
-            self.schedule(authorized);
+        if !current {
+            self.schedule(id);
         }
     }
 
-    fn fetched(&mut self, completion: FetchCompletion) {
+    fn fetched(&mut self, completion: FetchCompletion, command_tx: &mpsc::Sender<ControlCommand>) {
         let id = completion.authorized.subscription.id;
         match completion.result {
             Some(Ok(_)) if self.paused => self.finish(id, Err("supervisor_paused")),
             Some(Ok(nodes)) => {
-                let command_tx = self.command_tx.clone();
+                let command_tx = command_tx.clone();
                 let task = self.publications.spawn(async move {
                     let (result, wait) = oneshot::channel();
                     let command = ControlCommand::MergeSubscription {
@@ -426,11 +479,11 @@ impl SupervisorState {
             return;
         }
         let id = subscription.id;
-        let Some(authorized) = self.authorized.get(&id).cloned() else {
+        let Some(provider) = self.providers.get_mut(&id) else {
             operation.reject(crate::native_api::providers::not_refreshable());
             return;
         };
-        if !same_worker_spec(&authorized.subscription, &subscription) {
+        if !same_worker_spec(&provider.authorized.subscription, &subscription) {
             operation.reject(crate::native_api::providers::busy());
             return;
         }
@@ -443,10 +496,14 @@ impl SupervisorState {
             return;
         }
         operation.accept();
+        if matches!(provider.schedule, ProviderSchedule::Deferred) {
+            provider.schedule = ProviderSchedule::RefreshEligible(None);
+            provider.reset_deadline(Instant::now());
+        }
         self.flights.insert(
             id,
             Flight {
-                authorized,
+                authorized: provider.authorized.clone(),
                 operation: Some(operation),
             },
         );
@@ -502,11 +559,11 @@ impl SupervisorState {
         self.stop = watch::channel(false).0;
         self.paused = false;
         let now = Instant::now();
-        for worker in self.periodic.values_mut() {
-            worker.next = now + Duration::from_secs(worker.authorized.subscription.update_interval);
+        for provider in self.providers.values_mut() {
+            provider.reset_deadline(now);
         }
-        for authorized in self.authorized.values().cloned().collect::<Vec<_>>() {
-            self.schedule(authorized);
+        for id in self.providers.keys().copied().collect::<Vec<_>>() {
+            self.schedule(id);
         }
         Ok(())
     }
@@ -534,7 +591,7 @@ impl SupervisorState {
                 }
             }
         }
-        self.authorized.clear();
+        self.providers.clear();
         self.pending.clear();
         #[cfg(feature = "native-api")]
         for (_, flight) in self.flights.drain() {
@@ -549,7 +606,6 @@ impl SupervisorState {
         #[cfg(not(feature = "native-api"))]
         self.flights.clear();
         self.fetch_ids.clear();
-        self.periodic.clear();
         if let Some(done) = self.pause_done.take() {
             let _ = done.send(self.pause_result());
         }
@@ -560,11 +616,15 @@ impl SupervisorState {
         self.fetches.len() + self.publications.len()
     }
 
-    async fn run(mut self, mut commands: mpsc::Receiver<SupervisorCommand>) {
+    async fn run(
+        mut self,
+        mut commands: mpsc::Receiver<SupervisorCommand>,
+        merge_tx: mpsc::Sender<ControlCommand>,
+    ) {
         let mut ticks = tokio::time::interval(Duration::from_secs(1));
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            self.start_pending();
+            self.start_pending(MAX_ACTIVE_FETCHES);
             if self.paused
                 && self.owned_task_count() == 0
                 && self.flights.is_empty()
@@ -577,6 +637,30 @@ impl SupervisorState {
                     Some(SupervisorCommand::Reconcile { authorized, done }) => {
                         self.reconcile(authorized);
                         let _ = done.send(());
+                    }
+                    #[cfg(feature = "native-api")]
+                    Some(SupervisorCommand::DeferredSubscriptions { done }) => {
+                        let deferred = self.providers.values()
+                            .filter(|provider| matches!(provider.schedule, ProviderSchedule::Deferred))
+                            .map(|provider| provider.authorized.subscription.clone())
+                            .collect();
+                        let _ = done.send(deferred);
+                    }
+                    #[cfg(feature = "native-api")]
+                    Some(SupervisorCommand::ReconcileManaged { authorized, deferred, done }) => {
+                        let result = if let Some(provider) = authorized.iter().find(|a| a.subscription.id == deferred) {
+                            if self.providers.contains_key(&deferred) || self.flights.contains_key(&deferred) {
+                                Err(anyhow::anyhow!("managed provider identity was already scheduled"))
+                            } else {
+                                self.providers.insert(deferred, Provider {
+                                    authorized: provider.clone(),
+                                    schedule: ProviderSchedule::Deferred,
+                                });
+                                self.reconcile(authorized);
+                                Ok(())
+                            }
+                        } else { Err(anyhow::anyhow!("managed provider was not authorized")) };
+                        let _ = done.send(result);
                     }
                     #[cfg(feature = "native-api")]
                     Some(SupervisorCommand::Refresh { subscription, operation }) => self.refresh(subscription, operation),
@@ -611,7 +695,7 @@ impl SupervisorState {
                 result = self.fetches.join_next_with_id(), if !self.fetches.is_empty() => match result {
                     Some(Ok((task, completion))) => {
                         self.fetch_ids.remove(&task);
-                        self.fetched(completion);
+                        self.fetched(completion, &merge_tx);
                     }
                     Some(Err(error)) => if let Some(id) = self.fetch_ids.remove(&error.id()) {
                         self.finish(id, Err("fetch_failed"));
@@ -630,12 +714,16 @@ impl SupervisorState {
                 },
                 _ = ticks.tick(), if !self.paused => {
                     let now = Instant::now();
-                    let due: Vec<_> = self.periodic.values_mut().filter_map(|worker| {
-                        if worker.next > now { return None; }
-                        worker.next = now + Duration::from_secs(worker.authorized.subscription.update_interval);
-                        Some(worker.authorized.clone())
+                    let due: Vec<_> = self.providers.iter_mut().filter_map(|(id, provider)| {
+                        match provider.schedule {
+                            ProviderSchedule::RefreshEligible(Some(next)) if next <= now => {
+                                provider.reset_deadline(now);
+                                Some(*id)
+                            }
+                            _ => None,
+                        }
                     }).collect();
-                    for authorized in due { self.schedule(authorized); }
+                    for id in due { self.schedule(id); }
                 }
             }
         }
@@ -648,6 +736,16 @@ enum SupervisorCommand {
     Reconcile {
         authorized: Vec<AuthorizedSubscription>,
         done: oneshot::Sender<()>,
+    },
+    #[cfg(feature = "native-api")]
+    ReconcileManaged {
+        authorized: Vec<AuthorizedSubscription>,
+        deferred: uuid::Uuid,
+        done: oneshot::Sender<anyhow::Result<()>>,
+    },
+    #[cfg(feature = "native-api")]
+    DeferredSubscriptions {
+        done: oneshot::Sender<Vec<Subscription>>,
     },
     #[cfg(feature = "native-api")]
     Refresh {
@@ -726,6 +824,36 @@ impl SubscriptionSupervisorHandle {
     }
 
     #[cfg(feature = "native-api")]
+    pub(crate) async fn reconcile_managed(
+        &self,
+        authorized: Vec<AuthorizedSubscription>,
+        deferred: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        let (done, wait) = oneshot::channel();
+        self.command_tx
+            .send(SupervisorCommand::ReconcileManaged {
+                authorized,
+                deferred,
+                done,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("subscription supervisor stopped before reconcile"))?;
+        wait.await
+            .map_err(|_| anyhow::anyhow!("subscription supervisor stopped during reconcile"))?
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) async fn deferred_subscriptions(&self) -> anyhow::Result<Vec<Subscription>> {
+        let (done, wait) = oneshot::channel();
+        self.command_tx
+            .send(SupervisorCommand::DeferredSubscriptions { done })
+            .await
+            .map_err(|_| anyhow::anyhow!("subscription supervisor stopped before snapshot"))?;
+        wait.await
+            .map_err(|_| anyhow::anyhow!("subscription supervisor stopped during snapshot"))
+    }
+
+    #[cfg(feature = "native-api")]
     /// Closes fetch admission and joins network/cache-write work, not publication acknowledgements.
     pub(crate) async fn begin_pause(&self) -> anyhow::Result<()> {
         let (done, wait) = oneshot::channel();
@@ -765,18 +893,12 @@ impl SubscriptionSupervisorHandle {
 }
 
 pub(crate) struct SubscriptionSupervisor {
-    manager: Option<Arc<SubscriptionManager>>,
-    store: Option<SubscriptionStore>,
-    initial: Vec<AuthorizedSubscription>,
+    prepared: Option<SupervisorState>,
     startup_diagnostics: Option<DiagnosticBuckets>,
-    startup: Option<JoinSet<FetchCompletion>>,
-    startup_pending: VecDeque<AuthorizedSubscription>,
-    fetch_ids: HashMap<tokio::task::Id, uuid::Uuid>,
-    pending_ids: HashSet<uuid::Uuid>,
+    #[cfg(feature = "native-api")]
     observations: Observations,
     command_tx: Option<mpsc::Sender<SupervisorCommand>>,
     task: Option<JoinHandle<()>>,
-    stop: watch::Sender<bool>,
 }
 
 impl SubscriptionSupervisor {
@@ -795,180 +917,15 @@ impl SubscriptionSupervisor {
         };
         #[cfg(not(feature = "native-api"))]
         let manager = SubscriptionManager::new()?;
-        let manager = Arc::new(manager);
-        let mut startup_diagnostics = DiagnosticBuckets {
-            static_diagnostics,
-            providers: Vec::new(),
-        };
-        let mut requires_network = HashSet::new();
-        let observations: Observations = Arc::new(parking_lot::RwLock::new(
-            initial
-                .iter()
-                .map(|a| {
-                    (
-                        a.subscription.id,
-                        ObservedProvider {
-                            subscription: a.subscription.clone(),
-                            load: ProviderLoad::default(),
-                        },
-                    )
-                })
-                .collect(),
-        ));
-
-        for authorized in &initial {
-            let subscription = &authorized.subscription;
-            let Some(store) = store.as_ref() else {
-                requires_network.insert(subscription.id);
-                continue;
-            };
-            let mut diagnostics = Vec::new();
-            match store
-                .load_nodes_with_diagnostics(subscription, &mut diagnostics)
-                .await
-            {
-                Ok(Some(nodes)) => {
-                    honk_config::diagnostic::report_detailed_diagnostics(&diagnostics);
-                    startup_diagnostics.replace_provider(subscription.id, diagnostics);
-                    info!(
-                        subscription = %subscription.name,
-                        nodes = nodes.len(),
-                        "Restored subscription"
-                    );
-                    config
-                        .nodes
-                        .retain(|node| node.subscription_id != Some(subscription.id));
-                    config.nodes.extend(nodes);
-                    observations.write().get_mut(&subscription.id).unwrap().load = ProviderLoad {
-                        updated_at: Some(SystemTime::now()),
-                        cached: true,
-                        error: None,
-                    };
-                }
-                Ok(None) => {
-                    requires_network.insert(subscription.id);
-                }
-                Err(error) => {
-                    honk_config::diagnostic::report_detailed_diagnostics(&diagnostics);
-                    warn!(
-                        subscription = %subscription.name,
-                        %error,
-                        "Failed to restore subscription"
-                    );
-                    requires_network.insert(subscription.id);
-                    observations
-                        .write()
-                        .get_mut(&subscription.id)
-                        .unwrap()
-                        .load
-                        .error = Some("cache_load_failed");
-                }
-            }
-        }
-
-        let mut startup = JoinSet::new();
-        let (stop, _) = watch::channel(false);
-        let mut fetch_ids = HashMap::new();
-        let mut pending_ids: HashSet<_> = initial.iter().map(|a| a.subscription.id).collect();
-        let mut startup_pending: VecDeque<_> = initial.iter().cloned().collect();
-        let startup_limit = if config.experimental.native_api.enabled {
-            MAX_ACTIVE_FETCHES
-        } else {
-            usize::MAX
-        };
-
-        let deadline = tokio::time::sleep(Duration::from_secs(5));
-        tokio::pin!(deadline);
-        let mut received = 0usize;
-        loop {
-            while startup.len() < startup_limit {
-                let Some(authorized) = startup_pending.pop_front() else {
-                    break;
-                };
-                let id = authorized.subscription.id;
-                let task = startup.spawn(fetch_once(
-                    Arc::clone(&manager),
-                    store.clone(),
-                    authorized,
-                    stop.subscribe(),
-                ));
-                fetch_ids.insert(task.id(), id);
-            }
-            if requires_network.is_empty() {
-                break;
-            }
-            tokio::select! {
-                result = startup.join_next_with_id() => match result {
-                    Some(Ok((task, completion))) => {
-                        fetch_ids.remove(&task);
-                        pending_ids.remove(&completion.authorized.subscription.id);
-                        received += 1;
-                        let FetchCompletion {
-                            authorized,
-                            result,
-                            diagnostics,
-                        } = completion;
-                        let subscription = authorized.subscription;
-                        match result {
-                            Some(Ok(nodes)) => {
-                                startup_diagnostics
-                                    .replace_provider(subscription.id, diagnostics);
-                                info!(
-                                    nodes = nodes.len(),
-                                    "Subscription body accepted; startup publication pending"
-                                );
-                                config.nodes.retain(|node| {
-                                    node.subscription_id != Some(subscription.id)
-                                });
-                                config.nodes.extend(nodes);
-                                observations.write().get_mut(&subscription.id).unwrap().load = ProviderLoad { updated_at: Some(SystemTime::now()), cached: false, error: None };
-                            }
-                            Some(Err(error)) => {
-                                observations.write().get_mut(&subscription.id).unwrap().load.error = Some("fetch_failed");
-                                warn!(subscription = %subscription.name, %error, "Failed to fetch subscription");
-                            }
-                            None => {}
-                        }
-                        requires_network.remove(&subscription.id);
-                    }
-                    Some(Err(error)) => {
-                        if let Some(id) = fetch_ids.remove(&error.id()) {
-                            pending_ids.remove(&id);
-                            requires_network.remove(&id);
-                            observations.write().get_mut(&id).unwrap().load.error = Some("fetch_failed");
-                        }
-                        warn!(%error, "Subscription startup task failed");
-                    }
-                    None => break,
-                },
-                _ = &mut deadline => {
-                    info!(
-                        received,
-                        total = initial.len(),
-                        "Subscription fetch deadline reached; starting control plane"
-                    );
-                    break;
-                }
-            }
-        }
-        if !startup.is_empty() {
-            info!(
-                pending = startup.len(),
-                "Subscriptions still refreshing in background"
-            );
-        }
+        let mut state = SupervisorState::new(Arc::new(manager), store);
+        state.reconcile(initial);
+        let startup_diagnostics = state.prepare_startup(config, static_diagnostics).await;
 
         Ok(Self {
-            manager: Some(manager),
-            store,
-            initial,
+            #[cfg(feature = "native-api")]
+            observations: Arc::clone(&state.observations),
+            prepared: Some(state),
             startup_diagnostics: Some(startup_diagnostics),
-            startup: Some(startup),
-            startup_pending,
-            fetch_ids,
-            pending_ids,
-            observations,
-            stop,
             command_tx: None,
             task: None,
         })
@@ -985,65 +942,16 @@ impl SubscriptionSupervisor {
             "subscription supervisor already started"
         );
         let (command_tx, commands) = mpsc::channel(MAX_REFRESH_QUEUE);
+        let mut state = self
+            .prepared
+            .take()
+            .expect("subscription startup state missing");
         let now = Instant::now();
-        let state = SupervisorState {
-            manager: self.manager.take().expect("subscription manager missing"),
-            store: self.store.take(),
-            command_tx: merge_tx,
-            observations: Arc::clone(&self.observations),
-            stop: self.stop.clone(),
-            paused: false,
-            pause_done: None,
-            pause_failure: None,
-            authorized: self
-                .initial
-                .iter()
-                .cloned()
-                .map(|a| (a.subscription.id, a))
-                .collect(),
-            fetches: self.startup.take().expect("startup tasks missing"),
-            fetch_ids: std::mem::take(&mut self.fetch_ids),
-            publications: JoinSet::new(),
-            publication_ids: HashMap::new(),
-            flights: self
-                .initial
-                .iter()
-                .filter(|a| self.pending_ids.contains(&a.subscription.id))
-                .map(|a| {
-                    (
-                        a.subscription.id,
-                        Flight {
-                            authorized: a.clone(),
-                            #[cfg(feature = "native-api")]
-                            operation: None,
-                        },
-                    )
-                })
-                .collect(),
-            pending: self
-                .startup_pending
-                .drain(..)
-                .map(|a| a.subscription.id)
-                .collect(),
-            periodic: self
-                .initial
-                .iter()
-                .filter(|a| a.subscription.update_interval > 0)
-                .map(|a| {
-                    (
-                        a.subscription.id,
-                        PeriodicWorker {
-                            authorized: a.clone(),
-                            next: now + Duration::from_secs(a.subscription.update_interval),
-                        },
-                    )
-                })
-                .collect(),
-        };
-        self.pending_ids.clear();
-        self.initial.clear();
+        for provider in state.providers.values_mut() {
+            provider.reset_deadline(now);
+        }
         self.command_tx = Some(command_tx);
-        self.task = Some(tokio::spawn(state.run(commands)));
+        self.task = Some(tokio::spawn(state.run(commands, merge_tx)));
     }
 
     pub(crate) fn handle(&self) -> SubscriptionSupervisorHandle {
@@ -1075,16 +983,12 @@ impl SubscriptionSupervisor {
                 ))
             }
         } else {
-            self.stop.send_replace(true);
-            let result = if let Some(manager) = &self.manager {
-                manager.pause_network().await
-            } else {
-                Ok(())
-            };
-            if let Some(startup) = self.startup.as_mut() {
-                while startup.join_next().await.is_some() {}
-            }
-            result.map(|()| 0)
+            self.prepared
+                .as_mut()
+                .expect("subscription startup state missing")
+                .shutdown()
+                .await
+                .map(|()| 0)
         };
         if let Some(task) = self.task.take() {
             task.await
@@ -1093,6 +997,8 @@ impl SubscriptionSupervisor {
         remaining
     }
 }
+
+mod startup;
 
 #[cfg(test)]
 mod tests;

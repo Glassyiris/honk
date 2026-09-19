@@ -85,7 +85,7 @@ pub(crate) fn resolve_outbound_nodes(
 pub(in crate::control) enum OutboundConstraint {
     #[default]
     Any,
-    #[cfg(feature = "native-api")]
+    #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
     Node(uuid::Uuid),
     #[cfg(feature = "native-api")]
     Unavailable,
@@ -153,9 +153,12 @@ pub(super) fn resolve_outbound_plan_for_target(
     constraint: OutboundConstraint,
 ) -> ResolvedScorePlan {
     #[cfg(feature = "native-api")]
-    if matches!(constraint, OutboundConstraint::Unavailable)
-        || matches!(constraint, OutboundConstraint::Node(id) if !config.nodes.iter().any(|node| node.id == id))
-    {
+    if match constraint {
+        OutboundConstraint::Unavailable => true,
+        #[cfg(any(feature = "clash-api", test))]
+        OutboundConstraint::Node(id) => !config.nodes.iter().any(|node| node.id == id),
+        OutboundConstraint::Any => false,
+    } {
         return ResolvedScorePlan {
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
             nodes: Vec::new(),
@@ -179,7 +182,7 @@ pub(super) fn resolve_outbound_plan_for_target(
     }
     if let Some(node) = config.nodes.iter().find(|node| match constraint {
         OutboundConstraint::Any => node.name == outbound_name,
-        #[cfg(feature = "native-api")]
+        #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
         OutboundConstraint::Node(id) => node.id == id,
         #[cfg(feature = "native-api")]
         OutboundConstraint::Unavailable => false,

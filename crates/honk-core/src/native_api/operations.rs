@@ -34,6 +34,7 @@ pub(crate) enum OperationKind {
     GroupUpdate,
     Suspend,
     Resume,
+    GeodataUpdate,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,6 +46,7 @@ pub(crate) enum OperationResult {
     },
     Probe(super::probes::ProbeResult),
     ProviderRefresh(super::providers::Provider),
+    Geodata(super::geodata::GeoData),
     GroupUpdate {
         group_id: String,
         config_revision: String,
@@ -63,6 +65,7 @@ impl OperationResult {
             Self::Reload { .. } => OperationKind::Reload,
             Self::Probe(_) => OperationKind::Probe,
             Self::ProviderRefresh(_) => OperationKind::ProviderRefresh,
+            Self::Geodata(_) => OperationKind::GeodataUpdate,
             Self::GroupUpdate { .. } => OperationKind::GroupUpdate,
             Self::Suspend { .. } => OperationKind::Suspend,
             Self::Resume { .. } => OperationKind::Resume,
@@ -252,6 +255,18 @@ impl OperationStore {
                 owner: None,
             });
         }
+        if kind == OperationKind::GeodataUpdate
+            && records
+                .iter()
+                .any(|record| record.kind == kind && record.terminal_at.is_none())
+        {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                ErrorCode::StateConflict,
+                "A geodata update is already queued or running.",
+                None,
+            ));
+        }
         if records.len() == MAX_OPERATIONS {
             return Err(unavailable());
         }
@@ -343,7 +358,7 @@ impl OperationStore {
                 None,
             );
         }
-        self.finish(id, Ok(result))
+        self.finish(id, Ok(result), None)
     }
 
     /// Details must already be safe structured fields, not engine error strings or source text.
@@ -365,10 +380,38 @@ impl OperationStore {
                 message,
                 details,
             }),
+            None,
         )
     }
 
-    fn finish(&self, id: &str, result: Result<OperationResult, SafeError>) -> bool {
+    /// Preserve completed measurement facts when lifecycle cleanup fails.
+    pub(crate) fn fail_with_result(
+        &self,
+        id: &str,
+        code: &'static str,
+        message: &'static str,
+        result: OperationResult,
+    ) -> bool {
+        let result = serde_json::to_writer(DetailsBudget(MAX_RESULT_BYTES), &result)
+            .is_ok()
+            .then_some(result);
+        self.finish(
+            id,
+            Err(SafeError {
+                code,
+                message,
+                details: None,
+            }),
+            result,
+        )
+    }
+
+    fn finish(
+        &self,
+        id: &str,
+        result: Result<OperationResult, SafeError>,
+        failed_result: Option<OperationResult>,
+    ) -> bool {
         let mut records = self.records.lock();
         let Some(record) = records.iter_mut().find(|record| record.id == id) else {
             return false;
@@ -398,6 +441,7 @@ impl OperationStore {
             Err(error) => {
                 operation.status = Status::Failed;
                 operation.error = Some(error);
+                operation.result = failed_result.filter(|result| result.kind() == record.kind);
             }
         }
         operation.finished_at = Some(SystemTime::now());

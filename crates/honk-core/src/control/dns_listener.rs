@@ -189,7 +189,7 @@ impl BoundDnsListener {
 /// Process-scoped supervisor ownership retained by `ControlPlane::run`.
 pub(super) struct DnsListener {
     phase: watch::Sender<ListenerPhase>,
-    supervisors: JoinSet<()>,
+    supervisors: JoinSet<anyhow::Result<()>>,
 }
 
 impl DnsListener {
@@ -202,13 +202,18 @@ impl DnsListener {
     /// Force-cancel any child that outlived the bounded drain and join every
     /// supervisor. Each supervisor owns and drains its own child `JoinSet`, so
     /// this leaves no detached query or connection task.
-    pub(super) async fn abort_and_join(&mut self) {
+    pub(super) async fn abort_and_join(&mut self) -> anyhow::Result<()> {
         let _ = self.phase.send(ListenerPhase::Abort);
+        let mut failure = None;
         while let Some(result) = self.supervisors.join_next().await {
-            if result.is_err() {
-                debug!("standalone DNS supervisor join failed");
+            if let Err(error) = result
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+            {
+                failure.get_or_insert(error);
             }
         }
+        failure.map_or(Ok(()), Err)
     }
 }
 
@@ -328,14 +333,15 @@ async fn run_udp_supervisor(
     stats: Arc<StatsManager>,
     drain: Arc<DrainTracker>,
     mut phase: watch::Receiver<ListenerPhase>,
-) {
+) -> anyhow::Result<()> {
     let mut buffer = [0u8; MAX_UDP_DNS_MESSAGE];
     let mut children = JoinSet::new();
+    let mut failure = None;
     let local_addr = match socket.local_addr() {
         Ok(local_addr) => local_addr,
         Err(error) => {
             warn!(error_kind = ?error.kind(), "standalone UDP DNS receive failed");
-            return;
+            return Err(error.into());
         }
     };
 
@@ -348,7 +354,7 @@ async fn run_udp_supervisor(
                 }
             }
             completed = children.join_next(), if !children.is_empty() => {
-                log_child_result(completed, "UDP query");
+                retain_child_result(&mut failure, completed, false, "UDP query");
             }
             received = super::sockets::recv_from_with_orig_dst(socket.as_ref(), local_addr, &mut buffer) => {
                 let (length, client_addr, meta) = match received {
@@ -451,7 +457,8 @@ async fn run_udp_supervisor(
     }
 
     drop(socket);
-    finish_children(&mut children, &mut phase, "UDP query").await;
+    finish_children(&mut children, &mut phase, &mut failure, "UDP query").await;
+    failure.map_or(Ok(()), Err)
 }
 
 async fn send_udp_refused(
@@ -475,8 +482,9 @@ async fn run_tcp_supervisor(
     standalone_tcp_limit: Arc<Semaphore>,
     drain: Arc<DrainTracker>,
     mut phase: watch::Receiver<ListenerPhase>,
-) {
+) -> anyhow::Result<()> {
     let mut children = JoinSet::new();
+    let mut failure = None;
 
     loop {
         tokio::select! {
@@ -487,7 +495,7 @@ async fn run_tcp_supervisor(
                 }
             }
             completed = children.join_next(), if !children.is_empty() => {
-                log_child_result(completed, "TCP connection");
+                retain_child_result(&mut failure, completed, false, "TCP connection");
             }
             accepted = listener.accept() => {
                 let (mut stream, client_addr) = match accepted {
@@ -533,12 +541,14 @@ async fn run_tcp_supervisor(
     }
 
     drop(listener);
-    finish_children(&mut children, &mut phase, "TCP connection").await;
+    finish_children(&mut children, &mut phase, &mut failure, "TCP connection").await;
+    failure.map_or(Ok(()), Err)
 }
 
 async fn finish_children(
     children: &mut JoinSet<()>,
     phase: &mut watch::Receiver<ListenerPhase>,
+    failure: &mut Option<anyhow::Error>,
     label: &'static str,
 ) {
     let mut aborted = *phase.borrow() == ListenerPhase::Abort;
@@ -554,14 +564,22 @@ async fn finish_children(
                     children.abort_all();
                 }
             }
-            completed = children.join_next() => log_child_result(completed, label),
+            completed = children.join_next() => retain_child_result(failure, completed, aborted, label),
         }
     }
 }
 
-fn log_child_result(completed: Option<Result<(), tokio::task::JoinError>>, label: &'static str) {
-    if completed.is_some_and(|result| result.is_err_and(|error| !error.is_cancelled())) {
+fn retain_child_result(
+    failure: &mut Option<anyhow::Error>,
+    completed: Option<Result<(), tokio::task::JoinError>>,
+    aborted: bool,
+    label: &'static str,
+) {
+    if let Some(Err(error)) = completed
+        && (!aborted || !error.is_cancelled())
+    {
         debug!(label, "standalone DNS child join failed");
+        failure.get_or_insert_with(|| anyhow::Error::new(error).context(label));
     }
 }
 
@@ -686,7 +704,10 @@ mod tests {
     async fn stop_listener(listener: &mut DnsListener, drain: &DrainTracker) {
         listener.stop_accepting();
         drain.drain().await.expect("drain standalone DNS");
-        listener.abort_and_join().await;
+        listener
+            .abort_and_join()
+            .await
+            .expect("join standalone DNS");
         assert_eq!(
             drain.active_count(),
             0,
@@ -1164,5 +1185,18 @@ mod tests {
         assert_eq!(replacement_calls.load(Ordering::SeqCst), 1);
 
         stop_listener(&mut listener, &drain).await;
+    }
+
+    #[tokio::test]
+    async fn supervisor_panic_is_a_listener_shutdown_failure() {
+        let (controller, _) = controller([203, 0, 113, 12]);
+        let (mut listener, address, drain) = start_listener("tcp+udp://127.0.0.1:0", controller);
+        listener
+            .supervisors
+            .spawn(async { panic!("DNS supervisor failed") });
+        assert!(listener.abort_and_join().await.is_err());
+        assert_eq!(drain.active_count(), 0);
+        BoundDnsListener::bind(&DnsBindEndpoint::parse(&format!("tcp+udp://{address}")).unwrap())
+            .expect("failed shutdown must still join healthy supervisors");
     }
 }

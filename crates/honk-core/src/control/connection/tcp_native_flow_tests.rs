@@ -175,6 +175,25 @@ async fn native_tcp_success_keeps_decision_path_after_selector_change() -> anyho
         assert_eq!(&reply, b"reply");
         let before = fixture.flow("active").await?;
         assert_eq!(before["outbound"], "outer");
+        let rule_id = format!("{}:0:fallback", before["instance_id"].as_str().unwrap());
+        assert_eq!(before["rule_id"], rule_id);
+        assert_eq!(before["rule_source"], "recomputed");
+        let flows: Value = fixture
+            .http
+            .get(format!("{}/flows", fixture.api))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let summary = flows["flows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == before["id"])
+            .unwrap();
+        assert_eq!(summary["rule_id"], rule_id);
+        assert_eq!(summary["rule_source"], "recomputed");
         assert_eq!(
             before["chain"],
             serde_json::json!([catalog.groups["outer"], catalog.groups["inner"], leaf_id])
@@ -239,6 +258,8 @@ async fn native_tcp_success_keeps_decision_path_after_selector_change() -> anyho
             .json()
             .await?;
         assert_eq!(connections["tcp"][0]["flow_id"], before["id"]);
+        assert_eq!(connections["tcp"][0]["rule_id"], rule_id);
+        assert_eq!(connections["tcp"][0]["rule_source"], "recomputed");
         fixture.client.shutdown().await?;
         upstream.shutdown().await?;
         (&mut fixture.task).await??;

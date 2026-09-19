@@ -84,11 +84,12 @@ async fn pause_closes_wire_query_but_waits_for_its_lease_then_resumes_fresh_runt
     let query_service = service.clone();
     let query = tokio::spawn(async move {
         let result = query_service
-            .resolve_outcome_with_runtime(
+            .resolve_client_outcome_with_runtime(
                 &lease,
                 &build_dns_query("blocked.example", 1),
                 crate::dns::query::DnsRequestMeta::EMPTY,
                 IngressProfile::Api,
+                None,
             )
             .await;
         assert_eq!(

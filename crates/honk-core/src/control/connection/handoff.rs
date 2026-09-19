@@ -479,7 +479,7 @@ impl ControlPlaneHandle {
             return result;
         }
         let state = mode_state.read().clone();
-        #[cfg(feature = "native-api")]
+        #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
         if state.native_enabled {
             let config = self.config.read().await;
             let state = mode_state.read().clone();

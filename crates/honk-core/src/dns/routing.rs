@@ -357,6 +357,8 @@ pub struct DnsRouter {
     rule_count: usize,
     geo_fingerprint: [u8; 32],
     geo_requirements: GeoRequirements,
+    #[cfg(feature = "native-api")]
+    geo_assets: std::sync::Arc<[crate::routing::GeoAssetSnapshot]>,
 }
 
 impl DnsRouter {
@@ -431,6 +433,8 @@ impl DnsRouter {
             fixed_domain_ttl: fixed_domain_ttl.clone(),
             geo_fingerprint: geo_sources.fingerprint_for(requirements),
             geo_requirements: requirements.clone(),
+            #[cfg(feature = "native-api")]
+            geo_assets: geo_sources.snapshots(requirements).into(),
         })
     }
 
@@ -542,6 +546,11 @@ impl DnsRouter {
 
     pub(crate) fn geo_fingerprint(&self) -> [u8; 32] {
         self.geo_fingerprint
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn geo_assets(&self) -> &[crate::routing::GeoAssetSnapshot] {
+        &self.geo_assets
     }
 
     pub(crate) fn geo_requirements_snapshot(&self) -> &GeoRequirements {

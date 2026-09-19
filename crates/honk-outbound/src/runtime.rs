@@ -826,6 +826,10 @@ impl NodeRuntime {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("outbound runtime cleanup failed")]
+pub struct RuntimeCleanupError;
+
 /// Ownership guard for an ephemeral [`NodeRuntime`]: Drop initiates the
 /// close, so a probe future dropped mid-flight (timeout, task abort) still
 /// releases the session-layer resources. Use [`Self::close`] on the normal
@@ -869,11 +873,20 @@ impl EphemeralRuntimeGuard {
         }
     }
 
-    /// Close the runtime and await full teardown.
-    pub async fn close(mut self) {
-        if let Some(runtime) = self.runtime.take() {
-            runtime.close().await;
-        }
+    /// Close and join all owned work. Cancelling this waiter retains ownership
+    /// in the guard so another waiter can finish the same teardown.
+    pub async fn close(&mut self) -> Result<(), RuntimeCleanupError> {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Ok(());
+        };
+        runtime.close().await;
+        let result = if runtime.tasks_failed() {
+            Err(RuntimeCleanupError)
+        } else {
+            Ok(())
+        };
+        self.runtime.take();
+        result
     }
 }
 

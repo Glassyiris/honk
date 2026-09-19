@@ -58,6 +58,21 @@ struct ProviderError {
 }
 
 impl Provider {
+    fn inline(node_count: usize) -> Self {
+        Self {
+            id: "inline".into(),
+            name: "inline".into(),
+            kind: "inline",
+            url_redacted: None,
+            node_count,
+            updated_at: None,
+            expires_at: None,
+            traffic: None,
+            status: "ok",
+            last_error: None,
+        }
+    }
+
     fn observed(subscription: &Subscription, load: ProviderLoad, node_count: usize) -> Self {
         Self {
             id: subscription.id.to_string(),
@@ -196,18 +211,24 @@ pub(super) async fn list(
     }
     let config = state.config.read().await;
     // Every row has a fixed-size safe label; reject before allocating its join or projection.
-    if config.subscriptions.len() > MAX_SNAPSHOT_BYTES / (size_of::<Provider>() + 256) {
+    if config.subscriptions.len() >= MAX_SNAPSHOT_BYTES / (size_of::<Provider>() + 256) {
         return Err(unavailable());
     }
     let mut counts: HashMap<_, usize> = config.subscriptions.iter().map(|s| (s.id, 0)).collect();
+    let mut inline_count = 0;
     for node in &config.nodes {
         if let Some(count) = node.subscription_id.and_then(|id| counts.get_mut(&id)) {
             *count += 1;
+        } else if super::catalog::is_inline_node(node) {
+            inline_count += 1;
         }
     }
     let supervisor = service.supervisor.read().clone();
-    let mut rows = Vec::with_capacity(config.subscriptions.len());
-    let mut bytes = size_of::<Snapshot>() + state.observation.instance_id.len();
+    let inline = Provider::inline(inline_count);
+    let mut bytes =
+        size_of::<Snapshot>() + state.observation.instance_id.len() + inline.retained_bytes();
+    let mut rows = Vec::with_capacity(config.subscriptions.len() + 1);
+    rows.push(inline);
     for subscription in &config.subscriptions {
         let load = supervisor
             .as_ref()
@@ -220,7 +241,7 @@ pub(super) async fn list(
         }
         rows.push(row);
     }
-    rows.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+    rows[1..].sort_unstable_by(|a, b| a.id.cmp(&b.id));
     service.page(
         Snapshot {
             id: Uuid::new_v4(),
@@ -240,19 +261,33 @@ pub(super) async fn detail(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     parse_query(uri, &[], id)?;
+    if provider_id == "inline" {
+        let config = state.config.read().await;
+        let count = config
+            .nodes
+            .iter()
+            .filter(|node| super::catalog::is_inline_node(node))
+            .count();
+        return Ok(Json(Provider::inline(count)).into_response());
+    }
     let provider_id = Uuid::parse_str(provider_id).map_err(|_| not_found())?;
     let config = state.config.read().await;
-    let subscription = config
-        .subscriptions
-        .iter()
-        .find(|s| s.id == provider_id)
-        .ok_or_else(not_found)?;
-    let load = state
-        .observation
-        .providers
-        .supervisor
-        .read()
-        .as_ref()
+    provider_value(
+        &config,
+        state.observation.providers.supervisor.read().as_ref(),
+        provider_id,
+    )
+    .map(|value| Json(value).into_response())
+    .ok_or_else(not_found)
+}
+
+pub(super) fn provider_value(
+    config: &honk_config::Config,
+    supervisor: Option<&SubscriptionSupervisorHandle>,
+    provider_id: Uuid,
+) -> Option<Value> {
+    let subscription = config.subscriptions.iter().find(|s| s.id == provider_id)?;
+    let load = supervisor
         .map(|s| s.observation(subscription))
         .unwrap_or_default();
     let count = config
@@ -260,7 +295,7 @@ pub(super) async fn detail(
         .iter()
         .filter(|node| node.subscription_id == Some(provider_id))
         .count();
-    Ok(Json(Provider::observed(subscription, load, count)).into_response())
+    serde_json::to_value(Provider::observed(subscription, load, count)).ok()
 }
 
 pub(super) async fn refresh(
@@ -270,6 +305,9 @@ pub(super) async fn refresh(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     parse_query(request.uri(), &[], id)?;
+    if provider_id == "inline" {
+        return Err(not_refreshable());
+    }
     let mut keys = request.headers().get_all("idempotency-key").iter();
     let key = keys
         .next()

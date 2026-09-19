@@ -1,5 +1,134 @@
 use super::*;
 
+struct PrivateChildProbe {
+    panic: bool,
+}
+
+#[async_trait::async_trait]
+impl honk_outbound::proxy::TcpOutbound for PrivateChildProbe {
+    async fn dial(
+        &self,
+        _node: &Node,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        _timeout: Duration,
+    ) -> anyhow::Result<honk_outbound::proxy::ProxyStream> {
+        Ok(honk_outbound::proxy::ProxyStream {
+            stream: Box::new(tokio::net::TcpStream::connect(target).await?),
+            target_addr: target,
+            target_domain: target_domain.map(str::to_owned),
+        })
+    }
+
+    async fn dial_runtime(
+        &self,
+        runtime: Arc<honk_outbound::runtime::NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        timeout: Duration,
+    ) -> anyhow::Result<honk_outbound::proxy::ProxyStream> {
+        let scope = honk_outbound::runtime::TaskScope::capture();
+        let panic = self.panic;
+        let child = scope
+            .spawn(async move {
+                if panic {
+                    panic!("private protocol child failed");
+                }
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
+        if panic {
+            while !child.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            // Registration reaps the panic before the guard closes.
+            scope.spawn(std::future::pending()).unwrap();
+        }
+        self.dial(&runtime.node, target, target_domain, timeout)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn private_child_panic_fails_operation_and_pause_without_negating_measurement() {
+    for panic in [true, false] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            receive_headers(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                .await
+                .unwrap();
+            assert_eq!(socket.read(&mut [0; 1]).await.unwrap(), 0);
+        });
+        let mut config = Config::default();
+        config.global.tcp_check_url = vec![format!("http://{address}/check")];
+        config.experimental.native_api.probe_allowed_ports = vec![address.port()];
+        let mut state = state(config).await;
+        let mut registry = honk_outbound::proxy::ProxyRegistry::new();
+        registry.register(honk_outbound::proxy::ProtocolEntry::new(
+            honk_config::types::NodeProtocol::Direct,
+            Arc::new(PrivateChildProbe { panic }),
+        ));
+        Arc::get_mut(&mut state).unwrap().proxy_registry = Arc::new(registry);
+        let service = &state.observation.probes;
+        let (stop, receiver) = watch::channel(false);
+        let worker = service.start(Arc::clone(&state), receiver);
+        let input = request(
+            json!({"type":"node","node_id":honk_config::config::DIRECT_NODE_ID.to_string()}),
+            "http",
+            json!(["tcp"]),
+            "ipv4",
+        );
+        let accepted = body(
+            create(
+                &state,
+                http_request(&input, "private-child"),
+                &RequestId("private-child".into()),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        let operation = terminal(&state, accepted["operation_id"].as_str().unwrap()).await;
+        assert_eq!(
+            operation["status"],
+            if panic { "failed" } else { "succeeded" }
+        );
+        assert_eq!(operation["result"]["results"][0]["state"], "healthy");
+        assert_eq!(operation["result"]["results"][0]["health_updated"], true);
+        assert_eq!(operation["result"]["results"][0]["error"], Value::Null);
+        assert_eq!(
+            state
+                .alive_set
+                .native_observations(honk_config::config::DIRECT_NODE_ID)
+                .iter()
+                .map(|observation| observation.state)
+                .collect::<Vec<_>>(),
+            [HealthState::Healthy]
+        );
+        if panic {
+            assert_eq!(operation["error"]["code"], "probe_cleanup_failed");
+            assert_eq!(
+                service.pause().await,
+                Err(ProbeLifecycleError::CleanupFailed)
+            );
+            assert_eq!(
+                service.resume().await,
+                Err(ProbeLifecycleError::CleanupFailed)
+            );
+        } else {
+            service.pause().await.unwrap();
+            service.resume().await.unwrap();
+        }
+        stop.send(true).unwrap();
+        worker.await.unwrap();
+        peer.await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn pause_drains_started_and_disconnected_queued_jobs_then_resumes_same_owner() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

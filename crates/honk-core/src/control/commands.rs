@@ -36,11 +36,11 @@ pub(crate) struct ReloadReply {
 pub(crate) enum ControlCommand {
     #[cfg(feature = "native-api")]
     Suspend {
-        reply: tokio::sync::oneshot::Sender<Result<(), crate::native_api::ApiError>>,
+        reply: tokio::sync::oneshot::Sender<Result<(), super::client::ControlError>>,
     },
     #[cfg(feature = "native-api")]
     Resume {
-        reply: tokio::sync::oneshot::Sender<Result<(), crate::native_api::ApiError>>,
+        reply: tokio::sync::oneshot::Sender<Result<(), super::client::ControlError>>,
     },
     #[cfg(any(feature = "native-api", feature = "clash-api"))]
     SetSelector {
@@ -49,17 +49,19 @@ pub(crate) enum ControlCommand {
             Result<super::client::SelectionResult, super::client::ControlError>,
         >,
     },
-    #[cfg(feature = "native-api")]
+    #[cfg(all(feature = "native-api", feature = "clash-api"))]
     SetRuntimeMode {
-        request: crate::native_api::mode::ModeRequest,
-        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, crate::native_api::ApiError>>,
+        request: super::client::ModeRequest,
+        reply: tokio::sync::oneshot::Sender<
+            Result<crate::mode::ModeState, super::client::ControlError>,
+        >,
     },
     ReloadConfig {
         request_id: u64,
         config: Box<Config>,
         diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
         #[cfg(feature = "native-api")]
-        sources: Option<std::sync::Arc<crate::native_api::config::SourceUpdate>>,
+        sources: Option<std::sync::Arc<crate::configuration::SourceUpdate>>,
         #[cfg(feature = "native-api")]
         expected_group_revision: Option<String>,
         result: tokio::sync::oneshot::Sender<ReloadReply>,

@@ -4,6 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const WAIT: Duration = Duration::from_secs(20);
 
+mod dns_failure;
 mod retention;
 #[cfg(feature = "rprx")]
 mod xudp;
@@ -39,6 +40,7 @@ struct Fixture {
     backend: Arc<RwLock<Box<dyn EbpfBackend>>>,
     groups: honk_outbound::group::SharedGroupManager,
     alive: Arc<honk_outbound::alive::AliveDialerSet>,
+    cache_db: Option<Arc<crate::cachedb::CacheDb>>,
     dns_service: crate::dns::DnsService,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     task: tokio::task::JoinHandle<(ControlPlane, anyhow::Result<()>)>,
@@ -158,6 +160,7 @@ impl Fixture {
             forwarder,
             upstream,
         )?;
+        plane.init_cache_db(None).await;
         plane.set_mode_state(Arc::new(parking_lot::RwLock::new(
             crate::mode::ModeState::native(),
         )));
@@ -180,6 +183,7 @@ impl Fixture {
         let dns_service = plane.dns_service();
         let shutdown = plane.shutdown_requested.clone();
         let alive = plane.alive_set();
+        let cache_db = plane.cache_db();
         alive.pause_health_checks().await?;
         let api = crate::native_api::NativeServer::start(listener, Arc::new(state));
         let task = tokio::spawn(async move {
@@ -194,6 +198,7 @@ impl Fixture {
             backend,
             groups,
             alive,
+            cache_db,
             dns_service,
             shutdown,
             task,
@@ -248,7 +253,7 @@ impl Fixture {
         Ok(tokio::time::timeout(WAIT, socket.connect(self.tproxy)).await??)
     }
 
-    async fn transition(&self, resume: bool) -> Result<(), crate::native_api::ApiError> {
+    async fn transition(&self, resume: bool) -> Result<(), super::super::client::ControlError> {
         let (reply, response) = tokio::sync::oneshot::channel();
         let command = if resume {
             ControlCommand::Resume { reply }

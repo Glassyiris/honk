@@ -28,14 +28,14 @@ enum NameResolutionError {
 }
 
 #[derive(Default)]
-struct FamilyResponses {
-    ipv4: Option<anyhow::Result<Vec<u8>>>,
-    ipv6: Option<anyhow::Result<Vec<u8>>>,
+struct FamilyResponses<T = Vec<u8>> {
+    ipv4: Option<anyhow::Result<T>>,
+    ipv6: Option<anyhow::Result<T>>,
     ipv4_eligible: bool,
     ipv6_eligible: bool,
 }
 
-impl FamilyResponses {
+impl<T> FamilyResponses<T> {
     fn has_missing_original_destination(&self) -> bool {
         self.ipv4
             .iter()
@@ -67,7 +67,82 @@ impl FamilyResponses {
     }
 }
 
+#[cfg(feature = "native-api")]
+pub(crate) struct PinnedNameResolver {
+    service: DnsService,
+    runtime: Option<crate::dns::runtime::RuntimeLease>,
+    forwarder: Arc<DnsForwarder>,
+}
+
+#[cfg(feature = "native-api")]
+impl PinnedNameResolver {
+    /// Resolve only through the captured generation, never bootstrap or system DNS.
+    pub(crate) async fn resolve(&self, domain: &str) -> anyhow::Result<Vec<IpAddr>> {
+        let domain = normalize_domain(domain)?;
+        if let Ok(ip) = domain.parse::<IpAddr>() {
+            return Ok(vec![ip]);
+        }
+        let mut responses = FamilyResponses {
+            ipv4_eligible: self.forwarder.strategy != DnsStrategy::Ipv6Only,
+            ipv6_eligible: self.forwarder.strategy != DnsStrategy::Ipv4Only,
+            ipv4: None,
+            ipv6: None,
+        };
+        if responses.ipv4_eligible {
+            responses.ipv4 = Some(self.resolve_family(&domain, 1).await);
+        }
+        if responses.ipv6_eligible {
+            responses.ipv6 = Some(self.resolve_family(&domain, 28).await);
+        }
+        let responses = responses.fail_on_packet_rejection()?;
+        let mut addresses = Vec::new();
+        for outcome in responses.ipv4.into_iter().chain(responses.ipv6).flatten() {
+            addresses.extend_from_slice(outcome.answer_ips());
+        }
+        Ok(addresses)
+    }
+
+    async fn resolve_family(
+        &self,
+        domain: &str,
+        qtype: u16,
+    ) -> anyhow::Result<crate::dns::outcome::DnsOutcome> {
+        let query = build_dns_query(domain, qtype);
+        let mut operation = self.service.operation();
+        let resolve = self.forwarder.resolve_outcome_with_context_and_profile(
+            &query,
+            DnsRequestMeta::EMPTY,
+            IngressProfile::Api,
+        );
+        let outcome = match &self.runtime {
+            Some(runtime) => {
+                let _permit = runtime.runtime().try_acquire_query()?;
+                operation.run(runtime.run(resolve)).await??
+            }
+            None => operation.run(resolve).await?,
+        };
+        outcome.map_err(Into::into)
+    }
+}
+
 impl DnsService {
+    #[cfg(feature = "native-api")]
+    pub(crate) fn pin_name_resolution(&self) -> anyhow::Result<PinnedNameResolver> {
+        let runtime = self
+            .provider()
+            .map(|provider| provider.try_acquire())
+            .transpose()?;
+        let forwarder = runtime.as_ref().map_or_else(
+            || self.forwarder(),
+            |runtime| Arc::clone(runtime.runtime().forwarder()),
+        );
+        Ok(PinnedNameResolver {
+            service: self.clone(),
+            runtime,
+            forwarder,
+        })
+    }
+
     pub(crate) async fn resolve_name(&self, domain: &str) -> anyhow::Result<ResolvedAddr> {
         self.resolve_name_with_fallback(domain, |name| async move {
             honk_outbound::bootstrap::resolve(&name)

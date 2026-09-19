@@ -1,10 +1,13 @@
 //! File-authority regressions through real HTTP, reload publication and supervisor handoff.
 
+mod geodata;
 mod groups;
+mod management;
 mod transactions;
 
+use super::ConfigService;
 use super::coordinator::ConfigCoordinator;
-use super::{ConfigService, SourceUpdate};
+use crate::configuration::SourceUpdate;
 use crate::control::{ControlCommand, ControlPlane};
 use crate::dns::DnsResolver;
 use crate::dns::cache::DnsCache;
@@ -72,6 +75,14 @@ struct Fixture {
 
 impl Fixture {
     async fn new(access: Access, gated: bool) -> Self {
+        Self::new_custom(access, gated, |_, _| {}).await
+    }
+
+    async fn new_custom(
+        access: Access,
+        gated: bool,
+        setup: impl FnOnce(&Path, &mut HashMap<&'static str, String>),
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -86,7 +97,7 @@ impl Fixture {
             "# Entry comment retained verbatim.\ninclude {{\n 'auth.dae'\n 'editable.dae'\n 'locked.dae'\n}}\nglobal {{\n nfqueue_enable: false\n store_subscribe: false\n dial_mode: ip\n data_dir: '{}'\n}}\nrouting {{\n fallback: direct\n}}\n",
             directory.path().join("state").display()
         );
-        let originals = HashMap::from([
+        let mut originals = HashMap::from([
             ("main.dae", main),
             (
                 "auth.dae",
@@ -97,6 +108,7 @@ impl Fixture {
             ("editable.dae", "# Explicitly writable include.\n".into()),
             ("locked.dae", "# Local-editor-only include.\n".into()),
         ]);
+        setup(directory.path(), &mut originals);
         for (name, text) in &originals {
             let path = directory.path().join(name);
             std::fs::write(&path, text).unwrap();
@@ -114,6 +126,7 @@ impl Fixture {
         let initial = SourceUpdate {
             sources: loaded.sources,
             dependencies: Vec::new(),
+            geo_sources: None,
         };
         let mut config = loaded.config;
         config.validate_detailed().unwrap();
@@ -121,13 +134,26 @@ impl Fixture {
         let mut subscriptions = SubscriptionSupervisor::prepare(&mut config, None, diagnostics)
             .await
             .unwrap();
-        let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
-        let resolver = DnsResolver::new(&config.dns).unwrap();
+        let requirements = crate::routing::GeoRequirements::for_traffic(&config.routing.rules)
+            .union(&DnsRouter::geo_requirements(&config.dns));
+        let geo = crate::routing::GeoSourceSet::load_captured(
+            &requirements,
+            Path::new(&config.global.data_dir),
+            |path| std::fs::read(path).map(Arc::from),
+        )
+        .unwrap();
+        let router = Router::new_with_geo_sources(
+            &config.routing.rules,
+            &config.routing.default_outbound,
+            &geo,
+        )
+        .unwrap();
         let forwarder = Arc::new(DnsForwarder::new(
             Arc::new(NoDns),
             Arc::new(tokio::sync::Mutex::new(DnsCache::new(16))),
-            Arc::new(DnsRouter::new_from_dns_config(&config.dns).unwrap()),
+            Arc::new(DnsRouter::new_with_geo_sources(&config.dns, &geo).unwrap()),
         ));
+        let resolver = DnsResolver::with_forwarder(&config.dns, Arc::clone(&forwarder)).unwrap();
         let mut control_plane = ControlPlane::new(
             config,
             Box::new(MockEbpfBackend::new()),
@@ -152,10 +178,13 @@ impl Fixture {
         let service = Arc::clone(&state.observation.configuration);
         let commands = control_plane.command_sender();
         subscriptions.start(commands.clone());
+        state.observation.providers.attach(subscriptions.handle());
+        control_plane.attach_subscriptions(subscriptions.handle());
         let coordinator = service
             .start(
                 Some(entry),
                 Some(initial),
+                directory.path().join("state"),
                 control_plane.config_handle(),
                 control_plane.diagnostics_handle(),
                 commands.clone(),
@@ -341,7 +370,7 @@ impl Fixture {
 }
 
 fn sha256(content: &str) -> String {
-    super::digest(content.as_bytes())
+    crate::configuration::digest(content.as_bytes())
 }
 fn source_path(source: &Value) -> String {
     format!("/api/v1/config/sources/{}", source["id"].as_str().unwrap())
@@ -382,10 +411,6 @@ async fn accepted(response: Response) -> Value {
     );
     let location = response.headers()["location"].to_str().unwrap().to_owned();
     let body: Value = response.json().await.unwrap();
-    assert!(matches!(
-        body["kind"].as_str(),
-        Some("reload" | "group_update")
-    ));
     assert_eq!(body["href"], location);
     assert_eq!(
         location,
@@ -447,7 +472,7 @@ fn disk(root: &Path) -> Vec<DiskEntry> {
     fn visit(root: &Path, path: &Path, entries: &mut Vec<DiskEntry>) {
         let metadata = std::fs::symlink_metadata(path).unwrap();
         let hash = if metadata.is_file() {
-            super::digest(&std::fs::read(path).unwrap())
+            crate::configuration::digest(&std::fs::read(path).unwrap())
         } else {
             String::new()
         };

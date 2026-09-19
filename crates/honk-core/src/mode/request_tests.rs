@@ -1,5 +1,6 @@
-use super::super::catalog::Catalog;
 use super::*;
+use crate::control::client::{ControlError, ModeRequest};
+use crate::native_api::catalog::Catalog;
 use crate::{
     ebpf::{EbpfBackend, mock::MockEbpfBackend},
     mode::{ModeOverride, SharedModeState},
@@ -44,7 +45,7 @@ async fn owner(
     (flags, backend)
 }
 
-fn runtime(mode: OutboundMode, target: Option<String>) -> ModeRequest {
+fn runtime(mode: &'static str, target: Option<String>) -> ModeRequest {
     ModeRequest::Runtime { mode, target }
 }
 
@@ -58,17 +59,17 @@ async fn native_mode_and_target_publish_once_and_failure_preserves_both() {
     let identity = catalog.snapshot();
     let (flags, backend) = owner(ModeState::native(), None).await;
     let node = config.nodes[1].id;
-    let first = apply(
+    let first = apply_mode_request(
         &config,
-        &identity,
+        &identity.groups,
         &flags,
-        runtime(OutboundMode::Global, Some(node.to_string())),
+        runtime("Global", Some(node.to_string())),
     )
     .await
     .unwrap();
-    assert_eq!(first["mode"], "global");
-    assert_eq!(first["target"], node.to_string());
-    assert_eq!(first["source"], "runtime");
+    assert!(first.is_global());
+    assert!(matches!(first.target, Some(ModeTarget::Node { id, .. }) if id == node));
+    assert_eq!(first.source, ModeSource::Runtime);
     assert_eq!(backend.read().await.datapath_flags_write_log().len(), 2);
     assert_eq!(
         backend.read().await.datapath_flags_write_log()[1],
@@ -81,14 +82,9 @@ async fn native_mode_and_target_publish_once_and_failure_preserves_both() {
         .arm_datapath_flags_write_fault(1)
         .unwrap();
     assert!(
-        apply(
-            &config,
-            &identity,
-            &flags,
-            runtime(OutboundMode::Direct, None)
-        )
-        .await
-        .is_err()
+        apply_mode_request(&config, &identity.groups, &flags, runtime("Direct", None))
+            .await
+            .is_err()
     );
     let after = flags.snapshot();
     assert_eq!(after.mode, before.mode);
@@ -116,12 +112,7 @@ async fn concurrent_fence_and_atomic_mode_write_never_reopen_nfqueue() {
     let identity = catalog.snapshot();
     let (flags, backend) = owner(ModeState::native(), None).await;
     let (mode, fence) = tokio::join!(
-        apply(
-            &config,
-            &identity,
-            &flags,
-            runtime(OutboundMode::Direct, None)
-        ),
+        apply_mode_request(&config, &identity.groups, &flags, runtime("Direct", None)),
         flags.fence_nfqueue(),
     );
     mode.unwrap();
@@ -135,11 +126,11 @@ async fn concurrent_fence_and_atomic_mode_write_never_reopen_nfqueue() {
             .copied(),
         Some(ALL | ENABLED)
     );
-    apply(
+    apply_mode_request(
         &config,
-        &identity,
+        &identity.groups,
         &flags,
-        runtime(OutboundMode::Global, Some(identity.groups["Proxy"].clone())),
+        runtime("Global", Some(identity.groups["Proxy"].clone())),
     )
     .await
     .unwrap();
@@ -170,11 +161,11 @@ async fn refresh_retains_identity_and_missing_or_recreated_targets_fail_closed()
     let catalog = Catalog::new(&config);
     let (flags, _) = owner(ModeState::native(), None).await;
     let chosen = config.nodes[1].id;
-    apply(
+    apply_mode_request(
         &config,
-        &catalog.snapshot(),
+        &catalog.snapshot().groups,
         &flags,
-        runtime(OutboundMode::Global, Some(chosen.to_string())),
+        runtime("Global", Some(chosen.to_string())),
     )
     .await
     .unwrap();
@@ -202,14 +193,14 @@ async fn refresh_retains_identity_and_missing_or_recreated_targets_fail_closed()
         ModeOverride::Block
     );
     assert_eq!(flags.snapshot().source, ModeSource::Runtime);
-    assert_eq!(value(&flags.snapshot())["target"], chosen.to_string());
+    assert!(matches!(flags.snapshot().target, Some(ModeTarget::Node { id, .. }) if id == chosen));
 
     let group_id = catalog.snapshot().groups["Proxy"].clone();
-    apply(
+    apply_mode_request(
         &config,
-        &catalog.snapshot(),
+        &catalog.snapshot().groups,
         &flags,
-        runtime(OutboundMode::Global, Some(group_id.clone())),
+        runtime("Global", Some(group_id.clone())),
     )
     .await
     .unwrap();
@@ -265,11 +256,11 @@ async fn explicit_activation_reset_is_transactional_and_keeps_the_fence() {
     let config = config();
     let catalog = Catalog::new(&config);
     let (flags, backend) = owner(ModeState::native(), None).await;
-    apply(
+    apply_mode_request(
         &config,
-        &catalog.snapshot(),
+        &catalog.snapshot().groups,
         &flags,
-        runtime(OutboundMode::Direct, None),
+        runtime("Direct", None),
     )
     .await
     .unwrap();
@@ -291,11 +282,11 @@ async fn explicit_activation_reset_is_transactional_and_keeps_the_fence() {
         );
     }
     // A no-op explicit activation has the same reset semantics; ordinary reads do not.
-    apply(
+    apply_mode_request(
         &config,
-        &catalog.snapshot(),
+        &catalog.snapshot().groups,
         &flags,
-        runtime(OutboundMode::Rule, None),
+        runtime("Rule", None),
     )
     .await
     .unwrap();
@@ -305,7 +296,7 @@ async fn explicit_activation_reset_is_transactional_and_keeps_the_fence() {
         .await
         .reset_for_activation(backend.write().await.as_mut())
         .unwrap();
-    assert_eq!(value(&flags.snapshot())["source"], "config");
+    assert_eq!(flags.snapshot().source, ModeSource::Config);
 }
 
 #[tokio::test]
@@ -329,8 +320,8 @@ async fn native_clash_mutations_do_not_restore_or_persist_legacy_mode_cache() {
     let config = config();
     let catalog = Catalog::new(&config);
     let (native, _) = owner(ModeState::native(), Some(db.clone())).await;
-    assert_eq!(value(&native.snapshot())["mode"], "rule");
-    assert_eq!(value(&native.snapshot())["source"], "config");
+    assert!(native.snapshot().is_rule());
+    assert_eq!(native.snapshot().source, ModeSource::Config);
     native
         .set_clash_global_selection("Proxy".into(), &config, &catalog.snapshot().groups)
         .await
@@ -339,11 +330,10 @@ async fn native_clash_mutations_do_not_restore_or_persist_legacy_mode_cache() {
         .set_clash_mode("Global", &config, &catalog.snapshot().groups)
         .await
         .unwrap();
-    assert_eq!(
-        value(&native.snapshot())["target"],
-        catalog.snapshot().groups["Proxy"]
+    assert!(
+        matches!(native.snapshot().target, Some(ModeTarget::Group { id, .. }) if id == catalog.snapshot().groups["Proxy"])
     );
-    assert_eq!(value(&native.snapshot())["source"], "runtime");
+    assert_eq!(native.snapshot().source, ModeSource::Runtime);
     assert_eq!(db.load_clash_mode().as_deref(), Some("Direct"));
     assert_eq!(
         db.load_selector_choice("GLOBAL").as_deref(),
@@ -370,38 +360,15 @@ async fn native_clash_mutations_do_not_restore_or_persist_legacy_mode_cache() {
 }
 
 #[tokio::test]
-async fn malformed_or_unknown_mode_target_never_mutates_the_owner() {
-    for body in [
-        json!({}),
-        json!({"mode":"unknown"}),
-        json!({"mode":"GLOBAL","target":"x"}),
-        json!({"mode":"global"}),
-        json!({"mode":"global","target":""}),
-        json!({"mode":"direct","target":"x"}),
-        json!({"mode":"rule","target":null}),
-        json!({"mode":"global","target":7}),
-        json!({"mode":"rule","extra":true}),
-    ] {
-        assert_eq!(
-            decode(&serde_json::to_vec(&body).unwrap())
-                .unwrap_err()
-                .into_response()
-                .status(),
-            StatusCode::BAD_REQUEST
-        );
-    }
+async fn unknown_mode_target_never_mutates_the_owner() {
     let config = config();
     let catalog = Catalog::new(&config);
     let (flags, backend) = owner(ModeState::native(), None).await;
-    let request = decode(br#"{"mode":"global","target":"missing"}"#).unwrap();
-    assert_eq!(
-        apply(&config, &catalog.snapshot(), &flags, request)
-            .await
-            .unwrap_err()
-            .into_response()
-            .status(),
-        StatusCode::UNPROCESSABLE_ENTITY
-    );
+    let request = runtime("Global", Some("missing".into()));
+    assert!(matches!(
+        apply_mode_request(&config, &catalog.snapshot().groups, &flags, request).await,
+        Err(ControlError::NotFound)
+    ));
     assert_eq!(flags.snapshot().mode, "Rule");
     assert_eq!(flags.snapshot().source, ModeSource::Config);
     assert_eq!(backend.read().await.datapath_flags_write_log().len(), 1);
@@ -430,11 +397,11 @@ async fn incomplete_fence_blocks_mode_ready_resurrection_and_explicit_reopen() {
     let (flags, backend) = owner(ModeState::native(), None).await;
     backend.write().await.arm_quiesce_fault();
     assert!(flags.fence_nfqueue().await.is_err());
-    apply(
+    apply_mode_request(
         &config,
-        &catalog.snapshot(),
+        &catalog.snapshot().groups,
         &flags,
-        runtime(OutboundMode::Direct, None),
+        runtime("Direct", None),
     )
     .await
     .unwrap();

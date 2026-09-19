@@ -318,6 +318,9 @@ async fn assert_native_udp_builtin_plan(selector_block: bool) {
         .await
         .unwrap();
     assert_eq!(flows["flows"].as_array().unwrap().len(), 1);
+    let rule_id = format!("{}:0:fallback", flows["instance_id"].as_str().unwrap());
+    assert_eq!(flows["flows"][0]["rule_id"], rule_id);
+    assert_eq!(flows["flows"][0]["rule_source"], "recomputed");
     let flow_id = flows["flows"][0]["id"].as_str().unwrap();
     let detail: serde_json::Value = reqwest::Client::builder()
         .no_proxy()
@@ -333,6 +336,8 @@ async fn assert_native_udp_builtin_plan(selector_block: bool) {
         .json()
         .await
         .unwrap();
+    assert_eq!(detail["rule_id"], rule_id);
+    assert_eq!(detail["rule_source"], "recomputed");
     assert_eq!(
         detail["state"],
         if selector_block { "blocked" } else { "active" }
@@ -366,6 +371,28 @@ async fn assert_native_udp_builtin_plan(selector_block: bool) {
         server.shutdown().await;
         return;
     }
+    let connections: serde_json::Value = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("http://{api_addr}/api/v1/connections"))
+        .bearer_auth("native-race-test")
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let connection = connections["udp"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["flow_id"] == flow_id)
+        .unwrap();
+    assert_eq!(connection["rule_id"], rule_id);
+    assert_eq!(connection["rule_source"], "recomputed");
     let won_direct = steps
         .iter()
         .find(|step| {

@@ -42,9 +42,13 @@ use super::{
     types::RequestId,
 };
 
+mod planning;
 #[cfg(test)]
 mod tests;
 mod wire;
+
+use planning::{Attempt, Context, Plan, PreparedPlan, capture, prepare};
+use wire::execute;
 
 const MAX_MEMBERS: usize = 64;
 const MAX_RESULTS: usize = 256;
@@ -171,32 +175,6 @@ struct ResultRow {
     health_updated: bool,
     error: Option<&'static str>,
     observed_at: String,
-}
-struct Attempt {
-    node: Node,
-    ticket: NativeProbeTicket,
-    transport: Transport,
-    family: Family,
-    rows: Vec<usize>,
-    addr: Option<SocketAddr>,
-    server: Option<IpAddr>,
-}
-struct Plan {
-    request: ProbeRequest,
-    config: Arc<Config>,
-    manager: Arc<GroupManager>,
-    identity: Arc<CatalogIdentity>,
-    registry: Arc<OutboundRuntimeRegistry>,
-    dns: DnsPin,
-    group: Option<String>,
-    http: Option<http::Request<()>>,
-    destination: Option<(String, u16)>,
-    result: ProbeResult,
-    attempts: Vec<Attempt>,
-}
-enum DnsPin {
-    Runtime(crate::dns::runtime::RuntimeLease),
-    Standalone(Arc<crate::dns::forwarder::DnsForwarder>),
 }
 struct Job {
     reservation: Reservation,
@@ -471,10 +449,10 @@ impl ProbeService {
                         Some(Command::Pause(reply)) => {
                             while let Ok(job) = receiver.try_recv() {
                                 owner.operations.reject(&job.reservation.id, paused());
-                                owner.targets.lock().remove(&job.plan.request.target.key());
+                                owner.targets.lock().remove(&job.plan.context.spec.target.key());
                             }
                             owner.drain_requests().await;
-                            while let Some(result) = jobs.join_next().await { clean &= result.is_ok(); }
+                            while let Some(result) = jobs.join_next().await { clean &= matches!(result, Ok(Ok(()))); }
                             owner.gate.lock().state = if clean { WorkerState::Paused } else { WorkerState::Faulted };
                             let _ = reply.send(if clean { Ok(()) } else { Err(ProbeLifecycleError::CleanupFailed) });
                         }
@@ -492,19 +470,26 @@ impl ProbeService {
                         }
                         None => break,
                     },
-                    completed = jobs.join_next(), if !jobs.is_empty() => { clean &= completed.is_some_and(|result| result.is_ok()); },
+                    completed = jobs.join_next(), if !jobs.is_empty() => {
+                        clean &= matches!(completed, Some(Ok(Ok(()))));
+                        if !clean {
+                            let mut gate = owner.gate.lock();
+                            gate.state = WorkerState::Faulted;
+                            gate.cancel.send_replace(true);
+                        }
+                    },
                     job = receiver.recv(), if jobs.len() < MAX_ACTIVE => {
                         let Some(job) = job else { break; };
                         let gate = owner.gate.lock();
                         if gate.state != WorkerState::Running {
                             owner.operations.reject(&job.reservation.id, paused());
-                            owner.targets.lock().remove(&job.plan.request.target.key());
+                            owner.targets.lock().remove(&job.plan.context.spec.target.key());
                             continue;
                         }
                         let cancel = gate.cancel.subscribe();
                         let owner = Arc::clone(&owner);
                         let state = Arc::clone(&state);
-                        jobs.spawn(async move { owner.run_job(&state, job, cancel).await; });
+                        jobs.spawn(async move { owner.run_job(&state, job, cancel).await });
                     }
                 }
             }
@@ -517,7 +502,10 @@ impl ProbeService {
             receiver.close();
             while let Some(job) = receiver.recv().await {
                 owner.operations.reject(&job.reservation.id, unavailable());
-                owner.targets.lock().remove(&job.plan.request.target.key());
+                owner
+                    .targets
+                    .lock()
+                    .remove(&job.plan.context.spec.target.key());
             }
             owner.drain_requests().await;
             while jobs.join_next().await.is_some() {}
@@ -539,7 +527,7 @@ impl ProbeService {
                 },
             ));
         }
-        let key = job.plan.request.target.key();
+        let key = job.plan.context.spec.target.key();
         if targets.contains(&key) {
             return Err(reject(
                 ApiError::new(
@@ -559,24 +547,29 @@ impl ProbeService {
         permit.send(job);
         Ok(())
     }
-    async fn run_job(&self, state: &NativeState, mut job: Job, stop: watch::Receiver<bool>) {
+    async fn run_job(
+        &self,
+        state: &NativeState,
+        job: Job,
+        stop: watch::Receiver<bool>,
+    ) -> Result<(), ProbeLifecycleError> {
         let _running = RunningJob {
             service: self,
-            target: job.plan.request.target.key(),
+            target: job.plan.context.spec.target.key(),
             id: job.reservation.id.clone(),
         };
         let preparation = wire::bounded(job.deadline, stop.clone(), async {
             state.require_running()?;
-            prepare(state, &self.policy, &mut job.plan).await?;
+            let plan = prepare(&self.policy, job.plan).await?;
             state.require_running()?;
             if *stop.borrow() {
                 return Err(paused());
             }
-            Ok(())
+            Ok(plan)
         })
         .await;
         match preparation {
-            Ok(Ok(())) => {
+            Ok(Ok(mut plan)) => {
                 let accepted = {
                     let gate = self.gate.lock();
                     if gate.state != WorkerState::Running || *stop.borrow() {
@@ -591,9 +584,17 @@ impl ProbeService {
                 };
                 if accepted {
                     self.operations.running(&job.reservation.id);
-                    execute(state, &mut job.plan, job.deadline, stop).await;
+                    if execute(state, &mut plan, job.deadline, stop).await.is_err() {
+                        self.operations.fail_with_result(
+                            &job.reservation.id,
+                            "probe_cleanup_failed",
+                            "Probe runtime cleanup failed.",
+                            OperationResult::Probe(plan.result),
+                        );
+                        return Err(ProbeLifecycleError::CleanupFailed);
+                    }
                     self.operations
-                        .succeed(&job.reservation.id, OperationResult::Probe(job.plan.result));
+                        .succeed(&job.reservation.id, OperationResult::Probe(plan.result));
                 }
             }
             Ok(Err(error)) => {
@@ -610,6 +611,7 @@ impl ProbeService {
                 );
             }
         }
+        Ok(())
     }
 }
 
@@ -700,7 +702,6 @@ pub(super) async fn create(
                 return Err(paused());
             }
             let request: ProbeRequest = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-            validate(&request)?;
             let plan = capture(state, request).await?;
             state.require_running()?;
             service.rate.admit(id)?;
@@ -733,513 +734,6 @@ pub(super) async fn create(
     }
     drop(guard);
     Ok(admission.await?.into_response())
-}
-fn validate(request: &ProbeRequest) -> Result<(), ApiError> {
-    if match &request.target {
-        Target::Node { node_id } => node_id.is_empty(),
-        Target::Group { group_id } => group_id.is_empty(),
-    } {
-        return Err(invalid());
-    }
-    if request.transport.is_empty()
-        || request.transport.len() > 2
-        || request.transport.len() == 2 && request.transport[0] == request.transport[1]
-        || matches!(request.target, Target::Node { .. }) && request.members.is_some()
-    {
-        return Err(invalid());
-    }
-    if (request.kind == Kind::Dns) != (request.purpose == Purpose::Dns)
-        || request.kind != Kind::Dns && request.transport != [Transport::Tcp]
-    {
-        return Err(invalid());
-    }
-    if let Some(Members::Ids(ids)) = &request.members {
-        if ids.is_empty()
-            || ids.iter().any(String::is_empty)
-            || ids.iter().collect::<HashSet<_>>().len() != ids.len()
-        {
-            return Err(invalid());
-        }
-        if ids.len() > MAX_MEMBERS {
-            return Err(too_large());
-        }
-    }
-    Ok(())
-}
-
-async fn capture(state: &NativeState, request: ProbeRequest) -> Result<Plan, ApiError> {
-    // Publication holds router before config; all later owner snapshots are synchronous.
-    let _router = state.traffic_router.read().await;
-    let config_guard = state.config.read().await;
-    let config = Arc::clone(&config_guard);
-    let manager = state.group_manager.read().clone();
-    let registry = state.runtime_registry.read().clone();
-    let identity = state.observation.catalog.snapshot();
-    let dns = if let Some(provider) = state.dns.provider() {
-        DnsPin::Runtime(
-            provider
-                .try_acquire()
-                .map_err(|_| state.require_running().err().unwrap_or_else(unavailable))?,
-        )
-    } else {
-        DnsPin::Standalone(state.dns.forwarder())
-    };
-    let group = match &request.target {
-        Target::Node { .. } => None,
-        Target::Group { group_id } => Some(
-            identity
-                .groups
-                .iter()
-                .find(|(_, id)| *id == group_id)
-                .map(|(name, _)| name.clone())
-                .ok_or_else(not_found)?,
-        ),
-    };
-    if group
-        .as_ref()
-        .is_some_and(|name| !manager.native_probe_plan_within_limit(name, MAX_RESULTS))
-    {
-        return Err(too_large());
-    }
-    let members: Vec<_> = if let Some(group) = &group {
-        match request.members.as_ref() {
-            Some(Members::Scope(MemberScope::Leaves)) => manager
-                .native_probe_leaves(group, MAX_MEMBERS + 1)
-                .into_iter()
-                .map(NativeGroupMember::Node)
-                .collect(),
-            _ => {
-                let mut members = Vec::new();
-                for member in manager.native_members(group) {
-                    if let Some(Members::Ids(ids)) = &request.members {
-                        let id = member_id(member, &identity).ok_or_else(not_found)?;
-                        if !ids.contains(&id) {
-                            continue;
-                        }
-                    }
-                    members.push(member);
-                    if members.len() > MAX_MEMBERS {
-                        break;
-                    }
-                }
-                if let Some(Members::Ids(ids)) = &request.members
-                    && members.len() != ids.len()
-                {
-                    return Err(not_found());
-                }
-                members
-            }
-        }
-    } else {
-        let Target::Node { node_id } = &request.target else {
-            unreachable!()
-        };
-        vec![NativeGroupMember::Node(
-            config
-                .nodes
-                .iter()
-                .find(|node| node.id.to_string() == *node_id)
-                .ok_or_else(not_found)?,
-        )]
-    };
-    let families: &[Family] = match request.ip_version {
-        RequestedFamily::Ipv4 => &[Family::Ipv4],
-        RequestedFamily::Ipv6 => &[Family::Ipv6],
-        RequestedFamily::Any => &[Family::Ipv4, Family::Ipv6],
-    };
-    if members.len() > MAX_MEMBERS
-        || members
-            .len()
-            .saturating_mul(families.len())
-            .saturating_mul(request.transport.len())
-            > MAX_RESULTS
-    {
-        return Err(too_large());
-    }
-    let before = selections(&manager, &identity, group.as_deref());
-    let mut rows = Vec::new();
-    let mut attempts: Vec<Attempt> = Vec::new();
-    let mut unique: HashMap<(Uuid, Transport, Family), usize> = HashMap::new();
-    for member in members {
-        let member_id = member_id(member, &identity).ok_or_else(not_found)?;
-        if let NativeGroupMember::Node(node) = member {
-            if request.kind == Kind::TcpConnect
-                && matches!(
-                    node.protocol(),
-                    honk_config::types::NodeProtocol::Direct
-                        | honk_config::types::NodeProtocol::Block
-                )
-            {
-                return Err(unsupported());
-            }
-            if request.transport.contains(&Transport::Udp)
-                && !(honk_outbound::descriptor::descriptor(node.protocol()).supports_udp)(node)
-            {
-                return Err(unsupported());
-            }
-        }
-        for &transport in &request.transport {
-            for &family in families {
-                let domain = if transport == Transport::Tcp {
-                    ProbeDomain::Tcp
-                } else {
-                    ProbeDomain::DnsUdp
-                };
-                let leaf = manager.native_probe_leaf(member, domain, family.ip());
-                let index = rows.len();
-                rows.push(ResultRow {
-                    member_id: member_id.clone(),
-                    resolved_leaf_node_id: leaf.map(|node| node.id.to_string()),
-                    kind: request.kind,
-                    purpose: request.purpose,
-                    transport,
-                    ip_version: family,
-                    warmth: "unknown",
-                    state: if leaf.is_some() {
-                        "unknown"
-                    } else {
-                        "unavailable"
-                    },
-                    latency_ms: None,
-                    health_updated: false,
-                    error: Some(if leaf.is_some() {
-                        "not_started"
-                    } else {
-                        "no_eligible_leaf"
-                    }),
-                    observed_at: timestamp(SystemTime::now()),
-                });
-                if let Some(node) = leaf {
-                    if request.kind == Kind::TcpConnect
-                        && matches!(
-                            node.protocol(),
-                            honk_config::types::NodeProtocol::Direct
-                                | honk_config::types::NodeProtocol::Block
-                        )
-                    {
-                        return Err(unsupported());
-                    }
-                    if request.kind != Kind::TcpConnect {
-                        let entry = state
-                            .proxy_registry
-                            .find(node.protocol())
-                            .ok_or_else(unsupported)?;
-                        if transport == Transport::Udp
-                            && (!(entry.descriptor.supports_udp)(node) || entry.packet.is_none())
-                        {
-                            return Err(unsupported());
-                        }
-                    }
-                    if let Some(&attempt) = unique.get(&(node.id, transport, family)) {
-                        attempts[attempt].rows.push(index);
-                    } else {
-                        unique.insert((node.id, transport, family), attempts.len());
-                        attempts.push(Attempt {
-                            node: node.clone(),
-                            ticket: state.alive_set.native_probe_ticket(node.id),
-                            transport,
-                            family,
-                            rows: vec![index],
-                            addr: None,
-                            server: None,
-                        });
-                    }
-                }
-            }
-        }
-    }
-    let (http, destination) = match request.kind {
-        Kind::TcpConnect => (None, None),
-        Kind::Http => {
-            let url = group
-                .as_ref()
-                .and_then(|name| manager.native_group(name))
-                .and_then(|group| group.check_url.as_deref())
-                .or_else(|| config.global.tcp_check_url.first().map(String::as_str))
-                .ok_or_else(unsupported)?;
-            let http = honk_outbound::urltest::health_http_probe_request(
-                url,
-                &config.global.tcp_check_http_method,
-            )
-            .map_err(|_| unsupported())?;
-            let host = http
-                .uri()
-                .host()
-                .ok_or_else(unsupported)?
-                .trim_matches(['[', ']'])
-                .to_owned();
-            let port =
-                http.uri()
-                    .port_u16()
-                    .unwrap_or(if http.uri().scheme_str() == Some("https") {
-                        443
-                    } else {
-                        80
-                    });
-            (Some(http), Some((host, port)))
-        }
-        Kind::Dns => {
-            match honk_config::check::select_dns_check_target(&config.global.udp_check_dns)
-                .map_err(|_| unsupported())?
-                .ok_or_else(unsupported)?
-            {
-                honk_config::check::DnsCheckTarget::Literal(addr) => {
-                    (None, Some((addr.ip().to_string(), addr.port())))
-                }
-                honk_config::check::DnsCheckTarget::Domain { host, port } => {
-                    (None, Some((host.to_owned(), port)))
-                }
-            }
-        }
-    };
-    let result = ProbeResult {
-        target: request.target.clone(),
-        selection_changed: TransportMap {
-            tcp: false,
-            udp: false,
-        },
-        selection_before: before.clone(),
-        selection_after: before,
-        results: rows,
-    };
-    drop(config_guard);
-    Ok(Plan {
-        request,
-        config,
-        manager,
-        identity,
-        registry,
-        dns,
-        group,
-        http,
-        destination,
-        result,
-        attempts,
-    })
-}
-
-fn member_id(member: NativeGroupMember<'_>, identity: &CatalogIdentity) -> Option<String> {
-    match member {
-        NativeGroupMember::Node(node) => Some(node.id.to_string()),
-        NativeGroupMember::Group(group) => identity.groups.get(&group.name).cloned(),
-    }
-}
-fn selections(
-    manager: &GroupManager,
-    identity: &CatalogIdentity,
-    group: Option<&str>,
-) -> TransportMap<Option<String>> {
-    let pick = |network| {
-        group
-            .and_then(|name| manager.native_selection(name, network))
-            .and_then(|selection| member_id(selection.member, identity))
-    };
-    TransportMap {
-        tcp: pick(SelectionNetwork::Tcp),
-        udp: pick(SelectionNetwork::Udp),
-    }
-}
-
-async fn prepare(state: &NativeState, policy: &Policy, plan: &mut Plan) -> Result<(), ApiError> {
-    let https = plan
-        .http
-        .as_ref()
-        .is_some_and(|request| request.uri().scheme_str() == Some("https"));
-    let mut resolved: HashMap<String, Vec<IpAddr>> = HashMap::new();
-    for attempt in &mut plan.attempts {
-        let (host, port) = plan
-            .destination
-            .as_ref()
-            .map(|(host, port)| (host.as_str(), *port))
-            .unwrap_or((attempt.node.host(), attempt.node.port));
-        if !policy.port(plan.request.kind, port, https) {
-            return Err(unsupported());
-        }
-        let ips = resolve(state, &plan.dns, &mut resolved, host).await;
-        if ips.iter().any(|&ip| !policy.address(ip)) {
-            return Err(unsupported());
-        }
-        attempt.addr = ips
-            .iter()
-            .copied()
-            .find(|&ip| attempt.family.matches(ip))
-            .map(|ip| SocketAddr::new(ip, port));
-        if plan.request.kind != Kind::TcpConnect
-            && attempt.node.protocol() != honk_config::types::NodeProtocol::Direct
-        {
-            let ips = resolve(state, &plan.dns, &mut resolved, attempt.node.host()).await;
-            if ips.iter().any(|&ip| !policy.address(ip)) {
-                return Err(unsupported());
-            }
-            attempt.server = ips.first().copied();
-            if attempt.server.is_none() {
-                attempt.addr = None;
-            }
-        }
-        if attempt.transport == Transport::Udp
-            && !honk_outbound::descriptor::udp_target_allowed(&attempt.node, port)
-        {
-            return Err(unsupported());
-        }
-        if attempt.addr.is_none() {
-            for &row in &attempt.rows {
-                plan.result.results[row].error = Some("address_unavailable");
-                plan.result.results[row].observed_at = timestamp(SystemTime::now());
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn resolve(
-    state: &NativeState,
-    dns: &DnsPin,
-    resolved: &mut HashMap<String, Vec<IpAddr>>,
-    host: &str,
-) -> Vec<IpAddr> {
-    if let Ok(ip) = host.trim_matches(['[', ']']).parse() {
-        return vec![normalize(ip)];
-    }
-    if let Some(ips) = resolved.get(host) {
-        return ips.clone();
-    }
-    let mut ips = Vec::new();
-    for qtype in [1, 28] {
-        let query = crate::dns::forwarder::build_dns_query(host, qtype);
-        let outcome = match dns {
-            DnsPin::Runtime(lease) => {
-                let Ok(_permit) = lease.runtime().try_acquire_query() else {
-                    continue;
-                };
-                state
-                    .dns
-                    .resolve_outcome_with_runtime(
-                        lease,
-                        &query,
-                        crate::dns::query::DnsRequestMeta::EMPTY,
-                        crate::dns::query::IngressProfile::Api,
-                    )
-                    .await
-            }
-            DnsPin::Standalone(forwarder) => forwarder
-                .resolve_outcome_with_context_and_profile(
-                    &query,
-                    crate::dns::query::DnsRequestMeta::EMPTY,
-                    crate::dns::query::IngressProfile::Api,
-                )
-                .await
-                .map_err(Into::into),
-        };
-        if let Ok(outcome) = outcome {
-            for ip in outcome.answer_ips().iter().copied().map(normalize) {
-                if !ips.contains(&ip) {
-                    ips.push(ip);
-                }
-            }
-        }
-    }
-    resolved.insert(host.to_owned(), ips.clone());
-    ips
-}
-
-async fn execute(
-    state: &NativeState,
-    plan: &mut Plan,
-    deadline: Instant,
-    stop: watch::Receiver<bool>,
-) {
-    for attempt in &plan.attempts {
-        let Some(addr) = attempt.addr else {
-            continue;
-        };
-        if *stop.borrow() || Instant::now() >= deadline {
-            for &row in &attempt.rows {
-                plan.result.results[row].error = Some(if *stop.borrow() {
-                    "cancelled"
-                } else {
-                    "deadline"
-                });
-                plan.result.results[row].observed_at = timestamp(SystemTime::now());
-            }
-            continue;
-        }
-        let outcome = wire::attempt(state, plan, attempt, addr, deadline, stop.clone()).await;
-        let sample = outcome.sample;
-        let completed = outcome.completed;
-        let error = outcome.error;
-        let warmth = if sample.is_some() {
-            if plan.request.kind == Kind::Http && plan.request.warmth == Warmth::Warm {
-                "warm"
-            } else {
-                "cold"
-            }
-        } else {
-            "unknown"
-        };
-        let observed_at = outcome.observed_at;
-        let observation = NativeHealthObservation {
-            transport: if attempt.transport == Transport::Tcp {
-                HealthTransport::Tcp
-            } else {
-                HealthTransport::Udp
-            },
-            purpose: if plan.request.purpose == Purpose::Data {
-                HealthPurpose::Data
-            } else {
-                HealthPurpose::Dns
-            },
-            measurement: match plan.request.kind {
-                Kind::TcpConnect => HealthMeasurement::TcpConnect,
-                Kind::Http => HealthMeasurement::HttpHeaders,
-                Kind::Dns => HealthMeasurement::DnsRoundTrip,
-            },
-            ip_version: attempt.family.ip(),
-            warmth: match warmth {
-                "cold" => HealthWarmth::Cold,
-                "warm" => HealthWarmth::Warm,
-                _ => HealthWarmth::Unknown,
-            },
-            sample_source: "probe",
-            state: if sample.is_some() {
-                HealthState::Healthy
-            } else {
-                HealthState::Unavailable
-            },
-            latency: sample.map(|sample| sample.latency),
-            observed_at,
-            error,
-        };
-        for &index in &attempt.rows {
-            let row = &mut plan.result.results[index];
-            let context = match &plan.request.target {
-                Target::Group { group_id } => Some(NativeGroupProbeContext {
-                    group_id: Uuid::parse_str(group_id).expect("catalog UUID"),
-                    member_id: Uuid::parse_str(&row.member_id).expect("catalog member UUID"),
-                }),
-                Target::Node { .. } => None,
-            };
-            row.health_updated = completed
-                && state
-                    .alive_set
-                    .complete_native_probe(&attempt.ticket, context, observation);
-            row.state = if sample.is_some() {
-                "healthy"
-            } else if completed {
-                "unavailable"
-            } else {
-                "unknown"
-            };
-            row.latency_ms = sample.map(|sample| sample.latency.as_secs_f64() * 1000.0);
-            row.warmth = warmth;
-            row.error = error;
-            row.observed_at = timestamp(observed_at);
-        }
-    }
-    plan.result.selection_after = selections(&plan.manager, &plan.identity, plan.group.as_deref());
-    plan.result.selection_changed = TransportMap {
-        tcp: plan.result.selection_before.tcp != plan.result.selection_after.tcp,
-        udp: plan.result.selection_before.udp != plan.result.selection_after.udp,
-    };
 }
 fn normalize(ip: IpAddr) -> IpAddr {
     match ip {
