@@ -24,7 +24,7 @@
 | `allow_anonymous_loopback` | `false` | 仅在 secret 为空且实际监听 IP 为 loopback 时允许无凭证请求。配置 secret 后仍必须认证。 |
 | `allow_origins` | 空列表 | 额外允许的完整 HTTP(S) Origin；不含路径、凭据、query、fragment、`null` 或通配符。 |
 | `allowed_hosts` | 空列表 | 额外允许的 HTTP Host authority；不含 URL scheme、路径、凭据或通配符。省略端口表示 80，不是监听端口。 |
-| `ui` | `""` | 空值关闭托管；非空为含可读 `index.html` 的可信本地目录。不支持内嵌产物，也不在启动时下载或构建。 |
+| `ui` | `""` | 空值关闭托管；其他值为含可读 `index.html` 的可信本地目录，或配合默认关闭的 `native-ui` feature 使用 `embedded`。启动不下载、不解压、不构建前端。 |
 | `record_flows` | `true` | 原生 API 启用后保留有界用户态决策，无客户端也记录；`false` 关闭记录并释放缓冲，需重启。 |
 | `record_traffic` | `true` | 无客户端也记录流量 history；最多 600 点/600 秒，false 在重启后释放对应缓冲，不关闭即时计数。 |
 | `record_memory` | `true` | 无客户端也记录 RSS/cgroup history；最多 600 点/600 秒，false 在重启后释放对应缓冲，不关闭即时内存观测。 |
@@ -35,6 +35,8 @@
 | `config_content` | `false` | 向通过控制 bearer 认证的管理员返回获准源的完整原文；要求非空 secret，含 API 凭据的整个源仍省略正文。 |
 | `config_write` | `false` | 允许非凭据主文件及明确授权的已接受 include 原文替换，耐久写入后排队真实 reload；要求非空 secret。 |
 | `writable_includes` | 空列表（`[]`） | 已接受 include 相对入口目录的规范化 `.dae` 路径精确许可列表；不接受绝对路径、遍历、glob 或任意新文件。dae 中省略字段表示空列表。 |
+| `geosite_download_url` | `""` | 更新已加载 geosite 的最终直达 HTTP(S) 来源；要求 `config_write`，已加载该资产而 URL 为空时不能更新。 |
+| `geoip_download_url` | `""` | 更新已加载 geoip 的最终直达 HTTP(S) 来源，使用相同授权与限制。 |
 
 ```dae
 experimental {
@@ -58,6 +60,10 @@ experimental {
 
 相对 UI 路径沿用依赖搜索顺序：`global.data_dir` 下已有路径、`/var/share/honk` 下已有路径、工作目录已有路径；均不存在时定位到 `global.data_dir` 并在启动时报错。目录及其符号链接目标均由可信管理员负责。参见[原生 API 契约](./api.md#原生-api-m1)。
 
+单文件部署可使用 `cargo build -p honk-core --features native-ui` 与 `ui: embedded`；`native-ui` 隐含 `native-api`，不要求 Clash。没有 `native-ui` 时启用内嵌托管会启动失败。访问 `/ui/` 后在真实 doona 登录表单输入 bearer。产物/源码身份、对应源码分发和管理契约见 [API 参考](./api.md#内嵌-doona-来源)。
+
+Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒绝 userinfo、fragment、redirect 与 content encoding。域名来源要求 `global.bootstrap_resolver`，不回退系统 DNS、不选择代理 detour；所有已加载资产都要有配置来源才能更新。[M9 契约](./api.md#主文件条目与-geodata-管理m9)区分网络期限、已验证字节激活及部分耐久替换，不承诺回滚。
+
 ### M5：共用采样与可选历史
 
 流量与内存 history 共用既有一秒 sampler，错过 tick 使用 Skip；仅存内存，重启清空，不插值、不补零，缺口与 null 原样保留。读取依据实际 RSS/cgroup v2 文件，不把未知值伪装为零，也不宣称内核内存核算。关闭 history 不关闭即时 runtime、出站或内存读取；所有记录开关仍需重启。已启用的日志/DNS 日志/flow 可通过 `/runtime/settings` 临时调整级别或留存上限，但不能动态开启被配置关闭的 recorder。合并全量校验后原子生效；显式配置激活（含 no-op）恢复配置值，provider/network refresh 保留临时值，见 [API 契约](./api.md#provider日志与临时设置)。
@@ -66,7 +72,7 @@ experimental {
 
 配置来源仅在真实 `.dae` 启动加载时捕获；程序内构造的配置或 serde 加载不提供无损源管理。默认只公开已接受的元数据，私有路径显示为 `<redacted>`。开启 `config_content` 或 `config_write` 必须设置非空有效 secret，匿名 loopback 不例外。完整 content 可能包含节点凭据、订阅 URL 或路径，不是脱敏或沙箱化保存载荷；含 API 凭据的整个源不返回正文且只读。API 禁止改变或迁移凭据及原生设置；需管理员本地修改并重启。若主文件包含凭据，要先在本地将其移至专用只读 include，再重启，才能通过 API 编辑该主文件。
 
-例如 `writable_includes: 'conf.d/routing.dae', 'conf.d/groups.dae'` 只授权已接受集合中的这两个规范化路径，不改变普通 include 的 glob、排序或无匹配语义。全量源/校验预算为 32 个来源、8 MiB，依赖的每次实体化也计入预算；HTTP JSON body 仍最多 64 KiB。源 PUT 要求磁盘原字节 SHA-256 的强 `If-Match`；组 PATCH 则使用 accepted 配置 revision，并独立检查源字节/依赖。正文披露与写许可是两个独立开关，content 缺失时不得回写空字符串或脱敏响应。具体校验、冲突、幂等、耐久性与 reload 失败恢复见 [M6 API 契约](./api.md#配置来源校验与操作m6)。Selector 分网络控制与可写来源的受限组 PATCH 已实现；自动策略 override、节点/provider CRUD 和 geodata 管理仍关闭。
+例如 `writable_includes: 'conf.d/routing.dae', 'conf.d/groups.dae'` 只授权这些已接受规范化路径，不改变普通 include 的 glob、排序或无匹配语义。全量源/校验预算为 32 个来源、8 MiB，重复依赖实体化也计费；HTTP JSON body 仍最多 64 KiB。源 PUT 使用磁盘字节 SHA-256 强 If-Match，组 PATCH 使用 accepted revision 并独立检查源/依赖。正文披露与写许可独立，content 缺失时不得回写空字符串或脱敏响应。Selector、受限组 PATCH 和 M9 主文件创建/删除均复用来源权威；自动策略 override 仍关闭。具体失败恢复见 [API 契约](./api.md#主文件条目与-geodata-管理m9)。
 
 
 ## `clash_api`

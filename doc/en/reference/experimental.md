@@ -24,7 +24,7 @@ Requires the default-off `native-api` Cargo feature; it does not require `clash-
 | `allow_anonymous_loopback` | `false` | Permit credential-free requests only when secret is empty and the actual listening IP is loopback. A configured secret always requires authentication. |
 | `allow_origins` | empty list | Additional explicit HTTP(S) origins, without paths, credentials, query, fragment, `null`, or wildcards. |
 | `allowed_hosts` | empty list | Additional explicit HTTP Host authorities, without URL schemes, paths, credentials, or wildcards. Omitted port means 80, not the listener's port. |
-| `ui` | `""` | Empty disables hosting; otherwise a trusted local directory with readable `index.html`. No embedded UI or startup download/build. |
+| `ui` | `""` | Empty disables hosting; otherwise a trusted local directory with readable `index.html`, or `embedded` with the default-off `native-ui` feature. No startup download, extraction or frontend build. |
 | `record_flows` | `true` | Retain bounded userspace decisions while native API is enabled, even without clients. `false` disables recording and releases its buffers; restart-required. |
 | `record_traffic` | `true` | Keep up to 600 traffic samples for 600 seconds, even without clients. `false` disables history and releases its buffer on restart; current counters remain available. |
 | `record_memory` | `true` | Keep up to 600 memory samples for 600 seconds, even without clients. `false` disables history and releases its buffer on restart; current readings remain available. |
@@ -35,6 +35,8 @@ Requires the default-off `native-api` Cargo feature; it does not require `clash-
 | `config_content` | `false` | Allow authenticated administrators to read exact accepted source text, excluding entire API-credential-bearing sources. Requires a nonempty `secret`. |
 | `config_write` | `false` | Allow whole-source replacement and reload for the accepted main file and explicitly authorized includes, excluding API-credential-bearing sources. Requires a nonempty `secret`. |
 | `writable_includes` | empty list | Explicit canonical entry-directory-relative `.dae` paths, such as `'parts/routing.dae'`; only already accepted includes qualify. No absolute paths, traversal or globs; ignored for write permission unless `config_write` is true. |
+| `geosite_download_url` | `""` | Final direct HTTP(S) source for updating the loaded geosite asset. Requires `config_write`; empty disables updates when geosite is loaded. |
+| `geoip_download_url` | `""` | Final direct HTTP(S) source for updating the loaded geoip asset, with the same authorization and bounds. |
 
 ```dae
 experimental {
@@ -57,6 +59,10 @@ Default Host acceptance is the concrete listening authority; loopback also accep
 Lists use individually quoted comma-separated entries, such as `allow_origins: 'http://localhost:3000', 'https://panel.example'`. Omit a list to leave it empty; JSON brackets and a single aggregate-quoted list are not accepted.
 
 Relative UI paths follow the existing dependency search: an existing path under `global.data_dir`, then `/var/share/honk`, then the working directory; a missing dependency resolves under `global.data_dir` and startup fails. The administrator owns the directory and any symlink targets. See the [native API contract](./api.md#native-api-m1).
+
+For a single binary, build `cargo build -p honk-core --features native-ui` and use `ui: embedded`; `native-ui` includes `native-api` without requiring Clash. Without `native-ui`, enabled embedded hosting fails startup. Open `/ui/` and supply the bearer token in doona's login form. Asset/source identities, corresponding-source distribution and the M9 management contract are documented in the [API reference](./api.md#embedded-doona-provenance).
+
+Geodata sources are administrator-controlled, restart-required and cannot be changed through source writes. Userinfo, fragments, redirects and content encoding are rejected. Hostname sources require `global.bootstrap_resolver`; no system-DNS fallback or proxy detour is used. All loaded assets need a configured source before updates are available. The [M9 contract](./api.md#managed-entries-and-geodata-m9) distinguishes network limits, verified-byte activation and partial durable replacement from rollback.
 
 Traffic and memory histories share the existing one-second sampler; missing samples/measurements remain gaps/nulls rather than zero-filled or interpolated points. Memory is actual process RSS and available cgroup-v2 data, not kernel accounting. File settings remain restart-required. `PATCH /api/v1/runtime/settings` can transiently adjust the supported log/DNS-log/flow limits and native log level, but cannot enable a disabled recorder. Accepted explicit activation, including no-op, restores configured values; provider/network refresh and suspend/resume preserve overrides.
 
