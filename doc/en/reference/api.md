@@ -310,7 +310,7 @@ The caller selects the test URL with `?url=`. A group request fans out to at mos
 
 Delay tests use the canonical HTTP check-target decoder: HEAD preserves the raw path/query (including dot segments and query-only `/?query`), while authority omits credentials/default ports and fragments are never sent. They share periodic health checks' HTTP implementation and report the second request's warm-path RTT, excluding proxy dial, target TLS and the first request. HTTPS verifies certificates, negotiates HTTP/2 or HTTP/1.1, and disables server push. Both final responses must have valid decoded 200–499 statuses. A measured-round transport failure or timeout can fall back to the validated first sample; HTTP/1 partial responses never fall back, including on timeout, while graceful HTTP/2 GOAWAY can. HTTP/1 informational and final response heads share a 16 KiB per-round cap; H2 response header lists also have a 16 KiB cap. Session warm-up, dial, target TLS, H2 startup and each request have separate timeout budgets. Cold reusable generation probes use guarded temporary runtimes that close afterward; HTTP/2 drivers are released on completion or cancellation, so group scans retain no new reusable runtime per tested node.
 
-Known limitation: [`h2` 0.4.19 can report 200 for a response missing `:status`](https://github.com/hyperium/h2/issues/958). Such a malformed HTTP/2 response may still yield a successful delay result. The dependency fix is deferred pending upstream; there is no local fork/vendor patch.
+Known limitation of the locked dependency: [`h2` 0.4.19 can report 200 for a response missing `:status`](https://github.com/hyperium/h2/issues/958). Such a malformed HTTP/2 response may still yield a successful delay result. [Upstream fix #959](https://github.com/hyperium/h2/pull/959) is merged but not included in this locked release; adoption awaits a published release containing it, without a local fork/vendor patch.
 
 Successful measurements update the node latency history. Failures return `503` for a single node, are omitted from the group result, and append a failure strike used by URLTest selection.
 
@@ -395,8 +395,10 @@ A non-empty `external_ui_download_detour` forces the initial request and redirec
 H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
 R = {
   coldExplore, periodicExplore, reliabilityWinner, performanceWinner,
-  incumbentHeld, freshFailureBypass, deadFiltered, switchFlap,
-  failStreakExcluded, exploreBackedOff
+  incumbentHeld, insufficientEvidenceHeld, incumbentIneligible,
+  freshFailureBypass, deadFiltered, ordinarySwitch, switchFlap,
+  failStreakExcluded, exploreBackedOff, carrierPressure, carrierRttPressure,
+  carrierLossPressure, carrierValidation
 } // every R value is a u64 count
 ```
 
@@ -449,7 +451,11 @@ events.
 
 `score.groups` is an additive part of the authenticated `/stats` response. It is an empty array when no group currently uses `policy: score`; otherwise it contains every current Score group, including groups with no resolved leaves, sorted lexicographically by `name`. Each group always has both `tcp` and `udp` objects, and each object always has every `R` field above. Missing network activity is represented by zeroes, never omitted fields.
 
-Each value is a saturating `u64` count, not a latency, throughput or health measurement. One authorized multi-candidate Score Apply records one final reason: `coldExplore` for the finite startup allowance; `periodicExplore` for shared time/count/degradation revalidation; `incumbentHeld` for a retained committed winner; `freshFailureBypass` when fresh failure defeats eligibility or holding; `reliabilityWinner` when no alternative qualifies for normal comparison; otherwise `performanceWinner`. A performance reason does not prove improvement or a switch. `deadFiltered` counts unique health-filtered leaves. `switchFlap` counts return to the prior committed winner within eight target-scoped selections, excluding trials. `failStreakExcluded` and `exploreBackedOff` count affected candidates per rank. Peek, API reads, singleton bypass and last resort do not increment these counters.
+Each value is a saturating `u64` count, not a latency, throughput or health measurement. One authorized multi-candidate Score Apply records one final reason: `coldExplore` or `periodicExplore` for validation; `incumbentIneligible` for leaving an incumbent outside ordinary eligibility; `freshFailureBypass` for an eligible incumbent's unresolved business failure; `insufficientEvidenceHeld` when no challenger earns promotion and the ordinary utility winner lacks a qualified shared performance comparison; `incumbentHeld` when comparison does not clear the hold margin; otherwise `reliabilityWinner` or `performanceWinner` retain their alternative-eligibility classification. `performanceWinner` does not prove improvement or a switch, and `insufficientEvidenceHeld` does not mean reliability history is absent. `ordinarySwitch` counts actual committed normal A→B choices; `switchFlap` counts returns to the prior winner within eight same-target ordinary choices. First choices, trials and missing prior history cannot add switches. `deadFiltered`, `failStreakExcluded` and `exploreBackedOff` count affected candidates per rank. Peek, API reads, singleton bypass and last resort do not increment these counters; ranks in nested groups are not a one-to-one count of dispatched connections.
+
+`carrierPressure` counts fresh carrier-family episodes admitted into an existing group/network aggregate cell, not packets or failed connections; duplicate heartbeat reads do not increment it. `carrierValidation` counts periodic validation selections while the ordinary winner has a carrier hint newer than the previous validation. It is an overlapping diagnostic count, not another exclusive reason or proof that the hint alone caused the selection. Hints do not alter business reliability, qualification or health. These fields are readonly on API reads; carrier observations arrive from the control heartbeat independently of selection calls.
+
+`carrierRttPressure` and `carrierLossPressure` retain the accepted episode's reason. An episode indicating both increments both reason counters but increments `carrierPressure` only once. These overlapping counts do not identify a specific carrier/transport, measure an application loss rate, or add failures; duplicate or stale hints increment none of them. TCP loss pressure means retransmission pressure, not confirmed application packet loss.
 
 Counters begin at zero on process start and accumulate in process memory only. They survive a successful reload while the group name remains configured, including zero-leaf and temporary Score-to-non-Score-to-Score transitions; non-Score groups are hidden from this response. A committed deletion prunes that name's counters, and a recreated name starts at zero. Generation-fenced superseded managers cannot mutate counters after replacement, including after same-name recreation. The snapshot is copied before JSON serialization, so reading it cannot mutate selection state.
 
@@ -462,7 +468,7 @@ Score group objects in `/proxies` and `/proxies/{name}` add `scoreVerification`.
 | Field | Meaning |
 | --- | --- |
 | `selected` | Existing public member tag for this readonly evaluation, or null with no ordinary eligible candidate. TCP `now` uses this same evaluated choice when present. |
-| `state` | `provisional` or `observedUsable`; the latter requires recent business evidence, not successful HEAD probes alone. |
+| `state` | `provisional` or `observedUsable`; the latter requires recent successful-terminal business evidence, not probes or live RX alone. Ordinary qualification retention and recovery do not relax this certification. |
 | `comparison` / `basis` | `unconfirmed`, `equivalent` or `supported`, with `none`, `configuredProbe`, `targetResponse`, `aggregateResponse`, `upload` or `download` as the limited evidence basis. No probability or guaranteed optimum is implied. |
 | `missing` | Boolean availability/response/transfer gaps across the relevant candidate coverage; selected usability can be observed while an alternative still needs validation. |
 | `nextAction` | `nextBusinessFlow` reserves future real work only when the shared budget permits; `awaitTransfer` waits for real offered load, never active bulk testing; `backoff` retains failure isolation; `none` means no actionable missing work. |

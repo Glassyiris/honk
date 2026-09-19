@@ -285,7 +285,7 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 
 延迟测试使用规范的 HTTP 检查目标解码器：HEAD 保留原始路径与查询串（包括点段和仅查询串的 `/?query`），authority 移除凭据和默认端口，fragment 不会发送。它与周期健康检查共享 HTTP 实现，报告第二轮请求的热路径 RTT，不含代理拨号、目标 TLS 与第一轮请求。HTTPS 验证证书，协商 HTTP/2 或 HTTP/1.1，并禁用 server push。两轮最终响应的解码状态都必须为有效的 200–499。第二轮传输失败或超时可回退到已验证的第一轮样本；HTTP/1 部分响应即使超时也不回退，而正常 HTTP/2 GOAWAY 可以回退。每轮 HTTP/1 临时响应头与最终响应头的累计上限为 16 KiB，H2 响应头列表上限同样为 16 KiB。session 预热、拨号、目标 TLS、H2 启动与每轮请求分别使用阶段预算。冷可复用 generation 探测使用带 guard 的临时 runtime，结束后关闭；HTTP/2 driver 在完成或取消后释放，因此组扫描不会为每个已测试节点留下新的常驻可复用 runtime。
 
-已知限制：[`h2` 0.4.19 可能把缺少 `:status` 的响应报告为 200](https://github.com/hyperium/h2/issues/958)，因此这种畸形 HTTP/2 响应仍可能得到成功的延迟结果。该依赖修复已明确延期，等待上游处理，不使用本地 fork/vendor 补丁。
+当前锁定依赖的已知限制：[`h2` 0.4.19 可能把缺少 `:status` 的响应报告为 200](https://github.com/hyperium/h2/issues/958)，因此这种畸形 HTTP/2 响应仍可能得到成功的延迟结果。[上游修复 #959](https://github.com/hyperium/h2/pull/959) 已合并，但当前锁定版本尚未包含；等待包含修复的正式版本后更新依赖，不使用本地 fork/vendor 补丁。
 
 成功测量会更新节点延迟历史。单节点失败返回 `503`；组测量会省略失败成员；两者都会追加供 URLTest 选择使用的 failure strike。
 
@@ -370,8 +370,10 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
 R = {
   coldExplore, periodicExplore, reliabilityWinner, performanceWinner,
-  incumbentHeld, freshFailureBypass, deadFiltered, switchFlap,
-  failStreakExcluded, exploreBackedOff
+  incumbentHeld, insufficientEvidenceHeld, incumbentIneligible,
+  freshFailureBypass, deadFiltered, ordinarySwitch, switchFlap,
+  failStreakExcluded, exploreBackedOff, carrierPressure, carrierRttPressure,
+  carrierLossPressure, carrierValidation
 } // R 的每个值均为 u64 计数
 ```
 
@@ -395,7 +397,11 @@ R = {
 
 `score.groups` 是经鉴权 `/stats` 响应中的附加部分。当前没有任何组使用 `policy: score` 时它为 `[]`；否则它包含每个当前 Score 组（包括没有解析出叶节点的组），按 `name` 的字典序排列。每组始终都有 `tcp` 和 `udp` 对象，且每个对象始终包含全部 `R` 字段；没有网络活动时以零表示，绝不省略字段。
 
-每个值是饱和 `u64` 计数，不是延迟、吞吐或健康测量。一次已授权的多候选 Score Apply 记录一个最终原因：`coldExplore` 表示有限冷启动预算；`periodicExplore` 表示共享时间/计数/退化验证；`incumbentHeld` 表示保持已提交胜者；`freshFailureBypass` 表示新鲜失败使资格或保持失效；没有其他普通合格候选时为 `reliabilityWinner`，其余为 `performanceWinner`。性能原因不证明提速或发生切换。`deadFiltered` 计数唯一健康过滤叶节点；`switchFlap` 计数同目标八次选择内返回前一已提交胜者，不包含试用；`failStreakExcluded` 和 `exploreBackedOff` 按 rank 计数受影响候选。Peek、API 读取、单例与最后尝试旁路不增加这些计数。
+每个值是饱和 `u64` 计数，不是延迟、吞吐或健康测量。一次已授权的多候选 Score Apply 记录一个最终原因：`coldExplore` 或 `periodicExplore` 表示验证；`incumbentIneligible` 表示现任已不满足普通资格；`freshFailureBypass` 表示合格现任的业务失败尚未恢复；`insufficientEvidenceHeld` 表示没有挑战者获得晋升且普通 utility 赢家缺少双方合格的性能比较；`incumbentHeld` 表示比较优势未跨过保持门槛；其余 `reliabilityWinner`、`performanceWinner` 保留按替代候选资格分类的含义。`performanceWinner` 不证明提速或发生切换，`insufficientEvidenceHeld` 不表示可靠性历史缺失。`ordinarySwitch` 统计实际普通已提交 A→B 选择；`switchFlap` 统计其中同目标八次普通选择内返回前一赢家的情况。首次选择、试用及缺少之前历史时不能增加切换计数。`deadFiltered`、`failStreakExcluded` 和 `exploreBackedOff` 按 rank 累计受影响候选。Peek、API 读取、单例与最后尝试旁路不增加这些计数；嵌套组 rank 与实际出站连接并非一一对应。
+
+`carrierPressure` 统计被已有组／网络聚合 cell 接收的新鲜 carrier 地址族事件，不是包数或失败连接数；重复心跳读取不增加它。`carrierValidation` 统计普通赢家具有晚于上次验证的 carrier 提示时发生的周期验证选择；它是可重叠的诊断计数，不是新的互斥原因，也不证明只有该提示导致选择。提示不改变业务可靠性、资格或健康。字段在 API 读取时只读；carrier 观测由控制心跳接入，与选路调用独立。
+
+`carrierRttPressure` 与 `carrierLossPressure` 保留被接收事件的原因。两种条件同时满足时，两个原因计数均增加，但 `carrierPressure` 只增加一次。这些可重叠计数不标识具体 carrier／传输协议，不是应用丢包率，也不增加失败；重复或过期提示均不增加它们。TCP 的 loss pressure 表示重传压力，不代表已确认应用包丢失。
 
 计数在进程启动时从零开始，只在进程内存中累积。只要组名仍在已提交配置中，成功 reload 会保留它们，包括零叶节点以及临时 Score→非 Score→Score 转换；非 Score 组不会显示在此响应中。已提交的删除会清除该名称的计数，之后重新创建同名组从零开始。受 generation fence 约束的已淘汰 manager 在被替换后不能再修改计数，即使同名组随后被重新创建。快照在 JSON 序列化前复制，读取不会改变选路状态。
 
@@ -408,7 +414,7 @@ R = {
 | 字段 | 含义 |
 | --- | --- |
 | `selected` | 本次只读判定对应的既有公开成员 tag；没有普通合格候选时为 null。存在时 TCP `now` 使用同一次判定的选择。 |
-| `state` | `provisional` 或 `observedUsable`；后者需要近期业务证据，不能仅由 HEAD 成功获得。 |
+| `state` | `provisional` 或 `observedUsable`；后者需要近期成功终态的业务证据，不能仅由探测或活跃 RX 获得。普通资格续租和恢复不会放宽这一认证。 |
 | `comparison` / `basis` | `unconfirmed`、`equivalent` 或 `supported`，依据为 `none`、`configuredProbe`、`targetResponse`、`aggregateResponse`、`upload` 或 `download`。不代表误判概率或保证最优。 |
 | `missing` | 相关候选覆盖范围内的 availability/response/transfer 布尔缺口；当前路径已观测可用时，备选仍可能需要验证。 |
 | `nextAction` | `nextBusinessFlow` 仅在共享预算允许时使用未来真实流量；`awaitTransfer` 等待真实负载，不主动大流量测速；`backoff` 保留失败隔离；`none` 表示没有可执行的缺失工作。 |

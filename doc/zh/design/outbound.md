@@ -258,12 +258,32 @@ Trojan 冷连接和 pool 中取出的裸连接使用同一套完整 transport。
 TLS 批量读取先返回已经读到的字节，再在下一次非空读取中报告后续的 I/O
 错误，不会把该错误转换成 EOF。
 
-gRPC transport 是手写的最小 gRPC-over-HTTP/2 client。opening HEADERS
-frame 不设置 `END_STREAM`，TLS 请求使用 `:scheme: https`。DATA 携带 gRPC
-长度前缀，以及 gun 风格服务端预期的 protobuf 单 bytes 字段 envelope。
-gRPC over TLS 始终协商 `h2`，与指纹 profile 无关。有界 write queue 取得字节
-所有权后才报告已接受长度；取消不能把这些字节归到后一次调用的 buffer。
-只要 HTTP/2 正窗口能容纳一个 payload 字节及其 envelope，就允许推进。
+`transport_quality` 管理按 runtime 所有者归属的 carrier 压力提示。共享 TCP/TLS/REALITY 与 AnyTLS 在物理 I/O 层观测，Shadowsocks 借用已有 socket half。Linux `TCP_INFO` 每个活跃秒最多读取一次，各字段按内核返回 ABI 长度独立检查；缺失或读取失败保持未知，不能改变 I/O。Vision Direct 与 ready pool 的 FD 存活性检查保留 socket 路径。Hy2/TUIC/Juicity 复用已有每秒物理 QUIC 采样，隔离握手确认／发布前历史，peer 改变时重建基线；逻辑 mux 子流不会重复报告同一事件。不额外持有 FD，也不创建逐 TCP 定时任务；静止 TCP 不产生新的事件驱动观测。详见 [Score 压力语义](./groups.md#score-评分与生命周期)。
+
+`proxy/transport/grpc.rs` 使用已有的 `h2` client 承载 gRPC gun framing。
+HTTP/2 帧、HPACK/Huffman、CONTINUATION 拼接和连接级动态表由 `h2` 管理，
+响应头限制为 64 KiB，动态表采用默认 4 KiB 上限。返回的流直接拥有连接
+driver 和 socket；丢弃流即关闭 transport，不留下脱离所有者的任务。
+
+opening request 不设置 `END_STREAM`；TLS 请求使用 `:scheme: https`，并且
+始终协商 `h2`，与指纹 profile 无关。DATA 保留 gRPC 长度前缀，以及 gun
+对端使用的 protobuf 单 bytes 字段 envelope。最多一个 16 KiB 应用消息可
+排队等待发送；取消不会把已经取得所有权的字节归到后一次调用的 buffer。
+`h2` 可将消息拆分到正发送窗口中，包括小于 envelope 的窗口。flush 同时
+等待排队 DATA 和底层 transport 刷新完成，不能仅凭控制帧已刷新就成功。
+请求 shutdown 发送 `END_STREAM`，但保留响应方向；拆分后的读写任务均能
+收到 driver 唤醒。
+
+非 200 响应、trailers-only 拒绝、非零 gRPC status、流重置，以及携带错误
+或排除当前流的 GOAWAY 会返回流错误，而不是正常 EOF。已缓存 payload 先于
+终止读取错误交付，后续读取仍保留该错误；成功完成的接收方向不会因为稍后
+的写入失败而失去 EOF。优雅 GOAWAY 允许已接受的流完成，不自动重放应用
+字节。当前锁定的 `h2` 0.4.19 仍会把缺失的 `:status` 默认解码为 200。
+[上游修复 #959](https://github.com/hyperium/h2/pull/959) 已合并，但当前锁定
+版本尚未包含；需要升级到包含修复的正式版本，才能拒绝该畸形响应。
+
+VMess 在关闭 duplex 半边前记录 relay 返回的错误，使响应头及消息体解码
+失败传递到流所有者，而不是变成 EOF。
 
 ### 带 mark socket 与名称解析
 

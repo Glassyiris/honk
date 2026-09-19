@@ -432,6 +432,7 @@ impl ControlPlane {
                     return Ok(ReloadOutcome::Rejected);
                 }
             };
+        new_group_manager.bind_transport_quality(&new_runtime_registry);
         let reuse_dns_router = dns_routing_state_reusable(&current_config, &new_config)
             && current_dns_router.geo_fingerprint() == dns_geo_fingerprint;
         let dns_router = if reuse_dns_router {
@@ -989,6 +990,7 @@ impl ControlPlane {
             match backend.publish_routing_plan(&plan, &domains) {
                 Err(_) => false,
                 Ok(()) => {
+                    manager.bind_transport_quality(&runtime);
                     *registry = Arc::clone(&runtime);
                     runtime.activate_background_dial_admission();
                     publication.commit();

@@ -355,3 +355,35 @@ async fn test_vmess_dial_over_ws_handshake() {
         .unwrap()
         .unwrap();
 }
+
+/// A peer that answers the request with bytes that are not a sealed
+/// response header is a rejected dial: the stream must report the
+/// failure, not the EOF the dropped relay half would otherwise mean.
+#[tokio::test]
+async fn rejected_response_header_surfaces_as_stream_error() {
+    let (physical, mut peer) = tokio::io::duplex(4096);
+    let uuid = uuid::Uuid::parse_str(UUID).unwrap();
+    let target = "93.184.216.34:53".parse().unwrap();
+    let mut stream =
+        VmessHandler::perform_handshake(uuid.as_bytes(), Box::new(physical), target, None).unwrap();
+
+    let mut first = [0];
+    peer.read_exact(&mut first).await.unwrap();
+    // 18 bytes: a full sealed length that does not authenticate.
+    peer.write_all(&[0x5a; 18]).await.unwrap();
+    drop(peer);
+
+    let mut out = Vec::new();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        stream.stream.read_to_end(&mut out),
+    )
+    .await
+    .expect("the stream must settle once the relay fails")
+    .expect_err("a rejected response header must not read as EOF");
+    assert!(out.is_empty());
+    assert!(
+        error.to_string().starts_with("vmess: "),
+        "error should carry the relay's reason: {error}"
+    );
+}

@@ -1301,6 +1301,7 @@ async fn connect_transport(
     let password = node.anytls().unwrap().password.as_deref().unwrap_or("");
     let auth = authentication_payload(password, padding);
     let tcp = crate::util::connect_outbound(addr, connect_timeout).await?;
+    let tcp = crate::transport_quality::tcp::ObservedTcp::new(tcp);
     debug!("AnyTLS: TCP connected to {}", addr);
 
     let connector = match tls_connector {
@@ -1314,11 +1315,12 @@ async fn connect_transport(
         .sni
         .clone()
         .unwrap_or_else(|| node.host().to_string());
-    let tls = tokio::time::timeout(connect_timeout, connector.connect(&server_name, tcp))
+    let mut tls = tokio::time::timeout(connect_timeout, connector.connect(&server_name, tcp))
         .await
         .map_err(|_| {
             anyhow::anyhow!("AnyTLS TLS handshake timed out after {connect_timeout:?}")
         })??;
+    tls.get_mut().activate();
     debug!("AnyTLS: TLS handshake completed with {}", addr);
     let (read, write) = tokio::io::split(crate::tls::BatchRead::new(tls));
 
@@ -1359,15 +1361,18 @@ impl AnyTlsHandler {
                     .as_ref()
                     .map(|runtime| runtime.anytls_tls_connector())
                     .transpose()?;
-                dial_session(
+                let dial = dial_session(
                     &node,
                     &label,
                     Duration::from_secs(10),
                     tls_connector,
                     padding_state,
                     inbound_payload_budget,
-                )
-                .await
+                );
+                match runtime {
+                    Some(runtime) => runtime.transport_quality().scope(dial).await,
+                    None => dial.await,
+                }
             }
         });
     }
@@ -1649,15 +1654,17 @@ impl WarmableOutbound for AnyTlsHandler {
         let inbound_payload_budget = pool.inbound_payload_budget();
         Self::warm_pool_with(runtime, move || async move {
             let tls_connector = dial_runtime.anytls_tls_connector()?;
-            dial_session(
-                &node,
-                &addr,
-                connect_timeout,
-                Some(tls_connector),
-                padding_state,
-                inbound_payload_budget,
-            )
-            .await
+            dial_runtime
+                .transport_quality()
+                .scope(dial_session(
+                    &node,
+                    &addr,
+                    connect_timeout,
+                    Some(tls_connector),
+                    padding_state,
+                    inbound_payload_budget,
+                ))
+                .await
         })
         .await
     }
@@ -1707,15 +1714,17 @@ impl TcpOutbound for AnyTlsHandler {
                     let inbound_payload_budget = Arc::clone(&inbound_payload_budget);
                     async move {
                         let tls_connector = runtime.anytls_tls_connector()?;
-                        dial_session(
-                            &node,
-                            &addr,
-                            connect_timeout,
-                            Some(tls_connector),
-                            padding_state,
-                            inbound_payload_budget,
-                        )
-                        .await
+                        runtime
+                            .transport_quality()
+                            .scope(dial_session(
+                                &node,
+                                &addr,
+                                connect_timeout,
+                                Some(tls_connector),
+                                padding_state,
+                                inbound_payload_budget,
+                            ))
+                            .await
                     }
                 },
                 move |session, permit| {
@@ -1779,15 +1788,17 @@ impl PacketOutbound for AnyTlsHandler {
                     let inbound_payload_budget = Arc::clone(&inbound_payload_budget);
                     async move {
                         let tls_connector = runtime.anytls_tls_connector()?;
-                        dial_session(
-                            &node,
-                            &addr,
-                            connect_timeout,
-                            Some(tls_connector),
-                            padding_state,
-                            inbound_payload_budget,
-                        )
-                        .await
+                        runtime
+                            .transport_quality()
+                            .scope(dial_session(
+                                &node,
+                                &addr,
+                                connect_timeout,
+                                Some(tls_connector),
+                                padding_state,
+                                inbound_payload_budget,
+                            ))
+                            .await
                     }
                 },
                 move |session, permit| {
@@ -1826,15 +1837,17 @@ impl PacketOutbound for AnyTlsHandler {
                     let tls_connector = dial_runtime.anytls_tls_connector()?;
                     let padding_state = Arc::clone(&padding_state);
                     let inbound_payload_budget = Arc::clone(&inbound_payload_budget);
-                    dial_session(
-                        dial_node.as_ref(),
-                        &dial_addr,
-                        connect_timeout,
-                        Some(tls_connector),
-                        padding_state,
-                        inbound_payload_budget,
-                    )
-                    .await
+                    dial_runtime
+                        .transport_quality()
+                        .scope(dial_session(
+                            dial_node.as_ref(),
+                            &dial_addr,
+                            connect_timeout,
+                            Some(tls_connector),
+                            padding_state,
+                            inbound_payload_budget,
+                        ))
+                        .await
                 },
             ))
             .await

@@ -173,9 +173,41 @@ impl Session {
     }
 }
 
+/// How the relay task ended, when it failed: a rejected response header or
+/// an invalid chunk reads as that error, not as EOF.
+type RelayFailure = std::sync::Arc<std::sync::OnceLock<(std::io::ErrorKind, String)>>;
+
 struct VmessStream {
     inner: tokio::io::DuplexStream,
     relay: tokio::task::AbortHandle,
+    failure: RelayFailure,
+}
+
+impl VmessStream {
+    fn relay_error(&self) -> Option<std::io::Error> {
+        self.failure
+            .get()
+            .map(|(kind, message)| std::io::Error::new(*kind, message.clone()))
+    }
+}
+
+/// The failure is recorded before the duplex half closes, so the owner sees it
+/// on the poll that would otherwise be EOF.
+async fn vmess_relay_recorded(
+    server: Box<dyn AsyncReadWrite>,
+    mut client: tokio::io::DuplexStream,
+    header_wire: Vec<u8>,
+    session: Session,
+    failure: RelayFailure,
+) {
+    if let Err(error) = vmess_relay(server, &mut client, header_wire, session).await {
+        let kind = error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind)
+            .unwrap_or(std::io::ErrorKind::InvalidData);
+        let _ = failure.set((kind, format!("vmess: {error:#}")));
+    }
+    drop(client);
 }
 
 impl std::fmt::Debug for VmessStream {
@@ -190,7 +222,15 @@ impl AsyncRead for VmessStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        let before = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) if buf.filled().len() == before => match self.relay_error() {
+                Some(error) => Poll::Ready(Err(error)),
+                None => Poll::Ready(Ok(())),
+            },
+            Poll::Ready(Err(error)) => Poll::Ready(Err(self.relay_error().unwrap_or(error))),
+            other => other,
+        }
     }
 }
 
@@ -200,11 +240,17 @@ impl AsyncWrite for VmessStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        match Pin::new(&mut self.inner).poll_write(cx, buf) {
+            Poll::Ready(Err(error)) => Poll::Ready(Err(self.relay_error().unwrap_or(error))),
+            other => other,
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        match Pin::new(&mut self.inner).poll_flush(cx) {
+            Poll::Ready(Err(error)) => Poll::Ready(Err(self.relay_error().unwrap_or(error))),
+            other => other,
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -388,15 +434,21 @@ impl VmessHandler {
         let header_wire = Self::seal_request_header(&cmd_key, &auth_id, &conn_nonce, &plain);
 
         let (client_half, server_half) = tokio::io::duplex(65536);
-        let relay = crate::runtime::spawn_owned(async move {
-            let _ = vmess_relay(stream, server_half, header_wire, session).await;
-        })
+        let failure = RelayFailure::default();
+        let relay = crate::runtime::spawn_owned(vmess_relay_recorded(
+            stream,
+            server_half,
+            header_wire,
+            session,
+            failure.clone(),
+        ))
         .ok_or(crate::proxy::PacketRejection::Cancelled)?;
 
         Ok(ProxyStream {
             stream: Box::new(VmessStream {
                 inner: client_half,
                 relay,
+                failure,
             }),
             target_addr: target,
             target_domain: target_domain.map(|s| s.to_string()),
@@ -549,7 +601,7 @@ impl BodyChunks {
 /// server→client data using the VMess AEAD chunking format.
 async fn vmess_relay(
     server: Box<dyn AsyncReadWrite>,
-    client: tokio::io::DuplexStream,
+    client: &mut tokio::io::DuplexStream,
     header_wire: Vec<u8>,
     session: Session,
 ) -> anyhow::Result<()> {

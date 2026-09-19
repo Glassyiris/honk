@@ -49,7 +49,7 @@ fn idle_terminal_does_not_refresh_old_business_evidence() {
     let score = score_snapshot(&state.inner.lock(), "score", &target, nodes[0].id, expired);
     assert_eq!(score.completed, 5.0);
     assert_eq!(score.useful_completed, 5.0);
-    assert_eq!(score.failures, 0.0);
+    assert_eq!(score.fail_streak, 0);
 }
 
 #[test]

@@ -347,6 +347,8 @@ impl ControlPlane {
             Some(self.alive_set.clone()),
             self.group_manager.read().score_state(),
         );
+        let runtimes = self.runtime_registry.read().clone();
+        new_gm.bind_transport_quality(&runtimes);
         // Migrate runtime choices before wiring callbacks: migration must
         // not fire persistence or connection interruption.
         new_gm.migrate_selector_choices_from(&self.group_manager.read());

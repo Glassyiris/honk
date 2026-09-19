@@ -236,11 +236,13 @@ impl ProxyRegistry {
             .find(protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
         let stream = generation
-            .scope_dials(runtime.scope_tasks(entry.tcp.dial_runtime(
-                Arc::clone(&runtime),
-                target,
-                target_domain,
-                connect_timeout,
+            .scope_dials(runtime.scope_tasks(runtime.transport_quality().scope(
+                entry.tcp.dial_runtime(
+                    Arc::clone(&runtime),
+                    target,
+                    target_domain,
+                    connect_timeout,
+                ),
             )))
             .await?;
         if generation.is_shutdown() {
@@ -371,11 +373,13 @@ impl ProxyRegistry {
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let (runtime, packet) = self.packet_runtime(&generation, node_id, target.port())?;
         let transport = generation
-            .scope_dials(runtime.scope_tasks(packet.dial_udp_transport_runtime(
-                Arc::clone(&runtime),
-                target,
-                target_domain,
-                connect_timeout,
+            .scope_dials(runtime.scope_tasks(runtime.transport_quality().scope(
+                packet.dial_udp_transport_runtime(
+                    Arc::clone(&runtime),
+                    target,
+                    target_domain,
+                    connect_timeout,
+                ),
             )))
             .await?;
         if generation.is_shutdown() {
@@ -397,14 +401,14 @@ impl ProxyRegistry {
     ) -> anyhow::Result<PreparedUdpTransport> {
         let (runtime, packet) = self.packet_runtime(&generation, node_id, target.port())?;
         let prepared = generation
-            .scope_dials(
-                runtime.scope_tasks(packet.dial_udp_transport_speculative_runtime(
+            .scope_dials(runtime.scope_tasks(runtime.transport_quality().scope(
+                packet.dial_udp_transport_speculative_runtime(
                     Arc::clone(&runtime),
                     target,
                     target_domain,
                     connect_timeout,
-                )),
-            )
+                ),
+            )))
             .await?;
         if generation.is_shutdown() {
             anyhow::bail!("outbound runtime generation shut down during UDP preparation");

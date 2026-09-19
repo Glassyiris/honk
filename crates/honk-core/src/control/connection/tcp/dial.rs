@@ -622,7 +622,11 @@ impl ControlPlaneHandle {
                         .tcp
                         .dial_with_tcp(node, target, target_domain, tcp, connect_timeout);
                 return match generation.get(&node.id) {
-                    Some(runtime) => runtime.scope_tasks(dial).await,
+                    Some(runtime) => {
+                        runtime
+                            .scope_tasks(runtime.transport_quality().scope(dial))
+                            .await
+                    }
                     None => dial.await,
                 }
                 .map(|stream| (stream, true));

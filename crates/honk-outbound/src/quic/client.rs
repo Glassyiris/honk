@@ -8,6 +8,8 @@ use anyhow::{Context as _, anyhow};
 use quinn::{ClientConfig, Connection, Endpoint, VarInt};
 use tokio::sync::Mutex;
 
+use crate::transport_quality::TransportQuality;
+
 use super::endpoint::{clamp_quic_payload_size, client_endpoint_with_mtu};
 use super::metrics::{QuicClientConnectionMonitor, spawn_quic_client_connection_monitor};
 use super::{
@@ -106,7 +108,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                 conn: None,
                 connections: Vec::new(),
                 next_connection_id: 1,
-                metrics_enabled: false,
+                quality: None,
                 closed: false,
             })),
         }
@@ -141,14 +143,14 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         self.endpoint_factory = Some(Arc::new(factory));
         self
     }
-    pub(crate) async fn enable_metrics(&self)
+    pub(crate) async fn enable_metrics(&self, quality: Arc<TransportQuality>)
     where
         C: QuicConnState,
     {
         let mut state = self.state.lock().await;
-        state.metrics_enabled = true;
+        state.quality = Some(Arc::clone(&quality));
         for tracked in &state.connections {
-            tracked.monitor.enable_metrics();
+            tracked.monitor.enable_metrics(Arc::clone(&quality));
             if let Some(ctx) = tracked.state.upgrade() {
                 ctx.enable_telemetry();
             }
@@ -214,7 +216,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         {
             let conn = conn.clone();
             let ctx = Arc::clone(ctx);
-            let metrics_enabled = state.metrics_enabled;
+            let metrics_enabled = state.quality.is_some();
             drop(state);
             // The QUIC connection is already admitted and reusable; time the
             // logical stream before its protocol open can block or cancel.
@@ -304,7 +306,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             }
         };
         let ctx = Arc::new(ctx);
-        if state.metrics_enabled {
+        if state.quality.is_some() {
             on_publish(ctx.as_ref(), &conn);
         }
         close_guard.disarm();
@@ -316,7 +318,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             Arc::clone(&self.flow_control_profiles),
             ipv6,
             owner.clone(),
-            state.metrics_enabled,
+            state.quality.clone(),
         ));
         state.connections.push(TrackedConnection {
             id,

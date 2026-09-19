@@ -27,7 +27,7 @@ struct RuntimeEpoch {
     stop: watch::Sender<bool>,
     ingress: JoinSet<()>,
     tcp: JoinSet<()>,
-    maintenance: [Option<tokio::task::JoinHandle<()>>; 6],
+    maintenance: [Option<tokio::task::JoinHandle<()>>; 7],
     dns: Option<dns_listener::DnsListener>,
     janitor: Option<tokio::task::JoinHandle<()>>,
     removals: Option<tokio::task::JoinHandle<()>>,
@@ -506,6 +506,7 @@ impl ControlPlane {
     async fn start_epoch_maintenance(&self, epoch: &mut RuntimeEpoch) {
         let registry = self.runtime_registry.clone();
         let dns = self.dns_controller.runtime_provider();
+        let groups = self.group_manager.clone();
         epoch.maintenance = [
             self.udp_pool.spawn_janitor(),
             self.sniffer_pool.spawn_janitor(),
@@ -525,6 +526,15 @@ impl ControlPlane {
                     let now = std::time::Instant::now();
                     registry.read().reap_idle_resources(now);
                     dns.current().reap_idle_resources(now);
+                }
+            }),
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(5));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    let manager = groups.read().clone();
+                    manager.observe_transport_quality();
                 }
             }),
         ]

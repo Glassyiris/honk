@@ -136,14 +136,14 @@ impl VLessHandler {
     ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
         let permit = runtime.acquire_vless_carrier()?;
         runtime
-            .scope_tasks(self.dial_carrier(
+            .scope_tasks(runtime.transport_quality().scope(self.dial_carrier(
                 &runtime.node,
                 uuid,
                 header,
                 None,
                 connect_timeout,
                 Some(permit),
-            ))
+            )))
             .await
     }
 

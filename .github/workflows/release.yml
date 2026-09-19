@@ -2,15 +2,15 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "debug.*"]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('ci-{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('ci-{0}-{1}', github.workflow, github.run_id) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ startsWith(github.ref, 'refs/tags/debug.') && 'release-debug' || format('ci-{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,6 +22,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test Debug artifact preflight
+        run: bash .github/ci/test-debug-artifacts.sh
       - name: Read Rust toolchain
         id: toolchain
         run: echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
@@ -74,6 +76,8 @@ jobs:
     name: build ${{ matrix.target }}${{ matrix.suffix }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    env:
+      ARTIFACT_NAME: honk-core-${{ startsWith(github.ref, 'refs/tags/debug.') && 'debug' || github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}
     strategy:
       fail-fast: false
       matrix:
@@ -213,7 +217,7 @@ jobs:
       - name: Package artifact
         run: |
           set -euo pipefail
-          name="honk-core-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}"
+          name="$ARTIFACT_NAME"
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/honk-core" "dist/$name/"
           cp LICENSE README.md "dist/$name/"
@@ -221,8 +225,6 @@ jobs:
 
       - name: Start the packaged x86_64 artifact
         if: startsWith(matrix.target, 'x86_64-')
-        env:
-          ARTIFACT_NAME: honk-core-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}
         run: |
           set -euo pipefail
           smoke_dir=$(mktemp -d "$RUNNER_TEMP/release-smoke.XXXXXX")
@@ -234,7 +236,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: honk-core-${{ matrix.target }}${{ matrix.suffix }}
-          path: honk-core-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}.tar.gz
+          path: ${{ env.ARTIFACT_NAME }}.tar.gz
           retention-days: 1
 
   release:
@@ -244,7 +246,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/debug.')
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -253,8 +255,44 @@ jobs:
           merge-multiple: true
 
       - name: Create release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: dist/*.tar.gz
           prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
           generate_release_notes: true
+
+      - name: Checkout Debug source
+        if: startsWith(github.ref, 'refs/tags/debug.')
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: debug-source
+
+      - name: Check complete Debug artifacts
+        if: startsWith(github.ref, 'refs/tags/debug.')
+        run: bash debug-source/.github/ci/check-debug-artifacts.sh
+
+      - name: Move rolling Debug tag
+        if: startsWith(github.ref, 'refs/tags/debug.')
+        working-directory: debug-source
+        run: git push --force origin "$GITHUB_SHA:refs/tags/debug"
+
+      - name: Update Debug release
+        if: startsWith(github.ref, 'refs/tags/debug.')
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          tag_name: debug
+          name: Debug
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          make_latest: "false"
+          files: dist/*.tar.gz
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          body: |
+            Rolling debug build; replaced by subsequent successful debug-tag runs.
+
+            Source tag: `${{ github.ref_name }}`
+            Commit: `${{ github.sha }}`
+            Build: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

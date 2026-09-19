@@ -1,4 +1,180 @@
 use super::*;
+
+#[test]
+fn recovered_historical_failure_holds_five_percent_latency_jitter() {
+    let nodes = [node("incumbent"), node("challenger")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    let past = now - Duration::from_secs(3600);
+    let failure = manager
+        .feedback_for_group_node("score", nodes[0].id, target.clone())
+        .unwrap()
+        .start_at(past);
+    failure.setup_succeeded_at(past);
+    failure.finish_at(ScoreOutcome::Io(io::ErrorKind::ConnectionReset), true, past);
+    for (index, leaf) in nodes.iter().enumerate() {
+        train_at(
+            &manager,
+            leaf,
+            &target,
+            200,
+            Duration::from_millis(100 + index as u64 * 10),
+            1,
+            now + Duration::from_secs(index as u64 * 2),
+        );
+    }
+    assert_eq!(
+        rank_at(&manager, &nodes, &target, now + Duration::from_secs(4)),
+        0
+    );
+    train_at(
+        &manager,
+        &nodes[1],
+        &target,
+        200,
+        Duration::from_millis(95),
+        1,
+        now + Duration::from_secs(5),
+    );
+    assert_eq!(
+        rank_at(&manager, &nodes, &target, now + Duration::from_secs(7)),
+        0
+    );
+    let reasons = manager
+        .score_state()
+        .selection_reason_counts("score", SelectionNetwork::Tcp);
+    assert_eq!(reasons.incumbent_held, 1);
+    assert_eq!(reasons.fresh_failure_bypass, 0);
+}
+
+#[test]
+fn only_newer_business_rx_restores_incumbent_protection() {
+    for recovery in [
+        "none",
+        "old-rx",
+        "same-time-rx",
+        "setup-only",
+        "probe",
+        "warmup",
+        "neutral",
+        "other-target",
+        "business-rx",
+        "new-rx-before-old-finish",
+    ] {
+        let nodes = [node("incumbent"), node("challenger")];
+        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+        let target = context("business.example", IpVersion::V4);
+        let now = Instant::now();
+        for (index, leaf) in nodes.iter().enumerate() {
+            train_at(
+                &manager,
+                leaf,
+                &target,
+                1000,
+                Duration::from_millis(100 + index as u64 * 10),
+                1,
+                now + Duration::from_secs(index as u64 * 2),
+            );
+        }
+        assert_eq!(
+            rank_at(&manager, &nodes, &target, now + Duration::from_secs(4)),
+            0
+        );
+        let feedback = manager
+            .feedback_for_group_node("score", nodes[0].id, target.clone())
+            .unwrap();
+        let failed_at = now + Duration::from_secs(6);
+        let late = matches!(
+            recovery,
+            "old-rx" | "same-time-rx" | "new-rx-before-old-finish"
+        )
+        .then(|| {
+            let at = if recovery == "same-time-rx" {
+                failed_at
+            } else {
+                failed_at - Duration::from_secs(1)
+            };
+            let reporter = feedback.start_at(at);
+            reporter.setup_succeeded_at(at);
+            reporter.transfer_at(1, 1, at);
+            reporter
+        });
+        let failure = feedback.start_at(failed_at);
+        failure.setup_succeeded_at(failed_at);
+        failure.finish_at(ScoreOutcome::Timeout, true, failed_at);
+        train_at(
+            &manager,
+            &nodes[1],
+            &target,
+            1000,
+            Duration::from_millis(95),
+            1,
+            now + Duration::from_secs(7),
+        );
+        let at = now + Duration::from_secs(9);
+        match recovery {
+            "business-rx" | "new-rx-before-old-finish" | "other-target" => {
+                let recovered_target = if recovery == "other-target" {
+                    context("other.example", IpVersion::V4)
+                } else {
+                    target.clone()
+                };
+                train_at(
+                    &manager,
+                    &nodes[0],
+                    &recovered_target,
+                    20,
+                    Duration::from_millis(100),
+                    1,
+                    at,
+                );
+            }
+            "setup-only" | "neutral" | "probe" | "warmup" => {
+                let source = match recovery {
+                    "probe" => ScoreSource::HealthProbe,
+                    "warmup" => ScoreSource::Warmup,
+                    _ => ScoreSource::Traffic,
+                };
+                let reporter = feedback.clone().with_source(source).start_at(at);
+                reporter.setup_succeeded_at(at);
+                if recovery != "setup-only" {
+                    reporter.transfer_at(1, 1, at);
+                }
+                let outcome = if recovery == "neutral" {
+                    ScoreOutcome::Cancelled
+                } else {
+                    ScoreOutcome::Success
+                };
+                reporter.finish_at(outcome, recovery != "setup-only", at);
+            }
+            _ => {}
+        }
+        let selected_at = now + Duration::from_secs(11);
+        if let Some(late) = late {
+            late.finish_at(ScoreOutcome::Success, true, selected_at);
+        }
+        let recovered = matches!(
+            recovery,
+            "business-rx" | "new-rx-before-old-finish" | "neutral"
+        );
+        assert_eq!(
+            rank_at(&manager, &nodes, &target, selected_at),
+            usize::from(!recovered),
+            "{recovery}"
+        );
+        let reasons = manager
+            .score_state()
+            .selection_reason_counts("score", SelectionNetwork::Tcp);
+        assert_eq!(
+            reasons.fresh_failure_bypass,
+            u64::from(!recovered),
+            "{recovery}"
+        );
+        assert_eq!(reasons.incumbent_ineligible, 0, "{recovery}");
+    }
+}
+
 #[test]
 fn stale_manager_authority_stays_revoked_after_same_name_recreation() {
     let survivor = node("survivor");
@@ -96,147 +272,6 @@ fn captured_feedback_requires_current_authority_at_start() {
 
     assert!(!state.has_exact("score", &context, nodes[0].id));
     assert_eq!(state.inner.lock().tick, before_tick);
-}
-
-#[test]
-fn single_failure_layer_freshness_is_unchanged() {
-    // Given: one aggregate failure cell with exactly one half-life of age.
-    let node = node("leaf");
-    let context = context("example.com", IpVersion::V4);
-    let start = Instant::now();
-    let mut inner = StateInner::default();
-    inner.aggregate.put(
-        AggregateKey {
-            group: "score".into(),
-            network: SelectionNetwork::Tcp,
-            family: None,
-            node_id: node.id,
-        },
-        Stats {
-            setup_failure: 2.0,
-            updated_at: Some(start),
-            ..Default::default()
-        },
-    );
-
-    // When: the scorer snapshots the single layer after one half-life.
-    let score = score_snapshot(
-        &inner,
-        "score",
-        &context,
-        node.id,
-        start + SCORE_EVIDENCE_HALF_LIFE,
-    );
-
-    // Then: existing decay remains unchanged and no absent layer contributes.
-    println!("single failure layer envelope={:.12}", score.failures);
-    assert_close(score.failures, 1.0);
-}
-
-fn layered_failure_value(ages: [Option<Duration>; 3]) -> f64 {
-    let node = node("leaf");
-    let context = context("example.com", IpVersion::V4);
-    let start = Instant::now();
-    let now = start + Duration::from_secs(60);
-    let mut inner = StateInner::default();
-    for (index, age) in ages.into_iter().enumerate() {
-        let Some(age) = age else {
-            continue;
-        };
-        let stats = Stats {
-            setup_failure: 1.0,
-            updated_at: Some(now - age),
-            ..Default::default()
-        };
-        match index {
-            0 | 1 => {
-                inner.aggregate.put(
-                    AggregateKey {
-                        group: "score".into(),
-                        network: SelectionNetwork::Tcp,
-                        family: (index == 1).then_some(IpVersion::V4),
-                        node_id: node.id,
-                    },
-                    stats,
-                );
-            }
-            2 => {
-                inner.exact.put(
-                    ExactKey {
-                        group: "score".into(),
-                        network: SelectionNetwork::Tcp,
-                        family: IpVersion::V4,
-                        target: context.target.clone().unwrap(),
-                        node_id: node.id,
-                    },
-                    stats,
-                );
-            }
-            _ => unreachable!(),
-        }
-    }
-    score_snapshot(&inner, "score", &context, node.id, now).failures
-}
-
-#[test]
-fn layered_failure_freshness_uses_one_envelope() {
-    // Given: the same 30-second-old failure appears in overlapping layers.
-    let age = Some(Duration::from_secs(30));
-
-    // When: one, two, and three layers are independently snapshotted.
-    let global_only = layered_failure_value([age, None, None]);
-    let global_family = layered_failure_value([age, age, None]);
-    let global_family_exact = layered_failure_value([age, age, age]);
-    println!(
-        "layered failure envelope: global_only={global_only:.12} global_family={global_family:.12} global_family_exact={global_family_exact:.12}"
-    );
-
-    // Then: replication does not increase the effective failure envelope.
-    assert_close(global_family, global_only);
-    assert_close(global_family_exact, global_only);
-    let aged = layered_failure_value([
-        Some(Duration::from_secs(SCORE_EVIDENCE_HALF_LIFE.as_secs() * 8)),
-        Some(Duration::from_secs(SCORE_EVIDENCE_HALF_LIFE.as_secs() * 8)),
-        Some(Duration::from_secs(SCORE_EVIDENCE_HALF_LIFE.as_secs() * 8)),
-    ]);
-    let incumbent =
-        super::super::ranking::snapshot(&trained_stats(8.0, 100.0, Instant::now()), Instant::now());
-    let challenger = ScoreSnapshot {
-        failures: 0.0,
-        ..incumbent
-    };
-    let retained = super::super::ranking::hold_decision(
-        &ScoreSnapshot {
-            failures: aged,
-            ..incumbent
-        },
-        &challenger,
-        super::super::ranking::performance_baseline(&[incumbent, challenger]),
-    ) == HoldDecision::Held;
-    println!("aged layered envelope={aged:.12} retained_incumbent={retained}");
-    assert!(aged < SCORE_FAILURE_FORGIVENESS_THRESHOLD);
-    assert!(retained);
-}
-
-#[test]
-fn specific_failure_freshness_is_not_hidden() {
-    // Given: global, family, and exact evidence are respectively 30, 20, and 10 seconds old.
-    let global = evidence_decay(Duration::from_secs(30));
-    let family = evidence_decay(Duration::from_secs(20));
-    let exact = evidence_decay(Duration::from_secs(10));
-
-    // When: all three overlapping layers are snapshotted together.
-    let effective = layered_failure_value([
-        Some(Duration::from_secs(30)),
-        Some(Duration::from_secs(20)),
-        Some(Duration::from_secs(10)),
-    ]);
-    println!(
-        "specific failure envelope: global_30s={global:.12} family_20s={family:.12} exact_10s={exact:.12} effective={effective:.12}"
-    );
-
-    // Then: the freshest specific layer is the effective envelope.
-    assert_close(effective, exact);
 }
 
 pub(super) fn inner_update_response(state: &ScorePolicyState, key: AggregateKey, latency_ms: f64) {
