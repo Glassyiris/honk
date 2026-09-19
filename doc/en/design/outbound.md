@@ -292,14 +292,34 @@ the next non-empty read; it never converts that error into EOF.
 
 `transport_quality` owns advisory per-runtime carrier pressure. Common TCP/TLS/REALITY and AnyTLS use a physical-I/O adapter; Shadowsocks borrows its existing socket half. Linux `TCP_INFO` is read at most once per active second, checking each field against the returned ABI length; missing fields/errors remain unknown and never alter I/O. Vision Direct and ready-pool descriptor probing retain the socket path. Hy2/TUIC/Juicity reuse their existing one-second physical QUIC monitor, excluding pre-confirmation/pre-publication history and reseeding on peer changes. Logical mux children do not each report the same carrier event. No extra descriptor or per-TCP sampling task is retained; quiescent TCP has no new event-driven observation. See [Score pressure semantics](./groups.md#score-scoring-and-lifecycle).
 
-The gRPC transport is a hand-written minimal gRPC-over-HTTP/2 client that interoperates with official sing-box Trojan+gRPC. The
-opening HEADERS frame does not set `END_STREAM`, and TLS requests use
-`:scheme: https`. DATA carries gRPC length prefixes and the protobuf
-single-bytes-field envelope expected by gun-style servers.
-gRPC over TLS always negotiates `h2`, independent of the fingerprint profile.
-Its bounded write queue reports bytes once it owns them; cancellation cannot
-attribute those bytes to a later caller buffer. Positive HTTP/2 windows are
-usable whenever one payload byte and its envelope fit.
+`proxy/transport/grpc.rs` implements gRPC gun framing over the existing `h2`
+client. HTTP/2 framing, HPACK/Huffman, continuation assembly and dynamic-table
+state belong to `h2`, with a 64 KiB response-header limit and the default 4 KiB
+dynamic table. The stream owns its connection driver and socket directly;
+dropping it closes the transport without a detached task.
+
+The opening request does not set `END_STREAM`; TLS requests use `:scheme: https`
+and negotiate `h2` independently of the fingerprint profile. DATA preserves the
+gRPC length prefix and protobuf single-bytes-field envelope used by gun peers.
+One owned application message of at most 16 KiB may wait for transmission;
+cancellation never attributes its bytes to a later caller buffer. `h2` fragments
+it across positive send windows, including windows smaller than the envelope.
+Flush waits for queued DATA and the physical transport flush, not merely a
+control-frame flush. Request shutdown sends `END_STREAM` without discarding the
+response direction; split readers and writers both receive driver wakeups.
+
+Non-200 responses, trailers-only refusals, nonzero gRPC status, stream resets and
+error/excluding GOAWAY are stream errors rather than clean EOF. Already buffered
+payload precedes terminal read errors, which remain errors on later reads;
+successful receive completion remains EOF even if the write direction later
+fails. An admitted stream can finish after graceful GOAWAY; no application
+bytes are retried. The locked `h2` 0.4.19 still normalizes a missing `:status` to
+200. [Upstream fix #959](https://github.com/hyperium/h2/pull/959) is merged but not
+included in this locked release; rejection of that malformed response still
+requires upgrading to a published release containing the fix.
+
+VMess records errors returned by its relay before closing the duplex half, so
+response-header and body-decoding failures reach the stream owner instead of EOF.
 
 ### Marked sockets and name resolution
 
