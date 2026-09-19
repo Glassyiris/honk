@@ -1,5 +1,6 @@
 mod evidence;
 mod feedback;
+mod pressure;
 mod ranking;
 mod selection;
 #[cfg(test)]
@@ -8,6 +9,7 @@ mod verification;
 
 use evidence::{MetricSnapshot, Performance, PerformanceSnapshot};
 pub use feedback::{ScoreFeedback, ScoreReporter};
+pub(in crate::group) use pressure::TransportQualitySource;
 pub use verification::{
     ScoreComparison, ScoreEvidenceBasis, ScoreEvidenceGaps, ScoreValidationAction,
     ScoreVerificationCounters, ScoreVerificationSnapshot, ScoreVerificationState,
@@ -55,6 +57,7 @@ const PERFORMANCE_VALIDATION_SAMPLES: f64 = 4.0;
 const PERFORMANCE_SWITCH_MARGIN: f64 = 0.1;
 const LIVE_RX_INTERVAL: Duration = Duration::from_secs(1);
 const LIVE_QUALIFICATION_TTL: Duration = Duration::from_secs(60);
+const CARRIER_PRESSURE_TTL: Duration = Duration::from_secs(60);
 
 /// Separates business outcomes from configured health and preparation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -196,6 +199,7 @@ struct Stats {
     probes: [evidence::ProbeMetric; 6],
     last_attempt: Option<Instant>,
     degraded_at: Option<Instant>,
+    carrier_pressure: [Option<crate::transport_quality::TransportPressure>; 2],
     fail_streak: u32,
     explore_not_before: Option<Instant>,
     updated_at: Option<Instant>,
@@ -323,6 +327,8 @@ pub struct ScoreReasonCounters {
     pub switch_flap: u64,
     pub fail_streak_excluded: u64,
     pub explore_backed_off: u64,
+    pub carrier_pressure: u64,
+    pub carrier_validation: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -352,6 +358,7 @@ struct StateInner {
     selection_reasons: HashMap<SelectionReasonKey, ScoreReasonCounters>,
     verification_counters: HashMap<SelectionReasonKey, ScoreVerificationCounters>,
     active_authority: Option<Arc<ScoreAuthority>>,
+    published_at: Option<Instant>,
     tick: u64,
     exact_evictions: u64,
     aggregate_evictions: u64,
@@ -375,6 +382,7 @@ impl Default for StateInner {
             ),
             selection_reasons: HashMap::new(),
             verification_counters: HashMap::new(),
+            published_at: None,
             active_authority: None,
             tick: 0,
             exact_evictions: 0,
@@ -440,6 +448,7 @@ impl ScorePolicyState {
         let mut inner = self.inner.lock();
         let now = Instant::now();
         inner.active_authority = Some(authority);
+        inner.published_at = Some(now);
         inner.valid = membership.into_iter().collect();
         inner.valid_groups = groups.into_iter().collect();
         let StateInner {
@@ -512,6 +521,7 @@ impl ScorePolicyState {
         // In-flight traffic keeps its cells, but a new generation must remeasure health.
         for (_, stats) in inner.aggregate.iter_mut() {
             stats.probes = Default::default();
+            stats.carrier_pressure = Default::default();
             stats.invalidate_business(now);
         }
         for (_, stats) in inner.exact.iter_mut() {
@@ -766,6 +776,7 @@ struct ScoreSnapshot {
     observed_reliability: f64,
     last_attempt: Option<Instant>,
     degraded_at: Option<Instant>,
+    carrier_pressure_at: Option<Instant>,
     unresolved_failure: bool,
     explore_backed_off: bool,
     fail_streak: u32,

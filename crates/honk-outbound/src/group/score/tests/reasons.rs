@@ -646,6 +646,8 @@ fn selection_reason_counting_respects_apply_and_filter_boundaries() {
         switch_flap: u64::MAX,
         fail_streak_excluded: u64::MAX,
         explore_backed_off: u64::MAX,
+        carrier_pressure: u64::MAX,
+        carrier_validation: u64::MAX,
     };
     stale_state.inner.lock().selection_reasons.insert(
         SelectionReasonKey::new("stale", SelectionNetwork::Tcp),
@@ -818,6 +820,8 @@ fn score_reason_snapshot_is_sorted_fixed_and_private() {
         switch_flap: _,
         fail_streak_excluded: _,
         explore_backed_off: _,
+        carrier_pressure: _,
+        carrier_validation: _,
     } = snapshot[0].tcp;
 
     let _ = manager.selection_plan_for_target(

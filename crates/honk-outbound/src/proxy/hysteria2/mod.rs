@@ -63,6 +63,7 @@ use tracing::debug;
 
 use crate::quic::defrag::Defragmenter;
 use crate::quic::{QuicClient, QuicConnState, now_secs};
+use crate::transport_quality::TransportQuality;
 
 use super::{
     PacketOutbound, PacketTransport, ProbeableOutbound, ProxyStream, QuicSendToken, TcpOutbound,
@@ -415,8 +416,8 @@ impl crate::runtime::QuicRuntimeClient for Hy2Client {
         self
     }
 
-    async fn enable_metrics(&self) {
-        self.quic.enable_metrics().await;
+    async fn enable_metrics(&self, quality: Arc<TransportQuality>) {
+        self.quic.enable_metrics(quality).await;
     }
 
     async fn force_close(&self) {

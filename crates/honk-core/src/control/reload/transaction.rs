@@ -332,6 +332,7 @@ impl ControlPlane {
                     return Ok(false);
                 }
             };
+        new_group_manager.bind_transport_quality(&new_runtime_registry);
         let reuse_dns_router = dns_routing_state_reusable(&current_config, &new_config)
             && current_dns_router.geo_fingerprint() == dns_geo_fingerprint;
         let dns_router = if reuse_dns_router {

@@ -1965,4 +1965,30 @@ mod tests {
             pool.check_invariants();
         }
     }
+
+    #[tokio::test]
+    async fn observed_plain_trojan_ready_pool_rejects_closed_carrier() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut node = ready_identity_trojan_node(address, "localhost", "observed");
+            node.tls_mut().unwrap().enabled = false;
+            node.id = node.derive_id();
+            let target: SocketAddr = "192.0.2.1:80".parse().unwrap();
+            let mut stream = honk_outbound::proxy::trojan::TrojanHandler::new()
+                .dial(&node, target, None, Duration::from_secs(1))
+                .await
+                .unwrap();
+            let (peer, _) = listener.accept().await.unwrap();
+            drop(peer);
+            let mut byte = [0u8; 1];
+            assert!(!matches!(stream.stream.read(&mut byte).await, Ok(n) if n > 0));
+            let pool = ConnectionPool::new();
+            let key = ConnectionPool::ready_key(1, node.id, target, None);
+            pool.deposit_ready(1, &key, stream).await;
+            assert!(pool.acquire_ready(&key).await.is_none());
+        })
+        .await
+        .unwrap();
+    }
 }

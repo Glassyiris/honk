@@ -83,6 +83,8 @@ Score 经普通健康过滤后选择一个权威叶节点；代理健康地址�
 
 透明 TCP/UDP、受支持的 DNS exchange 和 UI 下载反馈真实业务 attempt。配置 HTTP/UDP/QUIC 探测提供近期质量，不增加业务成功或清除真实连败。手动 Clash delay 保留 Alive/API 历史，但不建立配置 Score 基线，也不把任意目标失败变成真实拨号降级；实际准备仍记预热质量。独立 Score QUIC 握手保留既有 DataUdp 健康恢复，不虚构字节流量。
 
+持续且实际测得的 carrier 压力可以重新打开预算内比较，但不增加业务失败，也不直接改变赢家。这是 honk→代理服务器的提示证据，不是端到端 UDP 丢包率或首请求保证；不支持观测的路径仍未知。详见[提示范围](../design/groups.md#score-评分与生命周期)。
+
 全部评分状态仅存于当前进程内存。精确 node-target cell 使用硬上限为 4,096 的 LRU，聚合 cell 使用另一个 4,096 项 LRU。精确目标证据衡量的是实际 transport 质量，不表示服务在语义上已解锁；需要这种粗粒度 cohort 时，应使用已有 routing 或 geosite 规则选择专用的服务 Score 组。成功的进程内 reload 复用同一共享状态并移除已删除组或成员的 cell；进程重启会清空状态。评分 cell 与仅由 scorer 持有的 domain/IP 键不会进入日志、持久化存储或任何 API 输出。Clash 仍将 Score 表示为 `type: "url_test"`，在 `now` 中显示当前聚合 TCP 胜者，并拒绝对该组执行 `PUT /proxies/{name}`。
 
 可重试的 TCP 建立失败后，Score 所属请求至多顺序尝试一个不同的合格叶节点，不要求普通评分先改选。两次尝试共享 deadline 和既有拨号准入；Selector 边界与首选实际经过的 final 边保持权威，不新增 direct/final 兜底或重放应用负载。提交 reload 时清空探测基线，但保留有效在途业务证据；中性 cell 仍受既有 LRU 容量约束。

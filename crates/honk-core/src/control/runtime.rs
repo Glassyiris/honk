@@ -878,6 +878,8 @@ impl ControlPlane {
                     }
                 }
                 _ = heartbeat.tick() => {
+                    let manager = self.group_manager.read().clone();
+                    manager.observe_transport_quality();
                     trace!(
                         "control plane heartbeat (iteration {}, active_connections={})",
                         loop_count,

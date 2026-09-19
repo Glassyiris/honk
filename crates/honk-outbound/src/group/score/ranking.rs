@@ -162,6 +162,21 @@ impl ScorePolicyState {
                 index,
                 reason: SelectionReason::PeriodicExplore,
             };
+            if snapshots[ordinary.index]
+                .carrier_pressure_at
+                .is_some_and(|at| {
+                    inner
+                        .selection_counts
+                        .get(&cadence_key)
+                        .is_some_and(|cadence| at > cadence.revalidated_at)
+                })
+            {
+                let counts = inner
+                    .selection_reasons
+                    .entry(SelectionReasonKey::new(group, context.network))
+                    .or_default();
+                counts.carrier_validation = counts.carrier_validation.saturating_add(1);
+            }
         }
         if selection.reason.is_exploration()
             && let Some(cadence) = inner.selection_counts.get_mut(&cadence_key)
@@ -513,6 +528,17 @@ pub(super) fn score_snapshot(
         let probe = &stats.probes[super::evidence::probe_slot(context)];
         score.probe = probe.latency.snapshot(now);
         score.probe_scope = probe.scope;
+        // The filter family is not the socket selected by a dual-stack dial.
+        // A carrier hint asks a node-wide question; it is not target performance.
+        score.carrier_pressure_at = stats
+            .carrier_pressure
+            .iter()
+            .flatten()
+            .filter(|pressure| {
+                now.saturating_duration_since(pressure.observed_at) < super::CARRIER_PRESSURE_TTL
+            })
+            .map(|pressure| pressure.observed_at)
+            .max();
     }
     if let (Some(family), Some(target)) = (context.target_family, context.target.as_ref())
         && let Some(stats) = inner.exact.peek(&ExactKey {
@@ -548,6 +574,7 @@ pub(super) fn score_snapshot(
             .map(|stats| super::verification::VerificationEvidence::new(stats, now))
             .unwrap_or_default();
     }
+    score.degraded_at = score.degraded_at.max(score.carrier_pressure_at);
     score
 }
 

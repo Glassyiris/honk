@@ -80,6 +80,8 @@ async fn score_stats_count_only_committed_switches_and_distinguish_ineligible_in
         "switchFlap": 0,
         "failStreakExcluded": 0,
         "exploreBackedOff": 0,
+        "carrierPressure": 0,
+        "carrierValidation": 0,
     });
     let initial = get_json(&app, "/stats").await;
     let groups = initial["score"]["groups"].as_array().unwrap();

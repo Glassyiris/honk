@@ -258,6 +258,8 @@ Trojan 冷连接和 pool 中取出的裸连接使用同一套完整 transport。
 TLS 批量读取先返回已经读到的字节，再在下一次非空读取中报告后续的 I/O
 错误，不会把该错误转换成 EOF。
 
+`transport_quality` 管理按 runtime 所有者归属的 carrier 压力提示。共享 TCP/TLS/REALITY 与 AnyTLS 在物理 I/O 层观测，Shadowsocks 借用已有 socket half。Linux `TCP_INFO` 每个活跃秒最多读取一次，各字段按内核返回 ABI 长度独立检查；缺失或读取失败保持未知，不能改变 I/O。Vision Direct 与 ready pool 的 FD 存活性检查保留 socket 路径。Hy2/TUIC/Juicity 复用已有每秒物理 QUIC 采样，隔离握手确认／发布前历史，peer 改变时重建基线；逻辑 mux 子流不会重复报告同一事件。不额外持有 FD，也不创建逐 TCP 定时任务；静止 TCP 不产生新的事件驱动观测。详见 [Score 压力语义](./groups.md#score-评分与生命周期)。
+
 gRPC transport 是手写的最小 gRPC-over-HTTP/2 client。opening HEADERS
 frame 不设置 `END_STREAM`，TLS 请求使用 `:scheme: https`。DATA 携带 gRPC
 长度前缀，以及 gun 风格服务端预期的 protobuf 单 bytes 字段 envelope。

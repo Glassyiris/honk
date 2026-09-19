@@ -885,6 +885,8 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
                     "switchFlap": counters.switch_flap,
                     "failStreakExcluded": counters.fail_streak_excluded,
                     "exploreBackedOff": counters.explore_backed_off,
+                    "carrierPressure": counters.carrier_pressure,
+                    "carrierValidation": counters.carrier_validation,
                 })
             };
             serde_json::json!({

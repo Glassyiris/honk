@@ -735,6 +735,8 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
                     "switchFlap": 0,
                     "failStreakExcluded": 0,
                     "exploreBackedOff": 0,
+                    "carrierPressure": 0,
+                    "carrierValidation": 0,
                 },
                 "udp": {
                     "coldExplore": 0,
@@ -750,6 +752,8 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
                     "switchFlap": 0,
                     "failStreakExcluded": 0,
                     "exploreBackedOff": 0,
+                    "carrierPressure": 0,
+                    "carrierValidation": 0,
                 },
             },
             {
@@ -768,6 +772,8 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
                     "switchFlap": 0,
                     "failStreakExcluded": 0,
                     "exploreBackedOff": 0,
+                    "carrierPressure": 0,
+                    "carrierValidation": 0,
                 },
                 "udp": {
                     "coldExplore": 0,
@@ -783,6 +789,8 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
                     "switchFlap": 0,
                     "failStreakExcluded": 0,
                     "exploreBackedOff": 0,
+                    "carrierPressure": 0,
+                    "carrierValidation": 0,
                 },
             },
         ],

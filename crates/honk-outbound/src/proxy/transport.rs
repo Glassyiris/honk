@@ -23,6 +23,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
 use super::AsyncReadWrite;
+use crate::transport_quality::tcp::ObservedTcp;
 
 /// Connect if needed, then apply TLS and `node.transport` wrapping.
 pub(crate) async fn wrap_transport(
@@ -62,7 +63,7 @@ pub(crate) async fn maybe_tls_wrap(
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
     match maybe_tls_wrap_concrete(node, tcp, connect_timeout).await? {
         MaybeTls::Tls(stream) => Ok(Box::new(crate::tls::BatchRead::new(*stream))),
-        MaybeTls::Plain(stream) => Ok(Box::new(stream)),
+        MaybeTls::Plain(stream) => Ok(stream),
     }
 }
 
@@ -70,8 +71,8 @@ pub(crate) async fn maybe_tls_wrap(
 /// Vision direct-copy switch must reach the raw TCP socket under the TLS
 /// stream once the server abandons the outer TLS session.
 pub(crate) enum MaybeTls {
-    Tls(Box<crate::tls::TlsStream<TcpStream>>),
-    Plain(TcpStream),
+    Tls(Box<crate::tls::TlsStream<ObservedTcp>>),
+    Plain(Box<ObservedTcp>),
 }
 
 pub(crate) async fn maybe_tls_wrap_concrete(
@@ -98,8 +99,9 @@ pub(crate) async fn maybe_tls_wrap_concrete(
         let setup = async {
             let tcp = initial_tcp.await?;
             let peer = tcp.peer_addr()?;
+            let tcp = ObservedTcp::new(tcp);
             let chrome = crate::tls::chrome_mode();
-            let tls_stream =
+            let mut tls_stream =
                 match crate::reality::reality_connect_with_key_shares(tcp, &reality, chrome, true)
                     .await
                 {
@@ -123,6 +125,7 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                                 connect_timeout.min(remaining),
                             )
                             .await?;
+                            let tcp = ObservedTcp::new(tcp);
                             crate::reality::reality_connect_with_key_shares(
                                 tcp, &reality, chrome, false,
                             )
@@ -132,6 +135,7 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                     }
                     Err(error) => return Err(error),
                 };
+            tls_stream.get_mut().activate();
             Ok(MaybeTls::Tls(Box::new(tls_stream)))
         };
         return tokio::time::timeout_at(deadline, setup)
@@ -140,14 +144,16 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                 std::io::Error::new(std::io::ErrorKind::TimedOut, "REALITY setup timeout")
             })?;
     }
-    let tcp = initial_tcp.await?;
+    let mut tcp = ObservedTcp::new(initial_tcp.await?);
     if tls.enabled {
         let connector = crate::tls::build_connector(node)?;
         let server_name = tls.sni.clone().unwrap_or_else(|| node.host().to_string());
-        let tls_stream = connector.connect(&server_name, tcp).await?;
+        let mut tls_stream = connector.connect(&server_name, tcp).await?;
+        tls_stream.get_mut().activate();
         return Ok(MaybeTls::Tls(Box::new(tls_stream)));
     }
-    Ok(MaybeTls::Plain(tcp))
+    tcp.activate();
+    Ok(MaybeTls::Plain(Box::new(tcp)))
 }
 
 /// Upgrade an already-connected (optionally TLS-wrapped) stream to

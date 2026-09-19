@@ -15,6 +15,8 @@ use quinn::{ClientConfig, Connection, Endpoint, RecvStream, TransportConfig, Var
 use tokio::sync::Mutex;
 use tracing::warn;
 
+use crate::transport_quality::TransportQuality;
+
 pub mod boring;
 mod client;
 mod endpoint;
@@ -422,7 +424,7 @@ struct State<C> {
     conn: Option<(Connection, Arc<C>)>,
     connections: Vec<TrackedConnection<C>>,
     next_connection_id: u64,
-    metrics_enabled: bool,
+    quality: Option<Arc<TransportQuality>>,
 
     /// Set by [`QuicClient::force_close`]: future dials fail instead of
     /// re-dialing into a closed client.

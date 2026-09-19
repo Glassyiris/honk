@@ -1,8 +1,12 @@
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
+use std::time::Instant;
 
 use parking_lot::Mutex as SyncMutex;
 use quinn::Connection;
+
+use crate::transport_quality::{CarrierSample, CarrierSampler, TransportQuality};
 
 use super::flow_control::{
     AdaptiveFlowSampler, apply_flow_control_profile, seed_flow_control_profile,
@@ -350,17 +354,86 @@ pub fn monitor_quic_connection(conn: &Connection) -> QuicConnectionMonitor {
     }
 }
 
+struct QuicCarrierPressure {
+    quality: Arc<TransportQuality>,
+    remote: SocketAddr,
+    sampler: CarrierSampler,
+}
+
+impl QuicCarrierPressure {
+    fn new(quality: Arc<TransportQuality>, mut remote: SocketAddr) -> Self {
+        remote.set_ip(remote.ip().to_canonical());
+        Self {
+            sampler: CarrierSampler::new(Arc::clone(&quality), remote.is_ipv6()),
+            quality,
+            remote,
+        }
+    }
+
+    fn observe(&mut self, stats: &quinn::ConnectionStats, mut remote: SocketAddr, at: Instant) {
+        remote.set_ip(remote.ip().to_canonical());
+        if remote != self.remote {
+            self.remote = remote;
+            self.sampler = CarrierSampler::new(Arc::clone(&self.quality), remote.is_ipv6());
+        }
+        // Confirmation and runtime admission each start a fresh carrier baseline.
+        if !self.quality.is_enabled() || stats.frame_rx.handshake_done == 0 {
+            self.sampler.reset();
+            return;
+        }
+        let Some(transmitted) = stats
+            .path
+            .sent_packets
+            .checked_sub(stats.path.sent_plpmtud_probes)
+        else {
+            self.sampler.reset();
+            return;
+        };
+        self.sampler.observe(CarrierSample {
+            at,
+            rtt: Some(stats.path.rtt),
+            acknowledged: Some(stats.path.acked_ack_eliciting_packets),
+            transmitted: Some(transmitted),
+            // Quinn already excludes PLPMTUD losses; do not subtract them twice.
+            lost: Some(stats.path.lost_packets),
+            lost_bytes: Some(stats.path.lost_bytes),
+            // These are ACKed stream bytes, not all offered UDP payload bytes.
+            tx_bytes: Some(stats.flow_control.sent_bytes),
+            rx_bytes: Some(stats.flow_control.received_bytes),
+            tx_datagrams: Some(stats.frame_tx.datagram),
+            rx_datagrams: Some(stats.frame_rx.datagram),
+        });
+    }
+}
+
 pub(super) struct QuicClientConnectionMonitor {
     conn: Connection,
     metrics_enabled: Arc<AtomicBool>,
     tracker: Arc<SyncMutex<QuicMetricTracker>>,
+    pressure: Arc<SyncMutex<Option<QuicCarrierPressure>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl QuicClientConnectionMonitor {
-    pub(super) fn enable_metrics(&self) {
+    pub(super) fn enable_metrics(&self, quality: Arc<TransportQuality>) {
         self.metrics_enabled.store(true, Ordering::Release);
-        self.tracker.lock().sample(self.conn.stats());
+        let at = Instant::now();
+        let stats = {
+            let mut tracker = self.tracker.lock();
+            let stats = self.conn.stats();
+            tracker.sample(stats);
+            stats
+        };
+        let mut pressure = self.pressure.lock();
+        if pressure
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(&current.quality, &quality))
+        {
+            let remote = self.conn.remote_address();
+            let mut sampler = QuicCarrierPressure::new(quality, remote);
+            sampler.observe(&stats, remote, at);
+            *pressure = Some(sampler);
+        }
     }
 }
 
@@ -376,7 +449,7 @@ pub(super) fn spawn_quic_client_connection_monitor<C: Send + Sync + 'static>(
     profiles: Arc<AdaptiveFlowProfiles>,
     ipv6: bool,
     owner: Weak<C>,
-    metrics_enabled: bool,
+    quality: Option<Arc<TransportQuality>>,
 ) -> QuicClientConnectionMonitor {
     let family = usize::from(ipv6);
     let initial_stats = conn.stats();
@@ -387,6 +460,13 @@ pub(super) fn spawn_quic_client_connection_monitor<C: Send + Sync + 'static>(
         apply_flow_control_profile(&conn, &initial_stats, profile);
     }
     let mut sampler = AdaptiveFlowSampler::new(&initial_stats, path_now_millis());
+    let metrics_enabled = quality.is_some();
+    let pressure = Arc::new(SyncMutex::new(quality.map(|quality| {
+        let remote = conn.remote_address();
+        let mut sampler = QuicCarrierPressure::new(quality, remote);
+        sampler.observe(&initial_stats, remote, Instant::now());
+        sampler
+    })));
     let tracker = Arc::new(SyncMutex::new(QuicMetricTracker::default()));
     if metrics_enabled {
         tracker.lock().sample(initial_stats);
@@ -395,6 +475,7 @@ pub(super) fn spawn_quic_client_connection_monitor<C: Send + Sync + 'static>(
     let task_conn = conn.clone();
     let task_tracker = Arc::clone(&tracker);
     let task_enabled = Arc::clone(&enabled);
+    let task_pressure = Arc::clone(&pressure);
     let task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval_at(
             tokio::time::Instant::now() + QUIC_SAMPLE_INTERVAL,
@@ -408,6 +489,7 @@ pub(super) fn spawn_quic_client_connection_monitor<C: Send + Sync + 'static>(
                     if owner.upgrade().is_none() {
                         break;
                     }
+                    let at = Instant::now();
                     let stats = task_conn.stats();
                     {
                         let mut profiles = profiles.lock();
@@ -417,6 +499,11 @@ pub(super) fn spawn_quic_client_connection_monitor<C: Send + Sync + 'static>(
                     }
                     if task_enabled.load(Ordering::Acquire) {
                         task_tracker.lock().sample(stats);
+                    }
+                    if task_conn.close_reason().is_none()
+                        && let Some(pressure) = task_pressure.lock().as_mut()
+                    {
+                        pressure.observe(&stats, task_conn.remote_address(), at);
                     }
                 }
             }
@@ -432,6 +519,275 @@ pub(super) fn spawn_quic_client_connection_monitor<C: Send + Sync + 'static>(
         conn,
         metrics_enabled: enabled,
         tracker,
+        pressure,
         task,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::transport_quality::PressureReason;
+
+    fn loss_stats(tick: u64) -> quinn::ConnectionStats {
+        let mut stats = quinn::ConnectionStats::default();
+        stats.frame_rx.handshake_done = 1;
+        stats.path.rtt = Duration::from_millis(20);
+        stats.path.acked_ack_eliciting_packets = 32 * tick;
+        stats.path.sent_packets = 64 * tick;
+        stats.path.sent_plpmtud_probes = 32 * tick;
+        stats.path.lost_plpmtud_probes = 32 * tick;
+        stats.path.lost_packets = 3 * tick;
+        stats.path.lost_bytes = 3600 * tick;
+        stats.frame_tx.datagram = 32 * tick;
+        stats
+    }
+
+    #[test]
+    fn native_datagram_pressure_excludes_probe_sends_not_probe_losses() {
+        let quality = Arc::new(TransportQuality::default());
+        quality.enable();
+        let remote = "127.0.0.1:443".parse().unwrap();
+        let mut pressure = QuicCarrierPressure::new(Arc::clone(&quality), remote);
+        let now = Instant::now();
+        for tick in 0..=2 {
+            pressure.observe(&loss_stats(tick), remote, now + Duration::from_secs(tick));
+        }
+        assert!(quality.snapshot()[0].is_none());
+        pressure.observe(&loss_stats(3), remote, now + Duration::from_secs(3));
+        let event = quality.snapshot()[0].unwrap();
+        assert_eq!(event.reason, PressureReason::Loss);
+        assert_eq!(event.observed_at, now + Duration::from_secs(3));
+        assert!(quality.snapshot()[1].is_none());
+    }
+
+    #[test]
+    fn heartbeat_ack_and_probe_only_traffic_cannot_publish_pressure() {
+        let quality = Arc::new(TransportQuality::default());
+        quality.enable();
+        let remote = "127.0.0.1:443".parse().unwrap();
+        let mut pressure = QuicCarrierPressure::new(Arc::clone(&quality), remote);
+        let now = Instant::now();
+        for tick in 0..=12 {
+            let mut stats = loss_stats(tick);
+            // Even one tiny heartbeat each second is below the TUIC idle fence.
+            stats.frame_tx.datagram = tick;
+            stats.flow_control.sent_bytes = 64 * tick;
+            stats.udp_tx.bytes = 65536 * tick;
+            stats.frame_tx.ping = tick;
+            stats.frame_rx.acks = 64 * tick;
+            stats.path.rtt = Duration::from_millis(if tick < 5 { 20 } else { 80 });
+            pressure.observe(&stats, remote, now + Duration::from_secs(tick));
+        }
+        assert!(quality.snapshot().iter().all(Option::is_none));
+        for tick in 13..=24 {
+            let mut stats = loss_stats(tick);
+            stats.frame_tx.datagram = 12;
+            stats.flow_control.sent_bytes = 64 * 12;
+            stats.path.sent_packets = stats.path.sent_plpmtud_probes;
+            stats.path.lost_packets = 0;
+            stats.path.lost_bytes = 0;
+            pressure.observe(&stats, remote, now + Duration::from_secs(tick));
+        }
+        assert!(quality.snapshot().iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn receive_only_datagrams_do_not_turn_ack_losses_into_send_pressure() {
+        let quality = Arc::new(TransportQuality::default());
+        quality.enable();
+        let remote = "127.0.0.1:443".parse().unwrap();
+        let mut pressure = QuicCarrierPressure::new(Arc::clone(&quality), remote);
+        let now = Instant::now();
+        for tick in 0..=8 {
+            let mut stats = loss_stats(tick);
+            stats.frame_tx.datagram = 0;
+            stats.frame_rx.datagram = 32 * tick;
+            pressure.observe(&stats, remote, now + Duration::from_secs(tick));
+        }
+        assert!(quality.snapshot().iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn activation_and_handshake_confirmation_discard_old_history() {
+        let quality = Arc::new(TransportQuality::default());
+        let remote = "127.0.0.1:443".parse().unwrap();
+        let mut pressure = QuicCarrierPressure::new(Arc::clone(&quality), remote);
+        let now = Instant::now();
+        for tick in 0..=4 {
+            pressure.observe(&loss_stats(tick), remote, now + Duration::from_secs(tick));
+        }
+        assert!(quality.snapshot()[0].is_none());
+        quality.enable();
+        for tick in 5..=9 {
+            let mut stats = loss_stats(tick);
+            stats.frame_rx.handshake_done = 0;
+            pressure.observe(&stats, remote, now + Duration::from_secs(tick));
+        }
+        assert!(quality.snapshot()[0].is_none());
+        for tick in 10..=12 {
+            pressure.observe(&loss_stats(tick), remote, now + Duration::from_secs(tick));
+        }
+        assert!(quality.snapshot()[0].is_none());
+        pressure.observe(&loss_stats(13), remote, now + Duration::from_secs(13));
+        assert_eq!(
+            quality.snapshot()[0].unwrap().observed_at,
+            now + Duration::from_secs(13)
+        );
+    }
+
+    #[test]
+    fn runtime_activation_reseeds_a_confirmed_carrier() {
+        let quality = Arc::new(TransportQuality::default());
+        let remote = "127.0.0.1:443".parse().unwrap();
+        let mut pressure = QuicCarrierPressure::new(Arc::clone(&quality), remote);
+        let now = Instant::now();
+        for tick in 0..=2 {
+            pressure.observe(&loss_stats(tick), remote, now + Duration::from_secs(tick));
+        }
+        quality.enable();
+        for tick in 3..=5 {
+            pressure.observe(&loss_stats(tick), remote, now + Duration::from_secs(tick));
+        }
+        assert!(quality.snapshot()[0].is_none());
+        pressure.observe(&loss_stats(6), remote, now + Duration::from_secs(6));
+        assert_eq!(
+            quality.snapshot()[0].unwrap().observed_at,
+            now + Duration::from_secs(6)
+        );
+    }
+
+    #[test]
+    fn invalid_probe_send_counters_restart_the_observation_window() {
+        let quality = Arc::new(TransportQuality::default());
+        quality.enable();
+        let remote = "127.0.0.1:443".parse().unwrap();
+        let mut pressure = QuicCarrierPressure::new(Arc::clone(&quality), remote);
+        let now = Instant::now();
+        for tick in 0..=2 {
+            pressure.observe(&loss_stats(tick), remote, now + Duration::from_secs(tick));
+        }
+        let mut invalid = loss_stats(3);
+        invalid.path.sent_packets = invalid.path.sent_plpmtud_probes - 1;
+        pressure.observe(&invalid, remote, now + Duration::from_secs(3));
+        for tick in 4..=6 {
+            pressure.observe(&loss_stats(tick), remote, now + Duration::from_secs(tick));
+        }
+        assert!(quality.snapshot()[0].is_none());
+        pressure.observe(&loss_stats(7), remote, now + Duration::from_secs(7));
+        assert_eq!(
+            quality.snapshot()[0].unwrap().observed_at,
+            now + Duration::from_secs(7)
+        );
+    }
+
+    #[test]
+    fn mapped_ipv4_retains_current_pressure_streak() {
+        let quality = Arc::new(TransportQuality::default());
+        quality.enable();
+        let remote = "127.0.0.1:443".parse().unwrap();
+        let mapped = "[::ffff:127.0.0.1]:443".parse().unwrap();
+        let mut pressure = QuicCarrierPressure::new(Arc::clone(&quality), remote);
+        let now = Instant::now();
+        for tick in 0..=2 {
+            pressure.observe(&loss_stats(tick), remote, now + Duration::from_secs(tick));
+        }
+        pressure.observe(&loss_stats(3), mapped, now + Duration::from_secs(3));
+        assert_eq!(
+            quality.snapshot()[0].unwrap().observed_at,
+            now + Duration::from_secs(3)
+        );
+        assert!(quality.snapshot()[1].is_none());
+    }
+
+    #[test]
+    fn peer_tuple_changes_reseed_and_switch_family() {
+        let quality = Arc::new(TransportQuality::default());
+        quality.enable();
+        let remote = "127.0.0.1:443".parse().unwrap();
+        let next_port = "127.0.0.1:444".parse().unwrap();
+        let ipv6 = "[::1]:444".parse().unwrap();
+        let mut pressure = QuicCarrierPressure::new(Arc::clone(&quality), remote);
+        let now = Instant::now();
+        for tick in 0..=2 {
+            pressure.observe(&loss_stats(tick), remote, now + Duration::from_secs(tick));
+        }
+        for tick in 3..=5 {
+            pressure.observe(
+                &loss_stats(tick),
+                next_port,
+                now + Duration::from_secs(tick),
+            );
+        }
+        assert!(quality.snapshot()[0].is_none());
+        pressure.observe(&loss_stats(6), next_port, now + Duration::from_secs(6));
+        let first = quality.snapshot()[0].unwrap().observed_at;
+        assert_eq!(first, now + Duration::from_secs(6));
+        for tick in 7..=9 {
+            pressure.observe(&loss_stats(tick), ipv6, now + Duration::from_secs(tick));
+            assert!(quality.snapshot()[1].is_none());
+        }
+        pressure.observe(&loss_stats(10), ipv6, now + Duration::from_secs(10));
+        assert_eq!(
+            quality.snapshot()[1].unwrap().observed_at,
+            now + Duration::from_secs(10)
+        );
+        assert_eq!(quality.snapshot()[0].unwrap().observed_at, first);
+    }
+
+    #[tokio::test]
+    async fn repeated_monitor_activation_preserves_current_pressure_streak() {
+        use crate::quic::{self, testutil};
+
+        let (server_endpoint, remote) = testutil::server_endpoint(&[b"h3"], true).unwrap();
+        let accepted = tokio::spawn({
+            let endpoint = server_endpoint.clone();
+            async move { endpoint.accept().await.unwrap().await.unwrap() }
+        });
+        let mut node = honk_config::node::Node {
+            outbound: honk_config::node::OutboundConfig::Hysteria2(Default::default()),
+            ..Default::default()
+        };
+        node.tls_mut().unwrap().skip_cert_verify = true;
+        let config = quic::client_config(&node, &[b"h3"], quic::QuicClientOptions::default())
+            .await
+            .unwrap();
+        let endpoint = quic::client_endpoint(false).unwrap();
+        let conn = endpoint
+            .connect_with(config, remote, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let server = accepted.await.unwrap();
+        let owner = Arc::new(());
+        let monitor = spawn_quic_client_connection_monitor(
+            conn,
+            Arc::new(AdaptiveFlowProfiles::default()),
+            false,
+            Arc::downgrade(&owner),
+            None,
+        );
+        let quality = Arc::new(TransportQuality::default());
+        quality.enable();
+        monitor.enable_metrics(Arc::clone(&quality));
+        let now = Instant::now() + Duration::from_secs(20);
+        for tick in 0..=3 {
+            monitor.enable_metrics(Arc::clone(&quality));
+            monitor.pressure.lock().as_mut().unwrap().observe(
+                &loss_stats(tick),
+                remote,
+                now + Duration::from_secs(tick),
+            );
+        }
+        assert_eq!(
+            quality.snapshot()[0].unwrap().observed_at,
+            now + Duration::from_secs(3)
+        );
+        drop(monitor);
+        server.close(quinn::VarInt::from_u32(0), b"test complete");
+        endpoint.close(quinn::VarInt::from_u32(0), b"test complete");
+        server_endpoint.close(quinn::VarInt::from_u32(0), b"test complete");
     }
 }
