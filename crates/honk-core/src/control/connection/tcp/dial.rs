@@ -460,11 +460,15 @@ impl ControlPlaneHandle {
             {
                 scope.start();
                 tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);
-                return entry
-                    .tcp
-                    .dial_with_tcp(node, target, target_domain, tcp, connect_timeout)
-                    .await
-                    .map(|stream| (stream, true));
+                let dial =
+                    entry
+                        .tcp
+                        .dial_with_tcp(node, target, target_domain, tcp, connect_timeout);
+                let stream = match generation.get(&node.id) {
+                    Some(runtime) => runtime.transport_quality().scope(dial).await,
+                    None => dial.await,
+                }?;
+                return Ok((stream, true));
             }
 
             // Pool miss (or pools disabled) — fresh connect through the

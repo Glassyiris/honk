@@ -409,8 +409,8 @@ fn setup_quality_survives_neutral_completion_without_a_response() {
         );
         assert_eq!(score.target_performance.setup.value, Some(60.0));
         assert_eq!(
-            (score.attempts, score.completed, score.failures),
-            (0.0, 0.0, 0.0)
+            (score.attempts, score.completed, score.unresolved_failure),
+            (0.0, 0.0, false)
         );
         assert_eq!(
             state.peek_rank("score", &target, &nodes.iter().collect::<Vec<_>>()),
@@ -454,8 +454,8 @@ fn concurrent_failed_probe_cannot_retire_successful_probe_evidence() {
     let score = score_snapshot(&state.inner.lock(), "score", &target, nodes[1].id, now);
     assert_eq!(score.probe.value, Some(5.0));
     assert_eq!(
-        (score.attempts, score.completed, score.failures),
-        (0.0, 0.0, 0.0)
+        (score.attempts, score.completed, score.unresolved_failure),
+        (0.0, 0.0, false)
     );
     assert_eq!(
         state.peek_rank("score", &target, &nodes.iter().collect::<Vec<_>>()),

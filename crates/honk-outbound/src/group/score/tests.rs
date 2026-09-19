@@ -1,4 +1,3 @@
-use super::evidence::evidence_decay;
 use super::ranking::{exploration_period, exploration_target, score_snapshot};
 use super::*;
 use honk_config::group::{Group, GroupPolicy};
@@ -8,6 +7,8 @@ mod cadence;
 mod evidence;
 mod live;
 mod performance;
+mod pressure;
+mod progress;
 mod reasons;
 mod selection;
 mod verification;
@@ -120,15 +121,22 @@ fn train_at(
     download: u64,
     now: Instant,
 ) {
-    for _ in 0..samples {
-        let reporter = manager
-            .feedback_for_group_node("score", leaf.id, target.clone())
-            .unwrap()
-            .start_at(now);
+    let feedback = manager
+        .feedback_for_group_node("score", leaf.id, target.clone())
+        .unwrap();
+    let reporters: Vec<_> = (0..samples).map(|_| feedback.start_at(now)).collect();
+    for reporter in &reporters {
         reporter.setup_succeeded_at(now);
+    }
+    for reporter in &reporters {
         reporter.first_response_at(now + response);
-        reporter.transfer_at(1, download.max(1), now + Duration::from_secs(1));
-        reporter.finish_at(ScoreOutcome::Success, true, now + Duration::from_secs(1));
+    }
+    let finished = now + Duration::from_secs(1).max(response);
+    for reporter in &reporters {
+        reporter.transfer_at(1, download.max(1), finished);
+    }
+    for reporter in reporters {
+        reporter.finish_at(ScoreOutcome::Success, true, finished);
     }
 }
 

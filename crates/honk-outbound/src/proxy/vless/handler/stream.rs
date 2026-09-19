@@ -4,9 +4,9 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use crate::transport_quality::tcp::ObservedTcp;
 use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
 
 use super::super::encryption::EncryptedStream;
 use crate::proxy::AsyncReadWrite;
@@ -26,7 +26,7 @@ pub(super) trait DirectRead {
     }
 }
 
-impl DirectRead for TcpStream {
+impl DirectRead for ObservedTcp {
     fn poll_direct_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -36,7 +36,7 @@ impl DirectRead for TcpStream {
     }
 }
 
-impl DirectRead for tokio_boring::SslStream<TcpStream> {
+impl DirectRead for tokio_boring::SslStream<ObservedTcp> {
     fn poll_direct_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

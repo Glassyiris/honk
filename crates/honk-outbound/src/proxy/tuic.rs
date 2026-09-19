@@ -15,6 +15,7 @@ use tracing::debug;
 
 use crate::quic::defrag::Defragmenter;
 use crate::quic::{QuicClient, QuicConnState, now_secs, recv_read_exact as read_exact};
+use crate::transport_quality::TransportQuality;
 
 use super::addr::{self, SocksAddr};
 use super::{
@@ -405,8 +406,8 @@ impl crate::runtime::QuicRuntimeClient for TuicClient {
         self
     }
 
-    async fn enable_metrics(&self) {
-        self.quic.enable_metrics().await;
+    async fn enable_metrics(&self, quality: Arc<TransportQuality>) {
+        self.quic.enable_metrics(quality).await;
     }
 
     async fn force_close(&self) {

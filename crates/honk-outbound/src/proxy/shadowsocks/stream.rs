@@ -9,6 +9,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use crate::transport_quality::tcp::TcpPressure;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -39,6 +40,8 @@ type PrologueFuture = Pin<
 /// prologue (which `dial` completes before returning this type).
 pub(crate) struct SsStream {
     write_half: OwnedWriteHalf,
+    pressure: TcpPressure,
+    peer_authenticated: bool,
     /// Read half, parked inside the pending 2022 prologue future until the
     /// response header has been consumed.
     read_half: Option<OwnedReadHalf>,
@@ -70,9 +73,12 @@ impl SsStream {
         recv_cipher: AeadCipher,
         recv_nonce: Vec<u8>,
     ) -> Self {
+        let pressure = TcpPressure::new(&inner);
         let (read_half, write_half) = inner.into_split();
         Self {
             write_half,
+            pressure,
+            peer_authenticated: true,
             read_half: Some(read_half),
             send_cipher,
             send_nonce,
@@ -97,10 +103,13 @@ impl SsStream {
         send_nonce: Vec<u8>,
         prologue: Ss2022Prologue,
     ) -> Self {
+        let pressure = TcpPressure::new(&inner);
         let (read_half, write_half) = inner.into_split();
         let recv_prologue: PrologueFuture = Box::pin(prologue.run(read_half));
         Self {
             write_half,
+            pressure,
+            peer_authenticated: false,
             read_half: None,
             send_cipher,
             send_nonce,
@@ -125,10 +134,13 @@ impl SsStream {
         send_nonce: Vec<u8>,
         prologue: LegacyPrologue,
     ) -> Self {
+        let pressure = TcpPressure::new(&inner);
         let (read_half, write_half) = inner.into_split();
         let recv_prologue: PrologueFuture = Box::pin(prologue.run(read_half));
         Self {
             write_half,
+            pressure,
+            peer_authenticated: false,
             read_half: None,
             send_cipher,
             send_nonce,
@@ -185,6 +197,10 @@ impl AsyncRead for SsStream {
                     this.recv_nonce = nonce;
                     this.recv_prologue = None;
                     this.prefill_plaintext(&first_payload);
+                    if !first_payload.is_empty() {
+                        this.peer_authenticated = true;
+                        this.pressure.observe(this.write_half.as_ref());
+                    }
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -228,6 +244,8 @@ impl AsyncRead for SsStream {
                 this.carry = rest;
             }
             if out_len > 0 {
+                this.peer_authenticated = true;
+                this.pressure.observe(this.write_half.as_ref());
                 out.advance(out_len);
                 return Poll::Ready(Ok(()));
             }
@@ -291,6 +309,10 @@ impl AsyncRead for SsStream {
                 tag_len,
             )
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            if out_len > 0 {
+                this.peer_authenticated = true;
+                this.pressure.observe(this.write_half.as_ref());
+            }
             this.plain_start = 0;
             this.plain_end = out_len;
             this.carry = rest;
@@ -387,6 +409,9 @@ impl SsStream {
                 Poll::Pending => return Poll::Pending,
             };
             self.send_off += n;
+            if self.peer_authenticated {
+                self.pressure.observe(self.write_half.as_ref());
+            }
         }
         self.send_buf.clear();
         self.send_off = 0;

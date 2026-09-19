@@ -236,11 +236,12 @@ impl ProxyRegistry {
             .find(protocol)
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
         let stream = generation
-            .scope_dials(
-                entry
-                    .tcp
-                    .dial_runtime(runtime, target, target_domain, connect_timeout),
-            )
+            .scope_dials(runtime.transport_quality().scope(entry.tcp.dial_runtime(
+                runtime,
+                target,
+                target_domain,
+                connect_timeout,
+            )))
             .await?;
         if generation.is_shutdown() {
             anyhow::bail!("outbound runtime generation shut down during dial");
@@ -366,12 +367,16 @@ impl ProxyRegistry {
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
         let (runtime, packet) = self.packet_runtime(&generation, node_id, target.port())?;
         let transport = generation
-            .scope_dials(packet.dial_udp_transport_runtime(
-                runtime,
-                target,
-                target_domain,
-                connect_timeout,
-            ))
+            .scope_dials(
+                runtime
+                    .transport_quality()
+                    .scope(packet.dial_udp_transport_runtime(
+                        runtime,
+                        target,
+                        target_domain,
+                        connect_timeout,
+                    )),
+            )
             .await?;
         if generation.is_shutdown() {
             anyhow::bail!("outbound runtime generation shut down during UDP dial");
@@ -392,11 +397,13 @@ impl ProxyRegistry {
     ) -> anyhow::Result<PreparedUdpTransport> {
         let (runtime, packet) = self.packet_runtime(&generation, node_id, target.port())?;
         let prepared = generation
-            .scope_dials(packet.dial_udp_transport_speculative_runtime(
-                runtime,
-                target,
-                target_domain,
-                connect_timeout,
+            .scope_dials(runtime.transport_quality().scope(
+                packet.dial_udp_transport_speculative_runtime(
+                    runtime,
+                    target,
+                    target_domain,
+                    connect_timeout,
+                ),
             ))
             .await?;
         if generation.is_shutdown() {

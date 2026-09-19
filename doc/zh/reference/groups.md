@@ -75,17 +75,21 @@ Score 经普通健康过滤后选择一个权威叶节点；代理健康地址�
 
 冷启动预算为四个及以下覆盖全部，否则 `ceil(sqrt(n)) + 1`。后续机会在距前次试用 30 秒、累计 `clamp(2n,16,64)` 次选择，或出现退化且已过至少 16 次选择后产生，但只用于未解决的证据缺口。有希望且持续进展的候选最多获得八次集中试用；取消或无进展则公平轮转。触发条件共享组/网络/目标地址族预算，Peek 和新目标不能产生新预算，新鲜等价候选停止强制采样。试用不获得普通现任保护，真实失败保留指数退避和三连败普通排除，退避到期仍允许恢复试用。
 
-业务可靠性仍使用 30 分钟半衰期；性能置信度独立老化，120 秒后过期，不受样本数量影响。setup 与首响应即时发布，已接受的传输进展使用互不重叠的 1–10 秒窗口，被测方向至少 64 KiB 且 flow 已有双向进展和响应。窗口不增加终态成功或失败次数。goodput 受业务需求影响，不等于链路容量，静默不是拥塞。现任保持在八次有效完成后达到 `0.005`，新鲜失败可绕过。常量是不可配置的实验边界，详见[生命周期设计](../design/groups.md#score-评分与生命周期)。
+业务可靠性仍使用 30 分钟半衰期；性能置信度独立老化，120 秒后过期，不受样本数量影响。setup 与首响应即时发布，已接受的传输进展使用互不重叠的 1–10 秒窗口，被测方向至少 64 KiB 且 flow 已有双向进展和响应。窗口不增加终态成功或失败次数。goodput 受业务需求影响，不等于链路容量，静默不是拥塞。现任保持在八次有效完成后达到 `0.005`，支撑量取适用层分别衰减后的最大值。不合格现任和未恢复的业务失败可绕过保持；已恢复的历史失败量不再单独取消保护。健康现任的替换需要双方合格的共同性能依据或有充分支撑的实际可靠性优势，不能只靠对手缺失数据获益。常量仍不可配置，详见[生命周期设计](../design/groups.md#score-评分与生命周期)。
+
+已完成 setup 且已有 TX 的定向 Traffic RX，可在 flow 结束前恢复普通现任保护，但不清除连败、不增加终态成功。首次合格 RX 立即发布，后续按事件驱动且每个 reporter 每秒至多一次；被限频的接收需要等待下一次可发布 RX 或终态。四个有效 useful 完成与新鲜业务 RX 可取得 60 秒资格租约，租约内 RX 可续期而不扩大证据计数。失败／reload 使租约失效；低于完成数门槛的候选不能仅凭 RX 恢复已过期租约。普通选路的这些规则不会放宽 `scoreVerification` 的终态证据要求。
 
 业务评分仍按组、transport、目标地址族、规范化目标和节点身份隔离；全局/地址族/精确目标可靠性分层混合，但不把重叠完成数相加。目标性能仅在新鲜可比时覆盖基线。探测 RTT 单独保留 protocol/family 与规范化 HTTP URI/方法身份；预热只提供 setup 质量。一次真实结果向经过的每个 Score 组归因一次。
 
 透明 TCP/UDP、受支持的 DNS exchange 和 UI 下载反馈真实业务 attempt。配置 HTTP/UDP/QUIC 探测提供近期质量，不增加业务成功或清除真实连败。手动 Clash delay 保留 Alive/API 历史，但不建立配置 Score 基线，也不把任意目标失败变成真实拨号降级；实际准备仍记预热质量。独立 Score QUIC 握手保留既有 DataUdp 健康恢复，不虚构字节流量。
 
+持续且实际测得的 carrier 压力可以重新打开预算内比较，但不增加业务失败，也不直接改变赢家。这是 honk→代理服务器的提示证据，不是端到端 UDP 丢包率或首请求保证；不支持观测的路径仍未知。详见[提示范围](../design/groups.md#score-评分与生命周期)。
+
 全部评分状态仅存于当前进程内存。精确 node-target cell 使用硬上限为 4,096 的 LRU，聚合 cell 使用另一个 4,096 项 LRU。精确目标证据衡量的是实际 transport 质量，不表示服务在语义上已解锁；需要这种粗粒度 cohort 时，应使用已有 routing 或 geosite 规则选择专用的服务 Score 组。成功的进程内 reload 复用同一共享状态并移除已删除组或成员的 cell；进程重启会清空状态。评分 cell 与仅由 scorer 持有的 domain/IP 键不会进入日志、持久化存储或任何 API 输出。Clash 仍将 Score 表示为 `type: "url_test"`，在 `now` 中显示当前聚合 TCP 胜者，并拒绝对该组执行 `PUT /proxies/{name}`。
 
 可重试的 TCP 建立失败后，Score 所属请求至多顺序尝试一个不同的合格叶节点，不要求普通评分先改选。两次尝试共享 deadline 和既有拨号准入；Selector 边界与首选实际经过的 final 边保持权威，不新增 direct/final 兜底或重放应用负载。提交 reload 时清空探测基线，但保留有效在途业务证据；中性 cell 仍受既有 LRU 容量约束。
 
-每次已授权的多候选 Apply 按固定优先级只记录一个原因：初始探索（`coldExplore`）、周期探索（`periodicExplore`）、保持现任（`incumbentHeld`）、新鲜失败绕过（`freshFailureBypass`）、可靠性胜出（`reliabilityWinner`）或性能胜出（`performanceWinner`）。`deadFiltered` 独立记录活性过滤移除的唯一叶候选。`switchFlap` 记录已提交胜者在八次选择内返回前一胜者；探索不进入该窗口。`failStreakExcluded` 按每次 rank 累计被三连败新鲜失败门排除的候选数，`exploreBackedOff` 累计当前处于探索退避的候选数。Peek 与展示/API 读取保持中性。经鉴权的 `/stats.score.groups[]` 只导出这些按组汇总的 TCP/UDP 计数和组名，不导出 cell、节点、目标、cadence 或 manager authority。`/stats.score.cache` 导出两个 4,096 项证据 LRU 的当前 cell 数与累计淘汰数，不含任何组、节点或目标身份。
+每次已授权的多候选 rank 只记录一个互斥原因：`coldExplore`、`periodicExplore`、`incumbentIneligible`、`freshFailureBypass`、`insufficientEvidenceHeld`、`incumbentHeld`、`reliabilityWinner` 或 `performanceWinner`。`ordinarySwitch` 记录同作用域普通已提交 A→B 变更，不含首次选择和试用；`switchFlap` 是其中八次普通选择内返回前一赢家的子集。候选过滤／退避计数保持独立。Peek 与展示/API 读取保持中性。经鉴权的 `/stats.score.groups[]` 只导出固定组／网络计数，`/stats.score.cache` 描述两个有界证据 LRU。详见 [API 原因语义](./api.md#score-选路原因字段)，不导出 scorer 私有节点或目标身份。
 
 采样在共享预算内解决明确的可用性/响应缺口，有进展的候选最多连续获得八次集中试用；新鲜等价候选停止强制采样，缺少传输证据则等待真实负载。新增 `scoreVerification` 区分临时转发、已观测可用性、限定比较、证据范围/有效期及下一步，详见 [API 验证](./api.md#score-验证信息)。这些是可撤销的经验结论，不是最优候选识别或未来网络行为的保证。
 

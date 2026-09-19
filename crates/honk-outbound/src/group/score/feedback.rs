@@ -1,8 +1,8 @@
 use super::evidence::Observation;
 use super::{
-    FlowSample, MAX_THROUGHPUT_DURATION, MIN_THROUGHPUT_BYTES, MIN_THROUGHPUT_DURATION,
-    ScoreAttribution, ScoreAuthority, ScoreOutcome, ScorePolicyState, ScoreSelectionContext,
-    ScoreSource, StartedCells,
+    FlowSample, LIVE_RX_INTERVAL, MAX_THROUGHPUT_DURATION, MIN_THROUGHPUT_BYTES,
+    MIN_THROUGHPUT_DURATION, ScoreAttribution, ScoreAuthority, ScoreOutcome, ScorePolicyState,
+    ScoreSelectionContext, ScoreSource, StartedCells,
 };
 use parking_lot::Mutex;
 use std::hash::{Hash, Hasher};
@@ -124,6 +124,7 @@ impl ScoreFeedback {
                     tx: 0,
                     rx: 0,
                     last_rx_at: None,
+                    published_rx_at: None,
                     window_tx: 0,
                     window_rx: 0,
                 }),
@@ -140,6 +141,7 @@ struct ReporterProgress {
     tx: u64,
     rx: u64,
     last_rx_at: Option<Instant>,
+    published_rx_at: Option<Instant>,
     window_start: Instant,
     window_tx: u64,
     window_rx: u64,
@@ -249,6 +251,17 @@ impl ScoreReporter {
         }
         if rx > 0 {
             progress.last_rx_at = Some(progress.last_rx_at.map_or(now, |at| at.max(now)));
+            if progress.setup.is_some()
+                && progress.tx > 0
+                && self.shared.feedback.context.target.is_some()
+                && progress
+                    .published_rx_at
+                    .is_none_or(|at| now.saturating_duration_since(at) >= LIVE_RX_INTERVAL)
+            {
+                // Bound scorer-lock traffic independently of packet rate; no timer turns silence into progress.
+                progress.published_rx_at = Some(now);
+                self.observe(Observation::BusinessProgress { rx_at: now }, now);
+            }
         }
         if now.saturating_duration_since(progress.window_start) > MAX_THROUGHPUT_DURATION {
             progress.window_start = now;

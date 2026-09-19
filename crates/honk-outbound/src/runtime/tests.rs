@@ -493,7 +493,7 @@ fn build_reusing_ignores_parse_timestamps() {
 
 #[tokio::test]
 async fn speculative_quic_publish_keeps_a_concurrent_incumbent() {
-    let runtime = QuicRuntime::new(true);
+    let runtime = QuicRuntime::new(true, Arc::default());
     let incumbent: Arc<FakeQuicClient> = runtime
         .client(|| async { Ok(Arc::new(FakeQuicClient::default())) })
         .await
@@ -514,7 +514,7 @@ async fn speculative_quic_publish_keeps_a_concurrent_incumbent() {
 
 #[tokio::test]
 async fn cancelled_quic_publish_before_slot_lock_changes_nothing() {
-    let runtime = Arc::new(QuicRuntime::new(true));
+    let runtime = Arc::new(QuicRuntime::new(true, Arc::default()));
     let state_guard = runtime.state.lock().await;
     let detached = Arc::new(FakeQuicClient::default());
     let detached_weak = Arc::downgrade(&detached);
@@ -586,7 +586,7 @@ async fn cancelled_last_quic_release_still_clears_the_client_slot() {
 
 #[tokio::test]
 async fn quic_runtime_close_covers_client_and_rejects_new_builds() {
-    let runtime = QuicRuntime::new(true);
+    let runtime = QuicRuntime::new(true, Arc::default());
     let client: Arc<FakeQuicClient> = runtime
         .client(|| async { Ok(Arc::new(FakeQuicClient::default())) })
         .await

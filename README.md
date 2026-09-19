@@ -42,6 +42,14 @@ Vision currently implements downstream unpadding and Direct handling only. Uplin
 
 **Upgrade warning:** `vless_mode` is removed and every VLESS node ID is re-derived. Migrate static links and cached/provider content before upgrading, especially offline. Name-based Selector choices and recent persisted delay samples can survive; do not delete them. See the [migration guide](doc/en/reference/nodes.md#migration-from-vless_mode).
 
+## Debug builds
+
+Maintainers can push a `debug.*` tag, for example `debug.2026.9.19.score.1`, to run the existing release tests and build matrix. Successful runs update the same [Debug prerelease](https://github.com/daeuniverse/honk/releases/tag/debug), not a new release per source tag or the Latest release. These are release-profile binaries, not Cargo debug-profile builds.
+
+The rolling `debug` tag and `honk-core-debug-<target>[-stock].tar.gz` assets are replaced. The original source tags remain, and the release notes record the source tag, commit and workflow run. Debug runs are serialized; pending intermediate runs may be superseded.
+
+Before changing the rolling tag or release, publication checks that all eight expected archives are present and nonempty. If workflow artifacts have expired or been deleted, use **Re-run all jobs**, not only the release job. Publication itself is not transactional: failures after it starts can leave the tag, release notes and assets inconsistent until recovery.
+
 ## Before Using This Repository
 
 ### Important: Review Status

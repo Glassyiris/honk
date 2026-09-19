@@ -258,6 +258,7 @@ pub struct GroupManager {
     interrupt_callback: RwLock<Option<InterruptCallback>>,
     score_state: Arc<ScorePolicyState>,
     score_authority: Arc<score::ScoreAuthority>,
+    transport_quality: RwLock<Vec<score::TransportQualitySource>>,
 }
 
 impl GroupManager {
@@ -331,6 +332,7 @@ impl GroupManager {
             interrupt_callback: RwLock::new(None),
             score_state,
             score_authority: Arc::new(score::ScoreAuthority),
+            transport_quality: RwLock::new(Vec::new()),
         }
     }
 

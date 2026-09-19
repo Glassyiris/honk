@@ -42,6 +42,14 @@ Vision 始终禁止 TCP 多路复用，但允许仅 UDP 的 Xray mux。默认允
 
 **升级注意：**`vless_mode` 已删除，所有 VLESS 节点 ID 都会重新派生。升级前请迁移静态链接与缓存/provider 内容，尤其是离线升级。按名称保存的 Selector 选择及近期持久化延迟样本可继续使用，不要删除它们。见[迁移说明](doc/zh/reference/nodes.md#从-vless_mode-迁移)。
 
+## Debug 构建
+
+维护者推送 `debug.*` tag（例如 `debug.2026.9.19.score.1`）即可运行现有 release 测试与构建矩阵。成功后更新同一个 [Debug 预发布](https://github.com/daeuniverse/honk/releases/tag/debug)，不会为每个源 tag 新建 release，也不会取代 Latest。这些仍是 release profile 二进制，并非 Cargo debug profile 构建。
+
+滚动 `debug` tag 与 `honk-core-debug-<target>[-stock].tar.gz` 附件会被替换。原始源 tag 保留，release 说明记录源 tag、commit 和 workflow run。Debug 运行串行执行；尚在等待的中间运行可能被后续运行取代。
+
+修改滚动 tag 或 release 前，发布步骤会检查八个预期归档是否齐全且非空。若 workflow artifact 已过期或被删除，应选择 **Re-run all jobs**，而不是只重跑 release job。发布过程本身不是原子的：开始更新后的失败可能使 tag、release 说明和附件暂时不一致，需恢复后才能重新一致。
+
 ## 使用本仓库前
 
 ### 重要：Review 状态

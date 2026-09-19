@@ -1,5 +1,6 @@
 mod evidence;
 mod feedback;
+mod pressure;
 mod ranking;
 mod selection;
 #[cfg(test)]
@@ -8,6 +9,7 @@ mod verification;
 
 use evidence::{MetricSnapshot, Performance, PerformanceSnapshot};
 pub use feedback::{ScoreFeedback, ScoreReporter};
+pub(in crate::group) use pressure::TransportQualitySource;
 pub use verification::{
     ScoreComparison, ScoreEvidenceBasis, ScoreEvidenceGaps, ScoreValidationAction,
     ScoreVerificationCounters, ScoreVerificationSnapshot, ScoreVerificationState,
@@ -37,7 +39,6 @@ const MIN_TRAINED_EVIDENCE: f64 = 0.5;
 const SCORE_SWITCH_FULL_EVIDENCE: f64 = 8.0;
 const SCORE_SWITCH_FLAP_WINDOW: u64 = 8;
 const SELECTION_HISTORY_CAPACITY: usize = 4096;
-const SCORE_FAILURE_FORGIVENESS_THRESHOLD: f64 = 0.01;
 const SCORE_EXPLORATION_MIN_PERIOD: u64 = 16;
 const SCORE_EXPLORATION_MAX_PERIOD: u64 = 64;
 const SCORE_EXPLORE_BACKOFF_BASE: Duration = Duration::from_secs(5 * 60);
@@ -54,6 +55,9 @@ const MAX_THROUGHPUT_DURATION: Duration = Duration::from_secs(10);
 const REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
 const PERFORMANCE_VALIDATION_SAMPLES: f64 = 4.0;
 const PERFORMANCE_SWITCH_MARGIN: f64 = 0.1;
+const LIVE_RX_INTERVAL: Duration = Duration::from_secs(1);
+const LIVE_QUALIFICATION_TTL: Duration = Duration::from_secs(60);
+const CARRIER_PRESSURE_TTL: Duration = Duration::from_secs(60);
 
 /// Separates business outcomes from configured health and preparation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -189,10 +193,13 @@ struct Stats {
     useful_business: WeightedMean,
     business_invalidated_through: Option<Instant>,
     failed_at: Option<Instant>,
+    last_business_rx_at: Option<Instant>,
+    qualified_until: Option<Instant>,
     warm_setup_ms: WeightedMean,
     probes: [evidence::ProbeMetric; 6],
     last_attempt: Option<Instant>,
     degraded_at: Option<Instant>,
+    carrier_pressure: [Option<crate::transport_quality::TransportPressure>; 2],
     fail_streak: u32,
     explore_not_before: Option<Instant>,
     updated_at: Option<Instant>,
@@ -273,14 +280,9 @@ enum SelectionReason {
     ReliabilityWinner,
     PerformanceWinner,
     IncumbentHeld,
+    InsufficientEvidenceHeld,
+    IncumbentIneligible,
     FreshFailureBypass,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HoldDecision {
-    Held,
-    FreshFailureBypass,
-    UseBest,
 }
 
 impl SelectionReason {
@@ -317,11 +319,18 @@ pub struct ScoreReasonCounters {
     pub reliability_winner: u64,
     pub performance_winner: u64,
     pub incumbent_held: u64,
+    pub insufficient_evidence_held: u64,
+    pub incumbent_ineligible: u64,
     pub fresh_failure_bypass: u64,
     pub dead_filtered: u64,
+    pub ordinary_switch: u64,
     pub switch_flap: u64,
     pub fail_streak_excluded: u64,
     pub explore_backed_off: u64,
+    pub carrier_pressure: u64,
+    pub carrier_rtt_pressure: u64,
+    pub carrier_loss_pressure: u64,
+    pub carrier_validation: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -351,6 +360,7 @@ struct StateInner {
     selection_reasons: HashMap<SelectionReasonKey, ScoreReasonCounters>,
     verification_counters: HashMap<SelectionReasonKey, ScoreVerificationCounters>,
     active_authority: Option<Arc<ScoreAuthority>>,
+    published_at: Option<Instant>,
     tick: u64,
     exact_evictions: u64,
     aggregate_evictions: u64,
@@ -374,6 +384,7 @@ impl Default for StateInner {
             ),
             selection_reasons: HashMap::new(),
             verification_counters: HashMap::new(),
+            published_at: None,
             active_authority: None,
             tick: 0,
             exact_evictions: 0,
@@ -439,6 +450,7 @@ impl ScorePolicyState {
         let mut inner = self.inner.lock();
         let now = Instant::now();
         inner.active_authority = Some(authority);
+        inner.published_at = Some(now);
         inner.valid = membership.into_iter().collect();
         inner.valid_groups = groups.into_iter().collect();
         let StateInner {
@@ -511,6 +523,7 @@ impl ScorePolicyState {
         // In-flight traffic keeps its cells, but a new generation must remeasure health.
         for (_, stats) in inner.aggregate.iter_mut() {
             stats.probes = Default::default();
+            stats.carrier_pressure = Default::default();
             stats.invalidate_business(now);
         }
         for (_, stats) in inner.exact.iter_mut() {
@@ -552,6 +565,8 @@ impl ScorePolicyState {
             SelectionReason::ReliabilityWinner => &mut counts.reliability_winner,
             SelectionReason::PerformanceWinner => &mut counts.performance_winner,
             SelectionReason::IncumbentHeld => &mut counts.incumbent_held,
+            SelectionReason::InsufficientEvidenceHeld => &mut counts.insufficient_evidence_held,
+            SelectionReason::IncumbentIneligible => &mut counts.incumbent_ineligible,
             SelectionReason::FreshFailureBypass => &mut counts.fresh_failure_bypass,
         };
         *counter = counter.saturating_add(1);
@@ -593,16 +608,16 @@ impl ScorePolicyState {
         history.previous = Some(history.current);
         history.current = node_id;
         history.switched_at = history.selections;
+        let counters = inner
+            .selection_reasons
+            .entry(SelectionReasonKey::new(
+                &history_key.group,
+                history_key.network,
+            ))
+            .or_default();
+        counters.ordinary_switch = counters.ordinary_switch.saturating_add(1);
         if switch_flap {
-            let counter = &mut inner
-                .selection_reasons
-                .entry(SelectionReasonKey::new(
-                    &history_key.group,
-                    history_key.network,
-                ))
-                .or_default()
-                .switch_flap;
-            *counter = counter.saturating_add(1);
+            counters.switch_flap = counters.switch_flap.saturating_add(1);
         }
     }
 
@@ -751,10 +766,10 @@ impl ScorePolicyState {
 struct ScoreSnapshot {
     attempts: f64,
     completed: f64,
-    hysteresis_completed: f64,
     reliability: f64,
     reliability_upper: f64,
     useful_completed: f64,
+    qualification_retained: bool,
     performance: PerformanceSnapshot,
     target_performance: PerformanceSnapshot,
     probe: MetricSnapshot,
@@ -763,11 +778,18 @@ struct ScoreSnapshot {
     observed_reliability: f64,
     last_attempt: Option<Instant>,
     degraded_at: Option<Instant>,
-    failures: f64,
+    carrier_pressure_at: Option<Instant>,
+    unresolved_failure: bool,
     explore_backed_off: bool,
     fail_streak: u32,
     selected_at: u64,
     verification: verification::VerificationEvidence,
+}
+
+impl ScoreSnapshot {
+    fn qualified(&self) -> bool {
+        self.useful_completed >= PERFORMANCE_VALIDATION_SAMPLES || self.qualification_retained
+    }
 }
 
 #[derive(Clone, Copy)]

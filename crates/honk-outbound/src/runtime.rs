@@ -52,7 +52,12 @@ pub enum GenerationRuntime {
 }
 
 impl GenerationRuntime {
-    pub(crate) fn build(self, node: &Node, metrics_enabled: bool) -> ProtocolRuntime {
+    pub(crate) fn build(
+        self,
+        node: &Node,
+        metrics_enabled: bool,
+        quality: Arc<crate::transport_quality::TransportQuality>,
+    ) -> ProtocolRuntime {
         match self {
             Self::None => ProtocolRuntime::None,
             Self::AnyTls => ProtocolRuntime::AnyTls(AnyTlsRuntime::new()),
@@ -65,7 +70,7 @@ impl GenerationRuntime {
                 let _ = node;
                 ProtocolRuntime::None
             }
-            Self::Quic => ProtocolRuntime::Quic(QuicRuntime::new(metrics_enabled)),
+            Self::Quic => ProtocolRuntime::Quic(QuicRuntime::new(metrics_enabled, quality)),
         }
     }
 }
@@ -92,8 +97,8 @@ pub enum ProtocolRuntime {
 #[async_trait::async_trait]
 pub trait QuicRuntimeClient: Send + Sync + 'static {
     fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync>;
-    /// Start aggregate telemetry for a persistent QUIC client.
-    async fn enable_metrics(&self) {}
+    /// Activate persistent-carrier telemetry without reporting business outcomes.
+    async fn enable_metrics(&self, _quality: Arc<crate::transport_quality::TransportQuality>) {}
     /// Close the cached connection and endpoint, awaiting any in-flight
     /// dial so its late-arriving connection is closed too.
     async fn force_close(&self);
@@ -111,6 +116,7 @@ pub trait QuicRuntimeClient: Send + Sync + 'static {
 pub struct QuicRuntime {
     state: tokio::sync::Mutex<QuicRuntimeState>,
     flow_control_profiles: Arc<crate::quic::AdaptiveFlowProfiles>,
+    transport_quality: Arc<crate::transport_quality::TransportQuality>,
 }
 
 #[derive(Default)]
@@ -126,13 +132,17 @@ impl std::fmt::Debug for QuicRuntime {
     }
 }
 impl QuicRuntime {
-    pub(crate) fn new(metrics_enabled: bool) -> Self {
+    pub(crate) fn new(
+        metrics_enabled: bool,
+        transport_quality: Arc<crate::transport_quality::TransportQuality>,
+    ) -> Self {
         Self {
             flow_control_profiles: Arc::new(crate::quic::AdaptiveFlowProfiles::default()),
             state: tokio::sync::Mutex::new(QuicRuntimeState {
                 metrics_enabled,
                 ..Default::default()
             }),
+            transport_quality,
         }
     }
 
@@ -158,7 +168,9 @@ impl QuicRuntime {
         }
         let client = build().await?;
         if state.metrics_enabled {
-            client.enable_metrics().await;
+            client
+                .enable_metrics(Arc::clone(&self.transport_quality))
+                .await;
         }
         state.client = Some(Arc::clone(&client) as Arc<dyn QuicRuntimeClient>);
         Ok(client)
@@ -183,12 +195,16 @@ impl QuicRuntime {
                 .downcast::<T>()
                 .map_err(|_| anyhow::anyhow!("QUIC client slot type mismatch"))?;
             if state.metrics_enabled {
-                client.enable_metrics().await;
+                client
+                    .enable_metrics(Arc::clone(&self.transport_quality))
+                    .await;
             }
             return Ok(());
         }
         if state.metrics_enabled {
-            client.enable_metrics().await;
+            client
+                .enable_metrics(Arc::clone(&self.transport_quality))
+                .await;
         }
         state.client = Some(client as Arc<dyn QuicRuntimeClient>);
         Ok(())
@@ -357,6 +373,7 @@ pub struct NodeRuntime {
     pub node: Arc<Node>,
     pub udp_capable: bool,
     pub runtime: ProtocolRuntime,
+    transport_quality: Arc<crate::transport_quality::TransportQuality>,
     /// One-shot runtime outside any generation (see [`Self::ephemeral`]).
     /// Session protocols skip their standby janitor for these: there is no
     /// long-lived owner to keep warm state for, only [`Self::close`] to
@@ -438,16 +455,18 @@ impl NodeRuntime {
         node: &Node,
         #[cfg(any(feature = "rprx", test))] vless_carriers: Arc<tokio::sync::Semaphore>,
     ) -> Arc<Self> {
+        let transport_quality = Arc::new(crate::transport_quality::TransportQuality::default());
         Arc::new(Self {
             node: Arc::new(node.clone()),
             udp_capable: (crate::descriptor::descriptor(node.protocol()).supports_udp)(node),
             runtime: crate::descriptor::descriptor(node.protocol())
                 .generation_runtime
-                .build(node, false),
+                .build(node, false, Arc::clone(&transport_quality)),
             ephemeral: true,
             warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
             #[cfg(any(feature = "rprx", test))]
             vless_carriers,
+            transport_quality,
         })
     }
 
@@ -491,6 +510,11 @@ impl NodeRuntime {
 
     pub(crate) fn is_ephemeral(&self) -> bool {
         self.ephemeral
+    }
+
+    /// Advisory evidence belongs to this runtime, not merely its reusable node ID.
+    pub fn transport_quality(&self) -> Arc<crate::transport_quality::TransportQuality> {
+        Arc::clone(&self.transport_quality)
     }
 
     pub(crate) async fn retain_warm(self: &Arc<Self>, reason: WarmRetention) -> WarmAttempt {
@@ -991,19 +1015,24 @@ impl OutboundRuntimeRegistry {
                     reused.insert(node.id);
                     runtime
                 }
-                None => Arc::new(NodeRuntime {
-                    node: Arc::new(node.clone()),
-                    udp_capable: (crate::descriptor::descriptor(node.protocol()).supports_udp)(
-                        node,
-                    ),
-                    runtime: crate::descriptor::descriptor(node.protocol())
-                        .generation_runtime
-                        .build(node, true),
-                    ephemeral: false,
-                    warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
-                    #[cfg(any(feature = "rprx", test))]
-                    vless_carriers: Arc::clone(&vless_carrier_semaphore),
-                }),
+                None => {
+                    let transport_quality =
+                        Arc::new(crate::transport_quality::TransportQuality::default());
+                    Arc::new(NodeRuntime {
+                        node: Arc::new(node.clone()),
+                        udp_capable: (crate::descriptor::descriptor(node.protocol()).supports_udp)(
+                            node,
+                        ),
+                        runtime: crate::descriptor::descriptor(node.protocol())
+                            .generation_runtime
+                            .build(node, true, Arc::clone(&transport_quality)),
+                        transport_quality,
+                        ephemeral: false,
+                        warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
+                        #[cfg(any(feature = "rprx", test))]
+                        vless_carriers: Arc::clone(&vless_carrier_semaphore),
+                    })
+                }
             };
             map.insert(node.id, runtime);
         }
