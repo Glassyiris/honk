@@ -1,5 +1,5 @@
 use super::*;
-use crate::configuration::digest;
+use crate::configuration::{DependencyReader, DependencySnapshot, digest};
 use crate::native_api::config_write::StagedFile;
 use crate::native_api::geodata::{self, GeoUpdatePlan};
 use crate::native_api::operations::OperationResult;
@@ -181,6 +181,31 @@ impl Worker {
     }
 }
 
+/// Whether the dependencies the accepted configuration was admitted with still
+/// describe the disk, apart from subscription caches: the subscription owner
+/// rewrites those on every refresh without a new source acceptance, so a
+/// refreshed body is not a conflict with the sources the update is based on.
+/// The caches still fence the write itself, through the recapture that runs
+/// under the staged replacement.
+fn same_settled_dependencies(
+    accepted: &[DependencySnapshot],
+    captured: &[DependencySnapshot],
+) -> bool {
+    let settled = |dependencies: &[DependencySnapshot]| {
+        dependencies
+            .iter()
+            .filter(|dependency| {
+                !dependency
+                    .readers
+                    .iter()
+                    .any(|reader| matches!(reader, DependencyReader::Subscription(_)))
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    same_dependencies(&settled(accepted), &settled(captured))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_and_replace(
     service: &ConfigService,
@@ -223,7 +248,7 @@ fn prepare_and_replace(
     )
     .map_err(|_| failure("dependency_validation_failed", &writes))?;
     if !accepted.update.dependencies.is_empty()
-        && !same_dependencies(&accepted.update.dependencies, &captured.dependencies)
+        && !same_settled_dependencies(&accepted.update.dependencies, &captured.dependencies)
     {
         return Err(failure("dependency_conflict", &writes));
     }
@@ -422,4 +447,77 @@ fn prepare_and_replace(
         },
         assets: installed,
     })
+}
+
+#[cfg(test)]
+mod settled_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn dependency(path: &str, sha256: &str, readers: Vec<DependencyReader>) -> DependencySnapshot {
+        DependencySnapshot {
+            path: PathBuf::from(path),
+            sha256: sha256.to_owned(),
+            bytes: 1,
+            asset: readers
+                .iter()
+                .any(|reader| matches!(reader, DependencyReader::Geo(_))),
+            readers,
+        }
+    }
+
+    #[test]
+    fn a_refreshed_subscription_cache_is_not_a_conflict_but_a_changed_asset_is() {
+        let accepted = vec![
+            dependency(
+                "/state/geosite.dat",
+                "aa",
+                vec![DependencyReader::Geo("geosite")],
+            ),
+            dependency(
+                "/state/.sub/one",
+                "11",
+                vec![DependencyReader::Subscription(0)],
+            ),
+        ];
+        let refreshed = vec![
+            dependency(
+                "/state/geosite.dat",
+                "aa",
+                vec![DependencyReader::Geo("geosite")],
+            ),
+            dependency(
+                "/state/.sub/one",
+                "22",
+                vec![DependencyReader::Subscription(0)],
+            ),
+        ];
+        assert!(same_settled_dependencies(&accepted, &refreshed));
+        let edited = vec![
+            dependency(
+                "/state/geosite.dat",
+                "bb",
+                vec![DependencyReader::Geo("geosite")],
+            ),
+            dependency(
+                "/state/.sub/one",
+                "11",
+                vec![DependencyReader::Subscription(0)],
+            ),
+        ];
+        assert!(!same_settled_dependencies(&accepted, &edited));
+        let hosts_changed = vec![
+            dependency(
+                "/state/geosite.dat",
+                "aa",
+                vec![DependencyReader::Geo("geosite")],
+            ),
+            dependency(
+                "/etc/hosts",
+                "cc",
+                vec![DependencyReader::Hosts(0, "/etc/hosts".into())],
+            ),
+        ];
+        assert!(!same_settled_dependencies(&accepted, &hosts_changed));
+    }
 }
