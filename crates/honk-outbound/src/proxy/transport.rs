@@ -62,7 +62,7 @@ pub(crate) async fn maybe_tls_wrap(
     connect_timeout: std::time::Duration,
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
     match maybe_tls_wrap_concrete(node, tcp, connect_timeout).await? {
-        MaybeTls::Tls(stream) => Ok(Box::new(crate::tls::BatchRead::new(*stream))),
+        MaybeTls::Tls(stream) => Ok(Box::new(crate::tls::BatchRead::new(stream))),
         MaybeTls::Plain(stream) => Ok(stream),
     }
 }
@@ -71,7 +71,7 @@ pub(crate) async fn maybe_tls_wrap(
 /// Vision direct-copy switch must reach the raw TCP socket under the TLS
 /// stream once the server abandons the outer TLS session.
 pub(crate) enum MaybeTls {
-    Tls(Box<crate::tls::TlsStream<ObservedTcp>>),
+    Tls(crate::tls::TlsStream<ObservedTcp>),
     Plain(Box<ObservedTcp>),
 }
 
@@ -136,7 +136,7 @@ pub(crate) async fn maybe_tls_wrap_concrete(
                     Err(error) => return Err(error),
                 };
             tls_stream.get_mut().activate();
-            Ok(MaybeTls::Tls(Box::new(tls_stream)))
+            Ok(MaybeTls::Tls(tls_stream))
         };
         return tokio::time::timeout_at(deadline, setup)
             .await
@@ -150,7 +150,7 @@ pub(crate) async fn maybe_tls_wrap_concrete(
         let server_name = tls.sni.clone().unwrap_or_else(|| node.host().to_string());
         let mut tls_stream = connector.connect(&server_name, tcp).await?;
         tls_stream.get_mut().activate();
-        return Ok(MaybeTls::Tls(Box::new(tls_stream)));
+        return Ok(MaybeTls::Tls(tls_stream));
     }
     tcp.activate();
     Ok(MaybeTls::Plain(Box::new(tcp)))
