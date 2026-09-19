@@ -48,6 +48,8 @@ Vision 始终禁止 TCP 多路复用，但允许仅 UDP 的 Xray mux。默认允
 
 滚动 `debug` tag 与 `honk-core-debug-<target>[-stock].tar.gz` 附件会被替换。原始源 tag 保留，release 说明记录源 tag、commit 和 workflow run。Debug 运行串行执行；尚在等待的中间运行可能被后续运行取代。
 
+修改滚动 tag 或 release 前，发布步骤会检查八个预期归档是否齐全且非空。若 workflow artifact 已过期或被删除，应选择 **Re-run all jobs**，而不是只重跑 release job。发布过程本身不是原子的：开始更新后的失败可能使 tag、release 说明和附件暂时不一致，需恢复后才能重新一致。
+
 ## 使用本仓库前
 
 ### 重要：Review 状态

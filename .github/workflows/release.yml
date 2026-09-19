@@ -22,6 +22,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test Debug artifact preflight
+        run: bash .github/ci/test-debug-artifacts.sh
       - name: Read Rust toolchain
         id: toolchain
         run: echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
@@ -266,6 +268,10 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: debug-source
+
+      - name: Check complete Debug artifacts
+        if: startsWith(github.ref, 'refs/tags/debug.')
+        run: bash debug-source/.github/ci/check-debug-artifacts.sh
 
       - name: Move rolling Debug tag
         if: startsWith(github.ref, 'refs/tags/debug.')
