@@ -2304,14 +2304,17 @@ async fn health_pause_drains_nested_probe_and_retains_loop() {
 
 #[tokio::test(start_paused = true)]
 async fn health_pause_timeout_keeps_admission_closed_and_discards_queued_triggers() {
+    use futures_util::FutureExt as _;
+
     let set = AliveDialerSet::new();
     set.trigger_probe(id(1));
     let permit = set.acquire_health_probe().unwrap();
     let old_cancel = permit.cancellation();
-    assert_eq!(
-        set.pause_health_checks().await,
-        Err(HealthCheckError::DrainTimeout)
-    );
+    let pause = set.pause_health_checks();
+    tokio::pin!(pause);
+    assert!(pause.as_mut().now_or_never().is_none());
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert!(pause.as_mut().now_or_never().is_none());
     assert_eq!(
         set.resume_health_checks(),
         Err(HealthCheckError::NotDrained)
@@ -2322,6 +2325,7 @@ async fn health_pause_timeout_keeps_admission_closed_and_discards_queued_trigger
     ));
     set.trigger_probe(id(2));
     drop(permit);
+    assert_eq!(pause.await, Err(HealthCheckError::DrainTimeout));
     set.pause_health_checks().await.unwrap();
     set.resume_health_checks().unwrap();
     assert!(old_cancel.is_cancelled());
@@ -2464,4 +2468,66 @@ async fn health_pause_rejects_panicked_resolver_child() {
         set.shutdown_health_checks().await,
         Err(HealthCheckError::WorkerFailed)
     );
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test(start_paused = true)]
+async fn health_shutdown_deadline_joins_blocking_resolver_before_returning_error() {
+    use futures_util::FutureExt as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    for panics in [false, true] {
+        let set = AliveDialerSet::new();
+        set.enable_native_observations();
+        let permit = set.acquire_health_probe().unwrap();
+        let owner = set.health_resolver_tasks.lock().clone().unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let completed = Arc::new(AtomicBool::new(false));
+        let child_completed = Arc::clone(&completed);
+        let child = owner
+            .spawn_blocking(move || {
+                started.send(()).unwrap();
+                let _ = released.recv();
+                child_completed.store(true, Ordering::Release);
+                assert!(!panics, "health resolver failed during late cleanup");
+            })
+            .unwrap();
+        ready.await.unwrap();
+        drop(permit);
+
+        let shutdown = set.shutdown_health_checks();
+        tokio::pin!(shutdown);
+        assert!(shutdown.as_mut().now_or_never().is_none());
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(
+            shutdown.as_mut().now_or_never().is_none(),
+            "a missed deadline cannot finish before the blocking resolver joins"
+        );
+        assert!(!completed.load(Ordering::Acquire));
+        assert!(matches!(
+            set.acquire_health_probe(),
+            Err(HealthCheckError::Stopped)
+        ));
+
+        release.send(()).unwrap();
+        assert_eq!(
+            shutdown.await,
+            Err(if panics {
+                HealthCheckError::WorkerFailed
+            } else {
+                HealthCheckError::DrainTimeout
+            })
+        );
+        assert!(completed.load(Ordering::Acquire));
+        assert!(child.is_finished());
+        assert_eq!(
+            set.resume_health_checks(),
+            Err(if panics {
+                HealthCheckError::WorkerFailed
+            } else {
+                HealthCheckError::Stopped
+            })
+        );
+    }
 }

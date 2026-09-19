@@ -257,8 +257,7 @@ impl AliveDialerSet {
     }
 
     async fn wait_health_drained(&self) -> Result<(), HealthCheckError> {
-        // Timeout leaves admission closed and all cleanup owned; it is not an ack.
-        tokio::time::timeout(Duration::from_secs(5), async {
+        let drain = async {
             loop {
                 let changed = self.health_changed.notified();
                 tokio::pin!(changed);
@@ -304,9 +303,16 @@ impl AliveDialerSet {
                     }
                 }
             }
-        })
-        .await
-        .map_err(|_| HealthCheckError::DrainTimeout)?
+        };
+        tokio::pin!(drain);
+        match tokio::time::timeout(Duration::from_secs(5), &mut drain).await {
+            Ok(result) => result,
+            Err(_) => {
+                // A missed deadline is failure, not permission to detach blocking cleanup.
+                drain.await?;
+                Err(HealthCheckError::DrainTimeout)
+            }
+        }
     }
 
     /// Call only after datapath admission has actually reopened.

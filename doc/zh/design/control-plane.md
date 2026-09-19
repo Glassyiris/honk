@@ -287,6 +287,8 @@ Suspend/resume 与源写入共用 daemon-owned 配置协调器，再由唯一 co
 
 已开始的系统 blocking lookup/NSS 无法靠取消 async waiter 停止；subscription 专有 runtime 及 DNS/协议 task owner 必须等实际 join。阶段 deadline 超过后仍保有 join，不能声称十秒内一定暂停或丢弃线程继续运行。终止关闭具有不同顺序：关闭 admission，停止 watcher 并 detach hooks；健康正常退出给既有连接默认五秒 drain grace，再强制取消/join epoch，故障退出可跳过 grace。原生 HTTP 另有五秒 graceful drain；阻塞 join 可能延长总退出时间，shutdown 优先于恢复，不在半完成 transition 中遗失任务所有权。
 
+健康检查 owner 的五秒 drain deadline 遵循同一规则：暂停和终止关闭均等待同一个 drain 完成，包括健康检查持有的阻塞解析任务，然后才返回 deadline 错误。若在超时后的清理中发现子任务失败，该失败优先于 deadline 错误返回。
+
 ## Clash API 与 cache DB
 
 可选的 Clash-compatible axum server 是当前配置、GroupManager、mode/flags handle、connection tracker、DNS service、统计和出站 runtime pointer 上的用户态视图与修改接口；endpoint 细节见 [API 参考](../reference/api.md)。当任一 API 成功绑定，或任一配置组使用 `interrupt_connections` 时启用连接元数据；真实 transport 关闭不等于移除记录。可选 SQLite `cachedb` 在数据路径准入前打开，持久化分网络 Selector 选择与可选 DNS 应答；Clash mode/GLOBAL 仅在 native 未启用时恢复与保存。相对路径依次优先使用 `global.data_dir` 下、`/var/share/honk` 下和原始配置目录中的已有数据库；缺失数据库在 `global.data_dir` 下创建。配置和持久化语义见 [Experimental 参考](../reference/experimental.md)。
