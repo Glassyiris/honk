@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::time::Duration;
 
 use bytes::Bytes;
 use h2::client::{SendRequest, handshake};
@@ -15,11 +16,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::debug;
 
 use super::framing::force_dns_id_zero;
-use super::lifecycle::LifecycleSlot;
+use super::lifecycle::{LifecycleSlot, SessionFailure};
 use super::owned_task::OwnedTask;
 use super::{
-    DialContext, DnsMessageBody, build_doh_request, doh_content_length, exchange_with_retry,
-    finish_doh_response,
+    DialContext, DnsMessageBody, build_doh_request, check_doh_status, doh_content_length,
+    exchange_with_retry, finish_doh_response,
 };
 use honk_outbound::tls::TlsConnector;
 
@@ -30,6 +31,13 @@ type H2Sender = SendRequest<Bytes>;
 struct H2Session {
     sender: Mutex<Option<H2Sender>>,
     driver: OwnedTask,
+}
+
+impl H2Session {
+    async fn close(self: Arc<Self>, timeout: Duration) {
+        self.sender.lock().take();
+        self.driver.shutdown(timeout).await;
+    }
 }
 
 /// Shared DoH (HTTP/2) client for one upstream.
@@ -67,7 +75,14 @@ impl DohClient {
             "DoH",
             raw_query,
             |reporter| async move { self.exchange_once(raw_query, reporter.as_ref()).await },
-            || async { self.close_session().await },
+            |error| {
+                let session = SessionFailure::<H2Session>::session(error);
+                async move {
+                    if let Some(session) = session {
+                        self.retire_session(&session).await;
+                    }
+                }
+            },
             feedback,
         )
         .await
@@ -78,7 +93,7 @@ impl DohClient {
         raw_query: &[u8],
         reporter: Option<&honk_outbound::group::ScoreReporter>,
     ) -> anyhow::Result<Vec<u8>> {
-        let mut sender = self.get_sender().await?;
+        let (session, mut sender) = self.get_sender().await?;
         if let Some(reporter) = reporter {
             reporter.setup_succeeded();
         }
@@ -104,7 +119,7 @@ impl DohClient {
                 .await
                 .map_err(|e| anyhow::anyhow!("DoH response error: {e}"))?;
 
-            let status = response.status();
+            check_doh_status("DoH", response.status())?;
             let content_length = doh_content_length("DoH", response.headers())?;
             let mut body = response.into_body();
             let mut buf = DnsMessageBody::new("DoH", content_length)?;
@@ -115,7 +130,7 @@ impl DohClient {
                 let _ = body.flow_control().release_capacity(n);
             }
 
-            let response = finish_doh_response("DoH", status, buf.into_bytes(), orig_id)?;
+            let response = finish_doh_response("DoH", buf.into_bytes(), orig_id)?;
             if let Some(reporter) = reporter
                 && super::is_valid_response(raw_query, &response)
             {
@@ -125,18 +140,44 @@ impl DohClient {
             Ok::<_, anyhow::Error>(response)
         })
         .await
-        .map_err(|_| {
-            anyhow::anyhow!("DoH exchange timed out after {:?}", self.dial.query_timeout)
-        })?
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "DoH exchange timed out after {:?}",
+                self.dial.query_timeout
+            ))
+        })
+        .map_err(|error| SessionFailure::new(session, error).into())
     }
 
-    async fn get_sender(&self) -> anyhow::Result<H2Sender> {
-        let session = self.session.acquire(|| self.handshake()).await?;
-        session
-            .sender
-            .lock()
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("DoH session is closing"))
+    /// A sender on a live session. The connection driver can stop between
+    /// queries (server GOAWAY, idle close), leaving a sender clone that only
+    /// fails; `ready` catches that, and the session is rebuilt once before
+    /// the query goes out, instead of the query spending its retry on it.
+    async fn get_sender(&self) -> anyhow::Result<(Arc<H2Session>, H2Sender)> {
+        for attempt in 0..2 {
+            let session = self.session.acquire(|| self.handshake()).await?;
+            let sender = session.sender.lock().clone().ok_or_else(|| {
+                SessionFailure::new(
+                    Arc::clone(&session),
+                    anyhow::anyhow!("DoH session is closing"),
+                )
+            })?;
+            match sender.ready().await {
+                Ok(sender) => return Ok((session, sender)),
+                Err(error) if attempt == 0 => {
+                    debug!(error = %error, transport = "doh", "DoH session is dead; rebuilding");
+                    self.retire_session(&session).await;
+                }
+                Err(error) => {
+                    return Err(SessionFailure::new(
+                        session,
+                        anyhow::anyhow!("DoH session unusable: {error}"),
+                    )
+                    .into());
+                }
+            }
+        }
+        unreachable!("the loop returns or fails on its second pass")
     }
 
     async fn handshake(&self) -> anyhow::Result<H2Session> {
@@ -164,18 +205,18 @@ impl DohClient {
         })?
     }
 
-    async fn close_session(&self) {
+    async fn retire_session(&self, session: &Arc<H2Session>) {
         let timeout = self.dial.query_timeout;
         self.session
-            .close(|session| async move {
-                session.sender.lock().take();
-                session.driver.shutdown(timeout).await;
-            })
+            .retire(session, move |session| session.close(timeout))
             .await;
     }
 
     pub(crate) async fn close(&self) {
-        self.close_session().await;
+        let timeout = self.dial.query_timeout;
+        self.session
+            .close(move |session| session.close(timeout))
+            .await;
     }
 }
 
@@ -209,6 +250,91 @@ mod tests {
     use super::super::{
         DnsMessageBody, DnsMessageTooLarge, MAX_DNS_MESSAGE_SIZE, doh_content_length,
     };
+
+    #[tokio::test]
+    async fn deterministic_responses_preserve_the_live_session() {
+        use super::*;
+        use crate::dns::endpoint::DnsEndpoint;
+        use crate::dns::forwarder::build_dns_query;
+        use honk_config::types::DnsProtocol;
+        use std::sync::atomic::Ordering;
+
+        let query = build_dns_query("example.com", 1);
+        let mut answer = query.clone();
+        answer[..2].fill(0);
+        answer[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            let mut responses = tokio::task::JoinSet::new();
+            for (status, body) in [(400, Vec::new()), (200, vec![0; 3]), (200, answer)] {
+                let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+                responses.spawn(async move {
+                    let mut request = request.into_body();
+                    while let Some(chunk) = request.data().await {
+                        let chunk = chunk.unwrap();
+                        request
+                            .flow_control()
+                            .release_capacity(chunk.len())
+                            .unwrap();
+                    }
+                    let response = http::Response::builder().status(status).body(()).unwrap();
+                    let mut stream = respond.send_response(response, body.is_empty()).unwrap();
+                    if !body.is_empty() {
+                        stream.send_data(Bytes::from(body), true).unwrap();
+                    }
+                });
+            }
+            assert!(
+                connection.accept().await.is_none(),
+                "unexpected query replay"
+            );
+            while let Some(result) = responses.join_next().await {
+                result.unwrap();
+            }
+        });
+        let unused_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = unused_listener.local_addr().unwrap();
+        let active_tasks = Arc::new(AtomicUsize::new(0));
+        let client = DohClient::new_tracked(
+            DialContext {
+                endpoint: DnsEndpoint::parse(
+                    &format!("{address}/dns-query"),
+                    DnsProtocol::Https,
+                    Some("localhost"),
+                )
+                .unwrap(),
+                query_timeout: Duration::from_secs(1),
+                dial_timeout: Duration::from_millis(100),
+                proxy: None,
+            },
+            Arc::clone(&active_tasks),
+        )
+        .unwrap();
+        client
+            .session
+            .acquire(|| spawn_h2(client_io, Arc::clone(&active_tasks)))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let error = client.exchange(&query, None).await.unwrap_err();
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.is::<super::super::doh_message::DeterministicResponse>())
+            );
+        }
+        let response = client.exchange(&query, None).await.unwrap();
+        assert!(super::super::is_valid_response(&query, &response));
+        assert_eq!(&response[..2], &query[..2]);
+        assert_eq!(client.session.init_count(), 1);
+        client.close().await;
+        assert_eq!(active_tasks.load(Ordering::SeqCst), 0);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn h2_body_rejects_hostile_multichunk_response_before_append() {

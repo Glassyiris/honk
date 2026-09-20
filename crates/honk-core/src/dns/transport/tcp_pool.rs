@@ -33,7 +33,7 @@ impl TcpPool {
             "TCP DNS",
             raw_query,
             |reporter| async move { self.exchange_once(raw_query, reporter.as_ref()).await },
-            || async {},
+            |_| async {},
             feedback,
         )
         .await

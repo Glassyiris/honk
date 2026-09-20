@@ -161,13 +161,13 @@ mod entries {
     }
 
     impl UdpState {
-        pub(super) fn current_pool(&self) -> Option<(SocketAddr, Arc<UdpPool>)> {
+        pub(super) fn current_address(&self) -> Option<SocketAddr> {
             let current = self.current?;
             let family = usize::from(current.is_ipv6());
             self.pools[family]
                 .as_ref()
                 .filter(|(address, _)| *address == current)
-                .map(|(_, pool)| (current, Arc::clone(pool)))
+                .map(|_| current)
         }
 
         pub(super) fn mark_current(&mut self, address: SocketAddr) {

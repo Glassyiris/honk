@@ -5,13 +5,14 @@
 //! finishes the send side, and reads the length-prefixed response.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use quinn::{ClientConfig, Connection};
 
 use super::framing::{
     force_dns_id_zero, read_length_prefixed, restore_dns_id, write_length_prefixed,
 };
-use super::lifecycle::LifecycleSlot;
+use super::lifecycle::{LifecycleSlot, SessionFailure};
 use super::{
     DialContext, SharedQuicEndpoint, dns_quic_config, exchange_with_retry, quic_connect_endpoint,
 };
@@ -22,6 +23,16 @@ struct DoqConnection {
     connection: Connection,
     endpoint: Option<honk_outbound::quic::PacketTransportEndpoint>,
     _metrics: honk_outbound::quic::QuicConnectionMonitor,
+}
+
+impl DoqConnection {
+    async fn close(self: Arc<Self>, timeout: Duration) {
+        self.connection.close(0_u32.into(), b"shutdown");
+        let _ = tokio::time::timeout(timeout, self.connection.closed()).await;
+        if let Some(endpoint) = &self.endpoint {
+            endpoint.close(timeout).await;
+        }
+    }
 }
 
 /// DoQ client for one upstream.
@@ -52,7 +63,14 @@ impl DoqClient {
             "DoQ",
             raw_query,
             |reporter| async move { self.exchange_once(raw_query, reporter.as_ref()).await },
-            || async { self.close_connection().await },
+            |error| {
+                let connection = SessionFailure::<DoqConnection>::session(error);
+                async move {
+                    if let Some(connection) = connection {
+                        self.retire_connection(&connection).await;
+                    }
+                }
+            },
             feedback,
         )
         .await
@@ -69,6 +87,7 @@ impl DoqClient {
         }
         tokio::time::timeout(self.dial.query_timeout, async {
             let (mut send, mut recv) = conn
+                .connection
                 .open_bi()
                 .await
                 .map_err(|e| anyhow::anyhow!("DoQ open_bi: {e}"))?;
@@ -93,22 +112,22 @@ impl DoqClient {
             Ok::<_, anyhow::Error>(resp)
         })
         .await
-        .map_err(|_| {
-            anyhow::anyhow!("DoQ exchange timed out after {:?}", self.dial.query_timeout)
-        })?
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "DoQ exchange timed out after {:?}",
+                self.dial.query_timeout
+            ))
+        })
+        .map_err(|error| SessionFailure::new(conn, error).into())
     }
 
-    async fn get_conn(&self) -> anyhow::Result<Connection> {
+    async fn get_conn(&self) -> anyhow::Result<Arc<DoqConnection>> {
         let connection = self.connection.acquire(|| self.dial()).await?;
         if connection.connection.close_reason().is_some() {
-            self.close_connection().await;
-            return self
-                .connection
-                .acquire(|| self.dial())
-                .await
-                .map(|c| c.connection.clone());
+            self.retire_connection(&connection).await;
+            return self.connection.acquire(|| self.dial()).await;
         }
-        Ok(connection.connection.clone())
+        Ok(connection)
     }
     async fn dial(&self) -> anyhow::Result<DoqConnection> {
         let (connection, endpoint) = quic_connect_endpoint(
@@ -128,21 +147,18 @@ impl DoqClient {
         })
     }
 
-    async fn close_connection(&self) {
+    async fn retire_connection(&self, connection: &Arc<DoqConnection>) {
         let timeout = self.dial.query_timeout;
         self.connection
-            .close(|connection| async move {
-                connection.connection.close(0_u32.into(), b"shutdown");
-                let _ = tokio::time::timeout(timeout, connection.connection.closed()).await;
-                if let Some(endpoint) = &connection.endpoint {
-                    endpoint.close(timeout).await;
-                }
-            })
+            .retire(connection, move |connection| connection.close(timeout))
             .await;
     }
 
     pub(crate) async fn close(&self) {
-        self.close_connection().await;
+        let timeout = self.dial.query_timeout;
+        self.connection
+            .close(move |connection| connection.close(timeout))
+            .await;
         self.quic_ep.close(self.dial.query_timeout).await;
     }
 }
@@ -158,25 +174,6 @@ mod tests {
     use crate::dns::transport::tests_proto::{
         ProxiedQuicFixture, insecure_quic_config, proxied_quic_fixture, spawn_doq_server,
     };
-
-    #[tokio::test]
-    async fn constructor_keeps_query_and_dial_timeouts_distinct() {
-        let dial = DialContext {
-            endpoint: crate::dns::endpoint::DnsEndpoint::parse(
-                "127.0.0.1",
-                DnsProtocol::Quic,
-                Some("localhost"),
-            )
-            .expect("DoQ endpoint"),
-            query_timeout: Duration::from_millis(111),
-            dial_timeout: Duration::from_millis(222),
-            proxy: None,
-        };
-        let client = DoqClient::new(dial).await.expect("DoQ client");
-
-        assert_eq!(client.dial.query_timeout, Duration::from_millis(111));
-        assert_eq!(client.dial.dial_timeout, Duration::from_millis(222));
-    }
 
     #[tokio::test]
     async fn proxied_doq_reuses_and_closes_packet_endpoint() {

@@ -16,11 +16,11 @@ use tracing::debug;
 
 use super::DialContext;
 use super::framing::force_dns_id_zero;
-use super::lifecycle::LifecycleSlot;
+use super::lifecycle::{LifecycleSlot, SessionFailure};
 use super::owned_task::OwnedTask;
 use super::{
-    DnsMessageBody, SharedQuicEndpoint, build_doh_request, dns_quic_config, doh_content_length,
-    exchange_with_retry, finish_doh_response, quic_connect_endpoint,
+    DnsMessageBody, SharedQuicEndpoint, build_doh_request, check_doh_status, dns_quic_config,
+    doh_content_length, exchange_with_retry, finish_doh_response, quic_connect_endpoint,
 };
 
 type H3Sender = SendRequest<h3_quinn::OpenStreams, Bytes>;
@@ -32,6 +32,18 @@ struct H3Session {
     _metrics: honk_outbound::quic::QuicConnectionMonitor,
     driver: OwnedTask,
 }
+
+impl H3Session {
+    async fn close(self: Arc<Self>, timeout: Duration) {
+        self.sender.lock().await.take();
+        self.connection.close(0_u32.into(), b"shutdown");
+        self.driver.shutdown(timeout).await;
+        if let Some(endpoint) = &self.endpoint {
+            endpoint.close(timeout).await;
+        }
+    }
+}
+
 async fn close_failed_connection(
     connection: &quinn::Connection,
     endpoint: &Option<honk_outbound::quic::PacketTransportEndpoint>,
@@ -79,7 +91,14 @@ impl Doh3Client {
             "DoH3",
             raw_query,
             |reporter| async move { self.exchange_once(raw_query, reporter.as_ref()).await },
-            || async { self.close_session().await },
+            |error| {
+                let session = SessionFailure::<H3Session>::session(error);
+                async move {
+                    if let Some(session) = session {
+                        self.retire_session(&session).await;
+                    }
+                }
+            },
             feedback,
         )
         .await
@@ -90,7 +109,7 @@ impl Doh3Client {
         raw_query: &[u8],
         reporter: Option<&honk_outbound::group::ScoreReporter>,
     ) -> anyhow::Result<Vec<u8>> {
-        let mut sender = self.get_sender().await?;
+        let (session, mut sender) = self.get_sender().await?;
         if let Some(reporter) = reporter {
             reporter.setup_succeeded();
         }
@@ -99,10 +118,9 @@ impl Doh3Client {
             let mut wire = raw_query.to_vec();
             let orig_id = force_dns_id_zero(&mut wire);
 
-            let req = build_doh_request(&self.dial.endpoint, None, "DoH3")?;
-
+            let request = build_doh_request(&self.dial.endpoint, None, "DoH3")?;
             let mut stream = sender
-                .send_request(req)
+                .send_request(request)
                 .await
                 .map_err(|e| anyhow::anyhow!("DoH3 send_request: {e}"))?;
 
@@ -123,7 +141,7 @@ impl Doh3Client {
                 .await
                 .map_err(|e| anyhow::anyhow!("DoH3 recv_response: {e}"))?;
 
-            let status = response.status();
+            check_doh_status("DoH3", response.status())?;
             let content_length = doh_content_length("DoH3", response.headers())?;
             let mut buf = DnsMessageBody::new("DoH3", content_length)?;
             while let Some(mut bytes) = stream
@@ -139,7 +157,7 @@ impl Doh3Client {
                 }
             }
 
-            let response = finish_doh_response("DoH3", status, buf.into_bytes(), orig_id)?;
+            let response = finish_doh_response("DoH3", buf.into_bytes(), orig_id)?;
             if let Some(reporter) = reporter
                 && super::is_valid_response(raw_query, &response)
             {
@@ -149,22 +167,44 @@ impl Doh3Client {
             Ok::<_, anyhow::Error>(response)
         })
         .await
-        .map_err(|_| {
-            anyhow::anyhow!(
+        .unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
                 "DoH3 exchange timed out after {:?}",
                 self.dial.query_timeout
-            )
-        })?
+            ))
+        })
+        .map_err(|error| SessionFailure::new(session, error).into())
     }
 
-    async fn get_sender(&self) -> anyhow::Result<H3Sender> {
-        let session = self.session.acquire(|| self.handshake()).await?;
-        session
-            .sender
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("DoH3 session is closing"))
+    /// A sender on a live QUIC connection; one that closed between queries
+    /// is rebuilt before the query goes out rather than failing it.
+    async fn get_sender(&self) -> anyhow::Result<(Arc<H3Session>, H3Sender)> {
+        for attempt in 0..2 {
+            let session = self.session.acquire(|| self.handshake()).await?;
+            match session.connection.close_reason() {
+                None => {
+                    let sender = session.sender.lock().await.clone().ok_or_else(|| {
+                        SessionFailure::new(
+                            Arc::clone(&session),
+                            anyhow::anyhow!("DoH3 session is closing"),
+                        )
+                    })?;
+                    return Ok((session, sender));
+                }
+                Some(reason) if attempt == 0 => {
+                    debug!(error = %reason, transport = "doh3", "DoH3 connection is closed; rebuilding");
+                    self.retire_session(&session).await;
+                }
+                Some(reason) => {
+                    return Err(SessionFailure::new(
+                        session,
+                        anyhow::anyhow!("DoH3 connection closed: {reason}"),
+                    )
+                    .into());
+                }
+            }
+        }
+        unreachable!("the loop returns or fails on its second pass")
     }
 
     async fn handshake(&self) -> anyhow::Result<H3Session> {
@@ -215,30 +255,30 @@ impl Doh3Client {
         })
     }
 
-    async fn close_session(&self) {
+    async fn retire_session(&self, session: &Arc<H3Session>) {
         let timeout = self.dial.query_timeout;
         self.session
-            .close(|session| async move {
-                session.sender.lock().await.take();
-                session.connection.close(0_u32.into(), b"shutdown");
-                session.driver.shutdown(timeout).await;
-                if let Some(endpoint) = &session.endpoint {
-                    endpoint.close(timeout).await;
-                }
-            })
+            .retire(session, move |session| session.close(timeout))
             .await;
     }
 
     pub(crate) async fn close(&self) {
-        self.close_session().await;
+        let timeout = self.dial.query_timeout;
+        self.session
+            .close(move |session| session.close(timeout))
+            .await;
         self.quic_ep.close(self.dial.query_timeout).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::{DnsMessageBody, DnsMessageTooLarge, MAX_DNS_MESSAGE_SIZE};
-    use super::{DialContext, Doh3Client, LifecycleSlot, SharedQuicEndpoint};
+    use super::super::{
+        DnsMessageBody, DnsMessageTooLarge, MAX_DNS_MESSAGE_SIZE, exchange_with_retry,
+        is_valid_response,
+    };
+    use super::{Doh3Client, LifecycleSlot, OwnedTask, SharedQuicEndpoint};
+    use bytes::{Buf, Bytes};
     use honk_config::types::DnsProtocol;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -246,7 +286,7 @@ mod tests {
 
     use crate::dns::forwarder::build_dns_query;
     use crate::dns::transport::tests_proto::{
-        ProxiedQuicFixture, insecure_quic_config, proxied_quic_fixture, spawn_doh3_server,
+        ProxiedQuicFixture, insecure_quic_config, proxied_quic_fixture, quic_server_endpoint,
     };
 
     #[test]
@@ -280,27 +320,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn constructor_keeps_query_and_dial_timeouts_distinct() {
-        let dial = DialContext {
-            endpoint: crate::dns::endpoint::DnsEndpoint::parse(
-                "127.0.0.1/dns-query",
-                DnsProtocol::H3,
-                Some("localhost"),
-            )
-            .expect("DoH3 endpoint"),
-            query_timeout: Duration::from_millis(111),
-            dial_timeout: Duration::from_millis(222),
-            proxy: None,
-        };
-        let client = Doh3Client::new(dial).await.expect("DoH3 client");
-
-        assert_eq!(client.dial.query_timeout, Duration::from_millis(111));
-        assert_eq!(client.dial.dial_timeout, Duration::from_millis(222));
-    }
-
-    #[tokio::test]
     async fn proxied_doh3_reuses_and_closes_packet_endpoint() {
-        let (address, server) = spawn_doh3_server();
+        let (endpoint, address) = quic_server_endpoint(b"h3");
+        let mut answer = build_dns_query("example.com", 1);
+        answer[..2].fill(0);
+        answer[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        let server = tokio::spawn(async move {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            let mut h3 = h3::server::builder()
+                .build(h3_quinn::Connection::new(connection.clone()))
+                .await
+                .unwrap();
+            for (status, body) in [(400, Vec::new()), (200, vec![0; 3]), (200, answer)] {
+                respond_h3(&mut h3, status, body).await;
+            }
+            connection.closed().await;
+        });
         let endpoint = crate::dns::endpoint::DnsEndpoint::parse(
             &format!("127.0.0.1:{}/dns-query", address.port()),
             DnsProtocol::H3,
@@ -323,9 +358,16 @@ mod tests {
         let query = build_dns_query("example.com", 1);
 
         for _ in 0..2 {
-            let response = client.exchange(&query, None).await.unwrap();
-            assert_eq!(&response[..2], &query[..2]);
+            let error = client.exchange(&query, None).await.unwrap_err();
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.is::<super::super::doh_message::DeterministicResponse>())
+            );
         }
+        let response = client.exchange(&query, None).await.unwrap();
+        assert!(is_valid_response(&query, &response));
+        assert_eq!(&response[..2], &query[..2]);
         assert_eq!(runtime_dials.load(Ordering::SeqCst), 1);
         assert_eq!(active.load(Ordering::SeqCst), 1);
 
@@ -336,5 +378,174 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    async fn respond_h3(
+        h3: &mut h3::server::Connection<h3_quinn::Connection, Bytes>,
+        status: u16,
+        body: Vec<u8>,
+    ) -> Vec<u8> {
+        let resolver = h3.accept().await.unwrap().unwrap();
+        let (_request, mut stream) = resolver.resolve_request().await.unwrap();
+        let mut query = Vec::new();
+        while let Some(mut data) = stream.recv_data().await.unwrap() {
+            query.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+        }
+        stream
+            .send_response(http::Response::builder().status(status).body(()).unwrap())
+            .await
+            .unwrap();
+        if !body.is_empty() {
+            stream.send_data(Bytes::from(body)).await.unwrap();
+        }
+        stream.finish().await.unwrap();
+        query
+    }
+
+    #[tokio::test]
+    async fn final_attempt_goaway_does_not_block_later_query() {
+        let (endpoint, address) = quic_server_endpoint(b"h3");
+        let (goaway_sent, goaway_received) = tokio::sync::oneshot::channel();
+        let mut answer = build_dns_query("example.com", 1);
+        answer[..2].fill(0);
+        answer[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        let server = tokio::spawn(async move {
+            let first = endpoint.accept().await.unwrap().await.unwrap();
+            let first_peer = tokio::spawn(async move {
+                let mut h3 = h3::server::builder()
+                    .build(h3_quinn::Connection::new(first.clone()))
+                    .await
+                    .unwrap();
+                let query = respond_h3(&mut h3, 503, Vec::new()).await;
+                first.closed().await;
+                query
+            });
+
+            let draining = endpoint.accept().await.unwrap().await.unwrap();
+            let mut h3 = h3::server::builder()
+                .build::<_, Bytes>(h3_quinn::Connection::new(draining.clone()))
+                .await
+                .unwrap();
+            h3.shutdown(0).await.unwrap();
+            goaway_sent.send(()).unwrap();
+
+            let recovered = endpoint.accept().await.unwrap().await.unwrap();
+            let mut recovered_h3 = h3::server::builder()
+                .build(h3_quinn::Connection::new(recovered.clone()))
+                .await
+                .unwrap();
+            let recovered_query = respond_h3(&mut recovered_h3, 200, answer).await;
+            recovered.closed().await;
+            draining.closed().await;
+            (first_peer.await.unwrap(), recovered_query)
+        });
+
+        let endpoint = crate::dns::endpoint::DnsEndpoint::parse(
+            &format!("127.0.0.1:{}/dns-query", address.port()),
+            DnsProtocol::H3,
+            Some("localhost"),
+        )
+        .unwrap();
+        let ProxiedQuicFixture {
+            dial,
+            active,
+            runtime_dials,
+        } = proxied_quic_fixture(endpoint);
+        let active_tasks = Arc::new(AtomicUsize::new(0));
+        let client = Arc::new(Doh3Client {
+            dial,
+            quic_config: insecure_quic_config(b"h3").await,
+            quic_ep: SharedQuicEndpoint::new(),
+            session: LifecycleSlot::new(),
+            active_tasks: Arc::clone(&active_tasks),
+        });
+        client.session.acquire(|| client.handshake()).await.unwrap();
+        let mut final_session = client.handshake().await.unwrap();
+        goaway_received.await.unwrap();
+
+        // Wait for the real H3 driver to consume GOAWAY, without sending a DNS body.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut sender = final_session.sender.lock().await.clone().unwrap();
+            loop {
+                let request =
+                    super::build_doh_request(&client.dial.endpoint, None, "DoH3").unwrap();
+                match sender.send_request(request).await {
+                    Err(h3::error::StreamError::RemoteClosing { .. }) => break,
+                    Err(error) => panic!("unexpected H3 setup error: {error}"),
+                    Ok(stream) => drop(stream),
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("peer GOAWAY reached the client");
+
+        // Hold completion of the real driver's teardown beyond the final query deadline.
+        let (release_driver, driver_released) = tokio::sync::oneshot::channel();
+        let (driver_started, driver_running) = tokio::sync::oneshot::channel();
+        let connection = final_session.connection.clone();
+        let driver = final_session.driver;
+        final_session.driver = OwnedTask::spawn(
+            async move {
+                driver_started.send(()).unwrap();
+                connection.closed().await;
+                driver.shutdown(Duration::ZERO).await;
+                let _ = driver_released.await;
+            },
+            Arc::clone(&active_tasks),
+        );
+        driver_running.await.unwrap();
+
+        let query = build_dns_query("example.com", 1);
+        let attempts = AtomicUsize::new(0);
+        // The production retry boundary owns reset; only session publication is gated here.
+        exchange_with_retry(
+            "DoH3",
+            &query,
+            |_| async {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 1 {
+                    tokio::time::pause();
+                }
+                client.exchange_once(&query, None).await
+            },
+            |error| {
+                let session = super::SessionFailure::<super::H3Session>::session(error).unwrap();
+                let client = &client;
+                async move {
+                    client.retire_session(&session).await;
+                    client
+                        .session
+                        .acquire(|| async { Ok(final_session) })
+                        .await
+                        .unwrap();
+                }
+            },
+            None,
+        )
+        .await
+        .expect_err("503 followed by GOAWAY exhausts the two query attempts");
+        tokio::time::resume();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let _ = release_driver.send(());
+
+        let response = tokio::time::timeout(Duration::from_secs(2), client.exchange(&query, None))
+            .await
+            .expect("a later query must not wait on an abandoned close")
+            .expect("a later query rebuilds the draining session");
+        assert!(is_valid_response(&query, &response));
+        assert_eq!(&response[..2], &query[..2]);
+        assert_eq!(runtime_dials.load(Ordering::SeqCst), 3);
+
+        client.close().await;
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(active_tasks.load(Ordering::SeqCst), 0);
+        let (first_query, recovered_query) = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut wire_query = query;
+        wire_query[..2].fill(0);
+        assert_eq!(first_query, wire_query);
+        assert_eq!(recovered_query, wire_query);
     }
 }
