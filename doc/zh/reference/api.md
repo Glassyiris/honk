@@ -144,6 +144,8 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 `POST /routing/trace` 仅支持 `resolve=none`，返回 `mode:simulation`；`live` 为 422。模拟固定当前 compiled router/config/generation，不查询 DNS、不探测、不推进组选择、不建立连接；缺失输入保留 `indeterminate/missing_inputs`，不能视为历史 flow 或真实转发承诺。上限为 1 个地址、256 个规则/条件 steps、5 秒和每分钟 principal/global 各 30 次。`GET /rules` 返回含 fallback 的完整当前字典，最多 4096 行，超限拒绝而不截断。规则 ID 与用户态捕获证据共用 generation-scoped 身份；真实 parser 来源可用时给出 `source_id/line/column`，file 为 `<redacted>`，否则 source 为 null。历史 flow 不从当前字典重建，内核 final provenance 仍可为 unknown；编辑应使用 source ID，不猜私有路径。
 
+对已接受 `.dae` 配置中非凭据来源的规则，`expression` 保留编写时的条件值（包括 geosite/geoip 名称、否定和带引号参数），移除注释和出站子句。这属于规则元数据，不要求开启 `config_content` 或写权限；不会返回完整配置原文，也不展开 geodata。含凭据来源及没有已接受来源元数据的规则仍使用脱敏的编译后摘要。磁盘编辑只有在 reload 被接受后才更新字典；reload 被拒绝时保留旧表达式。Trace 与历史 flow 的表达式脱敏行为不变。
+
 ### Provider、日志与临时设置
 
 Provider GET 不联网，订阅条目连接真实 SubscriptionSupervisor 观测与已接受节点的 `subscription_id`，`Node.provider_id` 可用于关联。订阅显示名为安全的 `provider-<id>`，不披露原始 tag/URL；未观测 usage/expiry 为 null。从未加载、等待加载或禁用且无缓存时是 stale、零节点及 null 时间/错误；真实失败且无节点才是 error，保留旧/缓存节点时为 stale。列表 `limit` 默认 100、范围 1–1000，snapshot 上限 8 份/30 秒/4 MiB。启用且有运行 supervisor 的订阅可 POST refresh；同 provider 的不同并发 refresh 为 409，保留的幂等重放先于冲突检查。刷新成功须真实 revision-fenced publication 被接受，fetch 或写缓存不等于成功，HTTP 断连不丢失结果。虚拟 inline provider 不可刷新/删除；它关联 `provider_id: inline` 的静态非 builtin 节点，builtin 归属保持 null，订阅 ID 仍为 UUID。

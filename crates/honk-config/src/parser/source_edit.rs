@@ -373,6 +373,8 @@ pub struct RuleSourceLocation {
     pub bytes: Range<usize>,
     pub line: usize,
     pub column: usize,
+    /// Comment-free condition display, or `fallback` for the terminal entry.
+    pub expression: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -410,7 +412,8 @@ pub fn source_indices(
     };
     let mut diagnostics =
         super::diagnostics::ParserDiagnostics::new(&mut notices, source.source.clone());
-    super::routing::parse_section_indexed(&sections, &mut diagnostics, |ordinal, span| {
+    super::routing::parse_section_indexed(&sections, &mut diagnostics, |ordinal, statement| {
+        let span = statement.span;
         if let Some(index) = sources
             .iter()
             .position(|source| source.source.index() == span.source)
@@ -421,6 +424,14 @@ pub fn source_indices(
                 bytes: span.start..span.end,
                 line,
                 column,
+                expression: if ordinal.is_some() {
+                    statement
+                        .sub(span.start, statement.find("->").unwrap())
+                        .trim()
+                        .display()
+                } else {
+                    "fallback".into()
+                },
             };
             if ordinal.is_some() {
                 result.rules.push(location);

@@ -1,7 +1,6 @@
 use super::*;
 const OTHER_SCORE_NODE_ID: uuid::Uuid = uuid::Uuid::from_u128(0x5c07e);
 
-
 #[tokio::test(flavor = "current_thread")]
 async fn queued_source_view_timeout_is_local_congestion() {
     let (server, mut events, wire_task) = start_wire_peer().await;

@@ -298,11 +298,16 @@ pub(super) async fn rules(
                 .observation
                 .configuration
                 .rule_source(index)
-                .map(|(source_id, location)| RuleSource {
-                    file: "<redacted>",
-                    source_id,
-                    line: location.line,
-                    column: location.column,
+                .map(|(source_id, location)| {
+                    (
+                        RuleSource {
+                            file: "<redacted>",
+                            source_id,
+                            line: location.line,
+                            column: location.column,
+                        },
+                        location.expression,
+                    )
                 })
         };
         let mut order: Vec<_> = config.routing.rules.iter().enumerate().collect();
@@ -313,9 +318,14 @@ pub(super) async fn rules(
             .filter(|rule| rule.kind == "rule")
             .zip(order)
         {
-            rule.source = source(Some(source_index));
+            if let Some((source, expression)) = source(Some(source_index)) {
+                rule.source = Some(source);
+                if !expression.is_empty() {
+                    rule.expression = expression;
+                }
+            }
         }
-        result.fallback.source = source(None);
+        result.fallback.source = source(None).map(|(source, _)| source);
         if let Some(fallback) = result.rules.last_mut() {
             fallback.source = result.fallback.source.clone();
         }

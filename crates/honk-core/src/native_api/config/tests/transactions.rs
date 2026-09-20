@@ -1,6 +1,71 @@
 use super::*;
 
 #[tokio::test]
+async fn rule_details_use_accepted_expressions_without_exposing_source_content() {
+    let fixture = Fixture::new_custom(Access::Metadata, false, |_, files| {
+        files.get_mut("auth.dae").unwrap().push_str(
+            "routing { pname(credential-source-process) -> direct }\n",
+        );
+        files.insert("locked.dae", "routing {\n domain(\n # private-comment\n regex: 'a->b#c'\n ) && !dport(53) -> direct(must)\n -> block\n}\n".into());
+    })
+    .await;
+    let config = fixture.get(CONFIG).await;
+    assert!(
+        config["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|source| { source.get("content").is_none() && source["writable"] == false })
+    );
+    let before = fixture.get("/api/v1/rules").await;
+    assert_eq!(before["rules"][0]["expression"], "pname(<redacted>)");
+    assert!(before["rules"][0]["source"].is_null());
+    assert_eq!(
+        before["rules"][1]["expression"],
+        "domain( regex: 'a->b#c') && !dport(53)"
+    );
+    assert_eq!(before["rules"][1]["outbound"], "direct");
+    assert_eq!(before["rules"][1]["must"], true);
+    assert_eq!(before["rules"][1]["source"]["line"], 2);
+    assert_eq!(before["rules"][1]["source"]["file"], "<redacted>");
+    assert!(
+        !before["rules"][2]["expression"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
+    let encoded = before.to_string();
+    for withheld in [
+        SECRET,
+        "credential-source-process",
+        "private-comment",
+        "locked.dae",
+    ] {
+        assert!(!encoded.contains(withheld));
+    }
+
+    std::fs::write(fixture.path("locked.dae"), "routing { dport(\n").unwrap();
+    let rejected = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&rejected).await["status"], "failed");
+    assert_eq!(fixture.get("/api/v1/rules").await, before);
+
+    let candidate = fixture.originals["locked.dae"].replace("!dport(53)", "!dport(853)");
+    std::fs::write(fixture.path("locked.dae"), candidate).unwrap();
+    assert_eq!(fixture.get("/api/v1/rules").await, before);
+    let reload = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&reload).await["status"], "succeeded");
+    let after = fixture.get("/api/v1/rules").await;
+    assert_ne!(after["generation_id"], before["generation_id"]);
+    assert_ne!(after["rules"][1]["rule_id"], before["rules"][1]["rule_id"]);
+    assert_eq!(after["rules"][1]["source"], before["rules"][1]["source"]);
+    assert_eq!(
+        after["rules"][1]["expression"],
+        "domain( regex: 'a->b#c') && !dport(853)"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn discarded_202_and_concurrent_retries_share_exactly_one_write_and_reload() {
     let mut fixture = Fixture::new(Access::Admin, true).await;
     let before = fixture.get(CONFIG).await;
