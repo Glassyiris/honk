@@ -132,17 +132,34 @@ IP 分 family，避免 IPv6 前缀误匹配 mapped IPv4。更具体的 LPM 条�
 谓词的位，使最长前缀查找不破坏规则顺序。每一代使用完整 `DomainRouting` bitmap，
 不再共享可能被新前缀提前遮挡的双 bank LPM value。
 
-同一次调用中，出现至少两次的目的 IP、源 IP 或 MAC 类别，在实际执行到第一个相关
-条件时才 lookup。对齐栈槽保存 pointer（包括 NULL）及独立的 ready 标志；每个条件仍
-先检查自己的正向 bit，再应用否定。未使用或只使用一次的类别没有缓存状态。提前返回
-不预查未到达的类别，但重复类别仍有入口栈初始化成本。fact pointer 不跨调用或
-generation 保留。domain 入口 lookup 不变，因为它还负责确定 `domain_final`。
+事实是值，不是指针。每个类别（domain、目的 IP、源 IP、MAC）每次调用至多解析一次：
+lookup 把 map value 里 32 字节的 `DomainRouting` bitmap 复制到该类别固定的栈区域；
+输入没有这项事实或 map 没有条目时，就把区域填零。每处事实使用都由这次解析支配，
+之后不再读任何 map 指针；每个条件直接在区域里测自己的 bit（全零 bitmap 让所有正向
+bit 都不成立，这正是“没有条目”原来的含义），再应用否定。domain 在入口解析，因为
+命中还要置 `domain_final`。每条规则先执行完整的正向／取反目的端口与源端口条件，
+然后执行其余条件。非 domain 事实在首次实际到达的使用点解析，而不是规则入口：
+每个使用点检查本次调用 `R8` readiness mask 中对应类别的 bit，只有完整复制或
+填零结束后才置位；map miss、缺失 MAC、非法 family 和已有全零 bitmap 都算已解析。
+前面的使用点若被短路跳过，bit 仍为零，后面的使用点仍会解析。每次调用从空 mask
+开始，不跨调用或 generation 保留状态。逐使用点的 lazy guard 增加代码，但能跳过
+已被前置条件拒绝路径上的事实工作；这不代表已经测得净吞吐量提升。
 
-发射时用两个三位掩码跟踪“必然已计算”和“可能已计算”。每个失败条件都是下一规则的
-前驱：合流时前者取交集，后者取并集。确定首次使用时省去 ready 检查，必然已计算时只
-重载 pointer，不确定时保留运行时守卫。NULL 和输入缺失也算完成计算，否定不改变此
-状态；入口缓存初始化保持不变。IPv4/IPv6 分别构造 key、选择 map，再合流到一次
-lookup；仅清零 IPv4 key 的 padding，不清零马上会被覆盖的字节。
+这样做是为了 verifier。指针的类型取决于 lookup 结果，verifier 不会把 NULL 和
+map 指针合并成一个状态，于是跨越后续规则仍然存活的事实指针，会让它后面所有指令的
+状态数成倍增长；两条 `sip && dip && dport` 规则放在十五条进程名规则前面，就把一份
+策略推过了 1,000,000 指令预算（#280：Linux 6.12 上去掉这两条处理 159,837 条指令，
+加上就超过 1,000,000）。复制出来的 bitmap 是标量，其余状态相容时，已记录的非精确
+标量状态可以吸收其他路径。
+
+分支布局也是其中一环：verifier 先探索未定条件跳转的
+fall-through，所以每个分叉（包括 IPv4/IPv6 分派）都把从 map value 复制的路径放在
+fall-through、填零放在跳转目标；先被记录的填零路径一旦有 bit 测试可预测就会变成
+精确值，无法吸收后来的未知值。[历史测量](https://paste.gentoozh.org/md/Jh3E30L0+Vf)
+来自 Linux 6.12.107 上 `6a2b395` 的规则入口 eager 实现：去掉两条规则时处理 53,279
+条指令，加上时为 53,380；它们不是后来 port-first、READY-guarded 实现的测量值。
+verifier-budget 测试通过只证明可加载，不证明该指令数。IPv4/IPv6 仍分别构造 key、
+选择 map，再合流到一次 lookup；仅清零 IPv4 key 的 padding，不清零马上会被覆盖的字节。
 
 事实准备先用 hash 合并重复键，只排序唯一键，再在原向量中继承祖先位并压缩保留容量。
 内部跳转由 assembler 自己分配的 ordinal label 标识，只有规则 source record 保留
