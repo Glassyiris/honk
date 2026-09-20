@@ -36,7 +36,7 @@ Non-`must` transparent DNS and the standalone ingress adapter use the same `DnsC
     - `runtime/` — `DnsRuntime` and `DnsServiceProvider`; [generations and retirement](#generations-and-reload).
     - `forwarder/`, `engine/`, `planner/`, `policy.rs` — [resolution pipeline](#resolution-pipeline) and request/response policy.
     - `cache/` — [answer cache and persistence](#cache-and-persistence).
-    - `upstream_pool/`, `transport/` — [upstream sessions and drivers](#upstream-transports).
+    - `upstream_pool/`, `transport/` — [upstream sessions and drivers](#upstream-transports); `transport/retry.rs` owns the retry decision, `transport/lifecycle.rs` owns session retirement, and `transport/udp_pool/error_queue.rs` owns Linux quoted-packet error reception.
     - `projection/` — generation-owned routing projection and domain-fact reconciliation ([routing projection](#routing-projection)).
     - `service.rs`, `resolver.rs` — current-provider access for transparent DNS, `dns.bind`, Clash API, and application lookups.
 
@@ -232,9 +232,45 @@ Proxied DoQ and DoH3 adapt the generation-pinned leaf `PacketTransport` to quinn
 
 Direct upstream sockets carry the bypass mark so their traffic cannot re-enter transparent interception. Hostname endpoints resolve through the generation-captured bootstrap resolver; dials never depend on honk's intercepted resolver path.
 
-Dial/TLS/QUIC/HTTP session setup uses the dial/handshake timeout, while request/response exchange uses the distinct query timeout. A query attempt has one absolute exchange deadline. Every transport retries at most once after failure, resetting an invalid reusable session where required, so aggregate query work remains bounded. Transport slots single-flight concurrent initialization and assign exactly one closer. Pool shutdown first closes admission and waits for admitted exchanges, then closes idle resources and explicitly joins every receive or protocol-driver task.
+Dial/TLS/QUIC/HTTP session setup uses the dial/handshake timeout, while request/response exchange uses the distinct query timeout. A query attempt has one absolute exchange deadline. Every transport retries at most once after failure, resetting an invalid reusable session where required, so aggregate query work remains bounded. Transport slots single-flight concurrent initialization and retain one teardown future per closing resource. Pool shutdown first closes admission and waits for admitted exchanges, then closes idle resources and explicitly joins every receive or protocol-driver task.
+
+DoH and DoH3 judge HTTP status before allocating or reading the response body.
+Statuses outside 2xx/5xx, short DNS bodies and responses exceeding the DNS size
+limit return without resetting or retrying that session; 5xx and transport
+failures retain the one query-level reset/retry. Typed packet refusals remain
+terminal. Closed senders are refreshed before use, while HTTP/3 GOAWAY discovered
+by `send_request` uses the outer retry owner: its teardown is not cancelled by
+the single-query timeout. No extra nested query attempt is introduced.
+
+DoH, DoH3 and DoQ failures identify their session through a weak reference.
+Retaining an error does not keep its driver alive. Retirement checks that
+identity under the slot lock, so a late failure cannot close a replacement.
+Cancelling a closer leaves its teardown in the slot; a subsequent
+acquire or close resumes the same cleanup before rebuilding. Shutdown still
+closes the current resource regardless of which query last used it.
+Dropping the last owner still aborts its driver; task accounting also covers
+cancellation before the task's first poll.
 
 Direct UDP assigns each query a fresh CSPRNG-selected 16-bit ID, verifies both ID and question on receipt, restores the caller ID, and quarantines retired IDs for three seconds. Delayed packets therefore cannot satisfy a different question after reuse.
+
+Both cold and cached-current UDP paths use the same pool acquisition, replacing
+a closed/stopped socket before exchange rather than spending an address attempt
+on it. On Linux, `IP_RECVERR`/`IPV6_RECVERR` supplies the offending datagram to a
+separate ERROR-readiness consumer; ordinary datagrams consume READABLE only.
+A complete quoted ID and question can fail only that pending query, preserving
+the original I/O cause. Short, stale or unrelated quotes cannot fail other
+queries; attribution retains the same finite ID-quarantine limits as responses.
+Receive errors without a usable quote leave queries subject to their deadline,
+including on platforms without error-queue support. A send syscall failure still
+returns its original error to the current exchange; this existing behavior does
+not claim quote attribution for send failures. No send is replayed within the
+exchange, and sending plus awaiting the response share one absolute deadline.
+Socket-fatal receive errors stop admission and fail remaining waiters; repeated
+destination errors alone do not prove socket death.
+
+Transparent DNS reply sockets are also retained after destination-specific send
+failures. Other send failures retain the existing one replacement/retry path;
+standalone `dns.bind` replies use their original listener sockets.
 
 ## Routing projection
 

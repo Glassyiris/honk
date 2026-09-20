@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use bytes::{Buf, Bytes};
 use honk_config::dns::DnsUpstream;
 use honk_config::node::Node;
 use honk_config::types::{DnsProtocol, NodeProtocol};
@@ -288,7 +287,7 @@ pub(super) async fn insecure_quic_config(alpn: &[u8]) -> quinn::ClientConfig {
     .unwrap()
 }
 
-fn quic_server_endpoint(alpn: &[u8]) -> (quinn::Endpoint, SocketAddr) {
+pub(super) fn quic_server_endpoint(alpn: &[u8]) -> (quinn::Endpoint, SocketAddr) {
     ensure_crypto_provider();
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let mut tls =
@@ -328,38 +327,6 @@ pub(super) fn spawn_doq_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
                 .unwrap();
             send.write_all(&response).await.unwrap();
             send.finish().unwrap();
-        }
-        connection.closed().await;
-    });
-    (address, task)
-}
-
-pub(super) fn spawn_doh3_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let (endpoint, address) = quic_server_endpoint(b"h3");
-    let task = tokio::spawn(async move {
-        let connection = endpoint.accept().await.unwrap().await.unwrap();
-        let mut h3 = h3::server::builder()
-            .build(h3_quinn::Connection::new(connection.clone()))
-            .await
-            .unwrap();
-        for _ in 0..2 {
-            let resolver = h3.accept().await.unwrap().unwrap();
-            let (_request, mut stream) = resolver.resolve_request().await.unwrap();
-            while let Some(mut data) = stream.recv_data().await.unwrap() {
-                while data.has_remaining() {
-                    let length = data.chunk().len();
-                    data.advance(length);
-                }
-            }
-            stream
-                .send_response(http::Response::builder().status(200).body(()).unwrap())
-                .await
-                .unwrap();
-            stream
-                .send_data(Bytes::from(mock_dns_response(0)))
-                .await
-                .unwrap();
-            stream.finish().await.unwrap();
         }
         connection.closed().await;
     });

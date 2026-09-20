@@ -5,17 +5,22 @@
 //! packet cannot be delivered to a different question after ID reuse.
 
 use std::collections::{HashMap, VecDeque};
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use honk_ebpf_common::DAE_BYPASS_MARK;
+use honk_outbound::SharedError;
 use parking_lot::Mutex;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as TokioMutex, oneshot};
 
 use super::owned_task::OwnedTask;
+
+#[cfg(target_os = "linux")]
+mod error_queue;
 
 const MAX_PENDING: usize = 1024;
 const ID_QUARANTINE: Duration = Duration::from_secs(3);
@@ -25,11 +30,25 @@ struct Pending {
     nonce: u64,
     question: Vec<u8>,
     original_id: [u8; 2],
-    reply: oneshot::Sender<Vec<u8>>,
+    reply: oneshot::Sender<Result<Vec<u8>, SharedError>>,
+}
+
+enum Received {
+    Datagram(usize),
+    #[cfg(target_os = "linux")]
+    ErrorQuote(usize, Option<io::Error>),
+}
+
+fn socket_failed(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EBADF | libc::ENOTSOCK | libc::EINVAL | libc::EIO)
+    )
 }
 
 struct State {
     closed: bool,
+    stopped: Option<SharedError>,
     next_nonce: u64,
     pending: HashMap<u16, Pending>,
     retired: VecDeque<(Instant, u16)>,
@@ -83,6 +102,8 @@ impl UdpPool {
         socket.set_nonblocking(true)?;
         #[cfg(target_os = "linux")]
         honk_outbound::util::set_mark_best_effort(&socket, DAE_BYPASS_MARK)?;
+        #[cfg(target_os = "linux")]
+        error_queue::enable(&socket, address.is_ipv6())?;
         let unspecified = if address.is_ipv4() {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
         } else {
@@ -95,6 +116,7 @@ impl UdpPool {
             socket: Arc::clone(&socket),
             state: Mutex::new(State {
                 closed: false,
+                stopped: None,
                 next_nonce: 0,
                 pending: HashMap::new(),
                 retired: VecDeque::new(),
@@ -109,6 +131,12 @@ impl UdpPool {
         );
         pool.receive_task.lock().await.replace(receive_task);
         Ok(pool)
+    }
+
+    /// Closed or failed sockets cannot serve a new exchange.
+    pub(crate) fn is_stopped(&self) -> bool {
+        let state = self.state.lock();
+        state.closed || state.stopped.is_some()
     }
 
     pub(crate) async fn close(&self) {
@@ -139,6 +167,9 @@ impl UdpPool {
             if state.closed {
                 anyhow::bail!("UDP DNS exchange pool is closed");
             }
+            if let Some(failure) = &state.stopped {
+                return Err(anyhow::Error::new(failure.clone()));
+            }
             Self::purge_retired(&mut state);
             if state.pending.len() >= MAX_PENDING {
                 anyhow::bail!("UDP DNS exchange pool saturated");
@@ -168,58 +199,111 @@ impl UdpPool {
         };
         let mut wire = query.to_vec();
         wire[..2].copy_from_slice(&id.to_be_bytes());
-        self.socket.send(&wire).await?;
-        if let Some(reporter) = reporter {
-            reporter.setup_succeeded();
-            reporter.tx(query.len() as u64);
-        }
-        match tokio::time::timeout(self.timeout, receiver).await {
+        tokio::time::timeout(self.timeout, async {
+            self.socket.send(&wire).await?;
+            if let Some(reporter) = reporter {
+                reporter.setup_succeeded();
+                reporter.tx(query.len() as u64);
+            }
+            Self::received_reply(receiver.await)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("UDP DNS query timed out after {:?}", self.timeout))?
+    }
+
+    fn received_reply(
+        reply: Result<Result<Vec<u8>, SharedError>, oneshot::error::RecvError>,
+    ) -> anyhow::Result<Vec<u8>> {
+        match reply {
             Ok(Ok(response)) => Ok(response),
-            Ok(Err(_)) => anyhow::bail!("UDP DNS receive loop stopped"),
-            Err(_) => anyhow::bail!("UDP DNS query timed out after {:?}", self.timeout),
+            Ok(Err(error)) => Err(anyhow::Error::new(error)),
+            Err(_) => anyhow::bail!("UDP DNS receive loop stopped"),
         }
+    }
+
+    fn stop(&self, error: io::Error) {
+        let failure = SharedError::new(anyhow::Error::new(error).context("UDP DNS receive failed"));
+        let pending = {
+            let mut state = self.state.lock();
+            state.stopped.get_or_insert_with(|| failure.clone());
+            let pending = std::mem::take(&mut state.pending);
+            for id in pending.keys() {
+                Self::retire_id(&mut state, *id);
+            }
+            pending
+        };
+        for pending in pending.into_values() {
+            let _ = pending.reply.send(Err(failure.clone()));
+        }
+    }
+
+    fn take_pending(&self, wire: &[u8]) -> Option<Pending> {
+        let end = Self::question_end(wire).ok()?;
+        let id = u16::from_be_bytes([wire[0], wire[1]]);
+        let mut state = self.state.lock();
+        if state.pending.get(&id)?.question != wire[12..end] {
+            return None;
+        }
+        let pending = state.pending.remove(&id);
+        Self::retire_id(&mut state, id);
+        pending
     }
 
     async fn receive_loop(pool: Weak<Self>, socket: Arc<UdpSocket>) {
         let mut buffer = vec![0; 65535];
+        #[cfg(target_os = "linux")]
+        let mut quote = [0; 512];
         loop {
-            let Ok(Ok(length)) =
-                tokio::time::timeout(Duration::from_secs(1), socket.recv(&mut buffer)).await
-            else {
-                if pool.strong_count() == 0 {
-                    break;
+            let receive = async {
+                #[cfg(target_os = "linux")]
+                {
+                    tokio::select! {
+                        datagram = error_queue::receive_datagram(&socket, &mut buffer) => datagram.map(Received::Datagram),
+                        error = error_queue::receive(&socket, &mut quote) => error.map(|(length, error)| Received::ErrorQuote(length, error)),
+                    }
                 }
-                continue;
+                #[cfg(not(target_os = "linux"))]
+                {
+                    socket.recv(&mut buffer).await.map(Received::Datagram)
+                }
             };
-            if length < 12 {
-                continue;
-            }
+            let event = tokio::time::timeout(Duration::from_secs(1), receive).await;
             let Some(pool) = pool.upgrade() else {
                 break;
             };
-            let id = u16::from_be_bytes([buffer[0], buffer[1]]);
-            let pending = {
-                let mut state = pool.state.lock();
-                let matches = Self::question_end(&buffer[..length]).is_ok_and(|end| {
-                    state
-                        .pending
-                        .get(&id)
-                        .is_some_and(|pending| pending.question == buffer[12..end])
-                });
-                if matches {
-                    let pending = state.pending.remove(&id);
-                    if pending.is_some() {
-                        Self::retire_id(&mut state, id);
+            if pool.is_stopped() {
+                break;
+            }
+            match event {
+                Err(_) => {}
+                Ok(Ok(Received::Datagram(length))) => {
+                    if let Some(pending) = pool.take_pending(&buffer[..length]) {
+                        let mut response = buffer[..length].to_vec();
+                        response[..2].copy_from_slice(&pending.original_id);
+                        let _ = pending.reply.send(Ok(response));
                     }
-                    pending
-                } else {
-                    None
                 }
-            };
-            if let Some(pending) = pending {
-                let mut response = buffer[..length].to_vec();
-                response[..2].copy_from_slice(&pending.original_id);
-                let _ = pending.reply.send(response);
+                #[cfg(target_os = "linux")]
+                Ok(Ok(Received::ErrorQuote(length, error))) => {
+                    if let Some(error) = error
+                        && let Some(pending) = pool.take_pending(&quote[..length])
+                    {
+                        let failure = SharedError::new(
+                            anyhow::Error::new(error).context("UDP DNS receive failed"),
+                        );
+                        let _ = pending.reply.send(Err(failure));
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Ok(Err(error)) if socket_failed(&error) => {
+                    pool.stop(error);
+                    break;
+                }
+                Ok(Err(_)) => {
+                    // recv may report a delayed packet error without its quote. The
+                    // error-queue branch owns attribution; no pending query is removed.
+                    tokio::task::yield_now().await;
+                }
             }
         }
     }
@@ -309,6 +393,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_query_returns_the_send_error_without_waiting_for_reply() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pool = UdpPool::new(server.local_addr().unwrap(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let mut request = query(0x1234);
+        request[10..12].copy_from_slice(&1u16.to_be_bytes());
+        request.extend_from_slice(&[0, 0, 41, 0xff, 0xff, 0, 0, 0, 0]);
+        let padding = u16::MAX as usize - request.len() - 6;
+        request.extend_from_slice(&((padding + 4) as u16).to_be_bytes());
+        request.extend_from_slice(&12u16.to_be_bytes());
+        request.extend_from_slice(&(padding as u16).to_be_bytes());
+        request.resize(u16::MAX as usize, 0);
+        let error = tokio::time::timeout(Duration::from_secs(1), pool.exchange(&request, None))
+            .await
+            .expect("a synchronous send refusal must not wait for a response")
+            .unwrap_err();
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.raw_os_error() == Some(libc::EMSGSIZE))
+        }));
+        pool.close().await;
+    }
+
+    #[tokio::test]
     async fn successful_exchange_quarantines_pool_id() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let address = server.local_addr().unwrap();
@@ -340,6 +450,109 @@ mod tests {
 
         pool.close().await;
         responder.await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn refused_peer_fails_promptly_and_recovers_without_socket_replacement() {
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            let closed = UdpSocket::bind(bind).await.unwrap();
+            let address = closed.local_addr().unwrap();
+            drop(closed);
+            let pool = UdpPool::new(address, Duration::from_secs(5)).await.unwrap();
+            let local = pool.socket.local_addr().unwrap();
+            for attempt in 0..9 {
+                let error = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    pool.exchange(&query(0x1234), None),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{bind} refusal {attempt} waited for timeout"))
+                .unwrap_err();
+                assert!(error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|error| error.raw_os_error() == Some(libc::ECONNREFUSED))
+                }));
+            }
+            let server = UdpSocket::bind(address).await.unwrap();
+            let respond = async {
+                let mut wire = [0; 512];
+                let (length, peer) = server.recv_from(&mut wire).await.unwrap();
+                assert_eq!(peer, local);
+                wire[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+                server.send_to(&wire[..length], peer).await.unwrap();
+            };
+            let request = query(0x5678);
+            let (response, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(pool.exchange(&request, None), respond)
+            })
+            .await
+            .unwrap();
+            assert_eq!(&response.unwrap()[..2], &0x5678_u16.to_be_bytes());
+            pool.close().await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn packet_error_does_not_fail_another_pending_query() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let address = server.local_addr().unwrap();
+            let pool = UdpPool::new(address, Duration::from_secs(3)).await.unwrap();
+            let first_query = query(0x1234);
+            let second_query = query(0x5678);
+            let mut first = Box::pin(pool.exchange(&first_query, None));
+            let mut second = Box::pin(pool.exchange(&second_query, None));
+            let mut first_wire = [0; 512];
+            let (first_len, _) = tokio::select! {
+                reply = &mut first => panic!("first query ended before its peer received it: {reply:?}"),
+                packet = server.recv_from(&mut first_wire) => packet.unwrap(),
+            };
+            let mut second_wire = [0; 512];
+            let (second_len, second_peer) = tokio::select! {
+                reply = &mut second => panic!("second query ended before its peer received it: {reply:?}"),
+                packet = server.recv_from(&mut second_wire) => packet.unwrap(),
+            };
+            drop(server);
+            // Produce a real ICMP quote for the first wire ID while both queries wait.
+            pool.socket.send(&first_wire[..first_len]).await.unwrap();
+            first.await.unwrap_err();
+            let recovered = UdpSocket::bind(address).await.unwrap();
+            second_wire[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+            recovered.send_to(&second_wire[..second_len], second_peer).await.unwrap();
+            let response = second.await.expect("unrelated pending query must retain its response");
+            assert_eq!(&response[..2], &0x5678_u16.to_be_bytes());
+            pool.close().await;
+        }).await.expect("packet-local error exchange stalled");
+    }
+
+    #[tokio::test]
+    async fn fatal_socket_error_fails_all_waiters_and_future_queries() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pool = UdpPool::new(server.local_addr().unwrap(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let first_query = query(0x1234);
+        let second_query = query(0x5678);
+        let mut first = Box::pin(pool.exchange(&first_query, None));
+        let mut second = Box::pin(pool.exchange(&second_query, None));
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        pool.stop(io::Error::from_raw_os_error(libc::EBADF));
+        for error in [
+            first.await.unwrap_err(),
+            second.await.unwrap_err(),
+            pool.exchange(&query(1), None).await.unwrap_err(),
+        ] {
+            assert!(error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.raw_os_error() == Some(libc::EBADF))
+            }));
+        }
+        pool.close().await;
     }
 
     #[tokio::test]
@@ -438,6 +651,7 @@ mod tests {
     fn retired_id_bitmap_tracks_expiry_without_history_scans() {
         let mut state = State {
             closed: false,
+            stopped: None,
             next_nonce: 0,
             pending: HashMap::new(),
             retired: VecDeque::new(),

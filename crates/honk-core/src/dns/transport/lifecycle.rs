@@ -2,51 +2,16 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
 use honk_outbound::SharedError;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 mod guards {
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
 
     use super::{BuildFailure, LifecycleSlot, SharedError, SlotState};
-
-    pub(super) struct CloseGuard<'a, T> {
-        slot: &'a LifecycleSlot<T>,
-        armed: bool,
-    }
-
-    impl<'a, T> CloseGuard<'a, T> {
-        pub(super) fn new(slot: &'a LifecycleSlot<T>) -> Self {
-            Self { slot, armed: true }
-        }
-
-        pub(super) fn complete(mut self) {
-            {
-                let mut inner = self.slot.inner.lock();
-                inner.state = SlotState::Closed;
-            }
-            self.slot.close_count.fetch_add(1, Ordering::SeqCst);
-            self.armed = false;
-            self.slot.changed.notify_waiters();
-        }
-    }
-
-    impl<T> Drop for CloseGuard<'_, T> {
-        fn drop(&mut self) {
-            if !self.armed {
-                return;
-            }
-            {
-                let mut inner = self.slot.inner.lock();
-                if let SlotState::Closing { owner, .. } = &mut inner.state {
-                    *owner = false;
-                }
-            }
-            self.slot.changed.notify_waiters();
-        }
-    }
 
     pub(super) struct BuildGuard<'a, T> {
         slot: &'a LifecycleSlot<T>,
@@ -108,7 +73,7 @@ mod guards {
     }
 }
 
-use guards::{BuildGuard, CloseGuard};
+use guards::BuildGuard;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,9 +90,14 @@ struct BuildFailure {
 }
 
 enum SlotState<T> {
-    Building { generation: u64 },
+    Building {
+        generation: u64,
+    },
     Ready(Arc<T>),
-    Closing { value: Arc<T>, owner: bool },
+    Closing {
+        value: Arc<T>,
+        teardown: Shared<BoxFuture<'static, ()>>,
+    },
     Closed,
 }
 
@@ -182,6 +152,17 @@ impl<T> LifecycleSlot<T> {
         self.close_count.load(Ordering::SeqCst)
     }
 
+    async fn finish_close(&self, value: Arc<T>, teardown: Shared<BoxFuture<'static, ()>>) {
+        teardown.await;
+        let mut inner = self.inner.lock();
+        if matches!(&inner.state, SlotState::Closing { value: current, .. } if Arc::ptr_eq(current, &value))
+        {
+            inner.state = SlotState::Closed;
+            self.close_count.fetch_add(1, Ordering::SeqCst);
+            self.changed.notify_waiters();
+        }
+    }
+
     pub(crate) async fn acquire<F, Fut>(&self, build: F) -> anyhow::Result<Arc<T>>
     where
         F: FnOnce() -> Fut,
@@ -191,6 +172,7 @@ impl<T> LifecycleSlot<T> {
         let mut waited_generation = None;
         loop {
             let notified = self.changed.notified();
+            let mut closing = None;
             let action = {
                 let mut inner = self.inner.lock();
                 if let Some(generation) = waited_generation
@@ -205,7 +187,10 @@ impl<T> LifecycleSlot<T> {
                         waited_generation = Some(*generation);
                         None
                     }
-                    SlotState::Closing { .. } => None,
+                    SlotState::Closing { value, teardown } => {
+                        closing = Some((Arc::clone(value), teardown.clone()));
+                        None
+                    }
                     SlotState::Closed => {
                         inner.generation = inner.generation.wrapping_add(1);
                         let generation = inner.generation;
@@ -217,6 +202,11 @@ impl<T> LifecycleSlot<T> {
                     }
                 }
             };
+
+            if let Some((value, teardown)) = closing {
+                self.finish_close(value, teardown).await;
+                continue;
+            }
 
             let Some(generation) = action else {
                 notified.await;
@@ -239,45 +229,98 @@ impl<T> LifecycleSlot<T> {
 
     pub(crate) async fn close<F, Fut>(&self, close: F)
     where
-        F: FnOnce(Arc<T>) -> Fut,
-        Fut: Future<Output = ()>,
+        T: Send + Sync + 'static,
+        F: FnOnce(Arc<T>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
-        let mut close = Some(close);
-        loop {
+        self.close_observed(None, close).await;
+    }
+
+    pub(crate) async fn retire<F, Fut>(&self, observed: &Arc<T>, close: F)
+    where
+        T: Send + Sync + 'static,
+        F: FnOnce(Arc<T>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.close_observed(Some(observed), close).await;
+    }
+
+    async fn close_observed<F, Fut>(&self, observed: Option<&Arc<T>>, close: F)
+    where
+        T: Send + Sync + 'static,
+        F: FnOnce(Arc<T>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (value, teardown) = loop {
             let notified = self.changed.notified();
-            let resource = {
+            {
                 let mut inner = self.inner.lock();
-                match &mut inner.state {
+                match &inner.state {
+                    SlotState::Ready(value) | SlotState::Closing { value, .. }
+                        if observed.is_some_and(|observed| !Arc::ptr_eq(value, observed)) =>
+                    {
+                        return;
+                    }
                     SlotState::Ready(value) => {
                         let value = Arc::clone(value);
+                        let resource = Arc::clone(&value);
+                        // Invoke the callback only when polled after releasing the state lock.
+                        let teardown = async move { close(resource).await }.boxed().shared();
                         inner.state = SlotState::Closing {
                             value: Arc::clone(&value),
-                            owner: true,
+                            teardown: teardown.clone(),
                         };
-                        Some(value)
+                        break (value, teardown);
                     }
-                    SlotState::Closing { value, owner } if !*owner => {
-                        *owner = true;
-                        Some(Arc::clone(value))
+                    SlotState::Closing { value, teardown } => {
+                        break (Arc::clone(value), teardown.clone());
                     }
-                    SlotState::Building { .. } | SlotState::Closing { .. } => None,
-                    SlotState::Closed => return,
+                    SlotState::Building { .. } if observed.is_none() => {}
+                    SlotState::Building { .. } | SlotState::Closed => return,
                 }
-            };
-            let Some(resource) = resource else {
-                notified.await;
-                continue;
-            };
-            let guard = CloseGuard::new(self);
-            let close_resource = close
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("close operation was already consumed"));
-            if let Ok(close_resource) = close_resource {
-                close_resource(resource).await;
             }
-            guard.complete();
-            return;
+            notified.await;
+        };
+        self.finish_close(value, teardown).await;
+    }
+}
+
+pub(crate) struct SessionFailure<T> {
+    session: std::sync::Weak<T>,
+    error: anyhow::Error,
+}
+
+impl<T: 'static> SessionFailure<T> {
+    pub(crate) fn new(session: Arc<T>, error: anyhow::Error) -> Self {
+        Self {
+            session: Arc::downgrade(&session),
+            error,
         }
+    }
+
+    pub(crate) fn session(error: &anyhow::Error) -> Option<Arc<T>> {
+        error
+            .chain()
+            .find_map(|source| source.downcast_ref::<Self>())
+            .and_then(|failure| failure.session.upgrade())
+    }
+}
+
+impl<T> std::fmt::Debug for SessionFailure<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.error, formatter)
+    }
+}
+
+impl<T> std::fmt::Display for SessionFailure<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+impl<T> std::error::Error for SessionFailure<T> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
     }
 }
 

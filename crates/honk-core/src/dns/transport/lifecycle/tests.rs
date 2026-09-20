@@ -169,18 +169,20 @@ async fn builder_error_is_fanned_out_to_waiters() {
 async fn close_is_idempotent() {
     // Given
     let slot = LifecycleSlot::new();
-    let closes = AtomicUsize::new(0);
+    let closes = Arc::new(AtomicUsize::new(0));
     slot.acquire(|| async { Ok::<_, anyhow::Error>(5_u8) })
         .await
         .expect("resource");
 
     // When
-    slot.close(|_| async {
-        closes.fetch_add(1, Ordering::SeqCst);
+    let first_closes = Arc::clone(&closes);
+    slot.close(move |_| async move {
+        first_closes.fetch_add(1, Ordering::SeqCst);
     })
     .await;
-    slot.close(|_| async {
-        closes.fetch_add(1, Ordering::SeqCst);
+    let second_closes = Arc::clone(&closes);
+    slot.close(move |_| async move {
+        second_closes.fetch_add(1, Ordering::SeqCst);
     })
     .await;
 
@@ -223,46 +225,210 @@ async fn repeated_builder_interruption_never_leaves_a_stale_slot() {
 }
 
 #[tokio::test]
-async fn cancelled_close_owner_allows_waiting_close_to_finish() {
-    // Given
-    let slot = Arc::new(LifecycleSlot::new());
-    slot.acquire(|| async { Ok::<_, anyhow::Error>(17_u8) })
+async fn cancelled_close_preserves_cleanup_for_waiting_close() {
+    let slot = LifecycleSlot::new();
+    let resource = slot
+        .acquire(|| async { Ok::<_, anyhow::Error>(AtomicUsize::new(0)) })
         .await
         .expect("resource");
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let slot_for_owner = Arc::clone(&slot);
-    let owner = tokio::spawn(async move {
-        slot_for_owner
-            .close(|_| async move {
-                let _ = started_tx.send(());
-                std::future::pending::<()>().await;
-            })
-            .await;
-    });
-    started_rx.await.expect("close owner started");
-    let closes = Arc::new(AtomicUsize::new(0));
-    let slot_for_waiter = Arc::clone(&slot);
-    let closes_for_waiter = Arc::clone(&closes);
-    let waiter = tokio::spawn(async move {
-        slot_for_waiter
-            .close(|_| async move {
-                closes_for_waiter.fetch_add(1, Ordering::SeqCst);
-            })
-            .await;
-    });
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let mut first = Box::pin(slot.close(|resource| async move {
+        release_rx.await.expect("release original cleanup");
+        resource.fetch_add(1, Ordering::SeqCst);
+    }));
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    let mut second = Box::pin(slot.close(|_| async {
+        panic!("a second closer must not replace the original cleanup");
+    }));
+    assert!(futures::poll!(second.as_mut()).is_pending());
 
-    // When
-    owner.abort();
-    let _ = owner.await;
-    tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+    drop(first);
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    release_tx.send(()).expect("original cleanup retained");
+    tokio::time::timeout(Duration::from_secs(1), second)
         .await
-        .expect("waiting close resumed")
-        .expect("waiting close task");
+        .expect("waiting close finishes original cleanup");
 
-    // Then
-    assert_eq!(closes.load(Ordering::SeqCst), 1);
+    assert_eq!(resource.load(Ordering::SeqCst), 1);
     assert_eq!(slot.close_count(), 1);
     assert_eq!(slot.state(), LifecycleState::Closed);
+}
+
+#[tokio::test]
+async fn cancelled_close_allows_acquire_to_finish_original_teardown() {
+    let slot = LifecycleSlot::new();
+    let resource = slot
+        .acquire(|| async { Ok::<_, anyhow::Error>(AtomicUsize::new(0)) })
+        .await
+        .expect("resource");
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let mut closing = Box::pin(slot.close(|resource| async move {
+        release_rx.await.expect("release original cleanup");
+        resource.store(1, Ordering::SeqCst);
+    }));
+    assert!(futures::poll!(closing.as_mut()).is_pending());
+    drop(closing);
+
+    let mut acquiring = Box::pin(slot.acquire(|| async {
+        assert_eq!(resource.load(Ordering::SeqCst), 1, "cleanup precedes build");
+        Ok::<_, anyhow::Error>(AtomicUsize::new(0))
+    }));
+    assert!(futures::poll!(acquiring.as_mut()).is_pending());
+    release_tx.send(()).expect("original cleanup retained");
+    let replacement = tokio::time::timeout(Duration::from_secs(1), acquiring)
+        .await
+        .expect("ordinary acquire resumes teardown")
+        .expect("replacement");
+
+    assert!(!Arc::ptr_eq(&resource, &replacement));
+    assert_eq!(resource.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement.load(Ordering::SeqCst), 0);
+    assert_eq!(slot.init_count(), 2);
+    assert_eq!(slot.close_count(), 1);
+}
+
+#[tokio::test]
+async fn retained_failure_does_not_keep_driver_alive() {
+    use super::super::owned_task::OwnedTask;
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let (started, running) = tokio::sync::oneshot::channel();
+    let slot = LifecycleSlot::new();
+    let session = slot
+        .acquire(|| async {
+            Ok(OwnedTask::spawn(
+                async move {
+                    started.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                },
+                Arc::clone(&active),
+            ))
+        })
+        .await
+        .unwrap();
+    running.await.unwrap();
+    let error = anyhow::Error::new(SessionFailure::new(
+        session,
+        std::io::Error::from(std::io::ErrorKind::ConnectionReset).into(),
+    ));
+    drop(slot);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while active.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retaining an error must not retain its driver");
+    assert_eq!(
+        error
+            .root_cause()
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .kind(),
+        std::io::ErrorKind::ConnectionReset
+    );
+    assert!(SessionFailure::<OwnedTask>::session(&error).is_none());
+}
+
+#[tokio::test]
+async fn stale_retirement_cannot_close_a_replacement() {
+    let slot = LifecycleSlot::new();
+    let original = slot
+        .acquire(|| async { Ok::<_, anyhow::Error>(AtomicUsize::new(0)) })
+        .await
+        .expect("original");
+    let failure = anyhow::Error::new(SessionFailure::new(
+        Arc::clone(&original),
+        anyhow::Error::new(honk_outbound::proxy::PacketRejection::Capacity)
+            .context("query refused"),
+    ));
+    let failure = anyhow::Error::new(SharedError::new(failure)).context("upstream exchange");
+    assert!(honk_outbound::proxy::is_packet_rejection(&failure));
+
+    slot.retire(&original, |resource| async move {
+        resource.fetch_add(1, Ordering::SeqCst);
+    })
+    .await;
+    let observed = SessionFailure::<AtomicUsize>::session(&failure).expect("failed session");
+    let replacement = slot
+        .acquire(|| async { Ok::<_, anyhow::Error>(AtomicUsize::new(0)) })
+        .await
+        .expect("replacement");
+
+    slot.retire(&observed, |resource| async move {
+        resource.fetch_add(1, Ordering::SeqCst);
+    })
+    .await;
+    let current = slot
+        .acquire(|| async { panic!("replacement must remain available") })
+        .await
+        .expect("current session");
+    assert!(Arc::ptr_eq(&current, &replacement));
+    assert_eq!(replacement.load(Ordering::SeqCst), 0);
+    assert_eq!(original.load(Ordering::SeqCst), 1);
+    assert_eq!(slot.close_count(), 1);
+}
+
+#[tokio::test]
+async fn stale_retirement_does_not_wait_for_another_build() {
+    let slot = LifecycleSlot::new();
+    let original = slot
+        .acquire(|| async { Ok::<_, anyhow::Error>(1_u8) })
+        .await
+        .expect("original");
+    slot.retire(&original, |_| async {}).await;
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let mut building = Box::pin(slot.acquire(|| async move {
+        release_rx.await.expect("release replacement build");
+        Ok::<_, anyhow::Error>(2_u8)
+    }));
+    assert!(futures::poll!(building.as_mut()).is_pending());
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        slot.retire(&original, |_| async { panic!("cannot retire a builder") }),
+    )
+    .await
+    .expect("stale retirement does not wait for a different build");
+    release_tx.send(()).expect("release replacement");
+    assert_eq!(*building.await.expect("replacement"), 2);
+    assert_eq!(slot.close_count(), 1);
+}
+
+#[tokio::test]
+async fn concurrent_closer_cannot_close_a_replacement() {
+    let slot = LifecycleSlot::new();
+    let original = slot
+        .acquire(|| async { Ok::<_, anyhow::Error>(AtomicUsize::new(0)) })
+        .await
+        .expect("original");
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let mut first = Box::pin(slot.close(|resource| async move {
+        release_rx.await.expect("release original cleanup");
+        resource.fetch_add(1, Ordering::SeqCst);
+    }));
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    let mut second = Box::pin(slot.close(|resource| async move {
+        resource.fetch_add(1, Ordering::SeqCst);
+    }));
+    assert!(futures::poll!(second.as_mut()).is_pending());
+
+    release_tx.send(()).expect("release original");
+    first.await;
+    let replacement = slot
+        .acquire(|| async { Ok::<_, anyhow::Error>(AtomicUsize::new(0)) })
+        .await
+        .expect("replacement");
+    second.await;
+
+    let current = slot
+        .acquire(|| async { panic!("replacement must remain available") })
+        .await
+        .expect("current session");
+    assert!(Arc::ptr_eq(&current, &replacement));
+    assert_eq!(original.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement.load(Ordering::SeqCst), 0);
+    assert_eq!(slot.close_count(), 1);
 }
 async fn assert_close_excludes_inflight_return() {
     // Given

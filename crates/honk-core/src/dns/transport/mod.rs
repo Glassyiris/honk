@@ -33,7 +33,7 @@ mod tests_proto;
 use body::{DnsMessageBody, doh_content_length};
 #[cfg(test)]
 use body::{DnsMessageTooLarge, MAX_DNS_MESSAGE_SIZE};
-use doh_message::{build_doh_request, finish_doh_response};
+use doh_message::{build_doh_request, check_doh_status, finish_doh_response};
 use idle_pool::{IdlePoolState, close_idle_pool, idle_pool_exchange};
 use quic::{SharedQuicEndpoint, dns_quic_config, quic_connect_endpoint};
 use retry::exchange_with_retry;

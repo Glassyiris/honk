@@ -217,9 +217,39 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 
 直连上游 socket 带 bypass mark，使其流量不会重新进入透明拦截。主机名 endpoint 通过 generation 捕获的 bootstrap resolver 解析；拨号从不依赖 honk 被拦截的 resolver 路径。
 
-拨号/TLS/QUIC/HTTP session 建立使用 dial/handshake timeout，请求/响应交换使用独立的 query timeout。一次查询尝试只有一个绝对交换 deadline。每个 transport 失败后最多重试一次，并在需要时重置无效的可复用 session，因此总查询工作有界。Transport slot 对并发初始化执行 singleflight，并只分配一个 closer。池关闭先停止准入并等待已准入交换，然后关闭空闲资源，显式 join 每个 receive 或协议 driver task。
+拨号/TLS/QUIC/HTTP session 建立使用 dial/handshake timeout，请求/响应交换使用独立的 query timeout。一次查询尝试只有一个绝对交换 deadline。每个 transport 失败后最多重试一次，并在需要时重置无效的可复用 session，因此总查询工作有界。Transport slot 对并发初始化执行 singleflight，并为每个关闭中的资源保留唯一的 teardown future。池关闭先停止准入并等待已准入交换，然后关闭空闲资源，显式 join 每个 receive 或协议 driver task。
+
+DoH 与 DoH3 在分配或读取响应体前判定 HTTP 状态。2xx/5xx 之外的状态、
+不足 DNS 头部长度的响应体，以及超过 DNS 大小上限的响应，不重置或重试
+该 session；5xx 与传输错误保留一次查询级 reset/retry，typed packet refusal
+仍为终局拒绝。已关闭的 sender 在使用前刷新；`send_request` 发现的 HTTP/3
+GOAWAY 由外层重试所有者处理，不在单次查询的可取消 timeout 内关闭 session，
+也不增加嵌套查询尝试。重试决策由 `transport/retry.rs` 管理。
+
+DoH、DoH3 和 DoQ 的失败只保留弱引用会话见证，错误对象本身不会延长 driver
+的生命周期。退役在 slot 锁内核对身份，因此迟到的失败不能关闭替代 session。
+取消 closer 后，teardown
+仍保留在 slot 中，后续 acquire 或 close 会继续同一份清理，完成后才重建。
+Shutdown 仍关闭当前资源，不依赖最后使用它的是哪个查询。
+销毁最后一个 owner 仍会中止其 driver；任务计数也覆盖首次 poll 之前的取消。
 
 直连 UDP 为每个查询分配由 CSPRNG 选择的新 16-bit ID，接收时同时校验 ID 与 question，恢复调用方 ID，并将退役 ID 隔离三秒。因此延迟报文无法在 ID 复用后满足另一个问题。
+
+UDP 冷路径和 cached-current 快捷路径使用同一取池入口，在交换前替换已关闭
+或已停止的 socket，不把地址尝试浪费在旧池上。Linux 下由
+`transport/udp_pool/error_queue.rs` 读取 `IP_RECVERR`/`IPV6_RECVERR` 提供的
+原始报文；ERROR 就绪位与普通报文的 READABLE 就绪位由不同消费者处理。
+只有完整匹配 DNS ID 和 question 的错误引用才能结束对应请求，并保留原始
+I/O 错误原因。过短、已退役或不相关的引用不影响其他请求；归属判断仍受与
+普通响应相同的有限 ID 隔离窗口约束。没有可用引用的接收错误让请求继续受
+自身 deadline 限制，不支持 error queue 的平台也采取此保守行为。
+send 系统调用失败仍按既有行为把原始错误返回当前交换，不宣称对 send 错误
+实现了引用归属，也不在该交换内重新发送；发送与等待响应共用一个绝对
+deadline。只有 socket-fatal 接收错误会停止池并结束其余等待者；重复目的地
+错误本身不证明 socket 已死亡。
+
+透明 DNS 回复 socket 遇到目的地相关发送错误时也保持复用；其他发送错误
+保留原有的一次替换／重试路径。独立 `dns.bind` 回复仍使用原 listener socket。
 
 ## 路由投影
 
