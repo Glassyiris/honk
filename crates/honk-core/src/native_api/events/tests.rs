@@ -18,11 +18,7 @@ fn subscribe(hub: &Arc<EventHub>, filter: Filter, cursor: Option<&str>) -> Subsc
 }
 
 fn publish_flow(hub: &EventHub, id: &str, revision: u64) {
-    hub.publish(
-        "flow.updated",
-        json!({"resource_id": id, "revision": revision}),
-        Some(id),
-    );
+    hub.flow_updated(id, revision);
 }
 
 async fn next(stream: &mut Subscription) -> String {
@@ -89,6 +85,78 @@ async fn fresh_ready_then_replay_ready_and_live_have_no_gap() {
 }
 
 #[tokio::test]
+async fn live_flow_updates_coalesce_at_the_tail_without_rewriting_replay() {
+    let hub = hub();
+    let mut live = subscribe(&hub, all(), None);
+    let ready = next(&mut live).await;
+    publish_flow(&hub, "flow-a", 1);
+    publish_flow(&hub, "flow-b", 1);
+    hub.publish(
+        "flow.gap",
+        json!({"resource_id":"flow-a","reason":"buffer_overflow","dropped_records":"1"}),
+        Some("flow-a"),
+    );
+    hub.publish("runtime.updated", json!({}), None);
+    publish_flow(&hub, "flow-a", 2);
+
+    assert_eq!(data(&next(&mut live).await)["resource_id"], "flow-b");
+    assert!(next(&mut live).await.starts_with("event: flow.gap\n"));
+    let runtime = next(&mut live).await;
+    assert!(runtime.starts_with("event: runtime.updated\n"));
+    let latest = next(&mut live).await;
+    assert_eq!(data(&latest)["revision"], 2);
+    let sequence = |frame: &str| {
+        let bytes = URL_SAFE_NO_PAD.decode(cursor(frame)).unwrap();
+        u64::from_be_bytes(bytes[..8].try_into().unwrap())
+    };
+    assert!(sequence(&runtime) < sequence(&latest));
+    assert!(live.next().now_or_never().is_none());
+    drop(live);
+
+    let mut resumed = subscribe(&hub, all(), Some(cursor(&ready)));
+    publish_flow(&hub, "flow-a", 3);
+    publish_flow(&hub, "flow-a", 4);
+    assert_eq!(data(&next(&mut resumed).await)["revision"], 1);
+    assert_eq!(data(&next(&mut resumed).await)["resource_id"], "flow-b");
+    assert!(next(&mut resumed).await.starts_with("event: flow.gap\n"));
+    assert_eq!(next(&mut resumed).await, runtime);
+    assert_eq!(next(&mut resumed).await, latest);
+    let ready = next(&mut resumed).await;
+    assert!(ready.starts_with("event: stream.ready\n"));
+    let last = next(&mut resumed).await;
+    assert_eq!(data(&last)["revision"], 4);
+    assert!(sequence(&ready) < sequence(&last));
+    assert!(resumed.next().now_or_never().is_none());
+    drop(resumed);
+
+    publish_flow(&hub, "flow-a", 5);
+    let mut replay = subscribe(&hub, all(), Some(cursor(&last)));
+    assert_eq!(data(&next(&mut replay).await)["revision"], 5);
+    assert!(next(&mut replay).await.starts_with("event: stream.ready\n"));
+}
+
+#[tokio::test]
+async fn queued_flow_replacement_preserves_capacity_for_latest_revision() {
+    let hub = hub();
+    let mut stream = subscribe(&hub, all(), None);
+    next(&mut stream).await;
+    for index in 0..CLIENT_QUEUE {
+        publish_flow(&hub, &format!("flow-{index}"), 1);
+    }
+    for revision in 2..=100 {
+        publish_flow(&hub, "flow-0", revision);
+    }
+    for index in 1..CLIENT_QUEUE {
+        assert_eq!(
+            data(&next(&mut stream).await)["resource_id"],
+            format!("flow-{index}")
+        );
+    }
+    assert_eq!(data(&next(&mut stream).await)["revision"], 100);
+    assert!(stream.next().now_or_never().is_none());
+}
+
+#[tokio::test]
 async fn cursors_reject_changed_filters_instance_and_forgery() {
     let hub = hub();
     let mut stream = subscribe(&hub, all(), None);
@@ -130,8 +198,8 @@ async fn queue_overflow_discards_buffered_frames_and_wakes_receiver() {
     let mut stream = subscribe(&hub, all(), None);
     next(&mut stream).await;
     assert!(stream.next().now_or_never().is_none());
-    for revision in 1..=CLIENT_QUEUE as u64 + 1 {
-        publish_flow(&hub, "flow-a", revision);
+    for index in 0..=CLIENT_QUEUE {
+        publish_flow(&hub, &format!("flow-{index}"), 1);
     }
     assert_eq!(
         stream.next().await.unwrap().unwrap_err().kind(),
@@ -140,8 +208,8 @@ async fn queue_overflow_discards_buffered_frames_and_wakes_receiver() {
     assert!(stream.next().await.is_none());
 
     let mut before_ready = subscribe(&hub, all(), None);
-    for revision in 1..=CLIENT_QUEUE as u64 + 1 {
-        publish_flow(&hub, "flow-a", revision);
+    for index in 0..=CLIENT_QUEUE {
+        publish_flow(&hub, &format!("flow-{index}"), 1);
     }
     assert!(before_ready.next().await.unwrap().is_err());
 }
@@ -159,8 +227,8 @@ async fn body_drop_releases_client_capacity_even_before_polling() {
     );
     bodies.pop();
     let replacement = Body::from_stream(subscribe(&hub, all(), None));
-    for revision in 1..=CLIENT_QUEUE as u64 + 1 {
-        publish_flow(&hub, "flow-a", revision);
+    for index in 0..=CLIENT_QUEUE {
+        publish_flow(&hub, &format!("flow-{index}"), 1);
     }
     assert_eq!(
         hub.subscribe(all(), None, &request_id())
@@ -231,22 +299,14 @@ async fn heartbeat_has_no_cursor_and_shutdown_ends_pending_clients() {
 }
 
 #[tokio::test]
-async fn payloads_preserve_integer_contracts_and_omit_untrusted_fields() {
+async fn payloads_enforce_identifier_and_integer_contracts() {
     let hub = hub();
     let mut stream = subscribe(&hub, all(), None);
     let ready = next(&mut stream).await;
-    hub.publish(
-        "flow.updated",
-        json!({
-            "resource_id": "flow-a", "revision": MAX_SAFE_UINT,
-            "href": "https://user:password@private.invalid", "error": "private error",
-        }),
-        Some("flow-a"),
-    );
+    publish_flow(&hub, "flow-a", MAX_SAFE_UINT);
     let event = data(&next(&mut stream).await);
     assert_eq!(event["revision"], MAX_SAFE_UINT);
     assert_eq!(event["href"], "/api/v1/flows/flow-a");
-    assert!(event.get("error").is_none());
     hub.publish("flow.gap", json!({
         "resource_id": null, "reason": "buffer_overflow", "dropped_records": u64::MAX.to_string(),
     }), None);
@@ -264,6 +324,18 @@ async fn payloads_preserve_integer_contracts_and_omit_untrusted_fields() {
         "resource_id": null, "reason": "buffer_overflow", "dropped_records": "18446744073709551616",
     }), None);
     assert!(stream.next().await.unwrap().is_err());
+
+    for (flow_id, revision) in [
+        ("", 1),
+        ("https://user:password@private.invalid", 1),
+        ("flow-a", 0),
+    ] {
+        let mut stream = subscribe(&hub, all(), None);
+        let ready = next(&mut stream).await;
+        publish_flow(&hub, flow_id, revision);
+        assert!(stream.next().await.unwrap().is_err());
+        assert_expired(&hub, all(), cursor(&ready));
+    }
 }
 
 #[tokio::test]

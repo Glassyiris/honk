@@ -314,14 +314,8 @@ impl FlowStore {
     }
 
     fn updated(&self, record: &Record) {
-        self.events.publish(
-            "flow.updated",
-            json!({
-                "resource_id": record.id(), "revision": record.summary.revision,
-                "href": format!("/api/v1/flows/{}", record.id())
-            }),
-            Some(record.id()),
-        );
+        self.events
+            .flow_updated(record.id(), record.summary.revision);
     }
 
     fn gap(&self, store: &Store, id: Option<&str>, reason: &'static str) {

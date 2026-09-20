@@ -227,6 +227,33 @@ impl EventHub {
         self.publish_record(payload, flow_id, None);
     }
 
+    pub(crate) fn flow_updated(&self, flow_id: &str, revision: u64) {
+        #[derive(serde::Serialize)]
+        struct Update<'a> {
+            instance_id: &'a str,
+            observed_at: String,
+            resource_id: &'a str,
+            revision: u64,
+            href: String,
+        }
+        let payload = identifier(flow_id)
+            .filter(|_| (1..=MAX_SAFE_UINT).contains(&revision))
+            .map(|resource_id| {
+                let update = Update {
+                    instance_id: &self.instance_id,
+                    observed_at: timestamp(SystemTime::now()),
+                    resource_id,
+                    revision,
+                    href: format!("/api/v1/flows/{resource_id}"),
+                };
+                (
+                    2,
+                    Bytes::from(serde_json::to_vec(&update).expect("event data is serializable")),
+                )
+            });
+        self.publish_record(payload, Some(flow_id), None);
+    }
+
     pub(super) fn publish_log(&self, level: u8, target: &'static str, payload: Bytes) {
         self.publish_record(Some((0, payload)), None, Some((level, target)));
     }
@@ -290,6 +317,15 @@ impl EventHub {
             if subscriber.closed || !subscriber.filter.matches(&record) {
                 continue;
             }
+            if record.kind == 2
+                && let Some(index) = subscriber
+                    .queue
+                    .iter()
+                    .position(|queued| queued.kind == 2 && queued.flow_id == record.flow_id)
+            {
+                // Reappend at the tail: replacing in place would reorder signed cursors.
+                subscriber.queue.remove(index);
+            }
             if subscriber.queue.len() == CLIENT_QUEUE {
                 subscriber.close();
             } else {
@@ -351,22 +387,12 @@ impl EventHub {
             1 if flow_id.is_none() => {
                 object.insert("href".into(), json!("/api/v1/runtime"));
             }
-            2 => {
-                let id = identifier(data.get("resource_id")?)?;
-                let revision = data.get("revision")?.as_u64()?;
-                if flow_id != Some(id) || !(1..=MAX_SAFE_UINT).contains(&revision) {
-                    return None;
-                }
-                object.insert("resource_id".into(), json!(id));
-                object.insert("revision".into(), json!(revision));
-                object.insert("href".into(), json!(format!("/api/v1/flows/{id}")));
-            }
             3 => {
                 let resource = data.get("resource_id")?;
                 let id = if resource.is_null() {
                     None
                 } else {
-                    Some(identifier(resource)?)
+                    Some(identifier(resource.as_str()?)?)
                 };
                 let reason = data.get("reason")?.as_str()?;
                 let dropped = data.get("dropped_records")?;
@@ -382,7 +408,7 @@ impl EventHub {
                 object.insert("dropped_records".into(), dropped.clone());
             }
             4 if flow_id.is_none() => {
-                let id = identifier(data.get("resource_id")?)?;
+                let id = identifier(data.get("resource_id")?.as_str()?)?;
                 let status = data.get("status")?.as_str()?;
                 if !["queued", "running", "succeeded", "failed"].contains(&status) {
                     return None;
@@ -393,7 +419,7 @@ impl EventHub {
             }
             5 if flow_id.is_none() => {
                 for field in ["previous_generation_id", "generation_id"] {
-                    object.insert(field.into(), json!(identifier(data.get(field)?)?));
+                    object.insert(field.into(), json!(identifier(data.get(field)?.as_str()?)?));
                 }
             }
             _ => return None,
@@ -660,8 +686,7 @@ fn frame(kind: &str, cursor: &str, payload: &[u8]) -> Bytes {
     Bytes::from(bytes)
 }
 
-fn identifier(value: &Value) -> Option<&str> {
-    let id = value.as_str()?;
+fn identifier(id: &str) -> Option<&str> {
     (!id.is_empty()
         && id.len() <= 256
         && id

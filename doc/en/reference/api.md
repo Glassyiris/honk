@@ -94,6 +94,8 @@ Use streaming fetch with Bearer and `Accept: text/event-stream`; browser EventSo
 
 Published events are `stream.ready`, `runtime.updated`, `flow.updated`, `flow.gap`, `generation.changed` and `operation.updated`. Operation events reflect actual admitted work, not only reloads; generation events originate at accepted publication, not request receipt. Events contain bounded safe IDs/state, not packet bodies or raw configuration. Flow/event retention is memory-only, not a durable log.
 
+`flow.updated` is an invalidation hint: fetch its `href` for the latest retained revision. Each live client queue keeps only the newest pending hint for a given flow, appended at its new sequence position; revisions may jump, but delivered cursors remain ordered. Publication is immediate, including terminal updates, with no batching timer. The replay ring still records every published notification even without subscribers, and replay is not coalesced. Other event kinds and logs are never coalesced. Distinct-flow or other nonreplaceable events still disconnect a full live queue. Flow data, revisions and captured trace steps are unchanged.
+
 ### Outbound counters and telemetry (M5)
 
 `runtime/outbounds` retains `kind` (`builtin`, `node` or `group`) alongside `name`: names can collide across kinds, so do not key rows by name alone. Cumulative connections, bytes and errors are full 64-bit decimal strings; active connections are safe JSON integers. Counters share the engine's existing statistics lifetime and survive reload, rather than resetting with a dashboard or listener request.
