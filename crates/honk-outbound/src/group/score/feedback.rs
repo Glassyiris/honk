@@ -238,11 +238,32 @@ impl ScoreReporter {
         self.transfer_at(bytes, 0, Instant::now());
     }
 
+    /// Record a successful send whose receiver can run before its completion callback.
+    /// `started_at` must follow core send serialization checks, not source-gate queue entry.
+    pub fn tx_completed(&self, bytes: u64, started_at: Instant) {
+        self.transfer_with_send_start_at(bytes, 0, Some(started_at), None);
+    }
+
+    #[cfg(test)]
+    pub(super) fn tx_completed_at(&self, bytes: u64, started_at: Instant, now: Instant) {
+        self.transfer_with_send_start_at(bytes, 0, Some(started_at), Some(now));
+    }
+
     pub fn rx(&self, bytes: u64) {
         self.transfer_at(0, bytes, Instant::now());
     }
 
     pub(super) fn transfer_at(&self, tx: u64, rx: u64, now: Instant) {
+        self.transfer_with_send_start_at(tx, rx, None, Some(now));
+    }
+
+    fn transfer_with_send_start_at(
+        &self,
+        tx: u64,
+        rx: u64,
+        send_started_at: Option<Instant>,
+        now: Option<Instant>,
+    ) {
         if tx == 0 && rx == 0 {
             return;
         }
@@ -250,6 +271,9 @@ impl ScoreReporter {
         if progress.finished {
             return;
         }
+        // A receive can publish while this completion waits for the reporter lock.
+        let now = now.unwrap_or_else(Instant::now);
+        let send_started_at = send_started_at.filter(|at| tx > 0 && progress.tx == 0 && *at <= now);
         progress.tx = progress.tx.saturating_add(tx);
         progress.rx = progress.rx.saturating_add(rx);
         if self.shared.feedback.source != ScoreSource::Traffic {
@@ -259,27 +283,34 @@ impl ScoreReporter {
             progress.last_rx_at = Some(progress.last_rx_at.map_or(now, |at| at.max(now)));
         }
         if tx > 0 {
-            progress.first_tx_at = Some(progress.first_tx_at.map_or(now, |at| at.min(now)));
+            let at = send_started_at.unwrap_or(now);
+            progress.first_tx_at = Some(progress.first_tx_at.map_or(at, |seen| seen.min(at)));
         }
-        if rx > 0
+        let rx_at = if rx > 0 {
+            Some(now)
+        } else {
+            send_started_at.and_then(|started| {
+                progress
+                    .last_rx_at
+                    .filter(|at| *at >= started && *at <= now)
+            })
+        };
+        if let Some(rx_at) = rx_at
             && progress
                 .setup
-                .is_some_and(|setup| now >= self.shared.started + setup)
-            && progress.first_tx_at.is_some_and(|at| now >= at)
+                .is_some_and(|setup| rx_at >= self.shared.started + setup)
+            && progress.first_tx_at.is_some_and(|at| rx_at >= at)
             && self.shared.feedback.context.target.is_some()
         {
-            progress.eligible_rx_at = Some(progress.eligible_rx_at.map_or(now, |at| at.max(now)));
+            progress.eligible_rx_at =
+                Some(progress.eligible_rx_at.map_or(rx_at, |at| at.max(rx_at)));
             if progress
                 .published_rx_at
                 .is_none_or(|at| now.saturating_duration_since(at) >= LIVE_RX_INTERVAL)
             {
-                // Bound scorer-lock traffic independently of packet rate; no timer turns silence into progress.
+                // A confirmed send can reconcile an already delivered reply; neither callback invents RX time.
                 progress.published_rx_at = Some(now);
-                self.observe(
-                    Observation::BusinessProgress { rx_at: now },
-                    now,
-                    &mut progress,
-                );
+                self.observe(Observation::BusinessProgress { rx_at }, now, &mut progress);
             }
         }
         if now.saturating_duration_since(progress.window_start) > MAX_THROUGHPUT_DURATION {

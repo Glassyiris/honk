@@ -427,7 +427,9 @@ impl UdpEndpoint {
 
     #[cfg(all(test, feature = "rprx"))]
     async fn send_packet(&self, data: &[u8], confirmed: bool) -> io::Result<()> {
-        self.send_packet_with_admission(data, confirmed, None).await
+        self.send_packet_with_admission(data, confirmed, None)
+            .await
+            .map(|_| ())
     }
 
     async fn send_packet_with_admission(
@@ -435,16 +437,21 @@ impl UdpEndpoint {
         data: &[u8],
         confirmed: bool,
         admitted: Option<&AtomicBool>,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<Instant>> {
         #[cfg(not(feature = "rprx"))]
         let _ = admitted;
         match &self.transport {
             EndpointTransport::Flow(transport) if confirmed => {
-                transport.send_packet_confirmed(data).await
+                transport.send_packet_confirmed(data).await.map(|()| None)
             }
-            EndpointTransport::Flow(transport) => transport.send_packet(data).await,
+            EndpointTransport::Flow(transport) => transport.send_packet(data).await.map(|()| None),
             #[cfg(feature = "rprx")]
-            EndpointTransport::Source(source) => source.send(data, admitted).await,
+            EndpointTransport::Source(source) => {
+                let record_start = self.score_reporter.is_some()
+                    && !data.is_empty()
+                    && self.upload.load(Ordering::Relaxed) == 0;
+                source.send(data, admitted, record_start).await
+            }
         }
     }
 

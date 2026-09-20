@@ -65,6 +65,393 @@ fn prepared(feedback: &ScoreFeedback, at: Instant) -> ScoreReporter {
 }
 
 #[test]
+fn confirmed_sends_reconcile_four_live_replies_at_their_receive_time() {
+    let nodes = [node("confirmed")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("confirmed.example", IpVersion::V4);
+    let now = Instant::now();
+    let started = now + Duration::from_millis(250);
+    let received = now + Duration::from_millis(500);
+    let completed = now + Duration::from_secs(1);
+    let feedback = manager
+        .feedback_for_group_node("score", nodes[0].id, target.clone())
+        .unwrap();
+    let reporters: Vec<_> = (0..4).map(|_| feedback.start_at(now)).collect();
+    for reporter in &reporters {
+        reporter.setup_succeeded_at(now);
+        reporter.transfer_at(0, 1, received);
+    }
+    for reporter in &reporters[..3] {
+        reporter.tx_completed_at(1, started, completed);
+    }
+    assert_eq!(
+        availability_at(&manager, &nodes, &target, completed).state,
+        ScoreVerificationState::Provisional
+    );
+    reporters[3].tx_completed_at(1, started, completed);
+    let report = availability_at(&manager, &nodes, &target, completed);
+    assert_eq!(report.state, ScoreVerificationState::ObservedUsable);
+    assert_eq!(report.evidence_age_ms, Some(500));
+    assert_eq!(report.valid_for_ms, Some(59_500));
+    let state = manager.score_state();
+    let score = score_snapshot(
+        &state.inner.lock(),
+        "score",
+        &target,
+        nodes[0].id,
+        completed,
+    );
+    assert_eq!(score.completed, 0.0);
+    assert_eq!(score.useful_completed, 0.0);
+    for reporter in &reporters {
+        reporter.finish_at(ScoreOutcome::Cancelled, true, completed);
+    }
+}
+
+#[test]
+fn confirmed_send_clones_and_settlement_do_not_duplicate_bytes_or_credit() {
+    let nodes = [node("confirmed-dedup")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("confirmed-dedup.example", IpVersion::V4);
+    let now = Instant::now();
+    let received = now + Duration::from_millis(500);
+    let completed = now + Duration::from_secs(1);
+    let feedback = manager
+        .feedback_for_group_node("score", nodes[0].id, target.clone())
+        .unwrap();
+    let reporters: Vec<_> = (0..3).map(|_| feedback.start_at(now)).collect();
+    for reporter in &reporters {
+        reporter.setup_succeeded_at(now);
+        reporter.first_response_at(received);
+        reporter.transfer_at(0, 65_536, received);
+        reporter.tx_completed_at(65_536, now, completed);
+        let clone = reporter.clone();
+        clone.tx_completed_at(1, completed, completed);
+        clone.finish_at(ScoreOutcome::Success, true, completed);
+        reporter.finish_at(ScoreOutcome::Success, true, completed);
+    }
+    assert_eq!(
+        availability_at(&manager, &nodes, &target, completed).state,
+        ScoreVerificationState::Provisional,
+        "completion, clones and terminal reports still represent only three flows"
+    );
+    let state = manager.score_state();
+    let score = score_snapshot(
+        &state.inner.lock(),
+        "score",
+        &target,
+        nodes[0].id,
+        completed,
+    );
+    assert_eq!(score.completed, 3.0);
+    assert_eq!(score.useful_completed, 3.0);
+    assert_eq!(score.target_performance.upload.value, Some(65_536.0));
+    assert_eq!(score.target_performance.download.value, Some(65_536.0));
+    assert_eq!(score.target_performance.response.value, Some(500.0));
+    let fourth = prepared(&feedback, completed);
+    fourth.transfer_at(0, 1, completed);
+    assert_eq!(
+        availability_at(&manager, &nodes, &target, completed).state,
+        ScoreVerificationState::ObservedUsable
+    );
+    fourth.finish_at(ScoreOutcome::Cancelled, true, completed);
+}
+
+struct CompletionCohort {
+    nodes: [Node; 1],
+    manager: GroupManager,
+    target: ScoreSelectionContext,
+    feedback: ScoreFeedback,
+}
+
+impl CompletionCohort {
+    fn new() -> Self {
+        let nodes = [node("completion-window")];
+        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+        let target = context("completion-window.example", IpVersion::V4);
+        let feedback = manager
+            .feedback_for_group_node("score", nodes[0].id, target.clone())
+            .unwrap();
+        Self {
+            nodes,
+            manager,
+            target,
+            feedback,
+        }
+    }
+
+    fn state_at(&self, at: Instant) -> ScoreVerificationState {
+        availability_at(&self.manager, &self.nodes, &self.target, at).state
+    }
+}
+
+#[test]
+fn confirmed_send_reconciliation_requires_a_closed_causal_window() {
+    use ScoreVerificationState::{ObservedUsable, Provisional};
+
+    for (label, start_ms, rx_ms, completed_ms, expected) in [
+        ("closed-boundary", 20, 20, 20, ObservedUsable),
+        ("rx-before-send", 31, 30, 40, Provisional),
+        ("rx-before-setup", 10, 19, 40, Provisional),
+        ("future-start", 41, 30, 40, Provisional),
+        ("future-rx", 20, 41, 40, Provisional),
+    ] {
+        let cohort = CompletionCohort::new();
+        let now = Instant::now();
+        let started = now + Duration::from_millis(start_ms);
+        let received = now + Duration::from_millis(rx_ms);
+        let completed = now + Duration::from_millis(completed_ms);
+        let reporters: Vec<_> = (0..4).map(|_| cohort.feedback.start_at(now)).collect();
+        for reporter in &reporters {
+            reporter.setup_succeeded_at(now + Duration::from_millis(20));
+            reporter.transfer_at(0, 1, received);
+            reporter.tx_completed_at(1, started, completed);
+        }
+        assert_eq!(
+            cohort.state_at(completed),
+            expected,
+            "completion case {label}"
+        );
+        for reporter in &reporters {
+            reporter.finish_at(ScoreOutcome::Success, true, completed);
+        }
+        assert_eq!(
+            cohort.state_at(completed),
+            expected,
+            "terminal settlement changed completion case {label}"
+        );
+    }
+}
+
+#[test]
+fn zero_tx_does_not_consume_the_first_positive_send() {
+    let cohort = CompletionCohort::new();
+    let now = Instant::now();
+    let started = now + Duration::from_millis(20);
+    let received = now + Duration::from_millis(30);
+    let completed = now + Duration::from_millis(40);
+    let reporters: Vec<_> = (0..4).map(|_| cohort.feedback.start_at(now)).collect();
+    for reporter in &reporters {
+        reporter.setup_succeeded_at(started);
+        reporter.transfer_at(0, 1, received);
+        reporter.tx_completed_at(0, started, completed);
+    }
+    assert_eq!(
+        cohort.state_at(completed),
+        ScoreVerificationState::Provisional
+    );
+    for reporter in &reporters {
+        reporter.tx_completed_at(1, started, completed);
+    }
+    assert_eq!(
+        cohort.state_at(completed),
+        ScoreVerificationState::ObservedUsable,
+        "zero bytes must not consume the first positive send"
+    );
+    for reporter in &reporters {
+        reporter.finish_at(ScoreOutcome::Success, true, completed);
+    }
+    assert_eq!(
+        cohort.state_at(completed),
+        ScoreVerificationState::ObservedUsable
+    );
+}
+
+#[test]
+fn ordinary_tx_first_prevents_later_send_completion_from_reconciling_old_rx() {
+    let cohort = CompletionCohort::new();
+    let now = Instant::now();
+    let started = now + Duration::from_millis(20);
+    let received = now + Duration::from_millis(30);
+    let completed = now + Duration::from_millis(40);
+    let reporters: Vec<_> = (0..4).map(|_| cohort.feedback.start_at(now)).collect();
+    for reporter in &reporters {
+        reporter.setup_succeeded_at(started);
+        reporter.transfer_at(0, 1, received);
+        reporter.transfer_at(1, 0, completed);
+        reporter.tx_completed_at(1, started, completed);
+    }
+    assert_eq!(
+        cohort.state_at(completed),
+        ScoreVerificationState::Provisional
+    );
+    for reporter in &reporters {
+        reporter.finish_at(ScoreOutcome::Success, true, completed);
+    }
+    assert_eq!(
+        cohort.state_at(completed),
+        ScoreVerificationState::Provisional
+    );
+}
+
+#[test]
+fn finished_reporters_ignore_late_send_completion_and_success_settlement() {
+    let cohort = CompletionCohort::new();
+    let now = Instant::now();
+    let started = now + Duration::from_millis(20);
+    let received = now + Duration::from_millis(30);
+    let completed = now + Duration::from_millis(40);
+    let reporters: Vec<_> = (0..4).map(|_| cohort.feedback.start_at(now)).collect();
+    for reporter in &reporters {
+        reporter.setup_succeeded_at(started);
+        reporter.transfer_at(0, 1, received);
+        reporter.finish_at(ScoreOutcome::Cancelled, true, completed);
+        reporter.tx_completed_at(1, started, completed);
+    }
+    assert_eq!(
+        cohort.state_at(completed),
+        ScoreVerificationState::Provisional
+    );
+    for reporter in &reporters {
+        reporter.finish_at(ScoreOutcome::Success, true, completed);
+    }
+    assert_eq!(
+        cohort.state_at(completed),
+        ScoreVerificationState::Provisional
+    );
+}
+
+#[test]
+fn future_start_rejects_reconciliation_but_still_counts_accepted_tx() {
+    let cohort = CompletionCohort::new();
+    let now = Instant::now();
+    let received = now + Duration::from_millis(30);
+    let completed = now + Duration::from_millis(40);
+    let started = now + Duration::from_millis(41);
+    let reporters: Vec<_> = (0..4).map(|_| cohort.feedback.start_at(now)).collect();
+    for reporter in &reporters {
+        reporter.setup_succeeded_at(now + Duration::from_millis(20));
+        reporter.transfer_at(0, 1, received);
+        reporter.tx_completed_at(1, started, completed);
+    }
+    assert_eq!(
+        cohort.state_at(completed),
+        ScoreVerificationState::Provisional
+    );
+    for reporter in &reporters {
+        reporter.finish_at(ScoreOutcome::Success, true, completed);
+    }
+    assert_eq!(
+        cohort.state_at(completed),
+        ScoreVerificationState::Provisional
+    );
+    let state = cohort.manager.score_state();
+    let score = score_snapshot(
+        &state.inner.lock(),
+        "score",
+        &cohort.target,
+        cohort.nodes[0].id,
+        completed,
+    );
+    assert_eq!(score.useful_completed, 4.0, "accepted TX still counts");
+}
+
+#[test]
+fn confirmed_sends_cannot_move_old_replies_across_failure_or_reload_fences() {
+    for reload in [false, true] {
+        let nodes = [node("completion-fence")];
+        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+        let target = context("completion-fence.example", IpVersion::V4);
+        let now = Instant::now() - Duration::from_secs(10);
+        let received = now + Duration::from_secs(1);
+        let feedback = manager
+            .feedback_for_group_node("score", nodes[0].id, target.clone())
+            .unwrap();
+        let reporters: Vec<_> = (0..4).map(|_| feedback.start_at(now)).collect();
+        for reporter in &reporters {
+            reporter.setup_succeeded_at(now);
+            reporter.transfer_at(0, 1, received);
+        }
+        if reload {
+            manager.publish_score_membership();
+        } else {
+            feedback.start_at(now).finish_at(
+                ScoreOutcome::Timeout,
+                true,
+                received + Duration::from_secs(1),
+            );
+        }
+        let completed = Instant::now() + Duration::from_secs(1);
+        for reporter in &reporters {
+            reporter.tx_completed_at(1, now, completed);
+        }
+        assert_eq!(
+            availability_at(&manager, &nodes, &target, completed).state,
+            ScoreVerificationState::Provisional,
+            "old reply crossed {} fence",
+            if reload { "reload" } else { "failure" }
+        );
+        let fresh = completed + Duration::from_secs(1);
+        for reporter in &reporters[..3] {
+            reporter.transfer_at(0, 1, fresh);
+        }
+        assert_eq!(
+            availability_at(&manager, &nodes, &target, fresh).state,
+            ScoreVerificationState::Provisional
+        );
+        reporters[3].transfer_at(0, 1, fresh);
+        assert_eq!(
+            availability_at(&manager, &nodes, &target, fresh).state,
+            ScoreVerificationState::ObservedUsable
+        );
+        for reporter in &reporters {
+            reporter.finish_at(ScoreOutcome::Cancelled, true, fresh);
+        }
+    }
+}
+
+#[test]
+fn delayed_send_completion_cannot_revive_or_bridge_an_expired_cohort() {
+    for (rx_second, completion_second) in [(1, 61), (59, 60)] {
+        let nodes = [node("delayed-completion")];
+        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+        let target = context("delayed-completion.example", IpVersion::V4);
+        let now = Instant::now();
+        let feedback = manager
+            .feedback_for_group_node("score", nodes[0].id, target.clone())
+            .unwrap();
+        for _ in 0..4 {
+            let reporter = prepared(&feedback, now);
+            reporter.transfer_at(0, 1, now);
+            reporter.finish_at(ScoreOutcome::Cancelled, true, now);
+        }
+        assert_eq!(
+            availability_at(&manager, &nodes, &target, now).state,
+            ScoreVerificationState::ObservedUsable
+        );
+        let received = now + Duration::from_secs(rx_second);
+        let completed = now + Duration::from_secs(completion_second);
+        let reporters: Vec<_> = (0..4).map(|_| feedback.start_at(now)).collect();
+        for reporter in &reporters {
+            reporter.setup_succeeded_at(now);
+            reporter.transfer_at(0, 1, received);
+            reporter.tx_completed_at(1, now, completed);
+        }
+        assert_eq!(
+            availability_at(&manager, &nodes, &target, completed).state,
+            ScoreVerificationState::Provisional,
+            "RX at {rx_second}s, completion at {completion_second}s"
+        );
+        let fresh = completed + Duration::from_secs(1);
+        for reporter in &reporters[..3] {
+            reporter.transfer_at(0, 1, fresh);
+        }
+        assert_eq!(
+            availability_at(&manager, &nodes, &target, fresh).state,
+            ScoreVerificationState::Provisional
+        );
+        reporters[3].transfer_at(0, 1, fresh);
+        assert_eq!(
+            availability_at(&manager, &nodes, &target, fresh).state,
+            ScoreVerificationState::ObservedUsable
+        );
+        for reporter in &reporters {
+            reporter.finish_at(ScoreOutcome::Cancelled, true, fresh);
+        }
+    }
+}
+
+#[test]
 fn continuous_rx_keeps_live_availability_but_idle_settlement_cannot_refresh_it() {
     let nodes = [node("live")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
@@ -297,6 +684,9 @@ fn neutral_settlement_flushes_throttled_eligible_rx_at_its_event_time() {
         reporter.transfer_at(0, 1, received);
     }
     let finished = now + Duration::from_secs(1);
+    for reporter in &reporters {
+        reporter.tx_completed_at(1, finished, finished);
+    }
     assert_eq!(
         availability_at(&manager, &nodes, &target, finished).state,
         ScoreVerificationState::Provisional

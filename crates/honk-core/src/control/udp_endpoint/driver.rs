@@ -762,14 +762,14 @@ async fn send_one(
         )),
     };
     let timed_out = match &sent {
-        Ok(Ok(())) => false,
+        Ok(Ok(_)) => false,
         Ok(Err(error)) | Err(error) => error.kind() == io::ErrorKind::TimedOut,
     };
     let endpoint_retired = endpoint.dead.load(Ordering::Acquire);
     if let Some(attempt) = attempt {
         match &sent {
-            Ok(Ok(())) if endpoint_retired => attempt.failure(),
-            Ok(Ok(())) => attempt.success(),
+            Ok(Ok(_)) if endpoint_retired => attempt.failure(),
+            Ok(Ok(_)) => attempt.success(),
             Ok(Err(_)) | Err(_) if endpoint_retired => attempt.failure(),
             Ok(Err(_)) | Err(_) if timed_out => attempt.timeout(),
             Ok(Err(_)) | Err(_) => attempt.failure(),
@@ -782,7 +782,7 @@ async fn send_one(
         )))
     } else {
         match sent {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(started_at)) => Ok(started_at),
             Ok(Err(error)) => Err(classify_send_error(endpoint, error)),
             Err(error)
                 if source_admitted
@@ -808,7 +808,7 @@ async fn send_one(
         stats.record_udp_first_send_latency(started.elapsed());
     }
     match result {
-        Ok(()) => {
+        Ok(started_at) => {
             #[cfg(feature = "native-api")]
             if first && let Some(flow) = endpoint.native_flow() {
                 flow.transition(
@@ -821,7 +821,11 @@ async fn send_one(
             endpoint.refresh();
             endpoint.tracker_upload(packet.data.len() as u64);
             if let Some(reporter) = &endpoint.score_reporter {
-                reporter.tx(packet.data.len() as u64);
+                if let Some(started_at) = started_at {
+                    reporter.tx_completed(packet.data.len() as u64, started_at);
+                } else {
+                    reporter.tx(packet.data.len() as u64);
+                }
             }
             outbound_tracker.add_bytes(packet.data.len() as u64, 0);
             Ok(())

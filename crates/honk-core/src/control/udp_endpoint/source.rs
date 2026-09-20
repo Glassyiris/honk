@@ -642,7 +642,12 @@ impl SourceEndpoint {
         self.flow_tracker.add_bytes(0, len);
     }
 
-    pub(super) async fn send(&self, data: &[u8], admitted: Option<&AtomicBool>) -> io::Result<()> {
+    pub(super) async fn send(
+        &self,
+        data: &[u8],
+        admitted: Option<&AtomicBool>,
+        record_start: bool,
+    ) -> io::Result<Option<Instant>> {
         let _send = self.owner.send_gate.lock().await;
         let reusable = self.owner.transport.source_send_usable().await;
         let mut active = {
@@ -672,6 +677,7 @@ impl SourceEndpoint {
                 clear_intent: false,
             }
         };
+        let started_at = record_start.then(Instant::now);
         self.owner.begin_receive();
         let result = self
             .owner
@@ -684,7 +690,7 @@ impl SourceEndpoint {
         } else if let Err(error) = &result {
             active.clear_intent = !self.owner.handle_transport_error(error);
         }
-        result
+        result.map(|()| started_at)
     }
 
     pub(super) fn send_timeout(&self) -> Duration {
