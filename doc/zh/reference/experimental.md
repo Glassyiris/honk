@@ -70,7 +70,7 @@ Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒
 
 ### M6：配置管理的信任边界
 
-配置来源仅在真实 `.dae` 启动加载时捕获；程序内构造的配置或 serde 加载不提供无损源管理。默认只公开已接受的元数据，私有路径显示为 `<redacted>`。开启 `config_content` 或 `config_write` 必须设置非空有效 secret，匿名 loopback 不例外。完整 content 可能包含节点凭据、订阅 URL 或路径，不是脱敏或沙箱化保存载荷；含 API 凭据的整个源不返回正文且只读。API 禁止改变或迁移凭据及原生设置；需管理员本地修改并重启。若主文件包含凭据，要先在本地将其移至专用只读 include，再重启，才能通过 API 编辑该主文件。
+配置来源仅在真实 `.dae` 启动加载时捕获；程序内构造的配置或 serde 加载不提供无损源管理。默认只公开已接受的元数据，路径显示为规范化的入口目录相对名称。开启 `config_content` 或 `config_write` 必须设置非空有效 secret，匿名 loopback 不例外。完整 content 可能包含节点凭据、订阅 URL 或路径，不是脱敏或沙箱化保存载荷；含 API 凭据的整个源不返回正文且只读。API 禁止改变或迁移凭据及原生设置；需管理员本地修改并重启。若主文件包含凭据，要先在本地将其移至专用只读 include，再重启，才能通过 API 编辑该主文件。
 
 例如 `writable_includes: 'conf.d/routing.dae', 'conf.d/groups.dae'` 只授权这些已接受规范化路径，不改变普通 include 的 glob、排序或无匹配语义。全量源/校验预算为 32 个来源、8 MiB，重复依赖实体化也计费；HTTP JSON body 仍最多 64 KiB。源 PUT 使用磁盘字节 SHA-256 强 If-Match，组 PATCH 使用 accepted revision 并独立检查源/依赖。正文披露与写许可独立，content 缺失时不得回写空字符串或脱敏响应。Selector、受限组 PATCH 和 M9 主文件创建/删除均复用来源权威；自动策略 override 仍关闭。具体失败恢复见 [API 契约](./api.md#主文件条目与-geodata-管理m9)。
 

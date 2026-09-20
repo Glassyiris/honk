@@ -132,7 +132,7 @@ impl TraceInput {
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct RuleSource {
-    file: &'static str,
+    file: String,
     source_id: String,
     line: usize,
     column: usize,
@@ -293,23 +293,22 @@ pub(super) async fn rules(
         let config = state.config.read().await;
         let generation = state.diagnostics.read().generation;
         let mut result = dictionary(&router, &state.instance_id, generation, deadline, id)?;
-        let source = |index| {
-            state
-                .observation
-                .configuration
-                .rule_source(index)
-                .map(|(source_id, location)| {
-                    (
-                        RuleSource {
-                            file: "<redacted>",
-                            source_id,
-                            line: location.line,
-                            column: location.column,
-                        },
-                        location.expression,
-                    )
-                })
-        };
+        let source =
+            |index| {
+                state.observation.configuration.rule_source(index).map(
+                    |(source_id, file, location)| {
+                        (
+                            RuleSource {
+                                file,
+                                source_id,
+                                line: location.line,
+                                column: location.column,
+                            },
+                            location.expression,
+                        )
+                    },
+                )
+            };
         let mut order: Vec<_> = config.routing.rules.iter().enumerate().collect();
         order.sort_by_key(|(_, rule)| rule.priority);
         for (rule, (source_index, _)) in result

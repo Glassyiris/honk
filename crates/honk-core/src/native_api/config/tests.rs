@@ -537,7 +537,7 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
     assert_eq!(config["sources"].as_array().unwrap().len(), 4);
     for (name, original) in &fixture.originals {
         let row = source(&config, original);
-        assert_eq!(row["path"], "<redacted>");
+        assert_eq!(row["path"], *name);
         assert_eq!(row["bytes"], original.len());
         assert_eq!(row["line_count"], original.lines().count());
         assert_eq!(
@@ -734,7 +734,7 @@ async fn validation_ids_and_display_paths_cannot_expand_file_authority() {
         "mode":"syntax","sources":[{"id":"label","path":"../not-opened.dae","content":"routing { fallback: direct }"}]
     })).send().await.unwrap()).await;
     assert_eq!(syntax["valid"], true);
-    // The display path GET /config hands out names no file; a client may echo it with the id.
+    // Returned entry-relative paths can be echoed without expanding file authority.
     let echoed_sources: Vec<_> = before["sources"]
         .as_array()
         .unwrap()

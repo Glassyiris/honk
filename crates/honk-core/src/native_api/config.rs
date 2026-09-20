@@ -32,8 +32,16 @@ use crate::configuration::{
     same_dependencies,
 };
 
-/// What `GET /config` shows in place of a private source path.
-pub(crate) const REDACTED_PATH: &str = "<redacted>";
+fn source_path(accepted: &Accepted, index: usize) -> &Path {
+    let root = accepted.update.sources[0]
+        .path
+        .parent()
+        .expect("accepted entry has a parent directory");
+    accepted.update.sources[index]
+        .path
+        .strip_prefix(root)
+        .expect("accepted sources are confined to the entry directory")
+}
 
 pub(crate) struct ConfigService {
     settings: NativeApiConfig,
@@ -231,7 +239,11 @@ impl ConfigService {
     pub(crate) fn rule_source(
         &self,
         index: Option<usize>,
-    ) -> Option<(String, honk_config::parser::source_edit::RuleSourceLocation)> {
+    ) -> Option<(
+        String,
+        String,
+        honk_config::parser::source_edit::RuleSourceLocation,
+    )> {
         let guard = self.sources.accepted.read();
         let accepted = guard.as_ref()?;
         let location = match index {
@@ -242,13 +254,19 @@ impl ConfigService {
         if self.credential_source(source) {
             return None;
         }
-        Some((accepted.ids[&source.path].clone(), location.clone()))
+        Some((
+            accepted.ids[&source.path].clone(),
+            source_path(accepted, location.source_index)
+                .to_string_lossy()
+                .into_owned(),
+            location.clone(),
+        ))
     }
 
     fn source_value(&self, accepted: &Accepted, index: usize) -> Value {
         let source = &accepted.update.sources[index];
         let mut value = json!({
-            "id":accepted.ids[&source.path], "path":REDACTED_PATH, "kind":if index==0 {"main"} else {"include"},
+            "id":accepted.ids[&source.path], "path":source_path(accepted, index).to_string_lossy(), "kind":if index==0 {"main"} else {"include"},
             "content_sha256":accepted.hashes[index], "bytes":source.content.len(),
             "writable":self.source_writable(accepted,index), "loaded_at":timestamp(accepted.accepted_at),
             "line_count":source.content.lines().count(),
@@ -720,7 +738,6 @@ pub(super) async fn validate(
             return Err(invalid());
         }
         if let Some(path) = &source.path
-            && path != REDACTED_PATH
             && (path.is_empty() || !paths.insert(path))
         {
             return Err(invalid());

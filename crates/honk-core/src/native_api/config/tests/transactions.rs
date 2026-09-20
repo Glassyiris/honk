@@ -27,7 +27,16 @@ async fn rule_details_use_accepted_expressions_without_exposing_source_content()
     assert_eq!(before["rules"][1]["outbound"], "direct");
     assert_eq!(before["rules"][1]["must"], true);
     assert_eq!(before["rules"][1]["source"]["line"], 2);
-    assert_eq!(before["rules"][1]["source"]["file"], "<redacted>");
+    let rule_source = &before["rules"][1]["source"];
+    assert_eq!(rule_source["file"], "locked.dae");
+    let config_source = config["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["id"] == rule_source["source_id"])
+        .unwrap();
+    assert_eq!(rule_source["file"], config_source["path"]);
+    assert_eq!(before["fallback"]["source"]["file"], "main.dae");
     assert!(
         !before["rules"][2]["expression"]
             .as_str()
@@ -39,7 +48,7 @@ async fn rule_details_use_accepted_expressions_without_exposing_source_content()
         SECRET,
         "credential-source-process",
         "private-comment",
-        "locked.dae",
+        fixture.directory.path().to_str().unwrap(),
     ] {
         assert!(!encoded.contains(withheld));
     }

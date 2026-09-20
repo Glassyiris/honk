@@ -21,8 +21,7 @@ impl Worker {
             let root=entry.parent().ok_or_else(invalid)?;
             let mut documents=Vec::new();let mut ids=HashMap::new();
             for (index,source) in request.sources.iter().enumerate(){
-                // GET /config shows private paths as `<redacted>`; a client echoing that label names no file.
-                let path=source.path.as_deref().filter(|path|*path!=super::REDACTED_PATH);
+                let path=source.path.as_deref();
                 let resolved=if request.mode=="syntax" {PathBuf::from(path.map(str::to_owned).unwrap_or_else(||format!("source-{}.dae",index+1)))}
                     else if index==0 {
                         if let Some(path)=path {let supplied=resolve_source_path(root,path)?;if supplied!=entry{return Err(denied());}}
