@@ -112,10 +112,10 @@ impl ScoreFeedback {
         ScoreReporter {
             shared: Arc::new(ReporterShared {
                 feedback: self.clone(),
-                cells: cells.into(),
                 started,
                 handles: AtomicUsize::new(1),
                 progress: Mutex::new(ReporterProgress {
+                    cells,
                     window_start: started,
                     setup: None,
                     first_response: false,
@@ -124,6 +124,8 @@ impl ScoreFeedback {
                     tx: 0,
                     rx: 0,
                     last_rx_at: None,
+                    first_tx_at: None,
+                    eligible_rx_at: None,
                     published_rx_at: None,
                     window_tx: 0,
                     window_rx: 0,
@@ -134,6 +136,7 @@ impl ScoreFeedback {
 }
 
 struct ReporterProgress {
+    cells: Vec<StartedCells>,
     setup: Option<Duration>,
     first_response: bool,
     probe: bool,
@@ -141,6 +144,8 @@ struct ReporterProgress {
     tx: u64,
     rx: u64,
     last_rx_at: Option<Instant>,
+    first_tx_at: Option<Instant>,
+    eligible_rx_at: Option<Instant>,
     published_rx_at: Option<Instant>,
     window_start: Instant,
     window_tx: u64,
@@ -149,7 +154,6 @@ struct ReporterProgress {
 
 struct ReporterShared {
     feedback: ScoreFeedback,
-    cells: Arc<[StartedCells]>,
     started: Instant,
     handles: AtomicUsize,
     progress: Mutex<ReporterProgress>,
@@ -183,7 +187,7 @@ impl ScoreReporter {
         let elapsed = now.saturating_duration_since(self.shared.started);
         progress.setup = Some(elapsed);
         progress.window_start = now;
-        self.observe(Observation::Setup(elapsed), now);
+        self.observe(Observation::Setup(elapsed), now, &mut progress);
     }
 
     pub fn setup_failed(&self, outcome: ScoreOutcome) {
@@ -203,6 +207,7 @@ impl ScoreReporter {
         self.observe(
             Observation::Response(now.saturating_duration_since(self.shared.started)),
             now,
+            &mut progress,
         );
     }
 
@@ -225,6 +230,7 @@ impl ScoreReporter {
                 slot: super::evidence::probe_slot(&feedback.context),
             },
             now,
+            &mut progress,
         );
     }
 
@@ -251,16 +257,29 @@ impl ScoreReporter {
         }
         if rx > 0 {
             progress.last_rx_at = Some(progress.last_rx_at.map_or(now, |at| at.max(now)));
-            if progress.setup.is_some()
-                && progress.tx > 0
-                && self.shared.feedback.context.target.is_some()
-                && progress
-                    .published_rx_at
-                    .is_none_or(|at| now.saturating_duration_since(at) >= LIVE_RX_INTERVAL)
+        }
+        if tx > 0 {
+            progress.first_tx_at = Some(progress.first_tx_at.map_or(now, |at| at.min(now)));
+        }
+        if rx > 0
+            && progress
+                .setup
+                .is_some_and(|setup| now >= self.shared.started + setup)
+            && progress.first_tx_at.is_some_and(|at| now >= at)
+            && self.shared.feedback.context.target.is_some()
+        {
+            progress.eligible_rx_at = Some(progress.eligible_rx_at.map_or(now, |at| at.max(now)));
+            if progress
+                .published_rx_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= LIVE_RX_INTERVAL)
             {
                 // Bound scorer-lock traffic independently of packet rate; no timer turns silence into progress.
                 progress.published_rx_at = Some(now);
-                self.observe(Observation::BusinessProgress { rx_at: now }, now);
+                self.observe(
+                    Observation::BusinessProgress { rx_at: now },
+                    now,
+                    &mut progress,
+                );
             }
         }
         if now.saturating_duration_since(progress.window_start) > MAX_THROUGHPUT_DURATION {
@@ -291,13 +310,14 @@ impl ScoreReporter {
                 elapsed,
             },
             now,
+            progress,
         );
         progress.window_tx = 0;
         progress.window_rx = 0;
         progress.window_start = now;
     }
 
-    fn observe(&self, observation: Observation, now: Instant) {
+    fn observe(&self, observation: Observation, now: Instant, progress: &mut ReporterProgress) {
         let feedback = &self.shared.feedback;
         let mut inner = feedback.state.inner.lock();
         if feedback.source == ScoreSource::HealthProbe
@@ -312,7 +332,7 @@ impl ScoreReporter {
             &mut inner,
             &feedback.context,
             &feedback.attributions,
-            &self.shared.cells,
+            &mut progress.cells,
             feedback.source,
             observation,
             now,
@@ -348,13 +368,14 @@ impl ScoreReporter {
             tx: progress.tx,
             rx: progress.rx,
             last_rx_at: progress.last_rx_at,
+            eligible_rx_at: progress.eligible_rx_at,
             elapsed: now.saturating_duration_since(self.shared.started),
             count_usefulness,
         };
         feedback.state.finish_at(
             &feedback.context,
             &feedback.attributions,
-            &self.shared.cells,
+            &mut progress.cells,
             &sample,
             now,
         );

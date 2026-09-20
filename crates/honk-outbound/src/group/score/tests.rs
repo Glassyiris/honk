@@ -3,6 +3,7 @@ use super::*;
 use honk_config::group::{Group, GroupPolicy};
 use honk_config::node::Node;
 mod attribution;
+mod availability;
 mod cadence;
 mod evidence;
 mod live;
@@ -68,10 +69,10 @@ fn trained_stats(successes: f64, latency_ms: f64, now: Instant) -> Stats {
         attempts: successes,
         setup_success: successes,
         useful_success: successes,
-        useful_business: WeightedMean {
-            sum: successes,
-            weight: successes.min(PERFORMANCE_VALIDATION_SAMPLES),
-            observed_at: Some(now),
+        availability: Availability {
+            reporters: successes.min(PERFORMANCE_VALIDATION_SAMPLES) as u8,
+            latest_rx_at: Some(now),
+            ..Default::default()
         },
         performance: Performance {
             response: WeightedMean {
