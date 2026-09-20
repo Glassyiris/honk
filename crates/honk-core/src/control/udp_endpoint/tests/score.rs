@@ -1,7 +1,9 @@
 use super::*;
 use honk_config::group::{Group, GroupPolicy};
 use honk_config::node::Node;
-use honk_outbound::group::{GroupManager, ScoreSelectionContext, SelectionNetwork};
+use honk_outbound::group::{
+    GroupManager, ScoreSelectionContext, ScoreVerificationState, SelectionNetwork,
+};
 
 #[tokio::test]
 async fn accepted_udp_progress_changes_selection_before_endpoint_finishes() {
@@ -348,4 +350,138 @@ async fn delivered_udp_reply_restores_incumbent_protection_before_endpoint_finis
         "a duplicate terminal failure must not replace the settled success",
     );
     assert!(pool.shutdown().await.joined);
+}
+
+#[tokio::test]
+async fn four_live_udp_drivers_establish_observed_usability_before_retirement() {
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target = server.local_addr().unwrap();
+    let node = Node::from_share_link("socks5://127.0.0.1:1080#live").unwrap();
+    let manager = GroupManager::new(
+        &[Group {
+            name: "score".into(),
+            policy: GroupPolicy::Score,
+            nodes: vec![node.id],
+            ..Default::default()
+        }],
+        std::slice::from_ref(&node),
+    );
+    let context = ScoreSelectionContext {
+        network: SelectionNetwork::Udp,
+        probe_domain: honk_outbound::alive::ProbeDomain::DataUdp,
+        target_family: Some(honk_outbound::alive::IpVersion::V4),
+        health_family: honk_outbound::alive::IpVersion::V4,
+        target: Some(target.into()),
+    };
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = Arc::new(StatsManager::new());
+    let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
+    let mut clients = Vec::new();
+    let mut endpoints = Vec::new();
+    let mut drivers = Vec::new();
+    for flow in 0..4 {
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let outbound = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let outbound_addr = outbound.local_addr().unwrap();
+        let reporter = manager
+            .feedback_for_group_node("score", node.id, context.clone())
+            .unwrap()
+            .start();
+        reporter.setup_succeeded();
+        let endpoint = Arc::new(UdpEndpoint::new_scored(
+            transport(outbound, target),
+            target,
+            false,
+            node.id,
+            honk_outbound::alive::IpVersion::V4,
+            Some(reporter),
+        ));
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let mut lease = match pool.reserve_or_enqueue(client_addr, target, b"q", permit, &stats) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("each client must reserve a distinct scored endpoint"),
+        };
+        let mut driver = pool.spawn_driver(
+            client_addr,
+            target,
+            lease.generation(),
+            lease.decision_token(),
+            Arc::clone(&endpoint),
+            lease.take_queue_receiver().unwrap(),
+            test_reply_socket().await,
+            Arc::clone(&alive),
+            Arc::clone(&stats),
+            "live".into(),
+        );
+        tokio::time::timeout(Duration::from_secs(1), driver.wait_ready())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(lease.commit_ready(Arc::clone(&endpoint)));
+        driver.start(lease.take_first().unwrap()).unwrap();
+        drop(lease);
+        tokio::time::timeout(Duration::from_secs(1), driver.wait_first_ack())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut buf = [0; 8];
+        for packet in 0..if flow == 0 { 4 } else { 1 } {
+            if packet != 0 {
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+                assert!(matches!(
+                    pool.reserve_or_enqueue(client_addr, target, b"q", permit, &stats),
+                    EndpointReservation::Enqueued
+                ));
+            }
+            let (len, peer) =
+                tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(peer, outbound_addr);
+            assert_eq!(&buf[..len], b"q");
+            server.send_to(b"r", peer).await.unwrap();
+            let (len, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&buf[..len], b"r");
+            if flow < 3 {
+                let (_, report) = manager
+                    .score_verification_for_network("score", SelectionNetwork::Udp)
+                    .unwrap();
+                assert_eq!(report.state, ScoreVerificationState::Provisional);
+            }
+        }
+        clients.push(client);
+        endpoints.push(endpoint);
+        drivers.push(driver);
+    }
+    let counters = manager.score_verification_counters("score", SelectionNetwork::Udp);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let (_, report) = manager
+                .score_verification_for_network("score", SelectionNetwork::Udp)
+                .unwrap();
+            if report.state == ScoreVerificationState::ObservedUsable {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("four delivered live replies must establish public observed usability");
+    assert_eq!(
+        manager.score_verification_counters("score", SelectionNetwork::Udp),
+        counters
+    );
+    assert_eq!(pool.driver_count(), 4);
+    assert!(
+        endpoints
+            .iter()
+            .all(|endpoint| !endpoint.dead.load(Ordering::Acquire))
+    );
+    assert!(pool.shutdown().await);
 }

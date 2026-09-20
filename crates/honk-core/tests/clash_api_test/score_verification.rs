@@ -451,14 +451,23 @@ async fn score_verification_reports_response_only_singleton_without_a_best_claim
     )
     .await;
     let manager = app.state.group_manager.read().clone();
+    let mut reporters = Vec::new();
     for network in [SelectionNetwork::Tcp, SelectionNetwork::Udp] {
         let context = ScoreSelectionContext {
             target: Some(ScoreTarget::domain("business-private.example", 443)),
             target_family: Some(IpVersion::V6),
             ..context(network)
         };
-        for _ in 0..16 {
-            business_success(&manager, &node, &context, true);
+        for _ in 0..4 {
+            let reporter = manager
+                .feedback_for_node(node.id, context.clone())
+                .unwrap()
+                .start();
+            reporter.setup_succeeded();
+            reporter.tx(1);
+            reporter.first_response();
+            reporter.rx(1);
+            reporters.push(reporter);
         }
     }
     let observed = get_json(&app, "/proxies/auto").await;
@@ -484,4 +493,14 @@ async fn score_verification_reports_response_only_singleton_without_a_best_claim
             .to_string()
             .contains("business-private.example")
     );
+    for reporter in reporters {
+        reporter.finish(ScoreOutcome::Cancelled);
+    }
+    let cancelled = get_json(&app, "/proxies/auto").await;
+    for network in ["tcp", "udp"] {
+        assert_eq!(
+            cancelled["scoreVerification"][network]["state"],
+            "observedUsable"
+        );
+    }
 }

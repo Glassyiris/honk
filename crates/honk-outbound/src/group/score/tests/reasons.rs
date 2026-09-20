@@ -310,7 +310,7 @@ fn selection_reason_precedence_is_stable() {
                 },
                 Stats {
                     selected_at: u64::from(index == 0),
-                    useful_business: WeightedMean::default(),
+                    availability: Availability::default(),
                     ..trained_stats(8.0, 100.0, now)
                 },
             );

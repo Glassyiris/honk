@@ -754,7 +754,7 @@ fn stale_aggregate_completion_does_not_mutate_recreated_cell() {
         group: memberships[0].0.clone(),
         node_id,
     };
-    let stale_cells = state.start(&context, std::slice::from_ref(&evicted));
+    let mut stale_cells = state.start(&context, std::slice::from_ref(&evicted));
     for (group, node_id) in memberships.iter().skip(1) {
         drop(state.start(
             &context,
@@ -764,21 +764,23 @@ fn stale_aggregate_completion_does_not_mutate_recreated_cell() {
             }],
         ));
     }
-    let current_cells = state.start(&context, std::slice::from_ref(&evicted));
+    let mut current_cells = state.start(&context, std::slice::from_ref(&evicted));
+    let rx_at = Instant::now();
     let sample = FlowSample {
         outcome: ScoreOutcome::Success,
         setup: Some(Duration::ZERO),
         source: ScoreSource::Traffic,
         tx: 1,
         rx: 1,
-        last_rx_at: Some(Instant::now()),
+        last_rx_at: Some(rx_at),
+        eligible_rx_at: Some(rx_at),
         elapsed: Duration::from_millis(1),
         count_usefulness: true,
     };
     state.finish(
         &context,
         std::slice::from_ref(&evicted),
-        &stale_cells,
+        &mut stale_cells,
         &sample,
     );
     assert_eq!(state.inner.lock().aggregate.len(), AGGREGATE_CAPACITY);
@@ -789,7 +791,7 @@ fn stale_aggregate_completion_does_not_mutate_recreated_cell() {
     state.finish(
         &context,
         std::slice::from_ref(&evicted),
-        &current_cells,
+        &mut current_cells,
         &sample,
     );
     assert_eq!(

@@ -87,7 +87,7 @@ fn recent_business_uses_latest_rx_across_out_of_order_completions() {
 }
 
 #[test]
-fn delayed_business_does_not_revive_expired_weight_or_admit_expired_rx() {
+fn delayed_settlement_preserves_fresh_live_availability_without_refreshing_old_rx() {
     let nodes = [node("delayed")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
@@ -112,14 +112,14 @@ fn delayed_business_does_not_revive_expired_weight_or_admit_expired_rx() {
     fresh[0].finish_at(ScoreOutcome::Success, true, terminal);
     assert_eq!(
         verification_at(&manager, &nodes, &target, terminal).state,
-        ScoreVerificationState::Provisional
+        ScoreVerificationState::ObservedUsable
     );
     for reporter in &stale {
         reporter.finish_at(ScoreOutcome::Success, true, terminal);
     }
     assert_eq!(
         verification_at(&manager, &nodes, &target, terminal).state,
-        ScoreVerificationState::Provisional
+        ScoreVerificationState::ObservedUsable
     );
     for reporter in &fresh[1..] {
         reporter.finish_at(ScoreOutcome::Success, true, terminal);
@@ -233,6 +233,7 @@ fn real_flow_gaps_become_usable_and_supported_with_measured_exposure() {
     let state = manager.score_state();
     let mut first_usable = None;
     let mut confirmed_at = None;
+    let mut resolved_at = None;
     for second in 0..100 {
         let at = now + Duration::from_secs(second);
         let index = rank_at(&manager, &nodes, &target, at);
@@ -244,13 +245,21 @@ fn real_flow_gaps_become_usable_and_supported_with_measured_exposure() {
         assert!(counts.validation_selections <= 2 + second / exploration_period(2));
         if snapshot.comparison == ScoreComparison::Supported {
             assert_eq!(snapshot.state, ScoreVerificationState::ObservedUsable);
-            assert_eq!(snapshot.pending_count, 0);
             assert_eq!(snapshot.compared_count, 2);
             assert_eq!(snapshot.basis, ScoreEvidenceBasis::TargetResponse);
             assert!(snapshot.missing.transfer);
-            assert_eq!(snapshot.next_action, ScoreValidationAction::AwaitTransfer);
-            confirmed_at = Some(second);
-            break;
+            confirmed_at.get_or_insert(second);
+            if snapshot.pending_count == 0 {
+                assert_eq!(snapshot.next_action, ScoreValidationAction::AwaitTransfer);
+                resolved_at = Some(second);
+                break;
+            }
+            assert!(!snapshot.missing.availability);
+            assert!(!snapshot.missing.response);
+            assert_eq!(
+                snapshot.next_action,
+                ScoreValidationAction::NextBusinessFlow
+            );
         }
         train_at(
             &manager,
@@ -264,6 +273,8 @@ fn real_flow_gaps_become_usable_and_supported_with_measured_exposure() {
     }
     let confirmed_at =
         confirmed_at.expect("actual candidate trials must resolve the response dispute");
+    let resolved_at =
+        resolved_at.expect("bounded trials must also complete ordinary qualification");
     let counts = state.verification_counters("score", SelectionNetwork::Tcp);
     assert_eq!(counts.confirmations, 2);
     assert_eq!(
@@ -273,7 +284,7 @@ fn real_flow_gaps_become_usable_and_supported_with_measured_exposure() {
     assert!(counts.validation_selections >= 4);
     assert_eq!(
         counts.provisional_selections + counts.usable_selections,
-        confirmed_at + 1
+        resolved_at + 1
     );
     println!(
         "response confirmed in {confirmed_at}s with {} validation flows",
@@ -868,7 +879,7 @@ fn partial_success_cannot_pin_a_cancelled_validation_run_forever() {
 }
 
 #[test]
-fn validity_includes_the_effective_completion_threshold() {
+fn availability_validity_does_not_depend_on_decaying_terminal_completions() {
     let nodes = [node("barely-qualified")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
@@ -881,14 +892,15 @@ fn validity_includes_the_effective_completion_threshold() {
             target: target.target.clone().unwrap(),
             node_id: nodes[0].id,
         },
-        trained_stats(4.001, 100.0, now),
+        trained_stats(4.0, 100.0, now),
     );
     let snapshot = verification_at(&manager, &nodes, &target, now);
     assert_eq!(snapshot.state, ScoreVerificationState::ObservedUsable);
     let validity = snapshot.valid_for_ms.unwrap();
-    assert!(
-        validity < 1000,
-        "historical qualification decays before the 60s metric clock"
+    assert_eq!(validity, 60_000);
+    assert_eq!(
+        verification_at(&manager, &nodes, &target, now + Duration::from_secs(1)).state,
+        ScoreVerificationState::ObservedUsable
     );
     assert_eq!(
         verification_at(

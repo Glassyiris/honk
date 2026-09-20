@@ -182,6 +182,14 @@ struct WeightedMean {
 }
 
 #[derive(Debug, Clone, Default)]
+struct Availability {
+    epoch: u64,
+    reporters: u8,
+    latest_rx_at: Option<Instant>,
+    valid_from: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Default)]
 struct Stats {
     incarnation: u64,
     attempts: f64,
@@ -190,7 +198,7 @@ struct Stats {
     useful_success: f64,
     useful_failure: f64,
     performance: Performance,
-    useful_business: WeightedMean,
+    availability: Availability,
     business_invalidated_through: Option<Instant>,
     failed_at: Option<Instant>,
     last_business_rx_at: Option<Instant>,
@@ -210,6 +218,8 @@ struct Stats {
 struct StartedCells {
     aggregate: [Option<u64>; 2],
     exact: Option<u64>,
+    credited_aggregate: [Option<u64>; 2],
+    credited_exact: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -812,6 +822,7 @@ struct FlowSample {
     tx: u64,
     rx: u64,
     last_rx_at: Option<Instant>,
+    eligible_rx_at: Option<Instant>,
     elapsed: Duration,
     count_usefulness: bool,
 }
