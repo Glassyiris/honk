@@ -4,10 +4,10 @@
 //! that a sole TCP leaf with no `final` remains a last resort.
 //! Modeled after sing-box outbound groups.
 //!
-//! UDP candidate filtering is per-node: a node with both UDP probe domains
-//! (DataUDP + DnsUDP) explicitly dead is excluded from UDP selection even
-//! when its TCP is alive; nodes never probed for UDP inherit TCP liveness
-//! (see `filter_alive_candidates`).
+//! UDP forwarding candidates need protocol/configuration capability before health
+//! filtering. A capable node with both UDP probe domains explicitly dead remains
+//! excluded even when TCP is alive; capable unprobed nodes inherit TCP liveness.
+//! Built-in block remains a terminal action, not a forwarding capability.
 //!
 //! Groups nest (sing-box style): `Group.groups` lists sub-group tags whose
 //! own current selection contributes one member candidate each (the leaf
@@ -20,7 +20,7 @@
 //! `GroupManager` is the facade: it owns the group/node tables and the
 //! selection pipeline entry points below. The internals are split by
 //! responsibility — `resolver` (group-graph expansion and member/leaf
-//! introspection), `filter` (liveness filtering), `policy` (per-policy
+//! introspection), `filter` (capability and liveness), `policy` (per-policy
 //! picks and latency ranking), `state` (selection caches and callbacks).
 
 use honk_config::group::{Group, GroupPolicy};
