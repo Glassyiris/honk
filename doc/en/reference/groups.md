@@ -61,6 +61,8 @@ Only missing or no-longer-member choices fall through to `default` or the first 
 
 Each selected subgroup resolves its own explicit `final` before returning an empty result to its parent. This is not permission to choose a different Selector sibling or retry a terminal protocol refusal. For IPv6 targets, an ordinary selected leaf reachable through IPv4 proxy health is tried before a final route.
 
+UDP eligibility requires protocol/configuration support as well as health. VMess and explicitly TCP-only leaves are excluded before selection and Score comparison; TCP remains unaffected. An incapable Selector choice does not authorize a sibling, and built-in `block` remains terminal. This capability filter does not bypass a selected node's target-specific UDP policy refusal.
+
 When distinct nodes share a display tag, name-based defaults and Clash writes bind the first matching member in declaration order before health filtering. Native member IDs can select a particular direct member. Health cannot retarget either choice to a healthy same-name sibling.
 Named `final` nodes likewise resolve the first matching configuration declaration; a healthy duplicate cannot replace it. Selection and final-node health registration use that same identity.
 

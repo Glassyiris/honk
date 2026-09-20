@@ -266,7 +266,12 @@ pub(in crate::control) fn group_datapath_alive(
         || group_manager
             .reachable_leaf_nodes_in_group(&group.name)
             .iter()
-            .any(|node| alive_set.is_alive_for(node.id, domain, ipver))
+            .any(|node| {
+                (domain == ProbeDomain::Tcp
+                    || node.protocol() == NodeProtocol::Block
+                    || (honk_outbound::descriptor::descriptor(node.protocol()).supports_udp)(node))
+                    && alive_set.is_alive_for(node.id, domain, ipver)
+            })
 }
 
 pub(crate) fn group_connectivity_snapshot(

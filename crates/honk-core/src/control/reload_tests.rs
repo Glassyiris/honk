@@ -221,11 +221,7 @@ fn equivalent_resolved_log_file_path_does_not_require_restart() {
 
 #[test]
 fn single_leaf_tcp_connectivity_stays_open_for_recovery() {
-    let node = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "only".into(),
-        ..Default::default()
-    };
+    let node = canonical_socks5("only", "127.0.0.1", 1080, None);
     let config = Config {
         nodes: vec![node.clone()],
         groups: vec![Group {
@@ -245,6 +241,97 @@ fn single_leaf_tcp_connectivity_stays_open_for_recovery() {
 
     assert!(snapshot.contains(&(OutboundIndex::UserBase as u8, 0, 0, true)));
     assert!(snapshot.contains(&(OutboundIndex::UserBase as u8, 2, 0, false)));
+}
+
+#[test]
+fn udp_connectivity_requires_a_live_udp_capable_leaf() {
+    use honk_config::node::{OutboundConfig, VlessConfig, VmessConfig};
+
+    for outbound in [
+        OutboundConfig::Vmess(VmessConfig {
+            uuid: Some("11111111-1111-4111-8111-111111111111".into()),
+            ..Default::default()
+        }),
+        OutboundConfig::Vless(VlessConfig {
+            uuid: Some("11111111-1111-4111-8111-111111111111".into()),
+            network: Some("tcp".into()),
+            ..Default::default()
+        }),
+    ] {
+        let mut tcp_only = Node {
+            name: "tcp-only".into(),
+            address: "127.0.0.1:443".into(),
+            host: "127.0.0.1".into(),
+            port: 443,
+            outbound,
+            ..Default::default()
+        };
+        tcp_only.id = tcp_only.derive_id();
+        let capable = canonical_socks5("udp-capable", "127.0.0.1", 1080, None);
+        let config = Config {
+            nodes: vec![tcp_only.clone(), capable.clone()],
+            groups: vec![
+                Group {
+                    name: "only".into(),
+                    nodes: vec![tcp_only.id],
+                    ..Default::default()
+                },
+                Group {
+                    name: "mixed".into(),
+                    nodes: vec![tcp_only.id, capable.id],
+                    default: Some(tcp_only.name.clone()),
+                    ..Default::default()
+                },
+                Group {
+                    name: "with-final".into(),
+                    nodes: vec![tcp_only.id],
+                    final_outbound: Some(capable.name.clone()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let alive = Arc::new(AliveDialerSet::new());
+        let manager =
+            GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive.clone()));
+        let mut backend = MockEbpfBackend::new();
+
+        for capable_alive in [false, true] {
+            for ipver in [IpVersion::V4, IpVersion::V6] {
+                for domain in [ProbeDomain::DnsUdp, ProbeDomain::DataUdp] {
+                    if capable_alive {
+                        alive.report_available_traffic(capable.id, domain, ipver);
+                    } else {
+                        alive.report_unavailable_forced(capable.id, domain, ipver);
+                    }
+                }
+            }
+            publish_group_connectivity(
+                &mut backend,
+                &group_connectivity_snapshot(&config, &manager, &alive),
+            )
+            .unwrap();
+            for index in 0..config.groups.len() {
+                for domain in 0..3 {
+                    for ipver in 0..2 {
+                        assert_eq!(
+                            backend
+                                .get_outbound_alive(
+                                    OutboundIndex::UserBase as u8 + index as u8,
+                                    domain,
+                                    ipver,
+                                )
+                                .unwrap(),
+                            domain == 0 || (index != 0 && capable_alive),
+                            "protocol={:?}, group={}, domain={domain}, ipver={ipver}, capable_alive={capable_alive}",
+                            tcp_only.protocol(),
+                            config.groups[index].name,
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn nested_final_config() -> Config {
@@ -520,16 +607,8 @@ async fn final_only_leaf_health_push_updates_all_ancestor_datapath_slots() {
 
 #[test]
 fn group_connectivity_follows_reordered_outbound_ids() {
-    let a = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "a".into(),
-        ..Default::default()
-    };
-    let b = Node {
-        id: uuid::Uuid::new_v4(),
-        name: "b".into(),
-        ..Default::default()
-    };
+    let a = canonical_socks5("a", "127.0.0.1", 1080, None);
+    let b = canonical_socks5("b", "127.0.0.1", 1081, None);
     let group = |name: &str, node: &Node| Group {
         name: name.into(),
         policy: GroupPolicy::Selector,
