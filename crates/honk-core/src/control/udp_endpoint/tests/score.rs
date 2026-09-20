@@ -412,7 +412,7 @@ async fn four_live_udp_drivers_establish_observed_usability_before_retirement() 
             test_reply_socket().await,
             Arc::clone(&alive),
             Arc::clone(&stats),
-            "live".into(),
+            stats.outbound_tracker("live", crate::stats::OutboundKind::Node),
         );
         tokio::time::timeout(Duration::from_secs(1), driver.wait_ready())
             .await
@@ -483,5 +483,5 @@ async fn four_live_udp_drivers_establish_observed_usability_before_retirement() 
             .iter()
             .all(|endpoint| !endpoint.dead.load(Ordering::Acquire))
     );
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
 }

@@ -335,13 +335,17 @@ fn selector_udp_capability_keeps_the_pin_and_terminal_members() {
         let manager =
             GroupManager::with_alive_set(&[selector.clone(), parent.clone()], &nodes, alive_set);
         for node in &nodes[..2] {
-            manager.set_selector_choice("selector", &node.name);
+            manager
+                .set_selector_choice("selector", &node.name, SelectorNetworks::Both)
+                .unwrap();
             assert_udp_selection(&manager, "selector", None);
             assert_udp_selection(&manager, "parent", None);
             assert_eq!(manager.select_node("selector").unwrap().id, node.id);
         }
         for selected in ["udp", "block", "direct"] {
-            manager.set_selector_choice("selector", selected);
+            manager
+                .set_selector_choice("selector", selected, SelectorNetworks::Both)
+                .unwrap();
             assert_udp_selection(&manager, "selector", Some(selected));
             assert_udp_selection(&manager, "parent", Some(selected));
         }
