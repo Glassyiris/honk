@@ -144,7 +144,7 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 `POST /routing/trace` 仅支持 `resolve=none`，返回 `mode:simulation`；`live` 为 422。模拟固定当前 compiled router/config/generation，不查询 DNS、不探测、不推进组选择、不建立连接；缺失输入保留 `indeterminate/missing_inputs`，不能视为历史 flow 或真实转发承诺。上限为 1 个地址、256 个规则/条件 steps、5 秒和每分钟 principal/global 各 30 次。`GET /rules` 返回含 fallback 的完整当前字典，最多 4096 行，超限拒绝而不截断。规则 ID 与用户态捕获证据共用 generation-scoped 身份；真实 parser 来源可用时给出 `source_id/line/column`，file 与该来源的入口相对 `path` 一致，否则 source 为 null。历史 flow 不从当前字典重建，内核 final provenance 仍可为 unknown；编辑应使用 source ID，不猜私有路径。
 
-对已接受 `.dae` 配置中非凭据来源的规则，`expression` 保留编写时的条件值（包括 geosite/geoip 名称、否定和带引号参数），移除注释和出站子句。这属于规则元数据，不要求开启 `config_content` 或写权限；不会返回完整配置原文，也不展开 geodata。含凭据来源及没有已接受来源元数据的规则仍使用脱敏的编译后摘要。磁盘编辑只有在 reload 被接受后才更新字典；reload 被拒绝时保留旧表达式。Trace 与历史 flow 的表达式脱敏行为不变。
+对已接受 `.dae` 配置中非凭据来源的规则，`/rules` 与 `/routing/trace` 的规则 `expression` 保留编写时的条件值（包括 geosite/geoip 名称、否定和带引号参数），移除注释和出站子句。Trace 的逐条件表达式按实际编译后顺序显示带引号的配置值：普通域名候选与 geosite 分属不同条件，目标 IP 与 geoip 候选共用一个条件。这属于规则元数据，不要求开启 `config_content` 或写权限；不会返回完整配置原文，也不展开 geodata。含凭据来源及没有已接受来源元数据的规则仍使用脱敏的编译后摘要。Trace 的展示元数据与决策固定在同一已接受代次。磁盘编辑只有在 reload 被接受后才更新两种响应；reload 被拒绝时保留旧表达式。历史 flow 的表达式脱敏行为不变。
 
 ### Provider、日志与临时设置
 
@@ -401,8 +401,6 @@ R = {
 
 每个值是饱和 `u64` 计数，不是延迟、吞吐或健康测量。一次已授权的多候选 Score Apply 记录一个最终原因：`coldExplore` 或 `periodicExplore` 表示验证；`incumbentIneligible` 表示现任已不满足普通资格；`freshFailureBypass` 表示合格现任的业务失败尚未恢复；`insufficientEvidenceHeld` 表示没有挑战者获得晋升且普通 utility 赢家缺少双方合格的性能比较；`incumbentHeld` 表示比较优势未跨过保持门槛；其余 `reliabilityWinner`、`performanceWinner` 保留按替代候选资格分类的含义。`performanceWinner` 不证明提速或发生切换，`insufficientEvidenceHeld` 不表示可靠性历史缺失。`ordinarySwitch` 统计实际普通已提交 A→B 选择；`switchFlap` 统计其中同目标八次普通选择内返回前一赢家的情况。首次选择、试用及缺少之前历史时不能增加切换计数。`deadFiltered`、`failStreakExcluded` 和 `exploreBackedOff` 按 rank 累计受影响候选。Peek、API 读取、单例与最后尝试旁路不增加这些计数；嵌套组 rank 与实际出站连接并非一一对应。
 
-对 UDP，`deadFiltered` 也统计因协议／配置不具备 UDP 能力而被排除的候选；它不是新发生故障的节点数或业务尝试数，这类排除不会增加 Score 失败或探索退避。
-
 `carrierPressure` 统计被已有组／网络聚合 cell 接收的新鲜 carrier 地址族事件，不是包数或失败连接数；重复心跳读取不增加它。`carrierValidation` 统计普通赢家具有晚于上次验证的 carrier 提示时发生的周期验证选择；它是可重叠的诊断计数，不是新的互斥原因，也不证明只有该提示导致选择。提示不改变业务可靠性、资格或健康。字段在 API 读取时只读；carrier 观测由控制心跳接入，与选路调用独立。
 
 `carrierRttPressure` 与 `carrierLossPressure` 保留被接收事件的原因。两种条件同时满足时，两个原因计数均增加，但 `carrierPressure` 只增加一次。这些可重叠计数不标识具体 carrier／传输协议，不是应用丢包率，也不增加失败；重复或过期提示均不增加它们。TCP 的 loss pressure 表示重传压力，不代表已确认应用包丢失。
@@ -418,11 +416,11 @@ R = {
 | 字段 | 含义 |
 | --- | --- |
 | `selected` | 本次只读判定对应的既有公开成员 tag；没有普通合格候选时为 null。存在时 TCP `now` 使用同一次判定的选择。 |
-| `state` | `provisional` 或 `observedUsable`；后者要求同一连续可用性 cohort 中四个不同的定向 Traffic reporter 在 setup/TX 后收到 RX，且 cohort 最近的合格 RX 距今不足 60 秒。未结束的 flow 也可取得资格；clone／重复回包不增加信用。失败／reload 或 60 秒进展间隔会重置 cohort。这不授予普通选路资格，也不清除连败。 |
+| `state` | `provisional` 或 `observedUsable`；后者需要近期成功终态的业务证据，不能仅由探测或活跃 RX 获得。普通资格续租和恢复不会放宽这一认证。 |
 | `comparison` / `basis` | `unconfirmed`、`equivalent` 或 `supported`，依据为 `none`、`configuredProbe`、`targetResponse`、`aggregateResponse`、`upload` 或 `download`。不代表误判概率或保证最优。 |
 | `missing` | 相关候选覆盖范围内的 availability/response/transfer 布尔缺口；当前路径已观测可用时，备选仍可能需要验证。 |
-| `nextAction` | `nextBusinessFlow` 仅在共享预算允许时使用未来真实流量，补充证据、普通选路资格或恢复验证；`awaitTransfer` 等待真实负载，不主动大流量测速；`backoff` 保留失败隔离；`none` 表示没有可执行的缺失工作。 |
-| `coverage` | 候选、已比较与待确认数量；即使 availability/response 缺口已关闭，pending 仍可包含普通资格／恢复工作。单节点可以证明已观测可用，不代表优于其他路径。 |
+| `nextAction` | `nextBusinessFlow` 仅在共享预算允许时使用未来真实流量；`awaitTransfer` 等待真实负载，不主动大流量测速；`backoff` 保留失败隔离；`none` 表示没有可执行的缺失工作。 |
+| `coverage` | 候选、已比较与待确认数量；单节点可以证明已观测可用，不代表优于其他路径。 |
 | `evidenceAgeMs` / `validForMs` | 最弱支持证据的年龄与条件性剩余有效期；没有结论时为 null。新证据可以提前撤销结论。 |
 | `network`、`targetFamily`、`healthFamily`、`targetSpecific` | transport 与适用范围；此聚合接口没有精确目标，不导出 domain/IP/port 或原始节点 ID。 |
 

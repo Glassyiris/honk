@@ -52,15 +52,52 @@ async fn rule_details_use_accepted_expressions_without_exposing_source_content()
     ] {
         assert!(!encoded.contains(withheld));
     }
+    let trace = || {
+        fixture
+            .request(Method::POST, "/api/v1/routing/trace")
+            .json(&json!({
+                "input":{"network":"tcp","domain":"example.com","dst_port":443,"pname":"curl"},
+                "resolve":"none"
+            }))
+    };
+    let traced = ok(trace().send().await.unwrap()).await;
+    let evaluated = &traced["evaluations"][0]["rules"];
+    assert_eq!(evaluated[1]["expression"], before["rules"][1]["expression"]);
+    assert_eq!(evaluated[1]["rule_id"], before["rules"][1]["rule_id"]);
+    assert_eq!(
+        evaluated[1]["conditions"][0]["expression"],
+        r#"domain(regex: "a->b#c")"#
+    );
+    assert_eq!(evaluated[1]["conditions"][0]["result"], "not_matched");
+    assert_eq!(
+        evaluated[1]["conditions"][1]["expression"],
+        r#"!dport("53")"#
+    );
+    assert_eq!(evaluated[1]["conditions"][1]["result"], "skipped");
+    assert_eq!(
+        evaluated[0]["conditions"][0]["expression"],
+        "pname(<redacted>)"
+    );
+    for withheld in [SECRET, "credential-source-process", "private-comment"] {
+        assert!(!traced.to_string().contains(withheld));
+    }
 
     std::fs::write(fixture.path("locked.dae"), "routing { dport(\n").unwrap();
     let rejected = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
     assert_eq!(fixture.terminal(&rejected).await["status"], "failed");
     assert_eq!(fixture.get("/api/v1/rules").await, before);
+    assert_eq!(
+        ok(trace().send().await.unwrap()).await["evaluations"],
+        traced["evaluations"]
+    );
 
     let candidate = fixture.originals["locked.dae"].replace("!dport(53)", "!dport(853)");
     std::fs::write(fixture.path("locked.dae"), candidate).unwrap();
     assert_eq!(fixture.get("/api/v1/rules").await, before);
+    assert_eq!(
+        ok(trace().send().await.unwrap()).await["evaluations"],
+        traced["evaluations"]
+    );
     let reload = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
     assert_eq!(fixture.terminal(&reload).await["status"], "succeeded");
     let after = fixture.get("/api/v1/rules").await;
@@ -70,6 +107,16 @@ async fn rule_details_use_accepted_expressions_without_exposing_source_content()
     assert_eq!(
         after["rules"][1]["expression"],
         "domain( regex: 'a->b#c') && !dport(853)"
+    );
+    let traced_after = ok(trace().send().await.unwrap()).await;
+    assert_eq!(traced_after["generation_id"], after["generation_id"]);
+    assert_eq!(
+        traced_after["evaluations"][0]["rules"][1]["expression"],
+        after["rules"][1]["expression"]
+    );
+    assert_eq!(
+        traced_after["evaluations"][0]["rules"][1]["conditions"][1]["expression"],
+        r#"!dport("853")"#
     );
     fixture.shutdown().await;
 }

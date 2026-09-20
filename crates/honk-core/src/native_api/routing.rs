@@ -198,16 +198,44 @@ pub(crate) struct RoutingTraceResponse {
     pub(crate) dns: Vec<Value>,
 }
 
-async fn pin(
+async fn evaluate_current(
     state: &NativeState,
+    input: &TraceInput,
     deadline: Instant,
     id: &RequestId,
-) -> Result<(Router, u64), ApiError> {
+) -> Result<(RoutingEvaluation, u64), ApiError> {
     tokio::time::timeout_at(deadline.into(), async {
         let router = state.traffic_router.read().await;
-        let _config = state.config.read().await;
+        let config = state.config.read().await;
         let generation = state.diagnostics.read().generation;
-        (router.clone(), generation)
+        let mut evaluation =
+            evaluate(&router, &state.instance_id, generation, input, deadline, id)?;
+        let mut order: Vec<_> = config.routing.rules.iter().enumerate().collect();
+        order.sort_by_key(|(_, rule)| rule.priority);
+        for ((evaluated, compiled), (source_index, configured)) in evaluation
+            .rules
+            .iter_mut()
+            .zip(router.compiled_routes())
+            .zip(order)
+        {
+            check_deadline(deadline, id)?;
+            let Some((_, _, source)) = state
+                .observation
+                .configuration
+                .rule_source(Some(source_index))
+            else {
+                continue;
+            };
+            if !source.expression.is_empty() {
+                evaluated.expression = source.expression;
+            }
+            for (condition, compiled) in evaluated.conditions.iter_mut().zip(&compiled.conditions) {
+                check_deadline(deadline, id)?;
+                condition.expression = router.condition_display(compiled, &configured.condition);
+            }
+        }
+        check_deadline(deadline, id)?;
+        Ok((evaluation, generation))
     })
     .await
     .map_err(|_| {
@@ -217,7 +245,7 @@ async fn pin(
             "Routing snapshot is unavailable",
             id,
         )
-    })
+    })?
 }
 
 pub(super) async fn trace(
@@ -261,15 +289,7 @@ pub(super) async fn trace(
             id,
         ));
     }
-    let (router, generation) = pin(state, deadline, id).await?;
-    let evaluation = evaluate(
-        &router,
-        &state.instance_id,
-        generation,
-        &request.input,
-        deadline,
-        id,
-    )?;
+    let (evaluation, generation) = evaluate_current(state, &request.input, deadline, id).await?;
     Ok(Json(RoutingTraceResponse {
         mode: "simulation",
         instance_id: state.instance_id.clone(),

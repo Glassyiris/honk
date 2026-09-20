@@ -1,6 +1,6 @@
 //! Side-effect-free inspection of the accepted compiled routing policy.
 
-use std::time::Instant;
+use std::{fmt::Write, time::Instant};
 
 use super::{CompiledCondition, CompiledPredicate, PredicateInput, Router};
 
@@ -29,6 +29,66 @@ pub(crate) enum TraceError {
 }
 
 impl Router {
+    pub(crate) fn condition_display(
+        &self,
+        compiled: &CompiledCondition,
+        configured: &honk_config::routing::RoutingCondition,
+    ) -> String {
+        macro_rules! field {
+            ($name:ident) => {
+                if compiled.not {
+                    configured.not.$name.as_slice()
+                } else {
+                    configured.$name.as_slice()
+                }
+            };
+        }
+        // Select by the compiled predicate, not source order: domain/geosite split,
+        // while explicit destination IPs and geoip alternatives share one predicate.
+        let (kind, fields): (&str, &[(&str, &[String])]) = match &compiled.predicate {
+            CompiledPredicate::Domain(id) => match &self.domain_matchers[*id as usize] {
+                super::DomainMatcher::Ordinary { .. } => (
+                    "domain",
+                    &[
+                        ("full: ", field!(domain)),
+                        ("suffix: ", field!(domain_suffix)),
+                        ("keyword: ", field!(domain_keyword)),
+                        ("regex: ", field!(domain_regex)),
+                    ],
+                ),
+                super::DomainMatcher::Geosite { .. } => {
+                    ("domain", &[("geosite: ", field!(geosite))])
+                }
+            },
+            CompiledPredicate::DestinationIp(_) => {
+                ("dip", &[("", field!(ip)), ("geoip: ", field!(geo_ip))])
+            }
+            CompiledPredicate::SourceIp(_) => ("sip", &[("", field!(source_ip))]),
+            CompiledPredicate::DestinationPort(_) => ("dport", &[("", field!(port))]),
+            CompiledPredicate::SourcePort(_) => ("sport", &[("", field!(source_port))]),
+            CompiledPredicate::Protocol(_) => ("l4proto", &[("", field!(protocol))]),
+            CompiledPredicate::IpVersion(_) => ("ipversion", &[("", field!(ip_version))]),
+            CompiledPredicate::Dscp(_) => ("dscp", &[("", field!(dscp))]),
+            CompiledPredicate::ProcessName(_) => ("pname", &[("", field!(process_name))]),
+            CompiledPredicate::Mac(_) => ("mac", &[("", field!(mac))]),
+        };
+        let mut display = String::new();
+        if compiled.not {
+            display.push('!');
+        }
+        display.push_str(kind);
+        display.push('(');
+        let mut separator = "";
+        for (prefix, values) in fields {
+            for value in *values {
+                write!(display, "{separator}{prefix}{value:?}").unwrap();
+                separator = ", ";
+            }
+        }
+        display.push(')');
+        display
+    }
+
     pub(crate) fn simulate(
         &self,
         input: PredicateInput<'_>,

@@ -28,6 +28,70 @@ fn geoip(first: u8) -> Vec<u8> {
     delimited(1, &entry)
 }
 
+#[tokio::test]
+async fn trace_displays_configured_values_in_compiled_condition_order() {
+    let fixture = Fixture::new_custom(Access::Metadata, false, |root, files| {
+        let directory = root.join("state");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("geosite.dat"), geosite("old.example")).unwrap();
+        std::fs::write(directory.join("geoip.dat"), geoip(198)).unwrap();
+        files.insert("locked.dae", "routing {\n pname(curl) && !dport(53) && dip(192.0.2.0/24, geoip: test) && domain(keyword: example, geosite: test) -> block\n !domain(geosite: test) && !dip(geoip: test) -> direct\n}\n".into());
+    }).await;
+    let dictionary = fixture.get("/api/v1/rules").await;
+    let trace = |domain| {
+        fixture.request(Method::POST, "/api/v1/routing/trace").json(&json!({
+        "input":{"network":"tcp","domain":domain,"dst_ip":"192.0.2.1","dst_port":443,"pname":"curl"},
+        "resolve":"none"
+    }))
+    };
+    let matched = ok(trace("old.example").send().await.unwrap()).await;
+    let evaluation = &matched["evaluations"][0];
+    assert_eq!(matched["generation_id"], dictionary["generation_id"]);
+    assert_eq!(evaluation["outbound"], "block");
+    assert_eq!(
+        evaluation["rules"][0]["rule_id"],
+        dictionary["rules"][0]["rule_id"]
+    );
+    assert_eq!(
+        evaluation["rules"][0]["expression"],
+        dictionary["rules"][0]["expression"]
+    );
+    let conditions = evaluation["rules"][0]["conditions"].as_array().unwrap();
+    assert_eq!(
+        conditions
+            .iter()
+            .map(|row| row["expression"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            r#"domain(keyword: "example")"#,
+            r#"domain(geosite: "test")"#,
+            r#"dip("192.0.2.0/24", geoip: "test")"#,
+            r#"pname("curl")"#,
+            r#"!dport("53")"#,
+        ]
+    );
+    assert!(conditions.iter().all(|row| row["result"] == "matched"));
+    let not_matched = ok(trace("other.example").send().await.unwrap()).await;
+    let evaluation = &not_matched["evaluations"][0];
+    assert_eq!(evaluation["outbound"], "direct");
+    assert_eq!(evaluation["rules"][0]["conditions"][0]["result"], "matched");
+    assert_eq!(
+        evaluation["rules"][0]["conditions"][1]["result"],
+        "not_matched"
+    );
+    assert_eq!(evaluation["rules"][0]["conditions"][2]["result"], "skipped");
+    assert_eq!(
+        evaluation["rules"][1]["conditions"][0]["expression"],
+        r#"!domain(geosite: "test")"#
+    );
+    assert_eq!(
+        evaluation["rules"][1]["conditions"][1]["expression"],
+        r#"!dip(geoip: "test")"#
+    );
+    assert_eq!(evaluation["rules"][1]["result"], "matched");
+    fixture.shutdown().await;
+}
+
 struct AssetServer {
     address: SocketAddr,
     requests: Arc<AtomicUsize>,
