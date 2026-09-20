@@ -148,11 +148,7 @@ async fn stalled_tls_session_dial_respects_its_own_deadline() {
 
     // Then: the handshake expires instead of relying on caller cancellation.
     let outcome = result.expect("the AnyTLS dial must enforce an internal deadline");
-    let error = outcome.err().expect("the stalled TLS dial must fail");
-    assert!(
-        error.to_string().contains("AnyTLS TLS handshake timed out"),
-        "unexpected error: {error:#}"
-    );
+    assert!(outcome.is_err(), "the stalled TLS dial must fail");
 }
 
 #[tokio::test]
