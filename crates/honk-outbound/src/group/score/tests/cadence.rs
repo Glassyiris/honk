@@ -157,6 +157,11 @@ fn expired_backoff_gets_bounded_recovery_despite_normal_exclusion() {
     let nodes = [node("working"), node("failed")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
+    let aggregate = ScoreSelectionContext {
+        target: None,
+        target_family: None,
+        ..target.clone()
+    };
     let now = Instant::now();
     for leaf in &nodes {
         train_at(
@@ -178,10 +183,41 @@ fn expired_backoff_gets_bounded_recovery_despite_normal_exclusion() {
     }
     for _ in 0..32 {
         assert_eq!(rank_at(&manager, &nodes, &target, now), 0);
+        assert_eq!(rank_at(&manager, &nodes, &aggregate, now), 0);
     }
     let expired = now + SCORE_EXPLORE_BACKOFF_BASE * 4 + Duration::from_secs(1);
+    let mut active = Vec::new();
+    for leaf in &nodes {
+        let feedback = manager
+            .feedback_for_group_node("score", leaf.id, target.clone())
+            .unwrap();
+        for _ in 0..4 {
+            let reporter = feedback.start_at(expired);
+            reporter.setup_succeeded_at(expired);
+            reporter.transfer_at(1, 1, expired);
+            active.push(reporter);
+        }
+        probe_at(
+            &manager,
+            leaf,
+            &target,
+            ScoreSource::HealthProbe,
+            Duration::from_millis(100),
+            expired,
+        );
+    }
+    let recovered = manager
+        .score_state()
+        .verification_snapshot_at("score", &aggregate, &[&nodes[1]], expired)
+        .unwrap();
+    assert_eq!(recovered.state, ScoreVerificationState::ObservedUsable);
     assert_eq!(rank_at(&manager, &nodes, &target, expired), 1);
     assert_eq!(rank_at(&manager, &nodes, &target, expired), 0);
+    assert_eq!(rank_at(&manager, &nodes, &aggregate, expired), 1);
+    assert_eq!(rank_at(&manager, &nodes, &aggregate, expired), 0);
+    for reporter in active {
+        reporter.finish_at(ScoreOutcome::Cancelled, true, expired);
+    }
 }
 
 #[test]

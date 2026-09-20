@@ -87,7 +87,7 @@ pub(super) struct VerificationEvidence {
 impl VerificationEvidence {
     pub(super) fn new(stats: &Stats, now: Instant) -> Self {
         Self {
-            business: stats.useful_business.snapshot(now),
+            business: stats.availability.snapshot(now),
             performance: stats.performance.snapshot(now),
             failed_at: stats.failed_at,
         }
@@ -117,8 +117,6 @@ fn qualified(metric: MetricSnapshot) -> bool {
 
 pub(super) fn usable(score: &ScoreSnapshot) -> bool {
     qualified(score.verification.business)
-        && score.useful_completed >= PERFORMANCE_VALIDATION_SAMPLES
-        && score.fail_streak == 0
 }
 
 fn milliseconds(duration: Duration) -> u64 {
@@ -192,7 +190,14 @@ pub(super) fn evaluate(
             || degraded_at
                 .is_some_and(|at| response(score).observed_at.is_none_or(|seen| seen < at))
     };
-    let gap = |score: &ScoreSnapshot| !excluded(score) && (!usable(score) || response_gap(score));
+    // Live availability can precede the qualification needed to compete with trained candidates.
+    let gap = |score: &ScoreSnapshot| {
+        !excluded(score)
+            && (!usable(score)
+                || response_gap(score)
+                || score.fail_streak > 0
+                || (baseline.any_qualified && !score.qualified()))
+    };
     let availability = snapshots
         .iter()
         .filter(relevant)
@@ -286,34 +291,37 @@ pub(super) fn evaluate(
         };
     }
     let mut oldest = None;
-    let mut support_metric = |metric: MetricSnapshot| {
+    let mut expires_at = None;
+    let mut support_metric = |metric: MetricSnapshot, lifetime: Duration| {
         if let Some(at) = metric.observed_at {
             oldest = Some(oldest.map_or(at, |old: Instant| old.min(at)));
+            let until = at + lifetime;
+            expires_at = Some(expires_at.map_or(until, |old: Instant| old.min(until)));
         }
     };
     let mut claims = 0;
     if usable(winner) {
         claims |= claim(ScoreEvidenceKind::Availability);
-        support_metric(winner.verification.business);
+        support_metric(winner.verification.business, LIVE_QUALIFICATION_TTL);
     }
     if !excluded(winner) && !response_gap(winner) {
         claims |= claim(ScoreEvidenceKind::Response);
-        support_metric(response(winner));
+        support_metric(response(winner), PERFORMANCE_MAX_AGE / 2);
     }
     if comparison != ScoreComparison::Unconfirmed {
         claims |= claim(ScoreEvidenceKind::Response);
         for score in snapshots.iter().filter(relevant) {
-            support_metric(response(score));
+            support_metric(response(score), PERFORMANCE_MAX_AGE / 2);
             if !use_probe {
-                support_metric(score.verification.business);
+                support_metric(score.verification.business, LIVE_QUALIFICATION_TTL);
             }
         }
     }
     if let Some(metric) = transfer_metric {
         claims |= claim(ScoreEvidenceKind::Transfer);
         for score in snapshots.iter().filter(relevant) {
-            support_metric(metric(score));
-            support_metric(score.verification.business);
+            support_metric(metric(score), PERFORMANCE_MAX_AGE / 2);
+            support_metric(score.verification.business, LIVE_QUALIFICATION_TTL);
         }
     }
     let focused = cadence.and_then(|cadence| {
@@ -343,7 +351,7 @@ pub(super) fn evaluate(
     let actionable = snapshots
         .iter()
         .any(|score| gap(score) && !score.explore_backed_off);
-    let next_action = if availability || missing_response {
+    let next_action = if pending_count > 0 {
         if actionable {
             ScoreValidationAction::NextBusinessFlow
         } else {
@@ -364,26 +372,13 @@ pub(super) fn evaluate(
         }
     }
     (basis as u8).hash(&mut hasher);
-    let mut expires_at = oldest.map(|at| at + PERFORMANCE_MAX_AGE / 2);
-    for (index, score) in snapshots.iter().enumerate() {
-        let supports_business = (index == selected && usable(score))
-            || (!excluded(score)
-                && (transfer_metric.is_some()
-                    || (comparison != ScoreComparison::Unconfirmed && !use_probe)));
-        if supports_business {
-            let remaining = Duration::from_secs_f64(
-                (score.useful_completed / PERFORMANCE_VALIDATION_SAMPLES)
-                    .log2()
-                    .max(0.0)
-                    * SCORE_EVIDENCE_HALF_LIFE.as_secs_f64(),
-            );
-            expires_at = expires_at.map(|at| at.min(now + remaining));
-        }
-        if comparison != ScoreComparison::Unconfirmed
+    for score in snapshots {
+        if (comparison != ScoreComparison::Unconfirmed || transfer_metric.is_some())
             && excluded(score)
             && let Some(at) = score.verification.failed_at
         {
-            expires_at = expires_at.map(|until| until.min(at + PERFORMANCE_MAX_AGE));
+            let until = at + PERFORMANCE_MAX_AGE;
+            expires_at = Some(expires_at.map_or(until, |old| old.min(until)));
         }
     }
     Evaluation {
@@ -537,7 +532,7 @@ impl ScorePolicyState {
         if lost {
             let counter = if previous
                 .and_then(|history| history.expires_at)
-                .is_some_and(|at| now > at)
+                .is_some_and(|at| now >= at)
             {
                 &mut counts.expired
             } else {

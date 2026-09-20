@@ -96,8 +96,8 @@ fn active_udp_keeps_earned_qualification_without_inventing_completions() {
             now + Duration::from_secs(662),
         )
         .unwrap();
-    assert_eq!(verification.state, ScoreVerificationState::Provisional);
-    assert_eq!(verification.evidence_age_ms, None);
+    assert_eq!(verification.state, ScoreVerificationState::ObservedUsable);
+    assert_eq!(verification.evidence_age_ms, Some(0));
     let reasons = state.selection_reason_counts("score", SelectionNetwork::Udp);
     assert_eq!(reasons.incumbent_ineligible, 0);
     assert_eq!(reasons.ordinary_switch, 0);
@@ -258,7 +258,7 @@ fn publishable_business_rx_restores_hold_but_never_settles_the_flow() {
     );
     assert_eq!(recovered[0].fail_streak, 1);
     assert!(recovered[0].explore_backed_off);
-    assert!(recovered[0].verification.business.value.is_none());
+    assert!(recovered[0].verification.business.confidence < 1.0);
     assert_eq!(rank_at(&manager, &nodes, &target, at), 0);
     let reasons = manager
         .score_state()
@@ -293,7 +293,7 @@ fn publishable_business_rx_restores_hold_but_never_settles_the_flow() {
         cancelled[0].attempts,
         published[0].attempts - (-1.0_f64 / 1800.0).exp2(),
     );
-    assert!(cancelled[0].verification.business.value.is_none());
+    assert!(cancelled[0].verification.business.confidence < 1.0);
 
     let last_failure_at = published_at + Duration::from_secs(1);
     let last_failure = feedback.start_at(last_failure_at);
@@ -429,7 +429,7 @@ fn reload_and_eviction_fence_progress_without_disabling_surviving_reporters() {
         performance_baseline(&surviving)
     ));
     assert_close(surviving[0].useful_completed, stale[0].useful_completed);
-    assert!(surviving[0].verification.business.value.is_none());
+    assert!(surviving[0].verification.business.confidence < 1.0);
 
     let new_feedback = replacement
         .feedback_for_group_node("score", nodes[0].id, target.clone())
@@ -528,7 +528,7 @@ fn delayed_terminal_bridges_qualification_to_already_observed_newer_rx() {
     }
     let state = manager.score_state();
     let started = now + Duration::from_secs(1802);
-    let cells = state.start_at(&target, feedback.attributions(), started);
+    let mut cells = state.start_at(&target, feedback.attributions(), started);
     train_at(
         &manager,
         &nodes[1],
@@ -551,13 +551,14 @@ fn delayed_terminal_bridges_qualification_to_already_observed_newer_rx() {
         tx: 1,
         rx: 1,
         last_rx_at: Some(now + Duration::from_secs(1851)),
+        eligible_rx_at: Some(now + Duration::from_secs(1851)),
         elapsed: terminal_at.duration_since(started),
         count_usefulness: true,
     };
     state.finish_at(
         &target,
         feedback.attributions(),
-        &cells,
+        &mut cells,
         &sample,
         terminal_at,
     );

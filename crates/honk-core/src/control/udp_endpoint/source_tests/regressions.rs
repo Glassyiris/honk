@@ -1,89 +1,6 @@
 use super::*;
 const OTHER_SCORE_NODE_ID: uuid::Uuid = uuid::Uuid::from_u128(0x5c07e);
 
-fn source_runtime(
-    server: SocketAddr,
-    capacity: usize,
-) -> (
-    Node,
-    Arc<OutboundRuntimeRegistry>,
-    Arc<honk_outbound::runtime::NodeRuntime>,
-) {
-    let node = vless_node(server);
-    let generation = Arc::new(
-        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
-            std::slice::from_ref(&node),
-            capacity,
-            capacity,
-            capacity,
-            None,
-        )
-        .unwrap()
-        .0,
-    );
-    let runtime = generation.get(&node.id).unwrap();
-    (node, generation, runtime)
-}
-
-async fn attach_source(
-    pool: &Arc<UdpEndpointPool>,
-    generation: &Arc<OutboundRuntimeRegistry>,
-    runtime: &Arc<honk_outbound::runtime::NodeRuntime>,
-    client: SocketAddr,
-    target: SocketAddr,
-    alive: &Arc<honk_outbound::alive::AliveDialerSet>,
-    stats: &Arc<StatsManager>,
-) -> SourceAttachment {
-    pool.prepare_vless_source(
-        Arc::clone(generation),
-        Arc::clone(runtime),
-        client,
-        VlessUdpPath::Xudp,
-        None,
-        target,
-        None,
-        Duration::from_secs(2),
-        Arc::clone(alive),
-        Arc::clone(stats),
-        honk_outbound::alive::IpVersion::V4,
-    )
-    .await
-    .unwrap()
-    .commit(pool)
-    .await
-    .unwrap()
-}
-
-fn source_endpoint(
-    pool: &Arc<UdpEndpointPool>,
-    attachment: SourceAttachment,
-    target: SocketAddr,
-    stats: &Arc<StatsManager>,
-    node_id: uuid::Uuid,
-    reporter: Option<honk_outbound::group::ScoreReporter>,
-) -> Arc<UdpEndpoint> {
-    Arc::new(UdpEndpoint::new_source_scored(
-        attachment,
-        target,
-        None,
-        Arc::new(pool.create_reply_socket(target).unwrap()),
-        stats.outbound_tracker("core-source-vless"),
-        node_id,
-        honk_outbound::alive::IpVersion::V4,
-        reporter,
-    ))
-}
-
-fn score_context(target: SocketAddr) -> honk_outbound::group::ScoreSelectionContext {
-    honk_outbound::group::ScoreSelectionContext {
-        network: honk_outbound::group::SelectionNetwork::Udp,
-        probe_domain: honk_outbound::alive::ProbeDomain::DataUdp,
-        target_family: Some(honk_outbound::alive::IpVersion::V4),
-        health_family: honk_outbound::alive::IpVersion::V4,
-        target: Some(target.into()),
-    }
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn queued_source_view_timeout_is_local_congestion() {
     let (server, mut events, wire_task) = start_wire_peer().await;
@@ -316,6 +233,7 @@ async fn admitted_source_transport_timeout_still_demotes_health() {
         first_ack_rx.await.unwrap().unwrap_err().kind(),
         io::ErrorKind::TimedOut
     );
+    assert_eq!(endpoint.upload.load(Ordering::Relaxed), 0);
     assert!(!alive.is_alive_for(
         node.id,
         honk_outbound::alive::ProbeDomain::DataUdp,

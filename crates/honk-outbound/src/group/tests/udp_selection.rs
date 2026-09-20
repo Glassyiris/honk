@@ -190,6 +190,164 @@ fn assert_udp_selection(manager: &GroupManager, group: &str, expected: Option<&s
     }
 }
 
+fn udp_incapable_nodes() -> [Node; 2] {
+    use honk_config::node::{OutboundConfig, VlessConfig, VmessConfig};
+
+    let uuid = "00000000-0000-0000-0000-000000000001";
+    [
+        (
+            "vmess",
+            OutboundConfig::Vmess(VmessConfig {
+                uuid: Some(uuid.into()),
+                ..Default::default()
+            }),
+        ),
+        (
+            "vless-tcp",
+            OutboundConfig::Vless(VlessConfig {
+                uuid: Some(uuid.into()),
+                network: Some("tcp".into()),
+                ..Default::default()
+            }),
+        ),
+    ]
+    .map(|(name, outbound)| {
+        let mut node = Node {
+            name: name.into(),
+            address: "127.0.0.1:443".into(),
+            host: "127.0.0.1".into(),
+            port: 443,
+            outbound,
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        node
+    })
+}
+
+#[test]
+fn score_udp_capability_filters_selection_verification_and_nested_finals() {
+    use honk_config::node::{Udp443Policy, VlessMultiplex};
+
+    let mut capable =
+        Node::from_share_link("vless://00000000-0000-0000-0000-000000000002@127.0.0.1:443#udp")
+            .unwrap();
+    capable.vless_mut().unwrap().multiplex = VlessMultiplex::xray(8, 0, Udp443Policy::Reject);
+    capable.id = capable.derive_id();
+    let mut nodes = udp_incapable_nodes().to_vec();
+    let incapable_ids: Vec<_> = nodes.iter().map(|node| node.id).collect();
+    nodes.push(capable);
+    let score = make_group(
+        "score",
+        GroupPolicy::Score,
+        nodes.iter().map(|node| node.id).collect(),
+    );
+    let mut incapable = make_group("incapable", GroupPolicy::Score, incapable_ids);
+    incapable.final_outbound = Some("terminal".into());
+    let mut terminal = make_group("terminal", GroupPolicy::Score, vec![nodes[1].id]);
+    terminal.final_outbound = Some("block".into());
+    let parent = make_subgroup("parent", GroupPolicy::Selector, &["incapable"]);
+    let groups = [score, incapable, terminal, parent];
+    let alive = Arc::new(AliveDialerSet::new());
+    for node in &nodes {
+        alive.register_node(node.id, node.name.clone(), node.address.clone());
+    }
+
+    for alive_set in [Some(alive), None] {
+        let manager = GroupManager::with_alive_set(&groups, &nodes, alive_set);
+        let counters = manager.score_verification_counters("score", SelectionNetwork::Udp);
+        let (selected, verification) = manager
+            .score_verification_for_network("score", SelectionNetwork::Udp)
+            .unwrap();
+        assert_eq!(
+            (selected.as_str(), verification.candidate_count),
+            ("udp", 1)
+        );
+        assert_eq!(
+            manager
+                .get_score_selection_for_network("score", SelectionNetwork::Udp)
+                .as_deref(),
+            Some("udp")
+        );
+        assert_eq!(
+            manager.score_verification_counters("score", SelectionNetwork::Udp),
+            counters
+        );
+        assert!(
+            manager
+                .score_verification_for_network("incapable", SelectionNetwork::Udp)
+                .is_none()
+        );
+        assert_eq!(
+            manager
+                .score_verification_for_network("score", SelectionNetwork::Tcp)
+                .unwrap()
+                .1
+                .candidate_count,
+            3
+        );
+        // Port-443 policy refusal belongs to dispatch, not capability filtering.
+        assert_udp_selection(&manager, "score", Some("udp"));
+        assert_udp_selection(&manager, "parent", Some("block"));
+        let context = ScoreSelectionContext::aggregate(
+            SelectionNetwork::Udp,
+            ProbeDomain::DataUdp,
+            IpVersion::V4,
+        );
+        assert_eq!(
+            manager
+                .selection_plan_for_target("parent", &context)
+                .entries[0]
+                .selection_chain,
+            ["parent", "incapable", "terminal", "block"]
+        );
+        assert_eq!(
+            manager
+                .ranked_udp_leaves("score", IpVersion::V4, 3)
+                .iter()
+                .map(|node| node.id)
+                .collect::<Vec<_>>(),
+            [nodes[2].id]
+        );
+    }
+}
+
+#[test]
+fn selector_udp_capability_keeps_the_pin_and_terminal_members() {
+    let mut nodes = udp_incapable_nodes().to_vec();
+    nodes.extend([
+        Node::from_share_link("socks5://127.0.0.1:1080#udp").unwrap(),
+        honk_config::Config::builtin_block_node(),
+        honk_config::Config::builtin_direct_node(),
+    ]);
+    let mut selector = make_group(
+        "selector",
+        GroupPolicy::Selector,
+        nodes.iter().map(|node| node.id).collect(),
+    );
+    selector.default = Some("udp".into());
+    let parent = make_subgroup("parent", GroupPolicy::Selector, &["selector"]);
+    let alive = Arc::new(AliveDialerSet::new());
+    for node in &nodes {
+        alive.register_node(node.id, node.name.clone(), node.address.clone());
+    }
+    for alive_set in [Some(alive), None] {
+        let manager =
+            GroupManager::with_alive_set(&[selector.clone(), parent.clone()], &nodes, alive_set);
+        for node in &nodes[..2] {
+            manager.set_selector_choice("selector", &node.name);
+            assert_udp_selection(&manager, "selector", None);
+            assert_udp_selection(&manager, "parent", None);
+            assert_eq!(manager.select_node("selector").unwrap().id, node.id);
+        }
+        for selected in ["udp", "block", "direct"] {
+            manager.set_selector_choice("selector", selected);
+            assert_udp_selection(&manager, "selector", Some(selected));
+            assert_udp_selection(&manager, "parent", Some(selected));
+        }
+    }
+}
+
 #[test]
 fn selector_udp_choice_does_not_fall_back_to_default_or_sibling() {
     let nodes = [make_node(nid("a"), "a"), make_node(nid("b"), "b")];

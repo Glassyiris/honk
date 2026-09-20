@@ -1,7 +1,7 @@
 use super::ranking::explore_backoff;
 use super::{
-    AggregateKey, ExactKey, FlowSample, LIVE_QUALIFICATION_TTL, MAX_THROUGHPUT_DURATION,
-    MIN_THROUGHPUT_BYTES, MIN_THROUGHPUT_DURATION, PERFORMANCE_MAX_AGE,
+    AggregateKey, Availability, ExactKey, FlowSample, LIVE_QUALIFICATION_TTL,
+    MAX_THROUGHPUT_DURATION, MIN_THROUGHPUT_BYTES, MIN_THROUGHPUT_DURATION, PERFORMANCE_MAX_AGE,
     PERFORMANCE_VALIDATION_SAMPLES, RELIABILITY_CONFIDENCE_Z, SCORE_EVIDENCE_HALF_LIFE,
     ScoreAttribution, ScoreAuthority, ScoreOutcome, ScorePolicyState, ScoreSelectionContext,
     ScoreSource, StartedCells, Stats, WeightedMean,
@@ -92,6 +92,50 @@ impl WeightedMean {
     }
 }
 
+impl Availability {
+    fn invalidate(&mut self, at: Instant) {
+        self.epoch = self.epoch.saturating_add(1);
+        self.reporters = 0;
+        self.latest_rx_at = None;
+        self.valid_from = Some(self.valid_from.map_or(at, |old| old.max(at)));
+    }
+
+    fn record(&mut self, rx_at: Instant, now: Instant, credited: &mut Option<u64>) {
+        let latest = self.latest_rx_at.map_or(now, |at| at.max(now));
+        if let Some(at) = self.latest_rx_at
+            && now.saturating_duration_since(at) >= LIVE_QUALIFICATION_TTL
+        {
+            // Delayed publication cannot bridge a cohort that has already expired.
+            self.invalidate(at + LIVE_QUALIFICATION_TTL);
+        }
+        if rx_at > now
+            || latest.saturating_duration_since(rx_at) >= LIVE_QUALIFICATION_TTL
+            || self.valid_from.is_some_and(|start| rx_at < start)
+        {
+            return;
+        }
+        if *credited != Some(self.epoch) {
+            self.reporters = (self.reporters + 1).min(PERFORMANCE_VALIDATION_SAMPLES as u8);
+            *credited = Some(self.epoch);
+        }
+        self.latest_rx_at = Some(self.latest_rx_at.map_or(rx_at, |at| at.max(rx_at)));
+    }
+
+    pub(super) fn snapshot(&self, now: Instant) -> MetricSnapshot {
+        let Some(at) = self.latest_rx_at else {
+            return MetricSnapshot::default();
+        };
+        if now.saturating_duration_since(at) >= LIVE_QUALIFICATION_TTL || self.reporters == 0 {
+            return MetricSnapshot::default();
+        }
+        MetricSnapshot {
+            value: Some(1.0),
+            confidence: f64::from(self.reporters) / PERFORMANCE_VALIDATION_SAMPLES,
+            observed_at: Some(at),
+        }
+    }
+}
+
 pub(super) enum Observation {
     Setup(Duration),
     Response(Duration),
@@ -153,7 +197,13 @@ impl Stats {
         }
     }
 
-    fn observe(&mut self, observation: &Observation, source: ScoreSource, now: Instant) {
+    fn observe(
+        &mut self,
+        observation: &Observation,
+        source: ScoreSource,
+        now: Instant,
+        credited: &mut Option<u64>,
+    ) {
         match (source, observation) {
             (
                 ScoreSource::Traffic,
@@ -215,6 +265,7 @@ impl Stats {
                     .business_invalidated_through
                     .is_none_or(|fence| *rx_at > fence) =>
             {
+                self.availability.record(*rx_at, now, credited);
                 self.last_business_rx_at = Some(
                     self.last_business_rx_at
                         .map_or(*rx_at, |seen| seen.max(*rx_at)),
@@ -258,7 +309,7 @@ impl Stats {
     }
 
     pub(super) fn invalidate_business(&mut self, now: Instant) {
-        self.useful_business = WeightedMean::default();
+        self.availability.invalidate(now);
         self.qualified_until = None;
         self.business_invalidated_through = Some(
             self.business_invalidated_through
@@ -305,24 +356,6 @@ impl Stats {
                         Some(self.last_business_rx_at.map_or(at, |seen| seen.max(at)));
                     self.retain_qualification(at, now);
                 }
-                if let Some(at) = sample.last_rx_at
-                    && now.saturating_duration_since(at) < PERFORMANCE_MAX_AGE
-                    && self
-                        .business_invalidated_through
-                        .is_none_or(|fence| at > fence)
-                {
-                    // Terminal order is not RX order; expired weight must not be revived.
-                    if self.useful_business.observed_at.is_some_and(|seen| {
-                        now.saturating_duration_since(seen) >= PERFORMANCE_MAX_AGE
-                    }) {
-                        self.useful_business = WeightedMean::default();
-                    }
-                    let at = self
-                        .useful_business
-                        .observed_at
-                        .map_or(at, |seen| seen.max(at));
-                    self.useful_business.record(1.0, at);
-                }
             } else {
                 self.useful_failure += 1.0;
             }
@@ -362,13 +395,14 @@ fn update_cell<K: std::hash::Hash + Eq>(
     cache: &mut LruCache<K, Stats>,
     key: &K,
     incarnation: Option<u64>,
-    update: &mut impl FnMut(&mut Stats, bool),
+    credited: &mut Option<u64>,
+    update: &mut impl FnMut(&mut Stats, &mut Option<u64>, bool),
     exact: bool,
 ) {
     if let Some(stats) = cache.get_mut(key)
         && Some(stats.incarnation) == incarnation
     {
-        update(stats, exact);
+        update(stats, credited, exact);
     }
 }
 
@@ -482,8 +516,8 @@ impl ScorePolicyState {
         inner: &mut super::StateInner,
         context: &ScoreSelectionContext,
         attributions: &[ScoreAttribution],
-        cells: &[StartedCells],
-        mut update: impl FnMut(&mut Stats, bool),
+        cells: &mut [StartedCells],
+        mut update: impl FnMut(&mut Stats, &mut Option<u64>, bool),
     ) {
         for (attribution, started) in attributions.iter().zip(cells) {
             if !inner
@@ -509,6 +543,7 @@ impl ScorePolicyState {
                     &mut inner.aggregate,
                     &key,
                     started.aggregate[index],
+                    &mut started.credited_aggregate[index],
                     &mut update,
                     false,
                 );
@@ -524,7 +559,14 @@ impl ScorePolicyState {
                     target: target.clone(),
                     node_id: attribution.node_id,
                 };
-                update_cell(&mut inner.exact, &key, started.exact, &mut update, true);
+                update_cell(
+                    &mut inner.exact,
+                    &key,
+                    started.exact,
+                    &mut started.credited_exact,
+                    &mut update,
+                    true,
+                );
             }
         }
     }
@@ -533,7 +575,7 @@ impl ScorePolicyState {
         inner: &mut super::StateInner,
         context: &ScoreSelectionContext,
         attributions: &[ScoreAttribution],
-        cells: &[StartedCells],
+        cells: &mut [StartedCells],
         source: ScoreSource,
         observation: Observation,
         now: Instant,
@@ -541,8 +583,8 @@ impl ScorePolicyState {
         if matches!(observation, Observation::BusinessProgress { .. }) && context.target.is_none() {
             return;
         }
-        Self::update_started(inner, context, attributions, cells, |stats, _| {
-            stats.observe(&observation, source, now)
+        Self::update_started(inner, context, attributions, cells, |stats, credited, _| {
+            stats.observe(&observation, source, now, credited)
         });
     }
 
@@ -551,7 +593,7 @@ impl ScorePolicyState {
         &self,
         context: &ScoreSelectionContext,
         attributions: &[ScoreAttribution],
-        cells: &[StartedCells],
+        cells: &mut [StartedCells],
         sample: &FlowSample,
     ) {
         self.finish_at(context, attributions, cells, sample, Instant::now());
@@ -561,7 +603,7 @@ impl ScorePolicyState {
         &self,
         context: &ScoreSelectionContext,
         attributions: &[ScoreAttribution],
-        cells: &[StartedCells],
+        cells: &mut [StartedCells],
         sample: &FlowSample,
         now: Instant,
     ) {
@@ -570,7 +612,24 @@ impl ScorePolicyState {
             context,
             attributions,
             cells,
-            |stats, exact| {
+            |stats, credited, exact| {
+                if context.target.is_some()
+                    && matches!(
+                        sample.outcome,
+                        ScoreOutcome::Success
+                            | ScoreOutcome::Rejected
+                            | ScoreOutcome::Cancelled
+                            | ScoreOutcome::Shutdown
+                    )
+                    && let Some(rx_at) = sample.eligible_rx_at
+                {
+                    stats.observe(
+                        &Observation::BusinessProgress { rx_at },
+                        sample.source,
+                        now,
+                        credited,
+                    );
+                }
                 stats.record_finish(
                     now,
                     sample,

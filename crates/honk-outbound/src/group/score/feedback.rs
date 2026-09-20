@@ -112,10 +112,10 @@ impl ScoreFeedback {
         ScoreReporter {
             shared: Arc::new(ReporterShared {
                 feedback: self.clone(),
-                cells: cells.into(),
                 started,
                 handles: AtomicUsize::new(1),
                 progress: Mutex::new(ReporterProgress {
+                    cells,
                     window_start: started,
                     setup: None,
                     first_response: false,
@@ -124,6 +124,8 @@ impl ScoreFeedback {
                     tx: 0,
                     rx: 0,
                     last_rx_at: None,
+                    first_tx_at: None,
+                    eligible_rx_at: None,
                     published_rx_at: None,
                     window_tx: 0,
                     window_rx: 0,
@@ -134,6 +136,7 @@ impl ScoreFeedback {
 }
 
 struct ReporterProgress {
+    cells: Vec<StartedCells>,
     setup: Option<Duration>,
     first_response: bool,
     probe: bool,
@@ -141,6 +144,8 @@ struct ReporterProgress {
     tx: u64,
     rx: u64,
     last_rx_at: Option<Instant>,
+    first_tx_at: Option<Instant>,
+    eligible_rx_at: Option<Instant>,
     published_rx_at: Option<Instant>,
     window_start: Instant,
     window_tx: u64,
@@ -149,7 +154,6 @@ struct ReporterProgress {
 
 struct ReporterShared {
     feedback: ScoreFeedback,
-    cells: Arc<[StartedCells]>,
     started: Instant,
     handles: AtomicUsize,
     progress: Mutex<ReporterProgress>,
@@ -183,7 +187,7 @@ impl ScoreReporter {
         let elapsed = now.saturating_duration_since(self.shared.started);
         progress.setup = Some(elapsed);
         progress.window_start = now;
-        self.observe(Observation::Setup(elapsed), now);
+        self.observe(Observation::Setup(elapsed), now, &mut progress);
     }
 
     pub fn setup_failed(&self, outcome: ScoreOutcome) {
@@ -203,6 +207,7 @@ impl ScoreReporter {
         self.observe(
             Observation::Response(now.saturating_duration_since(self.shared.started)),
             now,
+            &mut progress,
         );
     }
 
@@ -225,6 +230,7 @@ impl ScoreReporter {
                 slot: super::evidence::probe_slot(&feedback.context),
             },
             now,
+            &mut progress,
         );
     }
 
@@ -232,11 +238,32 @@ impl ScoreReporter {
         self.transfer_at(bytes, 0, Instant::now());
     }
 
+    /// Record a successful send whose receiver can run before its completion callback.
+    /// `started_at` must follow core send serialization checks, not source-gate queue entry.
+    pub fn tx_completed(&self, bytes: u64, started_at: Instant) {
+        self.transfer_with_send_start_at(bytes, 0, Some(started_at), None);
+    }
+
+    #[cfg(test)]
+    pub(super) fn tx_completed_at(&self, bytes: u64, started_at: Instant, now: Instant) {
+        self.transfer_with_send_start_at(bytes, 0, Some(started_at), Some(now));
+    }
+
     pub fn rx(&self, bytes: u64) {
         self.transfer_at(0, bytes, Instant::now());
     }
 
     pub(super) fn transfer_at(&self, tx: u64, rx: u64, now: Instant) {
+        self.transfer_with_send_start_at(tx, rx, None, Some(now));
+    }
+
+    fn transfer_with_send_start_at(
+        &self,
+        tx: u64,
+        rx: u64,
+        send_started_at: Option<Instant>,
+        now: Option<Instant>,
+    ) {
         if tx == 0 && rx == 0 {
             return;
         }
@@ -244,6 +271,9 @@ impl ScoreReporter {
         if progress.finished {
             return;
         }
+        // A receive can publish while this completion waits for the reporter lock.
+        let now = now.unwrap_or_else(Instant::now);
+        let send_started_at = send_started_at.filter(|at| tx > 0 && progress.tx == 0 && *at <= now);
         progress.tx = progress.tx.saturating_add(tx);
         progress.rx = progress.rx.saturating_add(rx);
         if self.shared.feedback.source != ScoreSource::Traffic {
@@ -251,16 +281,36 @@ impl ScoreReporter {
         }
         if rx > 0 {
             progress.last_rx_at = Some(progress.last_rx_at.map_or(now, |at| at.max(now)));
-            if progress.setup.is_some()
-                && progress.tx > 0
-                && self.shared.feedback.context.target.is_some()
-                && progress
-                    .published_rx_at
-                    .is_none_or(|at| now.saturating_duration_since(at) >= LIVE_RX_INTERVAL)
+        }
+        if tx > 0 {
+            let at = send_started_at.unwrap_or(now);
+            progress.first_tx_at = Some(progress.first_tx_at.map_or(at, |seen| seen.min(at)));
+        }
+        let rx_at = if rx > 0 {
+            Some(now)
+        } else {
+            send_started_at.and_then(|started| {
+                progress
+                    .last_rx_at
+                    .filter(|at| *at >= started && *at <= now)
+            })
+        };
+        if let Some(rx_at) = rx_at
+            && progress
+                .setup
+                .is_some_and(|setup| rx_at >= self.shared.started + setup)
+            && progress.first_tx_at.is_some_and(|at| rx_at >= at)
+            && self.shared.feedback.context.target.is_some()
+        {
+            progress.eligible_rx_at =
+                Some(progress.eligible_rx_at.map_or(rx_at, |at| at.max(rx_at)));
+            if progress
+                .published_rx_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= LIVE_RX_INTERVAL)
             {
-                // Bound scorer-lock traffic independently of packet rate; no timer turns silence into progress.
+                // A confirmed send can reconcile an already delivered reply; neither callback invents RX time.
                 progress.published_rx_at = Some(now);
-                self.observe(Observation::BusinessProgress { rx_at: now }, now);
+                self.observe(Observation::BusinessProgress { rx_at }, now, &mut progress);
             }
         }
         if now.saturating_duration_since(progress.window_start) > MAX_THROUGHPUT_DURATION {
@@ -291,13 +341,14 @@ impl ScoreReporter {
                 elapsed,
             },
             now,
+            progress,
         );
         progress.window_tx = 0;
         progress.window_rx = 0;
         progress.window_start = now;
     }
 
-    fn observe(&self, observation: Observation, now: Instant) {
+    fn observe(&self, observation: Observation, now: Instant, progress: &mut ReporterProgress) {
         let feedback = &self.shared.feedback;
         let mut inner = feedback.state.inner.lock();
         if feedback.source == ScoreSource::HealthProbe
@@ -312,7 +363,7 @@ impl ScoreReporter {
             &mut inner,
             &feedback.context,
             &feedback.attributions,
-            &self.shared.cells,
+            &mut progress.cells,
             feedback.source,
             observation,
             now,
@@ -348,13 +399,14 @@ impl ScoreReporter {
             tx: progress.tx,
             rx: progress.rx,
             last_rx_at: progress.last_rx_at,
+            eligible_rx_at: progress.eligible_rx_at,
             elapsed: now.saturating_duration_since(self.shared.started),
             count_usefulness,
         };
         feedback.state.finish_at(
             &feedback.context,
             &feedback.attributions,
-            &self.shared.cells,
+            &mut progress.cells,
             &sample,
             now,
         );
