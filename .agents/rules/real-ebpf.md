@@ -15,10 +15,15 @@ Score is always compiled, without a Cargo feature; omitted policy selects Select
 Native routing keeps domain resolution in the prologue for `domain_final`.
 Complete positive/negative port conditions precede the other conditions within
 each rule; non-domain facts use per-invocation READY-guarded bitmap copy/zero-fill.
-Missing facts count as resolved. Keep the emitter's private tests in
-`control/routing_matcher/codegen/tests.rs`; real decision/load goldens remain in
-`ebpf/real/routing/tests/`. Historical eager-emitter verifier counts do not apply
-to the later lazy control flow without a new measurement.
+Missing facts count as resolved. The READY mask is loaded back from the
+decision's zeroed `mark`, the unresolved areas are pre-filled from independent
+loads of that field, and each guard is a `jset` on the mask register itself; a
+constant mask, an area spilled from the mask register, or a guard on a copy of
+the mask each split verifier states per resolution history and multiply the walk
+of the later process-name chains (measured on Linux 6.12.107, roughly 3× for the
+#280 policy; `doc/en/design/routing.md`).
+Keep the emitter's private tests in `control/routing_matcher/codegen/tests.rs`;
+real decision/load goldens remain in `ebpf/real/routing/tests/`.
 
 `build.rs` always emits `HONK_VERSION` from the GitHub release tag, local `git describe`, or Cargo package version without Git metadata. `honk_core::VERSION` supplies both CLIs and Clash `/version`; runtime needs no Git. With `ebpf`, locate `crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf` or `target/honk-core.o` and **verify `.BTF`**. Missing, BTF-less or stale objects trigger a rebuild with the channel read from `crates/honk-ebpf/rust-toolchain.toml`, stripping child `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`: environment flags override `crates/honk-ebpf/.cargo/config.toml`'s `--btf` and silently omit BTF. The object records its compiler channel in a `.toolchain` sidecar; source or pin changes invalidate it. Copy to `OUT_DIR/honk-ebpf.o`, set `HONK_EBPF_OBJECT`; `lib.rs` embeds with `include_bytes!`. Runtime override: `--bpf-object`.
 

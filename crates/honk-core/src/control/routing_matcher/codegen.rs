@@ -8,8 +8,8 @@ use super::{KernelCondition, KernelPredicate, RoutingPushPlan};
 use anyhow::{Context, ensure};
 use aya_obj::generated::{
     BPF_ALU64, BPF_AND, BPF_B, BPF_CALL, BPF_DW, BPF_EXIT, BPF_IMM, BPF_JA, BPF_JEQ, BPF_JGE,
-    BPF_JGT, BPF_JMP, BPF_JNE, BPF_K, BPF_LD, BPF_LDX, BPF_MEM, BPF_MOV, BPF_OR, BPF_ST, BPF_STX,
-    BPF_W, BPF_X, bpf_insn,
+    BPF_JGT, BPF_JMP, BPF_JNE, BPF_JSET, BPF_K, BPF_LD, BPF_LDX, BPF_MEM, BPF_MOV, BPF_OR, BPF_ST,
+    BPF_STX, BPF_W, BPF_X, bpf_insn,
 };
 use honk_ebpf_common::{
     ROUTING_FACT_CAPACITY, ROUTING_FEATURE_DOMAIN, ROUTING_FEATURE_DOMAIN_REROUTE,
@@ -237,6 +237,20 @@ impl Assembler {
 /// (Destination/Source/MAC). Kept in R8, which callee-saves across the
 /// lookup helper; it says this call already resolved the category, not
 /// that the emitter merely emitted a lookup somewhere.
+///
+/// The verifier must not see its initial value as a constant. Initialized
+/// with `mov 0` it is one precise value per resolution history, states
+/// with different values cannot subsume each other, and every later
+/// process-name chain is walked once per value: the #280 policy cost
+/// 160k processed instructions that way against 54k when the mask is
+/// loaded back from the decision's just-zeroed `mark` (a memory load the
+/// verifier does not fold into a constant; zero at runtime). The lazily
+/// resolved areas are pre-filled from fresh loads of the same field, so a
+/// use verified before its resolution reads initialized stack, and the
+/// stored values share no scalar id with the mask: spilling the mask
+/// register itself links them and the walk splits again (133k). Measured
+/// on Linux 6.12.107; a verifier that tracks memory contents through the
+/// store would make the mask a constant again.
 const READY: u8 = R8;
 
 /// Emit a complete RoutingInput -> RoutingDecision function body.
@@ -276,7 +290,13 @@ pub fn emit_routing_program(
         (!plan.has_domain_rules || plan.features & ROUTING_FEATURE_DOMAIN_REROUTE == 0) as i32,
     )?;
     asm.st_imm(R7, RULE_ID, u32::MAX as i32)?;
-    asm.mov_imm(READY, 0)?;
+    asm.ldx_w(READY, R7, MARK)?;
+    for kind in [FactKind::Destination, FactKind::Source, FactKind::Mac] {
+        for word in 0..FACT_BYTES / 8 {
+            asm.ldx_w(R1, R7, MARK)?;
+            asm.stx_dw(R10, R1, kind.area() + word * 8)?;
+        }
+    }
 
     if plan.has_domain_rules {
         emit_fact_lookup(&mut asm, FactKind::Domain, &fds)?;
@@ -461,9 +481,16 @@ fn emit_condition(
 
 /// Test one bit of a lazily resolved category. The READY bit is set only
 /// after the lookup wrote all 32 bytes of the area, so a resolved
-/// all-zeros bitmap is never re-looked-up and an unresolved one is never
-/// read. Each use site carries its own guard, so a later rule still
-/// resolves a category an earlier rule skipped.
+/// all-zeros bitmap is never re-looked-up. Each use site carries its own
+/// guard, so a later rule still resolves a category an earlier rule
+/// skipped.
+///
+/// The guard tests the mask register itself with `jset`: the verifier
+/// refines that bit on both edges (known one on the skip edge, known zero
+/// then set by the `or` on the resolve edge), so the two paths agree on it
+/// at the bit test and can merge. Copying the mask into R0 and testing the
+/// copy leaves the register unrefined on the skip edge, and the join keeps
+/// two states (82k against 54k for the #280 policy, Linux 6.12.107).
 fn emit_fact_bit_lazy(
     asm: &mut Assembler,
     kind: FactKind,
@@ -474,12 +501,7 @@ fn emit_fact_bit_lazy(
 ) -> anyhow::Result<()> {
     let resolved = asm.label();
     let bit = 1i32 << (kind as u8 - 1);
-    // READY is a per-invocation bitmask; test the category bit, not
-    // equality against the whole mask (other resolved categories set
-    // other bits).
-    asm.mov_reg(R0, READY)?;
-    asm.and_imm(R0, bit)?;
-    asm.jump(BPF_JNE, R0, 0, resolved)?;
+    asm.jump(BPF_JSET, READY, bit, resolved)?;
     emit_fact_lookup(asm, kind, fds)?;
     asm.or_imm(READY, bit)?;
     asm.bind(resolved);

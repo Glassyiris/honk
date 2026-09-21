@@ -79,7 +79,7 @@ fn domain_lookup_stays_in_the_prologue_before_ports() {
     assert!(
         bytecode.insns[..calls[0]]
             .iter()
-            .any(|insn| fields(insn) == (BPF_ALU64 | BPF_MOV | BPF_K, READY, 0, 0, 0))
+            .any(|insn| fields(insn) == (BPF_LDX | BPF_W | BPF_MEM, READY, R7, MARK, 0))
     );
     let start = rule_start(&bytecode, 0);
     assert!(calls[0] < start);
@@ -87,6 +87,45 @@ fn domain_lookup_stays_in_the_prologue_before_ports() {
         fields(&bytecode.insns[start]),
         (BPF_LDX | BPF_W | BPF_MEM, R0, R6, INPUT_DST_PORT, 0)
     );
+}
+
+// The readiness mask and the unresolved areas are loaded back from the
+// decision's mark, zeroed just before and not written in between, never
+// set as constants; each area word comes from its own load.
+#[test]
+fn readiness_mask_and_lazy_areas_start_as_verifier_unknown_zeros() {
+    let bytecode = emit(&[rule(json!({"ip": ["203.0.113.0/24"]}), "proxy")]);
+    let insns = &bytecode.insns;
+    let zeroed = insns
+        .iter()
+        .position(|insn| fields(insn) == (BPF_ST | BPF_W | BPF_MEM, R7, 0, MARK, 0))
+        .unwrap();
+    let mask = zeroed + 4;
+    assert!(insns[zeroed + 1..mask].iter().all(|insn| {
+        insn.code as u32 == BPF_ST | BPF_W | BPF_MEM && insn.dst_reg() == R7 && insn.off != MARK
+    }));
+    assert_eq!(
+        fields(&insns[mask]),
+        (BPF_LDX | BPF_W | BPF_MEM, READY, R7, MARK, 0)
+    );
+    let mut index = mask + 1;
+    for area in [-64, -96, -128] {
+        for offset in [0, 8, 16, 24] {
+            assert_eq!(
+                fields(&insns[index]),
+                (BPF_LDX | BPF_W | BPF_MEM, R1, R7, MARK, 0)
+            );
+            assert_eq!(
+                fields(&insns[index + 1]),
+                (BPF_STX | BPF_DW | BPF_MEM, R10, R1, area + offset, 0)
+            );
+            index += 2;
+        }
+    }
+    assert_eq!(index, rule_start(&bytecode, 0));
+    assert!(!insns.iter().any(|insn| {
+        insn.code as u32 == BPF_ALU64 | BPF_MOV | BPF_K && insn.dst_reg() == READY
+    }));
 }
 
 #[test]
@@ -116,34 +155,37 @@ fn lazy_fact_guard_publishes_its_bit_after_copy_and_zero_paths() {
         asm.exit().unwrap();
         let bytecode = asm.finish().unwrap();
         let insns = &bytecode.insns;
+        // The guard tests the mask register itself; the resolution follows
+        // on the fall-through and publishes the bit before the bit test.
+        let resolved = jump_target(insns, 0);
         assert_eq!(
             fields(&insns[0]),
-            (BPF_ALU64 | BPF_MOV | BPF_X, R0, READY, 0, 0)
-        );
-        assert_eq!(
-            fields(&insns[1]),
-            (BPF_ALU64 | BPF_AND | BPF_K, R0, 0, 0, bit)
-        );
-        let resolved = jump_target(insns, 2);
-        assert_eq!(
-            fields(&insns[2]),
-            (BPF_JMP | BPF_JNE | BPF_K, R0, 0, (resolved - 3) as i16, 0)
+            (
+                BPF_JMP | BPF_JSET | BPF_K,
+                READY,
+                0,
+                (resolved - 1) as i16,
+                bit
+            )
         );
         let calls = lookups(&bytecode);
         assert_eq!(calls.len(), 1);
         let copy = calls[0] + 2;
         let absent = jump_target(insns, calls[0] + 1);
-        let publish = resolved - 1;
+        let publish = absent + 5;
         assert_eq!(jump_target(insns, copy + 8), publish);
-        assert_eq!(absent + 5, publish);
         assert_eq!(
             fields(&insns[publish]),
             (BPF_ALU64 | BPF_OR | BPF_K, READY, 0, 0, bit)
         );
+        assert_eq!(publish + 1, resolved);
         assert_eq!(
             fields(&insns[resolved]),
             (BPF_LDX | BPF_W | BPF_MEM, R2, R10, area + 28, 0)
         );
+        assert_eq!(insns[resolved + 3].code as u32, BPF_JMP | BPF_JA);
+        assert_eq!(jump_target(insns, resolved + 2), resolved + 4);
+        assert_eq!(jump_target(insns, resolved + 3), resolved + 6);
     }
 }
 
@@ -266,10 +308,8 @@ fn complete_positive_and_negative_ports_precede_ip_facts() {
         );
         start = next;
     }
-    assert_eq!(
-        fields(&insns[start]),
-        (BPF_ALU64 | BPF_MOV | BPF_X, R0, READY, 0, 0)
-    );
+    let (code, dst, _, _, imm) = fields(&insns[start]);
+    assert_eq!((code, dst, imm), (BPF_JMP | BPF_JSET | BPF_K, READY, 1));
     assert!(lookups(&bytecode)[0] > start);
 }
 
