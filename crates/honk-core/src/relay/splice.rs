@@ -68,15 +68,15 @@ enum SpliceError {
     /// capability probe, before any byte was moved).
     Unsupported,
     /// A regular I/O error.
-    Io(io::Error),
+    Io(super::RelayError),
 }
 
 impl SpliceError {
-    fn classify(err: io::Error) -> Self {
+    fn classify(err: io::Error, client_side: bool) -> Self {
         if is_unsupported_errno(&err) {
             SpliceError::Unsupported
         } else {
-            SpliceError::Io(err)
+            SpliceError::Io(super::RelayError::new(err, client_side))
         }
     }
 }
@@ -145,15 +145,18 @@ fn shutdown_write(stream: &TcpStream) {
 ///
 /// Returns the number of bytes staged in the pipe (0 when the source had no
 /// data ready or is already at EOF; the pump re-reads either way).
-fn probe(src: &TcpStream, pipe: &Pipe) -> Result<usize, SpliceError> {
+fn probe(src: &TcpStream, pipe: &Pipe, client_side: bool) -> Result<usize, SpliceError> {
     #[cfg(test)]
-    if let Some(errno) = test_hook::forced_probe_errno() {
-        return Err(SpliceError::classify(io::Error::from_raw_os_error(errno)));
+    if let Some(errno) = test_hook::forced_probe_errno(src.as_raw_fd()) {
+        return Err(SpliceError::classify(
+            io::Error::from_raw_os_error(errno),
+            client_side,
+        ));
     }
     match raw_splice(src, &pipe.write, pipe.capacity) {
         Ok(n) => Ok(n),
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
-        Err(e) => Err(SpliceError::classify(e)),
+        Err(e) => Err(SpliceError::classify(e, client_side)),
     }
 }
 
@@ -172,7 +175,7 @@ async fn pump(
     mut staged: usize,
     progress: &super::RelayProgress,
     upload: bool,
-) -> io::Result<u64> {
+) -> Result<u64, super::RelayError> {
     let mut total = 0u64;
     let counter = if upload {
         &progress.upload
@@ -191,7 +194,8 @@ async fn pump(
                 .async_io(Interest::READABLE, || {
                     raw_splice(src, &pipe.write, pipe.capacity)
                 })
-                .await?;
+                .await
+                .map_err(|error| super::RelayError::new(error, upload))?;
             if staged == 0 {
                 // Source reached EOF: propagate the half-close.
                 shutdown_write(dst);
@@ -210,13 +214,17 @@ async fn pump(
                     test_hook::wrote(dst.as_raw_fd(), n);
                     Ok(n)
                 })
-                .await?;
+                .await
+                .map_err(|error| super::RelayError::new(error, !upload))?;
             if n == 0 {
                 // A non-empty pipe must always make progress; bail out
                 // instead of spinning.
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "splice pipe→socket made no progress",
+                return Err(super::RelayError::new(
+                    io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "splice pipe→socket made no progress",
+                    ),
+                    !upload,
                 ));
             }
             staged -= n;
@@ -250,13 +258,15 @@ async fn run(
     upstream: &TcpStream,
     progress: super::OptionalRelayProgress,
 ) -> Result<(u64, u64), SpliceError> {
-    let pipe_c2p = Pipe::new().map_err(SpliceError::Io)?;
-    let pipe_p2c = Pipe::new().map_err(SpliceError::Io)?;
+    let pipe_c2p =
+        Pipe::new().map_err(|error| SpliceError::Io(super::RelayError::new(error, false)))?;
+    let pipe_p2c =
+        Pipe::new().map_err(|error| SpliceError::Io(super::RelayError::new(error, false)))?;
 
     // The probes run before any byte reaches a destination socket, so an
     // `Unsupported` verdict here still allows a lossless copy fallback.
-    let staged_c2p = probe(client, &pipe_c2p)?;
-    let staged_p2c = match probe(upstream, &pipe_p2c) {
+    let staged_c2p = probe(client, &pipe_c2p, true)?;
+    let staged_p2c = match probe(upstream, &pipe_p2c, false) {
         Ok(n) => n,
         Err(SpliceError::Unsupported) if staged_c2p == 0 => return Err(SpliceError::Unsupported),
         Err(SpliceError::Unsupported) => {
@@ -264,8 +274,9 @@ async fn run(
             // the same kind of fds), but bytes have left the client socket,
             // so a copy fallback would lose them. Fail instead of silently
             // corrupting the stream.
-            return Err(SpliceError::Io(io::Error::other(
-                "splice probe failed after staging bytes",
+            return Err(SpliceError::Io(super::RelayError::new(
+                io::Error::other("splice probe failed after staging bytes"),
+                false,
             )));
         }
         Err(e) => return Err(e),
@@ -344,7 +355,7 @@ pub async fn splice_bidirectional(
             io::ErrorKind::Unsupported,
             "splice(2) not supported for these sockets",
         )),
-        Err(SpliceError::Io(e)) => Err(e),
+        Err(SpliceError::Io(e)) => Err(e.error),
     }
 }
 
@@ -401,13 +412,13 @@ pub async fn relay_splice(
         Err(SpliceError::Io(e)) => {
             shutdown_write(client);
             shutdown_write(&upstream);
-            if !is_ignorable_connection_error(&e) {
+            if !is_ignorable_connection_error(&e.error) {
                 warn!(
                     "TCP splice relay error for {} → {}: {}",
-                    client_addr, target_addr, e
+                    client_addr, target_addr, e.error
                 );
             }
-            Err(e.into())
+            Err(e.into_anyhow())
         }
     }
 }
@@ -464,6 +475,7 @@ mod test_hook {
 
     /// When non-zero, `probe()` fails with this errno instead of splicing.
     static FORCED_PROBE_ERRNO: AtomicI32 = AtomicI32::new(0);
+    static FORCED_PROBE_FD: AtomicI32 = AtomicI32::new(-1);
     /// Number of `probe()` calls, to assert the probe is skipped once the
     /// global "unsupported" flag is latched.
     static PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -481,7 +493,7 @@ mod test_hook {
         }
         match WRITE_REMAINING.load(Ordering::Relaxed) {
             -1 => Ok(requested),
-            0 => Err(std::io::ErrorKind::BrokenPipe.into()),
+            0 => Err(std::io::Error::from_raw_os_error(libc::EPIPE)),
             remaining => Ok(requested.min(remaining as usize).min(3)),
         }
     }
@@ -492,8 +504,12 @@ mod test_hook {
         }
     }
 
-    pub fn forced_probe_errno() -> Option<i32> {
+    pub fn forced_probe_errno(fd: i32) -> Option<i32> {
         PROBE_CALLS.fetch_add(1, Ordering::Relaxed);
+        let target = FORCED_PROBE_FD.load(Ordering::Relaxed);
+        if target != -1 && target != fd {
+            return None;
+        }
         match FORCED_PROBE_ERRNO.load(Ordering::Relaxed) {
             0 => None,
             e => Some(e),
@@ -504,12 +520,14 @@ mod test_hook {
         PROBE_CALLS.load(Ordering::Relaxed)
     }
 
-    pub fn set_forced_errno(errno: i32) {
+    pub fn set_forced_errno(errno: i32, fd: i32) {
         FORCED_PROBE_ERRNO.store(errno, Ordering::Relaxed);
+        FORCED_PROBE_FD.store(fd, Ordering::Relaxed);
     }
 
     pub fn reset() {
         FORCED_PROBE_ERRNO.store(0, Ordering::Relaxed);
+        FORCED_PROBE_FD.store(-1, Ordering::Relaxed);
         PROBE_CALLS.store(0, Ordering::Relaxed);
         WRITE_REMAINING.store(-1, Ordering::Relaxed);
         WRITE_FD.store(-1, Ordering::Relaxed);

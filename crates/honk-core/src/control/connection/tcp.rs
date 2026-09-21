@@ -7,6 +7,14 @@ use std::collections::{HashMap, HashSet};
 
 mod dial;
 
+fn tcp_relay_score_outcome(error: &anyhow::Error) -> crate::group::ScoreOutcome {
+    if error.is::<relay::ClientIoError>() {
+        crate::group::ScoreOutcome::Cancelled
+    } else {
+        crate::group::ScoreOutcome::from_error(error)
+    }
+}
+
 async fn write_sniff_prefix(
     stream: &mut (impl tokio::io::AsyncWrite + Unpin + ?Sized),
     mut buffered: &[u8],
@@ -808,7 +816,7 @@ impl ControlPlaneHandle {
                 self.stats.record_error(&outbound_name);
                 self.stats.record_close(&outbound_name);
                 if let Some(reporter) = &score_reporter {
-                    reporter.finish(crate::group::ScoreOutcome::from_error(&e));
+                    reporter.finish(tcp_relay_score_outcome(&e));
                 }
             }
         }
@@ -820,6 +828,118 @@ impl ControlPlaneHandle {
 #[cfg(test)]
 mod score_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn client_reset_preserves_score_availability_but_upstream_reset_revokes_it() {
+        use crate::group::{ScoreOutcome, ScoreVerificationState};
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn pair() -> (TcpStream, TcpStream) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (client, server) = tokio::join!(
+                TcpStream::connect(listener.local_addr().unwrap()),
+                listener.accept(),
+            );
+            (client.unwrap(), server.unwrap().0)
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for client_reset in [true, false] {
+                let node = Node::from_share_link("socks5://127.0.0.1:1080#relay").unwrap();
+                let group = honk_config::group::Group {
+                    name: "score".into(),
+                    policy: honk_config::group::GroupPolicy::Score,
+                    nodes: vec![node.id],
+                    ..Default::default()
+                };
+                let manager =
+                    crate::group::GroupManager::new(&[group], std::slice::from_ref(&node));
+                let address = "127.0.0.1:443".parse().unwrap();
+                let context = tcp_score_context(address, None, IpVersion::V4);
+                let feedback = manager.feedback_for_node(node.id, context).unwrap();
+                feedback.start().finish(ScoreOutcome::Timeout);
+                for _ in 0..4 {
+                    let seed = feedback.start();
+                    seed.setup_succeeded();
+                    seed.tx(1);
+                    seed.rx(1);
+                    seed.finish(ScoreOutcome::Cancelled);
+                }
+                let snapshot = || {
+                    manager
+                        .score_verification_for_network("score", SelectionNetwork::Tcp)
+                        .unwrap()
+                        .1
+                };
+                let before = snapshot();
+                assert_eq!(before.state, ScoreVerificationState::ObservedUsable);
+                assert_eq!(
+                    before.next_action,
+                    crate::group::ScoreValidationAction::Backoff
+                );
+                let reporter = feedback.start();
+                reporter.setup_succeeded();
+                let progress = relay::RelayProgress {
+                    upload: Arc::new(AtomicU64::new(0)),
+                    download: Arc::new(AtomicU64::new(0)),
+                    first_response: Some(Arc::new({
+                        let reporter = reporter.clone();
+                        move || reporter.first_response()
+                    })),
+                    on_transfer: Some(Arc::new({
+                        let reporter = reporter.clone();
+                        move |up, down| {
+                            reporter.tx(up);
+                            reporter.rx(down);
+                        }
+                    })),
+                };
+                let (mut client, relay_client) = pair().await;
+                let (relay_upstream, mut upstream) = pair().await;
+                let running = tokio::spawn(relay::splice::relay_auto(
+                    relay_client,
+                    relay_upstream,
+                    address,
+                    address,
+                    Some(progress),
+                ));
+                client.write_all(b"q").await.unwrap();
+                assert_eq!(upstream.read_u8().await.unwrap(), b'q');
+                upstream.write_all(b"r").await.unwrap();
+                assert_eq!(client.read_u8().await.unwrap(), b'r');
+                let reset = if client_reset { client } else { upstream };
+                socket2::SockRef::from(&reset)
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+                drop(reset);
+                let error = running.await.unwrap().unwrap_err();
+                assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .raw_os_error(),
+                    Some(libc::ECONNRESET)
+                );
+                reporter.finish(tcp_relay_score_outcome(&error));
+                let after = snapshot();
+                assert_eq!(
+                    after.state,
+                    if client_reset {
+                        ScoreVerificationState::ObservedUsable
+                    } else {
+                        ScoreVerificationState::Provisional
+                    }
+                );
+                assert_eq!(
+                    after.next_action,
+                    crate::group::ScoreValidationAction::Backoff
+                );
+            }
+        })
+        .await
+        .expect("reset must terminate the relay without waiting for idle cleanup");
+    }
 
     #[tokio::test]
     async fn sniff_prefix_reports_accepted_bytes_before_write_failure() {
