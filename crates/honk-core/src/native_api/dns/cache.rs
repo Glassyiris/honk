@@ -116,30 +116,29 @@ pub(super) async fn serve(
     let available = SNAPSHOT_BYTES
         .checked_sub(retained.saturating_add(overhead))
         .ok_or_else(|| unavailable(id))?;
-    let mut entries = state
-        .dns
-        .inspect_cache(available)
-        .await
-        .map_err(|_| unavailable(id))?;
     let created = Instant::now();
     let wall = SystemTime::now();
-    entries.retain(|entry| {
-        if !filters.expired && entry.expires_at <= created {
-            return false;
-        }
-        let Ok(question) = records::question(entry.key.wire_identity(), entry.key.ingress()) else {
-            return false;
-        };
-        let name = question.name.to_ascii_lowercase();
-        filters.name.as_ref().is_none_or(|filter| filter == &name)
-            && filters
-                .domain
-                .as_ref()
-                .is_none_or(|filter| name.contains(filter))
-            && (filters.types.is_empty()
-                || records::parse_type(&question.rtype)
-                    .is_some_and(|qtype| filters.types.contains(&qtype)))
-    });
+    let mut entries = state
+        .dns
+        .inspect_cache(available, created, |key, expires_at| {
+            if !filters.expired && expires_at <= created {
+                return false;
+            }
+            let Ok(question) = records::question(key.wire_identity(), key.ingress()) else {
+                return false;
+            };
+            let name = question.name.to_ascii_lowercase();
+            filters.name.as_ref().is_none_or(|filter| filter == &name)
+                && filters
+                    .domain
+                    .as_ref()
+                    .is_none_or(|filter| name.contains(filter))
+                && (filters.types.is_empty()
+                    || records::parse_type(&question.rtype)
+                        .is_some_and(|qtype| filters.types.contains(&qtype)))
+        })
+        .await
+        .map_err(|_| unavailable(id))?;
     entries.sort_unstable_by(|left, right| left.id.cmp(&right.id));
     let bytes = overhead
         + entries.iter().map(|entry| entry.cost).sum::<usize>()
