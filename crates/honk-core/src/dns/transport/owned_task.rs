@@ -16,8 +16,9 @@ impl OwnedTask {
         F: Future<Output = ()> + Send + 'static,
     {
         active.fetch_add(1, Ordering::SeqCst);
+        let guard = ActiveTaskGuard(active);
         let handle = tokio::spawn(async move {
-            let _guard = ActiveTaskGuard(active);
+            let _guard = guard;
             future.await;
         });
         Self {
@@ -26,13 +27,15 @@ impl OwnedTask {
     }
 
     pub(crate) async fn shutdown(&self, timeout: Duration) {
-        let Some(mut handle) = self.handle.lock().await.take() else {
+        let mut slot = self.handle.lock().await;
+        let Some(handle) = slot.as_mut() else {
             return;
         };
-        if tokio::time::timeout(timeout, &mut handle).await.is_err() {
+        if tokio::time::timeout(timeout, &mut *handle).await.is_err() {
             handle.abort();
             let _ = handle.await;
         }
+        slot.take();
     }
 }
 
@@ -55,6 +58,52 @@ impl Drop for ActiveTaskGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_close_then_last_owner_drop_aborts_driver() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let (started, running) = tokio::sync::oneshot::channel();
+        let slot = super::super::lifecycle::LifecycleSlot::new();
+        slot.acquire(|| async {
+            Ok(OwnedTask::spawn(
+                async move {
+                    started.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                },
+                Arc::clone(&active),
+            ))
+        })
+        .await
+        .unwrap();
+        running.await.unwrap();
+        let mut close = Box::pin(slot.close(|task| async move {
+            task.shutdown(Duration::from_secs(60)).await;
+        }));
+        assert!(futures::poll!(close.as_mut()).is_pending());
+        drop(close);
+        drop(slot);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the last owner must abort its driver");
+    }
+
+    #[tokio::test]
+    async fn dropping_unpolled_task_releases_active_count() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let task = OwnedTask::spawn(std::future::pending(), Arc::clone(&active));
+        drop(task);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an unpolled task must release its active count");
+    }
 
     #[tokio::test]
     async fn shutdown_awaits_task_termination() {

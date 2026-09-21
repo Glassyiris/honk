@@ -45,6 +45,7 @@ impl UpstreamPool {
         let family = if address.is_ipv6() { 1 } else { 0 };
         if let Some((cached_address, pool)) = entry.udp.lock().pools[family].as_ref()
             && *cached_address == address
+            && !pool.is_stopped()
         {
             return Ok(Arc::clone(pool));
         }
@@ -58,6 +59,7 @@ impl UpstreamPool {
             let mut state = entry.udp.lock();
             if let Some((cached_address, pool)) = state.pools[family].as_ref()
                 && *cached_address == address
+                && !pool.is_stopped()
             {
                 (Arc::clone(pool), Some(candidate))
             } else {
@@ -103,8 +105,8 @@ impl UpstreamPool {
         entry: &UpstreamEntry,
         address: SocketAddr,
         raw_query: &[u8],
+        admission: AdmissionPermit<'a>,
     ) -> anyhow::Result<(Vec<u8>, AdmissionPermit<'a>, Option<EcsQuery>)> {
-        let admission = self.admit_query().await?;
         let injected = self.prepare_generated_ecs(raw_query);
         let effective_query = injected.as_ref().map_or(raw_query, EcsQuery::wire);
         let response = self
@@ -208,7 +210,7 @@ impl UpstreamPool {
         entry: &UpstreamEntry,
         raw_query: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
-        let current = { entry.udp.lock().current_pool() };
+        let current = { entry.udp.lock().current_address() };
         let has_traffic_router =
             self.traffic_router_snapshot.read().is_some() || self.traffic_router.read().is_some();
         let initial_route = if current.is_none() && entry.outbound.is_none() && has_traffic_router {
@@ -221,7 +223,7 @@ impl UpstreamPool {
         } else {
             None
         };
-        let failed = if let Some((address, pool)) = current {
+        let failed = if let Some(address) = current {
             let route = self.resolve_dial_route_for_address(entry, address).await?;
             if route.node.is_some() {
                 match self
@@ -233,25 +235,22 @@ impl UpstreamPool {
                 }
             } else {
                 let admission = self.admit_query().await?;
-                let injected = self.prepare_generated_ecs(raw_query);
-                let effective_query = injected.as_ref().map_or(raw_query, EcsQuery::wire);
-                match pool.exchange(effective_query, None).await {
-                    Ok(response) => {
-                        entry.udp.lock().mark_current(address);
+                match self
+                    .exchange_direct_udp(entry, address, raw_query, admission)
+                    .await
+                {
+                    Ok(exchange) => {
                         return self
                             .finish_direct_udp_query(
                                 upstream_name,
                                 entry,
                                 address,
                                 raw_query,
-                                (response, admission, injected),
+                                exchange,
                             )
                             .await;
                     }
-                    Err(error) => {
-                        drop(admission);
-                        Some((address, retryable_error(error)?))
-                    }
+                    Err(error) => Some((address, retryable_error(error)?)),
                 }
             }
         } else {
@@ -284,7 +283,13 @@ impl UpstreamPool {
                     Err(first_error) => (first, retryable_error(first_error)?, retry),
                 }
             } else {
-                match self.exchange_direct_udp(entry, first, raw_query).await {
+                let attempt = async {
+                    let admission = self.admit_query().await?;
+                    self.exchange_direct_udp(entry, first, raw_query, admission)
+                        .await
+                }
+                .await;
+                match attempt {
                     Ok(exchange) => {
                         return self
                             .finish_direct_udp_query(
@@ -316,7 +321,13 @@ impl UpstreamPool {
                     format!("UDP DNS failed via {retry} (first {first}: {first_error})")
                 });
         }
-        match self.exchange_direct_udp(entry, retry, raw_query).await {
+        let attempt = async {
+            let admission = self.admit_query().await?;
+            self.exchange_direct_udp(entry, retry, raw_query, admission)
+                .await
+        }
+        .await;
+        match attempt {
             Ok(exchange) => {
                 self.finish_direct_udp_query(upstream_name, entry, retry, raw_query, exchange)
                     .await

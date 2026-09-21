@@ -500,6 +500,95 @@ async fn udp_warm_pool_answers_after_bootstrap_stops() {
 }
 
 #[tokio::test]
+async fn udp_closed_current_rebuilds_without_alternate_attempt() {
+    let (server, alternate) = async {
+        const MAX_ATTEMPTS: usize = 8;
+        let mut last_error = None;
+
+        for _ in 0..MAX_ATTEMPTS {
+            let alternate = std::net::UdpSocket::bind("[::1]:0").unwrap();
+            let address = SocketAddr::new(
+                Ipv4Addr::LOCALHOST.into(),
+                alternate.local_addr().unwrap().port(),
+            );
+            match UdpSocket::bind(address).await {
+                Ok(server) => return (server, alternate),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    last_error = Some(error);
+                }
+                Err(error) => panic!("bind IPv4 upstream: {error}"),
+            }
+        }
+
+        panic!(
+            "could not bind matching IPv4/IPv6 UDP listeners after {MAX_ATTEMPTS} attempts: {}",
+            last_error.unwrap()
+        );
+    }
+    .await;
+    alternate.set_nonblocking(true).unwrap();
+    let address = server.local_addr().unwrap();
+    let (bootstrap_address, bootstrap_task) = spawn_dual_stack_bootstrap(4).await;
+    let resolver =
+        honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{bootstrap_address}"));
+    let upstream = make_upstream(
+        "rebuild",
+        &format!("rebuild.test:{}", address.port()),
+        DnsProtocol::Udp,
+    );
+    let pool = UpstreamPool::new_with_proxy_and_bootstrap(
+        &[upstream],
+        make_router(),
+        None,
+        Vec::new(),
+        Vec::new(),
+        resolver,
+        DnsStrategy::PreferIpv4,
+    )
+    .unwrap()
+    .with_timeouts(Duration::from_millis(100), Duration::from_millis(100));
+
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        for transaction_id in [0x1234, 0x5678] {
+            let query = mock_dns_query(transaction_id);
+            let response = pool.query("rebuild", &query);
+            let serve = async {
+                let mut buffer = [0_u8; 512];
+                let (_, source) = server.recv_from(&mut buffer).await.unwrap();
+                let mut response = mock_dns_response(0);
+                response[..2].copy_from_slice(&buffer[..2]);
+                server.send_to(&response, source).await.unwrap();
+            };
+            let (response, ()) = tokio::join!(response, serve);
+            assert_eq!(
+                response.expect("the retained IPv4 upstream should answer"),
+                mock_dns_response(transaction_id)
+            );
+
+            if transaction_id == 0x1234 {
+                let old_pool = pool
+                    .udp_pool(&pool.entries["rebuild"], address)
+                    .await
+                    .unwrap();
+                old_pool.close().await;
+            }
+        }
+    })
+    .await;
+
+    bootstrap_task.abort();
+    let _ = bootstrap_task.await;
+    pool.close().await;
+    result.expect("both IPv4 exchanges must finish within the peer deadline");
+    let mut buffer = [0_u8; 512];
+    assert_eq!(
+        alternate.recv_from(&mut buffer).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "rebuilding the current pool must not consume the alternate attempt"
+    );
+}
+
+#[tokio::test]
 async fn udp_literals_respect_strict_family_strategy() {
     for (address, strategy) in [
         ("127.0.0.1:9", DnsStrategy::Ipv6Only),

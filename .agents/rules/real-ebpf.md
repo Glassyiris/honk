@@ -13,6 +13,14 @@ The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 
 Score is always compiled, without a Cargo feature; omitted policy selects Selector.
 
+Native routing keeps domain resolution in the prologue for `domain_final`.
+Complete positive/negative port conditions precede the other conditions within
+each rule; non-domain facts use per-invocation READY-guarded bitmap copy/zero-fill.
+Missing facts count as resolved. Keep the emitter's private tests in
+`control/routing_matcher/codegen/tests.rs`; real decision/load goldens remain in
+`ebpf/real/routing/tests/`. Historical eager-emitter verifier counts do not apply
+to the later lazy control flow without a new measurement.
+
 `build.rs` always emits `HONK_VERSION` from the GitHub release tag, local `git describe`, or Cargo package version without Git metadata. `honk_core::VERSION` supplies both CLIs and Clash `/version`; runtime needs no Git. With `ebpf`, locate `crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf` or `target/honk-core.o` and **verify `.BTF`**. Missing, BTF-less or stale objects trigger a rebuild with the channel read from `crates/honk-ebpf/rust-toolchain.toml`, stripping child `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`: environment flags override `crates/honk-ebpf/.cargo/config.toml`'s `--btf` and silently omit BTF. The object records its compiler channel in a `.toolchain` sidecar; source or pin changes invalidate it. Copy to `OUT_DIR/honk-ebpf.o`, set `HONK_EBPF_OBJECT`; `lib.rs` embeds with `include_bytes!`. Runtime override: `--bpf-object`.
 
 ```bash

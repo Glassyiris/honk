@@ -305,7 +305,7 @@ async fn test_relay_splice_live_progress_matches_stats() {
     for unsupported in [false, true] {
         let _state = StateGuard::new();
         if unsupported {
-            test_hook::set_forced_errno(libc::EINVAL);
+            test_hook::set_forced_errno(libc::EINVAL, -1);
         }
         let echo = spawn_echo().await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -411,7 +411,7 @@ async fn test_probe_failure_falls_back_to_copy() {
     let echo = spawn_echo().await;
 
     // Arm the probe hook: the first connection's probes fail with EINVAL.
-    test_hook::set_forced_errno(libc::EINVAL);
+    test_hook::set_forced_errno(libc::EINVAL, -1);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let front = listener.local_addr().unwrap();
@@ -497,6 +497,124 @@ async fn tcp_pair() -> (TcpStream, TcpStream) {
 }
 
 #[tokio::test]
+async fn splice_probe_reset_preserves_origin_and_errno() {
+    let _lock = TEST_LOCK.lock().await;
+    let _state = StateGuard::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        for client_reset in [true, false] {
+            let (client_peer, mut client) = tcp_pair().await;
+            let (upstream_peer, upstream) = tcp_pair().await;
+            let client_addr = client.peer_addr().unwrap();
+            let target_addr = upstream.peer_addr().unwrap();
+            let reset = if client_reset {
+                client_peer
+            } else {
+                upstream_peer
+            };
+            socket2::SockRef::from(&reset)
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+            drop(reset);
+            let reset_socket = if client_reset { &client } else { &upstream };
+            reset_socket.readable().await.unwrap();
+            let (progress, accepted) = observed_progress();
+            let error = relay_splice(
+                &mut client,
+                upstream,
+                client_addr,
+                target_addr,
+                Some(progress.clone()),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.is::<crate::relay::ClientIoError>(), client_reset);
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+                Some(libc::ECONNRESET)
+            );
+            assert_eq!(progress.upload.load(Ordering::Relaxed), 0);
+            assert_eq!(progress.download.load(Ordering::Relaxed), 0);
+            assert_eq!(accepted.0.load(Ordering::Relaxed), 0);
+            assert_eq!(accepted.1.load(Ordering::Relaxed), 0);
+            assert!(splice_available());
+        }
+        let (mut sender, mut client) = tcp_pair().await;
+        let (mut receiver, upstream) = tcp_pair().await;
+        sender.write_all(b"staged").await.unwrap();
+        client.readable().await.unwrap();
+        test_hook::set_forced_errno(libc::EINVAL, upstream.as_raw_fd());
+        let client_addr = client.peer_addr().unwrap();
+        let target_addr = upstream.peer_addr().unwrap();
+        let (progress, accepted) = observed_progress();
+        let error = relay_splice(
+            &mut client,
+            upstream,
+            client_addr,
+            target_addr,
+            Some(progress.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.is::<crate::relay::ClientIoError>());
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::Other
+        );
+        assert!(splice_available());
+        let mut received = Vec::new();
+        receiver.read_to_end(&mut received).await.unwrap();
+        assert!(received.is_empty());
+        assert_eq!(progress.upload.load(Ordering::Relaxed), 0);
+        assert_eq!(progress.download.load(Ordering::Relaxed), 0);
+        assert_eq!(accepted.0.load(Ordering::Relaxed), 0);
+        assert_eq!(accepted.1.load(Ordering::Relaxed), 0);
+    })
+    .await
+    .expect("splice probe reset did not complete");
+}
+
+#[tokio::test]
+async fn splice_source_reset_preserves_origin_after_accepted_bytes() {
+    let _lock = TEST_LOCK.lock().await;
+    let _state = StateGuard::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        for upload in [true, false] {
+            let (mut sender, source) = tcp_pair().await;
+            let (destination, mut receiver) = tcp_pair().await;
+            let pipe = Pipe::new().unwrap();
+            let (progress, accepted) = observed_progress();
+            let exchange = async {
+                sender.write_all(b"accepted").await.unwrap();
+                let mut received = [0; 8];
+                receiver.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"accepted");
+                socket2::SockRef::from(&sender)
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+                drop(sender);
+            };
+            let (result, ()) = tokio::join!(
+                pump(&source, &destination, &pipe, 0, &progress, upload),
+                exchange,
+            );
+            let error = result.unwrap_err().into_anyhow();
+            assert_eq!(error.is::<crate::relay::ClientIoError>(), upload);
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+                Some(libc::ECONNRESET)
+            );
+            let expected = if upload { (8, 0) } else { (0, 8) };
+            assert_eq!(progress.upload.load(Ordering::Relaxed), expected.0);
+            assert_eq!(progress.download.load(Ordering::Relaxed), expected.1);
+            assert_eq!(accepted.0.load(Ordering::Relaxed), expected.0);
+            assert_eq!(accepted.1.load(Ordering::Relaxed), expected.1);
+        }
+    })
+    .await
+    .expect("splice source reset did not complete");
+}
+
+#[tokio::test]
 async fn splice_first_response_precedes_blocked_client_for_staged_and_new_bytes() {
     let _lock = TEST_LOCK.lock().await;
     let _state = StateGuard::new();
@@ -525,7 +643,7 @@ async fn splice_first_response_precedes_blocked_client_for_staged_and_new_bytes(
             source.readable().await.unwrap();
             let pipe = Pipe::new().unwrap();
             let staged = if initially_staged {
-                let staged = probe(&source, &pipe).unwrap();
+                let staged = probe(&source, &pipe, false).unwrap();
                 assert_eq!(staged, 5);
                 staged
             } else {
@@ -575,23 +693,33 @@ async fn splice_transfer_counts_only_accepted_partial_writes_before_error() {
     let _lock = TEST_LOCK.lock().await;
     let _state = StateGuard::new();
     tokio::time::timeout(Duration::from_secs(2), async {
-        let (_server, source) = tcp_pair().await;
-        let (destination, mut client) = tcp_pair().await;
-        let pipe = Pipe::new().unwrap();
-        assert_eq!(nix::unistd::write(&pipe.write, b"abcdefgh").unwrap(), 8);
-        let (progress, accepted) = observed_progress();
-        test_hook::fail_write_after(destination.as_raw_fd(), 5);
-        let error = pump(&source, &destination, &pipe, 8, &progress, true)
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
-        test_hook::fail_write_after(-1, -1);
-        drop(destination);
-        let mut received = Vec::new();
-        client.read_to_end(&mut received).await.unwrap();
-        assert_eq!(received, b"abcde");
-        assert_eq!(accepted.0.load(Ordering::Relaxed), 5);
-        assert_eq!(accepted.1.load(Ordering::Relaxed), 0);
+        for upload in [true, false] {
+            let (_server, source) = tcp_pair().await;
+            let (destination, mut client) = tcp_pair().await;
+            let pipe = Pipe::new().unwrap();
+            assert_eq!(nix::unistd::write(&pipe.write, b"abcdefgh").unwrap(), 8);
+            let (progress, accepted) = observed_progress();
+            test_hook::fail_write_after(destination.as_raw_fd(), 5);
+            let error = pump(&source, &destination, &pipe, 8, &progress, upload)
+                .await
+                .unwrap_err()
+                .into_anyhow();
+            assert_eq!(error.is::<crate::relay::ClientIoError>(), !upload);
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+                Some(libc::EPIPE)
+            );
+            test_hook::fail_write_after(-1, -1);
+            drop(destination);
+            let mut received = Vec::new();
+            client.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, b"abcde");
+            let expected = if upload { (5, 0) } else { (0, 5) };
+            assert_eq!(progress.upload.load(Ordering::Relaxed), expected.0);
+            assert_eq!(progress.download.load(Ordering::Relaxed), expected.1);
+            assert_eq!(accepted.0.load(Ordering::Relaxed), expected.0);
+            assert_eq!(accepted.1.load(Ordering::Relaxed), expected.1);
+        }
     })
     .await
     .expect("splice partial-write failure did not complete");

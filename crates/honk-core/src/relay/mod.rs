@@ -44,6 +44,41 @@ pub fn is_ignorable_connection_error(err: &std::io::Error) -> bool {
     )
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("client-side relay connection closed")]
+pub(crate) struct ClientIoError;
+
+#[derive(Debug)]
+struct RelayError {
+    error: std::io::Error,
+    client: bool,
+}
+
+impl RelayError {
+    fn new(error: std::io::Error, client_side: bool) -> Self {
+        let client = client_side
+            && matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::TimedOut
+            );
+        Self { error, client }
+    }
+
+    fn into_anyhow(self) -> anyhow::Error {
+        let error = anyhow::Error::new(self.error);
+        if self.client {
+            error.context(ClientIoError)
+        } else {
+            error
+        }
+    }
+}
+
 /// Statistics for a relayed connection.
 #[derive(Debug, Clone, Default)]
 pub struct RelayStats {
@@ -192,14 +227,17 @@ async fn copy_way<R, W>(
     rd: &mut R,
     wr: &mut W,
     progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
-) -> std::io::Result<u64>
+    upload: bool,
+) -> Result<u64, RelayError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let read_error = |error| RelayError::new(error, upload);
+    let write_error = |error| RelayError::new(error, !upload);
     // Sniffing or protocol setup may already have buffered bytes before the
     // relay starts, independently of bytes read by this copy loop.
-    wr.flush().await?;
+    wr.flush().await.map_err(write_error)?;
     let mut rd = RelayIo::wrap(rd, progress, None, None, None, false);
     let mut buffer = vec![0; RELAY_BUF_SIZE];
     let mut n = 0;
@@ -210,10 +248,12 @@ where
 
             let mut chunk = tokio::io::ReadBuf::new(&mut buffer);
             match Pin::new(&mut rd).poll_read(cx, &mut chunk) {
-                Poll::Ready(result) => Poll::Ready(result.map(|()| chunk.filled().len())),
+                Poll::Ready(result) => {
+                    Poll::Ready(result.map(|()| chunk.filled().len()).map_err(read_error))
+                }
                 Poll::Pending => {
                     // copy_buf waits here without flushing buffered protocol writes.
-                    ready!(Pin::new(&mut *wr).poll_flush(cx))?;
+                    ready!(Pin::new(&mut *wr).poll_flush(cx)).map_err(write_error)?;
                     Poll::Pending
                 }
             }
@@ -222,11 +262,11 @@ where
         if read == 0 {
             break;
         }
-        wr.write_all(&buffer[..read]).await?;
+        wr.write_all(&buffer[..read]).await.map_err(write_error)?;
         n += read as u64;
     }
-    wr.flush().await?;
-    wr.shutdown().await?;
+    wr.flush().await.map_err(write_error)?;
+    wr.shutdown().await.map_err(write_error)?;
     Ok(n)
 }
 
@@ -236,9 +276,9 @@ where
 /// interrupted. A cut survivor reports the counter's final value, so the
 /// bytes it did move are not lost from the stats.
 async fn drain_wait(
-    f: &mut (impl std::future::Future<Output = std::io::Result<u64>> + Unpin),
+    f: &mut (impl Future<Output = Result<u64, RelayError>> + Unpin),
     progress: &std::sync::atomic::AtomicU64,
-) -> std::io::Result<u64> {
+) -> Result<u64, RelayError> {
     const CHECK: std::time::Duration = std::time::Duration::from_millis(100);
     let mut last = 0u64;
     let mut stalled = std::time::Duration::ZERO;
@@ -289,14 +329,14 @@ where
     let p2c_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Boxed so dropping them actually releases the stream borrows before
     // the final shutdown calls.
-    let mut c2p = Box::pin(copy_way(&mut cr, &mut pw, c2p_progress.clone()));
-    let mut p2c = Box::pin(copy_way(&mut pr, &mut cw, p2c_progress.clone()));
+    let mut c2p = Box::pin(copy_way(&mut cr, &mut pw, c2p_progress.clone(), true));
+    let mut p2c = Box::pin(copy_way(&mut pr, &mut cw, p2c_progress.clone(), false));
 
     // The first direction to finish half-closes the other (inside
     // copy_way); the survivor then drains until its own EOF or until it
     // stalls for a full DRAIN_DEADLINE. An error in either direction
     // cancels the whole relay, mirroring `copy_bidirectional`.
-    let result: std::io::Result<(u64, u64)> = tokio::select! {
+    let result: Result<(u64, u64), RelayError> = tokio::select! {
         r = &mut c2p => match r {
             Err(e) => Err(e),
             Ok(first_n) => drain_wait(&mut p2c, &p2c_progress).await.map(|second_n| (first_n, second_n)),
@@ -331,13 +371,13 @@ where
             Ok(stats)
         }
         Err(e) => {
-            if !is_ignorable_connection_error(&e) {
+            if !is_ignorable_connection_error(&e.error) {
                 warn!(
                     "TCP relay error for {} → {}: {}",
-                    client_addr, target_addr, e
+                    client_addr, target_addr, e.error
                 );
             }
-            Err(e.into())
+            Err(e.into_anyhow())
         }
     }
 }
@@ -404,7 +444,7 @@ mod tests {
                 pending: false,
             };
             let progress = Arc::new(AtomicU64::new(0));
-            let copied = copy_way(&mut source, &mut writer, Arc::clone(&progress))
+            let copied = copy_way(&mut source, &mut writer, Arc::clone(&progress), true)
                 .await
                 .unwrap();
             assert_eq!(writer.bytes, payload);

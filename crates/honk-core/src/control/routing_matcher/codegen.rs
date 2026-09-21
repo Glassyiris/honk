@@ -8,8 +8,8 @@ use super::{KernelCondition, KernelPredicate, RoutingPushPlan};
 use anyhow::{Context, ensure};
 use aya_obj::generated::{
     BPF_ALU64, BPF_AND, BPF_B, BPF_CALL, BPF_DW, BPF_EXIT, BPF_IMM, BPF_JA, BPF_JEQ, BPF_JGE,
-    BPF_JGT, BPF_JMP, BPF_JNE, BPF_K, BPF_LD, BPF_LDX, BPF_MEM, BPF_MOV, BPF_ST, BPF_STX, BPF_W,
-    BPF_X, bpf_insn,
+    BPF_JGT, BPF_JMP, BPF_JNE, BPF_K, BPF_LD, BPF_LDX, BPF_MEM, BPF_MOV, BPF_OR, BPF_ST, BPF_STX,
+    BPF_W, BPF_X, bpf_insn,
 };
 use honk_ebpf_common::{
     ROUTING_FACT_CAPACITY, ROUTING_FEATURE_DOMAIN, ROUTING_FEATURE_DOMAIN_REROUTE,
@@ -26,11 +26,15 @@ const R6: u8 = 6;
 const R7: u8 = 7;
 const R8: u8 = 8;
 const R10: u8 = 10;
-const STACK_DOMAIN_KEY: i16 = -96;
 const MAP_LOOKUP_ELEM: i32 = 1;
 const BPF_INSTRUCTION_CAPACITY: usize = 1_000_000;
 const PSEUDO_MAP_FD: u8 = 1;
-const STACK_KEY: i16 = -64;
+/// Bytes of one `DomainRouting` bitmap, copied out of a map value.
+const FACT_BYTES: i16 = (ROUTING_FACT_CAPACITY / 8) as i16;
+/// LPM/MAC lookup key: 20 bytes written, 32 reserved.
+const STACK_KEY: i16 = -(4 * FACT_BYTES) - 32;
+/// Domain lookup key: the 16-byte destination address.
+const STACK_DOMAIN_KEY: i16 = STACK_KEY - 16;
 const INPUT_SRC_IP: i16 = std::mem::offset_of!(RoutingInput, src_ip) as i16;
 const INPUT_DST_IP: i16 = std::mem::offset_of!(RoutingInput, dst_ip) as i16;
 const INPUT_MAC: i16 = std::mem::offset_of!(RoutingInput, mac) as i16;
@@ -48,57 +52,20 @@ const MUST: i16 = std::mem::offset_of!(RoutingDecision, must) as i16;
 const DOMAIN_FINAL: i16 = std::mem::offset_of!(RoutingDecision, domain_final) as i16;
 const RULE_ID: i16 = std::mem::offset_of!(RoutingDecision, rule_id) as i16;
 
+/// One lookup category. Each owns a 32-byte stack area holding its
+/// `DomainRouting` bitmap once resolved: domain at [-32, -1], destination at
+/// [-64, -33], source at [-96, -65], MAC at [-128, -97].
 #[derive(Clone, Copy)]
 enum FactKind {
+    Domain,
     Destination,
     Source,
     Mac,
 }
 
 impl FactKind {
-    fn of(predicate: &KernelPredicate) -> Option<Self> {
-        match predicate {
-            KernelPredicate::DestinationIp(_) => Some(Self::Destination),
-            KernelPredicate::SourceIp(_) => Some(Self::Source),
-            KernelPredicate::Mac(_) => Some(Self::Mac),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct FactCache {
-    pointer: i16,
-    ready: i16,
-}
-
-struct FactCaches {
-    slots: [Option<FactCache>; 3],
-    must_ready: u8,
-    may_ready: u8,
-}
-
-fn fact_caches(plan: &RoutingPushPlan) -> FactCaches {
-    let mut uses = [0u8; 3];
-    for condition in plan.rules.iter().flat_map(|rule| &rule.conditions) {
-        if let Some(kind) = FactKind::of(&condition.predicate) {
-            let count = &mut uses[kind as usize];
-            *count = (*count + 1).min(2);
-        }
-    }
-    // Separate DW slots preserve ready constants on 6.12; packed W flags
-    // lose precision and exhaust the verifier budget on mixed 256-bit policies.
-    // Pairs occupy [-32, -1] and [-80, -65], outside both key buffers.
-    FactCaches {
-        slots: std::array::from_fn(|index| {
-            let pointer = [-16, -32, -80][index];
-            (uses[index] == 2).then_some(FactCache {
-                pointer,
-                ready: pointer + 8,
-            })
-        }),
-        must_ready: 0,
-        may_ready: 0,
+    fn area(self) -> i16 {
+        -(self as i16 + 1) * FACT_BYTES
     }
 }
 
@@ -228,6 +195,10 @@ impl Assembler {
         self.emit(BPF_ALU64 | BPF_AND | BPF_K, dst, 0, 0, imm)?;
         Ok(())
     }
+    fn or_imm(&mut self, dst: u8, imm: i32) -> anyhow::Result<()> {
+        self.emit(BPF_ALU64 | BPF_OR | BPF_K, dst, 0, 0, imm)?;
+        Ok(())
+    }
     fn ldx_w(&mut self, dst: u8, src: u8, off: i16) -> anyhow::Result<()> {
         self.emit(BPF_LDX | BPF_W | BPF_MEM, dst, src, off, 0)?;
         Ok(())
@@ -252,10 +223,6 @@ impl Assembler {
         self.emit(BPF_ST | BPF_W | BPF_MEM, dst, 0, off, imm)?;
         Ok(())
     }
-    fn st_dw_imm(&mut self, dst: u8, off: i16, imm: i32) -> anyhow::Result<()> {
-        self.emit(BPF_ST | BPF_DW | BPF_MEM, dst, 0, off, imm)?;
-        Ok(())
-    }
     fn call(&mut self, helper: i32) -> anyhow::Result<()> {
         self.emit(BPF_JMP | BPF_CALL, 0, 0, 0, helper)?;
         Ok(())
@@ -265,6 +232,12 @@ impl Assembler {
         Ok(())
     }
 }
+
+/// Per-invocation resolved bits for the lazily evaluated categories
+/// (Destination/Source/MAC). Kept in R8, which callee-saves across the
+/// lookup helper; it says this call already resolved the category, not
+/// that the emitter merely emitted a lookup somewhere.
+const READY: u8 = R8;
 
 /// Emit a complete RoutingInput -> RoutingDecision function body.
 pub fn emit_routing_program(
@@ -303,24 +276,10 @@ pub fn emit_routing_program(
         (!plan.has_domain_rules || plan.features & ROUTING_FEATURE_DOMAIN_REROUTE == 0) as i32,
     )?;
     asm.st_imm(R7, RULE_ID, u32::MAX as i32)?;
-
-    let mut caches = fact_caches(plan);
-    for cache in caches.slots.iter().flatten() {
-        asm.st_dw_imm(R10, cache.pointer, 0)?;
-        asm.st_dw_imm(R10, cache.ready, 0)?;
-    }
+    asm.mov_imm(READY, 0)?;
 
     if plan.has_domain_rules {
-        write_domain_key_from_input(&mut asm)?;
-        load_map_fd(&mut asm, fds.domain)?;
-        asm.mov_reg(R2, R10)?;
-        asm.add_imm(R2, STACK_DOMAIN_KEY as i32)?;
-        asm.call(MAP_LOOKUP_ELEM)?;
-        asm.mov_reg(R8, R0)?;
-        let domain_absent = asm.label();
-        asm.jump(BPF_JEQ, R8, 0, domain_absent)?;
-        asm.st_imm(R7, DOMAIN_FINAL, 1)?;
-        asm.bind(domain_absent);
+        emit_fact_lookup(&mut asm, FactKind::Domain, &fds)?;
     }
 
     for rule in &plan.rules {
@@ -334,25 +293,28 @@ pub fn emit_routing_program(
         }
         asm.source(rule.id + 1, rule.source.as_str());
         let fail = asm.label();
-        let mut failure_ready: Option<(u8, u8)> = None;
+        let mut conditional = false;
+        let port_first = |condition: &&KernelCondition| {
+            matches!(
+                condition.predicate,
+                KernelPredicate::DestinationPort(_) | KernelPredicate::SourcePort(_)
+            )
+        };
         for condition in rule
             .conditions
             .iter()
             .filter(|condition| !predicate_is_empty(&condition.predicate))
+            .filter(port_first)
+            .chain(
+                rule.conditions
+                    .iter()
+                    .filter(|condition| !predicate_is_empty(&condition.predicate))
+                    .filter(|condition| !port_first(condition)),
+            )
         {
             let pass = asm.label();
-            emit_condition(&mut asm, condition, pass, fail, &fds, &caches)?;
-            if let Some(kind) = FactKind::of(&condition.predicate) {
-                let bit = 1u8 << kind as u8;
-                caches.must_ready |= bit;
-                caches.may_ready |= bit;
-            }
-            // Every failed condition can enter the next rule, including a
-            // short circuit before this rule's first fact lookup.
-            failure_ready = Some(match failure_ready {
-                None => (caches.must_ready, caches.may_ready),
-                Some((must, may)) => (must & caches.must_ready, may | caches.may_ready),
-            });
+            emit_condition(&mut asm, condition, pass, fail, &fds)?;
+            conditional = true;
             asm.bind(pass);
         }
         asm.st_imm(R7, OUTBOUND, rule.outbound as i32)?;
@@ -361,11 +323,10 @@ pub fn emit_routing_program(
         asm.st_imm(R7, RULE_ID, rule.id as i32)?;
         asm.mov_imm(R0, 0)?;
         asm.exit()?;
-        if failure_ready.is_none() {
+        if !conditional {
             return asm.finish();
         }
         asm.bind(fail);
-        (caches.must_ready, caches.may_ready) = failure_ready.unwrap_or_default();
     }
 
     asm.source(0, "fallback");
@@ -492,13 +453,37 @@ fn emit_condition(
     pass: Label,
     fail: Label,
     fds: &RoutingMapFds,
-    caches: &FactCaches,
 ) -> anyhow::Result<()> {
-    if condition.not {
-        emit_predicate(asm, &condition.predicate, fail, pass, fds, caches)
-    } else {
-        emit_predicate(asm, &condition.predicate, pass, fail, fds, caches)
-    }
+    let on_true = if condition.not { fail } else { pass };
+    let on_false = if condition.not { pass } else { fail };
+    emit_predicate(asm, &condition.predicate, on_true, on_false, fds)
+}
+
+/// Test one bit of a lazily resolved category. The READY bit is set only
+/// after the lookup wrote all 32 bytes of the area, so a resolved
+/// all-zeros bitmap is never re-looked-up and an unresolved one is never
+/// read. Each use site carries its own guard, so a later rule still
+/// resolves a category an earlier rule skipped.
+fn emit_fact_bit_lazy(
+    asm: &mut Assembler,
+    kind: FactKind,
+    id: u32,
+    on_true: Label,
+    on_false: Label,
+    fds: &RoutingMapFds,
+) -> anyhow::Result<()> {
+    let resolved = asm.label();
+    let bit = 1i32 << (kind as u8 - 1);
+    // READY is a per-invocation bitmask; test the category bit, not
+    // equality against the whole mask (other resolved categories set
+    // other bits).
+    asm.mov_reg(R0, READY)?;
+    asm.and_imm(R0, bit)?;
+    asm.jump(BPF_JNE, R0, 0, resolved)?;
+    emit_fact_lookup(asm, kind, fds)?;
+    asm.or_imm(READY, bit)?;
+    asm.bind(resolved);
+    emit_fact_bit(asm, kind, id, on_true, on_false)
 }
 
 fn emit_predicate(
@@ -507,28 +492,19 @@ fn emit_predicate(
     on_true: Label,
     on_false: Label,
     fds: &RoutingMapFds,
-    caches: &FactCaches,
 ) -> anyhow::Result<()> {
     match predicate {
         KernelPredicate::Domain(id) => {
-            emit_bitmap_bit(asm, R8, *id, on_true, on_false)?;
+            emit_fact_bit(asm, FactKind::Domain, *id, on_true, on_false)?;
         }
         KernelPredicate::DestinationIp(id) => {
-            emit_fact_bit(
-                asm,
-                FactKind::Destination,
-                *id,
-                caches,
-                on_true,
-                on_false,
-                fds,
-            )?;
+            emit_fact_bit_lazy(asm, FactKind::Destination, *id, on_true, on_false, fds)?;
         }
         KernelPredicate::SourceIp(id) => {
-            emit_fact_bit(asm, FactKind::Source, *id, caches, on_true, on_false, fds)?;
+            emit_fact_bit_lazy(asm, FactKind::Source, *id, on_true, on_false, fds)?;
         }
         KernelPredicate::Mac(id) => {
-            emit_fact_bit(asm, FactKind::Mac, *id, caches, on_true, on_false, fds)?;
+            emit_fact_bit_lazy(asm, FactKind::Mac, *id, on_true, on_false, fds)?;
         }
         KernelPredicate::DestinationPort(ranges) => {
             emit_port_ranges(asm, ranges, INPUT_DST_PORT, on_true, on_false)?;
@@ -631,56 +607,34 @@ fn emit_process_names(
     Ok(())
 }
 
-fn emit_bitmap_bit(
+/// Test one bit of a resolved category. The area holds the bitmap or zeros,
+/// so a missing entry fails every bit test without a pointer check.
+fn emit_fact_bit(
     asm: &mut Assembler,
-    pointer: u8,
+    kind: FactKind,
     id: u32,
     on_true: Label,
     on_false: Label,
 ) -> anyhow::Result<()> {
-    asm.jump(BPF_JEQ, pointer, 0, on_false)?;
-    asm.ldx_w(R2, pointer, (id / 32 * 4) as i16)?;
+    asm.ldx_w(R2, R10, kind.area() + (id / 32 * 4) as i16)?;
     asm.and_imm(R2, (1u32 << (id % 32)) as i32)?;
     asm.jump(BPF_JNE, R2, 0, on_true)?;
     asm.ja(on_false)?;
     Ok(())
 }
 
-fn emit_fact_bit(
-    asm: &mut Assembler,
-    kind: FactKind,
-    id: u32,
-    caches: &FactCaches,
-    on_true: Label,
-    on_false: Label,
-    fds: &RoutingMapFds,
-) -> anyhow::Result<()> {
-    if let Some(cache) = caches.slots[kind as usize] {
-        let bit = 1u8 << kind as u8;
-        if caches.must_ready & bit != 0 {
-            asm.ldx_dw(R0, R10, cache.pointer)?;
-        } else {
-            let branch = (caches.may_ready & bit != 0).then(|| (asm.label(), asm.label()));
-            if let Some((reuse, _)) = branch {
-                asm.ldx_dw(R0, R10, cache.ready)?;
-                asm.jump(BPF_JNE, R0, 0, reuse)?;
-            }
-            emit_fact_lookup(asm, kind, fds)?;
-            asm.stx_dw(R10, R0, cache.pointer)?;
-            asm.st_dw_imm(R10, cache.ready, 1)?;
-            if let Some((reuse, ready)) = branch {
-                asm.ja(ready)?;
-                asm.bind(reuse);
-                asm.ldx_dw(R0, R10, cache.pointer)?;
-                asm.bind(ready);
-            }
-        }
-    } else {
-        emit_fact_lookup(asm, kind, fds)?;
-    }
-    emit_bitmap_bit(asm, R0, id, on_true, on_false)
-}
-
+/// Look the category up and copy its bitmap into the stack area; zero the
+/// area when the input has no such fact or the map has no entry. R0 to R5
+/// are clobbered; no pointer into the map value survives.
+///
+/// Branch layout matters to the verifier: at an unresolved conditional it
+/// explores the fall-through first, so a copy from a map value (unknown
+/// scalars) sits on the fall-through at every split and the zero fill on
+/// the jump target. A recorded imprecise scalar can subsume the zero-fill
+/// path; a zero fill recorded first becomes precise once a bit test on it
+/// is predictable, and a precise zero cannot subsume an unknown. Measured
+/// on Linux 6.12 with the IPv4/IPv6 dispatch the other way round the #280
+/// policy cost four times as much.
 fn emit_fact_lookup(
     asm: &mut Assembler,
     kind: FactKind,
@@ -689,7 +643,15 @@ fn emit_fact_lookup(
     let absent = asm.label();
     let lookup = asm.label();
     let done = asm.label();
+    let key = match kind {
+        FactKind::Domain => STACK_DOMAIN_KEY,
+        _ => STACK_KEY,
+    };
     match kind {
+        FactKind::Domain => {
+            write_domain_key_from_input(asm)?;
+            load_map_fd(asm, fds.domain)?;
+        }
         FactKind::Mac => {
             asm.ldx_w(R0, R6, INPUT_MAC_PRESENT)?;
             asm.jump(BPF_JEQ, R0, 0, absent)?;
@@ -701,28 +663,36 @@ fn emit_fact_lookup(
                 FactKind::Destination => (fds.destination_v4, fds.destination_v6, INPUT_DST_IP),
                 _ => (fds.source_v4, fds.source_v6, INPUT_SRC_IP),
             };
-            let v4 = asm.label();
             let v6 = asm.label();
             asm.ldx_w(R0, R6, INPUT_VERSION)?;
-            asm.jump(BPF_JEQ, R0, 1, v4)?;
-            asm.jump(BPF_JEQ, R0, 2, v6)?;
-            asm.ja(absent)?;
-            asm.bind(v4);
+            asm.jump(BPF_JNE, R0, 1, v6)?;
             write_key_from_input(asm, input_offset + 12, 32)?;
             load_map_fd(asm, v4_fd)?;
             asm.ja(lookup)?;
             asm.bind(v6);
+            asm.jump(BPF_JNE, R0, 2, absent)?;
             write_key_from_input(asm, input_offset, 128)?;
             load_map_fd(asm, v6_fd)?;
         }
     }
     asm.bind(lookup);
     asm.mov_reg(R2, R10)?;
-    asm.add_imm(R2, STACK_KEY as i32)?;
+    asm.add_imm(R2, key as i32)?;
     asm.call(MAP_LOOKUP_ELEM)?;
+    asm.jump(BPF_JEQ, R0, 0, absent)?;
+    if matches!(kind, FactKind::Domain) {
+        asm.st_imm(R7, DOMAIN_FINAL, 1)?;
+    }
+    for word in 0..FACT_BYTES / 8 {
+        asm.ldx_dw(R1, R0, word * 8)?;
+        asm.stx_dw(R10, R1, kind.area() + word * 8)?;
+    }
     asm.ja(done)?;
     asm.bind(absent);
-    asm.mov_imm(R0, 0)?;
+    asm.mov_imm(R1, 0)?;
+    for word in 0..FACT_BYTES / 8 {
+        asm.stx_dw(R10, R1, kind.area() + word * 8)?;
+    }
     asm.bind(done);
     Ok(())
 }
@@ -746,10 +716,9 @@ fn write_key_from_input(
 }
 
 fn write_domain_key_from_input(asm: &mut Assembler) -> anyhow::Result<()> {
-    asm.mov_reg(R2, R6)?;
-    asm.ldx_dw(R3, R2, INPUT_DST_IP)?;
+    asm.ldx_dw(R3, R6, INPUT_DST_IP)?;
     asm.stx_dw(R10, R3, STACK_DOMAIN_KEY)?;
-    asm.ldx_dw(R3, R2, INPUT_DST_IP + 8)?;
+    asm.ldx_dw(R3, R6, INPUT_DST_IP + 8)?;
     asm.stx_dw(R10, R3, STACK_DOMAIN_KEY + 8)?;
     Ok(())
 }
@@ -761,109 +730,4 @@ fn load_map_fd(asm: &mut Assembler, fd: i32) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn assembler_stops_at_instruction_capacity_without_publishing_fixup() {
-        let mut asm = Assembler::new();
-        asm.insns
-            .resize_with(BPF_INSTRUCTION_CAPACITY - 1, || bpf_insn {
-                code: 0,
-                _bitfield_align_1: [],
-                _bitfield_1: bpf_insn::new_bitfield_1(0, 0),
-                off: 0,
-                imm: 0,
-            });
-
-        let last = asm
-            .emit(BPF_JMP | BPF_EXIT, 0, 0, 0, 0)
-            .expect("the last instruction within capacity must be emitted");
-        assert_eq!(last, BPF_INSTRUCTION_CAPACITY - 1);
-        assert_eq!(asm.insns.len(), BPF_INSTRUCTION_CAPACITY);
-
-        let past_capacity = asm.label();
-        assert!(asm.ja(past_capacity).is_err());
-        assert_eq!(asm.insns.len(), BPF_INSTRUCTION_CAPACITY);
-        assert!(asm.fixups.is_empty());
-
-        let bytecode = asm
-            .finish()
-            .expect("a boundary-sized program must still finish");
-        assert_eq!(bytecode.insns.len(), BPF_INSTRUCTION_CAPACITY);
-        assert_eq!(bytecode.insns[last].code, (BPF_JMP | BPF_EXIT) as u8);
-    }
-
-    #[test]
-    fn assembler_rejects_unresolved_referenced_label() {
-        let mut asm = Assembler::new();
-        let missing = asm.label();
-        asm.ja(missing).expect("jump itself should be emitted");
-
-        assert!(asm.finish().is_err());
-    }
-
-    #[test]
-    fn assembler_accepts_signed_jump_range_endpoints() {
-        let mut forward = Assembler::new();
-        let target = forward.label();
-        let _unused = forward.label();
-        forward.ja(target).unwrap();
-        forward
-            .insns
-            .resize_with(i16::MAX as usize + 1, || bpf_insn {
-                code: 0,
-                _bitfield_align_1: [],
-                _bitfield_1: bpf_insn::new_bitfield_1(0, 0),
-                off: 0,
-                imm: 0,
-            });
-        forward.bind(target);
-        let bytecode = forward.finish().unwrap();
-        assert_eq!(bytecode.insns[0].off, i16::MAX);
-
-        let mut backward = Assembler::new();
-        let target = backward.label();
-        backward.bind(target);
-        backward.insns.resize_with(i16::MAX as usize, || bpf_insn {
-            code: 0,
-            _bitfield_align_1: [],
-            _bitfield_1: bpf_insn::new_bitfield_1(0, 0),
-            off: 0,
-            imm: 0,
-        });
-        backward.ja(target).unwrap();
-        let bytecode = backward.finish().unwrap();
-        assert_eq!(bytecode.insns[i16::MAX as usize].off, i16::MIN);
-
-        let mut too_far_forward = Assembler::new();
-        let target = too_far_forward.label();
-        too_far_forward.ja(target).unwrap();
-        too_far_forward
-            .insns
-            .resize_with(i16::MAX as usize + 2, || bpf_insn {
-                code: 0,
-                _bitfield_align_1: [],
-                _bitfield_1: bpf_insn::new_bitfield_1(0, 0),
-                off: 0,
-                imm: 0,
-            });
-        too_far_forward.bind(target);
-        assert!(too_far_forward.finish().is_err());
-
-        let mut too_far_backward = Assembler::new();
-        let target = too_far_backward.label();
-        too_far_backward.bind(target);
-        too_far_backward
-            .insns
-            .resize_with(i16::MAX as usize + 1, || bpf_insn {
-                code: 0,
-                _bitfield_align_1: [],
-                _bitfield_1: bpf_insn::new_bitfield_1(0, 0),
-                off: 0,
-                imm: 0,
-            });
-        too_far_backward.ja(target).unwrap();
-        assert!(too_far_backward.finish().is_err());
-    }
-}
+mod tests;
