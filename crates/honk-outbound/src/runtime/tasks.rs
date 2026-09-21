@@ -1,3 +1,112 @@
+use futures_util::FutureExt as _;
+
+#[derive(Clone, Debug)]
+pub(crate) struct SharedTask {
+    abort: tokio::task::AbortHandle,
+    join: futures_util::future::Shared<futures_util::future::BoxFuture<'static, bool>>,
+}
+
+impl SharedTask {
+    pub(crate) fn abort(&self) {
+        self.abort.abort();
+    }
+
+    pub(crate) async fn join(&self) -> bool {
+        self.join.clone().await
+    }
+}
+
+#[derive(Debug)]
+enum TaskEntry {
+    Raw(tokio::task::JoinHandle<()>),
+    Shared(SharedTask),
+}
+
+impl TaskEntry {
+    fn abort_handle(&self) -> tokio::task::AbortHandle {
+        match self {
+            Self::Raw(task) => task.abort_handle(),
+            Self::Shared(task) => task.abort.clone(),
+        }
+    }
+
+    fn abort(&self) {
+        self.abort_handle().abort();
+    }
+
+    fn is_finished(&self) -> bool {
+        match self {
+            Self::Raw(task) => task.is_finished(),
+            Self::Shared(task) => task.abort.is_finished(),
+        }
+    }
+}
+
+impl Future for TaskEntry {
+    type Output = bool;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<bool> {
+        match self.get_mut() {
+            Self::Raw(task) => std::pin::Pin::new(task).poll(cx).map(join_succeeded),
+            Self::Shared(task) => std::pin::Pin::new(&mut task.join).poll(cx),
+        }
+    }
+}
+
+/// Both a transport and its enclosing runtime may await the same worker.
+pub(crate) fn spawn_joinable<F>(
+    owner: Option<&std::sync::Arc<TaskOwner>>,
+    future: F,
+) -> std::io::Result<SharedTask>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let scope = OWNER.try_with(Clone::clone).ok().flatten();
+    let scoped = scope
+        .as_ref()
+        .map(|owner| owner.upgrade().ok_or(std::io::ErrorKind::Interrupted))
+        .transpose()?;
+    let primary = owner.or(scoped.as_ref());
+    let (start, started) = tokio::sync::oneshot::channel();
+    let future = async move {
+        if started.await.is_ok() {
+            future.await;
+        }
+    };
+    let mut shared = None;
+    let build = |scope| {
+        let task = tokio::spawn(OWNER.scope(scope, future));
+        let task = SharedTask {
+            abort: task.abort_handle(),
+            join: async move { join_succeeded(task.await) }.boxed().shared(),
+        };
+        shared = Some(task.clone());
+        TaskEntry::Shared(task)
+    };
+    if let Some(primary) = primary {
+        primary
+            .register(|_| build(scope.clone()))
+            .ok_or_else(|| primary.admission_error())?;
+    } else {
+        build(scope);
+    }
+    let task = shared.expect("admitted worker has a join");
+    if let (Some(owner), Some(scoped)) = (owner, scoped.as_ref())
+        && !std::sync::Arc::ptr_eq(owner, scoped)
+        && scoped
+            .register(|_| TaskEntry::Shared(task.clone()))
+            .is_none()
+    {
+        task.abort();
+        return Err(scoped.admission_error());
+    }
+    let _ = start.send(());
+    Ok(task)
+}
+
 /// Spawn a protocol/pool task in its captured runtime, when ownership is enabled.
 pub(crate) fn spawn_owned<F>(future: F) -> Option<tokio::task::AbortHandle>
 where
@@ -141,7 +250,7 @@ pub(super) fn sync_scope_owner<T>(
 struct OwnedTasks {
     closed: bool,
     capacity_rejected: bool,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    tasks: Vec<TaskEntry>,
     endpoints: Vec<(std::sync::Weak<()>, quinn::Endpoint)>,
 }
 
@@ -193,6 +302,13 @@ impl TaskOwner {
         self.state.lock().closed
     }
 
+    fn admission_error(&self) -> std::io::Error {
+        if self.state.lock().capacity_rejected {
+            crate::proxy::PacketRejection::Capacity.into()
+        } else {
+            std::io::ErrorKind::Interrupted.into()
+        }
+    }
     /// Sticky panic status, including tasks already reaped before close.
     pub fn has_failed(&self) -> bool {
         self.failed.load(std::sync::atomic::Ordering::Acquire)
@@ -203,12 +319,12 @@ impl TaskOwner {
             if !task.is_finished() {
                 return true;
             }
-            report_join(
-                &self.failed,
-                futures_util::FutureExt::now_or_never(task)
-                    .expect("finished task has a ready join result"),
-            );
-            false
+            if let Some(result) = futures_util::FutureExt::now_or_never(task) {
+                report_join(&self.failed, result);
+                false
+            } else {
+                true
+            }
         });
         self.reap_endpoints();
     }
@@ -277,7 +393,7 @@ impl TaskOwner {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.register(|owner| tokio::spawn(OWNER.scope(Some(owner), future)))
+        self.register(|owner| TaskEntry::Raw(tokio::spawn(OWNER.scope(Some(owner), future))))
     }
 
     /// Retain blocking platform work before publication. The caller's admission
@@ -295,15 +411,15 @@ impl TaskOwner {
             let work = OWNER.scope(Some(owner), async move {
                 work();
             });
-            tokio::task::spawn_blocking(move || {
+            TaskEntry::Raw(tokio::task::spawn_blocking(move || {
                 futures_util::FutureExt::now_or_never(work).expect("blocking work cannot suspend");
-            })
+            }))
         })
     }
 
     fn register<S>(self: &std::sync::Arc<Self>, start: S) -> Option<tokio::task::AbortHandle>
     where
-        S: FnOnce(std::sync::Weak<Self>) -> tokio::task::JoinHandle<()>,
+        S: FnOnce(std::sync::Weak<Self>) -> TaskEntry,
     {
         let mut state = self.state.lock();
         if state.closed {
@@ -315,10 +431,12 @@ impl TaskOwner {
             if !task.is_finished() {
                 return true;
             }
-            let result = futures_util::FutureExt::now_or_never(task)
-                .expect("finished task has a ready join result");
-            report_join(&self.failed, result);
-            false
+            if let Some(result) = futures_util::FutureExt::now_or_never(task) {
+                report_join(&self.failed, result);
+                false
+            } else {
+                true
+            }
         });
         if self.limit.is_some_and(|limit| state.tasks.len() >= limit) {
             state.capacity_rejected = true;
@@ -419,18 +537,25 @@ impl Drop for TaskOwner {
     }
 }
 
-fn report_join(failed: &std::sync::atomic::AtomicBool, result: Result<(), tokio::task::JoinError>) {
+fn join_succeeded(result: Result<(), tokio::task::JoinError>) -> bool {
     if let Err(error) = result
         && error.is_panic()
     {
-        failed.store(true, std::sync::atomic::Ordering::Release);
         tracing::error!(%error, "outbound runtime task panicked");
+        return false;
+    }
+    true
+}
+
+fn report_join(failed: &std::sync::atomic::AtomicBool, succeeded: bool) {
+    if !succeeded {
+        failed.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
 struct PendingJoin<'a> {
     owner: &'a TaskOwner,
-    task: Option<tokio::task::JoinHandle<()>>,
+    task: Option<TaskEntry>,
 }
 
 impl Drop for PendingJoin<'_> {
@@ -686,5 +811,56 @@ mod tests {
         ));
         owner.close().await;
         assert!(owner.state.lock().tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shared_worker_panic_survives_each_owners_reaping_and_close() {
+        let parent = Arc::new(TaskOwner::production());
+        let local = Arc::new(TaskOwner::production());
+        let task = parent
+            .sync_scope(|| {
+                spawn_joinable(Some(&local), async {
+                    panic!("shared adapter worker failed");
+                })
+            })
+            .unwrap();
+        assert!(!task.join().await);
+        local.reap();
+        parent.reap();
+        for owner in [local, parent] {
+            owner.close().await;
+            assert!(owner.has_failed());
+            owner.close().await;
+            assert!(owner.has_failed());
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_worker_admission_counts_alias_once_and_rejects_closed_parent_before_io() {
+        let owner = Arc::new(TaskOwner::new(Some(2)));
+        owner.sync_scope(|| {
+            for _ in 0..2 {
+                spawn_joinable(Some(&owner), std::future::pending()).unwrap();
+            }
+            let error = spawn_joinable(Some(&owner), std::future::pending()).unwrap_err();
+            assert_eq!(
+                crate::proxy::io_packet_rejection(&error),
+                Some(crate::proxy::PacketRejection::Capacity)
+            );
+        });
+        owner.close().await;
+
+        let local = Arc::new(TaskOwner::production());
+        let ran = Arc::new(AtomicBool::new(false));
+        let running = Arc::clone(&ran);
+        assert!(
+            owner
+                .sync_scope(|| spawn_joinable(Some(&local), async move {
+                    running.store(true, Ordering::Release);
+                }))
+                .is_err()
+        );
+        local.close().await;
+        assert!(!ran.load(Ordering::Acquire));
     }
 }

@@ -17,7 +17,9 @@ pub use tasks::TaskOwner;
 pub use tasks::TaskScope;
 #[cfg(feature = "native-api")]
 pub(crate) use tasks::lookup_host_owned;
-pub(crate) use tasks::{RuntimeEndpoint, new_owned_quic_endpoint, spawn_owned};
+pub(crate) use tasks::{
+    RuntimeEndpoint, SharedTask, new_owned_quic_endpoint, spawn_joinable, spawn_owned,
+};
 #[cfg(any(feature = "rprx", test))]
 mod vless;
 

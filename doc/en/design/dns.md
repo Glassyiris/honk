@@ -228,6 +228,8 @@ When `store_dns` enables persistence, a bounded actor mirrors retained positive 
 
 Proxied DoQ and DoH3 adapt the generation-pinned leaf `PacketTransport` to quinn's `AsyncUdpSocket`. Each pooled QUIC connection or HTTP/3 session owns one bounded adapter and client endpoint until retry or shutdown closes it; datagram boundaries and peer metadata remain intact, and the inner QUIC payload cap is 1252 bytes. A missing proxy registry or packet capability fails closed instead of bypassing to direct. Direct QUIC keeps the reusable native bypass-marked endpoint.
 
+The DNS client's task owner and any captured runtime owner retain the same packet-adapter worker joins, including failed or cancelled handshakes before session publication. Close and pause wait for those joins; worker panics remain sticky after reaping and make suspension fail. Zero-timeout endpoint close only requests closure, never acknowledges joined cleanup. Health probes use the same endpoint close protocol.
+
 `-> node-or-group` forces one generation-pinned dial leaf. Without an explicit target, the upstream endpoint is passed through the pinned traffic router and group snapshot. UDP+proxy deliberately uses TCP-DNS; this policy is separate from the SOCKS5 RFC 1928 UDP transport used by ordinary proxied UDP flows.
 
 Direct upstream sockets carry the bypass mark so their traffic cannot re-enter transparent interception. Hostname endpoints resolve through the generation-captured bootstrap resolver; dials never depend on honk's intercepted resolver path.

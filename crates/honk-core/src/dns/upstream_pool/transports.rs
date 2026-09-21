@@ -36,6 +36,14 @@ impl PooledTransport {
         }
     }
 
+    fn tasks_failed(&self) -> bool {
+        match self {
+            Self::Doq(transport) => transport.tasks_failed(),
+            Self::Doh3(transport) => transport.tasks_failed(),
+            _ => false,
+        }
+    }
+
     pub(super) async fn exchange(
         &self,
         raw_query: &[u8],
@@ -180,8 +188,12 @@ impl UpstreamPool {
             pool.close().await;
         }
         for slot in slots {
-            slot.close(|transport| async move {
+            let failed = Arc::clone(&self.transport_tasks_failed);
+            slot.close(move |transport| async move {
                 transport.close().await;
+                if transport.tasks_failed() {
+                    failed.store(true, Ordering::Release);
+                }
             })
             .await;
         }

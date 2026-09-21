@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use parking_lot::Mutex as SyncMutex;
 use quinn::{ClientConfig, Endpoint, VarInt};
+#[cfg(test)]
 use tokio::sync::Mutex;
 
 use super::endpoint::endpoint_config_with_mtu;
@@ -89,28 +90,34 @@ struct TransportQuinnSocket {
     send_error: SharedTransportError,
     recv_error: SharedTransportError,
     recv_waker: SharedRecvWaker,
-    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    tasks: std::sync::OnceLock<[crate::runtime::SharedTask; 2]>,
     metrics_enabled: bool,
 }
 
 impl TransportQuinnSocket {
     #[cfg(test)]
     fn new(transport: Arc<dyn PacketTransport>, remote: SocketAddr) -> Arc<Self> {
-        Self::new_with_metrics(transport, remote, false)
+        let (socket, sender, receiver) = Self::prepare(transport, remote, false);
+        socket.start_workers(None, sender, receiver).unwrap();
+        socket
     }
 
-    fn new_with_metrics(
+    fn prepare(
         transport: Arc<dyn PacketTransport>,
         remote: SocketAddr,
         metrics_enabled: bool,
-    ) -> Arc<Self> {
+    ) -> (
+        Arc<Self>,
+        impl Future<Output = ()> + Send + 'static,
+        impl Future<Output = ()> + Send + 'static,
+    ) {
         let (outbound_tx, mut outbound_rx) =
             tokio::sync::mpsc::channel::<QueuedTransportPacket>(TRANSPORT_QUEUE_CAP);
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(TRANSPORT_QUEUE_CAP);
         let send_error = Arc::new(SyncMutex::new(None));
         let recv_error = Arc::new(SyncMutex::new(None));
         let recv_waker = Arc::new(SyncMutex::new(None));
-        let sender = tokio::spawn({
+        let sender = {
             let transport = Arc::clone(&transport);
             let send_error = Arc::clone(&send_error);
             let recv_waker = Arc::clone(&recv_waker);
@@ -176,9 +183,9 @@ impl TransportQuinnSocket {
                     }
                 }
             }
-        });
+        };
         let allows_full_cone_replies = transport.allows_full_cone_replies();
-        let receiver = tokio::spawn({
+        let receiver = {
             let recv_error = Arc::clone(&recv_error);
             let recv_waker = Arc::clone(&recv_waker);
             async move {
@@ -226,17 +233,38 @@ impl TransportQuinnSocket {
                     }
                 }
             }
-        });
-        Arc::new(Self {
+        };
+        let socket = Arc::new(Self {
             remote,
             outbound: outbound_tx,
             inbound: SyncMutex::new(inbound_rx),
             send_error,
             recv_error,
             recv_waker,
-            tasks: Mutex::new(vec![sender, receiver]),
+            tasks: std::sync::OnceLock::new(),
             metrics_enabled,
-        })
+        });
+        (socket, sender, receiver)
+    }
+
+    fn start_workers(
+        &self,
+        owner: Option<&Arc<crate::runtime::TaskOwner>>,
+        sender: impl Future<Output = ()> + Send + 'static,
+        receiver: impl Future<Output = ()> + Send + 'static,
+    ) -> io::Result<()> {
+        let sender = crate::runtime::spawn_joinable(owner, sender)?;
+        let receiver = match crate::runtime::spawn_joinable(owner, receiver) {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                sender.abort();
+                return Err(error);
+            }
+        };
+        self.tasks
+            .set([sender, receiver])
+            .expect("workers start once");
+        Ok(())
     }
 
     fn send_error(&self) -> Option<io::Error> {
@@ -258,22 +286,20 @@ impl TransportQuinnSocket {
     }
 
     async fn close_tasks(&self) -> bool {
-        let mut tasks = self.tasks.lock().await;
         let mut joined = true;
-        for task in tasks.iter() {
+        for task in self.tasks.get().into_iter().flatten() {
             task.abort();
         }
-        for task in tasks.iter_mut() {
-            joined &= !task.await.is_err_and(|error| !error.is_cancelled());
+        for task in self.tasks.get().into_iter().flatten() {
+            joined &= task.join().await;
         }
-        tasks.clear();
         joined
     }
 }
 
 impl Drop for TransportQuinnSocket {
     fn drop(&mut self) {
-        for task in self.tasks.get_mut().drain(..) {
+        for task in self.tasks.get().into_iter().flatten() {
             task.abort();
         }
     }
@@ -470,16 +496,16 @@ impl PacketTransportEndpoint {
         &self.endpoint
     }
 
-    /// Close the Quinn endpoint and wait up to `timeout` for it to drain.
-    /// A zero timeout leaves the adapter workers alive until Quinn releases
-    /// the socket; other closes abort and join them.
-    pub async fn close(&self, timeout: Duration) {
+    /// Close the endpoint, drain for up to `timeout`, then abort and join workers.
+    /// Returns false if draining timed out or a worker panicked. Zero only requests
+    /// closure, leaving the workers alive until Quinn releases its socket.
+    pub async fn close(&self, timeout: Duration) -> bool {
         self.endpoint.close(VarInt::from_u32(0), b"shutdown");
         if timeout.is_zero() {
-            return;
+            return true;
         }
-        let _ = tokio::time::timeout(timeout, self.endpoint.wait_idle()).await;
-        self.socket.close_tasks().await;
+        let idle = tokio::time::timeout(timeout, self.endpoint.wait_idle()).await;
+        self.socket.close_tasks().await && idle.is_ok()
     }
 }
 
@@ -490,28 +516,18 @@ pub fn packet_transport_endpoint(
     transport: Arc<dyn PacketTransport>,
     remote: SocketAddr,
 ) -> io::Result<PacketTransportEndpoint> {
-    packet_transport_endpoint_with_metrics(transport, remote, false)
+    packet_transport_endpoint_with_metrics(transport, remote, false, None)
 }
 
 /// Create a packet-backed endpoint whose adapter pressure counters belong to a
 /// persistent pooled DNS connection.
+/// `owner` retains unpublished worker joins even without a native runtime scope.
 pub fn packet_transport_endpoint_with_metrics(
     transport: Arc<dyn PacketTransport>,
     remote: SocketAddr,
     metrics_enabled: bool,
+    owner: Option<&Arc<crate::runtime::TaskOwner>>,
 ) -> io::Result<PacketTransportEndpoint> {
-    let (socket, endpoint) = packet_transport_endpoint_parts(transport, remote, metrics_enabled)?;
-    Ok(PacketTransportEndpoint {
-        endpoint: endpoint?,
-        socket,
-    })
-}
-
-fn packet_transport_endpoint_parts(
-    transport: Arc<dyn PacketTransport>,
-    remote: SocketAddr,
-    metrics_enabled: bool,
-) -> io::Result<(Arc<TransportQuinnSocket>, io::Result<Endpoint>)> {
     if transport.relay_addr() != remote {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -521,9 +537,11 @@ fn packet_transport_endpoint_parts(
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
     let config = endpoint_config_with_mtu(1252)?;
-    let socket = TransportQuinnSocket::new_with_metrics(transport, remote, metrics_enabled);
-    let endpoint = Endpoint::new_with_abstract_socket(config, None, socket.clone(), runtime);
-    Ok((socket, endpoint))
+    let (socket, sender, receiver) =
+        TransportQuinnSocket::prepare(transport, remote, metrics_enabled);
+    let endpoint = Endpoint::new_with_abstract_socket(config, None, socket.clone(), runtime)?;
+    socket.start_workers(owner, sender, receiver)?;
+    Ok(PacketTransportEndpoint { endpoint, socket })
 }
 
 /// Establish a QUIC connection through a proxied UDP tunnel and time the
@@ -543,19 +561,22 @@ pub async fn quic_handshake_probe(
     if cancel.is_cancelled() {
         return Err(crate::alive::HealthCheckError::Paused.into());
     }
-    let (socket, endpoint) = packet_transport_endpoint_parts(transport, target, false)?;
-    let endpoint = match endpoint {
-        Ok(endpoint) => endpoint,
-        Err(error) => {
-            if !socket.close_tasks().await {
-                cancel.report_cleanup_failure();
+    let tasks = Arc::new(crate::runtime::TaskOwner::production());
+    let endpoint =
+        match packet_transport_endpoint_with_metrics(transport, target, false, Some(&tasks)) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                tasks.close().await;
+                if tasks.has_failed() {
+                    cancel.report_cleanup_failure();
+                }
+                return Err(error.into());
             }
-            return Err(error.into());
-        }
-    };
+        };
     let result = async {
         let start = Instant::now();
         let connecting = endpoint
+            .endpoint()
             .connect_with(config.clone(), target, server_name)
             .context("create QUIC connecting")?;
         let conn = cancel
@@ -571,10 +592,9 @@ pub async fn quic_handshake_probe(
         Ok(measured)
     }
     .await;
-    endpoint.close(quinn::VarInt::from_u32(0), b"probe closed");
-    let idle = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
-    let joined = socket.close_tasks().await;
-    if idle.is_err() || !joined {
+    let joined = endpoint.close(Duration::from_secs(2)).await;
+    tasks.close().await;
+    if !joined || tasks.has_failed() {
         cancel.report_cleanup_failure();
         return result.and_then(|_| Err(crate::alive::HealthCheckError::WorkerFailed.into()));
     }
@@ -997,5 +1017,51 @@ mod probe_tests {
         .await
         .unwrap();
         server_task.await.unwrap();
+    }
+
+    #[derive(Debug)]
+    struct PanicReceiveTransport {
+        inner: UdpPacketTransport,
+        panicked: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl PacketTransport for PanicReceiveTransport {
+        fn relay_addr(&self) -> SocketAddr {
+            self.inner.remote
+        }
+
+        async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
+            self.inner.send_packet(data).await
+        }
+
+        async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            self.inner.recv_packet(buf).await?;
+            self.panicked.notify_one();
+            panic!("injected packet receiver panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_close_keeps_worker_panic_failure_after_first_join() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote = peer.local_addr().unwrap();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(remote).await.unwrap();
+        peer.send_to(b"panic", socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        let panicked = Arc::new(tokio::sync::Notify::new());
+        let endpoint = packet_transport_endpoint(
+            Arc::new(PanicReceiveTransport {
+                inner: UdpPacketTransport { socket, remote },
+                panicked: Arc::clone(&panicked),
+            }),
+            remote,
+        )
+        .unwrap();
+        panicked.notified().await;
+        assert!(!endpoint.close(Duration::from_secs(1)).await);
+        assert!(!endpoint.close(Duration::from_secs(1)).await);
     }
 }

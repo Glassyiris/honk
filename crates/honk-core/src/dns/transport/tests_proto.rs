@@ -25,6 +25,8 @@ use crate::dns::upstream_pool::UpstreamPool;
 use crate::dns::{DnsResolver, cache::DnsCache};
 use crate::proxy::{PacketOutbound, PacketTransport, ProtocolEntry, ProxyStream, TcpOutbound};
 
+mod quic_lifecycle;
+
 fn mock_dns_response(txid: u16) -> Vec<u8> {
     vec![
         (txid >> 8) as u8,
@@ -130,6 +132,7 @@ struct TrackedUdpTransport {
     socket: UdpSocket,
     remote: SocketAddr,
     active: Arc<AtomicUsize>,
+    fault: Option<Arc<PacketWorkerFault>>,
 }
 
 impl Drop for TrackedUdpTransport {
@@ -150,7 +153,44 @@ impl PacketTransport for TrackedUdpTransport {
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        let _teardown = self.fault.as_ref().and_then(|fault| {
+            fault.entered.notify_one();
+            assert!(
+                !fault.panic.swap(false, Ordering::AcqRel),
+                "injected adapter panic"
+            );
+            fault
+                .release
+                .lock()
+                .take()
+                .map(|release| PacketWorkerTeardown {
+                    fault: Arc::clone(fault),
+                    release,
+                })
+        });
         Ok((self.socket.recv(buf).await?, self.remote))
+    }
+}
+
+#[derive(Debug, Default)]
+struct PacketWorkerFault {
+    entered: tokio::sync::Notify,
+    dropping: tokio::sync::Notify,
+    release: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    completed: std::sync::atomic::AtomicBool,
+    panic: std::sync::atomic::AtomicBool,
+}
+
+struct PacketWorkerTeardown {
+    fault: Arc<PacketWorkerFault>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl Drop for PacketWorkerTeardown {
+    fn drop(&mut self) {
+        self.fault.dropping.notify_one();
+        let _ = self.release.recv_timeout(Duration::from_secs(5));
+        self.fault.completed.store(true, Ordering::Release);
     }
 }
 
@@ -158,6 +198,7 @@ impl PacketTransport for TrackedUdpTransport {
 struct TestPacketHandler {
     active: Arc<AtomicUsize>,
     runtime_dials: Arc<AtomicUsize>,
+    fault: Option<Arc<PacketWorkerFault>>,
 }
 
 impl TestPacketHandler {
@@ -174,6 +215,7 @@ impl TestPacketHandler {
             socket,
             remote: target,
             active: Arc::clone(&self.active),
+            fault: self.fault.clone(),
         }))
     }
 }
@@ -223,11 +265,19 @@ pub(super) struct ProxiedQuicFixture {
 }
 
 pub(super) fn proxied_quic_fixture(endpoint: DnsEndpoint) -> ProxiedQuicFixture {
+    proxied_quic_fixture_with_fault(endpoint, None)
+}
+
+fn proxied_quic_fixture_with_fault(
+    endpoint: DnsEndpoint,
+    fault: Option<Arc<PacketWorkerFault>>,
+) -> ProxiedQuicFixture {
     let active = Arc::new(AtomicUsize::new(0));
     let runtime_dials = Arc::new(AtomicUsize::new(0));
     let handler = Arc::new(TestPacketHandler {
         active: Arc::clone(&active),
         runtime_dials: Arc::clone(&runtime_dials),
+        fault,
     });
     let mut registry = crate::proxy::ProxyRegistry::new();
     registry.register(

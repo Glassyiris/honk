@@ -154,6 +154,10 @@ impl DoqClient {
             .await;
     }
 
+    pub(crate) fn tasks_failed(&self) -> bool {
+        self.quic_ep.tasks_failed()
+    }
+
     pub(crate) async fn close(&self) {
         let timeout = self.dial.query_timeout;
         self.connection
