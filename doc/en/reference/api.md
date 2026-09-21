@@ -4,7 +4,7 @@ The native and Clash APIs have independent features, listeners, credentials, and
 
 ## Native API (M1)
 
-Build with `--features native-api` and enable [`experimental.native_api`](./experimental.md#native_api). The feature and listener are default-off; `--no-default-features --features native-api` works without Clash. `.dae` remains the configuration authority, with opt-in source administration rather than a SQLite configuration store.
+The `native-api` Cargo feature is included in default builds and both release allocator variants; the listener remains disabled until [`experimental.native_api`](./experimental.md#native_api) is enabled. `--no-default-features --features native-api` works without Clash. `.dae` remains the configuration authority, with opt-in source administration rather than a SQLite configuration store.
 
 The base contract is [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992), supplemented by the node/provider management and geodata additions in [doona-pin ba3e4c3648e04d093d32164ecca018f51bd74e00](https://github.com/Zakkaus/api-standardize/tree/ba3e4c3648e04d093d32164ecca018f51bd74e00). This does not adopt that later bundle's mode/automatic-override changes: native mode and automatic-policy overrides remain gated, and `full_transparency` is not advertised. Source administration requires a captured `.dae` startup with separate content/write opt-ins. Discover current capabilities and source permissions rather than assuming every action is enabled.
 

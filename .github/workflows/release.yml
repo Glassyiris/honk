@@ -172,23 +172,22 @@ jobs:
         with:
           version: 0.14.1
 
-      # The default feature set carries mimalloc; the "-stock" matrix entries
-      # build the same target against the system malloc instead.
+      # Allocator variants must expose the same protocol and API capabilities.
       - name: Resolve feature set
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${{ matrix.suffix }}" == "-stock" ]]; then
-            echo "FEATURES=--no-default-features --features clash-api,ebpf,rprx" >> "$GITHUB_ENV"
-          else
-            echo "FEATURES=--features ebpf" >> "$GITHUB_ENV"
+          features=clash-api,ebpf,rprx,native-api
+          if [[ "${{ matrix.suffix }}" != "-stock" ]]; then
+            features+=,mimalloc
           fi
+          echo "FEATURES=$features" >> "$GITHUB_ENV"
 
       # The root rust-toolchain.toml selects the host compiler whose cross
       # targets were installed above; the eBPF crate has its own nightly pin.
       - name: Build honk-core (native gnu)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo build --release -p honk-core $FEATURES --target ${{ matrix.target }}
+        run: cargo build --release -p honk-core --no-default-features --features "$FEATURES" --target ${{ matrix.target }}
 
       - name: Build honk-core (cross via zig wrappers)
         if: matrix.target != 'x86_64-unknown-linux-gnu'
@@ -211,8 +210,9 @@ jobs:
           fi
           # boring-sys generates its bindings with bindgen at build time —
           # point it at zig's target headers, not the host's.
-          export BINDGEN_EXTRA_CLANG_ARGS="$(ci/zig-bindgen-env "$ZIGCC_TARGET")"
-          cargo build --release -p honk-core $FEATURES --target "$T"
+          BINDGEN_EXTRA_CLANG_ARGS="$(ci/zig-bindgen-env "$ZIGCC_TARGET")"
+          export BINDGEN_EXTRA_CLANG_ARGS
+          cargo build --release -p honk-core --no-default-features --features "$FEATURES" --target "$T"
 
       - name: Package artifact
         run: |

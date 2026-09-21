@@ -4,7 +4,7 @@
 
 ## 原生 API (M1)
 
-本节保留 M1 标题锚点，说明当前已实现的原生观测与控制契约。以 `--features native-api` 构建并启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是唯一配置权威；显式授权后可读取与替换已接受的源文件，不引入 SQLite 配置主存储。
+本节保留 M1 标题锚点，说明当前已实现的原生观测与控制契约。默认构建及两种 allocator 发布产物均包含 `native-api` Cargo feature，但 listener 默认关闭，须显式启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是唯一配置权威；显式授权后可读取与替换已接受的源文件，不引入 SQLite 配置主存储。
 
 基础契约为 [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992)，节点/provider 管理与 geodata 使用 [doona-pin ba3e4c3648e04d093d32164ecca018f51bd74e00](https://github.com/Zakkaus/api-standardize/tree/ba3e4c3648e04d093d32164ecca018f51bd74e00) 中的 M9 补充。没有整体切换到该后续 bundle 的 mode/自动 override 变更：原生 mode 与自动策略 override 继续 gate，不声明 `full_transparency`。源管理仍要求真实 `.dae` 启动及独立 content/write 授权；以 capabilities 和逐源权限为准，不按路由名称推断全部可用。
 

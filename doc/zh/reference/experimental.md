@@ -14,7 +14,7 @@
 
 ## `native_api`
 
-需要默认关闭的 Cargo feature `native-api`，不依赖 `clash-api`。未编译该 feature 却启用配置时，启动报错。所有字段都要求重启；SIGHUP 拒绝其变更并保留当前 listener 与配置代次。未知字段、标量中的嵌套块、无效布尔值及安全列表空成员均报错。
+需要默认编译的 Cargo feature `native-api`，不依赖 `clash-api`，listener 仍默认关闭。未编译该 feature 却启用配置时，启动报错。所有字段都要求重启；SIGHUP 拒绝其变更并保留当前 listener 与配置代次。未知字段、标量中的嵌套块、无效布尔值及安全列表空成员均报错。
 
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |

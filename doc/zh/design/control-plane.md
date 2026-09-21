@@ -239,7 +239,7 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 
 ## 原生观测 API
 
-独立且默认关闭的 `native-api` feature 在控制面准入前绑定。按需 phase watch 仅在真实 admission-open 成功后报告 running，在关闭栅栏前报告 draining；现有 health handle 可将 running 细化为 degraded。读取 generation 与 health 期间保留 config 发布屏障，不改变发布锁序。HTTP 可用不代表数据面健康。
+独立且默认编译的 `native-api` feature 提供默认关闭的 listener，启用后在控制面准入前绑定。按需 phase watch 仅在真实 admission-open 成功后报告 running，在关闭栅栏前报告 draining；现有 health handle 可将 running 细化为 degraded。读取 generation 与 health 期间保留 config 发布屏障，不改变发布锁序。HTTP 可用不代表数据面健康。
 
 `native_api.rs` 完整持有 listener、64 连接 JoinSet、唯一一秒 sampler 与 native tracker consumer，直到关闭 join。Header 预算五秒，空闲 I/O 与停滞写入有独立 30 秒期限，健康 SSE 可持续超过 30 秒；关闭共享五秒 grace。`observation.rs` 拥有进程身份、有界 flow/catalog/event、telemetry、结构化日志、DNS 历史及共用 operation store。TCP/UDP producer 在真实决策点捕获不可变 partial 证据，已接受发布在既有屏障下发出 generation 事件；native-only final handoff 不重复生成旧选路证据，不宣称完整内核透明观测。日志直接捕获审查过的结构化安全字段，不转发 Clash 格式化输出；`/events` 续传 replay→ready，而 `/logs` 按自身契约 ready→replay。
 
