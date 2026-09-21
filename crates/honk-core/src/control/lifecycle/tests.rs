@@ -360,6 +360,129 @@ async fn closed(stream: &mut TcpStream) {
     );
 }
 
+async fn prepare_loopback_epoch(
+    plane: &mut ControlPlane,
+    resuming: bool,
+) -> anyhow::Result<(RuntimeEpoch, SocketAddr)> {
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0")?;
+    tcp.set_nonblocking(true)?;
+    let dns = dns_listener::BoundDnsListener::bind(&honk_config::dns::DnsBindEndpoint::parse(
+        "udp://127.0.0.1:0",
+    )?)?;
+    let address = dns.local_addr();
+    let epoch = plane
+        .prepare_epoch(
+            BoundListeners {
+                tcp4: tokio::io::unix::AsyncFd::new(tcp)?,
+                tcp6: None,
+                udp4: Vec::new(),
+                udp6: Vec::new(),
+                dns: Some(dns),
+                nfqueue_enabled: false,
+            },
+            resuming,
+        )
+        .await?;
+    Ok((epoch, address))
+}
+
+async fn suspended_loopback_plane() -> anyhow::Result<ControlPlane> {
+    let mut config = Config::default();
+    config.ensure_builtin_nodes();
+    config.global.nfqueue_enable = false;
+    config.dns.strategy = honk_config::dns::DnsStrategy::Ipv4Only;
+    let mut plane = crate::control::tests::support::control_plane(config);
+    plane.set_mode_state(Arc::new(parking_lot::RwLock::new(
+        crate::mode::ModeState::native(),
+    )));
+    plane.start_datapath_flags_coordinator()?;
+    let (epoch, _) = prepare_loopback_epoch(&mut plane, false).await?;
+    let mut epoch = Some(epoch);
+    plane.open_epoch(epoch.as_mut().unwrap(), false).await?;
+    let authorizations = crate::subscription::SubscriptionAuthorizations::new(&[])?;
+    let mut commands = plane.command_rx.take().unwrap();
+    plane
+        .suspend_epoch(&mut epoch, &mut commands, &authorizations)
+        .await?;
+    plane.command_rx = Some(commands);
+    assert!(epoch.is_none());
+    Ok(plane)
+}
+
+#[tokio::test]
+async fn resumed_epoch_admits_dns_before_ingress_publication() -> anyhow::Result<()> {
+    let mut plane = suspended_loopback_plane().await?;
+    assert!(plane.rebuild_suspended_runtime().await?.accepted());
+    let (epoch, address) = prepare_loopback_epoch(&mut plane, true).await?;
+    let mut epoch = Some(epoch);
+    assert!(plane.dns_controller.try_admit_query(true).is_err());
+    // Hold the publication writer so admission is checked before any ready write.
+    let backend = plane.ebpf.clone();
+    let publication = backend.write().await;
+    let controller = plane.dns_controller.clone();
+    let mut opening = Box::pin(plane.open_epoch(epoch.as_mut().unwrap(), true));
+    assert!(futures::poll!(opening.as_mut()).is_pending());
+    drop(
+        controller
+            .try_admit_query(true)
+            .expect("DNS must admit before ingress publication can proceed"),
+    );
+    drop(publication);
+    opening.await?;
+    let client = UdpSocket::bind("127.0.0.1:0").await?;
+    let query = crate::dns::forwarder::build_dns_query("resume.example", 28);
+    client.send_to(&query, address).await?;
+    let mut answer = [0; 512];
+    let (size, source) = tokio::time::timeout(WAIT, client.recv_from(&mut answer)).await??;
+    assert_eq!(source, address);
+    assert!(size >= 12);
+    assert_eq!(&answer[..2], &query[..2]);
+    assert_ne!(answer[2] & 0x80, 0);
+    assert_eq!(answer[3] & 0x0f, 0, "resumed DNS must answer NOERROR");
+    assert_eq!(&answer[6..8], &[0, 0], "ipv4only answers AAAA locally");
+    let authorizations = crate::subscription::SubscriptionAuthorizations::new(&[])?;
+    let mut commands = plane.command_rx.take().unwrap();
+    plane
+        .suspend_epoch(&mut epoch, &mut commands, &authorizations)
+        .await?;
+    plane.finalize_shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dns_resume_rejection_keeps_candidate_epoch_fenced_and_owned() -> anyhow::Result<()> {
+    let mut plane = suspended_loopback_plane().await?;
+    // A drained runtime without a fresh publication is not eligible to resume.
+    let (epoch, address) = prepare_loopback_epoch(&mut plane, true).await?;
+    let mut epoch = Some(epoch);
+    let error = plane
+        .open_epoch(epoch.as_mut().unwrap(), true)
+        .await
+        .expect_err("unready DNS must reject ingress reopening");
+    assert!(matches!(
+        error.downcast_ref::<crate::dns::runtime::DnsPauseError>(),
+        Some(crate::dns::runtime::DnsPauseError::NotReady)
+    ));
+    assert!(plane.drain_tracker.should_reject());
+    assert!(plane.dns_controller.try_admit_query(true).is_err());
+    plane
+        .ebpf
+        .write()
+        .await
+        .clear_listener_sockets()
+        .expect("datapath admission must remain closed after DNS resume rejection");
+    let authorizations = crate::subscription::SubscriptionAuthorizations::new(&[])?;
+    let mut commands = plane.command_rx.take().unwrap();
+    plane
+        .suspend_epoch(&mut epoch, &mut commands, &authorizations)
+        .await?;
+    assert!(epoch.is_none());
+    assert_eq!(plane.drain_tracker.active_count(), 0);
+    let _rebound = UdpSocket::bind(address).await?;
+    plane.finalize_shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires transparent-listener permissions; run in the isolated lifecycle gate"]
 async fn mock_commands_close_live_and_pre_id_tcp_preserving_api_history() -> anyhow::Result<()> {

@@ -285,6 +285,8 @@ Suspend/resume 与源写入共用 daemon-owned 配置协调器，再由唯一 co
 
 恢复从 accepted 内存配置与 hosts/geodata artifact 重建 fresh runtime/listener、UDP pool、DNS fork 与协议任务 owner，不从磁盘悄悄 reload，也不复用已终止的 transport。新的 owner 继续共用原进程 FD/dial/carrier gate；完整重查拓扑，确认 listeners/routing/NFQUEUE 就绪后最后打开 admission。旧连接不会恢复，取消的流量与订阅正文不会重放；provider/network 通知不改变 retained settings/mode。安全清理完成的恢复失败保持 suspended；fence 或清理不确定则 failed 并终止。已经发布的新 userspace generation 不因后续 reopen 失败伪装成旧代，operation 分别报告 committed/current generation。
 
+恢复先让 DNS query acquisition 就绪，再重开 pending/NFQUEUE/datapath 准入。主动健康检查与按需探测调度仍在入口开放后恢复；DNS 就绪失败时保留 candidate 栅栏，交给原有 joined cleanup。
+
 已开始的系统 blocking lookup/NSS 无法靠取消 async waiter 停止；subscription 专有 runtime 及 DNS/协议 task owner 必须等实际 join。阶段 deadline 超过后仍保有 join，不能声称十秒内一定暂停或丢弃线程继续运行。终止关闭具有不同顺序：关闭 admission，停止 watcher 并 detach hooks；健康正常退出给既有连接默认五秒 drain grace，再强制取消/join epoch，故障退出可跳过 grace。原生 HTTP 另有五秒 graceful drain；阻塞 join 可能延长总退出时间，shutdown 优先于恢复，不在半完成 transition 中遗失任务所有权。
 
 健康检查 owner 的五秒 drain deadline 遵循同一规则：暂停和终止关闭均等待同一个 drain 完成，包括健康检查持有的阻塞解析任务，然后才返回 deadline 错误。若在超时后的清理中发现子任务失败，该失败优先于 deadline 错误返回。

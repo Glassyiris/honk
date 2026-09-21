@@ -481,6 +481,9 @@ impl ControlPlane {
                 !epoch.listeners.nfqueue_enabled || queue_ready,
                 "NFQUEUE token admission is not ready"
             );
+            // Receive loops are already running; DNS must admit before ingress opens.
+            #[cfg(feature = "native-api")]
+            self.dns_controller.runtime_provider().resume()?;
         } else {
             self.initialize_datapath_flags(epoch.listeners.nfqueue_enabled, queue_ready)
                 .await?;
@@ -832,7 +835,6 @@ impl ControlPlane {
         );
         self.open_epoch(epoch.as_mut().expect("prepared epoch"), true)
             .await?;
-        self.dns_controller.runtime_provider().resume()?;
         if self.health_task.is_some() {
             self.alive_set.resume_health_checks()?;
         }
