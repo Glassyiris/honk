@@ -16,7 +16,8 @@ use entries::{parse_node_section, parse_subscription_section};
 use groups::{parse_group_section, resolve_group_filters_inner};
 use scalars::{parse_experimental_section, parse_global_section};
 pub use sources::{
-    LoadedConfig, SourceLimits, SourceSnapshot, load_dae_sources, parse_dae_sources,
+    LoadedConfig, SourceLimits, SourceSnapshot, check_dae_source, load_dae_sources,
+    parse_dae_sources,
 };
 
 #[cfg(test)]

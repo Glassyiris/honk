@@ -1,5 +1,5 @@
 use super::*;
-use honk_config::parser::parse_dae_sources;
+use honk_config::parser::{check_dae_source, parse_dae_sources};
 
 impl Worker {
     pub(super) async fn validate(&self, request: ValidationRequest) -> Result<Value, ApiError> {
@@ -33,22 +33,20 @@ impl Worker {
                 documents.push((resolved,Arc::<str>::from(source.content.as_str())));
             }
             let mut diagnostics=Vec::new();
-            let syntax=parse_dae_sources(&documents,limits(),&mut diagnostics);
-            let initial_sources=syntax.as_ref().map(|loaded|loaded.sources.clone()).unwrap_or_default();
-            let result=if request.mode=="syntax" {syntax}
-                else {syntax.and_then(|_|{
+            let mut initial_sources=Vec::new();
+            let result=if request.mode=="syntax" {parse_dae_sources(&documents,limits(),&mut diagnostics)}
+                else {(||{
                     let overlay=documents.iter().cloned().collect();
                     let loaded=Config::from_dae_file_with_sources(&entry,&overlay,limits(),&mut diagnostics)?;
-                    let validated=offline::validate_for_coordinator(loaded,&active,&data_dir,limits(),&mut diagnostics,&deferred,None)?;
-                    let loaded_paths:HashSet<_>=validated.sources.iter().map(|source|&source.path).collect();
-                    let unused:Vec<_>=documents.iter().filter(|(path,_)|!loaded_paths.contains(path)).collect();
-                    let budgeted=validated.dependencies.iter().filter(|dependency|!dependency.asset);
-                    let bytes=validated.sources.iter().map(|source|source.content.len()).chain(budgeted.clone().map(|source|source.bytes)).chain(unused.iter().map(|(_,text)|text.len())).sum::<usize>();
-                    if bytes>MAX_SOURCE_BYTES||validated.sources.len()+budgeted.count()+unused.len()>MAX_SOURCES{
-                        return Err(honk_config::error::DetailedConfigError::new(honk_config::error::ErrorCategory::Validation,"config-byte-limit",honk_config::diagnostic::DiagnosticSources::new(None).root(),honk_config::diagnostic::SettingPath::new("config"),"configuration dependency budget exceeded"));
+                    initial_sources=loaded.sources.clone();
+                    for (path,content) in &documents {
+                        if !loaded.sources.iter().any(|source|source.path==*path) {
+                            check_dae_source(path,content)?;
+                        }
                     }
+                    let validated=offline::validate_for_coordinator(loaded,&active,&data_dir,limits(),&mut diagnostics,&deferred,None,&documents)?;
                     Ok(LoadedConfig {config:validated.config,sources:validated.sources})
-                })};
+                })()};
             if let Err(error)=&result {
                 if is_limit(error){return Err(too_large());}
                 if !diagnostics.iter().any(|diagnostic|diagnostic==error.diagnostic.as_ref()){diagnostics.push(error.diagnostic.as_ref().clone());}

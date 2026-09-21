@@ -54,10 +54,20 @@ pub(crate) fn capture_for_coordinator(
     deferred: &[honk_config::subscription::Subscription],
     geo: Option<&GeoSourceSet>,
 ) -> Result<CapturedConfig, DetailedConfigError> {
-    let result = capture_inner(loaded, active, data_dir, limits, diagnostics, geo, deferred);
+    let result = capture_inner(
+        loaded,
+        active,
+        data_dir,
+        limits,
+        diagnostics,
+        geo,
+        deferred,
+        &[],
+    );
     finish_attempt(result, diagnostics)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_for_coordinator(
     loaded: LoadedConfig,
     active: &Config,
@@ -66,9 +76,19 @@ pub(crate) fn validate_for_coordinator(
     diagnostics: &mut Vec<DetailedDiagnostic>,
     deferred: &[honk_config::subscription::Subscription],
     geo: Option<&GeoSourceSet>,
+    submitted: &[(PathBuf, Arc<str>)],
 ) -> Result<ValidatedConfig, DetailedConfigError> {
-    let result = capture_inner(loaded, active, data_dir, limits, diagnostics, geo, deferred)
-        .and_then(CapturedConfig::validate);
+    let result = capture_inner(
+        loaded,
+        active,
+        data_dir,
+        limits,
+        diagnostics,
+        geo,
+        deferred,
+        submitted,
+    )
+    .and_then(CapturedConfig::validate);
     finish_attempt(result, diagnostics)
 }
 
@@ -80,11 +100,21 @@ pub(crate) fn validate_with_data_dir(
     limits: SourceLimits,
     diagnostics: &mut Vec<DetailedDiagnostic>,
 ) -> Result<ValidatedConfig, DetailedConfigError> {
-    let result = capture_inner(loaded, active, data_dir, limits, diagnostics, None, &[])
-        .and_then(CapturedConfig::validate);
+    let result = capture_inner(
+        loaded,
+        active,
+        data_dir,
+        limits,
+        diagnostics,
+        None,
+        &[],
+        &[],
+    )
+    .and_then(CapturedConfig::validate);
     finish_attempt(result, diagnostics)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_inner(
     loaded: LoadedConfig,
     active: &Config,
@@ -93,6 +123,7 @@ fn capture_inner(
     diagnostics: &mut Vec<DetailedDiagnostic>,
     geo_override: Option<&GeoSourceSet>,
     deferred: &[honk_config::subscription::Subscription],
+    submitted: &[(PathBuf, Arc<str>)],
 ) -> Result<CapturedConfig, DetailedConfigError> {
     let LoadedConfig {
         mut config,
@@ -107,7 +138,7 @@ fn capture_inner(
         ));
     };
     let source = &entry.source;
-    let mut capture = Capture::new(&sources, active, data_dir, limits)
+    let mut capture = Capture::new(&sources, active, data_dir, limits, submitted)
         .map_err(|cause| dependency_error(source, "config", cause))?;
     config.append_diagnostics(source.clone(), diagnostics);
     config.validate_detailed().map_err(|mut error| {
@@ -366,19 +397,25 @@ impl Capture {
         active: &Config,
         data_dir: &Path,
         limits: SourceLimits,
+        submitted: &[(PathBuf, Arc<str>)],
     ) -> io::Result<Self> {
         let limits = SourceLimits {
             max_bytes: limits.max_bytes.min(8 * 1024 * 1024),
             max_sources: limits.max_sources.min(32),
         };
-        if sources.len() > limits.max_sources {
-            return Err(io::ErrorKind::QuotaExceeded.into());
-        }
+        let unused = submitted
+            .iter()
+            .filter(|(path, _)| !sources.iter().any(|source| source.path == *path));
+        let source_count = sources
+            .len()
+            .checked_add(unused.clone().count())
+            .filter(|count| *count <= limits.max_sources)
+            .ok_or(io::ErrorKind::QuotaExceeded)?;
         let bytes = sources
             .iter()
-            .try_fold(0usize, |total, source| {
-                total.checked_add(source.content.len())
-            })
+            .map(|source| source.content.len())
+            .chain(unused.map(|(_, content)| content.len()))
+            .try_fold(0usize, |total, bytes| total.checked_add(bytes))
             .filter(|bytes| *bytes <= limits.max_bytes)
             .ok_or(io::ErrorKind::FileTooLarge)?;
         let data_dir = data_dir.to_path_buf();
@@ -413,7 +450,7 @@ impl Capture {
             roots,
             explicitly_allowed,
             limits,
-            source_count: sources.len(),
+            source_count,
             bytes,
             files: Vec::new(),
         })

@@ -190,6 +190,71 @@ fn hosts_admission_charges_each_materialized_reference() {
 }
 
 #[test]
+fn unused_submissions_share_exact_materialization_byte_and_count_limits() {
+    let temp = tempfile::tempdir().unwrap();
+    let body = "full:exact.test 192.0.2.1\n";
+    fs::write(temp.path().join("hosts.rules"), body).unwrap();
+    let loaded = fixture(
+        temp.path(),
+        &format!(
+            "dns {{ use_host: '{}/hosts.rules'\n use_host: '{}/./hosts.rules' }}",
+            temp.path().display(),
+            temp.path().display(),
+        ),
+    );
+    let active = loaded.config.clone();
+    let unused = "# submitted but not included\n";
+    let submitted = [
+        (
+            loaded.sources[0].path.clone(),
+            loaded.sources[0].content.clone(),
+        ),
+        (temp.path().join("unused.dae"), Arc::from(unused)),
+    ];
+    let exact = SourceLimits {
+        max_bytes: loaded.sources[0].content.len() + unused.len() + 2 * body.len(),
+        max_sources: 4,
+    };
+    let validate = |limits| {
+        validate_for_coordinator(
+            loaded.clone(),
+            &active,
+            Path::new(&active.global.data_dir),
+            limits,
+            &mut Vec::new(),
+            &[],
+            None,
+            &submitted,
+        )
+    };
+    let admitted = validate(exact).unwrap();
+    assert_eq!(
+        admitted.dependencies,
+        admitted
+            .recapture_dependencies(&active, Path::new(&active.global.data_dir), exact, &[])
+            .unwrap()
+    );
+    for (limits, code) in [
+        (
+            SourceLimits {
+                max_bytes: exact.max_bytes - 1,
+                ..exact
+            },
+            "config-byte-limit",
+        ),
+        (
+            SourceLimits {
+                max_sources: exact.max_sources - 1,
+                ..exact
+            },
+            "config-source-limit",
+        ),
+    ] {
+        assert_eq!(validate(limits).err().unwrap().diagnostic.code, code);
+    }
+}
+
+#[test]
 fn revalidation_binds_ordered_host_aliases_to_their_targets() {
     let temp = tempfile::tempdir().unwrap();
     let first = temp.path().join("first.rules");
@@ -362,6 +427,7 @@ fn repeated_aliases_cannot_retain_bodies_beyond_byte_or_source_limits() {
             &loaded.config,
             Path::new(&loaded.config.global.data_dir),
             limits,
+            &[],
         )
         .unwrap();
         let mut retained_bytes = 0;
@@ -728,6 +794,7 @@ fn geodata_overlay_compiles_and_retains_verified_bytes_instead_of_disk() {
         &mut Vec::new(),
         &[],
         Some(&geo),
+        &[],
     )
     .unwrap();
     assert_eq!(admitted.dependencies[0].sha256, expected.sha256);

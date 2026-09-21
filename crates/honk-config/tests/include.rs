@@ -869,3 +869,13 @@ fn virtual_includes_follow_existing_directory_aliases_and_parent_components() {
         "duplicate-config-source"
     );
 }
+
+#[test]
+fn structural_source_check_rejects_recovered_lexical_errors() {
+    let path = std::path::Path::new("unused.dae");
+    let error = honk_config::parser::check_dae_source(path, "dns {\n use_host: 'unterminated\n}\n")
+        .unwrap_err();
+    assert_eq!(error.diagnostic.code, "unterminated-quote");
+    assert_eq!(error.diagnostic.line, Some(2));
+    assert!(error.diagnostic.terminal);
+}

@@ -4,6 +4,7 @@ mod geodata;
 mod groups;
 mod management;
 mod transactions;
+mod validation;
 
 use super::ConfigService;
 use super::coordinator::ConfigCoordinator;
@@ -635,138 +636,6 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
             .await,
         *source(&config, &fixture.originals["editable.dae"])
     );
-    assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
-    fixture.shutdown().await;
-}
-
-#[tokio::test]
-async fn validation_is_offline_readonly_and_distinguishes_syntax_from_full_admission() {
-    let fixture = Fixture::new(Access::Admin, false).await;
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let candidate = format!(
-        "{}subscription {{ private: 'http://{}/private-candidate-token' }}\n",
-        fixture.originals["main.dae"],
-        listener.local_addr().unwrap()
-    );
-    let before = fixture.get(CONFIG).await;
-    let before_disk = disk(fixture.directory.path());
-    for (mode, content, valid) in [
-        ("syntax", candidate.as_str(), true),
-        // Full admission of a subscription that was never fetched passes with a
-        // warning and, above all, without fetching it.
-        ("full", candidate.as_str(), true),
-        ("full", fixture.originals["main.dae"].as_str(), true),
-        ("syntax", "routing {\n", false),
-    ] {
-        let result = ok(fixture.validate(mode, content).send().await.unwrap()).await;
-        assert_eq!(result["valid"], valid);
-        assert_eq!(result["generation_id"], before["generation_id"]);
-        chrono::DateTime::parse_from_rfc3339(result["validated_at"].as_str().unwrap()).unwrap();
-        if !valid {
-            diagnostics(
-                &result["diagnostics"],
-                "candidate",
-                "private-candidate-token",
-            );
-        } else if mode == "full" && content == candidate.as_str() {
-            let rows = result["diagnostics"].as_array().unwrap();
-            let notice = rows
-                .iter()
-                .find(|row| row["code"] == "subscription-not-fetched")
-                .unwrap();
-            assert_eq!(notice["level"], "warning");
-            assert!(!result.to_string().contains("private-candidate-token"));
-        }
-        assert_eq!(disk(fixture.directory.path()), before_disk);
-        assert_eq!(fixture.get(CONFIG).await, before);
-    }
-    assert_eq!(
-        listener.accept().unwrap_err().kind(),
-        std::io::ErrorKind::WouldBlock
-    );
-    assert!(!fixture.path("state").exists());
-    assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
-    fixture.shutdown().await;
-}
-
-#[tokio::test]
-async fn validation_ids_and_display_paths_cannot_expand_file_authority() {
-    let fixture = Fixture::new(Access::Admin, false).await;
-    let before = fixture.get(CONFIG).await;
-    let before_disk = disk(fixture.directory.path());
-    for sources in [
-        json!([{"id":"same","content":""},{"id":"same","content":""}]),
-        json!([{"id":"a","path":"main.dae","content":""},{"id":"b","path":"main.dae","content":""}]),
-        json!([{"id":"../private","content":""}]),
-    ] {
-        error(
-            fixture
-                .request(Method::POST, VALIDATE)
-                .json(&json!({"mode":"syntax","sources":sources}))
-                .send()
-                .await
-                .unwrap(),
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-        )
-        .await;
-    }
-    for path in ["../outside.dae", "/tmp/outside.dae"] {
-        error(
-            fixture
-                .request(Method::POST, VALIDATE)
-                .json(&json!({
-                    "mode":"full","sources":[
-                        {"id":"main","path":"main.dae","content":fixture.originals["main.dae"]},
-                        {"id":"outside","path":path,"content":"# no authority\n"}
-                    ]
-                }))
-                .send()
-                .await
-                .unwrap(),
-            StatusCode::FORBIDDEN,
-            "permission_denied",
-        )
-        .await;
-    }
-    let syntax = ok(fixture.request(Method::POST, VALIDATE).json(&json!({
-        "mode":"syntax","sources":[{"id":"label","path":"../not-opened.dae","content":"routing { fallback: direct }"}]
-    })).send().await.unwrap()).await;
-    assert_eq!(syntax["valid"], true);
-    // Returned entry-relative paths can be echoed without expanding file authority.
-    let echoed_sources: Vec<_> = before["sources"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|row| row["content"].is_string())
-        .map(|row| json!({"id":row["id"],"path":row["path"],"content":row["content"]}))
-        .collect();
-    assert!(echoed_sources.len() > 1);
-    let echoed = ok(fixture
-        .request(Method::POST, VALIDATE)
-        .json(&json!({
-            "mode":"full","sources":echoed_sources
-        }))
-        .send()
-        .await
-        .unwrap())
-    .await;
-    assert_eq!(echoed["valid"], true);
-    let outside = tempfile::tempdir().unwrap();
-    let outside_path = outside.path().join("outside.dae");
-    std::fs::write(&outside_path, "routing { fallback: block }").unwrap();
-    let escaping = fixture.originals["main.dae"]
-        .replace("'locked.dae'", &format!("'{}'", outside_path.display()));
-    let result = ok(fixture.validate("full", &escaping).send().await.unwrap()).await;
-    assert_eq!(result["valid"], false);
-    diagnostics(
-        &result["diagnostics"],
-        "candidate",
-        outside_path.to_str().unwrap(),
-    );
-    assert_eq!(disk(fixture.directory.path()), before_disk);
-    assert_eq!(fixture.get(CONFIG).await, before);
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
     fixture.shutdown().await;
 }

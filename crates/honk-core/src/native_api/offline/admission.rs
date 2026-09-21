@@ -95,7 +95,7 @@ impl ValidatedConfig {
         limits: SourceLimits,
         deferred: &[honk_config::subscription::Subscription],
     ) -> io::Result<Vec<DependencySnapshot>> {
-        let mut capture = Capture::new(&self.sources, active, data_dir, limits)?;
+        let mut capture = Capture::new(&self.sources, active, data_dir, limits, &[])?;
         if self
             .config
             .subscriptions

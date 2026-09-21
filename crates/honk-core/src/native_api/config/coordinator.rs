@@ -692,6 +692,7 @@ impl Worker {
                     diagnostics,
                     &deferred,
                     None,
+                    &[],
                 )
             };
             let validated = validate(loaded, &mut diagnostics).map_err(|error| {

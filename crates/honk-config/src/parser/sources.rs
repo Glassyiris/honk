@@ -7,7 +7,7 @@ use std::time::SystemTime;
 use super::{Document, ParseFailure, ParserDiagnostics, lexer, parse_documents};
 use crate::Config;
 use crate::diagnostic::{
-    DetailedDiagnostic, DiagnosticSources, SettingPath, SourceRef, finish_attempt,
+    DetailedDiagnostic, DiagnosticSources, SettingPath, Severity, SourceRef, finish_attempt,
 };
 use crate::error::{DetailedConfigError, ErrorCategory};
 
@@ -149,19 +149,11 @@ pub fn parse_dae_sources(
             check_budget(limits, index, bytes, content.len(), &source)?;
             bytes += content.len();
             let loaded_at = SystemTime::now();
-            let document = Document::parse_attempt(
+            let document = source_document(
                 lexer::Source::shared(content.clone(), source.clone()),
-                sink.output,
-                false,
-            )
-            .map_err(|error| ParseFailure::Detailed(error.error))?;
-            for segment in document
-                .sections()
-                .filter(|segment| segment.header() == "include")
-            {
-                super::warn_include_hash(&segment, &mut sink);
-                super::parse_include_body(segment, path)?;
-            }
+                path,
+                &mut sink,
+            )?;
             sources.push(SourceSnapshot {
                 path: path.clone(),
                 content: content.clone(),
@@ -183,6 +175,48 @@ pub fn parse_dae_sources(
     });
     sink.finish();
     finish_attempt(result, sink.output)
+}
+
+/// Check one submitted fragment's structure and include syntax without decoding
+/// settings, resolving includes or publishing warnings for an unused document.
+pub fn check_dae_source(path: &Path, content: &str) -> Result<(), DetailedConfigError> {
+    let source = DiagnosticSources::new(Some(path.to_path_buf())).root();
+    let mut diagnostics = Vec::new();
+    let mut sink = ParserDiagnostics::new(&mut diagnostics, source.clone());
+    source_document(lexer::Source::new(content, source), path, &mut sink)
+        .map(|_| ())
+        .map_err(|error| match error {
+            ParseFailure::Detailed(error) => error,
+            ParseFailure::Legacy(error) => sink.error(error),
+        })?;
+    if let Some(mut diagnostic) = diagnostics
+        .into_iter()
+        .find(|diagnostic| diagnostic.severity == Severity::Error)
+    {
+        diagnostic.terminal = true;
+        return Err(DetailedConfigError {
+            category: ErrorCategory::Parse,
+            diagnostic: Box::new(diagnostic),
+        });
+    }
+    Ok(())
+}
+
+fn source_document<'a>(
+    source: lexer::Source<'a>,
+    path: &Path,
+    sink: &mut ParserDiagnostics<'_>,
+) -> Result<Document<'a>, ParseFailure> {
+    let document = Document::parse_attempt(source, sink.output, false)
+        .map_err(|error| ParseFailure::Detailed(error.error))?;
+    for segment in document
+        .sections()
+        .filter(|segment| segment.header() == "include")
+    {
+        super::warn_include_hash(&segment, sink);
+        super::parse_include_body(segment, path)?;
+    }
+    Ok(document)
 }
 
 pub(super) fn source_error(
