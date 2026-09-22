@@ -219,6 +219,7 @@ enum ResponseGap {
     Availability,
     ProbeScope,
     Degraded,
+    Misaligned,
 }
 
 #[derive(Clone, Copy)]
@@ -362,6 +363,14 @@ pub(super) fn evaluate(
                     .is_none_or(|seen| seen < at)
             }) {
                 ResponseGap::Degraded
+            } else if summary.response_misaligned
+                && !excluded(index)
+                && (index == selected
+                    || pair
+                        .and_then(|pair| pair.response)
+                        .is_some_and(|metric| now < metric.expires_at))
+            {
+                ResponseGap::Misaligned
             } else {
                 ResponseGap::None
             };
@@ -383,7 +392,10 @@ pub(super) fn evaluate(
                 ScoreEvidenceQuestion::Response
                     if matches!(
                         response_gap,
-                        ResponseGap::Missing | ResponseGap::Unpaired | ResponseGap::ProbeScope
+                        ResponseGap::Missing
+                            | ResponseGap::Unpaired
+                            | ResponseGap::ProbeScope
+                            | ResponseGap::Misaligned
                     ) =>
                 {
                     0.0
