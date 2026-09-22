@@ -110,6 +110,12 @@ impl ListenerSecrets {
             .with_clash(&config.experimental.clash_api.secret)
     }
 
+    /// Adds both effective secrets the configuration db holds.
+    pub(crate) fn with_all(self, secrets: &super::store::db::ListenerSecrets) -> Self {
+        self.with_clash(&secrets.native_api)
+            .with_clash(&secrets.clash_api)
+    }
+
     pub(crate) fn with_clash(mut self, secret: &str) -> Self {
         if secret.len() >= MIN_MASKED_SECRET && !self.values.iter().any(|value| value == secret) {
             self.values.push(secret.to_owned());
@@ -127,7 +133,7 @@ impl ListenerSecrets {
         })
     }
 
-    fn contains(&self, text: &str) -> bool {
+    pub(crate) fn contains(&self, text: &str) -> bool {
         self.spellings().any(|value| text.contains(value.as_ref()))
     }
 
@@ -346,6 +352,7 @@ impl ConfigService {
                 .read()
                 .as_ref()
                 .is_some_and(|accepted| self.source_writable(accepted, 0))
+            && !self.store_blocked()
     }
 
     pub(super) async fn manage(
@@ -413,10 +420,14 @@ impl ConfigService {
         {
             return Arc::clone(secrets);
         }
-        let secrets = Arc::new(ListenerSecrets::new(
-            &accepted.update.sources,
-            &self.settings.secret,
-        ));
+        let mut secrets = ListenerSecrets::new(&accepted.update.sources, &self.settings.secret);
+        // Db sources are stripped, so the stored values are the only record of them.
+        if let Some(store) = self.store.read().as_ref()
+            && let Some(database) = store.database()
+        {
+            secrets = secrets.with_all(&database.listener_secrets());
+        }
+        let secrets = Arc::new(secrets);
         *cached = Some((Arc::clone(&accepted.update), Arc::clone(&secrets)));
         secrets
     }

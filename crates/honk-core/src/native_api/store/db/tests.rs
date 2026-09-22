@@ -44,7 +44,10 @@ fn initialized(fixture: &Fixture) -> DbStore {
         native_api: "native-token".into(),
         clash_api: String::new(),
     };
-    assert_eq!(store.initialize(&main, &main, &secrets, "startup"), Ok(1));
+    assert_eq!(
+        store.initialize(&main, &MaskSet::new(&[], ""), &secrets, "startup"),
+        Ok(1)
+    );
     store
 }
 
@@ -267,5 +270,24 @@ fn cli_export_restores_secrets_into_a_new_private_file() {
     fs::write(&out, "kept").unwrap();
     assert!(export_to(&fixture.data_dir, &out, true).is_err());
     assert_eq!(fs::read_to_string(&out).unwrap(), "kept");
+    assert!(fs::read_dir(&fixture.data_dir).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")
+    }));
     assert_eq!(store.head(), Ok(Some(1)));
+}
+
+#[test]
+fn head_cache_and_existence_follow_promote() {
+    let fixture = fixture();
+    let store = initialized(&fixture);
+    assert_eq!(store.cached_head(), Some((1, None)));
+    let pending = write(&store, "global { log_level: debug }\n");
+    assert_eq!(store.promote(pending), Ok(2));
+    assert_eq!(store.cached_head(), Some((2, Some(1))));
+    assert_eq!(store.revision_exists(1), Ok(true));
+    assert_eq!(store.revision_exists(9), Ok(false));
 }

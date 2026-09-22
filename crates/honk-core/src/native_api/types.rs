@@ -358,7 +358,7 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
             "max_json_body_bytes": 65536,
         },
         "resources": {
-            "config": {"available":config.content_enabled(),"content":config.content_enabled(),"writable":config.writable(),"max_bytes":crate::configuration::MAX_SOURCE_BYTES,"max_sources":crate::configuration::MAX_SOURCES,"store":config.store_value()["kind"]},
+            "config": {"available":config.content_enabled(),"content":config.content_enabled(),"writable":config.editable(),"max_bytes":crate::configuration::MAX_SOURCE_BYTES,"max_sources":crate::configuration::MAX_SOURCES,"store":config.store_value()["kind"]},
             "config_export": {"available":config.content_enabled()},
             "config_import": config.import_capability(),
             "config_revisions": config.revisions_capability(),
@@ -373,7 +373,7 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
             "nodes": {"available": true, "can_manage":config.can_manage()},
             "providers": providers,
             "geodata": geodata,
-            "groups": {"available": true, "config_patch":config.writable(), "selection": true, "max_patch_operations":32},
+            "groups": {"available": true, "config_patch":config.editable(), "selection": true, "max_patch_operations":32},
             "probes": state.observation.probes.capability(),
             "connections": {
                 "available": true,

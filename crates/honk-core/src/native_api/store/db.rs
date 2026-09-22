@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::ApiError;
 use super::super::auth::{CREDENTIAL_DIR, DIR_FLAGS, effective_uid};
+use super::super::config::ListenerSecrets as MaskSet;
 use super::super::config_write::WriteError;
 use crate::configuration::{MAX_SOURCE_BYTES, MAX_SOURCES, digest, limits};
 
@@ -126,8 +127,6 @@ struct StoredSource {
     parent: Option<usize>,
     content: String,
     sha256: String,
-    /// Hash of the operator's text before listener secrets were stripped; never leaves the db.
-    origin_sha256: String,
 }
 
 struct Revision {
@@ -142,8 +141,14 @@ pub(crate) struct DbStore {
     root: PathBuf,
     /// The `-c` entry this process started with; `import` reads it.
     import_entry: PathBuf,
-    /// Set when the daemon may run something `head` does not record; cleared only by restart.
+    /// Set when the daemon may run something `head` does not record; cleared by
+    /// restart or by re-activating `head`.
     blocked: AtomicBool,
+    /// `(head, parent)` as last read or written, so readers need no SQLite call.
+    head: Mutex<Option<(i64, Option<i64>)>>,
+    secrets: Mutex<ListenerSecrets>,
+    #[cfg(test)]
+    pub(crate) fail_promote: AtomicBool,
 }
 
 impl DbStore {
@@ -161,6 +166,8 @@ impl DbStore {
             .parent()
             .ok_or(StoreError::Invalid)?
             .to_path_buf();
+        let head = head_and_parent(&connection)?;
+        let secrets = listener_secrets(&connection)?;
         Ok(Self {
             _directory: directory,
             connection: Mutex::new(connection),
@@ -168,7 +175,40 @@ impl DbStore {
             root,
             import_entry,
             blocked: AtomicBool::new(false),
+            head: Mutex::new(head),
+            secrets: Mutex::new(secrets),
+            #[cfg(test)]
+            fail_promote: AtomicBool::new(false),
         })
+    }
+
+    /// The cached `(head, parent)`; never touches SQLite.
+    pub(crate) fn cached_head(&self) -> Option<(i64, Option<i64>)> {
+        *self.head.lock()
+    }
+
+    pub(crate) fn listener_secrets(&self) -> ListenerSecrets {
+        self.secrets.lock().clone()
+    }
+
+    pub(crate) fn blocked(&self) -> bool {
+        self.blocked.load(Ordering::Acquire)
+    }
+
+    /// The daemon runs `head` again after a re-activation.
+    pub(crate) fn unblock(&self) {
+        self.blocked.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn revision_exists(&self, number: i64) -> Result<bool, StoreError> {
+        self.connection
+            .lock()
+            .query_row("SELECT 1 FROM revision WHERE number = ?1", [number], |_| {
+                Ok(())
+            })
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(sql)
     }
 
     pub(crate) fn entry(&self) -> &Path {
@@ -181,22 +221,6 @@ impl DbStore {
 
     pub(crate) fn import_entry(&self) -> &Path {
         &self.import_entry
-    }
-
-    /// `(head, parent of head)`.
-    pub(crate) fn head_and_parent(&self) -> Result<Option<(i64, Option<i64>)>, StoreError> {
-        let connection = self.connection.lock();
-        let Some(number) = head(&connection)? else {
-            return Ok(None);
-        };
-        let parent = connection
-            .query_row(
-                "SELECT parent FROM revision WHERE number = ?1",
-                [number],
-                |row| row.get(0),
-            )
-            .map_err(sql)?;
-        Ok(Some((number, parent)))
     }
 
     /// Newest first.
@@ -256,7 +280,7 @@ impl DbStore {
             if root != self.root {
                 return Err(StoreError::Invalid);
             }
-            (revision, listener_secrets(&connection)?)
+            (revision, self.secrets.lock().clone())
         };
         let sources = revision
             .sources
@@ -282,10 +306,7 @@ impl DbStore {
             .head()
             .map_err(|_| WriteError::Unavailable)?
             .ok_or(WriteError::Unavailable)?;
-        let sources = self.stored(candidate, None).map_err(|error| match error {
-            StoreError::Invalid => WriteError::UnsafePath,
-            _ => WriteError::Unavailable,
-        })?;
+        let sources = self.stored_now(candidate)?;
         Ok(Pending {
             parent,
             sources,
@@ -308,17 +329,15 @@ impl DbStore {
     }
 
     /// Records the first revision; refused once any revision exists.
+    /// `forbidden` holds every listener secret value the operator's tree carried.
     pub(crate) fn initialize(
         &self,
         sources: &[SourceSnapshot],
-        originals: &[SourceSnapshot],
+        forbidden: &MaskSet,
         secrets: &ListenerSecrets,
         principal: &str,
     ) -> Result<i64, StoreError> {
-        if originals.len() != sources.len() {
-            return Err(StoreError::Invalid);
-        }
-        let stored = self.stored(sources, Some(originals))?;
+        let stored = self.stored(sources, &forbidden.clone().with_all(secrets))?;
         let mut connection = self.connection.lock();
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -351,6 +370,8 @@ impl DbStore {
             .execute("INSERT INTO head (id, active) VALUES (1, ?1)", [number])
             .map_err(sql)?;
         transaction.commit().map_err(sql)?;
+        *self.head.lock() = Some((number, None));
+        *self.secrets.lock() = secrets.clone();
         Ok(number)
     }
 
@@ -374,17 +395,14 @@ impl DbStore {
         overlay: &HashMap<PathBuf, Arc<str>>,
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> Result<LoadedConfig, DetailedConfigError> {
-        let (revision, secrets) = {
-            let connection = self.connection.lock();
-            let revision = active_revision(&connection)
-                .ok()
-                .flatten()
-                .map(|(_, _, revision)| revision);
-            (revision, listener_secrets(&connection))
-        };
-        let (Some(revision), Ok(secrets)) = (revision, secrets) else {
+        let revision = active_revision(&self.connection.lock())
+            .ok()
+            .flatten()
+            .map(|(_, _, revision)| revision);
+        let Some(revision) = revision else {
             return Err(store_unavailable());
         };
+        let secrets = self.secrets.lock().clone();
         let mut sources: HashMap<PathBuf, Arc<str>> = revision
             .sources
             .into_iter()
@@ -399,6 +417,9 @@ impl DbStore {
     }
 
     pub(crate) fn pin(&self, path: &Path) -> Result<RevisionPin, WriteError> {
+        if self.blocked() {
+            return Err(WriteError::Unavailable);
+        }
         let connection = self.connection.lock();
         let (number, _, revision) = active_revision(&connection)
             .map_err(|_| WriteError::Unavailable)?
@@ -441,10 +462,7 @@ impl DbStore {
         {
             return Err(WriteError::Conflict);
         }
-        let sources = self.stored(candidate, None).map_err(|error| match error {
-            StoreError::Invalid => WriteError::UnsafePath,
-            _ => WriteError::Unavailable,
-        })?;
+        let sources = self.stored_now(candidate)?;
         self.recheck(&pin)?;
         before()?;
         self.recheck(&pin)?;
@@ -474,6 +492,10 @@ impl DbStore {
         if self.blocked.load(Ordering::Acquire) {
             return Err(WriteError::Unavailable);
         }
+        #[cfg(test)]
+        if self.fail_promote.load(Ordering::Acquire) {
+            return Err(WriteError::Unavailable);
+        }
         let mut connection = self.connection.lock();
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -497,17 +519,32 @@ impl DbStore {
         if let Err(error) = transaction.commit() {
             log_sql(&error);
             return match head(&connection) {
-                Ok(Some(active)) if active == number => Ok(number),
+                Ok(Some(active)) if active == number => {
+                    *self.head.lock() = Some((number, Some(pending.parent)));
+                    Ok(number)
+                }
                 _ => Err(WriteError::Unavailable),
             };
         }
+        *self.head.lock() = Some((number, Some(pending.parent)));
         Ok(number)
     }
 
+    /// `stored` against the listener secrets this db already holds.
+    fn stored_now(&self, candidate: &[SourceSnapshot]) -> Result<Vec<StoredSource>, WriteError> {
+        let forbidden = MaskSet::new(&[], "").with_all(&self.secrets.lock());
+        self.stored(candidate, &forbidden)
+            .map_err(|error| match error {
+                StoreError::Invalid => WriteError::UnsafePath,
+                _ => WriteError::Unavailable,
+            })
+    }
+
+    /// Refuses any source whose content or name still carries a `forbidden` value.
     fn stored(
         &self,
         sources: &[SourceSnapshot],
-        originals: Option<&[SourceSnapshot]>,
+        forbidden: &MaskSet,
     ) -> Result<Vec<StoredSource>, StoreError> {
         let bytes: usize = sources.iter().map(|source| source.content.len()).sum();
         if sources.is_empty()
@@ -519,9 +556,11 @@ impl DbStore {
         }
         sources
             .iter()
-            .enumerate()
-            .map(|(index, source)| {
-                if source.contains_api_secret {
+            .map(|source| {
+                if source.contains_api_secret
+                    || forbidden.contains(&source.content)
+                    || forbidden.contains(&source.path.to_string_lossy())
+                {
                     return Err(StoreError::Invalid);
                 }
                 let name = source
@@ -529,17 +568,11 @@ impl DbStore {
                     .strip_prefix(&self.root)
                     .map_err(|_| StoreError::Invalid)?;
                 valid_name(name)?;
-                let sha256 = digest(source.content.as_bytes());
-                let origin_sha256 = match originals {
-                    Some(originals) => digest(originals[index].content.as_bytes()),
-                    None => sha256.clone(),
-                };
                 Ok(StoredSource {
                     name: name.to_str().ok_or(StoreError::Invalid)?.to_owned(),
                     parent: source.parent,
                     content: source.content.to_string(),
-                    sha256,
-                    origin_sha256,
+                    sha256: digest(source.content.as_bytes()),
                 })
             })
             .collect()
@@ -547,7 +580,7 @@ impl DbStore {
 }
 
 /// Opens the checked directory and the SQLite file in it; `create` makes both
-/// when missing, otherwise an absent db is `Unavailable`.
+/// when missing, otherwise the db is opened read-only and must exist.
 fn connect(data_dir: &Path, create: bool) -> Result<(File, Connection), StoreError> {
     let parent =
         File::from(open(data_dir, DIR_FLAGS, Mode::empty()).map_err(|_| StoreError::Unavailable)?);
@@ -560,11 +593,16 @@ fn connect(data_dir: &Path, create: bool) -> Result<(File, Connection), StoreErr
     let directory =
         File::from(openat(&parent, CREDENTIAL_DIR, DIR_FLAGS, Mode::empty()).map_err(path_error)?);
     private(&directory, true)?;
+    let access = if create {
+        OFlag::O_RDWR
+    } else {
+        OFlag::O_RDONLY
+    };
     let existing = || {
         openat(
             &directory,
             DB_FILE,
-            OFlag::O_RDWR | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            access | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::empty(),
         )
         .map(File::from)
@@ -591,11 +629,14 @@ fn connect(data_dir: &Path, create: bool) -> Result<(File, Connection), StoreErr
     let resolved = std::fs::read_link(format!("/proc/self/fd/{}", directory.as_raw_fd()))
         .map_err(|_| StoreError::Unavailable)?;
     let path = resolved.join(DB_FILE);
+    let mode = if create {
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+    } else {
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+    };
     let connection = Connection::open_with_flags(
         &path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        mode | OpenFlags::SQLITE_OPEN_NOFOLLOW | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(sql)?;
     let opened = std::fs::symlink_metadata(&path).map_err(|_| StoreError::Unavailable)?;
@@ -611,9 +652,6 @@ pub(crate) fn export(data_dir: &Path, with_secrets: bool) -> Result<String, Stor
     let (_directory, mut connection) = connect(data_dir, false)?;
     connection
         .busy_timeout(std::time::Duration::from_millis(2000))
-        .map_err(sql)?;
-    connection
-        .execute_batch("PRAGMA query_only = ON")
         .map_err(sql)?;
     let application_id: i64 = pragma(&connection, "application_id")?;
     let version: i64 = pragma(&connection, "user_version")?;
@@ -642,6 +680,7 @@ pub(crate) fn export(data_dir: &Path, with_secrets: bool) -> Result<String, Stor
     } else if secrets == ListenerSecrets::default() {
         Ok(text)
     } else {
+        let (text, _) = MaskSet::new(&[], "").with_all(&secrets).mask(&text);
         Ok(format!("# listener secrets omitted\n{text}"))
     }
 }
@@ -653,15 +692,29 @@ pub(crate) fn export_to(data_dir: &Path, out: &Path, with_secrets: bool) -> anyh
 
     let text = export(data_dir, with_secrets)
         .map_err(|error| anyhow::anyhow!("configuration db: {error}"))?;
+    let name = out
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{} names no file", out.display()))?;
+    let mut staged = name.to_owned();
+    staged.push(format!(".{}.tmp", std::process::id()));
+    let staged = out.with_file_name(staged);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(out)
-        .map_err(|error| anyhow::anyhow!("create {}: {error}", out.display()))?;
-    file.write_all(text.as_bytes())?;
-    file.sync_all()?;
+        .open(&staged)
+        .map_err(|error| anyhow::anyhow!("create {}: {error}", staged.display()))?;
+    // A hard link publishes the complete file and, unlike rename, never replaces `out`.
+    let published = file
+        .write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::hard_link(&staged, out));
+    let _ = std::fs::remove_file(&staged);
+    published.map_err(|error| anyhow::anyhow!("write {}: {error}", out.display()))?;
+    if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -703,6 +756,14 @@ fn prepare(connection: &mut Connection) -> Result<(), StoreError> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Exclusive)
             .map_err(sql)?;
+        // A concurrent first start may have created the schema since the read above.
+        let current: i64 = pragma(&transaction, "user_version")?;
+        if current == SCHEMA_VERSION && pragma(&transaction, "application_id")? == APPLICATION_ID {
+            return Ok(());
+        }
+        if current != 0 {
+            return Err(StoreError::Unsupported);
+        }
         transaction
             .execute_batch(&format!(
                 "{SCHEMA}PRAGMA application_id = {APPLICATION_ID};PRAGMA user_version = {SCHEMA_VERSION};"
@@ -717,6 +778,20 @@ fn pragma(connection: &Connection, name: &str) -> Result<i64, StoreError> {
     connection
         .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
         .map_err(sql)
+}
+
+fn head_and_parent(connection: &Connection) -> Result<Option<(i64, Option<i64>)>, StoreError> {
+    let Some(number) = head(connection)? else {
+        return Ok(None);
+    };
+    let parent = connection
+        .query_row(
+            "SELECT parent FROM revision WHERE number = ?1",
+            [number],
+            |row| row.get(0),
+        )
+        .map_err(sql)?;
+    Ok(Some((number, parent)))
 }
 
 fn head(connection: &Connection) -> Result<Option<i64>, StoreError> {

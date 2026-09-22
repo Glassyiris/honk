@@ -293,14 +293,18 @@ impl Worker {
                 reservation,
             } => {
                 let id = reservation.id.clone();
-                let head = self
+                let (head, blocked) = self
                     .store
                     .as_ref()
                     .and_then(|store| store.database())
-                    .map(|database| database.head());
-                if let Some(Ok(Some(head))) = head
-                    && head == number
-                {
+                    .map_or((None, false), |database| {
+                        (
+                            database.cached_head().map(|(head, _)| head),
+                            database.blocked(),
+                        )
+                    });
+                let current = head == Some(number);
+                if current && !blocked {
                     self.service.operations.accept(&id);
                     self.service.operations.running(&id);
                     let generation = self.diagnostics.read().generation;
@@ -315,7 +319,9 @@ impl Worker {
                         },
                     );
                 } else {
-                    let prepared = self.prepare_revision(number, &reservation.principal).await;
+                    let prepared = self
+                        .prepare_revision(number, &reservation.principal, current)
+                        .await;
                     self.tree_operation(&id, prepared).await;
                 }
                 drop(reservation);

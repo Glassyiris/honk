@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::native_api::store::db::Origin;
-use honk_config::parser::source_edit::strip_listener_secrets;
+use crate::native_api::store::startup::strip_tree;
 
 impl Worker {
     /// Reads the `-c` tree, strips its listener secrets and validates it as the next revision.
@@ -10,7 +10,7 @@ impl Worker {
         let store = self.store.clone().ok_or_else(unsupported)?;
         self.prepare_tree(
             principal,
-            Origin::Import,
+            Some(Origin::Import),
             move |store, diagnostics| {
                 let database = store.database().ok_or_else(unsupported)?;
                 let entry = database.import_entry();
@@ -24,12 +24,8 @@ impl Worker {
                     diagnostics,
                 )
                 .map_err(|error| config_error(error, diagnostics, &[], None, None))?;
-                let mut overlay = HashMap::new();
-                for source in &originals.sources {
-                    let stripped = strip_listener_secrets(&source.content)
-                        .map_err(|_| management::unsupported_value())?;
-                    overlay.insert(source.path.clone(), Arc::<str>::from(stripped));
-                }
+                let (overlay, _) =
+                    strip_tree(&originals.sources).map_err(|_| management::unsupported_value())?;
                 let mut loaded =
                     Config::from_dae_sources_in_memory(entry, &overlay, limits(), &mut Vec::new())
                         .map_err(|error| config_error(error, diagnostics, &[], None, None))?;
@@ -46,16 +42,18 @@ impl Worker {
         .await
     }
 
-    /// Validates stored revision `number` as the next revision.
+    /// Validates stored revision `number` as the next revision. `resync` re-activates
+    /// `head` itself for a blocked store and records nothing.
     pub(super) async fn prepare_revision(
         &self,
         number: i64,
         principal: &str,
+        resync: bool,
     ) -> Result<Prepared, ApiError> {
         let store = self.store.clone().ok_or_else(unsupported)?;
         self.prepare_tree(
             principal,
-            Origin::Activate,
+            (!resync).then_some(Origin::Activate),
             move |store, diagnostics| {
                 let database = store.database().ok_or_else(unsupported)?;
                 database
@@ -71,7 +69,7 @@ impl Worker {
     async fn prepare_tree(
         &self,
         principal: &str,
-        origin: Origin,
+        origin: Option<Origin>,
         read: impl FnOnce(
             &dyn SourceStore,
             &mut Vec<DetailedDiagnostic>,
@@ -123,20 +121,20 @@ impl Worker {
                 return Err(denied());
             }
             let database = store.database().ok_or_else(unsupported)?;
-            let pending = database
-                .stage(&validated.sources, &principal, origin)
-                .map_err(|error| store_write_error(StoreKind::Database, error))?;
+            let committed = match origin {
+                Some(origin) => Committed::Pending(
+                    database
+                        .stage(&validated.sources, &principal, origin)
+                        .map_err(|error| store_write_error(StoreKind::Database, error))?,
+                ),
+                None => Committed::Resync,
+            };
             let update = SourceUpdate {
                 sources: validated.sources,
                 dependencies: validated.dependencies,
                 geo_sources: None,
             };
-            Ok((
-                validated.config,
-                update,
-                diagnostics,
-                Committed::Pending(pending),
-            ))
+            Ok((validated.config, update, diagnostics, committed))
         })
         .await
         .map_err(|_| unavailable())?

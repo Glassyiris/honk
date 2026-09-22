@@ -61,3 +61,40 @@ fn data_dir_mismatch_refuses_startup() {
     let store = DbStore::open(&data_dir, &entry).unwrap();
     assert_eq!(store.head(), Ok(None));
 }
+
+#[test]
+fn secret_copy_in_a_comment_refuses_import() {
+    let state = tempfile::tempdir().unwrap();
+    let data_dir = state.path().canonicalize().unwrap();
+    let (_directory, entry) = tree(&data_dir);
+    let mut main = fs::read_to_string(&entry).unwrap();
+    main.push_str("# old startup-token copied here\n");
+    fs::write(&entry, main).unwrap();
+    let error = DatabaseStartup::open(&entry, &data_dir, &mut Vec::new())
+        .err()
+        .expect("a secret copy must refuse the import");
+    assert!(error.to_string().contains("copies"), "{error}");
+}
+
+#[test]
+fn head_moved_before_the_instance_lock_refuses_startup() {
+    let state = tempfile::tempdir().unwrap();
+    let data_dir = state.path().canonicalize().unwrap();
+    let (_directory, entry) = tree(&data_dir);
+    DatabaseStartup::open(&entry, &data_dir, &mut Vec::new())
+        .unwrap()
+        .record()
+        .unwrap();
+    let mut waiting = DatabaseStartup::open(&entry, &data_dir, &mut Vec::new()).unwrap();
+    let running = DbStore::open(&data_dir, &entry).unwrap();
+    let pin = running.pin(running.entry()).unwrap();
+    let mut candidate = waiting.sources.sources.clone();
+    let content = format!("{}# edited\n", candidate[0].content);
+    candidate[0].content = Arc::from(content.as_str());
+    let pending = running
+        .commit(pin, &content, &candidate, "control", Box::new(|| Ok(())))
+        .unwrap();
+    assert_eq!(running.promote(pending), Ok(2));
+    let error = waiting.record().expect_err("a moved head must refuse");
+    assert!(error.to_string().contains("moved"), "{error}");
+}

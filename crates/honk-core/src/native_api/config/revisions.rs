@@ -27,22 +27,34 @@ impl ConfigService {
             .filter(|store| store.kind() == StoreKind::Database)
     }
 
-    /// `store` of `GET /config`.
+    /// True when the running configuration may differ from the recorded `head`.
+    pub(crate) fn store_blocked(&self) -> bool {
+        self.store
+            .read()
+            .as_ref()
+            .is_some_and(|store| store.blocked())
+    }
+
+    /// `store` of `GET /config`; reads only cached state.
     pub(crate) fn store_value(&self) -> Value {
         let Some(store) = self.database() else {
-            return json!({"kind":"file","revision":null,"parent":null});
+            return json!({"kind":"file","revision":null,"parent":null,"recorded":true});
         };
-        let head = store
-            .database()
-            .and_then(|database| database.head_and_parent().ok().flatten());
-        json!({"kind":"db","revision":head.map(|(number,_)|number),"parent":head.and_then(|(_,parent)|parent)})
+        let head = store.database().and_then(|database| database.cached_head());
+        json!({"kind":"db","revision":head.map(|(number,_)|number),"parent":head.and_then(|(_,parent)|parent),"recorded":!store.blocked()})
+    }
+
+    /// `writable` as advertised: false while a failed record blocks writes.
+    pub(crate) fn editable(&self) -> bool {
+        self.writable() && !self.store_blocked()
     }
 
     pub(crate) fn import_capability(&self) -> Value {
-        json!({"available":self.database().is_some() && self.writable(),"replace_required":true})
+        json!({"available":self.database().is_some() && self.editable(),"replace_required":true})
     }
 
     pub(crate) fn revisions_capability(&self) -> Value {
+        // Activating `head` stays possible while blocked: it is the way back in sync.
         json!({"available":self.database().is_some(),"can_activate":self.database().is_some() && self.writable(),"max_revisions":MAX_REVISIONS})
     }
 }
@@ -81,9 +93,10 @@ pub(in crate::native_api) async fn export(
     } else {
         inlined
     };
-    let filename = match service.store_value()["revision"].as_i64() {
-        Some(revision) => format!("honk-r{revision}.dae"),
-        None => "honk.dae".to_owned(),
+    let store = service.store_value();
+    let filename = match store["revision"].as_i64() {
+        Some(revision) if store["recorded"] == true => format!("honk-r{revision}.dae"),
+        _ => "honk.dae".to_owned(),
     };
     let etag = format!("\"{}\"", crate::configuration::digest(body.as_bytes()));
     let mut response = body.into_response();
@@ -115,8 +128,16 @@ pub(in crate::native_api) async fn revisions(
     let store = service.database().ok_or_else(unsupported)?;
     let database = store.database().ok_or_else(unsupported)?;
     let store_error = || unavailable().with_details(json!({"stage":"store"}));
-    let active = database.head().map_err(|_| store_error())?;
-    let rows = database.revisions().map_err(|_| store_error())?;
+    let active = database.cached_head().map(|(number, _)| number);
+    let _ = database;
+    let reader = Arc::clone(&store);
+    let rows =
+        tokio::task::spawn_blocking(move || reader.database().map(|database| database.revisions()))
+            .await
+            .map_err(|_| store_error())?
+            .ok_or_else(unsupported)?
+            .map_err(|_| store_error())?;
+    let secrets = service.secrets(service.sources.accepted.read().as_ref());
     let revisions: Vec<Value> = rows
         .into_iter()
         .map(|row| {
@@ -126,7 +147,7 @@ pub(in crate::native_api) async fn revisions(
                 "revision":row.number, "parent":row.parent, "created_at":timestamp(created_at),
                 "principal":row.principal, "origin":row.origin, "content_sha256":row.content_sha256,
                 "bytes":row.bytes,
-                "sources":row.sources.iter().map(|(path,sha256)|json!({"path":path,"sha256":sha256})).collect::<Vec<_>>(),
+                "sources":row.sources.iter().map(|(path,sha256)|json!({"path":secrets.mask(path).0,"sha256":sha256})).collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -156,8 +177,7 @@ pub(in crate::native_api) async fn import(
     let body: Import = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
     let initialized = store
         .database()
-        .and_then(|database| database.head().ok())
-        .flatten()
+        .and_then(|database| database.cached_head())
         .is_some();
     if initialized && !body.replace {
         return Err(ApiError::new(
@@ -213,12 +233,18 @@ pub(in crate::native_api) async fn activate(
     {
         return Err(invalid());
     }
-    let exists = store
-        .database()
-        .and_then(|database| database.revisions().ok())
-        .is_some_and(|rows| rows.iter().any(|row| row.number == number));
-    if !exists {
-        return Err(not_found());
+    let exists = tokio::task::spawn_blocking(move || {
+        store
+            .database()
+            .map(|database| database.revision_exists(number))
+    })
+    .await
+    .map_err(|_| unavailable())?;
+    match exists {
+        Some(Ok(true)) => {}
+        Some(Ok(false)) => return Err(not_found()),
+        None => return Err(unsupported()),
+        Some(Err(_)) => return Err(unavailable().with_details(json!({"stage":"store"}))),
     }
     let reservation = service.operations.reserve(
         principal(state),

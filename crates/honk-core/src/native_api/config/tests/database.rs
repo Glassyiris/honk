@@ -65,7 +65,7 @@ async fn main_source_write_records_a_revision_after_the_tree_is_deleted() {
 async fn rejected_reload_leaves_the_db_head_alone() {
     let fixture = Fixture::new_db(Access::Admin).await;
     let store = Arc::clone(fixture.database.as_ref().unwrap());
-    fixture.reject_reloads.store(true, Ordering::SeqCst);
+    fixture.reject_reloads.store(1, Ordering::SeqCst);
     let before = fixture.get(CONFIG).await;
     let main = source(&before, &fixture.originals["main.dae"]);
     assert_eq!(main["writable"], true);
@@ -191,7 +191,7 @@ async fn import_export_and_activate_record_revisions() {
     let config = fixture.get(CONFIG).await;
     assert_eq!(
         config["store"],
-        json!({"kind":"db","revision":1,"parent":null})
+        json!({"kind":"db","revision":1,"parent":null,"recorded":true})
     );
     assert!(config["sources"][0]["absolute_path"].is_null());
     let capabilities = fixture.get("/api/v1/capabilities").await;
@@ -305,5 +305,160 @@ async fn import_export_and_activate_record_revisions() {
     );
     assert!(list["revisions"][0]["sources"][0]["path"] == "main.dae");
     assert!(!list.to_string().contains("origin_sha256") && !list.to_string().contains("content\""));
+    fixture.shutdown().await;
+}
+
+fn main_edit(fixture: &Fixture) -> String {
+    fixture.originals["main.dae"].replace("fallback: direct", "fallback: block")
+}
+
+#[tokio::test]
+async fn failed_record_blocks_writes_until_head_is_activated_again() {
+    let fixture = Fixture::new_db(Access::Admin).await;
+    let store = Arc::clone(fixture.database.as_ref().unwrap());
+    store.fail_promote.store(true, Ordering::SeqCst);
+    let before = fixture.get(CONFIG).await;
+    let main = source(&before, &fixture.originals["main.dae"]);
+    let candidate = main_edit(&fixture);
+    let admitted = accepted(fixture.replace(main, &candidate).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&admitted).await;
+    assert_eq!(terminal["status"], "failed", "{terminal}");
+    assert_eq!(terminal["error"]["code"], "store_unavailable");
+    assert_eq!(
+        terminal["error"]["details"],
+        json!({"stage":"store","committed":true,"durable":false})
+    );
+    assert_eq!(store.head(), Ok(Some(1)));
+    let config = fixture.get(CONFIG).await;
+    assert_eq!(
+        config["store"],
+        json!({"kind":"db","revision":1,"parent":null,"recorded":false})
+    );
+    let capabilities = fixture.get("/api/v1/capabilities").await;
+    assert_eq!(capabilities["resources"]["config"]["writable"], false);
+    assert_eq!(
+        capabilities["resources"]["config_revisions"]["can_activate"],
+        true
+    );
+    let response = fixture
+        .request(Method::GET, "/api/v1/config/export")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers()["content-disposition"],
+        "attachment; filename=\"honk.dae\""
+    );
+    let running = source(&config, &candidate);
+    let again = candidate.replace("fallback: block", "fallback: direct");
+    let response = fixture.replace(running, &again).send().await.unwrap();
+    let body = error(
+        response,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "temporarily_unavailable",
+    )
+    .await;
+    assert_eq!(body["error"]["details"]["stage"], "store");
+
+    store.fail_promote.store(false, Ordering::SeqCst);
+    let reloads = fixture.reloads.load(Ordering::SeqCst);
+    let terminal = operation(
+        &fixture,
+        "/api/v1/config/revisions/1/activate",
+        "resync",
+        json!({}),
+    )
+    .await;
+    assert_eq!(terminal["status"], "succeeded", "{terminal}");
+    assert_eq!(fixture.reloads.load(Ordering::SeqCst), reloads + 1);
+    assert_eq!(store.head(), Ok(Some(1)));
+    assert_eq!(revisions(&fixture).len(), 1);
+    let config = fixture.get(CONFIG).await;
+    assert_eq!(config["store"]["recorded"], true);
+    source(&config, &fixture.originals["main.dae"]);
+    let capabilities = fixture.get("/api/v1/capabilities").await;
+    assert_eq!(capabilities["resources"]["config"]["writable"], true);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn unconfirmed_activation_blocks_writes() {
+    let fixture = Fixture::new_db(Access::Admin).await;
+    let store = Arc::clone(fixture.database.as_ref().unwrap());
+    fixture.reject_reloads.store(2, Ordering::SeqCst);
+    let before = fixture.get(CONFIG).await;
+    let main = source(&before, &fixture.originals["main.dae"]);
+    let operation = accepted(
+        fixture
+            .replace(main, &main_edit(&fixture))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    let terminal = fixture.terminal(&operation).await;
+    assert_eq!(terminal["status"], "failed", "{terminal}");
+    assert_eq!(
+        terminal["error"]["details"],
+        json!({"stage":"store","committed":null})
+    );
+    assert_eq!(store.head(), Ok(Some(1)));
+    assert_eq!(fixture.get(CONFIG).await["store"]["recorded"], false);
+    fixture.reject_reloads.store(0, Ordering::SeqCst);
+    fixture.shutdown().await;
+}
+
+const CLASH: &str = "clash-listener-token";
+
+#[tokio::test]
+async fn db_mode_never_returns_or_keeps_listener_secret_values() {
+    let fixture = Fixture::new_db_custom(Access::Admin, |_, files| {
+        let auth = files.get_mut("auth.dae").unwrap();
+        *auth = auth.replace(
+            &format!("secret: '{SECRET}'"),
+            &format!("secret: 'overridden-listener-token'\n secret: '{SECRET}'"),
+        );
+        auth.push_str(&format!(
+            "experimental {{ clash_api {{ secret: '{CLASH}' }} }}\n"
+        ));
+    })
+    .await;
+    let store = Arc::clone(fixture.database.as_ref().unwrap());
+    let leaked = |text: &str| {
+        [SECRET, CLASH, "overridden-listener-token"]
+            .iter()
+            .any(|secret| text.contains(secret))
+    };
+    let stored = store.load(&HashMap::new(), &mut Vec::new()).unwrap();
+    assert_eq!(stored.config.experimental.clash_api.secret, CLASH);
+    assert!(stored.sources.iter().all(|source| !leaked(&source.content)));
+    assert!(!leaked(&fixture.get(CONFIG).await.to_string()));
+    assert!(!leaked(
+        &fixture.get("/api/v1/config/revisions").await.to_string()
+    ));
+    let bare = fixture.path("bare.dae");
+    crate::native_api::store::db::export_to(&fixture.path("state"), &bare, false).unwrap();
+    assert!(!leaked(&std::fs::read_to_string(&bare).unwrap()));
+
+    // A copy survives stripping, so import refuses rather than store it.
+    let copied = format!(
+        "{}# old {CLASH} copied here\n",
+        fixture.originals["main.dae"]
+    );
+    std::fs::write(fixture.path("etc/main.dae"), &copied).unwrap();
+    let response = fixture
+        .request(Method::POST, "/api/v1/config/import")
+        .header("idempotency-key", "copy")
+        .json(&json!({"replace":true}))
+        .send()
+        .await
+        .unwrap();
+    error(
+        response,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_value",
+    )
+    .await;
+    assert_eq!(store.head(), Ok(Some(1)));
     fixture.shutdown().await;
 }

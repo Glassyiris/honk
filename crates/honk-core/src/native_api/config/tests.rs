@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::AsyncWriteExt;
@@ -75,8 +75,8 @@ struct Fixture {
     reloads: Arc<AtomicUsize>,
     gates: Option<mpsc::UnboundedReceiver<oneshot::Sender<()>>>,
     database: Option<Arc<DbStore>>,
-    /// When set, the engine answers every reload `Rejected` without applying it.
-    reject_reloads: Arc<AtomicBool>,
+    /// 1: the engine answers every reload `Rejected`; 2: it drops the reply. Neither applies it.
+    reject_reloads: Arc<AtomicU8>,
 }
 
 impl Fixture {
@@ -94,7 +94,14 @@ impl Fixture {
 
     /// Starts from `--store db`: the tree is imported as revision 1.
     async fn new_db(access: Access) -> Self {
-        Self::build(access, false, |_, _| {}, true).await
+        Self::new_db_custom(access, |_, _| {}).await
+    }
+
+    async fn new_db_custom(
+        access: Access,
+        setup: impl FnOnce(&Path, &mut HashMap<&'static str, String>),
+    ) -> Self {
+        Self::build(access, false, setup, true).await
     }
 
     async fn build(
@@ -231,7 +238,7 @@ impl Fixture {
             .await;
         let reloads = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&reloads);
-        let reject_reloads = Arc::new(AtomicBool::new(false));
+        let reject_reloads = Arc::new(AtomicU8::new(0));
         let rejecting = Arc::clone(&reject_reloads);
         let (gate, gates) = if gated {
             let (sender, receiver) = mpsc::unbounded_channel();

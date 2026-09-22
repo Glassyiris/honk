@@ -14,7 +14,7 @@ use super::config_write::{SourceFile, WriteError};
 use crate::configuration::{MAX_SOURCE_BYTES, limits};
 
 pub(crate) mod db;
-mod startup;
+pub(crate) mod startup;
 
 pub(crate) use db::DbStore;
 pub(crate) use startup::DatabaseStartup;
@@ -53,6 +53,8 @@ impl Pin {
 pub(crate) enum Committed {
     Written,
     Pending(db::Pending),
+    /// `head` itself re-activated to bring a blocked store back in sync; records nothing.
+    Resync,
 }
 
 impl Committed {
@@ -92,6 +94,10 @@ pub(crate) trait SourceStore: Send + Sync + 'static {
     fn block(&self);
     fn database(&self) -> Option<&DbStore> {
         None
+    }
+    /// True after a failed record: the daemon may run what the store does not hold.
+    fn blocked(&self) -> bool {
+        false
     }
 }
 
@@ -216,6 +222,10 @@ impl SourceStore for DbStore {
     fn promote(&self, committed: Committed) -> Result<(), WriteError> {
         match committed {
             Committed::Pending(pending) => DbStore::promote(self, pending).map(drop),
+            Committed::Resync => {
+                self.unblock();
+                Ok(())
+            }
             Committed::Written => Ok(()),
         }
     }
@@ -226,5 +236,9 @@ impl SourceStore for DbStore {
 
     fn database(&self) -> Option<&DbStore> {
         Some(self)
+    }
+
+    fn blocked(&self) -> bool {
+        DbStore::blocked(self)
     }
 }
