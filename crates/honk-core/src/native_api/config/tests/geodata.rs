@@ -265,7 +265,10 @@ async fn updates_verified_bytes_and_keeps_loaded_metadata_after_disk_edits() {
             .unwrap()
             .starts_with(&format!("http://{}/", server.address))
     );
-    assert!(!old.to_string().contains("PRIVATE"));
+    assert_eq!(
+        old["assets"][0]["source_redacted"],
+        format!("http://{}/geosite/PRIVATE?token=PRIVATE", server.address)
+    );
     assert_eq!(route(&fixture, "old.example", "192.0.2.5").await, "block");
     assert_eq!(route(&fixture, "new.example", "192.0.2.5").await, "direct");
     let operation = accepted(
@@ -280,6 +283,10 @@ async fn updates_verified_bytes_and_keeps_loaded_metadata_after_disk_edits() {
     let terminal = fixture.terminal(&operation).await;
     assert_eq!(terminal["status"], "succeeded", "{terminal}");
     assert_eq!(terminal["kind"], "geodata_update");
+    assert_eq!(
+        terminal["result"]["assets"][0]["source_redacted"],
+        old["assets"][0]["source_redacted"]
+    );
     assert_eq!(
         terminal["result"]["assets"][0]["sha256"],
         crate::configuration::digest(&geosite("new.example"))

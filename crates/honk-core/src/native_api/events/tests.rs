@@ -498,3 +498,41 @@ async fn idle_admission_and_old_capture_epochs_preserve_boundaries() {
     hub.publish("runtime.updated", json!({}), None);
     assert_eq!(hub.buffered_kinds(), vec!["runtime.updated"]);
 }
+
+#[tokio::test]
+async fn provider_urls_share_links_and_passwords_never_enter_sse_payloads() {
+    let hub = hub();
+    let mut stream = subscribe(&hub, all(), None);
+    next(&mut stream).await;
+    let subscription = honk_config::subscription::Subscription {
+        name: "sentinel-provider".into(),
+        url: "https://example.test/private-source?token=provider-url-sentinel".into(),
+        ..Default::default()
+    };
+    let config = honk_config::Config {
+        subscriptions: vec![subscription.clone()],
+        ..Default::default()
+    };
+    let provider =
+        crate::native_api::providers::provider_value(&config, None, subscription.id).unwrap();
+    assert_eq!(provider["url_redacted"], subscription.url);
+    hub.publish(
+        "operation.updated",
+        json!({
+            "resource_id":"operation-a", "status":"succeeded", "result":provider,
+            "link":"socks5://user:password-sentinel@127.0.0.1:1080", "password":"password-sentinel"
+        }),
+        None,
+    );
+    let frame = next(&mut stream).await;
+    assert_eq!(data(&frame)["status"], "succeeded");
+    for withheld in [
+        "provider-url-sentinel",
+        "private-source",
+        "sentinel-provider",
+        "socks5://",
+        "password-sentinel",
+    ] {
+        assert!(!frame.contains(withheld));
+    }
+}

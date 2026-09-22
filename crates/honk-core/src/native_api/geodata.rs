@@ -18,19 +18,29 @@ use crate::routing::GeoAssetSnapshot;
 
 pub(crate) const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct GeoData {
     observed_at: String,
     assets: Vec<GeoAsset>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct GeoAsset {
     kind: &'static str,
     sha256: String,
     size_bytes: String,
     modified_at: Option<String>,
     source_redacted: Option<String>,
+}
+
+impl std::fmt::Debug for GeoData {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GeoData")
+            .field("observed_at", &self.observed_at)
+            .field("asset_count", &self.assets.len())
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) struct GeoUpdatePlan {
@@ -89,13 +99,8 @@ pub(crate) fn project(assets: Vec<GeoAssetSnapshot>, settings: &NativeApiConfig)
         assets: assets
             .into_iter()
             .map(|asset| {
-                let source_redacted =
-                    parse_geodata_url(configured_url(settings, asset.kind)).map(|mut url| {
-                        url.set_query(None);
-                        url.set_fragment(None);
-                        url.set_path("/[redacted]");
-                        url.to_string()
-                    });
+                let url = configured_url(settings, asset.kind);
+                let source_redacted = (!url.is_empty()).then(|| url.to_owned());
                 GeoAsset {
                     kind: asset.kind,
                     sha256: asset.sha256,
@@ -118,6 +123,9 @@ fn updatable(state: &NativeState, assets: &[GeoAssetSnapshot]) -> bool {
 }
 
 pub(super) async fn capability(state: &NativeState) -> Value {
+    if state.settings.secret.is_empty() {
+        return json!({"available": false, "can_update": false});
+    }
     match capture(state).await {
         Ok(assets) => json!({"available": true, "can_update": updatable(state, &assets),
             "assets": assets.iter().map(|asset| asset.kind).collect::<Vec<_>>()}),
@@ -131,6 +139,7 @@ pub(super) async fn get(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     parse_query(uri, &[], id)?;
+    super::types::require_administrator(state)?;
     Ok(axum::Json(project(capture(state).await?, &state.settings)).into_response())
 }
 

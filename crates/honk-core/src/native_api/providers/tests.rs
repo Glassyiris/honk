@@ -121,7 +121,7 @@ impl Fixture {
         config.global.nfqueue_enable = false;
         config.global.store_subscribe = false;
         config.experimental.native_api.enabled = true;
-        config.experimental.native_api.allow_anonymous_loopback = true;
+        config.experimental.native_api.secret = "provider-admin-token".into();
         config.experimental.native_api.listen = address.to_string();
         config.ensure_builtin_nodes();
         let preparation = tokio::spawn(async move {
@@ -171,6 +171,10 @@ impl Fixture {
             address,
             client: reqwest::Client::builder()
                 .no_proxy()
+                .default_headers(reqwest::header::HeaderMap::from_iter([(
+                    reqwest::header::AUTHORIZATION,
+                    reqwest::header::HeaderValue::from_static("Bearer provider-admin-token"),
+                )]))
                 .timeout(WAIT)
                 .build()
                 .unwrap(),
@@ -273,13 +277,17 @@ async fn provider_get_is_safe_pure_and_counts_accepted_provenance_not_display_na
         assert_eq!(detail["node_count"], 1);
         assert_eq!(detail["status"], "ok");
         assert!(detail["updated_at"].is_string());
-        assert!(
-            detail["url_redacted"].is_null()
-                && detail["traffic"].is_null()
-                && detail["expires_at"].is_null()
-        );
-        assert!(
-            !list.to_string().contains("private-") && !format!("{detail:?}").contains("private-")
+        assert_eq!(detail["url_redacted"], subscription.url);
+        assert_eq!(detail["name"], subscription.name);
+        assert!(detail["traffic"].is_null() && detail["expires_at"].is_null());
+        assert_eq!(
+            list["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == detail["id"])
+                .unwrap(),
+            &detail
         );
         let disabled = fixture
             .get(&format!("/api/v1/providers/{}", disabled.id))
@@ -339,6 +347,8 @@ async fn refresh_replays_before_busy_and_success_waits_for_real_runtime_publicat
     let terminal = fixture.terminal(&accepted).await;
     assert_eq!(terminal["status"], "succeeded");
     assert_eq!(terminal["result"]["node_count"], 1);
+    assert_eq!(terminal["result"]["url_redacted"], subscription.url);
+    assert_eq!(terminal["result"]["name"], subscription.name);
     assert!(
         fixture
             .state
@@ -518,7 +528,7 @@ async fn disconnected_refresh_keeps_daemon_owned_fetch_and_merge_until_completio
     config.subscriptions.push(subscription.clone());
     let mut fixture = Fixture::start(config, None, Some(OLD), &mut origin).await;
     let mut caller = TcpStream::connect(fixture.address).await.unwrap();
-    caller.write_all(format!("POST /api/v1/providers/{}/refresh HTTP/1.1\r\nHost: {}\r\nIdempotency-Key: lost-response\r\nContent-Length: 0\r\n\r\n", subscription.id, fixture.address).as_bytes()).await.unwrap();
+    caller.write_all(format!("POST /api/v1/providers/{}/refresh HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer provider-admin-token\r\nIdempotency-Key: lost-response\r\nContent-Length: 0\r\n\r\n", subscription.id, fixture.address).as_bytes()).await.unwrap();
     let socket = origin.next().await;
     drop(caller);
     respond(socket, NEW).await;
@@ -650,4 +660,23 @@ async fn provider_snapshot_is_immutable_and_unknown_cursor_is_invalid() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     fixture.stop().await;
     origin.stop().await;
+}
+
+#[test]
+fn provider_retention_accounts_for_full_url_and_debug_omits_it() {
+    let subscription = Subscription {
+        name: "configured-provider".into(),
+        url: format!(
+            "https://example.test/{}?token=url-sentinel",
+            "p".repeat(4096)
+        ),
+        ..Default::default()
+    };
+    let row = Provider::observed(&subscription, ProviderLoad::default(), 0);
+    assert_eq!(row.url_redacted.as_deref(), Some(subscription.url.as_str()));
+    assert!(
+        row.retained_bytes()
+            >= size_of::<Provider>() + subscription.url.len() + subscription.name.len()
+    );
+    assert!(!format!("{row:?}").contains("url-sentinel"));
 }

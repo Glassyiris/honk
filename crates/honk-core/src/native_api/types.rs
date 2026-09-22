@@ -303,6 +303,19 @@ pub(super) fn version() -> Value {
     })
 }
 
+pub(super) fn require_administrator(state: &super::NativeState) -> Result<(), ApiError> {
+    if state.settings.secret.is_empty() {
+        Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            ErrorCode::PermissionDenied,
+            "Administrative access requires a configured secret.",
+            None,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub(super) async fn capabilities(state: &super::NativeState) -> Value {
     let config = &state.observation.configuration;
     let telemetry = &state.observation.telemetry;
@@ -316,6 +329,10 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
     ];
     let mut providers = state.observation.providers.capability();
     providers["can_manage"] = json!(config.can_manage());
+    if state.settings.secret.is_empty() {
+        providers["available"] = json!(false);
+        providers["can_refresh"] = json!(false);
+    }
     let geodata = super::geodata::capability(state).await;
     json!({
         "observed_at": chrono::Utc::now().to_rfc3339(),

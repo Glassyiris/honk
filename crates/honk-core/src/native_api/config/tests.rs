@@ -507,11 +507,20 @@ async fn metadata_defaults_and_anonymous_never_grant_source_authority() {
         assert_eq!(capabilities["resources"]["config"]["writable"], false);
         assert_eq!(capabilities["resources"]["groups"]["config_patch"], false);
         if !fixture.authenticated {
+            for resource in ["providers", "geodata"] {
+                assert_eq!(capabilities["resources"][resource]["available"], false);
+            }
             assert_eq!(
                 fixture.service.snapshot().unwrap()["secrets_redacted"],
                 false
             );
-            for path in [CONFIG, "/api/v1/config/sources/unknown"] {
+            for path in [
+                CONFIG,
+                "/api/v1/config/sources/unknown",
+                "/api/v1/providers",
+                "/api/v1/providers/inline",
+                "/api/v1/geodata",
+            ] {
                 error(
                     fixture.request(Method::GET, path).send().await.unwrap(),
                     StatusCode::FORBIDDEN,
@@ -586,21 +595,19 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
     }
     assert!(!config.to_string().contains(SECRET));
     let before = disk(fixture.directory.path());
-    for name in ["auth.dae"] {
-        error(
-            fixture
-                .replace(
-                    source(&config, &fixture.originals[name]),
-                    "# not authorized\n",
-                )
-                .send()
-                .await
-                .unwrap(),
-            StatusCode::FORBIDDEN,
-            "permission_denied",
-        )
-        .await;
-    }
+    error(
+        fixture
+            .replace(
+                source(&config, &fixture.originals["auth.dae"]),
+                "# not authorized\n",
+            )
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::FORBIDDEN,
+        "permission_denied",
+    )
+    .await;
     let without_auth = fixture.originals["main.dae"].replace(" 'auth.dae'\n", "");
     error(
         fixture

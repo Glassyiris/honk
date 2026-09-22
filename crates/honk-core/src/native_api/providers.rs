@@ -1,4 +1,4 @@
-//! Safe provider observations and supervisor-owned refresh admission.
+//! Provider observations and supervisor-owned refresh admission.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -36,7 +36,7 @@ const MAX_SNAPSHOTS: usize = 8;
 const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct Provider {
     id: String,
     name: String,
@@ -48,6 +48,18 @@ pub(crate) struct Provider {
     traffic: Option<()>,
     status: &'static str,
     last_error: Option<ProviderError>,
+}
+
+impl std::fmt::Debug for Provider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Provider")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("node_count", &self.node_count)
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -76,11 +88,9 @@ impl Provider {
     fn observed(subscription: &Subscription, load: ProviderLoad, node_count: usize) -> Self {
         Self {
             id: subscription.id.to_string(),
-            // Configured tags and even URL hosts can contain credentials. No raw source text
-            // is needed to correlate this stable display label with Node.provider_id.
-            name: format!("provider-{}", subscription.id),
+            name: subscription.name.clone(),
             kind: "subscription",
-            url_redacted: None,
+            url_redacted: Some(subscription.url.clone()),
             node_count,
             updated_at: load.updated_at.map(timestamp),
             expires_at: None,
@@ -109,6 +119,7 @@ impl Provider {
         size_of::<Self>()
             + self.id.capacity()
             + self.name.capacity()
+            + self.url_redacted.as_ref().map_or(0, String::capacity)
             + self.updated_at.as_ref().map_or(0, String::capacity)
     }
 }
@@ -196,6 +207,7 @@ pub(super) async fn list(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     let query = parse_query(uri, &["limit", "cursor"], id)?;
+    super::types::require_administrator(state)?;
     let limit = query
         .get("limit")
         .map(|value| value.parse::<usize>())
@@ -210,8 +222,17 @@ pub(super) async fn list(
         return service.resume(cursor, &state.observation.instance_id, limit, id);
     }
     let config = state.config.read().await;
-    // Every row has a fixed-size safe label; reject before allocating its join or projection.
-    if config.subscriptions.len() >= MAX_SNAPSHOT_BYTES / (size_of::<Provider>() + 256) {
+    if config
+        .subscriptions
+        .iter()
+        .fold(0usize, |bytes, subscription| {
+            bytes
+                .saturating_add(size_of::<Provider>() + 256)
+                .saturating_add(subscription.name.len())
+                .saturating_add(subscription.url.len())
+        })
+        >= MAX_SNAPSHOT_BYTES
+    {
         return Err(unavailable());
     }
     let mut counts: HashMap<_, usize> = config.subscriptions.iter().map(|s| (s.id, 0)).collect();
@@ -261,6 +282,7 @@ pub(super) async fn detail(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     parse_query(uri, &[], id)?;
+    super::types::require_administrator(state)?;
     if provider_id == "inline" {
         let config = state.config.read().await;
         let count = config
@@ -305,6 +327,7 @@ pub(super) async fn refresh(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     parse_query(request.uri(), &[], id)?;
+    super::types::require_administrator(state)?;
     if provider_id == "inline" {
         return Err(not_refreshable());
     }
@@ -328,11 +351,7 @@ pub(super) async fn refresh(
     let operations = &state.observation.operations;
     let path = format!("/api/v1/providers/{provider_id}/refresh");
     let reservation = operations.reserve(
-        if state.settings.secret.is_empty() {
-            "anonymous"
-        } else {
-            "control"
-        },
+        "control",
         "POST",
         &path,
         key.as_deref(),
