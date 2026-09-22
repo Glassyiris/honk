@@ -187,7 +187,7 @@ struct StoreState {
     blocked: bool,
 }
 
-const DIR_FLAGS: OFlag = OFlag::O_RDONLY
+pub(super) const DIR_FLAGS: OFlag = OFlag::O_RDONLY
     .union(OFlag::O_DIRECTORY)
     .union(OFlag::O_NOFOLLOW)
     .union(OFlag::O_CLOEXEC);
@@ -408,7 +408,7 @@ impl Sessions {
     }
 }
 
-fn effective_uid() -> u32 {
+pub(super) fn effective_uid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
 }

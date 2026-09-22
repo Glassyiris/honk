@@ -13,6 +13,10 @@ use super::ApiError;
 use super::config_write::{SourceFile, WriteError};
 use crate::configuration::{MAX_SOURCE_BYTES, limits};
 
+// Selected at startup by `--store db`; until then only its tests use it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod db;
+
 /// Revision fence taken before a candidate is validated and checked again on commit.
 pub(crate) enum Pin {
     File(SourceFile),

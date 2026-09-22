@@ -589,7 +589,7 @@ fn unavailable() -> ApiError {
         None,
     )
 }
-fn denied() -> ApiError {
+pub(super) fn denied() -> ApiError {
     ApiError::new(
         StatusCode::FORBIDDEN,
         ErrorCode::PermissionDenied,
