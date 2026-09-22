@@ -724,6 +724,7 @@ async fn group_patch_revision_rejects_same_named_provider_replacement_before_act
         &config,
     ));
     cp.native = Some(Arc::clone(&native));
+    native.attach_for_test();
     cp.configuration = Some(Arc::clone(&native.configuration.sources));
     let sources =
         source_update("group { selected { filter: name(peer) } }\nrouting { fallback: direct }\n");
@@ -791,6 +792,7 @@ async fn accepted_sources_follow_noop_rejection_and_derived_updates() {
         &config,
     ));
     cp.native = Some(Arc::clone(&native));
+    native.attach_for_test();
     cp.configuration = Some(Arc::clone(&native.configuration.sources));
     let mut authorizations = crate::subscription::SubscriptionAuthorizations::new(&[]).unwrap();
     let initial = source_update("routing { fallback: direct }\n");
@@ -913,6 +915,7 @@ async fn first_subscription_publication_invalidates_source_revision() {
         &config,
     ));
     cp.native = Some(Arc::clone(&native));
+    native.attach_for_test();
     cp.configuration = Some(Arc::clone(&native.configuration.sources));
     let mut subscriptions =
         crate::subscription::SubscriptionSupervisor::prepare(&mut config, None, Vec::new())
@@ -1167,6 +1170,7 @@ async fn post_publication_datapath_failure_is_committed_degraded() {
         cp.native = Some(Arc::new(
             crate::native_api::observation::NativeObservation::new(&config),
         ));
+        cp.native.as_ref().unwrap().attach_for_test();
         cp.configuration = Some(Arc::clone(
             &cp.native.as_ref().unwrap().configuration.sources,
         ));
@@ -2007,6 +2011,7 @@ async fn native_dns_selection_keeps_catalog_ownership_across_reload_and_rejectio
     });
     let cp = control_plane(config.clone());
     let native = cp.native.as_ref().unwrap();
+    native.attach_for_test();
     let provider = cp.dns_controller.runtime_provider();
     let old_lease = provider.try_acquire().unwrap();
     let old_manager = cp.group_manager.read().clone();

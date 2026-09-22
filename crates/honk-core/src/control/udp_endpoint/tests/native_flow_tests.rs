@@ -255,6 +255,7 @@ async fn assert_native_udp_builtin_plan(selector_block: bool) {
         .await
         .unwrap(),
     );
+    control.native_observation().attach_for_test();
     let server = NativeServer::start(listener, state);
     let handle = control.spawn_handle();
     let hello = crate::control::quic::test_utils::build_client_hello(Some("original-target.test"));
@@ -587,6 +588,7 @@ async fn native_udp_queued_packet_cannot_borrow_recreated_token_zero_witness() {
             Arc::new(UdpTestReplySocketFactory),
         ));
         let native = plane.native_observation();
+        native.attach_for_test();
         let state = Arc::new(
             crate::native_api::NativeState::new(
                 &mut plane,
