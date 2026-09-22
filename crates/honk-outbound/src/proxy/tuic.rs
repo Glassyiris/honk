@@ -537,6 +537,10 @@ impl TuicHandler {
                     send.write_all(&header)
                         .await
                         .context("TUIC: send CONNECT")?;
+                    #[cfg(feature = "native-api")]
+                    if let Some(observer) = crate::runtime::flow_observation::current() {
+                        observer.milestone_once("target_request_sent");
+                    }
                     Ok((send, recv))
                 }
             },
@@ -561,7 +565,11 @@ impl TuicHandler {
         let target_addr = TuicAddr::new(target, target_domain)?;
         loop {
             let (conn, state) = client.connection(connect_timeout).await?;
+            #[cfg(feature = "native-api")]
+            let observation = crate::session::ObservedSessionOpen::start();
             let Some(session_id) = state.alloc_session() else {
+                #[cfg(feature = "native-api")]
+                observation.finish("session_open_capacity", Some("capacity"));
                 client.quic.invalidate(&conn).await;
                 continue;
             };
@@ -569,6 +577,8 @@ impl TuicHandler {
             let (tx, rx) = mpsc::channel::<UdpInbound>(UDP_SESSION_QUEUE_CAP);
             state.sessions.lock().insert(session_id, tx);
             state.open.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "native-api")]
+            observation.finish("session_open_succeeded", None);
             return Ok(Arc::new(TuicUdpTransport {
                 state,
                 session_id,
@@ -577,6 +587,10 @@ impl TuicHandler {
                 defrag: tokio::sync::Mutex::new(Defragmenter::new(u16::MAX as usize)),
                 target_addr,
                 target,
+                #[cfg(feature = "native-api")]
+                request_observer: parking_lot::Mutex::new(
+                    crate::runtime::flow_observation::current(),
+                ),
             }));
         }
     }
@@ -631,9 +645,14 @@ impl WarmableOutbound for TuicHandler {
         connect_timeout: Duration,
         _requirement: super::WarmRequirement,
     ) -> anyhow::Result<()> {
-        let client = self.client_for_runtime(&runtime).await?;
-        client.connection(connect_timeout).await?;
-        Ok(())
+        let warm = async {
+            let client = self.client_for_runtime(&runtime).await?;
+            client.connection(connect_timeout).await?;
+            Ok(())
+        };
+        #[cfg(feature = "native-api")]
+        let warm = crate::runtime::flow_observation::without(warm);
+        warm.await
     }
 }
 
@@ -748,6 +767,8 @@ struct TuicUdpTransport {
     defrag: tokio::sync::Mutex<Defragmenter>,
     target_addr: TuicAddr,
     target: SocketAddr,
+    #[cfg(feature = "native-api")]
+    request_observer: parking_lot::Mutex<Option<crate::runtime::flow_observation::FlowObserver>>,
 }
 
 impl std::fmt::Debug for TuicUdpTransport {
@@ -820,7 +841,12 @@ impl PacketTransport for TuicUdpTransport {
             data,
         )
         .await
-        .map_err(io::Error::other)
+        .map_err(io::Error::other)?;
+        #[cfg(feature = "native-api")]
+        if let Some(observer) = self.request_observer.lock().take() {
+            observer.milestone_once("target_request_sent");
+        }
+        Ok(())
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {

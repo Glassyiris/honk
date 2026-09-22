@@ -151,6 +151,8 @@ impl Socks5Handler {
             );
 
             stream.write_all(&request).await?;
+            #[cfg(feature = "native-api")]
+            crate::runtime::flow_observation::milestone("target_request_sent");
 
             // Reply: VER | REP | RSV | ATYP | BND.ADDR | BND.PORT
             let mut reply_header = [0u8; 4];
@@ -202,6 +204,8 @@ impl Socks5Handler {
             }
 
             debug!("SOCKS5 handshake complete");
+            #[cfg(feature = "native-api")]
+            crate::runtime::flow_observation::milestone("target_confirmed");
             Ok(())
         })
         .await
@@ -352,13 +356,19 @@ impl Socks5Handler {
                         domain_and_port[domain_len + 1],
                     ]);
                     let domain = std::str::from_utf8(&domain_and_port[..domain_len])?;
-                    let ip = crate::bootstrap::resolve(domain)
-                        .await?
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("SOCKS5 UDP: relay domain resolved empty")
-                        })?;
+                    let resolution = crate::bootstrap::resolve(domain);
+                    #[cfg(feature = "native-api")]
+                    let (resolution, selection) =
+                        crate::runtime::flow_observation::observe_resolution(resolution).await;
+                    #[cfg(not(feature = "native-api"))]
+                    let resolution = resolution.await;
+                    let ip = resolution?.into_iter().next().ok_or_else(|| {
+                        anyhow::anyhow!("SOCKS5 UDP: relay domain resolved empty")
+                    })?;
+                    #[cfg(feature = "native-api")]
+                    if let Some(selection) = selection {
+                        selection.selected_ip(ip);
+                    }
                     SocketAddr::new(ip, port)
                 }
                 a => anyhow::bail!("SOCKS5 UDP: unknown address type 0x{:02x}", a),
@@ -549,6 +559,8 @@ impl TcpOutbound for Socks5Handler {
         _connect_timeout: std::time::Duration,
     ) -> anyhow::Result<ProxyStream> {
         let config = node.socks5().unwrap();
+        #[cfg(feature = "native-api")]
+        crate::runtime::flow_observation::milestone("transport_ready");
         Self::handshake(
             &mut stream,
             target,
@@ -578,6 +590,8 @@ impl PacketOutbound for Socks5Handler {
         let (udp_socket, relay_addr, control) =
             Self::udp_association(node, connect_timeout).await?;
         udp_socket.connect(relay_addr).await?;
+        #[cfg(feature = "native-api")]
+        crate::runtime::flow_observation::milestone("transport_ready");
 
         Ok(Arc::new(Socks5UdpTransport {
             socket: udp_socket,

@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use crate::routing::{
     PredicateInput, Router,
-    native::{self, MatchResult, TraceError},
+    native::{self, EvaluatedRule, MatchResult, TraceError},
 };
 
 use super::{
@@ -162,7 +162,7 @@ pub(crate) struct RuleList {
     pub(crate) fallback: RuleFallback,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct RuleCondition {
     pub(crate) id: String,
     pub(crate) expression: String,
@@ -170,13 +170,31 @@ pub(crate) struct RuleCondition {
     pub(crate) missing_inputs: Vec<&'static str>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct RuleEvaluation {
     pub(crate) rule_id: String,
     pub(crate) expression: String,
     pub(crate) result: &'static str,
     pub(crate) missing_inputs: Vec<&'static str>,
     pub(crate) conditions: Vec<RuleCondition>,
+}
+
+impl RuleEvaluation {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.rule_id.capacity()
+            + self.expression.capacity()
+            + self.missing_inputs.capacity() * size_of::<&str>()
+            + self.conditions.capacity() * size_of::<RuleCondition>()
+            + self
+                .conditions
+                .iter()
+                .map(|condition| {
+                    condition.id.capacity()
+                        + condition.expression.capacity()
+                        + condition.missing_inputs.capacity() * size_of::<&str>()
+                })
+                .sum::<usize>()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -420,55 +438,15 @@ fn evaluate(
         })?;
     let mut missing_inputs = Vec::new();
     let mut rules = Vec::with_capacity(evaluation.rules.len());
-    for (index, evaluated) in evaluation.rules.into_iter().enumerate() {
+    for (index, evaluated) in evaluation.rules.iter().enumerate() {
         check_deadline(deadline, id)?;
-        let compiled = router.compiled_routes().get(index);
-        let rule_id = rule_id(instance, generation, compiled.map(|rule| rule.id));
-        let mut missing = Vec::new();
-        let conditions = compiled
-            .map(|rule| {
-                rule.conditions
-                    .iter()
-                    .zip(evaluated.conditions)
-                    .enumerate()
-                    .map(|(index, (condition, result))| {
-                        let condition_missing = if result == MatchResult::Indeterminate {
-                            let name = native::missing_input(&condition.predicate);
-                            if !missing.contains(&name) {
-                                missing.push(name);
-                            }
-                            vec![name]
-                        } else {
-                            Vec::new()
-                        };
-                        RuleCondition {
-                            id: format!("{rule_id}/condition:{index}"),
-                            expression: native::condition_expression(condition),
-                            result: result_name(result),
-                            missing_inputs: condition_missing,
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        if evaluated.result == MatchResult::Indeterminate {
-            for name in &missing {
-                if !missing_inputs.contains(name) {
-                    missing_inputs.push(*name);
-                }
+        let rule = rule_evaluation(instance, generation, router, index, evaluated);
+        for name in &rule.missing_inputs {
+            if !missing_inputs.contains(name) {
+                missing_inputs.push(*name);
             }
-        } else {
-            missing.clear();
         }
-        rules.push(RuleEvaluation {
-            rule_id,
-            expression: compiled
-                .map(|rule| native::rule_expression(&rule.conditions))
-                .unwrap_or_else(|| "fallback".into()),
-            result: result_name(evaluated.result),
-            missing_inputs: missing,
-            conditions,
-        });
+        rules.push(rule);
     }
     check_deadline(deadline, id)?;
     Ok(RoutingEvaluation {
@@ -482,6 +460,69 @@ fn evaluate(
         missing_inputs,
         rules,
     })
+}
+
+pub(crate) fn observed_rule_evaluations(
+    instance: &str,
+    generation: u64,
+    router: &Router,
+    evaluated: &[EvaluatedRule],
+) -> Vec<RuleEvaluation> {
+    evaluated
+        .iter()
+        .enumerate()
+        .map(|(index, evaluated)| rule_evaluation(instance, generation, router, index, evaluated))
+        .collect()
+}
+
+fn rule_evaluation(
+    instance: &str,
+    generation: u64,
+    router: &Router,
+    index: usize,
+    evaluated: &EvaluatedRule,
+) -> RuleEvaluation {
+    let compiled = router.compiled_routes().get(index);
+    let rule_id = rule_id(instance, generation, compiled.map(|rule| rule.id));
+    let mut missing = Vec::new();
+    let conditions = compiled
+        .map(|rule| {
+            rule.conditions
+                .iter()
+                .zip(&evaluated.conditions)
+                .enumerate()
+                .map(|(index, (condition, &result))| {
+                    let condition_missing = if result == MatchResult::Indeterminate {
+                        let name = native::missing_input(&condition.predicate);
+                        if !missing.contains(&name) {
+                            missing.push(name);
+                        }
+                        vec![name]
+                    } else {
+                        Vec::new()
+                    };
+                    RuleCondition {
+                        id: format!("{rule_id}/condition:{index}"),
+                        expression: native::condition_expression(condition),
+                        result: result_name(result),
+                        missing_inputs: condition_missing,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if evaluated.result != MatchResult::Indeterminate {
+        missing.clear();
+    }
+    RuleEvaluation {
+        rule_id,
+        expression: compiled
+            .map(|rule| native::rule_expression(&rule.conditions))
+            .unwrap_or_else(|| "fallback".into()),
+        result: result_name(evaluated.result),
+        missing_inputs: missing,
+        conditions,
+    }
 }
 
 fn result_name(result: MatchResult) -> &'static str {

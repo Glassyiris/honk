@@ -48,7 +48,7 @@ async fn native_udp_terminal_evidence_survives_retirement_and_tuple_reuse() {
             },
         ));
         let mut endpoint = UdpEndpoint::new(transport, dst, TEST_NODE_ID);
-        endpoint.set_native_flow(Some(flow), &pool);
+        endpoint.set_native_flow(Some(flow), &pool, None);
         let endpoint = Arc::new(endpoint);
         let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
         let death_called = Arc::new(AtomicBool::new(false));
@@ -403,6 +403,30 @@ async fn assert_native_udp_builtin_plan(selector_block: bool) {
         .unwrap();
     assert_eq!(won_direct["data"]["target_kind"], "ip");
     assert_eq!(won_direct["data"]["target"], destination.to_string());
+    let winner = &won_direct["data"]["attempt_id"];
+    assert!(
+        steps
+            .iter()
+            .any(|step| step["data"]["reason"] == "udp_prepared"
+                && step["data"]["attempt_id"] == *winner)
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|step| step["data"]["reason"] == "udp_transport_ready"
+                && step["data"]["attempt_id"] == *winner)
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|step| step["data"]["reason"] == "application_send_accepted"
+                && step["data"]["attempt_id"] == *winner)
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|step| step["data"]["reason"] == "selection_evaluated")
+    );
     assert_eq!(
         steps
             .iter()
@@ -417,4 +441,333 @@ async fn assert_native_udp_builtin_plan(selector_block: bool) {
     );
     assert!(handle.udp_pool.shutdown().await.joined);
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_udp_received_reply_survives_client_send_failure_until_cleanup() {
+    let api = NativeFlowApi::new().await;
+    for cleanup_succeeded in [true, false] {
+        let pool = Arc::new(UdpEndpointPool::new());
+        let stats = Arc::new(StatsManager::new());
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = upstream.local_addr().unwrap();
+        let client = make_addr("127.0.0.1", 0);
+        let flow = Arc::new(api.flows.begin("udp", client, destination));
+        let id = flow.id().to_owned();
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let mut lease =
+            match pool.reserve_or_enqueue(client, destination, b"request", permit, &stats) {
+                EndpointReservation::Initializing(lease) => lease,
+                _ => panic!("new loopback flow must be admitted"),
+            };
+        let (removed_tx, mut removed_rx) = mpsc::channel(1);
+        pool.set_remove_sink(removed_tx);
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut endpoint =
+            UdpEndpoint::new(transport(socket, destination), destination, TEST_NODE_ID);
+        endpoint.set_native_flow(Some(flow), &pool, None);
+        let endpoint = Arc::new(endpoint);
+        let mut driver = pool.spawn_driver(
+            client,
+            destination,
+            lease.generation(),
+            lease.decision_token(),
+            Arc::clone(&endpoint),
+            lease.take_queue_receiver().unwrap(),
+            test_reply_socket().await,
+            Arc::new(honk_outbound::alive::AliveDialerSet::new()),
+            Arc::clone(&stats),
+            stats.outbound_tracker("loopback", crate::stats::OutboundKind::Node),
+        );
+        driver.wait_ready().await.unwrap();
+        assert!(lease.commit_ready(Arc::clone(&endpoint)));
+        driver.start(lease.take_first().unwrap()).unwrap();
+        drop(lease);
+        driver.wait_first_ack().await.unwrap();
+        let mut request = [0; 32];
+        let (length, peer) = upstream.recv_from(&mut request).await.unwrap();
+        assert_eq!(&request[..length], b"request");
+        upstream.send_to(b"reply", peer).await.unwrap();
+        let removal = tokio::time::timeout(Duration::from_secs(2), removed_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !endpoint.has_reply(),
+            "failed client delivery must remain Score-neutral RX"
+        );
+        assert_eq!(endpoint.byte_counters().1.load(Ordering::Relaxed), 0);
+        let before = api.detail(&id).await;
+        assert!(before["ended_at"].is_null());
+        let steps = before["trace"]["steps"].as_array().unwrap();
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step["data"]["milestone"] == "first_reply")
+                .count(),
+            1
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|step| step["data"]["reason"] == "client_delivery_failed"
+                    && step["data"]["action"] == "drop")
+        );
+        assert!(
+            !steps
+                .iter()
+                .any(|step| step["data"]["reason"] == "client_delivery_succeeded")
+        );
+        drop(endpoint);
+        assert!(pool.wait_removal_io(&removal).await);
+        pool.finish_removal(&removal, cleanup_succeeded);
+        let after = api.detail(&id).await;
+        let terminal: Vec<_> = after["trace"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|step| step["data"]["milestone"] == "terminal")
+            .collect();
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(
+            terminal[0]["data"]["reason"],
+            if cleanup_succeeded {
+                "client_delivery_failed"
+            } else {
+                "cleanup_failed"
+            }
+        );
+        if !cleanup_succeeded {
+            assert!(pool.complete_removal(
+                removal.client,
+                removal.dst,
+                removal.decision_token,
+                removal.generation
+            ));
+        }
+        assert!(pool.shutdown().await.joined);
+    }
+    api.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_udp_queued_packet_cannot_borrow_recreated_token_zero_witness() {
+    use crate::control::tests::support::{UdpTestReplySocketFactory, control_plane};
+    use crate::ebpf::{EbpfBackend, mock::MockEbpfBackend};
+    use honk_ebpf_common::*;
+    for recreated in [false, true] {
+        let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_addr = api_listener.local_addr().unwrap();
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = upstream.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let mut config = honk_config::Config::default();
+        config.global.nfqueue_enable = false;
+        config.global.store_subscribe = false;
+        config.global.dial_mode = "ip".into();
+        config.routing.default_outbound = "direct".into();
+        config.experimental.native_api.enabled = true;
+        config.experimental.native_api.secret = "udp-lineage-test".into();
+        config.experimental.native_api.listen = api_addr.to_string();
+        config.ensure_builtin_nodes();
+        let router = crate::routing::Router::new(&[], "direct").unwrap();
+        let mut plan = crate::control::routing_matcher::RoutingPushPlan::compile(
+            &router,
+            &std::collections::HashMap::from([("direct".into(), 0), ("block".into(), 1)]),
+            "direct",
+            honk_config::types::DialMode::Ip,
+        )
+        .unwrap();
+        plan.enable_trace(true);
+        let mut plane = control_plane(config.clone());
+        plane.diagnostics.write().generation = 17;
+        plane.udp_pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
+            2,
+            Arc::new(UdpTestReplySocketFactory),
+        ));
+        let native = plane.native_observation();
+        let state = Arc::new(
+            crate::native_api::NativeState::new(
+                &mut plane,
+                api_addr,
+                std::time::SystemTime::now(),
+                Instant::now(),
+            )
+            .await
+            .unwrap(),
+        );
+        let server = crate::native_api::NativeServer::start(api_listener, state);
+        let ingress = crate::control::udp_ingress::UdpLoopState::new(&plane, true);
+        let tuples = crate::control::connection::build_tuples_key(
+            destination.ip(),
+            destination.port(),
+            client_addr.ip(),
+            client_addr.port(),
+            17,
+        );
+        let mut backend = MockEbpfBackend::new();
+        backend.publish_routing_plan(&plan, &[]).unwrap();
+        backend.bind_kernel_trace_dictionary(
+            crate::native_api::flows::kernel::KernelTraceDictionary::prepare(
+                &native.instance_id,
+                17,
+                &router,
+                &config,
+                &plan,
+            )
+            .unwrap(),
+        );
+        let descriptor = backend.routing_snapshot().descriptor;
+        let mut witness = KernelRouteWitness {
+            tuple: tuples,
+            ..Default::default()
+        };
+        witness.output.flags = ROUTE_TRACE_VERSION | ROUTE_TRACE_ENABLED | ROUTE_TRACE_COMPLETE;
+        witness.output.policy_id = descriptor.trace_policy;
+        witness.output.generation = descriptor.generation;
+        witness.output.decision = RoutingDecision {
+            outbound: OutboundIndex::Direct as u32,
+            domain_final: 1,
+            ..Default::default()
+        };
+        witness.output.input.src_ip = *tuples.src_ip.as_bytes();
+        witness.output.input.dst_ip = *tuples.dst_ip.as_bytes();
+        witness.output.input.src_port = u32::from(tuples.src_port);
+        witness.output.input.dst_port = u32::from(tuples.dst_port);
+        witness.output.input.l4proto = 2;
+        witness.output.input.dscp = 8;
+        witness.output.outcomes[0] = ROUTE_TRACE_MATCHED;
+        let first_id = backend.capture_route_witness(witness);
+        let reference = crate::native_api::flows::kernel::KernelRouteReference {
+            trace_id: first_id,
+            decision_token: 0,
+            routing_generation: descriptor.generation,
+            effective_outbound: OutboundIndex::Direct as u8,
+            mark: Some(0),
+            must: Some(0),
+        };
+        assert_eq!(
+            backend
+                .capture_kernel_route(
+                    &tuples,
+                    crate::native_api::flows::kernel::KernelRouteReference {
+                        effective_outbound: OutboundIndex::Block as u8,
+                        ..reference
+                    },
+                )
+                .unwrap_err(),
+            "kernel_trace_action_mismatch"
+        );
+        let captured = backend.capture_kernel_route(&tuples, reference).unwrap();
+        assert_eq!(captured.gap, None);
+        assert_eq!(captured.rules[0].result, "matched");
+        let config_guard = plane.config.write().await;
+        ingress
+            .dispatch_datagram_at(
+                b"queued-original",
+                client_addr,
+                &crate::control::sockets::UdpRecvMeta {
+                    original_dst_cmsg: Some(destination),
+                    packet_dst_ip: Some(destination.ip()),
+                    packet_ifindex: Some(1),
+                    packet_mark: Some(TPROXY_MARK),
+                    packet_priority: Some(first_id),
+                    local_addr: make_addr("0.0.0.0", 15000),
+                },
+                crate::control::udp_endpoint::queue_now(),
+            )
+            .await;
+        let current_id = if recreated {
+            witness.output.input.dscp = 46;
+            backend.capture_route_witness(witness)
+        } else {
+            first_id
+        };
+        backend
+            .udp_conn_state_store(
+                &tuples,
+                &ConnState {
+                    trace_id: current_id,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        backend.routing_handoffs.lock().insert(
+            *backend.udp_conn_states.keys().next().unwrap(),
+            RoutingHandoffEntry {
+                trace_id: current_id,
+                routing_generation: descriptor.generation,
+                result: RoutingResult {
+                    dscp: if recreated { 46 } else { 8 },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        *plane.ebpf.write().await = Box::new(backend);
+        drop(config_guard);
+        let mut received = [0; 64];
+        let (length, _) =
+            tokio::time::timeout(Duration::from_secs(2), upstream.recv_from(&mut received))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&received[..length], b"queued-original");
+        assert_eq!(
+            upstream.try_recv_from(&mut received).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let page: serde_json::Value = http
+            .get(format!("http://{api_addr}/api/v1/flows"))
+            .bearer_auth("udp-lineage-test")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(page["flows"].as_array().unwrap().len(), 1);
+        let id = page["flows"][0]["id"].as_str().unwrap();
+        let detail: serde_json::Value = http
+            .get(format!("http://{api_addr}/api/v1/flows/{id}"))
+            .bearer_auth("udp-lineage-test")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let steps = detail["trace"]["steps"].as_array().unwrap();
+        let kernel_routes: Vec<_> = steps
+            .iter()
+            .filter(|step| step["stage"] == "route" && step["data"]["plane"] == "kernel")
+            .collect();
+        if recreated {
+            assert!(
+                kernel_routes.is_empty(),
+                "queued A must not adopt the current B witness"
+            );
+            assert_eq!(detail["trace"]["status"], "partial");
+        } else {
+            assert_eq!(
+                kernel_routes.len(),
+                1,
+                "an exact packet carrier retains kernel evidence"
+            );
+            assert_eq!(kernel_routes[0]["data"]["input"]["dscp"], 8);
+            assert_eq!(kernel_routes[0]["data"]["rules"][0]["result"], "matched");
+            assert_eq!(
+                kernel_routes[0]["data"]["evaluation_id"],
+                format!("{}:kernel:{first_id}", native.instance_id)
+            );
+        }
+        assert!(plane.udp_pool.shutdown().await.joined);
+        server.shutdown().await;
+    }
 }

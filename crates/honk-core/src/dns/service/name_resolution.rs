@@ -117,7 +117,9 @@ impl PinnedNameResolver {
         let outcome = match &self.runtime {
             Some(runtime) => {
                 let _permit = runtime.runtime().try_acquire_query()?;
-                operation.run(runtime.run(resolve)).await??
+                operation
+                    .run(runtime.run(std::pin::pin!(resolve)))
+                    .await??
             }
             None => operation.run(resolve).await?,
         };
@@ -258,7 +260,7 @@ impl DnsService {
             Ok(resolved)
         };
         match lease {
-            Some(lease) => lease.run(resolve).await?,
+            Some(lease) => lease.run(std::pin::pin!(resolve)).await?,
             None => resolve.await,
         }
     }
@@ -273,13 +275,13 @@ impl DnsService {
             DnsServiceBackend::Runtime(provider) => {
                 let lease = provider.try_acquire()?;
                 lease
-                    .run(resolve_with_forwarder(
+                    .run(std::pin::pin!(resolve_with_forwarder(
                         self,
                         &mut operation,
                         lease.runtime().forwarder(),
                         domain,
                         metadata,
-                    ))
+                    )))
                     .await??
             }
             DnsServiceBackend::Standalone(forwarder) => {

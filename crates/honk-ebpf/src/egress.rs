@@ -321,6 +321,7 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                 0,    // dscp
                 None, // pname
                 0,    // pid
+                0,
             );
         }
         IPPROTO_UDP => {
@@ -346,6 +347,7 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                 0,    // dscp
                 None, // pname
                 0,    // pid
+                0,
             );
         }
         _ => {}
@@ -365,11 +367,13 @@ fn do_tproxy_wan_egress_tcp(
     let tuples = &pkt.tuples;
     let ethh = &pkt.ethh;
     let tcph = &pkt.tcph;
+    let dns = tuples.five.dst_port == 53;
     let tcp_state_syn = is_new_tcp_connection(tcph);
     let outbound: u8;
     let must: bool;
     let mark: u32;
     let routing_generation: u64;
+    let trace_id: u32;
 
     let mut handoff_pname: Option<&[u8; TASK_COMM_LEN]> = None;
     let mut handoff_pid: u32 = 0;
@@ -413,10 +417,12 @@ fn do_tproxy_wan_egress_tcp(
             ip_version,
             true,
         );
-        let (decision, generation) = match crate::route::route(&mut pkt.routing_input, pname) {
-            Ok(result) => result,
-            Err(_) => return Err(TC_ACT_SHOT),
-        };
+        let (decision, generation) =
+            match crate::route::route(&mut pkt.routing_input, pname, &mut pkt.route_witness.output)
+            {
+                Ok(result) => result,
+                Err(_) => return Err(TC_ACT_SHOT),
+            };
         routing_generation = generation;
 
         outbound =
@@ -438,6 +444,16 @@ fn do_tproxy_wan_egress_tcp(
             };
 
         let pname_bytes: Option<&[u8; TASK_COMM_LEN]> = handoff_pname;
+        let ambiguous = pkt.route_witness.output.flags & 1 != 0
+            && (crate::maps::CONN_STATE_MAP.get_ptr(&tuples.five).is_some()
+                || ROUTING_HANDOFF_MAP.get_ptr(&tuples.five).is_some());
+        trace_id = if outbound == OUTBOUND_BLOCK
+            || (outbound == OUTBOUND_DIRECT && ((!dns && mark == 0) || (dns && must)))
+        {
+            0
+        } else {
+            crate::route::capture(&mut pkt.route_witness, &tuples.five, 0, ambiguous)
+        };
 
         let tcp_conn = mark_tcp_seen(
             &tuples.five,
@@ -450,6 +466,7 @@ fn do_tproxy_wan_egress_tcp(
             dscp,
             pname_bytes,
             handoff_pid,
+            trace_id,
         );
 
         if tcp_conn.is_none() {
@@ -460,6 +477,7 @@ fn do_tproxy_wan_egress_tcp(
         }
     } else {
         routing_generation = 0;
+        trace_id = 0;
         let tcp_conn = mark_tcp_seen(
             &tuples.five,
             tcph,
@@ -471,6 +489,7 @@ fn do_tproxy_wan_egress_tcp(
             0,    // dscp
             None, // pname
             0,    // pid
+            0,
         );
 
         if let Some(conn) = tcp_conn {
@@ -493,7 +512,6 @@ fn do_tproxy_wan_egress_tcp(
         }
     }
 
-    let dns = tuples.five.dst_port == 53;
     if outbound == OUTBOUND_DIRECT && ((!dns && mark == 0) || (dns && must)) {
         ctx.set_mark(mark);
         return Err(TC_ACT_OK);
@@ -528,6 +546,7 @@ fn do_tproxy_wan_egress_tcp(
         (*ctx.skb.skb).cb[0] = TPROXY_MARK;
         (*ctx.skb.skb).cb[1] = tcp_listener_l4proto(tcph) as u32;
         (*ctx.skb.skb).cb[2] = 0;
+        (*ctx.skb.skb).cb[3] = 0;
     }
 
     // Write routing handoff entry for the control plane.  Only the SYN that
@@ -538,6 +557,7 @@ fn do_tproxy_wan_egress_tcp(
         let mut handoff: RoutingHandoffEntry = unsafe { mem::zeroed() };
         handoff.last_seen_ns = unsafe { bpf_ktime_get_ns() };
         handoff.routing_generation = routing_generation;
+        handoff.trace_id = trace_id;
         handoff.result.mark = mark;
         handoff.result.must = must as u8;
         handoff.result.outbound = outbound;
@@ -578,6 +598,7 @@ fn fast_path_decision(
     handoff_pid: u32,
     decision_token: u32,
     routing_generation: u64,
+    trace_id: u32,
 ) -> Verdict {
     let dns = tuples.five.dst_port == 53;
     if outbound == OUTBOUND_DIRECT && ((!dns && mark == 0) || (dns && must)) {
@@ -621,6 +642,7 @@ fn fast_path_decision(
         (*ctx.skb.skb).cb[0] = TPROXY_MARK;
         (*ctx.skb.skb).cb[1] = IPPROTO_UDP as u32;
         (*ctx.skb.skb).cb[2] = dns_route_mark;
+        (*ctx.skb.skb).cb[3] = trace_id;
     }
 
     // Raw must UDP53 is admitted from the per-packet carrier, so only flows
@@ -640,7 +662,12 @@ fn fast_path_decision(
         if write_handoff {
             let mut handoff: RoutingHandoffEntry = unsafe { mem::zeroed() };
             handoff.last_seen_ns = now;
-            handoff.routing_generation = 0;
+            handoff.routing_generation = if routing_generation != 0 {
+                routing_generation
+            } else {
+                crate::route::captured_generation(trace_id)
+            };
+            handoff.trace_id = trace_id;
             handoff.result.mark = mark;
             handoff.result.must = must as u8;
             handoff.result.outbound = outbound;
@@ -675,6 +702,7 @@ fn do_tproxy_wan_egress_udp(
 ) -> Verdict {
     let tuples = &pkt.tuples;
     let ethh = &pkt.ethh;
+    let dns = tuples.five.dst_port == 53;
     let mut outbound: u8;
     let mut mark: u32;
     let must: bool;
@@ -732,6 +760,7 @@ fn do_tproxy_wan_egress_udp(
                 handoff_pid,
                 decision_token,
                 0,
+                conn_state.trace_id,
             );
         }
     }
@@ -756,10 +785,11 @@ fn do_tproxy_wan_egress_udp(
         ip_version,
         true,
     );
-    let (decision, generation) = match crate::route::route(&mut pkt.routing_input, pname) {
-        Ok(result) => result,
-        Err(_) => return Err(TC_ACT_SHOT),
-    };
+    let (decision, generation) =
+        match crate::route::route(&mut pkt.routing_input, pname, &mut pkt.route_witness.output) {
+            Ok(result) => result,
+            Err(_) => return Err(TC_ACT_SHOT),
+        };
     let routing_generation = generation;
 
     let force_direct = tuples.five.dst_port != 53
@@ -777,12 +807,19 @@ fn do_tproxy_wan_egress_udp(
         }
         outbound = OUTBOUND_DIRECT;
     }
+    let trace_id = if outbound == OUTBOUND_BLOCK
+        || (outbound == OUTBOUND_DIRECT && ((!dns && mark == 0) || (dns && must)))
+    {
+        0
+    } else {
+        crate::route::capture(&mut pkt.route_witness, &tuples.five, decision_token, false)
+    };
 
     if !is_short_lived_udp_traffic(&tuples.five) {
         let must_u8 = must as u8;
         let pname = pid_pname_opt.map(|pid_pname| &pid_pname.pname);
         let pid = pid_pname_opt.map_or(0, |pid_pname| pid_pname.pid);
-        if mark_udp_seen(
+        let state = mark_udp_seen(
             &tuples.five,
             0u8,
             Some(&outbound),
@@ -792,9 +829,9 @@ fn do_tproxy_wan_egress_udp(
             tuples.dscp,
             pname,
             pid,
-        )
-        .is_none()
-        {
+            trace_id,
+        );
+        if state.is_none() {
             if outbound == OUTBOUND_DIRECT && mark == 0 {
                 return Err(TC_ACT_OK);
             }
@@ -815,6 +852,7 @@ fn do_tproxy_wan_egress_udp(
         handoff_pid,
         decision_token,
         routing_generation,
+        trace_id,
     )
 }
 

@@ -1943,6 +1943,154 @@ async fn identical_effective_reload_retains_runtime_identity_and_writes_nothing(
     assert!(!drain.should_reject());
 }
 
+#[cfg(feature = "native-api")]
+#[tokio::test(start_paused = true)]
+async fn native_dns_selection_keeps_catalog_ownership_across_reload_and_rejection() {
+    async fn observed_selection(
+        native: &crate::native_api::observation::NativeObservation,
+        lease: &crate::dns::runtime::RuntimeLease,
+        config: &Config,
+        manager: &GroupManager,
+        active_generation: u64,
+    ) -> (u64, String) {
+        let flow = Arc::new(native.flows.begin(
+            "tcp",
+            "127.0.0.1:31000".parse().unwrap(),
+            "192.0.2.17:443".parse().unwrap(),
+        ));
+        let observer = flow
+            .observer(active_generation, None, "dial_target")
+            .unwrap();
+        observer
+            .scope(crate::native_api::flows::dns::scope_api(
+                Arc::downgrade(&native.dns),
+                lease.run(std::pin::pin!(async {
+                    let observer = honk_outbound::runtime::flow_observation::current().unwrap();
+                    let plan = observer.sync_scope(|| {
+                        resolve_outbound_plan_for_target(
+                            config,
+                            manager,
+                            "catalog-root",
+                            &score_reload_context(),
+                            OutboundConstraint::Any,
+                        )
+                    });
+                    let selections = crate::native_api::flows::dns::selection_evaluated(
+                        plan.observation.as_deref(),
+                    );
+                    assert_eq!(
+                        selections[0].member_id.as_deref(),
+                        Some(honk_config::config::DIRECT_NODE_ID.to_string().as_str()),
+                    );
+                    (
+                        observer.context().generation,
+                        selections[0].group_id.clone(),
+                    )
+                })),
+            ))
+            .await
+            .unwrap()
+    }
+
+    let mut config = Config::default();
+    config.ensure_builtin_nodes();
+    config.global.nfqueue_enable = false;
+    config.experimental.native_api.enabled = true;
+    config.experimental.native_api.allow_anonymous_loopback = true;
+    config.groups.push(honk_config::group::Group {
+        name: "catalog-root".into(),
+        nodes: vec![
+            honk_config::config::DIRECT_NODE_ID,
+            honk_config::config::BLOCK_NODE_ID,
+        ],
+        ..Default::default()
+    });
+    let cp = control_plane(config.clone());
+    let native = cp.native.as_ref().unwrap();
+    let provider = cp.dns_controller.runtime_provider();
+    let old_lease = provider.try_acquire().unwrap();
+    let old_manager = cp.group_manager.read().clone();
+    let old_id = native.catalog.snapshot().groups["catalog-root"].clone();
+    assert_eq!(
+        observed_selection(native, &old_lease, &config, &old_manager, 0).await,
+        (0, old_id.clone()),
+    );
+    config.global.check_tolerance_ms += 1;
+    assert!(
+        cp.apply_runtime_config(config.clone(), Default::default(), &DrainTracker::new())
+            .await
+            .accepted()
+    );
+    let unchanged_generation = provider.current_generation().get();
+    assert_eq!(
+        cp.apply_runtime_config(config.clone(), Default::default(), &DrainTracker::new())
+            .await,
+        ReloadOutcome::Noop {
+            generation: unchanged_generation
+        },
+    );
+
+    let mut removed = config.clone();
+    removed.groups.clear();
+    assert!(
+        cp.apply_runtime_config(removed.clone(), Default::default(), &DrainTracker::new())
+            .await
+            .accepted()
+    );
+    assert!(
+        cp.apply_runtime_config(config.clone(), Default::default(), &DrainTracker::new())
+            .await
+            .accepted()
+    );
+    let active_generation = provider.current_generation().get();
+    let current_lease = provider.try_acquire().unwrap();
+    let current_manager = cp.group_manager.read().clone();
+    let current_id = native.catalog.snapshot().groups["catalog-root"].clone();
+    assert_ne!(current_id, old_id);
+    assert_eq!(
+        observed_selection(native, &old_lease, &config, &old_manager, active_generation).await,
+        (0, old_id),
+    );
+    assert_eq!(
+        observed_selection(
+            native,
+            &current_lease,
+            &config,
+            &current_manager,
+            active_generation
+        )
+        .await,
+        (active_generation, current_id.clone()),
+    );
+
+    removed.routing = changed_routing_config().routing;
+    cp.ebpf
+        .write()
+        .await
+        .inject_routing_fault(RoutingPushPhase::Root, 1)
+        .unwrap();
+    assert_eq!(
+        cp.apply_runtime_config(removed, Default::default(), &DrainTracker::new())
+            .await,
+        ReloadOutcome::Rejected,
+    );
+    assert_eq!(
+        observed_selection(
+            native,
+            &current_lease,
+            &config,
+            &current_manager,
+            active_generation
+        )
+        .await,
+        (active_generation, current_id),
+    );
+    assert_eq!(provider.current_generation().get(), active_generation);
+    drop(old_lease);
+    drop(current_lease);
+    provider.shutdown().await;
+}
+
 #[tokio::test]
 async fn semantic_domain_reload_replaces_matching_predicates() {
     let cp = test_cp().await;

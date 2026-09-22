@@ -169,6 +169,8 @@ impl GroupManager {
         effects: SelectionEffects,
     ) -> Candidate<'a> {
         let tolerance = Duration::from_millis(group.tolerance.max(1));
+        observation::metric("sorting_latency", Some(tolerance.as_secs_f64() * 1000.0));
+        observation::reason("lowest_latency");
 
         // Without real UDP ranking evidence, keep the TCP-chosen member.
         // Synthetic dial failures alone must not disable this mirror.
@@ -191,6 +193,9 @@ impl GroupManager {
             if let Some(entry) = tcp_entry
                 && let Some(c) = candidates.iter().find(|c| c.tag() == entry.tag)
             {
+                observation::reason("udp_tcp_mirror");
+                observation::metric("tcp_selection", None);
+                observation::previous_tag(self, group, &entry.tag);
                 if effects.applies()
                     && self.cache_urltest_selection(group, network, c, entry.latency)
                 {
@@ -206,7 +211,10 @@ impl GroupManager {
 
         {
             let cache = self.urltest_cache.read();
-            if let Some(current) = cache.get(&group.name).and_then(|sel| sel.get(network))
+            if let Some(current) = cache
+                .get(&group.name)
+                .and_then(|sel| sel.get(network))
+                .inspect(|current| observation::previous_tag(self, group, &current.tag))
                 && let Some(pos) = candidates.iter().position(|c| c.tag() == current.tag)
             {
                 let best_latency = self.node_latency(
@@ -239,6 +247,7 @@ impl GroupManager {
                     )
                     && best_latency.saturating_add(tolerance) >= current_latency
                 {
+                    observation::reason("tolerance_held");
                     return candidates[pos].clone();
                 }
             }
@@ -274,11 +283,13 @@ impl GroupManager {
         network: SelectionNetwork,
         effects: SelectionEffects,
     ) -> Candidate<'a> {
+        observation::reason("round_robin");
         let Some(counter) = self
             .lb_counters
             .get(&group.name)
             .map(|counters| &counters[network.slot()])
         else {
+            observation::reason("first_member");
             return candidates[0].clone();
         };
         let cursor = if effects.applies() {
@@ -305,13 +316,16 @@ impl GroupManager {
         network: SelectionNetwork,
         effects: SelectionEffects,
     ) -> Candidate<'a> {
+        observation::reason("first_alive");
         {
             let cache = self.fallback_cache.read();
             if let Some(pinned) = cache
                 .get(&group.name)
                 .and_then(|pins| pins[network.slot()].as_deref())
+                .inspect(|pinned| observation::previous_tag(self, group, pinned))
                 && let Some(c) = candidates.iter().find(|c| c.tag() == pinned)
             {
+                observation::reason("pinned_alive");
                 return c.clone();
             }
         }
@@ -338,8 +352,11 @@ impl GroupManager {
         candidates
             .iter()
             .min_by_key(|c| {
+                let demoted =
+                    self.failure_demoted(c.node, network, ipver, group.check_url.as_deref());
+                observation::latency_tier(c, demoted);
                 (
-                    self.failure_demoted(c.node, network, ipver, group.check_url.as_deref()),
+                    demoted,
                     self.node_latency(c.node, network, ipver, group.check_url.as_deref(), c.tag()),
                 )
             })
@@ -415,7 +432,9 @@ impl GroupManager {
                         .and_then(|a| a.get_moving_average(node.id, ProbeDomain::DnsUdp, ipver))
                 }),
         };
-        latency.unwrap_or(Duration::MAX)
+        let latency = latency.unwrap_or(Duration::MAX);
+        observation::latency(node.id, tag, latency);
+        latency
     }
 
     /// Order candidates by (network-aware) latency, lowest first.
@@ -427,6 +446,7 @@ impl GroupManager {
         check_url: Option<&str>,
     ) -> Vec<Candidate<'a>> {
         candidates.sort_by_key(|c| self.node_latency(c.node, network, ipver, check_url, c.tag()));
+        observation::ordered(&candidates);
         candidates
     }
 }

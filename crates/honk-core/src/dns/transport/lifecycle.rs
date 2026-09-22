@@ -163,7 +163,9 @@ impl<T> LifecycleSlot<T> {
         }
     }
 
-    pub(crate) async fn acquire<F, Fut>(&self, build: F) -> anyhow::Result<Arc<T>>
+    /// The reuse flag includes callers coalesced behind another caller's build.
+    /// Acquiring a pool wrapper is not evidence of a physical connection.
+    pub(crate) async fn acquire<F, Fut>(&self, build: F) -> anyhow::Result<(Arc<T>, bool)>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = anyhow::Result<T>>,
@@ -182,7 +184,7 @@ impl<T> LifecycleSlot<T> {
                     return Err(anyhow::Error::new(failure.error.clone()));
                 }
                 match &inner.state {
-                    SlotState::Ready(value) => return Ok(Arc::clone(value)),
+                    SlotState::Ready(value) => return Ok((Arc::clone(value), true)),
                     SlotState::Building { generation } => {
                         waited_generation = Some(*generation);
                         None
@@ -217,7 +219,7 @@ impl<T> LifecycleSlot<T> {
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("initializer was already consumed"))?;
             match initializer().await {
-                Ok(value) => return Ok(guard.publish(value)),
+                Ok(value) => return Ok((guard.publish(value), false)),
                 Err(error) => {
                     let error = SharedError::new(error);
                     guard.fail(error.clone());
@@ -282,6 +284,92 @@ impl<T> LifecycleSlot<T> {
             notified.await;
         };
         self.finish_close(value, teardown).await;
+    }
+}
+
+pub(super) fn attached() {
+    #[cfg(feature = "native-api")]
+    if let Some(observer) = honk_outbound::runtime::flow_observation::current() {
+        observer.publish(
+            honk_outbound::runtime::flow_observation::FlowEvent::TransportAttached {
+                server_addr: None,
+                resolution_location: "unknown",
+            },
+        );
+    }
+}
+
+pub(super) struct SessionObservation {
+    #[cfg(feature = "native-api")]
+    observer: Option<honk_outbound::runtime::flow_observation::FlowObserver>,
+    finished: bool,
+}
+
+impl SessionObservation {
+    pub(super) fn start() -> Self {
+        Self {
+            #[cfg(feature = "native-api")]
+            observer: honk_outbound::runtime::flow_observation::current(),
+            finished: false,
+        }
+    }
+
+    pub(super) fn record(&self, _reason: &'static str, _error: Option<&'static str>) {
+        #[cfg(feature = "native-api")]
+        if let Some(observer) = &self.observer {
+            observer.publish(
+                honk_outbound::runtime::flow_observation::FlowEvent::Session {
+                    reason: _reason,
+                    error: _error,
+                },
+            );
+        }
+    }
+
+    pub(super) fn finish<T>(
+        mut self,
+        result: anyhow::Result<T>,
+        _success: &'static str,
+    ) -> anyhow::Result<T> {
+        #[cfg(feature = "native-api")]
+        if self.observer.is_some() {
+            let cancelled = result.as_ref().err().is_some_and(|error| {
+                error.chain().any(|cause| {
+                    matches!(
+                        cause.downcast_ref::<honk_outbound::proxy::PacketRejection>(),
+                        Some(honk_outbound::proxy::PacketRejection::Cancelled)
+                    )
+                })
+            });
+            self.record(
+                if result.is_ok() {
+                    _success
+                } else if cancelled {
+                    "dns_session_ready_cancelled"
+                } else {
+                    "dns_session_ready_failed"
+                },
+                result.as_ref().err().map(|error| {
+                    if cancelled {
+                        "cancelled"
+                    } else if honk_outbound::proxy::is_packet_rejection(error) {
+                        "local_refusal"
+                    } else {
+                        "upstream_failed"
+                    }
+                }),
+            );
+        }
+        self.finished = true;
+        result
+    }
+}
+
+impl Drop for SessionObservation {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.record("dns_session_ready_cancelled", Some("cancelled"));
+        }
     }
 }
 

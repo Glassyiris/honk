@@ -80,7 +80,7 @@ async fn quic_connect(
     Option<honk_outbound::quic::PacketTransportEndpoint>,
 )> {
     let deadline = tokio::time::Instant::now() + budget;
-    let (connecting, owner) = if dial.proxy.is_some() {
+    let owner = if dial.proxy.is_some() {
         let transport = dial.dial_packet_transport_until(addr, deadline).await?;
         let owner = honk_outbound::quic::packet_transport_endpoint_with_metrics(
             transport,
@@ -89,22 +89,42 @@ async fn quic_connect(
             Some(&direct_endpoint.tasks),
         )
         .map_err(|error| anyhow::anyhow!("{label} packet endpoint: {error}"))?;
-        let connecting = owner
-            .endpoint()
-            .connect_with(config.clone(), addr, sni)
-            .map_err(|e| anyhow::anyhow!("{label} connect_with: {e}"))?;
-        (connecting, Some(owner))
+        Some(owner)
     } else {
-        let endpoint = direct_endpoint.get(addr.is_ipv6()).await?;
+        None
+    };
+    let direct;
+    let endpoint = if let Some(owner) = &owner {
+        owner.endpoint()
+    } else {
+        direct = direct_endpoint.get(addr.is_ipv6()).await?;
+        &direct
+    };
+    #[cfg(feature = "native-api")]
+    let mut observation =
+        honk_outbound::runtime::flow_observation::TransportAttempt::start(Some(addr), "unknown");
+    let handshake = async {
         let connecting = endpoint
             .connect_with(config.clone(), addr, sni)
             .map_err(|e| anyhow::anyhow!("{label} connect_with: {e}"))?;
-        (connecting, None)
-    };
-    let connection = tokio::time::timeout_at(deadline, connecting)
-        .await
-        .map_err(|_| anyhow::anyhow!("{label} handshake timed out"))?
-        .map_err(|e| anyhow::anyhow!("{label} handshake: {e}"))?;
+        tokio::time::timeout_at(deadline, connecting)
+            .await
+            .map_err(|_| anyhow::anyhow!("{label} handshake timed out"))?
+            .map_err(|e| anyhow::anyhow!("{label} handshake: {e}"))
+    }
+    .await;
+    #[cfg(feature = "native-api")]
+    if let Some(observation) = &mut observation {
+        observation.finish(
+            if handshake.is_ok() {
+                "succeeded"
+            } else {
+                "failed"
+            },
+            handshake.as_ref().err().map(|_| "quic_connect_failed"),
+        );
+    }
+    let connection = handshake?;
     Ok((connection, owner))
 }
 
@@ -135,3 +155,6 @@ pub(super) async fn quic_connect_endpoint(
     })
     .await
 }
+
+#[cfg(all(test, feature = "native-api"))]
+mod tests;

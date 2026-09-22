@@ -57,7 +57,8 @@ async fn native_shared_source_idle_keeps_reply_evidence_per_flow_view() {
             honk_outbound::alive::IpVersion::V4,
             None,
         );
-        endpoint.set_native_flow(Some(flow), &pool);
+        endpoint.set_native_observer(flow.observer(7, None, "dial_target"));
+        endpoint.set_native_flow(Some(flow), &pool, None);
         let endpoint = Arc::new(endpoint);
         assert!(lease.commit_ready(Arc::clone(&endpoint)));
         owner_ids.push(endpoint.source_owner_id().unwrap());
@@ -71,6 +72,12 @@ async fn native_shared_source_idle_keeps_reply_evidence_per_flow_view() {
     let first = next_data_frame(&mut events, &mut replies).await;
     endpoints[1].send_packet(b"second", false).await.unwrap();
     let second = next_data_frame(&mut events, &mut replies).await;
+    endpoints[0].send_packet(b"same-flow", false).await.unwrap();
+    let repeated = next_data_frame(&mut events, &mut replies).await;
+    assert_eq!(
+        (repeated.connection, repeated.session_id),
+        (first.connection, first.session_id)
+    );
     assert_eq!(
         (first.connection, first.session_id),
         (second.connection, second.session_id)
@@ -92,19 +99,28 @@ async fn native_shared_source_idle_keeps_reply_evidence_per_flow_view() {
     tokio::task::yield_now().await;
     tokio::time::pause();
     tokio::time::advance(REPLY_IDLE_TIMEOUT).await;
+    let downloaded: Vec<_> = endpoints
+        .iter()
+        .map(|endpoint| endpoint.byte_counters().1.load(Ordering::Relaxed))
+        .collect();
+    drop(endpoints);
     for _ in 0..2 {
         let removal = removed_rx.recv().await.unwrap();
-        assert!(pool.complete_removal(
-            removal.client,
-            removal.dst,
-            removal.decision_token,
-            removal.generation
-        ));
+        let index = targets
+            .iter()
+            .position(|target| *target == removal.dst)
+            .unwrap();
+        let before = api.detail(&ids[index]).await;
+        assert!(
+            before["ended_at"].is_null(),
+            "source retirement is not cleanup acknowledgement"
+        );
+        assert!(pool.wait_removal_io(&removal).await);
+        pool.finish_removal(&removal, true);
     }
     tokio::time::resume();
     assert!(pool.is_empty());
-    assert_eq!(endpoints[0].byte_counters().1.load(Ordering::Relaxed), 5);
-    assert_eq!(endpoints[1].byte_counters().1.load(Ordering::Relaxed), 0);
+    assert_eq!(downloaded, [5, 0]);
 
     for (index, state, reason) in [
         (0, "closed", "reply_idle"),
@@ -113,6 +129,14 @@ async fn native_shared_source_idle_keeps_reply_evidence_per_flow_view() {
         let detail = api.detail(&ids[index]).await;
         assert_eq!(detail["state"], state);
         let steps = detail["trace"]["steps"].as_array().unwrap();
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step["data"]["milestone"] == "target_request_sent")
+                .count(),
+            1,
+            "each endpoint context records its own first target send, not the shared owner",
+        );
         let terminal: Vec<_> = steps
             .iter()
             .filter(|step| step["data"]["milestone"] == "terminal")

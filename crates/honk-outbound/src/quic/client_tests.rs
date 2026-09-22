@@ -698,3 +698,106 @@ async fn native_production_close_drains_cancelled_quic_handshake() {
             .is_err()
     );
 }
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn observed_quic_reuse_is_not_a_physical_attempt_and_cancel_settles_once() {
+    use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let observe = |flow_id| {
+        let events = Arc::clone(&events);
+        FlowObserver::new(
+            FlowContext {
+                flow_id,
+                generation: 1,
+                attempt_id: Some(uuid::Uuid::new_v4()),
+                lookup_id: None,
+                dns_purpose: "proxy_server",
+            },
+            Arc::new(move |context, event| events.lock().push((context, event))),
+        )
+    };
+    let first = observe(uuid::Uuid::new_v4());
+    let second = observe(uuid::Uuid::new_v4());
+    let (endpoint, address) = testutil::server_endpoint(&[b"h3"], true).unwrap();
+    let accepted = tokio::spawn({
+        let endpoint = endpoint.clone();
+        async move { endpoint.accept().await.unwrap().await.unwrap() }
+    });
+    let client = test_client(address.port()).await;
+    let (connection, _) = first
+        .scope(client.connection_with(Duration::from_secs(2), |_| async { Ok(()) }))
+        .await
+        .unwrap();
+    let server = accepted.await.unwrap();
+    let (reused, _) = second
+        .scope(client.connection_with(Duration::from_secs(2), |_| async {
+            panic!("cached connection must not run setup")
+        }))
+        .await
+        .unwrap();
+    assert_eq!(connection.stable_id(), reused.stable_id());
+    {
+        let events = events.lock();
+        let physical: Vec<_> = events
+            .iter()
+            .filter_map(|(context, event)| match event {
+                FlowEvent::Transport {
+                    attempt_id, status, ..
+                } => Some((context, attempt_id, *status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(physical.len(), 2);
+        assert_eq!(physical[0].2, "started");
+        assert_eq!(physical[1].2, "succeeded");
+        assert_eq!(physical[0].1, physical[1].1);
+        assert_ne!(Some(*physical[0].1), physical[0].0.attempt_id);
+        assert!(
+            physical
+                .iter()
+                .all(|(context, _, _)| context.flow_id == first.context().flow_id)
+        );
+        assert!(events.iter().any(|(context, event)| {
+            context.flow_id == second.context().flow_id
+                && matches!(event, FlowEvent::TransportAttached { server_addr: Some(addr), .. } if *addr == address)
+        }));
+        assert!(!events.iter().any(|(_, event)| matches!(
+            event,
+            FlowEvent::Milestone {
+                milestone: "target_confirmed" | "target_request_sent"
+            }
+        )));
+    }
+    connection.close(VarInt::from_u32(0), b"finished");
+    drop(server);
+    client.force_close().await;
+    endpoint.close(VarInt::from_u32(0), b"finished");
+
+    events.lock().clear();
+    let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = test_client(blackhole.local_addr().unwrap().port()).await;
+    let mut pending = Box::pin(
+        first.scope(client.connection_with(Duration::from_secs(10), |_| async { Ok(()) })),
+    );
+    let mut packet = [0; 2048];
+    tokio::select! {
+        _ = &mut pending => panic!("blackhole handshake unexpectedly completed"),
+        result = blackhole.recv(&mut packet) => { result.unwrap(); }
+    }
+    drop(pending);
+    let physical: Vec<_> = events
+        .lock()
+        .iter()
+        .filter_map(|(_, event)| match event {
+            FlowEvent::Transport {
+                attempt_id, status, ..
+            } => Some((*attempt_id, *status)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(physical.len(), 2);
+    assert_eq!(physical[0].0, physical[1].0);
+    assert_eq!((physical[0].1, physical[1].1), ("started", "cancelled"));
+    client.force_close().await;
+}

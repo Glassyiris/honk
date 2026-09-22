@@ -237,6 +237,11 @@ impl ControlPlane {
         }
 
         let config_unchanged = effective_config_unchanged(current_config.as_ref(), &mut new_config);
+        #[cfg(feature = "native-api")]
+        let prepared_catalog = self
+            .native
+            .as_ref()
+            .map(|native| native.catalog.prepare(&new_config));
         let current_dns_forwarder = self.dns_controller.forwarder();
         let current_dns_router = current_dns_forwarder.routing_snapshot();
         #[cfg(feature = "native-api")]
@@ -298,7 +303,9 @@ impl ControlPlane {
                     self.diagnostics.write().buckets.apply(diagnostic_update);
                     #[cfg(feature = "native-api")]
                     if let Some(native) = &self.native {
-                        native.catalog.install(&new_config);
+                        native
+                            .catalog
+                            .install_prepared(prepared_catalog.expect("native candidate catalog"));
                     }
                 }
                 #[cfg(feature = "native-api")]
@@ -504,6 +511,16 @@ impl ControlPlane {
                 .get()
                 .saturating_add(1),
         );
+        #[cfg(feature = "native-api")]
+        let prepared_dictionary = self.native.as_ref().and_then(|native| {
+            crate::native_api::flows::kernel::KernelTraceDictionary::prepare(
+                &native.instance_id,
+                generation.get(),
+                &new_router,
+                &new_config,
+                &new_plan,
+            )
+        });
         let old_projection_snapshot = {
             let current = self.dns_controller.runtime_provider().current();
             Arc::clone(current.routing_projection())
@@ -521,6 +538,10 @@ impl ControlPlane {
                 outbound_runtime: Some(Arc::clone(&new_runtime_registry)),
                 transport: new_upstream_pool,
             });
+        #[cfg(feature = "native-api")]
+        if let Some(identity) = &prepared_catalog {
+            new_runtime.bind_flow_catalog(Arc::clone(identity));
+        }
 
         let route_count = new_router.route_count();
         let datapath_flags = if let Some(handle) = self.datapath_flags.clone() {
@@ -732,7 +753,11 @@ impl ControlPlane {
                         if replaces_sources {
                             native.settings.activate(native, &config_guard);
                         }
-                        native.committed(&config_guard, previous_generation, generation.get());
+                        native.committed(
+                            prepared_catalog.expect("native candidate catalog"),
+                            previous_generation,
+                            generation.get(),
+                        );
                     }
                 }
                 if let Some(authorizations) = authorizations {
@@ -743,6 +768,10 @@ impl ControlPlane {
                 *outbound_guard = new_outbound_id_map;
                 if routing_publication_needed {
                     *plan_guard = Arc::clone(&new_plan);
+                    #[cfg(feature = "native-api")]
+                    if let Some(dictionary) = prepared_dictionary {
+                        ebpf.bind_kernel_trace_dictionary(dictionary);
+                    }
                 }
                 // The projection worker takes eBPF before its generation fence;
                 // publish under both locks so an old batch cannot enter this snapshot.
@@ -961,6 +990,19 @@ impl ControlPlane {
                 .checked_add(1)
                 .ok_or_else(invalid)?,
         );
+        let prepared_catalog = self
+            .native
+            .as_ref()
+            .map(|native| native.catalog.prepare(&config));
+        let prepared_dictionary = self.native.as_ref().and_then(|native| {
+            crate::native_api::flows::kernel::KernelTraceDictionary::prepare(
+                &native.instance_id,
+                generation.get(),
+                &pinned_router,
+                &config,
+                &plan,
+            )
+        });
         let projection = Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
             generation.get(),
             pinned_router,
@@ -974,6 +1016,9 @@ impl ControlPlane {
                 outbound_runtime: Some(Arc::clone(&runtime)),
                 transport,
             });
+        if let Some(identity) = &prepared_catalog {
+            candidate.bind_flow_catalog(Arc::clone(identity));
+        }
         let published = {
             let _router = self.router.write().await;
             let mut current = self.config.write().await;
@@ -1002,7 +1047,11 @@ impl ControlPlane {
                         previous
                     };
                     if let Some(native) = &self.native {
-                        native.committed(&current, previous_generation, generation.get());
+                        native.committed(
+                            prepared_catalog.expect("native candidate catalog"),
+                            previous_generation,
+                            generation.get(),
+                        );
                     }
                     install_interrupt_callback(
                         &manager,
@@ -1013,6 +1062,9 @@ impl ControlPlane {
                         self.native.as_ref(),
                     );
                     projection_publication.commit(projection, Some(learned));
+                    if let Some(dictionary) = prepared_dictionary {
+                        backend.bind_kernel_trace_dictionary(dictionary);
+                    }
                     true
                 }
             }

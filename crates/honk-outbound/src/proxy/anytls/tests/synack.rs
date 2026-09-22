@@ -379,3 +379,111 @@ async fn synack_before_wire_write_settles_the_open() {
     assert_eq!(&reply, b"open");
     assert!(!session.is_closed());
 }
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn target_evidence_is_scoped_to_sid_and_uot_ack_is_not_target_confirmation() {
+    use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let observe = |flow_id| {
+        let events = Arc::clone(&events);
+        FlowObserver::new(
+            FlowContext {
+                flow_id,
+                generation: 1,
+                attempt_id: None,
+                lookup_id: None,
+                dns_purpose: "proxy_server",
+            },
+            Arc::new(move |context, event| {
+                if let FlowEvent::Milestone { milestone } = event {
+                    events.lock().push((context.flow_id, milestone));
+                }
+            }),
+        )
+    };
+    let first = observe(uuid::Uuid::new_v4());
+    let second = observe(uuid::Uuid::new_v4());
+    let udp = observe(uuid::Uuid::new_v4());
+    let (session, mut server) = establish_test_session("127.0.0.1:443").await;
+    expect_handshake(&mut server).await;
+    let mut first_stream = first
+        .scope(
+            session.open_stream_direct(vec![1, 1, 1, 1, 1, 0, 80], session.try_reserve().unwrap()),
+        )
+        .await
+        .unwrap();
+    let mut second_stream = second
+        .scope(
+            session.open_stream_direct(vec![1, 2, 2, 2, 2, 0, 80], session.try_reserve().unwrap()),
+        )
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        read_frame(&mut server).await.unwrap();
+    }
+    write_frame(&mut server, CMD_SYNACK, second_stream.sid, b"refused")
+        .await
+        .unwrap();
+    assert!(second_stream.read_u8().await.is_err());
+    let (command, sid, _) = read_frame(&mut server).await.unwrap();
+    assert_eq!((command, sid), (CMD_FIN, second_stream.sid));
+    write_frame(&mut server, CMD_SYNACK, first_stream.sid, &[])
+        .await
+        .unwrap();
+    write_frame(&mut server, CMD_PSH, first_stream.sid, b"x")
+        .await
+        .unwrap();
+    assert_eq!(first_stream.read_u8().await.unwrap(), b'x');
+
+    let transport = udp
+        .scope(Arc::clone(&session).open_packet(
+            session.try_reserve().unwrap(),
+            "8.8.8.8:53".parse().unwrap(),
+            None,
+        ))
+        .await
+        .unwrap_or_else(|_| panic!("UoT open failed"));
+    assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_SYN);
+    assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_PSH);
+    write_frame(&mut server, CMD_SYNACK, transport.sid, &[])
+        .await
+        .unwrap();
+    assert!(
+        !events
+            .lock()
+            .iter()
+            .any(|(id, _)| *id == udp.context().flow_id)
+    );
+    let (sent, frame) = tokio::join!(
+        transport.send_packet_confirmed(b"dns"),
+        read_frame(&mut server),
+    );
+    sent.unwrap();
+    assert_eq!(frame.unwrap().0, CMD_PSH);
+    let events = events.lock();
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|(id, event)| { (*id == first.context().flow_id).then_some(*event) })
+            .collect::<Vec<_>>(),
+        ["target_request_sent", "target_confirmed"]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|(id, event)| { (*id == second.context().flow_id).then_some(*event) })
+            .collect::<Vec<_>>(),
+        ["target_request_sent"]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|(id, event)| { (*id == udp.context().flow_id).then_some(*event) })
+            .collect::<Vec<_>>(),
+        ["target_request_sent"]
+    );
+    drop(events);
+    drop((transport, first_stream, second_stream));
+    session.close();
+}

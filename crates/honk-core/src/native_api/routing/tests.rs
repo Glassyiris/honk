@@ -404,3 +404,252 @@ fn trace_input_rejects_unknown_fields_and_invalid_metadata() {
         assert!(serde_json::from_value::<TraceInput>(value).is_err());
     }
 }
+
+fn connection() -> crate::routing::ConnectionInfo {
+    crate::routing::ConnectionInfo {
+        domain: None,
+        dst_ip: "198.51.100.20".parse().unwrap(),
+        dst_port: 443,
+        src_ip: "192.0.2.10".parse().unwrap(),
+        src_port: 50000,
+        protocol: "tcp",
+        process_name: None,
+        mac: None,
+        dscp: None,
+    }
+}
+
+#[test]
+fn observed_route_retains_real_priority_and_short_circuit_outcomes() {
+    let router = Router::new(
+        &[
+            rule(ip(), "later", 20),
+            rule(
+                RoutingCondition {
+                    domain: vec!["absent.test".into()],
+                    ..ip()
+                },
+                "miss",
+                0,
+            ),
+            rule(ip(), "winner", 10),
+        ],
+        "fallback",
+    )
+    .unwrap();
+    let observed = router.route_full_observed(&connection(), None, 64);
+    assert!(!observed.truncated);
+    assert_eq!(observed.matched.unwrap().outbound_name, "winner");
+    let evaluated = observed_rule_evaluations("instance", 7, &router, &observed.rules);
+    assert_eq!(
+        evaluated.iter().map(|rule| rule.result).collect::<Vec<_>>(),
+        ["not_matched", "matched", "skipped", "skipped"]
+    );
+    assert_eq!(
+        evaluated[0]
+            .conditions
+            .iter()
+            .map(|condition| condition.result)
+            .collect::<Vec<_>>(),
+        ["not_matched", "skipped"]
+    );
+    assert_eq!(evaluated[1].rule_id, rule_id("instance", 7, Some(1)));
+    assert_eq!(evaluated[1].conditions[0].result, "matched");
+    assert_eq!(evaluated[2].conditions[0].result, "skipped");
+    assert_eq!(evaluated[3].rule_id, rule_id("instance", 7, None));
+}
+
+#[test]
+fn observed_route_preserves_empty_rule_miss_and_fallback() {
+    let router = Router::new(
+        &[
+            rule(RoutingCondition::default(), "empty", 0),
+            rule(process("curl"), "process", 1),
+        ],
+        "fallback",
+    )
+    .unwrap();
+    let observed = router.route_full_observed(&connection(), None, 4);
+    assert!(observed.matched.is_none());
+    assert!(!observed.truncated);
+    assert_eq!(
+        observed
+            .rules
+            .iter()
+            .map(|rule| rule.result)
+            .collect::<Vec<_>>(),
+        [
+            MatchResult::NotMatched,
+            MatchResult::NotMatched,
+            MatchResult::Matched
+        ]
+    );
+    assert!(observed.rules[0].conditions.is_empty());
+    let evaluated = observed_rule_evaluations("instance", 7, &router, &observed.rules);
+    assert_eq!(evaluated[2].rule_id, rule_id("instance", 7, None));
+    assert_eq!(evaluated[2].expression, "fallback");
+    let empty = Router::new(&[], "direct").unwrap();
+    let observed = empty.route_full_observed(&connection(), None, 1);
+    assert!(observed.matched.is_none());
+    assert!(!observed.truncated);
+    assert_eq!(observed.rules[0].result, MatchResult::Matched);
+}
+
+#[test]
+fn observed_route_uses_production_absence_before_negation_not_simulation_unknowns() {
+    let router = Router::new(
+        &[
+            rule(
+                RoutingCondition {
+                    domain: vec!["example.test".into()],
+                    process_name: vec!["curl".into()],
+                    mac: vec!["aa:bb:cc:dd:ee:ff".into()],
+                    dscp: vec!["8".into()],
+                    ..Default::default()
+                },
+                "present",
+                0,
+            ),
+            rule(
+                RoutingCondition {
+                    not: RoutingNotCondition {
+                        domain: vec!["example.test".into()],
+                        process_name: vec!["curl".into()],
+                        mac: vec!["aa:bb:cc:dd:ee:ff".into()],
+                        dscp: vec!["8".into()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                "absent",
+                1,
+            ),
+        ],
+        "fallback",
+    )
+    .unwrap();
+    let observed = router.route_full_observed(&connection(), None, 64);
+    assert_eq!(observed.matched.unwrap().outbound_name, "absent");
+    assert_eq!(
+        observed.rules[0].conditions,
+        [
+            MatchResult::NotMatched,
+            MatchResult::Skipped,
+            MatchResult::Skipped,
+            MatchResult::Skipped
+        ]
+    );
+    assert_eq!(observed.rules[1].conditions, [MatchResult::Matched; 4]);
+    let evaluated = observed_rule_evaluations("instance", 7, &router, &observed.rules);
+    assert!(evaluated.iter().all(|rule| {
+        rule.missing_inputs.is_empty()
+            && rule
+                .conditions
+                .iter()
+                .all(|condition| condition.missing_inputs.is_empty())
+    }));
+    assert_eq!(trace(&router, &destination()).decision, "indeterminate");
+}
+
+#[test]
+fn observed_route_uses_authoritative_domain_bitmap_and_preserves_action() {
+    let positive = rule(
+        RoutingCondition {
+            domain: vec!["example.test".into()],
+            ..Default::default()
+        },
+        "proxy",
+        0,
+    );
+    let mut negative = rule(
+        RoutingCondition {
+            not: RoutingNotCondition {
+                domain: vec!["example.test".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        "direct",
+        1,
+    );
+    negative.must = true;
+    negative.mark = 42;
+    let router = Router::new(&[positive, negative], "fallback").unwrap();
+    let mut conn = connection();
+    conn.domain = Some("example.test".into());
+    let zero = router.domain_bitmap("other.test").unwrap();
+    let observed = router.route_full_observed(&conn, Some(&zero), 64);
+    let matched = observed.matched.unwrap();
+    assert_eq!(
+        (matched.outbound_name, matched.must, matched.mark),
+        ("direct", true, 42)
+    );
+    assert_eq!(observed.rules[0].conditions, [MatchResult::NotMatched]);
+    assert_eq!(observed.rules[1].conditions, [MatchResult::Matched]);
+    conn.domain = None;
+    let positive = router.domain_bitmap("example.test").unwrap();
+    let observed = router.route_full_observed(&conn, Some(&positive), 64);
+    assert_eq!(observed.matched.unwrap().outbound_name, "proxy");
+    assert_eq!(observed.rules[0].conditions, [MatchResult::Matched]);
+    assert_eq!(observed.rules[1].conditions, [MatchResult::Skipped]);
+}
+
+#[test]
+fn observed_route_budget_only_truncates_evidence_never_decisions() {
+    let mut winner = rule(ip(), "winner", 1);
+    winner.mark = 42;
+    winner.must = true;
+    let router = Router::new(
+        &[
+            rule(
+                RoutingCondition {
+                    domain: vec!["absent.test".into()],
+                    ..ip()
+                },
+                "miss",
+                0,
+            ),
+            winner,
+            rule(ip(), "later", 2),
+        ],
+        "fallback",
+    )
+    .unwrap();
+    let complete = router.route_full_observed(&connection(), None, 64);
+    let required: usize = complete
+        .rules
+        .iter()
+        .map(|rule| 1 + rule.conditions.len())
+        .sum();
+    for budget in 0..=required {
+        let observed = router.route_full_observed(&connection(), None, budget);
+        let matched = observed.matched.unwrap();
+        assert_eq!(
+            (matched.outbound_name, matched.must, matched.mark),
+            ("winner", true, 42)
+        );
+        assert_eq!(observed.truncated, budget < required, "budget={budget}");
+        assert_eq!(
+            observed
+                .rules
+                .iter()
+                .map(|rule| 1 + rule.conditions.len())
+                .sum::<usize>(),
+            budget
+        );
+        for (captured, full) in observed.rules.iter().zip(&complete.rules) {
+            assert_eq!(captured.result, full.result);
+            assert_eq!(
+                captured.conditions,
+                full.conditions[..captured.conditions.len()]
+            );
+        }
+    }
+    let mut miss = connection();
+    miss.dst_ip = "203.0.113.10".parse().unwrap();
+    let observed = router.route_full_observed(&miss, None, 0);
+    assert!(observed.matched.is_none());
+    assert!(observed.rules.is_empty());
+    assert!(observed.truncated);
+    assert_eq!(router.route(&miss), "fallback");
+}

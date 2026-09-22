@@ -5,7 +5,11 @@ use super::*;
 async fn native_log_captures_transparent_udp_completion_with_full_source() {
     let query = query_with_txid("example.com", 0x1111);
     let (controller, _) = test_controller(a_response(&query, [192, 0, 2, 5]), Duration::ZERO);
-    let api = Arc::new(crate::native_api::dns::DnsApi::new("udp-log".into(), true));
+    let api = Arc::new(crate::native_api::dns::DnsApi::new(
+        "udp-log".into(),
+        true,
+        std::sync::Weak::new(),
+    ));
     controller
         .dns_service()
         .attach_observer(Arc::downgrade(&api));

@@ -54,6 +54,11 @@ pub struct MockEbpfBackend {
     descriptor: RoutingPolicyDescriptor,
     next_generation: u64,
     next_domain_map_id: u32,
+    next_trace_policy: u32,
+    #[cfg(feature = "native-api")]
+    trace_dictionaries: crate::native_api::flows::kernel::KernelTraceDictionaries,
+    pub route_witnesses: HashMap<u32, KernelRouteWitness>,
+    next_trace_id: u32,
     /// TCP connection states (TuplesKey → ConnState)
     pub tcp_conn_states: HashMap<[u8; 40], ConnState>,
     /// UDP connection states (TuplesKey → ConnState)
@@ -119,6 +124,25 @@ impl MockEbpfBackend {
     /// Create a new mock backend.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn capture_route_witness(&mut self, mut witness: KernelRouteWitness) -> u32 {
+        if witness.output.flags & ROUTE_TRACE_ENABLED == 0 {
+            return 0;
+        }
+        if self.next_trace_id >= ROUTE_TRACE_LOST - 1 {
+            return ROUTE_TRACE_LOST;
+        }
+        self.next_trace_id += 1;
+        let id = self.next_trace_id;
+        witness.capture_id = id;
+        if self.route_witnesses.len() >= ROUTE_TRACE_CAPACITY as usize
+            && let Some(oldest) = self.route_witnesses.keys().min().copied()
+        {
+            self.route_witnesses.remove(&oldest);
+        }
+        self.route_witnesses.insert(id, witness);
+        id
     }
 
     #[cfg(feature = "reload-bench-counters")]
@@ -579,6 +603,15 @@ impl EbpfBackend for MockEbpfBackend {
                 "mock UDP staging quiescence rejected {token}: {result:?}"
             );
         }
+        if self.routing_generation.is_some() {
+            let generation = self
+                .next_generation
+                .checked_add(1)
+                .filter(|generation| *generation <= DNS_ROUTE_GENERATION_MAX)
+                .ok_or_else(|| anyhow::anyhow!("routing generation counter exhausted"))?;
+            self.next_generation = generation;
+            self.descriptor.generation = generation;
+        }
         Ok(())
     }
 
@@ -601,6 +634,12 @@ impl EbpfBackend for MockEbpfBackend {
             self.active_slot
         );
         let slot = self.active_slot ^ 1;
+        let trace_policy = if plan.trace_enabled() {
+            self.next_trace_policy = self.next_trace_policy.saturating_add(1);
+            self.next_trace_policy
+        } else {
+            0
+        };
         self.take_routing_fault(RoutingPushPhase::DomainRouting)?;
         let domain: HashMap<_, _> = learned_domains
             .iter()
@@ -637,7 +676,7 @@ impl EbpfBackend for MockEbpfBackend {
             features: plan.features,
             generation,
             domain_map_id,
-            reserved: 0,
+            trace_policy,
         };
         self.next_generation = generation;
         self.next_domain_map_id = domain_map_id;
@@ -931,6 +970,39 @@ impl EbpfBackend for MockEbpfBackend {
             .remove(&Self::tuples_key_bytes(key)))
     }
 
+    #[cfg(feature = "native-api")]
+    fn bind_kernel_trace_dictionary(
+        &mut self,
+        dictionary: crate::native_api::flows::kernel::KernelTraceDictionary,
+    ) {
+        if let Some(owner) = &self.routing_generation {
+            self.trace_dictionaries.bind(
+                self.descriptor.trace_policy,
+                owner.fingerprint,
+                dictionary,
+            );
+        }
+    }
+
+    #[cfg(feature = "native-api")]
+    fn capture_kernel_route(
+        &self,
+        key: &TuplesKey,
+        reference: crate::native_api::flows::kernel::KernelRouteReference,
+    ) -> Result<crate::native_api::flows::kernel::CapturedKernelRoute, &'static str> {
+        if reference.trace_id == 0 {
+            return Err("kernel_trace_not_captured");
+        }
+        if reference.trace_id == ROUTE_TRACE_LOST {
+            return Err("kernel_trace_lost");
+        }
+        let witness = self
+            .route_witnesses
+            .get(&reference.trace_id)
+            .ok_or("kernel_trace_sidecar_missing")?;
+        self.trace_dictionaries.capture(witness, key, reference)
+    }
+
     fn cookie_pid_lookup(&self, cookie: u64) -> anyhow::Result<Option<PIDName>> {
         Ok(self.cookie_pids.get(&cookie).copied())
     }
@@ -1164,6 +1236,7 @@ impl EbpfBackend for MockEbpfBackend {
         self.udp_conn_states.clear();
         self.redirect_tracks.clear();
         self.routing_handoffs.get_mut().clear();
+        self.route_witnesses.clear();
         self.cookie_pids.clear();
         self.outbound_alive.clear();
         self.bpf_stats.clear();
@@ -1855,6 +1928,7 @@ mod tests {
                 ..Default::default()
             },
             routing_generation: 0,
+            ..Default::default()
         };
         backend
             .routing_handoffs
@@ -1934,6 +2008,23 @@ mod tests {
         assert_eq!(backend.get_bpf_stats(1).unwrap(), Some(250));
         assert_eq!(backend.get_bpf_stats(99).unwrap(), Some(999));
         assert!(backend.get_bpf_stats(50).unwrap().is_none());
+    }
+
+    #[test]
+    fn trace_capture_exhaustion_and_cleanup_never_reuse_ids() {
+        let mut backend = MockEbpfBackend::new();
+        let mut witness = KernelRouteWitness::default();
+        assert_eq!(backend.capture_route_witness(witness), 0);
+        witness.output.flags = ROUTE_TRACE_ENABLED;
+        let first = backend.capture_route_witness(witness);
+        futures::executor::block_on(backend.cleanup()).unwrap();
+        assert!(backend.capture_route_witness(witness) > first);
+        backend.next_trace_id = ROUTE_TRACE_LOST - 2;
+        assert_eq!(backend.capture_route_witness(witness), ROUTE_TRACE_LOST - 1);
+        backend.route_witnesses.clear();
+        assert_eq!(backend.capture_route_witness(witness), ROUTE_TRACE_LOST);
+        assert_eq!(backend.capture_route_witness(witness), ROUTE_TRACE_LOST);
+        assert!(backend.route_witnesses.is_empty());
     }
 
     #[test]

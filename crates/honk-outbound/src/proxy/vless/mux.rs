@@ -572,6 +572,8 @@ struct MuxResponse {
     error_remaining: Option<usize>,
     error_message: Vec<u8>,
     failed: Option<String>,
+    #[cfg(feature = "native-api")]
+    observer: Option<crate::runtime::flow_observation::FlowObserver>,
 }
 
 fn h2_clean_eof(error: &h2::Error) -> bool {
@@ -588,6 +590,8 @@ impl MuxResponse {
             error_remaining: None,
             error_message: Vec::new(),
             failed: None,
+            #[cfg(feature = "native-api")]
+            observer: crate::runtime::flow_observation::current(),
         }
     }
 
@@ -731,6 +735,10 @@ impl MuxResponse {
             match byte {
                 0 => {
                     self.status_ready = true;
+                    #[cfg(feature = "native-api")]
+                    if let Some(observer) = self.observer.take() {
+                        observer.milestone_once("target_confirmed");
+                    }
                     return Poll::Ready(Ok(()));
                 }
                 1 => self.error_len = Some((0, 0)),
@@ -828,6 +836,8 @@ struct MuxUdpWriter {
     send: h2::SendStream<Bytes>,
     setup: Option<Bytes>,
     pending: bool,
+    #[cfg(feature = "native-api")]
+    request_observer: Option<crate::runtime::flow_observation::FlowObserver>,
 }
 
 struct MuxUdpReader {
@@ -870,6 +880,10 @@ impl VlessMuxUdpTransport {
         };
         writer.pending = true;
         send_owned(&mut writer.send, frame).await?;
+        #[cfg(feature = "native-api")]
+        if let Some(observer) = writer.request_observer.take() {
+            observer.milestone_once("target_request_sent");
+        }
         writer.setup = None;
         writer.pending = false;
         Ok(())
@@ -947,6 +961,8 @@ impl MuxSession for VlessMuxSession {
             send_owned(&mut opened.send, request)
                 .await
                 .map_err(|error| OpenError::Draining(anyhow::Error::new(error)))?;
+            #[cfg(feature = "native-api")]
+            crate::runtime::flow_observation::milestone("target_request_sent");
             Ok(VlessMuxStream {
                 send: MuxSendStream::new(opened.send),
                 response: MuxResponse::new(opened.response),
@@ -970,6 +986,8 @@ impl MuxSession for VlessMuxSession {
                     send: opened.send,
                     setup: Some(setup),
                     pending: false,
+                    #[cfg(feature = "native-api")]
+                    request_observer: crate::runtime::flow_observation::current(),
                 }),
                 reader: tokio::sync::Mutex::new(MuxUdpReader {
                     response: MuxResponse::new(opened.response),

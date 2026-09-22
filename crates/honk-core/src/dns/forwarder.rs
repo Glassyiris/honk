@@ -668,16 +668,21 @@ mod strategy {
 
             // Boxed: breaks the async recursion cycle through resolve_with_context
             // (the sibling uses the preferred qtype, so it never re-enters here).
+            let sibling_options = options.sibling();
             let sibling = Box::pin(self.resolve_inner(
                 &sibling_query,
                 metadata,
                 query.ingress(),
-                &options.sibling(),
+                &sibling_options,
                 mode,
                 None,
-            ))
-            .await
-            .map_err(anyhow::Error::from);
+            ));
+            #[cfg(feature = "native-api")]
+            let sibling = std::pin::pin!(sibling);
+            #[cfg(feature = "native-api")]
+            let sibling =
+                crate::native_api::flows::dns::scope_purpose("family_preference", sibling);
+            let sibling = sibling.await.map_err(anyhow::Error::from);
             Ok(match sibling {
                 Ok(outcome) => response_has_family_ips(outcome.rendered(), preferred_qtype),
                 Err(error) if honk_outbound::proxy::is_packet_rejection(&error) => {

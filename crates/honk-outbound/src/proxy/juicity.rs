@@ -231,6 +231,10 @@ impl JuicityHandler {
         send.write_all(&header)
             .await
             .context("Juicity: send request header")?;
+        #[cfg(feature = "native-api")]
+        if let Some(observer) = crate::runtime::flow_observation::current() {
+            observer.milestone_once("target_request_sent");
+        }
         Ok((send, recv))
     }
     async fn client_for_runtime(
@@ -285,8 +289,12 @@ impl JuicityHandler {
         for _ in 0..2 {
             let (conn, state) = client.connection(connect_timeout).await?;
             state.touch();
+            #[cfg(feature = "native-api")]
+            let observation = crate::session::ObservedSessionOpen::start();
             match Self::open_stream(&conn, NETWORK_UDP, &stream_addr).await {
                 Ok((send, recv)) => {
+                    #[cfg(feature = "native-api")]
+                    observation.finish("session_open_succeeded", None);
                     state.open.fetch_add(1, Ordering::Relaxed);
                     let open = Arc::clone(&state.open);
                     let stream_state = Arc::clone(&state);
@@ -306,6 +314,8 @@ impl JuicityHandler {
                     }));
                 }
                 Err(error) => {
+                    #[cfg(feature = "native-api")]
+                    observation.finish("session_open_failed", Some("session"));
                     client.quic.invalidate(&conn).await;
                     last_error = Some(error);
                 }
@@ -323,9 +333,14 @@ impl WarmableOutbound for JuicityHandler {
         connect_timeout: Duration,
         _requirement: super::WarmRequirement,
     ) -> anyhow::Result<()> {
-        let client = self.client_for_runtime(&runtime).await?;
-        client.connection(connect_timeout).await?;
-        Ok(())
+        let warm = async {
+            let client = self.client_for_runtime(&runtime).await?;
+            client.connection(connect_timeout).await?;
+            Ok(())
+        };
+        #[cfg(feature = "native-api")]
+        let warm = crate::runtime::flow_observation::without(warm);
+        warm.await
     }
 }
 

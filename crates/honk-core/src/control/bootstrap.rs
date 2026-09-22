@@ -215,8 +215,22 @@ impl ControlPlane {
         dns_upstream_pool.set_group_manager_snapshot(Arc::clone(&pinned_groups));
         dns_upstream_pool.set_traffic_router_snapshot(Arc::clone(&pinned_router));
         let initial_routing_plan = Arc::new(Self::compile_routing_plan(&config, &router)?);
+        #[cfg(feature = "native-api")]
+        let initial_dictionary = native.as_ref().and_then(|native| {
+            crate::native_api::flows::kernel::KernelTraceDictionary::prepare(
+                &native.instance_id,
+                0,
+                &router,
+                &config,
+                &initial_routing_plan,
+            )
+        });
         ebpf.publish_routing_plan(&initial_routing_plan, &[])
             .map_err(|error| anyhow::anyhow!("publish initial routing policy: {error:#}"))?;
+        #[cfg(feature = "native-api")]
+        if let Some(dictionary) = initial_dictionary {
+            ebpf.bind_kernel_trace_dictionary(dictionary);
+        }
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));
         let interrupt_groups = config.groups.clone();
@@ -233,6 +247,10 @@ impl ControlPlane {
                 outbound_runtime: Some(outbound_runtime),
                 transport: dns_upstream_pool,
             });
+        #[cfg(feature = "native-api")]
+        if let Some(native) = &native {
+            initial_runtime.bind_flow_catalog(native.catalog.snapshot());
+        }
         let runtime_provider = Arc::new(crate::dns::runtime::DnsServiceProvider::new(
             initial_runtime,
         ));

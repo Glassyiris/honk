@@ -1,5 +1,15 @@
 use super::*;
 
+pub(super) struct TcpDialWinner {
+    pub(super) stream: crate::proxy::ProxyStream,
+    pub(super) node: Node,
+    pub(super) reporter: Option<crate::group::ScoreReporter>,
+    #[cfg(feature = "native-api")]
+    pub(super) attempt_id: Option<uuid::Uuid>,
+    #[cfg(feature = "native-api")]
+    pub(super) observer: Option<honk_outbound::runtime::flow_observation::FlowObserver>,
+}
+
 impl ControlPlaneHandle {
     /// Race the candidate dials: the first success wins, losers are
     /// cancelled, and fresh connections for losers are deposited into the
@@ -24,18 +34,14 @@ impl ControlPlaneHandle {
         cold_urltest: bool,
         #[cfg(feature = "native-api")] selection_chains: &HashMap<uuid::Uuid, Vec<String>>,
         #[cfg(feature = "native-api")] native: &ConnectionObservation,
-    ) -> anyhow::Result<
-        Option<(
-            crate::proxy::ProxyStream,
-            Node,
-            Option<crate::group::ScoreReporter>,
-        )>,
-    > {
+    ) -> anyhow::Result<Option<TcpDialWinner>> {
         anyhow::ensure!(
             !runtime_generation.is_shutdown(),
             "outbound runtime generation is shut down"
         );
         if tokio::time::Instant::now() >= dial_deadline {
+            #[cfg(feature = "native-api")]
+            native.tcp_deadline();
             return Ok(None);
         }
         let ctx = self.clone();
@@ -68,6 +74,10 @@ impl ControlPlaneHandle {
                     }
                     #[cfg(feature = "native-api")]
                     let mut native_attempt = native.attempt(chain, &node, target_domain.as_deref());
+                    #[cfg(feature = "native-api")]
+                    let native_observer = native_attempt
+                        .as_ref()
+                        .and_then(|attempt| attempt.observer());
                     let reporter = Arc::new(parking_lot::Mutex::new(None));
                     let on_start = {
                         let feedback = feedback.get(&node.id).cloned();
@@ -84,7 +94,7 @@ impl ControlPlaneHandle {
                     let start = std::time::Instant::now();
                     let per_dial_timeout = connect_timeout * 3;
                     let result = {
-                        let mut dial = std::pin::pin!(Self::dial_pooled(
+                        let dial = Self::dial_pooled(
                             &ctx.proxy_registry,
                             &ctx.connection_pool,
                             &generation,
@@ -92,7 +102,15 @@ impl ControlPlaneHandle {
                             (target, target_domain.as_deref()),
                             connect_timeout,
                             &scope,
-                        ));
+                        );
+                        #[cfg(feature = "native-api")]
+                        let dial = async {
+                            match &native_observer {
+                                Some(observer) => observer.scope(dial).await,
+                                None => dial.await,
+                            }
+                        };
+                        let mut dial = std::pin::pin!(dial);
                         // Poll the dial before the timer, and keep its pending
                         // acquisitions alive until the timeout is classified.
                         tokio::time::timeout(per_dial_timeout, dial.as_mut())
@@ -127,7 +145,14 @@ impl ControlPlaneHandle {
                     if let Some(attempt) = &mut native_attempt {
                         attempt.tcp_finished(result.as_ref().err(), &node);
                     }
-                    (result, idx, elapsed, node, reporter)
+                    #[cfg(feature = "native-api")]
+                    let native = (
+                        native_attempt.as_ref().map(|attempt| attempt.id()),
+                        native_observer,
+                    );
+                    #[cfg(not(feature = "native-api"))]
+                    let native = ();
+                    (result, idx, elapsed, node, reporter, native)
                 })
                 .catch_unwind(),
             );
@@ -137,12 +162,7 @@ impl ControlPlaneHandle {
         let mut first_err: Option<(String, String)> = None;
         let mut rejection = None;
         let mut timeout_count: usize = 0;
-        let mut winner: Option<(
-            crate::proxy::ProxyStream,
-            usize,
-            Node,
-            Option<crate::group::ScoreReporter>,
-        )> = None;
+        let mut winner = None;
         let mut remaining = set.len();
 
         loop {
@@ -152,7 +172,7 @@ impl ControlPlaneHandle {
             remaining -= 1;
             match tokio::time::timeout_at(dial_deadline, set.next()).await {
                 Ok(Some(task_result)) => match task_result {
-                    Ok((Ok((stream, fresh)), idx, elapsed, node, reporter)) => {
+                    Ok((Ok((stream, fresh)), idx, elapsed, node, reporter, native)) => {
                         ctx.alive_set
                             .report_available_traffic(node.id, ProbeDomain::Tcp, ipver);
                         // Real-traffic degradation fast path: a fresh
@@ -169,10 +189,10 @@ impl ControlPlaneHandle {
                         {
                             ctx.alive_set.notify_check_tcp(node.id);
                         }
-                        winner = Some((stream, idx, node, reporter));
+                        winner = Some((stream, idx, node, reporter, native));
                         break;
                     }
-                    Ok((Err(e), _idx, _elapsed, node, _reporter)) => {
+                    Ok((Err(e), _idx, _elapsed, node, _reporter, _native)) => {
                         debug!("Parallel dial to {} failed: {}", node.name, e);
                         if node.protocol() != honk_config::types::NodeProtocol::Block {
                             ctx.stats.record_error(&outbound, outbound_kind);
@@ -205,6 +225,8 @@ impl ControlPlaneHandle {
                 },
                 Ok(None) => break,
                 Err(_elapsed) => {
+                    #[cfg(feature = "native-api")]
+                    native.tcp_deadline();
                     if runtime_generation.is_shutdown() {
                         for reporter in started_reporters.lock().iter() {
                             reporter.finish(crate::group::ScoreOutcome::Shutdown);
@@ -386,7 +408,15 @@ impl ControlPlaneHandle {
         }
 
         Ok(match winner {
-            Some((stream, _, node, reporter)) => Some((stream, node, reporter)),
+            Some((stream, _, node, reporter, _native)) => Some(TcpDialWinner {
+                stream,
+                node,
+                reporter,
+                #[cfg(feature = "native-api")]
+                attempt_id: _native.0,
+                #[cfg(feature = "native-api")]
+                observer: _native.1,
+            }),
             None => {
                 if let Some((last_msg, last_name)) = last_err {
                     let (first_msg, first_name) =
@@ -603,6 +633,15 @@ impl ControlPlaneHandle {
                     addr,
                     target
                 );
+                #[cfg(feature = "native-api")]
+                if let Some(observer) = honk_outbound::runtime::flow_observation::current() {
+                    observer.publish(
+                        honk_outbound::runtime::flow_observation::FlowEvent::TransportAttached {
+                            server_addr: None,
+                            resolution_location: "reused",
+                        },
+                    );
+                }
                 scope.start();
                 return Ok((stream, false));
             }
@@ -617,6 +656,15 @@ impl ControlPlaneHandle {
             {
                 scope.start();
                 tracing::debug!("Pooled TCP to {} acquired for {}", addr, target);
+                #[cfg(feature = "native-api")]
+                if let Some(observer) = honk_outbound::runtime::flow_observation::current() {
+                    observer.publish(
+                        honk_outbound::runtime::flow_observation::FlowEvent::TransportAttached {
+                            server_addr: tcp.peer_addr().ok(),
+                            resolution_location: "reused",
+                        },
+                    );
+                }
                 let dial =
                     entry
                         .tcp

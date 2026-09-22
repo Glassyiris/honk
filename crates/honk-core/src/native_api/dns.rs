@@ -4,6 +4,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{self, Write},
     net::SocketAddr,
+    sync::Weak,
     time::{Duration, SystemTime},
 };
 
@@ -34,6 +35,8 @@ mod records;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use records::record_type;
+
 pub(super) const MAX_RESPONSE_BYTES: usize = 262_144;
 const TYPES: &[u16] = &[1, 2, 5, 6, 12, 15, 16, 28, 33, 64, 65, 257];
 
@@ -42,16 +45,36 @@ pub(crate) struct DnsApi {
     rate: super::security::RequestRate,
     snapshots: tokio::sync::Mutex<VecDeque<cache::Snapshot>>,
     log: log::LogStore,
+    flows: Weak<super::flows::FlowStore>,
 }
 
 impl DnsApi {
-    pub(crate) fn new(instance_id: String, recording: bool) -> Self {
+    pub(crate) fn new(
+        instance_id: String,
+        recording: bool,
+        flows: Weak<super::flows::FlowStore>,
+    ) -> Self {
         Self {
             log: log::LogStore::new(instance_id.clone(), recording),
             instance: instance_id,
             rate: super::security::RequestRate::new(),
             snapshots: tokio::sync::Mutex::new(VecDeque::new()),
+            flows,
         }
+    }
+
+    pub(crate) fn instance(&self) -> &str {
+        &self.instance
+    }
+
+    pub(crate) fn record_flow(
+        &self,
+        context: honk_outbound::runtime::flow_observation::FlowContext,
+        data: super::flows::record::StepData,
+    ) -> bool {
+        self.flows.upgrade().is_some_and(|flows| {
+            flows.record_step(&context.flow_id.to_string(), Some(context.generation), data)
+        })
     }
     pub(crate) fn set_log_limit(&self, limit: usize) {
         self.log.set_limit(limit);

@@ -168,6 +168,8 @@ pub(super) struct InitializingEndpoint {
     pub(super) selected_node: Mutex<Option<uuid::Uuid>>,
     pub(super) cancelled: AtomicBool,
     pub(super) cancel_notify: Notify,
+    #[cfg(feature = "native-api")]
+    pub(super) native_terminal: std::sync::OnceLock<Arc<retirement::NativeUdpTerminal>>,
 }
 
 impl InitializingEndpoint {
@@ -227,6 +229,8 @@ pub(super) enum EndpointEntry {
         generation: u64,
         token: u32,
         io: Option<Arc<RetirementIo>>,
+        #[cfg(feature = "native-api")]
+        native_terminal: Option<Arc<retirement::NativeUdpTerminal>>,
     },
 }
 
@@ -302,9 +306,73 @@ pub(in crate::control) struct UdpInitLease {
     _initializer_guard: UdpInitializerGuard,
     connection_guard: Option<ActiveConnectionGuard>,
     committed: bool,
+    #[cfg(feature = "native-api")]
+    packet_route: Option<crate::control::udp_ingress::PacketRoute>,
+    #[cfg(feature = "native-api")]
+    packet_trace_id: Option<u32>,
 }
 
 impl UdpInitLease {
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn set_packet_trace_id(&mut self, trace_id: Option<u32>) {
+        self.packet_trace_id =
+            trace_id.filter(|id| *id != 0 && *id != honk_ebpf_common::ROUTE_TRACE_LOST);
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn packet_trace_id(&self) -> Option<u32> {
+        self.packet_trace_id
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn set_packet_route(
+        &mut self,
+        capture: Option<crate::control::udp_ingress::PacketRoute>,
+    ) {
+        self.packet_route = capture;
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn take_packet_route(
+        &mut self,
+    ) -> Option<crate::control::udp_ingress::PacketRoute> {
+        self.packet_route.take()
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn set_native_flow(
+        &self,
+        flow: Option<Arc<crate::native_api::flows::FlowGuard>>,
+    ) -> Option<Arc<retirement::NativeUdpTerminal>> {
+        let flow = flow?;
+        let terminal = Arc::clone(
+            self.initializer
+                .native_terminal
+                .get_or_init(|| retirement::NativeUdpTerminal::new(Arc::clone(&flow), false)),
+        );
+        if let Some(mut entry) = self.pool.endpoints.get_mut(&self.key) {
+            if let EndpointEntry::Retiring {
+                generation,
+                token,
+                native_terminal,
+                ..
+            } = entry.value_mut()
+                && *generation == self.generation
+                && *token == self.decision_token
+            {
+                *native_terminal = Some(Arc::clone(&terminal));
+            }
+        } else {
+            flow.mark_gap("retirement_owner_lost");
+        }
+        Some(terminal)
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn native_terminal(&self) -> Option<Arc<retirement::NativeUdpTerminal>> {
+        self.initializer.native_terminal.get().cloned()
+    }
+
     pub(in crate::control) fn client_addr(&self) -> SocketAddr {
         SocketAddr::new(self.key.client_ip(), self.key.client_port)
     }
@@ -499,6 +567,8 @@ impl UdpInitLease {
             generation: self.generation,
             token: self.decision_token,
             io: None,
+            #[cfg(feature = "native-api")]
+            native_terminal: self.initializer.native_terminal.get().cloned(),
         });
         drop(occupied);
         let conn_id = entry.retire();
@@ -642,36 +712,48 @@ impl UdpEndpointPool {
         data: DatagramPayload<'_>,
         enqueued_at: u32,
         stats: &StatsManager,
+        #[cfg(feature = "native-api")] native_terminal: Option<&Arc<retirement::NativeUdpTerminal>>,
     ) -> EndpointReservation {
-        if sender.is_closed() {
-            stats.record_udp_queue_closed();
-            return EndpointReservation::QueueClosed;
-        }
-        let packet = match self.make_packet_at(data, flow_slots, enqueued_at) {
-            Ok(packet) => packet,
-            Err(PacketAdmissionError::FlowQueueFull) => {
-                stats.record_udp_flow_queue_full();
-                return EndpointReservation::QueueFull;
-            }
-            Err(PacketAdmissionError::GlobalPayloadFull) => {
-                stats.record_udp_global_payload_full();
-                return EndpointReservation::QueueFull;
-            }
-        };
-        match sender.try_send(packet) {
-            Ok(()) => {
-                stats.record_udp_queue_accepted();
-                EndpointReservation::Enqueued
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                stats.record_udp_flow_queue_full();
-                EndpointReservation::QueueFull
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+        let result = (|| {
+            if sender.is_closed() {
                 stats.record_udp_queue_closed();
-                EndpointReservation::QueueClosed
+                return EndpointReservation::QueueClosed;
+            }
+            let packet = match self.make_packet_at(data, flow_slots, enqueued_at) {
+                Ok(packet) => packet,
+                Err(PacketAdmissionError::FlowQueueFull) => {
+                    stats.record_udp_flow_queue_full();
+                    return EndpointReservation::QueueFull;
+                }
+                Err(PacketAdmissionError::GlobalPayloadFull) => {
+                    stats.record_udp_global_payload_full();
+                    return EndpointReservation::QueueFull;
+                }
+            };
+            match sender.try_send(packet) {
+                Ok(()) => {
+                    stats.record_udp_queue_accepted();
+                    EndpointReservation::Enqueued
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    stats.record_udp_flow_queue_full();
+                    EndpointReservation::QueueFull
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    stats.record_udp_queue_closed();
+                    EndpointReservation::QueueClosed
+                }
+            }
+        })();
+        #[cfg(feature = "native-api")]
+        if let Some(terminal) = native_terminal {
+            match &result {
+                EndpointReservation::QueueFull => terminal.packet_drop("queue_capacity"),
+                EndpointReservation::QueueClosed => terminal.packet_drop("queue_closed"),
+                _ => {}
             }
         }
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -737,6 +819,8 @@ impl UdpEndpointPool {
             selected_node: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             cancel_notify: Notify::new(),
+            #[cfg(feature = "native-api")]
+            native_terminal: std::sync::OnceLock::new(),
         });
         let key = *vacant.key();
         vacant.insert(EndpointEntry::Initializing(Arc::clone(&initializer)));
@@ -754,6 +838,10 @@ impl UdpEndpointPool {
             initializer,
             _initializer_guard: initializer_guard,
             connection_guard: None,
+            #[cfg(feature = "native-api")]
+            packet_route: None,
+            #[cfg(feature = "native-api")]
+            packet_trace_id: None,
             committed: false,
         })
     }
@@ -844,6 +932,8 @@ impl UdpEndpointPool {
                                 data.clone(),
                                 enqueued_at,
                                 stats,
+                                #[cfg(feature = "native-api")]
+                                initializing.native_terminal.get(),
                             ) {
                                 EndpointReservation::QueueClosed => {
                                     (initializing.decision_token, initializing.generation)
@@ -864,6 +954,8 @@ impl UdpEndpointPool {
                                 data.clone(),
                                 enqueued_at,
                                 stats,
+                                #[cfg(feature = "native-api")]
+                                ready.endpoint.native_terminal.as_ref(),
                             ) {
                                 EndpointReservation::QueueClosed => {
                                     (ready.decision_token, ready.generation)
@@ -964,6 +1056,8 @@ impl UdpEndpointPool {
                         DatagramPayload::Owned(data),
                         enqueued_at,
                         stats,
+                        #[cfg(feature = "native-api")]
+                        initializing.native_terminal.get(),
                     ),
                     EndpointEntry::Ready(ready)
                         if ready.alive.load(Ordering::Acquire)
@@ -975,6 +1069,8 @@ impl UdpEndpointPool {
                             DatagramPayload::Owned(data),
                             enqueued_at,
                             stats,
+                            #[cfg(feature = "native-api")]
+                            ready.endpoint.native_terminal.as_ref(),
                         )
                     }
                     EndpointEntry::Ready(_) | EndpointEntry::Retiring { .. } => {
@@ -1056,6 +1152,8 @@ impl UdpEndpointPool {
                         DatagramPayload::Owned(data),
                         enqueued_at,
                         stats,
+                        #[cfg(feature = "native-api")]
+                        initializing.native_terminal.get(),
                     ),
                 )
             }
@@ -1072,6 +1170,8 @@ impl UdpEndpointPool {
                         DatagramPayload::Owned(data),
                         enqueued_at,
                         stats,
+                        #[cfg(feature = "native-api")]
+                        ready.endpoint.native_terminal.as_ref(),
                     ),
                 )
             }
@@ -1142,6 +1242,8 @@ impl UdpEndpointPool {
                         DatagramPayload::Borrowed(data),
                         enqueued_at,
                         stats,
+                        #[cfg(feature = "native-api")]
+                        ready.endpoint.native_terminal.as_ref(),
                     ),
                     (ready.decision_token, ready.generation),
                 )

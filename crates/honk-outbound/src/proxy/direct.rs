@@ -38,6 +38,11 @@ impl TcpOutbound for DirectHandler {
             connect_timeout,
         ))
         .await?;
+        #[cfg(feature = "native-api")]
+        {
+            crate::runtime::flow_observation::milestone("transport_ready");
+            crate::runtime::flow_observation::milestone("target_confirmed");
+        }
         Ok(ProxyStream {
             stream: Box::new(stream),
             target_addr: target,
@@ -54,6 +59,23 @@ impl TcpOutbound for DirectHandler {
         _connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
         debug!("Direct dial (pooled) to {}", target);
+        #[cfg(feature = "native-api")]
+        if let Some(observer) = crate::runtime::flow_observation::current() {
+            let server_addr = tcp.peer_addr().ok();
+            observer.publish(
+                crate::runtime::flow_observation::FlowEvent::TransportAttached {
+                    server_addr,
+                    resolution_location: "original_ip",
+                },
+            );
+            if server_addr == Some(target) {
+                observer.milestone_once("target_confirmed");
+            } else {
+                observer.publish(crate::runtime::flow_observation::FlowEvent::Gap(
+                    "not_instrumented",
+                ));
+            }
+        }
         Ok(ProxyStream {
             stream: Box::new(tcp),
             target_addr: target,
@@ -79,6 +101,8 @@ impl PacketOutbound for DirectHandler {
             "[::]:0".parse().expect("hardcoded IPv6 bind address")
         };
         let socket = crate::util::udp_marked_bind(bind_addr).await?;
+        #[cfg(feature = "native-api")]
+        crate::runtime::flow_observation::milestone("transport_ready");
         Ok(Arc::new(UdpSocketTransport::new(Arc::new(socket), target)))
     }
 }

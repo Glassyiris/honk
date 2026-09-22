@@ -39,6 +39,7 @@ impl NativeObservation {
         let dns = Arc::new(super::dns::DnsApi::new(
             instance_id.clone(),
             config.experimental.native_api.record_dns_log,
+            Arc::downgrade(&flows),
         ));
         let probes = Arc::new(super::probes::ProbeService::new(
             &config.experimental.native_api,
@@ -70,11 +71,16 @@ impl NativeObservation {
         }
     }
 
-    pub(crate) fn committed(&self, config: &Config, previous: u64, generation: u64) {
-        self.catalog.install(config);
+    pub(crate) fn committed(
+        &self,
+        identity: Arc<super::catalog::CatalogIdentity>,
+        previous: u64,
+        generation: u64,
+    ) {
+        self.catalog.install_prepared(Arc::clone(&identity));
         self.configuration
             .sources
-            .generation_committed(&self.catalog.snapshot().revision, generation);
+            .generation_committed(&identity.revision, generation);
         if previous != generation {
             self.events.publish(
                 "generation.changed",

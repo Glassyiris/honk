@@ -11,6 +11,12 @@ fn handoff(outbound: u8, must: u8) -> HandoffResult {
         mac: [0; 6],
         pname: [0; 16],
         pid: 0,
+        #[cfg(feature = "native-api")]
+        trace_id: 0,
+        #[cfg(feature = "native-api")]
+        capture: None,
+        #[cfg(feature = "native-api")]
+        capture_gap: Some("not_instrumented"),
     }
 }
 

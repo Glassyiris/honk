@@ -184,6 +184,7 @@ fn recv_meta(route: Option<UdpDnsRoute>) -> sockets::UdpRecvMeta {
         packet_dst_ip: Some(original_dst.ip()),
         packet_ifindex: Some(1),
         packet_mark: route.map(UdpDnsRoute::to_mark),
+        packet_priority: None,
         local_addr: super::addr("0.0.0.0:15000"),
     }
 }
@@ -414,6 +415,7 @@ fn queued_dns_packet(client: SocketAddr, payload: &[u8], mark: u32) -> honk_nfqu
         },
         payload: bytes::Bytes::copy_from_slice(payload),
         mark,
+        priority: None,
         received_at: std::time::Instant::now(),
     }
 }

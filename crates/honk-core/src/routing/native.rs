@@ -1,8 +1,11 @@
-//! Side-effect-free inspection of the accepted compiled routing policy.
+//! Inspection and bounded source-time capture of the accepted compiled routing policy.
 
 use std::{fmt::Write, time::Instant};
 
-use super::{CompiledCondition, CompiledPredicate, PredicateInput, Router};
+use super::{
+    CompiledCondition, CompiledPredicate, ConnectionInfo, DomainRouting, PredicateInput,
+    RouteMatch, Router,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MatchResult {
@@ -12,6 +15,7 @@ pub(crate) enum MatchResult {
     Skipped,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EvaluatedRule {
     pub(crate) result: MatchResult,
     pub(crate) conditions: Vec<MatchResult>,
@@ -22,6 +26,13 @@ pub(crate) struct Evaluation<'a> {
     pub(crate) rules: Vec<EvaluatedRule>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ObservedRoute<'a> {
+    pub(crate) matched: Option<RouteMatch<'a>>,
+    pub(crate) rules: Vec<EvaluatedRule>,
+    pub(crate) truncated: bool,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TraceError {
     Steps,
@@ -29,6 +40,74 @@ pub(crate) enum TraceError {
 }
 
 impl Router {
+    pub(crate) fn route_full_observed(
+        &self,
+        conn: &ConnectionInfo,
+        bitmap: Option<&DomainRouting>,
+        max_steps: usize,
+    ) -> ObservedRoute<'_> {
+        // Reserve only evidence slots, never evaluate predicates here. Budget exhaustion
+        // omits a suffix but cannot short-circuit the production decision below.
+        let mut remaining = max_steps;
+        let mut rules = Vec::with_capacity(max_steps.min(self.routes.len().saturating_add(1)));
+        let mut truncated = false;
+        for route in self.routes.iter() {
+            if remaining == 0 {
+                truncated = true;
+                break;
+            }
+            remaining -= 1;
+            let count = route.conditions.len().min(remaining);
+            rules.push(EvaluatedRule {
+                result: MatchResult::Skipped,
+                conditions: vec![MatchResult::Skipped; count],
+            });
+            remaining -= count;
+            if count < route.conditions.len() {
+                truncated = true;
+                break;
+            }
+        }
+        if !truncated {
+            if remaining == 0 {
+                truncated = true;
+            } else {
+                rules.push(EvaluatedRule {
+                    result: MatchResult::Skipped,
+                    conditions: Vec::new(),
+                });
+            }
+        }
+
+        let matched = self.route_full_with_observer(conn, bitmap, |rule, condition, matched| {
+            let Some(evaluated) = rules.get_mut(rule) else {
+                return;
+            };
+            let result = if matched {
+                MatchResult::Matched
+            } else {
+                MatchResult::NotMatched
+            };
+            if let Some(condition) = condition {
+                if let Some(recorded) = evaluated.conditions.get_mut(condition) {
+                    *recorded = result;
+                }
+            } else {
+                evaluated.result = result;
+            }
+        });
+        if matched.is_none()
+            && let Some(fallback) = rules.get_mut(self.routes.len())
+        {
+            fallback.result = MatchResult::Matched;
+        }
+        ObservedRoute {
+            matched,
+            rules,
+            truncated,
+        }
+    }
+
     pub(crate) fn condition_display(
         &self,
         compiled: &CompiledCondition,

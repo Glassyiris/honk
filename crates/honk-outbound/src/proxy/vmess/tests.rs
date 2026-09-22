@@ -387,3 +387,49 @@ async fn rejected_response_header_surfaces_as_stream_error() {
         "error should carry the relay's reason: {error}"
     );
 }
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn deferred_request_observation_follows_relay_write_not_stream_construction() {
+    use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
+    let events = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let captured = std::sync::Arc::clone(&events);
+    let observer = FlowObserver::new(
+        FlowContext {
+            flow_id: uuid::Uuid::new_v4(),
+            generation: 11,
+            attempt_id: Some(uuid::Uuid::new_v4()),
+            lookup_id: None,
+            dns_purpose: "proxy_server",
+        },
+        std::sync::Arc::new(move |_, event| captured.lock().push(event)),
+    );
+    let (physical, mut peer) = tokio::io::duplex(4096);
+    let uuid = uuid::Uuid::parse_str(UUID).unwrap();
+    let stream = observer
+        .scope(async {
+            VmessHandler::perform_handshake(
+                uuid.as_bytes(),
+                Box::new(physical),
+                "127.0.0.1:80".parse().unwrap(),
+                None,
+            )
+            .unwrap()
+        })
+        .await;
+    assert!(
+        events.lock().is_empty(),
+        "constructing a deferred relay has sent nothing"
+    );
+    let mut first = [0];
+    peer.read_exact(&mut first).await.unwrap();
+    assert!(matches!(
+        events.lock().as_slice(),
+        [FlowEvent::Milestone {
+            milestone: "target_request_sent"
+        }]
+    ));
+    drop(stream);
+    let mut remaining = Vec::new();
+    peer.read_to_end(&mut remaining).await.unwrap();
+}

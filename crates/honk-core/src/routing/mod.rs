@@ -528,8 +528,22 @@ impl Router {
         conn: &ConnectionInfo,
         domain_bitmap: Option<&DomainRouting>,
     ) -> Option<RouteMatch<'a>> {
-        self.routes.iter().find_map(|route| {
-            if !self.matches_route(route, conn, domain_bitmap) {
+        self.route_full_with_observer(conn, domain_bitmap, |_, _, _| {})
+    }
+
+    #[inline]
+    fn route_full_with_observer<'a>(
+        &'a self,
+        conn: &ConnectionInfo,
+        domain_bitmap: Option<&DomainRouting>,
+        mut observe: impl FnMut(usize, Option<usize>, bool),
+    ) -> Option<RouteMatch<'a>> {
+        self.routes.iter().enumerate().find_map(|(index, route)| {
+            let matched = self.matches_route(route, conn, domain_bitmap, |condition, matched| {
+                observe(index, Some(condition), matched);
+            });
+            observe(index, None, matched);
+            if !matched {
                 return None;
             }
             tracing::debug!(
@@ -557,6 +571,7 @@ impl Router {
         route: &CompiledRoute,
         conn: &ConnectionInfo,
         domain_bitmap: Option<&DomainRouting>,
+        mut observe: impl FnMut(usize, bool),
     ) -> bool {
         let input = PredicateInput {
             domain: conn.domain.as_deref(),
@@ -570,13 +585,24 @@ impl Router {
             dscp: conn.dscp,
         };
         !route.conditions.is_empty()
-            && route.conditions.iter().all(|condition| {
-                // Production absence is a miss before negation; simulations retain unknown.
-                let matched = self
-                    .evaluate_predicate::<false>(&condition.predicate, input, domain_bitmap, None)
-                    .unwrap_or(false);
-                if condition.not { !matched } else { matched }
-            })
+            && route
+                .conditions
+                .iter()
+                .enumerate()
+                .all(|(index, condition)| {
+                    // Production absence is a miss before negation; simulations retain unknown.
+                    let matched = self
+                        .evaluate_predicate::<false>(
+                            &condition.predicate,
+                            input,
+                            domain_bitmap,
+                            None,
+                        )
+                        .unwrap_or(false);
+                    let matched = if condition.not { !matched } else { matched };
+                    observe(index, matched);
+                    matched
+                })
     }
 
     fn evaluate_predicate<const BOUNDED: bool>(

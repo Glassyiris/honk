@@ -1830,6 +1830,7 @@ async fn tcp_idle_relay_survives_conn_state_sweep() -> anyhow::Result<()> {
             ..Default::default()
         },
         routing_generation: 0,
+        ..Default::default()
     };
 
     let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
@@ -3237,6 +3238,7 @@ async fn udp_dns_with_ready_endpoint_uses_controller_not_queue() {
             admission,
             data,
             validated,
+            ..
         } => {
             dns.handle_udp_dns_admitted(&admission, &data, client, dst, validated)
                 .await;
@@ -3301,6 +3303,7 @@ async fn udp_dns_with_initializing_endpoint_uses_controller_not_queue() {
             admission,
             data,
             validated,
+            ..
         } => {
             dns.handle_udp_dns_admitted(&admission, &data, client, dst, validated)
                 .await;
@@ -4685,6 +4688,11 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
         let client_netns = fresh_test_netns();
         let server_netns = fresh_test_netns();
         let mut netlink = crate::netlink::NlSock::new()?;
+        #[cfg(feature = "native-api")]
+        {
+            let (loopback, _) = netlink.get_link("lo")?;
+            netlink.set_link_up(loopback, true)?;
+        }
         netlink.add_veth_pair("honk-lan0", "honk-c0")?;
         netlink.add_veth_pair("honk-wan0", "honk-s0")?;
         let (lan, _) = netlink.get_link("honk-lan0")?;
@@ -4769,6 +4777,11 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
             config.global.dial_mode = "domain++".into();
             config.global.wan_interface = vec!["honk-wan0".into()];
             config.global.nfqueue_enable = true;
+            #[cfg(feature = "native-api")]
+            {
+                config.experimental.native_api.enabled = true;
+                config.experimental.native_api.allow_anonymous_loopback = true;
+            }
             config
                 .routing
                 .rules
@@ -4810,6 +4823,22 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
                 DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
                 udp_test_forwarder(),
             )?;
+            #[cfg(feature = "native-api")]
+            let (api_address, api_server) = {
+                let listener = TcpListener::bind("127.0.0.1:0").await?;
+                let address = listener.local_addr()?;
+                let state = crate::native_api::NativeState::new(
+                    &mut control,
+                    address,
+                    std::time::SystemTime::now(),
+                    Instant::now(),
+                )
+                .await?;
+                (
+                    address,
+                    crate::native_api::NativeServer::start(listener, Arc::new(state)),
+                )
+            };
             control.udp_pool = Arc::new(UdpEndpointPool::with_reply_socket_factory(
                 1024,
                 Arc::new(KernelUdpReplySocketFactory),
@@ -4936,9 +4965,54 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
                 anyhow::ensure!(proxy_stats.proxy_copied == 1);
                 anyhow::ensure!(proxy_stats.proxy_dropped == 1);
                 anyhow::ensure!(removal_fatal_rx.try_recv().is_err());
+                #[cfg(feature = "native-api")]
+                {
+                    let http = reqwest::Client::builder().no_proxy().build()?;
+                    let root = format!("http://{api_address}/api/v1");
+                    let listing: serde_json::Value = http
+                        .get(format!("{root}/flows?detail=full"))
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
+                    for (destination, action) in [
+                        (direct_dst, "activate_direct"),
+                        (proxy_dst, "activate_proxy"),
+                    ] {
+                        let row = listing["flows"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|row| row["input"]["dst"] == destination.to_string())
+                            .expect("the real staged packet has retained flow evidence");
+                        let id = row["id"].as_str().unwrap();
+                        let detail: serde_json::Value = http
+                            .get(format!("{root}/flows/{id}"))
+                            .send()
+                            .await?
+                            .error_for_status()?
+                            .json()
+                            .await?;
+                        anyhow::ensure!(
+                            detail["trace"]["steps"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|step| {
+                                    step["stage"] == "datapath"
+                                        && step["data"]["action"] == action
+                                        && step["data"]["error"].is_null()
+                                }),
+                            "the successful kernel transition must use the adopted wire action"
+                        );
+                    }
+                }
                 Ok::<_, anyhow::Error>(())
             }
             .await;
+            #[cfg(feature = "native-api")]
+            api_server.shutdown().await;
 
             if let Some(flags) = control.datapath_flags.as_ref() {
                 let _ = flags.fence_nfqueue().await;

@@ -117,9 +117,12 @@ impl VLessHandler {
             target_domain,
             vless.wire_flow(),
         )?;
-        let stream = self
-            .dial_carrier(node, uuid, header, tcp, connect_timeout, None)
-            .await?;
+        let operation = self.dial_carrier(node, uuid, header, tcp, connect_timeout, None);
+        #[cfg(feature = "native-api")]
+        let stream =
+            crate::runtime::flow_observation::request_write(std::pin::pin!(operation)).await?;
+        #[cfg(not(feature = "native-api"))]
+        let stream = operation.await?;
         Ok(ProxyStream {
             stream,
             target_addr: target,

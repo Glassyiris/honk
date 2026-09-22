@@ -1,4 +1,5 @@
 use crate::group::GroupMember;
+use crate::group::observation;
 
 use super::*;
 
@@ -120,18 +121,20 @@ impl super::GroupManager {
         group_name: &str,
         context: &ScoreSelectionContext,
     ) -> super::ScoreSelectionPlan<'_> {
-        let plan = self.selection_plan_for_target_with_effects(
-            group_name,
-            context,
-            super::SelectionEffects::ApplyWithHealthFallback,
-            None,
-        );
-        if !plan.entries.is_empty() || context.health_family != IpVersion::V6 {
-            return plan;
-        }
-        let mut fallback = context.clone();
-        fallback.health_family = IpVersion::V4;
-        self.selection_plan_for_target(group_name, &fallback)
+        observation::capture(|| {
+            let plan = self.selection_plan_for_target_with_effects(
+                group_name,
+                context,
+                super::SelectionEffects::ApplyWithHealthFallback,
+                None,
+            );
+            if !plan.entries.is_empty() || context.health_family != IpVersion::V6 {
+                return plan;
+            }
+            let mut fallback = context.clone();
+            fallback.health_family = IpVersion::V4;
+            self.selection_plan_for_target(group_name, &fallback)
+        })
     }
     /// Return the latency-ordered URLTest alternatives for one target without
     /// changing selection state. Each entry keeps the same Honk attribution
@@ -141,52 +144,77 @@ impl super::GroupManager {
         group_name: &str,
         context: &ScoreSelectionContext,
     ) -> super::ScoreSelectionPlan<'_> {
-        let Some(group) = self.groups.get(group_name) else {
-            return super::ScoreSelectionPlan {
-                mode: super::SelectionPlanMode::Authoritative,
-                health_family: context.health_family,
-                entries: Vec::new(),
+        observation::capture(|| {
+            let Some(group) = self.groups.get(group_name) else {
+                observation::gap();
+                return super::ScoreSelectionPlan {
+                    mode: super::SelectionPlanMode::Authoritative,
+                    health_family: context.health_family,
+                    entries: Vec::new(),
+                    observation: None,
+                };
             };
-        };
-        if group.policy != honk_config::group::GroupPolicy::URLTest {
-            return super::ScoreSelectionPlan {
-                mode: super::SelectionPlanMode::Authoritative,
-                health_family: context.health_family,
-                entries: Vec::new(),
-            };
-        }
-        let mut visited = Vec::new();
-        let candidates = self.flatten_candidates_for_target(
-            group,
-            context,
-            &mut visited,
-            0,
-            super::SelectionEffects::Peek,
-            None,
-        );
-        let candidates = self.filter_alive_candidates(
-            candidates,
-            context.probe_domain,
-            context.health_family,
-            group.check_url.as_deref(),
-        );
-        let mut seen = std::collections::HashSet::new();
-        let candidates = self
-            .order_by_latency(
-                candidates,
-                context.network,
+            if group.policy != honk_config::group::GroupPolicy::URLTest {
+                return observation::decision(
+                    group,
+                    context.health_family,
+                    super::SelectionEffects::Peek,
+                    || {
+                        observation::reason("not_urltest");
+                        self.score_selection_plan(
+                            Vec::new(),
+                            super::SelectionPlanMode::Authoritative,
+                            context,
+                        )
+                    },
+                );
+            }
+            observation::decision(
+                group,
                 context.health_family,
-                group.check_url.as_deref(),
+                super::SelectionEffects::Peek,
+                || {
+                    let mut visited = Vec::new();
+                    let candidates = self.flatten_candidates_for_target(
+                        group,
+                        context,
+                        &mut visited,
+                        0,
+                        super::SelectionEffects::Peek,
+                        None,
+                    );
+                    let candidates = self.filter_alive_candidates(
+                        candidates,
+                        context.probe_domain,
+                        context.health_family,
+                        group.check_url.as_deref(),
+                    );
+                    observation::metric("sorting_latency", None);
+                    observation::reason("retry_candidates_pending");
+                    let mut seen = std::collections::HashSet::new();
+                    let candidates = self
+                        .order_by_latency(
+                            candidates,
+                            context.network,
+                            context.health_family,
+                            group.check_url.as_deref(),
+                        )
+                        .into_iter()
+                        .filter(|candidate| seen.insert(candidate.node.id))
+                        .take(3)
+                        .map(|mut candidate| {
+                            candidate.selection_chain.insert(0, group.name.as_str());
+                            candidate
+                        })
+                        .collect();
+                    self.score_selection_plan(
+                        candidates,
+                        super::SelectionPlanMode::Authoritative,
+                        context,
+                    )
+                },
             )
-            .into_iter()
-            .filter(|candidate| seen.insert(candidate.node.id))
-            .take(3)
-            .map(|mut candidate| {
-                candidate.selection_chain.insert(0, group.name.as_str());
-                candidate
-            })
-            .collect();
-        self.score_selection_plan(candidates, super::SelectionPlanMode::Authoritative, context)
+        })
     }
 
     /// Resolve one different Score-owned TCP leaf without opening a new final edge.
@@ -198,18 +226,20 @@ impl super::GroupManager {
         failed_node: Uuid,
         final_owners: &[String],
     ) -> super::ScoreSelectionPlan<'_> {
-        let excluded = ExcludedScoreLeaf {
-            node_id: failed_node,
-            final_owners,
-        };
-        let mut plan = self.selection_plan_for_target_with_effects(
-            group_name,
-            context,
-            super::SelectionEffects::Apply,
-            Some(&excluded),
-        );
-        plan.entries.retain(|entry| entry.feedback.is_some());
-        plan
+        observation::capture(|| {
+            let excluded = ExcludedScoreLeaf {
+                node_id: failed_node,
+                final_owners,
+            };
+            let mut plan = self.selection_plan_for_target_with_effects(
+                group_name,
+                context,
+                super::SelectionEffects::Apply,
+                Some(&excluded),
+            );
+            plan.entries.retain(|entry| entry.feedback.is_some());
+            plan
+        })
     }
 
     fn score_selection_plan<'a>(
@@ -221,6 +251,7 @@ impl super::GroupManager {
         super::ScoreSelectionPlan {
             mode,
             health_family: context.health_family,
+            observation: None,
             entries: candidates
                 .into_iter()
                 .map(|candidate| {
@@ -269,12 +300,14 @@ impl super::GroupManager {
         group_name: &str,
         context: &ScoreSelectionContext,
     ) -> super::ScoreSelectionPlan<'_> {
-        self.selection_plan_for_target_with_effects(
-            group_name,
-            context,
-            super::SelectionEffects::Apply,
-            None,
-        )
+        observation::capture(|| {
+            self.selection_plan_for_target_with_effects(
+                group_name,
+                context,
+                super::SelectionEffects::Apply,
+                None,
+            )
+        })
     }
 
     fn selection_plan_for_target_with_effects(
@@ -285,6 +318,7 @@ impl super::GroupManager {
         excluded: Option<&ExcludedScoreLeaf<'_>>,
     ) -> super::ScoreSelectionPlan<'_> {
         let Some(group) = self.groups.get(group_name) else {
+            observation::gap();
             return self.score_selection_plan(
                 Vec::new(),
                 super::SelectionPlanMode::Authoritative,
@@ -317,96 +351,127 @@ impl super::GroupManager {
         cold_urltest: bool,
         excluded: Option<&ExcludedScoreLeaf<'_>>,
     ) -> (super::SelectionPlanMode, Vec<super::Candidate<'a>>) {
-        if depth >= super::MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
-            return (super::SelectionPlanMode::Authoritative, Vec::new());
-        }
-        let (mut mode, mut candidates) = self.normal_candidates_for_target(
-            group,
-            context,
-            visited,
-            depth,
-            effects,
-            cold_urltest,
-            excluded,
-        );
-        if candidates.is_empty()
-            && let Some(member) = self.final_member(group)
-            && excluded.is_none_or(|excluded| {
-                matches!(member, GroupMember::Group(_))
-                    && excluded.final_owners.contains(&group.name)
-            })
-        {
-            // A business IPv6 target may use an IPv4 proxy. Defer this final
-            // until the outer health-family retry has tried that ordinary path.
-            if effects.health_fallback() && context.health_family == IpVersion::V6 {
-                let mut ipv4 = context.clone();
-                ipv4.health_family = IpVersion::V4;
-                if !self
-                    .normal_candidates_for_target(
-                        group,
-                        &ipv4,
-                        visited,
-                        depth,
-                        effects.peek(),
-                        cold_urltest,
-                        excluded,
-                    )
+        observation::decision(group, context.health_family, effects, || {
+            if depth >= super::MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
+                observation::reason("resolution_limit");
+                return (super::SelectionPlanMode::Authoritative, Vec::new());
+            }
+            let (mut mode, mut candidates) = self.normal_candidates_for_target(
+                group,
+                context,
+                visited,
+                depth,
+                effects,
+                cold_urltest,
+                excluded,
+            );
+            if candidates.is_empty()
+                && let Some(member) = self.final_member(group)
+                && excluded.is_none_or(|excluded| {
+                    matches!(member, GroupMember::Group(_))
+                        && excluded.final_owners.contains(&group.name)
+                })
+            {
+                // A business IPv6 target may use an IPv4 proxy. Defer this final
+                // until the outer health-family retry has tried that ordinary path.
+                if effects.health_fallback() && context.health_family == IpVersion::V6 {
+                    let mut ipv4 = context.clone();
+                    ipv4.health_family = IpVersion::V4;
+                    if !observation::decision(group, ipv4.health_family, effects.peek(), || {
+                        self.normal_candidates_for_target(
+                            group,
+                            &ipv4,
+                            visited,
+                            depth,
+                            effects.peek(),
+                            cold_urltest,
+                            excluded,
+                        )
+                    })
                     .1
                     .is_empty()
-                {
-                    return (mode, candidates);
-                }
-            }
-            match member {
-                GroupMember::Node(node) => {
-                    if matches!(
-                        node.protocol(),
-                        honk_config::types::NodeProtocol::Direct
-                            | honk_config::types::NodeProtocol::Block
-                    ) || self.is_node_selectable_for_domain(
-                        node.id,
-                        context.probe_domain,
-                        context.health_family,
-                    ) {
-                        mode = super::SelectionPlanMode::Authoritative;
-                        candidates.push(super::Candidate {
-                            via: None,
-                            node,
-                            attribution: Vec::new(),
-                            selection_chain: vec![node.name.as_str()],
-                            final_owners: Vec::new(),
-                        });
+                    {
+                        observation::reason("health_family_fallback");
+                        return (mode, candidates);
                     }
                 }
-                GroupMember::Group(final_group) => {
-                    if effects.applies() {
-                        self.mark_used(&final_group.name);
+                match member {
+                    GroupMember::Node(node) => {
+                        let eligible = matches!(
+                            node.protocol(),
+                            honk_config::types::NodeProtocol::Direct
+                                | honk_config::types::NodeProtocol::Block
+                        ) || self.is_node_selectable_for_domain(
+                            node.id,
+                            context.probe_domain,
+                            context.health_family,
+                        );
+                        observation::member(
+                            member,
+                            Some(node),
+                            Some(eligible),
+                            "final_eligibility",
+                        );
+                        if eligible {
+                            mode = super::SelectionPlanMode::Authoritative;
+                            candidates.push(super::Candidate {
+                                via: None,
+                                node,
+                                attribution: Vec::new(),
+                                selection_chain: vec![node.name.as_str()],
+                                final_owners: Vec::new(),
+                            });
+                        }
                     }
-                    visited.push(group.name.as_str());
-                    (mode, candidates) = self.selection_candidates_for_target(
-                        final_group,
-                        context,
-                        visited,
-                        depth + 1,
-                        effects,
-                        cold_urltest,
-                        excluded,
+                    GroupMember::Group(final_group) => {
+                        if effects.applies() {
+                            self.mark_used(&final_group.name);
+                        }
+                        visited.push(group.name.as_str());
+                        (mode, candidates) = self.selection_candidates_for_target(
+                            final_group,
+                            context,
+                            visited,
+                            depth + 1,
+                            effects,
+                            cold_urltest,
+                            excluded,
+                        );
+                        visited.pop();
+                        for candidate in &mut candidates {
+                            candidate.via = Some(final_group);
+                            candidate.final_owners.insert(0, group.name.as_str());
+                        }
+                        if candidates.is_empty() {
+                            observation::member(member, None, Some(false), "final_empty");
+                        } else {
+                            for candidate in &candidates {
+                                observation::candidate(candidate, true, "final_candidate");
+                            }
+                        }
+                    }
+                }
+                if mode == super::SelectionPlanMode::ColdUrlTest && !candidates.is_empty() {
+                    observation::selected(None, "final_candidates_pending");
+                } else {
+                    observation::selected(
+                        candidates.first(),
+                        if candidates.is_empty() {
+                            "final_unavailable"
+                        } else {
+                            "final_selected"
+                        },
                     );
-                    visited.pop();
-                    for candidate in &mut candidates {
-                        candidate.via = Some(final_group);
-                        candidate.final_owners.insert(0, group.name.as_str());
-                    }
                 }
             }
-        }
-        for candidate in &mut candidates {
-            if group.policy == honk_config::group::GroupPolicy::Score {
-                candidate.attribution.insert(0, group.name.as_str());
+            for candidate in &mut candidates {
+                if group.policy == honk_config::group::GroupPolicy::Score {
+                    candidate.attribution.insert(0, group.name.as_str());
+                }
+                candidate.selection_chain.insert(0, group.name.as_str());
             }
-            candidate.selection_chain.insert(0, group.name.as_str());
-        }
-        (mode, candidates)
+            (mode, candidates)
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -421,6 +486,9 @@ impl super::GroupManager {
         excluded: Option<&ExcludedScoreLeaf<'_>>,
     ) -> (super::SelectionPlanMode, Vec<super::Candidate<'a>>) {
         let selected_member = self.selector_member(group, context.network);
+        if let Some(member) = selected_member {
+            observation::previous(member);
+        }
         let mut candidates =
             self.flatten_candidates_for_target(group, context, visited, depth, effects, excluded);
         let before_filter = (effects.applies()
@@ -456,6 +524,14 @@ impl super::GroupManager {
             } else {
                 super::SelectionPlanMode::Authoritative
             };
+            observation::selected(
+                candidate.as_ref(),
+                if candidate.is_some() {
+                    "sole_tcp_leaf_last_resort"
+                } else {
+                    "no_eligible_candidate"
+                },
+            );
             return (mode, candidate.into_iter().collect());
         }
         if cold_urltest
@@ -470,6 +546,8 @@ impl super::GroupManager {
                 ) != Duration::MAX
             })
         {
+            observation::metric("sorting_latency", None);
+            observation::reason("cold_candidates_pending");
             return (
                 super::SelectionPlanMode::ColdUrlTest,
                 self.order_by_latency(
@@ -481,13 +559,16 @@ impl super::GroupManager {
             );
         }
         let candidate = match group.policy {
-            honk_config::group::GroupPolicy::Selector => selected_member
-                .and_then(|member| Self::pick_selector(&candidates, member))
-                .and_then(|picked| {
-                    self.commit_selector_pick_for_target(
-                        group, picked, context, visited, depth, effects, excluded,
-                    )
-                }),
+            honk_config::group::GroupPolicy::Selector => {
+                observation::reason("selector_choice");
+                selected_member
+                    .and_then(|member| Self::pick_selector(&candidates, member))
+                    .and_then(|picked| {
+                        self.commit_selector_pick_for_target(
+                            group, picked, context, visited, depth, effects, excluded,
+                        )
+                    })
+            }
             honk_config::group::GroupPolicy::URLTest => Some(self.pick_urltest(
                 &candidates,
                 group,
@@ -505,6 +586,10 @@ impl super::GroupManager {
                 Some(self.pick_score(&candidates, group, context, effects))
             }
         };
+        observation::chosen(candidate.as_ref());
+        if candidate.is_none() {
+            observation::reason("selected_member_unavailable");
+        }
         (
             super::SelectionPlanMode::Authoritative,
             candidate.into_iter().collect(),
@@ -604,6 +689,14 @@ impl super::GroupManager {
         visited.pop();
         let mut committed = committed?;
         committed.via = picked.via;
+        if committed.node.id != picked.node.id {
+            observation::member(
+                committed.member(),
+                Some(committed.node),
+                None,
+                "selector_committed",
+            );
+        }
         Some(committed)
     }
 
@@ -631,8 +724,25 @@ impl super::GroupManager {
         let mut candidates: Vec<_> = group
             .nodes
             .iter()
-            .filter_map(|id| self.nodes.get(id))
-            .filter(|node| excluded.is_none_or(|excluded| node.id != excluded.node_id))
+            .filter_map(|id| {
+                let node = self.nodes.get(id);
+                if node.is_none() {
+                    observation::gap();
+                }
+                node
+            })
+            .filter(|node| {
+                let eligible = excluded.is_none_or(|excluded| node.id != excluded.node_id);
+                if !eligible {
+                    observation::member(
+                        GroupMember::Node(node),
+                        Some(node),
+                        Some(false),
+                        "retry_excluded",
+                    );
+                }
+                eligible
+            })
             .map(|node| super::Candidate {
                 via: None,
                 node,
@@ -643,6 +753,7 @@ impl super::GroupManager {
             .collect();
         for tag in &group.groups {
             let Some(subgroup) = self.groups.get(tag.as_str()) else {
+                observation::gap();
                 continue;
             };
             if sub_effects.applies() {
@@ -658,6 +769,13 @@ impl super::GroupManager {
             ) {
                 candidate.via = Some(subgroup);
                 candidates.push(candidate);
+            } else {
+                observation::member(
+                    GroupMember::Group(subgroup),
+                    None,
+                    Some(false),
+                    "empty_member",
+                );
             }
         }
         visited.pop();

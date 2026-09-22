@@ -27,11 +27,15 @@ use super::{
     types::{ApiError, ErrorCode, RequestId},
 };
 
+pub(crate) mod dns;
+pub(crate) mod kernel;
+mod producer;
 pub(crate) mod record;
 use record::{Input, InputValues, SnapshotRow, Step, StepData, Summary};
 
 const MAX_RECORDS: usize = 1024;
 const MAX_STEPS: usize = 64;
+pub(crate) const MAX_RULE_VALUES: usize = 256;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Listings keep this much of the budget for their snapshots, so a ring that
 /// has grown to its own limit still leaves room to page through it.
@@ -47,8 +51,8 @@ const EVICTED_GAP_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_SAFE_UINT: u64 = 9_007_199_254_740_991;
 const MAX_TEXT: usize = 512;
 const MAX_STEP_BYTES: usize = 64 * 1024;
-// Covers the bounded deque allocations, tombstones, filters, and owner metadata.
-const OWNER_BYTES: usize = 256 * 1024;
+// Kernel dictionaries and snapshots share the recorder's fixed userspace budget.
+const OWNER_BYTES: usize = 256 * 1024 + kernel::MAX_RETAINED_BYTES;
 
 pub(crate) struct FlowStore {
     instance_id: String,
@@ -77,6 +81,10 @@ struct Record {
     ended: Option<Instant>,
     redacted: bool,
     overflow: bool,
+    missing: u8,
+    reply_observed: bool,
+    selected_attempt: Option<String>,
+    mode_recorded: bool,
     bytes: usize,
 }
 
@@ -103,6 +111,7 @@ pub(crate) struct FlowGuard {
     store: Weak<FlowStore>,
     id: String,
     replied: AtomicBool,
+    sent: AtomicBool,
 }
 
 pub(crate) struct ConnectionEvidence {
@@ -194,6 +203,7 @@ impl FlowStore {
                 store: Weak::new(),
                 id: String::new(),
                 replied: AtomicBool::new(false),
+                sent: AtomicBool::new(false),
             };
         }
         let now = Instant::now();
@@ -219,7 +229,7 @@ impl FlowStore {
                 observed_by: "userspace",
                 started_at: timestamp(SystemTime::now()),
                 ended_at: None,
-                trace_status: "partial",
+                trace_status: "complete",
             },
             input: Input {
                 src,
@@ -239,6 +249,10 @@ impl FlowStore {
             ended: None,
             redacted: false,
             overflow: false,
+            missing: 0,
+            reply_observed: false,
+            selected_attempt: None,
+            mode_recorded: false,
             bytes: 0,
         };
         record.push_step(
@@ -260,6 +274,7 @@ impl FlowStore {
             store: Arc::downgrade(self),
             id,
             replied: AtomicBool::new(false),
+            sent: AtomicBool::new(false),
         }
     }
 
@@ -279,28 +294,29 @@ impl FlowStore {
         })
     }
 
-    fn mutate(&self, id: &str, change: impl FnOnce(&mut Record) -> bool) {
+    fn mutate(&self, id: &str, change: impl FnOnce(&mut Record) -> bool) -> bool {
         let mut store = self.inner.lock();
         let now = Instant::now();
         self.prune(&mut store, now);
         // ponytail: bounded 1024-record scan; add an ID index only if this becomes a measured bottleneck.
         let Some(index) = store.records.iter().position(|record| record.id() == id) else {
-            return;
+            return false;
         };
         let record = &mut store.records[index];
         if record.ended.is_some() {
-            return;
+            return false;
         }
         let old_bytes = record.bytes;
         let overflow = record.overflow;
         if !change(record) {
-            return;
+            return false;
         }
         let revision = record.summary.revision;
         if revision == MAX_SAFE_UINT {
             self.evict(&mut store, index, now, "buffer_overflow", false);
-            return;
+            return false;
         }
+        record.summary.trace_status = record.trace_status();
         record.summary.revision += 1;
         record.bytes = record.retained_bytes();
         let new_bytes = record.bytes;
@@ -310,7 +326,59 @@ impl FlowStore {
         if lost_steps {
             self.gap(&store, Some(id), "buffer_overflow");
         }
+        let previous_count = store.records.len();
         self.enforce_limit(&mut store, now);
+        index
+            .checked_sub(previous_count - store.records.len())
+            .and_then(|index| store.records.get(index))
+            .is_some_and(|record| record.id() == id)
+    }
+
+    pub(crate) fn record_step(&self, id: &str, generation: Option<u64>, data: StepData) -> bool {
+        self.record_with(id, generation, |_| Some(data))
+    }
+
+    fn record_with(
+        &self,
+        id: &str,
+        generation: Option<u64>,
+        build: impl FnOnce(&Record) -> Option<StepData>,
+    ) -> bool {
+        let mut accepted = false;
+        let retained = self.mutate(id, |record| {
+            if record.steps.len() == MAX_STEPS {
+                return record.mark_gap("buffer_overflow");
+            }
+            let Some(mut data) = build(record) else {
+                return false;
+            };
+            let mut redacted = false;
+            let mut overflow = false;
+            if !data.sanitize(&mut redacted, &mut overflow) {
+                return record.mark_gap(if overflow {
+                    "buffer_overflow"
+                } else {
+                    "redacted"
+                });
+            }
+            if size_of::<StepData>() + data.heap_bytes() > MAX_STEP_BYTES {
+                return record.mark_gap("buffer_overflow");
+            }
+            let changed = redacted && !record.redacted;
+            record.redacted |= redacted;
+            let previous_count = record.steps.len();
+            let pushed = record.push_step(
+                generation.map(|generation| format!("{}:{generation}", self.instance_id)),
+                data,
+            );
+            accepted = record.steps.len() != previous_count;
+            pushed || changed
+        });
+        accepted && retained
+    }
+
+    pub(crate) fn mark_gap(&self, id: &str, reason: &'static str) {
+        self.mutate(id, |record| record.mark_gap(reason));
     }
 
     fn updated(&self, record: &Record) {
@@ -513,6 +581,12 @@ impl FlowStore {
             ))
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_detail(&self, flow_id: &str) -> Value {
+        self.get(flow_id, &RequestId("flow-test".to_owned()))
+            .unwrap()
+    }
 }
 
 impl Record {
@@ -523,14 +597,52 @@ impl Record {
     fn retained_bytes(&self) -> usize {
         size_of::<Self>()
             + self.summary.heap_bytes()
+            + self.selected_attempt.as_ref().map_or(0, String::capacity)
             + self.input.heap_bytes()
             + self.steps.capacity() * size_of::<Step>()
             + self.steps.iter().map(Step::heap_bytes).sum::<usize>()
     }
 
-    fn push_step(&mut self, generation_id: Option<String>, data: StepData) -> bool {
+    fn push_step(&mut self, generation_id: Option<String>, mut data: StepData) -> bool {
         if self.steps.len() == MAX_STEPS {
             return !std::mem::replace(&mut self.overflow, true);
+        }
+        if !self.references_known(&data) && self.missing == 0 && !self.overflow && !self.redacted {
+            self.mark_gap("not_instrumented");
+        }
+        if missing_source_evidence(&data) {
+            self.mark_gap("not_instrumented");
+        }
+        if let StepData::Connection { reply_received, .. } = &mut data {
+            self.reply_observed |= *reply_received == Some(true);
+            if reply_received.is_some() && self.reply_observed {
+                *reply_received = Some(true);
+            }
+        }
+        if let StepData::Route {
+            chain: "traffic",
+            plane,
+            rule_id,
+            rules,
+            outbound,
+            ..
+        } = &data
+        {
+            self.summary.outbound = outbound.clone();
+            self.summary.rule_id = rule_id.clone();
+            self.summary.rule_expression = rule_id.as_ref().and_then(|id| {
+                rules
+                    .iter()
+                    .find(|rule| &rule.rule_id == id)
+                    .filter(|rule| record::safe_expression(&rule.expression))
+                    .map(|rule| rule.expression.clone())
+            });
+            self.summary.rule_source = if *plane == "kernel" {
+                "kernel"
+            } else {
+                "recomputed"
+            };
+            self.mode_recorded = false;
         }
         let elapsed = self.started.elapsed().as_micros();
         self.steps.push(Step {
@@ -544,22 +656,167 @@ impl Record {
         true
     }
 
+    fn mark_gap(&mut self, reason: &'static str) -> bool {
+        match reason {
+            "buffer_overflow" => !std::mem::replace(&mut self.overflow, true),
+            "redacted" => !std::mem::replace(&mut self.redacted, true),
+            reason => {
+                let flag = match reason {
+                    "started_late" => 2,
+                    "sampled" => 4,
+                    "evicted" => 8,
+                    _ => 1,
+                };
+                let changed = self.missing & flag == 0;
+                self.missing |= flag;
+                changed
+            }
+        }
+    }
+
+    fn trace_status(&self) -> &'static str {
+        if self.missing != 0 || self.overflow || self.redacted {
+            "partial"
+        } else {
+            "complete"
+        }
+    }
+
+    fn references_known(&self, data: &StepData) -> bool {
+        let route = |id: &str| {
+            self.steps.iter().any(|step| {
+            matches!(&step.data, StepData::Route { evaluation_id, .. } if evaluation_id == id)
+        })
+        };
+        let attempt = |id: &str| {
+            self.steps.iter().any(|step| {
+            matches!(&step.data, StepData::Outbound { attempt_id, .. } if attempt_id == id)
+        })
+        };
+        let lookup = |id: Uuid| {
+            self.steps
+                .iter()
+                .any(|step| matches!(&step.data, StepData::Dns(data) if data.lookup_id == id))
+        };
+        match data {
+            StepData::Reroute {
+                from_evaluation_id,
+                to_evaluation_id,
+                ..
+            } => {
+                from_evaluation_id.as_deref().is_none_or(route)
+                    && to_evaluation_id.as_deref().is_none_or(route)
+            }
+            StepData::Outbound { attempt: data, .. } => {
+                data.evaluation_id.as_deref().is_none_or(route)
+                    && data.parent_attempt_id.as_deref().is_none_or(attempt)
+                    && data
+                        .lookup_id
+                        .as_ref()
+                        .is_none_or(|id| Uuid::try_parse(id).is_ok_and(lookup))
+            }
+            StepData::Dns(data) => {
+                data.parent_lookup_id.is_none_or(lookup)
+                    && data.attempt_id.is_none_or(|id| {
+                        let mut text = Uuid::encode_buffer();
+                        attempt(id.hyphenated().encode_lower(&mut text))
+                    })
+                    && data.route_evaluation_ids.iter().all(|id| route(id))
+            }
+            StepData::Connection {
+                attempt_id,
+                lookup_id,
+                ..
+            } => {
+                attempt_id.as_deref().is_none_or(attempt)
+                    && lookup_id
+                        .as_ref()
+                        .is_none_or(|id| Uuid::try_parse(id).is_ok_and(lookup))
+            }
+            _ => true,
+        }
+    }
+
+    fn has_open_operations(&self) -> bool {
+        self.steps.iter().enumerate().any(|(index, step)| match &step.data {
+            StepData::Outbound { attempt_id, status: "started", .. } => {
+                !self.steps[index + 1..].iter().any(|later| {
+                    matches!(&later.data, StepData::Outbound { attempt_id: id, status, .. } if id == attempt_id && *status != "started")
+                })
+            }
+            StepData::Dns(data) if data.status == "started" => {
+                !self.steps[index + 1..].iter().any(|later| {
+                    matches!(&later.data, StepData::Dns(later) if later.lookup_id == data.lookup_id && !matches!(later.status, "started" | "joined"))
+                })
+            }
+            _ => false,
+        })
+    }
+
     fn project(&self, full: bool, trace: bool) -> Value {
         let mut row = json!(self.summary);
         if full {
             row["input"] = json!(self.input);
         }
         if trace {
-            let mut missing = vec!["not_instrumented"];
+            let mut missing = Vec::new();
+            for (flag, reason) in [
+                (1, "not_instrumented"),
+                (2, "started_late"),
+                (4, "sampled"),
+                (8, "evicted"),
+            ] {
+                if self.missing & flag != 0 {
+                    missing.push(reason);
+                }
+            }
             if self.overflow {
                 missing.push("buffer_overflow");
             }
             if self.redacted {
                 missing.push("redacted");
             }
-            row["trace"] = json!({"status": "partial", "missing": missing, "steps": self.steps});
+            row["trace"] = json!({"status": self.summary.trace_status, "missing": missing, "steps": self.steps});
         }
         row
+    }
+}
+
+fn missing_source_evidence(data: &StepData) -> bool {
+    let incomplete_selection = |rows: &[record::Selection]| {
+        rows.iter().any(|row| {
+            matches!(
+                row.policy,
+                "urltest" | "url_test" | "load_balance" | "loadbalance" | "fallback" | "score"
+            ) && row.selection.is_none()
+        })
+    };
+    match data {
+        StepData::Route {
+            rules,
+            input,
+            chain,
+            dns_action,
+            ..
+        } => {
+            input.is_none()
+                || rules.is_empty()
+                || rules.iter().any(|rule| {
+                    rule.result == "indeterminate"
+                        || rule
+                            .conditions
+                            .iter()
+                            .any(|condition| condition.result == "indeterminate")
+                })
+                || (matches!(*chain, "dns_request" | "dns_response") && dns_action.is_none())
+        }
+        StepData::Outbound { attempt, .. } => {
+            attempt.routing_source == "unknown"
+                || attempt.mode_override == "unknown"
+                || incomplete_selection(&attempt.selection_path)
+        }
+        StepData::Connection { selections, .. } => incomplete_selection(selections),
+        _ => false,
     }
 }
 
@@ -588,26 +845,39 @@ impl FlowGuard {
         let Some(store) = self.store.upgrade() else {
             return;
         };
-        store.mutate(&self.id, |record| {
-            let mut redacted = false;
-            let mut overflow = false;
-            if !data.sanitize(&mut redacted, &mut overflow) {
-                return if overflow {
-                    !std::mem::replace(&mut record.overflow, true)
-                } else {
-                    !std::mem::replace(&mut record.redacted, true)
-                };
-            }
-            if size_of::<StepData>() + data.heap_bytes() > MAX_STEP_BYTES {
-                return !std::mem::replace(&mut record.overflow, true);
-            }
-            let changed = redacted && !record.redacted;
-            record.redacted |= redacted;
-            record.push_step(
-                generation.map(|generation| format!("{}:{generation}", store.instance_id)),
-                data,
-            ) || changed
-        });
+        if let StepData::Connection {
+            reply_received: Some(reply_received),
+            ..
+        } = &mut data
+        {
+            *reply_received |= self.replied.load(Ordering::Relaxed);
+        }
+        store.record_step(&self.id, generation, data);
+    }
+
+    pub(crate) fn mark_gap(&self, reason: &'static str) {
+        if let Some(store) = self.store.upgrade() {
+            store.mark_gap(&self.id, reason);
+        }
+    }
+
+    pub(crate) fn mark_overflow(&self) {
+        self.mark_gap("buffer_overflow");
+    }
+
+    pub(crate) fn select_attempt(&self, attempt: &str) {
+        if let Some(store) = self.store.upgrade() {
+            store.mutate(&self.id, |record| {
+                if !safe_text(attempt) {
+                    return record.mark_gap("redacted");
+                }
+                if record.selected_attempt.as_deref() == Some(attempt) {
+                    return false;
+                }
+                record.selected_attempt = Some(attempt.to_owned());
+                true
+            });
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -691,18 +961,54 @@ impl FlowGuard {
             let mut redacted = record.redacted;
             let outbound = safe_optional(Some(outbound), &mut redacted);
             let rule_id = safe_optional(rule_id, &mut redacted);
-            let expression = safe_optional(expression, &mut redacted);
+            let expression = expression.and_then(|expression| {
+                if record::safe_expression(expression) {
+                    Some(expression.to_owned())
+                } else {
+                    redacted = true;
+                    None
+                }
+            });
+            let reason = if record.summary.outbound == outbound {
+                "mode_preserved"
+            } else if outbound.as_deref() == Some("direct") {
+                "mode_direct"
+            } else if record.summary.outbound.is_none() {
+                "forced_outbound"
+            } else {
+                "mode_global"
+            };
+            let gap_changed = source == "unknown" && record.mark_gap("not_instrumented");
             let source = rule_source(source);
             let changed = record.summary.outbound != outbound
                 || record.summary.rule_id != rule_id
                 || record.summary.rule_expression != expression
                 || record.summary.rule_source != source
-                || record.redacted != redacted;
+                || record.redacted != redacted
+                || !record.mode_recorded
+                || gap_changed;
             record.summary.outbound = outbound;
             record.summary.rule_id = rule_id;
             record.summary.rule_expression = expression;
             record.summary.rule_source = source;
             record.redacted = redacted;
+            if changed {
+                record.mode_recorded = true;
+                record.push_step(
+                    None,
+                    StepData::Connection {
+                        state: record.summary.state,
+                        reason,
+                        milestone: "unknown",
+                        attempt_id: None,
+                        reply_received: None,
+                        error: None,
+                        selections: Vec::new(),
+                        lookup_id: None,
+                        server_addr: None,
+                    },
+                );
+            }
             changed
         });
     }
@@ -769,6 +1075,9 @@ impl FlowGuard {
             record.redacted |= redacted;
             record.summary.state = state;
             if milestone == "terminal" || matches!(state, "closed" | "blocked" | "failed") {
+                if state == "unknown" || record.has_open_operations() {
+                    record.mark_gap("not_instrumented");
+                }
                 record.ended = Some(Instant::now());
                 record.summary.ended_at = Some(timestamp(SystemTime::now()));
             }
@@ -778,9 +1087,12 @@ impl FlowGuard {
                     state,
                     reason,
                     milestone,
-                    attempt_id: None,
+                    attempt_id: record.selected_attempt.clone(),
                     reply_received,
                     error: None,
+                    selections: Vec::new(),
+                    lookup_id: None,
+                    server_addr: None,
                 },
             ) || changed
         });
@@ -795,7 +1107,7 @@ impl FlowGuard {
             state,
             reason,
             "terminal",
-            self.replied.load(Ordering::Relaxed).then_some(true),
+            Some(self.replied.load(Ordering::Relaxed)),
         );
     }
 }
@@ -893,7 +1205,7 @@ fn snapshot_busy(id: &RequestId) -> ApiError {
 fn coverage(recording: bool) -> Value {
     let userspace = if recording { "partial" } else { "none" };
     json!({"userspace_tcp": userspace, "userspace_udp": userspace, "kernel_direct": "none",
-        "kernel_block": "none", "dns_intercept": "none", "kernel_bypass": "none"})
+        "kernel_block": "none", "dns_intercept": userspace, "kernel_bypass": "none"})
 }
 
 fn connection_state(value: &str) -> &'static str {

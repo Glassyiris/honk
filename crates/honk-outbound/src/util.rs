@@ -79,6 +79,33 @@ pub async fn connect_marked_addr(
     mark: Option<u32>,
     connect_timeout: Duration,
 ) -> io::Result<TcpStream> {
+    #[cfg(feature = "native-api")]
+    let mut attempt =
+        crate::runtime::flow_observation::TransportAttempt::start(Some(addr), "unknown");
+    let result = connect_marked_addr_inner(addr, mark, connect_timeout).await;
+    #[cfg(feature = "native-api")]
+    if let Some(attempt) = &mut attempt {
+        attempt.finish(
+            if result.is_ok() {
+                "succeeded"
+            } else {
+                "failed"
+            },
+            result.as_ref().err().map(|error| match error.kind() {
+                io::ErrorKind::TimedOut => "timeout",
+                io::ErrorKind::ConnectionRefused => "connection_refused",
+                _ => "connect_failed",
+            }),
+        );
+    }
+    result
+}
+
+async fn connect_marked_addr_inner(
+    addr: SocketAddr,
+    mark: Option<u32>,
+    connect_timeout: Duration,
+) -> io::Result<TcpStream> {
     let socket = new_tcp_socket(&addr, mark)?;
     match socket.connect(&addr.into()) {
         Ok(()) => {
@@ -118,15 +145,28 @@ pub async fn connect_marked(
     let port: u16 = port
         .parse()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad port"))?;
-    let addrs: Vec<_> = crate::bootstrap::resolve(host)
-        .await?
+    let resolution = crate::bootstrap::resolve(host);
+    #[cfg(feature = "native-api")]
+    let (resolution, selection) =
+        crate::runtime::flow_observation::observe_resolution(resolution).await;
+    #[cfg(not(feature = "native-api"))]
+    let resolution = resolution.await;
+    let addrs: Vec<_> = resolution?
         .into_iter()
         .map(|ip| SocketAddr::new(ip, port))
         .collect();
     // Address fallback stays inside one authoritative node; policy selection
     // and its dial-admission accounting remain unchanged.
     crate::address_race::race_resolved_addrs(&addrs, |addr| {
-        connect_marked_addr(addr, mark, connect_timeout)
+        #[cfg(feature = "native-api")]
+        let selection = &selection;
+        async move {
+            #[cfg(feature = "native-api")]
+            if let Some(selection) = selection {
+                selection.selected_ip(addr.ip());
+            }
+            connect_marked_addr(addr, mark, connect_timeout).await
+        }
     })
     .await
     .unwrap_or_else(|| {

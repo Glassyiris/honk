@@ -34,6 +34,8 @@ enum DnsServiceBackend {
 struct OperationToken {
     generation: u64,
     updates: watch::Receiver<u64>,
+    #[cfg(feature = "native-api")]
+    observer: std::sync::Weak<crate::native_api::dns::DnsApi>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +54,8 @@ impl OperationToken {
                 generation: self.generation,
             });
         }
+        #[cfg(feature = "native-api")]
+        let operation = crate::native_api::flows::dns::scope_api(self.observer.clone(), operation);
         tokio::pin!(operation);
         tokio::select! {
             biased;
@@ -136,16 +140,12 @@ impl DnsService {
             DnsServiceBackend::Runtime(provider) => {
                 let lease = provider.try_acquire()?;
                 operation
-                    .run(
-                        lease.run(
-                            lease
-                                .runtime()
-                                .forwarder()
-                                .resolve_strict_with_context_and_profile(
-                                    raw_query, metadata, ingress,
-                                ),
-                        ),
-                    )
+                    .run(lease.run(std::pin::pin!(lease
+                            .runtime()
+                            .forwarder()
+                            .resolve_strict_with_context_and_profile(
+                                raw_query, metadata, ingress,
+                            ))))
                     .await??
             }
             DnsServiceBackend::Standalone(forwarder) => {
@@ -169,14 +169,16 @@ impl DnsService {
     ) -> anyhow::Result<DnsOutcome> {
         let mut operation = self.operation();
         operation
-            .run(runtime.run(runtime.runtime().forwarder().resolve_inner(
-                raw_query,
-                metadata,
-                ingress,
-                &crate::dns::forwarder::ResolveOptions::default(),
-                crate::dns::forwarder::ResolveMode::Strict,
-                evidence,
-            )))
+            .run(
+                runtime.run(std::pin::pin!(runtime.runtime().forwarder().resolve_inner(
+                    raw_query,
+                    metadata,
+                    ingress,
+                    &crate::dns::forwarder::ResolveOptions::default(),
+                    crate::dns::forwarder::ResolveMode::Strict,
+                    evidence,
+                ))),
+            )
             .await??
             .map_err(Into::into)
     }
@@ -220,6 +222,12 @@ impl DnsService {
         OperationToken {
             generation,
             updates,
+            #[cfg(feature = "native-api")]
+            observer: if honk_outbound::runtime::flow_observation::current().is_some() {
+                self.observer.read().clone()
+            } else {
+                std::sync::Weak::new()
+            },
         }
     }
 }

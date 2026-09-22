@@ -115,6 +115,7 @@ pub struct ScoreSelectionPlan<'a> {
     pub mode: SelectionPlanMode,
     pub health_family: IpVersion,
     pub entries: Vec<ScoreSelectionEntry<'a>>,
+    pub observation: Option<Arc<observation::SelectionObservation>>,
 }
 
 /// Whether resolving a selection may update group state or must only observe
@@ -598,6 +599,7 @@ impl GroupManager {
 }
 
 mod filter;
+pub mod observation;
 mod policy;
 mod resolver;
 mod score;

@@ -513,7 +513,9 @@ async fn retirement_cancels_every_foreground_entry_path() {
         if let Some(closed_lease) = closed_lease {
             assert!(
                 closed_lease
-                    .run(async { panic!("closed runtime must not poll a query") })
+                    .run(std::pin::pin!(async {
+                        panic!("closed runtime must not poll a query")
+                    }))
                     .await
                     .is_err()
             );

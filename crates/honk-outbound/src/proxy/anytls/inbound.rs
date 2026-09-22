@@ -536,6 +536,8 @@ pub(super) async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedRe
             CMD_FIN => session.dispatch_fin(sid).await,
             CMD_SYNACK => {
                 session.settle_syn_pending(sid);
+                #[cfg(feature = "native-api")]
+                session.observe_synack(sid, data.is_empty());
                 if !data.is_empty() {
                     let shown = &data[..data.len().min(MAX_STREAM_ERROR_SOURCE_BYTES)];
                     let suffix = if shown.len() == data.len() {

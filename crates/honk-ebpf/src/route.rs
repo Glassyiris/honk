@@ -8,8 +8,7 @@
 use aya_ebpf::bindings::__sk_buff;
 
 use aya_ebpf_cty::c_long;
-#[cfg(feature = "routing-test")]
-use honk_ebpf_common::RoutingTestResult;
+use honk_ebpf_common::{KernelRouteOutput, KernelRouteWitness};
 use honk_ebpf_common::{
     L4ProtoType, ROUTING_FEATURE_PROCESS, ROUTING_PROCESS_MAX_LEN, RoutingDecision, RoutingInput,
 };
@@ -32,7 +31,7 @@ pub const OUTBOUND_CONTROL_PLANE_ROUTING: u8 = 0xFD;
 #[inline(never)]
 pub unsafe extern "C" fn honk_route_slot0(
     _input: *const RoutingInput,
-    _decision: *mut RoutingDecision,
+    _decision: *mut KernelRouteOutput,
 ) -> i32 {
     if _input.is_null() || _decision.is_null() {
         return -EFAULT;
@@ -42,7 +41,16 @@ pub unsafe extern "C" fn honk_route_slot0(
         for word in 0..32 {
             let _ = core::ptr::read_volatile(_input.cast::<u32>().add(word));
         }
-        core::ptr::write_volatile(_decision, RoutingDecision::default());
+        for word in 0..5 {
+            let pointer = _decision.cast::<u32>().add(word);
+            core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
+        }
+        if core::ptr::read_volatile(core::ptr::addr_of!((*_decision).flags)) & 1 != 0 {
+            for word in 5..66 {
+                let pointer = _decision.cast::<u32>().add(word);
+                core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
+            }
+        }
         core::ptr::read_volatile(core::ptr::addr_of!(ROUTING_SLOT0_ERROR))
     }
 }
@@ -53,7 +61,7 @@ pub unsafe extern "C" fn honk_route_slot0(
 #[inline(never)]
 pub unsafe extern "C" fn honk_route_slot1(
     _input: *const RoutingInput,
-    _decision: *mut RoutingDecision,
+    _decision: *mut KernelRouteOutput,
 ) -> i32 {
     if _input.is_null() || _decision.is_null() {
         return -EFAULT;
@@ -62,7 +70,16 @@ pub unsafe extern "C" fn honk_route_slot1(
         for word in 0..32 {
             let _ = core::ptr::read_volatile(_input.cast::<u32>().add(word));
         }
-        core::ptr::write_volatile(_decision, RoutingDecision::default());
+        for word in 0..5 {
+            let pointer = _decision.cast::<u32>().add(word);
+            core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
+        }
+        if core::ptr::read_volatile(core::ptr::addr_of!((*_decision).flags)) & 1 != 0 {
+            for word in 5..66 {
+                let pointer = _decision.cast::<u32>().add(word);
+                core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
+            }
+        }
         core::ptr::read_volatile(core::ptr::addr_of!(ROUTING_SLOT1_ERROR))
     }
 }
@@ -118,18 +135,16 @@ fn evaluate_policy(
     input: &mut RoutingInput,
     pname: Option<&[u8; 16]>,
     input_is_canonical: bool,
-    decision: &mut RoutingDecision,
-) -> (i32, u64) {
+    output: &mut KernelRouteOutput,
+) -> (i32, RoutingDecision, u64) {
     let zero = 0u32;
+    output.flags = 0;
     let Some(descriptor) = ROUTING_POLICY_ROOT.get_value(0, &zero) else {
-        return (-EFAULT, 0);
+        return (-EFAULT, RoutingDecision::default(), 0);
     };
     let generation = descriptor.generation;
-
+    let policy_id = descriptor.trace_policy;
     if !input_is_canonical {
-        // Process facts are meaningful only for WAN packets and only in
-        // policies that contain process predicates. Canonicalization is gated
-        // here so ordinary production routes pay no UTF-8 scan cost.
         if input.is_wan != 0
             && descriptor.features & ROUTING_FEATURE_PROCESS != 0
             && let Some(pname) = pname
@@ -140,32 +155,43 @@ fn evaluate_policy(
             input.pname_len = 0;
         }
     }
-
+    if policy_id != 0 {
+        output.flags = (1 << 24) | 1;
+    }
     let status = match descriptor.slot {
-        0 => unsafe { honk_route_slot0(input, decision) },
-        1 => unsafe { honk_route_slot1(input, decision) },
+        0 => unsafe { honk_route_slot0(input, output) },
+        1 => unsafe { honk_route_slot1(input, output) },
         _ => -EINVAL,
     };
-    // The replacement, not the visible stub body, determines these bytes.
-    *decision = unsafe {
-        RoutingDecision {
-            outbound: core::ptr::read_volatile(core::ptr::addr_of!(decision.outbound)),
-            mark: core::ptr::read_volatile(core::ptr::addr_of!(decision.mark)),
-            must: core::ptr::read_volatile(core::ptr::addr_of!(decision.must)),
-            domain_final: core::ptr::read_volatile(core::ptr::addr_of!(decision.domain_final)),
-            rule_id: core::ptr::read_volatile(core::ptr::addr_of!(decision.rule_id)),
+    // freplace writes are opaque to LLVM; retain the replacement's whole output.
+    unsafe {
+        for word in 0..5 {
+            let pointer = core::ptr::from_mut(output).cast::<u32>().add(word);
+            core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
         }
-    };
+        if policy_id != 0 {
+            for word in 5..66 {
+                let pointer = core::ptr::from_mut(output).cast::<u32>().add(word);
+                core::ptr::write_volatile(pointer, core::ptr::read_volatile(pointer));
+            }
+        }
+    }
+    if policy_id != 0 {
+        output.generation = generation;
+        output.policy_id = policy_id;
+    }
+    let mut decision = output.decision;
     if status == 0
         && input.dst_port == 53
         && (input.l4proto == L4ProtoType::Tcp as u32 || input.l4proto == L4ProtoType::Udp as u32)
         && decision.must == 0
     {
-        // Non-must DNS belongs to the controller even when ordinary traffic
-        // policy selects block; an explicit must result retains its authority.
         decision.outbound = OUTBOUND_CONTROL_PLANE_ROUTING as u32;
+        if policy_id != 0 {
+            output.flags |= 16;
+        }
     }
-    (status, generation)
+    (status, decision, generation)
 }
 
 /// Invoke the committed policy and return its decision and descriptor generation.
@@ -173,9 +199,9 @@ fn evaluate_policy(
 pub fn route(
     input: &mut RoutingInput,
     pname: Option<&[u8; 16]>,
+    output: &mut KernelRouteOutput,
 ) -> Result<(RoutingDecision, u64), c_long> {
-    let mut decision = RoutingDecision::default();
-    let (status, generation) = evaluate_policy(input, pname, false, &mut decision);
+    let (status, decision, generation) = evaluate_policy(input, pname, false, output);
     if status == 0 {
         Ok((decision, generation))
     } else if status < 0 {
@@ -190,20 +216,76 @@ pub fn route(
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn routing_test(_ctx: *mut __sk_buff) -> c_long {
-    let mut decision = RoutingDecision::default();
-    let status = match crate::maps::ROUTING_TEST_INPUT.get(0) {
-        Some(input) => {
-            let mut input = *input;
-            evaluate_policy(&mut input, None, true, &mut decision).0
-        }
-        None => -EFAULT,
+    let Some(result) = crate::maps::ROUTING_TEST_OUTPUT.get_ptr_mut(0) else {
+        return crate::action::TC_ACT_SHOT;
     };
-    let result = RoutingTestResult { status, decision };
-    if crate::maps::ROUTING_TEST_OUTPUT.set(0, result, 0).is_ok() {
-        crate::action::TC_ACT_OK
-    } else {
-        crate::action::TC_ACT_SHOT
+    let result = unsafe { &mut *result };
+    let Some(input) = crate::maps::ROUTING_TEST_INPUT.get_ptr_mut(0) else {
+        result.status = -EFAULT;
+        return crate::action::TC_ACT_OK;
+    };
+    let (status, decision, _) =
+        evaluate_policy(unsafe { &mut *input }, None, true, &mut result.trace);
+    result.status = status;
+    result.decision = decision;
+    crate::action::TC_ACT_OK
+}
+
+/// Publish the same invocation before any handoff/cache reference becomes visible.
+#[inline(always)]
+pub fn capture(
+    witness: &mut KernelRouteWitness,
+    tuple: &honk_ebpf_common::TuplesKey,
+    token: u32,
+    ambiguous: bool,
+) -> u32 {
+    if witness.output.flags & 1 == 0 {
+        return 0;
     }
+    if witness.output.policy_id == u32::MAX {
+        return u32::MAX;
+    }
+    let Some(sequence) = crate::maps::ROUTE_TRACE_SEQUENCE.get_ptr_mut(0) else {
+        return u32::MAX;
+    };
+    let sequence = unsafe { &mut *sequence };
+    unsafe { aya_ebpf_bindings::helpers::bpf_spin_lock(&mut sequence.lock) };
+    let id = if sequence.next >= u32::MAX - 1 {
+        u32::MAX
+    } else {
+        sequence.next += 1;
+        sequence.next
+    };
+    unsafe { aya_ebpf_bindings::helpers::bpf_spin_unlock(&mut sequence.lock) };
+    if id == u32::MAX {
+        return id;
+    }
+    // Copy the initialized tuple padding as well as its fields.
+    unsafe { core::ptr::copy_nonoverlapping(tuple, &mut witness.tuple, 1) };
+    witness.capture_id = id;
+    witness.decision_token = token;
+    witness.observed_ns = unsafe { aya_ebpf_bindings::helpers::bpf_ktime_get_ns() };
+    if ambiguous {
+        witness.output.flags |= 8;
+    }
+    if crate::maps::ROUTE_TRACE_MAP
+        .insert(&id, &*witness, 1)
+        .is_err()
+    {
+        u32::MAX
+    } else {
+        id
+    }
+}
+
+#[inline(always)]
+pub fn captured_generation(trace_id: u32) -> u64 {
+    if trace_id == 0 || trace_id == u32::MAX {
+        return 0;
+    }
+    crate::maps::ROUTE_TRACE_MAP
+        .get_ptr(&trace_id)
+        .map_or(0, |value| unsafe { (*value).output.generation })
 }
 
 /// Build the fixed input used by both LAN and WAN routing paths.

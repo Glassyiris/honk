@@ -193,6 +193,7 @@ async fn source_resolution_logs_real_ipv6_client_but_diagnostic_does_not() {
     let api = Arc::new(crate::native_api::dns::DnsApi::new(
         "client-resolution".into(),
         true,
+        std::sync::Weak::new(),
     ));
     service.attach_observer(Arc::downgrade(&api));
     let source: SocketAddr = "[2001:db8::1]:53123".parse().unwrap();

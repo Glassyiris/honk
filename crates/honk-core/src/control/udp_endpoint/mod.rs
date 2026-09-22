@@ -103,6 +103,12 @@ pub struct UdpEndpoint {
     native_flow: Option<Arc<crate::native_api::flows::FlowGuard>>,
     #[cfg(feature = "native-api")]
     native_pool: std::sync::Weak<UdpEndpointPool>,
+    #[cfg(feature = "native-api")]
+    native_observer: Option<honk_outbound::runtime::flow_observation::FlowObserver>,
+    #[cfg(feature = "native-api")]
+    native_terminal: Option<Arc<retirement::NativeUdpTerminal>>,
+    #[cfg(feature = "native-api")]
+    native_received_reply: AtomicBool,
     retirement: EndpointIoGuard,
 }
 
@@ -210,6 +216,12 @@ impl UdpEndpoint {
             native_flow: None,
             #[cfg(feature = "native-api")]
             native_pool: std::sync::Weak::new(),
+            #[cfg(feature = "native-api")]
+            native_observer: None,
+            #[cfg(feature = "native-api")]
+            native_terminal: None,
+            #[cfg(feature = "native-api")]
+            native_received_reply: AtomicBool::new(false),
             retirement: EndpointIoGuard(RetirementIo::new()),
         }
     }
@@ -219,9 +231,51 @@ impl UdpEndpoint {
         &mut self,
         flow: Option<Arc<crate::native_api::flows::FlowGuard>>,
         pool: &Arc<UdpEndpointPool>,
+        terminal: Option<Arc<retirement::NativeUdpTerminal>>,
     ) {
+        self.native_terminal = terminal.or_else(|| {
+            flow.clone()
+                .map(|flow| retirement::NativeUdpTerminal::new(flow, true))
+        });
         self.native_flow = flow;
         self.native_pool = Arc::downgrade(pool);
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn set_native_observer(
+        &mut self,
+        observer: Option<honk_outbound::runtime::flow_observation::FlowObserver>,
+    ) {
+        self.native_observer = observer;
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(in crate::control) fn native_drop(
+        &self,
+        reason: &'static str,
+        error: Option<&'static str>,
+    ) {
+        if let Some(flow) = &self.native_flow {
+            flow.step(
+                None,
+                crate::native_api::flows::record::StepData::Datapath {
+                    plane: "userspace",
+                    action: "drop",
+                    reason,
+                    error: error.map(crate::native_api::flows::record::FlowError::Code),
+                },
+            );
+        }
+    }
+
+    #[cfg(feature = "native-api")]
+    fn native_reply_received(&self) {
+        if let Some(flow) = &self.native_flow {
+            self.native_received_reply.store(true, Ordering::Relaxed);
+            if flow.first_reply() {
+                flow.transition("active", "reply_received", "first_reply", Some(true));
+            }
+        }
     }
 
     #[cfg(feature = "native-api")]
@@ -233,15 +287,15 @@ impl UdpEndpoint {
 
     #[cfg(feature = "native-api")]
     fn finish_native(&self, state: &'static str, reason: &'static str) {
-        if let Some(flow) = &self.native_flow {
+        if let Some(terminal) = &self.native_terminal {
             let shutdown = self
                 .native_pool
                 .upgrade()
                 .is_some_and(|pool| pool.terminal.load(Ordering::Acquire));
             if shutdown {
-                flow.finish("closed", "shutdown");
+                terminal.outcome("closed", "shutdown");
             } else {
-                flow.finish(state, reason);
+                terminal.outcome(state, reason);
             }
         }
     }
@@ -251,6 +305,11 @@ impl UdpEndpoint {
         let (state, reason) = match retirement {
             SourceRetirement::Neutral(ScoreOutcome::Timeout) if self.has_reply() => {
                 ("closed", "reply_idle")
+            }
+            SourceRetirement::Neutral(ScoreOutcome::Timeout)
+                if self.native_received_reply.load(Ordering::Relaxed) =>
+            {
+                ("failed", "timeout_after_reply")
             }
             SourceRetirement::Neutral(ScoreOutcome::Timeout) => ("failed", "timeout_before_reply"),
             SourceRetirement::Neutral(_) => ("closed", "intentional_retirement"),
@@ -327,13 +386,13 @@ impl UdpEndpoint {
     }
 
     pub fn mark_reply(&self) {
-        self.has_reply.store(true, Ordering::Relaxed);
+        let first = !self.has_reply.swap(true, Ordering::Relaxed);
         #[cfg(feature = "native-api")]
-        if let Some(flow) = &self.native_flow
-            && flow.first_reply()
-        {
-            flow.transition("active", "reply_received", "first_reply", Some(true));
+        if first && let Some(flow) = &self.native_flow {
+            flow.transition("active", "client_delivery_succeeded", "unknown", Some(true));
         }
+        #[cfg(not(feature = "native-api"))]
+        let _ = first;
         self.refresh();
         self.reply_epoch.fetch_add(1, Ordering::Release);
         self.reply_notify.notify_waiters();
@@ -440,19 +499,28 @@ impl UdpEndpoint {
     ) -> io::Result<Option<Instant>> {
         #[cfg(not(feature = "rprx"))]
         let _ = admitted;
-        match &self.transport {
-            EndpointTransport::Flow(transport) if confirmed => {
-                transport.send_packet_confirmed(data).await.map(|()| None)
+        let operation = async {
+            match &self.transport {
+                EndpointTransport::Flow(transport) if confirmed => {
+                    transport.send_packet_confirmed(data).await.map(|()| None)
+                }
+                EndpointTransport::Flow(transport) => {
+                    transport.send_packet(data).await.map(|()| None)
+                }
+                #[cfg(feature = "rprx")]
+                EndpointTransport::Source(source) => {
+                    let record_start = self.score_reporter.is_some()
+                        && !data.is_empty()
+                        && self.upload.load(Ordering::Relaxed) == 0;
+                    source.send(data, admitted, record_start).await
+                }
             }
-            EndpointTransport::Flow(transport) => transport.send_packet(data).await.map(|()| None),
-            #[cfg(feature = "rprx")]
-            EndpointTransport::Source(source) => {
-                let record_start = self.score_reporter.is_some()
-                    && !data.is_empty()
-                    && self.upload.load(Ordering::Relaxed) == 0;
-                source.send(data, admitted, record_start).await
-            }
+        };
+        #[cfg(feature = "native-api")]
+        if let Some(observer) = &self.native_observer {
+            return observer.scope(operation).await;
         }
+        operation.await
     }
 
     fn fail_source(&self, outcome: ScoreOutcome) {

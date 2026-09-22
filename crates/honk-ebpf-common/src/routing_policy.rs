@@ -8,6 +8,29 @@ pub const ROUTING_FEATURE_PROCESS: u32 = 1 << 2;
 pub const ROUTING_PROCESS_MAX_LEN: usize = 48;
 pub const ROUTING_FACT_CAPACITY: usize = 256;
 
+pub const ROUTE_TRACE_VALUES: usize = 256;
+pub const ROUTE_TRACE_WORDS: usize = ROUTE_TRACE_VALUES / 16;
+pub const ROUTE_TRACE_ENABLED: u32 = 1;
+pub const ROUTE_TRACE_COMPLETE: u32 = 1 << 1;
+pub const ROUTE_TRACE_OVERFLOW: u32 = 1 << 2;
+pub const ROUTE_TRACE_AMBIGUOUS: u32 = 1 << 3;
+pub const ROUTE_TRACE_DNS_OVERRIDE: u32 = 1 << 4;
+pub const ROUTE_TRACE_VERSION: u32 = 1 << 24;
+pub const ROUTE_TRACE_VERSION_MASK: u32 = 0xff << 24;
+pub const ROUTE_TRACE_LOST: u32 = u32::MAX;
+pub const ROUTE_TRACE_CAPACITY: u32 = 1024;
+pub const ROUTE_TRACE_SKIPPED: u32 = 0;
+pub const ROUTE_TRACE_MATCHED: u32 = 1;
+pub const ROUTE_TRACE_NOT_MATCHED: u32 = 2;
+pub const ROUTE_TRACE_UNAVAILABLE: u32 = 3;
+/// Low bits say a category was resolved, including missing facts; high bits
+/// say the consumed map entry was present (even if its bitmap was all zero).
+pub const ROUTE_FACT_DOMAIN: u32 = 1;
+pub const ROUTE_FACT_DESTINATION: u32 = 1 << 1;
+pub const ROUTE_FACT_SOURCE: u32 = 1 << 2;
+pub const ROUTE_FACT_MAC: u32 = 1 << 3;
+pub const ROUTE_FACT_PRESENT_SHIFT: u32 = 16;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoutingInput {
@@ -90,12 +113,49 @@ fn unresolved_direct_handoff_keeps_sniffing_authority() {
     }
 }
 
+/// Map-backed freplace output. The static caller supplies the descriptor
+/// identity and admission flag; the generated function owns all other trace
+/// fields and preserves the decision before static DNS/controller rewrites.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KernelRouteOutput {
+    pub decision: RoutingDecision,
+    pub flags: u32,
+    pub generation: u64,
+    pub policy_id: u32,
+    pub fact_state: u32,
+    pub input: RoutingInput,
+    pub domain_bitmap: crate::DomainRouting,
+    pub outcomes: [u32; ROUTE_TRACE_WORDS],
+}
+
+impl KernelRouteOutput {
+    pub fn outcome(&self, slot: usize) -> Option<u32> {
+        self.outcomes
+            .get(slot / 16)
+            .map(|word| (word >> ((slot % 16) * 2)) & 3)
+    }
+}
+
+/// Immutable same-invocation evidence, referenced only by its capture ID and
+/// validated against the independent tuple/token handoff authority.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KernelRouteWitness {
+    pub output: KernelRouteOutput,
+    pub tuple: crate::TuplesKey,
+    pub decision_token: u32,
+    pub capture_id: u32,
+    pub observed_ns: u64,
+}
+
 /// Result written by the optional real-kernel routing differential fixture.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RoutingTestResult {
     pub status: i32,
     pub decision: RoutingDecision,
+    pub trace: KernelRouteOutput,
 }
 
 #[repr(C)]
@@ -105,16 +165,35 @@ pub struct RoutingPolicyDescriptor {
     pub features: u32,
     pub generation: u64,
     pub domain_map_id: u32,
-    pub reserved: u32,
+    /// Frozen dictionary identity; descriptor-only generation fences retain it.
+    pub trace_policy: u32,
 }
 
 const _: () = assert!(core::mem::size_of::<RoutingInput>() == 128);
 const _: () = assert!(core::mem::size_of::<RoutingDecision>() == 20);
 const _: () = assert!(core::mem::size_of::<RoutingPolicyDescriptor>() == 24);
-const _: () = assert!(core::mem::size_of::<RoutingTestResult>() == 24);
-const _: () = assert!(core::mem::align_of::<RoutingTestResult>() == 4);
+const _: () = assert!(core::mem::size_of::<RoutingTestResult>() == 288);
+const _: () = assert!(core::mem::align_of::<RoutingTestResult>() == 8);
 const _: () = assert!(core::mem::offset_of!(RoutingTestResult, status) == 0);
 const _: () = assert!(core::mem::offset_of!(RoutingTestResult, decision) == 4);
+const _: () = assert!(core::mem::offset_of!(RoutingTestResult, trace) == 24);
+const _: () = assert!(core::mem::size_of::<KernelRouteOutput>() == 264);
+const _: () = assert!(core::mem::align_of::<KernelRouteOutput>() == 8);
+const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, decision) == 0);
+const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, flags) == 20);
+const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, generation) == 24);
+const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, policy_id) == 32);
+const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, fact_state) == 36);
+const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, input) == 40);
+const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, domain_bitmap) == 168);
+const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, outcomes) == 200);
+const _: () = assert!(core::mem::size_of::<KernelRouteWitness>() == 320);
+const _: () = assert!(core::mem::align_of::<KernelRouteWitness>() == 8);
+const _: () = assert!(core::mem::offset_of!(KernelRouteWitness, output) == 0);
+const _: () = assert!(core::mem::offset_of!(KernelRouteWitness, tuple) == 264);
+const _: () = assert!(core::mem::offset_of!(KernelRouteWitness, decision_token) == 304);
+const _: () = assert!(core::mem::offset_of!(KernelRouteWitness, capture_id) == 308);
+const _: () = assert!(core::mem::offset_of!(KernelRouteWitness, observed_ns) == 312);
 const _: () = assert!(core::mem::align_of::<RoutingInput>() == 4);
 const _: () = assert!(core::mem::offset_of!(RoutingInput, src_ip) == 0);
 const _: () = assert!(core::mem::offset_of!(RoutingInput, dst_ip) == 16);
@@ -139,7 +218,7 @@ const _: () = assert!(core::mem::offset_of!(RoutingPolicyDescriptor, slot) == 0)
 const _: () = assert!(core::mem::offset_of!(RoutingPolicyDescriptor, features) == 4);
 const _: () = assert!(core::mem::offset_of!(RoutingPolicyDescriptor, generation) == 8);
 const _: () = assert!(core::mem::offset_of!(RoutingPolicyDescriptor, domain_map_id) == 16);
-const _: () = assert!(core::mem::offset_of!(RoutingPolicyDescriptor, reserved) == 20);
+const _: () = assert!(core::mem::offset_of!(RoutingPolicyDescriptor, trace_policy) == 20);
 
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for RoutingInput {}
@@ -149,6 +228,10 @@ unsafe impl aya::Pod for RoutingDecision {}
 unsafe impl aya::Pod for RoutingPolicyDescriptor {}
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for RoutingTestResult {}
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for KernelRouteOutput {}
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for KernelRouteWitness {}
 
 /// Canonicalize the fixed process-name handoff without allocation.
 ///

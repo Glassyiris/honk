@@ -60,11 +60,24 @@ impl Catalog {
     }
 
     pub(crate) fn install(&self, config: &Config) {
+        let mut identity = self.identity.write();
+        *identity = Self::prepare_identity(config, &identity);
+    }
+
+    pub(crate) fn prepare(&self, config: &Config) -> Arc<CatalogIdentity> {
+        Self::prepare_identity(config, &self.identity.read())
+    }
+
+    /// The configuration publisher installs the same identity bound to its DNS runtime.
+    pub(crate) fn install_prepared(&self, identity: Arc<CatalogIdentity>) {
+        *self.identity.write() = identity;
+    }
+
+    fn prepare_identity(config: &Config, identity: &Arc<CatalogIdentity>) -> Arc<CatalogIdentity> {
         let effective = GroupManager::native_effective_groups(&config.groups);
         let revision = config_revision(config, &effective);
-        let mut identity = self.identity.write();
         if identity.revision == revision {
-            return;
+            return Arc::clone(identity);
         }
         let groups = effective
             .keys()
@@ -77,7 +90,7 @@ impl Catalog {
                 (name.clone(), id)
             })
             .collect();
-        *identity = Arc::new(CatalogIdentity { revision, groups });
+        Arc::new(CatalogIdentity { revision, groups })
     }
 
     pub(crate) fn snapshot(&self) -> Arc<CatalogIdentity> {

@@ -49,6 +49,17 @@ impl PooledTransport {
         raw_query: &[u8],
         feedback: Option<&ScoreFeedback>,
     ) -> anyhow::Result<Vec<u8>> {
+        #[cfg(feature = "native-api")]
+        {
+            let (upstream, carrier) = match self {
+                Self::Tcp(_) => ("tcp", "tcp"),
+                Self::Dot(_) => ("dot", "tcp"),
+                Self::Doh(_) => ("doh", "tcp"),
+                Self::Doq(_) => ("doq", "udp"),
+                Self::Doh3(_) => ("doh3", "udp"),
+            };
+            crate::native_api::flows::dns::transport(upstream, carrier);
+        }
         match self {
             Self::Tcp(transport) => transport.exchange(raw_query, feedback).await,
             Self::Dot(transport) => transport.exchange(raw_query, feedback).await,
@@ -128,6 +139,7 @@ impl UpstreamPool {
         };
         slot.acquire(|| self.build_transport(entry, proxy_node, target))
             .await
+            .map(|(value, _)| value)
     }
 
     pub fn lifecycle_stats(&self) -> super::TransportLifecycleStats {

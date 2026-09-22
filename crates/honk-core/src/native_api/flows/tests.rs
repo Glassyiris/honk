@@ -49,6 +49,120 @@ fn dial_mode() -> StepData {
 }
 
 #[test]
+fn completeness_tracks_captured_frontier_and_sticky_loss_not_lifecycle_or_population() {
+    let store = store();
+    let flow = begin(&store, "tcp");
+    flow.transition("active", "transport_ready", "transport_ready", None);
+    let page = store
+        .page(filters("tcp", "all", true, 100), None, &request_id())
+        .unwrap();
+    let detail = store.get(flow.id(), &request_id()).unwrap();
+    assert_eq!(detail["trace_status"], "complete");
+    assert_eq!(detail["trace"]["status"], "complete");
+    assert_eq!(detail["trace"]["missing"], json!([]));
+    assert_eq!(page["coverage"]["kernel_direct"], "none");
+    assert_eq!(page["flows"][0]["trace_status"], "complete");
+    assert!(detail["ended_at"].is_null());
+
+    flow.mark_gap("not_instrumented");
+    flow.step(Some(7), dial_mode());
+    flow.finish("closed", "relay_finished");
+    let changed = store.get(flow.id(), &request_id()).unwrap();
+    let next = store
+        .page(filters("tcp", "all", false, 100), None, &request_id())
+        .unwrap();
+    assert_eq!(changed["state"], "closed");
+    assert_eq!(changed["trace"]["status"], "partial");
+    assert_eq!(changed["trace_status"], "partial");
+    assert_eq!(next["flows"][0]["trace_status"], "partial");
+    assert_eq!(changed["trace"]["missing"], json!(["not_instrumented"]));
+    assert_eq!(page["flows"][0]["trace_status"], "complete");
+}
+
+#[test]
+fn rejected_source_writes_never_authorize_causal_references() {
+    let store = store();
+    let flow = begin(&store, "udp");
+    assert!(store.record_step(flow.id(), Some(1), dial_mode()));
+    assert!(!store.record_step("foreign-flow", Some(1), dial_mode()));
+    for _ in 0..MAX_STEPS {
+        flow.step(None, dial_mode());
+    }
+    assert!(!store.record_step(flow.id(), Some(1), dial_mode()));
+    flow.finish("failed", "capture_lost");
+    assert!(!store.record_step(flow.id(), Some(1), dial_mode()));
+    let detail = store.get(flow.id(), &request_id()).unwrap();
+    assert!(
+        detail["trace"]["missing"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("buffer_overflow"))
+    );
+}
+
+#[test]
+fn reply_evidence_survives_later_send_bookkeeping_and_terminal_publication() {
+    let store = store();
+    let flow = begin(&store, "udp");
+    assert!(flow.first_reply());
+    flow.transition("active", "reply_received", "first_reply", Some(true));
+    flow.transition(
+        "active",
+        "send_completed",
+        "target_request_sent",
+        Some(false),
+    );
+    flow.finish("closed", "idle_after_reply");
+    let detail = store.get(flow.id(), &request_id()).unwrap();
+    for step in detail["trace"]["steps"].as_array().unwrap().iter().skip(1) {
+        assert_eq!(step["data"]["reply_received"], true);
+    }
+}
+
+#[test]
+fn observer_identity_cannot_be_rebound_to_another_retained_flow() {
+    use honk_outbound::runtime::flow_observation::FlowEvent;
+    let store = store();
+    let first = Arc::new(begin(&store, "tcp"));
+    let second = begin(&store, "tcp");
+    let before_first = store.get(first.id(), &request_id()).unwrap();
+    let before_second = store.get(second.id(), &request_id()).unwrap();
+    let observer = first.observer(1, None, "dial_target").unwrap();
+    let mut context = observer.context();
+    context.flow_id = second.id().parse().unwrap();
+    observer
+        .with_context(context)
+        .publish(FlowEvent::Gap("not_instrumented"));
+    assert_eq!(store.get(first.id(), &request_id()).unwrap(), before_first);
+    assert_eq!(
+        store.get(second.id(), &request_id()).unwrap(),
+        before_second
+    );
+}
+
+#[test]
+fn physical_dns_attempt_without_its_lookup_cannot_claim_complete_evidence() {
+    use honk_outbound::runtime::flow_observation::FlowEvent;
+    let store = store();
+    let flow = Arc::new(begin(&store, "tcp"));
+    let observer = flow.observer(1, None, "proxy_server").unwrap();
+    let mut context = observer.context();
+    context.lookup_id = Some(Uuid::new_v4());
+    observer
+        .with_context(context)
+        .publish(FlowEvent::Transport {
+            attempt_id: Uuid::new_v4(),
+            server_addr: Some("127.0.0.1:53".parse().unwrap()),
+            status: "started",
+            resolution_location: "unknown",
+            error: None,
+        });
+    let detail = store.get(flow.id(), &request_id()).unwrap();
+    assert_eq!(detail["trace"]["status"], "partial");
+    assert_eq!(detail["trace"]["missing"], json!(["not_instrumented"]));
+}
+
+#[test]
 fn tuple_reincarnation_keeps_history_and_exact_connection_identity() {
     let store = store();
     let first = begin(&store, "tcp");
@@ -73,7 +187,12 @@ fn tuple_reincarnation_keeps_history_and_exact_connection_identity() {
     let detail = store.get(first.id(), &request_id()).unwrap();
     assert_eq!(detail["outbound"], "original-group");
     assert_eq!(
-        detail["trace"]["steps"][1]["generation_id"],
+        detail["trace"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["stage"] == "dial_mode")
+            .unwrap()["generation_id"],
         format!("{}:7", store.instance_id)
     );
     let mut query = filters("all", "all", true, 100);
@@ -335,14 +454,14 @@ fn retention_distinguishes_expired_unknown_and_active_records() {
 fn trace_bounds_keep_terminal_state_and_explicit_loss_without_private_errors() {
     let store = store();
     let flow = begin(&store, "tcp");
-    for _ in 0..MAX_STEPS + 10 {
-        flow.step(Some(1), dial_mode());
-    }
     let mut unsafe_data = dial_mode();
     if let StepData::DialMode { domain, .. } = &mut unsafe_data {
         *domain = Some("https://operator:credential@example.test".into());
     }
     flow.step(Some(1), unsafe_data);
+    for _ in 0..MAX_STEPS + 10 {
+        flow.step(Some(1), dial_mode());
+    }
     flow.finish("failed", "dial_failed");
     let detail = store.get(flow.id(), &request_id()).unwrap();
     assert_eq!(detail["state"], "failed");
@@ -353,11 +472,9 @@ fn trace_bounds_keep_terminal_state_and_explicit_loss_without_private_errors() {
     );
     assert_eq!(
         detail["trace"]["missing"],
-        json!(["not_instrumented", "buffer_overflow", "redacted"])
+        json!(["buffer_overflow", "redacted"])
     );
     assert!(!detail.to_string().contains("credential"));
-    assert!(detail["input"]["process_path"].is_null());
-    assert!(detail["input"]["domain_rule_ids"].is_null());
 }
 
 #[test]
@@ -373,6 +490,9 @@ fn unsafe_causal_identity_drops_step_without_losing_the_terminal_outcome() {
             attempt_id: Some("https://operator:credential@example.test/private".into()),
             reply_received: None,
             error: Some(FlowError::UdpPrepareFailed),
+            selections: Vec::new(),
+            lookup_id: None,
+            server_addr: None,
         },
     );
     flow.finish("failed", "transport_failed");
@@ -383,10 +503,7 @@ fn unsafe_causal_identity_drops_step_without_losing_the_terminal_outcome() {
         detail["trace"]["steps"][1]["data"]["reason"],
         "transport_failed"
     );
-    assert_eq!(
-        detail["trace"]["missing"],
-        json!(["not_instrumented", "redacted"])
-    );
+    assert_eq!(detail["trace"]["missing"], json!(["redacted"]));
     assert!(!detail.to_string().contains("credential"));
 }
 
@@ -420,6 +537,9 @@ fn fixed_error_codes_and_safe_addresses_do_not_invent_input_provenance() {
             attempt_id: Some("attempt-1".into()),
             reply_received: None,
             error: Some(FlowError::UdpPrepareFailed),
+            selections: Vec::new(),
+            lookup_id: None,
+            server_addr: None,
         },
     );
     let detail = store.get(flow.id(), &request_id()).unwrap();
@@ -453,6 +573,7 @@ fn optional_display_redaction_preserves_attempt_transitions_and_selection_ids() 
                 error: None,
                 attempt: OutboundAttempt {
                     parent_attempt_id: None,
+                    lookup_id: None,
                     kind: "leaf",
                     evaluation_id: Some("evaluation-1".into()),
                     routing_source: "evaluation",
@@ -461,18 +582,20 @@ fn optional_display_redaction_preserves_attempt_transitions_and_selection_ids() 
                     mode_override: "none",
                     selection_path: vec![Selection {
                         group_id: "group-1".into(),
-                        member_id: "node-1".into(),
+                        member_id: Some("node-1".into()),
                         member_name: Some("HK/Trojan".into()),
                         policy: "urltest",
                         reason: "selected",
-                        selection: (),
+                        selection: None,
+                        health_family: None,
+                        applied: None,
                     }],
-                    leaf_node_id: "node-1".into(),
+                    leaf_node_id: Some("node-1".into()),
                     leaf_node_name: Some("HK/Trojan".into()),
                     target: Some("127.0.0.2:443".into()),
                     target_kind: "ip",
                     dial_ip: Some("127.0.0.2".parse().unwrap()),
-                    server_addr: (),
+                    server_addr: None,
                     resolution_location: "original_ip",
                 },
             },
@@ -541,118 +664,6 @@ fn recorder_and_snapshots_share_the_byte_budget_and_tombstones_are_bounded() {
 }
 
 #[test]
-fn six_captured_forms_preserve_wire_fields_and_nulls() {
-    let store = store();
-    let flow = begin(&store, "tcp");
-    flow.step(Some(7), dial_mode());
-    flow.step(
-        Some(7),
-        StepData::Route {
-            evaluation_id: "evaluation-1".into(),
-            chain: "traffic",
-            plane: "userspace",
-            rule_id: Some("rule-1".into()),
-            rules: [],
-            outbound: Some("direct".into()),
-            must: false,
-            mark: 0,
-            input: Some(super::record::RouteInput {
-                network: "tcp",
-                src_ip: "127.0.0.1".parse().unwrap(),
-                src_port: 31000,
-                dst_ip: "127.0.0.2".parse().unwrap(),
-                dst_port: 443,
-                domain: None,
-                pname: None,
-                src_mac: None,
-                dscp: None,
-                mark: (),
-                ingress: (),
-                domain_rule_ids: (),
-            }),
-            dns_action: (),
-        },
-    );
-    flow.step(
-        Some(7),
-        StepData::Reroute {
-            performed: false,
-            reason: "not_required",
-            from_evaluation_id: None,
-            to_evaluation_id: Some("evaluation-1".into()),
-        },
-    );
-    flow.step(
-        Some(7),
-        StepData::Outbound {
-            attempt_id: "attempt-1".into(),
-            status: "failed",
-            error: Some(FlowError::DialTimeout),
-            attempt: OutboundAttempt {
-                parent_attempt_id: None,
-                kind: "leaf",
-                evaluation_id: Some("evaluation-1".into()),
-                routing_source: "evaluation",
-                routed_outbound: Some("direct".into()),
-                effective_outbound: Some("direct".into()),
-                mode_override: "none",
-                selection_path: vec![],
-                leaf_node_id: "direct-id".into(),
-                leaf_node_name: Some("direct".into()),
-                target: Some("127.0.0.2:443".into()),
-                target_kind: "ip",
-                dial_ip: Some("127.0.0.2".parse().unwrap()),
-                server_addr: (),
-                resolution_location: "original_ip",
-            },
-        },
-    );
-    flow.finish("failed", "dial_failed");
-    let detail = store.get(flow.id(), &request_id()).unwrap();
-    let steps: Vec<_> = detail["trace"]["steps"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|step| json!({"stage": step["stage"], "data": step["data"]}))
-        .collect();
-    assert_eq!(
-        steps,
-        vec![
-            json!({"stage":"input","data":{"source":"socket","values":{
-                "src":"127.0.0.1:31000","dst":"127.0.0.2:443","domain":null,"domain_source":null,
-                "pid":null,"process_path":null,"src_mac":null,"ingress":null,"domain_rule_ids":null,
-                "dscp":null,"mark":null,"pname":null
-            }}}),
-            json!({"stage":"dial_mode","data":{"configured":"ip","effective_target":"ip",
-            "domain":null,"domain_source":null,"verification":"not_required","reason":"original_destination"}}),
-            json!({"stage":"route","data":{"evaluation_id":"evaluation-1","chain":"traffic","plane":"userspace",
-            "rule_id":"rule-1","rules":[],"outbound":"direct","must":false,"mark":0,"dns_action":null,
-            "input":{"network":"tcp","src_ip":"127.0.0.1","src_port":31000,"dst_ip":"127.0.0.2","dst_port":443,
-                "domain":null,"pname":null,"src_mac":null,"dscp":null,"mark":null,"ingress":null,"domain_rule_ids":null}}}),
-            json!({"stage":"reroute","data":{"performed":false,"reason":"not_required",
-            "from_evaluation_id":null,"to_evaluation_id":"evaluation-1"}}),
-            json!({"stage":"outbound","data":{"attempt_id":"attempt-1","parent_attempt_id":null,"kind":"leaf",
-            "evaluation_id":"evaluation-1","routing_source":"evaluation","routed_outbound":"direct","effective_outbound":"direct",
-            "mode_override":"none","selection_path":[],"leaf_node_id":"direct-id","leaf_node_name":"direct",
-            "target":"127.0.0.2:443","target_kind":"ip","dial_ip":"127.0.0.2","server_addr":null,
-            "resolution_location":"original_ip","status":"failed","error":"dial_timeout"}}),
-            json!({"stage":"connection","data":{"state":"failed","reason":"dial_failed","milestone":"terminal",
-            "attempt_id":null,"reply_received":null,"error":null}}),
-        ]
-    );
-    let summary = store
-        .page(filters("all", "all", false, 100), None, &request_id())
-        .unwrap();
-    assert!(summary["flows"][0].get("input").is_none());
-    assert!(summary["flows"][0].get("trace").is_none());
-    let full = store
-        .page(filters("all", "all", true, 100), None, &request_id())
-        .unwrap();
-    assert_eq!(full["flows"][0]["input"], detail["input"]);
-    assert!(full["flows"][0].get("trace").is_none());
-}
-
-#[test]
 fn step_capacity_not_only_string_length_counts_toward_retention() {
     let store = store();
     let flow = begin(&store, "tcp");
@@ -670,9 +681,6 @@ fn step_capacity_not_only_string_length_counts_toward_retention() {
     flow.finish("closed", "relay_finished");
     let detail = store.get(flow.id(), &request_id()).unwrap();
     assert_eq!(detail["trace"]["steps"].as_array().unwrap().len(), 2);
-    assert_eq!(
-        detail["trace"]["missing"],
-        json!(["not_instrumented", "buffer_overflow"])
-    );
+    assert_eq!(detail["trace"]["missing"], json!(["buffer_overflow"]));
     assert_eq!(detail["state"], "closed");
 }

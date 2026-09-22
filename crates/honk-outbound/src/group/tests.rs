@@ -1,5 +1,7 @@
 use super::*;
 
+#[cfg(feature = "native-api")]
+mod observation;
 mod selector_networks;
 mod udp_selection;
 

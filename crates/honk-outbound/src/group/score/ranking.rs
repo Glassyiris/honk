@@ -8,6 +8,7 @@ use super::{
     ScoreSnapshot, SelectionCadence, SelectionCadenceKey, SelectionHistoryKey, SelectionReason,
     SelectionReasonKey, StateInner, Stats,
 };
+use crate::group::observation;
 use honk_config::node::Node;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -102,7 +103,9 @@ impl ScorePolicyState {
             .selection_history
             .peek(&history_key)
             .filter(|history| history.selections > 0)
+            .inspect(|history| observation::previous_node(history.current))
             .and_then(|history| nodes.iter().position(|node| node.id == history.current));
+        observation::metric("score_utility", None);
         let (selection_count, due) = if authorized {
             let cadence =
                 inner
@@ -135,6 +138,7 @@ impl ScorePolicyState {
         };
         let ordinary = ordinary_selection(&snapshots, nodes, incumbent, performance);
         if !authorized {
+            observe_reason(ordinary.reason);
             return ordinary.index;
         }
         let evaluation = super::verification::evaluate(
@@ -228,6 +232,7 @@ impl ScorePolicyState {
                 selection.reason,
             );
         }
+        observe_reason(selection.reason);
         inner.tick = inner.tick.saturating_add(1);
         let tick = inner.tick;
         mark_selected(&mut inner, group, context, nodes[selection.index].id, tick);
@@ -334,10 +339,18 @@ pub(super) fn best_index(
     let index = snapshots
         .iter()
         .enumerate()
-        .filter(|(_, score)| normal_eligible(score, performance))
+        .filter(|(index, score)| {
+            let eligible = normal_eligible(score, performance);
+            observation::score_eligible(nodes[*index].id, eligible);
+            eligible
+        })
         .max_by(|(left_index, left), (right_index, right)| {
-            utility(left, performance)
-                .total_cmp(&utility(right, performance))
+            let left_utility = utility(left, performance);
+            let right_utility = utility(right, performance);
+            observation::score(nodes[*left_index].id, left_utility);
+            observation::score(nodes[*right_index].id, right_utility);
+            left_utility
+                .total_cmp(&right_utility)
                 .then_with(|| right_index.cmp(left_index))
                 .then_with(|| nodes[*right_index].id.cmp(&nodes[*left_index].id))
         })
@@ -355,6 +368,19 @@ pub(super) fn best_index(
             SelectionReason::ReliabilityWinner
         },
     }
+}
+
+fn observe_reason(reason: SelectionReason) {
+    observation::reason(match reason {
+        SelectionReason::ColdExplore => "cold_explore",
+        SelectionReason::PeriodicExplore => "periodic_explore",
+        SelectionReason::ReliabilityWinner => "reliability_winner",
+        SelectionReason::PerformanceWinner => "performance_winner",
+        SelectionReason::IncumbentHeld => "incumbent_held",
+        SelectionReason::InsufficientEvidenceHeld => "insufficient_evidence_held",
+        SelectionReason::IncumbentIneligible => "incumbent_ineligible",
+        SelectionReason::FreshFailureBypass => "fresh_failure_bypass",
+    });
 }
 
 pub(super) fn normal_eligible(score: &ScoreSnapshot, baseline: PerformanceBaseline) -> bool {

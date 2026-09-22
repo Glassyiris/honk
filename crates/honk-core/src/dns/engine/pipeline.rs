@@ -189,6 +189,8 @@ pub(crate) async fn resolve_with_owner(
     if !is_filtered_qtype(qtype, &forwarder.strategy)
         && let Some(outcome) = forwarder.resolve_hosts(engine, &parsed, raw_query, mode)?
     {
+        #[cfg(feature = "native-api")]
+        crate::native_api::flows::dns::source("hosts", Some("bypass"));
         return Ok(outcome);
     }
     let prepared = engine.prepare_parsed(
@@ -198,6 +200,8 @@ pub(crate) async fn resolve_with_owner(
         options.forced_upstream.as_ref(),
         evidence,
     )?;
+    #[cfg(feature = "native-api")]
+    crate::native_api::flows::dns::source("unknown", Some("bypass"));
     let reuse_eligible = options.cache != CacheAccess::Bypass
         && prepared.is_cacheable()
         && prepared.is_coalescable();
@@ -268,16 +272,24 @@ pub(crate) async fn resolve_with_owner(
     loop {
         match flights.acquire(flight_key.clone()) {
             FlightRole::Rejected => return Err(DnsForwardError::Overloaded),
-            FlightRole::Waiter(waiter) => match waiter.receive().await {
-                Some(result) => {
-                    return flight::waiter_outcome(
-                        &context,
-                        result.map_err(DnsForwardError::Shared)?,
-                    )
-                    .await;
+            FlightRole::Waiter(waiter) => {
+                #[cfg(feature = "native-api")]
+                crate::native_api::flows::dns::source("coalesced", None);
+                match waiter.receive().await {
+                    Some(result) => {
+                        return flight::waiter_outcome(
+                            &context,
+                            result.map_err(DnsForwardError::Shared)?,
+                        )
+                        .await;
+                    }
+                    None => {
+                        #[cfg(feature = "native-api")]
+                        crate::native_api::flows::dns::source("unknown", None);
+                        continue;
+                    }
                 }
-                None => continue,
-            },
+            }
             FlightRole::Leader(leader) => {
                 if options.cache == CacheAccess::Normal
                     && let Some(outcome) = cache::lookup(&context, true).await?

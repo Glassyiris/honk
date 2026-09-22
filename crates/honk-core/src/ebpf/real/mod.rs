@@ -102,6 +102,12 @@ pub struct RealEbpfBackend {
     routing_slot: u32,
     routing_generation_counter: u64,
     routing_generation_sequence: AyaArray<AyaMapData, u64>,
+    next_trace_policy: u32,
+    #[cfg(feature = "native-api")]
+    trace_dictionaries: crate::native_api::flows::kernel::KernelTraceDictionaries,
+    receive_trace: Option<std::sync::Arc<receive_trace::ReceiveTrace>>,
+    receive_trace_available: bool,
+    receive_trace_attempted: bool,
     udp_staging_quiesce_incomplete: bool,
 }
 
@@ -139,6 +145,7 @@ mod events;
 mod iface_watch;
 mod observation;
 mod process_name;
+pub(crate) mod receive_trace;
 mod routing;
 mod syscall;
 #[cfg(test)]
@@ -820,6 +827,15 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     fn routing_handoff_take(&self, key: &TuplesKey) -> anyhow::Result<Option<RoutingHandoffEntry>> {
+        Ok(self
+            .routing_handoff_take_observed(key)?
+            .map(|(entry, _)| entry))
+    }
+
+    fn routing_handoff_take_observed(
+        &self,
+        key: &TuplesKey,
+    ) -> anyhow::Result<Option<(RoutingHandoffEntry, bool)>> {
         let bpf = self.bpf()?;
         match bpf_lookup_and_delete::<_, RoutingHandoffEntry>(
             bpf,
@@ -827,17 +843,60 @@ impl EbpfBackend for RealEbpfBackend {
             "ROUTING_HANDOFF_MAP",
             key,
         )? {
-            LookupAndDelete::Value(entry) => return Ok(Some(entry)),
+            LookupAndDelete::Value(entry) => return Ok(Some((entry, true))),
             LookupAndDelete::Missing => return Ok(None),
             LookupAndDelete::Unsupported => {}
         }
-        // This legacy non-atomic fallback may lose a replacement. Ordinary
-        // flows can re-route; transparent TCP DNS rejects missing authority.
         let entry = self.hash_lookup("ROUTING_HANDOFF_MAP", key)?;
         if entry.is_some() {
             bpf_delete_shared(bpf, "ROUTING_HANDOFF_MAP", key)?;
         }
-        Ok(entry)
+        Ok(entry.map(|entry| (entry, false)))
+    }
+
+    #[cfg(feature = "native-api")]
+    fn bind_kernel_trace_dictionary(
+        &mut self,
+        dictionary: crate::native_api::flows::kernel::KernelTraceDictionary,
+    ) {
+        if let Some(owner) = &self.routing_generation {
+            self.trace_dictionaries
+                .bind(owner.trace_policy, owner.fingerprint, dictionary);
+        }
+    }
+
+    #[cfg(feature = "native-api")]
+    fn capture_kernel_route(
+        &self,
+        key: &TuplesKey,
+        reference: crate::native_api::flows::kernel::KernelRouteReference,
+    ) -> Result<crate::native_api::flows::kernel::CapturedKernelRoute, &'static str> {
+        if reference.trace_id == 0 {
+            return Err("kernel_trace_not_captured");
+        }
+        if reference.trace_id == ROUTE_TRACE_LOST {
+            return Err("kernel_trace_lost");
+        }
+        let witness = self
+            .hash_lookup::<_, KernelRouteWitness>("ROUTE_TRACE_MAP", &reference.trace_id)
+            .map_err(|_| "kernel_trace_lookup_failed")?
+            .ok_or("kernel_trace_sidecar_missing")?;
+        self.trace_dictionaries.capture(&witness, key, reference)
+    }
+
+    fn receive_trace(&mut self) -> Option<std::sync::Arc<receive_trace::ReceiveTrace>> {
+        if !self.receive_trace_attempted {
+            self.receive_trace_attempted = true;
+            if !self.receive_trace_available {
+                warn!("kernel UDP trace unavailable: checked BTF offsets missing");
+            } else {
+                match receive_trace::ReceiveTrace::attach(self.bpf_mut().ok()?) {
+                    Ok(trace) => self.receive_trace = Some(trace),
+                    Err(error) => warn!(%error, "kernel UDP trace attach unavailable"),
+                }
+            }
+        }
+        self.receive_trace.clone()
     }
 
     fn cookie_pid_lookup(&self, c: u64) -> anyhow::Result<Option<PIDName>> {

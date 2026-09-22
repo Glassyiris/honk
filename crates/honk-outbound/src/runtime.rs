@@ -12,6 +12,8 @@
 //! QUIC protocols own their per-node client (and shared connection) here.
 
 mod admission;
+#[cfg(feature = "native-api")]
+pub mod flow_observation;
 mod tasks;
 pub use tasks::TaskOwner;
 pub use tasks::TaskScope;

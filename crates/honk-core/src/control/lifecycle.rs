@@ -372,8 +372,21 @@ impl ControlPlane {
                     self.concurrency_limit.clone(),
                     self.stats.clone(),
                     self.drain_tracker.clone(),
+                    #[cfg(feature = "native-api")]
+                    self.native.clone(),
+                    #[cfg(feature = "native-api")]
+                    self.diagnostics.clone(),
                 )?);
             }
+            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+            let record_flows = self.native.is_some()
+                && self
+                    .config
+                    .read()
+                    .await
+                    .experimental
+                    .native_api
+                    .record_flows;
             let state = UdpLoopState::new(self, daens_netns_exists());
             for (socket, family) in epoch
                 .listeners
@@ -384,6 +397,16 @@ impl ControlPlane {
             {
                 let state = state.clone();
                 let socket = Arc::clone(socket);
+                let batch = sockets::UdpRecvBatch::new()?;
+                #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+                let mut batch = batch;
+                #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+                if record_flows && batch.enable_trace(&socket, None).is_err() {
+                    let trace = self.ebpf.write().await.receive_trace();
+                    if let Err(error) = batch.enable_trace(&socket, trace) {
+                        warn!(family, %error, "UDP receive trace unavailable");
+                    }
+                }
                 let mut stopping = epoch.stop.subscribe();
                 let mut exit = CriticalTaskExit {
                     name: "udp_listener_loop",
@@ -394,7 +417,7 @@ impl ControlPlane {
                     tokio::select! {
                         biased;
                         _ = stopping.changed() => exit.expected_stop(),
-                        _ = udp_listener_loop(state, socket, family) => {},
+                        _ = udp_listener_loop(state, socket, family, batch) => {},
                     }
                 });
             }

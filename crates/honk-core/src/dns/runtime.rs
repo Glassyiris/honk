@@ -127,6 +127,8 @@ pub(crate) struct DnsRuntime {
     lifecycle_enabled: AtomicBool,
     #[cfg(feature = "native-api")]
     network_tasks: std::sync::LazyLock<Arc<honk_outbound::runtime::TaskOwner>>,
+    #[cfg(feature = "native-api")]
+    flow_catalog: std::sync::OnceLock<Arc<crate::native_api::catalog::CatalogIdentity>>,
 }
 
 impl DnsRuntime {
@@ -148,11 +150,24 @@ impl DnsRuntime {
             network_tasks: std::sync::LazyLock::new(|| {
                 Arc::new(honk_outbound::runtime::TaskOwner::production())
             }),
+            #[cfg(feature = "native-api")]
+            flow_catalog: std::sync::OnceLock::new(),
         })
     }
 
     pub(crate) const fn generation(&self) -> RuntimeGeneration {
         self.parts.generation
+    }
+
+    #[cfg(feature = "native-api")]
+    pub(crate) fn bind_flow_catalog(
+        &self,
+        identity: Arc<crate::native_api::catalog::CatalogIdentity>,
+    ) {
+        assert!(
+            self.flow_catalog.set(identity).is_ok(),
+            "DNS catalog must be bound before publication exactly once"
+        );
     }
 
     pub(crate) fn state(&self) -> RuntimeState {
@@ -353,8 +368,29 @@ impl RuntimeLease {
 
     pub(crate) async fn run<T>(
         &self,
-        operation: impl Future<Output = T>,
+        operation: std::pin::Pin<&mut impl Future<Output = T>>,
     ) -> Result<T, RuntimeCancelled> {
+        #[cfg(feature = "native-api")]
+        let observer = honk_outbound::runtime::flow_observation::current().map(|observer| {
+            let mut context = observer.context();
+            context.generation = self.runtime.generation().get();
+            observer.with_context(context)
+        });
+        #[cfg(feature = "native-api")]
+        let operation = async {
+            match observer {
+                Some(observer) => {
+                    crate::native_api::flows::dns::scope_catalog(
+                        self.runtime.flow_catalog.get().cloned(),
+                        observer.scope(operation),
+                    )
+                    .await
+                }
+                None => operation.await,
+            }
+        };
+        #[cfg(feature = "native-api")]
+        let operation = std::pin::pin!(operation);
         #[cfg(feature = "native-api")]
         let operation = async {
             if self.runtime.lifecycle_enabled.load(Ordering::Acquire) {

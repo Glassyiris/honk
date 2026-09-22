@@ -1,5 +1,6 @@
 use super::*;
 mod dns_ownership;
+mod native_trace;
 mod predicate_semantics;
 mod publication;
 mod readiness;

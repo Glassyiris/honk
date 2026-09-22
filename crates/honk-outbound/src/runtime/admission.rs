@@ -180,26 +180,56 @@ pub struct DialPermit {
 pub(crate) struct CapturedDialScope(
     Arc<DialScope>,
     #[cfg(feature = "native-api")] Option<std::sync::Weak<super::tasks::TaskOwner>>,
+    #[cfg(feature = "native-api")] Option<super::flow_observation::FlowObserver>,
 );
 
 impl CapturedDialScope {
+    #[cfg(feature = "native-api")]
+    pub(crate) fn without_observer(mut self) -> Self {
+        self.2 = None;
+        self
+    }
+
     fn standalone() -> Self {
         Self(
             DialScope::new(DialAdmission::standalone(), None),
             #[cfg(feature = "native-api")]
             super::tasks::capture_owner(),
+            #[cfg(feature = "native-api")]
+            super::flow_observation::current(),
         )
     }
 
-    pub(crate) async fn scope<F>(self, future: F) -> F::Output
+    pub(crate) fn scope<F>(self, future: F) -> impl Future<Output = F::Output>
     where
         F: Future,
     {
-        let future = DIAL_SCOPE.scope(self.0, future);
         #[cfg(feature = "native-api")]
-        return super::tasks::scope_owner(self.1, future).await;
+        let suppressed = super::flow_observation::is_suppressed();
+        #[cfg(feature = "native-api")]
+        let captured = if suppressed {
+            self.without_observer()
+        } else {
+            self
+        };
         #[cfg(not(feature = "native-api"))]
-        future.await
+        let captured = self;
+        async move {
+            let future = DIAL_SCOPE.scope(captured.0, future);
+            #[cfg(feature = "native-api")]
+            {
+                let observation = async {
+                    if suppressed || super::flow_observation::is_suppressed() {
+                        super::flow_observation::without(future).await
+                    } else {
+                        super::flow_observation::scope(captured.2, future).await
+                    }
+                };
+                super::tasks::scope_owner(captured.1, observation).await
+            }
+            #[cfg(not(feature = "native-api"))]
+            future.await
+        }
     }
 }
 
@@ -226,7 +256,7 @@ impl CapturedDialAdmission {
     {
         let future = DIAL_SCOPE.scope(DialScope::new(self.0, None), future);
         #[cfg(feature = "native-api")]
-        return super::tasks::scope_owner(self.1, future).await;
+        return super::tasks::scope_owner(self.1, super::flow_observation::without(future)).await;
         #[cfg(not(feature = "native-api"))]
         future.await
     }
@@ -239,6 +269,8 @@ pub(crate) fn capture_dial_scope() -> CapturedDialScope {
                 Arc::clone(scope),
                 #[cfg(feature = "native-api")]
                 super::tasks::capture_owner(),
+                #[cfg(feature = "native-api")]
+                super::flow_observation::current(),
             )
         })
         .unwrap_or_else(|_| CapturedDialScope::standalone())

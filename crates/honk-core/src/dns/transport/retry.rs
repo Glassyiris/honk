@@ -22,13 +22,27 @@ where
     ResetFut: Future<Output = ()>,
 {
     let reporter = feedback.map(honk_outbound::group::ScoreFeedback::start);
-    let result = match once(reporter.clone()).await {
+    let first_result = {
+        let exchange = once(reporter.clone());
+        #[cfg(feature = "native-api")]
+        let exchange = std::pin::pin!(exchange);
+        #[cfg(feature = "native-api")]
+        let exchange = crate::native_api::flows::dns::transport_exchange_scope(raw_query, exchange);
+        exchange.await
+    };
+    let result = match first_result {
         Ok(response) => Ok(response),
         Err(first) if !should_retry(&first) => Err(first),
         Err(first) => {
             record_reset(label);
             reset(&first).await;
-            once(reporter.clone()).await.map_err(|error| {
+            let exchange = once(reporter.clone());
+            #[cfg(feature = "native-api")]
+            let exchange = std::pin::pin!(exchange);
+            #[cfg(feature = "native-api")]
+            let exchange =
+                crate::native_api::flows::dns::transport_exchange_scope(raw_query, exchange);
+            exchange.await.map_err(|error| {
                 let detail = error.to_string();
                 error.context(format!(
                     "{label} failed after retry: {detail} (first: {first})"

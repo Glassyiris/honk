@@ -16,7 +16,7 @@
 | GET | `/api/v1/runtime?detail=summary\|full` | 引擎 phase、已接受代次与具有独立时间戳的用户态流量。 |
 | GET | `/api/v1/connections?type=all\|tcp\|udp&src=192.0.2.1&limit=100&detail=summary\|full` | 可见的活跃用户态连接；可选 `src` 必须为无端口 IP literal。 |
 | DELETE | `/api/v1/connections/{connection_id}`、`/api/v1/connections` | 确认精确 transport owner 关闭；批量需过滤器或显式 `all=true`。 |
-| GET | `/api/v1/flows`、`/api/v1/flows/{flow_id}` | 活跃及保留的终态用户态决策；detail 包含捕获的 partial trace。 |
+| GET | `/api/v1/flows`、`/api/v1/flows/{flow_id}` | 活跃及保留的终态用户态决策；detail 包含执行源头记录的 trace。 |
 | GET | `/api/v1/nodes` | 稳定节点 ID、当前直接成员/订阅来源与真实测量。 |
 | POST | `/api/v1/nodes` | 用 `{name,link}` 创建主文件节点；真实激活后才返回 201。 |
 | DELETE | `/api/v1/nodes/{id}` | 删除主文件 inline 节点；激活后返回 `{deleted:0\|1}`。 |
@@ -73,9 +73,15 @@ TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，
 
 ### 用户态记录流（M2）
 
-原生 listener 启用后默认记录，不依赖 dashboard 订阅。`record_flows: false` 在重启后关闭记录并释放缓冲。进程内最多保留 1024 条 flow、每条 64 steps，含 snapshot 的总保留预算 8 MiB；终态最多保留 300 秒，压力下可提前淘汰，重启清空。由既有 sampler 清理，不新增 timer。
+原生 listener 启用后默认记录，不依赖 dashboard 订阅。`record_flows: false` 在重启后关闭记录并释放缓冲。进程内最多保留 1024 条 flow、每条 64 steps，含 snapshot 与内核字典预留的总预算 8 MiB；终态最多保留 300 秒，压力下可提前淘汰，重启清空。由既有 sampler 清理，不新增 timer。
 
-Flow ID 表示 incarnation，不是五元组。TCP/UDP 在真实 route/sniff/verification/selected-leaf/attempt/terminal 边界捕获，拨号失败或阻断即使没有 live connection 也保留。名称、ID、代次取自决策时，不与当前选择重建关联。内核 offload 以 unknown 结束观察，不伪造连接 closed。Rule 内部执行、DNS 子步骤和底层 transport attempt 尚未完整捕获，因此 trace 为 partial，kernel/DNS scope 为 none，不开放 full_transparency。
+Flow ID 表示 incarnation，不是五元组。TCP/UDP 捕获真实执行的路由谓词与短路、嗅探/校验、群组选择、DNS 子查询、物理尝试、会话复用/重试及终态边界；拨号失败或阻断即使没有 live connection 也保留。名称、ID、代次来自实际使用它们的操作，不按当前配置或路由模拟重建。DNS lookup/parent ID 与 outbound attempt/parent ID 保留因果关系；复用 carrier 记录为 attachment，不伪造新物理拨号。协议请求/确认 milestone 必须有真实协议证据，DNS 子步骤就绪不能成为业务目标确认。TCP/UDP 终态跟随所属清理边界；内核 offload 以 unknown 结束观察，不伪造 closed。
+
+只有该 flow 范围内截至当前进度已执行的决策均被捕获，`trace_status` 与 `trace.status` 才是 `complete`。Active、failed、closed 均可完整；这不代表成功或全局覆盖。来源缺失/歧义、必要证据脱敏及捕获预算耗尽，会保持 `partial` 并列出 `missing` 原因；达到 trace 上限不停止转发。用户态 TCP/UDP 和截获 DNS 的总体覆盖仍为 `partial`，仅内核处理的 direct/block/bypass 仍为 `none`，不开放 `full_transparency`。
+
+交接流量的内核规则结果来自编译程序实际执行的分支 witness，不做用户态重算。UDP 还必须使用收到报文携带的 capture ID；五元组、decision token、路由代次与动作均须匹配保留 witness，后来的同元组 incarnation 不能为旧报文提供证据。Capture ID 不回绕。冻结字典最多 16 份、每份 64 KiB、总计 1 MiB，计入 recorder 预留；字典拒绝/淘汰、witness 缺失、TCP 对应歧义及实际执行超出 256 个规则/条件值，都会使证据不完整；仅未执行的规则超出该值上限，不代表执行证据丢失。
+
+原生扩展字段保留来源细节而不虚构身份：路由输入可携带 `ingress`、`domain_fact_bitmap`、`domain_fact_state`，不伪造 domain rule ID；DNS 关联的 outbound/connection step 带 `lookup_id`，已知物理对端带 `server_addr`。选择事实保留健康 IP 族以及实际应用还是仅 peek。Score 的 `previous_leaf_node_id` 与 `previous_member_id` 分开：叶节点历史不能重建过去经过的子组路径。
 
 Flow list 接受 `network/state/connection_id/detail/limit/cursor`。最多八份有界不可变 snapshot，TTL 30 秒，游标绑定 instance 与原过滤器/detail。表满时淘汰最旧 snapshot；保留字节预算耗尽才返回 503 与 Retry-After。过期或被淘汰的列表返回 `410 snapshot_expired`，已知淘汰 ID 的有界 tombstone 返回 `410 flow_expired`，未知 ID 返回 `404 resource_not_found`。Detail 不接受 query，始终返回保留的 full input/trace。计数为十进制字符串，revision/seq/elapsed_us 为 safe JSON number；不安全的可选显示字段置 null，不丢弃因果 ID 或结果。
 

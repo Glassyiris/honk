@@ -51,6 +51,12 @@ pub(super) struct HandoffResult {
     pub(super) mac: [u8; 6],
     pub(super) pname: [u8; 16],
     pub(super) pid: u32,
+    #[cfg(feature = "native-api")]
+    pub(super) trace_id: u32,
+    #[cfg(feature = "native-api")]
+    pub(super) capture: Option<crate::native_api::flows::kernel::CapturedKernelRoute>,
+    #[cfg(feature = "native-api")]
+    pub(super) capture_gap: Option<&'static str>,
 }
 
 impl From<RoutingHandoffEntry> for HandoffResult {
@@ -65,11 +71,64 @@ impl From<RoutingHandoffEntry> for HandoffResult {
             mac: entry.result.mac,
             pname: entry.result.pname,
             pid: entry.result.pid,
+            #[cfg(feature = "native-api")]
+            trace_id: entry.trace_id,
+            #[cfg(feature = "native-api")]
+            capture: None,
+            #[cfg(feature = "native-api")]
+            capture_gap: Some("kernel_trace_not_captured"),
         }
     }
 }
 
 impl HandoffResult {
+    fn captured(
+        backend: &dyn crate::ebpf::EbpfBackend,
+        key: &TuplesKey,
+        entry: RoutingHandoffEntry,
+        atomic: bool,
+    ) -> Self {
+        let handoff = Self::from(entry);
+        #[cfg(feature = "native-api")]
+        let handoff = {
+            let mut handoff = handoff;
+            match backend.capture_kernel_route(key, (&entry).into()) {
+                Ok(mut capture) => {
+                    if !atomic {
+                        capture.gap = Some("kernel_handoff_nonatomic_take");
+                        capture.ambiguous = true;
+                    }
+                    if key.dst_port != 53 {
+                        let state = if key.l4proto == 6 {
+                            backend.tcp_conn_state_lookup(key)
+                        } else {
+                            backend.udp_conn_state_lookup(key)
+                        };
+                        if !state.ok().flatten().is_some_and(|state| {
+                            state.trace_id == entry.trace_id
+                                && state.decision_token == entry.result.decision_token
+                        }) {
+                            capture.gap = Some("kernel_trace_conn_incarnation_mismatch");
+                            capture.ambiguous = true;
+                        }
+                    }
+                    handoff.capture_gap = capture.gap;
+                    handoff.capture = Some(capture);
+                }
+                Err(gap) => {
+                    handoff.capture_gap = Some(if atomic {
+                        gap
+                    } else {
+                        "kernel_handoff_nonatomic_take"
+                    })
+                }
+            }
+            handoff
+        };
+        #[cfg(not(feature = "native-api"))]
+        let _ = (backend, key, atomic);
+        handoff
+    }
     /// Convert the eBPF process name byte array to an optional string.
     /// Treats the array as NUL-terminated or fixed-length, trimming trailing
     /// NULs and whitespace.
@@ -345,13 +404,12 @@ impl ControlPlaneHandle {
     /// backend (and its map fds) alive against `cleanup()`, which takes the
     /// write lock.
     pub(super) async fn lookup_handoff(&self, tuples: &TuplesKey) -> Option<HandoffResult> {
-        self.ebpf
-            .read()
-            .await
-            .routing_handoff_take(tuples)
+        let backend = self.ebpf.read().await;
+        backend
+            .routing_handoff_take_observed(tuples)
             .ok()
             .flatten()
-            .map(Into::into)
+            .map(|(entry, atomic)| HandoffResult::captured(backend.as_ref(), tuples, entry, atomic))
     }
 
     /// Staged UDP transitions consume their handoff atomically at commit, so
@@ -373,10 +431,8 @@ impl ControlPlaneHandle {
                 handoff
             });
         }
-        let entry = self
-            .ebpf
-            .read()
-            .await
+        let backend = self.ebpf.read().await;
+        let entry = backend
             .routing_handoff_lookup(tuples)?
             .ok_or_else(|| anyhow::anyhow!("staged UDP flow has no routing handoff"))?;
         if entry.result.decision_token != decision_token {
@@ -386,7 +442,12 @@ impl ControlPlaneHandle {
                 entry.result.decision_token
             );
         }
-        Ok(Some(entry.into()))
+        Ok(Some(HandoffResult::captured(
+            backend.as_ref(),
+            tuples,
+            entry,
+            true,
+        )))
     }
 
     pub(super) async fn adopt_tcp_flow(
@@ -413,10 +474,12 @@ impl ControlPlaneHandle {
             Arc::clone(&self.connection_tracker),
         );
         let handoff = backend
-            .routing_handoff_take(&tuples)
+            .routing_handoff_take_observed(&tuples)
             .ok()
             .flatten()
-            .map(Into::into);
+            .map(|(entry, atomic)| {
+                HandoffResult::captured(backend.as_ref(), &tuples, entry, atomic)
+            });
         Ok((flow, handoff))
     }
 
@@ -531,3 +594,30 @@ impl ControlPlaneHandle {
 #[cfg(test)]
 #[path = "tcp_flow_lifecycle_tests.rs"]
 mod tcp_flow_lifecycle_tests;
+
+#[cfg(all(test, feature = "native-api"))]
+#[test]
+fn nonatomic_take_downgrades_evidence_without_changing_handoff_authority() {
+    let backend = crate::ebpf::mock::MockEbpfBackend::new();
+    let entry = RoutingHandoffEntry {
+        result: honk_ebpf_common::RoutingResult {
+            outbound: 2,
+            mark: 0x42,
+            must: 1,
+            ..Default::default()
+        },
+        routing_generation: 9,
+        ..Default::default()
+    };
+    let result = HandoffResult::captured(&backend, &TuplesKey::default(), entry, false);
+    assert_eq!(result.capture_gap, Some("kernel_handoff_nonatomic_take"));
+    assert_eq!(
+        (
+            result.outbound,
+            result.mark,
+            result.must,
+            result.routing_generation
+        ),
+        (2, 0x42, 1, 9)
+    );
+}

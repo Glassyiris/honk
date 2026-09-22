@@ -329,7 +329,9 @@ async fn pinned_generation_survives_restart_and_failed_fence() {
         true,
     )];
     let router = Router::new(&rules, "direct").unwrap();
-    let plan = RoutingPushPlan::compile(&router, &outbound_ids(), "direct", DialMode::Ip).unwrap();
+    let mut plan =
+        RoutingPushPlan::compile(&router, &outbound_ids(), "direct", DialMode::Ip).unwrap();
+    plan.enable_trace(true);
     let mut connection = golden::connection();
     connection.dst_port = 53;
     let input = input(&connection);
@@ -342,6 +344,7 @@ async fn pinned_generation_survives_restart_and_failed_fence() {
     assert_eq!(decision.outbound, 2);
     assert_eq!(decision.must, 1);
     let before = published_descriptor(&backend);
+    assert_ne!(before.trace_policy, 0);
 
     backend
         .set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED)
@@ -350,6 +353,9 @@ async fn pinned_generation_survives_restart_and_failed_fence() {
     let fenced = backend.routing_policy_generation();
     assert!(fenced > initial);
     assert_eq!(backend.run_routing_test(&input).unwrap().decision, decision);
+    let fenced_trace = backend.run_routing_test(&input).unwrap().trace;
+    assert_eq!(fenced_trace.policy_id, before.trace_policy);
+    assert_eq!(fenced_trace.generation, fenced);
     assert_eq!(
         published_descriptor(&backend),
         honk_ebpf_common::RoutingPolicyDescriptor {
@@ -374,6 +380,9 @@ async fn pinned_generation_survives_restart_and_failed_fence() {
     assert!(failed_fence > reserved);
     assert_eq!(backend.routing_policy_generation(), fenced);
     assert_eq!(backend.run_routing_test(&input).unwrap().decision, decision);
+    let preserved_trace = backend.run_routing_test(&input).unwrap().trace;
+    assert_eq!(preserved_trace.policy_id, before.trace_policy);
+    assert_eq!(preserved_trace.generation, fenced);
     assert_eq!(
         published_descriptor(&backend),
         honk_ebpf_common::RoutingPolicyDescriptor {

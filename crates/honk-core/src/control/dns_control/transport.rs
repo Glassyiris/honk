@@ -18,6 +18,33 @@ impl DnsController {
         original_dst: SocketAddr,
         validated: ValidatedDnsQuery,
     ) {
+        let operation = self.handle_udp_dns_admitted_inner(
+            admission,
+            data,
+            client_addr,
+            original_dst,
+            validated,
+        );
+        #[cfg(feature = "native-api")]
+        let operation = std::pin::pin!(operation);
+        #[cfg(feature = "native-api")]
+        let operation = crate::native_api::flows::dns::client_scope(
+            data,
+            validated.ingress(),
+            DnsRequestMeta::new(Some(client_addr.ip()), Some(original_dst)),
+            operation,
+        );
+        operation.await;
+    }
+
+    async fn handle_udp_dns_admitted_inner(
+        &self,
+        admission: &super::AdmittedDnsQuery,
+        data: &[u8],
+        client_addr: SocketAddr,
+        original_dst: SocketAddr,
+        validated: ValidatedDnsQuery,
+    ) {
         #[cfg(feature = "native-api")]
         let started = std::time::Instant::now();
         debug!(%client_addr, "DNS controller (UDP): forwarding query");
@@ -29,13 +56,22 @@ impl DnsController {
                 validated.ingress(),
             )
             .await;
-        let _ = admission
+        let _delivery = admission
             .run_reply(super::super::send_udp_reply_from_orig_dst(
                 response.wire(),
                 client_addr,
                 original_dst,
             ))
             .await;
+        #[cfg(feature = "native-api")]
+        {
+            let (status, error) = match &_delivery {
+                Ok(Ok(length)) if *length == response.wire().len() => ("delivered", None),
+                Err(_) => ("cancelled", Some("runtime_retired")),
+                _ => ("delivery_failed", Some("client_send_failed")),
+            };
+            crate::native_api::flows::dns::delivery(status, error);
+        }
         #[cfg(feature = "native-api")]
         self.dns_service.observe_client(
             data,
@@ -107,6 +143,26 @@ impl DnsController {
         client_addr: SocketAddr,
         metadata: DnsRequestMeta,
     ) -> anyhow::Result<()> {
+        let operation = self.process_tcp_query_inner(stream, query, client_addr, metadata);
+        #[cfg(feature = "native-api")]
+        let operation = std::pin::pin!(operation);
+        #[cfg(feature = "native-api")]
+        let operation = crate::native_api::flows::dns::client_scope(
+            query,
+            IngressProfile::Tcp,
+            metadata,
+            operation,
+        );
+        operation.await
+    }
+
+    async fn process_tcp_query_inner(
+        &self,
+        stream: &mut TcpStream,
+        query: &[u8],
+        client_addr: SocketAddr,
+        metadata: DnsRequestMeta,
+    ) -> anyhow::Result<()> {
         #[cfg(feature = "native-api")]
         let started = std::time::Instant::now();
         #[cfg(not(feature = "native-api"))]
@@ -115,8 +171,23 @@ impl DnsController {
         let admission = match self.try_admit_query(false) {
             Ok(admission) => admission,
             Err(_) => {
+                #[cfg(feature = "native-api")]
+                crate::native_api::flows::dns::decision("rejected", Some("admission_refused"));
                 let response = build_dns_refused(query);
                 let result = write_tcp_dns_response(stream, &response, TCP_DNS_IO_TIMEOUT).await;
+                #[cfg(feature = "native-api")]
+                crate::native_api::flows::dns::delivery(
+                    if result.is_ok() {
+                        "delivered"
+                    } else {
+                        "delivery_failed"
+                    },
+                    if result.is_ok() {
+                        None
+                    } else {
+                        Some("client_write_failed")
+                    },
+                );
                 #[cfg(feature = "native-api")]
                 self.dns_service.observe_client(
                     query,
@@ -140,6 +211,15 @@ impl DnsController {
             ))
             .await
             .map_err(|_| anyhow::anyhow!("DNS runtime retired during TCP response write"));
+        #[cfg(feature = "native-api")]
+        {
+            let (status, error) = match &result {
+                Ok(Ok(())) => ("delivered", None),
+                Err(_) => ("cancelled", Some("runtime_retired")),
+                _ => ("delivery_failed", Some("client_write_failed")),
+            };
+            crate::native_api::flows::dns::delivery(status, error);
+        }
         #[cfg(feature = "native-api")]
         self.dns_service.observe_client(
             query,

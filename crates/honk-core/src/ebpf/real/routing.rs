@@ -36,6 +36,8 @@ pub(super) struct RoutingGeneration {
     _source_v6: RoutingLpm,
     _mac: RoutingLpm,
     descriptor: RoutingDescriptor,
+    pub(super) trace_policy: u32,
+    pub(super) fingerprint: [u8; 32],
     _btf: OwnedFd,
     _program: OwnedFd,
     _links: Vec<OwnedFd>,
@@ -324,7 +326,7 @@ impl RealEbpfBackend {
                 && value.generation != 0
                 && value.slot == self.routing_slot
                 && value.slot < ROUTING_SLOT_NAMES.len() as u32
-                && value.reserved == 0
+                && value.trace_policy == owner.trace_policy
                 && value.domain_map_id == owner.domain.map().info()?.id(),
             "routing root differs from its owner"
         );
@@ -409,6 +411,12 @@ impl RealEbpfBackend {
         learned_domains: &[(LpmKey, DomainRouting)],
     ) -> anyhow::Result<()> {
         let generation = self.reserve_routing_generation()?;
+        let trace_policy = if plan.trace_enabled() {
+            self.next_trace_policy = self.next_trace_policy.saturating_add(1);
+            self.next_trace_policy
+        } else {
+            0
+        };
         let active = self.routing_slot;
         anyhow::ensure!(
             active < ROUTING_SLOT_NAMES.len() as u32,
@@ -432,7 +440,7 @@ impl RealEbpfBackend {
             features: plan.features,
             generation,
             domain_map_id,
-            reserved: 0,
+            trace_policy,
         };
         let descriptor = self.publish_routing_descriptor(descriptor_value)?;
 
@@ -444,6 +452,8 @@ impl RealEbpfBackend {
             _source_v6: maps.source_v6,
             _mac: maps.mac,
             descriptor,
+            trace_policy,
+            fingerprint: plan.fingerprint,
             _btf: btf,
             _program: program,
             _links: links,
@@ -503,6 +513,12 @@ impl RealEbpfBackend {
             routing_slot: 0,
             routing_generation_counter: 0,
             routing_generation_sequence: AyaArray::create(1, 0)?,
+            next_trace_policy: 0,
+            #[cfg(feature = "native-api")]
+            trace_dictionaries: Default::default(),
+            receive_trace: None,
+            receive_trace_available: false,
+            receive_trace_attempted: false,
             udp_staging_quiesce_incomplete: false,
         })
     }

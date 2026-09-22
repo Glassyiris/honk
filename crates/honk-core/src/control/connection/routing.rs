@@ -74,12 +74,13 @@ impl ControlPlaneHandle {
         let dns_timeout = std::time::Duration::from_millis(
             self.config.read().await.global.dns_resolve_timeout_ms,
         );
-        match tokio::time::timeout(
-            dns_timeout,
-            self.dns_resolver.resolve_for_source(domain, source),
-        )
-        .await
-        {
+        let resolution = self.dns_resolver.resolve_for_source(domain, source);
+        #[cfg(feature = "native-api")]
+        let resolution = std::pin::pin!(resolution);
+        #[cfg(feature = "native-api")]
+        let resolution =
+            crate::native_api::flows::dns::scope_purpose("domain_verification", resolution);
+        match tokio::time::timeout(dns_timeout, resolution).await {
             Ok(Ok(resolved)) => {
                 match domain_reality_outcome(expected, &resolved.ipv4, &resolved.ipv6) {
                     RealityOutcome::ExactMatch => RealityOutcome::ExactMatch,
@@ -227,21 +228,47 @@ impl ControlPlaneHandle {
             routing_conn_info.domain = None;
         }
         #[cfg(feature = "native-api")]
-        let mut native_route = None;
+        let mut native_route = (record_route
+            && handoff.is_some_and(|handoff| {
+                handoff.outbound != OutboundIndex::ControlPlaneRouting as u8
+                    && !reroute_by_sniffed_domain
+            }))
+        .then(super::observation::RouteObservation::kernel);
         let (userspace_outbound, userspace_must, userspace_mark, matched_rule) = {
             let router = self.router.read().await;
-            let matched = router.route_full(&routing_conn_info);
             #[cfg(feature = "native-api")]
-            if record_route && let Some(native) = &self.native {
+            let matched = if record_route
+                && native_route.is_none()
+                && let Some(native) = &self.native
+            {
                 let _config = self.config.read().await;
+                let generation = self.diagnostics.read().generation;
+                let observed = router.route_full_observed(
+                    &routing_conn_info,
+                    None,
+                    crate::native_api::flows::MAX_RULE_VALUES,
+                );
+                let rules = crate::native_api::routing::observed_rule_evaluations(
+                    &native.instance_id,
+                    generation,
+                    &router,
+                    &observed.rules,
+                );
                 native_route = Some(super::observation::RouteObservation::userspace(
                     &native.instance_id,
-                    self.diagnostics.read().generation,
+                    generation,
                     &routing_conn_info,
                     &router,
-                    matched.as_ref(),
+                    observed.matched.as_ref(),
+                    rules,
+                    observed.truncated,
                 ));
-            }
+                observed.matched
+            } else {
+                router.route_full(&routing_conn_info)
+            };
+            #[cfg(not(feature = "native-api"))]
+            let matched = router.route_full(&routing_conn_info);
             match matched {
                 Some(route) => (
                     route.outbound_name.to_string(),
@@ -267,12 +294,6 @@ impl ControlPlaneHandle {
                 {
                     (userspace_outbound, userspace_must, userspace_mark)
                 } else {
-                    {
-                        #[cfg(feature = "native-api")]
-                        if let Some(native_route) = native_route.as_mut() {
-                            native_route.retain_kernel_decision();
-                        }
-                    }
                     (
                         self.outbound_index_to_name(ho.outbound).await,
                         ho.must != 0,

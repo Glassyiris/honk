@@ -126,23 +126,29 @@ impl DialContext {
                 deadline,
                 "Proxy DNS",
                 |address, budget| async move {
-                    if let Some(generation) = &proxy.generation {
-                        proxy
-                            .registry
-                            .dial_runtime(
-                                Arc::clone(generation),
-                                proxy.node.id,
-                                address,
-                                None,
-                                budget,
-                            )
-                            .await
-                    } else {
-                        proxy
-                            .registry
-                            .dial(&proxy.node, address, None, budget)
-                            .await
-                    }
+                    let dial = async {
+                        if let Some(generation) = &proxy.generation {
+                            proxy
+                                .registry
+                                .dial_runtime(
+                                    Arc::clone(generation),
+                                    proxy.node.id,
+                                    address,
+                                    None,
+                                    budget,
+                                )
+                                .await
+                        } else {
+                            proxy
+                                .registry
+                                .dial(&proxy.node, address, None, budget)
+                                .await
+                        }
+                    };
+                    #[cfg(feature = "native-api")]
+                    let dial =
+                        crate::native_api::flows::dns::outbound_dial_scope(&proxy.node, dial);
+                    dial.await
                 },
             )
             .await?;
@@ -164,30 +170,35 @@ impl DialContext {
         if remaining.is_zero() {
             anyhow::bail!("DNS proxy packet setup deadline elapsed")
         }
-        let transport = if let Some(generation) = &proxy.generation {
-            tokio::time::timeout_at(
-                deadline,
-                proxy.registry.dial_udp_transport_runtime(
-                    Arc::clone(generation),
-                    proxy.node.id,
-                    remote,
-                    None,
-                    remaining,
-                ),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("DNS proxy packet setup timed out"))??
-        } else {
-            tokio::time::timeout_at(
-                deadline,
-                proxy
-                    .registry
-                    .dial_udp_transport(&proxy.node, remote, None, remaining),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("DNS proxy packet setup timed out"))??
+        let dial = async {
+            let transport = if let Some(generation) = &proxy.generation {
+                tokio::time::timeout_at(
+                    deadline,
+                    proxy.registry.dial_udp_transport_runtime(
+                        Arc::clone(generation),
+                        proxy.node.id,
+                        remote,
+                        None,
+                        remaining,
+                    ),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("DNS proxy packet setup timed out"))??
+            } else {
+                tokio::time::timeout_at(
+                    deadline,
+                    proxy
+                        .registry
+                        .dial_udp_transport(&proxy.node, remote, None, remaining),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("DNS proxy packet setup timed out"))??
+            };
+            Ok(transport)
         };
-        Ok(transport)
+        #[cfg(feature = "native-api")]
+        let dial = crate::native_api::flows::dns::outbound_dial_scope(&proxy.node, dial);
+        dial.await
     }
 }
 

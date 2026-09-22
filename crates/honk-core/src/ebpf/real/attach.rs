@@ -126,6 +126,10 @@ impl RealEbpfBackend {
                 .override_global("TASK_MM_OFFSET", &offsets.task_mm, true)
                 .override_global("MM_ARG_START_OFFSET", &offsets.mm_arg_start, true);
         }
+        let receive_trace_offsets = receive_trace::detect();
+        if let Some(offsets) = &receive_trace_offsets {
+            offsets.configure(&mut loader);
+        }
         let mut bpf = loader.load(obj)?;
         validate_routing_handoff_layout(&bpf)?;
         syscall::validate_loaded_udp_decision_sequence(&bpf)?;
@@ -547,6 +551,12 @@ impl RealEbpfBackend {
             routing_slot: 0,
             routing_generation_counter: 0,
             routing_generation_sequence,
+            next_trace_policy: 0,
+            #[cfg(feature = "native-api")]
+            trace_dictionaries: Default::default(),
+            receive_trace: None,
+            receive_trace_available: receive_trace_offsets.is_some(),
+            receive_trace_attempted: false,
             udp_staging_quiesce_incomplete: false,
         })
     }

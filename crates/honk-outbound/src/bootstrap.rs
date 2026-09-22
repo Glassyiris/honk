@@ -114,6 +114,21 @@ pub async fn lookup_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
     #[cfg(feature = "native-api")]
+    let mut observation = LookupObservation::start(host, "UNKNOWN", None);
+    let result = lookup_host_inner(host, port).await;
+    #[cfg(feature = "native-api")]
+    if let Some(observation) = &mut observation {
+        observation.finish(
+            result
+                .as_ref()
+                .map(|addresses| addresses.iter().map(SocketAddr::ip)),
+        );
+    }
+    result
+}
+
+async fn lookup_host_inner(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    #[cfg(feature = "native-api")]
     if let Some(result) = crate::runtime::lookup_host_owned(host, port).await {
         return result;
     }
@@ -138,11 +153,42 @@ impl BootstrapResolver {
     }
 
     async fn query_udp(&self, host: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
-        parse_answers(&query_udp_raw(self.server, host, qtype).await?, qtype)
+        #[cfg(feature = "native-api")]
+        let mut observation =
+            LookupObservation::start(host, qtype_name(qtype), Some((self.server, "udp")));
+        let result =
+            async { parse_answers(&query_udp_raw(self.server, host, qtype).await?, qtype) };
+        #[cfg(feature = "native-api")]
+        let result = match &observation {
+            Some(observation) => observation.child().scope(result).await,
+            None => result.await,
+        };
+        #[cfg(not(feature = "native-api"))]
+        let result = result.await;
+        #[cfg(feature = "native-api")]
+        if let Some(observation) = &mut observation {
+            observation.finish(result.as_ref().map(|addresses| addresses.iter().copied()));
+        }
+        result
     }
 
     async fn query_tcp(&self, host: &str, qtype: u16) -> io::Result<Vec<IpAddr>> {
-        parse_answers(&self.query_tcp_raw(host, qtype).await?, qtype)
+        #[cfg(feature = "native-api")]
+        let mut observation =
+            LookupObservation::start(host, qtype_name(qtype), Some((self.server, "tcp")));
+        let result = async { parse_answers(&self.query_tcp_raw(host, qtype).await?, qtype) };
+        #[cfg(feature = "native-api")]
+        let result = match &observation {
+            Some(observation) => observation.child().scope(result).await,
+            None => result.await,
+        };
+        #[cfg(not(feature = "native-api"))]
+        let result = result.await;
+        #[cfg(feature = "native-api")]
+        if let Some(observation) = &mut observation {
+            observation.finish(result.as_ref().map(|addresses| addresses.iter().copied()));
+        }
+        result
     }
 
     /// Send a single query and return the raw response bytes.
@@ -221,16 +267,40 @@ pub async fn query_ech_config(host: &str) -> io::Result<Option<(Vec<u8>, u32)>> 
         return Ok(None);
     }
     let resolver = *GLOBAL.read().unwrap();
-    let msg = match resolver {
-        Some(r) => r.query_raw(host, QTYPE_HTTPS).await?,
+    let resolver = match resolver {
+        Some(resolver) => resolver,
         None => {
             let Some(server) = system_nameserver() else {
                 return Ok(None);
             };
-            query_udp_raw(server, host, QTYPE_HTTPS).await?
+            BootstrapResolver {
+                server,
+                use_tcp: false,
+            }
         }
     };
-    Ok(parse_https_rr_ech(&msg))
+    #[cfg(feature = "native-api")]
+    let mut observation = LookupObservation::start(
+        host,
+        "HTTPS",
+        Some((
+            resolver.server,
+            if resolver.use_tcp { "tcp" } else { "udp" },
+        )),
+    );
+    let operation = resolver.query_raw(host, QTYPE_HTTPS);
+    #[cfg(feature = "native-api")]
+    let result = match &observation {
+        Some(observation) => observation.child().scope(operation).await,
+        None => operation.await,
+    };
+    #[cfg(not(feature = "native-api"))]
+    let result = operation.await;
+    #[cfg(feature = "native-api")]
+    if let Some(observation) = &mut observation {
+        observation.finish(result.as_ref().map(|_| std::iter::empty()));
+    }
+    Ok(parse_https_rr_ech(&result?))
 }
 
 /// Extract the ECHConfigList and TTL from the first ServiceMode HTTPS RR in
@@ -384,6 +454,126 @@ fn skip_name(msg: &[u8], mut pos: usize) -> io::Result<usize> {
         pos += 1 + len as usize;
         if pos > msg.len() {
             return Err(bad());
+        }
+    }
+}
+
+#[cfg(feature = "native-api")]
+fn qtype_name(qtype: u16) -> &'static str {
+    match qtype {
+        1 => "A",
+        28 => "AAAA",
+        65 => "HTTPS",
+        _ => "UNKNOWN",
+    }
+}
+
+#[cfg(feature = "native-api")]
+struct LookupObservation {
+    observer: crate::runtime::flow_observation::FlowObserver,
+    data: crate::runtime::flow_observation::DnsLookup,
+    finished: bool,
+}
+
+#[cfg(feature = "native-api")]
+impl LookupObservation {
+    fn start(
+        host: &str,
+        qtype: &str,
+        upstream: Option<(SocketAddr, &'static str)>,
+    ) -> Option<Self> {
+        use crate::runtime::flow_observation::{DnsLookup, FlowEvent, current};
+        let observer = current()?;
+        if host.is_empty() || host.len() > 253 {
+            observer.publish(FlowEvent::Gap("redacted"));
+            return None;
+        }
+        let context = observer.context();
+        let data = DnsLookup {
+            lookup_id: uuid::Uuid::new_v4(),
+            parent_lookup_id: context.lookup_id,
+            attempt_id: context.attempt_id,
+            purpose: context.dns_purpose,
+            name: host.to_owned(),
+            qtype: qtype.to_owned(),
+            source: if upstream.is_some() {
+                "upstream"
+            } else {
+                "unknown"
+            },
+            upstream_transport: upstream.map(|(_, transport)| transport),
+            carrier_transport: upstream.map(|(_, transport)| transport),
+            cache: if upstream.is_some() {
+                "bypass"
+            } else {
+                "unknown"
+            },
+            cache_entry_id: None,
+            upstream: upstream.map(|(address, _)| address.to_string()),
+            route_evaluation_ids: Vec::new(),
+            status: "started",
+            addresses: Vec::new(),
+            selected_ip: None,
+            error: None,
+        };
+        if upstream.is_none() {
+            // libc/NSS supplies an outcome, not its hosts/cache/upstream decision path.
+            observer.publish(FlowEvent::Gap("not_instrumented"));
+        }
+        observer.publish(FlowEvent::Dns(data.clone()));
+        Some(Self {
+            observer,
+            data,
+            finished: false,
+        })
+    }
+
+    fn child(&self) -> crate::runtime::flow_observation::FlowObserver {
+        let mut context = self.observer.context();
+        context.lookup_id = Some(self.data.lookup_id);
+        self.observer.with_context(context)
+    }
+
+    fn finish<I: Iterator<Item = IpAddr>>(&mut self, result: Result<I, &io::Error>) {
+        use crate::runtime::flow_observation::FlowEvent;
+        self.finished = true;
+        match result {
+            Ok(addresses) => {
+                self.data.status = "succeeded";
+                for address in addresses {
+                    if self.data.addresses.contains(&address) {
+                        continue;
+                    }
+                    if self.data.addresses.len() == 32 {
+                        self.observer.publish(FlowEvent::Gap("buffer_overflow"));
+                        break;
+                    }
+                    self.data.addresses.push(address);
+                }
+            }
+            Err(error) => {
+                self.data.status = "failed";
+                self.data.error = Some(if error.kind() == io::ErrorKind::TimedOut {
+                    "timeout"
+                } else {
+                    "resolution_failed"
+                });
+            }
+        }
+        self.observer.publish(FlowEvent::Dns(self.data.clone()));
+    }
+}
+
+#[cfg(feature = "native-api")]
+impl Drop for LookupObservation {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.data.status = "cancelled";
+            self.data.error = Some("cancelled");
+            self.observer
+                .publish(crate::runtime::flow_observation::FlowEvent::Dns(
+                    self.data.clone(),
+                ));
         }
     }
 }

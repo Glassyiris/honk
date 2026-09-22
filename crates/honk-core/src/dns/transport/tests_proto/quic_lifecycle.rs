@@ -80,7 +80,9 @@ async fn failed_and_cancelled_quic_handshakes_keep_adapter_cleanup_in_dns_pause(
             let lease = provider.try_acquire().unwrap();
             let query = tokio::spawn(async move {
                 lease
-                    .run(pool.query("proxy", &build_dns_query("blocked.example", 1)))
+                    .run(std::pin::pin!(
+                        pool.query("proxy", &build_dns_query("blocked.example", 1))
+                    ))
                     .await
             });
             tokio::time::timeout(Duration::from_secs(2), fault.entered.notified())
@@ -131,7 +133,9 @@ async fn quic_adapter_panic_is_a_sticky_dns_pause_failure() {
         let lease = provider.try_acquire().unwrap();
         assert!(
             lease
-                .run(pool.query("proxy", &build_dns_query("panic.example", 1)))
+                .run(std::pin::pin!(
+                    pool.query("proxy", &build_dns_query("panic.example", 1))
+                ))
                 .await
                 .unwrap()
                 .is_err()

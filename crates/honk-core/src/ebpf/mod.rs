@@ -591,6 +591,34 @@ pub trait EbpfBackend: Send + Sync {
     /// `cleanup()`, which takes the write lock.
     fn routing_handoff_take(&self, key: &TuplesKey) -> anyhow::Result<Option<RoutingHandoffEntry>>;
 
+    fn routing_handoff_take_observed(
+        &self,
+        key: &TuplesKey,
+    ) -> anyhow::Result<Option<(RoutingHandoffEntry, bool)>> {
+        Ok(self.routing_handoff_take(key)?.map(|entry| (entry, true)))
+    }
+
+    #[cfg(feature = "native-api")]
+    fn bind_kernel_trace_dictionary(
+        &mut self,
+        _dictionary: crate::native_api::flows::kernel::KernelTraceDictionary,
+    ) {
+    }
+
+    #[cfg(feature = "native-api")]
+    fn capture_kernel_route(
+        &self,
+        _key: &TuplesKey,
+        _reference: crate::native_api::flows::kernel::KernelRouteReference,
+    ) -> Result<crate::native_api::flows::kernel::CapturedKernelRoute, &'static str> {
+        Err("kernel_trace_unsupported")
+    }
+
+    #[cfg(feature = "ebpf")]
+    fn receive_trace(&mut self) -> Option<std::sync::Arc<real::receive_trace::ReceiveTrace>> {
+        None
+    }
+
     fn cookie_pid_lookup(&self, cookie: u64) -> anyhow::Result<Option<PIDName>>;
     fn cookie_pid_store(&mut self, cookie: u64, entry: &PIDName) -> anyhow::Result<()>;
 

@@ -99,6 +99,8 @@ pub(super) struct ResolvedScorePlan {
     pub(super) feedback: Vec<Option<honk_outbound::group::ScoreFeedback>>,
     pub(super) selection_chains: Vec<Vec<String>>,
     pub(super) final_owners: Vec<Vec<String>>,
+    #[cfg(feature = "native-api")]
+    pub(super) observation: Option<Arc<honk_outbound::group::observation::SelectionObservation>>,
 }
 
 fn own_score_plan(plan: honk_outbound::group::ScoreSelectionPlan<'_>) -> ResolvedScorePlan {
@@ -119,6 +121,8 @@ fn own_score_plan(plan: honk_outbound::group::ScoreSelectionPlan<'_>) -> Resolve
         feedback,
         selection_chains,
         final_owners,
+        #[cfg(feature = "native-api")]
+        observation: plan.observation,
     }
 }
 
@@ -166,6 +170,8 @@ pub(super) fn resolve_outbound_plan_for_target(
             feedback: Vec::new(),
             selection_chains: Vec::new(),
             final_owners: Vec::new(),
+            #[cfg(feature = "native-api")]
+            observation: None,
         };
     }
     if matches!(constraint, OutboundConstraint::Any)
@@ -178,6 +184,8 @@ pub(super) fn resolve_outbound_plan_for_target(
             feedback: vec![None],
             selection_chains: vec![vec![outbound_name.to_owned()]],
             final_owners: vec![Vec::new()],
+            #[cfg(feature = "native-api")]
+            observation: None,
         };
     }
     if let Some(node) = config.nodes.iter().find(|node| match constraint {
@@ -214,6 +222,8 @@ pub(super) fn resolve_outbound_plan_for_target(
                 .into_iter()
                 .collect(),
             final_owners: health_family.map(|_| Vec::new()).into_iter().collect(),
+            #[cfg(feature = "native-api")]
+            observation: None,
         };
     }
     if !config
@@ -228,6 +238,8 @@ pub(super) fn resolve_outbound_plan_for_target(
             feedback: vec![None],
             selection_chains: vec![vec![Config::BUILTIN_DIRECT_NODE.to_owned()]],
             final_owners: vec![Vec::new()],
+            #[cfg(feature = "native-api")]
+            observation: None,
         };
     }
     own_score_plan(
@@ -244,6 +256,8 @@ pub(super) struct ResolvedUdpPlan {
     pub(super) ipver: IpVersion,
     pub(super) feedback: Vec<Option<honk_outbound::group::ScoreFeedback>>,
     pub(super) selection_chains: Vec<Vec<String>>,
+    #[cfg(feature = "native-api")]
+    pub(super) observation: Option<Arc<honk_outbound::group::observation::SelectionObservation>>,
 }
 
 pub(super) fn resolve_udp_outbound_plan_for_target(
@@ -261,5 +275,7 @@ pub(super) fn resolve_udp_outbound_plan_for_target(
         ipver: plan.health_family,
         feedback: plan.feedback,
         selection_chains: plan.selection_chains,
+        #[cfg(feature = "native-api")]
+        observation: plan.observation,
     }
 }

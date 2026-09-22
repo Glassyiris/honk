@@ -236,9 +236,13 @@ impl VLessHandler {
                     target_domain,
                     vless.wire_flow(),
                 )?;
-                let stream = self
-                    .dial_retained_carrier(&runtime, uuid, header, connect_timeout)
-                    .await?;
+                let operation = self.dial_retained_carrier(&runtime, uuid, header, connect_timeout);
+                #[cfg(feature = "native-api")]
+                let stream =
+                    crate::runtime::flow_observation::request_write(std::pin::pin!(operation))
+                        .await?;
+                #[cfg(not(feature = "native-api"))]
+                let stream = operation.await?;
                 Ok(Arc::new(VlessConnectedTransport::new(stream, target, None)))
             }
             VlessUdpPath::UotV2 => {
@@ -440,7 +444,12 @@ impl VLessHandler {
         for _ in 0..2 {
             match pool.checkout_speculative().await? {
                 SpeculativeCheckout::Shared { session, permit } => {
-                    match open(Arc::clone(&session), permit).await {
+                    #[cfg(feature = "native-api")]
+                    let observation = crate::session::ObservedSessionOpen::start();
+                    let result = open(Arc::clone(&session), permit).await;
+                    #[cfg(feature = "native-api")]
+                    observation.finish_open(&result);
+                    match result {
                         Ok(transport) => return Ok(PreparedUdpTransport::ready(transport)),
                         Err(OpenError::Refused(error)) => return Err(error),
                         Err(OpenError::Draining(error)) => {
@@ -460,7 +469,12 @@ impl VLessHandler {
                         _ = reservation.cancelled() => anyhow::bail!(retired_error),
                     };
                     let permit = reservation.attach(&session)?;
-                    let transport = open(session, permit).await.map_err(Self::open_error)?;
+                    #[cfg(feature = "native-api")]
+                    let observation = crate::session::ObservedSessionOpen::start();
+                    let result = open(session, permit).await;
+                    #[cfg(feature = "native-api")]
+                    observation.finish_open(&result);
+                    let transport = result.map_err(Self::open_error)?;
                     return Ok(PreparedUdpTransport::new(async move {
                         reservation.commit()?;
                         Ok(transport)
@@ -748,56 +762,65 @@ impl WarmableOutbound for VLessHandler {
         connect_timeout: std::time::Duration,
         requirement: WarmRequirement,
     ) -> anyhow::Result<()> {
-        enum WarmPath {
-            H2,
-            Cool(bool),
-        }
-        let path = match requirement {
-            WarmRequirement::Session => match runtime.node.vless().unwrap().tcp_path() {
-                VlessTcpPath::H2 => WarmPath::H2,
-                VlessTcpPath::Cool => WarmPath::Cool(false),
-                VlessTcpPath::Direct => anyhow::bail!("VLESS TCP path is not warmable"),
-            },
-            WarmRequirement::Udp => match runtime.node.vless().unwrap().udp_path(0) {
-                Some(VlessUdpPath::H2) => WarmPath::H2,
-                Some(VlessUdpPath::CoolShared) => WarmPath::Cool(false),
-                Some(VlessUdpPath::CoolSeparate) => WarmPath::Cool(true),
-                Some(VlessUdpPath::Native | VlessUdpPath::Xudp | VlessUdpPath::UotV2) | None => {
-                    anyhow::bail!("VLESS UDP path is not warmable")
+        let operation = async {
+            enum WarmPath {
+                H2,
+                Cool(bool),
+            }
+            let path = match requirement {
+                WarmRequirement::Session => match runtime.node.vless().unwrap().tcp_path() {
+                    VlessTcpPath::H2 => WarmPath::H2,
+                    VlessTcpPath::Cool => WarmPath::Cool(false),
+                    VlessTcpPath::Direct => anyhow::bail!("VLESS TCP path is not warmable"),
+                },
+                WarmRequirement::Udp => match runtime.node.vless().unwrap().udp_path(0) {
+                    Some(VlessUdpPath::H2) => WarmPath::H2,
+                    Some(VlessUdpPath::CoolShared) => WarmPath::Cool(false),
+                    Some(VlessUdpPath::CoolSeparate) => WarmPath::Cool(true),
+                    Some(VlessUdpPath::Native | VlessUdpPath::Xudp | VlessUdpPath::UotV2)
+                    | None => {
+                        anyhow::bail!("VLESS UDP path is not warmable")
+                    }
+                },
+            };
+            match path {
+                WarmPath::H2 => {
+                    let pool = runtime.vless_h2_pool()?;
+                    let dial_runtime = Arc::clone(&runtime);
+                    Self::warm_mux_pool(
+                        pool,
+                        move || Self::dial_h2_session(dial_runtime, connect_timeout),
+                        "VLESS H2 pool retired during warm-up",
+                    )
+                    .await
                 }
-            },
-        };
-        match path {
-            WarmPath::H2 => {
-                let pool = runtime.vless_h2_pool()?;
-                let dial_runtime = Arc::clone(&runtime);
-                Self::warm_mux_pool(
-                    pool,
-                    move || Self::dial_h2_session(dial_runtime, connect_timeout),
-                    "VLESS H2 pool retired during warm-up",
-                )
-                .await
-            }
-            WarmPath::Cool(separate) => {
-                let pool = if separate {
-                    runtime.vless_separate_cool_pool()?
-                } else {
-                    runtime.vless_shared_cool_pool()?
-                };
-                let active_limit = Self::cool_limit(&runtime.node, separate)?;
-                let dial_runtime = Arc::clone(&runtime);
-                Self::warm_mux_pool(
-                    pool,
-                    move || Self::dial_cool_session(dial_runtime, active_limit, connect_timeout),
-                    if separate {
-                        "VLESS separate Cool pool retired during warm-up"
+                WarmPath::Cool(separate) => {
+                    let pool = if separate {
+                        runtime.vless_separate_cool_pool()?
                     } else {
-                        "VLESS shared Cool pool retired during warm-up"
-                    },
-                )
-                .await
+                        runtime.vless_shared_cool_pool()?
+                    };
+                    let active_limit = Self::cool_limit(&runtime.node, separate)?;
+                    let dial_runtime = Arc::clone(&runtime);
+                    Self::warm_mux_pool(
+                        pool,
+                        move || {
+                            Self::dial_cool_session(dial_runtime, active_limit, connect_timeout)
+                        },
+                        if separate {
+                            "VLESS separate Cool pool retired during warm-up"
+                        } else {
+                            "VLESS shared Cool pool retired during warm-up"
+                        },
+                    )
+                    .await
+                }
             }
-        }
+        };
+        #[cfg(feature = "native-api")]
+        return crate::runtime::flow_observation::without(operation).await;
+        #[cfg(not(feature = "native-api"))]
+        operation.await
     }
 }
 

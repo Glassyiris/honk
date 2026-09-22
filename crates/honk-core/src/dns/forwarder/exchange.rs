@@ -30,7 +30,26 @@ impl DnsForwarder {
                 self.upstream_pool.query(upstream.as_str(), raw_query).await
             }
             RequestScope::AsIs(destination) => {
-                self.query_asis(raw_query, *destination, ingress).await
+                let query = self.query_asis(raw_query, *destination, ingress);
+                #[cfg(feature = "native-api")]
+                let observation = crate::native_api::flows::dns::outbound_evidence(
+                    "direct",
+                    "builtin",
+                    None,
+                    None,
+                    *destination,
+                    Vec::new(),
+                );
+                #[cfg(feature = "native-api")]
+                let query = std::pin::pin!(query);
+                #[cfg(feature = "native-api")]
+                let query =
+                    crate::native_api::flows::dns::outbound_scope(observation.as_ref(), query);
+                #[cfg(feature = "native-api")]
+                let query = std::pin::pin!(query);
+                #[cfg(feature = "native-api")]
+                let query = crate::native_api::flows::dns::exchange_scope(raw_query, "asis", query);
+                query.await
             }
         }
     }
@@ -161,6 +180,8 @@ impl DnsForwarder {
         let cache = self.cache_service().await;
         let (entry, revision) =
             cache.get_stale_exact(cache_key, matches!(mode, ResolveMode::Strict))?;
+        #[cfg(feature = "native-api")]
+        crate::native_api::flows::dns::cache_state("stale");
         let mut response = entry.response.to_vec();
         if self.stale_reply_ttl != 0 {
             rewrite_answer_ttls(&mut response, self.stale_reply_ttl);
@@ -236,22 +257,34 @@ impl DnsForwarder {
     ) -> anyhow::Result<Vec<u8>> {
         match ingress {
             IngressProfile::Udp { .. } => {
-                let response = self.query_asis_udp(raw_query, destination).await?;
-                if crate::dns::response::is_truncated(&response) {
-                    debug!(
-                        destination = %destination,
-                        "DNS forwarder: truncated asis UDP response, retrying over TCP"
-                    );
-                    self.query_asis_tcp(raw_query, destination).await
-                } else {
-                    Ok(response)
+                let query = self.query_asis_udp(raw_query, destination);
+                #[cfg(feature = "native-api")]
+                let query = std::pin::pin!(query);
+                #[cfg(feature = "native-api")]
+                let query =
+                    crate::native_api::flows::dns::transport_exchange_scope(raw_query, query);
+                let response = query.await?;
+                if !crate::dns::response::is_truncated(&response) {
+                    return Ok(response);
                 }
+                #[cfg(feature = "native-api")]
+                crate::native_api::flows::dns::tcp_fallback();
+                debug!(
+                    destination = %destination,
+                    "DNS forwarder: truncated asis UDP response, retrying over TCP"
+                );
             }
-            IngressProfile::Tcp => self.query_asis_tcp(raw_query, destination).await,
+            IngressProfile::Tcp => {}
             IngressProfile::Api | IngressProfile::Internal => {
                 unreachable!("internal/API asis request escaped planning")
             }
         }
+        let query = self.query_asis_tcp(raw_query, destination);
+        #[cfg(feature = "native-api")]
+        let query = std::pin::pin!(query);
+        #[cfg(feature = "native-api")]
+        let query = crate::native_api::flows::dns::transport_exchange_scope(raw_query, query);
+        query.await
     }
 
     async fn query_asis_udp(
@@ -260,22 +293,46 @@ impl DnsForwarder {
         destination: SocketAddr,
     ) -> anyhow::Result<Vec<u8>> {
         debug!(%destination, "DNS forwarder: asis UDP dial");
-        let sock2 = new_asis_socket_with_mark(destination, |socket| {
-            #[cfg(target_os = "linux")]
-            {
-                honk_outbound::util::set_mark_best_effort(socket, DAE_BYPASS_MARK)
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = socket;
-                Ok(())
-            }
-        })?;
-        let socket = tokio::net::UdpSocket::from_std(sock2.into()).context("asis UDP from_std")?;
-        socket
-            .connect(destination)
-            .await
-            .context("asis UDP connect")?;
+        #[cfg(feature = "native-api")]
+        crate::native_api::flows::dns::transport("udp", "udp");
+        #[cfg(feature = "native-api")]
+        let mut observation = honk_outbound::runtime::flow_observation::TransportAttempt::start(
+            Some(destination),
+            "original_ip",
+        );
+        let socket = async {
+            let sock2 = new_asis_socket_with_mark(destination, |socket| {
+                #[cfg(target_os = "linux")]
+                {
+                    honk_outbound::util::set_mark_best_effort(socket, DAE_BYPASS_MARK)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = socket;
+                    Ok(())
+                }
+            })?;
+            let socket =
+                tokio::net::UdpSocket::from_std(sock2.into()).context("asis UDP from_std")?;
+            socket
+                .connect(destination)
+                .await
+                .context("asis UDP connect")?;
+            Ok::<_, anyhow::Error>(socket)
+        }
+        .await;
+        #[cfg(feature = "native-api")]
+        if let Some(observation) = &mut observation {
+            observation.finish(
+                if socket.is_ok() {
+                    "succeeded"
+                } else {
+                    "failed"
+                },
+                socket.as_ref().err().map(|_| "udp_socket_failed"),
+            );
+        }
+        let socket = socket?;
 
         tokio::time::timeout(self.query_timeout, async {
             socket.send(raw_query).await?;
@@ -295,6 +352,8 @@ impl DnsForwarder {
         destination: SocketAddr,
     ) -> anyhow::Result<Vec<u8>> {
         debug!(%destination, "DNS forwarder: asis TCP dial");
+        #[cfg(feature = "native-api")]
+        crate::native_api::flows::dns::transport("tcp", "tcp");
         let mut stream = honk_outbound::util::connect_marked_addr(
             destination,
             Some(DAE_BYPASS_MARK),

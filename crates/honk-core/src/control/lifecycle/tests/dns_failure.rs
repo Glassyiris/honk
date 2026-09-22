@@ -60,6 +60,8 @@ async fn suspend_listener(protocol: &str, panic_query: bool) -> anyhow::Result<(
         plane.concurrency_limit.clone(),
         plane.stats.clone(),
         plane.drain_tracker.clone(),
+        plane.native.clone(),
+        plane.diagnostics.clone(),
     )?;
     // Only the DNS owner is under test; no transparent sockets or privileged setup.
     let tcp = std::net::TcpListener::bind("127.0.0.1:0")?;

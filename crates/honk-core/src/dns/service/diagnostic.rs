@@ -48,14 +48,14 @@ impl DnsService {
                     .try_acquire_query()
                     .map_err(|_| DiagnosticError::Unavailable)?;
                 lease
-                    .run(run(
+                    .run(std::pin::pin!(run(
                         &mut operation,
                         lease.runtime().forwarder(),
                         domain,
                         types,
                         options,
                         deadline,
-                    ))
+                    )))
                     .await
                     .map_err(|_| DiagnosticError::Unavailable)?
             }

@@ -439,12 +439,18 @@ impl ControlPlane {
             .parse::<DialMode>()
             .map_err(|_| anyhow::anyhow!("invalid global.dial_mode"))?;
         let fallback_outbound = config.routing.default_outbound.as_str();
-        routing_matcher::RoutingPushPlan::compile(
+        let mut plan = routing_matcher::RoutingPushPlan::compile(
             router,
             &outbound_name_to_id,
             fallback_outbound,
             dial_mode,
-        )
+        )?;
+        plan.enable_trace(
+            cfg!(feature = "native-api")
+                && config.experimental.native_api.enabled
+                && config.experimental.native_api.record_flows,
+        );
+        Ok(plan)
     }
 }
 

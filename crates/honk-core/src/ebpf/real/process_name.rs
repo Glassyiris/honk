@@ -4,8 +4,9 @@ use honk_ebpf_common::DaeParam;
 use std::convert::TryInto;
 use std::ops::Range;
 
-const VMLINUX_BTF_PATHS: [&str; 2] = ["/sys/kernel/btf/vmlinux", "/usr/lib/debug/boot/vmlinux"];
-const VMLINUX_BTF_ENV: &str = "HONK_VMLINUX_BTF";
+pub(super) const VMLINUX_BTF_PATHS: [&str; 2] =
+    ["/sys/kernel/btf/vmlinux", "/usr/lib/debug/boot/vmlinux"];
+pub(super) const VMLINUX_BTF_ENV: &str = "HONK_VMLINUX_BTF";
 const BTF_HEADER_LEN: usize = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +105,7 @@ impl Endian {
     }
 }
 
-struct Btf<'a> {
+pub(super) struct Btf<'a> {
     data: &'a [u8],
     types: Range<usize>,
     strings: Range<usize>,
@@ -112,7 +113,7 @@ struct Btf<'a> {
 }
 
 impl<'a> Btf<'a> {
-    fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(super) fn parse(data: &'a [u8]) -> Option<Self> {
         if data.len() < BTF_HEADER_LEN {
             return None;
         }
@@ -158,7 +159,25 @@ impl<'a> Btf<'a> {
         std::str::from_utf8(&self.data[start..end]).ok()
     }
 
-    fn member_offset(&self, type_name: &str, member_name: &str) -> Option<u32> {
+    pub(super) fn member_offset(&self, type_name: &str, member_name: &str) -> Option<u32> {
+        self.find_member_offset(type_name, member_name, None)
+    }
+
+    pub(super) fn sized_member_offset(
+        &self,
+        type_name: &str,
+        member_name: &str,
+        width: u32,
+    ) -> Option<u32> {
+        self.find_member_offset(type_name, member_name, Some(width))
+    }
+
+    fn find_member_offset(
+        &self,
+        type_name: &str,
+        member_name: &str,
+        width: Option<u32>,
+    ) -> Option<u32> {
         let mut cursor = self.types.start;
         while cursor < self.types.end {
             let name_offset = read_u32(self.data, cursor, self.endian)?;
@@ -169,14 +188,20 @@ impl<'a> Btf<'a> {
                 return None;
             }
             if (info >> 24) & 0x1f == 4 && self.string(name_offset) == Some(type_name) {
-                return self.composite_member_offset(cursor, member_name, 0);
+                return self.composite_member_offset(cursor, member_name, 0, width);
             }
             cursor = next;
         }
         None
     }
 
-    fn composite_member_offset(&self, cursor: usize, member_name: &str, depth: u8) -> Option<u32> {
+    fn composite_member_offset(
+        &self,
+        cursor: usize,
+        member_name: &str,
+        depth: u8,
+        width: Option<u32>,
+    ) -> Option<u32> {
         if depth == 8 {
             return None;
         }
@@ -199,20 +224,34 @@ impl<'a> Btf<'a> {
             } else {
                 raw_offset
             };
-            if bit_offset % 8 != 0 {
+            if bit_offset % 8 != 0 || (info >> 31 == 1 && raw_offset >> 24 != 0) {
                 continue;
             }
             let byte_offset = bit_offset / 8;
             if self.string(name_offset) == Some(member_name) {
+                if let Some(width) = width {
+                    let size = read_u32(self.data, cursor.checked_add(8)?, self.endian)?;
+                    let type_id = read_u32(self.data, member.checked_add(4)?, self.endian)?;
+                    if byte_offset.checked_add(width)? > size || self.type_size(type_id)? != width {
+                        return None;
+                    }
+                }
                 return Some(byte_offset);
             }
             if name_offset == 0 {
                 let type_id = read_u32(self.data, member.checked_add(4)?, self.endian)?;
                 if let Some(nested) = self.resolve_composite(type_id)
                     && let Some(offset) =
-                        self.composite_member_offset(nested, member_name, depth + 1)
+                        self.composite_member_offset(nested, member_name, depth + 1, width)
                 {
-                    return byte_offset.checked_add(offset);
+                    let offset = byte_offset.checked_add(offset)?;
+                    if let Some(width) = width {
+                        let size = read_u32(self.data, cursor.checked_add(8)?, self.endian)?;
+                        if offset.checked_add(width)? > size {
+                            return None;
+                        }
+                    }
+                    return Some(offset);
                 }
             }
         }
@@ -227,6 +266,20 @@ impl<'a> Btf<'a> {
                 8..=11 | 18 => {
                     type_id = read_u32(self.data, cursor.checked_add(8)?, self.endian)?;
                 }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn type_size(&self, mut type_id: u32) -> Option<u32> {
+        for _ in 0..8 {
+            let cursor = self.type_by_id(type_id)?;
+            let info = read_u32(self.data, cursor.checked_add(4)?, self.endian)?;
+            let size = read_u32(self.data, cursor.checked_add(8)?, self.endian)?;
+            match (info >> 24) & 0x1f {
+                1 | 4 | 5 | 6 | 16 | 19 => return Some(size),
+                8..=11 | 18 => type_id = size,
                 _ => return None,
             }
         }
@@ -331,6 +384,55 @@ mod tests {
                 task_mm: 24,
                 mm_arg_start: 80,
             })
+        );
+    }
+
+    #[test]
+    fn receive_fields_require_complete_sized_non_bitfield_members() {
+        let strings = b"\0holder\0priority\0u32\0";
+        let types: Vec<u8> = [1u32, (4 << 24) | 1, 8, 8, 2, 32, 17, 1 << 24, 4, 32]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let mut data = Vec::from(0xeb9fu16.to_le_bytes());
+        data.extend_from_slice(&[1, 0]);
+        for value in [
+            24u32,
+            0,
+            types.len() as u32,
+            types.len() as u32,
+            strings.len() as u32,
+        ] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        data.extend_from_slice(&types);
+        data.extend_from_slice(strings);
+        let btf = Btf::parse(&data).unwrap();
+        assert_eq!(btf.sized_member_offset("holder", "priority", 4), Some(4));
+        assert_eq!(btf.sized_member_offset("holder", "priority", 8), None);
+        let mut outside = data.clone();
+        outside[44..48].copy_from_slice(&64u32.to_le_bytes());
+        assert_eq!(
+            Btf::parse(&outside)
+                .unwrap()
+                .sized_member_offset("holder", "priority", 4),
+            None
+        );
+        let mut bitfield = data.clone();
+        bitfield[28..32].copy_from_slice(&((1u32 << 31) | (4 << 24) | 1).to_le_bytes());
+        bitfield[44..48].copy_from_slice(&((1u32 << 24) | 32).to_le_bytes());
+        assert_eq!(
+            Btf::parse(&bitfield)
+                .unwrap()
+                .sized_member_offset("holder", "priority", 4),
+            None
+        );
+        data[44..48].copy_from_slice(&33u32.to_le_bytes());
+        assert_eq!(
+            Btf::parse(&data)
+                .unwrap()
+                .sized_member_offset("holder", "priority", 4),
+            None
         );
     }
 }

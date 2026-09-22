@@ -106,7 +106,7 @@ fn ensure_crypto_provider() {
     });
 }
 
-fn self_signed_server_config() -> (ServerConfig, rustls::RootCertStore) {
+pub(super) fn self_signed_server_config() -> (ServerConfig, rustls::RootCertStore) {
     ensure_crypto_provider();
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into(), "dns.test".into()])
         .expect("rcgen");
@@ -371,7 +371,8 @@ pub(super) fn spawn_doq_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
             recv.read_exact(&mut length).await.unwrap();
             let mut query = vec![0; u16::from_be_bytes(length) as usize];
             recv.read_exact(&mut query).await.unwrap();
-            let response = mock_dns_response(0);
+            let mut response = query;
+            response[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
             send.write_all(&(response.len() as u16).to_be_bytes())
                 .await
                 .unwrap();
