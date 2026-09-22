@@ -207,7 +207,6 @@ impl FlowStore {
             };
         }
         let now = Instant::now();
-        self.prune(&mut store, now);
         let id = Uuid::new_v4().to_string();
         let mut record = Record {
             summary: Summary {
@@ -294,12 +293,12 @@ impl FlowStore {
         })
     }
 
+    /// Expiry stays with the sampler tick; the connection path only pays for
+    /// its own record, which is usually near the back of the ring.
     fn mutate(&self, id: &str, change: impl FnOnce(&mut Record) -> bool) -> bool {
         let mut store = self.inner.lock();
         let now = Instant::now();
-        self.prune(&mut store, now);
-        // ponytail: bounded 1024-record scan; add an ID index only if this becomes a measured bottleneck.
-        let Some(index) = store.records.iter().position(|record| record.id() == id) else {
+        let Some(index) = store.records.iter().rposition(|record| record.id() == id) else {
             return false;
         };
         let record = &mut store.records[index];
@@ -425,10 +424,16 @@ impl FlowStore {
         store.tombstones.push_back((record.id().to_owned(), now));
     }
 
+    /// Expired records give way before a live one is evicted for room.
     fn enforce_limit(&self, store: &mut Store, now: Instant) {
-        while store.records.len() > store.max_records
-            || OWNER_BYTES + store.retained_record_bytes() > MAX_BYTES - SNAPSHOT_BYTES
-        {
+        let over = |store: &Store| {
+            store.records.len() > store.max_records
+                || OWNER_BYTES + store.retained_record_bytes() > MAX_BYTES - SNAPSHOT_BYTES
+        };
+        if over(store) {
+            self.prune(store, now);
+        }
+        while over(store) {
             if store.records.is_empty() {
                 break;
             }
@@ -647,7 +652,7 @@ impl Record {
         let elapsed = self.started.elapsed().as_micros();
         self.steps.push(Step {
             seq: self.steps.len() + 1,
-            observed_at: timestamp(SystemTime::now()),
+            observed_at: SystemTime::now(),
             elapsed_us: (elapsed <= u128::from(MAX_SAFE_UINT)).then_some(elapsed as u64),
             generation_id,
             evidence: "observed",
