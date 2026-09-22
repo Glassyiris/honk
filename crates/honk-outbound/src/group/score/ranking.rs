@@ -487,11 +487,8 @@ pub(super) fn switch_margin(completed: f64) -> f64 {
 #[derive(Clone, Copy, Default)]
 pub(super) struct PromotionResult {
     pub gain: f64,
-    pub response_gain: f64,
     pub comparable: bool,
     pub directional_tradeoff: bool,
-    pub upload_known: bool,
-    pub download_known: bool,
 }
 
 pub(super) fn promotion_result(
@@ -536,11 +533,8 @@ pub(super) fn promotion_result(
     };
     PromotionResult {
         gain: reliability_gain + 0.03 * latency_gain + 0.02 * throughput_gain,
-        response_gain: reliability_gain + 0.03 * latency_gain,
         comparable: pair.response.is_some() || pair.upload.is_some() || pair.download.is_some(),
         directional_tradeoff: improved && regressed,
-        upload_known: pair.upload.is_some(),
-        download_known: pair.download.is_some(),
     }
 }
 

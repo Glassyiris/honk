@@ -14,6 +14,7 @@ fn metric(left: f64, right: f64, now: Instant) -> MetricPair {
         latest_at: now,
         expires_at: now + Duration::from_secs(60),
         dispersion: 0.0,
+        support: 0,
     }
 }
 
@@ -79,7 +80,6 @@ fn unilateral_upload_and_download_gains_promote_without_max_direction_masking() 
             ),
         );
         assert!(result.gain > switch_margin(scores[0].completed));
-        assert!(result.upload_known && result.download_known);
         assert_eq!(
             ordinary_selection(scores, &refs, Some(0), baseline, &decision.pairs).index,
             1
@@ -108,7 +108,6 @@ fn crossed_directions_are_a_tradeoff_not_missing_evidence() {
     );
     assert_eq!(result.gain, 0.0);
     assert!(result.directional_tradeoff);
-    assert!(result.upload_known && result.download_known);
     let scores = [incumbent, candidate];
     let selected = ordinary_selection(
         &scores,
@@ -137,8 +136,6 @@ fn unknown_direction_stays_unknown_but_does_not_veto_a_supported_gain() {
             candidate.observed_reliability,
         ),
     );
-    assert!(result.upload_known);
-    assert!(!result.download_known);
     assert!(!result.directional_tradeoff);
     assert!(result.gain > switch_margin(incumbent.completed));
     pair.response = None;

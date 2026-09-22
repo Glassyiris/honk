@@ -1,6 +1,7 @@
-use super::super::ranking::{Decision, normal_eligible, promotion_result, switch_margin};
+use super::super::ranking::{Decision, normal_eligible};
 use super::super::{PERFORMANCE_MAX_AGE, PERFORMANCE_SWITCH_MARGIN, ScoreEvidenceBasis};
 use super::{Basis, MetricPair, PairEvidence};
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -11,6 +12,7 @@ pub(in crate::group::score) struct Summary {
     pub complete: bool,
     pub equivalent: bool,
     pub supported: bool,
+    pub response_misaligned: bool,
     pub reporters: u8,
     pub span: Option<Duration>,
     pub evidence_age: Option<Duration>,
@@ -39,6 +41,56 @@ fn reversed(pair: PairEvidence) -> PairEvidence {
     }
 }
 
+fn equivalent(left: f64, right: f64) -> bool {
+    let low = left.min(right);
+    let high = left.max(right);
+    // Averaging and unit conversion can round an inclusive boundary by a few ulps.
+    high - low <= low * PERFORMANCE_SWITCH_MARGIN + high * f64::EPSILON * 8.0
+}
+
+fn advantage(
+    pair: PairEvidence,
+    qualified: (bool, bool),
+    reliability: (f64, f64),
+) -> (bool, [f64; 2]) {
+    let Some(response) = pair.response else {
+        return (false, [0.0; 2]);
+    };
+    let qualified = qualified.0 && qualified.1;
+    if qualified && reliability.1 < reliability.0 {
+        return (false, [0.0; 2]);
+    }
+    if !equivalent(response.incumbent, response.candidate) {
+        return (response.candidate < response.incumbent, [0.0; 2]);
+    }
+    if qualified && reliability.1 > reliability.0 {
+        return (true, [0.0; 2]);
+    }
+    if !qualified
+        || [pair.upload, pair.download]
+            .into_iter()
+            .flatten()
+            .any(|metric| {
+                metric.incumbent - metric.candidate > metric.incumbent * PERFORMANCE_SWITCH_MARGIN
+            })
+    {
+        return (false, [0.0; 2]);
+    }
+    (
+        false,
+        [pair.upload, pair.download].map(|metric| {
+            metric.map_or(0.0, |metric| {
+                let change = metric.candidate - metric.incumbent;
+                if change > 0.0 && change >= metric.incumbent * PERFORMANCE_SWITCH_MARGIN {
+                    change / metric.candidate
+                } else {
+                    0.0
+                }
+            })
+        }),
+    )
+}
+
 pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> Summary {
     let snapshots = &decision.scores;
     let selected = decision.pairs.reference;
@@ -46,15 +98,19 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
         return Summary::default();
     };
     let mut summary = Summary::default();
+    let mut support = std::collections::hash_map::DefaultHasher::new();
+    selected.hash(&mut support);
     let baseline = decision.baseline;
     let mut excluded = 0;
-    let mut coherent = true;
+    let mut response_support = None;
+    let mut directional_support = [None; 2];
+    let mut directional_known = [true; 2];
     let mut ranges: [Option<(f64, f64)>; 3] = [None; 3];
+    let mut pairwise_equivalent = true;
     let mut undefeated = true;
-    let mut advantage = false;
-    let mut rate_advantage = 0.0;
-    let mut all_upload = true;
-    let mut all_download = true;
+    let mut response_advantage = false;
+    let mut selected_rates = [0.0_f64; 2];
+    let mut rate_nonregression = true;
     let mut all_responses = true;
     let mut full_coverage = true;
     let mut oldest: Option<Instant> = None;
@@ -74,22 +130,25 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
         let Some(pair) = decision.pairs.get(index) else {
             continue;
         };
+        let pair = PairEvidence {
+            response: pair.response.filter(|metric| now < metric.expires_at),
+            upload: pair.upload.filter(|metric| now < metric.expires_at),
+            download: pair.download.filter(|metric| now < metric.expires_at),
+            ..pair
+        };
         full_coverage &= !pair.partial;
-        let result = promotion_result(
-            pair,
-            (winner.qualified(), candidate.qualified()),
-            (winner.observed_reliability, candidate.observed_reliability),
-        );
-        summary.directional_tradeoff |= result.directional_tradeoff;
         let Some(supporting) = [pair.response, pair.upload, pair.download]
             .into_iter()
             .flatten()
-            .find(|metric| now < metric.expires_at)
+            .next()
         else {
             continue;
         };
-        all_responses &= pair.response.is_some_and(|metric| now < metric.expires_at);
+        all_responses &= pair.response.is_some();
         if let Some(response) = pair.response {
+            let identity = (pair.basis, response.support);
+            summary.response_misaligned |= response_support.is_some_and(|old| old != identity);
+            response_support = Some(identity);
             summary.response_latest_at = Some(
                 summary
                     .response_latest_at
@@ -98,53 +157,60 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
         }
         if summary.compared_candidates == 0 {
             summary.basis = pair.basis;
-            summary.support = pair.support;
             summary.compared_candidates = 1;
             summary.reporters = supporting.reporters;
-        } else {
-            coherent &= summary.basis == pair.basis && summary.support == pair.support;
         }
         summary.compared_candidates += 1;
-        all_upload &= result.upload_known;
-        all_download &= result.download_known;
-        let reverse_pair = reversed(pair);
-        let reverse_result = promotion_result(
-            reverse_pair,
-            (candidate.qualified(), winner.qualified()),
-            (candidate.observed_reliability, winner.observed_reliability),
-        );
-        undefeated &= result.gain < switch_margin(winner.completed) || result.gain <= 0.0;
-        let margin = switch_margin(candidate.completed);
-        let wins = reverse_result.gain >= margin && reverse_result.gain > 0.0;
-        advantage |= wins;
-        if wins && (reverse_result.upload_known || reverse_result.download_known) {
-            let response_gain = reverse_result.response_gain;
-            if response_gain < margin || response_gain <= 0.0 {
-                for (basis, metric) in [
-                    (ScoreEvidenceBasis::Upload, reverse_pair.upload),
-                    (ScoreEvidenceBasis::Download, reverse_pair.download),
-                ] {
-                    let Some(metric) = metric else {
-                        continue;
-                    };
-                    let gain = (metric.candidate - metric.incumbent)
-                        / metric.candidate.max(metric.incumbent).max(1.0);
-                    if gain > rate_advantage {
-                        rate_advantage = gain;
-                        summary.advantage_basis = Some(basis);
-                    }
+        let mut improved = false;
+        let mut regressed = false;
+        for (direction, metric) in [pair.upload, pair.download].into_iter().enumerate() {
+            directional_known[direction] &= metric.is_some();
+            if let Some(metric) = metric {
+                let identity = (pair.basis, metric.support);
+                directional_known[direction] &=
+                    directional_support[direction].is_none_or(|old| old == identity);
+                directional_support[direction] = Some(identity);
+                improved |= metric.candidate - metric.incumbent
+                    >= metric.incumbent * PERFORMANCE_SWITCH_MARGIN
+                    && metric.candidate > metric.incumbent;
+                regressed |= metric.incumbent - metric.candidate
+                    > metric.incumbent * PERFORMANCE_SWITCH_MARGIN;
+                if winner.qualified() && candidate.qualified() {
+                    rate_nonregression &= metric.candidate - metric.incumbent
+                        <= metric.candidate * PERFORMANCE_SWITCH_MARGIN;
                 }
             }
         }
-        for (range, metric) in ranges
+        summary.directional_tradeoff |= improved && regressed;
+        let (rival_advantage, rates) = advantage(
+            pair,
+            (winner.qualified(), candidate.qualified()),
+            (winner.observed_reliability, candidate.observed_reliability),
+        );
+        undefeated &= !rival_advantage && rates.into_iter().all(|gain| gain <= 0.0);
+        let (wins, reverse_rates) = advantage(
+            reversed(pair),
+            (candidate.qualified(), winner.qualified()),
+            (candidate.observed_reliability, winner.observed_reliability),
+        );
+        response_advantage |= wins;
+        for direction in 0..2 {
+            selected_rates[direction] = selected_rates[direction].max(reverse_rates[direction]);
+        }
+        index.hash(&mut support);
+        (pair.basis as u8).hash(&mut support);
+        for (metric_index, (range, metric)) in ranges
             .iter_mut()
             .zip([pair.response, pair.upload, pair.download])
+            .enumerate()
         {
             let Some(metric) = metric else {
                 continue;
             };
+            (metric_index, metric.support).hash(&mut support);
             let low = metric.incumbent.min(metric.candidate);
             let high = metric.incumbent.max(metric.candidate);
+            pairwise_equivalent &= equivalent(low, high);
             *range = Some(range.map_or((low, high), |(min, max)| (min.min(low), max.max(high))));
             summary.reporters = summary.reporters.min(metric.reporters);
             summary.span = Some(summary.span.map_or(metric.span, |old| old.min(metric.span)));
@@ -154,23 +220,36 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
         }
     }
     let compared = summary.compared_candidates >= 2;
-    summary.complete = compared
-        && all_responses
-        && full_coverage
-        && coherent
-        && summary.compared_candidates + excluded == snapshots.len();
-    summary.equivalent = compared
-        && all_responses
-        && coherent
+    summary.upload_known = compared && directional_known[0];
+    summary.download_known = compared && directional_known[1];
+    let mut rate_advantage = 0.0;
+    for (direction, basis) in [ScoreEvidenceBasis::Upload, ScoreEvidenceBasis::Download]
+        .into_iter()
+        .enumerate()
+    {
+        if directional_known[direction] && selected_rates[direction] > rate_advantage {
+            rate_advantage = selected_rates[direction];
+            summary.advantage_basis = Some(basis);
+        }
+    }
+    let comparable = compared && all_responses && !summary.response_misaligned;
+    summary.complete =
+        comparable && full_coverage && summary.compared_candidates + excluded == snapshots.len();
+    summary.equivalent = comparable
+        && pairwise_equivalent
         && ranges
             .into_iter()
-            .flatten()
-            .all(|(min, max)| max - min <= min * PERFORMANCE_SWITCH_MARGIN)
+            .zip([true, summary.upload_known, summary.download_known])
+            .filter_map(|(range, known)| known.then_some(range).flatten())
+            .all(|(min, max)| equivalent(min, max))
         && undefeated
         && !summary.directional_tradeoff;
-    summary.supported = compared && all_responses && coherent && undefeated && advantage;
-    summary.upload_known = compared && all_upload;
-    summary.download_known = compared && all_download;
+    summary.supported = comparable
+        && undefeated
+        && (response_advantage || (rate_advantage > 0.0 && rate_nonregression));
+    if compared {
+        summary.support = support.finish();
+    }
     summary.evidence_age = oldest.map(|at| now.saturating_duration_since(at));
     summary.valid_for = expires.map(|at| at.saturating_duration_since(now));
     summary

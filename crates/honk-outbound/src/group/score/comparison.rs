@@ -8,6 +8,7 @@ use super::{
 };
 use honk_config::node::Node;
 use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
@@ -53,6 +54,8 @@ pub(super) struct MetricPair {
     pub latest_at: Instant,
     pub expires_at: Instant,
     pub dispersion: f64,
+    // Fingerprints describe selected keys/blocks, never measured values or raw API targets.
+    pub support: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -62,8 +65,6 @@ pub(super) struct PairEvidence {
     pub upload: Option<MetricPair>,
     pub download: Option<MetricPair>,
     pub partial: bool,
-    // Fingerprints describe selected keys/blocks, never measured values or raw API targets.
-    pub support: u64,
 }
 
 pub(super) struct PairCohort {
@@ -584,6 +585,7 @@ fn metric_pair(
     origin: Instant,
     now: Instant,
     timing: Timing,
+    mut support: std::collections::hash_map::DefaultHasher,
 ) -> Option<MetricPair> {
     let mut a = Accumulator::default();
     let mut b = Accumulator::default();
@@ -593,6 +595,7 @@ fn metric_pair(
             continue;
         }
         let until = timing.deadline(origin, left.block)?;
+        left.block.hash(&mut support);
         a.add(left);
         b.add(right);
         expires = Some(expires.map_or(until, |old: Instant| old.min(until)));
@@ -620,6 +623,7 @@ fn metric_pair(
         latest_at,
         expires_at,
         dispersion: ((a.max - a.min?) / left.max(1.0)).max((b.max - b.min?) / right.max(1.0)),
+        support: support.finish(),
     })
 }
 
@@ -639,16 +643,21 @@ fn has_common_block(left: &Cell, right: &Cell, origin: Instant, now: Instant) ->
 fn merge_metric(acc: &mut Option<MetricPair>, next: Option<MetricPair>, count: usize) {
     *acc = match (*acc, next) {
         (_, Some(next)) if count == 0 => Some(next),
-        (Some(old), Some(next)) => Some(MetricPair {
-            incumbent: old.incumbent + next.incumbent,
-            candidate: old.candidate + next.candidate,
-            reporters: old.reporters.min(next.reporters),
-            span: old.span.min(next.span),
-            oldest_at: old.oldest_at.min(next.oldest_at),
-            latest_at: old.latest_at.min(next.latest_at),
-            expires_at: old.expires_at.min(next.expires_at),
-            dispersion: old.dispersion.max(next.dispersion),
-        }),
+        (Some(old), Some(next)) => {
+            let mut support = std::collections::hash_map::DefaultHasher::new();
+            (old.support, next.support).hash(&mut support);
+            Some(MetricPair {
+                incumbent: old.incumbent + next.incumbent,
+                candidate: old.candidate + next.candidate,
+                reporters: old.reporters.min(next.reporters),
+                span: old.span.min(next.span),
+                oldest_at: old.oldest_at.min(next.oldest_at),
+                latest_at: old.latest_at.min(next.latest_at),
+                expires_at: old.expires_at.min(next.expires_at),
+                dispersion: old.dispersion.max(next.dispersion),
+                support: support.finish(),
+            })
+        }
         _ => None,
     };
 }
@@ -660,7 +669,6 @@ fn paired_cell(
     now: Instant,
     basis: Basis,
 ) -> PairEvidence {
-    use std::hash::{Hash, Hasher};
     let mut result = PairEvidence {
         basis,
         ..PairEvidence::default()
@@ -679,27 +687,13 @@ fn paired_cell(
             slot.hash(&mut support);
         }
     }
-    for (metric_index, ((a, b), output)) in left
-        .metrics
-        .iter()
-        .zip(&right.metrics)
-        .zip([
-            &mut result.response,
-            &mut result.upload,
-            &mut result.download,
-        ])
-        .enumerate()
-    {
-        metric_index.hash(&mut support);
-        for (a, b) in a.iter().zip(b) {
-            timing
-                .common(a, b, origin, now)
-                .then_some(a.block)
-                .hash(&mut support);
-        }
-        *output = metric_pair(a, b, origin, now, timing);
+    for ((a, b), output) in left.metrics.iter().zip(&right.metrics).zip([
+        &mut result.response,
+        &mut result.upload,
+        &mut result.download,
+    ]) {
+        *output = metric_pair(a, b, origin, now, timing, support.clone());
     }
-    result.support = support.finish();
     result
 }
 
@@ -711,7 +705,6 @@ fn compare(
     candidate: Uuid,
     now: Instant,
 ) -> PairEvidence {
-    use std::hash::{Hash, Hasher};
     let empty = PairEvidence::default();
     let Some(origin) = inner.comparisons.origin else {
         return empty;
@@ -720,7 +713,6 @@ fn compare(
         basis: Basis::CommonTargets,
         ..empty
     };
-    let mut support = std::collections::hash_map::DefaultHasher::new();
     let mut count = 0;
     let mut exact = None;
     let mut probe = None;
@@ -764,7 +756,6 @@ fn compare(
                             merge_metric(&mut common.response, pair.response, count);
                             merge_metric(&mut common.upload, pair.upload, count);
                             merge_metric(&mut common.download, pair.download, count);
-                            pair.support.hash(&mut support);
                             count += 1;
                         } else {
                             common.partial = true;
@@ -789,7 +780,6 @@ fn compare(
             pending = Some(cell);
         }
     }
-    common.support = support.finish();
     if count == 0 {
         common.basis = Basis::None;
     }
@@ -868,7 +858,15 @@ pub(super) fn node_evidence(
             continue;
         };
         let metric = |buckets: &[Bucket; BLOCKS]| {
-            metric_pair(buckets, buckets, origin, now, timing).map(|pair| TimedMetric {
+            metric_pair(
+                buckets,
+                buckets,
+                origin,
+                now,
+                timing,
+                std::collections::hash_map::DefaultHasher::new(),
+            )
+            .map(|pair| TimedMetric {
                 value: pair.incumbent,
                 reporters: pair.reporters,
                 observed_at: pair.oldest_at,
