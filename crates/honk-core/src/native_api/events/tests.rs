@@ -473,7 +473,28 @@ async fn log_stream_binding_and_rejected_payload_invalidate_cursors() {
         3,
         "honk_core",
         Bytes::from(vec![b'x'; MAX_PAYLOAD_BYTES + 1]),
+        logs.capture_epoch(),
     );
     assert!(stream.next().await.unwrap().is_err());
     assert_expired(&logs, filter, cursor(&ready));
+}
+
+#[tokio::test]
+async fn idle_admission_and_old_capture_epochs_preserve_boundaries() {
+    let hub = hub();
+    let mut old = subscribe(&hub, all(), None);
+    let ready = next(&mut old).await;
+    let epoch = hub.capture_epoch();
+    hub.set_recording(false);
+    assert!(old.next().await.unwrap().is_err());
+    assert_expired(&hub, all(), cursor(&ready));
+    let _idle = subscribe(&hub, all(), None);
+    hub.publish("runtime.updated", json!({}), None);
+    assert!(hub.buffered_kinds().is_empty());
+    hub.set_recording(true);
+    let payload = hub.payload("runtime.updated", &json!({}), None);
+    hub.publish_record(payload, None, None, epoch);
+    assert!(hub.buffered_kinds().is_empty());
+    hub.publish("runtime.updated", json!({}), None);
+    assert_eq!(hub.buffered_kinds(), vec!["runtime.updated"]);
 }

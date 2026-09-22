@@ -95,13 +95,17 @@ fn assert_expired(store: &Arc<LogStore>, query: &str, cursor: &str) {
 }
 
 #[tokio::test]
-async fn tracing_retains_without_clients_and_resume_ready_cannot_skip_replay() {
+async fn tracing_retains_during_grace_and_resume_ready_cannot_skip_replay() {
     if run_isolated(
-        "native_api::logs::tests::tracing_retains_without_clients_and_resume_ready_cannot_skip_replay",
+        "native_api::logs::tests::tracing_retains_during_grace_and_resume_ready_cannot_skip_replay",
     ) {
         return;
     }
-    let store = store();
+    let mut config = honk_config::Config::default();
+    config.global.log_level = "trace".into();
+    let owner = super::super::observation::NativeObservation::new(&config);
+    owner.settings.renew(&owner);
+    let store = Arc::clone(&owner.logs);
     let dispatch = capture(&store);
     let mut stream = response(&store, "?level=info&target=honk_core::control", None)
         .into_body()

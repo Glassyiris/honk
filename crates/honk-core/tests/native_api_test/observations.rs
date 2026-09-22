@@ -150,6 +150,9 @@ async fn native_head_disposes_event_stream_without_consuming_client_capacity() {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["content-type"], "text/event-stream");
         assert!(response.bytes().await.unwrap().is_empty());
+        let settings =
+            response_json(app.get("/api/v1/runtime/settings").send().await.unwrap()).await;
+        assert_eq!(settings["recording"]["events"]["active"], false);
     }
     let mut response = app
         .get(path)
@@ -199,4 +202,169 @@ async fn native_sse_heartbeat_survives_connection_lifetime_and_shutdown_releases
     let ended = timeout(IO_TIMEOUT, response.chunk()).await.unwrap();
     assert!(matches!(ended, Ok(None) | Err(_)));
     assert!(weak.upgrade().is_none());
+}
+
+#[tokio::test]
+async fn native_recorder_modes_reject_forbidden_mixed_patches_atomically() {
+    let app = TestApp::new(|config| config.experimental.native_api.record_logs = false).await;
+    let path = "/api/v1/runtime/settings";
+    let initial = response_json(app.get(path).send().await.unwrap()).await;
+    assert_eq!(initial["recording"]["logs"]["allowed"], false);
+    for mode in [json!(true), json!(false), json!("auto")] {
+        let response = app
+            .client
+            .patch(app.url(path))
+            .bearer_auth(SECRET)
+            .json(&json!({"record_flows": mode}))
+            .send()
+            .await
+            .unwrap();
+        let value = response_json(response).await;
+        let expected = match mode.as_bool() {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => "auto",
+        };
+        assert_eq!(value["recording"]["flows"]["mode"], expected);
+        if let Some(active) = mode.as_bool() {
+            assert_eq!(value["recording"]["flows"]["active"], active);
+        }
+    }
+    let before = response_json(app.get(path).send().await.unwrap()).await;
+    for patch in [
+        json!({"record_flows": true, "record_logs": true}),
+        json!({"record_flows": null}),
+        json!({"record_flows": "on"}),
+        json!({"recording": {"events": {"active": true}}}),
+    ] {
+        error_response(
+            app.client
+                .patch(app.url(path))
+                .bearer_auth(SECRET)
+                .json(&patch)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        )
+        .await;
+        let after = response_json(app.get(path).send().await.unwrap()).await;
+        assert_eq!(after["recording"], before["recording"]);
+    }
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_only_successful_observation_gets_attach() {
+    for poll in ["/api/v1/flows", "/api/v1/dns/log"] {
+        let app = TestApp::new(|_| {}).await;
+        for (method, path, status) in [
+            (Method::GET, "/api/v1/runtime/settings", StatusCode::OK),
+            (Method::GET, "/api/v1/capabilities", StatusCode::OK),
+            (Method::HEAD, "/api/v1/flows", StatusCode::OK),
+            (Method::HEAD, "/api/v1/dns/log", StatusCode::OK),
+            (Method::HEAD, "/api/v1/logs", StatusCode::OK),
+            (
+                Method::GET,
+                "/api/v1/flows?limit=0",
+                StatusCode::BAD_REQUEST,
+            ),
+            (Method::GET, "/api/v1/flows?cursor=bad", StatusCode::GONE),
+            (Method::GET, "/api/v1/flows/unknown", StatusCode::NOT_FOUND),
+            (
+                Method::GET,
+                "/api/v1/dns/log?cursor=bad",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Method::GET,
+                "/api/v1/events?kinds=invalid",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Method::GET,
+                "/api/v1/logs?level=invalid",
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = app
+                .client
+                .request(method, app.url(path))
+                .bearer_auth(SECRET)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{path}");
+            drop(response);
+            let settings =
+                response_json(app.get("/api/v1/runtime/settings").send().await.unwrap()).await;
+            for recorder in ["flows", "logs", "dns_log", "events"] {
+                assert_eq!(
+                    settings["recording"][recorder]["active"], false,
+                    "{path}: {recorder}"
+                );
+            }
+        }
+        let preflight = app
+            .client
+            .request(Method::OPTIONS, app.url(poll))
+            .header("origin", app.url(""))
+            .header("access-control-request-method", "GET")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            app.client.get(app.url(poll)).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let settings =
+            response_json(app.get("/api/v1/runtime/settings").send().await.unwrap()).await;
+        assert_eq!(settings["recording"]["events"]["active"], false);
+        assert_eq!(app.get(poll).send().await.unwrap().status(), StatusCode::OK);
+        let settings =
+            response_json(app.get("/api/v1/runtime/settings").send().await.unwrap()).await;
+        for recorder in ["flows", "logs", "dns_log", "events"] {
+            assert_eq!(
+                settings["recording"][recorder]["active"], true,
+                "{poll}: {recorder}"
+            );
+        }
+        assert!(
+            settings["recording"]["grace_remaining_seconds"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        app.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn native_admitted_anonymous_loopback_get_attaches() {
+    let app = TestApp::new(|config| {
+        config.experimental.native_api.secret.clear();
+        config.experimental.native_api.allow_anonymous_loopback = true;
+    })
+    .await;
+    assert_eq!(
+        app.client
+            .get(app.url("/api/v1/flows"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let settings = response_json(
+        app.client
+            .get(app.url("/api/v1/runtime/settings"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(settings["recording"]["flows"]["active"], true);
+    app.shutdown().await;
 }

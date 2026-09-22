@@ -4,7 +4,10 @@ use std::{
     collections::VecDeque,
     io,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::{Duration, SystemTime},
 };
@@ -123,11 +126,13 @@ struct Subscriber {
     queue: VecDeque<Arc<Record>>,
     closed: bool,
     waker: AtomicWaker,
+    lease: Option<super::settings::StreamLease>,
 }
 
 impl Subscriber {
     fn close(&mut self) {
         self.closed = true;
+        self.lease = None;
         self.queue = VecDeque::new();
         self.waker.wake();
     }
@@ -186,6 +191,7 @@ pub(crate) struct EventHub {
     started: Instant,
     state: Mutex<State>,
     kind: StreamKind,
+    epoch: AtomicU64,
 }
 
 impl EventHub {
@@ -207,6 +213,7 @@ impl EventHub {
             instance_id,
             started: Instant::now(),
             kind,
+            epoch: AtomicU64::new(1),
             state: Mutex::new(State {
                 records: VecDeque::new(),
                 subscribers: std::array::from_fn(|_| None),
@@ -223,11 +230,19 @@ impl EventHub {
 
     /// Producers supply only schema fields, never raw errors or configuration.
     pub(crate) fn publish(&self, kind: &'static str, data: Value, flow_id: Option<&str>) {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        if epoch.is_multiple_of(2) {
+            return;
+        }
         let payload = self.payload(kind, &data, flow_id);
-        self.publish_record(payload, flow_id, None);
+        self.publish_record(payload, flow_id, None, epoch);
     }
 
     pub(crate) fn flow_updated(&self, flow_id: &str, revision: u64) {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        if epoch.is_multiple_of(2) {
+            return;
+        }
         #[derive(serde::Serialize)]
         struct Update<'a> {
             instance_id: &'a str,
@@ -251,15 +266,15 @@ impl EventHub {
                     Bytes::from(serde_json::to_vec(&update).expect("event data is serializable")),
                 )
             });
-        self.publish_record(payload, Some(flow_id), None);
+        self.publish_record(payload, Some(flow_id), None, epoch);
     }
 
-    pub(super) fn publish_log(&self, level: u8, target: &'static str, payload: Bytes) {
-        self.publish_record(Some((0, payload)), None, Some((level, target)));
+    pub(super) fn publish_log(&self, level: u8, target: &'static str, payload: Bytes, epoch: u64) {
+        self.publish_record(Some((0, payload)), None, Some((level, target)), epoch);
     }
 
-    pub(super) fn reject_log(&self) {
-        self.publish_record(None, None, None);
+    pub(super) fn reject_log(&self, epoch: u64) {
+        self.publish_record(None, None, None, epoch);
     }
 
     fn publish_record(
@@ -267,9 +282,10 @@ impl EventHub {
         payload: Option<(usize, Bytes)>,
         flow_id: Option<&str>,
         logs: Option<(u8, &'static str)>,
+        epoch: u64,
     ) {
         let mut state = self.state.lock();
-        if state.stopped || !state.enabled {
+        if state.stopped || !state.enabled || self.epoch.load(Ordering::Acquire) != epoch {
             return;
         }
         let now = Instant::now();
@@ -346,8 +362,15 @@ impl EventHub {
             .collect()
     }
 
+    pub(super) fn capture_epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
     pub(crate) fn shutdown(&self) {
         let mut state = self.state.lock();
+        if !self.epoch.load(Ordering::Acquire).is_multiple_of(2) {
+            self.epoch.fetch_add(1, Ordering::AcqRel);
+        }
         state.stopped = true;
         state.close_clients();
         state.records = VecDeque::new();
@@ -366,12 +389,17 @@ impl EventHub {
 
     pub(super) fn set_recording(&self, enabled: bool) {
         let mut state = self.state.lock();
+        if state.enabled == enabled || state.stopped {
+            return;
+        }
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         state.enabled = enabled;
         if !enabled {
             state.close_clients();
             state.records = VecDeque::new();
             state.retained_bytes = 0;
-            state.evicted_through = state.sequence;
+            // The new signer already rejects every earlier cursor; bumping
+            // `evicted_through` would also reject the next stream's own ready cursor.
             state.signer = new_signer(&self.instance_id);
         }
     }
@@ -445,7 +473,7 @@ impl EventHub {
             .map(|cursor| self.resume_sequence(&state, cursor, &filter, now, id))
             .transpose()?
             .map(|after| (after, cutoff));
-        if state.stopped || !state.enabled {
+        if state.stopped {
             return Err(error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorCode::TemporarilyUnavailable,
@@ -491,6 +519,7 @@ impl EventHub {
             queue: VecDeque::new(),
             closed: false,
             waker: AtomicWaker::new(),
+            lease: None,
         });
         let mut heartbeat = tokio::time::interval_at(now + HEARTBEAT, HEARTBEAT);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -502,6 +531,16 @@ impl EventHub {
             heartbeat,
             ended: false,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn subscribe_for_test(
+        self: &Arc<Self>,
+        request: &Request,
+    ) -> Result<Subscription, ApiError> {
+        let id = RequestId("attachment-test".into());
+        let (filter, cursor) = request_options(request, &id)?;
+        self.subscribe(filter, cursor.as_deref(), &id)
     }
 
     fn resume_sequence(
@@ -546,6 +585,17 @@ pub(super) struct Subscription {
     ready: Option<Bytes>,
     heartbeat: Interval,
     ended: bool,
+}
+
+impl Subscription {
+    pub(super) fn attach(&mut self, lease: super::settings::StreamLease) {
+        let mut state = self.hub.state.lock();
+        if let Some(subscriber) = &mut state.subscribers[self.slot]
+            && !subscriber.closed
+        {
+            subscriber.lease = Some(lease);
+        }
+    }
 }
 
 impl Stream for Subscription {
@@ -874,10 +924,20 @@ pub(super) async fn serve(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     let (filter, cursor) = request_options(&request, id)?;
-    let subscription = state
-        .observation
-        .events
-        .subscribe(filter, cursor.as_deref(), id)?;
+    let admit = || {
+        state
+            .observation
+            .events
+            .subscribe(filter, cursor.as_deref(), id)
+    };
+    let subscription = if request.method() == axum::http::Method::GET {
+        state
+            .observation
+            .settings
+            .subscribe(&state.observation, admit)?
+    } else {
+        admit()?
+    };
     Ok(stream_response(subscription))
 }
 

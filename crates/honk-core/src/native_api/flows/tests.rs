@@ -290,6 +290,7 @@ fn pinned_pages_survive_mutation_and_bind_all_filters() {
 #[test]
 fn snapshot_capacity_is_explicit_and_recording_disable_releases_every_owner() {
     let store = store();
+    store.set_limits(64, 1);
     let first = begin(&store, "tcp");
     let _second = begin(&store, "tcp");
     let query = filters("all", "all", true, 1);
@@ -339,6 +340,10 @@ fn snapshot_capacity_is_explicit_and_recording_disable_releases_every_owner() {
     assert_eq!(inner.record_bytes + inner.snapshot_bytes, 0);
     drop(inner);
     store.set_recording(true);
+    assert_eq!(store.inner.lock().max_records, 64);
+    assert_eq!(store.inner.lock().retention, Duration::from_secs(1));
+    first.finish("closed", "late_finish_after_restart");
+    assert!(store.inner.lock().records.is_empty());
     let restarted = begin(&store, "tcp");
     assert_ne!(restarted.id(), first.id());
     assert!(!restarted.id().is_empty());
@@ -695,4 +700,18 @@ fn room_making_prunes_expired_records_before_evicting_live_ones() {
     assert!(store.get(live.id(), &request_id()).is_ok());
     assert!(store.get(newcomer.id(), &request_id()).is_ok());
     assert_eq!(store.inner.lock().records.len(), 2);
+}
+
+#[test]
+fn detached_begin_is_empty_without_locking_or_allocating_a_record() {
+    let owner = super::super::observation::NativeObservation::new(&honk_config::Config::default());
+    assert!(!owner.flows.recording.load(Ordering::Acquire));
+    let inner = owner.flows.inner.lock();
+    let guard = begin(&owner.flows, "tcp");
+    assert!(guard.id().is_empty());
+    assert_eq!(guard.id.capacity(), 0);
+    assert!(guard.store.upgrade().is_none());
+    assert!(inner.records.is_empty());
+    assert_eq!(inner.records.capacity(), 0);
+    assert_eq!(inner.record_bytes, 0);
 }

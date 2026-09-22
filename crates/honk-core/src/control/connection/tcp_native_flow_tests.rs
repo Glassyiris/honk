@@ -89,6 +89,11 @@ impl Fixture {
         )
         .await?;
         let server = crate::native_api::NativeServer::start(api_listener, Arc::new(state));
+        let http = reqwest::Client::builder().no_proxy().build()?;
+        http.get(format!("http://{address}/api/v1/flows"))
+            .send()
+            .await?
+            .error_for_status()?;
         let handle = plane.spawn_handle();
         handle.connection_tracker.disable_api();
         store_active_tcp_flow(&handle, destination, source).await?;
@@ -98,7 +103,7 @@ impl Fixture {
             plane,
             handle,
             server,
-            http: reqwest::Client::builder().no_proxy().build()?,
+            http,
             api: format!("http://{address}/api/v1"),
             listener,
             client,

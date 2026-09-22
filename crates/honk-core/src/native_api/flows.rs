@@ -57,6 +57,7 @@ const OWNER_BYTES: usize = 256 * 1024 + kernel::MAX_RETAINED_BYTES;
 pub(crate) struct FlowStore {
     instance_id: String,
     events: Arc<EventHub>,
+    recording: AtomicBool,
     inner: Mutex<Store>,
 }
 
@@ -157,6 +158,7 @@ impl FlowStore {
         Self {
             instance_id,
             events,
+            recording: AtomicBool::new(true),
             inner: Mutex::new(Store::new(true)),
         }
     }
@@ -166,7 +168,12 @@ impl FlowStore {
         if store.recording == enabled {
             return;
         }
+        let max_records = store.max_records;
+        let retention = store.retention;
         *store = Store::new(enabled);
+        store.max_records = max_records;
+        store.retention = retention;
+        self.recording.store(enabled, Ordering::Release);
         self.gap(&store, None, "recording_changed");
     }
 
@@ -188,6 +195,9 @@ impl FlowStore {
     }
 
     pub(crate) fn maintain(&self) {
+        if !self.recording.load(Ordering::Acquire) {
+            return;
+        }
         self.prune(&mut self.inner.lock(), Instant::now());
     }
 
@@ -197,6 +207,14 @@ impl FlowStore {
         src: SocketAddr,
         dst: SocketAddr,
     ) -> FlowGuard {
+        if !self.recording.load(Ordering::Acquire) {
+            return FlowGuard {
+                store: Weak::new(),
+                id: String::new(),
+                replied: AtomicBool::new(false),
+                sent: AtomicBool::new(false),
+            };
+        }
         let mut store = self.inner.lock();
         if !store.recording || !matches!(network, "tcp" | "udp") {
             return FlowGuard {

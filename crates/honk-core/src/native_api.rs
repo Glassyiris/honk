@@ -150,9 +150,32 @@ pub fn router(state: Arc<NativeState>) -> Router {
     router
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
+            observation_request,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
             security::boundary,
         ))
         .with_state(state)
+}
+
+async fn observation_request(
+    State(state): State<Arc<NativeState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let get = request.method() == axum::http::Method::GET;
+    let path = request.uri().path();
+    let poll = get
+        && (matches!(path, "/api/v1/flows" | "/api/v1/dns/log")
+            || path
+                .strip_prefix("/api/v1/flows/")
+                .is_some_and(|id| !id.is_empty() && !id.contains('/')));
+    let response = next.run(request).await;
+    if poll && response.status().is_success() {
+        state.observation.settings.renew(&state.observation);
+    }
+    response
 }
 
 async fn ui_fallback(
@@ -468,6 +491,7 @@ async fn sample_traffic(state: Arc<NativeState>, mut stop: watch::Receiver<bool>
             biased;
             _ = stop.changed() => break,
             _ = interval.tick() => {
+                state.observation.settings.maintain(&state.observation);
                 state.observation.flows.maintain();
                 let now = Instant::now();
                 let totals = state.stats.traffic_totals();
@@ -686,6 +710,7 @@ async fn supervise(
     if probes_running {
         let _ = probes.await;
     }
+    observation.settings.shutdown(&observation);
     observation.logs.shutdown();
     observation.events.shutdown();
     let _ = sampler_stop.send(true);

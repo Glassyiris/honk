@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use axum::http::{StatusCode, Uri, header};
@@ -27,7 +27,9 @@ const MAX_SAFE_UINT: u128 = 9_007_199_254_740_991;
 
 pub(crate) struct LogStore {
     instance: String,
+    allowed: bool,
     recording: AtomicBool,
+    epoch: AtomicU64,
     inner: Mutex<Ring>,
 }
 
@@ -58,7 +60,9 @@ impl LogStore {
     pub(crate) fn new(instance: String, recording: bool) -> Self {
         Self {
             instance,
+            allowed: recording,
             recording: AtomicBool::new(recording),
+            epoch: AtomicU64::new(0),
             inner: Mutex::new(Ring {
                 entries: VecDeque::new(),
                 bytes: 0,
@@ -76,9 +80,12 @@ impl LogStore {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn set_recording(&self, recording: bool) {
         let mut ring = self.inner.lock();
+        if self.recording.load(Ordering::Acquire) == recording {
+            return;
+        }
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         self.recording.store(recording, Ordering::Release);
         if !recording {
             ring.entries = VecDeque::new();
@@ -91,7 +98,7 @@ impl LogStore {
     }
 
     pub(crate) fn capability(&self) -> serde_json::Value {
-        serde_json::json!({"available": self.recording(), "max_records": MAX_RECORDS, "max_page_size": MAX_PAGE_SIZE})
+        serde_json::json!({"available": self.allowed, "max_records": MAX_RECORDS, "max_page_size": MAX_PAGE_SIZE})
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -104,6 +111,7 @@ impl LogStore {
         response: &[u8],
         elapsed: Duration,
     ) {
+        let epoch = self.epoch.load(Ordering::Acquire);
         if !self.recording.load(Ordering::Acquire)
             || matches!(ingress, IngressProfile::Api)
             || (matches!(ingress, IngressProfile::Internal) && source.is_none())
@@ -151,7 +159,10 @@ impl LogStore {
             + size_of::<Entry>()
             + 256;
         let mut ring = self.inner.lock();
-        if !self.recording.load(Ordering::Acquire) || ring.limit == 0 {
+        if !self.recording.load(Ordering::Acquire)
+            || self.epoch.load(Ordering::Acquire) != epoch
+            || ring.limit == 0
+        {
             return;
         }
         let Some(sequence) = ring.sequence.checked_add(1) else {
@@ -361,7 +372,7 @@ pub(super) async fn serve(
     uri: &Uri,
     id: &RequestId,
 ) -> Result<Response, ApiError> {
-    if !state.observation.dns.log.recording() {
+    if !state.observation.dns.log.allowed {
         return Err(error(
             StatusCode::NOT_FOUND,
             ErrorCode::CapabilityNotSupported,
@@ -479,11 +490,13 @@ mod tests {
         assert_eq!(value(store.page_for_test()).await["total"], 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn disabled_diagnostic_and_background_calls_do_not_enter_history() {
-        let store = LogStore::new("instance".into(), false);
-        capture(&store, "disabled.example", None);
-        store.set_recording(true);
+        let owner =
+            crate::native_api::observation::NativeObservation::new(&honk_config::Config::default());
+        let store = owner.dns.log_for_test();
+        capture(store, "disabled.example", None);
+        owner.settings.renew(&owner);
         let query = crate::dns::forwarder::build_dns_query("diagnostic.example", 1);
         let response = crate::dns::response::build_dns_refused(&query);
         let mapped: SocketAddr = "[::ffff:192.0.2.1]:53000".parse().unwrap();
@@ -525,8 +538,11 @@ mod tests {
         assert_eq!(page["total"], 1);
         assert_eq!(page["records"][0]["src"], mapped.to_string());
         assert_eq!(page["records"][0]["status"], "REFUSED");
-        store.set_recording(false);
-        store.set_recording(true);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        owner.settings.maintain(&owner);
+        assert!(!store.recording());
+        owner.settings.renew(&owner);
+        assert!(store.recording());
         assert_eq!(value(store.page_for_test()).await["total"], 0);
     }
 

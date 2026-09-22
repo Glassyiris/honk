@@ -79,6 +79,9 @@ impl DnsApi {
     pub(crate) fn set_log_limit(&self, limit: usize) {
         self.log.set_limit(limit);
     }
+    pub(crate) fn set_recording(&self, recording: bool) {
+        self.log.set_recording(recording);
+    }
     pub(crate) fn recording(&self) -> bool {
         self.log.recording()
     }

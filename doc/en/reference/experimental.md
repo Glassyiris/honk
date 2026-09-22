@@ -25,11 +25,11 @@ Requires the default-on `native-api` Cargo feature; it does not require `clash-a
 | `allow_origins` | empty list | Additional explicit HTTP(S) origins, without paths, credentials, query, fragment, `null`, or wildcards. |
 | `allowed_hosts` | empty list | Additional explicit HTTP Host authorities, without URL schemes, paths, credentials, or wildcards. Omitted port means 80, not the listener's port. |
 | `ui` | `""` | Empty disables hosting; otherwise a trusted local directory with readable `index.html`, or `embedded` with the default-off `native-ui` feature. No startup download, extraction or frontend build. |
-| `record_flows` | `true` | Retain bounded userspace decisions while native API is enabled, even without clients. `false` disables recording and releases its buffers; restart-required. |
+| `record_flows` | `true` | Permit bounded userspace flow recording under the API client-attachment rule or an explicit runtime pin. `false` prohibits recording, including runtime pins; configuration changes require restart. |
 | `record_traffic` | `true` | Keep up to 600 traffic samples for 600 seconds, even without clients. `false` disables history and releases its buffer on restart; current counters remain available. |
 | `record_memory` | `true` | Keep up to 600 memory samples for 600 seconds, even without clients. `false` disables history and releases its buffer on restart; current readings remain available. |
-| `record_logs` | `true` | Retain up to 512 sanitized structured logs for 60 seconds without subscribers. `false` disables native capture and releases storage; console/Clash logging is independent. |
-| `record_dns_log` | `true` | Retain up to 512 completed client DNS outcomes within an 8 MiB wire/metadata budget. `false` disables history and releases storage. |
+| `record_logs` | `true` | Permit up to 512 structured logs for 60 seconds under the API client-attachment rule or an explicit runtime pin. `false` prohibits capture; configuration changes require restart. Console/Clash logging remains independent. |
+| `record_dns_log` | `true` | Permit completed client DNS history under the API client-attachment rule or an explicit runtime pin, bounded to 512 records and 8 MiB. `false` prohibits history; configuration changes require restart. |
 | `probe_allowed_cidrs` | empty list | Explicit IP CIDRs authorizing otherwise restricted resolved probe targets and proxy-server addresses. Empty denies restricted addresses, including loopback/private/link-local ranges. |
 | `probe_allowed_ports` | empty list | Additional ports 1–65535 for configured HTTP/DNS probe targets. Defaults permit HTTP 80, HTTPS 443 and DNS 53; raw TCP probes use only the node's configured server port. CIDR authorization remains independently required. |
 | `config_content` | `false` | Allow authenticated administrators to read exact accepted source text, excluding entire API-credential-bearing sources. Requires a nonempty `secret`. |
