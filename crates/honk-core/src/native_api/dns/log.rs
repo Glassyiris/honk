@@ -27,6 +27,7 @@ const MAX_SAFE_UINT: u128 = 9_007_199_254_740_991;
 
 pub(crate) struct LogStore {
     instance: String,
+    allowed: bool,
     recording: AtomicBool,
     inner: Mutex<Ring>,
 }
@@ -58,6 +59,7 @@ impl LogStore {
     pub(crate) fn new(instance: String, recording: bool) -> Self {
         Self {
             instance,
+            allowed: recording,
             recording: AtomicBool::new(recording),
             inner: Mutex::new(Ring {
                 entries: VecDeque::new(),
@@ -76,7 +78,6 @@ impl LogStore {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn set_recording(&self, recording: bool) {
         let mut ring = self.inner.lock();
         self.recording.store(recording, Ordering::Release);
@@ -91,7 +92,7 @@ impl LogStore {
     }
 
     pub(crate) fn capability(&self) -> serde_json::Value {
-        serde_json::json!({"available": self.recording(), "max_records": MAX_RECORDS, "max_page_size": MAX_PAGE_SIZE})
+        serde_json::json!({"available": self.allowed, "max_records": MAX_RECORDS, "max_page_size": MAX_PAGE_SIZE})
     }
 
     #[allow(clippy::too_many_arguments)]

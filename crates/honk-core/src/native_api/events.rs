@@ -366,6 +366,9 @@ impl EventHub {
 
     pub(super) fn set_recording(&self, enabled: bool) {
         let mut state = self.state.lock();
+        if state.enabled == enabled || state.stopped {
+            return;
+        }
         state.enabled = enabled;
         if !enabled {
             state.close_clients();

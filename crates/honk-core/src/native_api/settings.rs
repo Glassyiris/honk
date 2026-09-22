@@ -49,6 +49,26 @@ impl Level {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum RecorderMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl<'de> Deserialize<'de> for RecorderMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Value::deserialize(deserializer)? {
+            Value::Bool(true) => Ok(Self::On),
+            Value::Bool(false) => Ok(Self::Off),
+            Value::String(value) if value == "auto" => Ok(Self::Auto),
+            _ => Err(serde::de::Error::custom("expected true, false, or auto")),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Values {
     level: Level,
@@ -57,6 +77,9 @@ struct Values {
     flows: usize,
     retention: u64,
     overridden: bool,
+    allowed: [bool; 3],
+    modes: [RecorderMode; 3],
+    attached: bool,
 }
 impl Values {
     fn configured(config: &Config) -> Self {
@@ -67,18 +90,56 @@ impl Values {
             flows: 1024,
             retention: 300,
             overridden: false,
+            allowed: [
+                config.experimental.native_api.record_flows,
+                config.experimental.native_api.record_logs,
+                config.experimental.native_api.record_dns_log,
+            ],
+            modes: [RecorderMode::Auto; 3],
+            attached: true,
         }
     }
+    fn active(self) -> [bool; 3] {
+        std::array::from_fn(|index| {
+            self.allowed[index]
+                && match self.modes[index] {
+                    RecorderMode::Auto => self.attached,
+                    RecorderMode::On => true,
+                    RecorderMode::Off => false,
+                }
+        })
+    }
+    fn events_active(self) -> bool {
+        self.attached
+            || self
+                .allowed
+                .iter()
+                .zip(self.modes)
+                .any(|(allowed, mode)| *allowed && mode == RecorderMode::On)
+    }
     fn json(self) -> Value {
+        let active = self.active();
+        let recorder = |index: usize| json!({"allowed": self.allowed[index], "mode": self.modes[index], "active": active[index]});
         json!({"observed_at":chrono::Utc::now().to_rfc3339(),"source":if self.overridden {"runtime"} else {"config"},
             "log":{"level":self.level,"buffered_records":self.logs},"dns_log":{"max_records":self.dns},
-            "flows":{"max_flows":self.flows,"retention_seconds":self.retention}})
+            "flows":{"max_flows":self.flows,"retention_seconds":self.retention},
+            "recording":{"flows":recorder(0),"logs":recorder(1),"dns_log":recorder(2),"events":{"active":self.events_active()},"grace_remaining_seconds":0}})
     }
     fn apply(self, owner: &NativeObservation) {
         owner.logs.set_level(self.level.as_str());
         owner.logs.set_limit(self.logs);
         owner.dns.set_log_limit(self.dns);
         owner.flows.set_limits(self.flows, self.retention);
+        let active = self.active();
+        if self.events_active() {
+            owner.events.set_recording(true);
+        }
+        owner.flows.set_recording(active[0]);
+        owner.logs.set_recording(active[1]);
+        owner.dns.set_recording(active[2]);
+        if !self.events_active() {
+            owner.events.set_recording(false);
+        }
     }
 }
 
@@ -93,6 +154,9 @@ impl Settings {
         next.apply(owner);
         *current = next;
     }
+    pub(crate) fn flow_recording(&self) -> bool {
+        self.0.lock().active()[0]
+    }
     fn snapshot(&self) -> Value {
         self.0.lock().json()
     }
@@ -105,7 +169,13 @@ impl Settings {
     ) -> Result<Value, ApiError> {
         let mut current = self.0.lock();
         let mut next = *current;
-        if patch.log.is_none() && patch.dns_log.is_none() && patch.flows.is_none() {
+        if patch.log.is_none()
+            && patch.dns_log.is_none()
+            && patch.flows.is_none()
+            && patch.record_flows.is_none()
+            && patch.record_logs.is_none()
+            && patch.record_dns_log.is_none()
+        {
             return Err(invalid(id));
         }
         if let Some(log) = patch.log {
@@ -150,6 +220,17 @@ impl Settings {
                 next.retention = seconds;
             }
         }
+        for (index, mode) in [patch.record_flows, patch.record_logs, patch.record_dns_log]
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(mode) = mode {
+                if mode == RecorderMode::On && !next.allowed[index] {
+                    return Err(invalid(id));
+                }
+                next.modes[index] = mode;
+            }
+        }
         next.overridden = true;
         next.apply(owner);
         *current = next;
@@ -160,6 +241,9 @@ impl Settings {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Patch {
+    record_flows: Option<RecorderMode>,
+    record_logs: Option<RecorderMode>,
+    record_dns_log: Option<RecorderMode>,
     log: Option<LogPatch>,
     dns_log: Option<DnsPatch>,
     flows: Option<FlowPatch>,
@@ -183,7 +267,7 @@ struct FlowPatch {
 }
 
 pub(super) fn capability(settings: &honk_config::experimental::NativeApiConfig) -> Value {
-    let mut fields = Vec::new();
+    let mut fields = vec!["record_flows", "record_logs", "record_dns_log"];
     if settings.record_logs {
         fields.extend(["log.level", "log.buffered_records"]);
     }
@@ -302,10 +386,49 @@ mod tests {
         let unchanged = owner.settings.snapshot();
         assert_eq!(unchanged["log"], current["log"]);
         assert_eq!(unchanged["flows"], current["flows"]);
+        let modes: Patch = serde_json::from_value(
+            json!({"record_flows":true,"record_logs":false,"record_dns_log":"auto"}),
+        )
+        .unwrap();
+        let changed = owner
+            .settings
+            .patch(&owner, &config.experimental.native_api, modes, &id)
+            .unwrap();
+        assert_eq!(changed["recording"]["flows"]["mode"], "on");
+        assert_eq!(changed["recording"]["flows"]["active"], true);
+        assert_eq!(changed["recording"]["logs"]["mode"], "off");
+        assert_eq!(changed["recording"]["logs"]["active"], false);
+        assert_eq!(changed["recording"]["dns_log"]["mode"], "auto");
         owner.settings.activate(&owner, &config);
         let restored = owner.settings.snapshot();
         assert_eq!(restored["source"], "config");
         assert_eq!(restored["log"]["level"], "warn");
         assert_eq!(restored["flows"]["max_flows"], 1024);
+        assert_eq!(restored["recording"]["flows"]["mode"], "auto");
+        assert_eq!(restored["recording"]["logs"]["mode"], "auto");
+
+        config.experimental.native_api.record_flows = false;
+        let forbidden = NativeObservation::new(&config);
+        let mixed =
+            serde_json::from_value(json!({"record_flows":true,"log":{"level":"trace"}})).unwrap();
+        assert!(
+            forbidden
+                .settings
+                .patch(&forbidden, &config.experimental.native_api, mixed, &id)
+                .is_err()
+        );
+        assert_eq!(forbidden.settings.snapshot()["log"]["level"], "warn");
+        assert_eq!(
+            forbidden.settings.snapshot()["recording"]["flows"]["active"],
+            false
+        );
+        let auto = serde_json::from_value(json!({"record_flows":"auto"})).unwrap();
+        assert!(
+            forbidden
+                .settings
+                .patch(&forbidden, &config.experimental.native_api, auto, &id)
+                .is_ok()
+        );
+        assert!(!forbidden.settings.flow_recording());
     }
 }

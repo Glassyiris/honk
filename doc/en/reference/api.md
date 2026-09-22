@@ -200,13 +200,18 @@ Use `Last-Event-ID` for resume. Logs have independent stream/filter-bound cursor
 
 | Field | Allowed value | Configured value |
 | --- | --- | --- |
+| `record_flows`, `record_logs`, `record_dns_log` | `true`, `false`, `"auto"` | `"auto"` |
 | `log.level` | `trace`, `debug`, `info`, `warn`, `error` | Configured native capture level |
 | `log.buffered_records` | 64–512 | 512 |
 | `dns_log.max_records` | 64–512 | 512 |
 | `flows.max_flows` | 64–1024 | 1024 |
 | `flows.retention_seconds` | 1–300 | 300 |
 
-Only enabled recorders expose their fields in capabilities. Empty, null, unknown, disabled-recorder or out-of-range updates return 400 and change nothing; the full merge is validated before any store changes. Shrinking discards old records. Log level affects only native capture, not console or Clash filtering. Overrides are memory-only: every accepted explicit activation, including a no-op or committed-degraded activation, restores configured settings. Rejected activation, provider/network refresh and suspend/resume do not reset them.
+Configuration permission determines which level and retention controls are available, independently of temporary recording activity. Empty, null, unknown or out-of-range updates, and level or retention updates for forbidden recorders, return 400 and change nothing; the full merge is validated before any store changes. Shrinking discards old records. Log level affects only native capture, not console or Clash filtering. Overrides are memory-only: every accepted explicit activation, including a no-op or committed-degraded activation, restores configured settings and resets recorder modes to `"auto"`. Rejected activation, provider/network refresh and suspend/resume do not reset them.
+
+The top-level recorder fields accept `true` to keep a permitted recorder on, `false` to force it off, or `"auto"` to follow client attachment. Omitted fields remain unchanged; null is rejected. Configuration false prohibits recording, and a runtime request to pin that recorder on rejects the entire patch.
+
+GET and successful PATCH include readonly `recording`: `flows`, `logs` and `dns_log` each contain `{allowed, mode, active}`, where `mode` is `"auto"`, `"on"` or `"off"`; `events.active` reports event capture, and `grace_remaining_seconds` reports the remaining attachment grace. Settings reads do not renew attachment.
 
 ### Connection closing, mode and datapath lifecycle
 

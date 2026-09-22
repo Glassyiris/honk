@@ -166,7 +166,11 @@ Provider GET 不联网，订阅条目连接真实 SubscriptionSupervisor 观测�
 
 `record_dns_log` 默认 true，在真实客户端完成点记录普通 DNS 和有来源的客户端解析，排除原生/Clash 诊断与后台刷新重复项。最多 512 条、8 MiB，仅内存；完整 wire 与元数据一起计费，按整条旧记录淘汰。`GET /dns/log` 最新优先，支持大小写不敏感的 name 子串、type、无端口 src、limit（1–500，默认 100）及过滤器绑定 cursor；淘汰使相关 cursor 失效。关闭任一记录开关需重启并释放对应缓冲，不影响正常 DNS 服务。
 
-`PATCH /runtime/settings` 使用 JSON 对象，仅合并 capabilities 列出的字段：`log.level`（trace/debug/info/warn/error）、`log.buffered_records`（64–512）、`dns_log.max_records`（64–512）、`flows.max_flows`（64–1024）与 `flows.retention_seconds`（1–300）。未知、null、空对象、越界或启动时未启用的记录字段使整次请求 400，任何字段都不改变。通过校验后由一个 owner 原子发布，source 为 runtime；缩容淘汰旧记录并使受影响 cursor 失效。原生日志级别只影响该 capture layer，不修改控制台/Clash 过滤器。这些 override 不写 `.dae` 或 cache DB；每次成功的显式配置激活（含 no-op）恢复配置级别和初始留存上限，provider/network refresh 保留。
+`PATCH /runtime/settings` 使用 JSON 对象，仅合并 capabilities 列出的字段：`record_flows`、`record_logs`、`record_dns_log`（`true`、`false` 或 `"auto"`）、`log.level`（trace/debug/info/warn/error）、`log.buffered_records`（64–512）、`dns_log.max_records`（64–512）、`flows.max_flows`（64–1024）与 `flows.retention_seconds`（1–300）。未知、null、空对象、越界值，或对配置禁止的记录器修改级别、留存上限，均使整次请求返回 400，任何字段都不改变。通过校验后由一个 owner 原子发布，source 为 runtime；缩容淘汰旧记录并使受影响 cursor 失效。原生日志级别只影响该 capture layer，不修改控制台/Clash 过滤器。这些 override 不写 `.dae` 或 cache DB；每次成功的显式配置激活（含 no-op）恢复配置级别和初始留存上限，并将记录模式重置为 `"auto"`；provider/network refresh 保留运行时设置。
+
+顶层记录字段中，`true` 使获准的记录器持续开启，`false` 强制关闭，`"auto"` 按客户端连接状态控制，也是初始模式。省略的字段保持不变；null 被拒绝。配置中的 false 禁止记录，运行时请求开启该记录器会使整次 PATCH 被拒绝。配置权限决定哪些级别和留存控制可用，与记录器是否暂时停止无关。
+
+GET 和成功的 PATCH 响应包含只读 `recording`：`flows`、`logs`、`dns_log` 各含 `{allowed, mode, active}`，其中 `mode` 为 `"auto"`、`"on"` 或 `"off"`；`events.active` 表示事件捕获是否开启，`grace_remaining_seconds` 表示连接宽限期剩余秒数。读取设置不延长连接期限。
 
 ### 主文件条目与 geodata 管理（M9）
 

@@ -200,3 +200,54 @@ async fn native_sse_heartbeat_survives_connection_lifetime_and_shutdown_releases
     assert!(matches!(ended, Ok(None) | Err(_)));
     assert!(weak.upgrade().is_none());
 }
+
+#[tokio::test]
+async fn native_recorder_modes_reject_forbidden_mixed_patches_atomically() {
+    let app = TestApp::new(|config| config.experimental.native_api.record_logs = false).await;
+    let path = "/api/v1/runtime/settings";
+    let initial = response_json(app.get(path).send().await.unwrap()).await;
+    assert_eq!(initial["recording"]["logs"]["allowed"], false);
+    for mode in [json!(true), json!(false), json!("auto")] {
+        let response = app
+            .client
+            .patch(app.url(path))
+            .bearer_auth(SECRET)
+            .json(&json!({"record_flows": mode}))
+            .send()
+            .await
+            .unwrap();
+        let value = response_json(response).await;
+        let expected = match mode.as_bool() {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => "auto",
+        };
+        assert_eq!(value["recording"]["flows"]["mode"], expected);
+        if let Some(active) = mode.as_bool() {
+            assert_eq!(value["recording"]["flows"]["active"], active);
+        }
+    }
+    let before = response_json(app.get(path).send().await.unwrap()).await;
+    for patch in [
+        json!({"record_flows": true, "record_logs": true}),
+        json!({"record_flows": null}),
+        json!({"record_flows": "on"}),
+        json!({"recording": {"events": {"active": true}}}),
+    ] {
+        error_response(
+            app.client
+                .patch(app.url(path))
+                .bearer_auth(SECRET)
+                .json(&patch)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        )
+        .await;
+        let after = response_json(app.get(path).send().await.unwrap()).await;
+        assert_eq!(after["recording"], before["recording"]);
+    }
+    app.shutdown().await;
+}

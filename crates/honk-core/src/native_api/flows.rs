@@ -166,7 +166,11 @@ impl FlowStore {
         if store.recording == enabled {
             return;
         }
+        let max_records = store.max_records;
+        let retention = store.retention;
         *store = Store::new(enabled);
+        store.max_records = max_records;
+        store.retention = retention;
         self.gap(&store, None, "recording_changed");
     }
 

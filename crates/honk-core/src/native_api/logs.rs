@@ -45,6 +45,7 @@ struct LogRecord {
 
 pub(crate) struct LogStore {
     hub: Arc<EventHub>,
+    allowed: bool,
     recording: AtomicBool,
     stopped: AtomicBool,
     level: AtomicU8,
@@ -56,6 +57,7 @@ impl LogStore {
         hub.set_recording(recording);
         Self {
             hub,
+            allowed: recording,
             recording: AtomicBool::new(recording),
             stopped: AtomicBool::new(false),
             level: AtomicU8::new(level_number(level).expect("validated native log level")),
@@ -67,15 +69,17 @@ impl LogStore {
     }
 
     pub(crate) fn set_level(&self, level: &str) {
-        self.level.store(
-            level_number(level).expect("validated native log level"),
-            Ordering::Release,
-        );
-        tracing::callsite::rebuild_interest_cache();
+        let level = level_number(level).expect("validated native log level");
+        if self.level.swap(level, Ordering::AcqRel) != level {
+            tracing::callsite::rebuild_interest_cache();
+        }
     }
 
-    #[cfg(test)]
     pub(crate) fn set_recording(&self, recording: bool) {
+        let recording = recording && !self.stopped.load(Ordering::Acquire);
+        if self.recording.load(Ordering::Acquire) == recording {
+            return;
+        }
         if recording && !self.stopped.load(Ordering::Acquire) {
             self.hub.set_recording(true);
             self.recording.store(true, Ordering::Release);
@@ -95,7 +99,7 @@ impl LogStore {
 
     pub(crate) fn capability(&self) -> Value {
         json!({
-            "available": self.recording.load(Ordering::Acquire) && !self.stopped.load(Ordering::Acquire),
+            "available": self.allowed && !self.stopped.load(Ordering::Acquire),
             "levels": ["trace", "debug", "info", "warn", "error"],
             "max_buffered_records": MAX_RECORDS,
         })
