@@ -96,9 +96,7 @@ where
     let task = shared.expect("admitted worker has a join");
     if let (Some(owner), Some(scoped)) = (owner, scoped.as_ref())
         && !std::sync::Arc::ptr_eq(owner, scoped)
-        && scoped
-            .register(|_| TaskEntry::Shared(task.clone()))
-            .is_none()
+        && !scoped.retain_joinable(task.clone())
     {
         task.abort();
         return Err(scoped.admission_error());
@@ -415,6 +413,10 @@ impl TaskOwner {
                 futures_util::FutureExt::now_or_never(work).expect("blocking work cannot suspend");
             }))
         })
+    }
+
+    pub(crate) fn retain_joinable(self: &std::sync::Arc<Self>, task: SharedTask) -> bool {
+        self.register(|_| TaskEntry::Shared(task)).is_some()
     }
 
     fn register<S>(self: &std::sync::Arc<Self>, start: S) -> Option<tokio::task::AbortHandle>

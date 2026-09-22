@@ -295,9 +295,11 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 
 当前锁定依赖的已知限制：[`h2` 0.4.19 可能把缺少 `:status` 的响应报告为 200](https://github.com/hyperium/h2/issues/958)，因此这种畸形 HTTP/2 响应仍可能得到成功的延迟结果。[上游修复 #959](https://github.com/hyperium/h2/pull/959) 已合并，但当前锁定版本尚未包含；等待包含修复的正式版本后更新依赖，不使用本地 fork/vendor 补丁。
 
-成功测量会更新节点延迟历史。单节点失败返回 `503`；组测量会省略失败成员；两者都会追加供 URLTest 选择使用的 failure strike。
+成功测量会更新节点延迟历史。单节点失败返回 `503`，组测量会省略失败成员；任意手动测试目标的失败不会增加真实拨号失败连续计数。
 
-每次经代理或内建 `direct` 叶节点执行、并实际经过 Score 组的 delay-test exchange，都会把真实 URL 目标及成功或失败反馈给包含该被测叶节点的每个 Score 组。之前仅连接 server/session 的预热只报告聚合 setup，不会把该 URL 虚构为预热自身的目标；非 Score 路径不会创建 reporter 或评分 cell。
+手动延迟测量不会创建 Score exchange reporter。实际发生的前置 server/session 准备仍可报告聚合预热 setup 质量，但不会虚构业务结果或 URL 目标测量。
+
+两个延迟接口都会持有已接纳的任务直到测量清理结束，即使 HTTP 客户端已经断开。owner 接纳失败的 `503` 响应会区分容量耗尽、检查已暂停或停止，以及 worker 失败。QUIC 探测超时或正常关闭等待属于测量结果，不代表健康检查 owner 失败：有限的对端通知宽限期结束后，会停止并 join packet-adapter worker 和 Quinn driver。真正的受管 worker 失败仍会关闭健康检查接纳。
 
 ### Score 组表示
 

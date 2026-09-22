@@ -320,9 +320,11 @@ Delay tests use the canonical HTTP check-target decoder: HEAD preserves the raw 
 
 Known limitation of the locked dependency: [`h2` 0.4.19 can report 200 for a response missing `:status`](https://github.com/hyperium/h2/issues/958). Such a malformed HTTP/2 response may still yield a successful delay result. [Upstream fix #959](https://github.com/hyperium/h2/pull/959) is merged but not included in this locked release; adoption awaits a published release containing it, without a local fork/vendor patch.
 
-Successful measurements update the node latency history. Failures return `503` for a single node, are omitted from the group result, and append a failure strike used by URLTest selection.
+Successful measurements update the node latency history. Failures return `503` for a single node and are omitted from group results; arbitrary manual test targets do not advance real-dial failure streaks.
 
-Each delay-test exchange through a proxy or built-in `direct` leaf reports its real URL target and success or failure to every Score group containing the tested leaf. Any preliminary server/session warm-up reports aggregate setup only; it does not fabricate the URL as its own target. Non-Score paths create no score reporter or cell.
+Manual delay exchanges do not create Score exchange reporters. Actual preliminary server/session preparation may report aggregate warm-up setup quality, without inventing a business outcome or URL-target measurement.
+
+Both delay routes retain admitted jobs through measurement cleanup even if the HTTP client disconnects. Owner-admission `503` responses distinguish exhausted capacity, paused or stopped checks, and failed workers. A QUIC probe timeout or normal close linger is a measurement result, not a failed health owner: after the bounded peer-notification grace, packet-adapter workers and Quinn drivers are stopped and joined. Actual owned-worker failure still closes health admission.
 
 ### Score group representation
 

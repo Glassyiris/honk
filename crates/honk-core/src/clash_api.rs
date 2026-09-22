@@ -30,7 +30,7 @@ use honk_config::Config;
 use honk_config::group::GroupPolicy;
 use honk_config::node::{Group, Node};
 use honk_config::types::NodeProtocol;
-use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
+use honk_outbound::alive::{AliveDialerSet, HealthCheckError, IpVersion, ProbeDomain};
 use honk_outbound::group::SelectionNetwork;
 use honk_outbound::group::{GroupManager, SharedGroupManager};
 use honk_outbound::urltest::{
@@ -709,6 +709,10 @@ fn delay_ms(d: Duration) -> u64 {
     (d.as_millis() as u64).min(u16::MAX as u64)
 }
 
+fn health_probe_error(error: HealthCheckError) -> Response {
+    error_response(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
+}
+
 /// GET /proxies/{name}/delay — live latency measurement (HEAD request
 /// through the node / group members). Successes refresh the alive-set
 /// history; errors return 503 without changing real dial failure streaks.
@@ -721,12 +725,7 @@ async fn get_proxy_delay(
     owner
         .run_external_probe(move |cancel| async move { proxy_delay(s, name, query, cancel).await })
         .await
-        .unwrap_or_else(|_| {
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "health probe owner is unavailable",
-            )
-        })
+        .unwrap_or_else(health_probe_error)
 }
 
 async fn proxy_delay(
@@ -852,12 +851,7 @@ async fn get_group_delay(
     owner
         .run_external_probe(move |cancel| async move { group_delay(s, name, query, cancel).await })
         .await
-        .unwrap_or_else(|_| {
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "health probe owner is unavailable",
-            )
-        })
+        .unwrap_or_else(health_probe_error)
 }
 
 async fn group_delay(

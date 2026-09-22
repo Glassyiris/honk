@@ -1380,6 +1380,71 @@ async fn test_group_delay_omits_failed_members() {
 }
 
 #[tokio::test]
+async fn delay_owner_errors_distinguish_saturation_pause_stop_and_failure() {
+    use honk_outbound::alive::HealthCheckError;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let app = spawn_app("", "").await;
+        let owner = &app.state.alive_set;
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let mut jobs = Vec::new();
+        for _ in 0..10 {
+            let owner = Arc::clone(owner);
+            let started = started.clone();
+            jobs.push(tokio::spawn(async move {
+                owner
+                    .run_external_probe(move |cancel| async move {
+                        started.send(()).unwrap();
+                        cancel.cancelled().await;
+                    })
+                    .await
+            }));
+            starts.recv().await.unwrap();
+        }
+        let client = http_client();
+        for expected in [HealthCheckError::Busy, HealthCheckError::Paused] {
+            for path in ["/group/proxy/delay", "/proxies/node-a/delay"] {
+                let response = client.get(app.url(path)).send().await.unwrap();
+                assert_eq!(response.status(), 503);
+                let body: serde_json::Value = response.json().await.unwrap();
+                assert_eq!(body["message"], expected.to_string());
+            }
+            owner.pause_health_checks().await.unwrap();
+        }
+        for job in jobs {
+            job.await.unwrap().unwrap();
+        }
+        owner.resume_health_checks().unwrap();
+        let response = client
+            .get(app.url("/group/no-such-group/delay"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "resumed owner must admit work");
+        owner.shutdown_health_checks().await.unwrap();
+        for path in ["/group/proxy/delay", "/proxies/node-a/delay"] {
+            let response = client.get(app.url(path)).send().await.unwrap();
+            assert_eq!(response.status(), 503);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["message"], HealthCheckError::Stopped.to_string());
+        }
+
+        let failed = spawn_app("", "").await;
+        let permit = failed.state.alive_set.acquire_health_probe().unwrap();
+        permit.cancellation().report_cleanup_failure();
+        drop(permit);
+        for path in ["/group/proxy/delay", "/proxies/node-a/delay"] {
+            let response = client.get(failed.url(path)).send().await.unwrap();
+            assert_eq!(response.status(), 503);
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["message"], HealthCheckError::WorkerFailed.to_string());
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn test_score_group_delay_returns_current_winner_latency() {
     use honk_outbound::group::{ScoreOutcome, ScoreSelectionContext, SelectionNetwork};
 

@@ -481,12 +481,60 @@ impl quinn::AsyncUdpSocket for TransportQuinnSocket {
     }
 }
 
-/// Owns a client-only quinn endpoint and the bounded [`PacketTransport`]
-/// adapter workers that drive it.
+#[derive(Debug)]
+struct PacketTransportRuntime {
+    inner: Arc<dyn quinn::Runtime>,
+    tasks: std::sync::Weak<crate::runtime::TaskOwner>,
+    parent: Option<std::sync::Weak<crate::runtime::TaskOwner>>,
+}
+
+impl quinn::Runtime for PacketTransportRuntime {
+    fn new_timer(&self, deadline: Instant) -> Pin<Box<dyn quinn::AsyncTimer>> {
+        self.inner.new_timer(deadline)
+    }
+
+    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        let Some(tasks) = self.tasks.upgrade() else {
+            return;
+        };
+        let (start, started) = tokio::sync::oneshot::channel();
+        let Ok(task) = crate::runtime::spawn_joinable(Some(&tasks), async move {
+            if started.await.is_ok() {
+                future.await;
+            }
+        }) else {
+            return;
+        };
+        if self.parent.as_ref().is_some_and(|parent| {
+            parent
+                .upgrade()
+                .is_none_or(|parent| !parent.retain_joinable(task.clone()))
+        }) {
+            task.abort();
+            return;
+        }
+        let _ = start.send(());
+    }
+
+    fn wrap_udp_socket(
+        &self,
+        socket: std::net::UdpSocket,
+    ) -> io::Result<Arc<dyn quinn::AsyncUdpSocket>> {
+        self.inner.wrap_udp_socket(socket)
+    }
+
+    fn now(&self) -> Instant {
+        self.inner.now()
+    }
+}
+
+/// Owns a client-only quinn endpoint, its drivers, and the bounded
+/// [`PacketTransport`] adapter workers that drive it.
 #[derive(Debug)]
 pub struct PacketTransportEndpoint {
     endpoint: Endpoint,
     socket: Arc<TransportQuinnSocket>,
+    drivers: Arc<crate::runtime::TaskOwner>,
 }
 
 impl PacketTransportEndpoint {
@@ -496,16 +544,20 @@ impl PacketTransportEndpoint {
         &self.endpoint
     }
 
-    /// Close the endpoint, drain for up to `timeout`, then abort and join workers.
-    /// Returns false if draining timed out or a worker panicked. Zero only requests
-    /// closure, leaving the workers alive until Quinn releases its socket.
+    /// Request closure, allow `timeout` for peer notification, then stop and join
+    /// adapter workers and Quinn drivers. Returns false only for a worker panic.
+    /// Zero only requests closure; retained owners still own all jobs.
     pub async fn close(&self, timeout: Duration) -> bool {
         self.endpoint.close(VarInt::from_u32(0), b"shutdown");
         if timeout.is_zero() {
             return true;
         }
-        let idle = tokio::time::timeout(timeout, self.endpoint.wait_idle()).await;
-        self.socket.close_tasks().await && idle.is_ok()
+        // Quinn's normal close linger is three PTOs and may exceed the grace.
+        // Expiry ends peer notification, not successful owned teardown.
+        let _ = tokio::time::timeout(timeout, self.endpoint.wait_idle()).await;
+        let joined = self.socket.close_tasks().await;
+        self.drivers.close().await;
+        joined && !self.drivers.has_failed()
     }
 }
 
@@ -536,12 +588,22 @@ pub fn packet_transport_endpoint_with_metrics(
     }
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
+    let drivers = Arc::new(crate::runtime::TaskOwner::production());
+    let runtime = Arc::new(PacketTransportRuntime {
+        inner: runtime,
+        tasks: Arc::downgrade(&drivers),
+        parent: owner.map(Arc::downgrade),
+    });
     let config = endpoint_config_with_mtu(1252)?;
     let (socket, sender, receiver) =
         TransportQuinnSocket::prepare(transport, remote, metrics_enabled);
     let endpoint = Endpoint::new_with_abstract_socket(config, None, socket.clone(), runtime)?;
     socket.start_workers(owner, sender, receiver)?;
-    Ok(PacketTransportEndpoint { endpoint, socket })
+    Ok(PacketTransportEndpoint {
+        endpoint,
+        socket,
+        drivers,
+    })
 }
 
 /// Establish a QUIC connection through a proxied UDP tunnel and time the
@@ -1019,6 +1081,66 @@ mod probe_tests {
         server_task.await.unwrap();
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn silent_handshake_timeout_does_not_retire_health_owner() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let remote = peer.local_addr().unwrap();
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            socket.connect(remote).await.unwrap();
+            let transport = Arc::new(UdpPacketTransport { socket, remote });
+            let retained = Arc::downgrade(&transport);
+            let node = honk_config::node::Node {
+                outbound: honk_config::node::OutboundConfig::Hysteria2(Default::default()),
+                ..Default::default()
+            };
+            let mut config = client_config(&node, &[b"h3"], QuicClientOptions::default())
+                .await
+                .unwrap();
+            let mut timing = quinn::TransportConfig::default();
+            timing.initial_rtt(Duration::from_secs(1));
+            config.transport_config(Arc::new(timing));
+            let owner = Arc::new(crate::alive::AliveDialerSet::new());
+            let request = tokio::spawn({
+                let owner = Arc::clone(&owner);
+                async move {
+                    owner
+                        .run_external_probe(move |cancel| async move {
+                            quic_handshake_probe(
+                                transport,
+                                remote,
+                                "localhost",
+                                &config,
+                                Duration::from_millis(10),
+                                cancel,
+                            )
+                            .await
+                        })
+                        .await
+                }
+            });
+            let mut initial = [0; 1500];
+            let (received, _) = peer.recv_from(&mut initial).await.unwrap();
+            assert!(
+                received >= 1200,
+                "a real QUIC Initial reached the silent peer"
+            );
+            let error = request.await.unwrap().unwrap().unwrap_err();
+            assert!(error.to_string().contains("QUIC handshake timeout"));
+            assert!(
+                retained.upgrade().is_none(),
+                "measurement completion must join the transport workers"
+            );
+            assert_eq!(owner.run_external_probe(|_| async { 42 }).await, Ok(42));
+            owner.pause_health_checks().await.unwrap();
+            owner.resume_health_checks().unwrap();
+            assert_eq!(owner.run_external_probe(|_| async { 43 }).await, Ok(43));
+            owner.shutdown_health_checks().await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
     #[derive(Debug)]
     struct PanicReceiveTransport {
         inner: UdpPacketTransport,
@@ -1063,5 +1185,97 @@ mod probe_tests {
         panicked.notified().await;
         assert!(!endpoint.close(Duration::from_secs(1)).await);
         assert!(!endpoint.close(Duration::from_secs(1)).await);
+    }
+
+    #[derive(Debug)]
+    struct PanicDriverRuntime {
+        inner: Arc<dyn quinn::Runtime>,
+        panicked: Arc<tokio::sync::Notify>,
+    }
+
+    impl quinn::Runtime for PanicDriverRuntime {
+        fn new_timer(&self, deadline: Instant) -> Pin<Box<dyn quinn::AsyncTimer>> {
+            self.inner.new_timer(deadline)
+        }
+
+        fn spawn(&self, mut future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+            let panicked = Arc::clone(&self.panicked);
+            self.inner.spawn(Box::pin(async move {
+                std::future::poll_fn(|cx| {
+                    let _ = future.as_mut().poll(cx);
+                    Poll::Ready(())
+                })
+                .await;
+                // Inject outside Quinn's mutexes, which intentionally poison on panic.
+                drop(future);
+                panicked.notify_one();
+                panic!("injected Quinn driver-task panic");
+            }));
+        }
+
+        fn wrap_udp_socket(
+            &self,
+            socket: std::net::UdpSocket,
+        ) -> io::Result<Arc<dyn quinn::AsyncUdpSocket>> {
+            self.inner.wrap_udp_socket(socket)
+        }
+
+        fn now(&self) -> Instant {
+            self.inner.now()
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_close_retains_quinn_driver_panic_in_both_owners() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let remote = peer.local_addr().unwrap();
+            let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            udp.connect(remote).await.unwrap();
+            let parent = Arc::new(crate::runtime::TaskOwner::production());
+            let drivers = Arc::new(crate::runtime::TaskOwner::production());
+            let panicked = Arc::new(tokio::sync::Notify::new());
+            let runtime = Arc::new(PanicDriverRuntime {
+                inner: Arc::new(PacketTransportRuntime {
+                    inner: quinn::default_runtime().unwrap(),
+                    tasks: Arc::downgrade(&drivers),
+                    parent: Some(Arc::downgrade(&parent)),
+                }),
+                panicked: Arc::clone(&panicked),
+            });
+            let (socket, sender, receiver) = TransportQuinnSocket::prepare(
+                Arc::new(UdpPacketTransport {
+                    socket: udp,
+                    remote,
+                }),
+                remote,
+                false,
+            );
+            let endpoint = Endpoint::new_with_abstract_socket(
+                endpoint_config_with_mtu(1252).unwrap(),
+                None,
+                socket.clone(),
+                runtime,
+            )
+            .unwrap();
+            socket
+                .start_workers(Some(&parent), sender, receiver)
+                .unwrap();
+            let endpoint = PacketTransportEndpoint {
+                endpoint,
+                socket,
+                drivers,
+            };
+            panicked.notified().await;
+            assert!(!endpoint.close(Duration::from_millis(1)).await);
+            assert!(!endpoint.close(Duration::from_millis(1)).await);
+            parent.close().await;
+            assert!(
+                parent.has_failed(),
+                "parent teardown must retain driver failure"
+            );
+        })
+        .await
+        .unwrap();
     }
 }
