@@ -73,7 +73,9 @@ TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，
 
 ### 用户态记录流（M2）
 
-原生 listener 启用后默认记录，不依赖 dashboard 订阅。`record_flows: false` 在重启后关闭记录并释放缓冲。进程内最多保留 1024 条 flow、每条 64 steps，含 snapshot 与内核字典预留的总预算 8 MiB；终态最多保留 300 秒，压力下可提前淘汰，重启清空。由既有 sampler 清理，不新增 timer。
+客户端通过 GET 建立的 `/events` 或 `/logs` SSE 流仍连接时，视为已连接。最后一条流关闭后，或通过请求校验的 GET 请求访问 `/flows`、`/flows/{id}`、`/dns/log` 后，连接状态保留 60 秒。其他请求不延长此期限。记录从客户端连接时开始，首次读取历史为空是正常情况。
+
+`record_flows` 默认为 true，允许在客户端已连接时记录。显式运行时设置 `record_flows: true` 可在无客户端时持续记录；配置中的 `record_flows: false` 禁止记录，修改后需重启。实际记录停止时释放 flow 记录和快照。进程内最多保留 1024 条 flow、每条 64 steps，含 snapshot 与内核字典预留的总预算 8 MiB；终态最多保留 300 秒，压力下可提前淘汰，重启清空。由既有 sampler 清理，不新增 timer。
 
 Flow ID 表示 incarnation，不是五元组。TCP/UDP 捕获真实执行的路由谓词与短路、嗅探/校验、群组选择、DNS 子查询、物理尝试、会话复用/重试及终态边界；拨号失败或阻断即使没有 live connection 也保留。名称、ID、代次来自实际使用它们的操作，不按当前配置或路由模拟重建。DNS lookup/parent ID 与 outbound attempt/parent ID 保留因果关系；复用 carrier 记录为 attachment，不伪造新物理拨号。协议请求/确认 milestone 必须有真实协议证据，DNS 子步骤就绪不能成为业务目标确认。TCP/UDP 终态跟随所属清理边界；内核 offload 以 unknown 结束观察，不伪造 closed。
 
@@ -103,7 +105,9 @@ PATCH 只修改 parser 定位的可写源片段，保留其他原文字节、注
 
 实际发布 `stream.ready/runtime.updated/flow.updated/flow.gap/generation.changed` 及真实 operation 状态转换的 `operation.updated`；operation store 不依赖是否具有可写 `.dae` 来源。Generation 事件只来自已接受发布，不来自 reload 收件。事件仅含有界安全 ID/状态，不含包正文或原始配置。Flow/event 保留只在内存，不是耐久日志。
 
-`flow.updated` 是失效通知：通过其 `href` 读取最新保留 revision。每个客户端的 live 队列只保留同一 flow 尚未发送的最新通知，并按新事件序号追加到队尾；revision 可以跳跃，但发送游标保持有序。发布仍是即时的，包括终态更新，不增加批量定时器。重放环即使没有订阅者也记录每次发布，replay 不做合并。其他事件类型和日志不合并；不同 flow 或其他不可替换事件仍会在 live 队列满时断流。Flow 数据、revision 与捕获的 trace steps 不变。
+`flow.updated` 是失效通知：通过其 `href` 读取最新保留 revision。每个客户端的 live 队列只保留同一 flow 尚未发送的最新通知，并按新事件序号追加到队尾；revision 可以跳跃，但发送游标保持有序。发布仍是即时的，包括终态更新，不增加批量定时器。事件捕获开启时，重放环记录每次发布，replay 不做合并。其他事件类型和日志不合并；不同 flow 或其他不可替换事件仍会在 live 队列满时断流。Flow 数据、revision 与捕获的 trace steps 不变。
+
+客户端已连接，或获准的记录器通过显式运行时设置持续开启时，事件捕获开启。空闲事件中心仍接受新流；停止捕获后，旧事件游标失效。事件开启时，手动或自动记录切换通过 `flow.gap` 的 `reason=recording_changed` 表示记录连续性中断，不表示丢包或未捕获的 flow 数量。空闲事件中心不重放关闭时的 gap；重新连接建立新的记录边界。
 
 ### 出站、内存与历史（M5）
 
@@ -162,9 +166,9 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 Provider GET 不联网，订阅条目连接真实 SubscriptionSupervisor 观测与已接受节点的 `subscription_id`，`Node.provider_id` 可用于关联。订阅显示名为安全的 `provider-<id>`，不披露原始 tag/URL；未观测 usage/expiry 为 null。从未加载、等待加载或禁用且无缓存时是 stale、零节点及 null 时间/错误；真实失败且无节点才是 error，保留旧/缓存节点时为 stale。列表 `limit` 默认 100、范围 1–1000，snapshot 上限 8 份/30 秒/4 MiB。启用且有运行 supervisor 的订阅可 POST refresh；同 provider 的不同并发 refresh 为 409，保留的幂等重放先于冲突检查。刷新成功须真实 revision-fenced publication 被接受，fetch 或写缓存不等于成功，HTTP 断连不丢失结果。虚拟 inline provider 不可刷新/删除；它关联 `provider_id: inline` 的静态非 builtin 节点，builtin 归属保持 null，订阅 ID 仍为 UUID。
 
-`record_logs` 默认 true，结构化 tracing layer 无客户端也保留最多 512 条/60 秒日志，仅内存。保留真实 timestamp/level/target；只有审查过的静态消息和有类型的安全字段可披露，其他 message/fields 明确 withheld，不靠正则猜测所有秘密，也不转发控制台或 Clash 格式化输出。`GET /logs` 以 SSE 返回 `stream.ready` 与日志，支持 level/target 过滤和绑定 stream/instance/过滤器的 cursor；与 `/events` **不同，续传顺序为 ready→replay→live**，ready 保留请求 cursor，之后才由 replay 推进。每 stream 最多 16 clients、每 client 64 队列、15 秒 heartbeat；过期 cursor 在 200 前返回 409，队满或 replay 丢失则断流。
+`record_logs` 默认为 true，允许在客户端已连接时捕获日志，最多保留 512 条、60 秒。显式运行时设置 `record_logs: true` 可在无客户端时持续捕获；配置中的 false 禁止捕获，修改后需重启。实际记录停止时释放日志，续传游标失效。保留真实 timestamp/level/target；只有审查过的静态消息和有类型的安全字段可披露，其他 message/fields 明确 withheld，不靠正则猜测所有秘密，也不转发控制台或 Clash 格式化输出。`GET /logs` 以 SSE 返回 `stream.ready` 与日志，支持 level/target 过滤和绑定 stream/instance/过滤器的 cursor；与 `/events` **不同，续传顺序为 ready→replay→live**，ready 保留请求 cursor，之后才由 replay 推进。每 stream 最多 16 clients、每 client 64 队列、15 秒 heartbeat；过期 cursor 在 200 前返回 409，队满或 replay 丢失则断流。
 
-`record_dns_log` 默认 true，在真实客户端完成点记录普通 DNS 和有来源的客户端解析，排除原生/Clash 诊断与后台刷新重复项。最多 512 条、8 MiB，仅内存；完整 wire 与元数据一起计费，按整条旧记录淘汰。`GET /dns/log` 最新优先，支持大小写不敏感的 name 子串、type、无端口 src、limit（1–500，默认 100）及过滤器绑定 cursor；淘汰使相关 cursor 失效。关闭任一记录开关需重启并释放对应缓冲，不影响正常 DNS 服务。
+`record_dns_log` 默认为 true，允许在客户端已连接时记录，最多保留 512 条、8 MiB。显式运行时设置 `record_dns_log: true` 可在无客户端时持续记录；配置中的 false 禁止记录，修改后需重启。实际记录停止时释放历史，已有游标失效。在真实客户端完成点记录普通 DNS 和有来源的客户端解析，排除原生/Clash 诊断与后台刷新重复项。仅存内存；完整 wire 与元数据一起计费，按整条旧记录淘汰。`GET /dns/log` 最新优先，支持大小写不敏感的 name 子串、type、无端口 src、limit（1–500，默认 100）及过滤器绑定 cursor；淘汰使相关 cursor 失效。停止记录不影响正常 DNS 服务。
 
 `PATCH /runtime/settings` 使用 JSON 对象，仅合并 capabilities 列出的字段：`record_flows`、`record_logs`、`record_dns_log`（`true`、`false` 或 `"auto"`）、`log.level`（trace/debug/info/warn/error）、`log.buffered_records`（64–512）、`dns_log.max_records`（64–512）、`flows.max_flows`（64–1024）与 `flows.retention_seconds`（1–300）。未知、null、空对象、越界值，或对配置禁止的记录器修改级别、留存上限，均使整次请求返回 400，任何字段都不改变。通过校验后由一个 owner 原子发布，source 为 runtime；缩容淘汰旧记录并使受影响 cursor 失效。原生日志级别只影响该 capture layer，不修改控制台/Clash 过滤器。这些 override 不写 `.dae` 或 cache DB；每次成功的显式配置激活（含 no-op）恢复配置级别和初始留存上限，并将记录模式重置为 `"auto"`；provider/network refresh 保留运行时设置。
 

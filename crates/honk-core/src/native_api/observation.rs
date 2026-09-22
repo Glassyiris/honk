@@ -51,7 +51,7 @@ impl NativeObservation {
             config.experimental.native_api.record_logs,
             level.as_str(),
         ));
-        Self {
+        let owner = Self {
             instance_id,
             events,
             flows,
@@ -68,7 +68,9 @@ impl NativeObservation {
             trace: super::routing::TraceState::new(),
             settings: super::settings::Settings::new(config),
             providers: super::providers::ProviderApi::new(),
-        }
+        };
+        owner.settings.activate(&owner, config);
+        owner
     }
 
     pub(crate) fn committed(

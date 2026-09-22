@@ -25,11 +25,11 @@
 | `allow_origins` | 空列表 | 额外允许的完整 HTTP(S) Origin；不含路径、凭据、query、fragment、`null` 或通配符。 |
 | `allowed_hosts` | 空列表 | 额外允许的 HTTP Host authority；不含 URL scheme、路径、凭据或通配符。省略端口表示 80，不是监听端口。 |
 | `ui` | `""` | 空值关闭托管；其他值为含可读 `index.html` 的可信本地目录，或配合默认关闭的 `native-ui` feature 使用 `embedded`。启动不下载、不解压、不构建前端。 |
-| `record_flows` | `true` | 原生 API 启用后保留有界用户态决策，无客户端也记录；`false` 关闭记录并释放缓冲，需重启。 |
+| `record_flows` | `true` | 允许按 API 客户端连接规则记录有界用户态 flow，或通过显式运行时设置持续记录。`false` 禁止记录，运行时设置不能覆盖；修改配置需重启。 |
 | `record_traffic` | `true` | 无客户端也记录流量 history；最多 600 点/600 秒，false 在重启后释放对应缓冲，不关闭即时计数。 |
 | `record_memory` | `true` | 无客户端也记录 RSS/cgroup history；最多 600 点/600 秒，false 在重启后释放对应缓冲，不关闭即时内存观测。 |
-| `record_logs` | `true` | 无客户端也保留结构化、安全投影的日志，最多 512 条/60 秒；false 在重启后关闭记录并释放缓冲。 |
-| `record_dns_log` | `true` | 保留真实客户端 DNS 完成历史，最多 512 条/8 MiB；不记录诊断请求或后台刷新重复项，false 在重启后释放缓冲。 |
+| `record_logs` | `true` | 允许按 API 客户端连接规则或显式运行时设置捕获结构化日志，最多保留 512 条、60 秒。`false` 禁止捕获；修改配置需重启。控制台和 Clash 日志保持独立。 |
+| `record_dns_log` | `true` | 允许按 API 客户端连接规则或显式运行时设置记录客户端 DNS 完成历史，最多保留 512 条、8 MiB。`false` 禁止记录；修改配置需重启。 |
 | `probe_allowed_cidrs` | 空列表 | 管理员允许原生 probe 访问的受限 IP CIDR；默认拒绝私网、loopback、link-local 等受限解析目标，包括配置的节点地址。不是任意 URL 许可。 |
 | `probe_allowed_ports` | 空列表 | 扩展原生 HTTP/HTTPS 检查的默认 80/443、DNS 检查的默认 53 端口；每项须为 1–65535。Raw TCP-connect 只使用节点实际配置端口，不受此扩展列表限制；受限地址仍需独立 CIDR 许可。 |
 | `config_content` | `false` | 向通过控制 bearer 认证的管理员返回获准源的完整原文；要求非空 secret，含 API 凭据的整个源仍省略正文。 |

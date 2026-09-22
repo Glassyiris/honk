@@ -1,5 +1,8 @@
 //! One transition owner for runtime-only native recorder settings.
 
+use std::sync::Arc;
+use tokio::time::{Duration, Instant};
+
 use axum::{
     Json,
     extract::Request,
@@ -96,7 +99,7 @@ impl Values {
                 config.experimental.native_api.record_dns_log,
             ],
             modes: [RecorderMode::Auto; 3],
-            attached: true,
+            attached: false,
         }
     }
     fn active(self) -> [bool; 3] {
@@ -130,6 +133,9 @@ impl Values {
         owner.logs.set_limit(self.logs);
         owner.dns.set_log_limit(self.dns);
         owner.flows.set_limits(self.flows, self.retention);
+        self.apply_recording(owner);
+    }
+    fn apply_recording(self, owner: &NativeObservation) {
         let active = self.active();
         if self.events_active() {
             owner.events.set_recording(true);
@@ -143,22 +149,118 @@ impl Values {
     }
 }
 
-pub(crate) struct Settings(Mutex<Values>);
+#[derive(Default)]
+struct Attachment {
+    streams: usize,
+    deadline: Option<Instant>,
+}
+
+impl Attachment {
+    fn active(&self, now: Instant) -> bool {
+        self.streams != 0 || self.deadline.is_some_and(|deadline| now < deadline)
+    }
+    fn remaining(&self) -> u64 {
+        if self.streams != 0 {
+            return 0;
+        }
+        self.deadline.map_or(0, |deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_secs_f64()
+                .ceil() as u64
+        })
+    }
+}
+
+pub(super) struct StreamLease(Arc<Mutex<Attachment>>);
+impl Drop for StreamLease {
+    fn drop(&mut self) {
+        let mut attachment = self.0.lock();
+        attachment.streams -= 1;
+        if attachment.streams == 0 {
+            attachment.deadline = Some(Instant::now() + Duration::from_secs(60));
+        }
+    }
+}
+
+pub(crate) struct Settings {
+    values: Mutex<Values>,
+    attachment: Arc<Mutex<Attachment>>,
+    stopped: std::sync::atomic::AtomicBool,
+}
 impl Settings {
     pub(crate) fn new(config: &Config) -> Self {
-        Self(Mutex::new(Values::configured(config)))
+        Self {
+            values: Mutex::new(Values::configured(config)),
+            attachment: Arc::new(Mutex::new(Attachment::default())),
+            stopped: std::sync::atomic::AtomicBool::new(false),
+        }
     }
     pub(crate) fn activate(&self, owner: &NativeObservation, config: &Config) {
-        let mut current = self.0.lock();
-        let next = Values::configured(config);
+        let mut current = self.values.lock();
+        let mut next = Values::configured(config);
+        next.allowed = current.allowed;
+        next.attached =
+            current.attached && !self.stopped.load(std::sync::atomic::Ordering::Acquire);
         next.apply(owner);
         *current = next;
     }
     pub(crate) fn flow_recording(&self) -> bool {
-        self.0.lock().active()[0]
+        self.values.lock().active()[0]
     }
     fn snapshot(&self) -> Value {
-        self.0.lock().json()
+        let current = self.values.lock();
+        self.json(*current)
+    }
+    fn json(&self, values: Values) -> Value {
+        let mut value = values.json();
+        value["recording"]["grace_remaining_seconds"] = json!(self.attachment.lock().remaining());
+        value
+    }
+    pub(crate) fn renew(&self, owner: &NativeObservation) {
+        let mut current = self.values.lock();
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        self.attachment.lock().deadline = Some(Instant::now() + Duration::from_secs(60));
+        if !current.attached {
+            current.attached = true;
+            current.apply_recording(owner);
+        }
+    }
+    pub(crate) fn maintain(&self, owner: &NativeObservation) {
+        let mut current = self.values.lock();
+        let attached = self.attachment.lock().active(Instant::now())
+            && !self.stopped.load(std::sync::atomic::Ordering::Acquire);
+        if current.attached != attached {
+            current.attached = attached;
+            current.apply_recording(owner);
+        }
+    }
+    pub(crate) fn shutdown(&self, owner: &NativeObservation) {
+        let mut current = self.values.lock();
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+        current.attached = false;
+        current.modes = [RecorderMode::Off; 3];
+        current.apply_recording(owner);
+    }
+    pub(super) fn subscribe(
+        &self,
+        owner: &NativeObservation,
+        admit: impl FnOnce() -> Result<super::events::Subscription, ApiError>,
+    ) -> Result<super::events::Subscription, ApiError> {
+        let mut current = self.values.lock();
+        let mut stream = admit()?;
+        if !self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            self.attachment.lock().streams += 1;
+            stream.attach(StreamLease(Arc::clone(&self.attachment)));
+            if !current.attached {
+                current.attached = true;
+                current.apply_recording(owner);
+            }
+        }
+        Ok(stream)
     }
     fn patch(
         &self,
@@ -167,7 +269,10 @@ impl Settings {
         patch: Patch,
         id: &RequestId,
     ) -> Result<Value, ApiError> {
-        let mut current = self.0.lock();
+        let mut current = self.values.lock();
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(invalid(id));
+        }
         let mut next = *current;
         if patch.log.is_none()
             && patch.dns_log.is_none()
@@ -234,7 +339,7 @@ impl Settings {
         next.overridden = true;
         next.apply(owner);
         *current = next;
-        Ok(next.json())
+        Ok(self.json(next))
     }
 }
 
@@ -429,6 +534,108 @@ mod tests {
                 .patch(&forbidden, &config.experimental.native_api, auto, &id)
                 .is_ok()
         );
+        forbidden.settings.renew(&forbidden);
         assert!(!forbidden.settings.flow_recording());
+        assert_eq!(
+            forbidden.settings.snapshot()["recording"]["flows"]["active"],
+            false
+        );
+    }
+    fn stream(owner: &NativeObservation) -> super::super::events::Subscription {
+        let request = axum::extract::Request::builder()
+            .uri("/api/v1/events")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        owner
+            .settings
+            .subscribe(owner, || owner.events.subscribe_for_test(&request))
+            .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attachment_gate_and_grace_expiry_control_all_recorders() {
+        use futures::StreamExt;
+        let owner = NativeObservation::new(&Config::default());
+        let active = |expected| {
+            let value = owner.settings.snapshot();
+            for recorder in ["flows", "logs", "dns_log", "events"] {
+                assert_eq!(
+                    value["recording"][recorder]["active"], expected,
+                    "{recorder}"
+                );
+            }
+        };
+        active(false);
+        assert!(owner.events.buffered_kinds().is_empty());
+        owner.events.publish("runtime.updated", json!({}), None);
+        assert!(owner.events.buffered_kinds().is_empty());
+        let mut first = stream(&owner);
+        let ready = first.next().await.unwrap().unwrap();
+        active(true);
+        let second = stream(&owner);
+        drop(first);
+        tokio::time::advance(Duration::from_secs(61)).await;
+        owner.settings.maintain(&owner);
+        active(true);
+        drop(second);
+        assert_eq!(
+            owner.settings.snapshot()["recording"]["grace_remaining_seconds"],
+            60
+        );
+        tokio::time::advance(Duration::from_secs(59)).await;
+        owner.settings.maintain(&owner);
+        active(true);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        active(true);
+        owner.settings.maintain(&owner);
+        active(false);
+        let cursor = std::str::from_utf8(&ready)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("id: "))
+            .unwrap();
+        let request = axum::extract::Request::builder()
+            .uri("/api/v1/events")
+            .header("last-event-id", cursor)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(
+            owner
+                .settings
+                .subscribe(&owner, || owner.events.subscribe_for_test(&request))
+                .is_err()
+        );
+        active(false);
+        owner.settings.renew(&owner);
+        active(true);
+        assert_eq!(owner.events.buffered_kinds(), vec!["flow.gap"]);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        owner.settings.maintain(&owner);
+        active(false);
+        owner.settings.shutdown(&owner);
+        owner.settings.renew(&owner);
+        active(false);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unpolled_and_overflowed_subscriptions_release_attachment_once() {
+        let owner = NativeObservation::new(&Config::default());
+        let unpolled = stream(&owner);
+        drop(unpolled);
+        assert_eq!(owner.settings.attachment.lock().streams, 0);
+        let overflow = stream(&owner);
+        for _ in 0..65 {
+            owner.events.publish("runtime.updated", json!({}), None);
+        }
+        assert_eq!(owner.settings.attachment.lock().streams, 0);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        owner.settings.maintain(&owner);
+        assert!(!owner.settings.flow_recording());
+        drop(overflow);
+        assert_eq!(owner.settings.attachment.lock().streams, 0);
+        assert_eq!(
+            owner.settings.snapshot()["recording"]["grace_remaining_seconds"],
+            0
+        );
     }
 }

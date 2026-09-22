@@ -113,8 +113,9 @@ impl LogStore {
     }
 
     fn capture(&self, event: &Event<'_>) {
+        let epoch = self.hub.capture_epoch();
         let metadata = event.metadata();
-        if !self.accepts(metadata) {
+        if epoch.is_multiple_of(2) || !self.accepts(metadata) {
             return;
         }
         if metadata.target().is_empty()
@@ -124,7 +125,7 @@ impl LogStore {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || b"_:-.".contains(&byte))
         {
-            self.hub.reject_log();
+            self.hub.reject_log(epoch);
             return;
         }
         let ts = timestamp(SystemTime::now());
@@ -145,10 +146,19 @@ impl LogStore {
             Bytes::from(
                 serde_json::to_vec(&payload).expect("bounded log projection is serializable"),
             ),
+            epoch,
         );
     }
 
     fn response(self: &Arc<Self>, request: &Request, id: &RequestId) -> Result<Response, ApiError> {
+        Ok(events::stream_response(self.subscribe(request, id)?))
+    }
+
+    fn subscribe(
+        self: &Arc<Self>,
+        request: &Request,
+        id: &RequestId,
+    ) -> Result<events::Subscription, ApiError> {
         let values = parse_query(request.uri(), &["level", "target"], id)?;
         let level = values.get("level").map_or(Ok(5), |value| {
             level_number(value).ok_or_else(|| invalid(id))
@@ -161,8 +171,15 @@ impl LogStore {
         }
         let cursor = events::request_cursor(request, id)?;
         let filter = events::Filter::logs(level, target);
-        let stream = self.hub.subscribe(filter, cursor.as_deref(), id)?;
-        Ok(events::stream_response(stream))
+        if !self.allowed {
+            return Err(error(
+                StatusCode::NOT_FOUND,
+                ErrorCode::CapabilityNotSupported,
+                "Log recording is disabled",
+                id,
+            ));
+        }
+        self.hub.subscribe(filter, cursor.as_deref(), id)
     }
 }
 
@@ -365,7 +382,17 @@ pub(super) async fn serve(
     request: Request,
     id: &RequestId,
 ) -> Result<Response, ApiError> {
-    state.observation.logs.response(&request, id)
+    if request.method() == axum::http::Method::GET {
+        let subscription = state
+            .observation
+            .settings
+            .subscribe(&state.observation, || {
+                state.observation.logs.subscribe(&request, id)
+            })?;
+        Ok(events::stream_response(subscription))
+    } else {
+        state.observation.logs.response(&request, id)
+    }
 }
 
 #[cfg(test)]

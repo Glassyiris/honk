@@ -924,3 +924,21 @@ fn selection_path(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detached_connection_begin_has_no_recorded_guard() {
+        let native = NativeObservation::new(&Config::default());
+        let observation = ConnectionObservation::begin(
+            Some(&native),
+            "tcp",
+            "127.0.0.1:31000".parse().unwrap(),
+            "127.0.0.2:443".parse().unwrap(),
+        );
+        assert!(!observation.is_recording());
+        assert!(observation.flow().is_none());
+    }
+}
