@@ -427,6 +427,123 @@ fn append_entry(document: &Document<'_>, section: &str, entry: &str) -> String {
     output
 }
 
+/// Quote `value` as a dae scalar that reads back unchanged.
+pub fn quote_dae_scalar(value: &str) -> Result<String, ManagedSourceError> {
+    quote_scalar(value, None).map_err(|_| ManagedSourceError)
+}
+
+/// Remove every `secret:` of `experimental.native_api` and `.clash_api`,
+/// duplicates and overridden ones included.
+pub fn strip_listener_secrets(content: &str) -> Result<String, ManagedSourceError> {
+    let document = plain_document(content)?;
+    let mut ranges = Vec::new();
+    for block in listener_blocks(&document) {
+        for field in block.1.body().into_iter().flatten() {
+            let text = Text::segment(&field);
+            if text.kv().is_some_and(|(key, _)| key.raw() == "secret") {
+                ranges.push(line_of(content, text.span.start..text.span.end));
+            }
+        }
+    }
+    let mut output = content.to_owned();
+    for range in ranges.into_iter().rev() {
+        output.replace_range(range, "");
+    }
+    if super::sources::contains_api_secret(&plain_document(&output)?) {
+        return Err(ManagedSourceError);
+    }
+    Ok(output)
+}
+
+/// Put listener secrets back into content without any; an empty value is not
+/// written. Each goes into the last block of its API.
+pub fn restore_listener_secrets(
+    content: &str,
+    native_api: &str,
+    clash_api: &str,
+) -> Result<String, ManagedSourceError> {
+    let document = plain_document(content)?;
+    if super::sources::contains_api_secret(&document) {
+        return Err(ManagedSourceError);
+    }
+    let newline = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let blocks = listener_blocks(&document);
+    let mut edits = Vec::new();
+    for (api, value) in [("native_api", native_api), ("clash_api", clash_api)] {
+        if value.is_empty() {
+            continue;
+        }
+        let (_, block) = blocks
+            .iter()
+            .rfind(|(name, _)| *name == api)
+            .ok_or(ManagedSourceError)?;
+        let entry = format!("secret: {}", quote_dae_scalar(value)?);
+        let close = block.span().end - 1;
+        let edit = match own_line_start(content, close) {
+            Some(line_start) => {
+                let indent = &content[line_start..close];
+                (line_start, format!("{indent}    {entry}{newline}"))
+            }
+            None => (close, format!("{entry} ")),
+        };
+        edits.push(edit);
+    }
+    edits.sort_unstable_by_key(|(offset, _)| *offset);
+    let mut output = content.to_owned();
+    for (offset, text) in edits.into_iter().rev() {
+        output.insert_str(offset, &text);
+    }
+    Ok(output)
+}
+
+/// Join preorder sources into one document without their `include` roots,
+/// which parses to the same `Config` as the tree.
+pub fn inline_sources(sources: &[SourceSnapshot]) -> Result<String, ManagedSourceError> {
+    let mut output = String::new();
+    for source in sources {
+        let document = managed_document(source)?;
+        let mut content = source.content.to_string();
+        let includes: Vec<_> = document
+            .sections()
+            .filter(|root| root.header() == "include")
+            .map(|root| line_of(&source.content, root.span().start..root.span().end))
+            .collect();
+        for range in includes.into_iter().rev() {
+            content.replace_range(range, "");
+        }
+        output.push_str(&content);
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    Ok(output)
+}
+
+fn plain_document(content: &str) -> Result<Document<'_>, ManagedSourceError> {
+    let source = crate::diagnostic::DiagnosticSources::new(None).root();
+    Document::parse_attempt(Source::new(content, source), &mut Vec::new(), false)
+        .map_err(|_| ManagedSourceError)
+}
+
+fn listener_blocks<'d, 'a>(
+    document: &'d Document<'a>,
+) -> Vec<(&'d str, super::cursor::Segment<'d, 'a>)> {
+    document
+        .sections()
+        .filter(|root| root.header() == "experimental")
+        .filter_map(|root| root.body())
+        .flatten()
+        .filter_map(|block| {
+            let name = read::block_header(&block)?.raw();
+            matches!(name, "native_api" | "clash_api").then_some((name, block))
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleSourceLocation {
     pub source_index: usize,
@@ -888,6 +1005,64 @@ mod tests {
                 crate::parser::parse_dae_config(&format!("group {{ G {{ {setting} }} }}")).is_err()
             );
         }
+    }
+
+    #[test]
+    fn listener_secrets_strip_and_restore_by_span() {
+        let main = "include { 'child.dae' }\nglobal { log_level: info }\nexperimental {\n    native_api {\n        enabled: true\n        secret: 'first-native-token'\n        secret: \"override-native-token\" # kept comment\n    }\n    clash_api {\n        external_controller: '127.0.0.1:9090'\n        secret: \"clash token with spaces\"\n    }\n}\n";
+        let child = "experimental { native_api { secret: final-native-token } }";
+        let inputs = |main: &str, child: &str| {
+            parse_dae_sources(
+                &[
+                    (PathBuf::from("main.dae"), Arc::from(main)),
+                    (PathBuf::from("child.dae"), Arc::from(child)),
+                ],
+                SourceLimits::default(),
+                &mut Vec::new(),
+            )
+            .unwrap()
+        };
+        let original = inputs(main, child);
+        let native = original.config.experimental.native_api.secret.clone();
+        let clash = original.config.experimental.clash_api.secret.clone();
+        assert_eq!(
+            (native.as_str(), clash.as_str()),
+            ("final-native-token", "clash token with spaces")
+        );
+
+        let stripped_main = strip_listener_secrets(main).unwrap();
+        let stripped_child = strip_listener_secrets(child).unwrap();
+        for text in [&stripped_main, &stripped_child] {
+            assert!(!text.contains("token"));
+        }
+        assert!(stripped_main.contains("# kept comment"));
+        let stripped = inputs(&stripped_main, &stripped_child);
+        assert!(
+            stripped
+                .sources
+                .iter()
+                .all(|source| !source.contains_api_secret)
+        );
+        let mut resupplied = stripped.config.clone();
+        resupplied.experimental.native_api.secret = native.clone();
+        resupplied.experimental.clash_api.secret = clash.clone();
+        assert_eq!(resupplied, original.config);
+
+        let inlined = inline_sources(&original.sources).unwrap();
+        assert!(!inlined.contains("include"));
+        assert_eq!(
+            crate::parser::parse_dae_config(&inlined).unwrap(),
+            original.config
+        );
+
+        let restored =
+            restore_listener_secrets(&inline_sources(&stripped.sources).unwrap(), &native, &clash)
+                .unwrap();
+        assert_eq!(
+            crate::parser::parse_dae_config(&restored).unwrap(),
+            original.config
+        );
+        assert!(restore_listener_secrets(main, &native, &clash).is_err());
     }
 
     #[test]
