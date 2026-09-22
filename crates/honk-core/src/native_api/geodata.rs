@@ -172,11 +172,7 @@ pub(super) async fn update(
             )
         })?;
     let reservation = state.observation.operations.reserve(
-        if state.settings.secret.is_empty() {
-            "anonymous"
-        } else {
-            "control"
-        },
+        state.principal(),
         "POST",
         "/api/v1/geodata/update",
         key.as_deref(),

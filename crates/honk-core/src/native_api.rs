@@ -1,5 +1,6 @@
 //! Independent, opt-in native observation API.
 
+pub(crate) mod auth;
 pub(crate) mod catalog;
 pub(crate) mod config;
 mod config_write;
@@ -58,6 +59,8 @@ pub struct NativeState {
     /// waits on the configuration lock.
     clash_secret: String,
     security: security::Security,
+    /// Present only in password mode: the administrator record, the live sessions and login admission.
+    pub(crate) auth: Option<auth::Auth>,
     ui: Option<ui::Ui>,
     instance_id: String,
     started_at: SystemTime,
@@ -90,11 +93,12 @@ impl NativeState {
         started: Instant,
     ) -> anyhow::Result<Self> {
         let config = control.config_handle();
-        let (settings, clash_secret) = {
+        let (settings, clash_secret, data_dir) = {
             let config = config.read().await;
             (
                 config.experimental.native_api.clone(),
                 config.experimental.clash_api.secret.clone(),
+                std::path::PathBuf::from(&config.global.data_dir),
             )
         };
         for (api, secret) in [
@@ -109,11 +113,23 @@ impl NativeState {
                 );
             }
         }
+        // Password mode needs its credential directory before the listener answers anything.
+        let auth = if settings.password_auth {
+            Some(auth::Auth::open(&data_dir).map_err(|error| {
+                anyhow::anyhow!(
+                    "native API password login cannot use {}: {error}",
+                    data_dir.join(auth::CREDENTIAL_DIR).display()
+                )
+            })?)
+        } else {
+            None
+        };
         let observation = control.native_observation();
         let phase = control.observe_phase();
         observation.configuration.attach_phase(phase.clone());
         Ok(Self {
             security: security::Security::new(&settings, listen),
+            auth,
             ui: ui::load(&settings.ui).await?,
             settings,
             clash_secret,
@@ -141,6 +157,40 @@ impl NativeState {
         })
     }
 
+    /// Who owns the operations this listener's callers start: the administrator when a credential protects the
+    /// listener, the anonymous loopback caller otherwise. Sessions are not principals: an operation survives logout.
+    pub(crate) fn principal(&self) -> &'static str {
+        if self.settings.credentialed() {
+            "control"
+        } else {
+            "anonymous"
+        }
+    }
+
+    /// The bearer token a request carries, for the endpoints that need to name a session.
+    pub(crate) fn security_bearer<'a>(
+        &self,
+        request: &'a axum::extract::Request,
+    ) -> Option<&'a str> {
+        self.security.bearer(request)
+    }
+
+    /// The authentication mode this listener runs in, as discovery reports it.
+    pub(crate) fn auth_discovery(&self) -> types::AuthDiscovery {
+        match &self.auth {
+            Some(auth) => types::AuthDiscovery {
+                mode: "password",
+                setup_required: auth.store.setup_required(),
+                anonymous_loopback: false,
+            },
+            None => types::AuthDiscovery {
+                mode: "token",
+                setup_required: false,
+                anonymous_loopback: self.security.anonymous_loopback(),
+            },
+        }
+    }
+
     pub(crate) fn require_running(&self) -> Result<(), ApiError> {
         match *self.phase.borrow() {
             EnginePhase::Running if self.healthy.load(Ordering::Acquire) => Ok(()),
@@ -159,6 +209,32 @@ impl NativeState {
                 None,
             )),
         }
+    }
+}
+
+/// The peer address of the accepted socket. Never derived from a header: a proxy cannot claim to be private.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Peer(pub(crate) IpAddr);
+
+impl Peer {
+    /// Loopback, RFC 1918, RFC 4193 ULA and link-local peers may claim an uninitialized account.
+    pub(crate) fn may_set_up(self) -> bool {
+        match self.0 {
+            IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+            IpAddr::V6(ip) => {
+                ip.is_loopback()
+                    || (ip.segments()[0] & 0xfe00) == 0xfc00
+                    || (ip.segments()[0] & 0xffc0) == 0xfe80
+            }
+        }
+    }
+}
+
+/// An IPv4-mapped IPv6 peer is the IPv4 address it carries, so one rule covers both stacks.
+pub(crate) fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        other => other,
     }
 }
 
@@ -709,11 +785,21 @@ async fn supervise(
                 }
             }
             accepted = listener.accept(), if children.len() < 64 => {
-                let Ok((stream, _)) = accepted else {
+                let Ok((stream, peer)) = accepted else {
                     tracing::error!(message = "native HTTP listener failed");
                     break;
                 };
-                let service = TowerToHyperService::new(router.clone());
+                let peer = Peer(canonical_ip(peer.ip()));
+                let routed = router.clone();
+                let service = TowerToHyperService::new(tower::service_fn(
+                    move |mut request: axum::http::Request<hyper::body::Incoming>| {
+                        request.extensions_mut().insert(peer);
+                        let mut routed = routed.clone();
+                        async move {
+                            tower::Service::call(&mut routed, request.map(axum::body::Body::new)).await
+                        }
+                    },
+                ));
                 let mut stop = connection_receiver.clone();
                 children.spawn(async move {
                     let mut builder = hyper::server::conn::http1::Builder::new();

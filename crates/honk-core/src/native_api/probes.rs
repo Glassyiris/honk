@@ -670,11 +670,7 @@ pub(super) async fn create(
     }
     .map_err(|_| too_large())?;
     let reservation = service.operations.reserve(
-        if state.settings.secret.is_empty() {
-            "anonymous"
-        } else {
-            "control"
-        },
+        state.principal(),
         "POST",
         "/api/v1/probes",
         key.as_deref(),

@@ -369,11 +369,7 @@ pub(super) async fn refresh(
     let operations = &state.observation.operations;
     let path = format!("/api/v1/providers/{provider_id}/refresh");
     let reservation = operations.reserve(
-        if state.settings.secret.is_empty() {
-            "anonymous"
-        } else {
-            "control"
-        },
+        state.principal(),
         "POST",
         &path,
         key.as_deref(),

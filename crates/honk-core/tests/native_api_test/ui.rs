@@ -103,8 +103,13 @@ async fn ui_serves_only_its_directory_with_navigation_and_static_cache_policy() 
         "resource_not_found",
     )
     .await;
+    // Serving the UI does not exempt the API: a protected route still needs its bearer.
     error_response(
-        app.client.get(app.url("/api")).send().await.unwrap(),
+        app.client
+            .get(app.url("/api/v1/version"))
+            .send()
+            .await
+            .unwrap(),
         StatusCode::UNAUTHORIZED,
         "authentication_required",
     )
@@ -252,8 +257,13 @@ async fn embedded_ui_preserves_assets_head_and_safe_navigation() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
+    // Serving the UI does not exempt the API: a protected route still needs its bearer.
     error_response(
-        app.client.get(app.url("/api")).send().await.unwrap(),
+        app.client
+            .get(app.url("/api/v1/version"))
+            .send()
+            .await
+            .unwrap(),
         StatusCode::UNAUTHORIZED,
         "authentication_required",
     )

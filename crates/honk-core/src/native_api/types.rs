@@ -29,6 +29,9 @@ pub enum ErrorCode {
     PreconditionRequired,
     RateLimited,
     TemporarilyUnavailable,
+    SetupRequired,
+    SetupAlreadyCompleted,
+    InvalidCredentials,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -268,7 +271,22 @@ pub(super) struct ConnectionList {
     pub(super) total_udp: u64,
 }
 
-pub(super) fn discovery() -> Value {
+/// What a client must do before it may call anything else.
+pub(crate) struct AuthDiscovery {
+    pub(crate) mode: &'static str,
+    pub(crate) setup_required: bool,
+    pub(crate) anonymous_loopback: bool,
+}
+
+pub(super) fn discovery(auth: AuthDiscovery) -> Value {
+    let password = auth.mode == "password";
+    let link = |path: &'static str| {
+        if password {
+            Value::from(path)
+        } else {
+            Value::Null
+        }
+    };
     json!({
         "name": "dae/honk-native",
         "status": "draft",
@@ -289,6 +307,14 @@ pub(super) fn discovery() -> Value {
             "rules": "/api/v1/rules",
             "geodata": "/api/v1/geodata",
             "operations": "/api/v1/operations/{id}",
+            "auth_setup": link("/api/v1/auth/setup"),
+            "auth_login": link("/api/v1/auth/login"),
+            "auth_logout": link("/api/v1/auth/logout"),
+        },
+        "auth": {
+            "mode": auth.mode,
+            "setup_required": auth.setup_required,
+            "anonymous_loopback": auth.anonymous_loopback,
         },
     })
 }

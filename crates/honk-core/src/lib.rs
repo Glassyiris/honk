@@ -712,6 +712,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         let requested_data_dir = PathBuf::from(&config.global.data_dir);
         let (runtime_data_dir, data_dir_creation_error) =
             prepare_runtime_data_dir(&requested_data_dir)?;
+        #[cfg(feature = "native-api")]
+        anyhow::ensure!(
+            !(config.experimental.native_api.enabled
+                && config.experimental.native_api.password_auth
+                && runtime_data_dir != requested_data_dir),
+            "native API password login needs its configured data directory {}; refusing to fall back to {}",
+            requested_data_dir.display(),
+            runtime_data_dir.display()
+        );
         honk_config::paths::set_data_dir(runtime_data_dir).map_err(|requested| {
             anyhow::anyhow!(
                 "runtime data directory is already {}; cannot switch to {}",
