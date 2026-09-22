@@ -488,7 +488,8 @@ pub fn restore_listener_secrets(
                 let indent = &content[line_start..close];
                 (line_start, format!("{indent}    {entry}{newline}"))
             }
-            None => (close, format!("{entry} ")),
+            // Fields are line-separated, so a compact block gets its own lines.
+            None => (close, format!("{newline}{entry}{newline}")),
         };
         edits.push(edit);
     }
@@ -1063,6 +1064,22 @@ mod tests {
             original.config
         );
         assert!(restore_listener_secrets(main, &native, &clash).is_err());
+    }
+
+    #[test]
+    fn restored_secret_in_a_compact_block_parses() {
+        let restored = restore_listener_secrets(
+            "experimental { native_api { enabled: true } }\n",
+            "compact-native-token",
+            "",
+        )
+        .unwrap();
+        let config = crate::parser::parse_dae_config(&restored).unwrap();
+        assert!(config.experimental.native_api.enabled);
+        assert_eq!(
+            config.experimental.native_api.secret,
+            "compact-native-token"
+        );
     }
 
     #[test]

@@ -179,6 +179,24 @@ pub enum ClashCommand {
     },
     /// Ask the running instance to reload its configured file
     Reload,
+    /// Read the configuration db
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommand,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Write the active revision as one dae file, listener secrets included
+    Export {
+        /// New file to write; an existing one is refused
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+        /// Leave the listener secrets out
+        #[arg(long)]
+        without_secrets: bool,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -229,7 +247,7 @@ pub struct Cli {
     pub store: ConfigStore,
 
     /// Runtime data directory holding the configuration db; must equal `global.data_dir`
-    #[arg(long, value_name = "PATH", default_value = honk_config::paths::DEFAULT_DATA_DIR)]
+    #[arg(long, value_name = "PATH", default_value = honk_config::paths::DEFAULT_DATA_DIR, global = true)]
     pub data_dir: PathBuf,
 }
 
@@ -244,8 +262,37 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
     use std::time::Duration;
 
     let cmd = cli.command.as_ref().expect("subcommand required");
+    let read_config = || -> anyhow::Result<Config> {
+        match cli.store {
+            ConfigStore::File => Ok(Config::from_file(cli.config.to_str().unwrap())?),
+            #[cfg(feature = "native-api")]
+            ConfigStore::Db => {
+                let text = native_api::store::db::export(&cli.data_dir, true)
+                    .map_err(|error| anyhow::anyhow!("configuration db: {error}"))?;
+                Ok(honk_config::parser::parse_dae_config(&text)?)
+            }
+            #[cfg(not(feature = "native-api"))]
+            ConfigStore::Db => anyhow::bail!("--store db needs the native-api feature"),
+        }
+    };
 
     match cmd {
+        #[cfg(feature = "native-api")]
+        ClashCommand::Config {
+            action:
+                ConfigCommand::Export {
+                    out,
+                    without_secrets,
+                },
+        } => {
+            native_api::store::db::export_to(&cli.data_dir, out, !without_secrets)?;
+            println!(
+                "Exported the active configuration revision to {}",
+                out.display()
+            );
+        }
+        #[cfg(not(feature = "native-api"))]
+        ClashCommand::Config { .. } => anyhow::bail!("config export needs the native-api feature"),
         ClashCommand::Reload => {
             let pid = request_reload(std::path::Path::new(INSTANCE_LOCK_PATH))?;
             println!("Reload requested for honk-core process {pid}");
@@ -271,7 +318,7 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
             println!("Mode set to {}", mode);
         }
         ClashCommand::Proxy { group, node } => {
-            let config = Config::from_file(cli.config.to_str().unwrap())?;
+            let config = read_config()?;
             let group_exists = config.groups.iter().any(|g| g.name == *group);
             if !group_exists {
                 anyhow::bail!("Group '{}' not found in configuration", group);
@@ -283,7 +330,7 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
             println!("Proxy group '{}' set to '{}'", group, node);
         }
         ClashCommand::Delay { node, url } => {
-            let config = Config::from_file(cli.config.to_str().unwrap())?;
+            let config = read_config()?;
             let target_node = config
                 .nodes
                 .iter()

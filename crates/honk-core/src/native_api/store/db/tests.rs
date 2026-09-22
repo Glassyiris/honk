@@ -238,3 +238,34 @@ fn retention_keeps_fifty_revisions_and_the_active_one() {
     let loaded = store.load(&HashMap::new(), &mut Vec::new()).unwrap();
     assert_eq!(loaded.config.global.tproxy_port, 20054);
 }
+
+#[test]
+fn cli_export_restores_secrets_into_a_new_private_file() {
+    let fixture = fixture();
+    let store = initialized(&fixture);
+    let out = fixture.data_dir.join("export.dae");
+    export_to(&fixture.data_dir, &out, true).unwrap();
+    assert_eq!(
+        fs::symlink_metadata(&out).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let text = fs::read_to_string(&out).unwrap();
+    let exported = honk_config::parser::parse_dae_config(&text).unwrap();
+    exported.validate().unwrap();
+    assert_eq!(exported.experimental.native_api.secret, "native-token");
+    assert_eq!(
+        exported,
+        store.load(&HashMap::new(), &mut Vec::new()).unwrap().config
+    );
+
+    let bare = fixture.data_dir.join("bare.dae");
+    export_to(&fixture.data_dir, &bare, false).unwrap();
+    let text = fs::read_to_string(&bare).unwrap();
+    assert!(text.starts_with("# listener secrets omitted\n"));
+    assert!(!text.contains("native-token"));
+
+    fs::write(&out, "kept").unwrap();
+    assert!(export_to(&fixture.data_dir, &out, true).is_err());
+    assert_eq!(fs::read_to_string(&out).unwrap(), "kept");
+    assert_eq!(store.head(), Ok(Some(1)));
+}

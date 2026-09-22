@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use honk_config::Config;
 use honk_config::diagnostic::{DetailedDiagnostic, DiagnosticSources, SettingPath};
 use honk_config::error::{DetailedConfigError, ErrorCategory};
+use honk_config::parser::source_edit::{inline_sources, restore_listener_secrets};
 use honk_config::parser::{LoadedConfig, SourceSnapshot};
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, open, openat};
@@ -149,54 +150,7 @@ impl DbStore {
     /// Opens or creates the db. `entry` names the main source when the db is still
     /// empty; otherwise the active revision's own entry wins.
     pub(crate) fn open(data_dir: &Path, entry: &Path) -> Result<Self, StoreError> {
-        let parent = File::from(
-            open(data_dir, DIR_FLAGS, Mode::empty()).map_err(|_| StoreError::Unavailable)?,
-        );
-        match mkdirat(&parent, CREDENTIAL_DIR, Mode::S_IRWXU) {
-            Ok(()) | Err(Errno::EEXIST) => {}
-            Err(_) => return Err(StoreError::Unavailable),
-        }
-        let directory = File::from(
-            openat(&parent, CREDENTIAL_DIR, DIR_FLAGS, Mode::empty()).map_err(path_error)?,
-        );
-        private(&directory, true)?;
-        let file = match openat(
-            &directory,
-            DB_FILE,
-            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-            Mode::S_IRUSR | Mode::S_IWUSR,
-        ) {
-            Ok(fd) => File::from(fd),
-            Err(Errno::EEXIST) => File::from(
-                openat(
-                    &directory,
-                    DB_FILE,
-                    OFlag::O_RDWR | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(path_error)?,
-            ),
-            Err(error) => return Err(path_error(error)),
-        };
-        private(&file, false)?;
-        let identity = file.metadata().map_err(|_| StoreError::Unavailable)?;
-        // SQLite resolves `/proc/self/fd` itself, so NOFOLLOW would refuse it;
-        // the directory's own path is checked against the FD instead.
-        let resolved = std::fs::read_link(format!("/proc/self/fd/{}", directory.as_raw_fd()))
-            .map_err(|_| StoreError::Unavailable)?;
-        let path = resolved.join(DB_FILE);
-        let mut connection = Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(sql)?;
-        let opened = std::fs::symlink_metadata(&path).map_err(|_| StoreError::Unavailable)?;
-        if (opened.dev(), opened.ino()) != (identity.dev(), identity.ino()) {
-            return Err(StoreError::Unsafe);
-        }
-        drop(file);
+        let (directory, mut connection) = connect(data_dir, true)?;
         prepare(&mut connection)?;
         let import_entry = lexical(entry)?;
         let root_entry = match active_revision(&connection)? {
@@ -590,6 +544,125 @@ impl DbStore {
             })
             .collect()
     }
+}
+
+/// Opens the checked directory and the SQLite file in it; `create` makes both
+/// when missing, otherwise an absent db is `Unavailable`.
+fn connect(data_dir: &Path, create: bool) -> Result<(File, Connection), StoreError> {
+    let parent =
+        File::from(open(data_dir, DIR_FLAGS, Mode::empty()).map_err(|_| StoreError::Unavailable)?);
+    if create {
+        match mkdirat(&parent, CREDENTIAL_DIR, Mode::S_IRWXU) {
+            Ok(()) | Err(Errno::EEXIST) => {}
+            Err(_) => return Err(StoreError::Unavailable),
+        }
+    }
+    let directory =
+        File::from(openat(&parent, CREDENTIAL_DIR, DIR_FLAGS, Mode::empty()).map_err(path_error)?);
+    private(&directory, true)?;
+    let existing = || {
+        openat(
+            &directory,
+            DB_FILE,
+            OFlag::O_RDWR | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(path_error)
+    };
+    let file = if create {
+        match openat(
+            &directory,
+            DB_FILE,
+            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        ) {
+            Ok(fd) => File::from(fd),
+            Err(Errno::EEXIST) => existing()?,
+            Err(error) => return Err(path_error(error)),
+        }
+    } else {
+        existing()?
+    };
+    private(&file, false)?;
+    let identity = file.metadata().map_err(|_| StoreError::Unavailable)?;
+    // SQLite resolves `/proc/self/fd` itself, so NOFOLLOW would refuse it;
+    // the directory's own path is checked against the FD instead.
+    let resolved = std::fs::read_link(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+        .map_err(|_| StoreError::Unavailable)?;
+    let path = resolved.join(DB_FILE);
+    let connection = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(sql)?;
+    let opened = std::fs::symlink_metadata(&path).map_err(|_| StoreError::Unavailable)?;
+    if (opened.dev(), opened.ino()) != (identity.dev(), identity.ino()) {
+        return Err(StoreError::Unsafe);
+    }
+    Ok((directory, connection))
+}
+
+/// The active revision as one runnable document, read without writing the db
+/// whether or not a daemon holds it open.
+pub(crate) fn export(data_dir: &Path, with_secrets: bool) -> Result<String, StoreError> {
+    let (_directory, mut connection) = connect(data_dir, false)?;
+    connection
+        .busy_timeout(std::time::Duration::from_millis(2000))
+        .map_err(sql)?;
+    connection
+        .execute_batch("PRAGMA query_only = ON")
+        .map_err(sql)?;
+    let application_id: i64 = pragma(&connection, "application_id")?;
+    let version: i64 = pragma(&connection, "user_version")?;
+    if (application_id, version) != (APPLICATION_ID, SCHEMA_VERSION) {
+        return Err(StoreError::Unsupported);
+    }
+    let (root, revision, secrets) = {
+        let transaction = connection.transaction().map_err(sql)?;
+        let (_, root, revision) = active_revision(&transaction)?.ok_or(StoreError::Invalid)?;
+        let secrets = listener_secrets(&transaction)?;
+        transaction.commit().map_err(sql)?;
+        (root, revision, secrets)
+    };
+    let entry = root.join(&revision.sources[0].name);
+    let sources = revision
+        .sources
+        .into_iter()
+        .map(|source| (root.join(source.name), Arc::from(source.content)))
+        .collect();
+    let loaded = Config::from_dae_sources_in_memory(&entry, &sources, limits(), &mut Vec::new())
+        .map_err(|_| StoreError::Corrupt)?;
+    let text = inline_sources(&loaded.sources).map_err(|_| StoreError::Corrupt)?;
+    if with_secrets {
+        restore_listener_secrets(&text, &secrets.native_api, &secrets.clash_api)
+            .map_err(|_| StoreError::Corrupt)
+    } else if secrets == ListenerSecrets::default() {
+        Ok(text)
+    } else {
+        Ok(format!("# listener secrets omitted\n{text}"))
+    }
+}
+
+/// Writes `export` to a new 0600 file; an existing `out` is never replaced.
+pub(crate) fn export_to(data_dir: &Path, out: &Path, with_secrets: bool) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let text = export(data_dir, with_secrets)
+        .map_err(|error| anyhow::anyhow!("configuration db: {error}"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(out)
+        .map_err(|error| anyhow::anyhow!("create {}: {error}", out.display()))?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn prepare(connection: &mut Connection) -> Result<(), StoreError> {
