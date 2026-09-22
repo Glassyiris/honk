@@ -1,6 +1,7 @@
 use super::*;
 use crate::configuration::{ActivationCompletion, ActivationFailure, ActivationRequest};
 use crate::native_api::operations::OperationResult;
+use crate::native_api::store::Committed;
 
 impl ActivationFailure {
     fn reason(self) -> (&'static str, &'static str) {
@@ -53,13 +54,15 @@ impl Worker {
         id: &str,
         request: ActivationRequest,
         group: Option<&str>,
+        committed: Committed,
     ) {
+        let written = committed.written();
         let pending = match self.activation.dispatch(request).await {
             Ok(pending) => pending,
             Err(failure) => {
                 let error = match failure {
                     ActivationFailure::EngineUnavailable => {
-                        unavailable().with_details(json!({"written":true}))
+                        unavailable().with_details(json!({"written":written}))
                     }
                     _ => unavailable(),
                 };
@@ -70,12 +73,49 @@ impl Worker {
         self.service.operations.accept(id);
         self.service.operations.running(id);
         let completion = self.activation.complete(pending).await;
+        if let Err(details) = self.record(committed, &completion) {
+            let (code, message) = match completion {
+                Err(ActivationFailure::Unconfirmed) => ActivationFailure::Unconfirmed.reason(),
+                _ => (
+                    "store_unavailable",
+                    "Configuration is active but was not recorded",
+                ),
+            };
+            self.failed(id, code, message, Some(details));
+            return;
+        }
         self.publish_operation(
             id,
             completion,
             group,
-            Some(json!({"written":true,"committed":false})),
+            Some(json!({"written":written,"committed":false})),
         );
+    }
+
+    /// Records an activated candidate in the store; `Err` carries the failure details.
+    pub(super) fn record(
+        &self,
+        committed: Committed,
+        completion: &ActivationCompletion,
+    ) -> Result<(), Value> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        if committed.written() {
+            return Ok(());
+        }
+        match completion {
+            Ok(_) | Err(ActivationFailure::Degraded(_) | ActivationFailure::Reconciliation(_)) => {
+                store
+                    .promote(committed)
+                    .map_err(|_| json!({"stage":"store","committed":true,"durable":false}))
+            }
+            Err(ActivationFailure::Unconfirmed) => {
+                store.block();
+                Err(json!({"stage":"store","committed":null}))
+            }
+            Err(_) => Ok(()),
+        }
     }
 
     pub(super) async fn reload_operation(&mut self, id: &str, request: ActivationRequest) {

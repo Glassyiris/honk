@@ -307,6 +307,15 @@ impl ConfigService {
         }
     }
 
+    /// The principal recorded for writes that carry no reservation.
+    pub(crate) fn principal(&self) -> &'static str {
+        if self.settings.credentialed() {
+            "control"
+        } else {
+            "anonymous"
+        }
+    }
+
     pub(crate) fn writable(&self) -> bool {
         self.sources.available()
             && self.settings.config_write

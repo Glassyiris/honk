@@ -3,6 +3,7 @@ use crate::configuration::{DependencyReader, DependencySnapshot, digest};
 use crate::native_api::config_write::{SourceFile, StagedFile};
 use crate::native_api::geodata::{self, GeoUpdatePlan};
 use crate::native_api::operations::OperationResult;
+use crate::native_api::store::Pin;
 use crate::routing::{GeoAssetSnapshot, GeoRequirements, GeoSourceSet};
 
 #[derive(Clone, Copy, serde::Serialize)]
@@ -259,15 +260,17 @@ fn prepare_and_replace(
     {
         return Err(failure("dependency_conflict", &writes));
     }
-    let mut guards = Vec::new();
+    let mut source_pins = Vec::new();
     for source in &captured.sources {
-        let file = SourceFile::open(&source.path, MAX_SOURCE_BYTES)
+        let pin = store
+            .pin(&source.path)
             .map_err(|_| failure("source_conflict", &writes))?;
-        if file.sha256() != digest(source.content.as_bytes()) {
+        if pin.sha256() != digest(source.content.as_bytes()) {
             return Err(failure("source_conflict", &writes));
         }
-        guards.push(file);
+        source_pins.push(pin);
     }
+    let mut guards = Vec::new();
     for dependency in captured
         .dependencies
         .iter()
@@ -304,7 +307,10 @@ fn prepare_and_replace(
         {
             return Err(failure("asset_conflict", &writes));
         }
-        if guards.iter().any(|other| file.same_target(other))
+        if guards
+            .iter()
+            .chain(source_pins.iter().filter_map(Pin::file))
+            .any(|other| file.same_target(other))
             || assets.iter().any(|asset| asset.staged.same_target(&file))
         {
             return Err(failure("asset_alias", &writes));
@@ -378,6 +384,9 @@ fn prepare_and_replace(
             if service.sources.revision().as_deref() != Some(revision) {
                 return Err(WriteError::Conflict);
             }
+            for pin in &source_pins {
+                store.recheck(pin)?;
+            }
             for guard in &guards {
                 guard.recheck()?;
             }
@@ -428,6 +437,14 @@ fn prepare_and_replace(
             installed: completed.file,
             receipt,
         });
+    }
+    for pin in &source_pins {
+        store.recheck(pin).map_err(|_| {
+            failure(
+                "postwrite_conflict",
+                installed.iter().map(|asset| &asset.receipt),
+            )
+        })?;
     }
     for guard in guards
         .iter()

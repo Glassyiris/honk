@@ -222,6 +222,21 @@ pub struct Cli {
     /// Use mock eBPF backend (for testing without kernel support)
     #[arg(long)]
     pub mock_ebpf: bool,
+
+    /// Where the administered configuration lives: the `-c` file tree, or the
+    /// revisions in `<data-dir>/native-api/config.db`
+    #[arg(long, value_enum, default_value = "file")]
+    pub store: ConfigStore,
+
+    /// Runtime data directory holding the configuration db; must equal `global.data_dir`
+    #[arg(long, value_name = "PATH", default_value = honk_config::paths::DEFAULT_DATA_DIR)]
+    pub data_dir: PathBuf,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigStore {
+    File,
+    Db,
 }
 
 pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
@@ -236,6 +251,10 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
             println!("Reload requested for honk-core process {pid}");
         }
         ClashCommand::Mode { mode } => {
+            anyhow::ensure!(
+                cli.store == ConfigStore::File,
+                "mode edits the -c file; with --store db, change default_mode through the native API"
+            );
             let valid_modes = ["rule", "global", "direct"];
             if !valid_modes.contains(&mode.as_str()) {
                 anyhow::bail!(
@@ -691,9 +710,28 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let mut diagnostics = Vec::new();
     #[cfg(feature = "native-api")]
     let mut native_sources = None;
+    #[cfg(feature = "native-api")]
+    let mut database = None;
+    #[cfg(not(feature = "native-api"))]
+    anyhow::ensure!(
+        cli.store == ConfigStore::File,
+        "--store db needs the native-api feature"
+    );
     let startup = (|| -> anyhow::Result<_> {
         #[cfg(feature = "native-api")]
-        let mut config = {
+        let mut config = if cli.store == ConfigStore::Db {
+            std::fs::create_dir_all(&cli.data_dir)?;
+            // DbStore needs an absolute, lexically normal entry; a missing -c
+            // is fine once the db holds a revision.
+            let entry =
+                std::fs::canonicalize(&cli.config).or_else(|_| std::path::absolute(&cli.config))?;
+            let startup =
+                native_api::store::DatabaseStartup::open(&entry, &cli.data_dir, &mut diagnostics)?;
+            native_sources = Some(startup.sources.clone());
+            let config = startup.config.clone();
+            database = Some(startup);
+            config
+        } else {
             let (config, sources) = load_operator_config_captured(&cli.config, &mut diagnostics)?;
             anyhow::ensure!(
                 sources.is_some() || !config.experimental.native_api.config_write,
@@ -712,6 +750,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         let requested_data_dir = PathBuf::from(&config.global.data_dir);
         let (runtime_data_dir, data_dir_creation_error) =
             prepare_runtime_data_dir(&requested_data_dir)?;
+        #[cfg(feature = "native-api")]
+        anyhow::ensure!(
+            cli.store == ConfigStore::File || runtime_data_dir == requested_data_dir,
+            "the configuration db needs its data directory {}; refusing to fall back to {}",
+            requested_data_dir.display(),
+            runtime_data_dir.display()
+        );
         #[cfg(feature = "native-api")]
         anyhow::ensure!(
             !(config.experimental.native_api.enabled
@@ -927,6 +972,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     } else {
         Some(acquire_instance_lock(&cli.bpf_pin_root)?)
     };
+    #[cfg(feature = "native-api")]
+    if let Some(database) = database.as_mut() {
+        database.record()?;
+    }
 
     // The old instance owns queue 320 until this lock is released. Check
     // NFQUEUE only after the handoff so a transient busy result cannot turn
@@ -1277,7 +1326,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Persistent cache (selector choices, clash mode): opens cache.db when
     // `experimental.cache_file` is enabled, restores Selector choices, and
     // wires change persistence into the group manager.
-    control_plane.init_cache_db(cli.config.parent()).await;
+    let legacy_cache_dir = match cli.store {
+        ConfigStore::File => cli.config.parent(),
+        ConfigStore::Db => Some(cli.data_dir.as_path()),
+    };
+    control_plane.init_cache_db(legacy_cache_dir).await;
 
     #[cfg(feature = "clash-api")]
     let clash_cfg = control_plane
@@ -1462,9 +1515,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             .enabled;
         if enabled {
             let service = control_plane.native_observation().configuration.clone();
+            let store: std::sync::Arc<dyn native_api::store::SourceStore> = match database.take() {
+                Some(database) => database.store,
+                None => std::sync::Arc::new(native_api::store::FileStore::new(
+                    native_sources
+                        .as_ref()
+                        .and_then(|sources| sources.sources.first())
+                        .map_or_else(|| cli.config.clone(), |source| source.path.clone()),
+                )),
+            };
             let owner = service
                 .start(
-                    Some(cli.config.clone()),
+                    Some(store),
                     native_sources,
                     honk_config::paths::data_dir().to_path_buf(),
                     control_plane.config_handle(),
