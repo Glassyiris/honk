@@ -54,6 +54,9 @@ use types::*;
 /// Process-owned handles; constructing a router never starts observers or I/O.
 pub struct NativeState {
     settings: NativeApiConfig,
+    /// Restart-required like every listener secret; read here so masking never
+    /// waits on the configuration lock.
+    clash_secret: String,
     security: security::Security,
     ui: Option<ui::Ui>,
     instance_id: String,
@@ -87,7 +90,13 @@ impl NativeState {
         started: Instant,
     ) -> anyhow::Result<Self> {
         let config = control.config_handle();
-        let settings = config.read().await.experimental.native_api.clone();
+        let (settings, clash_secret) = {
+            let config = config.read().await;
+            (
+                config.experimental.native_api.clone(),
+                config.experimental.clash_api.secret.clone(),
+            )
+        };
         let observation = control.native_observation();
         let phase = control.observe_phase();
         observation.configuration.attach_phase(phase.clone());
@@ -95,6 +104,7 @@ impl NativeState {
             security: security::Security::new(&settings, listen),
             ui: ui::load(&settings.ui).await?,
             settings,
+            clash_secret,
             instance_id: observation.instance_id.clone(),
             observation,
             alive_set: control.alive_set(),

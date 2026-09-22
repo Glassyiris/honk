@@ -20,7 +20,7 @@
 | --- | --- | --- |
 | `enabled` | `false` | 启动独立原生 listener。 |
 | `listen` | `"127.0.0.1:9527"` | 数字 IP 与 1–65535 端口，不接受主机名或 `:port` 简写。 |
-| `secret` | `""` | 独立于 Clash 的 bearer 凭证。除显式匿名 loopback 外必须配置。 |
+| `secret` | `""` | 独立于 Clash 的 bearer 凭证。除显式匿名 loopback 外必须配置；非空值至少 8 字节，因为 API 响应按值遮蔽监听 secret。 |
 | `allow_anonymous_loopback` | `false` | 仅在 secret 为空且实际监听 IP 为 loopback 时允许无凭证请求。配置 secret 后仍必须认证。 |
 | `allow_origins` | 空列表 | 额外允许的完整 HTTP(S) Origin；不含路径、凭据、query、fragment、`null` 或通配符。 |
 | `allowed_hosts` | 空列表 | 额外允许的 HTTP Host authority；不含 URL scheme、路径、凭据或通配符。省略端口表示 80，不是监听端口。 |
@@ -83,7 +83,7 @@ Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒
 | `external_ui` | `""` | 外部 dashboard 目录。空值关闭 dashboard 服务与下载。 |
 | `external_ui_download_url` | `""` | HTTP(S) dashboard ZIP URL。空值使用内建 zashboard URL。 |
 | `external_ui_download_detour` | `""` | 下载使用的节点或组 tag。空值遵循普通流量路由。 |
-| `secret` | `""` | API 鉴权 secret。空值关闭鉴权。 |
+| `secret` | `""` | API 鉴权 secret。空值关闭鉴权。启用原生 API 时非空值至少 8 字节。 |
 | `default_mode` | `"Rule"` | 启动模式：`Rule`、`Global` 或 `Direct`。有效的缓存模式优先。 |
 
 所有 `clash_api` 字段都由启动阶段持有。通过 SIGHUP 提交的候选配置只要修改其中任一字段就会被拒绝。

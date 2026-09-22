@@ -698,14 +698,13 @@ pub(super) fn administrative_projection(
     state: &NativeState,
     mut value: Value,
 ) -> Result<Value, ApiError> {
-    let config = state.config.try_read().map_err(|_| unavailable())?;
     let accepted = state.observation.configuration.sources.accepted.read();
     let sources = accepted
         .as_ref()
         .map(|accepted| accepted.update.sources.as_slice())
         .unwrap_or(&[]);
-    let secrets = ListenerSecrets::new(sources, &state.settings.secret)
-        .with_clash(&config.experimental.clash_api.secret);
+    let secrets =
+        ListenerSecrets::new(sources, &state.settings.secret).with_clash(&state.clash_secret);
     secrets.mask_value(&mut value);
     Ok(value)
 }

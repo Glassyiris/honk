@@ -715,7 +715,7 @@ mod native_api {
             serde_json::json!({"ui":"embedded"}),
             serde_json::json!({"enabled":true,"allow_anonymous_loopback":true}),
             serde_json::json!({"enabled":true,"listen":"[::1]:9527","allow_anonymous_loopback":true}),
-            serde_json::json!({"enabled":true,"listen":"0.0.0.0:9527","secret":"PRIVATE"}),
+            serde_json::json!({"enabled":true,"listen":"0.0.0.0:9527","secret":"PRIVATE1"}),
             serde_json::json!({"geosite_download_url":"https://example.test/data?token=PRIVATE","geoip_download_url":"http://[::1]:8080/data"}),
         ] {
             let config: Config =
@@ -755,5 +755,36 @@ fn retired_native_source_settings_are_accepted_and_ignored() {
             "config_content":value == "true", "writable_includes":["/absolute", "../outside", "*.dae", ""]
         })).unwrap();
         assert_eq!(serde, NativeApiConfig::default());
+    }
+}
+
+#[test]
+fn short_listener_secrets_are_rejected_while_the_native_api_is_enabled() {
+    use honk_config::parser::parse_dae_config;
+    let render = |enabled: bool, native: &str, clash: &str| {
+        format!(
+            "experimental {{\n native_api {{\n enabled: {enabled}\n allow_anonymous_loopback: true\n secret: '{native}'\n }}\n clash_api {{\n external_controller: '127.0.0.1:9090'\n secret: '{clash}'\n }}\n}}"
+        )
+    };
+    for (enabled, native, clash) in [
+        (true, "short1", ""),
+        (true, "", "short1"),
+        (true, "abcdefgh", "short1"),
+    ] {
+        let error = parse_dae_config(&render(enabled, native, clash))
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(error.to_string().contains("8 bytes"), "{error}");
+    }
+    for (enabled, native, clash) in [
+        (true, "abcdefgh", ""),
+        (true, "", "abcdefgh"),
+        (false, "short1", "short1"),
+    ] {
+        parse_dae_config(&render(enabled, native, clash))
+            .unwrap()
+            .validate()
+            .unwrap();
     }
 }
