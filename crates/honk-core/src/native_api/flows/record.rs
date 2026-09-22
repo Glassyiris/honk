@@ -3,6 +3,7 @@
 use std::{
     mem::size_of,
     net::{IpAddr, SocketAddr},
+    time::SystemTime,
 };
 
 use honk_config::types::DialMode;
@@ -316,7 +317,8 @@ pub(crate) enum StepData {
 #[derive(Serialize)]
 pub(super) struct Step {
     pub seq: usize,
-    pub observed_at: String,
+    #[serde(serialize_with = "rfc3339")]
+    pub observed_at: SystemTime,
     pub elapsed_us: Option<u64>,
     pub generation_id: Option<String>,
     pub evidence: &'static str,
@@ -340,7 +342,7 @@ impl SnapshotRow {
 
 impl Step {
     pub(super) fn heap_bytes(&self) -> usize {
-        self.observed_at.capacity() + optional_bytes([&self.generation_id]) + self.data.heap_bytes()
+        optional_bytes([&self.generation_id]) + self.data.heap_bytes()
     }
 }
 
@@ -709,4 +711,8 @@ fn redact_display(value: &mut Option<String>, redacted: &mut bool) {
         *value = None;
         *redacted = true;
     }
+}
+
+fn rfc3339<S: serde::Serializer>(time: &SystemTime, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&crate::native_api::timestamp(*time))
 }

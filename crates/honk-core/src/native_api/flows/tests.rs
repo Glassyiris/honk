@@ -684,3 +684,15 @@ fn step_capacity_not_only_string_length_counts_toward_retention() {
     assert_eq!(detail["trace"]["missing"], json!(["buffer_overflow"]));
     assert_eq!(detail["state"], "closed");
 }
+
+#[test]
+fn room_making_prunes_expired_records_before_evicting_live_ones() {
+    let store = store();
+    store.set_limits(2, 0);
+    let live = begin(&store, "tcp");
+    begin(&store, "tcp").finish("closed", "relay_finished");
+    let newcomer = begin(&store, "tcp");
+    assert!(store.get(live.id(), &request_id()).is_ok());
+    assert!(store.get(newcomer.id(), &request_id()).is_ok());
+    assert_eq!(store.inner.lock().records.len(), 2);
+}
