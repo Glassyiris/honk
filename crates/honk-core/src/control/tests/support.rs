@@ -700,7 +700,9 @@ impl NativeFlowApi {
             .await
             .unwrap(),
         );
-        let flows = Arc::clone(&control.native_observation().flows);
+        let native = control.native_observation();
+        native.attach_for_test();
+        let flows = Arc::clone(&native.flows);
         Self {
             flows,
             addr,

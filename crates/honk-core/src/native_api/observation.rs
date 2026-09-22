@@ -73,6 +73,14 @@ impl NativeObservation {
         owner
     }
 
+    /// Fixtures that read flows directly stand in for an attached client,
+    /// pinned so virtual time cannot expire the attachment grace.
+    #[cfg(test)]
+    pub(crate) fn attach_for_test(&self) {
+        self.settings.pin_for_test(self);
+        self.settings.renew(self);
+    }
+
     pub(crate) fn committed(
         &self,
         identity: Arc<super::catalog::CatalogIdentity>,

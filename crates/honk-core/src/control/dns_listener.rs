@@ -1037,6 +1037,7 @@ mod tests {
         );
         let api_server = crate::native_api::NativeServer::start(api_listener, state);
         let native = plane.native_observation();
+        native.attach_for_test();
         let (controller, calls) = controller([192, 0, 2, 10]);
         controller
             .dns_service()

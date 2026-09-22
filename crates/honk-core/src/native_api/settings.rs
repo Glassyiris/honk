@@ -237,6 +237,15 @@ impl Settings {
             current.apply_recording(owner);
         }
     }
+    /// Fixtures that drive flows directly and advance virtual time past the
+    /// attachment grace keep every permitted recorder pinned on.
+    #[cfg(test)]
+    pub(crate) fn pin_for_test(&self, owner: &NativeObservation) {
+        let mut current = self.values.lock();
+        current.modes = [RecorderMode::On; 3];
+        current.apply_recording(owner);
+    }
+
     pub(crate) fn shutdown(&self, owner: &NativeObservation) {
         let mut current = self.values.lock();
         self.stopped
