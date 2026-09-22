@@ -19,6 +19,7 @@ pub struct ScoreFeedback {
     attributions: Arc<[ScoreAttribution]>,
     source: ScoreSource,
     probe_scope: u64,
+    probe_interval: Option<Duration>,
 }
 
 /// One pending business attempt. Clones retain the same reservation and original identity.
@@ -199,6 +200,7 @@ impl ScoreFeedback {
             attributions: attributions.into(),
             source: ScoreSource::Traffic,
             probe_scope: 0,
+            probe_interval: None,
         }
     }
 
@@ -220,6 +222,11 @@ impl ScoreFeedback {
             self.context.hash(&mut scope);
             self.probe_scope = scope.finish();
         }
+        self
+    }
+    /// Bind configured-probe comparison freshness to its producer's cadence.
+    pub fn with_probe_interval(mut self, interval: Duration) -> Self {
+        self.probe_interval = Some(interval);
         self
     }
 
@@ -398,11 +405,19 @@ impl ScoreReporter {
             return;
         }
         progress.probe = true;
+        let scope = feedback
+            .probe_interval
+            .map_or(feedback.probe_scope, |interval| {
+                let mut scope = std::collections::hash_map::DefaultHasher::new();
+                (feedback.probe_scope, interval).hash(&mut scope);
+                scope.finish()
+            });
         self.observe(
             Observation::Probe {
                 latency,
-                scope: feedback.probe_scope,
+                scope,
                 slot: super::evidence::probe_slot(&feedback.context),
+                interval: feedback.probe_interval,
             },
             now,
             &mut progress,

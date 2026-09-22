@@ -619,3 +619,190 @@ fn global_equivalence_checks_the_full_response_range() {
     assert!(summary.complete);
     assert!(!summary.equivalent);
 }
+
+#[test]
+fn ordinary_probe_streams_qualify_through_block_rotation_and_expire_on_weaker_support() {
+    for seconds in [30, 60] {
+        let nodes = [node("periodic a"), node("periodic b")];
+        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+        let target = ScoreSelectionContext::aggregate(
+            SelectionNetwork::Tcp,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+        );
+        let interval = Duration::from_secs(seconds);
+        let feedback: Vec<_> = nodes
+            .iter()
+            .map(|leaf| {
+                manager
+                    .feedback_for_group_node("score", leaf.id, target.clone())
+                    .unwrap()
+                    .with_source(ScoreSource::HealthProbe)
+                    .with_probe_interval(interval)
+                    .with_probe_identity("https://periodic.example/check", "HEAD")
+            })
+            .collect();
+        let publish = |index: usize, at| {
+            let reporter = feedback[index].clone().start_at(at);
+            reporter.probe_latency_at(Duration::from_millis(100), at);
+            reporter.finish_at(ScoreOutcome::Success, false, at);
+        };
+        let now = Instant::now();
+        let state = manager.score_state();
+        for cycle in 0..12 {
+            let phase = cycle % 2;
+            let at = now + Duration::from_secs(cycle * seconds + phase);
+            publish(0, at);
+            publish(1, at + Duration::from_secs(2));
+            let decision = scores(
+                &state.inner.lock(),
+                &nodes,
+                &target,
+                at + Duration::from_secs(3),
+            );
+            let response = decision.pairs.get(1).unwrap().response;
+            assert_eq!(
+                response.is_some(),
+                cycle >= 3,
+                "interval={seconds} cycle={cycle}"
+            );
+            if cycle >= 3 {
+                let summary = comparison::summarize(&decision, at + Duration::from_secs(3));
+                assert!(summary.complete && summary.equivalent);
+            }
+        }
+        let last = now + Duration::from_secs(11 * seconds + 1);
+        // Only the stronger side continues; it cannot renew the weaker side's proof.
+        publish(1, last + interval);
+        let expires = last + interval * 2;
+        let metric = pair(
+            &state.inner.lock(),
+            &nodes,
+            &target,
+            expires - Duration::from_nanos(1),
+        )
+        .response
+        .unwrap();
+        assert_eq!(metric.expires_at, expires);
+        assert!(
+            pair(&state.inner.lock(), &nodes, &target, expires)
+                .response
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn changed_and_invalid_probe_cadences_cannot_inherit_comparison_support() {
+    let nodes = [node("cadence a"), node("cadence b")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    let publish = |index: usize, interval, count, at| {
+        let feedback = manager
+            .feedback_for_group_node("score", nodes[index].id, target.clone())
+            .unwrap()
+            .with_source(ScoreSource::HealthProbe)
+            .with_probe_identity("https://periodic.example/check", "HEAD")
+            .with_probe_interval(interval);
+        for _ in 0..count {
+            let reporter = feedback.clone().start_at(at);
+            reporter.probe_latency_at(Duration::from_millis(100), at);
+            reporter.finish_at(ScoreOutcome::Success, false, at);
+        }
+    };
+    let now = Instant::now();
+    let state = manager.score_state();
+    let old = Duration::from_secs(30);
+    let new = Duration::from_secs(60);
+    for index in 0..2 {
+        publish(index, old, 4, now);
+    }
+    assert!(
+        pair(&state.inner.lock(), &nodes, &target, now)
+            .response
+            .is_some()
+    );
+    let later = now + Duration::from_secs(1);
+    publish(1, new, 4, later);
+    assert!(
+        pair(&state.inner.lock(), &nodes, &target, later)
+            .response
+            .is_none()
+    );
+    publish(1, old, 1, later);
+    assert!(
+        pair(&state.inner.lock(), &nodes, &target, later)
+            .response
+            .is_none()
+    );
+    publish(1, old, 3, later);
+    assert!(
+        pair(&state.inner.lock(), &nodes, &target, later)
+            .response
+            .is_some()
+    );
+    for invalid in [Duration::ZERO, Duration::MAX] {
+        for index in 0..2 {
+            publish(index, invalid, 4, later);
+        }
+        let decision = scores(&state.inner.lock(), &nodes, &target, later);
+        assert!(decision.pairs.get(1).unwrap().response.is_none());
+        assert!(
+            decision
+                .evidence
+                .iter()
+                .all(|evidence| evidence.probe.is_none())
+        );
+    }
+}
+
+#[test]
+fn common_target_cap_follows_qualification_and_directional_metrics_keep_that_cohort() {
+    let nodes = [node("qualified a"), node("qualified b")];
+    let now = Instant::now();
+    let mut inner = StateInner::default();
+    let unseen = context("unseen", IpVersion::V4);
+    for index in (0..17).rev() {
+        let target = context(&format!("{index:02}.target"), IpVersion::V4);
+        for (side, leaf) in nodes.iter().enumerate() {
+            response(
+                &mut inner,
+                leaf,
+                &target,
+                if index < 8 { 1 } else { 4 },
+                if index == 16 && side == 1 { 1 } else { 100 },
+                now,
+            );
+            if index != 8 {
+                for _ in 0..4 {
+                    publish(
+                        &mut inner,
+                        leaf,
+                        &target,
+                        comparison::next_reporter_id(),
+                        now,
+                        Observation::Transfer {
+                            tx: 1_048_576,
+                            rx: 1_048_576,
+                            elapsed: Duration::from_secs(1),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    for reference in [0, 1] {
+        let decision = decision_at(&inner, &nodes, &unseen, reference, now);
+        let pair = decision.pairs.get(1 - reference).unwrap();
+        assert_close(pair.response.unwrap().incumbent, 100.0);
+        assert_close(pair.response.unwrap().candidate, 100.0);
+        assert!(pair.upload.is_none() && pair.download.is_none());
+        let summary = comparison::summarize(&decision, now);
+        assert!(summary.equivalent && !summary.complete);
+    }
+    let exact = pair(&inner, &nodes, &context("16.target", IpVersion::V4), now);
+    assert_eq!(exact.basis, Basis::ExactTarget);
+    assert_close(exact.response.unwrap().candidate, 1.0);
+    assert!(!exact.partial);
+}

@@ -56,6 +56,7 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
     let mut all_upload = true;
     let mut all_download = true;
     let mut all_responses = true;
+    let mut full_coverage = true;
     let mut oldest: Option<Instant> = None;
     let mut expires: Option<Instant> = None;
     for (index, candidate) in snapshots.iter().enumerate() {
@@ -73,6 +74,7 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
         let Some(pair) = decision.pairs.get(index) else {
             continue;
         };
+        full_coverage &= !pair.partial;
         let result = promotion_result(
             pair,
             (winner.qualified(), candidate.qualified()),
@@ -154,6 +156,7 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
     let compared = summary.compared_candidates >= 2;
     summary.complete = compared
         && all_responses
+        && full_coverage
         && coherent
         && summary.compared_candidates + excluded == snapshots.len();
     summary.equivalent = compared

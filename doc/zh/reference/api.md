@@ -251,7 +251,7 @@ B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
 | `evidenceAgeMs` / `validForMs` | 最弱支持证据的年龄与条件性剩余有效期；没有结论时为 null。新证据可以提前撤销结论。 |
 | `network`、`targetFamily`、`healthFamily`、`targetSpecific` | transport 与适用范围；此聚合接口没有精确目标，不导出 domain/IP/port 或原始节点 ID。 |
 
-`localComparison.scope` 为 `activeChallengers`；`comparison` 和 `basis` 使用上述词汇。`comparedCandidates` 包含所选成员和有支持的挑战者。`reporters` 是双方已保留的不同 reporter 支持量中的最弱值：四个块各保留最多四个 ID，跨块去重并集最多十六个，不是所有已观测 reporter 的精确总数。`spanMs`、`evidenceAgeMs`、`validForMs` 与 `dispersionPpm` 描述这些支持，不代表统计独立或误判概率。`uploadKnown`、`downloadKnown` 明确保留未知方向；`directionalTradeoff` 标记相反的合格方向变化。证明使用共同 15 秒块，各块在起点后 60 秒到期，并受当前探测 cohort／失败／reload／incarnation 边界约束。局部子集可有支持，同时顶层仍为 `comparison: "unconfirmed"`。
+`localComparison.scope` 为 `activeChallengers`；`comparison` 和 `basis` 使用上述词汇。`comparedCandidates` 包含所选成员和有支持的挑战者。`reporters` 是双方已保留的不同 reporter 支持量中的最弱值：四个块各保留最多四个 ID，跨块去重并集最多十六个，不是所有已观测 reporter 的精确总数。`spanMs`、`evidenceAgeMs`、`validForMs` 与 `dispersionPpm` 描述这些支持，不代表统计独立或误判概率。`uploadKnown`、`downloadKnown` 明确保留未知方向；`directionalTradeoff` 标记相反的合格方向变化。业务证明使用共同 15 秒块，在块起点后 60 秒到期；配置探测按生产者周期 `I` 使用 `max(15s, 2I)` 块，有效期同时受最早支持块的四块保留期限与“较弱一侧最近支持加 `max(60s, 2I)`”限制。失败／reload／incarnation 边界保持不变。合格共同目标子集可以保留局部支持，但跳过尚未合格或因上限截断的已匹配目标时，`missing.response` 仍为 true，顶层仍为 `comparison: "unconfirmed"`；精确目标不能继承该子集的认证。
 
 `/stats.score.groups[].verification.tcp` 与 `.udp` 增加饱和计数：`provisionalSelections`、`usableSelections`、`validationSelections`、`confirmations`、`expired`、`contradicted`、`confirmationMillis`。确认计数包括新成立的配置探测比较等经验性结论，不表示所有维度的业务或带宽认证；`confirmationMillis / confirmations` 是这些结论的累计平均确认耗时，不是网络延迟。只读查询立即反映过期，转移计数只在后续授权 Apply 时推进。没有流量或预算不能授予确认；查询不派发验证，也不改变计数。10% 比较容差表示实际意义上的近似等价，不是已校准的误判概率。
 

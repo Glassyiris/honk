@@ -61,6 +61,7 @@ pub(super) struct PairEvidence {
     pub response: Option<MetricPair>,
     pub upload: Option<MetricPair>,
     pub download: Option<MetricPair>,
+    pub partial: bool,
     // Fingerprints describe selected keys/blocks, never measured values or raw API targets.
     pub support: u64,
 }
@@ -126,6 +127,7 @@ enum Key {
         key: AggregateKey,
         scope: u64,
         slot: usize,
+        interval: Option<Duration>,
     },
 }
 
@@ -151,6 +153,24 @@ impl Key {
         }
     }
 
+    fn timing(&self) -> Option<Timing> {
+        let interval = match self {
+            Self::Probe { interval, .. } => *interval,
+            Self::Traffic(_) => None,
+        };
+        let doubled = match interval {
+            Some(interval) if !interval.is_zero() => interval.checked_mul(2)?,
+            Some(_) => return None,
+            None => Duration::ZERO,
+        };
+        let width = Duration::from_secs(BLOCK_SECONDS).max(doubled);
+        width.checked_mul(BLOCKS as u32)?;
+        Some(Timing {
+            width,
+            freshness: LIFETIME.max(doubled),
+        })
+    }
+
     fn heap_bytes(&self) -> usize {
         match self {
             Self::Traffic(key) => key.group.capacity() + target_bytes(&key.target),
@@ -170,14 +190,19 @@ impl Key {
                     Self::Probe {
                         scope: left,
                         slot: a,
+                        interval: left_interval,
                         ..
                     },
                     Self::Probe {
                         scope: right,
                         slot: b,
+                        interval: right_interval,
                         ..
                     },
-                ) => a.cmp(b).then_with(|| left.cmp(right)),
+                ) => a
+                    .cmp(b)
+                    .then_with(|| left.cmp(right))
+                    .then_with(|| left_interval.cmp(right_interval)),
                 (Self::Traffic(_), Self::Probe { .. }) => Ordering::Less,
                 (Self::Probe { .. }, Self::Traffic(_)) => Ordering::Greater,
             })
@@ -193,6 +218,37 @@ impl Key {
             Self::Traffic(key) => inner.exact.peek(key),
             Self::Probe { key, .. } => inner.aggregate.peek(key),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Timing {
+    width: Duration,
+    freshness: Duration,
+}
+
+impl Timing {
+    fn deadline(self, origin: Instant, block: u64) -> Option<Instant> {
+        let nanos = self
+            .width
+            .as_nanos()
+            .checked_mul(u128::from(block.checked_add(BLOCKS as u64)?))?;
+        let duration = Duration::new(
+            u64::try_from(nanos / 1_000_000_000).ok()?,
+            (nanos % 1_000_000_000) as u32,
+        );
+        origin.checked_add(duration)
+    }
+
+    fn common(self, left: &Bucket, right: &Bucket, origin: Instant, now: Instant) -> bool {
+        left.count > 0
+            && right.count > 0
+            && left.block == right.block
+            && left.last.is_some_and(|at| at <= now)
+            && right.last.is_some_and(|at| at <= now)
+            && self
+                .deadline(origin, left.block)
+                .is_some_and(|until| now < until)
     }
 }
 
@@ -282,7 +338,9 @@ impl Store {
         reporter: u64,
         now: Instant,
     ) {
-        if let Key::Probe { key, scope, slot } = &key
+        if let Key::Probe {
+            key, scope, slot, ..
+        } = &key
             && stats.probes[*slot].scope != *scope
         {
             // Stats still holds the previous scope until this observation is published.
@@ -304,11 +362,19 @@ impl Store {
         {
             return;
         }
+        let Some(timing) = key.timing() else {
+            return;
+        };
         let origin = *self.origin.get_or_insert(now);
         let Some(elapsed) = now.checked_duration_since(origin) else {
             return;
         };
-        let block = elapsed.as_secs() / BLOCK_SECONDS;
+        let Ok(block) = u64::try_from(elapsed.as_nanos() / timing.width.as_nanos()) else {
+            return;
+        };
+        if timing.deadline(origin, block).is_none() {
+            return;
+        }
         let heap = key.heap_bytes();
         if heap > MAX_KEY_BYTES {
             self.rejected = self.rejected.saturating_add(1);
@@ -319,8 +385,9 @@ impl Store {
             let mut position = 0;
             while position < self.cells.len() {
                 let cell = &self.cells[position];
-                let last_block = now.saturating_duration_since(cell.touched).as_secs();
-                if last_block >= LIFETIME.as_secs() {
+                if cell.key.timing().is_none_or(|timing| {
+                    now.saturating_duration_since(cell.touched) >= timing.freshness
+                }) {
                     self.remove(position);
                     self.expired = self.expired.saturating_add(1);
                 } else {
@@ -420,7 +487,12 @@ pub(super) fn observe(
             continue;
         }
         let (key, captured) = match observation {
-            Observation::Probe { scope, slot, .. } => (
+            Observation::Probe {
+                scope,
+                slot,
+                interval,
+                ..
+            } => (
                 Key::Probe {
                     key: AggregateKey {
                         group: attribution.group.clone(),
@@ -430,6 +502,7 @@ pub(super) fn observe(
                     },
                     scope: *scope,
                     slot: *slot,
+                    interval: *interval,
                 },
                 started.aggregate[0],
             ),
@@ -510,27 +583,27 @@ fn metric_pair(
     right: &[Bucket; BLOCKS],
     origin: Instant,
     now: Instant,
+    timing: Timing,
 ) -> Option<MetricPair> {
     let mut a = Accumulator::default();
     let mut b = Accumulator::default();
     let mut expires = None;
     for (left, right) in left.iter().zip(right) {
-        if left.count == 0 || right.count == 0 || left.block != right.block {
+        if !timing.common(left, right, origin, now) {
             continue;
         }
-        let until = origin + Duration::from_secs(left.block * BLOCK_SECONDS) + LIFETIME;
-        if now >= until
-            || left.last.is_some_and(|at| at > now)
-            || right.last.is_some_and(|at| at > now)
-        {
-            continue;
-        }
+        let until = timing.deadline(origin, left.block)?;
         a.add(left);
         b.add(right);
         expires = Some(expires.map_or(until, |old: Instant| old.min(until)));
     }
     let reporters = a.reporters().min(b.reporters());
     if reporters < REPORTERS {
+        return None;
+    }
+    let latest_at = a.last?.min(b.last?);
+    let expires_at = expires?.min(latest_at.checked_add(timing.freshness)?);
+    if now >= expires_at {
         return None;
     }
     let left = a.sum / a.count as f64;
@@ -544,24 +617,23 @@ fn metric_pair(
             .saturating_duration_since(a.first?)
             .min(b.last?.saturating_duration_since(b.first?)),
         oldest_at: a.first?.min(b.first?),
-        latest_at: a.last?.min(b.last?),
-        expires_at: expires?,
+        latest_at,
+        expires_at,
         dispersion: ((a.max - a.min?) / left.max(1.0)).max((b.max - b.min?) / right.max(1.0)),
     })
 }
 
 fn has_common_block(left: &Cell, right: &Cell, origin: Instant, now: Instant) -> bool {
-    left.metrics
-        .iter()
-        .zip(&right.metrics)
-        .any(|(left, right)| {
-            left.iter().zip(right).any(|(a, b)| {
-                a.count > 0
-                    && b.count > 0
-                    && a.block == b.block
-                    && now < origin + Duration::from_secs(a.block * BLOCK_SECONDS) + LIFETIME
+    left.key.timing().is_some_and(|timing| {
+        left.metrics
+            .iter()
+            .zip(&right.metrics)
+            .any(|(left, right)| {
+                left.iter()
+                    .zip(right)
+                    .any(|(a, b)| timing.common(a, b, origin, now))
             })
-        })
+    })
 }
 
 fn merge_metric(acc: &mut Option<MetricPair>, next: Option<MetricPair>, count: usize) {
@@ -581,8 +653,9 @@ fn merge_metric(acc: &mut Option<MetricPair>, next: Option<MetricPair>, count: u
     };
 }
 
-fn paired_cells(
-    cells: &[(&Cell, &Cell)],
+fn paired_cell(
+    left: &Cell,
+    right: &Cell,
     origin: Instant,
     now: Instant,
     basis: Basis,
@@ -592,50 +665,39 @@ fn paired_cells(
         basis,
         ..PairEvidence::default()
     };
+    let Some(timing) = left.key.timing() else {
+        return result;
+    };
     let mut support = std::collections::hash_map::DefaultHasher::new();
-    for (count, (left, right)) in cells.iter().enumerate() {
-        match &left.key {
-            Key::Traffic(key) => {
-                key.target.hash(&mut support);
-                (key.family as u8).hash(&mut support);
-            }
-            Key::Probe { scope, slot, .. } => {
-                scope.hash(&mut support);
-                slot.hash(&mut support);
-            }
+    match &left.key {
+        Key::Traffic(key) => {
+            key.target.hash(&mut support);
+            (key.family as u8).hash(&mut support);
         }
-        for (metric_index, ((a, b), output)) in left
-            .metrics
-            .iter()
-            .zip(&right.metrics)
-            .zip([
-                &mut result.response,
-                &mut result.upload,
-                &mut result.download,
-            ])
-            .enumerate()
-        {
-            metric_index.hash(&mut support);
-            for (a, b) in a.iter().zip(b) {
-                let common = a.count > 0
-                    && b.count > 0
-                    && a.block == b.block
-                    && now < origin + Duration::from_secs(a.block * BLOCK_SECONDS) + LIFETIME;
-                common.then_some(a.block).hash(&mut support);
-            }
-            merge_metric(output, metric_pair(a, b, origin, now), count);
+        Key::Probe { scope, slot, .. } => {
+            scope.hash(&mut support);
+            slot.hash(&mut support);
         }
     }
-    for metric in [
-        &mut result.response,
-        &mut result.upload,
-        &mut result.download,
-    ]
-    .into_iter()
-    .flatten()
+    for (metric_index, ((a, b), output)) in left
+        .metrics
+        .iter()
+        .zip(&right.metrics)
+        .zip([
+            &mut result.response,
+            &mut result.upload,
+            &mut result.download,
+        ])
+        .enumerate()
     {
-        metric.incumbent /= cells.len() as f64;
-        metric.candidate /= cells.len() as f64;
+        metric_index.hash(&mut support);
+        for (a, b) in a.iter().zip(b) {
+            timing
+                .common(a, b, origin, now)
+                .then_some(a.block)
+                .hash(&mut support);
+        }
+        *output = metric_pair(a, b, origin, now, timing);
     }
     result.support = support.finish();
     result
@@ -649,11 +711,16 @@ fn compare(
     candidate: Uuid,
     now: Instant,
 ) -> PairEvidence {
+    use std::hash::{Hash, Hasher};
     let empty = PairEvidence::default();
     let Some(origin) = inner.comparisons.origin else {
         return empty;
     };
-    let mut common = [None; MAX_TARGETS];
+    let mut common = PairEvidence {
+        basis: Basis::CommonTargets,
+        ..empty
+    };
+    let mut support = std::collections::hash_map::DefaultHasher::new();
     let mut count = 0;
     let mut exact = None;
     let mut probe = None;
@@ -683,18 +750,36 @@ fn compare(
                             .target_family
                             .is_none_or(|family| family == key.family) =>
                     {
+                        if count == MAX_TARGETS && context.target.as_ref() != Some(&key.target) {
+                            common.partial = true;
+                            pending = None;
+                            continue;
+                        }
+                        let pair = paired_cell(pair.0, pair.1, origin, now, Basis::ExactTarget);
                         if context.target.as_ref() == Some(&key.target) {
                             exact = Some(pair);
                         }
-                        if count < MAX_TARGETS {
-                            common[count] = Some(pair);
+                        // Qualification, never magnitude, selects the canonical response cohort.
+                        if pair.response.is_some() && count < MAX_TARGETS {
+                            merge_metric(&mut common.response, pair.response, count);
+                            merge_metric(&mut common.upload, pair.upload, count);
+                            merge_metric(&mut common.download, pair.download, count);
+                            pair.support.hash(&mut support);
                             count += 1;
+                        } else {
+                            common.partial = true;
                         }
                     }
                     Key::Probe { slot, .. }
                         if *slot == super::evidence::probe_slot(context) && probe.is_none() =>
                     {
-                        probe = Some(pair);
+                        probe = Some(paired_cell(
+                            pair.0,
+                            pair.1,
+                            origin,
+                            now,
+                            Basis::ConfiguredProbe,
+                        ));
                     }
                     _ => {}
                 }
@@ -704,26 +789,30 @@ fn compare(
             pending = Some(cell);
         }
     }
-    let mut result = exact.map_or(empty, |pair| {
-        paired_cells(&[pair], origin, now, Basis::ExactTarget)
-    });
-    if result.response.is_none()
-        && result.upload.is_none()
-        && result.download.is_none()
-        && let Some(first) = common[0]
+    common.support = support.finish();
+    if count == 0 {
+        common.basis = Basis::None;
+    }
+    for metric in [
+        &mut common.response,
+        &mut common.upload,
+        &mut common.download,
+    ]
+    .into_iter()
+    .flatten()
     {
-        // The first canonical common keys are selected before reading their values.
-        let mut pairs = [first; MAX_TARGETS];
-        for (out, pair) in pairs.iter_mut().zip(common.into_iter().flatten()) {
-            *out = pair;
-        }
-        result = paired_cells(&pairs[..count], origin, now, Basis::CommonTargets);
+        metric.incumbent /= count as f64;
+        metric.candidate /= count as f64;
+    }
+    let mut result = exact.unwrap_or(empty);
+    if result.response.is_none() && result.upload.is_none() && result.download.is_none() {
+        result = common;
     }
     if result.response.is_none()
         && let Some(pair) = probe
     {
         // Do not combine business rates with an unrelated proxy-probe response.
-        result = paired_cells(&[pair], origin, now, Basis::ConfiguredProbe);
+        result = pair;
     }
     result
 }
@@ -775,8 +864,11 @@ pub(super) fn node_evidence(
         let Some(index) = nodes.iter().position(|node| node.id == cell.key.node()) else {
             continue;
         };
+        let Some(timing) = cell.key.timing() else {
+            continue;
+        };
         let metric = |buckets: &[Bucket; BLOCKS]| {
-            metric_pair(buckets, buckets, origin, now).map(|pair| TimedMetric {
+            metric_pair(buckets, buckets, origin, now, timing).map(|pair| TimedMetric {
                 value: pair.incumbent,
                 reporters: pair.reporters,
                 observed_at: pair.oldest_at,

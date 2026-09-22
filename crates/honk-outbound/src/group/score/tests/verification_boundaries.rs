@@ -277,3 +277,81 @@ fn response_age_uses_event_time_while_validity_uses_the_support_block() {
     assert_eq!(expired.state, ScoreVerificationState::ObservedUsable);
     assert!(expired.missing.response);
 }
+
+#[test]
+fn sparse_common_support_is_local_only_and_completeness_recovers() {
+    let nodes = [node("partial a"), node("partial b")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let dense = context("a.dense.example", IpVersion::V4);
+    let sparse = context("b.sparse.example", IpVersion::V4);
+    let aggregate =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    let now = Instant::now();
+    for leaf in &nodes {
+        train_at(
+            &manager,
+            leaf,
+            &sparse,
+            1,
+            Duration::from_millis(100),
+            1,
+            now,
+        );
+    }
+    let state = manager.score_state();
+    let refs: Vec<_> = nodes.iter().collect();
+    let unknown = state
+        .verification_snapshot_at("score", &aggregate, &refs, now + Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(
+        unknown.local_comparison.comparison,
+        ScoreComparison::Unconfirmed
+    );
+    assert!(unknown.missing.response);
+    for leaf in &nodes {
+        train_at(
+            &manager,
+            leaf,
+            &dense,
+            4,
+            Duration::from_millis(100),
+            1,
+            now + Duration::from_secs(2),
+        );
+    }
+    let partial = state
+        .verification_snapshot_at("score", &aggregate, &refs, now + Duration::from_secs(4))
+        .unwrap();
+    assert_eq!(partial.comparison, ScoreComparison::Unconfirmed);
+    assert_eq!(
+        partial.local_comparison.comparison,
+        ScoreComparison::Equivalent
+    );
+    assert_eq!(
+        partial.local_comparison.basis,
+        ScoreEvidenceBasis::CommonTargets
+    );
+    assert!(partial.missing.response);
+    assert_eq!(partial.question, ScoreEvidenceQuestion::Response);
+    let exact = state
+        .verification_snapshot_at("score", &dense, &refs, now + Duration::from_secs(4))
+        .unwrap();
+    assert_eq!(exact.comparison, ScoreComparison::Equivalent);
+    assert!(!exact.missing.response);
+    for leaf in &nodes {
+        train_at(
+            &manager,
+            leaf,
+            &sparse,
+            3,
+            Duration::from_millis(100),
+            1,
+            now + Duration::from_secs(4),
+        );
+    }
+    let complete = state
+        .verification_snapshot_at("score", &aggregate, &refs, now + Duration::from_secs(6))
+        .unwrap();
+    assert_eq!(complete.comparison, ScoreComparison::Equivalent);
+    assert!(!complete.missing.response);
+}

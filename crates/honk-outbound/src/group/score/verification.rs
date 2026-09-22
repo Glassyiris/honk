@@ -349,7 +349,7 @@ pub(super) fn evaluate(
             let availability_missing = !usable(&evidence[index]);
             let response_gap = if !qualified(response(index)) && paired_at.is_none() {
                 ResponseGap::Missing
-            } else if pair.is_some_and(|pair| pair.response.is_none()) {
+            } else if pair.is_some_and(|pair| pair.partial || pair.response.is_none()) {
                 ResponseGap::Unpaired
             } else if !use_probe && availability_missing {
                 ResponseGap::Availability

@@ -130,6 +130,7 @@ pub(super) enum Observation {
         latency: Duration,
         scope: u64,
         slot: usize,
+        interval: Option<Duration>,
     },
     Transfer {
         tx: u64,
@@ -219,6 +220,7 @@ impl Stats {
                     latency,
                     scope,
                     slot,
+                    ..
                 },
             ) => {
                 let probe = &mut self.probes[*slot];
