@@ -211,13 +211,15 @@ impl ScorePolicyState {
         super::verification::apply_budget_wait(&inner, group, context, nodes, now, &mut evaluation);
         let mut selection = ordinary;
         let mut reservation = None;
-        if allow_trials
-            && context.target.is_some()
-            && !matches!(
-                ordinary.reason,
-                SelectionReason::IncumbentIneligible | SelectionReason::FreshFailureBypass
-            )
-        {
+        let escaping = matches!(
+            ordinary.reason,
+            SelectionReason::IncumbentIneligible | SelectionReason::FreshFailureBypass
+        ) && inner
+            .selection_history
+            .peek(&history_key)
+            .is_some_and(|history| history.current != nodes[ordinary.index].id);
+        // A bypass label alone must not starve funded validation of alternatives.
+        if allow_trials && context.target.is_some() && !escaping {
             let cold = budget::cold_available(&inner, group, context, now);
             let startup = super::verification::startup_index(&decision);
             let focused = evaluation.validation_index.is_some_and(|index| {

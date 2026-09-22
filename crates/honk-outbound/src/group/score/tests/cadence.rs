@@ -1,3 +1,4 @@
+use super::super::verification;
 use super::*;
 
 #[test]
@@ -233,6 +234,197 @@ fn expired_backoff_gets_bounded_recovery_despite_normal_exclusion() {
             <= after.cold_allowance + after.business_starts / after.earning_period
     );
     reporter.finish_at(ScoreOutcome::Cancelled, false, expired);
+}
+
+#[test]
+fn unchanged_failed_incumbent_allows_funded_recovery_without_free_trials() {
+    let nodes = [node("recovery incumbent"), node("recovery challenger")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    train_at(
+        &manager,
+        &nodes[0],
+        &target,
+        100,
+        Duration::from_millis(10),
+        1,
+        now,
+    );
+    train_at(
+        &manager,
+        &nodes[1],
+        &target,
+        80,
+        Duration::from_millis(100),
+        1,
+        now,
+    );
+    assert_eq!(
+        rank_at(&manager, &nodes, &target, now + Duration::from_secs(2)),
+        0
+    );
+    let failed_at = now + Duration::from_secs(3);
+    for leaf in &nodes {
+        let reporter = manager
+            .feedback_for_group_node("score", leaf.id, target.clone())
+            .unwrap()
+            .start_at(failed_at);
+        reporter.setup_succeeded_at(failed_at);
+        reporter.transfer_at(1, 0, failed_at);
+        reporter.finish_at(ScoreOutcome::Timeout, true, failed_at);
+    }
+    let backed_off = failed_at + Duration::from_secs(1);
+    for _ in 0..128 {
+        manager
+            .feedback_for_group_node("score", nodes[0].id, target.clone())
+            .unwrap()
+            .business()
+            .begin_at(backed_off)
+            .unwrap()
+            .finish(ScoreOutcome::Cancelled);
+    }
+    let state = manager.score_state();
+    let refs = [&nodes[0], &nodes[1]];
+    let (index, attempt) = state.rank_plan_at("score", &target, &refs, backed_off);
+    assert_eq!(index, 0, "backed-off alternatives must not become trials");
+    attempt
+        .begin_at(backed_off)
+        .unwrap()
+        .start_at(backed_off)
+        .finish_at(ScoreOutcome::Cancelled, false, backed_off);
+    let before = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    assert_eq!((before.earned_available, before.trial_starts), (8, 0));
+
+    let later = now + Duration::from_secs(304);
+    {
+        let inner = state.inner.lock();
+        let decision = ranking::decision(&inner, "score", &target, &refs, later);
+        assert_eq!(decision.ordinary.index, 0);
+        assert_eq!(
+            decision.ordinary.reason,
+            SelectionReason::FreshFailureBypass
+        );
+        let evaluation = verification::evaluate(&decision, &refs, &target, None, later);
+        assert_eq!(evaluation.validation_index, Some(1));
+        assert!(evaluation.candidates[1].actionable());
+    }
+    let mut challenger_trials = 0;
+    let mut total_trials = 0;
+    let mut exhausted = false;
+    for second in 0..32 {
+        let at = later + Duration::from_secs(second);
+        let counts = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        let ordinary = ranking::decision(&state.inner.lock(), "score", &target, &refs, at)
+            .ordinary
+            .index;
+        let (index, attempt) = state.rank_plan_at("score", &target, &refs, at);
+        let reserved = manager
+            .score_budget_counters("score", SelectionNetwork::Tcp)
+            .reserved
+            > counts.reserved;
+        if counts.cold_available + counts.earned_available == 0 {
+            exhausted = true;
+            assert_eq!(
+                index, ordinary,
+                "an exhausted budget must keep the ordinary choice"
+            );
+            assert!(!reserved, "an exhausted budget cannot reserve a free trial");
+        }
+        challenger_trials += u64::from(reserved && index == 1);
+        total_trials += u64::from(reserved);
+        let reporter = attempt.begin_at(at).unwrap().start_at(at);
+        reporter.setup_succeeded_at(at);
+        reporter.transfer_at(1, 0, at);
+        reporter.finish_at(ScoreOutcome::Cancelled, true, at + Duration::from_millis(1));
+        let after = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        assert_eq!(
+            after.trial_starts - counts.trial_starts,
+            u64::from(reserved)
+        );
+        assert!(
+            after.spent + after.reserved
+                <= after.cold_allowance + after.business_starts / after.earning_period
+        );
+    }
+    let after = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    assert!(
+        challenger_trials > 0,
+        "funded actionable recovery must remain reachable"
+    );
+    assert!(exhausted);
+    assert_eq!(after.trial_cancelled - before.trial_cancelled, total_trials);
+    assert_eq!(after.refunded, before.refunded);
+    let escape_at = later + Duration::from_secs(32);
+    for leaf in &nodes {
+        assert!(
+            score_snapshot(&state.inner.lock(), "score", &target, leaf.id, escape_at)
+                .unresolved_failure
+        );
+    }
+
+    let failure = manager
+        .feedback_for_group_node("score", nodes[1].id, target.clone())
+        .unwrap()
+        .start_at(escape_at);
+    failure.finish_at(ScoreOutcome::Timeout, false, escape_at);
+    let (index, attempt) = state.rank_plan_at("score", &target, &refs, escape_at);
+    assert_eq!(index, 0);
+    attempt
+        .begin_at(escape_at)
+        .unwrap()
+        .finish(ScoreOutcome::Cancelled);
+
+    train_at(
+        &manager,
+        &nodes[1],
+        &target,
+        100,
+        Duration::from_millis(10),
+        1,
+        escape_at,
+    );
+    let escape_at = escape_at + Duration::from_secs(2);
+    for _ in 0..before.earning_period {
+        manager
+            .feedback_for_group_node("score", nodes[0].id, target.clone())
+            .unwrap()
+            .business()
+            .begin_at(escape_at)
+            .unwrap()
+            .finish(ScoreOutcome::Cancelled);
+    }
+    assert!(
+        manager
+            .score_budget_counters("score", SelectionNetwork::Tcp)
+            .earned_available
+            > 0
+    );
+    {
+        let inner = state.inner.lock();
+        let decision = ranking::decision(&inner, "score", &target, &refs, escape_at);
+        assert_eq!(decision.ordinary.index, 1);
+        assert_eq!(
+            decision.ordinary.reason,
+            SelectionReason::FreshFailureBypass
+        );
+        let evaluation = verification::evaluate(&decision, &refs, &target, None, escape_at);
+        assert_eq!(evaluation.validation_index, Some(0));
+    }
+    let (index, attempt) = state.rank_plan_at("score", &target, &refs, escape_at);
+    assert_eq!(
+        index, 1,
+        "ordinary escape takes priority over optional recovery"
+    );
+    attempt
+        .begin_at(escape_at)
+        .unwrap()
+        .start_at(escape_at)
+        .finish_at(ScoreOutcome::Cancelled, false, escape_at);
+    let escaped = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    assert_eq!(escaped.spent, after.spent);
+    assert_eq!(escaped.trial_starts, after.trial_starts);
+    assert_eq!(escaped.reserved, 0);
 }
 
 #[test]
