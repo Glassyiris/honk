@@ -500,59 +500,53 @@ async fn metadata_defaults_and_anonymous_never_grant_source_authority() {
     for access in [Access::Metadata, Access::Anonymous] {
         let fixture = Fixture::new(access, false).await;
         let capabilities = fixture.get("/api/v1/capabilities").await;
-        assert_eq!(
-            capabilities["resources"]["config"]["content"],
-            fixture.authenticated
-        );
+        assert_eq!(capabilities["resources"]["config"]["content"], true);
         assert_eq!(capabilities["resources"]["config"]["writable"], false);
         assert_eq!(capabilities["resources"]["groups"]["config_patch"], false);
-        if !fixture.authenticated {
-            for resource in ["providers", "geodata"] {
-                assert_eq!(capabilities["resources"][resource]["available"], false);
-            }
-            assert_eq!(
-                fixture.service.snapshot().unwrap()["secrets_redacted"],
-                false
-            );
-            for path in [
-                CONFIG,
-                "/api/v1/config/sources/unknown",
-                "/api/v1/providers",
-                "/api/v1/providers/inline",
-                "/api/v1/geodata",
-            ] {
-                error(
-                    fixture.request(Method::GET, path).send().await.unwrap(),
-                    StatusCode::FORBIDDEN,
-                    "permission_denied",
-                )
-                .await;
-            }
-        } else {
-            let config = fixture.get(CONFIG).await;
-            assert_eq!(config["secrets_redacted"], true);
-            assert!(
-                config["sources"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .all(|row| row["content"].is_string() && row["writable"] == false)
-            );
-            assert!(!config.to_string().contains(SECRET));
-            let main = source(&config, &fixture.originals["main.dae"]);
-            let before = disk(fixture.directory.path());
-            error(
-                fixture
-                    .replace(main, "routing { fallback: block }")
-                    .send()
-                    .await
-                    .unwrap(),
-                StatusCode::FORBIDDEN,
-                "permission_denied",
-            )
-            .await;
-            assert_eq!(disk(fixture.directory.path()), before);
+        for resource in [
+            "providers",
+            "geodata",
+            "rules",
+            "routing_trace",
+            "flows",
+            "connections",
+        ] {
+            assert_eq!(capabilities["resources"][resource]["available"], true);
         }
+        for path in [
+            "/api/v1/providers",
+            "/api/v1/providers/inline",
+            "/api/v1/geodata",
+            "/api/v1/connections",
+            "/api/v1/rules",
+            "/api/v1/flows",
+        ] {
+            fixture.get(path).await;
+        }
+        let config = fixture.get(CONFIG).await;
+        assert_eq!(config["secrets_redacted"], fixture.authenticated);
+        assert!(
+            config["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["content"].is_string() && row["writable"] == false)
+        );
+        assert!(!config.to_string().contains(SECRET));
+        let main = source(&config, &fixture.originals["main.dae"]);
+        assert_eq!(fixture.get(&source_path(main)).await, *main);
+        let before = disk(fixture.directory.path());
+        error(
+            fixture
+                .replace(main, "routing { fallback: block }")
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+        )
+        .await;
+        assert_eq!(disk(fixture.directory.path()), before);
         assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
         fixture.shutdown().await;
     }
@@ -853,6 +847,8 @@ async fn mixed_listener_secrets_mask_values_and_keep_ordinary_content() {
         *auth = auth.replace(&format!("secret: '{SECRET}'"),
             &format!("secret: 'overridden-listener-token'\n secret: '{SECRET}'"));
         auth.push_str("experimental { clash_api { secret: 'old-clash-token'\n secret: 'clash-listener-token' } }\n# old-clash-token copied here\n");
+        files.get_mut("main.dae").unwrap().push_str("include { 'clash-listener-token.dae' }\n");
+        files.insert("clash-listener-token.dae", "# Ordinary included content.\n".into());
         files.get_mut("locked.dae").unwrap().push_str(
             "# overridden-listener-token copied across sources\nnode { ordinary: 'socks5://user:ordinary-password@192.0.2.1:1080' }\n");
     }).await;
@@ -867,6 +863,9 @@ async fn mixed_listener_secrets_mask_values_and_keep_ordinary_content() {
     ] {
         assert!(!encoded.contains(secret), "listener value leaked");
     }
+    let path_only = source(&config, &fixture.originals["clash-listener-token.dae"]);
+    assert_eq!(path_only["content"], "# Ordinary included content.\n");
+    assert_eq!(path_only["path"], "<redacted>.dae");
     let auth = source(&config, &fixture.originals["auth.dae"]);
     assert_eq!(auth["writable"], false);
     assert_eq!(
@@ -915,4 +914,116 @@ async fn retired_content_flag_and_echoed_redaction_flag_do_not_grant_write_autho
         .unwrap();
     assert_eq!(ok(response).await["valid"], true);
     fixture.shutdown().await;
+}
+
+#[test]
+fn listener_masking_preserves_wire_identifiers_and_enums() {
+    use super::ListenerSecrets;
+
+    let mut value = json!({
+        "id": "12345678-abcd-1234-abcd-123456789012",
+        "next_cursor": "12345678-abcd-1234-abcd-123456789012:1",
+        "network": "tcp",
+        "chain": ["node-with-secret"],
+        "trace_status": "complete",
+        "trace": {"status": "complete", "missing": [], "steps": [
+            {"chain": "traffic", "rule_id": "instance-1:2:rule:0", "expression": "pname(node-with-secret)"}
+        ]}
+    });
+    let original = value.clone();
+    assert!(ListenerSecrets::new(&[], "-").mask_value(&mut value));
+    assert_eq!(value["id"], original["id"]);
+    assert_eq!(value["next_cursor"], original["next_cursor"]);
+    assert_eq!(value["network"], "tcp");
+    assert_eq!(value["chain"][0], "node<redacted>with<redacted>secret");
+    assert_eq!(value["trace"]["steps"][0]["chain"], "traffic");
+    assert_eq!(value["trace"]["steps"][0]["rule_id"], "instance-1:2:rule:0");
+    assert_eq!(value["trace_status"], "partial");
+    assert_eq!(value["trace"]["missing"], json!(["redacted"]));
+    let mut value = json!({"network": "tcp", "expression": "l4proto(tcp)"});
+    assert!(ListenerSecrets::new(&[], "tcp").mask_value(&mut value));
+    assert_eq!(value["network"], "tcp");
+    assert_eq!(value["expression"], "l4proto(<redacted>)");
+    assert_eq!(
+        ListenerSecrets::new(&[], "aba").mask("ababa"),
+        ("<redacted>".into(), true)
+    );
+    let secret = "quoted\"token";
+    let mut value = json!({"expression": format!("pname({secret:?})")});
+    assert!(ListenerSecrets::new(&[], secret).mask_value(&mut value));
+    assert_eq!(value["expression"], "pname(\"<redacted>\")");
+}
+
+#[tokio::test]
+async fn connection_projection_masks_listener_values_without_losing_flow_references() {
+    use crate::connection_tracker::ConnectionEntry;
+    use std::sync::atomic::AtomicU64;
+
+    let fixture = Fixture::new(Access::Metadata, false).await;
+    let state = fixture.state.upgrade().unwrap();
+    let flow = state.observation.flows.begin(
+        "tcp",
+        "192.0.2.1:31000".parse().unwrap(),
+        "198.51.100.1:443".parse().unwrap(),
+    );
+    let rule_id = format!("{}:1:rule:0", state.instance_id);
+    flow.routed(
+        "group/name@host",
+        Some(&rule_id),
+        Some(&format!("pname(\"/usr/bin/{SECRET}\")")),
+        "evaluation",
+    );
+    state.tracker.register(ConnectionEntry {
+        id: "connection-visible-id".into(),
+        source: "192.0.2.1:31000".into(),
+        destination: "198.51.100.1:443".into(),
+        proxy: "leaf".into(),
+        routed_outbound: Some("group/name@host".into()),
+        native_flow_id: Some(flow.id().into()),
+        rule: String::new(),
+        rule_payload: String::new(),
+        chains: vec![],
+        upload: Arc::new(AtomicU64::new(0)),
+        download: Arc::new(AtomicU64::new(0)),
+        start_time: Instant::now(),
+        domain: None,
+        network: "tcp".into(),
+        process: Some("/usr/bin/user@host".into()),
+        process_path: None,
+    });
+    let value = fixture.get("/api/v1/connections?detail=full").await;
+    let row = &value["tcp"][0];
+    assert_eq!(row["id"], "connection-visible-id");
+    assert_eq!(row["flow_id"], flow.id());
+    assert_eq!(row["rule_id"], rule_id);
+    assert_eq!(row["outbound"], "group/name@host");
+    assert_eq!(row["pname"], "/usr/bin/user@host");
+    assert_eq!(row["rule_expression"], "pname(\"/usr/bin/<redacted>\")");
+    assert!(!value.to_string().contains(SECRET));
+    drop(state);
+    fixture.shutdown().await;
+}
+
+#[test]
+fn malformed_credential_source_is_withheld_without_panicking() {
+    let content = "experimental { native_api { secret: 'unfinished\n";
+    let source = honk_config::parser::SourceSnapshot {
+        path: PathBuf::from("/config/auth.dae"),
+        content: Arc::from(content),
+        parent: None,
+        source: honk_config::diagnostic::DiagnosticSources::new(None).root(),
+        contains_api_secret: true,
+        loaded_at: SystemTime::now(),
+    };
+    let sources = [source];
+    let secrets = super::ListenerSecrets::new(&sources, "listener-token");
+    assert_eq!(secrets.mask(content), ("<redacted>\n".into(), true));
+    assert_eq!(
+        secrets.mask(&format!("before\n{content}after")),
+        ("before\n<redacted>\nafter".into(), true)
+    );
+    assert_eq!(
+        secrets.mask("ordinary content"),
+        ("ordinary content".into(), false)
+    );
 }

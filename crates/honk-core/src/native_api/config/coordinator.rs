@@ -468,7 +468,12 @@ impl Worker {
                 id,
             )
         } else {
-            super::super::providers::provider_value(&active, Some(&self.subscriptions), id)
+            super::super::providers::provider_value(
+                &active,
+                Some(&self.subscriptions),
+                id,
+                Some(&self.service),
+            )
         }
         .ok_or_else(|| {
             management::activation_error("resource_unavailable", Some(true), Some(true), Some(true))

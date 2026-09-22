@@ -93,14 +93,21 @@ pub(crate) fn configured_url<'a>(settings: &'a NativeApiConfig, kind: &str) -> &
     }
 }
 
-pub(crate) fn project(assets: Vec<GeoAssetSnapshot>, settings: &NativeApiConfig) -> GeoData {
+pub(crate) fn project(
+    assets: Vec<GeoAssetSnapshot>,
+    settings: &NativeApiConfig,
+    active: &honk_config::Config,
+    sources: &config::ConfigService,
+) -> GeoData {
+    let secrets = config::ListenerSecrets::from_config(active);
     GeoData {
         observed_at: timestamp(SystemTime::now()),
         assets: assets
             .into_iter()
             .map(|asset| {
                 let url = configured_url(settings, asset.kind);
-                let source_redacted = (!url.is_empty()).then(|| url.to_owned());
+                let source_redacted =
+                    (!url.is_empty()).then(|| sources.mask_text(&secrets.mask(url).0).0);
                 GeoAsset {
                     kind: asset.kind,
                     sha256: asset.sha256,
@@ -123,9 +130,6 @@ fn updatable(state: &NativeState, assets: &[GeoAssetSnapshot]) -> bool {
 }
 
 pub(super) async fn capability(state: &NativeState) -> Value {
-    if state.settings.secret.is_empty() {
-        return json!({"available": false, "can_update": false});
-    }
     match capture(state).await {
         Ok(assets) => json!({"available": true, "can_update": updatable(state, &assets),
             "assets": assets.iter().map(|asset| asset.kind).collect::<Vec<_>>()}),
@@ -139,8 +143,15 @@ pub(super) async fn get(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     parse_query(uri, &[], id)?;
-    super::types::require_administrator(state)?;
-    Ok(axum::Json(project(capture(state).await?, &state.settings)).into_response())
+    let assets = capture(state).await?;
+    let active = state.config.read().await;
+    Ok(axum::Json(project(
+        assets,
+        &state.settings,
+        &active,
+        &state.observation.configuration,
+    ))
+    .into_response())
 }
 
 pub(super) async fn update(

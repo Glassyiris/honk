@@ -303,19 +303,6 @@ pub(super) fn version() -> Value {
     })
 }
 
-pub(super) fn require_administrator(state: &super::NativeState) -> Result<(), ApiError> {
-    if state.settings.secret.is_empty() {
-        Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            ErrorCode::PermissionDenied,
-            "Administrative access requires a configured secret.",
-            None,
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 pub(super) async fn capabilities(state: &super::NativeState) -> Value {
     let config = &state.observation.configuration;
     let telemetry = &state.observation.telemetry;
@@ -329,11 +316,9 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
     ];
     let mut providers = state.observation.providers.capability();
     providers["can_manage"] = json!(config.can_manage());
-    if state.settings.secret.is_empty() {
-        providers["available"] = json!(false);
-        providers["can_refresh"] = json!(false);
-    }
     let geodata = super::geodata::capability(state).await;
+    let routing_trace = state.observation.trace.capability();
+    let rules = super::routing::rules_capability();
     json!({
         "observed_at": chrono::Utc::now().to_rfc3339(),
         "profiles": ["base"],
@@ -363,8 +348,8 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
                 "max_bulk_close": 1000,
             },
             "flows": {"available": true, "recording": if state.observation.settings.flow_recording() { "on" } else { "off" }, "scopes":["userspace_tcp","userspace_udp"], "max_flows":1024, "max_steps_per_flow":64, "retention_seconds":300, "snapshot_ttl_seconds":30, "max_page_size":1000},
-            "routing_trace": state.observation.trace.capability(),
-            "rules": super::routing::rules_capability(),
+            "routing_trace": routing_trace,
+            "rules": rules,
             "events": {"available":true,"kinds":kinds,"retention_seconds":60,"max_buffered_events":512,"max_clients":16,"heartbeat_seconds":15},
             "logs": state.observation.logs.capability(),
             "dns_query": state.observation.dns.query_capability(),

@@ -32,22 +32,26 @@ use crate::configuration::{
     same_dependencies,
 };
 
-struct ListenerSecrets<'a> {
+pub(crate) struct ListenerSecrets<'a> {
     values: Vec<&'a str>,
 }
 
 impl<'a> ListenerSecrets<'a> {
-    fn new(sources: &'a [SourceSnapshot], native_secret: &'a str) -> Self {
+    pub(crate) fn new(sources: &'a [SourceSnapshot], native_secret: &'a str) -> Self {
         let mut values = Vec::new();
         if !native_secret.is_empty() {
             values.push(native_secret);
         }
         for source in sources.iter().filter(|source| source.contains_api_secret) {
-            let document = Document::parse(
+            let Ok(document) = Document::parse(
                 Source::new(&source.content, source.source.clone()),
                 &mut Vec::new(),
-            )
-            .expect("accepted credential source has valid syntax");
+            ) else {
+                if !source.content.is_empty() {
+                    values.push(source.content.as_ref());
+                }
+                continue;
+            };
             for field in document
                 .sections()
                 .filter(|root| root.header() == "experimental")
@@ -89,46 +93,128 @@ impl<'a> ListenerSecrets<'a> {
         Self { values }
     }
 
-    fn contains(&self, text: &str) -> bool {
-        self.values.iter().any(|value| text.contains(value))
+    pub(crate) fn from_config(config: &'a Config) -> Self {
+        Self::new(&[], &config.experimental.native_api.secret)
+            .with_clash(&config.experimental.clash_api.secret)
     }
 
-    fn mask(&self, text: &str) -> (String, bool) {
-        let mut ranges = self
-            .values
-            .iter()
-            .flat_map(|value| {
-                text.match_indices(value)
-                    .map(|(start, matched)| start..start + matched.len())
-            })
-            .collect::<Vec<_>>();
-        ranges.sort_unstable_by_key(|range| (range.start, range.end));
-        let redacted = !ranges.is_empty();
-        let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
-        for range in ranges {
-            if let Some(previous) = merged
-                .last_mut()
-                .filter(|previous| range.start <= previous.end)
-            {
-                previous.end = previous.end.max(range.end);
-            } else {
-                merged.push(range);
+    pub(crate) fn with_clash(mut self, secret: &'a str) -> Self {
+        if !secret.is_empty() && !self.values.contains(&secret) {
+            self.values.push(secret);
+        }
+        self
+    }
+
+    fn spellings(&self) -> impl Iterator<Item = std::borrow::Cow<'_, str>> {
+        self.values.iter().flat_map(|value| {
+            let quoted = serde_json::to_string(value).expect("listener secret is a string");
+            [
+                std::borrow::Cow::Borrowed(*value),
+                std::borrow::Cow::Owned(quoted[1..quoted.len() - 1].to_owned()),
+            ]
+        })
+    }
+
+    fn contains(&self, text: &str) -> bool {
+        self.spellings().any(|value| text.contains(value.as_ref()))
+    }
+
+    pub(crate) fn mask(&self, text: &str) -> (String, bool) {
+        if !self.contains(text) {
+            return (text.to_owned(), false);
+        }
+        let mut hidden = vec![false; text.len()];
+        for secret in self.spellings() {
+            let mut offset = 0;
+            while let Some(relative) = text[offset..].find(secret.as_ref()) {
+                let start = offset + relative;
+                hidden[start..start + secret.len()].fill(true);
+                offset = start + text[start..].chars().next().unwrap().len_utf8();
             }
         }
         let mut masked = String::new();
-        let mut end = 0;
-        for range in merged {
-            masked.push_str(&text[end..range.start]);
-            masked.push_str("<redacted>");
-            masked.extend(
-                text[range.clone()]
-                    .chars()
-                    .filter(|character| matches!(character, '\r' | '\n')),
-            );
-            end = range.end;
+        let mut hiding = false;
+        for (index, character) in text.char_indices() {
+            if hidden[index] {
+                if !hiding {
+                    masked.push_str("<redacted>");
+                }
+                if matches!(character, '\r' | '\n') {
+                    masked.push(character);
+                }
+            } else {
+                masked.push(character);
+            }
+            hiding = hidden[index];
         }
-        masked.push_str(&text[end..]);
-        (masked, redacted)
+        (masked, true)
+    }
+
+    fn mask_display(&self, value: &mut Value) -> bool {
+        let Some(text) = value.as_str() else {
+            return false;
+        };
+        let (masked, changed) = self.mask(text);
+        *value = json!(masked);
+        changed
+    }
+
+    fn mask_value(&self, value: &mut Value) -> bool {
+        let masked = match value {
+            Value::Array(values) => values
+                .iter_mut()
+                .fold(false, |masked, value| self.mask_value(value) | masked),
+            Value::Object(values) => values.iter_mut().fold(false, |masked, (key, value)| {
+                let changed = if matches!(
+                    key.as_str(),
+                    "expression"
+                        | "rule_expression"
+                        | "domain"
+                        | "pname"
+                        | "src_mac"
+                        | "outbound"
+                        | "routed_outbound"
+                        | "effective_outbound"
+                        | "leaf_node_name"
+                        | "member_name"
+                        | "target"
+                        | "name"
+                        | "from_upstream"
+                        | "upstream"
+                        | "file"
+                        | "path"
+                        | "absolute_path"
+                        | "url_redacted"
+                        | "source_redacted"
+                ) {
+                    self.mask_display(value)
+                } else if key == "chain"
+                    && let Some(chain) = value.as_array_mut()
+                {
+                    chain
+                        .iter_mut()
+                        .fold(false, |masked, value| self.mask_display(value) | masked)
+                } else {
+                    self.mask_value(value)
+                };
+                changed | masked
+            }),
+            _ => false,
+        };
+        if masked && let Some(object) = value.as_object_mut() {
+            if object.contains_key("trace_status") {
+                object.insert("trace_status".into(), json!("partial"));
+            }
+            if let Some(trace) = object.get_mut("trace").and_then(Value::as_object_mut) {
+                trace.insert("status".into(), json!("partial"));
+                if let Some(missing) = trace.get_mut("missing").and_then(Value::as_array_mut)
+                    && !missing.contains(&json!("redacted"))
+                {
+                    missing.push(json!("redacted"));
+                }
+            }
+        }
+        masked
     }
 }
 
@@ -262,7 +348,7 @@ impl ConfigService {
         })
     }
     pub(crate) fn content_enabled(&self) -> bool {
-        self.sources.available() && !self.settings.secret.is_empty()
+        self.sources.available()
     }
     pub(crate) fn running(&self) -> bool {
         self.sources.available() && self.sender.lock().is_some()
@@ -283,9 +369,13 @@ impl ConfigService {
         self.last_reload.read().clone()
     }
 
-    fn credential_source(&self, source: &SourceSnapshot) -> bool {
-        source.contains_api_secret
-            || (!self.settings.secret.is_empty() && source.content.contains(&self.settings.secret))
+    pub(crate) fn mask_text(&self, text: &str) -> (String, bool) {
+        let guard = self.sources.accepted.read();
+        let sources = guard
+            .as_ref()
+            .map(|accepted| accepted.update.sources.as_slice())
+            .unwrap_or(&[]);
+        ListenerSecrets::new(sources, &self.settings.secret).mask(text)
     }
 
     fn source_writable(&self, accepted: &Accepted, index: usize) -> bool {
@@ -347,15 +437,15 @@ impl ConfigService {
             None => accepted.rule_sources.fallback.as_ref()?,
         };
         let source = &accepted.update.sources[location.source_index];
-        if self.credential_source(source) {
-            return None;
-        }
+        let secrets = ListenerSecrets::new(&accepted.update.sources, &self.settings.secret);
+        let mut location = location.clone();
+        location.expression = secrets.mask(&location.expression).0;
         Some((
             accepted.ids[&source.path].clone(),
-            source_path(accepted, location.source_index)
-                .to_string_lossy()
-                .into_owned(),
-            location.clone(),
+            secrets
+                .mask(&source_path(accepted, location.source_index).to_string_lossy())
+                .0,
+            location,
         ))
     }
 
@@ -367,14 +457,16 @@ impl ConfigService {
     ) -> (Value, bool) {
         let source = &accepted.update.sources[index];
         let (content, redacted) = secrets.mask(&source.content);
+        let (path, path_redacted) = secrets.mask(&source_path(accepted, index).to_string_lossy());
+        let (absolute_path, absolute_redacted) = secrets.mask(&source.path.to_string_lossy());
         let value = json!({
-            "id":accepted.ids[&source.path], "path":source_path(accepted, index).to_string_lossy(),
-            "absolute_path":source.path.to_string_lossy(), "kind":if index==0 {"main"} else {"include"},
+            "id":accepted.ids[&source.path], "path":path,
+            "absolute_path":absolute_path, "kind":if index==0 {"main"} else {"include"},
             "content_sha256":accepted.hashes[index], "bytes":source.content.len(),
             "writable":self.source_writable_with_secrets(accepted,index,secrets), "loaded_at":timestamp(accepted.accepted_at),
             "line_count":source.content.lines().count(), "content":content,
         });
-        (value, redacted)
+        (value, redacted || path_redacted || absolute_redacted)
     }
 
     pub(crate) fn snapshot(&self) -> Option<Value> {
@@ -602,15 +694,28 @@ struct ValidationRequest {
     _secrets_redacted: Option<bool>,
 }
 
+pub(super) fn administrative_projection(
+    state: &NativeState,
+    mut value: Value,
+) -> Result<Value, ApiError> {
+    let config = state.config.try_read().map_err(|_| unavailable())?;
+    let accepted = state.observation.configuration.sources.accepted.read();
+    let sources = accepted
+        .as_ref()
+        .map(|accepted| accepted.update.sources.as_slice())
+        .unwrap_or(&[]);
+    let secrets = ListenerSecrets::new(sources, &state.settings.secret)
+        .with_clash(&config.experimental.clash_api.secret);
+    secrets.mask_value(&mut value);
+    Ok(value)
+}
+
 pub(super) async fn get(
     state: &NativeState,
     uri: &Uri,
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     parse_query(uri, &[], id)?;
-    if state.settings.secret.is_empty() {
-        return Err(denied());
-    }
     let _config = state.config.read().await;
     let mut value = state.observation.configuration.snapshot().ok_or_else(|| {
         error(
@@ -651,9 +756,6 @@ pub(super) async fn source(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     parse_query(uri, &[], id)?;
-    if state.settings.secret.is_empty() {
-        return Err(denied());
-    }
     let _config = state.config.read().await;
     let accepted = state.observation.configuration.sources.accepted.read();
     let accepted = accepted.as_ref().ok_or_else(unsupported)?;

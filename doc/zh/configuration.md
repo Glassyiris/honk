@@ -272,7 +272,7 @@ dns {
 
 **原生 API。** 默认构建包含 `native-api`，listener 须配置 `experimental.native_api.enabled: true` 和独立强 `secret` 才会启用；默认监听地址为 `127.0.0.1:9527`，匿名 loopback 仅供本地开发。所有生效的原生字段均需重启。可见用户态观测、事件与有界历史独立于 Clash；流量/内存历史默认保留最多 600 点/600 秒。可选 `ui` 目录需已有可读 `index.html`，也可用 `--features native-ui` 与 `ui: embedded` 内嵌固定真实 doona；运行时不下载或构建 UI。
 
-`.dae` 仍是唯一配置权威。启动捕获来源、离线校验和 reload 共用引擎；认证后的配置读取要求非空 secret，返回已接受正文，仅遮蔽监听凭据值，包括重复、被覆盖的值及其在其他位置的出现；凭据源仍只读，哈希仍对应原始字节。源 `path` 保持相对路径，`absolute_path` 另行提供规范化绝对路径。匿名配置读取返回 `403 permission_denied`。`config_content` 与 `writable_includes` 仍可配置，但不产生作用；`config_write` 默认 false，要求非空 secret。主文件节点/provider 创建删除、授权源 PUT 和受限组 PATCH 复用该权威；启用 `config_write` 后，所有已接受的非凭据 include 均可进行源编辑，但不授予专用条目删除权限。配置的 geodata 更新将不可变已验证字节交给同一 reload owner。激活失败不会自动回滚已写字节，应避免并发外部编辑。详见[原生设置](./reference/experimental.md#native_api)与 [M9 契约](./reference/api.md#主文件条目与-geodata-管理m9)。
+`.dae` 仍是唯一配置权威。启动捕获来源、离线校验和 reload 共用引擎；配置读取返回已接受正文，仅遮蔽监听凭据值，包括重复、被覆盖的值及其在其他位置的出现；凭据源仍只读，哈希仍对应原始字节。源 `path` 保持相对路径，`absolute_path` 另行提供规范化绝对路径。获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的数据。`config_content` 与 `writable_includes` 仍可配置，但不产生作用；`config_write` 默认 false，要求非空 secret。主文件节点/provider 创建删除、授权源 PUT 和受限组 PATCH 复用该权威；启用 `config_write` 后，所有已接受的非凭据 include 均可进行源编辑，但不授予专用条目删除权限。配置的 geodata 更新将不可变已验证字节交给同一 reload owner。激活失败不会自动回滚已写字节，应避免并发外部编辑。详见[原生设置](./reference/experimental.md#native_api)与 [M9 契约](./reference/api.md#主文件条目与-geodata-管理m9)。
 
 **Clash API。** 非空的 `experimental.clash_api.external_controller` 会启用服务器。除非防火墙和非空 `secret` 已提供保护，否则应保持 loopback 绑定；空 secret 会关闭 API 认证。相对 `external_ui` 依次优先使用 `data_dir` 下、`/var/share/honk` 下和工作目录中的已有目录；都不存在时，在 `data_dir` 下下载 dashboard。`external_ui_download_url` 选择 ZIP 来源，`external_ui_download_detour` 强制下载经过指定节点或组；空值分别保留内建 URL 和普通流量路由。
 

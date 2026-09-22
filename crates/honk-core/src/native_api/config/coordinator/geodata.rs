@@ -177,7 +177,13 @@ impl Worker {
             details["committed"] = json!(true);
             return Err(details);
         }
-        Ok(geodata::project(assets, &self.service.settings))
+        let active = self.active.read().await;
+        Ok(geodata::project(
+            assets,
+            &self.service.settings,
+            &active,
+            &self.service,
+        ))
     }
 }
 

@@ -469,7 +469,7 @@ fn connections(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respons
             udp.push(entry.value);
         }
     }
-    Ok(Json(ConnectionList {
+    let response = ConnectionList {
         observed_at: timestamp(SystemTime::now()),
         instance_id: state.instance_id.clone(),
         visibility: "partial",
@@ -478,7 +478,11 @@ fn connections(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Respons
         udp,
         total_tcp,
         total_udp,
-    })
+    };
+    Ok(Json(config::administrative_projection(
+        state,
+        serde_json::json!(response),
+    )?)
     .into_response())
 }
 

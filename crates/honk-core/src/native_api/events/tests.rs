@@ -514,7 +514,7 @@ async fn provider_urls_share_links_and_passwords_never_enter_sse_payloads() {
         ..Default::default()
     };
     let provider =
-        crate::native_api::providers::provider_value(&config, None, subscription.id).unwrap();
+        crate::native_api::providers::provider_value(&config, None, subscription.id, None).unwrap();
     assert_eq!(provider["url_redacted"], subscription.url);
     hub.publish(
         "operation.updated",

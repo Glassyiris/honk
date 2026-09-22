@@ -63,11 +63,11 @@ async fn trace_displays_configured_values_in_compiled_condition_order() {
             .map(|row| row["expression"].as_str().unwrap())
             .collect::<Vec<_>>(),
         [
-            r#"domain(keyword: "example")"#,
-            r#"domain(geosite: "test")"#,
-            r#"dip("192.0.2.0/24", geoip: "test")"#,
-            r#"pname("curl")"#,
-            r#"!dport("53")"#,
+            r#"domain(keyword: example)"#,
+            r#"domain(geosite: test)"#,
+            r#"dip(192.0.2.0/24, geoip: test)"#,
+            r#"pname(curl)"#,
+            r#"!dport(53)"#,
         ]
     );
     assert!(conditions.iter().all(|row| row["result"] == "matched"));
@@ -82,11 +82,11 @@ async fn trace_displays_configured_values_in_compiled_condition_order() {
     assert_eq!(evaluation["rules"][0]["conditions"][2]["result"], "skipped");
     assert_eq!(
         evaluation["rules"][1]["conditions"][0]["expression"],
-        r#"!domain(geosite: "test")"#
+        r#"!domain(geosite: test)"#
     );
     assert_eq!(
         evaluation["rules"][1]["conditions"][1]["expression"],
-        r#"!dip(geoip: "test")"#
+        r#"!dip(geoip: test)"#
     );
     assert_eq!(evaluation["rules"][1]["result"], "matched");
     fixture.shutdown().await;

@@ -296,14 +296,10 @@ fn dictionary_and_trace_share_complete_priority_order_and_redacted_ids() {
             .collect::<Vec<_>>()
     );
     let json = serde_json::to_string(&dictionary).unwrap();
-    for secret in [
-        "credential-secret",
-        "/private",
-        "token",
-        "private-config-label",
-    ] {
-        assert!(!json.contains(secret));
+    for value in ["credential-secret", "/private", "token"] {
+        assert!(json.contains(value));
     }
+    assert!(!json.contains("private-config-label"));
     assert_ne!(
         rule_id("instance", 7, Some(0)),
         rule_id("instance", 8, Some(0))
@@ -652,4 +648,68 @@ fn observed_route_budget_only_truncates_evidence_never_decisions() {
     assert!(observed.rules.is_empty());
     assert!(observed.truncated);
     assert_eq!(router.route(&miss), "fallback");
+}
+
+#[test]
+fn condition_displays_use_dae_values_and_require_context_for_domains() {
+    use crate::routing::{CompiledCondition, CompiledPredicate, IpMatcher};
+    use std::sync::Arc;
+
+    let cases = [
+        (
+            CompiledPredicate::DestinationIp(Arc::new(IpMatcher::new(vec![
+                "10.0.0.0/8".parse().unwrap(),
+                "1.1.1.1/32".parse().unwrap(),
+            ]))),
+            "dip(10.0.0.0/8, 1.1.1.1)",
+        ),
+        (
+            CompiledPredicate::ProcessName(vec!["chrome".into(), "firefox".into()]),
+            "pname(chrome, firefox)",
+        ),
+        (CompiledPredicate::Dscp(vec![1, 2]), "dscp(1, 2)"),
+    ];
+    for (predicate, expected) in cases {
+        let mut condition = CompiledCondition {
+            not: false,
+            predicate,
+        };
+        assert_eq!(
+            native::condition_expression(&condition).as_deref(),
+            Some(expected)
+        );
+        condition.not = true;
+        assert_eq!(
+            native::condition_expression(&condition),
+            Some(format!("!{expected}"))
+        );
+    }
+    let configured = RoutingCondition {
+        domain_suffix: vec!["example.com".into(), "example.net".into()],
+        ..Default::default()
+    };
+    let router = Router::new(&[rule(configured.clone(), "direct", 0)], "block").unwrap();
+    let condition = &router.compiled_routes()[0].conditions[0];
+    assert_eq!(native::condition_expression(condition), None);
+    assert_eq!(native::rule_expression(std::slice::from_ref(condition)), "");
+    assert_eq!(
+        router.condition_expression(condition),
+        "domain(suffix: example.com, suffix: example.net)"
+    );
+    let configured = RoutingCondition {
+        domain: vec!["a.example.com".into()],
+        domain_suffix: vec!["example.com".into()],
+        ..Default::default()
+    };
+    assert_eq!(
+        router.condition_display(condition, &configured),
+        "domain(full: a.example.com, suffix: example.com)"
+    );
+    let oversized = CompiledCondition {
+        not: false,
+        predicate: CompiledPredicate::ProcessName(vec!["x".repeat(600)]),
+    };
+    let display = native::condition_expression(&oversized).unwrap();
+    assert_eq!(display.len(), 512 + '…'.len_utf8());
+    assert!(display.ends_with('…'));
 }

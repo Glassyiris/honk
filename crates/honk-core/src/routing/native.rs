@@ -160,12 +160,63 @@ impl Router {
         let mut separator = "";
         for (prefix, values) in fields {
             for value in *values {
-                write!(display, "{separator}{prefix}{value:?}").unwrap();
+                write!(display, "{separator}{prefix}{value}").unwrap();
                 separator = ", ";
             }
         }
         display.push(')');
         display
+    }
+
+    pub(crate) fn configured_rule_expression(
+        &self,
+        conditions: &[CompiledCondition],
+        configured: &honk_config::routing::RoutingCondition,
+    ) -> String {
+        if conditions.is_empty() {
+            return rule_expression(conditions);
+        }
+        conditions
+            .iter()
+            .map(|condition| self.condition_display(condition, configured))
+            .collect::<Vec<_>>()
+            .join(" && ")
+    }
+
+    pub(crate) fn condition_expression(&self, condition: &CompiledCondition) -> String {
+        let CompiledPredicate::Domain(id) = condition.predicate else {
+            return condition_expression(condition)
+                .expect("non-domain predicate retains its values");
+        };
+        let matcher = &self.domain_matchers[id as usize];
+        let mut expression = format!("{}domain(", if condition.not { "!" } else { "" });
+        for (index, (kind, value)) in matcher.key().alternatives.iter().enumerate() {
+            let kind = match (matcher, kind) {
+                (super::DomainMatcher::Ordinary { .. }, 0) | (_, 3) => "regex",
+                (_, 0) => "full",
+                (_, 1) => "suffix",
+                _ => "keyword",
+            };
+            write!(
+                expression,
+                "{}{kind}: {value}",
+                if index == 0 { "" } else { ", " }
+            )
+            .unwrap();
+            if expression.len() > 512 {
+                return bounded_expression(expression);
+            }
+        }
+        expression.push(')');
+        expression
+    }
+
+    pub(crate) fn rule_expression(&self, conditions: &[CompiledCondition]) -> String {
+        join_expressions(
+            conditions
+                .iter()
+                .map(|condition| self.condition_expression(condition)),
+        )
     }
 
     pub(crate) fn simulate(
@@ -276,36 +327,132 @@ pub(crate) fn missing_input(predicate: &CompiledPredicate) -> &'static str {
     }
 }
 
-pub(crate) fn condition_expression(condition: &CompiledCondition) -> String {
-    let kind = match condition.predicate {
-        CompiledPredicate::Domain(_) => "domain",
-        CompiledPredicate::DestinationIp(_) => "dip",
-        CompiledPredicate::SourceIp(_) => "sip",
-        CompiledPredicate::DestinationPort(_) => "dport",
-        CompiledPredicate::SourcePort(_) => "sport",
-        CompiledPredicate::Protocol(_) => "l4proto",
-        CompiledPredicate::IpVersion(_) => "ipversion",
-        CompiledPredicate::Dscp(_) => "dscp",
-        CompiledPredicate::ProcessName(_) => "pname",
-        CompiledPredicate::Mac(_) => "mac",
+pub(crate) fn condition_expression(condition: &CompiledCondition) -> Option<String> {
+    let ip_display = |net: &ipnet::IpNet| {
+        if net.prefix_len() == if net.addr().is_ipv4() { 32 } else { 128 } {
+            net.addr().to_string()
+        } else {
+            net.to_string()
+        }
     };
-    format!("{}{kind}(<redacted>)", if condition.not { "!" } else { "" })
+    let (kind, values) = match &condition.predicate {
+        CompiledPredicate::Domain(_) => return None,
+        CompiledPredicate::DestinationIp(matcher) => (
+            "dip",
+            matcher
+                .nets()
+                .iter()
+                .map(ip_display)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        CompiledPredicate::SourceIp(matcher) => (
+            "sip",
+            matcher
+                .nets()
+                .iter()
+                .map(ip_display)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        CompiledPredicate::DestinationPort(ports) | CompiledPredicate::SourcePort(ports) => (
+            if matches!(condition.predicate, CompiledPredicate::DestinationPort(_)) {
+                "dport"
+            } else {
+                "sport"
+            },
+            ports
+                .iter()
+                .map(|port| {
+                    if port.start == port.end {
+                        port.start.to_string()
+                    } else {
+                        format!("{}-{}", port.start, port.end)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        CompiledPredicate::Protocol(mask) => (
+            "l4proto",
+            [(1, "tcp"), (2, "udp")]
+                .into_iter()
+                .filter_map(|(bit, name)| (mask & bit != 0).then_some(name))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        CompiledPredicate::IpVersion(mask) => (
+            "ipversion",
+            [(1, "4"), (2, "6")]
+                .into_iter()
+                .filter_map(|(bit, name)| (mask & bit != 0).then_some(name))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        CompiledPredicate::Dscp(values) => (
+            "dscp",
+            values
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        CompiledPredicate::ProcessName(values) => ("pname", values.join(", ")),
+        CompiledPredicate::Mac(values) => (
+            "mac",
+            values
+                .iter()
+                .map(|mac| {
+                    mac.iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(":")
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    };
+    Some(bounded_expression(format!(
+        "{}{kind}({values})",
+        if condition.not { "!" } else { "" }
+    )))
+}
+
+fn bounded_expression(mut expression: String) -> String {
+    if expression.len() > 512 {
+        let mut end = 512;
+        while !expression.is_char_boundary(end) {
+            end -= 1;
+        }
+        expression.truncate(end);
+        expression.push('…');
+    }
+    expression
+}
+
+fn join_expressions(expressions: impl Iterator<Item = String>) -> String {
+    let mut joined = String::new();
+    for expression in expressions {
+        if !joined.is_empty() {
+            joined.push_str(" && ");
+        }
+        joined.push_str(&expression);
+        if joined.len() > 512 {
+            return bounded_expression(joined);
+        }
+    }
+    if joined.is_empty() {
+        "empty rule (never matches)".into()
+    } else {
+        joined
+    }
 }
 
 pub(crate) fn rule_expression(conditions: &[CompiledCondition]) -> String {
-    if conditions.is_empty() {
-        return "empty rule (never matches)".into();
-    }
-    // A dictionary row is a safe display, not an unbounded reproduction of configuration.
-    if conditions.len() > 64 {
-        return format!(
-            "AND({} compiled conditions; values redacted)",
-            conditions.len()
-        );
-    }
     conditions
         .iter()
         .map(condition_expression)
-        .collect::<Vec<_>>()
-        .join(" && ")
+        .collect::<Option<Vec<_>>>()
+        .map(|expressions| join_expressions(expressions.into_iter()))
+        .unwrap_or_default()
 }

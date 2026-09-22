@@ -680,3 +680,58 @@ fn provider_retention_accounts_for_full_url_and_debug_omits_it() {
     );
     assert!(!format!("{row:?}").contains("url-sentinel"));
 }
+
+#[test]
+fn provider_projection_masks_only_listener_values_in_names_and_urls() {
+    let mut config = Config::default();
+    config.experimental.native_api.secret = "native-listener-token".into();
+    config.experimental.clash_api.secret = "clash-listener-token".into();
+    let subscription = Subscription {
+        name: "provider-native-listener-token".into(),
+        url: "https://user:password@example.test/path?token=clash-listener-token#fragment".into(),
+        ..Default::default()
+    };
+    let id = subscription.id;
+    config.subscriptions.push(subscription);
+    let value = provider_value(&config, None, id, None).unwrap();
+    assert_eq!(value["name"], "provider-<redacted>");
+    assert_eq!(
+        value["url_redacted"],
+        "https://user:password@example.test/path?token=<redacted>#fragment"
+    );
+}
+
+#[tokio::test]
+async fn refresh_results_keep_full_urls_except_listener_values() {
+    let mut origin = Origin::new().await;
+    let mut subscription = origin.subscription();
+    subscription.name.push_str("-provider-admin-token");
+    let mut config = Config::default();
+    config.experimental.clash_api.secret = "private-query".into();
+    config.subscriptions.push(subscription.clone());
+    let mut fixture = Fixture::start(config, None, Some(OLD), &mut origin).await;
+    let expected_url = subscription.url.replace("private-query", "<redacted>");
+    let expected_name = subscription
+        .name
+        .replace("provider-admin-token", "<redacted>");
+    let before = fixture
+        .get(&format!("/api/v1/providers/{}", subscription.id))
+        .await;
+    assert_eq!(before["url_redacted"], expected_url);
+    assert_eq!(before["name"], expected_name);
+    let accepted: Value = fixture
+        .refresh(subscription.id, "masked-refresh")
+        .await
+        .json()
+        .await
+        .unwrap();
+    respond(origin.next().await, NEW).await;
+    fixture.publish().await;
+    let terminal = fixture.terminal(&accepted).await;
+    assert_eq!(terminal["status"], "succeeded");
+    assert_eq!(terminal["result"]["id"], subscription.id.to_string());
+    assert_eq!(terminal["result"]["url_redacted"], expected_url);
+    assert_eq!(terminal["result"]["name"], expected_name);
+    fixture.stop().await;
+    origin.stop().await;
+}
