@@ -637,9 +637,7 @@ fn load_operator_config_captured(
         Err(captured_error) => {
             diagnostics.truncate(start);
             let config = load_operator_config(path.to_str().unwrap_or(""), diagnostics)?;
-            if config.experimental.native_api.config_content
-                || config.experimental.native_api.config_write
-            {
+            if config.experimental.native_api.config_write {
                 return Err(captured_error);
             }
             return Ok((config, None));
@@ -698,9 +696,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         let mut config = {
             let (config, sources) = load_operator_config_captured(&cli.config, &mut diagnostics)?;
             anyhow::ensure!(
-                sources.is_some()
-                    || !(config.experimental.native_api.config_content
-                        || config.experimental.native_api.config_write),
+                sources.is_some() || !config.experimental.native_api.config_write,
                 "native configuration administration requires a dae source file"
             );
             native_sources = sources;

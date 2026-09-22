@@ -15,11 +15,14 @@ async fn rule_details_use_accepted_expressions_without_exposing_source_content()
             .as_array()
             .unwrap()
             .iter()
-            .all(|source| { source.get("content").is_none() && source["writable"] == false })
+            .all(|source| { source["content"].is_string() && source["writable"] == false })
     );
     let before = fixture.get("/api/v1/rules").await;
-    assert_eq!(before["rules"][0]["expression"], "pname(<redacted>)");
-    assert!(before["rules"][0]["source"].is_null());
+    assert_eq!(
+        before["rules"][0]["expression"],
+        "pname(credential-source-process)"
+    );
+    assert_eq!(before["rules"][0]["source"]["file"], "auth.dae");
     assert_eq!(
         before["rules"][1]["expression"],
         "domain( regex: 'a->b#c') && !dport(53)"
@@ -46,7 +49,6 @@ async fn rule_details_use_accepted_expressions_without_exposing_source_content()
     let encoded = before.to_string();
     for withheld in [
         SECRET,
-        "credential-source-process",
         "private-comment",
         fixture.directory.path().to_str().unwrap(),
     ] {
@@ -66,19 +68,16 @@ async fn rule_details_use_accepted_expressions_without_exposing_source_content()
     assert_eq!(evaluated[1]["rule_id"], before["rules"][1]["rule_id"]);
     assert_eq!(
         evaluated[1]["conditions"][0]["expression"],
-        r#"domain(regex: "a->b#c")"#
+        r#"domain(regex: a->b#c)"#
     );
     assert_eq!(evaluated[1]["conditions"][0]["result"], "not_matched");
-    assert_eq!(
-        evaluated[1]["conditions"][1]["expression"],
-        r#"!dport("53")"#
-    );
+    assert_eq!(evaluated[1]["conditions"][1]["expression"], r#"!dport(53)"#);
     assert_eq!(evaluated[1]["conditions"][1]["result"], "skipped");
     assert_eq!(
         evaluated[0]["conditions"][0]["expression"],
-        "pname(<redacted>)"
+        "pname(credential-source-process)"
     );
-    for withheld in [SECRET, "credential-source-process", "private-comment"] {
+    for withheld in [SECRET, "private-comment"] {
         assert!(!traced.to_string().contains(withheld));
     }
 
@@ -116,7 +115,7 @@ async fn rule_details_use_accepted_expressions_without_exposing_source_content()
     );
     assert_eq!(
         traced_after["evaluations"][0]["rules"][1]["conditions"][1]["expression"],
-        r#"!dport("853")"#
+        r#"!dport(853)"#
     );
     fixture.shutdown().await;
 }

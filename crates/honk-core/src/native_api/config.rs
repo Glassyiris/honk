@@ -18,7 +18,7 @@ use honk_config::{
     Config,
     diagnostic::{DetailedDiagnostic, Severity},
     experimental::NativeApiConfig,
-    parser::SourceSnapshot,
+    parser::{SourceSnapshot, cursor::Document, lexer::Source},
 };
 use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
@@ -31,6 +31,192 @@ use crate::configuration::{
     Accepted, AcceptedSources, MAX_SOURCE_BYTES, MAX_SOURCES, SourceUpdate, limits,
     same_dependencies,
 };
+
+pub(crate) struct ListenerSecrets<'a> {
+    values: Vec<&'a str>,
+}
+
+impl<'a> ListenerSecrets<'a> {
+    pub(crate) fn new(sources: &'a [SourceSnapshot], native_secret: &'a str) -> Self {
+        let mut values = Vec::new();
+        if !native_secret.is_empty() {
+            values.push(native_secret);
+        }
+        for source in sources.iter().filter(|source| source.contains_api_secret) {
+            let Ok(document) = Document::parse(
+                Source::new(&source.content, source.source.clone()),
+                &mut Vec::new(),
+            ) else {
+                if !source.content.is_empty() {
+                    values.push(source.content.as_ref());
+                }
+                continue;
+            };
+            for field in document
+                .sections()
+                .filter(|root| root.header() == "experimental")
+                .filter_map(|root| root.body())
+                .flatten()
+                .filter(|section| matches!(section.header().trim(), "native_api" | "clash_api"))
+                .filter_map(|section| section.body())
+                .flatten()
+            {
+                let span = field.header_span();
+                let Some((key, value)) = source.content[span.start..span.end].split_once(':')
+                else {
+                    continue;
+                };
+                if key.trim() != "secret" {
+                    continue;
+                }
+                let value = value.trim();
+                let start = span.start + source.content[span.start..span.end].trim_end().len()
+                    - value.len();
+                let end = start + value.len();
+                let quoted = document
+                    .tokens()
+                    .iter()
+                    .flat_map(|token| &token.quoted)
+                    .any(|quote| quote.start == start && quote.end == end);
+                let value = if quoted {
+                    &source.content[start + 1..end - 1]
+                } else {
+                    value
+                };
+                if !value.is_empty() {
+                    values.push(value);
+                }
+            }
+        }
+        values.sort_unstable();
+        values.dedup();
+        Self { values }
+    }
+
+    pub(crate) fn from_config(config: &'a Config) -> Self {
+        Self::new(&[], &config.experimental.native_api.secret)
+            .with_clash(&config.experimental.clash_api.secret)
+    }
+
+    pub(crate) fn with_clash(mut self, secret: &'a str) -> Self {
+        if !secret.is_empty() && !self.values.contains(&secret) {
+            self.values.push(secret);
+        }
+        self
+    }
+
+    fn spellings(&self) -> impl Iterator<Item = std::borrow::Cow<'_, str>> {
+        self.values.iter().flat_map(|value| {
+            let quoted = serde_json::to_string(value).expect("listener secret is a string");
+            [
+                std::borrow::Cow::Borrowed(*value),
+                std::borrow::Cow::Owned(quoted[1..quoted.len() - 1].to_owned()),
+            ]
+        })
+    }
+
+    fn contains(&self, text: &str) -> bool {
+        self.spellings().any(|value| text.contains(value.as_ref()))
+    }
+
+    pub(crate) fn mask(&self, text: &str) -> (String, bool) {
+        if !self.contains(text) {
+            return (text.to_owned(), false);
+        }
+        let mut hidden = vec![false; text.len()];
+        for secret in self.spellings() {
+            let mut offset = 0;
+            while let Some(relative) = text[offset..].find(secret.as_ref()) {
+                let start = offset + relative;
+                hidden[start..start + secret.len()].fill(true);
+                offset = start + text[start..].chars().next().unwrap().len_utf8();
+            }
+        }
+        let mut masked = String::new();
+        let mut hiding = false;
+        for (index, character) in text.char_indices() {
+            if hidden[index] {
+                if !hiding {
+                    masked.push_str("<redacted>");
+                }
+                if matches!(character, '\r' | '\n') {
+                    masked.push(character);
+                }
+            } else {
+                masked.push(character);
+            }
+            hiding = hidden[index];
+        }
+        (masked, true)
+    }
+
+    fn mask_display(&self, value: &mut Value) -> bool {
+        let Some(text) = value.as_str() else {
+            return false;
+        };
+        let (masked, changed) = self.mask(text);
+        *value = json!(masked);
+        changed
+    }
+
+    fn mask_value(&self, value: &mut Value) -> bool {
+        let masked = match value {
+            Value::Array(values) => values
+                .iter_mut()
+                .fold(false, |masked, value| self.mask_value(value) | masked),
+            Value::Object(values) => values.iter_mut().fold(false, |masked, (key, value)| {
+                let changed = if matches!(
+                    key.as_str(),
+                    "expression"
+                        | "rule_expression"
+                        | "domain"
+                        | "pname"
+                        | "src_mac"
+                        | "outbound"
+                        | "routed_outbound"
+                        | "effective_outbound"
+                        | "leaf_node_name"
+                        | "member_name"
+                        | "target"
+                        | "name"
+                        | "from_upstream"
+                        | "upstream"
+                        | "file"
+                        | "path"
+                        | "absolute_path"
+                        | "url_redacted"
+                        | "source_redacted"
+                ) {
+                    self.mask_display(value)
+                } else if key == "chain"
+                    && let Some(chain) = value.as_array_mut()
+                {
+                    chain
+                        .iter_mut()
+                        .fold(false, |masked, value| self.mask_display(value) | masked)
+                } else {
+                    self.mask_value(value)
+                };
+                changed | masked
+            }),
+            _ => false,
+        };
+        if masked && let Some(object) = value.as_object_mut() {
+            if object.contains_key("trace_status") {
+                object.insert("trace_status".into(), json!("partial"));
+            }
+            if let Some(trace) = object.get_mut("trace").and_then(Value::as_object_mut) {
+                trace.insert("status".into(), json!("partial"));
+                if let Some(missing) = trace.get_mut("missing").and_then(Value::as_array_mut)
+                    && !missing.contains(&json!("redacted"))
+                {
+                    missing.push(json!("redacted"));
+                }
+            }
+        }
+        masked
+    }
+}
 
 fn source_path(accepted: &Accepted, index: usize) -> &Path {
     let root = accepted.update.sources[0]
@@ -162,7 +348,7 @@ impl ConfigService {
         })
     }
     pub(crate) fn content_enabled(&self) -> bool {
-        self.sources.available() && self.settings.config_content && !self.settings.secret.is_empty()
+        self.sources.available()
     }
     pub(crate) fn running(&self) -> bool {
         self.sources.available() && self.sender.lock().is_some()
@@ -183,31 +369,31 @@ impl ConfigService {
         self.last_reload.read().clone()
     }
 
-    fn credential_source(&self, source: &SourceSnapshot) -> bool {
-        source.contains_api_secret
-            || (!self.settings.secret.is_empty() && source.content.contains(&self.settings.secret))
+    pub(crate) fn mask_text(&self, text: &str) -> (String, bool) {
+        let guard = self.sources.accepted.read();
+        let sources = guard
+            .as_ref()
+            .map(|accepted| accepted.update.sources.as_slice())
+            .unwrap_or(&[]);
+        ListenerSecrets::new(sources, &self.settings.secret).mask(text)
     }
 
     fn source_writable(&self, accepted: &Accepted, index: usize) -> bool {
-        if !self.settings.config_write
-            || self.settings.secret.is_empty()
-            || self.credential_source(&accepted.update.sources[index])
-        {
-            return false;
-        }
-        if index == 0 {
-            return true;
-        }
-        let Some(root) = accepted.update.sources[0].path.parent() else {
-            return false;
-        };
-        let Ok(relative) = accepted.update.sources[index].path.strip_prefix(root) else {
-            return false;
-        };
-        self.settings
-            .writable_includes
-            .iter()
-            .any(|path| Path::new(path) == relative)
+        let secrets = ListenerSecrets::new(&accepted.update.sources, &self.settings.secret);
+        self.source_writable_with_secrets(accepted, index, &secrets)
+    }
+
+    fn source_writable_with_secrets(
+        &self,
+        accepted: &Accepted,
+        index: usize,
+        secrets: &ListenerSecrets<'_>,
+    ) -> bool {
+        let source = &accepted.update.sources[index];
+        self.settings.config_write
+            && !self.settings.secret.is_empty()
+            && !source.contains_api_secret
+            && !secrets.contains(&source.content)
     }
 
     pub(crate) fn group_writable(&self, name: &str) -> bool {
@@ -251,42 +437,53 @@ impl ConfigService {
             None => accepted.rule_sources.fallback.as_ref()?,
         };
         let source = &accepted.update.sources[location.source_index];
-        if self.credential_source(source) {
-            return None;
-        }
+        let secrets = ListenerSecrets::new(&accepted.update.sources, &self.settings.secret);
+        let mut location = location.clone();
+        location.expression = secrets.mask(&location.expression).0;
         Some((
             accepted.ids[&source.path].clone(),
-            source_path(accepted, location.source_index)
-                .to_string_lossy()
-                .into_owned(),
-            location.clone(),
+            secrets
+                .mask(&source_path(accepted, location.source_index).to_string_lossy())
+                .0,
+            location,
         ))
     }
 
-    fn source_value(&self, accepted: &Accepted, index: usize) -> Value {
+    fn source_value(
+        &self,
+        accepted: &Accepted,
+        index: usize,
+        secrets: &ListenerSecrets<'_>,
+    ) -> (Value, bool) {
         let source = &accepted.update.sources[index];
-        let mut value = json!({
-            "id":accepted.ids[&source.path], "path":source_path(accepted, index).to_string_lossy(), "kind":if index==0 {"main"} else {"include"},
+        let (content, redacted) = secrets.mask(&source.content);
+        let (path, path_redacted) = secrets.mask(&source_path(accepted, index).to_string_lossy());
+        let (absolute_path, absolute_redacted) = secrets.mask(&source.path.to_string_lossy());
+        let value = json!({
+            "id":accepted.ids[&source.path], "path":path,
+            "absolute_path":absolute_path, "kind":if index==0 {"main"} else {"include"},
             "content_sha256":accepted.hashes[index], "bytes":source.content.len(),
-            "writable":self.source_writable(accepted,index), "loaded_at":timestamp(accepted.accepted_at),
-            "line_count":source.content.lines().count(),
+            "writable":self.source_writable_with_secrets(accepted,index,secrets), "loaded_at":timestamp(accepted.accepted_at),
+            "line_count":source.content.lines().count(), "content":content,
         });
-        if self.settings.config_content
-            && !self.settings.secret.is_empty()
-            && !self.credential_source(source)
-        {
-            value["content"] = json!(source.content.as_ref());
-        }
-        value
+        (value, redacted || path_redacted || absolute_redacted)
     }
 
     pub(crate) fn snapshot(&self) -> Option<Value> {
         let guard = self.sources.accepted.read();
         let accepted = guard.as_ref()?;
+        let secrets = ListenerSecrets::new(&accepted.update.sources, &self.settings.secret);
+        let mut secrets_redacted = false;
+        let sources = (0..accepted.update.sources.len())
+            .map(|index| {
+                let (value, redacted) = self.source_value(accepted, index, &secrets);
+                secrets_redacted |= redacted;
+                value
+            })
+            .collect::<Vec<_>>();
         Some(
             json!({"generation_id":format!("{}:{}",self.instance_id,accepted.generation),"revision":accepted.revision,
-            "sources":(0..accepted.update.sources.len()).map(|index| self.source_value(accepted,index)).collect::<Vec<_>>(),
-            "diagnostics":[],"secrets_redacted":true}),
+            "sources":sources,"diagnostics":[],"secrets_redacted":secrets_redacted}),
         )
     }
 
@@ -476,6 +673,8 @@ fn principal(state: &NativeState) -> &'static str {
 #[serde(deny_unknown_fields)]
 struct Replacement {
     content: String,
+    #[serde(default, rename = "secrets_redacted")]
+    _secrets_redacted: Option<bool>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -483,12 +682,31 @@ struct ValidationSource {
     id: Option<String>,
     path: Option<String>,
     content: String,
+    #[serde(default, rename = "secrets_redacted")]
+    _secrets_redacted: Option<bool>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ValidationRequest {
     sources: Vec<ValidationSource>,
     mode: String,
+    #[serde(default, rename = "secrets_redacted")]
+    _secrets_redacted: Option<bool>,
+}
+
+pub(super) fn administrative_projection(
+    state: &NativeState,
+    mut value: Value,
+) -> Result<Value, ApiError> {
+    let accepted = state.observation.configuration.sources.accepted.read();
+    let sources = accepted
+        .as_ref()
+        .map(|accepted| accepted.update.sources.as_slice())
+        .unwrap_or(&[]);
+    let secrets =
+        ListenerSecrets::new(sources, &state.settings.secret).with_clash(&state.clash_secret);
+    secrets.mask_value(&mut value);
+    Ok(value)
 }
 
 pub(super) async fn get(
@@ -546,11 +764,13 @@ pub(super) async fn source(
         .iter()
         .position(|source| accepted.ids[&source.path] == source_id)
         .ok_or_else(not_found)?;
+    let secrets = ListenerSecrets::new(&accepted.update.sources, &state.settings.secret);
     Ok(Json(
         state
             .observation
             .configuration
-            .source_value(accepted, index),
+            .source_value(accepted, index, &secrets)
+            .0,
     )
     .into_response())
 }

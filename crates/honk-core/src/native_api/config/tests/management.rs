@@ -546,7 +546,8 @@ async fn managed_provider_stays_unfetched_until_explicit_refresh_and_deletes_its
     assert_eq!(provider["node_count"], 0);
     assert_eq!(provider["status"], "stale");
     assert!(provider["updated_at"].is_null());
-    assert!(!provider.to_string().contains("private-provider-token"));
+    assert_eq!(provider["url_redacted"], url);
+    assert_eq!(provider["name"], "managed-provider");
     assert_eq!(fixture.get(&path).await, provider);
     let after = fixture.get(CONFIG).await;
     assert_ne!(after["revision"], before["revision"]);

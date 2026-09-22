@@ -237,16 +237,15 @@ async fn evaluate_current(
             .zip(order)
         {
             check_deadline(deadline, id)?;
-            let Some((_, _, source)) = state
+            evaluated.expression = state
                 .observation
                 .configuration
                 .rule_source(Some(source_index))
-            else {
-                continue;
-            };
-            if !source.expression.is_empty() {
-                evaluated.expression = source.expression;
-            }
+                .map(|(_, _, source)| source.expression)
+                .filter(|expression| !expression.is_empty())
+                .unwrap_or_else(|| {
+                    router.configured_rule_expression(&compiled.conditions, &configured.condition)
+                });
             for (condition, compiled) in evaluated.conditions.iter_mut().zip(&compiled.conditions) {
                 check_deadline(deadline, id)?;
                 condition.expression = router.condition_display(compiled, &configured.condition);
@@ -308,14 +307,18 @@ pub(super) async fn trace(
         ));
     }
     let (evaluation, generation) = evaluate_current(state, &request.input, deadline, id).await?;
-    Ok(Json(RoutingTraceResponse {
+    let response = RoutingTraceResponse {
         mode: "simulation",
         instance_id: state.instance_id.clone(),
         generation_id: format!("{}:{generation}", state.instance_id),
         observed_at: timestamp(SystemTime::now()),
         evaluations: vec![evaluation],
         dns: Vec::new(),
-    })
+    };
+    Ok(Json(super::config::administrative_projection(
+        state,
+        json!(response),
+    )?)
     .into_response())
 }
 
@@ -349,12 +352,16 @@ pub(super) async fn rules(
             };
         let mut order: Vec<_> = config.routing.rules.iter().enumerate().collect();
         order.sort_by_key(|(_, rule)| rule.priority);
-        for (rule, (source_index, _)) in result
+        for (rule, (source_index, configured)) in result
             .rules
             .iter_mut()
             .filter(|rule| rule.kind == "rule")
             .zip(order)
         {
+            if let Some(compiled) = router.compiled_routes().get(rule.index) {
+                rule.expression =
+                    router.configured_rule_expression(&compiled.conditions, &configured.condition);
+            }
             if let Some((source, expression)) = source(Some(source_index)) {
                 rule.source = Some(source);
                 if !expression.is_empty() {
@@ -370,7 +377,11 @@ pub(super) async fn rules(
     })
     .await
     .map_err(|_| unavailable(id))??;
-    Ok(Json(result).into_response())
+    Ok(Json(super::config::administrative_projection(
+        state,
+        json!(result),
+    )?)
+    .into_response())
 }
 
 fn dictionary(
@@ -395,7 +406,7 @@ fn dictionary(
         rules.push(RoutingRule {
             rule_id: rule_id(instance, generation, Some(rule.id)),
             index,
-            expression: native::rule_expression(&rule.conditions),
+            expression: rule.expression.clone(),
             outbound: rule.outbound.clone(),
             must: rule.must,
             source: None,
@@ -517,7 +528,7 @@ fn rule_evaluation(
     RuleEvaluation {
         rule_id,
         expression: compiled
-            .map(|rule| native::rule_expression(&rule.conditions))
+            .map(|rule| rule.expression.clone())
             .unwrap_or_else(|| "fallback".into()),
         result: result_name(evaluated.result),
         missing_inputs: missing,

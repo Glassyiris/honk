@@ -475,11 +475,12 @@ fn trace_bounds_keep_terminal_state_and_explicit_loss_without_private_errors() {
         detail["trace"]["steps"].as_array().unwrap().len(),
         MAX_STEPS
     );
-    assert_eq!(
-        detail["trace"]["missing"],
-        json!(["buffer_overflow", "redacted"])
+    assert_eq!(detail["trace"]["missing"], json!(["buffer_overflow"]));
+    assert!(
+        detail
+            .to_string()
+            .contains("https://operator:credential@example.test")
     );
-    assert!(!detail.to_string().contains("credential"));
 }
 
 #[test]
@@ -615,13 +616,10 @@ fn optional_display_redaction_preserves_attempt_transitions_and_selection_ids() 
         assert_eq!(data["leaf_node_id"], "node-1");
         assert_eq!(data["selection_path"][0]["group_id"], "group-1");
         assert_eq!(data["selection_path"][0]["member_id"], "node-1");
-        assert!(data["selection_path"][0]["member_name"].is_null());
-        assert!(data["routed_outbound"].is_null());
+        assert_eq!(data["selection_path"][0]["member_name"], "HK/Trojan");
+        assert_eq!(data["routed_outbound"], "Group/Proxy");
     }
-    assert_eq!(
-        detail["trace"]["missing"],
-        json!(["not_instrumented", "redacted"])
-    );
+    assert_eq!(detail["trace"]["missing"], json!(["not_instrumented"]));
 }
 
 #[test]
@@ -714,4 +712,115 @@ fn detached_begin_is_empty_without_locking_or_allocating_a_record() {
     assert!(inner.records.is_empty());
     assert_eq!(inner.records.capacity(), 0);
     assert_eq!(inner.record_bytes, 0);
+}
+
+#[test]
+fn captured_url_rule_values_survive_summary_updates_and_new_router_generations() {
+    use crate::native_api::routing::{RuleCondition, RuleEvaluation};
+    let store = store();
+    let flow = begin(&store, "tcp");
+    let expression = r#"pname("/usr/bin/user@host") && domain(regex: "https://example.test/path")"#;
+    let id = "instance:7:rule:0";
+    flow.step(
+        Some(7),
+        StepData::Route {
+            evaluation_id: "evaluation-7".into(),
+            chain: "traffic",
+            plane: "userspace",
+            rule_id: Some(id.into()),
+            outbound: Some("group/name@host".into()),
+            must: None,
+            mark: None,
+            input: Some(record::EvaluationInput::Traffic(record::RouteInput {
+                network: "tcp",
+                src_ip: "127.0.0.1".parse().unwrap(),
+                src_port: 31000,
+                dst_ip: "127.0.0.2".parse().unwrap(),
+                dst_port: 443,
+                domain: None,
+                pname: Some("/usr/bin/user@host".into()),
+                src_mac: None,
+                dscp: None,
+                mark: (),
+                ingress: None,
+                domain_rule_ids: None,
+                domain_fact_bitmap: None,
+                domain_fact_state: None,
+            })),
+            rules: vec![RuleEvaluation {
+                rule_id: id.into(),
+                expression: expression.into(),
+                result: "matched",
+                missing_inputs: vec![],
+                conditions: vec![RuleCondition {
+                    id: format!("{id}/condition:0"),
+                    expression: expression.into(),
+                    result: "matched",
+                    missing_inputs: vec![],
+                }],
+            }],
+            dns_action: None,
+        },
+    );
+    flow.routed(
+        "group/name@host",
+        Some(id),
+        Some("domain(<redacted>)"),
+        "evaluation",
+    );
+    let before = store.get(flow.id(), &request_id()).unwrap();
+    assert_eq!(before["rule_expression"], expression);
+    let later = begin(&store, "tcp");
+    later.routed(
+        "new",
+        Some("instance:8:rule:0"),
+        Some("pname(\"new\")"),
+        "evaluation",
+    );
+    assert_eq!(store.get(flow.id(), &request_id()).unwrap(), before);
+    assert_eq!(
+        before["trace"]["steps"][1]["generation_id"],
+        format!("{}:7", store.instance_id)
+    );
+    assert_eq!(before["trace"]["missing"], json!([]));
+}
+
+#[test]
+fn oversized_utf8_display_is_explicit_capture_loss() {
+    let store = store();
+    let flow = begin(&store, "tcp");
+    let oversized = "界".repeat(MAX_TEXT / 3 + 1);
+    let mut data = dial_mode();
+    if let StepData::DialMode { domain, .. } = &mut data {
+        *domain = Some(oversized.clone());
+    }
+    flow.step(Some(1), data);
+    flow.finish("closed", "relay_finished");
+    let detail = store.get(flow.id(), &request_id()).unwrap();
+    assert_eq!(detail["trace_status"], "partial");
+    assert!(
+        detail["trace"]["missing"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("buffer_overflow"))
+    );
+    assert!(!detail.to_string().contains(&oversized));
+    assert_eq!(detail["state"], "closed");
+}
+
+#[test]
+fn rendered_rule_text_is_not_interpreted_as_an_internal_placeholder() {
+    let store = store();
+    let flow = begin(&store, "tcp");
+    let expression = "pname(unavailable without matcher)";
+    flow.routed(
+        "direct",
+        Some("instance:1:rule:0"),
+        Some(expression),
+        "evaluation",
+    );
+    assert_eq!(
+        store.get(flow.id(), &request_id()).unwrap()["rule_expression"],
+        expression
+    );
 }

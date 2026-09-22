@@ -381,8 +381,9 @@ impl FlowStore {
             if size_of::<StepData>() + data.heap_bytes() > MAX_STEP_BYTES {
                 return record.mark_gap("buffer_overflow");
             }
-            let changed = redacted && !record.redacted;
+            let changed = (redacted && !record.redacted) || (overflow && !record.overflow);
             record.redacted |= redacted;
+            record.overflow |= overflow;
             let previous_count = record.steps.len();
             let pushed = record.push_step(
                 generation.map(|generation| format!("{}:{generation}", self.instance_id)),
@@ -919,13 +920,13 @@ impl FlowGuard {
         };
         store.mutate(&self.id, |record| {
             let mut redacted = record.redacted;
-            let domain = safe_optional(domain, &mut redacted);
-            let pname = safe_optional(pname, &mut redacted);
-            let src_mac = src_mac.filter(|value| {
-                let safe = safe_text(value);
-                redacted |= !safe;
-                safe
-            });
+            let domain = domain
+                .and_then(|value| bounded_display(value, &mut redacted, &mut record.overflow));
+            let pname =
+                pname.and_then(|value| bounded_display(value, &mut redacted, &mut record.overflow));
+            let src_mac = src_mac
+                .as_deref()
+                .and_then(|value| bounded_display(value, &mut redacted, &mut record.overflow));
             let source = source.map(domain_source);
             let dscp = dscp.filter(|value| *value <= 63);
             let input = Input {
@@ -982,16 +983,15 @@ impl FlowGuard {
         };
         store.mutate(&self.id, |record| {
             let mut redacted = record.redacted;
-            let outbound = safe_optional(Some(outbound), &mut redacted);
+            let outbound = bounded_display(outbound, &mut redacted, &mut record.overflow);
             let rule_id = safe_optional(rule_id, &mut redacted);
-            let expression = expression.and_then(|expression| {
-                if record::safe_expression(expression) {
-                    Some(expression.to_owned())
-                } else {
-                    redacted = true;
-                    None
-                }
-            });
+            let expression = if record.summary.rule_id == rule_id && rule_id.is_some() {
+                record.summary.rule_expression.clone()
+            } else {
+                expression.and_then(|expression| {
+                    bounded_display(expression, &mut redacted, &mut record.overflow)
+                })
+            };
             let reason = if record.summary.outbound == outbound {
                 "mode_preserved"
             } else if outbound.as_deref() == Some("direct") {
@@ -1041,9 +1041,15 @@ impl FlowGuard {
             return;
         };
         store.mutate(&self.id, |record| {
-            if chain.len() > MAX_STEPS || chain.iter().any(|part| !safe_text(part)) {
-                return !std::mem::replace(&mut record.redacted, true);
+            if chain.len() > MAX_STEPS {
+                return record.mark_gap("buffer_overflow");
             }
+            let chain = chain
+                .iter()
+                .filter_map(|part| {
+                    bounded_display(part, &mut record.redacted, &mut record.overflow)
+                })
+                .collect::<Vec<_>>();
             if record.summary.chain == chain && record.summary.chain_source == "evaluation" {
                 return false;
             }
@@ -1184,7 +1190,9 @@ pub(super) fn list(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Res
         .flows
         .page(filters, query.get("cursor").map(String::as_str), id)
     {
-        Ok(page) => Ok(Json(page).into_response()),
+        Ok(page) => {
+            Ok(Json(super::config::administrative_projection(state, page)?).into_response())
+        }
         Err(error) => {
             let mut response = error.into_response();
             if response.status() == StatusCode::SERVICE_UNAVAILABLE {
@@ -1204,7 +1212,11 @@ pub(super) fn detail(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     parse_query(uri, &[], id)?;
-    Ok(Json(state.observation.flows.get(flow_id, id)?).into_response())
+    Ok(Json(super::config::administrative_projection(
+        state,
+        state.observation.flows.get(flow_id, id)?,
+    )?)
+    .into_response())
 }
 
 fn snapshot_expired(id: &RequestId) -> ApiError {
@@ -1264,6 +1276,23 @@ fn rule_source(value: &str) -> &'static str {
         "recomputed" | "evaluation" => "recomputed",
         _ => "unknown",
     }
+}
+
+fn display_text(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_TEXT && !value.chars().any(char::is_control)
+}
+
+fn bounded_display(value: &str, redacted: &mut bool, overflow: &mut bool) -> Option<String> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        *redacted = true;
+        return None;
+    }
+    let mut end = value.len().min(MAX_TEXT);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    *overflow |= end < value.len();
+    Some(value[..end].to_owned())
 }
 
 fn safe_text(value: &str) -> bool {

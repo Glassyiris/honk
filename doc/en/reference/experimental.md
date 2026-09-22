@@ -14,13 +14,13 @@ This reference describes the current nested sections under `experimental { ... }
 
 ## `native_api`
 
-Requires the default-on `native-api` Cargo feature; it does not require `clash-api`, and the listener remains default-off. Enabling it without that feature fails startup. All fields are restart-required: SIGHUP rejects changes and preserves the active listener and configuration generation. Unknown fields, nested scalar blocks, malformed booleans, and empty security-list members are errors.
+Requires the default-on `native-api` Cargo feature; it does not require `clash-api`, and the listener remains default-off. Enabling it without that feature fails startup. All effective fields are restart-required: SIGHUP rejects changes and preserves the active listener and configuration generation. Unknown fields, nested scalar blocks, malformed booleans, and empty security-list members are errors.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `false` | Start the independent native listener. |
 | `listen` | `"127.0.0.1:9527"` | Numeric IP plus port 1–65535; no hostname or `:port` shorthand. |
-| `secret` | `""` | Bearer credential, independent of the Clash credential. Required unless explicit anonymous loopback is enabled. |
+| `secret` | `""` | Bearer credential, independent of the Clash credential. Required unless explicit anonymous loopback is enabled; a nonempty value must be at least 8 bytes, because listener secrets are masked by value in API responses. |
 | `allow_anonymous_loopback` | `false` | Permit credential-free requests only when secret is empty and the actual listening IP is loopback. A configured secret always requires authentication. |
 | `allow_origins` | empty list | Additional explicit HTTP(S) origins, without paths, credentials, query, fragment, `null`, or wildcards. |
 | `allowed_hosts` | empty list | Additional explicit HTTP Host authorities, without URL schemes, paths, credentials, or wildcards. Omitted port means 80, not the listener's port. |
@@ -32,9 +32,9 @@ Requires the default-on `native-api` Cargo feature; it does not require `clash-a
 | `record_dns_log` | `true` | Permit completed client DNS history under the API client-attachment rule or an explicit runtime pin, bounded to 512 records and 8 MiB. `false` prohibits history; configuration changes require restart. |
 | `probe_allowed_cidrs` | empty list | Explicit IP CIDRs authorizing otherwise restricted resolved probe targets and proxy-server addresses. Empty denies restricted addresses, including loopback/private/link-local ranges. |
 | `probe_allowed_ports` | empty list | Additional ports 1–65535 for configured HTTP/DNS probe targets. Defaults permit HTTP 80, HTTPS 443 and DNS 53; raw TCP probes use only the node's configured server port. CIDR authorization remains independently required. |
-| `config_content` | `false` | Allow authenticated administrators to read exact accepted source text, excluding entire API-credential-bearing sources. Requires a nonempty `secret`. |
-| `config_write` | `false` | Allow whole-source replacement and reload for the accepted main file and explicitly authorized includes, excluding API-credential-bearing sources. Requires a nonempty `secret`. |
-| `writable_includes` | empty list | Explicit canonical entry-directory-relative `.dae` paths, such as `'parts/routing.dae'`; only already accepted includes qualify. No absolute paths, traversal or globs; ignored for write permission unless `config_write` is true. |
+| `config_content` | `false` | Accepted for compatibility and ignored. Authenticated source reads require a nonempty `secret` and mask only listener-secret values. |
+| `config_write` | `false` | Allow whole-source replacement and reload for the accepted main file and all accepted includes, excluding listener-credential-bearing sources. Requires a nonempty `secret`. |
+| `writable_includes` | empty list | Accepted for compatibility and ignored; it grants no path authority and does not restrict accepted includes. |
 | `geosite_download_url` | `""` | Final direct HTTP(S) source for updating the loaded geosite asset. Requires `config_write`; empty disables updates when geosite is loaded. |
 | `geoip_download_url` | `""` | Final direct HTTP(S) source for updating the loaded geoip asset, with the same authorization and bounds. |
 
@@ -66,9 +66,9 @@ Geodata sources are administrator-controlled, restart-required and cannot be cha
 
 Traffic and memory histories share the existing one-second sampler; missing samples/measurements remain gaps/nulls rather than zero-filled or interpolated points. Memory is actual process RSS and available cgroup-v2 data, not kernel accounting. File settings remain restart-required. `PATCH /api/v1/runtime/settings` can transiently adjust the supported log/DNS-log/flow limits and native log level, but cannot enable a disabled recorder. Accepted explicit activation, including no-op, restores configured values; provider/network refresh and suspend/resume preserve overrides.
 
-Configuration metadata, validation and reload operations require a genuine `.dae` source snapshot captured at startup; programmatic configs and compatibility serde loaders do not supply one. Content and write permission are independent opt-ins. Exact disclosed text may contain sensitive configuration: it is not a sandboxed or generally redacted save payload. Entire API-credential-bearing sources are omitted from content and stay read-only; metadata paths show canonical entry-directory-relative names. Move credentials to a dedicated read-only include locally if the main source must be editable. The API cannot change/move API credentials or alter native settings; those require a local edit and restart.
+Configuration metadata, validation and reload operations require a genuine `.dae` source snapshot captured at startup; programmatic configs and compatibility serde loaders do not supply one. Configuration reads expose accepted content, masking only declared listener-secret values, including duplicate/overridden values and their other occurrences. Admitted anonymous loopback requests read the same data as bearer-authenticated requests. Credential-bearing sources stay read-only and retain original-byte hashes. Source `path` stays entry-directory-relative; `absolute_path` exposes the canonical absolute path. Move credentials to a dedicated read-only include locally if the main source must be editable. The API cannot change/move API credentials or alter native settings; those require a local edit and restart.
 
-For example, `writable_includes: 'parts/routing.dae', 'parts/groups.dae'` authorizes only those accepted canonical paths when writing is enabled; it does not change ordinary `include` glob or no-match semantics. Save by opaque source ID with a strong disk-content SHA-256 `If-Match`, then follow the real reload operation. A successful write is not activation success, and externally uncoordinated editors can still race the final check/rename window. Restricted Group PATCH uses the same source transaction but requires the accepted group/config ETag, checked before writing and again before activation; that revision is not the disk hash. See [source safety and failure semantics](./api.md#accepted-configuration-and-reload-operations-m6).
+`config_content` and `writable_includes` are accepted and ignored. With `config_write: true`, all accepted noncredential includes are writable; ordinary `include` glob and no-match semantics remain unchanged. Save by opaque source ID with a strong disk-content SHA-256 `If-Match`, then follow the real reload operation. A successful write is not activation success, and externally uncoordinated editors can still race the final check/rename window. Restricted Group PATCH uses the same source transaction but requires the accepted group/config ETag, checked before writing and again before activation; that revision is not the disk hash. See [source safety and failure semantics](./api.md#accepted-configuration-and-reload-operations-m6).
 
 Probe requests cannot supply URLs or allowlist exceptions. For an intentionally local test target, an administrator might set `probe_allowed_cidrs: '127.0.0.1/32'` and `probe_allowed_ports: '18080'`; authorize only the necessary destinations/ports. Resolution checks and address pinning still apply. Native source writes cannot change these allowlists.
 
@@ -80,7 +80,7 @@ Probe requests cannot supply URLs or allowlist exceptions. For an intentionally 
 | `external_ui` | `""` | External dashboard directory. An empty value disables dashboard serving and download. |
 | `external_ui_download_url` | `""` | HTTP(S) dashboard ZIP URL. An empty value uses the built-in zashboard URL. |
 | `external_ui_download_detour` | `""` | Node or group tag used for the download. An empty value follows normal traffic routing. |
-| `secret` | `""` | API authentication secret. An empty value disables authentication. |
+| `secret` | `""` | API authentication secret. An empty value disables authentication. While the native API is enabled a nonempty value must be at least 8 bytes. |
 | `default_mode` | `"Rule"` | Startup mode when native API is disabled: `Rule`, `Global`, or `Direct`; a valid cached mode takes precedence. Native-enabled startup uses shared transient rule mode instead. |
 
 All `clash_api` fields are startup-owned. SIGHUP rejects a candidate configuration that changes any of them.

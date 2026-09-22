@@ -47,6 +47,9 @@ pub struct CompiledRoute {
     /// A matching configured must rule is terminal.
     pub must: bool,
     pub mark: u32,
+    /// The configured conditions as dae text, bounded; rendered once here so
+    /// every API projection shows the same spelling without touching matchers.
+    pub expression: String,
 }
 
 impl CompiledRoute {
@@ -434,7 +437,15 @@ impl Router {
                 outbound,
                 must: rule.must || outbound_must,
                 mark: rule.mark,
+                expression: String::new(),
             });
+        }
+        for route in &mut compiled {
+            route.expression = native::configured_rule_expression(
+                &registry.0,
+                &route.conditions,
+                &rules[route.id as usize].condition,
+            );
         }
 
         // `sort_by_key` is stable, so equal priorities retain source order.

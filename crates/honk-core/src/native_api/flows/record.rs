@@ -10,7 +10,7 @@ use honk_config::types::DialMode;
 use honk_outbound::runtime::flow_observation::DnsLookup;
 use serde::Serialize;
 
-use super::{MAX_RULE_VALUES, MAX_STEPS, safe_text};
+use super::{MAX_RULE_VALUES, MAX_STEPS, display_text, safe_text};
 use crate::native_api::routing::RuleEvaluation;
 
 #[derive(Clone, Serialize)]
@@ -74,9 +74,9 @@ impl Input {
         optional_bytes([&self.domain, &self.src_mac])
     }
 
-    fn redact(&mut self, redacted: &mut bool) {
-        redact_display(&mut self.domain, redacted);
-        redact_display(&mut self.src_mac, redacted);
+    fn redact(&mut self, redacted: &mut bool, overflow: &mut bool) {
+        redact_display(&mut self.domain, redacted, overflow);
+        redact_display(&mut self.src_mac, redacted, overflow);
     }
 }
 
@@ -406,8 +406,8 @@ impl StepData {
     pub(super) fn sanitize(&mut self, redacted: &mut bool, overflow: &mut bool) -> bool {
         match self {
             Self::Input { values, source } => {
-                values.input.redact(redacted);
-                redact_display(&mut values.pname, redacted);
+                values.input.redact(redacted, overflow);
+                redact_display(&mut values.pname, redacted, overflow);
                 safe_text(source) && values.input.domain_source.is_none_or(safe_text)
             }
             Self::Route {
@@ -421,16 +421,16 @@ impl StepData {
                 dns_action,
                 ..
             } => {
-                redact_display(outbound, redacted);
+                redact_display(outbound, redacted, overflow);
                 if !sanitize_rules(rules, redacted, overflow) {
                     return false;
                 }
                 if let Some(input) = input {
                     match input {
                         EvaluationInput::Traffic(input) => {
-                            redact_display(&mut input.domain, redacted);
-                            redact_display(&mut input.pname, redacted);
-                            redact_display(&mut input.src_mac, redacted);
+                            redact_display(&mut input.domain, redacted, overflow);
+                            redact_display(&mut input.pname, redacted, overflow);
+                            redact_display(&mut input.src_mac, redacted, overflow);
                             if !safe_text(input.network) {
                                 return false;
                             }
@@ -445,18 +445,25 @@ impl StepData {
                             }
                         }
                         EvaluationInput::DnsRequest(input) => {
-                            if !safe_text(&input.name) || !safe_text(&input.qtype) {
+                            input.name = super::bounded_display(&input.name, redacted, overflow)
+                                .unwrap_or_default();
+                            if !display_text(&input.name) || !safe_text(&input.qtype) {
                                 return false;
                             }
                         }
                         EvaluationInput::DnsResponse(input) => {
+                            input.name = super::bounded_display(&input.name, redacted, overflow)
+                                .unwrap_or_default();
+                            input.from_upstream =
+                                super::bounded_display(&input.from_upstream, redacted, overflow)
+                                    .unwrap_or_default();
                             if input.answer_ips.len() > MAX_RULE_VALUES {
                                 *overflow = true;
                                 return false;
                             }
-                            if ![input.name.as_str(), &input.qtype, &input.from_upstream]
-                                .into_iter()
-                                .all(safe_text)
+                            if !display_text(&input.name)
+                                || !safe_text(&input.qtype)
+                                || !display_text(&input.from_upstream)
                             {
                                 return false;
                             }
@@ -481,10 +488,18 @@ impl StepData {
                     *overflow = true;
                     return false;
                 }
-                redact_display(&mut data.upstream, redacted);
-                redact_display(&mut data.cache_entry_id, redacted);
+                redact_display(&mut data.upstream, redacted, overflow);
+                data.name =
+                    super::bounded_display(&data.name, redacted, overflow).unwrap_or_default();
+                if data
+                    .cache_entry_id
+                    .as_deref()
+                    .is_some_and(|value| !safe_text(value))
+                {
+                    data.cache_entry_id = None;
+                    *redacted = true;
+                }
                 [
-                    data.name.as_str(),
                     &data.qtype,
                     data.purpose,
                     data.source,
@@ -493,6 +508,7 @@ impl StepData {
                 ]
                 .into_iter()
                 .all(safe_text)
+                    && display_text(&data.name)
                     && data.route_evaluation_ids.iter().all(|id| safe_text(id))
                     && data.upstream_transport.is_none_or(safe_text)
                     && data.carrier_transport.is_none_or(safe_text)
@@ -512,7 +528,7 @@ impl StepData {
                 reason,
                 ..
             } => {
-                redact_display(domain, redacted);
+                redact_display(domain, redacted, overflow);
                 [*effective_target, *verification, *reason]
                     .into_iter()
                     .all(safe_text)
@@ -540,7 +556,7 @@ impl StepData {
                     &mut attempt.leaf_node_name,
                     &mut attempt.target,
                 ] {
-                    redact_display(display, redacted);
+                    redact_display(display, redacted, overflow);
                 }
                 sanitize_selections(&mut attempt.selection_path, redacted, overflow)
                     && [
@@ -592,10 +608,7 @@ fn safe_reference(value: &str) -> bool {
 }
 
 pub(super) fn safe_expression(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= super::MAX_TEXT
-        && !value.chars().any(|c| c.is_control() || c == '@')
-        && !value.contains("://")
+    display_text(value)
 }
 
 fn sanitize_rules(rules: &mut [RuleEvaluation], redacted: &mut bool, overflow: &mut bool) -> bool {
@@ -615,10 +628,8 @@ fn sanitize_rules(rules: &mut [RuleEvaluation], redacted: &mut bool, overflow: &
         {
             return false;
         }
-        if !safe_expression(&rule.expression) {
-            rule.expression.clear();
-            *redacted = true;
-        }
+        rule.expression =
+            super::bounded_display(&rule.expression, redacted, overflow).unwrap_or_default();
         for condition in &mut rule.conditions {
             if !safe_reference(&condition.id)
                 || !safe_rule_result(condition.result)
@@ -629,10 +640,9 @@ fn sanitize_rules(rules: &mut [RuleEvaluation], redacted: &mut bool, overflow: &
             {
                 return false;
             }
-            if !safe_expression(&condition.expression) {
-                condition.expression.clear();
-                *redacted = true;
-            }
+            condition.expression =
+                super::bounded_display(&condition.expression, redacted, overflow)
+                    .unwrap_or_default();
         }
     }
     true
@@ -662,7 +672,7 @@ fn sanitize_selections(
         return false;
     }
     for row in selections {
-        redact_display(&mut row.member_name, redacted);
+        redact_display(&mut row.member_name, redacted, overflow);
         if ![row.group_id.as_str(), row.policy, row.reason]
             .into_iter()
             .all(safe_text)
@@ -686,8 +696,8 @@ fn sanitize_selections(
                 return false;
             }
             for candidate in &mut selection.candidates {
-                redact_display(&mut candidate.member_name, redacted);
-                redact_display(&mut candidate.leaf_node_name, redacted);
+                redact_display(&mut candidate.member_name, redacted, overflow);
+                redact_display(&mut candidate.leaf_node_name, redacted, overflow);
                 if !safe_text(&candidate.member_id)
                     || !safe_text(candidate.reason)
                     || !candidate.leaf_node_id.as_deref().is_none_or(safe_text)
@@ -706,10 +716,9 @@ fn optional_bytes<const N: usize>(values: [&Option<String>; N]) -> usize {
     values.into_iter().flatten().map(String::capacity).sum()
 }
 
-fn redact_display(value: &mut Option<String>, redacted: &mut bool) {
-    if value.as_deref().is_some_and(|text| !safe_text(text)) {
-        *value = None;
-        *redacted = true;
+fn redact_display(value: &mut Option<String>, redacted: &mut bool, overflow: &mut bool) {
+    if let Some(text) = value {
+        *value = super::bounded_display(text, redacted, overflow);
     }
 }
 

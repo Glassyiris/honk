@@ -789,11 +789,6 @@ pub(super) fn parse_experimental_section(
                             &mut config.native_api.config_write,
                         ),
                         (
-                            "config_content",
-                            "experimental.native_api.config_content",
-                            &mut config.native_api.config_content,
-                        ),
-                        (
                             "allow_anonymous_loopback",
                             "experimental.native_api.allow_anonymous_loopback",
                             &mut config.native_api.allow_anonymous_loopback,
@@ -809,6 +804,16 @@ pub(super) fn parse_experimental_section(
                                 )
                             })?;
                         }
+                    }
+                    if let Some(text) = values.get("config_content") {
+                        strict_bool(text.unquote().raw()).ok_or_else(|| {
+                            scalar_error(
+                                *text,
+                                "invalid-config-value",
+                                "experimental.native_api.config_content",
+                                "expected true/false, yes/no, 1/0 or on/off",
+                            )
+                        })?;
                     }
                     for (key, target) in [
                         ("listen", &mut config.native_api.listen),
@@ -852,21 +857,7 @@ pub(super) fn parse_experimental_section(
                         }).collect::<Result<Vec<_>,_>>()?;
                     }
                     if let Some(text) = values.get("writable_includes") {
-                        config.native_api.writable_includes = new_list_value(*text, diagnostics);
-                        if config
-                            .native_api
-                            .writable_includes
-                            .iter()
-                            .any(String::is_empty)
-                        {
-                            return Err(scalar_error(
-                                *text,
-                                "invalid-config-value",
-                                "experimental.native_api.writable_includes",
-                                "include allowlist entries must not be empty",
-                            )
-                            .into());
-                        }
+                        let _ = new_list_value(*text, diagnostics);
                     }
                     for (key, setting, target) in [
                         (

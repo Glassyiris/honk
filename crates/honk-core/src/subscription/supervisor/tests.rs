@@ -207,8 +207,10 @@ async fn refresh_queue_refusal_wakes_idempotent_waiters_and_shutdown_settles_acc
             )
             .unwrap();
         state.refresh(
-            authorized.subscription,
+            authorized.subscription.clone(),
             RefreshOperation {
+                display_name: authorized.subscription.name.clone(),
+                display_url: authorized.subscription.url.clone(),
                 reservation,
                 operations: Arc::clone(&operations),
                 instance: instance.clone(),
@@ -447,6 +449,8 @@ async fn finish_pause_waits_for_late_enqueue_and_retains_removed_provider_commit
     state.refresh(
         subscription.subscription.clone(),
         RefreshOperation {
+            display_name: subscription.subscription.name.clone(),
+            display_url: subscription.subscription.url.clone(),
             reservation,
             operations: Arc::clone(&operations),
             instance,
@@ -583,6 +587,8 @@ async fn pause_cancels_periodic_and_explicit_fetches_without_losing_replay() {
         state.refresh(
             subscription.subscription.clone(),
             RefreshOperation {
+                display_name: subscription.subscription.name.clone(),
+                display_url: subscription.subscription.url.clone(),
                 reservation,
                 operations: Arc::clone(&operations),
                 instance: instance.clone(),
@@ -647,8 +653,10 @@ async fn pause_cancels_periodic_and_explicit_fetches_without_losing_replay() {
         .unwrap();
     let admission = reservation.admission();
     state.refresh(
-        explicit.subscription,
+        explicit.subscription.clone(),
         RefreshOperation {
+            display_name: explicit.subscription.name.clone(),
+            display_url: explicit.subscription.url.clone(),
             reservation,
             operations,
             instance,

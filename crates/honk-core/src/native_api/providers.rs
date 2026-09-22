@@ -1,4 +1,4 @@
-//! Safe provider observations and supervisor-owned refresh admission.
+//! Provider observations and supervisor-owned refresh admission.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -36,7 +36,7 @@ const MAX_SNAPSHOTS: usize = 8;
 const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct Provider {
     id: String,
     name: String,
@@ -48,6 +48,18 @@ pub(crate) struct Provider {
     traffic: Option<()>,
     status: &'static str,
     last_error: Option<ProviderError>,
+}
+
+impl std::fmt::Debug for Provider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Provider")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("node_count", &self.node_count)
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -76,11 +88,9 @@ impl Provider {
     fn observed(subscription: &Subscription, load: ProviderLoad, node_count: usize) -> Self {
         Self {
             id: subscription.id.to_string(),
-            // Configured tags and even URL hosts can contain credentials. No raw source text
-            // is needed to correlate this stable display label with Node.provider_id.
-            name: format!("provider-{}", subscription.id),
+            name: subscription.name.clone(),
             kind: "subscription",
-            url_redacted: None,
+            url_redacted: Some(subscription.url.clone()),
             node_count,
             updated_at: load.updated_at.map(timestamp),
             expires_at: None,
@@ -105,10 +115,26 @@ impl Provider {
         }
     }
 
+    fn mask_listener_secrets(
+        mut self,
+        config: &honk_config::Config,
+        sources: Option<&super::config::ConfigService>,
+    ) -> Self {
+        let secrets = super::config::ListenerSecrets::from_config(config);
+        for value in std::iter::once(&mut self.name).chain(self.url_redacted.iter_mut()) {
+            *value = secrets.mask(value).0;
+            if let Some(sources) = sources {
+                *value = sources.mask_text(value).0;
+            }
+        }
+        self
+    }
+
     fn retained_bytes(&self) -> usize {
         size_of::<Self>()
             + self.id.capacity()
             + self.name.capacity()
+            + self.url_redacted.as_ref().map_or(0, String::capacity)
             + self.updated_at.as_ref().map_or(0, String::capacity)
     }
 }
@@ -210,8 +236,17 @@ pub(super) async fn list(
         return service.resume(cursor, &state.observation.instance_id, limit, id);
     }
     let config = state.config.read().await;
-    // Every row has a fixed-size safe label; reject before allocating its join or projection.
-    if config.subscriptions.len() >= MAX_SNAPSHOT_BYTES / (size_of::<Provider>() + 256) {
+    if config
+        .subscriptions
+        .iter()
+        .fold(0usize, |bytes, subscription| {
+            bytes
+                .saturating_add(size_of::<Provider>() + 256)
+                .saturating_add(subscription.name.len())
+                .saturating_add(subscription.url.len())
+        })
+        >= MAX_SNAPSHOT_BYTES
+    {
         return Err(unavailable());
     }
     let mut counts: HashMap<_, usize> = config.subscriptions.iter().map(|s| (s.id, 0)).collect();
@@ -234,7 +269,8 @@ pub(super) async fn list(
             .as_ref()
             .map(|owner| owner.observation(subscription))
             .unwrap_or_default();
-        let row = Provider::observed(subscription, load, counts[&subscription.id]);
+        let row = Provider::observed(subscription, load, counts[&subscription.id])
+            .mask_listener_secrets(&config, Some(&state.observation.configuration));
         bytes += row.retained_bytes();
         if bytes > MAX_SNAPSHOT_BYTES {
             return Err(unavailable());
@@ -276,6 +312,7 @@ pub(super) async fn detail(
         &config,
         state.observation.providers.supervisor.read().as_ref(),
         provider_id,
+        Some(&state.observation.configuration),
     )
     .map(|value| Json(value).into_response())
     .ok_or_else(not_found)
@@ -285,6 +322,7 @@ pub(super) fn provider_value(
     config: &honk_config::Config,
     supervisor: Option<&SubscriptionSupervisorHandle>,
     provider_id: Uuid,
+    sources: Option<&super::config::ConfigService>,
 ) -> Option<Value> {
     let subscription = config.subscriptions.iter().find(|s| s.id == provider_id)?;
     let load = supervisor
@@ -295,7 +333,10 @@ pub(super) fn provider_value(
         .iter()
         .filter(|node| node.subscription_id == Some(provider_id))
         .count();
-    serde_json::to_value(Provider::observed(subscription, load, count)).ok()
+    serde_json::to_value(
+        Provider::observed(subscription, load, count).mask_listener_secrets(config, sources),
+    )
+    .ok()
 }
 
 pub(super) async fn refresh(
@@ -365,16 +406,20 @@ pub(super) async fn refresh(
                 .read()
                 .clone()
                 .ok_or_else(unavailable)?;
-            Ok((subscription, supervisor))
+            let display = Provider::observed(&subscription, ProviderLoad::default(), 0)
+                .mask_listener_secrets(&config, Some(&state.observation.configuration));
+            Ok((subscription, supervisor, display))
         }
         .await;
         match prepared {
-            Ok((subscription, supervisor)) => supervisor.refresh(
+            Ok((subscription, supervisor, display)) => supervisor.refresh(
                 subscription,
                 RefreshOperation {
                     reservation,
                     operations: Arc::clone(operations),
                     instance: state.observation.instance_id.clone(),
+                    display_name: display.name,
+                    display_url: display.url_redacted.expect("subscription URL is present"),
                 },
             )?,
             Err(error) => {
@@ -390,6 +435,8 @@ pub(crate) struct RefreshOperation {
     pub(crate) reservation: Reservation,
     pub(crate) operations: Arc<OperationStore>,
     pub(crate) instance: String,
+    pub(crate) display_name: String,
+    pub(crate) display_url: String,
 }
 
 impl RefreshOperation {
@@ -414,14 +461,11 @@ impl RefreshOperation {
             Ok(reply) => {
                 match reply.outcome {
                     ReloadOutcome::Noop { .. } | ReloadOutcome::Committed { .. } => {
-                        self.operations.succeed(
-                            id,
-                            OperationResult::ProviderRefresh(Provider::observed(
-                                subscription,
-                                load,
-                                reply.node_count,
-                            )),
-                        );
+                        let mut provider = Provider::observed(subscription, load, reply.node_count);
+                        provider.name = self.display_name;
+                        provider.url_redacted = Some(self.display_url);
+                        self.operations
+                            .succeed(id, OperationResult::ProviderRefresh(provider));
                     }
                     ReloadOutcome::CommittedDegraded { generation } => {
                         self.operations.fail(id, "publication_degraded", "Provider nodes were committed but the runtime is degraded.", Some(json!({"committed": true, "active_generation_id": format!("{}:{generation}", self.instance), "datapath_generation_id": generation.to_string()})));

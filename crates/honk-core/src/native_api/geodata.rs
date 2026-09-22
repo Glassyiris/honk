@@ -18,19 +18,29 @@ use crate::routing::GeoAssetSnapshot;
 
 pub(crate) const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct GeoData {
     observed_at: String,
     assets: Vec<GeoAsset>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct GeoAsset {
     kind: &'static str,
     sha256: String,
     size_bytes: String,
     modified_at: Option<String>,
     source_redacted: Option<String>,
+}
+
+impl std::fmt::Debug for GeoData {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GeoData")
+            .field("observed_at", &self.observed_at)
+            .field("asset_count", &self.assets.len())
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) struct GeoUpdatePlan {
@@ -83,19 +93,21 @@ pub(crate) fn configured_url<'a>(settings: &'a NativeApiConfig, kind: &str) -> &
     }
 }
 
-pub(crate) fn project(assets: Vec<GeoAssetSnapshot>, settings: &NativeApiConfig) -> GeoData {
+pub(crate) fn project(
+    assets: Vec<GeoAssetSnapshot>,
+    settings: &NativeApiConfig,
+    active: &honk_config::Config,
+    sources: &config::ConfigService,
+) -> GeoData {
+    let secrets = config::ListenerSecrets::from_config(active);
     GeoData {
         observed_at: timestamp(SystemTime::now()),
         assets: assets
             .into_iter()
             .map(|asset| {
+                let url = configured_url(settings, asset.kind);
                 let source_redacted =
-                    parse_geodata_url(configured_url(settings, asset.kind)).map(|mut url| {
-                        url.set_query(None);
-                        url.set_fragment(None);
-                        url.set_path("/[redacted]");
-                        url.to_string()
-                    });
+                    (!url.is_empty()).then(|| sources.mask_text(&secrets.mask(url).0).0);
                 GeoAsset {
                     kind: asset.kind,
                     sha256: asset.sha256,
@@ -131,7 +143,15 @@ pub(super) async fn get(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     parse_query(uri, &[], id)?;
-    Ok(axum::Json(project(capture(state).await?, &state.settings)).into_response())
+    let assets = capture(state).await?;
+    let active = state.config.read().await;
+    Ok(axum::Json(project(
+        assets,
+        &state.settings,
+        &active,
+        &state.observation.configuration,
+    ))
+    .into_response())
 }
 
 pub(super) async fn update(

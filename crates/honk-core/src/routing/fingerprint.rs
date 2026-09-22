@@ -167,6 +167,7 @@ mod tests {
             name: "rule".into(),
             rule_type: "Match".into(),
             rule_payload: String::new(),
+            expression: String::new(),
             priority: 0,
             conditions: vec![CompiledCondition {
                 not: false,
