@@ -377,7 +377,11 @@ impl ControlPlaneHandle {
                 let alive_set = Arc::clone(&alive_set);
                 let target_domain = target_domain.clone();
                 Box::pin(async move {
-                    let reporter = feedback.map(|feedback| feedback.start());
+                    let reporter = feedback
+                        .as_ref()
+                        .map(crate::group::ScoreAttempt::begin)
+                        .transpose()?
+                        .map(crate::group::ScoreBusinessGuard::start);
                     let dial_started_at = std::time::Instant::now();
                     let result = {
                         #[cfg(feature = "rprx")]

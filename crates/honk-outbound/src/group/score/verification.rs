@@ -1,4 +1,4 @@
-use super::ranking::{normal_eligible, ordinary_selection, performance_baseline, score_snapshot};
+use super::ranking::{Decision, decision, normal_eligible};
 use super::*;
 use honk_config::node::Node;
 use std::hash::{Hash, Hasher};
@@ -28,7 +28,7 @@ pub enum ScoreEvidenceBasis {
     None,
     ConfiguredProbe,
     TargetResponse,
-    AggregateResponse,
+    CommonTargets,
     Upload,
     Download,
 }
@@ -48,6 +48,70 @@ pub enum ScoreValidationAction {
     Backoff,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ScoreEvidenceQuestion {
+    #[default]
+    None,
+    Availability,
+    Response,
+    Qualification,
+    Recovery,
+    Transfer,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ScoreWaitReason {
+    #[default]
+    None,
+    Budget,
+    ComparableTraffic,
+    InFlight,
+    Transfer,
+    Backoff,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ScoreTrialSource {
+    #[default]
+    None,
+    Cold,
+    Periodic,
+    Recovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScoreLocalComparison {
+    pub comparison: ScoreComparison,
+    pub basis: ScoreEvidenceBasis,
+    pub compared_candidates: usize,
+    pub reporter_count: usize,
+    pub span_ms: u64,
+    pub evidence_age_ms: Option<u64>,
+    pub valid_for_ms: Option<u64>,
+    pub dispersion_ppm: u64,
+    pub upload_known: bool,
+    pub download_known: bool,
+    pub directional_tradeoff: bool,
+}
+
+impl Default for ScoreLocalComparison {
+    fn default() -> Self {
+        Self {
+            comparison: ScoreComparison::Unconfirmed,
+            basis: ScoreEvidenceBasis::None,
+            compared_candidates: 0,
+            reporter_count: 0,
+            span_ms: 0,
+            evidence_age_ms: None,
+            valid_for_ms: None,
+            dispersion_ppm: 0,
+            upload_known: false,
+            download_known: false,
+            directional_tradeoff: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScoreVerificationSnapshot {
     pub state: ScoreVerificationState,
@@ -55,6 +119,9 @@ pub struct ScoreVerificationSnapshot {
     pub basis: ScoreEvidenceBasis,
     pub missing: ScoreEvidenceGaps,
     pub next_action: ScoreValidationAction,
+    pub question: ScoreEvidenceQuestion,
+    pub wait_reason: ScoreWaitReason,
+    pub local_comparison: ScoreLocalComparison,
     pub candidate_count: usize,
     pub compared_count: usize,
     pub pending_count: usize,
@@ -77,19 +144,43 @@ pub struct ScoreVerificationCounters {
     pub confirmation_millis: u64,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct TimedMetric {
+    pub value: f64,
+    pub reporters: u8,
+    pub observed_at: Instant,
+    pub latest_at: Instant,
+    pub expires_at: Instant,
+}
+
 #[derive(Clone, Copy, Default)]
 pub(super) struct VerificationEvidence {
-    pub business: MetricSnapshot,
-    pub performance: PerformanceSnapshot,
+    pub business: Option<TimedMetric>,
+    pub response: Option<TimedMetric>,
+    pub upload: Option<TimedMetric>,
+    pub download: Option<TimedMetric>,
+    pub probe: Option<TimedMetric>,
     pub failed_at: Option<Instant>,
 }
 
 impl VerificationEvidence {
     pub(super) fn new(stats: &Stats, now: Instant) -> Self {
+        let availability = &stats.availability;
         Self {
-            business: stats.availability.snapshot(now),
-            performance: stats.performance.snapshot(now),
+            business: availability
+                .latest_rx_at
+                .filter(|at| {
+                    *at <= now && now < *at + LIVE_QUALIFICATION_TTL && availability.reporters > 0
+                })
+                .map(|observed_at| TimedMetric {
+                    value: 1.0,
+                    reporters: availability.reporters,
+                    observed_at,
+                    latest_at: observed_at,
+                    expires_at: observed_at + LIVE_QUALIFICATION_TTL,
+                }),
             failed_at: stats.failed_at,
+            ..Self::default()
         }
     }
 }
@@ -106,17 +197,52 @@ pub(super) struct VerificationHistory {
 pub(super) struct Evaluation {
     pub snapshot: ScoreVerificationSnapshot,
     pub validation_index: Option<usize>,
+    pub candidates: Vec<CandidateQuestion>,
     claims: u8,
     support: u64,
     expires_at: Option<Instant>,
 }
 
-fn qualified(metric: MetricSnapshot) -> bool {
-    metric.value.is_some() && metric.confidence >= 1.0
+fn qualified(metric: Option<TimedMetric>) -> bool {
+    metric.is_some_and(|metric| f64::from(metric.reporters) >= PERFORMANCE_VALIDATION_SAMPLES)
 }
 
-pub(super) fn usable(score: &ScoreSnapshot) -> bool {
-    qualified(score.verification.business)
+pub(super) fn usable(evidence: &VerificationEvidence) -> bool {
+    qualified(evidence.business)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResponseGap {
+    None,
+    Missing,
+    Unpaired,
+    Availability,
+    ProbeScope,
+    Degraded,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct CandidateQuestion {
+    pub question: ScoreEvidenceQuestion,
+    pub required: usize,
+    excluded: bool,
+    backed_off: bool,
+    availability_missing: bool,
+    response_gap: ResponseGap,
+}
+
+impl CandidateQuestion {
+    fn pending(&self) -> bool {
+        !self.excluded
+            && !matches!(
+                self.question,
+                ScoreEvidenceQuestion::None | ScoreEvidenceQuestion::Transfer
+            )
+    }
+
+    pub fn actionable(&self) -> bool {
+        self.pending() && !self.backed_off
+    }
 }
 
 fn milliseconds(duration: Duration) -> u64 {
@@ -127,201 +253,268 @@ fn claim(kind: ScoreEvidenceKind) -> u8 {
     1 << kind as u8
 }
 
-pub(super) fn untried_hint(left: &ScoreSnapshot, right: &ScoreSnapshot) -> std::cmp::Ordering {
-    if left.selected_at != 0 || right.selected_at != 0 {
+fn untried_hint(decision: &Decision, left: usize, right: usize) -> std::cmp::Ordering {
+    let scores = &decision.scores;
+    if scores[left].selected_at != 0 || scores[right].selected_at != 0 {
         return std::cmp::Ordering::Equal;
     }
-    let (left_metric, right_metric) = if left.verification.performance.response.value.is_some()
-        || right.verification.performance.response.value.is_some()
-    {
-        (
-            left.verification.performance.response,
-            right.verification.performance.response,
-        )
-    } else if left.probe_scope == right.probe_scope {
-        (left.probe, right.probe)
-    } else {
-        return std::cmp::Ordering::Equal;
-    };
+    let evidence = &decision.evidence;
+    let (left_metric, right_metric) =
+        if evidence[left].response.is_some() || evidence[right].response.is_some() {
+            (evidence[left].response, evidence[right].response)
+        } else if scores[left].probe_scope == scores[right].probe_scope {
+            (evidence[left].probe, evidence[right].probe)
+        } else {
+            return std::cmp::Ordering::Equal;
+        };
     left_metric
-        .value
-        .unwrap_or(f64::INFINITY)
-        .total_cmp(&right_metric.value.unwrap_or(f64::INFINITY))
+        .map_or(f64::INFINITY, |metric| metric.value)
+        .total_cmp(&right_metric.map_or(f64::INFINITY, |metric| metric.value))
+}
+
+pub(super) fn startup_index(decision: &Decision) -> Option<usize> {
+    (decision.scores.len() > 1)
+        .then(|| {
+            decision
+                .scores
+                .iter()
+                .enumerate()
+                .filter(|(_, score)| {
+                    score.completed < MIN_TRAINED_EVIDENCE && !score.explore_backed_off
+                })
+                .min_by(|(left_index, left), (right_index, right)| {
+                    left.attempts
+                        .total_cmp(&right.attempts)
+                        .then_with(|| untried_hint(decision, *left_index, *right_index))
+                        .then_with(|| left.selected_at.cmp(&right.selected_at))
+                        .then_with(|| left_index.cmp(right_index))
+                })
+                .map(|(index, _)| index)
+        })
+        .flatten()
 }
 
 // These are recent empirical comparisons with a practical tolerance, not a
 // confidence sequence or a guarantee about an unobserved future workload.
 pub(super) fn evaluate(
-    snapshots: &[ScoreSnapshot],
+    decision: &Decision,
     nodes: &[&Node],
-    selected: usize,
     context: &ScoreSelectionContext,
     cadence: Option<&SelectionCadence>,
-    baseline: PerformanceBaseline,
     now: Instant,
 ) -> Evaluation {
+    let snapshots = &decision.scores;
+    let evidence = &decision.evidence;
+    let selected = decision.ordinary.index;
     let winner = &snapshots[selected];
-    let excluded = |score: &ScoreSnapshot| {
-        !normal_eligible(score, baseline)
-            && score
-                .verification
+    let baseline = decision.baseline;
+    let excluded = |index: usize| {
+        !normal_eligible(&snapshots[index], baseline)
+            && evidence[index]
                 .failed_at
                 .is_some_and(|at| now.saturating_duration_since(at) < PERFORMANCE_MAX_AGE)
     };
-    let relevant = |score: &&ScoreSnapshot| !excluded(score);
-    let coverage = snapshots.iter().filter(relevant).count();
-    let business_response = snapshots
-        .iter()
-        .filter(relevant)
-        .all(|score| usable(score) && qualified(score.verification.performance.response));
-    let use_probe = !business_response && context.target.is_none() && qualified(winner.probe);
-    let response = |score: &ScoreSnapshot| {
+    let summary = super::comparison::summarize(decision, now);
+    let use_probe = context.target.is_none()
+        && match summary.basis {
+            super::comparison::Basis::ConfiguredProbe => true,
+            super::comparison::Basis::None => qualified(evidence[selected].probe),
+            super::comparison::Basis::ExactTarget | super::comparison::Basis::CommonTargets => {
+                false
+            }
+        };
+    let response = |index: usize| {
         if use_probe {
-            score.probe
+            evidence[index].probe
         } else {
-            score.verification.performance.response
+            evidence[index].response
         }
     };
-    let degraded_at = winner.degraded_at;
-    let response_gap = |score: &ScoreSnapshot| {
-        !qualified(response(score))
-            || (!use_probe && !usable(score))
-            || (use_probe && score.probe_scope != winner.probe_scope)
-            || degraded_at
-                .is_some_and(|at| response(score).observed_at.is_none_or(|seen| seen < at))
-    };
-    // Live availability can precede the qualification needed to compete with trained candidates.
-    let gap = |score: &ScoreSnapshot| {
-        !excluded(score)
-            && (!usable(score)
-                || response_gap(score)
-                || score.fail_streak > 0
-                || (baseline.any_qualified && !score.qualified()))
-    };
-    let availability = snapshots
+    let candidates: Vec<_> = snapshots
         .iter()
-        .filter(relevant)
-        .any(|score| !usable(score));
-    let missing_response = snapshots.iter().filter(relevant).any(response_gap);
-    let pending_count = snapshots.iter().filter(|score| gap(score)).count();
-    let compared_count = snapshots
-        .iter()
-        .filter(relevant)
-        .filter(|score| {
-            qualified(response(score))
-                && if use_probe {
-                    score.probe_scope == winner.probe_scope
-                } else {
-                    usable(score)
+        .enumerate()
+        .map(|(index, score)| {
+            let pair = decision.pairs.get(index);
+            let paired_at = if context.target.is_none() && !use_probe {
+                pair.and_then(|pair| pair.response)
+                    .map(|metric| metric.latest_at)
+                    .or_else(|| {
+                        (index == selected)
+                            .then_some(summary.response_latest_at)
+                            .flatten()
+                    })
+            } else {
+                None
+            };
+            let availability_missing = !usable(&evidence[index]);
+            let response_gap = if !qualified(response(index)) && paired_at.is_none() {
+                ResponseGap::Missing
+            } else if pair.is_some_and(|pair| pair.response.is_none()) {
+                ResponseGap::Unpaired
+            } else if !use_probe && availability_missing {
+                ResponseGap::Availability
+            } else if use_probe && score.probe_scope != winner.probe_scope {
+                ResponseGap::ProbeScope
+            } else if winner.degraded_at.is_some_and(|at| {
+                response(index)
+                    .map(|metric| metric.latest_at)
+                    .or(paired_at)
+                    .is_none_or(|seen| seen < at)
+            }) {
+                ResponseGap::Degraded
+            } else {
+                ResponseGap::None
+            };
+            let question = if score.fail_streak > 0 {
+                ScoreEvidenceQuestion::Recovery
+            } else if availability_missing {
+                ScoreEvidenceQuestion::Availability
+            } else if response_gap != ResponseGap::None {
+                ScoreEvidenceQuestion::Response
+            } else if baseline.any_qualified && !score.qualified() {
+                ScoreEvidenceQuestion::Qualification
+            } else {
+                ScoreEvidenceQuestion::None
+            };
+            let supported = match question {
+                ScoreEvidenceQuestion::Availability => evidence[index]
+                    .business
+                    .map_or(0.0, |metric| f64::from(metric.reporters)),
+                ScoreEvidenceQuestion::Response
+                    if matches!(
+                        response_gap,
+                        ResponseGap::Missing | ResponseGap::Unpaired | ResponseGap::ProbeScope
+                    ) =>
+                {
+                    0.0
                 }
+                ScoreEvidenceQuestion::Response => {
+                    response(index).map_or(0.0, |metric| f64::from(metric.reporters))
+                }
+                ScoreEvidenceQuestion::Qualification => score.useful_completed,
+                _ => PERFORMANCE_VALIDATION_SAMPLES,
+            };
+            CandidateQuestion {
+                question,
+                required: (PERFORMANCE_VALIDATION_SAMPLES - supported)
+                    .ceil()
+                    .clamp(1.0, 4.0) as usize,
+                excluded: excluded(index),
+                backed_off: score.explore_backed_off,
+                availability_missing,
+                response_gap,
+            }
         })
+        .collect();
+    let availability = candidates
+        .iter()
+        .any(|candidate| !candidate.excluded && candidate.availability_missing);
+    let missing_response = candidates
+        .iter()
+        .any(|candidate| !candidate.excluded && candidate.response_gap != ResponseGap::None);
+    let pending_count = candidates
+        .iter()
+        .filter(|candidate| candidate.pending())
         .count();
-    let complete = coverage >= 2 && !missing_response && !excluded(winner);
-    let compare = |metric: &dyn Fn(&ScoreSnapshot) -> MetricSnapshot, larger: bool| {
-        let chosen = metric(winner).value.unwrap_or_default().max(1.0);
-        let mut min = chosen;
-        let mut max = chosen;
-        for score in snapshots.iter().filter(relevant) {
-            let value = metric(score).value.unwrap_or_default().max(1.0);
-            min = min.min(value);
-            max = max.max(value);
+    let basis = match summary.basis {
+        super::comparison::Basis::ExactTarget => ScoreEvidenceBasis::TargetResponse,
+        super::comparison::Basis::CommonTargets => ScoreEvidenceBasis::CommonTargets,
+        super::comparison::Basis::ConfiguredProbe => ScoreEvidenceBasis::ConfiguredProbe,
+        super::comparison::Basis::None if use_probe => ScoreEvidenceBasis::ConfiguredProbe,
+        super::comparison::Basis::None if qualified(response(selected)) => {
+            ScoreEvidenceBasis::TargetResponse
         }
-        if max <= min * (1.0 + PERFORMANCE_SWITCH_MARGIN) {
+        super::comparison::Basis::None => ScoreEvidenceBasis::None,
+    };
+    let local_comparison = ScoreLocalComparison {
+        comparison: if summary.equivalent {
             ScoreComparison::Equivalent
-        } else if (larger && chosen * (1.0 + PERFORMANCE_SWITCH_MARGIN) >= max)
-            || (!larger && chosen <= min * (1.0 + PERFORMANCE_SWITCH_MARGIN))
-        {
+        } else if summary.supported {
             ScoreComparison::Supported
         } else {
             ScoreComparison::Unconfirmed
-        }
+        },
+        basis,
+        compared_candidates: summary.compared_candidates,
+        reporter_count: usize::from(summary.reporters),
+        span_ms: summary.span.map_or(0, milliseconds),
+        evidence_age_ms: summary.evidence_age.map(milliseconds),
+        valid_for_ms: summary.valid_for.map(milliseconds),
+        dispersion_ppm: (summary.dispersion * 1_000_000.0).clamp(0.0, u64::MAX as f64) as u64,
+        upload_known: summary.upload_known,
+        download_known: summary.download_known,
+        directional_tradeoff: summary.directional_tradeoff,
     };
-    let mut comparison = if complete {
-        compare(&response, false)
+    let complete = summary.complete
+        && !missing_response
+        && !candidates[selected].excluded
+        && (context.target.is_none() || summary.basis == super::comparison::Basis::ExactTarget);
+    let comparison = if complete {
+        local_comparison.comparison
     } else {
         ScoreComparison::Unconfirmed
     };
-    let mut basis = if use_probe {
-        ScoreEvidenceBasis::ConfiguredProbe
-    } else if winner.verification.performance.response.value.is_some() {
-        if context.target.is_some() {
-            ScoreEvidenceBasis::TargetResponse
-        } else {
-            ScoreEvidenceBasis::AggregateResponse
-        }
-    } else if winner.performance.response.value.is_some() {
-        ScoreEvidenceBasis::AggregateResponse
-    } else if winner.probe.value.is_some() {
-        ScoreEvidenceBasis::ConfiguredProbe
+    let compared_count = summary
+        .compared_candidates
+        .max(usize::from(qualified(response(selected))));
+    let has_transfer = if snapshots.len() == 1 {
+        usable(&evidence[selected])
+            && (qualified(evidence[selected].upload) || qualified(evidence[selected].download))
     } else {
-        ScoreEvidenceBasis::None
+        complete && (summary.upload_known || summary.download_known)
     };
-    let direction = |get: fn(&ScoreSnapshot) -> MetricSnapshot| {
-        coverage > 0
-            && snapshots
-                .iter()
-                .filter(relevant)
-                .all(|score| usable(score) && qualified(get(score)))
-    };
-    let download = |score: &ScoreSnapshot| score.verification.performance.download;
-    let upload = |score: &ScoreSnapshot| score.verification.performance.upload;
-    let has_download = direction(download);
-    let has_upload = direction(upload);
-    let prefer_upload = has_upload
-        && (!has_download
-            || (compare(&download, true) != ScoreComparison::Supported
-                && compare(&upload, true) == ScoreComparison::Supported));
-    let transfer_metric: Option<fn(&ScoreSnapshot) -> MetricSnapshot> = if prefer_upload {
-        Some(upload)
-    } else if has_download {
-        Some(download)
-    } else {
-        None
-    };
-    if complete
-        && comparison != ScoreComparison::Supported
-        && let Some(metric) = transfer_metric
-        && compare(&metric, true) == ScoreComparison::Supported
-    {
-        comparison = ScoreComparison::Supported;
-        basis = if prefer_upload {
-            ScoreEvidenceBasis::Upload
-        } else {
-            ScoreEvidenceBasis::Download
-        };
-    }
     let mut oldest = None;
     let mut expires_at = None;
-    let mut support_metric = |metric: MetricSnapshot, lifetime: Duration| {
-        if let Some(at) = metric.observed_at {
-            oldest = Some(oldest.map_or(at, |old: Instant| old.min(at)));
-            let until = at + lifetime;
-            expires_at = Some(expires_at.map_or(until, |old: Instant| old.min(until)));
+    let mut support_metric = |metric: Option<TimedMetric>| {
+        if let Some(metric) = metric {
+            oldest = Some(oldest.map_or(metric.observed_at, |old: Instant| {
+                old.min(metric.observed_at)
+            }));
+            expires_at = Some(
+                expires_at.map_or(metric.expires_at, |old: Instant| old.min(metric.expires_at)),
+            );
         }
     };
     let mut claims = 0;
-    if usable(winner) {
+    if usable(&evidence[selected]) {
         claims |= claim(ScoreEvidenceKind::Availability);
-        support_metric(winner.verification.business, LIVE_QUALIFICATION_TTL);
+        support_metric(evidence[selected].business);
     }
-    if !excluded(winner) && !response_gap(winner) {
+    if !candidates[selected].excluded
+        && candidates[selected].response_gap == ResponseGap::None
+        && qualified(response(selected))
+    {
         claims |= claim(ScoreEvidenceKind::Response);
-        support_metric(response(winner), PERFORMANCE_MAX_AGE / 2);
+        support_metric(response(selected));
     }
-    if comparison != ScoreComparison::Unconfirmed {
-        claims |= claim(ScoreEvidenceKind::Response);
-        for score in snapshots.iter().filter(relevant) {
-            support_metric(response(score), PERFORMANCE_MAX_AGE / 2);
-            if !use_probe {
-                support_metric(score.verification.business, LIVE_QUALIFICATION_TTL);
+    if has_transfer {
+        claims |= claim(ScoreEvidenceKind::Transfer);
+        for metric in [evidence[selected].upload, evidence[selected].download] {
+            if qualified(metric) {
+                support_metric(metric);
             }
         }
     }
-    if let Some(metric) = transfer_metric {
-        claims |= claim(ScoreEvidenceKind::Transfer);
-        for score in snapshots.iter().filter(relevant) {
-            support_metric(metric(score), PERFORMANCE_MAX_AGE / 2);
-            support_metric(score.verification.business, LIVE_QUALIFICATION_TTL);
+    if !use_probe && (comparison != ScoreComparison::Unconfirmed || has_transfer) {
+        for (_, evidence) in evidence
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !candidates[*index].excluded)
+        {
+            support_metric(evidence.business);
+        }
+    }
+    if comparison != ScoreComparison::Unconfirmed {
+        claims |= claim(ScoreEvidenceKind::Response);
+    }
+    if comparison != ScoreComparison::Unconfirmed || has_transfer {
+        if let Some(age) = summary.evidence_age {
+            let at = now.checked_sub(age).unwrap_or(now);
+            oldest = Some(oldest.map_or(at, |old: Instant| old.min(at)));
+        }
+        if let Some(valid_for) = summary.valid_for {
+            let until = now + valid_for;
+            expires_at = Some(expires_at.map_or(until, |old: Instant| old.min(until)));
         }
     }
     let focused = cadence.and_then(|cadence| {
@@ -332,50 +525,68 @@ pub(super) fn evaluate(
     let validation_index = snapshots
         .iter()
         .enumerate()
-        .filter(|(index, score)| *index != selected && gap(score) && !score.explore_backed_off)
+        .filter(|(index, _)| *index != selected && candidates[*index].actionable())
         .min_by(|(left_index, left), (right_index, right)| {
             // A short run resolves one real question; no-progress/cancelled work
             // rotates by recency instead of pinning that run indefinitely.
-            let focus = |index: usize, score: &ScoreSnapshot| {
-                focused == Some(nodes[index].id) && score.verification.business.value.is_some()
+            let focus = |index: usize| {
+                focused == Some(nodes[index].id) && evidence[index].business.is_some()
             };
-            focus(*right_index, right)
-                .cmp(&focus(*left_index, left))
-                .then_with(|| untried_hint(left, right))
+            focus(*right_index)
+                .cmp(&focus(*left_index))
+                .then_with(|| untried_hint(decision, *left_index, *right_index))
                 .then_with(|| left.selected_at.cmp(&right.selected_at))
                 .then_with(|| left.last_attempt.cmp(&right.last_attempt))
                 .then_with(|| right.reliability_upper.total_cmp(&left.reliability_upper))
                 .then_with(|| left_index.cmp(right_index))
         })
         .map(|(index, _)| index);
-    let actionable = snapshots
-        .iter()
-        .any(|score| gap(score) && !score.explore_backed_off);
-    let next_action = if pending_count > 0 {
-        if actionable {
-            ScoreValidationAction::NextBusinessFlow
+    let question_index = validation_index
+        .or_else(|| candidates.iter().position(CandidateQuestion::actionable))
+        .or_else(|| candidates.iter().position(CandidateQuestion::pending));
+    let (next_action, question, wait_reason) = if let Some(index) = question_index {
+        let candidate = candidates[index];
+        if candidate.backed_off {
+            (
+                ScoreValidationAction::Backoff,
+                candidate.question,
+                ScoreWaitReason::Backoff,
+            )
         } else {
-            ScoreValidationAction::Backoff
+            (
+                ScoreValidationAction::NextBusinessFlow,
+                candidate.question,
+                ScoreWaitReason::ComparableTraffic,
+            )
         }
-    } else if transfer_metric.is_none() {
-        ScoreValidationAction::AwaitTransfer
+    } else if !has_transfer {
+        (
+            ScoreValidationAction::AwaitTransfer,
+            ScoreEvidenceQuestion::Transfer,
+            ScoreWaitReason::Transfer,
+        )
     } else {
-        ScoreValidationAction::None
+        (
+            ScoreValidationAction::None,
+            ScoreEvidenceQuestion::None,
+            ScoreWaitReason::None,
+        )
     };
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     nodes[selected].id.hash(&mut hasher);
-    for (node, score) in nodes.iter().zip(snapshots) {
+    for (index, (node, score)) in nodes.iter().zip(snapshots).enumerate() {
         node.id.hash(&mut hasher);
-        excluded(score).hash(&mut hasher);
+        candidates[index].excluded.hash(&mut hasher);
         if use_probe {
             score.probe_scope.hash(&mut hasher);
         }
     }
     (basis as u8).hash(&mut hasher);
-    for score in snapshots {
-        if (comparison != ScoreComparison::Unconfirmed || transfer_metric.is_some())
-            && excluded(score)
-            && let Some(at) = score.verification.failed_at
+    summary.support.hash(&mut hasher);
+    for (index, evidence) in evidence.iter().enumerate() {
+        if (comparison != ScoreComparison::Unconfirmed || has_transfer)
+            && candidates[index].excluded
+            && let Some(at) = evidence.failed_at
         {
             let until = at + PERFORMANCE_MAX_AGE;
             expires_at = Some(expires_at.map_or(until, |old| old.min(until)));
@@ -383,19 +594,22 @@ pub(super) fn evaluate(
     }
     Evaluation {
         snapshot: ScoreVerificationSnapshot {
-            state: if usable(winner) {
+            state: if usable(&evidence[selected]) {
                 ScoreVerificationState::ObservedUsable
             } else {
                 ScoreVerificationState::Provisional
             },
             comparison,
-            basis,
+            basis: summary.advantage_basis.unwrap_or(basis),
             missing: ScoreEvidenceGaps {
                 availability,
                 response: missing_response,
-                transfer: transfer_metric.is_none(),
+                transfer: !has_transfer,
             },
             next_action,
+            question,
+            wait_reason,
+            local_comparison,
             candidate_count: snapshots.len(),
             compared_count,
             pending_count,
@@ -407,9 +621,35 @@ pub(super) fn evaluate(
             target_specific: context.target.is_some(),
         },
         validation_index,
+        candidates,
         claims,
         support: hasher.finish(),
         expires_at,
+    }
+}
+
+pub(super) fn apply_budget_wait(
+    inner: &StateInner,
+    group: &str,
+    context: &ScoreSelectionContext,
+    nodes: &[&Node],
+    now: Instant,
+    evaluation: &mut Evaluation,
+) {
+    if let Some(index) = evaluation.validation_index {
+        let candidate = evaluation.candidates[index];
+        let wait = super::budget::wait_reason(
+            inner,
+            group,
+            context,
+            nodes[index].id,
+            candidate.question,
+            candidate.required,
+            now,
+        );
+        if wait != ScoreWaitReason::None {
+            evaluation.snapshot.wait_reason = wait;
+        }
     }
 }
 
@@ -446,32 +686,18 @@ impl ScorePolicyState {
             return None;
         }
         let inner = self.inner.lock();
-        let snapshots: Vec<_> = nodes
-            .iter()
-            .map(|node| score_snapshot(&inner, group, context, node.id, now))
-            .collect();
-        let incumbent = inner
-            .selection_history
-            .peek(&SelectionHistoryKey::new(group, context))
-            .filter(|history| history.selections > 0)
-            .and_then(|history| nodes.iter().position(|node| node.id == history.current));
-        let baseline = performance_baseline(&snapshots);
-        let selected = ordinary_selection(&snapshots, nodes, incumbent, baseline);
-        Some((
-            selected.index,
-            evaluate(
-                &snapshots,
-                nodes,
-                selected.index,
-                context,
-                inner
-                    .selection_counts
-                    .get(&SelectionCadenceKey::new(group, context)),
-                baseline,
-                now,
-            )
-            .snapshot,
-        ))
+        let decision = decision(&inner, group, context, nodes, now);
+        let mut evaluation = evaluate(
+            &decision,
+            nodes,
+            context,
+            inner
+                .selection_counts
+                .get(&SelectionCadenceKey::new(group, context)),
+            now,
+        );
+        apply_budget_wait(&inner, group, context, nodes, now, &mut evaluation);
+        Some((decision.ordinary.index, evaluation.snapshot))
     }
 
     pub(in crate::group) fn verification_counters(

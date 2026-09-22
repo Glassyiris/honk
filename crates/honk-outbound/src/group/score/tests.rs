@@ -4,7 +4,11 @@ use honk_config::group::{Group, GroupPolicy};
 use honk_config::node::Node;
 mod attribution;
 mod availability;
+mod budget;
+mod budget_projection;
 mod cadence;
+mod comparison;
+mod directional;
 mod evidence;
 mod live;
 mod performance;
@@ -13,6 +17,7 @@ mod progress;
 mod reasons;
 mod selection;
 mod verification;
+mod verification_boundaries;
 
 fn assert_close(actual: f64, expected: f64) {
     assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
@@ -92,6 +97,8 @@ fn finish_success(plan: &super::super::ScoreSelectionPlan<'_>) {
         .feedback
         .as_ref()
         .expect("Score candidate must carry feedback")
+        .begin()
+        .expect("current Score plan must admit work")
         .start();
     reporter.setup_succeeded();
     reporter.tx(1);
@@ -103,6 +110,8 @@ fn finish_failure(plan: &super::super::ScoreSelectionPlan<'_>) {
         .feedback
         .as_ref()
         .expect("Score candidate must carry feedback")
+        .begin()
+        .expect("current Score plan must admit work")
         .start()
         .setup_failed(ScoreOutcome::Timeout);
 }
@@ -170,4 +179,29 @@ fn rank_at(
     manager
         .score_state()
         .rank_at("score", target, &nodes.iter().collect::<Vec<_>>(), now)
+}
+
+fn decision_at(
+    inner: &StateInner,
+    nodes: &[Node],
+    target: &ScoreSelectionContext,
+    reference: usize,
+    now: Instant,
+) -> ranking::Decision {
+    let refs = nodes.iter().collect::<Vec<_>>();
+    let scores = nodes
+        .iter()
+        .map(|node| score_snapshot(inner, "score", target, node.id, now))
+        .collect::<Vec<_>>();
+    let baseline = ranking::performance_baseline(&scores);
+    let evidence = super::comparison::node_evidence(inner, "score", target, &refs, &scores, now);
+    let pairs = super::comparison::pairs(inner, "score", target, &refs, &scores, reference, now);
+    let ordinary = ranking::ordinary_selection(&scores, &refs, Some(reference), baseline, &pairs);
+    ranking::Decision {
+        scores,
+        evidence,
+        pairs,
+        baseline,
+        ordinary,
+    }
 }

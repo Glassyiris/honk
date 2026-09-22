@@ -610,7 +610,7 @@ fn urltest_retry_plan_deduplicates_shared_nested_leaves_before_cap() {
         ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
 
     let retry_ids: Vec<_> = manager
-        .urltest_retry_plan_for_target("retry", &context)
+        .urltest_retry_plan_for_target("retry", &context, None)
         .entries
         .into_iter()
         .map(|entry| entry.node.id)

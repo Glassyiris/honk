@@ -158,20 +158,17 @@ fn only_newer_business_rx_restores_incumbent_protection() {
             recovery,
             "business-rx" | "new-rx-before-old-finish" | "neutral"
         );
+        let state = manager.score_state();
         assert_eq!(
-            rank_at(&manager, &nodes, &target, selected_at),
+            state.peek_rank_at(
+                "score",
+                &target,
+                &nodes.iter().collect::<Vec<_>>(),
+                selected_at
+            ),
             usize::from(!recovered),
             "{recovery}"
         );
-        let reasons = manager
-            .score_state()
-            .selection_reason_counts("score", SelectionNetwork::Tcp);
-        assert_eq!(
-            reasons.fresh_failure_bypass,
-            u64::from(!recovered),
-            "{recovery}"
-        );
-        assert_eq!(reasons.incumbent_ineligible, 0, "{recovery}");
     }
 }
 
@@ -213,7 +210,7 @@ fn stale_manager_authority_stays_revoked_after_same_name_recreation() {
     assert_eq!((before.1, before.2, before.3), (0, 0, 0));
 
     let stale = old.selection_plan_for_target("score", &context("stale.example", IpVersion::V4));
-    assert!(stale.entries[0].feedback.is_none());
+    assert!(stale.entries[0].feedback.as_ref().unwrap().begin().is_err());
     assert!(
         old.feedback_for_group_node("score", survivor.id, seeded_context.clone())
             .is_none(),
@@ -272,12 +269,6 @@ fn captured_feedback_requires_current_authority_at_start() {
 
     assert!(!state.has_exact("score", &context, nodes[0].id));
     assert_eq!(state.inner.lock().tick, before_tick);
-}
-
-pub(super) fn inner_update_response(state: &ScorePolicyState, key: AggregateKey, latency_ms: f64) {
-    let mut inner = state.inner.lock();
-    let stats = inner.aggregate.get_mut(&key).unwrap();
-    stats.performance.response.sum = latency_ms * stats.performance.response.weight;
 }
 
 #[test]

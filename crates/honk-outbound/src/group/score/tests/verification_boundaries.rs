@@ -1,0 +1,279 @@
+use super::*;
+
+#[test]
+fn disjoint_response_support_schedules_comparable_business_not_bulk_transfer() {
+    let nodes = [node("incumbent"), node("challenger")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("shared.example", IpVersion::V4);
+    let now = Instant::now();
+    train_at(
+        &manager,
+        &nodes[1],
+        &target,
+        8,
+        Duration::from_millis(100),
+        1,
+        now,
+    );
+    let later = now + Duration::from_secs(16);
+    train_at(
+        &manager,
+        &nodes[0],
+        &target,
+        8,
+        Duration::from_millis(10),
+        1,
+        later,
+    );
+    let at = later + Duration::from_secs(2);
+    let state = manager.score_state();
+    let snapshot = state
+        .verification_snapshot_at("score", &target, &nodes.iter().collect::<Vec<_>>(), at)
+        .unwrap();
+    assert_eq!(snapshot.comparison, ScoreComparison::Unconfirmed);
+    assert_eq!(snapshot.question, ScoreEvidenceQuestion::Response);
+    assert_eq!(
+        snapshot.next_action,
+        ScoreValidationAction::NextBusinessFlow
+    );
+    assert_eq!(snapshot.wait_reason, ScoreWaitReason::ComparableTraffic);
+    let (index, feedback) =
+        state.rank_plan_at("score", &target, &nodes.iter().collect::<Vec<_>>(), at);
+    assert_eq!(index, 1);
+    feedback
+        .begin_at(at)
+        .unwrap()
+        .start_at(at)
+        .finish_at(ScoreOutcome::Cancelled, true, at);
+    assert_eq!(
+        manager
+            .score_budget_counters("score", SelectionNetwork::Tcp)
+            .trial_starts,
+        1
+    );
+}
+
+#[test]
+fn aggregate_transfer_claim_expires_with_crossed_direction_support() {
+    let nodes = [node("uploader"), node("downloader")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("shared.example", IpVersion::V4);
+    let aggregate =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    let now = Instant::now();
+    for (index, leaf) in nodes.iter().enumerate() {
+        for _ in 0..8 {
+            let reporter = manager
+                .feedback_for_group_node("score", leaf.id, target.clone())
+                .unwrap()
+                .start_at(now);
+            reporter.setup_succeeded_at(now);
+            reporter.first_response_at(now + Duration::from_millis(100));
+            let (tx, rx) = if index == 0 {
+                (1_048_576, 524_288)
+            } else {
+                (524_288, 1_048_576)
+            };
+            reporter.transfer_at(tx, rx, now + Duration::from_secs(1));
+            reporter.finish_at(ScoreOutcome::Success, true, now + Duration::from_secs(1));
+        }
+    }
+    let later = now + Duration::from_secs(45);
+    for leaf in &nodes {
+        let reporter = manager
+            .feedback_for_group_node("score", leaf.id, target.clone())
+            .unwrap()
+            .start_at(later);
+        reporter.setup_succeeded_at(later);
+        reporter.transfer_at(1, 1, later + Duration::from_secs(1));
+        reporter.finish_at(
+            ScoreOutcome::Cancelled,
+            true,
+            later + Duration::from_secs(1),
+        );
+    }
+    let state = manager.score_state();
+    let snapshot = state
+        .verification_snapshot_at(
+            "score",
+            &aggregate,
+            &nodes.iter().collect::<Vec<_>>(),
+            later + Duration::from_secs(2),
+        )
+        .unwrap();
+    assert_eq!(snapshot.comparison, ScoreComparison::Unconfirmed);
+    assert!(snapshot.local_comparison.directional_tradeoff);
+    assert!(!snapshot.missing.transfer);
+    assert_eq!(snapshot.next_action, ScoreValidationAction::None);
+    assert_eq!(snapshot.question, ScoreEvidenceQuestion::None);
+    assert_eq!(snapshot.wait_reason, ScoreWaitReason::None);
+    assert!(snapshot.valid_for_ms.unwrap() <= 13_100);
+    let expired = state
+        .verification_snapshot_at(
+            "score",
+            &aggregate,
+            &nodes.iter().collect::<Vec<_>>(),
+            now + Duration::from_secs(61),
+        )
+        .unwrap();
+    assert!(expired.missing.transfer);
+}
+
+#[test]
+fn winner_only_probe_does_not_replace_common_business_response_evidence() {
+    let nodes = [node("business winner"), node("business peer")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("shared.example", IpVersion::V4);
+    let aggregate =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    let now = Instant::now();
+    for leaf in &nodes {
+        train_at(
+            &manager,
+            leaf,
+            &target,
+            4,
+            Duration::from_millis(100),
+            1,
+            now,
+        );
+    }
+    let at = now + Duration::from_secs(2);
+    let state = manager.score_state();
+    let refs: Vec<_> = nodes.iter().collect();
+    let before = state
+        .verification_snapshot_at("score", &aggregate, &refs, at)
+        .unwrap();
+    assert_eq!(before.comparison, ScoreComparison::Equivalent);
+    assert_eq!(before.basis, ScoreEvidenceBasis::CommonTargets);
+    let winner = state.peek_rank_at("score", &aggregate, &refs, at);
+    probe_at(
+        &manager,
+        &nodes[winner],
+        &context("health.example", IpVersion::V4),
+        ScoreSource::HealthProbe,
+        Duration::from_millis(100),
+        at,
+    );
+    let after = state
+        .verification_snapshot_at("score", &aggregate, &refs, at)
+        .unwrap();
+    assert_eq!(after.comparison, before.comparison);
+    assert_eq!(after.missing, before.missing);
+    assert_eq!(after.evidence_age_ms, before.evidence_age_ms);
+    assert_eq!(after.valid_for_ms, before.valid_for_ms);
+}
+
+#[test]
+fn comparison_validity_cannot_outlive_a_required_candidate_availability_lease() {
+    let nodes = [node("fresh winner"), node("older availability")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("lease.example", IpVersion::V4);
+    let aggregate =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    let now = Instant::now();
+    for leaf in &nodes {
+        for _ in 0..8 {
+            let reporter = manager
+                .feedback_for_group_node("score", leaf.id, target.clone())
+                .unwrap()
+                .start_at(now);
+            reporter.setup_succeeded_at(now);
+            reporter.first_response_at(now + Duration::from_millis(100));
+            reporter.transfer_at(1, 1, now + Duration::from_secs(10));
+            reporter.finish_at(ScoreOutcome::Success, true, now + Duration::from_secs(10));
+        }
+    }
+    let later = now + Duration::from_secs(61);
+    for (index, leaf) in nodes.iter().enumerate() {
+        for _ in 0..4 {
+            let reporter = manager
+                .feedback_for_group_node("score", leaf.id, target.clone())
+                .unwrap()
+                .start_at(later);
+            reporter.setup_succeeded_at(later);
+            reporter.first_response_at(later + Duration::from_millis(100));
+            reporter.transfer_at(u64::from(index == 0), 1, later + Duration::from_millis(100));
+            reporter.finish_at(
+                ScoreOutcome::Cancelled,
+                true,
+                later + Duration::from_millis(100),
+            );
+        }
+        probe_at(
+            &manager,
+            leaf,
+            &context("health.example", IpVersion::V4),
+            ScoreSource::HealthProbe,
+            Duration::from_millis(100),
+            later,
+        );
+    }
+    let state = manager.score_state();
+    for scope in [&target, &aggregate] {
+        let snapshot = state
+            .verification_snapshot_at(
+                "score",
+                scope,
+                &nodes.iter().collect::<Vec<_>>(),
+                now + Duration::from_secs(62),
+            )
+            .unwrap();
+        assert_eq!(snapshot.comparison, ScoreComparison::Equivalent);
+        assert_eq!(snapshot.valid_for_ms, Some(8000));
+        let expired = state
+            .verification_snapshot_at(
+                "score",
+                scope,
+                &nodes.iter().collect::<Vec<_>>(),
+                now + Duration::from_secs(71),
+            )
+            .unwrap();
+        assert_eq!(expired.comparison, ScoreComparison::Unconfirmed);
+        assert!(expired.missing.availability && expired.missing.response);
+    }
+}
+
+#[test]
+fn response_age_uses_event_time_while_validity_uses_the_support_block() {
+    let nodes = [node("timed evidence")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let start = Instant::now();
+    let seed = manager
+        .feedback_for_group_node(
+            "score",
+            nodes[0].id,
+            context("block-origin.example", IpVersion::V4),
+        )
+        .unwrap()
+        .start_at(start);
+    seed.setup_succeeded_at(start);
+    seed.first_response_at(start);
+    seed.finish_at(ScoreOutcome::Cancelled, false, start);
+    let target = context("observed-later.example", IpVersion::V4);
+    let observed = start + Duration::from_secs(7);
+    let feedback = manager
+        .feedback_for_group_node("score", nodes[0].id, target.clone())
+        .unwrap();
+    for _ in 0..4 {
+        let reporter = feedback.start_at(observed);
+        reporter.setup_succeeded_at(observed);
+        reporter.first_response_at(observed);
+        reporter.transfer_at(1, 1, observed);
+        reporter.finish_at(ScoreOutcome::Success, true, observed);
+    }
+    let state = manager.score_state();
+    let refs: Vec<_> = nodes.iter().collect();
+    let snapshot = state
+        .verification_snapshot_at("score", &target, &refs, start + Duration::from_secs(9))
+        .unwrap();
+    assert_eq!(snapshot.state, ScoreVerificationState::ObservedUsable);
+    assert!(!snapshot.missing.response);
+    assert_eq!(snapshot.evidence_age_ms, Some(2000));
+    assert_eq!(snapshot.valid_for_ms, Some(51_000));
+    let expired = state
+        .verification_snapshot_at("score", &target, &refs, start + Duration::from_secs(60))
+        .unwrap();
+    assert_eq!(expired.state, ScoreVerificationState::ObservedUsable);
+    assert!(expired.missing.response);
+}

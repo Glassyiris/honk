@@ -407,7 +407,8 @@ async fn tcp_fallback_keeps_selected_score_group_chain() {
             .collect::<Vec<_>>(),
         ["selected"]
     );
-    let feedback = pool.tcp_feedback_for_route(entry, &route).unwrap();
+    let _business = route.feedback.as_ref().unwrap().begin().unwrap();
+    let feedback = pool.tcp_feedback_for_route(entry, &route).unwrap().unwrap();
     assert_eq!(
         feedback
             .attributions()
@@ -448,4 +449,61 @@ async fn implicit_score_route_keeps_target_and_attribution() {
     assert_eq!(route.target, "192.0.2.53:53".parse().unwrap());
     assert_eq!(route.node.unwrap().id, node.id);
     assert_eq!(route.feedback.unwrap().attributions()[0].group, "proxy");
+}
+
+#[tokio::test]
+async fn repeated_dns_reroutes_keep_one_original_without_optional_reservations() {
+    use honk_outbound::group::{ScoreOutcome, SelectionNetwork};
+    let nodes = [test_node("first"), test_node("second"), test_node("third")];
+    let group = test_group(
+        "score",
+        GroupPolicy::Score,
+        nodes.iter().map(|node| node.id).collect(),
+    );
+    let manager = Arc::new(GroupManager::new(&[group], &nodes));
+    let upstream = DnsUpstream {
+        outbound: Some("score".into()),
+        ..make_upstream("dns", "192.0.2.53:53", DnsProtocol::Tcp)
+    };
+    let pool =
+        UpstreamPool::new_with_proxy(&[upstream], make_router(), None, nodes.to_vec(), vec![])
+            .unwrap()
+            .with_group_manager_snapshot(Arc::clone(&manager));
+    let entry = &pool.entries["dns"];
+    let first = pool.resolve_dial_route(entry).await.unwrap();
+    let business = first.feedback.as_ref().unwrap().begin().unwrap();
+    let original = business.continuation();
+    business.finish(ScoreOutcome::Cancelled);
+    for target in ["192.0.2.54:53", "192.0.2.55:53", "192.0.2.56:53"] {
+        let route = pool
+            .resolve_dial_route_for_address(entry, target.parse().unwrap(), Some(&original))
+            .await
+            .unwrap();
+        let selected = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        assert_eq!(
+            (
+                selected.reserved,
+                selected.refunded,
+                selected.cold_available
+            ),
+            (0, 0, 2)
+        );
+        route
+            .feedback
+            .unwrap()
+            .begin()
+            .unwrap()
+            .finish(ScoreOutcome::Cancelled);
+    }
+    let after = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    assert_eq!(
+        (
+            after.business_starts,
+            after.trial_starts,
+            after.recovery_starts,
+            after.spent
+        ),
+        (1, 1, 3, 1)
+    );
+    assert_eq!(manager.score_state().root_business_starts(), 1);
 }

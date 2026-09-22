@@ -106,7 +106,7 @@ Known limitation of the locked dependency: [`h2` 0.4.19 can report 200 for a res
 
 Successful measurements update the node latency history. Failures return `503` for a single node, are omitted from the group result, and append a failure strike used by URLTest selection.
 
-Each delay-test exchange through a proxy or built-in `direct` leaf reports its real URL target and success or failure to every Score group containing the tested leaf. Any preliminary server/session warm-up reports aggregate setup only; it does not fabricate the URL as its own target. Non-Score paths create no score reporter or cell.
+On-demand delay exchanges retain Alive/API latency history but do not report business outcomes or populate configured Score comparison cohorts. Actual preliminary server/session preparation may report aggregate warm-up setup only; it does not fabricate the caller's URL as its own target or provide promotion proof.
 
 ### Score group representation
 
@@ -160,8 +160,13 @@ A non-empty `external_ui_download_detour` forces the initial request and redirec
     activeFlows, limit, capacity: { rejected }
   },
   score: {
-    groups: [{ name, tcp: R, udp: R }],
-    cache: { exactCells, aggregateCells, exactEvictions, aggregateEvictions }
+    groups: [{ name, tcp: R, udp: R, verification: { tcp: V, udp: V }, budget: { tcp: B, udp: B } }],
+    businessStarts,
+    cache: {
+      exactCells, aggregateCells, exactEvictions, aggregateEvictions,
+      comparisonCells, comparisonLogicalBytes, comparisonLogicalCapacity,
+      comparisonEvictions, comparisonExpired, comparisonRejected
+    }
   },
   udp: {
     endpoint: { hits, misses },
@@ -187,11 +192,18 @@ A non-empty `external_ui_download_detour` forces the initial request and redirec
 H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
 R = {
   coldExplore, periodicExplore, reliabilityWinner, performanceWinner,
-  incumbentHeld, insufficientEvidenceHeld, incumbentIneligible,
+  incumbentHeld, insufficientEvidenceHeld, directionalTradeoffHeld, incumbentIneligible,
   freshFailureBypass, deadFiltered, ordinarySwitch, switchFlap,
   failStreakExcluded, exploreBackedOff, carrierPressure, carrierRttPressure,
   carrierLossPressure, carrierValidation
 } // every R value is a u64 count
+V = { provisionalSelections, usableSelections, validationSelections,
+      confirmations, expired, contradicted, confirmationMillis }
+B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
+      reserved, spent, budgetBlocked, inFlightBlocked, refunded, expired,
+      coldAllowance, coldAvailable, earnedAvailable, earningPeriod, scopes,
+      trialSuccess, trialFailure, trialCancelled, trialSetupHistogram,
+      trialSetupMillis, trialElapsedMillis }
 ```
 
 ### TCP fields
@@ -243,7 +255,7 @@ events.
 
 `score.groups` is an additive part of the authenticated `/stats` response. It is an empty array when no group currently uses `policy: score`; otherwise it contains every current Score group, including groups with no resolved leaves, sorted lexicographically by `name`. Each group always has both `tcp` and `udp` objects, and each object always has every `R` field above. Missing network activity is represented by zeroes, never omitted fields.
 
-Each value is a saturating `u64` count, not a latency, throughput or health measurement. One authorized multi-candidate Score Apply records one final reason: `coldExplore` or `periodicExplore` for validation; `incumbentIneligible` for leaving an incumbent outside ordinary eligibility; `freshFailureBypass` for an eligible incumbent's unresolved business failure; `insufficientEvidenceHeld` when no challenger earns promotion and the ordinary utility winner lacks a qualified shared performance comparison; `incumbentHeld` when comparison does not clear the hold margin; otherwise `reliabilityWinner` or `performanceWinner` retain their alternative-eligibility classification. `performanceWinner` does not prove improvement or a switch, and `insufficientEvidenceHeld` does not mean reliability history is absent. `ordinarySwitch` counts actual committed normal A→B choices; `switchFlap` counts returns to the prior winner within eight same-target ordinary choices. First choices, trials and missing prior history cannot add switches. `deadFiltered`, `failStreakExcluded` and `exploreBackedOff` count affected candidates per rank. Peek, API reads, singleton bypass and last resort do not increment these counters; ranks in nested groups are not a one-to-one count of dispatched connections.
+Each `R` value is a saturating `u64` count, not a latency, throughput or health measurement. One authorized multi-candidate Score Apply records one final reason: `coldExplore` or `periodicExplore` for validation; `incumbentIneligible` for leaving an incumbent outside ordinary eligibility; `freshFailureBypass` for an eligible incumbent's unresolved business failure; `insufficientEvidenceHeld` when no challenger earns promotion and the ordinary utility winner lacks a qualified shared performance comparison; `directionalTradeoffHeld` when none earns promotion and a comparison has at least 10% gain in one known direction but greater than 10% loss in another; `incumbentHeld` when comparison does not clear the hold margin; otherwise `reliabilityWinner` or `performanceWinner` retain their alternative-eligibility classification. `performanceWinner` does not by itself prove improvement or a switch, and `insufficientEvidenceHeld` does not mean reliability history is absent. `ordinarySwitch` counts actual committed normal A→B choices; `switchFlap` counts returns to the prior winner within eight same-target ordinary choices. First choices, trials and missing prior history cannot add switches. `deadFiltered`, `failStreakExcluded` and `exploreBackedOff` count affected candidates per rank. Peek, API reads, singleton bypass and last resort do not increment these reason counters; ranks in nested groups are not a one-to-one count of dispatched connections.
 
 For UDP, `deadFiltered` also counts candidates excluded by protocol/configuration incapability. It is a candidate-filter count, not a count of newly failed nodes or business attempts; these exclusions do not add Score failures or exploration backoff.
 
@@ -253,7 +265,7 @@ For UDP, `deadFiltered` also counts candidates excluded by protocol/configuratio
 
 Counters begin at zero on process start and accumulate in process memory only. They survive a successful reload while the group name remains configured, including zero-leaf and temporary Score-to-non-Score-to-Score transitions; non-Score groups are hidden from this response. A committed deletion prunes that name's counters, and a recreated name starts at zero. Generation-fenced superseded managers cannot mutate counters after replacement, including after same-name recreation. The snapshot is copied before JSON serialization, so reading it cannot mutate selection state.
 
-`/stats.score` exports group names, fixed TCP/UDP reason and verification counters, and bounded evidence-cache occupancy/evictions. It contains no node identity, target/domain/IP/port, raw cell, cadence key, authority or credential. Existing public member names in `/proxies` and destination metadata in `/connections` remain unchanged.
+`/stats.score` exports group names, fixed TCP/UDP reason, verification and budget fields, a root business count, and bounded evidence-cache totals. It contains no node identity, target/domain/IP/port, raw cell, cadence key, authority or credential. Existing public member names in `/proxies` and destination metadata in `/connections` remain unchanged.
 
 ### Score verification
 
@@ -263,14 +275,37 @@ Score group objects in `/proxies` and `/proxies/{name}` add `scoreVerification`.
 | --- | --- |
 | `selected` | Existing public member tag for this readonly evaluation, or null with no ordinary eligible candidate. TCP `now` uses this same evaluated choice when present. |
 | `state` | `provisional` or `observedUsable`; the latter requires four distinct targeted Traffic reporters with RX after setup/TX in one uninterrupted availability cohort, with its latest eligible RX less than 60 seconds old. Open flows can qualify; clones/repeats cannot add credits. Failure/reload or a 60-second gap resets the cohort. This does not grant ordinary selection qualification or clear streaks. |
-| `comparison` / `basis` | `unconfirmed`, `equivalent` or `supported`, with `none`, `configuredProbe`, `targetResponse`, `aggregateResponse`, `upload` or `download` as the limited evidence basis. No probability or guaranteed optimum is implied. |
+| `comparison` / `basis` | `unconfirmed`, `equivalent` or `supported`, with `none`, `configuredProbe`, `targetResponse`, `commonTargets`, `upload` or `download` as the evidence-basis vocabulary. `commonTargets` uses bounded equal-weight shared targets, not unrelated aggregate averages; setup/warm-up are not proof. No probability or guaranteed optimum is implied. |
 | `missing` | Boolean availability/response/transfer gaps across the relevant candidate coverage; selected usability can be observed while an alternative still needs validation. |
-| `nextAction` | `nextBusinessFlow` reserves future real work for evidence, ordinary qualification or recovery only when the shared budget permits; `awaitTransfer` waits for real offered load, never active bulk testing; `backoff` retains failure isolation; `none` means no actionable missing work. |
+| `nextAction` | `nextBusinessFlow` names future real-work demand for evidence, ordinary qualification or recovery, not a reservation or dispatched I/O; inspect `waitReason`. `awaitTransfer` waits for offered load, never active bulk testing; `backoff` retains failure isolation; `none` means no actionable missing work. |
+| `question` | `none`, `availability`, `response`, `qualification`, `recovery` or `transfer`: the next unresolved evidence question. No remaining action reports `none`; backoff retains the blocked candidate's question rather than the settled winner's. |
+| `waitReason` | `none`; `budget` for unavailable credit; `comparableTraffic` for future comparable business; `inFlight` for sufficient matching-target work or the separate four-work node ceiling; `transfer` for offered transfer load; or `backoff` for failure isolation. Aggregate reads inspect retained IPv4/IPv6 scopes without creating them: both budget-blocked yields `budget`, either available/unseen scope leaves future comparable traffic possible, otherwise an in-flight wait remains. A wait is not proof that work will succeed. |
+| `localComparison` | Bounded active-challenger summary below; it never upgrades incomplete whole-candidate coverage to a global comparison. |
 | `coverage` | Candidate, compared and pending counts; pending includes ordinary qualification/recovery work even when availability/response gaps are closed. A singleton can be usable without proving it beats another path. |
 | `evidenceAgeMs` / `validForMs` | Age and remaining conditional validity of the weakest supporting evidence, or null without a claim. New evidence can revoke a claim earlier. |
 | `network`, `targetFamily`, `healthFamily`, `targetSpecific` | Transport and scope dimensions. This aggregate endpoint has no exact target and exports no domain/IP/port or raw node ID. |
 
+`localComparison.scope` is `activeChallengers`; `comparison` and `basis` use the vocabularies above. `comparedCandidates` includes the selected member and supported challengers. `reporters` is the weakest per-side retained distinct-reporter support: each of four blocks retains up to four IDs, and their deduplicated union can reach sixteen; this is not the exact count of every observed reporter. `spanMs`, `evidenceAgeMs`, `validForMs` and `dispersionPpm` describe that support, not statistical independence or error probability. `uploadKnown` and `downloadKnown` keep unknown directions explicit; `directionalTradeoff` flags opposing qualified directional changes. Proof uses shared 15-second blocks, each expiring at block start plus 60 seconds, with current probe-cohort/failure/reload/incarnation fences. A locally supported subset can coexist with top-level `comparison: "unconfirmed"`.
+
 `/stats.score.groups[].verification.tcp` and `.udp` add saturating counters: `provisionalSelections`, `usableSelections`, `validationSelections`, `confirmations`, `expired`, `contradicted`, and `confirmationMillis`. Confirmations count newly supported empirical claims, including configured-probe comparisons; they do not mean business or bandwidth certification in every dimension. `confirmationMillis / confirmations` is accumulated time to those observed claims, not a network latency metric. Expiry is reflected immediately on readonly inspection, while transition counters advance only on a subsequent authorized Apply. Missing traffic/budget never grants confirmation, and reads do not dispatch validation or change counters. The 10% comparison tolerance is a practical equivalence threshold, not a calibrated error probability.
+
+### Score work budget and observed costs
+
+`/stats.score.businessStarts` counts unique original Score business starts across nested groups. `/stats.score.groups[].budget.tcp` and `.udp` aggregate retained target-family scopes; nested group totals must not be summed as unique businesses. Original work counts even when selected as a trial; retries, clones and reads do not create another original. Node-specific work starts before DNS/admission waits, independently of the reporter's physical/logical I/O boundary.
+
+Budget counters report recorded ledger values. Readonly wait and cold-start decisions also account for credit refundable from expired pending reservations; they do not update `refunded`, `expired` or other counters.
+
+| Fields | Meaning |
+| --- | --- |
+| `businessStarts`, `scopes`, `earningPeriod` | Original starts summed over retained scopes, scope count, and the maximum frozen earning period across them (not a denominator for a combined-scope budget formula). Each scope freezes `q = clamp(2n,16,64)` and cold allowance `B` at creation; `spent + reserved <= B + floor(businessStarts/q)` applies per scope. |
+| `sources.cold`, `sources.periodic`, `sources.recovery` | Started work by source: cold-token trial, earned-token trial, or budget-neutral recovery retry. Ordinary non-trial work has no source bucket. `recovery` is not an optional trial or new original business. |
+| `trialStarts`, `spent`, `reserved` | Begun optional trials, cumulative spent tokens, and outstanding unbegun token reservations. Begin spends once; cancellation after begin does not refund. |
+| `coldAllowance`, `coldAvailable`, `earnedAvailable` | Summed frozen initial allowances and current available credit. Each scope retains at most eight unspent earned tokens. Time, reads, target churn and evidence expiry earn none; retained reload/membership changes do not reset currency. |
+| `budgetBlocked`, `inFlightBlocked`, `refunded`, `expired` | Denied reservation counts, last-reference/unbegun invalidation refunds, and expired in-flight tracking entries. Only unbegun reservations refund; tracking expiry never refunds begun work. |
+| `trialSuccess`, `trialFailure`, `trialCancelled` | Exactly-once outcomes of begun optional trials. Rejection/shutdown/neutral cancellation belongs to `trialCancelled`. `trialFailure` is actual observed failure, not the extra failures caused by choosing a trial instead of an unobserved alternative. |
+| `trialSetupHistogram`, `trialSetupMillis`, `trialElapsedMillis` | Eight fixed log2-millisecond setup buckets (slot 0 includes 0–1 ms; final slot includes 128 ms and above), summed observed setup duration, and summed start-to-settlement duration. These measure actual trial cost, not causal extra latency or overhead. |
+
+`/stats.score.cache.comparisonCells` is capped at 256. `comparisonLogicalBytes` charges the comparison store, vector capacity and owned key capacity; `comparisonLogicalCapacity` is its implementation-sized worst-case allocation bound, no greater than 1 MiB. Neither is measured process RSS or the size of all Score state; allocator overhead and other process allocations are excluded. `comparisonEvictions`, `comparisonExpired` and `comparisonRejected` count store removal/admission events; readonly expiry can invalidate support before physical removal increments a counter. Existing exact/aggregate LRU fields are unchanged.
 
 ### Outbound and ready-pool fields
 

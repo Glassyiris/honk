@@ -337,7 +337,10 @@ async fn delivered_udp_reply_restores_incumbent_protection_before_endpoint_finis
         "accepted RX must restore protection before terminal settlement",
     );
     let recovered = manager.score_reason_snapshot()[0].udp;
-    assert_eq!(recovered.incumbent_held, before.incumbent_held + 1);
+    assert_eq!(
+        recovered.insufficient_evidence_held,
+        before.insufficient_evidence_held + 1
+    );
     assert_eq!(recovered.fresh_failure_bypass, 0);
     assert_eq!(recovered.incumbent_ineligible, 0);
     assert_eq!(recovered.ordinary_switch, 0);

@@ -1,7 +1,8 @@
 use honk_outbound::alive::IpVersion;
 use honk_outbound::group::{
-    GroupManager, ScoreComparison, ScoreEvidenceBasis, ScoreEvidenceGaps, ScoreValidationAction,
-    ScoreVerificationCounters, ScoreVerificationSnapshot, ScoreVerificationState, SelectionNetwork,
+    GroupManager, ScoreBudgetCounters, ScoreComparison, ScoreEvidenceBasis, ScoreEvidenceGaps,
+    ScoreEvidenceQuestion, ScoreLocalComparison, ScoreValidationAction, ScoreVerificationCounters,
+    ScoreVerificationSnapshot, ScoreVerificationState, ScoreWaitReason, SelectionNetwork,
 };
 
 pub(super) fn verification(
@@ -40,6 +41,9 @@ fn snapshot(
             transfer: true,
         },
         next_action: ScoreValidationAction::None,
+        question: ScoreEvidenceQuestion::None,
+        wait_reason: ScoreWaitReason::None,
+        local_comparison: ScoreLocalComparison::default(),
         candidate_count: 0,
         compared_count: 0,
         pending_count: 0,
@@ -65,7 +69,7 @@ fn snapshot(
             ScoreEvidenceBasis::None => "none",
             ScoreEvidenceBasis::ConfiguredProbe => "configuredProbe",
             ScoreEvidenceBasis::TargetResponse => "targetResponse",
-            ScoreEvidenceBasis::AggregateResponse => "aggregateResponse",
+            ScoreEvidenceBasis::CommonTargets => "commonTargets",
             ScoreEvidenceBasis::Upload => "upload",
             ScoreEvidenceBasis::Download => "download",
         },
@@ -80,6 +84,23 @@ fn snapshot(
             ScoreValidationAction::AwaitTransfer => "awaitTransfer",
             ScoreValidationAction::Backoff => "backoff",
         },
+        "question": match snapshot.question {
+            ScoreEvidenceQuestion::None => "none",
+            ScoreEvidenceQuestion::Availability => "availability",
+            ScoreEvidenceQuestion::Response => "response",
+            ScoreEvidenceQuestion::Qualification => "qualification",
+            ScoreEvidenceQuestion::Recovery => "recovery",
+            ScoreEvidenceQuestion::Transfer => "transfer",
+        },
+        "waitReason": match snapshot.wait_reason {
+            ScoreWaitReason::None => "none",
+            ScoreWaitReason::Budget => "budget",
+            ScoreWaitReason::ComparableTraffic => "comparableTraffic",
+            ScoreWaitReason::InFlight => "inFlight",
+            ScoreWaitReason::Transfer => "transfer",
+            ScoreWaitReason::Backoff => "backoff",
+        },
+        "localComparison": local_comparison(snapshot.local_comparison),
         "coverage": {
             "candidates": snapshot.candidate_count,
             "compared": snapshot.compared_count,
@@ -112,5 +133,58 @@ pub(super) fn counters(counters: ScoreVerificationCounters) -> serde_json::Value
         "expired": counters.expired,
         "contradicted": counters.contradicted,
         "confirmationMillis": counters.confirmation_millis,
+    })
+}
+
+fn local_comparison(value: ScoreLocalComparison) -> serde_json::Value {
+    serde_json::json!({
+        "scope": "activeChallengers",
+        "comparison": match value.comparison {
+            ScoreComparison::Unconfirmed => "unconfirmed",
+            ScoreComparison::Equivalent => "equivalent",
+            ScoreComparison::Supported => "supported",
+        },
+        "basis": match value.basis {
+            ScoreEvidenceBasis::None => "none",
+            ScoreEvidenceBasis::ConfiguredProbe => "configuredProbe",
+            ScoreEvidenceBasis::TargetResponse => "targetResponse",
+            ScoreEvidenceBasis::CommonTargets => "commonTargets",
+            ScoreEvidenceBasis::Upload => "upload",
+            ScoreEvidenceBasis::Download => "download",
+        },
+        "comparedCandidates": value.compared_candidates,
+        "reporters": value.reporter_count,
+        "spanMs": value.span_ms,
+        "evidenceAgeMs": value.evidence_age_ms,
+        "validForMs": value.valid_for_ms,
+        "dispersionPpm": value.dispersion_ppm,
+        "uploadKnown": value.upload_known,
+        "downloadKnown": value.download_known,
+        "directionalTradeoff": value.directional_tradeoff,
+    })
+}
+
+pub(super) fn budget(value: ScoreBudgetCounters) -> serde_json::Value {
+    serde_json::json!({
+        "businessStarts": value.business_starts,
+        "sources": { "cold": value.cold_trial_starts, "periodic": value.periodic_trial_starts, "recovery": value.recovery_starts },
+        "trialStarts": value.trial_starts,
+        "reserved": value.reserved,
+        "spent": value.spent,
+        "budgetBlocked": value.budget_blocked,
+        "inFlightBlocked": value.in_flight_blocked,
+        "refunded": value.refunded,
+        "expired": value.expired,
+        "coldAllowance": value.cold_allowance,
+        "coldAvailable": value.cold_available,
+        "earnedAvailable": value.earned_available,
+        "earningPeriod": value.earning_period,
+        "scopes": value.scopes,
+        "trialSuccess": value.trial_success,
+        "trialFailure": value.trial_failure,
+        "trialCancelled": value.trial_cancelled,
+        "trialSetupHistogram": value.trial_setup_histogram,
+        "trialSetupMillis": value.trial_setup_millis,
+        "trialElapsedMillis": value.trial_elapsed_millis,
     })
 }

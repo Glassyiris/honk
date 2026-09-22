@@ -57,7 +57,7 @@ impl DoqClient {
     pub async fn exchange(
         self: &Arc<Self>,
         raw_query: &[u8],
-        feedback: Option<&honk_outbound::group::ScoreFeedback>,
+        feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
     ) -> anyhow::Result<Vec<u8>> {
         exchange_with_retry(
             "DoQ",

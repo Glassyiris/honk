@@ -727,7 +727,13 @@ async fn reload_publishes_score_authority_before_dns_snapshot_is_reachable() {
         assert!(lock_at_hook.reload_lock.try_lock().is_err());
         let first = new_manager.selection_plan_for_target("score", &score_reload_context());
         let first_id = first.entries[0].node.id;
-        let reporter = first.entries[0].feedback.as_ref().unwrap().start();
+        let reporter = first.entries[0]
+            .feedback
+            .as_ref()
+            .unwrap()
+            .begin()
+            .unwrap()
+            .start();
         reporter.setup_succeeded();
         reporter.tx(1);
         reporter.rx(1);
@@ -742,11 +748,14 @@ async fn reload_publishes_score_authority_before_dns_snapshot_is_reachable() {
             "the published replacement authority must accept Score writes"
         );
         assert!(
-            old_manager
+            !old_manager
                 .selection_plan_for_target("score", &score_reload_context())
                 .entries[0]
                 .feedback
-                .is_none()
+                .as_ref()
+                .unwrap()
+                .begin()
+                .is_ok()
         );
         observed_at_hook.store(true, std::sync::atomic::Ordering::Release);
         println!("replacement Score authority accepted writes before DNS publication");
@@ -811,6 +820,8 @@ async fn failed_reload_keeps_old_score_authority() {
     println!("rejected reload preserved DNS generation and old Score authority");
     feedback
         .unwrap()
+        .begin()
+        .unwrap()
         .start()
         .setup_failed(honk_outbound::group::ScoreOutcome::Timeout);
 }
@@ -857,11 +868,14 @@ async fn post_publication_datapath_failure_is_committed_degraded() {
         0
     );
     assert!(
-        before_manager
+        !before_manager
             .selection_plan_for_target("score", &score_reload_context())
             .entries[0]
             .feedback
-            .is_none()
+            .as_ref()
+            .unwrap()
+            .begin()
+            .is_ok()
     );
     assert!(
         cp.group_manager

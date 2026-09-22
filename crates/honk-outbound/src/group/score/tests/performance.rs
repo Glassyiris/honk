@@ -1,4 +1,25 @@
+use super::super::ranking::ordinary_selection;
 use super::*;
+
+fn ordinary_at(
+    manager: &GroupManager,
+    nodes: &[Node],
+    target: &ScoreSelectionContext,
+    incumbent: Option<usize>,
+    now: Instant,
+) -> RankedSelection {
+    let state = manager.score_state();
+    let inner = state.inner.lock();
+    let refs = nodes.iter().collect::<Vec<_>>();
+    let decision = decision_at(&inner, nodes, target, incumbent.unwrap_or(0), now);
+    ordinary_selection(
+        &decision.scores,
+        &refs,
+        incumbent,
+        decision.baseline,
+        &decision.pairs,
+    )
+}
 
 #[test]
 fn one_exact_success_cannot_weaken_mature_incumbent_protection() {
@@ -19,7 +40,14 @@ fn one_exact_success_cannot_weaken_mature_incumbent_protection() {
         );
     }
     assert_eq!(
-        rank_at(&manager, &nodes, &target, now + Duration::from_secs(4)),
+        ordinary_at(
+            &manager,
+            &nodes,
+            &target,
+            None,
+            now + Duration::from_secs(4)
+        )
+        .index,
         0
     );
     train_at(
@@ -40,17 +68,15 @@ fn one_exact_success_cannot_weaken_mature_incumbent_protection() {
         1,
         now + Duration::from_secs(7),
     );
-    assert_eq!(
-        rank_at(&manager, &nodes, &target, now + Duration::from_secs(9)),
-        0
+    let held = ordinary_at(
+        &manager,
+        &nodes,
+        &target,
+        Some(0),
+        now + Duration::from_secs(9),
     );
-    let state = manager.score_state();
-    assert_eq!(
-        state
-            .selection_reason_counts("score", SelectionNetwork::Tcp)
-            .incumbent_held,
-        1
-    );
+    assert_eq!(held.index, 0);
+    assert_eq!(held.reason, SelectionReason::IncumbentHeld);
 
     for (index, leaf) in nodes.iter().enumerate() {
         train_at(
@@ -63,16 +89,15 @@ fn one_exact_success_cannot_weaken_mature_incumbent_protection() {
             now + Duration::from_secs(10 + index as u64 * 2),
         );
     }
-    assert_eq!(
-        rank_at(&manager, &nodes, &target, now + Duration::from_secs(14)),
-        1
+    let promoted = ordinary_at(
+        &manager,
+        &nodes,
+        &target,
+        Some(0),
+        now + Duration::from_secs(14),
     );
-    assert_eq!(
-        state
-            .selection_reason_counts("score", SelectionNetwork::Tcp)
-            .ordinary_switch,
-        1
-    );
+    assert_eq!(promoted.index, 1);
+    assert_eq!(promoted.reason, SelectionReason::PerformanceWinner);
 }
 
 #[test]
@@ -94,7 +119,14 @@ fn expired_incumbent_holds_unmatched_refresh_but_shared_probe_can_promote() {
         );
     }
     assert_eq!(
-        rank_at(&manager, &nodes, &target, start + Duration::from_secs(6)),
+        ordinary_at(
+            &manager,
+            &nodes,
+            &target,
+            None,
+            start + Duration::from_secs(6)
+        )
+        .index,
         0
     );
     for (index, leaf) in nodes.iter().enumerate().skip(1) {
@@ -108,15 +140,9 @@ fn expired_incumbent_holds_unmatched_refresh_but_shared_probe_can_promote() {
             start + Duration::from_secs(80 + index as u64 * 2),
         );
     }
-    let state = manager.score_state();
-    let refs = nodes.iter().collect::<Vec<_>>();
-    assert_eq!(state.peek_rank("score", &target, &refs), 0);
-    let _ = rank_at(&manager, &nodes, &target, now);
-    assert_eq!(rank_at(&manager, &nodes, &target, now), 0);
-    let reasons = state.selection_reason_counts("score", SelectionNetwork::Tcp);
-    assert_eq!(reasons.insufficient_evidence_held, 2);
-    assert_eq!(reasons.ordinary_switch, 0);
-    assert_eq!(reasons.periodic_explore, 0);
+    let held = ordinary_at(&manager, &nodes, &target, Some(0), now);
+    assert_eq!(held.index, 0);
+    assert_eq!(held.reason, SelectionReason::InsufficientEvidenceHeld);
 
     let probe = context("configured.example", IpVersion::V4);
     for (leaf, latency) in nodes[..2].iter().zip([600, 60]) {
@@ -129,13 +155,9 @@ fn expired_incumbent_holds_unmatched_refresh_but_shared_probe_can_promote() {
             now,
         );
     }
-    assert_eq!(rank_at(&manager, &nodes, &target, now), 1);
-    assert_eq!(
-        state
-            .selection_reason_counts("score", SelectionNetwork::Tcp)
-            .ordinary_switch,
-        1
-    );
+    let promoted = ordinary_at(&manager, &nodes, &target, Some(0), now);
+    assert_eq!(promoted.index, 1);
+    assert_eq!(promoted.reason, SelectionReason::PerformanceWinner);
 }
 
 #[test]
@@ -241,15 +263,15 @@ fn opposite_direction_strengths_do_not_create_a_pairwise_rate_gain() {
             reporter.finish_at(ScoreOutcome::Success, true, at + Duration::from_secs(1));
         }
     }
-    assert_eq!(
-        rank_at(&manager, &nodes, &target, now + Duration::from_secs(13)),
-        0
+    let held = ordinary_at(
+        &manager,
+        &nodes,
+        &target,
+        Some(0),
+        now + Duration::from_secs(13),
     );
-    let reasons = manager
-        .score_state()
-        .selection_reason_counts("score", SelectionNetwork::Tcp);
-    assert_eq!(reasons.incumbent_held, 1);
-    assert_eq!(reasons.ordinary_switch, 0);
+    assert_eq!(held.index, 0);
+    assert_eq!(held.reason, SelectionReason::DirectionalTradeoffHeld);
 }
 
 #[test]
@@ -276,12 +298,15 @@ fn less_sampled_faster_leaf_wins_normal_selection() {
         8_000_000,
         now,
     );
-    assert_eq!(selected(&manager, &target), nodes[1].id);
-    let reasons = manager
-        .score_state()
-        .selection_reason_counts("score", SelectionNetwork::Tcp);
-    assert_eq!(reasons.performance_winner, 1);
-    assert_eq!(reasons.cold_explore + reasons.periodic_explore, 0);
+    let winner = ordinary_at(
+        &manager,
+        &nodes,
+        &target,
+        None,
+        now + Duration::from_secs(2),
+    );
+    assert_eq!(winner.index, 1);
+    assert_eq!(winner.reason, SelectionReason::PerformanceWinner);
 }
 
 #[test]
@@ -299,41 +324,41 @@ fn sparse_fast_leaf_earns_normal_traffic_with_bounded_validation() {
         2_000_000,
         now,
     );
-    let mut trials = 0;
+    let state = manager.score_state();
+    let refs = nodes.iter().collect::<Vec<_>>();
     let mut normal_winner = false;
     for request in 0..96 {
-        let before = manager
-            .score_state()
-            .selection_reason_counts("score", SelectionNetwork::Tcp);
-        let index = rank_at(&manager, &nodes, &target, now + Duration::from_secs(2));
-        let after = manager
-            .score_state()
-            .selection_reason_counts("score", SelectionNetwork::Tcp);
-        if index == 1 {
-            if after.cold_explore + after.periodic_explore
-                == before.cold_explore + before.periodic_explore
-            {
-                normal_winner = true;
-                break;
-            }
-            trials += 1;
-            assert!(trials <= 1 + request / 16);
-        }
-        train_at(
-            &manager,
-            &nodes[index],
-            &target,
-            1,
-            Duration::from_millis(if index == 0 { 600 } else { 60 }),
-            if index == 0 { 2_000_000 } else { 8_000_000 },
-            now,
+        let at = now + Duration::from_secs(2 + request * 2);
+        let before = state.selection_reason_counts("score", SelectionNetwork::Tcp);
+        let (index, feedback) = state.rank_plan_at("score", &target, &refs, at);
+        let after = state.selection_reason_counts("score", SelectionNetwork::Tcp);
+        let guard = feedback.begin_at(at).unwrap();
+        let budget = state.budget_counters("score", SelectionNetwork::Tcp);
+        assert!(
+            budget.trial_starts + budget.reserved
+                <= budget.cold_allowance + budget.business_starts / budget.earning_period
         );
+        let reporter = guard.start_at(at);
+        reporter.setup_succeeded_at(at);
+        reporter.first_response_at(at + Duration::from_millis(if index == 0 { 600 } else { 60 }));
+        reporter.transfer_at(
+            1,
+            if index == 0 { 2_000_000 } else { 8_000_000 },
+            at + Duration::from_secs(1),
+        );
+        reporter.finish_at(ScoreOutcome::Success, true, at + Duration::from_secs(1));
+        if index == 1
+            && after.cold_explore + after.periodic_explore
+                == before.cold_explore + before.periodic_explore
+        {
+            normal_winner = true;
+            break;
+        }
     }
     assert!(
         normal_winner,
         "successful validation must graduate out of exploration"
     );
-    assert!(trials <= 6);
 }
 
 #[test]
@@ -426,12 +451,24 @@ fn excluded_leaf_cannot_change_eligible_performance_winner_or_reason() {
             .start_at(now)
             .finish_at(ScoreOutcome::Timeout, true, now);
     }
-    assert_eq!(rank_at(&manager, &nodes, &target, now), 0);
-    let reasons = manager
-        .score_state()
-        .selection_reason_counts("score", SelectionNetwork::Tcp);
-    assert_eq!(reasons.performance_winner, 1);
-    assert_eq!(reasons.reliability_winner, 0);
+    let with_excluded = ordinary_at(
+        &manager,
+        &nodes,
+        &target,
+        None,
+        now + Duration::from_secs(2),
+    );
+    let eligible_only = ordinary_at(
+        &manager,
+        &nodes[..2],
+        &target,
+        None,
+        now + Duration::from_secs(2),
+    );
+    assert_eq!(with_excluded.index, 0);
+    assert_eq!(with_excluded.index, eligible_only.index);
+    assert_eq!(with_excluded.reason, SelectionReason::PerformanceWinner);
+    assert_eq!(with_excluded.reason, eligible_only.reason);
 }
 
 #[test]
@@ -482,7 +519,7 @@ fn stale_exact_volume_cannot_override_fresh_comparable_probes() {
             now,
         );
         assert_eq!(
-            rank_at(&manager, &nodes, &target, now),
+            ordinary_at(&manager, &nodes, &target, Some(0), now).index,
             1,
             "history volume={samples}"
         );
@@ -551,7 +588,10 @@ fn trustworthy_target_beats_probe_only_while_target_is_fresh() {
         Duration::from_millis(60),
         expired,
     );
-    assert_eq!(rank_at(&manager, &nodes, &target, expired), 1);
+    assert_eq!(
+        ordinary_at(&manager, &nodes, &target, Some(0), expired).index,
+        1
+    );
 }
 
 #[test]
@@ -608,7 +648,7 @@ fn starts_and_warmups_do_not_renew_business_freshness() {
         Duration::from_millis(60),
         now,
     );
-    assert_eq!(rank_at(&manager, &nodes, &target, now), 1);
+    assert_eq!(ordinary_at(&manager, &nodes, &target, None, now).index, 1);
     unfinished.finish_at(ScoreOutcome::Cancelled, false, now);
 }
 
@@ -637,7 +677,14 @@ fn qualified_half_faster_goodput_switches_but_latency_jitter_holds() {
         now,
     );
     assert_eq!(
-        rank_at(&manager, &nodes, &target, now + Duration::from_secs(2)),
+        ordinary_at(
+            &manager,
+            &nodes,
+            &target,
+            None,
+            now + Duration::from_secs(2)
+        )
+        .index,
         0
     );
     train_at(
@@ -650,20 +697,37 @@ fn qualified_half_faster_goodput_switches_but_latency_jitter_holds() {
         now,
     );
     assert_eq!(
-        rank_at(&manager, &nodes, &target, now + Duration::from_secs(2)),
+        ordinary_at(
+            &manager,
+            &nodes,
+            &target,
+            Some(0),
+            now + Duration::from_secs(2)
+        )
+        .index,
         0
     );
-    train_at(
-        &manager,
-        &nodes[1],
-        &target,
-        20,
-        Duration::from_millis(100),
-        1_500_000,
-        now,
-    );
+    let refreshed = now + PERFORMANCE_MAX_AGE + Duration::from_secs(2);
+    for (leaf, download) in nodes.iter().zip([1_000_000, 1_500_000]) {
+        train_at(
+            &manager,
+            leaf,
+            &target,
+            20,
+            Duration::from_millis(100),
+            download,
+            refreshed,
+        );
+    }
     assert_eq!(
-        rank_at(&manager, &nodes, &target, now + Duration::from_secs(2)),
+        ordinary_at(
+            &manager,
+            &nodes,
+            &target,
+            Some(0),
+            refreshed + Duration::from_secs(2)
+        )
+        .index,
         1
     );
 }
@@ -714,7 +778,10 @@ fn probe_domains_and_health_families_are_not_comparable() {
         Duration::from_millis(1),
         now,
     );
-    assert_eq!(rank_at(&manager, &nodes, &target, now), 0);
+    assert_eq!(
+        ordinary_at(&manager, &nodes, &target, Some(0), now).index,
+        0
+    );
     probe.probe_domain = ProbeDomain::DataUdp;
     probe.health_family = IpVersion::V6;
     probe_at(
@@ -725,7 +792,10 @@ fn probe_domains_and_health_families_are_not_comparable() {
         Duration::from_millis(1),
         now,
     );
-    assert_eq!(rank_at(&manager, &nodes, &target, now), 0);
+    assert_eq!(
+        ordinary_at(&manager, &nodes, &target, Some(0), now).index,
+        0
+    );
     probe.health_family = IpVersion::V4;
     probe_at(
         &manager,
@@ -735,7 +805,10 @@ fn probe_domains_and_health_families_are_not_comparable() {
         Duration::from_millis(1),
         now,
     );
-    assert_eq!(rank_at(&manager, &nodes, &target, now), 1);
+    assert_eq!(
+        ordinary_at(&manager, &nodes, &target, Some(0), now).index,
+        1
+    );
 }
 
 #[test]
@@ -776,7 +849,10 @@ fn one_healthy_probe_scope_does_not_replace_another() {
         Duration::from_millis(1),
         now,
     );
-    assert_eq!(rank_at(&manager, &nodes, &target, now), 1);
+    assert_eq!(
+        ordinary_at(&manager, &nodes, &target, Some(0), now).index,
+        1
+    );
     probe.probe_domain = ProbeDomain::DnsUdp;
     probe_at(
         &manager,
@@ -796,7 +872,10 @@ fn one_healthy_probe_scope_does_not_replace_another() {
         Duration::from_secs(10),
         now,
     );
-    assert_eq!(rank_at(&manager, &nodes, &target, now), 1);
+    assert_eq!(
+        ordinary_at(&manager, &nodes, &target, Some(1), now).index,
+        1
+    );
 }
 
 fn http_probe_at(

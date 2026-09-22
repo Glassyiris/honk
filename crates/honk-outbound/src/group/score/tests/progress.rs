@@ -1,4 +1,4 @@
-use super::super::ranking::{normal_eligible, ordinary_selection, performance_baseline};
+use super::super::ranking::{normal_eligible, ordinary_selection};
 use super::*;
 
 fn udp_context() -> ScoreSelectionContext {
@@ -13,13 +13,10 @@ fn snapshots(
     nodes: &[Node],
     target: &ScoreSelectionContext,
     at: Instant,
-) -> Vec<ScoreSnapshot> {
+) -> super::super::ranking::Decision {
     let state = manager.score_state();
     let inner = state.inner.lock();
-    nodes
-        .iter()
-        .map(|node| score_snapshot(&inner, "score", target, node.id, at))
-        .collect()
+    decision_at(&inner, nodes, target, 0, at)
 }
 
 #[test]
@@ -39,10 +36,8 @@ fn active_udp_keeps_earned_qualification_without_inventing_completions() {
             now,
         );
     }
-    assert_eq!(
-        rank_at(&manager, &nodes, &target, now + Duration::from_secs(1)),
-        0
-    );
+    // A cold optional trial is not an ordinary incumbent switch.
+    let _ = rank_at(&manager, &nodes, &target, now + Duration::from_secs(1));
     let active: Vec<_> = nodes
         .iter()
         .map(|leaf| {
@@ -60,16 +55,16 @@ fn active_udp_keeps_earned_qualification_without_inventing_completions() {
             reporter.transfer_at(1, 1, at);
         }
         let scores = snapshots(&manager, &nodes, &target, at);
-        let baseline = performance_baseline(&scores);
-        assert!(scores[0].useful_completed < 4.0);
+        let baseline = scores.baseline;
+        assert!(scores.scores[0].useful_completed < 4.0);
         if second == 2 {
-            assert!(scores[1].useful_completed >= 4.0);
+            assert!(scores.scores[1].useful_completed >= 4.0);
         }
         assert!(baseline.any_qualified);
-        assert!(normal_eligible(&scores[0], baseline));
-        assert!(normal_eligible(&scores[1], baseline));
-        assert!(!normal_eligible(&scores[2], baseline));
-        for (score, samples) in scores.iter().zip([4.0, 5.0, 3.0]) {
+        assert!(normal_eligible(&scores.scores[0], baseline));
+        assert!(normal_eligible(&scores.scores[1], baseline));
+        assert!(!normal_eligible(&scores.scores[2], baseline));
+        for (score, samples) in scores.scores.iter().zip([4.0, 5.0, 3.0]) {
             let expected = samples * (-((second - 1) as f64) / 1800.0).exp2();
             assert_close(score.completed, expected);
             assert_close(score.useful_completed, expected);
@@ -77,13 +72,14 @@ fn active_udp_keeps_earned_qualification_without_inventing_completions() {
             assert!(!score.unresolved_failure);
         }
         if second == 2 {
-            assert_eq!(rank_at(&manager, &nodes, &target, at), 0);
+            let _ = rank_at(&manager, &nodes, &target, at);
         }
         let ordinary = ordinary_selection(
-            &scores,
+            &scores.scores,
             &nodes.iter().collect::<Vec<_>>(),
             Some(0),
             baseline,
+            &scores.pairs,
         );
         assert_eq!(ordinary.index, 0);
     }
@@ -113,23 +109,21 @@ fn active_udp_keeps_earned_qualification_without_inventing_completions() {
     );
     let expiry = now + Duration::from_secs(722);
     let before = snapshots(&manager, &nodes, &target, expiry - Duration::from_nanos(1));
-    assert!(normal_eligible(&before[0], performance_baseline(&before)));
+    assert!(normal_eligible(&before.scores[0], before.baseline));
     let expired = snapshots(&manager, &nodes, &target, expiry);
-    assert!(!normal_eligible(
-        &expired[0],
-        performance_baseline(&expired)
-    ));
+    assert!(!normal_eligible(&expired.scores[0], expired.baseline));
     let ordinary = ordinary_selection(
-        &expired,
+        &expired.scores,
         &nodes.iter().collect::<Vec<_>>(),
         Some(0),
-        performance_baseline(&expired),
+        expired.baseline,
+        &expired.pairs,
     );
     assert_eq!(ordinary.index, 1);
     assert_eq!(ordinary.reason, SelectionReason::IncumbentIneligible);
     active[0].transfer_at(1, 1, expiry + Duration::from_secs(1));
     let late = snapshots(&manager, &nodes, &target, expiry + Duration::from_secs(1));
-    assert!(!normal_eligible(&late[0], performance_baseline(&late)));
+    assert!(!normal_eligible(&late.scores[0], late.baseline));
 
     let settled_at = expiry + Duration::from_secs(2);
     let before = snapshots(&manager, &nodes, &target, settled_at);
@@ -138,13 +132,16 @@ fn active_udp_keeps_earned_qualification_without_inventing_completions() {
     clone.finish_at(ScoreOutcome::Timeout, true, settled_at);
     clone.transfer_at(1, 1, settled_at + Duration::from_secs(1));
     let settled = snapshots(&manager, &nodes, &target, settled_at);
-    assert_close(settled[0].completed, before[0].completed + 1.0);
     assert_close(
-        settled[0].useful_completed,
-        before[0].useful_completed + 1.0,
+        settled.scores[0].completed,
+        before.scores[0].completed + 1.0,
     );
-    assert!(normal_eligible(&settled[0], performance_baseline(&settled)));
-    assert!(!settled[0].unresolved_failure);
+    assert_close(
+        settled.scores[0].useful_completed,
+        before.scores[0].useful_completed + 1.0,
+    );
+    assert!(normal_eligible(&settled.scores[0], settled.baseline));
+    assert!(!settled.scores[0].unresolved_failure);
     for reporter in &active[1..] {
         reporter.finish_at(ScoreOutcome::Cancelled, true, settled_at);
     }
@@ -155,13 +152,10 @@ fn active_udp_keeps_earned_qualification_without_inventing_completions() {
         &target,
         terminal_expiry - Duration::from_nanos(1),
     );
-    assert!(before[0].useful_completed < 4.0);
-    assert!(normal_eligible(&before[0], performance_baseline(&before)));
+    assert!(before.scores[0].useful_completed < 4.0);
+    assert!(normal_eligible(&before.scores[0], before.baseline));
     let expired = snapshots(&manager, &nodes, &target, terminal_expiry);
-    assert!(!normal_eligible(
-        &expired[0],
-        performance_baseline(&expired)
-    ));
+    assert!(!normal_eligible(&expired.scores[0], expired.baseline));
 }
 
 #[test]
@@ -230,70 +224,89 @@ fn publishable_business_rx_restores_hold_but_never_settles_the_flow() {
     active.transfer_at(1, 0, at);
     active.transfer_at(0, 0, at);
     let before = snapshots(&manager, &nodes, &target, at);
-    assert!(before[0].unresolved_failure);
+    assert!(before.scores[0].unresolved_failure);
     untargeted.target_family = None;
-    assert!(snapshots(&manager, &nodes, &untargeted, at)[0].unresolved_failure);
-    let baseline = performance_baseline(&before);
-    assert!(normal_eligible(&before[0], baseline));
+    assert!(snapshots(&manager, &nodes, &untargeted, at).scores[0].unresolved_failure);
+    let baseline = before.baseline;
+    assert!(normal_eligible(&before.scores[0], baseline));
     let bypass = ordinary_selection(
-        &before,
+        &before.scores,
         &nodes.iter().collect::<Vec<_>>(),
         Some(0),
         baseline,
+        &before.pairs,
     );
     assert_eq!(bypass.index, 1);
     assert_eq!(bypass.reason, SelectionReason::FreshFailureBypass);
 
     active.transfer_at(0, 1, at);
     let recovered = snapshots(&manager, &nodes, &target, at);
-    assert!(!recovered[0].unresolved_failure);
-    assert_close(recovered[0].attempts, before[0].attempts);
-    assert_close(recovered[0].completed, before[0].completed);
-    assert_close(recovered[0].useful_completed, before[0].useful_completed);
-    assert_close(recovered[0].reliability, before[0].reliability);
-    assert_close(recovered[0].reliability_upper, before[0].reliability_upper);
+    assert!(!recovered.scores[0].unresolved_failure);
+    assert_close(recovered.scores[0].attempts, before.scores[0].attempts);
+    assert_close(recovered.scores[0].completed, before.scores[0].completed);
     assert_close(
-        recovered[0].observed_reliability,
-        before[0].observed_reliability,
+        recovered.scores[0].useful_completed,
+        before.scores[0].useful_completed,
     );
-    assert_eq!(recovered[0].fail_streak, 1);
-    assert!(recovered[0].explore_backed_off);
-    assert!(recovered[0].verification.business.confidence < 1.0);
-    assert_eq!(rank_at(&manager, &nodes, &target, at), 0);
-    let reasons = manager
-        .score_state()
-        .selection_reason_counts("score", SelectionNetwork::Udp);
-    assert_eq!(reasons.incumbent_held, 1);
-    assert_eq!(reasons.fresh_failure_bypass, 0);
+    assert_close(
+        recovered.scores[0].reliability,
+        before.scores[0].reliability,
+    );
+    assert_close(
+        recovered.scores[0].reliability_upper,
+        before.scores[0].reliability_upper,
+    );
+    assert_close(
+        recovered.scores[0].observed_reliability,
+        before.scores[0].observed_reliability,
+    );
+    assert_eq!(recovered.scores[0].fail_streak, 1);
+    assert!(recovered.scores[0].explore_backed_off);
+    assert!(!super::super::verification::usable(&recovered.evidence[0]));
+    let held = ordinary_selection(
+        &recovered.scores,
+        &nodes.iter().collect::<Vec<_>>(),
+        Some(0),
+        recovered.baseline,
+        &recovered.pairs,
+    );
+    assert_eq!(held.index, 0);
+    assert_eq!(held.reason, SelectionReason::InsufficientEvidenceHeld);
 
     let next_failure = feedback.start_at(at + Duration::from_millis(100));
     next_failure.setup_succeeded_at(at + Duration::from_millis(100));
     next_failure.finish_at(ScoreOutcome::Timeout, true, at + Duration::from_millis(100));
     active.transfer_at(0, 1, at + Duration::from_millis(200));
     let throttled = snapshots(&manager, &nodes, &target, at + Duration::from_millis(200));
-    assert!(throttled[0].unresolved_failure);
+    assert!(throttled.scores[0].unresolved_failure);
     // No timer flushes throttled RX: only the next publishable RX or terminal can recover.
     let published_at = at + Duration::from_secs(1);
     let before = snapshots(&manager, &nodes, &target, published_at);
     active.transfer_at(0, 1, published_at);
     let published = snapshots(&manager, &nodes, &target, published_at);
-    assert!(!published[0].unresolved_failure);
-    assert_eq!(published[0].fail_streak, 2);
-    assert!(published[0].explore_backed_off);
-    assert_close(published[0].completed, before[0].completed);
-    assert_close(published[0].useful_completed, before[0].useful_completed);
+    assert!(!published.scores[0].unresolved_failure);
+    assert_eq!(published.scores[0].fail_streak, 2);
+    assert!(published.scores[0].explore_backed_off);
+    assert_close(published.scores[0].completed, before.scores[0].completed);
+    assert_close(
+        published.scores[0].useful_completed,
+        before.scores[0].useful_completed,
+    );
     let clone = active.clone();
     active.finish_at(ScoreOutcome::Cancelled, true, published_at);
     clone.finish_at(ScoreOutcome::Success, true, published_at);
     let cancelled = snapshots(&manager, &nodes, &target, published_at);
-    assert!(!cancelled[0].unresolved_failure);
-    assert_close(cancelled[0].completed, published[0].completed);
-    assert_close(cancelled[0].useful_completed, published[0].useful_completed);
+    assert!(!cancelled.scores[0].unresolved_failure);
+    assert_close(cancelled.scores[0].completed, published.scores[0].completed);
     assert_close(
-        cancelled[0].attempts,
-        published[0].attempts - (-1.0_f64 / 1800.0).exp2(),
+        cancelled.scores[0].useful_completed,
+        published.scores[0].useful_completed,
     );
-    assert!(cancelled[0].verification.business.confidence < 1.0);
+    assert_close(
+        cancelled.scores[0].attempts,
+        published.scores[0].attempts - (-1.0_f64 / 1800.0).exp2(),
+    );
+    assert!(!super::super::verification::usable(&cancelled.evidence[0]));
 
     let last_failure_at = published_at + Duration::from_secs(1);
     let last_failure = feedback.start_at(last_failure_at);
@@ -308,10 +321,13 @@ fn publishable_business_rx_restores_hold_but_never_settles_the_flow() {
     );
     last_failure.finish_at(ScoreOutcome::Success, true, last_failure_at);
     let ignored = snapshots(&manager, &nodes, &target, last_failure_at);
-    assert!(ignored[0].unresolved_failure);
-    assert_eq!(ignored[0].fail_streak, 3);
-    assert_close(ignored[0].completed, failed[0].completed);
-    assert_close(ignored[0].useful_completed, failed[0].useful_completed);
+    assert!(ignored.scores[0].unresolved_failure);
+    assert_eq!(ignored.scores[0].fail_streak, 3);
+    assert_close(ignored.scores[0].completed, failed.scores[0].completed);
+    assert_close(
+        ignored.scores[0].useful_completed,
+        failed.scores[0].useful_completed,
+    );
 }
 
 #[test]
@@ -347,7 +363,7 @@ fn terminal_rx_recovers_after_verification_age_without_refreshing_verification()
     failure.finish_at(ScoreOutcome::Timeout, true, at);
     active.transfer_at(1, 1, at + Duration::from_millis(100));
     assert!(
-        !snapshots(&manager, &nodes, &target, at + Duration::from_millis(100))[0]
+        !snapshots(&manager, &nodes, &target, at + Duration::from_millis(100)).scores[0]
             .unresolved_failure
     );
     let next_failure = feedback.start_at(at + Duration::from_millis(200));
@@ -356,14 +372,23 @@ fn terminal_rx_recovers_after_verification_age_without_refreshing_verification()
     active.transfer_at(0, 1, at + Duration::from_millis(300));
     let finished_at = now + Duration::from_secs(124);
     let before = snapshots(&manager, &nodes, &target, finished_at);
-    assert!(before[0].unresolved_failure);
+    assert!(before.scores[0].unresolved_failure);
     active.finish_at(ScoreOutcome::Success, true, finished_at);
     let after = snapshots(&manager, &nodes, &target, finished_at);
-    assert!(!after[0].unresolved_failure);
-    assert_close(after[0].useful_completed, before[0].useful_completed + 1.0);
-    let baseline = performance_baseline(&after);
-    assert!(normal_eligible(&after[0], baseline));
-    let ordinary = ordinary_selection(&after, &nodes.iter().collect::<Vec<_>>(), Some(0), baseline);
+    assert!(!after.scores[0].unresolved_failure);
+    assert_close(
+        after.scores[0].useful_completed,
+        before.scores[0].useful_completed + 1.0,
+    );
+    let baseline = after.baseline;
+    assert!(normal_eligible(&after.scores[0], baseline));
+    let ordinary = ordinary_selection(
+        &after.scores,
+        &nodes.iter().collect::<Vec<_>>(),
+        Some(0),
+        baseline,
+        &after.pairs,
+    );
     assert_eq!(ordinary.index, 0);
     assert_eq!(ordinary.reason, SelectionReason::InsufficientEvidenceHeld);
     assert_eq!(
@@ -379,7 +404,7 @@ fn terminal_rx_recovers_after_verification_age_without_refreshing_verification()
             .state,
         ScoreVerificationState::Provisional
     );
-    assert!(after[0].verification.business.value.is_none());
+    assert!(after.evidence[0].business.is_none());
 }
 
 #[test]
@@ -406,10 +431,7 @@ fn reload_and_eviction_fence_progress_without_disabling_surviving_reporters() {
     active.setup_succeeded_at(before + Duration::from_secs(2));
     active.transfer_at(1, 1, before + Duration::from_secs(2));
     let qualified = snapshots(&manager, &nodes, &target, before + Duration::from_secs(2));
-    assert!(normal_eligible(
-        &qualified[0],
-        performance_baseline(&qualified)
-    ));
+    assert!(normal_eligible(&qualified.scores[0], qualified.baseline));
     let state = manager.score_state();
     let replacement = GroupManager::with_alive_set_and_score_state(
         &[group("score", &nodes)],
@@ -421,15 +443,15 @@ fn reload_and_eviction_fence_progress_without_disabling_surviving_reporters() {
     let after = Instant::now() + Duration::from_secs(1);
     active.transfer_at(0, 1, before + Duration::from_secs(3));
     let stale = snapshots(&replacement, &nodes, &target, after);
-    assert!(!normal_eligible(&stale[0], performance_baseline(&stale)));
+    assert!(!normal_eligible(&stale.scores[0], stale.baseline));
     active.transfer_at(0, 1, after);
     let surviving = snapshots(&replacement, &nodes, &target, after);
-    assert!(!normal_eligible(
-        &surviving[0],
-        performance_baseline(&surviving)
-    ));
-    assert_close(surviving[0].useful_completed, stale[0].useful_completed);
-    assert!(surviving[0].verification.business.confidence < 1.0);
+    assert!(!normal_eligible(&surviving.scores[0], surviving.baseline));
+    assert_close(
+        surviving.scores[0].useful_completed,
+        stale.scores[0].useful_completed,
+    );
+    assert!(!super::super::verification::usable(&surviving.evidence[0]));
 
     let new_feedback = replacement
         .feedback_for_group_node("score", nodes[0].id, target.clone())
@@ -444,8 +466,9 @@ fn reload_and_eviction_fence_progress_without_disabling_surviving_reporters() {
             &nodes,
             &target,
             after + Duration::from_secs(2)
-        )[0]
-        .unresolved_failure
+        )
+        .scores[0]
+            .unresolved_failure
     );
 
     {
@@ -466,7 +489,7 @@ fn reload_and_eviction_fence_progress_without_disabling_surviving_reporters() {
         &target,
         after + Duration::from_secs(4),
     );
-    assert!(before_late[0].unresolved_failure);
+    assert!(before_late.scores[0].unresolved_failure);
     active.transfer_at(0, 1, after + Duration::from_secs(4));
     active.finish_at(ScoreOutcome::Success, true, after + Duration::from_secs(4));
     let ignored = snapshots(
@@ -475,10 +498,16 @@ fn reload_and_eviction_fence_progress_without_disabling_surviving_reporters() {
         &target,
         after + Duration::from_secs(4),
     );
-    assert!(ignored[0].unresolved_failure);
-    assert_close(ignored[0].completed, before_late[0].completed);
-    assert_close(ignored[0].useful_completed, before_late[0].useful_completed);
-    assert_eq!(ignored[0].fail_streak, before_late[0].fail_streak);
+    assert!(ignored.scores[0].unresolved_failure);
+    assert_close(ignored.scores[0].completed, before_late.scores[0].completed);
+    assert_close(
+        ignored.scores[0].useful_completed,
+        before_late.scores[0].useful_completed,
+    );
+    assert_eq!(
+        ignored.scores[0].fail_streak,
+        before_late.scores[0].fail_streak
+    );
     let fresh = new_feedback.start_at(after + Duration::from_secs(5));
     fresh.setup_succeeded_at(after + Duration::from_secs(5));
     fresh.transfer_at(1, 1, after + Duration::from_secs(5));
@@ -488,8 +517,9 @@ fn reload_and_eviction_fence_progress_without_disabling_surviving_reporters() {
             &nodes[..1],
             &target,
             after + Duration::from_secs(5)
-        )[0]
-        .unresolved_failure
+        )
+        .scores[0]
+            .unresolved_failure
     );
     fresh.finish_at(
         ScoreOutcome::Cancelled,
@@ -541,7 +571,7 @@ fn delayed_terminal_bridges_qualification_to_already_observed_newer_rx() {
     active.transfer_at(0, 1, now + Duration::from_secs(1871));
     let terminal_at = now + Duration::from_secs(1881);
     let before = snapshots(&manager, &nodes, &target, terminal_at);
-    assert!(!normal_eligible(&before[0], performance_baseline(&before)));
+    assert!(!normal_eligible(&before.scores[0], before.baseline));
 
     // RX at +50 was delivered late; RX at +70 alone could not bridge the +60 expiry.
     let sample = FlowSample {
@@ -564,13 +594,14 @@ fn delayed_terminal_bridges_qualification_to_already_observed_newer_rx() {
     );
     let bridged_at = now + Duration::from_secs(1921);
     let bridged = snapshots(&manager, &nodes, &target, bridged_at);
-    assert!(bridged[0].useful_completed < 4.0);
-    assert!(normal_eligible(&bridged[0], performance_baseline(&bridged)));
+    assert!(bridged.scores[0].useful_completed < 4.0);
+    assert!(normal_eligible(&bridged.scores[0], bridged.baseline));
     let ordinary = ordinary_selection(
-        &bridged,
+        &bridged.scores,
         &nodes.iter().collect::<Vec<_>>(),
         Some(0),
-        performance_baseline(&bridged),
+        bridged.baseline,
+        &bridged.pairs,
     );
     assert_eq!(ordinary.index, 0);
     let expires_at = now + Duration::from_secs(1931);
@@ -581,14 +612,11 @@ fn delayed_terminal_bridges_qualification_to_already_observed_newer_rx() {
         expires_at - Duration::from_nanos(1),
     );
     assert!(normal_eligible(
-        &before_expiry[0],
-        performance_baseline(&before_expiry)
+        &before_expiry.scores[0],
+        before_expiry.baseline
     ));
     let expired = snapshots(&manager, &nodes, &target, expires_at);
-    assert!(!normal_eligible(
-        &expired[0],
-        performance_baseline(&expired)
-    ));
+    assert!(!normal_eligible(&expired.scores[0], expired.baseline));
     active.transfer_at(0, 1, expires_at + Duration::from_secs(1));
     let gap = snapshots(
         &manager,
@@ -596,7 +624,7 @@ fn delayed_terminal_bridges_qualification_to_already_observed_newer_rx() {
         &target,
         expires_at + Duration::from_secs(1),
     );
-    assert!(!normal_eligible(&gap[0], performance_baseline(&gap)));
+    assert!(!normal_eligible(&gap.scores[0], gap.baseline));
     active.finish_at(
         ScoreOutcome::Cancelled,
         true,

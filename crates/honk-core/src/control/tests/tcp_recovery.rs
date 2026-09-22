@@ -16,6 +16,104 @@ async fn tcp_score_recovers_inside_previously_selected_nested_final() -> anyhow:
     loopback_recovery(honk_config::group::GroupPolicy::Score, true).await
 }
 
+#[tokio::test]
+async fn cold_urltest_refunds_unscheduled_score_work_before_relay_closes() -> anyhow::Result<()> {
+    use crate::group::SelectionNetwork;
+    use honk_config::group::GroupPolicy;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let target = listener.local_addr()?;
+        let nodes: Vec<_> = (0..8)
+            .map(|index| {
+                let mut node = udp_test_node();
+                node.name = format!("leaf-{index}");
+                node.port += index;
+                node.id = node.derive_id();
+                node
+            })
+            .collect();
+        let mut groups: Vec<_> = nodes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .enumerate()
+            .map(|(index, nodes)| Group {
+                name: format!("child-{index}"),
+                policy: GroupPolicy::Score,
+                nodes: nodes.iter().map(|node| node.id).collect(),
+                ..Default::default()
+            })
+            .collect();
+        groups.push(Group {
+            name: "cold".into(),
+            policy: GroupPolicy::URLTest,
+            groups: groups.iter().map(|group| group.name.clone()).collect(),
+            ..Default::default()
+        });
+        let mut config = udp_test_config("cold", nodes, groups);
+        config.global.dial_mode = "ip".into();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handle = udp_test_handle(
+            config,
+            UdpTestMode::TcpHold {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+            1,
+        );
+        let manager = handle.group_manager.read().clone();
+        let counts = |group| manager.score_budget_counters(group, SelectionNetwork::Tcp);
+        let mut client = TcpStream::connect(target).await?;
+        let (accepted, client_addr) = listener.accept().await?;
+        store_active_tcp_flow(&handle, target, client_addr).await?;
+        let serving = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.serve_connection(accepted, client_addr).await })
+        };
+        entered.notified().await;
+        let (mut upstream, _) = listener.accept().await?;
+        let truncated = counts("child-3");
+        assert_eq!((truncated.reserved, truncated.refunded), (0, 1));
+        assert_eq!(truncated.cold_available, truncated.cold_allowance);
+        for group in ["child-1", "child-2"] {
+            assert_eq!(counts(group).reserved, 1);
+            assert_eq!(counts(group).business_starts, 0);
+        }
+
+        release.notify_one();
+        client.write_all(b"q").await?;
+        assert_eq!(upstream.read_u8().await?, b'q');
+        upstream.write_all(b"r").await?;
+        assert_eq!(client.read_u8().await?, b'r');
+        assert!(
+            !serving.is_finished(),
+            "the winning relay must still be open"
+        );
+        assert_eq!(counts("child-0").business_starts, 1);
+        for group in ["child-1", "child-2", "child-3"] {
+            let refunded = counts(group);
+            assert_eq!((refunded.reserved, refunded.refunded), (0, 1), "{group}");
+            assert_eq!(
+                (refunded.business_starts, refunded.spent),
+                (0, 0),
+                "{group}"
+            );
+            assert_eq!(refunded.cold_available, refunded.cold_allowance, "{group}");
+        }
+        drop(upstream);
+        drop(client);
+        serving.await??;
+        let generation = handle.runtime_registry.read().clone();
+        generation.shutdown().await;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("cold URLTest ownership must settle before the live relay closes")?
+}
+
 async fn loopback_recovery(
     policy: honk_config::group::GroupPolicy,
     through_final: bool,
@@ -283,6 +381,31 @@ fn train_score_setup(
             reporter.finish_setup_only();
         }
     }
+    // Recovery must work after optional validation currency is exhausted.
+    for _ in 0..32 {
+        let budget = manager.score_budget_counters("proxy", SelectionNetwork::Tcp);
+        if budget.cold_available + budget.earned_available == 0 {
+            break;
+        }
+        let plan = manager.selection_plan_for_target("proxy", &context);
+        if manager
+            .score_budget_counters("proxy", SelectionNetwork::Tcp)
+            .reserved
+            == 0
+        {
+            return;
+        }
+        plan.entries[0]
+            .feedback
+            .as_ref()
+            .unwrap()
+            .begin()
+            .unwrap()
+            .start()
+            .finish(crate::group::ScoreOutcome::Cancelled);
+    }
+    let budget = manager.score_budget_counters("proxy", SelectionNetwork::Tcp);
+    assert_eq!(budget.cold_available + budget.earned_available, 0);
 }
 
 #[derive(Debug)]

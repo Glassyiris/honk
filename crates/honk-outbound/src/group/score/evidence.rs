@@ -32,7 +32,6 @@ pub(super) fn probe_slot(context: &ScoreSelectionContext) -> usize {
 pub(super) struct MetricSnapshot {
     pub value: Option<f64>,
     pub confidence: f64,
-    pub observed_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -87,7 +86,6 @@ impl WeightedMean {
         MetricSnapshot {
             value: Some(self.sum / self.weight),
             confidence: (self.weight / PERFORMANCE_VALIDATION_SAMPLES).min(1.0) * freshness,
-            observed_at: Some(at),
         }
     }
 }
@@ -119,20 +117,6 @@ impl Availability {
             *credited = Some(self.epoch);
         }
         self.latest_rx_at = Some(self.latest_rx_at.map_or(rx_at, |at| at.max(rx_at)));
-    }
-
-    pub(super) fn snapshot(&self, now: Instant) -> MetricSnapshot {
-        let Some(at) = self.latest_rx_at else {
-            return MetricSnapshot::default();
-        };
-        if now.saturating_duration_since(at) >= LIVE_QUALIFICATION_TTL || self.reporters == 0 {
-            return MetricSnapshot::default();
-        }
-        MetricSnapshot {
-            value: Some(1.0),
-            confidence: f64::from(self.reporters) / PERFORMANCE_VALIDATION_SAMPLES,
-            observed_at: Some(at),
-        }
     }
 }
 

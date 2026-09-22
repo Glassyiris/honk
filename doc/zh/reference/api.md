@@ -101,7 +101,7 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 
 成功测量会更新节点延迟历史。单节点失败返回 `503`；组测量会省略失败成员；两者都会追加供 URLTest 选择使用的 failure strike。
 
-每次经代理或内建 `direct` 叶节点执行、并实际经过 Score 组的 delay-test exchange，都会把真实 URL 目标及成功或失败反馈给包含该被测叶节点的每个 Score 组。之前仅连接 server/session 的预热只报告聚合 setup，不会把该 URL 虚构为预热自身的目标；非 Score 路径不会创建 reporter 或评分 cell。
+按需 delay exchange 保留 Alive/API 延迟历史，但不报告业务结果，也不填充配置 Score 比较 cohort。实际的前置 server/session 准备可报告聚合预热 setup；不会把调用方 URL 虚构为预热自身目标，也不提供晋升证明。
 
 ### Score 组表示
 
@@ -155,8 +155,13 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
     activeFlows, limit, capacity: { rejected }
   },
   score: {
-    groups: [{ name, tcp: R, udp: R }],
-    cache: { exactCells, aggregateCells, exactEvictions, aggregateEvictions }
+    groups: [{ name, tcp: R, udp: R, verification: { tcp: V, udp: V }, budget: { tcp: B, udp: B } }],
+    businessStarts,
+    cache: {
+      exactCells, aggregateCells, exactEvictions, aggregateEvictions,
+      comparisonCells, comparisonLogicalBytes, comparisonLogicalCapacity,
+      comparisonEvictions, comparisonExpired, comparisonRejected
+    }
   },
   udp: {
     endpoint: { hits, misses },
@@ -182,11 +187,18 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 H = { count, sumNanos, buckets }  // buckets has 64 fixed log2 slots
 R = {
   coldExplore, periodicExplore, reliabilityWinner, performanceWinner,
-  incumbentHeld, insufficientEvidenceHeld, incumbentIneligible,
+  incumbentHeld, insufficientEvidenceHeld, directionalTradeoffHeld, incumbentIneligible,
   freshFailureBypass, deadFiltered, ordinarySwitch, switchFlap,
   failStreakExcluded, exploreBackedOff, carrierPressure, carrierRttPressure,
   carrierLossPressure, carrierValidation
 } // R 的每个值均为 u64 计数
+V = { provisionalSelections, usableSelections, validationSelections,
+      confirmations, expired, contradicted, confirmationMillis }
+B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
+      reserved, spent, budgetBlocked, inFlightBlocked, refunded, expired,
+      coldAllowance, coldAvailable, earnedAvailable, earningPeriod, scopes,
+      trialSuccess, trialFailure, trialCancelled, trialSetupHistogram,
+      trialSetupMillis, trialElapsedMillis }
 ```
 
 ### TCP 字段
@@ -209,7 +221,7 @@ R = {
 
 `score.groups` 是经鉴权 `/stats` 响应中的附加部分。当前没有任何组使用 `policy: score` 时它为 `[]`；否则它包含每个当前 Score 组（包括没有解析出叶节点的组），按 `name` 的字典序排列。每组始终都有 `tcp` 和 `udp` 对象，且每个对象始终包含全部 `R` 字段；没有网络活动时以零表示，绝不省略字段。
 
-每个值是饱和 `u64` 计数，不是延迟、吞吐或健康测量。一次已授权的多候选 Score Apply 记录一个最终原因：`coldExplore` 或 `periodicExplore` 表示验证；`incumbentIneligible` 表示现任已不满足普通资格；`freshFailureBypass` 表示合格现任的业务失败尚未恢复；`insufficientEvidenceHeld` 表示没有挑战者获得晋升且普通 utility 赢家缺少双方合格的性能比较；`incumbentHeld` 表示比较优势未跨过保持门槛；其余 `reliabilityWinner`、`performanceWinner` 保留按替代候选资格分类的含义。`performanceWinner` 不证明提速或发生切换，`insufficientEvidenceHeld` 不表示可靠性历史缺失。`ordinarySwitch` 统计实际普通已提交 A→B 选择；`switchFlap` 统计其中同目标八次普通选择内返回前一赢家的情况。首次选择、试用及缺少之前历史时不能增加切换计数。`deadFiltered`、`failStreakExcluded` 和 `exploreBackedOff` 按 rank 累计受影响候选。Peek、API 读取、单例与最后尝试旁路不增加这些计数；嵌套组 rank 与实际出站连接并非一一对应。
+每个 `R` 值是饱和 `u64` 计数，不是延迟、吞吐或健康测量。一次已授权的多候选 Score Apply 记录一个最终原因：`coldExplore` 或 `periodicExplore` 表示验证；`incumbentIneligible` 表示现任已不满足普通资格；`freshFailureBypass` 表示合格现任的业务失败尚未恢复；`insufficientEvidenceHeld` 表示没有挑战者获得晋升且普通 utility 赢家缺少合格的共同性能比较；`directionalTradeoffHeld` 表示无挑战者晋升时，某个比较在一个已知方向提升至少 10%，另一个已知方向却退化超过 10%；`incumbentHeld` 表示比较优势未跨过保持门槛；其余 `reliabilityWinner`、`performanceWinner` 保留按替代候选资格分类的含义。`performanceWinner` 本身不证明提速或发生切换，`insufficientEvidenceHeld` 不表示可靠性历史缺失。`ordinarySwitch` 统计实际普通已提交 A→B 选择；`switchFlap` 统计其中同目标八次普通选择内返回前一赢家的情况。首次选择、试用及缺少之前历史时不能增加切换计数。`deadFiltered`、`failStreakExcluded` 和 `exploreBackedOff` 按 rank 累计受影响候选。Peek、API 读取、单例与最后尝试旁路不增加这些原因计数；嵌套组 rank 与实际出站连接并非一一对应。
 
 对 UDP，`deadFiltered` 也统计因协议／配置不具备 UDP 能力而被排除的候选；它不是新发生故障的节点数或业务尝试数，这类排除不会增加 Score 失败或探索退避。
 
@@ -219,7 +231,7 @@ R = {
 
 计数在进程启动时从零开始，只在进程内存中累积。只要组名仍在已提交配置中，成功 reload 会保留它们，包括零叶节点以及临时 Score→非 Score→Score 转换；非 Score 组不会显示在此响应中。已提交的删除会清除该名称的计数，之后重新创建同名组从零开始。受 generation fence 约束的已淘汰 manager 在被替换后不能再修改计数，即使同名组随后被重新创建。快照在 JSON 序列化前复制，读取不会改变选路状态。
 
-`/stats.score` 公开组名、固定的 TCP/UDP 原因与验证计数，以及有界证据缓存的占用/淘汰数，不包含节点身份、目标/domain/IP/port、原始 cell、cadence 键、authority 或凭据。`/proxies` 中既有公开成员名和 `/connections` 中目标元数据保持不变。
+`/stats.score` 公开组名、固定的 TCP/UDP 原因、验证与预算字段、根业务计数，以及有界证据缓存总量，不包含节点身份、目标/domain/IP/port、原始 cell、cadence 键、authority 或凭据。`/proxies` 中既有公开成员名和 `/connections` 中目标元数据保持不变。
 
 ### Score 验证信息
 
@@ -229,14 +241,37 @@ R = {
 | --- | --- |
 | `selected` | 本次只读判定对应的既有公开成员 tag；没有普通合格候选时为 null。存在时 TCP `now` 使用同一次判定的选择。 |
 | `state` | `provisional` 或 `observedUsable`；后者要求同一连续可用性 cohort 中四个不同的定向 Traffic reporter 在 setup/TX 后收到 RX，且 cohort 最近的合格 RX 距今不足 60 秒。未结束的 flow 也可取得资格；clone／重复回包不增加信用。失败／reload 或 60 秒进展间隔会重置 cohort。这不授予普通选路资格，也不清除连败。 |
-| `comparison` / `basis` | `unconfirmed`、`equivalent` 或 `supported`，依据为 `none`、`configuredProbe`、`targetResponse`、`aggregateResponse`、`upload` 或 `download`。不代表误判概率或保证最优。 |
+| `comparison` / `basis` | `unconfirmed`、`equivalent` 或 `supported`；证据依据为 `none`、`configuredProbe`、`targetResponse`、`commonTargets`、`upload` 或 `download`。`commonTargets` 使用有界等权共同目标，不是无关聚合均值；setup／预热不是证明。不代表误判概率或保证最优。 |
 | `missing` | 相关候选覆盖范围内的 availability/response/transfer 布尔缺口；当前路径已观测可用时，备选仍可能需要验证。 |
-| `nextAction` | `nextBusinessFlow` 仅在共享预算允许时使用未来真实流量，补充证据、普通选路资格或恢复验证；`awaitTransfer` 等待真实负载，不主动大流量测速；`backoff` 保留失败隔离；`none` 表示没有可执行的缺失工作。 |
+| `nextAction` | `nextBusinessFlow` 表示未来真实工作补充证据、普通资格或恢复的需求，不是已预留或已派发 I/O；需同时查看 `waitReason`。`awaitTransfer` 等待真实负载，不主动大流量测速；`backoff` 保留失败隔离；`none` 表示没有可执行的缺失工作。 |
+| `question` | `none`、`availability`、`response`、`qualification`、`recovery` 或 `transfer`：下一个尚未解决的证据问题。没有剩余动作时为 `none`；退避时保留被阻塞候选的问题，不回退到已解决现任的问题。 |
+| `waitReason` | `none`；`budget` 表示没有可用额度；`comparableTraffic` 等待未来可比业务；`inFlight` 表示已有足够的同目标工作，或已达到独立的每节点四项工作上限；`transfer` 等待真实传输负载；`backoff` 保留失败隔离。聚合读取检查已保留 IPv4/IPv6 作用域，不创建它们：两者预算均阻塞才返回 `budget`；任一可用／未创建作用域允许继续等待未来可比流量；其余情况保留在途等待。等待不证明工作必然成功。 |
+| `localComparison` | 下述有界活跃挑战者摘要；不能把不完整的全体候选覆盖升级为全局比较。 |
 | `coverage` | 候选、已比较与待确认数量；即使 availability/response 缺口已关闭，pending 仍可包含普通资格／恢复工作。单节点可以证明已观测可用，不代表优于其他路径。 |
 | `evidenceAgeMs` / `validForMs` | 最弱支持证据的年龄与条件性剩余有效期；没有结论时为 null。新证据可以提前撤销结论。 |
 | `network`、`targetFamily`、`healthFamily`、`targetSpecific` | transport 与适用范围；此聚合接口没有精确目标，不导出 domain/IP/port 或原始节点 ID。 |
 
+`localComparison.scope` 为 `activeChallengers`；`comparison` 和 `basis` 使用上述词汇。`comparedCandidates` 包含所选成员和有支持的挑战者。`reporters` 是双方已保留的不同 reporter 支持量中的最弱值：四个块各保留最多四个 ID，跨块去重并集最多十六个，不是所有已观测 reporter 的精确总数。`spanMs`、`evidenceAgeMs`、`validForMs` 与 `dispersionPpm` 描述这些支持，不代表统计独立或误判概率。`uploadKnown`、`downloadKnown` 明确保留未知方向；`directionalTradeoff` 标记相反的合格方向变化。证明使用共同 15 秒块，各块在起点后 60 秒到期，并受当前探测 cohort／失败／reload／incarnation 边界约束。局部子集可有支持，同时顶层仍为 `comparison: "unconfirmed"`。
+
 `/stats.score.groups[].verification.tcp` 与 `.udp` 增加饱和计数：`provisionalSelections`、`usableSelections`、`validationSelections`、`confirmations`、`expired`、`contradicted`、`confirmationMillis`。确认计数包括新成立的配置探测比较等经验性结论，不表示所有维度的业务或带宽认证；`confirmationMillis / confirmations` 是这些结论的累计平均确认耗时，不是网络延迟。只读查询立即反映过期，转移计数只在后续授权 Apply 时推进。没有流量或预算不能授予确认；查询不派发验证，也不改变计数。10% 比较容差表示实际意义上的近似等价，不是已校准的误判概率。
+
+### Score 工作预算与观测成本
+
+`/stats.score.businessStarts` 对嵌套组去重，统计唯一原始 Score 业务开始。`/stats.score.groups[].budget.tcp` 与 `.udp` 聚合保留的目标地址族作用域；不能把嵌套组总量相加当作唯一业务数。原始业务被选为试用时仍计数，重试、clone 与读取不产生另一份原始业务。节点专属工作早于 DNS／准入等待开始，与 reporter 的物理／逻辑 I/O 边界独立。
+
+预算计数器反映已记录的账本值。只读等待和冷启动判定还会考虑过期未开始预留中可退回的额度，但不更新 `refunded`、`expired` 或其他计数器。
+
+| 字段 | 含义 |
+| --- | --- |
+| `businessStarts`、`scopes`、`earningPeriod` | 保留作用域原始开始数之和、作用域数，以及各自固定赚取周期的最大值（不能作为合并作用域预算公式的分母）。每个作用域在创建时固定 `q = clamp(2n,16,64)` 和冷启动额度 `B`；`spent + reserved <= B + floor(businessStarts/q)` 按作用域成立。 |
+| `sources.cold`、`sources.periodic`、`sources.recovery` | 按来源区分的已开始工作：冷额度试用、已赚额度试用、无需可选预算的恢复重试。普通非试用没有来源桶；`recovery` 不是可选试用或新原始业务。 |
+| `trialStarts`、`spent`、`reserved` | 已开始可选试用、累计已支出 token，以及尚未开始的 token 预留。开始只支出一次，开始后取消不退款。 |
+| `coldAllowance`、`coldAvailable`、`earnedAvailable` | 固定初始额度与当前可用额度的合计。每作用域最多保留八个未花费已赚 token。时间、读取、目标变动与证据过期不赚额度，保留作用域在 reload／成员变化后不重置。 |
+| `budgetBlocked`、`inFlightBlocked`、`refunded`、`expired` | 预留被拒计数、最后引用释放／未开始失效的退款数，以及在途跟踪项过期数。只有未开始预留可退款；跟踪过期不退回已开始工作的支出。 |
+| `trialSuccess`、`trialFailure`、`trialCancelled` | 已开始可选试用的 exactly-once 终态；拒绝／关闭／中性取消归入 `trialCancelled`。`trialFailure` 是实际观测失败，不是相对于未观测替代路径、因选择试用而额外造成的失败。 |
+| `trialSetupHistogram`、`trialSetupMillis`、`trialElapsedMillis` | 八个固定 log2 毫秒 setup 桶（slot 0 包含 0–1 ms，末槽包含 128 ms 及以上）、已观测 setup 时长之和，以及开始至终态时长之和。它们是实际试用成本，不是因果额外延迟或开销。 |
+
+`/stats.score.cache.comparisonCells` 上限为 256。`comparisonLogicalBytes` 计入比较存储、vector 容量及所持有键容量；`comparisonLogicalCapacity` 是按实现结构大小计算的最坏分配界限，不超过 1 MiB。两者均不是实测进程 RSS 或全部 Score 状态大小，均不包含分配器开销与进程其他分配。`comparisonEvictions`、`comparisonExpired`、`comparisonRejected` 统计存储移除／准入事件；只读过期可以先使支持失效，实际移除后才增加计数。既有精确／聚合 LRU 字段不变。
 
 ### 出站与 ready pool 字段
 

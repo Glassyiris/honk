@@ -380,8 +380,9 @@ fn train_score_context(
         other_reporter.finish_setup_only();
     }
     assert_eq!(
-        manager.selection_plan_for_target("score", context).entries[0]
-            .node
+        manager
+            .peek_selection_plan_for_domain("score", context.probe_domain, context.health_family)
+            .nodes[0]
             .id,
         preferred,
     );
@@ -574,18 +575,24 @@ async fn shared_source_failure_finishes_every_flow_before_death_cleanup() {
     assert_eq!(deaths.load(Ordering::Relaxed), 1);
     assert_eq!(
         manager_a
-            .selection_plan_for_target("score", &context_a)
-            .entries[0]
-            .node
+            .peek_selection_plan_for_domain(
+                "score",
+                context_a.probe_domain,
+                context_a.health_family
+            )
+            .nodes[0]
             .id,
         other_id,
         "a genuine source failure stays I/O-negative even after A replied",
     );
     assert_eq!(
         manager_b
-            .selection_plan_for_target("score", &context_b)
-            .entries[0]
-            .node
+            .peek_selection_plan_for_domain(
+                "score",
+                context_b.probe_domain,
+                context_b.health_family
+            )
+            .nodes[0]
             .id,
         other_id,
         "B must be scored before reentrant death cleanup can cancel its driver",
@@ -855,9 +862,12 @@ async fn shared_source_failure_wins_late_cleanup_but_preserves_local_cancellatio
         .unwrap();
     let winner = |index: usize| {
         managers[index]
-            .selection_plan_for_target("score", &contexts[index])
-            .entries[0]
-            .node
+            .peek_selection_plan_for_domain(
+                "score",
+                contexts[index].probe_domain,
+                contexts[index].health_family,
+            )
+            .nodes[0]
             .id
     };
     let settlement = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

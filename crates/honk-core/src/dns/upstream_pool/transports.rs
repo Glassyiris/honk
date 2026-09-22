@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 
 use honk_config::node::Node;
 use honk_config::types::DnsProtocol;
-use honk_outbound::group::ScoreFeedback;
+use honk_outbound::group::ScoreBusinessGuard;
 
 use super::UpstreamPool;
 use super::entries::UpstreamEntry;
@@ -39,7 +39,7 @@ impl PooledTransport {
     pub(super) async fn exchange(
         &self,
         raw_query: &[u8],
-        feedback: Option<&ScoreFeedback>,
+        feedback: Option<ScoreBusinessGuard>,
     ) -> anyhow::Result<Vec<u8>> {
         match self {
             Self::Tcp(transport) => transport.exchange(raw_query, feedback).await,
