@@ -6,7 +6,7 @@ impl Worker {
         let active = self.active.read().await.clone();
         let generation = self.diagnostics.read().generation;
         let instance = self.service.instance_id.clone();
-        let entry = self.entry.clone().ok_or_else(unsupported)?;
+        let store = self.store.clone().ok_or_else(unsupported)?;
         let accepted = self.service.sources.accepted.read().clone();
         let data_dir = self.data_dir.clone();
         let deferred = if request.mode == "syntax" {
@@ -18,17 +18,17 @@ impl Worker {
                 .map_err(|_| unavailable())?
         };
         tokio::task::spawn_blocking(move||{
-            let root=entry.parent().ok_or_else(invalid)?;
+            let entry=store.entry().to_path_buf();
             let mut documents=Vec::new();let mut ids=HashMap::new();
             for (index,source) in request.sources.iter().enumerate(){
                 let path=source.path.as_deref();
                 let resolved=if request.mode=="syntax" {PathBuf::from(path.map(str::to_owned).unwrap_or_else(||format!("source-{}.dae",index+1)))}
                     else if index==0 {
-                        if let Some(path)=path {let supplied=resolve_source_path(root,path)?;if supplied!=entry{return Err(denied());}}
+                        if let Some(path)=path {let supplied=store.resolve(path)?;if supplied!=entry{return Err(denied());}}
                         entry.clone()
-                    }else if let Some(path)=path { resolve_source_path(root,path)? }
+                    }else if let Some(path)=path { store.resolve(path)? }
                     else if let Some(path)=source.id.as_ref().and_then(|id|accepted.as_ref()?.ids.iter().find(|(_,value)|*value==id).map(|(path,_)|path.clone())) { path }
-                    else { root.join(format!("source-{}.dae",index+1)) };
+                    else { entry.parent().ok_or_else(invalid)?.join(format!("source-{}.dae",index+1)) };
                 if ids.insert(resolved.clone(),source.id.clone().unwrap_or_else(||format!("source-{}",index+1))).is_some(){return Err(invalid());}
                 documents.push((resolved,Arc::<str>::from(source.content.as_str())));
             }
@@ -37,14 +37,14 @@ impl Worker {
             let result=if request.mode=="syntax" {parse_dae_sources(&documents,limits(),&mut diagnostics)}
                 else {(||{
                     let overlay=documents.iter().cloned().collect();
-                    let loaded=Config::from_dae_file_with_sources(&entry,&overlay,limits(),&mut diagnostics)?;
+                    let loaded=store.load(&overlay,&mut diagnostics)?;
                     initial_sources=loaded.sources.clone();
                     for (path,content) in &documents {
                         if !loaded.sources.iter().any(|source|source.path==*path) {
                             check_dae_source(path,content)?;
                         }
                     }
-                    let validated=offline::validate_for_coordinator(loaded,&active,&data_dir,limits(),&mut diagnostics,&deferred,None,&documents)?;
+                    let validated=offline::validate_for_coordinator(loaded,store.dependency_root(),&active,&data_dir,limits(),&mut diagnostics,&deferred,None,&documents)?;
                     Ok(LoadedConfig {config:validated.config,sources:validated.sources})
                 })()};
             if let Err(error)=&result {

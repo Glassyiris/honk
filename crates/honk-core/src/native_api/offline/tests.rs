@@ -218,6 +218,7 @@ fn unused_submissions_share_exact_materialization_byte_and_count_limits() {
     let validate = |limits| {
         validate_for_coordinator(
             loaded.clone(),
+            loaded.sources[0].path.parent(),
             &active,
             Path::new(&active.global.data_dir),
             limits,
@@ -424,6 +425,7 @@ fn repeated_aliases_cannot_retain_bodies_beyond_byte_or_source_limits() {
     ] {
         let mut capture = Capture::new(
             &loaded.sources,
+            loaded.sources[0].path.parent(),
             &loaded.config,
             Path::new(&loaded.config.global.data_dir),
             limits,
@@ -787,7 +789,8 @@ fn geodata_overlay_compiles_and_retains_verified_bytes_instead_of_disk() {
         GeoSourceSet::from_assets(&requirements, vec![(expected.clone(), bytes.into())]).unwrap();
     assert!(admit(loaded.clone(), &active).is_err());
     let admitted = validate_for_coordinator(
-        loaded,
+        loaded.clone(),
+        loaded.sources[0].path.parent(),
         &active,
         data_dir,
         SourceLimits::default(),

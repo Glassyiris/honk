@@ -22,6 +22,7 @@ pub(crate) mod providers;
 pub(crate) mod routing;
 mod security;
 mod settings;
+mod store;
 pub(crate) mod telemetry;
 mod types;
 mod ui;

@@ -25,6 +25,7 @@ impl CapturedConfig {
             retain_geo,
             hosts,
             ech_paths,
+            dependency_root,
         } = self;
         let source = &sources[0].source;
         let dns_requirements = DnsRouter::geo_requirements(&config.dns);
@@ -83,6 +84,7 @@ impl CapturedConfig {
             dependencies,
             geo_sources: retain_geo.then_some(geo),
             ech_paths,
+            dependency_root,
         })
     }
 }
@@ -95,7 +97,14 @@ impl ValidatedConfig {
         limits: SourceLimits,
         deferred: &[honk_config::subscription::Subscription],
     ) -> io::Result<Vec<DependencySnapshot>> {
-        let mut capture = Capture::new(&self.sources, active, data_dir, limits, &[])?;
+        let mut capture = Capture::new(
+            &self.sources,
+            self.dependency_root.as_deref(),
+            active,
+            data_dir,
+            limits,
+            &[],
+        )?;
         if self
             .config
             .subscriptions

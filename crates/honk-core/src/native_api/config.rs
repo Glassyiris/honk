@@ -621,7 +621,7 @@ fn unsupported() -> ApiError {
         None,
     )
 }
-fn invalid() -> ApiError {
+pub(super) fn invalid() -> ApiError {
     ApiError::new(
         StatusCode::BAD_REQUEST,
         ErrorCode::InvalidRequest,
@@ -1031,7 +1031,7 @@ fn project_diagnostic(
         "span":null,"code":diagnostic.code,"message":diagnostic.message})
 }
 
-fn resolve_source_path(root: &Path, label: &str) -> Result<PathBuf, ApiError> {
+pub(super) fn resolve_source_path(root: &Path, label: &str) -> Result<PathBuf, ApiError> {
     let input = Path::new(label);
     let path = if input.is_absolute() {
         input.strip_prefix(root).map_err(|_| denied())?

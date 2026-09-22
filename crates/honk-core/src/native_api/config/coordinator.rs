@@ -4,8 +4,9 @@ mod validation;
 
 use super::super::management::{self, Completion, Mutation};
 use super::super::{
-    config_write::{SourceFile, WriteError},
+    config_write::WriteError,
     offline,
+    store::{FileStore, SourceStore},
 };
 use super::*;
 use crate::configuration::{Activation, ActivationFailure, ActivationRequest};
@@ -23,7 +24,7 @@ pub(crate) struct ConfigCoordinator {
 
 struct Worker {
     service: Arc<ConfigService>,
-    entry: Option<PathBuf>,
+    store: Option<Arc<dyn SourceStore>>,
     data_dir: PathBuf,
     source_managed: bool,
     active: Arc<tokio::sync::RwLock<Arc<Config>>>,
@@ -64,7 +65,7 @@ impl ConfigService {
         let task = tokio::spawn(async move {
             let mut worker = Worker {
                 service,
-                entry,
+                store: entry.map(|entry| Arc::new(FileStore::new(entry)) as Arc<dyn SourceStore>),
                 data_dir,
                 source_managed: initial.is_some(),
                 active,
@@ -488,26 +489,22 @@ impl Worker {
     async fn load(
         &self,
     ) -> Result<(Config, Option<SourceUpdate>, Vec<DetailedDiagnostic>), ApiError> {
-        let entry = self.entry.clone().ok_or_else(unsupported)?;
+        let store = self.store.clone().ok_or_else(unsupported)?;
         let source_managed = self.source_managed;
         tokio::task::spawn_blocking(move || {
             let mut diagnostics = Vec::new();
             if !source_managed {
                 let mut config = crate::load_operator_config(
-                    entry.to_str().ok_or_else(invalid)?,
+                    store.entry().to_str().ok_or_else(invalid)?,
                     &mut diagnostics,
                 )
                 .map_err(|error| config_error(error, &diagnostics, &[], None, None))?;
                 config.ensure_builtin_nodes();
                 return Ok((config, None, diagnostics));
             }
-            let loaded = Config::from_dae_file_with_sources(
-                &entry,
-                &HashMap::new(),
-                limits(),
-                &mut diagnostics,
-            )
-            .map_err(|error| config_error(error, &diagnostics, &[], None, None))?;
+            let loaded = store
+                .load(&HashMap::new(), &mut diagnostics)
+                .map_err(|error| config_error(error, &diagnostics, &[], None, None))?;
             let mut config = crate::admit_operator_config(
                 loaded.config,
                 loaded.sources[0].source.clone(),
@@ -564,17 +561,13 @@ impl Worker {
         )
         .map_err(|_| invalid())?;
         if content == accepted.update.sources[index].content.as_ref() {
-            let entry = self.entry.clone().ok_or_else(unsupported)?;
+            let store = self.store.clone().ok_or_else(unsupported)?;
             let service = Arc::clone(&self.service);
             tokio::task::spawn_blocking(move || {
                 let mut diagnostics = Vec::new();
-                let baseline = Config::from_dae_file_with_sources(
-                    &entry,
-                    &HashMap::new(),
-                    limits(),
-                    &mut diagnostics,
-                )
-                .map_err(|_| stale())?;
+                let baseline = store
+                    .load(&HashMap::new(), &mut diagnostics)
+                    .map_err(|_| stale())?;
                 if service.sources.revision().as_ref() != Some(&patch.revision)
                     || !same_source_documents(&accepted.update.sources, &baseline.sources)
                 {
@@ -626,7 +619,7 @@ impl Worker {
             return Err(denied());
         }
         let target = accepted.update.sources[index].path.clone();
-        let entry = self.entry.clone().ok_or_else(unsupported)?;
+        let store = self.store.clone().ok_or_else(unsupported)?;
         let active = self.active.read().await.clone();
         let data_dir = self.data_dir.clone();
         let mut deferred = self
@@ -639,8 +632,8 @@ impl Worker {
         let before_replace = self.service.before_replace.lock().take();
         let service = Arc::clone(&self.service);
         tokio::task::spawn_blocking(move || {
-            let file = SourceFile::open(&target, MAX_SOURCE_BYTES).map_err(write_error)?;
-            if file.sha256() != expected {
+            let pin = store.pin(&target).map_err(write_error)?;
+            if pin.sha256() != expected {
                 return Err(stale());
             }
             if let Some(revision) = &group_revision {
@@ -648,13 +641,9 @@ impl Worker {
                     return Err(stale());
                 }
                 let mut diagnostics = Vec::new();
-                let baseline = Config::from_dae_file_with_sources(
-                    &entry,
-                    &HashMap::new(),
-                    limits(),
-                    &mut diagnostics,
-                )
-                .map_err(|_| stale())?;
+                let baseline = store
+                    .load(&HashMap::new(), &mut diagnostics)
+                    .map_err(|_| stale())?;
                 if !same_source_documents(&accepted.update.sources, &baseline.sources) {
                     return Err(stale());
                 }
@@ -662,17 +651,15 @@ impl Worker {
             let mut overlay = HashMap::new();
             overlay.insert(target.clone(), Arc::<str>::from(content.as_str()));
             let mut diagnostics = Vec::new();
-            let loaded =
-                Config::from_dae_file_with_sources(&entry, &overlay, limits(), &mut diagnostics)
-                    .map_err(|error| {
-                        config_error(
-                            error,
-                            &diagnostics,
-                            &accepted.update.sources,
-                            Some(&source_id),
-                            Some(&accepted.ids),
-                        )
-                    })?;
+            let loaded = store.load(&overlay, &mut diagnostics).map_err(|error| {
+                config_error(
+                    error,
+                    &diagnostics,
+                    &accepted.update.sources,
+                    Some(&source_id),
+                    Some(&accepted.ids),
+                )
+            })?;
             if let Some(name) = &new_provider {
                 let provider = loaded
                     .config
@@ -691,6 +678,7 @@ impl Worker {
             let validate = |loaded, diagnostics: &mut Vec<DetailedDiagnostic>| {
                 offline::validate_for_coordinator(
                     loaded,
+                    store.dependency_root(),
                     &active,
                     &data_dir,
                     limits(),
@@ -753,7 +741,7 @@ impl Worker {
             {
                 return Err(denied());
             }
-            file.replace(&expected, &content, || {
+            let recheck = Box::new(|| {
                 #[cfg(test)]
                 if let Some(hook) = before_replace {
                     hook();
@@ -765,13 +753,9 @@ impl Worker {
                 {
                     return Err(WriteError::Conflict);
                 }
-                let reloaded = Config::from_dae_file_with_sources(
-                    &entry,
-                    &overlay,
-                    limits(),
-                    &mut recheck_diagnostics,
-                )
-                .map_err(|_| WriteError::Conflict)?;
+                let reloaded = store
+                    .load(&overlay, &mut recheck_diagnostics)
+                    .map_err(|_| WriteError::Conflict)?;
                 if !same_source_documents(&validated.sources, &reloaded.sources) {
                     return Err(WriteError::Conflict);
                 }
@@ -782,8 +766,8 @@ impl Worker {
                     return Err(WriteError::Conflict);
                 }
                 Ok(())
-            })
-            .map_err(write_error)?;
+            });
+            store.commit(pin, &content, recheck).map_err(write_error)?;
             let update = SourceUpdate {
                 sources: validated.sources,
                 dependencies: validated.dependencies,

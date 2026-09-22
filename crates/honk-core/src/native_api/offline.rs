@@ -33,6 +33,7 @@ pub(crate) struct ValidatedConfig {
     pub(crate) dependencies: Vec<DependencySnapshot>,
     pub(crate) geo_sources: Option<GeoSourceSet>,
     ech_paths: Vec<String>,
+    dependency_root: Option<PathBuf>,
 }
 
 pub(crate) struct CapturedConfig {
@@ -43,10 +44,13 @@ pub(crate) struct CapturedConfig {
     retain_geo: bool,
     hosts: HostsSourceSet,
     ech_paths: Vec<String>,
+    dependency_root: Option<PathBuf>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn capture_for_coordinator(
     loaded: LoadedConfig,
+    dependency_root: Option<&Path>,
     active: &Config,
     data_dir: &Path,
     limits: SourceLimits,
@@ -56,6 +60,7 @@ pub(crate) fn capture_for_coordinator(
 ) -> Result<CapturedConfig, DetailedConfigError> {
     let result = capture_inner(
         loaded,
+        dependency_root,
         active,
         data_dir,
         limits,
@@ -70,6 +75,7 @@ pub(crate) fn capture_for_coordinator(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_for_coordinator(
     loaded: LoadedConfig,
+    dependency_root: Option<&Path>,
     active: &Config,
     data_dir: &Path,
     limits: SourceLimits,
@@ -80,6 +86,7 @@ pub(crate) fn validate_for_coordinator(
 ) -> Result<ValidatedConfig, DetailedConfigError> {
     let result = capture_inner(
         loaded,
+        dependency_root,
         active,
         data_dir,
         limits,
@@ -100,8 +107,14 @@ pub(crate) fn validate_with_data_dir(
     limits: SourceLimits,
     diagnostics: &mut Vec<DetailedDiagnostic>,
 ) -> Result<ValidatedConfig, DetailedConfigError> {
+    let entry_dir = loaded
+        .sources
+        .first()
+        .and_then(|source| source.path.parent())
+        .map(Path::to_path_buf);
     let result = capture_inner(
         loaded,
+        entry_dir.as_deref(),
         active,
         data_dir,
         limits,
@@ -117,6 +130,7 @@ pub(crate) fn validate_with_data_dir(
 #[allow(clippy::too_many_arguments)]
 fn capture_inner(
     loaded: LoadedConfig,
+    dependency_root: Option<&Path>,
     active: &Config,
     data_dir: &Path,
     limits: SourceLimits,
@@ -138,8 +152,15 @@ fn capture_inner(
         ));
     };
     let source = &entry.source;
-    let mut capture = Capture::new(&sources, active, data_dir, limits, submitted)
-        .map_err(|cause| dependency_error(source, "config", cause))?;
+    let mut capture = Capture::new(
+        &sources,
+        dependency_root,
+        active,
+        data_dir,
+        limits,
+        submitted,
+    )
+    .map_err(|cause| dependency_error(source, "config", cause))?;
     config.append_diagnostics(source.clone(), diagnostics);
     config.validate_detailed().map_err(|mut error| {
         error.diagnostic.source = source.clone();
@@ -296,6 +317,7 @@ fn capture_inner(
         hosts,
         ech_paths,
         dependencies,
+        dependency_root: dependency_root.map(Path::to_path_buf),
     })
 }
 
@@ -394,6 +416,7 @@ struct Capture {
 impl Capture {
     fn new(
         sources: &[SourceSnapshot],
+        dependency_root: Option<&Path>,
         active: &Config,
         data_dir: &Path,
         limits: SourceLimits,
@@ -420,8 +443,8 @@ impl Capture {
             .ok_or(io::ErrorKind::FileTooLarge)?;
         let data_dir = data_dir.to_path_buf();
         let mut roots = Vec::new();
-        if let Some(parent) = sources.first().and_then(|source| source.path.parent()) {
-            roots.push(fs::canonicalize(parent)?);
+        if let Some(root) = dependency_root {
+            roots.push(fs::canonicalize(root)?);
         }
         if let Ok(path) = fs::canonicalize(&data_dir) {
             roots.push(path);
