@@ -675,26 +675,6 @@ impl Config {
 
     fn validate_globals_detailed(&self, source: &SourceRef) -> Result<(), DetailedConfigError> {
         self.experimental.native_api.validate_detailed(source)?;
-        if self.experimental.native_api.enabled {
-            // Listener secrets are masked by value in API responses; a short one
-            // would erase every occurrence of a common substring.
-            for (api, secret) in [
-                ("native_api", &self.experimental.native_api.secret),
-                ("clash_api", &self.experimental.clash_api.secret),
-            ] {
-                if !secret.is_empty() && secret.len() < 8 {
-                    return Err(DetailedConfigError::new(
-                        crate::error::ErrorCategory::Validation,
-                        "invalid-config-value",
-                        source.clone(),
-                        crate::diagnostic::SettingPath::new("experimental")
-                            .field(api)
-                            .field("secret"),
-                        "listener secrets must be empty or at least 8 bytes while the native API is enabled",
-                    ));
-                }
-            }
-        }
         if let Err(mut error) = crate::check::validate_dns_check_targets(&self.global.udp_check_dns)
         {
             error.diagnostic.source = source.clone();

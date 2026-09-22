@@ -20,7 +20,7 @@ Requires the default-on `native-api` Cargo feature; it does not require `clash-a
 | --- | --- | --- |
 | `enabled` | `false` | Start the independent native listener. |
 | `listen` | `"127.0.0.1:9527"` | Numeric IP plus port 1–65535; no hostname or `:port` shorthand. |
-| `secret` | `""` | Bearer credential, independent of the Clash credential. Required unless explicit anonymous loopback is enabled; a nonempty value must be at least 8 bytes, because listener secrets are masked by value in API responses. |
+| `secret` | `""` | Bearer credential, independent of the Clash credential. Required unless explicit anonymous loopback is enabled. Listener secrets are masked by value in API responses; a value shorter than 8 bytes is not masked and is reported at startup. |
 | `allow_anonymous_loopback` | `false` | Permit credential-free requests only when secret is empty and the actual listening IP is loopback. A configured secret always requires authentication. |
 | `allow_origins` | empty list | Additional explicit HTTP(S) origins, without paths, credentials, query, fragment, `null`, or wildcards. |
 | `allowed_hosts` | empty list | Additional explicit HTTP Host authorities, without URL schemes, paths, credentials, or wildcards. Omitted port means 80, not the listener's port. |
@@ -80,7 +80,7 @@ Probe requests cannot supply URLs or allowlist exceptions. For an intentionally 
 | `external_ui` | `""` | External dashboard directory. An empty value disables dashboard serving and download. |
 | `external_ui_download_url` | `""` | HTTP(S) dashboard ZIP URL. An empty value uses the built-in zashboard URL. |
 | `external_ui_download_detour` | `""` | Node or group tag used for the download. An empty value follows normal traffic routing. |
-| `secret` | `""` | API authentication secret. An empty value disables authentication. While the native API is enabled a nonempty value must be at least 8 bytes. |
+| `secret` | `""` | API authentication secret. An empty value disables authentication. A value shorter than 8 bytes is not masked in native API responses. |
 | `default_mode` | `"Rule"` | Startup mode when native API is disabled: `Rule`, `Global`, or `Direct`; a valid cached mode takes precedence. Native-enabled startup uses shared transient rule mode instead. |
 
 All `clash_api` fields are startup-owned. SIGHUP rejects a candidate configuration that changes any of them.
