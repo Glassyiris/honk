@@ -738,3 +738,22 @@ mod native_api {
         );
     }
 }
+
+#[test]
+fn retired_native_source_settings_are_accepted_and_ignored() {
+    use honk_config::{experimental::NativeApiConfig, parser::parse_dae_config};
+    let baseline = parse_dae_config("experimental { native_api {} }").unwrap();
+    for value in ["false", "true"] {
+        let parsed = parse_dae_config(&format!(
+            "experimental {{ native_api {{ config_content: {value}\n writable_includes: '/absolute', '../outside', '*.dae', '' }} }}"
+        )).unwrap();
+        assert_eq!(
+            parsed.experimental.native_api,
+            baseline.experimental.native_api
+        );
+        let serde: NativeApiConfig = serde_json::from_value(serde_json::json!({
+            "config_content":value == "true", "writable_includes":["/absolute", "../outside", "*.dae", ""]
+        })).unwrap();
+        assert_eq!(serde, NativeApiConfig::default());
+    }
+}

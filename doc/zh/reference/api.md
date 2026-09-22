@@ -6,7 +6,7 @@
 
 本节保留 M1 标题锚点，说明当前已实现的原生观测与控制契约。默认构建及两种 allocator 发布产物均包含 `native-api` Cargo feature，但 listener 默认关闭，须显式启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是唯一配置权威；显式授权后可读取与替换已接受的源文件，不引入 SQLite 配置主存储。
 
-基础契约为 [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992)，节点/provider 管理与 geodata 使用 [doona-pin ba3e4c3648e04d093d32164ecca018f51bd74e00](https://github.com/Zakkaus/api-standardize/tree/ba3e4c3648e04d093d32164ecca018f51bd74e00) 中的 M9 补充。没有整体切换到该后续 bundle 的 mode/自动 override 变更：原生 mode 与自动策略 override 继续 gate，不声明 `full_transparency`。源管理仍要求真实 `.dae` 启动及独立 content/write 授权；以 capabilities 和逐源权限为准，不按路由名称推断全部可用。
+基础契约为 [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992)，节点/provider 管理与 geodata 使用 [doona-pin ba3e4c3648e04d093d32164ecca018f51bd74e00](https://github.com/Zakkaus/api-standardize/tree/ba3e4c3648e04d093d32164ecca018f51bd74e00) 中的 M9 补充。没有整体切换到该后续 bundle 的 mode/自动 override 变更：原生 mode 与自动策略 override 继续 gate，不声明 `full_transparency`。源管理要求真实 `.dae` 启动及非空 bearer secret，写入还需启用 `config_write`；以 capabilities 和逐源权限为准，不按路由名称推断全部可用。
 
 | 方法 | 路径 | 含义 |
 | --- | --- | --- |
@@ -43,8 +43,8 @@
 | GET | `/api/v1/geodata` | 读取流量/DNS 路由实际已加载资产的保留元数据。 |
 | POST | `/api/v1/geodata/update` | 下载配置资产、完整校验后，通过 operation 激活精确候选字节。 |
 | GET | `/api/v1/logs` | 结构化、安全投影的原生日志 SSE，独立于 Clash 格式化日志。 |
-| GET | `/api/v1/config` | 已接受的源快照、配置 revision 与安全诊断。 |
-| GET | `/api/v1/config/sources/{source_id}` | 单个已接受源的元数据及获准返回的原文。 |
+| GET | `/api/v1/config` | 认证后返回已接受的源快照、配置 revision 与安全诊断，仅遮蔽监听凭据值。 |
+| GET | `/api/v1/config/sources/{source_id}` | 认证后返回单个已接受源的元数据及正文，仅遮蔽监听凭据值。 |
 | POST | `/api/v1/config/validate` | `syntax` 或离线 `full` 校验，不写盘、不 reload。 |
 | PUT | `/api/v1/config/sources/{source_id}` | 强 `If-Match` 保护的单源原文替换；写盘后排队真实 reload，返回 operation。 |
 | POST | `/api/v1/operations/reload` | 从磁盘重新加载，返回 daemon-owned operation；body 留空或为 `{}`。 |
@@ -119,17 +119,17 @@ RSS 来自 `/proc/self/status`；cgroup v2 依据实际 membership/mountinfo 定
 
 ### 配置来源、校验与操作（M6）
 
-只有真实 `.dae` 启动加载时捕获的源集合才启用配置管理；程序内构造的 Config 或 serde 格式加载不能冒充无损来源，其配置能力不可用。GET 返回最后已接受的快照，不临时重扫磁盘。源 ID 不含路径，元数据路径显示为规范化的入口目录相对名称（例如 `config.d/routing.dae`），不包含部署目录的绝对路径；原文 SHA-256、字节数、加载时间与逐源 `writable` 单独提供。源集合与校验最多 32 个来源、8 MiB 原始字节，依赖的每次实体化也计入数量和字节预算；geodata 文件是引擎本来就整体加载的运行时资产，只参与哈希冲突检测，不计入预算；HTTP JSON body 的 64 KiB 上限仍独立生效，超限返回 413。
+只有真实 `.dae` 启动加载时捕获的源集合才启用配置管理；程序内构造的 Config 或 serde 格式加载不能冒充无损来源，其配置能力不可用。GET 返回最后已接受的快照，不临时重扫磁盘。源 ID 不含路径，源 `path` 与规则 `file` 保留规范化的入口目录相对名称（例如 `config.d/routing.dae`），源 `absolute_path` 另行提供规范化绝对路径；原文 SHA-256、字节数、加载时间与逐源 `writable` 单独提供。源集合与校验最多 32 个来源、8 MiB 原始字节，依赖的每次实体化也计入数量和字节预算；geodata 文件是引擎本来就整体加载的运行时资产，只参与哈希冲突检测，不计入预算；HTTP JSON body 的 64 KiB 上限仍独立生效，超限返回 413。
 
-默认 `config_content: false`、`config_write: false`、`writable_includes: []`，以上设置及 history 设置都需重启。Content 或 write 为 true 必须配置非空有效 bearer secret；完整正文仅供通过控制凭证认证的管理员，匿名模式不能取得。包含 API 凭据的整个源不返回 content，并且只读；不要把省略正文误当成可保存的空字符串。获准返回的 content 是逐字原文，可能含出站凭据、订阅 URL 或路径，不是沙箱化/脱敏后的保存载荷；`secrets_redacted` 不表示可以无检查地公开或回写整个响应。
+配置读取要求使用非空配置 secret 通过认证。匿名 loopback 返回 `403 permission_denied`，对应的配置读取能力为 false。`config_content` 与 `writable_includes` 仍可配置，但不产生作用。已接受正文包含普通凭据、分享链接及路径；仅遮蔽声明的原生/Clash 监听凭据值，包括重复、被覆盖的声明及这些值在源中其他位置的出现。解析器提供的范围用于识别凭据值，非凭据文本与行结构保持不变。凭据源仍只读，哈希仍对应原始字节。必有的 `secrets_redacted` 布尔值表示是否遮蔽了监听凭据值；遮蔽后的正文不能作为可编辑的往返载荷。
 
-启用 `config_write` 后，非凭据主文件可写；include 只有在已接受集合中，且其规范化路径相对入口目录精确匹配 `writable_includes` 时才可写。该列表不接受绝对路径、遍历或 glob，也不能授权任意新文件；generated/subscription 来源不因此可写。普通 include 仍使用原有入口相对 glob、排序、无匹配及重复/越界检查语义，不因写许可列表改变。API 禁止修改原生设置或改变、移动 API 凭据；如需编辑含凭据主文件，先在本地把凭据迁到专用只读 include 并重启，不能通过 API 完成迁移。
+启用 `config_write` 且 secret 非空时，已接受的非凭据主文件与所有非凭据 include 均可写。只有已接受的源 ID 授权替换，调用方提供的路径不能授权任意文件写入；generated/subscription 来源不可写。普通 include 仍使用原有入口相对 glob、排序、无匹配及重复/越界检查语义。API 禁止修改原生设置或改变、移动 API 凭据；如需编辑含凭据主文件，先在本地把凭据迁到专用只读 include 并重启，不能通过 API 完成迁移。
 
 校验使用 `Content-Type: application/json`，例如 `{"mode":"syntax","sources":[{"id":"source-1","content":"..."}]}`；mode 可选 `syntax` 或 `full`，每个 source 的 id/path 可省略。`syntax` 只解析提交的文档，path 仅作来源标签，不授权文件访问，也不跟随磁盘 include。`full` 的首份文档对应入口主文件，额外路径须通过入口根目录授权；使用 overlay、获准本地 include、只读订阅缓存、实际本地 geodata/hosts/ECH 依赖做完整离线准入。从未拉取的订阅以 warning 准入、不产生缓存节点；已有 same-fetch 活动节点仍可 rebase。其他缺失或无效依赖是错误。校验不联网、不创建目录或改权限、不启动 worker、不发布 generation。完成的无效 dry-run 返回 `200` 与 `valid:false`；这不代替之后真实 reload 的运行时校验，也不承诺 reload 一定成功。
 
 Full 校验先按 include 顺序合并，再判定有效配置语义。未进入实际 include 树的提交文档只检查结构（包含 lexer 恢复后保留的错误），其设置和告警不影响有效候选；其字节与源数量仍和每次依赖物化共用同一预算。
 
-PUT 的 JSON body 为 `{"content":"完整的新原文"}`。`If-Match` 必须是**单个带双引号、含 64 个小写十六进制字符的 SHA-256 强标签**，可将读取到的 `content_sha256` 加双引号使用；它比较磁盘当前原始字节，不是 config revision 或 runtime generation。源 GET 仍是 accepted 快照，因此外部编辑后可能需要本地处理或显式 reload，而不是用旧快照覆盖磁盘。
+PUT 与校验 source 对象接受并忽略可选的回传布尔字段 `secrets_redacted`；其他未知字段返回 `400 invalid_request`。PUT 的 JSON body 为 `{"content":"完整的新原文"}`。`If-Match` 必须是**单个带双引号、含 64 个小写十六进制字符的 SHA-256 强标签**，可将读取到的 `content_sha256` 加双引号使用；它比较磁盘当前原始字节，不是 config revision 或 runtime generation。源 GET 仍是 accepted 快照，因此外部编辑后可能需要本地处理或显式 reload，而不是用旧快照覆盖磁盘。
 
 | 写入条件/结果 | HTTP 语义 |
 | --- | --- |

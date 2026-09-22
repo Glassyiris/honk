@@ -499,33 +499,51 @@ fn disk(root: &Path) -> Vec<DiskEntry> {
 async fn metadata_defaults_and_anonymous_never_grant_source_authority() {
     for access in [Access::Metadata, Access::Anonymous] {
         let fixture = Fixture::new(access, false).await;
-        let config = fixture.get(CONFIG).await;
-        assert_eq!(config["secrets_redacted"], true);
-        assert!(
-            config["sources"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|row| row.get("content").is_none() && row["writable"] == false)
-        );
-        assert!(!config.to_string().contains(SECRET));
         let capabilities = fixture.get("/api/v1/capabilities").await;
-        assert_eq!(capabilities["resources"]["config"]["content"], false);
+        assert_eq!(
+            capabilities["resources"]["config"]["content"],
+            fixture.authenticated
+        );
         assert_eq!(capabilities["resources"]["config"]["writable"], false);
         assert_eq!(capabilities["resources"]["groups"]["config_patch"], false);
-        let main = source(&config, &fixture.originals["main.dae"]);
-        let before = disk(fixture.directory.path());
-        error(
-            fixture
-                .replace(main, "routing { fallback: block }")
-                .send()
-                .await
-                .unwrap(),
-            StatusCode::FORBIDDEN,
-            "permission_denied",
-        )
-        .await;
-        assert_eq!(disk(fixture.directory.path()), before);
+        if !fixture.authenticated {
+            assert_eq!(
+                fixture.service.snapshot().unwrap()["secrets_redacted"],
+                false
+            );
+            for path in [CONFIG, "/api/v1/config/sources/unknown"] {
+                error(
+                    fixture.request(Method::GET, path).send().await.unwrap(),
+                    StatusCode::FORBIDDEN,
+                    "permission_denied",
+                )
+                .await;
+            }
+        } else {
+            let config = fixture.get(CONFIG).await;
+            assert_eq!(config["secrets_redacted"], true);
+            assert!(
+                config["sources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row["content"].is_string() && row["writable"] == false)
+            );
+            assert!(!config.to_string().contains(SECRET));
+            let main = source(&config, &fixture.originals["main.dae"]);
+            let before = disk(fixture.directory.path());
+            error(
+                fixture
+                    .replace(main, "routing { fallback: block }")
+                    .send()
+                    .await
+                    .unwrap(),
+                StatusCode::FORBIDDEN,
+                "permission_denied",
+            )
+            .await;
+            assert_eq!(disk(fixture.directory.path()), before);
+        }
         assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
         fixture.shutdown().await;
     }
@@ -552,12 +570,11 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
         chrono::DateTime::parse_from_rfc3339(row["loaded_at"].as_str().unwrap()).unwrap();
         let id = row["id"].as_str().unwrap();
         assert!(!id.is_empty() && !id.contains(name));
-        assert_eq!(
-            row["writable"],
-            matches!(*name, "main.dae" | "editable.dae")
-        );
+        assert_eq!(row["writable"], *name != "auth.dae");
+        assert_eq!(row["absolute_path"], fixture.path(name).to_str().unwrap());
         if *name == "auth.dae" {
-            assert!(row.get("content").is_none());
+            assert!(row["content"].as_str().unwrap().contains("enabled: true"));
+            assert!(!row["content"].as_str().unwrap().contains(SECRET));
         } else {
             assert_eq!(row["content"], *original);
             assert_eq!(
@@ -569,7 +586,7 @@ async fn admin_reads_exact_accepted_bytes_but_never_auth_source_or_unapproved_wr
     }
     assert!(!config.to_string().contains(SECRET));
     let before = disk(fixture.directory.path());
-    for name in ["locked.dae", "auth.dae"] {
+    for name in ["auth.dae"] {
         error(
             fixture
                 .replace(
@@ -819,5 +836,76 @@ async fn source_replacement_preserves_text_mode_and_independent_revision_generat
     );
     fixture.assert_last_reload(&terminal).await;
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), 2);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn mixed_listener_secrets_mask_values_and_keep_ordinary_content() {
+    let fixture = Fixture::new_custom(Access::Admin, false, |_, files| {
+        let auth = files.get_mut("auth.dae").unwrap();
+        *auth = auth.replace(&format!("secret: '{SECRET}'"),
+            &format!("secret: 'overridden-listener-token'\n secret: '{SECRET}'"));
+        auth.push_str("experimental { clash_api { secret: 'old-clash-token'\n secret: 'clash-listener-token' } }\n# old-clash-token copied here\n");
+        files.get_mut("locked.dae").unwrap().push_str(
+            "# overridden-listener-token copied across sources\nnode { ordinary: 'socks5://user:ordinary-password@192.0.2.1:1080' }\n");
+    }).await;
+    let config = fixture.get(CONFIG).await;
+    assert_eq!(config["secrets_redacted"], true);
+    let encoded = config.to_string();
+    for secret in [
+        SECRET,
+        "overridden-listener-token",
+        "old-clash-token",
+        "clash-listener-token",
+    ] {
+        assert!(!encoded.contains(secret), "listener value leaked");
+    }
+    let auth = source(&config, &fixture.originals["auth.dae"]);
+    assert_eq!(auth["writable"], false);
+    assert_eq!(
+        auth["content"].as_str().unwrap().lines().count(),
+        fixture.originals["auth.dae"].lines().count()
+    );
+    let mixed = source(&config, &fixture.originals["locked.dae"]);
+    assert!(
+        mixed["content"]
+            .as_str()
+            .unwrap()
+            .contains("socks5://user:ordinary-password@192.0.2.1:1080")
+    );
+    assert_eq!(mixed["writable"], false);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn retired_content_flag_and_echoed_redaction_flag_do_not_grant_write_authority() {
+    let fixture = Fixture::new_custom(Access::Admin, false, |_, files| {
+        let auth = files.get_mut("auth.dae").unwrap();
+        *auth = auth.replace("config_content: true", "config_content: false");
+    })
+    .await;
+    let config = fixture.get(CONFIG).await;
+    let row = source(&config, &fixture.originals["locked.dae"]);
+    assert_eq!(row["content"], fixture.originals["locked.dae"]);
+    assert_eq!(row["writable"], true);
+    let candidate = "# accepted include without an allowlist\n";
+    let admission = accepted(
+        fixture
+            .replace(row, candidate)
+            .json(&json!({"content": candidate, "secrets_redacted": false}))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(fixture.terminal(&admission).await["status"], "succeeded");
+    let response = fixture
+        .request(Method::POST, "/api/v1/config/validate")
+        .json(&json!({"mode":"syntax", "secrets_redacted":true,
+            "sources":[{"content":"routing { fallback: direct }", "secrets_redacted":false}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok(response).await["valid"], true);
     fixture.shutdown().await;
 }

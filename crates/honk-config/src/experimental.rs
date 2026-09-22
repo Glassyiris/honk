@@ -100,10 +100,24 @@ pub struct NativeApiConfig {
     pub probe_allowed_cidrs: Vec<String>,
     pub probe_allowed_ports: Vec<u16>,
     pub config_write: bool,
+    #[serde(skip_serializing, deserialize_with = "ignore_config_content")]
     pub config_content: bool,
+    #[serde(skip_serializing, deserialize_with = "ignore_writable_includes")]
     pub writable_includes: Vec<String>,
     pub geosite_download_url: String,
     pub geoip_download_url: String,
+}
+
+fn ignore_config_content<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<bool, D::Error> {
+    bool::deserialize(deserializer).map(|_| false)
+}
+
+fn ignore_writable_includes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    Vec::<String>::deserialize(deserializer).map(|_| Vec::new())
 }
 
 impl Default for NativeApiConfig {
@@ -154,7 +168,7 @@ impl NativeApiConfig {
                 "native API secret must be visible ASCII without commas or whitespace",
             ));
         }
-        if (self.config_write || self.config_content) && self.secret.is_empty() {
+        if self.config_write && self.secret.is_empty() {
             return Err(invalid(
                 "secret",
                 "configuration administration requires a bearer secret",
@@ -170,21 +184,6 @@ impl NativeApiConfig {
                     "geodata source requires a credential-free HTTP(S) URL without a fragment",
                 ));
             }
-        }
-        if self.writable_includes.iter().any(|value| {
-            let path = std::path::Path::new(value);
-            value.is_empty()
-                || path.is_absolute()
-                || path
-                    .components()
-                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
-                || path.extension().and_then(|value| value.to_str()) != Some("dae")
-                || value.contains(['*', '?', '[', ']', '\\'])
-        }) {
-            return Err(invalid(
-                "writable_includes",
-                "writable includes must be explicit relative dae paths without traversal or globs",
-            ));
         }
         if self
             .probe_allowed_cidrs

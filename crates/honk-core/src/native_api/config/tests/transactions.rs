@@ -15,7 +15,7 @@ async fn rule_details_use_accepted_expressions_without_exposing_source_content()
             .as_array()
             .unwrap()
             .iter()
-            .all(|source| { source.get("content").is_none() && source["writable"] == false })
+            .all(|source| { source["content"].is_string() && source["writable"] == false })
     );
     let before = fixture.get("/api/v1/rules").await;
     assert_eq!(before["rules"][0]["expression"], "pname(<redacted>)");

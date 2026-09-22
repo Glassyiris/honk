@@ -14,7 +14,7 @@
 
 ## `native_api`
 
-需要默认编译的 Cargo feature `native-api`，不依赖 `clash-api`，listener 仍默认关闭。未编译该 feature 却启用配置时，启动报错。所有字段都要求重启；SIGHUP 拒绝其变更并保留当前 listener 与配置代次。未知字段、标量中的嵌套块、无效布尔值及安全列表空成员均报错。
+需要默认编译的 Cargo feature `native-api`，不依赖 `clash-api`，listener 仍默认关闭。未编译该 feature 却启用配置时，启动报错。所有生效字段都要求重启；SIGHUP 拒绝其变更并保留当前 listener 与配置代次。未知字段、标量中的嵌套块、无效布尔值及安全列表空成员均报错。
 
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -32,9 +32,9 @@
 | `record_dns_log` | `true` | 允许按 API 客户端连接规则或显式运行时设置记录客户端 DNS 完成历史，最多保留 512 条、8 MiB。`false` 禁止记录；修改配置需重启。 |
 | `probe_allowed_cidrs` | 空列表 | 管理员允许原生 probe 访问的受限 IP CIDR；默认拒绝私网、loopback、link-local 等受限解析目标，包括配置的节点地址。不是任意 URL 许可。 |
 | `probe_allowed_ports` | 空列表 | 扩展原生 HTTP/HTTPS 检查的默认 80/443、DNS 检查的默认 53 端口；每项须为 1–65535。Raw TCP-connect 只使用节点实际配置端口，不受此扩展列表限制；受限地址仍需独立 CIDR 许可。 |
-| `config_content` | `false` | 向通过控制 bearer 认证的管理员返回获准源的完整原文；要求非空 secret，含 API 凭据的整个源仍省略正文。 |
-| `config_write` | `false` | 允许非凭据主文件及明确授权的已接受 include 原文替换，耐久写入后排队真实 reload；要求非空 secret。 |
-| `writable_includes` | 空列表（`[]`） | 已接受 include 相对入口目录的规范化 `.dae` 路径精确许可列表；不接受绝对路径、遍历、glob 或任意新文件。dae 中省略字段表示空列表。 |
+| `config_content` | `false` | 为兼容旧配置而接受，不产生作用。认证后的源读取要求非空 `secret`，仅遮蔽监听凭据值。 |
+| `config_write` | `false` | 允许已接受主文件及所有已接受 include 的原文替换与 reload，含监听凭据的源除外；要求非空 `secret`。 |
+| `writable_includes` | 空列表 | 为兼容旧配置而接受，不产生作用；不授予路径权限，也不限制已接受 include。 |
 | `geosite_download_url` | `""` | 更新已加载 geosite 的最终直达 HTTP(S) 来源；要求 `config_write`，已加载该资产而 URL 为空时不能更新。 |
 | `geoip_download_url` | `""` | 更新已加载 geoip 的最终直达 HTTP(S) 来源，使用相同授权与限制。 |
 
@@ -70,9 +70,9 @@ Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒
 
 ### M6：配置管理的信任边界
 
-配置来源仅在真实 `.dae` 启动加载时捕获；程序内构造的配置或 serde 加载不提供无损源管理。默认只公开已接受的元数据，路径显示为规范化的入口目录相对名称。开启 `config_content` 或 `config_write` 必须设置非空有效 secret，匿名 loopback 不例外。完整 content 可能包含节点凭据、订阅 URL 或路径，不是脱敏或沙箱化保存载荷；含 API 凭据的整个源不返回正文且只读。API 禁止改变或迁移凭据及原生设置；需管理员本地修改并重启。若主文件包含凭据，要先在本地将其移至专用只读 include，再重启，才能通过 API 编辑该主文件。
+配置来源仅在真实 `.dae` 启动加载时捕获；程序内构造的配置或 serde 加载不提供无损源管理。认证后的读取要求非空 secret，并返回已接受正文，仅遮蔽声明的监听凭据值，包括重复、被覆盖的值及其在其他位置的出现。匿名配置读取返回 `403 permission_denied`。凭据源仍只读，哈希仍对应原始字节。源 `path` 保持入口目录相对名称，`absolute_path` 提供规范化绝对路径。API 禁止改变或迁移凭据及原生设置；需管理员本地修改并重启。若主文件包含凭据，要先在本地将其移至专用只读 include，再重启，才能通过 API 编辑该主文件。
 
-例如 `writable_includes: 'conf.d/routing.dae', 'conf.d/groups.dae'` 只授权这些已接受规范化路径，不改变普通 include 的 glob、排序或无匹配语义。全量源/校验预算为 32 个来源、8 MiB，重复依赖实体化也计费；HTTP JSON body 仍最多 64 KiB。源 PUT 使用磁盘字节 SHA-256 强 If-Match，组 PATCH 使用 accepted revision 并独立检查源/依赖。正文披露与写许可独立，content 缺失时不得回写空字符串或脱敏响应。Selector、受限组 PATCH 和 M9 主文件创建/删除均复用来源权威；自动策略 override 仍关闭。具体失败恢复见 [API 契约](./api.md#主文件条目与-geodata-管理m9)。
+`config_content` 与 `writable_includes` 仍可配置，但不产生作用。启用 `config_write` 后，所有已接受的非凭据 include 均可写；普通 include 的 glob、排序及无匹配语义不变。全量源/校验预算为 32 个来源、8 MiB，重复依赖实体化也计费；HTTP JSON body 仍最多 64 KiB。源 PUT 使用磁盘字节 SHA-256 强 If-Match，组 PATCH 使用 accepted revision 并独立检查源/依赖。正文披露与写许可独立，遮蔽后的凭据源正文不能回写。Selector、受限组 PATCH 和 M9 主文件创建/删除均复用来源权威；自动策略 override 仍关闭。具体失败恢复见 [API 契约](./api.md#主文件条目与-geodata-管理m9)。
 
 
 ## `clash_api`

@@ -326,7 +326,7 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
             "max_json_body_bytes": 65536,
         },
         "resources": {
-            "config": {"available":config.sources.available(),"content":config.content_enabled(),"writable":config.writable(),"max_bytes":crate::configuration::MAX_SOURCE_BYTES,"max_sources":crate::configuration::MAX_SOURCES},
+            "config": {"available":config.content_enabled(),"content":config.content_enabled(),"writable":config.writable(),"max_bytes":crate::configuration::MAX_SOURCE_BYTES,"max_sources":crate::configuration::MAX_SOURCES},
             "config_validate": {"available":config.running(),"modes":["syntax","full"],"max_bytes":crate::configuration::MAX_SOURCE_BYTES,"max_sources":crate::configuration::MAX_SOURCES},
             "runtime": {"available": true},
             "runtime_memory": {"available":true,"metrics":telemetry.metrics()},
