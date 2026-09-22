@@ -84,6 +84,50 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
             ),
         )
         .route(
+            "/api/v1/config/export",
+            resource(
+                get(
+                    |State(state): App, Extension(id): Id, uri: Uri| async move {
+                        respond(config::export(&state, &uri, &id).await, id)
+                    },
+                ),
+                &["GET"],
+            ),
+        )
+        .route(
+            "/api/v1/config/import",
+            resource(
+                post(
+                    |State(state): App, Extension(id): Id, request: Request| async move {
+                        respond(config::import(&state, request, &id).await, id)
+                    },
+                ),
+                &["POST"],
+            ),
+        )
+        .route(
+            "/api/v1/config/revisions",
+            resource(
+                get(
+                    |State(state): App, Extension(id): Id, uri: Uri| async move {
+                        respond(config::revisions(&state, &uri, &id).await, id)
+                    },
+                ),
+                &["GET"],
+            ),
+        )
+        .route(
+            "/api/v1/config/revisions/{number}/activate",
+            resource(
+                post(
+                    |State(state): App, Extension(id): Id, request: Request| async move {
+                        respond(config::activate(&state, request, &id).await, id)
+                    },
+                ),
+                &["POST"],
+            ),
+        )
+        .route(
             "/api/v1/config/sources/{source_id}",
             resource(
                 get(

@@ -1,6 +1,9 @@
 //! Native file permissions, HTTP projections and configuration work admission.
 
 mod coordinator;
+mod revisions;
+
+pub(super) use revisions::{activate, export, import, revisions};
 
 use axum::body::HttpBody;
 use std::collections::{HashMap, HashSet};
@@ -26,6 +29,7 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use super::operations::{OperationStore, Reservation};
+use super::store::{SourceStore, StoreKind};
 use super::{ApiError, ErrorCode, NativeState, error, parse_query, timestamp, types::RequestId};
 use crate::configuration::{
     Accepted, AcceptedSources, MAX_SOURCE_BYTES, MAX_SOURCES, SourceUpdate, limits,
@@ -247,6 +251,7 @@ pub(crate) struct ConfigService {
     phase: RwLock<Option<tokio::sync::watch::Receiver<crate::control::EnginePhase>>>,
     /// The secret set for the accepted sources, keyed by the `SourceUpdate` it was built from.
     secrets: Mutex<Option<(Arc<SourceUpdate>, Arc<ListenerSecrets>)>>,
+    store: RwLock<Option<Arc<dyn SourceStore>>>,
     #[cfg(test)]
     before_replace: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -280,6 +285,13 @@ enum Work {
     Reload {
         reservation: Reservation,
     },
+    Import {
+        reservation: Reservation,
+    },
+    ActivateRevision {
+        number: i64,
+        reservation: Reservation,
+    },
     Validate {
         request: ValidationRequest,
         response: oneshot::Sender<Result<Value, ApiError>>,
@@ -302,6 +314,7 @@ impl ConfigService {
             last_reload: RwLock::new(None),
             phase: RwLock::new(None),
             secrets: Mutex::new(None),
+            store: RwLock::new(None),
             #[cfg(test)]
             before_replace: Mutex::new(None),
         }
@@ -494,6 +507,8 @@ impl ConfigService {
         let (content, redacted) = secrets.mask(&source.content);
         let (path, path_redacted) = secrets.mask(&source_path(accepted, index).to_string_lossy());
         let (absolute_path, absolute_redacted) = secrets.mask(&source.path.to_string_lossy());
+        // Db paths are labels, not files an operator could open.
+        let absolute_path = (self.store_kind() == StoreKind::File).then_some(absolute_path);
         let value = json!({
             "id":accepted.ids[&source.path], "path":path,
             "absolute_path":absolute_path, "kind":if index==0 {"main"} else {"include"},
@@ -762,6 +777,7 @@ pub(super) async fn get(
         .expect("source snapshot pinned by config publication guard");
     let active = state.diagnostics.read();
     value["generation_id"] = json!(format!("{}:{}", state.instance_id, active.generation));
+    value["store"] = state.observation.configuration.store_value();
     let diagnostics = active
         .buckets
         .static_diagnostics

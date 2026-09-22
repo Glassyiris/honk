@@ -1,5 +1,6 @@
 mod completion;
 mod geodata;
+mod revisions;
 mod validation;
 
 use super::super::management::{self, Completion, Mutation};
@@ -54,6 +55,7 @@ impl ConfigService {
             self.sources
                 .generation_committed(&super::super::catalog::revision_for(&config), generation);
         }
+        *self.store.write() = store.clone();
         let (sender, mut receiver) = mpsc::channel(16);
         *self.sender.lock() = Some(sender);
         let (stop, mut stopping) = watch::channel(false);
@@ -118,6 +120,8 @@ impl Worker {
                 | Work::GeoUpdate { reservation, .. }
                 | Work::GroupPatch { reservation, .. }
                 | Work::Reload { reservation }
+                | Work::Import { reservation }
+                | Work::ActivateRevision { reservation, .. }
                 | Work::Lifecycle { reservation, .. } => {
                     self.service.operations.reject(&reservation.id, error);
                 }
@@ -275,6 +279,44 @@ impl Worker {
                     Err(error) => {
                         self.service.operations.reject(&id, error);
                     }
+                }
+                drop(reservation);
+            }
+            Work::Import { reservation } => {
+                let id = reservation.id.clone();
+                let prepared = self.prepare_import(&reservation.principal).await;
+                self.tree_operation(&id, prepared).await;
+                drop(reservation);
+            }
+            Work::ActivateRevision {
+                number,
+                reservation,
+            } => {
+                let id = reservation.id.clone();
+                let head = self
+                    .store
+                    .as_ref()
+                    .and_then(|store| store.database())
+                    .map(|database| database.head());
+                if let Some(Ok(Some(head))) = head
+                    && head == number
+                {
+                    self.service.operations.accept(&id);
+                    self.service.operations.running(&id);
+                    let generation = self.diagnostics.read().generation;
+                    self.service.operations.succeed(
+                        &id,
+                        super::super::operations::OperationResult::Reload {
+                            active_generation_id: Some(format!(
+                                "{}:{generation}",
+                                self.service.instance_id
+                            )),
+                            datapath_generation_id: None,
+                        },
+                    );
+                } else {
+                    let prepared = self.prepare_revision(number, &reservation.principal).await;
+                    self.tree_operation(&id, prepared).await;
                 }
                 drop(reservation);
             }
@@ -496,6 +538,29 @@ impl Worker {
             id,
             value,
         })
+    }
+
+    async fn tree_operation(&mut self, id: &str, prepared: Result<Prepared, ApiError>) {
+        match prepared {
+            Ok((candidate, sources, diagnostics, committed)) => {
+                self.replace_operation(
+                    id,
+                    ActivationRequest {
+                        candidate,
+                        sources: Some(sources),
+                        diagnostics,
+                        expected_revision: None,
+                        deferred_provider: None,
+                    },
+                    None,
+                    committed,
+                )
+                .await;
+            }
+            Err(error) => {
+                self.service.operations.reject(id, error);
+            }
+        }
     }
 
     async fn load(

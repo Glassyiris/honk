@@ -32,6 +32,7 @@ pub enum ErrorCode {
     SetupRequired,
     SetupAlreadyCompleted,
     InvalidCredentials,
+    AlreadyInitialized,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -297,6 +298,9 @@ pub(super) fn discovery(auth: AuthDiscovery) -> Value {
             "capabilities": "/api/v1/capabilities",
             "config": "/api/v1/config",
             "config_validate": "/api/v1/config/validate",
+            "config_export": "/api/v1/config/export",
+            "config_import": "/api/v1/config/import",
+            "config_revisions": "/api/v1/config/revisions",
             "runtime": "/api/v1/runtime",
             "runtime_outbounds": "/api/v1/runtime/outbounds",
             "traffic_history": "/api/v1/runtime/traffic/history",
@@ -354,7 +358,10 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
             "max_json_body_bytes": 65536,
         },
         "resources": {
-            "config": {"available":config.content_enabled(),"content":config.content_enabled(),"writable":config.writable(),"max_bytes":crate::configuration::MAX_SOURCE_BYTES,"max_sources":crate::configuration::MAX_SOURCES},
+            "config": {"available":config.content_enabled(),"content":config.content_enabled(),"writable":config.writable(),"max_bytes":crate::configuration::MAX_SOURCE_BYTES,"max_sources":crate::configuration::MAX_SOURCES,"store":config.store_value()["kind"]},
+            "config_export": {"available":config.content_enabled()},
+            "config_import": config.import_capability(),
+            "config_revisions": config.revisions_capability(),
             "config_validate": {"available":config.running(),"modes":["syntax","full"],"max_bytes":crate::configuration::MAX_SOURCE_BYTES,"max_sources":crate::configuration::MAX_SOURCES},
             "runtime": {"available": true},
             "runtime_memory": {"available":true,"metrics":telemetry.metrics()},

@@ -90,6 +90,9 @@ pub(crate) trait SourceStore: Send + Sync + 'static {
     fn promote(&self, committed: Committed) -> Result<(), WriteError>;
     /// Refuses later writes until restart: the running config may differ from the store.
     fn block(&self);
+    fn database(&self) -> Option<&DbStore> {
+        None
+    }
 }
 
 /// Sources read from and replaced in the operator's `-c` tree.
@@ -219,5 +222,9 @@ impl SourceStore for DbStore {
 
     fn block(&self) {
         DbStore::block(self);
+    }
+
+    fn database(&self) -> Option<&DbStore> {
+        Some(self)
     }
 }

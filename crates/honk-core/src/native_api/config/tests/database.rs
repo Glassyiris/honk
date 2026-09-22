@@ -123,3 +123,187 @@ async fn listener_settings_data_dir_and_secrets_stay_read_only() {
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
     fixture.shutdown().await;
 }
+
+async fn operation(fixture: &Fixture, path: &str, key: &str, body: Value) -> Value {
+    let response = fixture
+        .request(Method::POST, path)
+        .header("idempotency-key", key)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let operation = accepted(response).await;
+    fixture.terminal(&operation).await
+}
+
+#[tokio::test]
+async fn file_mode_has_export_but_no_import_or_revisions() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let response = fixture
+        .request(Method::POST, "/api/v1/config/import")
+        .header("idempotency-key", "import")
+        .json(&json!({"replace":true}))
+        .send()
+        .await
+        .unwrap();
+    error(response, StatusCode::NOT_FOUND, "capability_not_supported").await;
+    let response = fixture
+        .request(Method::GET, "/api/v1/config/revisions")
+        .send()
+        .await
+        .unwrap();
+    error(response, StatusCode::NOT_FOUND, "capability_not_supported").await;
+    let response = fixture
+        .request(Method::POST, "/api/v1/config/revisions/1/activate")
+        .send()
+        .await
+        .unwrap();
+    error(response, StatusCode::NOT_FOUND, "capability_not_supported").await;
+    let response = fixture
+        .request(Method::GET, "/api/v1/config/export")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-disposition"],
+        "attachment; filename=\"honk.dae\""
+    );
+    let body = response.text().await.unwrap();
+    assert!(body.starts_with("# listener secrets omitted\n"));
+    assert!(!body.contains(SECRET));
+    let config = fixture.get(CONFIG).await;
+    assert_eq!(config["store"]["kind"], "file");
+    assert!(config["sources"][0]["absolute_path"].is_string());
+    let capabilities = fixture.get("/api/v1/capabilities").await;
+    assert_eq!(capabilities["resources"]["config"]["store"], "file");
+    assert_eq!(
+        capabilities["resources"]["config_import"]["available"],
+        false
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn import_export_and_activate_record_revisions() {
+    let fixture = Fixture::new_db(Access::Admin).await;
+    let store = Arc::clone(fixture.database.as_ref().unwrap());
+    let config = fixture.get(CONFIG).await;
+    assert_eq!(
+        config["store"],
+        json!({"kind":"db","revision":1,"parent":null})
+    );
+    assert!(config["sources"][0]["absolute_path"].is_null());
+    let capabilities = fixture.get("/api/v1/capabilities").await;
+    assert_eq!(capabilities["resources"]["config"]["store"], "db");
+    assert_eq!(
+        capabilities["resources"]["config_revisions"],
+        json!({"available":true,"can_activate":true,"max_revisions":50})
+    );
+
+    let response = fixture
+        .request(Method::POST, "/api/v1/config/import")
+        .header("idempotency-key", "first")
+        .json(&json!({"replace":false}))
+        .send()
+        .await
+        .unwrap();
+    error(response, StatusCode::CONFLICT, "already_initialized").await;
+
+    let edited = fixture.originals["main.dae"].replace("fallback: direct", "fallback: block");
+    std::fs::write(fixture.path("etc/main.dae"), &edited).unwrap();
+    let terminal = operation(
+        &fixture,
+        "/api/v1/config/import",
+        "replace",
+        json!({"replace":true}),
+    )
+    .await;
+    assert_eq!(terminal["status"], "succeeded", "{terminal}");
+    assert_eq!(store.head(), Ok(Some(2)));
+    let config = fixture.get(CONFIG).await;
+    source(&config, &edited);
+
+    let response = fixture
+        .request(Method::GET, "/api/v1/config/export")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/plain; charset=utf-8"
+    );
+    assert_eq!(
+        response.headers()["content-disposition"],
+        "attachment; filename=\"honk-r2.dae\""
+    );
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let etag = response.headers()["etag"].to_str().unwrap().to_owned();
+    let body = response.text().await.unwrap();
+    assert_eq!(etag, format!("\"{}\"", sha256(&body)));
+    assert!(body.starts_with("# listener secrets omitted\n"));
+    assert!(!body.contains(SECRET) && !body.contains("include {"));
+    let stored = store.load(&HashMap::new(), &mut Vec::new()).unwrap();
+    let documents: Vec<_> = stored
+        .sources
+        .iter()
+        .map(|source| (source.path.clone(), source.content.clone()))
+        .collect();
+    let expected = honk_config::parser::parse_dae_sources(
+        &documents,
+        SourceLimits::default(),
+        &mut Vec::new(),
+    )
+    .unwrap()
+    .config;
+    assert_eq!(
+        honk_config::parser::parse_dae_config(&body).unwrap(),
+        expected
+    );
+
+    let terminal = operation(
+        &fixture,
+        "/api/v1/config/revisions/1/activate",
+        "rollback",
+        json!({}),
+    )
+    .await;
+    assert_eq!(terminal["status"], "succeeded", "{terminal}");
+    assert_eq!(store.head(), Ok(Some(3)));
+    let config = fixture.get(CONFIG).await;
+    source(&config, &fixture.originals["main.dae"]);
+    let response = fixture
+        .request(Method::POST, "/api/v1/config/revisions/9/activate")
+        .send()
+        .await
+        .unwrap();
+    error(response, StatusCode::NOT_FOUND, "resource_not_found").await;
+
+    let list = fixture.get("/api/v1/config/revisions").await;
+    assert_eq!(list["active"], 3);
+    assert_eq!(list["max_revisions"], 50);
+    let rows: Vec<_> = list["revisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["revision"].as_i64().unwrap(),
+                row["parent"].as_i64(),
+                row["origin"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (3, Some(2), "activate".to_owned()),
+            (2, Some(1), "import".to_owned()),
+            (1, None, "import".to_owned()),
+        ]
+    );
+    assert!(list["revisions"][0]["sources"][0]["path"] == "main.dae");
+    assert!(!list.to_string().contains("origin_sha256") && !list.to_string().contains("content\""));
+    fixture.shutdown().await;
+}

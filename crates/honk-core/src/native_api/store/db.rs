@@ -69,6 +69,7 @@ pub(crate) enum StoreError {
 pub(crate) enum Origin {
     Import,
     Write,
+    Activate,
 }
 
 impl Origin {
@@ -76,8 +77,23 @@ impl Origin {
         match self {
             Self::Import => "import",
             Self::Write => "write",
+            Self::Activate => "activate",
         }
     }
+}
+
+/// One row of the revision list; content stays in the db.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RevisionInfo {
+    pub(crate) number: i64,
+    pub(crate) parent: Option<i64>,
+    pub(crate) created_at: i64,
+    pub(crate) principal: String,
+    pub(crate) origin: String,
+    pub(crate) content_sha256: String,
+    pub(crate) bytes: i64,
+    /// `(name, sha256)` in loader preorder.
+    pub(crate) sources: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -123,6 +139,8 @@ pub(crate) struct DbStore {
     connection: Mutex<Connection>,
     entry: PathBuf,
     root: PathBuf,
+    /// The `-c` entry this process started with; `import` reads it.
+    import_entry: PathBuf,
     /// Set when the daemon may run something `head` does not record; cleared only by restart.
     blocked: AtomicBool,
 }
@@ -180,9 +198,10 @@ impl DbStore {
         }
         drop(file);
         prepare(&mut connection)?;
+        let import_entry = lexical(entry)?;
         let root_entry = match active_revision(&connection)? {
             Some((_, root, revision)) => root.join(&revision.sources[0].name),
-            None => lexical(entry)?,
+            None => import_entry.clone(),
         };
         let root = root_entry
             .parent()
@@ -193,6 +212,7 @@ impl DbStore {
             connection: Mutex::new(connection),
             entry: root_entry,
             root,
+            import_entry,
             blocked: AtomicBool::new(false),
         })
     }
@@ -203,6 +223,134 @@ impl DbStore {
 
     pub(crate) fn head(&self) -> Result<Option<i64>, StoreError> {
         head(&self.connection.lock())
+    }
+
+    pub(crate) fn import_entry(&self) -> &Path {
+        &self.import_entry
+    }
+
+    /// `(head, parent of head)`.
+    pub(crate) fn head_and_parent(&self) -> Result<Option<(i64, Option<i64>)>, StoreError> {
+        let connection = self.connection.lock();
+        let Some(number) = head(&connection)? else {
+            return Ok(None);
+        };
+        let parent = connection
+            .query_row(
+                "SELECT parent FROM revision WHERE number = ?1",
+                [number],
+                |row| row.get(0),
+            )
+            .map_err(sql)?;
+        Ok(Some((number, parent)))
+    }
+
+    /// Newest first.
+    pub(crate) fn revisions(&self) -> Result<Vec<RevisionInfo>, StoreError> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT number, parent, created_at, principal, origin, content_sha256, bytes, sources
+                 FROM revision ORDER BY number DESC",
+            )
+            .map_err(sql)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    RevisionInfo {
+                        number: row.get(0)?,
+                        parent: row.get(1)?,
+                        created_at: row.get(2)?,
+                        principal: row.get(3)?,
+                        origin: row.get(4)?,
+                        content_sha256: row.get(5)?,
+                        bytes: row.get(6)?,
+                        sources: Vec::new(),
+                    },
+                    row.get::<_, String>(7)?,
+                ))
+            })
+            .map_err(sql)?;
+        let mut revisions = Vec::new();
+        for row in rows {
+            let (mut info, sources) = row.map_err(sql)?;
+            if digest(sources.as_bytes()) != info.content_sha256 {
+                return Err(StoreError::Corrupt);
+            }
+            let sources: Vec<StoredSource> =
+                serde_json::from_str(&sources).map_err(|_| StoreError::Corrupt)?;
+            info.sources = sources
+                .into_iter()
+                .map(|source| (source.name, source.sha256))
+                .collect();
+            revisions.push(info);
+        }
+        Ok(revisions)
+    }
+
+    /// Loads revision `number` as the loader sees it, secrets re-applied.
+    pub(crate) fn load_revision(
+        &self,
+        number: i64,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+    ) -> Result<Option<LoadedConfig>, StoreError> {
+        let (revision, secrets) = {
+            let connection = self.connection.lock();
+            let Some((root, revision)) = revision(&connection, number)? else {
+                return Ok(None);
+            };
+            if root != self.root {
+                return Err(StoreError::Invalid);
+            }
+            (revision, listener_secrets(&connection)?)
+        };
+        let sources = revision
+            .sources
+            .into_iter()
+            .map(|source| (self.root.join(source.name), Arc::from(source.content)))
+            .collect();
+        self.load_sources(&sources, &secrets, diagnostics)
+            .map(Some)
+            .map_err(|_| StoreError::Invalid)
+    }
+
+    /// A candidate that did not come from editing one pinned source.
+    pub(crate) fn stage(
+        &self,
+        candidate: &[SourceSnapshot],
+        principal: &str,
+        origin: Origin,
+    ) -> Result<Pending, WriteError> {
+        if self.blocked.load(Ordering::Acquire) {
+            return Err(WriteError::Unavailable);
+        }
+        let parent = self
+            .head()
+            .map_err(|_| WriteError::Unavailable)?
+            .ok_or(WriteError::Unavailable)?;
+        let sources = self.stored(candidate, None).map_err(|error| match error {
+            StoreError::Invalid => WriteError::UnsafePath,
+            _ => WriteError::Unavailable,
+        })?;
+        Ok(Pending {
+            parent,
+            sources,
+            principal: principal.to_owned(),
+            origin,
+        })
+    }
+
+    fn load_sources(
+        &self,
+        sources: &HashMap<PathBuf, Arc<str>>,
+        secrets: &ListenerSecrets,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+    ) -> Result<LoadedConfig, DetailedConfigError> {
+        let mut loaded =
+            Config::from_dae_sources_in_memory(&self.entry, sources, limits(), diagnostics)?;
+        loaded.config.experimental.native_api.secret = secrets.native_api.clone();
+        loaded.config.experimental.clash_api.secret = secrets.clash_api.clone();
+        Ok(loaded)
     }
 
     /// Records the first revision; refused once any revision exists.
@@ -293,11 +441,7 @@ impl DbStore {
                 .iter()
                 .map(|(path, content)| (path.clone(), content.clone())),
         );
-        let mut loaded =
-            Config::from_dae_sources_in_memory(&self.entry, &sources, limits(), diagnostics)?;
-        loaded.config.experimental.native_api.secret = secrets.native_api;
-        loaded.config.experimental.clash_api.secret = secrets.clash_api;
-        Ok(loaded)
+        self.load_sources(&sources, &secrets, diagnostics)
     }
 
     pub(crate) fn pin(&self, path: &Path) -> Result<RevisionPin, WriteError> {
@@ -515,13 +659,26 @@ fn active_revision(
     let Some(number) = head(connection)? else {
         return Ok(None);
     };
-    let (root, sources, content_sha256, bytes): (String, String, String, i64) = connection
-        .query_row(
-            "SELECT root, sources, content_sha256, bytes FROM revision WHERE number = ?1",
-            [number],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .map_err(sql)?;
+    let (root, revision) = revision(connection, number)?.ok_or(StoreError::Corrupt)?;
+    Ok(Some((number, root, revision)))
+}
+
+fn revision(
+    connection: &Connection,
+    number: i64,
+) -> Result<Option<(PathBuf, Revision)>, StoreError> {
+    let Some((root, sources, content_sha256, bytes)): Option<(String, String, String, i64)> =
+        connection
+            .query_row(
+                "SELECT root, sources, content_sha256, bytes FROM revision WHERE number = ?1",
+                [number],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(sql)?
+    else {
+        return Ok(None);
+    };
     let root = lexical(Path::new(&root)).map_err(|_| StoreError::Corrupt)?;
     if digest(sources.as_bytes()) != content_sha256 {
         return Err(StoreError::Corrupt);
@@ -543,7 +700,7 @@ fn active_revision(
     {
         return Err(StoreError::Corrupt);
     }
-    Ok(Some((number, root, Revision { sources })))
+    Ok(Some((root, Revision { sources })))
 }
 
 fn listener_secrets(connection: &Connection) -> Result<ListenerSecrets, StoreError> {
