@@ -119,7 +119,9 @@ pub fn edit_group_source(
                 if let Some((_, value)) = fields.last() {
                     edits.push((value.span.start..value.span.end, encoded));
                 } else {
-                    additions.push_str(newline);
+                    if !additions.is_empty() {
+                        additions.push_str(newline);
+                    }
                     additions.push_str(indent);
                     additions.push_str("    ");
                     additions.push_str(field.key());
@@ -129,16 +131,23 @@ pub fn edit_group_source(
             }
             None => {
                 for (text, _) in fields {
-                    edits.push((text.span.start..text.span.end, String::new()));
+                    edits.push((
+                        line_of(&source.content, text.span.start..text.span.end),
+                        String::new(),
+                    ));
                 }
             }
         }
     }
     if !additions.is_empty() {
         let close = group.span().end - 1;
-        additions.push_str(newline);
-        additions.push_str(indent);
-        edits.push((close..close, additions));
+        match own_line_start(&source.content, close) {
+            Some(line_start) => edits.push((line_start..line_start, additions + newline)),
+            None => edits.push((
+                close..close,
+                format!("{newline}{additions}{newline}{indent}"),
+            )),
+        }
     }
     edits.sort_unstable_by_key(|(range, _)| range.start);
     if edits.windows(2).any(|pair| pair[0].0.end > pair[1].0.start) {
@@ -228,7 +237,7 @@ pub fn remove_node_source(
     }
     Ok(target.map(|range| {
         let mut output = source.content.to_string();
-        output.replace_range(range, "");
+        output.replace_range(line_of(&source.content, range), "");
         output
     }))
 }
@@ -309,9 +318,41 @@ pub fn remove_subscription_source(
     }
     Ok(target.map(|range| {
         let mut output = source.content.to_string();
-        output.replace_range(range, "");
+        output.replace_range(line_of(&source.content, range), "");
         output
     }))
+}
+
+fn is_blank(byte: &u8) -> bool {
+    matches!(byte, b' ' | b'\t')
+}
+
+/// The whole line, newline included, when nothing but blanks shares it with
+/// the declaration; deleting that range leaves no empty line behind.
+fn line_of(content: &str, declaration: Range<usize>) -> Range<usize> {
+    let bytes = content.as_bytes();
+    let Some(line_start) = own_line_start(content, declaration.start) else {
+        return declaration;
+    };
+    let mut line_end = declaration.end;
+    while bytes.get(line_end).is_some_and(is_blank) {
+        line_end += 1;
+    }
+    match &bytes[line_end..] {
+        rest if rest.starts_with(b"\r\n") => line_start..line_end + 2,
+        rest if rest.starts_with(b"\n") => line_start..line_end + 1,
+        [] => line_start..line_end,
+        _ => declaration,
+    }
+}
+
+/// Start of the line when nothing but blanks precedes `offset` on it.
+fn own_line_start(content: &str, offset: usize) -> Option<usize> {
+    let line_start = content[..offset].rfind('\n').map_or(0, |end| end + 1);
+    content[line_start..offset]
+        .bytes()
+        .all(|byte| is_blank(&byte))
+        .then_some(line_start)
 }
 
 fn managed_document(source: &SourceSnapshot) -> Result<Document<'_>, ManagedSourceError> {
@@ -331,16 +372,34 @@ fn managed_entry(
     if name.trim().is_empty() {
         return Err(ManagedSourceError);
     }
-    let name = quote_scalar(name, None).map_err(|_| ManagedSourceError)?;
     let value = quote_scalar(value, None).map_err(|_| ManagedSourceError)?;
-    let entry = format!("{name}: {value}");
-    let config = super::parse_dae_config_with_detailed_diagnostics(
-        &format!("{section} {{\n    {entry}\n}}"),
-        &mut Vec::new(),
-    )
-    .map_err(|_| ManagedSourceError)?;
-    config.validate().map_err(|_| ManagedSourceError)?;
-    Ok((entry, config))
+    let quoted = quote_scalar(name, None).map_err(|_| ManagedSourceError)?;
+    let bare = name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+        .then(|| name.to_owned());
+    // A bare key that the section reads back differently (`mux`) keeps its quotes.
+    for key in bare.into_iter().chain([quoted]) {
+        let entry = format!("{key}: {value}");
+        let Ok(config) = super::parse_dae_config_with_detailed_diagnostics(
+            &format!("{section} {{\n    {entry}\n}}"),
+            &mut Vec::new(),
+        ) else {
+            continue;
+        };
+        let names: Vec<&str> = match section {
+            "node" => config.nodes.iter().map(|node| node.name.as_str()).collect(),
+            _ => config
+                .subscriptions
+                .iter()
+                .map(|subscription| subscription.name.as_str())
+                .collect(),
+        };
+        if names == [name] && config.validate().is_ok() {
+            return Ok((entry, config));
+        }
+    }
+    Err(ManagedSourceError)
 }
 
 fn append_entry(document: &Document<'_>, section: &str, entry: &str) -> String {
@@ -352,10 +411,11 @@ fn append_entry(document: &Document<'_>, section: &str, entry: &str) -> String {
     };
     let mut output = content.to_owned();
     if let Some(root) = document.sections().rfind(|root| root.header() == section) {
-        output.insert_str(
-            root.span().end - 1,
-            &format!("{newline}    {entry}{newline}"),
-        );
+        let close = root.span().end - 1;
+        match own_line_start(content, close) {
+            Some(line_start) => output.insert_str(line_start, &format!("    {entry}{newline}")),
+            None => output.insert_str(close, &format!("{newline}    {entry}{newline}")),
+        }
     } else {
         if !content.is_empty() && !content.ends_with('\n') {
             output.push_str(newline);
@@ -486,7 +546,7 @@ mod tests {
             append_node_source(&loaded.sources[0], "node", "socks5://127.0.0.1:1080").unwrap();
         assert_eq!(
             edited,
-            "# preserved EOF comment\nnode {\n    'node': 'socks5://127.0.0.1:1080'\n}\n"
+            "# preserved EOF comment\nnode {\n    node: 'socks5://127.0.0.1:1080'\n}\n"
         );
         let loaded = managed_source(&edited);
         let edited =
@@ -495,6 +555,49 @@ mod tests {
         let config = managed_source(&edited).config;
         assert_eq!(config.nodes[0].name, "node");
         assert_eq!(config.subscriptions[0].name, "provider");
+        let loaded = managed_source(&edited);
+        let edited =
+            append_node_source(&loaded.sources[0], "mux", "socks5://127.0.0.1:1081").unwrap();
+        assert!(edited.contains("    'mux': 'socks5://127.0.0.1:1081'\n"));
+        assert_eq!(managed_source(&edited).config.nodes[1].name, "mux");
+    }
+
+    #[test]
+    fn managed_entries_write_bare_keys_and_delete_whole_lines() {
+        for newline in ["\n", "\r\n"] {
+            let text = format!(
+                "node {{{newline}    a: 'socks5://127.0.0.1:1080'{newline}}}{newline}subscription {{{newline}    a: 'https://example.test/a'{newline}}}{newline}"
+            );
+            let loaded = managed_source(&text);
+            let edited =
+                append_node_source(&loaded.sources[0], "lab-1.b", "socks5://127.0.0.1:1081")
+                    .unwrap();
+            let loaded = managed_source(&edited);
+            let edited =
+                append_subscription_source(&loaded.sources[0], "lab_2", "https://example.test/b")
+                    .unwrap();
+            assert_eq!(
+                edited,
+                text.replace(
+                    "1080'",
+                    &format!("1080'{newline}    lab-1.b: 'socks5://127.0.0.1:1081'")
+                )
+                .replace(
+                    "test/a'",
+                    &format!("test/a'{newline}    lab_2: 'https://example.test/b'")
+                )
+            );
+            let loaded = managed_source(&edited);
+            let edited = remove_node_source(&loaded.sources[0], loaded.config.nodes[1].id)
+                .unwrap()
+                .unwrap();
+            let loaded = managed_source(&edited);
+            let edited =
+                remove_subscription_source(&loaded.sources[0], &loaded.config.subscriptions[1])
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(edited, text);
+        }
     }
 
     #[test]
@@ -691,6 +794,7 @@ mod tests {
             &[
                 (GroupField::Policy, Some("selector".into())),
                 (GroupField::Tolerance, None),
+                (GroupField::Final, Some("block".into())),
             ],
         )
         .unwrap();
@@ -698,8 +802,9 @@ mod tests {
             edited,
             child
                 .replace("\"urltest\"", "\"selector\"")
-                .replace("tolerance: 4", "")
+                .replace("    tolerance: 4\r\n", "")
                 .replace("tolerance: 9", "")
+                .replace("  }\r\n}", "      final: 'block'\r\n  }\r\n}")
         );
         let config = crate::parser::parse_dae_config(&edited).unwrap();
         assert_eq!(config.groups[0].policy, crate::node::GroupPolicy::Selector);
