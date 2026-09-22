@@ -406,7 +406,7 @@ fn dictionary(
         rules.push(RoutingRule {
             rule_id: rule_id(instance, generation, Some(rule.id)),
             index,
-            expression: router.rule_expression(&rule.conditions),
+            expression: rule.expression.clone(),
             outbound: rule.outbound.clone(),
             must: rule.must,
             source: None,
@@ -514,7 +514,7 @@ fn rule_evaluation(
                     };
                     RuleCondition {
                         id: format!("{rule_id}/condition:{index}"),
-                        expression: router.condition_expression(condition),
+                        expression: native::condition_expression(condition),
                         result: result_name(result),
                         missing_inputs: condition_missing,
                     }
@@ -528,7 +528,7 @@ fn rule_evaluation(
     RuleEvaluation {
         rule_id,
         expression: compiled
-            .map(|rule| router.rule_expression(&rule.conditions))
+            .map(|rule| rule.expression.clone())
             .unwrap_or_else(|| "fallback".into()),
         result: result_name(evaluated.result),
         missing_inputs: missing,

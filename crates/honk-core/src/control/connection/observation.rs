@@ -70,7 +70,7 @@ impl RouteObservation {
                     .compiled_routes()
                     .iter()
                     .find(|compiled| compiled.id == route.rule_id)
-                    .map(|compiled| crate::routing::native::rule_expression(&compiled.conditions))
+                    .map(|compiled| compiled.expression.clone())
                     .expect("matched compiled rule"),
                 None => "fallback".to_owned(),
             }),

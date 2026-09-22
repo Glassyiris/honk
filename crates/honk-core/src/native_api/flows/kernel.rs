@@ -96,7 +96,9 @@ impl KernelTraceDictionary {
                                 .map(|configured| {
                                     router.condition_display(condition, &configured.condition)
                                 })
-                                .unwrap_or_else(|| router.condition_expression(condition)),
+                                .unwrap_or_else(|| {
+                                    crate::routing::native::condition_expression(condition)
+                                }),
                             result: "indeterminate",
                             missing_inputs: Vec::new(),
                         })
@@ -110,7 +112,7 @@ impl KernelTraceDictionary {
                             router
                                 .configured_rule_expression(&rule.conditions, &configured.condition)
                         })
-                        .unwrap_or_else(|| router.rule_expression(&rule.conditions))
+                        .unwrap_or_else(|| rule.expression.clone())
                 })
                 .unwrap_or_else(|| "fallback".into());
             rules.push((

@@ -674,14 +674,11 @@ fn condition_displays_use_dae_values_and_require_context_for_domains() {
             not: false,
             predicate,
         };
-        assert_eq!(
-            native::condition_expression(&condition).as_deref(),
-            Some(expected)
-        );
+        assert_eq!(native::condition_expression(&condition), expected);
         condition.not = true;
         assert_eq!(
             native::condition_expression(&condition),
-            Some(format!("!{expected}"))
+            format!("!{expected}")
         );
     }
     let configured = RoutingCondition {
@@ -690,10 +687,13 @@ fn condition_displays_use_dae_values_and_require_context_for_domains() {
     };
     let router = Router::new(&[rule(configured.clone(), "direct", 0)], "block").unwrap();
     let condition = &router.compiled_routes()[0].conditions[0];
-    assert_eq!(native::condition_expression(condition), None);
-    assert_eq!(native::rule_expression(std::slice::from_ref(condition)), "");
+    assert_eq!(native::condition_expression(condition), "domain");
     assert_eq!(
-        router.condition_expression(condition),
+        router.condition_display(condition, &configured),
+        "domain(suffix: example.com, suffix: example.net)"
+    );
+    assert_eq!(
+        router.compiled_routes()[0].expression,
         "domain(suffix: example.com, suffix: example.net)"
     );
     let configured = RoutingCondition {
@@ -709,7 +709,7 @@ fn condition_displays_use_dae_values_and_require_context_for_domains() {
         not: false,
         predicate: CompiledPredicate::ProcessName(vec!["x".repeat(600)]),
     };
-    let display = native::condition_expression(&oversized).unwrap();
+    let display = native::condition_expression(&oversized);
     assert_eq!(display.len(), 512 + '…'.len_utf8());
     assert!(display.ends_with('…'));
 }

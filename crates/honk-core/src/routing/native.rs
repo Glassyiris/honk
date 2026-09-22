@@ -113,6 +113,28 @@ impl Router {
         compiled: &CompiledCondition,
         configured: &honk_config::routing::RoutingCondition,
     ) -> String {
+        condition_display(&self.domain_matchers, compiled, configured)
+    }
+}
+
+pub(super) fn configured_rule_expression(
+    matchers: &[super::DomainMatcher],
+    conditions: &[CompiledCondition],
+    configured: &honk_config::routing::RoutingCondition,
+) -> String {
+    join_expressions(
+        conditions
+            .iter()
+            .map(|condition| condition_display(matchers, condition, configured)),
+    )
+}
+
+fn condition_display(
+    matchers: &[super::DomainMatcher],
+    compiled: &CompiledCondition,
+    configured: &honk_config::routing::RoutingCondition,
+) -> String {
+    {
         macro_rules! field {
             ($name:ident) => {
                 if compiled.not {
@@ -125,7 +147,7 @@ impl Router {
         // Select by the compiled predicate, not source order: domain/geosite split,
         // while explicit destination IPs and geoip alternatives share one predicate.
         let (kind, fields): (&str, &[(&str, &[String])]) = match &compiled.predicate {
-            CompiledPredicate::Domain(id) => match &self.domain_matchers[*id as usize] {
+            CompiledPredicate::Domain(id) => match &matchers[*id as usize] {
                 super::DomainMatcher::Ordinary { .. } => (
                     "domain",
                     &[
@@ -167,56 +189,15 @@ impl Router {
         display.push(')');
         display
     }
+}
 
+impl Router {
     pub(crate) fn configured_rule_expression(
         &self,
         conditions: &[CompiledCondition],
         configured: &honk_config::routing::RoutingCondition,
     ) -> String {
-        if conditions.is_empty() {
-            return rule_expression(conditions);
-        }
-        conditions
-            .iter()
-            .map(|condition| self.condition_display(condition, configured))
-            .collect::<Vec<_>>()
-            .join(" && ")
-    }
-
-    pub(crate) fn condition_expression(&self, condition: &CompiledCondition) -> String {
-        let CompiledPredicate::Domain(id) = condition.predicate else {
-            return condition_expression(condition)
-                .expect("non-domain predicate retains its values");
-        };
-        let matcher = &self.domain_matchers[id as usize];
-        let mut expression = format!("{}domain(", if condition.not { "!" } else { "" });
-        for (index, (kind, value)) in matcher.key().alternatives.iter().enumerate() {
-            let kind = match (matcher, kind) {
-                (super::DomainMatcher::Ordinary { .. }, 0) | (_, 3) => "regex",
-                (_, 0) => "full",
-                (_, 1) => "suffix",
-                _ => "keyword",
-            };
-            write!(
-                expression,
-                "{}{kind}: {value}",
-                if index == 0 { "" } else { ", " }
-            )
-            .unwrap();
-            if expression.len() > 512 {
-                return bounded_expression(expression);
-            }
-        }
-        expression.push(')');
-        expression
-    }
-
-    pub(crate) fn rule_expression(&self, conditions: &[CompiledCondition]) -> String {
-        join_expressions(
-            conditions
-                .iter()
-                .map(|condition| self.condition_expression(condition)),
-        )
+        configured_rule_expression(&self.domain_matchers, conditions, configured)
     }
 
     pub(crate) fn simulate(
@@ -327,7 +308,7 @@ pub(crate) fn missing_input(predicate: &CompiledPredicate) -> &'static str {
     }
 }
 
-pub(crate) fn condition_expression(condition: &CompiledCondition) -> Option<String> {
+pub(crate) fn condition_expression(condition: &CompiledCondition) -> String {
     let ip_display = |net: &ipnet::IpNet| {
         if net.prefix_len() == if net.addr().is_ipv4() { 32 } else { 128 } {
             net.addr().to_string()
@@ -336,7 +317,9 @@ pub(crate) fn condition_expression(condition: &CompiledCondition) -> Option<Stri
         }
     };
     let (kind, values) = match &condition.predicate {
-        CompiledPredicate::Domain(_) => return None,
+        // Domain matchers hold compiled patterns, not the configured spelling;
+        // routes carry that in `CompiledRoute::expression`.
+        CompiledPredicate::Domain(_) => ("domain", String::new()),
         CompiledPredicate::DestinationIp(matcher) => (
             "dip",
             matcher
@@ -412,10 +395,11 @@ pub(crate) fn condition_expression(condition: &CompiledCondition) -> Option<Stri
                 .join(", "),
         ),
     };
-    Some(bounded_expression(format!(
-        "{}{kind}({values})",
-        if condition.not { "!" } else { "" }
-    )))
+    let not = if condition.not { "!" } else { "" };
+    if values.is_empty() {
+        return format!("{not}{kind}");
+    }
+    bounded_expression(format!("{not}{kind}({values})"))
 }
 
 fn bounded_expression(mut expression: String) -> String {
@@ -446,13 +430,4 @@ fn join_expressions(expressions: impl Iterator<Item = String>) -> String {
     } else {
         joined
     }
-}
-
-pub(crate) fn rule_expression(conditions: &[CompiledCondition]) -> String {
-    conditions
-        .iter()
-        .map(condition_expression)
-        .collect::<Option<Vec<_>>>()
-        .map(|expressions| join_expressions(expressions.into_iter()))
-        .unwrap_or_default()
 }
