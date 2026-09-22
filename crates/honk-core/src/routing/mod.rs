@@ -440,6 +440,7 @@ impl Router {
                 expression: String::new(),
             });
         }
+        #[cfg(feature = "native-api")]
         for route in &mut compiled {
             route.expression = native::configured_rule_expression(
                 &registry.0,

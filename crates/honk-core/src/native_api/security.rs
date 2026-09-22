@@ -104,6 +104,25 @@ impl Security {
         }
     }
 
+    pub(super) fn anonymous_loopback(&self) -> bool {
+        self.anonymous_loopback
+    }
+
+    /// The bearer token this request carries, if it is well formed.
+    pub(super) fn bearer<'a>(&self, request: &'a Request) -> Option<&'a str> {
+        single_header(request.headers(), "authorization")
+            .ok()
+            .flatten()?
+            .to_str()
+            .ok()?
+            .split_once(' ')
+            .filter(|(scheme, token)| {
+                scheme.eq_ignore_ascii_case("Bearer")
+                    && honk_config::experimental::valid_native_bearer_token(token)
+            })
+            .map(|(_, token)| token)
+    }
+
     fn listener_itself(&self, host: &str, port: u16) -> bool {
         self.wildcard_port == Some(port)
             && (host == "localhost" || host.parse::<std::net::IpAddr>().is_ok())
@@ -156,9 +175,23 @@ impl Security {
         Ok(origin.cloned())
     }
 
-    fn authenticate(&self, request: &Request, request_id: &str) -> Result<(), ApiError> {
+    fn authenticate(
+        &self,
+        request: &Request,
+        sessions: Option<&super::auth::Sessions>,
+        request_id: &str,
+    ) -> Result<(), ApiError> {
         let authorization = single_header(request.headers(), "authorization")
             .map_err(|()| unauthorized(request_id))?;
+        if let Some(sessions) = sessions {
+            if !self
+                .bearer(request)
+                .is_some_and(|token| sessions.authenticate(token))
+            {
+                return Err(unauthorized(request_id));
+            }
+            return self.reject_query_credentials(request, request_id);
+        }
         match (&self.expected, authorization) {
             (Some(expected), Some(value)) => {
                 let (_, token) = value
@@ -178,7 +211,15 @@ impl Security {
             (None, None) if self.anonymous_loopback => {}
             _ => return Err(unauthorized(request_id)),
         }
-        // Decode keys with the same form parser as API queries; never accept query credentials.
+        self.reject_query_credentials(request, request_id)
+    }
+
+    // Decode keys with the same form parser as API queries; never accept query credentials.
+    fn reject_query_credentials(
+        &self,
+        request: &Request,
+        request_id: &str,
+    ) -> Result<(), ApiError> {
         let Query(parameters) = Query::<Vec<(String, IgnoredAny)>>::try_from_uri(request.uri())
             .map_err(|_| invalid_request(request_id))?;
         if parameters
@@ -191,6 +232,31 @@ impl Security {
     }
 }
 
+/// An Authorization header or a token query parameter, parsed as `reject_query_credentials` parses it.
+fn carries_credential(request: &Request) -> bool {
+    request
+        .headers()
+        .contains_key(axum::http::header::AUTHORIZATION)
+        || Query::<Vec<(String, IgnoredAny)>>::try_from_uri(request.uri()).map_or(
+            true,
+            |Query(parameters)| {
+                parameters
+                    .iter()
+                    .any(|(name, _)| name == "token" || name == "access_token")
+            },
+        )
+}
+
+/// Discovery and the password endpoints answer a request that carries no credential; everything else, and
+/// any request that does carry one, is authenticated.
+fn public_route(method: &Method, path: &str) -> bool {
+    match path {
+        "/api" | "/api/v1/discovery" => matches!(*method, Method::GET | Method::HEAD),
+        "/api/v1/auth/setup" | "/api/v1/auth/login" => *method == Method::POST,
+        _ => false,
+    }
+}
+
 pub(super) async fn boundary(
     State(state): State<Arc<NativeState>>,
     mut request: Request,
@@ -200,6 +266,7 @@ pub(super) async fn boundary(
     let request_id = uuid::Uuid::new_v4().to_string();
     let method = request.method().clone();
     let path = request.uri().path();
+    let public = public_route(&method, path);
     let is_api = path == "/api" || path.starts_with("/api/");
     let is_ui = state.ui.is_some() && (matches!(path, "/" | "/ui") || path.starts_with("/ui/"));
     let route = request.extensions().get::<MatchedPath>().cloned();
@@ -221,7 +288,13 @@ pub(super) async fn boundary(
             };
         }
         if is_api {
-            state.security.authenticate(&request, &request_id)?;
+            if !public || carries_credential(&request) {
+                state.security.authenticate(
+                    &request,
+                    state.auth.as_ref().map(|auth| &auth.sessions),
+                    &request_id,
+                )?;
+            }
             let (parts, body) = request.into_parts();
             let bytes = read_body(body, header_bytes, &request_id).await?;
             if matches!(method, Method::GET | Method::HEAD) && !bytes.is_empty() {

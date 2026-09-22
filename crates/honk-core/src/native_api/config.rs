@@ -310,7 +310,7 @@ impl ConfigService {
     pub(crate) fn writable(&self) -> bool {
         self.sources.available()
             && self.settings.config_write
-            && !self.settings.secret.is_empty()
+            && self.settings.credentialed()
             && self.sender.lock().is_some()
     }
     pub(crate) fn can_manage(&self) -> bool {
@@ -417,7 +417,7 @@ impl ConfigService {
     ) -> bool {
         let source = &accepted.update.sources[index];
         self.settings.config_write
-            && !self.settings.secret.is_empty()
+            && self.settings.credentialed()
             && !source.contains_api_secret
             && !secrets.contains(&source.content)
     }
@@ -688,11 +688,7 @@ pub(super) fn json_type(request: &Request) -> Result<(), ApiError> {
     }
 }
 fn principal(state: &NativeState) -> &'static str {
-    if state.settings.secret.is_empty() {
-        "anonymous"
-    } else {
-        "control"
-    }
+    state.principal()
 }
 
 #[derive(Deserialize)]

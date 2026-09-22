@@ -20,8 +20,9 @@
 | --- | --- | --- |
 | `enabled` | `false` | 启动独立原生 listener。 |
 | `listen` | `"127.0.0.1:9527"` | 数字 IP 与 1–65535 端口，不接受主机名或 `:port` 简写。 |
-| `secret` | `""` | 独立于 Clash 的 bearer 凭证。除显式匿名 loopback 外必须配置。API 响应按值遮蔽监听 secret；短于 8 字节的值不遮蔽，启动时会记录提示。 |
-| `allow_anonymous_loopback` | `false` | 仅在 secret 为空且实际监听 IP 为 loopback 时允许无凭证请求。配置 secret 后仍必须认证。 |
+| `secret` | `""` | 独立于 Clash 的静态 bearer 凭证。非空值选择 token 模式，不能与 `password_auth` 组合。API 响应按值遮蔽监听 secret；短于 8 字节的值不遮蔽，启动时会记录提示。 |
+| `password_auth` | `false` | `secret` 为空时启用管理员密码登录。不能与 `allow_anonymous_loopback` 组合。 |
+| `allow_anonymous_loopback` | `false` | 仅在 `secret` 为空、`password_auth` 为 false 且实际监听 IP 为 loopback 时允许无凭证请求。 |
 | `allow_origins` | 空列表 | 额外允许的完整 HTTP(S) Origin；不含路径、凭据、query、fragment、`null` 或通配符。 |
 | `allowed_hosts` | 空列表 | 额外允许的 HTTP Host authority；不含 URL scheme、路径、凭据或通配符。省略端口表示 80，不是监听端口。 |
 | `ui` | `""` | 空值关闭托管；其他值为含可读 `index.html` 的可信本地目录，或配合默认关闭的 `native-ui` feature 使用 `embedded`。启动不下载、不解压、不构建前端。 |
@@ -32,8 +33,8 @@
 | `record_dns_log` | `true` | 允许按 API 客户端连接规则或显式运行时设置记录客户端 DNS 完成历史，最多保留 512 条、8 MiB。`false` 禁止记录；修改配置需重启。 |
 | `probe_allowed_cidrs` | 空列表 | 管理员允许原生 probe 访问的受限 IP CIDR；默认拒绝私网、loopback、link-local 等受限解析目标，包括配置的节点地址。不是任意 URL 许可。 |
 | `probe_allowed_ports` | 空列表 | 扩展原生 HTTP/HTTPS 检查的默认 80/443、DNS 检查的默认 53 端口；每项须为 1–65535。Raw TCP-connect 只使用节点实际配置端口，不受此扩展列表限制；受限地址仍需独立 CIDR 许可。 |
-| `config_content` | `false` | 为兼容旧配置而接受，不产生作用。认证后的源读取要求非空 `secret`，仅遮蔽监听凭据值。 |
-| `config_write` | `false` | 允许已接受主文件及所有已接受 include 的原文替换与 reload，含监听凭据的源除外；要求非空 `secret`。 |
+| `config_content` | `false` | 为兼容旧配置而接受，不产生作用。所有获准请求均可读取可用来源，仅遮蔽监听凭据值。 |
+| `config_write` | `false` | 允许已接受主文件及所有已接受 include 的原文替换与 reload，含监听凭据的源除外；要求非空 `secret` 或启用 `password_auth`。 |
 | `writable_includes` | 空列表 | 为兼容旧配置而接受，不产生作用；不授予路径权限，也不限制已接受 include。 |
 | `geosite_download_url` | `""` | 更新已加载 geosite 的最终直达 HTTP(S) 来源；要求 `config_write`，已加载该资产而 URL 为空时不能更新。 |
 | `geoip_download_url` | `""` | 更新已加载 geoip 的最终直达 HTTP(S) 来源，使用相同授权与限制。 |
@@ -52,6 +53,8 @@ experimental {
 
 非空原生 secret 必须为不含空白或逗号的可见 ASCII，与 HTTP bearer parser 一致；不支持的字节在共同配置准入处报错，不会启动一个无法认证的 listener。
 
+认证模式变更需要重启。非空 `secret` 选择现有静态 token 模式；空 `secret` 与 `password_auth: true` 选择密码模式；空 `secret`、显式匿名 loopback 及实际 loopback 监听选择现有开发模式。启用 listener 却不满足任一模式时，配置校验失败。密码模式要求 `secret` 为空，且不能与 `allow_anonymous_loopback` 组合；`config_write: true` 同样要求 token 或密码模式。
+
 请替换示例 secret。本地无凭证开发需省略 `secret` 并显式设置 `allow_anonymous_loopback: true`；不能通过反向代理公开该匿名 listener。非 loopback 网络上的明文 HTTP 加 token 不是安全部署，应由可信代理终止 TLS。
 
 默认 Host 只接受具体监听 authority；loopback 另接受同端口的 `localhost`、`127.0.0.1` 与 `[::1]`。通配监听接受同端口的任意 IP 字面量 Host 与 `localhost`，因为这些就是请求到达的那个监听器本身；DNS 名称仍不授权，因为只有名称能被重绑定。只有真实直连对应的明文 HTTP Origin 自动允许。TLS 反代若保留 `Host: panel.example`，需配置 `allowed_hosts: 'panel.example'` 与 `allow_origins: 'https://panel.example'`；若保留 `Host: panel.example:443`，则使用 `allowed_hosts: 'panel.example', 'panel.example:443'`。Forwarded headers 不授予权限。
@@ -60,7 +63,7 @@ experimental {
 
 相对 UI 路径沿用依赖搜索顺序：`global.data_dir` 下已有路径、`/var/share/honk` 下已有路径、工作目录已有路径；均不存在时定位到 `global.data_dir` 并在启动时报错。目录及其符号链接目标均由可信管理员负责。参见[原生 API 契约](./api.md#原生-api-m1)。
 
-单文件部署可使用 `cargo build -p honk-core --features native-ui` 与 `ui: embedded`；`native-ui` 隐含 `native-api`，不要求 Clash。没有 `native-ui` 时启用内嵌托管会启动失败。访问 `/ui/` 后在真实 doona 登录表单输入 bearer。产物/源码身份、对应源码分发和管理契约见 [API 参考](./api.md#内嵌-doona-来源)。
+单文件部署可使用 `cargo build -p honk-core --features native-ui` 与 `ui: embedded`；`native-ui` 隐含 `native-api`，不要求 Clash。没有 `native-ui` 时启用内嵌托管会启动失败。静态资源不注入凭据；客户端通过公共 discovery 选择静态 token 输入或密码 setup/login。产物/源码身份、对应源码分发和管理契约见 [API 参考](./api.md#内嵌-doona-来源)。
 
 Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒绝 userinfo、fragment、redirect 与 content encoding。域名来源要求 `global.bootstrap_resolver`，不回退系统 DNS、不选择代理 detour；所有已加载资产都要有配置来源才能更新。[M9 契约](./api.md#主文件条目与-geodata-管理m9)区分网络期限、已验证字节激活及部分耐久替换，不承诺回滚。
 

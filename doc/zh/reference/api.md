@@ -6,11 +6,14 @@
 
 本节保留 M1 标题锚点，说明当前已实现的原生观测与控制契约。默认构建及两种 allocator 发布产物均包含 `native-api` Cargo feature，但 listener 默认关闭，须显式启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是唯一配置权威；显式授权后可读取与替换已接受的源文件，不引入 SQLite 配置主存储。
 
-基础契约为 [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992)，节点/provider 管理与 geodata 使用 [doona-pin ba3e4c3648e04d093d32164ecca018f51bd74e00](https://github.com/Zakkaus/api-standardize/tree/ba3e4c3648e04d093d32164ecca018f51bd74e00) 中的 M9 补充。没有整体切换到该后续 bundle 的 mode/自动 override 变更：原生 mode 与自动策略 override 继续 gate，不声明 `full_transparency`。源管理要求真实 `.dae` 启动，写入还需启用 `config_write` 并配置非空 secret；以 capabilities 和逐源权限为准，不按路由名称推断全部可用。
+基础契约为 [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992)，节点/provider 管理与 geodata 使用 [doona-pin ba3e4c3648e04d093d32164ecca018f51bd74e00](https://github.com/Zakkaus/api-standardize/tree/ba3e4c3648e04d093d32164ecca018f51bd74e00) 中的 M9 补充。没有整体切换到该后续 bundle 的 mode/自动 override 变更：原生 mode 与自动策略 override 继续 gate，不声明 `full_transparency`。源管理要求真实 `.dae` 启动，写入还需启用 `config_write` 并配置非空 secret 或 `password_auth`；以 capabilities 和逐源权限为准，不按路由名称推断全部可用。
 
 | 方法 | 路径 | 含义 |
 | --- | --- | --- |
-| GET | `/api` | Discovery，固定 `/api/v1` base 与全部契约 links。 |
+| GET | `/api`、`/api/v1/discovery` | 公共 discovery，提供固定 `/api/v1` base、认证状态与全部契约 links。 |
+| POST | `/api/v1/auth/setup` | 创建首个密码模式管理员并签发会话。 |
+| POST | `/api/v1/auth/login` | 校验密码模式管理员并签发会话。 |
+| POST | `/api/v1/auth/logout` | 撤销已认证的密码模式会话。 |
 | GET | `/api/v1/version` | 原生契约身份、引擎构建版本以及构建的提交与目标平台，不伪造构建时间。 |
 | GET | `/api/v1/capabilities` | 已实现资源与请求上限。 |
 | GET | `/api/v1/runtime?detail=summary\|full` | 引擎 phase、已接受代次与具有独立时间戳的用户态流量。 |
@@ -59,17 +62,43 @@
 
 TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，成功写出的嗅探前缀仅计一次；UDP 保持原逐包语义。唯一的一秒 sampler 使用实际时间间隔；初次采样、reset 和 overflow 返回 null rate，不补零。`counter_since` 属于共用计数器生命周期，`sampled_at` 属于流量样本，`observed_at` 属于 HTTP 观察。UInt64 使用十进制字符串，有界数量仍为 JSON number。CPU 与 activation 时间仍未知；有源管理器时提供配置 revision，`last_reload` 提供最近完成的 API reload operation 结果，否则为 null。
 
-配置 secret 后，所有 API 路径（包括 discovery/version/capabilities、禁用 action、未知 API path）都要求单个有效 Bearer header。Query token、重复凭据、错误凭据均不能回退匿名，同源 UI 也不豁免。无 secret 需显式 loopback 授权，并拒绝 `Sec-Fetch-Site: cross-site`。公共静态文件也接受 Host/Origin 校验；OPTIONS preflight 无需 bearer，但必须通过 Host、Origin、method 与 header 白名单。不返回 cookie credentials 或通配 CORS。
+所有认证模式都公开 `GET /api` 及其等价别名 `/api/v1/discovery`。密码 setup 与 login POST 也公开；version、capabilities 及其他 API 资源要求配置的静态 bearer 或有效密码会话。上述例外只针对不带凭据的请求：带有凭据的请求无论是否公开都会校验，错误或重复的凭据直接拒绝，不回退为匿名。query string 中的 token 一律拒绝。现有无 secret 开发模式要求显式匿名 loopback 授权，并拒绝 `Sec-Fetch-Site: cross-site`。Host 与 Origin 校验先于这些认证例外执行，也覆盖公共静态文件。OPTIONS preflight 无需 bearer，但必须通过 Host、Origin、method 与 header 白名单。不返回 cookie credentials 或通配 CORS。
 
 已知禁用 action 返回 JSON `404 capability_not_supported`，未知 path 或未定义 method 返回 JSON `404 resource_not_found`；配置来源可读但未授权写入时，PUT 返回 `403 permission_denied`。错误信封为 `{error:{code,message,details},request_id}`。HEAD 保留 GET 状态/header，无 body。API 响应带 `no-store` 与 `nosniff`。应用上限为规范化 target 4096 字节、规范化 header 名/值合计 16384 字节、body 65536 字节（含 chunked）；已认证 GET/HEAD 携带非空 body 会被拒绝。普通观测读取不触发 probe 或选择变化；显式 `/dns/query` 是可联网的诊断请求。
 
 原生 server 最多拥有 64 条 HTTP/1.1 连接，满时暂停 accept，header 读取上限五秒；关闭时全部连接共享五秒 graceful drain，随后 abort 并逐一 join。空闲 I/O 与停滞写入分别受 30 秒期限约束；SSE heartbeat 成功写入使健康长连接保持活跃，读取不能延长阻塞 writer 的期限。TLS/HTTP2 可由可信反代终止。Forwarded headers 不改写固定 discovery path，也不授予 Host/Origin 权限。
 
-**已记录的契约差异：** bootstrap 采用 common bearer 安全规则，尽管该 pin 的 bootstrap 标记了 `security: []`。Hyper 可在应用处理前以 400/414/431 或断连拒绝畸形/硬超限 HTTP；这些 transport 拒绝不保证 JSON 信封或应用 headers。
+**已记录的契约差异：** discovery 的 `auth` 对象与密码 endpoint 是该 pin 尚未包含的新增内容。Hyper 可在应用处理前以 400/414/431 或断连拒绝畸形/硬超限 HTTP；这些 transport 拒绝不保证 JSON 信封或应用 headers。
 
 应用 target/header 上限作用于 Hyper **解析并规范化后的表示**，不是原始 wire 字节。Hyper 可能先移除 request-target fragment，或合并相同 `Content-Length` 字段，再交给应用计量；这些形式的原始文本即使超过应用上限，也可能得到正常响应而不是 413。原始输入仍受 Hyper 传输处理约束。这是已接受的边界差异，不另写 HTTP parser，也不宣称原始 wire 大小保证；body 限制仍覆盖全部交付的 body 字节。
 
-配置 `ui` 后，`/` 与 `/ui` 重定向到 `/ui/`。目录托管保留无扩展名 SPA fallback；缺失静态资产、fonts/icons、manifest 或 service worker 返回 404，不返回 HTML。以 `--features native-ui` 构建并设置 `ui: embedded`，即可直接提供固定真实 doona 产物，不解压到磁盘、不联网。其 hash router 使用 `/ui/#/...`；其他合法内嵌导航路径重定向回 `/ui/`，确保相对资产与 service worker 路径正确。静态响应保留 `no-cache`、`nosniff`、`X-Frame-Options: DENY`；公开资产仍经过 Host/Origin 校验，API bootstrap 与请求仍需 bearer，不向 UI 注入凭据。
+配置 `ui` 后，`/` 与 `/ui` 重定向到 `/ui/`。目录托管保留无扩展名 SPA fallback；缺失静态资产、fonts/icons、manifest 或 service worker 返回 404，不返回 HTML。以 `--features native-ui` 构建并设置 `ui: embedded`，即可直接提供固定真实 doona 产物，不解压到磁盘、不联网。其 hash router 使用 `/ui/#/...`；其他合法内嵌导航路径重定向回 `/ui/`，确保相对资产与 service worker 路径正确。静态响应保留 `no-cache`、`nosniff`、`X-Frame-Options: DENY`；公开资产仍经过 Host/Origin 校验。Discovery 与密码 setup/login 使用上述公共例外，其他 API 请求要求 bearer；不向 UI 注入凭据。
+
+### 认证发现与密码会话
+
+Discovery 返回 `auth: {mode, setup_required, anonymous_loopback}`。配置非空 `secret` 或使用匿名 loopback 开发模式时，`mode` 为 `token`；`secret` 为空且启用 `password_auth` 时为 `password`。仅在密码模式尚无管理员记录时，`setup_required` 为 true。仅在实际 loopback 监听上显式启用开发模式时，`anonymous_loopback` 为 true。密码模式下，`links.auth_setup`、`links.auth_login`、`links.auth_logout` 为对应 endpoint 路径；其他模式下均为 null。
+
+Token 模式不提供三个密码 endpoint，返回 `404 capability_not_supported`。密码模式使用以下契约：
+
+| Endpoint | 请求与成功响应 | 模式特定失败 |
+| --- | --- | --- |
+| `POST /api/v1/auth/setup` | `{"username":"admin","password":"..."}` → `201 {"token":"hnk1_…","expires_at":"..."}` | 对端地址不符合要求时返回 `403 permission_denied`；首个管理员发布后返回 `409 setup_already_completed`。 |
+| `POST /api/v1/auth/login` | 相同 body → `200 {"token":"hnk1_…","expires_at":"..."}` | setup 前返回 `409 setup_required`；用户名或密码错误均返回 `401 invalid_credentials`。 |
+| `POST /api/v1/auth/logout` | `Authorization: Bearer <session>` → `204` | 无效或过期会话按普通 bearer 认证失败。 |
+
+`expires_at` 是 RFC 3339 UTC 时间戳。Setup 与 login 要求 `Content-Type: application/json`，不能携带 query string 或未知 JSON 字段，body 最多 4096 字节。用户名区分大小写，必须是匹配 `[A-Za-z0-9_.-]{1,64}` 的 ASCII。密码须为 12–128 个 Unicode 标量值，UTF-8 编码最多 512 字节。无效 JSON 或字段返回 `400 invalid_request`；缺少或使用其他 media type 返回 `415 unsupported_media_type`。
+
+Setup 只信任 accept socket 的对端地址，不读取 `Forwarded`、`X-Forwarded-For` 或其他 header。允许范围为 `127.0.0.0/8`、`::1`、RFC 1918、`fc00::/7`、`169.254.0.0/16` 及 `fe80::/10`；IPv4-mapped IPv6 按 IPv4 分类。其他对端在读取账户状态或处理凭据前返回 `403 permission_denied`。
+
+Setup 与 login 每分钟按规范化对端最多接受 5 次尝试，全局最多 10 次。连续 5 次凭据校验失败触发 60 秒全局锁定。拒绝尝试时返回 `429 rate_limited` 与 `Retry-After`；计数器与锁定状态仅保存在进程内。
+
+会话 token 是不透明的 `hnk1_…` 值，通过 `Authorization: Bearer <session>` 使用。每个会话固定有效 12 小时。进程只保留 token 的 SHA-256 digest，最多保留 32 个有效会话；签发新会话时淘汰最早会话，重启结束全部会话。通过配置 secret 或密码登录启动的 operation 属于管理员，而非某个 token，因此 logout 不删除 operation。
+
+密码模式把唯一凭据记录存于 `<data_dir>/native-api/admin.json`。新目录与记录分别使用 `0700` 和 `0600`；已有对象必须由进程的有效用户拥有，且不能授予 group 或 other 权限。符号链接、其他所有者、更宽权限或畸形记录都会阻止启动。
+
+记录使用 PBKDF2-HMAC-SHA256、100,000 次迭代及新生成的 16 字节随机 salt。密码模式直接使用配置的 `global.data_dir`：该目录不可用时启动失败，不回退到其他目录，以免在别处重新开放 setup。首次 setup 不替换已有记录，凭据目录在进程生命周期内保持独占锁定。
+
+不提供 HTTP 密码重置。恢复访问时，停止 honk，删除 `admin.json`，重启后重新 setup。
 
 ### 用户态记录流（M2）
 
@@ -125,7 +154,7 @@ RSS 来自 `/proc/self/status`；cgroup v2 依据实际 membership/mountinfo 定
 
 获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的配置数据。`config_content` 与 `writable_includes` 仍可配置，但不产生作用。已接受正文包含普通凭据、分享链接及路径；仅遮蔽声明的原生/Clash 监听凭据值，包括重复、被覆盖的声明及这些值在源中其他位置的出现。解析器提供的范围用于识别凭据值，非凭据文本与行结构保持不变。凭据源仍只读，哈希仍对应原始字节。必有的 `secrets_redacted` 布尔值表示是否遮蔽了监听凭据值；遮蔽后的正文不能作为可编辑的往返载荷。
 
-启用 `config_write` 且 secret 非空时，已接受的非凭据主文件与所有非凭据 include 均可写。只有已接受的源 ID 授权替换，调用方提供的路径不能授权任意文件写入；generated/subscription 来源不可写。普通 include 仍使用原有入口相对 glob、排序、无匹配及重复/越界检查语义。API 禁止修改原生设置或改变、移动 API 凭据；如需编辑含凭据主文件，先在本地把凭据迁到专用只读 include 并重启，不能通过 API 完成迁移。
+启用 `config_write` 且配置非空 secret 或 `password_auth` 时，已接受的非凭据主文件与所有非凭据 include 均可写。只有已接受的源 ID 授权替换，调用方提供的路径不能授权任意文件写入；generated/subscription 来源不可写。普通 include 仍使用原有入口相对 glob、排序、无匹配及重复/越界检查语义。API 禁止修改原生设置或改变、移动 API 凭据；如需编辑含凭据主文件，先在本地把凭据迁到专用只读 include 并重启，不能通过 API 完成迁移。
 
 校验使用 `Content-Type: application/json`，例如 `{"mode":"syntax","sources":[{"id":"source-1","content":"..."}]}`；mode 可选 `syntax` 或 `full`，每个 source 的 id/path 可省略。`syntax` 只解析提交的文档，path 仅作来源标签，不授权文件访问，也不跟随磁盘 include。`full` 的首份文档对应入口主文件，额外路径须通过入口根目录授权；使用 overlay、获准本地 include、只读订阅缓存、实际本地 geodata/hosts/ECH 依赖做完整离线准入。从未拉取的订阅以 warning 准入、不产生缓存节点；已有 same-fetch 活动节点仍可 rebase。其他缺失或无效依赖是错误。校验不联网、不创建目录或改权限、不启动 worker、不发布 generation。完成的无效 dry-run 返回 `200` 与 `valid:false`；这不代替之后真实 reload 的运行时校验，也不承诺 reload 一定成功。
 
@@ -146,7 +175,7 @@ PUT 与校验 source 对象接受并忽略可选的回传布尔字段 `secrets_r
 
 PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST reload 入协调队列后返回 `202`。响应含 `operation_id`、`href`、相同的 `Location` 与 `Retry-After: 1`，不表示配置已经生效。操作由 daemon 持有，HTTP 断连不取消它或其 supervisor reconciliation。可选 `Idempotency-Key` 绑定 principal、method、path、instance 与原始 body：同 key 同 body 的并发/重试共用结果，不重复写入或 reload，丢失首个 202 后仍可用原 If-Match 重试；不同 body 返回 `409 idempotency_conflict`。总共最多 32 个预留/保留操作，终态保留 300 秒，未过期记录不因容量提前淘汰；重启后不保留。
 
-通过 GET operation、`runtime.last_reload` 及 `operation.updated` 读取真实结果，不能把收到 202 当作 succeeded。Reload 拒绝时保留旧 accepted 快照和 generation，但已写入字节不回滚；提交后 degraded 时保留新快照/generation 并报告 failed，而不是声称旧代仍活动。管理员应据磁盘内容与结果修复，再显式 reload。SIGHUP 本身不创建 API operation。仅改注释也会更新 source hash/config revision，但有效配置未变时不增加 runtime generation；有效组成员变化会改变 revision，健康测量变化不会。这三种版本不是可互换的并发令牌。
+通过 GET operation、`runtime.last_reload` 及 `operation.updated` 读取真实结果，不能把收到 202 当作 succeeded。Reload 拒绝时保留旧 accepted 快照和 generation，但已写入字节不回滚；提交后 degraded 时保留新快照/generation 并报告 failed，而不是声称旧代仍活动。管理员应据磁盘内容与结果修复，再显式 reload。SIGHUP 本身不创建 API operation。仅改注释也会更新 source hash/config revision，但有效配置未变时不增加 runtime generation；有效组成员变化会改变 revision，健康测量变化不会。这三种版本不是可互换的并发令牌。配置 secret 或密码登录保护 listener 时，所有会话使用同一个管理员 operation principal，logout 不删除保留的 operation。
 
 ### 有界探测、DNS 与路由诊断
 

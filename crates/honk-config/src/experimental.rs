@@ -88,6 +88,8 @@ pub struct NativeApiConfig {
     pub enabled: bool,
     pub listen: String,
     pub secret: String,
+    /// Administrator login with a username and password instead of a bearer secret; restart-required.
+    pub password_auth: bool,
     pub allow_anonymous_loopback: bool,
     pub allow_origins: Vec<String>,
     pub allowed_hosts: Vec<String>,
@@ -126,6 +128,7 @@ impl Default for NativeApiConfig {
             enabled: false,
             listen: "127.0.0.1:9527".into(),
             secret: String::new(),
+            password_auth: false,
             allow_anonymous_loopback: false,
             allow_origins: Vec::new(),
             allowed_hosts: Vec::new(),
@@ -147,6 +150,11 @@ impl Default for NativeApiConfig {
 }
 
 impl NativeApiConfig {
+    /// A bearer secret or password login protects the listener: administration may be enabled.
+    pub fn credentialed(&self) -> bool {
+        !self.secret.is_empty() || self.password_auth
+    }
+
     pub(crate) fn validate_detailed(
         &self,
         source: &crate::diagnostic::SourceRef,
@@ -168,10 +176,22 @@ impl NativeApiConfig {
                 "native API secret must be visible ASCII without commas or whitespace",
             ));
         }
-        if self.config_write && self.secret.is_empty() {
+        if self.config_write && !self.credentialed() {
             return Err(invalid(
                 "secret",
-                "configuration administration requires a bearer secret",
+                "configuration administration requires a bearer secret or password login",
+            ));
+        }
+        if self.password_auth && !self.secret.is_empty() {
+            return Err(invalid(
+                "password_auth",
+                "password login requires an empty secret; a configured secret selects token mode",
+            ));
+        }
+        if self.password_auth && self.allow_anonymous_loopback {
+            return Err(invalid(
+                "password_auth",
+                "password login cannot be combined with anonymous loopback",
             ));
         }
         for (field, value) in [
@@ -213,12 +233,11 @@ impl NativeApiConfig {
                         "native API requires a numeric IP and nonzero port",
                     )
                 })?;
-            if self.secret.is_empty()
-                && !(self.allow_anonymous_loopback && listen.ip().is_loopback())
+            if !self.credentialed() && !(self.allow_anonymous_loopback && listen.ip().is_loopback())
             {
                 return Err(invalid(
                     "secret",
-                    "native API requires a secret or explicitly anonymous loopback",
+                    "native API requires a secret, password login, or explicitly anonymous loopback",
                 ));
             }
         }

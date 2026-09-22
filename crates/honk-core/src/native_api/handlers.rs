@@ -20,18 +20,20 @@ type Id = Extension<RequestId>;
 
 pub(super) fn routes() -> Router<Arc<NativeState>> {
     Router::new()
+        .route("/api", resource(get(discovery), &["GET"]))
+        // The contract's own spelling of the discovery path; the short one stays for existing clients.
+        .route("/api/v1/discovery", resource(get(discovery), &["GET"]))
         .route(
-            "/api",
-            resource(
-                get(|Extension(id): Id, uri: Uri| async move {
-                    respond(
-                        parse_query(&uri, &[], &id)
-                            .map(|_| Json(types::discovery()).into_response()),
-                        id,
-                    )
-                }),
-                &["GET"],
-            ),
+            "/api/v1/auth/setup",
+            resource(post(super::auth::setup), &["POST"]),
+        )
+        .route(
+            "/api/v1/auth/login",
+            resource(post(super::auth::login), &["POST"]),
+        )
+        .route(
+            "/api/v1/auth/logout",
+            resource(post(super::auth::logout), &["POST"]),
         )
         .route(
             "/api/v1/version",
@@ -566,11 +568,7 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
                         let result = parse_query(&uri, &[], &id).and_then(|_| {
                             state.observation.operations.get(
                                 path_id(uri.path()),
-                                if state.settings.secret.is_empty() {
-                                    "anonymous"
-                                } else {
-                                    "control"
-                                },
+                                state.principal(),
                                 true,
                             )
                         });
@@ -593,6 +591,14 @@ fn resource(
         })
         // Unlike the default 405 fallback, this preserves the native JSON 404 without Allow.
         .merge(any(not_found))
+}
+
+async fn discovery(State(state): App, Extension(id): Id, uri: Uri) -> Response {
+    respond(
+        parse_query(&uri, &[], &id)
+            .map(|_| Json(types::discovery(state.auth_discovery())).into_response()),
+        id,
+    )
 }
 
 fn respond(result: Result<Response, ApiError>, id: RequestId) -> Response {

@@ -593,6 +593,7 @@ pub(super) fn parse_experimental_section(
                     "enabled",
                     "listen",
                     "secret",
+                    "password_auth",
                     "allow_anonymous_loopback",
                     "allow_origins",
                     "allowed_hosts",
@@ -792,6 +793,11 @@ pub(super) fn parse_experimental_section(
                             "allow_anonymous_loopback",
                             "experimental.native_api.allow_anonymous_loopback",
                             &mut config.native_api.allow_anonymous_loopback,
+                        ),
+                        (
+                            "password_auth",
+                            "experimental.native_api.password_auth",
+                            &mut config.native_api.password_auth,
                         ),
                     ] {
                         if let Some(text) = values.get(key) {
