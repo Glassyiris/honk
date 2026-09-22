@@ -452,6 +452,7 @@ impl ControlPlane {
         &mut self,
         reloads: Arc<std::sync::atomic::AtomicUsize>,
         gate: Option<mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>,
+        reject_reloads: Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<()> {
         let mut receiver = self
             .command_rx
@@ -479,6 +480,15 @@ impl ControlPlane {
                         if gate.send(release).is_ok() {
                             let _ = tokio::time::timeout(Duration::from_secs(5), wait).await?;
                         }
+                    }
+                    if reject_reloads.load(std::sync::atomic::Ordering::SeqCst) {
+                        if let ControlCommand::ReloadConfig { result, .. } = command {
+                            let _ = result.send(ReloadReply {
+                                outcome: ReloadOutcome::Rejected,
+                                authorized: Vec::new(),
+                            });
+                        }
+                        continue;
                     }
                 }
                 if !self

@@ -163,7 +163,11 @@ impl Fixture {
         state.observation.providers.attach(subscriptions.handle());
         let control = tokio::spawn(async move {
             control
-                .run_native_config_test_commands(Arc::new(AtomicUsize::new(0)), None)
+                .run_native_config_test_commands(
+                    Arc::new(AtomicUsize::new(0)),
+                    None,
+                    Arc::default(),
+                )
                 .await
         });
         let server = NativeServer::start(listener, Arc::clone(&state));

@@ -60,3 +60,66 @@ async fn main_source_write_records_a_revision_after_the_tree_is_deleted() {
     assert!(!fixture.path("etc").exists());
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn rejected_reload_leaves_the_db_head_alone() {
+    let fixture = Fixture::new_db(Access::Admin).await;
+    let store = Arc::clone(fixture.database.as_ref().unwrap());
+    fixture.reject_reloads.store(true, Ordering::SeqCst);
+    let before = fixture.get(CONFIG).await;
+    let main = source(&before, &fixture.originals["main.dae"]);
+    assert_eq!(main["writable"], true);
+    let candidate = fixture.originals["main.dae"].replace("fallback: direct", "fallback: block");
+    let operation = accepted(fixture.replace(main, &candidate).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&operation).await;
+    assert_eq!(terminal["status"], "failed", "{terminal}");
+    assert_eq!(terminal["error"]["code"], "reload_rejected");
+    assert_eq!(terminal["error"]["details"]["written"], false);
+    assert_eq!(store.head(), Ok(Some(1)));
+    assert_eq!(revisions(&fixture).len(), 1);
+    let after = fixture.get(CONFIG).await;
+    assert_eq!(after["revision"], before["revision"]);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn listener_settings_data_dir_and_secrets_stay_read_only() {
+    let fixture = Fixture::new_db(Access::Admin).await;
+    let store = Arc::clone(fixture.database.as_ref().unwrap());
+    let config = fixture.get(CONFIG).await;
+    let main = source(&config, &fixture.originals["main.dae"]);
+    let auth = config["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["path"] == "auth.dae")
+        .unwrap();
+    let stored_auth = store
+        .load(&HashMap::new(), &mut Vec::new())
+        .unwrap()
+        .sources
+        .into_iter()
+        .find(|source| source.path.ends_with("auth.dae"))
+        .unwrap()
+        .content;
+    assert!(!stored_auth.contains(SECRET));
+    let moved = fixture.originals["main.dae"].replace("/state'", "/moved'");
+    assert_ne!(moved, fixture.originals["main.dae"]);
+    for (target, content) in [
+        (main, moved),
+        (
+            auth,
+            stored_auth.replace("enabled: true", "enabled: true\n record_logs: false"),
+        ),
+        (
+            auth,
+            stored_auth.replace("enabled: true", "enabled: true\n secret: 'another-token'"),
+        ),
+    ] {
+        let response = fixture.replace(target, &content).send().await.unwrap();
+        error(response, StatusCode::FORBIDDEN, "permission_denied").await;
+    }
+    assert_eq!(store.head(), Ok(Some(1)));
+    assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
+    fixture.shutdown().await;
+}

@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::AsyncWriteExt;
@@ -75,6 +75,8 @@ struct Fixture {
     reloads: Arc<AtomicUsize>,
     gates: Option<mpsc::UnboundedReceiver<oneshot::Sender<()>>>,
     database: Option<Arc<DbStore>>,
+    /// When set, the engine answers every reload `Rejected` without applying it.
+    reject_reloads: Arc<AtomicBool>,
 }
 
 impl Fixture {
@@ -229,6 +231,8 @@ impl Fixture {
             .await;
         let reloads = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&reloads);
+        let reject_reloads = Arc::new(AtomicBool::new(false));
+        let rejecting = Arc::clone(&reject_reloads);
         let (gate, gates) = if gated {
             let (sender, receiver) = mpsc::unbounded_channel();
             (Some(sender), Some(receiver))
@@ -238,7 +242,7 @@ impl Fixture {
         let mut control = JoinSet::new();
         control.spawn(async move {
             control_plane
-                .run_native_config_test_commands(observed, gate)
+                .run_native_config_test_commands(observed, gate, rejecting)
                 .await
         });
         let weak = Arc::downgrade(&state);
@@ -259,6 +263,7 @@ impl Fixture {
             reloads,
             gates,
             database,
+            reject_reloads,
         }
     }
 
