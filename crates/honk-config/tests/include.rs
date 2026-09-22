@@ -615,6 +615,73 @@ fn source_overlay_resolves_siblings_and_virtual_globs_without_writing() {
 }
 
 #[test]
+fn memory_sources_expand_includes_without_reading_the_disk() {
+    use honk_config::parser::SourceLimits;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir(root.join("conf.d")).unwrap();
+    let entry = root.join("config.dae");
+    let included = root.join("conf.d/a.dae");
+    write(&entry, "global { log_level: error }");
+    write(&root.join("conf.d/x.dae"), "global { tproxy_port: 30001 }");
+    let sources: HashMap<_, Arc<str>> = HashMap::from([
+        (
+            entry.clone(),
+            Arc::from("include { conf.d/*.dae }\nglobal { log_level: warn }"),
+        ),
+        (included.clone(), Arc::from("global { tproxy_port: 30000 }")),
+    ]);
+    let loaded = Config::from_dae_sources_in_memory(
+        &entry,
+        &sources,
+        SourceLimits::default(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        loaded
+            .sources
+            .iter()
+            .map(|source| &source.path)
+            .collect::<Vec<_>>(),
+        [&entry, &included]
+    );
+    assert_eq!(loaded.config.global.log_level, "warn");
+    assert_eq!(loaded.config.global.tproxy_port, 30000);
+
+    let gone = root.join("missing");
+    let moved: HashMap<_, Arc<str>> = sources
+        .iter()
+        .map(|(path, content)| {
+            (
+                gone.join(path.strip_prefix(&root).unwrap()),
+                content.clone(),
+            )
+        })
+        .collect();
+    let relocated = Config::from_dae_sources_in_memory(
+        &gone.join("config.dae"),
+        &moved,
+        SourceLimits::default(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(relocated.config, loaded.config);
+
+    let orphan = HashMap::from([(included, Arc::from("global {}"))]);
+    let error = Config::from_dae_sources_in_memory(
+        &entry,
+        &orphan,
+        SourceLimits::default(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(error.diagnostic.code, "missing-config-source");
+}
+
+#[test]
 fn source_limits_cover_entry_and_dependency_bytes_and_counts() {
     use honk_config::parser::{SourceLimits, load_dae_sources, parse_dae_sources};
     let dir = tempfile::tempdir().unwrap();

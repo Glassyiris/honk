@@ -17,7 +17,7 @@ use groups::{parse_group_section, resolve_group_filters_inner};
 use scalars::{parse_experimental_section, parse_global_section};
 pub use sources::{
     LoadedConfig, SourceLimits, SourceSnapshot, check_dae_source, load_dae_sources,
-    parse_dae_sources,
+    load_dae_sources_in_memory, parse_dae_sources,
 };
 
 #[cfg(test)]
@@ -103,6 +103,7 @@ pub(crate) fn parse_dae_config_file_attempt(
         &HashMap::new(),
         SourceLimits::UNLIMITED,
         entry_input,
+        true,
         diagnostics,
         semantic,
     )
@@ -114,10 +115,13 @@ fn parse_dae_file_inner(
     overlay: &HashMap<PathBuf, Arc<str>>,
     limits: SourceLimits,
     entry_input: Option<Arc<str>>,
+    disk: bool,
     diagnostics: &mut ParserDiagnostics<'_>,
     semantic: &mut bool,
 ) -> Result<LoadedConfig, ParseFailure> {
-    let entry = if overlay.contains_key(path) {
+    let entry = if !disk {
+        sources::lexical_source_path(path)
+    } else if overlay.contains_key(path) {
         sources::canonical_overlay_path(path)
     } else {
         std::fs::canonicalize(path)
@@ -132,9 +136,14 @@ fn parse_dae_file_inner(
         )
     })?;
     for path in overlay.keys() {
+        let canonical = if disk {
+            sources::canonical_overlay_path(path)
+        } else {
+            sources::lexical_source_path(path)
+        };
         if !path.starts_with(&entry_dir)
-            || !sources::canonical_overlay_path(path).is_ok_and(|canonical| canonical == *path)
-            || std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file())
+            || !canonical.is_ok_and(|canonical| canonical == *path)
+            || disk && std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file())
         {
             return Err(sources::source_error(
                 diagnostics.source(),
@@ -152,6 +161,7 @@ fn parse_dae_file_inner(
         entry_input: Arc::from(""),
         supplied_entry: entry_input,
         overlay,
+        disk,
         limits,
         bytes: 0,
         sources: Vec::new(),
@@ -235,6 +245,8 @@ struct IncludeLoader<'a> {
     entry_input: Arc<str>,
     supplied_entry: Option<Arc<str>>,
     overlay: &'a HashMap<PathBuf, Arc<str>>,
+    /// When false the overlay is the whole source set and no path is resolved on disk.
+    disk: bool,
     limits: SourceLimits,
     bytes: usize,
     sources: Vec<SourceSnapshot>,
@@ -276,6 +288,13 @@ impl IncludeLoader<'_> {
                 input.clone()
             } else if let Some(input) = supplied_entry {
                 input
+            } else if !self.disk {
+                return Err(sources::source_error(
+                    source.clone(),
+                    "missing-config-source",
+                    "configuration source is not in the supplied set",
+                )
+                .into());
             } else {
                 sources::read_source(
                     path,
@@ -347,7 +366,10 @@ impl IncludeLoader<'_> {
             self.entry_dir.join(pattern_path)
         };
         // dae treats `**` as an ordinary same-component wildcard.
-        let pattern = normalize_dae_glob_pattern(&pattern);
+        let mut pattern = normalize_dae_glob_pattern(&pattern);
+        if !self.disk {
+            pattern = sources::lexical_normalize(&pattern);
+        }
         let pattern_display = pattern.to_string_lossy();
         let expansion_error = || {
             sources::source_error(
@@ -357,7 +379,12 @@ impl IncludeLoader<'_> {
             )
         };
         let mut matches = Vec::new();
-        for path in glob::glob(&pattern_display).map_err(|_| expansion_error())? {
+        let disk_matches = if self.disk {
+            Some(glob::glob(&pattern_display).map_err(|_| expansion_error())?)
+        } else {
+            None
+        };
+        for path in disk_matches.into_iter().flatten() {
             let path = path.map_err(|_| expansion_error())?;
             if path.extension().and_then(|ext| ext.to_str()) != Some("dae") {
                 continue;
@@ -404,7 +431,9 @@ impl IncludeLoader<'_> {
                 }
             }
             // Existing directory aliases and `..` must also find a virtual leaf.
-            if let (Some(parent), Some(name)) = (pattern.parent(), pattern.file_name()) {
+            if self.disk
+                && let (Some(parent), Some(name)) = (pattern.parent(), pattern.file_name())
+            {
                 let leaf =
                     glob::Pattern::new(&name.to_string_lossy()).map_err(|_| expansion_error())?;
                 for directory in
@@ -434,7 +463,9 @@ impl IncludeLoader<'_> {
         matches.sort();
         let mut files = Vec::with_capacity(matches.len());
         for path in matches {
-            let path = if self.overlay.contains_key(&path) {
+            let path = if !self.disk {
+                Ok(path)
+            } else if self.overlay.contains_key(&path) {
                 sources::canonical_overlay_path(&path)
             } else {
                 std::fs::canonicalize(&path).or_else(|error| {

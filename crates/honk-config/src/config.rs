@@ -513,6 +513,20 @@ impl Config {
         Ok(loaded)
     }
 
+    /// Load a dae tree held entirely in memory; see
+    /// [`load_dae_sources_in_memory`](crate::parser::load_dae_sources_in_memory).
+    pub fn from_dae_sources_in_memory(
+        path: &std::path::Path,
+        sources: &std::collections::HashMap<std::path::PathBuf, std::sync::Arc<str>>,
+        limits: crate::parser::SourceLimits,
+        diagnostics: &mut Vec<DetailedDiagnostic>,
+    ) -> Result<crate::parser::LoadedConfig, DetailedConfigError> {
+        let mut loaded =
+            crate::parser::load_dae_sources_in_memory(path, sources, limits, diagnostics)?;
+        loaded.config.derive_node_ids();
+        Ok(loaded)
+    }
+
     fn load_file_attempt(
         path: &str,
         diagnostics: &mut Vec<DetailedDiagnostic>,
