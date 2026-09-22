@@ -32,6 +32,10 @@ use crate::configuration::{
     same_dependencies,
 };
 
+/// Shorter secrets are not masked: a one-byte value would erase every
+/// occurrence of that byte from every response.
+pub(crate) const MIN_MASKED_SECRET: usize = 8;
+
 pub(crate) struct ListenerSecrets<'a> {
     values: Vec<&'a str>,
 }
@@ -39,7 +43,7 @@ pub(crate) struct ListenerSecrets<'a> {
 impl<'a> ListenerSecrets<'a> {
     pub(crate) fn new(sources: &'a [SourceSnapshot], native_secret: &'a str) -> Self {
         let mut values = Vec::new();
-        if !native_secret.is_empty() {
+        if native_secret.len() >= MIN_MASKED_SECRET {
             values.push(native_secret);
         }
         for source in sources.iter().filter(|source| source.contains_api_secret) {
@@ -83,7 +87,7 @@ impl<'a> ListenerSecrets<'a> {
                 } else {
                     value
                 };
-                if !value.is_empty() {
+                if value.len() >= MIN_MASKED_SECRET {
                     values.push(value);
                 }
             }
@@ -99,7 +103,7 @@ impl<'a> ListenerSecrets<'a> {
     }
 
     pub(crate) fn with_clash(mut self, secret: &'a str) -> Self {
-        if !secret.is_empty() && !self.values.contains(&secret) {
+        if secret.len() >= MIN_MASKED_SECRET && !self.values.contains(&secret) {
             self.values.push(secret);
         }
         self

@@ -97,6 +97,18 @@ impl NativeState {
                 config.experimental.clash_api.secret.clone(),
             )
         };
+        for (api, secret) in [
+            ("native_api", &settings.secret),
+            ("clash_api", &clash_secret),
+        ] {
+            if !secret.is_empty() && secret.len() < config::MIN_MASKED_SECRET {
+                tracing::warn!(
+                    api,
+                    "listener secret shorter than {} bytes is not masked in native API responses",
+                    config::MIN_MASKED_SECRET
+                );
+            }
+        }
         let observation = control.native_observation();
         let phase = control.observe_phase();
         observation.configuration.attach_phase(phase.clone());

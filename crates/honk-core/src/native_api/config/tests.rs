@@ -931,22 +931,27 @@ fn listener_masking_preserves_wire_identifiers_and_enums() {
         ]}
     });
     let original = value.clone();
-    assert!(ListenerSecrets::new(&[], "-").mask_value(&mut value));
+    assert!(ListenerSecrets::new(&[], "with-secret").mask_value(&mut value));
     assert_eq!(value["id"], original["id"]);
     assert_eq!(value["next_cursor"], original["next_cursor"]);
     assert_eq!(value["network"], "tcp");
-    assert_eq!(value["chain"][0], "node<redacted>with<redacted>secret");
+    assert_eq!(value["chain"][0], "node-<redacted>");
     assert_eq!(value["trace"]["steps"][0]["chain"], "traffic");
     assert_eq!(value["trace"]["steps"][0]["rule_id"], "instance-1:2:rule:0");
     assert_eq!(value["trace_status"], "partial");
     assert_eq!(value["trace"]["missing"], json!(["redacted"]));
-    let mut value = json!({"network": "tcp", "expression": "l4proto(tcp)"});
-    assert!(ListenerSecrets::new(&[], "tcp").mask_value(&mut value));
+    let mut value = json!({"network": "tcp", "expression": "pname(tcpsecret)"});
+    assert!(ListenerSecrets::new(&[], "tcpsecret").mask_value(&mut value));
     assert_eq!(value["network"], "tcp");
-    assert_eq!(value["expression"], "l4proto(<redacted>)");
+    assert_eq!(value["expression"], "pname(<redacted>)");
     assert_eq!(
-        ListenerSecrets::new(&[], "aba").mask("ababa"),
+        ListenerSecrets::new(&[], "abababab").mask("ababababab"),
         ("<redacted>".into(), true)
+    );
+    // Below the minimum a secret is left alone rather than shredding common substrings.
+    assert_eq!(
+        ListenerSecrets::new(&[], "tcp").mask("l4proto(tcp)"),
+        ("l4proto(tcp)".into(), false)
     );
     let secret = "quoted\"token";
     let mut value = json!({"expression": format!("pname({secret:?})")});
