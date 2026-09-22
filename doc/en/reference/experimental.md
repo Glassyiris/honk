@@ -20,8 +20,9 @@ Requires the default-on `native-api` Cargo feature; it does not require `clash-a
 | --- | --- | --- |
 | `enabled` | `false` | Start the independent native listener. |
 | `listen` | `"127.0.0.1:9527"` | Numeric IP plus port 1–65535; no hostname or `:port` shorthand. |
-| `secret` | `""` | Bearer credential, independent of the Clash credential. Required unless explicit anonymous loopback is enabled. Listener secrets are masked by value in API responses; a value shorter than 8 bytes is not masked and is reported at startup. |
-| `allow_anonymous_loopback` | `false` | Permit credential-free requests only when secret is empty and the actual listening IP is loopback. A configured secret always requires authentication. |
+| `secret` | `""` | Static bearer credential, independent of the Clash credential. A nonempty value selects token mode and cannot be combined with `password_auth`. Listener secrets are masked by value in API responses; a value shorter than 8 bytes is not masked and is reported at startup. |
+| `password_auth` | `false` | Select administrator password login when `secret` is empty. Cannot be combined with `allow_anonymous_loopback`. |
+| `allow_anonymous_loopback` | `false` | Permit credential-free requests only when `secret` is empty, `password_auth` is false and the actual listening IP is loopback. |
 | `allow_origins` | empty list | Additional explicit HTTP(S) origins, without paths, credentials, query, fragment, `null`, or wildcards. |
 | `allowed_hosts` | empty list | Additional explicit HTTP Host authorities, without URL schemes, paths, credentials, or wildcards. Omitted port means 80, not the listener's port. |
 | `ui` | `""` | Empty disables hosting; otherwise a trusted local directory with readable `index.html`, or `embedded` with the default-off `native-ui` feature. No startup download, extraction or frontend build. |
@@ -32,8 +33,8 @@ Requires the default-on `native-api` Cargo feature; it does not require `clash-a
 | `record_dns_log` | `true` | Permit completed client DNS history under the API client-attachment rule or an explicit runtime pin, bounded to 512 records and 8 MiB. `false` prohibits history; configuration changes require restart. |
 | `probe_allowed_cidrs` | empty list | Explicit IP CIDRs authorizing otherwise restricted resolved probe targets and proxy-server addresses. Empty denies restricted addresses, including loopback/private/link-local ranges. |
 | `probe_allowed_ports` | empty list | Additional ports 1–65535 for configured HTTP/DNS probe targets. Defaults permit HTTP 80, HTTPS 443 and DNS 53; raw TCP probes use only the node's configured server port. CIDR authorization remains independently required. |
-| `config_content` | `false` | Accepted for compatibility and ignored. Authenticated source reads require a nonempty `secret` and mask only listener-secret values. |
-| `config_write` | `false` | Allow whole-source replacement and reload for the accepted main file and all accepted includes, excluding listener-credential-bearing sources. Requires a nonempty `secret`. |
+| `config_content` | `false` | Accepted for compatibility and ignored. Every admitted request may read available sources; only listener-secret values are masked. |
+| `config_write` | `false` | Allow whole-source replacement and reload for the accepted main file and all accepted includes, excluding listener-credential-bearing sources. Requires a nonempty `secret` or `password_auth`. |
 | `writable_includes` | empty list | Accepted for compatibility and ignored; it grants no path authority and does not restrict accepted includes. |
 | `geosite_download_url` | `""` | Final direct HTTP(S) source for updating the loaded geosite asset. Requires `config_write`; empty disables updates when geosite is loaded. |
 | `geoip_download_url` | `""` | Final direct HTTP(S) source for updating the loaded geoip asset, with the same authorization and bounds. |
@@ -52,6 +53,8 @@ experimental {
 
 Nonempty native secrets must be visible ASCII without whitespace or commas, matching the HTTP bearer parser; unsupported bytes fail shared configuration admission rather than creating an unusable listener.
 
+Authentication mode is restart-required. A nonempty `secret` selects the existing static-token mode. An empty `secret` with `password_auth: true` selects password mode. An empty `secret` with explicit anonymous loopback and an actual loopback bind selects the existing development mode. An enabled listener with none of these fails validation. Password mode requires an empty `secret` and is rejected with `allow_anonymous_loopback`; `config_write: true` likewise requires token or password mode.
+
 Replace the example secret. For local credential-free development, omit `secret` and explicitly set `allow_anonymous_loopback: true`; never publish that anonymous listener through a reverse proxy. Plain HTTP with a token on a non-loopback network is not a secure deployment. Terminate TLS at a trusted proxy.
 
 Default Host acceptance is the concrete listening authority; loopback also accepts `localhost`, `127.0.0.1`, and `[::1]` at that port. A wildcard bind accepts any IP-literal Host, and `localhost`, at the listening port, since those name the listener itself on whichever interface the request arrived; DNS names are still not authorized, because only a name can be rebound. Only directly corresponding plain-HTTP origins are automatically allowed. A TLS proxy preserving `Host: panel.example` needs `allowed_hosts: 'panel.example'` and `allow_origins: 'https://panel.example'`; if it preserves `Host: panel.example:443`, add `allowed_hosts: 'panel.example', 'panel.example:443'`. Forwarded headers do not grant authorization.
@@ -60,7 +63,7 @@ Lists use individually quoted comma-separated entries, such as `allow_origins: '
 
 Relative UI paths follow the existing dependency search: an existing path under `global.data_dir`, then `/var/share/honk`, then the working directory; a missing dependency resolves under `global.data_dir` and startup fails. The administrator owns the directory and any symlink targets. See the [native API contract](./api.md#native-api-m1).
 
-For a single binary, build `cargo build -p honk-core --features native-ui` and use `ui: embedded`; `native-ui` includes `native-api` without requiring Clash. Without `native-ui`, enabled embedded hosting fails startup. Open `/ui/` and supply the bearer token in doona's login form. Asset/source identities, corresponding-source distribution and the M9 management contract are documented in the [API reference](./api.md#embedded-doona-provenance).
+For a single binary, build `cargo build -p honk-core --features native-ui` and use `ui: embedded`; `native-ui` includes `native-api` without requiring Clash. Without `native-ui`, enabled embedded hosting fails startup. The assets receive no injected credentials; clients use public discovery to select static-token entry or password setup/login. Asset/source identities, corresponding-source distribution and the M9 management contract are documented in the [API reference](./api.md#embedded-doona-provenance).
 
 Geodata sources are administrator-controlled, restart-required and cannot be changed through source writes. Userinfo, fragments, redirects and content encoding are rejected. Hostname sources require `global.bootstrap_resolver`; no system-DNS fallback or proxy detour is used. All loaded assets need a configured source before updates are available. The [M9 contract](./api.md#managed-entries-and-geodata-m9) distinguishes network limits, verified-byte activation and partial durable replacement from rollback.
 
