@@ -36,15 +36,19 @@ use crate::configuration::{
 /// occurrence of that byte from every response.
 pub(crate) const MIN_MASKED_SECRET: usize = 8;
 
-pub(crate) struct ListenerSecrets<'a> {
-    values: Vec<&'a str>,
+/// The listener secret values a response must not carry. Building one parses every source that
+/// holds an API secret, so `ConfigService` keeps the set for the accepted sources and rebuilds it
+/// only when they change.
+#[derive(Clone)]
+pub(crate) struct ListenerSecrets {
+    values: Vec<String>,
 }
 
-impl<'a> ListenerSecrets<'a> {
-    pub(crate) fn new(sources: &'a [SourceSnapshot], native_secret: &'a str) -> Self {
+impl ListenerSecrets {
+    pub(crate) fn new(sources: &[SourceSnapshot], native_secret: &str) -> Self {
         let mut values = Vec::new();
         if native_secret.len() >= MIN_MASKED_SECRET {
-            values.push(native_secret);
+            values.push(native_secret.to_owned());
         }
         for source in sources.iter().filter(|source| source.contains_api_secret) {
             let Ok(document) = Document::parse(
@@ -52,7 +56,7 @@ impl<'a> ListenerSecrets<'a> {
                 &mut Vec::new(),
             ) else {
                 if !source.content.is_empty() {
-                    values.push(source.content.as_ref());
+                    values.push(source.content.to_string());
                 }
                 continue;
             };
@@ -88,7 +92,7 @@ impl<'a> ListenerSecrets<'a> {
                     value
                 };
                 if value.len() >= MIN_MASKED_SECRET {
-                    values.push(value);
+                    values.push(value.to_owned());
                 }
             }
         }
@@ -97,14 +101,14 @@ impl<'a> ListenerSecrets<'a> {
         Self { values }
     }
 
-    pub(crate) fn from_config(config: &'a Config) -> Self {
+    pub(crate) fn from_config(config: &Config) -> Self {
         Self::new(&[], &config.experimental.native_api.secret)
             .with_clash(&config.experimental.clash_api.secret)
     }
 
-    pub(crate) fn with_clash(mut self, secret: &'a str) -> Self {
-        if secret.len() >= MIN_MASKED_SECRET && !self.values.contains(&secret) {
-            self.values.push(secret);
+    pub(crate) fn with_clash(mut self, secret: &str) -> Self {
+        if secret.len() >= MIN_MASKED_SECRET && !self.values.iter().any(|value| value == secret) {
+            self.values.push(secret.to_owned());
         }
         self
     }
@@ -113,7 +117,7 @@ impl<'a> ListenerSecrets<'a> {
         self.values.iter().flat_map(|value| {
             let quoted = serde_json::to_string(value).expect("listener secret is a string");
             [
-                std::borrow::Cow::Borrowed(*value),
+                std::borrow::Cow::Borrowed(value.as_str()),
                 std::borrow::Cow::Owned(quoted[1..quoted.len() - 1].to_owned()),
             ]
         })
@@ -241,6 +245,8 @@ pub(crate) struct ConfigService {
     sender: Mutex<Option<mpsc::Sender<Work>>>,
     last_reload: RwLock<Option<Value>>,
     phase: RwLock<Option<tokio::sync::watch::Receiver<crate::control::EnginePhase>>>,
+    /// The secret set for the accepted sources, keyed by the `SourceUpdate` it was built from.
+    secrets: Mutex<Option<(Arc<SourceUpdate>, Arc<ListenerSecrets>)>>,
     #[cfg(test)]
     before_replace: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -295,6 +301,7 @@ impl ConfigService {
             sender: Mutex::new(None),
             last_reload: RwLock::new(None),
             phase: RwLock::new(None),
+            secrets: Mutex::new(None),
             #[cfg(test)]
             before_replace: Mutex::new(None),
         }
@@ -373,17 +380,32 @@ impl ConfigService {
         self.last_reload.read().clone()
     }
 
+    /// The secret set for `accepted`, rebuilt only when its sources are a new `SourceUpdate`.
+    pub(crate) fn secrets(&self, accepted: Option<&Accepted>) -> Arc<ListenerSecrets> {
+        let Some(accepted) = accepted else {
+            return Arc::new(ListenerSecrets::new(&[], &self.settings.secret));
+        };
+        let mut cached = self.secrets.lock();
+        if let Some((update, secrets)) = cached.as_ref()
+            && Arc::ptr_eq(update, &accepted.update)
+        {
+            return Arc::clone(secrets);
+        }
+        let secrets = Arc::new(ListenerSecrets::new(
+            &accepted.update.sources,
+            &self.settings.secret,
+        ));
+        *cached = Some((Arc::clone(&accepted.update), Arc::clone(&secrets)));
+        secrets
+    }
+
     pub(crate) fn mask_text(&self, text: &str) -> (String, bool) {
         let guard = self.sources.accepted.read();
-        let sources = guard
-            .as_ref()
-            .map(|accepted| accepted.update.sources.as_slice())
-            .unwrap_or(&[]);
-        ListenerSecrets::new(sources, &self.settings.secret).mask(text)
+        self.secrets(guard.as_ref()).mask(text)
     }
 
     fn source_writable(&self, accepted: &Accepted, index: usize) -> bool {
-        let secrets = ListenerSecrets::new(&accepted.update.sources, &self.settings.secret);
+        let secrets = self.secrets(Some(accepted));
         self.source_writable_with_secrets(accepted, index, &secrets)
     }
 
@@ -391,7 +413,7 @@ impl ConfigService {
         &self,
         accepted: &Accepted,
         index: usize,
-        secrets: &ListenerSecrets<'_>,
+        secrets: &ListenerSecrets,
     ) -> bool {
         let source = &accepted.update.sources[index];
         self.settings.config_write
@@ -441,7 +463,7 @@ impl ConfigService {
             None => accepted.rule_sources.fallback.as_ref()?,
         };
         let source = &accepted.update.sources[location.source_index];
-        let secrets = ListenerSecrets::new(&accepted.update.sources, &self.settings.secret);
+        let secrets = self.secrets(Some(accepted));
         let mut location = location.clone();
         location.expression = secrets.mask(&location.expression).0;
         Some((
@@ -457,7 +479,7 @@ impl ConfigService {
         &self,
         accepted: &Accepted,
         index: usize,
-        secrets: &ListenerSecrets<'_>,
+        secrets: &ListenerSecrets,
     ) -> (Value, bool) {
         let source = &accepted.update.sources[index];
         let (content, redacted) = secrets.mask(&source.content);
@@ -476,7 +498,7 @@ impl ConfigService {
     pub(crate) fn snapshot(&self) -> Option<Value> {
         let guard = self.sources.accepted.read();
         let accepted = guard.as_ref()?;
-        let secrets = ListenerSecrets::new(&accepted.update.sources, &self.settings.secret);
+        let secrets = self.secrets(Some(accepted));
         let mut secrets_redacted = false;
         let sources = (0..accepted.update.sources.len())
             .map(|index| {
@@ -703,12 +725,13 @@ pub(super) fn administrative_projection(
     mut value: Value,
 ) -> Result<Value, ApiError> {
     let accepted = state.observation.configuration.sources.accepted.read();
-    let sources = accepted
+    let secrets = state
+        .observation
+        .configuration
+        .secrets(accepted.as_ref())
         .as_ref()
-        .map(|accepted| accepted.update.sources.as_slice())
-        .unwrap_or(&[]);
-    let secrets =
-        ListenerSecrets::new(sources, &state.settings.secret).with_clash(&state.clash_secret);
+        .clone()
+        .with_clash(&state.clash_secret);
     secrets.mask_value(&mut value);
     Ok(value)
 }
@@ -768,7 +791,7 @@ pub(super) async fn source(
         .iter()
         .position(|source| accepted.ids[&source.path] == source_id)
         .ok_or_else(not_found)?;
-    let secrets = ListenerSecrets::new(&accepted.update.sources, &state.settings.secret);
+    let secrets = state.observation.configuration.secrets(Some(accepted));
     Ok(Json(
         state
             .observation
