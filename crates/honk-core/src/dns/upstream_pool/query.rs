@@ -145,6 +145,27 @@ impl UpstreamPool {
             .next()
             .ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))
     }
+    async fn exchange_routed(
+        &self,
+        entry: &UpstreamEntry,
+        route: &DnsDialRoute,
+        raw_query: &[u8],
+        business: Option<honk_outbound::group::ScoreBusinessGuard>,
+    ) -> anyhow::Result<Vec<u8>> {
+        match self
+            .get_transport(entry, route.node.as_ref(), route.target)
+            .await
+        {
+            Ok(transport) => transport.exchange(raw_query, business).await,
+            Err(error) => {
+                if let Some(business) = business {
+                    business.finish(honk_outbound::group::ScoreOutcome::from_error(&error));
+                }
+                Err(error)
+            }
+        }
+    }
+
     async fn query_udp_via_proxy(
         &self,
         upstream_name: &str,
@@ -158,31 +179,18 @@ impl UpstreamPool {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("proxied DNS route has no node"))?;
         let _admission = self.admit_query().await?;
-        let mut business = admit_score_attempt(route.feedback.as_ref(), original)?;
-        let transport = self
-            .get_transport(entry, Some(node), route.target)
-            .await
-            .inspect_err(|error| {
-                if let Some(business) = business.take() {
-                    business.finish(honk_outbound::group::ScoreOutcome::from_error(error));
-                }
-            })?;
-        let response = transport.exchange(raw_query, business.take()).await?;
+        let business = admit_score_attempt(route.feedback.as_ref(), original)?;
+        let response = self
+            .exchange_routed(entry, route, raw_query, business)
+            .await?;
         let response = if crate::dns::response::is_truncated(&response) {
             let tcp_feedback = self.tcp_feedback_for_route(entry, route)?;
-            let mut business = admit_score_attempt(tcp_feedback.as_ref(), original)?;
+            let business = admit_score_attempt(tcp_feedback.as_ref(), original)?;
             debug!(
                 "DNS upstream '{}' proxied UDP answer has TC set — retrying over proxied TCP",
                 upstream_name
             );
-            self.get_transport(entry, Some(node), route.target)
-                .await
-                .inspect_err(|error| {
-                    if let Some(business) = business.take() {
-                        business.finish(honk_outbound::group::ScoreOutcome::from_error(error));
-                    }
-                })?
-                .exchange(raw_query, business.take())
+            self.exchange_routed(entry, route, raw_query, business)
                 .await?
         } else {
             response
@@ -419,8 +427,7 @@ impl DnsUpstreamPool for UpstreamPool {
                 .resolve_dial_route_for_address(entry, target, original_business.as_ref())
                 .await?;
             let _admission = self.admit_query().await?;
-            let mut business =
-                admit_score_attempt(route.feedback.as_ref(), &mut original_business)?;
+            let business = admit_score_attempt(route.feedback.as_ref(), &mut original_business)?;
             debug!(
                 "DNS upstream '{}' dial leaf={:?} (forced={})",
                 upstream_name,
@@ -433,13 +440,9 @@ impl DnsUpstreamPool for UpstreamPool {
                 None
             };
             let effective_query = injected.as_ref().map_or(raw_query, EcsQuery::wire);
-            let response = match self
-                .get_transport(entry, route.node.as_ref(), route.target)
-                .await
-            {
-                Ok(transport) => transport.exchange(effective_query, business.take()).await,
-                Err(error) => Err(error),
-            };
+            let response = self
+                .exchange_routed(entry, &route, effective_query, business)
+                .await;
             match response {
                 Ok(response) => {
                     debug!(
@@ -462,9 +465,6 @@ impl DnsUpstreamPool for UpstreamPool {
                     };
                 }
                 Err(error) => {
-                    if let Some(business) = business.take() {
-                        business.finish(honk_outbound::group::ScoreOutcome::from_error(&error));
-                    }
                     let error = retryable_error(error)?;
                     debug!(
                         target: "honk_core::dns::upstream_pool::failure",
