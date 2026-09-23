@@ -181,7 +181,7 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 
 | 机制 | 不变量 |
 | --- | --- |
-| 容量 | 最多 16 个 LRU 分片精确划分 `max_cache_size`。每个分片同时受条目数与保留的 key/response wire 字节限制。字节目标为每个配置条目 4 KiB，每分片至少 65,535 字节，全局上限 64 MiB。 |
+| 容量 | 最多 16 个 LRU 分片精确划分 `max_cache_size`。每个分片只受条目数限制；`max_cache_size` 钳制为不超过 100,000。 |
 | 正缓存 TTL | `fixed_domain_ttl` 优先级最高；零表示该域名不缓存。否则，非零 `optimistic_cache_ttl` 覆盖应答最小 TTL。两者均未覆盖时，NOERROR 正应答取所有已遍历非 OPT 记录的最小 TTL，包括零；最小值为零时移除精确缓存槽，不保留新应答。选定的非零 TTL 也会写入缓存中的记录。失败响应码仍使用原有的 TTL 提取规则。 |
 | 负缓存 TTL | NXDOMAIN 使用 `min(SOA TTL, SOA MINIMUM, 300)` 秒；缺少 SOA 或生命周期为零时移除精确缓存槽，不保留应答。SERVFAIL 仍缺省为 60 秒，并将 SOA 得出的生命周期限制在 `1..=300` 秒。`fixed_domain_ttl: 0` 禁止缓存所有响应码的应答，但不移除已有条目。 |
 | NODATA TTL | `ANCOUNT=0` 的 NOERROR 应答以完整报文保留在正缓存槽中。非零 `fixed_domain_ttl` 优先于 SOA 和上限；否则生命周期为 `min(SOA TTL, SOA MINIMUM, 300)`，缺少 SOA 或生命周期为零时移除精确缓存槽，不保留新应答。`optimistic_cache_ttl` 不适用。NODATA 仍可作为过期应答返回；过期改写只改变 SOA TTL，不改变 MINIMUM。 |
@@ -196,7 +196,7 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 
 此保证仅适用于内存；缓存槽版本号仅在进程内有效，不改变持久化格式或严格模式的应答准入。移除正缓存不会使已保存的 SQLite 行失效。若在该行过期前重启，该正缓存可能恢复为仅兼容模式可用：严格模式不会复用它，兼容模式则可能在持久化过期时间之后的一小时内继续提供过期应答。因为刷新触发条件对剩余秒数向下取整，所以刷新开始时原应答可能仍有至多 `max(min_ttl / 10, 1) + 1` 秒的实际有效期。
 
-`store_dns` 启用持久化后，一个有界 actor 会将仍被保留的正缓存插入镜像到 SQLite。若条目因分片 wire 字节预算而立即被驱逐，则不会进入持久化队列。actor 将命令队列与 pending set 都限制为 1,024 项，批量写入并按 epoch 隔离；flush 会在接纳当前状态前丢弃更旧的排队 epoch。
+`store_dns` 启用持久化后，一个有界 actor 会将仍被保留的正缓存插入镜像到 SQLite。actor 将命令队列与 pending set 都限制为 1,024 项，批量写入并按 epoch 隔离；flush 会在接纳当前状态前丢弃更旧的排队 epoch。
 
 `HDNS` version 2 条目保存在状态数据库的 `dns_answer` 表中，编码 canonical wire、入口 profile、scope、policy、operation、expiry 与已校验的 response wire。恢复时跳过已过期、损坏、version 不匹配、collision 不匹配及 policy 不匹配的行。编码后超过 4 KiB 的条目在进入批量写入前被丢弃并计入 `oversize`，因为表的长度 `CHECK` 会让整个批量事务失败。
 

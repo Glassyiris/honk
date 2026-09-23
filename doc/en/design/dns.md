@@ -198,7 +198,7 @@ Configured ECS is a generation-pinned named-upstream transport policy, not ingre
 
 | Mechanism | Invariant |
 | --- | --- |
-| Capacity | At most 16 LRU shards divide `max_cache_size` exactly. Each shard is bounded by both entry count and retained key/response wire bytes. The byte target is 4 KiB per configured entry, with at least 65,535 bytes per shard and a 64 MiB global cap. |
+| Capacity | At most 16 LRU shards divide `max_cache_size` exactly. Each shard is bounded by entry count only; `max_cache_size` is clamped to 100,000. |
 | Positive TTL | `fixed_domain_ttl` has first priority; zero disables caching for that domain. Otherwise nonzero `optimistic_cache_ttl` overrides the answer minimum TTL. With neither override, a positive NOERROR response uses the minimum of all walked non-OPT record TTLs, including zero; zero supersedes the exact slot without caching. The selected nonzero TTL is also written into cached records. Failure rcodes keep their existing TTL extraction. |
 | Negative TTL | NXDOMAIN uses `min(SOA TTL, SOA MINIMUM, 300)` seconds; missing SOA or zero lifetime supersedes the exact slot without retaining the response. SERVFAIL still defaults to 60 seconds and clamps the SOA-derived lifetime to `1..=300`. `fixed_domain_ttl: 0` prevents caching for every response code without superseding an existing entry. |
 | NODATA TTL | NOERROR with `ANCOUNT=0` retains its full wire in the positive slot. A nonzero `fixed_domain_ttl` overrides SOA and the cap; otherwise lifetime is `min(SOA TTL, SOA MINIMUM, 300)`, with missing SOA or zero superseding the exact slot without caching. `optimistic_cache_ttl` does not apply. NODATA remains stale-eligible; stale rewriting changes SOA TTL, not MINIMUM. |
@@ -211,7 +211,7 @@ Foreground publication remains last-publication-wins. An uncacheable NXDOMAIN, N
 
 Ordinary response-driven supersession above is in-memory only: removing a positive need not delete its saved SQLite row. Before that row expires, restart can restore it as compatibility-only; strict mode never reuses it. Explicit API cache deletion/flush instead uses an acknowledged persistence barrier and reports failures. The near-expiry trigger floors remaining seconds, so the original can still have up to `max(min_ttl / 10, 1) + 1` seconds of lifetime when refresh begins. Slot revisions are process-local and do not change the persistence format or strict-response admission.
 
-When `store_dns` enables persistence, a bounded actor mirrors retained positive insertions to SQLite. An entry evicted immediately by the shard's wire-byte budget is not queued for persistence. The actor bounds both its command queue and pending set to 1,024 items, batches writes, and fences them by epoch; a flush discards older queued epochs before admitting the current state.
+When `store_dns` enables persistence, a bounded actor mirrors retained positive insertions to SQLite. The actor bounds both its command queue and pending set to 1,024 items, batches writes, and fences them by epoch; a flush discards older queued epochs before admitting the current state.
 
 `HDNS` version 2 entries are rows of the state db's `dns_answer` table and encode canonical wire, ingress profile, scope, policy, operation, expiry, and validated response wire. Restore skips expired, corrupt, version-mismatched, collision-mismatched, and policy-mismatched rows. An entry that encodes to more than 4 KiB is dropped before it is queued for the batch and counted as `oversize`, because the table's size `CHECK` would otherwise fail the whole batch transaction.
 
