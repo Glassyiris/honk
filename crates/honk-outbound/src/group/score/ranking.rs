@@ -33,16 +33,40 @@ pub(super) fn decision(
     nodes: &[&Node],
     now: Instant,
 ) -> Decision {
+    let mut decision = ordinary_decision(inner, group, context, nodes, now);
+    decision.evidence =
+        comparison::node_evidence(inner, group, context, nodes, &decision.scores, now);
+    if decision.ordinary.index != decision.pairs.reference {
+        decision.pairs = comparison::pairs(
+            inner,
+            group,
+            context,
+            nodes,
+            (&decision.scores, decision.baseline),
+            decision.ordinary.index,
+            now,
+        );
+    }
+    decision
+}
+
+/// The ordinary choice alone: no verification evidence, and pairs stay bound to the incumbent.
+fn ordinary_decision(
+    inner: &StateInner,
+    group: &str,
+    context: &ScoreSelectionContext,
+    nodes: &[&Node],
+    now: Instant,
+) -> Decision {
     let scores = score_snapshots(inner, group, context, nodes.iter().map(|node| node.id), now);
     let baseline = performance_baseline(&scores);
-    let evidence = comparison::node_evidence(inner, group, context, nodes, &scores, now);
     let incumbent = inner
         .selection_history
         .peek(&SelectionHistoryKey::new(group, context))
         .filter(|history| history.selections > 0)
         .and_then(|history| nodes.iter().position(|node| node.id == history.current));
     let reference = incumbent.unwrap_or_else(|| best_index(&scores, nodes, baseline).index);
-    let mut pairs = comparison::pairs(
+    let pairs = comparison::pairs(
         inner,
         group,
         context,
@@ -52,20 +76,9 @@ pub(super) fn decision(
         now,
     );
     let ordinary = ordinary_selection(&scores, nodes, incumbent, baseline, &pairs);
-    if ordinary.index != pairs.reference {
-        pairs = comparison::pairs(
-            inner,
-            group,
-            context,
-            nodes,
-            (&scores, baseline),
-            ordinary.index,
-            now,
-        );
-    }
     Decision {
         scores,
-        evidence,
+        evidence: Vec::new(),
         pairs,
         baseline,
         ordinary,
@@ -182,15 +195,20 @@ impl ScorePolicyState {
                 .as_ref()
                 .is_some_and(|active| Arc::ptr_eq(active, authority))
         }) && inner.valid_groups.contains(group);
+        if !authorized {
+            return (
+                ordinary_decision(&inner, group, context, nodes, now)
+                    .ordinary
+                    .index,
+                None,
+            );
+        }
         let decision = decision(&inner, group, context, nodes, now);
         let snapshots = &decision.scores;
         let performance = decision.baseline;
         let ordinary = decision.ordinary;
         let cadence_key = SelectionCadenceKey::new(group, context);
         let history_key = SelectionHistoryKey::new(group, context);
-        if !authorized {
-            return (ordinary.index, None);
-        }
         inner
             .selection_counts
             .entry(cadence_key.clone())
