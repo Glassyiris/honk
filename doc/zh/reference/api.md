@@ -86,7 +86,7 @@ Token 模式不提供三个密码 endpoint，返回 `404 capability_not_supporte
 | `POST /api/v1/auth/login` | 相同 body → `200 {"token":"hnk1_…","expires_at":"..."}` | setup 前返回 `409 setup_required`；用户名或密码错误均返回 `401 invalid_credentials`。 |
 | `POST /api/v1/auth/logout` | `Authorization: Bearer <session>` → `204` | 无效或过期会话按普通 bearer 认证失败。 |
 
-`expires_at` 是 RFC 3339 UTC 时间戳。Setup 与 login 要求 `Content-Type: application/json`，不能携带 query string 或未知 JSON 字段，body 最多 4096 字节。用户名区分大小写，必须是匹配 `[A-Za-z0-9_.-]{1,64}` 的 ASCII。密码须为 12–128 个 Unicode 标量值，UTF-8 编码最多 512 字节。无效 JSON 或字段返回 `400 invalid_request`；缺少或使用其他 media type 返回 `415 unsupported_media_type`。
+`expires_at` 是 RFC 3339 UTC 时间戳。Setup 与 login 要求 `Content-Type: application/json`，不能携带 query string 或未知 JSON 字段，body 最多 4096 字节。用户名区分大小写，必须是匹配 `[A-Za-z0-9_.-]{1,64}` 的 ASCII。密码须为 8–128 个 Unicode 标量值，UTF-8 编码最多 512 字节。无效 JSON 或字段返回 `400 invalid_request`；缺少或使用其他 media type 返回 `415 unsupported_media_type`。
 
 Setup 只信任 accept socket 的对端地址，不读取 `Forwarded`、`X-Forwarded-For` 或其他 header。允许范围为 `127.0.0.0/8`、`::1`、RFC 1918、`fc00::/7`、`169.254.0.0/16` 及 `fe80::/10`；IPv4-mapped IPv6 按 IPv4 分类。其他对端在读取账户状态或处理凭据前返回 `403 permission_denied`。
 

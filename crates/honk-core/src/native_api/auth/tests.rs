@@ -46,6 +46,16 @@ fn record_round_trips_and_verifies_in_constant_shape() {
 }
 
 #[test]
+fn passwords_are_eight_to_128_characters() {
+    assert!(!valid_password("7 chars"));
+    assert!(valid_password("8 chars!"));
+    assert!(valid_password(&"x".repeat(128)));
+    assert!(!valid_password(&"x".repeat(129)));
+    // Counted in Unicode scalar values, so eight CJK characters are enough.
+    assert!(valid_password("八個字元的密碼好"));
+}
+
+#[test]
 fn record_parsing_rejects_unknown_shapes() {
     let mut json: serde_json::Value = serde_json::from_slice(
         &Record::create("a", "correct horse battery")

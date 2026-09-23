@@ -74,7 +74,7 @@ pub(crate) fn valid_username(username: &str) -> bool {
 
 pub(crate) fn valid_password(password: &str) -> bool {
     let scalars = password.chars().count();
-    (12..=128).contains(&scalars) && password.len() <= 512
+    (8..=128).contains(&scalars) && password.len() <= 512
 }
 
 /// The stored administrator: everything needed to verify a login, nothing that reveals the password.
@@ -643,7 +643,7 @@ fn invalid(id: &RequestId) -> ApiError {
     ApiError::new(
         StatusCode::BAD_REQUEST,
         ErrorCode::InvalidRequest,
-        "Credentials require a username and a password of 12 to 128 characters",
+        "Credentials require a username and a password of 8 to 128 characters",
         Some(id.0.clone()),
     )
 }

@@ -83,7 +83,7 @@ In token mode, the three password endpoints are unavailable with `404 capability
 | `POST /api/v1/auth/login` | Same body → `200 {"token":"hnk1_…","expires_at":"..."}` | `409 setup_required` before setup; `401 invalid_credentials` for either a wrong username or wrong password. |
 | `POST /api/v1/auth/logout` | `Authorization: Bearer <session>` → `204` | Invalid or expired sessions fail normal bearer authentication. |
 
-`expires_at` is an RFC 3339 UTC timestamp. Setup and login require `Content-Type: application/json`, no query string, no unknown JSON fields and a body of at most 4096 bytes. The username is case-sensitive ASCII matching `[A-Za-z0-9_.-]{1,64}`. The password is 12–128 Unicode scalar values and at most 512 UTF-8 bytes. Invalid JSON or fields return `400 invalid_request`; a missing or different media type returns `415 unsupported_media_type`.
+`expires_at` is an RFC 3339 UTC timestamp. Setup and login require `Content-Type: application/json`, no query string, no unknown JSON fields and a body of at most 4096 bytes. The username is case-sensitive ASCII matching `[A-Za-z0-9_.-]{1,64}`. The password is 8–128 Unicode scalar values and at most 512 UTF-8 bytes. Invalid JSON or fields return `400 invalid_request`; a missing or different media type returns `415 unsupported_media_type`.
 
 Setup trusts only the peer address from the accepted socket, never `Forwarded`, `X-Forwarded-For` or another header. It permits `127.0.0.0/8`, `::1`, RFC 1918, `fc00::/7`, `169.254.0.0/16` and `fe80::/10`; IPv4-mapped IPv6 is classified as IPv4. Other peers receive `403 permission_denied` before account-state or credential processing.
 
