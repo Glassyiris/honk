@@ -342,19 +342,71 @@ impl PairScan {
     }
 }
 
-/// Pairs every challenger with the reference in one scan; results follow `challengers`.
+/// Pairs every challenger with the reference; results follow `challengers`.
 fn compare_all(
     inner: &StateInner,
     group: &str,
     context: &ScoreSelectionContext,
-    (reference, reference_parent): (Uuid, Option<&Stats>),
+    reference: (Uuid, Option<&Stats>),
     challengers: &[(Uuid, Option<&Stats>)],
     now: Instant,
 ) -> Vec<PairEvidence> {
     let Some(origin) = inner.comparisons.origin else {
         return vec![PairEvidence::default(); challengers.len()];
     };
-    let mut scans: Vec<_> = challengers.iter().map(|_| PairScan::default()).collect();
+    let scan = |members: &[(Uuid, Option<&Stats>)], wanted: &dyn Fn(&Key) -> bool| {
+        let mut scans: Vec<_> = members.iter().map(|_| PairScan::default()).collect();
+        for_each_pair(
+            inner,
+            group,
+            context,
+            reference,
+            members,
+            wanted,
+            |slot, pair| {
+                scans[slot].add(context, pair, origin, now);
+            },
+        );
+        scans
+    };
+    let mut results = vec![None; challengers.len()];
+    // A metric-bearing exact pair decides the result, so only the rest need common targets.
+    if let (Some(family), Some(target)) = (context.target_family, context.target.as_ref()) {
+        let slot = super::evidence::probe_slot(context);
+        let exact_or_probe = |key: &Key| match key {
+            Key::Traffic(key) => key.family == family && key.target == *target,
+            Key::Probe { slot: probe, .. } => *probe == slot,
+        };
+        for (result, scan) in results.iter_mut().zip(scan(challengers, &exact_or_probe)) {
+            if scan.exact.is_some_and(|pair| {
+                pair.response.is_some() || pair.upload.is_some() || pair.download.is_some()
+            }) {
+                *result = Some(scan.finish());
+            }
+        }
+    }
+    let remaining: Vec<_> = (0..challengers.len())
+        .filter(|slot| results[*slot].is_none())
+        .collect();
+    if !remaining.is_empty() {
+        let members: Vec<_> = remaining.iter().map(|slot| challengers[*slot]).collect();
+        for (slot, scan) in remaining.into_iter().zip(scan(&members, &|_| true)) {
+            results[slot] = Some(scan.finish());
+        }
+    }
+    results.into_iter().map(Option::unwrap_or_default).collect()
+}
+
+/// Visits valid reference/challenger cells of each wanted cohort in store order.
+fn for_each_pair<'a>(
+    inner: &'a StateInner,
+    group: &str,
+    context: &ScoreSelectionContext,
+    (reference, reference_parent): (Uuid, Option<&Stats>),
+    challengers: &[(Uuid, Option<&Stats>)],
+    wanted: &dyn Fn(&Key) -> bool,
+    mut visit: impl FnMut(usize, (&'a Cell, &'a Cell)),
+) {
     let mut order: Vec<_> = challengers
         .iter()
         .enumerate()
@@ -370,6 +422,9 @@ fn compare_all(
             .unwrap_or(cells.len());
         let (cohort, rest) = cells.split_at(end);
         cells = rest;
+        if !wanted(&first.key) {
+            continue;
+        }
         let Some(left) = cohort
             .iter()
             .find(|cell| cell.key.node() == reference && cell.valid(inner, reference_parent))
@@ -381,12 +436,11 @@ fn compare_all(
             let first = order.partition_point(|(id, _)| *id < node);
             for &(_, slot) in order[first..].iter().take_while(|(id, _)| *id == node) {
                 if right.valid(inner, challengers[slot].1) {
-                    scans[slot].add(context, (left, right), origin, now);
+                    visit(slot, (left, right));
                 }
             }
         }
     }
-    scans.into_iter().map(PairScan::finish).collect()
 }
 
 fn global_stats<'a>(
