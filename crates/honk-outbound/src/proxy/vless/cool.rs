@@ -5,8 +5,8 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
@@ -148,14 +148,14 @@ struct WriterCommand {
 #[derive(Clone)]
 struct CarrierWriter {
     tx: mpsc::Sender<WriterCommand>,
-    failure: Arc<Mutex<Option<Failure>>>,
+    failure: Arc<OnceLock<Failure>>,
 }
 
 impl CarrierWriter {
     fn closed_failure(&self, message: &'static str) -> Failure {
         self.failure
-            .lock()
-            .clone()
+            .get()
+            .cloned()
             .unwrap_or_else(|| Failure::new(io::ErrorKind::BrokenPipe, message))
     }
 
@@ -373,18 +373,12 @@ impl VlessCoolSession {
     }
 
     fn fail(&self, failure: Failure) {
-        {
-            // Losing failures must not discard writer acknowledgements before the cause exists.
-            let mut terminal = self.writer.failure.lock();
-            if self
-                .state
-                .swap(SessionState::Closed as u8, Ordering::AcqRel)
-                == SessionState::Closed as u8
-            {
-                return;
-            }
-            *terminal = Some(failure.clone());
+        // Even a losing set waits for publication before acknowledgements can disappear.
+        if self.writer.failure.set(failure.clone()).is_err() {
+            return;
         }
+        self.state
+            .store(SessionState::Closed as u8, Ordering::Release);
         self.capacity.close();
         let children = std::mem::take(&mut *self.children.lock());
         for child in children.values() {
@@ -813,7 +807,7 @@ pub(crate) fn connect(
         zero_id_issued: AtomicBool::new(false),
         writer: CarrierWriter {
             tx,
-            failure: Arc::new(Mutex::new(None)),
+            failure: Arc::new(OnceLock::new()),
         },
         children: Mutex::new(HashMap::new()),
         ending_ids: Mutex::new(HashSet::new()),

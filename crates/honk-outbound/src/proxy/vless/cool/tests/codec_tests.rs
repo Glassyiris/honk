@@ -98,7 +98,7 @@ async fn missing_writer_ack_is_conservatively_committed() {
     let (tx, mut rx) = mpsc::channel(1);
     let writer = CarrierWriter {
         tx,
-        failure: Arc::new(Mutex::new(None)),
+        failure: Arc::new(OnceLock::new()),
     };
     let pending =
         tokio::spawn(async move { writer.send(Bytes::from_static(b"frame"), true).await });

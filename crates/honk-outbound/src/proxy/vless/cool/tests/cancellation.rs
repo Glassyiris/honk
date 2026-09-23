@@ -79,7 +79,7 @@ async fn stalled_carrier_writer_times_out() {
     let (tx, rx) = mpsc::channel(1);
     let writer = CarrierWriter {
         tx,
-        failure: Arc::new(Mutex::new(None)),
+        failure: Arc::new(OnceLock::new()),
     };
     let driver = tokio::spawn(run_writer(
         GatedFlushIo {
@@ -109,7 +109,7 @@ async fn competing_carrier_failures_preserve_pending_udp_send_and_tcp_flush_caus
             inner: client,
             gate: Arc::clone(&gate),
         }),
-        MAX_STREAMS_PER_SESSION,
+        2,
     );
     let mut tcp = open_tcp(
         Arc::clone(&session),
@@ -155,42 +155,44 @@ async fn competing_carrier_failures_preserve_pending_udp_send_and_tcp_flush_caus
             .is_err()
     );
 
-    let driver_stopped_before_publication = {
-        let session = Arc::clone(&session);
-        tokio::task::spawn_blocking(move || {
-            let drivers = session.tasks.lock().clone();
-            let _publication = session.writer.failure.lock();
-            // EOF and BrokenPipe now compete, while the queued UDP send and TCP
-            // flush can only be settled by the carrier's published terminal cause.
-            drop(wire);
-            gate.open();
-            let deadline = std::time::Instant::now() + Duration::from_secs(1);
-            while !drivers.iter().any(|driver| driver.is_finished())
-                && std::time::Instant::now() < deadline
-            {
-                std::thread::yield_now();
-            }
-            drivers.iter().any(|driver| driver.is_finished())
-        })
-        .await
-        .unwrap()
-    };
+    // Pause the winning reader failure after publication but before child fanout.
+    // The writer must then lose publication before dropping its queued acknowledgements.
+    let (entered, paused) = oneshot::channel();
+    let (release, resumed) = std::sync::mpsc::channel();
+    let waker = Waker::from(Arc::new(PauseWake {
+        entered: Mutex::new(Some(entered)),
+        release: Mutex::new(resumed),
+    }));
+    let capacity = session.capacity.acquire();
+    tokio::pin!(capacity);
     assert!(
-        !driver_stopped_before_publication,
-        "a losing carrier failure discarded queued acknowledgements before cause publication"
+        capacity
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
     );
+    drop(wire);
+    let paused = tokio::time::timeout(Duration::from_secs(2), paused).await;
+    if !matches!(paused, Ok(Ok(()))) {
+        let _ = release.send(());
+    }
+    paused
+        .expect("reader failure must publish its cause")
+        .unwrap();
+    gate.open();
 
-    let send_error = tokio::time::timeout(Duration::from_secs(2), &mut send)
-        .await
-        .expect("carrier EOF must settle the pending UDP send")
+    let sent = tokio::time::timeout(Duration::from_secs(2), &mut send).await;
+    let flushed = tokio::time::timeout(Duration::from_secs(2), tcp.flush()).await;
+    let received = tokio::time::timeout(Duration::from_secs(2), udp.recv_packet(&mut [0; 1])).await;
+    release.send(()).unwrap();
+    let send_error = sent
+        .expect("writer death must settle the pending UDP send before child fanout")
         .unwrap_err();
-    let flush_error = tokio::time::timeout(Duration::from_secs(2), tcp.flush())
-        .await
-        .expect("carrier EOF must settle the pending TCP flush")
+    let flush_error = flushed
+        .expect("writer death must settle the pending TCP flush before child fanout")
         .unwrap_err();
-    let recv_error = tokio::time::timeout(Duration::from_secs(2), udp.recv_packet(&mut [0; 1]))
-        .await
-        .expect("carrier failure must settle the UDP receiver")
+    let recv_error = received
+        .expect("failed UDP send must settle its receiver before child fanout")
         .unwrap_err();
     for error in [send_error, flush_error, recv_error] {
         assert_eq!(
@@ -199,10 +201,7 @@ async fn competing_carrier_failures_preserve_pending_udp_send_and_tcp_flush_caus
         );
         let kind = error.kind();
         let error = anyhow::Error::new(error);
-        assert!(matches!(
-            kind,
-            io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe
-        ));
+        assert_eq!(kind, io::ErrorKind::UnexpectedEof);
         assert_eq!(
             error
                 .root_cause()
