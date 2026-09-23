@@ -288,6 +288,21 @@ impl Store {
         self.key_bytes -= self.cells.remove(index).key.heap_bytes();
     }
 
+    /// One order-preserving pass; returns how many cells were dropped.
+    fn retain(&mut self, mut keep: impl FnMut(&Cell) -> bool) -> u64 {
+        let (mut removed, mut bytes) = (0, 0);
+        self.cells.retain(|cell| {
+            let kept = keep(cell);
+            if !kept {
+                removed += 1;
+                bytes += cell.key.heap_bytes();
+            }
+            kept
+        });
+        self.key_bytes -= bytes;
+        removed
+    }
+
     pub(in crate::group::score) fn invalidate_probe(
         &mut self,
         group: &str,
@@ -296,17 +311,11 @@ impl Store {
         scope: u64,
         slot: usize,
     ) {
-        let mut index = 0;
-        while index < self.cells.len() {
-            if matches!(&self.cells[index].key, Key::Probe { key, scope: old_scope, slot: old_slot, .. }
+        self.retain(|cell| {
+            !matches!(&cell.key, Key::Probe { key, scope: old_scope, slot: old_slot, .. }
                 if key.group == group && key.network == network && key.node_id == node
                     && *old_scope == scope && *old_slot == slot)
-            {
-                self.remove(index);
-            } else {
-                index += 1;
-            }
-        }
+        });
     }
 
     fn record(
@@ -326,16 +335,10 @@ impl Store {
             && stats.probes[*slot].scope != *scope
         {
             // Stats still holds the previous scope until this observation is published.
-            let mut index = 0;
-            while index < self.cells.len() {
-                if matches!(&self.cells[index].key, Key::Probe { key: old, slot: old_slot, .. }
+            self.retain(|cell| {
+                !matches!(&cell.key, Key::Probe { key: old, slot: old_slot, .. }
                     if old == key && old_slot == slot)
-                {
-                    self.remove(index);
-                } else {
-                    index += 1;
-                }
-            }
+            });
         }
         if reporter == 0 || invalidated_through.is_some_and(|at| now <= at) {
             return;
@@ -360,18 +363,12 @@ impl Store {
         }
         let mut index = self.cells.binary_search_by(|cell| cell.key.cmp(&key));
         if index.is_err() {
-            let mut position = 0;
-            while position < self.cells.len() {
-                let cell = &self.cells[position];
-                if cell.key.timing().is_none_or(|timing| {
-                    now.saturating_duration_since(cell.touched) >= timing.freshness
-                }) {
-                    self.remove(position);
-                    self.expired = self.expired.saturating_add(1);
-                } else {
-                    position += 1;
-                }
-            }
+            let expired = self.retain(|cell| {
+                cell.key.timing().is_some_and(|timing| {
+                    now.saturating_duration_since(cell.touched) < timing.freshness
+                })
+            });
+            self.expired = self.expired.saturating_add(expired);
             if self.cells.len() == MAX_CELLS
                 && let Some((oldest, _)) = self
                     .cells
