@@ -481,14 +481,12 @@ fn stream_request(
 }
 
 fn h2_io(error: h2::Error) -> io::Error {
-    if error.is_io() || error.is_go_away() || !error.is_reset() {
-        io::Error::new(
-            io::ErrorKind::ConnectionReset,
-            crate::proxy::NodeFailure(error.into()),
-        )
+    let cause: Box<dyn std::error::Error + Send + Sync> = if error.is_io() || error.is_go_away() {
+        Box::new(crate::proxy::NodeFailure(error.into()))
     } else {
-        io::Error::new(io::ErrorKind::ConnectionReset, error)
-    }
+        Box::new(error)
+    };
+    io::Error::new(io::ErrorKind::ConnectionReset, cause)
 }
 
 async fn send_owned(send: &mut h2::SendStream<Bytes>, mut data: Bytes) -> io::Result<()> {

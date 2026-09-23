@@ -72,7 +72,7 @@ async fn reused_v2_session_requires_synack_within_deadline() {
         "a received SYNACK keeps the session live"
     );
 
-    let _third = session
+    let mut third = session
         .open_stream_direct(
             vec![0x01, 3, 3, 3, 3, 0, 80],
             session.try_reserve().unwrap(),
@@ -89,11 +89,10 @@ async fn reused_v2_session_requires_synack_within_deadline() {
         session.is_closed(),
         "a missing SYNACK retires the reused session"
     );
-    assert!(
-        session
-            .terminal_error
-            .get()
-            .is_some_and(|error| error.to_string().contains("SYNACK timed out"))
+    let error = third.read_u8().await.unwrap_err();
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&error),
+        crate::group::ScoreOutcome::NodeFailure
     );
     drop((first, second));
 }
@@ -259,7 +258,15 @@ async fn synack_timeout_on_active_session_resets_only_the_stream() {
         )
         .await
         .unwrap();
-    for _ in 0..4 {
+    let uot = Arc::clone(&session)
+        .open_packet(
+            session.try_reserve().unwrap(),
+            "192.0.2.1:53".parse().unwrap(),
+            None,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("UoT service stream must open"));
+    for _ in 0..6 {
         read_frame(&mut server).await.unwrap();
     }
     tokio::task::yield_now().await;
@@ -280,13 +287,26 @@ async fn synack_timeout_on_active_session_resets_only_the_stream() {
     let mut buf = [0u8; 16];
     let err = second.read(&mut buf).await.unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
-    assert!(err.to_string().contains("not acknowledged"), "{err}");
     assert_eq!(
         crate::group::ScoreOutcome::from_io_error(&err),
+        crate::group::ScoreOutcome::TargetFailure
+    );
+    let service_error = uot.recv_packet(&mut buf).await.unwrap_err();
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&service_error),
         crate::group::ScoreOutcome::NodeFailure
     );
     let n = first.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"ok", "the sibling stream keeps its data");
+    let (cmd, sid, _) = read_frame(&mut server).await.unwrap();
+    assert_eq!((cmd, sid), (CMD_FIN, second.sid));
+    first.write_all(b"still live").await.unwrap();
+    let (cmd, sid, payload) = read_frame(&mut server).await.unwrap();
+    assert_eq!(
+        (cmd, sid, payload.as_slice()),
+        (CMD_PSH, first.sid, b"still live".as_slice())
+    );
+    session.close();
 }
 
 /// Dropping a stream whose open was never answered must settle its pending

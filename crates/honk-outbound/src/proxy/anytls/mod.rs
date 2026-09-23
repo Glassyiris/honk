@@ -463,20 +463,16 @@ impl AnyTlsSession {
                 let budget_waiting = session.inbound_budget_epoch.load(Ordering::SeqCst) & 1 != 0;
                 if budget_waiting || session.rx_frame_seq.load(Ordering::Relaxed) > activity_marker
                 {
-                    // Frames kept arriving through the window: the server is
-                    // alive but never acknowledged this open. Reset only this
-                    // stream — failing the session would kill every healthy
-                    // sibling with it.
+                    // SYNACK follows the target dial; UoT instead opens the
+                    // proxy's magic service, so its failure stays node-scoped.
+                    let error = anyhow::anyhow!("stream open not acknowledged");
+                    let error = if session.tcp_sink_is_live(sid) {
+                        anyhow::Error::new(crate::proxy::TargetFailure(error))
+                    } else {
+                        anyhow::Error::new(crate::proxy::NodeFailure(error))
+                    };
                     session
-                        .dispatch_error(
-                            sid,
-                            crate::SharedError::new(
-                                crate::proxy::NodeFailure(anyhow::anyhow!(
-                                    "stream open not acknowledged"
-                                ))
-                                .into(),
-                            ),
-                        )
+                        .dispatch_error(sid, crate::SharedError::new(error))
                         .await;
                 } else {
                     session.fail(anyhow::anyhow!(

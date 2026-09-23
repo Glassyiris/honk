@@ -336,12 +336,15 @@ async fn rejected_response_header_surfaces_as_stream_error() {
         crate::group::ScoreOutcome::NodeFailure
     );
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    let error = anyhow::Error::new(error);
+    let cause = error.root_cause().to_string();
+    assert_eq!(format!("{error:#}").matches(&cause).count(), 1);
 }
 
 #[derive(Debug)]
-struct ResetOnEof(tokio::io::DuplexStream);
+struct ErrorOnEof(tokio::io::DuplexStream, io::ErrorKind);
 
-impl AsyncRead for ResetOnEof {
+impl AsyncRead for ErrorOnEof {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -350,14 +353,18 @@ impl AsyncRead for ResetOnEof {
         let before = buf.filled().len();
         match Pin::new(&mut self.0).poll_read(cx, buf) {
             Poll::Ready(Ok(())) if buf.filled().len() == before && buf.remaining() != 0 => {
-                Poll::Ready(Err(io::Error::from_raw_os_error(libc::ECONNRESET)))
+                Poll::Ready(Err(if self.1 == io::ErrorKind::ConnectionReset {
+                    io::Error::from_raw_os_error(libc::ECONNRESET)
+                } else {
+                    self.1.into()
+                }))
             }
             result => result,
         }
     }
 }
 
-impl AsyncWrite for ResetOnEof {
+impl AsyncWrite for ErrorOnEof {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -376,11 +383,23 @@ impl AsyncWrite for ResetOnEof {
 }
 
 #[tokio::test]
-async fn response_header_transport_failures_keep_io_kind_and_node_cause() {
-    for kind in [io::ErrorKind::UnexpectedEof, io::ErrorKind::ConnectionReset] {
+async fn response_header_eof_and_transport_failures_keep_scope_and_cause() {
+    for (prefix_len, failure) in [
+        (0, None),
+        (3, None),
+        (0, Some(io::ErrorKind::ConnectionReset)),
+        (3, Some(io::ErrorKind::ConnectionReset)),
+        (0, Some(io::ErrorKind::UnexpectedEof)),
+    ] {
+        let kind = failure.unwrap_or(io::ErrorKind::UnexpectedEof);
+        let expected = if prefix_len == 0 && failure.is_none() {
+            crate::group::ScoreOutcome::Io(kind)
+        } else {
+            crate::group::ScoreOutcome::NodeFailure
+        };
         let (physical, mut peer) = tokio::io::duplex(4096);
-        let physical: Box<dyn AsyncReadWrite> = if kind == io::ErrorKind::ConnectionReset {
-            Box::new(ResetOnEof(physical))
+        let physical: Box<dyn AsyncReadWrite> = if let Some(kind) = failure {
+            Box::new(ErrorOnEof(physical, kind))
         } else {
             Box::new(physical)
         };
@@ -390,8 +409,8 @@ async fn response_header_transport_failures_keep_io_kind_and_node_cause() {
             VmessHandler::perform_handshake(uuid.as_bytes(), physical, target, None).unwrap();
 
         peer.read_exact(&mut [0]).await.unwrap();
-        peer.write_all(&[0x5a; 3]).await.unwrap();
-        // Keep the request side open so the failure comes from the partial response header.
+        peer.write_all(&[0x5a; 3][..prefix_len]).await.unwrap();
+        // Leave the request side open so only the response read can fail.
         peer.shutdown().await.unwrap();
 
         let error = tokio::time::timeout(
@@ -400,17 +419,16 @@ async fn response_header_transport_failures_keep_io_kind_and_node_cause() {
         )
         .await
         .expect("header transport failure must settle the returned stream")
-        .expect_err("a partial response header must not read as clean EOF");
+        .expect_err("an absent or partial response header must not read as clean EOF");
         assert_eq!(error.kind(), kind);
-        assert_eq!(
-            crate::group::ScoreOutcome::from_io_error(&error),
-            crate::group::ScoreOutcome::NodeFailure
-        );
+        assert_eq!(crate::group::ScoreOutcome::from_io_error(&error), expected);
         let error = anyhow::Error::new(error);
         let cause = error.root_cause().downcast_ref::<io::Error>().unwrap();
         assert_eq!(cause.kind(), kind);
         if kind == io::ErrorKind::ConnectionReset {
             assert_eq!(cause.raw_os_error(), Some(libc::ECONNRESET));
         }
+        let cause = cause.to_string();
+        assert_eq!(format!("{error:#}").matches(&cause).count(), 1);
     }
 }
