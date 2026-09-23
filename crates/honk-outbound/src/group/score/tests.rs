@@ -196,7 +196,15 @@ fn decision_at(
         .collect::<Vec<_>>();
     let baseline = ranking::performance_baseline(&scores);
     let evidence = super::comparison::node_evidence(inner, "score", target, &refs, &scores, now);
-    let pairs = super::comparison::pairs(inner, "score", target, &refs, &scores, reference, now);
+    let pairs = super::comparison::pairs(
+        inner,
+        "score",
+        target,
+        &refs,
+        (&scores, baseline),
+        reference,
+        now,
+    );
     let ordinary = ranking::ordinary_selection(&scores, &refs, Some(reference), baseline, &pairs);
     ranking::Decision {
         scores,

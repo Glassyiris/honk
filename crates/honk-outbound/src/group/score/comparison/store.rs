@@ -273,6 +273,17 @@ impl Store {
         size_of::<Self>() + MAX_CELLS * (size_of::<Cell>() + MAX_KEY_BYTES)
     }
 
+    /// Cells are ordered by group, then network.
+    pub(super) fn scope(&self, group: &str, network: SelectionNetwork) -> &[Cell] {
+        fn key(cell: &Cell) -> (&str, u8) {
+            (cell.key.group(), cell.key.network() as u8)
+        }
+        let wanted = (group, network as u8);
+        let start = self.cells.partition_point(|cell| key(cell) < wanted);
+        let len = self.cells[start..].partition_point(|cell| key(cell) == wanted);
+        &self.cells[start..start + len]
+    }
+
     fn remove(&mut self, index: usize) {
         self.key_bytes -= self.cells.remove(index).key.heap_bytes();
     }

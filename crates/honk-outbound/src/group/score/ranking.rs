@@ -45,10 +45,26 @@ pub(super) fn decision(
         .filter(|history| history.selections > 0)
         .and_then(|history| nodes.iter().position(|node| node.id == history.current));
     let reference = incumbent.unwrap_or_else(|| best_index(&scores, nodes, baseline).index);
-    let mut pairs = comparison::pairs(inner, group, context, nodes, &scores, reference, now);
+    let mut pairs = comparison::pairs(
+        inner,
+        group,
+        context,
+        nodes,
+        (&scores, baseline),
+        reference,
+        now,
+    );
     let ordinary = ordinary_selection(&scores, nodes, incumbent, baseline, &pairs);
     if ordinary.index != pairs.reference {
-        pairs = comparison::pairs(inner, group, context, nodes, &scores, ordinary.index, now);
+        pairs = comparison::pairs(
+            inner,
+            group,
+            context,
+            nodes,
+            (&scores, baseline),
+            ordinary.index,
+            now,
+        );
     }
     Decision {
         scores,

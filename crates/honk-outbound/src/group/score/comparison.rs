@@ -94,6 +94,7 @@ struct Accumulator {
     first: Option<Instant>,
     last: Option<Instant>,
     reporters: [u64; BLOCKS * REPORTERS],
+    distinct: usize,
 }
 
 impl Accumulator {
@@ -110,16 +111,17 @@ impl Accumulator {
             self.last = Some(self.last.map_or(at, |old| old.max(at)));
         }
         for id in bucket.reporters.into_iter().filter(|id| *id != 0) {
-            if !self.reporters.contains(&id)
-                && let Some(slot) = self.reporters.iter_mut().find(|value| **value == 0)
+            if self.distinct < self.reporters.len()
+                && !self.reporters[..self.distinct].contains(&id)
             {
-                *slot = id;
+                self.reporters[self.distinct] = id;
+                self.distinct += 1;
             }
         }
     }
 
     fn reporters(&self) -> usize {
-        self.reporters.iter().filter(|id| **id != 0).count()
+        self.distinct
     }
 }
 
@@ -271,10 +273,8 @@ fn compare(
     let mut pending: Option<&Cell> = None;
     let parents = [incumbent_parent, candidate_parent];
     // Sorted cohorts allow a single bounded store scan, without an all-pairs index.
-    for cell in &inner.comparisons.cells {
-        if cell.key.group() != group
-            || cell.key.network() != context.network
-            || ![incumbent, candidate].contains(&cell.key.node())
+    for cell in inner.comparisons.scope(group, context.network) {
+        if ![incumbent, candidate].contains(&cell.key.node())
             || !cell.valid(inner, parents[usize::from(cell.key.node() == candidate)])
         {
             continue;
@@ -382,6 +382,30 @@ fn global_stats<'a>(
     })
 }
 
+fn timed(
+    buckets: &[Bucket; BLOCKS],
+    origin: Instant,
+    now: Instant,
+    timing: Timing,
+) -> Option<TimedMetric> {
+    metric_pair(
+        buckets,
+        buckets,
+        origin,
+        now,
+        timing,
+        u8::MAX,
+        std::collections::hash_map::DefaultHasher::new(),
+    )
+    .map(|pair| TimedMetric {
+        value: pair.incumbent,
+        reporters: pair.reporters,
+        observed_at: pair.oldest_at,
+        latest_at: pair.latest_at,
+        expires_at: pair.expires_at,
+    })
+}
+
 pub(super) fn node_evidence(
     inner: &StateInner,
     group: &str,
@@ -396,41 +420,43 @@ pub(super) fn node_evidence(
         family: None,
         node_id: Uuid::nil(),
     };
-    nodes
+    let mut family_key = AggregateKey {
+        family: context.target_family,
+        ..parent_key.clone()
+    };
+    let mut exact_key =
+        context
+            .target_family
+            .zip(context.target.clone())
+            .map(|(family, target)| ExactKey {
+                group: group.to_owned(),
+                network: context.network,
+                family,
+                target,
+                node_id: Uuid::nil(),
+            });
+    let mut parents = Vec::with_capacity(nodes.len());
+    let mut evidence: Vec<_> = nodes
         .iter()
-        .zip(snapshots)
-        .map(|(node, snapshot)| {
+        .map(|node| {
             parent_key.node_id = node.id;
             let parent = inner.aggregate.peek(&parent_key);
-            let stamp = if let (Some(family), Some(target)) =
-                (context.target_family, context.target.as_ref())
-            {
+            parents.push(parent);
+            let stamp = if let Some(key) = exact_key.as_mut() {
+                key.node_id = node.id;
                 inner
                     .exact
-                    .peek(&ExactKey {
-                        group: group.to_owned(),
-                        network: context.network,
-                        family,
-                        target: target.clone(),
-                        node_id: node.id,
-                    })
+                    .peek(key)
                     .and_then(|stats| CellStamp::current(stats, parent))
             } else if context.target.is_none() {
-                inner
-                    .aggregate
-                    .peek(&AggregateKey {
-                        group: group.to_owned(),
-                        network: context.network,
-                        family: context.target_family,
-                        node_id: node.id,
-                    })
-                    .and_then(|stats| {
-                        if context.target_family.is_none() {
-                            Some(CellStamp::own(stats))
-                        } else {
-                            CellStamp::current(stats, parent)
-                        }
-                    })
+                family_key.node_id = node.id;
+                inner.aggregate.peek(&family_key).and_then(|stats| {
+                    if context.target_family.is_none() {
+                        Some(CellStamp::own(stats))
+                    } else {
+                        CellStamp::current(stats, parent)
+                    }
+                })
             } else {
                 None
             };
@@ -446,59 +472,54 @@ pub(super) fn node_evidence(
             evidence.failed_at = evidence
                 .failed_at
                 .max(parent.and_then(|parent| parent.failed_at));
-            let Some(origin) = inner.comparisons.origin else {
-                return evidence;
-            };
-            for cell in &inner.comparisons.cells {
-                if cell.key.group() != group
-                    || cell.key.network() != context.network
-                    || cell.key.node() != node.id
-                    || !cell.valid(inner, parent)
-                {
-                    continue;
-                }
-                let Some(timing) = cell.key.timing() else {
-                    continue;
-                };
-                let metric = |buckets: &[Bucket; BLOCKS]| {
-                    metric_pair(
-                        buckets,
-                        buckets,
-                        origin,
-                        now,
-                        timing,
-                        u8::MAX,
-                        std::collections::hash_map::DefaultHasher::new(),
-                    )
-                    .map(|pair| TimedMetric {
-                        value: pair.incumbent,
-                        reporters: pair.reporters,
-                        observed_at: pair.oldest_at,
-                        latest_at: pair.latest_at,
-                        expires_at: pair.expires_at,
-                    })
-                };
-                match &cell.key {
-                    Key::Traffic(key)
-                        if Some(key.family) == context.target_family
-                            && Some(&key.target) == context.target.as_ref() =>
-                    {
-                        evidence.response = metric(&cell.metrics[0]);
-                        evidence.upload = metric(&cell.metrics[1]);
-                        evidence.download = metric(&cell.metrics[2]);
-                    }
-                    Key::Probe { slot, scope, .. }
-                        if *slot == super::evidence::probe_slot(context)
-                            && *scope == snapshot.probe_scope =>
-                    {
-                        evidence.probe = metric(&cell.metrics[0]);
-                    }
-                    _ => {}
-                }
-            }
             evidence
         })
-        .collect()
+        .collect();
+    let Some(origin) = inner.comparisons.origin else {
+        return evidence;
+    };
+    let mut order: Vec<_> = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id, index))
+        .collect();
+    order.sort_unstable();
+    let slot = super::evidence::probe_slot(context);
+    // One scope pass; each node still sees its own cells in store order.
+    for cell in inner.comparisons.scope(group, context.network) {
+        let wanted = match &cell.key {
+            Key::Traffic(key) => {
+                Some(key.family) == context.target_family
+                    && Some(&key.target) == context.target.as_ref()
+            }
+            Key::Probe {
+                slot: cell_slot, ..
+            } => *cell_slot == slot,
+        };
+        let Some(timing) = cell.key.timing().filter(|_| wanted) else {
+            continue;
+        };
+        let node = cell.key.node();
+        let first = order.partition_point(|(id, _)| *id < node);
+        for &(_, index) in order[first..].iter().take_while(|(id, _)| *id == node) {
+            if !cell.valid(inner, parents[index]) {
+                continue;
+            }
+            let evidence = &mut evidence[index];
+            match &cell.key {
+                Key::Traffic(_) => {
+                    evidence.response = timed(&cell.metrics[0], origin, now, timing);
+                    evidence.upload = timed(&cell.metrics[1], origin, now, timing);
+                    evidence.download = timed(&cell.metrics[2], origin, now, timing);
+                }
+                Key::Probe { scope, .. } if *scope == snapshots[index].probe_scope => {
+                    evidence.probe = timed(&cell.metrics[0], origin, now, timing);
+                }
+                Key::Probe { .. } => {}
+            }
+        }
+    }
+    evidence
 }
 
 pub(super) fn pairs(
@@ -506,27 +527,27 @@ pub(super) fn pairs(
     group: &str,
     context: &ScoreSelectionContext,
     nodes: &[&Node],
-    snapshots: &[ScoreSnapshot],
+    (snapshots, baseline): (&[ScoreSnapshot], super::PerformanceBaseline),
     reference: usize,
     now: Instant,
 ) -> PairCohort {
-    let baseline = super::ranking::performance_baseline(snapshots);
-    let mut proposals = [None; MAX_CHALLENGERS];
+    let mut proposals: [Option<(usize, f64)>; MAX_CHALLENGERS] = [None; MAX_CHALLENGERS];
     for (index, score) in snapshots.iter().enumerate() {
         if index == reference || !normal_eligible(score, baseline) {
             continue;
         }
+        let value = utility(score, baseline);
         let position = proposals.iter().position(|entry| {
-            entry.is_none_or(|other: usize| {
-                utility(score, baseline)
-                    .total_cmp(&utility(&snapshots[other], baseline))
+            entry.is_none_or(|(other, other_value)| {
+                value
+                    .total_cmp(&other_value)
                     .then_with(|| nodes[other].id.cmp(&nodes[index].id))
                     == Ordering::Greater
             })
         });
         if let Some(position) = position {
             proposals[position..].rotate_right(1);
-            proposals[position] = Some(index);
+            proposals[position] = Some((index, value));
         }
     }
     let mut parent_key = AggregateKey {
@@ -538,7 +559,7 @@ pub(super) fn pairs(
     let mut members = [(Uuid::nil(), None); MAX_CHALLENGERS + 1];
     members[0] = (parent_key.node_id, inner.aggregate.peek(&parent_key));
     let mut count = 0;
-    for index in proposals.iter().flatten() {
+    for (index, _) in proposals.iter().flatten() {
         count += 1;
         parent_key.node_id = nodes[*index].id;
         members[count] = (parent_key.node_id, inner.aggregate.peek(&parent_key));
@@ -547,7 +568,7 @@ pub(super) fn pairs(
         reference,
         joint: None,
         pairs: std::array::from_fn(|slot| {
-            proposals[slot].map(|index| {
+            proposals[slot].map(|(index, _)| {
                 (
                     index,
                     compare(inner, group, context, members[0], members[slot + 1], now),
@@ -606,7 +627,7 @@ fn joint_pairs(
     }; MAX_CHALLENGERS];
     let mut targets = 0;
     let mut partial = false;
-    let mut cells = inner.comparisons.cells.as_slice();
+    let mut cells = inner.comparisons.scope(group, context.network);
     while let Some(first) = cells.first() {
         let end = cells
             .iter()
@@ -614,9 +635,6 @@ fn joint_pairs(
             .unwrap_or(cells.len());
         let (current, rest) = cells.split_at(end);
         cells = rest;
-        if first.key.group() != group || first.key.network() != context.network {
-            continue;
-        }
         let eligible = match (&first.key, basis) {
             (Key::Traffic(key), Basis::ExactTarget) => {
                 Some(key.family) == context.target_family
@@ -745,10 +763,14 @@ pub(super) fn response_progress(
             stamp.invalidated_through,
         )
             .hash(&mut identity);
-        cells[side] = inner.comparisons.cells.iter().find(|cell| {
-            matches!(&cell.key, Key::Traffic(current) if current == &key)
-                && cell.valid(inner, Some(parent))
-        });
+        cells[side] = inner
+            .comparisons
+            .scope(group, context.network)
+            .iter()
+            .find(|cell| {
+                matches!(&cell.key, Key::Traffic(current) if current == &key)
+                    && cell.valid(inner, Some(parent))
+            });
     }
     let mut counts = [0; 2];
     if let (Some(origin), [Some(left), Some(right)]) = (inner.comparisons.origin, cells) {
