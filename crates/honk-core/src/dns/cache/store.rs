@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use super::service::remove_positive;
 use super::{
     CacheKey, CacheSlot, CacheValue, CachedEntry, DnsCacheService, NegativeCacheHit, NegativeEntry,
     PublicationEpoch, lock,
@@ -93,7 +94,7 @@ impl DnsCacheService {
         } else {
             let (positive, clear_positive) = positive;
             if clear_positive {
-                shard.remove_positive(&key);
+                remove_positive(&mut shard, &key);
             }
             positive.unwrap_or(ExactLookup::Miss)
         };
@@ -138,7 +139,7 @@ impl DnsCacheService {
             None => (None, false),
         };
         if clear_positive {
-            shard.remove_positive(key);
+            remove_positive(&mut shard, key);
         }
         if result.is_some() {
             self.counters.hits.fetch_add(1, Ordering::Relaxed);
@@ -287,9 +288,8 @@ impl DnsCacheService {
             return None;
         }
         let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
-        shard
-            .put(key, CacheValue::positive(entry, revision))
-            .then_some(revision)
+        shard.put(key, CacheValue::positive(entry, revision));
+        Some(revision)
     }
 
     #[cfg(test)]
@@ -432,16 +432,14 @@ impl DnsCacheService {
             return None;
         }
         if refreshing.is_some() && rcode == 3 {
-            shard.remove_positive(&key);
+            remove_positive(&mut shard, &key);
         }
         let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
         if let Some(value) = shard.get_mut(&key) {
             value.negative = Some(negative);
             value.revision = revision;
         } else {
-            if !shard.put(key, CacheValue::negative(negative, revision)) {
-                return None;
-            }
+            shard.put(key, CacheValue::negative(negative, revision));
         }
         Some(revision)
     }

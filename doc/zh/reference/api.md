@@ -212,6 +212,8 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 名称、类型及过期筛选在快照字节准入和复制之前完成；未选中的缓存记录不消耗本次快照预算。负应答优先级和过期筛选使用同一个观测时刻。
 
+每页还带 `usage {entries, entry_capacity}`，描述快照时刻的整个运行时缓存，不受过滤器影响。`entry_capacity` 为 `max_cache_size` 钳制到 1–100,000 后的值。两个值均为十进制字符串，在所有分片同时加锁时读取；同一快照的后续页重复相同的值。淘汰按分片进行，因此单个热点分片可能已在淘汰，而合计值仍显示有余量。`usage.entries` 还计入 `total` 不包含的过期记录与非 exact-key 记录。
+
 获准访问的匿名 loopback 请求与 bearer 认证请求具有相同的规则读取和路由模拟权限。`POST /routing/trace` 仅支持 `resolve=none`，返回 `mode:simulation`；`live` 为 422。模拟固定当前 compiled router/config/generation，不查询 DNS、不探测、不推进组选择、不建立连接；缺失输入保留 `indeterminate/missing_inputs`，不能视为历史 flow 或真实转发承诺。上限为 1 个地址、256 个规则/条件 steps、5 秒和每分钟 principal/global 各 30 次。`GET /rules` 返回含 fallback 的完整当前字典，最多 4096 行，超限拒绝而不截断。规则 ID 与用户态捕获证据共用 generation-scoped 身份；真实 parser 来源可用时给出 `source_id/line/column`，file 与该来源的入口相对 `path` 一致，否则 source 为 null。历史 flow 不从当前字典重建，内核 final provenance 仍可为 unknown；编辑应使用 source ID，不猜私有路径。
 
 对已接受 `.dae` 配置中的规则，包括含凭据来源的规则，`/rules` 与 `/routing/trace` 的规则 `expression` 保留编写时的条件值（包括 geosite/geoip 名称、否定和带引号参数），移除注释和出站子句。Trace 的逐条件表达式按实际编译后顺序以 dae 写法显示配置值，不加引号：普通域名候选与 geosite 分属不同条件，目标 IP 与 geoip 候选共用一个条件。监听凭据值仍被遮蔽；普通条件文本无需写权限即可读取，`config_content` 不产生作用。没有已接受来源元数据的规则显示编译后条件值，来源保持 null。编译后展示反映规范化的谓词，不等同于原始编写语法，也不展开 geodata。Trace 的展示元数据与决策固定在同一已接受代次。磁盘编辑只有在 reload 被接受后才更新两种响应；reload 被拒绝时保留旧表达式。历史 flow 保留各自代次捕获的有界编译后值，包括程序内构造路由器的值。

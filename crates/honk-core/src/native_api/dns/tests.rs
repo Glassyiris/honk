@@ -118,6 +118,10 @@ async fn cache_snapshot_filters_before_budget_admission_and_freezes_selected_pag
     let (status, first) = cache_page(&state, filters).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(first["total"], 2);
+    assert_eq!(
+        first["usage"],
+        json!({"entries":"322","entry_capacity":"8192"})
+    );
     assert_eq!(first["entries"][0]["entry_id"], expected_ids[0]);
     assert_eq!(first["entries"][0]["type"], "A");
     let cursor = first["next_cursor"].as_str().unwrap();
@@ -127,6 +131,7 @@ async fn cache_snapshot_filters_before_budget_admission_and_freezes_selected_pag
     assert_eq!(second["total"], 2);
     assert_eq!(second["entries"][0]["entry_id"], expected_ids[1]);
     assert_eq!(second["observed_at"], first["observed_at"]);
+    assert_eq!(second["usage"], first["usage"]);
     assert!(second["next_cursor"].is_null());
     assert_eq!(
         cache_page(

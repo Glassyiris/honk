@@ -152,6 +152,7 @@ mod key;
 mod maintenance {
     use std::time::Instant;
 
+    use super::service::remove_positive;
     use super::{CacheSlot, CachedEntry, DnsCacheService, lock};
 
     impl DnsCacheService {
@@ -208,7 +209,7 @@ mod maintenance {
                     .map(|(key, _)| key.clone())
                     .collect();
                 for key in expired {
-                    shard.remove_positive(&key);
+                    remove_positive(&mut shard, &key);
                 }
             }
             self.purge_expired_negatives();
@@ -357,12 +358,12 @@ mod storage {
 }
 mod store;
 
-#[cfg(any(feature = "native-api", test))]
-pub(crate) use control::CacheInspectionError;
 #[cfg(feature = "native-api")]
 pub(crate) use control::ExactCacheEntry;
 #[cfg(any(feature = "native-api", test))]
 pub(crate) use control::question_matches;
+#[cfg(any(feature = "native-api", test))]
+pub(crate) use control::{CacheInspection, CacheInspectionError, CacheUsage};
 pub(crate) use control::{CacheInvalidation, CacheMutation};
 pub use counters::CacheCounters;
 pub(crate) use key::{CacheKey, KeyIdentity, OperationKind};
