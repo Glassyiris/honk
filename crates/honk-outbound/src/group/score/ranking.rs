@@ -33,10 +33,7 @@ pub(super) fn decision(
     nodes: &[&Node],
     now: Instant,
 ) -> Decision {
-    let scores: Vec<_> = nodes
-        .iter()
-        .map(|node| score_snapshot(inner, group, context, node.id, now))
-        .collect();
+    let scores = score_snapshots(inner, group, context, nodes.iter().map(|node| node.id), now);
     let baseline = performance_baseline(&scores);
     let evidence = comparison::node_evidence(inner, group, context, nodes, &scores, now);
     let incumbent = inner
@@ -522,6 +519,7 @@ fn mark_selected(
     }
 }
 
+#[cfg(test)]
 pub(super) fn score_snapshot(
     inner: &StateInner,
     group: &str,
@@ -529,20 +527,32 @@ pub(super) fn score_snapshot(
     node_id: Uuid,
     now: Instant,
 ) -> ScoreSnapshot {
-    let layer = |family| {
-        inner.aggregate.peek(&AggregateKey {
-            group: group.to_string(),
+    score_snapshots(inner, group, context, [node_id], now).remove(0)
+}
+
+pub(super) fn score_snapshots(
+    inner: &StateInner,
+    group: &str,
+    context: &ScoreSelectionContext,
+    nodes: impl IntoIterator<Item = Uuid>,
+    now: Instant,
+) -> Vec<ScoreSnapshot> {
+    let mut layer = AggregateKey {
+        group: group.to_owned(),
+        network: context.network,
+        family: None,
+        node_id: Uuid::nil(),
+    };
+    let mut exact = context
+        .target_family
+        .zip(context.target.clone())
+        .map(|(family, target)| ExactKey {
+            group: group.to_owned(),
             network: context.network,
             family,
-            node_id,
-        })
-    };
-    let global_stats = layer(None);
-    let mut score = global_stats.map_or_else(
-        || snapshot(&Stats::default(), now),
-        |stats| snapshot(stats, now),
-    );
-    score.node_failure = score.unresolved_failure;
+            target,
+            node_id: Uuid::nil(),
+        });
     let scoped = |stamp: CellStamp<'_>| {
         let stats = stamp.stats;
         let mut value = snapshot(stats, now);
@@ -553,88 +563,103 @@ pub(super) fn score_snapshot(
         }
         value
     };
-    if let Some(stamp) = context
-        .target_family
-        .and_then(|family| layer(Some(family)))
-        .and_then(|stats| CellStamp::current(stats, global_stats))
-    {
-        let family = scoped(stamp);
-        let weight = (family.useful_completed / SCORE_SWITCH_FULL_EVIDENCE).clamp(0.0, 1.0);
-        score.reliability = blend(score.reliability, family.reliability, weight);
-        score.reliability_upper = blend(score.reliability_upper, family.reliability_upper, weight);
-        score.observed_reliability = blend(
-            score.observed_reliability,
-            family.observed_reliability,
-            weight,
-        );
-        score.completed = score.completed.max(family.completed);
-        score.useful_completed = score.useful_completed.max(family.useful_completed);
-        score.qualification_retained |= family.qualification_retained;
-        score.recovered_qualification |= family.recovered_qualification;
-        score.attempts = score.attempts.max(family.attempts);
-        score.performance = prefer_specific(score.performance, family.performance);
-        score.unresolved_failure |= family.unresolved_failure;
-        score.fail_streak = score.fail_streak.max(family.fail_streak);
-        score.explore_backed_off |= family.explore_backed_off;
-        score.selected_at = score.selected_at.max(family.selected_at);
-        score.last_attempt = score.last_attempt.max(family.last_attempt);
-        score.degraded_at = score.degraded_at.max(family.degraded_at);
-    }
-    // Proxy health-family and probe protocol are independent of target family.
-    if let Some(stats) = global_stats {
-        let probe = &stats.probes[super::evidence::probe_slot(context)];
-        score.probe = probe.latency.snapshot(now);
-        score.probe_scope = probe.scope;
-        // The filter family is not the socket selected by a dual-stack dial.
-        // A carrier hint asks a node-wide question; it is not target performance.
-        score.carrier_pressure_at = stats
-            .carrier_pressure
-            .iter()
-            .flatten()
-            .filter(|pressure| {
-                now.saturating_duration_since(pressure.observed_at) < super::CARRIER_PRESSURE_TTL
-            })
-            .map(|pressure| pressure.observed_at)
-            .max();
-    }
-    if context.target.is_some() {
-        score.recovered_qualification = false;
-    }
-    if let (Some(family), Some(target)) = (context.target_family, context.target.as_ref())
-        && let Some(stats) = inner.exact.peek(&ExactKey {
-            group: group.to_string(),
-            network: context.network,
-            family,
-            target: target.clone(),
-            node_id,
+    nodes
+        .into_iter()
+        .map(|node_id| {
+            layer.node_id = node_id;
+            layer.family = None;
+            let global_stats = inner.aggregate.peek(&layer);
+            let mut score = global_stats.map_or_else(
+                || snapshot(&Stats::default(), now),
+                |stats| snapshot(stats, now),
+            );
+            score.node_failure = score.unresolved_failure;
+            let family_stats = context.target_family.and_then(|family| {
+                layer.family = Some(family);
+                inner.aggregate.peek(&layer)
+            });
+            if let Some(stamp) =
+                family_stats.and_then(|stats| CellStamp::current(stats, global_stats))
+            {
+                let family = scoped(stamp);
+                let weight = (family.useful_completed / SCORE_SWITCH_FULL_EVIDENCE).clamp(0.0, 1.0);
+                score.reliability = blend(score.reliability, family.reliability, weight);
+                score.reliability_upper =
+                    blend(score.reliability_upper, family.reliability_upper, weight);
+                score.observed_reliability = blend(
+                    score.observed_reliability,
+                    family.observed_reliability,
+                    weight,
+                );
+                score.completed = score.completed.max(family.completed);
+                score.useful_completed = score.useful_completed.max(family.useful_completed);
+                score.qualification_retained |= family.qualification_retained;
+                score.recovered_qualification |= family.recovered_qualification;
+                score.attempts = score.attempts.max(family.attempts);
+                score.performance = prefer_specific(score.performance, family.performance);
+                score.unresolved_failure |= family.unresolved_failure;
+                score.fail_streak = score.fail_streak.max(family.fail_streak);
+                score.explore_backed_off |= family.explore_backed_off;
+                score.selected_at = score.selected_at.max(family.selected_at);
+                score.last_attempt = score.last_attempt.max(family.last_attempt);
+                score.degraded_at = score.degraded_at.max(family.degraded_at);
+            }
+            // Proxy health-family and probe protocol are independent of target family.
+            if let Some(stats) = global_stats {
+                let probe = &stats.probes[super::evidence::probe_slot(context)];
+                score.probe = probe.latency.snapshot(now);
+                score.probe_scope = probe.scope;
+                // The filter family is not the socket selected by a dual-stack dial.
+                // A carrier hint asks a node-wide question; it is not target performance.
+                score.carrier_pressure_at = stats
+                    .carrier_pressure
+                    .iter()
+                    .flatten()
+                    .filter(|pressure| {
+                        now.saturating_duration_since(pressure.observed_at)
+                            < super::CARRIER_PRESSURE_TTL
+                    })
+                    .map(|pressure| pressure.observed_at)
+                    .max();
+            }
+            if context.target.is_some() {
+                score.recovered_qualification = false;
+            }
+            let exact_stats = exact.as_mut().and_then(|key| {
+                key.node_id = node_id;
+                inner.exact.peek(key)
+            });
+            if let Some(stats) = exact_stats
+                && let Some(stamp) = CellStamp::current(stats, global_stats)
+            {
+                let exact = scoped(stamp);
+                let weight = (exact.useful_completed / SCORE_SWITCH_FULL_EVIDENCE).clamp(0.0, 1.0);
+                score.reliability = blend(score.reliability, exact.reliability, weight);
+                score.reliability_upper =
+                    blend(score.reliability_upper, exact.reliability_upper, weight);
+                score.observed_reliability = blend(
+                    score.observed_reliability,
+                    exact.observed_reliability,
+                    weight,
+                );
+                score.completed = score.completed.max(exact.completed);
+                score.useful_completed = score.useful_completed.max(exact.useful_completed);
+                score.qualification_retained |= exact.qualification_retained;
+                score.recovered_qualification = exact.recovered_qualification;
+                score.target_performance = exact.performance;
+                score.unresolved_failure |= exact.unresolved_failure;
+                score.fail_streak = score.fail_streak.max(exact.fail_streak);
+                score.target_failure = exact.fail_streak > 0
+                    && stats.failed_at > global_stats.and_then(|global| global.failed_at);
+                score.explore_backed_off |= exact.explore_backed_off;
+                score.selected_at = score.selected_at.max(exact.selected_at);
+                score.degraded_at = score.degraded_at.max(exact.degraded_at);
+            }
+            score.degraded_at = score.degraded_at.max(score.carrier_pressure_at);
+            score.recovered_qualification &= !score.unresolved_failure;
+            score
         })
-        && let Some(stamp) = CellStamp::current(stats, global_stats)
-    {
-        let exact = scoped(stamp);
-        let weight = (exact.useful_completed / SCORE_SWITCH_FULL_EVIDENCE).clamp(0.0, 1.0);
-        score.reliability = blend(score.reliability, exact.reliability, weight);
-        score.reliability_upper = blend(score.reliability_upper, exact.reliability_upper, weight);
-        score.observed_reliability = blend(
-            score.observed_reliability,
-            exact.observed_reliability,
-            weight,
-        );
-        score.completed = score.completed.max(exact.completed);
-        score.useful_completed = score.useful_completed.max(exact.useful_completed);
-        score.qualification_retained |= exact.qualification_retained;
-        score.recovered_qualification = exact.recovered_qualification;
-        score.target_performance = exact.performance;
-        score.unresolved_failure |= exact.unresolved_failure;
-        score.fail_streak = score.fail_streak.max(exact.fail_streak);
-        score.target_failure = exact.fail_streak > 0
-            && stats.failed_at > global_stats.and_then(|global| global.failed_at);
-        score.explore_backed_off |= exact.explore_backed_off;
-        score.selected_at = score.selected_at.max(exact.selected_at);
-        score.degraded_at = score.degraded_at.max(exact.degraded_at);
-    }
-    score.degraded_at = score.degraded_at.max(score.carrier_pressure_at);
-    score.recovered_qualification &= !score.unresolved_failure;
-    score
+        .collect()
 }
 
 pub(super) fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
