@@ -284,6 +284,16 @@ impl Store {
         &self.cells[start..start + len]
     }
 
+    /// Consecutive cells of one comparison cohort, in store order.
+    pub(super) fn cohorts(
+        &self,
+        group: &str,
+        network: SelectionNetwork,
+    ) -> impl Iterator<Item = &[Cell]> {
+        self.scope(group, network)
+            .chunk_by(|left, right| left.key.cohort_cmp(&right.key) == Ordering::Equal)
+    }
+
     fn remove(&mut self, index: usize) {
         self.key_bytes -= self.cells.remove(index).key.heap_bytes();
     }

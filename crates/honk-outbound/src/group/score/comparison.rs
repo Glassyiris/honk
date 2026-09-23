@@ -3,7 +3,6 @@ use super::ranking::normal_eligible;
 use super::verification::{TimedMetric, VerificationEvidence};
 use super::{AggregateKey, ExactKey, ScoreSelectionContext, ScoreSnapshot, StateInner, Stats};
 use honk_config::node::Node;
-use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
@@ -262,6 +261,29 @@ fn paired_cell(
     result
 }
 
+/// Positions of node ids within one evaluation; duplicates keep ascending positions.
+struct NodeSlots(Vec<(Uuid, usize)>);
+
+impl NodeSlots {
+    fn new(ids: impl IntoIterator<Item = Uuid>) -> Self {
+        let mut slots: Vec<_> = ids
+            .into_iter()
+            .enumerate()
+            .map(|(slot, id)| (id, slot))
+            .collect();
+        slots.sort_unstable();
+        Self(slots)
+    }
+
+    fn of(&self, node: Uuid) -> impl Iterator<Item = usize> + '_ {
+        let first = self.0.partition_point(|(id, _)| *id < node);
+        self.0[first..]
+            .iter()
+            .take_while(move |(id, _)| *id == node)
+            .map(|(_, slot)| *slot)
+    }
+}
+
 /// One challenger's accumulation against the reference, in store order.
 #[derive(Default)]
 struct PairScan {
@@ -418,22 +440,10 @@ fn for_each_pair<'a>(
     wanted: &dyn Fn(&Key) -> bool,
     mut visit: impl FnMut(usize, (&'a Cell, &'a Cell)),
 ) {
-    let mut order: Vec<_> = challengers
-        .iter()
-        .enumerate()
-        .map(|(slot, (node, _))| (*node, slot))
-        .collect();
-    order.sort_unstable();
+    let slots = NodeSlots::new(challengers.iter().map(|(node, _)| *node));
     // Keys are unique per node within a sorted cohort, so each cohort pairs at most once.
-    let mut cells = inner.comparisons.scope(group, context.network);
-    while let Some(first) = cells.first() {
-        let end = cells
-            .iter()
-            .position(|cell| first.key.cohort_cmp(&cell.key) != Ordering::Equal)
-            .unwrap_or(cells.len());
-        let (cohort, rest) = cells.split_at(end);
-        cells = rest;
-        if !wanted(&first.key) {
+    for cohort in inner.comparisons.cohorts(group, context.network) {
+        if !wanted(&cohort[0].key) {
             continue;
         }
         let Some(left) = cohort
@@ -443,9 +453,7 @@ fn for_each_pair<'a>(
             continue;
         };
         for right in cohort.iter().filter(|cell| cell.key.node() != reference) {
-            let node = right.key.node();
-            let first = order.partition_point(|(id, _)| *id < node);
-            for &(_, slot) in order[first..].iter().take_while(|(id, _)| *id == node) {
+            for slot in slots.of(right.key.node()) {
                 if right.valid(inner, challengers[slot].1) {
                     visit(slot, (left, right));
                 }
@@ -564,12 +572,7 @@ pub(super) fn node_evidence(
     let Some(origin) = inner.comparisons.origin else {
         return evidence;
     };
-    let mut order: Vec<_> = nodes
-        .iter()
-        .enumerate()
-        .map(|(index, node)| (node.id, index))
-        .collect();
-    order.sort_unstable();
+    let slots = NodeSlots::new(nodes.iter().map(|node| node.id));
     let slot = super::evidence::probe_slot(context);
     // One scope pass; each node still sees its own cells in store order.
     for cell in inner.comparisons.scope(group, context.network) {
@@ -585,9 +588,7 @@ pub(super) fn node_evidence(
         let Some(timing) = cell.key.timing().filter(|_| wanted) else {
             continue;
         };
-        let node = cell.key.node();
-        let first = order.partition_point(|(id, _)| *id < node);
-        for &(_, index) in order[first..].iter().take_while(|(id, _)| *id == node) {
+        for index in slots.of(cell.key.node()) {
             if !cell.valid(inner, parents[index]) {
                 continue;
             }
@@ -697,31 +698,18 @@ fn joint_pairs(
     let mut targets = 0;
     let mut partial = false;
     // A duplicated node id resolves to its first member slot.
-    let mut order: Vec<_> = members
-        .iter()
-        .enumerate()
-        .map(|(slot, (node, _))| (*node, slot))
-        .collect();
-    order.sort_unstable();
+    let slots = NodeSlots::new(members.iter().map(|(node, _)| *node));
     let slot_of = |cell: &Cell| {
-        let node = cell.key.node();
-        order
-            .get(order.partition_point(|(id, _)| *id < node))
-            .filter(|(id, slot)| *id == node && cell.valid(inner, members[*slot].1))
-            .map(|(_, slot)| *slot)
+        slots
+            .of(cell.key.node())
+            .next()
+            .filter(|slot| cell.valid(inner, members[*slot].1))
     };
     let (reference, reference_parent) = members[0];
     let mut selected = vec![None; members.len()];
     let mut next = vec![PairEvidence::default(); count];
-    let mut cells = inner.comparisons.scope(group, context.network);
-    while let Some(first) = cells.first() {
-        let end = cells
-            .iter()
-            .position(|cell| first.key.cohort_cmp(&cell.key) != Ordering::Equal)
-            .unwrap_or(cells.len());
-        let (current, rest) = cells.split_at(end);
-        cells = rest;
-        let eligible = match (&first.key, basis) {
+    for current in inner.comparisons.cohorts(group, context.network) {
+        let eligible = match (&current[0].key, basis) {
             (Key::Traffic(key), Basis::ExactTarget) => {
                 Some(key.family) == context.target_family
                     && Some(&key.target) == context.target.as_ref()
