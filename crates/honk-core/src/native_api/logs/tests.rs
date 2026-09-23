@@ -8,7 +8,7 @@ use tracing_subscriber::prelude::*;
 // cache NoSubscriber's interest even while this test retains a scoped subscriber.
 const ISOLATED: &str = "HONK_NATIVE_LOG_ISOLATED";
 
-fn run_isolated(test_name: &str) -> bool {
+pub(crate) fn run_isolated(test_name: &str) -> bool {
     if std::env::var_os(ISOLATED).is_some() {
         return false;
     }

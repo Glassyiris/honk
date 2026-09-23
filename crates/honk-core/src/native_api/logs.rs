@@ -154,6 +154,15 @@ impl LogStore {
         Ok(events::stream_response(self.subscribe(request, id)?))
     }
 
+    #[cfg(test)]
+    pub(crate) fn stream_for_test(self: &Arc<Self>) -> Response {
+        let request = Request::builder()
+            .uri("/api/v1/logs")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        self.response(&request, &RequestId("test".into())).unwrap()
+    }
+
     fn subscribe(
         self: &Arc<Self>,
         request: &Request,
@@ -396,4 +405,4 @@ pub(super) async fn serve(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -129,8 +129,24 @@ impl BoundDnsListener {
         #[cfg(feature = "native-api")] diagnostics: crate::config_diagnostics::SharedDiagnostics,
     ) -> io::Result<DnsListener> {
         let Self { tcp, udp, .. } = self;
+        let address = match (&tcp, &udp) {
+            (Some(listener), _) => Some(listener.local_addr()?),
+            (None, Some(socket)) => Some(socket.local_addr()?),
+            (None, None) => None,
+        };
         let udp = udp.map(UdpSocket::from_std).transpose()?.map(Arc::new);
         let tcp = tcp.map(TcpListener::from_std).transpose()?;
+        // The release smoke keys on this message. The native log feed admits it only
+        // as a literal `message` field at the runtime target it had before this move.
+        if let Some(address) = address {
+            tracing::info!(
+                target: "honk_core::control::runtime",
+                %address,
+                tcp = tcp.is_some(),
+                udp = udp.is_some(),
+                message = "Standalone DNS listener started"
+            );
+        }
         let (phase, phase_rx) = watch::channel(ListenerPhase::Running);
         let standalone_tcp_limit = Arc::new(Semaphore::new(standalone_tcp_capacity(
             connection_limit.available_permits(),
@@ -1008,6 +1024,106 @@ mod tests {
         assert_eq!(log["records"][0]["question"]["name"], "refused.example.");
         assert_eq!(log["records"][0]["src"], source.to_string());
         assert_eq!(log["records"][1]["answers"][0]["data"], "192.0.2.10");
+    }
+
+    #[cfg(feature = "native-api")]
+    #[tokio::test]
+    async fn native_log_feed_admits_the_listener_start() {
+        use futures::StreamExt;
+        if crate::native_api::logs::tests::run_isolated(
+            "control::dns_listener::tests::native_log_feed_admits_the_listener_start",
+        ) {
+            return;
+        }
+        use tracing_subscriber::prelude::*;
+        let store = Arc::new(crate::native_api::logs::LogStore::new(
+            "listener-start".into(),
+            true,
+            "info",
+        ));
+        let (layer, binding) = crate::native_api::logs::tracing_layer();
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
+        binding.bind(Arc::downgrade(&store));
+        let mut stream = store.stream_for_test().into_body().into_data_stream();
+        let mut next = async || {
+            let frame = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            String::from_utf8(frame.to_vec()).unwrap()
+        };
+        assert!(next().await.starts_with("event: stream.ready\n"));
+        let (controller, _) = controller([192, 0, 2, 10]);
+        let (mut listener, _, drain) = tracing::dispatcher::with_default(&dispatch, || {
+            start_listener("udp://127.0.0.1:0", controller)
+        });
+        let frame = next().await;
+        let record: serde_json::Value = serde_json::from_str(
+            frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["message"], "Standalone DNS listener started");
+        assert_eq!(record["fields"]["tcp"], false);
+        assert_eq!(record["fields"]["udp"], true);
+        stop_listener(&mut listener, &drain).await;
+        store.shutdown();
+    }
+
+    #[tokio::test]
+    async fn listener_start_is_not_logged_when_socket_adoption_fails() {
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer({
+                let captured = Arc::clone(&captured);
+                move || Capture(Arc::clone(&captured))
+            })
+            .finish();
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        tcp.set_nonblocking(true).unwrap();
+        // epoll refuses a character device, so adopting this "socket" fails.
+        let udp = std::net::UdpSocket::from(std::os::fd::OwnedFd::from(
+            std::fs::File::open("/dev/null").unwrap(),
+        ));
+        udp.set_nonblocking(true).unwrap();
+        let bound = BoundDnsListener {
+            local_addr: tcp.local_addr().unwrap(),
+            tcp: Some(tcp),
+            udp: Some(udp),
+        };
+        let (controller, _) = controller([192, 0, 2, 10]);
+
+        let result = tracing::subscriber::with_default(subscriber, || {
+            bound.spawn(
+                controller,
+                Arc::new(Semaphore::new(16)),
+                Arc::new(StatsManager::new()),
+                Arc::new(DrainTracker::new()),
+                #[cfg(feature = "native-api")]
+                None,
+                #[cfg(feature = "native-api")]
+                Default::default(),
+            )
+        });
+
+        assert!(result.is_err());
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(!logs.contains("Standalone DNS listener started"), "{logs}");
     }
 
     #[cfg(feature = "native-api")]
