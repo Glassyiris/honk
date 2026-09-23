@@ -334,6 +334,200 @@ fn promising_cold_target_run_waits_for_ordinary_reference_observation() {
 }
 
 #[test]
+fn terminal_staged_runs_release_other_target_trials() {
+    for outcome in [
+        None,
+        Some(ScoreOutcome::Cancelled),
+        Some(ScoreOutcome::Success),
+    ] {
+        let nodes = [node("known control"), node("cold challenger")];
+        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+        let start = Instant::now();
+        train_at(
+            &manager,
+            &nodes[0],
+            &context("old.example", IpVersion::V4),
+            20,
+            Duration::from_millis(100),
+            1,
+            start,
+        );
+        let target = context("staged.example", IpVersion::V4);
+        let other = context("offered.example", IpVersion::V4);
+        let state = manager.score_state();
+        let refs: Vec<_> = nodes.iter().collect();
+        let at = start + Duration::from_secs(2);
+        let (index, pending) = state.rank_plan_at("score", &target, &refs, at);
+        assert_eq!(index, 1);
+        let reporter = outcome.map(|_| pending.begin_at(at).unwrap().start_at(at));
+        let before = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        let (index, ordinary) =
+            state.rank_plan_at("score", &other, &refs, at + Duration::from_secs(1));
+        assert_eq!(index, 0, "live staged work must retain its target");
+        drop(ordinary);
+        assert_eq!(
+            manager
+                .score_budget_counters("score", SelectionNetwork::Tcp)
+                .reserved,
+            before.reserved,
+        );
+        if let Some(reporter) = reporter {
+            let finished = at + Duration::from_secs(2);
+            if outcome == Some(ScoreOutcome::Success) {
+                reporter.setup_succeeded_at(at);
+                reporter.first_response_at(finished);
+                reporter.transfer_at(1, 1, finished);
+            }
+            reporter.finish_at(outcome.unwrap(), true, finished);
+        }
+        drop(pending);
+        let before = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        let at = at + Duration::from_secs(3);
+        let (index, next) = state.rank_plan_at("score", &other, &refs, at);
+        assert_eq!(
+            index, 1,
+            "terminal staged outcome {outcome:?} retained focus"
+        );
+        answer_run_attempt(next, at);
+        let after = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        assert_eq!(after.trial_starts, before.trial_starts + 1);
+        assert_eq!(after.spent, before.spent + 1);
+    }
+}
+
+#[test]
+fn bound_run_keeps_unfinished_pair_but_releases_completed_pair() {
+    let nodes = [node("paired control"), node("paired challenger")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("paired.example", IpVersion::V4);
+    let other = context("offered.example", IpVersion::V4);
+    let start = Instant::now();
+    for (index, leaf) in nodes.iter().enumerate() {
+        train_at(
+            &manager,
+            leaf,
+            &target,
+            128,
+            Duration::from_millis(100 + 15 * index as u64),
+            1,
+            start,
+        );
+    }
+    let state = manager.score_state();
+    let refs: Vec<_> = nodes.iter().collect();
+    let mut allocated = [0; 2];
+    let mut live_last = None;
+    for step in 0..8 {
+        let at = start + Duration::from_secs(75 + step * 5);
+        let (index, attempt) = state.rank_plan_at("score", &target, &refs, at);
+        allocated[index] += 1;
+        if step == 7 {
+            let reporter = attempt.begin_at(at).unwrap().start_at(at);
+            reporter.setup_succeeded_at(at);
+            let received = at + Duration::from_millis(100 + 15 * index as u64);
+            reporter.first_response_at(received);
+            reporter.transfer_at(1, 1, received);
+            live_last = Some(reporter);
+        } else {
+            answer_run_attempt(attempt, at);
+        }
+        if step == 0 {
+            let before = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+            let (_, unrelated) =
+                state.rank_plan_at("score", &other, &refs, at + Duration::from_secs(1));
+            drop(unrelated);
+            let after = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+            assert_eq!(after.refunded, before.refunded);
+            assert_eq!(after.reserved, before.reserved);
+        }
+    }
+    assert_eq!(allocated, [4, 4]);
+    let before = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    let at = start + Duration::from_secs(111);
+    let (_, next) = state.rank_plan_at("score", &other, &refs, at);
+    answer_run_attempt(next, at);
+    let after = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    assert_eq!(after.trial_starts, before.trial_starts + 1);
+    drop(live_last);
+}
+
+#[test]
+fn pending_bound_work_releases_focus_after_cell_replacement() {
+    for parent in [false, true] {
+        let nodes = [node("fenced control"), node("fenced challenger")];
+        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+        let target = context("fenced.example", IpVersion::V4);
+        let other = context("new-offer.example", IpVersion::V4);
+        let start = Instant::now();
+        for leaf in &nodes {
+            train_at(
+                &manager,
+                leaf,
+                &target,
+                128,
+                Duration::from_millis(100),
+                1,
+                start,
+            );
+        }
+        let state = manager.score_state();
+        let refs: Vec<_> = nodes.iter().collect();
+        let first = start + Duration::from_secs(75);
+        let (_, control) = state.rank_plan_at("score", &target, &refs, first);
+        answer_run_attempt(control, first);
+        let at = start + Duration::from_secs(80);
+        let (_, pending) = state.rank_plan_at("score", &target, &refs, at);
+        {
+            let mut inner = state.inner.lock();
+            if parent {
+                inner
+                    .aggregate
+                    .pop(&AggregateKey {
+                        group: "score".into(),
+                        network: target.network,
+                        family: None,
+                        node_id: nodes[0].id,
+                    })
+                    .unwrap();
+            } else {
+                inner
+                    .exact
+                    .pop(&ExactKey {
+                        group: "score".into(),
+                        network: target.network,
+                        family: IpVersion::V4,
+                        target: target.target.clone().unwrap(),
+                        node_id: nodes[0].id,
+                    })
+                    .unwrap();
+            }
+        }
+        drop(
+            manager
+                .feedback_for_group_node("score", nodes[0].id, target.clone())
+                .unwrap()
+                .start_at(at),
+        );
+        let before = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        let (_, offered) = state.rank_plan_at("score", &other, &refs, at + Duration::from_secs(1));
+        answer_run_attempt(offered, at + Duration::from_secs(1));
+        let after = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        assert_eq!(
+            after.trial_starts,
+            before.trial_starts + 1,
+            "parent={parent}"
+        );
+        assert!(pending.begin_at(at + Duration::from_secs(2)).is_err());
+        assert_eq!(
+            manager
+                .score_budget_counters("score", SelectionNetwork::Tcp)
+                .refunded,
+            after.refunded + 1
+        );
+    }
+}
+
+#[test]
 fn staged_failure_invalidates_pending_work_without_another_rank() {
     for (failed_index, outcome, unrelated, admitted) in [
         (0, ScoreOutcome::TargetFailure, false, false),

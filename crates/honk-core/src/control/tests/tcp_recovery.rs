@@ -508,9 +508,15 @@ fn held_score_handle(
     let mut config = udp_test_config("proxy", nodes.clone(), groups);
     if urltest {
         config.groups.push(Group {
+            name: "alternate".into(),
+            policy: GroupPolicy::Score,
+            nodes: vec![nodes[1].id],
+            ..Default::default()
+        });
+        config.groups.push(Group {
             name: "outer".into(),
             policy: GroupPolicy::URLTest,
-            groups: vec!["proxy".into()],
+            groups: vec!["proxy".into(), "alternate".into()],
             ..Default::default()
         });
         config.routing.default_outbound = "outer".into();
@@ -670,6 +676,62 @@ async fn tcp_urltest_retry_after_deadline_preserves_original_business() -> anyho
     let after = manager.score_budget_counters("proxy", SelectionNetwork::Tcp);
     assert_eq!(manager.score_state().root_business_starts(), root_before);
     assert_eq!(after.business_starts, before.business_starts);
+    serve.abort();
+    let _ = serve.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn tcp_urltest_retry_after_score_reload_still_reaches_alternate() -> anyhow::Result<()> {
+    use crate::group::SelectionNetwork;
+    let (handle, nodes, release, mut attempts) = held_score_handle(None, false, true);
+    for (index, node) in nodes.iter().enumerate() {
+        handle.alive_set.record_probe_latency(
+            node.id,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_millis(1 + index as u64 * 50),
+        );
+    }
+    let (_client, serve) = start_held_flow(&handle, &nodes).await?;
+    assert_eq!(attempts.recv().await, Some(nodes[0].id));
+    let manager = handle.group_manager.read().clone();
+    let replacement = {
+        let config = handle.config.read().await;
+        GroupManager::with_alive_set_and_score_state(
+            &config.groups,
+            &config.nodes,
+            Some(Arc::clone(&handle.alive_set)),
+            manager.score_state(),
+        )
+    };
+    replacement.publish_score_membership();
+    let before = replacement.score_budget_counters("proxy", SelectionNetwork::Tcp);
+    let root_before = replacement.score_state().root_business_starts();
+    release.notify_one();
+    let reached = tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(node) = attempts.recv().await {
+            if node == nodes[1].id {
+                return true;
+            }
+            assert_eq!(node, nodes[0].id);
+            release.notify_one();
+        }
+        false
+    })
+    .await?;
+    assert!(
+        reached,
+        "Score authority replacement must not cancel an ordinary retry on the admitted generation"
+    );
+    assert_eq!(
+        replacement.score_state().root_business_starts(),
+        root_before
+    );
+    assert_eq!(
+        replacement.score_budget_counters("proxy", SelectionNetwork::Tcp),
+        before
+    );
     serve.abort();
     let _ = serve.await;
     Ok(())

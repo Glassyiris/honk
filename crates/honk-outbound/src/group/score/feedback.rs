@@ -39,6 +39,7 @@ pub struct ScoreContinuation {
 /// Owns admitted work until its physical/logical reporter starts.
 pub struct ScoreBusinessGuard {
     attempt: Option<ScoreAttempt>,
+    admitted: bool,
 }
 
 impl ScoreBusinessGuard {
@@ -60,7 +61,9 @@ impl ScoreBusinessGuard {
 
     pub(super) fn start_at(mut self, started: Instant) -> ScoreReporter {
         let attempt = self.attempt.take().expect("admitted Score attempt");
-        attempt.feedback.reporter(attempt.work, started, true)
+        attempt
+            .feedback
+            .reporter(attempt.work, started, self.admitted)
     }
 
     pub fn finish(mut self, outcome: ScoreOutcome) {
@@ -121,7 +124,7 @@ impl ScoreAttempt {
         }
     }
 
-    /// Admit before node DNS or admission waits; refusal is terminal and refunds pending work.
+    /// Admit before node DNS or physical-dial admission waits; stale ordinary work proceeds unscored.
     pub fn begin(&self) -> Result<ScoreBusinessGuard, crate::proxy::PacketRejection> {
         self.begin_at(Instant::now())
     }
@@ -131,6 +134,20 @@ impl ScoreAttempt {
         now: Instant,
     ) -> Result<ScoreBusinessGuard, crate::proxy::PacketRejection> {
         let mut inner = self.feedback.state.inner.lock();
+        if !inner
+            .active_authority
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, &self.feedback.authority))
+        {
+            return if budget::begin_unscored(&mut inner, &self.opportunity, &self.work, now) {
+                Ok(ScoreBusinessGuard {
+                    attempt: Some(self.clone()),
+                    admitted: false,
+                })
+            } else {
+                Err(crate::proxy::PacketRejection::Cancelled)
+            };
+        }
         if !validation::admissible(&inner, &self.feedback.context, &self.work, now) {
             for work in self.work.iter() {
                 work.cancel_pending(&mut inner);
@@ -150,6 +167,7 @@ impl ScoreAttempt {
         }
         Ok(ScoreBusinessGuard {
             attempt: Some(self.clone()),
+            admitted: true,
         })
     }
 

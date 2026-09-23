@@ -10,7 +10,6 @@ use honk_config::Config;
 use honk_config::dns::{DnsConfig, DnsRouting};
 use honk_config::experimental::CacheFileConfig;
 use honk_config::node::{Group, Node};
-use honk_config::types::NodeProtocol;
 use honk_core::cachedb::CacheDb;
 use honk_core::clash_api::{self, ClashState};
 use honk_core::connection_tracker::{ConnectionEntry, ConnectionTracker};
@@ -544,87 +543,11 @@ async fn test_score_proxy_contract_and_put_rejection() {
 
 #[tokio::test]
 async fn score_stats_are_authenticated_deterministic_and_private() {
-    use honk_config::group::GroupPolicy;
     use honk_outbound::group::{ScoreSelectionContext, ScoreTarget, SelectionNetwork};
 
     let fixture = include_str!("fixtures/score_stats_manual.dae");
 
     let config = honk_config::parser::parse_dae_config(fixture).unwrap();
-    assert_eq!(
-        config.experimental.clash_api.external_controller,
-        "127.0.0.1:19090"
-    );
-    assert_eq!(config.experimental.clash_api.secret, "score-review-secret");
-    assert_eq!(config.global.lan_interface, ["lo"]);
-    assert_eq!(config.global.wan_interface, ["lo"]);
-    assert_eq!(config.global.log_level, "info");
-    assert!(!config.global.auto_config_kernel_parameter);
-    assert!(!config.global.nfqueue_enable);
-    assert_eq!(config.global.data_dir, "__HONK_SCORE_QA_DATA_DIR__");
-    assert_eq!(config.routing.default_outbound, "direct");
-    assert_eq!(
-        config
-            .groups
-            .iter()
-            .map(|group| group.name.as_str())
-            .collect::<Vec<_>>(),
-        ["z-score", "a-score"]
-    );
-    assert!(
-        config
-            .groups
-            .iter()
-            .all(|group| group.policy == GroupPolicy::Score)
-    );
-    assert_eq!(
-        config
-            .nodes
-            .iter()
-            .map(|node| {
-                let socks = node.socks5().unwrap();
-                (
-                    node.name.as_str(),
-                    node.protocol(),
-                    node.address.as_str(),
-                    node.port,
-                    socks.username.as_deref(),
-                    socks.password.as_deref(),
-                )
-            })
-            .collect::<Vec<_>>(),
-        [
-            (
-                "private-node-alpha",
-                NodeProtocol::Socks5,
-                "private-node-alpha.invalid:16543",
-                16543,
-                Some("private-user"),
-                Some("private-pass"),
-            ),
-            (
-                "private-node-beta",
-                NodeProtocol::Socks5,
-                "203.0.113.88:26543",
-                26543,
-                Some("private-user-2"),
-                Some("private-pass-2"),
-            ),
-        ]
-    );
-    let expected_members: std::collections::HashSet<_> =
-        config.nodes.iter().map(|node| node.id).collect();
-    for group in &config.groups {
-        assert_eq!(
-            group
-                .nodes
-                .iter()
-                .copied()
-                .collect::<std::collections::HashSet<_>>(),
-            expected_members,
-            "{} must resolve exactly the two fixture nodes",
-            group.name
-        );
-    }
 
     let selector = spawn_app("", "").await;
     let selector_stats: serde_json::Value = http_client()
@@ -676,6 +599,43 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
     assert_eq!(first_response.status(), 200);
     let first: serde_json::Value = first_response.json().await.unwrap();
     let score = first["score"].clone();
+    let assert_keys = |value: &serde_json::Value, expected: &[&str]| {
+        assert_eq!(
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+    };
+    assert_keys(&score, &["businessStarts", "cache", "groups"]);
+    assert_keys(
+        &score["cache"],
+        &[
+            "exactCells",
+            "aggregateCells",
+            "exactEvictions",
+            "aggregateEvictions",
+            "comparisonCells",
+            "comparisonLogicalBytes",
+            "comparisonLogicalCapacity",
+            "comparisonEvictions",
+            "comparisonExpired",
+            "comparisonRejected",
+        ],
+    );
+    assert!(
+        score["cache"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(serde_json::Value::is_u64)
+    );
     assert_eq!(score["businessStarts"], 0);
     let groups = score["groups"].as_array().unwrap();
     assert_eq!(
@@ -686,6 +646,107 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
         ["a-score", "z-score"]
     );
     for group in groups {
+        assert_keys(group, &["name", "tcp", "udp", "verification", "budget"]);
+        assert_keys(&group["verification"], &["tcp", "udp"]);
+        assert_keys(&group["budget"], &["tcp", "udp"]);
+        for network in ["tcp", "udp"] {
+            let reasons = &group[network];
+            assert_keys(
+                reasons,
+                &[
+                    "coldExplore",
+                    "periodicExplore",
+                    "reliabilityWinner",
+                    "performanceWinner",
+                    "incumbentHeld",
+                    "insufficientEvidenceHeld",
+                    "directionalTradeoffHeld",
+                    "incumbentIneligible",
+                    "freshFailureBypass",
+                    "deadFiltered",
+                    "ordinarySwitch",
+                    "switchFlap",
+                    "failStreakExcluded",
+                    "exploreBackedOff",
+                    "carrierPressure",
+                    "carrierRttPressure",
+                    "carrierLossPressure",
+                    "carrierValidation",
+                ],
+            );
+            assert!(
+                reasons
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(serde_json::Value::is_u64)
+            );
+            let verification = &group["verification"][network];
+            assert_keys(
+                verification,
+                &[
+                    "provisionalSelections",
+                    "usableSelections",
+                    "validationSelections",
+                    "confirmations",
+                    "expired",
+                    "contradicted",
+                    "confirmationMillis",
+                ],
+            );
+            assert!(
+                verification
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(serde_json::Value::is_u64)
+            );
+            let budget = &group["budget"][network];
+            assert_keys(
+                budget,
+                &[
+                    "businessStarts",
+                    "sources",
+                    "trialStarts",
+                    "reserved",
+                    "spent",
+                    "budgetBlocked",
+                    "inFlightBlocked",
+                    "refunded",
+                    "expired",
+                    "coldAllowance",
+                    "coldAvailable",
+                    "earnedAvailable",
+                    "earningPeriod",
+                    "scopes",
+                    "trialSuccess",
+                    "trialFailure",
+                    "trialCancelled",
+                    "trialSetupHistogram",
+                    "trialSetupMillis",
+                    "trialElapsedMillis",
+                ],
+            );
+            assert_keys(&budget["sources"], &["cold", "periodic", "recovery"]);
+            assert!(
+                budget["sources"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(serde_json::Value::is_u64)
+            );
+            let histogram = budget["trialSetupHistogram"].as_array().unwrap();
+            assert_eq!(histogram.len(), 8);
+            assert!(histogram.iter().all(serde_json::Value::is_u64));
+            assert!(
+                budget
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .filter(|(key, _)| !matches!(key.as_str(), "sources" | "trialSetupHistogram"))
+                    .all(|(_, value)| value.is_u64())
+            );
+        }
         assert_eq!(group["tcp"]["coldExplore"], 1);
         assert_eq!(group["tcp"]["ordinarySwitch"], 0);
         let budget = &group["budget"]["tcp"];

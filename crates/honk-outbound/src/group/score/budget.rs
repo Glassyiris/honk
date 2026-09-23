@@ -259,15 +259,31 @@ impl Scope {
     }
 
     pub(super) fn invalidate_pending(&mut self) {
-        while let Some(entry) = self.in_flight.pop() {
-            if let Some(life) = entry.life.upgrade()
-                && life.status.load(Ordering::Relaxed) == PENDING
-            {
-                life.status.store(CANCELLED, Ordering::Relaxed);
-                if let Some(token) = life.token {
-                    self.refund(token);
+        let mut refunded_cold = 0;
+        let mut refunded_earned = 0;
+        self.in_flight.retain(|entry| {
+            let Some(life) = entry.life.upgrade() else {
+                return false;
+            };
+            match life.status.load(Ordering::Relaxed) {
+                STARTED => true,
+                PENDING => {
+                    life.status.store(CANCELLED, Ordering::Relaxed);
+                    match life.token {
+                        Some(Token::Cold) => refunded_cold += 1,
+                        Some(Token::Earned) => refunded_earned += 1,
+                        None => {}
+                    }
+                    false
                 }
+                _ => false,
             }
+        });
+        for _ in 0..refunded_cold {
+            self.refund(Token::Cold);
+        }
+        for _ in 0..refunded_earned {
+            self.refund(Token::Earned);
         }
     }
 }
@@ -505,6 +521,30 @@ pub(super) fn cold_available(
         .is_none_or(|scope| scope.effective_credit(now).0 > 0)
 }
 
+pub(super) fn begin_unscored(
+    inner: &mut StateInner,
+    opportunity: &Opportunity,
+    work: &[Arc<Work>],
+    now: Instant,
+) -> bool {
+    if work.iter().any(|item| {
+        item.life.token.is_some()
+            || item.life.deadline().is_some()
+            || item.life.status.load(Ordering::Relaxed) != PENDING
+    }) {
+        for item in work {
+            item.cancel_pending(inner);
+        }
+        return false;
+    }
+    opportunity.progress.lock().begun = true;
+    for item in work {
+        item.life.status.store(STARTED, Ordering::Relaxed);
+        let _ = item.life.started_at.set(now);
+    }
+    true
+}
+
 pub(super) fn begin(
     inner: &mut StateInner,
     authority: &Arc<ScoreAuthority>,
@@ -534,6 +574,13 @@ pub(super) fn begin(
         return false;
     }
     if context.target.is_none() {
+        if work.iter().any(|item| item.life.token.is_some()) {
+            for item in work {
+                item.cancel_pending(inner);
+            }
+            return false;
+        }
+        opportunity.progress.lock().begun = true;
         for item in work {
             item.life.status.store(STARTED, Ordering::Relaxed);
             let _ = item.life.started_at.set(now);
@@ -553,11 +600,12 @@ pub(super) fn begin(
     let mut progress = opportunity.progress.lock();
     if (!progress.begun && inner.root_business_starts == u64::MAX)
         || work.iter().any(|item| {
-            inner.budgets.get(&item.key).is_some_and(|scope| {
-                !progress.scopes.iter().any(|(key, identity)| {
-                    *key == item.key && Arc::ptr_eq(identity, &scope.identity)
-                }) && scope.counters.business_starts == u64::MAX
-            })
+            item.life.source != ScoreTrialSource::Recovery
+                && inner.budgets.get(&item.key).is_some_and(|scope| {
+                    !progress.scopes.iter().any(|(key, identity)| {
+                        *key == item.key && Arc::ptr_eq(identity, &scope.identity)
+                    }) && scope.counters.business_starts == u64::MAX
+                })
         })
     {
         for item in work {
@@ -572,10 +620,11 @@ pub(super) fn begin(
     }
     for item in work {
         let scope = ensure_scope(inner, &item.key);
-        if !progress
-            .scopes
-            .iter()
-            .any(|(key, identity)| *key == item.key && Arc::ptr_eq(identity, &scope.identity))
+        if item.life.source != ScoreTrialSource::Recovery
+            && !progress
+                .scopes
+                .iter()
+                .any(|(key, identity)| *key == item.key && Arc::ptr_eq(identity, &scope.identity))
         {
             scope.counters.business_starts += 1;
             if scope

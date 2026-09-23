@@ -123,203 +123,218 @@ fn response_validation(
         .selection_counts
         .get_mut(key)
         .and_then(|cadence| cadence.run.take());
-    if let Some(active) = &mut run {
-        if now >= active.deadline || active.offers >= 16 || active.trials >= 8 {
-            return RunAction::Wait;
-        }
-        if !active.owns_target(context) {
-            inner
-                .selection_counts
-                .get_mut(key)
-                .expect("cadence exists")
-                .run = run;
-            return RunAction::Wait;
-        }
-        if active.reference != nodes[reference].id {
-            return RunAction::Wait;
-        }
-        active.offers += 1;
-    }
-    let candidate = run
-        .as_ref()
-        .and_then(|run| nodes.iter().position(|node| node.id == run.challenger))
-        .or_else(|| {
-            run.is_none()
-                .then_some(evaluation.validation_index)
-                .flatten()
-        });
-    let Some(candidate) = candidate else {
-        return if run.is_some() {
-            RunAction::Wait
-        } else {
-            RunAction::Ordinary
-        };
-    };
-    let question = evaluation.candidates[candidate];
-    if !question.actionable() || question.question == ScoreEvidenceQuestion::Recovery {
-        return if run.is_some() {
-            RunAction::Wait
-        } else {
-            RunAction::Ordinary
-        };
-    }
-    // Misalignment must release a staged run too, before waiting for business evidence.
-    if question.needs_alignment() {
-        return RunAction::Ordinary;
-    }
-    if let Some(ValidationRun {
-        phase: Phase::Staged { pending },
-        ..
-    }) = &run
-        && decision.evidence[candidate].business.is_none()
-    {
-        if pending.finished() {
-            return RunAction::Ordinary;
-        }
-        inner
-            .selection_counts
-            .get_mut(key)
-            .expect("cadence exists")
-            .run = run;
-        return RunAction::Wait;
-    }
-    let (counts, fence, needed) = match response_demand(
-        inner,
-        (key, context),
-        (nodes[reference].id, nodes[candidate].id),
-        question,
-        run.is_some(),
-        now,
-    ) {
-        ResponseDemand::Ordinary => return RunAction::Ordinary,
-        ResponseDemand::Unavailable => {
-            let managed = run.is_some();
-            if run
-                .as_ref()
-                .is_some_and(|run| matches!(run.phase, Phase::Staged { .. }))
-            {
-                inner
-                    .selection_counts
-                    .get_mut(key)
-                    .expect("cadence exists")
-                    .run = run;
-            }
-            return if managed {
-                RunAction::Wait
+    let (action, run) = 'transition: {
+        if let Some(active) = &mut run {
+            if now >= active.deadline || active.offers >= 16 || active.trials >= 8 {
+                if active.owns_target(context) {
+                    break 'transition (RunAction::Wait, None);
+                }
+                run = None;
+            } else if !active.owns_target(context) {
+                let keep = match &active.phase {
+                    Phase::Staged { pending } => !pending.finished(),
+                    Phase::Bound { fence, .. } => comparison::response_progress(
+                        inner,
+                        &key.group,
+                        &ScoreSelectionContext {
+                            target: Some(active.target.clone()),
+                            ..*context
+                        },
+                        active.reference,
+                        active.challenger,
+                        now,
+                    )
+                    .is_some_and(|(counts, current)| current == *fence && counts != [4, 4]),
+                };
+                if keep {
+                    break 'transition (RunAction::Wait, run);
+                }
+                run = None;
             } else {
-                RunAction::Ordinary
+                if active.reference != nodes[reference].id {
+                    break 'transition (RunAction::Wait, None);
+                }
+                active.offers += 1;
+            }
+        }
+        let candidate = run
+            .as_ref()
+            .and_then(|run| nodes.iter().position(|node| node.id == run.challenger))
+            .or_else(|| {
+                run.is_none()
+                    .then_some(evaluation.validation_index)
+                    .flatten()
+            });
+        let Some(candidate) = candidate else {
+            break 'transition (
+                if run.is_some() {
+                    RunAction::Wait
+                } else {
+                    RunAction::Ordinary
+                },
+                None,
+            );
+        };
+        let question = evaluation.candidates[candidate];
+        if !question.actionable() || question.question == ScoreEvidenceQuestion::Recovery {
+            break 'transition (
+                if run.is_some() {
+                    RunAction::Wait
+                } else {
+                    RunAction::Ordinary
+                },
+                None,
+            );
+        }
+        // Misalignment must release a staged run too, before waiting for business evidence.
+        if question.needs_alignment() {
+            break 'transition (RunAction::Ordinary, None);
+        }
+        if let Some(ValidationRun {
+            phase: Phase::Staged { pending },
+            ..
+        }) = &run
+            && decision.evidence[candidate].business.is_none()
+        {
+            break 'transition if pending.finished() {
+                (RunAction::Ordinary, None)
+            } else {
+                (RunAction::Wait, run)
             };
         }
-        ResponseDemand::Focused {
-            counts,
-            fence,
-            needed,
-        } => (counts, fence, needed),
-    };
-    let mut run = if let Some(mut active) = run {
-        active.phase = match active.phase {
-            Phase::Staged { pending } => Phase::Bound {
+        let (counts, fence, needed) = match response_demand(
+            inner,
+            (key, context),
+            (nodes[reference].id, nodes[candidate].id),
+            question,
+            run.is_some(),
+            now,
+        ) {
+            ResponseDemand::Ordinary => break 'transition (RunAction::Ordinary, None),
+            ResponseDemand::Unavailable => {
+                let action = if run.is_some() {
+                    RunAction::Wait
+                } else {
+                    RunAction::Ordinary
+                };
+                break 'transition (
+                    action,
+                    run.filter(|run| matches!(run.phase, Phase::Staged { .. })),
+                );
+            }
+            ResponseDemand::Focused {
+                counts,
                 fence,
-                pending: Some(pending),
-                control_due: false,
-            },
-            Phase::Bound {
-                fence: old,
-                pending,
-                control_due,
-            } => {
-                if old != fence {
-                    return RunAction::Wait;
-                }
-                Phase::Bound {
+                needed,
+            } => (counts, fence, needed),
+        };
+        let mut run = if let Some(mut active) = run {
+            active.phase = match active.phase {
+                Phase::Staged { pending } => Phase::Bound {
                     fence,
+                    pending: Some(pending),
+                    control_due: false,
+                },
+                Phase::Bound {
+                    fence: old,
                     pending,
                     control_due,
+                } => {
+                    if old != fence {
+                        break 'transition (RunAction::Wait, None);
+                    }
+                    Phase::Bound {
+                        fence,
+                        pending,
+                        control_due,
+                    }
                 }
+            };
+            active
+        } else {
+            if budget::available_credit(inner, &key.group, context, now) < needed {
+                break 'transition (
+                    if budget::cold_available(inner, &key.group, context, now) {
+                        RunAction::Ordinary
+                    } else {
+                        RunAction::Wait
+                    },
+                    None,
+                );
+            }
+            let Some(target) = context.target.as_ref() else {
+                break 'transition (RunAction::Wait, None);
+            };
+            ValidationRun {
+                reference: nodes[reference].id,
+                challenger: nodes[candidate].id,
+                target: target.clone(),
+                deadline: now + Duration::from_secs(45),
+                offers: 1,
+                trials: 0,
+                phase: Phase::Bound {
+                    fence,
+                    pending: None,
+                    control_due: counts[0] <= counts[1],
+                },
             }
         };
-        active
-    } else {
-        if budget::available_credit(inner, &key.group, context, now) < needed {
-            return if budget::cold_available(inner, &key.group, context, now) {
-                RunAction::Ordinary
-            } else {
-                RunAction::Wait
-            };
-        }
-        let Some(target) = context.target.as_ref() else {
-            return RunAction::Wait;
+        let Phase::Bound {
+            pending,
+            control_due,
+            ..
+        } = &mut run.phase
+        else {
+            unreachable!("response progress binds the run above")
         };
-        ValidationRun {
-            reference: nodes[reference].id,
-            challenger: nodes[candidate].id,
-            target: target.clone(),
-            deadline: now + Duration::from_secs(45),
-            offers: 1,
-            trials: 0,
-            phase: Phase::Bound {
-                fence,
-                pending: None,
-                control_due: counts[0] <= counts[1],
-            },
+        if let Some(previous) = pending.take() {
+            if previous.original_started() {
+                *control_due = !*control_due;
+            } else if previous.pending() {
+                *pending = Some(previous);
+                break 'transition (RunAction::Wait, Some(run));
+            }
         }
-    };
-    let Phase::Bound {
-        pending,
-        control_due,
-        ..
-    } = &mut run.phase
-    else {
-        unreachable!("response progress binds the run above")
-    };
-    if let Some(previous) = pending.take() {
-        if previous.original_started() {
-            *control_due = !*control_due;
-        } else if previous.pending() {
-            *pending = Some(previous);
-            inner
-                .selection_counts
-                .get_mut(key)
-                .expect("cadence exists")
-                .run = Some(run);
-            return RunAction::Wait;
+        let index = if *control_due { reference } else { candidate };
+        let work = if *control_due {
+            Some(budget::Work::new(
+                state,
+                &key.group,
+                context,
+                nodes[index].id,
+                ScoreTrialSource::None,
+            ))
+        } else {
+            run.trials += 1;
+            budget::reserve(
+                state,
+                inner,
+                &key.group,
+                context,
+                nodes[index].id,
+                (
+                    ScoreEvidenceQuestion::Response,
+                    question
+                        .required
+                        .max(usize::from(4_u8.saturating_sub(counts[1]))),
+                ),
+                now,
+            )
+        };
+        if let Some(work) = &work {
+            *pending = Some(budget::bind_deadline(inner, work, run.deadline));
         }
-    }
-    let index = if *control_due { reference } else { candidate };
-    let work = if *control_due {
-        Some(budget::Work::new(
-            state,
-            &key.group,
-            context,
-            nodes[index].id,
-            ScoreTrialSource::None,
-        ))
-    } else {
-        run.trials += 1;
-        budget::reserve(
-            state,
-            inner,
-            &key.group,
-            context,
-            nodes[index].id,
-            (
-                ScoreEvidenceQuestion::Response,
-                question
-                    .required
-                    .max(usize::from(4_u8.saturating_sub(counts[1]))),
-            ),
-            now,
-        )
+        break 'transition (
+            work.map_or(RunAction::Wait, |work| RunAction::Planned(index, work)),
+            Some(run),
+        );
     };
-    if let Some(work) = &work {
-        *pending = Some(budget::bind_deadline(inner, work, run.deadline));
-    }
     inner
         .selection_counts
         .get_mut(key)
         .expect("cadence exists")
-        .run = Some(run);
-    work.map_or(RunAction::Wait, |work| RunAction::Planned(index, work))
+        .run = run;
+    action
 }
 
 pub(super) fn cancel_run(

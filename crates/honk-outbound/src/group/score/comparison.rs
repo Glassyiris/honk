@@ -726,17 +726,19 @@ pub(super) fn response_progress(
     if group.len().saturating_add(target_bytes(target)) > MAX_KEY_BYTES {
         return None;
     }
+    let mut key = ExactKey {
+        group: group.to_owned(),
+        network: context.network,
+        family,
+        target: target.clone(),
+        node_id: reference,
+    };
     let mut identity = std::collections::hash_map::DefaultHasher::new();
     let mut cells = [None; 2];
     for (side, node) in [reference, candidate].into_iter().enumerate() {
         let parent = global_stats(inner, group, context.network, node)?;
-        let (key, stats) = inner.exact.iter().find(|(key, _)| {
-            key.group == group
-                && key.network == context.network
-                && key.family == family
-                && &key.target == target
-                && key.node_id == node
-        })?;
+        key.node_id = node;
+        let stats = inner.exact.peek(&key)?;
         let stamp = CellStamp::current(stats, Some(parent))?;
         (
             parent.incarnation,
@@ -745,7 +747,7 @@ pub(super) fn response_progress(
         )
             .hash(&mut identity);
         cells[side] = inner.comparisons.cells.iter().find(|cell| {
-            matches!(&cell.key, Key::Traffic(current) if current == key)
+            matches!(&cell.key, Key::Traffic(current) if current == &key)
                 && cell.valid(inner, Some(parent))
         });
     }

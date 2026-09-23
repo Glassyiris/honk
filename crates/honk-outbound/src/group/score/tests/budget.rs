@@ -191,7 +191,7 @@ fn retry_and_related_context_preserve_original_identity_without_optional_cost() 
             udp_counts.spent,
             udp_counts.reserved
         ),
-        (1, 0, 0)
+        (0, 0, 0)
     );
     assert_eq!(udp_counts.recovery_starts, 1);
 }
@@ -636,4 +636,351 @@ fn related_route_selections_do_not_reserve_optional_work_with_cold_credit_remain
         ),
         (2, 2)
     );
+}
+
+#[test]
+fn family_network_and_nested_route_continuations_never_earn_again() {
+    let nodes = [node("a"), node("b")];
+    let manager = GroupManager::new(
+        &[
+            group("child", &nodes),
+            group("other", &nodes),
+            group_with_children("score", &[], &["child"]),
+        ],
+        &nodes,
+    );
+    for _ in 0..16 {
+        let target = context("original.example", IpVersion::V6);
+        let plan = manager.selection_plan_for_target("score", &target);
+        let original = plan.entries[0].feedback.as_ref().unwrap();
+        original.begin().unwrap().finish(ScoreOutcome::Cancelled);
+        let mut related = original
+            .clone()
+            .with_context(context("related.example", IpVersion::V4))
+            .unwrap();
+        related.begin().unwrap().finish(ScoreOutcome::Cancelled);
+        let mut udp = related.context().clone();
+        udp.network = SelectionNetwork::Udp;
+        udp.probe_domain = ProbeDomain::DnsUdp;
+        related = related.with_context(udp.clone()).unwrap();
+        related.begin().unwrap().finish(ScoreOutcome::Cancelled);
+        let rerouted = manager.selection_plan_for_target_with_health_fallback(
+            "other",
+            &udp,
+            Some(&related.continuation().unwrap()),
+        );
+        rerouted.entries[0]
+            .feedback
+            .as_ref()
+            .unwrap()
+            .begin()
+            .unwrap()
+            .finish(ScoreOutcome::Cancelled);
+    }
+    assert_eq!(manager.score_state().root_business_starts(), 16);
+    for group in ["score", "child"] {
+        let tcp = counts(&manager, group);
+        assert_eq!((tcp.business_starts, tcp.earned_available), (16, 1));
+        let udp = manager.score_budget_counters(group, SelectionNetwork::Udp);
+        assert_eq!(
+            (udp.business_starts, udp.earned_available, udp.spent),
+            (0, 0, 0)
+        );
+    }
+    let rerouted = manager.score_budget_counters("other", SelectionNetwork::Udp);
+    assert_eq!(
+        (
+            rerouted.business_starts,
+            rerouted.earned_available,
+            rerouted.spent
+        ),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn reload_refunds_pending_but_retains_running_trial_cap_until_settlement_or_ttl() {
+    let nodes: Vec<_> = (0..5).map(|index| node(&format!("leaf-{index}"))).collect();
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let state = manager.score_state();
+    let target = context("reload-cap.example", IpVersion::V4);
+    let now = Instant::now();
+    let attribution = [ScoreAttribution {
+        group: "score".into(),
+        node_id: nodes[0].id,
+    }];
+    let reserve = |at| {
+        budget::reserve(
+            &state,
+            &mut state.inner.lock(),
+            "score",
+            &target,
+            nodes[0].id,
+            (ScoreEvidenceQuestion::Availability, 4),
+            at,
+        )
+    };
+    let mut running = Vec::new();
+    for _ in 0..3 {
+        let work = reserve(now).unwrap();
+        assert!(budget::begin(
+            &mut state.inner.lock(),
+            &manager.score_authority,
+            &target,
+            &attribution,
+            &budget::Opportunity::default(),
+            std::slice::from_ref(&work),
+            now,
+        ));
+        running.push(work);
+    }
+    let pending = reserve(now).unwrap();
+    let replacement = GroupManager::with_alive_set_and_score_state(
+        &[group("score", &nodes[..2])],
+        &nodes,
+        None,
+        Arc::clone(&state),
+    );
+    replacement.publish_score_membership();
+    let after = counts(&replacement, "score");
+    assert_eq!(
+        (
+            after.spent,
+            after.reserved,
+            after.refunded,
+            after.cold_available
+        ),
+        (3, 0, 1, 1)
+    );
+    assert_eq!((after.cold_allowance, after.earning_period), (4, 16));
+    assert!(!budget::begin(
+        &mut state.inner.lock(),
+        &replacement.score_authority,
+        &target,
+        &attribution,
+        &budget::Opportunity::default(),
+        std::slice::from_ref(&pending),
+        now,
+    ));
+    let fourth = reserve(now).unwrap();
+    assert!(budget::begin(
+        &mut state.inner.lock(),
+        &replacement.score_authority,
+        &target,
+        &attribution,
+        &budget::Opportunity::default(),
+        std::slice::from_ref(&fourth),
+        now,
+    ));
+    assert_eq!(
+        budget::wait_reason(
+            &state.inner.lock(),
+            "score",
+            &target,
+            nodes[0].id,
+            ScoreEvidenceQuestion::Availability,
+            4,
+            now,
+        ),
+        ScoreWaitReason::InFlight
+    );
+    assert!(reserve(now).is_none());
+    budget::finish(
+        &state,
+        std::slice::from_ref(&running[0]),
+        ScoreOutcome::Cancelled,
+        now,
+    );
+    assert_eq!(
+        budget::wait_reason(
+            &state.inner.lock(),
+            "score",
+            &target,
+            nodes[0].id,
+            ScoreEvidenceQuestion::Availability,
+            4,
+            now,
+        ),
+        ScoreWaitReason::Budget
+    );
+    let later = now + Duration::from_secs(61);
+    assert_eq!(
+        budget::wait_reason(
+            &state.inner.lock(),
+            "score",
+            &target,
+            nodes[0].id,
+            ScoreEvidenceQuestion::Availability,
+            1,
+            later,
+        ),
+        ScoreWaitReason::Budget
+    );
+    assert_eq!(
+        (
+            counts(&replacement, "score").spent,
+            counts(&replacement, "score").refunded
+        ),
+        (4, 1)
+    );
+}
+
+#[test]
+fn targetless_reserved_work_is_refunded_and_cannot_start_for_free() {
+    let nodes = [node("a"), node("b")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let state = manager.score_state();
+    let target =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    let now = Instant::now();
+    let work = budget::reserve(
+        &state,
+        &mut state.inner.lock(),
+        "score",
+        &target,
+        nodes[0].id,
+        (ScoreEvidenceQuestion::Availability, 4),
+        now,
+    )
+    .unwrap();
+    let attempt = ScoreAttempt::planned(
+        manager
+            .feedback_for_group_node("score", nodes[0].id, target.clone())
+            .unwrap(),
+        Arc::new(budget::Opportunity::default()),
+        vec![work],
+        ScoreTrialSource::None,
+    );
+    assert!(attempt.begin_at(now).is_err());
+    assert!(attempt.begin_at(now).is_err());
+    assert!(attempt.continuation().is_err());
+    let after = counts(&manager, "score");
+    assert_eq!(
+        (
+            after.spent,
+            after.reserved,
+            after.refunded,
+            after.cold_available
+        ),
+        (0, 0, 1, 2)
+    );
+    let ordinary = manager
+        .feedback_for_group_node("score", nodes[0].id, target)
+        .unwrap()
+        .business();
+    ordinary
+        .begin_at(now)
+        .unwrap()
+        .finish(ScoreOutcome::Cancelled);
+    let related = ordinary
+        .with_context(context("later.example", IpVersion::V4))
+        .unwrap();
+    related
+        .begin_at(now)
+        .unwrap()
+        .finish(ScoreOutcome::Cancelled);
+    assert_eq!(counts(&manager, "score").business_starts, 0);
+    assert_eq!(state.root_business_starts(), 0);
+}
+
+#[test]
+fn stale_ordinary_begin_and_retry_preserve_traffic_without_publishing_or_earning() {
+    let nodes = [node("a"), node("b")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let state = manager.score_state();
+    let target = context("stale-ordinary.example", IpVersion::V4);
+    let original = manager
+        .feedback_for_group_node("score", nodes[0].id, target.clone())
+        .unwrap()
+        .business();
+    let replacement = GroupManager::with_alive_set_and_score_state(
+        &[group("score", &nodes)],
+        &nodes,
+        None,
+        Arc::clone(&state),
+    );
+    replacement.publish_score_membership();
+    let now = Instant::now();
+    let reporter = original.begin_at(now).unwrap().start_at(now);
+    assert!(original.clone().begin_at(now).is_err());
+    reporter.setup_succeeded_at(now);
+    reporter.transfer_at(1, 1, now + Duration::from_millis(10));
+    reporter.finish_at(ScoreOutcome::Success, true, now + Duration::from_millis(20));
+    assert_eq!(state.exact_stats("score", &target, nodes[0].id), None);
+    assert_eq!(counts(&replacement, "score").business_starts, 0);
+    let retry = manager.score_retry_plan_for_target(
+        "score",
+        &target,
+        nodes[0].id,
+        &[],
+        &original.continuation().unwrap(),
+    );
+    let attempt = retry.entries[0].feedback.as_ref().unwrap();
+    attempt
+        .begin_at(now)
+        .unwrap()
+        .finish(ScoreOutcome::Cancelled);
+    assert!(attempt.begin_at(now).is_err());
+    let active_retry = replacement.selection_plan_for_target_with_health_fallback(
+        "score",
+        &target,
+        Some(&attempt.continuation().unwrap()),
+    );
+    active_retry.entries[0]
+        .feedback
+        .as_ref()
+        .unwrap()
+        .begin_at(now)
+        .unwrap()
+        .finish(ScoreOutcome::Cancelled);
+    let after = counts(&replacement, "score");
+    assert_eq!(
+        (
+            after.business_starts,
+            after.spent,
+            after.reserved,
+            after.earned_available
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(state.root_business_starts(), 0);
+}
+
+#[test]
+fn stale_run_bound_ordinary_work_cannot_downgrade_to_unscored() {
+    let nodes = [node("a"), node("b")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let state = manager.score_state();
+    let target = context("stale-control.example", IpVersion::V4);
+    let now = Instant::now();
+    let work = budget::Work::new(
+        &state,
+        "score",
+        &target,
+        nodes[0].id,
+        ScoreTrialSource::None,
+    );
+    budget::bind_deadline(
+        &mut state.inner.lock(),
+        &work,
+        now + Duration::from_secs(45),
+    );
+    let attempt = ScoreAttempt::planned(
+        manager
+            .feedback_for_group_node("score", nodes[0].id, target)
+            .unwrap(),
+        Arc::new(budget::Opportunity::default()),
+        vec![work],
+        ScoreTrialSource::None,
+    );
+    let replacement = GroupManager::with_alive_set_and_score_state(
+        &[group("score", &nodes)],
+        &nodes,
+        None,
+        Arc::clone(&state),
+    );
+    replacement.publish_score_membership();
+    assert!(attempt.begin_at(now).is_err());
+    assert!(attempt.continuation().is_err());
+    assert_eq!(state.root_business_starts(), 0);
 }
