@@ -114,13 +114,16 @@ impl NativeState {
                 );
             }
         }
-        // Password mode needs its credential directory before the listener answers anything.
+        // Password mode needs its record before the listener answers anything.
         let auth = if settings.password_auth {
-            Some(auth::Auth::open(&data_dir).map_err(|error| {
-                anyhow::anyhow!(
-                    "native API password login cannot use {}: {error}",
-                    data_dir.join(auth::CREDENTIAL_DIR).display()
-                )
+            let db = match control.state_db() {
+                Some(db) => db,
+                None => Arc::new(crate::state::StateDb::open(&data_dir).map_err(|error| {
+                    anyhow::anyhow!("native API password login needs the state db: {error}")
+                })?),
+            };
+            Some(auth::Auth::open(db, &data_dir).map_err(|error| {
+                anyhow::anyhow!("native API password login cannot use the state db: {error}")
             })?)
         } else {
             None

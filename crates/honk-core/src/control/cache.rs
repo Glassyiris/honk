@@ -42,6 +42,7 @@ impl ControlPlane {
         let Some(state) = state else {
             return;
         };
+        self.state_db = Some(Arc::clone(&state));
         if !cache_cfg.enabled {
             self.start_state_tick(state, None);
             return;
@@ -231,6 +232,12 @@ impl ControlPlane {
             }
         });
         self.state_tick.task = Some(task);
+    }
+
+    /// The state database, when `init_cache_db` had one.
+    #[cfg(feature = "native-api")]
+    pub(crate) fn state_db(&self) -> Option<Arc<StateDb>> {
+        self.state_db.clone()
     }
 
     /// Shared handle to the persistent cache database (clash API, etc.).

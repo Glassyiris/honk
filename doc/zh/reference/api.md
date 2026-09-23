@@ -94,11 +94,13 @@ Setup 与 login 每分钟按规范化对端最多接受 5 次尝试，全局最�
 
 会话 token 是不透明的 `hnk1_…` 值，通过 `Authorization: Bearer <session>` 使用。每个会话固定有效 12 小时。进程只保留 token 的 SHA-256 digest，最多保留 32 个有效会话；签发新会话时淘汰最早会话，重启结束全部会话。通过配置 secret 或密码登录启动的 operation 属于管理员，而非某个 token，因此 logout 不删除 operation。
 
-密码模式把唯一凭据记录存于 `<data_dir>/native-api/admin.json`。新目录与记录分别使用 `0700` 和 `0600`；已有对象必须由进程的有效用户拥有，且不能授予 group 或 other 权限。符号链接、其他所有者、更宽权限或畸形记录都会阻止启动。
+密码模式把唯一凭据记录保存在状态数据库 `<data_dir>/state/honk.db` 的 `admin` 行中（文件权限 0600，目录 0700，见[配置数据库](#配置数据库--store-db)）。记录畸形时拒绝启动；状态数据库损坏时同样拒绝启动，密码模式不会把它移走。
 
-记录使用 PBKDF2-HMAC-SHA256、100,000 次迭代及新生成的 16 字节随机 salt。密码模式直接使用配置的 `global.data_dir`：该目录不可用时启动失败，不回退到其他目录，以免在别处重新开放 setup。首次 setup 不替换已有记录，凭据目录在进程生命周期内保持独占锁定。
+记录使用 PBKDF2-HMAC-SHA256、100,000 次迭代及新生成的 16 字节随机 salt。密码模式直接使用配置的 `global.data_dir`：该目录不可用时启动失败，不回退到其他目录，以免在别处重新开放 setup。首次 setup 插入该行，不替换已有记录，因此两个进程在同一个状态数据库上同时 setup 时只有一个成功。写入开始前数据库忙碌时，setup 失败，可以重试。插入或提交因其他原因失败时，由于该行是否已持久化无法确定，进程在重启前拒绝登录和再次 setup。
 
-不提供 HTTP 密码重置。恢复访问时，停止 honk，删除 `admin.json`，重启后重新 setup。
+状态数据库之前的版本把记录保存在 `<data_dir>/native-api/admin.json`。启用 `password_auth` 时，首次启动导入该文件一次（已有的行优先），随后删除文件，`native-api/` 为空时一并删除；旧文件仍须通过与之前相同的所有者与权限检查。未启用 `password_auth` 时不处理该文件。此后再启动旧版本时，它找不到 `admin.json`，会重新开放 setup。
+
+不提供 HTTP 密码重置。恢复访问时，停止 honk，执行 `honk-core admin reset`，重启后重新 setup。把 `<data_dir>/state` 整个移走也能恢复，但会丢弃所有其他持久化状态。
 
 ### 用户态记录流（M2）
 

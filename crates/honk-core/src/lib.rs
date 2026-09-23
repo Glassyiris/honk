@@ -185,6 +185,17 @@ pub enum ClashCommand {
         #[command(subcommand)]
         action: ConfigCommand,
     },
+    /// Manage the password-mode administrator
+    Admin {
+        #[command(subcommand)]
+        action: AdminCommand,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum AdminCommand {
+    /// Delete the administrator record so that setup opens again; refused while honk-core runs
+    Reset,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -294,6 +305,17 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
         }
         #[cfg(not(feature = "native-api"))]
         ClashCommand::Config { .. } => anyhow::bail!("config export needs the native-api feature"),
+        ClashCommand::Admin {
+            action: AdminCommand::Reset,
+        } => {
+            let deleted = state::reset_admin(&cli.data_dir)
+                .map_err(|error| anyhow::anyhow!("admin reset: {error}"))?;
+            if deleted {
+                println!("Deleted the administrator; setup is open again");
+            } else {
+                println!("No administrator was set up");
+            }
+        }
         ClashCommand::Reload => {
             let pid = request_reload(std::path::Path::new(INSTANCE_LOCK_PATH))?;
             println!("Reload requested for honk-core process {pid}");
@@ -442,7 +464,9 @@ fn open_state_db(
 ) -> anyhow::Result<(Option<Arc<state::StateDb>>, bool)> {
     let strict = cli.store == ConfigStore::Db || config.experimental.native_api.password_auth;
     if cli.store == ConfigStore::Db
-        || !(config.experimental.cache_file.enabled || config.global.store_subscribe)
+        || !(config.experimental.cache_file.enabled
+            || config.global.store_subscribe
+            || config.experimental.native_api.password_auth)
     {
         return Ok((None, false));
     }

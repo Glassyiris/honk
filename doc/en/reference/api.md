@@ -91,11 +91,13 @@ Setup and login admit at most five attempts per canonical peer and ten attempts 
 
 Session tokens are opaque `hnk1_…` values used as `Authorization: Bearer <session>`. Each has a fixed 12-hour lifetime. The process retains only SHA-256 token digests, keeps at most 32 live sessions and evicts the oldest when issuing another; restart ends every session. Operations started through a configured secret or password login belong to the administrator rather than to one token, so logout does not delete them.
 
-Password mode stores one credential record at `<data_dir>/native-api/admin.json`. New directories and records use modes `0700` and `0600`; existing objects must be owned by the effective user and grant no permissions to group or other users. Symlinks, foreign ownership, broader permissions or a malformed record prevent startup.
+Password mode stores one credential record in the `admin` row of the state db, `<data_dir>/state/honk.db` (a 0600 file in a 0700 directory; see [Configuration db](#configuration-db---store-db)). A malformed record prevents startup, and so does a corrupt state db: password mode never moves it aside.
 
-The record uses PBKDF2-HMAC-SHA256 with 100,000 iterations and a fresh 16-byte random salt. Password mode uses the configured `global.data_dir` itself: if that directory is unusable, startup fails instead of falling back to another directory, where setup would reopen. First setup publishes without replacing an existing record, and the credential directory remains exclusively locked for the process lifetime.
+The record uses PBKDF2-HMAC-SHA256 with 100,000 iterations and a fresh 16-byte random salt. Password mode uses the configured `global.data_dir` itself: if that directory is unusable, startup fails instead of falling back to another directory, where setup would reopen. First setup inserts the row without replacing an existing one, so of two processes racing setup on one state db exactly one wins. If the db is busy before anything is written, setup fails and can be retried. If the insert or its commit fails for any other reason, the process refuses login and a second setup until it restarts, because the row may or may not be durable.
 
-There is no HTTP password reset. To recover access, stop honk, remove `admin.json`, restart, and run setup again.
+Releases before the state db kept the record in `<data_dir>/native-api/admin.json`. With `password_auth`, the first start imports it once (an existing row wins), then deletes the file and removes `native-api/` if it is empty; the old file must pass the same ownership and mode checks as before. Without `password_auth` the file is left alone. An older binary started afterwards finds no `admin.json` and opens setup again.
+
+There is no HTTP password reset. To recover access, stop honk, run `honk-core admin reset`, restart, and run setup again. Moving `<data_dir>/state` aside also works but discards every other persisted state.
 
 ### Recorded userspace flows (M2)
 

@@ -1,37 +1,39 @@
 //! Administrator credentials and sessions for password mode.
 //!
-//! One record in `<data_dir>/native-api/admin.json` names the administrator and holds a
+//! One record in the state db's `admin` row names the administrator and holds a
 //! PBKDF2-HMAC-SHA256 hash of the password. Sessions are opaque random tokens kept in memory as
 //! SHA-256 digests; a restart forgets them all.
 
 use std::fs::File;
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
 use hmac::Mac as _;
 use hmac::digest::KeyInit as _;
 use nix::errno::Errno;
-use nix::fcntl::AtFlags;
-use nix::fcntl::{Flock, FlockArg, OFlag, open, openat};
-use nix::sys::stat::{Mode, mkdirat};
-use nix::unistd::{UnlinkatFlags, linkat, unlinkat};
+use nix::fcntl::{OFlag, open, openat};
+use nix::sys::stat::Mode;
+use nix::unistd::{UnlinkatFlags, unlinkat};
 use parking_lot::Mutex;
 use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 
-use crate::state::{DIR_FLAGS, effective_uid};
+use rusqlite::{OptionalExtension as _, TransactionBehavior};
+
+use crate::state::{DIR_FLAGS, StateDb, effective_uid};
 
 #[cfg(test)]
 mod tests;
 
-/// Directory under the data directory that holds the record; mode 0700.
-pub(crate) const CREDENTIAL_DIR: &str = "native-api";
-pub(crate) const RECORD_FILE: &str = "admin.json";
+/// Where releases before the state db kept the record, below the data directory.
+pub(crate) const LEGACY_DIR: &str = "native-api";
+pub(crate) const LEGACY_RECORD: &str = "admin.json";
 const RECORD_LIMIT: usize = 4096;
 /// A login costs this many HMAC rounds: about a tenth of a second on a router-class CPU, which
 /// only the administrator pays, and enough that a stolen record is not cheap to guess against.
@@ -155,14 +157,12 @@ impl Record {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum StoreError {
-    #[error("credential directory is unusable: {0}")]
+    #[error("credential store is unusable: {0}")]
     Unavailable(&'static str),
-    #[error("credential directory or record is not private to this user")]
+    #[error("legacy credential directory or record is not private to this user")]
     Unsafe,
     #[error("credential record is corrupt or unsupported")]
     Corrupt,
-    #[error("another honk process holds the credential directory")]
-    Locked,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -171,14 +171,14 @@ pub(crate) enum SetupError {
     AlreadyCompleted,
     #[error("the record could not be written")]
     Unavailable,
-    /// The record is visible but the directory did not sync; nothing may rely on it until a restart.
+    /// The row may or may not be durable; nothing may rely on it until a restart.
     #[error("the record was written but not confirmed durable")]
     NotDurable,
 }
 
-/// The credential directory, held open and locked for the life of the process.
+/// The administrator record in the state db's `admin` row.
 pub(crate) struct CredentialStore {
-    directory: Flock<File>,
+    db: Arc<StateDb>,
     state: Mutex<StoreState>,
 }
 
@@ -190,32 +190,22 @@ struct StoreState {
 }
 
 impl CredentialStore {
-    /// Opens `<data_dir>/native-api`, creating it 0700 if absent, and reads the record if present.
-    /// Anything that is not a private directory holding a valid record, or no record, fails closed.
-    pub(crate) fn open(data_dir: &Path) -> Result<Self, StoreError> {
-        let parent = File::from(
-            open(data_dir, DIR_FLAGS, Mode::empty())
-                .map_err(|_| StoreError::Unavailable("data directory"))?,
-        );
-        match mkdirat(&parent, CREDENTIAL_DIR, Mode::S_IRWXU) {
-            Ok(()) | Err(Errno::EEXIST) => {}
-            Err(_) => return Err(StoreError::Unavailable("credential directory")),
-        }
-        let directory = File::from(
-            openat(&parent, CREDENTIAL_DIR, DIR_FLAGS, Mode::empty())
-                .map_err(|_| StoreError::Unavailable("credential directory"))?,
-        );
-        let metadata = directory
-            .metadata()
-            .map_err(|_| StoreError::Unavailable("credential directory"))?;
-        if !metadata.is_dir() || metadata.uid() != effective_uid() || metadata.mode() & 0o077 != 0 {
-            return Err(StoreError::Unsafe);
-        }
-        let directory = Flock::lock(directory, FlockArg::LockExclusiveNonblock)
-            .map_err(|_| StoreError::Locked)?;
-        let record = read_record(&directory)?;
+    /// Imports a legacy `<data_dir>/native-api/admin.json`, then reads the record if present.
+    /// A record that fails its checks fails closed. Call with the instance lock held.
+    pub(crate) fn open(db: Arc<StateDb>, data_dir: &Path) -> Result<Self, StoreError> {
+        import_admin_json(&db, data_dir)?;
+        let record: Option<String> = db
+            .strict()
+            .query_row("SELECT record FROM admin WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|_| StoreError::Unavailable("state db"))?;
+        let record = record
+            .map(|record| Record::from_json(record.as_bytes()))
+            .transpose()?;
         Ok(Self {
-            directory,
+            db,
             state: Mutex::new(StoreState {
                 record,
                 blocked: false,
@@ -240,62 +230,129 @@ impl CredentialStore {
     }
 
     /// Publishes the first administrator without replacing anything: a second creator, racing or
-    /// not, sees `AlreadyCompleted`. The record is fsynced, linked into place, then the directory synced.
+    /// not, in this process or another, sees `AlreadyCompleted`.
     pub(crate) fn setup(&self, username: &str, password: &str) -> Result<(), SetupError> {
         let record = Record::create(username, password).ok_or(SetupError::Unavailable)?;
         let mut state = self.state.lock();
         if state.record.is_some() || state.blocked {
             return Err(SetupError::AlreadyCompleted);
         }
-        let name = format!(".admin-{}.tmp", uuid::Uuid::new_v4());
-        let mut file = File::from(
-            openat(
-                &*self.directory,
-                name.as_str(),
-                OFlag::O_WRONLY
-                    | OFlag::O_CREAT
-                    | OFlag::O_EXCL
-                    | OFlag::O_CLOEXEC
-                    | OFlag::O_NOFOLLOW,
-                Mode::S_IRUSR | Mode::S_IWUSR,
-            )
-            .map_err(|_| SetupError::Unavailable)?,
-        );
-        let written = file
-            .write_all(&record.to_json())
-            .and_then(|()| file.sync_all())
-            .map_err(|_| SetupError::Unavailable);
-        let linked = written.and_then(|()| {
-            linkat(
-                &*self.directory,
-                name.as_str(),
-                &*self.directory,
-                RECORD_FILE,
-                AtFlags::empty(),
-            )
-            .map_err(|error| {
-                if error == Errno::EEXIST {
-                    SetupError::AlreadyCompleted
-                } else {
-                    SetupError::Unavailable
-                }
-            })
-        });
-        let _ = unlinkat(&*self.directory, name.as_str(), UnlinkatFlags::NoRemoveDir);
-        linked?;
-        if self.directory.sync_all().is_err() {
-            state.blocked = true;
-            return Err(SetupError::NotDurable);
+        let json = String::from_utf8(record.to_json()).map_err(|_| SetupError::Unavailable)?;
+        let mut connection = self.db.strict();
+        // Nothing is written yet if the transaction cannot start, for example while busy.
+        let Ok(transaction) = connection.transaction_with_behavior(TransactionBehavior::Immediate)
+        else {
+            return Err(SetupError::Unavailable);
+        };
+        let result = (move || {
+            transaction.execute("INSERT INTO admin (id, record) VALUES (1, ?1)", [&json])?;
+            transaction.commit()
+        })();
+        match result {
+            Ok(()) => {
+                state.record = Some(record);
+                Ok(())
+            }
+            Err(error)
+                if error.sqlite_error().is_some_and(|error| {
+                    error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                }) =>
+            {
+                Err(SetupError::AlreadyCompleted)
+            }
+            Err(_) => {
+                // Failing at the statement or at COMMIT leaves the row's durability unknown.
+                state.blocked = true;
+                Err(SetupError::NotDurable)
+            }
         }
-        state.record = Some(record);
-        Ok(())
     }
+}
+
+/// Copies a legacy `admin.json` into the `admin` row once, unless a row exists,
+/// then unlinks it and removes `native-api/` if that left it empty.
+fn import_admin_json(db: &StateDb, data_dir: &Path) -> Result<(), StoreError> {
+    let parent = File::from(
+        open(data_dir, DIR_FLAGS, Mode::empty())
+            .map_err(|_| StoreError::Unavailable("data directory"))?,
+    );
+    let directory = match openat(&parent, LEGACY_DIR, DIR_FLAGS, Mode::empty()) {
+        Ok(fd) => File::from(fd),
+        Err(Errno::ENOENT) => return Ok(()),
+        Err(Errno::ELOOP | Errno::ENOTDIR) => return Err(StoreError::Unsafe),
+        Err(_) => return Err(StoreError::Unavailable("legacy credential directory")),
+    };
+    let metadata = directory
+        .metadata()
+        .map_err(|_| StoreError::Unavailable("legacy credential directory"))?;
+    if !metadata.is_dir() || metadata.uid() != effective_uid() || metadata.mode() & 0o077 != 0 {
+        return Err(StoreError::Unsafe);
+    }
+    let Some(record) = read_record(&directory)? else {
+        return Ok(());
+    };
+    let source = format!("admin.json:{}", data_dir.join(LEGACY_DIR).display());
+    // Whether this call inserted the row; `None` when an earlier start had
+    // already imported this file's location.
+    let copied = (|| -> rusqlite::Result<Option<bool>> {
+        let mut connection = db.strict();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let done: Option<i64> = transaction
+            .query_row(
+                "SELECT 1 FROM legacy_import WHERE source = ?1",
+                [&source],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut inserted = None;
+        if done.is_none() {
+            let json = String::from_utf8_lossy(&record.to_json()).into_owned();
+            inserted = Some(
+                transaction.execute(
+                    "INSERT OR IGNORE INTO admin (id, record) VALUES (1, ?1)",
+                    [&json],
+                )? == 1,
+            );
+            transaction.execute(
+                "INSERT INTO legacy_import (source, done_at) VALUES (?1, ?2)",
+                rusqlite::params![source, unix_now_secs()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(inserted)
+    })();
+    let inserted = copied.map_err(|_| StoreError::Unavailable("state db"))?;
+    unlinkat(&directory, LEGACY_RECORD, UnlinkatFlags::NoRemoveDir)
+        .map_err(|_| StoreError::Unavailable("legacy credential record"))?;
+    directory
+        .sync_all()
+        .map_err(|_| StoreError::Unavailable("legacy credential directory"))?;
+    // Fails while anything else is left in it.
+    let _ = unlinkat(&parent, LEGACY_DIR, UnlinkatFlags::RemoveDir);
+    match inserted {
+        Some(true) => {
+            tracing::info!("imported the administrator record from native-api/admin.json")
+        }
+        Some(false) => tracing::warn!(
+            "native-api/admin.json removed without import: the state db already has an administrator"
+        ),
+        None => tracing::warn!(
+            "native-api/admin.json removed without import: an earlier start imported this location, so the file is from an older binary"
+        ),
+    }
+    Ok(())
+}
+
+fn unix_now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
 }
 
 fn read_record(directory: &File) -> Result<Option<Record>, StoreError> {
     let file = match openat(
         directory,
-        RECORD_FILE,
+        LEGACY_RECORD,
         OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
         Mode::empty(),
     ) {
@@ -509,9 +566,9 @@ pub(crate) struct Auth {
 }
 
 impl Auth {
-    pub(crate) fn open(data_dir: &Path) -> Result<Self, StoreError> {
+    pub(crate) fn open(db: Arc<StateDb>, data_dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
-            store: CredentialStore::open(data_dir)?,
+            store: CredentialStore::open(db, data_dir)?,
             sessions: Sessions::default(),
             rate: AuthRate::default(),
         })
@@ -527,7 +584,6 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
 use super::types::RequestId;
-use std::sync::Arc;
 
 use super::{ApiError, ErrorCode, NativeState, Peer, error};
 

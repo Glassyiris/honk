@@ -1100,8 +1100,12 @@ mod password_auth {
     }
 
     impl PasswordApp {
-        fn record(&self) -> std::path::PathBuf {
-            self.data.path().join("native-api").join("admin.json")
+        /// Rows in the state db's `admin` table.
+        fn administrators(&self) -> i64 {
+            rusqlite::Connection::open(self.data.path().join("state/honk.db"))
+                .unwrap()
+                .query_row("SELECT count(*) FROM admin", [], |row| row.get(0))
+                .unwrap()
         }
 
         async fn shutdown(self) {
@@ -1316,8 +1320,9 @@ mod password_auth {
             .await
             .unwrap();
         error_response(queried, StatusCode::UNAUTHORIZED, "authentication_required").await;
-        assert!(
-            !app.record().exists(),
+        assert_eq!(
+            app.administrators(),
+            0,
             "no account was created by a refused request"
         );
         app.shutdown().await;

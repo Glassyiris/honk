@@ -188,6 +188,76 @@ impl StateDb {
     }
 }
 
+/// Deletes the administrator record, for `honk-core admin reset`, and a legacy
+/// `native-api/admin.json` that no start has imported yet; `Ok(false)` when
+/// there was neither. Refused while any process has the db open through
+/// `StateDb`, because each holds a shared lock on `state/`.
+pub fn reset_admin(data_dir: &Path) -> Result<bool, StateError> {
+    // Before any start created the state db, only a legacy record can exist.
+    match std::fs::symlink_metadata(data_dir.join(STATE_DIR).join(DB_FILE)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return remove_legacy_admin(data_dir);
+        }
+        _ => {}
+    }
+    let directory = state_directory(data_dir, false)?;
+    let directory = Flock::lock(directory, FlockArg::LockExclusiveNonblock).map_err(
+        |(_, error)| match error {
+            Errno::EWOULDBLOCK => StateError::InUse,
+            _ => StateError::Unavailable,
+        },
+    )?;
+    let file = existing(&directory)?;
+    private(&file, false)?;
+    let metadata = file.metadata().map_err(|_| StateError::Unavailable)?;
+    drop(file);
+    let path = resolved(&directory)?.join(DB_FILE);
+    let connection = open_checked(
+        &path,
+        (metadata.dev(), metadata.ino()),
+        OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )?;
+    check(&connection)?;
+    // A first start that stopped before creating the schema left no administrator.
+    let schema: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'admin'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql)?;
+    let deleted = if schema == 0 {
+        0
+    } else {
+        connection.execute("DELETE FROM admin", []).map_err(sql)?
+    };
+    Ok(remove_legacy_admin(data_dir)? || deleted > 0)
+}
+
+fn remove_legacy_admin(data_dir: &Path) -> Result<bool, StateError> {
+    const LEGACY_DIR: &str = "native-api";
+    let parent =
+        File::from(open(data_dir, DIR_FLAGS, Mode::empty()).map_err(|_| StateError::Unavailable)?);
+    let directory = match openat(&parent, LEGACY_DIR, DIR_FLAGS, Mode::empty()) {
+        Ok(fd) => File::from(fd),
+        Err(Errno::ENOENT) => return Ok(false),
+        Err(error) => return Err(path_error(error)),
+    };
+    match nix::unistd::unlinkat(
+        &directory,
+        "admin.json",
+        nix::unistd::UnlinkatFlags::NoRemoveDir,
+    ) {
+        Ok(()) => {}
+        Err(Errno::ENOENT) => return Ok(false),
+        Err(error) => return Err(path_error(error)),
+    }
+    nix::unistd::fsync(&directory).map_err(|_| StateError::Unavailable)?;
+    // Fails while anything else is left in it.
+    let _ = nix::unistd::unlinkat(&parent, LEGACY_DIR, nix::unistd::UnlinkatFlags::RemoveDir);
+    Ok(true)
+}
+
 /// Which owners of the cache tables are configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActiveOwners {

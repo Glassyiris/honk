@@ -22,7 +22,7 @@ honk-core [OPTIONS] [COMMAND]
 | `-d`, `--debug` | Off | Select `debug` as the default console filter when `RUST_LOG` does not provide a valid filter. |
 | `--mock-ebpf` | Off | Use `MockEbpfBackend` instead of loading kernel eBPF. If `global.nfqueue_enable: true` is requested, honk logs a warning and disables NFQUEUE staging for this process. |
 | `--store file\|db` | `file` | `db` runs from the revisions in `<data-dir>/state/honk.db` and imports `-c` into an empty db. See the [configuration db](./api.md#configuration-db---store-db). |
-| `--data-dir PATH` | `/var/lib/honk` | Data directory holding the state db, `state/honk.db`. It must equal `global.data_dir`. Used by `--store db` and `config export`. |
+| `--data-dir PATH` | `/var/lib/honk` | Data directory holding the state db, `state/honk.db`. It must equal `global.data_dir`. Used by `--store db`, `config export` and `admin reset`. |
 
 Both binaries provide `-h`/`--help` and `-v`/`--version`.
 
@@ -51,6 +51,7 @@ See the [global configuration reference](./global.md) for `log_level`.
 | `mode <rule\|global\|direct>` | Loads `--config`, assigns the supplied string to `experimental.clash_api.default_mode`, and validates before rewriting structured-format files. `.dae` files are rejected unchanged because the writer cannot preserve dae syntax, comments, or includes; edit those sources directly or use `.toml`, `.yaml`, or `.json`. | File-only; it does not contact the running engine or change dial mode. The accepted strings differ from the normal dial-mode values `ip`, `domain`, `domain+`, and `domain++`. |
 | `proxy <group> <node>` | Checks that the group and node names each exist, then prints the requested selection. It does not check membership. | Nothing is written and no running engine is contacted. |
 | `config export --out PATH [--without-secrets]` | Writes the active revision of the configuration db as one `.dae` file, with listener secrets restored unless `--without-secrets`. It reads the db through a query-only connection that opens read-write, whether or not a daemon runs. Closing it never checkpoints or deletes `honk.db-wal`; apart from the `-shm` index SQLite may create, the only write it can cause is rolling back a journal a crash left. It publishes the file only once it is complete. | Creates `PATH` with mode 0600 and refuses an existing file. |
+| `admin reset` | Deletes the password-mode administrator from the state db under `--data-dir`, and a legacy `native-api/admin.json` that no start has imported yet, so the next start opens setup again. | Refused while any honk-core, mock mode included, has that state db open. |
 | `delay <node> [-u\|--url HOST:PORT]` | Opens one raw TCP connection with a five-second timeout and prints elapsed milliseconds. Without `--url`, it uses the node server address. | Not proxied, not an HTTP URLTest, and no running engine is contacted. |
 
 With `--store db`, `proxy` and `delay` read the active revision and `mode` refuses.
