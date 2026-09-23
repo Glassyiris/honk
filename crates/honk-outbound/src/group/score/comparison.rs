@@ -374,12 +374,11 @@ fn global_stats<'a>(
     network: super::SelectionNetwork,
     node: Uuid,
 ) -> Option<&'a Stats> {
-    inner.aggregate.iter().find_map(|(key, stats)| {
-        (key.group == group
-            && key.network == network
-            && key.family.is_none()
-            && key.node_id == node)
-            .then_some(stats)
+    inner.aggregate.peek(&AggregateKey {
+        group: group.to_owned(),
+        network,
+        family: None,
+        node_id: node,
     })
 }
 
