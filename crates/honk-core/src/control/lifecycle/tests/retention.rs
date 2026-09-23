@@ -263,11 +263,11 @@ async fn repeated_cycles_retain_accepted_artifacts_policy_cache_and_history() ->
 #[ignore = "requires transparent-listener permissions; run in the isolated lifecycle gate"]
 async fn delay_samples_persist_across_suspend_resume_and_stop_at_shutdown() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
-    let path = directory.path().join("cache.db");
+    let path = directory.path().join("state/honk.db");
     let mut node_id = uuid::Uuid::nil();
     let fixture = Fixture::start_with(|config, _| {
         config.experimental.cache_file.enabled = true;
-        config.experimental.cache_file.path = path.to_string_lossy().into_owned();
+        config.global.data_dir = directory.path().to_string_lossy().into_owned();
         node_id = config
             .nodes
             .iter()
@@ -294,15 +294,14 @@ async fn delay_samples_persist_across_suspend_resume_and_stop_at_shutdown() -> a
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
         let _ = db.load_delay_samples(now, 24 * 3600);
-        let value: Option<String> = sqlite
-            .query_row("SELECT value FROM kv WHERE key = 'delay:peer'", [], |row| {
-                row.get(0)
-            })
+        let value: Option<i64> = sqlite
+            .query_row(
+                "SELECT delay_ms FROM delay_sample WHERE node = 'peer'",
+                [],
+                |row| row.get(0),
+            )
             .optional()?;
-        Ok(value
-            .map(|value| serde_json::from_str::<serde_json::Value>(&value))
-            .transpose()?
-            .and_then(|value| value["delay_ms"].as_u64()))
+        Ok(value.map(i64::unsigned_abs))
     };
     for delay in [13, 29] {
         fixture.alive.pause_health_checks().await?;

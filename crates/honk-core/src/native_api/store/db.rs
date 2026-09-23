@@ -58,7 +58,7 @@ impl From<StateError> for StoreError {
             StateError::Unsafe => Self::Unsafe,
             StateError::Corrupt => Self::Corrupt,
             StateError::Unsupported => Self::Unsupported,
-            StateError::Locked => Self::Locked,
+            StateError::Locked | StateError::InUse => Self::Locked,
         }
     }
 }
@@ -182,6 +182,10 @@ impl DbStore {
     #[cfg(test)]
     pub(crate) fn open_in(data_dir: &Path, entry: &Path) -> Result<Self, StoreError> {
         Self::open(Arc::new(StateDb::open(data_dir)?), entry)
+    }
+
+    pub(crate) fn state(&self) -> Arc<StateDb> {
+        Arc::clone(&self.state)
     }
 
     /// The cached `(head, parent)`; never touches SQLite.

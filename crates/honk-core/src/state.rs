@@ -2,7 +2,11 @@
 //! everything honk persists.
 //!
 //! Strict tables hold what the operator cannot regenerate and are written with
-//! `synchronous = FULL`. Every table shares one `max_page_count` ceiling.
+//! `synchronous = FULL`; cache tables are written by other connections with
+//! `NORMAL`. Both share one `max_page_count` ceiling.
+
+pub mod cache;
+pub(crate) mod import;
 
 use std::fs::File;
 use std::os::fd::AsRawFd as _;
@@ -58,7 +62,7 @@ CREATE TABLE clash_state (key TEXT PRIMARY KEY CHECK (key IN ('mode','global')),
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum StateError {
+pub enum StateError {
     #[error("state database is unavailable")]
     Unavailable,
     #[error("state database path is unsafe")]
@@ -69,18 +73,31 @@ pub(crate) enum StateError {
     Unsupported,
     #[error("state database is locked by `honk-core admin reset`")]
     Locked,
+    #[error("another honk-core has the state database open")]
+    InUse,
+}
+
+/// Connection class; it decides `synchronous` and `foreign_keys`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Class {
+    Strict,
+    Cache,
 }
 
 /// The open state database. It holds a shared `flock` on `state/` for its
 /// lifetime, so an exclusive lock there means no daemon has the file open.
-pub(crate) struct StateDb {
+pub struct StateDb {
     _lock: Flock<File>,
+    /// `/proc/self/fd`-resolved path of `honk.db`; every open compares its
+    /// inode with `identity`.
+    path: PathBuf,
+    identity: (u64, u64),
     strict: Mutex<Connection>,
 }
 
 impl StateDb {
     /// Opens or creates `<data_dir>/state/honk.db` and checks its integrity.
-    pub(crate) fn open(data_dir: &Path) -> Result<Self, StateError> {
+    pub fn open(data_dir: &Path) -> Result<Self, StateError> {
         let directory = state_directory(data_dir, true)?;
         let directory = Flock::lock(directory, FlockArg::LockSharedNonblock).map_err(
             |(_, error)| match error {
@@ -113,11 +130,21 @@ impl StateDb {
             check(&connection)?;
         }
         create_schema(&mut connection)?;
-        configure(&connection)?;
+        configure(&connection, Class::Strict)?;
         Ok(Self {
             _lock: directory,
+            path,
+            identity,
             strict: Mutex::new(connection),
         })
+    }
+
+    /// A new connection to the same file, configured for `class`.
+    pub(crate) fn connect(&self, class: Class) -> Result<Connection, StateError> {
+        let connection =
+            open_checked(&self.path, self.identity, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        configure(&connection, class)?;
+        Ok(connection)
     }
 
     /// The strict connection, `synchronous = FULL`.
@@ -126,12 +153,82 @@ impl StateDb {
     }
 }
 
+/// Called with the instance lock held, after `open` found a non-strict db
+/// corrupt: moves `honk.db` and its `-wal` aside as `honk.db.corrupt` and
+/// `honk.db.corrupt-wal`, deletes `-shm` and creates a new file. An earlier
+/// `honk.db.corrupt` is never overwritten; honk then runs without a db (`None`).
+pub fn reset_corrupt(data_dir: &Path) -> Result<Option<StateDb>, StateError> {
+    const CORRUPT: &str = "honk.db.corrupt";
+    // Exclusive for the renames: no other process may have the file open.
+    let directory = Flock::lock(
+        state_directory(data_dir, false)?,
+        FlockArg::LockExclusiveNonblock,
+    )
+    .map_err(|(_, error)| match error {
+        Errno::EWOULDBLOCK => StateError::InUse,
+        _ => StateError::Unavailable,
+    })?;
+    let shown = resolved(&directory)?;
+    match nix::sys::stat::fstatat(
+        &*directory,
+        CORRUPT,
+        nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+    ) {
+        Ok(_) => {
+            tracing::warn!(
+                database = %shown.join(DB_FILE).display(),
+                earlier = %shown.join(CORRUPT).display(),
+                "state database is corrupt and an earlier copy is kept; running without it"
+            );
+            return Ok(None);
+        }
+        Err(Errno::ENOENT) => {}
+        Err(error) => return Err(path_error(error)),
+    }
+    // The `-wal` moves first: a crash in between must not leave it beside a new file.
+    for (from, to) in [("honk.db-wal", "honk.db.corrupt-wal"), (DB_FILE, CORRUPT)] {
+        match nix::fcntl::renameat2(
+            &*directory,
+            from,
+            &*directory,
+            to,
+            nix::fcntl::RenameFlags::RENAME_NOREPLACE,
+        ) {
+            Ok(()) | Err(Errno::ENOENT) => {}
+            Err(Errno::EEXIST) => {
+                tracing::warn!(
+                    earlier = %shown.join(to).display(),
+                    "state database is corrupt and an earlier copy is kept; running without it"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(path_error(error)),
+        }
+    }
+    match nix::unistd::unlinkat(
+        &*directory,
+        "honk.db-shm",
+        nix::unistd::UnlinkatFlags::NoRemoveDir,
+    ) {
+        Ok(()) | Err(Errno::ENOENT) => {}
+        Err(error) => return Err(path_error(error)),
+    }
+    nix::unistd::fsync(&*directory).map_err(|_| StateError::Unavailable)?;
+    tracing::warn!(
+        kept = %shown.join(CORRUPT).display(),
+        "state database was corrupt; moved it aside and started a new one"
+    );
+    drop(directory);
+    StateDb::open(data_dir).map(Some)
+}
+
 /// A `query_only` connection for readers such as `config export`, whether or
 /// not a daemon holds the file open. It sets no pragma that writes and does not
 /// checkpoint when it closes; besides the `-shm` index SQLite may create, the
 /// only write it can cause is rolling back a rollback journal left by a crash.
 /// Only `application_id` and `user_version` are checked, so it can read a file
 /// that fails `quick_check`.
+#[cfg(feature = "native-api")]
 pub(crate) fn open_read_only(data_dir: &Path) -> Result<(File, Connection), StateError> {
     let directory = state_directory(data_dir, false)?;
     let file = existing(&directory)?;
@@ -308,26 +405,43 @@ fn create_schema(connection: &mut Connection) -> Result<(), StateError> {
 }
 
 /// Per-connection pragmas, set on every open.
-fn configure(connection: &Connection) -> Result<(), StateError> {
+fn configure(connection: &Connection, class: Class) -> Result<(), StateError> {
     let mode: String = connection
         .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
         .map_err(sql)?;
-    match mode.as_str() {
-        "wal" => {}
+    let wal = match mode.as_str() {
+        "wal" => true,
         // For example, a filesystem without shared memory.
-        "delete" => tracing::warn!("state database cannot use WAL; using a rollback journal"),
+        "delete" => {
+            tracing::warn!("state database cannot use WAL; using a rollback journal");
+            false
+        }
         _ => return Err(StateError::Unavailable),
-    }
+    };
     for statement in [
         "PRAGMA wal_autocheckpoint = 256".to_owned(),
         "PRAGMA journal_size_limit = 1048576".to_owned(),
         format!("PRAGMA max_page_count = {MAX_PAGE_COUNT}"),
-        "PRAGMA synchronous = FULL".to_owned(),
-        "PRAGMA foreign_keys = ON".to_owned(),
     ] {
         run_pragma(connection, &statement)?;
     }
+    run_pragma(
+        connection,
+        &format!("PRAGMA synchronous = {}", synchronous(class, wal)),
+    )?;
+    if class == Class::Strict {
+        run_pragma(connection, "PRAGMA foreign_keys = ON")?;
+    }
     Ok(())
+}
+
+/// `NORMAL` is crash-safe only under WAL; with a rollback journal a cache
+/// commit, which can also move strict pages in `incremental_vacuum`, needs `FULL`.
+fn synchronous(class: Class, wal: bool) -> &'static str {
+    match class {
+        Class::Cache if wal => "NORMAL",
+        _ => "FULL",
+    }
 }
 
 fn run_pragma(connection: &Connection, statement: &str) -> Result<(), StateError> {

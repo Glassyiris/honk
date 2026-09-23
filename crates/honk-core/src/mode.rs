@@ -330,7 +330,7 @@ enum Persistence {
 struct DatapathFlagsInner {
     backend: SharedEbpfBackend,
     mode_state: SharedModeState,
-    cache_db: Option<Arc<crate::cachedb::CacheDb>>,
+    cache_db: Option<Arc<crate::state::cache::CacheDb>>,
     state: DatapathFlagsState,
 }
 
@@ -338,7 +338,7 @@ impl DatapathFlagsHandle {
     pub fn new(
         backend: SharedEbpfBackend,
         mode_state: SharedModeState,
-        cache_db: Option<Arc<crate::cachedb::CacheDb>>,
+        cache_db: Option<Arc<crate::state::cache::CacheDb>>,
     ) -> Self {
         Self {
             mode_state: Arc::clone(&mode_state),
@@ -520,7 +520,7 @@ impl DatapathFlagsHandle {
             match persistence {
                 Persistence::None => {}
                 Persistence::Mode => db.save_clash_mode(&mode.mode),
-                Persistence::Global => db.save_selector_choice("GLOBAL", &mode.global_selection),
+                Persistence::Global => db.save_clash_global(&mode.global_selection),
             }
         }
         Ok(mode)

@@ -11,16 +11,16 @@ use tokio::sync::mpsc;
 use super::PersistInvalidation;
 use super::codec;
 use super::{COMMAND_CAPACITY, Command, CounterSet, PersistControlError, Put};
-use crate::cachedb::CacheDb;
+use crate::state::cache::CacheDb;
 
 mod restore {
     use std::sync::atomic::Ordering;
 
     use super::super::codec::{self, DecodeError};
     use super::super::{CounterSet, unix_now};
-    use crate::cachedb::CacheDb;
     use crate::dns::cache::DnsCacheService;
     use crate::dns::policy::PolicyId;
+    use crate::state::cache::CacheDb;
 
     pub(super) fn restore(
         db: &CacheDb,
@@ -29,7 +29,7 @@ mod restore {
         policy: Option<&PolicyId>,
         counters: &CounterSet,
     ) -> usize {
-        let rows = match db.load_dns_v2() {
+        let rows = match db.load_dns() {
             Ok(rows) => rows,
             Err(error) => {
                 counters.db_errors.fetch_add(1, Ordering::Relaxed);
@@ -77,9 +77,13 @@ mod restore {
 
 const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const PENDING_CAPACITY: usize = COMMAND_CAPACITY;
+/// The `dns_answer.entry` `CHECK`. A row above it would abort the whole batch
+/// transaction, which `write_active` would then retry forever.
+pub(super) const MAX_ENTRY_BYTES: usize = 4096;
 
 struct Pending {
     epoch: u64,
+    expire_at_unix: u64,
     bytes: Vec<u8>,
 }
 
@@ -170,6 +174,11 @@ fn receive_put(
         return;
     }
     let encoded = codec::encode(&value.key, &value.response, value.expire_at_unix);
+    if encoded.bytes.len() > MAX_ENTRY_BYTES {
+        counters.oversize.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(reason = "oversize", "DNS persistence write dropped");
+        return;
+    }
     if pending
         .get(&encoded.suffix)
         .is_some_and(|existing| existing.epoch > value.epoch)
@@ -189,6 +198,7 @@ fn receive_put(
         encoded.suffix,
         Pending {
             epoch: value.epoch,
+            expire_at_unix: value.expire_at_unix,
             bytes: encoded.bytes,
         },
     );
@@ -204,19 +214,23 @@ fn write_active(
     let entries = pending
         .iter()
         .filter(|(_, value)| value.epoch == active_epoch)
-        .map(|(suffix, value)| (suffix.clone(), value.bytes.clone()))
+        .map(|(suffix, value)| (suffix.clone(), value.expire_at_unix, value.bytes.clone()))
         .collect::<Vec<_>>();
     if entries.is_empty() {
         return Ok(());
     }
     counters.write_attempts.fetch_add(1, Ordering::Relaxed);
-    match db.write_dns_v2(&entries) {
+    let suffixes: Vec<String> = entries
+        .iter()
+        .map(|(suffix, _, _)| suffix.clone())
+        .collect();
+    match db.write_dns(entries) {
         Ok(()) => {
-            for (suffix, _) in &entries {
+            for suffix in &suffixes {
                 pending.remove(suffix);
             }
             counters.written.fetch_add(
-                u64::try_from(entries.len()).unwrap_or(u64::MAX),
+                u64::try_from(suffixes.len()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
             counters.pending.store(pending.len(), Ordering::Relaxed);
@@ -248,7 +262,7 @@ fn flush(
     }
     *active_epoch = epoch;
     discard_before(pending, epoch, counters);
-    db.flush_dns_namespaces().map_err(|error| {
+    db.flush_dns().map_err(|error| {
         counters.db_errors.fetch_add(1, Ordering::Relaxed);
         PersistControlError::Database(error.to_string())
     })?;
@@ -292,20 +306,17 @@ fn invalidate(
         .fetch_add((before - pending.len()) as u64, Ordering::Relaxed);
     counters.pending.store(pending.len(), Ordering::Relaxed);
     let result = (|| {
-        let (suffixes, name): (Vec<String>, _) = match &selection {
-            PersistInvalidation::Keys(_) => (keys.iter().cloned().collect(), None),
-            PersistInvalidation::Name { name, types } => {
-                let suffixes = db
-                    .load_dns_v2()?
-                    .into_iter()
-                    .filter(|(suffix, bytes)| matches(suffix, bytes))
-                    .map(|(suffix, _)| suffix)
-                    .collect();
-                (suffixes, Some((name.as_str(), types.as_slice())))
-            }
+        let suffixes: Vec<String> = match &selection {
+            PersistInvalidation::Keys(_) => keys.iter().cloned().collect(),
+            PersistInvalidation::Name { .. } => db
+                .load_dns()?
+                .into_iter()
+                .filter(|(suffix, bytes)| matches(suffix, bytes))
+                .map(|(suffix, _)| suffix)
+                .collect(),
             PersistInvalidation::All => unreachable!("full invalidations use Flush"),
         };
-        db.delete_dns_entries(&suffixes, name)
+        db.delete_dns_entries(&suffixes)
     })();
     result.map_err(|error| {
         counters.db_errors.fetch_add(1, Ordering::Relaxed);

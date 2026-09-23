@@ -7,7 +7,7 @@ This reference describes the current nested sections under `experimental { ... }
 | Nested section | Purpose |
 | --- | --- |
 | `clash_api` | Clash-compatible HTTP API and external dashboard |
-| `cache_file` | SQLite persistence for runtime choices, mode, delay samples, and optional DNS state |
+| `cache_file` | Persistence of runtime choices, mode, delay samples, and optional DNS state in the state db |
 | `native_api` | Independent, opt-in observations, bounded diagnostics, runtime/source control and local UI directory |
 
 `udp_nfqueue { enabled: ... }` is a deprecated compatibility section. Dae and structured loaders accept it, print a migration warning, and copy its value to `global.nfqueue_enable`; new configurations should use the global field directly.
@@ -110,24 +110,28 @@ With native disabled, `default_mode` accepts `Rule`, `Global`, and `Direct`; a v
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `false` | Open the SQLite cache and enable runtime-state persistence. |
-| `path` | `"cache.db"` | Database path. An absolute path is literal. For a relative path, an existing file below `global.data_dir` wins, then an existing file below `/var/share/honk`, then an existing path relative to the original config directory; a new file is created below `global.data_dir`. |
-| `cache_id` | `""` | Namespace for every database key. A non-empty value prefixes keys with `<cache_id>:`. |
-| `store_fakeip` | `false` | FakeIP persistence intent only. The `fakeip:` prefix and flush API exist, but the engine does not populate or restore mappings yet. |
-| `store_dns` | `false` | Persist and restore DNS cache answers using the exact-key v2 format. |
+| `enabled` | `false` | Persist runtime state in the state db, `<data_dir>/state/honk.db`. |
+| `store_dns` | `false` | Also persist and restore DNS cache answers. |
 
-The whole `cache_file` section is startup-owned. SIGHUP rejects a candidate configuration that changes any field.
+Both fields are startup-owned; SIGHUP rejects a candidate configuration that changes either.
 
-### Always-persisted state
+`path`, `cache_id` and `store_fakeip` are no longer settings. They still parse, emit a `legacy-cache-file` warning and have no effect, and SIGHUP accepts edits to them. `path` and `cache_id` are read once, to import a legacy `cache.db` (below).
 
-Whenever `enabled` successfully opens the database, honk persists per-network Selector choices and each node's last real delay sample independently of `store_fakeip` and `store_dns`. Clash mode is restored/persisted only with native API disabled. Delay samples are snapshotted every minute; restoration discards malformed, zero, or older-than-24-hour samples. Liveness is not restored.
+### Persisted state
+
+With `enabled`, honk keeps per-network Selector choices and each node's last real delay sample in the state db, independently of `store_dns`. Clash mode and the Clash GLOBAL selection are restored and persisted only with native API disabled. Delay samples are written as one batch every minute; restoration discards zero samples and samples older than 24 hours. Liveness is not restored.
+
+If the state db is corrupt and neither `--store db` nor `native_api.password_auth` is set, honk moves `honk.db` and `honk.db-wal` aside as `honk.db.corrupt` and `honk.db.corrupt-wal` once it holds the instance lock, and starts a new file. If `honk.db.corrupt` already exists, it keeps both files and runs without persistence until one is removed. In the same case a state db that is unavailable, unsafe (not a private file owned by the honk user) or locked by `honk-core admin reset` also leaves honk running without persistence, with a warning. A db from a newer honk or another program refuses startup in every mode, because moving it aside would destroy data only that program can read.
 
 ### DNS persistence
 
-With `store_dns: true`, entries use the `dns:v2:` key namespace and an `HDNS` version-2 binary payload. The v2 namespace is rollback-safe: a pre-v2 binary reads the legacy `dns:` namespace while excluding `dns:v2:` rows, so it leaves v2 data untouched.
+With `store_dns: true`, each answer is one `dns_answer` row holding an `HDNS` version-2 payload, keyed by the digest of its exact cache key. A row is restored only while unexpired and only when its key digest, canonical query wire, response wire identity and active DNS policy match. The exact key also preserves the ingress profile, request scope and operation, preventing reuse across different DNS contexts. An entry that encodes to more than 4 KiB is not persisted and is counted as `oversize`.
 
-A v2 row is restored only while unexpired and only when its key digest, canonical query wire, response wire identity, and active DNS policy match. The exact key also preserves the ingress profile, request scope, and operation, preventing reuse across different DNS contexts.
+### Upgrading from `cache.db`
 
+The first start with `enabled` imports the legacy `cache.db` that `path` names, resolved as before: an absolute path is literal; a relative one prefers an existing file below `global.data_dir`, then below `/var/share/honk`, then relative to the original config directory. Only keys under this instance's `cache_id` prefix are read. Per-network Selector choices of Selector groups in the configuration, Clash mode, the Clash GLOBAL selection and delay samples newer than 24 hours of configured nodes are copied; rows already in the state db win. Name-only Selector choices from older releases, DNS answers and FakeIP rows are not imported, so persisted DNS answers are refetched. The import is recorded in the state db, one row per imported path, and never repeated, even if an older binary recreates the file. A `cache.db` that is a symlink, is not a regular file owned by the honk user, is writable by other users, or cannot be read as a `cache.db` is left in place with a warning, and the next start tries again.
+
+With an empty `cache_id`, honk then deletes `cache.db`, its `-wal` and `-shm`, and any `cache.db.corrupt-*` copies. With a non-empty `cache_id`, another instance may share the file, so it stays and honk logs a warning once. An older binary started afterwards finds no `cache.db` and starts with empty runtime state.
 
 ## Example
 
@@ -143,9 +147,6 @@ experimental {
     }
     cache_file {
         enabled: true
-        path: 'cache.db'
-        cache_id: 'gateway-main'
-        store_fakeip: false
         store_dns: true
     }
 }

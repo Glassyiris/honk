@@ -9,7 +9,6 @@
 //! in dae netns"). Trait-based backends (real aya + mock) for testing
 //! without kernel eBPF support.
 
-pub mod cachedb;
 #[cfg(feature = "clash-api")]
 pub mod clash_api;
 pub mod config_diagnostics;
@@ -27,8 +26,7 @@ pub mod pool;
 pub mod relay;
 pub mod routing;
 pub mod sniffing;
-#[cfg_attr(not(feature = "native-api"), allow(dead_code))]
-pub(crate) mod state;
+pub mod state;
 pub mod stats;
 pub mod subscription;
 
@@ -50,6 +48,7 @@ use honk_config::diagnostic::{
 };
 use honk_config::error::{DetailedConfigError, ErrorCategory};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Raise the soft descriptor limit toward the hard maximum, then return the
@@ -427,6 +426,52 @@ fn request_reload(path: &std::path::Path) -> anyhow::Result<libc::pid_t> {
         );
     }
     Ok(pid)
+}
+
+/// Opens the state db in file mode; db mode opened it with its revisions.
+/// Returns `(db, reset)`: `reset` asks for a corrupt, non-strict db to be
+/// moved aside once the instance lock is held.
+///
+/// Unless the db is strict, a db that is unavailable, unsafe or locked by
+/// `admin reset` leaves honk running without persistence; a newer schema or a
+/// foreign file still refuses startup, because only that binary can use it.
+fn open_state_db(
+    cli: &Cli,
+    config: &Config,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<(Option<Arc<state::StateDb>>, bool)> {
+    let strict = cli.store == ConfigStore::Db || config.experimental.native_api.password_auth;
+    if cli.store == ConfigStore::Db || !config.experimental.cache_file.enabled {
+        return Ok((None, false));
+    }
+    match state::StateDb::open(data_dir) {
+        Ok(db) => Ok((Some(Arc::new(db)), false)),
+        Err(state::StateError::Corrupt) if !strict => {
+            warn!("state database is corrupt; it is moved aside once the instance lock is held");
+            Ok((None, true))
+        }
+        Err(
+            error @ (state::StateError::Unavailable
+            | state::StateError::Unsafe
+            | state::StateError::Locked),
+        ) if !strict => {
+            warn!(%error, "continuing without persistence");
+            Ok((None, false))
+        }
+        Err(error) => Err(anyhow::anyhow!("state database: {error}")),
+    }
+}
+
+/// Moves a corrupt, non-strict state db aside; any failure, including another
+/// process still holding the db, leaves honk running without persistence.
+fn reset_non_strict(data_dir: &std::path::Path) -> Option<Arc<state::StateDb>> {
+    match state::reset_corrupt(data_dir) {
+        Ok(db) => db.map(Arc::new),
+        Err(error) => {
+            warn!(%error, "state database could not be reset; continuing without persistence");
+            None
+        }
+    }
 }
 
 /// Take the process-wide instance lock: the datapath uses fixed names
@@ -912,6 +957,20 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     report_detailed_diagnostics(&diagnostics);
     info!(directory = %honk_config::paths::data_dir().display(), "Runtime data directory configured");
+    let (state_db, state_reset) = open_state_db(&cli, &config, honk_config::paths::data_dir())?;
+    #[cfg(feature = "native-api")]
+    let state_db = database
+        .as_ref()
+        .map(|database| database.store.state())
+        .or(state_db);
+    let legacy_cache = {
+        let (path, cache_id) = config.experimental.cache_file.legacy_cache_file();
+        let config_dir = match cli.store {
+            ConfigStore::File => cli.config.parent(),
+            ConfigStore::Db => Some(cli.data_dir.as_path()),
+        };
+        state::import::LegacyCache::locate(path, cache_id, config_dir)
+    };
     if let Some(path) = log_file_path.as_ref() {
         info!(path = %path.display(), "File logging enabled");
     }
@@ -1021,9 +1080,17 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     } else {
         Some(acquire_instance_lock(&cli.bpf_pin_root)?)
     };
+    // Bound after the lock so they drop before it: a successor that takes the
+    // lock must not find this process still holding the state db.
+    let mut state_db = state_db;
+    #[cfg(feature = "native-api")]
+    let mut database = database;
     #[cfg(feature = "native-api")]
     if let Some(database) = database.as_mut() {
         database.record()?;
+    }
+    if state_reset {
+        state_db = reset_non_strict(honk_config::paths::data_dir());
     }
 
     // The old instance owns queue 320 until this lock is released. Check
@@ -1372,14 +1439,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     dns_upstream_pool.set_traffic_router(Some(control_plane.traffic_router()));
     info!("DNS upstream pool attached to SharedGroupManager + traffic Router");
 
-    // Persistent cache (selector choices, clash mode): opens cache.db when
-    // `experimental.cache_file` is enabled, restores Selector choices, and
-    // wires change persistence into the group manager.
-    let legacy_cache_dir = match cli.store {
-        ConfigStore::File => cli.config.parent(),
-        ConfigStore::Db => Some(cli.data_dir.as_path()),
-    };
-    control_plane.init_cache_db(legacy_cache_dir).await;
+    // Runtime state (selector choices, clash mode): with
+    // `experimental.cache_file` enabled, imports a legacy cache.db, restores
+    // Selector choices, and wires change persistence into the group manager.
+    control_plane
+        .init_cache_db(state_db.clone(), Some(legacy_cache))
+        .await;
 
     #[cfg(feature = "clash-api")]
     let clash_cfg = control_plane
@@ -1427,7 +1492,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     } else {
         cache_db
             .as_ref()
-            .and_then(|db| db.load_selector_choice("GLOBAL"))
+            .and_then(|db| db.load_clash_global())
             .filter(|selection| {
                 valid_global_selections
                     .iter()
@@ -2406,6 +2471,61 @@ mod startup_lifecycle_tests {
         running_instance_pid,
     };
     use clap::Parser;
+
+    #[test]
+    fn a_reset_that_cannot_run_leaves_honk_running_without_persistence() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(crate::state::StateDb::open(directory.path()).unwrap());
+        let held = crate::state::StateDb::open(directory.path()).unwrap();
+        assert!(super::reset_non_strict(directory.path()).is_none());
+        drop(held);
+    }
+
+    #[test]
+    fn a_non_strict_state_db_that_cannot_be_used_leaves_honk_running() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let cli = Cli::parse_from(["honk-core"]);
+        let mut config = honk_config::Config::default();
+        config.experimental.cache_file.enabled = true;
+
+        let unsafe_dir = tempfile::tempdir().unwrap();
+        let state = unsafe_dir.path().join(crate::state::STATE_DIR);
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (db, reset) = super::open_state_db(&cli, &config, unsafe_dir.path()).unwrap();
+        assert!(db.is_none() && !reset);
+
+        let locked_dir = tempfile::tempdir().unwrap();
+        drop(crate::state::StateDb::open(locked_dir.path()).unwrap());
+        let held = nix::fcntl::Flock::lock(
+            std::fs::File::open(locked_dir.path().join(crate::state::STATE_DIR)).unwrap(),
+            nix::fcntl::FlockArg::LockExclusiveNonblock,
+        )
+        .unwrap();
+        let (db, reset) = super::open_state_db(&cli, &config, locked_dir.path()).unwrap();
+        assert!(db.is_none() && !reset);
+        drop(held);
+
+        // Password mode makes the db strict: the same unsafe directory refuses startup.
+        config.experimental.native_api.password_auth = true;
+        assert!(super::open_state_db(&cli, &config, unsafe_dir.path()).is_err());
+
+        // A newer schema refuses startup either way.
+        config.experimental.native_api.password_auth = false;
+        let newer_dir = tempfile::tempdir().unwrap();
+        drop(crate::state::StateDb::open(newer_dir.path()).unwrap());
+        rusqlite::Connection::open(
+            newer_dir
+                .path()
+                .join(crate::state::STATE_DIR)
+                .join(crate::state::DB_FILE),
+        )
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 2")
+        .unwrap();
+        assert!(super::open_state_db(&cli, &config, newer_dir.path()).is_err());
+    }
 
     #[test]
     fn nfqueue_requested_with_mock_backend_falls_back_to_disabled() {

@@ -28,6 +28,7 @@ global {
 ```
 
 Legacy `experimental { udp_nfqueue { enabled: ... } }` warns and migrates to `global.nfqueue_enable`; never serialize the removed section.
+Removed `experimental.cache_file` keys (`path`, `cache_id`, `store_fakeip`) are `skip_serializing` legacy fields: they warn `legacy-cache-file` at parse and seed, have no effect, and only `legacy_cache_file()` reads `path`/`cache_id`, for the one-time `cache.db` import.
 
 Default on; restart-required. Activation requires the real eBPF backend and an `ebpf` build.
 Mock/no-`ebpf` startup or failed fixed-queue preflight warns and disables staging

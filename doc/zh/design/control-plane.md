@@ -214,7 +214,7 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 | DNS listener | `dns.bind` endpoint 或 transport 的语义变更 |
 | Clash API | `experimental.clash_api.external_controller`、`external_ui`、`external_ui_download_url`、`external_ui_download_detour`、`secret`、`default_mode` |
 | 原生 API | 任意 `experimental.native_api` 变更 |
-| 持久化 | 任意 `experimental.cache_file` 变更 |
+| 持久化 | `experimental.cache_file.enabled`、`store_dns` |
 | NFQUEUE | `global.nfqueue_enable` |
 | 健康检查与 TLS | `global.check_interval`、生效的第一个 `global.tcp_check_url`、启用 HTTP 检查时的 `global.tcp_check_http_method`、选中的 `global.udp_check_dns` 目标，或原生 TLS/uTLS 模式切换（参见[健康检查重载语义](../reference/global.md#重载健康检查与-tls-模式)） |
 

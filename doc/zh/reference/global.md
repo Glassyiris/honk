@@ -111,7 +111,7 @@ UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或
 | ---- | ---------------- |
 | 节点 `ech_config_path` | 依次优先使用已存在的 `<data_dir>/<path>`、已存在的 `/var/share/honk/<path>`，以及已存在的工作目录相对路径。都不存在时解析为 `<data_dir>/<path>`，使读取错误指出预期位置。 |
 | `global.log_file` | 相对路径始终通过仅用于创建的路径 helper 解析为 `<data_dir>/<path>`，启动时创建父目录；不会读取或迁移 `/var/share/honk` 中已有的日志。绝对路径保持原样。在 Linux 上，新日志文件使用 mode `0600`；符号链接与非普通文件会被拒绝，已有普通文件的权限保持不变。honk 只追加写且不负责轮转，需要时使用系统日志轮转工具。控制台与文件里的时间戳都是本机本地时间并带 UTC 偏移（`2026-09-12T02:30:15.123456+10:00`）。 |
-| `experimental.cache_file.path` | 依次优先使用已存在的 `<data_dir>/<path>`、已存在的 `/var/share/honk/<path>`，以及相对于原始配置目录且已存在的路径。新数据库在 `data_dir` 下创建。 |
+| `experimental.cache_file.path` | 不再决定存储位置，状态保存在 `<data_dir>/state/honk.db`。首次启动时按旧的解析顺序读取一次，用于导入旧 `cache.db`（见[升级说明](./experimental.md#从-cachedb-升级)）。 |
 | `experimental.clash_api.external_ui` | 依次优先使用已存在的 `<data_dir>/<path>`、已存在的 `/var/share/honk/<path>`，以及已存在的工作目录相对目录。都不存在时，dashboard 下载使用 `<data_dir>/<path>`。 |
 | 订阅存储 | 依次优先使用已存在的 `<data_dir>/.sub`、已存在的 `/var/share/honk/.sub`，以及已存在的 `./.sub`。都不存在时创建 `<data_dir>/.sub`；不会自动移动或删除存储。 |
 

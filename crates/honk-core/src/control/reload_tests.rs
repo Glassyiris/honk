@@ -107,6 +107,24 @@ fn native_api_settings_require_restart() {
 }
 
 #[test]
+fn edits_to_removed_cache_file_keys_do_not_require_restart() {
+    let current = Config::default();
+    let mut replacement = current.clone();
+    replacement.experimental.cache_file = serde_json::from_value(serde_json::json!({
+        "path": "elsewhere.db",
+        "cache_id": "gw",
+        "store_fakeip": true,
+    }))
+    .unwrap();
+    assert!(restart_required_changes(&current, &replacement).is_empty());
+    replacement.experimental.cache_file.store_dns = true;
+    assert_eq!(
+        restart_required_changes(&current, &replacement),
+        ["experimental.cache_file"]
+    );
+}
+
+#[test]
 fn semantically_equivalent_dns_bind_does_not_require_restart() {
     let mut current = Config::default();
     current.dns.bind = "127.0.0.1:53".into();
@@ -975,14 +993,7 @@ fn score_reload_context() -> honk_outbound::group::ScoreSelectionContext {
 #[tokio::test]
 async fn reload_persists_selector_choice_before_manager_publication() {
     let temp = tempfile::tempdir().unwrap();
-    let db = Arc::new(
-        crate::cachedb::CacheDb::open(&honk_config::experimental::CacheFileConfig {
-            enabled: true,
-            path: temp.path().join("cache.db").to_str().unwrap().into(),
-            ..Default::default()
-        })
-        .unwrap(),
-    );
+    let db = Arc::new(crate::state::cache::CacheDb::in_dir(temp.path()));
     let mut cp = test_cp().await;
     cp.cache_db = Some(Arc::clone(&db));
     let mut config = changed_routing_config();

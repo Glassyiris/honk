@@ -62,8 +62,32 @@ fn pragmas_read_back_on_a_fresh_and_a_reopened_file() {
     assert_eq!(read_pragmas(&state.strict()), expected);
 }
 
+/// The bundled SQLite is built with `SQLITE_ENABLE_MEMORY_MANAGEMENT`, so every
+/// connection's page cache draws on one process-wide budget, the sum of their
+/// `cache_size`. Other tests' connections would lend this one room, so the
+/// measurement runs in a child process holding only this connection.
 #[test]
 fn page_cache_stays_within_cache_size() {
+    const CHILD: &str = "HONK_STATE_CACHE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "state::tests::page_cache_stays_within_cache_size",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && text.contains("1 passed"),
+            "{text}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     StateDb::open(directory.path())
         .unwrap()
@@ -302,4 +326,75 @@ fn a_reader_inside_the_daemon_keeps_its_locks() {
         .query_row("SELECT count(*) FROM legacy_import", [], |row| row.get(0))
         .unwrap();
     assert_eq!(rows, 1);
+}
+
+fn corrupt_with_wal(data_dir: &Path) {
+    drop(StateDb::open(data_dir).unwrap());
+    fs::write(db_path(data_dir), vec![0x5a; 8192]).unwrap();
+    fs::write(data_dir.join(STATE_DIR).join("honk.db-wal"), b"wal").unwrap();
+    assert_eq!(StateDb::open(data_dir).err(), Some(StateError::Corrupt));
+}
+
+#[test]
+fn reset_moves_a_corrupt_db_aside_with_its_wal() {
+    let directory = tempfile::tempdir().unwrap();
+    corrupt_with_wal(directory.path());
+    let state = reset_corrupt(directory.path()).unwrap().expect("a new db");
+    let dir = directory.path().join(STATE_DIR);
+    assert_eq!(
+        fs::read(dir.join("honk.db.corrupt")).unwrap(),
+        vec![0x5a; 8192]
+    );
+    assert_eq!(fs::read(dir.join("honk.db.corrupt-wal")).unwrap(), b"wal");
+    assert_eq!(pragma(&state.strict(), "user_version"), Ok(SCHEMA_VERSION));
+}
+
+#[test]
+fn reset_keeps_an_earlier_corrupt_copy_and_runs_without_a_db() {
+    let directory = tempfile::tempdir().unwrap();
+    corrupt_with_wal(directory.path());
+    let dir = directory.path().join(STATE_DIR);
+    fs::write(dir.join("honk.db.corrupt"), b"earlier").unwrap();
+    assert!(reset_corrupt(directory.path()).unwrap().is_none());
+    assert_eq!(fs::read(dir.join("honk.db.corrupt")).unwrap(), b"earlier");
+    assert_eq!(
+        fs::read(db_path(directory.path())).unwrap(),
+        vec![0x5a; 8192]
+    );
+    assert_eq!(fs::read(dir.join("honk.db-wal")).unwrap(), b"wal");
+}
+
+#[test]
+fn reset_refuses_while_another_process_holds_the_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    corrupt_with_wal(directory.path());
+    let held = Flock::lock(
+        state_directory(directory.path(), false).unwrap(),
+        FlockArg::LockSharedNonblock,
+    )
+    .unwrap();
+    assert_eq!(
+        reset_corrupt(directory.path()).err(),
+        Some(StateError::InUse)
+    );
+    assert_eq!(
+        fs::read(db_path(directory.path())).unwrap(),
+        vec![0x5a; 8192]
+    );
+    assert!(
+        !directory
+            .path()
+            .join(STATE_DIR)
+            .join("honk.db.corrupt")
+            .exists()
+    );
+    drop(held);
+    assert!(reset_corrupt(directory.path()).unwrap().is_some());
+}
+
+#[test]
+fn cache_connections_sync_fully_without_wal() {
+    assert_eq!(synchronous(Class::Cache, true), "NORMAL");
+    assert_eq!(synchronous(Class::Cache, false), "FULL");
+    assert_eq!(synchronous(Class::Strict, true), "FULL");
 }

@@ -11,7 +11,7 @@ use super::*;
 async fn bounded_queue_drops_only_persistence_work_when_saturated() {
     let before = crate::stats::dns_snapshot();
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = test_db(&dir, "");
+    let db = test_db(&dir);
     let persister = DnsCachePersister::spawn(Arc::clone(&db));
     let mut cache = DnsCache::new(8);
     cache.set_persister(Some(persister.clone()));
@@ -36,7 +36,7 @@ async fn bounded_queue_drops_only_persistence_work_when_saturated() {
 #[tokio::test]
 async fn new_epoch_put_queued_before_flush_command_survives_barrier() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = test_db(&dir, "");
+    let db = test_db(&dir);
     let persister = DnsCachePersister::spawn(Arc::clone(&db));
     let (old_key, response, _) = fixture(IngressProfile::Internal, None, upstream("old"));
     persister.save(old_key, response.clone().into(), unix_now() + 300);
@@ -54,7 +54,7 @@ async fn new_epoch_put_queued_before_flush_command_survives_barrier() {
         .await
         .expect("flush command");
     receive.await.expect("flush ack").expect("flush succeeds");
-    assert_eq!(db.load_dns_v2().expect("rows").len(), 1);
+    assert_eq!(db.load_dns().expect("rows").len(), 1);
     persister.shutdown().await.expect("shutdown");
 
     let cache = DnsCache::new(8);
@@ -70,7 +70,7 @@ async fn new_epoch_put_queued_before_flush_command_survives_barrier() {
 #[tokio::test]
 async fn flush_discards_late_old_epoch_and_preserves_new_epoch_put() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = test_db(&dir, "");
+    let db = test_db(&dir);
     let persister = DnsCachePersister::spawn(Arc::clone(&db));
     let (old_key, response, _) = fixture(IngressProfile::Internal, None, upstream("old"));
     persister.flush().await.expect("flush");
@@ -90,7 +90,7 @@ async fn flush_discards_late_old_epoch_and_preserves_new_epoch_put() {
     persister.save(new_key.clone(), response.into(), unix_now() + 300);
     persister.shutdown().await.expect("shutdown");
 
-    assert_eq!(db.load_dns_v2().expect("rows").len(), 1);
+    assert_eq!(db.load_dns().expect("rows").len(), 1);
     assert_eq!(persister.counters().old_epoch_discarded, 1);
     let cache = DnsCache::new(8);
     let restart = DnsCachePersister::spawn(db);
@@ -108,7 +108,7 @@ async fn flush_discards_late_old_epoch_and_preserves_new_epoch_put() {
 #[tokio::test]
 async fn database_write_error_is_nonfatal_and_counted() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = test_db(&dir, "");
+    let db = test_db(&dir);
     db.set_query_only_for_test(true);
     let persister = DnsCachePersister::spawn(Arc::clone(&db));
     let (key, response, _) = fixture(IngressProfile::Internal, None, upstream("default"));
@@ -123,8 +123,9 @@ async fn database_write_error_is_nonfatal_and_counted() {
 async fn flush_reports_database_clear_failure() {
     let before = crate::stats::dns_snapshot();
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = test_db(&dir, "");
-    db.save_dns_answer("legacy.example", 1, "answer", unix_now() + 300);
+    let db = test_db(&dir);
+    db.write_dns(vec![("row".into(), unix_now() + 300, vec![1])])
+        .unwrap();
     db.set_query_only_for_test(true);
     let persister = DnsCachePersister::spawn(Arc::clone(&db));
 
@@ -148,7 +149,7 @@ async fn flush_reports_database_clear_failure() {
 #[tokio::test]
 async fn out_of_order_flush_epochs_never_regress_or_strand_new_put() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = test_db(&dir, "");
+    let db = test_db(&dir);
     let persister = DnsCachePersister::spawn(Arc::clone(&db));
     persister.epoch.store(2, Ordering::SeqCst);
     let (strong_ack, strong_receive) = oneshot::channel();
@@ -199,7 +200,7 @@ async fn out_of_order_flush_epochs_never_regress_or_strand_new_put() {
 #[tokio::test]
 async fn same_key_newer_epoch_survives_delayed_older_put_before_flush() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = test_db(&dir, "");
+    let db = test_db(&dir);
     let persister = DnsCachePersister::spawn(Arc::clone(&db));
     let (key, newer_response, _) = fixture(IngressProfile::Internal, None, upstream("same-key"));
     let mut older_response = newer_response.clone();
@@ -227,7 +228,7 @@ async fn same_key_newer_epoch_survives_delayed_older_put_before_flush() {
 #[tokio::test]
 async fn failing_database_keeps_pending_bounded_and_timer_progressing() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = test_db(&dir, "");
+    let db = test_db(&dir);
     db.set_query_only_for_test(true);
     let persister = DnsCachePersister::spawn(Arc::clone(&db));
     for index in 0..(COMMAND_CAPACITY * 2) {
@@ -269,10 +270,35 @@ async fn failing_database_keeps_pending_bounded_and_timer_progressing() {
 #[tokio::test]
 async fn shutdown_performs_final_write_without_periodic_wait() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = test_db(&dir, "");
+    let db = test_db(&dir);
     let persister = DnsCachePersister::spawn(Arc::clone(&db));
     let (key, response, _) = fixture(IngressProfile::Internal, None, upstream("default"));
     persister.save(key, response.into(), unix_now() + 300);
     persister.shutdown().await.expect("shutdown");
-    assert_eq!(db.load_dns_v2().expect("rows").len(), 1);
+    assert_eq!(db.load_dns().expect("rows").len(), 1);
+}
+
+#[tokio::test]
+async fn an_encoded_entry_above_the_row_limit_is_dropped_and_its_batch_is_written() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = test_db(&dir);
+    let persister = DnsCachePersister::spawn(Arc::clone(&db));
+    let (large, _, _) = fixture(IngressProfile::Internal, None, upstream("large"));
+    let (small, response, _) = fixture(IngressProfile::Internal, None, upstream("small"));
+    // Under 4 KiB as a response; the key and header push the entry one byte over.
+    let overhead = codec::encode(&large, &[], 0).bytes.len();
+    let oversized = vec![0; worker::MAX_ENTRY_BYTES + 1 - overhead];
+    assert!(oversized.len() < worker::MAX_ENTRY_BYTES);
+    persister.save(large, oversized.into(), unix_now() + 300);
+    persister.save(small.clone(), response.into(), unix_now() + 300);
+    persister.shutdown().await.expect("shutdown");
+
+    let counters = persister.counters();
+    assert_eq!(
+        (counters.oversize, counters.written, counters.db_errors),
+        (1, 1, 0)
+    );
+    let rows = db.load_dns().expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, codec::key_suffix(&small));
 }

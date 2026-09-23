@@ -322,6 +322,32 @@ pub(crate) fn legacy_nfqueue_warning(source: SourceRef) -> DetailedDiagnostic {
     )
 }
 
+pub(crate) fn legacy_cache_file_warning(
+    source: SourceRef,
+    key: &'static str,
+) -> DetailedDiagnostic {
+    let message = match key {
+        "path" => {
+            "experimental.cache_file.path no longer has an effect; state is kept in `<data_dir>/state/honk.db`"
+        }
+        "cache_id" => {
+            "experimental.cache_file.cache_id no longer has an effect; state is kept in `<data_dir>/state/honk.db`"
+        }
+        _ => {
+            "experimental.cache_file.store_fakeip no longer has an effect; state is kept in `<data_dir>/state/honk.db`"
+        }
+    };
+    DetailedDiagnostic::warning(
+        "legacy-cache-file",
+        source,
+        SettingPath::new("experimental")
+            .field("cache_file")
+            .field(key),
+        SafeValue::Redacted,
+        message,
+    )
+}
+
 /// Called by the outer attempt owner, not by nested readers or format probes.
 pub fn finish_attempt<T>(
     result: Result<T, crate::error::DetailedConfigError>,

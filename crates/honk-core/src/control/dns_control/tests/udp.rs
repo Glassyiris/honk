@@ -103,19 +103,7 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
     });
     let cache = Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(8)));
     let directory = tempfile::tempdir().expect("cache directory");
-    let database = Arc::new(
-        crate::cachedb::CacheDb::open(&honk_config::experimental::CacheFileConfig {
-            enabled: true,
-            path: directory
-                .path()
-                .join("cache.db")
-                .to_string_lossy()
-                .into_owned(),
-            store_dns: true,
-            ..Default::default()
-        })
-        .expect("cache database"),
-    );
+    let database = Arc::new(crate::state::cache::CacheDb::in_dir(directory.path()));
     let persister = crate::dns::persist::DnsCachePersister::spawn(Arc::clone(&database));
     cache.lock().await.set_persister(Some(persister.clone()));
     let forwarder = Arc::new(DnsForwarder::new(
@@ -168,7 +156,7 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
     assert_eq!(projected_again[0].0, projected[0].0);
     assert_eq!(projected_again[0].1.bitmap, projected[0].1.bitmap);
     persister.shutdown().await.expect("persistence shutdown");
-    assert!(database.load_dns_v2().expect("persisted rows").is_empty());
+    assert!(database.load_dns().expect("persisted rows").is_empty());
     controller.shutdown(Duration::from_secs(1)).await;
 }
 

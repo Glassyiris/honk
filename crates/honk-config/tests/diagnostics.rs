@@ -270,6 +270,51 @@ mod config_loaders {
     }
 
     #[test]
+    fn legacy_cache_file_keys_warn_in_dae_and_structured_input() {
+        let dae = "experimental { cache_file { enabled: true\n path: 'cache.db' } }\n";
+        let mut diagnostics = Vec::new();
+        honk_config::parser::parse_dae_config_with_detailed_diagnostics(dae, &mut diagnostics)
+            .unwrap();
+        let warned = |diagnostics: &[honk_config::diagnostic::DetailedDiagnostic]| {
+            diagnostics
+                .iter()
+                .filter(|d| d.code == "legacy-cache-file")
+                .map(|d| d.setting.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(warned(&diagnostics), ["experimental.cache_file.path"]);
+
+        let file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            "[experimental.cache_file]\nenabled = true\npath = \"cache.db\"\ncache_id = \"gw\"\n",
+        )
+        .unwrap();
+        let mut diagnostics = Vec::new();
+        let config = Config::from_file_with_detailed_diagnostics(
+            file.path().to_str().unwrap(),
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(
+            warned(&diagnostics),
+            [
+                "experimental.cache_file.path",
+                "experimental.cache_file.cache_id"
+            ]
+        );
+        assert_eq!(
+            config.experimental.cache_file.legacy_cache_file(),
+            (Some("cache.db"), Some("gw"))
+        );
+        let serialized = serde_json::to_value(&config.experimental.cache_file).unwrap();
+        assert_eq!(
+            serialized,
+            serde_json::json!({"enabled": true, "store_dns": false})
+        );
+    }
+
+    #[test]
     fn failed_fallback_retains_attempts_and_only_one_terminal() {
         let file = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
         std::fs::write(

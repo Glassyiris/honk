@@ -8,11 +8,8 @@ use super::*;
 #[tokio::test]
 async fn targeted_deletion_orders_queued_puts_preserves_unrelated_rows_and_rejects_late_work() {
     let dir = tempfile::tempdir().unwrap();
-    let db = test_db(&dir, "one");
-    let other_namespace = test_db(&dir, "two");
-    db.save_selector_choice("proxy", "node-a");
-    db.save_dns_answer("Example.com.", 1, "old", unix_now() + 300);
-    other_namespace.save_dns_answer("example.com", 1, "other instance", unix_now() + 300);
+    let db = test_db(&dir);
+    db.save_clash_global("node-a");
     let persister = DnsCachePersister::spawn(db.clone());
     let mut cache = DnsCache::new(64);
     cache.set_persister(Some(persister.clone()));
@@ -44,7 +41,7 @@ async fn targeted_deletion_orders_queued_puts_preserves_unrelated_rows_and_rejec
         .await
         .unwrap();
     persister.shutdown().await.unwrap();
-    let rows = db.load_dns_v2().unwrap();
+    let rows = db.load_dns().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].0, codec::key_suffix(&second));
     let restarted = DnsCachePersister::spawn(db.clone());
@@ -59,17 +56,15 @@ async fn targeted_deletion_orders_queued_puts_preserves_unrelated_rows_and_rejec
         .await
         .unwrap();
     assert_eq!(result.deleted, 0);
-    assert!(db.load_dns_v2().unwrap().is_empty());
-    assert!(db.load_dns_answers(unix_now()).is_empty());
-    assert_eq!(db.load_selector_choice("proxy").as_deref(), Some("node-a"));
-    assert_eq!(other_namespace.load_dns_answers(unix_now()).len(), 1);
+    assert!(db.load_dns().unwrap().is_empty());
+    assert_eq!(db.load_clash_global().as_deref(), Some("node-a"));
     restarted.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn overlapping_mutations_and_cancelled_waiters_keep_publication_and_actor_ordered() {
     let dir = tempfile::tempdir().unwrap();
-    let db = test_db(&dir, "");
+    let db = test_db(&dir);
     let persister = DnsCachePersister::spawn(db.clone());
     let mut cache = DnsCache::new(64);
     cache.set_persister(Some(persister.clone()));
@@ -142,7 +137,7 @@ async fn overlapping_mutations_and_cancelled_waiters_keep_publication_and_actor_
             .is_some()
     );
     persister.shutdown().await.unwrap();
-    let rows = db.load_dns_v2().unwrap();
+    let rows = db.load_dns().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].0, codec::key_suffix(&first));
 }
@@ -150,10 +145,11 @@ async fn overlapping_mutations_and_cancelled_waiters_keep_publication_and_actor_
 #[tokio::test]
 async fn invalidation_reports_database_failure_and_does_not_publish_old_work() {
     let dir = tempfile::tempdir().unwrap();
-    let db = test_db(&dir, "");
+    let db = test_db(&dir);
     let (key, response, _) = fixture(IngressProfile::Internal, None, upstream("default"));
     let encoded = codec::encode(&key, &response, unix_now() + 300);
-    db.write_dns_v2(&[(encoded.suffix, encoded.bytes)]).unwrap();
+    db.write_dns(vec![(encoded.suffix, unix_now() + 300, encoded.bytes)])
+        .unwrap();
     let persister = DnsCachePersister::spawn(db.clone());
     let mut cache = DnsCache::new(8);
     cache.set_persister(Some(persister.clone()));
@@ -172,7 +168,7 @@ async fn invalidation_reports_database_failure_and_does_not_publish_old_work() {
             .put_exact_if_current(epoch, key.clone(), response.clone(), 300, None)
             .is_none()
     );
-    assert_eq!(db.load_dns_v2().unwrap().len(), 1);
+    assert_eq!(db.load_dns().unwrap().len(), 1);
     db.set_query_only_for_test(false);
     assert!(
         service
@@ -180,6 +176,6 @@ async fn invalidation_reports_database_failure_and_does_not_publish_old_work() {
             .is_some()
     );
     service.invalidate(CacheInvalidation::All).await.unwrap();
-    assert!(db.load_dns_v2().unwrap().is_empty());
+    assert!(db.load_dns().unwrap().is_empty());
     persister.shutdown().await.unwrap();
 }

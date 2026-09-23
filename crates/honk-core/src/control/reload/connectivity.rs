@@ -335,8 +335,8 @@ impl ControlPlane {
     /// (control plane, per-connection handles, clash API) picks up new or
     /// changed groups at once. Runtime selector choices migrate by group
     /// name (choices whose group or selected node vanished are dropped);
-    /// cache.db-backed choices survive because every change is persisted
-    /// at set time, so no cache.db restore runs here. The alive set's
+    /// choices kept in the state db survive because every change is persisted
+    /// at set time, so no restore runs here. The alive set's
     /// health-check registrations and URLTest group table are refreshed to
     /// match the new group membership, and the node → eBPF outbound id map
     /// (`outbound_id_map`, already refreshed by the reload path) is built

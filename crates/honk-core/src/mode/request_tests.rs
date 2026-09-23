@@ -5,7 +5,7 @@ use crate::{
     ebpf::{EbpfBackend, mock::MockEbpfBackend},
     mode::{ModeOverride, SharedModeState},
 };
-use honk_config::{Config, experimental::CacheFileConfig, node::Node};
+use honk_config::{Config, node::Node};
 use std::{collections::HashMap, sync::Arc};
 
 type Backend = Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>>;
@@ -36,7 +36,7 @@ fn config() -> Config {
 
 async fn owner(
     mode: ModeState,
-    cache: Option<Arc<crate::cachedb::CacheDb>>,
+    cache: Option<Arc<crate::state::cache::CacheDb>>,
 ) -> (DatapathFlagsHandle, Backend) {
     let backend: Backend = Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
     let state: SharedModeState = Arc::new(parking_lot::RwLock::new(mode));
@@ -302,21 +302,9 @@ async fn explicit_activation_reset_is_transactional_and_keeps_the_fence() {
 #[tokio::test]
 async fn native_clash_mutations_do_not_restore_or_persist_legacy_mode_cache() {
     let directory = tempfile::tempdir().unwrap();
-    let db = Arc::new(
-        crate::cachedb::CacheDb::open(&CacheFileConfig {
-            enabled: true,
-            path: directory
-                .path()
-                .join("cache.db")
-                .to_str()
-                .unwrap()
-                .to_owned(),
-            ..Default::default()
-        })
-        .unwrap(),
-    );
+    let db = Arc::new(crate::state::cache::CacheDb::in_dir(directory.path()));
     db.save_clash_mode("Direct");
-    db.save_selector_choice("GLOBAL", "old-choice");
+    db.save_clash_global("old-choice");
     let config = config();
     let catalog = Catalog::new(&config);
     let (native, _) = owner(ModeState::native(), Some(db.clone())).await;
@@ -335,10 +323,7 @@ async fn native_clash_mutations_do_not_restore_or_persist_legacy_mode_cache() {
     );
     assert_eq!(native.snapshot().source, ModeSource::Runtime);
     assert_eq!(db.load_clash_mode().as_deref(), Some("Direct"));
-    assert_eq!(
-        db.load_selector_choice("GLOBAL").as_deref(),
-        Some("old-choice")
-    );
+    assert_eq!(db.load_clash_global().as_deref(), Some("old-choice"));
     assert!(native.set_mode("Rule").await.is_err());
     assert!(native.set_global_selection("Proxy".into()).await.is_err());
 
@@ -346,7 +331,7 @@ async fn native_clash_mutations_do_not_restore_or_persist_legacy_mode_cache() {
     legacy.set_mode("Global").await.unwrap();
     legacy.set_global_selection("Proxy".into()).await.unwrap();
     assert_eq!(db.load_clash_mode().as_deref(), Some("Global"));
-    assert_eq!(db.load_selector_choice("GLOBAL").as_deref(), Some("Proxy"));
+    assert_eq!(db.load_clash_global().as_deref(), Some("Proxy"));
     legacy
         .publication()
         .await

@@ -213,7 +213,7 @@ Ordinary response-driven supersession above is in-memory only: removing a positi
 
 When `store_dns` enables persistence, a bounded actor mirrors retained positive insertions to SQLite. An entry evicted immediately by the shard's wire-byte budget is not queued for persistence. The actor bounds both its command queue and pending set to 4,096 items, batches writes, and fences them by epoch; a flush discards older queued epochs before admitting the current state.
 
-`HDNS` version 2 rows live under `dns:v2:` and encode canonical wire, ingress profile, scope, policy, operation, expiry, and validated response wire. Restore skips expired, corrupt, version-mismatched, collision-mismatched, and policy-mismatched rows. The v2 namespace does not consume or rewrite legacy `dns:` rows. Pre-v2 binaries ignore `dns:v2:` rows, so leaving them in `cache.db` is rollback-safe.
+`HDNS` version 2 entries are rows of the state db's `dns_answer` table and encode canonical wire, ingress profile, scope, policy, operation, expiry, and validated response wire. Restore skips expired, corrupt, version-mismatched, collision-mismatched, and policy-mismatched rows. An entry that encodes to more than 4 KiB is dropped before it is queued for the batch and counted as `oversize`, because the table's size `CHECK` would otherwise fail the whole batch transaction.
 
 ## Upstream transports
 

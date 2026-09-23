@@ -1,8 +1,7 @@
-//! Rollback-safe exact-key DNS cache persistence.
+//! Exact-key DNS cache persistence in the state db's `dns_answer` table.
 //!
-//! Version-two entries live under `dns:v2:` and never modify or consume the
-//! legacy `dns:` representation. A bounded actor owns SQLite writes and
-//! linearizes explicit flushes with an epoch barrier.
+//! A bounded actor owns SQLite writes and linearizes explicit flushes with an
+//! epoch barrier.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::cache::{CacheKey, DnsCacheService};
 use super::policy::PolicyId;
-use crate::cachedb::CacheDb;
+use crate::state::cache::CacheDb;
 
 mod codec;
 mod counters {
@@ -25,6 +24,7 @@ mod counters {
         pub dropped_full: u64,
         pub dropped_pending_full: u64,
         pub dropped_closed: u64,
+        pub oversize: u64,
         pub old_epoch_discarded: u64,
         pub written: u64,
         pub restored: u64,
@@ -43,6 +43,7 @@ mod counters {
         pub(super) dropped_full: AtomicU64,
         pub(super) dropped_pending_full: AtomicU64,
         pub(super) dropped_closed: AtomicU64,
+        pub(super) oversize: AtomicU64,
         pub(super) old_epoch_discarded: AtomicU64,
         pub(super) written: AtomicU64,
         pub(super) restored: AtomicU64,
@@ -62,6 +63,7 @@ mod counters {
                 dropped_full: self.dropped_full.load(Ordering::Relaxed),
                 dropped_pending_full: self.dropped_pending_full.load(Ordering::Relaxed),
                 dropped_closed: self.dropped_closed.load(Ordering::Relaxed),
+                oversize: self.oversize.load(Ordering::Relaxed),
                 old_epoch_discarded: self.old_epoch_discarded.load(Ordering::Relaxed),
                 written: self.written.load(Ordering::Relaxed),
                 restored: self.restored.load(Ordering::Relaxed),

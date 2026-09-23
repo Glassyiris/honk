@@ -20,19 +20,42 @@ impl Drop for DelayWriter {
 }
 
 impl ControlPlane {
-    /// Open the persistent cache database (sing-box `cache_file`), wire
-    /// selector-choice persistence into the group manager, and restore
-    /// persisted choices. An existing cache relative to the original config
-    /// directory is retained during the data-directory cutover. No-op when
-    /// `experimental.cache_file` is disabled or the database cannot be opened.
-    /// Called once from `run()`.
-    pub async fn init_cache_db(&mut self, legacy_config_dir: Option<&Path>) {
+    /// Open the cache tables of the state database (sing-box `cache_file`),
+    /// import a legacy `cache.db`, wire selector-choice persistence into the
+    /// group manager, and restore persisted choices. No-op when
+    /// `experimental.cache_file` is disabled or there is no state database.
+    /// Called once from `run()`, with the instance lock held.
+    pub async fn init_cache_db(
+        &mut self,
+        state: Option<Arc<crate::state::StateDb>>,
+        legacy: Option<crate::state::import::LegacyCache>,
+    ) {
         let cache_cfg = self.config.read().await.experimental.cache_file.clone();
-        let Some(db) = crate::cachedb::CacheDb::open_with_config_dir(&cache_cfg, legacy_config_dir)
-        else {
+        let Some(state) = state.filter(|_| cache_cfg.enabled) else {
             return;
         };
-        let db = Arc::new(db);
+        if let Some(legacy) = legacy {
+            let scope = {
+                let config = self.config.read().await;
+                crate::state::import::ImportScope {
+                    selector_groups: config
+                        .groups
+                        .iter()
+                        .filter(|group| group.policy == GroupPolicy::Selector)
+                        .map(|group| group.name.clone())
+                        .collect(),
+                    nodes: config.nodes.iter().map(|node| node.name.clone()).collect(),
+                }
+            };
+            crate::state::import::import_cache_db(&state, &legacy, &scope);
+        }
+        let db = match crate::state::cache::CacheDb::open(state) {
+            Ok(db) => Arc::new(db),
+            Err(error) => {
+                warn!(%error, "state cache unavailable; continuing without persistence");
+                return;
+            }
+        };
 
         // Restore persisted selector choices before wiring the persist
         // callback so restoration does not rewrite the same values.
@@ -47,16 +70,7 @@ impl ControlPlane {
                     honk_outbound::group::SelectionNetwork::Tcp,
                     honk_outbound::group::SelectionNetwork::Udp,
                 ] {
-                    let member = match db.load_network_selector(&group.name, network) {
-                        Some(Ok(member)) => Some(member),
-                        Some(Err(_)) => None,
-                        None => db.load_selector_choice(&group.name).and_then(|name| {
-                            group_manager
-                                .selector_member_by_name(&group.name, &name)
-                                .ok()
-                        }),
-                    };
-                    if let Some(member) = member
+                    if let Some(Ok(member)) = db.load_network_selector(&group.name, network)
                         && let Ok(update) = group_manager.publish_selector_choice(
                             &group.name,
                             &member,
@@ -88,9 +102,9 @@ impl ControlPlane {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let samples = db.load_delay_samples(now_unix, DELAY_SAMPLE_MAX_AGE_SECS);
-            // cache.db keys delay samples by node name (format unchanged);
-            // resolve them onto this generation's NodeIds — samples for
-            // nodes no longer configured are dropped.
+            // Delay samples are keyed by node name; resolve them onto this
+            // generation's NodeIds — samples for nodes no longer configured
+            // are dropped.
             let id_by_name: std::collections::HashMap<String, uuid::Uuid> = {
                 let config = self.config.read().await;
                 config
@@ -112,7 +126,7 @@ impl ControlPlane {
                 restored += 1;
             }
             if restored > 0 {
-                info!("cache.db: restored {} persisted delay sample(s)", restored);
+                info!("state db: restored {} persisted delay sample(s)", restored);
             }
             let db_delay = db.clone();
             let alive_for_delay = self.alive_set.clone();
@@ -128,16 +142,22 @@ impl ControlPlane {
                         .iter()
                         .map(|n| (n.id, n.name.clone()))
                         .collect();
-                    for (node_id, latency, at) in alive_for_delay.latency_snapshot() {
-                        let Some(name) = names.get(&node_id) else {
-                            continue;
-                        };
-                        let measured_at = at
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        db_delay.save_delay_sample(name, latency.as_millis() as u64, measured_at);
-                    }
+                    let samples = alive_for_delay
+                        .latency_snapshot()
+                        .into_iter()
+                        .filter_map(|(node_id, latency, at)| {
+                            let measured_at = at
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            Some((
+                                names.get(&node_id)?.clone(),
+                                latency.as_millis() as u64,
+                                measured_at,
+                            ))
+                        })
+                        .collect();
+                    db_delay.save_delay_samples(samples);
                     interval.tick().await;
                 }
             });
@@ -145,7 +165,7 @@ impl ControlPlane {
         }
 
         // store_dns: restore persisted DNS answers into the shared DNS
-        // cache, then mirror future answers into cache.db through a
+        // cache, then mirror future answers into the state db through a
         // background batch writer (sing-box SaveDNSCacheAsync). Restoring
         // runs before the persister is installed so restored entries are
         // not immediately re-persisted.
@@ -155,10 +175,10 @@ impl ControlPlane {
             let policy = self.dns_controller.forwarder().policy_id();
             match persister.restore_cache(&dns_cache, policy).await {
                 Ok(restored) if restored > 0 => {
-                    info!("cache.db: restored {} persisted DNS answer(s)", restored);
+                    info!("state db: restored {} persisted DNS answer(s)", restored);
                 }
                 Ok(_) => {}
-                Err(error) => warn!(%error, "cache.db DNS restore failed"),
+                Err(error) => warn!(%error, "state db DNS restore failed"),
             }
             dns_cache.lock().await.set_persister(Some(persister));
         }
@@ -167,7 +187,7 @@ impl ControlPlane {
     }
 
     /// Shared handle to the persistent cache database (clash API, etc.).
-    pub fn cache_db(&self) -> Option<Arc<crate::cachedb::CacheDb>> {
+    pub fn cache_db(&self) -> Option<Arc<crate::state::cache::CacheDb>> {
         self.cache_db.clone()
     }
 }
@@ -190,13 +210,9 @@ mod tests {
             config.nodes.push(node);
             config.dns.bind = format!("tcp://{}", occupied.local_addr()?);
             config.experimental.cache_file.enabled = true;
-            config.experimental.cache_file.path = directory
-                .path()
-                .join("cache.db")
-                .to_string_lossy()
-                .into_owned();
+            let state = Arc::new(crate::state::StateDb::open(directory.path())?);
             let mut plane = control_plane(config);
-            plane.init_cache_db(None).await;
+            plane.init_cache_db(Some(state), None).await;
             let db = plane.cache_db().unwrap();
             let alive = plane.alive_set();
             let record = |delay| {
