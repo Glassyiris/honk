@@ -88,6 +88,8 @@ Probe requests cannot supply URLs or allowlist exceptions. For an intentionally 
 
 All `clash_api` fields are startup-owned. SIGHUP rejects a candidate configuration that changes any of them.
 
+`--store db` does not run the Clash API. A non-empty `external_controller` refuses startup in that mode; see [Configuration db](./api.md#configuration-db---store-db).
+
 ### Authentication and transport
 
 With a non-empty `secret`, API requests use `Authorization: Bearer <secret>`; WebSocket upgrades may instead pass `?token=<secret>`. Static `/ui` content is outside this authentication middleware. The built-in listener serves plain HTTP and provides no TLS. Bind it to a loopback address such as `127.0.0.1`, or put an authenticated TLS reverse proxy in front of it; do not expose it directly on an untrusted network. See the [Clash API reference](./api.md) for the endpoint inventory.

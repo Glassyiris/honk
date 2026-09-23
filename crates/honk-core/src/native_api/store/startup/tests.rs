@@ -98,3 +98,58 @@ fn head_moved_before_the_instance_lock_refuses_startup() {
     let error = waiting.record().expect_err("a moved head must refuse");
     assert!(error.to_string().contains("moved"), "{error}");
 }
+
+const CONTROLLER: &str = "clash_api { external_controller: '127.0.0.1:9090' }\n native_api {";
+
+#[test]
+fn clash_controller_refuses_the_import() {
+    let state = tempfile::tempdir().unwrap();
+    let data_dir = state.path().canonicalize().unwrap();
+    let (directory, entry) = tree(&data_dir);
+    let auth = directory.path().canonicalize().unwrap().join("auth.dae");
+    let content = fs::read_to_string(&auth).unwrap();
+    fs::write(&auth, content.replace("native_api {", CONTROLLER)).unwrap();
+    let error = DatabaseStartup::open(&entry, &data_dir, &mut Vec::new())
+        .err()
+        .expect("a Clash controller must refuse the import");
+    assert!(
+        error.to_string().contains("without the Clash API"),
+        "{error}"
+    );
+    let store = DbStore::open(&data_dir, &entry).unwrap();
+    assert_eq!(store.head(), Ok(None));
+}
+
+#[test]
+fn clash_controller_in_the_head_refuses_startup() {
+    let state = tempfile::tempdir().unwrap();
+    let data_dir = state.path().canonicalize().unwrap();
+    let (_directory, entry) = tree(&data_dir);
+    let startup = {
+        let mut startup = DatabaseStartup::open(&entry, &data_dir, &mut Vec::new()).unwrap();
+        startup.record().unwrap();
+        startup
+    };
+    let mut candidate = startup.sources.sources.clone();
+    drop(startup);
+    let store = DbStore::open(&data_dir, &entry).unwrap();
+    let auth = candidate
+        .iter_mut()
+        .find(|source| source.path.ends_with("auth.dae"))
+        .unwrap();
+    let pin = store.pin(&auth.path).unwrap();
+    let content = auth.content.replace("native_api {", CONTROLLER);
+    auth.content = Arc::from(content.as_str());
+    let pending = store
+        .commit(pin, &content, &candidate, "control", Box::new(|| Ok(())))
+        .unwrap();
+    assert_eq!(store.promote(pending), Ok(2));
+    drop(store);
+    let error = DatabaseStartup::open(&entry, &data_dir, &mut Vec::new())
+        .err()
+        .expect("a head with a Clash controller must refuse startup");
+    assert!(
+        error.to_string().contains("without the Clash API"),
+        "{error}"
+    );
+}

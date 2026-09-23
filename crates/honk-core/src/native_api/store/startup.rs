@@ -65,6 +65,7 @@ impl DatabaseStartup {
                 diagnostics,
             )?;
             same_data_dir(&config, data_dir)?;
+            no_clash_api(&config)?;
             return Ok(Self {
                 store,
                 config,
@@ -88,6 +89,7 @@ impl DatabaseStartup {
             native.enabled && native.config_write && native.credentialed(),
             "--store db needs experimental.native_api with enabled, config_write and a credential"
         );
+        no_clash_api(&config)?;
         same_data_dir(&config, data_dir)?;
         let (overlay, forbidden) = strip_tree(&originals).map_err(|path| {
             anyhow!(
@@ -166,6 +168,14 @@ fn same_data_dir(config: &Config, data_dir: &Path) -> anyhow::Result<()> {
         "global.data_dir {} differs from --data-dir {}",
         config.global.data_dir,
         data_dir.display()
+    );
+    Ok(())
+}
+
+fn no_clash_api(config: &Config) -> anyhow::Result<()> {
+    ensure!(
+        config.experimental.clash_api.external_controller.is_empty(),
+        "experimental.clash_api.external_controller is set; --store db runs without the Clash API"
     );
     Ok(())
 }

@@ -91,6 +91,8 @@ Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒
 
 所有 `clash_api` 字段都由启动阶段持有。通过 SIGHUP 提交的候选配置只要修改其中任一字段就会被拒绝。
 
+`--store db` 模式不运行 Clash API，`external_controller` 非空时拒绝启动，详见[配置数据库](./api.md#配置数据库--store-db)。
+
 ### 鉴权与传输
 
 `secret` 非空时，API 请求使用 `Authorization: Bearer <secret>`；WebSocket upgrade 也可以改用 `?token=<secret>`。静态 `/ui` 内容不经过这层鉴权 middleware。内置 listener 只提供明文 HTTP，不提供 TLS。应绑定到 `127.0.0.1` 等 loopback 地址，或在前面部署带鉴权的 TLS reverse proxy；不得直接暴露到不受信任的网络。endpoint 清单见 [Clash API 参考](./api.md)。
