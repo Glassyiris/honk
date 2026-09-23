@@ -121,6 +121,31 @@ impl Accumulator {
     }
 }
 
+/// Same-block accumulation shared by pair metrics and run progress; each caller keeps its scope.
+fn accumulate_common(
+    left: &[Bucket; BLOCKS],
+    right: &[Bucket; BLOCKS],
+    origin: Instant,
+    now: Instant,
+    timing: Timing,
+    blocks: u8,
+    mut on_block: impl FnMut(u64),
+) -> Option<([Accumulator; 2], Option<Instant>)> {
+    let mut sides = [Accumulator::default(), Accumulator::default()];
+    let mut expires = None;
+    for (index, (left, right)) in left.iter().zip(right).enumerate() {
+        if blocks & (1 << index) == 0 || !timing.common(left, right, origin, now) {
+            continue;
+        }
+        let until = timing.deadline(origin, left.block)?;
+        on_block(left.block);
+        sides[0].add(left);
+        sides[1].add(right);
+        expires = Some(expires.map_or(until, |old: Instant| old.min(until)));
+    }
+    Some((sides, expires))
+}
+
 fn metric_pair(
     left: &[Bucket; BLOCKS],
     right: &[Bucket; BLOCKS],
@@ -130,19 +155,9 @@ fn metric_pair(
     blocks: u8,
     mut support: std::collections::hash_map::DefaultHasher,
 ) -> Option<MetricPair> {
-    let mut a = Accumulator::default();
-    let mut b = Accumulator::default();
-    let mut expires = None;
-    for (index, (left, right)) in left.iter().zip(right).enumerate() {
-        if blocks & (1 << index) == 0 || !timing.common(left, right, origin, now) {
-            continue;
-        }
-        let until = timing.deadline(origin, left.block)?;
-        left.block.hash(&mut support);
-        a.add(left);
-        b.add(right);
-        expires = Some(expires.map_or(until, |old: Instant| old.min(until)));
-    }
+    let ([a, b], expires) = accumulate_common(left, right, origin, now, timing, blocks, |block| {
+        block.hash(&mut support)
+    })?;
     let reporters = a.reporters().min(b.reporters());
     if reporters < REPORTERS {
         return None;
@@ -855,14 +870,16 @@ pub(super) fn response_progress(
     let mut counts = [0; 2];
     if let (Some(origin), [Some(left), Some(right)]) = (inner.comparisons.origin, cells) {
         let timing = left.key.timing()?;
-        let mut reporters = [Accumulator::default(), Accumulator::default()];
-        for (a, b) in left.metrics[0].iter().zip(&right.metrics[0]) {
-            if timing.common(a, b, origin, now) {
-                reporters[0].add(a);
-                reporters[1].add(b);
-            }
-        }
-        counts = reporters.map(|reporters| reporters.reporters().min(REPORTERS) as u8);
+        let (sides, _) = accumulate_common(
+            &left.metrics[0],
+            &right.metrics[0],
+            origin,
+            now,
+            timing,
+            u8::MAX,
+            |_| {},
+        )?;
+        counts = sides.map(|side| side.reporters().min(REPORTERS) as u8);
     }
     Some((counts, identity.finish()))
 }
