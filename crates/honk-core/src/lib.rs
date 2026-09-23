@@ -802,6 +802,92 @@ fn open_log_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
     Ok(file)
 }
 
+/// The log file rotates at this size: it becomes `<name>.1`, replacing an
+/// older copy, so the file and its copy together stay under twice the limit.
+const LOG_FILE_LIMIT: u64 = 10 * 1024 * 1024;
+
+/// The tracing writer for `global.log_file`, rotating at `limit`.
+struct RotatingLogFile {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+    size: u64,
+    limit: u64,
+    /// Set when a rotation failed: no further attempts, and the current file
+    /// takes lines only up to twice the limit.
+    stuck: bool,
+    /// Whether the one warning about dropped lines was printed.
+    dropping: bool,
+    #[cfg(test)]
+    fail_reopen: bool,
+}
+
+impl RotatingLogFile {
+    fn open(path: &std::path::Path, limit: u64) -> anyhow::Result<Self> {
+        let file = open_log_file(path)?;
+        let size = file.metadata()?.len();
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            size,
+            limit,
+            stuck: false,
+            dropping: false,
+            #[cfg(test)]
+            fail_reopen: false,
+        })
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        // Another honk sharing the file during a restart handoff may have
+        // rotated it already; renaming then would overwrite its copy.
+        let ours = self.file.metadata()?;
+        let current = std::fs::symlink_metadata(&self.path).ok();
+        if current.is_some_and(|current| (current.dev(), current.ino()) == (ours.dev(), ours.ino()))
+        {
+            let mut rotated = self.path.clone().into_os_string();
+            rotated.push(".1");
+            std::fs::rename(&self.path, rotated)?;
+        }
+        #[cfg(test)]
+        if self.fail_reopen {
+            return Err(std::io::Error::other("injected reopen failure"));
+        }
+        // Opened with the same checks as the first file.
+        self.file = open_log_file(&self.path).map_err(std::io::Error::other)?;
+        self.size = self.file.metadata()?.len();
+        Ok(())
+    }
+}
+
+impl std::io::Write for RotatingLogFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let after = self.size.saturating_add(buf.len() as u64);
+        if !self.stuck && self.size > 0 && after > self.limit && self.rotate().is_err() {
+            self.stuck = true;
+        }
+        if self.stuck && after > self.limit.saturating_mul(2) {
+            if !self.dropping {
+                self.dropping = true;
+                // Not through tracing: this is the tracing writer.
+                eprintln!(
+                    "honk-core: log file {} could not be rotated; dropping log lines until restart",
+                    self.path.display()
+                );
+            }
+            return Ok(buf.len());
+        }
+        let written = self.file.write(buf)?;
+        self.size = self.size.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
 fn load_operator_config(
     path: &str,
     diagnostics: &mut Vec<DetailedDiagnostic>,
@@ -1005,7 +1091,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
         let log_file_path = resolved_log_file_path(&config, cli.log_file.as_deref());
         let log_file_layer = if let Some(path) = log_file_path.as_ref() {
-            let file = open_log_file(path)?;
+            let file = RotatingLogFile::open(path, LOG_FILE_LIMIT)?;
             Some(
                 tracing_subscriber::fmt::layer()
                     .with_timer(LocalTime)
@@ -2563,9 +2649,9 @@ mod local_time_tests {
 #[cfg(test)]
 mod startup_lifecycle_tests {
     use super::{
-        ClashCommand, Cli, load_operator_config, open_log_file, prepare_nfqueue_startup,
-        prepare_runtime_data_dir, prepare_runtime_data_dir_with_fallback, publish_instance_pid,
-        running_instance_pid,
+        ClashCommand, Cli, RotatingLogFile, load_operator_config, open_log_file,
+        prepare_nfqueue_startup, prepare_runtime_data_dir, prepare_runtime_data_dir_with_fallback,
+        publish_instance_pid, running_instance_pid,
     };
     use clap::Parser;
 
@@ -2576,6 +2662,76 @@ mod startup_lifecycle_tests {
         let held = crate::state::StateDb::open(directory.path()).unwrap();
         assert!(super::reset_non_strict(directory.path()).is_none());
         drop(held);
+    }
+
+    #[test]
+    fn a_failed_reopen_bounds_the_log_to_twice_the_limit() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("honk.log");
+        let mut log = RotatingLogFile::open(&path, 100).unwrap();
+        log.fail_reopen = true;
+        for _ in 0..20 {
+            log.write_all(format!("{}\n", "x".repeat(59)).as_bytes())
+                .unwrap();
+        }
+        let rotated = std::fs::metadata(directory.path().join("honk.log.1")).unwrap();
+        assert!(
+            rotated.len() <= 200,
+            "{} bytes after a failed reopen",
+            rotated.len()
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn two_writers_sharing_the_log_rotate_it_once() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("honk.log");
+        let mut first = RotatingLogFile::open(&path, 100).unwrap();
+        let mut second = RotatingLogFile::open(&path, 100).unwrap();
+        let line = |text: &str| format!("{}\n", text.repeat(59));
+        first.write_all(line("a").as_bytes()).unwrap();
+        second.write_all(line("b").as_bytes()).unwrap();
+        first.write_all(line("c").as_bytes()).unwrap();
+        second.write_all(line("d").as_bytes()).unwrap();
+        let rotated = std::fs::read_to_string(directory.path().join("honk.log.1")).unwrap();
+        assert_eq!(rotated, format!("{}\n{}\n", "a".repeat(59), "b".repeat(59)));
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(current, format!("{}\n{}\n", "c".repeat(59), "d".repeat(59)));
+    }
+
+    #[test]
+    fn the_log_file_rotates_into_one_private_copy() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("honk.log");
+        let rotated = directory.path().join("honk.log.1");
+        let mut log = RotatingLogFile::open(&path, 100).unwrap();
+        for line in ["a", "b", "c", "d"] {
+            log.write_all(line.repeat(59).as_bytes()).unwrap();
+            log.write_all(b"\n").unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "d".repeat(59) + "\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&rotated).unwrap(),
+            "c".repeat(59) + "\n"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+        for file in [&path, &rotated] {
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]
