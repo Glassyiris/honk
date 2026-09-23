@@ -8,7 +8,7 @@ use super::{
     ApiError, MAX_RESPONSE_BYTES, NativeState, RequestId, bounded_response, canonical_name,
     full_detail, invalid_query, parameters, records, timestamp, unavailable,
 };
-use crate::dns::cache::ExactCacheEntry;
+use crate::dns::cache::{CacheUsage, ExactCacheEntry};
 
 const SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
 const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
@@ -29,6 +29,7 @@ pub(super) struct Snapshot {
     observed_at: String,
     filters: Filters,
     entries: Vec<ExactCacheEntry>,
+    usage: CacheUsage,
     bytes: usize,
     wall: SystemTime,
 }
@@ -118,7 +119,7 @@ pub(super) async fn serve(
         .ok_or_else(|| unavailable(id))?;
     let created = Instant::now();
     let wall = SystemTime::now();
-    let mut entries = state
+    let inspection = state
         .dns
         .inspect_cache(available, created, |key, expires_at| {
             if !filters.expired && expires_at <= created {
@@ -139,6 +140,7 @@ pub(super) async fn serve(
         })
         .await
         .map_err(|_| unavailable(id))?;
+    let mut entries = inspection.entries;
     entries.sort_unstable_by(|left, right| left.id.cmp(&right.id));
     let bytes = overhead
         + entries.iter().map(|entry| entry.cost).sum::<usize>()
@@ -150,6 +152,7 @@ pub(super) async fn serve(
         observed_at: timestamp(wall),
         filters,
         entries,
+        usage: inspection.usage,
         bytes,
         wall,
     };
@@ -236,9 +239,11 @@ fn page(
         rows.push(row);
     }
     let cursor = (end < snapshot.entries.len()).then(|| format!("{}:{end}", snapshot.id));
+    let usage = &snapshot.usage;
     bounded_response(
         &json!({"observed_at":snapshot.observed_at,"coverage":{"positive":true,"negative":true,"persistent":false},
-        "entries":rows,"total":snapshot.entries.len(),"next_cursor":cursor}),
+        "entries":rows,"total":snapshot.entries.len(),"next_cursor":cursor,
+        "usage":{"entries":usage.entries.to_string(),"entry_capacity":usage.entry_capacity.to_string()}}),
         id,
     )
 }

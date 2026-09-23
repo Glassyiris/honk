@@ -358,12 +358,12 @@ mod storage {
 }
 mod store;
 
-#[cfg(any(feature = "native-api", test))]
-pub(crate) use control::CacheInspectionError;
 #[cfg(feature = "native-api")]
 pub(crate) use control::ExactCacheEntry;
 #[cfg(any(feature = "native-api", test))]
 pub(crate) use control::question_matches;
+#[cfg(any(feature = "native-api", test))]
+pub(crate) use control::{CacheInspection, CacheInspectionError, CacheUsage};
 pub(crate) use control::{CacheInvalidation, CacheMutation};
 pub use counters::CacheCounters;
 pub(crate) use key::{CacheKey, KeyIdentity, OperationKind};

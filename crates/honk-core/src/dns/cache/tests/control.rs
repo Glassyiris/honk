@@ -38,7 +38,8 @@ async fn exact_ids_follow_incarnations_not_keys_or_cache_instances() {
     assert_eq!(
         service
             .inspect_exact(4096, Instant::now(), |_, _| true)
-            .unwrap()[0]
+            .unwrap()
+            .entries[0]
             .id,
         first
     );
@@ -104,7 +105,8 @@ fn bounded_inspection_retains_every_variant_without_touching_lru_or_counters() {
     let before = service.counters();
     let rows = service
         .inspect_exact(1024 * 1024, Instant::now(), |_, _| true)
-        .unwrap();
+        .unwrap()
+        .entries;
     assert_eq!(rows.len(), 4);
     assert!(rows.iter().all(|row| row.response.is_some()
         && row.expires_at > std::time::Instant::now()
@@ -118,6 +120,7 @@ fn bounded_inspection_retains_every_variant_without_touching_lru_or_counters() {
         service
             .inspect_exact(cost, Instant::now(), |_, _| true)
             .unwrap()
+            .entries
             .len(),
         4
     );
@@ -168,13 +171,15 @@ fn inspection_selection_precedes_byte_admission() {
         .inspect_exact(4096, now, |key, _| {
             question_matches(key.wire_identity(), "SELECTED.example.", &[1])
         })
-        .unwrap();
+        .unwrap()
+        .entries;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].key, selected);
     assert!(
         service
             .inspect_exact(0, now, |_, _| false)
             .unwrap()
+            .entries
             .is_empty()
     );
     assert_eq!(
@@ -199,14 +204,16 @@ fn inspection_selection_uses_the_same_instant_as_negative_precedence() {
     service.put_negative_exact(key, 30, 3);
     let negative = service
         .inspect_exact(4096, Instant::now(), |_, _| true)
-        .unwrap();
+        .unwrap()
+        .entries;
     assert_eq!(negative[0].negative, Some(3));
     assert!(negative[0].response.is_none());
 
     let now = negative[0].expires_at;
     let positive = service
         .inspect_exact(4096, now, |_, expires_at| expires_at > now)
-        .unwrap();
+        .unwrap()
+        .entries;
     assert_eq!(positive.len(), 1);
     assert!(positive[0].response.is_some());
     assert!(positive[0].negative.is_none());
@@ -217,10 +224,15 @@ fn inspection_selection_uses_the_same_instant_as_negative_precedence() {
         service
             .inspect_exact(0, now, |_, expires_at| expires_at > now)
             .unwrap()
+            .entries
             .is_empty()
     );
     assert_eq!(
-        service.inspect_exact(4096, now, |_, _| true).unwrap()[0].id,
+        service
+            .inspect_exact(4096, now, |_, _| true)
+            .unwrap()
+            .entries[0]
+            .id,
         positive[0].id
     );
 }
@@ -292,4 +304,63 @@ async fn name_invalidation_fences_foreground_refresh_and_restore_across_variants
         3
     );
     assert!(service.is_empty());
+}
+
+#[test]
+fn usage_reports_the_clamped_entry_capacity() {
+    for (max_size, entry_capacity) in [(0, 1), (4, 4), (1001, 1001), (usize::MAX, 100_000)] {
+        assert_eq!(
+            DnsCache::new(max_size)
+                .service()
+                .inspect_exact(0, Instant::now(), |_, _| false)
+                .unwrap()
+                .usage,
+            CacheUsage {
+                entries: 0,
+                entry_capacity,
+            },
+            "max_cache_size {max_size}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn usage_counts_the_whole_cache_regardless_of_the_listing_filter() {
+    let service = DnsCache::new(128).service();
+    let positive = key("example.com", 1, IngressProfile::Internal, "default");
+    let negative = key("missing.example", 1, IngressProfile::Internal, "default");
+    service.put_exact(
+        positive.clone(),
+        make_test_response([192, 0, 2, 1], 300),
+        300,
+        None,
+    );
+    service.put_negative_exact(negative, 30, 3);
+
+    let inspection = service
+        .inspect_exact(4096, Instant::now(), |key, _| key == &positive)
+        .unwrap();
+    assert_eq!(inspection.entries.len(), 1);
+    assert_eq!(
+        inspection.usage,
+        CacheUsage {
+            entries: 2,
+            entry_capacity: 128,
+        }
+    );
+    service
+        .invalidate(CacheInvalidation::Name {
+            name: "example.com.".into(),
+            types: vec![1],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .inspect_exact(4096, Instant::now(), |_, _| true)
+            .unwrap()
+            .usage
+            .entries,
+        1
+    );
 }

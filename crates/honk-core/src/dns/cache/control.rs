@@ -24,6 +24,21 @@ pub(crate) struct ExactCacheEntry {
     pub cost: usize,
 }
 
+/// Whole-cache occupancy beside its effective bounds, unaffected by listing filters.
+#[cfg(any(feature = "native-api", test))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CacheUsage {
+    pub entries: usize,
+    pub entry_capacity: usize,
+}
+
+#[cfg(any(feature = "native-api", test))]
+#[derive(Debug)]
+pub(crate) struct CacheInspection {
+    pub entries: Vec<ExactCacheEntry>,
+    pub usage: CacheUsage,
+}
+
 #[cfg(any(feature = "native-api", test))]
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("DNS cache snapshot exceeds its retained byte budget")]
@@ -96,18 +111,24 @@ impl DnsCacheService {
             .map(|_| self.incarnation_id(revision))
     }
     /// The selector must not reenter the cache: publication and shard locks are held.
+    ///
+    /// Every shard stays locked until the listing and usage are both taken, so
+    /// they describe one instant of the whole cache rather than per-shard reads.
     #[cfg(any(feature = "native-api", test))]
     pub(crate) fn inspect_exact(
         &self,
         max_bytes: usize,
         now: Instant,
         mut select: impl FnMut(&CacheKey, Instant) -> bool,
-    ) -> Result<Vec<ExactCacheEntry>, CacheInspectionError> {
+    ) -> Result<CacheInspection, CacheInspectionError> {
         let _publication = lock(&self.publication);
         let shards: Vec<_> = self.shards.iter().map(lock).collect();
         let mut total = 0usize;
         let mut selected = Vec::new();
+        let mut usage = CacheUsage::default();
         for shard in &shards {
+            usage.entries += shard.len();
+            usage.entry_capacity += shard.cap().get();
             for (slot, value) in shard.iter() {
                 let CacheSlot::Exact(key) = slot else {
                     continue;
@@ -160,7 +181,7 @@ impl DnsCacheService {
                 cost,
             });
         }
-        Ok(entries)
+        Ok(CacheInspection { entries, usage })
     }
 
     pub(crate) async fn invalidate(

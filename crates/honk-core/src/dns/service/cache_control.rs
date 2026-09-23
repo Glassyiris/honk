@@ -1,6 +1,6 @@
 use super::DnsService;
 #[cfg(feature = "native-api")]
-use crate::dns::cache::{CacheInspectionError, CacheKey, ExactCacheEntry};
+use crate::dns::cache::{CacheInspection, CacheInspectionError, CacheKey};
 use crate::dns::cache::{CacheInvalidation, CacheMutation};
 
 impl DnsService {
@@ -10,7 +10,7 @@ impl DnsService {
         max_bytes: usize,
         now: std::time::Instant,
         select: impl FnMut(&CacheKey, std::time::Instant) -> bool,
-    ) -> Result<Vec<ExactCacheEntry>, CacheInspectionError> {
+    ) -> Result<CacheInspection, CacheInspectionError> {
         self.cache()
             .lock()
             .await
