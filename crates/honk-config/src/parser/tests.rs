@@ -1314,9 +1314,14 @@ experimental {
         assert_eq!(config.experimental.clash_api.secret, "s3cret");
         assert_eq!(config.experimental.clash_api.default_mode, "Global");
         assert!(config.experimental.cache_file.enabled);
-        assert_eq!(config.experimental.cache_file.path, "cache.db");
-        assert_eq!(config.experimental.cache_file.cache_id, "router1");
-        assert!(config.experimental.cache_file.store_fakeip);
+        assert_eq!(
+            config.experimental.cache_file.legacy_cache_file(),
+            (Some("cache.db"), Some("router1"))
+        );
+        assert_eq!(
+            config.experimental.cache_file.legacy_store_fakeip,
+            Some(true)
+        );
         assert!(config.experimental.cache_file.store_dns);
     }
 
@@ -2678,7 +2683,6 @@ experimental {
     assert!(!config.global.mptcp);
     assert!(!config.dns.cache.enabled);
     assert!(!config.experimental.cache_file.enabled);
-    assert!(!config.experimental.cache_file.store_fakeip);
     assert!(!config.experimental.cache_file.store_dns);
 
     let valid_input = r#"
@@ -2697,7 +2701,6 @@ dns {
 experimental {
     cache_file {
         enabled: true
-        store_fakeip: yes
         store_dns: on
     }
 }
@@ -2721,7 +2724,6 @@ experimental {
     assert!(!config.global.mptcp);
     assert!(!config.dns.cache.enabled);
     assert!(config.experimental.cache_file.enabled);
-    assert!(config.experimental.cache_file.store_fakeip);
     assert!(config.experimental.cache_file.store_dns);
 }
 

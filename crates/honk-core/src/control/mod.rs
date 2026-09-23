@@ -161,8 +161,10 @@ pub struct ControlPlane {
     tcp_flow_pins: Arc<TcpFlowPins>,
     /// Persistent cache (selector choices, clash mode); opened by `run()`
     /// via `init_cache_db` when `experimental.cache_file` is enabled.
-    cache_db: Option<Arc<crate::cachedb::CacheDb>>,
-    delay_writer: cache::DelayWriter,
+    cache_db: Option<Arc<crate::state::cache::CacheDb>>,
+    /// The state database handed to `init_cache_db`.
+    state_db: Option<Arc<crate::state::StateDb>>,
+    state_tick: cache::StateTick,
     /// Node name → eBPF outbound id (push_routing_to_ebpf numbering),
     /// shared with the alive set's outbound resolver; rebuilt on reload.
     outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,

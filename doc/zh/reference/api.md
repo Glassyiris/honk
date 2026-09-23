@@ -4,7 +4,7 @@
 
 ## 原生 API (M1)
 
-本节保留 M1 标题锚点，说明当前已实现的原生观测与控制契约。默认构建及两种 allocator 发布产物均包含 `native-api` Cargo feature，但 listener 默认关闭，须显式启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是唯一配置权威；显式授权后可读取与替换已接受的源文件，不引入 SQLite 配置主存储。
+本节保留 M1 标题锚点，说明当前已实现的原生观测与控制契约。默认构建及两种 allocator 发布产物均包含 `native-api` Cargo feature，但 listener 默认关闭，须显式启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是配置格式；显式授权后可读取与替换已接受的源文件，或以 `--store db` 把 revision 记录在 SQLite 配置数据库中（见[配置数据库](#配置数据库--store-db)）。
 
 基础契约为 [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](https://github.com/Zakkaus/api-standardize/tree/cb8ac07c6520b7fb08539cc0b7701695f5a07992)，节点/provider 管理与 geodata 使用 [doona-pin ba3e4c3648e04d093d32164ecca018f51bd74e00](https://github.com/Zakkaus/api-standardize/tree/ba3e4c3648e04d093d32164ecca018f51bd74e00) 中的 M9 补充。没有整体切换到该后续 bundle 的 mode/自动 override 变更：原生 mode 与自动策略 override 继续 gate，不声明 `full_transparency`。源管理要求真实 `.dae` 启动，写入还需启用 `config_write` 并配置非空 secret 或 `password_auth`；以 capabilities 和逐源权限为准，不按路由名称推断全部可用。
 
@@ -86,7 +86,7 @@ Token 模式不提供三个密码 endpoint，返回 `404 capability_not_supporte
 | `POST /api/v1/auth/login` | 相同 body → `200 {"token":"hnk1_…","expires_at":"..."}` | setup 前返回 `409 setup_required`；用户名或密码错误均返回 `401 invalid_credentials`。 |
 | `POST /api/v1/auth/logout` | `Authorization: Bearer <session>` → `204` | 无效或过期会话按普通 bearer 认证失败。 |
 
-`expires_at` 是 RFC 3339 UTC 时间戳。Setup 与 login 要求 `Content-Type: application/json`，不能携带 query string 或未知 JSON 字段，body 最多 4096 字节。用户名区分大小写，必须是匹配 `[A-Za-z0-9_.-]{1,64}` 的 ASCII。密码须为 12–128 个 Unicode 标量值，UTF-8 编码最多 512 字节。无效 JSON 或字段返回 `400 invalid_request`；缺少或使用其他 media type 返回 `415 unsupported_media_type`。
+`expires_at` 是 RFC 3339 UTC 时间戳。Setup 与 login 要求 `Content-Type: application/json`，不能携带 query string 或未知 JSON 字段，body 最多 4096 字节。用户名区分大小写，必须是匹配 `[A-Za-z0-9_.-]{1,64}` 的 ASCII。密码须为 8–128 个 Unicode 标量值，UTF-8 编码最多 512 字节。无效 JSON 或字段返回 `400 invalid_request`；缺少或使用其他 media type 返回 `415 unsupported_media_type`。
 
 Setup 只信任 accept socket 的对端地址，不读取 `Forwarded`、`X-Forwarded-For` 或其他 header。允许范围为 `127.0.0.0/8`、`::1`、RFC 1918、`fc00::/7`、`169.254.0.0/16` 及 `fe80::/10`；IPv4-mapped IPv6 按 IPv4 分类。其他对端在读取账户状态或处理凭据前返回 `403 permission_denied`。
 
@@ -94,11 +94,13 @@ Setup 与 login 每分钟按规范化对端最多接受 5 次尝试，全局最�
 
 会话 token 是不透明的 `hnk1_…` 值，通过 `Authorization: Bearer <session>` 使用。每个会话固定有效 12 小时。进程只保留 token 的 SHA-256 digest，最多保留 32 个有效会话；签发新会话时淘汰最早会话，重启结束全部会话。通过配置 secret 或密码登录启动的 operation 属于管理员，而非某个 token，因此 logout 不删除 operation。
 
-密码模式把唯一凭据记录存于 `<data_dir>/native-api/admin.json`。新目录与记录分别使用 `0700` 和 `0600`；已有对象必须由进程的有效用户拥有，且不能授予 group 或 other 权限。符号链接、其他所有者、更宽权限或畸形记录都会阻止启动。
+密码模式把唯一凭据记录保存在状态数据库 `<data_dir>/state/honk.db` 的 `admin` 行中（文件权限 0600，目录 0700，见[配置数据库](#配置数据库--store-db)）。记录畸形时拒绝启动；状态数据库损坏时同样拒绝启动，密码模式不会把它移走。
 
-记录使用 PBKDF2-HMAC-SHA256、100,000 次迭代及新生成的 16 字节随机 salt。密码模式直接使用配置的 `global.data_dir`：该目录不可用时启动失败，不回退到其他目录，以免在别处重新开放 setup。首次 setup 不替换已有记录，凭据目录在进程生命周期内保持独占锁定。
+记录使用 PBKDF2-HMAC-SHA256、100,000 次迭代及新生成的 16 字节随机 salt。密码模式直接使用配置的 `global.data_dir`：该目录不可用时启动失败，不回退到其他目录，以免在别处重新开放 setup。首次 setup 插入该行，不替换已有记录，因此两个进程在同一个状态数据库上同时 setup 时只有一个成功。写入开始前数据库忙碌时，setup 失败，可以重试。插入或提交因其他原因失败时，由于该行是否已持久化无法确定，进程在重启前拒绝登录和再次 setup。
 
-不提供 HTTP 密码重置。恢复访问时，停止 honk，删除 `admin.json`，重启后重新 setup。
+状态数据库之前的版本把记录保存在 `<data_dir>/native-api/admin.json`。启用 `password_auth` 时，首次启动导入该文件一次（已有的行优先），随后删除文件，`native-api/` 为空时一并删除；旧文件仍须通过与之前相同的所有者与权限检查。未启用 `password_auth` 时不处理该文件。此后再启动旧版本时，它找不到 `admin.json`，会重新开放 setup。
+
+不提供 HTTP 密码重置。恢复访问时，停止 honk，执行 `honk-core admin reset`，重启后重新 setup。把 `<data_dir>/state` 整个移走也能恢复，但会丢弃所有其他持久化状态。
 
 ### 用户态记录流（M2）
 
@@ -177,6 +179,27 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 通过 GET operation、`runtime.last_reload` 及 `operation.updated` 读取真实结果，不能把收到 202 当作 succeeded。Reload 拒绝时保留旧 accepted 快照和 generation，但已写入字节不回滚；提交后 degraded 时保留新快照/generation 并报告 failed，而不是声称旧代仍活动。管理员应据磁盘内容与结果修复，再显式 reload。SIGHUP 本身不创建 API operation。仅改注释也会更新 source hash/config revision，但有效配置未变时不增加 runtime generation；有效组成员变化会改变 revision，健康测量变化不会。这三种版本不是可互换的并发令牌。配置 secret 或密码登录保护 listener 时，所有会话使用同一个管理员 operation principal，logout 不删除保留的 operation。
 
+### 配置数据库（`--store db`）
+
+`honk-core --store db` 将受管理的 `.dae` 源以 revision 形式保存在状态数据库 `<data_dir>/state/honk.db` 中。`data_dir` 取自 `--data-dir`（默认 `/var/lib/honk`），必须与 `global.data_dir` 相同，不回退到工作目录。`state` 目录权限为 0700、文件为 0600，二者均属 daemon 用户且不能是符号链接，否则拒绝启动。数据库采用 WAL 模式，同目录下的 `honk.db-wal` 与 `honk.db-shm` 权限与主文件相同；文件系统不支持 WAL（例如不支持共享内存）时，回退到回滚日志（`honk.db-journal`）并记录警告。配置中只有 `.dae` 源进入数据库；订阅正文在两种模式下都保存在数据库中。hosts、ECH 与 geodata 仍在磁盘上，按 `data_dir` 解析。导入源树所在的目录不授权任何依赖。
+
+数据库为空时，启动过程导入 `-c`，要求启用 `native_api.enabled` 与 `config_write` 并配置凭据。导入删除 `native_api` 与 `clash_api` 中的全部 `secret:`，确认去除凭据的源树在重新套用凭据后解析出相同配置，再以 principal `startup` 记录 revision 1。若凭据值在删除后仍残留（例如在注释或文件名中），导入被拒绝。已有 revision 时，启动过程加载当前 revision，不读取 `-c`；若启动期间另一实例移动了 `head`，启动终止；只有不持有实例锁的 mock 模式实例会造成这种情况。数据库模式不提供 Clash API：无论导入的源树还是当前 revision，只要 `experimental.clash_api.external_controller` 非空，启动即被拒绝。数据库损坏、`application_id` 不符或 schema 版本更高时拒绝启动；数据库不会被改名或重建。
+
+监听凭据与 revision 分开保存，从不返回。写入不能修改监听凭据、`native_api` 设置或 `global.data_dir`，否则返回 403；含已保存凭据值的源也会被拒绝。响应与 `--without-secrets` 导出均遮蔽这两个已保存的值。数据库模式下源 `absolute_path` 为 null，源路径只是标签，不对应文件；`If-Match` 比较数据库中保存的源字节。
+
+写入先激活再记录。激活提交后（包括 degraded 与 reconciliation 失败的提交）才写入 revision 行并移动 `head`；激活被拒绝时不增加记录，并报告 `written:false`。记录失败时，操作以 `details {stage:"store",committed:true,durable:false}` 失败；引擎在确认激活前停止时，操作以 `details {stage:"store",committed:null}` 失败。两种情况下，`store.recorded` 变为 false，capabilities 报告配置不可写，导出文件名不含 revision，写入返回 `503 temporarily_unavailable` 与 `details.stage:"store"`。激活 `head` 所在的 revision 会重新激活它而不增加记录，并解除该状态；重启同样会解除，重启后加载 `head`。最多保留 50 个 revision，按存储的 JSON 计共 16 MiB，从最旧的开始清理，不删除当前 revision。JSON 转义可能使 revision 大于源文件本身；单个 revision 的 JSON 超过 16 MiB 时拒绝写入。
+
+`GET /config` 增加 `store {kind, revision, parent, recorded}`，`kind` 为 `file` 或 `db`。capabilities 增加 `config.store`、`config_export {available}`、`config_import {available, replace_required}` 与 `config_revisions {available, can_activate, max_revisions}`；discovery 增加 `config_export`、`config_import` 与 `config_revisions` 链接。
+
+- `GET /config/export` 把已接受的源合并为一份文档返回：`text/plain; charset=utf-8`、`Content-Disposition: attachment; filename="honk-r<n>.dae"`（文件模式为 `honk.dae`）、基于正文的强 `ETag` 与 `Cache-Control: no-store`。正文不含监听凭据；有凭据被省略时，首行为 `# listener secrets omitted`，补回凭据后才能运行。两种模式均可用。
+- `POST /config/import`（数据库模式，需可写）接受严格 JSON `{"replace":bool}`，必须带 `Idempotency-Key`。它重新读取 `-c` 源树，经 reload 操作记录为 origin 为 `import` 的新 revision。因为启动过程总会记录 revision 1，所以必须提交 `replace:true`，其他请求返回 `409 already_initialized`。凭据副本在删除后仍残留时返回 `422 unsupported_value`。源树必须保持入口路径、监听凭据、`native_api` 设置与 `data_dir` 不变，否则返回 403。
+- `GET /config/revisions`（数据库模式）返回 `{active, max_revisions, revisions:[{revision, parent, created_at, principal, origin, content_sha256, bytes, sources:[{path, sha256}]}]}`，从新到旧排列，不含正文。
+- `POST /config/revisions/{n}/activate`（数据库模式，需可写）接受空 body 或 `{}`，`Idempotency-Key` 可选。它校验并激活 revision `n`，再记录为 origin 为 `activate` 的新 revision。`store.recorded` 为 true 时，激活当前 revision 不产生变更；未知的 `n` 返回 `404 resource_not_found`。
+
+文件模式下，import 与 revision 路由返回 `404 capability_not_supported`。
+
+回到文件模式时，执行 `honk-core config export --out /etc/honk/config.dae`，再去掉 `--store db` 重启。之后再以数据库模式启动时从 `head` 继续；文件改动只能通过 `replace:true` 的 import 进入数据库。数据库损坏时，先执行 `honk-core config export --out exported.dae`；导出只检查 application id 与 schema 版本，损坏的文件也可能读得出来。然后停止 honk，执行 `mv <data_dir>/state <data_dir>/state.bad` 移走整个目录，使 `honk.db-wal` 随主文件一起移走，再以 `--store db -c exported.dae` 启动。
+
 ### 有界探测、DNS 与路由诊断
 
 `POST /probes` 接受节点/组 target、`kind=tcp_connect|http|dns`、purpose、transport 数组、地址族与 `warmth=cold|warm`，不接受任意调用方 URL。组可选直接成员、叶节点或显式成员 ID；先固定当前配置/成员/注册代次，再去重执行并保留 member→leaf 关联。TCP-connect 测节点实际端口；HTTP 使用配置检查 URL，不跟随重定向；DNS 执行实际 UDP 或带长度帧的 TCP exchange。HTTP/HTTPS 默认仅端口 80/443，DNS 默认 53，额外端口需管理员 `probe_allowed_ports`；私网、loopback、link-local 等受限目标（包括节点地址）另需 `probe_allowed_cidrs`。解析后的地址规范化、校验并固定，不能以端口许可代替 CIDR 许可或交给代理重新解析。
@@ -209,7 +232,7 @@ GET 和成功的 PATCH 响应包含只读 `recording`：`flows`、`logs`、`dns_
 
 ### 主文件条目与 geodata 管理（M9）
 
-`resources.nodes.can_manage` 与 `resources.providers.can_manage` 要求来源协调器运行，且 accepted **主文件**可写、不含 API 凭据。创建节点提交 `{"name":"edge","link":"socks5://192.0.2.2:1080"}`；创建 provider 提交 `{"name":"feed","kind":"subscription","url":"https://example.net/sub"}`。严格 JSON 与 64 KiB 正文限制不变。复用引擎 parser、完整离线准入、FD 相对耐久写入及真实 reload；激活与订阅协调完成后才以 `201` 返回当前 Node/Provider 和 `Location`。HTTP 断连不取消已入队工作，不引入第二份配置数据库。
+`resources.nodes.can_manage` 与 `resources.providers.can_manage` 要求来源协调器运行，且 accepted **主文件**可写、不含 API 凭据。创建节点提交 `{"name":"edge","link":"socks5://192.0.2.2:1080"}`；创建 provider 提交 `{"name":"feed","kind":"subscription","url":"https://example.net/sub"}`。严格 JSON 与 64 KiB 正文限制不变。复用引擎 parser、完整离线准入、FD 相对耐久写入及真实 reload；激活与订阅协调完成后才以 `201` 返回当前 Node/Provider 和 `Location`。HTTP 断连不取消已入队工作；使用 `--store db` 时，这些操作记录新 revision，不重写主文件。
 
 节点名为 1–64 字符，链接最多 8192 字符；provider 名为 1–64 个 ASCII 字母/数字/`_.-`，HTTP(S) URL 最多 4096 字符。重名返回 409，不支持的链接、身份或值返回 422。新 provider 即使有旧缓存正文，也从零节点、stale、无更新时间开始；相同 source specification 的延迟拉取状态在无关编辑、reload 和 suspend/resume 中保留，直到显式 refresh。修改该 specification 或重启恢复普通订阅启动行为。API 不创建 same-fetch 别名，歧义删除直接拒绝，不让 ID/节点悄悄转移。
 

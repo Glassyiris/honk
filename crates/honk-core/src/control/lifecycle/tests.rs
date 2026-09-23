@@ -40,7 +40,7 @@ struct Fixture {
     backend: Arc<RwLock<Box<dyn EbpfBackend>>>,
     groups: honk_outbound::group::SharedGroupManager,
     alive: Arc<honk_outbound::alive::AliveDialerSet>,
-    cache_db: Option<Arc<crate::cachedb::CacheDb>>,
+    cache_db: Option<Arc<crate::state::cache::CacheDb>>,
     dns_service: crate::dns::DnsService,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     task: tokio::task::JoinHandle<(ControlPlane, anyhow::Result<()>)>,
@@ -152,6 +152,13 @@ impl Fixture {
             .with_policy_id(policy)
             .with_hosts_snapshot(hosts),
         );
+        let state = config
+            .experimental
+            .cache_file
+            .enabled
+            .then(|| crate::state::StateDb::open(std::path::Path::new(&config.global.data_dir)))
+            .transpose()?
+            .map(Arc::new);
         let mut plane = ControlPlane::new_with_upstream_pool(
             config,
             Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
@@ -160,7 +167,7 @@ impl Fixture {
             forwarder,
             upstream,
         )?;
-        plane.init_cache_db(None).await;
+        plane.init_cache_db(state, None).await;
         plane.set_mode_state(Arc::new(parking_lot::RwLock::new(
             crate::mode::ModeState::native(),
         )));

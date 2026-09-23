@@ -163,7 +163,11 @@ impl Fixture {
         state.observation.providers.attach(subscriptions.handle());
         let control = tokio::spawn(async move {
             control
-                .run_native_config_test_commands(Arc::new(AtomicUsize::new(0)), None)
+                .run_native_config_test_commands(
+                    Arc::new(AtomicUsize::new(0)),
+                    None,
+                    Arc::default(),
+                )
                 .await
         });
         let server = NativeServer::start(listener, Arc::clone(&state));
@@ -422,7 +426,7 @@ async fn cache_load_is_stale_until_ack_and_startup_or_periodic_fetch_shares_api_
     let mut subscription = origin.subscription();
     subscription.update_interval = 1;
     let directory = tempfile::tempdir().unwrap();
-    let store = SubscriptionStore::open(directory.path().join("cache")).unwrap();
+    let store = SubscriptionStore::in_dir(directory.path());
     store
         .store_content(&subscription, OLD.into())
         .await

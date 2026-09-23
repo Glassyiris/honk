@@ -9,7 +9,6 @@
 //! in dae netns"). Trait-based backends (real aya + mock) for testing
 //! without kernel eBPF support.
 
-pub mod cachedb;
 #[cfg(feature = "clash-api")]
 pub mod clash_api;
 pub mod config_diagnostics;
@@ -27,6 +26,7 @@ pub mod pool;
 pub mod relay;
 pub mod routing;
 pub mod sniffing;
+pub mod state;
 pub mod stats;
 pub mod subscription;
 
@@ -48,6 +48,7 @@ use honk_config::diagnostic::{
 };
 use honk_config::error::{DetailedConfigError, ErrorCategory};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Raise the soft descriptor limit toward the hard maximum, then return the
@@ -179,6 +180,35 @@ pub enum ClashCommand {
     },
     /// Ask the running instance to reload its configured file
     Reload,
+    /// Read the configuration db
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommand,
+    },
+    /// Manage the password-mode administrator
+    Admin {
+        #[command(subcommand)]
+        action: AdminCommand,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum AdminCommand {
+    /// Delete the administrator record so that setup opens again; refused while honk-core runs
+    Reset,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Write the active revision as one dae file, listener secrets included
+    Export {
+        /// New file to write; an existing one is refused
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+        /// Leave the listener secrets out
+        #[arg(long)]
+        without_secrets: bool,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -222,6 +252,21 @@ pub struct Cli {
     /// Use mock eBPF backend (for testing without kernel support)
     #[arg(long)]
     pub mock_ebpf: bool,
+
+    /// Where the administered configuration lives: the `-c` file tree, or the
+    /// revisions in `<data-dir>/state/honk.db`
+    #[arg(long, value_enum, default_value = "file")]
+    pub store: ConfigStore,
+
+    /// Runtime data directory holding the state db; must equal `global.data_dir`
+    #[arg(long, value_name = "PATH", default_value = honk_config::paths::DEFAULT_DATA_DIR, global = true)]
+    pub data_dir: PathBuf,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigStore {
+    File,
+    Db,
 }
 
 pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
@@ -229,13 +274,57 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
     use std::time::Duration;
 
     let cmd = cli.command.as_ref().expect("subcommand required");
+    let read_config = || -> anyhow::Result<Config> {
+        match cli.store {
+            ConfigStore::File => Ok(Config::from_file(cli.config.to_str().unwrap())?),
+            #[cfg(feature = "native-api")]
+            ConfigStore::Db => {
+                let text = native_api::store::db::export(&cli.data_dir, true)
+                    .map_err(|error| anyhow::anyhow!("configuration db: {error}"))?;
+                Ok(honk_config::parser::parse_dae_config(&text)?)
+            }
+            #[cfg(not(feature = "native-api"))]
+            ConfigStore::Db => anyhow::bail!("--store db needs the native-api feature"),
+        }
+    };
 
     match cmd {
+        #[cfg(feature = "native-api")]
+        ClashCommand::Config {
+            action:
+                ConfigCommand::Export {
+                    out,
+                    without_secrets,
+                },
+        } => {
+            native_api::store::db::export_to(&cli.data_dir, out, !without_secrets)?;
+            println!(
+                "Exported the active configuration revision to {}",
+                out.display()
+            );
+        }
+        #[cfg(not(feature = "native-api"))]
+        ClashCommand::Config { .. } => anyhow::bail!("config export needs the native-api feature"),
+        ClashCommand::Admin {
+            action: AdminCommand::Reset,
+        } => {
+            let deleted = state::reset_admin(&cli.data_dir)
+                .map_err(|error| anyhow::anyhow!("admin reset: {error}"))?;
+            if deleted {
+                println!("Deleted the administrator; setup is open again");
+            } else {
+                println!("No administrator was set up");
+            }
+        }
         ClashCommand::Reload => {
             let pid = request_reload(std::path::Path::new(INSTANCE_LOCK_PATH))?;
             println!("Reload requested for honk-core process {pid}");
         }
         ClashCommand::Mode { mode } => {
+            anyhow::ensure!(
+                cli.store == ConfigStore::File,
+                "mode edits the -c file; with --store db, change default_mode through the native API"
+            );
             let valid_modes = ["rule", "global", "direct"];
             if !valid_modes.contains(&mode.as_str()) {
                 anyhow::bail!(
@@ -252,7 +341,7 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
             println!("Mode set to {}", mode);
         }
         ClashCommand::Proxy { group, node } => {
-            let config = Config::from_file(cli.config.to_str().unwrap())?;
+            let config = read_config()?;
             let group_exists = config.groups.iter().any(|g| g.name == *group);
             if !group_exists {
                 anyhow::bail!("Group '{}' not found in configuration", group);
@@ -264,7 +353,7 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
             println!("Proxy group '{}' set to '{}'", group, node);
         }
         ClashCommand::Delay { node, url } => {
-            let config = Config::from_file(cli.config.to_str().unwrap())?;
+            let config = read_config()?;
             let target_node = config
                 .nodes
                 .iter()
@@ -361,6 +450,116 @@ fn request_reload(path: &std::path::Path) -> anyhow::Result<libc::pid_t> {
     Ok(pid)
 }
 
+/// Opens the state db in file mode; db mode opened it with its revisions.
+/// Returns `(db, reset)`: `reset` asks for a corrupt, non-strict db to be
+/// moved aside once the instance lock is held.
+///
+/// Unless the db is strict, a db that is unavailable, unsafe or locked by
+/// `admin reset` leaves honk running without persistence; a newer schema or a
+/// foreign file still refuses startup, because only that binary can use it.
+fn open_state_db(
+    cli: &Cli,
+    config: &Config,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<(Option<Arc<state::StateDb>>, bool)> {
+    let strict = cli.store == ConfigStore::Db || config.experimental.native_api.password_auth;
+    if cli.store == ConfigStore::Db
+        || !(config.experimental.cache_file.enabled
+            || config.global.store_subscribe
+            || config.experimental.native_api.password_auth)
+    {
+        return Ok((None, false));
+    }
+    match state::StateDb::open(data_dir) {
+        Ok(db) => Ok((Some(Arc::new(db)), false)),
+        Err(state::StateError::Corrupt) if !strict => {
+            warn!("state database is corrupt; it is moved aside once the instance lock is held");
+            Ok((None, true))
+        }
+        Err(
+            error @ (state::StateError::Unavailable
+            | state::StateError::Unsafe
+            | state::StateError::Locked),
+        ) if !strict => {
+            warn!(%error, "continuing without persistence");
+            Ok((None, false))
+        }
+        Err(error) => Err(anyhow::anyhow!("state database: {error}")),
+    }
+}
+
+/// Moves a corrupt, non-strict state db aside; any failure, including another
+/// process still holding the db, leaves honk running without persistence.
+fn reset_non_strict(data_dir: &std::path::Path) -> Option<Arc<state::StateDb>> {
+    match state::reset_corrupt(data_dir) {
+        Ok(db) => db.map(Arc::new),
+        Err(error) => {
+            warn!(%error, "state database could not be reset; continuing without persistence");
+            None
+        }
+    }
+}
+
+/// The state db and subscription store for this run.
+struct ClaimedState {
+    state_db: Option<Arc<state::StateDb>>,
+    subscriptions: Option<subscription::SubscriptionStore>,
+}
+
+/// Startup changes to the state db, made with the instance lock held: the
+/// reset of a corrupt non-strict db, clearing disabled owners' tables, and the
+/// legacy `.sub` import and removal. The previous instance has exited, so a
+/// legacy body it wrote last is copied before its store is removed.
+fn claim_state(
+    state_db: Option<Arc<state::StateDb>>,
+    reset: bool,
+    config: &Config,
+    data_dir: &std::path::Path,
+    legacy_roots: impl IntoIterator<Item = PathBuf>,
+) -> ClaimedState {
+    let state_db = if reset {
+        reset_non_strict(data_dir)
+    } else {
+        state_db
+    };
+    if let Some(state) = state_db.as_ref() {
+        let experimental = &config.experimental;
+        let owners = state::ActiveOwners {
+            cache: experimental.cache_file.enabled,
+            dns: experimental.cache_file.store_dns,
+            clash: cfg!(feature = "clash-api")
+                && !(cfg!(feature = "native-api") && experimental.native_api.enabled)
+                && !experimental.clash_api.external_controller.is_empty(),
+            subscriptions: config.global.store_subscribe,
+        };
+        if let Err(error) = state::clear_inactive(state, owners) {
+            warn!(%error, "state database: clearing tables of disabled owners failed");
+        }
+    }
+    let subscriptions = match state_db.as_ref().filter(|_| config.global.store_subscribe) {
+        Some(state) => {
+            if let Some(legacy) = subscription::LegacySubscriptionStore::import(
+                state,
+                legacy_roots,
+                &config.subscriptions,
+            ) {
+                legacy.remove();
+            }
+            Some(subscription::SubscriptionStore::new(Arc::clone(state)))
+        }
+        None => {
+            if config.global.store_subscribe {
+                warn!("Subscription store unavailable; continuing without persistence");
+            }
+            None
+        }
+    };
+    ClaimedState {
+        state_db,
+        subscriptions,
+    }
+}
+
 /// Take the process-wide instance lock: the datapath uses fixed names
 /// (dae0, daens, TC hooks) and a stopping instance's cleanup destroys
 /// them, so a second instance must never start while the first is still
@@ -368,20 +567,22 @@ fn request_reload(path: &std::path::Path) -> anyhow::Result<libc::pid_t> {
 /// under it — the restart race that hung the lab for a day). Waits up
 /// to 240s for the previous instance to exit (busy gateways can take
 /// well over 90s to drain), then fails loudly.
+///
+/// It is taken before the configuration or the state db is opened, so a
+/// successor that fails to take it leaves nothing behind.
 fn acquire_instance_lock(
-    _bpf_pin_root: &std::path::Path,
+    path: &std::path::Path,
+    wait: std::time::Duration,
 ) -> anyhow::Result<nix::fcntl::Flock<std::fs::File>> {
     use nix::fcntl::{Flock, FlockArg};
-    // /run (not the bpffs pin root, which rejects regular files).
-    let path = std::path::PathBuf::from(INSTANCE_LOCK_PATH);
     let mut file = std::fs::File::options()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&path)
+        .open(path)
         .map_err(|e| anyhow::anyhow!("open instance lock {}: {}", path.display(), e))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    let deadline = std::time::Instant::now() + wait;
     let mut logged = false;
     loop {
         match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
@@ -392,8 +593,9 @@ fn acquire_instance_lock(
             Err((f, _)) if std::time::Instant::now() < deadline => {
                 file = f; // the failed lock hands the file back for the retry
                 if !logged {
-                    info!(
-                        "another honk-core instance is shutting down; \
+                    // Logging is not set up yet.
+                    eprintln!(
+                        "honk-core: another honk-core instance is shutting down; \
                          waiting for the datapath lock at {}",
                         path.display()
                     );
@@ -410,6 +612,30 @@ fn acquire_instance_lock(
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_INSTANCE_LOCK: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Only the real datapath owns fixed dae0/daens/TC resources. Mock mode must
+/// remain usable without access to the process-global /run lock.
+fn instance_lock(mock_mode: bool) -> anyhow::Result<Option<nix::fcntl::Flock<std::fs::File>>> {
+    #[cfg(test)]
+    if let Some(path) = TEST_INSTANCE_LOCK.with(|path| path.borrow().clone()) {
+        return acquire_instance_lock(&path, std::time::Duration::ZERO).map(Some);
+    }
+    if mock_mode {
+        return Ok(None);
+    }
+    // /run, not the bpffs pin root, which rejects regular files.
+    acquire_instance_lock(
+        std::path::Path::new(INSTANCE_LOCK_PATH),
+        std::time::Duration::from_secs(240),
+    )
+    .map(Some)
 }
 
 fn prepare_nfqueue_startup(config: &mut Config, mock_mode: bool) {
@@ -576,6 +802,92 @@ fn open_log_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
     Ok(file)
 }
 
+/// The log file rotates at this size: it becomes `<name>.1`, replacing an
+/// older copy, so the file and its copy together stay under twice the limit.
+const LOG_FILE_LIMIT: u64 = 10 * 1024 * 1024;
+
+/// The tracing writer for `global.log_file`, rotating at `limit`.
+struct RotatingLogFile {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+    size: u64,
+    limit: u64,
+    /// Set when a rotation failed: no further attempts, and the current file
+    /// takes lines only up to twice the limit.
+    stuck: bool,
+    /// Whether the one warning about dropped lines was printed.
+    dropping: bool,
+    #[cfg(test)]
+    fail_reopen: bool,
+}
+
+impl RotatingLogFile {
+    fn open(path: &std::path::Path, limit: u64) -> anyhow::Result<Self> {
+        let file = open_log_file(path)?;
+        let size = file.metadata()?.len();
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            size,
+            limit,
+            stuck: false,
+            dropping: false,
+            #[cfg(test)]
+            fail_reopen: false,
+        })
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        // Another honk sharing the file during a restart handoff may have
+        // rotated it already; renaming then would overwrite its copy.
+        let ours = self.file.metadata()?;
+        let current = std::fs::symlink_metadata(&self.path).ok();
+        if current.is_some_and(|current| (current.dev(), current.ino()) == (ours.dev(), ours.ino()))
+        {
+            let mut rotated = self.path.clone().into_os_string();
+            rotated.push(".1");
+            std::fs::rename(&self.path, rotated)?;
+        }
+        #[cfg(test)]
+        if self.fail_reopen {
+            return Err(std::io::Error::other("injected reopen failure"));
+        }
+        // Opened with the same checks as the first file.
+        self.file = open_log_file(&self.path).map_err(std::io::Error::other)?;
+        self.size = self.file.metadata()?.len();
+        Ok(())
+    }
+}
+
+impl std::io::Write for RotatingLogFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let after = self.size.saturating_add(buf.len() as u64);
+        if !self.stuck && self.size > 0 && after > self.limit && self.rotate().is_err() {
+            self.stuck = true;
+        }
+        if self.stuck && after > self.limit.saturating_mul(2) {
+            if !self.dropping {
+                self.dropping = true;
+                // Not through tracing: this is the tracing writer.
+                eprintln!(
+                    "honk-core: log file {} could not be rotated; dropping log lines until restart",
+                    self.path.display()
+                );
+            }
+            return Ok(buf.len());
+        }
+        let written = self.file.write(buf)?;
+        self.size = self.size.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
 fn load_operator_config(
     path: &str,
     diagnostics: &mut Vec<DetailedDiagnostic>,
@@ -691,9 +1003,31 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let mut diagnostics = Vec::new();
     #[cfg(feature = "native-api")]
     let mut native_sources = None;
+    #[cfg(feature = "native-api")]
+    let mut database = None;
+    #[cfg(not(feature = "native-api"))]
+    anyhow::ensure!(
+        cli.store == ConfigStore::File,
+        "--store db needs the native-api feature"
+    );
+    let mock_mode = cli.mock_ebpf || cfg!(not(feature = "ebpf"));
+    // Everything else in `run` drops before it.
+    let _instance_lock = instance_lock(mock_mode)?;
     let startup = (|| -> anyhow::Result<_> {
         #[cfg(feature = "native-api")]
-        let mut config = {
+        let mut config = if cli.store == ConfigStore::Db {
+            std::fs::create_dir_all(&cli.data_dir)?;
+            // DbStore needs an absolute, lexically normal entry; a missing -c
+            // is fine once the db holds a revision.
+            let entry =
+                std::fs::canonicalize(&cli.config).or_else(|_| std::path::absolute(&cli.config))?;
+            let startup =
+                native_api::store::DatabaseStartup::open(&entry, &cli.data_dir, &mut diagnostics)?;
+            native_sources = Some(startup.sources.clone());
+            let config = startup.config.clone();
+            database = Some(startup);
+            config
+        } else {
             let (config, sources) = load_operator_config_captured(&cli.config, &mut diagnostics)?;
             anyhow::ensure!(
                 sources.is_some() || !config.experimental.native_api.config_write,
@@ -712,6 +1046,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         let requested_data_dir = PathBuf::from(&config.global.data_dir);
         let (runtime_data_dir, data_dir_creation_error) =
             prepare_runtime_data_dir(&requested_data_dir)?;
+        #[cfg(feature = "native-api")]
+        anyhow::ensure!(
+            cli.store == ConfigStore::File || runtime_data_dir == requested_data_dir,
+            "the configuration db needs its data directory {}; refusing to fall back to {}",
+            requested_data_dir.display(),
+            runtime_data_dir.display()
+        );
         #[cfg(feature = "native-api")]
         anyhow::ensure!(
             !(config.experimental.native_api.enabled
@@ -750,7 +1091,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
         let log_file_path = resolved_log_file_path(&config, cli.log_file.as_deref());
         let log_file_layer = if let Some(path) = log_file_path.as_ref() {
-            let file = open_log_file(path)?;
+            let file = RotatingLogFile::open(path, LOG_FILE_LIMIT)?;
             Some(
                 tracing_subscriber::fmt::layer()
                     .with_timer(LocalTime)
@@ -818,6 +1159,20 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     report_detailed_diagnostics(&diagnostics);
     info!(directory = %honk_config::paths::data_dir().display(), "Runtime data directory configured");
+    let (state_db, state_reset) = open_state_db(&cli, &config, honk_config::paths::data_dir())?;
+    #[cfg(feature = "native-api")]
+    let state_db = database
+        .as_ref()
+        .map(|database| database.store.state())
+        .or(state_db);
+    let legacy_cache = {
+        let (path, cache_id) = config.experimental.cache_file.legacy_cache_file();
+        let config_dir = match cli.store {
+            ConfigStore::File => cli.config.parent(),
+            ConfigStore::Db => Some(cli.data_dir.as_path()),
+        };
+        state::import::LegacyCache::locate(path, cache_id, config_dir)
+    };
     if let Some(path) = log_file_path.as_ref() {
         info!(path = %path.display(), "File logging enabled");
     }
@@ -852,26 +1207,28 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         info!("Bootstrap resolver: {}", config.global.bootstrap_resolver);
     }
 
+    #[cfg(feature = "native-api")]
+    if let Some(database) = database.as_mut() {
+        database.record()?;
+    }
+    let claimed = claim_state(
+        state_db,
+        state_reset,
+        &config,
+        honk_config::paths::data_dir(),
+        subscription::legacy_store_roots(),
+    );
+    let state_db = claimed.state_db;
+
     // A valid stored body makes network refresh non-blocking for startup.
     // Missing subscriptions still get the bounded first-fetch grace period;
     // every fetch continues in the background after the control plane starts.
-    let subscription_store = if config.global.store_subscribe {
-        match subscription::SubscriptionStore::in_data_dir() {
-            Ok(store) => {
-                info!(directory = %store.root().display(), "Subscription store ready");
-                Some(store)
-            }
-            Err(error) => {
-                warn!(%error, "Subscription store unavailable; continuing without persistence");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let mut subscription_supervisor =
-        subscription::SubscriptionSupervisor::prepare(&mut config, subscription_store, diagnostics)
-            .await?;
+    let mut subscription_supervisor = subscription::SubscriptionSupervisor::prepare(
+        &mut config,
+        claimed.subscriptions,
+        diagnostics,
+    )
+    .await?;
     let startup_diagnostics = subscription_supervisor.take_startup_diagnostics();
 
     // Resolve group filters into concrete node IDs. This must run for every
@@ -902,7 +1259,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         config.routing.rules.len()
     );
 
-    let mock_mode = cli.mock_ebpf || cfg!(not(feature = "ebpf"));
     #[cfg(feature = "ebpf")]
     let configured_ifaces = configured_interfaces(&config);
     #[cfg(feature = "ebpf")]
@@ -919,14 +1275,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             "default route unavailable; auto interface binding is pending until a network route appears"
         );
     }
-
-    // Only the real datapath owns fixed dae0/daens/TC resources. Mock mode
-    // must remain usable without access to the process-global /run lock.
-    let _instance_lock = if mock_mode {
-        None
-    } else {
-        Some(acquire_instance_lock(&cli.bpf_pin_root)?)
-    };
 
     // The old instance owns queue 320 until this lock is released. Check
     // NFQUEUE only after the handoff so a transient busy result cannot turn
@@ -1274,10 +1622,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     dns_upstream_pool.set_traffic_router(Some(control_plane.traffic_router()));
     info!("DNS upstream pool attached to SharedGroupManager + traffic Router");
 
-    // Persistent cache (selector choices, clash mode): opens cache.db when
-    // `experimental.cache_file` is enabled, restores Selector choices, and
-    // wires change persistence into the group manager.
-    control_plane.init_cache_db(cli.config.parent()).await;
+    // Runtime state (selector choices, clash mode): with
+    // `experimental.cache_file` enabled, imports a legacy cache.db, restores
+    // Selector choices, and wires change persistence into the group manager.
+    control_plane
+        .init_cache_db(state_db.clone(), Some(legacy_cache))
+        .await;
 
     #[cfg(feature = "clash-api")]
     let clash_cfg = control_plane
@@ -1325,7 +1675,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     } else {
         cache_db
             .as_ref()
-            .and_then(|db| db.load_selector_choice("GLOBAL"))
+            .and_then(|db| db.load_clash_global())
             .filter(|selection| {
                 valid_global_selections
                     .iter()
@@ -1462,9 +1812,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             .enabled;
         if enabled {
             let service = control_plane.native_observation().configuration.clone();
+            let store: std::sync::Arc<dyn native_api::store::SourceStore> = match database.take() {
+                Some(database) => database.store,
+                None => std::sync::Arc::new(native_api::store::FileStore::new(
+                    native_sources
+                        .as_ref()
+                        .and_then(|sources| sources.sources.first())
+                        .map_or_else(|| cli.config.clone(), |source| source.path.clone()),
+                )),
+            };
             let owner = service
                 .start(
-                    Some(cli.config.clone()),
+                    Some(store),
                     native_sources,
                     honk_config::paths::data_dir().to_path_buf(),
                     control_plane.config_handle(),
@@ -2290,11 +2649,136 @@ mod local_time_tests {
 #[cfg(test)]
 mod startup_lifecycle_tests {
     use super::{
-        ClashCommand, Cli, load_operator_config, open_log_file, prepare_nfqueue_startup,
-        prepare_runtime_data_dir, prepare_runtime_data_dir_with_fallback, publish_instance_pid,
-        running_instance_pid,
+        ClashCommand, Cli, RotatingLogFile, load_operator_config, open_log_file,
+        prepare_nfqueue_startup, prepare_runtime_data_dir, prepare_runtime_data_dir_with_fallback,
+        publish_instance_pid, running_instance_pid,
     };
     use clap::Parser;
+
+    #[test]
+    fn a_reset_that_cannot_run_leaves_honk_running_without_persistence() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(crate::state::StateDb::open(directory.path()).unwrap());
+        let held = crate::state::StateDb::open(directory.path()).unwrap();
+        assert!(super::reset_non_strict(directory.path()).is_none());
+        drop(held);
+    }
+
+    #[test]
+    fn a_failed_reopen_bounds_the_log_to_twice_the_limit() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("honk.log");
+        let mut log = RotatingLogFile::open(&path, 100).unwrap();
+        log.fail_reopen = true;
+        for _ in 0..20 {
+            log.write_all(format!("{}\n", "x".repeat(59)).as_bytes())
+                .unwrap();
+        }
+        let rotated = std::fs::metadata(directory.path().join("honk.log.1")).unwrap();
+        assert!(
+            rotated.len() <= 200,
+            "{} bytes after a failed reopen",
+            rotated.len()
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn two_writers_sharing_the_log_rotate_it_once() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("honk.log");
+        let mut first = RotatingLogFile::open(&path, 100).unwrap();
+        let mut second = RotatingLogFile::open(&path, 100).unwrap();
+        let line = |text: &str| format!("{}\n", text.repeat(59));
+        first.write_all(line("a").as_bytes()).unwrap();
+        second.write_all(line("b").as_bytes()).unwrap();
+        first.write_all(line("c").as_bytes()).unwrap();
+        second.write_all(line("d").as_bytes()).unwrap();
+        let rotated = std::fs::read_to_string(directory.path().join("honk.log.1")).unwrap();
+        assert_eq!(rotated, format!("{}\n{}\n", "a".repeat(59), "b".repeat(59)));
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(current, format!("{}\n{}\n", "c".repeat(59), "d".repeat(59)));
+    }
+
+    #[test]
+    fn the_log_file_rotates_into_one_private_copy() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("honk.log");
+        let rotated = directory.path().join("honk.log.1");
+        let mut log = RotatingLogFile::open(&path, 100).unwrap();
+        for line in ["a", "b", "c", "d"] {
+            log.write_all(line.repeat(59).as_bytes()).unwrap();
+            log.write_all(b"\n").unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "d".repeat(59) + "\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&rotated).unwrap(),
+            "c".repeat(59) + "\n"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+        for file in [&path, &rotated] {
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_strict_state_db_that_cannot_be_used_leaves_honk_running() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let cli = Cli::parse_from(["honk-core"]);
+        let mut config = honk_config::Config::default();
+        config.experimental.cache_file.enabled = true;
+
+        let unsafe_dir = tempfile::tempdir().unwrap();
+        let state = unsafe_dir.path().join(crate::state::STATE_DIR);
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (db, reset) = super::open_state_db(&cli, &config, unsafe_dir.path()).unwrap();
+        assert!(db.is_none() && !reset);
+
+        let locked_dir = tempfile::tempdir().unwrap();
+        drop(crate::state::StateDb::open(locked_dir.path()).unwrap());
+        let held = nix::fcntl::Flock::lock(
+            std::fs::File::open(locked_dir.path().join(crate::state::STATE_DIR)).unwrap(),
+            nix::fcntl::FlockArg::LockExclusiveNonblock,
+        )
+        .unwrap();
+        let (db, reset) = super::open_state_db(&cli, &config, locked_dir.path()).unwrap();
+        assert!(db.is_none() && !reset);
+        drop(held);
+
+        // Password mode makes the db strict: the same unsafe directory refuses startup.
+        config.experimental.native_api.password_auth = true;
+        assert!(super::open_state_db(&cli, &config, unsafe_dir.path()).is_err());
+
+        // A newer schema refuses startup either way.
+        config.experimental.native_api.password_auth = false;
+        let newer_dir = tempfile::tempdir().unwrap();
+        drop(crate::state::StateDb::open(newer_dir.path()).unwrap());
+        rusqlite::Connection::open(
+            newer_dir
+                .path()
+                .join(crate::state::STATE_DIR)
+                .join(crate::state::DB_FILE),
+        )
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 2")
+        .unwrap();
+        assert!(super::open_state_db(&cli, &config, newer_dir.path()).is_err());
+    }
 
     #[test]
     fn nfqueue_requested_with_mock_backend_falls_back_to_disabled() {
@@ -2477,5 +2961,137 @@ mod startup_lifecycle_tests {
         let rendered = error.to_string();
         assert!(rendered.contains("node ID duplicates another node"));
         assert!(!rendered.contains("configuration validation failed"));
+    }
+}
+
+#[cfg(test)]
+mod state_claim_tests {
+    use std::path::PathBuf;
+
+    use clap::Parser as _;
+
+    fn legacy_store(
+        root: &std::path::Path,
+        subscriptions: &[&honk_config::subscription::Subscription],
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if !root.exists() {
+            std::fs::create_dir(root).unwrap();
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for sub in subscriptions {
+            let path = root.join(crate::subscription::SubscriptionStore::key(sub));
+            std::fs::write(&path, format!("socks5://127.0.0.1:1080#{}", sub.url)).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    fn subscription(name: &str) -> honk_config::subscription::Subscription {
+        honk_config::subscription::Subscription {
+            url: format!("https://example.invalid/{name}"),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_successor_without_the_instance_lock_leaves_the_state_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let lock_path = directory.path().join("honk-core.lock");
+        let _held = nix::fcntl::Flock::lock(
+            std::fs::File::create(&lock_path).unwrap(),
+            nix::fcntl::FlockArg::LockExclusiveNonblock,
+        )
+        .unwrap();
+        super::TEST_INSTANCE_LOCK.with(|path| *path.borrow_mut() = Some(lock_path.clone()));
+
+        // One data directory without a db, and one whose db and legacy store
+        // belong to the running instance.
+        let empty = directory.path().join("empty");
+        let running = directory.path().join("running");
+        for data_dir in [&empty, &running] {
+            std::fs::create_dir(data_dir).unwrap();
+            std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let sub = subscription("kept");
+        legacy_store(&running.join(".sub"), &[&sub]);
+        drop(crate::state::StateDb::open(&running).unwrap());
+        let snapshot = |data_dir: &std::path::Path| {
+            let mut entries: Vec<_> = walk(data_dir);
+            entries.sort();
+            entries
+        };
+        let before = snapshot(&running);
+
+        for data_dir in [&empty, &running] {
+            let config = directory.path().join(format!(
+                "{}.dae",
+                data_dir.file_name().unwrap().to_string_lossy()
+            ));
+            std::fs::write(
+                &config,
+                format!(
+                    "global {{\n data_dir: '{}'\n store_subscribe: true\n}}\nsubscription {{\n '{}'\n}}\n",
+                    data_dir.display(),
+                    sub.url
+                ),
+            )
+            .unwrap();
+            let cli = super::Cli::parse_from([
+                "honk-core",
+                "--mock-ebpf",
+                "-c",
+                config.to_str().unwrap(),
+            ]);
+            let error = super::run(cli).await.unwrap_err();
+            assert!(error.to_string().contains("refusing to start"), "{error:#}");
+        }
+        assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
+        assert_eq!(snapshot(&running), before);
+        super::TEST_INSTANCE_LOCK.with(|path| *path.borrow_mut() = None);
+    }
+
+    fn walk(root: &std::path::Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            if metadata.is_dir() {
+                entries.extend(walk(&entry.path()));
+            }
+            entries.push((entry.path(), metadata.len(), metadata.modified().unwrap()));
+        }
+        entries
+    }
+
+    #[test]
+    fn a_reset_state_db_backs_the_subscription_store() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_dir = directory.path().join(crate::state::STATE_DIR);
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let file = state_dir.join(crate::state::DB_FILE);
+        std::fs::write(&file, vec![0x5a; 8192]).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let cli = super::Cli::parse_from(["honk-core"]);
+        let mut config = honk_config::Config::default();
+        config.global.store_subscribe = true;
+
+        let (db, reset) = super::open_state_db(&cli, &config, directory.path()).unwrap();
+        assert!(db.is_none() && reset);
+        let claimed = super::claim_state(
+            db,
+            reset,
+            &config,
+            directory.path(),
+            [directory.path().join(".sub")],
+        );
+        assert!(claimed.state_db.is_some());
+        assert!(claimed.subscriptions.is_some());
+        assert!(state_dir.join("honk.db.corrupt").exists());
     }
 }

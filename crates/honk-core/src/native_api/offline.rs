@@ -21,7 +21,7 @@ use crate::dns::forwarder::HostsSourceSet;
 use crate::dns::policy::PolicyId;
 use crate::dns::routing::DnsRouter;
 use crate::routing::{GeoRequirements, GeoSourceSet, Router};
-use crate::subscription::{SubscriptionStore, parse_subscription_content_with_diagnostics};
+use crate::subscription::{StoredBodies, parse_subscription_content_with_diagnostics};
 
 /// Upper bound for one standard asset read during offline validation. A
 /// `geoip.dat` is tens of megabytes; this only guards against a runaway file.
@@ -33,6 +33,7 @@ pub(crate) struct ValidatedConfig {
     pub(crate) dependencies: Vec<DependencySnapshot>,
     pub(crate) geo_sources: Option<GeoSourceSet>,
     ech_paths: Vec<String>,
+    dependency_root: Option<PathBuf>,
 }
 
 pub(crate) struct CapturedConfig {
@@ -43,10 +44,13 @@ pub(crate) struct CapturedConfig {
     retain_geo: bool,
     hosts: HostsSourceSet,
     ech_paths: Vec<String>,
+    dependency_root: Option<PathBuf>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn capture_for_coordinator(
     loaded: LoadedConfig,
+    dependency_root: Option<&Path>,
     active: &Config,
     data_dir: &Path,
     limits: SourceLimits,
@@ -56,6 +60,7 @@ pub(crate) fn capture_for_coordinator(
 ) -> Result<CapturedConfig, DetailedConfigError> {
     let result = capture_inner(
         loaded,
+        dependency_root,
         active,
         data_dir,
         limits,
@@ -70,6 +75,7 @@ pub(crate) fn capture_for_coordinator(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_for_coordinator(
     loaded: LoadedConfig,
+    dependency_root: Option<&Path>,
     active: &Config,
     data_dir: &Path,
     limits: SourceLimits,
@@ -80,6 +86,7 @@ pub(crate) fn validate_for_coordinator(
 ) -> Result<ValidatedConfig, DetailedConfigError> {
     let result = capture_inner(
         loaded,
+        dependency_root,
         active,
         data_dir,
         limits,
@@ -100,8 +107,14 @@ pub(crate) fn validate_with_data_dir(
     limits: SourceLimits,
     diagnostics: &mut Vec<DetailedDiagnostic>,
 ) -> Result<ValidatedConfig, DetailedConfigError> {
+    let entry_dir = loaded
+        .sources
+        .first()
+        .and_then(|source| source.path.parent())
+        .map(Path::to_path_buf);
     let result = capture_inner(
         loaded,
+        entry_dir.as_deref(),
         active,
         data_dir,
         limits,
@@ -117,6 +130,7 @@ pub(crate) fn validate_with_data_dir(
 #[allow(clippy::too_many_arguments)]
 fn capture_inner(
     loaded: LoadedConfig,
+    dependency_root: Option<&Path>,
     active: &Config,
     data_dir: &Path,
     limits: SourceLimits,
@@ -138,8 +152,15 @@ fn capture_inner(
         ));
     };
     let source = &entry.source;
-    let mut capture = Capture::new(&sources, active, data_dir, limits, submitted)
-        .map_err(|cause| dependency_error(source, "config", cause))?;
+    let mut capture = Capture::new(
+        &sources,
+        dependency_root,
+        active,
+        data_dir,
+        limits,
+        submitted,
+    )
+    .map_err(|cause| dependency_error(source, "config", cause))?;
     config.append_diagnostics(source.clone(), diagnostics);
     config.validate_detailed().map_err(|mut error| {
         error.diagnostic.source = source.clone();
@@ -156,12 +177,9 @@ fn capture_inner(
     config.ensure_builtin_nodes();
 
     if config.subscriptions.iter().any(|sub| sub.enabled) {
-        // No store yet means no subscription has ever been fetched on this host.
-        let store = match SubscriptionStore::open_readonly(&capture.data_dir) {
-            Ok(store) => Some(store),
-            Err(cause) if cause.kind() == io::ErrorKind::NotFound => None,
-            Err(cause) => return Err(dependency_error(source, "subscription", cause)),
-        };
+        // No state db yet means no subscription has ever been fetched on this host.
+        let store = StoredBodies::open(&capture.data_dir)
+            .map_err(|cause| dependency_error(source, "subscription", cause))?;
         for (index, subscription) in config
             .subscriptions
             .iter()
@@ -173,17 +191,15 @@ fn capture_inner(
             }) {
                 continue;
             }
-            let cached = match store.as_ref().map(|store| store.open_cached(subscription)) {
-                Some(Ok(file)) => Some(file),
-                Some(Err(cause)) if cause.kind() != io::ErrorKind::NotFound => {
-                    return Err(dependency_error(source, "subscription", cause));
-                }
-                _ => None,
+            let cached = match store.as_ref().map(|store| store.find(subscription)) {
+                Some(Ok(cached)) => cached,
+                Some(Err(cause)) => return Err(dependency_error(source, "subscription", cause)),
+                None => None,
             };
             // The runtime starts a never-fetched subscription with no nodes and
             // fills it in after the first fetch; offline admission mirrors that
             // instead of refusing the configuration that would add it.
-            let Some(cached) = cached else {
+            let Some(body) = cached else {
                 diagnostics.push(DetailedDiagnostic::warning(
                     "subscription-not-fetched",
                     source.clone(),
@@ -193,8 +209,11 @@ fn capture_inner(
                 ));
                 continue;
             };
+            let (label, length) = (body.label.clone(), body.length);
             let contents = capture
-                .file(cached, true, false, DependencyReader::Subscription(index))
+                .stored(label, length, DependencyReader::Subscription(index), || {
+                    body.read()
+                })
                 .map_err(|cause| dependency_error(source, "subscription", cause))?;
             let contents = std::str::from_utf8(&contents).map_err(|_| {
                 error(
@@ -296,6 +315,7 @@ fn capture_inner(
         hosts,
         ech_paths,
         dependencies,
+        dependency_root: dependency_root.map(Path::to_path_buf),
     })
 }
 
@@ -394,6 +414,7 @@ struct Capture {
 impl Capture {
     fn new(
         sources: &[SourceSnapshot],
+        dependency_root: Option<&Path>,
         active: &Config,
         data_dir: &Path,
         limits: SourceLimits,
@@ -420,8 +441,8 @@ impl Capture {
             .ok_or(io::ErrorKind::FileTooLarge)?;
         let data_dir = data_dir.to_path_buf();
         let mut roots = Vec::new();
-        if let Some(parent) = sources.first().and_then(|source| source.path.parent()) {
-            roots.push(fs::canonicalize(parent)?);
+        if let Some(root) = dependency_root {
+            roots.push(fs::canonicalize(root)?);
         }
         if let Ok(path) = fs::canonicalize(&data_dir) {
             roots.push(path);
@@ -503,6 +524,44 @@ impl Capture {
         if !trusted && !self.authorized(&path) {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
+        self.admit(path, asset, reader, |remaining| {
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            if metadata.len() > remaining as u64 {
+                return Err(io::ErrorKind::FileTooLarge.into());
+            }
+            let mut bytes = Vec::new();
+            file.take(remaining as u64 + 1).read_to_end(&mut bytes)?;
+            Ok(bytes.into())
+        })
+    }
+
+    /// A trusted source body of `length` bytes in the state db, named by
+    /// `label`; it takes the same budget as a file, checked before `read`.
+    pub(crate) fn stored(
+        &mut self,
+        label: PathBuf,
+        length: usize,
+        reader: DependencyReader,
+        read: impl FnOnce() -> io::Result<Arc<[u8]>>,
+    ) -> io::Result<Arc<[u8]>> {
+        self.admit(label, false, reader, |remaining| {
+            if length > remaining {
+                return Err(io::ErrorKind::FileTooLarge.into());
+            }
+            read()
+        })
+    }
+
+    fn admit(
+        &mut self,
+        path: PathBuf,
+        asset: bool,
+        reader: DependencyReader,
+        load: impl FnOnce(usize) -> io::Result<Arc<[u8]>>,
+    ) -> io::Result<Arc<[u8]>> {
         if !asset && self.source_count >= self.limits.max_sources {
             return Err(io::ErrorKind::QuotaExceeded.into());
         }
@@ -524,10 +583,6 @@ impl Capture {
             snapshot.readers.push(reader);
             return Ok(Arc::clone(bytes));
         }
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
         // Standard assets have their own bound: the engine loads them whole at
         // startup regardless of what an administrator submits.
         let remaining = if asset {
@@ -535,11 +590,7 @@ impl Capture {
         } else {
             self.limits.max_bytes - self.bytes
         };
-        if metadata.len() > remaining as u64 {
-            return Err(io::ErrorKind::FileTooLarge.into());
-        }
-        let mut bytes = Vec::new();
-        file.take(remaining as u64 + 1).read_to_end(&mut bytes)?;
+        let bytes = load(remaining)?;
         if bytes.len() > remaining {
             return Err(io::ErrorKind::FileTooLarge.into());
         }
@@ -554,7 +605,6 @@ impl Capture {
             self.bytes += bytes.len();
             self.source_count += 1;
         }
-        let bytes: Arc<[u8]> = bytes.into();
         self.files.push((snapshot, Arc::clone(&bytes)));
         Ok(bytes)
     }

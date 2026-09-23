@@ -82,7 +82,23 @@ pub fn load_dae_sources(
     limits: SourceLimits,
     diagnostics: &mut Vec<DetailedDiagnostic>,
 ) -> Result<LoadedConfig, DetailedConfigError> {
-    let result = load_attempt(path, overlay, limits, None, diagnostics, &mut false);
+    let result = load_attempt(path, overlay, limits, None, true, diagnostics, &mut false);
+    finish_attempt(result, diagnostics)
+}
+
+/// Load the dae tree rooted at `path` from `sources` alone, as the file loader
+/// would with every source in its overlay, but without touching the disk.
+///
+/// Keys are absolute, lexically normal labels inside the entry directory; they
+/// are never opened. Includes expand only against keys, and a missing key is
+/// `missing-config-source` rather than a disk read.
+pub fn load_dae_sources_in_memory(
+    path: &Path,
+    sources: &HashMap<PathBuf, Arc<str>>,
+    limits: SourceLimits,
+    diagnostics: &mut Vec<DetailedDiagnostic>,
+) -> Result<LoadedConfig, DetailedConfigError> {
+    let result = load_attempt(path, sources, limits, None, false, diagnostics, &mut false);
     finish_attempt(result, diagnostics)
 }
 
@@ -91,17 +107,25 @@ pub(super) fn load_attempt(
     overlay: &HashMap<PathBuf, Arc<str>>,
     limits: SourceLimits,
     entry_input: Option<Arc<str>>,
+    disk: bool,
     diagnostics: &mut Vec<DetailedDiagnostic>,
     semantic: &mut bool,
 ) -> Result<LoadedConfig, DetailedConfigError> {
     let source = DiagnosticSources::new(Some(path.to_path_buf())).root();
     let mut sink = ParserDiagnostics::new(diagnostics, source);
-    let result =
-        super::parse_dae_file_inner(path, overlay, limits, entry_input, &mut sink, semantic)
-            .map_err(|error| match error {
-                ParseFailure::Detailed(error) => error,
-                ParseFailure::Legacy(error) => sink.error(error),
-            });
+    let result = super::parse_dae_file_inner(
+        path,
+        overlay,
+        limits,
+        entry_input,
+        disk,
+        &mut sink,
+        semantic,
+    )
+    .map_err(|error| match error {
+        ParseFailure::Detailed(error) => error,
+        ParseFailure::Legacy(error) => sink.error(error),
+    });
     sink.finish();
     result
 }
@@ -324,6 +348,31 @@ pub(super) fn canonical_overlay_path(path: &Path) -> std::io::Result<PathBuf> {
         resolved.push(part);
     }
     Ok(resolved)
+}
+
+pub(super) fn lexical_source_path(path: &Path) -> std::io::Result<PathBuf> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+    {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    Ok(path.components().collect())
+}
+
+pub(super) fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            part => normalized.push(part),
+        }
+    }
+    normalized
 }
 
 pub(super) fn contains_api_secret(document: &Document<'_>) -> bool {

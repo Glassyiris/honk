@@ -17,7 +17,7 @@
 //! `external_ui_download_url` configures it, while `HONK_UI_DOWNLOAD_URL`
 //! remains the highest-precedence override.
 
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,6 +52,17 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// The dashboard zip is a few MB; anything beyond this ceiling is a broken
 /// or hostile endpoint, not a dashboard.
 const MAX_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
+/// Extraction bounds: a small archive must not unpack into an unbounded tree.
+const EXTRACT_LIMITS: ExtractLimits = ExtractLimits {
+    bytes: 128 * 1024 * 1024,
+    entries: 10_000,
+};
+
+#[derive(Debug, Clone, Copy)]
+struct ExtractLimits {
+    bytes: u64,
+    entries: usize,
+}
 
 /// Redirects followed per proxied fetch (each hop is re-routed: the
 /// Location target is usually a different host).
@@ -340,15 +351,20 @@ async fn download_external_ui_with_stop(
     stop: &mut Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<bool> {
     info!("downloading external ui from {}", url);
-    let Some(bytes) = fetch_routed(ctx, url, stop).await? else {
+    let mut archive = ArchiveFile::create(Path::new(&ctx.external_ui))?;
+    if !fetch_routed(ctx, url, &mut archive, stop).await? {
         return Ok(false);
-    };
+    }
     if stop.as_ref().is_some_and(|stop| *stop.borrow()) {
         return Ok(false);
     }
+    let file = archive.finish().await?;
     let dir = ctx.external_ui.clone();
     // Once accepted, blocking filesystem work must finish even if stop arrives.
-    let result = tokio::task::spawn_blocking(move || extract_ui_zip(&bytes, Path::new(&dir))).await;
+    let result = tokio::task::spawn_blocking(move || {
+        extract_ui_zip(std::io::BufReader::new(file), Path::new(&dir))
+    })
+    .await;
     match result {
         Ok(Ok(())) => Ok(true),
         Ok(Err(e)) => {
@@ -365,33 +381,36 @@ async fn download_external_ui_with_stop(
     }
 }
 
-/// Fetch `url` following the traffic routing decision; proxied redirects
-/// re-enter the router because the Location host usually differs.
+/// Fetch `url` into `archive` following the traffic routing decision; proxied
+/// redirects re-enter the router because the Location host usually differs.
+/// `Ok(false)` when stopped.
 async fn fetch_routed(
     ctx: &UiDownloadContext,
     url: &str,
+    archive: &mut ArchiveFile,
     stop: &mut Option<watch::Receiver<bool>>,
-) -> anyhow::Result<Option<Vec<u8>>> {
+) -> anyhow::Result<bool> {
     let mut url = url.to_string();
     for _ in 0..=MAX_REDIRECTS {
         let (host, port, path, is_https) = parse_download_url(&url)?;
         let route = tokio::select! {
             biased;
-            _ = download_stopped(stop) => return Ok(None),
+            _ = download_stopped(stop) => return Ok(false),
             route = decide_route(ctx, &host, port) => route?,
         };
         let response = match route {
-            UiRoute::Direct { feedback } => fetch_direct(&url, feedback, stop).await?,
+            UiRoute::Direct { feedback } => fetch_direct(&url, feedback, archive, stop).await?,
             UiRoute::Block => {
                 anyhow::bail!("routing sends the external UI download to 'block'");
             }
             UiRoute::Proxy { node, feedback } => {
-                fetch_proxied(ctx, &node, feedback, (&host, port, &path, is_https), stop).await?
+                let target = (host.as_str(), port, path.as_str(), is_https);
+                fetch_proxied(ctx, &node, feedback, target, archive, stop).await?
             }
         };
         match response {
-            ProxiedFetch::Body(bytes) => return Ok(Some(bytes)),
-            ProxiedFetch::Stopped => return Ok(None),
+            ProxiedFetch::Body => return Ok(true),
+            ProxiedFetch::Stopped => return Ok(false),
             ProxiedFetch::Redirect(location) => {
                 url = reqwest::Url::parse(&url)?.join(&location)?.to_string();
                 info!(url = %url, "external UI download following redirect");
@@ -407,6 +426,7 @@ async fn fetch_routed(
 async fn fetch_direct(
     url: &str,
     feedback: Option<ScoreFeedback>,
+    archive: &mut ArchiveFile,
     stop: &mut Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<ProxiedFetch> {
     let reporter = feedback.as_ref().map(ScoreFeedback::start);
@@ -439,17 +459,13 @@ async fn fetch_direct(
         if !response.status().is_success() {
             anyhow::bail!("download external ui failed: {}", response.status());
         }
-        let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await? {
-            if bytes.len() + chunk.len() > MAX_ARCHIVE_BYTES {
-                anyhow::bail!("external UI archive exceeds {} bytes", MAX_ARCHIVE_BYTES);
-            }
             if let Some(reporter) = &reporter {
                 reporter.rx(chunk.len() as u64);
             }
-            bytes.extend_from_slice(&chunk);
+            archive.append(&chunk).await?;
         }
-        Ok(ProxiedFetch::Body(bytes))
+        Ok(ProxiedFetch::Body)
         } => result,
     };
     if let Some(reporter) = &reporter {
@@ -463,7 +479,8 @@ async fn fetch_direct(
 }
 
 enum ProxiedFetch {
-    Body(Vec<u8>),
+    /// The body is in the archive file.
+    Body,
     Redirect(String),
     Stopped,
 }
@@ -476,6 +493,7 @@ async fn fetch_proxied(
     node: &Node,
     feedback: Option<ScoreFeedback>,
     (host, port, path, is_https): (&str, u16, &str, bool),
+    archive: &mut ArchiveFile,
     stop: &mut Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<ProxiedFetch> {
     let protocol = node.protocol();
@@ -515,7 +533,7 @@ async fn fetch_proxied(
     {
         Ok(proxy) => match tokio::time::timeout(
             DOWNLOAD_TIMEOUT,
-            proxied_get(proxy.stream, host, path, is_https, &reporter),
+            proxied_get(proxy.stream, (host, path, is_https), archive, &reporter),
         )
         .await
         {
@@ -544,9 +562,8 @@ async fn fetch_proxied(
 /// TLS-wrap when https, then run the HTTP/1.1 GET.
 async fn proxied_get(
     stream: Box<dyn AsyncReadWrite>,
-    host: &str,
-    path: &str,
-    is_https: bool,
+    (host, path, is_https): (&str, &str, bool),
+    archive: &mut ArchiveFile,
     reporter: &Option<ScoreReporter>,
 ) -> anyhow::Result<ProxiedFetch> {
     if is_https {
@@ -555,13 +572,13 @@ async fn proxied_get(
         if let Some(reporter) = reporter {
             reporter.setup_succeeded();
         }
-        http_get(&mut tls, host, path, reporter).await
+        http_get(&mut tls, host, path, archive, reporter).await
     } else {
         let mut stream = stream;
         if let Some(reporter) = reporter {
             reporter.setup_succeeded();
         }
-        http_get(&mut stream, host, path, reporter).await
+        http_get(&mut stream, host, path, archive, reporter).await
     }
 }
 
@@ -572,6 +589,7 @@ async fn http_get<S>(
     stream: &mut S,
     host: &str,
     path: &str,
+    archive: &mut ArchiveFile,
     reporter: &Option<ScoreReporter>,
 ) -> anyhow::Result<ProxiedFetch>
 where
@@ -637,40 +655,122 @@ where
         anyhow::bail!("download external ui failed: {status}");
     }
 
-    let mut body = buf.split_off(head_end);
+    let mut body = &buf[head_end..];
     match content_length {
         Some(len) => {
             if len > MAX_ARCHIVE_BYTES {
                 anyhow::bail!("external UI archive exceeds {} bytes", MAX_ARCHIVE_BYTES);
             }
-            body.reserve(len.saturating_sub(body.len()));
-            while body.len() < len {
+            body = &body[..body.len().min(len)];
+            archive.append(body).await?;
+            while archive.len < len {
                 let n = stream.read(&mut chunk).await?;
                 if let Some(reporter) = reporter {
                     reporter.rx(n as u64);
                 }
                 if n == 0 {
-                    anyhow::bail!("truncated archive: {} of {} bytes", body.len(), len);
+                    anyhow::bail!("truncated archive: {} of {} bytes", archive.len, len);
                 }
-                body.extend_from_slice(&chunk[..n]);
+                archive.append(&chunk[..n.min(len - archive.len)]).await?;
             }
-            body.truncate(len);
         }
-        None => loop {
-            let n = stream.read(&mut chunk).await?;
-            if n == 0 {
-                break;
+        None => {
+            archive.append(body).await?;
+            loop {
+                let n = stream.read(&mut chunk).await?;
+                if n == 0 {
+                    break;
+                }
+                if let Some(reporter) = reporter {
+                    reporter.rx(n as u64);
+                }
+                archive.append(&chunk[..n]).await?;
             }
-            if let Some(reporter) = reporter {
-                reporter.rx(n as u64);
-            }
-            if body.len() + n > MAX_ARCHIVE_BYTES {
-                anyhow::bail!("external UI archive exceeds {} bytes", MAX_ARCHIVE_BYTES);
-            }
-            body.extend_from_slice(&chunk[..n]);
-        },
+        }
     }
-    Ok(ProxiedFetch::Body(body))
+    Ok(ProxiedFetch::Body)
+}
+
+/// The archive being downloaded: an unlinked private file beside the target
+/// directory, so the download is not held in memory, stays on the target's
+/// filesystem and leaves nothing behind on any path.
+struct ArchiveFile {
+    file: tokio::fs::File,
+    len: usize,
+    limit: usize,
+}
+
+impl ArchiveFile {
+    fn create(target: &Path) -> std::io::Result<Self> {
+        let parent = match target.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        Ok(Self {
+            file: tokio::fs::File::from_std(unlinked_file(parent)?),
+            len: 0,
+            limit: MAX_ARCHIVE_BYTES,
+        })
+    }
+
+    async fn append(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        if self.len + bytes.len() > self.limit {
+            anyhow::bail!("external UI archive exceeds {} bytes", self.limit);
+        }
+        self.file.write_all(bytes).await?;
+        self.len += bytes.len();
+        Ok(())
+    }
+
+    /// The written file, positioned at its start.
+    async fn finish(mut self) -> std::io::Result<std::fs::File> {
+        self.file.flush().await?;
+        let mut file = self.file.into_std().await;
+        file.rewind()?;
+        Ok(file)
+    }
+}
+
+/// A 0600 file in `directory` with no name: `O_TMPFILE`, or where the
+/// filesystem lacks it, a new name unlinked as soon as it is open.
+fn unlinked_file(directory: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).mode(0o600);
+    match options
+        .clone()
+        .custom_flags(libc::O_TMPFILE | libc::O_CLOEXEC)
+        .open(directory)
+    {
+        Ok(file) => return Ok(file),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EISDIR)) => {}
+        Err(error) => return Err(error),
+    }
+    named_then_unlinked(directory, options)
+}
+
+fn named_then_unlinked(
+    directory: &Path,
+    mut options: std::fs::OpenOptions,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    options
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    for attempt in 0..16 {
+        let path = directory.join(format!(".honk-ui-{}-{attempt}.zip", std::process::id()));
+        match options.open(&path) {
+            Ok(file) => {
+                std::fs::remove_file(&path)?;
+                return Ok(file);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::ErrorKind::AlreadyExists.into())
 }
 
 fn parse_host_ip(host: &str) -> Option<std::net::IpAddr> {
@@ -709,9 +809,26 @@ fn parse_download_url(url: &str) -> anyhow::Result<(String, u16, String, bool)> 
 
 /// Extract a zip archive into `output`, stripping the single top-level
 /// directory when every entry shares one (GitHub archives always do).
-/// Entries with path-traversal components are skipped.
-pub fn extract_ui_zip(bytes: &[u8], output: &Path) -> anyhow::Result<()> {
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
+/// Entries with path-traversal components are skipped. An archive with more
+/// than 10,000 entries or 128 MiB of content is refused; the caller removes
+/// what was written.
+pub fn extract_ui_zip(archive: impl Read + Seek, output: &Path) -> anyhow::Result<()> {
+    extract_ui_zip_bounded(archive, output, EXTRACT_LIMITS)
+}
+
+fn extract_ui_zip_bounded(
+    archive: impl Read + Seek,
+    output: &Path,
+    limits: ExtractLimits,
+) -> anyhow::Result<()> {
+    let mut archive = zip::ZipArchive::new(archive)?;
+    if archive.len() > limits.entries {
+        anyhow::bail!(
+            "external UI archive has more than {} entries",
+            limits.entries
+        );
+    }
+    let mut remaining = limits.bytes;
     let names: Vec<String> = archive.file_names().map(str::to_string).collect();
     let trim_top = single_top_directory(&names);
 
@@ -743,7 +860,14 @@ pub fn extract_ui_zip(bytes: &[u8], output: &Path) -> anyhow::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         let mut out_file = std::fs::File::create(&save_path)?;
-        std::io::copy(&mut file as &mut dyn Read, &mut out_file)?;
+        // Counted as written: the declared size of an entry is not trusted.
+        let written = std::io::copy(
+            &mut (&mut file as &mut dyn Read).take(remaining + 1),
+            &mut out_file,
+        )?;
+        remaining = remaining.checked_sub(written).ok_or_else(|| {
+            anyhow::anyhow!("external UI archive expands past {} bytes", limits.bytes)
+        })?;
     }
     Ok(())
 }
@@ -837,7 +961,7 @@ mod tests {
             ("dist/assets/app.js", b"console.log(1)".as_slice()),
         ]);
         let dir = tempfile::tempdir().unwrap();
-        extract_ui_zip(&zip_bytes, dir.path()).unwrap();
+        extract_ui_zip(std::io::Cursor::new(&zip_bytes), dir.path()).unwrap();
 
         assert_eq!(
             std::fs::read(dir.path().join("index.html")).unwrap(),
@@ -852,13 +976,47 @@ mod tests {
     }
 
     #[test]
+    fn extract_refuses_an_archive_that_expands_past_its_bounds() {
+        let limits = ExtractLimits {
+            bytes: 1024 * 1024,
+            entries: 4,
+        };
+        let bomb = make_zip(&[("dist/zeros.bin", vec![0; 2 * 1024 * 1024].as_slice())]);
+        assert!(bomb.len() < 64 * 1024, "the fixture compresses well");
+        let dir = tempfile::tempdir().unwrap();
+        let error =
+            extract_ui_zip_bounded(std::io::Cursor::new(&bomb), dir.path(), limits).unwrap_err();
+        assert!(error.to_string().contains("expands past"), "{error}");
+
+        let many: Vec<(String, Vec<u8>)> = (0..5)
+            .map(|index| (format!("dist/{index}.js"), vec![1]))
+            .collect();
+        let entries: Vec<(&str, &[u8])> = many
+            .iter()
+            .map(|(name, body)| (name.as_str(), body.as_slice()))
+            .collect();
+        let error =
+            extract_ui_zip_bounded(std::io::Cursor::new(make_zip(&entries)), dir.path(), limits)
+                .unwrap_err();
+        assert!(error.to_string().contains("entries"), "{error}");
+        assert!(
+            extract_ui_zip_bounded(
+                std::io::Cursor::new(make_zip(&entries[..4])),
+                dir.path(),
+                limits
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn extract_keeps_layout_without_single_top_directory() {
         let zip_bytes = make_zip(&[
             ("index.html", b"root".as_slice()),
             ("sub/page.js", b"sub".as_slice()),
         ]);
         let dir = tempfile::tempdir().unwrap();
-        extract_ui_zip(&zip_bytes, dir.path()).unwrap();
+        extract_ui_zip(std::io::Cursor::new(&zip_bytes), dir.path()).unwrap();
         assert_eq!(
             std::fs::read(dir.path().join("index.html")).unwrap(),
             b"root"
@@ -876,10 +1034,21 @@ mod tests {
             ("top/ok.txt", b"ok".as_slice()),
         ]);
         let dir = tempfile::tempdir().unwrap();
-        extract_ui_zip(&zip_bytes, dir.path()).unwrap();
+        extract_ui_zip(std::io::Cursor::new(&zip_bytes), dir.path()).unwrap();
         assert!(!dir.path().join("evil.txt").exists());
         assert!(!dir.path().join("../evil.txt").exists());
         assert_eq!(std::fs::read(dir.path().join("ok.txt")).unwrap(), b"ok");
+    }
+
+    async fn archive_bytes(archive: ArchiveFile) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        archive
+            .finish()
+            .await
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        bytes
     }
 
     /// Raw TCP HTTP server serving `body` once per connection.
@@ -1152,14 +1321,52 @@ mod tests {
         let garbage = zip_bytes[..zip_bytes.len() / 2].to_vec();
         let addr = spawn_zip_server(garbage).await;
         let dir = tempfile::tempdir().unwrap();
-        let result = download_external_ui(
-            &test_ctx(dir.path(), &[]),
-            &format!("http://{}/bad.zip", addr),
-        )
-        .await;
+        let ui = dir.path().join("ui");
+        std::fs::create_dir(&ui).unwrap();
+        let result =
+            download_external_ui(&test_ctx(&ui, &[]), &format!("http://{}/bad.zip", addr)).await;
         assert!(result.is_err());
-        // Partial contents are removed so the next start retries.
-        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+        // Partial contents are removed so the next start retries, and the
+        // archive left no file beside the directory.
+        assert!(std::fs::read_dir(&ui).unwrap().next().is_none());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_archive_is_an_unlinked_private_file_bounded_while_it_streams() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let addr = spawn_zip_server(vec![7; 64]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ui = dir.path().join("ui");
+        let fetch = |limit| {
+            let url = format!("http://{addr}/ui.zip");
+            let mut archive = ArchiveFile::create(&ui).unwrap();
+            archive.limit = limit;
+            async move {
+                let direct = fetch_direct(&url, None, &mut archive, &mut None).await;
+                (direct, archive)
+            }
+        };
+
+        let (refused, _) = fetch(63).await;
+        let error = refused.err().expect("a body past the limit is refused");
+        assert!(error.to_string().contains("exceeds 63 bytes"), "{error:#}");
+        let (fetched, archive) = fetch(64).await;
+        assert!(matches!(fetched.unwrap(), ProxiedFetch::Body));
+        let metadata = archive.file.metadata().await.unwrap();
+        assert_eq!((metadata.nlink(), metadata.mode() & 0o777), (0, 0o600));
+        assert_eq!(metadata.dev(), std::fs::metadata(dir.path()).unwrap().dev());
+        assert_eq!(archive_bytes(archive).await, vec![7; 64]);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        // Without O_TMPFILE the file is named only until it is open.
+        let mut options = std::fs::OpenOptions::new();
+        std::os::unix::fs::OpenOptionsExt::mode(options.read(true).write(true), 0o600);
+        let file = named_then_unlinked(dir.path(), options).unwrap();
+        let metadata = file.metadata().unwrap();
+        assert_eq!((metadata.nlink(), metadata.mode() & 0o777), (0, 0o600));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
@@ -1213,6 +1420,7 @@ mod tests {
         let error = fetch_routed(
             &test_ctx(dir.path(), &rules),
             &format!("http://{addr}/redirect"),
+            &mut ArchiveFile::create(&dir.path().join("ui")).unwrap(),
             &mut None,
         )
         .await
@@ -1364,16 +1572,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["ui-parent", "ui-child"]
         );
+        let mut archive = ArchiveFile::create(&dir.path().join("ui")).unwrap();
         let fetched = fetch_proxied(
             &ctx,
             &node,
             Some(feedback),
             ("127.0.0.1", addr.port(), "/ui.zip", false),
+            &mut archive,
             &mut None,
         )
         .await
         .unwrap();
-        assert!(matches!(fetched, ProxiedFetch::Body(bytes) if bytes == body));
+        assert!(matches!(fetched, ProxiedFetch::Body));
+        assert_eq!(archive_bytes(archive).await, body);
 
         let UiRoute::Proxy { node, feedback } =
             decide_route(&ctx, "127.0.0.1", addr.port()).await.unwrap()
@@ -1449,10 +1660,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["ui-direct"]
         );
-        let fetched = fetch_direct(&format!("http://{addr}/ui.zip"), feedback, &mut None)
-            .await
-            .unwrap();
-        assert!(matches!(fetched, ProxiedFetch::Body(bytes) if bytes == body));
+        let mut archive = ArchiveFile::create(&dir.path().join("ui")).unwrap();
+        let fetched = fetch_direct(
+            &format!("http://{addr}/ui.zip"),
+            feedback,
+            &mut archive,
+            &mut None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(fetched, ProxiedFetch::Body));
+        assert_eq!(archive_bytes(archive).await, body);
         let UiRoute::Direct { feedback } =
             decide_route(&ctx, "127.0.0.1", addr.port()).await.unwrap()
         else {

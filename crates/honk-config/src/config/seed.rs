@@ -104,6 +104,13 @@ impl<'de> Visitor<'de> for RawConfigSeed<'_> {
                                 self.source.clone(),
                             ));
                     }
+                    for key in config.experimental.cache_file.legacy_keys() {
+                        self.diagnostics
+                            .push(crate::diagnostic::legacy_cache_file_warning(
+                                self.source.clone(),
+                                key,
+                            ));
+                    }
                     if let Some(diagnostic) = config
                         .experimental
                         .clash_api
@@ -136,6 +143,13 @@ impl<'de> Visitor<'de> for RawConfigSeed<'_> {
             self.diagnostics
                 .push(crate::diagnostic::legacy_nfqueue_warning(
                     self.source.clone(),
+                ));
+        }
+        for key in experimental.cache_file.legacy_keys() {
+            self.diagnostics
+                .push(crate::diagnostic::legacy_cache_file_warning(
+                    self.source.clone(),
+                    key,
                 ));
         }
         if let Some(diagnostic) = experimental

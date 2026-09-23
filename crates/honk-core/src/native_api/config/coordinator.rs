@@ -1,11 +1,13 @@
 mod completion;
 mod geodata;
+mod revisions;
 mod validation;
 
 use super::super::management::{self, Completion, Mutation};
 use super::super::{
-    config_write::{SourceFile, WriteError},
+    config_write::WriteError,
     offline,
+    store::{Committed, SourceStore, StoreKind},
 };
 use super::*;
 use crate::configuration::{Activation, ActivationFailure, ActivationRequest};
@@ -23,7 +25,7 @@ pub(crate) struct ConfigCoordinator {
 
 struct Worker {
     service: Arc<ConfigService>,
-    entry: Option<PathBuf>,
+    store: Option<Arc<dyn SourceStore>>,
     data_dir: PathBuf,
     source_managed: bool,
     active: Arc<tokio::sync::RwLock<Arc<Config>>>,
@@ -37,7 +39,7 @@ impl ConfigService {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn start(
         self: &Arc<Self>,
-        entry: Option<PathBuf>,
+        store: Option<Arc<dyn SourceStore>>,
         initial: Option<SourceUpdate>,
         data_dir: PathBuf,
         active: Arc<tokio::sync::RwLock<Arc<Config>>>,
@@ -45,10 +47,6 @@ impl ConfigService {
         commands: mpsc::Sender<ControlCommand>,
         subscriptions: SubscriptionSupervisorHandle,
     ) -> ConfigCoordinator {
-        let entry = initial
-            .as_ref()
-            .and_then(|initial| initial.sources.first().map(|source| source.path.clone()))
-            .or(entry);
         if let Some(initial) = &initial {
             let config = active.read().await;
             let generation = diagnostics.read().generation;
@@ -57,6 +55,7 @@ impl ConfigService {
             self.sources
                 .generation_committed(&super::super::catalog::revision_for(&config), generation);
         }
+        *self.store.write() = store.clone();
         let (sender, mut receiver) = mpsc::channel(16);
         *self.sender.lock() = Some(sender);
         let (stop, mut stopping) = watch::channel(false);
@@ -64,7 +63,7 @@ impl ConfigService {
         let task = tokio::spawn(async move {
             let mut worker = Worker {
                 service,
-                entry,
+                store,
                 data_dir,
                 source_managed: initial.is_some(),
                 active,
@@ -121,6 +120,8 @@ impl Worker {
                 | Work::GeoUpdate { reservation, .. }
                 | Work::GroupPatch { reservation, .. }
                 | Work::Reload { reservation }
+                | Work::Import { reservation }
+                | Work::ActivateRevision { reservation, .. }
                 | Work::Lifecycle { reservation, .. } => {
                     self.service.operations.reject(&reservation.id, error);
                 }
@@ -202,8 +203,11 @@ impl Worker {
                 let id = reservation.id.clone();
                 let group_id = patch.id.clone();
                 let revision = patch.revision.clone();
-                match self.prepare_group_patch(*patch).await {
-                    Ok(Some((candidate, sources, diagnostics))) => {
+                match self
+                    .prepare_group_patch(*patch, &reservation.principal)
+                    .await
+                {
+                    Ok(Some((candidate, sources, diagnostics, committed))) => {
                         self.replace_operation(
                             &id,
                             ActivationRequest {
@@ -214,6 +218,7 @@ impl Worker {
                                 deferred_provider: None,
                             },
                             Some(&group_id),
+                            committed,
                         )
                         .await;
                     }
@@ -246,10 +251,17 @@ impl Worker {
             } => {
                 let id = reservation.id.clone();
                 match self
-                    .prepare_replace(&source_id, content, if_match, None, None)
+                    .prepare_replace(
+                        &source_id,
+                        content,
+                        if_match,
+                        None,
+                        None,
+                        &reservation.principal,
+                    )
                     .await
                 {
-                    Ok((candidate, sources, diagnostics)) => {
+                    Ok((candidate, sources, diagnostics, committed)) => {
                         self.replace_operation(
                             &id,
                             ActivationRequest {
@@ -260,12 +272,57 @@ impl Worker {
                                 deferred_provider: None,
                             },
                             None,
+                            committed,
                         )
                         .await;
                     }
                     Err(error) => {
                         self.service.operations.reject(&id, error);
                     }
+                }
+                drop(reservation);
+            }
+            Work::Import { reservation } => {
+                let id = reservation.id.clone();
+                let prepared = self.prepare_import(&reservation.principal).await;
+                self.tree_operation(&id, prepared).await;
+                drop(reservation);
+            }
+            Work::ActivateRevision {
+                number,
+                reservation,
+            } => {
+                let id = reservation.id.clone();
+                let (head, blocked) = self
+                    .store
+                    .as_ref()
+                    .and_then(|store| store.database())
+                    .map_or((None, false), |database| {
+                        (
+                            database.cached_head().map(|(head, _)| head),
+                            database.blocked(),
+                        )
+                    });
+                let current = head == Some(number);
+                if current && !blocked {
+                    self.service.operations.accept(&id);
+                    self.service.operations.running(&id);
+                    let generation = self.diagnostics.read().generation;
+                    self.service.operations.succeed(
+                        &id,
+                        super::super::operations::OperationResult::Reload {
+                            active_generation_id: Some(format!(
+                                "{}:{generation}",
+                                self.service.instance_id
+                            )),
+                            datapath_generation_id: None,
+                        },
+                    );
+                } else {
+                    let prepared = self
+                        .prepare_revision(number, &reservation.principal, current)
+                        .await;
+                    self.tree_operation(&id, prepared).await;
                 }
                 drop(reservation);
             }
@@ -413,7 +470,7 @@ impl Worker {
             }
         };
         drop(active);
-        let (candidate, sources, diagnostics) = self
+        let (candidate, sources, diagnostics, committed) = self
             .prepare_replace(
                 &accepted.ids[&main.path],
                 content,
@@ -423,6 +480,7 @@ impl Worker {
                     Mutation::CreateProvider(input) => Some(input.name.clone()),
                     _ => None,
                 },
+                self.service.principal(),
             )
             .await?;
         let created = match &mutation {
@@ -441,7 +499,8 @@ impl Worker {
         let deferred = created
             .filter(|(collection, _)| *collection == "providers")
             .map(|(_, id)| id);
-        self.activation
+        let completion = self
+            .activation
             .activate(ActivationRequest {
                 candidate,
                 sources: Some(sources),
@@ -449,8 +508,10 @@ impl Worker {
                 expected_revision: Some(accepted.revision),
                 deferred_provider: deferred,
             })
-            .await
-            .map_err(ActivationFailure::management_error)?;
+            .await;
+        self.record(committed, &completion)
+            .map_err(|details| unavailable().with_details(details))?;
+        completion.map_err(ActivationFailure::management_error)?;
         if mutation.deleting() {
             return Ok(Completion::Deleted(1));
         }
@@ -485,29 +546,48 @@ impl Worker {
         })
     }
 
+    async fn tree_operation(&mut self, id: &str, prepared: Result<Prepared, ApiError>) {
+        match prepared {
+            Ok((candidate, sources, diagnostics, committed)) => {
+                self.replace_operation(
+                    id,
+                    ActivationRequest {
+                        candidate,
+                        sources: Some(sources),
+                        diagnostics,
+                        expected_revision: None,
+                        deferred_provider: None,
+                    },
+                    None,
+                    committed,
+                )
+                .await;
+            }
+            Err(error) => {
+                self.service.operations.reject(id, error);
+            }
+        }
+    }
+
     async fn load(
         &self,
     ) -> Result<(Config, Option<SourceUpdate>, Vec<DetailedDiagnostic>), ApiError> {
-        let entry = self.entry.clone().ok_or_else(unsupported)?;
+        let store = self.store.clone().ok_or_else(unsupported)?;
         let source_managed = self.source_managed;
         tokio::task::spawn_blocking(move || {
             let mut diagnostics = Vec::new();
             if !source_managed {
                 let mut config = crate::load_operator_config(
-                    entry.to_str().ok_or_else(invalid)?,
+                    store.entry().to_str().ok_or_else(invalid)?,
                     &mut diagnostics,
                 )
                 .map_err(|error| config_error(error, &diagnostics, &[], None, None))?;
                 config.ensure_builtin_nodes();
                 return Ok((config, None, diagnostics));
             }
-            let loaded = Config::from_dae_file_with_sources(
-                &entry,
-                &HashMap::new(),
-                limits(),
-                &mut diagnostics,
-            )
-            .map_err(|error| config_error(error, &diagnostics, &[], None, None))?;
+            let loaded = store
+                .load(&HashMap::new(), &mut diagnostics)
+                .map_err(|error| config_error(error, &diagnostics, &[], None, None))?;
             let mut config = crate::admit_operator_config(
                 loaded.config,
                 loaded.sources[0].source.clone(),
@@ -532,7 +612,8 @@ impl Worker {
     async fn prepare_group_patch(
         &self,
         patch: super::super::groups::GroupPatch,
-    ) -> Result<Option<(Config, SourceUpdate, Vec<DetailedDiagnostic>)>, ApiError> {
+        principal: &str,
+    ) -> Result<Option<Prepared>, ApiError> {
         let expected = patch.expected.as_ref().map_err(Clone::clone)?;
         let accepted = self
             .service
@@ -564,17 +645,13 @@ impl Worker {
         )
         .map_err(|_| invalid())?;
         if content == accepted.update.sources[index].content.as_ref() {
-            let entry = self.entry.clone().ok_or_else(unsupported)?;
+            let store = self.store.clone().ok_or_else(unsupported)?;
             let service = Arc::clone(&self.service);
             tokio::task::spawn_blocking(move || {
                 let mut diagnostics = Vec::new();
-                let baseline = Config::from_dae_file_with_sources(
-                    &entry,
-                    &HashMap::new(),
-                    limits(),
-                    &mut diagnostics,
-                )
-                .map_err(|_| stale())?;
+                let baseline = store
+                    .load(&HashMap::new(), &mut diagnostics)
+                    .map_err(|_| stale())?;
                 if service.sources.revision().as_ref() != Some(&patch.revision)
                     || !same_source_documents(&accepted.update.sources, &baseline.sources)
                 {
@@ -592,11 +669,13 @@ impl Worker {
             Ok(accepted.hashes[index].clone()),
             Some(patch.revision),
             None,
+            principal,
         )
         .await
         .map(Some)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn prepare_replace(
         &self,
         source_id: &str,
@@ -604,7 +683,8 @@ impl Worker {
         expected: Result<String, ApiError>,
         group_revision: Option<String>,
         new_provider: Option<String>,
-    ) -> Result<(Config, SourceUpdate, Vec<DetailedDiagnostic>), ApiError> {
+        principal: &str,
+    ) -> Result<Prepared, ApiError> {
         let expected = expected?;
         if content.len() > MAX_SOURCE_BYTES {
             return Err(too_large());
@@ -626,7 +706,7 @@ impl Worker {
             return Err(denied());
         }
         let target = accepted.update.sources[index].path.clone();
-        let entry = self.entry.clone().ok_or_else(unsupported)?;
+        let store = self.store.clone().ok_or_else(unsupported)?;
         let active = self.active.read().await.clone();
         let data_dir = self.data_dir.clone();
         let mut deferred = self
@@ -635,12 +715,16 @@ impl Worker {
             .await
             .map_err(|_| unavailable())?;
         let source_id = source_id.to_owned();
+        let principal = principal.to_owned();
         #[cfg(test)]
         let before_replace = self.service.before_replace.lock().take();
         let service = Arc::clone(&self.service);
         tokio::task::spawn_blocking(move || {
-            let file = SourceFile::open(&target, MAX_SOURCE_BYTES).map_err(write_error)?;
-            if file.sha256() != expected {
+            let kind = store.kind();
+            let pin = store
+                .pin(&target)
+                .map_err(|error| store_write_error(kind, error))?;
+            if pin.sha256() != expected {
                 return Err(stale());
             }
             if let Some(revision) = &group_revision {
@@ -648,13 +732,9 @@ impl Worker {
                     return Err(stale());
                 }
                 let mut diagnostics = Vec::new();
-                let baseline = Config::from_dae_file_with_sources(
-                    &entry,
-                    &HashMap::new(),
-                    limits(),
-                    &mut diagnostics,
-                )
-                .map_err(|_| stale())?;
+                let baseline = store
+                    .load(&HashMap::new(), &mut diagnostics)
+                    .map_err(|_| stale())?;
                 if !same_source_documents(&accepted.update.sources, &baseline.sources) {
                     return Err(stale());
                 }
@@ -662,17 +742,15 @@ impl Worker {
             let mut overlay = HashMap::new();
             overlay.insert(target.clone(), Arc::<str>::from(content.as_str()));
             let mut diagnostics = Vec::new();
-            let loaded =
-                Config::from_dae_file_with_sources(&entry, &overlay, limits(), &mut diagnostics)
-                    .map_err(|error| {
-                        config_error(
-                            error,
-                            &diagnostics,
-                            &accepted.update.sources,
-                            Some(&source_id),
-                            Some(&accepted.ids),
-                        )
-                    })?;
+            let loaded = store.load(&overlay, &mut diagnostics).map_err(|error| {
+                config_error(
+                    error,
+                    &diagnostics,
+                    &accepted.update.sources,
+                    Some(&source_id),
+                    Some(&accepted.ids),
+                )
+            })?;
             if let Some(name) = &new_provider {
                 let provider = loaded
                     .config
@@ -691,6 +769,7 @@ impl Worker {
             let validate = |loaded, diagnostics: &mut Vec<DetailedDiagnostic>| {
                 offline::validate_for_coordinator(
                     loaded,
+                    store.dependency_root(),
                     &active,
                     &data_dir,
                     limits(),
@@ -723,6 +802,8 @@ impl Worker {
             if validated.config.experimental.native_api != active.experimental.native_api
                 || validated.config.experimental.clash_api.secret
                     != active.experimental.clash_api.secret
+                || (store.kind() == StoreKind::Database
+                    && validated.config.global.data_dir != active.global.data_dir)
             {
                 return Err(denied());
             }
@@ -753,7 +834,7 @@ impl Worker {
             {
                 return Err(denied());
             }
-            file.replace(&expected, &content, || {
+            let recheck = Box::new(|| {
                 #[cfg(test)]
                 if let Some(hook) = before_replace {
                     hook();
@@ -765,13 +846,9 @@ impl Worker {
                 {
                     return Err(WriteError::Conflict);
                 }
-                let reloaded = Config::from_dae_file_with_sources(
-                    &entry,
-                    &overlay,
-                    limits(),
-                    &mut recheck_diagnostics,
-                )
-                .map_err(|_| WriteError::Conflict)?;
+                let reloaded = store
+                    .load(&overlay, &mut recheck_diagnostics)
+                    .map_err(|_| WriteError::Conflict)?;
                 if !same_source_documents(&validated.sources, &reloaded.sources) {
                     return Err(WriteError::Conflict);
                 }
@@ -782,17 +859,30 @@ impl Worker {
                     return Err(WriteError::Conflict);
                 }
                 Ok(())
-            })
-            .map_err(write_error)?;
+            });
+            let committed = store
+                .commit(pin, &content, &validated.sources, &principal, recheck)
+                .map_err(|error| store_write_error(kind, error))?;
             let update = SourceUpdate {
                 sources: validated.sources,
                 dependencies: validated.dependencies,
                 geo_sources: None,
             };
-            Ok((validated.config, update, diagnostics))
+            Ok((validated.config, update, diagnostics, committed))
         })
         .await
         .map_err(|_| unavailable())?
+    }
+}
+
+type Prepared = (Config, SourceUpdate, Vec<DetailedDiagnostic>, Committed);
+
+fn store_write_error(kind: StoreKind, error: WriteError) -> ApiError {
+    match (kind, error) {
+        (StoreKind::Database, WriteError::Unavailable) => {
+            unavailable().with_details(json!({"stage":"store"}))
+        }
+        (_, error) => write_error(error),
     }
 }
 

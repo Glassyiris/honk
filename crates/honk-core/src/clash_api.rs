@@ -84,7 +84,7 @@ pub struct ClashState {
     /// Hot-swappable group manager cell; a config reload swaps the inner
     /// manager and this API sees the new groups on the next request.
     pub group_manager: SharedGroupManager,
-    pub cache_db: Option<Arc<crate::cachedb::CacheDb>>,
+    pub cache_db: Option<Arc<crate::state::cache::CacheDb>>,
     pub connection_tracker: Arc<crate::connection_tracker::ConnectionTracker>,
     pub proxy_registry: Arc<honk_outbound::proxy::ProxyRegistry>,
     /// Hot-swappable runtime generation cell; delay measurements resolve
@@ -362,7 +362,7 @@ async fn put_configs() -> StatusCode {
 }
 
 /// PATCH /configs — update specific fields; `{mode}` switches the clash
-/// mode (Rule/Global/Direct, case-insensitive) and persists it to cache.db.
+/// mode (Rule/Global/Direct, case-insensitive) and persists it to the state db.
 /// The body is parsed regardless of Content-Type (dashboard parity).
 async fn patch_configs(State(s): State<Arc<ClashState>>, body: Bytes) -> Response {
     let body: serde_json::Value = match serde_json::from_slice(&body) {
@@ -1673,10 +1673,8 @@ async fn get_dns_query(
     }
 }
 
-async fn flush_fakeip(State(s): State<Arc<ClashState>>) -> StatusCode {
-    if let Some(ref db) = s.cache_db {
-        db.flush_prefix("fakeip:");
-    }
+/// Nothing persists FakeIP mappings, so there is nothing to flush.
+async fn flush_fakeip() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
@@ -1687,7 +1685,7 @@ async fn flush_dns(State(s): State<Arc<ClashState>>) -> StatusCode {
             let Some(db) = s.cache_db.clone() else {
                 return StatusCode::NO_CONTENT;
             };
-            match tokio::task::spawn_blocking(move || db.flush_dns_namespaces()).await {
+            match tokio::task::spawn_blocking(move || db.flush_dns()).await {
                 Ok(Ok(())) => StatusCode::NO_CONTENT,
                 _ => StatusCode::SERVICE_UNAVAILABLE,
             }

@@ -21,8 +21,11 @@ mod records;
 mod store;
 mod supervisor;
 
+#[cfg(feature = "native-api")]
+pub(crate) use store::StoredBodies;
 pub use store::SubscriptionStore;
 pub(crate) use store::same_subscription_fetch_identity;
+pub(crate) use store::{LegacySubscriptionStore, legacy_store_roots, prune_bodies};
 
 #[cfg(feature = "native-api")]
 pub(crate) use supervisor::ProviderLoad;

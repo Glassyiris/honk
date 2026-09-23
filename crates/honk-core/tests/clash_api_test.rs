@@ -8,16 +8,16 @@
 
 use honk_config::Config;
 use honk_config::dns::{DnsConfig, DnsRouting};
-use honk_config::experimental::CacheFileConfig;
 use honk_config::node::{Group, Node};
 use honk_config::types::NodeProtocol;
-use honk_core::cachedb::CacheDb;
 use honk_core::clash_api::{self, ClashState};
 use honk_core::connection_tracker::ConnectionEntry;
 use honk_core::dns::cache::DnsCache;
 use honk_core::dns::forwarder::{DnsForwarder, DnsUpstreamPool, build_dns_query};
 use honk_core::dns::routing::DnsRouter;
 use honk_core::mode::ModeState;
+use honk_core::state::StateDb;
+use honk_core::state::cache::CacheDb;
 use honk_outbound::alive::{IpVersion, ProbeDomain};
 use honk_outbound::proxy::ProxyRegistry;
 use std::net::SocketAddr;
@@ -64,7 +64,7 @@ struct TestApp {
     addr: SocketAddr,
     state: Arc<ClashState>,
     log_dispatch: tracing::Dispatch,
-    db_path: std::path::PathBuf,
+    data_dir: std::path::PathBuf,
     /// Every `set_datapath_flags` value the mock backend received.
     ebpf_datapath_flags_writes: std::sync::Arc<parking_lot::Mutex<Vec<u32>>>,
     control_task: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -135,13 +135,8 @@ async fn spawn_app(secret: &str, external_ui: &str) -> TestApp {
 
 async fn spawn_app_with_config(mut config: Config, secret: &str, external_ui: &str) -> TestApp {
     let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join("cache.db");
-    let cache_cfg = CacheFileConfig {
-        enabled: true,
-        path: db_path.to_str().unwrap().to_string(),
-        ..Default::default()
-    };
-    config.experimental.cache_file = cache_cfg;
+    let data_dir = tmp.path().to_path_buf();
+    config.experimental.cache_file.enabled = true;
     config.global.nfqueue_enable = false;
     let (log_layer, log_handle) = clash_api::logs::layer();
     let log_dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(log_layer));
@@ -167,7 +162,9 @@ async fn spawn_app_with_config(mut config: Config, secret: &str, external_ui: &s
         forwarder,
     )
     .unwrap();
-    control.init_cache_db(None).await;
+    control
+        .init_cache_db(Some(Arc::new(StateDb::open(&data_dir).unwrap())), None)
+        .await;
     control.set_mode_state(Arc::clone(&mode_state));
     control.start_datapath_flags_coordinator().unwrap();
     let datapath_flags = control.datapath_flags_handle().unwrap();
@@ -213,7 +210,7 @@ async fn spawn_app_with_config(mut config: Config, secret: &str, external_ui: &s
         addr,
         state,
         log_dispatch,
-        db_path,
+        data_dir,
         ebpf_datapath_flags_writes,
         control_task,
         _tmp: tmp,
@@ -560,13 +557,13 @@ async fn test_score_proxy_contract_and_put_rejection() {
         .await
         .unwrap();
     assert_eq!(response.status(), 400);
-    assert_eq!(
+    assert!(
         app.state
             .cache_db
             .as_ref()
             .unwrap()
-            .load_selector_choice("auto"),
-        None
+            .load_network_selector("auto", honk_outbound::group::SelectionNetwork::Tcp)
+            .is_none()
     );
     let body: serde_json::Value = client
         .get(app.url("/proxies/auto"))
@@ -1138,22 +1135,17 @@ async fn test_global_selection_and_mode_persisted() {
 
     // Point writes are acknowledged from the in-memory pending map and become
     // crash-durable on the bounded background flush.
-    let cache_cfg = CacheFileConfig {
-        enabled: true,
-        path: app.db_path.to_str().unwrap().to_string(),
-        ..Default::default()
-    };
-    let reopened = CacheDb::open(&cache_cfg).unwrap();
+    let reopened = CacheDb::open(Arc::new(StateDb::open(&app.data_dir).unwrap())).unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     loop {
         if reopened.load_clash_mode().as_deref() == Some("Global")
-            && reopened.load_selector_choice("GLOBAL").as_deref() == Some("proxy")
+            && reopened.load_clash_global().as_deref() == Some("proxy")
         {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "cache.db point-write durability bound exceeded"
+            "state db point-write durability bound exceeded"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1738,23 +1730,31 @@ async fn test_cache_flush_endpoints() {
     let client = http_client();
 
     let db = app.state.cache_db.as_ref().unwrap();
-    db.set("fakeip:198.18.0.1", "example.com");
-    assert!(db.get("fakeip:198.18.0.1").is_some());
+    db.save_clash_global("node-a");
 
+    // Nothing persists FakeIP mappings; the flush is accepted and touches nothing.
     let resp = client
         .post(app.url("/cache/fakeip/flush"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
-    assert!(db.get("fakeip:198.18.0.1").is_none());
-    // Unrelated keys survive the prefix flush.
-    db.save_selector_choice("proxy", "node-a");
-    assert!(db.load_selector_choice("proxy").is_some());
+    assert_eq!(db.load_clash_global().as_deref(), Some("node-a"));
 
     // DNS cache flush clears both the in-memory cache and persisted answers.
     let now = honk_core::dns::persist::unix_now();
-    db.save_dns_answer("example.com", 1, r#"{"r":"QUJD"}"#, now + 300);
+    let sqlite = rusqlite::Connection::open(app.data_dir.join("state/honk.db")).unwrap();
+    sqlite
+        .execute(
+            "INSERT INTO dns_answer (key, expire_at, entry) VALUES ('k', ?1, x'00')",
+            [now as i64 + 300],
+        )
+        .unwrap();
+    let persisted = || -> i64 {
+        sqlite
+            .query_row("SELECT count(*) FROM dns_answer", [], |row| row.get(0))
+            .unwrap()
+    };
     app.state
         .dns_service
         .cache()
@@ -1770,7 +1770,7 @@ async fn test_cache_flush_endpoints() {
             .get("example.com:1")
             .is_some()
     );
-    assert_eq!(db.load_dns_answers(now).len(), 1);
+    assert_eq!(persisted(), 1);
 
     let resp = client
         .post(app.url("/cache/dns/flush"))
@@ -1787,9 +1787,9 @@ async fn test_cache_flush_endpoints() {
             .get("example.com:1")
             .is_none()
     );
-    assert!(db.load_dns_answers(now).is_empty());
-    // The selector choice is untouched by the DNS flush.
-    assert!(db.load_selector_choice("proxy").is_some());
+    assert_eq!(persisted(), 0);
+    // Clash state is untouched by the DNS flush.
+    assert_eq!(db.load_clash_global().as_deref(), Some("node-a"));
 }
 
 #[tokio::test]
@@ -2186,14 +2186,7 @@ async fn test_proxy_providers_structure() {
 #[tokio::test]
 async fn test_store_dns_persister_end_to_end() {
     let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join("cache.db");
-    let cache_cfg = CacheFileConfig {
-        enabled: true,
-        path: db_path.to_str().unwrap().to_string(),
-        store_dns: true,
-        ..Default::default()
-    };
-    let db = Arc::new(CacheDb::open(&cache_cfg).unwrap());
+    let db = Arc::new(CacheDb::open(Arc::new(StateDb::open(tmp.path()).unwrap())).unwrap());
 
     let dns_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
     let dns_config = DnsConfig::default();
@@ -2221,8 +2214,6 @@ async fn test_store_dns_persister_end_to_end() {
     persister.shutdown().await.expect("persistence shutdown");
     assert_eq!(persister.counters().written, 1);
 
-    let now = honk_core::dns::persist::unix_now();
-    db.save_dns_answer("legacy.example", 1, r#"{"r":"TEVHQUNZ"}"#, now + 300);
     let fresh_cache = Arc::new(tokio::sync::Mutex::new(DnsCache::new(16)));
     let restart = honk_core::dns::persist::DnsCachePersister::spawn(db.clone());
     assert_eq!(
@@ -2242,11 +2233,6 @@ async fn test_store_dns_persister_end_to_end() {
         .unwrap();
     assert_eq!(resp, a_record_response([1, 2, 3, 4], 300));
     restart.shutdown().await.expect("restart shutdown");
-    assert_eq!(
-        db.load_dns_answers(now).len(),
-        1,
-        "v2 restart must leave rollback-compatible legacy rows untouched"
-    );
 }
 
 #[tokio::test]

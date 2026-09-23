@@ -84,5 +84,8 @@ fn test_example_dae_parses() {
         "127.0.0.1:9090"
     );
     assert!(config.experimental.cache_file.enabled);
-    assert_eq!(config.experimental.cache_file.path, "cache.db");
+    assert_eq!(
+        config.experimental.cache_file.legacy_cache_file(),
+        (None, None)
+    );
 }

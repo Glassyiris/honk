@@ -46,6 +46,16 @@ fn record_round_trips_and_verifies_in_constant_shape() {
 }
 
 #[test]
+fn passwords_are_eight_to_128_characters() {
+    assert!(!valid_password("7 chars"));
+    assert!(valid_password("8 chars!"));
+    assert!(valid_password(&"x".repeat(128)));
+    assert!(!valid_password(&"x".repeat(129)));
+    // Counted in Unicode scalar values, so eight CJK characters are enough.
+    assert!(valid_password("八個字元的密碼好"));
+}
+
+#[test]
 fn record_parsing_rejects_unknown_shapes() {
     let mut json: serde_json::Value = serde_json::from_slice(
         &Record::create("a", "correct horse battery")
@@ -84,10 +94,22 @@ fn temp_data_dir() -> tempfile::TempDir {
     tempfile::tempdir().expect("temp dir")
 }
 
+fn store_in(data: &Path) -> CredentialStore {
+    CredentialStore::open(Arc::new(StateDb::open(data).unwrap()), data).unwrap()
+}
+
+fn admin_rows(data: &Path) -> i64 {
+    StateDb::open(data)
+        .unwrap()
+        .strict()
+        .query_row("SELECT count(*) FROM admin", [], |row| row.get(0))
+        .unwrap()
+}
+
 #[test]
 fn setup_publishes_one_durable_account() {
     let data = temp_data_dir();
-    let store = CredentialStore::open(data.path()).unwrap();
+    let store = store_in(data.path());
     assert!(store.setup_required());
     assert!(!store.verify("admin", "correct horse battery"));
     store.setup("admin", "correct horse battery").unwrap();
@@ -97,98 +119,124 @@ fn setup_publishes_one_durable_account() {
         store.setup("other", "correct horse battery"),
         Err(SetupError::AlreadyCompleted)
     );
-    let record_path = data.path().join(CREDENTIAL_DIR).join(RECORD_FILE);
-    let record = std::fs::read(&record_path).unwrap();
-    assert!(Record::from_json(&record).is_ok());
-    let mode = std::fs::metadata(&record_path)
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o600);
-    assert!(
-        std::fs::read_dir(data.path().join(CREDENTIAL_DIR))
-            .unwrap()
-            .count()
-            == 1,
-        "no temporary file left"
-    );
+    assert_eq!(admin_rows(data.path()), 1);
     drop(store);
     // A fresh process reads the same account back.
-    let reopened = CredentialStore::open(data.path()).unwrap();
+    let reopened = store_in(data.path());
     assert!(!reopened.setup_required());
     assert!(reopened.verify("admin", "correct horse battery"));
 }
 
 #[test]
-fn concurrent_creators_yield_one_winner() {
+fn two_stores_racing_setup_yield_one_winner() {
     let data = temp_data_dir();
-    let store = std::sync::Arc::new(CredentialStore::open(data.path()).unwrap());
-    let results: Vec<_> = (0..4)
-        .map(|i| {
-            let store = store.clone();
-            std::thread::spawn(move || store.setup(&format!("admin{i}"), "correct horse battery"))
+    let stores: Vec<_> = (0..2).map(|_| Arc::new(store_in(data.path()))).collect();
+    let results: Vec<_> = stores
+        .iter()
+        .enumerate()
+        .map(|(index, store)| {
+            let store = Arc::clone(store);
+            std::thread::spawn(move || {
+                store.setup(&format!("admin{index}"), "correct horse battery")
+            })
         })
+        .collect::<Vec<_>>()
+        .into_iter()
         .map(|handle| handle.join().unwrap())
         .collect();
     assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-    assert_eq!(
-        results
-            .iter()
-            .filter(|result| **result == Err(SetupError::AlreadyCompleted))
-            .count(),
-        3
-    );
+    assert!(results.contains(&Err(SetupError::AlreadyCompleted)));
+    assert_eq!(admin_rows(data.path()), 1);
 }
 
 #[test]
-fn a_second_process_cannot_open_the_locked_directory() {
+fn a_failed_write_blocks_the_store() {
     let data = temp_data_dir();
-    let first = CredentialStore::open(data.path()).unwrap();
+    let db = Arc::new(StateDb::open(data.path()).unwrap());
+    let store = CredentialStore::open(Arc::clone(&db), data.path()).unwrap();
+    // The INSERT itself fails, after the transaction started.
+    db.strict()
+        .execute_batch(
+            "CREATE TEMP TRIGGER refuse BEFORE INSERT ON admin BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap();
     assert_eq!(
-        CredentialStore::open(data.path()).err(),
-        Some(StoreError::Locked)
+        store.setup("admin", "correct horse battery"),
+        Err(SetupError::NotDurable)
     );
-    drop(first);
-    assert!(CredentialStore::open(data.path()).is_ok());
+    db.strict().execute_batch("DROP TRIGGER refuse").unwrap();
+    assert!(!store.verify("admin", "correct horse battery"));
+    assert_eq!(
+        store.setup("admin", "correct horse battery"),
+        Err(SetupError::AlreadyCompleted)
+    );
 }
 
-#[test]
-fn unsafe_directory_or_record_fails_closed() {
-    let data = temp_data_dir();
-    let dir = data.path().join(CREDENTIAL_DIR);
+fn legacy_record(data: &Path) -> std::path::PathBuf {
+    let dir = data.join(LEGACY_DIR);
     std::fs::create_dir(&dir).unwrap();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
-    assert_eq!(
-        CredentialStore::open(data.path()).err(),
-        Some(StoreError::Unsafe)
-    );
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let file = dir.join(RECORD_FILE);
+    let file = dir.join(LEGACY_RECORD);
     std::fs::write(
         &file,
-        Record::create("admin", "correct horse battery")
+        Record::create("legacy", "correct horse battery")
             .unwrap()
             .to_json(),
     )
     .unwrap();
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert_eq!(
-        CredentialStore::open(data.path()).err(),
-        Some(StoreError::Unsafe)
-    );
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(CredentialStore::open(data.path()).is_ok());
+    file
+}
+
+#[test]
+fn a_legacy_record_is_imported_and_removed_only_by_the_credential_store() {
+    let data = temp_data_dir();
+    let file = legacy_record(data.path());
+    // File mode without password_auth opens the state db and leaves it alone.
+    drop(StateDb::open(data.path()).unwrap());
+    assert!(file.exists());
+
+    let store = store_in(data.path());
+    assert!(store.verify("legacy", "correct horse battery"));
+    assert!(!file.exists());
+    assert!(!data.path().join(LEGACY_DIR).exists());
+}
+
+#[test]
+fn an_unsafe_legacy_directory_or_record_fails_closed() {
+    let data = temp_data_dir();
+    let file = legacy_record(data.path());
+    let dir = data.path().join(LEGACY_DIR);
+    let open =
+        || CredentialStore::open(Arc::new(StateDb::open(data.path()).unwrap()), data.path()).err();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+    assert_eq!(open(), Some(StoreError::Unsafe));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(open(), Some(StoreError::Unsafe));
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::write(&file, b"{}").unwrap();
-    assert_eq!(
-        CredentialStore::open(data.path()).err(),
-        Some(StoreError::Corrupt)
-    );
+    assert_eq!(open(), Some(StoreError::Corrupt));
     std::fs::remove_file(&file).unwrap();
     std::os::unix::fs::symlink(data.path().join("elsewhere"), &file).unwrap();
+    assert_eq!(open(), Some(StoreError::Unsafe));
+    assert_eq!(admin_rows(data.path()), 0);
+}
+
+#[test]
+fn reset_refuses_while_a_daemon_has_the_db_open() {
+    let data = temp_data_dir();
+    let db = Arc::new(StateDb::open(data.path()).unwrap());
+    let store = CredentialStore::open(Arc::clone(&db), data.path()).unwrap();
+    store.setup("admin", "correct horse battery").unwrap();
     assert_eq!(
-        CredentialStore::open(data.path()).err(),
-        Some(StoreError::Unsafe)
+        crate::state::reset_admin(data.path()),
+        Err(crate::state::StateError::InUse)
     );
+    drop(store);
+    drop(db);
+    assert_eq!(crate::state::reset_admin(data.path()), Ok(true));
+    assert!(store_in(data.path()).setup_required());
 }
 
 #[test]
@@ -318,4 +366,63 @@ fn setup_peers_are_loopback_or_private_only() {
     // An IPv4-mapped peer is judged as the IPv4 address it carries.
     assert!(Peer(canonical_ip("::ffff:10.0.0.1".parse().unwrap())).may_set_up());
     assert!(!Peer(canonical_ip("::ffff:8.8.8.8".parse().unwrap())).may_set_up());
+}
+
+#[test]
+fn reset_also_removes_a_legacy_record_never_imported() {
+    let data = temp_data_dir();
+    drop(StateDb::open(data.path()).unwrap());
+    let file = legacy_record(data.path());
+    assert_eq!(crate::state::reset_admin(data.path()), Ok(true));
+    assert!(!file.exists());
+    assert!(store_in(data.path()).setup_required());
+}
+
+#[test]
+fn a_busy_db_leaves_setup_available() {
+    let data = temp_data_dir();
+    let store = store_in(data.path());
+    let holder = StateDb::open(data.path()).unwrap();
+    let mut connection = holder.strict();
+    let busy = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    assert_eq!(
+        store.setup("admin", "correct horse battery"),
+        Err(SetupError::Unavailable)
+    );
+    drop(busy);
+    drop(connection);
+    store.setup("admin", "correct horse battery").unwrap();
+    assert!(store.verify("admin", "correct horse battery"));
+}
+
+#[test]
+fn reset_removes_a_legacy_record_before_any_state_db_exists() {
+    let data = temp_data_dir();
+    let file = legacy_record(data.path());
+    assert_eq!(crate::state::reset_admin(data.path()), Ok(true));
+    assert!(!file.exists());
+    assert!(!data.path().join(crate::state::STATE_DIR).exists());
+    assert_eq!(crate::state::reset_admin(data.path()), Ok(false));
+}
+
+#[test]
+fn reset_on_a_db_without_its_schema_still_removes_a_legacy_record() {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let data = temp_data_dir();
+    let state = data.path().join(crate::state::STATE_DIR);
+    std::fs::create_dir(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // A first start that stopped between creating the file and its schema.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(state.join(crate::state::DB_FILE))
+        .unwrap();
+    let file = legacy_record(data.path());
+    assert_eq!(crate::state::reset_admin(data.path()), Ok(true));
+    assert!(!file.exists());
 }

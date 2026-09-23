@@ -1,5 +1,6 @@
 //! File-authority regressions through real HTTP, reload publication and supervisor handoff.
 
+mod database;
 mod geodata;
 mod groups;
 mod management;
@@ -15,6 +16,7 @@ use crate::dns::cache::DnsCache;
 use crate::dns::forwarder::{DnsForwarder, DnsUpstreamPool};
 use crate::dns::routing::DnsRouter;
 use crate::ebpf::mock::MockEbpfBackend;
+use crate::native_api::store::{DatabaseStartup, DbStore, FileStore, SourceStore};
 use crate::native_api::{NativeServer, NativeState};
 use crate::routing::Router;
 use crate::subscription::SubscriptionSupervisor;
@@ -26,7 +28,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::AsyncWriteExt;
@@ -72,6 +74,9 @@ struct Fixture {
     control: JoinSet<anyhow::Result<()>>,
     reloads: Arc<AtomicUsize>,
     gates: Option<mpsc::UnboundedReceiver<oneshot::Sender<()>>>,
+    database: Option<Arc<DbStore>>,
+    /// 1: the engine answers every reload `Rejected`; 2: it drops the reply. Neither applies it.
+    reject_reloads: Arc<AtomicU8>,
 }
 
 impl Fixture {
@@ -83,6 +88,27 @@ impl Fixture {
         access: Access,
         gated: bool,
         setup: impl FnOnce(&Path, &mut HashMap<&'static str, String>),
+    ) -> Self {
+        Self::build(access, gated, setup, false).await
+    }
+
+    /// Starts from `--store db`: the tree is imported as revision 1.
+    async fn new_db(access: Access) -> Self {
+        Self::new_db_custom(access, |_, _| {}).await
+    }
+
+    async fn new_db_custom(
+        access: Access,
+        setup: impl FnOnce(&Path, &mut HashMap<&'static str, String>),
+    ) -> Self {
+        Self::build(access, false, setup, true).await
+    }
+
+    async fn build(
+        access: Access,
+        gated: bool,
+        setup: impl FnOnce(&Path, &mut HashMap<&'static str, String>),
+        db: bool,
     ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -110,26 +136,44 @@ impl Fixture {
             ("locked.dae", "# Local-editor-only include.\n".into()),
         ]);
         setup(directory.path(), &mut originals);
+        // The db fixture keeps its tree apart from `state` so a test can delete all of it.
+        let tree = directory.path().join(if db { "etc" } else { "" });
+        std::fs::create_dir_all(&tree).unwrap();
         for (name, text) in &originals {
-            let path = directory.path().join(name);
+            let path = tree.join(name);
             std::fs::write(&path, text).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640)).unwrap();
         }
-        let entry = directory.path().join("main.dae");
+        let entry = tree.join("main.dae").canonicalize().unwrap();
         let mut diagnostics = Vec::new();
-        let loaded = Config::from_dae_file_with_sources(
-            &entry,
-            &HashMap::new(),
-            SourceLimits::default(),
-            &mut diagnostics,
-        )
-        .unwrap();
-        let initial = SourceUpdate {
-            sources: loaded.sources,
-            dependencies: Vec::new(),
-            geo_sources: None,
+        let (mut config, initial, store, database) = if db {
+            let state = directory.path().join("state");
+            std::fs::create_dir_all(&state).unwrap();
+            let mut startup = DatabaseStartup::open(&entry, &state, &mut diagnostics).unwrap();
+            startup.record().unwrap();
+            let store = Arc::clone(&startup.store);
+            (
+                startup.config,
+                startup.sources,
+                Arc::clone(&store) as Arc<dyn SourceStore>,
+                Some(store),
+            )
+        } else {
+            let loaded = Config::from_dae_file_with_sources(
+                &entry,
+                &HashMap::new(),
+                SourceLimits::default(),
+                &mut diagnostics,
+            )
+            .unwrap();
+            let store = Arc::new(FileStore::new(loaded.sources[0].path.clone()));
+            let initial = SourceUpdate {
+                sources: loaded.sources,
+                dependencies: Vec::new(),
+                geo_sources: None,
+            };
+            (loaded.config, initial, store as Arc<dyn SourceStore>, None)
         };
-        let mut config = loaded.config;
         config.validate_detailed().unwrap();
         config.ensure_builtin_nodes();
         let mut subscriptions = SubscriptionSupervisor::prepare(&mut config, None, diagnostics)
@@ -183,7 +227,7 @@ impl Fixture {
         control_plane.attach_subscriptions(subscriptions.handle());
         let coordinator = service
             .start(
-                Some(entry),
+                Some(store),
                 Some(initial),
                 directory.path().join("state"),
                 control_plane.config_handle(),
@@ -194,6 +238,8 @@ impl Fixture {
             .await;
         let reloads = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&reloads);
+        let reject_reloads = Arc::new(AtomicU8::new(0));
+        let rejecting = Arc::clone(&reject_reloads);
         let (gate, gates) = if gated {
             let (sender, receiver) = mpsc::unbounded_channel();
             (Some(sender), Some(receiver))
@@ -203,7 +249,7 @@ impl Fixture {
         let mut control = JoinSet::new();
         control.spawn(async move {
             control_plane
-                .run_native_config_test_commands(observed, gate)
+                .run_native_config_test_commands(observed, gate, rejecting)
                 .await
         });
         let weak = Arc::downgrade(&state);
@@ -223,6 +269,8 @@ impl Fixture {
             control,
             reloads,
             gates,
+            database,
+            reject_reloads,
         }
     }
 

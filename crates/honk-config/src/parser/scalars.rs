@@ -730,18 +730,20 @@ pub(super) fn parse_experimental_section(
                         );
                     }
                     if let Some(value) = values.get("path").map(|text| text.unquote().raw()) {
-                        config.cache_file.path = value.to_owned();
+                        config.cache_file.legacy_path = Some(value.to_owned());
                     }
                     if let Some(value) = values.get("cache_id").map(|text| text.unquote().raw()) {
-                        config.cache_file.cache_id = value.to_owned();
+                        config.cache_file.legacy_cache_id = Some(value.to_owned());
                     }
-                    if values.contains_key("store_fakeip") {
-                        config.cache_file.store_fakeip = bool_value(
-                            &values,
-                            "store_fakeip",
-                            "experimental.cache_file.store_fakeip",
-                            diagnostics,
-                        );
+                    if let Some(value) = values.get("store_fakeip") {
+                        config.cache_file.legacy_store_fakeip =
+                            Some(strict_bool(value.unquote().raw()).unwrap_or(false));
+                    }
+                    for key in config.cache_file.legacy_keys() {
+                        diagnostics.emit(crate::diagnostic::legacy_cache_file_warning(
+                            diagnostics.source(),
+                            key,
+                        ));
                     }
                     if values.contains_key("store_dns") {
                         config.cache_file.store_dns = bool_value(

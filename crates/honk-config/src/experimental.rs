@@ -44,40 +44,41 @@ impl Default for ClashApiConfig {
     }
 }
 
-/// Cache file for persistent state (FakeIP, DNS cache, mode/selection).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Persistence of runtime state (mode/selection, delays, DNS cache) in the
+/// state database.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheFileConfig {
-    /// Enable cache file persistence.
+    /// Enable runtime-state persistence.
     #[serde(default)]
     pub enabled: bool,
-    /// Cache database path. New relative paths resolve below `global.data_dir`;
-    /// an existing legacy config-directory path is retained.
-    #[serde(default = "default_cache_path")]
-    pub path: String,
-    /// Unique identifier for this router instance.
-    #[serde(default)]
-    pub cache_id: String,
-    /// Store FakeIP mappings across restarts.
-    #[serde(default)]
-    pub store_fakeip: bool,
     /// Store DNS cache answers across restarts.
     #[serde(default)]
     pub store_dns: bool,
+    /// Removed from the active schema; read once to find a legacy `cache.db`.
+    #[serde(rename = "path", default, skip_serializing)]
+    pub(crate) legacy_path: Option<String>,
+    /// Removed from the active schema; read once to select the imported key prefix.
+    #[serde(rename = "cache_id", default, skip_serializing)]
+    pub(crate) legacy_cache_id: Option<String>,
+    /// Removed from the active schema; it never had an effect.
+    #[serde(rename = "store_fakeip", default, skip_serializing)]
+    pub(crate) legacy_store_fakeip: Option<bool>,
 }
 
-fn default_cache_path() -> String {
-    "cache.db".to_string()
-}
+impl CacheFileConfig {
+    /// `(path, cache_id)` as written, for the one-time `cache.db` import.
+    pub fn legacy_cache_file(&self) -> (Option<&str>, Option<&str>) {
+        (self.legacy_path.as_deref(), self.legacy_cache_id.as_deref())
+    }
 
-impl Default for CacheFileConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            path: "cache.db".to_string(),
-            cache_id: String::new(),
-            store_fakeip: false,
-            store_dns: false,
-        }
+    pub(crate) fn legacy_keys(&self) -> impl Iterator<Item = &'static str> {
+        [
+            ("path", self.legacy_path.is_some()),
+            ("cache_id", self.legacy_cache_id.is_some()),
+            ("store_fakeip", self.legacy_store_fakeip.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(key, present)| present.then_some(key))
     }
 }
 

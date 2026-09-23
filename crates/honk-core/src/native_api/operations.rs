@@ -154,6 +154,8 @@ impl IntoResponse for OperationAcceptedResponse {
 pub(crate) struct Reservation {
     pub(crate) id: String,
     pub(crate) fresh: bool,
+    /// Who asked, as recorded in configuration revisions.
+    pub(crate) principal: String,
     admission: watch::Receiver<Admission>,
     owner: Option<Weak<OperationStore>>,
 }
@@ -204,6 +206,7 @@ impl OperationStore {
         body: &[u8],
         kind: OperationKind,
     ) -> Result<Reservation, ApiError> {
+        let requester = principal.to_owned();
         if key == Some("") {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
@@ -251,6 +254,7 @@ impl OperationStore {
             return Ok(Reservation {
                 id: record.id.clone(),
                 fresh: false,
+                principal: requester,
                 admission: record.admission.subscribe(),
                 owner: None,
             });
@@ -284,6 +288,7 @@ impl OperationStore {
         Ok(Reservation {
             id,
             fresh: true,
+            principal: requester,
             admission: receiver,
             owner: Some(Arc::downgrade(self)),
         })

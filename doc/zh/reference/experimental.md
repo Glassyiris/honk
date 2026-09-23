@@ -7,7 +7,7 @@
 | 嵌套 section | 用途 |
 | --- | --- |
 | `clash_api` | Clash 兼容 HTTP API 与外部 dashboard |
-| `cache_file` | 用 SQLite 持久化运行时选择、模式、延迟样本和可选 DNS 状态 |
+| `cache_file` | 在状态数据库中持久化运行时选择、模式、延迟样本和可选 DNS 状态 |
 | `native_api` | 独立、显式启用的原生观测/控制、受控 `.dae` 源管理与本地 UI 目录 |
 
 `udp_nfqueue { enabled: ... }` 是已弃用的兼容 section。dae 和结构化配置加载器仍会接受它，打印迁移 warning，并将值复制到 `global.nfqueue_enable`；新配置应直接使用全局字段。
@@ -91,6 +91,8 @@ Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒
 
 所有 `clash_api` 字段都由启动阶段持有。通过 SIGHUP 提交的候选配置只要修改其中任一字段就会被拒绝。
 
+`--store db` 模式不运行 Clash API，`external_controller` 非空时拒绝启动，详见[配置数据库](./api.md#配置数据库--store-db)。
+
 ### 鉴权与传输
 
 `secret` 非空时，API 请求使用 `Authorization: Bearer <secret>`；WebSocket upgrade 也可以改用 `?token=<secret>`。静态 `/ui` 内容不经过这层鉴权 middleware。内置 listener 只提供明文 HTTP，不提供 TLS。应绑定到 `127.0.0.1` 等 loopback 地址，或在前面部署带鉴权的 TLS reverse proxy；不得直接暴露到不受信任的网络。endpoint 清单见 [Clash API 参考](./api.md)。
@@ -101,7 +103,7 @@ Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒
 
 绝对 `external_ui` 路径按原值使用。相对路径首先选择 `global.data_dir` 下的已有目录，其次选择 `/var/share/honk` 下的已有目录，再选择相对当前工作目录的已有目录；都不存在时，honk 在 `global.data_dir` 下创建目标目录。目标缺失或为空时，会在后台下载 dashboard ZIP。非空 `external_ui_download_url` 会替换内建 zashboard URL；`HONK_UI_DOWNLOAD_URL` 的优先级高于两者。
 
-非空 `external_ui_download_detour` 会强制初始请求和每次 redirect 都经过该节点或组。`direct` 直接下载，`block` 中止下载，组则为每次 exchange 解析其权威叶节点。该字段为空时，每个 URL 仍按原有行为遵循普通流量路由。tag 不可用、下载失败或解压失败只写日志，不会停止引擎。
+非空 `external_ui_download_detour` 会强制初始请求和每次 redirect 都经过该节点或组。`direct` 直接下载，`block` 中止下载，组则为每次 exchange 解析其权威叶节点。该字段为空时，每个 URL 仍按原有行为遵循普通流量路由。tag 不可用、下载失败或解压失败只写日志，不会停止引擎。压缩包写入目标父目录中一个无文件名的私有文件，不保存在内存中；解压结束或下载失败后不留下任何文件。解压超过 10,000 个条目或 128 MiB 内容（与压缩包本身的上限相同）时拒绝继续，已写入的目录被清空，下次启动时重新下载。
 
 ### 启动模式
 
@@ -111,24 +113,36 @@ Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒
 
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
-| `enabled` | `false` | 打开 SQLite 缓存并启用运行时状态持久化。 |
-| `path` | `"cache.db"` | 数据库路径。对相对路径，依次优先使用 `global.data_dir` 下、`/var/share/honk` 下和相对原配置目录的已有文件；新文件创建在 `global.data_dir` 下。 |
-| `cache_id` | `""` | 所有数据库 key 的 namespace。非空值给 key 加上 `<cache_id>:` 前缀。 |
-| `store_fakeip` | `false` | 仅表示 FakeIP 持久化意图。已有 `fakeip:` 前缀和 flush API，但引擎尚不写入或恢复映射。 |
-| `store_dns` | `false` | 使用 exact-key v2 格式持久化并恢复 DNS 缓存应答。 |
+| `enabled` | `false` | 在状态数据库 `<data_dir>/state/honk.db` 中持久化运行时状态。 |
+| `store_dns` | `false` | 同时持久化并恢复 DNS 缓存应答。 |
 
-整个 `cache_file` section 都由启动阶段持有。通过 SIGHUP 提交的候选配置只要修改任一字段就会被拒绝。
+两个字段都由启动阶段持有；SIGHUP 提交的候选配置修改其中任一字段时会被拒绝。
 
-### 始终持久化的状态
+`path`、`cache_id` 与 `store_fakeip` 已不再是设置项。它们仍可解析，但只产生 `legacy-cache-file` 警告，不起作用；SIGHUP 也接受对它们的修改。`path` 与 `cache_id` 只在导入旧 `cache.db` 时读取一次，见下文。
 
-只要 `enabled` 成功打开数据库，honk 就会分别持久化 TCP/UDP Selector 选择和每个节点最后一次真实延迟样本，不受 `store_fakeip` 与 `store_dns` 影响。只有 native 未启用时才恢复/保存 Clash 模式与合成 GLOBAL 选择；native 启用时两种 API 共用临时模式，在启动与成功显式配置激活（含 no-op）时恢复 Rule，provider/network refresh 不重置。延迟样本每分钟生成一次快照；恢复时丢弃格式错误、为零或超过 24 小时的样本。liveness 不会恢复。
+### 持久化的状态
+
+启用 `enabled` 后，honk 在状态数据库中保存 TCP/UDP 各自的 Selector 选择和每个节点最后一次真实延迟样本，与 `store_dns` 无关。只有 native API 未启用时才恢复和保存 Clash 模式与 Clash GLOBAL 选择。延迟样本每分钟批量写入一次；恢复时丢弃为零或超过 24 小时的样本。存活状态不恢复。
+
+状态数据库损坏且未设置 `--store db` 与 `native_api.password_auth` 时，honk 在取得实例锁后把 `honk.db` 与 `honk.db-wal` 改名为 `honk.db.corrupt` 与 `honk.db.corrupt-wal`，再创建新文件。如果 `honk.db.corrupt` 已经存在，honk 保留两份文件，在其中一份被删除前不做持久化。同样条件下，状态数据库不可用、不安全（不是 honk 用户所有的私有文件）或被 `honk-core admin reset` 锁定时，honk 也记录警告并在不做持久化的情况下运行。来自更新版本 honk 或其他程序的数据库在任何模式下都拒绝启动，因为移走它会毁掉只有该程序才能读取的数据。
+
+### 容量限制
+
+维护任务每 60 秒执行一次。Selector 选择只为配置中的 Selector 组保留，延迟样本只为已配置的节点保留；组或节点连续两次维护时都不在配置中，对应的行才会删除，因此 reload 短暂移除后又恢复的组或节点仍保留原记录。每次维护都会删除超过 24 小时的延迟样本和已过期的 DNS 行，并把至多 1 MiB 的空闲页归还给文件系统。DNS 行最多保留 4,096 条，每批写入后先淘汰最早过期的行。
+
+启动过程打开状态数据库时（`--store db`、`password_auth`、`store_subscribe` 或 `cache_file.enabled` 需要它），`enabled: false` 会清空 Selector、延迟、Clash 状态与 DNS 表；`store_dns: false` 清空 DNS 表；启用 native API 或未启用 Clash API 时清空 Clash 状态表。不打开状态数据库的启动不改动该文件。
+
+状态数据库文件上限为 112 MiB。缓存写入为配置 revision 与订阅正文保留其中 24 MiB：某批写入会使已用空间超过 88 MiB 时，写入线程先把 DNS 行删减到 2,048 条，仍然超出时回滚该批写入；被跳过的 DNS 条目计入 `budget_skipped`，不计为已写入。旧 `cache.db` 的导入受同一预算约束：会超出预算的复制不提交，下次启动时重试。
 
 ### DNS 持久化
 
-`store_dns: true` 时，条目使用 `dns:v2:` key namespace 和 `HDNS` version-2 二进制 payload。v2 namespace 可安全回滚：pre-v2 binary 读取旧 `dns:` namespace 时会排除 `dns:v2:` 行，因此不会改动 v2 数据。
+`store_dns: true` 时，每条应答是 `dns_answer` 表中的一行，内容为 `HDNS` version 2 编码，以精确缓存 key 的摘要为主键。只有未过期，并且 key 摘要、规范 query wire、response wire 标识与当前 DNS policy 全部匹配的行才会恢复。精确 key 同时包含入口 profile、request scope 与 operation，因此不会在不同 DNS 上下文之间复用。编码后超过 4 KiB 的条目不写入，计入 `oversize`。
 
-只有未过期，并且 key digest、规范 query wire、response wire identity 与当前 DNS policy 全部匹配的 v2 行才会恢复。exact key 还保留 ingress profile、request scope 和 operation，防止在不同 DNS 上下文之间复用。
+### 从 `cache.db` 升级
 
+启用 `enabled` 后首次启动时，honk 导入 `path` 指向的旧 `cache.db`，解析规则与旧版本相同：绝对路径按原样使用；相对路径依次查找 `global.data_dir` 下、`/var/share/honk` 下以及相对原配置目录的已有文件。honk 只读取本实例 `cache_id` 前缀下的 key，复制配置中 Selector 组在 TCP/UDP 上各自的选择、Clash 模式、Clash GLOBAL 选择以及已配置节点 24 小时内的延迟样本；状态数据库中已有的行优先。旧版本按名称保存的 Selector 选择、DNS 应答与 FakeIP 记录不导入，因此已持久化的 DNS 应答需要重新查询。导入按路径记录在状态数据库中，每个路径一行；即使旧版本重新创建了该文件，也不会再次导入。如果 `cache.db` 是符号链接、不是 honk 用户所有的普通文件、可被其他用户写入，或无法按 `cache.db` 读取，honk 保留该文件并记录警告，下次启动时再次尝试。
+
+`cache_id` 为空时，honk 随后删除 `cache.db` 及其 `-wal`、`-shm` 和所有 `cache.db.corrupt-*` 副本。`cache_id` 非空时，该文件可能由其他实例共用，因此保留，并只记录一次警告。此后再启动旧版本时，它找不到 `cache.db`，运行时状态从空开始。
 
 ## 示例
 
@@ -144,9 +158,6 @@ experimental {
     }
     cache_file {
         enabled: true
-        path: 'cache.db'
-        cache_id: 'gateway-main'
-        store_fakeip: false
         store_dns: true
     }
 }

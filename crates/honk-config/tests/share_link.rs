@@ -579,9 +579,7 @@ fn sample_config() -> Config {
     config.experimental.clash_api.external_ui_download_detour = "proxy".to_string();
     config.experimental.clash_api.secret = "s3cret".to_string();
     config.experimental.cache_file.enabled = true;
-    config.experimental.cache_file.path = "cache.db".to_string();
-    config.experimental.cache_file.cache_id = "router1".to_string();
-    config.experimental.cache_file.store_fakeip = true;
+    config.experimental.cache_file.store_dns = true;
 
     config.nodes.push(
         Node::from_share_link(

@@ -1,6 +1,9 @@
 //! Native file permissions, HTTP projections and configuration work admission.
 
 mod coordinator;
+mod revisions;
+
+pub(super) use revisions::{activate, export, import, revisions};
 
 use axum::body::HttpBody;
 use std::collections::{HashMap, HashSet};
@@ -26,6 +29,7 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use super::operations::{OperationStore, Reservation};
+use super::store::{SourceStore, StoreKind};
 use super::{ApiError, ErrorCode, NativeState, error, parse_query, timestamp, types::RequestId};
 use crate::configuration::{
     Accepted, AcceptedSources, MAX_SOURCE_BYTES, MAX_SOURCES, SourceUpdate, limits,
@@ -106,6 +110,12 @@ impl ListenerSecrets {
             .with_clash(&config.experimental.clash_api.secret)
     }
 
+    /// Adds both effective secrets the configuration db holds.
+    pub(crate) fn with_all(self, secrets: &super::store::db::ListenerSecrets) -> Self {
+        self.with_clash(&secrets.native_api)
+            .with_clash(&secrets.clash_api)
+    }
+
     pub(crate) fn with_clash(mut self, secret: &str) -> Self {
         if secret.len() >= MIN_MASKED_SECRET && !self.values.iter().any(|value| value == secret) {
             self.values.push(secret.to_owned());
@@ -123,7 +133,7 @@ impl ListenerSecrets {
         })
     }
 
-    fn contains(&self, text: &str) -> bool {
+    pub(crate) fn contains(&self, text: &str) -> bool {
         self.spellings().any(|value| text.contains(value.as_ref()))
     }
 
@@ -247,6 +257,7 @@ pub(crate) struct ConfigService {
     phase: RwLock<Option<tokio::sync::watch::Receiver<crate::control::EnginePhase>>>,
     /// The secret set for the accepted sources, keyed by the `SourceUpdate` it was built from.
     secrets: Mutex<Option<(Arc<SourceUpdate>, Arc<ListenerSecrets>)>>,
+    store: RwLock<Option<Arc<dyn SourceStore>>>,
     #[cfg(test)]
     before_replace: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
@@ -280,6 +291,13 @@ enum Work {
     Reload {
         reservation: Reservation,
     },
+    Import {
+        reservation: Reservation,
+    },
+    ActivateRevision {
+        number: i64,
+        reservation: Reservation,
+    },
     Validate {
         request: ValidationRequest,
         response: oneshot::Sender<Result<Value, ApiError>>,
@@ -302,8 +320,18 @@ impl ConfigService {
             last_reload: RwLock::new(None),
             phase: RwLock::new(None),
             secrets: Mutex::new(None),
+            store: RwLock::new(None),
             #[cfg(test)]
             before_replace: Mutex::new(None),
+        }
+    }
+
+    /// The principal recorded for writes that carry no reservation.
+    pub(crate) fn principal(&self) -> &'static str {
+        if self.settings.credentialed() {
+            "control"
+        } else {
+            "anonymous"
         }
     }
 
@@ -324,6 +352,7 @@ impl ConfigService {
                 .read()
                 .as_ref()
                 .is_some_and(|accepted| self.source_writable(accepted, 0))
+            && !self.store_blocked()
     }
 
     pub(super) async fn manage(
@@ -391,10 +420,14 @@ impl ConfigService {
         {
             return Arc::clone(secrets);
         }
-        let secrets = Arc::new(ListenerSecrets::new(
-            &accepted.update.sources,
-            &self.settings.secret,
-        ));
+        let mut secrets = ListenerSecrets::new(&accepted.update.sources, &self.settings.secret);
+        // Db sources are stripped, so the stored values are the only record of them.
+        if let Some(store) = self.store.read().as_ref()
+            && let Some(database) = store.database()
+        {
+            secrets = secrets.with_all(&database.listener_secrets());
+        }
+        let secrets = Arc::new(secrets);
         *cached = Some((Arc::clone(&accepted.update), Arc::clone(&secrets)));
         secrets
     }
@@ -485,6 +518,8 @@ impl ConfigService {
         let (content, redacted) = secrets.mask(&source.content);
         let (path, path_redacted) = secrets.mask(&source_path(accepted, index).to_string_lossy());
         let (absolute_path, absolute_redacted) = secrets.mask(&source.path.to_string_lossy());
+        // Db paths are labels, not files an operator could open.
+        let absolute_path = (self.store_kind() == StoreKind::File).then_some(absolute_path);
         let value = json!({
             "id":accepted.ids[&source.path], "path":path,
             "absolute_path":absolute_path, "kind":if index==0 {"main"} else {"include"},
@@ -589,7 +624,7 @@ fn unavailable() -> ApiError {
         None,
     )
 }
-fn denied() -> ApiError {
+pub(super) fn denied() -> ApiError {
     ApiError::new(
         StatusCode::FORBIDDEN,
         ErrorCode::PermissionDenied,
@@ -621,7 +656,7 @@ fn unsupported() -> ApiError {
         None,
     )
 }
-fn invalid() -> ApiError {
+pub(super) fn invalid() -> ApiError {
     ApiError::new(
         StatusCode::BAD_REQUEST,
         ErrorCode::InvalidRequest,
@@ -753,6 +788,7 @@ pub(super) async fn get(
         .expect("source snapshot pinned by config publication guard");
     let active = state.diagnostics.read();
     value["generation_id"] = json!(format!("{}:{}", state.instance_id, active.generation));
+    value["store"] = state.observation.configuration.store_value();
     let diagnostics = active
         .buckets
         .static_diagnostics
@@ -1031,7 +1067,7 @@ fn project_diagnostic(
         "span":null,"code":diagnostic.code,"message":diagnostic.message})
 }
 
-fn resolve_source_path(root: &Path, label: &str) -> Result<PathBuf, ApiError> {
+pub(super) fn resolve_source_path(root: &Path, label: &str) -> Result<PathBuf, ApiError> {
     let input = Path::new(label);
     let path = if input.is_absolute() {
         input.strip_prefix(root).map_err(|_| denied())?

@@ -1,6 +1,5 @@
 use super::*;
 use std::collections::HashMap;
-use std::os::unix::fs::PermissionsExt as _;
 
 fn fixture(directory: &Path, extra: &str) -> LoadedConfig {
     let path = directory.join("config.dae");
@@ -218,6 +217,7 @@ fn unused_submissions_share_exact_materialization_byte_and_count_limits() {
     let validate = |limits| {
         validate_for_coordinator(
             loaded.clone(),
+            loaded.sources[0].path.parent(),
             &active,
             Path::new(&active.global.data_dir),
             limits,
@@ -424,6 +424,7 @@ fn repeated_aliases_cannot_retain_bodies_beyond_byte_or_source_limits() {
     ] {
         let mut capture = Capture::new(
             &loaded.sources,
+            loaded.sources[0].path.parent(),
             &loaded.config,
             Path::new(&loaded.config.global.data_dir),
             limits,
@@ -535,33 +536,15 @@ fn cache_body(
     data_dir: &Path,
     subscription: &honk_config::subscription::Subscription,
     body: &str,
-) -> PathBuf {
-    use base64::Engine as _;
-    use sha2::{Digest as _, Sha256};
-    let root = data_dir.join(".sub");
-    fs::create_dir_all(&root).unwrap();
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
-    let mut hash = Sha256::new();
-    for value in [
-        subscription.url.as_str(),
-        subscription.user_agent.as_deref().unwrap_or_default(),
-    ] {
-        hash.update((value.len() as u64).to_be_bytes());
-        hash.update(value.as_bytes());
-    }
-    for header in &subscription.headers {
-        for value in [&header.key, &header.value] {
-            hash.update((value.len() as u64).to_be_bytes());
-            hash.update(value.as_bytes());
-        }
-    }
-    let path = root.join(format!(
-        "{}.sub",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash.finalize())
-    ));
-    fs::write(&path, body).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
-    path
+) -> crate::subscription::SubscriptionStore {
+    fs::create_dir_all(data_dir).unwrap();
+    let store = crate::subscription::SubscriptionStore::in_dir(data_dir);
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(store.store_content(subscription, body.into()))
+        .unwrap();
+    store
 }
 
 #[test]
@@ -690,7 +673,10 @@ fn cached_presence_and_rebased_active_semantics_are_both_required() {
     );
     assert_eq!(
         admitted.dependencies[0].path,
-        fs::canonicalize(&cache).unwrap()
+        Path::new(&active.global.data_dir).join(format!(
+            "state/honk.db#subscription/{}",
+            crate::subscription::SubscriptionStore::key(&subscription)
+        ))
     );
     assert_eq!(
         admitted
@@ -704,22 +690,10 @@ fn cached_presence_and_rebased_active_semantics_are_both_required() {
         admitted.dependencies,
         "unchanged cached input must survive subscription identity rebasing",
     );
-    assert_eq!(
-        fs::metadata(cache.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o7777,
-        0o755
-    );
-    assert_eq!(
-        fs::metadata(&cache).unwrap().permissions().mode() & 0o7777,
-        0o400
-    );
     // Without the cache the subscription contributes no cached node; the
     // configuration is still admitted and the runtime's same-fetch node still
     // rebases onto it.
-    fs::remove_file(cache).unwrap();
+    cache.remove_body(&subscription);
     let admitted = admit(loaded, &active).unwrap();
     assert!(admitted.dependencies.is_empty());
     let names: Vec<_> = admitted
@@ -787,7 +761,8 @@ fn geodata_overlay_compiles_and_retains_verified_bytes_instead_of_disk() {
         GeoSourceSet::from_assets(&requirements, vec![(expected.clone(), bytes.into())]).unwrap();
     assert!(admit(loaded.clone(), &active).is_err());
     let admitted = validate_for_coordinator(
-        loaded,
+        loaded.clone(),
+        loaded.sources[0].path.parent(),
         &active,
         data_dir,
         SourceLimits::default(),
@@ -808,4 +783,28 @@ fn geodata_overlay_compiles_and_retains_verified_bytes_instead_of_disk() {
         admitted.geo_sources.unwrap().snapshots(&requirements),
         vec![expected]
     );
+}
+
+#[test]
+fn a_stored_body_over_the_budget_is_refused_before_it_is_read() {
+    let temp = tempfile::tempdir().unwrap();
+    let loaded = fixture(temp.path(), "");
+    let mut capture = Capture::new(
+        &loaded.sources,
+        loaded.sources[0].path.parent(),
+        &loaded.config,
+        Path::new(&loaded.config.global.data_dir),
+        SourceLimits::default(),
+        &[],
+    )
+    .unwrap();
+    let error = capture
+        .stored(
+            temp.path().join("state/honk.db#subscription/large"),
+            9 * 1024 * 1024,
+            DependencyReader::Subscription(0),
+            || panic!("the body was read before the budget check"),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
 }
