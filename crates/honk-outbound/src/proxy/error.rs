@@ -36,12 +36,28 @@ pub(crate) fn io_target_failure(error: &std::io::Error) -> bool {
 /// Recover explicit carrier provenance without inferring it from error text.
 pub fn node_failure(error: &anyhow::Error) -> bool {
     find_cause::<NodeFailure>(error.as_ref()).is_some()
-        || find_cause::<quinn::ConnectionError>(error.as_ref()).is_some()
 }
 
 pub(crate) fn io_node_failure(error: &std::io::Error) -> bool {
     find_cause::<NodeFailure>(error).is_some()
-        || find_cause::<quinn::ConnectionError>(error).is_some()
+}
+
+// Only proxy-owned QUIC carriers may add node provenance. End-to-end QUIC
+// (for example DoQ through a packet proxy) belongs to the requested target.
+pub(crate) fn quic_carrier_error(error: anyhow::Error) -> anyhow::Error {
+    if !node_failure(&error) && find_cause::<quinn::ConnectionError>(error.as_ref()).is_some() {
+        NodeFailure(error).into()
+    } else {
+        error
+    }
+}
+
+pub(crate) fn quic_carrier_io_error(error: std::io::Error) -> std::io::Error {
+    if !io_node_failure(&error) && find_cause::<quinn::ConnectionError>(&error).is_some() {
+        std::io::Error::new(error.kind(), NodeFailure(error.into()))
+    } else {
+        error
+    }
 }
 
 /// A local packet refusal that must not be treated as transport health.
@@ -109,19 +125,14 @@ pub fn packet_error_class(error: &std::io::Error) -> PacketErrorClass {
         return PacketErrorClass::Congestion;
     }
 
-    let mut source = error
-        .get_ref()
-        .map(|source| source as &(dyn std::error::Error + 'static));
-    while let Some(current) = source {
-        if let Some(quic_error) = current.downcast_ref::<quinn::SendDatagramError>() {
-            return match quic_error {
-                quinn::SendDatagramError::ConnectionLost(_) => PacketErrorClass::ConnectionDead,
-                quinn::SendDatagramError::TooLarge => PacketErrorClass::Congestion,
-                quinn::SendDatagramError::UnsupportedByPeer
-                | quinn::SendDatagramError::Disabled => PacketErrorClass::Other,
-            };
-        }
-        source = current.source();
+    if let Some(quic_error) = find_cause::<quinn::SendDatagramError>(error) {
+        return match quic_error {
+            quinn::SendDatagramError::ConnectionLost(_) => PacketErrorClass::ConnectionDead,
+            quinn::SendDatagramError::TooLarge => PacketErrorClass::Congestion,
+            quinn::SendDatagramError::UnsupportedByPeer | quinn::SendDatagramError::Disabled => {
+                PacketErrorClass::Other
+            }
+        };
     }
 
     if matches!(

@@ -82,6 +82,21 @@ fn packet_error_class_separates_backpressure_from_dead_tunnel() {
     );
     let too_large = std::io::Error::other(quinn::SendDatagramError::TooLarge);
     assert_eq!(packet_error_class(&too_large), PacketErrorClass::Congestion);
+    for (cause, expected) in [
+        (
+            quinn::SendDatagramError::ConnectionLost(quinn::ConnectionError::Reset),
+            PacketErrorClass::ConnectionDead,
+        ),
+        (
+            quinn::SendDatagramError::TooLarge,
+            PacketErrorClass::Congestion,
+        ),
+    ] {
+        let error = quic_carrier_io_error(std::io::Error::other(cause));
+        let shared = crate::SharedError::new(anyhow::Error::new(error).context("carrier send"));
+        let error = std::io::Error::other(std::io::Error::other(shared));
+        assert_eq!(packet_error_class(&error), expected);
+    }
 }
 
 #[test]
@@ -160,14 +175,45 @@ fn failure_provenance_survives_shared_io_context_without_losing_cause() {
     let error = std::io::Error::from(quinn::ReadError::ConnectionLost(
         quinn::ConnectionError::TimedOut,
     ));
+    let kind = error.kind();
+    assert_eq!(ScoreOutcome::from_io_error(&error), ScoreOutcome::Io(kind));
+    let shared = crate::SharedError::new(anyhow::Error::new(error).context("DoQ response"));
+    let error = std::io::Error::new(kind, shared);
+    assert_eq!(ScoreOutcome::from_io_error(&error), ScoreOutcome::Io(kind));
+    assert!(!node_failure(&anyhow::Error::new(error)));
+
+    let error = quic_carrier_io_error(std::io::Error::from(quinn::ReadError::ConnectionLost(
+        quinn::ConnectionError::TimedOut,
+    )));
+    assert_eq!(error.kind(), kind);
+    let shared = crate::SharedError::new(anyhow::Error::new(error).context("proxy carrier"));
+    let error = std::io::Error::other(std::io::Error::other(shared));
     assert_eq!(
         ScoreOutcome::from_io_error(&error),
         ScoreOutcome::NodeFailure
     );
+    assert!(matches!(
+        anyhow::Error::new(error)
+            .root_cause()
+            .downcast_ref::<quinn::ConnectionError>(),
+        Some(quinn::ConnectionError::TimedOut)
+    ));
+    for error in [
+        std::io::Error::from(quinn::ReadError::Reset(quinn::VarInt::from_u32(0))),
+        std::io::Error::from(quinn::WriteError::Stopped(quinn::VarInt::from_u32(0))),
+    ] {
+        let error = quic_carrier_io_error(error);
+        assert_eq!(
+            ScoreOutcome::from_io_error(&error),
+            ScoreOutcome::Io(std::io::ErrorKind::ConnectionReset),
+        );
+    }
     let error = anyhow::Error::new(TargetFailure(anyhow::Error::new(
         PacketRejection::Cancelled,
     )));
     assert_eq!(ScoreOutcome::from_error(&error), ScoreOutcome::Cancelled);
+    let error = anyhow::Error::new(NodeFailure(anyhow::Error::new(PacketRejection::Capacity)));
+    assert_eq!(ScoreOutcome::from_error(&error), ScoreOutcome::Rejected);
     assert!(!target_failure(&anyhow::Error::new(
         std::io::Error::from_raw_os_error(libc::ECONNREFUSED)
     )));

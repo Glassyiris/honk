@@ -53,6 +53,62 @@ impl SharedQuicEndpoint {
     }
 }
 
+fn endpoint_lost(mut error: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        if matches!(
+            error.downcast_ref::<quinn::ConnectError>(),
+            Some(quinn::ConnectError::EndpointStopping)
+        ) {
+            return true;
+        }
+        if matches!(
+            error.downcast_ref::<quinn::ConnectionError>(),
+            Some(quinn::ConnectionError::LocallyClosed)
+        ) {
+            return true;
+        }
+        if let Some(quinn::ConnectionError::TransportError(error)) = error.downcast_ref() {
+            return error.code == quinn::TransportErrorCode::INTERNAL_ERROR
+                && error.frame.is_none();
+        }
+        if let Some(h3::error::StreamError::ConnectionError(connection, ..)) = error.downcast_ref()
+        {
+            error = connection;
+            continue;
+        }
+        if let Some(h3::error::ConnectionError::Remote(
+            h3::quic::ConnectionErrorIncoming::Undefined(connection),
+            ..,
+        )) = error.downcast_ref()
+        {
+            error = connection.as_ref();
+            continue;
+        }
+        let source = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .map(|source| source as &(dyn std::error::Error + 'static))
+            .or_else(|| error.source());
+        let Some(source) = source else {
+            return false;
+        };
+        error = source;
+    }
+}
+
+pub(super) fn with_packet_cause(
+    endpoint: Option<&honk_outbound::quic::PacketTransportEndpoint>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    if honk_outbound::proxy::is_packet_rejection(&error) || !endpoint_lost(error.as_ref()) {
+        return error;
+    }
+    match endpoint.and_then(honk_outbound::quic::PacketTransportEndpoint::terminal_error) {
+        Some(cause) => anyhow::Error::new(cause).context(error),
+        None => error,
+    }
+}
+
 /// Connect `config` to `addr`, using either the shared direct endpoint or an
 /// endpoint backed by the selected proxy's PacketTransport. `label` prefixes
 /// error messages (`DoQ` / `DoH3 QUIC`).
@@ -77,7 +133,10 @@ async fn quic_connect(
         let connecting = owner
             .endpoint()
             .connect_with(config.clone(), addr, sni)
-            .map_err(|e| anyhow::anyhow!("{label} connect_with: {e}"))?;
+            .map_err(|error| {
+                with_packet_cause(Some(&owner), error.into())
+                    .context(format!("{label} connect_with"))
+            })?;
         (connecting, Some(owner))
     } else {
         let endpoint = direct_endpoint.get(addr.is_ipv6()).await?;
@@ -89,7 +148,10 @@ async fn quic_connect(
     let connection = tokio::time::timeout_at(deadline, connecting)
         .await
         .map_err(|_| anyhow::anyhow!("{label} handshake timed out"))?
-        .map_err(|e| anyhow::anyhow!("{label} handshake: {e}"))?;
+        .map_err(|error| {
+            with_packet_cause(owner.as_ref(), anyhow::Error::new(error))
+                .context(format!("{label} handshake"))
+        })?;
     Ok((connection, owner))
 }
 
@@ -119,4 +181,128 @@ pub(super) async fn quic_connect_endpoint(
         )
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use honk_outbound::group::ScoreOutcome;
+    use honk_outbound::proxy::{NodeFailure, PacketTransport};
+    use std::{io, net::SocketAddr, sync::Arc};
+
+    #[derive(Debug)]
+    struct FailedCarrier(SocketAddr);
+
+    #[async_trait::async_trait]
+    impl PacketTransport for FailedCarrier {
+        fn relay_addr(&self) -> SocketAddr {
+            self.0
+        }
+
+        async fn send_packet(&self, _data: &[u8]) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                NodeFailure(io::Error::from_raw_os_error(libc::ECONNRESET).into()),
+            ))
+        }
+
+        async fn recv_packet(&self, _data: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn dns_quic_keeps_carrier_causes_through_candidate_failure() {
+        let remote = "127.0.0.1:443".parse().unwrap();
+        let endpoint = Arc::new(
+            honk_outbound::quic::packet_transport_endpoint(Arc::new(FailedCarrier(remote)), remote)
+                .unwrap(),
+        );
+        let config = super::super::tests_proto::insecure_quic_config(b"doq").await;
+        let connection_error = Arc::new(parking_lot::Mutex::new(None));
+        let error = dial_candidates(
+            vec![remote],
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            "DoQ",
+            |address, _| {
+                let endpoint = Arc::clone(&endpoint);
+                let config = config.clone();
+                let observed = Arc::clone(&connection_error);
+                async move {
+                    let connection = endpoint
+                        .endpoint()
+                        .connect_with(config, address, "localhost")
+                        .map_err(|error| with_packet_cause(Some(&endpoint), error.into()))?;
+                    connection.await.map_err(|error| {
+                        *observed.lock() = Some(error.clone());
+                        with_packet_cause(Some(&endpoint), error.into())
+                    })
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            ScoreOutcome::from_error(&error),
+            ScoreOutcome::NodeFailure,
+            "{error:#?}; observed={:?}; adapter={:?}",
+            connection_error.lock(),
+            endpoint.terminal_error()
+        );
+        let failure: anyhow::Error =
+            super::super::lifecycle::SessionFailure::new(Arc::clone(&endpoint), error).into();
+        assert!(Arc::ptr_eq(
+            &super::super::lifecycle::SessionFailure::session(&failure).unwrap(),
+            &endpoint
+        ));
+        assert_eq!(
+            ScoreOutcome::from_error(&failure),
+            ScoreOutcome::NodeFailure
+        );
+        let h3_loss = h3::error::StreamError::ConnectionError(h3::error::ConnectionError::Remote(
+            h3::quic::ConnectionErrorIncoming::Undefined(Arc::new(
+                connection_error.lock().take().unwrap(),
+            )),
+        ));
+        assert_eq!(
+            ScoreOutcome::from_error(&with_packet_cause(Some(&endpoint), h3_loss.into())),
+            ScoreOutcome::NodeFailure
+        );
+        for error in [
+            h3::error::StreamError::StreamError {
+                code: h3::error::Code::H3_MESSAGE_ERROR,
+                reason: "malformed response headers".into(),
+            },
+            h3::error::StreamError::RemoteTerminate {
+                code: h3::error::Code::H3_REQUEST_CANCELLED,
+            },
+        ] {
+            assert_eq!(
+                ScoreOutcome::from_error(&with_packet_cause(Some(&endpoint), error.into())),
+                ScoreOutcome::Other
+            );
+        }
+
+        for error in [
+            io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                quinn::ReadError::Reset(7_u32.into()),
+            ),
+            io::Error::from(io::ErrorKind::UnexpectedEof),
+        ] {
+            let kind = error.kind();
+            let error = with_packet_cause(Some(&endpoint), error.into());
+            assert_eq!(ScoreOutcome::from_error(&error), ScoreOutcome::Io(kind));
+        }
+        let target_closed = with_packet_cause(
+            Some(&endpoint),
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: 7_u32.into(),
+                reason: bytes::Bytes::new(),
+            })
+            .into(),
+        );
+        assert!(!honk_outbound::proxy::node_failure(&target_closed));
+        endpoint.close(Duration::ZERO).await;
+    }
 }

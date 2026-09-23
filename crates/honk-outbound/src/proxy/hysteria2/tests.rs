@@ -917,6 +917,50 @@ async fn test_udp_transport_datagram_echo() {
 }
 
 #[tokio::test]
+async fn udp_carrier_close_is_node_failure() {
+    let server_addr = start_server(TEST_PASSWORD).await;
+    let node = test_node(server_addr.port(), TEST_PASSWORD);
+    let handler = Hysteria2Handler::new();
+    let client = handler.build_client(&node, None).await.unwrap();
+    let timeout = Duration::from_secs(5);
+    let transport = handler
+        .udp_transport_via_client(
+            Arc::clone(&client),
+            "192.0.2.53:53".parse().unwrap(),
+            None,
+            timeout,
+        )
+        .await
+        .unwrap();
+    let endpoint =
+        crate::quic::packet_transport_endpoint(Arc::clone(&transport), transport.relay_addr())
+            .unwrap();
+    let (conn, _) = client.connection(timeout).await.unwrap();
+    conn.close(quinn::VarInt::from_u32(0), b"carrier closed");
+    let error = transport.send_packet(b"query").await.unwrap_err();
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&error),
+        crate::group::ScoreOutcome::NodeFailure
+    );
+    let error = tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(error) = endpoint.terminal_error() {
+                break error;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&error),
+        crate::group::ScoreOutcome::NodeFailure
+    );
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+    endpoint.close(Duration::ZERO).await;
+}
+
+#[tokio::test]
 async fn test_udp_transport_size_rejection_preserves_fragmented_echo() {
     let server_addr = start_server(TEST_PASSWORD).await;
     let node = test_node(server_addr.port(), TEST_PASSWORD);

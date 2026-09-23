@@ -260,14 +260,14 @@ B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
 
 ### Score 工作预算与观测成本
 
-`/stats.score.businessStarts` 对嵌套组去重，统计唯一原始 Score 业务开始。`/stats.score.groups[].budget.tcp` 与 `.udp` 聚合保留的目标地址族作用域；不能把嵌套组总量相加当作唯一业务数。原始业务被选为试用时仍计数，重试、clone 与读取不产生另一份原始业务。节点专属工作早于 DNS／准入等待开始，与 reporter 的物理／逻辑 I/O 边界独立。
+`/stats.score.businessStarts` 对嵌套组去重，统计唯一原始 Score 业务开始。`/stats.score.groups[].budget.tcp` 与 `.udp` 聚合保留的目标地址族作用域；不能把嵌套组总量相加当作唯一业务数。原始业务被选为试用时仍计数，延续尝试即使切换网络或目标地址族，也不赚取另一份原始额度。节点专属工作早于代理 DNS／物理拨号准入等待开始，与 reporter 的物理／逻辑 I/O 边界独立。DNS 查询生命周期准入是在此前同步检查池是否开放，不是物理拨号准入等待。
 
 预算计数器反映已记录的账本值。只读等待和冷启动判定还会考虑过期未开始预留中可退回的额度，但不更新 `refunded`、`expired` 或其他计数器。
 
 | 字段 | 含义 |
 | --- | --- |
 | `businessStarts`、`scopes`、`earningPeriod` | 保留作用域原始开始数之和、作用域数，以及各自固定赚取周期的最大值（不能作为合并作用域预算公式的分母）。每个作用域在创建时固定 `q = clamp(2n,16,64)` 和冷启动额度 `B`；`spent + reserved <= B + floor(businessStarts/q)` 按作用域成立。 |
-| `sources.cold`、`sources.periodic`、`sources.recovery` | 按来源区分的已开始工作：冷额度试用、已赚额度试用、无需可选预算的恢复重试。普通非试用没有来源桶；`recovery` 不是可选试用或新原始业务。 |
+| `sources.cold`、`sources.periodic`、`sources.recovery` | 按来源区分的已开始工作：冷额度试用、已赚额度试用、不增加可选额度的延续尝试。`recovery` 包含 TCP 替代、DNS 改路／UDP 转 TCP 和 UI 重定向，不限于出错后的重试；它既不是可选试用，也不是新原始业务。普通非试用没有来源桶。 |
 | `trialStarts`、`spent`、`reserved` | 已开始可选试用、累计已支出 token，以及尚未开始的 token 预留。开始只支出一次，开始后取消不退款。 |
 | `coldAllowance`、`coldAvailable`、`earnedAvailable` | 固定初始额度与当前可用额度的合计。每作用域最多保留八个未花费已赚 token。时间、读取、目标变动与证据过期不赚额度，保留作用域在 reload／成员变化后不重置。 |
 | `budgetBlocked`、`inFlightBlocked`、`refunded`、`expired` | 预留被拒计数、最后引用释放／未开始失效的退款数，以及在途跟踪项过期数。只有未开始预留可退款；跟踪过期不退回已开始工作的支出。 |

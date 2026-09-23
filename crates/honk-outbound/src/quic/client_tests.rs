@@ -115,6 +115,56 @@ async fn test_client(port: u16) -> QuicClient<()> {
     QuicClient::new("127.0.0.1", port, "localhost", config)
 }
 
+#[tokio::test]
+async fn closed_proxy_stream_is_node_failure_but_end_to_end_quic_is_not() {
+    use crate::group::ScoreOutcome;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (endpoint, addr) = testutil::server_endpoint(&[b"h3"], true).unwrap();
+    let accepted = tokio::spawn({
+        let endpoint = endpoint.clone();
+        async move { endpoint.accept().await.unwrap().await.unwrap() }
+    });
+    let client = test_client(addr.port()).await;
+    let (conn, _) = client
+        .connection_with(Duration::from_secs(1), |_| async { Ok(()) })
+        .await
+        .unwrap();
+    let _server_conn = accepted.await.unwrap();
+    let (_raw_send, mut raw_recv) = conn.open_bi().await.unwrap();
+    let (send, recv) = conn.open_bi().await.unwrap();
+    let mut stream = QuicBiStream::new(send, recv);
+    conn.close(VarInt::from_u32(0), b"carrier closed");
+
+    let raw = AsyncReadExt::read(&mut raw_recv, &mut [0])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        ScoreOutcome::from_io_error(&raw),
+        ScoreOutcome::Io(raw.kind())
+    );
+    let error = stream.read(&mut [0]).await.unwrap_err();
+    assert_eq!(error.kind(), raw.kind());
+    assert_eq!(
+        ScoreOutcome::from_io_error(&error),
+        ScoreOutcome::NodeFailure
+    );
+    let error = stream.write_all(b"request").await.unwrap_err();
+    assert_eq!(
+        ScoreOutcome::from_io_error(&error),
+        ScoreOutcome::NodeFailure
+    );
+    let mut chunks = [bytes::Bytes::from_static(b"request")];
+    let error = std::future::poll_fn(|cx| stream.poll_write_chunks(cx, &mut chunks))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        ScoreOutcome::from_io_error(&error),
+        ScoreOutcome::NodeFailure
+    );
+    endpoint.close(VarInt::from_u32(0), b"test complete");
+}
+
 #[derive(Debug, Default)]
 struct TestConnState {
     open: Arc<std::sync::atomic::AtomicUsize>,

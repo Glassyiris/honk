@@ -13,6 +13,7 @@ use super::framing::{
     force_dns_id_zero, read_length_prefixed, restore_dns_id, write_length_prefixed,
 };
 use super::lifecycle::{LifecycleSlot, SessionFailure};
+use super::quic::with_packet_cause;
 use super::{
     DialContext, SharedQuicEndpoint, dns_quic_config, exchange_with_retry, quic_connect_endpoint,
 };
@@ -85,23 +86,33 @@ impl DoqClient {
         if let Some(reporter) = reporter {
             reporter.setup_succeeded();
         }
+        let io_error = |error: anyhow::Error| {
+            if error.downcast_ref::<std::io::Error>().is_some() {
+                with_packet_cause(conn.endpoint.as_ref(), error)
+            } else {
+                error
+            }
+        };
         tokio::time::timeout(self.dial.query_timeout, async {
-            let (mut send, mut recv) = conn
-                .connection
-                .open_bi()
-                .await
-                .map_err(|e| anyhow::anyhow!("DoQ open_bi: {e}"))?;
+            let (mut send, mut recv) = conn.connection.open_bi().await.map_err(|error| {
+                with_packet_cause(conn.endpoint.as_ref(), error.into()).context("DoQ open_bi")
+            })?;
 
             let mut wire = raw_query.to_vec();
             let orig_id = force_dns_id_zero(&mut wire);
-            write_length_prefixed(&mut send, &wire).await?;
-            send.finish()
-                .map_err(|e| anyhow::anyhow!("DoQ finish send: {e}"))?;
+            write_length_prefixed(&mut send, &wire)
+                .await
+                .map_err(io_error)?;
+            send.finish().map_err(|error| {
+                with_packet_cause(conn.endpoint.as_ref(), error.into()).context("DoQ finish send")
+            })?;
             if let Some(reporter) = reporter {
                 reporter.tx(raw_query.len() as u64);
             }
 
-            let mut resp = read_length_prefixed(&mut recv, self.dial.query_timeout).await?;
+            let mut resp = read_length_prefixed(&mut recv, self.dial.query_timeout)
+                .await
+                .map_err(io_error)?;
             if let Some(reporter) = reporter
                 && super::is_valid_response(raw_query, &resp)
             {

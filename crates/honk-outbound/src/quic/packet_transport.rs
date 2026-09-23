@@ -39,7 +39,7 @@ struct QueuedTransportPacket {
 #[derive(Debug)]
 struct TransportIoError {
     kind: io::ErrorKind,
-    message: String,
+    cause: crate::SharedError,
     rejection: Option<PacketRejection>,
 }
 
@@ -48,7 +48,7 @@ impl TransportIoError {
         let rejection = io_packet_rejection(&error);
         Self {
             kind: error.kind(),
-            message: error.to_string(),
+            cause: crate::SharedError::new(error.into()),
             rejection,
         }
     }
@@ -65,7 +65,7 @@ impl TransportIoError {
 
     fn to_io_error(&self) -> io::Error {
         self.rejection.map_or_else(
-            || io::Error::new(self.kind, self.message.clone()),
+            || io::Error::new(self.kind, self.cause.clone()),
             io::Error::from,
         )
     }
@@ -468,6 +468,12 @@ impl PacketTransportEndpoint {
         &self.endpoint
     }
 
+    /// Recover an already-recorded packet-carrier failure when Quinn reports
+    /// only endpoint loss. This does not probe or close the transport.
+    pub fn terminal_error(&self) -> Option<io::Error> {
+        self.socket.terminal_error()
+    }
+
     /// Close the Quinn endpoint and wait up to `timeout` for it to drain.
     /// A zero timeout leaves the adapter workers alive until Quinn releases
     /// the socket; other closes abort and join them.
@@ -538,7 +544,9 @@ pub async fn quic_handshake_probe(
         .context("create QUIC connecting")?;
     let conn = tokio::time::timeout(timeout, connecting)
         .await
-        .context("QUIC handshake timeout")??;
+        .context("QUIC handshake timeout")
+        .and_then(|result| result.map_err(anyhow::Error::from))
+        .map_err(|error| endpoint.terminal_error().map_or(error, anyhow::Error::from))?;
     let elapsed = start.elapsed();
     conn.close(quinn::VarInt::from_u32(0), b"probe");
     drop(conn);
@@ -547,419 +555,4 @@ pub async fn quic_handshake_probe(
 }
 
 #[cfg(test)]
-mod probe_tests {
-    use super::super::{QuicClientOptions, client_config, testutil};
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[test]
-    fn packet_rejection_survives_transport_error_storage() {
-        let stored = TransportIoError::new(io::Error::from(PacketRejection::InvalidSize));
-        assert_eq!(
-            packet_error_class(&stored.to_io_error()),
-            PacketErrorClass::Rejected
-        );
-    }
-
-    #[derive(Debug)]
-    struct SendFailedPacketTransport;
-
-    #[async_trait::async_trait]
-    impl PacketTransport for SendFailedPacketTransport {
-        fn relay_addr(&self) -> SocketAddr {
-            "127.0.0.1:443".parse().unwrap()
-        }
-
-        async fn send_packet(&self, _data: &[u8]) -> io::Result<()> {
-            Err(io::Error::from(io::ErrorKind::ConnectionReset))
-        }
-
-        async fn recv_packet(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-            std::future::pending().await
-        }
-    }
-
-    #[derive(Debug)]
-    struct ReceiveFailedPacketTransport;
-
-    #[async_trait::async_trait]
-    impl PacketTransport for ReceiveFailedPacketTransport {
-        fn relay_addr(&self) -> SocketAddr {
-            "127.0.0.1:443".parse().unwrap()
-        }
-
-        async fn send_packet(&self, _data: &[u8]) -> io::Result<()> {
-            Ok(())
-        }
-
-        async fn recv_packet(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-            Err(io::Error::from(io::ErrorKind::ConnectionReset))
-        }
-    }
-
-    #[derive(Debug)]
-    struct AdmissionPacketTransport {
-        confirmed: AtomicUsize,
-        ordinary: AtomicUsize,
-        ordinary_sent: tokio::sync::Notify,
-    }
-
-    #[async_trait::async_trait]
-    impl PacketTransport for AdmissionPacketTransport {
-        fn relay_addr(&self) -> SocketAddr {
-            "127.0.0.1:443".parse().unwrap()
-        }
-
-        async fn send_packet(&self, _data: &[u8]) -> io::Result<()> {
-            self.ordinary.fetch_add(1, Ordering::SeqCst);
-            self.ordinary_sent.notify_one();
-            Ok(())
-        }
-
-        async fn send_packet_confirmed(&self, _data: &[u8]) -> io::Result<()> {
-            self.confirmed.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        async fn recv_packet(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-            std::future::pending().await
-        }
-    }
-
-    #[derive(Debug)]
-    struct CongestedPacketTransport {
-        sends: AtomicUsize,
-        sent_after_congestion: tokio::sync::Notify,
-    }
-
-    #[async_trait::async_trait]
-    impl PacketTransport for CongestedPacketTransport {
-        fn relay_addr(&self) -> SocketAddr {
-            "127.0.0.1:443".parse().unwrap()
-        }
-
-        fn send_timeout_is_congestion(&self) -> bool {
-            true
-        }
-
-        async fn send_packet(&self, _data: &[u8]) -> io::Result<()> {
-            if self.sends.fetch_add(1, Ordering::SeqCst) == 0 {
-                Err(io::Error::from(io::ErrorKind::TimedOut))
-            } else {
-                self.sent_after_congestion.notify_one();
-                Ok(())
-            }
-        }
-
-        async fn recv_packet(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-            std::future::pending().await
-        }
-    }
-
-    #[derive(Debug)]
-    struct SequencePacketTransport {
-        remote: SocketAddr,
-        packets: Mutex<std::collections::VecDeque<(Vec<u8>, SocketAddr)>>,
-        full_cone: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl PacketTransport for SequencePacketTransport {
-        fn relay_addr(&self) -> SocketAddr {
-            self.remote
-        }
-
-        fn allows_full_cone_replies(&self) -> bool {
-            self.full_cone
-        }
-
-        async fn send_packet(&self, _data: &[u8]) -> io::Result<()> {
-            Ok(())
-        }
-
-        async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-            let Some((packet, source)) = self.packets.lock().await.pop_front() else {
-                return std::future::pending().await;
-            };
-            let len = packet.len().min(buf.len());
-            buf[..len].copy_from_slice(&packet[..len]);
-            Ok((len, source))
-        }
-    }
-
-    #[derive(Debug)]
-    struct UdpPacketTransport {
-        socket: tokio::net::UdpSocket,
-        remote: SocketAddr,
-    }
-
-    #[async_trait::async_trait]
-    impl PacketTransport for UdpPacketTransport {
-        fn relay_addr(&self) -> SocketAddr {
-            self.remote
-        }
-
-        async fn send_packet(&self, data: &[u8]) -> io::Result<()> {
-            self.socket.send(data).await?;
-            Ok(())
-        }
-
-        async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-            Ok((self.socket.recv(buf).await?, self.remote))
-        }
-    }
-
-    #[tokio::test]
-    async fn packet_transport_failures_surface() {
-        let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
-        let transmit = quinn::udp::Transmit {
-            destination: remote,
-            ecn: None,
-            contents: b"initial",
-            segment_size: None,
-            src_ip: None,
-        };
-        let send_socket = TransportQuinnSocket::new(Arc::new(SendFailedPacketTransport), remote);
-        quinn::AsyncUdpSocket::try_send(&*send_socket, &transmit).unwrap();
-
-        let mut data = [0; 64];
-        let mut meta = [quinn::udp::RecvMeta::default()];
-        let send_error = tokio::time::timeout(
-            Duration::from_secs(1),
-            std::future::poll_fn(|cx| {
-                let mut bufs = [std::io::IoSliceMut::new(&mut data)];
-                quinn::AsyncUdpSocket::poll_recv(&*send_socket, cx, &mut bufs, &mut meta)
-            }),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
-        assert_eq!(send_error.kind(), io::ErrorKind::ConnectionAborted);
-        assert_eq!(
-            quinn::AsyncUdpSocket::try_send(&*send_socket, &transmit)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::ConnectionAborted
-        );
-
-        let recv_socket = TransportQuinnSocket::new(Arc::new(ReceiveFailedPacketTransport), remote);
-        let recv_error = tokio::time::timeout(
-            Duration::from_secs(1),
-            std::future::poll_fn(|cx| {
-                let mut bufs = [std::io::IoSliceMut::new(&mut data)];
-                quinn::AsyncUdpSocket::poll_recv(&*recv_socket, cx, &mut bufs, &mut meta)
-            }),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
-        assert_eq!(recv_error.kind(), io::ErrorKind::ConnectionAborted);
-    }
-
-    #[tokio::test]
-    async fn zero_timeout_close_does_not_surface_adapter_error() {
-        let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
-        let endpoint = packet_transport_endpoint(
-            Arc::new(AdmissionPacketTransport {
-                confirmed: AtomicUsize::new(0),
-                ordinary: AtomicUsize::new(0),
-                ordinary_sent: tokio::sync::Notify::new(),
-            }),
-            remote,
-        )
-        .unwrap();
-
-        endpoint.close(Duration::ZERO).await;
-        tokio::task::yield_now().await;
-
-        let mut data = [0; 1];
-        let mut meta = [quinn::udp::RecvMeta::default()];
-        let receive = tokio::time::timeout(
-            Duration::from_millis(10),
-            std::future::poll_fn(|cx| {
-                let mut bufs = [std::io::IoSliceMut::new(&mut data)];
-                quinn::AsyncUdpSocket::poll_recv(&*endpoint.socket, cx, &mut bufs, &mut meta)
-            }),
-        )
-        .await;
-        assert!(
-            receive.is_err(),
-            "graceful close surfaced an adapter I/O error"
-        );
-    }
-
-    #[tokio::test]
-    async fn packet_transport_congestion_drops_only_one_datagram() {
-        let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
-        let transport = Arc::new(CongestedPacketTransport {
-            sends: AtomicUsize::new(0),
-            sent_after_congestion: tokio::sync::Notify::new(),
-        });
-        let socket = TransportQuinnSocket::new(transport.clone(), remote);
-        for contents in [b"dropped".as_slice(), b"forwarded".as_slice()] {
-            quinn::AsyncUdpSocket::try_send(
-                &*socket,
-                &quinn::udp::Transmit {
-                    destination: remote,
-                    ecn: None,
-                    contents,
-                    segment_size: None,
-                    src_ip: None,
-                },
-            )
-            .unwrap();
-        }
-
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            transport.sent_after_congestion.notified(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(transport.sends.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn packet_transport_confirms_only_the_first_datagram() {
-        let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
-        let transport = Arc::new(AdmissionPacketTransport {
-            confirmed: AtomicUsize::new(0),
-            ordinary: AtomicUsize::new(0),
-            ordinary_sent: tokio::sync::Notify::new(),
-        });
-        let socket = TransportQuinnSocket::new(transport.clone(), remote);
-        for contents in [b"first".as_slice(), b"second".as_slice()] {
-            quinn::AsyncUdpSocket::try_send(
-                &*socket,
-                &quinn::udp::Transmit {
-                    destination: remote,
-                    ecn: None,
-                    contents,
-                    segment_size: None,
-                    src_ip: None,
-                },
-            )
-            .unwrap();
-        }
-
-        tokio::time::timeout(Duration::from_secs(1), transport.ordinary_sent.notified())
-            .await
-            .unwrap();
-        assert_eq!(transport.confirmed.load(Ordering::SeqCst), 1);
-        assert_eq!(transport.ordinary.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn packet_transport_socket_is_peer_pinned_and_family_matched() {
-        let remote: SocketAddr = "[2001:db8::2]:443".parse().unwrap();
-        let wrong: SocketAddr = "[2001:db8::3]:443".parse().unwrap();
-        let socket = TransportQuinnSocket::new(
-            Arc::new(SequencePacketTransport {
-                remote,
-                full_cone: false,
-                packets: Mutex::new(std::collections::VecDeque::from([
-                    (b"wrong".to_vec(), wrong),
-                    (vec![0x5a; 65], remote),
-                ])),
-            }),
-            remote,
-        );
-        assert!(
-            quinn::AsyncUdpSocket::local_addr(&*socket)
-                .unwrap()
-                .is_ipv6()
-        );
-
-        let error = quinn::AsyncUdpSocket::try_send(
-            &*socket,
-            &quinn::udp::Transmit {
-                destination: wrong,
-                ecn: None,
-                contents: b"wrong peer",
-                segment_size: None,
-                src_ip: None,
-            },
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-
-        let mut data = [0u8; 64];
-        let mut meta = [quinn::udp::RecvMeta::default()];
-        let error = tokio::time::timeout(
-            Duration::from_secs(1),
-            std::future::poll_fn(|cx| {
-                let mut bufs = [std::io::IoSliceMut::new(&mut data)];
-                quinn::AsyncUdpSocket::poll_recv(&*socket, cx, &mut bufs, &mut meta)
-            }),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[tokio::test]
-    async fn packet_transport_socket_accepts_full_cone_reply_metadata() {
-        let remote: SocketAddr = "[2001:db8::2]:443".parse().unwrap();
-        let reply_source: SocketAddr = "[2001:db8::3]:443".parse().unwrap();
-        let socket = TransportQuinnSocket::new(
-            Arc::new(SequencePacketTransport {
-                remote,
-                packets: Mutex::new(std::collections::VecDeque::from([(
-                    b"accepted".to_vec(),
-                    reply_source,
-                )])),
-                full_cone: true,
-            }),
-            remote,
-        );
-        let mut data = [0; 64];
-        let mut meta = [quinn::udp::RecvMeta::default()];
-
-        let received = tokio::time::timeout(
-            Duration::from_secs(1),
-            std::future::poll_fn(|cx| {
-                let mut bufs = [std::io::IoSliceMut::new(&mut data)];
-                quinn::AsyncUdpSocket::poll_recv(&*socket, cx, &mut bufs, &mut meta)
-            }),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(received, 1);
-        assert_eq!(&data[..meta[0].len], b"accepted");
-        assert_eq!(meta[0].addr, remote);
-    }
-
-    #[tokio::test]
-    async fn handshake_crosses_packet_transport_adapter() {
-        let (server, remote) = testutil::server_endpoint(&[b"h3"], true).unwrap();
-        let server_task = tokio::spawn(async move {
-            server.accept().await.unwrap().await.unwrap();
-        });
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        socket.connect(remote).await.unwrap();
-        let mut node = honk_config::node::Node {
-            outbound: honk_config::node::OutboundConfig::Hysteria2(Default::default()),
-            ..Default::default()
-        };
-        let tls = node.tls_mut().unwrap();
-        tls.sni = Some("localhost".into());
-        tls.skip_cert_verify = true;
-        let config = client_config(&node, &[b"h3"], QuicClientOptions::default())
-            .await
-            .unwrap();
-
-        quic_handshake_probe(
-            Arc::new(UdpPacketTransport { socket, remote }),
-            remote,
-            "localhost",
-            &config,
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
-        server_task.await.unwrap();
-    }
-}
+mod probe_tests;

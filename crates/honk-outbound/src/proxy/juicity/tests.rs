@@ -202,3 +202,36 @@ async fn test_udp_transport_echo() {
         .unwrap();
     assert_eq!(&buf[..n], b"second");
 }
+
+#[tokio::test]
+async fn udp_carrier_close_is_node_failure() {
+    let server_addr = start_server(TEST_PASSWORD).await;
+    let node = test_node(server_addr.port(), TEST_PASSWORD);
+    let handler = JuicityHandler::new();
+    let client = handler.build_client(&node, None).await.unwrap();
+    let timeout = Duration::from_secs(5);
+    let transport = handler
+        .udp_transport_via_client(
+            Arc::clone(&client),
+            "192.0.2.53:53".parse().unwrap(),
+            None,
+            timeout,
+        )
+        .await
+        .unwrap();
+    let (conn, _) = client.connection(timeout).await.unwrap();
+    conn.close(VarInt::from_u32(0), b"carrier closed");
+    let error = transport.send_packet(b"query").await.unwrap_err();
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&error),
+        crate::group::ScoreOutcome::NodeFailure
+    );
+    let error = tokio::time::timeout(timeout, transport.recv_packet(&mut [0; 64]))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&error),
+        crate::group::ScoreOutcome::NodeFailure
+    );
+}

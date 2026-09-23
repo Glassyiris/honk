@@ -671,11 +671,7 @@ impl Hysteria2Handler {
                 async move { client.connection(timeout).await }
             },
             connect_timeout,
-            move |conn| async move {
-                conn.open_bi()
-                    .await
-                    .map_err(|error| anyhow!("Hysteria2: open stream: {error}"))
-            },
+            move |conn| async move { conn.open_bi().await.context("Hysteria2: open stream") },
             |_| true,
             "Hysteria2",
         )
@@ -911,7 +907,8 @@ impl PacketTransport for Hy2UdpTransport {
                 .conn
                 .send_datagram_wait(bytes::Bytes::from(packet))
                 .await
-                .map_err(io::Error::other)?;
+                .map_err(io::Error::other)
+                .map_err(super::quic_carrier_io_error)?;
         }
         Ok(())
     }

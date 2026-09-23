@@ -73,7 +73,8 @@ aho-corasick.workspace = true
 h2.workspace = true
 http.workspace = true
 quinn.workspace = true
-h3.workspace = true
+# Distinguish endpoint loss from H3 response errors without parsing error text.
+h3 = { workspace = true, features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 h3-quinn.workspace = true
 
 # Persistence (cache_file / cachedb)

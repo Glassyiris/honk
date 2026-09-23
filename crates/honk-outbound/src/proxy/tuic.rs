@@ -818,7 +818,8 @@ impl PacketTransport for TuicUdpTransport {
             data,
         )
         .await
-        .map_err(io::Error::other)
+        .map_err(|error| io::Error::other(crate::SharedError::new(error)))
+        .map_err(super::quic_carrier_io_error)
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {

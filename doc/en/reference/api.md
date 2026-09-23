@@ -294,14 +294,14 @@ Comparison labels describe empirical evidence, not whether the switching margin 
 
 ### Score work budget and observed costs
 
-`/stats.score.businessStarts` counts unique original Score business starts across nested groups. `/stats.score.groups[].budget.tcp` and `.udp` aggregate retained target-family scopes; nested group totals must not be summed as unique businesses. Original work counts even when selected as a trial; retries, clones and reads do not create another original. Node-specific work starts before DNS/admission waits, independently of the reporter's physical/logical I/O boundary.
+`/stats.score.businessStarts` counts unique original Score business starts across nested groups. `/stats.score.groups[].budget.tcp` and `.udp` aggregate retained target-family scopes; nested group totals must not be summed as unique businesses. Original work counts even when selected as a trial; continuations, including a different network or target family, earn no additional original credit. Node-specific work starts before proxy DNS or physical-dial admission waits, independently of the reporter's physical/logical I/O boundary. DNS query lifecycle admission is a synchronous open/closed check before that work, not a physical-admission wait.
 
 Budget counters report recorded ledger values. Readonly wait and cold-start decisions also account for credit refundable from expired pending reservations; they do not update `refunded`, `expired` or other counters.
 
 | Fields | Meaning |
 | --- | --- |
 | `businessStarts`, `scopes`, `earningPeriod` | Original starts summed over retained scopes, scope count, and the maximum frozen earning period across them (not a denominator for a combined-scope budget formula). Each scope freezes `q = clamp(2n,16,64)` and cold allowance `B` at creation; `spent + reserved <= B + floor(businessStarts/q)` applies per scope. |
-| `sources.cold`, `sources.periodic`, `sources.recovery` | Started work by source: cold-token trial, earned-token trial, or budget-neutral recovery retry. Ordinary non-trial work has no source bucket. `recovery` is not an optional trial or new original business. |
+| `sources.cold`, `sources.periodic`, `sources.recovery` | Started work by source: cold-token trial, earned-token trial, or budget-neutral continuation. `recovery` includes TCP replacement, DNS rerouting/UDP-to-TCP fallback and UI redirects, not only retries after errors; it is neither an optional trial nor new original business. Ordinary non-trial work has no source bucket. |
 | `trialStarts`, `spent`, `reserved` | Begun optional trials, cumulative spent tokens, and outstanding unbegun token reservations. Begin spends once; cancellation after begin does not refund. |
 | `coldAllowance`, `coldAvailable`, `earnedAvailable` | Summed frozen initial allowances and current available credit. Each scope retains at most eight unspent earned tokens. Time, reads, target churn and evidence expiry earn none; retained reload/membership changes do not reset currency. |
 | `budgetBlocked`, `inFlightBlocked`, `refunded`, `expired` | Denied reservation counts, last-reference/unbegun invalidation refunds, and expired in-flight tracking entries. Only unbegun reservations refund; tracking expiry never refunds begun work. |
