@@ -33,9 +33,9 @@ Configuration diagnostics are collected before tracing setup. An early load or o
 
 Startup keeps kernel admission closed until userspace can receive every redirected flow:
 
-1. Load and validate the configuration, select `global.data_dir`, raise `RLIMIT_NOFILE`, and take one immutable descriptor-budget snapshot.
-2. Restore persisted subscriptions before network refresh. Only subscriptions without a valid restored body participate in the five-second first-fetch grace period.
-3. Select the backend. Real mode takes `/run/honk-core.lock` and publishes the process PID in the locked file; `honk-core reload` reads that PID and sends `SIGHUP`. Mock mode does not take the process-global lock.
+1. Real mode takes `/run/honk-core.lock`, waiting up to 240 seconds for a previous instance to exit, and publishes the process PID in the locked file; `honk-core reload` reads that PID and sends `SIGHUP`. A successor that cannot take the lock exits before it reads the configuration or opens the state db. Mock mode does not take the process-global lock.
+2. Load and validate the configuration, select `global.data_dir`, raise `RLIMIT_NOFILE`, and take one immutable descriptor-budget snapshot.
+3. Restore persisted subscriptions before network refresh. Only subscriptions without a valid restored body participate in the five-second first-fetch grace period.
 4. After the real-instance lock handoff, probe the fixed NFQUEUE queue prerequisites. Mock/no-`ebpf` mode or a failed preflight logs a warning and disables NFQUEUE for this process; the preflight does not reject the reserved nftables table because installation reclaims stale owned state.
 5. In real mode, create the FD-owned `daens` namespace and the `dae0`/`dae0peer` link through rtnetlink. The engine tries an L2 netkit pair first and falls back to veth only when the kernel reports netkit unsupported. The process stays in the host namespace; only synchronous socket, link, and attachment operations enter `daens` through scoped `setns` calls.
 6. Load the BPF object and attach the real datapath. The default object is embedded with `include_bytes!`; `--bpf-object` supplies a runtime override. With the `ebpf` feature, `build.rs` locates the object, rejects stale or BTF-less output, rebuilds it with nightly after removing inherited `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS`, verifies `.BTF`, and copies it into `OUT_DIR` for embedding.

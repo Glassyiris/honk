@@ -344,11 +344,7 @@ fn pause_joins_queued_blocking_persistence() {
         .unwrap();
     runtime.block_on(async {
         let directory = tempfile::tempdir().unwrap();
-        let store = SubscriptionStore::open_with_legacy(
-            directory.path().join("store"),
-            [directory.path().join("old1"), directory.path().join("old2")],
-        )
-        .unwrap();
+        let store = SubscriptionStore::in_dir(directory.path());
         let subscription = authorized(uuid::Uuid::new_v4(), 1, "http://127.0.0.1:9".into());
         let mut state = state();
         state.reconcile(vec![subscription.clone()]);

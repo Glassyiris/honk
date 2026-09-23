@@ -20,7 +20,7 @@
 | `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | 自动配置 sysctl 的兼容开关。当前运行时不会按该字段分支；真实数据路径会执行固定的 best-effort sysctl 设置。该设置会把 `net.ipv6.conf.all.forwarding` 固定为 1，并因此向每个已解析的 WAN 接口（含运行期晚挂载的）写入 `net.ipv6.conf.<wan>.accept_ra=2`，保证 SLAAC/RA 学来的 IPv6 默认路由不会因 forwarding 被固定而过期消失。使用 systemd-networkd 的主机建议在 WAN 的 `.network` 文件中显式配置 `IPv6AcceptRA=yes`。 |
 | `nfqueue_enable` | `nfqueue_enable` | `true` | 将有歧义的 LAN 转发 UDP 原始包保留在 NFQUEUE，直到用户态得到终态决策。需要真实 eBPF 后端；单实例交接后若固定队列不可用，或数据路径准入前的队列/规则/健康检查失败，honk 记录 warning，仅在本进程关闭该功能且不改写配置。持久化 token generation 恢复失败仍为 fatal，因为分配器状态无法确定。安装阶段会回收保留的 nftables table。修改后需重启。新配置应使用此字段；已弃用的 `experimental.udp_nfqueue.enabled` 写法仍接受并给出迁移 warning；两者同时存在时以此 canonical 字段为准。 |
 | `data_dir` | `data_dir` | `"/var/lib/honk"` | 生成状态和相对运行时资源的非空绝对根目录。缺失目录会递归创建；每个候选目录都必须通过私有的 create-new/remove 探测。候选目录不可用时，仅回退到通过同一探测的工作目录。旧根目录 `/var/share/honk`（`LEGACY_DATA_DIR`）中的已有资源按下方各路径规则继续使用；honk 不会自动迁移它们；可写状态仍在原位置更新。修改后需重启。 |
-| `store_subscribe` | `store_subscribe` | `true` | 将每个订阅最近一次有效正文持久化到 `data_dir/.sub`，供启动和重载恢复；修改后需重启。 |
+| `store_subscribe` | `store_subscribe` | `true` | 将每个订阅最近一次有效正文持久化到状态数据库 `data_dir/state/honk.db`，供启动和重载恢复；修改后需重启。 |
 | `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | TCP/HTTP 健康检查 URL，逗号分隔。健康检查循环使用第一个值；空列表退回普通 TCP 检查。URI 解析分别处理用户信息、带方括号的 IPv6、端口、路径、查询和片段。用户信息不会生成授权头；请求保留路径和查询，不发送片段，无斜杠的查询以 `/?query` 发送。HTTP/HTTPS 默认端口为 80/443；无协议的健康检查目标使用 HTTP/80。URLTest 的无协议目标使用 HTTPS/443，并向解码后的路径和查询串发送 HEAD。 |
 | `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | URL 健康检查发送的 HTTP 方法；空值按 `HEAD` 处理。 |
 | `udp_check_dns` | `udp_check_dns` | `["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"]` | UDP 健康检查的 DNS 目标，逗号分隔。裸 IPv4/IPv6、`[IPv6]` 和域名默认使用端口 `53`；显式端口必须为 `1..65535` 内的整数。无效括号或端口会使校验失败，并产生带位置的诊断。优先选择第一个 IP 字面量，否则解析第一个域名。解析与 Score 共用解码后的主机和端口，解析完成后仍保留域名身份。 |
@@ -113,7 +113,7 @@ UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或
 | `global.log_file` | 相对路径始终通过仅用于创建的路径 helper 解析为 `<data_dir>/<path>`，启动时创建父目录；不会读取或迁移 `/var/share/honk` 中已有的日志。绝对路径保持原样。在 Linux 上，新日志文件使用 mode `0600`；符号链接与非普通文件会被拒绝，已有普通文件的权限保持不变。honk 只追加写且不负责轮转，需要时使用系统日志轮转工具。控制台与文件里的时间戳都是本机本地时间并带 UTC 偏移（`2026-09-12T02:30:15.123456+10:00`）。 |
 | `experimental.cache_file.path` | 不再决定存储位置，状态保存在 `<data_dir>/state/honk.db`。首次启动时按旧的解析顺序读取一次，用于导入旧 `cache.db`（见[升级说明](./experimental.md#从-cachedb-升级)）。 |
 | `experimental.clash_api.external_ui` | 依次优先使用已存在的 `<data_dir>/<path>`、已存在的 `/var/share/honk/<path>`，以及已存在的工作目录相对目录。都不存在时，dashboard 下载使用 `<data_dir>/<path>`。 |
-| 订阅存储 | 依次优先使用已存在的 `<data_dir>/.sub`、已存在的 `/var/share/honk/.sub`，以及已存在的 `./.sub`。都不存在时创建 `<data_dir>/.sub`；不会自动移动或删除存储。 |
+| 订阅存储 | 正文保存在 `<data_dir>/state/honk.db` 中。首次启动时，honk 依次在 `<data_dir>/.sub`、`/var/share/honk/.sub`、`./.sub` 中查找第一个私有的旧存储并导入，然后删除其中的文件（见[订阅参考](./subscription.md#拉取持久化与恢复)）。 |
 
 ## 预热与拨号预算
 

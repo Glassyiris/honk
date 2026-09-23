@@ -100,6 +100,9 @@ pub struct StateDb {
     identity: (u64, u64),
     max_page_count: i64,
     strict: Mutex<Connection>,
+    /// `subscription_body` keys of the enabled subscriptions in the published
+    /// configuration; `None` until the first publication.
+    enabled_subscriptions: Mutex<Option<std::collections::HashSet<String>>>,
 }
 
 impl StateDb {
@@ -148,7 +151,16 @@ impl StateDb {
             identity,
             max_page_count,
             strict: Mutex::new(connection),
+            enabled_subscriptions: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn set_enabled_subscriptions(&self, keys: std::collections::HashSet<String>) {
+        *self.enabled_subscriptions.lock() = Some(keys);
+    }
+
+    pub(crate) fn enabled_subscriptions(&self) -> Option<std::collections::HashSet<String>> {
+        self.enabled_subscriptions.lock().clone()
     }
 
     /// A new connection to the same file, configured for `class`.
@@ -185,6 +197,8 @@ pub struct ActiveOwners {
     pub dns: bool,
     /// Native API off and the Clash API on: Clash mode and GLOBAL.
     pub clash: bool,
+    /// `global.store_subscribe`: subscription bodies.
+    pub subscriptions: bool,
 }
 
 /// Empties the cache tables whose owner is off, so a disabled owner leaves no
@@ -199,6 +213,9 @@ pub fn clear_inactive(state: &StateDb, owners: ActiveOwners) -> Result<(), State
     }
     if !owners.cache || !owners.clash {
         tables.push("clash_state");
+    }
+    if !owners.subscriptions {
+        tables.push("subscription_body");
     }
     let mut connection = state.strict();
     let transaction = connection.transaction().map_err(sql)?;

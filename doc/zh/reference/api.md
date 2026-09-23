@@ -179,9 +179,9 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 ### 配置数据库（`--store db`）
 
-`honk-core --store db` 将受管理的 `.dae` 源以 revision 形式保存在状态数据库 `<data_dir>/state/honk.db` 中。`data_dir` 取自 `--data-dir`（默认 `/var/lib/honk`），必须与 `global.data_dir` 相同，不回退到工作目录。`state` 目录权限为 0700、文件为 0600，二者均属 daemon 用户且不能是符号链接，否则拒绝启动。数据库采用 WAL 模式，同目录下的 `honk.db-wal` 与 `honk.db-shm` 权限与主文件相同；文件系统不支持 WAL（例如不支持共享内存）时，回退到回滚日志（`honk.db-journal`）并记录警告。只有 `.dae` 源进入数据库；hosts、ECH、geodata 与订阅缓存仍在磁盘上，按 `data_dir` 解析。导入源树所在的目录不授权任何依赖。
+`honk-core --store db` 将受管理的 `.dae` 源以 revision 形式保存在状态数据库 `<data_dir>/state/honk.db` 中。`data_dir` 取自 `--data-dir`（默认 `/var/lib/honk`），必须与 `global.data_dir` 相同，不回退到工作目录。`state` 目录权限为 0700、文件为 0600，二者均属 daemon 用户且不能是符号链接，否则拒绝启动。数据库采用 WAL 模式，同目录下的 `honk.db-wal` 与 `honk.db-shm` 权限与主文件相同；文件系统不支持 WAL（例如不支持共享内存）时，回退到回滚日志（`honk.db-journal`）并记录警告。配置中只有 `.dae` 源进入数据库；订阅正文在两种模式下都保存在数据库中。hosts、ECH 与 geodata 仍在磁盘上，按 `data_dir` 解析。导入源树所在的目录不授权任何依赖。
 
-数据库为空时，启动过程导入 `-c`，要求启用 `native_api.enabled` 与 `config_write` 并配置凭据。导入删除 `native_api` 与 `clash_api` 中的全部 `secret:`，确认去除凭据的源树在重新套用凭据后解析出相同配置，再以 principal `startup` 记录 revision 1。若凭据值在删除后仍残留（例如在注释或文件名中），导入被拒绝。已有 revision 时，启动过程加载当前 revision，不读取 `-c`；若取得实例锁前另一实例已移动 `head`，启动终止。数据库模式不提供 Clash API：无论导入的源树还是当前 revision，只要 `experimental.clash_api.external_controller` 非空，启动即被拒绝。数据库损坏、`application_id` 不符或 schema 版本更高时拒绝启动；数据库不会被改名或重建。
+数据库为空时，启动过程导入 `-c`，要求启用 `native_api.enabled` 与 `config_write` 并配置凭据。导入删除 `native_api` 与 `clash_api` 中的全部 `secret:`，确认去除凭据的源树在重新套用凭据后解析出相同配置，再以 principal `startup` 记录 revision 1。若凭据值在删除后仍残留（例如在注释或文件名中），导入被拒绝。已有 revision 时，启动过程加载当前 revision，不读取 `-c`；若启动期间另一实例移动了 `head`，启动终止；只有不持有实例锁的 mock 模式实例会造成这种情况。数据库模式不提供 Clash API：无论导入的源树还是当前 revision，只要 `experimental.clash_api.external_controller` 非空，启动即被拒绝。数据库损坏、`application_id` 不符或 schema 版本更高时拒绝启动；数据库不会被改名或重建。
 
 监听凭据与 revision 分开保存，从不返回。写入不能修改监听凭据、`native_api` 设置或 `global.data_dir`，否则返回 403；含已保存凭据值的源也会被拒绝。响应与 `--without-secrets` 导出均遮蔽这两个已保存的值。数据库模式下源 `absolute_path` 为 null，源路径只是标签，不对应文件；`If-Match` 比较数据库中保存的源字节。
 

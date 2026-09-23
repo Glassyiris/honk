@@ -426,7 +426,7 @@ async fn cache_load_is_stale_until_ack_and_startup_or_periodic_fetch_shares_api_
     let mut subscription = origin.subscription();
     subscription.update_interval = 1;
     let directory = tempfile::tempdir().unwrap();
-    let store = SubscriptionStore::open(directory.path().join("cache")).unwrap();
+    let store = SubscriptionStore::in_dir(directory.path());
     store
         .store_content(&subscription, OLD.into())
         .await

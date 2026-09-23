@@ -14,9 +14,9 @@
 
 启动时保持内核准入关闭，直到用户态能够接收每个重定向流：
 
-1. 加载并校验配置、选择 `global.data_dir`，提升 `RLIMIT_NOFILE`，并取得一次不可变的描述符预算快照。
-2. 在网络刷新前恢复持久化订阅。只有没有有效已恢复正文的订阅才参与五秒首次拉取宽限期。
-3. 选择后端。真实模式取得 `/run/honk-core.lock`，并把进程 PID 发布到已锁文件；`honk-core reload` 读取该 PID 并发送 `SIGHUP`。Mock 模式不取得进程全局锁。
+1. 真实模式取得 `/run/honk-core.lock`，最多等待 240 秒让前一个实例退出，并把进程 PID 发布到已锁文件；`honk-core reload` 读取该 PID 并发送 `SIGHUP`。未取得锁的后继实例在读取配置和打开状态数据库之前退出。Mock 模式不取得进程全局锁。
+2. 加载并校验配置、选择 `global.data_dir`，提升 `RLIMIT_NOFILE`，并取得一次不可变的描述符预算快照。
+3. 在网络刷新前恢复持久化订阅。只有没有有效已恢复正文的订阅才参与五秒首次拉取宽限期。
 4. 真实实例完成锁交接后，再探测固定 NFQUEUE 队列前置条件。mock/不带 `ebpf` 的模式或前置检查失败时记录 warning，仅在本进程关闭 NFQUEUE；前置检查不会拒绝保留的 nftables table，因为安装阶段会回收残留的自有状态。
 5. 在真实模式下，通过 rtnetlink 创建由 FD 持有的 `daens` 命名空间和 `dae0`/`dae0peer` 链路。引擎优先尝试 L2 netkit pair，仅在内核报告不支持 netkit 时回退到 veth。进程留在宿主命名空间；只有同步的 socket、链路和挂载操作通过有作用域的 `setns` 调用进入 `daens`。
 6. 加载 BPF 对象并挂载真实数据路径。默认对象通过 `include_bytes!` 嵌入；`--bpf-object` 提供运行时覆盖。启用 `ebpf` feature 时，`build.rs` 定位对象，拒绝过期或无 BTF 的产物，在移除继承的 `RUSTFLAGS` 和 `CARGO_ENCODED_RUSTFLAGS` 后用 nightly 重建，校验 `.BTF`，再复制到 `OUT_DIR` 供嵌入。

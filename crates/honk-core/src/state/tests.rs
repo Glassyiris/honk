@@ -419,6 +419,7 @@ fn tables_of_disabled_owners_are_cleared_and_strict_tables_kept() {
                  INSERT OR REPLACE INTO delay_sample VALUES ('n', 5, 1);
                  INSERT OR REPLACE INTO dns_answer VALUES ('k', 1, x'00');
                  INSERT OR REPLACE INTO clash_state VALUES ('mode', 'Rule');
+                 INSERT OR REPLACE INTO subscription_body VALUES ('s', 1, x'00');
                  INSERT OR REPLACE INTO legacy_import VALUES ('source', 1);",
             )
             .unwrap();
@@ -428,6 +429,7 @@ fn tables_of_disabled_owners_are_cleared_and_strict_tables_kept() {
         "delay_sample",
         "dns_answer",
         "clash_state",
+        "subscription_body",
         "legacy_import",
     ];
 
@@ -436,9 +438,10 @@ fn tables_of_disabled_owners_are_cleared_and_strict_tables_kept() {
         cache: true,
         dns: false,
         clash: true,
+        subscriptions: true,
     };
     clear_inactive(&state, owners).unwrap();
-    assert_eq!(tables.map(count), [1, 1, 0, 1, 1]);
+    assert_eq!(tables.map(count), [1, 1, 0, 1, 1, 1]);
 
     seed();
     clear_inactive(
@@ -449,7 +452,7 @@ fn tables_of_disabled_owners_are_cleared_and_strict_tables_kept() {
         },
     )
     .unwrap();
-    assert_eq!(tables.map(count), [1, 1, 0, 0, 1]);
+    assert_eq!(tables.map(count), [1, 1, 0, 0, 1, 1]);
 
     seed();
     clear_inactive(
@@ -458,8 +461,20 @@ fn tables_of_disabled_owners_are_cleared_and_strict_tables_kept() {
             cache: false,
             dns: true,
             clash: true,
+            subscriptions: true,
         },
     )
     .unwrap();
-    assert_eq!(tables.map(count), [0, 0, 0, 0, 1]);
+    assert_eq!(tables.map(count), [0, 0, 0, 0, 1, 1]);
+
+    seed();
+    clear_inactive(
+        &state,
+        ActiveOwners {
+            subscriptions: false,
+            ..owners
+        },
+    )
+    .unwrap();
+    assert_eq!(tables.map(count), [1, 1, 0, 1, 0, 1]);
 }

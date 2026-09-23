@@ -441,7 +441,9 @@ fn open_state_db(
     data_dir: &std::path::Path,
 ) -> anyhow::Result<(Option<Arc<state::StateDb>>, bool)> {
     let strict = cli.store == ConfigStore::Db || config.experimental.native_api.password_auth;
-    if cli.store == ConfigStore::Db || !config.experimental.cache_file.enabled {
+    if cli.store == ConfigStore::Db
+        || !(config.experimental.cache_file.enabled || config.global.store_subscribe)
+    {
         return Ok((None, false));
     }
     match state::StateDb::open(data_dir) {
@@ -474,6 +476,66 @@ fn reset_non_strict(data_dir: &std::path::Path) -> Option<Arc<state::StateDb>> {
     }
 }
 
+/// The state db and subscription store for this run.
+struct ClaimedState {
+    state_db: Option<Arc<state::StateDb>>,
+    subscriptions: Option<subscription::SubscriptionStore>,
+}
+
+/// Startup changes to the state db, made with the instance lock held: the
+/// reset of a corrupt non-strict db, clearing disabled owners' tables, and the
+/// legacy `.sub` import and removal. The previous instance has exited, so a
+/// legacy body it wrote last is copied before its store is removed.
+fn claim_state(
+    state_db: Option<Arc<state::StateDb>>,
+    reset: bool,
+    config: &Config,
+    data_dir: &std::path::Path,
+    legacy_roots: impl IntoIterator<Item = PathBuf>,
+) -> ClaimedState {
+    let state_db = if reset {
+        reset_non_strict(data_dir)
+    } else {
+        state_db
+    };
+    if let Some(state) = state_db.as_ref() {
+        let experimental = &config.experimental;
+        let owners = state::ActiveOwners {
+            cache: experimental.cache_file.enabled,
+            dns: experimental.cache_file.store_dns,
+            clash: cfg!(feature = "clash-api")
+                && !(cfg!(feature = "native-api") && experimental.native_api.enabled)
+                && !experimental.clash_api.external_controller.is_empty(),
+            subscriptions: config.global.store_subscribe,
+        };
+        if let Err(error) = state::clear_inactive(state, owners) {
+            warn!(%error, "state database: clearing tables of disabled owners failed");
+        }
+    }
+    let subscriptions = match state_db.as_ref().filter(|_| config.global.store_subscribe) {
+        Some(state) => {
+            if let Some(legacy) = subscription::LegacySubscriptionStore::import(
+                state,
+                legacy_roots,
+                &config.subscriptions,
+            ) {
+                legacy.remove();
+            }
+            Some(subscription::SubscriptionStore::new(Arc::clone(state)))
+        }
+        None => {
+            if config.global.store_subscribe {
+                warn!("Subscription store unavailable; continuing without persistence");
+            }
+            None
+        }
+    };
+    ClaimedState {
+        state_db,
+        subscriptions,
+    }
+}
+
 /// Take the process-wide instance lock: the datapath uses fixed names
 /// (dae0, daens, TC hooks) and a stopping instance's cleanup destroys
 /// them, so a second instance must never start while the first is still
@@ -481,20 +543,22 @@ fn reset_non_strict(data_dir: &std::path::Path) -> Option<Arc<state::StateDb>> {
 /// under it — the restart race that hung the lab for a day). Waits up
 /// to 240s for the previous instance to exit (busy gateways can take
 /// well over 90s to drain), then fails loudly.
+///
+/// It is taken before the configuration or the state db is opened, so a
+/// successor that fails to take it leaves nothing behind.
 fn acquire_instance_lock(
-    _bpf_pin_root: &std::path::Path,
+    path: &std::path::Path,
+    wait: std::time::Duration,
 ) -> anyhow::Result<nix::fcntl::Flock<std::fs::File>> {
     use nix::fcntl::{Flock, FlockArg};
-    // /run (not the bpffs pin root, which rejects regular files).
-    let path = std::path::PathBuf::from(INSTANCE_LOCK_PATH);
     let mut file = std::fs::File::options()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&path)
+        .open(path)
         .map_err(|e| anyhow::anyhow!("open instance lock {}: {}", path.display(), e))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    let deadline = std::time::Instant::now() + wait;
     let mut logged = false;
     loop {
         match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
@@ -505,8 +569,9 @@ fn acquire_instance_lock(
             Err((f, _)) if std::time::Instant::now() < deadline => {
                 file = f; // the failed lock hands the file back for the retry
                 if !logged {
-                    info!(
-                        "another honk-core instance is shutting down; \
+                    // Logging is not set up yet.
+                    eprintln!(
+                        "honk-core: another honk-core instance is shutting down; \
                          waiting for the datapath lock at {}",
                         path.display()
                     );
@@ -523,6 +588,30 @@ fn acquire_instance_lock(
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_INSTANCE_LOCK: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Only the real datapath owns fixed dae0/daens/TC resources. Mock mode must
+/// remain usable without access to the process-global /run lock.
+fn instance_lock(mock_mode: bool) -> anyhow::Result<Option<nix::fcntl::Flock<std::fs::File>>> {
+    #[cfg(test)]
+    if let Some(path) = TEST_INSTANCE_LOCK.with(|path| path.borrow().clone()) {
+        return acquire_instance_lock(&path, std::time::Duration::ZERO).map(Some);
+    }
+    if mock_mode {
+        return Ok(None);
+    }
+    // /run, not the bpffs pin root, which rejects regular files.
+    acquire_instance_lock(
+        std::path::Path::new(INSTANCE_LOCK_PATH),
+        std::time::Duration::from_secs(240),
+    )
+    .map(Some)
 }
 
 fn prepare_nfqueue_startup(config: &mut Config, mock_mode: bool) {
@@ -811,6 +900,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         cli.store == ConfigStore::File,
         "--store db needs the native-api feature"
     );
+    let mock_mode = cli.mock_ebpf || cfg!(not(feature = "ebpf"));
+    // Everything else in `run` drops before it.
+    let _instance_lock = instance_lock(mock_mode)?;
     let startup = (|| -> anyhow::Result<_> {
         #[cfg(feature = "native-api")]
         let mut config = if cli.store == ConfigStore::Db {
@@ -1005,26 +1097,28 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         info!("Bootstrap resolver: {}", config.global.bootstrap_resolver);
     }
 
+    #[cfg(feature = "native-api")]
+    if let Some(database) = database.as_mut() {
+        database.record()?;
+    }
+    let claimed = claim_state(
+        state_db,
+        state_reset,
+        &config,
+        honk_config::paths::data_dir(),
+        subscription::legacy_store_roots(),
+    );
+    let state_db = claimed.state_db;
+
     // A valid stored body makes network refresh non-blocking for startup.
     // Missing subscriptions still get the bounded first-fetch grace period;
     // every fetch continues in the background after the control plane starts.
-    let subscription_store = if config.global.store_subscribe {
-        match subscription::SubscriptionStore::in_data_dir() {
-            Ok(store) => {
-                info!(directory = %store.root().display(), "Subscription store ready");
-                Some(store)
-            }
-            Err(error) => {
-                warn!(%error, "Subscription store unavailable; continuing without persistence");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let mut subscription_supervisor =
-        subscription::SubscriptionSupervisor::prepare(&mut config, subscription_store, diagnostics)
-            .await?;
+    let mut subscription_supervisor = subscription::SubscriptionSupervisor::prepare(
+        &mut config,
+        claimed.subscriptions,
+        diagnostics,
+    )
+    .await?;
     let startup_diagnostics = subscription_supervisor.take_startup_diagnostics();
 
     // Resolve group filters into concrete node IDs. This must run for every
@@ -1055,7 +1149,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         config.routing.rules.len()
     );
 
-    let mock_mode = cli.mock_ebpf || cfg!(not(feature = "ebpf"));
     #[cfg(feature = "ebpf")]
     let configured_ifaces = configured_interfaces(&config);
     #[cfg(feature = "ebpf")]
@@ -1071,39 +1164,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         warn!(
             "default route unavailable; auto interface binding is pending until a network route appears"
         );
-    }
-
-    // Only the real datapath owns fixed dae0/daens/TC resources. Mock mode
-    // must remain usable without access to the process-global /run lock.
-    let _instance_lock = if mock_mode {
-        None
-    } else {
-        Some(acquire_instance_lock(&cli.bpf_pin_root)?)
-    };
-    // Bound after the lock so they drop before it: a successor that takes the
-    // lock must not find this process still holding the state db.
-    let mut state_db = state_db;
-    #[cfg(feature = "native-api")]
-    let mut database = database;
-    #[cfg(feature = "native-api")]
-    if let Some(database) = database.as_mut() {
-        database.record()?;
-    }
-    if state_reset {
-        state_db = reset_non_strict(honk_config::paths::data_dir());
-    }
-    if let Some(state) = state_db.as_ref() {
-        let experimental = &config.experimental;
-        let owners = state::ActiveOwners {
-            cache: experimental.cache_file.enabled,
-            dns: experimental.cache_file.store_dns,
-            clash: cfg!(feature = "clash-api")
-                && !(cfg!(feature = "native-api") && experimental.native_api.enabled)
-                && !experimental.clash_api.external_controller.is_empty(),
-        };
-        if let Err(error) = state::clear_inactive(state, owners) {
-            warn!(%error, "state database: clearing tables of disabled owners failed");
-        }
     }
 
     // The old instance owns queue 320 until this lock is released. Check
@@ -2721,5 +2781,137 @@ mod startup_lifecycle_tests {
         let rendered = error.to_string();
         assert!(rendered.contains("node ID duplicates another node"));
         assert!(!rendered.contains("configuration validation failed"));
+    }
+}
+
+#[cfg(test)]
+mod state_claim_tests {
+    use std::path::PathBuf;
+
+    use clap::Parser as _;
+
+    fn legacy_store(
+        root: &std::path::Path,
+        subscriptions: &[&honk_config::subscription::Subscription],
+    ) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if !root.exists() {
+            std::fs::create_dir(root).unwrap();
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for sub in subscriptions {
+            let path = root.join(crate::subscription::SubscriptionStore::key(sub));
+            std::fs::write(&path, format!("socks5://127.0.0.1:1080#{}", sub.url)).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    fn subscription(name: &str) -> honk_config::subscription::Subscription {
+        honk_config::subscription::Subscription {
+            url: format!("https://example.invalid/{name}"),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_successor_without_the_instance_lock_leaves_the_state_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let lock_path = directory.path().join("honk-core.lock");
+        let _held = nix::fcntl::Flock::lock(
+            std::fs::File::create(&lock_path).unwrap(),
+            nix::fcntl::FlockArg::LockExclusiveNonblock,
+        )
+        .unwrap();
+        super::TEST_INSTANCE_LOCK.with(|path| *path.borrow_mut() = Some(lock_path.clone()));
+
+        // One data directory without a db, and one whose db and legacy store
+        // belong to the running instance.
+        let empty = directory.path().join("empty");
+        let running = directory.path().join("running");
+        for data_dir in [&empty, &running] {
+            std::fs::create_dir(data_dir).unwrap();
+            std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let sub = subscription("kept");
+        legacy_store(&running.join(".sub"), &[&sub]);
+        drop(crate::state::StateDb::open(&running).unwrap());
+        let snapshot = |data_dir: &std::path::Path| {
+            let mut entries: Vec<_> = walk(data_dir);
+            entries.sort();
+            entries
+        };
+        let before = snapshot(&running);
+
+        for data_dir in [&empty, &running] {
+            let config = directory.path().join(format!(
+                "{}.dae",
+                data_dir.file_name().unwrap().to_string_lossy()
+            ));
+            std::fs::write(
+                &config,
+                format!(
+                    "global {{\n data_dir: '{}'\n store_subscribe: true\n}}\nsubscription {{\n '{}'\n}}\n",
+                    data_dir.display(),
+                    sub.url
+                ),
+            )
+            .unwrap();
+            let cli = super::Cli::parse_from([
+                "honk-core",
+                "--mock-ebpf",
+                "-c",
+                config.to_str().unwrap(),
+            ]);
+            let error = super::run(cli).await.unwrap_err();
+            assert!(error.to_string().contains("refusing to start"), "{error:#}");
+        }
+        assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
+        assert_eq!(snapshot(&running), before);
+        super::TEST_INSTANCE_LOCK.with(|path| *path.borrow_mut() = None);
+    }
+
+    fn walk(root: &std::path::Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            if metadata.is_dir() {
+                entries.extend(walk(&entry.path()));
+            }
+            entries.push((entry.path(), metadata.len(), metadata.modified().unwrap()));
+        }
+        entries
+    }
+
+    #[test]
+    fn a_reset_state_db_backs_the_subscription_store() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_dir = directory.path().join(crate::state::STATE_DIR);
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let file = state_dir.join(crate::state::DB_FILE);
+        std::fs::write(&file, vec![0x5a; 8192]).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let cli = super::Cli::parse_from(["honk-core"]);
+        let mut config = honk_config::Config::default();
+        config.global.store_subscribe = true;
+
+        let (db, reset) = super::open_state_db(&cli, &config, directory.path()).unwrap();
+        assert!(db.is_none() && reset);
+        let claimed = super::claim_state(
+            db,
+            reset,
+            &config,
+            directory.path(),
+            [directory.path().join(".sub")],
+        );
+        assert!(claimed.state_db.is_some());
+        assert!(claimed.subscriptions.is_some());
+        assert!(state_dir.join("honk.db.corrupt").exists());
     }
 }

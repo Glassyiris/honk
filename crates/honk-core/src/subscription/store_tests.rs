@@ -1,155 +1,229 @@
 use std::fs;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, chown, symlink};
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::Path;
 
 use super::*;
 
-#[tokio::test]
-async fn store_keeps_opened_directory_after_path_replacement() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("store");
-    let retained = temp.path().join("retained");
-    let store = SubscriptionStore::open(root.clone()).unwrap();
-    let subscription = Subscription {
-        url: "https://example.invalid/subscription".into(),
+const MIB: usize = 1024 * 1024;
+
+fn subscription(name: &str) -> Subscription {
+    Subscription {
+        url: format!("https://example.invalid/{name}"),
         ..Default::default()
-    };
-    store
-        .store_content(&subscription, "socks5://127.0.0.1:1080#original".into())
-        .await
-        .unwrap();
-    let filename = store
-        .path_for(&subscription)
-        .file_name()
-        .unwrap()
-        .to_owned();
-    fs::rename(&root, &retained).unwrap();
-    fs::create_dir(&root).unwrap();
-    let injected = "socks5://127.0.0.1:1081#injected";
-    fs::write(root.join(&filename), injected).unwrap();
+    }
+}
 
-    let nodes = store.load_nodes(&subscription).await.unwrap().unwrap();
-    assert_eq!(nodes[0].name, "original");
-    store
-        .store_content(&subscription, "socks5://127.0.0.1:1082#updated".into())
+fn filler(bytes: usize) -> String {
+    "#".repeat(bytes)
+}
+
+#[tokio::test]
+async fn a_body_survives_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let sub = subscription("a");
+    SubscriptionStore::in_dir(temp.path())
+        .store_content(&sub, "socks5://127.0.0.1:1080#stored".into())
         .await
         .unwrap();
-    assert_eq!(fs::read_to_string(root.join(&filename)).unwrap(), injected);
+    let reopened = SubscriptionStore::in_dir(temp.path());
     assert_eq!(
-        fs::read_to_string(retained.join(&filename)).unwrap(),
-        "socks5://127.0.0.1:1082#updated"
+        reopened.load_nodes(&sub).await.unwrap().unwrap()[0].name,
+        "stored"
     );
 }
 
 #[tokio::test]
-async fn store_rejects_cache_body_writable_by_other_users() {
+async fn a_replacement_url_frees_the_old_bodies() {
     let temp = tempfile::tempdir().unwrap();
-    let store = SubscriptionStore::open(temp.path().join("store")).unwrap();
-    let subscription = Subscription::default();
+    let store = SubscriptionStore::in_dir(temp.path());
+    let old: Vec<_> = (0..4)
+        .map(|index| subscription(&format!("old{index}")))
+        .collect();
+    store.set_enabled(&old);
+    for sub in &old {
+        store
+            .store_content(sub, filler(7 * MIB + MIB / 2))
+            .await
+            .unwrap();
+    }
+    let replacement = subscription("new");
+    store.set_enabled([&replacement]);
     store
-        .store_content(&subscription, "socks5://127.0.0.1:1080#untrusted".into())
+        .store_content(&replacement, filler(4 * MIB))
         .await
         .unwrap();
-    let path = store.path_for(&subscription);
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
-
-    assert!(store.load_nodes(&subscription).await.is_err());
-    assert_eq!(
-        fs::metadata(path).unwrap().permissions().mode() & 0o7777,
-        0o666
-    );
-}
-
-#[test]
-fn store_rejects_symlink_directory() {
-    let temp = tempfile::tempdir().unwrap();
-    let target = temp.path().join("target");
-    fs::create_dir(&target).unwrap();
-    let link = temp.path().join(SUBSCRIPTION_STORE_DIR);
-    symlink(target, &link).unwrap();
-    assert!(SubscriptionStore::open(link).is_err());
+    assert!(old.iter().all(|sub| store.body(sub).is_none()));
+    assert_eq!(store.body(&replacement).unwrap().len(), 4 * MIB);
 }
 
 #[tokio::test]
-async fn store_skips_writable_legacy_directory_without_chmod() {
+async fn a_write_past_the_cap_among_enabled_bodies_is_refused_and_keeps_the_old_body() {
     let temp = tempfile::tempdir().unwrap();
-    let preferred = temp.path().join("preferred");
-    let writable = temp.path().join("writable");
-    let secure = temp.path().join("secure");
-    let subscription = Subscription::default();
-    let retained = SubscriptionStore::open(secure.clone()).unwrap();
-    retained
-        .store_content(&subscription, "socks5://127.0.0.1:1080#retained".into())
+    let store = SubscriptionStore::in_dir(temp.path());
+    let full: Vec<_> = (0..4)
+        .map(|index| subscription(&format!("full{index}")))
+        .collect();
+    let last = subscription("last");
+    store.set_enabled(full.iter().chain([&last]));
+    for sub in &full {
+        store
+            .store_content(sub, filler(7 * MIB + MIB / 2))
+            .await
+            .unwrap();
+    }
+    store
+        .store_content(&last, "socks5://127.0.0.1:1080#old".into())
         .await
         .unwrap();
-    fs::create_dir(&writable).unwrap();
-    fs::set_permissions(&writable, fs::Permissions::from_mode(0o777)).unwrap();
+    let mut diagnostics = Vec::new();
+    SubscriptionManager::persist_content(&last, Some(&store), filler(4 * MIB), &mut diagnostics, 0)
+        .await;
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "subscription-store-write-failed")
+    );
+    assert_eq!(
+        store.body(&last).as_deref(),
+        Some("socks5://127.0.0.1:1080#old")
+    );
+    assert!(full.iter().all(|sub| store.body(sub).is_some()));
+}
 
-    let store =
-        SubscriptionStore::open_with_legacy(preferred.clone(), [writable.clone(), secure.clone()])
+#[tokio::test]
+async fn two_subscriptions_refreshed_in_turn_both_keep_their_bodies() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SubscriptionStore::in_dir(temp.path());
+    let removed: Vec<_> = (0..3)
+        .map(|index| subscription(&format!("removed{index}")))
+        .collect();
+    store.set_enabled(&removed);
+    for sub in &removed {
+        store
+            .store_content(sub, filler(7 * MIB + MIB / 2))
+            .await
+            .unwrap();
+    }
+    let (a, b) = (subscription("a"), subscription("b"));
+    store.set_enabled([&a, &b]);
+    // Each refresh handles one subscription; the second one needs room.
+    store
+        .store_content(&a, filler(7 * MIB + MIB / 2))
+        .await
+        .unwrap();
+    store
+        .store_content(&b, filler(7 * MIB + MIB / 2))
+        .await
+        .unwrap();
+    assert!(store.body(&a).is_some() && store.body(&b).is_some());
+    assert!(removed.iter().all(|sub| store.body(sub).is_none()));
+}
+
+fn legacy_directory(root: &Path, bodies: &[(&Subscription, String)]) {
+    fs::create_dir(root).unwrap();
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+    for (sub, body) in bodies {
+        let path = root.join(SubscriptionStore::key(sub));
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fs::write(root.join(".left.123.tmp"), b"partial").unwrap();
+}
+
+#[tokio::test]
+async fn legacy_bodies_are_copied_at_open_and_removed_only_by_remove() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join(".sub");
+    let (kept, orphan) = (subscription("kept"), subscription("orphan"));
+    legacy_directory(
+        &root,
+        &[
+            (&kept, "socks5://127.0.0.1:1080#legacy".into()),
+            (&orphan, "socks5://127.0.0.1:1080#orphan".into()),
+        ],
+    );
+    let store = SubscriptionStore::in_dir(temp.path());
+    let legacy =
+        LegacySubscriptionStore::import(store.state(), [root.clone()], std::slice::from_ref(&kept))
             .unwrap();
     assert_eq!(
-        store.load_nodes(&subscription).await.unwrap().unwrap()[0].name,
-        "retained"
+        store.load_nodes(&kept).await.unwrap().unwrap()[0].name,
+        "legacy"
     );
-    assert_eq!(store.root(), secure);
+    assert!(store.body(&orphan).is_none());
+    assert_eq!(
+        fs::read_dir(&root).unwrap().count(),
+        3,
+        "nothing removed before the lock"
+    );
+
+    legacy.remove();
+    assert!(!root.exists());
+}
+
+#[tokio::test]
+async fn a_legacy_import_stops_at_the_cap_and_skips_an_unsafe_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let writable = temp.path().join("writable");
+    fs::create_dir(&writable).unwrap();
+    fs::set_permissions(&writable, fs::Permissions::from_mode(0o777)).unwrap();
+    let root = temp.path().join("secure");
+    let subs: Vec<_> = (0..5)
+        .map(|index| subscription(&format!("s{index}")))
+        .collect();
+    let bodies: Vec<_> = subs
+        .iter()
+        .map(|sub| (sub, filler(7 * MIB + MIB / 2)))
+        .collect();
+    legacy_directory(&root, &bodies);
+    let store = SubscriptionStore::in_dir(temp.path());
+    assert!(
+        LegacySubscriptionStore::import(store.state(), [writable.clone(), root.clone()], &subs)
+            .is_none(),
+        "the store with a body left behind is kept"
+    );
+    let stored = subs.iter().filter(|sub| store.body(sub).is_some()).count();
+    assert_eq!(stored, 4, "32 MiB holds four bodies of 7.5 MiB");
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 6);
     assert_eq!(
         fs::metadata(writable).unwrap().permissions().mode() & 0o7777,
         0o777
     );
-    assert!(!preferred.exists());
 }
 
 #[tokio::test]
-async fn store_reads_private_cache_without_chmod() {
+async fn a_legacy_body_that_cannot_be_copied_keeps_the_store_for_a_retry() {
     let temp = tempfile::tempdir().unwrap();
-    let store = SubscriptionStore::open(temp.path().join("store")).unwrap();
-    let subscription = Subscription::default();
-    store
-        .store_content(&subscription, "socks5://127.0.0.1:1080#stored".into())
-        .await
-        .unwrap();
-    let path = store.path_for(&subscription);
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
-    assert_eq!(
-        store.load_nodes(&subscription).await.unwrap().unwrap()[0].name,
-        "stored"
+    let root = temp.path().join(".sub");
+    let (large, small) = (subscription("large"), subscription("small"));
+    legacy_directory(
+        &root,
+        &[
+            (&large, filler(8 * MIB + 1)),
+            (&small, "socks5://127.0.0.1:1080#small".into()),
+        ],
     );
+    let store = SubscriptionStore::in_dir(temp.path());
+    let subscriptions = [large.clone(), small.clone()];
+    let import = || LegacySubscriptionStore::import(store.state(), [root.clone()], &subscriptions);
+    // The large body is left behind, so nothing is recorded or removed.
+    assert!(import().is_none());
+    assert!(store.body(&large).is_none());
     assert_eq!(
-        fs::metadata(path).unwrap().permissions().mode() & 0o7777,
-        0o400
+        store.body(&small).as_deref(),
+        Some("socks5://127.0.0.1:1080#small")
     );
-}
-
-#[tokio::test]
-#[ignore = "requires root to create foreign-owned fixtures"]
-async fn store_rejects_foreign_owners_without_chmod() {
-    // SAFETY: geteuid has no arguments or memory-safety preconditions.
+    assert!(root.join(SubscriptionStore::key(&large)).exists());
+    // A later start retries; once every enabled body copies, the store goes.
+    fs::write(
+        root.join(SubscriptionStore::key(&large)),
+        "socks5://127.0.0.1:1080#large",
+    )
+    .unwrap();
+    import().unwrap().remove();
     assert_eq!(
-        unsafe { libc::geteuid() },
-        0,
-        "this ignored test requires root"
+        store.body(&large).as_deref(),
+        Some("socks5://127.0.0.1:1080#large")
     );
-    let temp = tempfile::tempdir().unwrap();
-
-    let foreign_directory = temp.path().join("foreign-directory");
-    fs::create_dir(&foreign_directory).unwrap();
-    fs::set_permissions(&foreign_directory, fs::Permissions::from_mode(0o755)).unwrap();
-    chown(&foreign_directory, Some(1), None).unwrap();
-    assert!(SubscriptionStore::open(foreign_directory.clone()).is_err());
-    let metadata = fs::metadata(&foreign_directory).unwrap();
-    assert_eq!(metadata.uid(), 1);
-    assert_eq!(metadata.permissions().mode() & 0o7777, 0o755);
-
-    let store = SubscriptionStore::open(temp.path().join("store")).unwrap();
-    let subscription = Subscription::default();
-    store
-        .store_content(&subscription, "socks5://127.0.0.1:1080#foreign".into())
-        .await
-        .unwrap();
-    let path = store.path_for(&subscription);
-    chown(&path, Some(1), None).unwrap();
-    assert!(store.load_nodes(&subscription).await.is_err());
-    let metadata = fs::metadata(path).unwrap();
-    assert_eq!(metadata.uid(), 1);
-    assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+    assert!(!root.exists());
 }

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use super::*;
+use crate::state::StateDb;
 use crate::state::cache::{CacheDb, Maintenance};
 
 const DELAY_SAMPLE_MAX_AGE_SECS: u64 = 24 * 3600;
@@ -28,18 +29,23 @@ impl Drop for StateTick {
 impl ControlPlane {
     /// Open the cache tables of the state database (sing-box `cache_file`),
     /// import a legacy `cache.db`, wire selector-choice persistence into the
-    /// group manager, and restore persisted choices. No-op when
-    /// `experimental.cache_file` is disabled or there is no state database.
+    /// group manager, restore persisted choices, and start the maintenance
+    /// tick. Without `experimental.cache_file` only the tick starts, for
+    /// subscription bodies. No-op when there is no state database.
     /// Called once from `run()`, with the instance lock held.
     pub async fn init_cache_db(
         &mut self,
-        state: Option<Arc<crate::state::StateDb>>,
+        state: Option<Arc<StateDb>>,
         legacy: Option<crate::state::import::LegacyCache>,
     ) {
         let cache_cfg = self.config.read().await.experimental.cache_file.clone();
-        let Some(state) = state.filter(|_| cache_cfg.enabled) else {
+        let Some(state) = state else {
             return;
         };
+        if !cache_cfg.enabled {
+            self.start_state_tick(state, None);
+            return;
+        }
         if let Some(legacy) = legacy {
             let scope = {
                 let config = self.config.read().await;
@@ -55,10 +61,11 @@ impl ControlPlane {
             };
             crate::state::import::import_cache_db(&state, &legacy, &scope);
         }
-        let db = match crate::state::cache::CacheDb::open(state) {
+        let db = match CacheDb::open(Arc::clone(&state)) {
             Ok(db) => Arc::new(db),
             Err(error) => {
                 warn!(%error, "state cache unavailable; continuing without persistence");
+                self.start_state_tick(state, None);
                 return;
             }
         };
@@ -130,52 +137,6 @@ impl ControlPlane {
             if restored > 0 {
                 info!("state db: restored {} persisted delay sample(s)", restored);
             }
-            let db_tick = db.clone();
-            let alive_for_tick = self.alive_set.clone();
-            let config_for_tick = self.config.clone();
-            let store_dns = cache_cfg.store_dns;
-            let tick_task = tokio::spawn(async move {
-                let mut missing = Missing::default();
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-                interval.tick().await; // first tick after one period
-                loop {
-                    let (live, names) = {
-                        let config = config_for_tick.read().await;
-                        (
-                            Live::of(&config),
-                            config
-                                .nodes
-                                .iter()
-                                .map(|n| (n.id, n.name.clone()))
-                                .collect::<std::collections::HashMap<uuid::Uuid, String>>(),
-                        )
-                    };
-                    let samples = alive_for_tick
-                        .latency_snapshot()
-                        .into_iter()
-                        .filter_map(|(node_id, latency, at)| {
-                            let measured_at = at
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            Some((
-                                names.get(&node_id)?.clone(),
-                                latency.as_millis() as u64,
-                                measured_at,
-                            ))
-                        })
-                        .collect();
-                    let db = db_tick.clone();
-                    missing = tokio::task::spawn_blocking(move || {
-                        maintenance_tick(&db, &live, samples, &mut missing, store_dns, unix_now());
-                        missing
-                    })
-                    .await
-                    .unwrap_or_default();
-                    interval.tick().await;
-                }
-            });
-            self.state_tick.task = Some(tick_task);
         }
 
         // store_dns: restore persisted DNS answers into the shared DNS
@@ -204,8 +165,72 @@ impl ControlPlane {
         }) {
             warn!(%error, "state db startup prune failed");
         }
+        self.start_state_tick(state, Some(Arc::clone(&db)));
 
         self.cache_db = Some(db);
+    }
+
+    fn start_state_tick(&mut self, state: Arc<StateDb>, db: Option<Arc<CacheDb>>) {
+        let alive = self.alive_set.clone();
+        let config = self.config.clone();
+        let task = tokio::spawn(async move {
+            let mut missing = Missing::default();
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.tick().await; // first tick after one period
+            loop {
+                let (live, owners, names) = {
+                    let config = config.read().await;
+                    (
+                        Live::of(&config),
+                        TickOwners {
+                            store_dns: config.experimental.cache_file.store_dns,
+                            store_subscribe: config.global.store_subscribe,
+                        },
+                        config
+                            .nodes
+                            .iter()
+                            .map(|n| (n.id, n.name.clone()))
+                            .collect::<std::collections::HashMap<uuid::Uuid, String>>(),
+                    )
+                };
+                let samples = if db.is_some() {
+                    alive
+                        .latency_snapshot()
+                        .into_iter()
+                        .filter_map(|(node_id, latency, at)| {
+                            let measured_at = at
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            Some((
+                                names.get(&node_id)?.clone(),
+                                latency.as_millis() as u64,
+                                measured_at,
+                            ))
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let (state, db) = (Arc::clone(&state), db.clone());
+                missing = tokio::task::spawn_blocking(move || {
+                    maintenance_tick(
+                        &state,
+                        db.as_deref(),
+                        &live,
+                        samples,
+                        &mut missing,
+                        owners,
+                        unix_now(),
+                    );
+                    missing
+                })
+                .await
+                .unwrap_or_default();
+                interval.tick().await;
+            }
+        });
+        self.state_tick.task = Some(task);
     }
 
     /// Shared handle to the persistent cache database (clash API, etc.).
@@ -246,21 +271,39 @@ impl Live {
 pub(super) struct Missing {
     groups: HashSet<String>,
     nodes: HashSet<String>,
+    bodies: HashSet<String>,
 }
 
-/// One maintenance tick: writes `samples`, deletes Selector and delay rows
-/// whose group or node was missing at this tick and at the previous one, delay
-/// rows older than 24 h and, with `store_dns`, expired DNS rows, then runs
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TickOwners {
+    store_dns: bool,
+    store_subscribe: bool,
+}
+
+/// One maintenance tick. With `store_subscribe`, deletes subscription bodies
+/// whose subscription was not enabled at this tick and the previous one. With
+/// the cache open, writes `samples`, deletes Selector and delay rows whose
+/// group or node was missing at this tick and the previous one, delay rows
+/// older than 24 h and, with `store_dns`, expired DNS rows, then runs
 /// `incremental_vacuum`. The two-tick rule keeps rows across a config that
-/// briefly drops and restores a group or node.
+/// briefly drops and restores a group, node or subscription.
 pub(super) fn maintenance_tick(
-    db: &CacheDb,
+    state: &StateDb,
+    db: Option<&CacheDb>,
     live: &Live,
     samples: Vec<(String, u64, u64)>,
     missing: &mut Missing,
-    store_dns: bool,
+    owners: TickOwners,
     now: u64,
 ) {
+    if owners.store_subscribe
+        && let Err(error) = crate::subscription::prune_bodies(state, &mut missing.bodies)
+    {
+        warn!(%error, "state db subscription body maintenance failed");
+    }
+    let Some(db) = db else {
+        return;
+    };
     db.save_delay_samples(samples);
     let stale = |rows: Result<Vec<String>, _>,
                  present: &HashSet<String>,
@@ -287,7 +330,7 @@ pub(super) fn maintenance_tick(
         ),
         nodes: stale(db.delay_nodes(), &live.nodes, &mut missing.nodes),
         delay_cutoff: now.saturating_sub(DELAY_SAMPLE_MAX_AGE_SECS),
-        dns_expired_at: store_dns.then_some(now),
+        dns_expired_at: owners.store_dns.then_some(now),
     };
     if let Err(error) = db.maintain(work) {
         warn!(%error, "state db maintenance failed");
@@ -303,7 +346,8 @@ mod tests {
     #[test]
     fn a_dropped_group_and_node_keep_their_rows_for_one_tick() {
         let directory = tempfile::tempdir().unwrap();
-        let db = CacheDb::in_dir(directory.path());
+        let state = Arc::new(StateDb::open(directory.path()).unwrap());
+        let db = CacheDb::open(Arc::clone(&state)).unwrap();
         let now = 1_700_000_000;
         let member = honk_outbound::group::SelectorMember::Group("m".into());
         for group in ["kept", "dropped"] {
@@ -337,8 +381,20 @@ mod tests {
             (groups, nodes, dns)
         };
         let mut missing = Missing::default();
+        let owners = TickOwners {
+            store_dns: true,
+            store_subscribe: false,
+        };
 
-        maintenance_tick(&db, &live, Vec::new(), &mut missing, true, now);
+        maintenance_tick(
+            &state,
+            Some(&db),
+            &live,
+            Vec::new(),
+            &mut missing,
+            owners,
+            now,
+        );
         assert_eq!(
             rows(&db),
             (
@@ -347,7 +403,15 @@ mod tests {
                 vec!["fresh".to_owned()],
             )
         );
-        maintenance_tick(&db, &live, Vec::new(), &mut missing, true, now);
+        maintenance_tick(
+            &state,
+            Some(&db),
+            &live,
+            Vec::new(),
+            &mut missing,
+            owners,
+            now,
+        );
         assert_eq!(
             rows(&db),
             (
@@ -355,6 +419,50 @@ mod tests {
                 vec!["kept-node".to_owned()],
                 vec!["fresh".to_owned()],
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_subscription_keeps_its_body_for_one_tick() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDb::open(directory.path()).unwrap());
+        let store = crate::subscription::SubscriptionStore::new(Arc::clone(&state));
+        let subscription = |name: &str| honk_config::subscription::Subscription {
+            url: format!("https://example.invalid/{name}"),
+            ..Default::default()
+        };
+        let (kept, dropped) = (subscription("kept"), subscription("dropped"));
+        for sub in [&kept, &dropped] {
+            store.store_content(sub, "body".into()).await.unwrap();
+        }
+        store.set_enabled([&kept]);
+        let live = Live {
+            selector_groups: HashSet::new(),
+            nodes: HashSet::new(),
+        };
+        let owners = TickOwners {
+            store_dns: false,
+            store_subscribe: true,
+        };
+        let mut missing = Missing::default();
+        let bodies = || -> i64 {
+            state
+                .strict()
+                .query_row("SELECT count(*) FROM subscription_body", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        maintenance_tick(&state, None, &live, Vec::new(), &mut missing, owners, 0);
+        assert_eq!(bodies(), 2);
+        maintenance_tick(&state, None, &live, Vec::new(), &mut missing, owners, 0);
+        let remaining: String = state
+            .strict()
+            .query_row("SELECT key FROM subscription_body", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            remaining,
+            crate::subscription::SubscriptionStore::key(&kept)
         );
     }
 

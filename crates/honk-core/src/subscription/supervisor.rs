@@ -327,6 +327,13 @@ impl SupervisorState {
                 (id, provider)
             })
             .collect();
+        if let Some(store) = &self.store {
+            store.set_enabled(
+                self.providers
+                    .values()
+                    .map(|provider| &provider.authorized.subscription),
+            );
+        }
         {
             let mut observations = self.observations.write();
             observations.retain(|id, _| self.providers.contains_key(id));

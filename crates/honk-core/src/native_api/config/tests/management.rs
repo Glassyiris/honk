@@ -520,7 +520,8 @@ async fn managed_provider_stays_unfetched_until_explicit_refresh_and_deletes_its
         "http://{}/private-path?token=private-provider-token",
         origin.local_addr().unwrap()
     );
-    let store = crate::subscription::SubscriptionStore::open(fixture.path("state/.sub")).unwrap();
+    std::fs::create_dir_all(fixture.path("state")).unwrap();
+    let store = crate::subscription::SubscriptionStore::in_dir(&fixture.path("state"));
     let cached = honk_config::subscription::Subscription {
         url: url.clone(),
         ..Default::default()

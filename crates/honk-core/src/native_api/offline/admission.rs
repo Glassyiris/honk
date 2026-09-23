@@ -111,11 +111,7 @@ impl ValidatedConfig {
             .iter()
             .any(|subscription| subscription.enabled)
         {
-            let store = match SubscriptionStore::open_readonly(data_dir) {
-                Ok(store) => Some(store),
-                Err(cause) if cause.kind() == io::ErrorKind::NotFound => None,
-                Err(cause) => return Err(cause),
-            };
+            let store = StoredBodies::open(data_dir)?;
             for (index, subscription) in self
                 .config
                 .subscriptions
@@ -128,14 +124,16 @@ impl ValidatedConfig {
                 }) {
                     continue;
                 }
-                match store.as_ref().map(|store| store.open_cached(subscription)) {
-                    Some(Ok(file)) => {
-                        capture.file(file, true, false, DependencyReader::Subscription(index))?;
-                    }
-                    Some(Err(cause)) if cause.kind() != io::ErrorKind::NotFound => {
-                        return Err(cause);
-                    }
-                    _ => {}
+                if let Some(body) = store
+                    .as_ref()
+                    .map(|store| store.find(subscription))
+                    .transpose()?
+                    .flatten()
+                {
+                    let (label, length) = (body.label.clone(), body.length);
+                    capture.stored(label, length, DependencyReader::Subscription(index), || {
+                        body.read()
+                    })?;
                 }
             }
         }
