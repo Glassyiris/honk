@@ -252,7 +252,7 @@ fn joint_common_targets_keep_partial_coverage_and_response_bound_directions() {
     let decision = scores(&state.inner.lock(), &nodes, &aggregate, at);
     let summary = comparison::summarize(&decision, at);
     assert!(summary.supported && summary.upload_known && !summary.response_misaligned);
-    assert!(summary.target_limited && !summary.complete && !summary.candidate_limited);
+    assert!(summary.target_limited && !summary.complete);
     for index in [1, 2] {
         let pair = decision.pairs.summary_pair(index).unwrap();
         assert_close(

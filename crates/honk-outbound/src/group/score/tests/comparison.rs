@@ -1,6 +1,4 @@
-use super::super::comparison::{
-    self, Basis, MAX_CELLS, MAX_CHALLENGERS, MAX_LOGICAL_BYTES, PairEvidence,
-};
+use super::super::comparison::{self, Basis, MAX_CELLS, MAX_LOGICAL_BYTES, PairEvidence};
 use super::super::evidence::Observation;
 use super::super::ranking::{ordinary_selection, performance_baseline};
 use super::super::verification::evaluate;

@@ -305,7 +305,7 @@ async fn score_verification_is_private_readonly_and_uses_canonical_candidates() 
                     summary["coverage"],
                     serde_json::json!({
                         "candidates": 0, "compared": 0, "pending": 0,
-                        "candidateLimited": false, "targetLimited": false, "excluded": 0,
+                        "targetLimited": false, "excluded": 0,
                     })
                 );
             }
@@ -371,7 +371,7 @@ async fn score_verification_separates_probe_comparison_from_business_usability()
         verification["coverage"],
         serde_json::json!({
             "candidates": 2, "compared": 2, "pending": 0,
-            "candidateLimited": false, "targetLimited": false, "excluded": 0,
+            "targetLimited": false, "excluded": 0,
         })
     );
     assert_eq!(

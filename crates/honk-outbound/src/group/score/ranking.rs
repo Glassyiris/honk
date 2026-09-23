@@ -340,7 +340,7 @@ pub(super) fn ordinary_selection(
     let mut promoted = None;
     let mut best_has_comparison = false;
     let mut directional_tradeoff = false;
-    // Only the bounded proposals prepared against this fixed incumbent may compete.
+    // Only pairs prepared against this fixed incumbent may compete.
     for (candidate_index, candidate) in snapshots.iter().enumerate() {
         if candidate_index == index
             || !normal_eligible(candidate, performance)

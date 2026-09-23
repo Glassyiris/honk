@@ -13,7 +13,6 @@ pub(in crate::group::score) struct Summary {
     pub equivalent: bool,
     pub supported: bool,
     pub response_misaligned: bool,
-    pub candidate_limited: bool,
     pub target_limited: bool,
     pub reporters: u8,
     pub span: Option<Duration>,
@@ -130,7 +129,6 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
             continue;
         }
         let Some(pair) = decision.pairs.get(index) else {
-            summary.candidate_limited |= normal_eligible(candidate, baseline);
             continue;
         };
         if decision.pairs.joint.is_some() {

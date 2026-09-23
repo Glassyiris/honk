@@ -37,7 +37,7 @@ fn common_targets_do_not_promote_a_simpson_mixture() {
 }
 
 #[test]
-fn target_and_challenger_limits_choose_identity_order_not_favorable_values() {
+fn target_limit_chooses_identity_order_not_favorable_values() {
     let now = Instant::now();
     let nodes: Vec<_> = (0..10)
         .map(|index| node(&format!("bounded {index}")))
@@ -64,14 +64,46 @@ fn target_and_challenger_limits_choose_identity_order_not_favorable_values() {
     }
     let unseen = context("unseen", IpVersion::V4);
     let scores = scores(&inner, &nodes, &unseen, now);
-    assert_eq!(scores.pairs.pairs.iter().flatten().count(), MAX_CHALLENGERS);
-    for (_, pair) in scores.pairs.pairs.iter().flatten() {
+    assert_eq!(scores.pairs.pairs.iter().flatten().count(), nodes.len() - 1);
+    for pair in scores.pairs.pairs.iter().flatten() {
         assert_close(pair.response.unwrap().candidate, 200.0);
     }
     let summary = comparison::summarize(&scores, now);
-    assert_eq!(summary.compared_candidates, MAX_CHALLENGERS + 1);
+    assert_eq!(summary.compared_candidates, nodes.len());
     assert!(!summary.complete);
-    assert!(summary.candidate_limited && summary.target_limited);
+    assert!(summary.target_limited);
+}
+
+#[test]
+fn more_than_five_members_confirm_and_revoke_with_their_weakest_support() {
+    let start = Instant::now();
+    let nodes: Vec<_> = (0..7).map(|index| node(&format!("wide {index}"))).collect();
+    let target = context("wide.example", IpVersion::V4);
+    let mut inner = StateInner::default();
+    for leaf in &nodes {
+        response(&mut inner, leaf, &target, 4, 100, start);
+    }
+    // Only the last member misses the later block, so its support expires first.
+    for leaf in &nodes[..6] {
+        response(
+            &mut inner,
+            leaf,
+            &target,
+            4,
+            100,
+            start + Duration::from_secs(30),
+        );
+    }
+    let confirmed = comparison::summarize(
+        &scores(&inner, &nodes, &target, start + Duration::from_secs(31)),
+        start + Duration::from_secs(31),
+    );
+    assert_eq!(confirmed.compared_candidates, nodes.len());
+    assert!(confirmed.complete && confirmed.equivalent);
+    let revoked_at = start + Duration::from_secs(61);
+    let revoked = comparison::summarize(&scores(&inner, &nodes, &target, revoked_at), revoked_at);
+    assert_eq!(revoked.compared_candidates, nodes.len() - 1);
+    assert!(!revoked.complete, "{revoked:?}");
 }
 
 #[test]

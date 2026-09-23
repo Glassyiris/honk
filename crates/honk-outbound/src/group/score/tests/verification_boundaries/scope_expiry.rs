@@ -230,7 +230,7 @@ fn cross_pair_response_misalignment_requests_funded_validation_for_control_and_c
 }
 
 #[test]
-fn cross_pair_response_misalignment_does_not_relabel_a_capped_nonparticipant() {
+fn cross_pair_response_misalignment_requests_every_compared_challenger() {
     let nodes = [
         node("timing a"),
         node("timing b"),
@@ -250,7 +250,7 @@ fn cross_pair_response_misalignment_does_not_relabel_a_capped_nonparticipant() {
     assert_eq!(decision.ordinary.index, 0);
     let evaluation = verification_engine::evaluate(&decision, &refs, &target, None, at);
     assert_eq!(evaluation.snapshot.comparison, ScoreComparison::Unconfirmed);
-    assert_eq!(evaluation.snapshot.pending_count, 5);
+    assert_eq!(evaluation.snapshot.pending_count, nodes.len());
     for (index, candidate) in evaluation.candidates.iter().enumerate() {
         assert_eq!(
             candidate.question,

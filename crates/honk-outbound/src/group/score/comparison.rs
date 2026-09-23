@@ -1,5 +1,5 @@
 use super::evidence::CellStamp;
-use super::ranking::{normal_eligible, utility};
+use super::ranking::normal_eligible;
 use super::verification::{TimedMetric, VerificationEvidence};
 use super::{AggregateKey, ExactKey, ScoreSelectionContext, ScoreSnapshot, StateInner, Stats};
 use honk_config::node::Node;
@@ -17,7 +17,6 @@ pub(super) use summary::summarize;
 
 pub(super) const MAX_CELLS: usize = 256;
 pub(super) const MAX_TARGETS: usize = 8;
-pub(super) const MAX_CHALLENGERS: usize = 4;
 pub(super) const MAX_LOGICAL_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_KEY_BYTES: usize = 1024;
 const BLOCKS: usize = 4;
@@ -63,25 +62,22 @@ pub(super) struct PairEvidence {
     pub partial: bool,
 }
 
+/// Pairs indexed by node position; the reference and ineligible members have none.
 pub(super) struct PairCohort {
     pub reference: usize,
-    pub pairs: [Option<(usize, PairEvidence)>; MAX_CHALLENGERS],
-    pub joint: Option<[PairEvidence; MAX_CHALLENGERS]>,
+    pub pairs: Vec<Option<PairEvidence>>,
+    /// The joint common-block projection, with the same indexing, when one applies.
+    pub joint: Option<Vec<PairEvidence>>,
 }
 
 impl PairCohort {
     pub fn get(&self, index: usize) -> Option<PairEvidence> {
-        self.pairs
-            .iter()
-            .flatten()
-            .find_map(|(candidate, pair)| (*candidate == index).then_some(*pair))
+        self.pairs.get(index).copied().flatten()
     }
 
     pub fn summary_pair(&self, index: usize) -> Option<PairEvidence> {
-        self.pairs.iter().enumerate().find_map(|(slot, pair)| {
-            let (candidate, pair) = pair.as_ref()?;
-            (*candidate == index).then(|| self.joint.as_ref().map_or(*pair, |joint| joint[slot]))
-        })
+        self.get(index)
+            .map(|pair| self.joint.as_ref().map_or(pair, |joint| joint[index]))
     }
 }
 
@@ -606,50 +602,26 @@ pub(super) fn pairs(
     reference: usize,
     now: Instant,
 ) -> PairCohort {
-    let mut proposals: [Option<(usize, f64)>; MAX_CHALLENGERS] = [None; MAX_CHALLENGERS];
-    for (index, score) in snapshots.iter().enumerate() {
-        if index == reference || !normal_eligible(score, baseline) {
-            continue;
-        }
-        let value = utility(score, baseline);
-        let position = proposals.iter().position(|entry| {
-            entry.is_none_or(|(other, other_value)| {
-                value
-                    .total_cmp(&other_value)
-                    .then_with(|| nodes[other].id.cmp(&nodes[index].id))
-                    == Ordering::Greater
-            })
-        });
-        if let Some(position) = position {
-            proposals[position..].rotate_right(1);
-            proposals[position] = Some((index, value));
-        }
-    }
     let mut parent_key = AggregateKey {
         group: group.to_owned(),
         network: context.network,
         family: None,
         node_id: nodes[reference].id,
     };
-    let mut members = [(Uuid::nil(), None); MAX_CHALLENGERS + 1];
-    members[0] = (parent_key.node_id, inner.aggregate.peek(&parent_key));
-    let mut count = 0;
-    for (index, _) in proposals.iter().flatten() {
-        count += 1;
-        parent_key.node_id = nodes[*index].id;
-        members[count] = (parent_key.node_id, inner.aggregate.peek(&parent_key));
+    let mut members = vec![(parent_key.node_id, inner.aggregate.peek(&parent_key))];
+    let mut challengers = Vec::new();
+    for (index, score) in snapshots.iter().enumerate() {
+        if index == reference || !normal_eligible(score, baseline) {
+            continue;
+        }
+        parent_key.node_id = nodes[index].id;
+        members.push((parent_key.node_id, inner.aggregate.peek(&parent_key)));
+        challengers.push(index);
     }
-    let compared = compare_all(inner, group, context, members[0], &members[1..=count], now);
-    let mut cohort = PairCohort {
-        reference,
-        joint: None,
-        pairs: std::array::from_fn(|slot| {
-            proposals[slot].map(|(index, _)| (index, compared[slot]))
-        }),
-    };
+    let compared = compare_all(inner, group, context, members[0], &members[1..], now);
     let mut identity = None;
-    let needs_joint = cohort.pairs.iter().flatten().count() > 1
-        && cohort.pairs.iter().flatten().any(|(_, pair)| {
+    let needs_joint = compared.len() > 1
+        && compared.iter().any(|pair| {
             let Some(response) = pair.response else {
                 return true;
             };
@@ -658,28 +630,36 @@ pub(super) fn pairs(
             identity = Some(next);
             differs
         });
-    if needs_joint {
-        for basis in [
-            Basis::ExactTarget,
-            Basis::CommonTargets,
-            Basis::ConfiguredProbe,
-        ] {
-            if basis == Basis::ConfiguredProbe
-                && cohort.pairs.iter().flatten().any(|(_, pair)| {
-                    matches!(pair.basis, Basis::ExactTarget | Basis::CommonTargets)
-                        && pair.response.is_some()
-                })
-            {
-                continue;
-            }
-            if let Some(joint) = joint_pairs(inner, group, context, &members[..=count], basis, now)
-            {
-                cohort.joint = Some(joint);
-                break;
-            }
-        }
+    let business_response = compared.iter().any(|pair| {
+        matches!(pair.basis, Basis::ExactTarget | Basis::CommonTargets) && pair.response.is_some()
+    });
+    let joint = needs_joint
+        .then(|| {
+            [
+                Basis::ExactTarget,
+                Basis::CommonTargets,
+                Basis::ConfiguredProbe,
+            ]
+            .into_iter()
+            .filter(|basis| *basis != Basis::ConfiguredProbe || !business_response)
+            .find_map(|basis| joint_pairs(inner, group, context, &members, basis, now))
+        })
+        .flatten();
+    let mut pairs = vec![None; nodes.len()];
+    for (index, pair) in challengers.iter().zip(compared) {
+        pairs[*index] = Some(pair);
     }
-    cohort
+    PairCohort {
+        reference,
+        pairs,
+        joint: joint.map(|joint| {
+            let mut by_node = vec![PairEvidence::default(); nodes.len()];
+            for (index, pair) in challengers.iter().zip(joint) {
+                by_node[*index] = pair;
+            }
+            by_node
+        }),
+    }
 }
 
 fn joint_pairs(
@@ -689,13 +669,16 @@ fn joint_pairs(
     members: &[(Uuid, Option<&Stats>)],
     basis: Basis,
     now: Instant,
-) -> Option<[PairEvidence; MAX_CHALLENGERS]> {
+) -> Option<Vec<PairEvidence>> {
     let origin = inner.comparisons.origin?;
     let count = members.len() - 1;
-    let mut result = [PairEvidence {
-        basis,
-        ..PairEvidence::default()
-    }; MAX_CHALLENGERS];
+    let mut result = vec![
+        PairEvidence {
+            basis,
+            ..PairEvidence::default()
+        };
+        count
+    ];
     let mut targets = 0;
     let mut partial = false;
     // A duplicated node id resolves to its first member slot.
@@ -705,6 +688,16 @@ fn joint_pairs(
         .map(|(slot, (node, _))| (*node, slot))
         .collect();
     order.sort_unstable();
+    let slot_of = |cell: &Cell| {
+        let node = cell.key.node();
+        order
+            .get(order.partition_point(|(id, _)| *id < node))
+            .filter(|(id, slot)| *id == node && cell.valid(inner, members[*slot].1))
+            .map(|(_, slot)| *slot)
+    };
+    let (reference, reference_parent) = members[0];
+    let mut selected = vec![None; members.len()];
+    let mut next = vec![PairEvidence::default(); count];
     let mut cells = inner.comparisons.scope(group, context.network);
     while let Some(first) = cells.first() {
         let end = cells
@@ -729,19 +722,29 @@ fn joint_pairs(
         if !eligible {
             continue;
         }
-        let mut selected = [None; MAX_CHALLENGERS + 1];
+        // Keys are unique per node within a cohort: fewer cells than members cannot be complete.
+        if current.len() < members.len() {
+            partial |= current
+                .iter()
+                .find(|cell| cell.key.node() == reference && cell.valid(inner, reference_parent))
+                .is_some_and(|left| {
+                    current.iter().any(|right| {
+                        right.key.node() != reference
+                            && slot_of(right).is_some()
+                            && has_common_block(left, right, origin, now)
+                    })
+                });
+            continue;
+        }
+        selected.fill(None);
         for cell in current {
-            let node = cell.key.node();
-            if let Some(&(id, slot)) = order.get(order.partition_point(|(id, _)| *id < node))
-                && id == node
-                && cell.valid(inner, members[slot].1)
-            {
+            if let Some(slot) = slot_of(cell) {
                 selected[slot] = Some(cell);
             }
         }
-        if selected[..=count].iter().any(Option::is_none) {
+        if selected.iter().any(Option::is_none) {
             partial |= selected[0].is_some_and(|left| {
-                selected[1..=count]
+                selected[1..]
                     .iter()
                     .flatten()
                     .any(|right| has_common_block(left, right, origin, now))
@@ -753,7 +756,7 @@ fn joint_pairs(
         let mut blocks = [0_u8; 3];
         for (metric, mask) in blocks.iter_mut().enumerate() {
             for block in 0..BLOCKS {
-                if selected[..=count].iter().flatten().all(|cell| {
+                if selected.iter().flatten().all(|cell| {
                     timing.common(
                         &left.metrics[metric][block],
                         &cell.metrics[metric][block],
@@ -767,12 +770,11 @@ fn joint_pairs(
         }
         blocks[1] &= blocks[0];
         blocks[2] &= blocks[0];
-        let mut next = [PairEvidence::default(); MAX_CHALLENGERS];
-        for slot in 0..count {
-            next[slot] = paired_cell(left, selected[slot + 1]?, origin, now, basis, blocks);
+        for (slot, pair) in next.iter_mut().enumerate() {
+            *pair = paired_cell(left, selected[slot + 1]?, origin, now, basis, blocks);
         }
-        if next[..count].iter().any(|pair| pair.response.is_none()) {
-            partial |= selected[1..=count]
+        if next.iter().any(|pair| pair.response.is_none()) {
+            partial |= selected[1..]
                 .iter()
                 .flatten()
                 .any(|right| has_common_block(left, right, origin, now));
@@ -782,7 +784,7 @@ fn joint_pairs(
             partial = true;
             continue;
         }
-        for (pair, next) in result[..count].iter_mut().zip(&next[..count]) {
+        for (pair, next) in result.iter_mut().zip(&next) {
             merge_metric(&mut pair.response, next.response, targets);
             merge_metric(&mut pair.upload, next.upload, targets);
             merge_metric(&mut pair.download, next.download, targets);
@@ -795,7 +797,7 @@ fn joint_pairs(
     if targets == 0 {
         return None;
     }
-    for pair in &mut result[..count] {
+    for pair in &mut result {
         pair.partial = basis == Basis::CommonTargets && partial;
         for metric in [&mut pair.response, &mut pair.upload, &mut pair.download]
             .into_iter()
