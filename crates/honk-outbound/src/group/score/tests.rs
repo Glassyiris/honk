@@ -12,6 +12,7 @@ mod comparison;
 mod directional;
 mod evidence;
 mod live;
+mod loaded;
 mod performance;
 mod pressure;
 mod progress;
