@@ -229,12 +229,24 @@ pub(super) async fn session_writer(
         } else {
             Ok(write_op.await)
         };
-        let write_error = match &write_result {
+        let write_error = match write_result {
             Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(format!("{e}")),
-            Err(_) => Some(format!("write timed out after {WRITER_IO_TIMEOUT:?}")),
+            Ok(Err(error)) => Some(anyhow::Error::new(error)),
+            Err(error) => Some(
+                anyhow::Error::new(error)
+                    .context(format!("write timed out after {WRITER_IO_TIMEOUT:?}")),
+            ),
         };
         let succeeded = write_error.is_none();
+        if let Some(reason) = write_error {
+            debug!(
+                "AnyTLS session {} writer failed, closing: {}",
+                session.seq, reason
+            );
+            let _ = session.terminal_error.set(crate::SharedError::new(
+                crate::proxy::NodeFailure(reason.context("writer task write failed")).into(),
+            ));
+        }
         for command in &mut batch {
             match command {
                 FrameCommand::Control {
@@ -252,12 +264,8 @@ pub(super) async fn session_writer(
         }
 
         batch.clear();
-        if let Some(reason) = write_error {
-            debug!(
-                "AnyTLS session {} writer failed, closing: {}",
-                session.seq, reason
-            );
-            session.fail(anyhow::anyhow!("writer task write failed: {reason}"));
+        if !succeeded {
+            session.close();
             break;
         }
         if session.is_closed() {

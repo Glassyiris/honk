@@ -142,10 +142,65 @@ async fn a_server_alert_does_not_become_clean_eof() {
         .await
         .expect("read settles")
         .expect_err("an alerted session must not read as clean EOF");
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&error),
+        crate::group::ScoreOutcome::NodeFailure
+    );
     assert!(
         error.to_string().contains("authentication failed"),
         "error must carry the alert: {error}"
     );
+}
+
+#[tokio::test]
+async fn failed_session_preserves_node_failure_after_stream_unregistration() {
+    use crate::proxy::{MuxSession as _, PacketTransport as _};
+
+    let (session, mut server) = establish_test_session("failed-send").await;
+    expect_handshake(&mut server).await;
+    let transport = Arc::clone(&session)
+        .open_packet(
+            session.try_reserve().unwrap(),
+            "192.0.2.1:53".parse().unwrap(),
+            None,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("UoT transport must open"));
+    assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_SYN);
+    assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_PSH);
+    let queued_permit = session.acquire_data_permit(1).await.unwrap();
+    let confirmed_permit = session.acquire_data_permit(1).await.unwrap();
+
+    session.fail(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+
+    for error in [
+        transport.send_packet(b"late").await.unwrap_err(),
+        transport.send_packet_confirmed(b"late").await.unwrap_err(),
+        session
+            .enqueue_data_with_permit(
+                transport.sid,
+                bytes::Bytes::from_static(b"x"),
+                queued_permit,
+            )
+            .unwrap_err(),
+        session
+            .enqueue_confirmed_data_with_permit(
+                transport.sid,
+                bytes::Bytes::from_static(b"x"),
+                confirmed_permit,
+            )
+            .unwrap_err(),
+    ] {
+        assert_eq!(
+            crate::group::ScoreOutcome::from_io_error(&error),
+            crate::group::ScoreOutcome::NodeFailure
+        );
+        assert!(anyhow::Error::new(error).chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof)
+        }));
+    }
 }
 
 #[tokio::test]

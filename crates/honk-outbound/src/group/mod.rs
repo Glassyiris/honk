@@ -40,8 +40,8 @@ pub use score::{
     ScoreComparison, ScoreContinuation, ScoreEvidenceBasis, ScoreEvidenceGaps,
     ScoreEvidenceQuestion, ScoreFeedback, ScoreLocalComparison, ScoreOutcome, ScorePolicyState,
     ScoreReasonCounters, ScoreReasonGroupSnapshot, ScoreReporter, ScoreSelectionContext,
-    ScoreSource, ScoreTarget, ScoreTrialSource, ScoreValidationAction, ScoreVerificationCounters,
-    ScoreVerificationSnapshot, ScoreVerificationState, ScoreWaitReason,
+    ScoreSource, ScoreTarget, ScoreTrialSource, ScoreValidationAction, ScoreVerificationBlockers,
+    ScoreVerificationCounters, ScoreVerificationSnapshot, ScoreVerificationState, ScoreWaitReason,
 };
 pub use state::{InterruptCallback, PersistCallback, SelectorChangeCallback};
 

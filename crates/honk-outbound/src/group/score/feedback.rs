@@ -2,7 +2,7 @@ use super::evidence::Observation;
 use super::{
     FlowSample, LIVE_RX_INTERVAL, MAX_THROUGHPUT_DURATION, MIN_THROUGHPUT_BYTES,
     MIN_THROUGHPUT_DURATION, ScoreAttribution, ScoreAuthority, ScoreOutcome, ScorePolicyState,
-    ScoreSelectionContext, ScoreSource, StartedCells, budget, comparison,
+    ScoreSelectionContext, ScoreSource, StartedCells, budget, comparison, validation,
 };
 use parking_lot::Mutex;
 use std::hash::{Hash, Hasher};
@@ -130,8 +130,15 @@ impl ScoreAttempt {
         &self,
         now: Instant,
     ) -> Result<ScoreBusinessGuard, crate::proxy::PacketRejection> {
+        let mut inner = self.feedback.state.inner.lock();
+        if !validation::admissible(&inner, &self.feedback.context, &self.work, now) {
+            for work in self.work.iter() {
+                work.cancel_pending(&mut inner);
+            }
+            return Err(crate::proxy::PacketRejection::Cancelled);
+        }
         if !budget::begin(
-            &self.feedback.state,
+            &mut inner,
             &self.feedback.authority,
             &self.feedback.context,
             &self.feedback.attributions,
@@ -238,6 +245,13 @@ impl ScoreFeedback {
             self.probe_scope = scope.finish();
         }
         self
+    }
+    fn probe_scope(&self) -> u64 {
+        self.probe_interval.map_or(self.probe_scope, |interval| {
+            let mut scope = std::collections::hash_map::DefaultHasher::new();
+            (self.probe_scope, interval).hash(&mut scope);
+            scope.finish()
+        })
     }
 
     pub fn attributions(&self) -> &[ScoreAttribution] {
@@ -405,13 +419,7 @@ impl ScoreReporter {
             return;
         }
         progress.probe = true;
-        let scope = feedback
-            .probe_interval
-            .map_or(feedback.probe_scope, |interval| {
-                let mut scope = std::collections::hash_map::DefaultHasher::new();
-                (feedback.probe_scope, interval).hash(&mut scope);
-                scope.finish()
-            });
+        let scope = feedback.probe_scope();
         self.observe(
             Observation::Probe {
                 latency,
@@ -622,11 +630,27 @@ impl ScoreReporter {
             source: feedback.source,
             tx: progress.tx,
             rx: progress.rx,
-            last_rx_at: progress.last_rx_at,
             eligible_rx_at: progress.eligible_rx_at,
             elapsed: now.saturating_duration_since(self.shared.started),
             count_usefulness,
         };
+        if feedback.source == ScoreSource::HealthProbe
+            && !matches!(
+                outcome,
+                ScoreOutcome::Success
+                    | ScoreOutcome::Rejected
+                    | ScoreOutcome::Cancelled
+                    | ScoreOutcome::Shutdown
+            )
+        {
+            feedback.state.fail_probe_at(
+                &feedback.authority,
+                &feedback.context,
+                &feedback.attributions,
+                &mut progress.cells,
+                feedback.probe_scope(),
+            );
+        }
         feedback.state.finish_at(
             &feedback.context,
             &feedback.attributions,

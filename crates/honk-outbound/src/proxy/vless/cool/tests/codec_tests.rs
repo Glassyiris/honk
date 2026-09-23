@@ -96,7 +96,10 @@ async fn reader_accepts_payloads_larger_than_xray_writer_chunks() {
 #[tokio::test]
 async fn missing_writer_ack_is_conservatively_committed() {
     let (tx, mut rx) = mpsc::channel(1);
-    let writer = CarrierWriter { tx };
+    let writer = CarrierWriter {
+        tx,
+        failure: Arc::new(Mutex::new(None)),
+    };
     let pending =
         tokio::spawn(async move { writer.send(Bytes::from_static(b"frame"), true).await });
     let command = rx.recv().await.unwrap();

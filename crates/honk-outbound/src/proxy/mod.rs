@@ -24,10 +24,11 @@ mod outbound;
 mod packet;
 mod registry;
 
-pub(crate) use error::io_packet_rejection;
 pub use error::{
-    PacketErrorClass, PacketRejection, is_packet_rejection, packet_error_class, packet_rejection,
+    NodeFailure, PacketErrorClass, PacketRejection, TargetFailure, is_packet_rejection,
+    node_failure, packet_error_class, packet_rejection, target_failure,
 };
+pub(crate) use error::{io_node_failure, io_packet_rejection, io_target_failure};
 pub use outbound::{
     PacketOutbound, ProbeableOutbound, TcpOutbound, WarmOutcome, WarmRequirement, WarmableOutbound,
 };

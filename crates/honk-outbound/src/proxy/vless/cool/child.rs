@@ -60,7 +60,11 @@ impl VlessCoolStream {
         Poll::Ready(result)
     }
     fn terminal_error(&self) -> Option<io::Error> {
-        self.failure.lock().as_ref().map(Failure::io)
+        let failure = self.failure.lock().clone();
+        failure
+            .or_else(|| self.writer.failure.lock().clone())
+            .as_ref()
+            .map(Failure::io)
     }
 }
 
@@ -345,8 +349,14 @@ impl Drop for UdpSendCancellationGuard<'_> {
             return;
         }
         if self.admitted.load(Ordering::Acquire) {
-            self.session
-                .fail_child(self.id, Failure::source_post_admission_cancel());
+            let failure = self
+                .session
+                .writer
+                .failure
+                .lock()
+                .clone()
+                .unwrap_or_else(Failure::source_post_admission_cancel);
+            self.session.fail_child(self.id, failure);
             let _ = self.session.schedule_end(self.id);
             return;
         }

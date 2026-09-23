@@ -126,6 +126,53 @@ fn typed_packet_rejections_survive_io_and_anyhow_context() {
     }
 }
 
+#[test]
+fn failure_provenance_survives_shared_io_context_without_losing_cause() {
+    use crate::group::ScoreOutcome;
+    let failure = TargetFailure(anyhow::Error::new(std::io::Error::from_raw_os_error(
+        libc::ECONNREFUSED,
+    )));
+    let shared = crate::SharedError::new(anyhow::Error::new(failure).context("remote reply"));
+    let error = std::io::Error::other(std::io::Error::other(shared));
+    assert_eq!(
+        ScoreOutcome::from_io_error(&error),
+        ScoreOutcome::TargetFailure
+    );
+    let error = anyhow::Error::new(error).context("caller");
+    assert!(target_failure(&error));
+    assert_eq!(
+        ScoreOutcome::from_error(&error),
+        ScoreOutcome::TargetFailure
+    );
+    assert_eq!(
+        error
+            .root_cause()
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .raw_os_error(),
+        Some(libc::ECONNREFUSED)
+    );
+
+    let error = anyhow::Error::new(NodeFailure(anyhow::Error::new(
+        quinn::ConnectionError::TimedOut,
+    )));
+    assert_eq!(ScoreOutcome::from_error(&error), ScoreOutcome::NodeFailure);
+    let error = std::io::Error::from(quinn::ReadError::ConnectionLost(
+        quinn::ConnectionError::TimedOut,
+    ));
+    assert_eq!(
+        ScoreOutcome::from_io_error(&error),
+        ScoreOutcome::NodeFailure
+    );
+    let error = anyhow::Error::new(TargetFailure(anyhow::Error::new(
+        PacketRejection::Cancelled,
+    )));
+    assert_eq!(ScoreOutcome::from_error(&error), ScoreOutcome::Cancelled);
+    assert!(!target_failure(&anyhow::Error::new(
+        std::io::Error::from_raw_os_error(libc::ECONNREFUSED)
+    )));
+}
+
 /// Without the `rprx` feature a parsed VLESS/VMess node must hit the
 /// ordinary no-handler refusal, never a panic.
 #[cfg(not(feature = "rprx"))]

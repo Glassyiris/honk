@@ -583,10 +583,39 @@ async fn end_error_and_physical_eof_fail_children() {
         first.write_all(b"late").await.unwrap_err().kind(),
         io::ErrorKind::BrokenPipe
     );
+    let refused = second.read_u8().await.unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::ConnectionReset);
     assert_eq!(
-        second.read_u8().await.unwrap_err().kind(),
-        io::ErrorKind::ConnectionReset
+        crate::group::ScoreOutcome::from_io_error(&refused),
+        crate::group::ScoreOutcome::TargetFailure
     );
+
+    let udp = open_xudp(
+        Arc::clone(&session),
+        session.try_reserve().unwrap(),
+        udp_target(),
+        None,
+        [1; 8],
+    )
+    .await
+    .unwrap_or_else(|_| panic!("TCP refusal must leave the carrier usable"));
+    udp.send_packet_confirmed(b"query").await.unwrap();
+    let udp_id = read_wire_frame(&mut wire).await.id;
+    wire.write_all(&response_frame(
+        udp_id,
+        STATUS_KEEP,
+        OPTION_ERROR,
+        None,
+        None,
+    ))
+    .await
+    .unwrap();
+    let udp_error = udp.recv_packet(&mut [0; 1]).await.unwrap_err();
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&udp_error),
+        crate::group::ScoreOutcome::NodeFailure
+    );
+    assert!(!session.is_closed());
 
     let mut third = open_tcp(
         Arc::clone(&session),
@@ -607,8 +636,16 @@ async fn end_error_and_physical_eof_fail_children() {
     let _ = read_wire_frame(&mut wire).await;
     let _ = read_wire_frame(&mut wire).await;
     drop(wire);
-    assert!(third.read_u8().await.is_err());
-    assert!(fourth.read_u8().await.is_err());
+    let physical = third.read_u8().await.unwrap_err();
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&physical),
+        crate::group::ScoreOutcome::NodeFailure
+    );
+    let sibling = fourth.read_u8().await.unwrap_err();
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&sibling),
+        crate::group::ScoreOutcome::NodeFailure
+    );
     assert!(session.is_closed());
 }
 

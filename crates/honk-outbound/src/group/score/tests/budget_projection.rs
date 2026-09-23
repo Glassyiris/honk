@@ -234,6 +234,17 @@ fn expired_earned_reservation_is_available_but_started_work_never_refunds() {
         manager.score_budget_counters("score", SelectionNetwork::Tcp),
         before
     );
+    let ordinary = state.rank_plan_at("score", &target, &refs, later).1;
+    ordinary
+        .begin_at(later)
+        .unwrap()
+        .finish(ScoreOutcome::Cancelled);
+    assert_eq!(
+        manager
+            .score_budget_counters("score", SelectionNetwork::Tcp)
+            .spent,
+        before.spent
+    );
     let attempt = state.rank_plan_at("score", &target, &refs, later).1;
     let started = attempt.begin_at(later).unwrap();
     assert!(pending.begin_at(later).is_err());

@@ -175,7 +175,7 @@ impl Session {
 
 /// How the relay task ended, when it failed: a rejected response header or
 /// an invalid chunk reads as that error, not as EOF.
-type RelayFailure = std::sync::Arc<std::sync::OnceLock<(std::io::ErrorKind, String)>>;
+type RelayFailure = std::sync::Arc<std::sync::OnceLock<(std::io::ErrorKind, crate::SharedError)>>;
 
 struct VmessStream {
     inner: tokio::io::DuplexStream,
@@ -202,10 +202,12 @@ async fn vmess_relay_recorded(
 ) {
     if let Err(error) = vmess_relay(server, &mut client, header_wire, session).await {
         let kind = error
-            .downcast_ref::<std::io::Error>()
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
             .map(std::io::Error::kind)
             .unwrap_or(std::io::ErrorKind::InvalidData);
-        let _ = failure.set((kind, format!("vmess: {error:#}")));
+        let message = format!("vmess: {error:#}");
+        let _ = failure.set((kind, crate::SharedError::new(error.context(message))));
     }
     drop(client);
 }
@@ -629,7 +631,9 @@ async fn vmess_relay(
     };
 
     let download = async {
-        read_response_header(&mut server_read, &session).await?;
+        read_response_header(&mut server_read, &session)
+            .await
+            .map_err(crate::proxy::NodeFailure)?;
 
         let mut body = BodyChunks::new(&session.resp_key, &session.resp_iv)?;
         loop {
@@ -643,13 +647,17 @@ async fn vmess_relay(
             if chunk_len == GCM_TAG_LEN {
                 break;
             }
-            anyhow::ensure!(
-                chunk_len > GCM_TAG_LEN && chunk_len <= CHUNK_MAX_LEN + GCM_TAG_LEN,
-                "invalid VMess chunk size {chunk_len}"
-            );
+            if !(chunk_len > GCM_TAG_LEN && chunk_len <= CHUNK_MAX_LEN + GCM_TAG_LEN) {
+                return Err(crate::proxy::NodeFailure(anyhow::anyhow!(
+                    "invalid VMess chunk size {chunk_len}"
+                ))
+                .into());
+            }
             let mut ct = vec![0u8; chunk_len];
             server_read.read_exact(&mut ct).await?;
-            let n = body.open_chunk(&mut ct)?;
+            let n = body
+                .open_chunk(&mut ct)
+                .map_err(crate::proxy::NodeFailure)?;
             client_write.write_all(&ct[..n]).await?;
         }
         Ok::<(), anyhow::Error>(())

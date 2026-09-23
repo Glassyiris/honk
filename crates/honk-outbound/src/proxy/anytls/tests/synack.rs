@@ -24,6 +24,10 @@ async fn test_synack_with_data_surfaces_open_error() {
         .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
     assert!(err.to_string().contains("refused"));
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&err),
+        crate::group::ScoreOutcome::TargetFailure
+    );
     assert!(!session.is_closed(), "target refusal keeps the session");
     assert!(!session.streams.lock().unwrap().contains_key(&stream.sid));
 }
@@ -277,6 +281,10 @@ async fn synack_timeout_on_active_session_resets_only_the_stream() {
     let err = second.read(&mut buf).await.unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
     assert!(err.to_string().contains("not acknowledged"), "{err}");
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&err),
+        crate::group::ScoreOutcome::NodeFailure
+    );
     let n = first.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"ok", "the sibling stream keeps its data");
 }

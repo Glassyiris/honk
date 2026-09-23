@@ -212,7 +212,9 @@ async fn terminal_event_releases_later_payload_credit() {
     let (credit, _wait) = budget.acquire(&session, 401, BUDGET).await.unwrap();
     let credit = credit.unwrap();
     failed_tx
-        .send(StreamEvent::Error(Arc::from("target refused")))
+        .send(StreamEvent::Error(crate::SharedError::new(
+            anyhow::anyhow!("target refused"),
+        )))
         .await
         .unwrap();
     failed_tx

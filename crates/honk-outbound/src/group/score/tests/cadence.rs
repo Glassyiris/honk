@@ -194,16 +194,16 @@ fn expired_backoff_gets_bounded_recovery_despite_normal_exclusion() {
     }
     let expired = now + SCORE_EXPLORE_BACKOFF_BASE * 4 + Duration::from_secs(1);
     let mut active = Vec::new();
+    let feedback = manager
+        .feedback_for_group_node("score", nodes[0].id, target.clone())
+        .unwrap();
+    for _ in 0..4 {
+        let reporter = feedback.start_at(expired);
+        reporter.setup_succeeded_at(expired);
+        reporter.transfer_at(1, 1, expired);
+        active.push(reporter);
+    }
     for leaf in &nodes {
-        let feedback = manager
-            .feedback_for_group_node("score", leaf.id, target.clone())
-            .unwrap();
-        for _ in 0..4 {
-            let reporter = feedback.start_at(expired);
-            reporter.setup_succeeded_at(expired);
-            reporter.transfer_at(1, 1, expired);
-            active.push(reporter);
-        }
         probe_at(
             &manager,
             leaf,
@@ -213,11 +213,13 @@ fn expired_backoff_gets_bounded_recovery_despite_normal_exclusion() {
             expired,
         );
     }
-    let recovered = manager
-        .score_state()
-        .verification_snapshot_at("score", &aggregate, &[&nodes[1]], expired)
-        .unwrap();
-    assert_eq!(recovered.state, ScoreVerificationState::ObservedUsable);
+    let decision = ranking::decision(&state.inner.lock(), "score", &target, &node_refs, expired);
+    assert_eq!(decision.scores[1].fail_streak, 3);
+    assert!(!decision.scores[1].explore_backed_off);
+    assert!(!ranking::normal_eligible(
+        &decision.scores[1],
+        decision.baseline
+    ));
     for reporter in active {
         reporter.finish_at(ScoreOutcome::Cancelled, true, expired);
     }
@@ -617,7 +619,28 @@ fn qualified_trial_does_not_replace_committed_incumbent_without_new_evidence() {
         .unwrap()
         .start_at(at)
         .finish_at(ScoreOutcome::Cancelled, false, at);
+    for _ in 0..4 * exploration_period(nodes.len()) {
+        manager
+            .feedback_for_group_node("score", nodes[0].id, target.clone())
+            .unwrap()
+            .business()
+            .begin_at(at)
+            .unwrap()
+            .start_at(at)
+            .finish_at(ScoreOutcome::Cancelled, false, at);
+    }
     at += PERFORMANCE_MAX_AGE;
+    let before_control = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    let (index, control) = state.rank_plan_at("score", &target, &node_refs, at);
+    assert_eq!(index, 0);
+    control
+        .begin_at(at)
+        .unwrap()
+        .start_at(at)
+        .finish_at(ScoreOutcome::Cancelled, false, at);
+    let after_control = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    assert_eq!(after_control.spent, before_control.spent);
+    assert_eq!(after_control.trial_starts, before_control.trial_starts);
     let (index, feedback) = state.rank_plan_at("score", &target, &node_refs, at);
     assert_eq!(index, 1);
     feedback
@@ -694,7 +717,7 @@ fn first_normal_selection_uses_quality_not_the_last_startup_trial() {
 }
 
 #[test]
-fn real_success_steps_down_failure_backoff_instead_of_resetting_the_streak() {
+fn terminal_success_with_same_time_rx_does_not_clear_failure_backoff() {
     let leaf = node("recovering");
     let nodes = std::slice::from_ref(&leaf);
     let manager = GroupManager::new(&[group("score", nodes)], nodes);
@@ -714,13 +737,13 @@ fn real_success_steps_down_failure_backoff_instead_of_resetting_the_streak() {
     success.finish_at(ScoreOutcome::Success, true, now);
     let state = manager.score_state();
     let recovered = score_snapshot(&state.inner.lock(), "score", &target, leaf.id, now);
-    assert_eq!(recovered.fail_streak, 1);
-    assert!(!recovered.explore_backed_off);
+    assert_eq!(recovered.fail_streak, 2);
+    assert!(recovered.explore_backed_off);
 
     feedback
         .start_at(now)
         .finish_at(ScoreOutcome::Timeout, true, now);
-    let until = now + SCORE_EXPLORE_BACKOFF_BASE * 2;
+    let until = now + SCORE_EXPLORE_BACKOFF_BASE * 4;
     let before = score_snapshot(
         &state.inner.lock(),
         "score",
@@ -729,7 +752,7 @@ fn real_success_steps_down_failure_backoff_instead_of_resetting_the_streak() {
         until - Duration::from_nanos(1),
     );
     let expired = score_snapshot(&state.inner.lock(), "score", &target, leaf.id, until);
-    assert_eq!(expired.fail_streak, 2);
+    assert_eq!(expired.fail_streak, 3);
     assert!(before.explore_backed_off);
     assert!(!expired.explore_backed_off);
 }

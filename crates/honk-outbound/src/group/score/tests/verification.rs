@@ -342,10 +342,6 @@ fn funded_large_group_focuses_promising_contender_until_graduation() {
         snapshot.pending_count > 0,
         "untried rivals cannot be called beaten"
     );
-    println!(
-        "32-leaf graduation={}ms focused trials={focused_trials}",
-        step * 100
-    );
 }
 
 #[test]
@@ -393,16 +389,16 @@ fn old_history_cannot_refresh_availability_with_one_new_success() {
         let target = context("business.example", IpVersion::V4);
         let now = Instant::now();
         let state = manager.score_state();
-        state.inner.lock().exact.put(
-            ExactKey {
-                group: "score".into(),
-                network: target.network,
-                family: IpVersion::V4,
-                target: target.target.clone().unwrap(),
-                node_id: nodes[0].id,
-            },
-            trained_stats(history, 100.0, now),
+        train_at(
+            &manager,
+            &nodes[0],
+            &target,
+            history as usize,
+            Duration::from_millis(100),
+            1,
+            now,
         );
+        let now = now + Duration::from_secs(1);
         assert_eq!(
             verification_at(&manager, &nodes, &target, now).state,
             ScoreVerificationState::ObservedUsable
@@ -878,16 +874,15 @@ fn availability_validity_does_not_depend_on_decaying_terminal_completions() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
-    manager.score_state().inner.lock().exact.put(
-        ExactKey {
-            group: "score".into(),
-            network: target.network,
-            family: IpVersion::V4,
-            target: target.target.clone().unwrap(),
-            node_id: nodes[0].id,
-        },
-        trained_stats(4.0, 100.0, now),
-    );
+    for _ in 0..4 {
+        let reporter = manager
+            .feedback_for_group_node("score", nodes[0].id, target.clone())
+            .unwrap()
+            .start_at(now);
+        reporter.setup_succeeded_at(now);
+        reporter.transfer_at(1, 1, now);
+        reporter.finish_at(ScoreOutcome::Success, true, now);
+    }
     let snapshot = verification_at(&manager, &nodes, &target, now);
     assert_eq!(snapshot.state, ScoreVerificationState::ObservedUsable);
     let validity = snapshot.valid_for_ms.unwrap();

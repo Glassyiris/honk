@@ -1,19 +1,17 @@
-use super::evidence::Observation;
+use super::evidence::CellStamp;
 use super::ranking::{normal_eligible, utility};
 use super::verification::{TimedMetric, VerificationEvidence};
-use super::{
-    AggregateKey, ExactKey, MAX_THROUGHPUT_DURATION, MIN_THROUGHPUT_BYTES, MIN_THROUGHPUT_DURATION,
-    ScoreAttribution, ScoreSelectionContext, ScoreSnapshot, ScoreSource, ScoreTarget, StartedCells,
-    StateInner, Stats,
-};
+use super::{AggregateKey, ExactKey, ScoreSelectionContext, ScoreSnapshot, StateInner, Stats};
 use honk_config::node::Node;
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
-use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+mod store;
+use store::{Bucket, Cell, Key, Timing};
+pub(super) use store::{Store, observe, target_bytes};
 mod summary;
 pub(super) use summary::summarize;
 
@@ -21,10 +19,8 @@ pub(super) const MAX_CELLS: usize = 256;
 pub(super) const MAX_TARGETS: usize = 8;
 pub(super) const MAX_CHALLENGERS: usize = 4;
 pub(super) const MAX_LOGICAL_BYTES: usize = 1024 * 1024;
-const MAX_KEY_BYTES: usize = 1024;
-const BLOCK_SECONDS: u64 = 15;
+pub(super) const MAX_KEY_BYTES: usize = 1024;
 const BLOCKS: usize = 4;
-const LIFETIME: Duration = Duration::from_secs(BLOCK_SECONDS * BLOCKS as u64);
 const REPORTERS: usize = 4;
 
 pub(super) fn next_reporter_id() -> u64 {
@@ -70,6 +66,7 @@ pub(super) struct PairEvidence {
 pub(super) struct PairCohort {
     pub reference: usize,
     pub pairs: [Option<(usize, PairEvidence)>; MAX_CHALLENGERS],
+    pub joint: Option<[PairEvidence; MAX_CHALLENGERS]>,
 }
 
 impl PairCohort {
@@ -79,465 +76,12 @@ impl PairCohort {
             .flatten()
             .find_map(|(candidate, pair)| (*candidate == index).then_some(*pair))
     }
-}
 
-#[derive(Clone, Copy, Default)]
-struct Bucket {
-    block: u64,
-    count: u32,
-    sum: f64,
-    min: f64,
-    max: f64,
-    first: Option<Instant>,
-    last: Option<Instant>,
-    reporters: [u64; REPORTERS],
-}
-
-impl Bucket {
-    fn record(&mut self, block: u64, value: f64, reporter: u64, now: Instant) {
-        if self.count == 0 || self.block != block {
-            *self = Self {
-                block,
-                min: value,
-                max: value,
-                first: Some(now),
-                ..Self::default()
-            };
-        }
-        if self.count == u32::MAX {
-            return;
-        }
-        self.count += 1;
-        self.sum += value;
-        self.min = self.min.min(value);
-        self.max = self.max.max(value);
-        self.first = Some(self.first.map_or(now, |at| at.min(now)));
-        self.last = Some(self.last.map_or(now, |at| at.max(now)));
-        if !self.reporters.contains(&reporter)
-            && let Some(slot) = self.reporters.iter_mut().find(|id| **id == 0)
-        {
-            *slot = reporter;
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-enum Key {
-    Traffic(ExactKey),
-    Probe {
-        key: AggregateKey,
-        scope: u64,
-        slot: usize,
-        interval: Option<Duration>,
-    },
-}
-
-impl Key {
-    fn group(&self) -> &str {
-        match self {
-            Self::Traffic(key) => &key.group,
-            Self::Probe { key, .. } => &key.group,
-        }
-    }
-
-    fn node(&self) -> Uuid {
-        match self {
-            Self::Traffic(key) => key.node_id,
-            Self::Probe { key, .. } => key.node_id,
-        }
-    }
-
-    fn network(&self) -> super::SelectionNetwork {
-        match self {
-            Self::Traffic(key) => key.network,
-            Self::Probe { key, .. } => key.network,
-        }
-    }
-
-    fn timing(&self) -> Option<Timing> {
-        let interval = match self {
-            Self::Probe { interval, .. } => *interval,
-            Self::Traffic(_) => None,
-        };
-        let doubled = match interval {
-            Some(interval) if !interval.is_zero() => interval.checked_mul(2)?,
-            Some(_) => return None,
-            None => Duration::ZERO,
-        };
-        let width = Duration::from_secs(BLOCK_SECONDS).max(doubled);
-        width.checked_mul(BLOCKS as u32)?;
-        Some(Timing {
-            width,
-            freshness: LIFETIME.max(doubled),
+    pub fn summary_pair(&self, index: usize) -> Option<PairEvidence> {
+        self.pairs.iter().enumerate().find_map(|(slot, pair)| {
+            let (candidate, pair) = pair.as_ref()?;
+            (*candidate == index).then(|| self.joint.as_ref().map_or(*pair, |joint| joint[slot]))
         })
-    }
-
-    fn heap_bytes(&self) -> usize {
-        match self {
-            Self::Traffic(key) => key.group.capacity() + target_bytes(&key.target),
-            Self::Probe { key, .. } => key.group.capacity(),
-        }
-    }
-
-    fn cohort_cmp(&self, other: &Self) -> Ordering {
-        self.group()
-            .cmp(other.group())
-            .then_with(|| (self.network() as u8).cmp(&(other.network() as u8)))
-            .then_with(|| match (self, other) {
-                (Self::Traffic(left), Self::Traffic(right)) => (left.family as u8)
-                    .cmp(&(right.family as u8))
-                    .then_with(|| target_cmp(&left.target, &right.target)),
-                (
-                    Self::Probe {
-                        scope: left,
-                        slot: a,
-                        interval: left_interval,
-                        ..
-                    },
-                    Self::Probe {
-                        scope: right,
-                        slot: b,
-                        interval: right_interval,
-                        ..
-                    },
-                ) => a
-                    .cmp(b)
-                    .then_with(|| left.cmp(right))
-                    .then_with(|| left_interval.cmp(right_interval)),
-                (Self::Traffic(_), Self::Probe { .. }) => Ordering::Less,
-                (Self::Probe { .. }, Self::Traffic(_)) => Ordering::Greater,
-            })
-    }
-
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.cohort_cmp(other)
-            .then_with(|| self.node().cmp(&other.node()))
-    }
-
-    fn stats<'a>(&self, inner: &'a StateInner) -> Option<&'a Stats> {
-        match self {
-            Self::Traffic(key) => inner.exact.peek(key),
-            Self::Probe { key, .. } => inner.aggregate.peek(key),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Timing {
-    width: Duration,
-    freshness: Duration,
-}
-
-impl Timing {
-    fn deadline(self, origin: Instant, block: u64) -> Option<Instant> {
-        let nanos = self
-            .width
-            .as_nanos()
-            .checked_mul(u128::from(block.checked_add(BLOCKS as u64)?))?;
-        let duration = Duration::new(
-            u64::try_from(nanos / 1_000_000_000).ok()?,
-            (nanos % 1_000_000_000) as u32,
-        );
-        origin.checked_add(duration)
-    }
-
-    fn common(self, left: &Bucket, right: &Bucket, origin: Instant, now: Instant) -> bool {
-        left.count > 0
-            && right.count > 0
-            && left.block == right.block
-            && left.last.is_some_and(|at| at <= now)
-            && right.last.is_some_and(|at| at <= now)
-            && self
-                .deadline(origin, left.block)
-                .is_some_and(|until| now < until)
-    }
-}
-
-fn target_bytes(target: &ScoreTarget) -> usize {
-    match target {
-        ScoreTarget::Domain { host, .. } => host.capacity(),
-        ScoreTarget::Socket(_) => 0,
-    }
-}
-
-fn target_cmp(left: &ScoreTarget, right: &ScoreTarget) -> Ordering {
-    match (left, right) {
-        (ScoreTarget::Domain { host: a, port: ap }, ScoreTarget::Domain { host: b, port: bp }) => {
-            a.cmp(b).then_with(|| ap.cmp(bp))
-        }
-        (ScoreTarget::Socket(a), ScoreTarget::Socket(b)) => a.cmp(b),
-        (ScoreTarget::Domain { .. }, ScoreTarget::Socket(_)) => Ordering::Less,
-        (ScoreTarget::Socket(_), ScoreTarget::Domain { .. }) => Ordering::Greater,
-    }
-}
-
-struct Cell {
-    key: Key,
-    incarnation: u64,
-    invalidated_through: Option<Instant>,
-    metrics: [[Bucket; BLOCKS]; 3],
-    touched: Instant,
-}
-
-impl Cell {
-    fn valid(&self, inner: &StateInner) -> bool {
-        self.key.stats(inner).is_some_and(|stats| {
-            stats.incarnation == self.incarnation
-                && stats.business_invalidated_through == self.invalidated_through
-                && match &self.key {
-                    Key::Probe { scope, slot, .. } => stats.probes[*slot].scope == *scope,
-                    Key::Traffic(_) => true,
-                }
-        })
-    }
-}
-
-#[derive(Default)]
-pub(super) struct Store {
-    cells: Vec<Cell>,
-    origin: Option<Instant>,
-    key_bytes: usize,
-    pub expired: u64,
-    pub evicted: u64,
-    pub rejected: u64,
-}
-
-// Vec has no hidden per-entry links/buckets. String capacities, the Vec's full
-// allocation and the Store itself are all charged, including unused slots.
-const _: () = assert!(
-    size_of::<Store>() + MAX_CELLS * (size_of::<Cell>() + MAX_KEY_BYTES) <= MAX_LOGICAL_BYTES
-);
-
-impl Store {
-    pub(super) fn clear(&mut self) {
-        self.cells.clear();
-        self.key_bytes = 0;
-        self.origin = None;
-    }
-
-    pub(super) fn logical_bytes(&self) -> usize {
-        size_of::<Self>() + self.cells.capacity() * size_of::<Cell>() + self.key_bytes
-    }
-
-    pub(super) fn cell_count(&self) -> usize {
-        self.cells.len()
-    }
-
-    pub(super) fn logical_capacity_bound() -> usize {
-        size_of::<Self>() + MAX_CELLS * (size_of::<Cell>() + MAX_KEY_BYTES)
-    }
-
-    fn remove(&mut self, index: usize) {
-        self.key_bytes -= self.cells.remove(index).key.heap_bytes();
-    }
-
-    fn record(
-        &mut self,
-        key: Key,
-        stats: &Stats,
-        values: [Option<f64>; 3],
-        reporter: u64,
-        now: Instant,
-    ) {
-        if let Key::Probe {
-            key, scope, slot, ..
-        } = &key
-            && stats.probes[*slot].scope != *scope
-        {
-            // Stats still holds the previous scope until this observation is published.
-            let mut index = 0;
-            while index < self.cells.len() {
-                if matches!(&self.cells[index].key, Key::Probe { key: old, slot: old_slot, .. }
-                    if old == key && old_slot == slot)
-                {
-                    self.remove(index);
-                } else {
-                    index += 1;
-                }
-            }
-        }
-        if reporter == 0
-            || stats
-                .business_invalidated_through
-                .is_some_and(|at| now <= at)
-        {
-            return;
-        }
-        let Some(timing) = key.timing() else {
-            return;
-        };
-        let origin = *self.origin.get_or_insert(now);
-        let Some(elapsed) = now.checked_duration_since(origin) else {
-            return;
-        };
-        let Ok(block) = u64::try_from(elapsed.as_nanos() / timing.width.as_nanos()) else {
-            return;
-        };
-        if timing.deadline(origin, block).is_none() {
-            return;
-        }
-        let heap = key.heap_bytes();
-        if heap > MAX_KEY_BYTES {
-            self.rejected = self.rejected.saturating_add(1);
-            return;
-        }
-        let mut index = self.cells.binary_search_by(|cell| cell.key.cmp(&key));
-        if index.is_err() {
-            let mut position = 0;
-            while position < self.cells.len() {
-                let cell = &self.cells[position];
-                if cell.key.timing().is_none_or(|timing| {
-                    now.saturating_duration_since(cell.touched) >= timing.freshness
-                }) {
-                    self.remove(position);
-                    self.expired = self.expired.saturating_add(1);
-                } else {
-                    position += 1;
-                }
-            }
-            if self.cells.len() == MAX_CELLS
-                && let Some((oldest, _)) = self
-                    .cells
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, cell)| cell.touched)
-            {
-                self.remove(oldest);
-                self.evicted = self.evicted.saturating_add(1);
-            }
-            if self.cells.capacity() == 0 {
-                self.cells.reserve_exact(MAX_CELLS);
-            }
-            if self.logical_bytes().saturating_add(heap) > MAX_LOGICAL_BYTES {
-                self.rejected = self.rejected.saturating_add(1);
-                return;
-            }
-            index = self.cells.binary_search_by(|cell| cell.key.cmp(&key));
-        }
-        let index = match index {
-            Ok(index) => index,
-            Err(index) => {
-                self.key_bytes += heap;
-                self.cells.insert(
-                    index,
-                    Cell {
-                        key,
-                        incarnation: stats.incarnation,
-                        invalidated_through: stats.business_invalidated_through,
-                        metrics: [[Bucket::default(); BLOCKS]; 3],
-                        touched: now,
-                    },
-                );
-                index
-            }
-        };
-        let cell = &mut self.cells[index];
-        if cell.incarnation != stats.incarnation
-            || cell.invalidated_through != stats.business_invalidated_through
-        {
-            cell.metrics = [[Bucket::default(); BLOCKS]; 3];
-            cell.incarnation = stats.incarnation;
-            cell.invalidated_through = stats.business_invalidated_through;
-        }
-        cell.touched = cell.touched.max(now);
-        for (metric, value) in cell.metrics.iter_mut().zip(values) {
-            if let Some(value) = value.filter(|value| value.is_finite() && *value >= 0.0) {
-                let bucket = &mut metric[block as usize % BLOCKS];
-                // A delayed callback cannot overwrite a newer block in the ring.
-                if bucket.count == 0 || bucket.block <= block {
-                    bucket.record(block, value, reporter, now);
-                }
-            }
-        }
-    }
-}
-
-pub(super) fn observe(
-    inner: &mut StateInner,
-    context: &ScoreSelectionContext,
-    attributions: &[ScoreAttribution],
-    (cells, reporter_id): (&[StartedCells], u64),
-    source: ScoreSource,
-    observation: &Observation,
-    now: Instant,
-) {
-    if reporter_id == 0 && source != ScoreSource::HealthProbe {
-        return;
-    }
-    let values = match (source, observation) {
-        (ScoreSource::Traffic, Observation::Response(latency)) => {
-            [Some(latency.as_secs_f64() * 1000.0), None, None]
-        }
-        (ScoreSource::Traffic, Observation::Transfer { tx, rx, elapsed })
-            if *elapsed >= MIN_THROUGHPUT_DURATION && *elapsed <= MAX_THROUGHPUT_DURATION =>
-        {
-            [
-                None,
-                (*tx >= MIN_THROUGHPUT_BYTES).then(|| *tx as f64 / elapsed.as_secs_f64()),
-                (*rx >= MIN_THROUGHPUT_BYTES).then(|| *rx as f64 / elapsed.as_secs_f64()),
-            ]
-        }
-        (ScoreSource::HealthProbe, Observation::Probe { latency, .. }) => {
-            [Some(latency.as_secs_f64() * 1000.0), None, None]
-        }
-        _ => return,
-    };
-    for (attribution, started) in attributions.iter().zip(cells) {
-        if attribution.group.len() > MAX_KEY_BYTES {
-            inner.comparisons.rejected = inner.comparisons.rejected.saturating_add(1);
-            continue;
-        }
-        let (key, captured) = match observation {
-            Observation::Probe {
-                scope,
-                slot,
-                interval,
-                ..
-            } => (
-                Key::Probe {
-                    key: AggregateKey {
-                        group: attribution.group.clone(),
-                        network: context.network,
-                        family: None,
-                        node_id: attribution.node_id,
-                    },
-                    scope: *scope,
-                    slot: *slot,
-                    interval: *interval,
-                },
-                started.aggregate[0],
-            ),
-            _ => {
-                let (Some(family), Some(target)) = (context.target_family, context.target.as_ref())
-                else {
-                    continue;
-                };
-                if attribution.group.len().saturating_add(target_bytes(target)) > MAX_KEY_BYTES {
-                    inner.comparisons.rejected = inner.comparisons.rejected.saturating_add(1);
-                    continue;
-                }
-                (
-                    Key::Traffic(ExactKey {
-                        group: attribution.group.clone(),
-                        network: context.network,
-                        family,
-                        target: target.clone(),
-                        node_id: attribution.node_id,
-                    }),
-                    started.exact,
-                )
-            }
-        };
-        // Only the admitted incarnation may publish; evicted cells are not recreated here.
-        let stats = match &key {
-            Key::Traffic(key) => inner.exact.peek(key),
-            Key::Probe { key, .. } => inner.aggregate.peek(key),
-        };
-        if let Some(stats) = stats.filter(|stats| captured == Some(stats.incarnation)) {
-            inner
-                .comparisons
-                .record(key, stats, values, reporter_id, now);
-        }
     }
 }
 
@@ -585,13 +129,14 @@ fn metric_pair(
     origin: Instant,
     now: Instant,
     timing: Timing,
+    blocks: u8,
     mut support: std::collections::hash_map::DefaultHasher,
 ) -> Option<MetricPair> {
     let mut a = Accumulator::default();
     let mut b = Accumulator::default();
     let mut expires = None;
-    for (left, right) in left.iter().zip(right) {
-        if !timing.common(left, right, origin, now) {
+    for (index, (left, right)) in left.iter().zip(right).enumerate() {
+        if blocks & (1 << index) == 0 || !timing.common(left, right, origin, now) {
             continue;
         }
         let until = timing.deadline(origin, left.block)?;
@@ -668,6 +213,7 @@ fn paired_cell(
     origin: Instant,
     now: Instant,
     basis: Basis,
+    blocks: [u8; 3],
 ) -> PairEvidence {
     let mut result = PairEvidence {
         basis,
@@ -687,12 +233,18 @@ fn paired_cell(
             slot.hash(&mut support);
         }
     }
-    for ((a, b), output) in left.metrics.iter().zip(&right.metrics).zip([
-        &mut result.response,
-        &mut result.upload,
-        &mut result.download,
-    ]) {
-        *output = metric_pair(a, b, origin, now, timing, support.clone());
+    for (index, ((a, b), output)) in left
+        .metrics
+        .iter()
+        .zip(&right.metrics)
+        .zip([
+            &mut result.response,
+            &mut result.upload,
+            &mut result.download,
+        ])
+        .enumerate()
+    {
+        *output = metric_pair(a, b, origin, now, timing, blocks[index], support.clone());
     }
     result
 }
@@ -701,8 +253,8 @@ fn compare(
     inner: &StateInner,
     group: &str,
     context: &ScoreSelectionContext,
-    incumbent: Uuid,
-    candidate: Uuid,
+    (incumbent, incumbent_parent): (Uuid, Option<&Stats>),
+    (candidate, candidate_parent): (Uuid, Option<&Stats>),
     now: Instant,
 ) -> PairEvidence {
     let empty = PairEvidence::default();
@@ -717,12 +269,13 @@ fn compare(
     let mut exact = None;
     let mut probe = None;
     let mut pending: Option<&Cell> = None;
+    let parents = [incumbent_parent, candidate_parent];
     // Sorted cohorts allow a single bounded store scan, without an all-pairs index.
     for cell in &inner.comparisons.cells {
         if cell.key.group() != group
             || cell.key.network() != context.network
             || ![incumbent, candidate].contains(&cell.key.node())
-            || !cell.valid(inner)
+            || !cell.valid(inner, parents[usize::from(cell.key.node() == candidate)])
         {
             continue;
         }
@@ -747,7 +300,14 @@ fn compare(
                             pending = None;
                             continue;
                         }
-                        let pair = paired_cell(pair.0, pair.1, origin, now, Basis::ExactTarget);
+                        let pair = paired_cell(
+                            pair.0,
+                            pair.1,
+                            origin,
+                            now,
+                            Basis::ExactTarget,
+                            [u8::MAX; 3],
+                        );
                         if context.target.as_ref() == Some(&key.target) {
                             exact = Some(pair);
                         }
@@ -770,6 +330,7 @@ fn compare(
                             origin,
                             now,
                             Basis::ConfiguredProbe,
+                            [u8::MAX; 3],
                         ));
                     }
                     _ => {}
@@ -807,6 +368,21 @@ fn compare(
     result
 }
 
+fn global_stats<'a>(
+    inner: &'a StateInner,
+    group: &str,
+    network: super::SelectionNetwork,
+    node: Uuid,
+) -> Option<&'a Stats> {
+    inner.aggregate.iter().find_map(|(key, stats)| {
+        (key.group == group
+            && key.network == network
+            && key.family.is_none()
+            && key.node_id == node)
+            .then_some(stats)
+    })
+}
+
 pub(super) fn node_evidence(
     inner: &StateInner,
     group: &str,
@@ -815,84 +391,115 @@ pub(super) fn node_evidence(
     snapshots: &[ScoreSnapshot],
     now: Instant,
 ) -> Vec<VerificationEvidence> {
-    let mut evidence: Vec<_> = nodes
+    let mut parent_key = AggregateKey {
+        group: group.to_owned(),
+        network: context.network,
+        family: None,
+        node_id: Uuid::nil(),
+    };
+    nodes
         .iter()
-        .map(|node| {
-            let stats = if let (Some(family), Some(target)) =
+        .zip(snapshots)
+        .map(|(node, snapshot)| {
+            parent_key.node_id = node.id;
+            let parent = inner.aggregate.peek(&parent_key);
+            let stamp = if let (Some(family), Some(target)) =
                 (context.target_family, context.target.as_ref())
             {
-                inner.exact.peek(&ExactKey {
-                    group: group.to_owned(),
-                    network: context.network,
-                    family,
-                    target: target.clone(),
-                    node_id: node.id,
-                })
+                inner
+                    .exact
+                    .peek(&ExactKey {
+                        group: group.to_owned(),
+                        network: context.network,
+                        family,
+                        target: target.clone(),
+                        node_id: node.id,
+                    })
+                    .and_then(|stats| CellStamp::current(stats, parent))
             } else if context.target.is_none() {
-                inner.aggregate.peek(&AggregateKey {
-                    group: group.to_owned(),
-                    network: context.network,
-                    family: context.target_family,
-                    node_id: node.id,
-                })
+                inner
+                    .aggregate
+                    .peek(&AggregateKey {
+                        group: group.to_owned(),
+                        network: context.network,
+                        family: context.target_family,
+                        node_id: node.id,
+                    })
+                    .and_then(|stats| {
+                        if context.target_family.is_none() {
+                            Some(CellStamp::own(stats))
+                        } else {
+                            CellStamp::current(stats, parent)
+                        }
+                    })
             } else {
                 None
             };
-            stats.map_or_else(VerificationEvidence::default, |stats| {
-                VerificationEvidence::new(stats, now)
-            })
+            let mut evidence = stamp.map_or_else(VerificationEvidence::default, |stamp| {
+                let mut evidence = VerificationEvidence::new(stamp.stats, now);
+                evidence.business = evidence.business.filter(|metric| {
+                    stamp
+                        .invalidated_through
+                        .is_none_or(|at| metric.latest_at > at)
+                });
+                evidence
+            });
+            evidence.failed_at = evidence
+                .failed_at
+                .max(parent.and_then(|parent| parent.failed_at));
+            let Some(origin) = inner.comparisons.origin else {
+                return evidence;
+            };
+            for cell in &inner.comparisons.cells {
+                if cell.key.group() != group
+                    || cell.key.network() != context.network
+                    || cell.key.node() != node.id
+                    || !cell.valid(inner, parent)
+                {
+                    continue;
+                }
+                let Some(timing) = cell.key.timing() else {
+                    continue;
+                };
+                let metric = |buckets: &[Bucket; BLOCKS]| {
+                    metric_pair(
+                        buckets,
+                        buckets,
+                        origin,
+                        now,
+                        timing,
+                        u8::MAX,
+                        std::collections::hash_map::DefaultHasher::new(),
+                    )
+                    .map(|pair| TimedMetric {
+                        value: pair.incumbent,
+                        reporters: pair.reporters,
+                        observed_at: pair.oldest_at,
+                        latest_at: pair.latest_at,
+                        expires_at: pair.expires_at,
+                    })
+                };
+                match &cell.key {
+                    Key::Traffic(key)
+                        if Some(key.family) == context.target_family
+                            && Some(&key.target) == context.target.as_ref() =>
+                    {
+                        evidence.response = metric(&cell.metrics[0]);
+                        evidence.upload = metric(&cell.metrics[1]);
+                        evidence.download = metric(&cell.metrics[2]);
+                    }
+                    Key::Probe { slot, scope, .. }
+                        if *slot == super::evidence::probe_slot(context)
+                            && *scope == snapshot.probe_scope =>
+                    {
+                        evidence.probe = metric(&cell.metrics[0]);
+                    }
+                    _ => {}
+                }
+            }
+            evidence
         })
-        .collect();
-    let Some(origin) = inner.comparisons.origin else {
-        return evidence;
-    };
-    for cell in &inner.comparisons.cells {
-        if cell.key.group() != group || cell.key.network() != context.network || !cell.valid(inner)
-        {
-            continue;
-        }
-        let Some(index) = nodes.iter().position(|node| node.id == cell.key.node()) else {
-            continue;
-        };
-        let Some(timing) = cell.key.timing() else {
-            continue;
-        };
-        let metric = |buckets: &[Bucket; BLOCKS]| {
-            metric_pair(
-                buckets,
-                buckets,
-                origin,
-                now,
-                timing,
-                std::collections::hash_map::DefaultHasher::new(),
-            )
-            .map(|pair| TimedMetric {
-                value: pair.incumbent,
-                reporters: pair.reporters,
-                observed_at: pair.oldest_at,
-                latest_at: pair.latest_at,
-                expires_at: pair.expires_at,
-            })
-        };
-        match &cell.key {
-            Key::Traffic(key)
-                if Some(key.family) == context.target_family
-                    && Some(&key.target) == context.target.as_ref() =>
-            {
-                evidence[index].response = metric(&cell.metrics[0]);
-                evidence[index].upload = metric(&cell.metrics[1]);
-                evidence[index].download = metric(&cell.metrics[2]);
-            }
-            Key::Probe { slot, scope, .. }
-                if *slot == super::evidence::probe_slot(context)
-                    && *scope == snapshots[index].probe_scope =>
-            {
-                evidence[index].probe = metric(&cell.metrics[0]);
-            }
-            _ => {}
-        }
-    }
-    evidence
+        .collect()
 }
 
 pub(super) fn pairs(
@@ -923,22 +530,236 @@ pub(super) fn pairs(
             proposals[position] = Some(index);
         }
     }
-    PairCohort {
+    let mut parent_key = AggregateKey {
+        group: group.to_owned(),
+        network: context.network,
+        family: None,
+        node_id: nodes[reference].id,
+    };
+    let mut members = [(Uuid::nil(), None); MAX_CHALLENGERS + 1];
+    members[0] = (parent_key.node_id, inner.aggregate.peek(&parent_key));
+    let mut count = 0;
+    for index in proposals.iter().flatten() {
+        count += 1;
+        parent_key.node_id = nodes[*index].id;
+        members[count] = (parent_key.node_id, inner.aggregate.peek(&parent_key));
+    }
+    let mut cohort = PairCohort {
         reference,
-        pairs: proposals.map(|index| {
-            index.map(|index| {
+        joint: None,
+        pairs: std::array::from_fn(|slot| {
+            proposals[slot].map(|index| {
                 (
                     index,
-                    compare(
-                        inner,
-                        group,
-                        context,
-                        nodes[reference].id,
-                        nodes[index].id,
-                        now,
-                    ),
+                    compare(inner, group, context, members[0], members[slot + 1], now),
                 )
             })
         }),
+    };
+    let mut identity = None;
+    let needs_joint = cohort.pairs.iter().flatten().count() > 1
+        && cohort.pairs.iter().flatten().any(|(_, pair)| {
+            let Some(response) = pair.response else {
+                return true;
+            };
+            let next = (pair.basis, response.support);
+            let differs = identity.is_some_and(|old| old != next);
+            identity = Some(next);
+            differs
+        });
+    if needs_joint {
+        for basis in [
+            Basis::ExactTarget,
+            Basis::CommonTargets,
+            Basis::ConfiguredProbe,
+        ] {
+            if basis == Basis::ConfiguredProbe
+                && cohort.pairs.iter().flatten().any(|(_, pair)| {
+                    matches!(pair.basis, Basis::ExactTarget | Basis::CommonTargets)
+                        && pair.response.is_some()
+                })
+            {
+                continue;
+            }
+            if let Some(joint) = joint_pairs(inner, group, context, &members[..=count], basis, now)
+            {
+                cohort.joint = Some(joint);
+                break;
+            }
+        }
     }
+    cohort
+}
+
+fn joint_pairs(
+    inner: &StateInner,
+    group: &str,
+    context: &ScoreSelectionContext,
+    members: &[(Uuid, Option<&Stats>)],
+    basis: Basis,
+    now: Instant,
+) -> Option<[PairEvidence; MAX_CHALLENGERS]> {
+    let origin = inner.comparisons.origin?;
+    let count = members.len() - 1;
+    let mut result = [PairEvidence {
+        basis,
+        ..PairEvidence::default()
+    }; MAX_CHALLENGERS];
+    let mut targets = 0;
+    let mut partial = false;
+    let mut cells = inner.comparisons.cells.as_slice();
+    while let Some(first) = cells.first() {
+        let end = cells
+            .iter()
+            .position(|cell| first.key.cohort_cmp(&cell.key) != Ordering::Equal)
+            .unwrap_or(cells.len());
+        let (current, rest) = cells.split_at(end);
+        cells = rest;
+        if first.key.group() != group || first.key.network() != context.network {
+            continue;
+        }
+        let eligible = match (&first.key, basis) {
+            (Key::Traffic(key), Basis::ExactTarget) => {
+                Some(key.family) == context.target_family
+                    && Some(&key.target) == context.target.as_ref()
+            }
+            (Key::Traffic(key), Basis::CommonTargets) => context
+                .target_family
+                .is_none_or(|family| family == key.family),
+            (Key::Probe { slot, .. }, Basis::ConfiguredProbe) => {
+                *slot == super::evidence::probe_slot(context)
+            }
+            _ => false,
+        };
+        if !eligible {
+            continue;
+        }
+        let mut selected = [None; MAX_CHALLENGERS + 1];
+        for cell in current {
+            if let Some(slot) = members
+                .iter()
+                .position(|(node, _)| *node == cell.key.node())
+                && cell.valid(inner, members[slot].1)
+            {
+                selected[slot] = Some(cell);
+            }
+        }
+        if selected[..=count].iter().any(Option::is_none) {
+            partial |= selected[0].is_some_and(|left| {
+                selected[1..=count]
+                    .iter()
+                    .flatten()
+                    .any(|right| has_common_block(left, right, origin, now))
+            });
+            continue;
+        }
+        let left = selected[0]?;
+        let timing = left.key.timing()?;
+        let mut blocks = [0_u8; 3];
+        for (metric, mask) in blocks.iter_mut().enumerate() {
+            for block in 0..BLOCKS {
+                if selected[..=count].iter().flatten().all(|cell| {
+                    timing.common(
+                        &left.metrics[metric][block],
+                        &cell.metrics[metric][block],
+                        origin,
+                        now,
+                    )
+                }) {
+                    *mask |= 1 << block;
+                }
+            }
+        }
+        blocks[1] &= blocks[0];
+        blocks[2] &= blocks[0];
+        let mut next = [PairEvidence::default(); MAX_CHALLENGERS];
+        for slot in 0..count {
+            next[slot] = paired_cell(left, selected[slot + 1]?, origin, now, basis, blocks);
+        }
+        if next[..count].iter().any(|pair| pair.response.is_none()) {
+            partial |= selected[1..=count]
+                .iter()
+                .flatten()
+                .any(|right| has_common_block(left, right, origin, now));
+            continue;
+        }
+        if targets == MAX_TARGETS {
+            partial = true;
+            continue;
+        }
+        for (pair, next) in result[..count].iter_mut().zip(&next[..count]) {
+            merge_metric(&mut pair.response, next.response, targets);
+            merge_metric(&mut pair.upload, next.upload, targets);
+            merge_metric(&mut pair.download, next.download, targets);
+        }
+        targets += 1;
+        if basis != Basis::CommonTargets {
+            break;
+        }
+    }
+    if targets == 0 {
+        return None;
+    }
+    for pair in &mut result[..count] {
+        pair.partial = basis == Basis::CommonTargets && partial;
+        for metric in [&mut pair.response, &mut pair.upload, &mut pair.download]
+            .into_iter()
+            .flatten()
+        {
+            metric.incumbent /= targets as f64;
+            metric.candidate /= targets as f64;
+        }
+    }
+    Some(result)
+}
+
+pub(super) fn response_progress(
+    inner: &StateInner,
+    group: &str,
+    context: &ScoreSelectionContext,
+    reference: Uuid,
+    candidate: Uuid,
+    now: Instant,
+) -> Option<([u8; 2], u64)> {
+    let family = context.target_family?;
+    let target = context.target.as_ref()?;
+    if group.len().saturating_add(target_bytes(target)) > MAX_KEY_BYTES {
+        return None;
+    }
+    let mut identity = std::collections::hash_map::DefaultHasher::new();
+    let mut cells = [None; 2];
+    for (side, node) in [reference, candidate].into_iter().enumerate() {
+        let parent = global_stats(inner, group, context.network, node)?;
+        let (key, stats) = inner.exact.iter().find(|(key, _)| {
+            key.group == group
+                && key.network == context.network
+                && key.family == family
+                && &key.target == target
+                && key.node_id == node
+        })?;
+        let stamp = CellStamp::current(stats, Some(parent))?;
+        (
+            parent.incarnation,
+            stats.incarnation,
+            stamp.invalidated_through,
+        )
+            .hash(&mut identity);
+        cells[side] = inner.comparisons.cells.iter().find(|cell| {
+            matches!(&cell.key, Key::Traffic(current) if current == key)
+                && cell.valid(inner, Some(parent))
+        });
+    }
+    let mut counts = [0; 2];
+    if let (Some(origin), [Some(left), Some(right)]) = (inner.comparisons.origin, cells) {
+        let timing = left.key.timing()?;
+        let mut reporters = [Accumulator::default(), Accumulator::default()];
+        for (a, b) in left.metrics[0].iter().zip(&right.metrics[0]) {
+            if timing.common(a, b, origin, now) {
+                reporters[0].add(a);
+                reporters[1].add(b);
+            }
+        }
+        counts = reporters.map(|reporters| reporters.reporters().min(REPORTERS) as u8);
+    }
+    Some((counts, identity.finish()))
 }

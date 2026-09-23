@@ -98,7 +98,7 @@ impl Availability {
         self.valid_from = Some(self.valid_from.map_or(at, |old| old.max(at)));
     }
 
-    fn record(&mut self, rx_at: Instant, now: Instant, credited: &mut Option<u64>) {
+    fn record(&mut self, rx_at: Instant, now: Instant, credited: &mut Option<u64>) -> bool {
         let latest = self.latest_rx_at.map_or(now, |at| at.max(now));
         if let Some(at) = self.latest_rx_at
             && now.saturating_duration_since(at) >= LIVE_QUALIFICATION_TTL
@@ -110,13 +110,14 @@ impl Availability {
             || latest.saturating_duration_since(rx_at) >= LIVE_QUALIFICATION_TTL
             || self.valid_from.is_some_and(|start| rx_at < start)
         {
-            return;
+            return false;
         }
         if *credited != Some(self.epoch) {
             self.reporters = (self.reporters + 1).min(PERFORMANCE_VALIDATION_SAMPLES as u8);
             *credited = Some(self.epoch);
         }
         self.latest_rx_at = Some(self.latest_rx_at.map_or(rx_at, |at| at.max(rx_at)));
+        true
     }
 }
 
@@ -251,7 +252,16 @@ impl Stats {
                     .business_invalidated_through
                     .is_none_or(|fence| *rx_at > fence) =>
             {
-                self.availability.record(*rx_at, now, credited);
+                if !self.availability.record(*rx_at, now, credited) {
+                    return;
+                }
+                self.explore_not_before = None;
+                if self.failed_at.is_some()
+                    && self.availability.reporters >= PERFORMANCE_VALIDATION_SAMPLES as u8
+                {
+                    self.fail_streak = 0;
+                    self.qualified_until = Some(*rx_at + LIVE_QUALIFICATION_TTL);
+                }
                 self.last_business_rx_at = Some(
                     self.last_business_rx_at
                         .map_or(*rx_at, |seen| seen.max(*rx_at)),
@@ -294,6 +304,22 @@ impl Stats {
         }
     }
 
+    fn inherit_node(&mut self, node: NodeProvenance, now: Instant) {
+        let replaced = self.node_incarnation != 0 && self.node_incarnation != node.incarnation;
+        if replaced || node.invalidated_through > self.business_invalidated_through {
+            self.invalidate_business(if replaced {
+                node.invalidated_through.unwrap_or(now)
+            } else {
+                node.invalidated_through.unwrap()
+            });
+            self.performance = Performance::default();
+            self.last_business_rx_at = None;
+        }
+        self.node_incarnation = node.incarnation;
+        self.failed_at = self.failed_at.max(node.failed_at);
+        self.last_node_failure_episode = self.last_node_failure_episode.max(node.failure_episode);
+    }
+
     pub(super) fn invalidate_business(&mut self, now: Instant) {
         self.availability.invalidate(now);
         self.qualified_until = None;
@@ -308,9 +334,10 @@ impl Stats {
         now: Instant,
         sample: &FlowSample,
         count_usefulness: bool,
-    ) {
+        hard_failure: bool,
+    ) -> bool {
         if sample.source != ScoreSource::Traffic {
-            return;
+            return false;
         }
         self.decay_to(now);
         if matches!(
@@ -318,15 +345,23 @@ impl Stats {
             ScoreOutcome::Rejected | ScoreOutcome::Cancelled | ScoreOutcome::Shutdown
         ) {
             self.attempts = (self.attempts - evidence_decay(sample.elapsed)).max(0.0);
-            return;
+            return false;
         }
-        if sample.outcome == ScoreOutcome::Success {
-            self.fail_streak = self.fail_streak.saturating_sub(1);
-            self.explore_not_before = None;
-        } else {
+        let hard_failure = sample.outcome != ScoreOutcome::Success
+            && hard_failure
+            && match sample.outcome {
+                ScoreOutcome::SharedNodeFailure(episode) => {
+                    let fresh = episode > self.last_node_failure_episode;
+                    self.last_node_failure_episode = self.last_node_failure_episode.max(episode);
+                    fresh
+                }
+                _ => true,
+            };
+        if hard_failure {
             self.fail_streak = self.fail_streak.saturating_add(1);
             self.explore_not_before = Some(now + explore_backoff(self.fail_streak));
             self.invalidate_business(now);
+            self.probes = Default::default();
             self.failed_at = Some(self.failed_at.map_or(now, |at| at.max(now)));
         }
         if sample.setup.is_some() {
@@ -337,20 +372,63 @@ impl Stats {
         if count_usefulness {
             if sample.outcome == ScoreOutcome::Success && sample.tx > 0 && sample.rx > 0 {
                 self.useful_success += 1.0;
-                if let Some(at) = sample.last_rx_at {
-                    self.last_business_rx_at =
-                        Some(self.last_business_rx_at.map_or(at, |seen| seen.max(at)));
-                    self.retain_qualification(at, now);
+                if let Some(rx_at) = sample.eligible_rx_at {
+                    self.retain_qualification(rx_at, now);
                 }
             } else {
                 self.useful_failure += 1.0;
             }
         }
+        hard_failure
     }
 }
 
 pub(super) fn evidence_decay(elapsed: Duration) -> f64 {
     (-elapsed.as_secs_f64() / SCORE_EVIDENCE_HALF_LIFE.as_secs_f64()).exp2()
+}
+
+#[derive(Clone, Copy)]
+struct NodeProvenance {
+    incarnation: u64,
+    invalidated_through: Option<Instant>,
+    failed_at: Option<Instant>,
+    failure_episode: u64,
+}
+
+impl NodeProvenance {
+    fn new(stats: &Stats) -> Self {
+        Self {
+            incarnation: stats.incarnation,
+            invalidated_through: stats.business_invalidated_through,
+            failed_at: stats.failed_at,
+            failure_episode: stats.last_node_failure_episode,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct CellStamp<'a> {
+    pub stats: &'a Stats,
+    pub invalidated_through: Option<Instant>,
+}
+
+impl<'a> CellStamp<'a> {
+    pub(super) fn own(stats: &'a Stats) -> Self {
+        Self {
+            stats,
+            invalidated_through: stats.business_invalidated_through,
+        }
+    }
+
+    pub(super) fn current(stats: &'a Stats, parent: Option<&Stats>) -> Option<Self> {
+        let node = NodeProvenance::new(parent?);
+        (stats.node_incarnation == node.incarnation).then_some(Self {
+            stats,
+            invalidated_through: stats
+                .business_invalidated_through
+                .max(node.invalidated_through),
+        })
+    }
 }
 
 fn record_cell_start<K: std::hash::Hash + Eq>(
@@ -360,21 +438,29 @@ fn record_cell_start<K: std::hash::Hash + Eq>(
     tick: u64,
     evictions: &mut u64,
     source: ScoreSource,
-) -> u64 {
+    node: Option<NodeProvenance>,
+) -> NodeProvenance {
     if let Some(stats) = cache.get_mut(&key) {
+        if let Some(node) = node {
+            stats.inherit_node(node, now);
+        }
         stats.record_start(now, source);
-        return stats.incarnation;
+        return NodeProvenance::new(stats);
     }
     let mut stats = Stats {
         incarnation: tick,
         ..Default::default()
     };
+    if let Some(node) = node {
+        stats.inherit_node(node, now);
+    }
     stats.record_start(now, source);
     if cache.len() == cache.cap().get() {
         *evictions = evictions.saturating_add(1);
     }
+    let admitted = NodeProvenance::new(&stats);
     cache.put(key, stats);
-    tick
+    admitted
 }
 
 fn update_cell<K: std::hash::Hash + Eq>(
@@ -384,15 +470,58 @@ fn update_cell<K: std::hash::Hash + Eq>(
     credited: &mut Option<u64>,
     update: &mut impl FnMut(&mut Stats, &mut Option<u64>, bool),
     exact: bool,
+    node: Option<(NodeProvenance, Instant)>,
 ) {
     if let Some(stats) = cache.get_mut(key)
         && Some(stats.incarnation) == incarnation
     {
+        if let Some((node, now)) = node {
+            stats.inherit_node(node, now);
+        }
         update(stats, credited, exact);
     }
 }
 
 impl ScorePolicyState {
+    pub(super) fn fail_probe_at(
+        &self,
+        authority: &Arc<ScoreAuthority>,
+        context: &ScoreSelectionContext,
+        attributions: &[ScoreAttribution],
+        cells: &mut [StartedCells],
+        scope: u64,
+    ) {
+        let mut inner = self.inner.lock();
+        if !inner
+            .active_authority
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, authority))
+        {
+            return;
+        }
+        let slot = probe_slot(context);
+        for (attribution, started) in attributions.iter().zip(cells) {
+            let key = AggregateKey {
+                group: attribution.group.clone(),
+                network: context.network,
+                family: None,
+                node_id: attribution.node_id,
+            };
+            if let Some(stats) = inner.aggregate.get_mut(&key)
+                && Some(stats.incarnation) == started.aggregate[0]
+                && stats.probes[slot].scope == scope
+            {
+                stats.probes[slot] = ProbeMetric::default();
+                inner.comparisons.invalidate_probe(
+                    &attribution.group,
+                    context.network,
+                    attribution.node_id,
+                    scope,
+                    slot,
+                );
+            }
+        }
+    }
     #[cfg(test)]
     pub(super) fn start(
         &self,
@@ -443,6 +572,7 @@ impl ScorePolicyState {
                 .valid
                 .contains(&(attribution.group.clone(), attribution.node_id))
             {
+                let mut node = None;
                 for (index, family) in [None, context.target_family].into_iter().enumerate() {
                     if index == 1 && (family.is_none() || source == ScoreSource::HealthProbe) {
                         break;
@@ -458,14 +588,19 @@ impl ScorePolicyState {
                         aggregate_evictions,
                         ..
                     } = &mut *inner;
-                    started.aggregate[index] = Some(record_cell_start(
+                    let admitted = record_cell_start(
                         aggregate,
                         key,
                         now,
                         tick,
                         aggregate_evictions,
                         source,
-                    ));
+                        node,
+                    );
+                    started.aggregate[index] = Some(admitted.incarnation);
+                    if index == 0 {
+                        node = Some(admitted);
+                    }
                 }
                 if source != ScoreSource::HealthProbe
                     && let (Some(family), Some(target)) =
@@ -483,14 +618,10 @@ impl ScorePolicyState {
                         exact_evictions,
                         ..
                     } = &mut *inner;
-                    started.exact = Some(record_cell_start(
-                        exact,
-                        key,
-                        now,
-                        tick,
-                        exact_evictions,
-                        source,
-                    ));
+                    started.exact = Some(
+                        record_cell_start(exact, key, now, tick, exact_evictions, source, node)
+                            .incarnation,
+                    );
                 }
             }
             cells.push(started);
@@ -503,6 +634,7 @@ impl ScorePolicyState {
         context: &ScoreSelectionContext,
         attributions: &[ScoreAttribution],
         cells: &mut [StartedCells],
+        now: Instant,
         mut update: impl FnMut(&mut Stats, &mut Option<u64>, bool),
     ) {
         for (attribution, started) in attributions.iter().zip(cells) {
@@ -512,6 +644,21 @@ impl ScorePolicyState {
             {
                 continue;
             }
+            let node_key = AggregateKey {
+                group: attribution.group.clone(),
+                network: context.network,
+                family: None,
+                node_id: attribution.node_id,
+            };
+            // Capture before updating the parent so the first shared failure reaches every cell once.
+            let Some(node) = inner
+                .aggregate
+                .peek(&node_key)
+                .filter(|stats| Some(stats.incarnation) == started.aggregate[0])
+                .map(NodeProvenance::new)
+            else {
+                continue;
+            };
             for (index, family) in [None, context.target_family].into_iter().enumerate() {
                 if started.aggregate[index].is_none() {
                     continue;
@@ -532,6 +679,7 @@ impl ScorePolicyState {
                     &mut started.credited_aggregate[index],
                     &mut update,
                     false,
+                    (index != 0).then_some((node, now)),
                 );
             }
             if started.exact.is_some()
@@ -552,6 +700,7 @@ impl ScorePolicyState {
                     &mut started.credited_exact,
                     &mut update,
                     true,
+                    Some((node, now)),
                 );
             }
         }
@@ -569,9 +718,14 @@ impl ScorePolicyState {
         if matches!(observation, Observation::BusinessProgress { .. }) && context.target.is_none() {
             return;
         }
-        Self::update_started(inner, context, attributions, cells, |stats, credited, _| {
-            stats.observe(&observation, source, now, credited)
-        });
+        Self::update_started(
+            inner,
+            context,
+            attributions,
+            cells,
+            now,
+            |stats, credited, _| stats.observe(&observation, source, now, credited),
+        );
     }
 
     #[cfg(test)]
@@ -593,35 +747,50 @@ impl ScorePolicyState {
         sample: &FlowSample,
         now: Instant,
     ) {
-        Self::update_started(
-            &mut self.inner.lock(),
-            context,
-            attributions,
-            cells,
-            |stats, credited, exact| {
-                if context.target.is_some()
-                    && matches!(
-                        sample.outcome,
-                        ScoreOutcome::Success
-                            | ScoreOutcome::Rejected
-                            | ScoreOutcome::Cancelled
-                            | ScoreOutcome::Shutdown
-                    )
-                    && let Some(rx_at) = sample.eligible_rx_at
-                {
-                    stats.observe(
-                        &Observation::BusinessProgress { rx_at },
-                        sample.source,
+        let mut inner = self.inner.lock();
+        for (attribution, cells) in attributions.iter().zip(cells) {
+            let mut failures = [false; 2];
+            Self::update_started(
+                &mut inner,
+                context,
+                std::slice::from_ref(attribution),
+                std::slice::from_mut(cells),
+                now,
+                |stats, credited, exact| {
+                    if context.target.is_some()
+                        && matches!(
+                            sample.outcome,
+                            ScoreOutcome::Success
+                                | ScoreOutcome::Rejected
+                                | ScoreOutcome::Cancelled
+                                | ScoreOutcome::Shutdown
+                        )
+                        && let Some(rx_at) = sample.eligible_rx_at
+                    {
+                        stats.observe(
+                            &Observation::BusinessProgress { rx_at },
+                            sample.source,
+                            now,
+                            credited,
+                        );
+                    }
+                    failures[usize::from(exact)] |= stats.record_finish(
                         now,
-                        credited,
+                        sample,
+                        sample.count_usefulness && (exact || context.target.is_some()),
+                        exact
+                            || matches!(
+                                sample.outcome,
+                                ScoreOutcome::NodeFailure | ScoreOutcome::SharedNodeFailure(_)
+                            )
+                            || (sample.outcome != ScoreOutcome::TargetFailure
+                                && (sample.setup.is_none() || context.target.is_none())),
                     );
-                }
-                stats.record_finish(
-                    now,
-                    sample,
-                    sample.count_usefulness && (exact || context.target.is_some()),
-                );
-            },
-        );
+                },
+            );
+            if failures[0] || failures[1] {
+                super::validation::failed(&mut inner, attribution, context, failures[0]);
+            }
+        }
     }
 }

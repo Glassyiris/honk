@@ -112,6 +112,23 @@ impl Default for ScoreLocalComparison {
     }
 }
 
+/// Counts of current candidate blockers, not cumulative failures or dispatched work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScoreVerificationBlockers {
+    pub recovery: usize,
+    pub backoff: usize,
+    pub qualification: usize,
+    pub availability: usize,
+    pub response_missing: usize,
+    pub response_unpaired: usize,
+    pub response_misaligned: usize,
+    pub probe_scope: usize,
+    pub response_degraded: usize,
+    pub node_failure: usize,
+    pub target_failure: usize,
+    pub excluded: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScoreVerificationSnapshot {
     pub state: ScoreVerificationState,
@@ -125,6 +142,9 @@ pub struct ScoreVerificationSnapshot {
     pub candidate_count: usize,
     pub compared_count: usize,
     pub pending_count: usize,
+    pub blockers: ScoreVerificationBlockers,
+    pub candidate_limited: bool,
+    pub target_limited: bool,
     pub evidence_age_ms: Option<u64>,
     pub valid_for_ms: Option<u64>,
     pub health_family: IpVersion,
@@ -244,6 +264,10 @@ impl CandidateQuestion {
     pub fn actionable(&self) -> bool {
         self.pending() && !self.backed_off
     }
+
+    pub fn needs_alignment(&self) -> bool {
+        self.response_gap == ResponseGap::Misaligned
+    }
 }
 
 fn milliseconds(duration: Duration) -> u64 {
@@ -335,7 +359,7 @@ pub(super) fn evaluate(
         .iter()
         .enumerate()
         .map(|(index, score)| {
-            let pair = decision.pairs.get(index);
+            let pair = decision.pairs.summary_pair(index);
             let paired_at = if context.target.is_none() && !use_probe {
                 pair.and_then(|pair| pair.response)
                     .map(|metric| metric.latest_at)
@@ -428,6 +452,28 @@ pub(super) fn evaluate(
         .iter()
         .filter(|candidate| candidate.pending())
         .count();
+    let mut blockers = ScoreVerificationBlockers::default();
+    for (index, candidate) in candidates.iter().enumerate() {
+        blockers.node_failure += usize::from(snapshots[index].node_failure);
+        blockers.target_failure += usize::from(snapshots[index].target_failure);
+        if candidate.excluded {
+            blockers.excluded += 1;
+            continue;
+        }
+        blockers.recovery += usize::from(candidate.question == ScoreEvidenceQuestion::Recovery);
+        blockers.backoff += usize::from(candidate.backed_off && candidate.pending());
+        blockers.qualification +=
+            usize::from(candidate.question == ScoreEvidenceQuestion::Qualification);
+        blockers.availability += usize::from(candidate.availability_missing);
+        match candidate.response_gap {
+            ResponseGap::Missing => blockers.response_missing += 1,
+            ResponseGap::Unpaired => blockers.response_unpaired += 1,
+            ResponseGap::Misaligned => blockers.response_misaligned += 1,
+            ResponseGap::ProbeScope => blockers.probe_scope += 1,
+            ResponseGap::Degraded => blockers.response_degraded += 1,
+            ResponseGap::None | ResponseGap::Availability => {}
+        }
+    }
     let basis = match summary.basis {
         super::comparison::Basis::ExactTarget => ScoreEvidenceBasis::TargetResponse,
         super::comparison::Basis::CommonTargets => ScoreEvidenceBasis::CommonTargets,
@@ -529,11 +575,9 @@ pub(super) fn evaluate(
             expires_at = Some(expires_at.map_or(until, |old: Instant| old.min(until)));
         }
     }
-    let focused = cadence.and_then(|cadence| {
-        (cadence.validation_attempts < 8)
-            .then_some(cadence.validation_node)
-            .flatten()
-    });
+    let focused = cadence
+        .and_then(|cadence| cadence.run.as_ref())
+        .and_then(|run| run.focused(context, now));
     let validation_index = snapshots
         .iter()
         .enumerate()
@@ -625,6 +669,9 @@ pub(super) fn evaluate(
             candidate_count: snapshots.len(),
             compared_count,
             pending_count,
+            blockers,
+            candidate_limited: summary.candidate_limited,
+            target_limited: summary.target_limited,
             evidence_age_ms: oldest.map(|at| milliseconds(now.saturating_duration_since(at))),
             valid_for_ms: expires_at.map(|at| milliseconds(at.saturating_duration_since(now))),
             network: context.network,
@@ -637,31 +684,6 @@ pub(super) fn evaluate(
         claims,
         support: hasher.finish(),
         expires_at,
-    }
-}
-
-pub(super) fn apply_budget_wait(
-    inner: &StateInner,
-    group: &str,
-    context: &ScoreSelectionContext,
-    nodes: &[&Node],
-    now: Instant,
-    evaluation: &mut Evaluation,
-) {
-    if let Some(index) = evaluation.validation_index {
-        let candidate = evaluation.candidates[index];
-        let wait = super::budget::wait_reason(
-            inner,
-            group,
-            context,
-            nodes[index].id,
-            candidate.question,
-            candidate.required,
-            now,
-        );
-        if wait != ScoreWaitReason::None {
-            evaluation.snapshot.wait_reason = wait;
-        }
     }
 }
 
@@ -708,7 +730,15 @@ impl ScorePolicyState {
                 .get(&SelectionCadenceKey::new(group, context)),
             now,
         );
-        apply_budget_wait(&inner, group, context, nodes, now, &mut evaluation);
+        super::validation::apply_budget_wait(
+            &inner,
+            group,
+            context,
+            nodes,
+            decision.ordinary.index,
+            now,
+            &mut evaluation,
+        );
         Some((decision.ordinary.index, evaluation.snapshot))
     }
 

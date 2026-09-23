@@ -240,20 +240,21 @@ B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
 | 字段 | 含义 |
 | --- | --- |
 | `selected` | 本次只读判定对应的既有公开成员 tag；没有普通合格候选时为 null。存在时 TCP `now` 使用同一次判定的选择。 |
-| `state` | `provisional` 或 `observedUsable`；后者要求同一连续可用性 cohort 中四个不同的定向 Traffic reporter 在 setup/TX 后收到 RX，且 cohort 最近的合格 RX 距今不足 60 秒。未结束的 flow 也可取得资格；clone／重复回包不增加信用。失败／reload 或 60 秒进展间隔会重置 cohort。这不授予普通选路资格，也不清除连败。 |
+| `state` | `provisional` 或 `observedUsable`；后者要求连续 cohort 中四个不同的定向 Traffic reporter 在 setup/TX 后收到 RX，最近合格 RX 不足 60 秒。适用失败／reload 或 60 秒间隔重置 cohort，clone／重复回包不能增加信用。这不授予冷启动资格；真正失败后的 cohort 可独立用同样四份信用取得作用域恢复，聚合可用性不代表每个精确目标合格。 |
 | `comparison` / `basis` | `unconfirmed`、`equivalent` 或 `supported`；证据依据为 `none`、`configuredProbe`、`targetResponse`、`commonTargets`、`upload` 或 `download`。`commonTargets` 使用有界等权共同目标，不是无关聚合均值；setup／预热不是证明。不代表误判概率或保证最优。 |
 | `missing` | 相关候选覆盖范围内的 availability/response/transfer 布尔缺口；当前路径已观测可用时，备选仍可能需要验证。 |
 | `nextAction` | `nextBusinessFlow` 表示未来真实工作补充证据、普通资格或恢复的需求，不是已预留或已派发 I/O；需同时查看 `waitReason`。`awaitTransfer` 等待真实负载，不主动大流量测速；`backoff` 保留失败隔离；`none` 表示没有可执行的缺失工作。 |
 | `question` | `none`、`availability`、`response`、`qualification`、`recovery` 或 `transfer`：下一个尚未解决的证据问题。没有剩余动作时为 `none`；退避时保留被阻塞候选的问题，不回退到已解决现任的问题。 |
 | `waitReason` | `none`；`budget` 表示没有可用额度；`comparableTraffic` 等待未来可比业务；`inFlight` 表示已有足够的同目标工作，或已达到独立的每节点四项工作上限；`transfer` 等待真实传输负载；`backoff` 保留失败隔离。聚合读取检查已保留 IPv4/IPv6 作用域，不创建它们：两者预算均阻塞才返回 `budget`；任一可用／未创建作用域允许继续等待未来可比流量；其余情况保留在途等待。等待不证明工作必然成功。 |
 | `localComparison` | 下述有界活跃挑战者摘要；不能把不完整的全体候选覆盖升级为全局比较。 |
-| `coverage` | 候选、已比较与待确认数量；即使 availability/response 缺口已关闭，pending 仍可包含普通资格／恢复工作。单节点可以证明已观测可用，不代表优于其他路径。 |
+| `coverage` | `candidates`、`compared`、`pending`、`excluded` 数量，以及表示有界覆盖不完整的 `candidateLimited`、`targetLimited` 布尔值。即使可用性／响应已有支持，pending 仍可包含资格／恢复工作。单节点可证明可用，不代表优于其他路径。 |
+| `blockers` | 固定数量字段：`recovery`、`backoff`、`qualification`、`availability`、`responseMissing`、`responseUnpaired`、`responseMisaligned`、`probeScope`、`responseDegraded`、`nodeFailure`、`targetFailure`。原因可重叠，不是额外失败或累积计数器；被排除候选单独计数，节点／目标失败数量包含这些候选。不导出目标键。 |
 | `evidenceAgeMs` / `validForMs` | 最弱支持证据的年龄与条件性剩余有效期；没有结论时为 null。新证据可以提前撤销结论。 |
 | `network`、`targetFamily`、`healthFamily`、`targetSpecific` | transport 与适用范围；此聚合接口没有精确目标，不导出 domain/IP/port 或原始节点 ID。 |
 
 `localComparison.scope` 为 `activeChallengers`；`comparison` 和 `basis` 使用上述词汇。`comparedCandidates` 包含所选成员和有支持的挑战者。`reporters` 是双方已保留的不同 reporter 支持量中的最弱值：四个块各保留最多四个 ID，跨块去重并集最多十六个，不是所有已观测 reporter 的精确总数。`spanMs`、`evidenceAgeMs`、`validForMs` 与 `dispersionPpm` 描述这些支持，不代表统计独立或误判概率。`uploadKnown`、`downloadKnown` 明确保留未知方向；`directionalTradeoff` 标记相反的合格方向变化。业务证明使用共同 15 秒块，在块起点后 60 秒到期；配置探测按生产者周期 `I` 使用 `max(15s, 2I)` 块，有效期同时受最早支持块的四块保留期限与“较弱一侧最近支持加 `max(60s, 2I)`”限制。失败／reload／incarnation 边界保持不变。合格共同目标子集可以保留局部支持，但跳过尚未合格或因上限截断的已匹配目标时，`missing.response` 仍为 true，顶层仍为 `comparison: "unconfirmed"`；精确目标不能继承该子集的认证。
 
-比较标签描述经验性证据，不表示是否跨过普通切换门槛。完成数成熟度本身不会撤销不变的合格响应关系；被保持但缺少优势支持的成员或真实测量取舍，可能在没有响应样本缺口时仍为 `unconfirmed`。未知或交集中消失的方向不进入响应 cohort 身份；其他成员缺少该方向也不能掩盖某对手已成立的成对优势。合格响应 cohort 彼此不一致时则标记响应缺口，为对照节点与参与挑战者请求预算内可比流量，不在读取时创建工作，也不保证最终完成。方向 known 标志要求方向支持一致，有效期受所有实际参与判断的合格支持约束。
+比较标签描述经验性证据，不表示是否跨过切换门槛；被保持的成员或测量取舍可在不缺样本时仍为 `unconfirmed`。合格的联合共同时间块支持可立即对齐不同成对历史，否则响应对齐缺口请求有额度的对照／挑战者可比流量。原始合格成对对手优势仍可否决支持，即使位于联合子集之外，或另一成员缺少该方向。方向 known 标志要求支持一致；完整指纹与有效期包含所有实际参与判断的合格支持。读取不创建工作，也不保证完成。
 
 `/stats.score.groups[].verification.tcp` 与 `.udp` 增加饱和计数：`provisionalSelections`、`usableSelections`、`validationSelections`、`confirmations`、`expired`、`contradicted`、`confirmationMillis`。确认计数包括新成立的配置探测比较等经验性结论，不表示所有维度的业务或带宽认证；`confirmationMillis / confirmations` 是这些结论的累计平均确认耗时，不是网络延迟。只读查询立即反映过期，转移计数只在后续授权 Apply 时推进。没有流量或预算不能授予确认；查询不派发验证，也不改变计数。10% 比较容差表示实际意义上的近似等价，不是已校准的误判概率。
 

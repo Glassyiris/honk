@@ -457,12 +457,11 @@ impl ControlPlaneHandle {
             && selection_mode == SelectionPlanMode::Authoritative
             && candidates.len() == 1
             && !runtime_generation.is_shutdown()
-            && tokio::time::Instant::now() < dial_deadline
         {
+            // A deadline can expire before the spawned primary begins any work.
             score_feedback
                 .get(&candidates[0].id)
-                .map(crate::group::ScoreAttempt::continuation)
-                .transpose()?
+                .and_then(|attempt| attempt.continuation().ok())
         } else {
             None
         };
@@ -606,7 +605,7 @@ impl ControlPlaneHandle {
             self.stats.record_error(&outbound_name);
             self.stats.record_close(&outbound_name);
             if let Some(reporter) = &score_reporter {
-                reporter.finish(crate::group::ScoreOutcome::Io(e.kind()));
+                reporter.finish(crate::group::ScoreOutcome::from_io_error(&e));
             }
             return Ok(());
         }
@@ -798,7 +797,7 @@ impl ControlPlaneHandle {
                                     reporter.setup_failed(if generation.is_shutdown() {
                                         crate::group::ScoreOutcome::Shutdown
                                     } else {
-                                        crate::group::ScoreOutcome::Io(e.kind())
+                                        crate::group::ScoreOutcome::from_io_error(&e)
                                     });
                                 }
                                 debug!("Pool deposit: connect to {} failed: {}", node_addr, e);
@@ -892,7 +891,7 @@ mod score_tests {
     }
 
     #[tokio::test]
-    async fn client_reset_preserves_score_availability_but_upstream_reset_revokes_it() {
+    async fn client_reset_preserves_score_availability_but_upstream_reset_revokes_target() {
         use crate::group::{ScoreOutcome, ScoreVerificationState};
         use std::sync::atomic::AtomicU64;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -919,7 +918,7 @@ mod score_tests {
                     crate::group::GroupManager::new(&[group], std::slice::from_ref(&node));
                 let address = "127.0.0.1:443".parse().unwrap();
                 let context = tcp_score_context(address, None, IpVersion::V4);
-                let feedback = manager.feedback_for_node(node.id, context).unwrap();
+                let feedback = manager.feedback_for_node(node.id, context.clone()).unwrap();
                 feedback.start().finish(ScoreOutcome::Timeout);
                 for _ in 0..4 {
                     let seed = feedback.start();
@@ -938,7 +937,17 @@ mod score_tests {
                 assert_eq!(before.state, ScoreVerificationState::ObservedUsable);
                 assert_eq!(
                     before.next_action,
-                    crate::group::ScoreValidationAction::Backoff
+                    crate::group::ScoreValidationAction::NextBusinessFlow
+                );
+                drop(manager.selection_plan_for_target("score", &context));
+                let before_counts =
+                    manager.score_verification_counters("score", SelectionNetwork::Tcp);
+                assert_eq!(
+                    (
+                        before_counts.usable_selections,
+                        before_counts.provisional_selections
+                    ),
+                    (1, 0)
                 );
                 let reporter = feedback.start();
                 reporter.setup_succeeded();
@@ -983,19 +992,33 @@ mod score_tests {
                         .raw_os_error(),
                     Some(libc::ECONNRESET)
                 );
-                reporter.finish(tcp_relay_score_outcome(&error));
-                let after = snapshot();
+                let outcome = tcp_relay_score_outcome(&error);
                 assert_eq!(
-                    after.state,
+                    outcome,
                     if client_reset {
-                        ScoreVerificationState::ObservedUsable
+                        ScoreOutcome::Cancelled
                     } else {
-                        ScoreVerificationState::Provisional
+                        ScoreOutcome::Io(std::io::ErrorKind::ConnectionReset)
                     }
                 );
+                reporter.finish(outcome);
+                let after = snapshot();
+                // A target reset cannot erase the node's factual aggregate RX.
+                assert_eq!(after.state, ScoreVerificationState::ObservedUsable);
                 assert_eq!(
                     after.next_action,
-                    crate::group::ScoreValidationAction::Backoff
+                    crate::group::ScoreValidationAction::NextBusinessFlow
+                );
+                drop(manager.selection_plan_for_target("score", &context));
+                let after_counts =
+                    manager.score_verification_counters("score", SelectionNetwork::Tcp);
+                assert_eq!(
+                    (
+                        after_counts.usable_selections - before_counts.usable_selections,
+                        after_counts.provisional_selections - before_counts.provisional_selections,
+                    ),
+                    if client_reset { (1, 0) } else { (0, 1) },
+                    "only an upstream reset revokes observed usability for the next target flow"
                 );
             }
         })

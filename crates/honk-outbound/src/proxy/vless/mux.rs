@@ -481,7 +481,14 @@ fn stream_request(
 }
 
 fn h2_io(error: h2::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::ConnectionReset, error)
+    if error.is_io() || error.is_go_away() || !error.is_reset() {
+        io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            crate::proxy::NodeFailure(error.into()),
+        )
+    } else {
+        io::Error::new(io::ErrorKind::ConnectionReset, error)
+    }
 }
 
 async fn send_owned(send: &mut h2::SendStream<Bytes>, mut data: Bytes) -> io::Result<()> {
@@ -571,7 +578,7 @@ struct MuxResponse {
     error_len: Option<(u64, u32)>,
     error_remaining: Option<usize>,
     error_message: Vec<u8>,
-    failed: Option<String>,
+    failed: Option<crate::SharedError>,
 }
 
 fn h2_clean_eof(error: &h2::Error) -> bool {
@@ -592,9 +599,19 @@ impl MuxResponse {
     }
 
     fn error(&mut self, kind: io::ErrorKind, message: impl Into<String>) -> io::Error {
-        let message = message.into();
-        self.failed = Some(message.clone());
-        io::Error::new(kind, message)
+        let error = crate::SharedError::new(
+            crate::proxy::NodeFailure(anyhow::Error::msg(message.into())).into(),
+        );
+        self.failed = Some(error.clone());
+        io::Error::new(kind, error)
+    }
+
+    fn target_error(&mut self, message: impl Into<String>) -> io::Error {
+        let error = crate::SharedError::new(
+            crate::proxy::TargetFailure(anyhow::Error::msg(message.into())).into(),
+        );
+        self.failed = Some(error.clone());
+        io::Error::new(io::ErrorKind::ConnectionRefused, error)
     }
 
     fn release(&mut self, size: usize) -> io::Result<()> {
@@ -685,7 +702,7 @@ impl MuxResponse {
                 self.error_remaining = Some(remaining);
                 if remaining == 0 {
                     let message = String::from_utf8_lossy(&self.error_message).into_owned();
-                    return Poll::Ready(Err(self.error(io::ErrorKind::ConnectionRefused, message)));
+                    return Poll::Ready(Err(self.target_error(message)));
                 }
                 continue;
             }
@@ -717,9 +734,7 @@ impl MuxResponse {
                     self.error_len = None;
                     self.error_remaining = Some(length);
                     if length == 0 {
-                        return Poll::Ready(Err(
-                            self.error(io::ErrorKind::ConnectionRefused, "H2MUX request rejected")
-                        ));
+                        return Poll::Ready(Err(self.target_error("H2MUX request rejected")));
                     }
                 } else {
                     shift += 7;

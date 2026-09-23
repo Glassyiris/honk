@@ -226,9 +226,23 @@ async fn loopback_recovery(
     let failed_dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let failed_dials_on_wire = Arc::clone(&failed_dials);
     tokio::spawn(async move {
-        while let Ok((stream, _)) = refused_listener.accept().await {
+        while let Ok((mut stream, _)) = refused_listener.accept().await {
             failed_dials_on_wire.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            drop(stream);
+            // Refuse CONNECT, not the proxy handshake: the node and its
+            // configured-probe evidence remain usable for other targets.
+            let mut greeting = [0; 3];
+            if stream.read_exact(&mut greeting).await.is_err()
+                || stream.write_all(&[0x05, 0x00]).await.is_err()
+            {
+                continue;
+            }
+            let mut request = [0; 10];
+            if stream.read_exact(&mut request).await.is_err() {
+                continue;
+            }
+            let _ = stream
+                .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
         }
     });
     let node_b = socks_node("b", socks_addr.port());
@@ -309,6 +323,21 @@ async fn loopback_recovery(
             gm.get_score_selection_for_network("proxy", crate::group::SelectionNetwork::Tcp),
             Some(node_a.name.clone()),
             "A must remain the ordinary winner after its failed setup"
+        );
+        let context = crate::group::ScoreSelectionContext {
+            target: Some(target.into()),
+            target_family: Some(IpVersion::V4),
+            ..crate::group::ScoreSelectionContext::aggregate(
+                crate::group::SelectionNetwork::Tcp,
+                ProbeDomain::Tcp,
+                IpVersion::V4,
+            )
+        };
+        let ordinary = gm.selection_plan_for_target("proxy", &context);
+        assert_eq!(
+            ordinary.entries.first().map(|entry| entry.node.id),
+            Some(node_a.id),
+            "replacement must exclude A even when ordinary target selection still prefers it"
         );
     }
     alternate_release.notify_one();
@@ -439,6 +468,7 @@ impl honk_outbound::proxy::TcpOutbound for HeldSetup {
 fn held_score_handle(
     refusal: Option<honk_outbound::proxy::PacketRejection>,
     constrained: bool,
+    urltest: bool,
 ) -> (
     ControlPlaneHandle,
     Vec<Node>,
@@ -476,6 +506,15 @@ fn held_score_handle(
         });
     }
     let mut config = udp_test_config("proxy", nodes.clone(), groups);
+    if urltest {
+        config.groups.push(Group {
+            name: "outer".into(),
+            policy: GroupPolicy::URLTest,
+            groups: vec!["proxy".into()],
+            ..Default::default()
+        });
+        config.routing.default_outbound = "outer".into();
+    }
     config.ensure_builtin_nodes();
     config.global.dial_mode = "ip".into();
     config.global.connect_timeout_ms = 4000;
@@ -530,7 +569,7 @@ async fn start_held_flow(
 #[tokio::test(start_paused = true)]
 async fn tcp_score_alternate_shares_primary_absolute_deadline() -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
-    let (handle, nodes, release, mut attempts) = held_score_handle(None, false);
+    let (handle, nodes, release, mut attempts) = held_score_handle(None, false, false);
     let (mut client, mut serve) = start_held_flow(&handle, &nodes).await?;
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), attempts.recv())
@@ -562,7 +601,7 @@ async fn tcp_score_refusal_and_retirement_do_not_retry() -> anyhow::Result<()> {
         Some(PacketRejection::Cancelled),
         None,
     ] {
-        let (handle, nodes, release, mut attempts) = held_score_handle(refusal, false);
+        let (handle, nodes, release, mut attempts) = held_score_handle(refusal, false, false);
         let (_client, serve) = start_held_flow(&handle, &nodes).await?;
         assert_eq!(attempts.recv().await, Some(nodes[0].id));
         if refusal.is_none() {
@@ -591,7 +630,7 @@ async fn tcp_score_refusal_and_retirement_do_not_retry() -> anyhow::Result<()> {
 #[tokio::test]
 async fn tcp_score_exhaustion_cannot_escape_selector_or_synthesize_final() -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
-    let (handle, nodes, release, mut attempts) = held_score_handle(None, true);
+    let (handle, nodes, release, mut attempts) = held_score_handle(None, true, false);
     let (mut client, serve) = start_held_flow(&handle, &nodes).await?;
     assert_eq!(attempts.recv().await, Some(nodes[0].id));
     release.notify_one();
@@ -601,5 +640,37 @@ async fn tcp_score_exhaustion_cannot_escape_selector_or_synthesize_final() -> an
         attempts.try_recv().is_err(),
         "duplicate A and unchosen B are not alternates"
     );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn tcp_urltest_retry_after_deadline_preserves_original_business() -> anyhow::Result<()> {
+    use crate::group::SelectionNetwork;
+    let (handle, nodes, release, mut attempts) = held_score_handle(None, false, true);
+    for (index, node) in nodes.iter().enumerate() {
+        handle.alive_set.record_probe_latency(
+            node.id,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_millis(1 + index as u64 * 50),
+        );
+    }
+    let (_client, serve) = start_held_flow(&handle, &nodes).await?;
+    assert_eq!(attempts.recv().await, Some(nodes[0].id));
+    let manager = handle.group_manager.read().clone();
+    let before = manager.score_budget_counters("proxy", SelectionNetwork::Tcp);
+    let root_before = manager.score_state().root_business_starts();
+    // Jump past the absolute deadline without polling the earlier per-dial timer.
+    tokio::time::advance(Duration::from_secs(17)).await;
+    release.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), attempts.recv()).await?,
+        Some(nodes[1].id)
+    );
+    let after = manager.score_budget_counters("proxy", SelectionNetwork::Tcp);
+    assert_eq!(manager.score_state().root_business_starts(), root_before);
+    assert_eq!(after.business_starts, before.business_starts);
+    serve.abort();
+    let _ = serve.await;
     Ok(())
 }

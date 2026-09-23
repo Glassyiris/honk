@@ -71,6 +71,7 @@ pub(crate) fn session_pool_config(max_streams_per_session: usize) -> SessionPool
 #[derive(Clone, Debug)]
 enum FailureCause {
     Message(Arc<str>),
+    Shared(crate::SharedError),
     SourcePostAdmissionCancellation,
 }
 
@@ -113,12 +114,18 @@ impl Failure {
     }
 
     fn from_io(error: io::Error, context: &'static str) -> Self {
-        Self::new(error.kind(), format!("{context}: {error}"))
+        Self {
+            kind: error.kind(),
+            cause: FailureCause::Shared(crate::SharedError::new(
+                crate::proxy::NodeFailure(anyhow::Error::new(error).context(context)).into(),
+            )),
+        }
     }
 
     fn io(&self) -> io::Error {
         match &self.cause {
             FailureCause::Message(message) => io::Error::new(self.kind, message.to_string()),
+            FailureCause::Shared(error) => io::Error::new(self.kind, error.clone()),
             FailureCause::SourcePostAdmissionCancellation => {
                 io::Error::new(self.kind, SourcePostAdmissionCancellation)
             }
@@ -141,9 +148,17 @@ struct WriterCommand {
 #[derive(Clone)]
 struct CarrierWriter {
     tx: mpsc::Sender<WriterCommand>,
+    failure: Arc<Mutex<Option<Failure>>>,
 }
 
 impl CarrierWriter {
+    fn closed_failure(&self, message: &'static str) -> Failure {
+        self.failure
+            .lock()
+            .clone()
+            .unwrap_or_else(|| Failure::new(io::ErrorKind::BrokenPipe, message))
+    }
+
     async fn send(&self, frame: Bytes, flush: bool) -> Result<(), FrameSendFailure> {
         self.send_inner(frame, flush, None, || {}).await
     }
@@ -176,7 +191,7 @@ impl CarrierWriter {
     {
         let (done, wait) = oneshot::channel();
         let permit = self.tx.reserve().await.map_err(|_| FrameSendFailure {
-            failure: Failure::new(io::ErrorKind::BrokenPipe, "Mux.Cool carrier writer closed"),
+            failure: self.closed_failure("Mux.Cool carrier writer closed"),
             committed: false,
         })?;
         before_publish();
@@ -186,10 +201,8 @@ impl CarrierWriter {
         permit.send(WriterCommand { frame, flush, done });
         wait.await.unwrap_or_else(|_| {
             Err(FrameSendFailure {
-                failure: Failure::new(
-                    io::ErrorKind::BrokenPipe,
-                    "Mux.Cool carrier writer stopped before acknowledgement",
-                ),
+                failure: self
+                    .closed_failure("Mux.Cool carrier writer stopped before acknowledgement"),
                 committed: true,
             })
         })
@@ -262,7 +275,6 @@ pub struct VlessCoolSession {
     writer: CarrierWriter,
     children: Mutex<HashMap<u16, ChildSink>>,
     ending_ids: Mutex<HashSet<u16>>,
-    failure: Mutex<Option<Failure>>,
     tasks: Mutex<Vec<tokio::task::AbortHandle>>,
 }
 
@@ -350,9 +362,10 @@ impl VlessCoolSession {
                 {
                     Ok(Ok(())) => return,
                     Ok(Err(error)) => error.failure,
-                    Err(_) => {
-                        Failure::new(io::ErrorKind::TimedOut, "Mux.Cool END delivery timed out")
-                    }
+                    Err(_) => Failure::from_io(
+                        io::Error::new(io::ErrorKind::TimedOut, "Mux.Cool END delivery timed out"),
+                        "Mux.Cool carrier stalled",
+                    ),
                 };
             session.fail(failure);
         });
@@ -360,14 +373,18 @@ impl VlessCoolSession {
     }
 
     fn fail(&self, failure: Failure) {
-        if self
-            .state
-            .swap(SessionState::Closed as u8, Ordering::AcqRel)
-            == SessionState::Closed as u8
         {
-            return;
+            // Losing failures must not discard writer acknowledgements before the cause exists.
+            let mut terminal = self.writer.failure.lock();
+            if self
+                .state
+                .swap(SessionState::Closed as u8, Ordering::AcqRel)
+                == SessionState::Closed as u8
+            {
+                return;
+            }
+            *terminal = Some(failure.clone());
         }
-        *self.failure.lock() = Some(failure.clone());
         self.capacity.close();
         let children = std::mem::take(&mut *self.children.lock());
         for child in children.values() {
@@ -455,12 +472,22 @@ impl VlessCoolSession {
 
         let terminal = frame.status == STATUS_END;
         if frame.options & OPTION_ERROR != 0 {
+            let error =
+                anyhow::anyhow!("Mux.Cool peer closed the logical connection with an error");
+            let error = if matches!(
+                self.children.lock().get(&frame.id),
+                Some(ChildSink::Udp { .. })
+            ) {
+                anyhow::Error::new(crate::proxy::NodeFailure(error))
+            } else {
+                anyhow::Error::new(crate::proxy::TargetFailure(error))
+            };
             self.fail_child(
                 frame.id,
-                Failure::new(
-                    io::ErrorKind::ConnectionReset,
-                    "Mux.Cool peer closed the logical connection with an error",
-                ),
+                Failure {
+                    kind: io::ErrorKind::ConnectionReset,
+                    cause: FailureCause::Shared(crate::SharedError::new(error)),
+                },
             );
             return Ok(());
         }
@@ -729,10 +756,10 @@ async fn run_writer<W: AsyncWrite + Unpin>(
                     failure: Failure::from_io(error, "Mux.Cool carrier write failed"),
                     committed: offset != 0,
                 };
-                let _ = command.done.send(Err(failure.clone()));
                 if let Some(session) = session.upgrade() {
-                    session.fail(failure.failure);
+                    session.fail(failure.failure.clone());
                 }
+                let _ = command.done.send(Err(failure));
                 return;
             }
         }
@@ -784,11 +811,13 @@ pub(crate) fn connect(
         active_limit,
         next_id: AtomicU16::new(1),
         zero_id_issued: AtomicBool::new(false),
-        writer: CarrierWriter { tx },
+        writer: CarrierWriter {
+            tx,
+            failure: Arc::new(Mutex::new(None)),
+        },
         children: Mutex::new(HashMap::new()),
         ending_ids: Mutex::new(HashSet::new()),
         receive_budget: Arc::new(tokio::sync::Semaphore::new(RECEIVE_BYTE_BUDGET)),
-        failure: Mutex::new(None),
         tasks: Mutex::new(Vec::with_capacity(2)),
     });
     let writer_task = tokio::spawn(run_writer(writer, rx, Arc::downgrade(&session)));

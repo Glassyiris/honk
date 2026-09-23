@@ -13,6 +13,8 @@ pub(in crate::group::score) struct Summary {
     pub equivalent: bool,
     pub supported: bool,
     pub response_misaligned: bool,
+    pub candidate_limited: bool,
+    pub target_limited: bool,
     pub reporters: u8,
     pub span: Option<Duration>,
     pub evidence_age: Option<Duration>,
@@ -128,8 +130,36 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
             continue;
         }
         let Some(pair) = decision.pairs.get(index) else {
+            summary.candidate_limited |= normal_eligible(candidate, baseline);
             continue;
         };
+        if decision.pairs.joint.is_some() {
+            let original = PairEvidence {
+                response: pair.response.filter(|metric| now < metric.expires_at),
+                upload: pair.upload.filter(|metric| now < metric.expires_at),
+                download: pair.download.filter(|metric| now < metric.expires_at),
+                ..pair
+            };
+            // Narrowing support cannot erase a qualified defeat on the original pair.
+            let (rival_advantage, rates) = advantage(
+                original,
+                (winner.qualified(), candidate.qualified()),
+                (winner.observed_reliability, candidate.observed_reliability),
+            );
+            undefeated &= !rival_advantage && rates.into_iter().all(|gain| gain <= 0.0);
+            for (metric_index, metric) in [original.response, original.upload, original.download]
+                .into_iter()
+                .enumerate()
+            {
+                if let Some(metric) = metric {
+                    (index, original.basis as u8, metric_index, metric.support).hash(&mut support);
+                    oldest = Some(oldest.map_or(metric.oldest_at, |old| old.min(metric.oldest_at)));
+                    expires =
+                        Some(expires.map_or(metric.expires_at, |old| old.min(metric.expires_at)));
+                }
+            }
+        }
+        let pair = decision.pairs.summary_pair(index).unwrap_or(pair);
         let pair = PairEvidence {
             response: pair.response.filter(|metric| now < metric.expires_at),
             upload: pair.upload.filter(|metric| now < metric.expires_at),
@@ -137,6 +167,7 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
             ..pair
         };
         full_coverage &= !pair.partial;
+        summary.target_limited |= pair.partial;
         let Some(supporting) = [pair.response, pair.upload, pair.download]
             .into_iter()
             .flatten()

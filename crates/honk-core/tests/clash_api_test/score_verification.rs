@@ -263,6 +263,9 @@ async fn score_verification_is_private_readonly_and_uses_canonical_candidates() 
             assert_eq!(summary["basis"], "none");
             assert_eq!(summary["coverage"]["candidates"], candidates);
             assert_eq!(summary["coverage"]["compared"], 0);
+            assert_eq!(summary["blockers"]["availability"], candidates);
+            assert_eq!(summary["blockers"]["nodeFailure"], 0);
+            assert_eq!(summary["blockers"]["targetFailure"], 0);
             assert_eq!(
                 summary["missing"],
                 serde_json::json!({
@@ -302,6 +305,7 @@ async fn score_verification_is_private_readonly_and_uses_canonical_candidates() 
                     summary["coverage"],
                     serde_json::json!({
                         "candidates": 0, "compared": 0, "pending": 0,
+                        "candidateLimited": false, "targetLimited": false, "excluded": 0,
                     })
                 );
             }
@@ -367,6 +371,7 @@ async fn score_verification_separates_probe_comparison_from_business_usability()
         verification["coverage"],
         serde_json::json!({
             "candidates": 2, "compared": 2, "pending": 0,
+            "candidateLimited": false, "targetLimited": false, "excluded": 0,
         })
     );
     assert_eq!(

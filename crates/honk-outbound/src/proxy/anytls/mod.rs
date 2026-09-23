@@ -118,7 +118,7 @@ static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 enum StreamEvent {
     Data(InboundPayload),
     Fin,
-    Error(Arc<str>),
+    Error(crate::SharedError),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -326,7 +326,7 @@ pub(crate) struct AnyTlsSession {
     /// First physical-failure reason (demux read error, writer failure):
     /// streams report it after draining queued data — a dead session is
     /// never a clean EOF.
-    terminal_error: std::sync::OnceLock<Arc<anyhow::Error>>,
+    terminal_error: std::sync::OnceLock<crate::SharedError>,
     /// Streams killed locally (HOL slow-consumer): their readers see a
     /// reset after the queued data drains, not a clean EOF. A tombstone
     /// survives map/session teardown until the owning stream reads or drops.
@@ -468,7 +468,15 @@ impl AnyTlsSession {
                     // stream — failing the session would kill every healthy
                     // sibling with it.
                     session
-                        .dispatch_error(sid, Arc::from("stream open not acknowledged"))
+                        .dispatch_error(
+                            sid,
+                            crate::SharedError::new(
+                                crate::proxy::NodeFailure(anyhow::anyhow!(
+                                    "stream open not acknowledged"
+                                ))
+                                .into(),
+                            ),
+                        )
                         .await;
                 } else {
                     session.fail(anyhow::anyhow!(
@@ -497,12 +505,19 @@ impl AnyTlsSession {
         }
     }
 
+    fn session_error(&self, kind: std::io::ErrorKind, message: &'static str) -> std::io::Error {
+        match self.terminal_error.get() {
+            Some(error) => std::io::Error::new(kind, error.clone()),
+            None => std::io::Error::new(kind, message),
+        }
+    }
+
     fn writer_queue_error(&self) -> std::io::Error {
         let overloaded = !self.writer_q.is_closed();
         if overloaded {
             self.fail(anyhow::anyhow!("writer queue capacity exceeded"));
         }
-        std::io::Error::new(
+        self.session_error(
             std::io::ErrorKind::ConnectionAborted,
             if overloaded {
                 "AnyTLS writer queue capacity exceeded"
@@ -523,7 +538,7 @@ impl AnyTlsSession {
     /// makes the shared session terminal rather than growing memory.
     fn enqueue_control(&self, cmd: u8, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
         if self.is_closed() {
-            return Err(std::io::Error::new(
+            return Err(self.session_error(
                 std::io::ErrorKind::ConnectionAborted,
                 "AnyTLS session is closed",
             ));
@@ -538,7 +553,7 @@ impl AnyTlsSession {
     /// growing memory. Uncancellable once queued.
     async fn enqueue_data(&self, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
         if self.is_closed() {
-            return Err(std::io::Error::new(
+            return Err(self.session_error(
                 std::io::ErrorKind::ConnectionAborted,
                 "AnyTLS session is closed",
             ));
@@ -553,7 +568,7 @@ impl AnyTlsSession {
     async fn enqueue_confirmed_data(&self, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
         let permit = self.acquire_data_permit(payload.len()).await?;
         let completed = self.enqueue_confirmed_data_with_permit(sid, payload, permit)?;
-        Self::wait_for_confirmed_data(completed).await
+        self.wait_for_confirmed_data(completed).await
     }
 
     fn enqueue_confirmed_data_with_permit(
@@ -566,10 +581,10 @@ impl AnyTlsSession {
         let queued = {
             let streams = self.streams.lock().unwrap();
             if !streams.contains_key(&sid) {
-                return Err(Self::stream_not_registered_error());
+                return Err(self.stream_not_registered_error());
             }
             if self.is_closed() {
-                return Err(std::io::Error::new(
+                return Err(self.session_error(
                     std::io::ErrorKind::ConnectionAborted,
                     "AnyTLS session is closed",
                 ));
@@ -586,11 +601,12 @@ impl AnyTlsSession {
     }
 
     async fn wait_for_confirmed_data(
+        &self,
         completed: tokio::sync::oneshot::Receiver<bool>,
     ) -> std::io::Result<()> {
         match completed.await {
             Ok(true) => Ok(()),
-            Ok(false) | Err(_) => Err(std::io::Error::new(
+            Ok(false) | Err(_) => Err(self.session_error(
                 std::io::ErrorKind::BrokenPipe,
                 "AnyTLS writer failed before flushing frame",
             )),
@@ -601,13 +617,13 @@ impl AnyTlsSession {
     /// (async): one frame slot, then the payload's bytes.
     async fn acquire_data_permit(&self, bytes: usize) -> std::io::Result<DataPermit> {
         if self.is_closed() {
-            return Err(std::io::Error::new(
+            return Err(self.session_error(
                 std::io::ErrorKind::ConnectionAborted,
                 "AnyTLS session is closed",
             ));
         }
         let closed = || {
-            std::io::Error::new(
+            self.session_error(
                 std::io::ErrorKind::ConnectionAborted,
                 "AnyTLS writer queue is closed",
             )
@@ -677,10 +693,10 @@ impl AnyTlsSession {
         let queued = {
             let streams = self.streams.lock().unwrap();
             if !streams.contains_key(&sid) {
-                return Err(Self::stream_not_registered_error());
+                return Err(self.stream_not_registered_error());
             }
             if self.is_closed() {
-                return Err(std::io::Error::new(
+                return Err(self.session_error(
                     std::io::ErrorKind::ConnectionAborted,
                     "AnyTLS session is closed",
                 ));
@@ -793,8 +809,8 @@ impl AnyTlsSession {
         Ok((sid, rx, guard))
     }
 
-    fn stream_not_registered_error() -> std::io::Error {
-        std::io::Error::new(
+    fn stream_not_registered_error(&self) -> std::io::Error {
+        self.session_error(
             std::io::ErrorKind::BrokenPipe,
             "AnyTLS stream is no longer registered",
         )
@@ -806,7 +822,7 @@ impl AnyTlsSession {
             .unwrap()
             .contains_key(&sid)
             .then_some(())
-            .ok_or_else(Self::stream_not_registered_error)
+            .ok_or_else(|| self.stream_not_registered_error())
     }
 
     fn tcp_sink_is_live(&self, sid: u32) -> bool {
@@ -965,7 +981,9 @@ impl AnyTlsSession {
     /// Record the first physical-failure reason and close: streams
     /// report the reason after draining queued data.
     fn fail(&self, reason: anyhow::Error) {
-        let _ = self.terminal_error.set(Arc::new(reason));
+        let _ = self.terminal_error.set(crate::SharedError::new(
+            crate::proxy::NodeFailure(reason).into(),
+        ));
         self.close();
     }
 
@@ -1074,7 +1092,7 @@ impl AnyTlsSession {
         }
     }
 
-    async fn dispatch_error(self: &Arc<Self>, sid: u32, message: Arc<str>) {
+    async fn dispatch_error(self: &Arc<Self>, sid: u32, message: crate::SharedError) {
         let sink = self.streams.lock().unwrap().get(&sid).cloned();
         match sink {
             Some(StreamSink::Tcp(tx)) => {

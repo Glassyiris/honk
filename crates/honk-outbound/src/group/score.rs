@@ -7,6 +7,7 @@ mod ranking;
 pub(in crate::group) mod selection;
 #[cfg(test)]
 mod tests;
+mod validation;
 mod verification;
 
 pub use budget::ScoreBudgetCounters;
@@ -17,8 +18,8 @@ pub use feedback::{
 pub(in crate::group) use pressure::TransportQualitySource;
 pub use verification::{
     ScoreComparison, ScoreEvidenceBasis, ScoreEvidenceGaps, ScoreEvidenceQuestion,
-    ScoreLocalComparison, ScoreTrialSource, ScoreValidationAction, ScoreVerificationCounters,
-    ScoreVerificationSnapshot, ScoreVerificationState, ScoreWaitReason,
+    ScoreLocalComparison, ScoreTrialSource, ScoreValidationAction, ScoreVerificationBlockers,
+    ScoreVerificationCounters, ScoreVerificationSnapshot, ScoreVerificationState, ScoreWaitReason,
 };
 
 use super::{
@@ -136,6 +137,9 @@ pub enum ScoreOutcome {
     Success,
     Timeout,
     Io(io::ErrorKind),
+    TargetFailure,
+    NodeFailure,
+    SharedNodeFailure(u64),
     Rejected,
     Cancelled,
     Shutdown,
@@ -151,6 +155,12 @@ impl ScoreOutcome {
                 Self::Rejected
             };
         }
+        if crate::proxy::target_failure(error) {
+            return Self::TargetFailure;
+        }
+        if crate::proxy::node_failure(error) {
+            return Self::NodeFailure;
+        }
         error
             .chain()
             .find_map(|source| source.downcast_ref::<io::Error>())
@@ -161,6 +171,32 @@ impl ScoreOutcome {
                     Self::Io(error.kind())
                 }
             })
+    }
+
+    pub fn from_io_error(error: &io::Error) -> Self {
+        if let Some(rejection) = crate::proxy::io_packet_rejection(error) {
+            return if rejection == crate::proxy::PacketRejection::Cancelled {
+                Self::Cancelled
+            } else {
+                Self::Rejected
+            };
+        }
+        if crate::proxy::io_target_failure(error) {
+            Self::TargetFailure
+        } else if crate::proxy::io_node_failure(error) {
+            Self::NodeFailure
+        } else if error.kind() == io::ErrorKind::TimedOut {
+            Self::Timeout
+        } else {
+            Self::Io(error.kind())
+        }
+    }
+
+    pub fn shared_node_failure() -> Self {
+        match comparison::next_reporter_id() {
+            0 => Self::NodeFailure,
+            episode => Self::SharedNodeFailure(episode),
+        }
     }
 }
 
@@ -199,6 +235,8 @@ struct Availability {
 #[derive(Debug, Clone, Default)]
 struct Stats {
     incarnation: u64,
+    node_incarnation: u64,
+    last_node_failure_episode: u64,
     attempts: f64,
     setup_success: f64,
     setup_failure: f64,
@@ -249,11 +287,9 @@ impl SelectionCadenceKey {
     }
 }
 
-#[derive(Clone, Copy)]
 struct SelectionCadence {
     revalidated_at: Instant,
-    validation_node: Option<Uuid>,
-    validation_attempts: u8,
+    run: Option<validation::ValidationRun>,
 }
 
 /// Flap history is scoped to the same target the pick was ranked for:
@@ -499,7 +535,7 @@ impl ScorePolicyState {
             valid_groups,
             ..
         } = &mut *inner;
-        selection_counts.retain(|key, _| valid_groups.contains(&key.group));
+        selection_counts.clear();
         budgets.retain(|key, _| valid_groups.contains(&key.group));
         for scope in budgets.values_mut() {
             scope.invalidate_pending();
@@ -812,6 +848,7 @@ struct ScoreSnapshot {
     reliability_upper: f64,
     useful_completed: f64,
     qualification_retained: bool,
+    recovered_qualification: bool,
     performance: PerformanceSnapshot,
     target_performance: PerformanceSnapshot,
     probe: MetricSnapshot,
@@ -823,6 +860,8 @@ struct ScoreSnapshot {
     carrier_pressure_at: Option<Instant>,
     unresolved_failure: bool,
     explore_backed_off: bool,
+    node_failure: bool,
+    target_failure: bool,
     fail_streak: u32,
     selected_at: u64,
 }
@@ -852,7 +891,6 @@ struct FlowSample {
     source: ScoreSource,
     tx: u64,
     rx: u64,
-    last_rx_at: Option<Instant>,
     eligible_rx_at: Option<Instant>,
     elapsed: Duration,
     count_usefulness: bool,

@@ -784,35 +784,51 @@ async fn remote_no_error_reset_is_clean_eof_after_payload() {
 }
 
 #[tokio::test]
-async fn mux_body_error_is_reported_lazily() {
-    let (client, server) = tokio::io::duplex(1 << 20);
-    let server = tokio::spawn(async move {
-        let io = server_carrier(server, false).await;
-        let mut connection = h2::server::handshake(io).await.unwrap();
-        let (request, mut respond) = connection.accept().await.unwrap().unwrap();
-        assert_eq!(request.method(), http::Method::CONNECT);
-        let mut send = respond
-            .send_response(http::Response::new(()), false)
-            .unwrap();
-        send.send_data(Bytes::from_static(&[1, 3, b'b', b'a', b'd']), true)
-            .unwrap();
-        while connection.accept().await.is_some() {}
-    });
-    let session = connect(Box::new(client), false).await.unwrap();
-    let mut stream = Arc::clone(&session)
-        .open_stream(
-            session.try_reserve().unwrap(),
-            "93.184.216.34:443".parse().unwrap(),
-            None,
-        )
-        .await
-        .unwrap_or_else(|_| panic!("logical stream must open before lazy rejection"));
-    let error = stream.read_u8().await.unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
-    assert!(error.to_string().contains("bad"));
-    drop(stream);
-    session.close();
-    server.await.unwrap();
+async fn mux_refusal_distinguishes_target_status_from_http_envelope() {
+    for envelope in [false, true] {
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let server = tokio::spawn(async move {
+            let io = server_carrier(server, false).await;
+            let mut connection = h2::server::handshake(io).await.unwrap();
+            let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+            assert_eq!(request.method(), http::Method::CONNECT);
+            let mut response = http::Response::new(());
+            if envelope {
+                *response.status_mut() = http::StatusCode::FORBIDDEN;
+            }
+            let mut send = respond.send_response(response, envelope).unwrap();
+            if !envelope {
+                send.send_data(Bytes::from_static(&[1, 3, b'b', b'a', b'd']), true)
+                    .unwrap();
+            }
+            while connection.accept().await.is_some() {}
+        });
+        let session = connect(Box::new(client), false).await.unwrap();
+        let mut stream = Arc::clone(&session)
+            .open_stream(
+                session.try_reserve().unwrap(),
+                "93.184.216.34:443".parse().unwrap(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|_| panic!("logical stream must open before lazy rejection"));
+        let expected = if envelope {
+            crate::group::ScoreOutcome::NodeFailure
+        } else {
+            crate::group::ScoreOutcome::TargetFailure
+        };
+        let error = stream.read_u8().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(crate::group::ScoreOutcome::from_io_error(&error), expected);
+        let repeated = stream.read_u8().await.unwrap_err();
+        assert_eq!(
+            crate::group::ScoreOutcome::from_io_error(&repeated),
+            expected
+        );
+        drop(stream);
+        session.close();
+        server.await.unwrap();
+    }
 }
 
 #[tokio::test]

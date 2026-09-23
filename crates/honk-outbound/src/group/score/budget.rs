@@ -9,6 +9,19 @@ const PENDING: u8 = 0;
 const STARTED: u8 = 1;
 const FINISHED: u8 = 2;
 const CANCELLED: u8 = 3;
+pub(super) fn exploration_target(candidate_count: usize) -> usize {
+    if candidate_count <= 4 {
+        candidate_count
+    } else {
+        (((candidate_count as f64).sqrt().ceil() as usize) + 1).min(candidate_count)
+    }
+}
+
+pub(super) fn exploration_period(candidate_count: usize) -> u64 {
+    (candidate_count as u64)
+        .saturating_mul(2)
+        .clamp(SCORE_EXPLORATION_MIN_PERIOD, SCORE_EXPLORATION_MAX_PERIOD)
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScoreBudgetCounters {
@@ -59,13 +72,33 @@ impl std::fmt::Debug for Opportunity {
     }
 }
 
-struct Life {
+pub(super) struct Life {
     status: AtomicU8,
     setup: AtomicBool,
     token: Option<Token>,
     started_at: OnceLock<Instant>,
     answered: AtomicU8,
     source: ScoreTrialSource,
+    original: AtomicBool,
+    deadline: OnceLock<Instant>,
+}
+
+impl Life {
+    pub(super) fn original_started(&self) -> bool {
+        self.original.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn pending(&self) -> bool {
+        self.status.load(Ordering::Relaxed) == PENDING
+    }
+
+    pub(super) fn finished(&self) -> bool {
+        self.status.load(Ordering::Relaxed) >= FINISHED
+    }
+
+    pub(super) fn deadline(&self) -> Option<Instant> {
+        self.deadline.get().copied()
+    }
 }
 
 struct InFlight {
@@ -83,13 +116,13 @@ pub(super) struct Scope {
 
 impl Scope {
     fn new(members: usize) -> Self {
-        let allowance = ranking::exploration_target(members) as u64;
+        let allowance = exploration_target(members) as u64;
         Self {
             identity: Arc::new(()),
             counters: ScoreBudgetCounters {
                 cold_allowance: allowance,
                 cold_available: allowance,
-                earning_period: ranking::exploration_period(members),
+                earning_period: exploration_period(members),
                 scopes: 1,
                 ..Default::default()
             },
@@ -241,10 +274,10 @@ impl Scope {
 
 pub(in crate::group) struct Work {
     state: Weak<ScorePolicyState>,
-    key: SelectionCadenceKey,
+    pub(super) key: SelectionCadenceKey,
     scope: Option<Arc<()>>,
     node: Uuid,
-    life: Arc<Life>,
+    pub(super) life: Arc<Life>,
 }
 
 impl std::fmt::Debug for Work {
@@ -273,6 +306,8 @@ impl Work {
                 started_at: OnceLock::new(),
                 answered: AtomicU8::new(0),
                 source,
+                original: AtomicBool::new(false),
+                deadline: OnceLock::new(),
             }),
         })
     }
@@ -291,7 +326,7 @@ impl Work {
             .is_none_or(|identity| Arc::ptr_eq(identity, &scope.identity))
     }
 
-    fn cancel_pending(&self, inner: &mut StateInner) {
+    pub(super) fn cancel_pending(&self, inner: &mut StateInner) {
         if self.life.status.load(Ordering::Relaxed) != PENDING {
             return;
         }
@@ -330,6 +365,40 @@ fn ensure_scope<'a>(inner: &'a mut StateInner, key: &SelectionCadenceKey) -> &'a
         inner.budgets.insert(key.clone(), Scope::new(members));
     }
     inner.budgets.get_mut(key).expect("scope inserted above")
+}
+
+pub(super) fn bind_deadline(
+    inner: &mut StateInner,
+    work: &Arc<Work>,
+    deadline: Instant,
+) -> Arc<Life> {
+    let _ = work.life.deadline.set(deadline);
+    if let Some(scope) = inner.budgets.get_mut(&work.key) {
+        for entry in &mut scope.in_flight {
+            if entry.life.ptr_eq(&Arc::downgrade(&work.life)) {
+                entry.expires = entry.expires.min(deadline);
+                break;
+            }
+        }
+    }
+    Arc::clone(&work.life)
+}
+
+pub(super) fn available_credit(
+    inner: &StateInner,
+    group: &str,
+    context: &ScoreSelectionContext,
+    now: Instant,
+) -> u64 {
+    let Some(scope) = inner.budgets.get(&SelectionCadenceKey::new(group, context)) else {
+        return exploration_target(inner.valid.iter().filter(|(name, _)| name == group).count())
+            as u64;
+    };
+    if !scope.available(now) {
+        return 0;
+    }
+    let (cold, earned, _) = scope.effective_credit(now);
+    cold.saturating_add(earned)
 }
 
 pub(super) fn reserve(
@@ -373,6 +442,8 @@ pub(super) fn reserve(
             token: Some(token),
             started_at: OnceLock::new(),
             answered: AtomicU8::new(0),
+            original: AtomicBool::new(false),
+            deadline: OnceLock::new(),
             source: match token {
                 Token::Cold => ScoreTrialSource::Cold,
                 Token::Earned => ScoreTrialSource::Periodic,
@@ -435,7 +506,7 @@ pub(super) fn cold_available(
 }
 
 pub(super) fn begin(
-    state: &Arc<ScorePolicyState>,
+    inner: &mut StateInner,
     authority: &Arc<ScoreAuthority>,
     context: &ScoreSelectionContext,
     attributions: &[ScoreAttribution],
@@ -443,7 +514,6 @@ pub(super) fn begin(
     work: &[Arc<Work>],
     now: Instant,
 ) -> bool {
-    let mut inner = state.inner.lock();
     if !inner
         .active_authority
         .as_ref()
@@ -453,7 +523,7 @@ pub(super) fn begin(
             .any(|a| !inner.valid.contains(&(a.group.clone(), a.node_id)))
     {
         for item in work {
-            item.cancel_pending(&mut inner);
+            item.cancel_pending(inner);
         }
         return false;
     }
@@ -471,11 +541,11 @@ pub(super) fn begin(
         return true;
     }
     for item in work {
-        let scope = ensure_scope(&mut inner, &item.key);
+        let scope = ensure_scope(inner, &item.key);
         scope.expire(now);
         if !item.scope_matches(scope) || item.life.status.load(Ordering::Relaxed) == CANCELLED {
             for pending in work {
-                pending.cancel_pending(&mut inner);
+                pending.cancel_pending(inner);
             }
             return false;
         }
@@ -491,16 +561,17 @@ pub(super) fn begin(
         })
     {
         for item in work {
-            item.cancel_pending(&mut inner);
+            item.cancel_pending(inner);
         }
         return false;
     }
+    let original = !progress.begun;
     if !progress.begun {
         inner.root_business_starts += 1;
         progress.begun = true;
     }
     for item in work {
-        let scope = ensure_scope(&mut inner, &item.key);
+        let scope = ensure_scope(inner, &item.key);
         if !progress
             .scopes
             .iter()
@@ -522,6 +593,7 @@ pub(super) fn begin(
         if item.life.status.load(Ordering::Relaxed) == PENDING {
             item.life.status.store(STARTED, Ordering::Relaxed);
             let _ = item.life.started_at.set(now);
+            item.life.original.store(original, Ordering::Relaxed);
             if item.life.token.is_some() {
                 scope.counters.reserved -= 1;
                 scope.counters.spent += 1;

@@ -837,6 +837,10 @@ async fn test_first_read_sends_tcp_request_and_reports_response_error() {
         .expect("first read did not send the Hysteria2 TCP request")
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&error),
+        crate::group::ScoreOutcome::TargetFailure
+    );
 }
 
 #[tokio::test]
@@ -867,6 +871,7 @@ async fn test_wrong_password_rejected() {
         .dial(&node, target, None, Duration::from_secs(5))
         .await;
     let err = result.expect_err("bad password must fail the dial");
+    assert!(!crate::proxy::target_failure(&err));
     assert!(
         format!("{err:#}").contains("authentication failed, status code: 404"),
         "unexpected error: {err:#}"

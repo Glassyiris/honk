@@ -359,7 +359,7 @@ impl ControlPlaneHandle {
                                 reporter.setup_failed(if generation.is_shutdown() {
                                     crate::group::ScoreOutcome::Shutdown
                                 } else {
-                                    crate::group::ScoreOutcome::Io(e.kind())
+                                    crate::group::ScoreOutcome::from_io_error(&e)
                                 });
                             }
                             debug!(

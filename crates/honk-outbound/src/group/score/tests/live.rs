@@ -547,3 +547,315 @@ fn warmup_setup_quality_remains_available_without_business_completions() {
         1
     );
 }
+
+#[test]
+fn node_fault_fences_healthy_exact_and_replaced_parent_rejects_old_reporter() {
+    let leaf = node("parent fenced");
+    let nodes = std::slice::from_ref(&leaf);
+    let manager = GroupManager::new(&[group("score", nodes)], nodes);
+    let healthy = context("healthy.example", IpVersion::V4);
+    let failed = context("carrier.example", IpVersion::V6);
+    let now = Instant::now();
+    train_at(
+        &manager,
+        &leaf,
+        &healthy,
+        8,
+        Duration::from_millis(100),
+        1,
+        now,
+    );
+    let feedback = manager
+        .feedback_for_group_node("score", leaf.id, healthy.clone())
+        .unwrap();
+    let old = feedback.start_at(now + Duration::from_secs(2));
+    let fault = now + Duration::from_secs(3);
+    manager
+        .feedback_for_group_node("score", leaf.id, failed)
+        .unwrap()
+        .start_at(fault)
+        .finish_at(ScoreOutcome::NodeFailure, true, fault);
+    let state = manager.score_state();
+    let score = score_snapshot(&state.inner.lock(), "score", &healthy, leaf.id, fault);
+    assert!(score.unresolved_failure);
+    assert!(score.explore_backed_off);
+    assert!(score.target_performance.response.value.is_none());
+    assert_eq!(
+        state
+            .verification_snapshot_at("score", &healthy, &[&leaf], fault)
+            .unwrap()
+            .state,
+        ScoreVerificationState::Provisional
+    );
+    state.inner.lock().aggregate.pop(&AggregateKey {
+        group: "score".into(),
+        network: healthy.network,
+        family: None,
+        node_id: leaf.id,
+    });
+    let at = now + Duration::from_secs(4);
+    let replacement = feedback.start_at(at);
+    let before = state.exact_stats("score", &healthy, leaf.id);
+    old.setup_succeeded_at(at);
+    old.first_response_at(at + Duration::from_millis(10));
+    old.transfer_at(1, 1, at);
+    old.finish_at(ScoreOutcome::Success, true, at);
+    assert_eq!(state.exact_stats("score", &healthy, leaf.id), before);
+    let score = score_snapshot(&state.inner.lock(), "score", &healthy, leaf.id, at);
+    assert!(score.target_performance.response.value.is_none());
+    replacement.finish_at(ScoreOutcome::Cancelled, true, at);
+}
+
+#[test]
+fn new_target_live_recovery_requires_node_failure_not_reload_fence() {
+    for node_failed in [true, false] {
+        let nodes = [node("recovering"), node("healthy rival")];
+        let old = GroupManager::new(&[group("score", &nodes)], &nodes);
+        let failed_target = context("carrier.example", IpVersion::V4);
+        let target = context("new.example", IpVersion::V6);
+        let now = Instant::now();
+        let feedback = old
+            .feedback_for_group_node("score", nodes[0].id, failed_target)
+            .unwrap();
+        if node_failed {
+            for _ in 0..9 {
+                feedback
+                    .start_at(now)
+                    .finish_at(ScoreOutcome::NodeFailure, true, now);
+            }
+        } else {
+            feedback
+                .start_at(now)
+                .finish_at(ScoreOutcome::Cancelled, true, now);
+        }
+        let state = old.score_state();
+        let manager = GroupManager::with_alive_set_and_score_state(
+            &[group("score", &nodes)],
+            &nodes,
+            None,
+            Arc::clone(&state),
+        );
+        manager.publish_score_membership();
+        let at = Instant::now() + Duration::from_secs(2);
+        train_at(
+            &manager,
+            &nodes[1],
+            &target,
+            200,
+            Duration::from_millis(100),
+            1,
+            at - Duration::from_secs(1),
+        );
+        assert!(!state.has_exact("score", &target, nodes[0].id));
+        let feedback = manager
+            .feedback_for_group_node("score", nodes[0].id, target.clone())
+            .unwrap();
+        let open: Vec<_> = (0..4)
+            .map(|_| {
+                let reporter = feedback.start_at(at);
+                reporter.setup_succeeded_at(at);
+                reporter
+            })
+            .collect();
+        let before = decision_at(&state.inner.lock(), &nodes, &target, 0, at);
+        assert!(!ranking::normal_eligible(
+            &before.scores[0],
+            before.baseline
+        ));
+        let counts = state.aggregate_stats("score", target.network, nodes[0].id);
+        assert_eq!(counts.unwrap().2, if node_failed { 9 } else { 0 });
+        for (index, reporter) in open.iter().enumerate() {
+            reporter.transfer_at(1, 1, at);
+            let current = decision_at(&state.inner.lock(), &nodes, &target, 0, at);
+            let recovered = node_failed && index == 3;
+            assert_eq!(
+                ranking::normal_eligible(&current.scores[0], current.baseline),
+                recovered,
+                "node_failed={node_failed}, distinct replies={}",
+                index + 1
+            );
+            assert_eq!(current.scores[0].recovered_qualification, recovered);
+            assert_eq!(
+                current.scores[0].unresolved_failure,
+                node_failed && index < 3
+            );
+            assert_close(current.scores[0].completed, before.scores[0].completed);
+            assert_close(
+                current.scores[0].useful_completed,
+                before.scores[0].useful_completed,
+            );
+            assert_close(
+                current.scores[0].observed_reliability,
+                before.scores[0].observed_reliability,
+            );
+            assert_eq!(
+                state.aggregate_stats("score", target.network, nodes[0].id),
+                counts
+            );
+            assert_eq!(
+                state.exact_stats("score", &target, nodes[0].id),
+                Some((4, 0, 0))
+            );
+        }
+        for reporter in open {
+            reporter.finish_at(ScoreOutcome::Cancelled, true, at);
+        }
+    }
+}
+
+#[test]
+fn trained_target_needs_own_four_replies_after_inherited_node_failure() {
+    let nodes = [node("recovering"), node("healthy rival")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("trained.example", IpVersion::V4);
+    let other = context("other.example", IpVersion::V6);
+    let now = Instant::now();
+    let feedback = manager
+        .feedback_for_group_node("score", nodes[0].id, target.clone())
+        .unwrap();
+    for _ in 0..9 {
+        let reporter = feedback.start_at(now);
+        reporter.setup_succeeded_at(now);
+        reporter.finish_at(ScoreOutcome::TargetFailure, true, now);
+    }
+    for (leaf, samples) in [(&nodes[0], 4), (&nodes[1], 200)] {
+        train_at(
+            &manager,
+            leaf,
+            &target,
+            samples,
+            Duration::from_millis(100),
+            1,
+            now + Duration::from_secs(1),
+        );
+    }
+    let failed_at = now + Duration::from_secs(3);
+    manager
+        .feedback_for_group_node(
+            "score",
+            nodes[0].id,
+            context("carrier.example", IpVersion::V6),
+        )
+        .unwrap()
+        .start_at(failed_at)
+        .finish_at(ScoreOutcome::NodeFailure, true, failed_at);
+    let at = now + Duration::from_secs(4);
+    let open: Vec<_> = (0..4)
+        .map(|_| {
+            let reporter = feedback.start_at(at);
+            reporter.setup_succeeded_at(at);
+            reporter
+        })
+        .collect();
+    let other_feedback = manager
+        .feedback_for_group_node("score", nodes[0].id, other)
+        .unwrap();
+    let other_open: Vec<_> = (0..4)
+        .map(|_| {
+            let reporter = other_feedback.start_at(at);
+            reporter.setup_succeeded_at(at);
+            reporter
+        })
+        .collect();
+    let state = manager.score_state();
+    let before = decision_at(&state.inner.lock(), &nodes, &target, 0, at);
+    let counts = state.aggregate_stats("score", target.network, nodes[0].id);
+    open[0].transfer_at(1, 1, at);
+    for reporter in &other_open {
+        reporter.transfer_at(1, 1, at);
+    }
+    for (index, reporter) in open.iter().enumerate() {
+        if index > 0 {
+            reporter.transfer_at(1, 1, at);
+        }
+        let current = decision_at(&state.inner.lock(), &nodes, &target, 0, at);
+        assert_eq!(
+            ranking::normal_eligible(&current.scores[0], current.baseline),
+            index == 3,
+            "target replies={}, other-target replies=4",
+            index + 1
+        );
+        assert_eq!(current.scores[0].recovered_qualification, index == 3);
+        assert_close(current.scores[0].completed, before.scores[0].completed);
+        assert_close(
+            current.scores[0].useful_completed,
+            before.scores[0].useful_completed,
+        );
+        assert_close(
+            current.scores[0].observed_reliability,
+            before.scores[0].observed_reliability,
+        );
+        assert_eq!(
+            state.aggregate_stats("score", target.network, nodes[0].id),
+            counts
+        );
+    }
+    for reporter in open.into_iter().chain(other_open) {
+        reporter.finish_at(ScoreOutcome::Cancelled, true, at);
+    }
+}
+
+#[test]
+fn probe_failure_invalidates_only_matching_identity_and_current_authority() {
+    let leaf = node("probe fenced");
+    let nodes = std::slice::from_ref(&leaf);
+    let manager = GroupManager::new(&[group("score", nodes)], nodes);
+    let target = context("probe.example", IpVersion::V4);
+    let now = Instant::now();
+    let feedback = manager
+        .feedback_for_group_node("score", leaf.id, target.clone())
+        .unwrap()
+        .with_source(ScoreSource::HealthProbe);
+    let old = feedback.start_at(now);
+    probe_at(
+        &manager,
+        &leaf,
+        &target,
+        ScoreSource::HealthProbe,
+        Duration::from_millis(10),
+        now,
+    );
+    feedback
+        .clone()
+        .with_probe_identity("https://different.example", "HEAD")
+        .start_at(now)
+        .finish_at(ScoreOutcome::Timeout, false, now);
+    let state = manager.score_state();
+    assert_eq!(
+        score_snapshot(&state.inner.lock(), "score", &target, leaf.id, now)
+            .probe
+            .value,
+        Some(10.0)
+    );
+    feedback
+        .start_at(now)
+        .finish_at(ScoreOutcome::Timeout, false, now);
+    assert!(
+        score_snapshot(&state.inner.lock(), "score", &target, leaf.id, now)
+            .probe
+            .value
+            .is_none()
+    );
+    let replacement = GroupManager::with_alive_set_and_score_state(
+        &[group("score", nodes)],
+        nodes,
+        None,
+        Arc::clone(&state),
+    );
+    replacement.publish_score_membership();
+    probe_at(
+        &replacement,
+        &leaf,
+        &target,
+        ScoreSource::HealthProbe,
+        Duration::from_millis(20),
+        now,
+    );
+    old.finish_at(ScoreOutcome::Timeout, false, now);
+    assert_eq!(
+        score_snapshot(&state.inner.lock(), "score", &target, leaf.id, now)
+            .probe
+            .value,
+        Some(20.0)
+    );
+}

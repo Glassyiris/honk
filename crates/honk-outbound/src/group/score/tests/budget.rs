@@ -319,7 +319,7 @@ fn sparse_arrivals_obey_spent_plus_reserved_bound_without_clock_currency() {
         let before = counts(&manager, "score");
         assert!(before.spent + before.reserved <= 8 + before.business_starts / 64);
         assert!(budget::begin(
-            &state,
+            &mut state.inner.lock(),
             &manager.score_authority,
             &target,
             &attributions,
@@ -392,7 +392,7 @@ fn pending_expiry_refunds_and_started_expiry_only_releases_suppression() {
         node_id: nodes[0].id,
     }];
     assert!(!budget::begin(
-        &state,
+        &mut state.inner.lock(),
         &manager.score_authority,
         &target,
         &attribution,
@@ -401,7 +401,7 @@ fn pending_expiry_refunds_and_started_expiry_only_releases_suppression() {
         later
     ));
     assert!(budget::begin(
-        &state,
+        &mut state.inner.lock(),
         &manager.score_authority,
         &target,
         &attribution,

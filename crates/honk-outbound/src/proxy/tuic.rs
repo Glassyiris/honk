@@ -824,7 +824,16 @@ impl PacketTransport for TuicUdpTransport {
     async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         loop {
             let msg = self.rx.lock().await.recv().await.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::ConnectionAborted, "TUIC connection closed")
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    super::NodeFailure(
+                        self.state
+                            .conn
+                            .close_reason()
+                            .map(anyhow::Error::new)
+                            .unwrap_or_else(|| anyhow::anyhow!("TUIC connection closed")),
+                    ),
+                )
             })?;
             let complete =
                 self.defrag

@@ -117,6 +117,7 @@ fn crossed_directions_are_a_tradeoff_not_missing_evidence() {
         &comparison::PairCohort {
             reference: 0,
             pairs: [Some((1, pair)), None, None, None],
+            joint: None,
         },
     );
     assert_eq!(selected.index, 0);
@@ -263,6 +264,7 @@ fn first_choice_and_real_failure_escape_need_no_comparison_evidence() {
     let pairs = comparison::PairCohort {
         reference: 0,
         pairs: [None; 4],
+        joint: None,
     };
     let mut scores = [incumbent, candidate];
     let baseline = performance_baseline(&scores);

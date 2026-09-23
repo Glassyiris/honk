@@ -114,6 +114,14 @@ fn carrier_pressure_reopens_only_budgeted_comparison_without_penalizing_business
         assert_eq!(after.trial_starts, spent.trial_starts);
         validation.finish_at(ScoreOutcome::Cancelled, false, at);
         for _ in 1..funded.earned_available {
+            let available = state.budget_counters("score", network);
+            if available.earned_available == 1 {
+                let snapshot = state
+                    .verification_snapshot_at("score", &target, &refs, at)
+                    .unwrap();
+                assert_eq!(snapshot.wait_reason, ScoreWaitReason::ComparableTraffic);
+                assert_eq!(state.budget_counters("score", network), available);
+            }
             let (index, feedback) = state.rank_plan_at("score", &target, &refs, at);
             assert_eq!(index, 1);
             feedback.begin_at(at).unwrap().start_at(at).finish_at(

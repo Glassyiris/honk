@@ -1,4 +1,5 @@
 use super::*;
+use std::io;
 
 fn hex(s: &str) -> Vec<u8> {
     (0..s.len())
@@ -330,8 +331,86 @@ async fn rejected_response_header_surfaces_as_stream_error() {
     .expect("the stream must settle once the relay fails")
     .expect_err("a rejected response header must not read as EOF");
     assert!(out.is_empty());
-    assert!(
-        error.to_string().starts_with("vmess: "),
-        "error should carry the relay's reason: {error}"
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&error),
+        crate::group::ScoreOutcome::NodeFailure
     );
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
+#[derive(Debug)]
+struct ResetOnEof(tokio::io::DuplexStream);
+
+impl AsyncRead for ResetOnEof {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        match Pin::new(&mut self.0).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) if buf.filled().len() == before && buf.remaining() != 0 => {
+                Poll::Ready(Err(io::Error::from_raw_os_error(libc::ECONNRESET)))
+            }
+            result => result,
+        }
+    }
+}
+
+impl AsyncWrite for ResetOnEof {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test]
+async fn response_header_transport_failures_keep_io_kind_and_node_cause() {
+    for kind in [io::ErrorKind::UnexpectedEof, io::ErrorKind::ConnectionReset] {
+        let (physical, mut peer) = tokio::io::duplex(4096);
+        let physical: Box<dyn AsyncReadWrite> = if kind == io::ErrorKind::ConnectionReset {
+            Box::new(ResetOnEof(physical))
+        } else {
+            Box::new(physical)
+        };
+        let uuid = uuid::Uuid::parse_str(UUID).unwrap();
+        let target = "93.184.216.34:53".parse().unwrap();
+        let mut stream =
+            VmessHandler::perform_handshake(uuid.as_bytes(), physical, target, None).unwrap();
+
+        peer.read_exact(&mut [0]).await.unwrap();
+        peer.write_all(&[0x5a; 3]).await.unwrap();
+        // Keep the request side open so the failure comes from the partial response header.
+        peer.shutdown().await.unwrap();
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stream.stream.read(&mut [0; 1]),
+        )
+        .await
+        .expect("header transport failure must settle the returned stream")
+        .expect_err("a partial response header must not read as clean EOF");
+        assert_eq!(error.kind(), kind);
+        assert_eq!(
+            crate::group::ScoreOutcome::from_io_error(&error),
+            crate::group::ScoreOutcome::NodeFailure
+        );
+        let error = anyhow::Error::new(error);
+        let cause = error.root_cause().downcast_ref::<io::Error>().unwrap();
+        assert_eq!(cause.kind(), kind);
+        if kind == io::ErrorKind::ConnectionReset {
+            assert_eq!(cause.raw_os_error(), Some(libc::ECONNRESET));
+        }
+    }
 }

@@ -265,7 +265,7 @@ pub(in crate::control) async fn warm_selector_candidate(
                     reporter.setup_failed(if error.kind() == io::ErrorKind::TimedOut {
                         crate::group::ScoreOutcome::Timeout
                     } else {
-                        crate::group::ScoreOutcome::Io(error.kind())
+                        crate::group::ScoreOutcome::from_io_error(&error)
                     });
                 }
                 debug!(node = %node.name, %error, "Selector warm bare TCP failed");
