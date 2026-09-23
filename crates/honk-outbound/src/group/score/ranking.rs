@@ -302,10 +302,26 @@ impl ScorePolicyState {
                 selection.reason,
             );
         }
-        inner.tick = inner.tick.saturating_add(1);
-        let tick = inner.tick;
-        mark_selected(&mut inner, group, context, nodes[selection.index].id, tick);
         (selection.index, reservation)
+    }
+}
+
+/// An admitted begin, not a plan, is a real opportunity; one tick covers every attribution.
+pub(super) fn advance_rotation(
+    inner: &mut StateInner,
+    context: &ScoreSelectionContext,
+    attributions: &[super::ScoreAttribution],
+) {
+    inner.tick = inner.tick.saturating_add(1);
+    let tick = inner.tick;
+    for attribution in attributions {
+        mark_selected(
+            inner,
+            &attribution.group,
+            context,
+            attribution.node_id,
+            tick,
+        );
     }
 }
 

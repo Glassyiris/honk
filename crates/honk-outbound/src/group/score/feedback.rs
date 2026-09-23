@@ -165,6 +165,11 @@ impl ScoreAttempt {
         ) {
             return Err(crate::proxy::PacketRejection::Cancelled);
         }
+        super::ranking::advance_rotation(
+            &mut inner,
+            &self.feedback.context,
+            &self.feedback.attributions,
+        );
         Ok(ScoreBusinessGuard {
             attempt: Some(self.clone()),
             admitted: true,

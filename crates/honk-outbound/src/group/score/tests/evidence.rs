@@ -232,9 +232,15 @@ fn stale_manager_authority_stays_revoked_after_same_name_recreation() {
     let current =
         replacement.selection_plan_for_target("score", &context("current.example", IpVersion::V4));
     assert!(current.entries[0].feedback.is_some());
+    {
+        let planned = state.inner.lock();
+        assert_eq!(planned.selection_counts.len(), 1);
+        // An unbegun plan is not an opportunity: no discovery state or tick changes yet.
+        assert_eq!((planned.tick, planned.aggregate.len()), (before.0, 0));
+    }
+    finish_success(&current);
     let after_current = state.inner.lock();
-    assert_eq!(after_current.selection_counts.len(), 1);
-    assert_eq!(after_current.aggregate.len(), 1);
+    assert!(!after_current.aggregate.is_empty());
     assert!(after_current.tick > before.0);
 }
 

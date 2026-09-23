@@ -756,3 +756,47 @@ fn terminal_success_with_same_time_rx_does_not_clear_failure_backoff() {
     assert!(before.explore_backed_off);
     assert!(!expired.explore_backed_off);
 }
+
+#[test]
+fn unbegun_plans_do_not_rotate_discovery() {
+    let nodes = [node("rotation a"), node("rotation b"), node("rotation c")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("rotation.example", IpVersion::V4);
+    let state = manager.score_state();
+    let refs: Vec<_> = nodes.iter().collect();
+    let now = Instant::now();
+    // Rotation state is only visible once each member has begun real work.
+    for leaf in &nodes {
+        train_at(
+            &manager,
+            leaf,
+            &target,
+            1,
+            Duration::from_millis(10),
+            1,
+            now,
+        );
+    }
+    let at = now + Duration::from_secs(2);
+    let rotation = |index: usize| {
+        score_snapshot(&state.inner.lock(), "score", &target, nodes[index].id, at).selected_at
+    };
+    let before: Vec<_> = (0..nodes.len()).map(rotation).collect();
+    let (index, dropped) = state.rank_plan_at("score", &target, &refs, at);
+    drop(dropped);
+    assert_eq!(
+        rotation(index),
+        before[index],
+        "an unbegun plan is not an opportunity"
+    );
+    let (index, attempt) = state.rank_plan_at("score", &target, &refs, at);
+    attempt
+        .begin_at(at)
+        .unwrap()
+        .start_at(at)
+        .finish_at(ScoreOutcome::Success, true, at);
+    assert!(
+        rotation(index) > before[index],
+        "an admitted begin advances rotation"
+    );
+}
