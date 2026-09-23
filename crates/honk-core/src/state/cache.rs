@@ -5,6 +5,11 @@
 //! behind a write batch. Point writes (selectors, Clash state) are coalesced
 //! in `pending` and read from there until the writer has committed them.
 //! Write failures are logged and never fatal.
+//!
+//! Each batch checks the page budget (`StateDb::cache_budget_pages`) inside its
+//! transaction: above it, DNS rows are pruned to `DNS_BUDGET_ROWS`, and if that
+//! is not enough the batch is rolled back, so cache writes can never take the
+//! room a strict write needs.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
@@ -15,6 +20,9 @@ use rusqlite::{Connection, params};
 use super::{Class, StateDb, StateError};
 
 const CHANNEL_CAPACITY: usize = 256;
+/// Rows kept after each DNS batch, earliest expiry evicted first.
+pub(crate) const MAX_DNS_ROWS: i64 = 4096;
+const DNS_BUDGET_ROWS: i64 = 2048;
 const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Debug, thiserror::Error)]
@@ -44,15 +52,38 @@ struct PendingWrite {
     value: String,
 }
 
+/// `(key, expire_at_unix, entry)`.
+pub(crate) type DnsRow = (String, u64, Vec<u8>);
+
+/// What became of a DNS batch that did not fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DnsWrite {
+    Written,
+    /// Dropped because the db is over its cache page budget.
+    Skipped,
+}
+
+/// A failed DNS batch hands its rows back to the caller.
+pub(crate) type DnsWriteError = (CacheDbError, Vec<DnsRow>);
+
+/// Deletions for one maintenance tick, in one transaction.
+#[derive(Debug, Default)]
+pub(crate) struct Maintenance {
+    pub(crate) groups: Vec<String>,
+    pub(crate) nodes: Vec<String>,
+    /// Delay samples measured before this are deleted.
+    pub(crate) delay_cutoff: u64,
+    /// DNS rows expiring at or before this are deleted.
+    pub(crate) dns_expired_at: Option<u64>,
+}
+
 enum Write {
     Set(Key, String),
     Barrier(mpsc::Sender<Result<(), CacheDbError>>),
     Delays(Vec<(String, u64, u64)>),
     DeleteDelaysBefore(u64),
-    Dns(
-        Vec<(String, u64, Vec<u8>)>,
-        mpsc::Sender<Result<(), CacheDbError>>,
-    ),
+    Dns(Vec<DnsRow>, mpsc::Sender<Result<DnsWrite, DnsWriteError>>),
+    Maintain(Maintenance, mpsc::Sender<Result<(), CacheDbError>>),
     FlushDns(mpsc::Sender<Result<(), CacheDbError>>),
     #[cfg(any(feature = "native-api", test))]
     DeleteDns(Vec<String>, mpsc::Sender<Result<(), CacheDbError>>),
@@ -98,72 +129,160 @@ fn flush_pending_writes(
     Ok(())
 }
 
-fn write_points(
-    connection: &mut Connection,
-    latest: &mut HashMap<Key, String>,
-) -> rusqlite::Result<()> {
-    if latest.is_empty() {
-        return Ok(());
+/// Whether the batch in `transaction` leaves the db within the page budget,
+/// pruning DNS rows first; the caller rolls back a batch that does not fit.
+fn fits(transaction: &Connection, budget_pages: i64) -> rusqlite::Result<bool> {
+    if super::used_pages(transaction)? <= budget_pages {
+        return Ok(true);
     }
-    let transaction = connection.transaction()?;
-    {
-        let mut selector = transaction.prepare(
-            "INSERT OR REPLACE INTO selector (grp, network, member) VALUES (?1, ?2, ?3)",
-        )?;
-        let mut clash = transaction
-            .prepare("INSERT OR REPLACE INTO clash_state (key, value) VALUES (?1, ?2)")?;
-        for (key, value) in latest.iter() {
-            match key {
-                Key::Selector(group, network) => {
-                    selector.execute(params![group, network, value])?;
-                }
-                Key::Clash(key) => {
-                    clash.execute(params![key, value])?;
+    transaction.execute(
+        "DELETE FROM dns_answer WHERE key IN (SELECT key FROM dns_answer ORDER BY expire_at
+           LIMIT max(0, (SELECT count(*) FROM dns_answer) - ?1))",
+        [DNS_BUDGET_ROWS],
+    )?;
+    Ok(super::used_pages(transaction)? <= budget_pages)
+}
+
+struct Writer {
+    connection: Connection,
+    latest: HashMap<Key, String>,
+    budget_pages: i64,
+    /// Batches skipped for the page budget; the first one is logged.
+    skipped: u64,
+}
+
+impl Writer {
+    fn skip(&mut self) {
+        self.skipped = self.skipped.saturating_add(1);
+        if self.skipped == 1 {
+            tracing::warn!("state db is over its cache page budget; skipping cache writes");
+        }
+    }
+
+    fn write_points(&mut self) -> rusqlite::Result<()> {
+        if self.latest.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.connection.transaction()?;
+        {
+            let mut selector = transaction.prepare(
+                "INSERT OR REPLACE INTO selector (grp, network, member) VALUES (?1, ?2, ?3)",
+            )?;
+            let mut clash = transaction
+                .prepare("INSERT OR REPLACE INTO clash_state (key, value) VALUES (?1, ?2)")?;
+            for (key, value) in &self.latest {
+                match key {
+                    Key::Selector(group, network) => {
+                        selector.execute(params![group, network, value])?;
+                    }
+                    Key::Clash(key) => {
+                        clash.execute(params![key, value])?;
+                    }
                 }
             }
         }
+        if fits(&transaction, self.budget_pages)? {
+            transaction.commit()?;
+        } else {
+            drop(transaction);
+            self.skip();
+        }
+        self.latest.clear();
+        Ok(())
     }
-    transaction.commit()?;
-    latest.clear();
-    Ok(())
+
+    fn write_delays(&mut self, samples: &[(String, u64, u64)]) -> rusqlite::Result<()> {
+        let transaction = self.connection.transaction()?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT OR REPLACE INTO delay_sample (node, delay_ms, measured_at)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for (node, delay_ms, measured_at) in samples {
+                statement.execute(params![node, unix(*delay_ms), unix(*measured_at)])?;
+            }
+        }
+        if !fits(&transaction, self.budget_pages)? {
+            drop(transaction);
+            self.skip();
+            return Ok(());
+        }
+        transaction.commit()
+    }
+
+    /// Writes the batch, then evicts the earliest expiry down to `MAX_DNS_ROWS`.
+    fn write_dns(&mut self, entries: &[DnsRow]) -> rusqlite::Result<DnsWrite> {
+        let transaction = self.connection.transaction()?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT OR REPLACE INTO dns_answer (key, expire_at, entry) VALUES (?1, ?2, ?3)",
+            )?;
+            for (key, expire_at, entry) in entries {
+                statement.execute(params![key, unix(*expire_at), entry])?;
+            }
+        }
+        transaction.execute(
+            "DELETE FROM dns_answer WHERE key IN (SELECT key FROM dns_answer ORDER BY expire_at
+               LIMIT max(0, (SELECT count(*) FROM dns_answer) - ?1))",
+            [MAX_DNS_ROWS],
+        )?;
+        if !fits(&transaction, self.budget_pages)? {
+            drop(transaction);
+            self.skip();
+            return Ok(DnsWrite::Skipped);
+        }
+        transaction.commit()?;
+        Ok(DnsWrite::Written)
+    }
+
+    fn maintain(&mut self, work: &Maintenance) -> rusqlite::Result<()> {
+        let transaction = self.connection.transaction()?;
+        {
+            let mut selector = transaction.prepare("DELETE FROM selector WHERE grp = ?1")?;
+            for group in &work.groups {
+                selector.execute([group])?;
+            }
+            let mut delay = transaction.prepare("DELETE FROM delay_sample WHERE node = ?1")?;
+            for node in &work.nodes {
+                delay.execute([node])?;
+            }
+        }
+        transaction.execute(
+            "DELETE FROM delay_sample WHERE measured_at < ?1 OR delay_ms <= 0 OR measured_at <= 0",
+            [unix(work.delay_cutoff)],
+        )?;
+        if let Some(expired_at) = work.dns_expired_at {
+            transaction.execute(
+                "DELETE FROM dns_answer WHERE expire_at <= ?1",
+                [unix(expired_at)],
+            )?;
+        }
+        transaction.commit()?;
+        super::incremental_vacuum(&self.connection)
+    }
 }
 
-fn run_writer(mut connection: Connection, receiver: mpsc::Receiver<Write>) {
-    let mut latest = HashMap::<Key, String>::new();
+fn run_writer(mut writer: Writer, receiver: mpsc::Receiver<Write>) {
     while let Ok(write) = receiver.recv() {
         match write {
             Write::Set(key, value) => {
-                latest.insert(key, value);
-                if latest.len() >= 64
-                    && let Err(error) = write_points(&mut connection, &mut latest)
+                writer.latest.insert(key, value);
+                if writer.latest.len() >= 64
+                    && let Err(error) = writer.write_points()
                 {
                     tracing::warn!(error = %CacheDbError::from(error), "state cache point-write batch failed");
                 }
             }
             Write::Barrier(ack) => {
-                let result = write_points(&mut connection, &mut latest).map_err(CacheDbError::from);
-                let _ = ack.send(result);
+                let _ = ack.send(writer.write_points().map_err(CacheDbError::from));
             }
             Write::Delays(samples) => {
-                let result = (|| -> rusqlite::Result<()> {
-                    let transaction = connection.transaction()?;
-                    {
-                        let mut statement = transaction.prepare(
-                            "INSERT OR REPLACE INTO delay_sample (node, delay_ms, measured_at)
-                             VALUES (?1, ?2, ?3)",
-                        )?;
-                        for (node, delay_ms, measured_at) in &samples {
-                            statement.execute(params![node, unix(*delay_ms), unix(*measured_at)])?;
-                        }
-                    }
-                    transaction.commit()
-                })();
-                if let Err(error) = result {
+                if let Err(error) = writer.write_delays(&samples) {
                     tracing::warn!(error = %CacheDbError::from(error), "state cache delay batch failed");
                 }
             }
             Write::DeleteDelaysBefore(cutoff) => {
-                if let Err(error) = connection.execute(
+                if let Err(error) = writer.connection.execute(
                     "DELETE FROM delay_sample WHERE measured_at < ?1 OR delay_ms <= 0 OR measured_at <= 0",
                     [unix(cutoff)],
                 ) {
@@ -171,23 +290,17 @@ fn run_writer(mut connection: Connection, receiver: mpsc::Receiver<Write>) {
                 }
             }
             Write::Dns(entries, ack) => {
-                let result = (|| -> rusqlite::Result<()> {
-                    let transaction = connection.transaction()?;
-                    {
-                        let mut statement = transaction.prepare(
-                            "INSERT OR REPLACE INTO dns_answer (key, expire_at, entry) VALUES (?1, ?2, ?3)",
-                        )?;
-                        for (key, expire_at, entry) in &entries {
-                            statement.execute(params![key, unix(*expire_at), entry])?;
-                        }
-                    }
-                    transaction.commit()
-                })()
-                .map_err(CacheDbError::from);
+                let result = writer
+                    .write_dns(&entries)
+                    .map_err(|error| (CacheDbError::from(error), entries));
                 let _ = ack.send(result);
             }
+            Write::Maintain(work, ack) => {
+                let _ = ack.send(writer.maintain(&work).map_err(CacheDbError::from));
+            }
             Write::FlushDns(ack) => {
-                let result = connection
+                let result = writer
+                    .connection
                     .execute("DELETE FROM dns_answer", [])
                     .map(|_| ())
                     .map_err(CacheDbError::from);
@@ -196,7 +309,7 @@ fn run_writer(mut connection: Connection, receiver: mpsc::Receiver<Write>) {
             #[cfg(any(feature = "native-api", test))]
             Write::DeleteDns(keys, ack) => {
                 let result = (|| -> rusqlite::Result<()> {
-                    let transaction = connection.transaction()?;
+                    let transaction = writer.connection.transaction()?;
                     {
                         let mut statement =
                             transaction.prepare("DELETE FROM dns_answer WHERE key = ?1")?;
@@ -211,7 +324,8 @@ fn run_writer(mut connection: Connection, receiver: mpsc::Receiver<Write>) {
             }
             #[cfg(test)]
             Write::SetQueryOnly(enabled, ack) => {
-                let result = connection
+                let result = writer
+                    .connection
                     .pragma_update(None, "query_only", enabled)
                     .map_err(CacheDbError::from);
                 let _ = ack.send(result);
@@ -223,7 +337,7 @@ fn run_writer(mut connection: Connection, receiver: mpsc::Receiver<Write>) {
             }
         }
     }
-    if let Err(error) = write_points(&mut connection, &mut latest) {
+    if let Err(error) = writer.write_points() {
         tracing::warn!(error = %CacheDbError::from(error), "state cache final point-write flush failed");
     }
 }
@@ -313,12 +427,17 @@ impl CacheDb {
     /// Opens the reader and writer connections and starts the writer thread.
     pub fn open(state: Arc<StateDb>) -> Result<Self, StateError> {
         let reader = state.connect(Class::Cache)?;
-        let connection = state.connect(Class::Cache)?;
+        let thread = Writer {
+            connection: state.connect(Class::Cache)?,
+            latest: HashMap::new(),
+            budget_pages: state.cache_budget_pages(),
+            skipped: 0,
+        };
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (writer, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
         std::thread::Builder::new()
             .name("honk-cache-db-writer".into())
-            .spawn(move || run_writer(connection, receiver))
+            .spawn(move || run_writer(thread, receiver))
             .map_err(|_| StateError::Unavailable)?;
         let flush_pending = Arc::downgrade(&pending);
         let flush_writer = writer.clone();
@@ -504,28 +623,74 @@ impl CacheDb {
         })
     }
 
-    /// Writes `(key, expire_at_unix, entry)` DNS rows in one transaction.
-    pub(crate) fn write_dns(
-        &self,
-        entries: Vec<(String, u64, Vec<u8>)>,
-    ) -> Result<(), CacheDbError> {
+    /// Writes DNS rows in one transaction; on failure the rows come back.
+    pub(crate) fn write_dns(&self, entries: Vec<DnsRow>) -> Result<DnsWrite, DnsWriteError> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(DnsWrite::Written);
         }
         #[cfg(test)]
         self.write_attempted
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.request(|ack| Write::Dns(entries, ack))
+        let (ack, result) = mpsc::channel();
+        if let Err(mpsc::SendError(write)) = self.writer.send(Write::Dns(entries, ack)) {
+            let Write::Dns(entries, _) = write else {
+                unreachable!("the rejected write is the one sent")
+            };
+            return Err((CacheDbError::Closed, entries));
+        }
+        result
+            .recv()
+            .unwrap_or_else(|_| Err((CacheDbError::Closed, Vec::new())))
+    }
+
+    /// Calls `visit(key, entry)` for every DNS row, one row at a time.
+    pub(crate) fn for_each_dns(
+        &self,
+        mut visit: impl FnMut(&str, &[u8]),
+    ) -> Result<(), CacheDbError> {
+        let conn = self.conn.lock().map_err(|_| CacheDbError::Closed)?;
+        let mut statement = conn.prepare("SELECT key, entry FROM dns_answer")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let key = row.get_ref(0)?.as_str().map_err(rusqlite::Error::from)?;
+            visit(
+                key,
+                row.get_ref(1)?.as_blob().map_err(rusqlite::Error::from)?,
+            );
+        }
+        Ok(())
     }
 
     /// Every DNS row as `(key, entry)`.
+    #[cfg(test)]
     pub(crate) fn load_dns(&self) -> Result<Vec<(String, Vec<u8>)>, CacheDbError> {
-        let conn = self.conn.lock().map_err(|_| CacheDbError::Closed)?;
-        let mut statement = conn.prepare("SELECT key, entry FROM dns_answer")?;
-        let rows = statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
+        let mut rows = Vec::new();
+        self.for_each_dns(|key, entry| rows.push((key.to_owned(), entry.to_vec())))?;
         Ok(rows)
+    }
+
+    /// Groups with a stored Selector choice.
+    pub(crate) fn selector_groups(&self) -> Result<Vec<String>, CacheDbError> {
+        self.keys("SELECT DISTINCT grp FROM selector")
+    }
+
+    /// Nodes with a stored delay sample.
+    pub(crate) fn delay_nodes(&self) -> Result<Vec<String>, CacheDbError> {
+        self.keys("SELECT node FROM delay_sample")
+    }
+
+    fn keys(&self, sql: &str) -> Result<Vec<String>, CacheDbError> {
+        let conn = self.conn.lock().map_err(|_| CacheDbError::Closed)?;
+        let mut statement = conn.prepare(sql)?;
+        let keys = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(keys)
+    }
+
+    pub(crate) fn maintain(&self, work: Maintenance) -> Result<(), CacheDbError> {
+        self.flush_pending()?;
+        self.request(|ack| Write::Maintain(work, ack))
     }
 
     pub(crate) fn flush_dns(&self) -> Result<(), CacheDbError> {

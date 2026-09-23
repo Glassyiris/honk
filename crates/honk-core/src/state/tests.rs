@@ -398,3 +398,68 @@ fn cache_connections_sync_fully_without_wal() {
     assert_eq!(synchronous(Class::Cache, false), "FULL");
     assert_eq!(synchronous(Class::Strict, true), "FULL");
 }
+
+#[test]
+fn tables_of_disabled_owners_are_cleared_and_strict_tables_kept() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = StateDb::open(directory.path()).unwrap();
+    let count = |table: &str| -> i64 {
+        state
+            .strict()
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
+    let seed = || {
+        state
+            .strict()
+            .execute_batch(
+                "INSERT OR REPLACE INTO selector VALUES ('g', 'tcp', '\"m\"');
+                 INSERT OR REPLACE INTO delay_sample VALUES ('n', 5, 1);
+                 INSERT OR REPLACE INTO dns_answer VALUES ('k', 1, x'00');
+                 INSERT OR REPLACE INTO clash_state VALUES ('mode', 'Rule');
+                 INSERT OR REPLACE INTO legacy_import VALUES ('source', 1);",
+            )
+            .unwrap();
+    };
+    let tables = [
+        "selector",
+        "delay_sample",
+        "dns_answer",
+        "clash_state",
+        "legacy_import",
+    ];
+
+    seed();
+    let owners = ActiveOwners {
+        cache: true,
+        dns: false,
+        clash: true,
+    };
+    clear_inactive(&state, owners).unwrap();
+    assert_eq!(tables.map(count), [1, 1, 0, 1, 1]);
+
+    seed();
+    clear_inactive(
+        &state,
+        ActiveOwners {
+            clash: false,
+            ..owners
+        },
+    )
+    .unwrap();
+    assert_eq!(tables.map(count), [1, 1, 0, 0, 1]);
+
+    seed();
+    clear_inactive(
+        &state,
+        ActiveOwners {
+            cache: false,
+            dns: true,
+            clash: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(tables.map(count), [0, 0, 0, 0, 1]);
+}

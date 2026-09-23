@@ -126,6 +126,14 @@ Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒
 
 状态数据库损坏且未设置 `--store db` 与 `native_api.password_auth` 时，honk 在取得实例锁后把 `honk.db` 与 `honk.db-wal` 改名为 `honk.db.corrupt` 与 `honk.db.corrupt-wal`，再创建新文件。如果 `honk.db.corrupt` 已经存在，honk 保留两份文件，在其中一份被删除前不做持久化。同样条件下，状态数据库不可用、不安全（不是 honk 用户所有的私有文件）或被 `honk-core admin reset` 锁定时，honk 也记录警告并在不做持久化的情况下运行。来自更新版本 honk 或其他程序的数据库在任何模式下都拒绝启动，因为移走它会毁掉只有该程序才能读取的数据。
 
+### 容量限制
+
+维护任务每 60 秒执行一次。Selector 选择只为配置中的 Selector 组保留，延迟样本只为已配置的节点保留；组或节点连续两次维护时都不在配置中，对应的行才会删除，因此 reload 短暂移除后又恢复的组或节点仍保留原记录。每次维护都会删除超过 24 小时的延迟样本和已过期的 DNS 行，并把至多 1 MiB 的空闲页归还给文件系统。DNS 行最多保留 4,096 条，每批写入后先淘汰最早过期的行。
+
+启动过程打开状态数据库时（`--store db`、`password_auth`、`store_subscribe` 或 `cache_file.enabled` 需要它），`enabled: false` 会清空 Selector、延迟、Clash 状态与 DNS 表；`store_dns: false` 清空 DNS 表；启用 native API 或未启用 Clash API 时清空 Clash 状态表。不打开状态数据库的启动不改动该文件。
+
+状态数据库文件上限为 112 MiB。缓存写入为配置 revision 与订阅正文保留其中 24 MiB：某批写入会使已用空间超过 88 MiB 时，写入线程先把 DNS 行删减到 2,048 条，仍然超出时回滚该批写入；被跳过的 DNS 条目计入 `budget_skipped`，不计为已写入。旧 `cache.db` 的导入受同一预算约束：会超出预算的复制不提交，下次启动时重试。
+
 ### DNS 持久化
 
 `store_dns: true` 时，每条应答是 `dns_answer` 表中的一行，内容为 `HDNS` version 2 编码，以精确缓存 key 的摘要为主键。只有未过期，并且 key 摘要、规范 query wire、response wire 标识与当前 DNS policy 全部匹配的行才会恢复。精确 key 同时包含入口 profile、request scope 与 operation，因此不会在不同 DNS 上下文之间复用。编码后超过 4 KiB 的条目不写入，计入 `oversize`。

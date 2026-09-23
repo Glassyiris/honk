@@ -329,7 +329,7 @@ impl ControlPlane {
             connection_tracker: Arc::new(ConnectionTracker::new()),
             tcp_flow_pins: Arc::new(TcpFlowPins::default()),
             cache_db: None,
-            delay_writer: cache::DelayWriter::default(),
+            state_tick: cache::StateTick::default(),
             outbound_id_map,
             resource_budget,
             concurrency_limit: Arc::new(tokio::sync::Semaphore::new(

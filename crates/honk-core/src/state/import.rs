@@ -99,6 +99,8 @@ enum ImportError {
     NotCacheDb,
     #[error("the opened file changed")]
     Replaced,
+    #[error("the copy would pass the state db's cache page budget")]
+    OverBudget,
     #[error("SQLite result code {0}")]
     Sqlite(i32),
 }
@@ -270,6 +272,10 @@ fn copy_cache_db(
         if let Some(key) = key.strip_prefix(&prefix) {
             import_row(&transaction, key, &value, now, scope)?;
         }
+    }
+    // The copy is cache data: it must leave the strict headroom intact.
+    if super::used_pages(&transaction)? > state.cache_budget_pages() {
+        return Err(ImportError::OverBudget);
     }
     transaction.execute(
         "INSERT INTO legacy_import (source, done_at) VALUES (?1, ?2)",

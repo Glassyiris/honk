@@ -192,3 +192,143 @@ fn an_idle_cache_does_not_wake_the_flusher() {
     std::thread::sleep(std::time::Duration::from_millis(350));
     assert_eq!(wakeups(), 1, "one write, one wakeup");
 }
+
+#[test]
+fn dns_rows_are_capped_by_evicting_the_earliest_expiry() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = CacheDb::in_dir(directory.path());
+    let rows: Vec<DnsRow> = (0..5000u64)
+        .map(|index| (format!("k{index}"), 10_000 + index, vec![0]))
+        .collect();
+    for batch in rows.chunks(1000) {
+        db.write_dns(batch.to_vec()).unwrap();
+    }
+    let (count, earliest): (i64, i64) = db
+        .conn
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT count(*), min(expire_at) FROM dns_answer",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (count, earliest),
+        (MAX_DNS_ROWS, 10_000 + 5000 - MAX_DNS_ROWS)
+    );
+}
+
+#[cfg(feature = "native-api")]
+#[test]
+fn cache_writes_stop_at_the_budget_so_a_large_revision_still_commits() {
+    use crate::native_api::store::db::DbStore;
+    use honk_config::parser::{SourceLimits, parse_dae_sources};
+
+    let directory = tempfile::tempdir().unwrap();
+    // 32 MiB ceiling: an 8 MiB budget for cache writes and 24 MiB for strict ones.
+    let state = Arc::new(StateDb::open_for_test(directory.path(), 8192));
+    let db = CacheDb::open(Arc::clone(&state)).unwrap();
+    // Rows with a 64-hex key and an entry near 4 KiB spill to an overflow
+    // page: 4096 of them take about 18 MiB.
+    for batch in 0..8u64 {
+        let rows = (0..512u64)
+            .map(|index| {
+                (
+                    format!("{batch:032x}{index:032x}"),
+                    10_000 + index,
+                    vec![7; 4050],
+                )
+            })
+            .collect();
+        db.write_dns(rows).unwrap();
+    }
+
+    let entry = directory.path().join("etc/config.dae");
+    let store = DbStore::open(Arc::clone(&state), &entry).unwrap();
+    let initial = parse_dae_sources(
+        &[(entry.clone(), Arc::from("global {}\n"))],
+        SourceLimits::default(),
+        &mut Vec::new(),
+    )
+    .unwrap()
+    .sources;
+    let none = crate::native_api::config::ListenerSecrets::new(&[], "");
+    store
+        .initialize(&initial, &none, &Default::default(), "startup")
+        .unwrap();
+    // Just under 16 MiB of stored JSON once every quote is escaped.
+    let content = format!("global {{}}\n# {}\n", "\"".repeat(8_380_000));
+    let candidate = parse_dae_sources(
+        &[(entry.clone(), Arc::from(content.as_str()))],
+        SourceLimits::default(),
+        &mut Vec::new(),
+    )
+    .unwrap()
+    .sources;
+    let pin = store.pin(&entry).unwrap();
+    let pending = store
+        .commit(pin, &content, &candidate, "control", Box::new(|| Ok(())))
+        .unwrap();
+    assert_eq!(store.promote(pending), Ok(2));
+    let rows: i64 = db
+        .conn
+        .lock()
+        .unwrap()
+        .query_row("SELECT count(*) FROM dns_answer", [], |row| row.get(0))
+        .unwrap();
+    assert!(rows < MAX_DNS_ROWS, "the budget prunes DNS rows: {rows}");
+}
+
+#[test]
+fn a_tick_returns_a_bounded_number_of_free_pages() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = CacheDb::in_dir(directory.path());
+    let rows: Vec<DnsRow> = (0..1000u64)
+        .map(|index| (format!("{index:064}"), u64::MAX / 2, vec![7; 3000]))
+        .collect();
+    db.write_dns(rows).unwrap();
+    db.flush_dns().unwrap();
+    let free = |db: &CacheDb| -> i64 {
+        db.conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .unwrap()
+    };
+    let before = free(&db);
+    assert!(before > 2 * super::super::VACUUM_PAGES);
+    db.maintain(Maintenance::default()).unwrap();
+    assert_eq!(free(&db), before - super::super::VACUUM_PAGES);
+}
+
+#[test]
+fn a_batch_that_would_cross_the_budget_is_rolled_back() {
+    let directory = tempfile::tempdir().unwrap();
+    // A 256-page (1 MiB) budget for cache writes.
+    let state = Arc::new(StateDb::open_for_test(
+        directory.path(),
+        super::super::STRICT_HEADROOM_PAGES + 256,
+    ));
+    let db = CacheDb::open(Arc::clone(&state)).unwrap();
+    let used = |db: &CacheDb| super::super::used_pages(&db.conn.lock().unwrap()).unwrap();
+    let row = |index: u64| (format!("{index:064}"), 10_000 + index, vec![7; 3000]);
+    let mut next = 0;
+    while used(&db) < 240 {
+        assert_eq!(db.write_dns(vec![row(next)]).unwrap(), DnsWrite::Written);
+        next += 1;
+    }
+
+    let delays = (0..2000)
+        .map(|index| (format!("{index:0200}"), 10, 1_000))
+        .collect();
+    db.save_delay_samples(delays);
+    // Any request queued behind the batch waits for it.
+    db.delete_dns_entries(&[]).unwrap();
+    assert!(db.delay_nodes().unwrap().is_empty());
+    assert!(used(&db) <= 256, "{} pages", used(&db));
+
+    let batch = (next..next + 64).map(row).collect();
+    assert_eq!(db.write_dns(batch).unwrap(), DnsWrite::Skipped);
+    assert!(used(&db) <= 256, "{} pages", used(&db));
+}

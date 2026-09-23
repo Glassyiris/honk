@@ -123,6 +123,14 @@ With `enabled`, honk keeps per-network Selector choices and each node's last rea
 
 If the state db is corrupt and neither `--store db` nor `native_api.password_auth` is set, honk moves `honk.db` and `honk.db-wal` aside as `honk.db.corrupt` and `honk.db.corrupt-wal` once it holds the instance lock, and starts a new file. If `honk.db.corrupt` already exists, it keeps both files and runs without persistence until one is removed. In the same case a state db that is unavailable, unsafe (not a private file owned by the honk user) or locked by `honk-core admin reset` also leaves honk running without persistence, with a warning. A db from a newer honk or another program refuses startup in every mode, because moving it aside would destroy data only that program can read.
 
+### Limits
+
+A maintenance tick runs every 60 seconds. A Selector choice is kept only for a Selector group in the configuration, and a delay sample only for a configured node; a row whose group or node is missing at two consecutive ticks is deleted, so a reload that briefly drops one keeps its row. Delay samples older than 24 hours and expired DNS rows are deleted at each tick, and each tick returns up to 1 MiB of freed pages to the filesystem. At most 4,096 DNS rows are kept; after each batch the earliest expiry is evicted first.
+
+When a start opens the state db (because `--store db`, `password_auth`, `store_subscribe` or `cache_file.enabled` needs it), `enabled: false` empties the Selector, delay, Clash-state and DNS tables, `store_dns: false` empties the DNS table, and an enabled native API or a disabled Clash API empties the Clash-state table. A start that opens no state db leaves the file as it is.
+
+The state db file is capped at 112 MiB. Cache writes keep 24 MiB of it free for configuration revisions and subscription bodies: when a batch would leave more than 88 MiB in use, the writer first deletes DNS rows down to 2,048, and rolls the batch back if that is not enough; skipped DNS entries are counted as `budget_skipped`, not as written. The legacy `cache.db` import obeys the same budget: a copy that would pass it is not committed, and the next start tries again.
+
 ### DNS persistence
 
 With `store_dns: true`, each answer is one `dns_answer` row holding an `HDNS` version-2 payload, keyed by the digest of its exact cache key. A row is restored only while unexpired and only when its key digest, canonical query wire, response wire identity and active DNS policy match. The exact key also preserves the ingress profile, request scope and operation, preventing reuse across different DNS contexts. An entry that encodes to more than 4 KiB is not persisted and is counted as `oversize`.

@@ -302,3 +302,56 @@ async fn an_encoded_entry_above_the_row_limit_is_dropped_and_its_batch_is_writte
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].0, codec::key_suffix(&small));
 }
+
+#[tokio::test]
+async fn a_response_above_the_row_limit_never_enters_the_queue() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let persister = DnsCachePersister::spawn(test_db(&dir));
+    persister.shutdown().await.expect("shutdown");
+    let (key, _, _) = fixture(IngressProfile::Internal, None, upstream("large"));
+    persister.save(
+        key,
+        vec![0; worker::MAX_ENTRY_BYTES + 1].into(),
+        unix_now() + 300,
+    );
+    let counters = persister.counters();
+    assert_eq!((counters.oversize, counters.dropped_closed), (1, 0));
+}
+
+#[tokio::test]
+async fn a_batch_over_the_page_budget_is_counted_as_skipped_not_written() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // A budget of 64 pages, filled one entry at a time until one is refused.
+    let state = Arc::new(crate::state::StateDb::open_for_test(dir.path(), 6144 + 64));
+    let db = Arc::new(CacheDb::open(state).expect("cache"));
+    let persister = DnsCachePersister::spawn(Arc::clone(&db));
+    let response = vec![0; 3900];
+    for index in 0..200 {
+        let (key, _, _) = fixture(
+            IngressProfile::Internal,
+            None,
+            upstream(&format!("u{index}")),
+        );
+        persister.save(key, response.clone().into(), unix_now() + 300);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let counters = persister.counters();
+            if counters.written + counters.budget_skipped > index {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "entry {index} was not handled"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        if persister.counters().budget_skipped > 0 {
+            break;
+        }
+    }
+    persister.shutdown().await.expect("shutdown");
+    let counters = persister.counters();
+    assert_eq!(counters.budget_skipped, 1);
+    assert!(counters.written > 0);
+    assert_eq!(db.load_dns().expect("rows").len() as u64, counters.written);
+}

@@ -272,3 +272,37 @@ fn a_bare_legacy_name_is_looked_up_in_the_current_directory() {
         located.path.display()
     );
 }
+
+#[test]
+fn an_import_over_the_cache_budget_is_not_committed() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("cache.db");
+    let legacy = Connection::open(&path).unwrap();
+    legacy
+        .execute_batch("CREATE TABLE kv (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);")
+        .unwrap();
+    let sample = serde_json::json!({"delay_ms": 5, "measured_at": now()}).to_string();
+    let mut scope = ImportScope::default();
+    for index in 0..400 {
+        let node = format!("{index:0>1000}");
+        legacy
+            .execute(
+                "INSERT INTO kv VALUES (?1, ?2)",
+                [format!("delay:{node}"), sample.clone()],
+            )
+            .unwrap();
+        scope.nodes.insert(node);
+    }
+    drop(legacy);
+    // A budget of 32 pages: the 400 samples need far more.
+    let state = StateDb::open_for_test(directory.path(), 6144 + 32);
+    let cache = LegacyCache {
+        path: path.clone(),
+        cache_id: String::new(),
+    };
+    import_cache_db(&state, &cache, &scope);
+    assert!(all_rows(&state).is_empty());
+    assert!(path.exists(), "the file stays for a later start");
+    let used = super::super::used_pages(&state.strict()).unwrap();
+    assert!(used <= state.cache_budget_pages(), "{used} pages in use");
+}

@@ -25,7 +25,13 @@ pub(crate) const APPLICATION_ID: i64 = 0x686f_6e6b;
 pub(crate) const SCHEMA_VERSION: i64 = 1;
 const PAGE_SIZE: i64 = 4096;
 /// 112 MiB of 4 KiB pages.
-pub(crate) const MAX_PAGE_COUNT: i64 = 28672;
+const MAX_PAGE_COUNT: i64 = 28672;
+/// 24 MiB that cache writes leave free: a 16 MiB revision inserted before
+/// pruning plus an 8 MiB replaced subscription body.
+const STRICT_HEADROOM_PAGES: i64 = 6144;
+/// Free pages one `incremental_vacuum` returns to the filesystem (1 MiB), so a
+/// tick after a large deletion does not rewrite the whole free list at once.
+pub(crate) const VACUUM_PAGES: i64 = 256;
 const CACHE_KIB: i64 = 256;
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
 
@@ -92,12 +98,17 @@ pub struct StateDb {
     /// inode with `identity`.
     path: PathBuf,
     identity: (u64, u64),
+    max_page_count: i64,
     strict: Mutex<Connection>,
 }
 
 impl StateDb {
     /// Opens or creates `<data_dir>/state/honk.db` and checks its integrity.
     pub fn open(data_dir: &Path) -> Result<Self, StateError> {
+        Self::open_with_ceiling(data_dir, MAX_PAGE_COUNT)
+    }
+
+    fn open_with_ceiling(data_dir: &Path, max_page_count: i64) -> Result<Self, StateError> {
         let directory = state_directory(data_dir, true)?;
         let directory = Flock::lock(directory, FlockArg::LockSharedNonblock).map_err(
             |(_, error)| match error {
@@ -130,11 +141,12 @@ impl StateDb {
             check(&connection)?;
         }
         create_schema(&mut connection)?;
-        configure(&connection, Class::Strict)?;
+        configure(&connection, Class::Strict, max_page_count)?;
         Ok(Self {
             _lock: directory,
             path,
             identity,
+            max_page_count,
             strict: Mutex::new(connection),
         })
     }
@@ -143,14 +155,78 @@ impl StateDb {
     pub(crate) fn connect(&self, class: Class) -> Result<Connection, StateError> {
         let connection =
             open_checked(&self.path, self.identity, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-        configure(&connection, class)?;
+        configure(&connection, class, self.max_page_count)?;
         Ok(connection)
+    }
+
+    /// Pages cache writes may fill before they prune or skip, so that a strict
+    /// write always finds `STRICT_HEADROOM_PAGES` below the ceiling.
+    pub(crate) fn cache_budget_pages(&self) -> i64 {
+        self.max_page_count - STRICT_HEADROOM_PAGES
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_for_test(data_dir: &Path, max_page_count: i64) -> Self {
+        Self::open_with_ceiling(data_dir, max_page_count).expect("state db")
     }
 
     /// The strict connection, `synchronous = FULL`.
     pub(crate) fn strict(&self) -> MutexGuard<'_, Connection> {
         self.strict.lock()
     }
+}
+
+/// Which owners of the cache tables are configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveOwners {
+    /// `cache_file.enabled`: selectors, delays and Clash state.
+    pub cache: bool,
+    /// `cache_file.store_dns`.
+    pub dns: bool,
+    /// Native API off and the Clash API on: Clash mode and GLOBAL.
+    pub clash: bool,
+}
+
+/// Empties the cache tables whose owner is off, so a disabled owner leaves no
+/// rows behind. Strict tables are never touched. Call with the instance lock held.
+pub fn clear_inactive(state: &StateDb, owners: ActiveOwners) -> Result<(), StateError> {
+    let mut tables = Vec::new();
+    if !owners.cache {
+        tables.extend(["selector", "delay_sample"]);
+    }
+    if !owners.cache || !owners.dns {
+        tables.push("dns_answer");
+    }
+    if !owners.cache || !owners.clash {
+        tables.push("clash_state");
+    }
+    let mut connection = state.strict();
+    let transaction = connection.transaction().map_err(sql)?;
+    for table in tables {
+        transaction
+            .execute(&format!("DELETE FROM {table}"), [])
+            .map_err(sql)?;
+    }
+    transaction.commit().map_err(sql)
+}
+
+/// Returns up to `VACUUM_PAGES` free pages to the filesystem. The pragma
+/// frees pages as it is stepped, so it is stepped to the end.
+pub(crate) fn incremental_vacuum(connection: &Connection) -> rusqlite::Result<()> {
+    let mut statement =
+        connection.prepare(&format!("PRAGMA incremental_vacuum({VACUUM_PAGES})"))?;
+    let mut rows = statement.query([])?;
+    while rows.next()?.is_some() {}
+    Ok(())
+}
+
+/// Pages in use: the file's pages minus its free list.
+pub(crate) fn used_pages(connection: &Connection) -> rusqlite::Result<i64> {
+    connection.query_row(
+        "SELECT (SELECT page_count FROM pragma_page_count()) - (SELECT freelist_count FROM pragma_freelist_count())",
+        [],
+        |row| row.get(0),
+    )
 }
 
 /// Called with the instance lock held, after `open` found a non-strict db
@@ -405,7 +481,7 @@ fn create_schema(connection: &mut Connection) -> Result<(), StateError> {
 }
 
 /// Per-connection pragmas, set on every open.
-fn configure(connection: &Connection, class: Class) -> Result<(), StateError> {
+fn configure(connection: &Connection, class: Class, max_page_count: i64) -> Result<(), StateError> {
     let mode: String = connection
         .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
         .map_err(sql)?;
@@ -421,7 +497,7 @@ fn configure(connection: &Connection, class: Class) -> Result<(), StateError> {
     for statement in [
         "PRAGMA wal_autocheckpoint = 256".to_owned(),
         "PRAGMA journal_size_limit = 1048576".to_owned(),
-        format!("PRAGMA max_page_count = {MAX_PAGE_COUNT}"),
+        format!("PRAGMA max_page_count = {max_page_count}"),
     ] {
         run_pragma(connection, &statement)?;
     }

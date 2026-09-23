@@ -1,17 +1,23 @@
-use super::*;
+use std::collections::HashSet;
 
+use super::*;
+use crate::state::cache::{CacheDb, Maintenance};
+
+const DELAY_SAMPLE_MAX_AGE_SECS: u64 = 24 * 3600;
+
+/// The state db maintenance tick, every 60 s while the cache is open.
 #[derive(Default)]
-pub(super) struct DelayWriter {
+pub(super) struct StateTick {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl DelayWriter {
+impl StateTick {
     pub(super) async fn stop_and_join(&mut self) -> anyhow::Result<()> {
         super::lifecycle::abort_and_join(&mut self.task).await
     }
 }
 
-impl Drop for DelayWriter {
+impl Drop for StateTick {
     fn drop(&mut self) {
         if let Some(task) = &self.task {
             task.abort();
@@ -93,15 +99,11 @@ impl ControlPlane {
         // Delay-history persistence (sing-box URLTest history storage
         // parity): restore the last real delay sample per node so URLTest
         // groups don't start cold after a restart, then mirror fresh
-        // samples back every minute. Liveness is NOT restored — probes
-        // re-decide that; stale entries (>24h) are dropped on load.
+        // samples back every minute from the maintenance tick. Liveness is
+        // NOT restored — probes re-decide that; stale entries (>24h) are
+        // dropped on load.
         {
-            const DELAY_SAMPLE_MAX_AGE_SECS: u64 = 24 * 3600;
-            let now_unix = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let samples = db.load_delay_samples(now_unix, DELAY_SAMPLE_MAX_AGE_SECS);
+            let samples = db.load_delay_samples(unix_now(), DELAY_SAMPLE_MAX_AGE_SECS);
             // Delay samples are keyed by node name; resolve them onto this
             // generation's NodeIds — samples for nodes no longer configured
             // are dropped.
@@ -128,21 +130,27 @@ impl ControlPlane {
             if restored > 0 {
                 info!("state db: restored {} persisted delay sample(s)", restored);
             }
-            let db_delay = db.clone();
-            let alive_for_delay = self.alive_set.clone();
-            let config_for_delay = self.config.clone();
-            let delay_task = tokio::spawn(async move {
+            let db_tick = db.clone();
+            let alive_for_tick = self.alive_set.clone();
+            let config_for_tick = self.config.clone();
+            let store_dns = cache_cfg.store_dns;
+            let tick_task = tokio::spawn(async move {
+                let mut missing = Missing::default();
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-                interval.tick().await; // first snapshot after one period
+                interval.tick().await; // first tick after one period
                 loop {
-                    let names: std::collections::HashMap<uuid::Uuid, String> = config_for_delay
-                        .read()
-                        .await
-                        .nodes
-                        .iter()
-                        .map(|n| (n.id, n.name.clone()))
-                        .collect();
-                    let samples = alive_for_delay
+                    let (live, names) = {
+                        let config = config_for_tick.read().await;
+                        (
+                            Live::of(&config),
+                            config
+                                .nodes
+                                .iter()
+                                .map(|n| (n.id, n.name.clone()))
+                                .collect::<std::collections::HashMap<uuid::Uuid, String>>(),
+                        )
+                    };
+                    let samples = alive_for_tick
                         .latency_snapshot()
                         .into_iter()
                         .filter_map(|(node_id, latency, at)| {
@@ -157,11 +165,17 @@ impl ControlPlane {
                             ))
                         })
                         .collect();
-                    db_delay.save_delay_samples(samples);
+                    let db = db_tick.clone();
+                    missing = tokio::task::spawn_blocking(move || {
+                        maintenance_tick(&db, &live, samples, &mut missing, store_dns, unix_now());
+                        missing
+                    })
+                    .await
+                    .unwrap_or_default();
                     interval.tick().await;
                 }
             });
-            self.delay_writer.task = Some(delay_task);
+            self.state_tick.task = Some(tick_task);
         }
 
         // store_dns: restore persisted DNS answers into the shared DNS
@@ -182,6 +196,14 @@ impl ControlPlane {
             }
             dns_cache.lock().await.set_persister(Some(persister));
         }
+        // Startup prune, after restore: only the age and expiry rules.
+        if let Err(error) = db.maintain(Maintenance {
+            delay_cutoff: unix_now().saturating_sub(DELAY_SAMPLE_MAX_AGE_SECS),
+            dns_expired_at: cache_cfg.store_dns.then(unix_now),
+            ..Maintenance::default()
+        }) {
+            warn!(%error, "state db startup prune failed");
+        }
 
         self.cache_db = Some(db);
     }
@@ -192,11 +214,149 @@ impl ControlPlane {
     }
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Names the config holds when a tick starts.
+pub(super) struct Live {
+    selector_groups: HashSet<String>,
+    nodes: HashSet<String>,
+}
+
+impl Live {
+    fn of(config: &Config) -> Self {
+        Self {
+            selector_groups: config
+                .groups
+                .iter()
+                .filter(|group| group.policy == GroupPolicy::Selector)
+                .map(|group| group.name.clone())
+                .collect(),
+            nodes: config.nodes.iter().map(|node| node.name.clone()).collect(),
+        }
+    }
+}
+
+/// Keys that were missing from the config at the previous tick, one per row.
+#[derive(Default)]
+pub(super) struct Missing {
+    groups: HashSet<String>,
+    nodes: HashSet<String>,
+}
+
+/// One maintenance tick: writes `samples`, deletes Selector and delay rows
+/// whose group or node was missing at this tick and at the previous one, delay
+/// rows older than 24 h and, with `store_dns`, expired DNS rows, then runs
+/// `incremental_vacuum`. The two-tick rule keeps rows across a config that
+/// briefly drops and restores a group or node.
+pub(super) fn maintenance_tick(
+    db: &CacheDb,
+    live: &Live,
+    samples: Vec<(String, u64, u64)>,
+    missing: &mut Missing,
+    store_dns: bool,
+    now: u64,
+) {
+    db.save_delay_samples(samples);
+    let stale = |rows: Result<Vec<String>, _>,
+                 present: &HashSet<String>,
+                 previous: &mut HashSet<String>| {
+        let current: HashSet<String> = match rows {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|key| !present.contains(key))
+                .collect(),
+            Err(error) => {
+                warn!(%error, "state db maintenance read failed");
+                HashSet::new()
+            }
+        };
+        let expired = current.intersection(previous).cloned().collect();
+        *previous = current;
+        expired
+    };
+    let work = Maintenance {
+        groups: stale(
+            db.selector_groups(),
+            &live.selector_groups,
+            &mut missing.groups,
+        ),
+        nodes: stale(db.delay_nodes(), &live.nodes, &mut missing.nodes),
+        delay_cutoff: now.saturating_sub(DELAY_SAMPLE_MAX_AGE_SECS),
+        dns_expired_at: store_dns.then_some(now),
+    };
+    if let Err(error) = db.maintain(work) {
+        warn!(%error, "state db maintenance failed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::control::tests::support::{canonical_socks5, control_plane};
     use honk_outbound::alive::{IpVersion, ProbeDomain};
+
+    #[test]
+    fn a_dropped_group_and_node_keep_their_rows_for_one_tick() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = CacheDb::in_dir(directory.path());
+        let now = 1_700_000_000;
+        let member = honk_outbound::group::SelectorMember::Group("m".into());
+        for group in ["kept", "dropped"] {
+            db.save_network_selector(group, honk_outbound::group::SelectionNetwork::Tcp, &member);
+        }
+        db.save_delay_samples(vec![
+            ("kept-node".into(), 5, now),
+            ("dropped-node".into(), 5, now),
+        ]);
+        db.write_dns(vec![
+            ("expired".into(), now - 1, vec![0]),
+            ("fresh".into(), now + 60, vec![0]),
+        ])
+        .unwrap();
+        db.maintain(Maintenance::default()).unwrap();
+        let live = Live {
+            selector_groups: HashSet::from(["kept".to_owned()]),
+            nodes: HashSet::from(["kept-node".to_owned()]),
+        };
+        let rows = |db: &CacheDb| {
+            let mut groups = db.selector_groups().unwrap();
+            let mut nodes = db.delay_nodes().unwrap();
+            groups.sort();
+            nodes.sort();
+            let dns: Vec<String> = db
+                .load_dns()
+                .unwrap()
+                .into_iter()
+                .map(|row| row.0)
+                .collect();
+            (groups, nodes, dns)
+        };
+        let mut missing = Missing::default();
+
+        maintenance_tick(&db, &live, Vec::new(), &mut missing, true, now);
+        assert_eq!(
+            rows(&db),
+            (
+                vec!["dropped".to_owned(), "kept".to_owned()],
+                vec!["dropped-node".to_owned(), "kept-node".to_owned()],
+                vec!["fresh".to_owned()],
+            )
+        );
+        maintenance_tick(&db, &live, Vec::new(), &mut missing, true, now);
+        assert_eq!(
+            rows(&db),
+            (
+                vec!["kept".to_owned()],
+                vec!["kept-node".to_owned()],
+                vec!["fresh".to_owned()],
+            )
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn startup_failure_and_drop_stop_delay_persistence() -> anyhow::Result<()> {

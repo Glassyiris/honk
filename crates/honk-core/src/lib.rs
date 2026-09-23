@@ -1092,6 +1092,19 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     if state_reset {
         state_db = reset_non_strict(honk_config::paths::data_dir());
     }
+    if let Some(state) = state_db.as_ref() {
+        let experimental = &config.experimental;
+        let owners = state::ActiveOwners {
+            cache: experimental.cache_file.enabled,
+            dns: experimental.cache_file.store_dns,
+            clash: cfg!(feature = "clash-api")
+                && !(cfg!(feature = "native-api") && experimental.native_api.enabled)
+                && !experimental.clash_api.external_controller.is_empty(),
+        };
+        if let Err(error) = state::clear_inactive(state, owners) {
+            warn!(%error, "state database: clearing tables of disabled owners failed");
+        }
+    }
 
     // The old instance owns queue 320 until this lock is released. Check
     // NFQUEUE only after the handoff so a transient busy result cannot turn

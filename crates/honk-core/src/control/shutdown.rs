@@ -27,7 +27,7 @@ impl ControlPlane {
 
     /// Stop the retained DNS/persistence owners and clean up backend state.
     pub(super) async fn finalize_shutdown(&mut self) -> anyhow::Result<()> {
-        let delay_writer = self.delay_writer.stop_and_join().await;
+        let state_tick = self.state_tick.stop_and_join().await;
         info!("shutdown: stopping DNS controller");
         self.dns_controller.shutdown(SHUTDOWN_STAGE_TIMEOUT).await;
         let dns_cache = self.dns_controller.cache().await;
@@ -48,7 +48,7 @@ impl ControlPlane {
         }
         info!("shutdown: cleaning up eBPF backend");
         let backend = self.ebpf.write().await.cleanup().await;
-        delay_writer?;
+        state_tick?;
         backend?;
         info!("Control plane stopped");
         Ok(())
