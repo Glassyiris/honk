@@ -27,6 +27,8 @@ pub mod pool;
 pub mod relay;
 pub mod routing;
 pub mod sniffing;
+#[cfg_attr(not(feature = "native-api"), allow(dead_code))]
+pub(crate) mod state;
 pub mod stats;
 pub mod subscription;
 
@@ -242,11 +244,11 @@ pub struct Cli {
     pub mock_ebpf: bool,
 
     /// Where the administered configuration lives: the `-c` file tree, or the
-    /// revisions in `<data-dir>/native-api/config.db`
+    /// revisions in `<data-dir>/state/honk.db`
     #[arg(long, value_enum, default_value = "file")]
     pub store: ConfigStore,
 
-    /// Runtime data directory holding the configuration db; must equal `global.data_dir`
+    /// Runtime data directory holding the state db; must equal `global.data_dir`
     #[arg(long, value_name = "PATH", default_value = honk_config::paths::DEFAULT_DATA_DIR, global = true)]
     pub data_dir: PathBuf,
 }

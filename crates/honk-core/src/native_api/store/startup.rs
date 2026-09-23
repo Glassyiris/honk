@@ -13,6 +13,7 @@ use honk_config::parser::source_edit::strip_listener_secrets;
 use super::super::config::ListenerSecrets as MaskSet;
 use super::db::{DbStore, ListenerSecrets, StoreError};
 use crate::configuration::{SourceUpdate, limits};
+use crate::state::StateDb;
 
 pub(crate) struct DatabaseStartup {
     pub(crate) store: Arc<DbStore>,
@@ -56,7 +57,8 @@ impl DatabaseStartup {
         data_dir: &Path,
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> anyhow::Result<Self> {
-        let store = Arc::new(DbStore::open(data_dir, entry).map_err(store_error)?);
+        let state = StateDb::open(data_dir).map_err(|error| store_error(error.into()))?;
+        let store = Arc::new(DbStore::open(Arc::new(state), entry).map_err(store_error)?);
         if let Some((head, _)) = store.cached_head() {
             let loaded = store.load(&HashMap::new(), diagnostics)?;
             let config = crate::admit_operator_config(

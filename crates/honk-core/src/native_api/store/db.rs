@@ -1,4 +1,4 @@
-//! Configuration revisions in `<data_dir>/native-api/config.db`.
+//! Configuration revisions in the state database (`crate::state`).
 //!
 //! A write is activated first and recorded after: `commit` only fences `head`,
 //! and `promote` inserts the revision and moves `head` in one transaction, so a
@@ -6,8 +6,6 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::os::fd::AsRawFd as _;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,38 +16,20 @@ use honk_config::diagnostic::{DetailedDiagnostic, DiagnosticSources, SettingPath
 use honk_config::error::{DetailedConfigError, ErrorCategory};
 use honk_config::parser::source_edit::{inline_sources, restore_listener_secrets};
 use honk_config::parser::{LoadedConfig, SourceSnapshot};
-use nix::errno::Errno;
-use nix::fcntl::{OFlag, open, openat};
-use nix::sys::stat::{Mode, mkdirat};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use super::super::ApiError;
-use super::super::auth::{CREDENTIAL_DIR, DIR_FLAGS, effective_uid};
 use super::super::config::ListenerSecrets as MaskSet;
 use super::super::config_write::WriteError;
 use crate::configuration::{MAX_SOURCE_BYTES, MAX_SOURCES, digest, limits};
+use crate::state::{StateDb, StateError, log_sql};
 
-const DB_FILE: &str = "config.db";
-const APPLICATION_ID: i64 = 0x686f_6e6b;
-const SCHEMA_VERSION: i64 = 1;
 pub(crate) const MAX_REVISIONS: usize = 50;
-const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+/// Of stored JSON, which escaping can make larger than the source bytes.
+const MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NAME_BYTES: usize = 4096;
-
-const SCHEMA: &str = "
-CREATE TABLE revision (
-  number INTEGER PRIMARY KEY AUTOINCREMENT,
-  parent INTEGER REFERENCES revision(number) ON DELETE SET NULL,
-  created_at INTEGER NOT NULL, principal TEXT NOT NULL,
-  origin TEXT NOT NULL CHECK (origin IN ('import','write','activate')),
-  root TEXT NOT NULL,
-  sources TEXT NOT NULL,
-  content_sha256 TEXT NOT NULL, bytes INTEGER NOT NULL);
-CREATE TABLE head (id INTEGER PRIMARY KEY CHECK (id=1), active INTEGER NOT NULL REFERENCES revision(number));
-CREATE TABLE listener_secret (api TEXT PRIMARY KEY CHECK (api IN ('native_api','clash_api')), value TEXT NOT NULL);
-";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum StoreError {
@@ -65,6 +45,22 @@ pub(crate) enum StoreError {
     NotEmpty,
     #[error("configuration revision is invalid")]
     Invalid,
+    #[error("configuration revision exceeds 16 MiB of stored JSON")]
+    TooLarge,
+    #[error("state database is locked by `honk-core admin reset`")]
+    Locked,
+}
+
+impl From<StateError> for StoreError {
+    fn from(error: StateError) -> Self {
+        match error {
+            StateError::Unavailable => Self::Unavailable,
+            StateError::Unsafe => Self::Unsafe,
+            StateError::Corrupt => Self::Corrupt,
+            StateError::Unsupported => Self::Unsupported,
+            StateError::Locked => Self::Locked,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,9 +130,7 @@ struct Revision {
 }
 
 pub(crate) struct DbStore {
-    // Held so the checked directory stays the one SQLite resolved.
-    _directory: File,
-    connection: Mutex<Connection>,
+    state: Arc<StateDb>,
     entry: PathBuf,
     root: PathBuf,
     /// The `-c` entry this process started with; `import` reads it.
@@ -154,23 +148,26 @@ pub(crate) struct DbStore {
 impl DbStore {
     /// Opens or creates the db. `entry` names the main source when the db is still
     /// empty; otherwise the active revision's own entry wins.
-    pub(crate) fn open(data_dir: &Path, entry: &Path) -> Result<Self, StoreError> {
-        let (directory, mut connection) = connect(data_dir, true)?;
-        prepare(&mut connection)?;
+    pub(crate) fn open(state: Arc<StateDb>, entry: &Path) -> Result<Self, StoreError> {
         let import_entry = lexical(entry)?;
-        let root_entry = match active_revision(&connection)? {
-            Some((_, root, revision)) => root.join(&revision.sources[0].name),
-            None => import_entry.clone(),
+        let (root_entry, head, secrets) = {
+            let connection = state.strict();
+            let root_entry = match active_revision(&connection)? {
+                Some((_, root, revision)) => root.join(&revision.sources[0].name),
+                None => import_entry.clone(),
+            };
+            (
+                root_entry,
+                head_and_parent(&connection)?,
+                listener_secrets(&connection)?,
+            )
         };
         let root = root_entry
             .parent()
             .ok_or(StoreError::Invalid)?
             .to_path_buf();
-        let head = head_and_parent(&connection)?;
-        let secrets = listener_secrets(&connection)?;
         Ok(Self {
-            _directory: directory,
-            connection: Mutex::new(connection),
+            state,
             entry: root_entry,
             root,
             import_entry,
@@ -180,6 +177,11 @@ impl DbStore {
             #[cfg(test)]
             fail_promote: AtomicBool::new(false),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_in(data_dir: &Path, entry: &Path) -> Result<Self, StoreError> {
+        Self::open(Arc::new(StateDb::open(data_dir)?), entry)
     }
 
     /// The cached `(head, parent)`; never touches SQLite.
@@ -201,8 +203,8 @@ impl DbStore {
     }
 
     pub(crate) fn revision_exists(&self, number: i64) -> Result<bool, StoreError> {
-        self.connection
-            .lock()
+        self.state
+            .strict()
             .query_row("SELECT 1 FROM revision WHERE number = ?1", [number], |_| {
                 Ok(())
             })
@@ -216,7 +218,7 @@ impl DbStore {
     }
 
     pub(crate) fn head(&self) -> Result<Option<i64>, StoreError> {
-        head(&self.connection.lock())
+        head(&self.state.strict())
     }
 
     pub(crate) fn import_entry(&self) -> &Path {
@@ -225,7 +227,7 @@ impl DbStore {
 
     /// Newest first.
     pub(crate) fn revisions(&self) -> Result<Vec<RevisionInfo>, StoreError> {
-        let connection = self.connection.lock();
+        let connection = self.state.strict();
         let mut statement = connection
             .prepare(
                 "SELECT number, parent, created_at, principal, origin, content_sha256, bytes, sources
@@ -273,7 +275,7 @@ impl DbStore {
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> Result<Option<LoadedConfig>, StoreError> {
         let (revision, secrets) = {
-            let connection = self.connection.lock();
+            let connection = self.state.strict();
             let Some((root, revision)) = revision(&connection, number)? else {
                 return Ok(None);
             };
@@ -338,7 +340,7 @@ impl DbStore {
         principal: &str,
     ) -> Result<i64, StoreError> {
         let stored = self.stored(sources, &forbidden.clone().with_all(secrets))?;
-        let mut connection = self.connection.lock();
+        let mut connection = self.state.strict();
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql)?;
@@ -395,7 +397,7 @@ impl DbStore {
         overlay: &HashMap<PathBuf, Arc<str>>,
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> Result<LoadedConfig, DetailedConfigError> {
-        let revision = active_revision(&self.connection.lock())
+        let revision = active_revision(&self.state.strict())
             .ok()
             .flatten()
             .map(|(_, _, revision)| revision);
@@ -420,7 +422,7 @@ impl DbStore {
         if self.blocked() {
             return Err(WriteError::Unavailable);
         }
-        let connection = self.connection.lock();
+        let connection = self.state.strict();
         let (number, _, revision) = active_revision(&connection)
             .map_err(|_| WriteError::Unavailable)?
             .ok_or(WriteError::Unavailable)?;
@@ -440,7 +442,7 @@ impl DbStore {
         if self.blocked.load(Ordering::Acquire) {
             return Err(WriteError::Unavailable);
         }
-        match head(&self.connection.lock()) {
+        match head(&self.state.strict()) {
             Ok(Some(number)) if number == pin.number => Ok(()),
             Ok(_) => Err(WriteError::Conflict),
             Err(_) => Err(WriteError::Unavailable),
@@ -496,7 +498,7 @@ impl DbStore {
         if self.fail_promote.load(Ordering::Acquire) {
             return Err(WriteError::Unavailable);
         }
-        let mut connection = self.connection.lock();
+        let mut connection = self.state.strict();
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(write_sql)?;
@@ -536,6 +538,7 @@ impl DbStore {
         self.stored(candidate, &forbidden)
             .map_err(|error| match error {
                 StoreError::Invalid => WriteError::UnsafePath,
+                StoreError::TooLarge => WriteError::TooLarge,
                 _ => WriteError::Unavailable,
             })
     }
@@ -554,7 +557,7 @@ impl DbStore {
         {
             return Err(StoreError::Invalid);
         }
-        sources
+        let stored = sources
             .iter()
             .map(|source| {
                 if source.contains_api_secret
@@ -575,89 +578,18 @@ impl DbStore {
                     sha256: digest(source.content.as_bytes()),
                 })
             })
-            .collect()
-    }
-}
-
-/// Opens the checked directory and the SQLite file in it; `create` makes both
-/// when missing, otherwise the db is opened read-only and must exist.
-fn connect(data_dir: &Path, create: bool) -> Result<(File, Connection), StoreError> {
-    let parent =
-        File::from(open(data_dir, DIR_FLAGS, Mode::empty()).map_err(|_| StoreError::Unavailable)?);
-    if create {
-        match mkdirat(&parent, CREDENTIAL_DIR, Mode::S_IRWXU) {
-            Ok(()) | Err(Errno::EEXIST) => {}
-            Err(_) => return Err(StoreError::Unavailable),
+            .collect::<Result<Vec<_>, _>>()?;
+        if json_len(&stored) > MAX_RETAINED_BYTES {
+            return Err(StoreError::TooLarge);
         }
+        Ok(stored)
     }
-    let directory =
-        File::from(openat(&parent, CREDENTIAL_DIR, DIR_FLAGS, Mode::empty()).map_err(path_error)?);
-    private(&directory, true)?;
-    let access = if create {
-        OFlag::O_RDWR
-    } else {
-        OFlag::O_RDONLY
-    };
-    let existing = || {
-        openat(
-            &directory,
-            DB_FILE,
-            access | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        )
-        .map(File::from)
-        .map_err(path_error)
-    };
-    let file = if create {
-        match openat(
-            &directory,
-            DB_FILE,
-            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-            Mode::S_IRUSR | Mode::S_IWUSR,
-        ) {
-            Ok(fd) => File::from(fd),
-            Err(Errno::EEXIST) => existing()?,
-            Err(error) => return Err(path_error(error)),
-        }
-    } else {
-        existing()?
-    };
-    private(&file, false)?;
-    let identity = file.metadata().map_err(|_| StoreError::Unavailable)?;
-    // SQLite resolves `/proc/self/fd` itself, so NOFOLLOW would refuse it;
-    // the directory's own path is checked against the FD instead.
-    let resolved = std::fs::read_link(format!("/proc/self/fd/{}", directory.as_raw_fd()))
-        .map_err(|_| StoreError::Unavailable)?;
-    let path = resolved.join(DB_FILE);
-    let mode = if create {
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-    } else {
-        OpenFlags::SQLITE_OPEN_READ_ONLY
-    };
-    let connection = Connection::open_with_flags(
-        &path,
-        mode | OpenFlags::SQLITE_OPEN_NOFOLLOW | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(sql)?;
-    let opened = std::fs::symlink_metadata(&path).map_err(|_| StoreError::Unavailable)?;
-    if (opened.dev(), opened.ino()) != (identity.dev(), identity.ino()) {
-        return Err(StoreError::Unsafe);
-    }
-    Ok((directory, connection))
 }
 
 /// The active revision as one runnable document, read without writing the db
 /// whether or not a daemon holds it open.
 pub(crate) fn export(data_dir: &Path, with_secrets: bool) -> Result<String, StoreError> {
-    let (_directory, mut connection) = connect(data_dir, false)?;
-    connection
-        .busy_timeout(std::time::Duration::from_millis(2000))
-        .map_err(sql)?;
-    let application_id: i64 = pragma(&connection, "application_id")?;
-    let version: i64 = pragma(&connection, "user_version")?;
-    if (application_id, version) != (APPLICATION_ID, SCHEMA_VERSION) {
-        return Err(StoreError::Unsupported);
-    }
+    let (_directory, mut connection) = crate::state::open_read_only(data_dir)?;
     let (root, revision, secrets) = {
         let transaction = connection.transaction().map_err(sql)?;
         let (_, root, revision) = active_revision(&transaction)?.ok_or(StoreError::Invalid)?;
@@ -716,68 +648,6 @@ pub(crate) fn export_to(data_dir: &Path, out: &Path, with_secrets: bool) -> anyh
         File::open(parent)?.sync_all()?;
     }
     Ok(())
-}
-
-fn prepare(connection: &mut Connection) -> Result<(), StoreError> {
-    connection
-        .busy_timeout(std::time::Duration::from_millis(2000))
-        .map_err(sql)?;
-    let check: String = connection
-        .query_row("PRAGMA quick_check", [], |row| row.get(0))
-        .map_err(sql)?;
-    if check != "ok" {
-        return Err(StoreError::Corrupt);
-    }
-    let application_id: i64 = pragma(connection, "application_id")?;
-    let version: i64 = pragma(connection, "user_version")?;
-    let tables: i64 = connection
-        .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
-        .map_err(sql)?;
-    match (application_id, version, tables) {
-        (0, 0, 0) => {}
-        (APPLICATION_ID, SCHEMA_VERSION, _) => {}
-        (APPLICATION_ID, 0, _) => return Err(StoreError::Corrupt),
-        _ => return Err(StoreError::Unsupported),
-    }
-    for statement in [
-        "PRAGMA journal_mode = DELETE",
-        "PRAGMA synchronous = FULL",
-        "PRAGMA foreign_keys = ON",
-    ] {
-        connection
-            .query_row(statement, [], |_| Ok(()))
-            .optional()
-            .map_err(sql)?;
-    }
-    if version == 0 {
-        connection
-            .execute_batch("PRAGMA auto_vacuum = FULL")
-            .map_err(sql)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Exclusive)
-            .map_err(sql)?;
-        // A concurrent first start may have created the schema since the read above.
-        let current: i64 = pragma(&transaction, "user_version")?;
-        if current == SCHEMA_VERSION && pragma(&transaction, "application_id")? == APPLICATION_ID {
-            return Ok(());
-        }
-        if current != 0 {
-            return Err(StoreError::Unsupported);
-        }
-        transaction
-            .execute_batch(&format!(
-                "{SCHEMA}PRAGMA application_id = {APPLICATION_ID};PRAGMA user_version = {SCHEMA_VERSION};"
-            ))
-            .map_err(sql)?;
-        transaction.commit().map_err(sql)?;
-    }
-    Ok(())
-}
-
-fn pragma(connection: &Connection, name: &str) -> Result<i64, StoreError> {
-    connection
-        .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
-        .map_err(sql)
 }
 
 fn head_and_parent(connection: &Connection) -> Result<Option<(i64, Option<i64>)>, StoreError> {
@@ -904,10 +774,10 @@ fn insert(
     Ok(connection.last_insert_rowid())
 }
 
-/// Oldest first, until at most `MAX_REVISIONS` and `MAX_RETAINED_BYTES` remain.
+/// Oldest first, until at most `MAX_REVISIONS` and `MAX_RETAINED_BYTES` of stored JSON remain.
 fn prune(connection: &Connection, active: i64) -> rusqlite::Result<()> {
     let rows: Vec<(i64, i64)> = connection
-        .prepare("SELECT number, bytes FROM revision ORDER BY number DESC")?
+        .prepare("SELECT number, octet_length(sources) FROM revision ORDER BY number DESC")?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let (mut kept, mut total, mut full) = (0usize, 0usize, false);
@@ -922,6 +792,25 @@ fn prune(connection: &Connection, active: i64) -> rusqlite::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The length `insert` will store, without building the text.
+fn json_len(sources: &[StoredSource]) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    match serde_json::to_writer(&mut count, sources) {
+        Ok(()) => count.0,
+        Err(_) => usize::MAX,
+    }
 }
 
 fn valid_name(name: &Path) -> Result<(), StoreError> {
@@ -951,46 +840,8 @@ fn lexical(path: &Path) -> Result<PathBuf, StoreError> {
     Ok(path.components().collect())
 }
 
-fn private(file: &File, directory: bool) -> Result<(), StoreError> {
-    let metadata = file.metadata().map_err(|_| StoreError::Unavailable)?;
-    let kind = if directory {
-        metadata.is_dir()
-    } else {
-        metadata.is_file()
-    };
-    if !kind || metadata.uid() != effective_uid() || metadata.permissions().mode() & 0o077 != 0 {
-        return Err(StoreError::Unsafe);
-    }
-    Ok(())
-}
-
-fn path_error(error: Errno) -> StoreError {
-    match error {
-        Errno::ELOOP | Errno::ENOTDIR => StoreError::Unsafe,
-        _ => StoreError::Unavailable,
-    }
-}
-
-fn log_sql(error: &rusqlite::Error) {
-    let code = error.sqlite_error().map(|error| error.extended_code);
-    tracing::warn!(sqlite_code = ?code, "configuration database operation failed");
-}
-
 fn sql(error: rusqlite::Error) -> StoreError {
-    log_sql(&error);
-    match error.sqlite_error_code() {
-        Some(rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt) => {
-            StoreError::Corrupt
-        }
-        Some(rusqlite::ErrorCode::CannotOpen) if is_symlink_refusal(&error) => StoreError::Unsafe,
-        _ => StoreError::Unavailable,
-    }
-}
-
-fn is_symlink_refusal(error: &rusqlite::Error) -> bool {
-    error
-        .sqlite_error()
-        .is_some_and(|error| error.extended_code == rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK)
+    crate::state::sql(error).into()
 }
 
 fn write_sql(error: rusqlite::Error) -> WriteError {

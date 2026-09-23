@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 
+use crate::state::{DIR_FLAGS, effective_uid};
+
 #[cfg(test)]
 mod tests;
 
@@ -186,11 +188,6 @@ struct StoreState {
     /// Set after a write whose durability was not confirmed: no login, no second setup.
     blocked: bool,
 }
-
-pub(super) const DIR_FLAGS: OFlag = OFlag::O_RDONLY
-    .union(OFlag::O_DIRECTORY)
-    .union(OFlag::O_NOFOLLOW)
-    .union(OFlag::O_CLOEXEC);
 
 impl CredentialStore {
     /// Opens `<data_dir>/native-api`, creating it 0700 if absent, and reads the record if present.
@@ -406,11 +403,6 @@ impl Sessions {
     pub(crate) fn len(&self) -> usize {
         self.inner.lock().len()
     }
-}
-
-pub(super) fn effective_uid() -> u32 {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    unsafe { libc::geteuid() }
 }
 
 /// Login admission: per-peer and global attempt windows, one credential worker, and a global lock

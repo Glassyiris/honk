@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 
 use honk_config::parser::{SourceLimits, parse_dae_sources};
 
@@ -24,7 +25,10 @@ fn fixture() -> Fixture {
 }
 
 fn db_path(fixture: &Fixture) -> PathBuf {
-    fixture.data_dir.join(CREDENTIAL_DIR).join(DB_FILE)
+    fixture
+        .data_dir
+        .join(crate::state::STATE_DIR)
+        .join(crate::state::DB_FILE)
 }
 
 fn sources(entry: &Path, content: &str) -> Vec<SourceSnapshot> {
@@ -38,7 +42,7 @@ fn sources(entry: &Path, content: &str) -> Vec<SourceSnapshot> {
 }
 
 fn initialized(fixture: &Fixture) -> DbStore {
-    let store = DbStore::open(&fixture.data_dir, &fixture.entry).unwrap();
+    let store = DbStore::open_in(&fixture.data_dir, &fixture.entry).unwrap();
     let main = sources(&fixture.entry, MAIN);
     let secrets = ListenerSecrets {
         native_api: "native-token".into(),
@@ -60,20 +64,16 @@ fn write(store: &DbStore, content: &str) -> Pending {
 }
 
 #[test]
-fn created_directory_and_file_are_private() {
+fn an_open_db_keeps_the_entry_of_its_active_revision() {
     let fixture = fixture();
-    let store = DbStore::open(&fixture.data_dir, &fixture.entry).unwrap();
-    let directory = fs::metadata(fixture.data_dir.join(CREDENTIAL_DIR)).unwrap();
-    let file = fs::symlink_metadata(db_path(&fixture)).unwrap();
-    assert!(directory.is_dir() && file.is_file());
-    assert_eq!(directory.permissions().mode() & 0o777, 0o700);
-    assert_eq!(file.permissions().mode() & 0o777, 0o600);
+    let store = DbStore::open_in(&fixture.data_dir, &fixture.entry).unwrap();
+    assert!(db_path(&fixture).is_file());
     assert_eq!(store.head(), Ok(None));
     drop(store);
 
     let reopened = initialized(&fixture);
     drop(reopened);
-    let store = DbStore::open(&fixture.data_dir, Path::new("/elsewhere/other.dae")).unwrap();
+    let store = DbStore::open_in(&fixture.data_dir, Path::new("/elsewhere/other.dae")).unwrap();
     assert_eq!(store.entry(), fixture.entry);
     let loaded = store.load(&HashMap::new(), &mut Vec::new()).unwrap();
     assert_eq!(loaded.config.experimental.native_api.secret, "native-token");
@@ -81,72 +81,9 @@ fn created_directory_and_file_are_private() {
 }
 
 #[test]
-fn symlinked_database_is_refused() {
-    let fixture = fixture();
-    let directory = fixture.data_dir.join(CREDENTIAL_DIR);
-    fs::create_dir(&directory).unwrap();
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
-    let target = fixture.data_dir.join("target.db");
-    fs::write(&target, b"").unwrap();
-    fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
-    std::os::unix::fs::symlink(&target, db_path(&fixture)).unwrap();
-    assert_eq!(
-        DbStore::open(&fixture.data_dir, &fixture.entry).err(),
-        Some(StoreError::Unsafe)
-    );
-    assert_eq!(fs::read(&target).unwrap(), b"");
-}
-
-#[test]
-fn group_readable_database_is_refused() {
-    let fixture = fixture();
-    drop(DbStore::open(&fixture.data_dir, &fixture.entry).unwrap());
-    fs::set_permissions(db_path(&fixture), fs::Permissions::from_mode(0o640)).unwrap();
-    assert_eq!(
-        DbStore::open(&fixture.data_dir, &fixture.entry).err(),
-        Some(StoreError::Unsafe)
-    );
-}
-
-#[test]
-fn corrupt_database_is_refused_and_kept() {
-    let fixture = fixture();
-    drop(DbStore::open(&fixture.data_dir, &fixture.entry).unwrap());
-    let garbage = vec![0x5a; 8192];
-    fs::write(db_path(&fixture), &garbage).unwrap();
-    assert_eq!(
-        DbStore::open(&fixture.data_dir, &fixture.entry).err(),
-        Some(StoreError::Corrupt)
-    );
-    assert_eq!(fs::read(db_path(&fixture)).unwrap(), garbage);
-}
-
-#[test]
-fn foreign_or_newer_databases_are_refused() {
-    for (application_id, version) in [(1, 0), (1, 1), (APPLICATION_ID, 2)] {
-        let fixture = fixture();
-        drop(DbStore::open(&fixture.data_dir, &fixture.entry).unwrap());
-        fs::remove_file(db_path(&fixture)).unwrap();
-        let connection = Connection::open(db_path(&fixture)).unwrap();
-        connection
-            .execute_batch(&format!(
-                "CREATE TABLE other (x); PRAGMA application_id = {application_id}; PRAGMA user_version = {version};"
-            ))
-            .unwrap();
-        drop(connection);
-        fs::set_permissions(db_path(&fixture), fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(
-            DbStore::open(&fixture.data_dir, &fixture.entry).err(),
-            Some(StoreError::Unsupported),
-            "{application_id} {version}"
-        );
-    }
-}
-
-#[test]
 fn source_labels_resolve_lexically_inside_the_root() {
     let fixture = fixture();
-    let store = DbStore::open(&fixture.data_dir, &fixture.entry).unwrap();
+    let store = DbStore::open_in(&fixture.data_dir, &fixture.entry).unwrap();
     let root = fixture.entry.parent().unwrap();
     assert_eq!(
         store.resolve("conf.d/a.dae").unwrap(),
@@ -223,7 +160,7 @@ fn retention_keeps_fifty_revisions_and_the_active_one() {
             .unwrap();
         assert_eq!(number, index + 2);
     }
-    let connection = store.connection.lock();
+    let connection = store.state.strict();
     let (count, oldest): (i64, i64) = connection
         .query_row("SELECT count(*), min(number) FROM revision", [], |row| {
             Ok((row.get(0)?, row.get(1)?))
@@ -290,4 +227,117 @@ fn head_cache_and_existence_follow_promote() {
     assert_eq!(store.cached_head(), Some((2, Some(1))));
     assert_eq!(store.revision_exists(1), Ok(true));
     assert_eq!(store.revision_exists(9), Ok(false));
+}
+
+#[test]
+fn retention_counts_the_stored_json() {
+    let fixture = fixture();
+    let store = initialized(&fixture);
+    // 4.5 MiB of source, 9 MiB once JSON escapes every quote.
+    let quoted = format!("global {{}}\n# {}\n", "\"".repeat(4608 * 1024));
+    assert_eq!(store.promote(write(&store, &quoted)), Ok(2));
+    let again = format!("{quoted}# again\n");
+    assert_eq!(store.promote(write(&store, &again)), Ok(3));
+    let numbers: Vec<i64> = store
+        .revisions()
+        .unwrap()
+        .into_iter()
+        .map(|revision| revision.number)
+        .collect();
+    assert_eq!(numbers, [3]);
+
+    // 3 MiB of control characters stores as 18 MiB of `\u0001` escapes.
+    let content = format!("global {{}}\n# {}\n", "\u{1}".repeat(3 * 1024 * 1024));
+    let pin = store.pin(store.entry()).unwrap();
+    let candidate = sources(store.entry(), &content);
+    assert_eq!(
+        store
+            .commit(pin, &content, &candidate, "control", Box::new(|| Ok(())))
+            .err(),
+        Some(WriteError::TooLarge)
+    );
+}
+
+#[test]
+fn export_reads_the_db_with_and_without_a_daemon_connection() {
+    let fixture = fixture();
+    let store = initialized(&fixture);
+    assert_eq!(store.promote(write(&store, MAIN)), Ok(2));
+    let open = export(&fixture.data_dir, false).unwrap();
+    drop(store);
+    assert_eq!(export(&fixture.data_dir, false).unwrap(), open);
+    assert!(open.contains("log_level: info"));
+}
+
+/// A copy of `fixture`'s db as a crash leaves it in the middle of a
+/// transaction under a rollback journal: pages written, journal hot.
+fn hot_journal_copy(fixture: &Fixture) -> tempfile::TempDir {
+    let path = db_path(fixture);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("PRAGMA journal_mode = DELETE")
+        .unwrap();
+    let writer = Connection::open(&path).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA cache_size = 10;
+             BEGIN IMMEDIATE;
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+             INSERT INTO legacy_import (source, done_at) SELECT 'row' || i, i FROM n;",
+        )
+        .unwrap();
+    let copy = tempfile::tempdir().unwrap();
+    let state = copy.path().join(crate::state::STATE_DIR);
+    fs::create_dir(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    for name in [crate::state::DB_FILE, "honk.db-journal"] {
+        let source = path.with_file_name(name);
+        fs::copy(&source, state.join(name)).unwrap();
+        fs::set_permissions(state.join(name), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    drop(writer);
+    assert!(fs::metadata(state.join("honk.db-journal")).unwrap().len() > 0);
+    copy
+}
+
+#[test]
+fn a_hot_rollback_journal_is_rolled_back_by_open_and_by_export() {
+    let fixture = fixture();
+    drop(initialized(&fixture));
+    let exported = hot_journal_copy(&fixture);
+    let text = export(exported.path(), false).unwrap();
+    assert!(text.contains("log_level: info"));
+
+    let opened = hot_journal_copy(&fixture);
+    let state = StateDb::open(opened.path()).unwrap();
+    let rows: i64 = state
+        .strict()
+        .query_row("SELECT count(*) FROM legacy_import", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "the interrupted transaction is rolled back");
+}
+
+#[test]
+fn export_closing_last_leaves_the_wal_in_place() {
+    let fixture = fixture();
+    let store = initialized(&fixture);
+    assert_eq!(store.promote(write(&store, MAIN)), Ok(2));
+    // A copy taken while the store is open is what a crashed daemon leaves.
+    let copy = tempfile::tempdir().unwrap();
+    let state = copy.path().join(crate::state::STATE_DIR);
+    fs::create_dir(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    for name in [crate::state::DB_FILE, "honk.db-wal"] {
+        fs::copy(db_path(&fixture).with_file_name(name), state.join(name)).unwrap();
+        fs::set_permissions(state.join(name), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    drop(store);
+    let wal = fs::read(state.join("honk.db-wal")).unwrap();
+    assert!(!wal.is_empty());
+    assert!(
+        export(copy.path(), false)
+            .unwrap()
+            .contains("log_level: info")
+    );
+    assert_eq!(fs::read(state.join("honk.db-wal")).unwrap(), wal);
 }

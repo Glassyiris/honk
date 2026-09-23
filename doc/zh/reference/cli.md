@@ -21,8 +21,8 @@ honk-core [OPTIONS] [COMMAND]
 | `--disable-timestamp` | 关 | 控制台日志行不再带时间戳。在 systemd 或其他自带时间戳的日志系统下使用；`--log-file` 或 `global.log_file` 指定的文件仍带时间戳。 |
 | `-d`, `--debug` | 关 | 当 `RUST_LOG` 未提供有效 filter 时，选择 `debug` 作为默认控制台 filter。 |
 | `--mock-ebpf` | 关 | 使用 `MockEbpfBackend`，不加载内核 eBPF。若配置请求 `global.nfqueue_enable: true`，honk 会记录 warning 并仅在本进程关闭 NFQUEUE 暂存。 |
-| `--store file\|db` | `file` | `db` 从 `<data-dir>/native-api/config.db` 中的 revision 加载配置，数据库为空时导入 `-c`。见[配置数据库](./api.md#配置数据库--store-db)。 |
-| `--data-dir PATH` | `/var/lib/honk` | 存放配置数据库的数据目录，必须与 `global.data_dir` 相同。供 `--store db` 与 `config export` 使用。 |
+| `--store file\|db` | `file` | `db` 从 `<data-dir>/state/honk.db` 中的 revision 加载配置，数据库为空时导入 `-c`。见[配置数据库](./api.md#配置数据库--store-db)。 |
+| `--data-dir PATH` | `/var/lib/honk` | 数据目录，状态数据库位于其下的 `state/honk.db`，必须与 `global.data_dir` 相同。供 `--store db` 与 `config export` 使用。 |
 
 两个二进制都提供 `-h`/`--help` 和 `-v`/`--version`。
 
@@ -50,7 +50,7 @@ CLI 与 Clash API 共用构建时版本号：发布构建使用 GitHub tag 名�
 | `reload` | 从已加锁的 `/run/honk-core.lock` 读取 PID 并发送 `SIGHUP`。 | 只报告信号成功送达；运行中进程随后记录 `applied` 或 `rejected`。mock 实例不持有该锁。 |
 | `mode <rule\|global\|direct>` | 加载 `--config`，将参数字符串赋给 `experimental.clash_api.default_mode`，并在重写结构化格式文件前完成校验。`.dae` 文件会被拒绝且保持不变，因为 writer 无法保留 dae 语法、注释或 include；请直接编辑这些源文件，或使用 `.toml`、`.yaml`、`.json`。 | 仅修改文件；不联系运行中的引擎，也不更改 dial mode。接受的字符串不同于正常 dial mode 值 `ip`、`domain`、`domain+`、`domain++`。 |
 | `proxy <group> <node>` | 检查组名和节点名各自存在，然后打印请求的选择；不检查节点是否属于该组。 | 不写入任何内容，也不联系运行中的引擎。 |
-| `config export --out PATH [--without-secrets]` | 把配置数据库的当前 revision 写成一份 `.dae` 文件；未给 `--without-secrets` 时补回监听凭据。无论 daemon 是否运行，都以只读方式打开数据库，文件写完后才发布。 | 以 0600 权限新建 `PATH`，拒绝已存在的文件。 |
+| `config export --out PATH [--without-secrets]` | 把配置数据库的当前 revision 写成一份 `.dae` 文件；未给 `--without-secrets` 时补回监听凭据。无论 daemon 是否运行，都通过以读写方式打开的 query-only 连接读取数据库。关闭该连接不会执行检查点，也不会删除 `honk.db-wal`；除 SQLite 可能创建的 `-shm` 索引外，唯一可能的写入是回滚崩溃遗留的日志。文件写完后才发布。 | 以 0600 权限新建 `PATH`，拒绝已存在的文件。 |
 | `delay <node> [-u\|--url HOST:PORT]` | 建立一次原始 TCP 连接，超时五秒，并打印耗时毫秒数。未给 `--url` 时使用节点服务端地址。 | 不经过代理，不是 HTTP URLTest，也不联系运行中的引擎。 |
 
 [编译路由发布计数器](../design/routing.md#同步槽与原子发布)耗尽后需重启；它与普通 SIGHUP 及 DNS runtime 重载分开计数。

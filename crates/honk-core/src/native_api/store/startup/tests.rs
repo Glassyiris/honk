@@ -58,7 +58,7 @@ fn data_dir_mismatch_refuses_startup() {
         .err()
         .expect("mismatched data_dir must refuse startup");
     assert!(error.to_string().contains("--data-dir"), "{error}");
-    let store = DbStore::open(&data_dir, &entry).unwrap();
+    let store = DbStore::open_in(&data_dir, &entry).unwrap();
     assert_eq!(store.head(), Ok(None));
 }
 
@@ -86,7 +86,7 @@ fn head_moved_before_the_instance_lock_refuses_startup() {
         .record()
         .unwrap();
     let mut waiting = DatabaseStartup::open(&entry, &data_dir, &mut Vec::new()).unwrap();
-    let running = DbStore::open(&data_dir, &entry).unwrap();
+    let running = DbStore::open_in(&data_dir, &entry).unwrap();
     let pin = running.pin(running.entry()).unwrap();
     let mut candidate = waiting.sources.sources.clone();
     let content = format!("{}# edited\n", candidate[0].content);
@@ -116,7 +116,7 @@ fn clash_controller_refuses_the_import() {
         error.to_string().contains("without the Clash API"),
         "{error}"
     );
-    let store = DbStore::open(&data_dir, &entry).unwrap();
+    let store = DbStore::open_in(&data_dir, &entry).unwrap();
     assert_eq!(store.head(), Ok(None));
 }
 
@@ -132,7 +132,7 @@ fn clash_controller_in_the_head_refuses_startup() {
     };
     let mut candidate = startup.sources.sources.clone();
     drop(startup);
-    let store = DbStore::open(&data_dir, &entry).unwrap();
+    let store = DbStore::open_in(&data_dir, &entry).unwrap();
     let auth = candidate
         .iter_mut()
         .find(|source| source.path.ends_with("auth.dae"))

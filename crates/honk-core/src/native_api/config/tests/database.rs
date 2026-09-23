@@ -4,7 +4,7 @@ use super::*;
 
 /// `(number, parent, principal, origin)` of every revision, oldest first.
 fn revisions(fixture: &Fixture) -> Vec<(i64, Option<i64>, String, String)> {
-    let path = fixture.path("state/native-api/config.db");
+    let path = fixture.path("state/state/honk.db");
     let connection =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
