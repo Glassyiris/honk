@@ -46,8 +46,8 @@ const MIN_TRAINED_EVIDENCE: f64 = 0.5;
 const SCORE_SWITCH_FULL_EVIDENCE: f64 = 8.0;
 const SCORE_SWITCH_FLAP_WINDOW: u64 = 8;
 const SELECTION_HISTORY_CAPACITY: usize = 4096;
-const SCORE_EXPLORATION_MIN_PERIOD: u64 = 16;
-const SCORE_EXPLORATION_MAX_PERIOD: u64 = 64;
+/// Original business starts that earn one optional start.
+const SCORE_EXPLORATION_PERIOD: u64 = 16;
 const SCORE_EXPLORE_BACKOFF_BASE: Duration = Duration::from_secs(5 * 60);
 const SCORE_EXPLORE_BACKOFF_MAX: Duration = Duration::from_secs(6 * 3600);
 /// Consecutive fresh failures that drop a leaf out of the reliability band

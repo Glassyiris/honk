@@ -307,7 +307,8 @@ fn funded_large_group_focuses_promising_contender_until_graduation() {
         let budget = manager.score_budget_counters("score", SelectionNetwork::Tcp);
         assert!(
             budget.trial_starts + budget.reserved
-                <= exploration_target(32) as u64 + budget.business_starts / exploration_period(32)
+                <= exploration_target(32) as u64
+                    + budget.business_starts / SCORE_EXPLORATION_PERIOD
         );
     }
     let step = graduate
@@ -809,7 +810,7 @@ fn partial_success_cannot_pin_a_cancelled_validation_run_forever() {
     let mut run = 0;
     let mut max_run = 0;
     let mut other_trials = 0;
-    for _ in 0..exploration_period(3) * 12 {
+    for _ in 0..SCORE_EXPLORATION_PERIOD * 12 {
         let before = state.selection_reason_counts("score", SelectionNetwork::Tcp);
         let (index, feedback) =
             state.rank_plan_at("score", &target, &nodes.iter().collect::<Vec<_>>(), at);

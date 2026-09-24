@@ -317,7 +317,9 @@ fn sparse_arrivals_obey_spent_plus_reserved_bound_without_clock_currency() {
             node_id: nodes[0].id,
         }];
         let before = counts(&manager, "score");
-        assert!(before.spent + before.reserved <= 8 + before.business_starts / 64);
+        assert!(
+            before.spent + before.reserved <= 8 + before.business_starts / SCORE_EXPLORATION_PERIOD
+        );
         assert!(budget::begin(
             &mut state.inner.lock(),
             &manager.score_authority,
@@ -334,12 +336,14 @@ fn sparse_arrivals_obey_spent_plus_reserved_bound_without_clock_currency() {
             now,
         );
         let after = counts(&manager, "score");
-        assert!(after.spent + after.reserved <= 8 + after.business_starts / 64);
+        assert!(
+            after.spent + after.reserved <= 8 + after.business_starts / SCORE_EXPLORATION_PERIOD
+        );
     }
     let c = counts(&manager, "score");
     assert_eq!(c.business_starts, 128);
     assert_eq!(
-        c.spent, 9,
+        c.spent, 15,
         "arrival 128 cannot borrow its own newly earned credit"
     );
     assert_eq!(c.earned_available, 1);

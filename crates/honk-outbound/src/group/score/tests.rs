@@ -1,4 +1,4 @@
-use super::budget::{exploration_period, exploration_target};
+use super::budget::exploration_target;
 use super::ranking::score_snapshot;
 use super::*;
 use honk_config::group::{Group, GroupPolicy};

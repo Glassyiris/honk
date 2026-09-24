@@ -266,7 +266,7 @@ B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
 
 | 字段 | 含义 |
 | --- | --- |
-| `businessStarts`、`scopes`、`earningPeriod` | 保留作用域原始开始数之和、作用域数，以及各自固定赚取周期的最大值（不能作为合并作用域预算公式的分母）。每个作用域在创建时固定 `q = clamp(2n,16,64)` 和冷启动额度 `B`；`spent + reserved <= B + floor(businessStarts/q)` 按作用域成立。 |
+| `businessStarts`、`scopes`、`earningPeriod` | 保留作用域原始开始数之和、作用域数，以及各自固定赚取周期的最大值（不能作为合并作用域预算公式的分母）。每个作用域使用 `q = 16`，并在创建时固定冷启动额度 `B`；`spent + reserved <= B + floor(businessStarts/q)` 按作用域成立。 |
 | `sources.cold`、`sources.periodic`、`sources.recovery` | 按来源区分的已开始工作：冷额度试用、已赚额度试用、不增加可选额度的延续尝试。`recovery` 包含 TCP 替代、DNS 改路／UDP 转 TCP 和 UI 重定向，不限于出错后的重试；它既不是可选试用，也不是新原始业务。普通非试用没有来源桶。 |
 | `trialStarts`、`spent`、`reserved` | 已开始可选试用、累计已支出 token，以及尚未开始的 token 预留。开始只支出一次，开始后取消不退款。 |
 | `coldAllowance`、`coldAvailable`、`earnedAvailable` | 固定初始额度与当前可用额度的合计。每作用域最多保留八个未花费已赚 token。时间、读取、目标变动与证据过期不赚额度，保留作用域在 reload／成员变化后不重置。 |

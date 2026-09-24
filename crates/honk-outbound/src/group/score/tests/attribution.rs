@@ -56,7 +56,7 @@ fn cold_exploration_is_deterministic_and_cancelled_loser_is_neutral() {
     assert_ne!(next.entries[0].node.id, first.entries[0].node.id);
     finish_success(&next);
     let mut tried_other = false;
-    for _ in 0..=exploration_period(nodes.len()) {
+    for _ in 0..=SCORE_EXPLORATION_PERIOD {
         let plan = manager.selection_plan_for_target("score", &context);
         if plan.entries[0].node.id == nodes[1].id {
             tried_other = true;

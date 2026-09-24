@@ -154,7 +154,7 @@ fn ordinary_switch_counts_commits_but_not_first_choice_stay_peek_or_trial() {
         1
     );
 
-    for _ in 0..4 * exploration_period(nodes.len()) {
+    for _ in 0..4 * SCORE_EXPLORATION_PERIOD {
         manager
             .feedback_for_group_node("score", nodes[1].id, context.clone())
             .unwrap()
@@ -326,7 +326,7 @@ fn selection_reason_precedence_is_stable() {
             now,
         );
     }
-    for _ in 0..exploration_period(periodic.len()) {
+    for _ in 0..SCORE_EXPLORATION_PERIOD {
         manager
             .feedback_for_group_node("periodic", periodic[0].id, traffic.clone())
             .unwrap()

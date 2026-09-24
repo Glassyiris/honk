@@ -17,12 +17,6 @@ pub(super) fn exploration_target(candidate_count: usize) -> usize {
     }
 }
 
-pub(super) fn exploration_period(candidate_count: usize) -> u64 {
-    (candidate_count as u64)
-        .saturating_mul(2)
-        .clamp(SCORE_EXPLORATION_MIN_PERIOD, SCORE_EXPLORATION_MAX_PERIOD)
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScoreBudgetCounters {
     pub business_starts: u64,
@@ -129,7 +123,7 @@ impl Scope {
             counters: ScoreBudgetCounters {
                 cold_allowance: allowance,
                 cold_available: allowance,
-                earning_period: exploration_period(members),
+                earning_period: SCORE_EXPLORATION_PERIOD,
                 scopes: 1,
                 ..Default::default()
             },

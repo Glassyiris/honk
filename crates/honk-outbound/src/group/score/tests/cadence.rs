@@ -115,10 +115,7 @@ fn new_targets_cannot_mint_exploration_and_peek_cannot_spend_it() {
     let counts = manager.score_budget_counters("score", SelectionNetwork::Tcp);
     assert_eq!(counts.business_starts, 64);
     assert_eq!(counts.scopes, 1);
-    assert!(
-        counts.spent
-            <= exploration_target(nodes.len()) as u64 + 63 / exploration_period(nodes.len())
-    );
+    assert!(counts.spent <= exploration_target(nodes.len()) as u64 + 63 / SCORE_EXPLORATION_PERIOD);
 }
 
 #[test]
@@ -512,7 +509,7 @@ fn cancelled_cold_trials_keep_alternative_coverage() {
     train_at(&manager, &nodes[0], &target, 20, 100, 1, now);
     let state = manager.score_state();
     let mut trials = std::collections::HashSet::new();
-    let requests = exploration_target(nodes.len()) as u64 + exploration_period(nodes.len()) * 2;
+    let requests = exploration_target(nodes.len()) as u64 + SCORE_EXPLORATION_PERIOD * 2;
     let node_refs = nodes.iter().collect::<Vec<_>>();
     let at = now + Duration::from_secs(2);
     for _ in 0..requests {
@@ -564,7 +561,7 @@ fn qualified_trial_does_not_replace_committed_incumbent_without_new_evidence() {
         .unwrap()
         .start_at(at)
         .finish_at(ScoreOutcome::Cancelled, false, at);
-    for _ in 0..4 * exploration_period(nodes.len()) {
+    for _ in 0..4 * SCORE_EXPLORATION_PERIOD {
         manager
             .feedback_for_group_node("score", nodes[0].id, target.clone())
             .unwrap()
