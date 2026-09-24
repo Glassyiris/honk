@@ -749,16 +749,23 @@ fn startup_clash_mode(mode_db: Option<&state::cache::CacheDb>, default_mode: &st
         .unwrap_or_else(|| "Rule".to_owned())
 }
 
+/// quinn logs every endpoint-driver death at ERROR; probe/warm endpoints over
+/// retiring AnyTLS sessions die as a matter of course (the SYNACK watchdog
+/// kills them on purpose), so that target is silenced unless `RUST_LOG` says
+/// otherwise.
+const QUIET_LOG_TARGETS: &str = "quinn::endpoint=off";
+
 /// The console layer, with or without the local timestamp. The file layer
 /// always stamps: a file has no journal in front of it.
-fn console_log_layer<S, W>(
+fn console_log_layer<S, W, F>(
     disable_timestamp: bool,
     writer: W,
-    filter: tracing_subscriber::EnvFilter,
+    filter: F,
 ) -> Box<dyn tracing_subscriber::Layer<S> + Send + Sync>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
     W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+    F: tracing_subscriber::layer::Filter<S> + Send + Sync + 'static,
 {
     use tracing_subscriber::Layer as _;
     if disable_timestamp {
@@ -1091,27 +1098,27 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             other => other,
         };
         let default_level = if cli.debug { "debug" } else { config_level };
-        // quinn logs every endpoint-driver death at ERROR; probe/warm endpoints
-        // over retiring AnyTLS sessions die as a matter of course (the SYNACK
-        // watchdog kills them on purpose), so that target is silenced unless
-        // RUST_LOG says otherwise.
         let env_filter =
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(format!("{default_level},quinn::endpoint=off"))
+                tracing_subscriber::EnvFilter::new(format!("{default_level},{QUIET_LOG_TARGETS}"))
             });
 
         let log_file_path = resolved_log_file_path(&config, cli.log_file.as_deref());
-        let log_file_layer = if let Some(path) = log_file_path.as_ref() {
+        let (log_file_layer, log_file_level) = if let Some(path) = log_file_path.as_ref() {
             let file = RotatingLogFile::open(path, LOG_FILE_LIMIT)?;
-            Some(
-                tracing_subscriber::fmt::layer()
-                    .with_timer(LocalTime)
-                    .with_ansi(false)
-                    .with_writer(std::sync::Mutex::new(file))
-                    .with_filter(env_filter.clone()),
+            let (filter, level) = tracing_subscriber::reload::Layer::new(env_filter.clone());
+            (
+                Some(
+                    tracing_subscriber::fmt::layer()
+                        .with_timer(LocalTime)
+                        .with_ansi(false)
+                        .with_writer(std::sync::Mutex::new(file))
+                        .with_filter(filter),
+                ),
+                Some(level),
             )
         } else {
-            None
+            (None, None)
         };
         Ok((
             config,
@@ -1119,6 +1126,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             data_dir_creation_error,
             log_file_path,
             log_file_layer,
+            log_file_level,
             env_filter,
         ))
     })();
@@ -1128,6 +1136,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         data_dir_creation_error,
         log_file_path,
         log_file_layer,
+        log_file_level,
         env_filter,
     ) = match startup {
         Ok(startup) => startup,
@@ -1145,11 +1154,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let (native_log_layer, native_log_binding) = native_api::logs::tracing_layer();
 
     use tracing_subscriber::prelude::*;
+    let (console_filter, console_level) =
+        tracing_subscriber::reload::Layer::new(env_filter.clone());
     let registry = tracing_subscriber::registry()
         .with(console_log_layer(
             cli.disable_timestamp,
             std::io::stdout,
-            env_filter,
+            console_filter,
         ))
         .with(log_file_layer);
     #[cfg(feature = "clash-api")]
@@ -1157,6 +1168,17 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(feature = "native-api")]
     let registry = registry.with(native_log_layer);
     registry.init();
+    #[cfg(feature = "native-api")]
+    let engine_level = {
+        let mut engine = native_api::logs::EngineLevel::default();
+        engine.push(console_level, env_filter.clone());
+        if let Some(level) = log_file_level {
+            engine.push(level, env_filter);
+        }
+        engine
+    };
+    #[cfg(not(feature = "native-api"))]
+    let _ = (console_level, log_file_level, env_filter);
 
     info!("honk-core {} starting", VERSION);
     info!("Config: {}", cli.config.display());
@@ -1719,9 +1741,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let state =
                 native_api::NativeState::new(&mut control_plane, listen, started_at, started)
                     .await?;
-            native_log_binding.bind(std::sync::Arc::downgrade(
-                &control_plane.native_observation().logs,
-            ));
+            let logs = &control_plane.native_observation().logs;
+            logs.attach_engine_level(engine_level);
+            native_log_binding.bind(std::sync::Arc::downgrade(logs));
             let server = native_api::NativeServer::start(listener, std::sync::Arc::new(state));
             info!(%listen, message = "native API listener ready");
             Some(server)
