@@ -19,9 +19,9 @@ pub(in crate::group::score) struct Summary {
     pub target_limited: bool,
     pub reporters: u8,
     pub span: Option<Duration>,
-    pub evidence_age: Option<Duration>,
+    pub oldest_at: Option<Instant>,
     pub response_latest_at: Option<Instant>,
-    pub valid_for: Option<Duration>,
+    pub expires_at: Option<Instant>,
     pub dispersion: f64,
     pub upload_known: bool,
     pub download_known: bool,
@@ -319,7 +319,7 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
     if compared {
         summary.support = support.finish();
     }
-    summary.evidence_age = oldest.map(|at| now.saturating_duration_since(at));
-    summary.valid_for = expires.map(|at| at.saturating_duration_since(now));
+    summary.oldest_at = oldest;
+    summary.expires_at = expires;
     summary
 }

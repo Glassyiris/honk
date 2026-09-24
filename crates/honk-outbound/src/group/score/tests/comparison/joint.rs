@@ -58,14 +58,11 @@ fn joint_response_uses_qualified_common_blocks_without_more_traffic() {
             assert!(summary.complete && summary.supported && !summary.response_misaligned);
             assert_eq!(summary.reporters, 4);
             // The original pair's older block still participates in the adverse-evidence veto.
-            assert_eq!(summary.evidence_age, Some(Duration::from_millis(17_900)));
+            assert_eq!(summary.oldest_at, Some(at - Duration::from_millis(17_900)));
             let original = decision.pairs.get(1).unwrap().response.unwrap();
             let narrowed = decision.pairs.summary_pair(1).unwrap().response.unwrap();
             assert!(original.expires_at < narrowed.expires_at);
-            assert_eq!(
-                summary.valid_for,
-                Some(original.expires_at.duration_since(at))
-            );
+            assert_eq!(summary.expires_at, Some(original.expires_at));
             assert_eq!(
                 report.local_comparison.valid_for_ms,
                 Some(original.expires_at.duration_since(at).as_millis() as u64)
@@ -86,10 +83,7 @@ fn joint_response_uses_qualified_common_blocks_without_more_traffic() {
             let renewed = comparison::summarize(&renewed, original.expires_at);
             assert!(renewed.complete && renewed.supported && !renewed.response_misaligned);
             assert_ne!(renewed.support, summary.support);
-            assert_eq!(
-                renewed.valid_for,
-                Some(narrowed.expires_at.duration_since(original.expires_at))
-            );
+            assert_eq!(renewed.expires_at, Some(narrowed.expires_at));
             let expired = scores(
                 &state.inner.lock(),
                 &nodes,
@@ -360,15 +354,12 @@ fn optional_original_pair_vetoes_joint_support_until_its_own_expiry() {
     let summary = comparison::summarize(&decision, at);
     assert!(summary.complete && !summary.response_misaligned);
     assert!(!summary.equivalent && !summary.supported);
-    assert_eq!(summary.valid_for, Some(expiry.duration_since(at)));
+    assert_eq!(summary.expires_at, Some(expiry));
 
     let renewed = comparison::summarize(&decision_at(expiry), expiry);
     assert!(renewed.complete && renewed.equivalent && !renewed.response_misaligned);
     assert_ne!(renewed.support, summary.support);
-    assert_eq!(
-        renewed.valid_for,
-        Some(covered_expiry.duration_since(expiry))
-    );
+    assert_eq!(renewed.expires_at, Some(covered_expiry));
 }
 
 #[test]

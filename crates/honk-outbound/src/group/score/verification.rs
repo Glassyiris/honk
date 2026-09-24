@@ -512,8 +512,12 @@ pub(super) fn evaluate(
         compared_candidates: summary.compared_candidates,
         reporter_count: usize::from(summary.reporters),
         span_ms: summary.span.map_or(0, milliseconds),
-        evidence_age_ms: summary.evidence_age.map(milliseconds),
-        valid_for_ms: summary.valid_for.map(milliseconds),
+        evidence_age_ms: summary
+            .oldest_at
+            .map(|at| milliseconds(now.saturating_duration_since(at))),
+        valid_for_ms: summary
+            .expires_at
+            .map(|at| milliseconds(at.saturating_duration_since(now))),
         dispersion_ppm: (summary.dispersion * 1_000_000.0).clamp(0.0, u64::MAX as f64) as u64,
         upload_known: summary.upload_known,
         download_known: summary.download_known,
@@ -582,12 +586,10 @@ pub(super) fn evaluate(
         claims |= claim(ScoreEvidenceKind::Response);
     }
     if comparison != ScoreComparison::Unconfirmed || has_transfer {
-        if let Some(age) = summary.evidence_age {
-            let at = now.checked_sub(age).unwrap_or(now);
+        if let Some(at) = summary.oldest_at {
             oldest = Some(oldest.map_or(at, |old: Instant| old.min(at)));
         }
-        if let Some(valid_for) = summary.valid_for {
-            let until = now + valid_for;
+        if let Some(until) = summary.expires_at {
             expires_at = Some(expires_at.map_or(until, |old: Instant| old.min(until)));
         }
     }

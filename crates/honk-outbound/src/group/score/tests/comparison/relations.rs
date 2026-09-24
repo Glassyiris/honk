@@ -365,7 +365,10 @@ fn unqualified_upload_noise_cannot_revoke_response_support() {
         }
         let summary = comparison::summarize(&decision, at);
         assert!(summary.complete && summary.supported && !summary.response_misaligned);
-        let identity = (summary.support, summary.valid_for);
+        let identity = (
+            summary.support,
+            summary.expires_at.map(|until| until.duration_since(at)),
+        );
         if let Some(baseline) = baseline {
             assert_eq!(identity, baseline);
         } else {
@@ -427,7 +430,10 @@ fn common_target_aggregation_discards_lost_direction_identity() {
         }
         let summary = comparison::summarize(&decision, at);
         assert!(summary.complete && summary.supported && !summary.response_misaligned);
-        let identity = (summary.support, summary.valid_for);
+        let identity = (
+            summary.support,
+            summary.expires_at.map(|until| until.duration_since(at)),
+        );
         if let Some(baseline) = baseline {
             assert_eq!(identity, baseline);
         } else {
@@ -611,7 +617,7 @@ fn later_challenger_direction_controls_claim_identity_and_expiry() {
     assert!(before.pairs.get(1).unwrap().upload.is_none());
     let before = comparison::summarize(&before, at);
     assert!(before.complete && before.supported && !before.response_misaligned);
-    assert_eq!(before.valid_for, Some(expiry.duration_since(at)));
+    assert_eq!(before.expires_at, Some(expiry));
     for index in [0, 2] {
         for reporter in &reporters[index] {
             reporter.transfer_at(1, 1, now + Duration::from_secs(61));
@@ -631,7 +637,7 @@ fn later_challenger_direction_controls_claim_identity_and_expiry() {
     let after = comparison::summarize(&decision, at);
     assert!(after.complete && after.supported && !after.response_misaligned);
     assert_ne!(after.support, before.support);
-    assert_eq!(after.valid_for, before.valid_for);
+    assert_eq!(after.expires_at, before.expires_at);
     let report = evaluate(
         &decision,
         &nodes.iter().collect::<Vec<_>>(),
@@ -653,10 +659,7 @@ fn later_challenger_direction_controls_claim_identity_and_expiry() {
     let expired = comparison::summarize(&decision, expiry);
     assert!(expired.complete && expired.supported && !expired.response_misaligned);
     assert_ne!(expired.support, after.support);
-    assert_eq!(
-        expired.valid_for,
-        Some(response.expires_at.duration_since(expiry))
-    );
+    assert_eq!(expired.expires_at, Some(response.expires_at));
 }
 
 #[test]
