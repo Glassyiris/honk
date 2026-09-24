@@ -19,7 +19,7 @@ impl ControlPlaneHandle {
         dial_deadline: tokio::time::Instant,
         runtime_generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
         ipver: IpVersion,
-        feedback: &HashMap<uuid::Uuid, crate::group::ScoreFeedback>,
+        feedback: &HashMap<uuid::Uuid, crate::group::ScoreAttempt>,
         cold_urltest: bool,
     ) -> anyhow::Result<
         Option<(
@@ -37,7 +37,6 @@ impl ControlPlaneHandle {
         }
         let ctx = self.clone();
         let outbound = outbound_name.to_string();
-        let feedback = feedback.clone();
 
         let mut set = tokio::task::JoinSet::new();
         let started_reporters = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -46,7 +45,7 @@ impl ControlPlaneHandle {
             let node = (*node).clone();
             let target_domain = target_domain.clone();
             let generation = Arc::clone(&runtime_generation);
-            let feedback = feedback.clone();
+            let feedback = feedback.get(&node.id).cloned();
             let started_reporters = Arc::clone(&started_reporters);
             set.spawn(async move {
                 if cold_urltest {
@@ -55,16 +54,24 @@ impl ControlPlaneHandle {
                     // cancels it before it can start.
                     wait_for_cold_urltest_release(idx).await;
                 }
-                let reporter = Arc::new(parking_lot::Mutex::new(None));
+                let business = match feedback
+                    .as_ref()
+                    .map(crate::group::ScoreAttempt::begin)
+                    .transpose()
+                {
+                    Ok(business) => business,
+                    Err(error) => return (Err(error.into()), idx, Duration::ZERO, node, None),
+                };
+                let score = Arc::new(parking_lot::Mutex::new((business, None)));
                 let on_start = {
-                    let feedback = feedback.get(&node.id).cloned();
-                    let reporter = Arc::clone(&reporter);
+                    let score = Arc::clone(&score);
                     move || {
-                        let started = feedback.map(|feedback| feedback.start());
+                        let mut score = score.lock();
+                        let started = score.0.take().map(crate::group::ScoreBusinessGuard::start);
                         if let Some(reporter) = &started {
                             started_reporters.lock().push(reporter.clone());
                         }
-                        *reporter.lock() = started;
+                        score.1 = started;
                     }
                 };
                 let scope = generation.dial_scope(on_start);
@@ -95,7 +102,8 @@ impl ControlPlaneHandle {
                         })
                 };
                 let elapsed = start.elapsed();
-                let reporter = reporter.lock().clone();
+                let mut score = score.lock();
+                let reporter = score.1.clone();
                 match &result {
                     Ok(_) => {
                         if let Some(reporter) = &reporter {
@@ -103,6 +111,9 @@ impl ControlPlaneHandle {
                         }
                     }
                     Err(error) => {
+                        if let Some(business) = score.0.take() {
+                            business.finish(score_runtime_outcome(&generation, error));
+                        }
                         if let Some(reporter) = &reporter {
                             reporter.setup_failed(score_runtime_outcome(&generation, error));
                         }
@@ -237,10 +248,7 @@ impl ControlPlaneHandle {
                 let registry = ctx.proxy_registry.clone();
                 let target_domain = target_domain.clone();
                 let generation = Arc::clone(&runtime_generation);
-                let pool_feedback = feedback
-                    .get(&node.id)
-                    .cloned()
-                    .map(|feedback| feedback.with_source(crate::group::ScoreSource::Warmup));
+                let pool_feedback = feedback.get(&node.id).cloned();
                 let pool_health_family = ipver;
                 deposit_count += 1;
                 tokio::spawn(async move {
@@ -266,7 +274,10 @@ impl ControlPlaneHandle {
                         else {
                             return;
                         };
-                        let pool_reporter = pool_feedback.as_ref().map(|feedback| feedback.start());
+                        let pool_reporter = pool_feedback.map(|attempt| {
+                            let context = attempt.context().clone();
+                            attempt.start_warmup(context)
+                        });
                         match registry
                             .dial_runtime(
                                 Arc::clone(&generation),
@@ -308,15 +319,12 @@ impl ControlPlaneHandle {
                         // instead; a bare TCP is useless to them.
                         return;
                     }
-                    let pool_reporter = pool_feedback.as_ref().map(|feedback| {
-                        feedback
-                            .clone()
-                            .with_context(crate::group::ScoreSelectionContext::aggregate(
-                                SelectionNetwork::Tcp,
-                                ProbeDomain::Tcp,
-                                pool_health_family,
-                            ))
-                            .start()
+                    let pool_reporter = pool_feedback.map(|attempt| {
+                        attempt.start_warmup(crate::group::ScoreSelectionContext::aggregate(
+                            SelectionNetwork::Tcp,
+                            ProbeDomain::Tcp,
+                            pool_health_family,
+                        ))
                     });
                     match generation
                         .scope_dials(honk_outbound::util::connect_outbound(
@@ -351,7 +359,7 @@ impl ControlPlaneHandle {
                                 reporter.setup_failed(if generation.is_shutdown() {
                                     crate::group::ScoreOutcome::Shutdown
                                 } else {
-                                    crate::group::ScoreOutcome::Io(e.kind())
+                                    crate::group::ScoreOutcome::from_io_error(&e)
                                 });
                             }
                             debug!(

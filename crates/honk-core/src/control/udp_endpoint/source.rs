@@ -766,7 +766,7 @@ async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>
                     Ok(packet) => packet,
                     Err(error) => {
                         if !owner.handle_transport_error(&error) {
-                            owner.fail(ScoreOutcome::Io(error.kind()));
+                            owner.fail(ScoreOutcome::from_io_error(&error));
                         }
                         return;
                     }
@@ -913,6 +913,11 @@ impl UdpEndpointPool {
     }
 
     fn fail_source(&self, owner: &SourceOwner, outcome: ScoreOutcome) {
+        let outcome = if outcome == ScoreOutcome::NodeFailure {
+            ScoreOutcome::shared_node_failure()
+        } else {
+            outcome
+        };
         if owner.start_retiring(SourceRetirement::Failure(outcome)) {
             self.finish_source_failure(owner, outcome);
         }

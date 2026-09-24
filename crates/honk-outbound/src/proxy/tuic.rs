@@ -818,13 +818,23 @@ impl PacketTransport for TuicUdpTransport {
             data,
         )
         .await
-        .map_err(io::Error::other)
+        .map_err(|error| io::Error::other(crate::SharedError::new(error)))
+        .map_err(super::quic_carrier_io_error)
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         loop {
             let msg = self.rx.lock().await.recv().await.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::ConnectionAborted, "TUIC connection closed")
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    super::NodeFailure(
+                        self.state
+                            .conn
+                            .close_reason()
+                            .map(anyhow::Error::new)
+                            .unwrap_or_else(|| anyhow::anyhow!("TUIC connection closed")),
+                    ),
+                )
             })?;
             let complete =
                 self.defrag

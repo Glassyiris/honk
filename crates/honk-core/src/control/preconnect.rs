@@ -123,7 +123,7 @@ impl ControlPlane {
                                         if error.kind() == io::ErrorKind::TimedOut {
                                             crate::group::ScoreOutcome::Timeout
                                         } else {
-                                            crate::group::ScoreOutcome::Io(error.kind())
+                                            crate::group::ScoreOutcome::from_io_error(&error)
                                         },
                                     );
                                 }

@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use bytes::{Buf, Bytes, BytesMut};
 use h2::client::{ResponseFuture, SendRequest};
 use parking_lot::Mutex;
-use rand::RngExt as _;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::time::Instant;
 
@@ -20,11 +19,12 @@ use crate::session::{
     IdleClock, ManagedSession, OpenError, SessionPermit, SessionPool, SessionPoolConfig,
     SessionState,
 };
+use padding::{PaddingStream, mux_preface};
+
+mod padding;
 
 pub(crate) const MAX_SESSIONS: usize = 2;
 pub(crate) const MAX_STREAMS_PER_SESSION: usize = 128;
-const PADDED_RECORDS: u8 = 16;
-const MAX_RECORD_DATA: usize = u16::MAX as usize;
 const MAX_ERROR_MESSAGE: usize = 64 * 1024;
 // Let long-fat TCP streams grow without allowing one unread child to monopolize
 // the carrier; aggregate credit still covers one maximum response frame per slot.
@@ -35,7 +35,6 @@ const H2_CONNECTION_RECV_WINDOW: u32 =
 const MUX_MAGIC_ADDRESS: &str = "sp.mux.sing-box.arpa";
 #[cfg(feature = "rprx")]
 const MUX_MAGIC_PORT: u16 = 444;
-const H2MUX_BACKEND: u8 = 2;
 const FLAG_UDP: u16 = 1;
 
 pub(crate) type VlessMuxPool = SessionPool<VlessMuxSession>;
@@ -68,6 +67,7 @@ pub struct VlessMuxSession {
     capacity_notify: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
     sender: Mutex<SendRequest<Bytes>>,
     driver: Mutex<Option<tokio::task::AbortHandle>>,
+    failure: CarrierFailure,
 }
 
 impl VlessMuxSession {
@@ -80,6 +80,7 @@ impl VlessMuxSession {
             capacity_notify: std::sync::OnceLock::new(),
             sender: Mutex::new(sender),
             driver: Mutex::new(None),
+            failure: CarrierFailure::default(),
         })
     }
 
@@ -204,213 +205,6 @@ impl ManagedSession for VlessMuxSession {
     }
 }
 
-#[derive(Default)]
-struct PaddingReadState {
-    records: u8,
-    header: [u8; 4],
-    header_len: usize,
-    data_remaining: usize,
-    padding_remaining: usize,
-}
-
-#[derive(Default)]
-struct PaddingWriteState {
-    records: u8,
-    pending: Option<Bytes>,
-    offset: usize,
-}
-
-struct PaddingStream<S> {
-    inner: S,
-    enabled: bool,
-    read: PaddingReadState,
-    write: PaddingWriteState,
-}
-
-impl<S> PaddingStream<S> {
-    fn new(inner: S, enabled: bool) -> Self {
-        Self {
-            inner,
-            enabled,
-            read: PaddingReadState::default(),
-            write: PaddingWriteState::default(),
-        }
-    }
-}
-impl<S: AsyncRead + Unpin> AsyncRead for PaddingStream<S> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        output: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        if !self.enabled
-            || (self.read.records >= PADDED_RECORDS
-                && self.read.data_remaining == 0
-                && self.read.padding_remaining == 0
-                && self.read.header_len == 0)
-        {
-            return Pin::new(&mut self.inner).poll_read(cx, output);
-        }
-        if output.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-
-        loop {
-            if self.read.data_remaining != 0 {
-                let limit = self.read.data_remaining.min(output.remaining());
-                let target = output.initialize_unfilled_to(limit);
-                let mut limited = ReadBuf::new(target);
-                match Pin::new(&mut self.inner).poll_read(cx, &mut limited) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                    Poll::Ready(Ok(())) => {
-                        let read = limited.filled().len();
-                        if read == 0 {
-                            return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
-                        }
-                        output.advance(read);
-                        self.read.data_remaining -= read;
-                        return Poll::Ready(Ok(()));
-                    }
-                }
-            }
-
-            if self.read.padding_remaining != 0 {
-                let mut scratch = [0; 1024];
-                let limit = self.read.padding_remaining.min(scratch.len());
-                let mut discard = ReadBuf::new(&mut scratch[..limit]);
-                match Pin::new(&mut self.inner).poll_read(cx, &mut discard) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                    Poll::Ready(Ok(())) => {
-                        let read = discard.filled().len();
-                        if read == 0 {
-                            return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
-                        }
-                        self.read.padding_remaining -= read;
-                        continue;
-                    }
-                }
-            }
-
-            if self.read.records >= PADDED_RECORDS {
-                return Pin::new(&mut self.inner).poll_read(cx, output);
-            }
-
-            let header_len = self.read.header_len;
-            let mut bytes = [0; 4];
-            let mut header = ReadBuf::new(&mut bytes[..4 - header_len]);
-            match Pin::new(&mut self.inner).poll_read(cx, &mut header) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Ready(Ok(())) => {
-                    let read = header.filled().len();
-                    if read == 0 {
-                        return Poll::Ready(Err(io::ErrorKind::UnexpectedEof.into()));
-                    }
-                    self.read.header[header_len..header_len + read]
-                        .copy_from_slice(&header.filled()[..read]);
-                    self.read.header_len += read;
-                    if self.read.header_len != 4 {
-                        continue;
-                    }
-                    self.read.data_remaining =
-                        u16::from_be_bytes([self.read.header[0], self.read.header[1]]) as usize;
-                    self.read.padding_remaining =
-                        u16::from_be_bytes([self.read.header[2], self.read.header[3]]) as usize;
-                    self.read.header_len = 0;
-                    self.read.records += 1;
-                }
-            }
-        }
-    }
-}
-
-impl<S: AsyncWrite + Unpin> PaddingStream<S> {
-    fn poll_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        while let Some(frame) = self.write.pending.as_ref() {
-            match Pin::new(&mut self.inner).poll_write(cx, &frame[self.write.offset..]) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-                }
-                Poll::Ready(Ok(written)) => {
-                    self.write.offset += written;
-                    if self.write.offset == frame.len() {
-                        self.write.pending = None;
-                        self.write.offset = 0;
-                    }
-                }
-            }
-        }
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for PaddingStream<S> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        if !self.enabled {
-            return Pin::new(&mut self.inner).poll_write(cx, data);
-        }
-        match self.poll_pending(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-            Poll::Ready(Ok(())) => {}
-        }
-        if self.write.records >= PADDED_RECORDS {
-            return Pin::new(&mut self.inner).poll_write(cx, data);
-        }
-        if data.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-
-        let data_len = data.len().min(MAX_RECORD_DATA);
-        let padding_len = rand::rng().random_range(256..768);
-        let mut frame = BytesMut::with_capacity(4 + data_len + padding_len);
-        frame.extend_from_slice(&(data_len as u16).to_be_bytes());
-        frame.extend_from_slice(&(padding_len as u16).to_be_bytes());
-        frame.extend_from_slice(&data[..data_len]);
-        frame.resize(frame.len() + padding_len, 0);
-        self.write.pending = Some(frame.freeze());
-        self.write.records += 1;
-        cx.waker().wake_by_ref();
-        Poll::Ready(Ok(data_len))
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.poll_pending(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Ready(Ok(())) => Pin::new(&mut self.inner).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.as_mut().poll_flush(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Ready(Ok(())) => Pin::new(&mut self.inner).poll_shutdown(cx),
-        }
-    }
-}
-
-fn mux_preface(padded: bool) -> Bytes {
-    if !padded {
-        return Bytes::from_static(&[0, H2MUX_BACKEND]);
-    }
-    let padding_len = rand::rng().random_range(256..768);
-    let mut preface = BytesMut::with_capacity(5 + padding_len);
-    preface.extend_from_slice(&[1, H2MUX_BACKEND, 1]);
-    preface.extend_from_slice(&(padding_len as u16).to_be_bytes());
-    preface.resize(preface.len() + padding_len, 0);
-    preface.freeze()
-}
-
 pub(crate) async fn connect(
     mut stream: Box<dyn AsyncReadWrite>,
     padded: bool,
@@ -442,6 +236,7 @@ struct OpenedStream {
     send: h2::SendStream<Bytes>,
     response: ResponseFuture,
     permit: SessionPermit<VlessMuxSession>,
+    failure: CarrierFailure,
 }
 
 async fn open_h2_stream(
@@ -465,6 +260,7 @@ async fn open_h2_stream(
         send,
         response,
         permit,
+        failure: Arc::clone(&session.failure),
     })
 }
 
@@ -480,22 +276,43 @@ fn stream_request(
     Ok(request.freeze())
 }
 
-fn h2_io(error: h2::Error) -> io::Error {
+/// The first transport loss any stream observes; every stream of the connection shares it.
+type CarrierFailure = Arc<std::sync::OnceLock<crate::SharedError>>;
+
+fn h2_io(carrier: &CarrierFailure, error: h2::Error) -> io::Error {
+    if error.is_io() {
+        let failure = carrier.get_or_init(|| {
+            crate::SharedError::fanout(crate::proxy::NodeFailure(error.into()).into())
+        });
+        return io::Error::new(io::ErrorKind::ConnectionReset, failure.clone());
+    }
+    // GOAWAY refuses only later streams; earlier ones continue and may fail independently.
+    if error.is_go_away() {
+        return io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            crate::proxy::NodeFailure(error.into()),
+        );
+    }
     io::Error::new(io::ErrorKind::ConnectionReset, error)
 }
 
-async fn send_owned(send: &mut h2::SendStream<Bytes>, mut data: Bytes) -> io::Result<()> {
+async fn send_owned(
+    send: &mut h2::SendStream<Bytes>,
+    carrier: &CarrierFailure,
+    mut data: Bytes,
+) -> io::Result<()> {
     while !data.is_empty() {
         send.reserve_capacity(data.len());
         let capacity = std::future::poll_fn(|cx| send.poll_capacity(cx))
             .await
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "H2MUX stream closed"))?
-            .map_err(h2_io)?;
+            .map_err(|error| h2_io(carrier, error))?;
         if capacity == 0 {
             continue;
         }
         let chunk = data.split_to(capacity.min(data.len()));
-        send.send_data(chunk, false).map_err(h2_io)?;
+        send.send_data(chunk, false)
+            .map_err(|error| h2_io(carrier, error))?;
     }
     Ok(())
 }
@@ -503,13 +320,15 @@ async fn send_owned(send: &mut h2::SendStream<Bytes>, mut data: Bytes) -> io::Re
 struct MuxSendStream {
     inner: h2::SendStream<Bytes>,
     closed: bool,
+    carrier: CarrierFailure,
 }
 
 impl MuxSendStream {
-    fn new(inner: h2::SendStream<Bytes>) -> Self {
+    fn new(inner: h2::SendStream<Bytes>, carrier: CarrierFailure) -> Self {
         Self {
             inner,
             closed: false,
+            carrier,
         }
     }
 }
@@ -530,13 +349,13 @@ impl AsyncWrite for MuxSendStream {
         match self.inner.poll_capacity(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Err(h2_io(error))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Err(h2_io(&self.carrier, error))),
             Poll::Ready(Some(Ok(0))) => Poll::Pending,
             Poll::Ready(Some(Ok(capacity))) => {
                 let written = capacity.min(data.len());
                 self.inner
                     .send_data(Bytes::copy_from_slice(&data[..written]), false)
-                    .map_err(h2_io)?;
+                    .map_err(|error| h2_io(&self.carrier, error))?;
                 Poll::Ready(Ok(written))
             }
         }
@@ -548,7 +367,9 @@ impl AsyncWrite for MuxSendStream {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.closed {
-            self.inner.send_data(Bytes::new(), true).map_err(h2_io)?;
+            self.inner
+                .send_data(Bytes::new(), true)
+                .map_err(|error| h2_io(&self.carrier, error))?;
             self.closed = true;
         }
         Poll::Ready(Ok(()))
@@ -571,14 +392,15 @@ struct MuxResponse {
     error_len: Option<(u64, u32)>,
     error_remaining: Option<usize>,
     error_message: Vec<u8>,
-    failed: Option<String>,
+    failed: Option<crate::SharedError>,
+    carrier: CarrierFailure,
 }
 
 fn h2_clean_eof(error: &h2::Error) -> bool {
     error.is_remote() && error.is_reset() && error.reason() == Some(h2::Reason::NO_ERROR)
 }
 impl MuxResponse {
-    fn new(response: ResponseFuture) -> Self {
+    fn new(response: ResponseFuture, carrier: CarrierFailure) -> Self {
         Self {
             response: Some(Box::pin(response)),
             recv: None,
@@ -588,13 +410,24 @@ impl MuxResponse {
             error_remaining: None,
             error_message: Vec::new(),
             failed: None,
+            carrier,
         }
     }
 
     fn error(&mut self, kind: io::ErrorKind, message: impl Into<String>) -> io::Error {
-        let message = message.into();
-        self.failed = Some(message.clone());
-        io::Error::new(kind, message)
+        let error = crate::SharedError::new(
+            crate::proxy::NodeFailure(anyhow::Error::msg(message.into())).into(),
+        );
+        self.failed = Some(error.clone());
+        io::Error::new(kind, error)
+    }
+
+    fn target_error(&mut self, message: impl Into<String>) -> io::Error {
+        let error = crate::SharedError::new(
+            crate::proxy::TargetFailure(anyhow::Error::msg(message.into())).into(),
+        );
+        self.failed = Some(error.clone());
+        io::Error::new(io::ErrorKind::ConnectionRefused, error)
     }
 
     fn release(&mut self, size: usize) -> io::Result<()> {
@@ -603,7 +436,7 @@ impl MuxResponse {
             .expect("response body exists before data")
             .flow_control()
             .release_capacity(size)
-            .map_err(h2_io)
+            .map_err(|error| h2_io(&self.carrier, error))
     }
 
     fn poll_fill(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
@@ -620,7 +453,7 @@ impl MuxResponse {
             Poll::Ready(Some(Err(error))) if self.status_ready && h2_clean_eof(&error) => {
                 Poll::Ready(Ok(false))
             }
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Err(h2_io(error))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Err(h2_io(&self.carrier, error))),
             Poll::Ready(Some(Ok(data))) if data.is_empty() => {
                 cx.waker().wake_by_ref();
                 Poll::Pending
@@ -647,7 +480,7 @@ impl MuxResponse {
             let response = self.response.as_mut().expect("response future exists");
             let response = match response.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(h2_io(error))),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(h2_io(&self.carrier, error))),
                 Poll::Ready(Ok(response)) => response,
             };
             if response.status() != http::StatusCode::OK {
@@ -685,7 +518,7 @@ impl MuxResponse {
                 self.error_remaining = Some(remaining);
                 if remaining == 0 {
                     let message = String::from_utf8_lossy(&self.error_message).into_owned();
-                    return Poll::Ready(Err(self.error(io::ErrorKind::ConnectionRefused, message)));
+                    return Poll::Ready(Err(self.target_error(message)));
                 }
                 continue;
             }
@@ -717,9 +550,7 @@ impl MuxResponse {
                     self.error_len = None;
                     self.error_remaining = Some(length);
                     if length == 0 {
-                        return Poll::Ready(Err(
-                            self.error(io::ErrorKind::ConnectionRefused, "H2MUX request rejected")
-                        ));
+                        return Poll::Ready(Err(self.target_error("H2MUX request rejected")));
                     }
                 } else {
                     shift += 7;
@@ -826,6 +657,7 @@ impl AsyncWrite for VlessMuxStream {
 
 struct MuxUdpWriter {
     send: h2::SendStream<Bytes>,
+    carrier: CarrierFailure,
     setup: Option<Bytes>,
     pending: bool,
 }
@@ -869,7 +701,8 @@ impl VlessMuxUdpTransport {
             packet
         };
         writer.pending = true;
-        send_owned(&mut writer.send, frame).await?;
+        let writer = &mut *writer;
+        send_owned(&mut writer.send, &writer.carrier, frame).await?;
         writer.setup = None;
         writer.pending = false;
         Ok(())
@@ -944,12 +777,12 @@ impl MuxSession for VlessMuxSession {
             let request = stream_request(0, target, target_domain)
                 .map_err(|error| OpenError::Refused(anyhow::Error::new(error)))?;
             let mut opened = open_h2_stream(self, permit).await?;
-            send_owned(&mut opened.send, request)
+            send_owned(&mut opened.send, &opened.failure, request)
                 .await
                 .map_err(|error| OpenError::Draining(anyhow::Error::new(error)))?;
             Ok(VlessMuxStream {
-                send: MuxSendStream::new(opened.send),
-                response: MuxResponse::new(opened.response),
+                send: MuxSendStream::new(opened.send, Arc::clone(&opened.failure)),
+                response: MuxResponse::new(opened.response, opened.failure),
                 _permit: opened.permit,
             })
         }
@@ -968,11 +801,12 @@ impl MuxSession for VlessMuxSession {
             Ok(Arc::new(VlessMuxUdpTransport {
                 writer: tokio::sync::Mutex::new(MuxUdpWriter {
                     send: opened.send,
+                    carrier: Arc::clone(&opened.failure),
                     setup: Some(setup),
                     pending: false,
                 }),
                 reader: tokio::sync::Mutex::new(MuxUdpReader {
-                    response: MuxResponse::new(opened.response),
+                    response: MuxResponse::new(opened.response, opened.failure),
                     decoder: crate::proxy::uot::Decoder::default(),
                 }),
                 target,

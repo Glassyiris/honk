@@ -177,7 +177,8 @@ fn assert_udp_selection(manager: &GroupManager, group: &str, expected: Option<&s
                 target: Some(ScoreTarget::domain("selector.example", 443)),
                 ..ScoreSelectionContext::aggregate(SelectionNetwork::Udp, domain, ipver)
             };
-            let plan = manager.selection_plan_for_target_with_health_fallback(group, &context);
+            let plan =
+                manager.selection_plan_for_target_with_health_fallback(group, &context, None);
             assert_eq!(
                 plan.entries
                     .iter()
@@ -463,7 +464,7 @@ fn selector_udp_health_family_fallback_keeps_the_selected_member() {
             .entries
             .is_empty()
     );
-    let plan = manager.selection_plan_for_target_with_health_fallback("selector", &context);
+    let plan = manager.selection_plan_for_target_with_health_fallback("selector", &context, None);
     assert_eq!(plan.health_family, IpVersion::V4);
     assert_eq!(
         plan.entries
@@ -700,7 +701,7 @@ fn nested_final_waits_for_ipv4_proxy_health_before_direct() {
             IpVersion::V6,
         )
     };
-    let plan = manager.selection_plan_for_target_with_health_fallback("parent", &context);
+    let plan = manager.selection_plan_for_target_with_health_fallback("parent", &context, None);
     assert_eq!(plan.health_family, IpVersion::V4);
     assert_eq!(plan.entries[0].node.id, nodes[0].id);
     assert_eq!(
@@ -710,7 +711,7 @@ fn nested_final_waits_for_ipv4_proxy_health_before_direct() {
     for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
         alive.report_unavailable_forced(nodes[0].id, domain, IpVersion::V4);
     }
-    let plan = manager.selection_plan_for_target_with_health_fallback("parent", &context);
+    let plan = manager.selection_plan_for_target_with_health_fallback("parent", &context, None);
     assert_eq!(plan.entries[0].node.id, honk_config::config::DIRECT_NODE_ID);
     assert_eq!(
         plan.entries[0].selection_chain,

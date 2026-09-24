@@ -1,12 +1,11 @@
-use super::evidence::evidence_decay;
+use super::evidence::{CellStamp, evidence_decay};
 use super::{
     AggregateKey, ExactKey, MIN_TRAINED_EVIDENCE, MetricSnapshot, PERFORMANCE_SWITCH_MARGIN,
-    PerformanceBaseline, PerformanceSnapshot, RELIABILITY_CLOSE, REVALIDATION_INTERVAL,
-    RankedSelection, SCORE_EXPLORATION_MAX_PERIOD, SCORE_EXPLORATION_MIN_PERIOD,
+    PerformanceBaseline, PerformanceSnapshot, RELIABILITY_CLOSE, RankedSelection,
     SCORE_EXPLORE_BACKOFF_BASE, SCORE_EXPLORE_BACKOFF_MAX, SCORE_FAIL_STREAK_EXCLUDE,
     SCORE_SWITCH_FULL_EVIDENCE, ScoreAuthority, ScorePolicyState, ScoreSelectionContext,
     ScoreSnapshot, SelectionCadence, SelectionCadenceKey, SelectionHistoryKey, SelectionReason,
-    SelectionReasonKey, StateInner, Stats,
+    SelectionReasonKey, StateInner, Stats, budget, comparison,
 };
 use honk_config::node::Node;
 use std::sync::Arc;
@@ -19,43 +18,132 @@ pub(super) fn explore_backoff(streak: u32) -> Duration {
         .min(SCORE_EXPLORE_BACKOFF_MAX)
 }
 
-pub(super) fn exploration_target(candidate_count: usize) -> usize {
-    if candidate_count <= 4 {
-        candidate_count
-    } else {
-        (((candidate_count as f64).sqrt().ceil() as usize) + 1).min(candidate_count)
-    }
+pub(super) struct Decision {
+    pub scores: Vec<ScoreSnapshot>,
+    pub evidence: Vec<super::verification::VerificationEvidence>,
+    pub pairs: comparison::PairCohort,
+    pub baseline: PerformanceBaseline,
+    pub ordinary: RankedSelection,
+    pub evaluation: Option<super::evaluation::EvaluationSet>,
+    pub membership: super::evaluation::Membership,
 }
 
-pub(super) fn exploration_period(candidate_count: usize) -> u64 {
-    (candidate_count as u64)
-        .saturating_mul(2)
-        .clamp(SCORE_EXPLORATION_MIN_PERIOD, SCORE_EXPLORATION_MAX_PERIOD)
+pub(super) fn decision(
+    inner: &StateInner,
+    group: &str,
+    context: &ScoreSelectionContext,
+    nodes: &[&Node],
+    now: Instant,
+    apply: bool,
+) -> Decision {
+    let view = comparison::View::new(inner, group, context, nodes, now);
+    let (mut decision, evaluation) = ordinary_decision(&view, apply);
+    if decision.ordinary.index != decision.pairs.reference {
+        // The winner is always covered, even when it was outside the stored set.
+        decision.membership = evaluation.membership(
+            nodes,
+            decision.ordinary.index,
+            decision.baseline.any_qualified,
+        );
+        decision.pairs = view.pairs(
+            (&decision.scores, decision.baseline),
+            (&decision.membership, decision.ordinary.index),
+        );
+    }
+    view.join(&mut decision.pairs, &decision.membership);
+    decision.evidence = view.node_evidence(&decision.scores, &decision.membership.evaluated);
+    decision.evaluation = apply.then(|| evaluation.into_owned());
+    decision
+}
+
+/// The ordinary choice alone: no verification evidence, and pairs stay bound to the incumbent.
+fn ordinary_decision<'a>(
+    view: &comparison::View<'a>,
+    apply: bool,
+) -> (
+    Decision,
+    std::borrow::Cow<'a, super::evaluation::EvaluationSet>,
+) {
+    let (inner, group, context, nodes, now) =
+        (view.inner, view.group, view.context, view.nodes, view.now);
+    let scores = score_snapshots(inner, group, context, nodes.iter().map(|node| node.id), now);
+    let baseline = performance_baseline(&scores);
+    let incumbent = inner
+        .selection_history
+        .peek(&SelectionHistoryKey::new(group, context))
+        .filter(|history| history.selections > 0)
+        .and_then(|history| nodes.iter().position(|node| node.id == history.current));
+    let reference = incumbent.unwrap_or_else(|| best_index(&scores, nodes, baseline).index);
+    let evaluation = super::evaluation::derive(
+        inner
+            .evaluation
+            .get(&SelectionReasonKey::new(group, context.network)),
+        nodes,
+        &scores,
+        baseline,
+        now,
+        apply,
+    );
+    let membership = evaluation.membership(nodes, reference, baseline.any_qualified);
+    let pairs = view.pairs((&scores, baseline), (&membership, reference));
+    let ordinary = ordinary_selection(&scores, nodes, incumbent, baseline, &pairs);
+    (
+        Decision {
+            scores,
+            evidence: Vec::new(),
+            pairs,
+            baseline,
+            ordinary,
+            evaluation: None,
+            membership,
+        },
+        evaluation,
+    )
 }
 
 impl ScorePolicyState {
     pub(in crate::group) fn rank(
-        &self,
+        self: &Arc<Self>,
         authority: &Arc<ScoreAuthority>,
         group: &str,
         context: &ScoreSelectionContext,
         nodes: &[&Node],
-    ) -> usize {
-        self.rank_inner(Some(authority), group, context, nodes, Instant::now(), true)
+        allow_trials: bool,
+    ) -> (usize, Option<Arc<budget::Work>>) {
+        self.rank_inner(
+            Some(authority),
+            group,
+            context,
+            nodes,
+            Instant::now(),
+            allow_trials,
+        )
     }
 
     pub(in crate::group) fn peek_rank(
-        &self,
+        self: &Arc<Self>,
         group: &str,
         context: &ScoreSelectionContext,
         nodes: &[&Node],
     ) -> usize {
         self.rank_inner(None, group, context, nodes, Instant::now(), false)
+            .0
+    }
+
+    #[cfg(test)]
+    pub(super) fn peek_rank_at(
+        self: &Arc<Self>,
+        group: &str,
+        context: &ScoreSelectionContext,
+        nodes: &[&Node],
+        now: Instant,
+    ) -> usize {
+        self.rank_inner(None, group, context, nodes, now, false).0
     }
 
     #[cfg(test)]
     pub(super) fn rank_at(
-        &self,
+        self: &Arc<Self>,
         group: &str,
         context: &ScoreSelectionContext,
         nodes: &[&Node],
@@ -68,100 +156,119 @@ impl ScorePolicyState {
             .clone()
             .unwrap_or_else(|| Arc::new(ScoreAuthority));
         self.rank_inner(Some(&authority), group, context, nodes, now, true)
+            .0
+    }
+
+    #[cfg(test)]
+    pub(super) fn rank_plan_at(
+        self: &Arc<Self>,
+        group: &str,
+        context: &ScoreSelectionContext,
+        nodes: &[&Node],
+        now: Instant,
+    ) -> (usize, super::ScoreAttempt) {
+        let authority = self
+            .inner
+            .lock()
+            .active_authority
+            .clone()
+            .expect("published test membership");
+        let (index, reservation) =
+            self.rank_inner(Some(&authority), group, context, nodes, now, true);
+        let feedback = super::ScoreAttempt::planned(
+            super::ScoreFeedback::new(
+                Arc::clone(self),
+                authority,
+                context.clone(),
+                vec![super::ScoreAttribution {
+                    group: group.to_owned(),
+                    node_id: nodes[index].id,
+                }],
+            ),
+            Arc::new(budget::Opportunity::default()),
+            reservation.into_iter().collect(),
+            super::ScoreTrialSource::None,
+        );
+        (index, feedback)
     }
 
     fn rank_inner(
-        &self,
+        self: &Arc<Self>,
         authority: Option<&Arc<ScoreAuthority>>,
         group: &str,
         context: &ScoreSelectionContext,
         nodes: &[&Node],
         now: Instant,
-        apply: bool,
-    ) -> usize {
+        allow_trials: bool,
+    ) -> (usize, Option<Arc<budget::Work>>) {
         if nodes.is_empty() {
-            return 0;
+            return (0, None);
         }
         let mut inner = self.inner.lock();
-        let authorized = apply
-            && authority.is_some_and(|authority| {
-                inner
-                    .active_authority
-                    .as_ref()
-                    .is_some_and(|active| Arc::ptr_eq(active, authority))
-            })
-            && inner.valid_groups.contains(group);
-        let snapshots: Vec<_> = nodes
-            .iter()
-            .map(|node| score_snapshot(&inner, group, context, node.id, now))
-            .collect();
-        let performance = performance_baseline(&snapshots);
-        let cadence_key = SelectionCadenceKey::new(group, context);
-        let history_key = SelectionHistoryKey::new(group, context);
-        let incumbent = inner
-            .selection_history
-            .peek(&history_key)
-            .filter(|history| history.selections > 0)
-            .and_then(|history| nodes.iter().position(|node| node.id == history.current));
-        let (selection_count, due) = if authorized {
-            let cadence =
-                inner
-                    .selection_counts
-                    .entry(cadence_key.clone())
-                    .or_insert(SelectionCadence {
-                        count: 0,
-                        revalidated_count: 0,
-                        revalidated_at: now,
-                        validation_node: None,
-                        validation_attempts: 0,
-                    });
-            cadence.count = cadence.count.saturating_add(1);
-            let elapsed_count = cadence.count.saturating_sub(cadence.revalidated_count);
-            let degraded = incumbent
-                .and_then(|index| snapshots[index].degraded_at)
-                .is_some_and(|at| at > cadence.revalidated_at);
-            let due = elapsed_count >= exploration_period(nodes.len())
-                || now.saturating_duration_since(cadence.revalidated_at) >= REVALIDATION_INTERVAL
-                || (degraded && elapsed_count >= SCORE_EXPLORATION_MIN_PERIOD);
-            (cadence.count, due)
-        } else {
-            (
-                inner
-                    .selection_counts
-                    .get(&cadence_key)
-                    .map_or(0, |cadence| cadence.count),
-                false,
-            )
-        };
-        let ordinary = ordinary_selection(&snapshots, nodes, incumbent, performance);
+        let authorized = authority.is_some_and(|authority| {
+            inner
+                .active_authority
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, authority))
+        }) && inner.valid_groups.contains(group);
         if !authorized {
-            return ordinary.index;
+            let view = comparison::View::new(&inner, group, context, nodes, now);
+            return (ordinary_decision(&view, false).0.ordinary.index, None);
         }
+        let mut decision = decision(&inner, group, context, nodes, now, true);
+        let mut set = decision
+            .evaluation
+            .take()
+            .expect("Apply prepares membership");
+        let snapshots = &decision.scores;
+        let performance = decision.baseline;
+        let ordinary = decision.ordinary;
+        let cadence_key = SelectionCadenceKey::new(group, context);
+        set.anchor(nodes[ordinary.index].id);
+        super::validation::drop_runs_outside(&mut inner, group, context.network, &set);
+        inner
+            .evaluation
+            .insert(SelectionReasonKey::new(group, context.network), set);
+        let history_key = SelectionHistoryKey::new(group, context);
+        inner
+            .selection_counts
+            .entry(cadence_key.clone())
+            .or_insert(SelectionCadence {
+                revalidated_at: now,
+                run: None,
+            });
         let evaluation = super::verification::evaluate(
-            &snapshots,
+            &decision,
             nodes,
-            ordinary.index,
             context,
             inner.selection_counts.get(&cadence_key),
-            performance,
             now,
         );
         let mut selection = ordinary;
-        if selection_count <= exploration_target(nodes.len()) as u64 {
-            let startup = best_index(&snapshots, nodes, selection_count, true, performance);
-            if startup.reason.is_exploration() {
-                selection = startup;
-            }
+        let mut reservation = None;
+        let escaping = matches!(
+            ordinary.reason,
+            SelectionReason::IncumbentIneligible | SelectionReason::FreshFailureBypass
+        ) && inner
+            .selection_history
+            .peek(&history_key)
+            .is_some_and(|history| history.current != nodes[ordinary.index].id);
+        if escaping {
+            super::validation::cancel_run(&mut inner, &cadence_key, context);
         }
-        if due
-            && !selection.reason.is_exploration()
-            && let Some(index) = evaluation.validation_index
-            && Some(index) != incumbent.filter(|&previous| previous != ordinary.index)
-        {
-            selection = RankedSelection {
-                index,
-                reason: SelectionReason::PeriodicExplore,
-            };
+        // A bypass label alone must not starve funded validation of alternatives.
+        if allow_trials && context.target.is_some() && !escaping {
+            (selection, reservation) = super::validation::plan(
+                self,
+                &mut inner,
+                (&cadence_key, context),
+                &decision,
+                &evaluation,
+                nodes,
+                now,
+            );
+        }
+        if selection.reason.is_exploration() {
             if snapshots[ordinary.index]
                 .carrier_pressure_at
                 .is_some_and(|at| {
@@ -177,27 +284,15 @@ impl ScorePolicyState {
                     .or_default();
                 counts.carrier_validation = counts.carrier_validation.saturating_add(1);
             }
-        }
-        if selection.reason.is_exploration()
-            && let Some(cadence) = inner.selection_counts.get_mut(&cadence_key)
-        {
-            cadence.revalidated_count = selection_count;
-            cadence.revalidated_at = now;
-            let node_id = nodes[selection.index].id;
-            if cadence.validation_node == Some(node_id) {
-                cadence.validation_attempts = cadence.validation_attempts.saturating_add(1);
-            } else if cadence.validation_node.is_none()
-                || selection.reason != SelectionReason::ColdExplore
-            {
-                cadence.validation_node = Some(node_id);
-                cadence.validation_attempts = 1;
+            if let Some(cadence) = inner.selection_counts.get_mut(&cadence_key) {
+                cadence.revalidated_at = now;
             }
         }
         Self::record_verification(
             &mut inner,
             &history_key,
             nodes[ordinary.index].id,
-            super::verification::usable(&snapshots[selection.index]),
+            super::verification::usable(&decision.evidence[selection.index]),
             selection.reason.is_exploration(),
             &evaluation,
             now,
@@ -228,10 +323,26 @@ impl ScorePolicyState {
                 selection.reason,
             );
         }
-        inner.tick = inner.tick.saturating_add(1);
-        let tick = inner.tick;
-        mark_selected(&mut inner, group, context, nodes[selection.index].id, tick);
-        selection.index
+        (selection.index, reservation)
+    }
+}
+
+/// An admitted begin, not a plan, is a real opportunity; one tick covers every attribution.
+pub(super) fn advance_rotation(
+    inner: &mut StateInner,
+    context: &ScoreSelectionContext,
+    attributions: &[super::ScoreAttribution],
+) {
+    inner.tick = inner.tick.saturating_add(1);
+    let tick = inner.tick;
+    for attribution in attributions {
+        mark_selected(
+            inner,
+            &attribution.group,
+            context,
+            attribution.node_id,
+            tick,
+        );
     }
 }
 
@@ -240,9 +351,10 @@ pub(super) fn ordinary_selection(
     nodes: &[&Node],
     incumbent: Option<usize>,
     performance: PerformanceBaseline,
+    pairs: &comparison::PairCohort,
 ) -> RankedSelection {
-    let best = best_index(snapshots, nodes, 0, false, performance);
-    let Some(index) = incumbent.filter(|&index| index != best.index) else {
+    let best = best_index(snapshots, nodes, performance);
+    let Some(index) = incumbent else {
         return best;
     };
     let current = &snapshots[index];
@@ -264,17 +376,28 @@ pub(super) fn ordinary_selection(
     let margin = switch_margin(current.completed);
     let mut promoted = None;
     let mut best_has_comparison = false;
-    // Compare every challenger with the same incumbent, not a pairwise tournament.
+    let mut directional_tradeoff = false;
+    // Only pairs prepared against this fixed incumbent may compete.
     for (candidate_index, candidate) in snapshots.iter().enumerate() {
         if candidate_index == index
             || !normal_eligible(candidate, performance)
             || candidate.completed < MIN_TRAINED_EVIDENCE
+            || pairs.reference != index
         {
             continue;
         }
-        let (gain, comparable) = promotion_gain(current, candidate);
-        if candidate_index == best.index {
-            best_has_comparison = comparable;
+        let Some(pair) = pairs.get(candidate_index) else {
+            continue;
+        };
+        let result = promotion_result(
+            pair,
+            (current.qualified(), candidate.qualified()),
+            (current.observed_reliability, candidate.observed_reliability),
+        );
+        let gain = result.gain;
+        directional_tradeoff |= result.directional_tradeoff;
+        if candidate_index == best.index || best.index == index {
+            best_has_comparison |= result.comparable;
         }
         if gain >= margin
             && gain > 0.0
@@ -291,7 +414,9 @@ pub(super) fn ordinary_selection(
     } else {
         RankedSelection {
             index,
-            reason: if best_has_comparison {
+            reason: if directional_tradeoff {
+                SelectionReason::DirectionalTradeoffHeld
+            } else if best_has_comparison {
                 SelectionReason::IncumbentHeld
             } else {
                 SelectionReason::InsufficientEvidenceHeld
@@ -303,34 +428,8 @@ pub(super) fn ordinary_selection(
 pub(super) fn best_index(
     snapshots: &[ScoreSnapshot],
     nodes: &[&Node],
-    selection_count: u64,
-    explore: bool,
     performance: PerformanceBaseline,
 ) -> RankedSelection {
-    // The startup allowance is coarse-scope and finite. Cancellation, a new
-    // target or an evicted exact cell cannot mint another startup allowance.
-    if explore
-        && snapshots.len() > 1
-        && selection_count <= exploration_target(snapshots.len()) as u64
-        && let Some((index, _)) = snapshots
-            .iter()
-            .enumerate()
-            .filter(|(_, score)| {
-                score.completed < MIN_TRAINED_EVIDENCE && !score.explore_backed_off
-            })
-            .min_by(|(left_index, left), (right_index, right)| {
-                left.attempts
-                    .total_cmp(&right.attempts)
-                    .then_with(|| super::verification::untried_hint(left, right))
-                    .then_with(|| left.selected_at.cmp(&right.selected_at))
-                    .then_with(|| left_index.cmp(right_index))
-            })
-    {
-        return RankedSelection {
-            index,
-            reason: SelectionReason::ColdExplore,
-        };
-    }
     let index = snapshots
         .iter()
         .enumerate()
@@ -361,6 +460,9 @@ pub(super) fn normal_eligible(score: &ScoreSnapshot, baseline: PerformanceBaseli
     if baseline.any_healthy && score.fail_streak >= SCORE_FAIL_STREAK_EXCLUDE {
         return false;
     }
+    if score.recovered_qualification && !score.unresolved_failure {
+        return true;
+    }
     if baseline.any_qualified {
         score.qualified()
             && score.reliability_upper + RELIABILITY_CLOSE >= baseline.best_reliability
@@ -376,67 +478,58 @@ pub(super) fn switch_margin(completed: f64) -> f64 {
     0.05 * PERFORMANCE_SWITCH_MARGIN * (completed / SCORE_SWITCH_FULL_EVIDENCE).clamp(0.0, 1.0)
 }
 
-fn qualified_pair(left: MetricSnapshot, right: MetricSnapshot) -> Option<(f64, f64)> {
-    if left.confidence < 1.0 || right.confidence < 1.0 {
-        return None;
-    }
-    Some((left.value?, right.value?))
+#[derive(Clone, Copy, Default)]
+pub(super) struct PromotionResult {
+    pub gain: f64,
+    pub comparable: bool,
+    pub directional_tradeoff: bool,
 }
 
-fn performance_pair(
-    incumbent: &ScoreSnapshot,
-    candidate: &ScoreSnapshot,
-    metric: fn(&PerformanceSnapshot) -> MetricSnapshot,
-) -> Option<(f64, f64)> {
-    qualified_pair(
-        metric(&incumbent.target_performance),
-        metric(&candidate.target_performance),
-    )
-    .or_else(|| {
-        qualified_pair(
-            metric(&incumbent.performance),
-            metric(&candidate.performance),
-        )
-    })
-}
-
-fn promotion_gain(incumbent: &ScoreSnapshot, candidate: &ScoreSnapshot) -> (f64, bool) {
-    let latency = performance_pair(incumbent, candidate, |metrics| metrics.response)
-        .or_else(|| {
-            (incumbent.probe_scope == candidate.probe_scope)
-                .then(|| qualified_pair(incumbent.probe, candidate.probe))
-                .flatten()
-        })
-        .or_else(|| performance_pair(incumbent, candidate, |metrics| metrics.setup))
-        .or_else(|| qualified_pair(incumbent.warm_setup, candidate.warm_setup));
-    let mut comparable = latency.is_some();
-    let latency_gain = latency.map_or(0.0, |(left, right)| {
-        let best = left.min(right).max(1.0);
-        (best / right.max(1.0)).min(1.0) - (best / left.max(1.0)).min(1.0)
+pub(super) fn promotion_result(
+    pair: comparison::PairEvidence,
+    qualified: (bool, bool),
+    reliability: (f64, f64),
+) -> PromotionResult {
+    let latency_gain = pair.response.map_or(0.0, |metric| {
+        let best = metric.incumbent.min(metric.candidate).max(1.0);
+        (best / metric.candidate.max(1.0)).min(1.0) - (best / metric.incumbent.max(1.0)).min(1.0)
     });
-    let mut incumbent_rate = 0.0_f64;
-    let mut candidate_rate = 0.0_f64;
-    for pair in [
-        performance_pair(incumbent, candidate, |metrics| metrics.upload),
-        performance_pair(incumbent, candidate, |metrics| metrics.download),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        comparable = true;
-        let best = pair.0.max(pair.1).max(1.0);
-        incumbent_rate = incumbent_rate.max((pair.0 / best).clamp(0.0, 1.0));
-        candidate_rate = candidate_rate.max((pair.1 / best).clamp(0.0, 1.0));
+    let mut improved = false;
+    let mut regressed = false;
+    let mut directional_gain = 0.0_f64;
+    for metric in [pair.upload, pair.download].into_iter().flatten() {
+        improved |=
+            metric.candidate - metric.incumbent >= metric.incumbent * PERFORMANCE_SWITCH_MARGIN;
+        regressed |=
+            metric.incumbent - metric.candidate > metric.incumbent * PERFORMANCE_SWITCH_MARGIN;
+        directional_gain = directional_gain.max(
+            (metric.candidate - metric.incumbent) / metric.candidate.max(metric.incumbent).max(1.0),
+        );
     }
-    let reliability_gain = if incumbent.qualified() && candidate.qualified() {
-        candidate.observed_reliability - incumbent.observed_reliability
+    let qualified = qualified.0 && qualified.1;
+    let response_guard = pair.response.is_some_and(|metric| {
+        metric.candidate - metric.incumbent <= metric.incumbent * PERFORMANCE_SWITCH_MARGIN
+    });
+    let reliability_gain = if qualified {
+        reliability.1 - reliability.0
     } else {
         0.0
     };
-    (
-        reliability_gain + 0.03 * latency_gain + 0.02 * (candidate_rate - incumbent_rate),
-        comparable,
-    )
+    let throughput_gain = if improved
+        && !regressed
+        && response_guard
+        && qualified
+        && reliability.1 >= reliability.0
+    {
+        directional_gain
+    } else {
+        0.0
+    };
+    PromotionResult {
+        gain: reliability_gain + 0.03 * latency_gain + 0.02 * throughput_gain,
+        comparable: pair.response.is_some() || pair.upload.is_some() || pair.download.is_some(),
+        directional_tradeoff: improved && regressed,
+    }
 }
 
 fn mark_selected(
@@ -481,6 +574,7 @@ fn mark_selected(
     }
 }
 
+#[cfg(test)]
 pub(super) fn score_snapshot(
     inner: &StateInner,
     group: &str,
@@ -488,94 +582,138 @@ pub(super) fn score_snapshot(
     node_id: Uuid,
     now: Instant,
 ) -> ScoreSnapshot {
-    let layer = |family| {
-        inner.aggregate.peek(&AggregateKey {
-            group: group.to_string(),
-            network: context.network,
-            family,
-            node_id,
-        })
+    score_snapshots(inner, group, context, [node_id], now).remove(0)
+}
+
+pub(super) fn score_snapshots(
+    inner: &StateInner,
+    group: &str,
+    context: &ScoreSelectionContext,
+    nodes: impl IntoIterator<Item = Uuid>,
+    now: Instant,
+) -> Vec<ScoreSnapshot> {
+    let mut layer = AggregateKey {
+        group: group.to_owned(),
+        network: context.network,
+        family: None,
+        node_id: Uuid::nil(),
     };
-    let global_stats = layer(None);
-    let mut score = global_stats.map_or_else(
-        || snapshot(&Stats::default(), now),
-        |stats| snapshot(stats, now),
-    );
-    if let Some(stats) = context.target_family.and_then(|family| layer(Some(family))) {
-        let family = snapshot(stats, now);
-        let weight = (family.useful_completed / SCORE_SWITCH_FULL_EVIDENCE).clamp(0.0, 1.0);
-        score.reliability = blend(score.reliability, family.reliability, weight);
-        score.reliability_upper = blend(score.reliability_upper, family.reliability_upper, weight);
-        score.observed_reliability = blend(
-            score.observed_reliability,
-            family.observed_reliability,
-            weight,
-        );
-        score.completed = score.completed.max(family.completed);
-        score.useful_completed = score.useful_completed.max(family.useful_completed);
-        score.qualification_retained |= family.qualification_retained;
-        score.attempts = score.attempts.max(family.attempts);
-        score.performance = prefer_specific(score.performance, family.performance);
-        score.unresolved_failure |= family.unresolved_failure;
-        score.fail_streak = score.fail_streak.max(family.fail_streak);
-        score.explore_backed_off |= family.explore_backed_off;
-        score.selected_at = score.selected_at.max(family.selected_at);
-        score.last_attempt = score.last_attempt.max(family.last_attempt);
-        score.degraded_at = score.degraded_at.max(family.degraded_at);
-    }
-    // Proxy health-family and probe protocol are independent of target family.
-    if let Some(stats) = global_stats {
-        let probe = &stats.probes[super::evidence::probe_slot(context)];
-        score.probe = probe.latency.snapshot(now);
-        score.probe_scope = probe.scope;
-        // The filter family is not the socket selected by a dual-stack dial.
-        // A carrier hint asks a node-wide question; it is not target performance.
-        score.carrier_pressure_at = stats
-            .carrier_pressure
-            .iter()
-            .flatten()
-            .filter(|pressure| {
-                now.saturating_duration_since(pressure.observed_at) < super::CARRIER_PRESSURE_TTL
-            })
-            .map(|pressure| pressure.observed_at)
-            .max();
-    }
-    if let (Some(family), Some(target)) = (context.target_family, context.target.as_ref())
-        && let Some(stats) = inner.exact.peek(&ExactKey {
-            group: group.to_string(),
+    let mut exact = context
+        .target_family
+        .zip(context.target.clone())
+        .map(|(family, target)| ExactKey {
+            group: group.to_owned(),
             network: context.network,
             family,
-            target: target.clone(),
-            node_id,
+            target,
+            node_id: Uuid::nil(),
+        });
+    let scoped = |stamp: CellStamp<'_>| {
+        let stats = stamp.stats;
+        let mut value = snapshot(stats, now);
+        if stamp.invalidated_through > stats.business_invalidated_through {
+            value.performance = PerformanceSnapshot::default();
+            value.qualified_until = None;
+            value.recovered_qualification = false;
+        }
+        value
+    };
+    nodes
+        .into_iter()
+        .map(|node_id| {
+            layer.node_id = node_id;
+            layer.family = None;
+            let global_stats = inner.aggregate.peek(&layer);
+            let mut score = global_stats.map_or_else(
+                || snapshot(&Stats::default(), now),
+                |stats| snapshot(stats, now),
+            );
+            score.node_failure = score.unresolved_failure;
+            let family_stats = context.target_family.and_then(|family| {
+                layer.family = Some(family);
+                inner.aggregate.peek(&layer)
+            });
+            if let Some(stamp) =
+                family_stats.and_then(|stats| CellStamp::current(stats, global_stats))
+            {
+                let family = scoped(stamp);
+                let weight = (family.useful_completed / SCORE_SWITCH_FULL_EVIDENCE).clamp(0.0, 1.0);
+                score.reliability = blend(score.reliability, family.reliability, weight);
+                score.reliability_upper =
+                    blend(score.reliability_upper, family.reliability_upper, weight);
+                score.observed_reliability = blend(
+                    score.observed_reliability,
+                    family.observed_reliability,
+                    weight,
+                );
+                score.completed = score.completed.max(family.completed);
+                score.useful_completed = score.useful_completed.max(family.useful_completed);
+                score.qualified_until = score.qualified_until.max(family.qualified_until);
+                score.recovered_qualification |= family.recovered_qualification;
+                score.attempts = score.attempts.max(family.attempts);
+                score.performance = prefer_specific(score.performance, family.performance);
+                score.unresolved_failure |= family.unresolved_failure;
+                score.fail_streak = score.fail_streak.max(family.fail_streak);
+                score.explore_backed_off |= family.explore_backed_off;
+                score.selected_at = score.selected_at.max(family.selected_at);
+                score.last_attempt = score.last_attempt.max(family.last_attempt);
+            }
+            // Proxy health-family and probe protocol are independent of target family.
+            if let Some(stats) = global_stats {
+                let probe = &stats.probes[super::evidence::probe_slot(context)];
+                score.probe = probe.latency.snapshot(now);
+                score.probe_scope = probe.scope;
+                // The filter family is not the socket selected by a dual-stack dial.
+                // A carrier hint asks a node-wide question; it is not target performance.
+                score.carrier_pressure_at = stats
+                    .carrier_pressure
+                    .iter()
+                    .flatten()
+                    .filter(|pressure| {
+                        now.saturating_duration_since(pressure.observed_at)
+                            < super::CARRIER_PRESSURE_TTL
+                    })
+                    .map(|pressure| pressure.observed_at)
+                    .max();
+            }
+            if context.target.is_some() {
+                score.recovered_qualification = false;
+            }
+            let exact_stats = exact.as_mut().and_then(|key| {
+                key.node_id = node_id;
+                inner.exact.peek(key)
+            });
+            if let Some(stats) = exact_stats
+                && let Some(stamp) = CellStamp::current(stats, global_stats)
+            {
+                let exact = scoped(stamp);
+                let weight = (exact.useful_completed / SCORE_SWITCH_FULL_EVIDENCE).clamp(0.0, 1.0);
+                score.reliability = blend(score.reliability, exact.reliability, weight);
+                score.reliability_upper =
+                    blend(score.reliability_upper, exact.reliability_upper, weight);
+                score.observed_reliability = blend(
+                    score.observed_reliability,
+                    exact.observed_reliability,
+                    weight,
+                );
+                score.completed = score.completed.max(exact.completed);
+                score.useful_completed = score.useful_completed.max(exact.useful_completed);
+                score.qualified_until = score.qualified_until.max(exact.qualified_until);
+                score.recovered_qualification = exact.recovered_qualification;
+                score.target_performance = exact.performance;
+                score.unresolved_failure |= exact.unresolved_failure;
+                score.fail_streak = score.fail_streak.max(exact.fail_streak);
+                score.target_failure = exact.fail_streak > 0
+                    && stats.failed_at > global_stats.and_then(|global| global.failed_at);
+                score.explore_backed_off |= exact.explore_backed_off;
+                score.selected_at = score.selected_at.max(exact.selected_at);
+                score.degraded_at = score.degraded_at.max(exact.degraded_at);
+            }
+            score.degraded_at = score.degraded_at.max(score.carrier_pressure_at);
+            score.recovered_qualification &= !score.unresolved_failure;
+            score
         })
-    {
-        score.verification = super::verification::VerificationEvidence::new(stats, now);
-        let exact = snapshot(stats, now);
-        let weight = (exact.useful_completed / SCORE_SWITCH_FULL_EVIDENCE).clamp(0.0, 1.0);
-        score.reliability = blend(score.reliability, exact.reliability, weight);
-        score.reliability_upper = blend(score.reliability_upper, exact.reliability_upper, weight);
-        score.observed_reliability = blend(
-            score.observed_reliability,
-            exact.observed_reliability,
-            weight,
-        );
-        score.completed = score.completed.max(exact.completed);
-        score.useful_completed = score.useful_completed.max(exact.useful_completed);
-        score.qualification_retained |= exact.qualification_retained;
-        score.target_performance = exact.performance;
-        score.unresolved_failure |= exact.unresolved_failure;
-        score.fail_streak = score.fail_streak.max(exact.fail_streak);
-        score.explore_backed_off |= exact.explore_backed_off;
-        score.selected_at = score.selected_at.max(exact.selected_at);
-        score.degraded_at = score.degraded_at.max(exact.degraded_at);
-    }
-    if context.target.is_none() {
-        score.verification = layer(context.target_family)
-            .map(|stats| super::verification::VerificationEvidence::new(stats, now))
-            .unwrap_or_default();
-    }
-    score.degraded_at = score.degraded_at.max(score.carrier_pressure_at);
-    score
+        .collect()
 }
 
 pub(super) fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
@@ -589,7 +727,11 @@ pub(super) fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
         attempts: stats.attempts * factor,
         completed: stats.completed() * factor,
         useful_completed: stats.useful_completed() * factor,
-        qualification_retained: stats.qualified_until.is_some_and(|until| now < until),
+        qualified_until: stats.qualified_until.filter(|until| now < *until),
+        recovered_qualification: stats.failed_at.is_some()
+            && stats.fail_streak == 0
+            && stats.availability.reporters >= super::PERFORMANCE_VALIDATION_SAMPLES as u8
+            && stats.qualified_until.is_some_and(|until| now < until),
         reliability,
         reliability_upper,
         observed_reliability: if observations > 0.0 {
@@ -599,11 +741,7 @@ pub(super) fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
         },
         performance: stats.performance.snapshot(now),
         warm_setup: stats.warm_setup_ms.snapshot(now),
-        unresolved_failure: stats.failed_at.is_some_and(|failure| {
-            stats
-                .last_business_rx_at
-                .is_none_or(|success| success <= failure)
-        }),
+        unresolved_failure: stats.fail_streak > 0,
         explore_backed_off: stats.explore_not_before.is_some_and(|until| until > now),
         degraded_at: stats
             .degraded_at
@@ -709,7 +847,6 @@ pub(super) fn performance_baseline(snapshots: &[ScoreSnapshot]) -> PerformanceBa
                     },
                 )),
                 confidence: 1.0,
-                observed_at: None,
             },
             _ => MetricSnapshot::default(),
         }

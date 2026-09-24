@@ -369,7 +369,7 @@ async fn unaccepted_source_send_cannot_reconcile_delivered_reply() {
                 drivers.push(driver);
             } else {
                 if disposition == "failed" {
-                    owner.fail(ScoreOutcome::Io(io::ErrorKind::ConnectionReset));
+                    owner.fail(ScoreOutcome::NodeFailure);
                 } else {
                     endpoint.kill();
                 }

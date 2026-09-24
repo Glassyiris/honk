@@ -4,7 +4,9 @@ use honk_config::node::Node;
 use honk_config::types::DnsProtocol;
 use honk_outbound::alive::{IpVersion, ProbeDomain};
 use honk_outbound::group::GroupManager;
-use honk_outbound::group::{ScoreFeedback, ScoreSelectionContext, ScoreTarget, SelectionNetwork};
+use honk_outbound::group::{
+    ScoreAttempt, ScoreContinuation, ScoreSelectionContext, ScoreTarget, SelectionNetwork,
+};
 use tracing::{debug, warn};
 
 use super::UpstreamPool;
@@ -14,7 +16,7 @@ use crate::routing::ConnectionInfo;
 pub(super) struct DnsDialRoute {
     pub(super) target: SocketAddr,
     pub(super) node: Option<Node>,
-    pub(super) feedback: Option<ScoreFeedback>,
+    pub(super) feedback: Option<ScoreAttempt>,
 }
 
 pub(super) fn target_context(entry: &UpstreamEntry, target: SocketAddr) -> ScoreSelectionContext {
@@ -61,10 +63,15 @@ fn select_group_leaf_for_target(
     outbound: &str,
     entry: &UpstreamEntry,
     target: SocketAddr,
-) -> Option<(Node, Option<ScoreFeedback>)> {
+    original: Option<&ScoreContinuation>,
+) -> Option<(Node, Option<ScoreAttempt>)> {
     group_manager.get_group_policy(outbound)?;
     group_manager
-        .selection_plan_for_target_with_health_fallback(outbound, &target_context(entry, target))
+        .selection_plan_for_target_with_health_fallback(
+            outbound,
+            &target_context(entry, target),
+            original,
+        )
         .entries
         .into_iter()
         .next()
@@ -77,14 +84,15 @@ impl UpstreamPool {
         outbound: &str,
         entry: &UpstreamEntry,
         target: SocketAddr,
-    ) -> (Option<Node>, Option<ScoreFeedback>) {
+        original: Option<&ScoreContinuation>,
+    ) -> (Option<Node>, Option<ScoreAttempt>) {
         if outbound.eq_ignore_ascii_case("direct") {
             return (None, None);
         }
 
         if let Some(group_manager) = self.group_manager_snapshot.read().as_ref() {
             if let Some((node, feedback)) =
-                select_group_leaf_for_target(group_manager, outbound, entry, target)
+                select_group_leaf_for_target(group_manager, outbound, entry, target, original)
             {
                 return (Some(node), feedback);
             }
@@ -95,7 +103,7 @@ impl UpstreamPool {
             let group_manager = cell.read();
             if group_manager.get_group_policy(outbound).is_some() {
                 if let Some((node, feedback)) =
-                    select_group_leaf_for_target(&group_manager, outbound, entry, target)
+                    select_group_leaf_for_target(&group_manager, outbound, entry, target, original)
                 {
                     return (Some(node), feedback);
                 }
@@ -126,11 +134,13 @@ impl UpstreamPool {
         &self,
         entry: &UpstreamEntry,
         route: &DnsDialRoute,
-    ) -> Option<ScoreFeedback> {
+    ) -> anyhow::Result<Option<ScoreAttempt>> {
         route
             .feedback
             .clone()
             .map(|feedback| feedback.with_context(tcp_target_context(entry, route.target)))
+            .transpose()
+            .map_err(Into::into)
     }
     #[cfg(test)]
     pub(super) async fn resolve_dial_route(
@@ -138,19 +148,21 @@ impl UpstreamPool {
         entry: &UpstreamEntry,
     ) -> anyhow::Result<DnsDialRoute> {
         let target = Self::resolve_udp_addr(entry).await?;
-        self.resolve_dial_route_for_address(entry, target).await
+        self.resolve_dial_route_for_address(entry, target, None)
+            .await
     }
 
     pub(super) async fn resolve_dial_route_for_address(
         &self,
         entry: &UpstreamEntry,
         target: SocketAddr,
+        original: Option<&ScoreContinuation>,
     ) -> anyhow::Result<DnsDialRoute> {
         if let Some(tag) = entry.outbound.as_deref() {
             if tag.eq_ignore_ascii_case("block") {
                 anyhow::bail!("DNS upstream outbound 'block' rejected the dial");
             }
-            let (node, feedback) = self.resolve_outbound_for_target(tag, entry, target);
+            let (node, feedback) = self.resolve_outbound_for_target(tag, entry, target, original);
             if node.is_none() && !tag.eq_ignore_ascii_case("direct") {
                 anyhow::bail!("DNS upstream outbound '{tag}' has no available node");
             }
@@ -215,7 +227,8 @@ impl UpstreamPool {
                 feedback: None,
             });
         }
-        let (node, feedback) = self.resolve_outbound_for_target(&outbound_name, entry, target);
+        let (node, feedback) =
+            self.resolve_outbound_for_target(&outbound_name, entry, target, original);
         if node.is_none() {
             anyhow::bail!(
                 "DNS dial route selected outbound '{outbound_name}' but no leaf node is available"

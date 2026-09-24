@@ -1,18 +1,26 @@
+pub(in crate::group) mod budget;
+mod comparison;
+mod evaluation;
 mod evidence;
 mod feedback;
 mod pressure;
 mod ranking;
-mod selection;
+pub(in crate::group) mod selection;
 #[cfg(test)]
 mod tests;
+mod validation;
 mod verification;
 
+pub use budget::ScoreBudgetCounters;
 use evidence::{MetricSnapshot, Performance, PerformanceSnapshot};
-pub use feedback::{ScoreFeedback, ScoreReporter};
+pub use feedback::{
+    ScoreAttempt, ScoreBusinessGuard, ScoreContinuation, ScoreFeedback, ScoreReporter,
+};
 pub(in crate::group) use pressure::TransportQualitySource;
 pub use verification::{
-    ScoreComparison, ScoreEvidenceBasis, ScoreEvidenceGaps, ScoreValidationAction,
-    ScoreVerificationCounters, ScoreVerificationSnapshot, ScoreVerificationState,
+    ScoreComparison, ScoreEvidenceBasis, ScoreEvidenceGaps, ScoreEvidenceQuestion,
+    ScoreLocalComparison, ScoreTrialSource, ScoreValidationAction, ScoreVerificationBlockers,
+    ScoreVerificationCounters, ScoreVerificationSnapshot, ScoreVerificationState, ScoreWaitReason,
 };
 
 use super::{
@@ -39,8 +47,8 @@ const MIN_TRAINED_EVIDENCE: f64 = 0.5;
 const SCORE_SWITCH_FULL_EVIDENCE: f64 = 8.0;
 const SCORE_SWITCH_FLAP_WINDOW: u64 = 8;
 const SELECTION_HISTORY_CAPACITY: usize = 4096;
-const SCORE_EXPLORATION_MIN_PERIOD: u64 = 16;
-const SCORE_EXPLORATION_MAX_PERIOD: u64 = 64;
+/// Original business starts that earn one optional start.
+const SCORE_EXPLORATION_PERIOD: u64 = 16;
 const SCORE_EXPLORE_BACKOFF_BASE: Duration = Duration::from_secs(5 * 60);
 const SCORE_EXPLORE_BACKOFF_MAX: Duration = Duration::from_secs(6 * 3600);
 /// Consecutive fresh failures that drop a leaf out of the reliability band
@@ -52,6 +60,7 @@ const MIN_THROUGHPUT_BYTES: u64 = 64 * 1024;
 // Experimental demand-driven bounds, not estimates of link capacity.
 const PERFORMANCE_MAX_AGE: Duration = Duration::from_secs(120);
 const MAX_THROUGHPUT_DURATION: Duration = Duration::from_secs(10);
+#[cfg(test)]
 const REVALIDATION_INTERVAL: Duration = Duration::from_secs(30);
 const PERFORMANCE_VALIDATION_SAMPLES: f64 = 4.0;
 const PERFORMANCE_SWITCH_MARGIN: f64 = 0.1;
@@ -129,6 +138,9 @@ pub enum ScoreOutcome {
     Success,
     Timeout,
     Io(io::ErrorKind),
+    TargetFailure,
+    NodeFailure,
+    SharedNodeFailure(u64),
     Rejected,
     Cancelled,
     Shutdown,
@@ -144,6 +156,12 @@ impl ScoreOutcome {
                 Self::Rejected
             };
         }
+        if crate::proxy::target_failure(error) {
+            return Self::TargetFailure;
+        }
+        if let Some(episode) = crate::proxy::node_failure_episode(error.as_ref()) {
+            return episode.map_or(Self::NodeFailure, Self::SharedNodeFailure);
+        }
         error
             .chain()
             .find_map(|source| source.downcast_ref::<io::Error>())
@@ -154,6 +172,34 @@ impl ScoreOutcome {
                     Self::Io(error.kind())
                 }
             })
+    }
+
+    pub fn from_io_error(error: &io::Error) -> Self {
+        if let Some(rejection) = crate::proxy::io_packet_rejection(error) {
+            return if rejection == crate::proxy::PacketRejection::Cancelled {
+                Self::Cancelled
+            } else {
+                Self::Rejected
+            };
+        }
+        if crate::proxy::io_target_failure(error) {
+            Self::TargetFailure
+        } else if let Some(episode) = crate::proxy::node_failure_episode(error) {
+            episode.map_or(Self::NodeFailure, Self::SharedNodeFailure)
+        } else if error.kind() == io::ErrorKind::TimedOut {
+            Self::Timeout
+        } else {
+            Self::Io(error.kind())
+        }
+    }
+
+    pub fn shared_node_failure() -> Self {
+        Self::SharedNodeFailure(crate::shared_error::next_episode())
+    }
+
+    /// A failure of the proxy carrier, whether one flow or several flows report it.
+    pub fn is_node_failure(self) -> bool {
+        matches!(self, Self::NodeFailure | Self::SharedNodeFailure(_))
     }
 }
 
@@ -192,6 +238,8 @@ struct Availability {
 #[derive(Debug, Clone, Default)]
 struct Stats {
     incarnation: u64,
+    node_incarnation: u64,
+    last_node_failure_episode: u64,
     attempts: f64,
     setup_success: f64,
     setup_failure: f64,
@@ -242,13 +290,9 @@ impl SelectionCadenceKey {
     }
 }
 
-#[derive(Clone, Copy)]
 struct SelectionCadence {
-    count: u64,
-    revalidated_count: u64,
     revalidated_at: Instant,
-    validation_node: Option<Uuid>,
-    validation_attempts: u8,
+    run: Option<validation::ValidationRun>,
 }
 
 /// Flap history is scoped to the same target the pick was ranked for:
@@ -291,6 +335,7 @@ enum SelectionReason {
     PerformanceWinner,
     IncumbentHeld,
     InsufficientEvidenceHeld,
+    DirectionalTradeoffHeld,
     IncumbentIneligible,
     FreshFailureBypass,
 }
@@ -330,6 +375,7 @@ pub struct ScoreReasonCounters {
     pub performance_winner: u64,
     pub incumbent_held: u64,
     pub insufficient_evidence_held: u64,
+    pub directional_tradeoff_held: u64,
     pub incumbent_ineligible: u64,
     pub fresh_failure_bypass: u64,
     pub dead_filtered: u64,
@@ -350,7 +396,7 @@ pub struct ScoreReasonGroupSnapshot {
     pub udp: ScoreReasonCounters,
 }
 
-/// Occupancy and eviction totals of the two bounded evidence LRUs; carries no
+/// Occupancy and eviction totals of bounded evidence stores; carries no
 /// group, node, or target identity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScoreCacheSnapshot {
@@ -358,6 +404,12 @@ pub struct ScoreCacheSnapshot {
     pub aggregate_cells: usize,
     pub exact_evictions: u64,
     pub aggregate_evictions: u64,
+    pub comparison_cells: usize,
+    pub comparison_logical_bytes: usize,
+    pub comparison_logical_capacity: usize,
+    pub comparison_evictions: u64,
+    pub comparison_expired: u64,
+    pub comparison_rejected: u64,
 }
 
 struct StateInner {
@@ -365,7 +417,11 @@ struct StateInner {
     aggregate: LruCache<AggregateKey, Stats>,
     valid: HashSet<(String, Uuid)>,
     valid_groups: HashSet<String>,
+    budgets: HashMap<SelectionCadenceKey, budget::Scope>,
+    root_business_starts: u64,
+    comparisons: comparison::Store,
     selection_counts: HashMap<SelectionCadenceKey, SelectionCadence>,
+    evaluation: HashMap<SelectionReasonKey, evaluation::EvaluationSet>,
     selection_history: LruCache<SelectionHistoryKey, SelectionHistory>,
     selection_reasons: HashMap<SelectionReasonKey, ScoreReasonCounters>,
     verification_counters: HashMap<SelectionReasonKey, ScoreVerificationCounters>,
@@ -387,7 +443,11 @@ impl Default for StateInner {
             ),
             valid: HashSet::new(),
             valid_groups: HashSet::new(),
+            budgets: HashMap::new(),
+            root_business_starts: 0,
+            comparisons: comparison::Store::default(),
             selection_counts: HashMap::new(),
+            evaluation: HashMap::new(),
             selection_history: LruCache::new(
                 // SAFE-EXPECT: the capacity is a positive compile-time constant.
                 NonZeroUsize::new(SELECTION_HISTORY_CAPACITY).expect("non-zero capacity"),
@@ -443,6 +503,12 @@ impl ScorePolicyState {
             aggregate_cells: inner.aggregate.len(),
             exact_evictions: inner.exact_evictions,
             aggregate_evictions: inner.aggregate_evictions,
+            comparison_cells: inner.comparisons.cell_count(),
+            comparison_logical_bytes: inner.comparisons.logical_bytes(),
+            comparison_logical_capacity: comparison::Store::logical_capacity_bound(),
+            comparison_evictions: inner.comparisons.evicted,
+            comparison_expired: inner.comparisons.expired,
+            comparison_rejected: inner.comparisons.rejected,
         }
     }
 
@@ -463,16 +529,27 @@ impl ScorePolicyState {
         inner.published_at = Some(now);
         inner.valid = membership.into_iter().collect();
         inner.valid_groups = groups.into_iter().collect();
+        inner.comparisons.clear();
         let StateInner {
             selection_counts,
+            evaluation,
             selection_reasons,
             verification_counters,
             selection_history,
+            budgets,
             valid,
             valid_groups,
             ..
         } = &mut *inner;
-        selection_counts.retain(|key, _| valid_groups.contains(&key.group));
+        selection_counts.clear();
+        evaluation.retain(|key, _| valid_groups.contains(&key.group));
+        for set in evaluation.values_mut() {
+            set.reset_members();
+        }
+        budgets.retain(|key, _| valid_groups.contains(&key.group));
+        for scope in budgets.values_mut() {
+            scope.invalidate_pending();
+        }
         selection_reasons.retain(|key, _| valid_groups.contains(&key.group));
         verification_counters.retain(|key, _| valid_groups.contains(&key.group));
         let invalid_history: Vec<_> = selection_history
@@ -576,6 +653,7 @@ impl ScorePolicyState {
             SelectionReason::PerformanceWinner => &mut counts.performance_winner,
             SelectionReason::IncumbentHeld => &mut counts.incumbent_held,
             SelectionReason::InsufficientEvidenceHeld => &mut counts.insufficient_evidence_held,
+            SelectionReason::DirectionalTradeoffHeld => &mut counts.directional_tradeoff_held,
             SelectionReason::IncumbentIneligible => &mut counts.incumbent_ineligible,
             SelectionReason::FreshFailureBypass => &mut counts.fresh_failure_bypass,
         };
@@ -779,7 +857,9 @@ struct ScoreSnapshot {
     reliability: f64,
     reliability_upper: f64,
     useful_completed: f64,
-    qualification_retained: bool,
+    /// End of a qualification lease still in force at the snapshot time.
+    qualified_until: Option<Instant>,
+    recovered_qualification: bool,
     performance: PerformanceSnapshot,
     target_performance: PerformanceSnapshot,
     probe: MetricSnapshot,
@@ -791,14 +871,15 @@ struct ScoreSnapshot {
     carrier_pressure_at: Option<Instant>,
     unresolved_failure: bool,
     explore_backed_off: bool,
+    node_failure: bool,
+    target_failure: bool,
     fail_streak: u32,
     selected_at: u64,
-    verification: verification::VerificationEvidence,
 }
 
 impl ScoreSnapshot {
     fn qualified(&self) -> bool {
-        self.useful_completed >= PERFORMANCE_VALIDATION_SAMPLES || self.qualification_retained
+        self.useful_completed >= PERFORMANCE_VALIDATION_SAMPLES || self.qualified_until.is_some()
     }
 }
 
@@ -821,7 +902,6 @@ struct FlowSample {
     source: ScoreSource,
     tx: u64,
     rx: u64,
-    last_rx_at: Option<Instant>,
     eligible_rx_at: Option<Instant>,
     elapsed: Duration,
     count_usefulness: bool,

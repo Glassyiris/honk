@@ -35,7 +35,7 @@ async fn write_sniff_prefix(
 type UnpackedTcpScorePlan = (
     Vec<Node>,
     SelectionPlanMode,
-    HashMap<uuid::Uuid, crate::group::ScoreFeedback>,
+    HashMap<uuid::Uuid, crate::group::ScoreAttempt>,
     HashMap<uuid::Uuid, Vec<String>>,
     HashMap<uuid::Uuid, Vec<String>>,
     IpVersion,
@@ -385,7 +385,7 @@ impl ControlPlaneHandle {
         let (
             mut candidates,
             selection_mode,
-            score_feedback,
+            mut score_feedback,
             mut selection_chains,
             final_owners,
             health_ipver,
@@ -407,6 +407,7 @@ impl ControlPlaneHandle {
         } else {
             candidates.truncate(1);
         }
+        score_feedback.retain(|id, _| candidates.iter().any(|node| node.id == *id));
 
         if candidates.is_empty() {
             warn!(
@@ -452,6 +453,19 @@ impl ControlPlaneHandle {
                 cold_urltest,
             )
             .await;
+        let original = if matches!(&raced, Ok(None))
+            && selection_mode == SelectionPlanMode::Authoritative
+            && candidates.len() == 1
+            && !runtime_generation.is_shutdown()
+        {
+            // A deadline can expire before the spawned primary begins any work.
+            score_feedback
+                .get(&candidates[0].id)
+                .and_then(|attempt| attempt.continuation().ok())
+        } else {
+            None
+        };
+        drop(score_feedback);
         let (mut proxy_stream, node, score_reporter) = match raced {
             Ok(Some(pair)) => pair,
             Err(error) => {
@@ -471,11 +485,12 @@ impl ControlPlaneHandle {
                         &generation_group_manager,
                         &outbound_name,
                         &context,
+                        original.as_ref(),
                     );
                     // URLTest retains its existing fresh retry-round budget.
                     let mut retry_deadline = tokio::time::Instant::now() + overall_dial_timeout;
                     if plan.nodes.is_empty()
-                        && score_feedback.contains_key(&failed_node)
+                        && let Some(original) = original.as_ref()
                         && tokio::time::Instant::now() < dial_deadline
                     {
                         plan = crate::control::reload::resolve_score_retry_plan_for_target(
@@ -487,10 +502,11 @@ impl ControlPlaneHandle {
                                 .get(&failed_node)
                                 .map(Vec::as_slice)
                                 .unwrap_or_default(),
+                            original,
                         );
                         retry_deadline = dial_deadline;
                     }
-                    let (retry_nodes, _, retry_feedback, retry_chains, _, retry_health_ipver) =
+                    let (retry_nodes, _, mut retry_feedback, retry_chains, _, retry_health_ipver) =
                         unpack_tcp_score_plan(plan);
                     if retry_nodes.len() > 1
                         || retry_nodes
@@ -498,6 +514,7 @@ impl ControlPlaneHandle {
                             .is_some_and(|node| node.id != failed_node)
                     {
                         let nodes: Vec<_> = retry_nodes.iter().take(3).collect();
+                        retry_feedback.retain(|id, _| nodes.iter().any(|node| node.id == *id));
                         retried = match self
                             .race_candidates(
                                 &nodes,
@@ -588,7 +605,7 @@ impl ControlPlaneHandle {
             self.stats.record_error(&outbound_name);
             self.stats.record_close(&outbound_name);
             if let Some(reporter) = &score_reporter {
-                reporter.finish(crate::group::ScoreOutcome::Io(e.kind()));
+                reporter.finish(crate::group::ScoreOutcome::from_io_error(&e));
             }
             return Ok(());
         }
@@ -667,11 +684,7 @@ impl ControlPlaneHandle {
                     let registry = self.proxy_registry.clone();
                     let target_domain = target_domain.clone();
                     let generation = Arc::clone(&runtime_generation);
-                    let pool_feedback = score_reporter.as_ref().map(|reporter| {
-                        reporter
-                            .feedback()
-                            .with_source(crate::group::ScoreSource::Warmup)
-                    });
+                    let pool_feedback = score_reporter.clone();
                     let pool_health_family = health_ipver;
                     tokio::spawn(async move {
                         let (ready_capable, bare_capable) = registry
@@ -695,8 +708,13 @@ impl ControlPlaneHandle {
                             if !pool.note_target(generation.generation(), &key) {
                                 return;
                             }
-                            let pool_reporter =
-                                pool_feedback.as_ref().map(|feedback| feedback.start());
+                            let pool_reporter = pool_feedback.map(|reporter| {
+                                reporter.start_warmup(tcp_score_context(
+                                    original_dst,
+                                    target_domain.as_deref(),
+                                    pool_health_family,
+                                ))
+                            });
                             match registry
                                 .dial_runtime(
                                     Arc::clone(&generation),
@@ -739,15 +757,12 @@ impl ControlPlaneHandle {
                             // instead; a bare TCP is useless to them.
                             return;
                         }
-                        let pool_reporter = pool_feedback.as_ref().map(|feedback| {
-                            feedback
-                                .clone()
-                                .with_context(crate::group::ScoreSelectionContext::aggregate(
-                                    SelectionNetwork::Tcp,
-                                    ProbeDomain::Tcp,
-                                    pool_health_family,
-                                ))
-                                .start()
+                        let pool_reporter = pool_feedback.map(|reporter| {
+                            reporter.start_warmup(crate::group::ScoreSelectionContext::aggregate(
+                                SelectionNetwork::Tcp,
+                                ProbeDomain::Tcp,
+                                pool_health_family,
+                            ))
                         });
                         match generation
                             .scope_dials(honk_outbound::util::connect_outbound(
@@ -782,7 +797,7 @@ impl ControlPlaneHandle {
                                     reporter.setup_failed(if generation.is_shutdown() {
                                         crate::group::ScoreOutcome::Shutdown
                                     } else {
-                                        crate::group::ScoreOutcome::Io(e.kind())
+                                        crate::group::ScoreOutcome::from_io_error(&e)
                                     });
                                 }
                                 debug!("Pool deposit: connect to {} failed: {}", node_addr, e);
@@ -829,8 +844,54 @@ impl ControlPlaneHandle {
 mod score_tests {
     use super::*;
 
+    #[test]
+    fn pending_warm_refill_refunds_trial_without_starting_business() {
+        let nodes = [
+            Node::from_share_link("socks5://127.0.0.1:1080#a").unwrap(),
+            Node::from_share_link("socks5://127.0.0.1:1081#b").unwrap(),
+        ];
+        let group = honk_config::group::Group {
+            name: "score".into(),
+            policy: honk_config::group::GroupPolicy::Score,
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            ..Default::default()
+        };
+        let manager = crate::group::GroupManager::new(&[group], &nodes);
+        let context = tcp_score_context("192.0.2.1:443".parse().unwrap(), None, IpVersion::V4);
+        let mut plan = manager.selection_plan_for_target("score", &context);
+        let attempt = plan.entries[0].feedback.take().unwrap();
+        drop(plan);
+        assert!(attempt.continuation().is_err());
+        assert_eq!(
+            manager
+                .score_budget_counters("score", SelectionNetwork::Tcp)
+                .reserved,
+            1
+        );
+        let warm = attempt.start_warmup(context.clone());
+        warm.setup_succeeded();
+        warm.tx(1);
+        warm.rx(1);
+        warm.finish(crate::group::ScoreOutcome::Success);
+        let refill = warm.start_warmup(context);
+        refill.setup_succeeded();
+        refill.finish_setup_only();
+        let counters = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        assert_eq!(
+            (
+                counters.business_starts,
+                counters.spent,
+                counters.reserved,
+                counters.refunded
+            ),
+            (0, 0, 0, 1)
+        );
+        assert_eq!(counters.cold_available, counters.cold_allowance);
+        assert_eq!(manager.score_state().root_business_starts(), 0);
+    }
+
     #[tokio::test]
-    async fn client_reset_preserves_score_availability_but_upstream_reset_revokes_it() {
+    async fn client_reset_preserves_score_availability_but_upstream_reset_revokes_target() {
         use crate::group::{ScoreOutcome, ScoreVerificationState};
         use std::sync::atomic::AtomicU64;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -857,7 +918,7 @@ mod score_tests {
                     crate::group::GroupManager::new(&[group], std::slice::from_ref(&node));
                 let address = "127.0.0.1:443".parse().unwrap();
                 let context = tcp_score_context(address, None, IpVersion::V4);
-                let feedback = manager.feedback_for_node(node.id, context).unwrap();
+                let feedback = manager.feedback_for_node(node.id, context.clone()).unwrap();
                 feedback.start().finish(ScoreOutcome::Timeout);
                 for _ in 0..4 {
                     let seed = feedback.start();
@@ -876,7 +937,17 @@ mod score_tests {
                 assert_eq!(before.state, ScoreVerificationState::ObservedUsable);
                 assert_eq!(
                     before.next_action,
-                    crate::group::ScoreValidationAction::Backoff
+                    crate::group::ScoreValidationAction::NextBusinessFlow
+                );
+                drop(manager.selection_plan_for_target("score", &context));
+                let before_counts =
+                    manager.score_verification_counters("score", SelectionNetwork::Tcp);
+                assert_eq!(
+                    (
+                        before_counts.usable_selections,
+                        before_counts.provisional_selections
+                    ),
+                    (1, 0)
                 );
                 let reporter = feedback.start();
                 reporter.setup_succeeded();
@@ -921,19 +992,33 @@ mod score_tests {
                         .raw_os_error(),
                     Some(libc::ECONNRESET)
                 );
-                reporter.finish(tcp_relay_score_outcome(&error));
-                let after = snapshot();
+                let outcome = tcp_relay_score_outcome(&error);
                 assert_eq!(
-                    after.state,
+                    outcome,
                     if client_reset {
-                        ScoreVerificationState::ObservedUsable
+                        ScoreOutcome::Cancelled
                     } else {
-                        ScoreVerificationState::Provisional
+                        ScoreOutcome::Io(std::io::ErrorKind::ConnectionReset)
                     }
                 );
+                reporter.finish(outcome);
+                let after = snapshot();
+                // A target reset cannot erase the node's factual aggregate RX.
+                assert_eq!(after.state, ScoreVerificationState::ObservedUsable);
                 assert_eq!(
                     after.next_action,
-                    crate::group::ScoreValidationAction::Backoff
+                    crate::group::ScoreValidationAction::NextBusinessFlow
+                );
+                drop(manager.selection_plan_for_target("score", &context));
+                let after_counts =
+                    manager.score_verification_counters("score", SelectionNetwork::Tcp);
+                assert_eq!(
+                    (
+                        after_counts.usable_selections - before_counts.usable_selections,
+                        after_counts.provisional_selections - before_counts.provisional_selections,
+                    ),
+                    if client_reset { (1, 0) } else { (0, 1) },
+                    "only an upstream reset revokes observed usability for the next target flow"
                 );
             }
         })

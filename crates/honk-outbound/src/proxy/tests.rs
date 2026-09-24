@@ -28,6 +28,28 @@ fn registry_test_node(name: &str, protocol: NodeProtocol) -> Node {
 }
 use super::*;
 
+/// Closes the QUIC carrier under an open UDP relay and requires both directions to report node failure.
+pub(super) async fn assert_udp_carrier_close_is_node_failure(
+    conn: quinn::Connection,
+    transport: &dyn PacketTransport,
+    timeout: std::time::Duration,
+) {
+    conn.close(quinn::VarInt::from_u32(0), b"carrier closed");
+    let error = transport.send_packet(b"query").await.unwrap_err();
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&error),
+        crate::group::ScoreOutcome::NodeFailure
+    );
+    let error = tokio::time::timeout(timeout, transport.recv_packet(&mut [0; 64]))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&error),
+        crate::group::ScoreOutcome::NodeFailure
+    );
+}
+
 #[test]
 fn test_registry_default_handlers() {
     let registry = ProxyRegistry::default_resolver().unwrap();
@@ -82,6 +104,21 @@ fn packet_error_class_separates_backpressure_from_dead_tunnel() {
     );
     let too_large = std::io::Error::other(quinn::SendDatagramError::TooLarge);
     assert_eq!(packet_error_class(&too_large), PacketErrorClass::Congestion);
+    for (cause, expected) in [
+        (
+            quinn::SendDatagramError::ConnectionLost(quinn::ConnectionError::Reset),
+            PacketErrorClass::ConnectionDead,
+        ),
+        (
+            quinn::SendDatagramError::TooLarge,
+            PacketErrorClass::Congestion,
+        ),
+    ] {
+        let error = quic_carrier_io_error(std::io::Error::other(cause));
+        let shared = crate::SharedError::new(anyhow::Error::new(error).context("carrier send"));
+        let error = std::io::Error::other(std::io::Error::other(shared));
+        assert_eq!(packet_error_class(&error), expected);
+    }
 }
 
 #[test]
@@ -124,6 +161,85 @@ fn typed_packet_rejections_survive_io_and_anyhow_context() {
         assert_eq!(packet_error_class(&io_error), PacketErrorClass::Other);
         assert!(!is_packet_rejection(&anyhow::Error::new(io_error)));
     }
+}
+
+#[test]
+fn failure_provenance_survives_shared_io_context_without_losing_cause() {
+    use crate::group::ScoreOutcome;
+    let failure = TargetFailure(anyhow::Error::new(std::io::Error::from_raw_os_error(
+        libc::ECONNREFUSED,
+    )));
+    let shared = crate::SharedError::new(anyhow::Error::new(failure).context("remote reply"));
+    let error = std::io::Error::other(std::io::Error::other(shared));
+    assert_eq!(
+        ScoreOutcome::from_io_error(&error),
+        ScoreOutcome::TargetFailure
+    );
+    let error = anyhow::Error::new(error).context("caller");
+    assert!(target_failure(&error));
+    assert_eq!(
+        ScoreOutcome::from_error(&error),
+        ScoreOutcome::TargetFailure
+    );
+    assert_eq!(
+        error
+            .root_cause()
+            .downcast_ref::<std::io::Error>()
+            .unwrap()
+            .raw_os_error(),
+        Some(libc::ECONNREFUSED)
+    );
+
+    let error = anyhow::Error::new(NodeFailure(anyhow::Error::new(
+        quinn::ConnectionError::TimedOut,
+    )));
+    assert_eq!(ScoreOutcome::from_error(&error), ScoreOutcome::NodeFailure);
+    let error = std::io::Error::from(quinn::ReadError::ConnectionLost(
+        quinn::ConnectionError::TimedOut,
+    ));
+    let kind = error.kind();
+    assert_eq!(ScoreOutcome::from_io_error(&error), ScoreOutcome::Io(kind));
+    let shared = crate::SharedError::new(anyhow::Error::new(error).context("DoQ response"));
+    let error = std::io::Error::new(kind, shared);
+    assert_eq!(ScoreOutcome::from_io_error(&error), ScoreOutcome::Io(kind));
+    assert!(!node_failure(&anyhow::Error::new(error)));
+
+    let error = quic_carrier_io_error(std::io::Error::from(quinn::ReadError::ConnectionLost(
+        quinn::ConnectionError::TimedOut,
+    )));
+    assert_eq!(error.kind(), kind);
+    let shared = crate::SharedError::new(anyhow::Error::new(error).context("proxy carrier"));
+    let error = std::io::Error::other(std::io::Error::other(shared));
+    // An independently shared cause is its own failure, not a fanned-out episode.
+    assert_eq!(
+        ScoreOutcome::from_io_error(&error),
+        ScoreOutcome::NodeFailure
+    );
+    assert!(matches!(
+        anyhow::Error::new(error)
+            .root_cause()
+            .downcast_ref::<quinn::ConnectionError>(),
+        Some(quinn::ConnectionError::TimedOut)
+    ));
+    for error in [
+        std::io::Error::from(quinn::ReadError::Reset(quinn::VarInt::from_u32(0))),
+        std::io::Error::from(quinn::WriteError::Stopped(quinn::VarInt::from_u32(0))),
+    ] {
+        let error = quic_carrier_io_error(error);
+        assert_eq!(
+            ScoreOutcome::from_io_error(&error),
+            ScoreOutcome::Io(std::io::ErrorKind::ConnectionReset),
+        );
+    }
+    let error = anyhow::Error::new(TargetFailure(anyhow::Error::new(
+        PacketRejection::Cancelled,
+    )));
+    assert_eq!(ScoreOutcome::from_error(&error), ScoreOutcome::Cancelled);
+    let error = anyhow::Error::new(NodeFailure(anyhow::Error::new(PacketRejection::Capacity)));
+    assert_eq!(ScoreOutcome::from_error(&error), ScoreOutcome::Rejected);
+    assert!(!target_failure(&anyhow::Error::new(
+        std::io::Error::from_raw_os_error(libc::ECONNREFUSED)
+    )));
 }
 
 /// Without the `rprx` feature a parsed VLESS/VMess node must hit the

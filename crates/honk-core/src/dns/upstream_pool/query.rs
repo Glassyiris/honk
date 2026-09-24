@@ -36,6 +36,19 @@ fn retryable_error(error: anyhow::Error) -> anyhow::Result<anyhow::Error> {
     }
 }
 
+fn admit_score_attempt(
+    feedback: Option<&honk_outbound::group::ScoreAttempt>,
+    original: &mut Option<honk_outbound::group::ScoreContinuation>,
+) -> anyhow::Result<Option<honk_outbound::group::ScoreBusinessGuard>> {
+    feedback
+        .map(|feedback| {
+            let business = feedback.begin()?;
+            original.get_or_insert_with(|| business.continuation());
+            Ok(business)
+        })
+        .transpose()
+}
+
 impl UpstreamPool {
     pub(super) async fn udp_pool(
         &self,
@@ -132,31 +145,52 @@ impl UpstreamPool {
             .next()
             .ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))
     }
+    async fn exchange_routed(
+        &self,
+        entry: &UpstreamEntry,
+        route: &DnsDialRoute,
+        raw_query: &[u8],
+        business: Option<honk_outbound::group::ScoreBusinessGuard>,
+    ) -> anyhow::Result<Vec<u8>> {
+        match self
+            .get_transport(entry, route.node.as_ref(), route.target)
+            .await
+        {
+            Ok(transport) => transport.exchange(raw_query, business).await,
+            Err(error) => {
+                if let Some(business) = business {
+                    business.finish(honk_outbound::group::ScoreOutcome::from_error(&error));
+                }
+                Err(error)
+            }
+        }
+    }
+
     async fn query_udp_via_proxy(
         &self,
         upstream_name: &str,
         entry: &UpstreamEntry,
         route: &DnsDialRoute,
         raw_query: &[u8],
+        original: &mut Option<honk_outbound::group::ScoreContinuation>,
     ) -> anyhow::Result<Vec<u8>> {
         let node = route
             .node
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("proxied DNS route has no node"))?;
         let _admission = self.admit_query().await?;
-        let transport = self.get_transport(entry, Some(node), route.target).await?;
-        let response = transport
-            .exchange(raw_query, route.feedback.as_ref())
+        let business = admit_score_attempt(route.feedback.as_ref(), original)?;
+        let response = self
+            .exchange_routed(entry, route, raw_query, business)
             .await?;
         let response = if crate::dns::response::is_truncated(&response) {
-            let tcp_feedback = self.tcp_feedback_for_route(entry, route);
+            let tcp_feedback = self.tcp_feedback_for_route(entry, route)?;
+            let business = admit_score_attempt(tcp_feedback.as_ref(), original)?;
             debug!(
                 "DNS upstream '{}' proxied UDP answer has TC set — retrying over proxied TCP",
                 upstream_name
             );
-            self.get_transport(entry, Some(node), route.target)
-                .await?
-                .exchange(raw_query, tcp_feedback.as_ref())
+            self.exchange_routed(entry, route, raw_query, business)
                 .await?
         } else {
             response
@@ -210,6 +244,7 @@ impl UpstreamPool {
         entry: &UpstreamEntry,
         raw_query: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
+        let mut original_business = None;
         let current = { entry.udp.lock().current_address() };
         let has_traffic_router =
             self.traffic_router_snapshot.read().is_some() || self.traffic_router.read().is_some();
@@ -219,15 +254,26 @@ impl UpstreamPool {
                 .into_iter()
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))?;
-            Some(self.resolve_dial_route_for_address(entry, target).await?)
+            Some(
+                self.resolve_dial_route_for_address(entry, target, original_business.as_ref())
+                    .await?,
+            )
         } else {
             None
         };
         let failed = if let Some(address) = current {
-            let route = self.resolve_dial_route_for_address(entry, address).await?;
+            let route = self
+                .resolve_dial_route_for_address(entry, address, original_business.as_ref())
+                .await?;
             if route.node.is_some() {
                 match self
-                    .query_udp_via_proxy(upstream_name, entry, &route, raw_query)
+                    .query_udp_via_proxy(
+                        upstream_name,
+                        entry,
+                        &route,
+                        raw_query,
+                        &mut original_business,
+                    )
                     .await
                 {
                     Ok(response) => return Ok(response),
@@ -272,11 +318,20 @@ impl UpstreamPool {
                 .ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))?;
             let route = match initial_route {
                 Some(route) if route.target == first => route,
-                _ => self.resolve_dial_route_for_address(entry, first).await?,
+                _ => {
+                    self.resolve_dial_route_for_address(entry, first, original_business.as_ref())
+                        .await?
+                }
             };
             if route.node.is_some() {
                 match self
-                    .query_udp_via_proxy(upstream_name, entry, &route, raw_query)
+                    .query_udp_via_proxy(
+                        upstream_name,
+                        entry,
+                        &route,
+                        raw_query,
+                        &mut original_business,
+                    )
                     .await
                 {
                     Ok(response) => return Ok(response),
@@ -312,10 +367,18 @@ impl UpstreamPool {
             error_kind = "exchange_failed",
             "UDP DNS query candidate failed; retrying"
         );
-        let route = self.resolve_dial_route_for_address(entry, retry).await?;
+        let route = self
+            .resolve_dial_route_for_address(entry, retry, original_business.as_ref())
+            .await?;
         if route.node.is_some() {
             return self
-                .query_udp_via_proxy(upstream_name, entry, &route, raw_query)
+                .query_udp_via_proxy(
+                    upstream_name,
+                    entry,
+                    &route,
+                    raw_query,
+                    &mut original_business,
+                )
                 .await
                 .with_context(|| {
                     format!("UDP DNS failed via {retry} (first {first}: {first_error})")
@@ -356,14 +419,15 @@ impl DnsUpstreamPool for UpstreamPool {
         }
 
         let targets = entry.endpoint.resolve_addrs().await?;
-        let mut routes = Vec::with_capacity(targets.len());
-        for target in targets {
-            routes.push(self.resolve_dial_route_for_address(entry, target).await?);
-        }
-        let _admission = self.admit_query().await?;
         let mut last_error = None;
         let mut first_error = None;
-        for route in routes {
+        let mut original_business = None;
+        for target in targets {
+            let route = self
+                .resolve_dial_route_for_address(entry, target, original_business.as_ref())
+                .await?;
+            let _admission = self.admit_query().await?;
+            let business = admit_score_attempt(route.feedback.as_ref(), &mut original_business)?;
             debug!(
                 "DNS upstream '{}' dial leaf={:?} (forced={})",
                 upstream_name,
@@ -376,17 +440,9 @@ impl DnsUpstreamPool for UpstreamPool {
                 None
             };
             let effective_query = injected.as_ref().map_or(raw_query, EcsQuery::wire);
-            let response = match self
-                .get_transport(entry, route.node.as_ref(), route.target)
-                .await
-            {
-                Ok(transport) => {
-                    transport
-                        .exchange(effective_query, route.feedback.as_ref())
-                        .await
-                }
-                Err(error) => Err(error),
-            };
+            let response = self
+                .exchange_routed(entry, &route, effective_query, business)
+                .await;
             match response {
                 Ok(response) => {
                     debug!(

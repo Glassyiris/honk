@@ -13,7 +13,7 @@ pub(super) async fn exchange_with_retry<Once, Fut, Reset, ResetFut>(
     raw_query: &[u8],
     once: Once,
     reset: Reset,
-    feedback: Option<&honk_outbound::group::ScoreFeedback>,
+    feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
 ) -> anyhow::Result<Vec<u8>>
 where
     Once: Fn(Option<honk_outbound::group::ScoreReporter>) -> Fut,
@@ -21,7 +21,7 @@ where
     Reset: FnOnce(&anyhow::Error) -> ResetFut,
     ResetFut: Future<Output = ()>,
 {
-    let reporter = feedback.map(honk_outbound::group::ScoreFeedback::start);
+    let reporter = feedback.map(honk_outbound::group::ScoreBusinessGuard::start);
     let result = match once(reporter.clone()).await {
         Ok(response) => Ok(response),
         Err(first) if !should_retry(&first) => Err(first),
@@ -167,10 +167,9 @@ mod tests {
 
         let plan = manager.selection_plan_for_target("score", &context);
         let incumbent = plan.entries[0].node.id;
-        let feedback = plan.entries[0]
-            .feedback
-            .clone()
-            .expect("Score candidate feedback");
+        let feedback = manager
+            .feedback_for_group_node("score", incumbent, context.clone())
+            .unwrap();
         let calls = AtomicUsize::new(0);
         let query = vec![
             0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
@@ -200,7 +199,7 @@ mod tests {
                     Ok(response.clone())
                 },
                 |_| async {},
-                Some(&feedback),
+                Some(feedback.business().begin().unwrap()),
             )
             .await
             .expect("retry succeeds");

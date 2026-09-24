@@ -246,7 +246,9 @@ impl Hy2TcpStream {
         if message_len > MAX_MESSAGE_LENGTH {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Hysteria2: invalid TCP response message length",
+                super::NodeFailure(anyhow::anyhow!(
+                    "Hysteria2: invalid TCP response message length"
+                )),
             ));
         }
         let message_end = offset + message_len as usize;
@@ -260,7 +262,9 @@ impl Hy2TcpStream {
         if padding_len > MAX_PADDING_LENGTH {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Hysteria2: invalid TCP response padding length",
+                super::NodeFailure(anyhow::anyhow!(
+                    "Hysteria2: invalid TCP response padding length"
+                )),
             ));
         }
         let header_end = offset + padding_len as usize;
@@ -270,10 +274,10 @@ impl Hy2TcpStream {
         if status != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
-                format!(
+                super::TargetFailure(anyhow::anyhow!(
                     "Hysteria2: remote error: {}",
                     String::from_utf8_lossy(message)
-                ),
+                )),
             ));
         }
         Ok(Some(header_end))
@@ -324,7 +328,7 @@ impl AsyncRead for Hy2TcpStream {
             if self.response.len() == MAX_TCP_RESPONSE_BUFFER {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "Hysteria2 TCP response header too large",
+                    super::NodeFailure(anyhow::anyhow!("Hysteria2 TCP response header too large")),
                 )));
             }
             let mut chunk = [0; 1024];
@@ -335,7 +339,7 @@ impl AsyncRead for Hy2TcpStream {
                 Poll::Ready(Ok(())) if input.filled().is_empty() => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
-                        "Hysteria2 TCP response truncated",
+                        super::NodeFailure(anyhow::anyhow!("Hysteria2 TCP response truncated")),
                     )));
                 }
                 Poll::Ready(Ok(())) => self.response.extend_from_slice(input.filled()),
@@ -667,11 +671,7 @@ impl Hysteria2Handler {
                 async move { client.connection(timeout).await }
             },
             connect_timeout,
-            move |conn| async move {
-                conn.open_bi()
-                    .await
-                    .map_err(|error| anyhow!("Hysteria2: open stream: {error}"))
-            },
+            move |conn| async move { conn.open_bi().await.context("Hysteria2: open stream") },
             |_| true,
             "Hysteria2",
         )
@@ -907,7 +907,8 @@ impl PacketTransport for Hy2UdpTransport {
                 .conn
                 .send_datagram_wait(bytes::Bytes::from(packet))
                 .await
-                .map_err(io::Error::other)?;
+                .map_err(io::Error::other)
+                .map_err(super::quic_carrier_io_error)?;
         }
         Ok(())
     }
@@ -917,7 +918,13 @@ impl PacketTransport for Hy2UdpTransport {
             let msg = self.rx.lock().await.recv().await.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::ConnectionAborted,
-                    "hysteria2 connection closed",
+                    super::NodeFailure(
+                        self.state
+                            .conn
+                            .close_reason()
+                            .map(anyhow::Error::new)
+                            .unwrap_or_else(|| anyhow::anyhow!("hysteria2 connection closed")),
+                    ),
                 )
             })?;
             let complete =

@@ -27,6 +27,28 @@ fn legacy_stream(server: TcpStream, send_cipher: AeadCipher, recv_cipher: AeadCi
     )
 }
 
+#[tokio::test]
+async fn authenticated_stream_corruption_is_a_node_failure() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (mut peer, _) = listener.accept().await.unwrap();
+    let conf = CipherConf::for_method(METHOD).unwrap();
+    let master = ShadowsocksHandler::master_key(PASSWORD, conf.key_len);
+    let (send, recv) = ciphers(&master, &[7; 16], &[9; 16]);
+    let mut stream = legacy_stream(client, send, recv);
+    peer.write_all(&[0; 18]).await.unwrap();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(1), stream.read(&mut [0; 1]))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&error),
+        crate::group::ScoreOutcome::NodeFailure
+    );
+}
+
 /// AsyncWrite contract: a peer that accepts only a few bytes at a time
 /// (forcing Pending flushes) must still receive a byte-exact stream,
 /// and a write issued after a Pending must not lose or duplicate data.

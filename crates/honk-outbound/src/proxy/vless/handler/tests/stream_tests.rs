@@ -549,4 +549,8 @@ async fn response_strip_rejects_nonzero_version() {
     let mut out = Vec::new();
     let err = stream.read_to_end(&mut out).await.unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&err),
+        crate::group::ScoreOutcome::NodeFailure
+    );
 }

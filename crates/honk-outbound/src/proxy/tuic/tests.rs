@@ -279,6 +279,29 @@ async fn test_udp_transport_over_stream_echo() {
     assert_eq!(&buf[..n], b"stream-query");
 }
 
+#[tokio::test]
+async fn udp_carrier_close_is_node_failure() {
+    for datagrams in [true, false] {
+        let server_addr = start_server(datagrams, TEST_PASSWORD).await;
+        let node = test_node(server_addr.port(), TEST_PASSWORD);
+        let handler = TuicHandler::new();
+        let client = handler.build_client(&node, None).await.unwrap();
+        let timeout = Duration::from_secs(5);
+        let transport = handler
+            .udp_transport_via_client(
+                Arc::clone(&client),
+                "192.0.2.53:53".parse().unwrap(),
+                None,
+                timeout,
+            )
+            .await
+            .unwrap();
+        let (conn, _) = client.connection(timeout).await.unwrap();
+        crate::proxy::tests::assert_udp_carrier_close_is_node_failure(conn, &*transport, timeout)
+            .await;
+    }
+}
+
 async fn assert_udp_roundtrip(transport: &dyn PacketTransport, payload: &[u8]) {
     transport.send_packet(payload).await.unwrap();
     let mut buf = [0u8; 256];

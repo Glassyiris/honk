@@ -47,7 +47,24 @@ async fn dns_wait_timeout_remains_retryable_with_free_admission() {
         &dns.local_addr().unwrap().to_string(),
     ));
     let candidates = [&node];
-    let feedback = HashMap::new();
+    let score_group = honk_config::group::Group {
+        name: "score".into(),
+        policy: honk_config::group::GroupPolicy::Score,
+        nodes: vec![node.id],
+        ..Default::default()
+    };
+    let manager = crate::group::GroupManager::new(&[score_group], std::slice::from_ref(&node));
+    let feedback = HashMap::from([(
+        node.id,
+        manager
+            .feedback_for_group_node(
+                "score",
+                node.id,
+                tcp_score_context(target, None, IpVersion::V4),
+            )
+            .unwrap()
+            .business(),
+    )]);
     let (result, ()) = tokio::join!(
         handle.race_candidates(
             &candidates,
@@ -67,6 +84,13 @@ async fn dns_wait_timeout_remains_retryable_with_free_admission() {
                 .await
                 .expect("the candidate must reach bootstrap DNS")
                 .unwrap();
+            assert_eq!(manager.score_state().root_business_starts(), 1);
+            assert_eq!(
+                manager
+                    .score_budget_counters("score", SelectionNetwork::Tcp)
+                    .business_starts,
+                1
+            );
             let permit =
                 tokio::time::timeout(Duration::from_millis(100), generation.acquire_dial_permit())
                     .await
@@ -206,8 +230,8 @@ async fn feedback_does_not_start_while_waiting_for_dial_admission() {
     let manager = handle.group_manager.read().clone();
     let context = tcp_score_context(target, None, IpVersion::V4);
     let feedback = manager.feedback_for_node(node.id, context.clone()).unwrap();
-    let feedback = HashMap::from([(node.id, feedback)]);
     for _ in 0..2 {
+        let feedback = HashMap::from([(node.id, feedback.business())]);
         let result = handle
             .race_candidates(
                 &[&node],

@@ -11,9 +11,9 @@ use crate::proxy::uot::{
 
 #[cfg(test)]
 use super::{
-    CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, INBOUND_PAYLOAD_BUDGET, InboundPayloadBudget,
-    PaddingScheme, PaddingState, WRITER_CONTROL_RESERVED, WRITER_IO_TIMEOUT, WRITER_QUEUE_CAP,
-    read_frame, write_frame,
+    CMD_FIN, CMD_PSH, CMD_SETTINGS, CMD_SYN, CMD_SYNACK, INBOUND_PAYLOAD_BUDGET,
+    InboundPayloadBudget, PaddingScheme, PaddingState, WRITER_CONTROL_RESERVED, WRITER_IO_TIMEOUT,
+    WRITER_QUEUE_CAP, read_frame, write_frame,
 };
 #[cfg(test)]
 use crate::proxy::MuxSession as _;
@@ -195,7 +195,7 @@ impl AnyTlsUotTransport {
             )?;
             setup.take();
             drop(setup);
-            AnyTlsSession::wait_for_confirmed_data(completed).await
+            self.session.wait_for_confirmed_data(completed).await
         } else {
             self.session
                 .enqueue_data_with_permit(self.sid, payload.freeze(), permit)?;
@@ -244,7 +244,8 @@ impl PacketTransport for AnyTlsUotTransport {
             }
 
             let event = receive.rx.recv().await.ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "UoT stream closed")
+                self.session
+                    .session_error(std::io::ErrorKind::UnexpectedEof, "UoT stream closed")
             })?;
             match event {
                 StreamEvent::Data(data) => {
@@ -271,7 +272,7 @@ impl PacketTransport for AnyTlsUotTransport {
                 StreamEvent::Error(error) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::ConnectionReset,
-                        error.to_string(),
+                        error,
                     ));
                 }
             }
@@ -340,6 +341,21 @@ mod uot_transport_tests {
         let (cmd, _, _) = read_frame(&mut server_end).await.unwrap();
         assert_eq!(cmd, CMD_PSH);
         (transport, server_end)
+    }
+
+    #[tokio::test]
+    async fn uot_magic_refusal_is_not_a_target_failure() {
+        let (transport, mut server) = uot_test_transport("192.0.2.1:53".parse().unwrap()).await;
+        write_frame(&mut server, CMD_SYNACK, transport.sid, b"UoT unsupported")
+            .await
+            .unwrap();
+        let error =
+            tokio::time::timeout(Duration::from_secs(2), transport.recv_packet(&mut [0; 1]))
+                .await
+                .unwrap()
+                .unwrap_err();
+        assert!(crate::group::ScoreOutcome::from_io_error(&error).is_node_failure());
+        assert!(!transport.session.is_closed());
     }
 
     /// The UoT request and first datagram share one PSH; later datagrams carry

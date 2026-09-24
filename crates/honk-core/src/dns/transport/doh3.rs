@@ -18,6 +18,7 @@ use super::DialContext;
 use super::framing::force_dns_id_zero;
 use super::lifecycle::{LifecycleSlot, SessionFailure};
 use super::owned_task::OwnedTask;
+use super::quic::with_packet_cause;
 use super::{
     DnsMessageBody, SharedQuicEndpoint, build_doh_request, check_doh_status, dns_quic_config,
     doh_content_length, exchange_with_retry, finish_doh_response, quic_connect_endpoint,
@@ -85,7 +86,7 @@ impl Doh3Client {
     pub async fn exchange(
         self: &Arc<Self>,
         raw_query: &[u8],
-        feedback: Option<&honk_outbound::group::ScoreFeedback>,
+        feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
     ) -> anyhow::Result<Vec<u8>> {
         exchange_with_retry(
             "DoH3",
@@ -119,36 +120,32 @@ impl Doh3Client {
             let orig_id = force_dns_id_zero(&mut wire);
 
             let request = build_doh_request(&self.dial.endpoint, None, "DoH3")?;
-            let mut stream = sender
-                .send_request(request)
-                .await
-                .map_err(|e| anyhow::anyhow!("DoH3 send_request: {e}"))?;
+            let mut stream = sender.send_request(request).await.map_err(|error| {
+                with_packet_cause(session.endpoint.as_ref(), error.into())
+                    .context("DoH3 send_request")
+            })?;
 
-            stream
-                .send_data(Bytes::from(wire))
-                .await
-                .map_err(|e| anyhow::anyhow!("DoH3 send_data: {e}"))?;
-            stream
-                .finish()
-                .await
-                .map_err(|e| anyhow::anyhow!("DoH3 finish: {e}"))?;
+            stream.send_data(Bytes::from(wire)).await.map_err(|error| {
+                with_packet_cause(session.endpoint.as_ref(), error.into()).context("DoH3 send_data")
+            })?;
+            stream.finish().await.map_err(|error| {
+                with_packet_cause(session.endpoint.as_ref(), error.into()).context("DoH3 finish")
+            })?;
             if let Some(reporter) = reporter {
                 reporter.tx(raw_query.len() as u64);
             }
 
-            let response = stream
-                .recv_response()
-                .await
-                .map_err(|e| anyhow::anyhow!("DoH3 recv_response: {e}"))?;
+            let response = stream.recv_response().await.map_err(|error| {
+                with_packet_cause(session.endpoint.as_ref(), error.into())
+                    .context("DoH3 recv_response")
+            })?;
 
             check_doh_status("DoH3", response.status())?;
             let content_length = doh_content_length("DoH3", response.headers())?;
             let mut buf = DnsMessageBody::new("DoH3", content_length)?;
-            while let Some(mut bytes) = stream
-                .recv_data()
-                .await
-                .map_err(|e| anyhow::anyhow!("DoH3 recv_data: {e}"))?
-            {
+            while let Some(mut bytes) = stream.recv_data().await.map_err(|error| {
+                with_packet_cause(session.endpoint.as_ref(), error.into()).context("DoH3 recv_data")
+            })? {
                 while bytes.has_remaining() {
                     let chunk = bytes.chunk();
                     let len = chunk.len();
@@ -196,11 +193,9 @@ impl Doh3Client {
                     self.retire_session(&session).await;
                 }
                 Some(reason) => {
-                    return Err(SessionFailure::new(
-                        session,
-                        anyhow::anyhow!("DoH3 connection closed: {reason}"),
-                    )
-                    .into());
+                    let error = with_packet_cause(session.endpoint.as_ref(), reason.into())
+                        .context("DoH3 connection closed");
+                    return Err(SessionFailure::new(session, error).into());
                 }
             }
         }
@@ -223,8 +218,10 @@ impl Doh3Client {
         let (mut driver, sender) = match h3 {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => {
+                let error = with_packet_cause(endpoint.as_ref(), error.into())
+                    .context("DoH3 h3::client::new");
                 close_failed_connection(&conn, &endpoint).await;
-                return Err(anyhow::anyhow!("DoH3 h3::client::new: {error}"));
+                return Err(error);
             }
             Err(_) => {
                 close_failed_connection(&conn, &endpoint).await;
@@ -470,7 +467,7 @@ mod tests {
                 let request =
                     super::build_doh_request(&client.dial.endpoint, None, "DoH3").unwrap();
                 match sender.send_request(request).await {
-                    Err(h3::error::StreamError::RemoteClosing { .. }) => break,
+                    Err(h3::error::StreamError::RemoteClosing) => break,
                     Err(error) => panic!("unexpected H3 setup error: {error}"),
                     Ok(stream) => drop(stream),
                 }

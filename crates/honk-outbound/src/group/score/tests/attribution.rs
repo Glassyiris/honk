@@ -31,7 +31,15 @@ fn cold_exploration_is_deterministic_and_cancelled_loser_is_neutral() {
     let context = context("example.com", IpVersion::V4);
     let first = manager.selection_plan_for_target("score", &context);
     assert_eq!(first.entries[0].node.id, nodes[0].id);
-    drop(first.entries[0].feedback.as_ref().unwrap().start());
+    drop(
+        first.entries[0]
+            .feedback
+            .as_ref()
+            .unwrap()
+            .begin()
+            .unwrap()
+            .start(),
+    );
     assert_eq!(
         manager
             .score_state()
@@ -48,7 +56,7 @@ fn cold_exploration_is_deterministic_and_cancelled_loser_is_neutral() {
     assert_ne!(next.entries[0].node.id, first.entries[0].node.id);
     finish_success(&next);
     let mut tried_other = false;
-    for _ in 0..=exploration_period(nodes.len()) {
+    for _ in 0..=SCORE_EXPLORATION_PERIOD {
         let plan = manager.selection_plan_for_target("score", &context);
         if plan.entries[0].node.id == nodes[1].id {
             tried_other = true;
@@ -72,6 +80,8 @@ fn rejected_exact_attempt_is_neutral() {
     first.entries[0]
         .feedback
         .as_ref()
+        .unwrap()
+        .begin()
         .unwrap()
         .start()
         .setup_failed(ScoreOutcome::Rejected);
@@ -452,7 +462,7 @@ fn setup_only_success_does_not_become_usefulness_failure() {
         .feedback
         .clone()
         .unwrap();
-    let reporter = feedback.start();
+    let reporter = feedback.begin().unwrap().start();
     reporter.setup_succeeded();
     reporter.finish_setup_only();
     assert_eq!(
@@ -462,7 +472,7 @@ fn setup_only_success_does_not_become_usefulness_failure() {
         Some(0)
     );
 
-    let related = reporter.feedback().start();
+    let related = reporter.start_warmup(context.clone());
     related.setup_succeeded();
     related.finish_setup_only();
 
@@ -511,7 +521,12 @@ fn setup_only_exact_samples_keep_aggregate_reliability() {
         reporter.finish_setup_only();
     }
 
-    assert_eq!(selected(&manager, &target), nodes[0].id);
+    assert_eq!(
+        manager
+            .score_state()
+            .peek_rank("score", &target, &[&nodes[0], &nodes[1]]),
+        0
+    );
 }
 
 #[test]
@@ -553,8 +568,12 @@ fn setup_only_family_samples_keep_global_reliability() {
     reporter.finish_setup_only();
 
     assert_eq!(
-        selected(&manager, &context("fresh.example", IpVersion::V4)),
-        nodes[0].id
+        manager.score_state().peek_rank(
+            "score",
+            &context("fresh.example", IpVersion::V4),
+            &[&nodes[0], &nodes[1]],
+        ),
+        0
     );
 }
 
@@ -708,6 +727,8 @@ fn stale_exact_completion_does_not_mutate_recreated_cell() {
         .feedback
         .as_ref()
         .unwrap()
+        .begin()
+        .unwrap()
         .start();
     for index in 0..EXACT_CAPACITY {
         let context = context(&format!("{index}.example"), IpVersion::V4);
@@ -716,6 +737,8 @@ fn stale_exact_completion_does_not_mutate_recreated_cell() {
     let replacement = manager.selection_plan_for_target("score", &evicted).entries[0]
         .feedback
         .as_ref()
+        .unwrap()
+        .begin()
         .unwrap()
         .start();
     reporter.setup_succeeded();
@@ -772,7 +795,6 @@ fn stale_aggregate_completion_does_not_mutate_recreated_cell() {
         source: ScoreSource::Traffic,
         tx: 1,
         rx: 1,
-        last_rx_at: Some(rx_at),
         eligible_rx_at: Some(rx_at),
         elapsed: Duration::from_millis(1),
         count_usefulness: true,
@@ -850,11 +872,15 @@ fn late_completion_keeps_extant_member_and_drops_deleted_member() {
         .feedback
         .as_ref()
         .unwrap()
+        .begin()
+        .unwrap()
         .start();
     finish_success(&old.selection_plan_for_target("score", &context));
     let reporter_b = old.selection_plan_for_target("score", &context).entries[0]
         .feedback
         .as_ref()
+        .unwrap()
+        .begin()
         .unwrap()
         .start();
     let state = old.score_state();
@@ -938,7 +964,7 @@ fn urltest_retry_plan_keeps_the_group_in_the_selection_chain() {
 
     let context = context("retry.example", IpVersion::V4);
     let ordinary = manager.selection_plan_for_target("auto", &context);
-    let retry = manager.urltest_retry_plan_for_target("auto", &context);
+    let retry = manager.urltest_retry_plan_for_target("auto", &context, None);
 
     assert_eq!(ordinary.entries[0].selection_chain[0], "auto");
     for entry in &retry.entries {

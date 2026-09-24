@@ -697,6 +697,69 @@ async fn socks5_udp_transport_rejects_long_domain() {
     assert!(result.is_err(), "domains longer than 255 bytes must fail");
 }
 
+#[tokio::test]
+async fn target_refusals_are_scoped_only_to_valid_connect_replies() {
+    for (command, method, header, target_failure) in [
+        (CMD_CONNECT, METHOD_NO_AUTH, [5, 1, 0, 1], false),
+        (CMD_CONNECT, METHOD_NO_AUTH, [5, 2, 0, 1], true),
+        (CMD_CONNECT, METHOD_NO_AUTH, [5, 3, 0, 1], true),
+        (CMD_CONNECT, METHOD_NO_AUTH, [5, 4, 0, 1], true),
+        (CMD_CONNECT, METHOD_NO_AUTH, [5, 5, 0, 1], true),
+        (CMD_CONNECT, METHOD_NO_AUTH, [5, 6, 0, 1], true),
+        (CMD_CONNECT, METHOD_NO_AUTH, [5, 7, 0, 1], false),
+        (CMD_CONNECT, METHOD_NO_AUTH, [4, 5, 0, 1], false),
+        (CMD_CONNECT, METHOD_NO_AUTH, [5, 5, 1, 1], false),
+        (CMD_CONNECT, METHOD_NO_AUTH, [5, 5, 0, 0xff], false),
+        (CMD_CONNECT, METHOD_NO_ACCEPTABLE, [5, 5, 0, 1], false),
+        (CMD_UDP_ASSOCIATE, METHOD_NO_AUTH, [5, 5, 0, 1], false),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            stream.write_all(&[SOCKS5_VERSION, method]).await.unwrap();
+            if method == METHOD_NO_ACCEPTABLE {
+                return;
+            }
+            let mut request = [0; 10];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(request[1], command);
+            let mut reply = [0; 10];
+            reply[..4].copy_from_slice(&header);
+            stream.write_all(&reply).await.unwrap();
+        });
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        let error = if command == CMD_CONNECT {
+            Socks5Handler::handshake(
+                &mut stream,
+                "192.0.2.1:80".parse().unwrap(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err()
+        } else {
+            Socks5Handler::udp_associate(&mut stream, None, None)
+                .await
+                .unwrap_err()
+        };
+        peer.await.unwrap();
+        let error = anyhow::Error::new(io::Error::other(crate::SharedError::new(
+            error.context("dial"),
+        )));
+        assert_eq!(crate::proxy::target_failure(&error), target_failure);
+        let outcome = crate::group::ScoreOutcome::from_error(&error);
+        assert_eq!(
+            outcome == crate::group::ScoreOutcome::TargetFailure,
+            target_failure
+        );
+        assert_ne!(outcome, crate::group::ScoreOutcome::Success);
+    }
+}
+
 async fn run_test_socks5_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

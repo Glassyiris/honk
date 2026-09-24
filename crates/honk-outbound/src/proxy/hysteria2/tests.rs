@@ -837,6 +837,10 @@ async fn test_first_read_sends_tcp_request_and_reports_response_error() {
         .expect("first read did not send the Hysteria2 TCP request")
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&error),
+        crate::group::ScoreOutcome::TargetFailure
+    );
 }
 
 #[tokio::test]
@@ -867,6 +871,7 @@ async fn test_wrong_password_rejected() {
         .dial(&node, target, None, Duration::from_secs(5))
         .await;
     let err = result.expect_err("bad password must fail the dial");
+    assert!(!crate::proxy::target_failure(&err));
     assert!(
         format!("{err:#}").contains("authentication failed, status code: 404"),
         "unexpected error: {err:#}"
@@ -909,6 +914,47 @@ async fn test_udp_transport_datagram_echo() {
         .unwrap();
     assert_eq!(src, target);
     assert_eq!(&buf[..n], b"dns-query");
+}
+
+#[tokio::test]
+async fn udp_carrier_close_is_node_failure() {
+    let server_addr = start_server(TEST_PASSWORD).await;
+    let node = test_node(server_addr.port(), TEST_PASSWORD);
+    let handler = Hysteria2Handler::new();
+    let client = handler.build_client(&node, None).await.unwrap();
+    let timeout = Duration::from_secs(5);
+    let transport = handler
+        .udp_transport_via_client(
+            Arc::clone(&client),
+            "192.0.2.53:53".parse().unwrap(),
+            None,
+            timeout,
+        )
+        .await
+        .unwrap();
+    let endpoint =
+        crate::quic::packet_transport_endpoint(Arc::clone(&transport), transport.relay_addr())
+            .unwrap();
+    let (conn, _) = client.connection(timeout).await.unwrap();
+    conn.close(quinn::VarInt::from_u32(0), b"carrier closed");
+    let error = transport.send_packet(b"query").await.unwrap_err();
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&error),
+        crate::group::ScoreOutcome::NodeFailure
+    );
+    let error = tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(error) = endpoint.terminal_error() {
+                break error;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(crate::group::ScoreOutcome::from_io_error(&error).is_node_failure());
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+    endpoint.close(Duration::ZERO).await;
 }
 
 #[tokio::test]

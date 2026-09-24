@@ -30,22 +30,25 @@ fn carrier_pressure_reopens_only_budgeted_comparison_without_penalizing_business
             ProbeDomain::DataUdp
         };
         let start = Instant::now();
+        let state = manager.score_state();
+        let refs = nodes.iter().collect::<Vec<_>>();
+        for _ in 0..exploration_target(nodes.len()) {
+            let (_, feedback) = state.rank_plan_at("score", &target, &refs, start);
+            let guard = feedback.begin_at(start).unwrap();
+            guard
+                .start_at(start)
+                .finish_at(ScoreOutcome::Cancelled, false, start);
+        }
         for leaf in &nodes {
-            train_at(
-                &manager,
-                leaf,
-                &target,
-                20,
-                Duration::from_millis(100),
-                1,
-                start,
-            );
+            train_at(&manager, leaf, &target, 20, 100, 1, start);
         }
         let ready = start + Duration::from_secs(2);
         for _ in 0..16 {
             assert_eq!(rank_at(&manager, &nodes, &target, ready), 0);
         }
-        let state = manager.score_state();
+        let funded = state.budget_counters("score", network);
+        assert_eq!(funded.cold_available, 0);
+        assert!(funded.earned_available > 0);
         let at = ready + Duration::from_secs(1);
         let before = score_snapshot(&state.inner.lock(), "score", &target, nodes[0].id, at);
         assert_eq!(
@@ -63,16 +66,27 @@ fn carrier_pressure_reopens_only_budgeted_comparison_without_penalizing_business
         assert_eq!(after.fail_streak, before.fail_streak);
         assert_eq!(after.explore_backed_off, before.explore_backed_off);
         assert_eq!(after.qualified(), before.qualified());
-        let refs = nodes.iter().collect::<Vec<_>>();
         let counters = state.selection_reason_counts("score", network);
         for _ in 0..10 {
-            assert_eq!(state.peek_rank("score", &target, &refs), 0);
+            assert_eq!(state.peek_rank_at("score", &target, &refs, at), 0);
         }
         assert_eq!(state.selection_reason_counts("score", network), counters);
         assert_eq!(counters.carrier_pressure, 1);
         assert_eq!(counters.carrier_rtt_pressure, 1);
         assert_eq!(counters.carrier_loss_pressure, 1);
-        assert_eq!(rank_at(&manager, &nodes, &target, at), 1);
+        let (index, feedback) = state.rank_plan_at("score", &target, &refs, at);
+        assert_eq!(index, 1);
+        let validation = feedback.begin_at(at).unwrap().start_at(at);
+        validation.setup_succeeded_at(at);
+        let spent = state.budget_counters("score", network);
+        assert_eq!(
+            spent.periodic_trial_starts,
+            funded.periodic_trial_starts + 1
+        );
+        assert!(
+            spent.trial_starts + spent.reserved
+                <= spent.cold_allowance + spent.business_starts / spent.earning_period
+        );
         let validated = state.selection_reason_counts("score", network);
         assert_eq!(validated.periodic_explore, 1);
         assert_eq!(validated.carrier_validation, 1);
@@ -87,27 +101,208 @@ fn carrier_pressure_reopens_only_budgeted_comparison_without_penalizing_business
         assert_eq!(bounded.carrier_rtt_pressure, 1);
         assert_eq!(bounded.carrier_loss_pressure, 1);
         assert_eq!(bounded.ordinary_switch, 0);
-        // A successful measurement, not the hint, earns ordinary promotion.
-        train_at(
-            &manager,
-            &nodes[1],
-            &target,
-            4,
-            Duration::from_millis(10),
-            1,
-            at,
-        );
+        let after = state.budget_counters("score", network);
+        assert_eq!(after.business_starts, spent.business_starts);
+        assert_eq!(after.trial_starts, spent.trial_starts);
+        validation.finish_at(ScoreOutcome::Cancelled, false, at);
+        for _ in 1..funded.earned_available {
+            let available = state.budget_counters("score", network);
+            if available.earned_available == 1 {
+                let snapshot = state
+                    .verification_snapshot_at("score", &target, &refs, at)
+                    .unwrap();
+                assert_eq!(snapshot.wait_reason, ScoreWaitReason::ComparableTraffic);
+                assert_eq!(state.budget_counters("score", network), available);
+            }
+            let (index, feedback) = state.rank_plan_at("score", &target, &refs, at);
+            assert_eq!(index, 1);
+            feedback.begin_at(at).unwrap().start_at(at).finish_at(
+                ScoreOutcome::Cancelled,
+                false,
+                at,
+            );
+        }
+        let exhausted = state.budget_counters("score", network);
+        assert_eq!(exhausted.earned_available, 0);
+        assert_eq!(exhausted.periodic_trial_starts, funded.earned_available);
         assert_eq!(
             rank_at(&manager, &nodes, &target, at + Duration::from_secs(1)),
+            0
+        );
+        assert_eq!(
+            state.budget_counters("score", network).business_starts,
+            exhausted.business_starts
+        );
+        assert_eq!(
+            state.budget_counters("score", network).trial_starts,
+            exhausted.trial_starts
+        );
+        // A successful measurement, not the hint, earns ordinary promotion.
+        train_at(&manager, &nodes[1], &target, 20, 10, 1, at);
+        assert_eq!(
+            state.peek_rank_at("score", &target, &refs, at + Duration::from_secs(2)),
             1
         );
         assert_eq!(
             state
                 .selection_reason_counts("score", network)
                 .ordinary_switch,
-            1
+            0
         );
     }
+}
+
+#[test]
+fn answered_open_response_does_not_block_the_next_pressure_episode() {
+    for download in [1, 128 * 1024] {
+        let nodes = [node("refresh incumbent"), node("refresh challenger")];
+        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+        let target = context("refresh.example", IpVersion::V4);
+        let start = Instant::now();
+        let state = manager.score_state();
+        let refs: Vec<_> = nodes.iter().collect();
+        for _ in 0..exploration_target(nodes.len()) {
+            let (_, attempt) = state.rank_plan_at("score", &target, &refs, start);
+            attempt.begin_at(start).unwrap().start_at(start).finish_at(
+                ScoreOutcome::Cancelled,
+                false,
+                start,
+            );
+        }
+        for leaf in &nodes {
+            train_at(&manager, leaf, &target, 64, 100, download, start);
+        }
+        let at = start + Duration::from_secs(3);
+        assert_eq!(state.rank_at("score", &target, &refs, at), 0);
+        pressure_at(&manager, nodes[0].id, IpVersion::V4, at);
+        let snapshot = state
+            .verification_snapshot_at("score", &target, &refs, at)
+            .unwrap();
+        assert!(snapshot.missing.response);
+        assert_eq!(snapshot.question, ScoreEvidenceQuestion::Response);
+        let funded = state.budget_counters("score", target.network);
+        assert!(funded.earned_available >= 2);
+        let mut open = Vec::new();
+        for episode in 0..2 {
+            let began = at + Duration::from_secs(episode * 2);
+            pressure_at(&manager, nodes[0].id, IpVersion::V4, began);
+            let (index, attempt) = state.rank_plan_at("score", &target, &refs, began);
+            assert_eq!(
+                index, 1,
+                "an answered open reporter cannot answer a new episode"
+            );
+            let reporter = attempt.begin_at(began).unwrap().start_at(began);
+            reporter.setup_succeeded_at(began);
+            let waiting = state
+                .verification_snapshot_at("score", &target, &refs, began)
+                .unwrap();
+            assert_eq!(waiting.question, ScoreEvidenceQuestion::Response);
+            assert_eq!(waiting.wait_reason, ScoreWaitReason::InFlight);
+            assert_eq!(state.rank_at("score", &target, &refs, began), 0);
+            reporter.first_response_at(began + Duration::from_millis(100));
+            reporter.transfer_at(1, 1, began + Duration::from_millis(100));
+            open.push(reporter);
+            let answered = began + Duration::from_millis(200);
+            let (_, ordinary) = state.rank_plan_at("score", &target, &refs, answered);
+            ordinary
+                .begin_at(answered)
+                .unwrap()
+                .start_at(answered)
+                .finish_at(ScoreOutcome::Cancelled, false, answered);
+            assert_eq!(
+                state
+                    .budget_counters("score", target.network)
+                    .periodic_trial_starts,
+                funded.periodic_trial_starts + episode + 1
+            );
+        }
+        let now = at + Duration::from_secs(3);
+        for reporter in open {
+            reporter.finish_at(ScoreOutcome::Cancelled, true, now);
+        }
+    }
+}
+
+#[test]
+fn pressure_refresh_uses_latest_common_responses_without_renewing_old_support() {
+    let nodes = [node("refresh winner"), node("refresh peer")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let targets = [
+        context("first.example", IpVersion::V4),
+        context("second.example", IpVersion::V4),
+    ];
+    let aggregate =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    let start = Instant::now();
+    rank_at(&manager, &nodes, &targets[0], start);
+    for target in &targets {
+        for leaf in &nodes {
+            train_at(&manager, leaf, target, 8, 100, 1, start);
+        }
+    }
+    let state = manager.score_state();
+    let refs: Vec<_> = nodes.iter().collect();
+    let snapshot = |scope: &ScoreSelectionContext, at| {
+        state
+            .verification_snapshot_at("score", scope, &refs, at)
+            .unwrap()
+    };
+    let before = snapshot(&aggregate, start + Duration::from_secs(2));
+    assert_eq!(before.comparison, ScoreComparison::Equivalent);
+    pressure_at(
+        &manager,
+        nodes[0].id,
+        IpVersion::V4,
+        start + Duration::from_secs(3),
+    );
+    let fresh = start + Duration::from_millis(3200);
+    for leaf in &nodes {
+        train_at(&manager, leaf, &targets[0], 4, 100, 1, fresh);
+    }
+    let partially_refreshed = start + Duration::from_millis(4300);
+    assert!(!snapshot(&targets[0], partially_refreshed).missing.response);
+    assert!(snapshot(&aggregate, partially_refreshed).missing.response);
+    let fresh = start + Duration::from_secs(4);
+    let now = start + Duration::from_secs(5);
+    for (index, leaf) in nodes.iter().enumerate() {
+        train_at(&manager, leaf, &targets[1], 4, 100, 1, fresh);
+        if index == 0 {
+            assert!(snapshot(&aggregate, now).missing.response);
+        }
+    }
+    let funded = state.budget_counters("score", SelectionNetwork::Tcp);
+    assert!(funded.cold_available + funded.earned_available > 0);
+    for scope in [&targets[0], &targets[1], &aggregate] {
+        let refreshed = snapshot(scope, now);
+        assert_eq!(refreshed.comparison, ScoreComparison::Equivalent);
+        assert!(!refreshed.missing.response);
+        assert_eq!(refreshed.question, ScoreEvidenceQuestion::Transfer);
+        assert_eq!(
+            refreshed.evidence_age_ms,
+            before.evidence_age_ms.map(|age| age + 3000)
+        );
+        assert_eq!(
+            refreshed.valid_for_ms,
+            before.valid_for_ms.map(|valid_for| valid_for - 3000)
+        );
+        let (_, attempt) = state.rank_plan_at("score", scope, &refs, now);
+        attempt
+            .begin_at(now)
+            .unwrap()
+            .start_at(now)
+            .finish_at(ScoreOutcome::Cancelled, false, now);
+        assert!(
+            snapshot(scope, start + Duration::from_secs(61))
+                .missing
+                .response
+        );
+    }
+    assert_eq!(
+        state
+            .budget_counters("score", SelectionNetwork::Tcp)
+            .trial_starts,
+        funded.trial_starts
+    );
 }
 
 #[test]
@@ -119,15 +314,7 @@ fn carrier_pressure_is_owner_scoped_expiring_and_cannot_create_flow_evidence() {
     assert_eq!(manager.score_cache_snapshot().aggregate_cells, 0);
     let target = context("family.example", IpVersion::V6);
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            Duration::from_millis(100),
-            1,
-            start,
-        );
+        train_at(&manager, leaf, &target, 20, 100, 1, start);
     }
     let at = start + Duration::from_secs(2);
     manager.score_state.observe_carrier_pressure(
@@ -207,7 +394,7 @@ fn replaced_runtime_and_retired_manager_cannot_publish_carrier_pressure() {
         &leaf,
         &target,
         20,
-        Duration::from_millis(1),
+        1,
         1,
         Instant::now() - Duration::from_secs(2),
     );
@@ -294,7 +481,7 @@ fn shadowsocks_tcp_pressure_does_not_spend_native_udp_validation() {
             &leaf,
             target,
             20,
-            Duration::from_millis(10),
+            10,
             1,
             Instant::now() - Duration::from_secs(2),
         );

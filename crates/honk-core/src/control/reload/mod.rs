@@ -83,7 +83,7 @@ pub(super) struct ResolvedScorePlan {
     pub(super) mode: honk_outbound::group::SelectionPlanMode,
     pub(super) nodes: Vec<Node>,
     pub(super) health_family: IpVersion,
-    pub(super) feedback: Vec<Option<honk_outbound::group::ScoreFeedback>>,
+    pub(super) feedback: Vec<Option<honk_outbound::group::ScoreAttempt>>,
     pub(super) selection_chains: Vec<Vec<String>>,
     pub(super) final_owners: Vec<Vec<String>>,
 }
@@ -113,8 +113,9 @@ pub(super) fn resolve_urltest_retry_plan_for_target(
     group_manager: &GroupManager,
     outbound_name: &str,
     context: &honk_outbound::group::ScoreSelectionContext,
+    original: Option<&honk_outbound::group::ScoreContinuation>,
 ) -> ResolvedScorePlan {
-    own_score_plan(group_manager.urltest_retry_plan_for_target(outbound_name, context))
+    own_score_plan(group_manager.urltest_retry_plan_for_target(outbound_name, context, original))
 }
 
 pub(super) fn resolve_score_retry_plan_for_target(
@@ -123,12 +124,14 @@ pub(super) fn resolve_score_retry_plan_for_target(
     context: &honk_outbound::group::ScoreSelectionContext,
     failed_node: uuid::Uuid,
     final_owners: &[String],
+    original: &honk_outbound::group::ScoreContinuation,
 ) -> ResolvedScorePlan {
     own_score_plan(group_manager.score_retry_plan_for_target(
         outbound_name,
         context,
         failed_node,
         final_owners,
+        original,
     ))
 }
 
@@ -193,7 +196,7 @@ pub(super) fn resolve_outbound_plan_for_target(
         };
     }
     own_score_plan(
-        group_manager.selection_plan_for_target_with_health_fallback(outbound_name, context),
+        group_manager.selection_plan_for_target_with_health_fallback(outbound_name, context, None),
     )
 }
 
@@ -204,7 +207,7 @@ pub(super) struct ResolvedUdpPlan {
     pub(super) mode: honk_outbound::group::SelectionPlanMode,
     pub(super) nodes: Vec<Node>,
     pub(super) ipver: IpVersion,
-    pub(super) feedback: Vec<Option<honk_outbound::group::ScoreFeedback>>,
+    pub(super) feedback: Vec<Option<honk_outbound::group::ScoreAttempt>>,
     pub(super) selection_chains: Vec<Vec<String>>,
 }
 

@@ -26,7 +26,7 @@ impl GroupManager {
             visited,
             depth,
             effects,
-            None,
+            score::selection::ScoreSelectionRules::default(),
         )
         .map(|candidate| candidate.node)
     }
@@ -55,7 +55,7 @@ impl GroupManager {
             visited,
             depth,
             effects,
-            None,
+            score::selection::ScoreSelectionRules::default(),
         )
     }
 

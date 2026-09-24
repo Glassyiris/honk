@@ -1,3 +1,4 @@
+use super::super::verification;
 use super::*;
 
 #[test]
@@ -24,55 +25,67 @@ fn overlapping_layers_count_each_terminal_completion_once() {
 }
 
 #[test]
-fn settled_cohorts_stop_sampling_and_expiry_restores_bounded_coverage() {
-    for count in [2, 3, 4, 8, 32] {
-        let nodes: Vec<_> = (0..count).map(|i| node(&format!("node-{i}"))).collect();
-        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-        let target = context("business.example", IpVersion::V4);
-        let now = Instant::now();
-        for (index, leaf) in nodes.iter().enumerate() {
-            train_at(
-                &manager,
-                leaf,
-                &target,
-                20,
-                Duration::from_millis(if index == 0 { 10 } else { 600 }),
-                1,
-                now,
-            );
-        }
-        let period = exploration_period(count);
-        for _ in 0..period * count as u64 {
-            assert_eq!(
-                rank_at(&manager, &nodes, &target, now + Duration::from_secs(2)),
-                0
-            );
-        }
-        assert_eq!(
-            manager
-                .score_state()
-                .verification_counters("score", SelectionNetwork::Tcp)
-                .validation_selections,
-            0
+fn settled_cohorts_stop_sampling_and_expiry_spends_only_business_funding() {
+    let nodes: Vec<_> = (0..8).map(|i| node(&format!("node-{i}"))).collect();
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    for (index, leaf) in nodes.iter().enumerate() {
+        train_at(
+            &manager,
+            leaf,
+            &target,
+            20,
+            if index == 0 { 10 } else { 600 },
+            1,
+            now,
         );
-        let mut trials = std::collections::HashSet::new();
-        let expired = now + PERFORMANCE_MAX_AGE + Duration::from_secs(2);
-        for request in 0..period * (count as u64 - 1) {
-            let index = rank_at(&manager, &nodes, &target, expired);
-            if request.is_multiple_of(period) {
-                assert_ne!(index, 0);
-                trials.insert(index);
-            } else {
-                assert_eq!(index, 0);
-            }
-        }
-        assert_eq!(trials.len(), count - 1);
-        let reasons = manager
-            .score_state()
-            .selection_reason_counts("score", SelectionNetwork::Tcp);
-        assert_eq!(reasons.periodic_explore, count as u64 - 1);
-        assert_eq!(reasons.cold_explore, 0);
     }
+    let state = manager.score_state();
+    for _ in 0..32 {
+        let (index, feedback) = state.rank_plan_at(
+            "score",
+            &target,
+            &nodes.iter().collect::<Vec<_>>(),
+            now + Duration::from_secs(2),
+        );
+        assert_eq!(index, 0);
+        feedback
+            .begin_at(now + Duration::from_secs(2))
+            .unwrap()
+            .start_at(now + Duration::from_secs(2))
+            .finish_at(ScoreOutcome::Cancelled, false, now + Duration::from_secs(2));
+    }
+    assert_eq!(
+        manager
+            .score_budget_counters("score", SelectionNetwork::Tcp)
+            .trial_starts,
+        0
+    );
+    let expired = now + PERFORMANCE_MAX_AGE + Duration::from_secs(2);
+    let mut sampled = std::collections::HashSet::new();
+    for _ in 0..128 {
+        let before = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        let (index, feedback) =
+            state.rank_plan_at("score", &target, &nodes.iter().collect::<Vec<_>>(), expired);
+        feedback
+            .begin_at(expired)
+            .unwrap()
+            .start_at(expired)
+            .finish_at(ScoreOutcome::Cancelled, false, expired);
+        let after = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        if after.trial_starts > before.trial_starts {
+            sampled.insert(index);
+        }
+        assert!(
+            after.spent + after.reserved
+                <= after.cold_allowance + after.business_starts / after.earning_period
+        );
+    }
+    assert!(
+        sampled.len() > 1,
+        "unfinished questions rotate across real business offers"
+    );
 }
 
 #[test]
@@ -83,73 +96,56 @@ fn new_targets_cannot_mint_exploration_and_peek_cannot_spend_it() {
     let state = manager.score_state();
     for request in 0..64 {
         let target = context(&format!("{request}.example"), IpVersion::V4);
-        let before = state.selection_reason_counts("score", SelectionNetwork::Tcp);
+        let before = manager.score_budget_counters("score", SelectionNetwork::Tcp);
         for _ in 0..10 {
             state.peek_rank("score", &target, &nodes.iter().collect::<Vec<_>>());
         }
         assert_eq!(
-            state.selection_reason_counts("score", SelectionNetwork::Tcp),
+            manager.score_budget_counters("score", SelectionNetwork::Tcp),
             before
         );
-        let index = rank_at(&manager, &nodes, &target, now);
-        train_at(
-            &manager,
-            &nodes[index],
-            &target,
-            1,
-            Duration::from_millis(100),
-            1,
+        let (_, feedback) =
+            state.rank_plan_at("score", &target, &nodes.iter().collect::<Vec<_>>(), now);
+        feedback.begin_at(now).unwrap().start_at(now).finish_at(
+            ScoreOutcome::Cancelled,
+            false,
             now,
         );
     }
-    let reasons = state.selection_reason_counts("score", SelectionNetwork::Tcp);
-    assert!(reasons.cold_explore <= exploration_target(nodes.len()) as u64);
-    assert!(reasons.periodic_explore <= 64 / exploration_period(nodes.len()));
-    assert_eq!(state.inner.lock().selection_counts.len(), 1);
+    let counts = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    assert_eq!(counts.business_starts, 64);
+    assert_eq!(counts.scopes, 1);
+    assert!(counts.spent <= exploration_target(nodes.len()) as u64 + 63 / SCORE_EXPLORATION_PERIOD);
 }
 
 #[test]
-fn sparse_traffic_revalidates_on_time_without_minting_burst_trials() {
+fn sparse_selection_without_started_business_cannot_earn_currency() {
     let nodes: Vec<_> = (0..32).map(|i| node(&format!("node-{i}"))).collect();
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
-    for leaf in &nodes {
-        train_at(
+    for hour in 0..128 {
+        rank_at(
             &manager,
-            leaf,
+            &nodes,
             &target,
-            20,
-            Duration::from_millis(100),
-            1,
-            now,
+            now + Duration::from_secs(hour * 3600),
+        );
+        let counts = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        assert_eq!(
+            (
+                counts.business_starts,
+                counts.spent,
+                counts.reserved,
+                counts.earned_available
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(
+            counts.cold_available,
+            exploration_target(nodes.len()) as u64
         );
     }
-    assert_eq!(rank_at(&manager, &nodes, &target, now), 0);
-    let expired = now + PERFORMANCE_MAX_AGE + Duration::from_secs(2);
-    assert_ne!(rank_at(&manager, &nodes, &target, expired), 0);
-    let before = manager
-        .score_state()
-        .selection_reason_counts("score", SelectionNetwork::Tcp);
-    assert_eq!(before.periodic_explore, 1);
-    for _ in 0..15 {
-        rank_at(&manager, &nodes, &target, expired);
-    }
-    assert_eq!(
-        manager
-            .score_state()
-            .selection_reason_counts("score", SelectionNetwork::Tcp)
-            .periodic_explore,
-        before.periodic_explore,
-    );
-    rank_at(&manager, &nodes, &target, expired + REVALIDATION_INTERVAL);
-    assert_eq!(
-        manager
-            .score_state()
-            .selection_reason_counts("score", SelectionNetwork::Tcp)
-            .periodic_explore,
-        before.periodic_explore + 1,
-    );
 }
 
 #[test]
@@ -164,15 +160,7 @@ fn expired_backoff_gets_bounded_recovery_despite_normal_exclusion() {
     };
     let now = Instant::now();
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            Duration::from_millis(100),
-            1,
-            now,
-        );
+        train_at(&manager, leaf, &target, 20, 100, 1, now);
     }
     for _ in 0..3 {
         manager
@@ -181,43 +169,229 @@ fn expired_backoff_gets_bounded_recovery_despite_normal_exclusion() {
             .start_at(now)
             .finish_at(ScoreOutcome::Timeout, true, now);
     }
+    let state = manager.score_state();
+    let node_refs = [&nodes[0], &nodes[1]];
     for _ in 0..32 {
-        assert_eq!(rank_at(&manager, &nodes, &target, now), 0);
+        let (index, feedback) = state.rank_plan_at("score", &target, &node_refs, now);
+        assert_eq!(index, 0);
+        feedback.begin_at(now).unwrap().start_at(now).finish_at(
+            ScoreOutcome::Cancelled,
+            false,
+            now,
+        );
         assert_eq!(rank_at(&manager, &nodes, &aggregate, now), 0);
     }
     let expired = now + SCORE_EXPLORE_BACKOFF_BASE * 4 + Duration::from_secs(1);
     let mut active = Vec::new();
-    for leaf in &nodes {
-        let feedback = manager
-            .feedback_for_group_node("score", leaf.id, target.clone())
-            .unwrap();
-        for _ in 0..4 {
-            let reporter = feedback.start_at(expired);
-            reporter.setup_succeeded_at(expired);
-            reporter.transfer_at(1, 1, expired);
-            active.push(reporter);
-        }
-        probe_at(
-            &manager,
-            leaf,
-            &target,
-            ScoreSource::HealthProbe,
-            Duration::from_millis(100),
-            expired,
-        );
-    }
-    let recovered = manager
-        .score_state()
-        .verification_snapshot_at("score", &aggregate, &[&nodes[1]], expired)
+    let feedback = manager
+        .feedback_for_group_node("score", nodes[0].id, target.clone())
         .unwrap();
-    assert_eq!(recovered.state, ScoreVerificationState::ObservedUsable);
-    assert_eq!(rank_at(&manager, &nodes, &target, expired), 1);
-    assert_eq!(rank_at(&manager, &nodes, &target, expired), 0);
-    assert_eq!(rank_at(&manager, &nodes, &aggregate, expired), 1);
-    assert_eq!(rank_at(&manager, &nodes, &aggregate, expired), 0);
+    for _ in 0..4 {
+        let reporter = feedback.start_at(expired);
+        reporter.setup_succeeded_at(expired);
+        reporter.transfer_at(1, 1, expired);
+        active.push(reporter);
+    }
+    for leaf in &nodes {
+        probe_at(&manager, leaf, &target, 100, expired);
+    }
+    let decision = ranking::decision(
+        &state.inner.lock(),
+        "score",
+        &target,
+        &node_refs,
+        expired,
+        false,
+    );
+    assert_eq!(decision.scores[1].fail_streak, 3);
+    assert!(!decision.scores[1].explore_backed_off);
+    assert!(!ranking::normal_eligible(
+        &decision.scores[1],
+        decision.baseline
+    ));
     for reporter in active {
         reporter.finish_at(ScoreOutcome::Cancelled, true, expired);
     }
+    let before = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    let (index, feedback) = state.rank_plan_at("score", &target, &node_refs, expired);
+    assert_eq!(index, 1);
+    let reporter = feedback.begin_at(expired).unwrap().start_at(expired);
+    assert_eq!(rank_at(&manager, &nodes, &target, expired), 0);
+    assert_eq!(rank_at(&manager, &nodes, &aggregate, expired), 0);
+    let after = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    assert_eq!(after.trial_starts, before.trial_starts + 1);
+    assert!(
+        after.trial_starts + after.reserved
+            <= after.cold_allowance + after.business_starts / after.earning_period
+    );
+    reporter.finish_at(ScoreOutcome::Cancelled, false, expired);
+}
+
+#[test]
+fn unchanged_failed_incumbent_allows_funded_recovery_without_free_trials() {
+    let nodes = [node("recovery incumbent"), node("recovery challenger")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    train_at(&manager, &nodes[0], &target, 100, 10, 1, now);
+    train_at(&manager, &nodes[1], &target, 80, 100, 1, now);
+    assert_eq!(
+        rank_at(&manager, &nodes, &target, now + Duration::from_secs(2)),
+        0
+    );
+    let failed_at = now + Duration::from_secs(3);
+    for leaf in &nodes {
+        let reporter = manager
+            .feedback_for_group_node("score", leaf.id, target.clone())
+            .unwrap()
+            .start_at(failed_at);
+        reporter.setup_succeeded_at(failed_at);
+        reporter.transfer_at(1, 0, failed_at);
+        reporter.finish_at(ScoreOutcome::Timeout, true, failed_at);
+    }
+    let backed_off = failed_at + Duration::from_secs(1);
+    for _ in 0..128 {
+        manager
+            .feedback_for_group_node("score", nodes[0].id, target.clone())
+            .unwrap()
+            .business()
+            .begin_at(backed_off)
+            .unwrap()
+            .finish(ScoreOutcome::Cancelled);
+    }
+    let state = manager.score_state();
+    let refs = [&nodes[0], &nodes[1]];
+    let (index, attempt) = state.rank_plan_at("score", &target, &refs, backed_off);
+    assert_eq!(index, 0, "backed-off alternatives must not become trials");
+    attempt
+        .begin_at(backed_off)
+        .unwrap()
+        .start_at(backed_off)
+        .finish_at(ScoreOutcome::Cancelled, false, backed_off);
+    let before = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    assert_eq!((before.earned_available, before.trial_starts), (8, 0));
+
+    let later = now + Duration::from_secs(304);
+    {
+        let inner = state.inner.lock();
+        let decision = ranking::decision(&inner, "score", &target, &refs, later, false);
+        assert_eq!(decision.ordinary.index, 0);
+        assert_eq!(
+            decision.ordinary.reason,
+            SelectionReason::FreshFailureBypass
+        );
+        let evaluation = verification::evaluate(&decision, &refs, &target, None, later);
+        assert_eq!(evaluation.validation_index, Some(1));
+        assert!(evaluation.candidates[1].actionable());
+    }
+    let mut challenger_trials = 0;
+    let mut total_trials = 0;
+    let mut exhausted = false;
+    for second in 0..32 {
+        let at = later + Duration::from_secs(second);
+        let counts = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        let ordinary = ranking::decision(&state.inner.lock(), "score", &target, &refs, at, false)
+            .ordinary
+            .index;
+        let (index, attempt) = state.rank_plan_at("score", &target, &refs, at);
+        let reserved = manager
+            .score_budget_counters("score", SelectionNetwork::Tcp)
+            .reserved
+            > counts.reserved;
+        if counts.cold_available + counts.earned_available == 0 {
+            exhausted = true;
+            assert_eq!(
+                index, ordinary,
+                "an exhausted budget must keep the ordinary choice"
+            );
+            assert!(!reserved, "an exhausted budget cannot reserve a free trial");
+        }
+        challenger_trials += u64::from(reserved && index == 1);
+        total_trials += u64::from(reserved);
+        let reporter = attempt.begin_at(at).unwrap().start_at(at);
+        reporter.setup_succeeded_at(at);
+        reporter.transfer_at(1, 0, at);
+        reporter.finish_at(ScoreOutcome::Cancelled, true, at + Duration::from_millis(1));
+        let after = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        assert_eq!(
+            after.trial_starts - counts.trial_starts,
+            u64::from(reserved)
+        );
+        assert!(
+            after.spent + after.reserved
+                <= after.cold_allowance + after.business_starts / after.earning_period
+        );
+    }
+    let after = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    assert!(
+        challenger_trials > 0,
+        "funded actionable recovery must remain reachable"
+    );
+    assert!(exhausted);
+    assert_eq!(after.trial_cancelled - before.trial_cancelled, total_trials);
+    assert_eq!(after.refunded, before.refunded);
+    let escape_at = later + Duration::from_secs(32);
+    for leaf in &nodes {
+        assert!(
+            score_snapshot(&state.inner.lock(), "score", &target, leaf.id, escape_at)
+                .unresolved_failure
+        );
+    }
+
+    let failure = manager
+        .feedback_for_group_node("score", nodes[1].id, target.clone())
+        .unwrap()
+        .start_at(escape_at);
+    failure.finish_at(ScoreOutcome::Timeout, false, escape_at);
+    let (index, attempt) = state.rank_plan_at("score", &target, &refs, escape_at);
+    assert_eq!(index, 0);
+    attempt
+        .begin_at(escape_at)
+        .unwrap()
+        .finish(ScoreOutcome::Cancelled);
+
+    train_at(&manager, &nodes[1], &target, 100, 10, 1, escape_at);
+    let escape_at = escape_at + Duration::from_secs(2);
+    for _ in 0..before.earning_period {
+        manager
+            .feedback_for_group_node("score", nodes[0].id, target.clone())
+            .unwrap()
+            .business()
+            .begin_at(escape_at)
+            .unwrap()
+            .finish(ScoreOutcome::Cancelled);
+    }
+    assert!(
+        manager
+            .score_budget_counters("score", SelectionNetwork::Tcp)
+            .earned_available
+            > 0
+    );
+    {
+        let inner = state.inner.lock();
+        let decision = ranking::decision(&inner, "score", &target, &refs, escape_at, false);
+        assert_eq!(decision.ordinary.index, 1);
+        assert_eq!(
+            decision.ordinary.reason,
+            SelectionReason::FreshFailureBypass
+        );
+        let evaluation = verification::evaluate(&decision, &refs, &target, None, escape_at);
+        assert_eq!(evaluation.validation_index, Some(0));
+    }
+    let (index, attempt) = state.rank_plan_at("score", &target, &refs, escape_at);
+    assert_eq!(
+        index, 1,
+        "ordinary escape takes priority over optional recovery"
+    );
+    attempt
+        .begin_at(escape_at)
+        .unwrap()
+        .start_at(escape_at)
+        .finish_at(ScoreOutcome::Cancelled, false, escape_at);
+    let escaped = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    assert_eq!(escaped.spent, after.spent);
+    assert_eq!(escaped.trial_starts, after.trial_starts);
+    assert_eq!(escaped.reserved, 0);
 }
 
 #[test]
@@ -252,7 +426,7 @@ fn source_outcomes_do_not_forgive_traffic_backoff() {
             .finish_at(ScoreOutcome::Timeout, true, now);
     }
     for source in [ScoreSource::HealthProbe, ScoreSource::Warmup] {
-        probe_at(
+        probe_source_at(
             &manager,
             &nodes[0],
             &target,
@@ -291,7 +465,7 @@ fn latency_degradation_revalidation_cannot_bypass_exposure_budget() {
             leaf,
             &target,
             20,
-            Duration::from_millis(if index == 0 { 10 } else { 600 }),
+            if index == 0 { 10 } else { 600 },
             1,
             now,
         );
@@ -305,165 +479,32 @@ fn latency_degradation_revalidation_cannot_bypass_exposure_budget() {
         &nodes[0],
         &target,
         1,
-        Duration::from_millis(100),
+        100,
         1,
         now + Duration::from_secs(3),
     );
-    for _ in 1..15 {
-        assert_eq!(
-            rank_at(&manager, &nodes, &target, now + Duration::from_secs(4)),
-            0
+    let state = manager.score_state();
+    let node_refs = nodes.iter().collect::<Vec<_>>();
+    let at = now + Duration::from_secs(4);
+    let before = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    for _ in 0..128 {
+        let (_, feedback) = state.rank_plan_at("score", &target, &node_refs, at);
+        feedback
+            .begin_at(at)
+            .unwrap()
+            .start_at(at)
+            .finish_at(ScoreOutcome::Cancelled, false, at);
+        let counts = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        assert!(
+            counts.trial_starts + counts.reserved
+                <= counts.cold_allowance + counts.business_starts / counts.earning_period
         );
     }
-    assert_ne!(
-        rank_at(&manager, &nodes, &target, now + Duration::from_secs(4)),
-        0
-    );
-    assert_eq!(
-        rank_at(&manager, &nodes, &target, now + Duration::from_secs(4)),
-        0
-    );
-    assert_eq!(
-        manager
-            .score_state()
-            .selection_reason_counts("score", SelectionNetwork::Tcp)
-            .periodic_explore,
-        1
-    );
-}
-
-#[test]
-fn periodic_exploration_is_scoped_by_network_and_family() {
-    let nodes = [node("a"), node("b")];
-    let manager = super::super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
-    let targeted = |network, family| ScoreSelectionContext {
-        network,
-        probe_domain: if network == SelectionNetwork::Tcp {
-            ProbeDomain::Tcp
-        } else {
-            ProbeDomain::DataUdp
-        },
-        target_family: Some(family),
-        health_family: family,
-        target: Some(ScoreTarget::domain("target.example", 443)),
-    };
-    let aggregate = |network| {
-        ScoreSelectionContext::aggregate(
-            network,
-            if network == SelectionNetwork::Tcp {
-                ProbeDomain::Tcp
-            } else {
-                ProbeDomain::DataUdp
-            },
-            IpVersion::V4,
-        )
-    };
-    let contexts = [
-        targeted(SelectionNetwork::Tcp, IpVersion::V4),
-        targeted(SelectionNetwork::Tcp, IpVersion::V6),
-        targeted(SelectionNetwork::Udp, IpVersion::V4),
-        targeted(SelectionNetwork::Udp, IpVersion::V6),
-        aggregate(SelectionNetwork::Tcp),
-        aggregate(SelectionNetwork::Udp),
-    ];
-    for context in &contexts {
-        let _ = manager.selection_plan_for_target("score", context);
-    }
-    let state = manager.score_state();
-    assert_eq!(state.inner.lock().selection_counts.len(), 6);
-    println!(
-        "cadence scope cardinality={}",
-        state.inner.lock().selection_counts.len()
-    );
-
-    let tcp_v4_key = SelectionCadenceKey::new("score", &contexts[0]);
-    state
-        .inner
-        .lock()
-        .selection_counts
-        .get_mut(&tcp_v4_key)
-        .unwrap()
-        .count = exploration_period(nodes.len()) - 1;
-    let _ = manager.selection_plan_for_target("score", &contexts[2]);
-    assert_eq!(
-        state.inner.lock().selection_counts[&tcp_v4_key].count,
-        exploration_period(nodes.len()) - 1,
-        "UDP-V4 must not consume TCP-V4 cadence"
-    );
-    let _ = manager.selection_plan_for_target("score", &contexts[0]);
-    assert_eq!(
-        state.inner.lock().selection_counts[&tcp_v4_key].count,
-        exploration_period(nodes.len())
-    );
-
-    let different_target = context("other.example", IpVersion::V4);
-    let _ = manager.selection_plan_for_target("score", &different_target);
-    assert_eq!(state.inner.lock().selection_counts.len(), 6);
-}
-
-#[test]
-fn selection_count_reload_lifecycle_matches_group_name() {
-    let nodes = [node("a"), node("b")];
-    let old = super::super::super::GroupManager::new(&[group("score", &nodes)], &nodes);
-    let context = context("reload.example", IpVersion::V4);
-    let _ = old.selection_plan_for_target("score", &context);
-    let state = old.score_state();
-    let before: u64 = state
-        .inner
-        .lock()
-        .selection_counts
-        .values()
-        .map(|cadence| cadence.count)
-        .sum();
-
-    let empty = super::super::super::GroupManager::with_alive_set_and_score_state(
-        &[group("score", &[])],
-        &[],
-        None,
-        Arc::clone(&state),
-    );
-    empty.publish_score_membership();
-    assert_eq!(
-        state
-            .inner
-            .lock()
-            .selection_counts
-            .values()
-            .map(|cadence| cadence.count)
-            .sum::<u64>(),
-        before,
-        "a committed group name retains cadence through zero leaves"
-    );
-
-    let mut selector = group("score", &nodes);
-    selector.policy = GroupPolicy::Selector;
-    let non_score = super::super::super::GroupManager::with_alive_set_and_score_state(
-        &[selector],
-        &nodes,
-        None,
-        Arc::clone(&state),
-    );
-    non_score.publish_score_membership();
-    assert_eq!(
-        state
-            .inner
-            .lock()
-            .selection_counts
-            .values()
-            .map(|cadence| cadence.count)
-            .sum::<u64>(),
-        before,
-        "a surviving name retains cadence through Score to non-Score"
-    );
-
-    let removed = super::super::super::GroupManager::with_alive_set_and_score_state(
-        &[],
-        &[],
-        None,
-        Arc::clone(&state),
-    );
-    removed.publish_score_membership();
-    assert!(state.inner.lock().selection_counts.is_empty());
+    let after = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    assert_eq!(after.business_starts, before.business_starts + 128);
+    assert!(after.trial_starts > before.trial_starts);
+    assert_eq!(after.trial_cancelled, after.trial_starts);
+    assert_eq!(after.refunded, before.refunded);
 }
 
 #[test]
@@ -472,36 +513,33 @@ fn cancelled_cold_trials_keep_alternative_coverage() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        20,
-        Duration::from_millis(100),
-        1,
-        now,
-    );
+    train_at(&manager, &nodes[0], &target, 20, 100, 1, now);
     let state = manager.score_state();
     let mut trials = std::collections::HashSet::new();
-    let requests = exploration_target(nodes.len()) as u64 + exploration_period(nodes.len()) * 2;
+    let requests = exploration_target(nodes.len()) as u64 + SCORE_EXPLORATION_PERIOD * 2;
+    let node_refs = nodes.iter().collect::<Vec<_>>();
+    let at = now + Duration::from_secs(2);
     for _ in 0..requests {
-        let before = state.selection_reason_counts("score", SelectionNetwork::Tcp);
-        let index = rank_at(&manager, &nodes, &target, now + Duration::from_secs(2));
-        let after = state.selection_reason_counts("score", SelectionNetwork::Tcp);
-        if after.periodic_explore > before.periodic_explore {
+        let before = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        let (index, feedback) = state.rank_plan_at("score", &target, &node_refs, at);
+        feedback
+            .begin_at(at)
+            .unwrap()
+            .start_at(at)
+            .finish_at(ScoreOutcome::Cancelled, true, at);
+        let after = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        if after.trial_starts > before.trial_starts {
             trials.insert(index);
         }
-        if index != 0 {
-            manager
-                .feedback_for_group_node("score", nodes[index].id, target.clone())
-                .unwrap()
-                .start_at(now)
-                .finish_at(ScoreOutcome::Cancelled, true, now);
-        }
+        assert!(
+            after.trial_starts + after.reserved
+                <= after.cold_allowance + after.business_starts / after.earning_period
+        );
     }
     assert_eq!(trials, std::collections::HashSet::from([1, 2]));
-    let reasons = state.selection_reason_counts("score", SelectionNetwork::Tcp);
-    assert_eq!(reasons.periodic_explore, 2);
+    let counts = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    assert_eq!(counts.trial_cancelled, counts.trial_starts);
+    assert_eq!(counts.refunded, 0);
     for leaf in &nodes[1..] {
         let score = score_snapshot(&state.inner.lock(), "score", &target, leaf.id, now);
         assert_eq!(
@@ -518,46 +556,62 @@ fn qualified_trial_does_not_replace_committed_incumbent_without_new_evidence() {
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
     for (leaf, latency) in nodes.iter().zip([100, 105]) {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            Duration::from_millis(latency),
-            1,
-            now,
-        );
+        train_at(&manager, leaf, &target, 20, latency, 1, now);
     }
+    let state = manager.score_state();
+    let node_refs = [&nodes[0], &nodes[1]];
     let mut at = now + Duration::from_secs(2);
-    for _ in 1..exploration_period(nodes.len()) {
-        assert_eq!(rank_at(&manager, &nodes, &target, at), 0);
+    let (index, feedback) = state.rank_plan_at("score", &target, &node_refs, at);
+    assert_eq!(index, 0);
+    feedback
+        .begin_at(at)
+        .unwrap()
+        .start_at(at)
+        .finish_at(ScoreOutcome::Cancelled, false, at);
+    for _ in 0..4 * SCORE_EXPLORATION_PERIOD {
+        manager
+            .feedback_for_group_node("score", nodes[0].id, target.clone())
+            .unwrap()
+            .business()
+            .begin_at(at)
+            .unwrap()
+            .start_at(at)
+            .finish_at(ScoreOutcome::Cancelled, false, at);
     }
     at += PERFORMANCE_MAX_AGE;
-    assert_eq!(rank_at(&manager, &nodes, &target, at), 1);
-    manager
-        .feedback_for_group_node("score", nodes[1].id, target.clone())
+    let before_control = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    let (index, control) = state.rank_plan_at("score", &target, &node_refs, at);
+    assert_eq!(index, 0);
+    control
+        .begin_at(at)
+        .unwrap()
+        .start_at(at)
+        .finish_at(ScoreOutcome::Cancelled, false, at);
+    let after_control = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    assert_eq!(after_control.spent, before_control.spent);
+    assert_eq!(after_control.trial_starts, before_control.trial_starts);
+    let (index, feedback) = state.rank_plan_at("score", &target, &node_refs, at);
+    assert_eq!(index, 1);
+    feedback
+        .begin_at(at)
         .unwrap()
         .start_at(at)
         .finish_at(ScoreOutcome::Cancelled, true, at);
-    assert_eq!(rank_at(&manager, &nodes, &target, at), 0);
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        20,
-        Duration::from_millis(100),
-        1,
-        at,
+    assert_eq!(state.peek_rank_at("score", &target, &node_refs, at), 0);
+    assert_eq!(
+        manager
+            .score_budget_counters("score", SelectionNetwork::Tcp)
+            .trial_starts,
+        1
     );
-    train_at(
-        &manager,
-        &nodes[1],
-        &target,
-        20,
-        Duration::from_millis(50),
-        1,
-        at,
+    assert_eq!(
+        state
+            .selection_reason_counts("score", SelectionNetwork::Tcp)
+            .ordinary_switch,
+        0
     );
+    train_at(&manager, &nodes[0], &target, 20, 100, 1, at);
+    train_at(&manager, &nodes[1], &target, 20, 50, 1, at);
     assert_eq!(
         rank_at(&manager, &nodes, &target, at + Duration::from_secs(1)),
         1
@@ -566,7 +620,7 @@ fn qualified_trial_does_not_replace_committed_incumbent_without_new_evidence() {
         manager
             .score_state()
             .selection_reason_counts("score", SelectionNetwork::Tcp)
-            .periodic_explore,
+            .ordinary_switch,
         1
     );
 }
@@ -579,15 +633,7 @@ fn first_normal_selection_uses_quality_not_the_last_startup_trial() {
     let now = Instant::now();
     for (index, latency) in [100, 105].into_iter().enumerate() {
         assert_eq!(rank_at(&manager, &nodes, &target, now), index);
-        train_at(
-            &manager,
-            &nodes[index],
-            &target,
-            20,
-            Duration::from_millis(latency),
-            1,
-            now,
-        );
+        train_at(&manager, &nodes[index], &target, 20, latency, 1, now);
     }
     assert_eq!(
         rank_at(&manager, &nodes, &target, now + Duration::from_secs(2)),
@@ -596,7 +642,7 @@ fn first_normal_selection_uses_quality_not_the_last_startup_trial() {
 }
 
 #[test]
-fn real_success_steps_down_failure_backoff_instead_of_resetting_the_streak() {
+fn terminal_success_with_same_time_rx_does_not_clear_failure_backoff() {
     let leaf = node("recovering");
     let nodes = std::slice::from_ref(&leaf);
     let manager = GroupManager::new(&[group("score", nodes)], nodes);
@@ -616,13 +662,13 @@ fn real_success_steps_down_failure_backoff_instead_of_resetting_the_streak() {
     success.finish_at(ScoreOutcome::Success, true, now);
     let state = manager.score_state();
     let recovered = score_snapshot(&state.inner.lock(), "score", &target, leaf.id, now);
-    assert_eq!(recovered.fail_streak, 1);
-    assert!(!recovered.explore_backed_off);
+    assert_eq!(recovered.fail_streak, 2);
+    assert!(recovered.explore_backed_off);
 
     feedback
         .start_at(now)
         .finish_at(ScoreOutcome::Timeout, true, now);
-    let until = now + SCORE_EXPLORE_BACKOFF_BASE * 2;
+    let until = now + SCORE_EXPLORE_BACKOFF_BASE * 4;
     let before = score_snapshot(
         &state.inner.lock(),
         "score",
@@ -631,7 +677,43 @@ fn real_success_steps_down_failure_backoff_instead_of_resetting_the_streak() {
         until - Duration::from_nanos(1),
     );
     let expired = score_snapshot(&state.inner.lock(), "score", &target, leaf.id, until);
-    assert_eq!(expired.fail_streak, 2);
+    assert_eq!(expired.fail_streak, 3);
     assert!(before.explore_backed_off);
     assert!(!expired.explore_backed_off);
+}
+
+#[test]
+fn unbegun_plans_do_not_rotate_discovery() {
+    let nodes = [node("rotation a"), node("rotation b"), node("rotation c")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("rotation.example", IpVersion::V4);
+    let state = manager.score_state();
+    let refs: Vec<_> = nodes.iter().collect();
+    let now = Instant::now();
+    // Rotation state is only visible once each member has begun real work.
+    for leaf in &nodes {
+        train_at(&manager, leaf, &target, 1, 10, 1, now);
+    }
+    let at = now + Duration::from_secs(2);
+    let rotation = |index: usize| {
+        score_snapshot(&state.inner.lock(), "score", &target, nodes[index].id, at).selected_at
+    };
+    let before: Vec<_> = (0..nodes.len()).map(rotation).collect();
+    let (index, dropped) = state.rank_plan_at("score", &target, &refs, at);
+    drop(dropped);
+    assert_eq!(
+        rotation(index),
+        before[index],
+        "an unbegun plan is not an opportunity"
+    );
+    let (index, attempt) = state.rank_plan_at("score", &target, &refs, at);
+    attempt
+        .begin_at(at)
+        .unwrap()
+        .start_at(at)
+        .finish_at(ScoreOutcome::Success, true, at);
+    assert!(
+        rotation(index) > before[index],
+        "an admitted begin advances rotation"
+    );
 }

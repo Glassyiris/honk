@@ -407,7 +407,8 @@ async fn tcp_fallback_keeps_selected_score_group_chain() {
             .collect::<Vec<_>>(),
         ["selected"]
     );
-    let feedback = pool.tcp_feedback_for_route(entry, &route).unwrap();
+    let _business = route.feedback.as_ref().unwrap().begin().unwrap();
+    let feedback = pool.tcp_feedback_for_route(entry, &route).unwrap().unwrap();
     assert_eq!(
         feedback
             .attributions()

@@ -7,6 +7,23 @@ pub(in crate::group) struct ExcludedScoreLeaf<'a> {
     final_owners: &'a [String],
 }
 
+#[derive(Clone, Copy)]
+pub(in crate::group) struct ScoreSelectionRules<'a> {
+    pub(in crate::group) cold_urltest: bool,
+    pub(in crate::group) allow_trials: bool,
+    pub(in crate::group) excluded: Option<&'a ExcludedScoreLeaf<'a>>,
+}
+
+impl Default for ScoreSelectionRules<'_> {
+    fn default() -> Self {
+        Self {
+            cold_urltest: false,
+            allow_trials: true,
+            excluded: None,
+        }
+    }
+}
+
 impl super::GroupManager {
     /// Shared scorer handle for fallible reload construction.
     pub fn score_state(&self) -> Arc<ScorePolicyState> {
@@ -119,19 +136,27 @@ impl super::GroupManager {
         &self,
         group_name: &str,
         context: &ScoreSelectionContext,
+        original: Option<&ScoreContinuation>,
     ) -> super::ScoreSelectionPlan<'_> {
         let plan = self.selection_plan_for_target_with_effects(
             group_name,
             context,
             super::SelectionEffects::ApplyWithHealthFallback,
             None,
+            original,
         );
         if !plan.entries.is_empty() || context.health_family != IpVersion::V6 {
             return plan;
         }
         let mut fallback = context.clone();
         fallback.health_family = IpVersion::V4;
-        self.selection_plan_for_target(group_name, &fallback)
+        self.selection_plan_for_target_with_effects(
+            group_name,
+            &fallback,
+            super::SelectionEffects::Apply,
+            None,
+            original,
+        )
     }
     /// Return the latency-ordered URLTest alternatives for one target without
     /// changing selection state. Each entry keeps the same Honk attribution
@@ -140,6 +165,7 @@ impl super::GroupManager {
         &self,
         group_name: &str,
         context: &ScoreSelectionContext,
+        original: Option<&ScoreContinuation>,
     ) -> super::ScoreSelectionPlan<'_> {
         let Some(group) = self.groups.get(group_name) else {
             return super::ScoreSelectionPlan {
@@ -162,7 +188,10 @@ impl super::GroupManager {
             &mut visited,
             0,
             super::SelectionEffects::Peek,
-            None,
+            ScoreSelectionRules {
+                allow_trials: false,
+                ..Default::default()
+            },
         );
         let candidates = self.filter_alive_candidates(
             candidates,
@@ -186,7 +215,12 @@ impl super::GroupManager {
                 candidate
             })
             .collect();
-        self.score_selection_plan(candidates, super::SelectionPlanMode::Authoritative, context)
+        self.score_selection_plan(
+            candidates,
+            super::SelectionPlanMode::Authoritative,
+            context,
+            original,
+        )
     }
 
     /// Resolve one different Score-owned TCP leaf without opening a new final edge.
@@ -197,6 +231,7 @@ impl super::GroupManager {
         context: &ScoreSelectionContext,
         failed_node: Uuid,
         final_owners: &[String],
+        original: &ScoreContinuation,
     ) -> super::ScoreSelectionPlan<'_> {
         let excluded = ExcludedScoreLeaf {
             node_id: failed_node,
@@ -207,6 +242,7 @@ impl super::GroupManager {
             context,
             super::SelectionEffects::Apply,
             Some(&excluded),
+            Some(original),
         );
         plan.entries.retain(|entry| entry.feedback.is_some());
         plan
@@ -217,7 +253,9 @@ impl super::GroupManager {
         candidates: Vec<super::Candidate<'a>>,
         mode: super::SelectionPlanMode,
         context: &ScoreSelectionContext,
+        original: Option<&ScoreContinuation>,
     ) -> super::ScoreSelectionPlan<'a> {
+        let mut opportunity = original.map(|original| Arc::clone(&original.opportunity));
         super::ScoreSelectionPlan {
             mode,
             health_family: context.health_family,
@@ -237,16 +275,26 @@ impl super::GroupManager {
                         .into_iter()
                         .map(str::to_owned)
                         .collect();
-                    let feedback = (!attributions.is_empty())
-                        .then(|| {
-                            ScoreFeedback::new(
-                                Arc::clone(&self.score_state),
-                                Arc::clone(&self.score_authority),
-                                context.clone(),
-                                attributions,
+                    let feedback =
+                        (!attributions.is_empty()).then(|| {
+                            ScoreAttempt::planned(
+                                ScoreFeedback::new(
+                                    Arc::clone(&self.score_state),
+                                    Arc::clone(&self.score_authority),
+                                    context.clone(),
+                                    attributions,
+                                ),
+                                Arc::clone(opportunity.get_or_insert_with(|| {
+                                    Arc::new(budget::Opportunity::default())
+                                })),
+                                candidate.score_work,
+                                if original.is_some() {
+                                    ScoreTrialSource::Recovery
+                                } else {
+                                    ScoreTrialSource::None
+                                },
                             )
-                        })
-                        .filter(|_| self.score_state.is_current_authority(&self.score_authority));
+                        });
                     super::ScoreSelectionEntry {
                         node: candidate.node,
                         feedback,
@@ -274,6 +322,7 @@ impl super::GroupManager {
             context,
             super::SelectionEffects::Apply,
             None,
+            None,
         )
     }
 
@@ -283,12 +332,14 @@ impl super::GroupManager {
         context: &ScoreSelectionContext,
         effects: super::SelectionEffects,
         excluded: Option<&ExcludedScoreLeaf<'_>>,
+        original: Option<&ScoreContinuation>,
     ) -> super::ScoreSelectionPlan<'_> {
         let Some(group) = self.groups.get(group_name) else {
             return self.score_selection_plan(
                 Vec::new(),
                 super::SelectionPlanMode::Authoritative,
                 context,
+                original,
             );
         };
         if effects.applies() {
@@ -300,13 +351,15 @@ impl super::GroupManager {
             &mut Vec::new(),
             0,
             effects,
-            excluded.is_none(),
-            excluded,
+            ScoreSelectionRules {
+                cold_urltest: excluded.is_none(),
+                allow_trials: excluded.is_none() && original.is_none(),
+                excluded,
+            },
         );
-        self.score_selection_plan(candidates, mode, context)
+        self.score_selection_plan(candidates, mode, context, original)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::group) fn selection_candidates_for_target<'a>(
         &'a self,
         group: &'a honk_config::group::Group,
@@ -314,24 +367,16 @@ impl super::GroupManager {
         visited: &mut Vec<&'a str>,
         depth: usize,
         effects: super::SelectionEffects,
-        cold_urltest: bool,
-        excluded: Option<&ExcludedScoreLeaf<'_>>,
+        rules: ScoreSelectionRules<'_>,
     ) -> (super::SelectionPlanMode, Vec<super::Candidate<'a>>) {
         if depth >= super::MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
             return (super::SelectionPlanMode::Authoritative, Vec::new());
         }
-        let (mut mode, mut candidates) = self.normal_candidates_for_target(
-            group,
-            context,
-            visited,
-            depth,
-            effects,
-            cold_urltest,
-            excluded,
-        );
+        let (mut mode, mut candidates) =
+            self.normal_candidates_for_target(group, context, visited, depth, effects, rules);
         if candidates.is_empty()
             && let Some(member) = self.final_member(group)
-            && excluded.is_none_or(|excluded| {
+            && rules.excluded.is_none_or(|excluded| {
                 matches!(member, GroupMember::Group(_))
                     && excluded.final_owners.contains(&group.name)
             })
@@ -348,8 +393,7 @@ impl super::GroupManager {
                         visited,
                         depth,
                         effects.peek(),
-                        cold_urltest,
-                        excluded,
+                        rules,
                     )
                     .1
                     .is_empty()
@@ -375,6 +419,7 @@ impl super::GroupManager {
                             attribution: Vec::new(),
                             selection_chain: vec![node.name.as_str()],
                             final_owners: Vec::new(),
+                            score_work: Vec::new(),
                         });
                     }
                 }
@@ -389,8 +434,7 @@ impl super::GroupManager {
                         visited,
                         depth + 1,
                         effects,
-                        cold_urltest,
-                        excluded,
+                        rules,
                     );
                     visited.pop();
                     for candidate in &mut candidates {
@@ -409,7 +453,6 @@ impl super::GroupManager {
         (mode, candidates)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn normal_candidates_for_target<'a>(
         &'a self,
         group: &'a honk_config::group::Group,
@@ -417,12 +460,11 @@ impl super::GroupManager {
         visited: &mut Vec<&'a str>,
         depth: usize,
         effects: super::SelectionEffects,
-        cold_urltest: bool,
-        excluded: Option<&ExcludedScoreLeaf<'_>>,
+        rules: ScoreSelectionRules<'_>,
     ) -> (super::SelectionPlanMode, Vec<super::Candidate<'a>>) {
         let selected_member = self.selector_member(group);
         let mut candidates =
-            self.flatten_candidates_for_target(group, context, visited, depth, effects, excluded);
+            self.flatten_candidates_for_target(group, context, visited, depth, effects, rules);
         let before_filter = (effects.applies()
             && group.policy == honk_config::group::GroupPolicy::Score
             && self.score_state.is_current_authority(&self.score_authority))
@@ -442,14 +484,17 @@ impl super::GroupManager {
             );
         }
         if candidates.is_empty() {
-            let candidate = excluded
+            let candidate = rules
+                .excluded
                 .is_none()
                 .then(|| {
-                    self.last_resort_candidate_for_target(group, context, visited, depth, effects)
+                    self.last_resort_candidate_for_target(
+                        group, context, visited, depth, effects, rules,
+                    )
                 })
                 .flatten();
             let mode = if candidate.is_none()
-                && cold_urltest
+                && rules.cold_urltest
                 && group.policy == honk_config::group::GroupPolicy::URLTest
             {
                 super::SelectionPlanMode::ColdUrlTest
@@ -458,7 +503,7 @@ impl super::GroupManager {
             };
             return (mode, candidate.into_iter().collect());
         }
-        if cold_urltest
+        if rules.cold_urltest
             && group.policy == honk_config::group::GroupPolicy::URLTest
             && !candidates.iter().any(|candidate| {
                 self.node_latency(
@@ -485,7 +530,7 @@ impl super::GroupManager {
                 .and_then(|member| Self::pick_selector(&candidates, member))
                 .and_then(|picked| {
                     self.commit_selector_pick_for_target(
-                        group, picked, context, visited, depth, effects, excluded,
+                        group, picked, context, visited, depth, effects, rules,
                     )
                 }),
             honk_config::group::GroupPolicy::URLTest => Some(self.pick_urltest(
@@ -502,7 +547,7 @@ impl super::GroupManager {
                 Some(self.pick_fallback(&candidates, group, context.network, effects))
             }
             honk_config::group::GroupPolicy::Score => {
-                Some(self.pick_score(&candidates, group, context, effects))
+                Some(self.pick_score(&candidates, group, context, effects, rules.allow_trials))
             }
         };
         (
@@ -518,6 +563,7 @@ impl super::GroupManager {
         visited: &mut Vec<&'a str>,
         depth: usize,
         effects: super::SelectionEffects,
+        rules: ScoreSelectionRules<'_>,
     ) -> Option<super::Candidate<'a>> {
         if depth >= super::MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
             return None;
@@ -539,6 +585,7 @@ impl super::GroupManager {
                 attribution: Vec::new(),
                 selection_chain: vec![node.name.as_str()],
                 final_owners: Vec::new(),
+                score_work: Vec::new(),
             });
         }
 
@@ -550,7 +597,7 @@ impl super::GroupManager {
                 return None;
             }
             let subgroup = self.groups.get(tag)?;
-            self.pick_candidate_for_target(subgroup, context, visited, depth + 1, effects, None)
+            self.pick_candidate_for_target(subgroup, context, visited, depth + 1, effects, rules)
                 .filter(|candidate| candidate.node.id == node.id)
                 .map(|mut candidate| {
                     candidate.via = Some(subgroup);
@@ -561,7 +608,6 @@ impl super::GroupManager {
         candidate
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::group) fn pick_candidate_for_target<'a>(
         &'a self,
         group: &'a honk_config::group::Group,
@@ -569,17 +615,24 @@ impl super::GroupManager {
         visited: &mut Vec<&'a str>,
         depth: usize,
         effects: super::SelectionEffects,
-        excluded: Option<&ExcludedScoreLeaf<'_>>,
+        rules: ScoreSelectionRules<'_>,
     ) -> Option<super::Candidate<'a>> {
         self.selection_candidates_for_target(
-            group, context, visited, depth, effects, false, excluded,
+            group,
+            context,
+            visited,
+            depth,
+            effects,
+            ScoreSelectionRules {
+                cold_urltest: false,
+                ..rules
+            },
         )
         .1
         .into_iter()
         .next()
     }
 
-    /// Commit only the serving Selector subgroup; refusal cannot restore its stale peek.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::group) fn commit_selector_pick_for_target<'a>(
         &'a self,
@@ -589,25 +642,22 @@ impl super::GroupManager {
         visited: &mut Vec<&'a str>,
         depth: usize,
         effects: super::SelectionEffects,
-        excluded: Option<&ExcludedScoreLeaf<'_>>,
+        rules: ScoreSelectionRules<'_>,
     ) -> Option<super::Candidate<'a>> {
-        if !effects.applies() {
-            return Some(picked);
-        }
-        let Some(sub) = picked.via else {
+        let Some(sub) = picked.via.filter(|_| effects.applies()) else {
             return Some(picked);
         };
         self.mark_used(&sub.name);
         visited.push(group.name.as_str());
         let committed =
-            self.pick_candidate_for_target(sub, context, visited, depth + 1, effects, excluded);
+            self.pick_candidate_for_target(sub, context, visited, depth + 1, effects, rules);
         visited.pop();
-        let mut committed = committed?;
-        committed.via = picked.via;
-        Some(committed)
+        committed.map(|mut committed| {
+            committed.via = picked.via;
+            committed
+        })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::group) fn flatten_candidates_for_target<'a>(
         &'a self,
         group: &'a honk_config::group::Group,
@@ -615,7 +665,7 @@ impl super::GroupManager {
         visited: &mut Vec<&'a str>,
         depth: usize,
         effects: super::SelectionEffects,
-        excluded: Option<&ExcludedScoreLeaf<'_>>,
+        rules: ScoreSelectionRules<'_>,
     ) -> Vec<super::Candidate<'a>> {
         if depth >= super::MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
             return Vec::new();
@@ -632,13 +682,18 @@ impl super::GroupManager {
             .nodes
             .iter()
             .filter_map(|id| self.nodes.get(id))
-            .filter(|node| excluded.is_none_or(|excluded| node.id != excluded.node_id))
+            .filter(|node| {
+                rules
+                    .excluded
+                    .is_none_or(|excluded| node.id != excluded.node_id)
+            })
             .map(|node| super::Candidate {
                 via: None,
                 node,
                 attribution: Vec::new(),
                 selection_chain: vec![node.name.as_str()],
                 final_owners: Vec::new(),
+                score_work: Vec::new(),
             })
             .collect();
         for tag in &group.groups {
@@ -654,7 +709,7 @@ impl super::GroupManager {
                 visited,
                 depth + 1,
                 sub_effects,
-                excluded,
+                rules,
             ) {
                 candidate.via = Some(subgroup);
                 candidates.push(candidate);
@@ -681,7 +736,7 @@ impl super::GroupManager {
             &mut Vec::new(),
             0,
             super::SelectionEffects::Peek,
-            None,
+            ScoreSelectionRules::default(),
         );
         let candidates = self.filter_alive_candidates(
             candidates,
@@ -720,6 +775,15 @@ impl super::GroupManager {
         self.score_state.verification_counters(group_name, network)
     }
 
+    /// Fixed aggregate accounting; reading cannot reserve, expire, or earn currency.
+    pub fn score_budget_counters(
+        &self,
+        group_name: &str,
+        network: SelectionNetwork,
+    ) -> ScoreBudgetCounters {
+        self.score_state.budget_counters(group_name, network)
+    }
+
     fn aggregate_score_context(network: SelectionNetwork) -> ScoreSelectionContext {
         ScoreSelectionContext::aggregate(
             network,
@@ -746,8 +810,80 @@ impl super::GroupManager {
             &mut visited,
             0,
             super::SelectionEffects::Peek,
-            None,
+            ScoreSelectionRules::default(),
         )
         .map(|candidate| candidate.tag().to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use honk_config::group::{Group, GroupPolicy};
+    use honk_config::node::Node;
+
+    #[test]
+    fn publication_between_ranking_and_plan_construction_refuses_node_work() {
+        let nodes = ["a", "b"].map(|name| Node {
+            id: Uuid::new_v5(&honk_config::node::NODE_ID_NAMESPACE, name.as_bytes()),
+            name: name.into(),
+            ..Default::default()
+        });
+        let group = Group {
+            id: Uuid::new_v4(),
+            name: "score".into(),
+            policy: GroupPolicy::Score,
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            ..Default::default()
+        };
+        let manager = GroupManager::new(std::slice::from_ref(&group), &nodes);
+        let context = ScoreSelectionContext {
+            network: SelectionNetwork::Tcp,
+            probe_domain: ProbeDomain::Tcp,
+            target_family: Some(IpVersion::V4),
+            health_family: IpVersion::V4,
+            target: Some(ScoreTarget::domain("reload.example", 443)),
+        };
+        let (mode, candidates) = manager.selection_candidates_for_target(
+            &group,
+            &context,
+            &mut Vec::new(),
+            0,
+            SelectionEffects::Apply,
+            ScoreSelectionRules {
+                cold_urltest: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            manager
+                .score_budget_counters("score", SelectionNetwork::Tcp)
+                .reserved,
+            1
+        );
+        let replacement = GroupManager::with_alive_set_and_score_state(
+            std::slice::from_ref(&group),
+            &nodes,
+            None,
+            manager.score_state(),
+        );
+        replacement.publish_score_membership();
+        let published = replacement.score_budget_counters("score", SelectionNetwork::Tcp);
+        let plan = manager.score_selection_plan(candidates, mode, &context, None);
+        assert!(
+            !plan.entries[0]
+                .feedback
+                .as_ref()
+                .is_none_or(|attempt| attempt.begin().is_ok())
+        );
+        assert_eq!(
+            replacement.score_budget_counters("score", SelectionNetwork::Tcp),
+            published
+        );
+        assert_eq!(replacement.score_state().root_business_starts(), 0);
+        assert_eq!(
+            (published.reserved, published.spent, published.refunded),
+            (0, 0, 1)
+        );
     }
 }
