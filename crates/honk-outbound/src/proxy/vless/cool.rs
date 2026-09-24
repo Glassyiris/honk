@@ -116,7 +116,7 @@ impl Failure {
     fn from_io(error: io::Error, context: &'static str) -> Self {
         Self {
             kind: error.kind(),
-            cause: FailureCause::Shared(crate::SharedError::new(
+            cause: FailureCause::Shared(crate::SharedError::fanout(
                 crate::proxy::NodeFailure(anyhow::Error::new(error).context(context)).into(),
             )),
         }
@@ -480,7 +480,7 @@ impl VlessCoolSession {
                 frame.id,
                 Failure {
                     kind: io::ErrorKind::ConnectionReset,
-                    cause: FailureCause::Shared(crate::SharedError::new(error)),
+                    cause: FailureCause::Shared(crate::SharedError::fanout(error)),
                 },
             );
             return Ok(());

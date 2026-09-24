@@ -977,7 +977,7 @@ impl AnyTlsSession {
     /// Record the first physical-failure reason and close: streams
     /// report the reason after draining queued data.
     fn fail(&self, reason: anyhow::Error) {
-        let _ = self.terminal_error.set(crate::SharedError::new(
+        let _ = self.terminal_error.set(crate::SharedError::fanout(
             crate::proxy::NodeFailure(reason).into(),
         ));
         self.close();

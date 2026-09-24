@@ -142,10 +142,7 @@ async fn a_server_alert_does_not_become_clean_eof() {
         .await
         .expect("read settles")
         .expect_err("an alerted session must not read as clean EOF");
-    assert_eq!(
-        crate::group::ScoreOutcome::from_io_error(&error),
-        crate::group::ScoreOutcome::NodeFailure
-    );
+    assert!(crate::group::ScoreOutcome::from_io_error(&error).is_node_failure());
     assert!(
         error.to_string().contains("authentication failed"),
         "error must carry the alert: {error}"
@@ -191,10 +188,7 @@ async fn failed_session_preserves_node_failure_after_stream_unregistration() {
             )
             .unwrap_err(),
     ] {
-        assert_eq!(
-            crate::group::ScoreOutcome::from_io_error(&error),
-            crate::group::ScoreOutcome::NodeFailure
-        );
+        assert!(crate::group::ScoreOutcome::from_io_error(&error).is_node_failure());
         assert!(anyhow::Error::new(error).chain().any(|cause| {
             cause
                 .downcast_ref::<std::io::Error>()

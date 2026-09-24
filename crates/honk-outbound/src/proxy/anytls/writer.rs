@@ -243,7 +243,7 @@ pub(super) async fn session_writer(
                 "AnyTLS session {} writer failed, closing: {}",
                 session.seq, reason
             );
-            let _ = session.terminal_error.set(crate::SharedError::new(
+            let _ = session.terminal_error.set(crate::SharedError::fanout(
                 crate::proxy::NodeFailure(reason.context("writer task write failed")).into(),
             ));
         }

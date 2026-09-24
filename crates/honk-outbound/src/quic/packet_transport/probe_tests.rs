@@ -247,10 +247,7 @@ async fn endpoint_retains_worker_cause_and_rejection() {
             assert_eq!(ScoreOutcome::from_io_error(&error), ScoreOutcome::Rejected);
         } else {
             assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
-            assert_eq!(
-                ScoreOutcome::from_io_error(&error),
-                ScoreOutcome::NodeFailure
-            );
+            assert!(ScoreOutcome::from_io_error(&error).is_node_failure());
             assert_eq!(
                 anyhow::Error::new(error)
                     .root_cause()

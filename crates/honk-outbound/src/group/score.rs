@@ -159,8 +159,8 @@ impl ScoreOutcome {
         if crate::proxy::target_failure(error) {
             return Self::TargetFailure;
         }
-        if crate::proxy::node_failure(error) {
-            return Self::NodeFailure;
+        if let Some(episode) = crate::proxy::node_failure_episode(error.as_ref()) {
+            return episode.map_or(Self::NodeFailure, Self::SharedNodeFailure);
         }
         error
             .chain()
@@ -184,8 +184,8 @@ impl ScoreOutcome {
         }
         if crate::proxy::io_target_failure(error) {
             Self::TargetFailure
-        } else if crate::proxy::io_node_failure(error) {
-            Self::NodeFailure
+        } else if let Some(episode) = crate::proxy::node_failure_episode(error) {
+            episode.map_or(Self::NodeFailure, Self::SharedNodeFailure)
         } else if error.kind() == io::ErrorKind::TimedOut {
             Self::Timeout
         } else {
@@ -194,10 +194,12 @@ impl ScoreOutcome {
     }
 
     pub fn shared_node_failure() -> Self {
-        match comparison::next_reporter_id() {
-            0 => Self::NodeFailure,
-            episode => Self::SharedNodeFailure(episode),
-        }
+        Self::SharedNodeFailure(crate::shared_error::next_episode())
+    }
+
+    /// A failure of the proxy carrier, whether one flow or several flows report it.
+    pub fn is_node_failure(self) -> bool {
+        matches!(self, Self::NodeFailure | Self::SharedNodeFailure(_))
     }
 }
 

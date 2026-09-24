@@ -210,6 +210,7 @@ fn failure_provenance_survives_shared_io_context_without_losing_cause() {
     assert_eq!(error.kind(), kind);
     let shared = crate::SharedError::new(anyhow::Error::new(error).context("proxy carrier"));
     let error = std::io::Error::other(std::io::Error::other(shared));
+    // An independently shared cause is its own failure, not a fanned-out episode.
     assert_eq!(
         ScoreOutcome::from_io_error(&error),
         ScoreOutcome::NodeFailure

@@ -48,7 +48,7 @@ Score 首先运行与其他策略相同的存活性过滤。过滤所用的 heal
 
 精确键为 `(group, TCP/UDP, target IPv4/IPv6, normalized target, NodeId)`。domain 会转为 ASCII 小写、去掉一个末尾点并保留端口；IP 目标保留 socket address。第二个有界的 `(group, TCP/UDP, optional target family, NodeId)` 聚合层为冷目标提供先验，并接收无目标预热样本。精确目标、target-family 和全局聚合层按衰减后的有效证据分层混合：精确证据增多时逐渐覆盖聚合证据，老化后又逐渐让出权重。递归选择携带同一 target context，并把叶节点结果归因到路径上的每个 Score 组。
 
-目标路径失败仍计入全局／地址族／精确目标的数值结果，但只在精确目标上建立硬失败状态。类型化代理／认证／协议帧或共享 carrier 故障、setup 前的未知错误及无目标失败仍归为节点故障；setup 前明确的目标拒绝仍属于目标。节点故障隔离依赖它的目标和探测证据，无关目标失败不使配置探测失效，探测失败只撤销自身当前槽位。子 cell 继承节点 incarnation、失败时间和共享源事件身份；迟到 fanout 仍逐流计失败，但不能重新打开已恢复的同一事件。
+目标路径失败仍计入全局／地址族／精确目标的数值结果，但只在精确目标上建立硬失败状态。类型化代理／认证／协议帧或共享 carrier 故障、setup 前的未知错误及无目标失败仍归为节点故障；setup 前明确的目标拒绝仍属于目标。节点故障隔离依赖它的目标和探测证据，无关目标失败不使配置探测失效，探测失败只撤销自身当前槽位。子 cell 继承节点 incarnation、失败时间和共享源事件身份；迟到 fanout 仍逐流计失败，但不能重新打开已恢复的同一事件。收到同一次分发的 carrier、源、packet endpoint 或共享拨号故障的每条流（包括同一 H2MUX 连接上的各流）都报告该故障唯一的事件身份；独立产生的故障仍各自计入。
 
 Carrier 来源由实际拥有代理连接的边界标记，不能从通用 QUIC 错误推断：经过健康 packet 代理、连接已建立后的端到端 DoQ／DoH3 失败，不证明代理 carrier 失败。Packet-backed DNS endpoint 单独保留实际 adapter 故障，只在类型化 endpoint 丢失时附加该来源，不覆盖已缓冲的流重置、EOF 或畸形 H3 响应。Setup 前的未知失败仍遵循上述保守规则。H2MUX 流重置／用户态流错误仍属于单流，连接 I/O 与 GOAWAY 属于节点。AnyTLS 会话仍活跃时的 TCP SYNACK 超时属于目标，静默会话退役和 UoT 服务 open 失败仍属于节点。VMess 尚未收到任何响应头字节时的 EOF 含义不确定，保留为 I/O 失败；部分／畸形响应头及实际 carrier 错误仍保留节点来源。XUDP END|ERROR 关闭的是多目标共享源，绑定 flow 仍归因于共享源失败，不能虚构单一失败目标。
 

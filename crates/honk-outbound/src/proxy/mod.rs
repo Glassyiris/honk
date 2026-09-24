@@ -29,7 +29,7 @@ pub use error::{
     node_failure, packet_error_class, packet_rejection, target_failure,
 };
 pub(crate) use error::{
-    io_node_failure, io_packet_rejection, io_target_failure, quic_carrier_error,
+    io_packet_rejection, io_target_failure, node_failure_episode, quic_carrier_error,
     quic_carrier_io_error,
 };
 pub use outbound::{

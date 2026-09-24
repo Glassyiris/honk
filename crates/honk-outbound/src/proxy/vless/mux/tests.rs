@@ -288,7 +288,9 @@ async fn tcp_receive_window_admits_one_megabyte_before_reads() {
             let mut response = BytesMut::with_capacity(PAYLOAD_SIZE + 1);
             response.extend_from_slice(&[0]);
             response.resize(PAYLOAD_SIZE + 1, 0x5a);
-            send_owned(&mut send, response.freeze()).await.unwrap();
+            send_owned(&mut send, &Default::default(), response.freeze())
+                .await
+                .unwrap();
             send.send_data(Bytes::new(), true).unwrap();
             let _ = sent.send(());
         });
@@ -342,7 +344,9 @@ async fn stalled_tcp_stream_leaves_connection_credit_for_udp() {
                     let mut response = BytesMut::with_capacity(H2_STREAM_RECV_WINDOW as usize);
                     response.extend_from_slice(&[0]);
                     response.resize(H2_STREAM_RECV_WINDOW as usize, 0x5a);
-                    send_owned(&mut send, response.freeze()).await.unwrap();
+                    send_owned(&mut send, &Default::default(), response.freeze())
+                        .await
+                        .unwrap();
                     send.send_data(Bytes::new(), true).unwrap();
                     let _ = filled.send(());
                 }));
@@ -691,13 +695,19 @@ async fn carrier_failure_fans_out_and_stream_capacity_is_bounded() {
     drop_tx.send(()).unwrap();
     server.await.unwrap();
     let mut byte = [0];
+    let mut outcomes = Vec::new();
     for stream in [&mut first, &mut second] {
         let error = stream.read_exact(&mut byte).await.unwrap_err();
-        assert_eq!(
-            crate::group::ScoreOutcome::from_io_error(&error),
-            crate::group::ScoreOutcome::NodeFailure
-        );
+        outcomes.push(crate::group::ScoreOutcome::from_io_error(&error));
     }
+    assert!(matches!(
+        outcomes[0],
+        crate::group::ScoreOutcome::SharedNodeFailure(_)
+    ));
+    assert_eq!(
+        outcomes[0], outcomes[1],
+        "one carrier failure is one episode"
+    );
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         while !session.is_closed() {
             tokio::task::yield_now().await;
@@ -848,18 +858,19 @@ async fn mux_refusal_distinguishes_target_status_from_http_envelope() {
             )
             .await
             .unwrap_or_else(|_| panic!("logical stream must open before lazy rejection"));
-        let expected = if envelope {
-            crate::group::ScoreOutcome::NodeFailure
-        } else {
-            crate::group::ScoreOutcome::TargetFailure
-        };
         let error = stream.read_u8().await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
-        assert_eq!(crate::group::ScoreOutcome::from_io_error(&error), expected);
+        let outcome = crate::group::ScoreOutcome::from_io_error(&error);
+        if envelope {
+            assert!(outcome.is_node_failure(), "{outcome:?}");
+        } else {
+            assert_eq!(outcome, crate::group::ScoreOutcome::TargetFailure);
+        }
         let repeated = stream.read_u8().await.unwrap_err();
         assert_eq!(
             crate::group::ScoreOutcome::from_io_error(&repeated),
-            expected
+            outcome,
+            "a replayed refusal is the same event"
         );
         drop(stream);
         session.close();

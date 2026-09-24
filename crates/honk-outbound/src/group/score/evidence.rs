@@ -815,10 +815,7 @@ impl ScorePolicyState {
                         sample,
                         sample.count_usefulness && (exact || context.target.is_some()),
                         exact
-                            || matches!(
-                                sample.outcome,
-                                ScoreOutcome::NodeFailure | ScoreOutcome::SharedNodeFailure(_)
-                            )
+                            || sample.outcome.is_node_failure()
                             || (sample.outcome != ScoreOutcome::TargetFailure
                                 && (sample.setup.is_none() || context.target.is_none())),
                     );

@@ -242,9 +242,9 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(
-            ScoreOutcome::from_error(&error),
-            ScoreOutcome::NodeFailure,
+        let endpoint_loss = ScoreOutcome::from_error(&error);
+        assert!(
+            matches!(endpoint_loss, ScoreOutcome::SharedNodeFailure(_)),
             "{error:#?}; observed={:?}; adapter={:?}",
             connection_error.lock(),
             endpoint.terminal_error()
@@ -255,10 +255,7 @@ mod tests {
             &super::super::lifecycle::SessionFailure::session(&failure).unwrap(),
             &endpoint
         ));
-        assert_eq!(
-            ScoreOutcome::from_error(&failure),
-            ScoreOutcome::NodeFailure
-        );
+        assert_eq!(ScoreOutcome::from_error(&failure), endpoint_loss);
         let h3_loss = h3::error::StreamError::ConnectionError(h3::error::ConnectionError::Remote(
             h3::quic::ConnectionErrorIncoming::Undefined(Arc::new(
                 connection_error.lock().take().unwrap(),
@@ -266,7 +263,8 @@ mod tests {
         ));
         assert_eq!(
             ScoreOutcome::from_error(&with_packet_cause(Some(&endpoint), h3_loss.into())),
-            ScoreOutcome::NodeFailure
+            endpoint_loss,
+            "every query lost with one packet endpoint reports its one terminal episode"
         );
         for error in [
             h3::error::StreamError::StreamError {

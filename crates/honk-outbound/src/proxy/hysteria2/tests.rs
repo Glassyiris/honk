@@ -952,10 +952,7 @@ async fn udp_carrier_close_is_node_failure() {
     })
     .await
     .unwrap();
-    assert_eq!(
-        crate::group::ScoreOutcome::from_io_error(&error),
-        crate::group::ScoreOutcome::NodeFailure
-    );
+    assert!(crate::group::ScoreOutcome::from_io_error(&error).is_node_failure());
     assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
     endpoint.close(Duration::ZERO).await;
 }

@@ -8,6 +8,16 @@ pub struct TargetFailure(#[source] pub anyhow::Error);
 #[error("{0}")]
 pub struct NodeFailure(#[source] pub anyhow::Error);
 
+fn next_cause<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a (dyn std::error::Error + 'static)> {
+    error
+        .downcast_ref::<std::io::Error>()
+        .and_then(|error| error.get_ref())
+        .map(|source| source as &(dyn std::error::Error + 'static))
+        .or_else(|| error.source())
+}
+
 fn find_cause<'a, T: std::error::Error + 'static>(
     mut error: &'a (dyn std::error::Error + 'static),
 ) -> Option<&'a T> {
@@ -15,12 +25,28 @@ fn find_cause<'a, T: std::error::Error + 'static>(
         if let Some(cause) = error.downcast_ref::<T>() {
             return Some(cause);
         }
-        let source = error
-            .downcast_ref::<std::io::Error>()
-            .and_then(|error| error.get_ref())
-            .map(|source| source as &(dyn std::error::Error + 'static))
-            .or_else(|| error.source());
-        error = source?;
+        error = next_cause(error)?;
+    }
+}
+
+/// Carrier provenance, with the episode of the innermost fanned-out failure delivering it.
+/// Recipients of one fanned-out failure must not report separate node failures, while
+/// independently constructed failures stay separate however they settle.
+pub(crate) fn node_failure_episode(
+    mut error: &(dyn std::error::Error + 'static),
+) -> Option<Option<u64>> {
+    let mut episode = None;
+    loop {
+        if error.is::<NodeFailure>() {
+            return Some(episode);
+        }
+        if let Some(fanout) = error
+            .downcast_ref::<crate::SharedError>()
+            .and_then(crate::SharedError::episode)
+        {
+            episode = Some(fanout);
+        }
+        error = next_cause(error)?;
     }
 }
 

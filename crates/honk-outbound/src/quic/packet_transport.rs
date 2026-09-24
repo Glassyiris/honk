@@ -48,7 +48,7 @@ impl TransportIoError {
         let rejection = io_packet_rejection(&error);
         Self {
             kind: error.kind(),
-            cause: crate::SharedError::new(error.into()),
+            cause: crate::SharedError::fanout(error.into()),
             rejection,
         }
     }

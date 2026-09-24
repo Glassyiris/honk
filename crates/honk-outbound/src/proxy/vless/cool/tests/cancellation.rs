@@ -226,10 +226,7 @@ async fn carrier_failure_precedes_child_fanout_for_pending_tcp_and_udp() {
             .expect("failed UDP send must settle its receiver before child fanout")
             .unwrap_err();
         for error in [tcp_error, send_error, recv_error] {
-            assert_eq!(
-                crate::group::ScoreOutcome::from_io_error(&error),
-                crate::group::ScoreOutcome::NodeFailure
-            );
+            assert!(crate::group::ScoreOutcome::from_io_error(&error).is_node_failure());
             assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
             assert_eq!(
                 anyhow::Error::new(error)
@@ -311,10 +308,9 @@ async fn writer_failure_is_published_before_udp_error_acknowledgement() {
         .expect("failed send must settle its receiver while the writer is paused at its ACK")
         .unwrap_err();
     for (side, error) in [("send", send_error), ("receive", recv_error)] {
-        assert_eq!(
-            crate::group::ScoreOutcome::from_io_error(&error),
-            crate::group::ScoreOutcome::NodeFailure,
-            "{side}: {error:?}",
+        assert!(
+            crate::group::ScoreOutcome::from_io_error(&error).is_node_failure(),
+            "{side}: {error:?}"
         );
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(

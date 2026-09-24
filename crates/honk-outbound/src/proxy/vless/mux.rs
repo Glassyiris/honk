@@ -67,6 +67,7 @@ pub struct VlessMuxSession {
     capacity_notify: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
     sender: Mutex<SendRequest<Bytes>>,
     driver: Mutex<Option<tokio::task::AbortHandle>>,
+    failure: CarrierFailure,
 }
 
 impl VlessMuxSession {
@@ -79,6 +80,7 @@ impl VlessMuxSession {
             capacity_notify: std::sync::OnceLock::new(),
             sender: Mutex::new(sender),
             driver: Mutex::new(None),
+            failure: CarrierFailure::default(),
         })
     }
 
@@ -234,6 +236,7 @@ struct OpenedStream {
     send: h2::SendStream<Bytes>,
     response: ResponseFuture,
     permit: SessionPermit<VlessMuxSession>,
+    failure: CarrierFailure,
 }
 
 async fn open_h2_stream(
@@ -257,6 +260,7 @@ async fn open_h2_stream(
         send,
         response,
         permit,
+        failure: Arc::clone(&session.failure),
     })
 }
 
@@ -272,27 +276,43 @@ fn stream_request(
     Ok(request.freeze())
 }
 
-fn h2_io(error: h2::Error) -> io::Error {
-    let cause: Box<dyn std::error::Error + Send + Sync> = if error.is_io() || error.is_go_away() {
-        Box::new(crate::proxy::NodeFailure(error.into()))
-    } else {
-        Box::new(error)
-    };
-    io::Error::new(io::ErrorKind::ConnectionReset, cause)
+/// The first transport loss any stream observes; every stream of the connection shares it.
+type CarrierFailure = Arc<std::sync::OnceLock<crate::SharedError>>;
+
+fn h2_io(carrier: &CarrierFailure, error: h2::Error) -> io::Error {
+    if error.is_io() {
+        let failure = carrier.get_or_init(|| {
+            crate::SharedError::fanout(crate::proxy::NodeFailure(error.into()).into())
+        });
+        return io::Error::new(io::ErrorKind::ConnectionReset, failure.clone());
+    }
+    // GOAWAY refuses only later streams; earlier ones continue and may fail independently.
+    if error.is_go_away() {
+        return io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            crate::proxy::NodeFailure(error.into()),
+        );
+    }
+    io::Error::new(io::ErrorKind::ConnectionReset, error)
 }
 
-async fn send_owned(send: &mut h2::SendStream<Bytes>, mut data: Bytes) -> io::Result<()> {
+async fn send_owned(
+    send: &mut h2::SendStream<Bytes>,
+    carrier: &CarrierFailure,
+    mut data: Bytes,
+) -> io::Result<()> {
     while !data.is_empty() {
         send.reserve_capacity(data.len());
         let capacity = std::future::poll_fn(|cx| send.poll_capacity(cx))
             .await
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "H2MUX stream closed"))?
-            .map_err(h2_io)?;
+            .map_err(|error| h2_io(carrier, error))?;
         if capacity == 0 {
             continue;
         }
         let chunk = data.split_to(capacity.min(data.len()));
-        send.send_data(chunk, false).map_err(h2_io)?;
+        send.send_data(chunk, false)
+            .map_err(|error| h2_io(carrier, error))?;
     }
     Ok(())
 }
@@ -300,13 +320,15 @@ async fn send_owned(send: &mut h2::SendStream<Bytes>, mut data: Bytes) -> io::Re
 struct MuxSendStream {
     inner: h2::SendStream<Bytes>,
     closed: bool,
+    carrier: CarrierFailure,
 }
 
 impl MuxSendStream {
-    fn new(inner: h2::SendStream<Bytes>) -> Self {
+    fn new(inner: h2::SendStream<Bytes>, carrier: CarrierFailure) -> Self {
         Self {
             inner,
             closed: false,
+            carrier,
         }
     }
 }
@@ -327,13 +349,13 @@ impl AsyncWrite for MuxSendStream {
         match self.inner.poll_capacity(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Err(h2_io(error))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Err(h2_io(&self.carrier, error))),
             Poll::Ready(Some(Ok(0))) => Poll::Pending,
             Poll::Ready(Some(Ok(capacity))) => {
                 let written = capacity.min(data.len());
                 self.inner
                     .send_data(Bytes::copy_from_slice(&data[..written]), false)
-                    .map_err(h2_io)?;
+                    .map_err(|error| h2_io(&self.carrier, error))?;
                 Poll::Ready(Ok(written))
             }
         }
@@ -345,7 +367,9 @@ impl AsyncWrite for MuxSendStream {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.closed {
-            self.inner.send_data(Bytes::new(), true).map_err(h2_io)?;
+            self.inner
+                .send_data(Bytes::new(), true)
+                .map_err(|error| h2_io(&self.carrier, error))?;
             self.closed = true;
         }
         Poll::Ready(Ok(()))
@@ -369,13 +393,14 @@ struct MuxResponse {
     error_remaining: Option<usize>,
     error_message: Vec<u8>,
     failed: Option<crate::SharedError>,
+    carrier: CarrierFailure,
 }
 
 fn h2_clean_eof(error: &h2::Error) -> bool {
     error.is_remote() && error.is_reset() && error.reason() == Some(h2::Reason::NO_ERROR)
 }
 impl MuxResponse {
-    fn new(response: ResponseFuture) -> Self {
+    fn new(response: ResponseFuture, carrier: CarrierFailure) -> Self {
         Self {
             response: Some(Box::pin(response)),
             recv: None,
@@ -385,6 +410,7 @@ impl MuxResponse {
             error_remaining: None,
             error_message: Vec::new(),
             failed: None,
+            carrier,
         }
     }
 
@@ -410,7 +436,7 @@ impl MuxResponse {
             .expect("response body exists before data")
             .flow_control()
             .release_capacity(size)
-            .map_err(h2_io)
+            .map_err(|error| h2_io(&self.carrier, error))
     }
 
     fn poll_fill(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
@@ -427,7 +453,7 @@ impl MuxResponse {
             Poll::Ready(Some(Err(error))) if self.status_ready && h2_clean_eof(&error) => {
                 Poll::Ready(Ok(false))
             }
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Err(h2_io(error))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Err(h2_io(&self.carrier, error))),
             Poll::Ready(Some(Ok(data))) if data.is_empty() => {
                 cx.waker().wake_by_ref();
                 Poll::Pending
@@ -454,7 +480,7 @@ impl MuxResponse {
             let response = self.response.as_mut().expect("response future exists");
             let response = match response.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(h2_io(error))),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(h2_io(&self.carrier, error))),
                 Poll::Ready(Ok(response)) => response,
             };
             if response.status() != http::StatusCode::OK {
@@ -631,6 +657,7 @@ impl AsyncWrite for VlessMuxStream {
 
 struct MuxUdpWriter {
     send: h2::SendStream<Bytes>,
+    carrier: CarrierFailure,
     setup: Option<Bytes>,
     pending: bool,
 }
@@ -674,7 +701,8 @@ impl VlessMuxUdpTransport {
             packet
         };
         writer.pending = true;
-        send_owned(&mut writer.send, frame).await?;
+        let writer = &mut *writer;
+        send_owned(&mut writer.send, &writer.carrier, frame).await?;
         writer.setup = None;
         writer.pending = false;
         Ok(())
@@ -749,12 +777,12 @@ impl MuxSession for VlessMuxSession {
             let request = stream_request(0, target, target_domain)
                 .map_err(|error| OpenError::Refused(anyhow::Error::new(error)))?;
             let mut opened = open_h2_stream(self, permit).await?;
-            send_owned(&mut opened.send, request)
+            send_owned(&mut opened.send, &opened.failure, request)
                 .await
                 .map_err(|error| OpenError::Draining(anyhow::Error::new(error)))?;
             Ok(VlessMuxStream {
-                send: MuxSendStream::new(opened.send),
-                response: MuxResponse::new(opened.response),
+                send: MuxSendStream::new(opened.send, Arc::clone(&opened.failure)),
+                response: MuxResponse::new(opened.response, opened.failure),
                 _permit: opened.permit,
             })
         }
@@ -773,11 +801,12 @@ impl MuxSession for VlessMuxSession {
             Ok(Arc::new(VlessMuxUdpTransport {
                 writer: tokio::sync::Mutex::new(MuxUdpWriter {
                     send: opened.send,
+                    carrier: Arc::clone(&opened.failure),
                     setup: Some(setup),
                     pending: false,
                 }),
                 reader: tokio::sync::Mutex::new(MuxUdpReader {
-                    response: MuxResponse::new(opened.response),
+                    response: MuxResponse::new(opened.response, opened.failure),
                     decoder: crate::proxy::uot::Decoder::default(),
                 }),
                 target,

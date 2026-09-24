@@ -90,10 +90,7 @@ async fn reused_v2_session_requires_synack_within_deadline() {
         "a missing SYNACK retires the reused session"
     );
     let error = third.read_u8().await.unwrap_err();
-    assert_eq!(
-        crate::group::ScoreOutcome::from_io_error(&error),
-        crate::group::ScoreOutcome::NodeFailure
-    );
+    assert!(crate::group::ScoreOutcome::from_io_error(&error).is_node_failure());
     drop((first, second));
 }
 
@@ -292,10 +289,7 @@ async fn synack_timeout_on_active_session_resets_only_the_stream() {
         crate::group::ScoreOutcome::TargetFailure
     );
     let service_error = uot.recv_packet(&mut buf).await.unwrap_err();
-    assert_eq!(
-        crate::group::ScoreOutcome::from_io_error(&service_error),
-        crate::group::ScoreOutcome::NodeFailure
-    );
+    assert!(crate::group::ScoreOutcome::from_io_error(&service_error).is_node_failure());
     let n = first.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"ok", "the sibling stream keeps its data");
     let (cmd, sid, _) = read_frame(&mut server).await.unwrap();

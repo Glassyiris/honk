@@ -631,15 +631,17 @@ async fn end_error_and_physical_eof_fail_children() {
     .await
     .unwrap();
     let udp_error = udp.recv_packet(&mut [0; 1]).await.unwrap_err();
-    assert_eq!(
-        crate::group::ScoreOutcome::from_io_error(&udp_error),
-        crate::group::ScoreOutcome::NodeFailure
-    );
+    let source_failure = crate::group::ScoreOutcome::from_io_error(&udp_error);
+    assert!(matches!(
+        source_failure,
+        crate::group::ScoreOutcome::SharedNodeFailure(_)
+    ));
     for target in [udp_target(), other_target] {
         let error = udp.send_to(target, None, b"late", None).await.unwrap_err();
         assert_eq!(
             crate::group::ScoreOutcome::from_io_error(&error),
-            crate::group::ScoreOutcome::NodeFailure
+            source_failure,
+            "late sends repeat the source's one END|ERROR event"
         );
     }
     wire.write_all(&response_frame(
@@ -678,15 +680,16 @@ async fn end_error_and_physical_eof_fail_children() {
     let _ = read_wire_frame(&mut wire).await;
     let _ = read_wire_frame(&mut wire).await;
     drop(wire);
-    let physical = third.read_u8().await.unwrap_err();
+    let physical = crate::group::ScoreOutcome::from_io_error(&third.read_u8().await.unwrap_err());
+    assert!(matches!(
+        physical,
+        crate::group::ScoreOutcome::SharedNodeFailure(_)
+    ));
+    assert_ne!(physical, source_failure);
     assert_eq!(
-        crate::group::ScoreOutcome::from_io_error(&physical),
-        crate::group::ScoreOutcome::NodeFailure
-    );
-    let sibling = fourth.read_u8().await.unwrap_err();
-    assert_eq!(
-        crate::group::ScoreOutcome::from_io_error(&sibling),
-        crate::group::ScoreOutcome::NodeFailure
+        crate::group::ScoreOutcome::from_io_error(&fourth.read_u8().await.unwrap_err()),
+        physical,
+        "one carrier failure is one episode"
     );
     assert!(session.is_closed());
 }

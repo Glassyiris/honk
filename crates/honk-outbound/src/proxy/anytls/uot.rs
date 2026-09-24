@@ -354,10 +354,7 @@ mod uot_transport_tests {
                 .await
                 .unwrap()
                 .unwrap_err();
-        assert_eq!(
-            crate::group::ScoreOutcome::from_io_error(&error),
-            crate::group::ScoreOutcome::NodeFailure
-        );
+        assert!(crate::group::ScoreOutcome::from_io_error(&error).is_node_failure());
         assert!(!transport.session.is_closed());
     }
 

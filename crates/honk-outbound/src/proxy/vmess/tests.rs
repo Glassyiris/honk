@@ -331,10 +331,7 @@ async fn rejected_response_header_surfaces_as_stream_error() {
     .expect("the stream must settle once the relay fails")
     .expect_err("a rejected response header must not read as EOF");
     assert!(out.is_empty());
-    assert_eq!(
-        crate::group::ScoreOutcome::from_io_error(&error),
-        crate::group::ScoreOutcome::NodeFailure
-    );
+    assert!(crate::group::ScoreOutcome::from_io_error(&error).is_node_failure());
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 }
 
@@ -389,11 +386,6 @@ async fn response_header_eof_and_transport_failures_keep_scope_and_cause() {
         (0, Some(io::ErrorKind::UnexpectedEof)),
     ] {
         let kind = failure.unwrap_or(io::ErrorKind::UnexpectedEof);
-        let expected = if prefix_len == 0 && failure.is_none() {
-            crate::group::ScoreOutcome::Io(kind)
-        } else {
-            crate::group::ScoreOutcome::NodeFailure
-        };
         let (physical, mut peer) = tokio::io::duplex(4096);
         let physical: Box<dyn AsyncReadWrite> = if let Some(kind) = failure {
             Box::new(ErrorOnEof(physical, kind))
@@ -418,7 +410,12 @@ async fn response_header_eof_and_transport_failures_keep_scope_and_cause() {
         .expect("header transport failure must settle the returned stream")
         .expect_err("an absent or partial response header must not read as clean EOF");
         assert_eq!(error.kind(), kind);
-        assert_eq!(crate::group::ScoreOutcome::from_io_error(&error), expected);
+        let outcome = crate::group::ScoreOutcome::from_io_error(&error);
+        if prefix_len == 0 && failure.is_none() {
+            assert_eq!(outcome, crate::group::ScoreOutcome::Io(kind));
+        } else {
+            assert!(outcome.is_node_failure(), "{outcome:?}");
+        }
         let error = anyhow::Error::new(error);
         let cause = error.root_cause().downcast_ref::<io::Error>().unwrap();
         assert_eq!(cause.kind(), kind);
