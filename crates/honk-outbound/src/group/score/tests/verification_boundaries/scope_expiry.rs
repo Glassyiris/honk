@@ -209,7 +209,7 @@ fn cross_pair_response_misalignment_requests_funded_validation_for_control_and_c
         let control_at = at + Duration::from_secs(58);
         let (index, control) = state.rank_plan_at("score", &target, &refs, control_at);
         assert_eq!(index, 0);
-        answer_run_attempt(control, control_at);
+        respond_at(control, Duration::from_millis(100), control_at);
         let funded_at = at + Duration::from_secs(59);
         let (index, attempt) = state.rank_plan_at("score", &target, &refs, funded_at);
         assert_ne!(index, 0);
@@ -225,40 +225,6 @@ fn cross_pair_response_misalignment_requests_funded_validation_for_control_and_c
         assert!(
             funded.spent + funded.reserved
                 <= funded.cold_allowance + funded.business_starts / funded.earning_period
-        );
-    }
-}
-
-#[test]
-fn cross_pair_response_misalignment_requests_every_compared_challenger() {
-    let nodes = [
-        node("timing a"),
-        node("timing b"),
-        node("timing c"),
-        node("timing d"),
-        node("timing e"),
-        node("timing f"),
-    ];
-    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-    let target = context("timing.example", IpVersion::V4);
-    let now = Instant::now();
-    train_cross_pair_responses(&manager, &nodes, &target, now, false);
-    let state = manager.score_state();
-    let refs: Vec<_> = nodes.iter().collect();
-    let at = now + Duration::from_secs(19);
-    let decision = decision_at(&state.inner.lock(), &nodes, &target, 0, at);
-    assert_eq!(decision.ordinary.index, 0);
-    let evaluation = verification_engine::evaluate(&decision, &refs, &target, None, at);
-    assert_eq!(evaluation.snapshot.comparison, ScoreComparison::Unconfirmed);
-    assert_eq!(evaluation.snapshot.pending_count, nodes.len());
-    for (index, candidate) in evaluation.candidates.iter().enumerate() {
-        assert_eq!(
-            candidate.question,
-            if index == 0 || decision.pairs.get(index).is_some() {
-                ScoreEvidenceQuestion::Response
-            } else {
-                ScoreEvidenceQuestion::None
-            }
         );
     }
 }

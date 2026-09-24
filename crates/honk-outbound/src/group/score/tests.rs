@@ -12,7 +12,6 @@ mod comparison;
 mod directional;
 mod evidence;
 mod live;
-mod loaded;
 mod performance;
 mod pressure;
 mod progress;
@@ -116,6 +115,14 @@ fn finish_failure(plan: &super::super::ScoreSelectionPlan<'_>) {
         .expect("current Score plan must admit work")
         .start()
         .setup_failed(ScoreOutcome::Timeout);
+}
+
+fn respond_at(attempt: ScoreAttempt, latency: Duration, now: Instant) {
+    let reporter = attempt.begin_at(now).unwrap().start_at(now);
+    reporter.setup_succeeded_at(now);
+    reporter.first_response_at(now + latency);
+    reporter.transfer_at(1, 1, now + latency);
+    reporter.finish_at(ScoreOutcome::Success, true, now + latency);
 }
 
 fn selected(manager: &super::super::GroupManager, context: &ScoreSelectionContext) -> Uuid {

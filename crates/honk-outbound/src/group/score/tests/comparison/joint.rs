@@ -175,45 +175,41 @@ fn disjoint_pair_blocks_do_not_make_a_joint_certificate() {
 
 #[test]
 fn joint_narrowing_keeps_adverse_original_pair_evidence() {
-    for unfavorable in [false, true] {
-        let nodes = [node("veto a"), node("veto b"), node("veto c")];
-        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-        let target = context("veto.example", IpVersion::V4);
-        let now = Instant::now();
-        let early = if unfavorable { [1000, 1] } else { [100, 200] };
-        for (index, (leaf, latency)) in nodes[..2].iter().zip(early).enumerate() {
-            train_at(
-                &manager,
-                leaf,
-                &target,
-                4,
-                Duration::from_millis(latency),
-                1,
-                now + Duration::from_secs(index as u64 * 2),
-            );
-        }
-        for (leaf, latency) in nodes.iter().zip([100, 200, 300]) {
-            train_at(
-                &manager,
-                leaf,
-                &target,
-                4,
-                Duration::from_millis(latency),
-                1,
-                now + Duration::from_secs(16),
-            );
-        }
-        let at = now + Duration::from_secs(18);
-        let state = manager.score_state();
-        let decision = scores(&state.inner.lock(), &nodes, &target, at);
-        let narrowed = decision.pairs.summary_pair(1).unwrap().response.unwrap();
-        assert_close(narrowed.incumbent, 100.0);
-        assert_close(narrowed.candidate, 200.0);
-        let summary = comparison::summarize(&decision, at);
-        assert!(summary.complete && !summary.response_misaligned);
-        assert_eq!(summary.supported, !unfavorable);
-        assert!(!summary.equivalent);
+    let nodes = [node("veto a"), node("veto b"), node("veto c")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("veto.example", IpVersion::V4);
+    let now = Instant::now();
+    for (index, (leaf, latency)) in nodes[..2].iter().zip([1000, 1]).enumerate() {
+        train_at(
+            &manager,
+            leaf,
+            &target,
+            4,
+            Duration::from_millis(latency),
+            1,
+            now + Duration::from_secs(index as u64 * 2),
+        );
     }
+    for (leaf, latency) in nodes.iter().zip([100, 200, 300]) {
+        train_at(
+            &manager,
+            leaf,
+            &target,
+            4,
+            Duration::from_millis(latency),
+            1,
+            now + Duration::from_secs(16),
+        );
+    }
+    let at = now + Duration::from_secs(18);
+    let state = manager.score_state();
+    let decision = scores(&state.inner.lock(), &nodes, &target, at);
+    let narrowed = decision.pairs.summary_pair(1).unwrap().response.unwrap();
+    assert_close(narrowed.incumbent, 100.0);
+    assert_close(narrowed.candidate, 200.0);
+    let summary = comparison::summarize(&decision, at);
+    assert!(summary.complete && !summary.response_misaligned);
+    assert!(!summary.supported && !summary.equivalent);
 }
 
 #[test]

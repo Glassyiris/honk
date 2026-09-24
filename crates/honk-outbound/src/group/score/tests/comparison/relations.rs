@@ -37,44 +37,6 @@ fn common_targets_do_not_promote_a_simpson_mixture() {
 }
 
 #[test]
-fn target_limit_chooses_identity_order_not_favorable_values() {
-    let now = Instant::now();
-    let nodes: Vec<_> = (0..10)
-        .map(|index| node(&format!("bounded {index}")))
-        .collect();
-    let mut inner = StateInner::default();
-    for index in 0..9 {
-        let target = context(&format!("{index}.target"), IpVersion::V4);
-        for (position, leaf) in nodes.iter().enumerate() {
-            response(
-                &mut inner,
-                leaf,
-                &target,
-                4,
-                if position == 0 {
-                    100
-                } else if index < 8 {
-                    200
-                } else {
-                    1
-                },
-                now,
-            );
-        }
-    }
-    let unseen = context("unseen", IpVersion::V4);
-    let scores = scores(&inner, &nodes, &unseen, now);
-    assert_eq!(scores.pairs.pairs.iter().flatten().count(), nodes.len() - 1);
-    for pair in scores.pairs.pairs.iter().flatten() {
-        assert_close(pair.response.unwrap().candidate, 200.0);
-    }
-    let summary = comparison::summarize(&scores, now);
-    assert_eq!(summary.compared_candidates, nodes.len());
-    assert!(!summary.complete);
-    assert!(summary.target_limited);
-}
-
-#[test]
 fn more_than_five_members_confirm_and_revoke_with_their_weakest_support() {
     let start = Instant::now();
     let nodes: Vec<_> = (0..7).map(|index| node(&format!("wide {index}"))).collect();
@@ -144,7 +106,9 @@ fn global_equivalence_checks_the_full_response_range() {
 
 #[test]
 fn common_target_cap_follows_qualification_and_directional_metrics_keep_that_cohort() {
-    let nodes = [node("qualified a"), node("qualified b")];
+    let nodes: Vec<_> = (0..10)
+        .map(|index| node(&format!("bounded {index}")))
+        .collect();
     let now = Instant::now();
     let mut inner = StateInner::default();
     let unseen = context("unseen", IpVersion::V4);
@@ -156,7 +120,7 @@ fn common_target_cap_follows_qualification_and_directional_metrics_keep_that_coh
                 leaf,
                 &target,
                 if index < 8 { 1 } else { 4 },
-                if index == 16 && side == 1 { 1 } else { 100 },
+                if index == 16 && side > 0 { 1 } else { 100 },
                 now,
             );
             if index != 8 {
@@ -179,12 +143,18 @@ fn common_target_cap_follows_qualification_and_directional_metrics_keep_that_coh
     }
     for reference in [0, 1] {
         let decision = decision_at(&inner, &nodes, &unseen, reference, now);
-        let pair = decision.pairs.get(1 - reference).unwrap();
-        assert_close(pair.response.unwrap().incumbent, 100.0);
-        assert_close(pair.response.unwrap().candidate, 100.0);
-        assert!(pair.upload.is_none() && pair.download.is_none());
+        assert_eq!(
+            decision.pairs.pairs.iter().flatten().count(),
+            nodes.len() - 1
+        );
+        for pair in decision.pairs.pairs.iter().flatten() {
+            assert_close(pair.response.unwrap().incumbent, 100.0);
+            assert_close(pair.response.unwrap().candidate, 100.0);
+            assert!(pair.upload.is_none() && pair.download.is_none());
+        }
         let summary = comparison::summarize(&decision, now);
-        assert!(summary.equivalent && !summary.complete);
+        assert_eq!(summary.compared_candidates, nodes.len());
+        assert!(summary.equivalent && !summary.complete && summary.target_limited);
     }
     let exact = pair(&inner, &nodes, &context("16.target", IpVersion::V4), now);
     assert_eq!(exact.basis, Basis::ExactTarget);

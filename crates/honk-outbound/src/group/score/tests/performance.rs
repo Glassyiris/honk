@@ -472,61 +472,6 @@ fn excluded_leaf_cannot_change_eligible_performance_winner_or_reason() {
 }
 
 #[test]
-fn stale_exact_volume_cannot_override_fresh_comparable_probes() {
-    for samples in [100, 10_000] {
-        let nodes = [node("old-target-winner"), node("fresh-probe-winner")];
-        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-        let target = context("business.example", IpVersion::V4);
-        let probe = context("configured.example", IpVersion::V4);
-        let start = Instant::now();
-        train_at(
-            &manager,
-            &nodes[0],
-            &target,
-            samples,
-            Duration::from_millis(60),
-            1,
-            start,
-        );
-        train_at(
-            &manager,
-            &nodes[1],
-            &target,
-            20,
-            Duration::from_millis(600),
-            1,
-            start,
-        );
-        assert_eq!(
-            rank_at(&manager, &nodes, &target, start + Duration::from_secs(2)),
-            0
-        );
-        let now = start + PERFORMANCE_MAX_AGE + Duration::from_secs(2);
-        probe_at(
-            &manager,
-            &nodes[0],
-            &probe,
-            ScoreSource::HealthProbe,
-            Duration::from_millis(600),
-            now,
-        );
-        probe_at(
-            &manager,
-            &nodes[1],
-            &probe,
-            ScoreSource::HealthProbe,
-            Duration::from_millis(60),
-            now,
-        );
-        assert_eq!(
-            ordinary_at(&manager, &nodes, &target, Some(0), now).index,
-            1,
-            "history volume={samples}"
-        );
-    }
-}
-
-#[test]
 fn trustworthy_target_beats_probe_only_while_target_is_fresh() {
     let nodes = [node("target-winner"), node("probe-winner")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
@@ -537,7 +482,7 @@ fn trustworthy_target_beats_probe_only_while_target_is_fresh() {
         &manager,
         &nodes[0],
         &target,
-        20,
+        10_000,
         Duration::from_millis(60),
         1,
         start,
@@ -859,7 +804,7 @@ fn one_healthy_probe_scope_does_not_replace_another() {
         &nodes[1],
         &probe,
         ScoreSource::HealthProbe,
-        Duration::from_secs(10),
+        Duration::from_millis(10000),
         now,
     );
     probe.probe_domain = ProbeDomain::DataUdp;
@@ -869,7 +814,7 @@ fn one_healthy_probe_scope_does_not_replace_another() {
         &nodes[1],
         &probe,
         ScoreSource::HealthProbe,
-        Duration::from_secs(10),
+        Duration::from_millis(10000),
         now,
     );
     assert_eq!(

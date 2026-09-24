@@ -1,61 +1,6 @@
 use super::*;
 
 #[test]
-fn banked_validation_completes_with_real_interleaved_control_flows() {
-    let nodes = [node("run control"), node("run challenger")];
-    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-    let target = context("run.example", IpVersion::V4);
-    let start = Instant::now();
-    for (index, leaf) in nodes.iter().enumerate() {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            128,
-            Duration::from_millis(100 + 15 * index as u64),
-            1,
-            start,
-        );
-    }
-    let state = manager.score_state();
-    let refs: Vec<_> = nodes.iter().collect();
-    assert_eq!(
-        state
-            .rank_plan_at("score", &target, &refs, start + Duration::from_secs(2))
-            .0,
-        0
-    );
-    let before = manager.score_budget_counters("score", SelectionNetwork::Tcp);
-    let mut allocated = [0_usize; 2];
-    for step in 0..8 {
-        let at = start + Duration::from_secs(75 + step * 5);
-        let (index, attempt) = state.rank_plan_at("score", &target, &refs, at);
-        allocated[index] += 1;
-        let reporter = attempt.begin_at(at).unwrap().start_at(at);
-        reporter.setup_succeeded_at(at);
-        let received = at + Duration::from_millis(100 + 15 * index as u64);
-        reporter.first_response_at(received);
-        reporter.transfer_at(1, 1, received);
-        reporter.finish_at(ScoreOutcome::Success, true, received);
-        let counters = manager.score_budget_counters("score", SelectionNetwork::Tcp);
-        assert!(
-            counters.spent + counters.reserved
-                <= counters.cold_allowance + counters.business_starts / counters.earning_period
-        );
-    }
-    let after = manager.score_budget_counters("score", SelectionNetwork::Tcp);
-    assert_eq!(allocated, [4, 4]);
-    assert_eq!(after.business_starts - before.business_starts, 8);
-    assert_eq!(after.trial_starts - before.trial_starts, 4);
-    let snapshot = state
-        .verification_snapshot_at("score", &target, &refs, start + Duration::from_secs(111))
-        .unwrap();
-    assert_eq!(snapshot.comparison, ScoreComparison::Supported);
-    assert!(!snapshot.missing.response);
-    assert_eq!(snapshot.pending_count, 0);
-}
-
-#[test]
 fn unbegun_run_plans_expire_refund_and_do_not_advance_control() {
     let nodes = [node("pending control"), node("pending challenger")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
@@ -209,8 +154,16 @@ fn other_target_reference_and_escape_preserve_pending_validation() {
         let (index, unrelated) =
             state.rank_plan_at("score", &other, &refs, at + Duration::from_secs(1));
         assert_eq!(index, 1);
-        answer_run_attempt(unrelated, at + Duration::from_secs(1));
-        answer_run_attempt(pending, at + Duration::from_secs(2));
+        respond_at(
+            unrelated,
+            Duration::from_millis(100),
+            at + Duration::from_secs(1),
+        );
+        respond_at(
+            pending,
+            Duration::from_millis(100),
+            at + Duration::from_secs(2),
+        );
     }
 }
 
@@ -325,7 +278,7 @@ fn promising_cold_target_run_waits_for_ordinary_reference_observation() {
             assert_eq!(index, 1);
         }
         challenger_replies += usize::from(index == 1);
-        answer_run_attempt(attempt, at);
+        respond_at(attempt, Duration::from_millis(100), at);
         if challenger_replies == 4 {
             break;
         }
@@ -388,7 +341,7 @@ fn terminal_staged_runs_release_other_target_trials() {
             index, 1,
             "terminal staged outcome {outcome:?} retained focus"
         );
-        answer_run_attempt(next, at);
+        respond_at(next, Duration::from_millis(100), at);
         let after = manager.score_budget_counters("score", SelectionNetwork::Tcp);
         assert_eq!(after.trial_starts, before.trial_starts + 1);
         assert_eq!(after.spent, before.spent + 1);
@@ -415,22 +368,34 @@ fn bound_run_keeps_unfinished_pair_but_releases_completed_pair() {
     }
     let state = manager.score_state();
     let refs: Vec<_> = nodes.iter().collect();
+    assert_eq!(
+        state
+            .rank_plan_at("score", &target, &refs, start + Duration::from_secs(2))
+            .0,
+        0
+    );
+    let before = manager.score_budget_counters("score", SelectionNetwork::Tcp);
     let mut allocated = [0; 2];
     let mut live_last = None;
     for step in 0..8 {
         let at = start + Duration::from_secs(75 + step * 5);
         let (index, attempt) = state.rank_plan_at("score", &target, &refs, at);
         allocated[index] += 1;
+        let latency = Duration::from_millis(100 + 15 * index as u64);
         if step == 7 {
             let reporter = attempt.begin_at(at).unwrap().start_at(at);
             reporter.setup_succeeded_at(at);
-            let received = at + Duration::from_millis(100 + 15 * index as u64);
-            reporter.first_response_at(received);
-            reporter.transfer_at(1, 1, received);
+            reporter.first_response_at(at + latency);
+            reporter.transfer_at(1, 1, at + latency);
             live_last = Some(reporter);
         } else {
-            answer_run_attempt(attempt, at);
+            respond_at(attempt, latency, at);
         }
+        let counters = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        assert!(
+            counters.spent + counters.reserved
+                <= counters.cold_allowance + counters.business_starts / counters.earning_period
+        );
         if step == 0 {
             let before = manager.score_budget_counters("score", SelectionNetwork::Tcp);
             let (_, unrelated) =
@@ -441,14 +406,24 @@ fn bound_run_keeps_unfinished_pair_but_releases_completed_pair() {
             assert_eq!(after.reserved, before.reserved);
         }
     }
+    let after = manager.score_budget_counters("score", SelectionNetwork::Tcp);
     assert_eq!(allocated, [4, 4]);
-    let before = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    assert_eq!(after.business_starts - before.business_starts, 8);
+    assert_eq!(after.trial_starts - before.trial_starts, 4);
     let at = start + Duration::from_secs(111);
     let (_, next) = state.rank_plan_at("score", &other, &refs, at);
-    answer_run_attempt(next, at);
-    let after = manager.score_budget_counters("score", SelectionNetwork::Tcp);
-    assert_eq!(after.trial_starts, before.trial_starts + 1);
-    drop(live_last);
+    respond_at(next, Duration::from_millis(100), at);
+    let released = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    assert_eq!(released.trial_starts, after.trial_starts + 1);
+    live_last
+        .unwrap()
+        .finish_at(ScoreOutcome::Success, true, at);
+    let snapshot = state
+        .verification_snapshot_at("score", &target, &refs, at)
+        .unwrap();
+    assert_eq!(snapshot.comparison, ScoreComparison::Supported);
+    assert!(!snapshot.missing.response);
+    assert_eq!(snapshot.pending_count, 0);
 }
 
 #[test]
@@ -474,7 +449,7 @@ fn pending_bound_work_releases_focus_after_cell_replacement() {
         let refs: Vec<_> = nodes.iter().collect();
         let first = start + Duration::from_secs(75);
         let (_, control) = state.rank_plan_at("score", &target, &refs, first);
-        answer_run_attempt(control, first);
+        respond_at(control, Duration::from_millis(100), first);
         let at = start + Duration::from_secs(80);
         let (_, pending) = state.rank_plan_at("score", &target, &refs, at);
         {
@@ -510,7 +485,11 @@ fn pending_bound_work_releases_focus_after_cell_replacement() {
         );
         let before = manager.score_budget_counters("score", SelectionNetwork::Tcp);
         let (_, offered) = state.rank_plan_at("score", &other, &refs, at + Duration::from_secs(1));
-        answer_run_attempt(offered, at + Duration::from_secs(1));
+        respond_at(
+            offered,
+            Duration::from_millis(100),
+            at + Duration::from_secs(1),
+        );
         let after = manager.score_budget_counters("score", SelectionNetwork::Tcp);
         assert_eq!(
             after.trial_starts,

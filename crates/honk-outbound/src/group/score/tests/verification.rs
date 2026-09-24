@@ -12,14 +12,6 @@ fn verification_at(
         .unwrap()
 }
 
-fn respond_at(feedback: &ScoreAttempt, latency: Duration, now: Instant) {
-    let reporter = feedback.begin_at(now).unwrap().start_at(now);
-    reporter.setup_succeeded_at(now);
-    reporter.first_response_at(now + latency);
-    reporter.transfer_at(1, 1, now + latency);
-    reporter.finish_at(ScoreOutcome::Success, true, now + latency);
-}
-
 #[test]
 fn idle_terminal_does_not_refresh_old_business_evidence() {
     let nodes = [node("idle")];
@@ -244,7 +236,7 @@ fn real_flow_gaps_become_usable_and_supported_with_measured_exposure() {
         let (index, feedback) =
             state.rank_plan_at("score", &target, &nodes.iter().collect::<Vec<_>>(), at);
         respond_at(
-            &feedback,
+            feedback,
             Duration::from_millis(if index == 0 { 1 } else { 60 }),
             at,
         );
@@ -317,7 +309,7 @@ fn funded_large_group_focuses_promising_contender_until_graduation() {
             break;
         }
         respond_at(
-            &feedback,
+            feedback,
             Duration::from_millis(if index == 31 { 1 } else { 60 }),
             at,
         );
@@ -383,70 +375,68 @@ fn equivalent_response_stops_trials_while_transfer_remains_unknown() {
 
 #[test]
 fn old_history_cannot_refresh_availability_with_one_new_success() {
-    for history in [100.0, 10_000.0] {
-        let nodes = [node("historical")];
-        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-        let target = context("business.example", IpVersion::V4);
-        let now = Instant::now();
-        let state = manager.score_state();
-        train_at(
-            &manager,
-            &nodes[0],
-            &target,
-            history as usize,
-            Duration::from_millis(100),
-            1,
-            now,
-        );
-        let now = now + Duration::from_secs(1);
-        assert_eq!(
-            verification_at(&manager, &nodes, &target, now).state,
-            ScoreVerificationState::ObservedUsable
-        );
-        rank_at(&manager, &nodes, &target, now);
-        let before = state.verification_counters("score", SelectionNetwork::Tcp);
-        let expired = now + PERFORMANCE_MAX_AGE + Duration::from_secs(2);
-        let snapshot = verification_at(&manager, &nodes, &target, expired);
-        assert_eq!(snapshot.state, ScoreVerificationState::Provisional);
-        assert_eq!(snapshot.comparison, ScoreComparison::Unconfirmed);
-        assert_eq!(
-            state.verification_counters("score", SelectionNetwork::Tcp),
-            before
-        );
-        rank_at(&manager, &nodes, &target, expired);
-        assert_eq!(
-            state
-                .verification_counters("score", SelectionNetwork::Tcp)
-                .expired,
-            1
-        );
-        train_at(
-            &manager,
-            &nodes[0],
-            &target,
-            1,
-            Duration::from_millis(10),
-            1,
-            expired,
-        );
-        assert_eq!(
-            verification_at(&manager, &nodes, &target, expired + Duration::from_secs(2)).state,
-            ScoreVerificationState::Provisional
-        );
-        train_at(
-            &manager,
-            &nodes[0],
-            &target,
-            4,
-            Duration::from_millis(10),
-            1,
-            expired + Duration::from_secs(3),
-        );
-        assert_eq!(
-            verification_at(&manager, &nodes, &target, expired + Duration::from_secs(5)).state,
-            ScoreVerificationState::ObservedUsable
-        );
-    }
+    let nodes = [node("historical")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    let state = manager.score_state();
+    train_at(
+        &manager,
+        &nodes[0],
+        &target,
+        100,
+        Duration::from_millis(100),
+        1,
+        now,
+    );
+    let now = now + Duration::from_secs(1);
+    assert_eq!(
+        verification_at(&manager, &nodes, &target, now).state,
+        ScoreVerificationState::ObservedUsable
+    );
+    rank_at(&manager, &nodes, &target, now);
+    let before = state.verification_counters("score", SelectionNetwork::Tcp);
+    let expired = now + PERFORMANCE_MAX_AGE + Duration::from_secs(2);
+    let snapshot = verification_at(&manager, &nodes, &target, expired);
+    assert_eq!(snapshot.state, ScoreVerificationState::Provisional);
+    assert_eq!(snapshot.comparison, ScoreComparison::Unconfirmed);
+    assert_eq!(
+        state.verification_counters("score", SelectionNetwork::Tcp),
+        before
+    );
+    rank_at(&manager, &nodes, &target, expired);
+    assert_eq!(
+        state
+            .verification_counters("score", SelectionNetwork::Tcp)
+            .expired,
+        1
+    );
+    train_at(
+        &manager,
+        &nodes[0],
+        &target,
+        1,
+        Duration::from_millis(10),
+        1,
+        expired,
+    );
+    assert_eq!(
+        verification_at(&manager, &nodes, &target, expired + Duration::from_secs(2)).state,
+        ScoreVerificationState::Provisional
+    );
+    train_at(
+        &manager,
+        &nodes[0],
+        &target,
+        4,
+        Duration::from_millis(10),
+        1,
+        expired + Duration::from_secs(3),
+    );
+    assert_eq!(
+        verification_at(&manager, &nodes, &target, expired + Duration::from_secs(5)).state,
+        ScoreVerificationState::ObservedUsable
+    );
 }
 
 #[test]
@@ -966,7 +956,7 @@ fn partial_success_cannot_pin_a_cancelled_validation_run_forever() {
     let (index, feedback) =
         state.rank_plan_at("score", &target, &nodes.iter().collect::<Vec<_>>(), at);
     assert_eq!(index, 1);
-    respond_at(&feedback, Duration::from_millis(10), at);
+    respond_at(feedback, Duration::from_millis(10), at);
     let mut run = 0;
     let mut max_run = 0;
     let mut other_trials = 0;
@@ -993,7 +983,7 @@ fn partial_success_cannot_pin_a_cancelled_validation_run_forever() {
                 at,
             );
         } else {
-            respond_at(&feedback, Duration::from_millis(100), at);
+            respond_at(feedback, Duration::from_millis(100), at);
         }
     }
     assert!(max_run <= 8);

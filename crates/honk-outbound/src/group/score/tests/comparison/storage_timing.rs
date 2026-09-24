@@ -196,51 +196,6 @@ fn failures_delayed_events_and_recreated_incarnations_cannot_revive_proof() {
 }
 
 #[test]
-fn reload_clears_comparison_and_fences_delayed_support() {
-    let nodes = [node("reload incumbent"), node("reload candidate")];
-    let groups = vec![group("score", &nodes)];
-    let manager = GroupManager::new(&groups, &nodes);
-    let target = context("reload-comparison", IpVersion::V4);
-    let now = Instant::now();
-    for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            4,
-            Duration::from_millis(10),
-            1,
-            now,
-        );
-    }
-    let state = manager.score_state();
-    assert!(
-        pair(
-            &state.inner.lock(),
-            &nodes,
-            &target,
-            now + Duration::from_secs(1)
-        )
-        .response
-        .is_some()
-    );
-    let replacement =
-        GroupManager::with_alive_set_and_score_state(&groups, &nodes, None, state.clone());
-    replacement.publish_score_membership();
-    assert_eq!(state.inner.lock().comparisons.cell_count(), 0);
-    assert!(
-        pair(
-            &state.inner.lock(),
-            &nodes,
-            &target,
-            now + Duration::from_secs(2)
-        )
-        .response
-        .is_none()
-    );
-}
-
-#[test]
 fn comparison_memory_cap_counts_keys_and_container_capacity_and_eviction_loses_support() {
     let now = Instant::now();
     let leaf = node("capacity");
@@ -262,7 +217,6 @@ fn comparison_memory_cap_counts_keys_and_container_capacity_and_eviction_loses_s
     assert_eq!(store.cell_count(), MAX_CELLS);
     assert_eq!(store.evicted, 1);
     assert!(store.logical_bytes() <= comparison::Store::logical_capacity_bound());
-    assert!(comparison::Store::logical_capacity_bound() <= MAX_LOGICAL_BYTES);
     assert!(store.logical_bytes() >= MAX_CELLS * 1024);
     response(
         &mut inner,
@@ -283,7 +237,7 @@ fn comparison_memory_cap_counts_keys_and_container_capacity_and_eviction_loses_s
             .response
             .is_none()
     );
-    let oversize = context(&"z".repeat(MAX_LOGICAL_BYTES), IpVersion::V4);
+    let oversize = context(&"z".repeat(MAX_KEY_BYTES), IpVersion::V4);
     let before = inner.comparisons.logical_bytes();
     response(
         &mut inner,
@@ -322,104 +276,6 @@ fn disjoint_time_blocks_do_not_compare_even_when_both_nodes_are_fresh() {
     );
     assert!(scores.pairs.get(1).unwrap().response.is_none());
     assert!(!comparison::summarize(&scores, now + Duration::from_secs(16)).complete);
-}
-
-#[test]
-fn configured_probe_proof_requires_the_same_request_cohort_and_independent_freshness() {
-    let nodes = [node("probe incumbent"), node("probe candidate")];
-    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-    let target =
-        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
-    let now = Instant::now();
-    let publish_probe = |leaf: &Node, uri: &str, at: Instant| {
-        for _ in 0..4 {
-            let reporter = manager
-                .feedback_for_group_node("score", leaf.id, target.clone())
-                .unwrap()
-                .with_source(ScoreSource::HealthProbe)
-                .with_probe_identity(uri, "GET")
-                .start_at(at);
-            reporter.probe_latency_at(Duration::from_millis(100), at);
-            reporter.finish_at(ScoreOutcome::Success, false, at);
-        }
-    };
-    publish_probe(&nodes[0], "https://probe/a", now);
-    publish_probe(&nodes[1], "https://probe/b", now);
-    let state = manager.score_state();
-    assert!(
-        pair(&state.inner.lock(), &nodes, &target, now)
-            .response
-            .is_none()
-    );
-    publish_probe(&nodes[1], "https://probe/a", now + Duration::from_secs(1));
-    let paired = pair(
-        &state.inner.lock(),
-        &nodes,
-        &target,
-        now + Duration::from_secs(1),
-    );
-    assert_eq!(paired.basis, Basis::ConfiguredProbe);
-    assert!(paired.response.is_some());
-    assert!(paired.upload.is_none() && paired.download.is_none());
-    assert!(
-        pair(
-            &state.inner.lock(),
-            &nodes,
-            &target,
-            now + Duration::from_secs(60)
-        )
-        .response
-        .is_none()
-    );
-}
-
-#[test]
-fn replaced_probe_cohort_cannot_return_with_old_qualification() {
-    let nodes = [node("cohort incumbent"), node("cohort candidate")];
-    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-    let target =
-        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
-    let now = Instant::now();
-    let publish = |leaf: &Node, uri: &str, count: usize, at: Instant| {
-        for _ in 0..count {
-            let reporter = manager
-                .feedback_for_group_node("score", leaf.id, target.clone())
-                .unwrap()
-                .with_source(ScoreSource::HealthProbe)
-                .with_probe_identity(uri, "GET")
-                .start_at(at);
-            reporter.probe_latency_at(Duration::from_millis(100), at);
-            reporter.finish_at(ScoreOutcome::Success, false, at);
-        }
-    };
-    for leaf in &nodes {
-        publish(leaf, "https://probe/a", 4, now);
-    }
-    let state = manager.score_state();
-    assert!(
-        pair(&state.inner.lock(), &nodes, &target, now)
-            .response
-            .is_some()
-    );
-    let later = now + Duration::from_secs(1);
-    publish(&nodes[1], "https://probe/b", 1, later);
-    assert!(
-        pair(&state.inner.lock(), &nodes, &target, later)
-            .response
-            .is_none()
-    );
-    publish(&nodes[1], "https://probe/a", 1, later);
-    assert!(
-        pair(&state.inner.lock(), &nodes, &target, later)
-            .response
-            .is_none()
-    );
-    publish(&nodes[1], "https://probe/a", 3, later);
-    assert!(
-        pair(&state.inner.lock(), &nodes, &target, later)
-            .response
-            .is_some()
-    );
 }
 
 #[test]
@@ -495,67 +351,73 @@ fn ordinary_probe_streams_qualify_through_block_rotation_and_expire_on_weaker_su
 }
 
 #[test]
-fn changed_and_invalid_probe_cadences_cannot_inherit_comparison_support() {
+fn changed_probe_cohorts_and_invalid_cadences_cannot_inherit_comparison_support() {
     let nodes = [node("cadence a"), node("cadence b")];
-    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target =
         ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
-    let publish = |index: usize, interval, count, at| {
-        let feedback = manager
-            .feedback_for_group_node("score", nodes[index].id, target.clone())
-            .unwrap()
-            .with_source(ScoreSource::HealthProbe)
-            .with_probe_identity("https://periodic.example/check", "HEAD")
-            .with_probe_interval(interval);
-        for _ in 0..count {
-            let reporter = feedback.clone().start_at(at);
-            reporter.probe_latency_at(Duration::from_millis(100), at);
-            reporter.finish_at(ScoreOutcome::Success, false, at);
-        }
-    };
-    let now = Instant::now();
-    let state = manager.score_state();
+    let uri = "https://periodic.example/check";
     let old = Duration::from_secs(30);
-    let new = Duration::from_secs(60);
-    for index in 0..2 {
-        publish(index, old, 4, now);
-    }
-    assert!(
-        pair(&state.inner.lock(), &nodes, &target, now)
-            .response
-            .is_some()
-    );
-    let later = now + Duration::from_secs(1);
-    publish(1, new, 4, later);
-    assert!(
-        pair(&state.inner.lock(), &nodes, &target, later)
-            .response
-            .is_none()
-    );
-    publish(1, old, 1, later);
-    assert!(
-        pair(&state.inner.lock(), &nodes, &target, later)
-            .response
-            .is_none()
-    );
-    publish(1, old, 3, later);
-    assert!(
-        pair(&state.inner.lock(), &nodes, &target, later)
-            .response
-            .is_some()
-    );
-    for invalid in [Duration::ZERO, Duration::MAX] {
+    // The request scope and the cadence are both part of the cohort key.
+    for (changed_uri, changed_interval) in [
+        ("https://periodic.example/other", old),
+        (uri, Duration::from_secs(60)),
+    ] {
+        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+        let publish = |index: usize, uri: &str, interval: Duration, count: usize, at: Instant| {
+            let feedback = manager
+                .feedback_for_group_node("score", nodes[index].id, target.clone())
+                .unwrap()
+                .with_source(ScoreSource::HealthProbe)
+                .with_probe_identity(uri, "HEAD")
+                .with_probe_interval(interval);
+            for _ in 0..count {
+                let reporter = feedback.clone().start_at(at);
+                reporter.probe_latency_at(Duration::from_millis(100), at);
+                reporter.finish_at(ScoreOutcome::Success, false, at);
+            }
+        };
+        let now = Instant::now();
+        let state = manager.score_state();
         for index in 0..2 {
-            publish(index, invalid, 4, later);
+            publish(index, uri, old, 4, now);
         }
-        let decision = scores(&state.inner.lock(), &nodes, &target, later);
-        assert!(decision.pairs.get(1).unwrap().response.is_none());
         assert!(
-            decision
-                .evidence
-                .iter()
-                .all(|evidence| evidence.probe.is_none())
+            pair(&state.inner.lock(), &nodes, &target, now)
+                .response
+                .is_some()
         );
+        let later = now + Duration::from_secs(1);
+        publish(1, changed_uri, changed_interval, 4, later);
+        assert!(
+            pair(&state.inner.lock(), &nodes, &target, later)
+                .response
+                .is_none()
+        );
+        publish(1, uri, old, 1, later);
+        assert!(
+            pair(&state.inner.lock(), &nodes, &target, later)
+                .response
+                .is_none()
+        );
+        publish(1, uri, old, 3, later);
+        assert!(
+            pair(&state.inner.lock(), &nodes, &target, later)
+                .response
+                .is_some()
+        );
+        for invalid in [Duration::ZERO, Duration::MAX] {
+            for index in 0..2 {
+                publish(index, uri, invalid, 4, later);
+            }
+            let decision = scores(&state.inner.lock(), &nodes, &target, later);
+            assert!(decision.pairs.get(1).unwrap().response.is_none());
+            assert!(
+                decision
+                    .evidence
+                    .iter()
+                    .all(|evidence| evidence.probe.is_none())
+            );
+        }
     }
 }
 

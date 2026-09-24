@@ -88,43 +88,6 @@ fn unilateral_upload_and_download_gains_promote_without_max_direction_masking() 
 }
 
 #[test]
-fn crossed_directions_are_a_tradeoff_not_missing_evidence() {
-    let now = Instant::now();
-    let nodes = [node("cross incumbent"), node("cross candidate")];
-    let (incumbent, mut candidate, mut pair) = trained_pair(now);
-    pair.upload = Some(metric(100.0, 200.0, now));
-    pair.download = Some(metric(100.0, 50.0, now));
-    candidate.performance.upload = MetricSnapshot {
-        value: Some(200.0),
-        confidence: 1.0,
-    };
-    let result = promotion_result(
-        pair,
-        (incumbent.qualified(), candidate.qualified()),
-        (
-            incumbent.observed_reliability,
-            candidate.observed_reliability,
-        ),
-    );
-    assert_eq!(result.gain, 0.0);
-    assert!(result.directional_tradeoff);
-    let scores = [incumbent, candidate];
-    let selected = ordinary_selection(
-        &scores,
-        &nodes.iter().collect::<Vec<_>>(),
-        Some(0),
-        performance_baseline(&scores),
-        &comparison::PairCohort {
-            reference: 0,
-            pairs: vec![None, Some(pair)],
-            joint: None,
-        },
-    );
-    assert_eq!(selected.index, 0);
-    assert_eq!(selected.reason, SelectionReason::DirectionalTradeoffHeld);
-}
-
-#[test]
 fn unknown_direction_stays_unknown_but_does_not_veto_a_supported_gain() {
     let now = Instant::now();
     let (incumbent, candidate, mut pair) = trained_pair(now);

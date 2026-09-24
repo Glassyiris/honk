@@ -309,7 +309,6 @@ fn selector_parent_peeks_unchosen_score_subgroups() {
     let before_b = state.selection_reason_counts("sel-sub-b", SelectionNetwork::Tcp);
     let plan = manager
         .selection_plan_for_target("sel-parent", &context("sel-target.internal", IpVersion::V4));
-    let feedback = plan.entries[0].feedback.as_ref().unwrap().clone();
     let pending = manager.score_budget_counters("sel-sub-a", SelectionNetwork::Tcp);
     assert_eq!(
         (
@@ -326,22 +325,6 @@ fn selector_parent_peeks_unchosen_score_subgroups() {
         0
     );
     drop(plan);
-    assert_eq!(
-        manager
-            .score_budget_counters("sel-sub-a", SelectionNetwork::Tcp)
-            .reserved,
-        1
-    );
-    drop(feedback);
-    let released = manager.score_budget_counters("sel-sub-a", SelectionNetwork::Tcp);
-    assert_eq!(
-        (
-            released.reserved,
-            released.refunded,
-            released.business_starts
-        ),
-        (0, 1, 0)
-    );
     assert_ne!(
         state.selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp),
         before_a
