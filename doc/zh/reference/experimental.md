@@ -36,7 +36,7 @@
 | `config_content` | `false` | 为兼容旧配置而接受，不产生作用。所有获准请求均可读取可用来源，仅遮蔽监听凭据值。 |
 | `config_write` | `false` | 允许已接受主文件及所有已接受 include 的原文替换与 reload，含监听凭据的源除外；要求非空 `secret` 或启用 `password_auth`。 |
 | `writable_includes` | 空列表 | 为兼容旧配置而接受，不产生作用；不授予路径权限，也不限制已接受 include。 |
-| `geosite_download_url` | `""` | 更新已加载 geosite 的最终直达 HTTP(S) 来源；要求 `config_write`，已加载该资产而 URL 为空时不能更新。 |
+| `geosite_download_url` | `""` | 更新已加载 geosite 的最终直达 HTTP(S) 来源，最长 4096 字节；要求 `config_write`。有状态库时，已设置的 URL 在启动时写入已存储的 geodata 来源，覆盖通过 API 修改的 URL；删除该项后，下次启动时该资产恢复内置 URL。更新使用已存储或内置的 URL。没有状态库时，URL 为空则不能更新。 |
 | `geoip_download_url` | `""` | 更新已加载 geoip 的最终直达 HTTP(S) 来源，使用相同授权与限制。 |
 
 ```dae

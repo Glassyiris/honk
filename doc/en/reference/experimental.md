@@ -36,7 +36,7 @@ Requires the default-on `native-api` Cargo feature; it does not require `clash-a
 | `config_content` | `false` | Accepted for compatibility and ignored. Every admitted request may read available sources; only listener-secret values are masked. |
 | `config_write` | `false` | Allow whole-source replacement and reload for the accepted main file and all accepted includes, excluding listener-credential-bearing sources. Requires a nonempty `secret` or `password_auth`. |
 | `writable_includes` | empty list | Accepted for compatibility and ignored; it grants no path authority and does not restrict accepted includes. |
-| `geosite_download_url` | `""` | Final direct HTTP(S) source for updating the loaded geosite asset. Requires `config_write`; empty disables updates when geosite is loaded. |
+| `geosite_download_url` | `""` | Final direct HTTP(S) source for updating the loaded geosite asset, at most 4096 bytes. Requires `config_write`. With a state db, a set URL is written into the stored geodata sources at startup, over a URL patched through the API, and removing it returns the asset to its built-in URLs at the next startup; the stored or built-in URLs are the ones used. Without a state db, an empty URL disables updates. |
 | `geoip_download_url` | `""` | Final direct HTTP(S) source for updating the loaded geoip asset, with the same authorization and bounds. |
 
 ```dae
