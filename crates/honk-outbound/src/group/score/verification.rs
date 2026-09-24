@@ -246,6 +246,7 @@ pub(super) struct CandidateQuestion {
     pub question: ScoreEvidenceQuestion,
     pub required: usize,
     excluded: bool,
+    dominated: bool,
     backed_off: bool,
     availability_missing: bool,
     response_gap: ResponseGap,
@@ -262,6 +263,10 @@ impl CandidateQuestion {
 
     pub fn actionable(&self) -> bool {
         self.pending() && !self.backed_off
+    }
+
+    fn settled(&self) -> bool {
+        self.excluded || self.dominated
     }
 
     pub fn needs_alignment(&self) -> bool {
@@ -435,6 +440,7 @@ pub(super) fn evaluate(
                     .ceil()
                     .clamp(1.0, 4.0) as usize,
                 excluded: excluded(index),
+                dominated: super::comparison::dominated(winner, score, baseline),
                 backed_off: score.explore_backed_off,
                 availability_missing,
                 response_gap,
@@ -443,10 +449,10 @@ pub(super) fn evaluate(
         .collect();
     let availability = candidates
         .iter()
-        .any(|candidate| !candidate.excluded && candidate.availability_missing);
+        .any(|candidate| !candidate.settled() && candidate.availability_missing);
     let missing_response = candidates
         .iter()
-        .any(|candidate| !candidate.excluded && candidate.response_gap != ResponseGap::None);
+        .any(|candidate| !candidate.settled() && candidate.response_gap != ResponseGap::None);
     let pending_count = candidates
         .iter()
         .filter(|candidate| candidate.pending())
@@ -455,7 +461,7 @@ pub(super) fn evaluate(
     for (index, candidate) in candidates.iter().enumerate() {
         blockers.node_failure += usize::from(snapshots[index].node_failure);
         blockers.target_failure += usize::from(snapshots[index].target_failure);
-        if candidate.excluded {
+        if candidate.settled() {
             blockers.excluded += 1;
             continue;
         }
@@ -556,7 +562,7 @@ pub(super) fn evaluate(
         for (_, evidence) in evidence
             .iter()
             .enumerate()
-            .filter(|(index, _)| !candidates[*index].excluded)
+            .filter(|(index, _)| !candidates[*index].settled())
         {
             support_metric(evidence.business);
         }
@@ -631,20 +637,30 @@ pub(super) fn evaluate(
     nodes[selected].id.hash(&mut hasher);
     for (index, (node, score)) in nodes.iter().zip(snapshots).enumerate() {
         node.id.hash(&mut hasher);
-        candidates[index].excluded.hash(&mut hasher);
+        candidates[index].settled().hash(&mut hasher);
         if use_probe {
             score.probe_scope.hash(&mut hasher);
         }
     }
     (basis as u8).hash(&mut hasher);
     summary.support.hash(&mut hasher);
-    for (index, evidence) in evidence.iter().enumerate() {
-        if (comparison != ScoreComparison::Unconfirmed || has_transfer)
-            && candidates[index].excluded
-            && let Some(at) = evidence.failed_at
-        {
-            let until = at + PERFORMANCE_MAX_AGE;
-            expires_at = Some(expires_at.map_or(until, |old| old.min(until)));
+    if comparison != ScoreComparison::Unconfirmed || has_transfer {
+        for (index, candidate) in candidates.iter().enumerate() {
+            let failure = evidence[index]
+                .failed_at
+                .filter(|_| candidate.excluded)
+                .map(|at| at + PERFORMANCE_MAX_AGE);
+            // Dominance holds only while both sides remain completion-qualified.
+            let dominance = candidate.dominated.then(|| {
+                let lapse = winner
+                    .useful_completed
+                    .min(snapshots[index].useful_completed)
+                    / PERFORMANCE_VALIDATION_SAMPLES;
+                now + SCORE_EVIDENCE_HALF_LIFE.mul_f64(lapse.log2())
+            });
+            if let Some(until) = failure.max(dominance) {
+                expires_at = Some(expires_at.map_or(until, |old| old.min(until)));
+            }
         }
     }
     Evaluation {

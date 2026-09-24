@@ -1,5 +1,8 @@
 use super::super::ranking::{Decision, normal_eligible};
-use super::super::{PERFORMANCE_MAX_AGE, PERFORMANCE_SWITCH_MARGIN, ScoreEvidenceBasis};
+use super::super::{
+    PERFORMANCE_MAX_AGE, PERFORMANCE_SWITCH_MARGIN, PERFORMANCE_VALIDATION_SAMPLES,
+    PerformanceBaseline, ScoreEvidenceBasis, ScoreSnapshot,
+};
 use super::{Basis, MetricPair, PairEvidence};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
@@ -47,6 +50,19 @@ fn equivalent(left: f64, right: f64) -> bool {
     let high = left.max(right);
     // Averaging and unit conversion can round an inclusive boundary by a few ulps.
     high - low <= low * PERFORMANCE_SWITCH_MARGIN + high * f64::EPSILON * 8.0
+}
+
+/// Outside the eligibility band, yet completion-qualified with lower observed reliability than a
+/// completion-qualified selection, so [`advantage`] can never credit it as a rival. Coverage
+/// resolves it among eligible members; its unpaired metrics are not measured as equivalent.
+pub(in crate::group::score) fn dominated(
+    winner: &ScoreSnapshot,
+    candidate: &ScoreSnapshot,
+    baseline: PerformanceBaseline,
+) -> bool {
+    !normal_eligible(candidate, baseline)
+        && winner.useful_completed.min(candidate.useful_completed) >= PERFORMANCE_VALIDATION_SAMPLES
+        && candidate.observed_reliability < winner.observed_reliability
 }
 
 fn advantage(
@@ -120,10 +136,11 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
         if index == selected {
             continue;
         }
-        if !normal_eligible(candidate, baseline)
-            && decision.evidence[index]
-                .failed_at
-                .is_some_and(|at| now.saturating_duration_since(at) < PERFORMANCE_MAX_AGE)
+        if dominated(winner, candidate, baseline)
+            || (!normal_eligible(candidate, baseline)
+                && decision.evidence[index]
+                    .failed_at
+                    .is_some_and(|at| now.saturating_duration_since(at) < PERFORMANCE_MAX_AGE))
         {
             excluded += 1;
             continue;

@@ -710,3 +710,34 @@ fn later_challenger_direction_controls_claim_identity_and_expiry() {
         Some(response.expires_at.duration_since(expiry))
     );
 }
+
+#[test]
+fn dominance_is_relative_to_the_selection_and_needs_completed_qualification() {
+    let member = |observed: f64, completed: f64, fail_streak: u32| ScoreSnapshot {
+        reliability: observed,
+        reliability_upper: observed,
+        observed_reliability: observed,
+        useful_completed: completed,
+        fail_streak,
+        ..Default::default()
+    };
+    let selection = member(0.96, 8.0, 0);
+    let above_selection = member(0.97, 8.0, SCORE_FAIL_STREAK_EXCLUDE);
+    let below = member(0.9, 8.0, 0);
+    let unproven = member(0.9, 3.9, 0);
+    let baseline = performance_baseline(&[
+        selection,
+        member(1.0, 8.0, 0),
+        above_selection,
+        below,
+        unproven,
+    ]);
+    // Below the best member is not enough: only lower reliability than the selection vetoes.
+    for (candidate, dominated) in [(above_selection, false), (below, true), (unproven, false)] {
+        assert!(!ranking::normal_eligible(&candidate, baseline));
+        assert_eq!(
+            comparison::dominated(&selection, &candidate, baseline),
+            dominated
+        );
+    }
+}

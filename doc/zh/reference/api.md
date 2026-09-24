@@ -247,7 +247,7 @@ B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
 | `question` | `none`、`availability`、`response`、`qualification`、`recovery` 或 `transfer`：下一个尚未解决的证据问题。没有剩余动作时为 `none`；退避时保留被阻塞候选的问题，不回退到已解决现任的问题。 |
 | `waitReason` | `none`；`budget` 表示没有可用额度；`comparableTraffic` 等待未来可比业务；`inFlight` 表示已有足够的同目标工作，或已达到独立的每节点四项工作上限；`transfer` 等待真实传输负载；`backoff` 保留失败隔离。聚合读取检查已保留 IPv4/IPv6 作用域，不创建它们：两者预算均阻塞才返回 `budget`；任一可用／未创建作用域允许继续等待未来可比流量；其余情况保留在途等待。等待不证明工作必然成功。 |
 | `localComparison` | 下述对已比较合格挑战者的摘要；不能把不完整的全体候选覆盖升级为全局比较。 |
-| `coverage` | `candidates`、`compared`、`pending`、`excluded` 数量，以及共同目标支持不完整（存在未合格的已匹配目标或超过八个规范目标）时为真的 `targetLimited`。即使可用性／响应已有支持，pending 仍可包含资格／恢复工作。单节点可证明可用，不代表优于其他路径。 |
+| `coverage` | `candidates`、`compared`、`pending`、`excluded` 数量，以及共同目标支持不完整（存在未合格的已匹配目标或超过八个规范目标）时为真的 `targetLimited`。即使可用性／响应已有支持，pending 仍可包含资格／恢复工作。`excluded` 统计无需配对即可结清的成员：近期失败排除，或不具普通资格、且在双方都有四个有效完成时实际可靠性低于所选成员的成员。这类成员保留恢复／验证工作，因此也可能计入 pending；它未配对的指标不被称为近似等价。单节点可证明可用，不代表优于其他路径。 |
 | `blockers` | 固定数量字段：`recovery`、`backoff`、`qualification`、`availability`、`responseMissing`、`responseUnpaired`、`responseMisaligned`、`probeScope`、`responseDegraded`、`nodeFailure`、`targetFailure`。原因可重叠，不是额外失败或累积计数器；被排除候选单独计数，节点／目标失败数量包含这些候选。不导出目标键。 |
 | `evidenceAgeMs` / `validForMs` | 最弱支持证据的年龄与条件性剩余有效期；没有结论时为 null。新证据可以提前撤销结论。 |
 | `network`、`targetFamily`、`healthFamily`、`targetSpecific` | transport 与适用范围；此聚合接口没有精确目标，不导出 domain/IP/port 或原始节点 ID。 |

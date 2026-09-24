@@ -12,7 +12,7 @@ mod store;
 use store::{Bucket, Cell, Key, Timing};
 pub(super) use store::{Store, observe, target_bytes};
 mod summary;
-pub(super) use summary::summarize;
+pub(super) use summary::{dominated, summarize};
 
 pub(super) const MAX_CELLS: usize = 256;
 pub(super) const MAX_TARGETS: usize = 8;

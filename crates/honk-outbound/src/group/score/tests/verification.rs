@@ -762,52 +762,114 @@ fn exhausted_budget_and_retired_authority_cannot_publish_confirmation() {
 }
 
 #[test]
-fn fresh_excluded_failure_is_known_inferior_not_an_unknown_rival() {
-    let nodes = [node("working"), node("slower"), node("failed")];
+fn stale_failure_reopens_coverage_unless_qualified_reliability_dominates_it() {
+    for (history, dominated) in [(20, true), (0, false)] {
+        let nodes = [node("working"), node("slower"), node("failed")];
+        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+        let target = context("business.example", IpVersion::V4);
+        let now = Instant::now();
+        for (leaf, (samples, latency)) in nodes.iter().zip([(20, 10), (20, 100), (history, 1)]) {
+            train_at(
+                &manager,
+                leaf,
+                &target,
+                samples,
+                Duration::from_millis(latency),
+                1,
+                now,
+            );
+        }
+        for _ in 0..3 {
+            manager
+                .feedback_for_group_node("score", nodes[2].id, target.clone())
+                .unwrap()
+                .start_at(now)
+                .finish_at(ScoreOutcome::Timeout, true, now);
+        }
+        let snapshot = verification_at(&manager, &nodes, &target, now + Duration::from_secs(2));
+        assert_eq!(snapshot.comparison, ScoreComparison::Supported);
+        assert_eq!(snapshot.candidate_count, 3);
+        assert_eq!(snapshot.compared_count, 2);
+        assert_eq!(snapshot.pending_count, 0);
+        assert_eq!(snapshot.blockers.excluded, 1);
+        let at = now + PERFORMANCE_MAX_AGE + Duration::from_secs(2);
+        for leaf in &nodes[..2] {
+            train_at(
+                &manager,
+                leaf,
+                &target,
+                5,
+                Duration::from_millis(100),
+                1,
+                at,
+            );
+        }
+        let snapshot = verification_at(&manager, &nodes, &target, at + Duration::from_secs(2));
+        // Lower qualified reliability can never be a rival advantage; unknown history can.
+        assert_eq!(
+            snapshot.comparison,
+            if dominated {
+                ScoreComparison::Equivalent
+            } else {
+                ScoreComparison::Unconfirmed
+            },
+            "history={history}"
+        );
+        assert_eq!(snapshot.blockers.excluded, usize::from(dominated));
+        // Coverage resolution never withdraws the failed member's recovery work.
+        assert_eq!(snapshot.pending_count, 1);
+        assert_eq!(snapshot.next_action, ScoreValidationAction::Backoff);
+        assert_eq!(snapshot.question, ScoreEvidenceQuestion::Recovery);
+        assert_eq!(snapshot.wait_reason, ScoreWaitReason::Backoff);
+    }
+}
+
+#[test]
+fn dominance_ends_the_claim_when_qualification_lapses() {
+    let nodes = [node("steady"), node("peer"), node("flaky")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
-    for (leaf, latency) in nodes.iter().zip([10, 100, 1]) {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            Duration::from_millis(latency),
-            1,
-            now,
-        );
-    }
-    for _ in 0..3 {
-        manager
-            .feedback_for_group_node("score", nodes[2].id, target.clone())
-            .unwrap()
-            .start_at(now)
-            .finish_at(ScoreOutcome::Timeout, true, now);
-    }
-    let snapshot = verification_at(&manager, &nodes, &target, now + Duration::from_secs(2));
-    assert_eq!(snapshot.comparison, ScoreComparison::Supported);
-    assert_eq!(snapshot.candidate_count, 3);
-    assert_eq!(snapshot.compared_count, 2);
-    assert_eq!(snapshot.pending_count, 0);
-    let at = now + PERFORMANCE_MAX_AGE + Duration::from_secs(2);
+    train_at(
+        &manager,
+        &nodes[2],
+        &target,
+        4,
+        Duration::from_millis(1),
+        1,
+        now,
+    );
+    manager
+        .feedback_for_group_node("score", nodes[2].id, target.clone())
+        .unwrap()
+        .start_at(now)
+        .finish_at(ScoreOutcome::Timeout, true, now + Duration::from_secs(1));
+    // Five decayed completions sit just above the four-completion threshold here.
+    let decayed = now + Duration::from_secs(540);
     for leaf in &nodes[..2] {
         train_at(
             &manager,
             leaf,
             &target,
-            5,
-            Duration::from_millis(100),
+            20,
+            Duration::from_millis(10),
             1,
-            at,
+            decayed,
         );
     }
-    let snapshot = verification_at(&manager, &nodes, &target, at + Duration::from_secs(2));
-    assert_eq!(snapshot.comparison, ScoreComparison::Unconfirmed);
-    assert_eq!(snapshot.pending_count, 1);
-    assert_eq!(snapshot.next_action, ScoreValidationAction::Backoff);
-    assert_eq!(snapshot.question, ScoreEvidenceQuestion::Recovery);
-    assert_eq!(snapshot.wait_reason, ScoreWaitReason::Backoff);
+    let at = decayed + Duration::from_secs(2);
+    let report = verification_at(&manager, &nodes, &target, at);
+    assert_eq!(report.comparison, ScoreComparison::Equivalent);
+    let valid_for = Duration::from_millis(report.valid_for_ms.unwrap());
+    let margin = Duration::from_millis(100);
+    assert_eq!(
+        verification_at(&manager, &nodes, &target, at + valid_for - margin).comparison,
+        ScoreComparison::Equivalent
+    );
+    assert_eq!(
+        verification_at(&manager, &nodes, &target, at + valid_for + margin).comparison,
+        ScoreComparison::Unconfirmed
+    );
 }
 
 #[test]
