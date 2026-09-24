@@ -464,7 +464,7 @@ fn open_state_db(
 ) -> anyhow::Result<(Option<Arc<state::StateDb>>, bool)> {
     let strict = cli.store == ConfigStore::Db || config.experimental.native_api.password_auth;
     if cli.store == ConfigStore::Db
-        || !(config.experimental.cache_file.enabled
+        || !(config.experimental.cache_file.stores_selections()
             || config.global.store_subscribe
             || config.experimental.native_api.password_auth)
     {
@@ -525,9 +525,10 @@ fn claim_state(
     if let Some(state) = state_db.as_ref() {
         let experimental = &config.experimental;
         let owners = state::ActiveOwners {
-            cache: experimental.cache_file.enabled,
-            dns: experimental.cache_file.store_dns,
-            clash: cfg!(feature = "clash-api")
+            cache: experimental.cache_file.stores_selections(),
+            dns: experimental.cache_file.stores_dns(),
+            clash: experimental.cache_file.stores_mode()
+                && cfg!(feature = "clash-api")
                 && !(cfg!(feature = "native-api") && experimental.native_api.enabled)
                 && !experimental.clash_api.external_controller.is_empty(),
             subscriptions: config.global.store_subscribe,
@@ -736,6 +737,16 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
             chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f%:z")
         )
     }
+}
+
+/// A valid cached Clash mode, else `default_mode`, else `Rule`.
+#[cfg(feature = "clash-api")]
+fn startup_clash_mode(mode_db: Option<&state::cache::CacheDb>, default_mode: &str) -> String {
+    mode_db
+        .and_then(|db| db.load_clash_mode())
+        .and_then(|mode| mode::ModeState::normalize(&mode))
+        .or_else(|| mode::ModeState::normalize(default_mode))
+        .unwrap_or_else(|| "Rule".to_owned())
 }
 
 /// The console layer, with or without the local timestamp. The file layer
@@ -1637,7 +1648,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .experimental
         .clash_api
         .clone();
-    let cache_db = control_plane.cache_db();
+    let mode_db = control_plane.mode_db();
     let native_mode = cfg!(feature = "native-api")
         && control_plane
             .config_handle()
@@ -1650,12 +1661,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let mode = if native_mode {
         "Rule".to_owned()
     } else {
-        cache_db
-            .as_ref()
-            .and_then(|db| db.load_clash_mode())
-            .and_then(|mode| mode::ModeState::normalize(&mode))
-            .or_else(|| mode::ModeState::normalize(&clash_cfg.default_mode))
-            .unwrap_or_else(|| "Rule".to_owned())
+        startup_clash_mode(mode_db.as_deref(), &clash_cfg.default_mode)
     };
     #[cfg(not(feature = "clash-api"))]
     let mode = "Rule".to_owned();
@@ -1673,7 +1679,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let global_selection = if native_mode {
         String::new()
     } else {
-        cache_db
+        mode_db
             .as_ref()
             .and_then(|db| db.load_clash_global())
             .filter(|selection| {
@@ -2740,7 +2746,7 @@ mod startup_lifecycle_tests {
 
         let cli = Cli::parse_from(["honk-core"]);
         let mut config = honk_config::Config::default();
-        config.experimental.cache_file.enabled = true;
+        config.experimental.cache_file.enabled = Some(true);
 
         let unsafe_dir = tempfile::tempdir().unwrap();
         let state = unsafe_dir.path().join(crate::state::STATE_DIR);

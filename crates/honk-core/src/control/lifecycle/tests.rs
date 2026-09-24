@@ -81,6 +81,7 @@ impl Fixture {
         config.global.tproxy_port = free_port();
         config.global.nfqueue_enable = false;
         config.global.store_subscribe = false;
+        config.experimental.cache_file.enabled = Some(false);
         config.global.dial_mode = "ip".into();
         config.global.connect_timeout_ms = 30_000;
         config.global.preconnect_node_count = 0;
@@ -155,7 +156,7 @@ impl Fixture {
         let state = config
             .experimental
             .cache_file
-            .enabled
+            .stores_selections()
             .then(|| crate::state::StateDb::open(std::path::Path::new(&config.global.data_dir)))
             .transpose()?
             .map(Arc::new);

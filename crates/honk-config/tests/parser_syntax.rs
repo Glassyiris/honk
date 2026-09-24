@@ -387,7 +387,7 @@ routing {
         );
         assert_eq!(config.groups[0].final_outbound.as_deref(), Some("direct"));
         assert_eq!(config.experimental.clash_api.secret, "retained");
-        assert!(!config.experimental.cache_file.enabled);
+        assert_eq!(config.experimental.cache_file.enabled, Some(false));
         assert_eq!(config.dns.cache.max_size, 321);
         assert_eq!(config.dns.upstream.len(), 1);
         assert_eq!(config.dns.upstream[0].name, "visible");
@@ -430,7 +430,7 @@ routing {
         &mut diagnostics,
     ).unwrap();
         assert_eq!(config.experimental.clash_api.secret, "kept");
-        assert!(config.experimental.cache_file.enabled);
+        assert_eq!(config.experimental.cache_file.enabled, Some(true));
         assert_eq!(
             diagnostics
                 .iter()

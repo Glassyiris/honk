@@ -1313,7 +1313,7 @@ experimental {
         );
         assert_eq!(config.experimental.clash_api.secret, "s3cret");
         assert_eq!(config.experimental.clash_api.default_mode, "Global");
-        assert!(config.experimental.cache_file.enabled);
+        assert_eq!(config.experimental.cache_file.enabled, Some(true));
         assert_eq!(
             config.experimental.cache_file.legacy_cache_file(),
             (Some("cache.db"), Some("router1"))
@@ -2682,7 +2682,7 @@ experimental {
     assert!(!config.global.tls_fragment);
     assert!(!config.global.mptcp);
     assert!(!config.dns.cache.enabled);
-    assert!(!config.experimental.cache_file.enabled);
+    assert_eq!(config.experimental.cache_file.enabled, Some(false));
     assert!(!config.experimental.cache_file.store_dns);
 
     let valid_input = r#"
@@ -2723,7 +2723,7 @@ experimental {
     assert!(!config.global.tls_fragment);
     assert!(!config.global.mptcp);
     assert!(!config.dns.cache.enabled);
-    assert!(config.experimental.cache_file.enabled);
+    assert_eq!(config.experimental.cache_file.enabled, Some(true));
     assert!(config.experimental.cache_file.store_dns);
 }
 
