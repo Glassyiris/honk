@@ -365,7 +365,7 @@ pub(super) async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedRe
             Ok(header) => header,
             Err(e) => {
                 debug!("AnyTLS session {} demux read failed: {}", session.seq, e);
-                fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                fail_reason = Some(anyhow::Error::new(e).context("demux read failed"));
                 break;
             }
         };
@@ -378,7 +378,7 @@ pub(super) async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedRe
                     let Some(inbound) = inbound else {
                         session.end_stream(sid, false);
                         if let Err(e) = drain_frame_body(&mut read, payload_len).await {
-                            fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                            fail_reason = Some(anyhow::Error::new(e).context("demux read failed"));
                             break;
                         }
                         session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
@@ -391,8 +391,9 @@ pub(super) async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedRe
                     {
                         Ok(result) => result,
                         Err(e) => {
-                            fail_reason =
-                                Some(anyhow::anyhow!("inbound payload budget closed: {e}"));
+                            fail_reason = Some(
+                                anyhow::Error::new(e).context("inbound payload budget closed"),
+                            );
                             break;
                         }
                     };
@@ -404,7 +405,7 @@ pub(super) async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedRe
                         )
                         .await
                         {
-                            fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                            fail_reason = Some(anyhow::Error::new(e).context("demux read failed"));
                             break;
                         }
                         session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
@@ -420,7 +421,7 @@ pub(super) async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedRe
                         )
                         .await
                         {
-                            fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                            fail_reason = Some(anyhow::Error::new(e).context("demux read failed"));
                             break;
                         }
                         session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
@@ -435,7 +436,7 @@ pub(super) async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedRe
                     {
                         Ok(data) => data,
                         Err(e) => {
-                            fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                            fail_reason = Some(anyhow::Error::new(e).context("demux read failed"));
                             break;
                         }
                     };
@@ -451,7 +452,8 @@ pub(super) async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedRe
                         Err(_) => {
                             session.end_uot_stream(sid, true);
                             if let Err(e) = drain_frame_body(&mut read, payload_len).await {
-                                fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                                fail_reason =
+                                    Some(anyhow::Error::new(e).context("demux read failed"));
                                 break;
                             }
                             session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
@@ -464,7 +466,8 @@ pub(super) async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedRe
                             drop(queue);
                             session.end_uot_stream(sid, true);
                             if let Err(e) = drain_frame_body(&mut read, payload_len).await {
-                                fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                                fail_reason =
+                                    Some(anyhow::Error::new(e).context("demux read failed"));
                                 break;
                             }
                             session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
@@ -480,7 +483,7 @@ pub(super) async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedRe
                         drop(credit);
                         session.end_uot_stream(sid, true);
                         if let Err(e) = drain_frame_body(&mut read, payload_len).await {
-                            fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                            fail_reason = Some(anyhow::Error::new(e).context("demux read failed"));
                             break;
                         }
                         session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
@@ -489,7 +492,7 @@ pub(super) async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedRe
                     let data = match read_frame_body(&mut read, payload_len).await {
                         Ok(data) => data,
                         Err(e) => {
-                            fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                            fail_reason = Some(anyhow::Error::new(e).context("demux read failed"));
                             break;
                         }
                     };
@@ -502,7 +505,7 @@ pub(super) async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedRe
                         session.seq, sid, payload_len
                     );
                     if let Err(e) = drain_frame_body(&mut read, payload_len).await {
-                        fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                        fail_reason = Some(anyhow::Error::new(e).context("demux read failed"));
                         break;
                     }
                     session.rx_frame_seq.fetch_add(1, Ordering::Relaxed);
@@ -519,13 +522,13 @@ pub(super) async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedRe
             match read_frame_body(&mut read, payload_len).await {
                 Ok(data) => data,
                 Err(e) => {
-                    fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                    fail_reason = Some(anyhow::Error::new(e).context("demux read failed"));
                     break;
                 }
             }
         } else {
             if let Err(e) = drain_frame_body(&mut read, payload_len).await {
-                fail_reason = Some(anyhow::anyhow!("demux read failed: {e}"));
+                fail_reason = Some(anyhow::Error::new(e).context("demux read failed"));
                 break;
             }
             Bytes::new()
@@ -553,7 +556,15 @@ pub(super) async fn session_demux(session: Arc<AnyTlsSession>, mut read: BoxedRe
                         "AnyTLS session {} sid={} remote dial error: {}",
                         session.seq, sid, message
                     );
-                    session.dispatch_error(sid, message).await;
+                    let error = anyhow::Error::msg(message.to_string());
+                    let error = if session.tcp_sink_is_live(sid) {
+                        anyhow::Error::new(crate::proxy::TargetFailure(error))
+                    } else {
+                        anyhow::Error::new(crate::proxy::NodeFailure(error))
+                    };
+                    session
+                        .dispatch_error(sid, crate::SharedError::new(error))
+                        .await;
                 }
             }
             CMD_HEART_REQUEST => {
@@ -698,7 +709,7 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                             "stream killed: slow consumer (HOL)",
                         )
                     } else {
-                        std::io::Error::new(std::io::ErrorKind::ConnectionReset, e.to_string())
+                        std::io::Error::new(std::io::ErrorKind::ConnectionReset, e)
                     };
 
                     if got_any {
@@ -736,7 +747,7 @@ impl tokio::io::AsyncRead for AnyTlsStream {
                         if let Some(e) = this.session.terminal_error.get() {
                             Some(std::io::Error::new(
                                 std::io::ErrorKind::ConnectionAborted,
-                                e.to_string(),
+                                e.clone(),
                             ))
                         } else if killed || receive.was_reset() {
                             Some(std::io::Error::new(

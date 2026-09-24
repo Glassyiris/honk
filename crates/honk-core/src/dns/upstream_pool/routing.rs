@@ -4,7 +4,9 @@ use honk_config::node::Node;
 use honk_config::types::DnsProtocol;
 use honk_outbound::alive::{IpVersion, ProbeDomain};
 use honk_outbound::group::GroupManager;
-use honk_outbound::group::{ScoreFeedback, ScoreSelectionContext, ScoreTarget, SelectionNetwork};
+use honk_outbound::group::{
+    ScoreAttempt, ScoreContinuation, ScoreSelectionContext, ScoreTarget, SelectionNetwork,
+};
 use tracing::{debug, warn};
 
 use super::UpstreamPool;
@@ -14,7 +16,7 @@ use crate::routing::ConnectionInfo;
 pub(super) struct DnsDialRoute {
     pub(super) target: SocketAddr,
     pub(super) node: Option<Node>,
-    pub(super) feedback: Option<ScoreFeedback>,
+    pub(super) feedback: Option<ScoreAttempt>,
     #[cfg(feature = "native-api")]
     pub(super) observation: Option<crate::native_api::flows::record::OutboundAttempt>,
 }
@@ -22,7 +24,7 @@ pub(super) struct DnsDialRoute {
 #[derive(Default)]
 struct SelectedLeaf {
     node: Option<Node>,
-    feedback: Option<ScoreFeedback>,
+    feedback: Option<ScoreAttempt>,
     #[cfg(feature = "native-api")]
     path: Vec<crate::native_api::flows::record::Selection>,
 }
@@ -80,12 +82,14 @@ fn select_group_leaf_for_target(
     outbound: &str,
     entry: &UpstreamEntry,
     target: SocketAddr,
+    original: Option<&ScoreContinuation>,
 ) -> Option<SelectedLeaf> {
     group_manager.get_group_policy(outbound)?;
     let select = || {
         group_manager.selection_plan_for_target_with_health_fallback(
             outbound,
             &target_context(entry, target),
+            original,
         )
     };
     #[cfg(feature = "native-api")]
@@ -122,6 +126,7 @@ impl UpstreamPool {
         outbound: &str,
         entry: &UpstreamEntry,
         target: SocketAddr,
+        original: Option<&ScoreContinuation>,
     ) -> SelectedLeaf {
         if outbound.eq_ignore_ascii_case("direct") {
             return SelectedLeaf::default();
@@ -129,7 +134,7 @@ impl UpstreamPool {
 
         if let Some(group_manager) = self.group_manager_snapshot.read().as_ref() {
             if let Some(selected) =
-                select_group_leaf_for_target(group_manager, outbound, entry, target)
+                select_group_leaf_for_target(group_manager, outbound, entry, target, original)
             {
                 return selected;
             }
@@ -140,7 +145,7 @@ impl UpstreamPool {
             let group_manager = cell.read();
             if group_manager.get_group_policy(outbound).is_some() {
                 if let Some(selected) =
-                    select_group_leaf_for_target(&group_manager, outbound, entry, target)
+                    select_group_leaf_for_target(&group_manager, outbound, entry, target, original)
                 {
                     return selected;
                 }
@@ -171,11 +176,13 @@ impl UpstreamPool {
         &self,
         entry: &UpstreamEntry,
         route: &DnsDialRoute,
-    ) -> Option<ScoreFeedback> {
+    ) -> anyhow::Result<Option<ScoreAttempt>> {
         route
             .feedback
             .clone()
             .map(|feedback| feedback.with_context(tcp_target_context(entry, route.target)))
+            .transpose()
+            .map_err(Into::into)
     }
     #[cfg(test)]
     pub(super) async fn resolve_dial_route(
@@ -183,13 +190,15 @@ impl UpstreamPool {
         entry: &UpstreamEntry,
     ) -> anyhow::Result<DnsDialRoute> {
         let target = Self::resolve_udp_addr(entry).await?;
-        self.resolve_dial_route_for_address(entry, target).await
+        self.resolve_dial_route_for_address(entry, target, None)
+            .await
     }
 
     pub(super) async fn resolve_dial_route_for_address(
         &self,
         entry: &UpstreamEntry,
         target: SocketAddr,
+        original: Option<&ScoreContinuation>,
     ) -> anyhow::Result<DnsDialRoute> {
         if let Some(tag) = entry.outbound.as_deref() {
             if tag.eq_ignore_ascii_case("block") {
@@ -197,7 +206,7 @@ impl UpstreamPool {
                 crate::native_api::flows::dns::decision("rejected", Some("policy_block"));
                 anyhow::bail!("DNS upstream outbound 'block' rejected the dial");
             }
-            let selected = self.resolve_outbound_for_target(tag, entry, target);
+            let selected = self.resolve_outbound_for_target(tag, entry, target, original);
             if selected.node.is_none() && !tag.eq_ignore_ascii_case("direct") {
                 #[cfg(feature = "native-api")]
                 crate::native_api::flows::dns::decision("rejected", Some("no_available_outbound"));
@@ -303,7 +312,7 @@ impl UpstreamPool {
                 feedback: None,
             });
         }
-        let selected = self.resolve_outbound_for_target(&outbound_name, entry, target);
+        let selected = self.resolve_outbound_for_target(&outbound_name, entry, target, original);
         if selected.node.is_none() {
             #[cfg(feature = "native-api")]
             crate::native_api::flows::dns::decision("rejected", Some("no_available_outbound"));

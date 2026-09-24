@@ -229,7 +229,9 @@ impl AsyncRead for SsStream {
                 n,
                 tag_len,
             )
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, crate::proxy::NodeFailure(e))
+            })?;
             if n == 0 {
                 // Clean EOF (the fast path runs only with an empty carry).
                 return Poll::Ready(Ok(()));
@@ -308,7 +310,9 @@ impl AsyncRead for SsStream {
                 total,
                 tag_len,
             )
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, crate::proxy::NodeFailure(e))
+            })?;
             if out_len > 0 {
                 this.peer_authenticated = true;
                 this.pressure.observe(this.write_half.as_ref());
@@ -471,27 +475,30 @@ impl Ss2022Prologue {
         let fixed_len = 1 + 8 + method.key_len + 2;
         let mut fixed_buf = vec![0u8; fixed_len + TAG_LEN];
         read_half.read_exact(&mut fixed_buf).await?;
-        let fixed = recv_cipher
-            .open(&recv_nonce, &fixed_buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let fixed = recv_cipher.open(&recv_nonce, &fixed_buf).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                crate::proxy::NodeFailure(anyhow!(e)),
+            )
+        })?;
         increment_nonce(&mut recv_nonce);
         if fixed[0] != super::aead2022::HEADER_TYPE_SERVER {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("bad response header type {}", fixed[0]),
+                crate::proxy::NodeFailure(anyhow!("bad response header type {}", fixed[0])),
             ));
         }
         let ts = u64::from_be_bytes(fixed[1..9].try_into().expect("8-byte timestamp"));
         if unix_timestamp().abs_diff(ts) > 30 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "bad response timestamp",
+                crate::proxy::NodeFailure(anyhow!("bad response timestamp")),
             ));
         }
         if fixed[9..9 + method.key_len] != self.request_salt[..] {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "response request-salt mismatch",
+                crate::proxy::NodeFailure(anyhow!("response request-salt mismatch")),
             ));
         }
         let first_len = u16::from_be_bytes([fixed[fixed_len - 2], fixed[fixed_len - 1]]) as usize;
@@ -499,7 +506,10 @@ impl Ss2022Prologue {
         let mut first = vec![0u8; first_len + TAG_LEN];
         read_half.read_exact(&mut first).await?;
         let first_payload = recv_cipher.open(&recv_nonce, &first).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, anyhow!("{e:?}").to_string())
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                crate::proxy::NodeFailure(anyhow!(e)),
+            )
         })?;
         increment_nonce(&mut recv_nonce);
 

@@ -121,7 +121,7 @@ impl ControlPlane {
                                 reporter.setup_failed(if error.kind() == io::ErrorKind::TimedOut {
                                     crate::group::ScoreOutcome::Timeout
                                 } else {
-                                    crate::group::ScoreOutcome::Io(error.kind())
+                                    crate::group::ScoreOutcome::from_io_error(&error)
                                 });
                             }
                             debug!("Preconnect warmup to {} failed: {}", addr, error);

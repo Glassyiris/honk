@@ -124,7 +124,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for ResponseHeaderStrip<S> {
                     if version != 0 {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("VLESS: server rejected request (code 0x{version:02x})"),
+                            crate::proxy::NodeFailure(anyhow::anyhow!(
+                                "VLESS: server rejected request (code 0x{version:02x})"
+                            )),
                         )));
                     }
                     *state = if addon_len > 0 {
@@ -395,7 +397,9 @@ impl<S: AsyncRead + DirectRead + Unpin> AsyncRead for VisionStream<S> {
                         }
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "vision: unknown padding command",
+                            crate::proxy::NodeFailure(anyhow::anyhow!(
+                                "vision: unknown padding command"
+                            )),
                         )));
                     }
                 }

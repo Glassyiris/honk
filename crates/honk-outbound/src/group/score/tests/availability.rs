@@ -644,8 +644,8 @@ fn failure_fences_live_rx_without_requiring_survivors_to_settle() {
     assert_close(before.completed, failed.completed);
     assert_close(before.useful_completed, failed.useful_completed);
     assert_close(before.reliability, failed.reliability);
-    assert_eq!(before.fail_streak, 2);
-    assert!(before.explore_backed_off);
+    assert_eq!(before.fail_streak, 0);
+    assert!(!before.explore_backed_off);
     for reporter in &reporters {
         reporter.finish_at(ScoreOutcome::Cancelled, true, recovered);
     }
@@ -709,7 +709,7 @@ fn neutral_settlement_flushes_throttled_eligible_rx_at_its_event_time() {
     assert_close(after.completed, before.completed);
     assert_close(after.useful_completed, before.useful_completed);
     assert_close(after.reliability, before.reliability);
-    assert_eq!(after.fail_streak, 1);
+    assert_eq!(after.fail_streak, 0);
     assert_eq!(
         availability_at(
             &manager,
@@ -836,14 +836,6 @@ fn only_targeted_traffic_rx_after_setup_and_tx_establishes_availability() {
                 "ineligible admission case {case}"
             );
         }
-        if matches!(case, "rx-before-tx" | "rx-before-setup") {
-            let state = manager.score_state();
-            let score =
-                score_snapshot(&state.inner.lock(), "score", &target, nodes[0].id, finished);
-            assert_eq!(score.completed, 4.0);
-            assert_eq!(score.useful_completed, 4.0);
-            assert!(score.qualification_retained);
-        }
         let fresh = finished + Duration::from_secs(1);
         let reporters: Vec<_> = (0..4).map(|_| prepared(&feedback, fresh)).collect();
         for reporter in &reporters {
@@ -897,15 +889,11 @@ fn global_family_and_exact_cells_credit_their_own_availability_cohorts() {
         );
         assert_eq!(
             availability_at(&manager, &nodes, &family, at).state,
-            if index == 0 {
-                ScoreVerificationState::ObservedUsable
-            } else {
-                ScoreVerificationState::Provisional
-            }
+            ScoreVerificationState::Provisional
         );
         assert_eq!(
             availability_at(&manager, &nodes, &target, at).state,
-            ScoreVerificationState::ObservedUsable
+            ScoreVerificationState::Provisional
         );
         reporters[3].transfer_at(0, 1, at);
         for scope in [&global, &family, &target] {

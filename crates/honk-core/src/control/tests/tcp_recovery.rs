@@ -16,6 +16,104 @@ async fn tcp_score_recovers_inside_previously_selected_nested_final() -> anyhow:
     loopback_recovery(honk_config::group::GroupPolicy::Score, true).await
 }
 
+#[tokio::test]
+async fn cold_urltest_refunds_unscheduled_score_work_before_relay_closes() -> anyhow::Result<()> {
+    use crate::group::SelectionNetwork;
+    use honk_config::group::GroupPolicy;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let target = listener.local_addr()?;
+        let nodes: Vec<_> = (0..8)
+            .map(|index| {
+                let mut node = udp_test_node();
+                node.name = format!("leaf-{index}");
+                node.port += index;
+                node.id = node.derive_id();
+                node
+            })
+            .collect();
+        let mut groups: Vec<_> = nodes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .enumerate()
+            .map(|(index, nodes)| Group {
+                name: format!("child-{index}"),
+                policy: GroupPolicy::Score,
+                nodes: nodes.iter().map(|node| node.id).collect(),
+                ..Default::default()
+            })
+            .collect();
+        groups.push(Group {
+            name: "cold".into(),
+            policy: GroupPolicy::URLTest,
+            groups: groups.iter().map(|group| group.name.clone()).collect(),
+            ..Default::default()
+        });
+        let mut config = udp_test_config("cold", nodes, groups);
+        config.global.dial_mode = "ip".into();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handle = udp_test_handle(
+            config,
+            UdpTestMode::TcpHold {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+            1,
+        );
+        let manager = handle.group_manager.read().clone();
+        let counts = |group| manager.score_budget_counters(group, SelectionNetwork::Tcp);
+        let mut client = TcpStream::connect(target).await?;
+        let (accepted, client_addr) = listener.accept().await?;
+        store_active_tcp_flow(&handle, target, client_addr).await?;
+        let serving = {
+            let handle = handle.clone();
+            tokio::spawn(async move { handle.serve_connection(accepted, client_addr).await })
+        };
+        entered.notified().await;
+        let (mut upstream, _) = listener.accept().await?;
+        let truncated = counts("child-3");
+        assert_eq!((truncated.reserved, truncated.refunded), (0, 1));
+        assert_eq!(truncated.cold_available, truncated.cold_allowance);
+        for group in ["child-1", "child-2"] {
+            assert_eq!(counts(group).reserved, 1);
+            assert_eq!(counts(group).business_starts, 0);
+        }
+
+        release.notify_one();
+        client.write_all(b"q").await?;
+        assert_eq!(upstream.read_u8().await?, b'q');
+        upstream.write_all(b"r").await?;
+        assert_eq!(client.read_u8().await?, b'r');
+        assert!(
+            !serving.is_finished(),
+            "the winning relay must still be open"
+        );
+        assert_eq!(counts("child-0").business_starts, 1);
+        for group in ["child-1", "child-2", "child-3"] {
+            let refunded = counts(group);
+            assert_eq!((refunded.reserved, refunded.refunded), (0, 1), "{group}");
+            assert_eq!(
+                (refunded.business_starts, refunded.spent),
+                (0, 0),
+                "{group}"
+            );
+            assert_eq!(refunded.cold_available, refunded.cold_allowance, "{group}");
+        }
+        drop(upstream);
+        drop(client);
+        serving.await??;
+        let generation = handle.runtime_registry.read().clone();
+        generation.shutdown().await;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("cold URLTest ownership must settle before the live relay closes")?
+}
+
 async fn loopback_recovery(
     policy: honk_config::group::GroupPolicy,
     through_final: bool,
@@ -128,9 +226,23 @@ async fn loopback_recovery(
     let failed_dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let failed_dials_on_wire = Arc::clone(&failed_dials);
     tokio::spawn(async move {
-        while let Ok((stream, _)) = refused_listener.accept().await {
+        while let Ok((mut stream, _)) = refused_listener.accept().await {
             failed_dials_on_wire.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            drop(stream);
+            // Refuse CONNECT, not the proxy handshake: the node and its
+            // configured-probe evidence remain usable for other targets.
+            let mut greeting = [0; 3];
+            if stream.read_exact(&mut greeting).await.is_err()
+                || stream.write_all(&[0x05, 0x00]).await.is_err()
+            {
+                continue;
+            }
+            let mut request = [0; 10];
+            if stream.read_exact(&mut request).await.is_err() {
+                continue;
+            }
+            let _ = stream
+                .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
         }
     });
     let node_b = socks_node("b", socks_addr.port());
@@ -211,6 +323,21 @@ async fn loopback_recovery(
             gm.get_score_selection_for_network("proxy", crate::group::SelectionNetwork::Tcp),
             Some(node_a.name.clone()),
             "A must remain the ordinary winner after its failed setup"
+        );
+        let context = crate::group::ScoreSelectionContext {
+            target: Some(target.into()),
+            target_family: Some(IpVersion::V4),
+            ..crate::group::ScoreSelectionContext::aggregate(
+                crate::group::SelectionNetwork::Tcp,
+                ProbeDomain::Tcp,
+                IpVersion::V4,
+            )
+        };
+        let ordinary = gm.selection_plan_for_target("proxy", &context);
+        assert_eq!(
+            ordinary.entries.first().map(|entry| entry.node.id),
+            Some(node_a.id),
+            "replacement must exclude A even when ordinary target selection still prefers it"
         );
     }
     alternate_release.notify_one();
@@ -316,6 +443,7 @@ impl honk_outbound::proxy::TcpOutbound for HeldSetup {
 fn held_score_handle(
     refusal: Option<honk_outbound::proxy::PacketRejection>,
     constrained: bool,
+    urltest: bool,
 ) -> (
     ControlPlaneHandle,
     Vec<Node>,
@@ -353,6 +481,21 @@ fn held_score_handle(
         });
     }
     let mut config = udp_test_config("proxy", nodes.clone(), groups);
+    if urltest {
+        config.groups.push(Group {
+            name: "alternate".into(),
+            policy: GroupPolicy::Score,
+            nodes: vec![nodes[1].id],
+            ..Default::default()
+        });
+        config.groups.push(Group {
+            name: "outer".into(),
+            policy: GroupPolicy::URLTest,
+            groups: vec!["proxy".into(), "alternate".into()],
+            ..Default::default()
+        });
+        config.routing.default_outbound = "outer".into();
+    }
     config.ensure_builtin_nodes();
     config.global.dial_mode = "ip".into();
     config.global.connect_timeout_ms = 4000;
@@ -407,7 +550,7 @@ async fn start_held_flow(
 #[tokio::test(start_paused = true)]
 async fn tcp_score_alternate_shares_primary_absolute_deadline() -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
-    let (handle, nodes, release, mut attempts) = held_score_handle(None, false);
+    let (handle, nodes, release, mut attempts) = held_score_handle(None, false, false);
     let (mut client, mut serve) = start_held_flow(&handle, &nodes).await?;
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), attempts.recv())
@@ -439,7 +582,7 @@ async fn tcp_score_refusal_and_retirement_do_not_retry() -> anyhow::Result<()> {
         Some(PacketRejection::Cancelled),
         None,
     ] {
-        let (handle, nodes, release, mut attempts) = held_score_handle(refusal, false);
+        let (handle, nodes, release, mut attempts) = held_score_handle(refusal, false, false);
         let (_client, serve) = start_held_flow(&handle, &nodes).await?;
         assert_eq!(attempts.recv().await, Some(nodes[0].id));
         if refusal.is_none() {
@@ -468,7 +611,7 @@ async fn tcp_score_refusal_and_retirement_do_not_retry() -> anyhow::Result<()> {
 #[tokio::test]
 async fn tcp_score_exhaustion_cannot_escape_selector_or_synthesize_final() -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
-    let (handle, nodes, release, mut attempts) = held_score_handle(None, true);
+    let (handle, nodes, release, mut attempts) = held_score_handle(None, true, false);
     let (mut client, serve) = start_held_flow(&handle, &nodes).await?;
     assert_eq!(attempts.recv().await, Some(nodes[0].id));
     release.notify_one();
@@ -478,5 +621,93 @@ async fn tcp_score_exhaustion_cannot_escape_selector_or_synthesize_final() -> an
         attempts.try_recv().is_err(),
         "duplicate A and unchosen B are not alternates"
     );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn tcp_urltest_retry_after_deadline_preserves_original_business() -> anyhow::Result<()> {
+    use crate::group::SelectionNetwork;
+    let (handle, nodes, release, mut attempts) = held_score_handle(None, false, true);
+    for (index, node) in nodes.iter().enumerate() {
+        handle.alive_set.record_probe_latency(
+            node.id,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_millis(1 + index as u64 * 50),
+        );
+    }
+    let (_client, serve) = start_held_flow(&handle, &nodes).await?;
+    assert_eq!(attempts.recv().await, Some(nodes[0].id));
+    let manager = handle.group_manager.read().clone();
+    let before = manager.score_budget_counters("proxy", SelectionNetwork::Tcp);
+    let root_before = manager.score_state().root_business_starts();
+    // Jump past the absolute deadline without polling the earlier per-dial timer.
+    tokio::time::advance(Duration::from_secs(17)).await;
+    release.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), attempts.recv()).await?,
+        Some(nodes[1].id)
+    );
+    let after = manager.score_budget_counters("proxy", SelectionNetwork::Tcp);
+    assert_eq!(manager.score_state().root_business_starts(), root_before);
+    assert_eq!(after.business_starts, before.business_starts);
+    serve.abort();
+    let _ = serve.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn tcp_urltest_retry_after_score_reload_still_reaches_alternate() -> anyhow::Result<()> {
+    use crate::group::SelectionNetwork;
+    let (handle, nodes, release, mut attempts) = held_score_handle(None, false, true);
+    for (index, node) in nodes.iter().enumerate() {
+        handle.alive_set.record_probe_latency(
+            node.id,
+            ProbeDomain::Tcp,
+            IpVersion::V4,
+            Duration::from_millis(1 + index as u64 * 50),
+        );
+    }
+    let (_client, serve) = start_held_flow(&handle, &nodes).await?;
+    assert_eq!(attempts.recv().await, Some(nodes[0].id));
+    let manager = handle.group_manager.read().clone();
+    let replacement = {
+        let config = handle.config.read().await;
+        GroupManager::with_alive_set_and_score_state(
+            &config.groups,
+            &config.nodes,
+            Some(Arc::clone(&handle.alive_set)),
+            manager.score_state(),
+        )
+    };
+    replacement.publish_score_membership();
+    let before = replacement.score_budget_counters("proxy", SelectionNetwork::Tcp);
+    let root_before = replacement.score_state().root_business_starts();
+    release.notify_one();
+    let reached = tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(node) = attempts.recv().await {
+            if node == nodes[1].id {
+                return true;
+            }
+            assert_eq!(node, nodes[0].id);
+            release.notify_one();
+        }
+        false
+    })
+    .await?;
+    assert!(
+        reached,
+        "Score authority replacement must not cancel an ordinary retry on the admitted generation"
+    );
+    assert_eq!(
+        replacement.score_state().root_business_starts(),
+        root_before
+    );
+    assert_eq!(
+        replacement.score_budget_counters("proxy", SelectionNetwork::Tcp),
+        before
+    );
+    serve.abort();
+    let _ = serve.await;
     Ok(())
 }

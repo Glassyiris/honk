@@ -221,7 +221,7 @@ impl<T> LifecycleSlot<T> {
             match initializer().await {
                 Ok(value) => return Ok((guard.publish(value), false)),
                 Err(error) => {
-                    let error = SharedError::new(error);
+                    let error = SharedError::fanout(error);
                     guard.fail(error.clone());
                     return Err(anyhow::Error::new(error));
                 }

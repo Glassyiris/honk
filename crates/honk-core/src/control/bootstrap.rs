@@ -110,8 +110,12 @@ impl ControlPlane {
         let group_manager = group_manager.into_shared();
         {
             let group_manager = group_manager.clone();
+            let probe_interval = Duration::from_secs(config.global.check_interval_secs);
             alive_set.set_score_feedback_factory(move |node_id, context| {
-                group_manager.read().feedback_for_node(node_id, context)
+                group_manager
+                    .read()
+                    .feedback_for_node(node_id, context)
+                    .map(|feedback| feedback.with_probe_interval(probe_interval))
             });
         }
         // Per-node runtime registry (single owner of session-layer

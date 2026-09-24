@@ -38,6 +38,20 @@ fn is_reply_idle_timeout(error: &io::Error) -> bool {
         .is_some()
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct LocalReplyError(#[source] io::Error);
+
+fn local_reply_error(error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), LocalReplyError(error))
+}
+
+fn is_local_reply_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<LocalReplyError>())
+}
+
 impl PacketSendFailure {
     fn into_io_error(self) -> io::Error {
         match self {
@@ -59,17 +73,12 @@ fn classify_send_error(endpoint: &UdpEndpoint, error: io::Error) -> PacketSendFa
     }
 }
 
-fn duplicate_send_error(error: &io::Error) -> io::Error {
-    let mut source = error
-        .get_ref()
-        .map(|source| source as &(dyn std::error::Error + 'static));
-    while let Some(current) = source {
-        if let Some(rejection) = current.downcast_ref::<honk_outbound::proxy::PacketRejection>() {
-            return (*rejection).into();
-        }
-        source = current.source();
-    }
-    io::Error::new(error.kind(), error.to_string())
+fn duplicate_send_error(error: &mut io::Error) -> io::Error {
+    let kind = error.kind();
+    let original = std::mem::replace(error, io::Error::from(io::ErrorKind::Other));
+    let shared = honk_outbound::SharedError::new(original.into());
+    *error = io::Error::new(kind, shared.clone());
+    io::Error::new(kind, shared)
 }
 
 pub(super) struct TaskRegistry {
@@ -322,10 +331,15 @@ pub(super) fn score_driver_outcome(
             honk_outbound::proxy::PacketErrorClass::Rejected
         )
     {
-        return ScoreOutcome::Rejected;
+        return ScoreOutcome::from_io_error(error);
+    }
+    if let Err(error) = result
+        && is_local_reply_error(error)
+    {
+        return ScoreOutcome::Cancelled;
     }
     if endpoint.quic_path_stalled() {
-        return ScoreOutcome::Timeout;
+        return ScoreOutcome::NodeFailure;
     }
     match result {
         Ok(()) => ScoreOutcome::Success,
@@ -344,7 +358,7 @@ pub(super) fn score_driver_outcome(
                 ScoreOutcome::Timeout
             }
         }
-        Err(error) => ScoreOutcome::Io(error.kind()),
+        Err(error) => ScoreOutcome::from_io_error(error),
     }
 }
 
@@ -523,7 +537,7 @@ pub(super) async fn run_endpoint_driver(
             &failure,
             PacketSendFailure::Congestion(_) | PacketSendFailure::Rejected(_)
         );
-        let result = Err(failure.into_io_error());
+        let mut result = Err(failure.into_io_error());
         // Health reporting can synchronously retire and mark this endpoint dead.
         let outcome = score_driver_outcome(&endpoint, &result);
         #[cfg(feature = "native-api")]
@@ -535,7 +549,7 @@ pub(super) async fn run_endpoint_driver(
                 health_family,
             );
         }
-        let _ = first_ack.send(result.as_ref().map(|_| ()).map_err(duplicate_send_error));
+        let _ = first_ack.send(result.as_mut().map(|_| ()).map_err(duplicate_send_error));
         return UdpDriverResult { result, outcome };
     }
 
@@ -558,15 +572,15 @@ pub(super) async fn run_endpoint_driver(
                 );
             }
             Err(PacketSendFailure::Rejected(error)) => {
-                let result = Err(error);
+                let mut result = Err(error);
                 let outcome = score_driver_outcome(&endpoint, &result);
                 #[cfg(feature = "native-api")]
                 endpoint.finish_native_driver(&result);
-                let _ = first_ack.send(result.as_ref().map(|_| ()).map_err(duplicate_send_error));
+                let _ = first_ack.send(result.as_mut().map(|_| ()).map_err(duplicate_send_error));
                 return UdpDriverResult { result, outcome };
             }
             Err(PacketSendFailure::Transport(error)) => {
-                let result = Err(error);
+                let mut result = Err(error);
                 let outcome = score_driver_outcome(&endpoint, &result);
                 #[cfg(feature = "native-api")]
                 endpoint.finish_native_driver(&result);
@@ -577,7 +591,7 @@ pub(super) async fn run_endpoint_driver(
                         health_family,
                     );
                 }
-                let _ = first_ack.send(result.as_ref().map(|_| ()).map_err(duplicate_send_error));
+                let _ = first_ack.send(result.as_mut().map(|_| ()).map_err(duplicate_send_error));
                 return UdpDriverResult { result, outcome };
             }
         }
@@ -629,6 +643,7 @@ pub(super) async fn run_endpoint_driver(
     if let Err(error) = &result
         && !endpoint.is_source()
         && !endpoint.dead.load(Ordering::Acquire)
+        && !is_local_reply_error(error)
         && !matches!(
             honk_outbound::proxy::packet_error_class(error),
             honk_outbound::proxy::PacketErrorClass::Congestion
@@ -814,7 +829,7 @@ async fn send_one(
         endpoint.fail_source(if is_reply_idle_timeout(error) {
             ScoreOutcome::Timeout
         } else {
-            ScoreOutcome::Io(error.kind())
+            ScoreOutcome::from_io_error(error)
         });
     }
     if let Some(started) = started {
@@ -925,13 +940,13 @@ async fn receive_loop(
                 endpoint.native_drop("reply_family_mismatch", Some("reply_family_mismatch"));
                 endpoint.finish_native("failed", "reply_family_mismatch");
             }
-            return Err(io::Error::new(
+            return Err(local_reply_error(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "UDP reply source {} and client {} use different address families",
                     source, client_addr
                 ),
-            ));
+            )));
         }
         let reply_socket = if source == client_dst {
             reply_socket.as_ref()
@@ -948,10 +963,10 @@ async fn receive_loop(
                             endpoint.native_drop("reply_socket_capacity", Some("capacity"));
                             endpoint.finish_native("failed", "reply_socket_capacity");
                         }
-                        return Err(io::Error::new(
+                        return Err(local_reply_error(io::Error::new(
                             io::ErrorKind::AddrNotAvailable,
                             "UDP endpoint reply-source socket cache is full",
-                        ));
+                        )));
                     }
                     let socket = match ReplySocket::create(
                         reply_socket_factory.as_ref(),
@@ -974,7 +989,7 @@ async fn receive_loop(
                                 );
                                 endpoint.finish_native("failed", "reply_socket_failed");
                             }
-                            return Err(error);
+                            return Err(local_reply_error(error));
                         }
                     };
                     alternate_reply_sockets.push((source, socket));
@@ -989,7 +1004,7 @@ async fn receive_loop(
             endpoint.native_drop("client_delivery_failed", Some("client_send_failed"));
             endpoint.finish_native("failed", "client_delivery_failed");
         }
-        delivered?;
+        delivered.map_err(local_reply_error)?;
         endpoint.mark_reply();
         if let Some(elapsed) = endpoint.take_first_reply_metric() {
             stats.record_udp_first_reply_latency(elapsed);

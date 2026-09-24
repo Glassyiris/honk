@@ -957,6 +957,7 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
                     "performanceWinner": counters.performance_winner,
                     "incumbentHeld": counters.incumbent_held,
                     "insufficientEvidenceHeld": counters.insufficient_evidence_held,
+                    "directionalTradeoffHeld": counters.directional_tradeoff_held,
                     "incumbentIneligible": counters.incumbent_ineligible,
                     "freshFailureBypass": counters.fresh_failure_bypass,
                     "deadFiltered": counters.dead_filtered,
@@ -977,6 +978,10 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
                 "verification": {
                     "tcp": score::counters(group_manager.score_verification_counters(&group.name, SelectionNetwork::Tcp)),
                     "udp": score::counters(group_manager.score_verification_counters(&group.name, SelectionNetwork::Udp)),
+                },
+                "budget": {
+                    "tcp": score::budget(group_manager.score_budget_counters(&group.name, SelectionNetwork::Tcp)),
+                    "udp": score::budget(group_manager.score_budget_counters(&group.name, SelectionNetwork::Udp)),
                 },
             })
         })
@@ -1005,11 +1010,18 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
         "outbounds": per_outbound,
         "score": {
             "groups": score_groups,
+            "businessStarts": group_manager.score_state().root_business_starts(),
             "cache": {
                 "exactCells": score_cache.exact_cells,
                 "aggregateCells": score_cache.aggregate_cells,
                 "exactEvictions": score_cache.exact_evictions,
                 "aggregateEvictions": score_cache.aggregate_evictions,
+                "comparisonCells": score_cache.comparison_cells,
+                "comparisonLogicalBytes": score_cache.comparison_logical_bytes,
+                "comparisonLogicalCapacity": score_cache.comparison_logical_capacity,
+                "comparisonEvictions": score_cache.comparison_evictions,
+                "comparisonExpired": score_cache.comparison_expired,
+                "comparisonRejected": score_cache.comparison_rejected,
             },
         },
         "pool": {

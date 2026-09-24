@@ -133,6 +133,7 @@ impl GroupManager {
         group: &Group,
         context: &ScoreSelectionContext,
         effects: SelectionEffects,
+        allow_trials: bool,
     ) -> Candidate<'a> {
         let mut unique = Vec::with_capacity(candidates.len());
         for candidate in candidates {
@@ -144,13 +145,25 @@ impl GroupManager {
             }
         }
         let nodes: Vec<_> = unique.iter().map(|candidate| candidate.node).collect();
-        let index = if effects.applies() {
-            self.score_state
-                .rank(&self.score_authority, &group.name, context, &nodes)
+        let (index, work) = if effects.applies() {
+            self.score_state.rank(
+                &self.score_authority,
+                &group.name,
+                context,
+                &nodes,
+                allow_trials,
+            )
         } else {
-            self.score_state.peek_rank(&group.name, context, &nodes)
+            (
+                self.score_state.peek_rank(&group.name, context, &nodes),
+                None,
+            )
         };
-        unique[index].clone()
+        let mut candidate = unique[index].clone();
+        if let Some(work) = work {
+            candidate.score_work.push(work);
+        }
+        candidate
     }
 
     /// URLTest policy: lowest-latency alive candidate with tolerance-based

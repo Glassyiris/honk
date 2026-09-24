@@ -1,3 +1,91 @@
+/// A proxy's explicit failure to open the requested target, not its carrier.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct TargetFailure(#[source] pub anyhow::Error);
+
+/// A failure of the shared proxy carrier or its protocol, not one target.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct NodeFailure(#[source] pub anyhow::Error);
+
+fn next_cause<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a (dyn std::error::Error + 'static)> {
+    error
+        .downcast_ref::<std::io::Error>()
+        .and_then(|error| error.get_ref())
+        .map(|source| source as &(dyn std::error::Error + 'static))
+        .or_else(|| error.source())
+}
+
+fn find_cause<'a, T: std::error::Error + 'static>(
+    mut error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a T> {
+    loop {
+        if let Some(cause) = error.downcast_ref::<T>() {
+            return Some(cause);
+        }
+        error = next_cause(error)?;
+    }
+}
+
+/// Carrier provenance, with the episode of the innermost fanned-out failure delivering it.
+/// Recipients of one fanned-out failure must not report separate node failures, while
+/// independently constructed failures stay separate however they settle.
+pub(crate) fn node_failure_episode(
+    mut error: &(dyn std::error::Error + 'static),
+) -> Option<Option<u64>> {
+    let mut episode = None;
+    loop {
+        if error.is::<NodeFailure>() {
+            return Some(episode);
+        }
+        if let Some(fanout) = error
+            .downcast_ref::<crate::SharedError>()
+            .and_then(crate::SharedError::episode)
+        {
+            episode = Some(fanout);
+        }
+        error = next_cause(error)?;
+    }
+}
+
+/// Recover target provenance through anyhow, I/O and shared error wrappers.
+pub fn target_failure(error: &anyhow::Error) -> bool {
+    find_cause::<TargetFailure>(error.as_ref()).is_some()
+}
+
+pub(crate) fn io_target_failure(error: &std::io::Error) -> bool {
+    find_cause::<TargetFailure>(error).is_some()
+}
+
+/// Recover explicit carrier provenance without inferring it from error text.
+pub fn node_failure(error: &anyhow::Error) -> bool {
+    find_cause::<NodeFailure>(error.as_ref()).is_some()
+}
+
+pub(crate) fn io_node_failure(error: &std::io::Error) -> bool {
+    find_cause::<NodeFailure>(error).is_some()
+}
+
+// Only proxy-owned QUIC carriers may add node provenance. End-to-end QUIC
+// (for example DoQ through a packet proxy) belongs to the requested target.
+pub(crate) fn quic_carrier_error(error: anyhow::Error) -> anyhow::Error {
+    if !node_failure(&error) && find_cause::<quinn::ConnectionError>(error.as_ref()).is_some() {
+        NodeFailure(error).into()
+    } else {
+        error
+    }
+}
+
+pub(crate) fn quic_carrier_io_error(error: std::io::Error) -> std::io::Error {
+    if !io_node_failure(&error) && find_cause::<quinn::ConnectionError>(&error).is_some() {
+        std::io::Error::new(error.kind(), NodeFailure(error.into()))
+    } else {
+        error
+    }
+}
+
 /// A local packet refusal that must not be treated as transport health.
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum PacketRejection {
@@ -30,34 +118,12 @@ pub fn is_packet_rejection(error: &anyhow::Error) -> bool {
 
 /// Recover local refusal details without losing them through error wrappers.
 pub fn packet_rejection(error: &anyhow::Error) -> Option<PacketRejection> {
-    error.chain().find_map(|source| {
-        source
-            .downcast_ref::<PacketRejection>()
-            .copied()
-            .or_else(|| {
-                source
-                    .downcast_ref::<std::io::Error>()
-                    .and_then(io_packet_rejection)
-            })
-    })
+    find_cause::<PacketRejection>(error.as_ref()).copied()
 }
 
 /// Recover a typed packet rejection retained inside an I/O error chain.
 pub(crate) fn io_packet_rejection(error: &std::io::Error) -> Option<PacketRejection> {
-    let mut source = error
-        .get_ref()
-        .map(|source| source as &(dyn std::error::Error + 'static));
-    while let Some(current) = source {
-        if let Some(rejection) = current.downcast_ref::<PacketRejection>() {
-            return Some(*rejection);
-        }
-        source = current
-            .downcast_ref::<std::io::Error>()
-            .and_then(|error| error.get_ref())
-            .map(|source| source as &(dyn std::error::Error + 'static))
-            .or_else(|| current.source());
-    }
-    None
+    find_cause::<PacketRejection>(error).copied()
 }
 
 /// Coarse classification for packet-send failures shared with the control plane.
@@ -85,19 +151,14 @@ pub fn packet_error_class(error: &std::io::Error) -> PacketErrorClass {
         return PacketErrorClass::Congestion;
     }
 
-    let mut source = error
-        .get_ref()
-        .map(|source| source as &(dyn std::error::Error + 'static));
-    while let Some(current) = source {
-        if let Some(quic_error) = current.downcast_ref::<quinn::SendDatagramError>() {
-            return match quic_error {
-                quinn::SendDatagramError::ConnectionLost(_) => PacketErrorClass::ConnectionDead,
-                quinn::SendDatagramError::TooLarge => PacketErrorClass::Congestion,
-                quinn::SendDatagramError::UnsupportedByPeer
-                | quinn::SendDatagramError::Disabled => PacketErrorClass::Other,
-            };
-        }
-        source = current.source();
+    if let Some(quic_error) = find_cause::<quinn::SendDatagramError>(error) {
+        return match quic_error {
+            quinn::SendDatagramError::ConnectionLost(_) => PacketErrorClass::ConnectionDead,
+            quinn::SendDatagramError::TooLarge => PacketErrorClass::Congestion,
+            quinn::SendDatagramError::UnsupportedByPeer | quinn::SendDatagramError::Disabled => {
+                PacketErrorClass::Other
+            }
+        };
     }
 
     if matches!(

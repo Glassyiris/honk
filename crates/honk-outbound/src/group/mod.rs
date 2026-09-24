@@ -38,10 +38,12 @@ use state::{SelectorState, UrlTestSelections};
 #[cfg(feature = "native-api")]
 pub use resolver::{NativeGroupMember, NativeGroupSelection};
 pub use score::{
-    ScoreAttribution, ScoreCacheSnapshot, ScoreComparison, ScoreEvidenceBasis, ScoreEvidenceGaps,
-    ScoreFeedback, ScoreOutcome, ScorePolicyState, ScoreReasonCounters, ScoreReasonGroupSnapshot,
-    ScoreReporter, ScoreSelectionContext, ScoreSource, ScoreTarget, ScoreValidationAction,
-    ScoreVerificationCounters, ScoreVerificationSnapshot, ScoreVerificationState,
+    ScoreAttempt, ScoreAttribution, ScoreBudgetCounters, ScoreBusinessGuard, ScoreCacheSnapshot,
+    ScoreComparison, ScoreContinuation, ScoreEvidenceBasis, ScoreEvidenceGaps,
+    ScoreEvidenceQuestion, ScoreFeedback, ScoreLocalComparison, ScoreOutcome, ScorePolicyState,
+    ScoreReasonCounters, ScoreReasonGroupSnapshot, ScoreReporter, ScoreSelectionContext,
+    ScoreSource, ScoreTarget, ScoreTrialSource, ScoreValidationAction, ScoreVerificationBlockers,
+    ScoreVerificationCounters, ScoreVerificationSnapshot, ScoreVerificationState, ScoreWaitReason,
 };
 pub use state::{
     InterruptCallback, PersistCallback, SelectorChangeCallback, SelectorChoices, SelectorError,
@@ -103,7 +105,7 @@ pub struct SelectionPlan<'a> {
 #[derive(Clone)]
 pub struct ScoreSelectionEntry<'a> {
     pub node: &'a Node,
-    pub feedback: Option<ScoreFeedback>,
+    pub feedback: Option<ScoreAttempt>,
     pub selection_chain: Vec<String>,
     /// Owners of group-valued final edges traversed by this entry, valid only
     /// with the manager that produced the plan. Display chains are not authority.
@@ -192,6 +194,7 @@ struct Candidate<'a> {
     attribution: Vec<&'a str>,
     selection_chain: Vec<&'a str>,
     final_owners: Vec<&'a str>,
+    score_work: Vec<Arc<score::budget::Work>>,
 }
 
 impl<'a> Candidate<'a> {
@@ -475,8 +478,10 @@ impl GroupManager {
             &mut Vec::new(),
             0,
             effects,
-            true,
-            None,
+            score::selection::ScoreSelectionRules {
+                cold_urltest: true,
+                ..Default::default()
+            },
         );
         SelectionPlan {
             mode,

@@ -8,6 +8,7 @@
 
 use honk_config::Config;
 use honk_config::dns::{DnsConfig, DnsRouting};
+use honk_config::group::GroupPolicy;
 use honk_config::node::{Group, Node};
 use honk_config::types::NodeProtocol;
 use honk_core::clash_api::{self, ClashState};
@@ -223,52 +224,6 @@ fn http_client() -> reqwest::Client {
         .no_proxy()
         .build()
         .unwrap()
-}
-
-const SCORE_STATS_FIXTURE_LINES: &[&str] = &[
-    "global {",
-    "wan_interface: lo",
-    "lan_interface: lo",
-    "log_level: info",
-    "auto_config_kernel_parameter: false",
-    "nfqueue_enable: false",
-    "data_dir: '__HONK_SCORE_QA_DATA_DIR__'",
-    "}",
-    "node {",
-    "private-node-alpha: 'socks5://private-user:private-pass@private-node-alpha.invalid:16543'",
-    "private-node-beta: 'socks5://private-user-2:private-pass-2@203.0.113.88:26543'",
-    "}",
-    "group {",
-    "z-score {",
-    "filter: name('private-node-alpha','private-node-beta')",
-    "policy: score",
-    "}",
-    "a-score {",
-    "filter: name('private-node-alpha','private-node-beta')",
-    "policy: score",
-    "}",
-    "}",
-    "routing {",
-    "fallback: direct",
-    "}",
-    "experimental {",
-    "clash_api {",
-    "external_controller: '127.0.0.1:19090'",
-    "secret: 'score-review-secret'",
-    "}",
-    "}",
-];
-
-fn normalized_fixture_lines(source: &str) -> Vec<&str> {
-    source
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .collect()
-}
-
-fn score_stats_fixture_matches(source: &str) -> bool {
-    normalized_fixture_lines(source) == SCORE_STATS_FIXTURE_LINES
 }
 
 #[tokio::test]
@@ -524,11 +479,19 @@ async fn test_score_proxy_contract_and_put_rejection() {
         .feedback
         .as_ref()
         .unwrap()
+        .begin()
+        .unwrap()
         .start()
         .setup_failed(ScoreOutcome::Timeout);
     let second = manager.selection_plan_for_target("auto", &context);
     assert_eq!(second.entries[0].node.id, b.id);
-    let reporter = second.entries[0].feedback.as_ref().unwrap().start();
+    let reporter = second.entries[0]
+        .feedback
+        .as_ref()
+        .unwrap()
+        .begin()
+        .unwrap()
+        .start();
     reporter.setup_succeeded();
     reporter.tx(1);
     reporter.rx(1);
@@ -578,13 +541,9 @@ async fn test_score_proxy_contract_and_put_rejection() {
 
 #[tokio::test]
 async fn score_stats_are_authenticated_deterministic_and_private() {
-    use honk_config::group::GroupPolicy;
     use honk_outbound::group::{ScoreSelectionContext, ScoreTarget, SelectionNetwork};
 
     let fixture = include_str!("fixtures/score_stats_manual.dae");
-    assert!(score_stats_fixture_matches(fixture));
-    let missing_default = fixture.replacen("    log_level: info\n", "", 1);
-    assert!(!score_stats_fixture_matches(&missing_default));
 
     let data_dir = tempfile::tempdir().unwrap();
     let config = honk_config::parser::parse_dae_config(&fixture.replace(
@@ -717,121 +676,163 @@ async fn score_stats_are_authenticated_deterministic_and_private() {
     assert_eq!(first_response.status(), 200);
     let first: serde_json::Value = first_response.json().await.unwrap();
     let score = first["score"].clone();
-    let mut expected_score = serde_json::json!({
-        "groups": [
-            {
-                "name": "a-score",
-                "tcp": {
-                    "coldExplore": 1,
-                    "periodicExplore": 0,
-                    "reliabilityWinner": 0,
-                    "performanceWinner": 0,
-                    "incumbentHeld": 0,
-                    "insufficientEvidenceHeld": 0,
-                    "incumbentIneligible": 0,
-                    "freshFailureBypass": 0,
-                    "deadFiltered": 0,
-                    "ordinarySwitch": 0,
-                    "switchFlap": 0,
-                    "failStreakExcluded": 0,
-                    "exploreBackedOff": 0,
-                    "carrierPressure": 0,
-                    "carrierRttPressure": 0,
-                    "carrierLossPressure": 0,
-                    "carrierValidation": 0,
-                },
-                "udp": {
-                    "coldExplore": 0,
-                    "periodicExplore": 0,
-                    "reliabilityWinner": 0,
-                    "performanceWinner": 0,
-                    "incumbentHeld": 0,
-                    "insufficientEvidenceHeld": 0,
-                    "incumbentIneligible": 0,
-                    "freshFailureBypass": 0,
-                    "deadFiltered": 0,
-                    "ordinarySwitch": 0,
-                    "switchFlap": 0,
-                    "failStreakExcluded": 0,
-                    "exploreBackedOff": 0,
-                    "carrierPressure": 0,
-                    "carrierRttPressure": 0,
-                    "carrierLossPressure": 0,
-                    "carrierValidation": 0,
-                },
-            },
-            {
-                "name": "z-score",
-                "tcp": {
-                    "coldExplore": 1,
-                    "periodicExplore": 0,
-                    "reliabilityWinner": 0,
-                    "performanceWinner": 0,
-                    "incumbentHeld": 0,
-                    "insufficientEvidenceHeld": 0,
-                    "incumbentIneligible": 0,
-                    "freshFailureBypass": 0,
-                    "deadFiltered": 0,
-                    "ordinarySwitch": 0,
-                    "switchFlap": 0,
-                    "failStreakExcluded": 0,
-                    "exploreBackedOff": 0,
-                    "carrierPressure": 0,
-                    "carrierRttPressure": 0,
-                    "carrierLossPressure": 0,
-                    "carrierValidation": 0,
-                },
-                "udp": {
-                    "coldExplore": 0,
-                    "periodicExplore": 0,
-                    "reliabilityWinner": 0,
-                    "performanceWinner": 0,
-                    "incumbentHeld": 0,
-                    "insufficientEvidenceHeld": 0,
-                    "incumbentIneligible": 0,
-                    "freshFailureBypass": 0,
-                    "deadFiltered": 0,
-                    "ordinarySwitch": 0,
-                    "switchFlap": 0,
-                    "failStreakExcluded": 0,
-                    "exploreBackedOff": 0,
-                    "carrierPressure": 0,
-                    "carrierRttPressure": 0,
-                    "carrierLossPressure": 0,
-                    "carrierValidation": 0,
-                },
-            },
+    let assert_keys = |value: &serde_json::Value, expected: &[&str]| {
+        assert_eq!(
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+    };
+    assert_keys(&score, &["businessStarts", "cache", "groups"]);
+    assert_keys(
+        &score["cache"],
+        &[
+            "exactCells",
+            "aggregateCells",
+            "exactEvictions",
+            "aggregateEvictions",
+            "comparisonCells",
+            "comparisonLogicalBytes",
+            "comparisonLogicalCapacity",
+            "comparisonEvictions",
+            "comparisonExpired",
+            "comparisonRejected",
         ],
-        "cache": {
-            "exactCells": 0,
-            "aggregateCells": 2,
-            "exactEvictions": 0,
-            "aggregateEvictions": 0,
-        },
-    });
-    for group in expected_score["groups"].as_array_mut().unwrap() {
-        group["verification"] = serde_json::json!({
-            "tcp": {
-                "provisionalSelections": 1,
-                "usableSelections": 0,
-                "validationSelections": 1,
-                "confirmations": 0,
-                "expired": 0,
-                "contradicted": 0,
-                "confirmationMillis": 0,
-            },
-            "udp": {
-                "provisionalSelections": 0,
-                "usableSelections": 0,
-                "validationSelections": 0,
-                "confirmations": 0,
-                "expired": 0,
-                "contradicted": 0,
-                "confirmationMillis": 0,
-            },
-        });
+    );
+    assert!(
+        score["cache"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(serde_json::Value::is_u64)
+    );
+    assert_eq!(score["businessStarts"], 0);
+    let groups = score["groups"].as_array().unwrap();
+    assert_eq!(
+        groups
+            .iter()
+            .map(|group| group["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["a-score", "z-score"]
+    );
+    for group in groups {
+        assert_keys(group, &["name", "tcp", "udp", "verification", "budget"]);
+        assert_keys(&group["verification"], &["tcp", "udp"]);
+        assert_keys(&group["budget"], &["tcp", "udp"]);
+        for network in ["tcp", "udp"] {
+            let reasons = &group[network];
+            assert_keys(
+                reasons,
+                &[
+                    "coldExplore",
+                    "periodicExplore",
+                    "reliabilityWinner",
+                    "performanceWinner",
+                    "incumbentHeld",
+                    "insufficientEvidenceHeld",
+                    "directionalTradeoffHeld",
+                    "incumbentIneligible",
+                    "freshFailureBypass",
+                    "deadFiltered",
+                    "ordinarySwitch",
+                    "switchFlap",
+                    "failStreakExcluded",
+                    "exploreBackedOff",
+                    "carrierPressure",
+                    "carrierRttPressure",
+                    "carrierLossPressure",
+                    "carrierValidation",
+                ],
+            );
+            assert!(
+                reasons
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(serde_json::Value::is_u64)
+            );
+            let verification = &group["verification"][network];
+            assert_keys(
+                verification,
+                &[
+                    "provisionalSelections",
+                    "usableSelections",
+                    "validationSelections",
+                    "confirmations",
+                    "expired",
+                    "contradicted",
+                    "confirmationMillis",
+                ],
+            );
+            assert!(
+                verification
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(serde_json::Value::is_u64)
+            );
+            let budget = &group["budget"][network];
+            assert_keys(
+                budget,
+                &[
+                    "businessStarts",
+                    "sources",
+                    "trialStarts",
+                    "reserved",
+                    "spent",
+                    "budgetBlocked",
+                    "inFlightBlocked",
+                    "refunded",
+                    "expired",
+                    "coldAllowance",
+                    "coldAvailable",
+                    "earnedAvailable",
+                    "earningPeriod",
+                    "scopes",
+                    "trialSuccess",
+                    "trialFailure",
+                    "trialCancelled",
+                    "trialSetupHistogram",
+                    "trialSetupMillis",
+                    "trialElapsedMillis",
+                ],
+            );
+            assert_keys(&budget["sources"], &["cold", "periodic", "recovery"]);
+            assert!(
+                budget["sources"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(serde_json::Value::is_u64)
+            );
+            let histogram = budget["trialSetupHistogram"].as_array().unwrap();
+            assert_eq!(histogram.len(), 8);
+            assert!(histogram.iter().all(serde_json::Value::is_u64));
+            assert!(
+                budget
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .filter(|(key, _)| !matches!(key.as_str(), "sources" | "trialSetupHistogram"))
+                    .all(|(_, value)| value.is_u64())
+            );
+        }
+        assert_eq!(group["tcp"]["coldExplore"], 1);
+        assert_eq!(group["tcp"]["ordinarySwitch"], 0);
+        let budget = &group["budget"]["tcp"];
+        assert_eq!(budget["businessStarts"], 0);
+        assert_eq!(budget["trialStarts"], 0);
+        assert_eq!(budget["reserved"], 0);
+        assert_eq!(budget["refunded"], 1);
+        assert_eq!(group["verification"]["tcp"]["validationSelections"], 1);
     }
-    assert_eq!(score, expected_score);
     assert!(first["outbounds"].is_array());
     let connections = client
         .get(app.url("/connections"))

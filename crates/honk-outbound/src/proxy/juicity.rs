@@ -224,13 +224,18 @@ impl JuicityHandler {
         network: u8,
         addr: &JuiceAddr,
     ) -> anyhow::Result<(quinn::SendStream, quinn::RecvStream)> {
-        let (mut send, recv) = conn.open_bi().await.context("Juicity: open stream")?;
+        let (mut send, recv) = conn
+            .open_bi()
+            .await
+            .map_err(|error| super::NodeFailure(error.into()))
+            .context("Juicity: open stream")?;
         let mut header = Vec::with_capacity(1 + addr.encoded_len());
         header.push(network);
         addr.encode(&mut header);
         send.write_all(&header)
             .await
-            .context("Juicity: send request header")?;
+            .context("Juicity: send request header")
+            .map_err(super::quic_carrier_error)?;
         #[cfg(feature = "native-api")]
         if let Some(observer) = crate::runtime::flow_observation::current() {
             observer.milestone_once("target_request_sent");
@@ -529,10 +534,13 @@ impl PacketTransport for JuicityUdpTransport {
             .write_chunk(Bytes::from(frame))
             .await
             .map_err(io::Error::other)
+            .map_err(super::quic_carrier_io_error)
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let (_addr, payload_len) = read_udp_frame(&mut *self.recv.lock().await, buf).await?;
+        let (_addr, payload_len) = read_udp_frame(&mut *self.recv.lock().await, buf)
+            .await
+            .map_err(super::quic_carrier_io_error)?;
         Ok((payload_len, self.target))
     }
 }

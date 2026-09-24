@@ -631,7 +631,7 @@ async fn end_error_and_physical_eof_fail_children() {
         .unwrap();
     wire.write_all(&response_frame(
         second_id,
-        STATUS_KEEP,
+        STATUS_END,
         OPTION_ERROR,
         None,
         None,
@@ -644,10 +644,83 @@ async fn end_error_and_physical_eof_fail_children() {
         first.write_all(b"late").await.unwrap_err().kind(),
         io::ErrorKind::BrokenPipe
     );
+    let refused = second.read_u8().await.unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::ConnectionReset);
     assert_eq!(
-        second.read_u8().await.unwrap_err().kind(),
-        io::ErrorKind::ConnectionReset
+        crate::group::ScoreOutcome::from_io_error(&refused),
+        crate::group::ScoreOutcome::TargetFailure
     );
+
+    let udp = open_xudp(
+        Arc::clone(&session),
+        session.try_reserve().unwrap(),
+        udp_target(),
+        None,
+        [1; 8],
+    )
+    .await
+    .unwrap_or_else(|_| panic!("TCP refusal must leave the carrier usable"));
+    udp.send_packet_confirmed(b"query").await.unwrap();
+    let udp_id = read_wire_frame(&mut wire).await.id;
+    let other_target = "5.6.7.8:53".parse().unwrap();
+    udp.send_to(other_target, None, b"other query", None)
+        .await
+        .unwrap();
+    assert_eq!(read_wire_frame(&mut wire).await.id, udp_id);
+    let sibling_udp = open_xudp(
+        Arc::clone(&session),
+        session.try_reserve().unwrap(),
+        udp_target(),
+        None,
+        [2; 8],
+    )
+    .await
+    .unwrap_or_else(|_| panic!("another UDP source must open"));
+    sibling_udp
+        .send_packet_confirmed(b"sibling query")
+        .await
+        .unwrap();
+    let sibling_udp_id = read_wire_frame(&mut wire).await.id;
+    assert_ne!(sibling_udp_id, udp_id);
+    wire.write_all(&response_frame(
+        udp_id,
+        STATUS_END,
+        OPTION_ERROR,
+        None,
+        None,
+    ))
+    .await
+    .unwrap();
+    let udp_error = udp.recv_packet(&mut [0; 1]).await.unwrap_err();
+    let source_failure = crate::group::ScoreOutcome::from_io_error(&udp_error);
+    assert!(matches!(
+        source_failure,
+        crate::group::ScoreOutcome::SharedNodeFailure(_)
+    ));
+    for target in [udp_target(), other_target] {
+        let error = udp.send_to(target, None, b"late", None).await.unwrap_err();
+        assert_eq!(
+            crate::group::ScoreOutcome::from_io_error(&error),
+            source_failure,
+            "late sends repeat the source's one END|ERROR event"
+        );
+    }
+    wire.write_all(&response_frame(
+        sibling_udp_id,
+        STATUS_KEEP,
+        OPTION_DATA,
+        Some(udp_target()),
+        Some(b"answer"),
+    ))
+    .await
+    .unwrap();
+    let mut answer = [0; 6];
+    assert_eq!(
+        sibling_udp.recv_packet(&mut answer).await.unwrap(),
+        (6, udp_target())
+    );
+    assert_eq!(&answer, b"answer");
+    assert!(!session.is_closed());
 
     let mut third = open_tcp(
         Arc::clone(&session),
@@ -668,8 +741,17 @@ async fn end_error_and_physical_eof_fail_children() {
     let _ = read_wire_frame(&mut wire).await;
     let _ = read_wire_frame(&mut wire).await;
     drop(wire);
-    assert!(third.read_u8().await.is_err());
-    assert!(fourth.read_u8().await.is_err());
+    let physical = crate::group::ScoreOutcome::from_io_error(&third.read_u8().await.unwrap_err());
+    assert!(matches!(
+        physical,
+        crate::group::ScoreOutcome::SharedNodeFailure(_)
+    ));
+    assert_ne!(physical, source_failure);
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&fourth.read_u8().await.unwrap_err()),
+        physical,
+        "one carrier failure is one episode"
+    );
     assert!(session.is_closed());
 }
 

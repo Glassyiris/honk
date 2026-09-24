@@ -11,9 +11,14 @@ use quinn::{Connection, RecvStream, SendStream, VarInt};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::debug;
 
+use crate::proxy::{quic_carrier_error, quic_carrier_io_error};
+
 use super::{QuicClient, now_secs};
 
-/// A QUIC bidirectional stream as a single `AsyncRead + AsyncWrite` object.
+/// A proxy-carrier QUIC stream as a single `AsyncRead + AsyncWrite` object.
+///
+/// Connection loss carries [`crate::proxy::NodeFailure`]; stream resets do not.
+/// End-to-end QUIC users should use Quinn's streams directly.
 ///
 /// Dropping the send half finishes the stream (sends FIN), which is what the
 /// relay's half-close semantics rely on. The [`StreamDropGuard`] lets the
@@ -76,7 +81,7 @@ impl QuicBiStream {
         result.map(|result| {
             result
                 .map(|written| written.bytes)
-                .map_err(io::Error::other)
+                .map_err(|error| quic_carrier_io_error(io::Error::other(error)))
         })
     }
 
@@ -96,7 +101,7 @@ impl AsyncRead for QuicBiStream {
     ) -> Poll<io::Result<()>> {
         // Fully-qualified calls: quinn's inherent `poll_read`/`poll_write`
         // methods (different error types) would shadow the trait methods.
-        AsyncRead::poll_read(Pin::new(&mut self.recv), cx, buf)
+        AsyncRead::poll_read(Pin::new(&mut self.recv), cx, buf).map_err(quic_carrier_io_error)
     }
 }
 
@@ -106,15 +111,15 @@ impl AsyncWrite for QuicBiStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        AsyncWrite::poll_write(Pin::new(&mut self.send), cx, buf)
+        AsyncWrite::poll_write(Pin::new(&mut self.send), cx, buf).map_err(quic_carrier_io_error)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        AsyncWrite::poll_flush(Pin::new(&mut self.send), cx)
+        AsyncWrite::poll_flush(Pin::new(&mut self.send), cx).map_err(quic_carrier_io_error)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        AsyncWrite::poll_shutdown(Pin::new(&mut self.send), cx)
+        AsyncWrite::poll_shutdown(Pin::new(&mut self.send), cx).map_err(quic_carrier_io_error)
     }
 }
 
@@ -174,7 +179,7 @@ pub(crate) async fn exporter_auth(
             .context("QUIC exporter auth: finish authenticate stream")?;
     }
     tokio::select! {
-        e = conn.closed() => Err(anyhow!("QUIC exporter auth: connection closed during authentication: {e}")),
+        e = conn.closed() => Err(anyhow::Error::new(e).context("QUIC exporter auth: connection closed during authentication")),
         _ = tokio::time::sleep(grace) => Ok(stream),
     }
 }
@@ -246,7 +251,7 @@ where
         state.touch();
         #[cfg(feature = "native-api")]
         let observation = crate::session::ObservedSessionOpen::start();
-        match make(conn.clone()).await {
+        match make(conn.clone()).await.map_err(quic_carrier_error) {
             Ok((send, recv)) => {
                 #[cfg(feature = "native-api")]
                 observation.finish("session_open_succeeded", None);

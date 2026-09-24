@@ -202,3 +202,23 @@ async fn test_udp_transport_echo() {
         .unwrap();
     assert_eq!(&buf[..n], b"second");
 }
+
+#[tokio::test]
+async fn udp_carrier_close_is_node_failure() {
+    let server_addr = start_server(TEST_PASSWORD).await;
+    let node = test_node(server_addr.port(), TEST_PASSWORD);
+    let handler = JuicityHandler::new();
+    let client = handler.build_client(&node, None).await.unwrap();
+    let timeout = Duration::from_secs(5);
+    let transport = handler
+        .udp_transport_via_client(
+            Arc::clone(&client),
+            "192.0.2.53:53".parse().unwrap(),
+            None,
+            timeout,
+        )
+        .await
+        .unwrap();
+    let (conn, _) = client.connection(timeout).await.unwrap();
+    crate::proxy::tests::assert_udp_carrier_close_is_node_failure(conn, &*transport, timeout).await;
+}

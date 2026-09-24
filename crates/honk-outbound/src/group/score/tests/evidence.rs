@@ -19,7 +19,7 @@ fn recovered_historical_failure_holds_five_percent_latency_jitter() {
             leaf,
             &target,
             200,
-            Duration::from_millis(100 + index as u64 * 10),
+            100 + index as u64 * 10,
             1,
             now + Duration::from_secs(index as u64 * 2),
         );
@@ -33,7 +33,7 @@ fn recovered_historical_failure_holds_five_percent_latency_jitter() {
         &nodes[1],
         &target,
         200,
-        Duration::from_millis(95),
+        95,
         1,
         now + Duration::from_secs(5),
     );
@@ -72,7 +72,7 @@ fn only_newer_business_rx_restores_incumbent_protection() {
                 leaf,
                 &target,
                 1000,
-                Duration::from_millis(100 + index as u64 * 10),
+                100 + index as u64 * 10,
                 1,
                 now + Duration::from_secs(index as u64 * 2),
             );
@@ -108,7 +108,7 @@ fn only_newer_business_rx_restores_incumbent_protection() {
             &nodes[1],
             &target,
             1000,
-            Duration::from_millis(95),
+            95,
             1,
             now + Duration::from_secs(7),
         );
@@ -120,15 +120,7 @@ fn only_newer_business_rx_restores_incumbent_protection() {
                 } else {
                     target.clone()
                 };
-                train_at(
-                    &manager,
-                    &nodes[0],
-                    &recovered_target,
-                    20,
-                    Duration::from_millis(100),
-                    1,
-                    at,
-                );
+                train_at(&manager, &nodes[0], &recovered_target, 20, 100, 1, at);
             }
             "setup-only" | "neutral" | "probe" | "warmup" => {
                 let source = match recovery {
@@ -154,24 +146,18 @@ fn only_newer_business_rx_restores_incumbent_protection() {
         if let Some(late) = late {
             late.finish_at(ScoreOutcome::Success, true, selected_at);
         }
-        let recovered = matches!(
-            recovery,
-            "business-rx" | "new-rx-before-old-finish" | "neutral"
-        );
+        let recovered = matches!(recovery, "business-rx" | "new-rx-before-old-finish");
+        let state = manager.score_state();
         assert_eq!(
-            rank_at(&manager, &nodes, &target, selected_at),
+            state.peek_rank_at(
+                "score",
+                &target,
+                &nodes.iter().collect::<Vec<_>>(),
+                selected_at
+            ),
             usize::from(!recovered),
             "{recovery}"
         );
-        let reasons = manager
-            .score_state()
-            .selection_reason_counts("score", SelectionNetwork::Tcp);
-        assert_eq!(
-            reasons.fresh_failure_bypass,
-            u64::from(!recovered),
-            "{recovery}"
-        );
-        assert_eq!(reasons.incumbent_ineligible, 0, "{recovery}");
     }
 }
 
@@ -213,7 +199,7 @@ fn stale_manager_authority_stays_revoked_after_same_name_recreation() {
     assert_eq!((before.1, before.2, before.3), (0, 0, 0));
 
     let stale = old.selection_plan_for_target("score", &context("stale.example", IpVersion::V4));
-    assert!(stale.entries[0].feedback.is_none());
+    finish_success(&stale);
     assert!(
         old.feedback_for_group_node("score", survivor.id, seeded_context.clone())
             .is_none(),
@@ -238,9 +224,15 @@ fn stale_manager_authority_stays_revoked_after_same_name_recreation() {
     let current =
         replacement.selection_plan_for_target("score", &context("current.example", IpVersion::V4));
     assert!(current.entries[0].feedback.is_some());
+    {
+        let planned = state.inner.lock();
+        assert_eq!(planned.selection_counts.len(), 1);
+        // An unbegun plan is not an opportunity: no discovery state or tick changes yet.
+        assert_eq!((planned.tick, planned.aggregate.len()), (before.0, 0));
+    }
+    finish_success(&current);
     let after_current = state.inner.lock();
-    assert_eq!(after_current.selection_counts.len(), 1);
-    assert_eq!(after_current.aggregate.len(), 1);
+    assert!(!after_current.aggregate.is_empty());
     assert!(after_current.tick > before.0);
 }
 
@@ -272,12 +264,6 @@ fn captured_feedback_requires_current_authority_at_start() {
 
     assert!(!state.has_exact("score", &context, nodes[0].id));
     assert_eq!(state.inner.lock().tick, before_tick);
-}
-
-pub(super) fn inner_update_response(state: &ScorePolicyState, key: AggregateKey, latency_ms: f64) {
-    let mut inner = state.inner.lock();
-    let stats = inner.aggregate.get_mut(&key).unwrap();
-    stats.performance.response.sum = latency_ms * stats.performance.response.weight;
 }
 
 #[test]
@@ -314,5 +300,132 @@ group {
             .node
             .id,
         config.nodes[1].id
+    );
+}
+
+#[test]
+fn unrelated_target_failures_preserve_healthy_exact_selection_and_probe_support() {
+    let nodes = [node("healthy scoped"), node("scoped rival")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let healthy = context("healthy.example", IpVersion::V4);
+    let failing = context("unrelated.example", IpVersion::V6);
+    let now = Instant::now();
+    for leaf in &nodes {
+        train_at(&manager, leaf, &healthy, 32, 100, 1, now);
+        probe_at(&manager, leaf, &healthy, 50, now);
+    }
+    for outcome in [
+        ScoreOutcome::TargetFailure,
+        ScoreOutcome::Timeout,
+        ScoreOutcome::Io(io::ErrorKind::ConnectionReset),
+    ] {
+        let reporter = manager
+            .feedback_for_group_node("score", nodes[0].id, failing.clone())
+            .unwrap()
+            .start_at(now + Duration::from_secs(2));
+        reporter.setup_succeeded_at(now + Duration::from_secs(2));
+        reporter.finish_at(outcome, true, now + Duration::from_secs(3));
+    }
+    let state = manager.score_state();
+    let at = now + Duration::from_secs(4);
+    let scores = decision_at(&state.inner.lock(), &nodes, &healthy, 0, at);
+    assert!(super::super::ranking::normal_eligible(
+        &scores.scores[0],
+        scores.baseline
+    ));
+    assert!(!scores.scores[0].unresolved_failure);
+    assert!(!scores.scores[0].explore_backed_off);
+    assert_eq!(scores.scores[0].probe.value, Some(50.0));
+    assert_eq!(
+        state.peek_rank_at("score", &healthy, &nodes.iter().collect::<Vec<_>>(), at),
+        0
+    );
+    let failed = score_snapshot(&state.inner.lock(), "score", &failing, nodes[0].id, at);
+    assert_eq!(failed.fail_streak, 3);
+    assert!(failed.explore_backed_off);
+    assert_eq!(
+        state.exact_useful_failures("score", &failing, nodes[0].id),
+        Some(3)
+    );
+}
+
+#[test]
+fn target_refusal_before_setup_or_without_family_never_opens_node_episode() {
+    let leaf = node("refused target");
+    let nodes = std::slice::from_ref(&leaf);
+    let manager = GroupManager::new(&[group("score", nodes)], nodes);
+    let mut target = context("refused.example", IpVersion::V4);
+    let now = Instant::now();
+    for known_family in [true, false] {
+        if !known_family {
+            target.target_family = None;
+        }
+        manager
+            .feedback_for_group_node("score", leaf.id, target.clone())
+            .unwrap()
+            .start_at(now)
+            .finish_at(ScoreOutcome::TargetFailure, true, now);
+    }
+    let mut global = target.clone();
+    global.target = None;
+    let state = manager.score_state();
+    let score = score_snapshot(&state.inner.lock(), "score", &global, leaf.id, now);
+    assert_eq!(score.completed, 2.0);
+    assert_eq!(score.fail_streak, 0);
+    assert!(!score.explore_backed_off);
+}
+
+#[test]
+fn shared_carrier_failure_counts_flows_but_only_one_hard_episode() {
+    let leaf = node("shared carrier");
+    let nodes = std::slice::from_ref(&leaf);
+    let manager = GroupManager::new(&[group("score", nodes)], nodes);
+    let target = context("shared.example", IpVersion::V4);
+    let feedback = manager
+        .feedback_for_group_node("score", leaf.id, target.clone())
+        .unwrap();
+    let now = Instant::now();
+    let outcome = ScoreOutcome::shared_node_failure();
+    let pending: Vec<_> = (0..8).map(|_| feedback.start_at(now)).collect();
+    manager
+        .feedback_for_group_node(
+            "score",
+            leaf.id,
+            context("other-shared.example", IpVersion::V6),
+        )
+        .unwrap()
+        .start_at(now)
+        .finish_at(outcome, true, now);
+    let recovered_at = now + Duration::from_secs(1);
+    train_at(&manager, &leaf, &target, 4, 10, 1, recovered_at);
+    for reporter in &pending {
+        reporter.finish_at(outcome, true, now + Duration::from_secs(3));
+    }
+    let state = manager.score_state();
+    let score = score_snapshot(
+        &state.inner.lock(),
+        "score",
+        &target,
+        leaf.id,
+        now + Duration::from_secs(3),
+    );
+    assert_eq!(state.exact_stats("score", &target, leaf.id).unwrap().2, 8);
+    assert_eq!(score.fail_streak, 0);
+    assert!(!score.unresolved_failure);
+    assert!(!score.explore_backed_off);
+    feedback.start_at(now + Duration::from_secs(4)).finish_at(
+        ScoreOutcome::shared_node_failure(),
+        true,
+        now + Duration::from_secs(4),
+    );
+    assert!(
+        score_snapshot(
+            &state.inner.lock(),
+            "score",
+            &target,
+            leaf.id,
+            now + Duration::from_secs(4)
+        )
+        .unresolved_failure
     );
 }

@@ -193,7 +193,7 @@ impl GroupManager {
                     &mut Vec::new(),
                     depth,
                     SelectionEffects::Peek,
-                    None,
+                    score::selection::ScoreSelectionRules::default(),
                 )?;
                 return Some(NativeGroupSelection {
                     member: candidate.member().into(),
@@ -250,7 +250,7 @@ impl GroupManager {
             visited,
             depth,
             effects,
-            None,
+            score::selection::ScoreSelectionRules::default(),
         )
         .map(|candidate| candidate.node)
     }
@@ -279,7 +279,7 @@ impl GroupManager {
             visited,
             depth,
             effects,
-            None,
+            score::selection::ScoreSelectionRules::default(),
         )
     }
 

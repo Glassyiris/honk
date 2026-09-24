@@ -175,10 +175,20 @@ impl Socks5Handler {
                     REP_ADDRESS_TYPE_NOT_SUPPORTED => "address type not supported",
                     _ => "unknown error",
                 };
-                anyhow::bail!(
+                let error = anyhow::anyhow!(
                     "SOCKS5: server replied error: {} (0x{:02x})",
                     msg,
                     reply_code
+                );
+                return Err(
+                    if (REP_CONNECTION_NOT_ALLOWED..=REP_TTL_EXPIRED).contains(&reply_code)
+                        && reply_header[2] == 0
+                        && matches!(reply_header[3], ATYP_IPV4 | ATYP_DOMAIN | ATYP_IPV6)
+                    {
+                        super::TargetFailure(error).into()
+                    } else {
+                        error
+                    },
                 );
             }
 

@@ -440,15 +440,9 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
         context.target,
         Some(ScoreTarget::domain("quic.example.test", 9443))
     );
-    assert_eq!(
-        manager
-            .read()
-            .selection_plan_for_target("score", &context)
-            .entries[0]
-            .node
-            .id,
-        node.id
-    );
+    let budget_before = manager
+        .read()
+        .score_budget_counters("score", SelectionNetwork::Udp);
     let prober = probers::ProxyUdpProber::new(
         cp.config_handle(),
         Arc::new(registry),
@@ -476,18 +470,16 @@ async fn quic_failure_trains_score_without_failing_dns_udp_health() {
         "DNS health result: {result:?}"
     );
     assert!(
-        result.data_path.is_some(),
-        "Score QUIC probe must run: {result:?}"
+        matches!(result.data_path, Some(Err(_))),
+        "Score QUIC handshake must fail independently of DNS health: {result:?}"
     );
     assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 2);
     assert_eq!(
         manager
             .read()
-            .selection_plan_for_target("score", &context)
-            .entries[0]
-            .node
-            .id,
-        other.id
+            .score_budget_counters("score", SelectionNetwork::Udp),
+        budget_before,
+        "configured probes must not become business outcomes or fund trials",
     );
     assert!(!accepted);
     assert_eq!(cp.config_handle().read().await.as_ref(), &config);
@@ -4875,6 +4867,14 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
             let server_direct = UdpSocket::from_std(server_direct)?;
             let server_proxy = UdpSocket::from_std(server_proxy)?;
             let exercise = async {
+                #[cfg(feature = "native-api")]
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .build()?
+                    .get(format!("http://{api_address}/api/v1/flows"))
+                    .send()
+                    .await?
+                    .error_for_status()?;
                 let direct_dst = SocketAddr::from(([198, 51, 100, 2], 41001));
                 client.send_to(b"direct-first", direct_dst).await?;
                 let mut buffer = [0u8; 128];

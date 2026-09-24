@@ -319,9 +319,12 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                             if let Some(observation) = observation.as_mut() {
                                 observation.finish("failed", Some("quic_connect_failed"));
                             }
-                            last_error = Some(anyhow!(
-                                "QUIC connect to {server_addr}: {error} (attempt {attempt})"
-                            ));
+                            last_error = Some(
+                                crate::proxy::NodeFailure(anyhow::Error::new(error).context(
+                                    format!("QUIC connect to {server_addr} (attempt {attempt})"),
+                                ))
+                                .into(),
+                            );
                         }
                         Ok(Ok(connection)) => {
                             #[cfg(feature = "native-api")]
@@ -347,7 +350,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             Err(error) => {
                 close_guard.disarm();
                 conn.close(VarInt::from_u32(0), b"setup failed");
-                return Err(error);
+                return Err(crate::proxy::quic_carrier_error(error));
             }
         };
         #[cfg(feature = "native-api")]

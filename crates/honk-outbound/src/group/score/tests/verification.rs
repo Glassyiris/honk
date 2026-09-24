@@ -226,74 +226,39 @@ fn real_flow_gaps_become_usable_and_supported_with_measured_exposure() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
+    let state = manager.score_state();
     let initial = verification_at(&manager, &nodes, &target, now);
     assert_eq!(initial.state, ScoreVerificationState::Provisional);
     assert_eq!(initial.pending_count, 2);
-    assert_eq!(initial.next_action, ScoreValidationAction::NextBusinessFlow);
-    let state = manager.score_state();
-    let mut first_usable = None;
-    let mut confirmed_at = None;
-    let mut resolved_at = None;
-    for second in 0..100 {
-        let at = now + Duration::from_secs(second);
-        let index = rank_at(&manager, &nodes, &target, at);
-        let snapshot = verification_at(&manager, &nodes, &target, at);
-        if snapshot.state == ScoreVerificationState::ObservedUsable && first_usable.is_none() {
-            first_usable = Some(second);
-        }
-        let counts = state.verification_counters("score", SelectionNetwork::Tcp);
-        assert!(counts.validation_selections <= 2 + second / exploration_period(2));
-        if snapshot.comparison == ScoreComparison::Supported {
-            assert_eq!(snapshot.state, ScoreVerificationState::ObservedUsable);
-            assert_eq!(snapshot.compared_count, 2);
-            assert_eq!(snapshot.basis, ScoreEvidenceBasis::TargetResponse);
-            assert!(snapshot.missing.transfer);
-            confirmed_at.get_or_insert(second);
-            if snapshot.pending_count == 0 {
-                assert_eq!(snapshot.next_action, ScoreValidationAction::AwaitTransfer);
-                resolved_at = Some(second);
-                break;
-            }
-            assert!(!snapshot.missing.availability);
-            assert!(!snapshot.missing.response);
-            assert_eq!(
-                snapshot.next_action,
-                ScoreValidationAction::NextBusinessFlow
-            );
-        }
-        train_at(
-            &manager,
-            &nodes[index],
-            &target,
-            1,
-            Duration::from_millis(if index == 0 { 10 } else { 600 }),
-            1,
+    let mut resolved = None;
+    for step in 0..256 {
+        let at = now + Duration::from_millis(step * 100);
+        let (index, feedback) =
+            state.rank_plan_at("score", &target, &nodes.iter().collect::<Vec<_>>(), at);
+        respond_at(
+            feedback,
+            Duration::from_millis(if index == 0 { 1 } else { 60 }),
             at,
         );
+        let counters = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        assert!(counters.trial_starts + counters.reserved <= 2 + counters.business_starts / 16);
+        let snapshot = verification_at(&manager, &nodes, &target, at + Duration::from_millis(60));
+        if snapshot.comparison == ScoreComparison::Supported && snapshot.pending_count == 0 {
+            resolved = Some(snapshot);
+            break;
+        }
     }
-    let confirmed_at =
-        confirmed_at.expect("actual candidate trials must resolve the response dispute");
-    let resolved_at =
-        resolved_at.expect("bounded trials must also complete ordinary qualification");
-    let counts = state.verification_counters("score", SelectionNetwork::Tcp);
-    assert_eq!(counts.confirmations, 2);
-    assert_eq!(
-        counts.confirmation_millis,
-        (first_usable.unwrap() + confirmed_at) * 1000
-    );
-    assert!(counts.validation_selections >= 4);
-    assert_eq!(
-        counts.provisional_selections + counts.usable_selections,
-        resolved_at + 1
-    );
-    println!(
-        "response confirmed in {confirmed_at}s with {} validation flows",
-        counts.validation_selections
-    );
+    let snapshot =
+        resolved.expect("funded high-rate short flows must resolve the response dispute");
+    assert_eq!(snapshot.state, ScoreVerificationState::ObservedUsable);
+    assert_eq!(snapshot.compared_count, 2);
+    assert_eq!(snapshot.basis, ScoreEvidenceBasis::TargetResponse);
+    assert!(snapshot.missing.transfer);
+    assert_eq!(snapshot.next_action, ScoreValidationAction::AwaitTransfer);
 }
 
 #[test]
-fn sparse_large_group_focuses_promising_contender_until_graduation() {
+fn funded_large_group_focuses_promising_contender_until_graduation() {
     let nodes: Vec<_> = (0..32)
         .map(|index| node(&format!("leaf-{index}")))
         .collect();
@@ -301,34 +266,26 @@ fn sparse_large_group_focuses_promising_contender_until_graduation() {
     let target = context("business.example", IpVersion::V4);
     let probe = context("health.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        20,
-        Duration::from_millis(600),
-        1,
-        now,
-    );
+    train_at(&manager, &nodes[0], &target, 20, 60, 1, now);
     for (index, leaf) in nodes.iter().enumerate() {
         probe_at(
             &manager,
             leaf,
             &probe,
-            ScoreSource::HealthProbe,
-            Duration::from_millis(if index == 31 { 1 } else { 600 }),
-            now,
+            if index == 31 { 1 } else { 60 },
+            now + Duration::from_secs(1),
         );
     }
     let state = manager.score_state();
     let mut graduate = None;
     let mut focused_trials = 0;
-    for second in 2..300 {
-        let at = now + Duration::from_secs(second);
+    for step in 20..900 {
+        let at = now + Duration::from_millis(step * 100);
         let before = state.verification_counters("score", SelectionNetwork::Tcp);
-        let index = rank_at(&manager, &nodes, &target, at);
+        let (index, feedback) =
+            state.rank_plan_at("score", &target, &nodes.iter().collect::<Vec<_>>(), at);
         let after = state.verification_counters("score", SelectionNetwork::Tcp);
-        if second == 2 {
+        if step == 20 {
             assert_eq!(
                 index, 31,
                 "same-cohort fresh hint should choose a promising question"
@@ -339,32 +296,34 @@ fn sparse_large_group_focuses_promising_contender_until_graduation() {
             focused_trials += 1;
         }
         if index == 31 && !validation {
-            graduate = Some(second);
+            graduate = Some(step);
             break;
         }
-        train_at(
-            &manager,
-            &nodes[index],
-            &target,
-            1,
-            Duration::from_millis(if index == 31 { 10 } else { 600 }),
-            1,
+        respond_at(
+            feedback,
+            Duration::from_millis(if index == 31 { 1 } else { 60 }),
             at,
         );
-        assert!(after.validation_selections <= exploration_target(32) as u64 + second / 30);
+        let budget = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        assert!(
+            budget.trial_starts + budget.reserved
+                <= exploration_target(32) as u64
+                    + budget.business_starts / SCORE_EXPLORATION_PERIOD
+        );
     }
-    let second = graduate
-        .expect("round-robin sparse evidence must not strand a promising leaf below qualification");
+    let step = graduate
+        .expect("bounded focus must not strand a promising leaf under sufficient offered load");
     assert!((5..=8).contains(&focused_trials));
-    assert!(second < 250);
-    let snapshot = verification_at(&manager, &nodes, &target, now + Duration::from_secs(second));
-    assert_eq!(snapshot.state, ScoreVerificationState::ObservedUsable);
-    assert_eq!(snapshot.comparison, ScoreComparison::Unconfirmed);
-    assert!(
-        snapshot.pending_count > 0,
-        "untried rivals cannot be called beaten"
+    let snapshot = verification_at(
+        &manager,
+        &nodes,
+        &target,
+        now + Duration::from_millis(step * 100),
     );
-    println!("32-leaf sparse graduation={second}s focused trials={focused_trials}");
+    assert_eq!(snapshot.state, ScoreVerificationState::ObservedUsable);
+    // Untried rivals are reported as unevaluated, never counted as compared or excluded.
+    assert!(snapshot.evaluated_count < snapshot.candidate_count);
+    assert!(snapshot.compared_count + snapshot.blockers.excluded <= snapshot.evaluated_count);
 }
 
 #[test]
@@ -374,15 +333,7 @@ fn equivalent_response_stops_trials_while_transfer_remains_unknown() {
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
     for (leaf, latency) in nodes.iter().zip([100, 105]) {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            Duration::from_millis(latency),
-            1,
-            now,
-        );
+        train_at(&manager, leaf, &target, 20, latency, 1, now);
     }
     for _ in 0..256 {
         assert_eq!(
@@ -406,70 +357,52 @@ fn equivalent_response_stops_trials_while_transfer_remains_unknown() {
 
 #[test]
 fn old_history_cannot_refresh_availability_with_one_new_success() {
-    for history in [100.0, 10_000.0] {
-        let nodes = [node("historical")];
-        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
-        let target = context("business.example", IpVersion::V4);
-        let now = Instant::now();
-        let state = manager.score_state();
-        state.inner.lock().exact.put(
-            ExactKey {
-                group: "score".into(),
-                network: target.network,
-                family: IpVersion::V4,
-                target: target.target.clone().unwrap(),
-                node_id: nodes[0].id,
-            },
-            trained_stats(history, 100.0, now),
-        );
-        assert_eq!(
-            verification_at(&manager, &nodes, &target, now).state,
-            ScoreVerificationState::ObservedUsable
-        );
-        rank_at(&manager, &nodes, &target, now);
-        let before = state.verification_counters("score", SelectionNetwork::Tcp);
-        let expired = now + PERFORMANCE_MAX_AGE + Duration::from_secs(2);
-        let snapshot = verification_at(&manager, &nodes, &target, expired);
-        assert_eq!(snapshot.state, ScoreVerificationState::Provisional);
-        assert_eq!(snapshot.comparison, ScoreComparison::Unconfirmed);
-        assert_eq!(
-            state.verification_counters("score", SelectionNetwork::Tcp),
-            before
-        );
-        rank_at(&manager, &nodes, &target, expired);
-        assert_eq!(
-            state
-                .verification_counters("score", SelectionNetwork::Tcp)
-                .expired,
-            1
-        );
-        train_at(
-            &manager,
-            &nodes[0],
-            &target,
-            1,
-            Duration::from_millis(10),
-            1,
-            expired,
-        );
-        assert_eq!(
-            verification_at(&manager, &nodes, &target, expired + Duration::from_secs(2)).state,
-            ScoreVerificationState::Provisional
-        );
-        train_at(
-            &manager,
-            &nodes[0],
-            &target,
-            4,
-            Duration::from_millis(10),
-            1,
-            expired + Duration::from_secs(3),
-        );
-        assert_eq!(
-            verification_at(&manager, &nodes, &target, expired + Duration::from_secs(5)).state,
-            ScoreVerificationState::ObservedUsable
-        );
-    }
+    let nodes = [node("historical")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    let state = manager.score_state();
+    train_at(&manager, &nodes[0], &target, 100, 100, 1, now);
+    let now = now + Duration::from_secs(1);
+    assert_eq!(
+        verification_at(&manager, &nodes, &target, now).state,
+        ScoreVerificationState::ObservedUsable
+    );
+    rank_at(&manager, &nodes, &target, now);
+    let before = state.verification_counters("score", SelectionNetwork::Tcp);
+    let expired = now + PERFORMANCE_MAX_AGE + Duration::from_secs(2);
+    let snapshot = verification_at(&manager, &nodes, &target, expired);
+    assert_eq!(snapshot.state, ScoreVerificationState::Provisional);
+    assert_eq!(snapshot.comparison, ScoreComparison::Unconfirmed);
+    assert_eq!(
+        state.verification_counters("score", SelectionNetwork::Tcp),
+        before
+    );
+    rank_at(&manager, &nodes, &target, expired);
+    assert_eq!(
+        state
+            .verification_counters("score", SelectionNetwork::Tcp)
+            .expired,
+        1
+    );
+    train_at(&manager, &nodes[0], &target, 1, 10, 1, expired);
+    assert_eq!(
+        verification_at(&manager, &nodes, &target, expired + Duration::from_secs(2)).state,
+        ScoreVerificationState::Provisional
+    );
+    train_at(
+        &manager,
+        &nodes[0],
+        &target,
+        4,
+        10,
+        1,
+        expired + Duration::from_secs(3),
+    );
+    assert_eq!(
+        verification_at(&manager, &nodes, &target, expired + Duration::from_secs(5)).state,
+        ScoreVerificationState::ObservedUsable
+    );
 }
 
 #[test]
@@ -479,15 +412,7 @@ fn transfer_expiry_failure_and_reload_retract_only_supported_claims() {
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            Duration::from_millis(100),
-            1_000_000,
-            now,
-        );
+        train_at(&manager, leaf, &target, 20, 100, 1_000_000, now);
     }
     rank_at(&manager, &nodes, &target, now + Duration::from_secs(2));
     let snapshot = verification_at(&manager, &nodes, &target, now + Duration::from_secs(2));
@@ -496,15 +421,7 @@ fn transfer_expiry_failure_and_reload_retract_only_supported_claims() {
     let state = manager.score_state();
     let refreshed = now + Duration::from_secs(70);
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            5,
-            Duration::from_millis(100),
-            1,
-            refreshed,
-        );
+        train_at(&manager, leaf, &target, 5, 100, 1, refreshed);
     }
     let at = refreshed + Duration::from_secs(2);
     let snapshot = verification_at(&manager, &nodes, &target, at);
@@ -513,7 +430,7 @@ fn transfer_expiry_failure_and_reload_retract_only_supported_claims() {
     assert!(snapshot.missing.transfer);
     assert_eq!(snapshot.next_action, ScoreValidationAction::AwaitTransfer);
     assert_eq!(snapshot.evidence_age_ms, Some(1900));
-    assert_eq!(snapshot.valid_for_ms, Some(58100));
+    assert_eq!(snapshot.valid_for_ms, Some(48100));
     rank_at(&manager, &nodes, &target, at);
     assert_eq!(
         state
@@ -544,15 +461,7 @@ fn transfer_expiry_failure_and_reload_retract_only_supported_claims() {
         1
     );
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            5,
-            Duration::from_millis(100),
-            1,
-            at,
-        );
+        train_at(&manager, leaf, &target, 5, 100, 1, at);
     }
     rank_at(&manager, &nodes, &target, at + Duration::from_secs(2));
     let before = state.verification_counters("score", SelectionNetwork::Tcp);
@@ -584,14 +493,7 @@ fn probes_and_singletons_never_certify_unknown_business_scope() {
     let now = Instant::now();
     for (leaf, latency) in nodes.iter().zip([10, 100]) {
         for _ in 0..8 {
-            probe_at(
-                &manager,
-                leaf,
-                &probe,
-                ScoreSource::HealthProbe,
-                Duration::from_millis(latency),
-                now,
-            );
+            probe_at(&manager, leaf, &probe, latency, now);
         }
     }
     let aggregate_snapshot = verification_at(&manager, &nodes, &aggregate, now);
@@ -609,15 +511,7 @@ fn probes_and_singletons_never_certify_unknown_business_scope() {
     assert_eq!(exact.comparison, ScoreComparison::Unconfirmed);
     assert!(exact.missing.availability && exact.missing.response && exact.missing.transfer);
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            Duration::from_millis(100),
-            1,
-            now,
-        );
+        train_at(&manager, leaf, &target, 20, 100, 1, now);
     }
     let other = context("different-business.example", IpVersion::V4);
     assert_eq!(
@@ -625,7 +519,7 @@ fn probes_and_singletons_never_certify_unknown_business_scope() {
         ScoreVerificationState::Provisional
     );
     let fallback = verification_at(&manager, &nodes, &other, now + Duration::from_secs(2));
-    assert_eq!(fallback.basis, ScoreEvidenceBasis::AggregateResponse);
+    assert_eq!(fallback.basis, ScoreEvidenceBasis::CommonTargets);
     assert_eq!(fallback.comparison, ScoreComparison::Unconfirmed);
     assert!(fallback.missing.availability && fallback.missing.response);
     let singleton = verification_at(&manager, &nodes[..1], &target, now + Duration::from_secs(2));
@@ -642,14 +536,7 @@ fn one_unrelated_probe_cannot_suppress_comparable_http_pair() {
     let aggregate =
         ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
     let now = Instant::now();
-    probe_at(
-        &manager,
-        &nodes[0],
-        &probe,
-        ScoreSource::HealthProbe,
-        Duration::from_millis(1),
-        now,
-    );
+    probe_at(&manager, &nodes[0], &probe, 1, now);
     let uri = "https://health.example/check";
     for (leaf, latency) in nodes[1..].iter().zip([600, 10]) {
         let feedback = manager
@@ -681,15 +568,7 @@ fn sparse_cancellations_rotate_without_confirmation_or_unbounded_exposure() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        20,
-        Duration::from_millis(100),
-        1,
-        now,
-    );
+    train_at(&manager, &nodes[0], &target, 20, 100, 1, now);
     let state = manager.score_state();
     let mut trials = [0u64; 3];
     for step in 0..16 {
@@ -698,10 +577,10 @@ fn sparse_cancellations_rotate_without_confirmation_or_unbounded_exposure() {
             &manager,
             &nodes[0],
             &target,
-            5,
-            Duration::from_millis(100),
+            16,
+            100,
             1,
-            at,
+            at - Duration::from_secs(1),
         );
         let before = state.verification_counters("score", SelectionNetwork::Tcp);
         for _ in 0..10 {
@@ -711,14 +590,17 @@ fn sparse_cancellations_rotate_without_confirmation_or_unbounded_exposure() {
             state.verification_counters("score", SelectionNetwork::Tcp),
             before
         );
-        let index = rank_at(&manager, &nodes, &target, at);
+        let (index, feedback) =
+            state.rank_plan_at("score", &target, &nodes.iter().collect::<Vec<_>>(), at);
         assert_ne!(index, 0);
         trials[index] += 1;
-        manager
-            .feedback_for_group_node("score", nodes[index].id, target.clone())
+        feedback
+            .begin_at(at)
             .unwrap()
             .start_at(at)
             .finish_at(ScoreOutcome::Cancelled, true, at);
+        let budget = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+        assert!(budget.trial_starts + budget.reserved <= 3 + budget.business_starts / 16);
         let snapshot = verification_at(&manager, &nodes, &target, at);
         assert_eq!(snapshot.comparison, ScoreComparison::Unconfirmed);
         assert_eq!(snapshot.pending_count, 2);
@@ -745,7 +627,13 @@ fn exhausted_budget_and_retired_authority_cannot_publish_confirmation() {
     let now = Instant::now();
     let state = manager.score_state();
     for _ in 0..64 {
-        rank_at(&manager, &nodes, &target, now);
+        let (_, feedback) =
+            state.rank_plan_at("score", &target, &nodes.iter().collect::<Vec<_>>(), now);
+        feedback
+            .begin_at(now)
+            .unwrap()
+            .start_at(now)
+            .finish_at(ScoreOutcome::Cancelled, true, now);
     }
     let snapshot = verification_at(&manager, &nodes, &target, now);
     assert_eq!(snapshot.state, ScoreVerificationState::Provisional);
@@ -757,7 +645,9 @@ fn exhausted_budget_and_retired_authority_cannot_publish_confirmation() {
     );
     let before = state.verification_counters("score", SelectionNetwork::Tcp);
     assert_eq!(before.confirmations, 0);
-    assert!(before.validation_selections <= 2 + 64 / exploration_period(2));
+    let budget = manager.score_budget_counters("score", SelectionNetwork::Tcp);
+    assert_eq!(budget.business_starts, 64);
+    assert!(budget.trial_starts + budget.reserved <= 2 + 64 / 16);
     let authority = state.inner.lock().active_authority.clone().unwrap();
     state.publish_membership(nodes.iter().map(|node| ("score".to_owned(), node.id)));
     state.rank(
@@ -765,6 +655,7 @@ fn exhausted_budget_and_retired_authority_cannot_publish_confirmation() {
         "score",
         &target,
         &nodes.iter().collect::<Vec<_>>(),
+        true,
     );
     assert_eq!(
         state.verification_counters("score", SelectionNetwork::Tcp),
@@ -773,50 +664,184 @@ fn exhausted_budget_and_retired_authority_cannot_publish_confirmation() {
 }
 
 #[test]
-fn fresh_excluded_failure_is_known_inferior_not_an_unknown_rival() {
-    let nodes = [node("working"), node("slower"), node("failed")];
+fn stale_failure_is_dominated_or_stays_outside_coverage_until_qualified() {
+    for (history, dominated) in [(20, true), (0, false)] {
+        let nodes = [node("working"), node("slower"), node("failed")];
+        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+        let target = context("business.example", IpVersion::V4);
+        let now = Instant::now();
+        rank_at(&manager, &nodes, &target, now);
+        for (leaf, (samples, latency)) in nodes.iter().zip([(20, 10), (20, 100), (history, 1)]) {
+            train_at(&manager, leaf, &target, samples, latency, 1, now);
+        }
+        for _ in 0..3 {
+            manager
+                .feedback_for_group_node("score", nodes[2].id, target.clone())
+                .unwrap()
+                .start_at(now)
+                .finish_at(ScoreOutcome::Timeout, true, now);
+        }
+        let snapshot = verification_at(&manager, &nodes, &target, now + Duration::from_secs(2));
+        assert_eq!(snapshot.comparison, ScoreComparison::Supported);
+        assert_eq!(snapshot.candidate_count, 3);
+        // A member that never qualified never joined coverage, so it is not excluded from it.
+        assert_eq!(snapshot.covered_count, 2 + usize::from(dominated));
+        assert_eq!(snapshot.compared_count, 2);
+        assert_eq!(snapshot.pending_count, 0);
+        assert_eq!(snapshot.blockers.excluded, usize::from(dominated));
+        let at = now + PERFORMANCE_MAX_AGE + Duration::from_secs(2);
+        for leaf in &nodes[..2] {
+            train_at(&manager, leaf, &target, 5, 100, 1, at);
+        }
+        let snapshot = verification_at(&manager, &nodes, &target, at + Duration::from_secs(2));
+        // Lower qualified reliability can never be a rival advantage; unknown history stays
+        // outside coverage until it qualifies.
+        assert_eq!(
+            snapshot.comparison,
+            ScoreComparison::Equivalent,
+            "history={history}"
+        );
+        assert_eq!(snapshot.blockers.excluded, usize::from(dominated));
+        // Coverage resolution never withdraws the failed member's recovery work.
+        assert_eq!(snapshot.pending_count, 1);
+        assert_eq!(snapshot.next_action, ScoreValidationAction::Backoff);
+        assert_eq!(snapshot.question, ScoreEvidenceQuestion::Recovery);
+        assert_eq!(snapshot.wait_reason, ScoreWaitReason::Backoff);
+    }
+}
+
+#[test]
+fn dominance_ends_the_claim_when_qualification_lapses() {
+    let nodes = [node("steady"), node("peer"), node("flaky")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
-    for (leaf, latency) in nodes.iter().zip([10, 100, 1]) {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            Duration::from_millis(latency),
-            1,
-            now,
-        );
-    }
-    for _ in 0..3 {
-        manager
-            .feedback_for_group_node("score", nodes[2].id, target.clone())
-            .unwrap()
-            .start_at(now)
-            .finish_at(ScoreOutcome::Timeout, true, now);
-    }
-    let snapshot = verification_at(&manager, &nodes, &target, now + Duration::from_secs(2));
-    assert_eq!(snapshot.comparison, ScoreComparison::Supported);
-    assert_eq!(snapshot.candidate_count, 3);
-    assert_eq!(snapshot.compared_count, 2);
-    assert_eq!(snapshot.pending_count, 0);
-    let at = now + PERFORMANCE_MAX_AGE + Duration::from_secs(2);
+    rank_at(&manager, &nodes, &target, now);
+    train_at(&manager, &nodes[2], &target, 4, 1, 1, now);
+    manager
+        .feedback_for_group_node("score", nodes[2].id, target.clone())
+        .unwrap()
+        .start_at(now)
+        .finish_at(ScoreOutcome::Timeout, true, now + Duration::from_secs(1));
+    // Five decayed completions sit just above the four-completion threshold here.
+    let decayed = now + Duration::from_secs(540);
     for leaf in &nodes[..2] {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            5,
-            Duration::from_millis(100),
-            1,
-            at,
-        );
+        train_at(&manager, leaf, &target, 20, 10, 1, decayed);
     }
-    let snapshot = verification_at(&manager, &nodes, &target, at + Duration::from_secs(2));
-    assert_eq!(snapshot.comparison, ScoreComparison::Unconfirmed);
-    assert_eq!(snapshot.pending_count, 1);
-    assert_eq!(snapshot.next_action, ScoreValidationAction::Backoff);
+    let at = decayed + Duration::from_secs(2);
+    let report = verification_at(&manager, &nodes, &target, at);
+    assert_eq!(report.comparison, ScoreComparison::Equivalent);
+    assert_eq!(report.covered_count, 3);
+    let valid_for = Duration::from_millis(report.valid_for_ms.unwrap());
+    let margin = Duration::from_millis(100);
+    assert_eq!(
+        verification_at(&manager, &nodes, &target, at + valid_for - margin).comparison,
+        ScoreComparison::Equivalent
+    );
+    assert_eq!(
+        verification_at(&manager, &nodes, &target, at + valid_for + margin).comparison,
+        ScoreComparison::Unconfirmed
+    );
+    assert_eq!(
+        verification_at(&manager, &nodes, &target, at + valid_for + margin).covered_count,
+        3,
+        "qualification expiry must reopen the same covered set"
+    );
+}
+
+#[test]
+fn covered_qualification_lapse_expires_instead_of_contradicting_the_claim() {
+    let nodes = [node("steady"), node("marginal")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let probe = context("health.example", IpVersion::V4);
+    let aggregate =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    let now = Instant::now();
+    rank_at(&manager, &nodes, &aggregate, now);
+    // Five decayed completions sit just above the four-completion threshold here.
+    train_at(&manager, &nodes[1], &target, 5, 10, 1, now);
+    let decayed = now + Duration::from_secs(540);
+    train_at(&manager, &nodes[0], &target, 20, 10, 1, decayed);
+    for leaf in &nodes {
+        probe_at(&manager, leaf, &probe, 10, decayed);
+    }
+    let at = decayed + Duration::from_secs(2);
+    let report = verification_at(&manager, &nodes, &aggregate, at);
+    assert_eq!(report.comparison, ScoreComparison::Equivalent);
+    assert_eq!(report.basis, ScoreEvidenceBasis::ConfiguredProbe);
+    assert_eq!(report.covered_count, 2);
+    let valid_for = Duration::from_millis(report.valid_for_ms.unwrap());
+    let margin = Duration::from_millis(100);
+    assert_eq!(
+        verification_at(&manager, &nodes, &aggregate, at + valid_for - margin).comparison,
+        ScoreComparison::Equivalent
+    );
+    let lapsed = verification_at(&manager, &nodes, &aggregate, at + valid_for + margin);
+    assert_eq!(lapsed.comparison, ScoreComparison::Unconfirmed);
+    assert_eq!(lapsed.covered_count, 2);
+    let state = manager.score_state();
+    rank_at(&manager, &nodes, &aggregate, at);
+    let before = state.verification_counters("score", SelectionNetwork::Tcp);
+    rank_at(&manager, &nodes, &aggregate, at + valid_for + margin);
+    let after = state.verification_counters("score", SelectionNetwork::Tcp);
+    assert_eq!(after.expired, before.expired + 1);
+    assert_eq!(after.contradicted, before.contradicted);
+}
+
+#[test]
+fn cross_target_latency_is_not_node_degradation() {
+    let nodes = [node("fast"), node("slow")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let near = context("near.example", IpVersion::V4);
+    let aggregate =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    let now = Instant::now();
+    rank_at(&manager, &nodes, &near, now);
+    for (leaf, latency) in nodes.iter().zip([10, 100]) {
+        train_at(&manager, leaf, &near, 20, latency, 1, now);
+    }
+    let at = now + Duration::from_secs(2);
+    assert_eq!(
+        verification_at(&manager, &nodes, &aggregate, at).comparison,
+        ScoreComparison::Supported
+    );
+    // A farther target is slower through every path; it says nothing about this node.
+    train_at(
+        &manager,
+        &nodes[0],
+        &context("far.example", IpVersion::V4),
+        1,
+        100,
+        1,
+        at,
+    );
+    let later = at + Duration::from_secs(2);
+    let report = verification_at(&manager, &nodes, &aggregate, later);
+    assert_eq!(report.comparison, ScoreComparison::Supported);
+    assert_eq!(report.blockers.response_degraded, 0);
+    // The same target slowing down still reopens that target's comparison.
+    train_at(&manager, &nodes[0], &near, 1, 100, 1, later);
+    let report = verification_at(&manager, &nodes, &near, later + Duration::from_secs(2));
+    assert_eq!(report.comparison, ScoreComparison::Unconfirmed);
+    assert!(report.blockers.response_degraded > 0);
+}
+
+#[test]
+fn qualification_blocker_stays_visible_behind_missing_availability() {
+    let nodes = [node("qualified"), node("lapsing")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    train_at(&manager, &nodes[0], &target, 20, 10, 1, now);
+    train_at(&manager, &nodes[1], &target, 5, 10, 1, now);
+    rank_at(&manager, &nodes, &target, now + Duration::from_secs(2));
+    // Five completions decay below four; the admitted member still owes qualification.
+    let report = verification_at(&manager, &nodes, &target, now + Duration::from_secs(600));
+    assert_eq!(report.covered_count, 2);
+    assert_eq!(report.question, ScoreEvidenceQuestion::Availability);
+    assert!(report.blockers.availability > 0);
+    assert_eq!(report.blockers.qualification, 1);
 }
 
 #[test]
@@ -825,35 +850,24 @@ fn partial_success_cannot_pin_a_cancelled_validation_run_forever() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        20,
-        Duration::from_millis(100),
-        1,
-        now,
-    );
+    train_at(&manager, &nodes[0], &target, 20, 100, 1, now);
     let state = manager.score_state();
     let at = now + Duration::from_secs(2);
-    assert_eq!(rank_at(&manager, &nodes, &target, at), 1);
-    train_at(
-        &manager,
-        &nodes[1],
-        &target,
-        1,
-        Duration::from_millis(10),
-        1,
-        at,
-    );
+    let (index, feedback) =
+        state.rank_plan_at("score", &target, &nodes.iter().collect::<Vec<_>>(), at);
+    assert_eq!(index, 1);
+    respond_at(feedback, Duration::from_millis(10), at);
     let mut run = 0;
     let mut max_run = 0;
     let mut other_trials = 0;
-    for _ in 0..exploration_period(3) * 12 {
+    for _ in 0..SCORE_EXPLORATION_PERIOD * 12 {
         let before = state.selection_reason_counts("score", SelectionNetwork::Tcp);
-        let index = rank_at(&manager, &nodes, &target, at);
+        let (index, feedback) =
+            state.rank_plan_at("score", &target, &nodes.iter().collect::<Vec<_>>(), at);
         let after = state.selection_reason_counts("score", SelectionNetwork::Tcp);
-        if after.periodic_explore > before.periodic_explore {
+        if after.periodic_explore + after.cold_explore
+            > before.periodic_explore + before.cold_explore
+        {
             if index == 1 {
                 run += 1;
                 max_run = max_run.max(run);
@@ -863,11 +877,13 @@ fn partial_success_cannot_pin_a_cancelled_validation_run_forever() {
             }
         }
         if index != 0 {
-            manager
-                .feedback_for_group_node("score", nodes[index].id, target.clone())
-                .unwrap()
-                .start_at(at)
-                .finish_at(ScoreOutcome::Cancelled, true, at);
+            feedback.begin_at(at).unwrap().start_at(at).finish_at(
+                ScoreOutcome::Cancelled,
+                true,
+                at,
+            );
+        } else {
+            respond_at(feedback, Duration::from_millis(100), at);
         }
     }
     assert!(max_run <= 8);
@@ -884,16 +900,15 @@ fn availability_validity_does_not_depend_on_decaying_terminal_completions() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
-    manager.score_state().inner.lock().exact.put(
-        ExactKey {
-            group: "score".into(),
-            network: target.network,
-            family: IpVersion::V4,
-            target: target.target.clone().unwrap(),
-            node_id: nodes[0].id,
-        },
-        trained_stats(4.0, 100.0, now),
-    );
+    for _ in 0..4 {
+        let reporter = manager
+            .feedback_for_group_node("score", nodes[0].id, target.clone())
+            .unwrap()
+            .start_at(now);
+        reporter.setup_succeeded_at(now);
+        reporter.transfer_at(1, 1, now);
+        reporter.finish_at(ScoreOutcome::Success, true, now);
+    }
     let snapshot = verification_at(&manager, &nodes, &target, now);
     assert_eq!(snapshot.state, ScoreVerificationState::ObservedUsable);
     let validity = snapshot.valid_for_ms.unwrap();
@@ -921,15 +936,7 @@ fn removed_confirmed_winner_defers_revocation_count_until_apply() {
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
     for (leaf, latency) in nodes.iter().zip([10, 100]) {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            Duration::from_millis(latency),
-            1,
-            now,
-        );
+        train_at(&manager, leaf, &target, 20, latency, 1, now);
     }
     let at = now + Duration::from_secs(2);
     assert_eq!(rank_at(&manager, &nodes, &target, at), 0);
@@ -972,15 +979,7 @@ fn singleton_can_prove_transfer_observation_without_a_comparison() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("transfer.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        8,
-        Duration::from_millis(50),
-        128 * 1024,
-        now,
-    );
+    train_at(&manager, &nodes[0], &target, 8, 50, 128 * 1024, now);
     let report = verification_at(&manager, &nodes, &target, now + Duration::from_secs(2));
     assert_eq!(report.state, ScoreVerificationState::ObservedUsable);
     assert_eq!(report.comparison, ScoreComparison::Unconfirmed);
@@ -994,15 +993,7 @@ fn singleton_response_claim_expires_before_newer_business_success() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("response.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        8,
-        Duration::from_millis(50),
-        1,
-        now,
-    );
+    train_at(&manager, &nodes[0], &target, 8, 50, 1, now);
     let later = now + Duration::from_secs(59);
     for _ in 0..8 {
         let reporter = manager
@@ -1028,26 +1019,24 @@ fn a_measured_throughput_tradeoff_has_an_explicit_comparison_basis() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("tradeoff.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        8,
-        Duration::from_millis(100),
-        1_048_576,
-        now,
-    );
+    rank_at(&manager, &nodes, &target, now);
+    train_at(&manager, &nodes[0], &target, 8, 100, 1_048_576, now);
     train_at(
         &manager,
         &nodes[1],
         &target,
         8,
-        Duration::from_millis(90),
+        95,
         65_536,
-        now,
+        now + Duration::from_secs(1),
     );
     let at = now + Duration::from_secs(2);
-    assert_eq!(rank_at(&manager, &nodes, &target, at), 0);
+    assert_eq!(
+        manager
+            .score_state()
+            .peek_rank_at("score", &target, &nodes.iter().collect::<Vec<_>>(), at),
+        0
+    );
     let report = verification_at(&manager, &nodes, &target, at);
     assert_eq!(report.comparison, ScoreComparison::Supported);
     assert_eq!(report.basis, ScoreEvidenceBasis::Download);
@@ -1060,14 +1049,16 @@ fn upload_support_is_not_hidden_by_a_qualified_download_comparison() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("direction.example", IpVersion::V4);
     let now = Instant::now();
+    rank_at(&manager, &nodes, &target, now);
     for (index, (latency, upload, download)) in [
         (100, 1_048_576, 524_288),
-        (90, 524_288, 419_430),
+        (95, 524_288, 419_430),
         (200, 524_288, 1_048_576),
     ]
     .into_iter()
     .enumerate()
     {
+        let now = now + Duration::from_secs(index as u64);
         for _ in 0..8 {
             let reporter = manager
                 .feedback_for_group_node("score", nodes[index].id, target.clone())
@@ -1079,8 +1070,13 @@ fn upload_support_is_not_hidden_by_a_qualified_download_comparison() {
             reporter.finish_at(ScoreOutcome::Success, true, now + Duration::from_secs(1));
         }
     }
-    let at = now + Duration::from_secs(2);
-    assert_eq!(rank_at(&manager, &nodes, &target, at), 0);
+    let at = now + Duration::from_secs(4);
+    assert_eq!(
+        manager
+            .score_state()
+            .peek_rank_at("score", &target, &nodes.iter().collect::<Vec<_>>(), at),
+        0
+    );
     let report = verification_at(&manager, &nodes, &target, at);
     assert_eq!(report.comparison, ScoreComparison::Supported);
     assert_eq!(report.basis, ScoreEvidenceBasis::Upload);

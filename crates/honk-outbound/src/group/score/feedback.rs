@@ -2,15 +2,15 @@ use super::evidence::Observation;
 use super::{
     FlowSample, LIVE_RX_INTERVAL, MAX_THROUGHPUT_DURATION, MIN_THROUGHPUT_BYTES,
     MIN_THROUGHPUT_DURATION, ScoreAttribution, ScoreAuthority, ScoreOutcome, ScorePolicyState,
-    ScoreSelectionContext, ScoreSource, StartedCells,
+    ScoreSelectionContext, ScoreSource, StartedCells, budget, comparison, validation,
 };
 use parking_lot::Mutex;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 
+/// Immutable attribution and source factory; each start is independent work.
 #[derive(Clone)]
 pub struct ScoreFeedback {
     state: Arc<ScorePolicyState>,
@@ -19,6 +19,76 @@ pub struct ScoreFeedback {
     attributions: Arc<[ScoreAttribution]>,
     source: ScoreSource,
     probe_scope: u64,
+    probe_interval: Option<Duration>,
+}
+
+/// One pending business attempt. Clones retain the same reservation and original identity.
+#[derive(Clone, Debug)]
+pub struct ScoreAttempt {
+    feedback: ScoreFeedback,
+    pub(super) opportunity: Arc<budget::Opportunity>,
+    work: Arc<[Arc<budget::Work>]>,
+}
+
+/// Original business identity, issued only after admission.
+#[derive(Clone, Debug)]
+pub struct ScoreContinuation {
+    pub(super) opportunity: Arc<budget::Opportunity>,
+}
+
+/// Owns admitted work until its physical/logical reporter starts.
+pub struct ScoreBusinessGuard {
+    attempt: Option<ScoreAttempt>,
+    admitted: bool,
+}
+
+impl ScoreBusinessGuard {
+    pub fn continuation(&self) -> ScoreContinuation {
+        ScoreContinuation {
+            opportunity: Arc::clone(
+                &self
+                    .attempt
+                    .as_ref()
+                    .expect("admitted Score attempt")
+                    .opportunity,
+            ),
+        }
+    }
+
+    pub fn start(self) -> ScoreReporter {
+        self.start_at(Instant::now())
+    }
+
+    pub(super) fn start_at(mut self, started: Instant) -> ScoreReporter {
+        let attempt = self.attempt.take().expect("admitted Score attempt");
+        attempt
+            .feedback
+            .reporter(attempt.work, started, self.admitted)
+    }
+
+    pub fn finish(mut self, outcome: ScoreOutcome) {
+        if let Some(attempt) = self.attempt.take() {
+            budget::finish(
+                &attempt.feedback.state,
+                &attempt.work,
+                outcome,
+                Instant::now(),
+            );
+        }
+    }
+}
+
+impl Drop for ScoreBusinessGuard {
+    fn drop(&mut self) {
+        if let Some(attempt) = &self.attempt {
+            budget::finish(
+                &attempt.feedback.state,
+                &attempt.work,
+                ScoreOutcome::Cancelled,
+                Instant::now(),
+            );
+        }
+    }
 }
 
 impl std::fmt::Debug for ScoreFeedback {
@@ -28,6 +98,124 @@ impl std::fmt::Debug for ScoreFeedback {
             .finish_non_exhaustive()
     }
 }
+
+impl ScoreAttempt {
+    pub(super) fn planned(
+        feedback: ScoreFeedback,
+        opportunity: Arc<budget::Opportunity>,
+        mut work: Vec<Arc<budget::Work>>,
+        source: super::ScoreTrialSource,
+    ) -> Self {
+        for attribution in feedback.attributions.iter() {
+            if !work.iter().any(|item| item.key.group == attribution.group) {
+                work.push(budget::Work::new(
+                    &feedback.state,
+                    &attribution.group,
+                    &feedback.context,
+                    attribution.node_id,
+                    source,
+                ));
+            }
+        }
+        Self {
+            feedback,
+            opportunity,
+            work: work.into(),
+        }
+    }
+
+    /// Admit before node DNS or physical-dial admission waits; stale ordinary work proceeds unscored.
+    pub fn begin(&self) -> Result<ScoreBusinessGuard, crate::proxy::PacketRejection> {
+        self.begin_at(Instant::now())
+    }
+
+    pub(super) fn begin_at(
+        &self,
+        now: Instant,
+    ) -> Result<ScoreBusinessGuard, crate::proxy::PacketRejection> {
+        let mut inner = self.feedback.state.inner.lock();
+        if !inner
+            .active_authority
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, &self.feedback.authority))
+        {
+            return if budget::begin_unscored(&mut inner, &self.opportunity, &self.work, now) {
+                Ok(ScoreBusinessGuard {
+                    attempt: Some(self.clone()),
+                    admitted: false,
+                })
+            } else {
+                Err(crate::proxy::PacketRejection::Cancelled)
+            };
+        }
+        if !validation::admissible(&inner, &self.feedback.context, &self.work, now) {
+            for work in self.work.iter() {
+                work.cancel_pending(&mut inner);
+            }
+            return Err(crate::proxy::PacketRejection::Cancelled);
+        }
+        if !budget::begin(
+            &mut inner,
+            &self.feedback.authority,
+            &self.feedback.context,
+            &self.feedback.attributions,
+            &self.opportunity,
+            &self.work,
+            now,
+        ) {
+            return Err(crate::proxy::PacketRejection::Cancelled);
+        }
+        super::ranking::advance_rotation(
+            &mut inner,
+            &self.feedback.context,
+            &self.feedback.attributions,
+        );
+        Ok(ScoreBusinessGuard {
+            attempt: Some(self.clone()),
+            admitted: true,
+        })
+    }
+
+    pub fn attributions(&self) -> &[ScoreAttribution] {
+        self.feedback.attributions()
+    }
+
+    pub fn context(&self) -> &ScoreSelectionContext {
+        self.feedback.context()
+    }
+
+    /// Start unscored refill without admitting or transferring pending business work.
+    pub fn start_warmup(self, context: ScoreSelectionContext) -> ScoreReporter {
+        self.feedback
+            .with_context(context)
+            .with_source(ScoreSource::Warmup)
+            .start()
+    }
+
+    pub fn continuation(&self) -> Result<ScoreContinuation, crate::proxy::PacketRejection> {
+        if !self.work.iter().all(|work| work.has_started()) {
+            return Err(crate::proxy::PacketRejection::Cancelled);
+        }
+        Ok(ScoreContinuation {
+            opportunity: Arc::clone(&self.opportunity),
+        })
+    }
+
+    /// A carrier change requires an admitted original, never an unspent reservation.
+    pub fn with_context(
+        self,
+        context: ScoreSelectionContext,
+    ) -> Result<Self, crate::proxy::PacketRejection> {
+        let original = self.continuation()?;
+        Ok(Self::planned(
+            self.feedback.with_context(context),
+            original.opportunity,
+            Vec::new(),
+            super::ScoreTrialSource::Recovery,
+        ))
+    }
+}
+
 impl ScoreFeedback {
     pub(in crate::group) fn new(
         state: Arc<ScorePolicyState>,
@@ -42,10 +230,21 @@ impl ScoreFeedback {
             attributions: attributions.into(),
             source: ScoreSource::Traffic,
             probe_scope: 0,
+            probe_interval: None,
         }
     }
 
-    /// Classify an attempt before admission; only traffic settles business reliability.
+    /// Create one independent business, without changing this factory or any clone.
+    pub fn business(&self) -> ScoreAttempt {
+        ScoreAttempt::planned(
+            self.clone().with_source(ScoreSource::Traffic),
+            Arc::new(budget::Opportunity::default()),
+            Vec::new(),
+            super::ScoreTrialSource::None,
+        )
+    }
+
+    /// Classify before constructing business work.
     pub fn with_source(mut self, source: ScoreSource) -> Self {
         self.source = source;
         if source == ScoreSource::HealthProbe {
@@ -53,6 +252,11 @@ impl ScoreFeedback {
             self.context.hash(&mut scope);
             self.probe_scope = scope.finish();
         }
+        self
+    }
+    /// Bind configured-probe comparison freshness to its producer's cadence.
+    pub fn with_probe_interval(mut self, interval: Duration) -> Self {
+        self.probe_interval = Some(interval);
         self
     }
 
@@ -65,57 +269,70 @@ impl ScoreFeedback {
         }
         self
     }
+    fn probe_scope(&self) -> u64 {
+        self.probe_interval.map_or(self.probe_scope, |interval| {
+            let mut scope = std::collections::hash_map::DefaultHasher::new();
+            (self.probe_scope, interval).hash(&mut scope);
+            scope.finish()
+        })
+    }
 
     pub fn attributions(&self) -> &[ScoreAttribution] {
         &self.attributions
     }
+
     pub fn context(&self) -> &ScoreSelectionContext {
         &self.context
     }
 
-    /// Add an outer Score group when a terminal `final` outbound supplies the
-    /// leaf. Existing nested attribution order remains outer-to-inner.
-    pub fn prepend_attribution(mut self, group: String, node_id: Uuid) -> Self {
-        if !self
-            .attributions
-            .iter()
-            .any(|attribution| attribution.group == group)
-        {
-            let mut attributions = Vec::with_capacity(self.attributions.len() + 1);
-            attributions.push(ScoreAttribution { group, node_id });
-            attributions.extend(self.attributions.iter().cloned());
-            self.attributions = attributions.into();
-        }
-        self
-    }
-    /// Reuse the selected group chain for a related attempt with different
-    /// transport dimensions, such as a UDP DNS reply retried over TCP.
     pub fn with_context(mut self, context: ScoreSelectionContext) -> Self {
         self.context = context;
         let source = self.source;
         self.with_source(source)
     }
 
-    /// Call only when the physical dial or logical stream actually starts.
+    /// Start an independent observation; callers with selected business work use its guard.
     pub fn start(&self) -> ScoreReporter {
         self.start_at(Instant::now())
     }
 
     pub(super) fn start_at(&self, started: Instant) -> ScoreReporter {
-        let cells = self.state.start_at_with_authority(
-            &self.authority,
-            &self.context,
-            &self.attributions,
-            started,
-            self.source,
-        );
+        if self.source != ScoreSource::Traffic {
+            return self.clone().reporter(Arc::from([]), started, true);
+        }
+        match self.business().begin_at(started) {
+            Ok(guard) => guard.start_at(started),
+            // A captured factory cannot publish new observations after authority changes.
+            Err(_) => self.clone().reporter(Arc::from([]), started, false),
+        }
+    }
+
+    fn reporter(
+        self,
+        work: Arc<[Arc<budget::Work>]>,
+        started: Instant,
+        admitted: bool,
+    ) -> ScoreReporter {
+        let cells = if admitted {
+            self.state.start_at_with_authority(
+                &self.authority,
+                &self.context,
+                &self.attributions,
+                started,
+                self.source,
+            )
+        } else {
+            vec![StartedCells::default(); self.attributions.len()]
+        };
         ScoreReporter {
             shared: Arc::new(ReporterShared {
-                feedback: self.clone(),
+                feedback: self,
+                work,
                 started,
                 handles: AtomicUsize::new(1),
                 progress: Mutex::new(ReporterProgress {
                     cells,
+                    reporter_id: comparison::next_reporter_id(),
                     window_start: started,
                     setup: None,
                     first_response: false,
@@ -137,6 +354,7 @@ impl ScoreFeedback {
 
 struct ReporterProgress {
     cells: Vec<StartedCells>,
+    reporter_id: u64,
     setup: Option<Duration>,
     first_response: bool,
     probe: bool,
@@ -154,6 +372,7 @@ struct ReporterProgress {
 
 struct ReporterShared {
     feedback: ScoreFeedback,
+    work: Arc<[Arc<budget::Work>]>,
     started: Instant,
     handles: AtomicUsize,
     progress: Mutex<ReporterProgress>,
@@ -223,11 +442,13 @@ impl ScoreReporter {
             return;
         }
         progress.probe = true;
+        let scope = feedback.probe_scope();
         self.observe(
             Observation::Probe {
                 latency,
-                scope: feedback.probe_scope,
+                scope,
                 slot: super::evidence::probe_slot(&feedback.context),
+                interval: feedback.probe_interval,
             },
             now,
             &mut progress,
@@ -359,6 +580,23 @@ impl ScoreReporter {
         {
             return;
         }
+        if matches!(&observation, Observation::Setup(_)) {
+            budget::setup(&mut inner, &self.shared.work, now);
+        }
+        comparison::observe(
+            &mut inner,
+            &feedback.context,
+            &feedback.attributions,
+            (&progress.cells, progress.reporter_id),
+            feedback.source,
+            &observation,
+            now,
+        );
+        let answered = match &observation {
+            Observation::BusinessProgress { .. } => super::ScoreEvidenceQuestion::Availability,
+            Observation::Response(_) => super::ScoreEvidenceQuestion::Response,
+            _ => super::ScoreEvidenceQuestion::None,
+        };
         ScorePolicyState::observe(
             &mut inner,
             &feedback.context,
@@ -368,11 +606,28 @@ impl ScoreReporter {
             observation,
             now,
         );
+        if feedback.source == ScoreSource::Traffic && answered != super::ScoreEvidenceQuestion::None
+        {
+            budget::answered(
+                &inner,
+                &feedback.context,
+                &feedback.attributions,
+                &progress.cells,
+                &self.shared.work,
+                answered,
+                now,
+            );
+        }
     }
 
-    /// Recover the immutable attribution plan for a related physical attempt.
-    pub fn feedback(&self) -> ScoreFeedback {
-        self.shared.feedback.clone()
+    /// Background refill retains attribution, never the business source or work.
+    pub fn start_warmup(&self, context: ScoreSelectionContext) -> ScoreReporter {
+        self.shared
+            .feedback
+            .clone()
+            .with_context(context)
+            .with_source(ScoreSource::Warmup)
+            .start()
     }
 
     /// Complete a successful preparation that carried no application payload.
@@ -398,11 +653,27 @@ impl ScoreReporter {
             source: feedback.source,
             tx: progress.tx,
             rx: progress.rx,
-            last_rx_at: progress.last_rx_at,
             eligible_rx_at: progress.eligible_rx_at,
             elapsed: now.saturating_duration_since(self.shared.started),
             count_usefulness,
         };
+        if feedback.source == ScoreSource::HealthProbe
+            && !matches!(
+                outcome,
+                ScoreOutcome::Success
+                    | ScoreOutcome::Rejected
+                    | ScoreOutcome::Cancelled
+                    | ScoreOutcome::Shutdown
+            )
+        {
+            feedback.state.fail_probe_at(
+                &feedback.authority,
+                &feedback.context,
+                &feedback.attributions,
+                &mut progress.cells,
+                feedback.probe_scope(),
+            );
+        }
         feedback.state.finish_at(
             &feedback.context,
             &feedback.attributions,
@@ -410,6 +681,7 @@ impl ScoreReporter {
             &sample,
             now,
         );
+        budget::finish(&feedback.state, &self.shared.work, outcome, now);
     }
 }
 

@@ -67,7 +67,7 @@ async fn send_timeout_after_reply_is_not_idle_success() {
     ));
     assert_eq!(
         score_driver_outcome(&endpoint, &send_timeout),
-        ScoreOutcome::Io(io::ErrorKind::TimedOut)
+        ScoreOutcome::Timeout
     );
 
     assert_eq!(
@@ -87,8 +87,69 @@ async fn send_timeout_after_reply_is_not_idle_success() {
         ScoreOutcome::Rejected
     );
     assert_eq!(
+        score_driver_outcome(
+            &endpoint,
+            &Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                honk_outbound::proxy::TargetFailure(anyhow::anyhow!("remote refused target")),
+            ))
+        ),
+        ScoreOutcome::TargetFailure
+    );
+    assert_eq!(
         score_driver_outcome(&endpoint, &idle_timeout),
         ScoreOutcome::Success
+    );
+}
+
+#[test]
+fn quic_stall_is_node_failure_without_overriding_neutral_boundaries() {
+    let relay = make_addr("127.0.0.1", 443);
+    let transport = Arc::new(ScriptedPacketTransport::new(relay, []));
+    let endpoint = driver_test_endpoint(Arc::clone(&transport), relay);
+    let congestion = Err(io::Error::new(io::ErrorKind::WouldBlock, "congested"));
+    let idle = Err(io::Error::new(io::ErrorKind::TimedOut, ReplyIdleTimeout));
+    assert_eq!(
+        score_driver_outcome(&endpoint, &congestion),
+        ScoreOutcome::Cancelled
+    );
+    assert_eq!(
+        score_driver_outcome(&endpoint, &idle),
+        ScoreOutcome::Timeout
+    );
+
+    transport.quic_path_stalled.store(true, Ordering::Release);
+    assert_eq!(
+        score_driver_outcome(&endpoint, &congestion),
+        ScoreOutcome::NodeFailure
+    );
+    assert_eq!(
+        score_driver_outcome(&endpoint, &idle),
+        ScoreOutcome::NodeFailure
+    );
+    endpoint.has_reply.store(true, Ordering::Relaxed);
+    assert_eq!(
+        score_driver_outcome(&endpoint, &idle),
+        ScoreOutcome::NodeFailure
+    );
+    assert_eq!(
+        score_driver_outcome(
+            &endpoint,
+            &Err(io::Error::from(
+                honk_outbound::proxy::PacketRejection::InvalidSize
+            )),
+        ),
+        ScoreOutcome::Rejected,
+    );
+    endpoint.kill();
+    assert_eq!(
+        score_driver_outcome(&endpoint, &idle),
+        ScoreOutcome::Success
+    );
+    endpoint.has_reply.store(false, Ordering::Relaxed);
+    assert_eq!(
+        score_driver_outcome(&endpoint, &idle),
+        ScoreOutcome::Cancelled
     );
 }
 
@@ -210,6 +271,7 @@ struct ScriptedPacketTransport {
     confirmed_sends: std::sync::atomic::AtomicUsize,
     send_progress: tokio::sync::Notify,
     allows_full_cone_replies: bool,
+    quic_path_stalled: AtomicBool,
 }
 
 impl ScriptedPacketTransport {
@@ -222,6 +284,7 @@ impl ScriptedPacketTransport {
             confirmed_sends: std::sync::atomic::AtomicUsize::new(0),
             send_progress: tokio::sync::Notify::new(),
             allows_full_cone_replies: false,
+            quic_path_stalled: AtomicBool::new(false),
         }
     }
 
@@ -238,6 +301,7 @@ impl ScriptedPacketTransport {
             confirmed_sends: std::sync::atomic::AtomicUsize::new(0),
             send_progress: tokio::sync::Notify::new(),
             allows_full_cone_replies: false,
+            quic_path_stalled: AtomicBool::new(false),
         }
     }
 
@@ -269,6 +333,10 @@ impl ScriptedPacketTransport {
 impl honk_outbound::proxy::PacketTransport for ScriptedPacketTransport {
     fn relay_addr(&self) -> SocketAddr {
         self.relay
+    }
+
+    fn quic_path_stalled(&self) -> bool {
+        self.quic_path_stalled.load(Ordering::Acquire)
     }
 
     fn allows_full_cone_replies(&self) -> bool {
@@ -1337,6 +1405,79 @@ async fn udp_ready_endpoint_survives_ordinary_reload_cancellation() {
 }
 
 #[tokio::test]
+async fn local_reply_failures_do_not_become_upstream_failures() {
+    for client in ["[::1]:12345", "127.0.0.1:0"] {
+        let client: SocketAddr = client.parse().unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay = peer.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            let mut packet = [0; 8];
+            let (len, source) = peer.recv_from(&mut packet).await.unwrap();
+            peer.send_to(&packet[..len], source).await.unwrap();
+        });
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let endpoint = Arc::new(UdpEndpoint::new(
+            transport(socket, relay),
+            relay,
+            TEST_NODE_ID,
+        ));
+        let pool = Arc::new(UdpEndpointPool::new());
+        let stats = Arc::new(StatsManager::new());
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let mut lease = match pool.reserve_or_enqueue(client, relay, b"request", permit, &stats) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("local reply fixture must initialize"),
+        };
+        let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
+        let (first_ack, ack) = oneshot::channel();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::run_endpoint_driver(
+                UdpDriverContext {
+                    endpoint: Arc::clone(&endpoint),
+                    queue_rx: lease.take_queue_receiver().unwrap(),
+                    reply_socket: Arc::new(ReplySocket::untracked(test_reply_socket().await)),
+                    reply_socket_factory: Arc::new(SystemUdpReplySocketFactory),
+                    reply_socket_slots: Arc::new(Semaphore::new(MAX_REPLY_SOCKETS_PER_ENDPOINT)),
+                    client_addr: client,
+                    client_dst: relay,
+                    alive_set: Arc::clone(&alive),
+                    stats: Arc::clone(&stats),
+                    outbound_tracker: stats
+                        .outbound_tracker("test-node", crate::stats::OutboundKind::Node),
+                    health_family: honk_outbound::alive::IpVersion::V4,
+                },
+                UdpDriverStart {
+                    first: lease.take_first().unwrap(),
+                    followers: Vec::new(),
+                },
+                first_ack,
+            ),
+        )
+        .await
+        .unwrap();
+        ack.await.unwrap().unwrap();
+        echo.await.unwrap();
+        assert_eq!(result.outcome, ScoreOutcome::Cancelled);
+        assert_eq!(
+            result.result.unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(endpoint.upload.load(Ordering::Relaxed), 7);
+        assert_eq!(endpoint.download.load(Ordering::Relaxed), 0);
+        assert!(
+            alive
+                .get_probe_history(
+                    TEST_NODE_ID,
+                    honk_outbound::alive::ProbeDomain::DataUdp,
+                    honk_outbound::alive::IpVersion::V4
+                )
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
 async fn udp_endpoint_reply_sources_follow_target_policy() {
     for target_is_domain in [false, true] {
         let source_socket_a = std::net::UdpSocket::bind("127.0.0.2:0").unwrap();
@@ -2100,7 +2241,7 @@ async fn udp_endpoint_pool_shutdown_aborts_stuck_initializer_task() {
 
 #[tokio::test]
 async fn udp_endpoint_driver_receive_and_reply_errors_clean_up() {
-    for (client, transport) in [
+    for (client, transport, upstream_failure) in [
         (
             make_addr("10.0.0.1", 12345),
             Arc::new(ScriptedPacketTransport::with_receive_actions(
@@ -2108,6 +2249,7 @@ async fn udp_endpoint_driver_receive_and_reply_errors_clean_up() {
                 [DriverSendAction::Ok],
                 [DriverReceiveAction::Error],
             )),
+            true,
         ),
         (
             make_addr("[::1]", 12345),
@@ -2119,6 +2261,7 @@ async fn udp_endpoint_driver_receive_and_reply_errors_clean_up() {
                     source: make_addr("192.168.1.1", 1080),
                 }],
             )),
+            false,
         ),
     ] {
         let pool = Arc::new(UdpEndpointPool::new());
@@ -2171,8 +2314,12 @@ async fn udp_endpoint_driver_receive_and_reply_errors_clean_up() {
             honk_outbound::alive::ProbeDomain::DataUdp,
             honk_outbound::alive::IpVersion::V4,
         );
-        assert_eq!(history.len(), 1);
-        assert!(!history[0].success);
+        if upstream_failure {
+            assert_eq!(history.len(), 1);
+            assert!(!history[0].success);
+        } else {
+            assert!(history.is_empty(), "local reply errors are health-neutral");
+        }
         assert!(matches!(
             removed_rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)

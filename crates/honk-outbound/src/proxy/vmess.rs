@@ -175,7 +175,7 @@ impl Session {
 
 /// How the relay task ended, when it failed: a rejected response header or
 /// an invalid chunk reads as that error, not as EOF.
-type RelayFailure = std::sync::Arc<std::sync::OnceLock<(std::io::ErrorKind, String)>>;
+type RelayFailure = std::sync::Arc<std::sync::OnceLock<(std::io::ErrorKind, crate::SharedError)>>;
 
 struct VmessStream {
     inner: tokio::io::DuplexStream,
@@ -202,10 +202,14 @@ async fn vmess_relay_recorded(
 ) {
     if let Err(error) = vmess_relay(server, &mut client, header_wire, session).await {
         let kind = error
-            .downcast_ref::<std::io::Error>()
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
             .map(std::io::Error::kind)
             .unwrap_or(std::io::ErrorKind::InvalidData);
-        let _ = failure.set((kind, format!("vmess: {error:#}")));
+        let _ = failure.set((
+            kind,
+            crate::SharedError::new(error.context("VMess relay failed")),
+        ));
     }
     drop(client);
 }
@@ -644,13 +648,18 @@ async fn vmess_relay(
             if chunk_len == GCM_TAG_LEN {
                 break;
             }
-            anyhow::ensure!(
-                chunk_len > GCM_TAG_LEN && chunk_len <= CHUNK_MAX_LEN + GCM_TAG_LEN,
-                "invalid VMess chunk size {chunk_len}"
-            );
+            if !(chunk_len > GCM_TAG_LEN && chunk_len <= CHUNK_MAX_LEN + GCM_TAG_LEN) {
+                return Err(crate::proxy::NodeFailure(
+                    anyhow::anyhow!("invalid VMess chunk size {chunk_len}")
+                        .context("VMess response body"),
+                )
+                .into());
+            }
             let mut ct = vec![0u8; chunk_len];
             server_read.read_exact(&mut ct).await?;
-            let n = body.open_chunk(&mut ct)?;
+            let n = body
+                .open_chunk(&mut ct)
+                .map_err(|error| crate::proxy::NodeFailure(error.context("VMess response body")))?;
             client_write.write_all(&ct[..n]).await?;
         }
         Ok::<(), anyhow::Error>(())
@@ -676,38 +685,50 @@ async fn read_response_header<R: AsyncReadExt + Unpin>(
     session: &Session,
 ) -> anyhow::Result<()> {
     let mut len_ct = [0u8; 2 + GCM_TAG_LEN];
-    reader.read_exact(&mut len_ct).await?;
-    let len_plain = VmessHandler::open(
-        &kdf16(&session.resp_key, KDF_SALT_RESP_LEN_KEY, &[]),
-        &kdf12(&session.resp_iv, KDF_SALT_RESP_LEN_IV, &[]),
-        &len_ct,
-    )
-    .map_err(|e| anyhow::anyhow!("VMess response header length decrypt failed: {:?}", e))?;
-    let hdr_len = u16::from_be_bytes([len_plain[0], len_plain[1]]) as usize;
-    anyhow::ensure!(
-        (4..=256).contains(&hdr_len),
-        "invalid VMess response header length {hdr_len}"
-    );
+    let received = reader.read(&mut len_ct).await.map_err(|error| {
+        crate::proxy::NodeFailure(anyhow::Error::new(error).context("VMess response header"))
+    })?;
+    // sing-vmess writes its response header lazily with the first target data;
+    // no response bytes cannot distinguish target closure from a carrier fault.
+    if received == 0 {
+        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+    }
+    async {
+        reader.read_exact(&mut len_ct[received..]).await?;
+        let len_plain = VmessHandler::open(
+            &kdf16(&session.resp_key, KDF_SALT_RESP_LEN_KEY, &[]),
+            &kdf12(&session.resp_iv, KDF_SALT_RESP_LEN_IV, &[]),
+            &len_ct,
+        )
+        .map_err(|e| anyhow::anyhow!("VMess response header length decrypt failed: {:?}", e))?;
+        let hdr_len = u16::from_be_bytes([len_plain[0], len_plain[1]]) as usize;
+        anyhow::ensure!(
+            (4..=256).contains(&hdr_len),
+            "invalid VMess response header length {hdr_len}"
+        );
 
-    let mut hdr_ct = vec![0u8; hdr_len + GCM_TAG_LEN];
-    reader.read_exact(&mut hdr_ct).await?;
-    let hdr = VmessHandler::open(
-        &kdf16(&session.resp_key, KDF_SALT_RESP_KEY, &[]),
-        &kdf12(&session.resp_iv, KDF_SALT_RESP_IV, &[]),
-        &hdr_ct,
-    )
-    .map_err(|e| anyhow::anyhow!("VMess response header decrypt failed: {:?}", e))?;
+        let mut hdr_ct = vec![0u8; hdr_len + GCM_TAG_LEN];
+        reader.read_exact(&mut hdr_ct).await?;
+        let hdr = VmessHandler::open(
+            &kdf16(&session.resp_key, KDF_SALT_RESP_KEY, &[]),
+            &kdf12(&session.resp_iv, KDF_SALT_RESP_IV, &[]),
+            &hdr_ct,
+        )
+        .map_err(|e| anyhow::anyhow!("VMess response header decrypt failed: {:?}", e))?;
 
-    anyhow::ensure!(
-        hdr[0] == session.resp_header,
-        "unexpected VMess response header byte {:#x}, expected {:#x}",
-        hdr[0],
-        session.resp_header
-    );
-    // hdr[1] option, hdr[2] command id, hdr[3] command data length; the
-    // command data rides inside the same header block and carries nothing
-    // a plain TCP outbound needs.
-    Ok(())
+        anyhow::ensure!(
+            hdr[0] == session.resp_header,
+            "unexpected VMess response header byte {:#x}, expected {:#x}",
+            hdr[0],
+            session.resp_header
+        );
+        // hdr[1] option, hdr[2] command id, hdr[3] command data length; the
+        // command data rides inside the same header block and carries nothing
+        // a plain TCP outbound needs.
+        Ok::<(), anyhow::Error>(())
+    }
+    .await
+    .map_err(|error| crate::proxy::NodeFailure(error.context("VMess response header")).into())
 }
 
 #[cfg(test)]

@@ -1,10 +1,16 @@
-use super::ranking::{exploration_period, exploration_target, score_snapshot};
+use super::budget::exploration_target;
+use super::ranking::score_snapshot;
 use super::*;
 use honk_config::group::{Group, GroupPolicy};
 use honk_config::node::Node;
 mod attribution;
 mod availability;
+mod budget;
+mod budget_projection;
 mod cadence;
+mod comparison;
+mod directional;
+mod evaluation;
 mod evidence;
 mod live;
 mod performance;
@@ -13,6 +19,7 @@ mod progress;
 mod reasons;
 mod selection;
 mod verification;
+mod verification_boundaries;
 
 fn assert_close(actual: f64, expected: f64) {
     assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
@@ -92,6 +99,8 @@ fn finish_success(plan: &super::super::ScoreSelectionPlan<'_>) {
         .feedback
         .as_ref()
         .expect("Score candidate must carry feedback")
+        .begin()
+        .expect("current Score plan must admit work")
         .start();
     reporter.setup_succeeded();
     reporter.tx(1);
@@ -103,8 +112,18 @@ fn finish_failure(plan: &super::super::ScoreSelectionPlan<'_>) {
         .feedback
         .as_ref()
         .expect("Score candidate must carry feedback")
+        .begin()
+        .expect("current Score plan must admit work")
         .start()
         .setup_failed(ScoreOutcome::Timeout);
+}
+
+fn respond_at(attempt: ScoreAttempt, latency: Duration, now: Instant) {
+    let reporter = attempt.begin_at(now).unwrap().start_at(now);
+    reporter.setup_succeeded_at(now);
+    reporter.first_response_at(now + latency);
+    reporter.transfer_at(1, 1, now + latency);
+    reporter.finish_at(ScoreOutcome::Success, true, now + latency);
 }
 
 fn selected(manager: &super::super::GroupManager, context: &ScoreSelectionContext) -> Uuid {
@@ -114,6 +133,19 @@ fn selected(manager: &super::super::GroupManager, context: &ScoreSelectionContex
 }
 
 fn train_at(
+    manager: &GroupManager,
+    leaf: &Node,
+    target: &ScoreSelectionContext,
+    samples: usize,
+    response_ms: u64,
+    download: u64,
+    now: Instant,
+) {
+    let response = Duration::from_millis(response_ms);
+    train_response_at(manager, leaf, target, samples, response, download, now);
+}
+
+fn train_response_at(
     manager: &GroupManager,
     leaf: &Node,
     target: &ScoreSelectionContext,
@@ -145,6 +177,24 @@ fn probe_at(
     manager: &GroupManager,
     leaf: &Node,
     probe_context: &ScoreSelectionContext,
+    latency_ms: u64,
+    now: Instant,
+) {
+    let latency = Duration::from_millis(latency_ms);
+    probe_source_at(
+        manager,
+        leaf,
+        probe_context,
+        ScoreSource::HealthProbe,
+        latency,
+        now,
+    );
+}
+
+fn probe_source_at(
+    manager: &GroupManager,
+    leaf: &Node,
+    probe_context: &ScoreSelectionContext,
     source: ScoreSource,
     latency: Duration,
     now: Instant,
@@ -170,4 +220,56 @@ fn rank_at(
     manager
         .score_state()
         .rank_at("score", target, &nodes.iter().collect::<Vec<_>>(), now)
+}
+
+/// A decision's pairs with the covered joint projection, as `ranking::decision` builds them.
+fn pairs_at(
+    inner: &StateInner,
+    target: &ScoreSelectionContext,
+    refs: &[&Node],
+    scores: (&[ScoreSnapshot], PerformanceBaseline),
+    membership: (&super::evaluation::Membership, usize),
+    now: Instant,
+) -> super::comparison::PairCohort {
+    let view = super::comparison::View::new(inner, "score", target, refs, now);
+    let mut pairs = view.pairs(scores, membership);
+    view.join(&mut pairs, membership.0);
+    pairs
+}
+
+fn decision_at(
+    inner: &StateInner,
+    nodes: &[Node],
+    target: &ScoreSelectionContext,
+    reference: usize,
+    now: Instant,
+) -> ranking::Decision {
+    let refs = nodes.iter().collect::<Vec<_>>();
+    let scores = nodes
+        .iter()
+        .map(|node| score_snapshot(inner, "score", target, node.id, now))
+        .collect::<Vec<_>>();
+    let baseline = ranking::performance_baseline(&scores);
+    // Comparison unit tests exercise every member; bounding is covered by evaluation tests.
+    let membership = super::evaluation::Membership::all(nodes.len());
+    let evidence = super::comparison::View::new(inner, "score", target, &refs, now)
+        .node_evidence(&scores, &membership.evaluated);
+    let pairs = pairs_at(
+        inner,
+        target,
+        &refs,
+        (&scores, baseline),
+        (&membership, reference),
+        now,
+    );
+    let ordinary = ranking::ordinary_selection(&scores, &refs, Some(reference), baseline, &pairs);
+    ranking::Decision {
+        scores,
+        evidence,
+        pairs,
+        baseline,
+        ordinary,
+        evaluation: Default::default(),
+        membership,
+    }
 }

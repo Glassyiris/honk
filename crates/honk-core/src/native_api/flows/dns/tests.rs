@@ -438,6 +438,7 @@ async fn selection_evidence_keeps_the_consumed_catalog_after_group_recreation() 
                             health_family: IpVersion::V4,
                             target: None,
                         },
+                        None,
                     )
                 });
                 let rows = selection_evaluated(plan.observation.as_deref());

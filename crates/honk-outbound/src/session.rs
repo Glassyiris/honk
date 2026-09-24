@@ -772,7 +772,7 @@ impl<S: ManagedSession + 'static> SessionPool<S> {
                                                 )
                                             },
                                         );
-                                        DialSignal::Failed(crate::SharedError::new(e.context(context)))
+                                        DialSignal::Failed(crate::SharedError::fanout(e.context(context)))
                                     }
                                     Err(_panic) => {
                                         pool.dial_failures += 1;

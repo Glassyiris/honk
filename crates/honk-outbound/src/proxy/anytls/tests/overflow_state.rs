@@ -12,7 +12,10 @@ fn overflow_terminal_events_cap_per_stream() {
         OverflowAction::Parked
     ));
     assert!(matches!(
-        overflow.admit(1, StreamEvent::Error(Arc::from("x"))),
+        overflow.admit(
+            1,
+            StreamEvent::Error(crate::SharedError::new(anyhow::anyhow!("x")))
+        ),
         OverflowAction::Parked
     ));
 

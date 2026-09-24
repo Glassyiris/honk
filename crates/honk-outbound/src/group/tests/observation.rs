@@ -317,7 +317,7 @@ fn rejected_family_and_final_preflight_survive_ipv4_fallback() {
     let manager = GroupManager::with_alive_set(&[group], &nodes, Some(alive));
     let context = context(SelectionNetwork::Udp, IpVersion::V6);
     let plan = observer()
-        .sync_scope(|| manager.selection_plan_for_target_with_health_fallback("g", &context));
+        .sync_scope(|| manager.selection_plan_for_target_with_health_fallback("g", &context, None));
     assert_eq!(plan.health_family, IpVersion::V4);
     assert_eq!(plan.entries[0].node.id, nodes[0].id);
     let facts = plan.observation.unwrap();
@@ -488,7 +488,7 @@ fn retry_plan_keeps_evaluated_candidates_beyond_the_attempt_limit() {
     }
     let manager = GroupManager::with_alive_set(&[group], &nodes, Some(alive));
     let context = context(SelectionNetwork::Tcp, IpVersion::V4);
-    let plan = observer().sync_scope(|| manager.urltest_retry_plan_for_target("g", &context));
+    let plan = observer().sync_scope(|| manager.urltest_retry_plan_for_target("g", &context, None));
     assert_eq!(
         plan.entries
             .iter()

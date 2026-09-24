@@ -113,8 +113,20 @@ fn recovery_keeps_nested_selector_permissions_health_and_attribution() {
     let primary = manager.selection_plan_for_target("outer", &context);
     let failed_node = primary.entries[0].node.id;
     let final_owners = &primary.entries[0].final_owners;
-    let recovery =
-        manager.score_retry_plan_for_target("outer", &context, failed_node, final_owners);
+    let business = primary.entries[0]
+        .feedback
+        .as_ref()
+        .unwrap()
+        .begin()
+        .unwrap();
+    let original = business.continuation();
+    let recovery = manager.score_retry_plan_for_target(
+        "outer",
+        &context,
+        failed_node,
+        final_owners,
+        &original,
+    );
     assert_eq!(recovery.entries.len(), 1);
     assert_ne!(recovery.entries[0].node.id, failed_node);
     assert_eq!(
@@ -127,7 +139,7 @@ fn recovery_keeps_nested_selector_permissions_health_and_attribution() {
     alive.report_unavailable_forced(recovery.entries[0].node.id, ProbeDomain::Tcp, IpVersion::V4);
     assert!(
         manager
-            .score_retry_plan_for_target("outer", &context, failed_node, final_owners)
+            .score_retry_plan_for_target("outer", &context, failed_node, final_owners, &original)
             .entries
             .is_empty()
     );
@@ -136,7 +148,7 @@ fn recovery_keeps_nested_selector_permissions_health_and_attribution() {
         .unwrap();
     assert!(
         manager
-            .score_retry_plan_for_target("outer", &context, failed_node, final_owners)
+            .score_retry_plan_for_target("outer", &context, failed_node, final_owners, &original)
             .entries
             .is_empty()
     );
@@ -154,12 +166,19 @@ fn recovery_does_not_open_node_final_with_duplicate_display_name() {
     let context = context("duplicate-final.example", IpVersion::V4);
     let primary = manager.selection_plan_for_target("score", &context);
     assert_eq!(primary.entries[0].node.id, nodes[1].id);
+    let business = primary.entries[0]
+        .feedback
+        .as_ref()
+        .unwrap()
+        .begin()
+        .unwrap();
 
     let recovery = manager.score_retry_plan_for_target(
         "score",
         &context,
         primary.entries[0].node.id,
         &primary.entries[0].final_owners,
+        &business.continuation(),
     );
     assert!(
         recovery.entries.is_empty(),
@@ -182,6 +201,12 @@ fn recovery_does_not_turn_ordinary_child_into_final_after_parent_url_failure() {
     let context = context("parent-final.example", IpVersion::V4);
     let primary = manager.selection_plan_for_target("parent", &context);
     assert_eq!(primary.entries[0].node.id, nodes[0].id);
+    let business = primary.entries[0]
+        .feedback
+        .as_ref()
+        .unwrap()
+        .begin()
+        .unwrap();
 
     for _ in 0..3 {
         alive.record_url_probe_failure("child", url);
@@ -192,6 +217,7 @@ fn recovery_does_not_turn_ordinary_child_into_final_after_parent_url_failure() {
         &context,
         primary.entries[0].node.id,
         &primary.entries[0].final_owners,
+        &business.continuation(),
     );
     assert!(
         recovery.entries.is_empty(),
@@ -251,7 +277,7 @@ fn selector_parent_peeks_unchosen_score_subgroups() {
     assert_eq!(
         state
             .selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp)
-            .cold_explore,
+            .performance_winner,
         1
     );
     assert_eq!(
@@ -275,13 +301,13 @@ fn selector_parent_peeks_unchosen_score_subgroups() {
     assert_eq!(
         state
             .selection_reason_counts("sel-sub-b", SelectionNetwork::Tcp)
-            .cold_explore,
+            .performance_winner,
         1
     );
     assert_eq!(
         state
             .selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp)
-            .cold_explore,
+            .performance_winner,
         1
     );
 
@@ -295,8 +321,24 @@ fn selector_parent_peeks_unchosen_score_subgroups() {
         .unwrap();
     let before_a = state.selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp);
     let before_b = state.selection_reason_counts("sel-sub-b", SelectionNetwork::Tcp);
-    let _ = manager
+    let plan = manager
         .selection_plan_for_target("sel-parent", &context("sel-target.internal", IpVersion::V4));
+    let pending = manager.score_budget_counters("sel-sub-a", SelectionNetwork::Tcp);
+    assert_eq!(
+        (
+            pending.reserved,
+            pending.business_starts,
+            pending.trial_starts
+        ),
+        (1, 0, 0)
+    );
+    assert_eq!(
+        manager
+            .score_budget_counters("sel-sub-b", SelectionNetwork::Tcp)
+            .reserved,
+        0
+    );
+    drop(plan);
     assert_ne!(
         state.selection_reason_counts("sel-sub-a", SelectionNetwork::Tcp),
         before_a
@@ -343,7 +385,7 @@ fn selector_commit_follows_non_first_default() {
     assert_eq!(
         state
             .selection_reason_counts("def-sub-b", SelectionNetwork::Tcp)
-            .cold_explore,
+            .performance_winner,
         1
     );
     assert_eq!(
@@ -456,7 +498,7 @@ fn selector_commit_does_not_restore_a_stale_sibling() {
                     &mut visited,
                     0,
                     SelectionEffects::Apply,
-                    None,
+                    super::super::selection::ScoreSelectionRules::default(),
                 )
             } else {
                 manager.flatten_candidates(
@@ -481,7 +523,7 @@ fn selector_commit_does_not_restore_a_stale_sibling() {
                 &mut visited,
                 0,
                 SelectionEffects::Apply,
-                None,
+                super::super::selection::ScoreSelectionRules::default(),
             );
             results.push(committed.map(|candidate| candidate.node.id));
         }

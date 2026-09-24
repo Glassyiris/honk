@@ -1,3 +1,4 @@
+use super::padding::{H2MUX_BACKEND, PADDED_RECORDS};
 use super::*;
 use crate::session::SpeculativeCheckout;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -287,7 +288,9 @@ async fn tcp_receive_window_admits_one_megabyte_before_reads() {
             let mut response = BytesMut::with_capacity(PAYLOAD_SIZE + 1);
             response.extend_from_slice(&[0]);
             response.resize(PAYLOAD_SIZE + 1, 0x5a);
-            send_owned(&mut send, response.freeze()).await.unwrap();
+            send_owned(&mut send, &Default::default(), response.freeze())
+                .await
+                .unwrap();
             send.send_data(Bytes::new(), true).unwrap();
             let _ = sent.send(());
         });
@@ -341,7 +344,9 @@ async fn stalled_tcp_stream_leaves_connection_credit_for_udp() {
                     let mut response = BytesMut::with_capacity(H2_STREAM_RECV_WINDOW as usize);
                     response.extend_from_slice(&[0]);
                     response.resize(H2_STREAM_RECV_WINDOW as usize, 0x5a);
-                    send_owned(&mut send, response.freeze()).await.unwrap();
+                    send_owned(&mut send, &Default::default(), response.freeze())
+                        .await
+                        .unwrap();
                     send.send_data(Bytes::new(), true).unwrap();
                     let _ = filled.send(());
                 }));
@@ -690,8 +695,19 @@ async fn carrier_failure_fans_out_and_stream_capacity_is_bounded() {
     drop_tx.send(()).unwrap();
     server.await.unwrap();
     let mut byte = [0];
-    assert!(first.read_exact(&mut byte).await.is_err());
-    assert!(second.read_exact(&mut byte).await.is_err());
+    let mut outcomes = Vec::new();
+    for stream in [&mut first, &mut second] {
+        let error = stream.read_exact(&mut byte).await.unwrap_err();
+        outcomes.push(crate::group::ScoreOutcome::from_io_error(&error));
+    }
+    assert!(matches!(
+        outcomes[0],
+        crate::group::ScoreOutcome::SharedNodeFailure(_)
+    ));
+    assert_eq!(
+        outcomes[0], outcomes[1],
+        "one carrier failure is one episode"
+    );
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         while !session.is_closed() {
             tokio::task::yield_now().await;
@@ -740,79 +756,126 @@ async fn dropping_logical_stream_sends_cancel_reset() {
 }
 
 #[tokio::test]
-async fn remote_no_error_reset_is_clean_eof_after_payload() {
-    let (client, server) = tokio::io::duplex(1 << 20);
-    let (reset_tx, reset_rx) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(async move {
-        let io = server_carrier(server, false).await;
-        let mut connection = h2::server::handshake(io).await.unwrap();
-        let (_request, mut respond) = connection.accept().await.unwrap().unwrap();
-        let mut send = respond
-            .send_response(http::Response::new(()), false)
-            .unwrap();
-        send.send_data(Bytes::from_static(b"\0payload"), false)
-            .unwrap();
-        tokio::select! {
-            result = reset_rx => result.unwrap(),
-            request = connection.accept() => {
-                panic!("unexpected H2 event while awaiting reset: {request:?}");
+async fn remote_no_error_close_keeps_half_close_failure_stream_scoped() {
+    for end_stream in [false, true] {
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let (reset_tx, reset_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let io = server_carrier(server, false).await;
+            let mut connection = h2::server::handshake(io).await.unwrap();
+            let (_request, mut respond) = connection.accept().await.unwrap().unwrap();
+            let mut send = respond
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            send.send_data(Bytes::from_static(b"\0payload"), end_stream)
+                .unwrap();
+            tokio::select! {
+                result = reset_rx => result.unwrap(),
+                request = connection.accept() => {
+                    panic!("unexpected H2 event while awaiting reset: {request:?}");
+                }
             }
-        }
-        send.send_reset(h2::Reason::NO_ERROR);
-        while connection.accept().await.is_some() {}
-    });
-    let session = connect(Box::new(client), false).await.unwrap();
-    let mut stream = Arc::clone(&session)
-        .open_stream(
-            session.try_reserve().unwrap(),
-            "93.184.216.34:443".parse().unwrap(),
-            None,
+            // Go's HTTP/2 server resets an unfinished request with NO_ERROR
+            // after its handler has sent a complete response.
+            send.send_reset(h2::Reason::NO_ERROR);
+            while let Some(request) = connection.accept().await {
+                let (request, respond) = request.unwrap();
+                tokio::spawn(serve_logical_stream(request, respond));
+            }
+        });
+        let session = connect(Box::new(client), false).await.unwrap();
+        let mut stream = Arc::clone(&session)
+            .open_stream(
+                session.try_reserve().unwrap(),
+                "93.184.216.34:443".parse().unwrap(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|_| panic!("logical stream must open"));
+        let mut payload = [0; 7];
+        stream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"payload");
+        reset_tx.send(()).unwrap();
+        let reason = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            std::future::poll_fn(|cx| stream.send.inner.poll_reset(cx)),
         )
         .await
-        .unwrap_or_else(|_| panic!("logical stream must open"));
-    let mut payload = [0; 7];
-    stream.read_exact(&mut payload).await.unwrap();
-    assert_eq!(&payload, b"payload");
-    reset_tx.send(()).unwrap();
-    assert_eq!(
-        stream.read_u8().await.unwrap_err().kind(),
-        io::ErrorKind::UnexpectedEof
-    );
-    drop(stream);
-    session.close();
-    server.await.unwrap();
+        .unwrap()
+        .unwrap();
+        assert_eq!(reason, h2::Reason::NO_ERROR);
+        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+        let error = stream.shutdown().await.unwrap_err();
+        assert_eq!(
+            crate::group::ScoreOutcome::from_io_error(&error),
+            crate::group::ScoreOutcome::Io(io::ErrorKind::ConnectionReset)
+        );
+        let mut sibling = Arc::clone(&session)
+            .open_stream(
+                session.try_reserve().unwrap(),
+                "93.184.216.34:443".parse().unwrap(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|_| panic!("remote stream closure must keep its carrier usable"));
+        sibling.read_exact(&mut [0; 5]).await.unwrap();
+        sibling.write_all(b"ping").await.unwrap();
+        let mut pong = [0; 4];
+        sibling.read_exact(&mut pong).await.unwrap();
+        assert_eq!(&pong, b"pong");
+        drop((stream, sibling));
+        session.close();
+        server.await.unwrap();
+    }
 }
 
 #[tokio::test]
-async fn mux_body_error_is_reported_lazily() {
-    let (client, server) = tokio::io::duplex(1 << 20);
-    let server = tokio::spawn(async move {
-        let io = server_carrier(server, false).await;
-        let mut connection = h2::server::handshake(io).await.unwrap();
-        let (request, mut respond) = connection.accept().await.unwrap().unwrap();
-        assert_eq!(request.method(), http::Method::CONNECT);
-        let mut send = respond
-            .send_response(http::Response::new(()), false)
-            .unwrap();
-        send.send_data(Bytes::from_static(&[1, 3, b'b', b'a', b'd']), true)
-            .unwrap();
-        while connection.accept().await.is_some() {}
-    });
-    let session = connect(Box::new(client), false).await.unwrap();
-    let mut stream = Arc::clone(&session)
-        .open_stream(
-            session.try_reserve().unwrap(),
-            "93.184.216.34:443".parse().unwrap(),
-            None,
-        )
-        .await
-        .unwrap_or_else(|_| panic!("logical stream must open before lazy rejection"));
-    let error = stream.read_u8().await.unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
-    assert!(error.to_string().contains("bad"));
-    drop(stream);
-    session.close();
-    server.await.unwrap();
+async fn mux_refusal_distinguishes_target_status_from_http_envelope() {
+    for envelope in [false, true] {
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let server = tokio::spawn(async move {
+            let io = server_carrier(server, false).await;
+            let mut connection = h2::server::handshake(io).await.unwrap();
+            let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+            assert_eq!(request.method(), http::Method::CONNECT);
+            let mut response = http::Response::new(());
+            if envelope {
+                *response.status_mut() = http::StatusCode::FORBIDDEN;
+            }
+            let mut send = respond.send_response(response, envelope).unwrap();
+            if !envelope {
+                send.send_data(Bytes::from_static(&[1, 3, b'b', b'a', b'd']), true)
+                    .unwrap();
+            }
+            while connection.accept().await.is_some() {}
+        });
+        let session = connect(Box::new(client), false).await.unwrap();
+        let mut stream = Arc::clone(&session)
+            .open_stream(
+                session.try_reserve().unwrap(),
+                "93.184.216.34:443".parse().unwrap(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|_| panic!("logical stream must open before lazy rejection"));
+        let error = stream.read_u8().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        let outcome = crate::group::ScoreOutcome::from_io_error(&error);
+        if envelope {
+            assert!(outcome.is_node_failure(), "{outcome:?}");
+        } else {
+            assert_eq!(outcome, crate::group::ScoreOutcome::TargetFailure);
+        }
+        let repeated = stream.read_u8().await.unwrap_err();
+        assert_eq!(
+            crate::group::ScoreOutcome::from_io_error(&repeated),
+            outcome,
+            "a replayed refusal is the same event"
+        );
+        drop(stream);
+        session.close();
+        server.await.unwrap();
+    }
 }
 
 #[cfg(feature = "native-api")]

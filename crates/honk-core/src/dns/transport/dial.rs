@@ -57,7 +57,7 @@ where
             error = %error,
             "DNS dial failed; trying next address"
         );
-        last_error = Some(anyhow::anyhow!("{label} dial to {address}: {error}"));
+        last_error = Some(error.context(format!("{label} dial to {address}")));
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("{label} resolved to no addresses")))
 }

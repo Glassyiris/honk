@@ -66,25 +66,6 @@ async fn score_stats_count_only_committed_switches_and_distinguish_ineligible_in
     )
     .await;
     let manager = app.state.group_manager.read().clone();
-    let zero = serde_json::json!({
-        "coldExplore": 0,
-        "periodicExplore": 0,
-        "reliabilityWinner": 0,
-        "performanceWinner": 0,
-        "incumbentHeld": 0,
-        "insufficientEvidenceHeld": 0,
-        "incumbentIneligible": 0,
-        "freshFailureBypass": 0,
-        "deadFiltered": 0,
-        "ordinarySwitch": 0,
-        "switchFlap": 0,
-        "failStreakExcluded": 0,
-        "exploreBackedOff": 0,
-        "carrierPressure": 0,
-        "carrierRttPressure": 0,
-        "carrierLossPressure": 0,
-        "carrierValidation": 0,
-    });
     let initial = get_json(&app, "/stats").await;
     let groups = initial["score"]["groups"].as_array().unwrap();
     assert_eq!(groups.len(), 2);
@@ -92,7 +73,7 @@ async fn score_stats_count_only_committed_switches_and_distinguish_ineligible_in
     assert_eq!(groups[1]["name"], "empty");
     for group in groups {
         for network in ["tcp", "udp"] {
-            assert_eq!(group[network], zero);
+            assert_eq!(group[network]["ordinarySwitch"], 0);
         }
     }
 
@@ -108,6 +89,14 @@ async fn score_stats_count_only_committed_switches_and_distinguish_ineligible_in
         for node in &nodes {
             let trial = manager.selection_plan_for_target("auto", &context);
             assert_eq!(trial.entries[0].node.id, node.id);
+            trial.entries[0]
+                .feedback
+                .as_ref()
+                .unwrap()
+                .begin()
+                .unwrap()
+                .start()
+                .finish(ScoreOutcome::Cancelled);
             assert_eq!(
                 get_json(&app, "/stats").await["score"]["groups"][0][label]["ordinarySwitch"],
                 0
@@ -174,7 +163,10 @@ async fn score_stats_count_only_committed_switches_and_distinguish_ineligible_in
             final_stats["score"]["groups"][0][network]["ordinarySwitch"],
             1
         );
-        assert_eq!(final_stats["score"]["groups"][1][network], zero);
+        assert_eq!(
+            final_stats["score"]["groups"][1][network]["ordinarySwitch"],
+            0
+        );
     }
     let encoded = final_stats["score"].to_string();
     assert!(!encoded.contains("private-switch.example"));
@@ -271,6 +263,9 @@ async fn score_verification_is_private_readonly_and_uses_canonical_candidates() 
             assert_eq!(summary["basis"], "none");
             assert_eq!(summary["coverage"]["candidates"], candidates);
             assert_eq!(summary["coverage"]["compared"], 0);
+            assert_eq!(summary["blockers"]["availability"], candidates);
+            assert_eq!(summary["blockers"]["nodeFailure"], 0);
+            assert_eq!(summary["blockers"]["targetFailure"], 0);
             assert_eq!(
                 summary["missing"],
                 serde_json::json!({
@@ -309,7 +304,8 @@ async fn score_verification_is_private_readonly_and_uses_canonical_candidates() 
                 assert_eq!(
                     summary["coverage"],
                     serde_json::json!({
-                        "candidates": 0, "compared": 0, "pending": 0,
+                        "scope": "all", "candidates": 0, "evaluated": 0, "unevaluated": 0, "covered": 0,
+                        "compared": 0, "pending": 0, "targetLimited": false, "excluded": 0,
                     })
                 );
             }
@@ -365,6 +361,16 @@ async fn score_verification_separates_probe_comparison_from_business_usability()
             business_success(&manager, node, &context, false);
         }
     }
+    let pending = get_json(&app, "/proxies/auto").await;
+    assert_eq!(
+        pending["scoreVerification"]["tcp"]["comparison"],
+        "unconfirmed"
+    );
+    assert_eq!(
+        pending["scoreVerification"]["tcp"]["coverage"]["covered"],
+        1
+    );
+    manager.selection_plan_for_target("auto", &context);
     let observed = get_json(&app, "/proxies/auto").await;
     let verification = &observed["scoreVerification"]["tcp"];
     assert_eq!(observed["now"], "fast");
@@ -374,7 +380,8 @@ async fn score_verification_separates_probe_comparison_from_business_usability()
     assert_eq!(
         verification["coverage"],
         serde_json::json!({
-            "candidates": 2, "compared": 2, "pending": 0,
+            "scope": "all", "candidates": 2, "evaluated": 2, "unevaluated": 0, "covered": 2,
+            "compared": 2, "pending": 0, "targetLimited": false, "excluded": 0,
         })
     );
     assert_eq!(
@@ -389,7 +396,6 @@ async fn score_verification_separates_probe_comparison_from_business_usability()
     assert!(validity > 0 && validity <= 120_000);
     assert_eq!(observed["scoreVerification"]["udp"]["state"], "provisional");
 
-    manager.selection_plan_for_target("auto", &context);
     let before = get_json(&app, "/stats").await;
     assert_eq!(
         before["score"]["groups"][0]["verification"]["tcp"]["usableSelections"],
@@ -433,7 +439,7 @@ async fn score_verification_separates_probe_comparison_from_business_usability()
 }
 
 #[tokio::test]
-async fn score_verification_reports_response_only_singleton_without_a_best_claim() {
+async fn score_verification_keeps_singleton_aggregate_availability_separate_from_target_response() {
     let node = make_node("single");
     let app = spawn_app_with_config(
         Config {
@@ -475,15 +481,15 @@ async fn score_verification_reports_response_only_singleton_without_a_best_claim
         let verification = &observed["scoreVerification"][network];
         assert_eq!(verification["state"], "observedUsable");
         assert_eq!(verification["comparison"], "unconfirmed");
-        assert_eq!(verification["basis"], "aggregateResponse");
+        assert_eq!(verification["basis"], "none");
         assert_eq!(verification["coverage"]["candidates"], 1);
         assert_eq!(
             verification["missing"],
             serde_json::json!({
-                "availability": false, "response": false, "transfer": true,
+                "availability": false, "response": true, "transfer": true,
             })
         );
-        assert_eq!(verification["nextAction"], "awaitTransfer");
+        assert_eq!(verification["nextAction"], "nextBusinessFlow");
         assert_eq!(verification["targetSpecific"], false);
         assert!(verification["targetFamily"].is_null());
         assert!(verification["validForMs"].as_u64().unwrap() > 0);

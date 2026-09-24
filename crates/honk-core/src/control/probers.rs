@@ -12,19 +12,25 @@ fn probe_feedback(
     manager: &SharedGroupManager,
     node_id: uuid::Uuid,
     context: ScoreSelectionContext,
+    interval: Duration,
 ) -> Option<ScoreFeedback> {
     manager
         .read()
         .feedback_for_node(node_id, context)
-        .map(|feedback| feedback.with_source(ScoreSource::HealthProbe))
+        .map(|feedback| {
+            feedback
+                .with_source(ScoreSource::HealthProbe)
+                .with_probe_interval(interval)
+        })
 }
 
 fn start_probe_feedback(
     manager: &SharedGroupManager,
     node_id: uuid::Uuid,
     context: ScoreSelectionContext,
+    interval: Duration,
 ) -> ProbeReporter {
-    probe_feedback(manager, node_id, context).map(|feedback| feedback.start())
+    probe_feedback(manager, node_id, context, interval).map(|feedback| feedback.start())
 }
 
 fn probe_finish(reporter: &ProbeReporter, outcome: ScoreOutcome) {
@@ -143,7 +149,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 ))
                 .into();
             };
-            let (connect_timeout, default_probe_url) = match config.try_read() {
+            let (connect_timeout, default_probe_url, probe_interval) = match config.try_read() {
                 Ok(config) => (
                     Duration::from_millis(config.global.connect_timeout_ms),
                     config
@@ -152,6 +158,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                         .first()
                         .cloned()
                         .unwrap_or_default(),
+                    Duration::from_secs(config.global.check_interval_secs),
                 ),
                 Err(_) => {
                     return honk_outbound::alive::HttpProbeResult::SetupFailure(
@@ -210,6 +217,7 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                         ProbeDomain::Tcp,
                         target_family(addr),
                     ),
+                    probe_interval,
                 )
                 .map(|feedback| feedback.with_source(ScoreSource::Warmup))
             };
@@ -239,12 +247,15 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 .into();
             }
 
-            let feedback = group_manager.read().feedback_for_http_probe(
-                node.id,
-                http_probe_context(&request, addr),
-                &check_url,
-                &default_probe_url,
-            );
+            let feedback = group_manager
+                .read()
+                .feedback_for_http_probe(
+                    node.id,
+                    http_probe_context(&request, addr),
+                    &check_url,
+                    &default_probe_url,
+                )
+                .map(|feedback| feedback.with_probe_interval(probe_interval));
             let result = cancel
                 .run(runtime.scope_tasks(generation.scope_dials(
                     honk_outbound::urltest::measure_http_probe(
@@ -517,14 +528,15 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
             let Some(packet) = entry.packet.clone() else {
                 return failed(format!("protocol {:?} has no UDP capability", protocol));
             };
-            let connect_timeout = {
+            let (connect_timeout, probe_interval) = {
                 let config = config
                     .try_read()
                     .map_err(|_| "config lock busy".to_string());
                 match config {
-                    Ok(config) => {
-                        std::time::Duration::from_millis(config.global.connect_timeout_ms)
-                    }
+                    Ok(config) => (
+                        Duration::from_millis(config.global.connect_timeout_ms),
+                        Duration::from_secs(config.global.check_interval_secs),
+                    ),
                     Err(error) => return failed(error),
                 }
             };
@@ -565,6 +577,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                         health_family: target_family(*dns_target),
                         target: Some(dns_identity.clone()),
                     },
+                    probe_interval,
                 );
                 let start = std::time::Instant::now();
                 let mut measurement = HealthMeasurement::Mixed;
@@ -644,6 +657,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                                 &node,
                                 target,
                                 &group_manager,
+                                probe_interval,
                                 connect_timeout,
                                 deadline.saturating_duration_since(tokio::time::Instant::now()),
                                 &mut data_observation,
@@ -715,6 +729,7 @@ async fn score_quic_probe(
     node: &Node,
     target: &QuicScoreTarget,
     group_manager: &SharedGroupManager,
+    probe_interval: Duration,
     connect_timeout: Duration,
     timeout: Duration,
     observation: &mut Option<NativeHealthObservation>,
@@ -724,7 +739,12 @@ async fn score_quic_probe(
         return None;
     }
     // Nodes outside Score groups create no reporter and are not probed.
-    let reporter = start_probe_feedback(group_manager, node.id, quic_probe_context(target))?;
+    let reporter = start_probe_feedback(
+        group_manager,
+        node.id,
+        quic_probe_context(target),
+        probe_interval,
+    )?;
     let reporter = Some(reporter);
     let target_domain = match &target.identity {
         ScoreTarget::Domain { .. } => Some(target.host.as_str()),

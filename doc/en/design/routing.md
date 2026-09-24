@@ -183,6 +183,27 @@ Every call starts with an empty readiness mask; no fact state crosses invocation
 or generations. Lazy guards add code at each use site, while avoiding fact work
 on paths rejected earlier; this is not a measured net throughput improvement.
 
+The verifier must not see the mask's initial value as a constant. Set with
+`mov 0` it is one precise value per resolution history; states with different
+values cannot subsume one another, and the verifier walks every later
+process-name chain once per value (the #280 policy: 160,415 processed
+instructions on Linux 6.12.107; a policy with four fact rules ahead of
+twenty-nine process-name rules: 368,874). The prologue therefore loads the mask
+back from the decision's just-zeroed `mark`: the verifier does not fold a memory
+load into the stored constant, so the low word is unknown, while the runtime
+value is zero. The three lazily resolved areas are pre-filled from fresh loads of
+the same field, so a use verified before its resolution reads initialized stack
+and the stored words share no scalar id with the mask; spilling the mask register
+itself links them and the walk splits again (133,354). Each guard is a `jset` on
+the mask register, which refines the tested bit on both edges, so the skip edge
+and the resolve edge agree at the bit test; testing a copy in `R0` leaves the
+register unrefined on the skip edge (82,234). With all three the two policies
+cost 53,741 and 100,645 processed instructions, close to unconditional
+rule-entry resolution; `jset` alone on a constant mask changes nothing. At
+runtime every fact use follows a completed resolution. These are measurements
+of Linux 6.12.107; a verifier that tracked memory contents through the store
+would make the mask a constant again.
+
 The verifier is why. A pointer's type depends on the lookup outcome, and the
 verifier never merges a NULL with a map pointer, so a fact pointer kept live
 across later rules multiplied the states walked through everything emitted
@@ -195,12 +216,10 @@ that: the verifier explores the fall-through of an unresolved conditional
 first, so the copy from a map value sits on the fall-through at every split
 (including the IPv4/IPv6 dispatch) and the zero fill on the jump target; a
 zero fill recorded first becomes precise once a bit test on it is predictable
-and cannot subsume the later unknown values. The [historical measurements](https://paste.gentoozh.org/md/Jh3E30L0+Vf)
-on Linux 6.12.107 belong to the eager rule-entry implementation at `6a2b395`:
-53,279 processed instructions without the two rules and 53,380 with them.
-They are not measurements of the later port-first, READY-guarded implementation;
-successful verifier-budget tests establish loadability, not that numeric cost.
-IPv4/IPv6 key construction and map selection still join at one lookup call;
+and cannot subsume the later unknown values. Measured on the same kernel, the
+issue's policy verifies in 53,383 processed instructions without the two rules
+and 53,741 with them. Successful verifier-budget tests establish loadability,
+not that numeric cost. IPv4/IPv6 key construction and map selection still join at one lookup call;
 only IPv4 key padding is zeroed, without clearing bytes immediately overwritten.
 
 Fact preparation keeps hash-first duplicate coalescing, sorts only unique keys,

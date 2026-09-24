@@ -247,7 +247,8 @@ impl UdpPool {
     }
 
     fn stop(&self, error: io::Error) {
-        let failure = SharedError::new(anyhow::Error::new(error).context("UDP DNS receive failed"));
+        let failure =
+            SharedError::fanout(anyhow::Error::new(error).context("UDP DNS receive failed"));
         let pending = {
             let mut state = self.state.lock();
             state.stopped.get_or_insert_with(|| failure.clone());

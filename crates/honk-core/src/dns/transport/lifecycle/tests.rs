@@ -823,7 +823,9 @@ async fn query_paused_in_leaf_routing_cannot_publish_after_close() {
     .expect("query paused in leaf routing");
 
     // When
-    pool.close().await;
+    tokio::time::timeout(Duration::from_secs(1), pool.close())
+        .await
+        .expect("leaf routing must not hold a query-admission permit");
     drop(write_guard);
     let result = query.await.expect("query task");
     server.abort();

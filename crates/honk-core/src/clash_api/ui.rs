@@ -27,8 +27,8 @@ use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
 use honk_outbound::alive::{IpVersion, ProbeDomain};
 use honk_outbound::group::{
-    ScoreFeedback, ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreTarget,
-    SelectionNetwork, SharedGroupManager,
+    ScoreAttempt, ScoreBusinessGuard, ScoreContinuation, ScoreOutcome, ScoreReporter,
+    ScoreSelectionContext, ScoreTarget, SelectionNetwork, SharedGroupManager,
 };
 use honk_outbound::proxy::{AsyncReadWrite, ProxyRegistry};
 use honk_outbound::runtime::SharedRuntimeRegistry;
@@ -189,19 +189,24 @@ fn download_url(configured: &str) -> String {
 /// Where the routing decision sends the download.
 enum UiRoute {
     Direct {
-        feedback: Option<ScoreFeedback>,
+        feedback: Option<ScoreAttempt>,
     },
     Block,
     Proxy {
         node: Box<Node>,
-        feedback: Option<ScoreFeedback>,
+        feedback: Option<ScoreAttempt>,
     },
 }
 
 /// Run the download target through the same routing pipeline as user
 /// traffic: `Router::route_with_must` for the outbound name, then the
 /// authoritative group/leaf resolution for the node to dial.
-async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow::Result<UiRoute> {
+async fn decide_route(
+    ctx: &UiDownloadContext,
+    host: &str,
+    port: u16,
+    original: Option<&ScoreContinuation>,
+) -> anyhow::Result<UiRoute> {
     let host_ip = parse_host_ip(host);
     let resolved_ip = if let Some(ip) = host_ip {
         Some(ip)
@@ -291,8 +296,8 @@ async fn decide_route(ctx: &UiDownloadContext, host: &str, port: u16) -> anyhow:
                     std::net::SocketAddr::new(dst_ip, port).into()
                 }),
             };
-            let plan =
-                group_manager.selection_plan_for_target_with_health_fallback(&outbound, &context);
+            let plan = group_manager
+                .selection_plan_for_target_with_health_fallback(&outbound, &context, original);
             let mut entries = plan.entries.into_iter();
             match entries.next() {
                 Some(entry) => (vec![entry.node.clone()], entry.feedback),
@@ -391,12 +396,21 @@ async fn fetch_routed(
     stop: &mut Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<bool> {
     let mut url = url.to_string();
+    let mut original_business: Option<ScoreContinuation> = None;
     for _ in 0..=MAX_REDIRECTS {
         let (host, port, path, is_https) = parse_download_url(&url)?;
         let route = tokio::select! {
             biased;
             _ = download_stopped(stop) => return Ok(false),
-            route = decide_route(ctx, &host, port) => route?,
+            route = decide_route(ctx, &host, port, original_business.as_ref()) => route?,
+        };
+        let original_attempt = match &route {
+            UiRoute::Direct { feedback } | UiRoute::Proxy { feedback, .. }
+                if original_business.is_none() =>
+            {
+                feedback.clone()
+            }
+            _ => None,
         };
         let response = match route {
             UiRoute::Direct { feedback } => fetch_direct(&url, feedback, archive, stop).await?,
@@ -412,6 +426,9 @@ async fn fetch_routed(
             ProxiedFetch::Body => return Ok(true),
             ProxiedFetch::Stopped => return Ok(false),
             ProxiedFetch::Redirect(location) => {
+                if let Some(original) = original_attempt {
+                    original_business = Some(original.continuation()?);
+                }
                 url = reqwest::Url::parse(&url)?.join(&location)?.to_string();
                 info!(url = %url, "external UI download following redirect");
             }
@@ -425,11 +442,15 @@ async fn fetch_routed(
 /// size cap.
 async fn fetch_direct(
     url: &str,
-    feedback: Option<ScoreFeedback>,
+    feedback: Option<ScoreAttempt>,
     archive: &mut ArchiveFile,
     stop: &mut Option<watch::Receiver<bool>>,
 ) -> anyhow::Result<ProxiedFetch> {
-    let reporter = feedback.as_ref().map(ScoreFeedback::start);
+    let reporter = feedback
+        .as_ref()
+        .map(ScoreAttempt::begin)
+        .transpose()?
+        .map(ScoreBusinessGuard::start);
     let result = tokio::select! {
         biased;
         _ = download_stopped(stop) => Ok(ProxiedFetch::Stopped),
@@ -491,7 +512,7 @@ enum ProxiedFetch {
 async fn fetch_proxied(
     ctx: &UiDownloadContext,
     node: &Node,
-    feedback: Option<ScoreFeedback>,
+    feedback: Option<ScoreAttempt>,
     (host, port, path, is_https): (&str, u16, &str, bool),
     archive: &mut ArchiveFile,
     stop: &mut Option<watch::Receiver<bool>>,
@@ -519,11 +540,17 @@ async fn fetch_proxied(
         node,
         honk_outbound::proxy::WarmRequirement::Session,
     )?;
-    let reporter = feedback.as_ref().map(ScoreFeedback::start);
+    let mut reporter = None;
     let result = tokio::select! {
         biased;
         _ = download_stopped(stop) => Ok(ProxiedFetch::Stopped),
-        result = async { match generation
+        result = async {
+        reporter = feedback
+            .as_ref()
+            .map(ScoreAttempt::begin)
+            .transpose()?
+            .map(ScoreBusinessGuard::start);
+        match generation
         .scope_dials(
             entry
                 .tcp
@@ -1287,7 +1314,7 @@ mod tests {
             .external_ui_download_detour = "missing".into();
         drop(config);
 
-        let error = decide_route(&ctx, "127.0.0.1", 80)
+        let error = decide_route(&ctx, "127.0.0.1", 80, None)
             .await
             .err()
             .expect("an unknown explicit detour must fail");
@@ -1557,8 +1584,9 @@ mod tests {
             ))),
         };
 
-        let UiRoute::Proxy { node, feedback } =
-            decide_route(&ctx, "127.0.0.1", addr.port()).await.unwrap()
+        let UiRoute::Proxy { node, feedback } = decide_route(&ctx, "127.0.0.1", addr.port(), None)
+            .await
+            .unwrap()
         else {
             panic!("Score group must resolve to a proxy leaf");
         };
@@ -1586,18 +1614,20 @@ mod tests {
         assert!(matches!(fetched, ProxiedFetch::Body));
         assert_eq!(archive_bytes(archive).await, body);
 
-        let UiRoute::Proxy { node, feedback } =
-            decide_route(&ctx, "127.0.0.1", addr.port()).await.unwrap()
+        let UiRoute::Proxy { node, feedback } = decide_route(&ctx, "127.0.0.1", addr.port(), None)
+            .await
+            .unwrap()
         else {
             panic!("Score group must resolve to a proxy leaf");
         };
         assert_eq!(node.id, nodes[1].id);
-        let reporter = feedback.unwrap().start();
+        let reporter = feedback.unwrap().begin().unwrap().start();
         reporter.setup_succeeded();
         reporter.finish(ScoreOutcome::Success);
 
-        let UiRoute::Proxy { node, .. } =
-            decide_route(&ctx, "127.0.0.1", addr.port()).await.unwrap()
+        let UiRoute::Proxy { node, .. } = decide_route(&ctx, "127.0.0.1", addr.port(), None)
+            .await
+            .unwrap()
         else {
             panic!("Score group must resolve to a proxy leaf");
         };
@@ -1645,8 +1675,9 @@ mod tests {
                 honk_outbound::runtime::OutboundRuntimeRegistry::build(&[]).unwrap(),
             ))),
         };
-        let UiRoute::Direct { feedback } =
-            decide_route(&ctx, "127.0.0.1", addr.port()).await.unwrap()
+        let UiRoute::Direct { feedback } = decide_route(&ctx, "127.0.0.1", addr.port(), None)
+            .await
+            .unwrap()
         else {
             panic!("Score group must resolve to direct");
         };
@@ -1671,14 +1702,112 @@ mod tests {
         .unwrap();
         assert!(matches!(fetched, ProxiedFetch::Body));
         assert_eq!(archive_bytes(archive).await, body);
-        let UiRoute::Direct { feedback } =
-            decide_route(&ctx, "127.0.0.1", addr.port()).await.unwrap()
+        let UiRoute::Direct { feedback } = decide_route(&ctx, "127.0.0.1", addr.port(), None)
+            .await
+            .unwrap()
         else {
             panic!("Score group must still resolve to direct");
         };
         feedback
             .unwrap()
+            .begin()
+            .unwrap()
             .start()
             .setup_failed(ScoreOutcome::Timeout);
+    }
+
+    #[tokio::test]
+    async fn score_redirects_keep_optional_credit_and_one_original_business() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for hop in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                let mut used = 0;
+                while !request[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    assert!(
+                        used < request.len(),
+                        "loopback request headers exceed fixture limit"
+                    );
+                    let received = socket.read(&mut request[used..]).await.unwrap();
+                    assert_ne!(received, 0, "loopback request closed before its headers");
+                    used += received;
+                }
+                let response = if hop == 3 {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone"
+                        .to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: /hop{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        hop + 1
+                    )
+                };
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let nodes: Vec<_> = (1..=3)
+            .map(|port| {
+                let mut node = Node {
+                    name: format!("proxy-{port}"),
+                    outbound: honk_config::node::OutboundConfig::from_protocol(
+                        NodeProtocol::Socks5,
+                    ),
+                    address: "127.0.0.1".into(),
+                    port,
+                    ..Default::default()
+                };
+                node.id = node.derive_id();
+                node
+            })
+            .collect();
+        let group = Group {
+            name: "ui-score".into(),
+            policy: GroupPolicy::Score,
+            nodes: nodes.iter().map(|node| node.id).collect(),
+            ..Default::default()
+        };
+        let manager = Arc::new(GroupManager::new(std::slice::from_ref(&group), &nodes));
+        let mut registry = ProxyRegistry::new();
+        registry.register(ProtocolEntry::new(
+            NodeProtocol::Socks5,
+            Arc::new(LoopbackHandler),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx_with_registry(dir.path(), &[], Arc::new(registry));
+        {
+            let mut config = ctx.config.write().await;
+            let config = Arc::make_mut(&mut config);
+            config.nodes = nodes;
+            config.groups = vec![group];
+            config.experimental.clash_api.external_ui_download_detour = "ui-score".into();
+        }
+        *ctx.group_manager.write() = Arc::clone(&manager);
+        let mut archive = ArchiveFile::create(&dir.path().join("ui")).unwrap();
+        assert!(
+            fetch_routed(
+                &ctx,
+                &format!("http://{address}/start"),
+                &mut archive,
+                &mut None,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(archive_bytes(archive).await, b"done");
+        server.await.unwrap();
+        let cost = manager.score_budget_counters("ui-score", SelectionNetwork::Tcp);
+        assert_eq!(
+            (
+                cost.business_starts,
+                cost.trial_starts,
+                cost.recovery_starts,
+                cost.spent,
+                cost.cold_available,
+                cost.refunded
+            ),
+            (1, 1, 3, 1, 2, 0)
+        );
+        assert_eq!(manager.score_state().root_business_starts(), 1);
     }
 }

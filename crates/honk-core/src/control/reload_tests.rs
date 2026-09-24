@@ -990,6 +990,38 @@ fn score_reload_context() -> honk_outbound::group::ScoreSelectionContext {
     }
 }
 
+fn assert_stale_score_cannot_publish(
+    stale: &crate::group::GroupManager,
+    current: &crate::group::GroupManager,
+) {
+    let snapshot = || {
+        (
+            current.score_state().root_business_starts(),
+            current.score_budget_counters("score", honk_outbound::group::SelectionNetwork::Tcp),
+            current.score_cache_snapshot(),
+        )
+    };
+    let before = snapshot();
+    let plan = stale.selection_plan_for_target("score", &score_reload_context());
+    let reporter = plan.entries[0]
+        .feedback
+        .as_ref()
+        .unwrap()
+        .begin()
+        .unwrap()
+        .start();
+    reporter.setup_succeeded();
+    reporter.tx(1);
+    reporter.first_response();
+    reporter.rx(1);
+    reporter.finish(honk_outbound::group::ScoreOutcome::Success);
+    assert_eq!(
+        snapshot(),
+        before,
+        "stale ordinary traffic must not publish current Score state"
+    );
+}
+
 #[tokio::test]
 async fn reload_persists_selector_choice_before_manager_publication() {
     let temp = tempfile::tempdir().unwrap();
@@ -1082,7 +1114,13 @@ async fn reload_publishes_score_authority_before_dns_snapshot_is_reachable() {
         assert!(lock_at_hook.reload_lock.try_lock().is_err());
         let first = new_manager.selection_plan_for_target("score", &score_reload_context());
         let first_id = first.entries[0].node.id;
-        let reporter = first.entries[0].feedback.as_ref().unwrap().start();
+        let reporter = first.entries[0]
+            .feedback
+            .as_ref()
+            .unwrap()
+            .begin()
+            .unwrap()
+            .start();
         reporter.setup_succeeded();
         reporter.tx(1);
         reporter.rx(1);
@@ -1096,13 +1134,7 @@ async fn reload_publishes_score_authority_before_dns_snapshot_is_reachable() {
             first_id,
             "the published replacement authority must accept Score writes"
         );
-        assert!(
-            old_manager
-                .selection_plan_for_target("score", &score_reload_context())
-                .entries[0]
-                .feedback
-                .is_none()
-        );
+        assert_stale_score_cannot_publish(&old_manager, new_manager);
         observed_at_hook.store(true, std::sync::atomic::Ordering::Release);
         println!("replacement Score authority accepted writes before DNS publication");
     });
@@ -1168,6 +1200,8 @@ async fn failed_reload_keeps_old_score_authority() {
     assert!(feedback.is_some());
     println!("rejected reload preserved DNS generation and old Score authority");
     feedback
+        .unwrap()
+        .begin()
         .unwrap()
         .start()
         .setup_failed(honk_outbound::group::ScoreOutcome::Timeout);
@@ -1264,13 +1298,8 @@ async fn post_publication_datapath_failure_is_committed_degraded() {
         last_applied.flags & honk_ebpf_common::DATAPATH_FLAG_NFQ_READY,
         0
     );
-    assert!(
-        before_manager
-            .selection_plan_for_target("score", &score_reload_context())
-            .entries[0]
-            .feedback
-            .is_none()
-    );
+    let current_manager = cp.group_manager.read().clone();
+    assert_stale_score_cannot_publish(&before_manager, &current_manager);
     assert!(
         cp.group_manager
             .read()

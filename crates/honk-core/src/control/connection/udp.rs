@@ -637,7 +637,19 @@ impl ControlPlaneHandle {
                     let mut native_attempt = native.as_ref().and_then(|observation| {
                         observation.attempt(&selection_chain, &node, target_domain.as_deref())
                     });
-                    let reporter = feedback.map(|feedback| feedback.start());
+                    let reporter = feedback
+                        .as_ref()
+                        .map(crate::group::ScoreAttempt::begin)
+                        .transpose()
+                        .map_err(|error| {
+                            let error: anyhow::Error = error.into();
+                            #[cfg(feature = "native-api")]
+                            if let Some(attempt) = &mut native_attempt {
+                                attempt.tcp_finished(Some(&error), &node);
+                            }
+                            error
+                        })?
+                        .map(crate::group::ScoreBusinessGuard::start);
                     let dial_started_at = std::time::Instant::now();
                     let operation = async {
                         #[cfg(feature = "rprx")]
