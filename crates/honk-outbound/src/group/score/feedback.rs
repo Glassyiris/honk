@@ -107,7 +107,7 @@ impl ScoreAttempt {
         source: super::ScoreTrialSource,
     ) -> Self {
         for attribution in feedback.attributions.iter() {
-            if !work.iter().any(|item| item.group() == attribution.group) {
+            if !work.iter().any(|item| item.key.group == attribution.group) {
                 work.push(budget::Work::new(
                     &feedback.state,
                     &attribution.group,

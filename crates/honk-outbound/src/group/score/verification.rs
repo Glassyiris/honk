@@ -1,4 +1,4 @@
-use super::ranking::{Decision, decision, normal_eligible};
+use super::ranking::{Decision, decision};
 use super::*;
 use honk_config::node::Node;
 use std::hash::{Hash, Hasher};
@@ -16,15 +16,17 @@ pub enum ScoreVerificationState {
     ObservedUsable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ScoreComparison {
+    #[default]
     Unconfirmed,
     Equivalent,
     Supported,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ScoreEvidenceBasis {
+    #[default]
     None,
     ConfiguredProbe,
     TargetResponse,
@@ -79,7 +81,7 @@ pub enum ScoreTrialSource {
     Recovery,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScoreLocalComparison {
     pub comparison: ScoreComparison,
     pub basis: ScoreEvidenceBasis,
@@ -92,24 +94,6 @@ pub struct ScoreLocalComparison {
     pub upload_known: bool,
     pub download_known: bool,
     pub directional_tradeoff: bool,
-}
-
-impl Default for ScoreLocalComparison {
-    fn default() -> Self {
-        Self {
-            comparison: ScoreComparison::Unconfirmed,
-            basis: ScoreEvidenceBasis::None,
-            compared_candidates: 0,
-            reporter_count: 0,
-            span_ms: 0,
-            evidence_age_ms: None,
-            valid_for_ms: None,
-            dispersion_ppm: 0,
-            upload_known: false,
-            download_known: false,
-            directional_tradeoff: false,
-        }
-    }
 }
 
 /// Counts of current candidate blockers, not cumulative failures or dispatched work.
@@ -337,12 +321,7 @@ pub(super) fn evaluate(
     let selected = decision.ordinary.index;
     let winner = &snapshots[selected];
     let baseline = decision.baseline;
-    let excluded = |index: usize| {
-        !normal_eligible(&snapshots[index], baseline)
-            && evidence[index]
-                .failed_at
-                .is_some_and(|at| now.saturating_duration_since(at) < PERFORMANCE_MAX_AGE)
-    };
+    let excluded = |index: usize| super::comparison::failure_excluded(decision, index, now);
     let summary = super::comparison::summarize(decision, now);
     let use_probe = context.target.is_none()
         && match summary.basis {

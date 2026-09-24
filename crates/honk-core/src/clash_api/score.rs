@@ -62,19 +62,8 @@ fn snapshot(
             ScoreVerificationState::Provisional => "provisional",
             ScoreVerificationState::ObservedUsable => "observedUsable",
         },
-        "comparison": match snapshot.comparison {
-            ScoreComparison::Unconfirmed => "unconfirmed",
-            ScoreComparison::Equivalent => "equivalent",
-            ScoreComparison::Supported => "supported",
-        },
-        "basis": match snapshot.basis {
-            ScoreEvidenceBasis::None => "none",
-            ScoreEvidenceBasis::ConfiguredProbe => "configuredProbe",
-            ScoreEvidenceBasis::TargetResponse => "targetResponse",
-            ScoreEvidenceBasis::CommonTargets => "commonTargets",
-            ScoreEvidenceBasis::Upload => "upload",
-            ScoreEvidenceBasis::Download => "download",
-        },
+        "comparison": comparison_name(snapshot.comparison),
+        "basis": basis_name(snapshot.basis),
         "missing": {
             "availability": snapshot.missing.availability,
             "response": snapshot.missing.response,
@@ -156,19 +145,8 @@ pub(super) fn counters(counters: ScoreVerificationCounters) -> serde_json::Value
 fn local_comparison(value: ScoreLocalComparison) -> serde_json::Value {
     serde_json::json!({
         "scope": "activeChallengers",
-        "comparison": match value.comparison {
-            ScoreComparison::Unconfirmed => "unconfirmed",
-            ScoreComparison::Equivalent => "equivalent",
-            ScoreComparison::Supported => "supported",
-        },
-        "basis": match value.basis {
-            ScoreEvidenceBasis::None => "none",
-            ScoreEvidenceBasis::ConfiguredProbe => "configuredProbe",
-            ScoreEvidenceBasis::TargetResponse => "targetResponse",
-            ScoreEvidenceBasis::CommonTargets => "commonTargets",
-            ScoreEvidenceBasis::Upload => "upload",
-            ScoreEvidenceBasis::Download => "download",
-        },
+        "comparison": comparison_name(value.comparison),
+        "basis": basis_name(value.basis),
         "comparedCandidates": value.compared_candidates,
         "reporters": value.reporter_count,
         "spanMs": value.span_ms,
@@ -179,6 +157,25 @@ fn local_comparison(value: ScoreLocalComparison) -> serde_json::Value {
         "downloadKnown": value.download_known,
         "directionalTradeoff": value.directional_tradeoff,
     })
+}
+
+fn comparison_name(comparison: ScoreComparison) -> &'static str {
+    match comparison {
+        ScoreComparison::Unconfirmed => "unconfirmed",
+        ScoreComparison::Equivalent => "equivalent",
+        ScoreComparison::Supported => "supported",
+    }
+}
+
+fn basis_name(basis: ScoreEvidenceBasis) -> &'static str {
+    match basis {
+        ScoreEvidenceBasis::None => "none",
+        ScoreEvidenceBasis::ConfiguredProbe => "configuredProbe",
+        ScoreEvidenceBasis::TargetResponse => "targetResponse",
+        ScoreEvidenceBasis::CommonTargets => "commonTargets",
+        ScoreEvidenceBasis::Upload => "upload",
+        ScoreEvidenceBasis::Download => "download",
+    }
 }
 
 pub(super) fn budget(value: ScoreBudgetCounters) -> serde_json::Value {

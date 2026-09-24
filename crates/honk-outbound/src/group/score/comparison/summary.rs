@@ -65,6 +65,18 @@ pub(in crate::group::score) fn dominated(
         && candidate.observed_reliability < winner.observed_reliability
 }
 
+/// A recent failure excludes an ineligible member until its performance evidence expires.
+pub(in crate::group::score) fn failure_excluded(
+    decision: &Decision,
+    index: usize,
+    now: Instant,
+) -> bool {
+    !normal_eligible(&decision.scores[index], decision.baseline)
+        && decision.evidence[index]
+            .failed_at
+            .is_some_and(|at| now.saturating_duration_since(at) < PERFORMANCE_MAX_AGE)
+}
+
 fn advantage(
     pair: PairEvidence,
     qualified: (bool, bool),
@@ -129,19 +141,13 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
     let mut selected_rates = [0.0_f64; 2];
     let mut rate_nonregression = true;
     let mut all_responses = true;
-    let mut full_coverage = true;
     let mut oldest: Option<Instant> = None;
     let mut expires: Option<Instant> = None;
     for (index, candidate) in snapshots.iter().enumerate() {
         if index == selected {
             continue;
         }
-        if dominated(winner, candidate, baseline)
-            || (!normal_eligible(candidate, baseline)
-                && decision.evidence[index]
-                    .failed_at
-                    .is_some_and(|at| now.saturating_duration_since(at) < PERFORMANCE_MAX_AGE))
-        {
+        if dominated(winner, candidate, baseline) || failure_excluded(decision, index, now) {
             excluded += 1;
             continue;
         }
@@ -181,7 +187,6 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
             download: pair.download.filter(|metric| now < metric.expires_at),
             ..pair
         };
-        full_coverage &= !pair.partial;
         summary.target_limited |= pair.partial;
         let Some(supporting) = [pair.response, pair.upload, pair.download]
             .into_iter()
@@ -279,8 +284,9 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
         }
     }
     let comparable = compared && all_responses && !summary.response_misaligned;
-    summary.complete =
-        comparable && full_coverage && summary.compared_candidates + excluded == snapshots.len();
+    summary.complete = comparable
+        && !summary.target_limited
+        && summary.compared_candidates + excluded == snapshots.len();
     summary.equivalent = comparable
         && pairwise_equivalent
         && ranges

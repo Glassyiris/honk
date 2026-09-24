@@ -72,6 +72,7 @@ impl std::fmt::Debug for Opportunity {
     }
 }
 
+#[derive(Default)]
 pub(super) struct Life {
     status: AtomicU8,
     setup: AtomicBool,
@@ -98,6 +99,12 @@ impl Life {
 
     pub(super) fn deadline(&self) -> Option<Instant> {
         self.deadline.get().copied()
+    }
+
+    fn elapsed_millis(&self, now: Instant) -> u64 {
+        self.started_at.get().map_or(0, |started| {
+            u64::try_from(now.saturating_duration_since(*started).as_millis()).unwrap_or(u64::MAX)
+        })
     }
 }
 
@@ -184,8 +191,14 @@ impl Scope {
     }
 
     fn expire(&mut self, now: Instant) {
-        let mut refunded_cold = 0;
-        let mut refunded_earned = 0;
+        let expired = self.drop_in_flight(|entry, _| entry.expires > now);
+        self.counters.expired = self.counters.expired.saturating_add(expired);
+    }
+
+    /// Drops dead and finished entries plus live ones `keep` rejects, cancelling and refunding
+    /// pending work; returns how many live entries were dropped.
+    fn drop_in_flight(&mut self, keep: impl Fn(&InFlight, u8) -> bool) -> u64 {
+        let (mut dropped, mut cold, mut earned) = (0, 0, 0);
         self.in_flight.retain(|entry| {
             let Some(life) = entry.life.upgrade() else {
                 return false;
@@ -194,26 +207,27 @@ impl Scope {
             if status >= FINISHED {
                 return false;
             }
-            if entry.expires > now {
+            if keep(entry, status) {
                 return true;
             }
-            self.counters.expired = self.counters.expired.saturating_add(1);
+            dropped += 1;
             if status == PENDING {
                 life.status.store(CANCELLED, Ordering::Relaxed);
                 match life.token {
-                    Some(Token::Cold) => refunded_cold += 1,
-                    Some(Token::Earned) => refunded_earned += 1,
+                    Some(Token::Cold) => cold += 1,
+                    Some(Token::Earned) => earned += 1,
                     None => {}
                 }
             }
             false
         });
-        for _ in 0..refunded_cold {
+        for _ in 0..cold {
             self.refund(Token::Cold);
         }
-        for _ in 0..refunded_earned {
+        for _ in 0..earned {
             self.refund(Token::Earned);
         }
+        dropped
     }
 
     fn active(
@@ -259,32 +273,7 @@ impl Scope {
     }
 
     pub(super) fn invalidate_pending(&mut self) {
-        let mut refunded_cold = 0;
-        let mut refunded_earned = 0;
-        self.in_flight.retain(|entry| {
-            let Some(life) = entry.life.upgrade() else {
-                return false;
-            };
-            match life.status.load(Ordering::Relaxed) {
-                STARTED => true,
-                PENDING => {
-                    life.status.store(CANCELLED, Ordering::Relaxed);
-                    match life.token {
-                        Some(Token::Cold) => refunded_cold += 1,
-                        Some(Token::Earned) => refunded_earned += 1,
-                        None => {}
-                    }
-                    false
-                }
-                _ => false,
-            }
-        });
-        for _ in 0..refunded_cold {
-            self.refund(Token::Cold);
-        }
-        for _ in 0..refunded_earned {
-            self.refund(Token::Earned);
-        }
+        self.drop_in_flight(|_, status| status == STARTED);
     }
 }
 
@@ -316,20 +305,10 @@ impl Work {
             scope: None,
             node,
             life: Arc::new(Life {
-                status: AtomicU8::new(PENDING),
-                setup: AtomicBool::new(false),
-                token: None,
-                started_at: OnceLock::new(),
-                answered: AtomicU8::new(0),
                 source,
-                original: AtomicBool::new(false),
-                deadline: OnceLock::new(),
+                ..Default::default()
             }),
         })
-    }
-
-    pub(super) fn group(&self) -> &str {
-        &self.key.group
     }
 
     pub(super) fn has_started(&self) -> bool {
@@ -453,17 +432,12 @@ pub(super) fn reserve(
         scope: Some(Arc::clone(&scope.identity)),
         node,
         life: Arc::new(Life {
-            status: AtomicU8::new(PENDING),
-            setup: AtomicBool::new(false),
             token: Some(token),
-            started_at: OnceLock::new(),
-            answered: AtomicU8::new(0),
-            original: AtomicBool::new(false),
-            deadline: OnceLock::new(),
             source: match token {
                 Token::Cold => ScoreTrialSource::Cold,
                 Token::Earned => ScoreTrialSource::Periodic,
             },
+            ..Default::default()
         }),
     });
     scope.track(node, context.target.as_ref(), &work.life, now);
@@ -729,14 +703,7 @@ pub(super) fn setup(inner: &mut StateInner, work: &[Arc<Work>], now: Instant) {
             .get_mut(&item.key)
             .filter(|scope| item.scope_matches(scope))
         {
-            let elapsed = item
-                .life
-                .started_at
-                .get()
-                .map_or(Duration::ZERO, |started| {
-                    now.saturating_duration_since(*started)
-                });
-            let millis = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+            let millis = item.life.elapsed_millis(now);
             let bin = millis.max(1).ilog2().min(7) as usize;
             scope.counters.trial_setup_histogram[bin] =
                 scope.counters.trial_setup_histogram[bin].saturating_add(1);
@@ -767,16 +734,9 @@ fn settle(inner: &mut StateInner, item: &Work, outcome: ScoreOutcome, now: Insta
             }
             _ => c.trial_failure = c.trial_failure.saturating_add(1),
         }
-        let elapsed = item
-            .life
-            .started_at
-            .get()
-            .map_or(Duration::ZERO, |started| {
-                now.saturating_duration_since(*started)
-            });
         c.trial_elapsed_millis = c
             .trial_elapsed_millis
-            .saturating_add(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+            .saturating_add(item.life.elapsed_millis(now));
     }
 }
 

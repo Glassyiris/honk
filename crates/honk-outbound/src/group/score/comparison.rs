@@ -12,7 +12,7 @@ mod store;
 use store::{Bucket, Cell, Key, Timing};
 pub(super) use store::{Store, observe, target_bytes};
 mod summary;
-pub(super) use summary::{dominated, summarize};
+pub(super) use summary::{dominated, failure_excluded, summarize};
 
 pub(super) const MAX_CELLS: usize = 256;
 pub(super) const MAX_TARGETS: usize = 8;
@@ -114,10 +114,6 @@ impl Accumulator {
             }
         }
     }
-
-    fn reporters(&self) -> usize {
-        self.distinct
-    }
 }
 
 /// Same-block accumulation shared by pair metrics and run progress; each caller keeps its scope.
@@ -157,7 +153,7 @@ fn metric_pair(
     let ([a, b], expires) = accumulate_common(left, right, origin, now, timing, blocks, |block| {
         block.hash(&mut support)
     })?;
-    let reporters = a.reporters().min(b.reporters());
+    let reporters = a.distinct.min(b.distinct);
     if reporters < REPORTERS {
         return None;
     }
@@ -867,7 +863,7 @@ pub(super) fn response_progress(
             u8::MAX,
             |_| {},
         )?;
-        counts = sides.map(|side| side.reporters().min(REPORTERS) as u8);
+        counts = sides.map(|side| side.distinct.min(REPORTERS) as u8);
     }
     Some((counts, identity.finish()))
 }
