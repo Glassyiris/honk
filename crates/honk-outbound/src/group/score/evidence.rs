@@ -189,6 +189,7 @@ impl Stats {
         source: ScoreSource,
         now: Instant,
         credited: &mut Option<u64>,
+        exact: bool,
     ) {
         match (source, observation) {
             (
@@ -202,7 +203,10 @@ impl Stats {
                 };
                 let sample = latency.as_secs_f64() * 1000.0;
                 let previous = metric.snapshot(now);
-                if previous.confidence == 1.0
+                // Aggregate means mix targets of unrelated latency; only the same target's
+                // history can show that this node became slower.
+                if exact
+                    && previous.confidence == 1.0
                     && previous
                         .value
                         .is_some_and(|old| sample > old.max(1.0) * 1.5)
@@ -724,7 +728,7 @@ impl ScorePolicyState {
             attributions,
             cells,
             now,
-            |stats, credited, _| stats.observe(&observation, source, now, credited),
+            |stats, credited, exact| stats.observe(&observation, source, now, credited, exact),
         );
     }
 
@@ -772,6 +776,7 @@ impl ScorePolicyState {
                             sample.source,
                             now,
                             credited,
+                            exact,
                         );
                     }
                     failures[usize::from(exact)] |= stats.record_finish(

@@ -873,6 +873,59 @@ fn dominance_ends_the_claim_when_qualification_lapses() {
 }
 
 #[test]
+fn cross_target_latency_is_not_node_degradation() {
+    let nodes = [node("fast"), node("slow")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let near = context("near.example", IpVersion::V4);
+    let aggregate =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    let now = Instant::now();
+    for (leaf, latency) in nodes.iter().zip([10, 100]) {
+        train_at(
+            &manager,
+            leaf,
+            &near,
+            20,
+            Duration::from_millis(latency),
+            1,
+            now,
+        );
+    }
+    let at = now + Duration::from_secs(2);
+    assert_eq!(
+        verification_at(&manager, &nodes, &aggregate, at).comparison,
+        ScoreComparison::Supported
+    );
+    // A farther target is slower through every path; it says nothing about this node.
+    train_at(
+        &manager,
+        &nodes[0],
+        &context("far.example", IpVersion::V4),
+        1,
+        Duration::from_millis(100),
+        1,
+        at,
+    );
+    let later = at + Duration::from_secs(2);
+    let report = verification_at(&manager, &nodes, &aggregate, later);
+    assert_eq!(report.comparison, ScoreComparison::Supported);
+    assert_eq!(report.blockers.response_degraded, 0);
+    // The same target slowing down still reopens that target's comparison.
+    train_at(
+        &manager,
+        &nodes[0],
+        &near,
+        1,
+        Duration::from_millis(100),
+        1,
+        later,
+    );
+    let report = verification_at(&manager, &nodes, &near, later + Duration::from_secs(2));
+    assert_eq!(report.comparison, ScoreComparison::Unconfirmed);
+    assert!(report.blockers.response_degraded > 0);
+}
+
+#[test]
 fn partial_success_cannot_pin_a_cancelled_validation_run_forever() {
     let nodes = [node("working"), node("partial"), node("other")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);

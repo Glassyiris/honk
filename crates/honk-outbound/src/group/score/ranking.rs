@@ -636,7 +636,6 @@ pub(super) fn score_snapshots(
                 score.explore_backed_off |= family.explore_backed_off;
                 score.selected_at = score.selected_at.max(family.selected_at);
                 score.last_attempt = score.last_attempt.max(family.last_attempt);
-                score.degraded_at = score.degraded_at.max(family.degraded_at);
             }
             // Proxy health-family and probe protocol are independent of target family.
             if let Some(stats) = global_stats {
