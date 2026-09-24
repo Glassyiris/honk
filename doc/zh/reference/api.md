@@ -267,7 +267,7 @@ GET 和成功的 PATCH 响应包含只读 `recording`：`flows`、`logs`、`dns_
 
 DELETE 不接受 body/query。未知 ID 无写入地返回 `{"deleted":0}`，成功删除在激活后返回 `{"deleted":1}`；builtin、订阅派生节点、非主文件条目及不支持/歧义归属返回 `404 capability_not_supported`。静态 include 仍在 inline 下可见；固定客户端没有逐节点 writable 字段，因此显示的删除按钮仍可能被拒绝。仍被引用的条目须先修正引用，否则写前校验失败。编辑已有条目继续使用源 PUT，不新增 node/provider PATCH。
 
-这些同步动作与源 PUT、Group PATCH、SIGHUP 共用协调器，检查 accepted revision、磁盘字节与依赖，但不锁住任意外部 editor。失败 details 包含 `stage`、`written`、`durability_confirmed`、`committed`；无法确认时为 null，不伪造 false。生命周期与运行失败为带 Retry-After 的 503，POST 重名冲突为 409；DELETE 的受限失败契约也将校验/冲突映射为 503。已耐久写入但激活被拒绝报告 written true/committed false，提交后降级报告 committed true，不承诺回滚。源 PUT 仍使用独立磁盘 hash If-Match，旧编辑器会在管理修改后得到冲突。
+这些同步动作与源 PUT、Group PATCH、SIGHUP 共用协调器，检查 accepted revision、磁盘字节与依赖，但不锁住任意外部 editor。失败 details 包含 `stage`、`written`、`durability_confirmed`、`committed`；无法确认时为 null，不伪造 false。生命周期与运行失败为带 Retry-After 的 503，POST 重名冲突为 409；DELETE 的受限失败契约也将校验/冲突映射为 503。已耐久写入但激活被拒绝报告 written true/committed false；`--store db` 在激活前不写入，被拒绝时报告 written false；提交后降级报告 committed true，不承诺回滚。源 PUT 仍使用独立磁盘 hash If-Match，旧编辑器会在管理修改后得到冲突。
 
 获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的 geodata。Geodata GET 按既有 router-before-config 锁序读取流量/DNS 保留元数据，不扫描磁盘、不联网；hash/大小属于已加载字节，不属于后来的磁盘外部编辑。未记录或不一致的修改时间为 null；`source_redacted` 保留字段名，在 GET 与成功操作结果中返回第一个下载 URL，并遮蔽监听凭据；没有 URL 的资产为 null。未使用资产不列出；互相冲突的已加载快照报告不可用，不任取其一。
 

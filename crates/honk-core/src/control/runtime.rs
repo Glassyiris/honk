@@ -452,7 +452,8 @@ impl ControlPlane {
         &mut self,
         reloads: Arc<std::sync::atomic::AtomicUsize>,
         gate: Option<mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>,
-        // 0 applies reloads, 1 answers `Rejected`, 2 drops the reply unanswered.
+        // 0 applies reloads, 1 answers `Rejected`, 2 drops the reply unanswered,
+        // 3 applies reloads but reports a commit as degraded.
         reject_reloads: Arc<std::sync::atomic::AtomicU8>,
     ) -> anyhow::Result<()> {
         let mut receiver = self
@@ -483,6 +484,41 @@ impl ControlPlane {
                         }
                     }
                     let mode = reject_reloads.load(std::sync::atomic::Ordering::SeqCst);
+                    if mode == 3
+                        && let ControlCommand::ReloadConfig {
+                            request_id,
+                            config,
+                            diagnostics,
+                            sources,
+                            expected_group_revision,
+                            result,
+                        } = command
+                    {
+                        let (inner, reply) = tokio::sync::oneshot::channel::<ReloadReply>();
+                        tokio::spawn(async move {
+                            if let Ok(mut reply) = reply.await {
+                                if let ReloadOutcome::Committed { generation } = reply.outcome {
+                                    reply.outcome = ReloadOutcome::CommittedDegraded { generation };
+                                }
+                                let _ = result.send(reply);
+                            }
+                        });
+                        let command = ControlCommand::ReloadConfig {
+                            request_id,
+                            config,
+                            diagnostics,
+                            sources,
+                            expected_group_revision,
+                            result: inner,
+                        };
+                        if !self
+                            .dispatch_control_command(command, &drain, &mut authorizations)
+                            .await
+                        {
+                            break;
+                        }
+                        continue;
+                    }
                     if mode != 0 {
                         if let ControlCommand::ReloadConfig { result, .. } = command
                             && mode == 1

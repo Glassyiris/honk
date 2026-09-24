@@ -758,3 +758,51 @@ async fn managed_provider_aliases_cannot_transfer_existing_runtime_identity() {
     );
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn db_store_rejected_management_reports_nothing_written() {
+    let fixture = Fixture::new_db(Access::Admin).await;
+    fixture.reject_reloads.store(1, Ordering::SeqCst);
+    let failure = error(
+        create_node(&fixture, "not-recorded", LINK)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "temporarily_unavailable",
+    )
+    .await;
+    let details = &failure["error"]["details"];
+    assert_eq!(details["stage"], "reload_rejected");
+    assert_eq!(details["written"], false);
+    assert_eq!(details["durability_confirmed"], false);
+    assert_eq!(details["committed"], false);
+    assert_eq!(
+        fixture.database.as_ref().unwrap().head(),
+        Ok(Some(1)),
+        "a rejected activation records no revision"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn db_store_degraded_management_reports_recorded_write() {
+    let fixture = Fixture::new_db(Access::Admin).await;
+    fixture.reject_reloads.store(3, Ordering::SeqCst);
+    let failure = error(
+        create_node(&fixture, "degraded", LINK)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "temporarily_unavailable",
+    )
+    .await;
+    let details = &failure["error"]["details"];
+    assert_eq!(details["stage"], "reload_degraded");
+    assert_eq!(details["written"], true);
+    assert_eq!(details["durability_confirmed"], true);
+    assert_eq!(details["committed"], true);
+    assert_eq!(fixture.database.as_ref().unwrap().head(), Ok(Some(2)));
+    fixture.shutdown().await;
+}
