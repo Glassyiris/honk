@@ -4,6 +4,7 @@ use honk_config::parser::{check_dae_source, parse_dae_sources};
 impl Worker {
     pub(super) async fn validate(&self, request: ValidationRequest) -> Result<Value, ApiError> {
         let active = self.active.read().await.clone();
+        let log_files = self.log_files.clone();
         let generation = self.diagnostics.read().generation;
         let instance = self.service.instance_id.clone();
         let store = self.store.clone().ok_or_else(unsupported)?;
@@ -45,6 +46,8 @@ impl Worker {
                         }
                     }
                     let validated=offline::validate_for_coordinator(loaded,store.dependency_root(),&active,&data_dir,limits(),&mut diagnostics,&deferred,None,&documents)?;
+                    // A save of this candidate would be refused; a dry run only warns.
+                    diagnostics.extend(restart_diagnostics(&active,&validated.config,&log_files,&validated.sources[0].source,Severity::Warning));
                     Ok(LoadedConfig {config:validated.config,sources:validated.sources})
                 })()};
             if let Err(error)=&result {
@@ -58,6 +61,33 @@ impl Worker {
                 "generation_id":format!("{instance}:{generation}"),"validated_at":timestamp(SystemTime::now())}))
         }).await.map_err(|_|unavailable())?
     }
+}
+
+/// Restart-only settings the candidate changes, as diagnostics on `source`. The reload
+/// transaction rejects such a candidate, so a write must not start with one.
+pub(super) fn restart_diagnostics(
+    active: &Config,
+    candidate: &Config,
+    log_files: &LogFiles,
+    source: &honk_config::diagnostic::SourceRef,
+    severity: Severity,
+) -> Vec<DetailedDiagnostic> {
+    use honk_config::diagnostic::{SafeValue, SettingPath, SettingSegment};
+
+    crate::control::restart_required_fields(active, candidate, log_files)
+        .into_iter()
+        .map(|field| {
+            let mut diagnostic = DetailedDiagnostic::warning(
+                "restart-required",
+                source.clone(),
+                SettingPath(field.path.split('.').map(SettingSegment::Field).collect()),
+                SafeValue::Empty,
+                field.message,
+            );
+            diagnostic.severity = severity;
+            diagnostic
+        })
+        .collect()
 }
 
 fn is_limit(error: &honk_config::error::DetailedConfigError) -> bool {

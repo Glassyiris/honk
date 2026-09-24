@@ -52,6 +52,9 @@ fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'stati
         current_log_file.as_deref(),
         candidate_log_file.as_deref(),
     )
+    .into_iter()
+    .map(|field| field.path)
+    .collect()
 }
 
 #[test]
@@ -201,6 +204,31 @@ fn log_file_change_requires_restart() {
         restart_required_changes(&current, &replacement),
         vec!["global.log_file"]
     );
+}
+
+#[test]
+fn restart_fields_resolve_the_candidate_log_file_through_the_cli_override() {
+    let mut current = Config::default();
+    current.global.log_file = "old.log".into();
+    let mut replacement = current.clone();
+    replacement.global.log_file = "new.log".into();
+    let plain = super::LogFiles {
+        cli_override: None,
+        effective: crate::resolved_log_file_path(&current, None),
+    };
+    assert_eq!(
+        super::restart_required_fields(&current, &replacement, &plain),
+        vec![super::reload::RestartField {
+            path: "global.log_file",
+            message: "Changing global.log_file requires restarting honk",
+        }]
+    );
+    let cli_override = std::path::PathBuf::from("cli.log");
+    let overridden = super::LogFiles {
+        effective: crate::resolved_log_file_path(&current, Some(&cli_override)),
+        cli_override: Some(cli_override),
+    };
+    assert!(super::restart_required_fields(&current, &replacement, &overridden).is_empty());
 }
 
 #[test]
@@ -950,6 +978,7 @@ async fn first_subscription_publication_invalidates_source_revision() {
             Some(initial),
             honk_config::paths::data_dir().to_path_buf(),
             cp.config_handle(),
+            cp.log_files(),
             cp.diagnostics_handle(),
             cp.command_sender(),
             subscriptions.handle(),

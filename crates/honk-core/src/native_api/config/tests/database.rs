@@ -83,6 +83,56 @@ async fn rejected_reload_leaves_the_db_head_alone() {
 }
 
 #[tokio::test]
+async fn restart_only_changes_are_refused_before_recording() {
+    let fixture = Fixture::new_db(Access::Admin).await;
+    let store = Arc::clone(fixture.database.as_ref().unwrap());
+    let before = fixture.get(CONFIG).await;
+    let main = source(&before, &fixture.originals["main.dae"]);
+    let candidate =
+        fixture.originals["main.dae"].replace("dial_mode: ip", "dial_mode: ip\n log_level: debug");
+    let failure = error(
+        fixture.replace(main, &candidate).send().await.unwrap(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_value",
+    )
+    .await;
+    let rows = failure["error"]["details"]["diagnostics"]
+        .as_array()
+        .unwrap();
+    assert!(rows.iter().any(|row| row["code"] == "restart-required"
+        && row["level"] == "error"
+        && row["source_id"] == main["id"]
+        && row["message"] == "Changing global.log_level requires restarting honk"));
+
+    std::fs::write(fixture.path("etc/main.dae"), &candidate).unwrap();
+    let response = fixture
+        .request(Method::POST, "/api/v1/config/import")
+        .header("idempotency-key", "restart")
+        .json(&json!({"replace":true}))
+        .send()
+        .await
+        .unwrap();
+    let failure = error(
+        response,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_value",
+    )
+    .await;
+    assert!(
+        failure["error"]["details"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["code"] == "restart-required")
+    );
+    assert_eq!(store.head(), Ok(Some(1)));
+    assert_eq!(revisions(&fixture).len(), 1);
+    assert_eq!(fixture.get(CONFIG).await["revision"], before["revision"]);
+    assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn listener_settings_data_dir_and_secrets_stay_read_only() {
     let fixture = Fixture::new_db(Access::Admin).await;
     let store = Arc::clone(fixture.database.as_ref().unwrap());

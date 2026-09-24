@@ -326,17 +326,11 @@ impl ControlPlane {
                 return Ok(ReloadOutcome::Noop { generation });
             }
         }
-        let candidate_log_file =
-            crate::resolved_log_file_path(&new_config, self.log_file_override.as_deref());
-        let restart_required = restart_required_changes(
-            &current_config,
-            &new_config,
-            self.effective_log_file.as_deref(),
-            candidate_log_file.as_deref(),
-        );
+        let restart_required =
+            restart_required_fields(&current_config, &new_config, &self.log_files);
         if !restart_required.is_empty() {
             error!(
-                fields = ?restart_required,
+                fields = ?restart_required.iter().map(|field| field.path).collect::<Vec<_>>(),
                 "reload rejected: changed fields require process restart"
             );
             return Ok(ReloadOutcome::Rejected);

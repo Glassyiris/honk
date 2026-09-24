@@ -231,6 +231,7 @@ impl Fixture {
                 Some(initial),
                 directory.path().join("state"),
                 control_plane.config_handle(),
+                control_plane.log_files(),
                 control_plane.diagnostics_handle(),
                 commands.clone(),
                 subscriptions.handle(),
