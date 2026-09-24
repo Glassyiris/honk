@@ -2804,7 +2804,10 @@ mod startup_lifecycle_tests {
                 .join(crate::state::DB_FILE),
         )
         .unwrap()
-        .execute_batch("PRAGMA user_version = 2")
+        .execute_batch(&format!(
+            "PRAGMA user_version = {}",
+            crate::state::SCHEMA_VERSION + 1
+        ))
         .unwrap();
         assert!(super::open_state_db(&cli, &config, newer_dir.path()).is_err());
     }

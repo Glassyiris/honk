@@ -50,7 +50,7 @@ fn pragmas_read_back_on_a_fresh_and_a_reopened_file() {
         ("page_size", "Integer(4096)"),
         ("auto_vacuum", "Integer(2)"),
         ("application_id", "Integer(1752133227)"),
-        ("user_version", "Integer(1)"),
+        ("user_version", "Integer(2)"),
     ]
     .into_iter()
     .map(|(name, value)| (name, value.to_owned()))
@@ -189,7 +189,7 @@ fn corrupt_database_is_refused_and_kept() {
 
 #[test]
 fn foreign_or_newer_databases_are_refused() {
-    for (application_id, version) in [(1, 0), (1, 1), (APPLICATION_ID, 2)] {
+    for (application_id, version) in [(1, 0), (1, 1), (APPLICATION_ID, SCHEMA_VERSION + 1)] {
         let directory = tempfile::tempdir().unwrap();
         drop(StateDb::open(directory.path()).unwrap());
         let path = db_path(directory.path());
@@ -528,4 +528,31 @@ fn tables_of_disabled_owners_are_cleared_and_strict_tables_kept() {
     )
     .unwrap();
     assert_eq!(tables.map(count), [1, 1, 0, 1, 0, 1]);
+}
+
+#[test]
+fn a_version_1_database_gains_the_geodata_settings_table() {
+    let directory = tempfile::tempdir().unwrap();
+    drop(StateDb::open(directory.path()).unwrap());
+    let connection = Connection::open(db_path(directory.path())).unwrap();
+    connection
+        .execute_batch("DROP TABLE geodata_settings; PRAGMA user_version = 1;")
+        .unwrap();
+    drop(connection);
+    let state = StateDb::open(directory.path()).unwrap();
+    assert_eq!(pragma(&state.strict(), "user_version"), Ok(SCHEMA_VERSION));
+    state
+        .strict()
+        .execute(
+            "INSERT INTO geodata_settings (id, record) VALUES (1, '{}')",
+            [],
+        )
+        .unwrap();
+    drop(state);
+    let state = StateDb::open(directory.path()).unwrap();
+    let record: String = state
+        .strict()
+        .query_row("SELECT record FROM geodata_settings", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(record, "{}");
 }
