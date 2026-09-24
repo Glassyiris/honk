@@ -311,6 +311,7 @@ async fn updates_verified_bytes_and_keeps_loaded_metadata_after_disk_edits() {
         crate::configuration::digest(&geoip(203))
     );
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), 1);
+    fixture.assert_last_reload(&terminal).await;
     assert_eq!(route(&fixture, "old.example", "192.0.2.5").await, "direct");
     assert_eq!(route(&fixture, "new.example", "192.0.2.5").await, "block");
     assert_eq!(route(&fixture, "other.example", "203.1.2.3").await, "block");
@@ -442,6 +443,10 @@ async fn failure_after_first_rename_reports_partial_write_without_activation() {
     assert_eq!(fixture.get(GEO).await["assets"], old["assets"]);
     assert_eq!(route(&fixture, "old.example", "192.0.2.5").await, "block");
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture.get("/api/v1/runtime").await["last_reload"],
+        Value::Null
+    );
     fixture.shutdown().await;
     server.close().await;
 }
@@ -1048,4 +1053,18 @@ async fn the_download_route_names_a_current_group_by_id() {
         json!({"route": "group", "group_id": proxy})
     );
     fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn rejected_activation_records_failed_last_reload() {
+    let server = AssetServer::new(geosite("new.example"), geoip(203), false).await;
+    let fixture = fixture(server.address, false).await;
+    fixture.reject_reloads.store(1, Ordering::SeqCst);
+    let operation = accepted(fixture.request(Method::POST, UPDATE).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&operation).await;
+    assert_eq!(terminal["status"], "failed", "{terminal}");
+    assert_eq!(terminal["error"]["details"]["stage"], "reload_rejected");
+    fixture.assert_last_reload(&terminal).await;
+    fixture.shutdown().await;
+    server.close().await;
 }

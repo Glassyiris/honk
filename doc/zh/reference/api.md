@@ -276,7 +276,7 @@ DELETE 不接受 body/query。未知 ID 无写入地返回 `{"deleted":0}`，成
 全部下载完成、解析并编译完整候选后才替换任何文件；新文件缺少当前配置使用的分类时，更新以 `asset_validation_failed` 失败，已加载文件保持不变。已加载文件位于 `global.data_dir` 或 `$DAE_LOCATION_ASSET` 时就地替换。已加载文件来自优先级更低的位置（例如软件包安装的 `/usr/share/honk`）时不会被覆写：更新改为在 `global.data_dir/<文件>` 新建文件，若该路径期间已出现文件则拒绝替换；此后查找顺序优先使用新文件。文件经无符号链接的父目录/文件 FD 打开，别名、字节/来源/依赖冲突和不安全路径均拒绝；父目录分量只在安全打开后做身份规范化。各文件独立原子替换并确认耐久，**不是多文件原子事务**；首个 rename 后失败保留逐资产 written/durability 信息，不自动撤回。真实 reload 在 no-op 与重建两条路径都使用不可变已验证 geo 快照，后续磁盘改动不能替换激活字节。成功结果来自实际发布的 GeoData；拒绝/降级仍失败并报告提交信息。重试前先修复磁盘冲突。
 缓存订阅仍参与准入依赖检查，但其指纹标签指向数据库行，不是文件路径。Geodata 更新通过 rename 前的最后一次重新捕获检查正文是否变化；只有真实文件依赖才取得 inode guard。
 
-`POST /geodata/update` 不带 body；同键幂等重放先于互斥检查，不同的在途请求返回 409，operation 容量满返回 503。`202` 只代表 daemon 接管，不代表文件或路由已变更。相同内容可以 no-op 完成，不伪造 generation.changed。
+`POST /geodata/update` 不带 body；同键幂等重放先于互斥检查，不同的在途请求返回 409，operation 容量满返回 503。`202` 只代表 daemon 接管，不代表文件或路由已变更。相同内容可以 no-op 完成，不伪造 generation.changed。更新进入激活阶段后（含 no-op）会写入 `runtime.last_reload`；激活前失败则不改变该字段。
 
 ### Geodata 来源与自动更新
 

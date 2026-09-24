@@ -185,11 +185,15 @@ impl Worker {
                     }
                 };
                 self.service.operations.succeed(id, result);
-                *self.service.last_reload.write() = Some(
-                    json!({"operation_id":id,"status":"succeeded","finished_at":timestamp(SystemTime::now()),"error":null}),
-                );
+                self.reloaded(id);
             }
         }
+    }
+
+    pub(super) fn reloaded(&self, id: &str) {
+        *self.service.last_reload.write() = Some(
+            json!({"operation_id":id,"status":"succeeded","finished_at":timestamp(SystemTime::now()),"error":null}),
+        );
     }
 
     pub(super) fn failed(
