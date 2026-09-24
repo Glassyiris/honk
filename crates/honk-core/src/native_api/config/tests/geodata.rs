@@ -13,7 +13,11 @@ fn delimited(tag: u8, value: &[u8]) -> Vec<u8> {
 }
 
 fn geosite(domain: &str) -> Vec<u8> {
-    let mut entry = delimited(1, b"test");
+    geosite_code(b"test", domain)
+}
+
+fn geosite_code(code: &[u8], domain: &str) -> Vec<u8> {
+    let mut entry = delimited(1, code);
     let mut rule = vec![8, 3];
     rule.extend(delimited(2, domain.as_bytes()));
     entry.extend(delimited(2, &rule));
@@ -612,4 +616,27 @@ async fn concurrent_geodata_rejections_share_the_original_admission_error() {
     }
     drop(state);
     fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn update_refuses_a_file_without_a_used_category_and_keeps_the_old_one() {
+    let server = AssetServer::new(geosite_code(b"other", "new.example"), geoip(203), false).await;
+    let fixture = fixture(server.address, false).await;
+    let old = fixture.get(GEO).await;
+    let operation = accepted(fixture.request(Method::POST, UPDATE).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&operation).await;
+    assert_eq!(terminal["status"], "failed");
+    assert_eq!(
+        terminal["error"]["details"]["stage"],
+        "asset_validation_failed"
+    );
+    assert_eq!(
+        std::fs::read(fixture.path("state/geosite.dat")).unwrap(),
+        geosite("old.example")
+    );
+    assert_eq!(fixture.get(GEO).await["assets"], old["assets"]);
+    assert_eq!(route(&fixture, "old.example", "192.0.2.5").await, "block");
+    assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
+    fixture.shutdown().await;
+    server.close().await;
 }
