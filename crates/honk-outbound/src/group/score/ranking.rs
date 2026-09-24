@@ -24,7 +24,7 @@ pub(super) struct Decision {
     pub pairs: comparison::PairCohort,
     pub baseline: PerformanceBaseline,
     pub ordinary: RankedSelection,
-    pub evaluation: super::evaluation::EvaluationSet,
+    pub evaluation: Option<super::evaluation::EvaluationSet>,
     pub membership: super::evaluation::Membership,
 }
 
@@ -34,13 +34,16 @@ pub(super) fn decision(
     context: &ScoreSelectionContext,
     nodes: &[&Node],
     now: Instant,
+    apply: bool,
 ) -> Decision {
-    let mut decision = ordinary_decision(inner, group, context, nodes, now);
+    let (mut decision, evaluation) = ordinary_decision(inner, group, context, nodes, now, apply);
     if decision.ordinary.index != decision.pairs.reference {
         // The winner is always covered, even when it was outside the stored set.
-        decision.membership = decision
-            .evaluation
-            .membership(nodes, decision.ordinary.index);
+        decision.membership = evaluation.membership(
+            nodes,
+            decision.ordinary.index,
+            decision.baseline.any_qualified,
+        );
         decision.pairs = comparison::pairs(
             inner,
             group,
@@ -60,17 +63,22 @@ pub(super) fn decision(
         &decision.membership.evaluated,
         now,
     );
+    decision.evaluation = apply.then(|| evaluation.into_owned());
     decision
 }
 
 /// The ordinary choice alone: no verification evidence, and pairs stay bound to the incumbent.
-fn ordinary_decision(
-    inner: &StateInner,
+fn ordinary_decision<'a>(
+    inner: &'a StateInner,
     group: &str,
     context: &ScoreSelectionContext,
     nodes: &[&Node],
     now: Instant,
-) -> Decision {
+    apply: bool,
+) -> (
+    Decision,
+    std::borrow::Cow<'a, super::evaluation::EvaluationSet>,
+) {
     let scores = score_snapshots(inner, group, context, nodes.iter().map(|node| node.id), now);
     let baseline = performance_baseline(&scores);
     let incumbent = inner
@@ -87,8 +95,9 @@ fn ordinary_decision(
         &scores,
         baseline,
         now,
+        apply,
     );
-    let membership = evaluation.membership(nodes, reference);
+    let membership = evaluation.membership(nodes, reference, baseline.any_qualified);
     let pairs = comparison::pairs(
         inner,
         group,
@@ -99,15 +108,18 @@ fn ordinary_decision(
         now,
     );
     let ordinary = ordinary_selection(&scores, nodes, incumbent, baseline, &pairs);
-    Decision {
-        scores,
-        evidence: Vec::new(),
-        pairs,
-        baseline,
-        ordinary,
+    (
+        Decision {
+            scores,
+            evidence: Vec::new(),
+            pairs,
+            baseline,
+            ordinary,
+            evaluation: None,
+            membership,
+        },
         evaluation,
-        membership,
-    }
+    )
 }
 
 impl ScorePolicyState {
@@ -222,18 +234,22 @@ impl ScorePolicyState {
         }) && inner.valid_groups.contains(group);
         if !authorized {
             return (
-                ordinary_decision(&inner, group, context, nodes, now)
+                ordinary_decision(&inner, group, context, nodes, now, false)
+                    .0
                     .ordinary
                     .index,
                 None,
             );
         }
-        let decision = decision(&inner, group, context, nodes, now);
+        let mut decision = decision(&inner, group, context, nodes, now, true);
+        let mut set = decision
+            .evaluation
+            .take()
+            .expect("Apply prepares membership");
         let snapshots = &decision.scores;
         let performance = decision.baseline;
         let ordinary = decision.ordinary;
         let cadence_key = SelectionCadenceKey::new(group, context);
-        let mut set = decision.evaluation.clone();
         set.anchor(nodes[ordinary.index].id);
         super::validation::drop_runs_outside(&mut inner, group, context.network, &set);
         inner

@@ -306,3 +306,131 @@ fn joint_narrowing_cannot_discard_a_broader_directional_defeat() {
     assert!(summary.complete && summary.upload_known && !summary.response_misaligned);
     assert!(!summary.supported && !summary.equivalent);
 }
+
+#[test]
+fn optional_original_pair_vetoes_joint_support_until_its_own_expiry() {
+    let nodes: Vec<_> = (0..4)
+        .map(|index| node(&format!("optional veto {index}")))
+        .collect();
+    let refs = nodes.iter().collect::<Vec<_>>();
+    let target = context("optional-veto.example", IpVersion::V4);
+    let mut inner = StateInner::default();
+    let start = Instant::now();
+    // Optional evidence precedes both covered pairs and their shared block.
+    for (seconds, members) in [
+        (0, &[0, 3][..]),
+        (16, &[0, 1][..]),
+        (32, &[0, 1, 2][..]),
+        (48, &[0, 2][..]),
+    ] {
+        for &index in members {
+            response(
+                &mut inner,
+                &nodes[index],
+                &target,
+                4,
+                if index == 3 { 50 } else { 100 },
+                start + Duration::from_secs(seconds),
+            );
+        }
+    }
+    let decision_at = |at| {
+        let mut decision = scores(&inner, &nodes, &target, at);
+        for score in &mut decision.scores {
+            assert!(score.qualified());
+            score.observed_reliability = 1.0;
+        }
+        decision.membership.covered[3] = false;
+        decision.pairs = comparison::pairs(
+            &inner,
+            "score",
+            &target,
+            &refs,
+            (&decision.scores, decision.baseline),
+            (&decision.membership, 0),
+            at,
+        );
+        decision
+    };
+    let at = start + Duration::from_secs(49);
+    let decision = decision_at(at);
+    let expiry = decision.pairs.get(3).unwrap().response.unwrap().expires_at;
+    let covered_expiry = decision.pairs.get(1).unwrap().response.unwrap().expires_at;
+    assert!(expiry < covered_expiry);
+    let summary = comparison::summarize(&decision, at);
+    assert!(summary.complete && !summary.response_misaligned);
+    assert!(!summary.equivalent && !summary.supported);
+    assert_eq!(summary.valid_for, Some(expiry.duration_since(at)));
+
+    let renewed = comparison::summarize(&decision_at(expiry), expiry);
+    assert!(renewed.complete && renewed.equivalent && !renewed.response_misaligned);
+    assert_ne!(renewed.support, summary.support);
+    assert_eq!(
+        renewed.valid_for,
+        Some(covered_expiry.duration_since(expiry))
+    );
+}
+
+#[test]
+fn optional_pair_cannot_choose_the_covered_claim_basis() {
+    for optional_exact in [true, false] {
+        let nodes: Vec<_> = (0..4)
+            .map(|index| node(&format!("basis {index}")))
+            .collect();
+        let refs: Vec<_> = nodes.iter().collect();
+        let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+        let target = context("required.example", IpVersion::V4);
+        let other = context("other.example", IpVersion::V4);
+        let start = Instant::now();
+        let train = |indices: &[usize], scope: &ScoreSelectionContext, seconds| {
+            for &index in indices {
+                train_at(
+                    &manager,
+                    &nodes[index],
+                    scope,
+                    4,
+                    100,
+                    1,
+                    start + Duration::from_secs(seconds),
+                );
+            }
+        };
+        let at = if optional_exact {
+            train(&[0, 1, 2, 3], &other, 0);
+            train(&[2, 3], &target, 16);
+            train(&[0, 1], &target, 32);
+            start + Duration::from_secs(34)
+        } else {
+            train(&[0, 2], &target, 0);
+            train(&[0, 2, 3], &target, 16);
+            train(&[0, 3], &target, 32);
+            train(&[0, 1], &other, 34);
+            start + Duration::from_secs(36)
+        };
+        let state = manager.score_state();
+        let inner = state.inner.lock();
+        let mut decision = scores(&inner, &nodes, &target, at);
+        decision.membership.covered[1] = false;
+        decision.pairs = comparison::pairs(
+            &inner,
+            "score",
+            &target,
+            &refs,
+            (&decision.scores, decision.baseline),
+            (&decision.membership, 0),
+            at,
+        );
+        let summary = comparison::summarize(&decision, at);
+        assert!(summary.complete && summary.equivalent);
+        let report = evaluate(&decision, &refs, &target, None, at).snapshot;
+        assert_eq!(
+            report.comparison,
+            if optional_exact {
+                ScoreComparison::Unconfirmed
+            } else {
+                ScoreComparison::Equivalent
+            },
+            "an optional pair must neither lend nor erase exact-target support",
+        );
+    }
+}

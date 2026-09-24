@@ -195,7 +195,14 @@ fn expired_backoff_gets_bounded_recovery_despite_normal_exclusion() {
     for leaf in &nodes {
         probe_at(&manager, leaf, &target, 100, expired);
     }
-    let decision = ranking::decision(&state.inner.lock(), "score", &target, &node_refs, expired);
+    let decision = ranking::decision(
+        &state.inner.lock(),
+        "score",
+        &target,
+        &node_refs,
+        expired,
+        false,
+    );
     assert_eq!(decision.scores[1].fail_streak, 3);
     assert!(!decision.scores[1].explore_backed_off);
     assert!(!ranking::normal_eligible(
@@ -267,7 +274,7 @@ fn unchanged_failed_incumbent_allows_funded_recovery_without_free_trials() {
     let later = now + Duration::from_secs(304);
     {
         let inner = state.inner.lock();
-        let decision = ranking::decision(&inner, "score", &target, &refs, later);
+        let decision = ranking::decision(&inner, "score", &target, &refs, later, false);
         assert_eq!(decision.ordinary.index, 0);
         assert_eq!(
             decision.ordinary.reason,
@@ -283,7 +290,7 @@ fn unchanged_failed_incumbent_allows_funded_recovery_without_free_trials() {
     for second in 0..32 {
         let at = later + Duration::from_secs(second);
         let counts = manager.score_budget_counters("score", SelectionNetwork::Tcp);
-        let ordinary = ranking::decision(&state.inner.lock(), "score", &target, &refs, at)
+        let ordinary = ranking::decision(&state.inner.lock(), "score", &target, &refs, at, false)
             .ordinary
             .index;
         let (index, attempt) = state.rank_plan_at("score", &target, &refs, at);
@@ -362,7 +369,7 @@ fn unchanged_failed_incumbent_allows_funded_recovery_without_free_trials() {
     );
     {
         let inner = state.inner.lock();
-        let decision = ranking::decision(&inner, "score", &target, &refs, escape_at);
+        let decision = ranking::decision(&inner, "score", &target, &refs, escape_at, false);
         assert_eq!(decision.ordinary.index, 1);
         assert_eq!(
             decision.ordinary.reason,

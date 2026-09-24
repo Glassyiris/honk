@@ -161,6 +161,7 @@ fn response_support_is_independent_of_completion_maturity() {
         let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
         let target = context("maturity.example", IpVersion::V4);
         let now = Instant::now();
+        rank_at(&manager, &nodes, &target, now);
         for (leaf, latency) in nodes.iter().zip([100, 115]) {
             train_at(&manager, leaf, &target, samples, latency, 1, now);
         }
@@ -343,6 +344,7 @@ fn unqualified_upload_noise_cannot_revoke_response_support() {
         let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
         let target = context("unqualified.example", IpVersion::V4);
         let now = Instant::now();
+        rank_at(&manager, &nodes, &target, now);
         for (index, (leaf, latency)) in nodes.iter().zip([100, 200, 300]).enumerate() {
             train_transfers(
                 &manager,
@@ -707,6 +709,51 @@ fn rotation_evidence_can_neither_complete_nor_block_covered_members() {
     with_rotation(&mut decision, &inner, at);
     let bounded = comparison::summarize(&decision, at);
     assert!(bounded.complete && !bounded.response_misaligned);
+}
+
+#[test]
+fn optional_response_cannot_destroy_covered_joint_support() {
+    let nodes: Vec<_> = (0..4)
+        .map(|index| node(&format!("joint {index}")))
+        .collect();
+    let refs = nodes.iter().collect::<Vec<_>>();
+    let target = context("joint.example", IpVersion::V4);
+    let mut inner = StateInner::default();
+    let start = Instant::now();
+    // Covered pairs share B: {A, B} and {B, C}; the optional pair has only C.
+    for (seconds, members) in [(0, &[0, 1][..]), (20, &[0, 1, 2][..]), (40, &[0, 2, 3][..])] {
+        for &index in members {
+            response(
+                &mut inner,
+                &nodes[index],
+                &target,
+                4,
+                100,
+                start + Duration::from_secs(seconds),
+            );
+        }
+    }
+    let at = start + Duration::from_secs(41);
+    let mut decision = scores(&inner, &nodes, &target, at);
+    for score in &mut decision.scores {
+        assert!(score.qualified());
+        score.observed_reliability = 1.0;
+    }
+    decision.membership.covered[3] = false;
+    for evaluated in [false, true] {
+        decision.membership.evaluated[3] = evaluated;
+        decision.pairs = comparison::pairs(
+            &inner,
+            "score",
+            &target,
+            &refs,
+            (&decision.scores, decision.baseline),
+            (&decision.membership, 0),
+            at,
+        );
+        let summary = comparison::summarize(&decision, at);
+        assert!(summary.complete && summary.equivalent && !summary.response_misaligned);
+    }
 }
 
 #[test]

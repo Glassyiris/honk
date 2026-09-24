@@ -670,6 +670,7 @@ fn stale_failure_is_dominated_or_stays_outside_coverage_until_qualified() {
         let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
         let target = context("business.example", IpVersion::V4);
         let now = Instant::now();
+        rank_at(&manager, &nodes, &target, now);
         for (leaf, (samples, latency)) in nodes.iter().zip([(20, 10), (20, 100), (history, 1)]) {
             train_at(&manager, leaf, &target, samples, latency, 1, now);
         }
@@ -715,6 +716,7 @@ fn dominance_ends_the_claim_when_qualification_lapses() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
+    rank_at(&manager, &nodes, &target, now);
     train_at(&manager, &nodes[2], &target, 4, 1, 1, now);
     manager
         .feedback_for_group_node("score", nodes[2].id, target.clone())
@@ -727,10 +729,9 @@ fn dominance_ends_the_claim_when_qualification_lapses() {
         train_at(&manager, leaf, &target, 20, 10, 1, decayed);
     }
     let at = decayed + Duration::from_secs(2);
-    // Authorized selection admits the qualified member, so its lapse reopens the claim.
-    rank_at(&manager, &nodes, &target, at);
     let report = verification_at(&manager, &nodes, &target, at);
     assert_eq!(report.comparison, ScoreComparison::Equivalent);
+    assert_eq!(report.covered_count, 3);
     let valid_for = Duration::from_millis(report.valid_for_ms.unwrap());
     let margin = Duration::from_millis(100);
     assert_eq!(
@@ -740,6 +741,11 @@ fn dominance_ends_the_claim_when_qualification_lapses() {
     assert_eq!(
         verification_at(&manager, &nodes, &target, at + valid_for + margin).comparison,
         ScoreComparison::Unconfirmed
+    );
+    assert_eq!(
+        verification_at(&manager, &nodes, &target, at + valid_for + margin).covered_count,
+        3,
+        "qualification expiry must reopen the same covered set"
     );
 }
 
@@ -751,6 +757,7 @@ fn cross_target_latency_is_not_node_degradation() {
     let aggregate =
         ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
     let now = Instant::now();
+    rank_at(&manager, &nodes, &near, now);
     for (leaf, latency) in nodes.iter().zip([10, 100]) {
         train_at(&manager, leaf, &near, 20, latency, 1, now);
     }
@@ -972,6 +979,7 @@ fn a_measured_throughput_tradeoff_has_an_explicit_comparison_basis() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("tradeoff.example", IpVersion::V4);
     let now = Instant::now();
+    rank_at(&manager, &nodes, &target, now);
     train_at(&manager, &nodes[0], &target, 8, 100, 1_048_576, now);
     train_at(
         &manager,
@@ -1001,6 +1009,7 @@ fn upload_support_is_not_hidden_by_a_qualified_download_comparison() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("direction.example", IpVersion::V4);
     let now = Instant::now();
+    rank_at(&manager, &nodes, &target, now);
     for (index, (latency, upload, download)) in [
         (100, 1_048_576, 524_288),
         (95, 524_288, 419_430),

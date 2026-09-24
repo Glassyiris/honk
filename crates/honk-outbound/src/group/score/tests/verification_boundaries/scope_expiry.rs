@@ -71,6 +71,7 @@ fn cross_pair_response_misalignment_requests_funded_validation_for_control_and_c
         let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
         let target = context("timing.example", IpVersion::V4);
         let now = Instant::now();
+        rank_at(&manager, &nodes, &target, now);
         train_cross_pair_responses(&manager, &nodes, &target, now, aligned);
         let state = manager.score_state();
         let refs: Vec<_> = nodes.iter().collect();
@@ -227,6 +228,7 @@ fn cross_pair_response_repair_requires_shared_fresh_reporters_after_old_blocks_e
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("timing.example", IpVersion::V4);
     let now = Instant::now();
+    rank_at(&manager, &nodes, &target, now);
     train_cross_pair_responses(&manager, &nodes, &target, now, false);
     let state = manager.score_state();
     let refs: Vec<_> = nodes.iter().collect();
@@ -318,6 +320,7 @@ fn aggregate_transfer_claim_expires_with_crossed_direction_support() {
     let aggregate =
         ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
     let now = Instant::now();
+    rank_at(&manager, &nodes, &target, now);
     for (index, leaf) in nodes.iter().enumerate() {
         for _ in 0..8 {
             let reporter = manager
@@ -384,6 +387,7 @@ fn winner_only_probe_does_not_replace_common_business_response_evidence() {
     let aggregate =
         ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
     let now = Instant::now();
+    rank_at(&manager, &nodes, &target, now);
     for leaf in &nodes {
         train_at(&manager, leaf, &target, 4, 100, 1, now);
     }
@@ -420,6 +424,7 @@ fn comparison_validity_cannot_outlive_a_required_candidate_availability_lease() 
     let aggregate =
         ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
     let now = Instant::now();
+    rank_at(&manager, &nodes, &target, now);
     for leaf in &nodes {
         for _ in 0..8 {
             let reporter = manager
@@ -534,6 +539,7 @@ fn sparse_common_support_is_local_only_and_completeness_recovers() {
     let aggregate =
         ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
     let now = Instant::now();
+    rank_at(&manager, &nodes, &dense, now);
     for leaf in &nodes {
         train_at(&manager, leaf, &sparse, 1, 100, 1, now);
     }

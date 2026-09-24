@@ -9,7 +9,7 @@ const REFRESH: Duration = Duration::from_secs(5 * 60);
 const ROTATION_SLOT: Duration = Duration::from_secs(10 * 60);
 const DEMAND_HALF_LIFE: Duration = Duration::from_secs(5 * 60);
 const MIN_MEMBERS: usize = 3;
-/// Keeps each member's targets and probe cohorts within the comparison store's cell cap.
+/// Bounds per-group evaluation work; comparison storage has its own independent limit.
 const MAX_MEMBERS: usize = 25;
 /// Share of earned optional work spent keeping members qualified; the rest aligns responses.
 const QUALIFICATION_SHARE: f64 = 0.5;
@@ -20,18 +20,13 @@ const ANCHORS: usize = 4;
 
 #[derive(Clone, Default)]
 pub(super) struct EvaluationSet {
-    ranked: Vec<Uuid>,
-    /// Ranked members counted toward claims since their first qualification.
-    admitted: Vec<Uuid>,
-    /// Qualification gates coverage only once some member is qualified.
-    gated: bool,
+    /// Explicit ranked identities and their sticky qualification admission.
+    ranked: Vec<(Uuid, bool)>,
     rotation: Option<(Uuid, Instant)>,
     anchors: Vec<Uuid>,
     refreshed_at: Option<Instant>,
     limit: usize,
-    bounded: bool,
-    demand: f64,
-    demand_at: Option<Instant>,
+    demand: Option<(Instant, f64)>,
 }
 
 /// Flags aligned with the decision's node order.
@@ -53,24 +48,18 @@ impl Membership {
     }
 }
 
-fn decayed(value: f64, elapsed: Duration, half_life: Duration) -> f64 {
-    value * (-elapsed.as_secs_f64() / half_life.as_secs_f64()).exp2()
-}
-
 impl EvaluationSet {
     /// Counts an original business at the same deduplicated point as `business_starts`.
     pub(super) fn record_demand(&mut self, now: Instant) {
-        self.demand = self.demand_now(now) + 1.0;
-        self.demand_at = Some(now);
+        self.demand = Some((now, self.demand_now(now) + 1.0));
     }
 
     fn demand_now(&self, now: Instant) -> f64 {
-        self.demand_at.map_or(0.0, |at| {
-            decayed(
-                self.demand,
-                now.saturating_duration_since(at),
-                DEMAND_HALF_LIFE,
-            )
+        self.demand.map_or(0.0, |(at, starts)| {
+            starts
+                * (-now.saturating_duration_since(at).as_secs_f64()
+                    / DEMAND_HALF_LIFE.as_secs_f64())
+                .exp2()
         })
     }
 
@@ -86,12 +75,13 @@ impl EvaluationSet {
 
     /// Whether this member may receive comparisons and optional work under the stored set.
     pub(super) fn evaluates(&self, node: Uuid) -> bool {
-        self.ranks(node) || self.rotation.is_some_and(|(id, _)| id == node)
+        self.ranked.iter().any(|(id, _)| *id == node)
+            || self.rotation.is_some_and(|(id, _)| id == node)
     }
 
     /// Whether probe comparison cells for this member are outside the bounded store budget.
     pub(super) fn excludes(&self, node: Uuid) -> bool {
-        !self.evaluates(node) && !self.anchors.contains(&node)
+        self.refreshed_at.is_some() && !self.evaluates(node) && !self.anchors.contains(&node)
     }
 
     pub(super) fn anchor(&mut self, node: Uuid) {
@@ -104,22 +94,32 @@ impl EvaluationSet {
     pub(super) fn reset_members(&mut self) {
         *self = Self {
             demand: self.demand,
-            demand_at: self.demand_at,
             ..Self::default()
         };
     }
 
-    fn ranks(&self, node: Uuid) -> bool {
-        !self.bounded || self.ranked.contains(&node)
+    pub(super) fn pending_qualification(&mut self, node: Uuid) -> Option<&mut bool> {
+        self.ranked
+            .iter_mut()
+            .find(|(id, admitted)| *id == node && !*admitted)
+            .map(|(_, admitted)| admitted)
     }
 
-    pub(super) fn membership(&self, nodes: &[&Node], reference: usize) -> Membership {
+    pub(super) fn membership(
+        &self,
+        nodes: &[&Node],
+        reference: usize,
+        any_qualified: bool,
+    ) -> Membership {
         let covered: Vec<_> = nodes
             .iter()
             .enumerate()
             .map(|(index, node)| {
                 index == reference
-                    || (self.ranks(node.id) && (!self.gated || self.admitted.contains(&node.id)))
+                    || self
+                        .ranked
+                        .iter()
+                        .any(|(id, admitted)| *id == node.id && (!any_qualified || *admitted))
             })
             .collect();
         let evaluated = nodes
@@ -131,14 +131,18 @@ impl EvaluationSet {
     }
 }
 
-/// Pure projection of the stored set onto current members; only an authorized Apply stores it.
-pub(super) fn derive(
-    stored: Option<&EvaluationSet>,
+/// Only Apply refreshes committed participants; readonly bootstrap cannot admit qualified members.
+pub(super) fn derive<'a>(
+    stored: Option<&'a EvaluationSet>,
     nodes: &[&Node],
     snapshots: &[ScoreSnapshot],
     baseline: PerformanceBaseline,
     now: Instant,
-) -> EvaluationSet {
+    apply: bool,
+) -> std::borrow::Cow<'a, EvaluationSet> {
+    if !apply && let Some(set) = stored.filter(|set| set.refreshed_at.is_some()) {
+        return std::borrow::Cow::Borrowed(set);
+    }
     let mut set = stored.cloned().unwrap_or_default();
     if set
         .refreshed_at
@@ -149,7 +153,6 @@ pub(super) fn derive(
         if target > set.limit || target + 2 <= set.limit {
             set.limit = target;
         }
-        set.bounded = nodes.len() > set.limit;
         let utilities: Vec<_> = snapshots
             .iter()
             .map(|score| utility(score, baseline))
@@ -175,58 +178,50 @@ pub(super) fn derive(
                 .then_with(|| probe(left).total_cmp(&probe(right)))
                 .then_with(|| nodes[left].id.cmp(&nodes[right].id))
         });
-        let ranked_len = if set.bounded {
+        let ranked_len = if nodes.len() > set.limit {
             set.limit - 1
         } else {
-            nodes.len()
+            set.limit
         };
         let rank = |id: &Uuid| order.iter().position(|&index| nodes[index].id == *id);
         // A member missing from this filtered or retry view keeps its place; absence is not removal.
         set.ranked
-            .retain(|id| rank(id).is_none_or(|rank| rank < ranked_len + RANK_HYSTERESIS));
-        set.ranked.sort_by_key(|id| rank(id).unwrap_or(usize::MAX));
+            .retain(|(id, _)| rank(id).is_none_or(|rank| rank < ranked_len + RANK_HYSTERESIS));
+        set.ranked
+            .sort_by_key(|(id, _)| rank(id).unwrap_or(usize::MAX));
         set.ranked.truncate(ranked_len);
         for &index in &order {
             if set.ranked.len() == ranked_len {
                 break;
             }
-            if !set.ranked.contains(&nodes[index].id) {
-                set.ranked.push(nodes[index].id);
+            if !set.ranked.iter().any(|(id, _)| *id == nodes[index].id) {
+                set.ranked.push((nodes[index].id, false));
             }
         }
         set.refreshed_at = Some(now);
     }
-    // Members join claims at their first qualification, never by measured value, so members still
-    // acquiring evidence cannot stall a claim; once admitted they stay until ranked out.
-    set.gated = baseline.any_qualified;
-    let bounded = set.bounded;
-    set.admitted
-        .retain(|id| !bounded || set.ranked.contains(id));
-    for (node, score) in nodes.iter().zip(snapshots) {
-        if score.qualified() && set.ranks(node.id) && !set.admitted.contains(&node.id) {
-            set.admitted.push(node.id);
+    if apply {
+        for (node, score) in nodes.iter().zip(snapshots) {
+            if score.qualified()
+                && let Some(admitted) = set.pending_qualification(node.id)
+            {
+                *admitted = true;
+            }
         }
     }
-    if !set.bounded {
+    if set.ranked.len() == set.limit {
         set.rotation = None;
-        return set;
-    }
-    let rotation_due = set.rotation.is_none_or(|(id, since)| {
-        set.ranked.contains(&id) || now.saturating_duration_since(since) >= ROTATION_SLOT
-    });
-    if rotation_due {
+    } else if set.rotation.is_none_or(|(id, since)| {
+        set.ranked.iter().any(|(ranked, _)| *ranked == id)
+            || now.saturating_duration_since(since) >= ROTATION_SLOT
+    }) {
         let previous = set.rotation.map(|(id, _)| id);
-        let mut outside: Vec<_> = nodes
+        set.rotation = nodes
             .iter()
             .map(|node| node.id)
-            .filter(|id| !set.ranked.contains(id))
-            .collect();
-        outside.sort_unstable();
-        set.rotation = outside
-            .iter()
-            .find(|id| previous.is_some_and(|previous| **id > previous))
-            .or(outside.first())
-            .map(|id| (*id, now));
+            .filter(|id| !set.ranked.iter().any(|(ranked, _)| ranked == id))
+            .min_by_key(|id| (previous.is_some_and(|old| *id <= old), *id))
+            .map(|id| (id, now));
     }
-    set
+    std::borrow::Cow::Owned(set)
 }

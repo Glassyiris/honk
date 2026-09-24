@@ -333,6 +333,14 @@ impl Stats {
         );
     }
 
+    fn qualified(&self, now: Instant) -> bool {
+        let decay = self
+            .updated_at
+            .map_or(1.0, |at| evidence_decay(now.saturating_duration_since(at)));
+        self.useful_completed() * decay >= PERFORMANCE_VALIDATION_SAMPLES
+            || self.qualified_until.is_some_and(|until| now < until)
+    }
+
     pub(super) fn record_finish(
         &mut self,
         now: Instant,
@@ -639,6 +647,7 @@ impl ScorePolicyState {
         attributions: &[ScoreAttribution],
         cells: &mut [StartedCells],
         now: Instant,
+        source: ScoreSource,
         mut update: impl FnMut(&mut Stats, &mut Option<u64>, bool),
     ) {
         for (attribution, started) in attributions.iter().zip(cells) {
@@ -662,6 +671,26 @@ impl ScorePolicyState {
                 .map(NodeProvenance::new)
             else {
                 continue;
+            };
+            let mut admission = if source == ScoreSource::Traffic {
+                inner
+                    .evaluation
+                    .get_mut(&super::SelectionReasonKey::new(
+                        &attribution.group,
+                        context.network,
+                    ))
+                    .and_then(|set| set.pending_qualification(attribution.node_id))
+            } else {
+                None
+            };
+            // Admission belongs to accepted evidence, not to the timing of the next rank or GET.
+            let mut update = |stats: &mut Stats, credited: &mut Option<u64>, exact| {
+                update(stats, credited, exact);
+                if let Some(admitted) = admission.as_deref_mut()
+                    && !*admitted
+                {
+                    *admitted = stats.qualified(now);
+                }
             };
             for (index, family) in [None, context.target_family].into_iter().enumerate() {
                 if started.aggregate[index].is_none() {
@@ -728,6 +757,7 @@ impl ScorePolicyState {
             attributions,
             cells,
             now,
+            source,
             |stats, credited, exact| stats.observe(&observation, source, now, credited, exact),
         );
     }
@@ -760,6 +790,7 @@ impl ScorePolicyState {
                 std::slice::from_ref(attribution),
                 std::slice::from_mut(cells),
                 now,
+                sample.source,
                 |stats, credited, exact| {
                     if context.target.is_some()
                         && matches!(

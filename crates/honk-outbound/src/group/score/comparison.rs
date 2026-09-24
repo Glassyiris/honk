@@ -65,8 +65,8 @@ pub(super) struct PairEvidence {
 pub(super) struct PairCohort {
     pub reference: usize,
     pub pairs: Vec<Option<PairEvidence>>,
-    /// The joint common-block projection, with the same indexing, when one applies.
-    pub joint: Option<Vec<PairEvidence>>,
+    /// Covered members' joint common-block projection, with the same indexing, when one applies.
+    pub joint: Option<Vec<Option<PairEvidence>>>,
 }
 
 impl PairCohort {
@@ -75,8 +75,10 @@ impl PairCohort {
     }
 
     pub fn summary_pair(&self, index: usize) -> Option<PairEvidence> {
-        self.get(index)
-            .map(|pair| self.joint.as_ref().map_or(pair, |joint| joint[index]))
+        self.joint
+            .as_ref()
+            .and_then(|joint| joint.get(index).copied().flatten())
+            .or_else(|| self.get(index))
     }
 }
 
@@ -636,13 +638,13 @@ pub(super) fn pairs(
         challengers.push(index);
     }
     let compared = compare_all(inner, group, context, members[0], &members[1..], now);
-    // An optional member without response support cannot block the covered members' alignment.
-    let joined: Vec<_> = (0..challengers.len())
-        .filter(|&slot| membership.covered[challengers[slot]] || compared[slot].response.is_some())
+    // Optional evidence can veto a claim, but cannot constrain covered members' alignment.
+    let covered: Vec<_> = (0..challengers.len())
+        .filter(|&slot| membership.covered[challengers[slot]])
         .collect();
     let mut identity = None;
-    let needs_joint = joined.len() > 1
-        && joined.iter().any(|&slot| {
+    let needs_joint = covered.len() > 1
+        && covered.iter().any(|&slot| {
             let pair = &compared[slot];
             let Some(response) = pair.response else {
                 return true;
@@ -652,14 +654,15 @@ pub(super) fn pairs(
             identity = Some(next);
             differs
         });
-    let business_response = compared.iter().any(|pair| {
+    let business_response = covered.iter().any(|&slot| {
+        let pair = &compared[slot];
         matches!(pair.basis, Basis::ExactTarget | Basis::CommonTargets) && pair.response.is_some()
     });
-    let joint_members: Vec<_> = std::iter::once(members[0])
-        .chain(joined.iter().map(|&slot| members[slot + 1]))
-        .collect();
     let joint = needs_joint
         .then(|| {
+            let joint_members: Vec<_> = std::iter::once(members[0])
+                .chain(covered.iter().map(|&slot| members[slot + 1]))
+                .collect();
             [
                 Basis::ExactTarget,
                 Basis::CommonTargets,
@@ -678,9 +681,9 @@ pub(super) fn pairs(
         reference,
         pairs,
         joint: joint.map(|joint| {
-            let mut by_node = vec![PairEvidence::default(); nodes.len()];
-            for (&slot, pair) in joined.iter().zip(joint) {
-                by_node[challengers[slot]] = pair;
+            let mut by_node = vec![None; nodes.len()];
+            for (&slot, pair) in covered.iter().zip(joint) {
+                by_node[challengers[slot]] = Some(pair);
             }
             by_node
         }),

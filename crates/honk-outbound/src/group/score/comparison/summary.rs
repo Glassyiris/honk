@@ -156,7 +156,7 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
         let Some(pair) = decision.pairs.get(index) else {
             continue;
         };
-        if decision.pairs.joint.is_some() {
+        if covered[index] && decision.pairs.joint.is_some() {
             let original = PairEvidence {
                 response: pair.response.filter(|metric| now < metric.expires_at),
                 upload: pair.upload.filter(|metric| now < metric.expires_at),
@@ -182,7 +182,10 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
                 }
             }
         }
-        let pair = decision.pairs.summary_pair(index).unwrap_or(pair);
+        let pair = decision
+            .pairs
+            .summary_pair(index)
+            .expect("original pair exists");
         let pair = PairEvidence {
             response: pair.response.filter(|metric| now < metric.expires_at),
             upload: pair.upload.filter(|metric| now < metric.expires_at),
@@ -204,6 +207,10 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
         if covered[index] {
             all_responses &= pair.response.is_some();
             if let Some(response) = pair.response {
+                // Optional pairs cannot lend their target/probe basis to the covered claim.
+                if response_support.is_none() {
+                    summary.basis = pair.basis;
+                }
                 let identity = (pair.basis, response.support);
                 summary.response_misaligned |= response_support.is_some_and(|old| old != identity);
                 response_support = Some(identity);

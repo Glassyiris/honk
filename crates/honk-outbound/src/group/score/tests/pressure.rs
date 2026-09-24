@@ -234,6 +234,7 @@ fn pressure_refresh_uses_latest_common_responses_without_renewing_old_support() 
     let aggregate =
         ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
     let start = Instant::now();
+    rank_at(&manager, &nodes, &targets[0], start);
     for target in &targets {
         for leaf in &nodes {
             train_at(&manager, leaf, target, 8, 100, 1, start);

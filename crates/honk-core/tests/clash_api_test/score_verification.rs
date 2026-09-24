@@ -361,6 +361,16 @@ async fn score_verification_separates_probe_comparison_from_business_usability()
             business_success(&manager, node, &context, false);
         }
     }
+    let pending = get_json(&app, "/proxies/auto").await;
+    assert_eq!(
+        pending["scoreVerification"]["tcp"]["comparison"],
+        "unconfirmed"
+    );
+    assert_eq!(
+        pending["scoreVerification"]["tcp"]["coverage"]["covered"],
+        1
+    );
+    manager.selection_plan_for_target("auto", &context);
     let observed = get_json(&app, "/proxies/auto").await;
     let verification = &observed["scoreVerification"]["tcp"];
     assert_eq!(observed["now"], "fast");
@@ -386,7 +396,6 @@ async fn score_verification_separates_probe_comparison_from_business_usability()
     assert!(validity > 0 && validity <= 120_000);
     assert_eq!(observed["scoreVerification"]["udp"]["state"], "provisional");
 
-    manager.selection_plan_for_target("auto", &context);
     let before = get_json(&app, "/stats").await;
     assert_eq!(
         before["score"]["groups"][0]["verification"]["tcp"]["usableSelections"],

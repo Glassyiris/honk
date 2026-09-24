@@ -740,7 +740,7 @@ impl ScorePolicyState {
             return None;
         }
         let inner = self.inner.lock();
-        let decision = decision(&inner, group, context, nodes, now);
+        let decision = decision(&inner, group, context, nodes, now, false);
         let mut evaluation = evaluate(
             &decision,
             nodes,
