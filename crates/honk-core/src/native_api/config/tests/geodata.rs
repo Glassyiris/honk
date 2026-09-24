@@ -523,6 +523,62 @@ async fn repeated_update_with_hosts_and_split_dns_assets_retains_available_metad
 }
 
 #[tokio::test]
+async fn cached_subscription_rows_are_fenced_without_filesystem_guards() {
+    let server = AssetServer::new(geosite("new.example"), geoip(203), false).await;
+    let fixture = Fixture::new_custom(Access::Admin, false, |root, files| {
+        setup(root, files, server.address);
+        files
+            .get_mut("main.dae")
+            .unwrap()
+            .push_str("\nsubscription {\n cached: 'http://127.0.0.1:9/cached'\n}\n");
+    })
+    .await;
+    let state = fixture.state.upgrade().unwrap();
+    let subscription = state.config.read().await.subscriptions[0].clone();
+    drop(state);
+    let store = crate::subscription::SubscriptionStore::in_dir(&fixture.path("state"));
+
+    for port in [17771, 17772] {
+        store
+            .store_content(&subscription, format!("socks5://127.0.0.1:{port}#cached"))
+            .await
+            .unwrap();
+        let operation = accepted(fixture.request(Method::POST, UPDATE).send().await.unwrap()).await;
+        let terminal = fixture.terminal(&operation).await;
+        assert_eq!(terminal["status"], "succeeded", "{terminal}");
+        assert_eq!(route(&fixture, "new.example", "192.0.2.5").await, "block");
+    }
+
+    let before = fixture.get(GEO).await;
+    let (entered, resume) = fixture.pause_before_replace();
+    let operation = accepted(fixture.request(Method::POST, UPDATE).send().await.unwrap()).await;
+    timeout(WAIT, entered).await.unwrap().unwrap();
+    store
+        .store_content(&subscription, "socks5://127.0.0.1:17773#changed".into())
+        .await
+        .unwrap();
+    resume.send(()).unwrap();
+    let terminal = fixture.terminal(&operation).await;
+    assert_eq!(terminal["status"], "failed", "{terminal}");
+    assert_eq!(terminal["error"]["details"]["stage"], "replacement_failed");
+    assert!(
+        terminal["error"]["details"]["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|asset| asset["written"] == false)
+    );
+    assert_eq!(fixture.get(GEO).await["assets"], before["assets"]);
+    assert_eq!(
+        std::fs::read(fixture.path("state/geosite.dat")).unwrap(),
+        geosite("new.example")
+    );
+    drop(store);
+    fixture.shutdown().await;
+    server.close().await;
+}
+
+#[tokio::test]
 async fn concurrent_geodata_rejections_share_the_original_admission_error() {
     use axum::response::IntoResponse as _;
     let fixture = Fixture::new(Access::Metadata, false).await;

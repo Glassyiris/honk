@@ -188,6 +188,13 @@ impl Worker {
     }
 }
 
+fn subscription_dependency(dependency: &DependencySnapshot) -> bool {
+    dependency
+        .readers
+        .iter()
+        .any(|reader| matches!(reader, DependencyReader::Subscription(_)))
+}
+
 /// Whether the dependencies the accepted configuration was admitted with still
 /// describe the disk, apart from subscription caches: the subscription owner
 /// rewrites those on every refresh without a new source acceptance, so a
@@ -201,12 +208,7 @@ fn same_settled_dependencies(
     let settled = |dependencies: &[DependencySnapshot]| {
         dependencies
             .iter()
-            .filter(|dependency| {
-                !dependency
-                    .readers
-                    .iter()
-                    .any(|reader| matches!(reader, DependencyReader::Subscription(_)))
-            })
+            .filter(|dependency| !subscription_dependency(dependency))
             .cloned()
             .collect::<Vec<_>>()
     };
@@ -271,10 +273,11 @@ fn prepare_and_replace(
         source_pins.push(pin);
     }
     let mut guards = Vec::new();
+    // Subscription labels name SQLite rows; the pre-rename recapture fences their bytes.
     for dependency in captured
         .dependencies
         .iter()
-        .filter(|dependency| !dependency.asset)
+        .filter(|dependency| !dependency.asset && !subscription_dependency(dependency))
     {
         let file = SourceFile::open_binary(&dependency.path, MAX_SOURCE_BYTES)
             .map_err(|_| failure("dependency_conflict", &writes))?;
