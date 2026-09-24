@@ -373,93 +373,6 @@ impl PairScan {
     }
 }
 
-/// Pairs every challenger with the reference; results follow `challengers`.
-fn compare_all(
-    inner: &StateInner,
-    group: &str,
-    context: &ScoreSelectionContext,
-    reference: (Uuid, Option<&Stats>),
-    challengers: &[(Uuid, Option<&Stats>)],
-    now: Instant,
-) -> Vec<PairEvidence> {
-    let Some(origin) = inner.comparisons.origin else {
-        return vec![PairEvidence::default(); challengers.len()];
-    };
-    let scan = |members: &[(Uuid, Option<&Stats>)], wanted: &dyn Fn(&Key) -> bool| {
-        let mut scans: Vec<_> = members.iter().map(|_| PairScan::default()).collect();
-        for_each_pair(
-            inner,
-            group,
-            context,
-            reference,
-            members,
-            wanted,
-            |slot, pair| {
-                scans[slot].add(context, pair, origin, now);
-            },
-        );
-        scans
-    };
-    let mut results = vec![None; challengers.len()];
-    // A metric-bearing exact pair decides the result, so only the rest need common targets.
-    if let (Some(family), Some(target)) = (context.target_family, context.target.as_ref()) {
-        let slot = super::evidence::probe_slot(context);
-        let exact_or_probe = |key: &Key| match key {
-            Key::Traffic(key) => key.family == family && key.target == *target,
-            Key::Probe { slot: probe, .. } => *probe == slot,
-        };
-        for (result, scan) in results.iter_mut().zip(scan(challengers, &exact_or_probe)) {
-            if scan.exact.is_some_and(|pair| {
-                pair.response.is_some() || pair.upload.is_some() || pair.download.is_some()
-            }) {
-                *result = Some(scan.finish());
-            }
-        }
-    }
-    let remaining: Vec<_> = (0..challengers.len())
-        .filter(|slot| results[*slot].is_none())
-        .collect();
-    if !remaining.is_empty() {
-        let members: Vec<_> = remaining.iter().map(|slot| challengers[*slot]).collect();
-        for (slot, scan) in remaining.into_iter().zip(scan(&members, &|_| true)) {
-            results[slot] = Some(scan.finish());
-        }
-    }
-    results.into_iter().map(Option::unwrap_or_default).collect()
-}
-
-/// Visits valid reference/challenger cells of each wanted cohort in store order.
-fn for_each_pair<'a>(
-    inner: &'a StateInner,
-    group: &str,
-    context: &ScoreSelectionContext,
-    (reference, reference_parent): (Uuid, Option<&Stats>),
-    challengers: &[(Uuid, Option<&Stats>)],
-    wanted: &dyn Fn(&Key) -> bool,
-    mut visit: impl FnMut(usize, (&'a Cell, &'a Cell)),
-) {
-    let slots = NodeSlots::new(challengers.iter().map(|(node, _)| *node));
-    // Keys are unique per node within a sorted cohort, so each cohort pairs at most once.
-    for cohort in inner.comparisons.cohorts(group, context.network) {
-        if !wanted(&cohort[0].key) {
-            continue;
-        }
-        let Some(left) = cohort
-            .iter()
-            .find(|cell| cell.key.node() == reference && cell.valid(inner, reference_parent))
-        else {
-            continue;
-        };
-        for right in cohort.iter().filter(|cell| cell.key.node() != reference) {
-            for slot in slots.of(right.key.node()) {
-                if right.valid(inner, challengers[slot].1) {
-                    visit(slot, (left, right));
-                }
-            }
-        }
-    }
-}
-
 fn global_stats<'a>(
     inner: &'a StateInner,
     group: &str,
@@ -498,331 +411,453 @@ fn timed(
     })
 }
 
-pub(super) fn node_evidence(
-    inner: &StateInner,
-    group: &str,
-    context: &ScoreSelectionContext,
-    nodes: &[&Node],
-    snapshots: &[ScoreSnapshot],
-    evaluated: &[bool],
-    now: Instant,
-) -> Vec<VerificationEvidence> {
-    let mut parent_key = AggregateKey {
-        group: group.to_owned(),
-        network: context.network,
-        family: None,
-        node_id: Uuid::nil(),
-    };
-    let mut family_key = AggregateKey {
-        family: context.target_family,
-        ..parent_key.clone()
-    };
-    let mut exact_key =
-        context
-            .target_family
-            .zip(context.target.clone())
-            .map(|(family, target)| ExactKey {
-                group: group.to_owned(),
-                network: context.network,
-                family,
-                target,
-                node_id: Uuid::nil(),
-            });
-    let mut parents = Vec::with_capacity(nodes.len());
-    let mut evidence: Vec<_> = nodes
-        .iter()
-        .zip(evaluated)
-        .map(|(node, evaluated)| {
-            parent_key.node_id = node.id;
-            let parent = inner.aggregate.peek(&parent_key).filter(|_| *evaluated);
-            parents.push(parent);
-            if !evaluated {
-                return VerificationEvidence::default();
-            }
-            let stamp = if let Some(key) = exact_key.as_mut() {
+/// One decision's borrowed view of comparison evidence. Node positions and their current global
+/// parents are resolved once and shared by every reader of that decision.
+pub(super) struct View<'a> {
+    pub inner: &'a StateInner,
+    pub group: &'a str,
+    pub context: &'a ScoreSelectionContext,
+    pub nodes: &'a [&'a Node],
+    pub now: Instant,
+    slots: NodeSlots,
+    parents: Vec<Option<&'a Stats>>,
+}
+
+impl<'a> View<'a> {
+    pub(super) fn new(
+        inner: &'a StateInner,
+        group: &'a str,
+        context: &'a ScoreSelectionContext,
+        nodes: &'a [&'a Node],
+        now: Instant,
+    ) -> Self {
+        let mut key = AggregateKey {
+            group: group.to_owned(),
+            network: context.network,
+            family: None,
+            node_id: Uuid::nil(),
+        };
+        let parents = nodes
+            .iter()
+            .map(|node| {
                 key.node_id = node.id;
-                inner
-                    .exact
-                    .peek(key)
-                    .and_then(|stats| CellStamp::current(stats, parent))
-            } else if context.target.is_none() {
-                family_key.node_id = node.id;
-                inner.aggregate.peek(&family_key).and_then(|stats| {
-                    if context.target_family.is_none() {
-                        Some(CellStamp::own(stats))
-                    } else {
-                        CellStamp::current(stats, parent)
-                    }
-                })
-            } else {
-                None
-            };
-            let mut evidence = stamp.map_or_else(VerificationEvidence::default, |stamp| {
-                let mut evidence = VerificationEvidence::new(stamp.stats, now);
-                evidence.business = evidence.business.filter(|metric| {
-                    stamp
-                        .invalidated_through
-                        .is_none_or(|at| metric.latest_at > at)
-                });
-                evidence
+                inner.aggregate.peek(&key)
+            })
+            .collect();
+        Self {
+            inner,
+            group,
+            context,
+            nodes,
+            now,
+            slots: NodeSlots::new(nodes.iter().map(|node| node.id)),
+            parents,
+        }
+    }
+
+    /// Original pairs of evaluated eligible challengers against `reference`, as ordinary
+    /// selection compares them; the joint projection is a separate verification step.
+    pub(super) fn pairs(
+        &self,
+        (snapshots, baseline): (&[ScoreSnapshot], super::PerformanceBaseline),
+        (membership, reference): (&super::evaluation::Membership, usize),
+    ) -> PairCohort {
+        let challengers: Vec<_> = (0..snapshots.len())
+            .filter(|&index| {
+                index != reference
+                    && membership.evaluated[index]
+                    && normal_eligible(&snapshots[index], baseline)
+            })
+            .collect();
+        let mut pairs = vec![None; self.nodes.len()];
+        for (&index, pair) in challengers
+            .iter()
+            .zip(self.compare_all(reference, &challengers))
+        {
+            pairs[index] = Some(pair);
+        }
+        PairCohort {
+            reference,
+            pairs,
+            joint: None,
+        }
+    }
+
+    /// Adds covered members' joint common-block projection when their original pairs disagree.
+    /// Optional evidence can veto a claim, but cannot constrain covered members' alignment.
+    pub(super) fn join(&self, cohort: &mut PairCohort, membership: &super::evaluation::Membership) {
+        let covered: Vec<_> = (0..cohort.pairs.len())
+            .filter(|&index| membership.covered[index] && cohort.pairs[index].is_some())
+            .collect();
+        let original = |index: usize| cohort.pairs[index].expect("covered challengers are paired");
+        let mut identity = None;
+        let needs_joint = covered.len() > 1
+            && covered.iter().any(|&index| {
+                let pair = original(index);
+                let Some(response) = pair.response else {
+                    return true;
+                };
+                let next = (pair.basis, response.support);
+                let differs = identity.is_some_and(|old| old != next);
+                identity = Some(next);
+                differs
             });
-            evidence.failed_at = evidence
-                .failed_at
-                .max(parent.and_then(|parent| parent.failed_at));
-            evidence
-        })
-        .collect();
-    let Some(origin) = inner.comparisons.origin else {
-        return evidence;
-    };
-    let slots = NodeSlots::new(nodes.iter().map(|node| node.id));
-    let slot = super::evidence::probe_slot(context);
-    // One scope pass; each node still sees its own cells in store order.
-    for cell in inner.comparisons.scope(group, context.network) {
-        let wanted = match &cell.key {
-            Key::Traffic(key) => {
-                Some(key.family) == context.target_family
-                    && Some(&key.target) == context.target.as_ref()
+        if !needs_joint {
+            return;
+        }
+        let business_response = covered.iter().any(|&index| {
+            let pair = original(index);
+            matches!(pair.basis, Basis::ExactTarget | Basis::CommonTargets)
+                && pair.response.is_some()
+        });
+        let Some(joint) = [
+            Basis::ExactTarget,
+            Basis::CommonTargets,
+            Basis::ConfiguredProbe,
+        ]
+        .into_iter()
+        .filter(|basis| *basis != Basis::ConfiguredProbe || !business_response)
+        .find_map(|basis| self.joint_pairs(cohort.reference, &covered, basis)) else {
+            return;
+        };
+        let mut by_node = vec![None; cohort.pairs.len()];
+        for (&index, pair) in covered.iter().zip(joint) {
+            by_node[index] = Some(pair);
+        }
+        cohort.joint = Some(by_node);
+    }
+
+    pub(super) fn node_evidence(
+        &self,
+        snapshots: &[ScoreSnapshot],
+        evaluated: &[bool],
+    ) -> Vec<VerificationEvidence> {
+        let (inner, context, now) = (self.inner, self.context, self.now);
+        let mut family_key = AggregateKey {
+            group: self.group.to_owned(),
+            network: context.network,
+            family: context.target_family,
+            node_id: Uuid::nil(),
+        };
+        let mut exact_key =
+            context
+                .target_family
+                .zip(context.target.clone())
+                .map(|(family, target)| ExactKey {
+                    group: self.group.to_owned(),
+                    network: context.network,
+                    family,
+                    target,
+                    node_id: Uuid::nil(),
+                });
+        let mut evidence: Vec<_> = self
+            .nodes
+            .iter()
+            .zip(evaluated)
+            .zip(&self.parents)
+            .map(|((node, evaluated), &parent)| {
+                if !evaluated {
+                    return VerificationEvidence::default();
+                }
+                let stamp = if let Some(key) = exact_key.as_mut() {
+                    key.node_id = node.id;
+                    inner
+                        .exact
+                        .peek(key)
+                        .and_then(|stats| CellStamp::current(stats, parent))
+                } else if context.target.is_none() {
+                    family_key.node_id = node.id;
+                    inner.aggregate.peek(&family_key).and_then(|stats| {
+                        if context.target_family.is_none() {
+                            Some(CellStamp::own(stats))
+                        } else {
+                            CellStamp::current(stats, parent)
+                        }
+                    })
+                } else {
+                    None
+                };
+                let mut evidence = stamp.map_or_else(VerificationEvidence::default, |stamp| {
+                    let mut evidence = VerificationEvidence::new(stamp.stats, now);
+                    evidence.business = evidence.business.filter(|metric| {
+                        stamp
+                            .invalidated_through
+                            .is_none_or(|at| metric.latest_at > at)
+                    });
+                    evidence
+                });
+                evidence.failed_at = evidence
+                    .failed_at
+                    .max(parent.and_then(|parent| parent.failed_at));
+                evidence
+            })
+            .collect();
+        let Some(origin) = inner.comparisons.origin else {
+            return evidence;
+        };
+        let slot = super::evidence::probe_slot(context);
+        // One scope pass; each node still sees its own cells in store order.
+        for cell in inner.comparisons.scope(self.group, context.network) {
+            let wanted = match &cell.key {
+                Key::Traffic(key) => {
+                    Some(key.family) == context.target_family
+                        && Some(&key.target) == context.target.as_ref()
+                }
+                Key::Probe {
+                    slot: cell_slot, ..
+                } => *cell_slot == slot,
+            };
+            let Some(timing) = cell.key.timing().filter(|_| wanted) else {
+                continue;
+            };
+            for index in self.slots.of(cell.key.node()) {
+                if !evaluated[index] || !cell.valid(inner, self.parents[index]) {
+                    continue;
+                }
+                let evidence = &mut evidence[index];
+                match &cell.key {
+                    Key::Traffic(_) => {
+                        evidence.response = timed(&cell.metrics[0], origin, now, timing);
+                        evidence.upload = timed(&cell.metrics[1], origin, now, timing);
+                        evidence.download = timed(&cell.metrics[2], origin, now, timing);
+                    }
+                    Key::Probe { scope, .. } if *scope == snapshots[index].probe_scope => {
+                        evidence.probe = timed(&cell.metrics[0], origin, now, timing);
+                    }
+                    Key::Probe { .. } => {}
+                }
             }
-            Key::Probe {
-                slot: cell_slot, ..
-            } => *cell_slot == slot,
+        }
+        evidence
+    }
+
+    /// Pairs every challenger with the reference; results follow `challengers`.
+    fn compare_all(&self, reference: usize, challengers: &[usize]) -> Vec<PairEvidence> {
+        let Some(origin) = self.inner.comparisons.origin else {
+            return vec![PairEvidence::default(); challengers.len()];
         };
-        let Some(timing) = cell.key.timing().filter(|_| wanted) else {
-            continue;
+        let (context, now) = (self.context, self.now);
+        let scan = |members: &[usize], wanted: &dyn Fn(&Key) -> bool| {
+            let mut scans: Vec<_> = members.iter().map(|_| PairScan::default()).collect();
+            self.for_each_pair(reference, members, wanted, |slot, pair| {
+                scans[slot].add(context, pair, origin, now);
+            });
+            scans
         };
-        for index in slots.of(cell.key.node()) {
-            if !evaluated[index] || !cell.valid(inner, parents[index]) {
+        let mut results = vec![None; challengers.len()];
+        // A metric-bearing exact pair decides the result, so only the rest need common targets.
+        if let (Some(family), Some(target)) = (context.target_family, context.target.as_ref()) {
+            let slot = super::evidence::probe_slot(context);
+            let exact_or_probe = |key: &Key| match key {
+                Key::Traffic(key) => key.family == family && key.target == *target,
+                Key::Probe { slot: probe, .. } => *probe == slot,
+            };
+            for (result, scan) in results.iter_mut().zip(scan(challengers, &exact_or_probe)) {
+                if scan.exact.is_some_and(|pair| {
+                    pair.response.is_some() || pair.upload.is_some() || pair.download.is_some()
+                }) {
+                    *result = Some(scan.finish());
+                }
+            }
+        }
+        let remaining: Vec<_> = (0..challengers.len())
+            .filter(|slot| results[*slot].is_none())
+            .collect();
+        if !remaining.is_empty() {
+            let members: Vec<_> = remaining.iter().map(|slot| challengers[*slot]).collect();
+            for (slot, scan) in remaining.into_iter().zip(scan(&members, &|_| true)) {
+                results[slot] = Some(scan.finish());
+            }
+        }
+        results.into_iter().map(Option::unwrap_or_default).collect()
+    }
+
+    /// Each node position's slot within `members`, which lists positions without repeats.
+    fn member_slots(&self, members: &[usize]) -> Vec<Option<usize>> {
+        let mut slots = vec![None; self.nodes.len()];
+        for (slot, &index) in members.iter().enumerate() {
+            slots[index] = Some(slot);
+        }
+        slots
+    }
+
+    /// Visits valid reference/member cells of each wanted cohort in store order; `visit`
+    /// receives each member's position within `members`.
+    fn for_each_pair(
+        &self,
+        reference: usize,
+        members: &[usize],
+        wanted: &dyn Fn(&Key) -> bool,
+        mut visit: impl FnMut(usize, (&'a Cell, &'a Cell)),
+    ) {
+        let member_slot = self.member_slots(members);
+        let reference_id = self.nodes[reference].id;
+        // Keys are unique per node within a sorted cohort, so each cohort pairs at most once.
+        for cohort in self
+            .inner
+            .comparisons
+            .cohorts(self.group, self.context.network)
+        {
+            if !wanted(&cohort[0].key) {
                 continue;
             }
-            let evidence = &mut evidence[index];
-            match &cell.key {
-                Key::Traffic(_) => {
-                    evidence.response = timed(&cell.metrics[0], origin, now, timing);
-                    evidence.upload = timed(&cell.metrics[1], origin, now, timing);
-                    evidence.download = timed(&cell.metrics[2], origin, now, timing);
-                }
-                Key::Probe { scope, .. } if *scope == snapshots[index].probe_scope => {
-                    evidence.probe = timed(&cell.metrics[0], origin, now, timing);
-                }
-                Key::Probe { .. } => {}
-            }
-        }
-    }
-    evidence
-}
-
-pub(super) fn pairs(
-    inner: &StateInner,
-    group: &str,
-    context: &ScoreSelectionContext,
-    nodes: &[&Node],
-    (snapshots, baseline): (&[ScoreSnapshot], super::PerformanceBaseline),
-    (membership, reference): (&super::evaluation::Membership, usize),
-    now: Instant,
-) -> PairCohort {
-    let mut parent_key = AggregateKey {
-        group: group.to_owned(),
-        network: context.network,
-        family: None,
-        node_id: nodes[reference].id,
-    };
-    let mut members = vec![(parent_key.node_id, inner.aggregate.peek(&parent_key))];
-    let mut challengers = Vec::new();
-    for (index, score) in snapshots.iter().enumerate() {
-        if index == reference || !membership.evaluated[index] || !normal_eligible(score, baseline) {
-            continue;
-        }
-        parent_key.node_id = nodes[index].id;
-        members.push((parent_key.node_id, inner.aggregate.peek(&parent_key)));
-        challengers.push(index);
-    }
-    let compared = compare_all(inner, group, context, members[0], &members[1..], now);
-    // Optional evidence can veto a claim, but cannot constrain covered members' alignment.
-    let covered: Vec<_> = (0..challengers.len())
-        .filter(|&slot| membership.covered[challengers[slot]])
-        .collect();
-    let mut identity = None;
-    let needs_joint = covered.len() > 1
-        && covered.iter().any(|&slot| {
-            let pair = &compared[slot];
-            let Some(response) = pair.response else {
-                return true;
+            let Some(left) = cohort.iter().find(|cell| {
+                cell.key.node() == reference_id && cell.valid(self.inner, self.parents[reference])
+            }) else {
+                continue;
             };
-            let next = (pair.basis, response.support);
-            let differs = identity.is_some_and(|old| old != next);
-            identity = Some(next);
-            differs
-        });
-    let business_response = covered.iter().any(|&slot| {
-        let pair = &compared[slot];
-        matches!(pair.basis, Basis::ExactTarget | Basis::CommonTargets) && pair.response.is_some()
-    });
-    let joint = needs_joint
-        .then(|| {
-            let joint_members: Vec<_> = std::iter::once(members[0])
-                .chain(covered.iter().map(|&slot| members[slot + 1]))
-                .collect();
-            [
-                Basis::ExactTarget,
-                Basis::CommonTargets,
-                Basis::ConfiguredProbe,
-            ]
-            .into_iter()
-            .filter(|basis| *basis != Basis::ConfiguredProbe || !business_response)
-            .find_map(|basis| joint_pairs(inner, group, context, &joint_members, basis, now))
-        })
-        .flatten();
-    let mut pairs = vec![None; nodes.len()];
-    for (index, pair) in challengers.iter().zip(compared) {
-        pairs[*index] = Some(pair);
-    }
-    PairCohort {
-        reference,
-        pairs,
-        joint: joint.map(|joint| {
-            let mut by_node = vec![None; nodes.len()];
-            for (&slot, pair) in covered.iter().zip(joint) {
-                by_node[challengers[slot]] = Some(pair);
+            for right in cohort.iter().filter(|cell| cell.key.node() != reference_id) {
+                for index in self.slots.of(right.key.node()) {
+                    if let Some(slot) = member_slot[index]
+                        && right.valid(self.inner, self.parents[index])
+                    {
+                        visit(slot, (left, right));
+                    }
+                }
             }
-            by_node
-        }),
+        }
     }
-}
 
-fn joint_pairs(
-    inner: &StateInner,
-    group: &str,
-    context: &ScoreSelectionContext,
-    members: &[(Uuid, Option<&Stats>)],
-    basis: Basis,
-    now: Instant,
-) -> Option<Vec<PairEvidence>> {
-    let origin = inner.comparisons.origin?;
-    let count = members.len() - 1;
-    let mut result = vec![
-        PairEvidence {
-            basis,
-            ..PairEvidence::default()
+    fn joint_pairs(
+        &self,
+        reference: usize,
+        covered: &[usize],
+        basis: Basis,
+    ) -> Option<Vec<PairEvidence>> {
+        let (inner, context, now) = (self.inner, self.context, self.now);
+        let origin = inner.comparisons.origin?;
+        let members: Vec<_> = std::iter::once(reference)
+            .chain(covered.iter().copied())
+            .collect();
+        let count = covered.len();
+        let mut result = vec![
+            PairEvidence {
+                basis,
+                ..PairEvidence::default()
+            };
+            count
+        ];
+        let mut targets = 0;
+        let mut partial = false;
+        let member_slot = self.member_slots(&members);
+        // A duplicated node id resolves to its first member slot.
+        let slot_of = |cell: &Cell| {
+            self.slots
+                .of(cell.key.node())
+                .filter_map(|index| member_slot[index])
+                .min()
+                .filter(|slot| cell.valid(inner, self.parents[members[*slot]]))
         };
-        count
-    ];
-    let mut targets = 0;
-    let mut partial = false;
-    // A duplicated node id resolves to its first member slot.
-    let slots = NodeSlots::new(members.iter().map(|(node, _)| *node));
-    let slot_of = |cell: &Cell| {
-        slots
-            .of(cell.key.node())
-            .next()
-            .filter(|slot| cell.valid(inner, members[*slot].1))
-    };
-    let (reference, reference_parent) = members[0];
-    let mut selected = vec![None; members.len()];
-    let mut next = vec![PairEvidence::default(); count];
-    for current in inner.comparisons.cohorts(group, context.network) {
-        let eligible = match (&current[0].key, basis) {
-            (Key::Traffic(key), Basis::ExactTarget) => {
-                Some(key.family) == context.target_family
-                    && Some(&key.target) == context.target.as_ref()
+        let reference_id = self.nodes[reference].id;
+        let reference_parent = self.parents[reference];
+        let mut selected = vec![None; members.len()];
+        let mut next = vec![PairEvidence::default(); count];
+        for current in inner.comparisons.cohorts(self.group, context.network) {
+            let eligible = match (&current[0].key, basis) {
+                (Key::Traffic(key), Basis::ExactTarget) => {
+                    Some(key.family) == context.target_family
+                        && Some(&key.target) == context.target.as_ref()
+                }
+                (Key::Traffic(key), Basis::CommonTargets) => context
+                    .target_family
+                    .is_none_or(|family| family == key.family),
+                (Key::Probe { slot, .. }, Basis::ConfiguredProbe) => {
+                    *slot == super::evidence::probe_slot(context)
+                }
+                _ => false,
+            };
+            if !eligible {
+                continue;
             }
-            (Key::Traffic(key), Basis::CommonTargets) => context
-                .target_family
-                .is_none_or(|family| family == key.family),
-            (Key::Probe { slot, .. }, Basis::ConfiguredProbe) => {
-                *slot == super::evidence::probe_slot(context)
-            }
-            _ => false,
-        };
-        if !eligible {
-            continue;
-        }
-        // Keys are unique per node within a cohort: fewer cells than members cannot be complete.
-        if current.len() < members.len() {
-            partial |= current
-                .iter()
-                .find(|cell| cell.key.node() == reference && cell.valid(inner, reference_parent))
-                .is_some_and(|left| {
-                    current.iter().any(|right| {
-                        right.key.node() != reference
-                            && slot_of(right).is_some()
-                            && has_common_block(left, right, origin, now)
+            // Keys are unique per node within a cohort: fewer cells than members cannot be complete.
+            if current.len() < members.len() {
+                partial |= current
+                    .iter()
+                    .find(|cell| {
+                        cell.key.node() == reference_id && cell.valid(inner, reference_parent)
                     })
-                });
-            continue;
-        }
-        selected.fill(None);
-        for cell in current {
-            if let Some(slot) = slot_of(cell) {
-                selected[slot] = Some(cell);
+                    .is_some_and(|left| {
+                        current.iter().any(|right| {
+                            right.key.node() != reference_id
+                                && slot_of(right).is_some()
+                                && has_common_block(left, right, origin, now)
+                        })
+                    });
+                continue;
             }
-        }
-        if selected.iter().any(Option::is_none) {
-            partial |= selected[0].is_some_and(|left| {
-                selected[1..]
+            selected.fill(None);
+            for cell in current {
+                if let Some(slot) = slot_of(cell) {
+                    selected[slot] = Some(cell);
+                }
+            }
+            if selected.iter().any(Option::is_none) {
+                partial |= selected[0].is_some_and(|left| {
+                    selected[1..]
+                        .iter()
+                        .flatten()
+                        .any(|right| has_common_block(left, right, origin, now))
+                });
+                continue;
+            }
+            let left = selected[0]?;
+            let timing = left.key.timing()?;
+            let mut blocks = [0_u8; 3];
+            for (metric, mask) in blocks.iter_mut().enumerate() {
+                for block in 0..BLOCKS {
+                    if selected.iter().flatten().all(|cell| {
+                        timing.common(
+                            &left.metrics[metric][block],
+                            &cell.metrics[metric][block],
+                            origin,
+                            now,
+                        )
+                    }) {
+                        *mask |= 1 << block;
+                    }
+                }
+            }
+            blocks[1] &= blocks[0];
+            blocks[2] &= blocks[0];
+            for (slot, pair) in next.iter_mut().enumerate() {
+                *pair = paired_cell(left, selected[slot + 1]?, origin, now, basis, blocks);
+            }
+            if next.iter().any(|pair| pair.response.is_none()) {
+                partial |= selected[1..]
                     .iter()
                     .flatten()
-                    .any(|right| has_common_block(left, right, origin, now))
-            });
-            continue;
-        }
-        let left = selected[0]?;
-        let timing = left.key.timing()?;
-        let mut blocks = [0_u8; 3];
-        for (metric, mask) in blocks.iter_mut().enumerate() {
-            for block in 0..BLOCKS {
-                if selected.iter().flatten().all(|cell| {
-                    timing.common(
-                        &left.metrics[metric][block],
-                        &cell.metrics[metric][block],
-                        origin,
-                        now,
-                    )
-                }) {
-                    *mask |= 1 << block;
-                }
+                    .any(|right| has_common_block(left, right, origin, now));
+                continue;
+            }
+            if targets == MAX_TARGETS {
+                partial = true;
+                continue;
+            }
+            for (pair, next) in result.iter_mut().zip(&next) {
+                merge_metric(&mut pair.response, next.response, targets);
+                merge_metric(&mut pair.upload, next.upload, targets);
+                merge_metric(&mut pair.download, next.download, targets);
+            }
+            targets += 1;
+            if basis != Basis::CommonTargets {
+                break;
             }
         }
-        blocks[1] &= blocks[0];
-        blocks[2] &= blocks[0];
-        for (slot, pair) in next.iter_mut().enumerate() {
-            *pair = paired_cell(left, selected[slot + 1]?, origin, now, basis, blocks);
+        if targets == 0 {
+            return None;
         }
-        if next.iter().any(|pair| pair.response.is_none()) {
-            partial |= selected[1..]
-                .iter()
+        for pair in &mut result {
+            pair.partial = basis == Basis::CommonTargets && partial;
+            for metric in [&mut pair.response, &mut pair.upload, &mut pair.download]
+                .into_iter()
                 .flatten()
-                .any(|right| has_common_block(left, right, origin, now));
-            continue;
+            {
+                metric.incumbent /= targets as f64;
+                metric.candidate /= targets as f64;
+            }
         }
-        if targets == MAX_TARGETS {
-            partial = true;
-            continue;
-        }
-        for (pair, next) in result.iter_mut().zip(&next) {
-            merge_metric(&mut pair.response, next.response, targets);
-            merge_metric(&mut pair.upload, next.upload, targets);
-            merge_metric(&mut pair.download, next.download, targets);
-        }
-        targets += 1;
-        if basis != Basis::CommonTargets {
-            break;
-        }
+        Some(result)
     }
-    if targets == 0 {
-        return None;
-    }
-    for pair in &mut result {
-        pair.partial = basis == Basis::CommonTargets && partial;
-        for metric in [&mut pair.response, &mut pair.upload, &mut pair.download]
-            .into_iter()
-            .flatten()
-        {
-            metric.incumbent /= targets as f64;
-            metric.candidate /= targets as f64;
-        }
-    }
-    Some(result)
 }
 
 pub(super) fn response_progress(

@@ -335,9 +335,8 @@ fn optional_original_pair_vetoes_joint_support_until_its_own_expiry() {
             score.observed_reliability = 1.0;
         }
         decision.membership.covered[3] = false;
-        decision.pairs = comparison::pairs(
+        decision.pairs = pairs_at(
             &inner,
-            "score",
             &target,
             &refs,
             (&decision.scores, decision.baseline),
@@ -402,9 +401,8 @@ fn optional_pair_cannot_choose_the_covered_claim_basis() {
         let inner = state.inner.lock();
         let mut decision = scores(&inner, &nodes, &target, at);
         decision.membership.covered[1] = false;
-        decision.pairs = comparison::pairs(
+        decision.pairs = pairs_at(
             &inner,
-            "score",
             &target,
             &refs,
             (&decision.scores, decision.baseline),

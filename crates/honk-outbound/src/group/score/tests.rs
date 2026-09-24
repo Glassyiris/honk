@@ -222,6 +222,21 @@ fn rank_at(
         .rank_at("score", target, &nodes.iter().collect::<Vec<_>>(), now)
 }
 
+/// A decision's pairs with the covered joint projection, as `ranking::decision` builds them.
+fn pairs_at(
+    inner: &StateInner,
+    target: &ScoreSelectionContext,
+    refs: &[&Node],
+    scores: (&[ScoreSnapshot], PerformanceBaseline),
+    membership: (&super::evaluation::Membership, usize),
+    now: Instant,
+) -> super::comparison::PairCohort {
+    let view = super::comparison::View::new(inner, "score", target, refs, now);
+    let mut pairs = view.pairs(scores, membership);
+    view.join(&mut pairs, membership.0);
+    pairs
+}
+
 fn decision_at(
     inner: &StateInner,
     nodes: &[Node],
@@ -237,18 +252,10 @@ fn decision_at(
     let baseline = ranking::performance_baseline(&scores);
     // Comparison unit tests exercise every member; bounding is covered by evaluation tests.
     let membership = super::evaluation::Membership::all(nodes.len());
-    let evidence = super::comparison::node_evidence(
+    let evidence = super::comparison::View::new(inner, "score", target, &refs, now)
+        .node_evidence(&scores, &membership.evaluated);
+    let pairs = pairs_at(
         inner,
-        "score",
-        target,
-        &refs,
-        &scores,
-        &membership.evaluated,
-        now,
-    );
-    let pairs = super::comparison::pairs(
-        inner,
-        "score",
         target,
         &refs,
         (&scores, baseline),

@@ -671,9 +671,8 @@ fn rotation_evidence_can_neither_complete_nor_block_covered_members() {
     let target = context("rotation.example", IpVersion::V4);
     let with_rotation = |decision: &mut ranking::Decision, inner: &StateInner, at| {
         decision.membership.covered[3] = false;
-        decision.pairs = comparison::pairs(
+        decision.pairs = pairs_at(
             inner,
-            "score",
             &target,
             &refs,
             (&decision.scores, decision.baseline),
@@ -745,9 +744,8 @@ fn optional_response_cannot_destroy_covered_joint_support() {
     decision.membership.covered[3] = false;
     for evaluated in [false, true] {
         decision.membership.evaluated[3] = evaluated;
-        decision.pairs = comparison::pairs(
+        decision.pairs = pairs_at(
             &inner,
-            "score",
             &target,
             &refs,
             (&decision.scores, decision.baseline),
