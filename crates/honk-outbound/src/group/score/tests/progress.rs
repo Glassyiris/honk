@@ -31,7 +31,7 @@ fn active_udp_keeps_earned_qualification_without_inventing_completions() {
             &nodes[index],
             &target,
             samples,
-            Duration::from_millis(100 + index as u64 * 5),
+            100 + index as u64 * 5,
             1,
             now,
         );
@@ -103,7 +103,7 @@ fn active_udp_keeps_earned_qualification_without_inventing_completions() {
         &nodes[1],
         &target,
         5,
-        Duration::from_millis(105),
+        105,
         1,
         now + Duration::from_secs(720),
     );
@@ -170,7 +170,7 @@ fn publishable_business_rx_opens_recovery_without_settling_the_flow() {
             leaf,
             &target,
             1000,
-            Duration::from_millis(100 + index as u64 * 10),
+            100 + index as u64 * 10,
             1,
             now + Duration::from_secs(index as u64 * 2),
         );
@@ -191,7 +191,7 @@ fn publishable_business_rx_opens_recovery_without_settling_the_flow() {
         &nodes[1],
         &target,
         1000,
-        Duration::from_millis(95),
+        95,
         1,
         now + Duration::from_secs(7),
     );
@@ -338,15 +338,7 @@ fn stale_terminal_rx_preserves_failure_and_cannot_refresh_verification() {
     let now = Instant::now();
     // Two failures must stay below the mature margin to isolate recovery from risk-based promotion.
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            512,
-            Duration::from_millis(100),
-            1,
-            now,
-        );
+        train_at(&manager, leaf, &target, 512, 100, 1, now);
     }
     assert_eq!(
         rank_at(&manager, &nodes, &target, now + Duration::from_secs(2)),
@@ -414,15 +406,7 @@ fn reload_and_eviction_fence_progress_without_disabling_surviving_reporters() {
     let target = udp_context();
     let before = Instant::now() - Duration::from_secs(10);
     for (index, samples) in [4, 5].into_iter().enumerate() {
-        train_at(
-            &manager,
-            &nodes[index],
-            &target,
-            samples,
-            Duration::from_millis(100),
-            1,
-            before,
-        );
+        train_at(&manager, &nodes[index], &target, samples, 100, 1, before);
     }
     let feedback = manager
         .feedback_for_group_node("score", nodes[0].id, target.clone())
@@ -539,15 +523,7 @@ fn delayed_terminal_bridges_qualification_to_already_observed_newer_rx() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = udp_context();
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        4,
-        Duration::from_millis(100),
-        1,
-        now,
-    );
+    train_at(&manager, &nodes[0], &target, 4, 100, 1, now);
     let feedback = manager
         .feedback_for_group_node("score", nodes[0].id, target.clone())
         .unwrap();
@@ -564,7 +540,7 @@ fn delayed_terminal_bridges_qualification_to_already_observed_newer_rx() {
         &nodes[1],
         &target,
         5,
-        Duration::from_millis(105),
+        105,
         1,
         now + Duration::from_secs(1869),
     );
@@ -637,15 +613,7 @@ fn four_distinct_live_replies_restore_eligibility_without_paying_terminal_debt()
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = udp_context();
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[1],
-        &target,
-        200,
-        Duration::from_millis(100),
-        1,
-        now,
-    );
+    train_at(&manager, &nodes[1], &target, 200, 100, 1, now);
     let feedback = manager
         .feedback_for_group_node("score", nodes[0].id, target.clone())
         .unwrap();

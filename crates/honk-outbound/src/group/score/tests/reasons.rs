@@ -122,15 +122,7 @@ fn ordinary_switch_counts_commits_but_not_first_choice_stay_peek_or_trial() {
         node_id: node.id,
     });
     for (leaf, latency) in nodes.iter().zip([50, 200]) {
-        train_at(
-            &manager,
-            leaf,
-            &context,
-            8,
-            Duration::from_millis(latency),
-            1,
-            now,
-        );
+        train_at(&manager, leaf, &context, 8, latency, 1, now);
     }
     let now = now + Duration::from_secs(1);
     assert_eq!(state.rank_at("score", &context, &node_refs, now), 0);
@@ -144,15 +136,7 @@ fn ordinary_switch_counts_commits_but_not_first_choice_stay_peek_or_trial() {
 
     let now = now + PERFORMANCE_MAX_AGE;
     for (leaf, latency) in nodes.iter().zip([200, 50]) {
-        train_at(
-            &manager,
-            leaf,
-            &context,
-            8,
-            Duration::from_millis(latency),
-            1,
-            now,
-        );
+        train_at(&manager, leaf, &context, 8, latency, 1, now);
     }
     let now = now + Duration::from_secs(1);
     let before_peek = state.selection_reason_counts("score", SelectionNetwork::Tcp);
@@ -212,15 +196,7 @@ fn ordinary_switch_counts_commits_but_not_first_choice_stay_peek_or_trial() {
         1
     );
     for (leaf, latency) in nodes.iter().zip([50, 200]) {
-        train_at(
-            &manager,
-            leaf,
-            &context,
-            8,
-            Duration::from_millis(latency),
-            1,
-            expired,
-        );
+        train_at(&manager, leaf, &context, 8, latency, 1, expired);
     }
     let expired = expired + Duration::from_secs(1);
     assert_eq!(state.rank_at("score", &context, &node_refs, expired), 0);

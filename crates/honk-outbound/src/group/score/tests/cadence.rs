@@ -36,7 +36,7 @@ fn settled_cohorts_stop_sampling_and_expiry_spends_only_business_funding() {
             leaf,
             &target,
             20,
-            Duration::from_millis(if index == 0 { 10 } else { 600 }),
+            if index == 0 { 10 } else { 600 },
             1,
             now,
         );
@@ -163,15 +163,7 @@ fn expired_backoff_gets_bounded_recovery_despite_normal_exclusion() {
     };
     let now = Instant::now();
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            Duration::from_millis(100),
-            1,
-            now,
-        );
+        train_at(&manager, leaf, &target, 20, 100, 1, now);
     }
     for _ in 0..3 {
         manager
@@ -204,14 +196,7 @@ fn expired_backoff_gets_bounded_recovery_despite_normal_exclusion() {
         active.push(reporter);
     }
     for leaf in &nodes {
-        probe_at(
-            &manager,
-            leaf,
-            &target,
-            ScoreSource::HealthProbe,
-            Duration::from_millis(100),
-            expired,
-        );
+        probe_at(&manager, leaf, &target, 100, expired);
     }
     let decision = ranking::decision(&state.inner.lock(), "score", &target, &node_refs, expired);
     assert_eq!(decision.scores[1].fail_streak, 3);
@@ -244,24 +229,8 @@ fn unchanged_failed_incumbent_allows_funded_recovery_without_free_trials() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        100,
-        Duration::from_millis(10),
-        1,
-        now,
-    );
-    train_at(
-        &manager,
-        &nodes[1],
-        &target,
-        80,
-        Duration::from_millis(100),
-        1,
-        now,
-    );
+    train_at(&manager, &nodes[0], &target, 100, 10, 1, now);
+    train_at(&manager, &nodes[1], &target, 80, 100, 1, now);
     assert_eq!(
         rank_at(&manager, &nodes, &target, now + Duration::from_secs(2)),
         0
@@ -377,15 +346,7 @@ fn unchanged_failed_incumbent_allows_funded_recovery_without_free_trials() {
         .unwrap()
         .finish(ScoreOutcome::Cancelled);
 
-    train_at(
-        &manager,
-        &nodes[1],
-        &target,
-        100,
-        Duration::from_millis(10),
-        1,
-        escape_at,
-    );
+    train_at(&manager, &nodes[1], &target, 100, 10, 1, escape_at);
     let escape_at = escape_at + Duration::from_secs(2);
     for _ in 0..before.earning_period {
         manager
@@ -461,7 +422,7 @@ fn source_outcomes_do_not_forgive_traffic_backoff() {
             .finish_at(ScoreOutcome::Timeout, true, now);
     }
     for source in [ScoreSource::HealthProbe, ScoreSource::Warmup] {
-        probe_at(
+        probe_source_at(
             &manager,
             &nodes[0],
             &target,
@@ -500,7 +461,7 @@ fn latency_degradation_revalidation_cannot_bypass_exposure_budget() {
             leaf,
             &target,
             20,
-            Duration::from_millis(if index == 0 { 10 } else { 600 }),
+            if index == 0 { 10 } else { 600 },
             1,
             now,
         );
@@ -514,7 +475,7 @@ fn latency_degradation_revalidation_cannot_bypass_exposure_budget() {
         &nodes[0],
         &target,
         1,
-        Duration::from_millis(100),
+        100,
         1,
         now + Duration::from_secs(3),
     );
@@ -548,15 +509,7 @@ fn cancelled_cold_trials_keep_alternative_coverage() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        20,
-        Duration::from_millis(100),
-        1,
-        now,
-    );
+    train_at(&manager, &nodes[0], &target, 20, 100, 1, now);
     let state = manager.score_state();
     let mut trials = std::collections::HashSet::new();
     let requests = exploration_target(nodes.len()) as u64 + exploration_period(nodes.len()) * 2;
@@ -599,15 +552,7 @@ fn qualified_trial_does_not_replace_committed_incumbent_without_new_evidence() {
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
     for (leaf, latency) in nodes.iter().zip([100, 105]) {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            Duration::from_millis(latency),
-            1,
-            now,
-        );
+        train_at(&manager, leaf, &target, 20, latency, 1, now);
     }
     let state = manager.score_state();
     let node_refs = [&nodes[0], &nodes[1]];
@@ -661,24 +606,8 @@ fn qualified_trial_does_not_replace_committed_incumbent_without_new_evidence() {
             .ordinary_switch,
         0
     );
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        20,
-        Duration::from_millis(100),
-        1,
-        at,
-    );
-    train_at(
-        &manager,
-        &nodes[1],
-        &target,
-        20,
-        Duration::from_millis(50),
-        1,
-        at,
-    );
+    train_at(&manager, &nodes[0], &target, 20, 100, 1, at);
+    train_at(&manager, &nodes[1], &target, 20, 50, 1, at);
     assert_eq!(
         rank_at(&manager, &nodes, &target, at + Duration::from_secs(1)),
         1
@@ -700,15 +629,7 @@ fn first_normal_selection_uses_quality_not_the_last_startup_trial() {
     let now = Instant::now();
     for (index, latency) in [100, 105].into_iter().enumerate() {
         assert_eq!(rank_at(&manager, &nodes, &target, now), index);
-        train_at(
-            &manager,
-            &nodes[index],
-            &target,
-            20,
-            Duration::from_millis(latency),
-            1,
-            now,
-        );
+        train_at(&manager, &nodes[index], &target, 20, latency, 1, now);
     }
     assert_eq!(
         rank_at(&manager, &nodes, &target, now + Duration::from_secs(2)),
@@ -767,15 +688,7 @@ fn unbegun_plans_do_not_rotate_discovery() {
     let now = Instant::now();
     // Rotation state is only visible once each member has begun real work.
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            1,
-            Duration::from_millis(10),
-            1,
-            now,
-        );
+        train_at(&manager, leaf, &target, 1, 10, 1, now);
     }
     let at = now + Duration::from_secs(2);
     let rotation = |index: usize| {

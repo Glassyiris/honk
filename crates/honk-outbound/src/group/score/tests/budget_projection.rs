@@ -93,24 +93,8 @@ fn unrelated_inflight_work_cannot_fill_a_target_availability_gap() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("gap.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        8,
-        Duration::from_millis(10),
-        1,
-        now,
-    );
-    train_at(
-        &manager,
-        &nodes[1],
-        &target,
-        3,
-        Duration::from_millis(100),
-        1,
-        now,
-    );
+    train_at(&manager, &nodes[0], &target, 8, 10, 1, now);
+    train_at(&manager, &nodes[1], &target, 3, 100, 1, now);
     let at = now + Duration::from_secs(2);
     let unrelated = manager
         .feedback_for_group_node(

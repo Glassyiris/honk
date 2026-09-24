@@ -19,7 +19,7 @@ fn recovered_historical_failure_holds_five_percent_latency_jitter() {
             leaf,
             &target,
             200,
-            Duration::from_millis(100 + index as u64 * 10),
+            100 + index as u64 * 10,
             1,
             now + Duration::from_secs(index as u64 * 2),
         );
@@ -33,7 +33,7 @@ fn recovered_historical_failure_holds_five_percent_latency_jitter() {
         &nodes[1],
         &target,
         200,
-        Duration::from_millis(95),
+        95,
         1,
         now + Duration::from_secs(5),
     );
@@ -72,7 +72,7 @@ fn only_newer_business_rx_restores_incumbent_protection() {
                 leaf,
                 &target,
                 1000,
-                Duration::from_millis(100 + index as u64 * 10),
+                100 + index as u64 * 10,
                 1,
                 now + Duration::from_secs(index as u64 * 2),
             );
@@ -108,7 +108,7 @@ fn only_newer_business_rx_restores_incumbent_protection() {
             &nodes[1],
             &target,
             1000,
-            Duration::from_millis(95),
+            95,
             1,
             now + Duration::from_secs(7),
         );
@@ -120,15 +120,7 @@ fn only_newer_business_rx_restores_incumbent_protection() {
                 } else {
                     target.clone()
                 };
-                train_at(
-                    &manager,
-                    &nodes[0],
-                    &recovered_target,
-                    20,
-                    Duration::from_millis(100),
-                    1,
-                    at,
-                );
+                train_at(&manager, &nodes[0], &recovered_target, 20, 100, 1, at);
             }
             "setup-only" | "neutral" | "probe" | "warmup" => {
                 let source = match recovery {
@@ -319,23 +311,8 @@ fn unrelated_target_failures_preserve_healthy_exact_selection_and_probe_support(
     let failing = context("unrelated.example", IpVersion::V6);
     let now = Instant::now();
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &healthy,
-            32,
-            Duration::from_millis(100),
-            1,
-            now,
-        );
-        probe_at(
-            &manager,
-            leaf,
-            &healthy,
-            ScoreSource::HealthProbe,
-            Duration::from_millis(50),
-            now,
-        );
+        train_at(&manager, leaf, &healthy, 32, 100, 1, now);
+        probe_at(&manager, leaf, &healthy, 50, now);
     }
     for outcome in [
         ScoreOutcome::TargetFailure,
@@ -420,15 +397,7 @@ fn shared_carrier_failure_counts_flows_but_only_one_hard_episode() {
         .start_at(now)
         .finish_at(outcome, true, now);
     let recovered_at = now + Duration::from_secs(1);
-    train_at(
-        &manager,
-        &leaf,
-        &target,
-        4,
-        Duration::from_millis(10),
-        1,
-        recovered_at,
-    );
+    train_at(&manager, &leaf, &target, 4, 10, 1, recovered_at);
     for reporter in &pending {
         reporter.finish_at(outcome, true, now + Duration::from_secs(3));
     }

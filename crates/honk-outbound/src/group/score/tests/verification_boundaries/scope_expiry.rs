@@ -14,7 +14,7 @@ fn train_cross_pair_responses(
             leaf,
             target,
             4,
-            Duration::from_millis(100 * (index as u64 + 1)),
+            100 * (index as u64 + 1),
             1,
             if aligned || index == 0 || index % 2 == 1 {
                 now
@@ -23,15 +23,7 @@ fn train_cross_pair_responses(
             },
         );
     }
-    train_at(
-        manager,
-        &nodes[0],
-        target,
-        4,
-        Duration::from_millis(100),
-        1,
-        later,
-    );
+    train_at(manager, &nodes[0], target, 4, 100, 1, later);
 }
 
 #[test]
@@ -246,7 +238,7 @@ fn cross_pair_response_repair_requires_shared_fresh_reporters_after_old_blocks_e
                 leaf,
                 &target,
                 samples,
-                Duration::from_millis(100 * (index as u64 + 1)),
+                100 * (index as u64 + 1),
                 1,
                 at,
             );
@@ -287,25 +279,9 @@ fn disjoint_response_support_schedules_comparable_business_not_bulk_transfer() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("shared.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[1],
-        &target,
-        8,
-        Duration::from_millis(100),
-        1,
-        now,
-    );
+    train_at(&manager, &nodes[1], &target, 8, 100, 1, now);
     let later = now + Duration::from_secs(16);
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        8,
-        Duration::from_millis(10),
-        1,
-        later,
-    );
+    train_at(&manager, &nodes[0], &target, 8, 10, 1, later);
     let at = later + Duration::from_secs(2);
     let state = manager.score_state();
     let snapshot = state
@@ -409,15 +385,7 @@ fn winner_only_probe_does_not_replace_common_business_response_evidence() {
         ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
     let now = Instant::now();
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            4,
-            Duration::from_millis(100),
-            1,
-            now,
-        );
+        train_at(&manager, leaf, &target, 4, 100, 1, now);
     }
     let at = now + Duration::from_secs(2);
     let state = manager.score_state();
@@ -432,8 +400,7 @@ fn winner_only_probe_does_not_replace_common_business_response_evidence() {
         &manager,
         &nodes[winner],
         &context("health.example", IpVersion::V4),
-        ScoreSource::HealthProbe,
-        Duration::from_millis(100),
+        100,
         at,
     );
     let after = state
@@ -485,8 +452,7 @@ fn comparison_validity_cannot_outlive_a_required_candidate_availability_lease() 
             &manager,
             leaf,
             &context("health.example", IpVersion::V4),
-            ScoreSource::HealthProbe,
-            Duration::from_millis(100),
+            100,
             later,
         );
     }
@@ -569,15 +535,7 @@ fn sparse_common_support_is_local_only_and_completeness_recovers() {
         ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
     let now = Instant::now();
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &sparse,
-            1,
-            Duration::from_millis(100),
-            1,
-            now,
-        );
+        train_at(&manager, leaf, &sparse, 1, 100, 1, now);
     }
     let state = manager.score_state();
     let refs: Vec<_> = nodes.iter().collect();
@@ -595,7 +553,7 @@ fn sparse_common_support_is_local_only_and_completeness_recovers() {
             leaf,
             &dense,
             4,
-            Duration::from_millis(100),
+            100,
             1,
             now + Duration::from_secs(2),
         );
@@ -625,7 +583,7 @@ fn sparse_common_support_is_local_only_and_completeness_recovers() {
             leaf,
             &sparse,
             3,
-            Duration::from_millis(100),
+            100,
             1,
             now + Duration::from_secs(4),
         );

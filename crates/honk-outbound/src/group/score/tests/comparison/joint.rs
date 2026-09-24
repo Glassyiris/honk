@@ -8,21 +8,13 @@ fn joint_response_uses_qualified_common_blocks_without_more_traffic() {
         let target = context("joint.example", IpVersion::V4);
         let now = Instant::now();
         for (leaf, latency) in nodes[..2].iter().zip([100, 200]) {
-            train_at(
-                &manager,
-                leaf,
-                &target,
-                4,
-                Duration::from_millis(latency),
-                1,
-                now,
-            );
+            train_at(&manager, leaf, &target, 4, latency, 1, now);
             train_at(
                 &manager,
                 leaf,
                 &target,
                 shared,
-                Duration::from_millis(latency),
+                latency,
                 1,
                 now + Duration::from_secs(16),
             );
@@ -32,7 +24,7 @@ fn joint_response_uses_qualified_common_blocks_without_more_traffic() {
             &nodes[2],
             &target,
             4,
-            Duration::from_millis(300),
+            300,
             1,
             now + Duration::from_secs(16),
         );
@@ -122,14 +114,7 @@ fn disjoint_pair_blocks_do_not_make_a_joint_certificate() {
     let probe =
         ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
     for leaf in &nodes {
-        probe_at(
-            &manager,
-            leaf,
-            &probe,
-            ScoreSource::HealthProbe,
-            Duration::from_millis(50),
-            now,
-        );
+        probe_at(&manager, leaf, &probe, 50, now);
     }
     for (index, seconds) in [(0, 0), (1, 0), (0, 16), (2, 16)] {
         train_at(
@@ -137,7 +122,7 @@ fn disjoint_pair_blocks_do_not_make_a_joint_certificate() {
             &nodes[index],
             &target,
             4,
-            Duration::from_millis(100 + index as u64 * 100),
+            100 + index as u64 * 100,
             1,
             now + Duration::from_secs(seconds),
         );
@@ -185,7 +170,7 @@ fn joint_narrowing_keeps_adverse_original_pair_evidence() {
             leaf,
             &target,
             4,
-            Duration::from_millis(latency),
+            latency,
             1,
             now + Duration::from_secs(index as u64 * 2),
         );
@@ -196,7 +181,7 @@ fn joint_narrowing_keeps_adverse_original_pair_evidence() {
             leaf,
             &target,
             4,
-            Duration::from_millis(latency),
+            latency,
             1,
             now + Duration::from_secs(16),
         );

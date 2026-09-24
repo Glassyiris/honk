@@ -7,15 +7,7 @@ fn open_flow_progress_changes_selection_without_terminal_completions() {
     let target = context("stream.example", IpVersion::V4);
     let now = Instant::now();
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            Duration::from_millis(100),
-            1_000_000,
-            now,
-        );
+        train_at(&manager, leaf, &target, 20, 100, 1_000_000, now);
     }
     assert_eq!(
         rank_at(&manager, &nodes, &target, now + Duration::from_secs(2)),
@@ -426,14 +418,7 @@ fn concurrent_failed_probe_cannot_retire_successful_probe_evidence() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("configured.example", IpVersion::V4);
     let now = Instant::now();
-    probe_at(
-        &manager,
-        &nodes[0],
-        &target,
-        ScoreSource::HealthProbe,
-        Duration::from_millis(600),
-        now,
-    );
+    probe_at(&manager, &nodes[0], &target, 600, now);
     let feedback = manager
         .feedback_for_group_node("score", nodes[1].id, target.clone())
         .unwrap()
@@ -494,14 +479,7 @@ fn generation_publication_rejects_pending_health_but_keeps_admitted_traffic() {
             traffic.finish_at(ScoreOutcome::Success, true, now + Duration::from_secs(1));
         });
         replacement.publish_score_membership();
-        probe_at(
-            &replacement,
-            &leaf,
-            &target,
-            ScoreSource::HealthProbe,
-            Duration::from_millis(600),
-            now,
-        );
+        probe_at(&replacement, &leaf, &target, 600, now);
         barrier.wait();
     });
     let score = score_snapshot(
@@ -556,15 +534,7 @@ fn node_fault_fences_healthy_exact_and_replaced_parent_rejects_old_reporter() {
     let healthy = context("healthy.example", IpVersion::V4);
     let failed = context("carrier.example", IpVersion::V6);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &leaf,
-        &healthy,
-        8,
-        Duration::from_millis(100),
-        1,
-        now,
-    );
+    train_at(&manager, &leaf, &healthy, 8, 100, 1, now);
     let feedback = manager
         .feedback_for_group_node("score", leaf.id, healthy.clone())
         .unwrap();
@@ -642,7 +612,7 @@ fn new_target_live_recovery_requires_node_failure_not_reload_fence() {
             &nodes[1],
             &target,
             200,
-            Duration::from_millis(100),
+            100,
             1,
             at - Duration::from_secs(1),
         );
@@ -724,7 +694,7 @@ fn trained_target_needs_own_four_replies_after_inherited_node_failure() {
             leaf,
             &target,
             samples,
-            Duration::from_millis(100),
+            100,
             1,
             now + Duration::from_secs(1),
         );
@@ -807,14 +777,7 @@ fn probe_failure_invalidates_only_matching_identity_and_current_authority() {
         .unwrap()
         .with_source(ScoreSource::HealthProbe);
     let old = feedback.start_at(now);
-    probe_at(
-        &manager,
-        &leaf,
-        &target,
-        ScoreSource::HealthProbe,
-        Duration::from_millis(10),
-        now,
-    );
+    probe_at(&manager, &leaf, &target, 10, now);
     feedback
         .clone()
         .with_probe_identity("https://different.example", "HEAD")
@@ -843,14 +806,7 @@ fn probe_failure_invalidates_only_matching_identity_and_current_authority() {
         Arc::clone(&state),
     );
     replacement.publish_score_membership();
-    probe_at(
-        &replacement,
-        &leaf,
-        &target,
-        ScoreSource::HealthProbe,
-        Duration::from_millis(20),
-        now,
-    );
+    probe_at(&replacement, &leaf, &target, 20, now);
     old.finish_at(ScoreOutcome::Timeout, false, now);
     assert_eq!(
         score_snapshot(&state.inner.lock(), "score", &target, leaf.id, now)

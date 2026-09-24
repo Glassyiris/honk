@@ -428,15 +428,7 @@ fn parent_eviction_and_recreation_cannot_revive_exact_proof_or_old_reporters() {
     let target = context("parent.example", IpVersion::V4);
     let now = Instant::now();
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            4,
-            Duration::from_millis(100),
-            1,
-            now,
-        );
+        train_at(&manager, leaf, &target, 4, 100, 1, now);
     }
     let feedback = manager
         .feedback_for_group_node("score", nodes[1].id, target.clone())
@@ -486,7 +478,7 @@ fn parent_eviction_and_recreation_cannot_revive_exact_proof_or_old_reporters() {
         &nodes[1],
         &target,
         4,
-        Duration::from_millis(100),
+        100,
         1,
         now + Duration::from_secs(7),
     );
@@ -514,24 +506,9 @@ fn target_failure_preserves_other_targets_and_probe_but_node_failure_invalidates
         );
         let now = Instant::now();
         for leaf in &nodes {
-            probe_at(
-                &manager,
-                leaf,
-                &probe,
-                ScoreSource::HealthProbe,
-                Duration::from_millis(100),
-                now,
-            );
+            probe_at(&manager, leaf, &probe, 100, now);
             for target in [&good, &bad] {
-                train_at(
-                    &manager,
-                    leaf,
-                    target,
-                    4,
-                    Duration::from_millis(100),
-                    1,
-                    now,
-                );
+                train_at(&manager, leaf, target, 4, 100, 1, now);
             }
         }
         let state = manager.score_state();
@@ -584,14 +561,7 @@ fn failed_probe_cannot_requalify_from_its_prior_samples() {
         ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
     let now = Instant::now();
     for leaf in &nodes {
-        probe_at(
-            &manager,
-            leaf,
-            &context,
-            ScoreSource::HealthProbe,
-            Duration::from_millis(100),
-            now,
-        );
+        probe_at(&manager, leaf, &context, 100, now);
     }
     let feedback = manager
         .feedback_for_group_node("score", nodes[1].id, context.clone())

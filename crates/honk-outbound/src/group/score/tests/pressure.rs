@@ -40,15 +40,7 @@ fn carrier_pressure_reopens_only_budgeted_comparison_without_penalizing_business
                 .finish_at(ScoreOutcome::Cancelled, false, start);
         }
         for leaf in &nodes {
-            train_at(
-                &manager,
-                leaf,
-                &target,
-                20,
-                Duration::from_millis(100),
-                1,
-                start,
-            );
+            train_at(&manager, leaf, &target, 20, 100, 1, start);
         }
         let ready = start + Duration::from_secs(2);
         for _ in 0..16 {
@@ -146,15 +138,7 @@ fn carrier_pressure_reopens_only_budgeted_comparison_without_penalizing_business
             exhausted.trial_starts
         );
         // A successful measurement, not the hint, earns ordinary promotion.
-        train_at(
-            &manager,
-            &nodes[1],
-            &target,
-            20,
-            Duration::from_millis(10),
-            1,
-            at,
-        );
+        train_at(&manager, &nodes[1], &target, 20, 10, 1, at);
         assert_eq!(
             state.peek_rank_at("score", &target, &refs, at + Duration::from_secs(2)),
             1
@@ -186,15 +170,7 @@ fn answered_open_response_does_not_block_the_next_pressure_episode() {
             );
         }
         for leaf in &nodes {
-            train_at(
-                &manager,
-                leaf,
-                &target,
-                64,
-                Duration::from_millis(100),
-                download,
-                start,
-            );
+            train_at(&manager, leaf, &target, 64, 100, download, start);
         }
         let at = start + Duration::from_secs(3);
         assert_eq!(state.rank_at("score", &target, &refs, at), 0);
@@ -260,15 +236,7 @@ fn pressure_refresh_uses_latest_common_responses_without_renewing_old_support() 
     let start = Instant::now();
     for target in &targets {
         for leaf in &nodes {
-            train_at(
-                &manager,
-                leaf,
-                target,
-                8,
-                Duration::from_millis(100),
-                1,
-                start,
-            );
+            train_at(&manager, leaf, target, 8, 100, 1, start);
         }
     }
     let state = manager.score_state();
@@ -288,15 +256,7 @@ fn pressure_refresh_uses_latest_common_responses_without_renewing_old_support() 
     );
     let fresh = start + Duration::from_millis(3200);
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &targets[0],
-            4,
-            Duration::from_millis(100),
-            1,
-            fresh,
-        );
+        train_at(&manager, leaf, &targets[0], 4, 100, 1, fresh);
     }
     let partially_refreshed = start + Duration::from_millis(4300);
     assert!(!snapshot(&targets[0], partially_refreshed).missing.response);
@@ -304,15 +264,7 @@ fn pressure_refresh_uses_latest_common_responses_without_renewing_old_support() 
     let fresh = start + Duration::from_secs(4);
     let now = start + Duration::from_secs(5);
     for (index, leaf) in nodes.iter().enumerate() {
-        train_at(
-            &manager,
-            leaf,
-            &targets[1],
-            4,
-            Duration::from_millis(100),
-            1,
-            fresh,
-        );
+        train_at(&manager, leaf, &targets[1], 4, 100, 1, fresh);
         if index == 0 {
             assert!(snapshot(&aggregate, now).missing.response);
         }
@@ -361,15 +313,7 @@ fn carrier_pressure_is_owner_scoped_expiring_and_cannot_create_flow_evidence() {
     assert_eq!(manager.score_cache_snapshot().aggregate_cells, 0);
     let target = context("family.example", IpVersion::V6);
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            Duration::from_millis(100),
-            1,
-            start,
-        );
+        train_at(&manager, leaf, &target, 20, 100, 1, start);
     }
     let at = start + Duration::from_secs(2);
     manager.score_state.observe_carrier_pressure(
@@ -449,7 +393,7 @@ fn replaced_runtime_and_retired_manager_cannot_publish_carrier_pressure() {
         &leaf,
         &target,
         20,
-        Duration::from_millis(1),
+        1,
         1,
         Instant::now() - Duration::from_secs(2),
     );
@@ -536,7 +480,7 @@ fn shadowsocks_tcp_pressure_does_not_spend_native_udp_validation() {
             &leaf,
             target,
             20,
-            Duration::from_millis(10),
+            10,
             1,
             Instant::now() - Duration::from_secs(2),
         );

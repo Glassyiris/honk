@@ -75,15 +75,7 @@ fn global_equivalence_checks_the_full_response_range() {
     let target = context("range", IpVersion::V4);
     let now = Instant::now();
     for (index, latency) in [(1, 91), (0, 100), (2, 109)] {
-        train_at(
-            &manager,
-            &nodes[index],
-            &target,
-            8,
-            Duration::from_millis(latency),
-            1,
-            now,
-        );
+        train_at(&manager, &nodes[index], &target, 8, latency, 1, now);
     }
     let at = now + Duration::from_secs(2);
     let state = manager.score_state();
@@ -170,15 +162,7 @@ fn response_support_is_independent_of_completion_maturity() {
         let target = context("maturity.example", IpVersion::V4);
         let now = Instant::now();
         for (leaf, latency) in nodes.iter().zip([100, 115]) {
-            train_at(
-                &manager,
-                leaf,
-                &target,
-                samples,
-                Duration::from_millis(latency),
-                1,
-                now,
-            );
+            train_at(&manager, leaf, &target, samples, latency, 1, now);
         }
         let at = now + Duration::from_secs(2);
         let state = manager.score_state();
@@ -226,7 +210,7 @@ fn response_equivalence_uses_actual_symmetric_tolerance_including_zero() {
         let target = context("boundary.example", IpVersion::V4);
         let now = Instant::now();
         for (leaf, nanos) in nodes.iter().zip([left, right]) {
-            train_at(
+            train_response_at(
                 &manager,
                 leaf,
                 &target,
@@ -281,15 +265,7 @@ fn a_held_incumbent_cannot_hide_a_materially_faster_rival() {
     let target = context("held.example", IpVersion::V4);
     let now = Instant::now();
     for (index, latency) in [(1, 100), (0, 115), (2, 200)] {
-        train_at(
-            &manager,
-            &nodes[index],
-            &target,
-            8,
-            Duration::from_millis(latency),
-            1,
-            now,
-        );
+        train_at(&manager, &nodes[index], &target, 8, latency, 1, now);
     }
     let at = now + Duration::from_secs(2);
     let state = manager.score_state();
@@ -329,7 +305,7 @@ fn qualified_reliability_cannot_buy_a_material_response_regression() {
                 leaf,
                 &target,
                 32,
-                Duration::from_millis(latency),
+                latency,
                 1,
                 now + Duration::from_secs(1),
             );
@@ -620,7 +596,7 @@ fn later_challenger_direction_controls_claim_identity_and_expiry() {
             leaf,
             &target,
             8,
-            Duration::from_millis(latency),
+            latency,
             1,
             now + Duration::from_secs(32),
         );

@@ -136,6 +136,19 @@ fn train_at(
     leaf: &Node,
     target: &ScoreSelectionContext,
     samples: usize,
+    response_ms: u64,
+    download: u64,
+    now: Instant,
+) {
+    let response = Duration::from_millis(response_ms);
+    train_response_at(manager, leaf, target, samples, response, download, now);
+}
+
+fn train_response_at(
+    manager: &GroupManager,
+    leaf: &Node,
+    target: &ScoreSelectionContext,
+    samples: usize,
     response: Duration,
     download: u64,
     now: Instant,
@@ -160,6 +173,24 @@ fn train_at(
 }
 
 fn probe_at(
+    manager: &GroupManager,
+    leaf: &Node,
+    probe_context: &ScoreSelectionContext,
+    latency_ms: u64,
+    now: Instant,
+) {
+    let latency = Duration::from_millis(latency_ms);
+    probe_source_at(
+        manager,
+        leaf,
+        probe_context,
+        ScoreSource::HealthProbe,
+        latency,
+        now,
+    );
+}
+
+fn probe_source_at(
     manager: &GroupManager,
     leaf: &Node,
     probe_context: &ScoreSelectionContext,

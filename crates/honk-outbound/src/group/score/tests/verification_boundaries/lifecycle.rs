@@ -13,7 +13,7 @@ fn unbegun_run_plans_expire_refund_and_do_not_advance_control() {
             leaf,
             &target,
             128,
-            Duration::from_millis(100 + 15 * index as u64),
+            100 + 15 * index as u64,
             1,
             start,
         );
@@ -74,7 +74,7 @@ fn node_failure_between_run_plan_and_begin_cancels_unstarted_exposure() {
             leaf,
             &target,
             128,
-            Duration::from_millis(100 + 15 * index as u64),
+            100 + 15 * index as u64,
             1,
             start,
         );
@@ -113,7 +113,7 @@ fn other_target_reference_and_escape_preserve_pending_validation() {
                 leaf,
                 &target,
                 128,
-                Duration::from_millis(100 + 15 * index as u64),
+                100 + 15 * index as u64,
                 1,
                 start,
             );
@@ -122,7 +122,7 @@ fn other_target_reference_and_escape_preserve_pending_validation() {
                 leaf,
                 &other,
                 128,
-                Duration::from_millis(if (index == 0) == escape { 100 } else { 200 }),
+                if (index == 0) == escape { 100 } else { 200 },
                 1,
                 start,
             );
@@ -179,7 +179,7 @@ fn binding_a_staged_run_fences_its_original_unbegun_plan() {
             leaf,
             &target,
             if index == 0 { 8 } else { 1 },
-            Duration::from_millis(100),
+            100,
             1,
             start,
         );
@@ -219,7 +219,7 @@ fn staged_run_releases_unanswered_focus_after_sixteen_matching_offers() {
         &nodes[0],
         &context("old.example", IpVersion::V4),
         20,
-        Duration::from_millis(100),
+        100,
         1,
         start,
     );
@@ -259,7 +259,7 @@ fn promising_cold_target_run_waits_for_ordinary_reference_observation() {
         &nodes[0],
         &context("old.example", IpVersion::V4),
         20,
-        Duration::from_millis(100),
+        100,
         1,
         start,
     );
@@ -301,7 +301,7 @@ fn terminal_staged_runs_release_other_target_trials() {
             &nodes[0],
             &context("old.example", IpVersion::V4),
             20,
-            Duration::from_millis(100),
+            100,
             1,
             start,
         );
@@ -361,7 +361,7 @@ fn bound_run_keeps_unfinished_pair_but_releases_completed_pair() {
             leaf,
             &target,
             128,
-            Duration::from_millis(100 + 15 * index as u64),
+            100 + 15 * index as u64,
             1,
             start,
         );
@@ -435,15 +435,7 @@ fn pending_bound_work_releases_focus_after_cell_replacement() {
         let other = context("new-offer.example", IpVersion::V4);
         let start = Instant::now();
         for leaf in &nodes {
-            train_at(
-                &manager,
-                leaf,
-                &target,
-                128,
-                Duration::from_millis(100),
-                1,
-                start,
-            );
+            train_at(&manager, leaf, &target, 128, 100, 1, start);
         }
         let state = manager.score_state();
         let refs: Vec<_> = nodes.iter().collect();
@@ -542,7 +534,7 @@ fn staged_failure_invalidates_pending_work_without_another_rank() {
                 leaf,
                 &target,
                 if index == 0 { 8 } else { 1 },
-                Duration::from_millis(100),
+                100,
                 1,
                 start + Duration::from_secs(1),
             );

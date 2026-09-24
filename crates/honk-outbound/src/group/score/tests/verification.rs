@@ -266,22 +266,13 @@ fn funded_large_group_focuses_promising_contender_until_graduation() {
     let target = context("business.example", IpVersion::V4);
     let probe = context("health.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        20,
-        Duration::from_millis(60),
-        1,
-        now,
-    );
+    train_at(&manager, &nodes[0], &target, 20, 60, 1, now);
     for (index, leaf) in nodes.iter().enumerate() {
         probe_at(
             &manager,
             leaf,
             &probe,
-            ScoreSource::HealthProbe,
-            Duration::from_millis(if index == 31 { 1 } else { 60 }),
+            if index == 31 { 1 } else { 60 },
             now + Duration::from_secs(1),
         );
     }
@@ -343,15 +334,7 @@ fn equivalent_response_stops_trials_while_transfer_remains_unknown() {
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
     for (leaf, latency) in nodes.iter().zip([100, 105]) {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            Duration::from_millis(latency),
-            1,
-            now,
-        );
+        train_at(&manager, leaf, &target, 20, latency, 1, now);
     }
     for _ in 0..256 {
         assert_eq!(
@@ -380,15 +363,7 @@ fn old_history_cannot_refresh_availability_with_one_new_success() {
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
     let state = manager.score_state();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        100,
-        Duration::from_millis(100),
-        1,
-        now,
-    );
+    train_at(&manager, &nodes[0], &target, 100, 100, 1, now);
     let now = now + Duration::from_secs(1);
     assert_eq!(
         verification_at(&manager, &nodes, &target, now).state,
@@ -411,15 +386,7 @@ fn old_history_cannot_refresh_availability_with_one_new_success() {
             .expired,
         1
     );
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        1,
-        Duration::from_millis(10),
-        1,
-        expired,
-    );
+    train_at(&manager, &nodes[0], &target, 1, 10, 1, expired);
     assert_eq!(
         verification_at(&manager, &nodes, &target, expired + Duration::from_secs(2)).state,
         ScoreVerificationState::Provisional
@@ -429,7 +396,7 @@ fn old_history_cannot_refresh_availability_with_one_new_success() {
         &nodes[0],
         &target,
         4,
-        Duration::from_millis(10),
+        10,
         1,
         expired + Duration::from_secs(3),
     );
@@ -446,15 +413,7 @@ fn transfer_expiry_failure_and_reload_retract_only_supported_claims() {
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            Duration::from_millis(100),
-            1_000_000,
-            now,
-        );
+        train_at(&manager, leaf, &target, 20, 100, 1_000_000, now);
     }
     rank_at(&manager, &nodes, &target, now + Duration::from_secs(2));
     let snapshot = verification_at(&manager, &nodes, &target, now + Duration::from_secs(2));
@@ -463,15 +422,7 @@ fn transfer_expiry_failure_and_reload_retract_only_supported_claims() {
     let state = manager.score_state();
     let refreshed = now + Duration::from_secs(70);
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            5,
-            Duration::from_millis(100),
-            1,
-            refreshed,
-        );
+        train_at(&manager, leaf, &target, 5, 100, 1, refreshed);
     }
     let at = refreshed + Duration::from_secs(2);
     let snapshot = verification_at(&manager, &nodes, &target, at);
@@ -511,15 +462,7 @@ fn transfer_expiry_failure_and_reload_retract_only_supported_claims() {
         1
     );
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            5,
-            Duration::from_millis(100),
-            1,
-            at,
-        );
+        train_at(&manager, leaf, &target, 5, 100, 1, at);
     }
     rank_at(&manager, &nodes, &target, at + Duration::from_secs(2));
     let before = state.verification_counters("score", SelectionNetwork::Tcp);
@@ -551,14 +494,7 @@ fn probes_and_singletons_never_certify_unknown_business_scope() {
     let now = Instant::now();
     for (leaf, latency) in nodes.iter().zip([10, 100]) {
         for _ in 0..8 {
-            probe_at(
-                &manager,
-                leaf,
-                &probe,
-                ScoreSource::HealthProbe,
-                Duration::from_millis(latency),
-                now,
-            );
+            probe_at(&manager, leaf, &probe, latency, now);
         }
     }
     let aggregate_snapshot = verification_at(&manager, &nodes, &aggregate, now);
@@ -576,15 +512,7 @@ fn probes_and_singletons_never_certify_unknown_business_scope() {
     assert_eq!(exact.comparison, ScoreComparison::Unconfirmed);
     assert!(exact.missing.availability && exact.missing.response && exact.missing.transfer);
     for leaf in &nodes {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            Duration::from_millis(100),
-            1,
-            now,
-        );
+        train_at(&manager, leaf, &target, 20, 100, 1, now);
     }
     let other = context("different-business.example", IpVersion::V4);
     assert_eq!(
@@ -609,14 +537,7 @@ fn one_unrelated_probe_cannot_suppress_comparable_http_pair() {
     let aggregate =
         ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
     let now = Instant::now();
-    probe_at(
-        &manager,
-        &nodes[0],
-        &probe,
-        ScoreSource::HealthProbe,
-        Duration::from_millis(1),
-        now,
-    );
+    probe_at(&manager, &nodes[0], &probe, 1, now);
     let uri = "https://health.example/check";
     for (leaf, latency) in nodes[1..].iter().zip([600, 10]) {
         let feedback = manager
@@ -648,15 +569,7 @@ fn sparse_cancellations_rotate_without_confirmation_or_unbounded_exposure() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        20,
-        Duration::from_millis(100),
-        1,
-        now,
-    );
+    train_at(&manager, &nodes[0], &target, 20, 100, 1, now);
     let state = manager.score_state();
     let mut trials = [0u64; 3];
     for step in 0..16 {
@@ -666,7 +579,7 @@ fn sparse_cancellations_rotate_without_confirmation_or_unbounded_exposure() {
             &nodes[0],
             &target,
             16,
-            Duration::from_millis(100),
+            100,
             1,
             at - Duration::from_secs(1),
         );
@@ -759,15 +672,7 @@ fn stale_failure_reopens_coverage_unless_qualified_reliability_dominates_it() {
         let target = context("business.example", IpVersion::V4);
         let now = Instant::now();
         for (leaf, (samples, latency)) in nodes.iter().zip([(20, 10), (20, 100), (history, 1)]) {
-            train_at(
-                &manager,
-                leaf,
-                &target,
-                samples,
-                Duration::from_millis(latency),
-                1,
-                now,
-            );
+            train_at(&manager, leaf, &target, samples, latency, 1, now);
         }
         for _ in 0..3 {
             manager
@@ -784,15 +689,7 @@ fn stale_failure_reopens_coverage_unless_qualified_reliability_dominates_it() {
         assert_eq!(snapshot.blockers.excluded, 1);
         let at = now + PERFORMANCE_MAX_AGE + Duration::from_secs(2);
         for leaf in &nodes[..2] {
-            train_at(
-                &manager,
-                leaf,
-                &target,
-                5,
-                Duration::from_millis(100),
-                1,
-                at,
-            );
+            train_at(&manager, leaf, &target, 5, 100, 1, at);
         }
         let snapshot = verification_at(&manager, &nodes, &target, at + Duration::from_secs(2));
         // Lower qualified reliability can never be a rival advantage; unknown history can.
@@ -820,15 +717,7 @@ fn dominance_ends_the_claim_when_qualification_lapses() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[2],
-        &target,
-        4,
-        Duration::from_millis(1),
-        1,
-        now,
-    );
+    train_at(&manager, &nodes[2], &target, 4, 1, 1, now);
     manager
         .feedback_for_group_node("score", nodes[2].id, target.clone())
         .unwrap()
@@ -837,15 +726,7 @@ fn dominance_ends_the_claim_when_qualification_lapses() {
     // Five decayed completions sit just above the four-completion threshold here.
     let decayed = now + Duration::from_secs(540);
     for leaf in &nodes[..2] {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            Duration::from_millis(10),
-            1,
-            decayed,
-        );
+        train_at(&manager, leaf, &target, 20, 10, 1, decayed);
     }
     let at = decayed + Duration::from_secs(2);
     let report = verification_at(&manager, &nodes, &target, at);
@@ -871,15 +752,7 @@ fn cross_target_latency_is_not_node_degradation() {
         ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
     let now = Instant::now();
     for (leaf, latency) in nodes.iter().zip([10, 100]) {
-        train_at(
-            &manager,
-            leaf,
-            &near,
-            20,
-            Duration::from_millis(latency),
-            1,
-            now,
-        );
+        train_at(&manager, leaf, &near, 20, latency, 1, now);
     }
     let at = now + Duration::from_secs(2);
     assert_eq!(
@@ -892,7 +765,7 @@ fn cross_target_latency_is_not_node_degradation() {
         &nodes[0],
         &context("far.example", IpVersion::V4),
         1,
-        Duration::from_millis(100),
+        100,
         1,
         at,
     );
@@ -901,15 +774,7 @@ fn cross_target_latency_is_not_node_degradation() {
     assert_eq!(report.comparison, ScoreComparison::Supported);
     assert_eq!(report.blockers.response_degraded, 0);
     // The same target slowing down still reopens that target's comparison.
-    train_at(
-        &manager,
-        &nodes[0],
-        &near,
-        1,
-        Duration::from_millis(100),
-        1,
-        later,
-    );
+    train_at(&manager, &nodes[0], &near, 1, 100, 1, later);
     let report = verification_at(&manager, &nodes, &near, later + Duration::from_secs(2));
     assert_eq!(report.comparison, ScoreComparison::Unconfirmed);
     assert!(report.blockers.response_degraded > 0);
@@ -921,15 +786,7 @@ fn qualification_blocker_stays_visible_behind_missing_availability() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        20,
-        Duration::from_millis(10),
-        1,
-        now,
-    );
+    train_at(&manager, &nodes[0], &target, 20, 10, 1, now);
     let report = verification_at(&manager, &nodes, &target, now + Duration::from_secs(2));
     assert_eq!(report.question, ScoreEvidenceQuestion::Availability);
     assert_eq!(report.blockers.availability, 1);
@@ -942,15 +799,7 @@ fn partial_success_cannot_pin_a_cancelled_validation_run_forever() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        20,
-        Duration::from_millis(100),
-        1,
-        now,
-    );
+    train_at(&manager, &nodes[0], &target, 20, 100, 1, now);
     let state = manager.score_state();
     let at = now + Duration::from_secs(2);
     let (index, feedback) =
@@ -1036,15 +885,7 @@ fn removed_confirmed_winner_defers_revocation_count_until_apply() {
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
     for (leaf, latency) in nodes.iter().zip([10, 100]) {
-        train_at(
-            &manager,
-            leaf,
-            &target,
-            20,
-            Duration::from_millis(latency),
-            1,
-            now,
-        );
+        train_at(&manager, leaf, &target, 20, latency, 1, now);
     }
     let at = now + Duration::from_secs(2);
     assert_eq!(rank_at(&manager, &nodes, &target, at), 0);
@@ -1087,15 +928,7 @@ fn singleton_can_prove_transfer_observation_without_a_comparison() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("transfer.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        8,
-        Duration::from_millis(50),
-        128 * 1024,
-        now,
-    );
+    train_at(&manager, &nodes[0], &target, 8, 50, 128 * 1024, now);
     let report = verification_at(&manager, &nodes, &target, now + Duration::from_secs(2));
     assert_eq!(report.state, ScoreVerificationState::ObservedUsable);
     assert_eq!(report.comparison, ScoreComparison::Unconfirmed);
@@ -1109,15 +942,7 @@ fn singleton_response_claim_expires_before_newer_business_success() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("response.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        8,
-        Duration::from_millis(50),
-        1,
-        now,
-    );
+    train_at(&manager, &nodes[0], &target, 8, 50, 1, now);
     let later = now + Duration::from_secs(59);
     for _ in 0..8 {
         let reporter = manager
@@ -1143,21 +968,13 @@ fn a_measured_throughput_tradeoff_has_an_explicit_comparison_basis() {
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("tradeoff.example", IpVersion::V4);
     let now = Instant::now();
-    train_at(
-        &manager,
-        &nodes[0],
-        &target,
-        8,
-        Duration::from_millis(100),
-        1_048_576,
-        now,
-    );
+    train_at(&manager, &nodes[0], &target, 8, 100, 1_048_576, now);
     train_at(
         &manager,
         &nodes[1],
         &target,
         8,
-        Duration::from_millis(95),
+        95,
         65_536,
         now + Duration::from_secs(1),
     );
