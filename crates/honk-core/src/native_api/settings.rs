@@ -309,12 +309,26 @@ impl Settings {
         }
         Ok(stream)
     }
+    #[cfg(test)]
     fn patch(
         &self,
         owner: &NativeObservation,
         settings: &honk_config::experimental::NativeApiConfig,
         patch: Patch,
         id: &RequestId,
+    ) -> Result<Value, ApiError> {
+        self.patch_with(owner, settings, patch, id, || Ok(()))
+    }
+
+    /// Applies `patch` once it is valid and `commit` succeeded, so a stored
+    /// change made by `commit` and this one land together or not at all.
+    fn patch_with(
+        &self,
+        owner: &NativeObservation,
+        settings: &honk_config::experimental::NativeApiConfig,
+        patch: Patch,
+        id: &RequestId,
+        commit: impl FnOnce() -> Result<(), ApiError>,
     ) -> Result<Value, ApiError> {
         let mut current = self.values.lock();
         if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
@@ -384,6 +398,7 @@ impl Settings {
                 next.modes[index] = mode;
             }
         }
+        commit()?;
         next.overridden = true;
         next.apply(owner);
         *current = next;
@@ -419,7 +434,10 @@ struct FlowPatch {
     retention_seconds: Option<u64>,
 }
 
-pub(super) fn capability(settings: &honk_config::experimental::NativeApiConfig) -> Value {
+pub(super) fn capability(
+    settings: &honk_config::experimental::NativeApiConfig,
+    geodata: bool,
+) -> Value {
     let mut fields = vec!["record_flows", "record_logs", "record_dns_log"];
     if settings.record_logs {
         fields.extend(["log.level", "log.buffered_records"]);
@@ -430,6 +448,9 @@ pub(super) fn capability(settings: &honk_config::experimental::NativeApiConfig) 
     if settings.record_flows {
         fields.extend(["flows.max_flows", "flows.retention_seconds"]);
     }
+    if geodata {
+        fields.push("geodata");
+    }
     json!({"available":true,"fields":fields})
 }
 
@@ -439,8 +460,31 @@ pub(super) async fn get(
     id: &RequestId,
 ) -> Result<Response, ApiError> {
     parse_query(uri, &[], id)?;
-    let _config = state.config.read().await;
-    Ok(Json(state.observation.settings.snapshot()).into_response())
+    let active = state.config.read().await;
+    Ok(Json(with_geodata(
+        state,
+        state.observation.settings.snapshot(),
+        &active,
+    ))
+    .into_response())
+}
+
+/// Adds the geodata sources: URLs as written, apart from listener secrets, for
+/// an authenticated caller, who may edit them, and without userinfo, query and
+/// fragment for the anonymous loopback caller.
+fn with_geodata(state: &NativeState, mut value: Value, active: &Config) -> Value {
+    if let Some(sources) = state.geodata.as_ref() {
+        let secrets = super::config::ListenerSecrets::from_config(active);
+        let reveal = state.settings.credentialed();
+        value["geodata"] = sources.effective().json(|url| {
+            if reveal {
+                secrets.mask(url).0
+            } else {
+                super::geodata::redact_fully(url, &secrets, &state.observation.configuration)
+            }
+        });
+    }
+    value
 }
 
 pub(super) async fn patch(
@@ -478,7 +522,26 @@ pub(super) async fn patch(
                 id,
             )
         })?;
-    let value: Value = serde_json::from_slice(&bytes).map_err(|_| invalid(id))?;
+    let mut value: Value = serde_json::from_slice(&bytes).map_err(|_| invalid(id))?;
+    let geodata = value
+        .as_object_mut()
+        .and_then(|object| object.remove("geodata"))
+        .map(|patch| {
+            if state.geodata.as_ref().is_none() {
+                return Err(invalid(id));
+            }
+            if !state.settings.credentialed() {
+                return Err(super::error(
+                    StatusCode::FORBIDDEN,
+                    ErrorCode::PermissionDenied,
+                    "Geodata sources need an authenticated caller",
+                    id,
+                ));
+            }
+            super::geodata::SourcesPatch::parse(patch).map_err(|()| invalid(id))
+        })
+        .transpose()?;
+    let others = value.as_object().is_some_and(|object| !object.is_empty());
     if value
         .as_object()
         .is_none_or(|object| object.values().any(Value::is_null))
@@ -488,18 +551,36 @@ pub(super) async fn patch(
                 .filter_map(Value::as_object)
                 .any(|object| object.values().any(Value::is_null))
         })
+        || (!others && geodata.is_none())
     {
         return Err(invalid(id));
     }
-    let patch: Patch = serde_json::from_value(value).map_err(|_| invalid(id))?;
-    let _config = state.config.read().await;
-    Ok(Json(
-        state
-            .observation
-            .settings
-            .patch(&state.observation, &state.settings, patch, id)?,
-    )
-    .into_response())
+    let active = state.config.read().await;
+    let commit = || match (geodata, state.geodata.as_ref()) {
+        (Some(patch), Some(sources)) => sources.apply(patch).map(drop).map_err(|_| {
+            super::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::TemporarilyUnavailable,
+                "Geodata settings could not be stored",
+                id,
+            )
+        }),
+        _ => Ok(()),
+    };
+    let settings = if others {
+        let patch: Patch = serde_json::from_value(value).map_err(|_| invalid(id))?;
+        state.observation.settings.patch_with(
+            &state.observation,
+            &state.settings,
+            patch,
+            id,
+            commit,
+        )?
+    } else {
+        commit()?;
+        state.observation.settings.snapshot()
+    };
+    Ok(Json(with_geodata(state, settings, &active)).into_response())
 }
 
 fn invalid(id: &RequestId) -> ApiError {

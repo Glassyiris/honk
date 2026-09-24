@@ -223,6 +223,12 @@ impl NativeApiConfig {
                     "geodata source requires a credential-free HTTP(S) URL without a fragment",
                 ));
             }
+            if value.len() > MAX_GEODATA_URL_BYTES {
+                return Err(invalid(
+                    field,
+                    "geodata source URL must not exceed 4096 bytes",
+                ));
+            }
         }
         if self
             .probe_allowed_cidrs
@@ -283,6 +289,9 @@ impl NativeApiConfig {
         Ok(())
     }
 }
+
+/// The longest geodata source URL the configuration or the state db accepts.
+pub const MAX_GEODATA_URL_BYTES: usize = 4096;
 
 /// Parse an administrator-configured direct geodata source without credentials.
 pub fn parse_geodata_url(value: &str) -> Option<url::Url> {

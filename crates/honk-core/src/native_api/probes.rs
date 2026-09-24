@@ -254,13 +254,15 @@ pub(crate) struct ProbeService {
     gate: Mutex<Gate>,
     requests_drained: Notify,
 }
-struct Policy {
+/// The administrator's outbound destination policy: default ports and public
+/// addresses unless `probe_allowed_ports` and `probe_allowed_cidrs` widen it.
+pub(crate) struct Policy {
     allowed: Vec<IpNet>,
     ports: Vec<u16>,
     restricted: Vec<IpNet>,
 }
 impl Policy {
-    fn new(config: &NativeApiConfig) -> Self {
+    pub(crate) fn new(config: &NativeApiConfig) -> Self {
         Self {
             allowed: config
                 .probe_allowed_cidrs
@@ -294,7 +296,7 @@ impl Policy {
             .collect(),
         }
     }
-    fn address(&self, ip: IpAddr) -> bool {
+    pub(crate) fn address(&self, ip: IpAddr) -> bool {
         let ip = canonical_ip(ip);
         let restricted = self.restricted.iter().any(|net| net.contains(&ip))
             || match ip {
@@ -302,6 +304,9 @@ impl Policy {
                 IpAddr::V6(ip) => ip.segments()[0] & 0xe000 != 0x2000,
             };
         !restricted || self.allowed.iter().any(|net| net.contains(&ip))
+    }
+    pub(crate) fn http_port(&self, port: u16, https: bool) -> bool {
+        self.port(Kind::Http, port, https)
     }
     fn port(&self, kind: Kind, port: u16, https: bool) -> bool {
         port != 0

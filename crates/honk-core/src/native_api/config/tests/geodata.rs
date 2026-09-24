@@ -127,6 +127,13 @@ impl AssetServer {
                         break;
                     }
                 }
+                // No checksum is published beside these assets.
+                if head.split(|byte| *byte == b' ').nth(1).and_then(|target| target.split(|byte| *byte == b'?').next())
+                    .is_some_and(|path| path.ends_with(b".sha256sum")) {
+                    stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    stream.shutdown().await.unwrap();
+                    continue;
+                }
                 counted.fetch_add(1, Ordering::SeqCst);
                 if let Some(entered) = entered.take() {
                     let _ = entered.send(());
@@ -164,6 +171,14 @@ impl AssetServer {
 }
 
 fn setup(root: &Path, files: &mut HashMap<&'static str, String>, address: SocketAddr) {
+    setup_rules(root, files);
+    let auth = files.get_mut("auth.dae").unwrap();
+    *auth = auth.replace(" enabled: true", &format!(
+        " geosite_download_url: 'http://{address}/geosite/PRIVATE?token=PRIVATE'\n geoip_download_url: 'http://{address}/geoip'\n enabled: true",
+    ));
+}
+
+fn setup_rules(root: &Path, files: &mut HashMap<&'static str, String>) {
     let directory = root.join("state");
     std::fs::create_dir_all(&directory).unwrap();
     std::fs::write(directory.join("geosite.dat"), geosite("old.example")).unwrap();
@@ -173,10 +188,6 @@ fn setup(root: &Path, files: &mut HashMap<&'static str, String>, address: Socket
         " fallback: direct",
         " domain(geosite: test) -> block\n dip(geoip: test) -> block\n fallback: direct",
     );
-    let auth = files.get_mut("auth.dae").unwrap();
-    *auth = auth.replace(" enabled: true", &format!(
-        " geosite_download_url: 'http://{address}/geosite/PRIVATE?token=PRIVATE'\n geoip_download_url: 'http://{address}/geoip'\n enabled: true",
-    ));
 }
 
 async fn fixture(address: SocketAddr, gated_reload: bool) -> Fixture {
@@ -455,7 +466,7 @@ async fn download_bounds_actual_chunked_bytes_and_joins_timed_out_connection() {
             let read = timeout(WAIT, stream.read_to_end(&mut remaining)).await.unwrap();
             assert!(read.is_ok() || read.unwrap_err().kind() == std::io::ErrorKind::ConnectionReset);
         });
-        let result = download(&url, "", tokio::time::Instant::now() + Duration::from_millis(100), 4).await;
+        let result = download(&url, "", tokio::time::Instant::now() + Duration::from_millis(100), 4, None).await;
         assert_eq!(result.unwrap_err(), expected);
         tasks.join_next().await.unwrap().unwrap();
     }
@@ -618,6 +629,175 @@ async fn concurrent_geodata_rejections_share_the_original_admission_error() {
     fixture.shutdown().await;
 }
 
+const SETTINGS: &str = "/api/v1/runtime/settings";
+
+/// Serves fixed responses by request path; any other path is a 404.
+struct Mirror {
+    address: SocketAddr,
+    requests: Arc<parking_lot::Mutex<Vec<String>>>,
+    tasks: JoinSet<()>,
+}
+
+impl Mirror {
+    async fn new(routes: Vec<(&'static str, &'static str, Vec<u8>)>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    head.push(stream.read_u8().await.unwrap());
+                }
+                let head = String::from_utf8(head).unwrap();
+                let path = head.split(' ').nth(1).unwrap().to_owned();
+                seen.lock().push(path.clone());
+                let (status, body) = routes
+                    .iter()
+                    .find(|(route, _, _)| *route == path)
+                    .map_or(("404 Not Found", &[][..]), |(_, status, body)| {
+                        (*status, body)
+                    });
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        Self {
+            address,
+            requests,
+            tasks,
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.address)
+    }
+
+    async fn close(mut self) {
+        self.tasks.abort_all();
+        while self.tasks.join_next().await.is_some() {}
+    }
+}
+
+/// Stored URLs follow the administrator's destination policy, so the loopback
+/// mirror has to be allowed like any private address.
+fn allow(files: &mut HashMap<&'static str, String>, address: SocketAddr) {
+    let auth = files.get_mut("auth.dae").unwrap();
+    *auth = auth.replace(
+        " enabled: true",
+        &format!(
+            " probe_allowed_cidrs: '127.0.0.0/8'\n probe_allowed_ports: {}\n enabled: true",
+            address.port()
+        ),
+    );
+}
+
+fn checksum(bytes: &[u8]) -> Vec<u8> {
+    format!("{}  file.dat\n", crate::configuration::digest(bytes)).into_bytes()
+}
+
+async fn patch_settings(fixture: &Fixture, body: Value) -> Response {
+    fixture
+        .request(Method::PATCH, SETTINGS)
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn update_falls_back_past_a_failed_status_and_a_checksum_mismatch() {
+    let site = geosite("new.example");
+    let ip = geoip(203);
+    const OK: &str = "200 OK";
+    let mirror = Mirror::new(vec![
+        ("/tampered/geosite.dat", OK, site.clone()),
+        ("/tampered/geosite.dat.sha256sum", OK, checksum(b"other")),
+        ("/moved/geosite.dat", OK, site.clone()),
+        ("/moved/geosite.dat.sha256sum", "302 Found", Vec::new()),
+        ("/good/geosite.dat?token=abc", OK, site.clone()),
+        ("/good/geosite.dat.sha256sum?token=abc", OK, checksum(&site)),
+        ("/good/geoip.dat", OK, ip.clone()),
+    ])
+    .await;
+    let fixture = Fixture::new_with_state(Access::Admin, |root, files| {
+        setup_rules(root, files);
+        allow(files, mirror.address);
+    })
+    .await;
+    let geosite_urls = [
+        mirror.url("/missing/geosite.dat"),
+        mirror.url("/tampered/geosite.dat"),
+        mirror.url("/moved/geosite.dat"),
+        mirror.url("/good/geosite.dat?token=abc"),
+    ];
+    let settings = ok(patch_settings(
+        &fixture,
+        json!({"geodata": {"geosite": {"urls": geosite_urls},
+            "geoip": {"urls": [mirror.url("/good/geoip.dat")]}}}),
+    )
+    .await)
+    .await;
+    assert_eq!(settings["geodata"]["source"], "db");
+    assert_eq!(settings["geodata"]["geosite"]["urls"], json!(geosite_urls));
+    assert_eq!(settings["source"], "config");
+    let operation = accepted(fixture.request(Method::POST, UPDATE).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&operation).await;
+    assert_eq!(terminal["status"], "succeeded", "{terminal}");
+    assert_eq!(
+        std::fs::read(fixture.path("state/geosite.dat")).unwrap(),
+        site
+    );
+    assert_eq!(std::fs::read(fixture.path("state/geoip.dat")).unwrap(), ip);
+    assert_eq!(route(&fixture, "new.example", "192.0.2.5").await, "block");
+    let data = fixture.get(GEO).await;
+    assert_eq!(data["assets"], terminal["result"]["assets"]);
+    let assets = &data["assets"];
+    assert_eq!(assets[0]["source_redacted"], geosite_urls[0]);
+    assert_eq!(
+        assets[0]["fetched_url_redacted"],
+        mirror.url("/good/geosite.dat")
+    );
+    assert_eq!(assets[0]["verified"], true);
+    assert_eq!(
+        assets[1]["fetched_url_redacted"],
+        mirror.url("/good/geoip.dat")
+    );
+    assert_eq!(assets[1]["verified"], false);
+    assert!(data["last_checked_at"].is_string());
+    assert!(data["last_updated_at"].is_string());
+    assert_eq!(data["next_check_at"], Value::Null);
+    assert_eq!(data["last_error"], Value::Null);
+    assert_eq!(
+        data["required_codes"],
+        json!({"geosite": ["test"], "geoip": ["test"]})
+    );
+    assert_eq!(
+        *mirror.requests.lock(),
+        [
+            "/missing/geosite.dat",
+            "/tampered/geosite.dat",
+            "/tampered/geosite.dat.sha256sum",
+            "/moved/geosite.dat",
+            "/moved/geosite.dat.sha256sum",
+            "/good/geosite.dat?token=abc",
+            "/good/geosite.dat.sha256sum?token=abc",
+            "/good/geoip.dat",
+            "/good/geoip.dat.sha256sum",
+        ]
+    );
+    fixture.shutdown().await;
+    mirror.close().await;
+}
+
 #[tokio::test]
 async fn update_refuses_a_file_without_a_used_category_and_keeps_the_old_one() {
     let server = AssetServer::new(geosite_code(b"other", "new.example"), geoip(203), false).await;
@@ -639,4 +819,160 @@ async fn update_refuses_a_file_without_a_used_category_and_keeps_the_old_one() {
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
     fixture.shutdown().await;
     server.close().await;
+}
+
+#[tokio::test]
+async fn url_patches_are_accepted_while_the_configuration_names_urls() {
+    let address: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let fixture =
+        Fixture::new_with_state(Access::Admin, |root, files| setup(root, files, address)).await;
+    let before = fixture.get(SETTINGS).await;
+    assert_eq!(
+        before["geodata"],
+        json!({"source": "config",
+            "geosite": {"urls": [format!("http://{address}/geosite/PRIVATE?token=PRIVATE")]},
+            "geoip": {"urls": [format!("http://{address}/geoip")]},
+            "auto_update": {"enabled": false, "interval_hours": 24}})
+    );
+    let patched = ok(patch_settings(
+        &fixture,
+        json!({"geodata": {"geoip": {"urls": ["https://mirror.example/geoip.dat"]}},
+            "log": {"level": "debug"}}),
+    )
+    .await)
+    .await;
+    assert_eq!(patched["geodata"]["source"], "db");
+    assert_eq!(patched["geodata"]["geosite"], before["geodata"]["geosite"]);
+    assert_eq!(
+        patched["geodata"]["geoip"]["urls"],
+        json!(["https://mirror.example/geoip.dat"])
+    );
+    assert_eq!(patched["log"]["level"], "debug");
+    assert_eq!(fixture.get(SETTINGS).await["geodata"], patched["geodata"]);
+    let capabilities = fixture.get("/api/v1/capabilities").await;
+    assert_eq!(
+        capabilities["resources"]["geodata"]["configurable_sources"],
+        true
+    );
+    assert!(
+        capabilities["resources"]["runtime_settings"]["fields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("geodata"))
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unrelated_activation_keeps_patched_urls() {
+    let address: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let fixture =
+        Fixture::new_with_state(Access::Admin, |root, files| setup(root, files, address)).await;
+    let patched = ok(patch_settings(
+        &fixture,
+        json!({"geodata": {"geosite": {"urls": ["https://mirror.example/geosite.dat"]}}}),
+    )
+    .await)
+    .await["geodata"]
+        .clone();
+    let main = fixture.originals["main.dae"].replace(
+        "domain(geosite: test) -> block",
+        "domain(geosite: test) -> direct",
+    );
+    assert_ne!(main, fixture.originals["main.dae"]);
+    std::fs::write(fixture.path("main.dae"), main).unwrap();
+    let reload = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&reload).await["status"], "succeeded");
+    assert_eq!(route(&fixture, "old.example", "192.0.2.5").await, "direct");
+    assert_eq!(fixture.get(SETTINGS).await["geodata"], patched);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn auto_update_stays_settable_while_the_configuration_names_urls() {
+    let address: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let fixture =
+        Fixture::new_with_state(Access::Admin, |root, files| setup(root, files, address)).await;
+    assert_eq!(fixture.get(GEO).await["next_check_at"], Value::Null);
+    let settings = ok(patch_settings(
+        &fixture,
+        json!({"geodata": {"auto_update": {"enabled": true, "interval_hours": 48}}}),
+    )
+    .await)
+    .await;
+    assert_eq!(settings["geodata"]["source"], "config");
+    assert_eq!(
+        settings["geodata"]["auto_update"],
+        json!({"enabled": true, "interval_hours": 48})
+    );
+    assert_eq!(settings["source"], "config");
+    assert_eq!(fixture.get(SETTINGS).await["geodata"], settings["geodata"]);
+    assert!(fixture.get(GEO).await["next_check_at"].is_string());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn anonymous_callers_cannot_change_sources_and_read_masked_urls() {
+    const CLASH: &str = "clash-listener-secret";
+    let fixture = Fixture::new_with_state(Access::Anonymous, |root, files| {
+        setup_rules(root, files);
+        let auth = files.get_mut("auth.dae").unwrap();
+        *auth = auth.replace(
+            " native_api {",
+            &format!(" clash_api {{\n secret: '{CLASH}'\n }}\n native_api {{"),
+        );
+        *auth = auth.replace(
+            " allow_anonymous_loopback: true",
+            &format!(" allow_anonymous_loopback: true\n geosite_download_url: 'https://mirror.example/{CLASH}/geosite.dat?key=query-secret'"),
+        );
+    })
+    .await;
+    let before = fixture.get(SETTINGS).await;
+    let urls = before["geodata"]["geosite"]["urls"].as_array().unwrap();
+    assert_eq!(urls.len(), 1);
+    let url = urls[0].as_str().unwrap();
+    assert!(!url.contains(CLASH) && !url.contains('?'), "{url}");
+    assert!(url.starts_with("https://mirror.example/") && url.ends_with("/geosite.dat"));
+    for body in [
+        json!({"geodata": {"auto_update": {"enabled": true}}}),
+        json!({"geodata": null}),
+    ] {
+        error(
+            patch_settings(&fixture, body).await,
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+        )
+        .await;
+    }
+    assert_eq!(fixture.get(SETTINGS).await["geodata"], before["geodata"]);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn null_returns_to_the_built_in_sources() {
+    let fixture = Fixture::new_with_state(Access::Admin, setup_rules).await;
+    let defaults = fixture.get(SETTINGS).await["geodata"].clone();
+    assert_eq!(defaults["source"], "default");
+    assert_eq!(
+        defaults["auto_update"],
+        json!({"enabled": false, "interval_hours": 24})
+    );
+    let stored = ok(patch_settings(
+        &fixture,
+        json!({"geodata": {"geoip": {"urls": ["https://mirror.example/geoip.dat"]},
+            "auto_update": {"enabled": true}}}),
+    )
+    .await)
+    .await;
+    assert_eq!(stored["geodata"]["source"], "db");
+    assert_eq!(stored["geodata"]["geosite"], defaults["geosite"]);
+    assert_eq!(
+        stored["geodata"]["geoip"]["urls"],
+        json!(["https://mirror.example/geoip.dat"])
+    );
+    let reset = ok(patch_settings(&fixture, json!({"geodata": null})).await).await;
+    assert_eq!(reset["geodata"], defaults);
+    assert_eq!(fixture.get(SETTINGS).await["geodata"], defaults);
+    assert_eq!(fixture.get(GEO).await["next_check_at"], Value::Null);
+    fixture.shutdown().await;
 }

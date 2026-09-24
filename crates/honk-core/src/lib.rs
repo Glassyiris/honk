@@ -466,6 +466,7 @@ fn open_state_db(
     if cli.store == ConfigStore::Db
         || !(config.experimental.cache_file.stores_selections()
             || config.global.store_subscribe
+            || config.experimental.native_api.enabled
             || config.experimental.native_api.password_auth)
     {
         return Ok((None, false));

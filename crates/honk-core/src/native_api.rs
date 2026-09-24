@@ -58,6 +58,8 @@ pub struct NativeState {
     security: security::Security,
     /// Present only in password mode: the administrator record, the live sessions and login admission.
     pub(crate) auth: Option<Arc<auth::Auth>>,
+    /// Stored geodata sources and the update schedule; absent without a state db.
+    pub(crate) geodata: Option<Arc<geodata::Sources>>,
     ui: Option<ui::Ui>,
     instance_id: String,
     started_at: SystemTime,
@@ -136,12 +138,24 @@ impl NativeState {
         } else {
             None
         };
+        let geodata = control.state_db().and_then(|db| {
+            geodata::Sources::open(db, &settings)
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        %error,
+                        "geodata settings cannot be stored; geodata sources are not configurable"
+                    );
+                })
+                .ok()
+                .map(Arc::new)
+        });
         let observation = control.native_observation();
         let phase = control.observe_phase();
         observation.configuration.attach_phase(phase.clone());
         Ok(Self {
             security: security::Security::new(&settings, listen),
             auth,
+            geodata,
             ui: ui::load(&settings.ui).await?,
             settings,
             clash_secret,

@@ -60,12 +60,20 @@ impl Worker {
                 .service
                 .operations
                 .succeed(id, OperationResult::Geodata(data)),
-            Err(details) => self.service.operations.fail(
-                id,
-                "geodata_update_failed",
-                "Geodata update did not complete successfully",
-                Some(details),
-            ),
+            Err(details) => {
+                if let Some(sources) = &plan.sources {
+                    sources.record(Err(details["stage"]
+                        .as_str()
+                        .unwrap_or("activation_failed")
+                        .to_owned()));
+                }
+                self.service.operations.fail(
+                    id,
+                    "geodata_update_failed",
+                    "Geodata update did not complete successfully",
+                    Some(details),
+                )
+            }
         };
     }
 
@@ -88,14 +96,16 @@ impl Worker {
         {
             return Err(failure("revision_conflict", &writes));
         }
-        let deadline = tokio::time::Instant::now() + geodata::NETWORK_TIMEOUT;
         let mut downloads = Vec::with_capacity(plan.assets.len());
-        for asset in &plan.assets {
-            let bytes = geodata::download(
-                geodata::configured_url(&active.experimental.native_api, asset.kind),
+        let mut fetched = Vec::with_capacity(plan.assets.len());
+        for (asset, urls) in plan.assets.iter().zip(&plan.urls) {
+            let (bytes, origin) = geodata::fetch(
+                asset.kind,
+                urls,
                 &active.global.bootstrap_resolver,
-                deadline,
                 offline::MAX_ASSET_BYTES,
+                &plan.policy,
+                geodata::file_url(&active.experimental.native_api, asset.kind),
             )
             .await
             .map_err(|stage| failure(stage, &writes))?;
@@ -103,6 +113,7 @@ impl Worker {
                 original: asset.clone(),
                 bytes,
             });
+            fetched.push(origin);
         }
         let service = Arc::clone(&self.service);
         let store = self
@@ -178,10 +189,18 @@ impl Worker {
             details["committed"] = json!(true);
             return Err(details);
         }
+        if let Some(sources) = &plan.sources {
+            let replaced = plan
+                .assets
+                .iter()
+                .zip(&prepared)
+                .any(|(original, prepared)| original.sha256 != prepared.snapshot.sha256);
+            sources.record(Ok((fetched, replaced)));
+        }
         let active = self.active.read().await;
         Ok(geodata::project(
             assets,
-            &self.service.settings,
+            plan.sources.as_deref(),
             &active,
             &self.service,
         ))

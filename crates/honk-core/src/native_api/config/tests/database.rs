@@ -378,7 +378,7 @@ async fn changed_config(fixture: &Fixture, before: &Value) -> Value {
 
 #[tokio::test]
 async fn pending_record_keeps_http_responsive_and_serializes_the_next_work() {
-    let mut fixture = Fixture::build(Access::Admin, true, |_, _| {}, true).await;
+    let mut fixture = Fixture::build(Access::Admin, true, |_, _| {}, true, false).await;
     let before = fixture.get(CONFIG).await;
     let main = source(&before, &fixture.originals["main.dae"]);
     let candidate = main_edit(&fixture);
@@ -432,7 +432,7 @@ async fn pending_record_keeps_http_responsive_and_serializes_the_next_work() {
 
 #[tokio::test]
 async fn disconnected_management_and_shutdown_retain_pending_record() {
-    let mut fixture = Fixture::build(Access::Admin, true, |_, _| {}, true).await;
+    let mut fixture = Fixture::build(Access::Admin, true, |_, _| {}, true, false).await;
     let before = fixture.get(CONFIG).await;
     let request = fixture
         .request(Method::POST, "/api/v1/nodes")

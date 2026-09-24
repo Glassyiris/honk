@@ -692,6 +692,7 @@ mod native_api {
             serde_json::json!({"geoip_download_url":"https://example.test/#PRIVATE"}),
             serde_json::json!({"geosite_download_url":"https://@example.test/data"}),
             serde_json::json!({"geosite_download_url":"https://example.test:0/data"}),
+            serde_json::json!({"geoip_download_url":format!("https://example.test/{}", "a".repeat(4076))}),
         ] {
             let config: Config =
                 serde_json::from_value(serde_json::json!({"experimental":{"native_api":native}}))
@@ -717,6 +718,7 @@ mod native_api {
             serde_json::json!({"enabled":true,"listen":"[::1]:9527","allow_anonymous_loopback":true}),
             serde_json::json!({"enabled":true,"listen":"0.0.0.0:9527","secret":"PRIVATE"}),
             serde_json::json!({"geosite_download_url":"https://example.test/data?token=PRIVATE","geoip_download_url":"http://[::1]:8080/data"}),
+            serde_json::json!({"geoip_download_url":format!("https://example.test/{}", "a".repeat(4075))}),
         ] {
             let config: Config =
                 serde_json::from_value(serde_json::json!({"experimental":{"native_api":native}}))

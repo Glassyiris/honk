@@ -193,6 +193,12 @@ async fn supervise(
         .probes
         .start(Arc::clone(&state), probes_receiver);
     let mut probes_running = true;
+    let (schedule_stop, schedule_receiver) = watch::channel(false);
+    let mut schedule = tokio::spawn(super::geodata::schedule(
+        Arc::clone(&state),
+        schedule_receiver,
+    ));
+    let mut schedule_running = true;
     let mut sampler = tokio::spawn(sample_traffic(Arc::clone(&state), sampler_receiver));
     let mut sampler_running = true;
     let mut children = JoinSet::new();
@@ -208,6 +214,11 @@ async fn supervise(
             _ = &mut sampler => {
                 sampler_running = false;
                 tracing::error!(message = "native HTTP sampler stopped unexpectedly");
+                break;
+            }
+            _ = &mut schedule => {
+                schedule_running = false;
+                tracing::error!(message = "native geodata schedule stopped unexpectedly");
                 break;
             }
             child = children.join_next(), if !children.is_empty() => {
@@ -256,6 +267,10 @@ async fn supervise(
     let _ = sampler_stop.send(true);
     if sampler_running {
         let _ = sampler.await;
+    }
+    let _ = schedule_stop.send(true);
+    if schedule_running {
+        let _ = schedule.await;
     }
     let _ = connections_stop.send(true);
     if tokio::time::timeout(Duration::from_secs(5), async {
