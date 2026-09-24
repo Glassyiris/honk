@@ -41,7 +41,7 @@ async fn ui_serves_only_its_directory_with_navigation_and_static_cache_policy() 
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         assert_eq!(response.headers()["cache-control"], "no-cache");
         assert_eq!(response.headers()["x-content-type-options"], "nosniff");
-        assert_eq!(response.headers()["x-frame-options"], "DENY");
+        assert!(response.headers().get("x-frame-options").is_none());
         assert!(
             response.headers()["content-type"]
                 .to_str()
@@ -128,7 +128,7 @@ async fn ui_serves_only_its_directory_with_navigation_and_static_cache_policy() 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(response.headers()["cache-control"], "no-cache");
         assert_eq!(response.headers()["x-content-type-options"], "nosniff");
-        assert_eq!(response.headers()["x-frame-options"], "DENY");
+        assert!(response.headers().get("x-frame-options").is_none());
         error_body(
             &response.json::<Value>().await.unwrap(),
             "permission_denied",
@@ -188,7 +188,7 @@ async fn embedded_ui_preserves_assets_head_and_safe_navigation() {
             assert_eq!(response.status(), StatusCode::OK, "{path}");
             assert_eq!(response.headers()["cache-control"], "no-cache");
             assert_eq!(response.headers()["x-content-type-options"], "nosniff");
-            assert_eq!(response.headers()["x-frame-options"], "DENY");
+            assert!(response.headers().get("x-frame-options").is_none());
             assert_eq!(
                 response.headers()["content-length"]
                     .to_str()

@@ -66,7 +66,7 @@ impl Ui {
             header::X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),
         );
-        headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+        // No framing header: dashboards such as LuCI embed the UI in a frame served from another port.
         response
     }
 
