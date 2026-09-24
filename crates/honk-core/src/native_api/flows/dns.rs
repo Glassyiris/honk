@@ -8,12 +8,12 @@ use std::{
 
 use honk_outbound::runtime::flow_observation::{self, DnsLookup, FlowEvent, FlowObserver};
 use parking_lot::Mutex;
-use serde::Serialize;
 use uuid::Uuid;
 
 use super::{
-    MAX_RULE_VALUES,
-    record::{EvaluationInput, StepData},
+    MAX_RULE_VALUES, MAX_TEXT,
+    producer::{bounded, map_selection_observation},
+    record::{DnsRequestInput, DnsResponseInput, EvaluationInput, StepData},
 };
 use crate::dns::{
     forwarder::DnsForwardError,
@@ -26,42 +26,11 @@ use crate::native_api::{
 };
 
 const MAX_ADDRESSES: usize = 256;
-const MAX_TEXT: usize = 512;
 
 tokio::task_local! {
     static DNS_API: Weak<DnsApi>;
     static LOOKUP: LookupState;
     static CATALOG: Option<Arc<crate::native_api::catalog::CatalogIdentity>>;
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct DnsRequestInput {
-    pub(crate) name: String,
-    pub(crate) qtype: String,
-    pub(crate) source_ip: Option<IpAddr>,
-    pub(crate) original_dst: Option<SocketAddr>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub(crate) struct DnsResponseInput {
-    pub(crate) name: String,
-    pub(crate) qtype: String,
-    pub(crate) answer_ips: Vec<IpAddr>,
-    pub(crate) from_upstream: String,
-}
-
-impl DnsRequestInput {
-    pub(crate) fn heap_bytes(&self) -> usize {
-        self.name.capacity() + self.qtype.capacity()
-    }
-}
-impl DnsResponseInput {
-    pub(crate) fn heap_bytes(&self) -> usize {
-        self.name.capacity()
-            + self.qtype.capacity()
-            + self.from_upstream.capacity()
-            + self.answer_ips.capacity() * size_of::<IpAddr>()
-    }
 }
 
 pub(crate) fn scope_api<F: Future>(
@@ -132,13 +101,7 @@ impl LookupGuard {
                 return None;
             }
         };
-        let name = query.qname().and_then(|name| {
-            if name.as_wire() == [0] {
-                Some(".".to_owned())
-            } else {
-                name.to_domain_name()
-            }
-        });
+        let name = query.qname().and_then(|name| name.to_domain_name());
         let Some((name, query_type)) = name.zip(query.qtype()) else {
             observer.publish(FlowEvent::Gap("not_instrumented"));
             return None;
@@ -340,19 +303,6 @@ pub(crate) fn decision(status: &'static str, error: Option<&'static str>) {
         let data = lookup.data.lock().clone();
         lookup.observer.publish(FlowEvent::Dns(data));
     });
-}
-
-pub(crate) fn bounded(value: &str) -> String {
-    if value.len() > MAX_TEXT
-        && let Some(observer) = flow_observation::current()
-    {
-        observer.publish(FlowEvent::Gap("buffer_overflow"));
-    }
-    let mut end = value.len().min(MAX_TEXT);
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].to_owned()
 }
 
 pub(crate) fn qtype(value: u16) -> String {
@@ -798,98 +748,6 @@ pub(crate) fn route_upstream(
         }
     });
     (outbound.to_owned(), Some(evaluation_id))
-}
-
-pub(crate) fn map_selection_observation(
-    observation: &honk_outbound::group::observation::SelectionObservation,
-    catalog: &crate::native_api::catalog::CatalogIdentity,
-    observer: &FlowObserver,
-) -> Vec<super::record::Selection> {
-    use honk_outbound::group::observation::ObservedMember;
-    fn member(
-        value: &ObservedMember,
-        catalog: &crate::native_api::catalog::CatalogIdentity,
-        observer: &FlowObserver,
-    ) -> Option<(String, Option<String>)> {
-        match value {
-            ObservedMember::Node { id, name } => {
-                Some((id.to_string(), name.as_deref().map(bounded)))
-            }
-            ObservedMember::Group { name } => match catalog.groups.get(name) {
-                Some(id) => Some((id.clone(), Some(bounded(name)))),
-                None => {
-                    observer.publish(FlowEvent::Gap("not_instrumented"));
-                    None
-                }
-            },
-        }
-    }
-    if observation.truncated || observation.decisions.len() > 64 {
-        observer.publish(FlowEvent::Gap("buffer_overflow"));
-    }
-    let mut remaining = MAX_RULE_VALUES;
-    observation
-        .decisions
-        .iter()
-        .take(64)
-        .filter_map(|decision| {
-            let Some(group_id) = catalog.groups.get(&decision.group_name) else {
-                observer.publish(FlowEvent::Gap("not_instrumented"));
-                return None;
-            };
-            let selected = decision
-                .selected_member
-                .as_ref()
-                .and_then(|value| member(value, catalog, observer));
-            let previous = decision
-                .previous_member
-                .as_ref()
-                .and_then(|value| member(value, catalog, observer));
-            let count = decision.candidates.len().min(remaining);
-            remaining -= count;
-            if count != decision.candidates.len() {
-                observer.publish(FlowEvent::Gap("buffer_overflow"));
-            }
-            let candidates = decision
-                .candidates
-                .iter()
-                .take(count)
-                .filter_map(|candidate| {
-                    let (member_id, member_name) = member(&candidate.member, catalog, observer)?;
-                    Some(super::record::SelectionCandidate {
-                        member_id,
-                        member_name,
-                        leaf_node_id: candidate.leaf_node_id.map(|id| id.to_string()),
-                        leaf_node_name: candidate.leaf_node_name.as_deref().map(bounded),
-                        eligible: candidate.eligible,
-                        sorting_latency_ms: candidate.sorting_latency_ms,
-                        score: candidate.score,
-                        selected: candidate.selected,
-                        reason: candidate.reason,
-                    })
-                })
-                .collect();
-            Some(super::record::Selection {
-                group_id: group_id.clone(),
-                member_id: selected.as_ref().map(|(id, _)| id.clone()),
-                member_name: selected.and_then(|(_, name)| name),
-                policy: decision.policy,
-                reason: decision.reason,
-                health_family: Some(match decision.health_family {
-                    honk_outbound::alive::IpVersion::V4 => "ipv4",
-                    honk_outbound::alive::IpVersion::V6 => "ipv6",
-                }),
-                applied: Some(decision.applied),
-                selection: Some(super::record::SelectionDecision {
-                    previous_member_id: previous.map(|(id, _)| id),
-                    metric: decision.metric,
-                    previous_leaf_node_id: decision.previous_leaf_node_id.map(|id| id.to_string()),
-                    tolerance_ms: decision.tolerance_ms,
-                    candidates,
-                }),
-            })
-        })
-        .collect()
 }
 
 pub(crate) fn selection_evaluated(

@@ -25,47 +25,18 @@ fn query_parameters_reject_semantic_duplicates_and_name_wire_overflow() {
     assert!(!validate_name("example..com"));
     assert!(!validate_name("example.com.."));
     assert_eq!(canonical_name("EXAMPLE.Com.", &id).unwrap(), "example.com.");
-    for name in [".", "example.com."] {
-        let query = crate::dns::forwarder::build_dns_query(name, 1);
-        assert!(crate::dns::query::QueryContext::parse(&query).is_ok());
-    }
 }
 
 #[tokio::test]
 async fn cache_snapshot_filters_before_budget_admission_and_freezes_selected_pages() {
-    use std::sync::Arc;
-    use std::time::Instant;
-
     use crate::dns::cache::{CacheInvalidation, CacheKey, OperationKind};
     use crate::dns::forwarder::build_dns_query;
     use crate::dns::planner::RequestScope;
     use crate::dns::query::QueryContext;
 
     let mut config = honk_config::Config::default();
-    config.global.nfqueue_enable = false;
-    config.experimental.native_api.enabled = true;
-    config.experimental.native_api.allow_anonymous_loopback = true;
     config.dns.cache.max_size = 8192;
-    config.ensure_builtin_nodes();
-    let resolver = crate::dns::DnsResolver::new(&config.dns).unwrap();
-    let forwarder = resolver.forwarder();
-    let mut control = crate::control::ControlPlane::new(
-        config,
-        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
-        crate::routing::Router::new(&[], "direct").unwrap(),
-        Arc::new(crate::proxy::ProxyRegistry::default_resolver().unwrap()),
-        resolver,
-        forwarder,
-    )
-    .unwrap();
-    let state = NativeState::new(
-        &mut control,
-        "127.0.0.1:9527".parse().unwrap(),
-        SystemTime::now(),
-        Instant::now(),
-    )
-    .await
-    .unwrap();
+    let state = dns_state(config).await;
     let service = state.dns.cache().lock().await.service();
     let scope = RequestScope::Upstream(UpstreamTag::new("default").unwrap());
     for index in 0..320 {
@@ -154,4 +125,165 @@ async fn cache_page(state: &NativeState, query: &str) -> (StatusCode, Value) {
         .await
         .unwrap();
     (status, serde_json::from_slice(&body).unwrap())
+}
+
+async fn dns_state(mut config: honk_config::Config) -> NativeState {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    config.global.nfqueue_enable = false;
+    config.experimental.native_api.enabled = true;
+    config.experimental.native_api.allow_anonymous_loopback = true;
+    config.ensure_builtin_nodes();
+    let resolver = crate::dns::DnsResolver::new(&config.dns).unwrap();
+    let forwarder = resolver.forwarder();
+    let mut control = crate::control::ControlPlane::new(
+        config,
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        crate::routing::Router::new(&[], "direct").unwrap(),
+        Arc::new(crate::proxy::ProxyRegistry::default_resolver().unwrap()),
+        resolver,
+        forwarder,
+    )
+    .unwrap();
+    let state = NativeState::new(
+        &mut control,
+        "127.0.0.1:9527".parse().unwrap(),
+        SystemTime::now(),
+        Instant::now(),
+    )
+    .await
+    .unwrap();
+    control.publish_phase(crate::control::EnginePhase::Running);
+    state
+}
+
+#[tokio::test]
+async fn root_query_replays_lists_and_invalidates_only_root() {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    let mut upstream = tokio::task::JoinSet::new();
+    upstream.spawn(async move {
+        for name in [".", "ordinary.example."] {
+            let mut wire = [0u8; 512];
+            let (length, peer) =
+                tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut wire))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let question = records::question(&wire[..length], IngressProfile::Api).unwrap();
+            assert_eq!(question.name, name);
+            assert_eq!(question.rtype, "NS");
+            if name == "." {
+                assert_eq!(&wire[12..length], &[0, 0, 2, 0, 1]);
+            }
+            let mut response = wire[..length].to_vec();
+            response[2..4].copy_from_slice(&[0x81, 0x80]);
+            response[6..8].copy_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&[0xc0, 0x0c, 0, 2, 0, 1, 0, 0, 1, 44, 0, 12]);
+            response.extend_from_slice(b"\x02ns\x07example\0");
+            socket.send_to(&response, peer).await.unwrap();
+        }
+    });
+    let mut config = honk_config::Config::default();
+    config.dns.cache.ttl = 0;
+    config.dns.upstream = vec![honk_config::dns::DnsUpstream {
+        name: "default".into(),
+        address: address.to_string(),
+        protocol: honk_config::types::DnsProtocol::Udp,
+        tls_server_name: None,
+        outbound: None,
+    }];
+    let state = dns_state(config).await;
+    let id = RequestId("root-dns".into());
+    for name in ["", "..", "ordinary..example"] {
+        let uri = format!("/api/v1/dns/query?domain={name}&type=NS")
+            .parse()
+            .unwrap();
+        let response = query(&state, &uri, &id)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let mut root_entry = Value::Null;
+    for (name, expected, cached) in [
+        (".", ".", false),
+        (".", ".", true),
+        ("OrDiNaRy.Example.", "ordinary.example.", false),
+        ("ordinary.example", "ordinary.example.", true),
+    ] {
+        let uri = format!("/api/v1/dns/query?domain={name}&type=NS&detail=full")
+            .parse()
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), query(&state, &uri, &id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), MAX_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["domain"], expected);
+        let result = &value["results"][0];
+        assert_eq!(
+            result["question"],
+            json!({"name":expected,"type":"NS","class":"IN"})
+        );
+        assert_eq!(result["status"], "NOERROR");
+        assert_eq!(result["cached"], cached);
+        assert_eq!(
+            result["upstream"],
+            if cached {
+                Value::Null
+            } else {
+                json!("default")
+            }
+        );
+        assert_eq!(result["answers"].as_array().unwrap().len(), 1);
+        let answer = &result["answers"][0];
+        assert_eq!(answer["name"], expected);
+        assert_eq!(answer["type"], "NS");
+        assert_eq!(answer["class"], "IN");
+        assert_eq!(answer["data"], "ns.example.");
+        assert!((1..=300).contains(&answer["ttl"].as_u64().unwrap()));
+        if expected == "." {
+            if cached {
+                assert_eq!(result["cache_entry_id"], root_entry);
+            } else {
+                assert!(result["cache_entry_id"].is_string());
+                root_entry = result["cache_entry_id"].clone();
+            }
+        }
+    }
+    upstream.join_next().await.unwrap().unwrap();
+
+    let (status, page) = cache_page(&state, "?name=.&type=NS&detail=full").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["total"], 1);
+    assert_eq!(page["entries"][0]["entry_id"], root_entry);
+    assert_eq!(page["entries"][0]["domain"], ".");
+    assert_eq!(page["entries"][0]["answers"][0]["name"], ".");
+    assert_eq!(page["entries"][0]["answers"][0]["data"], "ns.example.");
+    for (kind, deleted) in [("A", 0), ("NS", 1)] {
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/v1/dns/cache?name=.&type={kind}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = delete_name(&state, request, &id).await.unwrap();
+        let body = to_bytes(response.into_body(), MAX_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"matched":deleted,"deleted":deleted}),
+        );
+    }
+    let (status, page) = cache_page(&state, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["total"], 1);
+    assert_eq!(page["entries"][0]["domain"], "ordinary.example.");
+    assert_eq!(cache_page(&state, "?name=.").await.1["total"], 0);
+    state.dns.provider().unwrap().shutdown().await;
 }

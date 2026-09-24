@@ -40,8 +40,19 @@ impl ConfigService {
         let Some(store) = self.database() else {
             return json!({"kind":"file","revision":null,"parent":null,"recorded":true});
         };
+        let recording = self.recording.read();
+        let recorded = !store.blocked()
+            && match &*recording {
+                RecordState::Idle => true,
+                RecordState::Pending(previous) => self
+                    .sources
+                    .accepted
+                    .read()
+                    .as_ref()
+                    .is_some_and(|accepted| previous.as_ref() == Some(&accepted.revision)),
+            };
         let head = store.database().and_then(|database| database.cached_head());
-        json!({"kind":"db","revision":head.map(|(number,_)|number),"parent":head.and_then(|(_,parent)|parent),"recorded":!store.blocked()})
+        json!({"kind":"db","revision":head.map(|(number,_)|number),"parent":head.and_then(|(_,parent)|parent),"recorded":recorded})
     }
 
     /// `writable` as advertised: false while a failed record blocks writes.
@@ -126,13 +137,9 @@ pub(in crate::native_api) async fn revisions(
     parse_query(uri, &[], id)?;
     let service = &state.observation.configuration;
     let store = service.database().ok_or_else(unsupported)?;
-    let database = store.database().ok_or_else(unsupported)?;
     let store_error = || unavailable().with_details(json!({"stage":"store"}));
-    let active = database.cached_head().map(|(number, _)| number);
-    let _ = database;
-    let reader = Arc::clone(&store);
-    let rows =
-        tokio::task::spawn_blocking(move || reader.database().map(|database| database.revisions()))
+    let (active, rows) =
+        tokio::task::spawn_blocking(move || store.database().map(|database| database.revisions()))
             .await
             .map_err(|_| store_error())?
             .ok_or_else(unsupported)?
@@ -188,7 +195,7 @@ pub(in crate::native_api) async fn import(
         ));
     }
     let reservation = service.operations.reserve(
-        principal(state),
+        state.principal(),
         "POST",
         "/api/v1/config/import",
         Some(&key),
@@ -247,7 +254,7 @@ pub(in crate::native_api) async fn activate(
         Some(Err(_)) => return Err(unavailable().with_details(json!({"stage":"store"}))),
     }
     let reservation = service.operations.reserve(
-        principal(state),
+        state.principal(),
         "POST",
         &path,
         key.as_deref(),

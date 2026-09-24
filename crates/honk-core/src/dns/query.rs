@@ -199,6 +199,7 @@ impl DnsName {
     }
 
     /// Decode the canonical wire name as a lowercase dotted UTF-8 domain.
+    /// The root is `"."`; other names have no trailing dot.
     pub fn to_domain_name(&self) -> Option<String> {
         let mut domain = String::with_capacity(self.0.len());
         let mut cursor = 0usize;
@@ -206,8 +207,11 @@ impl DnsName {
             let length = usize::from(*self.0.get(cursor)?);
             cursor += 1;
             if length == 0 {
-                if domain.is_empty() || cursor != self.0.len() {
+                if cursor != self.0.len() {
                     return None;
+                }
+                if domain.is_empty() {
+                    domain.push('.');
                 }
                 domain.make_ascii_lowercase();
                 return Some(domain);

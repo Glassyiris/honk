@@ -39,9 +39,9 @@ fn capture(config: &Config, catalog: &Catalog, filter: Option<&str>) -> NodeSnap
         &GroupManager::new(&config.groups, &config.nodes),
         &catalog.snapshot(),
         &AliveDialerSet::new(),
-        "instance",
         filter,
         &RequestId("request".into()),
+        &ListenerSecrets::from_config(config),
     )
     .unwrap()
 }
@@ -137,36 +137,23 @@ async fn pages_freeze_rows_and_bind_instance_and_direct_group_filter() {
     .await;
     let cursor = first["next_cursor"].as_str().unwrap();
     assert!(
-        catalog
-            .resume(cursor, "other-instance", Some(child), 1, &request)
+        Catalog::new(&config)
+            .resume(cursor, Some(child), 1, &request)
             .is_err()
     );
-    assert!(
-        catalog
-            .resume(cursor, "instance", Some(parent), 1, &request)
-            .is_err()
-    );
-    assert!(
-        catalog
-            .resume(cursor, "instance", None, 1, &request)
-            .is_err()
-    );
+    assert!(catalog.resume(cursor, Some(parent), 1, &request).is_err());
+    assert!(catalog.resume(cursor, None, 1, &request).is_err());
     config.nodes[2].name = "new-name".into();
     config.groups.clear();
     catalog.install(&config);
-    let second = body(
-        catalog
-            .resume(cursor, "instance", Some(child), 100, &request)
-            .unwrap(),
-    )
-    .await;
+    let second = body(catalog.resume(cursor, Some(child), 100, &request).unwrap()).await;
     assert_eq!(second["observed_at"], first["observed_at"]);
     assert_eq!(second["nodes"][0]["name"], "node-3");
     assert_eq!(second["nodes"][0]["group_ids"], json!([child]));
     assert_eq!(second["next_cursor"], Value::Null);
     catalog.snapshots.lock()[0].created = Instant::now() - SNAPSHOT_TTL;
     let error = catalog
-        .resume(cursor, "instance", Some(child), 1, &request)
+        .resume(cursor, Some(child), 1, &request)
         .unwrap_err()
         .into_response();
     assert_eq!(error.status(), StatusCode::BAD_REQUEST);
@@ -191,13 +178,7 @@ async fn snapshot_count_and_byte_caps_evict_old_cursors_and_reject_oversized_row
     assert_eq!(catalog.snapshots.lock().len(), MAX_SNAPSHOTS);
     assert!(
         catalog
-            .resume(
-                first["next_cursor"].as_str().unwrap(),
-                "instance",
-                None,
-                1,
-                &request
-            )
+            .resume(first["next_cursor"].as_str().unwrap(), None, 1, &request)
             .is_err()
     );
 
@@ -224,7 +205,6 @@ async fn snapshot_count_and_byte_caps_evict_old_cursors_and_reject_oversized_row
         catalog
             .resume(
                 first_large["next_cursor"].as_str().unwrap(),
-                "instance",
                 None,
                 1,
                 &request
@@ -238,9 +218,9 @@ async fn snapshot_count_and_byte_caps_evict_old_cursors_and_reject_oversized_row
         &GroupManager::new(&config.groups, &config.nodes),
         &catalog.snapshot(),
         &AliveDialerSet::new(),
-        "instance",
         None,
         &request,
+        &ListenerSecrets::from_config(&config),
     )
     .err()
     .unwrap()

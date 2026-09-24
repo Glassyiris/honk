@@ -1,6 +1,7 @@
 //! Process-local identities and bounded, immutable native node pages.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     io::{self, Write},
     sync::Arc,
@@ -27,8 +28,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    ApiError, ErrorCode, NativeState, error, invalid_query, parse_query, timestamp,
-    types::RequestId,
+    ApiError, ErrorCode, NativeState, config::ListenerSecrets, error, invalid_query, parse_query,
+    timestamp, types::RequestId,
 };
 
 const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
@@ -127,7 +128,6 @@ impl Catalog {
     fn resume(
         &self,
         cursor: &str,
-        instance: &str,
         group_id: Option<&str>,
         limit: usize,
         id: &RequestId,
@@ -141,10 +141,7 @@ impl Catalog {
             .iter()
             .find(|snapshot| snapshot.id == snapshot_id)
             .ok_or_else(|| invalid_query(id))?;
-        if snapshot.instance != instance
-            || snapshot.group_id.as_deref() != group_id
-            || offset == 0
-            || offset >= snapshot.nodes.len()
+        if snapshot.group_id.as_deref() != group_id || offset == 0 || offset >= snapshot.nodes.len()
         {
             return Err(invalid_query(id));
         }
@@ -224,7 +221,6 @@ fn config_revision(config: &Config, groups: &HashMap<String, Group>) -> String {
 
 struct NodeSnapshot {
     id: Uuid,
-    instance: String,
     group_id: Option<String>,
     observed_at: String,
     created: Instant,
@@ -307,9 +303,9 @@ enum ProviderId {
 #[derive(serde::Serialize)]
 struct NodeRow<'a> {
     id: Uuid,
-    name: &'a str,
+    name: Cow<'a, str>,
     protocol: &'static str,
-    subscription_tag: Option<&'a str>,
+    subscription_tag: Option<Cow<'a, str>>,
     provider_id: Option<ProviderId>,
     group_ids: Vec<&'a String>,
     health: Vec<Value>,
@@ -328,10 +324,11 @@ fn node_row<'a>(
     config: &'a Config,
     alive: &AliveDialerSet,
     group_ids: Vec<&'a String>,
+    secrets: &ListenerSecrets,
 ) -> NodeRow<'a> {
     NodeRow {
         id: node.id,
-        name: &node.name,
+        name: secrets.mask_borrowed(&node.name),
         protocol: node.protocol().as_str(),
         subscription_tag: node
             .subscription_id
@@ -341,7 +338,7 @@ fn node_row<'a>(
                     .iter()
                     .find(|subscription| subscription.id == id)
             })
-            .map(|subscription| subscription.name.as_str()),
+            .map(|subscription| secrets.mask_borrowed(&subscription.name)),
         provider_id: node
             .subscription_id
             .map(ProviderId::Subscription)
@@ -361,6 +358,7 @@ pub(super) fn node_value(
     manager: &GroupManager,
     alive: &AliveDialerSet,
     node_id: Uuid,
+    secrets: &ListenerSecrets,
 ) -> Option<Value> {
     let node = config.nodes.iter().find(|node| node.id == node_id)?;
     let mut groups: Vec<_> = identity
@@ -375,7 +373,7 @@ pub(super) fn node_value(
         .collect();
     groups.sort_unstable();
     groups.dedup();
-    serde_json::to_value(node_row(node, config, alive, groups)).ok()
+    serde_json::to_value(node_row(node, config, alive, groups, secrets)).ok()
 }
 
 fn node_snapshot(
@@ -383,9 +381,9 @@ fn node_snapshot(
     manager: &GroupManager,
     identity: &CatalogIdentity,
     alive: &AliveDialerSet,
-    instance: &str,
     group_id: Option<&str>,
     id: &RequestId,
+    secrets: &ListenerSecrets,
 ) -> Result<NodeSnapshot, ApiError> {
     let filter = match group_id {
         Some(group_id) => Some(
@@ -419,7 +417,6 @@ fn node_snapshot(
     nodes.sort_unstable_by_key(|node| node.id);
     let mut snapshot = NodeSnapshot {
         id: Uuid::new_v4(),
-        instance: instance.to_owned(),
         group_id: group_id.map(str::to_owned),
         observed_at: timestamp(SystemTime::now()),
         created: Instant::now(),
@@ -427,7 +424,6 @@ fn node_snapshot(
         bytes: 0,
     };
     let overhead = std::mem::size_of::<NodeSnapshot>()
-        + snapshot.instance.len()
         + snapshot.group_id.as_ref().map_or(0, String::len)
         + snapshot.observed_at.len()
         + nodes.len().saturating_mul(std::mem::size_of::<Box<str>>());
@@ -448,7 +444,7 @@ fn node_snapshot(
         let mut group_ids = membership.remove(&node.id).unwrap_or_default();
         group_ids.sort_unstable();
         group_ids.dedup();
-        let value = node_row(node, config, alive, group_ids);
+        let value = node_row(node, config, alive, group_ids, secrets);
         let mut writer = BoundedJson {
             bytes: Vec::new(),
             limit: MAX_SNAPSHOT_BYTES - snapshot.bytes,
@@ -482,25 +478,32 @@ pub(super) async fn nodes(
     }
     let group_id = query.get("group_id").map(String::as_str);
     if let Some(cursor) = query.get("cursor") {
-        return state.observation.catalog.resume(
-            cursor,
-            &state.observation.instance_id,
-            group_id,
-            limit,
-            id,
-        );
+        return state
+            .observation
+            .catalog
+            .resume(cursor, group_id, limit, id);
     }
     let config = state.config.read().await;
     let identity = state.observation.catalog.snapshot();
     let manager = state.group_manager.read().clone();
+    let secrets = {
+        let accepted = state.observation.configuration.sources.accepted.read();
+        state
+            .observation
+            .configuration
+            .secrets(accepted.as_ref())
+            .as_ref()
+            .clone()
+            .with_clash(&state.clash_secret)
+    };
     let snapshot = node_snapshot(
         &config,
         &manager,
         &identity,
         &state.alive_set,
-        &state.observation.instance_id,
         group_id,
         id,
+        &secrets,
     )?;
     drop(config);
     state.observation.catalog.page(snapshot, limit, id)
@@ -669,7 +672,11 @@ pub(super) async fn groups(
             value
         })
         .collect();
-    Ok(Json(groups).into_response())
+    Ok(Json(super::config::administrative_projection(
+        state,
+        Value::Array(groups),
+    )?)
+    .into_response())
 }
 
 pub(super) async fn group(
@@ -702,6 +709,7 @@ pub(super) async fn group(
     if state.observation.configuration.group_writable(name) {
         value["capabilities"]["mutable_config"] = json!(super::groups::MUTABLE_CONFIG);
     }
+    let value = super::config::administrative_projection(state, value)?;
     Ok(([(header::ETAG, format!("\"{revision}\""))], Json(value)).into_response())
 }
 

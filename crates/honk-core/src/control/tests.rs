@@ -733,10 +733,13 @@ fn strict_dns_query_enforces_expanded_name_limit_and_label_boundaries() {
 
 #[test]
 fn strict_dns_query_requires_forwarder_parseable_question() {
-    // Root qname is wire-valid but parse_dns_question rejects empty labels.
+    // The wire's empty label chain is the root, not a malformed empty domain.
     let root = dns_query_with_qname(&[0x00]);
-    assert!(crate::dns::forwarder::parse_dns_question(&root).is_none());
-    assert!(!is_exact_dns_query(&root));
+    assert_eq!(
+        crate::dns::forwarder::parse_dns_question(&root),
+        Some((".".into(), 1))
+    );
+    assert!(is_exact_dns_query(&root));
 
     // Non-UTF8 / binary label is wire-shaped but not consumer-parseable.
     let binary = dns_query_with_qname(&[0x01, 0xff, 0x00]);
@@ -750,42 +753,36 @@ fn strict_dns_query_requires_forwarder_parseable_question() {
 }
 
 #[tokio::test]
-async fn udp_slow_path_forwards_root_and_binary_questions() {
+async fn udp_slow_path_forwards_binary_questions() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let controller = production_dns_controller(calls.clone(), dns_response_payload());
     let dst = addr("203.0.113.53:53");
 
-    for (client, data) in [
-        (addr("127.0.0.1:34567"), dns_query_with_qname(&[0x00])),
-        (
-            addr("127.0.0.1:34568"),
-            dns_query_with_qname(&[0x01, 0xff, 0x00]),
-        ),
-    ] {
-        let pool = Arc::new(UdpEndpointPool::new());
-        let stats = Arc::new(StatsManager::new());
-        let limit = Arc::new(tokio::sync::Semaphore::new(1));
-        let work = begin_udp_slow_path(
-            &pool,
-            &stats,
-            &limit,
-            validate_exact_dns_query(&data).map(|validated| (controller.as_ref(), validated)),
-            client,
-            dst,
-            &data,
-        );
-        let lease = match work {
-            UdpSlowPathWork::Initialize(lease) => lease,
-            _ => panic!("non-strict port-53 payload must take ordinary UDP forwarding"),
-        };
-        assert_eq!(lease.client_addr(), client);
-        assert_eq!(lease.original_dst(), dst);
-        assert_eq!(lease.first_payload().as_ref(), data.as_slice());
-        assert_eq!(stats.udp_snapshot().slow_permit_accepted, 1);
-        assert_eq!(limit.available_permits(), 0);
-        drop(lease);
-        assert_eq!(limit.available_permits(), 1);
-    }
+    let client = addr("127.0.0.1:34568");
+    let data = dns_query_with_qname(&[0x01, 0xff, 0x00]);
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = Arc::new(StatsManager::new());
+    let limit = Arc::new(tokio::sync::Semaphore::new(1));
+    let work = begin_udp_slow_path(
+        &pool,
+        &stats,
+        &limit,
+        validate_exact_dns_query(&data).map(|validated| (controller.as_ref(), validated)),
+        client,
+        dst,
+        &data,
+    );
+    let lease = match work {
+        UdpSlowPathWork::Initialize(lease) => lease,
+        _ => panic!("non-strict port-53 payload must take ordinary UDP forwarding"),
+    };
+    assert_eq!(lease.client_addr(), client);
+    assert_eq!(lease.original_dst(), dst);
+    assert_eq!(lease.first_payload().as_ref(), data.as_slice());
+    assert_eq!(stats.udp_snapshot().slow_permit_accepted, 1);
+    assert_eq!(limit.available_permits(), 0);
+    drop(lease);
+    assert_eq!(limit.available_permits(), 1);
 
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }

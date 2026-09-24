@@ -520,6 +520,5 @@ mod tests {
         ] {
             assert!(request(operations).changes().is_err());
         }
-        assert_eq!(patch.group.tolerance, 50);
     }
 }

@@ -203,7 +203,7 @@ impl ConnectionObservation {
         else {
             return;
         };
-        let decisions = crate::native_api::flows::dns::map_selection_observation(
+        let decisions = crate::native_api::flows::producer::map_selection_observation(
             observation,
             &selection.catalog,
             &observer,

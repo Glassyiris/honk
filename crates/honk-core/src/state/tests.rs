@@ -393,6 +393,57 @@ fn reset_refuses_while_another_process_holds_the_directory() {
 }
 
 #[test]
+fn admin_reset_refuses_startup_before_the_database_exists() {
+    let data = tempfile::tempdir().unwrap();
+    let legacy = data.path().join("native-api");
+    fs::create_dir(&legacy).unwrap();
+    fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
+    let record = legacy.join("admin.json");
+    fs::write(&record, b"legacy administrator").unwrap();
+    fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
+    let startup = Flock::lock(
+        state_directory(data.path(), true).unwrap(),
+        FlockArg::LockSharedNonblock,
+    )
+    .unwrap();
+
+    assert!(!db_path(data.path()).exists());
+    assert_eq!(reset_admin(data.path()), Err(StateError::InUse));
+    assert_eq!(fs::read(&record).unwrap(), b"legacy administrator");
+
+    drop(startup);
+    assert_eq!(reset_admin(data.path()), Ok(true));
+    assert!(!record.exists());
+    assert_eq!(reset_admin(data.path()), Ok(false));
+}
+
+#[test]
+fn admin_reset_preserves_unsafe_legacy_credentials() {
+    let data = tempfile::tempdir().unwrap();
+    let legacy = data.path().join("native-api");
+    fs::create_dir(&legacy).unwrap();
+    fs::set_permissions(&legacy, fs::Permissions::from_mode(0o755)).unwrap();
+    let record = legacy.join("admin.json");
+    fs::write(&record, b"untrusted").unwrap();
+    fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(reset_admin(data.path()), Err(StateError::Unsafe));
+    assert_eq!(fs::read(&record).unwrap(), b"untrusted");
+
+    fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
+    let target = data.path().join("target");
+    fs::rename(&record, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &record).unwrap();
+    assert_eq!(reset_admin(data.path()), Err(StateError::Unsafe));
+    assert!(
+        fs::symlink_metadata(&record)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"untrusted");
+}
+
+#[test]
 fn cache_connections_sync_fully_without_wal() {
     assert_eq!(synchronous(Class::Cache, true), "NORMAL");
     assert_eq!(synchronous(Class::Cache, false), "FULL");

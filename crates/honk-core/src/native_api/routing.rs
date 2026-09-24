@@ -273,22 +273,7 @@ pub(super) async fn trace(
     let deadline = Instant::now() + TIMEOUT;
     parse_query(request.uri(), &[], id)?;
     state.observation.trace.rate.admit(id)?;
-    let mut content_types = request.headers().get_all("content-type").iter();
-    let content_type = content_types.next().and_then(|v| v.to_str().ok());
-    if content_types.next().is_some() {
-        return Err(invalid(id));
-    }
-    if !content_type
-        .and_then(|v| v.split(';').next())
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"))
-    {
-        return Err(error(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            ErrorCode::UnsupportedMediaType,
-            "Expected application/json",
-            id,
-        ));
-    }
+    super::config::json_type(&request)?;
     let bytes = tokio::time::timeout_at(
         deadline.into(),
         axum::body::to_bytes(request.into_body(), 65536),

@@ -609,13 +609,8 @@ pub(super) fn routes() -> Router<Arc<NativeState>> {
             resource(
                 get(
                     |State(state): App, Extension(id): Id, uri: Uri| async move {
-                        let result = parse_query(&uri, &[], &id).and_then(|_| {
-                            state.observation.operations.get(
-                                path_id(uri.path()),
-                                state.principal(),
-                                true,
-                            )
-                        });
+                        let result = parse_query(&uri, &[], &id)
+                            .and_then(|_| state.observation.operations.get(path_id(uri.path())));
                         respond(result, id)
                     },
                 ),

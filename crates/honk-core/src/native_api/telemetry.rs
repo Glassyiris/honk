@@ -307,7 +307,11 @@ pub(super) async fn outbounds(
             "download_bytes": row.download_bytes.to_string(), "errors": row.errors.to_string(),
         }))
     }).collect::<Result<Vec<_>, ApiError>>()?;
-    Ok(Json(json!({"observed_at": timestamp(SystemTime::now()), "counter_since": timestamp(state.stats.counter_since()), "outbounds": rows})).into_response())
+    let value = super::config::administrative_projection(
+        state,
+        json!({"observed_at": timestamp(SystemTime::now()), "counter_since": timestamp(state.stats.counter_since()), "outbounds": rows}),
+    )?;
+    Ok(Json(value).into_response())
 }
 
 impl MemoryReading {

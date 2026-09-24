@@ -33,8 +33,9 @@ use tokio::{
 use uuid::Uuid;
 
 use super::{
-    ApiError, ErrorCode, NativeState,
+    ApiError, ErrorCode, NativeState, canonical_ip,
     catalog::CatalogIdentity,
+    config,
     operations::{OperationKind, OperationResult, OperationStore, Reservation},
     parse_query,
     security::RequestRate,
@@ -294,7 +295,7 @@ impl Policy {
         }
     }
     fn address(&self, ip: IpAddr) -> bool {
-        let ip = normalize(ip);
+        let ip = canonical_ip(ip);
         let restricted = self.restricted.iter().any(|net| net.contains(&ip))
             || match ip {
                 IpAddr::V4(_) => false,
@@ -622,34 +623,8 @@ pub(super) async fn create(
 ) -> Result<Response, ApiError> {
     let deadline = Instant::now() + DEADLINE;
     parse_query(request.uri(), &[], id)?;
-    let mut keys = request.headers().get_all("idempotency-key").iter();
-    let key = keys
-        .next()
-        .map(|value| value.to_str().map(str::to_owned))
-        .transpose()
-        .map_err(|_| invalid())?;
-    if keys.next().is_some() {
-        return Err(invalid());
-    }
-    let json_type = request
-        .headers()
-        .get_all("content-type")
-        .iter()
-        .collect::<Vec<_>>();
-    if json_type.len() != 1
-        || !json_type[0]
-            .to_str()
-            .ok()
-            .and_then(|value| value.split(';').next())
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
-    {
-        return Err(ApiError::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            ErrorCode::UnsupportedMediaType,
-            "Expected application/json.",
-            None,
-        ));
-    }
+    let key = config::request_header(&request, "idempotency-key")?.map(str::to_owned);
+    config::json_type(&request)?;
     let service = &state.observation.probes;
     let guard = service.request();
     let body = axum::body::to_bytes(request.into_body(), 65536);
@@ -730,15 +705,6 @@ pub(super) async fn create(
     }
     drop(guard);
     Ok(admission.await?.into_response())
-}
-fn normalize(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(ip) => ip
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(ip)),
-        ip => ip,
-    }
 }
 fn invalid() -> ApiError {
     ApiError::new(

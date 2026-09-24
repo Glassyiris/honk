@@ -302,10 +302,14 @@ pub(crate) fn question_matches(wire: &[u8], name: &str, types: &[u16]) -> bool {
     let Ok(query) = QueryContext::parse(wire) else {
         return false;
     };
+    let name = name
+        .strip_suffix('.')
+        .filter(|name| !name.is_empty())
+        .unwrap_or(name);
     query
         .qname()
         .and_then(|name| name.to_domain_name())
-        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name.trim_end_matches('.')))
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name))
         && query
             .qtype()
             .is_some_and(|kind| types.is_empty() || types.contains(&kind.get()))

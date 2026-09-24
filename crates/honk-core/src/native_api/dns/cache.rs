@@ -188,9 +188,6 @@ fn page(
     for entry in &snapshot.entries[offset..end] {
         let question = records::question(entry.key.wire_identity(), entry.key.ingress())
             .map_err(|_| unavailable(id))?;
-        if question.name.len() < 2 {
-            return Err(unavailable(id));
-        }
         let metadata_cost = entry
             .id
             .len()

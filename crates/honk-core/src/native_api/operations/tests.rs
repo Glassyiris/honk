@@ -71,7 +71,7 @@ async fn concurrent_retries_share_pending_admission_and_the_original_operation()
         assert!(reservation.admission().now_or_never().is_none());
     }
     assert_error(
-        store.get(&id, "owner", true).unwrap_err(),
+        store.get(&id).unwrap_err(),
         StatusCode::NOT_FOUND,
         "resource_not_found",
     )
@@ -90,7 +90,7 @@ async fn concurrent_retries_share_pending_admission_and_the_original_operation()
         assert_eq!(response.headers()["retry-after"], "1");
         assert_eq!(body(response).await["status"], "queued");
     }
-    let queued = store.get(&id, "owner", false).unwrap();
+    let queued = store.get(&id).unwrap();
     assert_eq!(queued.headers()["retry-after"], "1");
     let queued = body(queued).await;
     assert_eq!(queued["status"], "queued");
@@ -110,7 +110,7 @@ async fn concurrent_retries_share_pending_admission_and_the_original_operation()
     let replay = reserve(&store, "same-key");
     assert!(!replay.fresh);
     assert_eq!(replay.admission().await.unwrap().operation_id, id);
-    let terminal = store.get(&id, "owner", false).unwrap();
+    let terminal = store.get(&id).unwrap();
     assert!(!terminal.headers().contains_key("retry-after"));
     let terminal = body(terminal).await;
     assert_eq!(terminal["status"], "succeeded");
@@ -212,7 +212,7 @@ async fn rejection_and_owner_cancellation_wake_waiters_without_publishing_operat
     assert_eq!(original, replay);
     assert_eq!(original["error"]["details"], json!({"valid": false}));
     assert_error(
-        store.get(&fresh.id, "owner", true).unwrap_err(),
+        store.get(&fresh.id).unwrap_err(),
         StatusCode::NOT_FOUND,
         "resource_not_found",
     )
@@ -310,14 +310,11 @@ async fn capacity_never_evicts_preparing_running_or_unexpired_terminal_operation
         .unwrap();
     assert_error(conflict, StatusCode::CONFLICT, "idempotency_conflict").await;
     for owner in owners.iter().skip(1) {
-        assert_eq!(
-            store.get(&owner.id, "owner", false).unwrap().status(),
-            StatusCode::OK
-        );
+        assert_eq!(store.get(&owner.id).unwrap().status(), StatusCode::OK);
     }
     tokio::time::advance(Duration::from_secs(1)).await;
     assert_error(
-        store.get(&owners[2].id, "owner", false).unwrap_err(),
+        store.get(&owners[2].id).unwrap_err(),
         StatusCode::NOT_FOUND,
         "resource_not_found",
     )
@@ -331,18 +328,18 @@ async fn capacity_never_evicts_preparing_running_or_unexpired_terminal_operation
         owners[0].id
     );
     assert_eq!(
-        body(store.get(&owners[1].id, "owner", false).unwrap()).await["status"],
+        body(store.get(&owners[1].id).unwrap()).await["status"],
         "running"
     );
     assert!(store.fail(&owners[1].id, "reload_failed", "Reload failed.", None));
     tokio::time::advance(RETENTION - Duration::from_secs(1)).await;
     assert_eq!(
-        body(store.get(&owners[1].id, "owner", false).unwrap()).await["status"],
+        body(store.get(&owners[1].id).unwrap()).await["status"],
         "failed"
     );
     tokio::time::advance(Duration::from_secs(1)).await;
     assert_error(
-        store.get(&owners[1].id, "owner", false).unwrap_err(),
+        store.get(&owners[1].id).unwrap_err(),
         StatusCode::NOT_FOUND,
         "resource_not_found",
     )
@@ -350,7 +347,7 @@ async fn capacity_never_evicts_preparing_running_or_unexpired_terminal_operation
 }
 
 #[tokio::test]
-async fn operation_reads_hide_ownership_and_never_echo_sensitive_admission_inputs() {
+async fn operation_reads_reject_unknown_ids_and_never_echo_sensitive_admission_inputs() {
     let store = store();
     let reservation = store
         .reserve(
@@ -369,22 +366,13 @@ async fn operation_reads_hide_ownership_and_never_echo_sensitive_admission_input
         "Reload was rejected.",
         Some(json!({"disk_changed": true}))
     ));
-    let foreign = assert_error(
-        store.get(&reservation.id, "other", false).unwrap_err(),
+    assert_error(
+        store.get("unknown").unwrap_err(),
         StatusCode::NOT_FOUND,
         "resource_not_found",
     )
     .await;
-    let absent = assert_error(
-        store.get("unknown", "other", true).unwrap_err(),
-        StatusCode::NOT_FOUND,
-        "resource_not_found",
-    )
-    .await;
-    assert_eq!(foreign, absent);
-    let owner = body(store.get(&reservation.id, "private-bearer", false).unwrap()).await;
-    let controller = body(store.get(&reservation.id, "other", true).unwrap()).await;
-    assert_eq!(owner, controller);
+    let owner = body(store.get(&reservation.id).unwrap()).await;
     assert_eq!(owner["status"], "failed");
     assert_eq!(owner["result"], Value::Null);
     assert_eq!(owner["started_at"], Value::Null);
@@ -421,7 +409,7 @@ async fn operation_reads_hide_ownership_and_never_echo_sensitive_admission_input
             "Reload failed.",
             Some(details),
         );
-        let value = body(store.get(&reservation.id, "owner", false).unwrap()).await;
+        let value = body(store.get(&reservation.id).unwrap()).await;
         assert_eq!(value["error"]["details"], Value::Null);
     }
 }

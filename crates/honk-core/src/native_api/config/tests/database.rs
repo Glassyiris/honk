@@ -79,6 +79,7 @@ async fn rejected_reload_leaves_the_db_head_alone() {
     assert_eq!(revisions(&fixture).len(), 1);
     let after = fixture.get(CONFIG).await;
     assert_eq!(after["revision"], before["revision"]);
+    assert_eq!(after["store"]["recorded"], true);
     fixture.shutdown().await;
 }
 
@@ -312,6 +313,136 @@ fn main_edit(fixture: &Fixture) -> String {
     fixture.originals["main.dae"].replace("fallback: direct", "fallback: block")
 }
 
+async fn hold_database(
+    fixture: &Fixture,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<bool>) {
+    let state = fixture.database.as_ref().unwrap().state();
+    let (entered, wait) = oneshot::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let _connection = state.strict();
+        entered.send(()).unwrap();
+        resume.recv_timeout(WAIT).is_ok()
+    });
+    timeout(WAIT, wait).await.unwrap().unwrap();
+    (release, thread)
+}
+
+async fn changed_config(fixture: &Fixture, before: &Value) -> Value {
+    timeout(WAIT, async {
+        loop {
+            let current = fixture.get(CONFIG).await;
+            if current["revision"] != before["revision"] {
+                return current;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("source activation did not publish")
+}
+
+#[tokio::test]
+async fn pending_record_keeps_http_responsive_and_serializes_the_next_work() {
+    let mut fixture = Fixture::build(Access::Admin, true, |_, _| {}, true).await;
+    let before = fixture.get(CONFIG).await;
+    let main = source(&before, &fixture.originals["main.dae"]);
+    let candidate = main_edit(&fixture);
+    let admitted = accepted(fixture.replace(main, &candidate).send().await.unwrap()).await;
+    let activation = fixture.next_reload().await;
+    assert_eq!(fixture.get(CONFIG).await["store"]["recorded"], true);
+    let (release, locked) = hold_database(&fixture).await;
+    activation.send(()).unwrap();
+
+    let active = changed_config(&fixture, &before).await;
+    assert_eq!(source(&active, &candidate)["id"], main["id"]);
+    assert_eq!(
+        active["store"],
+        json!({"kind":"db","revision":1,"parent":null,"recorded":false})
+    );
+    let export = fixture
+        .request(Method::GET, "/api/v1/config/export")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        export.headers()["content-disposition"],
+        "attachment; filename=\"honk.dae\""
+    );
+    assert!(export.text().await.unwrap().contains("fallback: block"));
+    assert_eq!(
+        fixture.get(admitted["href"].as_str().unwrap()).await["status"],
+        "running"
+    );
+
+    let request = fixture.validate("syntax", "routing { fallback: direct }");
+    let mut queued = tokio::spawn(request.send());
+    assert!(
+        timeout(Duration::from_millis(50), &mut queued)
+            .await
+            .is_err()
+    );
+    release.send(()).unwrap();
+    assert!(
+        locked.join().unwrap(),
+        "record blocked the async runtime until the lock expired"
+    );
+    assert_eq!(ok(queued.await.unwrap().unwrap()).await["valid"], true);
+    assert_eq!(fixture.terminal(&admitted).await["status"], "succeeded");
+    assert_eq!(
+        fixture.get(CONFIG).await["store"],
+        json!({"kind":"db","revision":2,"parent":1,"recorded":true})
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn disconnected_management_and_shutdown_retain_pending_record() {
+    let mut fixture = Fixture::build(Access::Admin, true, |_, _| {}, true).await;
+    let before = fixture.get(CONFIG).await;
+    let request = fixture
+        .request(Method::POST, "/api/v1/nodes")
+        .json(&json!({"name":"managed","link":"socks5://127.0.0.1:11080"}));
+    let client = tokio::spawn(request.send());
+    let activation = fixture.next_reload().await;
+    let (release, locked) = hold_database(&fixture).await;
+    activation.send(()).unwrap();
+    let active = changed_config(&fixture, &before).await;
+    assert_eq!(active["store"]["recorded"], false);
+    assert!(
+        active["sources"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("managed")
+    );
+    assert!(
+        !client.is_finished(),
+        "management replied before its revision was durable"
+    );
+    client.abort();
+    assert!(client.await.unwrap_err().is_cancelled());
+
+    let coordinator = fixture.coordinator.take().unwrap();
+    let mut shutdown = tokio::spawn(coordinator.shutdown());
+    assert!(
+        timeout(Duration::from_millis(50), &mut shutdown)
+            .await
+            .is_err()
+    );
+    release.send(()).unwrap();
+    assert!(
+        locked.join().unwrap(),
+        "record blocked the async runtime until the lock expired"
+    );
+    timeout(WAIT, shutdown).await.unwrap().unwrap();
+    assert_eq!(
+        fixture.get(CONFIG).await["store"],
+        json!({"kind":"db","revision":2,"parent":1,"recorded":true})
+    );
+    assert_eq!(revisions(&fixture).len(), 2);
+    fixture.shutdown().await;
+}
+
 #[tokio::test]
 async fn failed_record_blocks_writes_until_head_is_activated_again() {
     let fixture = Fixture::new_db(Access::Admin).await;
@@ -350,6 +481,7 @@ async fn failed_record_blocks_writes_until_head_is_activated_again() {
         "attachment; filename=\"honk.dae\""
     );
     let running = source(&config, &candidate);
+    assert_eq!(running["writable"], false);
     let again = candidate.replace("fallback: block", "fallback: direct");
     let response = fixture.replace(running, &again).send().await.unwrap();
     let body = error(

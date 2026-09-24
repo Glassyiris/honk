@@ -241,9 +241,11 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 
 独立且默认编译的 `native-api` feature 提供默认关闭的 listener，启用后在控制面准入前绑定。按需 phase watch 仅在真实 admission-open 成功后报告 running，在关闭栅栏前报告 draining；现有 health handle 可将 running 细化为 degraded。读取 generation 与 health 期间保留 config 发布屏障，不改变发布锁序。HTTP 可用不代表数据面健康。
 
-`native_api.rs` 完整持有 listener、64 连接 JoinSet、唯一一秒 sampler 与 native tracker consumer，直到关闭 join。Header 预算五秒，空闲 I/O 与停滞写入有独立 30 秒期限，健康 SSE 可持续超过 30 秒；关闭共享五秒 grace。`observation.rs` 拥有进程身份、有界 flow/catalog/event、telemetry、结构化日志、DNS 历史及共用 operation store。TCP/UDP/DNS producer 在真实执行点捕获不可变来源证据，已接受发布在既有屏障下发出 generation 事件。逐 flow 完整性描述已捕获的执行进度，独立于生命周期与总体覆盖；native-only final handoff 不重复生成旧选路证据，不宣称完整内核透明观测。日志直接捕获审查过的结构化安全字段，不转发 Clash 格式化输出；`/events` 续传 replay→ready，而 `/logs` 按自身契约 ready→replay。
+`native_api/server.rs` 完整持有 listener、64 连接 JoinSet、唯一一秒 sampler 与 native tracker consumer，直到关闭 join。Header 预算五秒，空闲 I/O 与停滞写入有独立 30 秒期限，健康 SSE 可持续超过 30 秒；HTTP 关闭共享五秒 grace，随后等待已准入的真实阻塞凭据任务结束。`observation.rs` 拥有进程身份、有界 flow/catalog/event、telemetry、结构化日志、DNS 历史及共用 operation store。TCP/UDP/DNS producer 在真实执行点捕获不可变来源证据，已接受发布在既有屏障下发出 generation 事件。逐 flow 完整性描述已捕获的执行进度，独立于生命周期与总体覆盖；native-only final handoff 不重复生成旧选路证据，不宣称完整内核透明观测。日志直接捕获审查过的结构化安全字段，不转发 Clash 格式化输出；`/events` 续传 replay→ready，而 `/logs` 按自身契约 ready→replay。
 
 `native_api/handlers.rs` 为每个资源只注册一份方法分派；共用安全边界仍先于方法和资源校验执行。`flows/record.rs` 持有类型化摘要、输入及证据步骤，留存预算计入实际持有的堆容量、snapshot 与有界内核字典预留，JSON 只在 wire 边界投影。核心生命周期与模式命令返回类型化结果，而不是 HTTP 错误或 JSON。
+
+`flows/producer.rs` 持有 FlowGuard 更新及 TCP/UDP、DNS 共用的组选择证据投影。DNS wire 输入模型归入统一 record；`flows/dns.rs` 保留 lookup/catalog scope 与 DNS 专属捕获。`auth.rs` 持有会话、有界准入和唯一受跟踪的阻塞任务；storage 子模块发布短时持有的凭据状态，不跨 KDF 或 SQL 持有状态锁。
 
 `control/connection/observation.rs` 根据已捕获的 handoff、route、selection 和 transport 事实组装 TCP/UDP 证据。连接编排不构造 wire record，也不使用当前配置重算历史；关闭记录时不分配 capture，精确连接关闭仍独立于记录。
 
@@ -254,6 +256,8 @@ TCP copy 成功读取与 splice 成功写入实时累加既有逐出站 atomics�
 M5 的出站读取保留共用账本的 `kind/name` 与完整 UInt64，reload 不重置计数生命周期。`telemetry.rs` 复用唯一一秒 sampler（Skip），无客户端也保留各 600 点/600 秒的流量与内存 history；关闭对应记录开关并重启后释放缓冲，不插值或补零。内存读取实际 RSS/cgroup v2 文件，未知值为 null，未实现 kernel memory 核算。
 
 `configuration/accepted.rs` 持有启动捕获的 `.dae` accepted 源及发布栅栏，`native_api/config.rs` 只投影权限与 HTTP。原生协调器在读盘前串行化 API 写入和 SIGHUP 加载，`configuration::Activation` 为 native 与 nonnative 调用方共用 reload、reply、订阅 reconciliation 链。HTTP 断开不取消 daemon-owned 任务，同 scope/key/body 重放共用结果；PUT 的 202 仅代表耐久写入且真实 reload 已排队。外部编辑器仍可能在最后检查与 rename 间竞争，rename 后目录 fsync 失败必须报告已写但耐久性未确认，不能称为回滚。
+
+`native_api/config/http.rs` 持有源 HTTP adapter。数据库记录通过 awaited blocking promotion 由协调器持续持有，包括 HTTP 取消与关闭；待记录的新 accepted 源不会被错误标成旧的耐久 revision。
 
 Accepted 源在真实 no-op 或 commit 时随原有 config 发布屏障更新，不改变 router→config→eBPF 的发布锁序或订阅 revision fence。拒绝 reload 保留旧快照/代次但不回滚已写文件；提交后 degraded 保留新快照/代次并令 operation 失败。API operation 的真实结果投影到 GET、`runtime.last_reload` 与 `operation.updated`，SIGHUP 本身不创建 API operation。注释变更可更新 source hash/config revision 而不推进 runtime generation，有效组成员变更影响 revision，健康变化不影响。
 

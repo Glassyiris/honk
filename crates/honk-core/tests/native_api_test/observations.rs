@@ -1,5 +1,120 @@
 use super::*;
 
+#[tokio::test]
+async fn connections_filter_before_combined_limit_and_preserve_full_width_live_bytes() {
+    let app = TestApp::new(|_| {}).await;
+    let tracker = app.control.connection_tracker();
+    let now = Instant::now();
+    for row in [
+        entry("old", "tcp", "192.0.2.1:4000", now - Duration::from_secs(1)),
+        entry("a", "udp", "[::ffff:192.0.2.1]:4001", now),
+        entry("b", "tcp", "192.0.2.1:4002", now),
+        entry("c", "tcp", "192.0.2.1:4003", now),
+        entry(
+            "other-source",
+            "tcp",
+            "192.0.2.2:4000",
+            now + Duration::from_secs(1),
+        ),
+    ] {
+        tracker.register(row);
+    }
+    let big = u64::from(u32::MAX) + 123;
+    tracker.update_bytes("a", big, u64::MAX);
+    let summary = response_json(
+        app.get("/api/v1/connections?src=192.0.2.1&limit=1")
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (summary["total_tcp"].as_u64(), summary["total_udp"].as_u64()),
+        (Some(3), Some(1))
+    );
+    assert_eq!(summary["tcp"], json!([]));
+    assert_eq!(summary["udp"][0]["id"], "a");
+    assert_eq!(summary["truncated"], true);
+    assert_eq!(summary["visibility"], "partial");
+    let row = &summary["udp"][0];
+    assert_eq!(row["upload_bytes"], big.to_string());
+    assert_eq!(row["download_bytes"], u64::MAX.to_string());
+    for key in ["src", "dst", "domain"] {
+        assert!(row.get(key).is_none());
+    }
+    for key in [
+        "flow_id",
+        "pname",
+        "rule_id",
+        "rule_expression",
+        "ingress",
+        "domain_source",
+        "started_at",
+        "upload_bytes_per_second",
+        "download_bytes_per_second",
+    ] {
+        assert_eq!(row.get(key), Some(&Value::Null), "{key}");
+    }
+    assert_eq!(row["outbound"], "routed-group");
+    assert_eq!(row["chain"], json!([]));
+    assert_eq!(row["chain_source"], "unknown");
+    assert_eq!(row["rule_source"], "unknown");
+    assert!(!summary.to_string().contains("private-"));
+    assert!(!summary.to_string().contains("current-leaf"));
+    let full = response_json(
+        app.get("/api/v1/connections?src=%3A%3Affff%3A192.0.2.1&limit=3&detail=full")
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        full["tcp"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["b", "c"]
+    );
+    assert_eq!(full["udp"][0]["id"], "a");
+    assert_eq!(full["udp"][0]["src"], "[::ffff:192.0.2.1]:4001");
+    assert_eq!(full["udp"][0]["dst"], "198.51.100.10:443");
+    assert_eq!(full["udp"][0].get("domain"), Some(&Value::Null));
+    let tcp = response_json(
+        app.get("/api/v1/connections?type=tcp&src=192.0.2.1&limit=1000")
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(tcp["total_udp"], 0);
+    assert_eq!(tcp["udp"], json!([]));
+    assert_eq!(tcp["truncated"], false);
+    assert_eq!(
+        tcp["tcp"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["b", "c", "old"]
+    );
+    let latest = response_json(app.get("/api/v1/connections?limit=1").send().await.unwrap()).await;
+    assert_eq!(latest["tcp"][0]["id"], "other-source");
+    tracker.remove("a");
+    let removed = response_json(
+        app.get("/api/v1/connections?type=udp")
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(removed["total_udp"], 0);
+    assert_eq!(removed["udp"], json!([]));
+    app.shutdown().await;
+}
+
 async fn next_event(response: &mut Response, pending: &mut String) -> (String, String, Value) {
     loop {
         if let Some(end) = pending.find("\n\n") {
@@ -133,6 +248,192 @@ async fn native_catalog_capabilities_and_recording_disable_are_honest() {
         "resource_not_found",
     )
     .await;
+    app.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_catalog_masks_listener_secrets_without_changing_membership_or_cursors() {
+    use honk_config::{group::Group, node::Node, subscription::Subscription};
+    use honk_core::stats::OutboundKind;
+
+    const CLASH_SECRET: &str = "clash-observation-secret";
+    let display = format!("{SECRET}-{CLASH_SECRET}");
+    let subscription = Subscription {
+        name: format!("provider-{display}"),
+        url: "https://example.invalid/nodes".into(),
+        ..Default::default()
+    };
+    let mut nodes: Vec<_> = (1080..1083)
+        .map(|port| Node::from_share_link(&format!("socks5://127.0.0.1:{port}")).unwrap())
+        .collect();
+    nodes.sort_unstable_by_key(|node| node.id);
+    for (index, node) in nodes.iter_mut().enumerate() {
+        node.name = if index == 2 {
+            "ordinary-node".into()
+        } else {
+            format!("node-{index}-{display}")
+        };
+        node.subscription_id = Some(subscription.id);
+    }
+    let parent_name = format!("parent-{display}");
+    let child_name = format!("child-{display}");
+    let app = TestApp::new(|config| {
+        config.experimental.clash_api.secret = CLASH_SECRET.into();
+        config.subscriptions.push(subscription.clone());
+        config.nodes.extend(nodes.clone());
+        config.groups = vec![
+            Group {
+                name: parent_name.clone(),
+                groups: vec![child_name.clone()],
+                default: Some(child_name.clone()),
+                ..Default::default()
+            },
+            Group {
+                name: child_name.clone(),
+                nodes: nodes.iter().map(|node| node.id).collect(),
+                default: Some(nodes[1].name.clone()),
+                icon: Some(format!("https://example.invalid/{display}.svg")),
+                check_url: Some(format!("https://example.invalid/{display}/check")),
+                final_outbound: Some(nodes[0].name.clone()),
+                ..Default::default()
+            },
+        ];
+    })
+    .await;
+    let stats = app.control.stats_handle();
+    stats.record_connection(&nodes[0].name, OutboundKind::Node);
+    stats.record_bytes(&nodes[0].name, OutboundKind::Node, 17, 29);
+    stats.record_connection("ordinary-node", OutboundKind::Node);
+    let clean = |value: &Value| {
+        let body = value.to_string();
+        assert!(!body.contains(SECRET), "{body}");
+        assert!(!body.contains(CLASH_SECRET), "{body}");
+    };
+
+    let groups = response_json(app.get("/api/v1/groups").send().await.unwrap()).await;
+    clean(&groups);
+    let rows = groups.as_array().unwrap();
+    let parent = rows
+        .iter()
+        .find(|row| row["name"] == "parent-<redacted>-<redacted>")
+        .unwrap();
+    let child = rows
+        .iter()
+        .find(|row| row["name"] == "child-<redacted>-<redacted>")
+        .unwrap();
+    let child_id = child["id"].as_str().unwrap();
+    assert_eq!(parent["selection"]["tcp_member_id"], child["id"]);
+    assert_eq!(child["selection"]["tcp_member_id"], nodes[1].id.to_string());
+    assert_eq!(child["member_count"], 3);
+    assert_eq!(
+        child["icon"],
+        "https://example.invalid/<redacted>-<redacted>.svg"
+    );
+
+    let first = response_json(
+        app.get(&format!("/api/v1/nodes?group_id={child_id}&limit=1"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    clean(&first);
+    assert_eq!(first["nodes"][0]["id"], nodes[0].id.to_string());
+    assert_eq!(first["nodes"][0]["name"], "node-0-<redacted>-<redacted>");
+    assert_eq!(
+        first["nodes"][0]["subscription_tag"],
+        "provider-<redacted>-<redacted>"
+    );
+    assert_eq!(
+        first["nodes"][0]["provider_id"],
+        subscription.id.to_string()
+    );
+    assert_eq!(first["nodes"][0]["group_ids"], json!([child_id]));
+    let cursor = first["next_cursor"].as_str().unwrap();
+    let resumed = response_json(
+        app.get(&format!(
+            "/api/v1/nodes?group_id={child_id}&limit=100&cursor={cursor}"
+        ))
+        .send()
+        .await
+        .unwrap(),
+    )
+    .await;
+    clean(&resumed);
+    assert_eq!(resumed["observed_at"], first["observed_at"]);
+    assert_eq!(resumed["nodes"][0]["id"], nodes[1].id.to_string());
+    assert_eq!(resumed["nodes"][0]["name"], "node-1-<redacted>-<redacted>");
+    assert_eq!(resumed["nodes"][1]["id"], nodes[2].id.to_string());
+    assert_eq!(resumed["nodes"][1]["name"], "ordinary-node");
+    assert!(resumed["next_cursor"].is_null());
+    error_response(
+        app.get(&format!("/api/v1/nodes?cursor={cursor}"))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+    )
+    .await;
+
+    for summary in [parent, child] {
+        let response = app
+            .get(&format!(
+                "/api/v1/groups/{}",
+                summary["id"].as_str().unwrap()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers()["etag"].to_str().unwrap(),
+            format!("\"{}\"", summary["config_revision"].as_str().unwrap())
+        );
+        let detail = response_json(response).await;
+        clean(&detail);
+        assert_eq!(detail["id"], summary["id"]);
+        assert_eq!(detail["config_revision"], summary["config_revision"]);
+        assert_eq!(
+            detail["config"]["default_member_id"],
+            summary["selection"]["tcp_member_id"]
+        );
+        assert_eq!(
+            detail["runtime"]["selection"]["tcp"]["member_id"],
+            summary["selection"]["tcp_member_id"]
+        );
+        assert_eq!(
+            detail["runtime"]["selection"]["tcp"]["resolved_leaf_node_id"],
+            nodes[1].id.to_string()
+        );
+        if summary["id"] == child["id"] {
+            assert_eq!(detail["members"][0]["id"], nodes[0].id.to_string());
+            assert_eq!(detail["members"][0]["name"], "node-0-<redacted>-<redacted>");
+            assert_eq!(detail["members"][2]["name"], "ordinary-node");
+            assert_eq!(
+                detail["config"]["final_outbound"],
+                "node-0-<redacted>-<redacted>"
+            );
+            assert_eq!(
+                detail["config"]["check_url"],
+                "https://example.invalid/<redacted>-<redacted>/check"
+            );
+        } else {
+            assert_eq!(detail["members"][0]["id"], child["id"]);
+            assert_eq!(detail["members"][0]["name"], child["name"]);
+        }
+    }
+    let outbounds = response_json(app.get("/api/v1/runtime/outbounds").send().await.unwrap()).await;
+    clean(&outbounds);
+    let counters = outbounds["outbounds"].as_array().unwrap();
+    let masked = counters
+        .iter()
+        .find(|row| row["name"] == "node-0-<redacted>-<redacted>")
+        .unwrap();
+    assert_eq!(masked["active_connections"], 1);
+    assert_eq!(masked["total_connections"], "1");
+    assert_eq!(masked["upload_bytes"], "17");
+    assert_eq!(masked["download_bytes"], "29");
+    assert!(counters.iter().any(|row| row["name"] == "ordinary-node"));
     app.shutdown().await;
 }
 

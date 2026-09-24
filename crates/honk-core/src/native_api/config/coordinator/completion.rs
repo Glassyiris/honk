@@ -57,6 +57,7 @@ impl Worker {
         committed: Committed,
     ) {
         let written = committed.written();
+        self.begin_record(&committed);
         let pending = match self.activation.dispatch(request).await {
             Ok(pending) => pending,
             Err(failure) => {
@@ -67,13 +68,14 @@ impl Worker {
                     _ => unavailable(),
                 };
                 self.service.operations.reject(id, error);
+                *self.service.recording.write() = RecordState::Idle;
                 return;
             }
         };
         self.service.operations.accept(id);
         self.service.operations.running(id);
         let completion = self.activation.complete(pending).await;
-        if let Err(details) = self.record(committed, &completion) {
+        if let Err(details) = self.record(committed, &completion).await {
             let (code, message) = match completion {
                 Err(ActivationFailure::Unconfirmed) => ActivationFailure::Unconfirmed.reason(),
                 _ => (
@@ -92,8 +94,15 @@ impl Worker {
         );
     }
 
+    pub(super) fn begin_record(&self, committed: &Committed) {
+        if !committed.written() {
+            let revision = self.service.sources.revision();
+            *self.service.recording.write() = RecordState::Pending(revision);
+        }
+    }
+
     /// Records an activated candidate in the store; `Err` carries the failure details.
-    pub(super) fn record(
+    pub(super) async fn record(
         &self,
         committed: Committed,
         completion: &ActivationCompletion,
@@ -104,18 +113,25 @@ impl Worker {
         if committed.written() {
             return Ok(());
         }
-        match completion {
+        let result = match completion {
             Ok(_) | Err(ActivationFailure::Degraded(_) | ActivationFailure::Reconciliation(_)) => {
-                store
-                    .promote(committed)
-                    .map_err(|_| json!({"stage":"store","committed":true,"durable":false}))
+                let writer = Arc::clone(store);
+                match tokio::task::spawn_blocking(move || writer.promote(committed)).await {
+                    Ok(Ok(())) => Ok(()),
+                    _ => {
+                        store.block();
+                        Err(json!({"stage":"store","committed":true,"durable":false}))
+                    }
+                }
             }
             Err(ActivationFailure::Unconfirmed) => {
                 store.block();
                 Err(json!({"stage":"store","committed":null}))
             }
             Err(_) => Ok(()),
-        }
+        };
+        *self.service.recording.write() = RecordState::Idle;
+        result
     }
 
     pub(super) async fn reload_operation(&mut self, id: &str, request: ActivationRequest) {

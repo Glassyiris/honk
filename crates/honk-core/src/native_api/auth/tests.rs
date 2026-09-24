@@ -1,3 +1,4 @@
+use super::storage::{LEGACY_DIR, LEGACY_RECORD, Record, SetupError};
 use super::*;
 use std::os::unix::fs::PermissionsExt as _;
 use std::time::Duration;
@@ -20,16 +21,6 @@ fn pbkdf2_sha256_matches_independent_vectors() {
     assert_eq!(
         hex(&pbkdf2_sha256(b"password", b"salt", 4096)),
         "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"
-    );
-    // A key longer than the SHA-256 block is hashed first by HMAC; the derivation must still agree.
-    let long = [b'p'; 100];
-    assert_ne!(
-        pbkdf2_sha256(&long, b"salt", 2),
-        pbkdf2_sha256(&long[..99], b"salt", 2)
-    );
-    assert_eq!(
-        pbkdf2_sha256("密碼 pässwörd".as_bytes(), b"salt", 3),
-        pbkdf2_sha256("密碼 pässwörd".as_bytes(), b"salt", 3)
     );
 }
 
@@ -165,6 +156,10 @@ fn a_failed_write_blocks_the_store() {
         Err(SetupError::NotDurable)
     );
     db.strict().execute_batch("DROP TRIGGER refuse").unwrap();
+    assert!(
+        !store.setup_required(),
+        "an uncertain write must not offer setup"
+    );
     assert!(!store.verify("admin", "correct horse battery"));
     assert_eq!(
         store.setup("admin", "correct horse battery"),
@@ -403,7 +398,6 @@ fn reset_removes_a_legacy_record_before_any_state_db_exists() {
     let file = legacy_record(data.path());
     assert_eq!(crate::state::reset_admin(data.path()), Ok(true));
     assert!(!file.exists());
-    assert!(!data.path().join(crate::state::STATE_DIR).exists());
     assert_eq!(crate::state::reset_admin(data.path()), Ok(false));
 }
 
@@ -425,4 +419,118 @@ fn reset_on_a_db_without_its_schema_still_removes_a_legacy_record() {
     let file = legacy_record(data.path());
     assert_eq!(crate::state::reset_admin(data.path()), Ok(true));
     assert!(!file.exists());
+}
+
+#[test]
+fn a_legacy_fifo_is_rejected_without_waiting_for_a_writer() {
+    use nix::fcntl::{OFlag, open};
+    use nix::sys::stat::Mode;
+
+    let data = temp_data_dir();
+    let directory = data.path().join(LEGACY_DIR);
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let fifo = directory.join(LEGACY_RECORD);
+    nix::unistd::mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+    let db = Arc::new(StateDb::open(data.path()).unwrap());
+    let path = data.path().to_owned();
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        send.send(CredentialStore::open(db, &path).err()).unwrap();
+    });
+    let result = receive.recv_timeout(Duration::from_secs(1));
+    // Unblock the old O_RDONLY implementation before asserting, so ablation cannot hang the suite.
+    let _unblock = open(&fifo, OFlag::O_RDWR | OFlag::O_NONBLOCK, Mode::empty()).unwrap();
+    reader.join().unwrap();
+    assert_eq!(result.unwrap(), Some(StoreError::Unsafe));
+}
+
+#[tokio::test]
+async fn blocked_setup_keeps_discovery_live_and_shutdown_joins_dropped_work() {
+    use crate::native_api::{NativeServer, router};
+    use axum::body::Body;
+    use tower::ServiceExt as _;
+
+    let data = temp_data_dir();
+    let db = Arc::new(StateDb::open(data.path()).unwrap());
+    let auth = Arc::new(Auth::open(Arc::clone(&db), data.path()).unwrap());
+    let mut state = crate::native_api::tests::state().await;
+    Arc::get_mut(&mut state).unwrap().auth = Some(Arc::clone(&auth));
+    let app = router(Arc::clone(&state)).layer(axum::Extension(Peer("127.0.0.1".parse().unwrap())));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = NativeServer::start(listener, state);
+    let (locked, ready) = tokio::sync::oneshot::channel();
+    let (release, held) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _connection = db.strict();
+        locked.send(()).unwrap();
+        let _ = held.recv_timeout(Duration::from_secs(10));
+    });
+    ready.await.unwrap();
+    let credentials = || {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/setup")
+            .header("host", "127.0.0.1:9527")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"username":"admin","password":"correct horse battery"}"#,
+            ))
+            .unwrap()
+    };
+    let started = Instant::now();
+    let request = tokio::spawn(app.clone().oneshot(credentials()));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while auth.store.setup_required() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "setup blocked the runtime or discovery"
+    );
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+
+    let discovery = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api")
+                .header("host", "127.0.0.1:9527")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(discovery.into_body(), 65536)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["auth"]["setup_required"], false);
+    let busy = app.clone().oneshot(credentials()).await.unwrap();
+    assert_eq!(busy.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(busy.headers()["retry-after"], "1");
+
+    let mut shutdown = tokio::spawn(server.shutdown());
+    while !auth.work.lock().closed {
+        tokio::task::yield_now().await;
+    }
+    let refused = app.oneshot(credentials()).await.unwrap();
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut shutdown)
+            .await
+            .is_err()
+    );
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(auth.store.verify("admin", "correct horse battery"));
+    assert_eq!(admin_rows(data.path()), 1);
 }

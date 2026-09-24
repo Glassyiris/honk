@@ -68,6 +68,8 @@ TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，
 
 原生 server 最多拥有 64 条 HTTP/1.1 连接，满时暂停 accept，header 读取上限五秒；关闭时全部连接共享五秒 graceful drain，随后 abort 并逐一 join。空闲 I/O 与停滞写入分别受 30 秒期限约束；SSE heartbeat 成功写入使健康长连接保持活跃，读取不能延长阻塞 writer 的期限。TLS/HTTP2 可由可信反代终止。Forwarded headers 不改写固定 discovery path，也不授予 Host/Origin 权限。
 
+密码模式先关闭凭据准入，再执行上述 HTTP grace，随后等待真实的阻塞凭据任务结束。五秒 HTTP 预算不限制最后的 KDF/数据库 join。
+
 **已记录的契约差异：** discovery 的 `auth` 对象与密码 endpoint 是该 pin 尚未包含的新增内容。Hyper 可在应用处理前以 400/414/431 或断连拒绝畸形/硬超限 HTTP；这些 transport 拒绝不保证 JSON 信封或应用 headers。
 
 应用 target/header 上限作用于 Hyper **解析并规范化后的表示**，不是原始 wire 字节。Hyper 可能先移除 request-target fragment，或合并相同 `Content-Length` 字段，再交给应用计量；这些形式的原始文本即使超过应用上限，也可能得到正常响应而不是 413。原始输入仍受 Hyper 传输处理约束。这是已接受的边界差异，不另写 HTTP parser，也不宣称原始 wire 大小保证；body 限制仍覆盖全部交付的 body 字节。
@@ -88,9 +90,13 @@ Token 模式不提供三个密码 endpoint，返回 `404 capability_not_supporte
 
 `expires_at` 是 RFC 3339 UTC 时间戳。Setup 与 login 要求 `Content-Type: application/json`，不能携带 query string 或未知 JSON 字段，body 最多 4096 字节。用户名区分大小写，必须是匹配 `[A-Za-z0-9_.-]{1,64}` 的 ASCII。密码须为 8–128 个 Unicode 标量值，UTF-8 编码最多 512 字节。无效 JSON 或字段返回 `400 invalid_request`；缺少或使用其他 media type 返回 `415 unsupported_media_type`。
 
+Media type 不区分大小写。重复或非文本的 `Content-Type` 值返回 `400 invalid_request`；配置、认证、probe 和路由诊断共用同一 JSON/header 解析边界。
+
 Setup 只信任 accept socket 的对端地址，不读取 `Forwarded`、`X-Forwarded-For` 或其他 header。允许范围为 `127.0.0.0/8`、`::1`、RFC 1918、`fc00::/7`、`169.254.0.0/16` 及 `fe80::/10`；IPv4-mapped IPv6 按 IPv4 分类。其他对端在读取账户状态或处理凭据前返回 `403 permission_denied`。
 
 Setup 与 login 每分钟按规范化对端最多接受 5 次尝试，全局最多 10 次。连续 5 次凭据校验失败触发 60 秒全局锁定。拒绝尝试时返回 `429 rate_limited` 与 `Retry-After`；计数器与锁定状态仅保存在进程内。
+
+凭据任务最多同时运行一个，并移出 Tokio worker；重叠请求返回 429 与 `Retry-After: 1`。HTTP 取消不会释放该任务的位置或丢弃其凭据处理结果。Discovery 只读取短时持有的凭据状态，不等待跨 KDF 或数据库 I/O 的锁。
 
 会话 token 是不透明的 `hnk1_…` 值，通过 `Authorization: Bearer <session>` 使用。每个会话固定有效 12 小时。进程只保留 token 的 SHA-256 digest，最多保留 32 个有效会话；签发新会话时淘汰最早会话，重启结束全部会话。通过配置 secret 或密码登录启动的 operation 属于管理员，而非某个 token，因此 logout 不删除 operation。
 
@@ -98,9 +104,13 @@ Setup 与 login 每分钟按规范化对端最多接受 5 次尝试，全局最�
 
 记录使用 PBKDF2-HMAC-SHA256、100,000 次迭代及新生成的 16 字节随机 salt。密码模式直接使用配置的 `global.data_dir`：该目录不可用时启动失败，不回退到其他目录，以免在别处重新开放 setup。首次 setup 插入该行，不替换已有记录，因此两个进程在同一个状态数据库上同时 setup 时只有一个成功。写入开始前数据库忙碌时，setup 失败，可以重试。插入或提交因其他原因失败时，由于该行是否已持久化无法确定，进程在重启前拒绝登录和再次 setup。
 
+Setup 占有凭据状态后，discovery 返回 `setup_required:false`，耐久性不确定时也不重新开放。无法确认写入时返回 503 与 `durability_confirmed:false`，不声称 `written:true`；须重启才能重新确认数据库中的账户状态。
+
 状态数据库之前的版本把记录保存在 `<data_dir>/native-api/admin.json`。启用 `password_auth` 时，首次启动导入该文件一次（已有的行优先），随后删除文件，`native-api/` 为空时一并删除；旧文件仍须通过与之前相同的所有者与权限检查。未启用 `password_auth` 时不处理该文件。此后再启动旧版本时，它找不到 `admin.json`，会重新开放 setup。
 
 不提供 HTTP 密码重置。恢复访问时，停止 honk，执行 `honk-core admin reset`，重启后重新 setup。把 `<data_dir>/state` 整个移走也能恢复，但会丢弃所有其他持久化状态。
+
+Reset 在检查数据库是否存在前取得状态目录的排他锁，因此不会与首次启动的旧凭据导入竞态。旧凭据文件仍须通过所有者、权限和普通文件检查。
 
 ### 用户态记录流（M2）
 
@@ -128,7 +138,10 @@ Flow list 接受 `network/state/connection_id/detail/limit/cursor`。最多八�
 
 节点读取接受 `group_id`、`limit`（1–1000）及 `cursor`；只筛直接成员，不展开叶节点。节点分页最多八份 snapshot、30 秒、4 MiB，冻结分页期间观测；无效或过滤器不匹配游标返回 400。Groups 返回摘要数组，detail 的带引号 ETag 对应仅由配置决定的 revision。组 ID 为进程生命周期随机身份：同名 reload/重排保持，删除再添加获得新 ID，重启重新发现；不使用位置 UUID 或名称 hash。
 
-Health 来自已完成且维度明确的 producer 测量，不把乐观 alive、跨族复制的排名信号、synthetic failure 或恢复延迟当真实测量。Raw TCP、HTTP 响应头、DNS exchange、QUIC handshake 保留实际目标地址族与完成时间；未知 average/ranking/warmth 保持 null/unknown。自定义组测量保留当时 member/leaf，不绑定到后来的选择。GET 不推进 URLTest、轮询或 Score 状态；`icon` 原样返回通过配置校验的 HTTP(S)/data URI，未配置为 null，不猜测或抓取图标。
+节点名、订阅标签、组名/成员名、icon、检查 URL、final 出站标签和出站计数名称，复用源内容/flow 显示的监听凭据遮罩。节点快照在有界序列化前遮罩，续页保留同一份已遮罩字节；不修改不透明 ID、revision hash、成员身份或游标绑定。
+既有遮罩阈值不变：不足八字节的监听凭据值不遮罩，启动时会发出警告。
+
+Health 来自已完成且维度明确的 producer 测量，不把乐观 alive、跨族复制的排名信号、synthetic failure 或恢复延迟当真实测量。Raw TCP、HTTP 响应头、DNS exchange、QUIC handshake 保留实际目标地址族与完成时间；未知 average/ranking/warmth 保持 null/unknown。自定义组测量保留当时 member/leaf，不绑定到后来的选择。GET 不推进 URLTest、轮询或 Score 状态；`icon` 返回通过配置校验并应用监听凭据遮罩的 HTTP(S)/data URI，未配置为 null，不猜测或抓取图标。
 
 Selector selection body 为 `{"member_id":"直接成员 ID","network":"tcp"}`，network 必填且接受 `tcp/udp/both`。TCP 与 UDP 分开保存，`both` 一次校验并原子发布；自动策略拒绝手动选择。原生与 Clash 写入都由共同 control/reload owner 串行化，Clash 写入等价于 both，读取 `now` 是 TCP 投影。返回独立的 `selection_revision` 与实际 `connections_interrupted`，不将选择 revision 当作配置 ETag。启用 `interrupt_connections` 时，按流量建立时捕获的组身份/路径和发生变更的网络关闭旧 owner，而非按当前可达叶名称删除记录；已有选择不触发中断。关闭确认失败可能在选择已发布后报错，不承诺回滚。
 
@@ -139,6 +152,8 @@ PATCH 只修改 parser 定位的可写源片段，保留其他原文字节、注
 ### 原生事件（M4）
 
 使用带 Bearer 与 `Accept: text/event-stream` 的 streaming fetch；浏览器 EventSource 不能设置所需 Authorization。可选 `kinds/flow_id` 绑定续传游标。最多保留 512 事件/60 秒，16 clients，每 client 64 条 live 队列；队满断流，不静默 skip。每 15 秒 heartbeat。Fresh 先 ready；有效续传 replay→ready→live，原子挂接不留空窗。过期、未知、旧 instance 或不同过滤器游标在 HTTP 200 前返回 `409 event_cursor_expired`。
+
+Ready 游标是不透明检查点，不是保留的事件记录。旧历史已经过期时，新签发的检查点仍可立即续传；它不会恢复已淘汰的记录游标，也不能跨过更新事件的丢失。时间、过滤器、instance 与记录重置检查保持有效。顺序指投递/重放位置，不是游标字节的排序。
 
 实际发布 `stream.ready/runtime.updated/flow.updated/flow.gap/generation.changed` 及真实 operation 状态转换的 `operation.updated`；operation store 不依赖是否具有可写 `.dae` 来源。Generation 事件只来自已接受发布，不来自 reload 收件。事件仅含有界安全 ID/状态，不含包正文或原始配置。Flow/event 保留只在内存，不是耐久日志。
 
@@ -193,11 +208,13 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 写入先激活再记录。激活提交后（包括 degraded 与 reconciliation 失败的提交）才写入 revision 行并移动 `head`；激活被拒绝时不增加记录，并报告 `written:false`。记录失败时，操作以 `details {stage:"store",committed:true,durable:false}` 失败；引擎在确认激活前停止时，操作以 `details {stage:"store",committed:null}` 失败。两种情况下，`store.recorded` 变为 false，capabilities 报告配置不可写，导出文件名不含 revision，写入返回 `503 temporarily_unavailable` 与 `details.stage:"store"`。激活 `head` 所在的 revision 会重新激活它而不增加记录，并解除该状态；重启同样会解除，重启后加载 `head`。最多保留 50 个 revision，按存储的 JSON 计共 16 MiB，从最旧的开始清理，不删除当前 revision。JSON 转义可能使 revision 大于源文件本身；单个 revision 的 JSON 超过 16 MiB 时拒绝写入。
 
+新 accepted 源已发布、但耐久记录尚未完成时，`store.recorded` 为 false，导出文件名为 `honk.dae`；`revision` 和 `parent` 仍描述耐久 head。读取尚未变化的旧 accepted 源时仍可报告已记录。协调器等待阻塞 SQLite promotion 结束，才完成操作、处理下一项修改或确认关闭。
+
 `GET /config` 增加 `store {kind, revision, parent, recorded}`，`kind` 为 `file` 或 `db`。capabilities 增加 `config.store`、`config_export {available}`、`config_import {available, replace_required}` 与 `config_revisions {available, can_activate, max_revisions}`；discovery 增加 `config_export`、`config_import` 与 `config_revisions` 链接。
 
 - `GET /config/export` 把已接受的源合并为一份文档返回：`text/plain; charset=utf-8`、`Content-Disposition: attachment; filename="honk-r<n>.dae"`（文件模式为 `honk.dae`）、基于正文的强 `ETag` 与 `Cache-Control: no-store`。正文不含监听凭据；有凭据被省略时，首行为 `# listener secrets omitted`，补回凭据后才能运行。两种模式均可用。
 - `POST /config/import`（数据库模式，需可写）接受严格 JSON `{"replace":bool}`，必须带 `Idempotency-Key`。它重新读取 `-c` 源树，经 reload 操作记录为 origin 为 `import` 的新 revision。因为启动过程总会记录 revision 1，所以必须提交 `replace:true`，其他请求返回 `409 already_initialized`。凭据副本在删除后仍残留时返回 `422 unsupported_value`。源树必须保持入口路径、监听凭据、`native_api` 设置与 `data_dir` 不变，否则返回 403。
-- `GET /config/revisions`（数据库模式）返回 `{active, max_revisions, revisions:[{revision, parent, created_at, principal, origin, content_sha256, bytes, sources:[{path, sha256}]}]}`，从新到旧排列，不含正文。
+- `GET /config/revisions`（数据库模式）返回 `{active, max_revisions, revisions:[{revision, parent, created_at, principal, origin, content_sha256, bytes, sources:[{path, sha256}]}]}`，从新到旧排列，不含正文。`active` 与行来自同一数据库快照；父 revision 被留存清理删除后，`parent` 为 null。
 - `POST /config/revisions/{n}/activate`（数据库模式，需可写）接受空 body 或 `{}`，`Idempotency-Key` 可选。它校验并激活 revision `n`，再记录为 origin 为 `activate` 的新 revision。`store.recorded` 为 true 时，激活当前 revision 不产生变更；未知的 `n` 返回 `404 resource_not_found`。
 
 文件模式下，import 与 revision 路由返回 `404 capability_not_supported`。
@@ -211,6 +228,8 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 每个 probe job 最多 64 个成员关联、256 行结果；最多 4 个 active、16 个 queued、每 target 1 个，准备/排队/测量共享 30 秒 deadline。最终 transport owner 清理即使超期也必须等待 join，因此 operation 总耗时可能超过 30 秒。每分钟 principal/global 均最多 30 次（当前只有一个 principal）；限流为 `429 rate_limited`，队列/owner 不可用为 503，均带正数 Retry-After。202 只表示 daemon 接管；断开 HTTP 不取消任务。结果保留真实 measurement/family/warmth/时间与 health 更新是否被当前 epoch 接受；过时代次、取消或 deadline 不伪造成 unhealthy，TCP-connect 不冒充 HTTP 排名样本。
 
 `GET /dns/query` 必填 `domain`，`type` 默认 A，可重复指定最多 8 个不同类型；支持类型见 capabilities。一次请求的所有类型固定同一 DNS generation，共享 10 秒期限；每分钟 principal/global 各 30 次。`upstream` 只接受已配置名称，包括未被规则引用的名称；它替换请求路由选择，不绕过 hosts/strategy 或响应侧 requery。Hosts 命中报告 default route、无 upstream。`cache_mode=bypass` 不读正/负/stale 缓存，不写缓存，不加入普通写入 singleflight/refresh，也不启动后台刷新；不提供该选项时保留正常生产语义。
+
+字面值 `.` 表示 DNS 根，支持实际查询、精确缓存列表和按名称删除。普通输入名称不区分大小写，末尾点可省略；展示名称保留规范化末尾点。合法根域 wire 问题也进入普通严格 DNS 路径；非 UTF-8 label 仍不属于该消费者契约。
 
 缓存 GET 只观察运行时 exact-key 正/负记录（`persistent:false`），不提升 LRU 或计入 hit。支持 `name` 精确名称、`domain` 子串、重复 `type`、`include_expired`、`detail`、`limit`（1–1000，默认 100）及 cursor；最多 8 份过滤器/instance 绑定的不可变快照、30 秒、合计 8 MiB，底层淘汰后快照占用仍计费。`entry_id` 标识精确 incarnation，旧 ID 不能删除替代记录；按 name 删除可跨 exact-key 变体并用 type 限制。删除/flush 与入库发布串行化，等待启用的持久化失效确认，旧 foreground/refresh 不能在确认后复活所删缓存；flush 不清空 DNS 路由投影。DNS query/cache/log 的完整 JSON 响应上限均为 262144 字节，不能完整表示或保留快照时返回 503 与 Retry-After，不裁剪 RRset 冒充完整答案。
 

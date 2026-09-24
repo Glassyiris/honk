@@ -39,6 +39,8 @@ const MAX_RETAINED_BYTES: usize = MAX_EVENTS * MAX_PAYLOAD_BYTES;
 const RETENTION: Duration = Duration::from_secs(60);
 const HEARTBEAT: Duration = Duration::from_secs(15);
 const MAX_SAFE_UINT: u64 = 9_007_199_254_740_991;
+// Signed cursors distinguish an after-record checkpoint from the record itself.
+const CHECKPOINT_BIT: u64 = 1 << 63;
 const KINDS: [&str; 6] = [
     "stream.ready",
     "runtime.updated",
@@ -301,7 +303,11 @@ impl EventHub {
             state.signer = new_signer(&self.instance_id);
             return;
         };
-        let Some(sequence) = state.sequence.checked_add(1) else {
+        let Some(sequence) = state
+            .sequence
+            .checked_add(1)
+            .filter(|sequence| *sequence < CHECKPOINT_BIT)
+        else {
             state.stopped = true;
             state.close_clients();
             return;
@@ -398,8 +404,7 @@ impl EventHub {
             state.close_clients();
             state.records = VecDeque::new();
             state.retained_bytes = 0;
-            // The new signer already rejects every earlier cursor; bumping
-            // `evicted_through` would also reject the next stream's own ready cursor.
+            // Rotating the signer rejects every earlier cursor.
             state.signer = new_signer(&self.instance_id);
         }
     }
@@ -499,7 +504,7 @@ impl EventHub {
             (StreamKind::Logs, Some(cursor)) => cursor.to_owned(),
             _ => encode_cursor(
                 &state.signer,
-                cutoff,
+                cutoff | CHECKPOINT_BIT,
                 stamp,
                 Uuid::new_v4().as_bytes(),
                 &filter.binding,
@@ -560,7 +565,9 @@ impl EventHub {
             .signer
             .expand(&bytes[..64], &mut signature)
             .expect("fixed HKDF length");
-        let seq = u64::from_be_bytes(bytes[..8].try_into().expect("fixed cursor length"));
+        let encoded_seq = u64::from_be_bytes(bytes[..8].try_into().expect("fixed cursor length"));
+        let checkpoint = encoded_seq & CHECKPOINT_BIT != 0;
+        let seq = encoded_seq & !CHECKPOINT_BIT;
         let stamp = u64::from_be_bytes(bytes[8..16].try_into().expect("fixed cursor length"));
         let age = now
             .duration_since(self.started)
@@ -569,7 +576,8 @@ impl EventHub {
         if signature.ct_eq(&bytes[64..]).unwrap_u8() != 1
             || bytes[32..64] != filter.binding
             || seq > state.sequence
-            || (state.evicted_through != 0 && seq <= state.evicted_through)
+            || seq < state.evicted_through
+            || (!checkpoint && state.evicted_through != 0 && seq == state.evicted_through)
             || age.is_none_or(|age| age >= RETENTION.as_nanos())
         {
             return Err(expired(id));

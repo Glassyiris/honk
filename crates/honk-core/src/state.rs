@@ -159,8 +159,11 @@ impl StateDb {
         *self.enabled_subscriptions.lock() = Some(keys);
     }
 
-    pub(crate) fn enabled_subscriptions(&self) -> Option<std::collections::HashSet<String>> {
-        self.enabled_subscriptions.lock().clone()
+    /// Pins publication until body cleanup has committed. Acquire after `strict`.
+    pub(crate) fn enabled_subscriptions(
+        &self,
+    ) -> MutexGuard<'_, Option<std::collections::HashSet<String>>> {
+        self.enabled_subscriptions.lock()
     }
 
     /// A new connection to the same file, configured for `class`.
@@ -193,20 +196,23 @@ impl StateDb {
 /// there was neither. Refused while any process has the db open through
 /// `StateDb`, because each holds a shared lock on `state/`.
 pub fn reset_admin(data_dir: &Path) -> Result<bool, StateError> {
-    // Before any start created the state db, only a legacy record can exist.
-    match std::fs::symlink_metadata(data_dir.join(STATE_DIR).join(DB_FILE)) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return remove_legacy_admin(data_dir);
-        }
-        _ => {}
-    }
-    let directory = state_directory(data_dir, false)?;
+    let directory = state_directory(data_dir, true)?;
     let directory = Flock::lock(directory, FlockArg::LockExclusiveNonblock).map_err(
         |(_, error)| match error {
             Errno::EWOULDBLOCK => StateError::InUse,
             _ => StateError::Unavailable,
         },
     )?;
+    // Startup takes the shared lock before creating the db or importing credentials.
+    match nix::sys::stat::fstatat(
+        &*directory,
+        DB_FILE,
+        nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+    ) {
+        Err(Errno::ENOENT) => return remove_legacy_admin(data_dir),
+        Err(error) => return Err(path_error(error)),
+        Ok(_) => {}
+    }
     let file = existing(&directory)?;
     private(&file, false)?;
     let metadata = file.metadata().map_err(|_| StateError::Unavailable)?;
@@ -243,6 +249,18 @@ fn remove_legacy_admin(data_dir: &Path) -> Result<bool, StateError> {
         Err(Errno::ENOENT) => return Ok(false),
         Err(error) => return Err(path_error(error)),
     };
+    private(&directory, true)?;
+    let record = match openat(
+        &directory,
+        "admin.json",
+        OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => File::from(fd),
+        Err(Errno::ENOENT) => return Ok(false),
+        Err(error) => return Err(path_error(error)),
+    };
+    private(&record, false)?;
     match nix::unistd::unlinkat(
         &directory,
         "admin.json",
@@ -438,6 +456,11 @@ fn state_directory(data_dir: &Path, create: bool) -> Result<File, StateError> {
     let directory =
         File::from(openat(&parent, STATE_DIR, DIR_FLAGS, Mode::empty()).map_err(path_error)?);
     private(&directory, true)?;
+    if create {
+        // Also cover another creator or a previous failed sync: strict commits
+        // cannot make this directory's entry durable in its parent.
+        parent.sync_all().map_err(|_| StateError::Unavailable)?;
+    }
     Ok(directory)
 }
 

@@ -118,11 +118,41 @@ impl RouteInput {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub(crate) struct DnsRequestInput {
+    pub(crate) name: String,
+    pub(crate) qtype: String,
+    pub(crate) source_ip: Option<IpAddr>,
+    pub(crate) original_dst: Option<SocketAddr>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct DnsResponseInput {
+    pub(crate) name: String,
+    pub(crate) qtype: String,
+    pub(crate) answer_ips: Vec<IpAddr>,
+    pub(crate) from_upstream: String,
+}
+
+impl DnsRequestInput {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.name.capacity() + self.qtype.capacity()
+    }
+}
+impl DnsResponseInput {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.name.capacity()
+            + self.qtype.capacity()
+            + self.from_upstream.capacity()
+            + self.answer_ips.capacity() * size_of::<IpAddr>()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 pub(crate) enum EvaluationInput {
     Traffic(RouteInput),
-    DnsRequest(super::dns::DnsRequestInput),
-    DnsResponse(super::dns::DnsResponseInput),
+    DnsRequest(DnsRequestInput),
+    DnsResponse(DnsResponseInput),
 }
 
 impl EvaluationInput {

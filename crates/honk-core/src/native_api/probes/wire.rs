@@ -332,7 +332,7 @@ async fn udp_dns(
     let mut response = vec![0; 65535];
     let (length, source) = transport.recv_packet(&mut response).await?;
     anyhow::ensure!(
-        normalize(source.ip()) == normalize(transport.relay_addr().ip())
+        canonical_ip(source.ip()) == canonical_ip(transport.relay_addr().ip())
             && source.port() == transport.relay_addr().port(),
         "DNS response peer mismatch"
     );

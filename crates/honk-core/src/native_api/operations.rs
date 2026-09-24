@@ -84,7 +84,6 @@ pub(crate) struct OperationStore {
 
 struct Record {
     id: String,
-    principal: [u8; 32],
     kind: OperationKind,
     replay: Option<Replay>,
     admission: watch::Sender<Admission>,
@@ -278,7 +277,6 @@ impl OperationStore {
         let (sender, receiver) = watch::channel(None);
         records.push(Record {
             id: id.clone(),
-            principal,
             kind,
             replay,
             admission: sender,
@@ -455,20 +453,10 @@ impl OperationStore {
         true
     }
 
-    pub(crate) fn get(
-        &self,
-        id: &str,
-        principal: &str,
-        control: bool,
-    ) -> Result<Response, ApiError> {
+    pub(crate) fn get(&self, id: &str) -> Result<Response, ApiError> {
         let mut records = self.records.lock();
         prune(&mut records);
-        let record = records.iter().find(|record| {
-            record.id == id
-                && (control
-                    || record.principal
-                        == digest(&[self.instance_id.as_bytes(), principal.as_bytes()]))
-        });
+        let record = records.iter().find(|record| record.id == id);
         let (record, operation) = record
             .and_then(|record| {
                 record

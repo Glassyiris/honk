@@ -52,14 +52,7 @@ async fn body(response: Response) -> Value {
 async fn terminal(state: &NativeState, operation: &str) -> Value {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let value = body(
-                state
-                    .observation
-                    .operations
-                    .get(operation, "anonymous", false)
-                    .unwrap(),
-            )
-            .await;
+            let value = body(state.observation.operations.get(operation).unwrap()).await;
             if matches!(value["status"].as_str(), Some("succeeded" | "failed")) {
                 break value;
             }

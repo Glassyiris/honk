@@ -250,9 +250,9 @@ fn read_body(connection: &Connection, key: &str) -> rusqlite::Result<Option<Vec<
 /// under `key` in one strict transaction, deleting bodies of subscriptions
 /// that are no longer enabled only when needed to stay under the cap.
 fn put_body(state: &StateDb, key: &str, body: &[u8]) -> Result<(), PutError> {
-    let enabled = state.enabled_subscriptions();
     let mut connection = state.strict();
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let enabled = state.enabled_subscriptions();
     put_body_in(&transaction, key, body, enabled.as_ref(), true)?;
     transaction.commit()?;
     Ok(())
@@ -323,25 +323,30 @@ pub(crate) fn prune_bodies(
     state: &StateDb,
     previous: &mut HashSet<String>,
 ) -> rusqlite::Result<()> {
-    let Some(enabled) = state.enabled_subscriptions() else {
+    let mut connection = state.strict();
+    let enabled = state.enabled_subscriptions();
+    let Some(enabled_keys) = enabled.as_ref() else {
         return Ok(());
     };
-    let mut connection = state.strict();
     let keys: Vec<String> = connection
         .prepare("SELECT key FROM subscription_body")?
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     let current: HashSet<String> = keys
         .into_iter()
-        .filter(|key| !enabled.contains(key))
+        .filter(|key| !enabled_keys.contains(key))
         .collect();
     let expired: Vec<&String> = current.intersection(previous).collect();
-    if !expired.is_empty() {
+    let deleted = !expired.is_empty();
+    if deleted {
         let transaction = connection.transaction()?;
         for key in expired {
             transaction.execute("DELETE FROM subscription_body WHERE key = ?1", [key])?;
         }
         transaction.commit()?;
+    }
+    drop(enabled);
+    if deleted {
         crate::state::incremental_vacuum(&connection)?;
     }
     *previous = current;

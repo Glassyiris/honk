@@ -444,7 +444,7 @@ async fn resolve<'a>(
 ) -> Result<&'a [IpAddr], ApiError> {
     if !resolved.contains_key(host) {
         let addresses = if let Ok(ip) = host.trim_matches(['[', ']']).parse() {
-            vec![normalize(ip)]
+            vec![canonical_ip(ip)]
         } else {
             match dns.resolve(host).await {
                 Ok(addresses) => addresses,
@@ -455,7 +455,7 @@ async fn resolve<'a>(
             }
         };
         let mut unique = Vec::with_capacity(addresses.len());
-        for ip in addresses.into_iter().map(normalize) {
+        for ip in addresses.into_iter().map(canonical_ip) {
             if !unique.contains(&ip) {
                 unique.push(ip);
             }

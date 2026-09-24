@@ -628,35 +628,27 @@ async fn tcp_wire_retry_keeps_distinct_lookup_ids_and_physical_parentage() {
 }
 
 #[tokio::test]
-async fn root_rejection_is_recorded_and_non_utf8_cannot_claim_complete_trace() {
+async fn non_utf8_query_cannot_claim_complete_trace() {
     let (service, store, _api, _gate, mut calls, server) = fixture().await;
-    for name in [&[0][..], &[1, 0xff, 0][..]] {
-        let mut query = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
-        query.extend_from_slice(name);
-        query.extend_from_slice(&[0, 1, 0, 1]);
-        let (flow, observer) = observer(&store);
-        assert!(
-            observer
-                .scope(service.resolve(&query, IngressProfile::Internal))
-                .await
-                .is_err()
-        );
-        let view = detail(&store, &flow);
-        if name == [0] {
-            assert!(dns_rows(&view).iter().any(|row| row["name"] == "."
-                && row["status"] == "failed"
-                && row["error"] == "query_or_policy_failed"));
-        } else {
-            assert_eq!(view["trace"]["status"], "partial");
-            assert!(
-                view["trace"]["missing"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|reason| reason == "not_instrumented")
-            );
-        }
-    }
+    let mut query = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    query.extend_from_slice(&[1, 0xff, 0]);
+    query.extend_from_slice(&[0, 1, 0, 1]);
+    let (flow, observer) = observer(&store);
+    assert!(
+        observer
+            .scope(service.resolve(&query, IngressProfile::Internal))
+            .await
+            .is_err()
+    );
+    let view = detail(&store, &flow);
+    assert_eq!(view["trace"]["status"], "partial");
+    assert!(
+        view["trace"]["missing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "not_instrumented")
+    );
     assert!(calls.try_recv().is_err());
     server.abort();
     let _ = server.await;

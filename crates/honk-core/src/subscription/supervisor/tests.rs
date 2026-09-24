@@ -232,7 +232,7 @@ async fn refresh_queue_refusal_wakes_idempotent_waiters_and_shutdown_settles_acc
     }
     state.shutdown().await.unwrap();
     for id in accepted {
-        let response = operations.get(&id, "control", true).unwrap();
+        let response = operations.get(&id).unwrap();
         let bytes = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
@@ -518,7 +518,7 @@ async fn finish_pause_waits_for_late_enqueue_and_retains_removed_provider_commit
         .unwrap();
     assert!(!replay.fresh);
     assert_eq!(replay.admission().await.unwrap().operation_id, operation_id);
-    let response = operations.get(&operation_id, "control", true).unwrap();
+    let response = operations.get(&operation_id).unwrap();
     let bytes = axum::body::to_bytes(response.into_body(), 4096)
         .await
         .unwrap();
@@ -628,7 +628,7 @@ async fn pause_cancels_periodic_and_explicit_fetches_without_losing_replay() {
             .unwrap();
         assert!(!replay.fresh);
         assert_eq!(replay.admission().await.unwrap().operation_id, id);
-        let response = operations.get(&id, "control", true).unwrap();
+        let response = operations.get(&id).unwrap();
         let bytes = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();

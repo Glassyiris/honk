@@ -236,15 +236,22 @@ fn retention_counts_the_stored_json() {
     // 4.5 MiB of source, 9 MiB once JSON escapes every quote.
     let quoted = format!("global {{}}\n# {}\n", "\"".repeat(4608 * 1024));
     assert_eq!(store.promote(write(&store, &quoted)), Ok(2));
-    let again = format!("{quoted}# again\n");
-    assert_eq!(store.promote(write(&store, &again)), Ok(3));
-    let numbers: Vec<i64> = store
-        .revisions()
-        .unwrap()
-        .into_iter()
-        .map(|revision| revision.number)
-        .collect();
-    assert_eq!(numbers, [3]);
+    for (number, lose_reply) in [(3, false), (4, true)] {
+        let again = format!("{quoted}# revision {number}\n");
+        store.lose_commit_reply.store(lose_reply, Ordering::Release);
+        assert_eq!(store.promote(write(&store, &again)), Ok(number));
+        assert!(!store.blocked());
+        assert_eq!(store.cached_head(), Some((number, None)));
+        let (active, revisions) = store.revisions().unwrap();
+        assert_eq!(active, Some(number));
+        assert_eq!(
+            revisions
+                .iter()
+                .map(|row| (row.number, row.parent))
+                .collect::<Vec<_>>(),
+            [(number, None)]
+        );
+    }
 
     // 3 MiB of control characters stores as 18 MiB of `\u0001` escapes.
     let content = format!("global {{}}\n# {}\n", "\u{1}".repeat(3 * 1024 * 1024));

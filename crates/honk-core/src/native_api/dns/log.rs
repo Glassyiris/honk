@@ -16,7 +16,7 @@ use crate::dns::outcome::{DnsOutcome, Provenance, RequestRoute};
 use crate::dns::query::IngressProfile;
 use crate::dns::response::native;
 use crate::native_api::{
-    ApiError, ErrorCode, NativeState, error, invalid_query, parse_query, timestamp,
+    ApiError, ErrorCode, NativeState, canonical_ip, error, invalid_query, parse_query, timestamp,
     types::RequestId,
 };
 
@@ -309,7 +309,7 @@ impl Filter {
             && self.source.is_none_or(|source| {
                 entry
                     .source
-                    .is_some_and(|actual| normalized_ip(actual.ip()) == source)
+                    .is_some_and(|actual| canonical_ip(actual.ip()) == source)
             })
             && self.name.as_deref().is_none_or(|name| {
                 entry
@@ -319,13 +319,6 @@ impl Filter {
                     .windows(name.len())
                     .any(|part| part.eq_ignore_ascii_case(name.as_bytes()))
             })
-    }
-}
-
-fn normalized_ip(value: IpAddr) -> IpAddr {
-    match value {
-        IpAddr::V6(value) => value.to_ipv4_mapped().map_or(IpAddr::V6(value), IpAddr::V4),
-        value => value,
     }
 }
 
@@ -402,7 +395,7 @@ pub(super) async fn serve(
         .map(|value| {
             value
                 .parse::<IpAddr>()
-                .map(normalized_ip)
+                .map(canonical_ip)
                 .map_err(|_| invalid_query(id))
         })
         .transpose()?;

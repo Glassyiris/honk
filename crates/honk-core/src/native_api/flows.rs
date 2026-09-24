@@ -29,7 +29,7 @@ use super::{
 
 pub(crate) mod dns;
 pub(crate) mod kernel;
-mod producer;
+pub(crate) mod producer;
 pub(crate) mod record;
 use record::{Input, InputValues, SnapshotRow, Step, StepData, Summary};
 
@@ -583,7 +583,7 @@ impl FlowStore {
         let mut store = self.inner.lock();
         self.prune(&mut store, Instant::now());
         if let Some(record) = store.records.iter().find(|record| record.id() == flow_id) {
-            return Ok(record.project(true, true));
+            return Ok(record.project());
         }
         if store
             .tombstones
@@ -777,31 +777,28 @@ impl Record {
         })
     }
 
-    fn project(&self, full: bool, trace: bool) -> Value {
+    fn project(&self) -> Value {
         let mut row = json!(self.summary);
-        if full {
-            row["input"] = json!(self.input);
+        row["input"] = json!(self.input);
+        let mut missing = Vec::new();
+        for (flag, reason) in [
+            (1, "not_instrumented"),
+            (2, "started_late"),
+            (4, "sampled"),
+            (8, "evicted"),
+        ] {
+            if self.missing & flag != 0 {
+                missing.push(reason);
+            }
         }
-        if trace {
-            let mut missing = Vec::new();
-            for (flag, reason) in [
-                (1, "not_instrumented"),
-                (2, "started_late"),
-                (4, "sampled"),
-                (8, "evicted"),
-            ] {
-                if self.missing & flag != 0 {
-                    missing.push(reason);
-                }
-            }
-            if self.overflow {
-                missing.push("buffer_overflow");
-            }
-            if self.redacted {
-                missing.push("redacted");
-            }
-            row["trace"] = json!({"status": self.summary.trace_status, "missing": missing, "steps": self.steps});
+        if self.overflow {
+            missing.push("buffer_overflow");
         }
+        if self.redacted {
+            missing.push("redacted");
+        }
+        row["trace"] =
+            json!({"status": self.summary.trace_status, "missing": missing, "steps": self.steps});
         row
     }
 }
@@ -855,298 +852,6 @@ impl Filters {
     }
 }
 
-impl FlowGuard {
-    pub(crate) fn id(&self) -> &str {
-        &self.id
-    }
-
-    /// Returns true only for the first observed reply; callers need not record every packet.
-    pub(crate) fn first_reply(&self) -> bool {
-        !self.id.is_empty() && !self.replied.swap(true, Ordering::Relaxed)
-    }
-
-    pub(crate) fn step(&self, generation: Option<u64>, mut data: StepData) {
-        let Some(store) = self.store.upgrade() else {
-            return;
-        };
-        if let StepData::Connection {
-            reply_received: Some(reply_received),
-            ..
-        } = &mut data
-        {
-            *reply_received |= self.replied.load(Ordering::Relaxed);
-        }
-        store.record_step(&self.id, generation, data);
-    }
-
-    pub(crate) fn mark_gap(&self, reason: &'static str) {
-        if let Some(store) = self.store.upgrade() {
-            store.mark_gap(&self.id, reason);
-        }
-    }
-
-    pub(crate) fn mark_overflow(&self) {
-        self.mark_gap("buffer_overflow");
-    }
-
-    pub(crate) fn select_attempt(&self, attempt: &str) {
-        if let Some(store) = self.store.upgrade() {
-            store.mutate(&self.id, |record| {
-                if !safe_text(attempt) {
-                    return record.mark_gap("redacted");
-                }
-                if record.selected_attempt.as_deref() == Some(attempt) {
-                    return false;
-                }
-                record.selected_attempt = Some(attempt.to_owned());
-                true
-            });
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn update_input(
-        &self,
-        domain: Option<&str>,
-        source: Option<&'static str>,
-        pname: Option<&str>,
-        pid: Option<u32>,
-        src_mac: Option<String>,
-        dscp: Option<u8>,
-        mark: Option<u32>,
-    ) {
-        let Some(store) = self.store.upgrade() else {
-            return;
-        };
-        store.mutate(&self.id, |record| {
-            let mut redacted = record.redacted;
-            let domain = domain
-                .and_then(|value| bounded_display(value, &mut redacted, &mut record.overflow));
-            let pname =
-                pname.and_then(|value| bounded_display(value, &mut redacted, &mut record.overflow));
-            let src_mac = src_mac
-                .as_deref()
-                .and_then(|value| bounded_display(value, &mut redacted, &mut record.overflow));
-            let source = source.map(domain_source);
-            let dscp = dscp.filter(|value| *value <= 63);
-            let input = Input {
-                src: record.input.src,
-                dst: record.input.dst,
-                domain,
-                domain_source: source,
-                pid,
-                process_path: (),
-                src_mac,
-                ingress: (),
-                domain_rule_ids: (),
-                dscp,
-                mark,
-            };
-            let changed = record.redacted != redacted
-                || record.input != input
-                || record.summary.pname != pname
-                || record.summary.domain_source != source;
-            record.redacted = redacted;
-            record.input = input;
-            record.summary.pname = pname;
-            record.summary.domain_source = source;
-            let input_source = match source {
-                Some("dns_mapping") => Some("dns_mapping"),
-                Some("tls_sni" | "http_host" | "quic_sni") => Some("sniffer"),
-                _ => None,
-            };
-            if changed && let Some(input_source) = input_source {
-                record.push_step(
-                    None,
-                    StepData::Input {
-                        values: InputValues {
-                            input: record.input.clone(),
-                            pname: record.summary.pname.clone(),
-                        },
-                        source: input_source,
-                    },
-                );
-            }
-            changed
-        });
-    }
-
-    pub(crate) fn routed(
-        &self,
-        outbound: &str,
-        rule_id: Option<&str>,
-        expression: Option<&str>,
-        source: &'static str,
-    ) {
-        let Some(store) = self.store.upgrade() else {
-            return;
-        };
-        store.mutate(&self.id, |record| {
-            let mut redacted = record.redacted;
-            let outbound = bounded_display(outbound, &mut redacted, &mut record.overflow);
-            let rule_id = safe_optional(rule_id, &mut redacted);
-            let expression = if record.summary.rule_id == rule_id && rule_id.is_some() {
-                record.summary.rule_expression.clone()
-            } else {
-                expression.and_then(|expression| {
-                    bounded_display(expression, &mut redacted, &mut record.overflow)
-                })
-            };
-            let reason = if record.summary.outbound == outbound {
-                "mode_preserved"
-            } else if outbound.as_deref() == Some("direct") {
-                "mode_direct"
-            } else if record.summary.outbound.is_none() {
-                "forced_outbound"
-            } else {
-                "mode_global"
-            };
-            let gap_changed = source == "unknown" && record.mark_gap("not_instrumented");
-            let source = rule_source(source);
-            let changed = record.summary.outbound != outbound
-                || record.summary.rule_id != rule_id
-                || record.summary.rule_expression != expression
-                || record.summary.rule_source != source
-                || record.redacted != redacted
-                || !record.mode_recorded
-                || gap_changed;
-            record.summary.outbound = outbound;
-            record.summary.rule_id = rule_id;
-            record.summary.rule_expression = expression;
-            record.summary.rule_source = source;
-            record.redacted = redacted;
-            if changed {
-                record.mode_recorded = true;
-                record.push_step(
-                    None,
-                    StepData::Connection {
-                        state: record.summary.state,
-                        reason,
-                        milestone: "unknown",
-                        attempt_id: None,
-                        reply_received: None,
-                        error: None,
-                        selections: Vec::new(),
-                        lookup_id: None,
-                        server_addr: None,
-                    },
-                );
-            }
-            changed
-        });
-    }
-
-    pub(crate) fn selected(&self, chain: Vec<String>) {
-        let Some(store) = self.store.upgrade() else {
-            return;
-        };
-        store.mutate(&self.id, |record| {
-            if chain.len() > MAX_STEPS {
-                return record.mark_gap("buffer_overflow");
-            }
-            let chain = chain
-                .iter()
-                .filter_map(|part| {
-                    bounded_display(part, &mut record.redacted, &mut record.overflow)
-                })
-                .collect::<Vec<_>>();
-            if record.summary.chain == chain && record.summary.chain_source == "evaluation" {
-                return false;
-            }
-            record.summary.chain = chain;
-            record.summary.chain_source = "evaluation";
-            true
-        });
-    }
-
-    pub(crate) fn attach_connection(&self, id: &str) {
-        let Some(store) = self.store.upgrade() else {
-            return;
-        };
-        store.mutate(&self.id, |record| {
-            if !safe_text(id) {
-                return !std::mem::replace(&mut record.redacted, true);
-            }
-            if record.summary.connection_id.as_deref() == Some(id) {
-                return false;
-            }
-            record.summary.connection_id = Some(id.to_owned());
-            true
-        });
-    }
-
-    pub(crate) fn transition(
-        &self,
-        state: &'static str,
-        reason: &'static str,
-        milestone: &'static str,
-        reply_received: Option<bool>,
-    ) {
-        let Some(store) = self.store.upgrade() else {
-            return;
-        };
-        store.mutate(&self.id, |record| {
-            let state = connection_state(state);
-            let milestone = match milestone {
-                "transport_ready"
-                | "target_request_sent"
-                | "target_confirmed"
-                | "first_reply"
-                | "terminal" => milestone,
-                _ => "unknown",
-            };
-            let redacted = !safe_text(reason);
-            let reason = if redacted { "redacted" } else { reason };
-            let changed = record.summary.state != state
-                || milestone == "terminal"
-                || matches!(state, "closed" | "blocked" | "failed")
-                || (redacted && !record.redacted);
-            record.redacted |= redacted;
-            record.summary.state = state;
-            if milestone == "terminal" || matches!(state, "closed" | "blocked" | "failed") {
-                if state == "unknown" || record.has_open_operations() {
-                    record.mark_gap("not_instrumented");
-                }
-                record.ended = Some(Instant::now());
-                record.summary.ended_at = Some(timestamp(SystemTime::now()));
-            }
-            record.push_step(
-                None,
-                StepData::Connection {
-                    state,
-                    reason,
-                    milestone,
-                    attempt_id: record.selected_attempt.clone(),
-                    reply_received,
-                    error: None,
-                    selections: Vec::new(),
-                    lookup_id: None,
-                    server_addr: None,
-                },
-            ) || changed
-        });
-    }
-
-    pub(crate) fn finish(&self, state: &'static str, reason: &'static str) {
-        let state = match state {
-            "closed" | "blocked" | "failed" => state,
-            _ => "unknown",
-        };
-        self.transition(
-            state,
-            reason,
-            "terminal",
-            Some(self.replied.load(Ordering::Relaxed)),
-        );
-    }
-}
-
-impl Drop for FlowGuard {
-    fn drop(&mut self) {
-        self.finish("failed", "cancelled");
-    }
-}
-
 pub(super) fn list(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Response, ApiError> {
     let query = parse_query(
         uri,
@@ -1169,7 +874,7 @@ pub(super) fn list(state: &NativeState, uri: &Uri, id: &RequestId) -> Result<Res
         .map_err(|_| invalid_query(id))?
         .unwrap_or(100);
     if !matches!(network, "tcp" | "udp" | "all")
-        || !(state_filter == "all" || connection_state(state_filter) == state_filter)
+        || !(state_filter == "all" || producer::connection_state(state_filter) == state_filter)
         || !(1..=1000).contains(&limit)
         || query
             .get("connection_id")
@@ -1241,41 +946,6 @@ fn coverage(recording: bool) -> Value {
     let userspace = if recording { "partial" } else { "none" };
     json!({"userspace_tcp": userspace, "userspace_udp": userspace, "kernel_direct": "none",
         "kernel_block": "none", "dns_intercept": userspace, "kernel_bypass": "none"})
-}
-
-fn connection_state(value: &str) -> &'static str {
-    match value {
-        "observed" => "observed",
-        "routing" => "routing",
-        "dialing" => "dialing",
-        "active" => "active",
-        "closed" => "closed",
-        "blocked" => "blocked",
-        "failed" => "failed",
-        _ => "unknown",
-    }
-}
-
-fn domain_source(value: &str) -> &'static str {
-    match value {
-        "tls_sni" => "tls_sni",
-        "http_host" => "http_host",
-        "quic_sni" => "quic_sni",
-        "dns_mapping" => "dns_mapping",
-        "explicit" => "explicit",
-        _ => "unknown",
-    }
-}
-
-/// The wire vocabulary knows a kernel decision and userspace evidence. The
-/// userspace connection paths name their route `evaluation`; that is the
-/// recomputed kind, not an unknown one.
-fn rule_source(value: &str) -> &'static str {
-    match value {
-        "kernel" => "kernel",
-        "recomputed" | "evaluation" => "recomputed",
-        _ => "unknown",
-    }
 }
 
 fn display_text(value: &str) -> bool {

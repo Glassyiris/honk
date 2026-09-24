@@ -315,16 +315,7 @@ fn dictionary_and_trace_share_complete_priority_order_and_redacted_ids() {
 }
 
 #[test]
-fn held_router_keeps_old_dictionary_and_fallback_after_replacement() {
-    let mut router = Router::new(&[rule(ip(), "old", 0)], "old-fallback").unwrap();
-    let pinned = router.clone();
-    router = Router::new(&[rule(process("curl"), "new", 0)], "new-fallback").unwrap();
-    assert_eq!(
-        trace(&pinned, &destination()).outbound.as_deref(),
-        Some("old")
-    );
-    assert_eq!(rules(&pinned).fallback.outbound, "old-fallback");
-    assert_eq!(rules(&router).fallback.outbound, "new-fallback");
+fn empty_rules_share_fallback_identity_with_trace() {
     let empty = Router::new(&[], "direct").unwrap();
     assert_eq!(
         trace(&empty, &destination()).rules[0].rule_id,

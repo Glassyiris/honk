@@ -119,6 +119,55 @@ async fn two_subscriptions_refreshed_in_turn_both_keep_their_bodies() {
     assert!(removed.iter().all(|sub| store.body(sub).is_none()));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_write_cannot_evict_a_newly_enabled_body() {
+    use std::sync::{Barrier, LazyLock};
+
+    static BUSY: LazyLock<Barrier> = LazyLock::new(|| Barrier::new(2));
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = SubscriptionStore::in_dir(temp.path());
+    let full: Vec<_> = (0..4)
+        .map(|index| subscription(&format!("full{index}")))
+        .collect();
+    let body = filler(8 * MIB);
+    for sub in &full {
+        store.store_content(sub, body.clone()).await.unwrap();
+    }
+    store.set_enabled(&full[1..]);
+    let mut blocker = store.state().connect(crate::state::Class::Strict).unwrap();
+    let transaction = blocker
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    store
+        .state()
+        .strict()
+        .busy_handler(Some(|attempt| {
+            if attempt != 0 {
+                return false;
+            }
+            BUSY.wait();
+            BUSY.wait();
+            true
+        }))
+        .unwrap();
+    let writer = store.clone();
+    let write = tokio::spawn(async move {
+        writer
+            .store_content(&subscription("replacement"), "#".into())
+            .await
+    });
+
+    BUSY.wait();
+    store.set_enabled(&full);
+    drop(transaction);
+    BUSY.wait();
+
+    assert!(write.await.unwrap().is_err());
+    assert_eq!(store.body(&full[0]).as_deref(), Some(body.as_str()));
+    assert!(store.body(&subscription("replacement")).is_none());
+}
+
 fn legacy_directory(root: &Path, bodies: &[(&Subscription, String)]) {
     fs::create_dir(root).unwrap();
     fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();

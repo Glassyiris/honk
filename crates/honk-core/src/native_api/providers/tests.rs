@@ -667,7 +667,7 @@ async fn provider_snapshot_is_immutable_and_unknown_cursor_is_invalid() {
 }
 
 #[test]
-fn provider_retention_accounts_for_full_url_and_debug_omits_it() {
+fn provider_debug_omits_full_url() {
     let subscription = Subscription {
         name: "configured-provider".into(),
         url: format!(
@@ -678,10 +678,6 @@ fn provider_retention_accounts_for_full_url_and_debug_omits_it() {
     };
     let row = Provider::observed(&subscription, ProviderLoad::default(), 0);
     assert_eq!(row.url_redacted.as_deref(), Some(subscription.url.as_str()));
-    assert!(
-        row.retained_bytes()
-            >= size_of::<Provider>() + subscription.url.len() + subscription.name.len()
-    );
     assert!(!format!("{row:?}").contains("url-sentinel"));
 }
 

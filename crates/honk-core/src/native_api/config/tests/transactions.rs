@@ -394,3 +394,185 @@ async fn suspended_admission_rejects_without_waiting_for_busy_coordinator() {
     );
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn conditional_and_invalid_writes_leave_files_and_generation_untouched() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let before = fixture.get(CONFIG).await;
+    let main = source(&before, &fixture.originals["main.dae"]);
+    let before_disk = disk(fixture.directory.path());
+    let strong = etag(main);
+    let conditions = [
+        (
+            None,
+            StatusCode::PRECONDITION_REQUIRED,
+            "precondition_required",
+        ),
+        (
+            Some(format!("W/{strong}")),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            Some(format!("{strong}, {strong}")),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (Some("*".into()), StatusCode::BAD_REQUEST, "invalid_request"),
+        (
+            Some(format!("\"{}\"", "0".repeat(64))),
+            StatusCode::PRECONDITION_FAILED,
+            "stale_revision",
+        ),
+    ];
+    for (condition, status, code) in conditions {
+        let request = fixture
+            .request(Method::PUT, &source_path(main))
+            .json(&json!({"content":"routing { fallback: block }"}));
+        let request = if let Some(condition) = condition {
+            request.header("if-match", condition)
+        } else {
+            request
+        };
+        error(request.send().await.unwrap(), status, code).await;
+        assert_eq!(disk(fixture.directory.path()), before_disk);
+        assert_eq!(fixture.get(CONFIG).await, before);
+    }
+    let invalid = fixture.originals["main.dae"].replace(
+        "nfqueue_enable: false",
+        "nfqueue_enable: private-invalid-value",
+    );
+    let failure = error(
+        fixture.replace(main, &invalid).send().await.unwrap(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_value",
+    )
+    .await;
+    diagnostics(
+        &failure["error"]["details"]["diagnostics"],
+        main["id"].as_str().unwrap(),
+        "private-invalid-value",
+    );
+    assert!(
+        !failure
+            .to_string()
+            .contains(fixture.directory.path().to_str().unwrap())
+    );
+    assert_eq!(disk(fixture.directory.path()), before_disk);
+    assert_eq!(fixture.get(CONFIG).await, before);
+    for (target, broken) in [("main.dae", "locked.dae"), ("editable.dae", "main.dae")] {
+        std::fs::write(
+            fixture.path(broken),
+            "global { nfqueue_enable: private-invalid-value }",
+        )
+        .unwrap();
+        let disk_before = disk(fixture.directory.path());
+        let failure = error(
+            fixture
+                .replace(
+                    source(&before, &fixture.originals[target]),
+                    &fixture.originals[target],
+                )
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_value",
+        )
+        .await;
+        diagnostics(
+            &failure["error"]["details"]["diagnostics"],
+            source(&before, &fixture.originals[broken])["id"]
+                .as_str()
+                .unwrap(),
+            "private-invalid-value",
+        );
+        assert_eq!(disk(fixture.directory.path()), disk_before);
+        std::fs::write(fixture.path(broken), &fixture.originals[broken]).unwrap();
+    }
+    let external = format!("{}# external editor\n", fixture.originals["main.dae"]);
+    std::fs::write(fixture.path("main.dae"), &external).unwrap();
+    let edited = disk(fixture.directory.path());
+    error(
+        fixture
+            .replace(main, &fixture.originals["main.dae"])
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::PRECONDITION_FAILED,
+        "stale_revision",
+    )
+    .await;
+    assert_eq!(disk(fixture.directory.path()), edited);
+    assert_eq!(fixture.get(CONFIG).await, before);
+    assert!(fixture.get("/api/v1/runtime").await["last_reload"].is_null());
+    assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn source_replacement_preserves_text_mode_and_independent_revision_generation() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let before = fixture.get(CONFIG).await;
+    let main = source(&before, &fixture.originals["main.dae"]);
+    let candidate = fixture.originals["main.dae"].replace("fallback: direct", "fallback: block")
+        + "# café: unchanged UTF-8 comments\n";
+    let operation = accepted(fixture.replace(main, &candidate).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&operation).await;
+    assert_eq!(terminal["status"], "succeeded");
+    assert!(terminal["error"].is_null());
+    assert_eq!(
+        std::fs::read_to_string(fixture.path("main.dae")).unwrap(),
+        candidate
+    );
+    assert_eq!(
+        std::fs::metadata(fixture.path("main.dae"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640
+    );
+    for name in ["auth.dae", "editable.dae", "locked.dae"] {
+        assert_eq!(
+            sha256(&std::fs::read_to_string(fixture.path(name)).unwrap()),
+            sha256(&fixture.originals[name])
+        );
+    }
+    let after = fixture.get(CONFIG).await;
+    assert_ne!(after["generation_id"], before["generation_id"]);
+    assert_ne!(after["revision"], before["revision"]);
+    assert_eq!(
+        terminal["result"]["active_generation_id"],
+        after["generation_id"]
+    );
+    assert_eq!(source(&after, &candidate)["id"], main["id"]);
+    fixture.assert_last_reload(&terminal).await;
+    let include = source(&after, &fixture.originals["editable.dae"]);
+    let comments = format!(
+        "{}# Comments-only accepted edit.\n",
+        fixture.originals["editable.dae"]
+    );
+    let operation = accepted(fixture.replace(include, &comments).send().await.unwrap()).await;
+    let terminal = fixture.terminal(&operation).await;
+    assert_eq!(terminal["status"], "succeeded");
+    let commented = fixture.get(CONFIG).await;
+    assert_eq!(commented["generation_id"], after["generation_id"]);
+    assert_ne!(commented["revision"], after["revision"]);
+    assert_eq!(source(&commented, &comments)["id"], include["id"]);
+    assert_eq!(
+        std::fs::read_to_string(fixture.path("editable.dae")).unwrap(),
+        comments
+    );
+    assert_eq!(
+        std::fs::metadata(fixture.path("editable.dae"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640
+    );
+    fixture.assert_last_reload(&terminal).await;
+    assert_eq!(fixture.reloads.load(Ordering::SeqCst), 2);
+    fixture.shutdown().await;
+}

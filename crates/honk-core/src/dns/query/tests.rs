@@ -104,6 +104,32 @@ fn accepts_questions_at_the_minimum_wire_size_boundary() {
 }
 
 #[test]
+fn canonical_domain_keeps_root_and_rejects_malformed_wire() {
+    for (wire, expected) in [(vec![0], "."), (example_name(true), "example.com")] {
+        let raw = query(0x0100, &[(&wire, 2, 1)], None);
+        let context = QueryContext::parse(&raw).unwrap();
+        assert_eq!(
+            context.qname().unwrap().to_domain_name().as_deref(),
+            Some(expected)
+        );
+        assert!(super::validate_exact_dns_query(&raw).is_some());
+        assert_eq!(
+            crate::dns::forwarder::parse_dns_question(&raw),
+            Some((expected.to_owned(), 2)),
+        );
+    }
+    for wire in [
+        vec![],
+        vec![0, 0],
+        vec![1, b'a', 0, 0],
+        vec![2, b'a'],
+        vec![1, 0xff, 0],
+    ] {
+        assert!(super::DnsName(wire.into()).to_domain_name().is_none());
+    }
+}
+
+#[test]
 fn preserves_exact_question_identity_when_parsed() {
     // Given
     let name = example_name(true);

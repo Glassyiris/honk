@@ -499,6 +499,7 @@ impl Worker {
         let deferred = created
             .filter(|(collection, _)| *collection == "providers")
             .map(|(_, id)| id);
+        self.begin_record(&committed);
         let completion = self
             .activation
             .activate(ActivationRequest {
@@ -510,6 +511,7 @@ impl Worker {
             })
             .await;
         self.record(committed, &completion)
+            .await
             .map_err(|details| unavailable().with_details(details))?;
         completion.map_err(ActivationFailure::management_error)?;
         if mutation.deleting() {
@@ -521,12 +523,21 @@ impl Worker {
         // Capture under the publication barrier before the queue can delete this resource.
         let active = self.active.read().await;
         let value = if collection == "nodes" {
+            let secrets = {
+                let accepted = self.service.sources.accepted.read();
+                self.service
+                    .secrets(accepted.as_ref())
+                    .as_ref()
+                    .clone()
+                    .with_clash(&active.experimental.clash_api.secret)
+            };
             super::super::catalog::node_value(
                 &active,
                 &catalog.snapshot(),
                 &group_manager.read(),
                 alive_set,
                 id,
+                &secrets,
             )
         } else {
             super::super::providers::provider_value(

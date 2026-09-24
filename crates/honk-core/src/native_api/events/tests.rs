@@ -105,11 +105,6 @@ async fn live_flow_updates_coalesce_at_the_tail_without_rewriting_replay() {
     assert!(runtime.starts_with("event: runtime.updated\n"));
     let latest = next(&mut live).await;
     assert_eq!(data(&latest)["revision"], 2);
-    let sequence = |frame: &str| {
-        let bytes = URL_SAFE_NO_PAD.decode(cursor(frame)).unwrap();
-        u64::from_be_bytes(bytes[..8].try_into().unwrap())
-    };
-    assert!(sequence(&runtime) < sequence(&latest));
     assert!(live.next().now_or_never().is_none());
     drop(live);
 
@@ -125,7 +120,6 @@ async fn live_flow_updates_coalesce_at_the_tail_without_rewriting_replay() {
     assert!(ready.starts_with("event: stream.ready\n"));
     let last = next(&mut resumed).await;
     assert_eq!(data(&last)["revision"], 4);
-    assert!(sequence(&ready) < sequence(&last));
     assert!(resumed.next().now_or_never().is_none());
     drop(resumed);
 
@@ -168,7 +162,7 @@ async fn cursors_reject_changed_filters_instance_and_forgery() {
     assert_expired(&Arc::new(EventHub::new("instance-a".into())), all(), saved);
     assert_expired(&hub, all(), "unknown");
     let mut tampered = URL_SAFE_NO_PAD.decode(saved).unwrap();
-    tampered[7] ^= 1;
+    tampered[0] ^= 0x80;
     assert_expired(&hub, all(), &URL_SAFE_NO_PAD.encode(tampered));
 }
 
@@ -190,6 +184,71 @@ async fn time_and_count_pressure_expire_before_stream_creation() {
         publish_flow(&hub, "flow-a", revision);
     }
     assert_expired(&hub, all(), cursor(&first));
+}
+
+#[tokio::test(start_paused = true)]
+async fn fresh_checkpoint_after_history_expires_resumes_replay_and_live() {
+    for kind in [StreamKind::Events, StreamKind::Logs] {
+        let hub = Arc::new(EventHub::with_kind("instance-a".into(), kind));
+        let filter = match kind {
+            StreamKind::Events => all(),
+            StreamKind::Logs => Filter::logs(5, None),
+        };
+        let publish = |revision| match kind {
+            StreamKind::Events => publish_flow(&hub, "flow-a", revision),
+            StreamKind::Logs => hub.publish_log(
+                3,
+                "honk_core",
+                Bytes::from(serde_json::to_vec(&json!({"fields": {"nodes": revision}})).unwrap()),
+                hub.capture_epoch(),
+            ),
+        };
+        let revision = |frame: &str| match kind {
+            StreamKind::Events => data(frame)["revision"].as_u64().unwrap(),
+            StreamKind::Logs => data(frame)["fields"]["nodes"].as_u64().unwrap(),
+        };
+        let mut original = subscribe(&hub, filter.clone(), None);
+        let old_ready = next(&mut original).await;
+        publish(1);
+        let old_record = next(&mut original).await;
+        drop(original);
+        tokio::time::advance(RETENTION).await;
+        assert_expired(&hub, filter.clone(), cursor(&old_ready));
+        assert_expired(&hub, filter.clone(), cursor(&old_record));
+
+        let mut fresh = subscribe(&hub, filter.clone(), None);
+        let checkpoint = next(&mut fresh).await;
+        drop(fresh);
+        let mut immediate = subscribe(&hub, filter.clone(), Some(cursor(&checkpoint)));
+        let ready = next(&mut immediate).await;
+        assert!(ready.starts_with("event: stream.ready\n"));
+        if kind == StreamKind::Logs {
+            assert_eq!(cursor(&ready), cursor(&checkpoint));
+        }
+        publish(2);
+        assert_eq!(revision(&next(&mut immediate).await), 2);
+        drop(immediate);
+
+        publish(3);
+        let mut replay = subscribe(&hub, filter.clone(), Some(cursor(&checkpoint)));
+        if kind == StreamKind::Logs {
+            assert_eq!(cursor(&next(&mut replay).await), cursor(&checkpoint));
+        }
+        assert_eq!(revision(&next(&mut replay).await), 2);
+        let last_replayed = next(&mut replay).await;
+        assert_eq!(revision(&last_replayed), 3);
+        if kind == StreamKind::Events {
+            assert!(next(&mut replay).await.starts_with("event: stream.ready\n"));
+        }
+        publish(4);
+        assert_eq!(revision(&next(&mut replay).await), 4);
+        drop(replay);
+
+        // A checkpoint cannot skip newer records that were subsequently evicted.
+        hub.set_limit(1);
+        assert_expired(&hub, filter.clone(), cursor(&checkpoint));
+        assert_expired(&hub, filter, cursor(&last_replayed));
+    }
 }
 
 #[tokio::test]

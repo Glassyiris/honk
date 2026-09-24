@@ -65,6 +65,8 @@ Known unavailable actions return JSON `404 capability_not_supported`; unknown pa
 
 The native server owns at most 64 HTTP/1.1 connections, pauses acceptance at capacity, bounds header reading to five seconds, and drains connections for at most five seconds before aborting and joining them on shutdown. Idle I/O and stalled writes have separate 30-second deadlines; successful SSE heartbeat writes keep healthy streams alive, while reads cannot extend a blocked writer's deadline. TLS/HTTP2 can terminate at a trusted reverse proxy. Forwarded headers neither rewrite fixed discovery paths nor authorize a Host/Origin.
 
+Password mode closes credential admission before this HTTP grace, then joins its actual blocking credential job. The five-second HTTP budget does not bound that final KDF/database join.
+
 **Documented contract differences:** the discovery `auth` object and the password endpoints are additions not yet in the pin. Hyper can reject malformed/hard-limit HTTP with 400/414/431 or a disconnect before application code; those transport rejections need not carry the JSON envelope or application headers.
 
 Application target/header budgets apply to Hyper's **parsed, normalized representation**, not the original wire bytes. Hyper may remove a request-target fragment or coalesce equal `Content-Length` fields before application counting; oversized original text in those forms can therefore reach a normal response instead of 413. Raw input remains subject to Hyper's transport handling. This is an accepted boundary difference, not a second HTTP parser or a raw-wire size guarantee; body limits still cover all delivered body bytes.
@@ -85,9 +87,13 @@ In token mode, the three password endpoints are unavailable with `404 capability
 
 `expires_at` is an RFC 3339 UTC timestamp. Setup and login require `Content-Type: application/json`, no query string, no unknown JSON fields and a body of at most 4096 bytes. The username is case-sensitive ASCII matching `[A-Za-z0-9_.-]{1,64}`. The password is 8–128 Unicode scalar values and at most 512 UTF-8 bytes. Invalid JSON or fields return `400 invalid_request`; a missing or different media type returns `415 unsupported_media_type`.
 
+Media types are case-insensitive. Duplicate or non-text `Content-Type` values return `400 invalid_request`; configuration, authentication, probes and routing diagnostics share this JSON/header parser.
+
 Setup trusts only the peer address from the accepted socket, never `Forwarded`, `X-Forwarded-For` or another header. It permits `127.0.0.0/8`, `::1`, RFC 1918, `fc00::/7`, `169.254.0.0/16` and `fe80::/10`; IPv4-mapped IPv6 is classified as IPv4. Other peers receive `403 permission_denied` before account-state or credential processing.
 
 Setup and login admit at most five attempts per canonical peer and ten attempts across all peers in each one-minute window. Five consecutive credential failures impose a 60-second global lock. A rejected attempt returns `429 rate_limited` with `Retry-After`; these counters and the lock are process-local.
+
+Only one credential job runs at a time, off Tokio workers; overlapping attempts return 429 with `Retry-After: 1`. HTTP cancellation neither frees that slot nor discards its credential outcome. Discovery reads short-lived credential state, not a lock held across KDF or database I/O.
 
 Session tokens are opaque `hnk1_…` values used as `Authorization: Bearer <session>`. Each has a fixed 12-hour lifetime. The process retains only SHA-256 token digests, keeps at most 32 live sessions and evicts the oldest when issuing another; restart ends every session. Operations started through a configured secret or password login belong to the administrator rather than to one token, so logout does not delete them.
 
@@ -95,9 +101,13 @@ Password mode stores one credential record in the `admin` row of the state db, `
 
 The record uses PBKDF2-HMAC-SHA256 with 100,000 iterations and a fresh 16-byte random salt. Password mode uses the configured `global.data_dir` itself: if that directory is unusable, startup fails instead of falling back to another directory, where setup would reopen. First setup inserts the row without replacing an existing one, so of two processes racing setup on one state db exactly one wins. If the db is busy before anything is written, setup fails and can be retried. If the insert or its commit fails for any other reason, the process refuses login and a second setup until it restarts, because the row may or may not be durable.
 
+Once setup claims the credential state, discovery reports `setup_required:false`, including while durability is indeterminate. An indeterminate write returns 503 with `durability_confirmed:false` without claiming `written:true`; restart is required to establish the stored account state.
+
 Releases before the state db kept the record in `<data_dir>/native-api/admin.json`. With `password_auth`, the first start imports it once (an existing row wins), then deletes the file and removes `native-api/` if it is empty; the old file must pass the same ownership and mode checks as before. Without `password_auth` the file is left alone. An older binary started afterwards finds no `admin.json` and opens setup again.
 
 There is no HTTP password reset. To recover access, stop honk, run `honk-core admin reset`, restart, and run setup again. Moving `<data_dir>/state` aside also works but discards every other persisted state.
+
+Reset takes the exclusive state-directory lock before checking whether the database exists, so it cannot race the first startup's legacy import. Legacy credential files must still pass ownership, mode and regular-file checks.
 
 ### Recorded userspace flows (M2)
 
@@ -125,7 +135,10 @@ Flow list filters are `network`, `state`, `connection_id`, `detail`, `limit` and
 
 Node reads accept `group_id`, `limit` (1–1000) and `cursor`; filtering is direct membership, not recursive leaves. Node pages freeze observations across up to eight snapshots, 30 seconds and 4 MiB. Invalidated or filter-mismatched node cursors return 400. Groups return a summary array; detail returns a quoted ETag matching its configuration-only revision. Group IDs are random process-lifetime identities: same-name reload/reorder retains them, removal/readdition creates new IDs, and restart requires rediscovery. They are not positional config UUIDs or name hashes.
 
-Health rows are completed, qualified producer observations—not optimistic alive flags, copied IPv4/IPv6 ranking signals, synthetic failures or restored delays. Raw TCP, HTTP response headers, DNS exchanges and QUIC handshakes retain actual destination family and completion time. Unknown averages/ranking/warmth remain null/unknown. Group-specific samples preserve the measured member and leaf rather than rebinding to a later selection. GET never advances URLTest, round-robin or Score state. Group `icon` passes through the configured validated HTTP(S) URL or data URI; absent icons are null, never guessed.
+Node names, subscription tags, group names/member names, icons, check URLs, final-outbound labels and outbound-counter names use the same listener-secret mask as source/flow displays. Node snapshots are masked before bounded serialization; resumed pages retain those masked bytes. Opaque IDs, revision hashes, membership and cursor bindings are unchanged.
+The existing masking threshold still applies: listener-secret values shorter than eight bytes are not masked; startup warns about them.
+
+Health rows are completed, qualified producer observations—not optimistic alive flags, copied IPv4/IPv6 ranking signals, synthetic failures or restored delays. Raw TCP, HTTP response headers, DNS exchanges and QUIC handshakes retain actual destination family and completion time. Unknown averages/ranking/warmth remain null/unknown. Group-specific samples preserve the measured member and leaf rather than rebinding to a later selection. GET never advances URLTest, round-robin or Score state. Group `icon` is the configured validated HTTP(S) URL or data URI, subject to listener-secret masking; absent icons are null, never guessed.
 
 `PUT /groups/{groupId}/selection` takes `{"member_id":"<direct-member-id>","network":"tcp"}`; `network` is required and also accepts `udp` or `both`. Only Selector groups support manual selection. One owner validates both networks before publishing `both`; a TCP-only write leaves UDP unchanged. Writes serialize with manager replacement, update existing persistence/warm consumers, and return the committed `selection_revision` and actual `connections_interrupted`. Clash writes both networks and displays the TCP projection. With `interrupt_connections: true`, affected pre-transition transports are closed by their captured group path and network, not by deleting tracker rows or matching today's leaf names. Automatic-policy pin/clear remains unavailable (`can_override:false`), including DELETE selection: the frozen combined-network response cannot represent divergent or absent choices.
 
@@ -136,6 +149,8 @@ Patch availability and `mutable_config` depend on the actual source's write perm
 ### Native events (M4)
 
 Use streaming fetch with Bearer and `Accept: text/event-stream`; browser EventSource cannot supply the required Authorization header. Optional `kinds` and `flow_id` filters bind the resume cursor. The store retains 512 events for at most 60 seconds, with 16 clients and 64 queued live events per client; a full client queue disconnects rather than silently skipping. Heartbeat comments arrive every 15 seconds. Fresh streams send ready first; valid resume sends retained replay, then ready, then live events without an attachment gap. Expired, unknown, previous-instance or changed-filter cursors return `409 event_cursor_expired` before HTTP 200.
+
+Ready cursors are opaque checkpoints, not retained event records. A newly issued checkpoint remains resumable when older history has already expired; it does not revive an evicted record cursor or survive loss of a newer event. Age, filter, instance and recording-reset checks still apply. Compare delivery/replay positions, not cursor bytes.
 
 Published events are `stream.ready`, `runtime.updated`, `flow.updated`, `flow.gap`, `generation.changed` and `operation.updated`. Operation events reflect actual admitted work, not only reloads; generation events originate at accepted publication, not request receipt. Events contain bounded safe IDs/state, not packet bodies or raw configuration. Flow/event retention is memory-only, not a durable log.
 
@@ -183,11 +198,13 @@ Listener secrets are stored apart from the revisions and never returned. Writes 
 
 A write is activated first and recorded after. The revision row and `head` move only once activation commits, including degraded and reconciliation-failed commits; a rejected activation adds no row and reports `written:false`. If recording fails, the operation fails with `details {stage:"store",committed:true,durable:false}`. If the engine stops before confirming activation, it fails with `details {stage:"store",committed:null}`. After either, `store.recorded` is false, capabilities report the config as not writable, the export filename carries no revision, and writes return `503 temporarily_unavailable` with `details.stage:"store"`. Activating the `head` revision re-activates it without a new row and clears the state; so does a restart, which runs `head`. Retention keeps at most 50 revisions and 16 MiB of stored JSON, pruning the oldest first and never the active one. JSON escaping can make a revision larger than its sources, and a revision whose JSON alone exceeds 16 MiB is refused.
 
+Between publishing new accepted sources and completing their durable record, `store.recorded` is false and export uses `honk.dae`; `revision` and `parent` still describe the durable head. Reads of unchanged old accepted sources can remain recorded. The coordinator awaits blocking SQLite promotion before finishing the operation, processing its next mutation or acknowledging shutdown.
+
 `GET /config` carries `store {kind, revision, parent, recorded}`, where `kind` is `file` or `db`. Capabilities add `config.store`, `config_export {available}`, `config_import {available, replace_required}` and `config_revisions {available, can_activate, max_revisions}`. Discovery links `config_export`, `config_import` and `config_revisions`.
 
 - `GET /config/export` returns the accepted sources as one inlined document: `text/plain; charset=utf-8`, `Content-Disposition: attachment; filename="honk-r<n>.dae"` (`honk.dae` in file mode), a strong `ETag` over the body and `Cache-Control: no-store`. Listener secrets are left out, and when any were the body starts with `# listener secrets omitted`; add them back before running it. Available in both modes.
 - `POST /config/import` (db mode, writable) takes strict JSON `{"replace":bool}` and a required `Idempotency-Key`. It re-reads the `-c` tree and records it through a reload operation as a new revision with origin `import`. Startup always records revision 1, so `replace:true` is required and anything else returns `409 already_initialized`. A secret copy that survives stripping returns `422 unsupported_value`. The tree must keep the entry path, listener secrets, `native_api` settings and `data_dir`; otherwise 403.
-- `GET /config/revisions` (db mode) returns `{active, max_revisions, revisions:[{revision, parent, created_at, principal, origin, content_sha256, bytes, sources:[{path, sha256}]}]}`, newest first and without content.
+- `GET /config/revisions` (db mode) returns `{active, max_revisions, revisions:[{revision, parent, created_at, principal, origin, content_sha256, bytes, sources:[{path, sha256}]}]}`, newest first and without content. `active` and rows share one database snapshot; `parent` becomes null if retention removes that parent revision.
 - `POST /config/revisions/{n}/activate` (db mode, writable) takes an empty body or `{}` and an optional `Idempotency-Key`. It validates revision `n`, activates it and records it as a new revision with origin `activate`. Activating the active revision is a no-op unless `store.recorded` is false; an unknown `n` returns `404 resource_not_found`.
 
 In file mode, import and the revision routes return `404 capability_not_supported`.
@@ -205,6 +222,8 @@ Limits are 64 member associations, 256 projected rows, four active jobs, 16 queu
 ### DNS query, cache and outcome history
 
 `GET /dns/query` requires `domain`; repeat `type` for up to eight distinct record types (default A). Supported types are A, AAAA, NS, CNAME, SOA, PTR, MX, TXT, SRV, SVCB, HTTPS and CAA. Optional fields are `detail=summary|full`, `cache_mode=normal|bypass` and a configured `upstream` name, including an otherwise unreferenced upstream. One generation and ten-second deadline cover all types; the rate ceiling is 30/minute for the sole principal and globally. Forced upstream replaces request-stage routing, not hosts/strategy precedence or response policy: a local-host answer still reports default route and no upstream. `bypass` neither reads nor writes positive/negative/stale cache, joins a writing singleflight, supersedes entries, nor starts refresh work. Full detail projects validated answer records; per-type timeout/refusal/error remains an actual outcome.
+
+Literal `.` names the DNS root and works for live queries, exact cache listing and name-based deletion. Ordinary input names are case-insensitive with an optional trailing dot; presented names retain their canonical trailing dot. Valid root wire questions also use the ordinary strict DNS path; non-UTF-8 labels remain outside that consumer contract.
 
 `GET /dns/cache` accepts `name`, `domain`, repeated `type`, `include_expired=false|true`, `detail`, `limit` (1–1000, default 100) and `cursor`. Reads neither promote LRU nor count hits. Up to eight immutable filter/instance-bound snapshots live for 30 seconds within an aggregate 8 MiB wire/metadata budget; exhausted capacity returns 503 rather than clipping. Coverage is the runtime cache (`persistent:false`), not a SQLite inventory. Opaque `entry_id` identifies an exact cache incarnation, not merely a name/type.
 

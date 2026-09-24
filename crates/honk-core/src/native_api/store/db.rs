@@ -143,6 +143,8 @@ pub(crate) struct DbStore {
     secrets: Mutex<ListenerSecrets>,
     #[cfg(test)]
     pub(crate) fail_promote: AtomicBool,
+    #[cfg(test)]
+    lose_commit_reply: AtomicBool,
 }
 
 impl DbStore {
@@ -176,6 +178,8 @@ impl DbStore {
             secrets: Mutex::new(secrets),
             #[cfg(test)]
             fail_promote: AtomicBool::new(false),
+            #[cfg(test)]
+            lose_commit_reply: AtomicBool::new(false),
         })
     }
 
@@ -229,10 +233,12 @@ impl DbStore {
         &self.import_entry
     }
 
-    /// Newest first.
-    pub(crate) fn revisions(&self) -> Result<Vec<RevisionInfo>, StoreError> {
-        let connection = self.state.strict();
-        let mut statement = connection
+    /// The durable head and its revision list, newest first, from one read transaction.
+    pub(crate) fn revisions(&self) -> Result<(Option<i64>, Vec<RevisionInfo>), StoreError> {
+        let mut connection = self.state.strict();
+        let transaction = connection.transaction().map_err(sql)?;
+        let active = head(&transaction)?;
+        let mut statement = transaction
             .prepare(
                 "SELECT number, parent, created_at, principal, origin, content_sha256, bytes, sources
                  FROM revision ORDER BY number DESC",
@@ -269,7 +275,7 @@ impl DbStore {
                 .collect();
             revisions.push(info);
         }
-        Ok(revisions)
+        Ok((active, revisions))
     }
 
     /// Loads revision `number` as the loader sees it, secrets re-applied.
@@ -522,17 +528,30 @@ impl DbStore {
             .execute("UPDATE head SET active = ?1 WHERE id = 1", [number])
             .map_err(write_sql)?;
         prune(&transaction, number).map_err(write_sql)?;
-        if let Err(error) = transaction.commit() {
+        let promoted = head_and_parent(&transaction).map_err(|_| WriteError::Unavailable)?;
+        let committed = transaction.commit();
+        #[cfg(test)]
+        let committed = committed.and_then(|()| {
+            if self.lose_commit_reply.swap(false, Ordering::AcqRel) {
+                Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                    None,
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = committed {
             log_sql(&error);
-            return match head(&connection) {
-                Ok(Some(active)) if active == number => {
-                    *self.head.lock() = Some((number, Some(pending.parent)));
+            return match head_and_parent(&connection) {
+                Ok(Some((active, parent))) if active == number => {
+                    *self.head.lock() = Some((active, parent));
                     Ok(number)
                 }
                 _ => Err(WriteError::Unavailable),
             };
         }
-        *self.head.lock() = Some((number, Some(pending.parent)));
+        *self.head.lock() = promoted;
         Ok(number)
     }
 

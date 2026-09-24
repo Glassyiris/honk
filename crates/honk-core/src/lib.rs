@@ -1167,10 +1167,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .or(state_db);
     let legacy_cache = {
         let (path, cache_id) = config.experimental.cache_file.legacy_cache_file();
-        let config_dir = match cli.store {
-            ConfigStore::File => cli.config.parent(),
-            ConfigStore::Db => Some(cli.data_dir.as_path()),
-        };
+        let config_dir = cli.config.parent();
+        #[cfg(feature = "native-api")]
+        let config_dir = database
+            .as_ref()
+            .map_or(config_dir, |database| database.store.entry().parent());
         state::import::LegacyCache::locate(path, cache_id, config_dir)
     };
     if let Some(path) = log_file_path.as_ref() {
