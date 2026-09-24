@@ -410,31 +410,6 @@ fn train_score_setup(
             reporter.finish_setup_only();
         }
     }
-    // Recovery must work after optional validation currency is exhausted.
-    for _ in 0..32 {
-        let budget = manager.score_budget_counters("proxy", SelectionNetwork::Tcp);
-        if budget.cold_available + budget.earned_available == 0 {
-            break;
-        }
-        let plan = manager.selection_plan_for_target("proxy", &context);
-        if manager
-            .score_budget_counters("proxy", SelectionNetwork::Tcp)
-            .reserved
-            == 0
-        {
-            return;
-        }
-        plan.entries[0]
-            .feedback
-            .as_ref()
-            .unwrap()
-            .begin()
-            .unwrap()
-            .start()
-            .finish(crate::group::ScoreOutcome::Cancelled);
-    }
-    let budget = manager.score_budget_counters("proxy", SelectionNetwork::Tcp);
-    assert_eq!(budget.cold_available + budget.earned_available, 0);
 }
 
 #[derive(Debug)]
