@@ -87,7 +87,7 @@ Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒
 | `external_ui_download_url` | `""` | HTTP(S) dashboard ZIP URL。空值使用内建 zashboard URL。 |
 | `external_ui_download_detour` | `""` | 下载使用的节点或组 tag。空值遵循普通流量路由。 |
 | `secret` | `""` | API 鉴权 secret。空值关闭鉴权。短于 8 字节的值在原生 API 响应里不遮蔽。 |
-| `default_mode` | `"Rule"` | 启动模式：`Rule`、`Global` 或 `Direct`。有效的缓存模式优先。 |
+| `default_mode` | `"Rule"` | 启动模式：`Rule`、`Global` 或 `Direct`。`cache_file.enabled: true` 时有效的缓存模式优先。 |
 
 所有 `clash_api` 字段都由启动阶段持有。通过 SIGHUP 提交的候选配置只要修改其中任一字段就会被拒绝。
 
@@ -107,14 +107,14 @@ Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒
 
 ### 启动模式
 
-`default_mode` 接受规范模式 `Rule`、`Global` 和 `Direct`。`cache_file` 已启用且包含有效的 Clash 缓存模式时，改为恢复该值。无效的缓存值或配置值回退到 `Rule`。
+`default_mode` 接受规范模式 `Rule`、`Global` 和 `Direct`。`cache_file.enabled` 为 `true` 且包含有效的 Clash 缓存模式时，改为恢复该值。无效的缓存值或配置值回退到 `Rule`。
 
 ## `cache_file`
 
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
-| `enabled` | `false` | 在状态数据库 `<data_dir>/state/honk.db` 中持久化运行时状态。 |
-| `store_dns` | `false` | 同时持久化并恢复 DNS 缓存应答。 |
+| `enabled` | 未设置 | 在状态数据库 `<data_dir>/state/honk.db` 中持久化运行时状态。未设置时保存 Selector 选择与延迟样本；`true` 时还保存 Clash 模式与 GLOBAL 选择，并允许 `store_dns`；`false` 时不保存任何状态。 |
+| `store_dns` | `false` | 在 `enabled: true` 时同时持久化并恢复 DNS 缓存应答。 |
 
 两个字段都由启动阶段持有；SIGHUP 提交的候选配置修改其中任一字段时会被拒绝。
 
@@ -122,7 +122,7 @@ Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒
 
 ### 持久化的状态
 
-启用 `enabled` 后，honk 在状态数据库中保存 TCP/UDP 各自的 Selector 选择和每个节点最后一次真实延迟样本，与 `store_dns` 无关。只有 native API 未启用时才恢复和保存 Clash 模式与 Clash GLOBAL 选择。延迟样本每分钟批量写入一次；恢复时丢弃为零或超过 24 小时的样本。存活状态不恢复。
+除非 `enabled` 为 `false`，honk 在状态数据库中保存 TCP/UDP 各自的 Selector 选择和每个节点最后一次真实延迟样本，与 mihomo 的 `store-selected` 一致。只有 `enabled: true` 且 native API 未启用时，才恢复和保存 Clash 模式与 Clash GLOBAL 选择；其他情况下重启后使用 `default_mode`。延迟样本每分钟批量写入一次；恢复时丢弃为零或超过 24 小时的样本。存活状态不恢复。
 
 状态数据库损坏且未设置 `--store db` 与 `native_api.password_auth` 时，honk 在取得实例锁后把 `honk.db` 与 `honk.db-wal` 改名为 `honk.db.corrupt` 与 `honk.db.corrupt-wal`，再创建新文件。如果 `honk.db.corrupt` 已经存在，honk 保留两份文件，在其中一份被删除前不做持久化。同样条件下，状态数据库不可用、不安全（不是 honk 用户所有的私有文件）或被 `honk-core admin reset` 锁定时，honk 也记录警告并在不做持久化的情况下运行。来自更新版本 honk 或其他程序的数据库在任何模式下都拒绝启动，因为移走它会毁掉只有该程序才能读取的数据。
 
@@ -130,7 +130,7 @@ Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒
 
 维护任务每 60 秒执行一次。Selector 选择只为配置中的 Selector 组保留，延迟样本只为已配置的节点保留；组或节点连续两次维护时都不在配置中，对应的行才会删除，因此 reload 短暂移除后又恢复的组或节点仍保留原记录。每次维护都会删除超过 24 小时的延迟样本和已过期的 DNS 行，并把至多 1 MiB 的空闲页归还给文件系统。DNS 行最多保留 4,096 条，每批写入后先淘汰最早过期的行。
 
-启动过程打开状态数据库时（`--store db`、`password_auth`、`store_subscribe` 或 `cache_file.enabled` 需要它），`enabled: false` 会清空 Selector、延迟、Clash 状态与 DNS 表；`store_dns: false` 清空 DNS 表；启用 native API 或未启用 Clash API 时清空 Clash 状态表。不打开状态数据库的启动不改动该文件。
+启动过程打开状态数据库时（`--store db`、`password_auth`、`store_subscribe` 或 `cache_file` 需要它），`enabled: false` 会清空 Selector、延迟、Clash 状态与 DNS 表；未设置 `enabled` 时清空 Clash 状态与 DNS 表；`store_dns: false` 清空 DNS 表；启用 native API 或未启用 Clash API 时清空 Clash 状态表。不打开状态数据库的启动不改动该文件。
 
 状态数据库文件上限为 112 MiB。缓存写入为配置 revision 与订阅正文保留其中 24 MiB：某批写入会使已用空间超过 88 MiB 时，写入线程先把 DNS 行删减到 2,048 条，仍然超出时回滚该批写入；被跳过的 DNS 条目计入 `budget_skipped`，不计为已写入。旧 `cache.db` 的导入受同一预算约束：会超出预算的复制不提交，下次启动时重试。
 

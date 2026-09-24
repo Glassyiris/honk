@@ -84,7 +84,7 @@ Probe requests cannot supply URLs or allowlist exceptions. For an intentionally 
 | `external_ui_download_url` | `""` | HTTP(S) dashboard ZIP URL. An empty value uses the built-in zashboard URL. |
 | `external_ui_download_detour` | `""` | Node or group tag used for the download. An empty value follows normal traffic routing. |
 | `secret` | `""` | API authentication secret. An empty value disables authentication. A value shorter than 8 bytes is not masked in native API responses. |
-| `default_mode` | `"Rule"` | Startup mode when native API is disabled: `Rule`, `Global`, or `Direct`; a valid cached mode takes precedence. Native-enabled startup uses shared transient rule mode instead. |
+| `default_mode` | `"Rule"` | Startup mode when native API is disabled: `Rule`, `Global`, or `Direct`; with `cache_file.enabled: true`, a valid cached mode takes precedence. Native-enabled startup uses shared transient rule mode instead. |
 
 All `clash_api` fields are startup-owned. SIGHUP rejects a candidate configuration that changes any of them.
 
@@ -104,14 +104,14 @@ A non-empty `external_ui_download_detour` forces the initial request and every r
 
 ### Startup mode
 
-With native disabled, `default_mode` accepts `Rule`, `Global`, and `Direct`; a valid cached Clash mode takes precedence, and invalid values fall back to `Rule`. With native enabled, both APIs use one transient mode owner: no mode restore/persistence, rule at startup and every accepted explicit activation (including no-op), and preservation across provider/network refresh or suspend/resume. Native global mode targets a stable node/group identity and fails closed if refresh removes it. See [runtime mode](./api.md#connection-closing-mode-and-datapath-lifecycle).
+With native disabled, `default_mode` accepts `Rule`, `Global`, and `Direct`; with `cache_file.enabled: true`, a valid cached Clash mode takes precedence, and invalid values fall back to `Rule`. With native enabled, both APIs use one transient mode owner: no mode restore/persistence, rule at startup and every accepted explicit activation (including no-op), and preservation across provider/network refresh or suspend/resume. Native global mode targets a stable node/group identity and fails closed if refresh removes it. See [runtime mode](./api.md#connection-closing-mode-and-datapath-lifecycle).
 
 ## `cache_file`
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `false` | Persist runtime state in the state db, `<data_dir>/state/honk.db`. |
-| `store_dns` | `false` | Also persist and restore DNS cache answers. |
+| `enabled` | unset | Persist runtime state in the state db, `<data_dir>/state/honk.db`. Unset keeps Selector choices and delay samples; `true` also keeps the Clash mode and GLOBAL selection and allows `store_dns`; `false` keeps nothing. |
+| `store_dns` | `false` | With `enabled: true`, also persist and restore DNS cache answers. |
 
 Both fields are startup-owned; SIGHUP rejects a candidate configuration that changes either.
 
@@ -119,7 +119,7 @@ Both fields are startup-owned; SIGHUP rejects a candidate configuration that cha
 
 ### Persisted state
 
-With `enabled`, honk keeps per-network Selector choices and each node's last real delay sample in the state db, independently of `store_dns`. Clash mode and the Clash GLOBAL selection are restored and persisted only with native API disabled. Delay samples are written as one batch every minute; restoration discards zero samples and samples older than 24 hours. Liveness is not restored.
+Unless `enabled` is `false`, honk keeps per-network Selector choices and each node's last real delay sample in the state db, like mihomo's `store-selected`. Only `enabled: true` also restores and persists the Clash mode and the Clash GLOBAL selection, and only with native API disabled; otherwise a restart starts in `default_mode`. Delay samples are written as one batch every minute; restoration discards zero samples and samples older than 24 hours. Liveness is not restored.
 
 If the state db is corrupt and neither `--store db` nor `native_api.password_auth` is set, honk moves `honk.db` and `honk.db-wal` aside as `honk.db.corrupt` and `honk.db.corrupt-wal` once it holds the instance lock, and starts a new file. If `honk.db.corrupt` already exists, it keeps both files and runs without persistence until one is removed. In the same case a state db that is unavailable, unsafe (not a private file owned by the honk user) or locked by `honk-core admin reset` also leaves honk running without persistence, with a warning. A db from a newer honk or another program refuses startup in every mode, because moving it aside would destroy data only that program can read.
 
@@ -127,7 +127,7 @@ If the state db is corrupt and neither `--store db` nor `native_api.password_aut
 
 A maintenance tick runs every 60 seconds. A Selector choice is kept only for a Selector group in the configuration, and a delay sample only for a configured node; a row whose group or node is missing at two consecutive ticks is deleted, so a reload that briefly drops one keeps its row. Delay samples older than 24 hours and expired DNS rows are deleted at each tick, and each tick returns up to 1 MiB of freed pages to the filesystem. At most 4,096 DNS rows are kept; after each batch the earliest expiry is evicted first.
 
-When a start opens the state db (because `--store db`, `password_auth`, `store_subscribe` or `cache_file.enabled` needs it), `enabled: false` empties the Selector, delay, Clash-state and DNS tables, `store_dns: false` empties the DNS table, and an enabled native API or a disabled Clash API empties the Clash-state table. A start that opens no state db leaves the file as it is.
+When a start opens the state db (because `--store db`, `password_auth`, `store_subscribe` or `cache_file` needs it), `enabled: false` empties the Selector, delay, Clash-state and DNS tables, an unset `enabled` empties the Clash-state and DNS tables, `store_dns: false` empties the DNS table, and an enabled native API or a disabled Clash API empties the Clash-state table. A start that opens no state db leaves the file as it is.
 
 The state db file is capped at 112 MiB. Cache writes keep 24 MiB of it free for configuration revisions and subscription bodies: when a batch would leave more than 88 MiB in use, the writer first deletes DNS rows down to 2,048, and rolls the batch back if that is not enough; skipped DNS entries are counted as `budget_skipped`, not as written. The legacy `cache.db` import obeys the same budget: a copy that would pass it is not committed, and the next start tries again.
 
