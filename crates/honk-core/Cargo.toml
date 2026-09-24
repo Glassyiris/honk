@@ -91,6 +91,7 @@ parking_lot.workspace = true
 dashmap.workspace = true
 libsystemd.workspace = true
 nix.workspace = true
+rustix.workspace = true
 sha2.workspace = true
 aes-gcm.workspace = true
 hkdf.workspace = true

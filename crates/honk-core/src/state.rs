@@ -350,13 +350,15 @@ pub fn reset_corrupt(data_dir: &Path) -> Result<Option<StateDb>, StateError> {
     }
     // The `-wal` moves first: a crash in between must not leave it beside a new file.
     for (from, to) in [("honk.db-wal", "honk.db.corrupt-wal"), (DB_FILE, CORRUPT)] {
-        match nix::fcntl::renameat2(
+        match rustix::fs::renameat_with(
             &*directory,
             from,
             &*directory,
             to,
-            nix::fcntl::RenameFlags::RENAME_NOREPLACE,
-        ) {
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| Errno::from_raw(error.raw_os_error()))
+        {
             Ok(()) | Err(Errno::ENOENT) => {}
             Err(Errno::EEXIST) => {
                 tracing::warn!(

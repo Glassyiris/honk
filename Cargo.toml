@@ -134,6 +134,7 @@ nix = { version = "0.31", features = [
     "resource",
     "zerocopy",
 ] }
+rustix = { version = "1.1", features = ["fs"] }
 pin-project-lite = "0.2"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
