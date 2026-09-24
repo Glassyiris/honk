@@ -926,6 +926,27 @@ fn cross_target_latency_is_not_node_degradation() {
 }
 
 #[test]
+fn qualification_blocker_stays_visible_behind_missing_availability() {
+    let nodes = [node("qualified"), node("untried")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let now = Instant::now();
+    train_at(
+        &manager,
+        &nodes[0],
+        &target,
+        20,
+        Duration::from_millis(10),
+        1,
+        now,
+    );
+    let report = verification_at(&manager, &nodes, &target, now + Duration::from_secs(2));
+    assert_eq!(report.question, ScoreEvidenceQuestion::Availability);
+    assert_eq!(report.blockers.availability, 1);
+    assert_eq!(report.blockers.qualification, 1);
+}
+
+#[test]
 fn partial_success_cannot_pin_a_cancelled_validation_run_forever() {
     let nodes = [node("working"), node("partial"), node("other")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);

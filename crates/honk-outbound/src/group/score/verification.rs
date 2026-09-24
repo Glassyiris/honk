@@ -468,7 +468,7 @@ pub(super) fn evaluate(
         blockers.recovery += usize::from(candidate.question == ScoreEvidenceQuestion::Recovery);
         blockers.backoff += usize::from(candidate.backed_off && candidate.pending());
         blockers.qualification +=
-            usize::from(candidate.question == ScoreEvidenceQuestion::Qualification);
+            usize::from(baseline.any_qualified && !snapshots[index].qualified());
         blockers.availability += usize::from(candidate.availability_missing);
         match candidate.response_gap {
             ResponseGap::Missing => blockers.response_missing += 1,
