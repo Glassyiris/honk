@@ -99,230 +99,147 @@ async fn stalled_carrier_writer_times_out() {
     driver.await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn competing_carrier_failures_preserve_pending_udp_send_and_tcp_flush_causes() {
-    let (client, mut wire) = tokio::io::duplex(1 << 16);
-    let gate = Arc::new(FlushGate::default());
-    gate.open();
-    let session = connect(
-        Box::new(GatedFlushIo {
-            inner: client,
-            gate: Arc::clone(&gate),
-        }),
-        2,
-    );
-    let mut tcp = open_tcp(
-        Arc::clone(&session),
-        session.try_reserve().unwrap(),
-        "127.0.0.1:80".parse().unwrap(),
-        None,
-    )
-    .await
-    .unwrap_or_else(|_| panic!("TCP stream must open"));
-    let _ = read_wire_frame(&mut wire).await;
-    let udp = open_udp(
-        Arc::clone(&session),
-        session.try_reserve().unwrap(),
-        udp_target(),
-        None,
-    )
-    .await
-    .unwrap_or_else(|_| panic!("UDP transport must open"));
+#[derive(Clone, Copy, Debug)]
+enum PendingTcp {
+    /// Queued write whose acknowledgement a pending flush awaits.
+    Flush,
+    /// Write refused admission by a full writer queue.
+    Reserve,
+}
 
-    gate.close();
-    let blocker = session.writer.flush();
-    tokio::pin!(blocker);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), &mut blocker)
-            .await
-            .is_err()
-    );
-    tcp.write_all(b"queued behind the blocked flush")
-        .await
-        .unwrap();
-    let admitted = AtomicBool::new(false);
-    let send = udp.send_to(udp_target(), None, b"query", Some(&admitted));
-    tokio::pin!(send);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), &mut send)
-            .await
-            .is_err()
-    );
-    assert!(admitted.load(Ordering::Acquire));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), tcp.flush())
-            .await
-            .is_err()
-    );
-
-    // Pause the winning reader failure after publication but before child fanout.
-    // The writer must then lose publication before dropping its queued acknowledgements.
-    let (entered, paused) = oneshot::channel();
-    let (release, resumed) = std::sync::mpsc::channel();
-    let waker = Waker::from(Arc::new(PauseWake {
-        entered: Mutex::new(Some(entered)),
-        release: Mutex::new(resumed),
-    }));
-    let capacity = session.capacity.acquire();
-    tokio::pin!(capacity);
-    assert!(
-        capacity
-            .as_mut()
-            .poll(&mut Context::from_waker(&waker))
-            .is_pending()
-    );
-    drop(wire);
-    let paused = tokio::time::timeout(Duration::from_secs(2), paused).await;
-    if !matches!(paused, Ok(Ok(()))) {
-        let _ = release.send(());
-    }
-    paused
-        .expect("reader failure must publish its cause")
-        .unwrap();
-    gate.open();
-
-    let sent = tokio::time::timeout(Duration::from_secs(2), &mut send).await;
-    let flushed = tokio::time::timeout(Duration::from_secs(2), tcp.flush()).await;
-    let received = tokio::time::timeout(Duration::from_secs(2), udp.recv_packet(&mut [0; 1])).await;
-    release.send(()).unwrap();
-    let send_error = sent
-        .expect("writer death must settle the pending UDP send before child fanout")
-        .unwrap_err();
-    let flush_error = flushed
-        .expect("writer death must settle the pending TCP flush before child fanout")
-        .unwrap_err();
-    let recv_error = received
-        .expect("failed UDP send must settle its receiver before child fanout")
-        .unwrap_err();
-    for error in [send_error, flush_error, recv_error] {
-        assert_eq!(
-            crate::group::ScoreOutcome::from_io_error(&error),
-            crate::group::ScoreOutcome::NodeFailure
-        );
-        let kind = error.kind();
-        let error = anyhow::Error::new(error);
-        assert_eq!(kind, io::ErrorKind::UnexpectedEof);
-        assert_eq!(
-            error
-                .root_cause()
-                .downcast_ref::<io::Error>()
-                .unwrap()
-                .kind(),
-            kind
-        );
+async fn pending_tcp_op(
+    tcp: &mut (impl AsyncWrite + Unpin),
+    pending: PendingTcp,
+) -> io::Result<()> {
+    match pending {
+        PendingTcp::Flush => tcp.flush().await,
+        PendingTcp::Reserve => tcp.write(b"not admitted").await.map(drop),
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn carrier_failure_precedes_child_fanout_for_tcp_reserve_and_udp_receive() {
-    let (client, mut wire) = tokio::io::duplex(1 << 16);
-    let gate = Arc::new(FlushGate::default());
-    gate.open();
-    let session = connect(
-        Box::new(GatedFlushIo {
-            inner: client,
-            gate: Arc::clone(&gate),
-        }),
-        2,
-    );
-    let mut tcp = open_tcp(
-        Arc::clone(&session),
-        session.try_reserve().unwrap(),
-        "127.0.0.1:80".parse().unwrap(),
-        None,
-    )
-    .await
-    .unwrap_or_else(|_| panic!("TCP stream must open"));
-    let _ = read_wire_frame(&mut wire).await;
-    let udp = open_udp(
-        Arc::clone(&session),
-        session.try_reserve().unwrap(),
-        udp_target(),
-        None,
-    )
-    .await
-    .unwrap_or_else(|_| panic!("UDP transport must open"));
-
-    gate.close();
-    let blocker = session.writer.flush();
-    tokio::pin!(blocker);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), &mut blocker)
-            .await
-            .is_err()
-    );
-    tcp.write_all(b"fail after carrier EOF").await.unwrap();
-    let admitted = AtomicBool::new(false);
-    let send = udp.send_to(udp_target(), None, b"query", Some(&admitted));
-    tokio::pin!(send);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), &mut send)
-            .await
-            .is_err()
-    );
-    assert!(admitted.load(Ordering::Acquire));
-    for _ in 2..WRITER_QUEUE_CAPACITY {
-        tcp.write_all(b"queued").await.unwrap();
-    }
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), tcp.write(b"not admitted"))
-            .await
-            .is_err()
-    );
-
-    // Closing capacity wakes this waiter after storing the carrier cause but
-    // before touching children. Pause there without any production test hook.
-    let (entered, paused) = oneshot::channel();
-    let (release, resumed) = std::sync::mpsc::channel();
-    let waker = Waker::from(Arc::new(PauseWake {
-        entered: Mutex::new(Some(entered)),
-        release: Mutex::new(resumed),
-    }));
-    let capacity = session.capacity.acquire();
-    tokio::pin!(capacity);
-    assert!(
-        capacity
-            .as_mut()
-            .poll(&mut Context::from_waker(&waker))
-            .is_pending()
-    );
-    drop(wire);
-    let paused = tokio::time::timeout(Duration::from_secs(2), paused).await;
-    if !matches!(paused, Ok(Ok(()))) {
-        let _ = release.send(());
-    }
-    paused
-        .expect("reader failure must publish its cause")
-        .unwrap();
-    gate.open();
-
-    let write = tokio::time::timeout(Duration::from_secs(2), tcp.write(b"not admitted")).await;
-    let sent = tokio::time::timeout(Duration::from_secs(2), &mut send).await;
-    let received = tokio::time::timeout(Duration::from_secs(2), udp.recv_packet(&mut [0; 1])).await;
-    release.send(()).unwrap();
-    let write_error = write
-        .expect("writer death must settle a queued TCP reserve before child fanout")
-        .unwrap_err();
-    let send_error = sent
-        .expect("writer death must settle the queued UDP send before child fanout")
-        .unwrap_err();
-    let recv_error = received
-        .expect("failed UDP send must settle its receiver before child fanout")
-        .unwrap_err();
-    for error in [write_error, send_error, recv_error] {
-        assert_eq!(
-            crate::group::ScoreOutcome::from_io_error(&error),
-            crate::group::ScoreOutcome::NodeFailure
+async fn carrier_failure_precedes_child_fanout_for_pending_tcp_and_udp() {
+    // child::poll_operation (flush) and poll_write (reserve) settle through different paths.
+    for pending in [PendingTcp::Flush, PendingTcp::Reserve] {
+        let (client, mut wire) = tokio::io::duplex(1 << 16);
+        let gate = Arc::new(FlushGate::default());
+        gate.open();
+        let session = connect(
+            Box::new(GatedFlushIo {
+                inner: client,
+                gate: Arc::clone(&gate),
+            }),
+            2,
         );
-        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
-        assert_eq!(
-            anyhow::Error::new(error)
-                .root_cause()
-                .downcast_ref::<io::Error>()
-                .unwrap()
-                .kind(),
-            io::ErrorKind::UnexpectedEof
+        let mut tcp = open_tcp(
+            Arc::clone(&session),
+            session.try_reserve().unwrap(),
+            "127.0.0.1:80".parse().unwrap(),
+            None,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("TCP stream must open"));
+        let _ = read_wire_frame(&mut wire).await;
+        let udp = open_udp(
+            Arc::clone(&session),
+            session.try_reserve().unwrap(),
+            udp_target(),
+            None,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("UDP transport must open"));
+
+        gate.close();
+        let blocker = session.writer.flush();
+        tokio::pin!(blocker);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut blocker)
+                .await
+                .is_err()
         );
+        tcp.write_all(b"queued behind the blocked flush")
+            .await
+            .unwrap();
+        let admitted = AtomicBool::new(false);
+        let send = udp.send_to(udp_target(), None, b"query", Some(&admitted));
+        tokio::pin!(send);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut send)
+                .await
+                .is_err()
+        );
+        assert!(admitted.load(Ordering::Acquire));
+        if let PendingTcp::Reserve = pending {
+            for _ in 2..WRITER_QUEUE_CAPACITY {
+                tcp.write_all(b"queued").await.unwrap();
+            }
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), pending_tcp_op(&mut tcp, pending))
+                .await
+                .is_err(),
+            "{pending:?} must stay pending while the carrier flush is blocked"
+        );
+
+        // Closing capacity wakes this waiter after storing the carrier cause but
+        // before touching children. Pause there without any production test hook;
+        // the writer must then lose publication before dropping its queued acknowledgements.
+        let (entered, paused) = oneshot::channel();
+        let (release, resumed) = std::sync::mpsc::channel();
+        let waker = Waker::from(Arc::new(PauseWake {
+            entered: Mutex::new(Some(entered)),
+            release: Mutex::new(resumed),
+        }));
+        let capacity = session.capacity.acquire();
+        tokio::pin!(capacity);
+        assert!(
+            capacity
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        drop(wire);
+        let paused = tokio::time::timeout(Duration::from_secs(2), paused).await;
+        if !matches!(paused, Ok(Ok(()))) {
+            let _ = release.send(());
+        }
+        paused
+            .expect("reader failure must publish its cause")
+            .unwrap();
+        gate.open();
+
+        let tcp_result =
+            tokio::time::timeout(Duration::from_secs(2), pending_tcp_op(&mut tcp, pending)).await;
+        let sent = tokio::time::timeout(Duration::from_secs(2), &mut send).await;
+        let received =
+            tokio::time::timeout(Duration::from_secs(2), udp.recv_packet(&mut [0; 1])).await;
+        release.send(()).unwrap();
+        let tcp_error = tcp_result
+            .unwrap_or_else(|_| {
+                panic!("writer death must settle the {pending:?} before child fanout")
+            })
+            .unwrap_err();
+        let send_error = sent
+            .expect("writer death must settle the pending UDP send before child fanout")
+            .unwrap_err();
+        let recv_error = received
+            .expect("failed UDP send must settle its receiver before child fanout")
+            .unwrap_err();
+        for error in [tcp_error, send_error, recv_error] {
+            assert_eq!(
+                crate::group::ScoreOutcome::from_io_error(&error),
+                crate::group::ScoreOutcome::NodeFailure
+            );
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(
+                anyhow::Error::new(error)
+                    .root_cause()
+                    .downcast_ref::<io::Error>()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
     }
 }
 

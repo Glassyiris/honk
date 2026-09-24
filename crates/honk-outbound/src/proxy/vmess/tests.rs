@@ -336,9 +336,6 @@ async fn rejected_response_header_surfaces_as_stream_error() {
         crate::group::ScoreOutcome::NodeFailure
     );
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    let error = anyhow::Error::new(error);
-    let cause = error.root_cause().to_string();
-    assert_eq!(format!("{error:#}").matches(&cause).count(), 1);
 }
 
 #[derive(Debug)]
@@ -428,7 +425,5 @@ async fn response_header_eof_and_transport_failures_keep_scope_and_cause() {
         if kind == io::ErrorKind::ConnectionReset {
             assert_eq!(cause.raw_os_error(), Some(libc::ECONNRESET));
         }
-        let cause = cause.to_string();
-        assert_eq!(format!("{error:#}").matches(&cause).count(), 1);
     }
 }

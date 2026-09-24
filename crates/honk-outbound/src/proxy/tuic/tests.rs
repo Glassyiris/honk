@@ -297,20 +297,8 @@ async fn udp_carrier_close_is_node_failure() {
             .await
             .unwrap();
         let (conn, _) = client.connection(timeout).await.unwrap();
-        conn.close(VarInt::from_u32(0), b"carrier closed");
-        let error = transport.send_packet(b"query").await.unwrap_err();
-        assert_eq!(
-            crate::group::ScoreOutcome::from_io_error(&error),
-            crate::group::ScoreOutcome::NodeFailure
-        );
-        let error = tokio::time::timeout(timeout, transport.recv_packet(&mut [0; 64]))
-            .await
-            .unwrap()
-            .unwrap_err();
-        assert_eq!(
-            crate::group::ScoreOutcome::from_io_error(&error),
-            crate::group::ScoreOutcome::NodeFailure
-        );
+        crate::proxy::tests::assert_udp_carrier_close_is_node_failure(conn, &*transport, timeout)
+            .await;
     }
 }
 

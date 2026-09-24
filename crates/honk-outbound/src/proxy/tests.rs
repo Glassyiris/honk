@@ -28,6 +28,28 @@ fn registry_test_node(name: &str, protocol: NodeProtocol) -> Node {
 }
 use super::*;
 
+/// Closes the QUIC carrier under an open UDP relay and requires both directions to report node failure.
+pub(super) async fn assert_udp_carrier_close_is_node_failure(
+    conn: quinn::Connection,
+    transport: &dyn PacketTransport,
+    timeout: std::time::Duration,
+) {
+    conn.close(quinn::VarInt::from_u32(0), b"carrier closed");
+    let error = transport.send_packet(b"query").await.unwrap_err();
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&error),
+        crate::group::ScoreOutcome::NodeFailure
+    );
+    let error = tokio::time::timeout(timeout, transport.recv_packet(&mut [0; 64]))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        crate::group::ScoreOutcome::from_io_error(&error),
+        crate::group::ScoreOutcome::NodeFailure
+    );
+}
+
 #[test]
 fn test_registry_default_handlers() {
     let registry = ProxyRegistry::default_resolver().unwrap();
