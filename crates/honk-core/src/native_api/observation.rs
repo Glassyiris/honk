@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
 use honk_config::Config;
 use serde_json::json;
@@ -19,6 +21,17 @@ pub(crate) struct NativeObservation {
     pub(crate) trace: super::routing::TraceState,
     pub(crate) settings: super::settings::Settings,
     pub(crate) providers: super::providers::ProviderApi,
+    reloading: AtomicBool,
+    activated: parking_lot::Mutex<Option<(u64, SystemTime)>>,
+}
+
+/// Marks a configuration activation in progress until dropped.
+pub(crate) struct ReloadGuard<'a>(&'a AtomicBool);
+
+impl Drop for ReloadGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl NativeObservation {
@@ -68,6 +81,8 @@ impl NativeObservation {
             trace: super::routing::TraceState::new(),
             settings: super::settings::Settings::new(config),
             providers: super::providers::ProviderApi::new(),
+            reloading: AtomicBool::new(false),
+            activated: parking_lot::Mutex::new(None),
         };
         owner.settings.activate(&owner, config);
         owner
@@ -81,6 +96,29 @@ impl NativeObservation {
         self.settings.renew(self, true);
     }
 
+    pub(crate) fn begin_reload(&self) -> ReloadGuard<'_> {
+        self.reloading.store(true, Ordering::Release);
+        ReloadGuard(&self.reloading)
+    }
+
+    pub(crate) fn reloading(&self) -> bool {
+        self.reloading.load(Ordering::Acquire)
+    }
+
+    /// The startup generation has no commit; it becomes active when the engine first runs.
+    pub(crate) fn started(&self, generation: u64) {
+        self.activated
+            .lock()
+            .get_or_insert((generation, SystemTime::now()));
+    }
+
+    pub(crate) fn activated_at(&self, generation: u64) -> Option<SystemTime> {
+        self.activated
+            .lock()
+            .filter(|(activated, _)| *activated == generation)
+            .map(|(_, at)| at)
+    }
+
     pub(crate) fn committed(
         &self,
         identity: Arc<super::catalog::CatalogIdentity>,
@@ -92,6 +130,7 @@ impl NativeObservation {
             .sources
             .generation_committed(&identity.revision, generation);
         if previous != generation {
+            *self.activated.lock() = Some((generation, SystemTime::now()));
             self.events.publish(
                 "generation.changed",
                 json!({

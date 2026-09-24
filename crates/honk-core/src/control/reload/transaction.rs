@@ -189,6 +189,12 @@ impl ControlPlane {
         #[cfg(feature = "native-api")] sources: Option<&crate::configuration::SourceUpdate>,
     ) -> Result<ReloadOutcome, honk_config::error::DetailedConfigError> {
         #[cfg(feature = "native-api")]
+        let native = self.native.clone();
+        #[cfg(feature = "native-api")]
+        let _reloading = native
+            .as_deref()
+            .map(crate::native_api::observation::NativeObservation::begin_reload);
+        #[cfg(feature = "native-api")]
         let replaces_sources = matches!(
             &diagnostic_update,
             DiagnosticUpdate::Replace(_) | DiagnosticUpdate::Rebase { .. }
@@ -927,6 +933,10 @@ impl ControlPlane {
             )
         };
         let _reload = self.reload_lock.lock().await;
+        let native = self.native.clone();
+        let _reloading = native
+            .as_deref()
+            .map(crate::native_api::observation::NativeObservation::begin_reload);
         let previous = self.runtime_registry.read().clone();
         if !self.drain_tracker.should_reject() || !previous.is_shutdown() {
             return Err(invalid());
