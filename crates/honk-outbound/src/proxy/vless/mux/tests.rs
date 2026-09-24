@@ -1,3 +1,4 @@
+use super::padding::{H2MUX_BACKEND, PADDED_RECORDS};
 use super::*;
 use crate::session::SpeculativeCheckout;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
