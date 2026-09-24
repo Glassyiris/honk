@@ -1,5 +1,6 @@
 pub(in crate::group) mod budget;
 mod comparison;
+mod evaluation;
 mod evidence;
 mod feedback;
 mod pressure;
@@ -418,6 +419,7 @@ struct StateInner {
     root_business_starts: u64,
     comparisons: comparison::Store,
     selection_counts: HashMap<SelectionCadenceKey, SelectionCadence>,
+    evaluation: HashMap<SelectionReasonKey, evaluation::EvaluationSet>,
     selection_history: LruCache<SelectionHistoryKey, SelectionHistory>,
     selection_reasons: HashMap<SelectionReasonKey, ScoreReasonCounters>,
     verification_counters: HashMap<SelectionReasonKey, ScoreVerificationCounters>,
@@ -443,6 +445,7 @@ impl Default for StateInner {
             root_business_starts: 0,
             comparisons: comparison::Store::default(),
             selection_counts: HashMap::new(),
+            evaluation: HashMap::new(),
             selection_history: LruCache::new(
                 // SAFE-EXPECT: the capacity is a positive compile-time constant.
                 NonZeroUsize::new(SELECTION_HISTORY_CAPACITY).expect("non-zero capacity"),
@@ -527,6 +530,7 @@ impl ScorePolicyState {
         inner.comparisons.clear();
         let StateInner {
             selection_counts,
+            evaluation,
             selection_reasons,
             verification_counters,
             selection_history,
@@ -536,6 +540,10 @@ impl ScorePolicyState {
             ..
         } = &mut *inner;
         selection_counts.clear();
+        evaluation.retain(|key, _| valid_groups.contains(&key.group));
+        for set in evaluation.values_mut() {
+            set.reset_members();
+        }
         budgets.retain(|key, _| valid_groups.contains(&key.group));
         for scope in budgets.values_mut() {
             scope.invalidate_pending();

@@ -10,6 +10,7 @@ mod budget_projection;
 mod cadence;
 mod comparison;
 mod directional;
+mod evaluation;
 mod evidence;
 mod live;
 mod performance;
@@ -234,14 +235,24 @@ fn decision_at(
         .map(|node| score_snapshot(inner, "score", target, node.id, now))
         .collect::<Vec<_>>();
     let baseline = ranking::performance_baseline(&scores);
-    let evidence = super::comparison::node_evidence(inner, "score", target, &refs, &scores, now);
+    // Comparison unit tests exercise every member; bounding is covered by evaluation tests.
+    let membership = super::evaluation::Membership::all(nodes.len());
+    let evidence = super::comparison::node_evidence(
+        inner,
+        "score",
+        target,
+        &refs,
+        &scores,
+        &membership.evaluated,
+        now,
+    );
     let pairs = super::comparison::pairs(
         inner,
         "score",
         target,
         &refs,
         (&scores, baseline),
-        reference,
+        (&membership, reference),
         now,
     );
     let ordinary = ranking::ordinary_selection(&scores, &refs, Some(reference), baseline, &pairs);
@@ -251,5 +262,7 @@ fn decision_at(
         pairs,
         baseline,
         ordinary,
+        evaluation: Default::default(),
+        membership,
     }
 }

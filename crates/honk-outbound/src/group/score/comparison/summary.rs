@@ -130,7 +130,9 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
     let mut support = std::collections::hash_map::DefaultHasher::new();
     selected.hash(&mut support);
     let baseline = decision.baseline;
-    let mut excluded = 0;
+    let covered = &decision.membership.covered;
+    // The selected member is always covered and needs no pair.
+    let mut resolved = 1;
     let mut response_support = None;
     let mut directional_support = [None; 2];
     let mut directional_known = [true; 2];
@@ -144,11 +146,11 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
     let mut oldest: Option<Instant> = None;
     let mut expires: Option<Instant> = None;
     for (index, candidate) in snapshots.iter().enumerate() {
-        if index == selected {
+        if index == selected || !decision.membership.evaluated[index] {
             continue;
         }
         if dominated(winner, candidate, baseline) || failure_excluded(decision, index, now) {
-            excluded += 1;
+            resolved += usize::from(covered[index]);
             continue;
         }
         let Some(pair) = decision.pairs.get(index) else {
@@ -187,7 +189,10 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
             download: pair.download.filter(|metric| now < metric.expires_at),
             ..pair
         };
-        summary.target_limited |= pair.partial;
+        // An optional rotation member contributes vetoes and ranges, never coverage or alignment.
+        if covered[index] {
+            summary.target_limited |= pair.partial;
+        }
         let Some(supporting) = [pair.response, pair.upload, pair.download]
             .into_iter()
             .flatten()
@@ -195,16 +200,18 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
         else {
             continue;
         };
-        all_responses &= pair.response.is_some();
-        if let Some(response) = pair.response {
-            let identity = (pair.basis, response.support);
-            summary.response_misaligned |= response_support.is_some_and(|old| old != identity);
-            response_support = Some(identity);
-            summary.response_latest_at = Some(
-                summary
-                    .response_latest_at
-                    .map_or(response.latest_at, |old| old.min(response.latest_at)),
-            );
+        if covered[index] {
+            all_responses &= pair.response.is_some();
+            if let Some(response) = pair.response {
+                let identity = (pair.basis, response.support);
+                summary.response_misaligned |= response_support.is_some_and(|old| old != identity);
+                response_support = Some(identity);
+                summary.response_latest_at = Some(
+                    summary
+                        .response_latest_at
+                        .map_or(response.latest_at, |old| old.min(response.latest_at)),
+                );
+            }
         }
         if summary.compared_candidates == 0 {
             summary.basis = pair.basis;
@@ -212,6 +219,7 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
             summary.reporters = supporting.reporters;
         }
         summary.compared_candidates += 1;
+        resolved += usize::from(covered[index]);
         let mut improved = false;
         let mut regressed = false;
         for (direction, metric) in [pair.upload, pair.download].into_iter().enumerate() {
@@ -286,7 +294,7 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
     let comparable = compared && all_responses && !summary.response_misaligned;
     summary.complete = comparable
         && !summary.target_limited
-        && summary.compared_candidates + excluded == snapshots.len();
+        && resolved == covered.iter().filter(|covered| **covered).count();
     summary.equivalent = comparable
         && pairwise_equivalent
         && ranges

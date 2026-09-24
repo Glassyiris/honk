@@ -24,6 +24,8 @@ pub(super) struct Decision {
     pub pairs: comparison::PairCohort,
     pub baseline: PerformanceBaseline,
     pub ordinary: RankedSelection,
+    pub evaluation: super::evaluation::EvaluationSet,
+    pub membership: super::evaluation::Membership,
 }
 
 pub(super) fn decision(
@@ -34,19 +36,30 @@ pub(super) fn decision(
     now: Instant,
 ) -> Decision {
     let mut decision = ordinary_decision(inner, group, context, nodes, now);
-    decision.evidence =
-        comparison::node_evidence(inner, group, context, nodes, &decision.scores, now);
     if decision.ordinary.index != decision.pairs.reference {
+        // The winner is always covered, even when it was outside the stored set.
+        decision.membership = decision
+            .evaluation
+            .membership(nodes, decision.ordinary.index);
         decision.pairs = comparison::pairs(
             inner,
             group,
             context,
             nodes,
             (&decision.scores, decision.baseline),
-            decision.ordinary.index,
+            (&decision.membership, decision.ordinary.index),
             now,
         );
     }
+    decision.evidence = comparison::node_evidence(
+        inner,
+        group,
+        context,
+        nodes,
+        &decision.scores,
+        &decision.membership.evaluated,
+        now,
+    );
     decision
 }
 
@@ -66,13 +79,23 @@ fn ordinary_decision(
         .filter(|history| history.selections > 0)
         .and_then(|history| nodes.iter().position(|node| node.id == history.current));
     let reference = incumbent.unwrap_or_else(|| best_index(&scores, nodes, baseline).index);
+    let evaluation = super::evaluation::derive(
+        inner
+            .evaluation
+            .get(&SelectionReasonKey::new(group, context.network)),
+        nodes,
+        &scores,
+        baseline,
+        now,
+    );
+    let membership = evaluation.membership(nodes, reference);
     let pairs = comparison::pairs(
         inner,
         group,
         context,
         nodes,
         (&scores, baseline),
-        reference,
+        (&membership, reference),
         now,
     );
     let ordinary = ordinary_selection(&scores, nodes, incumbent, baseline, &pairs);
@@ -82,6 +105,8 @@ fn ordinary_decision(
         pairs,
         baseline,
         ordinary,
+        evaluation,
+        membership,
     }
 }
 
@@ -208,6 +233,12 @@ impl ScorePolicyState {
         let performance = decision.baseline;
         let ordinary = decision.ordinary;
         let cadence_key = SelectionCadenceKey::new(group, context);
+        let mut set = decision.evaluation.clone();
+        set.anchor(nodes[ordinary.index].id);
+        super::validation::drop_runs_outside(&mut inner, group, context.network, &set);
+        inner
+            .evaluation
+            .insert(SelectionReasonKey::new(group, context.network), set);
         let history_key = SelectionHistoryKey::new(group, context);
         inner
             .selection_counts

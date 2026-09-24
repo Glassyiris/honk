@@ -352,6 +352,26 @@ pub(super) fn cancel_run(
     }
 }
 
+/// A run whose challenger left the evaluation set loses its witness, so its unbegun work is refused.
+pub(super) fn drop_runs_outside(
+    inner: &mut StateInner,
+    group: &str,
+    network: SelectionNetwork,
+    set: &super::evaluation::EvaluationSet,
+) {
+    for (key, cadence) in &mut inner.selection_counts {
+        if key.group == group
+            && key.network == network
+            && cadence
+                .run
+                .as_ref()
+                .is_some_and(|run| !set.evaluates(run.challenger))
+        {
+            cadence.run = None;
+        }
+    }
+}
+
 pub(super) fn plan(
     state: &Arc<ScorePolicyState>,
     inner: &mut StateInner,

@@ -45,6 +45,7 @@ fn snapshot(
         wait_reason: ScoreWaitReason::None,
         local_comparison: ScoreLocalComparison::default(),
         candidate_count: 0,
+        evaluated_count: 0,
         compared_count: 0,
         pending_count: 0,
         blockers: Default::default(),
@@ -93,7 +94,10 @@ fn snapshot(
         },
         "localComparison": local_comparison(snapshot.local_comparison),
         "coverage": {
+            "scope": if snapshot.evaluated_count < snapshot.candidate_count { "bounded" } else { "all" },
             "candidates": snapshot.candidate_count,
+            "evaluated": snapshot.evaluated_count,
+            "unevaluated": snapshot.candidate_count - snapshot.evaluated_count,
             "compared": snapshot.compared_count,
             "pending": snapshot.pending_count,
             "targetLimited": snapshot.target_limited,

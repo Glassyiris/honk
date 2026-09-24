@@ -124,6 +124,8 @@ pub struct ScoreVerificationSnapshot {
     pub wait_reason: ScoreWaitReason,
     pub local_comparison: ScoreLocalComparison,
     pub candidate_count: usize,
+    /// Members receiving comparisons; smaller than `candidate_count` when the claim is bounded.
+    pub evaluated_count: usize,
     pub compared_count: usize,
     pub pending_count: usize,
     pub blockers: ScoreVerificationBlockers,
@@ -231,6 +233,8 @@ pub(super) struct CandidateQuestion {
     pub required: usize,
     excluded: bool,
     dominated: bool,
+    evaluated: bool,
+    covered: bool,
     backed_off: bool,
     availability_missing: bool,
     response_gap: ResponseGap,
@@ -238,7 +242,8 @@ pub(super) struct CandidateQuestion {
 
 impl CandidateQuestion {
     fn pending(&self) -> bool {
-        !self.excluded
+        self.evaluated
+            && !self.excluded
             && !matches!(
                 self.question,
                 ScoreEvidenceQuestion::None | ScoreEvidenceQuestion::Transfer
@@ -251,6 +256,11 @@ impl CandidateQuestion {
 
     fn settled(&self) -> bool {
         self.excluded || self.dominated
+    }
+
+    /// Still owed before a claim over the covered members is complete.
+    fn open(&self) -> bool {
+        self.covered && !self.settled()
     }
 
     pub fn needs_alignment(&self) -> bool {
@@ -292,8 +302,10 @@ pub(super) fn startup_index(decision: &Decision) -> Option<usize> {
                 .scores
                 .iter()
                 .enumerate()
-                .filter(|(_, score)| {
-                    score.completed < MIN_TRAINED_EVIDENCE && !score.explore_backed_off
+                .filter(|(index, score)| {
+                    decision.membership.evaluated[*index]
+                        && score.completed < MIN_TRAINED_EVIDENCE
+                        && !score.explore_backed_off
                 })
                 .min_by(|(left_index, left), (right_index, right)| {
                     left.attempts
@@ -420,6 +432,8 @@ pub(super) fn evaluate(
                     .clamp(1.0, 4.0) as usize,
                 excluded: excluded(index),
                 dominated: super::comparison::dominated(winner, score, baseline),
+                evaluated: decision.membership.evaluated[index],
+                covered: decision.membership.covered[index],
                 backed_off: score.explore_backed_off,
                 availability_missing,
                 response_gap,
@@ -428,16 +442,19 @@ pub(super) fn evaluate(
         .collect();
     let availability = candidates
         .iter()
-        .any(|candidate| !candidate.settled() && candidate.availability_missing);
+        .any(|candidate| candidate.open() && candidate.availability_missing);
     let missing_response = candidates
         .iter()
-        .any(|candidate| !candidate.settled() && candidate.response_gap != ResponseGap::None);
+        .any(|candidate| candidate.open() && candidate.response_gap != ResponseGap::None);
     let pending_count = candidates
         .iter()
         .filter(|candidate| candidate.pending())
         .count();
     let mut blockers = ScoreVerificationBlockers::default();
     for (index, candidate) in candidates.iter().enumerate() {
+        if !candidate.covered {
+            continue;
+        }
         blockers.node_failure += usize::from(snapshots[index].node_failure);
         blockers.target_failure += usize::from(snapshots[index].target_failure);
         if candidate.settled() {
@@ -541,7 +558,7 @@ pub(super) fn evaluate(
         for (_, evidence) in evidence
             .iter()
             .enumerate()
-            .filter(|(index, _)| !candidates[*index].settled())
+            .filter(|(index, _)| candidates[*index].open())
         {
             support_metric(evidence.business);
         }
@@ -616,7 +633,7 @@ pub(super) fn evaluate(
     nodes[selected].id.hash(&mut hasher);
     for (index, (node, score)) in nodes.iter().zip(snapshots).enumerate() {
         node.id.hash(&mut hasher);
-        candidates[index].settled().hash(&mut hasher);
+        (candidates[index].covered, candidates[index].settled()).hash(&mut hasher);
         if use_probe {
             score.probe_scope.hash(&mut hasher);
         }
@@ -624,7 +641,7 @@ pub(super) fn evaluate(
     (basis as u8).hash(&mut hasher);
     summary.support.hash(&mut hasher);
     if comparison != ScoreComparison::Unconfirmed || has_transfer {
-        for (index, candidate) in candidates.iter().enumerate() {
+        for (index, candidate) in candidates.iter().enumerate().filter(|(_, c)| c.covered) {
             let failure = evidence[index]
                 .failed_at
                 .filter(|_| candidate.excluded)
@@ -661,6 +678,10 @@ pub(super) fn evaluate(
             wait_reason,
             local_comparison,
             candidate_count: snapshots.len(),
+            evaluated_count: candidates
+                .iter()
+                .filter(|candidate| candidate.evaluated)
+                .count(),
             compared_count,
             pending_count,
             blockers,

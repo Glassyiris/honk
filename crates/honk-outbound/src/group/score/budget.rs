@@ -588,12 +588,12 @@ pub(super) fn begin(
     }
     for item in work {
         let scope = ensure_scope(inner, &item.key);
-        if item.life.source != ScoreTrialSource::Recovery
+        let counted = item.life.source != ScoreTrialSource::Recovery
             && !progress
                 .scopes
                 .iter()
-                .any(|(key, identity)| *key == item.key && Arc::ptr_eq(identity, &scope.identity))
-        {
+                .any(|(key, identity)| *key == item.key && Arc::ptr_eq(identity, &scope.identity));
+        if counted {
             scope.counters.business_starts += 1;
             if scope
                 .counters
@@ -626,6 +626,13 @@ pub(super) fn begin(
                 *counter = counter.saturating_add(1);
             }
             scope.track(item.node, context.target.as_ref(), &item.life, now);
+        }
+        if counted {
+            inner
+                .evaluation
+                .entry(SelectionReasonKey::new(&item.key.group, item.key.network))
+                .or_default()
+                .record_demand(now);
         }
     }
     true

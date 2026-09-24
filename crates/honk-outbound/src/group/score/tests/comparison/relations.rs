@@ -658,6 +658,54 @@ fn later_challenger_direction_controls_claim_identity_and_expiry() {
 }
 
 #[test]
+fn rotation_evidence_can_neither_complete_nor_block_covered_members() {
+    let nodes: Vec<_> = (0..4)
+        .map(|index| node(&format!("evaluated {index}")))
+        .collect();
+    let refs = nodes.iter().collect::<Vec<_>>();
+    let target = context("rotation.example", IpVersion::V4);
+    let with_rotation = |decision: &mut ranking::Decision, inner: &StateInner, at| {
+        decision.membership.covered[3] = false;
+        decision.pairs = comparison::pairs(
+            inner,
+            "score",
+            &target,
+            &refs,
+            (&decision.scores, decision.baseline),
+            (&decision.membership, 0),
+            at,
+        );
+    };
+    let early = Instant::now();
+    let late = early + Duration::from_secs(20);
+    // A compared rotation member cannot stand in for a covered member without evidence.
+    let mut inner = StateInner::default();
+    for index in [0, 1, 3] {
+        response(&mut inner, &nodes[index], &target, 4, 100, early);
+    }
+    let at = early + Duration::from_secs(1);
+    let mut decision = scores(&inner, &nodes, &target, at);
+    with_rotation(&mut decision, &inner, at);
+    assert!(!comparison::summarize(&decision, at).complete);
+    // Nor can its disjoint blocks hold back complete covered evidence.
+    let mut inner = StateInner::default();
+    for at in [early, late] {
+        response(&mut inner, &nodes[0], &target, 4, 100, at);
+    }
+    for index in [1, 2] {
+        response(&mut inner, &nodes[index], &target, 4, 100, early);
+    }
+    response(&mut inner, &nodes[3], &target, 4, 100, late);
+    let at = late + Duration::from_secs(1);
+    let mut decision = scores(&inner, &nodes, &target, at);
+    let all = comparison::summarize(&decision, at);
+    assert!(all.response_misaligned && !all.complete);
+    with_rotation(&mut decision, &inner, at);
+    let bounded = comparison::summarize(&decision, at);
+    assert!(bounded.complete && !bounded.response_misaligned);
+}
+
+#[test]
 fn dominance_is_relative_to_the_selection_and_needs_completed_qualification() {
     let member = |observed: f64, completed: f64, fail_streak: u32| ScoreSnapshot {
         reliability: observed,

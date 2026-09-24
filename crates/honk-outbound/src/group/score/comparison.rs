@@ -502,6 +502,7 @@ pub(super) fn node_evidence(
     context: &ScoreSelectionContext,
     nodes: &[&Node],
     snapshots: &[ScoreSnapshot],
+    evaluated: &[bool],
     now: Instant,
 ) -> Vec<VerificationEvidence> {
     let mut parent_key = AggregateKey {
@@ -528,10 +529,14 @@ pub(super) fn node_evidence(
     let mut parents = Vec::with_capacity(nodes.len());
     let mut evidence: Vec<_> = nodes
         .iter()
-        .map(|node| {
+        .zip(evaluated)
+        .map(|(node, evaluated)| {
             parent_key.node_id = node.id;
-            let parent = inner.aggregate.peek(&parent_key);
+            let parent = inner.aggregate.peek(&parent_key).filter(|_| *evaluated);
             parents.push(parent);
+            if !evaluated {
+                return VerificationEvidence::default();
+            }
             let stamp = if let Some(key) = exact_key.as_mut() {
                 key.node_id = node.id;
                 inner
@@ -585,7 +590,7 @@ pub(super) fn node_evidence(
             continue;
         };
         for index in slots.of(cell.key.node()) {
-            if !cell.valid(inner, parents[index]) {
+            if !evaluated[index] || !cell.valid(inner, parents[index]) {
                 continue;
             }
             let evidence = &mut evidence[index];
@@ -611,7 +616,7 @@ pub(super) fn pairs(
     context: &ScoreSelectionContext,
     nodes: &[&Node],
     (snapshots, baseline): (&[ScoreSnapshot], super::PerformanceBaseline),
-    reference: usize,
+    (membership, reference): (&super::evaluation::Membership, usize),
     now: Instant,
 ) -> PairCohort {
     let mut parent_key = AggregateKey {
@@ -623,7 +628,7 @@ pub(super) fn pairs(
     let mut members = vec![(parent_key.node_id, inner.aggregate.peek(&parent_key))];
     let mut challengers = Vec::new();
     for (index, score) in snapshots.iter().enumerate() {
-        if index == reference || !normal_eligible(score, baseline) {
+        if index == reference || !membership.evaluated[index] || !normal_eligible(score, baseline) {
             continue;
         }
         parent_key.node_id = nodes[index].id;
@@ -631,9 +636,14 @@ pub(super) fn pairs(
         challengers.push(index);
     }
     let compared = compare_all(inner, group, context, members[0], &members[1..], now);
+    // An optional member without response support cannot block the covered members' alignment.
+    let joined: Vec<_> = (0..challengers.len())
+        .filter(|&slot| membership.covered[challengers[slot]] || compared[slot].response.is_some())
+        .collect();
     let mut identity = None;
-    let needs_joint = compared.len() > 1
-        && compared.iter().any(|pair| {
+    let needs_joint = joined.len() > 1
+        && joined.iter().any(|&slot| {
+            let pair = &compared[slot];
             let Some(response) = pair.response else {
                 return true;
             };
@@ -645,6 +655,9 @@ pub(super) fn pairs(
     let business_response = compared.iter().any(|pair| {
         matches!(pair.basis, Basis::ExactTarget | Basis::CommonTargets) && pair.response.is_some()
     });
+    let joint_members: Vec<_> = std::iter::once(members[0])
+        .chain(joined.iter().map(|&slot| members[slot + 1]))
+        .collect();
     let joint = needs_joint
         .then(|| {
             [
@@ -654,7 +667,7 @@ pub(super) fn pairs(
             ]
             .into_iter()
             .filter(|basis| *basis != Basis::ConfiguredProbe || !business_response)
-            .find_map(|basis| joint_pairs(inner, group, context, &members, basis, now))
+            .find_map(|basis| joint_pairs(inner, group, context, &joint_members, basis, now))
         })
         .flatten();
     let mut pairs = vec![None; nodes.len()];
@@ -666,8 +679,8 @@ pub(super) fn pairs(
         pairs,
         joint: joint.map(|joint| {
             let mut by_node = vec![PairEvidence::default(); nodes.len()];
-            for (index, pair) in challengers.iter().zip(joint) {
-                by_node[*index] = pair;
+            for (&slot, pair) in joined.iter().zip(joint) {
+                by_node[challengers[slot]] = pair;
             }
             by_node
         }),

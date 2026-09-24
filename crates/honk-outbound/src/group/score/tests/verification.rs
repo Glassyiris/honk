@@ -321,11 +321,9 @@ fn funded_large_group_focuses_promising_contender_until_graduation() {
         now + Duration::from_millis(step * 100),
     );
     assert_eq!(snapshot.state, ScoreVerificationState::ObservedUsable);
-    assert_eq!(snapshot.comparison, ScoreComparison::Unconfirmed);
-    assert!(
-        snapshot.pending_count > 0,
-        "untried rivals cannot be called beaten"
-    );
+    // Untried rivals are reported as unevaluated, never counted as compared or excluded.
+    assert!(snapshot.evaluated_count < snapshot.candidate_count);
+    assert!(snapshot.compared_count + snapshot.blockers.excluded <= snapshot.evaluated_count);
 }
 
 #[test]
