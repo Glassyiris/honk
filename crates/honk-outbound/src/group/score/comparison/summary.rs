@@ -189,7 +189,8 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
             download: pair.download.filter(|metric| now < metric.expires_at),
             ..pair
         };
-        // An optional rotation member contributes vetoes and ranges, never coverage or alignment.
+        // Evaluated members outside coverage (rotation, still qualifying) contribute vetoes and
+        // ranges, never coverage or alignment.
         if covered[index] {
             summary.target_limited |= pair.partial;
         }
@@ -292,9 +293,10 @@ pub(in crate::group::score) fn summarize(decision: &Decision, now: Instant) -> S
         }
     }
     let comparable = compared && all_responses && !summary.response_misaligned;
-    summary.complete = comparable
-        && !summary.target_limited
-        && resolved == covered.iter().filter(|covered| **covered).count();
+    // A claim needs a covered challenger; the selection alone would make one vacuous.
+    let covered_count = covered.iter().filter(|covered| **covered).count();
+    summary.complete =
+        comparable && !summary.target_limited && covered_count > 1 && resolved == covered_count;
     summary.equivalent = comparable
         && pairwise_equivalent
         && ranges

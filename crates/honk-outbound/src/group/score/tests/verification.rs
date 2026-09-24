@@ -664,7 +664,7 @@ fn exhausted_budget_and_retired_authority_cannot_publish_confirmation() {
 }
 
 #[test]
-fn stale_failure_reopens_coverage_unless_qualified_reliability_dominates_it() {
+fn stale_failure_is_dominated_or_stays_outside_coverage_until_qualified() {
     for (history, dominated) in [(20, true), (0, false)] {
         let nodes = [node("working"), node("slower"), node("failed")];
         let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
@@ -683,22 +683,21 @@ fn stale_failure_reopens_coverage_unless_qualified_reliability_dominates_it() {
         let snapshot = verification_at(&manager, &nodes, &target, now + Duration::from_secs(2));
         assert_eq!(snapshot.comparison, ScoreComparison::Supported);
         assert_eq!(snapshot.candidate_count, 3);
+        // A member that never qualified never joined coverage, so it is not excluded from it.
+        assert_eq!(snapshot.covered_count, 2 + usize::from(dominated));
         assert_eq!(snapshot.compared_count, 2);
         assert_eq!(snapshot.pending_count, 0);
-        assert_eq!(snapshot.blockers.excluded, 1);
+        assert_eq!(snapshot.blockers.excluded, usize::from(dominated));
         let at = now + PERFORMANCE_MAX_AGE + Duration::from_secs(2);
         for leaf in &nodes[..2] {
             train_at(&manager, leaf, &target, 5, 100, 1, at);
         }
         let snapshot = verification_at(&manager, &nodes, &target, at + Duration::from_secs(2));
-        // Lower qualified reliability can never be a rival advantage; unknown history can.
+        // Lower qualified reliability can never be a rival advantage; unknown history stays
+        // outside coverage until it qualifies.
         assert_eq!(
             snapshot.comparison,
-            if dominated {
-                ScoreComparison::Equivalent
-            } else {
-                ScoreComparison::Unconfirmed
-            },
+            ScoreComparison::Equivalent,
             "history={history}"
         );
         assert_eq!(snapshot.blockers.excluded, usize::from(dominated));
@@ -728,6 +727,8 @@ fn dominance_ends_the_claim_when_qualification_lapses() {
         train_at(&manager, leaf, &target, 20, 10, 1, decayed);
     }
     let at = decayed + Duration::from_secs(2);
+    // Authorized selection admits the qualified member, so its lapse reopens the claim.
+    rank_at(&manager, &nodes, &target, at);
     let report = verification_at(&manager, &nodes, &target, at);
     assert_eq!(report.comparison, ScoreComparison::Equivalent);
     let valid_for = Duration::from_millis(report.valid_for_ms.unwrap());
@@ -781,14 +782,18 @@ fn cross_target_latency_is_not_node_degradation() {
 
 #[test]
 fn qualification_blocker_stays_visible_behind_missing_availability() {
-    let nodes = [node("qualified"), node("untried")];
+    let nodes = [node("qualified"), node("lapsing")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
     let target = context("business.example", IpVersion::V4);
     let now = Instant::now();
     train_at(&manager, &nodes[0], &target, 20, 10, 1, now);
-    let report = verification_at(&manager, &nodes, &target, now + Duration::from_secs(2));
+    train_at(&manager, &nodes[1], &target, 5, 10, 1, now);
+    rank_at(&manager, &nodes, &target, now + Duration::from_secs(2));
+    // Five completions decay below four; the admitted member still owes qualification.
+    let report = verification_at(&manager, &nodes, &target, now + Duration::from_secs(600));
+    assert_eq!(report.covered_count, 2);
     assert_eq!(report.question, ScoreEvidenceQuestion::Availability);
-    assert_eq!(report.blockers.availability, 1);
+    assert!(report.blockers.availability > 0);
     assert_eq!(report.blockers.qualification, 1);
 }
 

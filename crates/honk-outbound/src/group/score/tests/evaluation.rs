@@ -94,6 +94,33 @@ fn members_missing_from_one_view_keep_their_place() {
 }
 
 #[test]
+fn ranked_members_join_coverage_at_their_first_qualification() {
+    let nodes = members(3);
+    let refs: Vec<_> = nodes.iter().collect();
+    let now = Instant::now();
+    let (idle, _) = idle_scores(3);
+    let qualified = ScoreSnapshot {
+        useful_completed: PERFORMANCE_VALIDATION_SAMPLES,
+        ..Default::default()
+    };
+    let unknown = ScoreSnapshot::default();
+    let derive = |stored: Option<&EvaluationSet>, scores: &[ScoreSnapshot]| {
+        evaluation::derive(stored, &refs, scores, performance_baseline(scores), now)
+    };
+    let covered = |set: &EvaluationSet| set.membership(&refs, 0).covered;
+    // Qualification cannot gate coverage before any member is qualified.
+    let cold = derive(None, &idle);
+    assert_eq!(covered(&cold), [true, true, true]);
+    // Once one is, members still acquiring evidence are evaluated but cannot stall a claim.
+    let first = derive(Some(&cold), &[qualified, qualified, unknown]);
+    assert_eq!(covered(&first), [true, true, false]);
+    assert!(first.membership(&refs, 0).evaluated[2]);
+    // Admission outlives a later lapse, so the lapse reopens the claim instead of shrinking it.
+    let lapsed = derive(Some(&first), &[qualified, unknown, unknown]);
+    assert_eq!(covered(&lapsed), [true, true, false]);
+}
+
+#[test]
 fn rotation_visits_every_member_outside_the_ranked_set() {
     let nodes = members(10);
     let refs: Vec<_> = nodes.iter().collect();

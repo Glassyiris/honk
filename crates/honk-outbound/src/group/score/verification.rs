@@ -126,6 +126,8 @@ pub struct ScoreVerificationSnapshot {
     pub candidate_count: usize,
     /// Members receiving comparisons; smaller than `candidate_count` when the claim is bounded.
     pub evaluated_count: usize,
+    /// Members a claim covers: the selection plus evaluated members admitted by qualification.
+    pub covered_count: usize,
     pub compared_count: usize,
     pub pending_count: usize,
     pub blockers: ScoreVerificationBlockers,
@@ -681,6 +683,10 @@ pub(super) fn evaluate(
             evaluated_count: candidates
                 .iter()
                 .filter(|candidate| candidate.evaluated)
+                .count(),
+            covered_count: candidates
+                .iter()
+                .filter(|candidate| candidate.covered)
                 .count(),
             compared_count,
             pending_count,

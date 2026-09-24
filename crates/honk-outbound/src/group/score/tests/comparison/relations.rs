@@ -687,6 +687,10 @@ fn rotation_evidence_can_neither_complete_nor_block_covered_members() {
     let mut decision = scores(&inner, &nodes, &target, at);
     with_rotation(&mut decision, &inner, at);
     assert!(!comparison::summarize(&decision, at).complete);
+    // Nor can uncovered comparisons alone complete a claim that covers only the selection.
+    decision.membership.covered[1] = false;
+    decision.membership.covered[2] = false;
+    assert!(!comparison::summarize(&decision, at).complete);
     // Nor can its disjoint blocks hold back complete covered evidence.
     let mut inner = StateInner::default();
     for at in [early, late] {

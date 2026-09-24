@@ -21,6 +21,10 @@ const ANCHORS: usize = 4;
 #[derive(Clone, Default)]
 pub(super) struct EvaluationSet {
     ranked: Vec<Uuid>,
+    /// Ranked members counted toward claims since their first qualification.
+    admitted: Vec<Uuid>,
+    /// Qualification gates coverage only once some member is qualified.
+    gated: bool,
     rotation: Option<(Uuid, Instant)>,
     anchors: Vec<Uuid>,
     refreshed_at: Option<Instant>,
@@ -82,9 +86,7 @@ impl EvaluationSet {
 
     /// Whether this member may receive comparisons and optional work under the stored set.
     pub(super) fn evaluates(&self, node: Uuid) -> bool {
-        !self.bounded
-            || self.ranked.contains(&node)
-            || self.rotation.is_some_and(|(id, _)| id == node)
+        self.ranks(node) || self.rotation.is_some_and(|(id, _)| id == node)
     }
 
     /// Whether probe comparison cells for this member are outside the bounded store budget.
@@ -107,18 +109,23 @@ impl EvaluationSet {
         };
     }
 
+    fn ranks(&self, node: Uuid) -> bool {
+        !self.bounded || self.ranked.contains(&node)
+    }
+
     pub(super) fn membership(&self, nodes: &[&Node], reference: usize) -> Membership {
         let covered: Vec<_> = nodes
             .iter()
             .enumerate()
             .map(|(index, node)| {
-                !self.bounded || index == reference || self.ranked.contains(&node.id)
+                index == reference
+                    || (self.ranks(node.id) && (!self.gated || self.admitted.contains(&node.id)))
             })
             .collect();
         let evaluated = nodes
             .iter()
             .zip(&covered)
-            .map(|(node, covered)| *covered || self.rotation.is_some_and(|(id, _)| id == node.id))
+            .map(|(node, covered)| *covered || self.evaluates(node.id))
             .collect();
         Membership { evaluated, covered }
     }
@@ -188,6 +195,17 @@ pub(super) fn derive(
             }
         }
         set.refreshed_at = Some(now);
+    }
+    // Members join claims at their first qualification, never by measured value, so members still
+    // acquiring evidence cannot stall a claim; once admitted they stay until ranked out.
+    set.gated = baseline.any_qualified;
+    let bounded = set.bounded;
+    set.admitted
+        .retain(|id| !bounded || set.ranked.contains(id));
+    for (node, score) in nodes.iter().zip(snapshots) {
+        if score.qualified() && set.ranks(node.id) && !set.admitted.contains(&node.id) {
+            set.admitted.push(node.id);
+        }
     }
     if !set.bounded {
         set.rotation = None;
