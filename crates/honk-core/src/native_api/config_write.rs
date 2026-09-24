@@ -122,13 +122,49 @@ impl SourceFile {
         expected_hash: &str,
         content: &[u8],
     ) -> Result<StagedFile, WriteError> {
+        self.stage_into(expected_hash, content, None)
+    }
+
+    /// Stages `content` as a new file at `target`, leaving this file in place
+    /// and pinned until the rename, which never replaces anything at `target`.
+    pub(crate) fn stage_beside(
+        self,
+        expected_hash: &str,
+        target: &Path,
+        content: &[u8],
+    ) -> Result<StagedFile, WriteError> {
+        let target = std::path::absolute(target).map_err(|_| WriteError::Unavailable)?;
+        let parent_path = target.parent().ok_or(WriteError::UnsafePath)?.to_owned();
+        let filename = target.file_name().ok_or(WriteError::UnsafePath)?.to_owned();
+        let directory = open_directory(&parent_path).map_err(path_error)?;
+        self.stage_into(
+            expected_hash,
+            content,
+            Some(Target {
+                directory,
+                parent_path,
+                filename,
+            }),
+        )
+    }
+
+    fn stage_into(
+        self,
+        expected_hash: &str,
+        content: &[u8],
+        target: Option<Target>,
+    ) -> Result<StagedFile, WriteError> {
         if self.hash != expected_hash {
             return Err(WriteError::Conflict);
         }
         if content.len() > self.max_bytes {
             return Err(WriteError::TooLarge);
         }
-        let mut temporary = TemporaryFile::create(&self.directory)?;
+        let mut temporary = TemporaryFile::create(
+            target
+                .as_ref()
+                .map_or(&self.directory, |target| &target.directory),
+        )?;
         temporary
             .file
             .write_all(content)
@@ -150,6 +186,7 @@ impl SourceFile {
             source: self,
             temporary,
             hash: crate::configuration::digest(content),
+            target,
         })
     }
 
@@ -211,6 +248,14 @@ pub(crate) struct StagedFile {
     source: SourceFile,
     temporary: TemporaryFile,
     hash: String,
+    /// Where a new file goes instead of replacing `source`.
+    target: Option<Target>,
+}
+
+struct Target {
+    directory: File,
+    parent_path: PathBuf,
+    filename: OsString,
 }
 
 pub(crate) struct InstalledFile {
@@ -242,28 +287,68 @@ impl StagedFile {
         self.source.recheck()?;
         before_rename()?;
         self.source.recheck()?;
-        renameat(
-            &self.source.directory,
+        let Some(target) = self.target.take() else {
+            renameat(
+                &self.source.directory,
+                self.temporary.name.as_str(),
+                &self.source.directory,
+                self.source.filename.as_os_str(),
+            )
+            .map_err(path_error)?;
+            self.temporary.renamed = true;
+            let metadata = self
+                .temporary
+                .file
+                .metadata()
+                .map_err(|_| WriteError::ChangedButNotDurable)?;
+            let durability_confirmed = self.source.directory.sync_all().is_ok();
+            #[cfg(test)]
+            let durability_confirmed =
+                durability_confirmed && self.source.sync_fault != Some(SyncFault::Directory);
+            std::mem::swap(&mut self.source.file, &mut self.temporary.file);
+            self.source.metadata = metadata;
+            self.source.hash = self.hash;
+            return Ok(InstalledFile {
+                file: self.source,
+                durability_confirmed,
+            });
+        };
+        rustix::fs::renameat_with(
+            &target.directory,
             self.temporary.name.as_str(),
-            &self.source.directory,
-            self.source.filename.as_os_str(),
+            &target.directory,
+            target.filename.as_os_str(),
+            rustix::fs::RenameFlags::NOREPLACE,
         )
-        .map_err(path_error)?;
+        .map_err(|error| match Errno::from_raw(error.raw_os_error()) {
+            Errno::EEXIST => WriteError::Conflict,
+            error => path_error(error),
+        })?;
         self.temporary.renamed = true;
-        let metadata = self
+        let file = self
             .temporary
             .file
+            .try_clone()
+            .map_err(|_| WriteError::ChangedButNotDurable)?;
+        let metadata = file
             .metadata()
             .map_err(|_| WriteError::ChangedButNotDurable)?;
-        let durability_confirmed = self.source.directory.sync_all().is_ok();
+        let durability_confirmed = target.directory.sync_all().is_ok();
         #[cfg(test)]
         let durability_confirmed =
             durability_confirmed && self.source.sync_fault != Some(SyncFault::Directory);
-        std::mem::swap(&mut self.source.file, &mut self.temporary.file);
-        self.source.metadata = metadata;
-        self.source.hash = self.hash;
         Ok(InstalledFile {
-            file: self.source,
+            file: SourceFile {
+                directory: target.directory,
+                parent_path: target.parent_path,
+                filename: target.filename,
+                file,
+                metadata,
+                hash: self.hash,
+                max_bytes: self.source.max_bytes,
+                #[cfg(test)]
+                sync_fault: self.source.sync_fault,
+            },
             durability_confirmed,
         })
     }
