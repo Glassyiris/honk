@@ -86,13 +86,7 @@ impl DoqClient {
         if let Some(reporter) = reporter {
             reporter.setup_succeeded();
         }
-        let io_error = |error: anyhow::Error| {
-            if error.downcast_ref::<std::io::Error>().is_some() {
-                with_packet_cause(conn.endpoint.as_ref(), error)
-            } else {
-                error
-            }
-        };
+        let io_error = |error| with_packet_cause(conn.endpoint.as_ref(), error);
         tokio::time::timeout(self.dial.query_timeout, async {
             let (mut send, mut recv) = conn.connection.open_bi().await.map_err(|error| {
                 with_packet_cause(conn.endpoint.as_ref(), error.into()).context("DoQ open_bi")
