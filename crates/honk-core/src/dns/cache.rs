@@ -326,6 +326,7 @@ mod storage {
             }
         }
 
+        #[cfg(any(feature = "native-api", test))]
         pub(super) fn response_bytes(&self) -> usize {
             self.positive
                 .as_ref()
