@@ -300,7 +300,7 @@ Budget counters report recorded ledger values. Readonly wait and cold-start deci
 
 | Fields | Meaning |
 | --- | --- |
-| `businessStarts`, `scopes`, `earningPeriod` | Original starts summed over retained scopes, scope count, and the maximum frozen earning period across them (not a denominator for a combined-scope budget formula). Each scope uses `q = 16` and freezes cold allowance `B` at creation; `spent + reserved <= B + floor(businessStarts/q)` applies per scope. |
+| `businessStarts`, `scopes`, `earningPeriod` | Original starts summed over retained scopes, scope count, and the fixed earning period `q = 16` (0 before any scope exists). It is not a denominator for a combined-scope budget formula: each scope freezes cold allowance `B` at creation, and `spent + reserved <= B + floor(businessStarts/q)` applies per scope. |
 | `sources.cold`, `sources.periodic`, `sources.recovery` | Started work by source: cold-token trial, earned-token trial, or budget-neutral continuation. `recovery` includes TCP replacement, DNS rerouting/UDP-to-TCP fallback and UI redirects, not only retries after errors; it is neither an optional trial nor new original business. Ordinary non-trial work has no source bucket. |
 | `trialStarts`, `spent`, `reserved` | Begun optional trials, cumulative spent tokens, and outstanding unbegun token reservations. Begin spends once; cancellation after begin does not refund. |
 | `coldAllowance`, `coldAvailable`, `earnedAvailable` | Summed frozen initial allowances and current available credit. Each scope retains at most eight unspent earned tokens. Time, reads, target churn and evidence expiry earn none; retained reload/membership changes do not reset currency. |

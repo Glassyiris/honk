@@ -123,7 +123,6 @@ impl Scope {
             counters: ScoreBudgetCounters {
                 cold_allowance: allowance,
                 cold_available: allowance,
-                earning_period: SCORE_EXPLORATION_PERIOD,
                 scopes: 1,
                 ..Default::default()
             },
@@ -166,7 +165,7 @@ impl Scope {
             && c.spent.checked_add(reserved).is_some_and(|used| {
                 used < c
                     .cold_allowance
-                    .saturating_add(c.business_starts / c.earning_period)
+                    .saturating_add(c.business_starts / SCORE_EXPLORATION_PERIOD)
             })
     }
 
@@ -598,7 +597,7 @@ pub(super) fn begin(
             if scope
                 .counters
                 .business_starts
-                .is_multiple_of(scope.counters.earning_period)
+                .is_multiple_of(SCORE_EXPLORATION_PERIOD)
             {
                 scope.counters.earned_available =
                     (scope.counters.earned_available + 1).min(EARNED_CAP);
@@ -795,8 +794,7 @@ impl ScorePolicyState {
                 trial_setup_millis,
                 trial_elapsed_millis
             );
-            // Families may have been admitted under different membership sizes.
-            total.earning_period = total.earning_period.max(c.earning_period);
+            total.earning_period = SCORE_EXPLORATION_PERIOD;
             for (out, count) in total
                 .trial_setup_histogram
                 .iter_mut()
