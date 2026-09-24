@@ -64,7 +64,9 @@ fn evaluation_limit_follows_offered_business_only_at_refresh() {
         .iter()
         .filter(|v| **v)
         .count();
-    assert!((10..=26).contains(&evaluated), "{evaluated}");
+    // 600 one-per-second starts decay to 324 under the five-minute half-life, sizing 16
+    // members; undecayed demand would reach the 25-member cap.
+    assert_eq!(evaluated, 16);
 }
 
 #[test]
@@ -333,7 +335,7 @@ fn readonly_refresh_does_not_replace_committed_participants() {
     let applied = state
         .verification_snapshot_at("score", &target, &refs, at)
         .unwrap();
-    assert!((10..=26).contains(&applied.evaluated_count));
+    assert_eq!(applied.evaluated_count, 17);
 }
 
 #[test]
