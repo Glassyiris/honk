@@ -750,6 +750,46 @@ fn dominance_ends_the_claim_when_qualification_lapses() {
 }
 
 #[test]
+fn covered_qualification_lapse_expires_instead_of_contradicting_the_claim() {
+    let nodes = [node("steady"), node("marginal")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let target = context("business.example", IpVersion::V4);
+    let probe = context("health.example", IpVersion::V4);
+    let aggregate =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    let now = Instant::now();
+    rank_at(&manager, &nodes, &aggregate, now);
+    // Five decayed completions sit just above the four-completion threshold here.
+    train_at(&manager, &nodes[1], &target, 5, 10, 1, now);
+    let decayed = now + Duration::from_secs(540);
+    train_at(&manager, &nodes[0], &target, 20, 10, 1, decayed);
+    for leaf in &nodes {
+        probe_at(&manager, leaf, &probe, 10, decayed);
+    }
+    let at = decayed + Duration::from_secs(2);
+    let report = verification_at(&manager, &nodes, &aggregate, at);
+    assert_eq!(report.comparison, ScoreComparison::Equivalent);
+    assert_eq!(report.basis, ScoreEvidenceBasis::ConfiguredProbe);
+    assert_eq!(report.covered_count, 2);
+    let valid_for = Duration::from_millis(report.valid_for_ms.unwrap());
+    let margin = Duration::from_millis(100);
+    assert_eq!(
+        verification_at(&manager, &nodes, &aggregate, at + valid_for - margin).comparison,
+        ScoreComparison::Equivalent
+    );
+    let lapsed = verification_at(&manager, &nodes, &aggregate, at + valid_for + margin);
+    assert_eq!(lapsed.comparison, ScoreComparison::Unconfirmed);
+    assert_eq!(lapsed.covered_count, 2);
+    let state = manager.score_state();
+    rank_at(&manager, &nodes, &aggregate, at);
+    let before = state.verification_counters("score", SelectionNetwork::Tcp);
+    rank_at(&manager, &nodes, &aggregate, at + valid_for + margin);
+    let after = state.verification_counters("score", SelectionNetwork::Tcp);
+    assert_eq!(after.expired, before.expired + 1);
+    assert_eq!(after.contradicted, before.contradicted);
+}
+
+#[test]
 fn cross_target_latency_is_not_node_degradation() {
     let nodes = [node("fast"), node("slow")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);

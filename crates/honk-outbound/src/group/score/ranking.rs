@@ -639,7 +639,7 @@ pub(super) fn score_snapshots(
         let mut value = snapshot(stats, now);
         if stamp.invalidated_through > stats.business_invalidated_through {
             value.performance = PerformanceSnapshot::default();
-            value.qualification_retained = false;
+            value.qualified_until = None;
             value.recovered_qualification = false;
         }
         value
@@ -674,7 +674,7 @@ pub(super) fn score_snapshots(
                 );
                 score.completed = score.completed.max(family.completed);
                 score.useful_completed = score.useful_completed.max(family.useful_completed);
-                score.qualification_retained |= family.qualification_retained;
+                score.qualified_until = score.qualified_until.max(family.qualified_until);
                 score.recovered_qualification |= family.recovered_qualification;
                 score.attempts = score.attempts.max(family.attempts);
                 score.performance = prefer_specific(score.performance, family.performance);
@@ -724,7 +724,7 @@ pub(super) fn score_snapshots(
                 );
                 score.completed = score.completed.max(exact.completed);
                 score.useful_completed = score.useful_completed.max(exact.useful_completed);
-                score.qualification_retained |= exact.qualification_retained;
+                score.qualified_until = score.qualified_until.max(exact.qualified_until);
                 score.recovered_qualification = exact.recovered_qualification;
                 score.target_performance = exact.performance;
                 score.unresolved_failure |= exact.unresolved_failure;
@@ -753,7 +753,7 @@ pub(super) fn snapshot(stats: &Stats, now: Instant) -> ScoreSnapshot {
         attempts: stats.attempts * factor,
         completed: stats.completed() * factor,
         useful_completed: stats.useful_completed() * factor,
-        qualification_retained: stats.qualified_until.is_some_and(|until| now < until),
+        qualified_until: stats.qualified_until.filter(|until| now < *until),
         recovered_qualification: stats.failed_at.is_some()
             && stats.fail_streak == 0
             && stats.availability.reporters >= super::PERFORMANCE_VALIDATION_SAMPLES as u8

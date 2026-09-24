@@ -218,6 +218,19 @@ pub(super) fn usable(evidence: &VerificationEvidence) -> bool {
     qualified(evidence.business)
 }
 
+/// When decayed completions fall below qualification; `None` if they already have.
+fn completion_lapse(useful_completed: f64, now: Instant) -> Option<Instant> {
+    (useful_completed >= PERFORMANCE_VALIDATION_SAMPLES).then(|| {
+        now + SCORE_EVIDENCE_HALF_LIFE
+            .mul_f64((useful_completed / PERFORMANCE_VALIDATION_SAMPLES).log2())
+    })
+}
+
+/// When decay and lease expiry together end a snapshot's qualification.
+fn qualification_lapse(score: &ScoreSnapshot, now: Instant) -> Option<Instant> {
+    completion_lapse(score.useful_completed, now).max(score.qualified_until)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ResponseGap {
     None,
@@ -648,15 +661,19 @@ pub(super) fn evaluate(
                 .failed_at
                 .filter(|_| candidate.excluded)
                 .map(|at| at + PERFORMANCE_MAX_AGE);
-            // Dominance holds only while both sides remain completion-qualified.
-            let dominance = candidate.dominated.then(|| {
-                let lapse = winner
-                    .useful_completed
-                    .min(snapshots[index].useful_completed)
-                    / PERFORMANCE_VALIDATION_SAMPLES;
-                now + SCORE_EVIDENCE_HALF_LIFE.mul_f64(lapse.log2())
-            });
-            if let Some(until) = failure.max(dominance) {
+            let score = &snapshots[index];
+            // Dominance needs both sides completion-qualified; a currently qualified member's
+            // comparison also ends when it or the winner loses that qualification.
+            let lapse = if candidate.dominated {
+                completion_lapse(winner.useful_completed.min(score.useful_completed), now)
+            } else if candidate.excluded {
+                None
+            } else {
+                qualification_lapse(score, now).map(|until| {
+                    qualification_lapse(winner, now).map_or(until, |winner| until.min(winner))
+                })
+            };
+            if let Some(until) = failure.max(lapse) {
                 expires_at = Some(expires_at.map_or(until, |old| old.min(until)));
             }
         }

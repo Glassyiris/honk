@@ -857,7 +857,8 @@ struct ScoreSnapshot {
     reliability: f64,
     reliability_upper: f64,
     useful_completed: f64,
-    qualification_retained: bool,
+    /// End of a qualification lease still in force at the snapshot time.
+    qualified_until: Option<Instant>,
     recovered_qualification: bool,
     performance: PerformanceSnapshot,
     target_performance: PerformanceSnapshot,
@@ -878,7 +879,7 @@ struct ScoreSnapshot {
 
 impl ScoreSnapshot {
     fn qualified(&self) -> bool {
-        self.useful_completed >= PERFORMANCE_VALIDATION_SAMPLES || self.qualification_retained
+        self.useful_completed >= PERFORMANCE_VALIDATION_SAMPLES || self.qualified_until.is_some()
     }
 }
 
