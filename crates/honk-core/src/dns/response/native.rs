@@ -78,7 +78,7 @@ pub(crate) fn project(
     budget: &mut usize,
 ) -> Result<Vec<DnsAnswer>, ProjectionError> {
     let query = context(query, ingress)?;
-    let charge = measure(&query, response, (*budget).min(MAX_JSON_BYTES))?;
+    let charge = measure(&query, response, *budget)?;
     // The complete expansion is charged before allocating any answer strings/vector.
     *budget -= charge;
     let mut answers = Vec::with_capacity(usize::from(read_u16(response, 6)?));

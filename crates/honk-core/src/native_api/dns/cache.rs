@@ -5,9 +5,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::{
-    ApiError, MAX_RESPONSE_BYTES, NativeState, RequestId, bounded_response, canonical_name,
-    full_detail, invalid_query, parameters, records, records::ProjectionError, timestamp,
-    unavailable,
+    ApiError, MAX_RESPONSE_BYTES, NativeState, RequestId, canonical_name, full_detail,
+    invalid_query, json_response, parameters, records, timestamp, unavailable,
 };
 use crate::dns::cache::{CacheUsage, ExactCacheEntry};
 
@@ -195,11 +194,15 @@ fn page(
             .len()
             .saturating_add(question.name.len())
             .saturating_add(512);
-        let Some(rest) = budget.checked_sub(metadata_cost) else {
-            end = full_page(offset + position, &rows, id)?;
-            break;
-        };
-        budget = rest;
+        let first = rows.is_empty();
+        match budget.checked_sub(metadata_cost) {
+            Some(rest) => budget = rest,
+            None if first => budget = 0,
+            None => {
+                end = offset + position;
+                break;
+            }
+        }
         let status = if let Some(rcode) = entry.negative {
             match rcode {
                 0 => "NODATA".to_owned(),
@@ -225,19 +228,19 @@ fn page(
             let answers = if let Some(response) =
                 entry.response.as_ref().filter(|_| entry.negative.is_none())
             {
-                match records::project(
+                let Some(answers) = records::page_row(
                     entry.key.wire_identity(),
                     response,
                     entry.key.ingress(),
                     &mut budget,
-                ) {
-                    Ok(answers) => answers,
-                    Err(ProjectionError::Budget) => {
-                        end = full_page(offset + position, &rows, id)?;
-                        break;
-                    }
-                    Err(ProjectionError::Invalid) => return Err(unavailable(id)),
-                }
+                    first,
+                )
+                .map_err(|_| unavailable(id))?
+                else {
+                    end = offset + position;
+                    break;
+                };
+                answers
             } else {
                 Vec::new()
             };
@@ -248,20 +251,18 @@ fn page(
     let more = end < snapshot.entries.len();
     let cursor = more.then(|| format!("{}:{end}", snapshot.id));
     let usage = &snapshot.usage;
-    let response = bounded_response(
+    // A single entry is served whole; see `records::page_row`.
+    let cap = if rows.len() > 1 {
+        MAX_RESPONSE_BYTES
+    } else {
+        usize::MAX
+    };
+    let response = json_response(
         &json!({"observed_at":snapshot.observed_at,"coverage":{"positive":true,"negative":true,"persistent":false},
         "entries":rows,"total":snapshot.entries.len(),"next_cursor":cursor,
         "usage":{"entries":usage.entries.to_string(),"entry_capacity":usage.entry_capacity.to_string()}}),
+        cap,
         id,
     )?;
     Ok((response, more))
-}
-
-/// Ends the page before the entry at `position`; an entry that fits no page stays an error.
-fn full_page<T>(position: usize, rows: &[T], id: &RequestId) -> Result<usize, ApiError> {
-    if rows.is_empty() {
-        Err(unavailable(id))
-    } else {
-        Ok(position)
-    }
 }

@@ -232,7 +232,7 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 
 字面值 `.` 表示 DNS 根，支持实际查询、精确缓存列表和按名称删除。普通输入名称不区分大小写，末尾点可省略；展示名称保留规范化末尾点。合法根域 wire 问题也进入普通严格 DNS 路径；非 UTF-8 label 仍不属于该消费者契约。
 
-缓存 GET 只观察运行时 exact-key 正/负记录（`persistent:false`），不提升 LRU 或计入 hit。支持 `name` 精确名称、`domain` 子串、重复 `type`、`include_expired`、`detail`、`limit`（1–1000，默认 100）及 cursor；最多 8 份过滤器/instance 绑定的不可变快照、30 秒、合计 8 MiB，底层淘汰后快照占用仍计费。`entry_id` 标识精确 incarnation，旧 ID 不能删除替代记录；按 name 删除可跨 exact-key 变体并用 type 限制。删除/flush 与入库发布串行化，等待启用的持久化失效确认，旧 foreground/refresh 不能在确认后复活所删缓存；flush 不清空 DNS 路由投影。DNS query/cache/log 的完整 JSON 响应上限均为 262144 字节。cache/log 分页在下一条会超出上限时提前结束并返回 `next_cursor`，因此 `limit` 只是上限，不保证条数。单条记录独占一页仍超限、query 响应超限或无法保留快照时返回 503 与 Retry-After，不裁剪 RRset 冒充完整答案。
+缓存 GET 只观察运行时 exact-key 正/负记录（`persistent:false`），不提升 LRU 或计入 hit。支持 `name` 精确名称、`domain` 子串、重复 `type`、`include_expired`、`detail`、`limit`（1–1000，默认 100）及 cursor；最多 8 份过滤器/instance 绑定的不可变快照、30 秒、合计 8 MiB，底层淘汰后快照占用仍计费。`entry_id` 标识精确 incarnation，旧 ID 不能删除替代记录；按 name 删除可跨 exact-key 变体并用 type 限制。删除/flush 与入库发布串行化，等待启用的持久化失效确认，旧 foreground/refresh 不能在确认后复活所删缓存；flush 不清空 DNS 路由投影。DNS query/cache/log 的完整 JSON 响应上限均为 262144 字节。cache/log 分页在下一条会超出上限时提前结束并返回 `next_cursor`，因此 `limit` 只是上限，不保证条数。单条记录本身超限时独占一页完整返回，不受上限约束；因为 wire 最长 65535 字节，展开大小有界，拒绝它会让其后的记录都无法读取。query 响应超限或无法保留快照时返回 503 与 Retry-After，不裁剪 RRset 冒充完整答案。
 
 名称、类型及过期筛选在快照字节准入和复制之前完成；未选中的缓存记录不消耗本次快照预算。负应答优先级和过期筛选使用同一个观测时刻。
 

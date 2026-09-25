@@ -184,6 +184,50 @@ async fn cache_pages_end_early_at_the_response_budget_and_walk_every_entry_once(
             "{filters} fit one page; the budget was not reached"
         );
     }
+
+    // An entry whose answers exceed any page is served alone, so the walk still reaches every entry.
+    for index in 0..3 {
+        let domain = [
+            format!("wide{index}{}", "d".repeat(57)),
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(61),
+        ]
+        .join(".");
+        let mut response = build_dns_query(&domain, 5);
+        let key = CacheKey::new(
+            &QueryContext::parse(&response).unwrap(),
+            None,
+            scope.clone(),
+            OperationKind::Resolve,
+        );
+        let count: u16 = if index == 1 { 2000 } else { 1 };
+        response[2..4].copy_from_slice(&[0x81, 0x80]);
+        response[6..8].copy_from_slice(&count.to_be_bytes());
+        for _ in 0..count {
+            response.extend_from_slice(&[0xc0, 12, 0, 5, 0, 1, 0, 0, 1, 44, 0, 2, 0xc0, 12]);
+        }
+        service.put_exact(key, response, 300, None);
+    }
+    let mut sizes = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let query = match &cursor {
+            Some(cursor) => format!("?domain=wide&limit=3&detail=full&cursor={cursor}"),
+            None => "?domain=wide&limit=3&detail=full".to_owned(),
+        };
+        let (status, page) = cache_page(&state, &query).await;
+        assert_eq!(status, StatusCode::OK, "{query}");
+        for entry in page["entries"].as_array().unwrap() {
+            sizes.push(entry["answers"].as_array().unwrap().len());
+        }
+        match page["next_cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_owned()),
+            None => break,
+        }
+    }
+    sizes.sort_unstable();
+    assert_eq!(sizes, [1, 1, 2000]);
 }
 
 async fn cache_page(state: &NativeState, query: &str) -> (StatusCode, Value) {
@@ -192,9 +236,7 @@ async fn cache_page(state: &NativeState, query: &str) -> (StatusCode, Value) {
         .await
         .unwrap_or_else(IntoResponse::into_response);
     let status = response.status();
-    let body = to_bytes(response.into_body(), MAX_RESPONSE_BYTES)
-        .await
-        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     (status, serde_json::from_slice(&body).unwrap())
 }
 

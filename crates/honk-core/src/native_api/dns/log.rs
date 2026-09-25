@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::records::{self, DnsAnswer, DnsQuestion, MAX_JSON_BYTES, ProjectionError};
+use super::records::{self, DnsAnswer, DnsQuestion, MAX_JSON_BYTES};
 use crate::dns::outcome::{DnsOutcome, Provenance, RequestRoute};
 use crate::dns::query::IngressProfile;
 use crate::dns::response::native;
@@ -263,22 +263,28 @@ impl LogStore {
             let charge = records::json_size(&meta)
                 .map_err(|_| unavailable(id))?
                 .saturating_add(size_of::<Row<'_>>() + 16);
-            let answers = match budget.checked_sub(charge) {
-                Some(rest) => {
-                    budget = rest;
-                    records::project(&entry.query, &entry.response, entry.ingress, &mut budget)
-                }
-                None => Err(ProjectionError::Budget),
-            };
-            match answers {
-                Ok(answers) => rows.push(Row { meta, answers }),
-                // A record that fits no page stays an error; skipping it would hide it.
-                Err(ProjectionError::Budget) if !rows.is_empty() => {
+            let first = rows.is_empty();
+            match budget.checked_sub(charge) {
+                Some(rest) => budget = rest,
+                None if first => budget = 0,
+                None => {
                     full = true;
                     break;
                 }
-                Err(_) => return Err(unavailable(id)),
             }
+            let Some(answers) = records::page_row(
+                &entry.query,
+                &entry.response,
+                entry.ingress,
+                &mut budget,
+                first,
+            )
+            .map_err(|_| unavailable(id))?
+            else {
+                full = true;
+                break;
+            };
+            rows.push(Row { meta, answers });
             last = Some(entry.sequence);
         }
         let more = full || selected.next().is_some();
@@ -291,7 +297,8 @@ impl LogStore {
             records: rows,
         };
         let bytes = records::json_size(&page).map_err(|_| unavailable(id))?;
-        if bytes > MAX_JSON_BYTES {
+        // A single record is served whole; see `records::page_row`.
+        if bytes > MAX_JSON_BYTES && page.records.len() > 1 {
             return Err(unavailable(id));
         }
         let mut body = Vec::with_capacity(bytes);
@@ -456,7 +463,7 @@ mod tests {
     }
 
     async fn value(response: Response) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(response.into_body(), MAX_JSON_BYTES)
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
@@ -631,7 +638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_record_larger_than_any_page_is_reported_not_skipped() {
+    async fn a_record_larger_than_any_page_is_served_alone_and_the_walk_continues() {
         let store = LogStore::new("instance".into(), true);
         let domain = [
             "a".repeat(63),
@@ -647,6 +654,7 @@ mod tests {
         for _ in 0..2000 {
             response.extend_from_slice(&[0xc0, 12, 0, 5, 0, 1, 0, 0, 0, 60, 0, 2, 0xc0, 12]);
         }
+        capture(&store, "older.example", None);
         store.capture(
             &query,
             IngressProfile::Tcp,
@@ -655,18 +663,29 @@ mod tests {
             &response,
             Duration::ZERO,
         );
-        capture(&store, "small.example", None);
+        capture(&store, "newer.example", None);
         let id = RequestId("test".into());
-        let first = value(store.page(Filter::default(), 2, None, &id).unwrap()).await;
-        assert_eq!(first["records"].as_array().unwrap().len(), 1);
-        let cursor = first["next_cursor"].as_str().unwrap();
-        assert_eq!(
-            store
-                .page(Filter::default(), 2, Some(cursor), &id)
-                .unwrap_err()
-                .into_response()
-                .status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
+        let mut pages = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = value(
+                store
+                    .page(Filter::default(), 2, cursor.as_deref(), &id)
+                    .unwrap(),
+            )
+            .await;
+            let records = page["records"].as_array().unwrap();
+            pages.push(
+                records
+                    .iter()
+                    .map(|record| record["answers"].as_array().unwrap().len())
+                    .collect::<Vec<_>>(),
+            );
+            match page["next_cursor"].as_str() {
+                Some(next) => cursor = Some(next.to_owned()),
+                None => break,
+            }
+        }
+        assert_eq!(pages, [vec![0], vec![2000], vec![0]]);
     }
 }
