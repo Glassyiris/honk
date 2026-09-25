@@ -64,12 +64,16 @@ async fn discovery_reports_the_mode_and_setup_state() {
         .json()
         .await
         .unwrap();
-    assert_eq!(body["auth"]["mode"], "password");
-    assert_eq!(body["auth"]["setup_required"], true);
-    assert_eq!(body["auth"]["anonymous_loopback"], false);
-    assert_eq!(body["links"]["auth_setup"], "/api/v1/auth/setup");
-    assert_eq!(body["links"]["auth_login"], "/api/v1/auth/login");
-    assert!(body["links"].get("runtime_mode").is_none());
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "name": "dae/honk-native",
+            "api_major": 1,
+            "links": {"auth_setup": "/api/v1/auth/setup", "auth_login": "/api/v1/auth/login"},
+            "auth": {"mode": "password", "setup_required": true},
+        }),
+        "a caller without a session sees only how to sign in"
+    );
     let alias: Value = app
         .client
         .get(app.url("/api/v1/discovery"))
@@ -144,6 +148,21 @@ async fn setup_claims_the_one_account() {
         .await
         .unwrap();
     assert_eq!(discovery["auth"]["setup_required"], false);
+    assert_eq!(discovery["status"], Value::Null);
+    // A live session is admitted, so it gets the full view.
+    let full: Value = app
+        .client
+        .get(app.url("/api"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(full["status"], "draft");
+    assert_eq!(full["links"]["auth_logout"], "/api/v1/auth/logout");
+    assert_eq!(full["auth"]["anonymous_loopback"], false);
     app.shutdown().await;
 }
 

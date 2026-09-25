@@ -164,6 +164,10 @@ impl IntoResponse for ApiError {
 #[derive(Clone)]
 pub(super) struct RequestId(pub String);
 
+/// Set on a request the listener authenticated, or admitted without a credential.
+#[derive(Clone, Copy)]
+pub(super) struct Admitted;
+
 #[derive(Clone, Serialize)]
 pub(super) struct Runtime {
     pub(super) observed_at: String,
@@ -285,7 +289,7 @@ pub(crate) struct AuthDiscovery {
     pub(crate) anonymous_loopback: bool,
 }
 
-pub(super) fn discovery(auth: AuthDiscovery) -> Value {
+pub(super) fn discovery(auth: AuthDiscovery, admitted: bool) -> Value {
     let password = auth.mode == "password";
     let link = |path: &'static str| {
         if password {
@@ -294,6 +298,21 @@ pub(super) fn discovery(auth: AuthDiscovery) -> Value {
             Value::Null
         }
     };
+    // Discovery is public; a caller that is not admitted learns only how to sign in.
+    if !admitted {
+        return json!({
+            "name": "dae/honk-native",
+            "api_major": 1,
+            "links": {
+                "auth_setup": link("/api/v1/auth/setup"),
+                "auth_login": link("/api/v1/auth/login"),
+            },
+            "auth": {
+                "mode": auth.mode,
+                "setup_required": auth.setup_required,
+            },
+        });
+    }
     json!({
         "name": "dae/honk-native",
         "status": "draft",

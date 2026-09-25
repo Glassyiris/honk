@@ -632,10 +632,16 @@ fn resource(
         .merge(any(not_found))
 }
 
-async fn discovery(State(state): App, Extension(id): Id, uri: Uri) -> Response {
+async fn discovery(
+    State(state): App,
+    Extension(id): Id,
+    admitted: Option<Extension<types::Admitted>>,
+    uri: Uri,
+) -> Response {
     respond(
-        parse_query(&uri, &[], &id)
-            .map(|_| Json(types::discovery(state.auth_discovery())).into_response()),
+        parse_query(&uri, &[], &id).map(|_| {
+            Json(types::discovery(state.auth_discovery(), admitted.is_some())).into_response()
+        }),
         id,
     )
 }
