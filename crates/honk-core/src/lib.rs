@@ -16,6 +16,8 @@ pub(crate) mod configuration;
 pub mod connection_tracker;
 pub mod control;
 pub mod dns;
+#[cfg(any(feature = "clash-api", feature = "native-api"))]
+pub(crate) mod download_route;
 pub mod ebpf;
 pub mod mode;
 #[cfg(feature = "native-api")]
