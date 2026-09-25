@@ -25,7 +25,7 @@ use super::types::{ApiError, ErrorCode, RequestId};
 
 const MAX_TARGET_BYTES: usize = 4096;
 const MAX_HEADER_BYTES: usize = 16384;
-const MAX_BODY_BYTES: usize = 65536;
+pub(super) const MAX_BODY_BYTES: usize = 65536;
 const ALLOW_HEADERS: &str =
     "Authorization, Last-Event-ID, Content-Type, If-Match, Idempotency-Key, Accept";
 
