@@ -283,15 +283,15 @@ async fn sighup_queued_behind_a_source_write_loads_the_written_bytes() {
 }
 
 #[tokio::test]
-async fn rejected_restart_reload_keeps_accepted_sources_while_written_bytes_remain() {
+async fn rejected_reload_keeps_accepted_sources_while_written_bytes_remain() {
     let fixture = Fixture::new(Access::Admin, false).await;
     let warm = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
     assert_eq!(fixture.terminal(&warm).await["status"], "succeeded");
     let reloads_before = fixture.reloads.load(Ordering::SeqCst);
     let before = fixture.get(CONFIG).await;
     let main = source(&before, &fixture.originals["main.dae"]);
-    let candidate =
-        fixture.originals["main.dae"].replace("nfqueue_enable: false", "nfqueue_enable: true");
+    let candidate = fixture.originals["main.dae"].replace("fallback: direct", "fallback: block");
+    fixture.reject_reloads.store(1, Ordering::SeqCst);
     let operation = accepted(fixture.replace(main, &candidate).send().await.unwrap()).await;
     let rejected = fixture.terminal(&operation).await;
     assert_eq!(rejected["status"], "failed");
@@ -304,6 +304,7 @@ async fn rejected_restart_reload_keeps_accepted_sources_while_written_bytes_rema
     assert_eq!(fixture.get(CONFIG).await, before);
     assert_eq!(fixture.get(&source_path(main)).await, *main);
     fixture.assert_last_reload(&rejected).await;
+    fixture.reject_reloads.store(0, Ordering::SeqCst);
     let repaired = format!("{}# repaired locally\n", fixture.originals["main.dae"]);
     std::fs::write(fixture.path("main.dae"), &repaired).unwrap();
     let recovery = accepted(fixture.request(Method::POST, RELOAD).send().await.unwrap()).await;
@@ -319,6 +320,68 @@ async fn rejected_restart_reload_keeps_accepted_sources_while_written_bytes_rema
         rejected
     );
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), reloads_before + 2);
+    fixture.shutdown().await;
+}
+
+/// Checks a 422 that names every restart-only setting the candidate changes.
+fn restart_rows(failure: &Value, source_id: &str, level: &str, fields: &[&str]) {
+    let rows: Vec<_> = failure
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["code"] == "restart-required")
+        .collect();
+    assert_eq!(rows.len(), fields.len(), "{failure}");
+    for (row, field) in rows.iter().zip(fields) {
+        assert_eq!(row["level"], level);
+        assert_eq!(row["source_id"], source_id);
+        assert_eq!(
+            row["message"],
+            format!("Changing {field} requires restarting honk")
+        );
+    }
+}
+
+#[tokio::test]
+async fn restart_only_change_is_refused_before_writing() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let before = fixture.get(CONFIG).await;
+    let main = source(&before, &fixture.originals["main.dae"]);
+    let before_disk = disk(fixture.directory.path());
+    let candidate = fixture.originals["main.dae"].replace(
+        "nfqueue_enable: false",
+        "nfqueue_enable: true\n log_level: debug",
+    );
+    let failure = error(
+        fixture.replace(main, &candidate).send().await.unwrap(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unsupported_value",
+    )
+    .await;
+    restart_rows(
+        &failure["error"]["details"]["diagnostics"],
+        main["id"].as_str().unwrap(),
+        "error",
+        &["global.log_level", "global.nfqueue_enable"],
+    );
+    assert_eq!(disk(fixture.directory.path()), before_disk);
+    assert_eq!(fixture.get(CONFIG).await, before);
+    assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
+
+    // Nothing was written, so the accepted hash still matches the disk and the next write goes through.
+    let edited = fixture.originals["main.dae"].replace("fallback: direct", "fallback: block");
+    let operation = accepted(fixture.replace(main, &edited).send().await.unwrap()).await;
+    assert_eq!(fixture.terminal(&operation).await["status"], "succeeded");
+    source(&fixture.get(CONFIG).await, &edited);
+
+    let checked = ok(fixture.validate("full", &candidate).send().await.unwrap()).await;
+    assert_eq!(checked["valid"], true, "{checked}");
+    restart_rows(
+        &checked["diagnostics"],
+        "candidate",
+        "warning",
+        &["global.log_level", "global.nfqueue_enable"],
+    );
     fixture.shutdown().await;
 }
 

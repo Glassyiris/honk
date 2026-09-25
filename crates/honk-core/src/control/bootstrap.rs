@@ -305,8 +305,10 @@ impl ControlPlane {
                 crate::config_diagnostics::ActiveDiagnostics::default(),
             )),
             reload_lock: tokio::sync::Mutex::new(()),
-            log_file_override: None,
-            effective_log_file,
+            log_files: LogFiles {
+                cli_override: None,
+                effective: effective_log_file,
+            },
             ebpf: ebpf_arc,
             router: router_arc,
             proxy_registry,
@@ -409,8 +411,10 @@ impl ControlPlane {
         log_file_override: Option<PathBuf>,
         effective_log_file: Option<PathBuf>,
     ) {
-        self.log_file_override = log_file_override;
-        self.effective_log_file = effective_log_file;
+        self.log_files = LogFiles {
+            cli_override: log_file_override,
+            effective: effective_log_file,
+        };
     }
 
     /// Reap node-bound UDP entries as soon as a real AliveDialerSet transition

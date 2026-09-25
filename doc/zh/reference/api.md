@@ -189,8 +189,11 @@ PUT 与校验 source 对象接受并忽略可选的回传布尔字段 `secrets_r
 | weak、wildcard、多个标签/重复 header、非小写 SHA-256 | `400 invalid_request` |
 | 磁盘 hash 或复查的目标/依赖变化 | `412 stale_revision`，检测到的外部内容不覆盖 |
 | 候选配置或依赖校验失败 | `422 unsupported_value`，不写盘、不 reload |
+| 修改当前运行配置中需重启的设置 | `422 unsupported_value`，不写盘、不 reload；每个设置一条 `error` 级 `restart-required` 诊断，消息写明设置名 |
 | 未授权源、凭据或原生设置修改 | `403 permission_denied` |
 | 操作容量或协调队列繁忙 | `503 temporarily_unavailable` 与 `Retry-After` |
+
+因为 reload 会拒绝修改需重启设置的候选配置，而已写入的文件不回滚，磁盘 hash 会与 accepted hash 不一致，后续写入都返回 412，所以协调器在写入前拒绝。Group PATCH、节点与 provider 编辑、数据库模式的 import 与 revision 激活同样适用；`full` 模式校验以 warning 报告这些诊断。需重启的设置应在配置文件中修改，然后重启 honk。
 
 协调器在副作用前预留 operation，串行处理 API 新写入和 SIGHUP，SIGHUP 也先入队再读盘。单源 overlay 完整校验后，采用目录 FD、拒绝符号链接的普通文件检查、独占临时文件、保留 mode、文件 fsync、目标与完整依赖集复查、原子 rename、目录 fsync。外部编辑器不受协调器约束，最后检查到 rename 之间仍有竞争窗口；UI 保存期间不要并行手工改同一文件。Rename 后若目录 fsync 失败，错误明确携带 `written:true,durability_confirmed:false`：可见内容已经改变，不表示未写或回滚。
 

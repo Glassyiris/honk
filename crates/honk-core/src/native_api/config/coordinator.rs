@@ -11,11 +11,11 @@ use super::super::{
 };
 use super::*;
 use crate::configuration::{Activation, ActivationFailure, ActivationRequest};
-use crate::control::ControlCommand;
+use crate::control::{ControlCommand, LogFiles};
 use crate::subscription::SubscriptionSupervisorHandle;
 use honk_config::parser::LoadedConfig;
 use tokio::sync::watch;
-use validation::{config_error, diagnostics_error};
+use validation::{config_error, diagnostics_error, restart_diagnostics};
 
 pub(crate) struct ConfigCoordinator {
     service: Arc<ConfigService>,
@@ -29,6 +29,7 @@ struct Worker {
     data_dir: PathBuf,
     source_managed: bool,
     active: Arc<tokio::sync::RwLock<Arc<Config>>>,
+    log_files: LogFiles,
     diagnostics: crate::config_diagnostics::SharedDiagnostics,
     commands: mpsc::Sender<ControlCommand>,
     subscriptions: SubscriptionSupervisorHandle,
@@ -43,6 +44,7 @@ impl ConfigService {
         initial: Option<SourceUpdate>,
         data_dir: PathBuf,
         active: Arc<tokio::sync::RwLock<Arc<Config>>>,
+        log_files: LogFiles,
         diagnostics: crate::config_diagnostics::SharedDiagnostics,
         commands: mpsc::Sender<ControlCommand>,
         subscriptions: SubscriptionSupervisorHandle,
@@ -67,6 +69,7 @@ impl ConfigService {
                 data_dir,
                 source_managed: initial.is_some(),
                 active,
+                log_files,
                 diagnostics,
                 activation: Activation::new(commands.clone(), subscriptions.clone()),
                 commands,
@@ -719,6 +722,7 @@ impl Worker {
         let target = accepted.update.sources[index].path.clone();
         let store = self.store.clone().ok_or_else(unsupported)?;
         let active = self.active.read().await.clone();
+        let log_files = self.log_files.clone();
         let data_dir = self.data_dir.clone();
         let mut deferred = self
             .subscriptions
@@ -844,6 +848,29 @@ impl Worker {
                 .any(|secret| !secret.is_empty() && content.contains(secret.as_str()))
             {
                 return Err(denied());
+            }
+            // The reload would reject these, and a rejected reload leaves the written file
+            // ahead of the accepted hash; refuse before writing.
+            let written = validated
+                .sources
+                .iter()
+                .find(|source| source.path == target)
+                .unwrap_or(&validated.sources[0]);
+            let restart = restart_diagnostics(
+                &active,
+                &validated.config,
+                &log_files,
+                &written.source,
+                Severity::Error,
+            );
+            if !restart.is_empty() {
+                diagnostics.extend(restart);
+                return Err(diagnostics_error(
+                    &diagnostics,
+                    &validated.sources,
+                    Some(&source_id),
+                    Some(&accepted.ids),
+                ));
             }
             let recheck = Box::new(|| {
                 #[cfg(test)]

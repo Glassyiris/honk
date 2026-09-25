@@ -1859,6 +1859,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     native_sources,
                     honk_config::paths::data_dir().to_path_buf(),
                     control_plane.config_handle(),
+                    control_plane.log_files(),
                     control_plane.diagnostics_handle(),
                     cmd_tx.clone(),
                     reload_subscription_supervisor.clone(),

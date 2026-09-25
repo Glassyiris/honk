@@ -11,7 +11,9 @@ pub(in crate::control) use fingerprint::{
     dns_routing_state_reusable, effective_config_unchanged, routing_state_reusable,
     subscription_nodes_unchanged,
 };
-pub(in crate::control) use policy::restart_required_changes;
+pub(crate) use policy::{LogFiles, restart_required_fields};
+#[cfg(test)]
+pub(in crate::control) use policy::{RestartField, restart_required_changes};
 #[cfg(feature = "native-api")]
 pub(crate) use transaction::rebase_subscription_nodes;
 

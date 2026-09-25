@@ -76,6 +76,7 @@ impl Worker {
         store: Arc<dyn SourceStore>,
     ) -> Result<Prepared, ApiError> {
         let active = self.active.read().await.clone();
+        let log_files = self.log_files.clone();
         let data_dir = self.data_dir.clone();
         let deferred = self
             .subscriptions
@@ -116,6 +117,22 @@ impl Worker {
                 || validated.config.global.data_dir != active.global.data_dir
             {
                 return Err(denied());
+            }
+            let restart = restart_diagnostics(
+                &active,
+                &validated.config,
+                &log_files,
+                &validated.sources[0].source,
+                Severity::Error,
+            );
+            if !restart.is_empty() {
+                diagnostics.extend(restart);
+                return Err(diagnostics_error(
+                    &diagnostics,
+                    &validated.sources,
+                    None,
+                    None,
+                ));
             }
             let database = store.database().ok_or_else(unsupported)?;
             let committed = match origin {

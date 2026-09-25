@@ -95,6 +95,7 @@ pub(crate) use commands::{ControlCommand, ReloadOutcome, ReloadReply};
 use connection::*;
 use probers::*;
 use reload::*;
+pub(crate) use reload::{LogFiles, restart_required_fields};
 pub(crate) use resource_budget::{MAX_EFFECTIVE_NOFILE, ResourceBudget};
 use sockets::*;
 
@@ -134,8 +135,7 @@ pub struct ControlPlane {
     diagnostics: crate::config_diagnostics::SharedDiagnostics,
     /// Reuse decisions must observe the generation they eventually replace.
     reload_lock: tokio::sync::Mutex<()>,
-    log_file_override: Option<PathBuf>,
-    effective_log_file: Option<PathBuf>,
+    log_files: LogFiles,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     router: Arc<RwLock<Router>>,
     proxy_registry: Arc<ProxyRegistry>,
@@ -307,6 +307,9 @@ impl ControlPlane {
     }
     pub fn config_handle(&self) -> Arc<RwLock<Arc<Config>>> {
         self.config.clone()
+    }
+    pub(crate) fn log_files(&self) -> LogFiles {
+        self.log_files.clone()
     }
 
     pub(crate) async fn install_startup_diagnostics(
