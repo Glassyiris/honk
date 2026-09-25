@@ -333,6 +333,7 @@ impl ControlPlane {
             connection_tracker: Arc::new(ConnectionTracker::new()),
             tcp_flow_pins: Arc::new(TcpFlowPins::default()),
             cache_db: None,
+            mode_db: None,
             state_db: None,
             state_tick: cache::StateTick::default(),
             outbound_id_map,

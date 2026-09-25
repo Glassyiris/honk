@@ -266,7 +266,7 @@ async fn delay_samples_persist_across_suspend_resume_and_stop_at_shutdown() -> a
     let path = directory.path().join("state/honk.db");
     let mut node_id = uuid::Uuid::nil();
     let fixture = Fixture::start_with(|config, _| {
-        config.experimental.cache_file.enabled = true;
+        config.experimental.cache_file.enabled = Some(true);
         config.global.data_dir = directory.path().to_string_lossy().into_owned();
         node_id = config
             .nodes

@@ -722,12 +722,12 @@ pub(super) fn parse_experimental_section(
                 }
                 "cache_file" => {
                     if values.contains_key("enabled") {
-                        config.cache_file.enabled = bool_value(
+                        config.cache_file.enabled = Some(bool_value(
                             &values,
                             "enabled",
                             "experimental.cache_file.enabled",
                             diagnostics,
-                        );
+                        ));
                     }
                     if let Some(value) = values.get("path").map(|text| text.unquote().raw()) {
                         config.cache_file.legacy_path = Some(value.to_owned());

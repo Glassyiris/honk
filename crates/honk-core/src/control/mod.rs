@@ -159,9 +159,11 @@ pub struct ControlPlane {
     connection_pool: Arc<ConnectionPool>,
     connection_tracker: Arc<ConnectionTracker>,
     tcp_flow_pins: Arc<TcpFlowPins>,
-    /// Persistent cache (selector choices, clash mode); opened by `run()`
-    /// via `init_cache_db` when `experimental.cache_file` is enabled.
+    /// Persistent cache (selector choices, delay samples); opened by `run()`
+    /// via `init_cache_db` unless `experimental.cache_file.enabled` is false.
     cache_db: Option<Arc<crate::state::cache::CacheDb>>,
+    /// `cache_db` when `experimental.cache_file` also keeps the Clash mode.
+    mode_db: Option<Arc<crate::state::cache::CacheDb>>,
     /// The state database handed to `init_cache_db`.
     state_db: Option<Arc<crate::state::StateDb>>,
     state_tick: cache::StateTick,
@@ -279,7 +281,7 @@ impl ControlPlane {
         self.datapath_flags = Some(crate::mode::DatapathFlagsHandle::new(
             Arc::clone(&self.ebpf),
             mode_state,
-            self.cache_db.clone(),
+            self.mode_db.clone(),
         ));
         Ok(())
     }

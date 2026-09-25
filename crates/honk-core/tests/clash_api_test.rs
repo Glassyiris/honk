@@ -137,7 +137,7 @@ async fn spawn_app(secret: &str, external_ui: &str) -> TestApp {
 async fn spawn_app_with_config(mut config: Config, secret: &str, external_ui: &str) -> TestApp {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().to_path_buf();
-    config.experimental.cache_file.enabled = true;
+    config.experimental.cache_file.enabled = Some(true);
     config.global.nfqueue_enable = false;
     let (log_layer, log_handle) = clash_api::logs::layer();
     let log_dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(log_layer));

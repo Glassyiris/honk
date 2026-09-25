@@ -48,9 +48,11 @@ impl Default for ClashApiConfig {
 /// state database.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheFileConfig {
-    /// Enable runtime-state persistence.
-    #[serde(default)]
-    pub enabled: bool,
+    /// Unset keeps Selector choices and delay samples; `true` also keeps the
+    /// Clash mode, the Clash GLOBAL selection and, with `store_dns`, DNS
+    /// answers; `false` keeps nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     /// Store DNS cache answers across restarts.
     #[serde(default)]
     pub store_dns: bool,
@@ -66,6 +68,22 @@ pub struct CacheFileConfig {
 }
 
 impl CacheFileConfig {
+    /// Selector choices and delay samples, kept unless `enabled: false`, as
+    /// mihomo's `store-selected` defaults on.
+    pub fn stores_selections(&self) -> bool {
+        self.enabled != Some(false)
+    }
+
+    /// The Clash mode and GLOBAL selection stay opt-in, as sing-box's
+    /// `cache_file` defaults off: a cached mode would override `default_mode`.
+    pub fn stores_mode(&self) -> bool {
+        self.enabled == Some(true)
+    }
+
+    pub fn stores_dns(&self) -> bool {
+        self.enabled == Some(true) && self.store_dns
+    }
+
     /// `(path, cache_id)` as written, for the one-time `cache.db` import.
     pub fn legacy_cache_file(&self) -> (Option<&str>, Option<&str>) {
         (self.legacy_path.as_deref(), self.legacy_cache_id.as_deref())

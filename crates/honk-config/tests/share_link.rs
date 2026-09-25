@@ -578,7 +578,7 @@ fn sample_config() -> Config {
         "https://example.com/ui.zip".to_string();
     config.experimental.clash_api.external_ui_download_detour = "proxy".to_string();
     config.experimental.clash_api.secret = "s3cret".to_string();
-    config.experimental.cache_file.enabled = true;
+    config.experimental.cache_file.enabled = Some(true);
     config.experimental.cache_file.store_dns = true;
 
     config.nodes.push(

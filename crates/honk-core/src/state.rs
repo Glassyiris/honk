@@ -279,11 +279,12 @@ fn remove_legacy_admin(data_dir: &Path) -> Result<bool, StateError> {
 /// Which owners of the cache tables are configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActiveOwners {
-    /// `cache_file.enabled`: selectors, delays and Clash state.
+    /// `cache_file.enabled` not false: selectors and delays.
     pub cache: bool,
     /// `cache_file.store_dns`.
     pub dns: bool,
-    /// Native API off and the Clash API on: Clash mode and GLOBAL.
+    /// `cache_file.enabled: true`, the native API off and the Clash API on:
+    /// Clash mode and GLOBAL.
     pub clash: bool,
     /// `global.store_subscribe`: subscription bodies.
     pub subscriptions: bool,

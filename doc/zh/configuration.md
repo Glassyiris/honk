@@ -275,7 +275,7 @@ dns {
 
 **Clash API。** 非空的 `experimental.clash_api.external_controller` 会启用服务器。除非防火墙和非空 `secret` 已提供保护，否则应保持 loopback 绑定；空 secret 会关闭 API 认证。相对 `external_ui` 依次优先使用 `data_dir` 下、`/var/share/honk` 下和工作目录中的已有目录；都不存在时，在 `data_dir` 下下载 dashboard。`external_ui_download_url` 选择 ZIP 来源，`external_ui_download_detour` 强制下载经过指定节点或组；空值分别保留内建 URL 和普通流量路由。
 
-**缓存文件。** 设置 `experimental.cache_file.enabled: true` 后，Selector 选择、延迟样本与 Clash 模式保存在 `<data_dir>/state/honk.db` 中；`store_dns: true` 还会持久化符合条件的 DNS 应答。`path`、`cache_id` 与 `store_fakeip` 已不起作用；首次启动时 honk 导入并删除旧 `cache.db`（见[升级说明](./reference/experimental.md#从-cachedb-升级)）。
+**缓存文件。** 默认情况下，Selector 选择与延迟样本保存在 `<data_dir>/state/honk.db` 中。设置 `experimental.cache_file.enabled: true` 后还保存 Clash 模式与 GLOBAL 选择，再设置 `store_dns: true` 时还会持久化符合条件的 DNS 应答；设为 `false` 时不保存这些状态。`path`、`cache_id` 与 `store_fakeip` 已不起作用；首次启动时 honk 导入并删除旧 `cache.db`（见[升级说明](./reference/experimental.md#从-cachedb-升级)）。
 
 **首包保留 UDP。** `global.nfqueue_enable` 默认值为 `true`；设置为 `false` 可关闭有歧义 LAN 转发 UDP 的 NFQUEUE 暂存。该设置修改后需重启。若使用 mock eBPF、不带 `ebpf` 的构建，或固定队列前置检查失败，honk 会记录 warning，仅在本进程关闭 NFQUEUE，不会改写配置文件。真实实例取得锁后，启动会绑定队列 `320`，并在发布 `inet honk_nfqueue` / `udp_decision` 前回收残留的自有 nftables table；honk 运行期间，防火墙管理器不得修改这些保留对象。
 
