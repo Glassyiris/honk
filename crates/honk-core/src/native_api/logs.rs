@@ -3,7 +3,7 @@
 use std::{
     fmt,
     sync::{
-        Arc, Weak,
+        Arc, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::SystemTime,
@@ -18,9 +18,10 @@ use tracing::{
     field::{Field, Visit},
 };
 use tracing_subscriber::{
-    Layer,
+    EnvFilter, Layer,
     layer::{Context, Filter},
     registry::LookupSpan,
+    reload,
 };
 
 use super::{
@@ -49,6 +50,7 @@ pub(crate) struct LogStore {
     recording: AtomicBool,
     stopped: AtomicBool,
     level: AtomicU8,
+    engine: OnceLock<EngineLevel>,
 }
 
 impl LogStore {
@@ -61,6 +63,22 @@ impl LogStore {
             recording: AtomicBool::new(recording),
             stopped: AtomicBool::new(false),
             level: AtomicU8::new(level_number(level).expect("validated native log level")),
+            engine: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn attach_engine_level(&self, engine: EngineLevel) {
+        if self.engine.set(engine).is_err() {
+            tracing::warn!(
+                "console and file log filters are already attached; runtime log.level keeps the first pair"
+            );
+        }
+    }
+
+    /// `None` restores the console and file filters honk started with.
+    pub(crate) fn set_engine_level(&self, level: Option<&str>) {
+        if let Some(engine) = self.engine.get() {
+            engine.set(level);
         }
     }
 
@@ -210,6 +228,48 @@ fn level_number(level: &str) -> Option<u8> {
         "debug" => Some(4),
         "trace" => Some(5),
         _ => None,
+    }
+}
+
+type Reload = Box<dyn Fn(Option<&str>) + Send + Sync>;
+
+/// The console and file filters, which a runtime `log.level` replaces until
+/// the next activation restores the startup filters, `RUST_LOG` included.
+#[derive(Default)]
+pub(crate) struct EngineLevel {
+    reloads: Vec<Reload>,
+    current: parking_lot::Mutex<Option<String>>,
+}
+
+impl EngineLevel {
+    pub(crate) fn push<S: 'static>(
+        &mut self,
+        handle: reload::Handle<EnvFilter, S>,
+        startup: EnvFilter,
+    ) {
+        let warned = AtomicBool::new(false);
+        self.reloads.push(Box::new(move |level| {
+            let filter = level.map_or_else(
+                || startup.clone(),
+                |level| EnvFilter::new(format!("{level},{}", crate::QUIET_LOG_TARGETS)),
+            );
+            if let Err(error) = handle.reload(filter)
+                && !warned.swap(true, Ordering::Relaxed)
+            {
+                tracing::warn!(%error, "runtime log.level could not replace a console or file log filter");
+            }
+        }));
+    }
+
+    fn set(&self, level: Option<&str>) {
+        let mut current = self.current.lock();
+        if current.as_deref() == level {
+            return;
+        }
+        *current = level.map(str::to_owned);
+        for reload in &self.reloads {
+            reload(level);
+        }
     }
 }
 

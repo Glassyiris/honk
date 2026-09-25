@@ -75,6 +75,8 @@ impl<'de> Deserialize<'de> for RecorderMode {
 #[derive(Clone, Copy)]
 struct Values {
     level: Level,
+    /// A PATCH chose `level`, which then also applies to console and file.
+    level_overridden: bool,
     logs: usize,
     dns: usize,
     flows: usize,
@@ -89,6 +91,7 @@ impl Values {
     fn configured(config: &Config) -> Self {
         Self {
             level: Level::configured(&config.global.log_level),
+            level_overridden: false,
             logs: 512,
             dns: 512,
             flows: 1024,
@@ -138,6 +141,9 @@ impl Values {
     }
     fn apply(self, owner: &NativeObservation) {
         owner.logs.set_level(self.level.as_str());
+        owner
+            .logs
+            .set_engine_level(self.level_overridden.then(|| self.level.as_str()));
         owner.logs.set_limit(self.logs);
         owner.dns.set_log_limit(self.dns);
         owner.flows.set_limits(self.flows, self.retention);
@@ -330,6 +336,7 @@ impl Settings {
             }
             if let Some(level) = log.level {
                 next.level = level;
+                next.level_overridden = true;
             }
             if let Some(count) = log.buffered_records {
                 if !(64..=512).contains(&count) {
@@ -582,6 +589,75 @@ mod tests {
             false
         );
     }
+    #[test]
+    fn a_runtime_level_reaches_console_and_file_until_activation() {
+        use tracing_subscriber::{EnvFilter, prelude::*};
+        if super::super::logs::tests::run_isolated(
+            "native_api::settings::tests::a_runtime_level_reaches_console_and_file_until_activation",
+        ) {
+            return;
+        }
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut config = Config::default();
+        config.global.log_level = "warn".into();
+        let owner = NativeObservation::new(&config);
+        let mut engine = super::super::logs::EngineLevel::default();
+        let mut sinks = Vec::new();
+        let mut layers = Vec::new();
+        for _ in ["console", "file"] {
+            let sink = Sink::default();
+            let writer = sink.clone();
+            let (filter, handle) = tracing_subscriber::reload::Layer::new(EnvFilter::new("warn"));
+            engine.push(handle, EnvFilter::new("warn"));
+            layers.push(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(move || writer.clone())
+                    .with_filter(filter)
+                    .boxed(),
+            );
+            sinks.push(sink);
+        }
+        owner.logs.attach_engine_level(engine);
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(layers));
+        let emitted = || {
+            tracing::dispatcher::with_default(&dispatch, || tracing::debug!("level probe"));
+            sinks
+                .iter()
+                .map(|sink| !std::mem::take(&mut *sink.0.lock()).is_empty())
+                .collect::<Vec<_>>()
+        };
+        let id = RequestId("settings-test".into());
+        let patch = |body: Value| {
+            owner
+                .settings
+                .patch(
+                    &owner,
+                    &config.experimental.native_api,
+                    serde_json::from_value(body).unwrap(),
+                    &id,
+                )
+                .unwrap();
+        };
+
+        assert_eq!(emitted(), [false, false]);
+        patch(json!({"log":{"level":"debug"}}));
+        assert_eq!(emitted(), [true, true]);
+        patch(json!({"log":{"buffered_records":64}}));
+        assert_eq!(emitted(), [true, true]);
+        owner.settings.activate(&owner, &config);
+        assert_eq!(emitted(), [false, false]);
+    }
+
     fn stream(owner: &NativeObservation, flow_demand: bool) -> super::super::events::Subscription {
         let request = axum::extract::Request::builder()
             .uri("/api/v1/events")
