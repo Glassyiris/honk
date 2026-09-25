@@ -543,19 +543,22 @@ impl ConfigService {
         secrets: &ListenerSecrets,
     ) -> (Value, bool) {
         let source = &accepted.update.sources[index];
-        let (content, redacted) = secrets.mask(&source.content);
+        let (content, mut redacted) = secrets.mask(&source.content);
         let (path, path_redacted) = secrets.mask(&source_path(accepted, index).to_string_lossy());
-        let (absolute_path, absolute_redacted) = secrets.mask(&source.path.to_string_lossy());
-        // Db paths are labels, not files an operator could open.
-        let absolute_path = (self.store_kind() == StoreKind::File).then_some(absolute_path);
-        let value = json!({
+        let mut value = json!({
             "id":accepted.ids[&source.path], "path":path,
-            "absolute_path":absolute_path, "kind":if index==0 {"main"} else {"include"},
+            "kind":if index==0 {"main"} else {"include"},
             "content_sha256":accepted.hashes[index], "bytes":source.content.len(),
             "writable":self.source_writable_with_secrets(accepted,index,secrets) && !self.store_blocked(), "loaded_at":timestamp(accepted.accepted_at),
             "line_count":source.content.lines().count(), "content":content,
         });
-        (value, redacted || path_redacted || absolute_redacted)
+        // Database source paths are labels, not files an operator could open.
+        if self.store_kind() == StoreKind::File {
+            let (absolute_path, absolute_redacted) = secrets.mask(&source.path.to_string_lossy());
+            value["absolute_path"] = Value::String(absolute_path);
+            redacted |= absolute_redacted;
+        }
+        (value, redacted || path_redacted)
     }
 
     pub(crate) fn snapshot(&self) -> Option<Value> {

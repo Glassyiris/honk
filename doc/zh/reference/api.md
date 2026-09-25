@@ -205,7 +205,7 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 数据库为空时，启动过程导入 `-c`，要求启用 `native_api.enabled` 与 `config_write` 并配置凭据。导入删除 `native_api` 与 `clash_api` 中的全部 `secret:`，确认去除凭据的源树在重新套用凭据后解析出相同配置，再以 principal `startup` 记录 revision 1。若凭据值在删除后仍残留（例如在注释或文件名中），导入被拒绝。已有 revision 时，启动过程加载当前 revision，不读取 `-c`；若启动期间另一实例移动了 `head`，启动终止；只有不持有实例锁的 mock 模式实例会造成这种情况。数据库模式不提供 Clash API：无论导入的源树还是当前 revision，只要 `experimental.clash_api.external_controller` 非空，启动即被拒绝。数据库损坏、`application_id` 不符或 schema 版本更高时拒绝启动；数据库不会被改名或重建。
 启动与 API 重新导入会恢复剥离的凭据，并对齐解析器临时生成的群组/订阅 ID 和解析时间戳，再严格比较配置值。节点派生身份、端点、群组定义和订阅抓取设置仍必须一致。
 
-监听凭据与 revision 分开保存，从不返回。写入不能修改监听凭据、`native_api` 设置或 `global.data_dir`，否则返回 403；含已保存凭据值的源也会被拒绝。响应与 `--without-secrets` 导出均遮蔽这两个已保存的值。数据库模式下源 `absolute_path` 为 null，源路径只是标签，不对应文件；`If-Match` 比较数据库中保存的源字节。
+监听凭据与 revision 分开保存，从不返回。写入不能修改监听凭据、`native_api` 设置或 `global.data_dir`，否则返回 403；含已保存凭据值的源也会被拒绝。响应与 `--without-secrets` 导出均遮蔽这两个已保存的值。数据库模式下源省略 `absolute_path` 字段，源路径只是标签，不对应文件；`If-Match` 比较数据库中保存的源字节。
 
 写入先激活再记录。激活提交后（包括 degraded 与 reconciliation 失败的提交）才写入 revision 行并移动 `head`；激活被拒绝时不增加记录，并报告 `written:false`。记录失败时，操作以 `details {stage:"store",committed:true,durable:false}` 失败；引擎在确认激活前停止时，操作以 `details {stage:"store",committed:null}` 失败。两种情况下，`store.recorded` 变为 false，capabilities 报告配置不可写，导出文件名不含 revision，写入返回 `503 temporarily_unavailable` 与 `details.stage:"store"`。激活 `head` 所在的 revision 会重新激活它而不增加记录，并解除该状态；重启同样会解除，重启后加载 `head`。最多保留 50 个 revision，按存储的 JSON 计共 16 MiB，从最旧的开始清理，不删除当前 revision。JSON 转义可能使 revision 大于源文件本身；单个 revision 的 JSON 超过 16 MiB 时拒绝写入。
 

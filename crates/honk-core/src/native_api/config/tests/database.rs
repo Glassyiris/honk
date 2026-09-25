@@ -215,7 +215,20 @@ async fn import_export_and_activate_record_revisions() {
         config["store"],
         json!({"kind":"db","revision":1,"parent":null,"recorded":true})
     );
-    assert!(config["sources"][0]["absolute_path"].is_null());
+    assert!(
+        config["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|source| source.get("absolute_path").is_none())
+    );
+    let main = fixture
+        .get(&format!(
+            "{CONFIG}/sources/{}",
+            config["sources"][0]["id"].as_str().unwrap()
+        ))
+        .await;
+    assert!(main.get("absolute_path").is_none());
     let capabilities = fixture.get("/api/v1/capabilities").await;
     assert_eq!(capabilities["resources"]["config"]["store"], "db");
     assert_eq!(
