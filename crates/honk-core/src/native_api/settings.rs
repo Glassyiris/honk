@@ -229,6 +229,10 @@ impl Settings {
     pub(crate) fn flow_recording(&self) -> bool {
         self.values.lock().active()[0]
     }
+    pub(crate) fn flow_limits(&self) -> (usize, u64) {
+        let values = self.values.lock();
+        (values.flows, values.retention)
+    }
     fn snapshot(&self) -> Value {
         let current = self.values.lock();
         self.json(*current)

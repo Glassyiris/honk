@@ -763,4 +763,21 @@ mod tests {
         stop.send(true).unwrap();
         sampler.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn flow_capability_reports_runtime_limits() {
+        let state = state().await;
+        let request = axum::http::Request::patch("/api/v1/runtime/settings")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"flows":{"max_flows":64,"retention_seconds":60}}"#,
+            ))
+            .unwrap();
+        settings::patch(&state, request, &RequestId("test".into()))
+            .await
+            .unwrap();
+        let flows = &types::capabilities(&state).await["resources"]["flows"];
+        assert_eq!(flows["max_flows"], 64);
+        assert_eq!(flows["retention_seconds"], 60);
+    }
 }
