@@ -38,6 +38,7 @@
 | `writable_includes` | 空列表 | 为兼容旧配置而接受，不产生作用；不授予路径权限，也不限制已接受 include。 |
 | `geosite_download_url` | `""` | 更新已加载 geosite 的最终直达 HTTP(S) 来源，最长 4096 字节；要求 `config_write`。有状态库时，已设置的 URL 在启动时写入已存储的 geodata 来源，覆盖通过 API 修改的 URL；删除该项后，下次启动时该资产恢复内置 URL。更新使用已存储或内置的 URL。没有状态库时，URL 为空则不能更新。 |
 | `geoip_download_url` | `""` | 更新已加载 geoip 的最终直达 HTTP(S) 来源，使用相同授权与限制。 |
+| `geodata_download_detour` | `""` | Geodata 下载的出口：`direct`、`routing` 或组名。有状态库时，启动时按与 URL 相同的规则写入已存储的路由；空值使已存储的路由（默认 `direct`）继续生效。与 `external_ui_download_detour` 不同，空值不表示遵循路由规则。未知的组在准入时拒绝。 |
 
 ```dae
 experimental {
@@ -65,7 +66,7 @@ experimental {
 
 单文件部署可使用 `cargo build -p honk-core --features native-ui` 与 `ui: embedded`；`native-ui` 隐含 `native-api`，不要求 Clash。没有 `native-ui` 时启用内嵌托管会启动失败。静态资源不注入凭据；客户端通过公共 discovery 选择静态 token 输入或密码 setup/login。产物/源码身份、对应源码分发和管理契约见 [API 参考](./api.md#内嵌-doona-来源)。
 
-Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒绝 userinfo、fragment、redirect 与 content encoding。域名来源要求 `global.bootstrap_resolver`，不回退系统 DNS、不选择代理 detour；所有已加载资产都要有配置来源才能更新。[M9 契约](./api.md#主文件条目与-geodata-管理m9)区分网络期限、已验证字节激活及部分耐久替换，不承诺回滚。
+Geodata 来源由管理员配置、需重启，不能通过源写入修改；拒绝 userinfo、fragment、redirect 与 content encoding。直连的域名来源要求 `global.bootstrap_resolver`，不回退系统 DNS。`geodata_download_detour` 或已存储的路由可改为遵循路由规则或经过组下载；路由无法承载请求时不会回退到直连。所有已加载资产都要有配置来源才能更新。[M9 契约](./api.md#主文件条目与-geodata-管理m9)区分网络期限、已验证字节激活及部分耐久替换，不承诺回滚。
 
 ### M5：共用采样与可选历史
 
