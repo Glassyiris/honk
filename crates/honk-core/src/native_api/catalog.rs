@@ -765,7 +765,7 @@ pub(super) fn snapshot_unavailable(id: &RequestId) -> ApiError {
     error(
         StatusCode::SERVICE_UNAVAILABLE,
         ErrorCode::SnapshotUnavailable,
-        "Snapshot capacity exceeded",
+        "A coherent snapshot is unavailable",
         id,
     )
 }

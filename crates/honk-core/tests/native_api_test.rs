@@ -162,6 +162,35 @@ async fn response_json(response: Response) -> Value {
 }
 
 #[tokio::test]
+async fn routing_reads_that_cannot_pin_the_router_are_retryable_snapshot_unavailable() {
+    let app = TestApp::new(|_| {}).await;
+    let router = app.control.traffic_router();
+    let reload = router.write().await;
+    let wait = Duration::from_secs(10);
+    let (rules, trace) = tokio::join!(
+        app.get("/api/v1/rules").timeout(wait).send(),
+        app.client
+            .post(app.url("/api/v1/routing/trace"))
+            .bearer_auth(SECRET)
+            .json(&json!({"input":{"network":"tcp","dst_ip":"198.51.100.20","dst_port":443}}))
+            .timeout(wait)
+            .send(),
+    );
+    drop(reload);
+    for response in [rules.unwrap(), trace.unwrap()] {
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "1");
+        error_response(
+            response,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "snapshot_unavailable",
+        )
+        .await;
+    }
+    app.shutdown().await;
+}
+
+#[tokio::test]
 async fn diagnostic_json_requests_reject_duplicate_and_unsupported_media_types() {
     let app = TestApp::new(|_| {}).await;
     for path in ["/api/v1/probes", "/api/v1/routing/trace"] {
