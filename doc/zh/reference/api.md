@@ -58,7 +58,7 @@
 
 连接 `outbound` 是选路当时的组/动作，不是当前叶节点或重建选择。启用记录时，`flow_id`、捕获的 root-first 组/叶 ID、首次观测 UTC、domain 来源与用户态 rule ID 关联保留证据；缺失或淘汰的证据保持 unknown。逐连接 rate 仍为 null。空列表是 `visibility: partial`，不代表设备没有连接。Mock 数据面显示 disabled/none；真实后端只依据实际程序、hooks、routing root、listener 和 admission 观测报告状态，未知项为 unknown/null，覆盖仍为 partial。HTTP 就绪不等于数据面就绪。
 
-单项 DELETE 的 `204` 表示已确认精确 TCP UUID 的转发任务结束，或精确 UDP token/generation/source view 的退役、backend 确认及已准入发送/回复排空；不是删除 tracker 行。共享 XUDP 只关闭本 view，不关闭其他 view 共用的 carrier，也不重放报文。已消失返回 404，不可关闭的非用户态 owner 返回 409，无法确认退役返回 503。批量只捕获一次匹配集合，支持 `type=tcp|udp|all`、无端口 `src`；未限制网络或来源时必须 `all=true`（仅 `type=all` 不算过滤）。超过 1000 条先返回 413，零关闭；成功返回实际 `closed/skipped`。关闭已选集合后出现的新连接不受影响；503 不表示已完成的关闭回滚。DELETE body 必须为空；重复 `Idempotency-Key` 仍检查当前连接状态，不重放旧结果。
+单项 DELETE 的 `204` 表示已确认精确 TCP UUID 的转发任务结束，或精确 UDP token/generation/source view 的退役、backend 确认及已准入发送/回复排空；不是删除 tracker 行。共享 XUDP 只关闭本 view，不关闭其他 view 共用的 carrier，也不重放报文。已消失返回 404，不可关闭的非用户态 owner 返回 409，无法确认退役返回 503。批量只捕获一次匹配集合，支持 `type=tcp|udp|all`、无端口 `src`；未限制网络或来源时必须 `all=true`（仅 `type=all` 不算过滤）。超过 1000 条先返回 413，零关闭；成功返回实际 `closed/skipped`。关闭已选集合后出现的新连接不受影响；批量关闭中任一退役无法确认时，等全部已选连接处理完再返回 503，`error.details` 带 `closed/skipped` 计数，这些连接不会回滚。DELETE body 必须为空；重复 `Idempotency-Key` 仍检查当前连接状态，不重放旧结果。
 
 TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，成功写出的嗅探前缀仅计一次；UDP 保持原逐包语义。唯一的一秒 sampler 使用实际时间间隔；初次采样、reset 和 overflow 返回 null rate，不补零。`counter_since` 属于共用计数器生命周期，`sampled_at` 属于流量样本，`observed_at` 属于 HTTP 观察。UInt64 使用十进制字符串，有界数量仍为 JSON number。CPU 仍未知。`generation.activated_at` 是当前 generation 的发布时间，启动 generation 取引擎首次进入运行状态的时间。配置激活或挂起后重建进行期间，`generation.state` 为 `reloading`；引擎运行且健康时，`lifecycle.state` 同为 `reloading`。有源管理器时提供配置 revision，`last_reload` 提供最近完成的 API reload operation 结果，否则为 null。
 

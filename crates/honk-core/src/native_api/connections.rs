@@ -112,12 +112,19 @@ pub(super) async fn close_bulk(
             )
         })?;
     // All claims precede the first wait; HTTP cancellation cannot abandon a suffix.
-    let mut pending: FuturesUnordered<_> = selected
+    let outcomes: Vec<_> = selected
         .into_iter()
         .map(|selected| state.tracker.start_close(selected).wait())
-        .collect();
+        .collect::<FuturesUnordered<_>>()
+        .collect()
+        .await;
+    bulk_result(outcomes, id)
+}
+
+/// A failed bulk close still reports its counts: those connections stay closed.
+fn bulk_result(outcomes: Vec<CloseOutcome>, id: &RequestId) -> Result<Response, ApiError> {
     let (mut closed, mut skipped, mut uncertain) = (0usize, 0usize, false);
-    while let Some(outcome) = pending.next().await {
+    for outcome in outcomes {
         match outcome {
             CloseOutcome::Closed => closed += 1,
             CloseOutcome::NotClosable => skipped += 1,
@@ -125,8 +132,40 @@ pub(super) async fn close_bulk(
             CloseOutcome::Failed => uncertain = true,
         }
     }
+    let counts = serde_json::json!({"closed":closed,"skipped":skipped});
     if uncertain {
-        return Err(failed(id));
+        return Err(failed(id).with_details(counts));
     }
-    Ok(Json(serde_json::json!({"closed":closed,"skipped":skipped})).into_response())
+    Ok(Json(counts).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_bulk_close_reports_what_it_already_closed() {
+        let id = RequestId("request-close".into());
+        let response = bulk_result(
+            vec![
+                CloseOutcome::Closed,
+                CloseOutcome::Failed,
+                CloseOutcome::NotClosable,
+                CloseOutcome::Closed,
+                CloseOutcome::Gone,
+            ],
+            &id,
+        )
+        .unwrap_err()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "1");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "temporarily_unavailable");
+        assert_eq!(
+            body["error"]["details"],
+            serde_json::json!({"closed": 2, "skipped": 1})
+        );
+    }
 }
