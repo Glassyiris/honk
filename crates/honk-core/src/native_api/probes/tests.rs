@@ -537,7 +537,7 @@ async fn deadline_drains_started_socket_and_keeps_unstarted_rows_neutral() {
 }
 
 #[tokio::test]
-async fn four_active_jobs_bound_wire_work_and_queued_request_cancellation_does_not_cancel_job() {
+async fn four_active_jobs_bound_wire_work_and_fifth_request_is_answered_as_queued() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let mut config = Config::default();
@@ -575,32 +575,32 @@ async fn four_active_jobs_bound_wire_work_and_queued_request_cancellation_does_n
         json!(["tcp"]),
         "ipv4",
     );
-    let caller = tokio::spawn({
-        let state = Arc::clone(&state);
-        let input = input.clone();
-        async move {
+    // The fifth job waits for a worker, but its request is answered at once.
+    let queued = body(
+        tokio::time::timeout(
+            Duration::from_secs(1),
             create(
                 &state,
-                http_request(&input, "disconnected"),
+                http_request(&input, "queued"),
                 &RequestId("queued".into()),
-            )
-            .await
-        }
-    });
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while state.observation.probes.sender.capacity() == MAX_QUEUED {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+            ),
+        )
+        .await
+        .expect("queued probe must not hold the request")
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(queued["status"], "queued");
+    let operation = queued["operation_id"].as_str().unwrap();
+    assert_eq!(
+        body(state.observation.operations.get(operation).unwrap()).await["status"],
+        "queued"
+    );
     assert!(
         tokio::time::timeout(Duration::from_millis(30), listener.accept())
             .await
             .is_err()
     );
-    caller.abort();
-    let _ = caller.await;
     for mut socket in held {
         socket
             .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
@@ -619,14 +619,15 @@ async fn four_active_jobs_bound_wire_work_and_queued_request_cancellation_does_n
     let replay = body(
         create(
             &state,
-            http_request(&input, "disconnected"),
+            http_request(&input, "queued"),
             &RequestId("replay".into()),
         )
         .await
         .unwrap(),
     )
     .await;
-    let result = terminal(&state, replay["operation_id"].as_str().unwrap()).await;
+    assert_eq!(replay["operation_id"], operation);
+    let result = terminal(&state, operation).await;
     assert_eq!(result["result"]["results"][0]["state"], "healthy");
     stop.send(true).unwrap();
     worker.await.unwrap();

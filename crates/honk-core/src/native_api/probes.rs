@@ -57,6 +57,22 @@ const MAX_ACTIVE: usize = 4;
 const MAX_QUEUED: usize = 16;
 const DEADLINE: Duration = Duration::from_secs(30);
 
+/// Operation error for an admitted job that ended before measurement.
+type Unmeasured = (&'static str, &'static str);
+const CANCELLED: Unmeasured = ("probe_cancelled", "Probe was cancelled before measurement.");
+const EXPIRED: Unmeasured = (
+    "probe_deadline",
+    "Probe deadline expired before measurement.",
+);
+const NOT_PERMITTED: Unmeasured = (
+    "unsupported_value",
+    "The configured probe target or protocol is not permitted.",
+);
+const ENGINE_UNAVAILABLE: Unmeasured = (
+    "engine_unavailable",
+    "Engine is not ready for this operation",
+);
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum Kind {
@@ -454,8 +470,7 @@ impl ProbeService {
                     command = commands.recv() => match command {
                         Some(Command::Pause(reply)) => {
                             while let Ok(job) = receiver.try_recv() {
-                                owner.operations.reject(&job.reservation.id, paused());
-                                owner.targets.lock().remove(&job.plan.context.spec.target.key());
+                                owner.cancel_queued(&job);
                             }
                             owner.drain_requests().await;
                             while let Some(result) = jobs.join_next().await { clean &= matches!(result, Ok(Ok(()))); }
@@ -488,8 +503,7 @@ impl ProbeService {
                         let Some(job) = job else { break; };
                         let gate = owner.gate.lock();
                         if gate.state != WorkerState::Running {
-                            owner.operations.reject(&job.reservation.id, paused());
-                            owner.targets.lock().remove(&job.plan.context.spec.target.key());
+                            owner.cancel_queued(&job);
                             continue;
                         }
                         let cancel = gate.cancel.subscribe();
@@ -507,11 +521,7 @@ impl ProbeService {
             commands.close();
             receiver.close();
             while let Some(job) = receiver.recv().await {
-                owner.operations.reject(&job.reservation.id, unavailable());
-                owner
-                    .targets
-                    .lock()
-                    .remove(&job.plan.context.spec.target.key());
+                owner.cancel_queued(&job);
             }
             owner.drain_requests().await;
             while jobs.join_next().await.is_some() {}
@@ -550,8 +560,17 @@ impl ProbeService {
             .try_reserve()
             .map_err(|_| reject(unavailable()))?;
         targets.insert(key);
+        self.operations.accept(&job.reservation.id);
         permit.send(job);
         Ok(())
+    }
+    fn cancel_queued(&self, job: &Job) {
+        let (code, message) = CANCELLED;
+        self.operations
+            .fail(&job.reservation.id, code, message, None);
+        self.targets
+            .lock()
+            .remove(&job.plan.context.spec.target.key());
     }
     async fn run_job(
         &self,
@@ -564,59 +583,48 @@ impl ProbeService {
             target: job.plan.context.spec.target.key(),
             id: job.reservation.id.clone(),
         };
+        let id = &job.reservation.id;
+        self.operations.running(id);
         let preparation = wire::bounded(job.deadline, stop.clone(), async {
-            state.require_running()?;
-            let plan = prepare(&self.policy, job.plan).await?;
-            state.require_running()?;
-            if *stop.borrow() {
-                return Err(paused());
-            }
-            Ok(plan)
+            state.require_running().map_err(|_| ENGINE_UNAVAILABLE)?;
+            prepare(&self.policy, job.plan)
+                .await
+                .map_err(|_| NOT_PERMITTED)
         })
         .await;
-        match preparation {
+        let (code, message) = match preparation {
             Ok(Ok(mut plan)) => {
-                let accepted = {
+                let start = {
                     let gate = self.gate.lock();
                     if gate.state != WorkerState::Running || *stop.borrow() {
-                        self.operations.reject(&job.reservation.id, paused());
-                        false
-                    } else if let Err(error) = state.require_running() {
-                        self.operations.reject(&job.reservation.id, error);
-                        false
+                        Err(CANCELLED)
                     } else {
-                        self.operations.accept(&job.reservation.id)
+                        state.require_running().map_err(|_| ENGINE_UNAVAILABLE)
                     }
                 };
-                if accepted {
-                    self.operations.running(&job.reservation.id);
-                    if execute(state, &mut plan, job.deadline, stop).await.is_err() {
-                        self.operations.fail_with_result(
-                            &job.reservation.id,
-                            "probe_cleanup_failed",
-                            "Probe runtime cleanup failed.",
-                            OperationResult::Probe(plan.result),
-                        );
-                        return Err(ProbeLifecycleError::CleanupFailed);
+                match start {
+                    Ok(()) => {
+                        if execute(state, &mut plan, job.deadline, stop).await.is_err() {
+                            self.operations.fail_with_result(
+                                id,
+                                "probe_cleanup_failed",
+                                "Probe runtime cleanup failed.",
+                                OperationResult::Probe(plan.result),
+                            );
+                            return Err(ProbeLifecycleError::CleanupFailed);
+                        }
+                        self.operations
+                            .succeed(id, OperationResult::Probe(plan.result));
+                        return Ok(());
                     }
-                    self.operations
-                        .succeed(&job.reservation.id, OperationResult::Probe(plan.result));
+                    Err(unmeasured) => unmeasured,
                 }
             }
-            Ok(Err(error)) => {
-                self.operations.reject(&job.reservation.id, error);
-            }
-            Err(_) => {
-                self.operations.reject(
-                    &job.reservation.id,
-                    if *stop.borrow() {
-                        paused()
-                    } else {
-                        unavailable()
-                    },
-                );
-            }
-        }
+            Ok(Err(unmeasured)) => unmeasured,
+            Err(_) if *stop.borrow() => CANCELLED,
+            Err(_) => EXPIRED,
+        };
+        self.operations.fail(id, code, message, None);
         Ok(())
     }
 }

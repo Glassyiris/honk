@@ -271,7 +271,14 @@ impl OperationStore {
             ));
         }
         if records.len() == MAX_OPERATIONS {
-            return Err(unavailable());
+            let oldest = records
+                .iter()
+                .enumerate()
+                .filter_map(|(index, record)| record.terminal_at.map(|at| (at, index)))
+                .min()
+                .map(|(_, index)| index)
+                .ok_or_else(unavailable)?;
+            records.remove(oldest);
         }
         let id = Uuid::new_v4().to_string();
         let (sender, receiver) = watch::channel(None);

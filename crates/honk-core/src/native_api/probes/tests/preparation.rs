@@ -95,14 +95,13 @@ async fn family_preparation(refusal: bool, response_code: u8) {
         &RequestId("family".into()),
     )
     .await;
+    let accepted = body(response.unwrap()).await;
+    let result = terminal(&state, accepted["operation_id"].as_str().unwrap()).await;
     if refusal {
-        assert_eq!(
-            response.unwrap_err().into_response().status(),
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
+        assert_eq!(result["status"], "failed");
+        assert_eq!(result["error"]["code"], "unsupported_value");
+        assert_eq!(result["result"], Value::Null);
     } else {
-        let accepted = body(response.unwrap()).await;
-        let result = terminal(&state, accepted["operation_id"].as_str().unwrap()).await;
         assert_eq!(
             result["result"]["results"][0]["error"],
             "address_unavailable"

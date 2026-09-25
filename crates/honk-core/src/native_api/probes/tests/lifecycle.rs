@@ -219,15 +219,10 @@ async fn pause_drains_started_and_disconnected_queued_jobs_then_resumes_same_own
         .unwrap();
     assert!(!service.running());
     assert_eq!(service.capability()["available"], false);
-    assert_eq!(
-        waiter
-            .admission()
-            .await
-            .unwrap_err()
-            .into_response()
-            .status(),
-        StatusCode::CONFLICT
-    );
+    let queued = waiter.admission().await.unwrap().operation_id;
+    let cancelled = terminal(&state, &queued).await;
+    assert_eq!(cancelled["status"], "failed");
+    assert_eq!(cancelled["error"]["code"], "probe_cancelled");
     for mut socket in held {
         let mut byte = [0];
         assert_eq!(
