@@ -134,7 +134,7 @@ impl Values {
     fn json(self) -> Value {
         let active = self.active();
         let recorder = |index: usize| json!({"allowed": self.allowed[index], "mode": self.modes[index], "active": active[index]});
-        json!({"observed_at":chrono::Utc::now().to_rfc3339(),"source":if self.overridden {"runtime"} else {"config"},
+        json!({"observed_at":super::timestamp(std::time::SystemTime::now()),"source":if self.overridden {"runtime"} else {"config"},
             "log":{"level":self.level,"buffered_records":self.logs},"dns_log":{"max_records":self.dns},
             "flows":{"max_flows":self.flows,"retention_seconds":self.retention},
             "recording":{"flows":recorder(0),"logs":recorder(1),"dns_log":recorder(2),"events":{"active":self.events_active()},"grace_remaining_seconds":0}})

@@ -351,7 +351,7 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
     let rules = super::routing::rules_capability();
     let (max_flows, flow_retention) = state.observation.settings.flow_limits();
     json!({
-        "observed_at": chrono::Utc::now().to_rfc3339(),
+        "observed_at": super::timestamp(std::time::SystemTime::now()),
         "profiles": ["base"],
         "limits": {
             "max_request_target_bytes": 4096,

@@ -803,4 +803,30 @@ mod tests {
                 .contains(&serde_json::json!("process.rss_bytes"))
         );
     }
+
+    #[tokio::test]
+    async fn observed_at_uses_the_shared_millisecond_format() {
+        let state = state().await;
+        let response = settings::get(
+            &state,
+            &"/api/v1/runtime/settings".parse().unwrap(),
+            &RequestId("test".into()),
+        )
+        .await
+        .unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        for observed in [
+            &types::capabilities(&state).await["observed_at"],
+            &settings["observed_at"],
+        ] {
+            let observed = observed.as_str().unwrap();
+            let parsed = chrono::DateTime::parse_from_rfc3339(observed).unwrap();
+            assert_eq!(observed, timestamp(parsed.into()));
+        }
+    }
 }
