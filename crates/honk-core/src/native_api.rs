@@ -150,6 +150,7 @@ impl NativeState {
                 .map(Arc::new)
         });
         let observation = control.native_observation();
+        observation.telemetry.discover().await;
         let phase = control.observe_phase();
         observation.configuration.attach_phase(phase.clone());
         Ok(Self {
@@ -788,6 +789,18 @@ mod tests {
         assert_eq!(
             flows["scopes"],
             serde_json::json!(["userspace_tcp", "userspace_udp", "dns_intercept"])
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_capability_lists_metrics_before_the_first_sample() {
+        let state = state().await;
+        let metrics = &types::capabilities(&state).await["resources"]["runtime_memory"]["metrics"];
+        assert!(
+            metrics
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("process.rss_bytes"))
         );
     }
 }

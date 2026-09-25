@@ -36,6 +36,16 @@ struct Samples {
     memory: Option<VecDeque<Sample<MemoryPoint>>>,
 }
 
+impl Samples {
+    fn learn(&mut self, reading: &MemoryReading) {
+        for metric in reading.metrics() {
+            if !self.metrics.contains(&metric) {
+                self.metrics.push(metric);
+            }
+        }
+    }
+}
+
 struct Sample<T> {
     at: SystemTime,
     recorded: Instant,
@@ -92,6 +102,12 @@ impl Telemetry {
         self.state.lock().metrics.clone()
     }
 
+    /// Fixes the readable metric names before the first sample, so capabilities do not start empty.
+    pub(super) async fn discover(&self) {
+        let reading = read_memory(Path::new("/proc/self")).await;
+        self.state.lock().learn(&reading);
+    }
+
     pub(super) async fn sample(&self, traffic: &TrafficSummary) {
         let reading = read_memory(Path::new("/proc/self")).await;
         let at = SystemTime::now();
@@ -106,11 +122,7 @@ impl Telemetry {
         now: Instant,
     ) {
         let mut samples = self.state.lock();
-        for metric in reading.metrics() {
-            if !samples.metrics.contains(&metric) {
-                samples.metrics.push(metric);
-            }
-        }
+        samples.learn(&reading);
         if let Some(ring) = &mut samples.traffic {
             prune(ring, now);
             if let Some(sampled_at) = &traffic.sampled_at
