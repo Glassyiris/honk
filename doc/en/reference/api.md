@@ -24,6 +24,7 @@ The base contract is [api-standardize cb8ac07c6520b7fb08539cc0b7701695f5a07992](
 | GET | `/api/v1/flows`, `/api/v1/flows/{flow_id}` | Active and retained terminal userspace decisions; detail includes the source-recorded trace. |
 | GET | `/api/v1/nodes` | Stable node IDs, current direct group membership/provenance and qualified measurements. |
 | POST | `/api/v1/nodes` | Create a main-source node from `{name,link}`; 201 only after activation. |
+| GET | `/api/v1/nodes/{id}` | One node in the list projection; unknown IDs return 404. |
 | DELETE | `/api/v1/nodes/{id}` | Remove a main-source inline node; return `{deleted:0\|1}` after activation. |
 | GET | `/api/v1/groups`, `/api/v1/groups/{groupId}` | Pure group observations, direct members, config revision/ETag and captured health. |
 | PUT | `/api/v1/groups/{groupId}/selection` | Select one direct member for `tcp`, `udp` or `both`. |

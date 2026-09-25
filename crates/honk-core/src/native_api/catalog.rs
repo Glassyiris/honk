@@ -486,16 +486,7 @@ pub(super) async fn nodes(
     let config = state.config.read().await;
     let identity = state.observation.catalog.snapshot();
     let manager = state.group_manager.read().clone();
-    let secrets = {
-        let accepted = state.observation.configuration.sources.accepted.read();
-        state
-            .observation
-            .configuration
-            .secrets(accepted.as_ref())
-            .as_ref()
-            .clone()
-            .with_clash(&state.clash_secret)
-    };
+    let secrets = listener_secrets(state);
     let snapshot = node_snapshot(
         &config,
         &manager,
@@ -507,6 +498,50 @@ pub(super) async fn nodes(
     )?;
     drop(config);
     state.observation.catalog.page(snapshot, limit, id)
+}
+
+pub(super) async fn node(
+    state: &NativeState,
+    node_id: &str,
+    uri: &Uri,
+    id: &RequestId,
+) -> Result<Response, ApiError> {
+    parse_query(uri, &[], id)?;
+    let config = state.config.read().await;
+    let identity = state.observation.catalog.snapshot();
+    let manager = state.group_manager.read().clone();
+    Uuid::parse_str(node_id)
+        .ok()
+        .and_then(|node_id| {
+            node_value(
+                &config,
+                &identity,
+                &manager,
+                &state.alive_set,
+                node_id,
+                &listener_secrets(state),
+            )
+        })
+        .map(|value| Json(value).into_response())
+        .ok_or_else(|| {
+            error(
+                StatusCode::NOT_FOUND,
+                ErrorCode::ResourceNotFound,
+                "Node not found",
+                id,
+            )
+        })
+}
+
+fn listener_secrets(state: &NativeState) -> ListenerSecrets {
+    let accepted = state.observation.configuration.sources.accepted.read();
+    state
+        .observation
+        .configuration
+        .secrets(accepted.as_ref())
+        .as_ref()
+        .clone()
+        .with_clash(&state.clash_secret)
 }
 
 fn member_id(member: NativeGroupMember<'_>, identity: &CatalogIdentity) -> Option<String> {
