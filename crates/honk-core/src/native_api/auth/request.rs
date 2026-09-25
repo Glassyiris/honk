@@ -111,7 +111,8 @@ pub(crate) async fn setup(
                     "The administrator record's durability could not be confirmed",
                     Some(id.0.clone()),
                 )
-                .with_details(json!({"durability_confirmed": false}))),
+                .with_details(json!({"durability_confirmed": false}))
+                .without_retry_after()),
                 Err(SetupError::Unavailable) => Err(ApiError::new(
                     StatusCode::SERVICE_UNAVAILABLE,
                     ErrorCode::TemporarilyUnavailable,

@@ -579,3 +579,38 @@ async fn blocked_setup_keeps_discovery_live_and_shutdown_joins_dropped_work() {
     assert!(auth.store.verify("admin", "correct horse battery"));
     assert_eq!(admin_rows(data.path()), 1);
 }
+
+#[tokio::test]
+async fn an_unconfirmed_setup_write_is_not_retryable() {
+    use crate::native_api::router;
+    use axum::body::Body;
+    use tower::ServiceExt as _;
+
+    let data = temp_data_dir();
+    let db = Arc::new(StateDb::open(data.path()).unwrap());
+    let auth = Arc::new(Auth::open(Arc::clone(&db), data.path()).unwrap());
+    let mut state = crate::native_api::tests::state().await;
+    Arc::get_mut(&mut state).unwrap().auth = Some(auth);
+    db.strict()
+        .execute_batch(
+            "CREATE TEMP TRIGGER refuse BEFORE INSERT ON admin BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap();
+    let response = router(state)
+        .layer(axum::Extension(Peer("127.0.0.1".parse().unwrap())))
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/setup")
+                .header("host", "127.0.0.1:9527")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"username":"admin","password":"correct horse battery"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(response.headers().get("retry-after").is_none());
+}

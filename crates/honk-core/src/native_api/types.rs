@@ -39,6 +39,7 @@ pub enum ErrorCode {
 pub struct ApiError {
     #[serde(skip)]
     status: StatusCode,
+    /// `Some(0)` suppresses the default 429/503 `Retry-After`.
     #[serde(skip)]
     retry_after: Option<u32>,
     error: ErrorBody,
@@ -83,6 +84,12 @@ impl ApiError {
 
     pub fn with_retry_after(mut self, seconds: u32) -> Self {
         self.retry_after = Some(seconds.max(1));
+        self
+    }
+
+    /// For a 503 after a completed write, where repeating the request cannot succeed.
+    pub(crate) fn without_retry_after(mut self) -> Self {
+        self.retry_after = Some(0);
         self
     }
 
@@ -146,7 +153,7 @@ impl IntoResponse for ApiError {
             Json(self),
         )
             .into_response();
-        if let Some(seconds) = retry_after {
+        if let Some(seconds) = retry_after.filter(|seconds| *seconds > 0) {
             response
                 .headers_mut()
                 .insert("retry-after", axum::http::HeaderValue::from(seconds));

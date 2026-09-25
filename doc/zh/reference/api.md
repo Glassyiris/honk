@@ -104,7 +104,7 @@ Setup 与 login 每分钟按规范化对端最多接受 5 次尝试，全局最�
 
 记录使用 PBKDF2-HMAC-SHA256、100,000 次迭代及新生成的 16 字节随机 salt。密码模式直接使用配置的 `global.data_dir`：该目录不可用时启动失败，不回退到其他目录，以免在别处重新开放 setup。首次 setup 插入该行，不替换已有记录，因此两个进程在同一个状态数据库上同时 setup 时只有一个成功。写入开始前数据库忙碌时，setup 失败，可以重试。插入或提交因其他原因失败时，由于该行是否已持久化无法确定，进程在重启前拒绝登录和再次 setup。
 
-Setup 占有凭据状态后，discovery 返回 `setup_required:false`，耐久性不确定时也不重新开放。无法确认写入时返回 503 与 `durability_confirmed:false`，不声称 `written:true`；须重启才能重新确认数据库中的账户状态。
+Setup 占有凭据状态后，discovery 返回 `setup_required:false`，耐久性不确定时也不重新开放。无法确认写入时返回 503 与 `durability_confirmed:false`，不带 `Retry-After`，不声称 `written:true`；须重启才能重新确认数据库中的账户状态。
 
 状态数据库之前的版本把记录保存在 `<data_dir>/native-api/admin.json`。启用 `password_auth` 时，首次启动导入该文件一次（已有的行优先），随后删除文件，`native-api/` 为空时一并删除；旧文件仍须通过与之前相同的所有者与权限检查。未启用 `password_auth` 时不处理该文件。此后再启动旧版本时，它找不到 `admin.json`，会重新开放 setup。
 
@@ -195,7 +195,7 @@ PUT 与校验 source 对象接受并忽略可选的回传布尔字段 `secrets_r
 
 因为 reload 会拒绝修改需重启设置的候选配置，而已写入的文件不回滚，磁盘 hash 会与 accepted hash 不一致，后续写入都返回 412，所以协调器在写入前拒绝。Group PATCH、节点与 provider 编辑、数据库模式的 import 与 revision 激活同样适用；`full` 模式校验以 warning 报告这些诊断。需重启的设置应在配置文件中修改，然后重启 honk。
 
-协调器在副作用前预留 operation，串行处理 API 新写入和 SIGHUP，SIGHUP 也先入队再读盘。单源 overlay 完整校验后，采用目录 FD、拒绝符号链接的普通文件检查、独占临时文件、保留 mode、文件 fsync、目标与完整依赖集复查、原子 rename、目录 fsync。外部编辑器不受协调器约束，最后检查到 rename 之间仍有竞争窗口；UI 保存期间不要并行手工改同一文件。Rename 后若目录 fsync 失败，错误明确携带 `written:true,durability_confirmed:false`：可见内容已经改变，不表示未写或回滚。
+协调器在副作用前预留 operation，串行处理 API 新写入和 SIGHUP，SIGHUP 也先入队再读盘。单源 overlay 完整校验后，采用目录 FD、拒绝符号链接的普通文件检查、独占临时文件、保留 mode、文件 fsync、目标与完整依赖集复查、原子 rename、目录 fsync。外部编辑器不受协调器约束，最后检查到 rename 之间仍有竞争窗口；UI 保存期间不要并行手工改同一文件。Rename 后若目录 fsync 失败，503 明确携带 `written:true,durability_confirmed:false`，不带 `Retry-After`：可见内容已经改变，不表示未写或回滚。写入后 reload 无法入队时同样返回 `written:true`，不带 `Retry-After`。
 
 PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST reload 入协调队列后返回 `202`。响应含 `operation_id`、`href`、相同的 `Location` 与 `Retry-After: 1`，不表示配置已经生效。操作由 daemon 持有，HTTP 断连不取消它或其 supervisor reconciliation。可选 `Idempotency-Key` 绑定 principal、method、path、instance 与原始 body：同 key 同 body 的并发/重试共用结果，不重复写入或 reload，丢失首个 202 后仍可用原 If-Match 重试；不同 body 返回 `409 idempotency_conflict`。总共最多 32 个预留/保留操作，终态最多保留 300 秒。存储已满时，新准入先淘汰最早结束的终态操作，该 ID 随后返回 404，其 `Idempotency-Key` 也不再重放。只有全部名额都是准备中或执行中的操作时，才返回 `503 temporarily_unavailable` 与 `Retry-After: 1`；重启后不保留。
 

@@ -1,6 +1,8 @@
 mod completion;
 mod geodata;
 mod revisions;
+#[cfg(test)]
+mod tests;
 mod validation;
 
 use super::super::management::{self, Completion, Mutation};
@@ -932,7 +934,7 @@ fn write_error(error: WriteError) -> ApiError {
         WriteError::InvalidUtf8 => invalid(),
         WriteError::Unavailable => unavailable().with_details(json!({"stage":"write"})),
         WriteError::ChangedButNotDurable => {
-            unavailable().with_details(json!({"stage":"durability","written":true,"durability_confirmed":false,"committed":false}))
+            unavailable().with_details(json!({"stage":"durability","written":true,"durability_confirmed":false,"committed":false})).without_retry_after()
         }
     }
 }

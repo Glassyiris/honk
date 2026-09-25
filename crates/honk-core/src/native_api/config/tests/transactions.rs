@@ -639,3 +639,30 @@ async fn source_replacement_preserves_text_mode_and_independent_revision_generat
     assert_eq!(fixture.reloads.load(Ordering::SeqCst), 2);
     fixture.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn written_source_whose_reload_cannot_dispatch_is_not_retryable() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let before = fixture.get(CONFIG).await;
+    let main = source(&before, &fixture.originals["main.dae"]).clone();
+    // Stop the engine after admission checks and before the reload is dispatched.
+    let commands = fixture.commands.clone();
+    *fixture.service.before_replace.lock() = Some(Box::new(move || {
+        commands.blocking_send(ControlCommand::Shutdown).unwrap();
+        let started = std::time::Instant::now();
+        while !commands.is_closed() {
+            assert!(started.elapsed() < WAIT, "control loop did not stop");
+            std::thread::yield_now();
+        }
+    }));
+    let content = format!("{}# written\n", fixture.originals["main.dae"]);
+    let response = fixture.replace(&main, &content).send().await.unwrap();
+    assert!(response.headers().get("retry-after").is_none());
+    let failure = error(
+        response,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "temporarily_unavailable",
+    )
+    .await;
+    assert_eq!(failure["error"]["details"]["written"], true);
+}
