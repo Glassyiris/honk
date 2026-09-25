@@ -355,10 +355,10 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
         "limits": {
             "max_request_target_bytes": 4096,
             "max_header_bytes": 16384,
-            "max_json_body_bytes": 65536,
+            "max_json_body_bytes": super::security::MAX_BODY_BYTES,
         },
         "resources": {
-            "config": {"available":config.content_enabled(),"content":config.content_enabled(),"writable":config.editable(),"max_bytes":crate::configuration::MAX_SOURCE_BYTES,"max_sources":crate::configuration::MAX_SOURCES,"store":config.store_value()["kind"]},
+            "config": {"available":config.content_enabled(),"content":config.content_enabled(),"writable":config.editable(),"max_bytes":super::security::MAX_BODY_BYTES,"max_sources":crate::configuration::MAX_SOURCES,"store":config.store_value()["kind"]},
             "config_export": {"available":config.content_enabled()},
             "config_import": config.import_capability(),
             "config_revisions": config.revisions_capability(),

@@ -550,6 +550,16 @@ async fn metadata_defaults_and_anonymous_never_grant_source_authority() {
         let capabilities = fixture.get("/api/v1/capabilities").await;
         assert_eq!(capabilities["resources"]["config"]["content"], true);
         assert_eq!(capabilities["resources"]["config"]["writable"], false);
+        // Replacement content travels in one JSON body, so it cannot exceed that body limit.
+        assert_eq!(
+            capabilities["resources"]["config"]["max_bytes"],
+            capabilities["limits"]["max_json_body_bytes"]
+        );
+        // Full validation also counts dependencies read from disk, not only the request body.
+        assert_eq!(
+            capabilities["resources"]["config_validate"]["max_bytes"],
+            crate::configuration::MAX_SOURCE_BYTES
+        );
         assert_eq!(capabilities["resources"]["groups"]["config_patch"], false);
         for resource in [
             "providers",
