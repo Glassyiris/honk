@@ -780,7 +780,7 @@ async fn update_falls_back_past_a_failed_status_and_a_checksum_mismatch() {
     }
     assert!(data["last_checked_at"].is_string());
     assert!(data["last_updated_at"].is_string());
-    assert_eq!(data["next_check_at"], Value::Null);
+    assert!(data["next_check_at"].is_string());
     assert_eq!(data["last_error"], Value::Null);
     assert_eq!(
         data["required_codes"],
@@ -838,7 +838,7 @@ async fn url_patches_are_accepted_while_the_configuration_names_urls() {
         json!({"source": "config",
             "geosite": {"urls": [format!("http://{address}/geosite/PRIVATE?token=PRIVATE")]},
             "geoip": {"urls": [format!("http://{address}/geoip")]},
-            "auto_update": {"enabled": false, "interval_hours": 24},
+            "auto_update": {"enabled": true, "interval_hours": 24},
             "download": {"route": "direct", "group_id": null}})
     );
     let patched = ok(patch_settings(
@@ -900,21 +900,21 @@ async fn auto_update_stays_settable_while_the_configuration_names_urls() {
     let address: SocketAddr = "127.0.0.1:9".parse().unwrap();
     let fixture =
         Fixture::new_with_state(Access::Admin, |root, files| setup(root, files, address)).await;
-    assert_eq!(fixture.get(GEO).await["next_check_at"], Value::Null);
+    assert!(fixture.get(GEO).await["next_check_at"].is_string());
     let settings = ok(patch_settings(
         &fixture,
-        json!({"geodata": {"auto_update": {"enabled": true, "interval_hours": 48}}}),
+        json!({"geodata": {"auto_update": {"enabled": false, "interval_hours": 48}}}),
     )
     .await)
     .await;
     assert_eq!(settings["geodata"]["source"], "config");
     assert_eq!(
         settings["geodata"]["auto_update"],
-        json!({"enabled": true, "interval_hours": 48})
+        json!({"enabled": false, "interval_hours": 48})
     );
     assert_eq!(settings["source"], "config");
     assert_eq!(fixture.get(SETTINGS).await["geodata"], settings["geodata"]);
-    assert!(fixture.get(GEO).await["next_check_at"].is_string());
+    assert_eq!(fixture.get(GEO).await["next_check_at"], Value::Null);
     fixture.shutdown().await;
 }
 
@@ -941,7 +941,7 @@ async fn anonymous_callers_cannot_change_sources_and_read_masked_urls() {
     assert!(!url.contains(CLASH) && !url.contains('?'), "{url}");
     assert!(url.starts_with("https://mirror.example/") && url.ends_with("/geosite.dat"));
     for body in [
-        json!({"geodata": {"auto_update": {"enabled": true}}}),
+        json!({"geodata": {"auto_update": {"enabled": false}}}),
         json!({"geodata": null}),
     ] {
         error(
@@ -962,12 +962,12 @@ async fn null_returns_to_the_built_in_sources() {
     assert_eq!(defaults["source"], "default");
     assert_eq!(
         defaults["auto_update"],
-        json!({"enabled": false, "interval_hours": 24})
+        json!({"enabled": true, "interval_hours": 24})
     );
     let stored = ok(patch_settings(
         &fixture,
         json!({"geodata": {"geoip": {"urls": ["https://mirror.example/geoip.dat"]},
-            "auto_update": {"enabled": true}}}),
+            "auto_update": {"enabled": false}}}),
     )
     .await)
     .await;
@@ -980,7 +980,7 @@ async fn null_returns_to_the_built_in_sources() {
     let reset = ok(patch_settings(&fixture, json!({"geodata": null})).await).await;
     assert_eq!(reset["geodata"], defaults);
     assert_eq!(fixture.get(SETTINGS).await["geodata"], defaults);
-    assert_eq!(fixture.get(GEO).await["next_check_at"], Value::Null);
+    assert!(fixture.get(GEO).await["next_check_at"].is_string());
     fixture.shutdown().await;
 }
 

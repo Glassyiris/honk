@@ -289,7 +289,7 @@ DELETE 不接受 body/query。未知 ID 无写入地返回 `{"deleted":0}`，成
 
 此时 `GET /geodata` 还为每个资产报告 `fetched_url_redacted`（已加载文件的下载 URL，去掉 userinfo、query 和 fragment，并遮蔽监听凭据）、`verified` 与 `download_route`（`route` 为该次下载时设置的路由，`group_id` 为请求经过的组，包括规则选中的组，否则为 null），并在顶层报告 `last_checked_at`、`last_updated_at`、`next_check_at`、`last_error` 和 `required_codes`；后者按资产列出当前配置引用的分类，已排序。`last_error.code` 为失败阶段，例如 `http_status_rejected`、`checksum_mismatch` 或 `asset_validation_failed`。这些状态只存于内存，因此重启后在下一次尝试前为 null，`verified` 为 false。
 
-自动更新使用同一个 `geodata_update` operation，因此自动更新执行期间的手动更新返回 `409 state_conflict`；自动更新到期时若已有更新在执行，下次时间由该更新的结果决定。每次等待为间隔加 0–60 分钟随机延迟。连续失败后等待 1 小时，每次失败加倍，最长不超过间隔；成功后恢复正常间隔。
+自动更新默认开启，间隔 24 小时；将 `auto_update.enabled` 设为 `false` 即关闭。启动后的首次检查在一个间隔加随机延迟之后执行，与已加载文件的新旧无关，因此升级或重启不会立即触发下载；需要立即更新时调用 `POST /geodata/update`。自动更新使用同一个 `geodata_update` operation，因此自动更新执行期间的手动更新返回 `409 state_conflict`；自动更新到期时若已有更新在执行，下次时间由该更新的结果决定。每次等待为间隔加 0–60 分钟随机延迟。连续失败后等待 1 小时，每次失败加倍，最长不超过间隔；成功后恢复正常间隔。
 
 ### 内嵌 doona 来源
 

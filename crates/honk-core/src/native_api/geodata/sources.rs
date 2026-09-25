@@ -43,7 +43,7 @@ pub(crate) struct AutoUpdate {
 impl Default for AutoUpdate {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             interval_hours: 24,
         }
     }
@@ -475,6 +475,8 @@ impl Sources {
         self.changed.notified()
     }
 
+    /// Before this process has checked, the wait counts from `now`, so a
+    /// startup never downloads at once, whatever the loaded files' age.
     fn reschedule(&self, now: SystemTime) {
         let auto = self.effective().auto_update;
         let mut status = self.status.lock();

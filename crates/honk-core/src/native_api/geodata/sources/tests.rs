@@ -143,6 +143,31 @@ fn patches_outside_the_url_and_interval_rules_are_refused() {
 }
 
 #[test]
+fn automatic_updates_are_on_by_default() {
+    let directory = tempfile::tempdir().unwrap();
+    let sources = Sources::open(db(directory.path()), &settings("")).unwrap();
+    assert!(sources.effective().auto_update.enabled);
+}
+
+#[test]
+fn the_default_interval_is_a_day() {
+    let directory = tempfile::tempdir().unwrap();
+    let sources = Sources::open(db(directory.path()), &settings("")).unwrap();
+    assert_eq!(sources.effective().auto_update.interval_hours, 24);
+}
+
+#[test]
+fn startup_waits_one_interval_before_the_first_check() {
+    let directory = tempfile::tempdir().unwrap();
+    let before = SystemTime::now();
+    let sources = Sources::open(db(directory.path()), &settings("")).unwrap();
+    let after = SystemTime::now();
+    let next = sources.next_check_at().expect("a check is scheduled");
+    assert!(next >= before + 24 * HOUR, "{next:?}");
+    assert!(next <= after + 25 * HOUR, "{next:?}");
+}
+
+#[test]
 fn backoff_starts_at_an_hour_doubles_and_stops_at_the_interval() {
     let daily = AutoUpdate {
         enabled: true,
@@ -165,7 +190,6 @@ fn backoff_starts_at_an_hour_doubles_and_stops_at_the_interval() {
 fn each_scheduled_wait_adds_at_most_an_hour() {
     let directory = tempfile::tempdir().unwrap();
     let sources = Sources::open(db(directory.path()), &settings("")).unwrap();
-    assert_eq!(sources.next_check_at(), None);
     sources
         .apply(patch(
             json!({"auto_update": {"enabled": true, "interval_hours": 6}}),
