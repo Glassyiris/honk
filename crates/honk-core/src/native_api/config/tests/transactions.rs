@@ -501,6 +501,48 @@ async fn conditional_and_invalid_writes_leave_files_and_generation_untouched() {
         assert_eq!(disk(fixture.directory.path()), before_disk);
         assert_eq!(fixture.get(CONFIG).await, before);
     }
+    // The precondition is checked before the media type and body.
+    for (condition, content_type, body, status, code) in [
+        (
+            None,
+            "text/plain",
+            "{}",
+            StatusCode::PRECONDITION_REQUIRED,
+            "precondition_required",
+        ),
+        (
+            None,
+            "application/json",
+            "not json",
+            StatusCode::PRECONDITION_REQUIRED,
+            "precondition_required",
+        ),
+        (
+            Some("*".to_owned()),
+            "text/plain",
+            "{}",
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            Some(strong.clone()),
+            "text/plain",
+            "{}",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+        ),
+    ] {
+        let request = fixture
+            .request(Method::PUT, &source_path(main))
+            .header("content-type", content_type)
+            .body(body);
+        let request = if let Some(condition) = condition {
+            request.header("if-match", condition)
+        } else {
+            request
+        };
+        error(request.send().await.unwrap(), status, code).await;
+    }
     let invalid = fixture.originals["main.dae"].replace(
         "nfqueue_enable: false",
         "nfqueue_enable: private-invalid-value",

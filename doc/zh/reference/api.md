@@ -185,7 +185,7 @@ PUT 与校验 source 对象接受并忽略可选的回传布尔字段 `secrets_r
 
 | 写入条件/结果 | HTTP 语义 |
 | --- | --- |
-| 缺少 `If-Match` | `428 precondition_required` |
+| 缺少 `If-Match`（先于 `Content-Type` 与 body 检查） | `428 precondition_required` |
 | weak、wildcard、多个标签/重复 header、非小写 SHA-256 | `400 invalid_request` |
 | 磁盘 hash 或复查的目标/依赖变化 | `412 stale_revision`，检测到的外部内容不覆盖 |
 | 候选配置或依赖校验失败 | `422 unsupported_value`，不写盘、不 reload |

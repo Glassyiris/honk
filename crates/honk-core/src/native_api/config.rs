@@ -311,7 +311,7 @@ enum Work {
     Replace {
         source_id: String,
         content: String,
-        if_match: Result<String, ApiError>,
+        if_match: String,
         reservation: Reservation,
     },
     Reload {

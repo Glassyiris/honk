@@ -479,7 +479,7 @@ impl Worker {
             .prepare_replace(
                 &accepted.ids[&main.path],
                 content,
-                Ok(accepted.hashes[0].clone()),
+                accepted.hashes[0].clone(),
                 Some(accepted.revision.clone()),
                 match &mutation {
                     Mutation::CreateProvider(input) => Some(input.name.clone()),
@@ -682,7 +682,7 @@ impl Worker {
         self.prepare_replace(
             &accepted.ids[&accepted.update.sources[index].path],
             content,
-            Ok(accepted.hashes[index].clone()),
+            accepted.hashes[index].clone(),
             Some(patch.revision),
             None,
             principal,
@@ -696,12 +696,11 @@ impl Worker {
         &self,
         source_id: &str,
         content: String,
-        expected: Result<String, ApiError>,
+        expected: String,
         group_revision: Option<String>,
         new_provider: Option<String>,
         principal: &str,
     ) -> Result<Prepared, ApiError> {
-        let expected = expected?;
         if content.len() > MAX_SOURCE_BYTES {
             return Err(too_large());
         }
