@@ -277,9 +277,9 @@ DELETE 不接受 body/query。未知 ID 无写入地返回 `{"deleted":0}`，成
 
 ### 内嵌 doona 来源
 
-默认关闭的 `native-ui` 隐含 `native-api`，内嵌 doona `0.3.0`、提交 `9b0ae26b684fd997082ee9abd5c411d03662440d` 的真实产物、字体与 notices。`crates/honk-core/assets/doona-provenance.json` 记录源码/程序/字体包 SHA-256、构建身份及逐文件摘要；`doona-source.tar.gz` 保留对应 GPL-3.0-only 源码，位于 HTTP/内嵌目录之外。分发二进制/资产时须一并保留对应源码与 notices，不能只给接收者不可访问的私有上游链接。
+默认关闭的 `native-ui` 隐含 `native-api`，内嵌 doona `0.3.0-beta.1`、提交 `1ada755053a14575a0775eec9d737542d4c67e85` 的真实产物、字体与 notices。`crates/honk-core/assets/doona-provenance.json` 记录源码/程序/字体包 SHA-256、构建身份及逐文件摘要；`doona-source.tar.gz` 保留对应 GPL-3.0-only 源码，位于 HTTP/内嵌目录之外。分发二进制/资产时须一并保留对应源码与 notices，不能只给接收者不可访问的私有上游链接。
 
-复现时将源码包解压到独立目录，用 Node 22+、`pnpm@11.15.1` 运行 `pnpm install --frozen-lockfile`、`pnpm build`、`SOURCE_DATE_EPOCH=1789793083 pnpm package`。该 epoch 是固定上游提交的时间；源码包不含 Git 历史。`PATH` 中须使用 GNU tar 和 GNU gzip（已验证 tar 1.35、gzip 1.13）；其他 gzip 实现即使压缩相同 tar 字节，也可能产生不同包摘要。普通 Cargo 构建只使用已检入资产，不调用前端 build/下载。真实 checker 在该源码的 `tools/conformance.mjs`；live walk 只读，主动跳过控制、诊断和缺少已观测 ID 的资源。基础与管理契约应分别核对，浏览器动作另行验收；schema 通过不等于完整 UI、内核或部署矩阵通过。
+复现时将源码包解压到独立目录，用 Node 22+、`pnpm@11.15.1` 运行 `pnpm install --frozen-lockfile`、`pnpm build`、`SOURCE_DATE_EPOCH=1790309083 pnpm package`。该 epoch 是固定上游提交的时间；源码包不含 Git 历史。`PATH` 中须使用 GNU tar 和 GNU gzip（已验证 tar 1.35、gzip 1.14）；其他 gzip 实现即使压缩相同 tar 字节，也可能产生不同包摘要。普通 Cargo 构建只使用已检入资产，不调用前端 build/下载。真实 checker 在该源码的 `tools/conformance.mjs`；live walk 只读，主动跳过控制、诊断和缺少已观测 ID 的资源。基础与管理契约应分别核对，浏览器动作另行验收；schema 通过不等于完整 UI、内核或部署矩阵通过。
 
 ### 共用模式与数据面生命周期
 
