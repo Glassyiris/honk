@@ -19,7 +19,7 @@ subscription {
 }
 ```
 
-The short `tag: URL` form keeps the default `honk/<version>` User-Agent. Append `(UA)` after a quoted URL to override it. The block form accepts `url`, optional `ua`, and optional `interval`; `interval` is a duration and defaults to `86400s`. Set it to `0` to disable periodic refresh.
+The short `tag: URL` form keeps the default `honk/<version>` User-Agent. Append `(UA)` after a quoted URL to override it. The block form accepts `url`, optional `ua`, optional `interval` and optional `cache`; `interval` is a duration and defaults to `86400s`. Set it to `0` to disable periodic refresh. `cache: false` keeps this subscription's body out of the subscription store.
 
 Tags are optional. For a bare entry, the text before the first `:` is its tag unless that colon starts `://`; later colons in a URL do not split a tag. Tags and URLs may use matching single or double quotes. A quoted tag followed by `:` is explicit; otherwise the parser removes the URL's enclosing quotes before applying the same first-colon rule. Thus `'paid:https://example.com/sub'` has tag `paid`, while `'https://example.com/sub'` is tagless. Requiring quotes for the `(UA)` suffix keeps parentheses in bare URLs unambiguous. Both forms keep `sub_type: simple`, which automatically detects the supported body formats below.
 
@@ -50,6 +50,7 @@ Quote-error and block rules are listed in the [dialect reference](./dialect.md).
 | `user_agent` | string or null | `honk/<version>` | Yes, as `(UA)` or block `ua` | Optional `User-Agent` override; otherwise requests identify as `honk/<version>`. |
 | `headers` | `{key,value}[]` | `[]` | No | Ordered extra request headers. |
 | `enabled` | bool | `true` | No | Disabled subscriptions are not restored, fetched, or refreshed. |
+| `cache` | bool | `true` | Yes, as block `cache` | With `global.store_subscribe`, keep the fetched body for offline startup. `false` neither stores nor restores it, and maintenance deletes a body kept earlier. |
 | `last_updated` | datetime or null | null | No | Model metadata; the current core runtime does not update it. |
 | `node_count` | u32 | `0` | No | Model metadata; the current core runtime does not update it. |
 | `created_at` | datetime | construction time | No | Model construction time. |

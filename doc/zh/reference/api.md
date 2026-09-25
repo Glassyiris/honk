@@ -41,7 +41,7 @@
 | GET | `/api/v1/rules` | 当前 generation 的完整规则字典、fallback 与可用来源位置。 |
 | GET | `/api/v1/providers`、`/api/v1/providers/{id}` | 真实订阅 owner 状态，不在读取时拉取。 |
 | POST | `/api/v1/providers/{id}/refresh` | 显式刷新订阅，并等待真实 runtime publication 的 operation。 |
-| POST | `/api/v1/providers` | 用 `{name,kind:"subscription",url}` 创建尚未拉取的主文件订阅。 |
+| POST | `/api/v1/providers` | 用 `{name,kind:"subscription",url}` 及可选的 `update_interval`、`user_agent`、`cache` 创建尚未拉取的主文件订阅。 |
 | DELETE | `/api/v1/providers/{id}` | 删除主文件 HTTP(S) 订阅及其已加载节点。 |
 | GET | `/api/v1/geodata` | 读取流量/DNS 路由实际已加载资产的保留元数据。 |
 | POST | `/api/v1/geodata/update` | 下载配置资产、完整校验后，通过 operation 激活精确候选字节。 |
@@ -261,7 +261,7 @@ GET 和成功的 PATCH 响应包含只读 `recording`：`flows`、`logs`、`dns_
 
 ### 主文件条目与 geodata 管理（M9）
 
-`resources.nodes.can_manage` 与 `resources.providers.can_manage` 要求来源协调器运行，且 accepted **主文件**可写、不含 API 凭据。创建节点提交 `{"name":"edge","link":"socks5://192.0.2.2:1080"}`；创建 provider 提交 `{"name":"feed","kind":"subscription","url":"https://example.net/sub"}`。严格 JSON 与 64 KiB 正文限制不变。复用引擎 parser、完整离线准入、FD 相对耐久写入及真实 reload；激活与订阅协调完成后才以 `201` 返回当前 Node/Provider 和 `Location`。HTTP 断连不取消已入队工作；使用 `--store db` 时，这些操作记录新 revision，不重写主文件。
+`resources.nodes.can_manage` 与 `resources.providers.can_manage` 要求来源协调器运行，且 accepted **主文件**可写、不含 API 凭据。创建节点提交 `{"name":"edge","link":"socks5://192.0.2.2:1080"}`；创建 provider 提交 `{"name":"feed","kind":"subscription","url":"https://example.net/sub"}`。`resources.providers.create_options` 列出可选的 provider 字段及省略时采用的值：`update_interval`（秒，最多一年，`0` 表示只在请求时刷新，默认 `86400`）、`user_agent`（1 至 256 个可打印 ASCII 字符，默认 `honk/<version>`），以及仅在 `global.store_subscribe` 打开订阅存储时列出的 `cache`（默认 `true`）。带任一字段的 provider 以块形式写入，使用 `ua`、`interval` 和 `cache`；未列出或超出范围的值返回 `422 unsupported_value`。严格 JSON 与 64 KiB 正文限制不变。复用引擎 parser、完整离线准入、FD 相对耐久写入及真实 reload；激活与订阅协调完成后才以 `201` 返回当前 Node/Provider 和 `Location`。HTTP 断连不取消已入队工作；使用 `--store db` 时，这些操作记录新 revision，不重写主文件。
 
 节点名为 1–64 字符，链接最多 8192 字符；provider 名为 1–64 个 ASCII 字母/数字/`_.-`，HTTP(S) URL 最多 4096 字符。重名返回 409，不支持的链接、身份或值返回 422。新 provider 即使有旧缓存正文，也从零节点、stale、无更新时间开始；相同 source specification 的延迟拉取状态在无关编辑、reload 和 suspend/resume 中保留，直到显式 refresh。修改该 specification 或重启恢复普通订阅启动行为。API 不创建 same-fetch 别名，歧义删除直接拒绝，不让 ID/节点悄悄转移。
 
